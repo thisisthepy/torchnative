@@ -44,7 +44,7 @@ CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 |---|---|---|
 | `aarch64-apple-darwin` (호스트) | `lib_C.dylib` 470,928 B | **`_C.so` 로 이름 바꿔 `import _C` 성공**, 함수 호출까지 |
 | `aarch64-linux-android` | `lib_C.so` 602,952 B | `ELF 64-bit LSB, ARM aarch64`. Python 심볼 48 개가 undefined 로 남음 — 로드 시 인터프리터가 해결하는 올바른 형태 |
-| `aarch64-apple-ios` | `lib_C.dylib` 463,584 B | `Mach-O 64-bit dylib arm64` |
+| `aarch64-apple-ios` | `lib_C.dylib` 463,584 B | `Mach-O 64-bit dylib arm64`, `@rpath/Python.framework/Python` 로 실제 프레임워크 링크(심볼릭 링크 우회 없음) |
 
 ### 타깃마다 링크 배선이 다르다 — `Cargo.kt` 가 인코딩해야 할 것
 
@@ -73,16 +73,88 @@ cargo ndk -t arm64-v8a --platform 21 build --release
 2. `ld: library 'python3.13' not found` — PyO3 가 `-lpython3.13` 을 내보내는데 **배포본에
    `libpython3.13.{a,dylib}` 이 없습니다.** 링크 가능한 것은 `Python.framework/Python` 뿐입니다.
 
-프레임워크 바이너리가 곧 dylib 이므로 심볼릭 링크로 통과시켰습니다.
+이전 판본은 프레임워크 바이너리를 `libpython3.13.dylib` 로 심볼릭 링크해 통과시켰습니다(스파이크용
+우회). **이번에 정식 방법을 실제로 빌드해 판정했고, 심볼릭 링크 없이 통과합니다.**
+
+**두 후보 중 하나만으로는 안 됩니다 — 실측으로 확인했습니다.**
+
+*   **`-F <프레임워크 디렉터리> -framework Python` 만 추가** — 실패합니다.
+    `ld: library 'python3.13' not found` 이 그대로 남습니다. 이유: `pyo3-build-config` 의
+    `is_linking_libpython_for_target()` 가 iOS 를 **`extension-module` 피처와 무관하게 무조건
+    링크 대상으로 하드코딩**합니다(`OperatingSystem::IOS(_)` 매칭). 그래서 PyO3 의 빌드 스크립트가
+    `-F`/`-framework` 를 추가하든 말든 **자기 몫의 `-lpython3.13` 을 별도로 계속 내보내고**, 그
+    이름의 라이브러리가 없으니 그대로 링크 실패합니다.
+*   **`PYO3_NO_PYTHON=1` 만 설정** — 더 나쁘게 실패합니다. 컴파일조차 안 됩니다.
+    ```
+    error: Neither abi3 or abi3t features are enabled
+    ```
+    `PYO3_NO_PYTHON` 은 인터프리터 탐색을 끄지만, 그 경로는 stable ABI(`abi3`) 빌드로 폴백하는데
+    이 크레이트는 `abi3` 피처를 켜지 않았습니다. **`Cargo.toml` 의 abi3 여부는 §1 에서 여전히
+    미결이므로, 이 크레이트 상태로는 이 방법 자체가 성립하지 않습니다.**
+
+**실제로 통과한 조합.** PyO3 자신의 링크 지시를 막는 것과, 우리가 진짜 프레임워크 링크 인자를
+주는 것 **둘 다** 필요합니다.
+
+1. `.cargo/config.toml` 의 `[target.aarch64-apple-ios]` 에 `-F`/`-framework Python` 을 유지합니다
+   (이미 반영됨).
+2. `PYO3_CONFIG_FILE` 환경 변수로 PyO3 자신의 `-lpython3.13` 방출을
+   `suppress_build_script_link_lines=true` 로 끕니다. `PYO3_CONFIG_FILE` 이 설정되면
+   `PYO3_CROSS*` 경로보다 **완전히 우선**하므로(둘 다 줘도 무해 — 무시될 뿐), 베이스라인 빌드
+   명령은 그대로 두고 이 변수만 추가하면 됩니다.
 
 ```
-ln -s <배포본>/arm64-iphoneos/Python.framework/Python  <linkstub>/libpython3.13.dylib
-RUSTFLAGS="-C link-arg=-L<linkstub>"
+cat > <config 경로> <<'EOF'
+implementation=CPython
+version=3.13
+shared=true
+lib_name=Python
+pointer_width=64
+suppress_build_script_link_lines=true
+EOF
+
+PYO3_CONFIG_FILE=<config 경로> \
+PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
+PYO3_CROSS_LIB_DIR=<배포본>/arm64-iphoneos/lib \
+cargo build --release --target aarch64-apple-ios
 ```
 
-**이것은 스파이크용 우회입니다.** 정식으로는 `-F <프레임워크 디렉터리> -framework Python` 을 주거나
-`PYO3_NO_PYTHON` 으로 PyO3 의 링크 지시 자체를 막는 쪽이 맞습니다. **`Cargo.kt` 를 구현할 때
-정할 항목입니다.**
+**검증.** 심볼릭 링크(`<linkstub>/libpython3.13.dylib`) 를 치워도, 위 조합만으로 `EXIT=0` 이고
+산출물이 진짜입니다.
+
+```
+$ file lib_C.dylib
+Mach-O 64-bit dynamically linked shared library arm64
+$ otool -L lib_C.dylib
+	...
+	@rpath/Python.framework/Python (compatibility version 3.13.0, current version 3.13.0)
+$ nm -u lib_C.dylib | grep -c '^_Py'
+106
+```
+
+`@rpath/Python.framework/Python` 로그가 실제 프레임워크 의존성이 Mach-O 로드 커맨드에 박혔다는
+뜻이고, `Py*` 심볼 106 개가 undefined 로 남은 것은 Android 경로와 같은 형태 — 로드 시점에
+그 프레임워크가 해결하는 올바른 모양입니다. `-undefined dynamic_lookup` 처럼 "아무 데서나 찾아라"
+가 아니라 **어느 라이브러리에서 찾을지가 명시적으로 기록**되므로 이쪽이 더 견고합니다.
+
+**주의: 지금 `.cargo/config.toml` 의 `-F` 경로가 이 기계에 하드코딩되어 있습니다.**
+
+```
+-F/Volumes/macMini/caches/target-python/arm64-iphoneos
+```
+
+**커밋된 파일에 절대 경로가 들어가 있으므로 다른 기계에서는 그대로 깨집니다.** 스파이크 단계라
+남겨두지만, 프레임워크 위치는 `Cargo.kt` 가 `XCode.kt` 의 경로 조회로 주입해야 할 값이지
+저장소에 박힐 값이 아닙니다. **아래 `PYO3_CONFIG_FILE` 주의사항과 같은 항목입니다** — 둘 다
+"빌드 배선이 타깃별로 주입" 으로 가야 합니다.
+
+**주의: `PYO3_CONFIG_FILE` 은 실제 `_sysconfigdata` 파싱을 완전히 건너뜁니다.** 위 파일은 손으로
+채운 최소 필드(`version`, `shared`, `pointer_width`) 뿐이고, `build_flags`(`Py_DEBUG`,
+`WITH_PYMALLOC` 등)는 기본값입니다. 이 최소 크레이트는 그것으로 충분했지만, **`Cargo.kt` 가 이
+경로를 실제로 구현할 때는 이 파일을 손으로 박아 넣지 말고, `PYO3_CROSS_LIB_DIR` 의 진짜
+`_sysconfigdata__ios_arm64-iphoneos.py` 를 파싱해 `PYO3_CONFIG_FILE` 내용을 생성해야 합니다** —
+그래야 빌드 플래그 불일치를 피합니다. 또한 `PYO3_CONFIG_FILE` 은 프로세스 전역 환경 변수라
+`.cargo/config.toml` 의 `[env]` 로는 타깃별로 분기할 수 없습니다 — Android/host 빌드에는 주면 안
+되므로, 이 변수는 **`Cargo.kt` 가 iOS 타깃 빌드를 호출할 때만** 주입해야 합니다.
 
 ### `PYO3_CROSS_LIB_DIR` 은 libpython 이 아니라 `_sysconfigdata` 를 찾는다
 

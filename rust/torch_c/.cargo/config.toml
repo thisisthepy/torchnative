@@ -7,8 +7,16 @@
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 
+# iOS has no libpython3.13.{a,dylib} to link -- only Python.framework/Python. PyO3
+# forces libpython linking on iOS regardless of the `extension-module` feature
+# (pyo3-build-config's `is_linking_libpython_for_target` hardcodes it), so it always
+# emits `-lpython3.13`, which the linker can never find here. These rustflags supply
+# the real framework link ourselves; PyO3's own (broken) link line must be suppressed
+# separately via `PYO3_CONFIG_FILE` with `suppress_build_script_link_lines=true` at
+# build time (see docs/RUST_CROSSBUILD.md §0.5). Without that env var this target
+# still fails with "library 'python3.13' not found" even with these flags present.
 [target.aarch64-apple-ios]
-rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+rustflags = ["-C", "link-arg=-F/Volumes/macMini/caches/target-python/arm64-iphoneos", "-C", "link-arg=-framework", "-C", "link-arg=Python"]
 
 [target.aarch64-apple-ios-sim]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
