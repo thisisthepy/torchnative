@@ -198,10 +198,21 @@ TTT-Linear 모델 위에 TTA 를 돌릴 수도 있고 ResNet 위에 돌릴 수�
 **단계 2 를 기기에서 명시적으로 배제하는 것이 중요합니다.** 가장 어려운 요구 — scan 을 통과하는
 역전파와, 2048 토큰 기준 1.5GB 를 넘는 활성값 보존 — 를 기기 타깃에서 통째로 들어냅니다.
 
-**메타러닝 메모리 아키텍처가 단계 0 에 들어가는 것이 핵심입니다.** 이름에 "training" 이 들어가고
-순전파 안에서 가중치가 갱신되지만, `theRiverLethe` 의 TTT-Linear `backward()` 는 **손으로 유도한
-닫힌 형식**이라 autograd 테이프가 없습니다 (`modular_ttt_linear.py:471-531`). 즉 **shim 에
-backward 를 구현하지 않아도 이 아키텍처들의 추론이 성립합니다.**
+**메타러닝 메모리 아키텍처의 추론이 단계 0 에 들어가는 것이 핵심입니다.** 이름에 "training" 이
+들어가고 순전파 안에서 가중치가 갱신되지만, 그 갱신이 **손으로 유도한 닫힌 형식**이라 autograd
+테이프가 없습니다. 구현된 둘 다에서 확인했습니다.
+
+| | 확인 내용 |
+|---|---|
+| `ttt_linear` | `backward()` 가 L2 손실의 그래디언트를 손으로 전개 (`modular_ttt_linear.py:471-531`) |
+| `titans/origin` | 같은 구조 (`modeling_origin.py:697`). **2271 줄 전체에서 autograd 흔적은 `@torch.no_grad()` 하나뿐** — `autograd` · `requires_grad` · `.backward()` 호출 · `optim.` · `create_graph` 가 0 회. `adapt_step` 이 momentary/past surprise(모멘텀)를 텐서로 직접 계산하고, `lr_gate` 가 네 게이트(token · momentary · past · forget)를 돌려줍니다 |
+
+즉 **shim 에 backward 를 구현하지 않아도 이 아키텍처들의 추론이 성립합니다.** 배제되는 것은
+**사전학습뿐**입니다 (단계 2).
+
+원 논문도 같은 형태입니다 — Nested Learning 발표 자료가 "원본 TITANS 구현은 Optimizer 없이 동작
+(closed-form solution, 직접적인 outer product update)" 이라고 적고 있고, NL 은 그것을 경사하강과
+**수학적으로 동등**하다고 재해석할 뿐입니다. **재해석이지 구현 변경이 아니므로 단계 0 이 유지됩니다.**
 
 단계 1 은 backward 가 필요하지만 `AdaptationEngine.online_parameters()` 가 갱신 대상을 명시적으로
 좁히므로 (`base.py:196-222`), **backward 가 필요한 op 집합은 forward 집합보다 훨씬 작습니다.**
@@ -462,8 +473,16 @@ raise NotImplementedError(f"aten op not implemented in torch._C shim: {op}")
 `olympians/__init__.py` 는 비어 있습니다. **설계되지 않은 아키텍처의 런타임을 설계할 수는 없으므로
 명시적으로 범위 밖에 둡니다.** 설계가 나오면 그때 사다리에 추가합니다.
 
-`cronos` 도 아직 대상이 아닙니다 — `modeling_cronos.py` 30줄, `configuration_cronos.py` 18줄,
-`processing_cronos.py` 는 빈 파일로 클래스 골격만 있습니다 (`origin` 은 2271 + 765 + 220줄).
+**`titans` 에서 실제로 구현된 것은 `origin` 하나뿐입니다.** `atlas` 와 `cronos` 는 둘 다
+클래스 골격만 있는 스텁입니다.
+
+| | `modeling_*.py` | 상태 |
+|---|---|---|
+| `origin` | 89,793 B (+ `modular` 35,229 B, `configuration` 12,300 B) | 구현됨 |
+| `atlas` | 1,010 B | **스텁** — `PreTrainedTitansModel` 상속 + `init_weights()` 뿐 |
+| `cronos` | 1,027 B | **스텁** — 같은 골격 |
+
+둘 다 자리를 잡은 뒤에 사다리에 넣습니다.
 
 여기에 `ttadapters` 쪽의 RT-DETR · YOLO11 과 적응 방법들이 더해집니다.
 
@@ -477,7 +496,7 @@ raise NotImplementedError(f"aten op not implemented in torch._C shim: {op}")
 | 1 | `vit` 또는 소형 `llama` | 순전파 최소 집합. 벤더링·import 배선이 실제로 서는가 |
 | 2 | `ttt_linear` | 손유도 갱신이 shim 위에서 도는가. §7 의 prefill 비용 실측 |
 | 3 | `ttadapters` 의 `online()` 한 스텝 | backward 부분집합의 실제 크기 |
-| 4 | `origin` · `atlas` | 메타러닝 메모리의 한계 비용 |
+| 4 | `titans/origin` | 메타러닝 메모리의 한계 비용 (`atlas` · `cronos` 는 스텁이라 아직 없음) |
 | 5 | 재귀 계열 (`llama_mor` 등) | 파라미터 공유가 델리게이트 가정을 건드리는가 |
 
 **1 번이 가장 값싸고 가장 많이 알려줍니다.** 벤더링한 torch 파이썬 트리와 빈 `_C` 스텁만으로
