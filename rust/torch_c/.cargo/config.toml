@@ -1,22 +1,28 @@
+# Per-target link wiring, machine-independent half.
+#
+# The split is deliberate: anything that is a *constant* for a target lives
+# here, and anything that is a *path on the build machine* lives in `build.rs`
+# behind an environment variable. Cargo performs no environment expansion inside
+# `rustflags`, so a path here can only ever be an absolute one -- which is how
+# the iOS `-F` flag came to be hardcoded to a single machine (RUST_CROSSBUILD.md
+# §0.5 flags it). See `build.rs` for the contract that replaced it.
+#
 # Python extension modules resolve their CPython symbols from the interpreter
 # that loads them, not from a linked libpython. Apple's linker needs to be told
 # that explicitly, or every Py* symbol is an undefined-symbol error.
-#
-# This is the first concrete case of the per-target link wiring that
-# pypackpack's Cargo.kt would have to encode. See docs/RUST_CROSSBUILD.md.
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 
-# iOS has no libpython3.13.{a,dylib} to link -- only Python.framework/Python. PyO3
-# forces libpython linking on iOS regardless of the `extension-module` feature
-# (pyo3-build-config's `is_linking_libpython_for_target` hardcodes it), so it always
-# emits `-lpython3.13`, which the linker can never find here. These rustflags supply
-# the real framework link ourselves; PyO3's own (broken) link line must be suppressed
-# separately via `PYO3_CONFIG_FILE` with `suppress_build_script_link_lines=true` at
-# build time (see docs/RUST_CROSSBUILD.md §0.5). Without that env var this target
-# still fails with "library 'python3.13' not found" even with these flags present.
-[target.aarch64-apple-ios]
-rustflags = ["-C", "link-arg=-F/Volumes/macMini/caches/target-python/arm64-iphoneos", "-C", "link-arg=-framework", "-C", "link-arg=Python"]
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 
+# The simulator behaves like macOS here. The physical device does not -- it has
+# no libpython3.13.{a,dylib} at all, only Python.framework/Python, so it needs a
+# framework search path. That path is injected by `build.rs` from
+# BRAINWAVE_PYTHON_FRAMEWORK_DIR, and PyO3's own (unsatisfiable) `-lpython3.13`
+# must be suppressed with PYO3_CONFIG_FILE at the same time.
 [target.aarch64-apple-ios-sim]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+# Android needs no extra flags: ELF shared libraries may carry undefined symbols
+# and the interpreter resolves them at load time.
