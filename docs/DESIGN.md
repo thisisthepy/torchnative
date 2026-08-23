@@ -886,12 +886,30 @@ pypackpack 이 `instant(.py) / bytecode / native / mixed` 를 지원하므로, �
 핫 루프를 nuitka 로 네이티브에 내릴 수 있습니다. §7 의 prefill 디스패치 비용에 대한 손잡이가
 둘이 되는 셈입니다 — 첫째는 융합 커널(§8), 둘째가 이것.
 
-### 확인이 필요한 것
+### Rust 배선은 아직 없다 — 이것이 1 단계보다 앞선다
 
-SPEC.md:427 의 meson 자동 생성은 `.c` · `.cc` · `.cpp` 를 `py.extension_module()` 로 만든다고만
-되어 있고 **Rust 는 언급이 없습니다.** 컴파일 백엔드에 `Cargo.kt` 가 있으니 경로는 있으나,
-`src/main` 스캔이 Rust 크레이트를 잡아 주는지는 스펙만으로 확정되지 않습니다. **`torch/_C/` 의
-Cargo 배선이 자동인지 손으로 붙여야 하는지가 뼈대 세우기의 첫 확인 항목입니다.**
+확인 결과 **pypackpack 에 Rust 확장 빌드가 구현되어 있지 않습니다.**
+
+| | 상태 |
+|---|---|
+| `compile/backend/external/Meson.kt` | 322 줄, 구현됨 |
+| `compile/backend/external/Cargo.kt` | **4 줄 — 패키지 선언과 주석뿐** |
+
+SPEC.md:427 의 meson 자동 생성도 `.c` · `.cc` · `.cpp` 만 `py.extension_module()` 로 만들고
+Rust 는 다루지 않습니다. 그러므로 **`torch/_C/` 는 지금 상태의 pypackpack 으로 빌드되지 않습니다.**
+
+선택지가 둘입니다.
+
+| | 내용 | 성격 |
+|---|---|---|
+| **A. `Cargo.kt` 를 구현** | pypackpack 에 Rust 백엔드를 채움. `Clang` · `NDK` · `XCode` 어댑터 위에 얹는 것이 이미 설계된 형태 | 제자리에 놓는 일. 같은 생태계 안이라 주인이 명확함 |
+| **B. 밖에서 빌드해 산출물만 넘김** | `cargo` + `cargo-ndk` / `cargo-lipo` 로 `.so` · `.dylib` 를 만들고 pypackpack 은 패키징만 | 빠르게 뚫음. 크로스 컴파일 설정을 이중 관리하게 됨 |
+
+**B 로 뚫고 A 로 수렴하는 것을 권합니다.** `torch._C` 의 첫 스파이크가 Rust 툴체인 문제로 막히면
+안 되고, 반대로 A 를 먼저 하면 아직 존재하지 않는 크레이트를 위해 백엔드를 설계하게 됩니다.
+B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 백엔드 설계도 정확해집니다.
+
+**이것이 §11 의 1 단계보다 앞섭니다** — `torch._C` 가 빌드되지 않으면 스텁조차 세울 수 없습니다.
 
 ---
 
