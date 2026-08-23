@@ -36,6 +36,69 @@ CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 떠 있는 것을 활성으로 오독했는데 실제로는 4 일 8 시간 묵은 좀비였습니다. `ps -o etime` 을 함께
 보아야 합니다.
 
+## 0.5 실제로 통과한 빌드 (`rust/torch_c`)
+
+**세 타깃 모두 빌드됩니다.** 최소 PyO3 크레이트(`rust/torch_c`, PyO3 0.29.2)로 확인했습니다.
+
+| 타깃 | 산출물 | 검증 |
+|---|---|---|
+| `aarch64-apple-darwin` (호스트) | `lib_C.dylib` 470,928 B | **`_C.so` 로 이름 바꿔 `import _C` 성공**, 함수 호출까지 |
+| `aarch64-linux-android` | `lib_C.so` 602,952 B | `ELF 64-bit LSB, ARM aarch64`. Python 심볼 48 개가 undefined 로 남음 — 로드 시 인터프리터가 해결하는 올바른 형태 |
+| `aarch64-apple-ios` | `lib_C.dylib` 463,584 B | `Mach-O 64-bit dylib arm64` |
+
+### 타깃마다 링크 배선이 다르다 — `Cargo.kt` 가 인코딩해야 할 것
+
+**호스트/macOS.** `extension-module` 은 libpython 을 링크하지 않고 로드 시점에 해결하는데,
+Apple 링커에 그것을 명시하지 않으면 모든 `Py*` 가 undefined 오류로 떨어집니다.
+
+```toml
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+```
+
+**Android.** `cargo-ndk` 로 통과합니다. 추가 링크 플래그가 필요 없습니다 — ELF 는 공유 라이브러리의
+undefined 심볼을 허용합니다.
+
+```
+ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006
+PYO3_CROSS=1  PYO3_CROSS_PYTHON_VERSION=3.13
+PYO3_CROSS_LIB_DIR=<배포본>/aarch64-linux-android/prefix/lib
+cargo ndk -t arm64-v8a --platform 21 build --release
+```
+
+**iOS — 여기만 특별합니다.** 두 가지가 걸립니다.
+
+1. `ld: warning: -undefined dynamic_lookup is deprecated on iOS` — macOS 의 방법이 그대로 넘어오지
+   않습니다.
+2. `ld: library 'python3.13' not found` — PyO3 가 `-lpython3.13` 을 내보내는데 **배포본에
+   `libpython3.13.{a,dylib}` 이 없습니다.** 링크 가능한 것은 `Python.framework/Python` 뿐입니다.
+
+프레임워크 바이너리가 곧 dylib 이므로 심볼릭 링크로 통과시켰습니다.
+
+```
+ln -s <배포본>/arm64-iphoneos/Python.framework/Python  <linkstub>/libpython3.13.dylib
+RUSTFLAGS="-C link-arg=-L<linkstub>"
+```
+
+**이것은 스파이크용 우회입니다.** 정식으로는 `-F <프레임워크 디렉터리> -framework Python` 을 주거나
+`PYO3_NO_PYTHON` 으로 PyO3 의 링크 지시 자체를 막는 쪽이 맞습니다. **`Cargo.kt` 를 구현할 때
+정할 항목입니다.**
+
+### `PYO3_CROSS_LIB_DIR` 은 libpython 이 아니라 `_sysconfigdata` 를 찾는다
+
+프레임워크를 가리켰더니 `Could not find _sysconfigdata*.py` 로 실패했습니다. PyO3 가 이 경로에서
+찾는 것은 **stdlib 의 `python3.13/_sysconfigdata*.py`** 이지 라이브러리가 아닙니다.
+
+| | `PYO3_CROSS_LIB_DIR` | 그 안의 파일 |
+|---|---|---|
+| Android | `aarch64-linux-android/prefix/lib` | `python3.13/_sysconfigdata__android_aarch64-linux-android.py` |
+| iOS | `arm64-iphoneos/lib` | `python3.13/_sysconfigdata__ios_arm64-iphoneos.py` |
+
+> **정정.** 이 문서의 이전 판본에서 "iOS `lib/` 는 비어 있음(`.DS_Store` 뿐)" 이라고 적었는데
+> **틀렸습니다.** `unzip -l` 결과를 직접 자식만 매칭하는 정규식으로 걸러 `python3.13/` 하위를
+> 통째로 놓쳤습니다. 제 필터가 만든 착시입니다. **`lib/` 에 stdlib 이 있고, 없는 것은
+> `libpython*.{a,so,dylib}` 입니다** — 링크 대상이 프레임워크뿐이라는 결론은 그대로입니다.
+
 ## 1. PyO3 CPython 3.13 확장 크로스 빌드 필수 요소
 
 *   **abi3 사용 여부 — 결정되지 않았습니다.** 초안은 "CPython 3.13 전용이므로 `abi3` 는 불필요"

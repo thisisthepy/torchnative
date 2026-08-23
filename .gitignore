@@ -172,3 +172,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Rust: build output lives in CARGO_TARGET_DIR on the external volume
+/rust/*/target/
