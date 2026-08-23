@@ -108,7 +108,7 @@ add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 �
 - **주입 지점을 일원화할 것.** 벤더링한 트리와 add-hook 이 같은 경로를 놓고 충돌하지 않도록,
   벤더링 트리 안에 확장 지점을 하나 두고 거기로만 들어갑니다.
 - **주입 범위를 좁게 유지할 것.** 데스크톱에서는 **상류 torch 위에서도 동작해야** 합니다
-  (§10 의 1~3 단계가 전부 데스크톱 상류 torch 에서 이뤄집니다). `torch` 를 소유한다는 전제를
+  (§11 의 1~3 단계가 전부 데스크톱 상류 torch 에서 이뤄집니다). `torch` 를 소유한다는 전제를
   API 가 요구하기 시작하면 그 검증 경로가 막힙니다. add-hook 은 **편의**이지 **의존**이 아니어야
   합니다.
 
@@ -203,7 +203,7 @@ TTT-Linear 모델 위에 TTA 를 돌릴 수도 있고 ResNet 위에 돌릴 수�
 
 **이름은 아직 정하지 않습니다.** 한 번은 지어냈다가(`Ephemeral · Session · Persistent · Shared`)
 근거가 없어 버렸고, 한 번은 남의 평가 분류를 가져왔다가 층이 달라 버렸습니다. 세 질문에 답이 필요한
-것은 확실하니, 이름은 §10 의 1~3 단계에서 실제 사용처가 드러난 뒤에 붙입니다.
+것은 확실하니, 이름은 §11 의 1~3 단계에서 실제 사용처가 드러난 뒤에 붙입니다.
 
 **`ScenarioType` 이 무의미한 것은 아닙니다.** BrainWave 가 적응 방법을 제공한다면 벤치마크 수치를
 재현할 수 있어야 하고, 그러려면 리셋 프로토콜을 지원하는 평가 하네스가 필요합니다. 그것은 이미
@@ -686,7 +686,7 @@ AOT 컴파일하고 앱 번들에 적재하며, 런타임에는 Hub 대신 **번
 3. **로컬 확장으로 들고 감** — 빠르지만 상류와 갈라집니다.
 
 **1 로 시작하고 2 를 병행하는 것을 권합니다.** 어차피 커널 구현은 사다리에서 핫스팟이 드러난
-뒤이므로 (§10),
+뒤이므로 (§11),
 그 사이에 상류 논의를 열어둘 시간이 있습니다.
 
 ### flash-attention 은 prefill 에서만 의미가 있다
@@ -798,7 +798,104 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 
 ---
 
-## 10. 순서
+## 10. 저장소 구성과 빌드
+
+빌드 도구는 [`pypackpack`](https://github.com/thisisthepy/pypackpack) 입니다 —
+`crossenv + compiler(nuitka) + bundler + codepush` 로, Android(arm64 · x86_64) · iOS(arm64) ·
+macOS · Linux · Windows · WASM 을 대상으로 합니다. **C · C++ · Rust 확장 빌드를 지원**하므로
+`torch._C` 를 크로스 컴파일할 도구가 이미 있습니다.
+
+그리고 **pypackpack 스펙에 이미 BrainWave 가 들어 있습니다.** 배포 채널이 셋으로 갈라져 있고
+그중 가중치를 BrainWave 가 맡습니다.
+
+| pypackpack `deploy/` | 무엇 |
+|---|---|
+| `code/FastTrackAPI.kt` | 코드 배포 |
+| `resource/ResourceHubAPI.kt` | 리소스 배포 |
+| **`weight/BrainWaveAPI.kt`** | **가중치 배포 클라이언트** |
+
+즉 `torchbrain/api/BrainWaveAPI` 는 그 **기기 쪽 상대편**입니다.
+
+### 디렉터리
+
+```
+BrainWave/
+├─ pyproject.toml                루트 워크스페이스, [tool.ppp] 타깃
+├─ uv.lock  .python-version
+│
+├─ torchbrain/                   pypackpack 패키지 — 하나
+│  ├─ pyproject.toml
+│  └─ src/
+│     ├─ main/                   ← 여기를 스캔해 최상위 파이썬 패키지를 찾음
+│     │  ├─ torch/               최상위 `torch` 로 임포트됨
+│     │  │  ├─ …                 벤더링한 상류 파이썬 트리 (BSD)
+│     │  │  ├─ _decomp/          Core ATen 분해표
+│     │  │  ├─ _C/               Rust + PyO3 → candle
+│     │  │  └─ nn/federated.py   add-hook. 편의이지 의존이 아님 (§2)
+│     │  └─ torchbrain/
+│     │     ├─ delta/            핵심 추상. 수명 이름 미정 (§3)
+│     │     ├─ adapt/            TTL 방법
+│     │     ├─ nn/federated/     FL
+│     │     ├─ kernels/          번들 리졸버 (§8)
+│     │     └─ api/              BrainWaveAPI
+│     ├─ android/  ios/  macos/  linux/  windows/
+│     └─ test/
+│
+├─ tools/scan/                   정적 스캔 (§6). 배포물 아님, CI 전용
+└─ docs/DESIGN.md
+```
+
+### 왜 한 패키지인가
+
+`torch` 는 **최상위 이름 `torch` 로 임포트되어야 합니다** — §1 의 전제가 그것입니다. pypackpack 이
+`src/main` 을 스캔해 최상위 파이썬 패키지들을 찾으므로 (SPEC.md:427), 한 패키지가 `torch` 와
+`torchbrain` 을 함께 제공할 수 있습니다.
+
+**별도 저장소로 빼지 않습니다.** BrainWave 는 `theRiverLethe` 와 `ttadapters` 를 참조하지 않고
+(소스 내 참조 0 건), 아키텍처는 §3 에서 정리한 대로 BrainWave 의 *입력*이므로 의존 방향이 생기지
+않습니다. `PythonMultiplatform` 이 CPython 배포본을 `binary/` 에 두어 라이브러리와 같은 저장소에서
+관리하는 것과 같은 형태입니다.
+
+### FL 의 결합은 extras 로 막는다
+
+"TTA 만 쓰는 사람이 집계 · 통신 · 프라이버시 스택을 끌고 오지 않는다" 는 요구는 유효하되, 패키지
+경계가 아니라 `[project.optional-dependencies].federated` 로 지킵니다. 네트워킹 · 암호 의존성이
+기본 설치에 딸려오지 않게 합니다.
+
+### `adapt/` 는 디렉터리로 단계를 나누지 않는다
+
+미분 요구를 디렉터리 이름으로 판정할 수 없습니다 — 정규화 보정이 단계 0 과 1 에 걸칩니다 (§3).
+**각 방법이 자기 요구를 선언하고 빌드가 그 선언으로 거릅니다.** backward 없는 기기 빌드에 단계 1
+방법이 들어오면 임포트 시점에 걸립니다.
+
+### 배포 채널을 섞지 않는다
+
+pypackpack 의 코드 fast-track 은 **파이썬(소스 · 바이트코드)에만** 씁니다. iOS 가 내려받은
+네이티브 코드의 실행을 금지하므로 — §8 에서 `kernels` 의 Hub 해석을 빌드 타임으로 역전시킨 것과
+같은 제약 — **`torch._C` 와 융합 커널은 fast-track 대상이 아니라 번들에 구워야 합니다.**
+
+| 무엇 | 채널 |
+|---|---|
+| 파이썬 계층 (`torchbrain`, 벤더링한 `torch/` 트리) | fast-track 가능 |
+| `torch._C`, 융합 커널 | **번들만** |
+| 모델 가중치 | BrainWaveAPI |
+
+### 빌드 레벨은 두 번째 손잡이다
+
+pypackpack 이 `instant(.py) / bytecode / native / mixed` 를 지원하므로, 릴리스에서 `adapt/` 의
+핫 루프를 nuitka 로 네이티브에 내릴 수 있습니다. §7 의 prefill 디스패치 비용에 대한 손잡이가
+둘이 되는 셈입니다 — 첫째는 융합 커널(§8), 둘째가 이것.
+
+### 확인이 필요한 것
+
+SPEC.md:427 의 meson 자동 생성은 `.c` · `.cc` · `.cpp` 를 `py.extension_module()` 로 만든다고만
+되어 있고 **Rust 는 언급이 없습니다.** 컴파일 백엔드에 `Cargo.kt` 가 있으니 경로는 있으나,
+`src/main` 스캔이 Rust 크레이트를 잡아 주는지는 스펙만으로 확정되지 않습니다. **`torch/_C/` 의
+Cargo 배선이 자동인지 손으로 붙여야 하는지가 뼈대 세우기의 첫 확인 항목입니다.**
+
+---
+
+## 11. 순서
 
 **부트스트랩 → 사다리 → 이식.** 3 단계까지는 KMP 도 기기도 건드리지 않습니다.
 **선행 측정 단계가 없습니다** — 각 단계가 다음 단계에 필요한 것을 스스로 만들어 냅니다 (§6).
