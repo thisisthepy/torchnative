@@ -902,8 +902,28 @@ Rust 는 다루지 않습니다. 그러므로 **`torch/_C/` 는 지금 상태의
 
 | | 내용 | 성격 |
 |---|---|---|
-| **A. `Cargo.kt` 를 구현** | pypackpack 에 Rust 백엔드를 채움. `Clang` · `NDK` · `XCode` 어댑터 위에 얹는 것이 이미 설계된 형태 | 제자리에 놓는 일. 같은 생태계 안이라 주인이 명확함 |
-| **B. 밖에서 빌드해 산출물만 넘김** | `cargo` + `cargo-ndk` / `cargo-lipo` 로 `.so` · `.dylib` 를 만들고 pypackpack 은 패키징만 | 빠르게 뚫음. 크로스 컴파일 설정을 이중 관리하게 됨 |
+| **A. `Cargo.kt` 를 구현** | pypackpack 에 Rust 백엔드를 채움 | **어댑터가 없어 함께 만들어야 함 — 아래 참조** |
+| **B. 밖에서 빌드해 산출물만 넘김** | `cargo` + `cargo-ndk` 로 `.so` · `.dylib` 를 만들고 pypackpack 은 패키징만 | 빠르게 뚫음. 크로스 컴파일 설정을 이중 관리하게 됨 |
+
+> **정정.** 위에서 A 를 "`Clang` · `NDK` · `XCode` 어댑터 위에 얹는 이미 설계된 형태" 라고 적었는데,
+> **그 어댑터들이 존재하지 않습니다.** 실제로 세어 보니 `compile/backend/external/` 에서 구현된
+> 것은 `Meson.kt`(322 줄) 하나뿐이고 **`Cargo.kt` · `Clang.kt` · `NDK.kt` · `XCode.kt` ·
+> `MSVC.kt` · `Emscripten.kt` 가 전부 4 줄짜리 스텁**입니다. SPEC.md 의 어댑터 설명은 의도이지
+> 배선이 아닙니다. 즉 A 는 "빈 칸 하나 채우기" 가 아니라 **크로스 컴파일 백엔드 계층 전체를
+> 만드는 일**입니다.
+>
+> 그리고 `Meson.kt` 는 `BackendInterface` 를 구현하지도 않습니다 — `DefaultBackend` 에 직접
+> 합성되는 `open class` 이고, `BackendType` enum 은 `MESON` 하나뿐인 채 참조되지 않습니다.
+> **팩토리가 없습니다.**
+>
+> 타깃 디스패치에 걸리는 실제 결함도 둘 확인했습니다 (로컬 `rustc --print target-list` 로 대조).
+>
+> | 위치 | 문제 |
+> |---|---|
+> | `utils/Platforms.kt:74-75` | `arm64-apple-ios` · `arm64-apple-ios-simulator` — **rustc 가 모르는 트리플**. 실제는 `aarch64-apple-ios` · `aarch64-apple-ios-sim` |
+> | `utils/Platforms.kt:100,102` | `android_21_arm64` 와 `android_24_arm64` 가 같은 트리플로 뭉개져 **API 레벨이 소실**. `cargo-ndk --platform` 이 그 값을 요구함 |
+>
+> **B 를 먼저 하라는 권고는 그대로이고, 근거가 더 강해졌습니다.** 설계안은 `docs/CARGO_KT.md`.
 
 **B 로 뚫고 A 로 수렴하는 것을 권합니다.** `torch._C` 의 첫 스파이크가 Rust 툴체인 문제로 막히면
 안 되고, 반대로 A 를 먼저 하면 아직 존재하지 않는 크레이트를 위해 백엔드를 설계하게 됩니다.
