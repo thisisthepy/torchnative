@@ -367,10 +367,48 @@ op 집합을 추측할 필요가 없습니다. PyTorch 에 **[Core ATen Operator
 
 지금은 논쟁이지만, 아래 넷이 나오면 계산입니다.
 
-1. **forward op 집합** — `TorchDispatchMode` 로 측정. TTT-Linear, Titans, RT-DETR, YOLO11
+1. **forward op 집합** — `TorchDispatchMode` 로 측정 (대상은 아래)
 2. **backward op 집합** — 같은 방법을 `online()` 상태의 한 스텝에 적용
 3. **selective libtorch 바이너리 크기** — 1+2 의 합집합으로 빌드
 4. **그 크로스 컴파일이 완료되기는 하는지** — **타임박스를 걸 것**
+
+### 측정 대상과 범위
+
+`theRiverLethe` 의 아키텍처는 `thelethe/architectures/__init__.py` 가 **세 계열**로 선언합니다.
+그리스 신화의 세대 순서(프로토게노이 → 티탄 → 올림포스)를 분류 축으로 쓰며, 실제 배치가 계보
+시기와 맞습니다.
+
+| 계열 | 성격 | 온디바이스 범위 |
+|---|---|---|
+| `protogenois` | transformer 를 대체할 새 아키텍처 아이디어들 | **구현된 것만** |
+| `titans` | 메타러닝 메모리 아키텍처 (LMM · MAC · MAE · MAG · MAL) | **구현된 것만** |
+| `olympians` | Nested Learning 기반 AGI 미래 아키텍처. **설계 미정** | **범위 밖** |
+
+`olympians/__init__.py` 는 비어 있습니다. **설계되지 않은 아키텍처의 런타임을 설계할 수는 없으므로
+명시적으로 범위 밖에 둡니다.** 설계가 나오면 그때 측정에 추가합니다.
+
+측정 대상 (구현이 있는 것만):
+
+| 출처 | 대상 |
+|---|---|
+| `protogenois` | `ttt_linear` · `ttt_mlp` · `llama` · `vit` · `recursive_llama` · `relaxed_recursive_llama` · `llama_mor` |
+| `titans` | `origin` · `atlas` |
+| `ttadapters` | RT-DETR · YOLO11 (+ `online()` 한 스텝) |
+
+**`cronos` 는 아직 측정 대상이 아닙니다.** `modeling_cronos.py` 가 30줄, `configuration_cronos.py`
+가 18줄, `processing_cronos.py` 가 빈 파일로 — 클래스 골격만 있고 아키텍처가 없습니다
+(`origin` 은 2271 + 765 + 220줄). 설계 중인 자체 구조이므로 구현이 자리를 잡은 뒤에 넣습니다.
+
+**재귀 계열을 빼먹지 말 것.** `llama_mor`(Mixture-of-Recursions) · `recursive_llama` ·
+`relaxed_recursive_llama` 는 NL 계보가 아니라 파라미터 공유·재귀 깊이 계열입니다. **같은 텐서를
+여러 번 쓰는 것**은 §8 에서 다룬 **매 스텝 바뀌는 것**과 다른 문제이고, 델리게이트의 가중치 가정을
+또 다른 방향으로 건드립니다. 별도로 재야 합니다.
+
+### 측정은 일회성 숫자가 아니라 재실행 가능한 산출물로
+
+`cronos` 처럼 **설계가 진행 중인 자체 아키텍처가 계속 추가됩니다.** 그러므로 op 집합은 한 번 재고
+끝내는 값이 아니라 **CI 에서 다시 돌릴 수 있는 형태**로 만들어야 합니다. 새 아키텍처가 들어올 때
+선택 빌드 범위 밖의 op 을 요구하면 그 시점에 드러나야지, 기기에서 터져서 알게 되면 안 됩니다.
 
 ```python
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -417,6 +455,43 @@ TTT-Linear 기준 구체적으로: `adapt_step` 하나가 텐서 연산 25~30 �
 
 **그러므로 `adapt_step` 전체를 네이티브 커널 하나로 내리는 탈출구를 처음부터 설계에 넣어둘 것.**
 당장 만들지는 않되, 나중에 끼워넣을 수 있는 형태로.
+
+### 테스트 타임에 갱신되는 가중치가 양자화 가능 범위를 정한다
+
+이것이 아키텍처 선택과 온디바이스 계획이 만나는 지점이고, **아키텍처가 진화할수록 나빠지는
+방향**입니다.
+
+델리게이트와 양자화 툴체인은 가중치를 상수로 취급합니다 — 미리 타일링해 패킹하고, 캘리브레이션을
+끝내고, 컴파일된 blob 에 굽습니다. 그런데 테스트 타임에 갱신되는 텐서는 그 취급을 받을 수 없고,
+누적이 수천 스텝 복리로 쌓이므로 int4 로 들고 있을 수도 없습니다 (분포가 입력에 따라 변해
+캘리브레이션 대상 자체가 없습니다). **즉 갱신 대상이 되는 텐서는 양자화 밖으로 나갑니다.**
+
+그 범위가 아키텍처마다 다릅니다.
+
+| | 갱신되는 것 | 크기 |
+|---|---|---|
+| TTT-Linear / Titans | 헤드당 fast weight `[nh, d, d]` | 작음 |
+| Nested Learning 의 CMS | **FFN 까지 포함** — "FFN 도 연관 메모리" | **파라미터의 대부분** |
+| MAE (Memory As Embedding) | **미정 — 아래** | 확인 필요 |
+
+**CMS 가 범위에 들어오면 계획이 크게 바뀝니다.** FFN 이 갱신 대상이면 폰에서 가장 큰 메모리 항목이
+양자화 밖으로 나가고, 사전 패킹·상수 폴딩·weight-stationary 데이터플로우도 함께 못 씁니다.
+`olympians` 가 설계 미정이므로 지금 결정할 것은 아니지만, **설계될 때 이 제약을 입력으로 넣어야
+합니다.** 나중에 발견하면 양자화 파이프라인(§ 위)을 다시 짜게 됩니다.
+
+**MAE 에 대해서는 조건부로만 적어 둡니다.** `TitansVariants` 에 `MAE = "mae"  # Memory As
+Embedding` 이 LMM · MAC · MAG · MAL 과 나란히 1급 변형으로 선언되어 있고
+(`titans/configuration_utils.py:10-15`), 이를 적용한 `cronos` 는 설계 중입니다. 설계를 모르는
+상태에서 비용을 단정할 수 없으나, **임베딩 위치에 특유한 상호작용이 하나 있어 미리 짚어 둡니다.**
+
+- 임베딩 테이블은 `vocab_size × hidden_size` 라 작은 모델에서 **단일 최대 텐서**인 경우가 많습니다.
+- 그리고 이 저장소는 **가중치 묶기가 기본값**입니다 — `TTTLinearConfig.tie_word_embeddings = True`
+  (`modular_ttt_linear.py:129`), `TTTLinearForCausalLM._tied_weights_keys =
+  {"lm_head.weight": "model.embed_tokens.weight"}` (`:927`).
+- **따라서 메모리가 임베딩 공간에 쓰이는 형태라면, 그 쓰기가 출력 투영도 함께 바꿉니다.**
+  의도된 것이면 상관없지만, 의도되지 않았다면 MAE 에서는 묶기를 푸는 결정이 필요합니다.
+- 온디바이스 관점에서는 어느 쪽이든 **가장 크고 가장 양자화하고 싶은 텐서가 갱신 대상이 되는지**가
+  갈립니다. 설계가 확정되면 이 항목을 조건부에서 확정으로 옮길 것.
 
 ### 양자화는 torch 코어 밖에 있다
 
