@@ -240,6 +240,60 @@ torch/export/decomp_utils.py → torch/_export/__init__.py → wrappers.py
 §5 는 A/B 를 "빌드 스파이크 한 번으로 판정" 하기로 했는데, **A 쪽에 새 비용 항목이 하나 생겼습니다.**
 결정을 §11 의 4 단계에서 내리는 것은 그대로 두되, 이 항목을 판단 재료에 넣어야 합니다.
 
+## 5 차 — 임포트되는 것과 실행되는 것의 비율
+
+4 차에서 A 에 붙은 비용 항목을 정량화하기 위해, **1084 개 중 추론 중에 실제로 파이썬이 실행되는
+모듈**을 셌습니다. 모델 생성까지는 추적을 끄고 순전파 · `generate` 구간에만 `sys.settrace` 를
+걸었습니다.
+
+| | 개수 |
+|---|---|
+| 임포트된 torch 모듈 | **1084** |
+| 추론 중 파이썬이 실행된 것 | **14** |
+| 비율 | **1.3%** |
+
+추적이 살아 있었음을 따로 확인했습니다 — 순전파 1 회에 파이썬 호출 474 건, 그중 torch 186 건.
+
+### 실행된 14 개
+
+```
+torch.nn.modules.module      torch.nn.modules.linear
+torch.nn.modules.sparse      torch.nn.modules.container
+torch.nn.functional
+torch._tensor                torch._utils              torch._jit_internal
+torch.autograd.grad_mode     torch.utils._contextlib
+torch.compiler               torch.jit._trace
+torch.cuda.graphs            torch.distributed.distributed_c10d
+```
+
+**마지막 넷은 일하는 것이 아니라 질문받는 것들입니다.** `compiler` · `jit._trace` ·
+`cuda.graphs` · `distributed_c10d` 가 실행 목록에 있는 이유는 추론 코드가 "너 지금 활성이냐" 를
+묻기 때문입니다 — `is_compiling()` · `is_tracing()` · `is_current_stream_capturing()` ·
+`is_initialized()`. **쓰이는 것이 아니라 조회되는 것입니다.**
+
+그러면 실제로 일하는 파이썬은 열 개 남짓 — `nn.modules` 넷과 `nn.functional`, 텐서/유틸 셋,
+`no_grad` 기계 둘입니다.
+
+### 이것이 A 의 비용을 정의한다
+
+**A 의 비용은 "도는 것을 구현하는 일" 이 아니라 "돌지 않는 것을 임포트되게 만드는 일" 입니다.**
+
+- 추론 중 실행되는 파이썬은 **14 개, 그중 실질은 10 개**. 이것을 우리 `_C` 위에서 동작시키는 것은
+  작은 일입니다.
+- 그러나 나머지 **1070 개는 임포트만이라도 성공해야** 하고, 4 차가 보여준 대로 **그것을 잘라내는
+  것이 싸지 않습니다** — import 시점 연산자 등록이 C++ 디스패처에 걸려 있기 때문입니다.
+
+즉 A 에서 지불하는 것의 대부분은 **한 번도 실행되지 않는 코드를 임포트 가능한 상태로 유지하는 비용**
+입니다. B 는 그 코드를 상류 그대로 두므로 이 비용이 0 입니다.
+
+### 한계
+
+- `sys.settrace` 는 **파이썬 프레임만** 봅니다. torch 작업의 대부분은 C++ 이고 여기서는 보이지
+  않습니다 — 그것이 바로 `_C` 가 제공해야 할 몫이므로, 이 측정은 "파이썬 계층이 얼마나 얇은가" 를
+  말하는 것이지 "일이 얼마나 적은가" 를 말하는 것이 아닙니다.
+- 2 층 Llama, 양자화 없음, 기본 어텐션 경로, `do_sample=False`. 더 큰 모델이나 다른 경로는 더
+  건드릴 수 있습니다.
+
 ## 아직 답하지 않은 것
 
 - 범주 5(`@torch.no_grad()`) 너머는 미탐색입니다. 여기서 멈췄습니다.
