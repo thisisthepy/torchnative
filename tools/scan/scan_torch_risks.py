@@ -146,22 +146,96 @@ def scope_key(node: ast.AST, parent_map: dict):
     return id(fn) if fn is not None else "<module>"
 
 
-def is_guarded_by_cuda_check(node: ast.AST, parent_map: dict) -> bool:
-    """True if `node` sits in the true-branch of an enclosing `if <cuda guard>:`,
-    within the same function scope (doesn't cross function/lambda boundaries)."""
+AVAILABILITY_TEST_RE = re.compile(r"is_available|hasattr|available|cuda", re.IGNORECASE)
+
+
+def _test_src(test: ast.expr) -> str:
+    try:
+        return ast.unparse(test)
+    except Exception:
+        return ""
+
+
+def _looks_like_availability_guard(test: ast.expr) -> bool:
+    """True if the *literal* source of an `if`/ternary test reads like an
+    availability check: `torch.cuda.is_available()`, `hasattr(torch, "compile")`,
+    a helper named `..._available(...)`, or anything mentioning `cuda`."""
+    return bool(AVAILABILITY_TEST_RE.search(_test_src(test)))
+
+
+def collect_guard_taint(tree: ast.Module, parent_map: dict) -> list[tuple]:
+    """Track variables assigned from an availability-guard-like call, e.g.
+    `use_cudnn = _cudnn_available()`, so that a later `if use_cudnn:` is recognized
+    as a guard even though the check happened through a helper function rather than
+    a literal `is_available()`/`hasattr()` call sitting directly in the `if` test.
+
+    This mirrors the tensor-value taint tracking in `scan_tensor_value_branching`
+    (Pass A there tags variables assigned from a *risky* call so later `if`s that
+    branch on them are flagged; here we tag variables assigned from a *guard* call
+    so later `if`s that branch on them are recognized as safe) -- same mechanism,
+    opposite direction, per KNOWN_FALSE_POSITIVES.md #2.
+    """
+    tainted: list[tuple] = []  # (scope, name, lineno)
+    for node in ast.walk(tree):
+        targets = None
+        value = None
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.AugAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not any(
+            isinstance(n, ast.Call) and _looks_like_availability_guard(n.func)
+            for n in ast.walk(value)
+        ):
+            continue
+        sk = scope_key(node, parent_map)
+        for t in targets:
+            if isinstance(t, (ast.Name, ast.Attribute)):
+                try:
+                    name = ast.unparse(t)
+                except Exception:
+                    continue
+                tainted.append((sk, name, node.lineno))
+    return tainted
+
+
+def _test_tainted(test: ast.expr, sk, guard_taint: list) -> bool:
+    test_src = _test_src(test)
+    test_lineno = getattr(test, "lineno", None)
+    for (tsk, name, taint_line) in guard_taint:
+        if tsk != sk:
+            continue
+        if test_lineno is not None and taint_line >= test_lineno:
+            continue
+        if name_appears(test_src, name):
+            return True
+    return False
+
+
+def is_guarded_by_availability_check(node: ast.AST, parent_map: dict, guard_taint: list) -> bool:
+    """True if `node` sits in the guarded branch of an enclosing `if <guard>:`
+    (statement) or `<x> if <guard> else <y>` (ternary), within the same function
+    scope (doesn't cross function/lambda boundaries). A "guard" is either a literal
+    availability check in the test's source text, or a bare/boolean-combined
+    reference to a variable that was itself assigned from such a check -- see
+    `collect_guard_taint`."""
+    sk = scope_key(node, parent_map)
     child = node
     while True:
         parent = parent_map.get(child)
         if parent is None:
             return False
         if isinstance(parent, ast.If):
-            try:
-                test_src = ast.unparse(parent.test)
-            except Exception:
-                test_src = ""
-            if "is_available" in test_src or "cuda" in test_src.lower():
-                if any(child is s or child in ast.walk(s) for s in parent.body):
+            if any(child is s or child in ast.walk(s) for s in parent.body):
+                if _looks_like_availability_guard(parent.test) or _test_tainted(parent.test, sk, guard_taint):
                     return True
+        if isinstance(parent, ast.IfExp) and child is parent.body:
+            if _looks_like_availability_guard(parent.test) or _test_tainted(parent.test, sk, guard_taint):
+                return True
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module)):
             return False
         child = parent
@@ -198,6 +272,7 @@ class Scanner:
         self.tree = tree
         self.symtab = build_import_symtab(tree)
         self.parent_map = build_parent_map(tree)
+        self.guard_taint = collect_guard_taint(tree, self.parent_map)
         self.findings: list[Finding] = []
 
     # -- category: torch.compile / torch.jit.* , torch.cuda.* / torch.backends.cudnn.* ,
@@ -216,7 +291,18 @@ class Scanner:
             kind, severity, guard_exempt = matched
             if guard_exempt:
                 continue
-            if kind == "CUDA_UNGUARDED" and is_guarded_by_cuda_check(node, self.parent_map):
+
+            import_time = enclosing_function(node, self.parent_map) is None
+
+            if kind == "CUDA_UNGUARDED" and is_guarded_by_availability_check(node, self.parent_map, self.guard_taint):
+                continue
+            if kind == "TORCH_COMPILE" and not import_time and is_guarded_by_availability_check(
+                node, self.parent_map, self.guard_taint
+            ):
+                # Deferred + availability-guarded: the risky call moved out of
+                # import time and won't run where torch.compile is unavailable.
+                # See KNOWN_FALSE_POSITIVES.md #1 -- guarded/lazy torch.compile
+                # is not the same hazard as a module-scope one.
                 continue
 
             # Only report the maximal (outermost) chain: if our ast-tree parent is
@@ -232,7 +318,6 @@ class Scanner:
                         continue
 
             invoked = isinstance(parent, ast.Call) and parent.func is node
-            import_time = enclosing_function(node, self.parent_map) is None
 
             usage = "called" if invoked else "referenced"
             message = self._message_for(kind, dotted, usage)
