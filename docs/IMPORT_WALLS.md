@@ -110,7 +110,36 @@ torch.utils            torch.utils._pytree      torch.utils.checkpoint
 torch.distributions
 ```
 
-### 범주 6 — 런타임 코드 생성 (여기가 스텁의 한계)
+### 범주 6 — 런타임 코드 생성 **[정정됨 — 아래 참조]**
+
+> **정정.** 이 절의 결론 — "`@auto_docstring` 이 런타임 코드 생성을 하므로 스텁으로 못 넘는다,
+> 따라서 여기가 벤더링이 필요해지는 최소 지점" — **은 틀렸습니다.** 근거는 `docs/AUTODOC.md`,
+> 요약은 이렇습니다.
+>
+> **`types.FunctionType(` 은 transformers 전체에서 딱 한 곳에만 있습니다** — `utils/doc.py:1088`
+> 의 `copy_func`. 그리고 그 호출처는 전부 `X.push_to_hub = copy_func(X.push_to_hub)` 형태로
+> **transformers 자기 함수**를 대상으로 하지 torch 객체를 건드리지 않습니다.
+> `auto_docstring.py` 는 `inspect.signature` 로 읽고 `__doc__` 을 대입할 뿐이고,
+> `func.__code__.co_filename` 을 **읽기만** 합니다 — 재구성하지 않습니다.
+> 실제로 계측했을 때 `LlamaModel` 임포트 중 `copy_func` 이 87 회 불리는데 **전부 그 9 개
+> 호출처에서 나오고, `@auto_docstring` 프레임에서는 0 회**입니다.
+>
+> **즉 그 벽은 transformers 의 것이 아니라 우리 프로브의 것이었습니다.** 당시 프로브가
+> 함수 비슷한 객체의 `__code__` 를 문자열로 흉내냈고, 그것이 `copy_func` 에 들어가 터진 것으로
+> 보입니다. 더 충실한 스텁으로 다시 만들면 `modeling_llama.py` 가 **끝까지 임포트되고**,
+> 각 클래스의 `__doc__` 길이가 진짜 torch 와 바이트 단위로 같습니다.
+>
+> **따라서 "벤더링이 필요해지는 최소 지점 = 모델 클래스 정의" 라는 결론도 근거를 잃습니다.**
+> 벤더링이 필요한 이유는 여전히 있지만(§3 의 1084 개 모듈, `VENDOR.md` 의 989 개 이름),
+> **이 벽은 그 이유가 아니었습니다.**
+>
+> 남은 교훈 하나: 함수를 흉내내는 프로브는 **진짜 `def` 로 만든 클로저**여야 합니다. 던더를
+> 문자열로 가짜로 채우면 이런 종류의 오진을 만듭니다.
+>
+> 아직 확인 안 된 것: 벤더링한 트리 + 우리 `_C` 조합에서 재확인한 것은 아닙니다. `import torch`
+> 가 아직 안 통과해서 거기까지 못 갔습니다.
+
+원래 기록은 아래에 남깁니다.
 
 `modeling_llama.py:347` 의 `@auto_docstring` 이 클래스 정의 시점에 함수를 **다시 만듭니다.**
 
