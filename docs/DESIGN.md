@@ -6,9 +6,13 @@
 
 ## 0. 이 문서가 답하는 것
 
-BrainWave 는 연합학습(FL) 프레임워크이고, 모델을 기기로 배포해 그곳에서 학습·적응시키는 것이
-목적입니다. 그러려면 **기기에서 PyTorch 모델이 실제로 돌아야 합니다.** 이 문서는 그것을 어떻게
-가능하게 할지, 그리고 아직 결정되지 않은 것이 무엇인지를 정리합니다.
+BrainWave 는 **온디바이스 인공지능 라이브러리**입니다. 연합학습(FL) 뿐 아니라
+TTT · TTA · TTL 을 전부 커버하고, 그 위에 flash-attention / flash-linear-attention 같은
+**커널 최적화를 멀티플랫폼으로** 제공하는 것을 목표로 합니다.
+
+그 전부가 하나의 전제에 걸려 있습니다 — **기기에서 PyTorch 모델이 실제로 돌아야 합니다.**
+이 문서는 그것을 어떻게 가능하게 할지, 커널 계층을 어떤 계약 위에 올릴지, 그리고 아직 결정되지
+않은 것이 무엇인지를 정리합니다.
 
 관련 저장소:
 
@@ -42,10 +46,16 @@ Kotlin Multiplatform (Android / iOS / Desktop / GraalVM native image)
    ├─ transformers (진짜, 또는 thelethe 의 포크)
    ├─ tokenizers · safetensors · huggingface_hub    ← 이미 torch-free, 일부는 이미 Rust
    ├─ ttadapters · thelethe · torchbrain            ← 무수정으로 동작해야 함
+   ├─ kernels                                       ← HF 표준. 인터페이스는 채용, 배포는 역전 (§8)
+   │  └─ 번들 리졸버 → 앱 번들 안의 AOT 커널
    └─ torch                                         ← 만들 것
       ├─ torch/ 파이썬 트리    ← 상류에서 벤더링 (BSD)
       ├─ torch/_decomp/        ← 벤더링. Core ATen 밖 롱테일이 자동 분해됨
       └─ torch/_C              ← 여기만 새로 만듦
+
+빌드 타임 (Gradle 플러그인 + 아티팩트 워커)
+   ├─ 체크포인트 → 선택한 양자화 포맷으로 변환      (§7)
+   └─ 커널 소스 → 타깃별 AOT 컴파일 → 번들에 적재   (§8)
 ```
 
 ### 왜 `torch._C` 만인가
@@ -69,14 +79,18 @@ add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 �
 
 ---
 
-## 3. 범위를 정하는 축 — 미분 요구가 3단계다
+## 3. 범위를 정하는 두 축
 
-이것이 설계 전체의 조직 원리입니다.
+BrainWave 가 커버해야 할 것은 FL · TTT · TTA · TTL 넷인데, **이 넷은 서로 배타적인 범주가
+아닙니다.** 같은 이름이 정반대의 요구를 가리키기도 합니다. 설계를 조직하려면 이름이 아니라
+두 축으로 잘라야 합니다.
+
+### 축 1 — 미분 요구
 
 | 단계 | 무엇 | 필요한 것 | 어디서 |
 |---|---|---|---|
-| 0 | TTT-Linear / Titans 추론 | **forward 만** | 기기 |
-| 1 | `ttadapters.online()` TTA, FL 로컬 스텝 | forward + **좁은** backward | 기기 |
+| 0 | TTT-Linear / Titans 추론, BN 통계 기반 TTA (DUA · NORM) | **forward 만** | 기기 |
+| 1 | 엔트로피 기반 TTA (TENT · EATA · DeYO), 보조과제 TTT, FL 로컬 스텝, TTL | forward + **좁은** backward | 기기 |
 | 2 | TTT 모델 사전학습 | scan 전체를 통과하는 full autograd | **데스크톱 전용, 영구히** |
 
 **단계 2 를 기기에서 명시적으로 배제하는 것이 중요합니다.** 가장 어려운 요구 — scan 을 통과하는
@@ -90,7 +104,45 @@ add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 �
 좁히므로 (`base.py:196-222`), **backward 가 필요한 op 집합은 forward 집합보다 훨씬 작습니다.**
 
 정리하면 `torch._C` 의 사양은 **"전체 forward op + 부분 backward op"** 이고, 두 집합 모두
-측정 가능합니다 (§5).
+측정 가능합니다 (§6).
+
+### "TTT" 는 정반대의 두 가지를 가리킨다
+
+이것이 이 축에서 가장 자주 틀리는 지점입니다.
+
+| | 예 | 미분 요구 |
+|---|---|---|
+| **아키텍처로서의 TTT** | TTT-Linear, Titans, Gated DeltaNet | 손유도 닫힌 형식 → **autograd 불필요** (단계 0) |
+| **보조과제로서의 TTT** | `ttadapters/methods/auxtasks/ttt/` | 자기지도 손실 + 역전파 → **autograd 필요** (단계 1) |
+
+`ttadapters` 안에서도 같은 분기가 있습니다. `methods/batchnorms/` 는 통계만 갱신하므로 단계 0,
+`methods/entropies/` 는 역전파가 필요하므로 단계 1 입니다. **API 를 "TTA" 하나로 묶으면 이 차이가
+숨어서, 기기에서 backward 가 없는 빌드에 gradient 기반 방법이 들어오는 순간 런타임에 터집니다.**
+타입 수준에서 갈라둘 것.
+
+### 축 2 — 상태의 수명과 소재
+
+미분 요구만으로는 FL 과 TTL 이 설명되지 않습니다. 둘째 축이 필요합니다.
+
+| | 상태 수명 | 기기 밖으로 나가나 |
+|---|---|---|
+| TTT (아키텍처) | 시퀀스 하나. 컨텍스트가 끝나면 버림 | 아니오 |
+| TTA | 세션 · 스트림. 도메인이 바뀌면 리셋 | 아니오 |
+| TTL | **프로세스 재시작을 넘어 영속** | 아니오 |
+| FL | 영속 | **예 — 집계 서버로** |
+
+FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 · 통신 · 보안 집계 · 차분 프라이버시가
+붙고, 나머지 셋에는 안 붙습니다. 이걸 섞으면 TTA 하나 돌리는 데 FL 스택이 딸려옵니다.
+
+### 그래서 핵심 추상은 하나다
+
+넷을 관통하는 것은 **베이스 가중치 위의 델타**입니다 — TTT 의 fast weight, TTA 의 적응된 파라미터,
+TTL 의 영속 델타, FL 의 로컬 업데이트가 전부 같은 물건이고 **수명과 행선지만 다릅니다.**
+
+따라서 BrainWave 의 중심 타입은 "적응 방법" 이 아니라 **수명이 타입에 박힌 가중치 델타** 여야
+합니다. 그러면 `reset()` · 체크포인팅 · 집계 · 영속화가 각 방법마다 재구현되지 않고 델타의 수명
+정책 하나로 정리됩니다. (`ttadapters` 가 지금 `base_state` 로 전체 가중치 사본을 들고 있는 문제도
+여기서 해소됩니다 — §9 항목 5.)
 
 ---
 
@@ -286,7 +338,82 @@ TTT-Linear 기준 구체적으로: `adapt_step` 하나가 텐서 연산 25~30 �
 
 ---
 
-## 8. 기존 코드에서 나온 선결 과제
+## 8. 커널 전략 — 계약은 채용하고, 배포는 역전한다
+
+flash-attention / flash-linear-attention 같은 융합 커널을 멀티플랫폼으로 제공하려면
+[HuggingFace `kernels`](https://github.com/huggingface/kernels) 를 쓰는 것이 맞습니다.
+다만 그 표준은 **분리 가능한 두 반쪽**으로 되어 있고, 우리에게 쓸모 있는 것은 한쪽뿐입니다.
+
+### 채용할 반쪽 — 계약
+
+`kernels` 의 계약은 우리 요구에 놀랄 만큼 잘 맞습니다.
+
+- **백엔드 목록에 `metal` 이 이미 있습니다.** 지원 백엔드는 `cpu` · `cuda` · `metal` · `rocm` ·
+  `xpu` 이고, 타입 목록에는 `cann` · `neuron` 도 있습니다. 즉 **CUDA 전용 표준이 아닙니다.**
+- `kernel-builder` 의 `build.toml` 이 **하나의 커널에 대해 백엔드별 변형**을 선언하는 구조이고,
+  백엔드별 의존성(`python-depends-backends`)까지 분리됩니다. 우리가 원하는 멀티플랫폼 패키징의
+  형태가 이미 그것입니다.
+- transformers 통합이 **모델 코드 수정 없이** 레이어를 교체합니다 (`from_pretrained(use_kernels=True)`,
+  `use_kernel_forward_from_hub`). §1 의 "무수정으로 동작해야 함" 과 정확히 맞습니다.
+
+**이 계약을 우리가 다시 발명할 이유가 없습니다.**
+
+### 역전할 반쪽 — 배포
+
+`get_kernel("kernels-community/activation")` 은 **런타임에 Hub 에서 사전 컴파일된 바이너리를
+내려받아 캐시하고 로드**합니다. 이것이 모바일에서 성립하지 않습니다.
+
+- **iOS**: 코드를 내려받아 실행할 수 없습니다. 네이티브 코드는 전부 서명된 앱 번들 안에 있어야
+  하고, 임의 경로의 `dylib` 를 `dlopen` 하는 것은 금지됩니다. §5 에서 `torch.compile` 을 막는
+  것과 같은 계열의 제약입니다.
+- **Android**: 앱 전용 저장소에서 `dlopen` 은 기술적으로 되지만, 실행 코드를 내려받는 것은
+  스토어 정책에 걸리고 서명되지 않은 네이티브 코드를 싣게 됩니다.
+
+**해법: 해석 시점을 런타임에서 빌드 타임으로 옮깁니다.** Gradle 플러그인이 타깃별 변형을 골라
+AOT 컴파일하고 앱 번들에 적재하며, 런타임에는 Hub 대신 **번들을 조회하는 리졸버**가 `kernels` 의
+탐색 API 를 만족시킵니다. 위쪽 코드(transformers, thelethe)는 차이를 모릅니다.
+
+이 단계가 §7 의 체크포인트 변환과 **같은 자리**입니다. 빌드 타임 해석 한 번이 모델과 커널을 함께
+처리합니다.
+
+### Triton 은 iOS 에서 불가능하다
+
+**`flash-linear-attention` 은 Triton 기반입니다.** 그리고 Triton 은 JIT 입니다 — 런타임에
+PTX/LLVM 으로 컴파일합니다. 따라서:
+
+- **iOS**: 원리적으로 불가능 (런타임 코드 생성 금지)
+- **Android**: Triton 런타임도, 인앱 GPU 컴파일러 툴체인도 없음
+- 설령 가능하더라도 Triton 의 autotuning 워밍업은 **세션이 짧은 기기에서 상각되지 않습니다.**
+
+그러므로 **"모바일에서 flash-linear-attention 을 지원한다" 는 FLA 의 Triton 커널을 돌린다는
+뜻일 수 없습니다.** 같은 *융합 연산 집합* 을 AOT 컴파일된 커널로 제공한다는 뜻이어야 합니다.
+
+선례가 있습니다 — FlexLA (ICLR 2026) 가 **Triton 위에 정적 커널 디스패처를 얹은 AOT 컴파일**로
+런타임 오버헤드를 없앴습니다. AOT 방향은 연구된 경로이지 즉흥적인 발상이 아닙니다.
+
+### 커널 소스 후보
+
+| 소스 | 장점 | 단점 |
+|---|---|---|
+| 손으로 쓴 Metal / NEON | 최고 성능. `kernels` 의 `metal` · `cpu` 변형에 그대로 맞음 | 타깃마다 따로 씀 |
+| **CubeCL** (burn 의 커널 언어) | Rust 안에서 한 번 쓰고 WGSL · SPIR-V · Metal · CUDA 로 컴파일 | 성숙도 확인 필요. burn 생태계 결합 |
+| AOT 컴파일한 Triton | FLA 의 커널 정의를 재사용 | 툴체인 무겁고, 모바일 백엔드 커버리지가 관건 |
+
+§4 에서 burn 을 shim 백엔드로는 기각했지만, **CubeCL 은 여기서 다시 후보가 됩니다.** 텐서 API 의
+정적 랭크 문제와 무관한 계층이기 때문입니다.
+
+### 그리고 이것이 prefill 탈출구다
+
+§7 에서 "`adapt_step` 전체를 네이티브 커널 하나로 내리는 탈출구를 설계에 넣어둘 것" 이라고 했는데,
+**그 탈출구가 바로 이 기제입니다.** 새로 만들 것이 아니라 TTT 적응 레이어에
+`use_kernel_forward_from_hub` 를 걸고 번들된 융합 커널을 물리면 됩니다.
+
+즉 커널 계층은 "나중에 추가할 최적화" 가 아니라 **prefill 문제의 예정된 해법**이고, 그래서 지금
+계약을 정해둘 가치가 있습니다. 커널 자체는 나중에 써도 됩니다.
+
+---
+
+## 9. 기존 코드에서 나온 선결 과제
 
 경로(A/B) 와 무관하게 옳은 것들입니다.
 
@@ -342,7 +469,7 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 
 ---
 
-## 9. 순서
+## 10. 순서
 
 **측정 → 부트스트랩 → 이식.** 3 단계까지는 KMP 도 기기도 건드리지 않습니다.
 
@@ -358,7 +485,16 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 `accelerate` 가 무조건 `import torch` 를 하는 것 같은 결합은 우리에게 유리합니다 — 그 이슈의
 사람들은 torch 를 *피하려* 했고 우리는 *만족시키려는* 것이므로 방향이 반대입니다.
 
-§8 의 1~4, 6~7 은 이 순서와 무관하게 지금 고쳐도 되는 것들이고, 5 와 8 이 설계 판단입니다.
+### 이 순서와 병행할 수 있는 것
+
+커널 계층(§8)은 **계약만 먼저 정하고 구현은 뒤로 미룰 수 있습니다.** 오히려 그래야 합니다 —
+번들 리졸버가 만족시켜야 할 `kernels` 탐색 API 는 지금 확정 가능하고, 실제 융합 커널은 §6 측정으로
+핫스팟이 드러난 뒤에 쓰는 것이 맞습니다. 지금 커널부터 쓰면 최적화할 대상을 모르는 채로 쓰게 됩니다.
+
+축 정리(§3)도 병행 가능합니다. **수명이 타입에 박힌 가중치 델타**를 먼저 정의해두면 `ttadapters`
+의 `base_state` 문제(§9-5)가 이식 전에 해소되고, FL · TTL 이 나중에 붙을 자리가 생깁니다.
+
+§9 의 1~4, 6~7 은 이 순서와 무관하게 지금 고쳐도 되는 것들이고, 5 와 8 이 설계 판단입니다.
 
 ---
 
@@ -373,6 +509,8 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 | **burn 을 shim 백엔드로** | `Tensor<B, D>` 정적 랭크가 torch 의 동적 랭크와 근본적으로 불일치. FL 학습 트랙에서는 여전히 후보 |
 | **torch-xla / torch-mlir** | torch-xla 는 libtorch 를 요구하는 **런타임 확장**, torch-mlir 은 AOT **컴파일러 프론트엔드**로 결과가 컴파일된 아티팩트 — 둘 다 "기기에서 진짜 파이썬 transformers" 가 아님. 다만 각각 훔칠 것이 있음: 전자는 "한 계층에서 가로채면 위가 전부 따라온다" 의 대규모 증명, 후자는 "aten 수천 개가 작은 핵심 집합으로 분해된다" 의 독립 검증 (TOSA 목록이 특히 하드웨어 지향) |
 | **`optimum-executorch` 로 `.pte` 배포** | 이미 공식으로 존재하고 잘 동작하지만, 데스크톱에서 export 한 아티팩트를 배포하는 것이라 §1 의 전제와 다름. §5 의 Core ATen 계약을 공유하므로 **나중에 무거운 모델만 빼는 하이브리드로는 열려 있음** |
+| **`kernels` 를 런타임 Hub 해석 그대로 사용** | iOS 가 내려받은 네이티브 코드의 실행을 금지하고 Android 도 스토어 정책에 걸림. **계약은 채용하고 해석 시점만 빌드 타임으로 옮김** (§8) |
+| **FLA 의 Triton 커널을 기기에서 실행** | Triton 은 런타임에 PTX/LLVM 으로 컴파일하는 JIT — iOS 에서 원리적으로 불가능하고, 짧은 세션에서 autotuning 이 상각되지 않음. **같은 융합 연산 집합을 AOT 커널로 제공** (§8) |
 
 ---
 
@@ -385,3 +523,7 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 - [huggingface/candle](https://github.com/huggingface/candle) · [tracel-ai/burn](https://github.com/tracel-ai/burn) · [LaurentMazare/tch-rs](https://github.com/LaurentMazare/tch-rs)
 - [torch-mlir architecture](https://github.com/llvm/torch-mlir/blob/main/docs/architecture.md)
 - [transformers v5 Migration Guide](https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md)
+- [huggingface/kernels](https://github.com/huggingface/kernels) · [Kernel requirements (백엔드 목록)](https://huggingface.co/docs/kernels/kernel-requirements) · [Writing Hub kernels with kernel-builder](https://huggingface.co/docs/kernels/en/builder/writing-kernels) · [Integrating kernels](https://huggingface.co/docs/kernels/integrating-kernels)
+- [transformers — Loading kernels](https://huggingface.co/docs/transformers/kernel_doc/loading_kernels)
+- [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+- [FlexLA: AOT compilation with a static kernel dispatcher on Triton (ICLR 2026)](https://proceedings.iclr.cc/paper_files/paper/2026/file/d029c97ee0db162c60f2ebc9cb93387e-Paper-Conference.pdf)
