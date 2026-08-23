@@ -190,6 +190,56 @@ dynamo(93) · fx(63) · onnx(27) · cuda(21) 만 **349 개, 전체의 32%** 입�
 요구했다는 사실은 **저 349 개를 빈 스텁으로 대체할 수 있을 가능성**을 시사하지만, 실물 torch 로
 확인한 것은 아닙니다.
 
+## 4 차 — 349 개를 끊을 수 있는가: **없습니다**
+
+3 차에서 "기기에서 안 쓰는 349 개(32%)를 쳐내는 것이 이 경로의 진짜 작업" 이라고 적었습니다.
+**시험해 보니 그 방식으로는 안 됩니다.**
+
+방법: meta path finder 로 `torch.distributed` · `torch._dynamo` · `torch.fx` · `torch.onnx` ·
+`torch.cuda` 를 가로채 빈 스텁을 돌려주고, 실물 torch 2.13.0 으로 모델 생성 · 순전파 · `generate`
+가 여전히 통과하는지 확인. 판정은 종료 코드.
+
+세 개의 벽을 차례로 만났고, **세 번째에서 멈춥니다.**
+
+| # | 실패 | 성격 |
+|---|---|---|
+| 1 | `torch/nn/parallel/distributed.py:412` — `class _DDPJoinHook(JoinHook)` | `torch.nn` 이 차단된 `torch.distributed` 에서 **상속**합니다. 스텁이 클래스를 돌려주게 하여 통과 |
+| 2 | `... in schema_to_signature_cache` | 컨테이너 프로토콜 요구. 던더를 추가해 통과 |
+| 3 | `torch/_ops.py:139` — `AssertionError: expected DispatchKey, got _Meta` | **여기서 끝** |
+
+### 왜 끝인가
+
+세 번째는 스텁을 더 다듬어 넘을 수 있는 종류가 아닙니다. 경로가 이렇습니다.
+
+```
+torch/export/decomp_utils.py → torch/_export/__init__.py → wrappers.py
+  → torch/_higher_order_ops/__init__.py → _invoke_quant.py → base_hop.py
+  → auto_functionalize.py:995 → torch/_ops.py:139
+```
+
+`torch._higher_order_ops` 가 **import 시점에 연산자를 등록**하는데, 그 dispatch key 를 차단된
+서브트리에서 가져옵니다. 그리고 등록은 **C++ 디스패처가 타입을 검사**합니다 — 파이썬 스텁이
+`DispatchKey` 행세를 할 수 없습니다.
+
+**즉 torch 의 서브트리들은 import 시점 연산자 등록으로 서로 엮여 있습니다.** 디렉터리 단위로
+분리되지 않습니다.
+
+### 계획에 주는 정정
+
+**3 차의 결론을 정정합니다.** "임포트 그래프를 쳐내면 된다" 가 아니라, 쳐내려면 **코드와 그 등록을
+함께 일관되게 제거**해야 합니다 — 즉 소스 수준의 진짜 prune 이고, import 가로채기로 흉내낼 수 있는
+것이 아닙니다. 그 작업의 크기는 아직 모릅니다.
+
+**그리고 이것은 §5 의 A/B 판단을 움직입니다.**
+
+- **A(candle + shim)** 는 벤더링한 파이썬 트리를 우리가 관리하므로, 1084 개를 그대로 지고 가든지
+  소스 prune 을 직접 하든지 해야 합니다. **이번 결과는 후자가 싸지 않다는 것을 보여줍니다.**
+- **B(selective libtorch)** 에는 이 문제가 **아예 없습니다.** 파이썬 트리는 상류 것을 그대로 쓰고
+  줄이는 것은 C++ 쪽 op 이므로, 등록 일관성이 저절로 유지됩니다.
+
+§5 는 A/B 를 "빌드 스파이크 한 번으로 판정" 하기로 했는데, **A 쪽에 새 비용 항목이 하나 생겼습니다.**
+결정을 §11 의 4 단계에서 내리는 것은 그대로 두되, 이 항목을 판단 재료에 넣어야 합니다.
+
 ## 아직 답하지 않은 것
 
 - 범주 5(`@torch.no_grad()`) 너머는 미탐색입니다. 여기서 멈췄습니다.
