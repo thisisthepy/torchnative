@@ -1,7 +1,12 @@
 #!/bin/sh
-# Build the host artefact, rename it to `_C.so`, and run the smoke tests
+# Build the host artefact, rename it to `_C.abi3.so`, and run the smoke tests
 # against it. Renaming is not incidental: cargo emits `lib_C.dylib`, and Python
-# will only load a file named `_C.so` (RUST_CROSSBUILD.md §2).
+# only loads a file whose name ends in one of importlib's extension suffixes
+# (RUST_CROSSBUILD.md §2).
+#
+# The suffix is `.abi3.so`, not a bare `.so`: ABI3.md §7 item 2. An untagged
+# `_C.so` loads into *any* interpreter, which is precisely the silent failure
+# the abi3 build exists to remove -- so the filename should say what it is.
 set -eu
 
 crate_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -17,10 +22,11 @@ cd -- "$crate_dir"
 cargo build --release
 
 mkdir -p "$stage"
+rm -f "$stage/_C.so"
 if [ -f "$target_dir/release/lib_C.dylib" ]; then
-    cp "$target_dir/release/lib_C.dylib" "$stage/_C.so"
+    cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
 elif [ -f "$target_dir/release/lib_C.so" ]; then
-    cp "$target_dir/release/lib_C.so" "$stage/_C.so"
+    cp "$target_dir/release/lib_C.so" "$stage/_C.abi3.so"
 else
     echo "no host artefact under $target_dir/release" >&2
     exit 1
