@@ -7,8 +7,9 @@ lookalike API over a native inference engine.
 
 - **Real `transformers`, on the device.** Built on [PythonMultiplatform](https://github.com/thisisthepy/PythonMultiplatform),
   which embeds CPython 3.13 into Kotlin Multiplatform. Real packages, unmodified.
-- **FL · TTT · TTA · TTL under one abstraction.** All four are a weight delta over base weights,
-  differing only in lifetime and destination.
+- **One abstraction under the test-time family.** FL, TTT and TTA are all a weight delta over base
+  weights, differing only in lifetime and destination. (TTL is not yet defined here — see the
+  open question in the design doc.)
 - **Multi-platform fused kernels.** Adopts the [Hugging Face `kernels`](https://github.com/huggingface/kernels)
   contract, with resolution moved from Hub-at-runtime to ahead-of-time at build time so it works
   where downloading executable code is not allowed.
