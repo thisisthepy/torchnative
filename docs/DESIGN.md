@@ -7,7 +7,8 @@
 ## 0. 이 문서가 답하는 것
 
 BrainWave 는 **온디바이스 인공지능 라이브러리**입니다. 연합학습(FL) 뿐 아니라
-TTT · TTA · TTL 을 전부 커버하고, 그 위에 flash-attention / flash-linear-attention 같은
+TTL 전반(그 안에 TTA 와 TTT 가 포함됩니다 — §3)을 커버하고, 그 위에 flash-attention /
+flash-linear-attention 같은
 **커널 최적화를 멀티플랫폼으로** 제공하는 것을 목표로 합니다.
 
 그 전부가 하나의 전제에 걸려 있습니다 — **기기에서 PyTorch 모델이 실제로 돌아야 합니다.**
@@ -115,60 +116,66 @@ add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 �
 
 ## 3. 범위를 정하는 두 축
 
-BrainWave 가 커버해야 할 것은 FL · TTT · TTA · TTL 넷인데, **이 넷은 서로 배타적인 범주가
-아닙니다.** 같은 이름이 정반대의 요구를 가리키기도 합니다. 설계를 조직하려면 이름이 아니라
-두 축으로 잘라야 합니다.
+### 용어 — 형제가 아니라 중첩이다
 
-### 용어
+**TTL · TTA · TTT 는 나란한 범주가 아니라 포함 관계입니다.**
 
-| | 뜻 | 레이블 | 갱신되는 것 |
-|---|---|---|---|
-| **FL** | 여러 기기가 각자의 로컬 데이터로 학습하고, **가중치 업데이트만** 서버로 보내 집계 | 있거나 없거나 | 모델 파라미터 (또는 어댑터) |
-| **TTA** | 배포된 모델을 추론 시점의 분포 변화에 맞춤 | **없음** | BN 통계 또는 좁은 파라미터 집합 |
-| **TTT** | 추론 중에 모델이 스스로 학습 신호를 만들어 갱신 — 두 갈래 (아래) | **없음** | fast weight 또는 좁은 파라미터 집합 |
-| **TTL** | **미정 — 아래 참조** | | |
+```
+TTL  (Test-Time Learning)  테스트 타임에 학습이 일어나는 모든 경우
+ └─ TTA  (Test-Time Adaptation)  그중 분포 변화에 대응하는 것. 레이블 없음, 소스 데이터 없음
+     └─ TTT  (Test-Time Training)  그중 학습 시점에 보조 과제를 함께 훈련해야 하는 것
+```
 
-FL 은 나머지와 성격이 다릅니다. 다른 것들은 *한 기기 안에서 닫히는* 적응이고, FL 만 **여러 기기에
-걸친 집계**입니다. 그래서 FL 은 형제가 아니라 위에 얹히는 층입니다 — 로컬 스텝 자체는 TTA 와 같은
+정의는 [Wang et al., *In Search of Lost Online Test-Time Adaptation: A Survey*, IJCV
+2025](https://doi.org/10.1007/s11263-024-02213-5) 를 따릅니다.
+
+- **TTA** — "adapting the model to unseen distributions using **unlabeled test data**"이고,
+  비지도 도메인 적응과 달리 **소스 데이터에 접근하지 않습니다.**
+- **TTT** — "introduces an auxiliary task for **both training and adaptation**. During training,
+  the original backbone is modified into a **'Y'-shaped structure**, with one branch for image
+  classification and another for an auxiliary task, such as rotation prediction."
+
+**둘을 가르는 것은 "학습 시점을 건드리는가" 입니다.** 서베이가 OTTA 를 정의하면서 명시적으로
+"the pre-trained model is expected to retain its original architecture ... **without modifying its
+layers or introducing new model branches during training**" 이라고 못박습니다. TTT 는 Y자 분기를
+요구하므로 이 조건 밖이고, 그래서 TTA 안에 있되 OTTA 는 아닙니다.
+
+**FL 은 이 중첩의 바깥입니다.** TTL 계열은 *한 기기 안에서 닫히는* 학습이고, FL 만 **여러 기기에
+걸친 집계**입니다. 그래서 FL 은 형제가 아니라 위에 얹히는 층입니다 — 로컬 스텝 자체는 TTL 의
 기제를 쓰고, 그 위에 집계·통신·프라이버시가 붙습니다.
 
-### TTL 은 아직 정의되지 않았다 (열린 질문)
+**따라서 BrainWave 의 범위는 "TTL + FL" 입니다.** TTA 와 TTT 는 별도로 커버할 대상이 아니라
+TTL 안의 좁은 영역이고, 라이브러리 구조도 넷을 나열할 것이 아니라 이 중첩을 반영해야 합니다.
 
-> **이전 판본에서 TTL 을 "TTA 와 같되 세션을 넘어 영속하는 것" 으로 정의했으나, 철회합니다.**
-> 두 가지로 틀렸습니다.
->
-> **첫째, 수명 축은 이미 TTA 안에 있고 이미 이름이 있습니다.** `ttadapters` 가
-> `scenarios/base.py` 에서 `ScenarioType` 을 `STANDARD · GRADUAL · CONTINUAL · UNIVERSAL`
-> 로 두고 있고, 학계도 episodic / online / continual 로 나눕니다. 수명이 TTA 와 TTL 을 가르는
-> 축이라면 continual TTA 는 이미 TTL 이어야 하는데 그렇게 부르지 않습니다.
->
-> **둘째, 그 정의는 TTL 을 저장 정책으로 만듭니다.** "적응된 파라미터를 저장했다 다음 실행에
-> 다시 읽는다" 는 학습 패러다임이 아니라 직렬화입니다. 그것이 전부라면 이 라이브러리의 네 기둥
-> 중 하나일 수 없고 TTA 의 체크박스입니다.
+### 아키텍처로서의 TTT 는 이 중첩의 어디인가 (열린 질문)
 
-두 저장소에 개념으로서의 TTL 용례가 없어 코드에서 유도할 수 없습니다. **정의가 정해지기 전까지
-TTL 을 전제로 한 설계 결정을 내리지 않습니다.** 후보:
+`TTT-Linear` · `Titans` 의 "TTT" 는 위 정의의 TTT 와 **같은 단어이지만 다른 것**입니다. 배포 절차가
+아니라 **은닉 상태 자체가 모델이고 청크마다 내부 자기지도 손실로 갱신되는 시퀀스 모델링 구조**입니다.
+분포 변화에 대응하는 것이 아니므로 TTA 의 정의(unseen distribution 대응)에 해당하지 않습니다.
 
-| 후보 | 그렇다면 설계에서의 위치 |
+즉 **TTL 이기는 하나 TTA 는 아닌** 자리로 보이지만, 이 배치는 확인이 필요합니다. 설계에 미치는
+영향은 §2 의 모듈 배치 — `adapt/` 아래에 둘 것인지, 아키텍처 계열로 분리할 것인지 — 입니다.
+
+### 수명 축은 서베이의 시나리오와 같다
+
+수명은 별개의 축이고, **이 프로젝트에 이미 이름이 있으며 그 이름이 서베이에서 온 것입니다.**
+서베이가 정의하는 시나리오가 `ttadapters` 의 `ScenarioType` 과 그대로 대응합니다.
+
+| `ScenarioType` | 서베이의 정의 |
 |---|---|
-| TTT + TTA 를 아우르는 **상위 우산 용어** | 형제가 아니라 상위 개념. 표에서 빼고 §3 전체의 제목이 됨 |
-| **레이블 · 피드백이 기기에서 들어오는** 학습 | TTA 는 정의상 무레이블이므로 **진짜 다른 체제**. 레이블 수집 · 저장 · 프라이버시가 새로 필요 |
-| **태스크를 넘나드는 지속 학습** | 중심 문제가 분포 변화가 아니라 catastrophic forgetting. 리허설 버퍼 · 정규화가 필요 |
-| 가중치를 안 바꾸는 **메모리 · 인컨텍스트 학습** | 단계 0. `delta/` 가 아니라 별도 메모리 저장소 |
+| `STANDARD` | OTTA 기본 프로토콜 — 도메인마다 사전학습 상태로 **리셋** (`f_θS → f_θ0 → f_θS → f_θ1 → …`) |
+| `CONTINUAL` | "does not require **resetting** the model with each perceived domain shift", 도메인 경계 표시 없이 계속 갱신 |
+| `GRADUAL` | "domain shifts are **gradually** introduced through incoming test samples" |
+| `UNIVERSAL` | (서베이에 대응 항목 없음 — 이 저장소 고유) |
 
-### 수명은 별개의 축으로 남는다
-
-TTL 정의와 무관하게 **수명 축 자체는 유효하고 필요합니다.** 다만 그것은 TTA 와 TTL 을 가르는 것이
-아니라 **TTA · TTT · FL 각각의 안에서** 정해지는 정책이고, 이 프로젝트에는 이미 이름이 있습니다 —
-`ScenarioType`. `delta/` 의 수명 정책은 새 이름을 만들지 말고 **거기에 맞춥니다.**
+**`delta/` 의 수명 정책은 새 이름을 만들지 말고 여기에 맞춥니다.**
 
 ### 축 1 — 미분 요구
 
 | 단계 | 무엇 | 필요한 것 | 어디서 |
 |---|---|---|---|
-| 0 | TTT-Linear / Titans 추론, BN 통계 기반 TTA (DUA · NORM) | **forward 만** | 기기 |
-| 1 | 엔트로피 기반 TTA (TENT · EATA · DeYO), 보조과제 TTT, FL 로컬 스텝 | forward + **좁은** backward | 기기 |
-| ? | TTL | **미정** — 정의에 따라 0 이거나 1 | 기기 |
+| 0 | 아키텍처로서의 TTT 추론 (TTT-Linear · Titans), 통계만 갱신하는 정규화 보정, 데이터 기반 방법 | **forward 만** | 기기 |
+| 1 | 손실을 최소화하는 TTA 전반, 보조과제 TTT, 모듈·프롬프트 추가, FL 로컬 스텝 | forward + **좁은** backward | 기기 |
 | 2 | TTT 모델 사전학습 | scan 전체를 통과하는 full autograd | **데스크톱 전용, 영구히** |
 
 **단계 2 를 기기에서 명시적으로 배제하는 것이 중요합니다.** 가장 어려운 요구 — scan 을 통과하는
@@ -176,7 +183,7 @@ TTL 정의와 무관하게 **수명 축 자체는 유효하고 필요합니다.*
 
 단계 0 이 성립하는 근거는 `theRiverLethe` 의 TTT-Linear `backward()` 가 **손으로 유도한 닫힌
 형식**이라는 점입니다 (`modular_ttt_linear.py:471-531`). autograd 테이프가 없습니다. 즉
-**shim 에 backward 를 구현하지 않아도 TTT 추론이 성립합니다.**
+**shim 에 backward 를 구현하지 않아도 아키텍처로서의 TTT 추론이 성립합니다.**
 
 단계 1 은 backward 가 필요하지만 `AdaptationEngine.online_parameters()` 가 갱신 대상을 명시적으로
 좁히므로 (`base.py:196-222`), **backward 가 필요한 op 집합은 forward 집합보다 훨씬 작습니다.**
@@ -184,19 +191,35 @@ TTL 정의와 무관하게 **수명 축 자체는 유효하고 필요합니다.*
 정리하면 `torch._C` 의 사양은 **"전체 forward op + 부분 backward op"** 이고, 두 집합 모두
 측정 가능합니다 (§6).
 
-### "TTT" 는 정반대의 두 가지를 가리킨다
+### 이 축은 서베이의 분류로 판정한다
 
-이것이 이 축에서 가장 자주 틀리는 지점입니다.
+**단계 0/1 은 방법 이름이 아니라 방법이 무엇을 하느냐로 갈립니다.** 서베이가 OTTA 를 세 갈래로
+나누는데, 그 분류가 그대로 미분 요구를 결정합니다.
 
-| | 예 | 미분 요구 |
+| 서베이 분류 | 예 | 미분 요구 |
 |---|---|---|
-| **아키텍처로서의 TTT** | TTT-Linear, Titans, Gated DeltaNet | 손유도 닫힌 형식 → **autograd 불필요** (단계 0) |
-| **보조과제로서의 TTT** | `ttadapters/methods/auxtasks/ttt/` | 자기지도 손실 + 역전파 → **autograd 필요** (단계 1) |
+| **최적화 기반** — 정규화 보정 | 테스트 배치에서 통계(μ, σ)만 다시 계산 | **단계 0** |
+| **최적화 기반** — 정규화 보정 | 손실로 affine {γ, β} 를 갱신 | 단계 1 |
+| **최적화 기반** — mean-teacher · 비지도 목적함수 · 의사 레이블 | | 단계 1 |
+| **데이터 기반** — 증강 · 메모리 뱅크 | 서베이가 TTAug 는 "does not require any modification to the model training process" 라고 명시 | **단계 0** |
+| **모델 기반** — 모듈 추가 · 치환 · 프롬프트 | 추가한 모듈을 학습시켜야 함 | 단계 1 |
 
-`ttadapters` 안에서도 같은 분기가 있습니다. `methods/batchnorms/` 는 통계만 갱신하므로 단계 0,
-`methods/entropies/` 는 역전파가 필요하므로 단계 1 입니다. **API 를 "TTA" 하나로 묶으면 이 차이가
-숨어서, 기기에서 backward 가 없는 빌드에 gradient 기반 방법이 들어오는 순간 런타임에 터집니다.**
-타입 수준에서 갈라둘 것.
+**정규화 보정이 양쪽에 걸치는 것에 주의하십시오.** "BatchNorm 계열이면 단계 0" 이 아닙니다 —
+통계만 다시 계산하면 backward 가 없고, 같은 레이어의 affine 파라미터를 손실로 갱신하면 backward 가
+있습니다. 디렉터리 이름으로 판정할 수 없고 **구현을 보고 판정해야 합니다.**
+
+> **주의 — 이 표는 서베이 기준이지 `ttadapters` 의 구현 상태가 아닙니다.** 현재
+> `methods/entropies/` 와 `methods/auxtasks/` 트리는 `__init__.py` 까지 포함해 **전부 0바이트**
+> 입니다. 구현이 있는 것은 `batchnorms/` · `deepsupervisions/` · `pefts/` · `regularizers/`
+> 뿐입니다. 각 방법이 실제로 어느 단계인지는 §6 의 측정으로 확정해야 하며, 그때까지 배정은
+> 서베이에 근거한 예상입니다.
+
+**그래도 단계 1 이 존재한다는 것 자체는 확정입니다.** `online()` 이 `online_parameters()` 에
+`requires_grad` 를 켜고 SGD/Adam/Muon 옵티마이저를 생성합니다 (`base.py:169-225`). 프레임워크가
+그래디언트 기반 적응을 전제로 설계되어 있습니다.
+
+**API 를 하나로 묶으면 이 차이가 숨습니다.** 기기에서 backward 가 없는 빌드에 단계 1 방법이
+들어오는 순간 런타임에 터집니다. 타입 수준에서 갈라둘 것.
 
 ### 축 2 — 상태의 수명과 소재
 
@@ -236,8 +259,9 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 정책 하나로 정리됩니다. (`ttadapters` 가 지금 `base_state` 로 전체 가중치 사본을 들고 있는 문제도
 여기서 해소됩니다 — §9 항목 5.)
 
-TTL 이 정의되면 (위 "열린 질문") 이 델타에 새 수명이 하나 붙거나, 아예 다른 저장소가 필요하거나,
-둘 중 하나입니다. **정의 전에는 어느 쪽도 만들지 않습니다.**
+TTL 은 이 델타 전체가 사는 범위이고 (§3 의 중첩), TTA · TTT 는 그 안의 좁은 영역입니다. 따라서
+**`adapt/` 아래에 TTA 와 TTT 를 나란한 모듈로 두면 안 됩니다** — 중첩을 평평하게 펴는 것이라,
+어느 쪽에 넣을지 모호한 방법이 반드시 생깁니다.
 
 ---
 
@@ -739,6 +763,8 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 - [huggingface/candle](https://github.com/huggingface/candle) · [tracel-ai/burn](https://github.com/tracel-ai/burn) · [LaurentMazare/tch-rs](https://github.com/LaurentMazare/tch-rs)
 - [torch-mlir architecture](https://github.com/llvm/torch-mlir/blob/main/docs/architecture.md)
 - [transformers v5 Migration Guide](https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md)
+- Wang, Luo, Zheng, Chen, Wang, Huang — [*In Search of Lost Online Test-Time Adaptation: A Survey*, IJCV 133:1106–1139 (2025)](https://doi.org/10.1007/s11263-024-02213-5) — §3 의 TTL ⊃ TTA ⊃ TTT 정의와 시나리오·미분 요구 분류의 출처
+- Behrouz et al. — *Nested Learning: The Illusion of Deep Learning Architectures*, Google Research, NeurIPS 2025 — §7 의 CMS·FFN 갱신 논의의 출처
 - [huggingface/kernels](https://github.com/huggingface/kernels) · [Kernel requirements (백엔드 목록)](https://huggingface.co/docs/kernels/kernel-requirements) · [Writing Hub kernels with kernel-builder](https://huggingface.co/docs/kernels/en/builder/writing-kernels) · [Integrating kernels](https://huggingface.co/docs/kernels/integrating-kernels)
 - [transformers — Loading kernels](https://huggingface.co/docs/transformers/kernel_doc/loading_kernels)
 - [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)

@@ -1,15 +1,15 @@
 # BrainWave
 An on-device AI library with automated model deployment
 
-Covers the whole test-time family — Federated Learning, Test-Time Training, Test-Time Adaptation,
-and Test-Time Learning — on top of the real Python ecosystem running on the device itself, not a
-lookalike API over a native inference engine.
+Covers Test-Time Learning in full — with Test-Time Adaptation, and Test-Time Training within it —
+plus Federated Learning on top, running on the real Python ecosystem on the device itself rather
+than a lookalike API over a native inference engine.
 
 - **Real `transformers`, on the device.** Built on [PythonMultiplatform](https://github.com/thisisthepy/PythonMultiplatform),
   which embeds CPython 3.13 into Kotlin Multiplatform. Real packages, unmodified.
-- **One abstraction under the test-time family.** FL, TTT and TTA are all a weight delta over base
-  weights, differing only in lifetime and destination. (TTL is not yet defined here — see the
-  open question in the design doc.)
+- **One abstraction under the test-time family.** Every method is a weight delta over base weights,
+  differing only in lifetime and destination — and the lifetimes are the survey's own scenarios,
+  not names we coined.
 - **Multi-platform fused kernels.** Adopts the [Hugging Face `kernels`](https://github.com/huggingface/kernels)
   contract, with resolution moved from Hub-at-runtime to ahead-of-time at build time so it works
   where downloading executable code is not allowed.
