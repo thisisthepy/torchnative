@@ -32,6 +32,7 @@ mod aten;
 mod device;
 mod dtype;
 mod err;
+mod info;
 mod tensor;
 
 use crate::device::PyDevice;
@@ -63,11 +64,24 @@ fn _tensor_from_flat(
         )));
     }
     let device = device.unwrap_or_else(PyDevice::cpu).resolve()?;
-    let target = dtype.map(|d| d.dtype()).unwrap_or(candle_core::DType::F32);
+    // BOOL.md §6.3 lists this function as one of the two ways the `torch.bool`
+    // invariant could be broken quietly, since arbitrary values come in here.
+    // It refuses the tag instead: this is scaffolding due for deletion, and it
+    // should not be the thing that teaches the shim to lie about booleans.
+    if dtype.is_some_and(|d| d.tag() == crate::dtype::TorchDType::Bool) {
+        return Err(crate::err::not_implemented(
+            "_tensor_from_flat: torch.bool is not accepted here -- a bool tensor \
+             must come from an op that guarantees 0/1 bytes (BOOL.md §6.3)",
+        ));
+    }
+    let target = dtype
+        .map(|d| d.storage("_tensor_from_flat"))
+        .transpose()?
+        .unwrap_or(candle_core::DType::F32);
     let tensor = Tensor::from_vec(values, shape, &device)
         .and_then(|t| t.to_dtype(target))
         .map_err(|e| candle_err("_tensor_from_flat", e))?;
-    Ok(PyTensorBase::new(tensor)
+    Ok(PyTensorBase::new(tensor)?
         .into_pyobject(py)?
         .into_any()
         .unbind())
@@ -81,13 +95,47 @@ fn _shim_target() -> &'static str {
     env!("TORCH_C_TARGET")
 }
 
+/// The name surface the vendored tree expects `_C` to present, extracted from
+/// the tree's own `.pyi` stubs by `vendor/gen_surface.py` and compiled in so
+/// the artefact needs nothing on disk at runtime. See `bootstrap.py`.
+const SURFACE: &str = include_str!("surface.json");
+
+/// Everything that is a name rather than a behaviour is built in Python, from
+/// `SURFACE`, at module init.
+///
+/// Why Python and not Rust: what has to be built is ~1,700 Python callables,
+/// ~200 heap types with chosen metaclasses, and 27 entries in `sys.modules`.
+/// All of that is dynamic Python object construction either way; doing it in
+/// Rust would be the same operations spelled through `Bound<'_, PyAny>`, at
+/// several times the length, with no more type safety, and it would still be
+/// executing at exactly this moment. Keeping it in one readable file also
+/// keeps the *reason* each name exists next to the name.
+///
+/// What stays in Rust is everything with behaviour: dtypes, devices, tensors,
+/// and the aten dispatcher. `bootstrap.py` never computes anything -- it wires
+/// names to the one door in `aten.rs`.
+fn run_bootstrap(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    let code = std::ffi::CString::new(include_str!("bootstrap.py"))?;
+    let boot = PyModule::from_code(
+        py,
+        code.as_c_str(),
+        c"torch_c_bootstrap.py",
+        c"_torch_c_bootstrap",
+    )?;
+    boot.getattr("install")?.call1((m, SURFACE))?;
+    Ok(())
+}
+
 #[pymodule]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     dtype::register(m)?;
     device::register(m)?;
+    info::register(m)?;
     tensor::register(m)?;
     aten::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;
+    run_bootstrap(m)?;
     Ok(())
 }

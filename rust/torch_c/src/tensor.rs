@@ -17,22 +17,67 @@ use pyo3::types::{PyList, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::device::PyDevice;
-use crate::dtype::PyDtype;
+use crate::dtype::{PyDtype, TorchDType};
 use crate::err::{candle_err, not_implemented};
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
 #[derive(Clone)]
 pub struct PyTensorBase {
     inner: Tensor,
+    /// The torch-level dtype. Not derivable from `inner.dtype()`: `torch.bool`
+    /// and `torch.uint8` share candle's `U8` storage and differ only here.
+    /// BOOL.md §5-B is the decision; §6.3 is the invariant that comes with it
+    /// (the bytes under a `bool` tag are 0 or 1), which is why `boolean()` is
+    /// the only way to attach that tag.
+    tag: TorchDType,
 }
 
 impl PyTensorBase {
-    pub fn new(inner: Tensor) -> Self {
-        Self { inner }
+    /// A tensor whose torch dtype is whatever candle is already storing.
+    pub fn new(inner: Tensor) -> PyResult<Self> {
+        let tag = TorchDType::from_storage(inner.dtype()).ok_or_else(|| {
+            not_implemented(format!(
+                "torch._C shim has no torch dtype for candle dtype: {}",
+                inner.dtype().as_str()
+            ))
+        })?;
+        Ok(Self { inner, tag })
+    }
+
+    /// The single entrance for the `torch.bool` tag (BOOL.md §6.3 item 1).
+    /// The caller is asserting the bytes are already normalised to 0/1;
+    /// `BRAINWAVE_CHECK_BOOL=1` turns that assertion into a check.
+    pub fn boolean(inner: Tensor) -> PyResult<Self> {
+        if inner.dtype() != DType::U8 {
+            return Err(not_implemented(format!(
+                "torch._C shim: a torch.bool tensor stores as U8, got {}",
+                inner.dtype().as_str()
+            )));
+        }
+        if std::env::var("BRAINWAVE_CHECK_BOOL").is_ok_and(|v| v != "0") {
+            let max = inner
+                .flatten_all()
+                .and_then(|t| t.max(0))
+                .and_then(|t| t.to_scalar::<u8>())
+                .map_err(|e| candle_err("bool invariant check", e))?;
+            if max > 1 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "torch._C shim: torch.bool invariant violated -- a byte under                      a bool tag is {max}, not 0 or 1 (BOOL.md §6.3)"
+                )));
+            }
+        }
+        Ok(Self {
+            inner,
+            tag: TorchDType::Bool,
+        })
     }
 
     pub fn tensor(&self) -> &Tensor {
         &self.inner
+    }
+
+    pub fn tag(&self) -> TorchDType {
+        self.tag
     }
 }
 
@@ -48,7 +93,7 @@ impl PyTensorBase {
 
     #[getter]
     fn dtype(&self) -> PyDtype {
-        PyDtype::new(self.inner.dtype())
+        PyDtype::new(self.tag)
     }
 
     #[getter]
@@ -96,7 +141,7 @@ impl PyTensorBase {
     /// way to read values out at the moment, so tests can compare numbers
     /// against real torch without any further surface being built first.
     fn tolist(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let flat = flat_objects(py, &self.inner)?;
+        let flat = flat_objects(py, &self.inner, self.tag)?;
         nest(py, &flat, self.inner.dims())
     }
 
@@ -104,7 +149,7 @@ impl PyTensorBase {
         format!(
             "TensorBase(shape={:?}, dtype={}, device={})",
             self.inner.dims(),
-            PyDtype::torch_name(self.inner.dtype()).unwrap_or("?"),
+            self.tag.name(),
             PyDevice::from_candle(self.inner.device()).__str__()
         )
     }
@@ -113,9 +158,21 @@ impl PyTensorBase {
 /// Flattens to Python scalars. Every float type is read through `f64` and every
 /// integer type through `i64`, so a dtype candle can hold but this shim has not
 /// taught itself to read fails by name instead of returning garbage.
-fn flat_objects(py: Python<'_>, tensor: &Tensor) -> PyResult<Vec<Py<PyAny>>> {
+fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Vec<Py<PyAny>>> {
     let flat = tensor.flatten_all().map_err(|e| candle_err("tolist", e))?;
     let dtype = tensor.dtype();
+    if tag == TorchDType::Bool {
+        // torch's `tolist` on a bool tensor yields Python `bool`s, not 0/1
+        // ints. Reading `!= 0` rather than the raw byte is also what torch
+        // guarantees (BOOL.md §2.6) -- the tag promises the read, not the byte.
+        let values = flat
+            .to_vec1::<u8>()
+            .map_err(|e| candle_err("tolist", e))?;
+        return values
+            .into_iter()
+            .map(|v| (v != 0).into_py_any(py))
+            .collect::<PyResult<Vec<_>>>();
+    }
     if dtype.is_float() {
         let values = flat
             .to_dtype(DType::F64)
