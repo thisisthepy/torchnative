@@ -363,7 +363,7 @@ candle 은 복사 지향이라 **view / stride aliasing 과 in-place 연산**(`a
 
 | | 실상 |
 |---|---|
-| libtorch(C++) 를 Android / iOS 로 빌드 | **된다.** `scripts/build_mobile.sh` 가 지금도 main 에 있음 |
+| libtorch(C++) 를 Android / iOS 로 빌드 | **된다** (실제로 빌드해 확인 — 아래 "B 는 판정됐다") |
 | TorchScript / `.pte` 아티팩트를 기기에서 실행 | **된다** |
 | 임베디드 CPython 에서 `import torch` | **아무도 안 했다** ← 우리가 필요한 것 |
 
@@ -395,6 +395,62 @@ Rust 구현도 닫힌 세계입니다. 커버리지는 차이가 아닙니다.
 
 **B 는 "이 논지가 성립하는가" 를 가장 빨리 답하고, A 는 "이걸 출시할 수 있는가" 의 답일 가능성이
 높습니다.**
+
+### B 는 판정됐다 — **A 로 간다**
+
+스파이크를 돌렸고(32 분, 60 분 타임박스 안), **결론이 예상과 반대 방향에서 나왔습니다.**
+상세는 `docs/B_SPIKE.md`.
+
+**크로스 컴파일은 됩니다.** 전체 op 빌드와 10 개 선택 빌드 둘 다 aarch64 `libtorch_cpu.a` 를
+만들었고(각각 202MB · 175MB), 종료 코드 0, 외장 4.7GB 를 썼습니다. 막힌 것 다섯 개는 전부
+얕았습니다 — 번들 cmake 버전, 삭제된 eigen 서브모듈 참조, NDK 27 의 Vulkan 래퍼, `cpuinfo` 이중
+링크, 그리고 선택 빌드가 CUDA 전용 `at::cpu::_scaled_grouped_mm_v2` 를 호출하는 torchgen 버그
+(디스패치 include 1074 개 중 1 개).
+
+**그런데 그것이 B 의 관문이 아니었습니다.**
+
+```cmake
+# CMakeLists.txt:813-816
+if(ANDROID OR IOS OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
+  set(INTERN_BUILD_MOBILE ON)
+...
+# CMakeLists.txt:917  — 같은 블록 안
+  set(BUILD_PYTHON OFF)
+```
+
+**Android 나 iOS 툴체인이면 `BUILD_PYTHON` 이 자동으로 꺼집니다.** 옵션이 아니라 덮어쓰기입니다.
+즉 **모바일 빌드 경로는 구조적으로 `torch._C` 를 만들 수 없습니다** — lite interpreter 용
+libtorch 를 만듭니다. B 가 필요로 했던 바로 그것이 나오지 않습니다.
+
+같은 블록이 `USE_DISTRIBUTED OFF` · `NO_API ON` 도 강제하고, `BUILD_MOBILE_AUTOGRAD` 를 켜지
+않으면 `INTERN_DISABLE_AUTOGRAD ON` 입니다 — **§3 의 단계 1(TTA · FL 로컬 스텝)이 요구하는
+backward 도 기본값으로 없습니다.**
+
+> **정정 두 개.** 위 표에서 "`scripts/build_mobile.sh` 가 지금도 main 에 있음" 이라고 적었는데
+> **틀렸습니다. main 에서 404 입니다.** 삭제 커밋은 `91602a92548d` "Cleanup old caffe2 scripts
+> (#158475)" (2025-07-23) — v2.8.0 에는 있고 v2.9.0 에는 없습니다. `cmake/iOS.cmake` 도 main 에서
+> 사라졌습니다. 저는 검색 결과 제목이 "…at main" 인 것을 보고 확인했다고 여겼습니다. **낡은 검색
+> 색인을 저장소 확인으로 대신한 것입니다.**
+>
+> 다만 **CMake · codegen 기계는 온전하고 실제로 동작합니다** — `SELECTED_OP_LIST` ·
+> `TRACING_BASED` · `INTERN_BUILD_MOBILE` · `gen_selected_mobile_ops_header`. pypackpack 의
+> `Cargo.kt` 처럼 속이 빈 경우가 아니라 **손잡이만 떼어진 경우**입니다. 상류 지원이 0 이라는 것은
+> 정량적으로도 확인됩니다 — `.github/` 와 `.ci/` 전체에서 모바일 경로 참조 **0 건**이고,
+> `test/mobile/custom_build/build.sh:41,55` 와 `android/common.sh:66` 은 삭제된 스크립트를
+> 부르는 끊긴 호출입니다.
+
+**그리고 §6 의 판정 기준이 틀린 질문이었습니다.** "B 의 유일한 미지수는 크로스 컴파일이
+완료되는가" 라고 적었는데, 크로스 컴파일은 §5 의 표에서 이미 "된다" 로 분류돼 있던 칸입니다.
+스파이크는 미지수를 **해소한 것이 아니라 옮겼습니다** — 그리고 옮겨간 자리에서 B 가 성립하지
+않는다는 것이 드러났습니다.
+
+**결론: A(candle 위 `torch._C`)로 갑니다.** IMPORT_WALLS 4·5 차가 A 의 비용(실행되지 않는
+1070 모듈을 임포트 가능하게 유지)을 드러냈지만, **B 는 애초에 목표물을 만들지 못합니다.**
+비용 비교가 아니라 가능/불가능의 문제였습니다.
+
+미확인으로 남은 것: 링크·스트립 후 배포 크기, 기기 실행, `TRACING_BASED`/`model_tracer` 동작,
+`USE_BLAS=OFF` 의 성능 비용, 그리고 **iOS 전체**(`cmake/iOS.cmake` 가 없어 Android 결과를
+외삽할 수 없음).
 
 ### 선행 사례
 
@@ -943,7 +999,7 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 | 1 | 벤더링한 torch 파이썬 트리 + 빈 `_C` 스텁으로 `import transformers` 시도 | import-time 요구사항 전체 목록 |
 | 2 | 정적 스캔을 CI 에 넣기 (§6) | `torch.compile` · CUDA · 사설 API · 텐서 값 분기의 조기 경보 |
 | 3 | 사다리 1~2 단 — 가장 작은 모델을 `torch._C` 로 통과, 진짜 torch 와 골든 대조 | 수치 의미론 리스크의 실제 크기, 첫 op 우선순위 |
-| 4 | B 의 크로스 컴파일 스파이크 (**타임박스**) | A/B 결정 |
+| ~~4~~ | ~~B 의 크로스 컴파일 스파이크~~ | **완료 — A 로 결정** (§5). 빌드는 됐으나 모바일 경로가 `BUILD_PYTHON` 을 강제로 끄므로 B 는 `torch._C` 를 만들지 못함 |
 | 5 | 사다리 3~5 단 | 아키텍처별 한계 비용 |
 | 6 | 기기 (Android 먼저 — iOS 보다 제약이 적음) | |
 | 7 | GraalVM 네이티브 이미지 경로 | `PythonMultiplatform` 의 요구사항 |
@@ -989,7 +1045,7 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 
 - [Core ATen Operator Set](https://docs.pytorch.org/executorch/stable/ir-ops-set-definition.html)
 - [PyTorch's Tracing Based Selective Build](https://pytorch.org/blog/pytorchs-tracing-based-selective-build/)
-- [`pytorch/scripts/build_mobile.sh`](https://github.com/pytorch/pytorch/blob/main/scripts/build_mobile.sh)
+- [`pytorch/scripts/build_mobile.sh`](https://github.com/pytorch/pytorch/blob/v2.8.0/scripts/build_mobile.sh) — **main 에서 삭제됨** (커밋 `91602a92548d`). v2.8.0 링크
 - [`ljk53/upytorch`](https://github.com/ljk53/upytorch)
 - [huggingface/candle](https://github.com/huggingface/candle) · [tracel-ai/burn](https://github.com/tracel-ai/burn) · [LaurentMazare/tch-rs](https://github.com/LaurentMazare/tch-rs)
 - [torch-mlir architecture](https://github.com/llvm/torch-mlir/blob/main/docs/architecture.md)
