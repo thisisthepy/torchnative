@@ -1265,6 +1265,7 @@ name = "torch_c"
 version = "0.0.0"
 dependencies = [
  "candle-core",
+ "gemm",
  "pyo3",
 ]
 
