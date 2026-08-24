@@ -2433,6 +2433,26 @@ def _install_nn(module, dispatch) -> None:
     def silu(input):
         return dispatch("aten.silu.default", input)
 
+    # `torch/nn/functional.py:2054` is `gelu = _add_docstr(torch._C._nn.gelu,
+    # ...)` -- `F.gelu` *is* this binding, not a wrapper around it, so it is a
+    # `_nn` composite rather than a table entry for the same reason `linear`
+    # and `silu` are: nothing looks up `_C._nn.gelu` through `_Overloads`.
+    #
+    # `approximate` has to be keyword-only *at this Python signature*, not
+    # just in what gets forwarded to `dispatch`. The schema marks it
+    # keyword-only (`*` before it) and upstream enforces that at the parser
+    # (measured: `torch._C._nn.gelu(x, "tanh")` raises "takes 1 positional
+    # argument but 2 were given" on torch 2.13.0). `gelu_default` in aten.rs
+    # reproduces that rejection too, but only by checking the length of the
+    # positional tuple it is *given* -- and this composite always calls
+    # `dispatch` with exactly one positional (`input`) and `approximate` as a
+    # kwarg regardless of how its own caller passed it. Without the bare `*`
+    # below, `gelu(x, "tanh")` would bind fine at this level and silently
+    # reach the tanh branch where upstream raises -- caught by testing the
+    # positional form directly, not reasoned out in advance.
+    def gelu(input, *, approximate="none"):
+        return dispatch("aten.gelu.default", input, approximate=approximate)
+
     # Upstream's `scaled_dot_product_attention` is a *backend selection*, and
     # the selection was measured rather than assumed (docs/NN_SURFACE.md §5).
     # On CPU, 4-D float inputs with `dropout_p == 0` go to
@@ -2511,6 +2531,7 @@ def _install_nn(module, dispatch) -> None:
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
+        (gelu, "gelu"),
         (scaled_dot_product_attention, "scaled_dot_product_attention"),
     ):
         fn.__name__ = fn.__qualname__ = name
@@ -2519,7 +2540,7 @@ def _install_nn(module, dispatch) -> None:
 
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
-    module._shim_nn_implemented = ["linear", "scaled_dot_product_attention", "silu"]
+    module._shim_nn_implemented = ["gelu", "linear", "scaled_dot_product_attention", "silu"]
 
 
 def _install_composites(module, varfns, dispatch) -> None:

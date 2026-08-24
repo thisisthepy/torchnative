@@ -129,6 +129,11 @@
     "aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value, *, str reduce) -> Tensor"
   ],
 
+  "gather": [
+    "aten::gather.out(Tensor self, int dim, Tensor index, *, bool sparse_grad=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
+  ],
+
   "split": [
     "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]"
   ],
@@ -265,5 +270,9 @@
     "aten::where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor",
     "aten::where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor",
     "aten::where(Tensor condition) -> Tensor[]"
+  ],
+
+  "zero_": [
+    "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
   ]
 }

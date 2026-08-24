@@ -272,6 +272,9 @@
   "select": [
     "aten::select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)"
   ],
+  "gather": [
+    "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
+  ],
   "scatter": [
     "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
     "aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *, str reduce) -> Tensor",
@@ -327,5 +330,8 @@
   ],
   "normal_": [
     "aten::normal_(Tensor(a!) self, float mean=0., float std=1., *, Generator? generator=None) -> Tensor(a!)"
+  ],
+  "zero_": [
+    "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
   ]
 }

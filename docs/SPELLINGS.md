@@ -280,3 +280,115 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 `Tensor.softmax`와 별개로 여전히 스펠링이 없다 — 지난 회차가 메서드 폼만 고쳤고 이번 회차도
 지시 범위(14개 목록 + GPT2.md의 넷) 밖이라 손대지 않았다, 실측만 남긴다
 (`_VariableFunctions.softmax`가 여전히 "overload resolution has no table entry" 로 거부).
+
+---
+
+## 5. 세 번째 회차 — `gelu`/`gather`/`zero_`, 그리고 `nn.LayerNorm(...)`이 실제로 열리는지
+
+`docs/ARCH.md`가 이 셋의 커널을 넣고 나서(82 → 85개) 남긴 항목을 메우는 회차다. §0이 지목한 대로
+`zero_`의 스펠링이 없으면 `nn.LayerNorm`의 `reset_parameters`가 `init.zeros_(self.bias)`에서
+막힌다. 그 벽이 실제로 걷히는지가 이 회차의 진짜 판정이다.
+
+### 5.0 세 이름 중 하나는 표(table) 항목이 아니다 — 측정으로 갈랐다
+
+셋을 지시받은 대로 `overloads.json`/`methods.json`에 다 넣기 전에, 각각이 실제로 상류에서
+어느 표면으로 도달하는지부터 쟀다(`TorchDispatchMode` 로거, torch 2.13.0):
+
+    x.gather(dim, idx)        -> aten.gather.default   (Tensor 메서드로 존재)
+    torch.gather(x, dim, idx) -> aten.gather.default    (_VariableFunctions 로 존재)
+    x.zero_()                 -> aten.zero_.default     (Tensor 메서드로 존재)
+    torch.zero_(x)            -> aten.zero_.default     (_VariableFunctions 로도 존재 -- 벤더 .pyi 에 실제로 있다)
+    F.gelu(x, approximate=..) -> aten.gelu.default
+
+`gather`와 `zero_`은 파서 키와 디스패치 키가 일치하는 평범한 leaf라서 표 항목으로 충분하다.
+`gelu`는 다르다 — **`hasattr(torch.Tensor, "gelu")`가 `False`다.** `Tensor.gelu()`라는 메서드
+자체가 상류에 없다. `torch/nn/functional.py:2054`가 `gelu = _add_docstr(torch._C._nn.gelu, ...)`이므로
+`F.gelu`는 `_C._nn` 서브모듈의 이름이지 `TensorBase`도 `_VariableFunctions`도 아니다 — `linear`/
+`silu`가 표가 아니라 `bootstrap.py`의 `_install_nn`에 있는 것과 정확히 같은 이유이고 같은 자리다.
+그래서 `gelu`는 `overloads.json`/`methods.json`에 넣지 않았다 — 넣었다면 상류가 절대 보지 않는
+파서 키(`aten.gelu.default`를 `Tensor.gelu`나 `torch.gelu`로 노출하는 것 자체가 상류에 없는 이름을
+짓는 일)를 만드는 셈이었다.
+
+### 5.1 채운 것
+
+| 이름 | 파일 | 위치 |
+|---|---|---|
+| `gather` (메서드 `aten::gather`, 함수 `aten::gather`/`.out`) | `methods.json`/`overloads.json` | 평범한 표 항목. 메서드 쪽 벤더 `.pyi`(`__init__.pyi:4767`)에는 `out=`이 없어 `.out` 스키마를 안 넣었고, 함수 쪽 `.pyi`(`_VariableFunctions.pyi:13255`)에는 있어 `.out`을 먼저(관례대로) 넣었다 — 커널이 없어(`aten.gather.out`은 `_aten_implemented()`에 없다) `out=`을 주는 호출은 정확한 이름으로 거부된다(실측) |
+| `zero_` (메서드 `aten::zero_`, 함수 `aten::zero_`) | `methods.json`/`overloads.json` | 평범한 표 항목. `torch.ops.aten.zero_.overloads()`가 `['default']` 하나뿐이라 `.out` 걱정이 없다 |
+| `gelu` (`_C._nn.gelu`) | `bootstrap.py` `_install_nn` | `silu`/`linear`와 같은 자리의 Python 합성. `dispatch("aten.gelu.default", input, approximate=approximate)`로 넘긴다 |
+
+셋 다 `_C.so`를 재빌드해 `tools/golden/loader.py`로 직접 로드하고 상류 torch 2.13.0과 값을
+대조했다 — `gather`(메서드/함수 둘 다), `zero_`(메서드/함수 둘 다), `gelu`(`approximate='none'`/
+`'tanh'` 둘 다)가 **전부 비트까지 일치**했다(`torch.tensor(...).tolist()`를 나란히 찍어 비교).
+`gelu`의 두 근사식 값은 `docs/ARCH.md` §1이 실측한 상류 수치와도 그대로 일치한다:
+
+    none [-3,-1,-0.5,0,0.5,1,3] -> [-0.00405, -0.158655, -0.154269, 0.0, 0.345731, 0.841345, 2.995950]
+    tanh [-3,-1,-0.5,0,0.5,1,3] -> [-0.00364, -0.158808, -0.154286, 0.0, 0.345714, 0.841192, 2.996363]
+
+### 5.2 처음 쓴 `gelu` 합성은 틀렸다 — `approximate`가 위치 인자로도 통과했다
+
+첫 구현은 `def gelu(input, approximate="none")`이었다. `dispatch()`에는 항상 `approximate=`를
+키워드로 넘기니 `aten.rs`의 키워드 전용 검사(`args.len() > 1`이면 거부)를 통과할 것이라고
+**추론했는데, 틀렸다.** 그 검사는 *`dispatch`가 받는 튜플의 길이*만 보고, 이 합성은 자신의
+호출자가 `approximate`를 위치로 줬든 키워드로 줬든 항상 `dispatch(..., approximate=approximate)`
+한 개의 위치 인자로 재포장해서 넘긴다 — 그래서 **`F.gelu(x, "tanh")`(위치 인자)가 조용히
+통과했다.** 상류는 이걸 `TypeError`로 거부한다(측정, `torch._C._nn.gelu(x, "tanh")` ->
+`gelu() takes 1 positional argument but 2 were given`).
+
+`vendor/probe.py --mode strict --target torch`로 벤더 트리 전체를 이 빌드의 `_C` 위에 얹어
+`F.gelu(x, "tanh")`를 직접 불러보고서야 잡았다 — 추론이 아니라 실행해서 발견했다. 고친 것은
+`aten.rs`가 아니라 **이 합성 자신의 Python 시그니처**다: `def gelu(input, *, approximate="none")`.
+`*`가 없으면 `dispatch` 쪽 키워드 전용 검사가 아무리 정확해도 그 앞에서 이미 잘못된 값을
+받아들인 뒤이므로 소용이 없다. 고친 뒤 같은 호출이 상류와 같은 자리에서 거부되는 것을
+재확인했다:
+
+    torch.nn.functional.gelu(x, "tanh")  ->  TypeError: gelu() takes 1 positional argument but 2 were given
+    (상류와 셰임 양쪽 동일 메시지, 재빌드 후 재측정)
+
+### 5.3 `nn.LayerNorm(...)`이 이제 열린다 — `vendor/probe.py`로 끝까지 확인했다
+
+`docs/ARCH.md` §0/§4.3이 지목한 벽은 `reset_parameters`의 `init.zeros_(self.bias)` ->
+`TensorBase.zero_`였다. `zero_` 스펠링을 채운 뒤 `TORCH_USE_RTLD_GLOBAL=1`로 벤더 트리 전체를
+이 `_C` 위에서 `import torch`시키고(`vendor/probe.py --mode strict --target torch`, exit 0,
+`torch.__version__ == 2.13.0`까지 확인), 그 프로세스 안에서 직접 실행했다:
+
+    torch.nn.LayerNorm(8)                 -> 생성자 성공
+      .weight.tolist()  == [1.0]*8        (fill_.Scalar 경로, 그대로)
+      .bias.tolist()    == [0.0]*8        (zero_ 경로 -- 이번에 열림)
+    ln(torch.ones(2, 8))                  -> forward 성공, shape (2, 8)
+      결과 전부 0.0  (상수 입력의 LayerNorm은 분산이 0이라 정확히 0이 나오는 것이 맞다)
+
+**생성자와 순전파 둘 다 통과했다.** `docs/ARCH.md` §0이 예고한 두 겹(`_get_cudnn_enabled`는
+이미 해결, `zero_`가 남은 것) 뒤에 **셋째 겹은 없었다** — `zero_` 스펠링을 채우는 것만으로
+`nn.LayerNorm(...)`이 끝까지 갔다.
+
+주의할 것 하나: `repr(ln)`이나 `print(ln.weight)`(값이 아니라 텐서 객체 자체를 출력하는 경로)는
+여전히 `torch._C._functorch.is_functorch_wrapped_tensor`에서 막힌다 — §4.1이 이미 기록한,
+이 작업과 무관한 기존 벽이다(`_tensor_str.py`가 모든 텐서 repr에서 그 이름을 부른다). `.tolist()`로
+값만 읽으면 이 벽을 타지 않는다. `torch.randn`도 여전히 커널이 없어 거부된다(스펠링 문제가 아니라
+`aten.rs`에 `randn` 계열 자체가 없음, §2에서 이미 남긴 목록 그대로) — 그래서 위 forward 검증은
+`torch.ones`로 입력을 만들었다.
+
+### 5.4 11개 커널 없는 목록 재확인 — 새로 열린 것 없음
+
+`docs/ARCH.md`가 이번에 커널을 넣은 것은 `gelu`/`gather`/`zero_` 셋뿐이다. 남은 11개
+(`flatten repeat chunk narrow permute clamp tril triu flip index_select`)를 이번 빌드의
+`_aten_implemented()`에 대고 다시 확인했다 — **전부 여전히 커널이 없다**(`permute`는 다른
+에이전트가 지금 작업 중이라는 지시를 받아 건드리지 않았다). 커널이 없는 스펠링은 정확한 이름으로
+거부되는 것 말고 할 수 있는 일이 없으므로, 이 11개는 그대로 다음 회차로 넘긴다.
+
+### 5.5 숫자
+
+`verify_schemas.py`: **199/199 → 204/204** (+5 — `overloads.json` 90→93 [`gather`+`.out`,
+`zero_`], `methods.json` 109→111 [`gather`, `zero_`]; `gelu`는 `_install_nn` 합성이라 이 표에
+없다). 골든 하네스는 **1934/1934, ops covered=85 그대로**(무회귀 — 스펠링은 `_aten_implemented()`가
+답하는 커널 집합을 바꾸지 않는다). `--inject-fault value/shape/dtype` 전부 그대로 exit 1. 호스트
+스모크(`pytests/run.sh`, `test_shim.py` 65개 + `compare.py --self-test`) exit 0. 3 타깃
+(host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0.
+
+### 5.6 손대지 않은 것 / 이 회차 밖
+
+`aten.rs`, `tools/golden/cases.py`, `tools/golden/compare.py`, `rust/torch_c/pytests/test_shim.py`는
+이번 회차의 파일 범위 밖이라 한 줄도 고치지 않았다 — 커널 추가도 하지 않았다. `nn.LayerNorm`에
+대한 회귀 테스트를 `test_shim.py`에 박아 두는 것은 다음 회차의 작업 항목이다(§4가 남긴 것과 같은
+이유 — 이번에 손으로 확인한 것을 자동화하지 못했다).
