@@ -268,3 +268,58 @@ bionic 쪽이 나중에 고쳐지면 면제 항목이 남아돌게 되는데, �
    앱에는 그대로 못 넣는다.
 3. **APK 경로 검증** (§10 첫 항목). `PythonMultiplatform` 의 샘플 앱 배선이 참고 대상이다.
 4. **dtype 확대와 큰 텐서.** 지금 배터리는 f32·64×64 까지만 말한다.
+
+---
+
+## 10. Vulkan 은 실기 없이도 열린다 — 꺼져 있었을 뿐이다 (2026-08-25)
+
+§5 까지의 작업은 API 26 AVD (`pmp_api26`) 에서 했고, 거기서 `pm list features` 에 vulkan 항목이
+**하나도** 없었습니다. 그것을 근거로 "Vulkan 은 실기가 필요하다" 고 판단했는데 **틀렸습니다.**
+
+원인은 하드웨어가 아니라 설정입니다:
+
+```
+~/.android/avd/pmp_api26.avd/config.ini   hw.gpu.enabled = no
+~/.android/avd/pmp_api36.avd/config.ini   hw.gpu.enabled = no
+```
+
+**두 AVD 모두 GPU 를 꺼둔 상태였습니다.** 이미지에 없는 것이 아니라 켜지지 않았을 뿐입니다.
+
+### 실측 — API 36 을 `-gpu host` 로 띄운 결과
+
+```
+$ emulator -avd pmp_api36 -gpu host -no-audio -no-snapshot -port 5556
+
+feature:android.hardware.vulkan.compute            ← 컴퓨트 셰이더
+feature:android.hardware.vulkan.level=1
+feature:android.hardware.vulkan.version=4206592    = VK_MAKE_VERSION(1, 3, 0)
+feature:android.software.vulkan.deqp.level=132711169
+```
+
+게스트 확장에 `ANDROID_EMU_vulkan`, `ANDROID_EMU_deferred_vulkan_commands`,
+`ANDROID_EMU_vulkan_async_queue_submit`, 그리고 **`ANDROID_EMU_vulkan_shader_float16_int8`**
+이 있습니다 — 마지막 것은 fp16·int8 셰이더가 된다는 뜻이라 양자화 경로까지 시험 대상입니다.
+
+드라이버는 `ro.hardware.vulkan = ranchu` (에뮬레이터의 virtio-gpu) 로, **게스트 Vulkan 을 호스트로
+번역**합니다.
+
+### 그래서 무엇이 열리고 무엇이 안 열리는가
+
+| | 지금 가능 | 근거 |
+|---|---|---|
+| Vulkan 경로가 도는지 | **예** | 컴퓨트 · fp16 확장 존재 |
+| 값이 CPU 와 맞는지 | **예** | §4 의 비트 단위 대조 방식 그대로 |
+| ExecuTorch `vulkan` 델리게이트 배선 | **예** | |
+| **성능이 Adreno·Mali 를 대표하는가** | **아니오** | `ranchu` 가 호스트 GPU 로 번역한다 |
+
+Apple Silicon 호스트에서 `-gpu host` 는 결국 Metal 로 갑니다. **정확성과 통합은 여기서 끝낼 수
+있고, "GPU 가 디코딩에서 이기는가" 만 실기 질문으로 남습니다.**
+
+`docs/PERF.md` §7.3 이 Apple 에서 잰 것 — 디코딩 모양의 행렬×벡터는 n=4096 까지 GPU 가 진다 —
+은 그 실기 측정의 **가설**이지 답이 아닙니다. 모바일 GPU 는 CPU 대비 우위가 데스크톱과 다릅니다.
+
+### 주의
+
+`pmp_api36` 에도 `pmp`, `pmp-nativetest-arm64-v8a` 디렉터리가 있습니다 — **다른 프로젝트가
+같은 AVD 를 씁니다.** §1 의 규칙대로 `/data/local/tmp/bw_device` 밖으로 나가지 마십시오.
+API 26 쪽 작업을 내리지 않고 포트 5556 에 나란히 띄웠습니다.
