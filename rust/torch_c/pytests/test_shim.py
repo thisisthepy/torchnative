@@ -172,9 +172,11 @@ def test_overload_resolution_refuses_rather_than_guessing():
         raise AssertionError("full(2, 3) must not resolve")
 
     # An op with no table entry keeps the old refusal rather than guessing
-    # `.default`.
+    # `.default`. `flatten` has no kernel (docs/SPELLINGS.md) and so no table
+    # entry either -- `relu` used to be this example, until docs/SPELLINGS.md
+    # §6 gave it one.
     try:
-        _vf("relu")(1)
+        _vf("flatten")(1)
     except NotImplementedError as e:
         assert "no table entry" in str(e)
     else:

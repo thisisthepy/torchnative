@@ -143,6 +143,9 @@
   "addmm": [
     "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
   ],
+  "baddbmm": [
+    "aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
+  ],
   "t": [
     "aten::t(Tensor(a) self) -> Tensor(a)"
   ],
@@ -244,6 +247,9 @@
   ],
   "tanh": [
     "aten::tanh(Tensor self) -> Tensor"
+  ],
+  "relu": [
+    "aten::relu(Tensor self) -> Tensor"
   ],
 
   "masked_fill": [

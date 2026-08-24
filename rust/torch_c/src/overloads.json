@@ -78,7 +78,29 @@
     "`torch/_tensor.py:Tensor.split` is what looks at the argument type and",
     "routes a list/tuple to `torch._VF.split_with_sizes` instead, which is",
     "why that op gets its own `split_with_sizes` key rather than being folded",
-    "in here."
+    "in here.",
+    "",
+    "docs/SPELLINGS.md §6 notes on `any`/`div`/`mean`/`sum`, measured with a",
+    "`TorchDispatchMode` logger on torch 2.13.0 rather than reasoned about:",
+    "",
+    "  * `any` -- the `.out` group's internal order is not the same as the",
+    "    non-`.out` group's. `any(x, out=o)` (no `dim`) resolves to",
+    "    `any.all_out`, not `any.dims_out`, even though `dims_out`'s `dim`",
+    "    parameter is also optional and would otherwise shadow it -- `all_out`",
+    "    simply comes first in the declaration order the real arg parser",
+    "    tries. `any.dims_out`/`any.out` follow, keyed off `dim` being a",
+    "    list/tuple versus a plain `int`, mirroring the non-`.out` group below.",
+    "  * `sum` -- `aten::sum.out` (the no-`dim` `.out` overload) is listed in",
+    "    `torch.ops.aten.sum.overloads()` but **`torch.sum` never reaches",
+    "    it**: `torch.sum(x, out=o)` raises `TypeError` from the real arg",
+    "    parser before any dispatch happens, because the no-`dim` Python",
+    "    overload plainly does not accept `out=`. `sum.out` is left out of",
+    "    this table for that reason -- listing it would name a path upstream",
+    "    itself does not expose, the same complaint `layer_norm` above makes",
+    "    about a schema that resolves to a kernel this shim will never reach.",
+    "    `mean` does not have this gap -- `mean(x, out=o)` (no `dim`) resolves",
+    "    to `mean.dtype_out`, a real reachable overload -- so `mean` lists all",
+    "    four."
   ],
 
   "arange": [
@@ -226,6 +248,10 @@
     "aten::tanh(Tensor self) -> Tensor"
   ],
 
+  "relu": [
+    "aten::relu(Tensor self) -> Tensor"
+  ],
+
   "zeros": [
     "aten::zeros.out(SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::zeros(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
@@ -247,6 +273,50 @@
   "matmul": [
     "aten::matmul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::matmul(Tensor self, Tensor other) -> Tensor"
+  ],
+
+  "baddbmm": [
+    "aten::baddbmm.out(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::baddbmm.dtype_out(Tensor self, Tensor batch1, Tensor batch2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::baddbmm.dtype(Tensor self, Tensor batch1, Tensor batch2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1) -> Tensor",
+    "aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
+  ],
+
+  "div": [
+    "aten::div.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::div.out_mode(Tensor self, Tensor other, *, str? rounding_mode, Tensor(a!) out) -> Tensor(a!)",
+    "aten::div.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::div.Scalar_mode_out(Tensor self, Scalar other, *, str? rounding_mode, Tensor(a!) out) -> Tensor(a!)",
+    "aten::div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor",
+    "aten::div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor",
+    "aten::div.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::div.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "any": [
+    "aten::any.all_out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::any.dims_out(Tensor self, int[]? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::any.out(Tensor self, int dim, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::any(Tensor self) -> Tensor",
+    "aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
+    "aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
+  ],
+
+  "mean": [
+    "aten::mean.dtype_out(Tensor self, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::mean(Tensor self, *, ScalarType? dtype=None) -> Tensor",
+    "aten::mean.dim(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+
+  "sum": [
+    "aten::sum.IntList_out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::sum(Tensor self, *, ScalarType? dtype=None) -> Tensor",
+    "aten::sum.dim_IntList(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
+
+  "unsqueeze": [
+    "aten::unsqueeze(Tensor(a) self, int dim) -> Tensor(a)"
   ],
 
   "neg": [

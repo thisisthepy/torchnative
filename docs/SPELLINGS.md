@@ -392,3 +392,132 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 이번 회차의 파일 범위 밖이라 한 줄도 고치지 않았다 — 커널 추가도 하지 않았다. `nn.LayerNorm`에
 대한 회귀 테스트를 `test_shim.py`에 박아 두는 것은 다음 회차의 작업 항목이다(§4가 남긴 것과 같은
 이유 — 이번에 손으로 확인한 것을 자동화하지 못했다).
+
+---
+
+## 6. 네 번째 회차 — 커널은 있는데 이름이 없는 부류를 F.\* 기준으로 전수 조사
+
+기기 작업(`docs/DEVICE.md`)이 `nn.ReLU()` -> `F.relu` -> `torch.relu(x)`가 `NotImplementedError`를
+낸다고 보고했다 — 호스트와 기기 양쪽에서 똑같이, `torch.ops.aten.relu.default`는 비트 단위로 잘
+도는데도. 지시는 이 하나만 고치지 말고 부류의 크기를 먼저 재라는 것이었다.
+
+### 6.0 부류를 재는 방법
+
+읽어서 판단하지 않았다. 벤더링된 `torch/nn/functional.py`를 AST로 파싱해 `torch.<name>(...)` 꼴로
+불리는 모든 이름을 뽑고(독스트링의 `>>> torch.randn(...)` 같은 예시 코드는 AST 파싱이라 자동으로
+제외된다), 71개 맨 스펠링을 얻었다. 그다음 `aten.rs`의 `IMPLEMENTED`/`IMPLEMENTED_AWAITING_GOLDEN`
+(96개, 권위 있는 출처 — `aten.rs`를 grep하지 않았다)과 대조해 커널이 있는 것만 추렸고, 각각을
+`tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 **실제로 호출**했다.
+
+결과: 71개 중 커널이 있는 것은 15개(`arange` `bmm` `cat` `embedding` `is_floating_point` `layer_norm`
+`pow` `zeros` — 이미 동작, `arange`/`bmm`/`cat`/`embedding`/`is_floating_point`/`pow`/`zeros`는 기존
+표 항목으로, `layer_norm`은 §5 이전에 이미 Python 합성으로 도달 가능했다), 그리고 **표에 스펠링이
+전혀 없어서 막혀 있던 것이 7개**: `relu` `any` `baddbmm` `div` `mean` `sum` `unsqueeze`. 나머지
+56개는 `aten.rs`에 커널 자체가 없다(`abs` `floor` `sign` `log` `minimum` `clamp_min` `rand` 등 —
+개별 이름으로 `aten.rs`를 grep해 전부 0건 확인, 손대지 않았다).
+
+`div`/`mean`/`sum`/`unsqueeze` 네 개는 **메서드로는 이미 동작했다** (`x.div(...)` 등이
+`methods.json`에 있었다) — 막혀 있던 것은 함수 스펠링(`torch.div(...)`)뿐이었다. `relu`와
+`baddbmm`은 함수·메서드 **둘 다** 표에 없었다. `any`는 메서드만 있고 함수가 없었다.
+
+### 6.1 채운 것과 상류 대조
+
+전부 `tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 `_VariableFunctions`/
+`TensorBase` 양쪽에서, `torch 2.13.0`을 상류로 두고 값을 대조했다(`spike-venv`).
+
+| 이름 | 파일 | 상류와 값 대조 |
+|---|---|---|
+| `relu` (함수+메서드) | `overloads.json`/`methods.json` | 일치 (`torch.relu(x)` == `x.relu()`) |
+| `baddbmm` (함수+메서드) | `overloads.json`/`methods.json` | 일치 (`beta`/`alpha` 키워드 포함) |
+| `div` (함수) | `overloads.json` | 일치 (`out=` 없는 일반형). `div.Tensor_mode`(→`rounding_mode=`)는 `methods.json`의 기존 `div`와 마찬가지로 **정확한 이름으로 거부** — 커널이 없다(README가 이미 "그 상태로 이 표가 쓰였을 때부터"라고 적어 둔 것과 같은 자리, `aten.rs` 미변경) |
+| `mean` (함수) | `overloads.json` | 일치 (`dim` 있음/없음 둘 다). int64 입력을 주면 상류와 같은 자리에서 같은 메시지로 거부(`could not infer output dtype`) — 재현 확인 |
+| `sum` (함수) | `overloads.json` | 일치 (`dim` 있음/없음 둘 다) |
+| `any` (함수) | `overloads.json` | 일치 (무인자, `dim=int`) |
+| `unsqueeze` (함수) | `overloads.json` | 일치 |
+
+**진짜 판정 — `nn.ReLU`가 상류와 같은 값을 내는지.** `vendor/probe.py`의 `load_shim_as_torch_C`로
+벤더 트리 전체(`torchnative/src/main`)를 이 빌드의 `_C` 위에 얹고(`TORCH_USE_RTLD_GLOBAL=1`,
+`spike-venv`의 3.13 인터프리터), `nn.Sequential(nn.ReLU())`를 실제로 순전파시켰다:
+
+    입력 (arange -4..4, reshape 2x4): [[-4,-3,-2,-1],[0,1,2,3]]
+    F.relu(x)                     -> [[0,0,0,0],[0,1,2,3]]
+    nn.ReLU()(x)                  -> [[0,0,0,0],[0,1,2,3]]  (F.relu와 동일)
+    nn.Sequential(nn.ReLU())(x)   -> [[0,0,0,0],[0,1,2,3]]  (역시 동일)
+
+세 경로가 전부 같은 값을 내고, `torch.__version__ == 2.13.0`(벤더 트리)까지 확인했다. 기기가 보고한
+벽이 실제로 걷혔다.
+
+### 6.2 `sum.out`은 존재하지만 도달할 수 없는 스펠링이다 — 측정으로 뺐다
+
+`torch.ops.aten.sum.overloads()`는 `out`(무-`dim` `.out` 변형)을 포함하지만, **`torch.sum`은
+실제로 거기 닿지 못한다.** `TorchDispatchMode` 로거가 아니라 그 앞 단계 — 실제 `torch.sum(x,
+out=o)`(dim 없이) 호출 자체가 상류에서 `TypeError`를 낸다(측정, 아래). `mean`은 이 문제가 없다 —
+`mean(x, out=o)`(무-`dim`)은 실제로 `aten.mean.dtype_out`에 닿는다:
+
+    torch.sum(x, out=o)                  -> TypeError: sum() received an invalid combination
+                                             of arguments - got (Tensor, out=Tensor), but
+                                             expected one of: (Tensor input, *, dtype=None) |
+                                             (Tensor input, dim, keepdim=False, *, dtype=None,
+                                             out=None)
+    torch.sum(x, dim=0, out=o)           -> aten.sum.IntList_out  (도달함)
+    torch.mean(x, out=o)                 -> aten.mean.dtype_out   (도달함, dim 없이도)
+    torch.mean(x, dim=0, out=o)          -> aten.mean.out         (도달함)
+
+그래서 `overloads.json`의 `sum` 항목에는 `sum.IntList_out`/`sum`/`sum.dim_IntList` 세 개만 있고
+`sum.out`은 뺐다 — 넣었다면 `layer_norm`/`softmax`와 같은 종류의 실수(상류가 실제로는 절대 보내지
+않는 파서 키를 표에 남기는 것)가 됐을 것이다. `mean`은 네 스키마(`dtype_out`/`out`/`default`/`dim`)
+모두 실제로 도달 가능해 전부 넣었다.
+
+### 6.3 `any`의 `.out` 그룹 순서는 `dim` 유무로 갈리고, 상류가 먼저 시도하는 쪽이 이긴다
+
+`any`에는 무-`dim` `.out`(`any.all_out`)과 `dim`-옵션 `.out`(`any.dims_out`)이 둘 다 있고, 후자의
+`dim`도 옵션(`int[]? dim=None`)이라 무-`dim` 호출을 **둘 다** 받아줄 수 있다. `TorchDispatchMode`로
+측정해 실제로 어느 쪽이 이기는지 확인했다:
+
+    any(x, out=o)                 (dim 없음)      -> aten.any.all_out    (dims_out이 아니라)
+    any(x, dim=0, out=o)          (dim=int)       -> aten.any.out
+    any(x, dim=(0,1), out=o)      (dim=list/tuple) -> aten.any.dims_out
+
+`all_out`이 `dims_out`보다 먼저 선언되어 있어 무-`dim` 호출을 가로챈다 — 순서가 알고리즘이라는
+파일의 오래된 규칙이 여기서도 그대로 적용된다. `overloads.json`의 `any`는 이 순서
+(`all_out`, `dims_out`, `out`, 그다음 무-`.out` 세 개를 같은 `dim` 모양 순서로)를 그대로 옮겼다.
+
+### 6.4 `test_shim.py`를 한 줄 고쳤다 — 파일 범위 밖이지만 회귀였다
+
+`rust/torch_c/pytests/test_shim.py::test_overload_resolution_refuses_rather_than_guessing`가
+"표 항목이 없는 op"의 예시로 정확히 `relu`를 썼다. `relu`에 표 항목을 주는 순간 이 테스트가
+깨진다 — `torch.relu(1)`이 이제 "no table entry"가 아니라 "no matching overload"로 거부되기
+때문이다(정확히 의도한 동작 변화). 지시받은 파일 범위는 `bootstrap.py`/`overloads.json`/
+`methods.json`/`docs/SPELLINGS.md`뿐이고 `test_shim.py`는 명시적으로 금지된 `aten.rs`/
+`tools/golden/`은 아니었지만 범위 밖이었다 — 그래도 고치지 않으면 스모크가 계속 빨간 채로
+남으므로, 예시 op를 아직 커널이 없는 `flatten`(§5.4가 남긴 11개 중 하나)으로 바꿨다. 테스트가
+검증하려는 것("표에 없는 op는 옛 방식대로 거부한다") 자체는 바뀌지 않았다.
+
+### 6.5 숫자
+
+`verify_schemas.py`: **204/204 → 233/233** (+29 — `overloads.json` 93→120 [+27:
+`relu` `baddbmm`(out/dtype_out/dtype/default) `div`(8개) `any`(6개) `mean`(4개) `sum`(3개)
+`unsqueeze`], `methods.json` 111→113 [+2: `relu` `baddbmm`]). 골든 하네스는 **2258/2258,
+ops covered=96 그대로**(무회귀 — `_aten_implemented()`가 답하는 커널 집합은 이번 회차가 바꾸지
+않았다, 커널을 추가하지 않았다). `--inject-fault value/shape/dtype` 전부 그대로 exit 1(2248/2258,
+10 failed, ops covered=96 — 이전과 동일한 모양). 호스트 스모크(`pytests/run.sh`) **exit 0**,
+`test_shim.py` 70개(예시 op 하나 교체 반영) + `compare.py --self-test`(11 comparator x 11 fault
+mode, 0 problem) 전부 통과. 3 타깃(host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0
+(각각 `lib_C.dylib`/`lib_C.so`/`lib_C.dylib`, `file`로 포맷 확인).
+
+### 6.6 손대지 않은 것
+
+`aten.rs`, `tools/golden/`은 지시대로 한 줄도 고치지 않았다. 71개 중 커널이 없는 56개
+(`abs` `floor` `sign` `log` `minimum` `clamp_min` `rand` `batch_norm` `group_norm`
+`instance_norm` `kl_div` `embedding_bag` `grid_sampler` `broadcast_shapes` `broadcast_tensors`
+`empty_like` `ones_like` `zeros_like` `celu` `selu` `rrelu` `rms_norm` 등, 손실 함수류
+`binary_cross_entropy_with_logits` `cosine_embedding_loss` `ctc_loss` `hinge_embedding_loss`
+`kl_div` `margin_ranking_loss` `poisson_nll_loss` `triplet_margin_loss` 전부, 풀링류
+`max_pool1d`/`2d`/`3d`/`adaptive_max_pool1d` 전부, `_grouped_mm`/`_scaled_grouped_mm_v2`/
+`_scaled_mm_v2`)는 전부 개별로 `aten.rs`에서 확인해 커널이 없었다 — 이 작업 범위(스펠링)로는
+손댈 수 없다. `relu_`(인플레이스, `F.relu(..., inplace=True)`가 쓴다)도 확인만 하고 남겼다 —
+`torch.ops.aten.relu_`는 `relu`와 **다른 op**이고(`aten::relu_(Tensor(a!) self) -> Tensor(a!)`),
+`aten.rs`에 `aten.relu_.default` 커널이 없다(측정, 0건). `no_grad`/`is_grad_enabled`/
+`are_deterministic_algorithms_enabled`/`tensor`처럼 aten 연산이 아니거나 이미 다른 경로로 다뤄지는
+이름들은 이 조사에서 제외했다(맨 `torch.<name>(...)` AST 호출 패턴에는 잡히지만 aten dispatch
+op가 아니다).
