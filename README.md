@@ -163,7 +163,11 @@ generator stream — a seeded run reproduces exactly.
 - Mamba and Mixtral are the two incomplete architectures — in-place overloads and `_grouped_mm`.
 - CPU only. No GPU or NPU backend.
 - The Android run is an emulator, not a phone. No number here describes real silicon.
-- Android arithmetic is slow: matmul runs ~12x upstream there, against ~1x on Apple.
+- Apple is much faster than Android at `f32` matmul, and that is the hardware. Accelerate
+  reaches the AMX coprocessor; ARMv8.2-A NEON has no equivalent. Our Android throughput equals
+  our own throughput on the same core under the same backend, at 88% of that core's NEON peak —
+  so the kernels are not the gap. Upstream PyTorch has no Android wheel, so how we compare to it
+  *there* is unmeasured. See [`docs/PERF_ANDROID.md`](docs/PERF_ANDROID.md).
 
 Tracked with the measurements behind them in [`docs/DESIGN.md`](docs/DESIGN.md) §11.1.
 
