@@ -17,7 +17,7 @@
 use candle_core::{Device, Tensor};
 use pyo3::prelude::*;
 use pyo3::PyErr;
-use pyo3::types::{PyDict, PyModule, PyTuple};
+use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::device::PyDevice;
@@ -41,6 +41,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._to_copy.default",
     "aten._unsafe_view.default",
     "aten.add.Tensor",
+    "aten.addmm.default",
     "aten.alias.default",
     "aten.any.default",
     "aten.any.dim",
@@ -84,6 +85,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mm.default",
     "aten.mul.Tensor",
     "aten.multinomial.default",
+    "aten.native_layer_norm.default",
     "aten.ne.Scalar",
     "aten.ne.Tensor",
     "aten.neg.default",
@@ -103,11 +105,13 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sin.default",
     "aten.slice.Tensor",
     "aten.sort.default",
+    "aten.split.Tensor",
     "aten.squeeze.dim",
     "aten.sub.Tensor",
     "aten.sum.default",
     "aten.sum.dim_IntList",
     "aten.t.default",
+    "aten.tanh.default",
     "aten.topk.default",
     "aten.transpose.int",
     "aten.uniform_.default",
@@ -191,6 +195,7 @@ fn aten_dispatch_inner(
 ) -> PyResult<Py<PyAny>> {
     match op {
         "aten.add.Tensor" => add_tensor(py, args, kwargs),
+        "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
@@ -218,6 +223,9 @@ fn aten_dispatch_inner(
         "aten._scaled_dot_product_flash_attention_for_cpu.default" => {
             sdpa_flash_cpu(py, args, kwargs)
         }
+
+        // -- the four docs/GPT2.md measured a 2-layer GPT-2 stopping on -----
+        "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
 
         // -- the TensorBase surface (docs/TENSORBASE.md) -------------------
         "aten.add.Scalar" => arith_scalar(py, args, kwargs, "aten.add.Scalar", Arith::Add),
@@ -248,6 +256,7 @@ fn aten_dispatch_inner(
         "aten.reciprocal.default" => {
             unary_float(py, args, kwargs, "aten.reciprocal.default", Unary::Reciprocal)
         }
+        "aten.tanh.default" => unary_float(py, args, kwargs, "aten.tanh.default", Unary::Tanh),
         "aten.neg.default" => neg_default(py, args, kwargs),
         "aten.silu.default" => silu_default(py, args, kwargs),
 
@@ -283,6 +292,7 @@ fn aten_dispatch_inner(
         "aten.t.default" => t_default(py, args, kwargs),
         "aten.unsqueeze.default" => unsqueeze_default(py, args, kwargs),
         "aten.squeeze.dim" => squeeze_dim(py, args, kwargs),
+        "aten.split.Tensor" => split_tensor(py, args, kwargs),
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
         "aten.clone.default" => clone_default(py, args, kwargs),
         "aten.detach.default" => detach_default(py, args, kwargs),
@@ -544,6 +554,202 @@ fn bmm_default(
         .contiguous()
         .and_then(|l| rhs.tensor().contiguous().and_then(|r| l.matmul(&r)))
         .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `beta`/`alpha` for `addmm`, applied in the *result* dtype.
+///
+/// The truncation is upstream's, measured: `addmm` on `int64` operands with
+/// `alpha=1.9` gives the same answer as `alpha=1`, and with `alpha=-1.9` the
+/// same as `alpha=-1`. torch converts the `Scalar` to `scalar_t` before it
+/// multiplies, so a fractional factor on an integral matmul is silently
+/// truncated toward zero -- including `beta=0.5`, which rounds to `0` and
+/// drops `self` entirely.
+fn addmm_scale(
+    op: &str,
+    tensor: &Tensor,
+    factor: Scalar,
+    storage: candle_core::DType,
+) -> PyResult<Tensor> {
+    if storage.is_int() {
+        let k = factor.as_i64();
+        if k == 1 {
+            return Ok(tensor.clone());
+        }
+        let scale = Tensor::full(k, (), tensor.device())
+            .and_then(|t| t.to_dtype(storage))
+            .map_err(|e| candle_err(op, e))?;
+        tensor.broadcast_mul(&scale).map_err(|e| candle_err(op, e))
+    } else {
+        let k = factor.as_f64();
+        if k == 1.0 {
+            return Ok(tensor.clone());
+        }
+        tensor.affine(k, 0.0).map_err(|e| candle_err(op, e))
+    }
+}
+
+/// `aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
+///     Scalar alpha=1) -> Tensor`
+///
+/// `beta * self + alpha * (mat1 @ mat2)`, and the reason it exists as its own
+/// op rather than as `mm` + `add` is docs/NN_SURFACE.md §5: `at::native::linear`
+/// emits `addmm` for every `bias=True` branch, so a shim without it makes
+/// `nn.Linear` take a path upstream would not take. `bootstrap.py` already
+/// reads `_aten_all_implemented()` to decide, so landing this kernel is what
+/// retires that patch -- nothing in the Python layer has to change.
+///
+/// Everything below is measured against torch 2.13.0, and three of the four
+/// surprises would have been got wrong by inference:
+///
+///   * **`beta == 0` and `alpha == 0` are quick returns, not multiplications.**
+///     `addmm(full(nan), m, n, beta=0)` gives a clean product, and
+///     `addmm(b, m_with_inf, n, alpha=0)` gives a clean `b` -- so a literal
+///     `0.0 * nan` would produce NaN where torch produces a number. Both
+///     branches are therefore skipped, not scaled.
+///   * **`self` is validated even when `beta == 0`.** A wrongly-shaped `self`
+///     raises with `beta=0, alpha=0`, where nothing reads it. The expand check
+///     runs unconditionally here for that reason.
+///   * **no promotion, and the two checks are asymmetric.** `mat1` is compared
+///     to `mat2` first ("mat1 and mat2 must have the same dtype"), then `self`
+///     to `mat2` ("self and mat2 must have the same dtype") -- `mat2` is the
+///     reference in both messages.
+///   * `bool` and the wide unsigned dtypes have no `addmm_impl_cpu_` upstream.
+///
+/// The dtype gap this inherits is `mm`'s, not a new one: candle's `matmul` has
+/// no integral kernel, so `int64`/`int32`/`int16`/`uint8`/`bfloat16` refuse
+/// here exactly where `aten.mm.default` already refuses (docs/TORCH_C.md §2),
+/// *except* when `alpha == 0` -- then no matmul happens and the answer comes
+/// out. That asymmetry is deliberate: it is the quick return above, and
+/// refusing it would be inventing a restriction torch does not have.
+fn addmm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.addmm.default";
+
+    let bias = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let mat1 = tensor_arg(OP, args, kwargs, 1, "mat1")?;
+    let mat2 = tensor_arg(OP, args, kwargs, 2, "mat2")?;
+
+    if mat1.tensor().rank() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mat1 must be a matrix, got {}-D tensor",
+            mat1.tensor().rank()
+        )));
+    }
+    if mat2.tensor().rank() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mat2 must be a matrix, got {}-D tensor",
+            mat2.tensor().rank()
+        )));
+    }
+    if mat1.tag() != mat2.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mat1 and mat2 must have the same dtype, but got {} and {}",
+            scalar_type_name(mat1.tag()),
+            scalar_type_name(mat2.tag())
+        )));
+    }
+    if bias.tag() != mat2.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "self and mat2 must have the same dtype, but got {} and {}",
+            scalar_type_name(bias.tag()),
+            scalar_type_name(mat2.tag())
+        )));
+    }
+
+    let tag = mat2.tag();
+    if matches!(
+        tag,
+        TorchDType::Bool | TorchDType::UInt16 | TorchDType::UInt32 | TorchDType::UInt64
+    ) {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"addmm_impl_cpu_\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let a = mat1.tensor().dims().to_vec();
+    let b = mat2.tensor().dims().to_vec();
+    if a[1] != b[0] {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mat1 and mat2 shapes cannot be multiplied ({}x{} and {}x{})",
+            a[0], a[1], b[0], b[1]
+        )));
+    }
+    let target = vec![a[0], b[1]];
+
+    // `self` expanded to the product's shape, with torch's own two messages
+    // for the two ways that fails. Done here rather than left to candle so the
+    // caller reads the same sentence upstream would have given.
+    let self_dims = bias.tensor().dims().to_vec();
+    if self_dims.len() > target.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expand(torch.{}Tensor{{{:?}}}, size={:?}): the number of sizes provided ({}) \
+             must be greater or equal to the number of dimensions in the tensor ({})",
+            scalar_type_name(tag),
+            self_dims,
+            target,
+            target.len(),
+            self_dims.len()
+        )));
+    }
+    let offset = target.len() - self_dims.len();
+    for (i, &extent) in self_dims.iter().enumerate() {
+        let wanted = target[i + offset];
+        if extent != wanted && extent != 1 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "The expanded size of the tensor ({wanted}) must match the existing size \
+                 ({extent}) at non-singleton dimension {}.  Target sizes: {:?}.  \
+                 Tensor sizes: {:?}",
+                i + offset,
+                target,
+                self_dims
+            )));
+        }
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let beta = scalar_arg(OP, args, kwargs, 3, "beta")?.unwrap_or(Scalar::Int(1));
+    let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?.unwrap_or(Scalar::Int(1));
+    // Zero is decided in the *result* dtype, which is why `beta=0.5` on an
+    // integral addmm counts as zero: it truncates to 0 before it multiplies.
+    let (beta_zero, alpha_zero) = if storage.is_int() {
+        (beta.as_i64() == 0, alpha.as_i64() == 0)
+    } else {
+        (beta.as_f64() == 0.0, alpha.as_f64() == 0.0)
+    };
+
+    let mut acc: Option<Tensor> = None;
+    if !alpha_zero {
+        let product = mat1
+            .tensor()
+            .contiguous()
+            .and_then(|l| mat2.tensor().contiguous().and_then(|r| l.matmul(&r)))
+            .map_err(|e| candle_err(OP, e))?;
+        acc = Some(addmm_scale(OP, &product, alpha, storage)?);
+    }
+    if !beta_zero {
+        let expanded = bias
+            .tensor()
+            .broadcast_as(target.as_slice())
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let scaled = addmm_scale(OP, &expanded, beta, storage)?;
+        acc = Some(match acc {
+            Some(product) => product.add(&scaled).map_err(|e| candle_err(OP, e))?,
+            None => scaled,
+        });
+    }
+    let out = match acc {
+        Some(tensor) => tensor,
+        // Both factors zero: torch still answers with a correctly shaped,
+        // correctly typed tensor of zeros rather than raising.
+        None => Tensor::zeros(target.as_slice(), storage, mat1.tensor().device())
+            .map_err(|e| candle_err(OP, e))?,
+    };
     finish(py, out, tag)
 }
 
@@ -1805,12 +2011,19 @@ enum Unary {
     Cos,
     Sin,
     Reciprocal,
+    Tanh,
 }
 
-/// `cos`, `sin`, `reciprocal` -- torch's unary float promotion, the same rule
-/// `rsqrt` above already implements: a floating input keeps its own dtype
-/// (`float16` in, `float16` out, *not* widened), and an integral or boolean
-/// input becomes the default float.
+/// `cos`, `sin`, `reciprocal`, `tanh` -- torch's unary float promotion, the
+/// same rule `rsqrt` above already implements: a floating input keeps its own
+/// dtype (`float16` in, `float16` out, *not* widened), and an integral or
+/// boolean input becomes the default float.
+///
+/// `tanh` belongs here rather than beside `silu` even though both are
+/// activations, and the difference is measured, not stylistic: `silu` has no
+/// integral CPU kernel upstream and raises, while `tanh(int64 tensor)` returns
+/// `float32` -- so `tanh` follows the promoting rule and `silu` does not.
+/// (`tanh(bool)` promotes too: `[True, False]` gives `[0.7615942, 0.0]`.)
 fn unary_float(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -1832,6 +2045,7 @@ fn unary_float(
             Unary::Cos => t.cos(),
             Unary::Sin => t.sin(),
             Unary::Reciprocal => t.recip(),
+            Unary::Tanh => t.tanh(),
         })
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
@@ -3695,6 +3909,312 @@ fn squeeze_dim(
     finish(py, out, input.tag())
 }
 
+/// `aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0)
+///     -> Tensor(a)[]`
+///
+/// The only op in this file that answers with a **list**, which is a fact about
+/// the call and not a detail: GPT-2's attention is `c_attn(x).split(n, dim=2)`,
+/// so the three-way unpack on the Python side is the op's whole purpose.
+/// `promote` at the dispatcher's exit does not look inside a list, so each
+/// chunk is promoted here -- the same reason `max.dim` promotes its own pair.
+///
+/// Measured against torch 2.13.0, including the parts that read like edge cases
+/// and are not:
+///
+///   * the **last chunk is short**, not padded: `split(arange(10), 3)` is four
+///     chunks sized 3, 3, 3, 1.
+///   * a `split_size` larger than the dimension gives **one** chunk, the whole
+///     tensor -- not an error.
+///   * `split_size == 0` is an error *unless* the dimension is empty, and the
+///     two refusals have different wording ("split_size can only be 0 if
+///     dimension size is 0, but got dimension size of 10" vs "split expects
+///     split_size be non-negative, but got split_size=-1").
+///   * an **empty dimension** gives one empty chunk for any `split_size`,
+///     including 0.
+///   * a 0-d tensor raises rather than answering with itself.
+///
+/// **Not reproduced: aliasing.** Upstream's chunks are views -- writing to
+/// `split(x, 3)[0][0]` changes `x`. candle's `narrow` gives a view too, but
+/// whether a write through this shim's `TensorBase` reaches the source is the
+/// same unanswered question `aten.slice.Tensor` already has, and this op does
+/// not settle it.
+fn split_tensor(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.split.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "split expects at least a 1-dimensional tensor",
+        ));
+    }
+    let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(OP, "split_size"))?;
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
+    let extent = input.tensor().dims()[dim];
+
+    if split_size < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "split expects split_size be non-negative, but got split_size={split_size}"
+        )));
+    }
+    let split_size = split_size as usize;
+    if split_size == 0 && extent != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "split_size can only be 0 if dimension size is 0, but got dimension size of {extent}"
+        )));
+    }
+
+    let mut chunks: Vec<Py<PyAny>> = Vec::new();
+    if extent == 0 {
+        // One empty chunk, whatever the split size -- measured for both
+        // `split_size == 0` and `split_size == 3`.
+        chunks.push(crate::tensor::promote(
+            py,
+            finish(py, input.tensor().clone(), input.tag())?,
+        )?);
+    } else {
+        let mut start = 0usize;
+        while start < extent {
+            let length = split_size.min(extent - start);
+            let chunk = input
+                .tensor()
+                .narrow(dim, start, length)
+                .map_err(|e| candle_err(OP, e))?;
+            chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
+            start += length;
+        }
+    }
+    Ok(PyList::new(py, chunks)?.into_any().unbind())
+}
+
+/// `aten::native_layer_norm(Tensor input, SymInt[] normalized_shape,
+///     Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)`
+///
+/// GPT-2's normalisation, and structurally not Llama's: RMSNorm is
+/// `mean.dim` + `rsqrt` + `mul` through the ordinary dispatcher, while
+/// `LayerNorm` is **one fused op that returns three tensors** -- the output
+/// plus the `mean` and `rstd` the backward pass would need. There is no
+/// autograd here, but the two extra results are part of the schema, so they are
+/// computed and returned rather than filled with zeros.
+///
+/// Measured against torch 2.13.0. The parts that inference gets wrong:
+///
+///   * **`mean`/`rstd` are not flat.** They keep the input's rank with the
+///     normalised dimensions replaced by 1: `(2,3,4)` with
+///     `normalized_shape=[4]` gives `(2,3,1)`, and with `[3,4]` gives
+///     `(2,1,1)`.
+///   * **the variance is biased** (divided by N, not N-1), and `eps` is added
+///     to it *before* the reciprocal square root, not to the standard
+///     deviation. A constant row therefore gives `rstd = 1/sqrt(eps)`
+///     (`316.2278` at `eps=1e-5`), which is what pins the order.
+///   * **`mean`/`rstd` follow the *parameter* dtype, not the input's.** A
+///     `float16` input with `float16` (or absent) parameters gives `float16`
+///     statistics; the same input with `float32` parameters gives `float32`
+///     ones while the output stays `float16`. That is upstream's mixed-dtype
+///     autocast path, and it is a *supported* combination, not an error.
+///   * a **negative `eps` is not refused** -- it gives NaN, and this follows.
+///
+/// Refusals copied rather than invented: an integral or boolean input raises
+/// `NotImplementedError` naming `LayerNormKernelImpl`; parameters that are
+/// neither the input dtype nor the `float32` autocast partner raise
+/// `mixed dtype (CPU): ...`, in two different wordings depending on whether the
+/// input was `float64`.
+///
+/// **Not implemented: a zero-extent normalized dimension.** `normalized_shape=[0]`
+/// makes upstream answer `mean=0, rstd=nan` -- a mean over no elements that is
+/// zero on one side of the pair and NaN on the other. Reproducing an internal
+/// inconsistency from one observation is guessing, so it is refused by name.
+fn native_layer_norm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.native_layer_norm.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let normalized = shape_arg(OP, args, kwargs, 1, "normalized_shape")?;
+    let weight = optional_tensor_arg(OP, args, kwargs, 2, "weight")?;
+    let bias = optional_tensor_arg(OP, args, kwargs, 3, "bias")?;
+    let eps = scalar_arg(OP, args, kwargs, 4, "eps")?
+        .map(|s| s.as_f64())
+        .ok_or_else(|| missing(OP, "eps"))?;
+
+    if normalized.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Expected normalized_shape to be at least 1-dimensional, i.e., containing at \
+             least one element, but got normalized_shape = []",
+        ));
+    }
+
+    let dims = input.tensor().dims().to_vec();
+    let k = normalized.len();
+    let suffix_matches = dims.len() >= k
+        && dims[dims.len() - k..]
+            .iter()
+            .zip(normalized.iter())
+            .all(|(&extent, &wanted)| wanted >= 0 && extent == wanted as usize);
+    if !suffix_matches {
+        let star: String = normalized.iter().map(|v| format!(", {v}")).collect();
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given normalized_shape={normalized:?}, expected input with shape [*{star}], \
+             but got input of size{dims:?}"
+        )));
+    }
+    let ns: Vec<usize> = normalized.iter().map(|&v| v as usize).collect();
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"LayerNormKernelImpl\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    for (label, param) in [("weight", &weight), ("bias", &bias)] {
+        if let Some(param) = param {
+            if param.tensor().dims() != ns.as_slice() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Expected {label} to be of same shape as normalized_shape, but got \
+                     {label} of shape {:?} and normalized_shape = {ns:?}",
+                    param.tensor().dims()
+                )));
+            }
+        }
+    }
+
+    // Upstream's rule, measured: the parameters agree with each other, and
+    // they are either the input dtype or `float32` standing in front of a
+    // reduced-precision input.
+    let mixed_dtype = || {
+        pyo3::exceptions::PyRuntimeError::new_err(if tag == TorchDType::Float64 {
+            "mixed dtype (CPU): all inputs must share same datatype."
+        } else {
+            "mixed dtype (CPU): expect parameter to have scalar type of Float"
+        })
+    };
+    let param_tag = match (&weight, &bias) {
+        (Some(w), Some(b)) if w.tag() != b.tag() => return Err(mixed_dtype()),
+        (Some(w), _) => Some(w.tag()),
+        (None, Some(b)) => Some(b.tag()),
+        (None, None) => None,
+    };
+    let mixed = match param_tag {
+        None => false,
+        Some(param) if param == tag => false,
+        Some(TorchDType::Float32)
+            if matches!(tag, TorchDType::Float16 | TorchDType::BFloat16) =>
+        {
+            true
+        }
+        Some(_) => return Err(mixed_dtype()),
+    };
+
+    let rows: usize = dims[..dims.len() - k].iter().product();
+    let cols: usize = ns.iter().product();
+    if cols == 0 {
+        return Err(not_implemented(format!(
+            "{OP}: a zero-extent normalized_shape ({ns:?}) is not implemented in torch._C \
+             shim -- upstream answers mean=0 with rstd=nan there, and that pair was not \
+             measured well enough to reproduce"
+        )));
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    // `opmath_type`: the reduced dtypes accumulate in `f32` and narrow once.
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let stat_tag = if mixed { TorchDType::Float32 } else { tag };
+    let stat_storage = PyDtype::new(stat_tag).storage(OP)?;
+    let stat_dims: Vec<usize> = dims[..dims.len() - k]
+        .iter()
+        .copied()
+        .chain(std::iter::repeat(1).take(k))
+        .collect();
+    let device = input.tensor().device().clone();
+
+    // No rows to reduce over: every result is empty, and candle's reductions
+    // have nothing to say about a zero-length axis.
+    if rows == 0 {
+        let empty = |shape: &[usize], dtype| {
+            Tensor::zeros(shape, dtype, &device).map_err(|e| candle_err(OP, e))
+        };
+        let triple = [
+            crate::tensor::promote(py, finish(py, empty(dims.as_slice(), storage)?, tag)?)?,
+            crate::tensor::promote(
+                py,
+                finish(py, empty(stat_dims.as_slice(), stat_storage)?, stat_tag)?,
+            )?,
+            crate::tensor::promote(
+                py,
+                finish(py, empty(stat_dims.as_slice(), stat_storage)?, stat_tag)?,
+            )?,
+        ];
+        return Ok(PyTuple::new(py, triple)?.into_any().unbind());
+    }
+
+    let flat = input
+        .tensor()
+        .contiguous()
+        .and_then(|t| t.to_dtype(acc))
+        .and_then(|t| t.reshape((rows, cols)))
+        .map_err(|e| candle_err(OP, e))?;
+    let mean = flat.mean_keepdim(1).map_err(|e| candle_err(OP, e))?;
+    let centred = flat.broadcast_sub(&mean).map_err(|e| candle_err(OP, e))?;
+    let rstd = centred
+        .sqr()
+        .and_then(|t| t.mean_keepdim(1))
+        // `var + eps` first, *then* rsqrt -- see the doc comment.
+        .and_then(|t| t.affine(1.0, eps))
+        .and_then(|t| t.sqrt())
+        .and_then(|t| t.recip())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let mut out = centred.broadcast_mul(&rstd).map_err(|e| candle_err(OP, e))?;
+    if let Some(weight) = &weight {
+        let row = weight
+            .tensor()
+            .contiguous()
+            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.reshape((1, cols)))
+            .map_err(|e| candle_err(OP, e))?;
+        out = out.broadcast_mul(&row).map_err(|e| candle_err(OP, e))?;
+    }
+    if let Some(bias) = &bias {
+        let row = bias
+            .tensor()
+            .contiguous()
+            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.reshape((1, cols)))
+            .map_err(|e| candle_err(OP, e))?;
+        out = out.broadcast_add(&row).map_err(|e| candle_err(OP, e))?;
+    }
+
+    let out = out
+        .to_dtype(storage)
+        .and_then(|t| t.reshape(dims.as_slice()))
+        .map_err(|e| candle_err(OP, e))?;
+    let reshape_stat = |t: Tensor| {
+        t.to_dtype(stat_storage)
+            .and_then(|t| t.reshape(stat_dims.as_slice()))
+            .map_err(|e| candle_err(OP, e))
+    };
+    let mean = reshape_stat(mean)?;
+    let rstd = reshape_stat(rstd)?;
+
+    // Promoted element by element: `promote` at the dispatcher's exit does not
+    // look inside a tuple, the same reason `max.dim` promotes its own pair.
+    let triple = [
+        crate::tensor::promote(py, finish(py, out, tag)?)?,
+        crate::tensor::promote(py, finish(py, mean, stat_tag)?)?,
+        crate::tensor::promote(py, finish(py, rstd, stat_tag)?)?,
+    ];
+    Ok(PyTuple::new(py, triple)?.into_any().unbind())
+}
+
 /// `aten::_softmax(Tensor self, int dim, bool half_to_float) -> Tensor`
 ///
 /// Two refusals are reproduced rather than papered over, both measured:
@@ -4399,6 +4919,27 @@ fn tensor_arg(
             value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
         ))
     })
+}
+
+/// `tensor_arg` for a `Tensor?` slot. `None` and an absent argument are the
+/// same answer -- `native_layer_norm(x, [4], None, None, eps)` is how a
+/// `nn.LayerNorm(elementwise_affine=False)` arrives.
+fn optional_tensor_arg(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<Option<PyTensorBase>> {
+    match optional(args, kwargs, index, name)? {
+        Some(value) if !value.is_none() => Ok(Some(value.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{op}: argument '{name}' must be a torch._C.TensorBase or None, got {}",
+                value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?)),
+        _ => Ok(None),
+    }
 }
 
 fn device_arg(
