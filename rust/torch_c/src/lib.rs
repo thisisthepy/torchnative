@@ -227,8 +227,27 @@ fn _tensor_new_from_data(
         crate::dtype::TorchDType::Int64
     };
     let tag = dtype.map(|d| d.tag()).unwrap_or(inferred);
+    let label = device.unwrap_or_else(PyDevice::cpu);
+    // `torch.tensor([1., 2.], device="meta")` keeps the shape and dtype the
+    // data implies and throws the data away, which is what upstream does
+    // (measured: `tensor(..., device='meta', size=(2,))`). The walk above still
+    // runs -- a ragged nested sequence is a `ValueError` on meta too -- because
+    // the shape *is* the answer here, and a shape that had not been validated
+    // would be worth nothing.
+    //
+    // This is also on the `with torch.device("meta")` path and not only the
+    // explicit one: `torch.get_default_device()` inside a device context is
+    // implemented upstream as `torch.tensor([]).device`
+    // (`torch/__init__.py:1222`), so the context manager cannot report itself
+    // without this branch.
+    if label.is_meta() {
+        return crate::tensor::promote(
+            py,
+            PyTensorBase::meta(shape, tag).into_pyobject(py)?.into_any().unbind(),
+        );
+    }
     let storage = PyDtype::new(tag).storage(OP)?;
-    let device = device.unwrap_or_else(PyDevice::cpu).resolve()?;
+    let device = label.resolve()?;
 
     let tensor = if tag == crate::dtype::TorchDType::Bool {
         let bytes: Vec<u8> = leaves

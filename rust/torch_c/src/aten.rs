@@ -198,12 +198,50 @@ pub fn aten_dispatch(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    check_devices_agree(op, args, kwargs)?;
+    // One scan, two answers: that the tensor arguments agree about their
+    // device, and *which* device that is. Making meta a second pass would have
+    // paid for a scan twice at the hottest line in the crate; merged, meta
+    // costs the dispatcher a discriminant test on a value the gate already had
+    // in hand.
+    let out = match check_devices_agree(op, args, kwargs)? {
+        Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
+        _ => aten_dispatch_inner(py, op, args, kwargs)?,
+    };
     // One exit as well as one entrance: every tensor leaving the dispatcher
     // wears the registered Python tensor class (`tensor::promote`). Doing it
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
-    crate::tensor::promote(py, aten_dispatch_inner(py, op, args, kwargs)?)
+    crate::tensor::promote(py, out)
+}
+
+/// Where a dispatched tensor argument lives, comparable without allocating.
+///
+/// Not `PyDevice`: a label costs a `String` per argument and that was measured
+/// at +78 ns per dispatch (docs/DEVICE_ABS.md §6). Not `candle_core::Device`
+/// either, because **a meta tensor has no candle handle** -- that is the whole
+/// content of `Repr::Meta`. So the gate compares this, which is a discriminant
+/// test in both arms, and builds a label only on the path that is about to
+/// raise.
+#[derive(Clone)]
+enum Where {
+    Dense(Device),
+    Meta,
+}
+
+impl Where {
+    fn of(tensor: &PyTensorBase) -> Self {
+        match tensor.repr() {
+            crate::tensor::Repr::Dense(inner) => Where::Dense(inner.device().clone()),
+            crate::tensor::Repr::Meta { .. } => Where::Meta,
+        }
+    }
+
+    fn label(&self) -> PyDevice {
+        match self {
+            Where::Dense(device) => PyDevice::from_candle(device),
+            Where::Meta => PyDevice::meta(),
+        }
+    }
 }
 
 /// Refuse an op whose tensor arguments are not all on one device.
@@ -222,11 +260,13 @@ pub fn aten_dispatch(
 /// The message is upstream's most common one, verbatim, so that code matching
 /// on it keeps working.
 ///
-/// **This cannot fire today and that is recorded, not hidden.** `resolve()`
-/// refuses every non-CPU label, so every tensor in this build is on the CPU and
-/// the loop always finds one device. What the tests can reach is the positive
-/// half -- that agreeing tensors still dispatch, including through the
-/// `Tensor[]` argument a top-level-only scan would miss.
+/// **The rejecting half of this gate is now reachable, and `meta` is what
+/// reached it.** Until there was a second device it could not fire at all --
+/// `resolve()` refuses every non-CPU label, so every tensor was on the CPU and
+/// the loop always found one device. That was recorded as an untested branch in
+/// docs/DEVICE_ABS.md §10. `meta` needs no backend, so `cpu + meta` is an input
+/// this build can actually construct, and docs/META.md §5 is the measurement
+/// that it raises.
 ///
 /// **The comparison is on candle's handles, not on reconstructed labels, and
 /// that is a measured decision.** Building a `PyDevice` per tensor argument
@@ -236,63 +276,315 @@ pub fn aten_dispatch(
 /// (392 -> 479 ns) -- +22% on the cheapest op this door has. Comparing `Device`
 /// directly is an enum discriminant test; a label is built only on the failing
 /// path, where an allocation is free next to raising. docs/DEVICE_ABS.md §6 has
-/// the numbers from both versions.
+/// the numbers from both versions. `Where` keeps that property while making
+/// room for a tensor with no handle at all.
+///
+/// Returns the device the arguments agreed on, or `None` when there were no
+/// tensor arguments at all (every factory call). The dispatcher needs that
+/// answer anyway to route meta, so returning it here is one scan instead of two.
 fn check_devices_agree(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<()> {
-    let mut first: Option<Device> = None;
-
-    // Returns whether the value *was* a tensor, so the caller can skip the
-    // sequence casts for the overwhelmingly common case.
-    let mut visit = |value: &Bound<'_, PyAny>| -> PyResult<bool> {
-        let Ok(tensor) = value.cast::<PyTensorBase>() else {
-            return Ok(false);
-        };
-        let borrowed = tensor.borrow();
-        let device = borrowed.tensor().device();
-        match &first {
-            None => first = Some(device.clone()),
-            Some(seen) if seen.same_device(device) => {}
-            Some(seen) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Expected all tensors to be on the same device, but found at least two \
-                     devices, {} and {}! ({op} in torch._C shim)",
-                    PyDevice::from_candle(seen).__str__(),
-                    PyDevice::from_candle(device).__str__(),
-                )));
-            }
-        }
-        Ok(true)
-    };
+) -> PyResult<Option<Where>> {
+    let mut first: Option<Where> = None;
 
     for value in args.iter() {
-        // Tensor first, sequence second, and the order is the measurement:
-        // almost every argument that is anything is a tensor, so trying the
-        // list and tuple casts first paid for two failed type checks on the
-        // hot path. `cat`/`stack` take `Tensor[]`, so the sequence branch
-        // cannot be dropped -- it is exactly the ops most likely to mix
-        // devices that hide their tensors one level down.
-        if visit(&value)? {
-            continue;
-        }
-        if let Ok(sequence) = value.cast::<PyList>() {
-            for item in sequence.iter() {
-                visit(&item)?;
-            }
-        } else if let Ok(sequence) = value.cast::<PyTuple>() {
-            for item in sequence.iter() {
-                visit(&item)?;
-            }
-        }
+        scan_for_device(op, &mut first, &value)?;
     }
+    // **The keyword loop descends into sequences too, and it did not used to.**
+    // That was a hole rather than an economy, and it was invisible for exactly
+    // as long as the gate could not fire: `_torch_level_function` binds every
+    // argument by name before dispatching, so a `torch.cat([a, b])` arrives
+    // here as `kwargs["tensors"] = [a, b]` and **never touches the positional
+    // loop at all**. With one device the two loops could not be told apart.
+    // The first `torch.cat([cpu_tensor, meta_tensor])` after meta landed went
+    // straight past the gate and died inside the kernel on
+    // `Cannot copy out of meta tensor; no data!` -- the right refusal by
+    // accident, from the wrong place, and it would have been a wrong *answer*
+    // for two backends that could both actually compute. docs/META.md §5.
     if let Some(kwargs) = kwargs {
         for (_, value) in kwargs.iter() {
-            visit(&value)?;
+            scan_for_device(op, &mut first, &value)?;
+        }
+    }
+    Ok(first)
+}
+
+/// One dispatched argument, and the sequences one level under it.
+///
+/// Tensor first, sequence second, and the order is the measurement: almost
+/// every argument that is anything is a tensor, so trying the list and tuple
+/// casts first paid for two failed type checks on the hot path. `cat`/`stack`
+/// take `Tensor[]`, so the sequence branch cannot be dropped -- it is exactly
+/// the ops most likely to mix devices that hide their tensors one level down.
+///
+/// A free function rather than a closure, and that too is a measurement: the
+/// first version of this was a closure calling another closure, both capturing
+/// `first` mutably, and the inner call did not inline. Taking `first` as a
+/// parameter costs nothing and lets both collapse into the caller.
+#[inline]
+fn scan_for_device(
+    op: &str,
+    first: &mut Option<Where>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    if visit_for_device(op, first, value)? {
+        return Ok(());
+    }
+    if let Ok(sequence) = value.cast::<PyList>() {
+        for item in sequence.iter() {
+            visit_for_device(op, first, &item)?;
+        }
+    } else if let Ok(sequence) = value.cast::<PyTuple>() {
+        for item in sequence.iter() {
+            visit_for_device(op, first, &item)?;
         }
     }
     Ok(())
+}
+
+/// One value. Returns whether it *was* a tensor, so the caller can skip the
+/// sequence casts for the overwhelmingly common case.
+///
+/// The agreement test reads the representation in place instead of building a
+/// `Where` per argument. Constructing one clones a `candle_core::Device`, and
+/// the version that did so on every argument (rather than only on the first)
+/// showed up in the A/B -- see docs/META.md §9. `Where` is built once, for the
+/// first tensor, and again only on the path that is about to raise.
+#[inline]
+fn visit_for_device(
+    op: &str,
+    first: &mut Option<Where>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let Ok(tensor) = value.cast::<PyTensorBase>() else {
+        return Ok(false);
+    };
+    let borrowed = tensor.borrow();
+    let agrees = match (&*first, borrowed.repr()) {
+        (None, _) => {
+            *first = Some(Where::of(&borrowed));
+            return Ok(true);
+        }
+        (Some(Where::Dense(seen)), crate::tensor::Repr::Dense(inner)) => {
+            seen.same_device(inner.device())
+        }
+        (Some(Where::Meta), crate::tensor::Repr::Meta { .. }) => true,
+        _ => false,
+    };
+    if agrees {
+        return Ok(true);
+    }
+    // `copy_` is the one op upstream lets cross devices, because transferring
+    // *is* its definition (docs/DEVICE_ABS.md §3.4, measured: `cpu.copy_(mps)`
+    // returns a cpu tensor). Checked only here, on the path that was about to
+    // raise, so agreeing arguments pay nothing for it.
+    if op == "aten.copy_.default" {
+        return Ok(true);
+    }
+    let seen = first.as_ref().expect("a disagreement needs a first").label();
+    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "Expected all tensors to be on the same device, but found at least two \
+         devices, {} and {}! ({op} in torch._C shim)",
+        seen.__str__(),
+        Where::of(&borrowed).label().__str__(),
+    )))
+}
+
+/// The `meta` half of the dispatcher: ops whose inputs have no storage.
+///
+/// **Structured as a separate table rather than a branch inside each kernel,
+/// because that is what upstream is.** torch has a `Meta` dispatch key with its
+/// own registrations (`torch/_meta_registrations.py`); a meta kernel computes
+/// shape and dtype and never touches bytes. Mirroring the shape here means the
+/// dense kernels stay unaware of meta -- `PyTensorBase::tensor()` refuses them
+/// if they ever try -- and it means the answer to "does this op work on meta?"
+/// is a list rather than 96 separate readings.
+///
+/// **The list is short and honest about it.** Shape inference for the other
+/// ninety-odd ops is a real body of work (upstream's file is thousands of
+/// lines), it has no measured caller here yet, and guessing a shape rule is
+/// exactly the kind of silent wrongness this shim refuses. So everything not
+/// named below raises with its own name in the message, which is DESIGN.md §6's
+/// instrument doing its job: run a model under `with torch.device("meta")` and
+/// the work queue prints itself in frequency order.
+///
+/// `_aten_implemented()` is *not* extended by anything here. That constant
+/// means "has a kernel and `tools/golden/cases.py` compares it against
+/// upstream", and the golden harness compares values -- which a meta tensor by
+/// definition has none of. Meta support is a property of ops already on the
+/// list, so op coverage stays 96 and the evidence lives in
+/// `pytests/test_shim.py` instead. docs/META.md §7.
+fn meta_dispatch(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    match op {
+        "aten._to_copy.default" => meta_to_copy(py, args, kwargs),
+        "aten.copy_.default" => meta_copy_inplace(py, args, kwargs),
+        // Metadata pass-throughs: upstream's kernels for these return a tensor
+        // with the same shape and dtype and (for `detach`/`alias`) share
+        // storage, which meta has none of. This shim's dense `detach`/`alias`
+        // already copy rather than alias (docs/OPS4.md §8), so meta is not
+        // losing an aliasing property it otherwise had.
+        "aten.detach.default" | "aten.alias.default" | "aten.clone.default"
+        | "aten.contiguous.default" | "aten.lift_fresh.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            meta_result(py, input.dims().to_vec(), input.tag())
+        }
+        // **In-place initialisers: no-ops that return the receiver.** These are
+        // not a convenience -- `nn.Linear.reset_parameters` runs
+        // `init.kaiming_uniform_(self.weight)` in every `__init__`, so
+        // `with torch.device("meta"): nn.Linear(4, 8)` stops on `uniform_`
+        // before it can produce a single parameter, which is the exact call
+        // `accelerate.init_empty_weights` is built around.
+        //
+        // "Write nothing and return self" is upstream's meta kernel for them
+        // too, and it is the only honest answer: filling a tensor that holds no
+        // bytes has no observable effect, and the shape it advertises is
+        // unchanged by what would have been written. The refusal that matters
+        // -- reading the values back -- is still `tolist`/`item`'s, one layer
+        // out, so nothing here lets a caller mistake an uninitialised meta
+        // parameter for an initialised one.
+        //
+        // `add_`/`mul_` are deliberately *not* here even though they are also
+        // in-place: they broadcast, so their meta kernel has a shape rule to
+        // get right, and a no-op would silently accept a shape upstream
+        // rejects.
+        "aten.uniform_.default"
+        | "aten.normal_.default"
+        | "aten.zero_.default"
+        | "aten.fill_.Scalar" => {
+            let receiver = tensor_receiver(op, args, kwargs)?;
+            Ok(receiver.into_any().unbind())
+        }
+        // `aten::is_floating_point` reads the dtype tag, which meta carries in
+        // full. Nothing about it needs storage.
+        "aten.is_floating_point.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            Ok(input.tag().is_floating_point().into_bound_py_any(py)?.unbind())
+        }
+        // `.item()`, `bool(t)`, `float(t)`. Upstream refuses this one with a
+        // *different* message from the copy-out family, and the difference is
+        // measured, not tidied: `torch.zeros(1, device="meta").item()` is
+        // `RuntimeError: Tensor.item() cannot be called on meta tensors` while
+        // `.tolist()` on the same tensor is `NotImplementedError: Cannot copy
+        // out of meta tensor; no data!`.
+        "aten._local_scalar_dense.default" => Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Tensor.item() cannot be called on meta tensors",
+        )),
+        // `new_ones` takes its shape from the argument and its device from the
+        // input tensor, so on a meta input it is a meta factory.
+        "aten.new_ones.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let size: Vec<usize> = required(op, args, kwargs, 1, "size")?.extract()?;
+            let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(input.tag());
+            match device_arg_or_label(args, kwargs, 4, "device", &PyDevice::meta())? {
+                label if label.is_meta() => meta_result(py, size, tag),
+                label => {
+                    let device = label.resolve()?;
+                    let storage = PyDtype::new(tag).storage(op)?;
+                    let out = Tensor::ones(size, storage, &device)
+                        .map_err(|e| candle_err(op, e))?;
+                    finish(py, out, tag)
+                }
+            }
+        }
+        other => Err(not_implemented(format!(
+            "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
+             dtype and no storage, so this op would have to infer its output shape without \
+             computing -- which is a real kernel (upstream registers one in \
+             torch/_meta_registrations.py), not a fallthrough. See docs/META.md §7 for the \
+             list that is implemented."
+        ))),
+    }
+}
+
+/// A finished meta tensor: shape and dtype, no allocation.
+///
+/// The meta counterpart of `finish`, and deliberately not folded into it. The
+/// two differ in exactly one interesting way -- `finish` has to ask
+/// `PyDtype::storage()` whether candle can hold the dtype, and this does not,
+/// because nothing is being held.
+fn meta_result(py: Python<'_>, shape: Vec<usize>, tag: TorchDType) -> PyResult<Py<PyAny>> {
+    Ok(PyTensorBase::meta(shape, tag)
+        .into_pyobject(py)?
+        .into_any()
+        .unbind())
+}
+
+/// `aten::_to_copy` with a meta input: the dtype half works, the device half
+/// only outwards-to-nowhere.
+///
+/// Three cases, all measured on torch 2.13.0:
+///
+/// | call | upstream |
+/// |---|---|
+/// | `meta.to(torch.float64)` | meta tensor, float64 |
+/// | `meta.to("meta")` | the same object (`t.to("meta") is t`) |
+/// | `meta.to("cpu")` / `meta.cpu()` | `NotImplementedError: Cannot copy out of meta tensor; no data!` |
+///
+/// The last one is the whole point of meta and the reason this is not a
+/// fallthrough: a shim that quietly produced a zero-filled CPU tensor here
+/// would turn "no weights were loaded" into "the weights are all zero", which
+/// is the failure `docs/CKPT.md`'s `filled` guard exists to prevent one layer
+/// down.
+fn meta_to_copy(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._to_copy.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+    reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
+    reject_memory_format(OP, args, kwargs, 6)?;
+    // `device=None` keeps the tensor where it is -- on meta. Same contract as
+    // the dense path (docs/DEVICE_ABS.md §5.2), and here it is observable:
+    // reading the absent argument as "the CPU" would make every `.float()` on
+    // a meta parameter try to leave the meta device.
+    let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::meta())?;
+    if !label.is_meta() {
+        return Err(crate::tensor::no_data());
+    }
+    meta_result(py, input.dims().to_vec(), tag)
+}
+
+/// `aten::copy_` where one side is meta.
+///
+/// The gate above lets this op through with disagreeing devices because
+/// transferring is its definition. What the two directions mean is not
+/// symmetric, and both halves are measured:
+///
+/// * `meta.copy_(cpu)` **succeeds and does nothing.** The receiver stays meta.
+///   `nn.Module.load_state_dict` without `assign=True` lands exactly here and
+///   upstream warns about it in as many words -- *"copying from a non-meta
+///   parameter in the checkpoint to a meta parameter in the current model,
+///   which is a no-op"*.
+/// * `cpu.copy_(meta)` **refuses**, with the copy-out message, because there is
+///   nothing to read.
+///
+/// A shim that made the first case allocate would silently turn
+/// `load_state_dict` into something that appeared to work; a shim that refused
+/// it would stop a path upstream completes with a warning.
+fn meta_copy_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.copy_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let source = tensor_arg(OP, args, kwargs, 1, "src")?;
+    if !receiver.borrow().is_meta_repr() {
+        // Receiver is dense, source is meta: reading the source is the copy.
+        return Err(crate::tensor::no_data());
+    }
+    let _ = source;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
 }
 
 fn aten_dispatch_inner(
@@ -512,12 +804,22 @@ fn full_default(
     };
 
     reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
-    let device = device_arg(args, kwargs, 4, "device")?;
+    let label = device_arg_or_label(args, kwargs, 4, "device", &PyDevice::cpu())?;
 
     // torch refuses a fill value the target dtype cannot hold. candle would
     // wrap (int) or saturate (float) instead, which is the silent divergence
     // the golden harness caught -- see `checked_convert` below.
+    //
+    // Checked *before* the meta branch on purpose: upstream's meta kernel runs
+    // the same conversion check, so `torch.full((3,), 2**31, dtype=torch.int32,
+    // device="meta")` raises there too. A meta tensor is a claim about what the
+    // real call would have produced, and a claim that skipped the checks the
+    // real call makes would be worth less than no claim.
     checked_convert(&fill, fill_is_int, dtype, size.iter().product())?;
+    if label.is_meta() {
+        return meta_result(py, size, dtype);
+    }
+    let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(OP)?;
 
     if dtype == TorchDType::Bool {
@@ -578,7 +880,7 @@ fn add_tensor(
         )));
     }
 
-    let (lhs, rhs) = (lhs.tensor().clone(), rhs.tensor().clone());
+    let (lhs, rhs) = (lhs.tensor()?.clone(), rhs.tensor()?.clone());
     let rhs = if alpha == 1.0 {
         rhs
     } else {
@@ -645,11 +947,11 @@ fn mm_default(
     // torch's `mm` is strictly 2-D; `matmul`/`bmm` are separate ops with their
     // own overloads. candle's `matmul` accepts batched inputs, so accepting a
     // 3-D argument here would quietly implement a different op.
-    if lhs.tensor().rank() != 2 || rhs.tensor().rank() != 2 {
+    if lhs.tensor()?.rank() != 2 || rhs.tensor()?.rank() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{OP}: both arguments to mm need to be 2D, but they are {}D and {}D",
-            lhs.tensor().rank(),
-            rhs.tensor().rank()
+            lhs.tensor()?.rank(),
+            rhs.tensor()?.rank()
         )));
     }
     let tag = same_dtype(OP, &lhs, &rhs)?;
@@ -657,10 +959,11 @@ fn mm_default(
     // Accumulate where torch accumulates -- see `gemm_accumulate_in`.
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
+    let rhs_inner = rhs.tensor()?;
     let out = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(acc)
-        .and_then(|l| rhs.tensor().to_dtype(acc).and_then(|r| l.matmul(&r)))
+        .and_then(|l| rhs_inner.to_dtype(acc).and_then(|r| l.matmul(&r)))
         .and_then(|p| p.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
@@ -690,12 +993,12 @@ fn bmm_default(
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(OP, args, kwargs, 1, "mat2")?;
 
-    if lhs.tensor().rank() != 3 {
+    if lhs.tensor()?.rank() != 3 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "batch1 must be a 3D tensor",
         ));
     }
-    if rhs.tensor().rank() != 3 {
+    if rhs.tensor()?.rank() != 3 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "batch2 must be a 3D tensor",
         ));
@@ -705,8 +1008,8 @@ fn bmm_default(
     // torch checks batch2's leading pair against batch1's (batch, k) and says
     // so in exactly these words. Reproduced rather than paraphrased: the
     // message is the work item a caller reads.
-    let a = lhs.tensor().dims();
-    let b = rhs.tensor().dims();
+    let a = lhs.tensor()?.dims();
+    let b = rhs.tensor()?.dims();
     if a[0] != b[0] || a[2] != b[1] {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Expected size for first two dimensions of batch2 tensor to be: \
@@ -717,12 +1020,13 @@ fn bmm_default(
 
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
+    let rhs_inner = rhs.tensor()?;
     let out = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(acc)
         .and_then(|l| l.contiguous())
         .and_then(|l| {
-            rhs.tensor()
+            rhs_inner
                 .to_dtype(acc)
                 .and_then(|r| r.contiguous())
                 .and_then(|r| l.matmul(&r))
@@ -808,16 +1112,16 @@ fn addmm_default(
     let mat1 = tensor_arg(OP, args, kwargs, 1, "mat1")?;
     let mat2 = tensor_arg(OP, args, kwargs, 2, "mat2")?;
 
-    if mat1.tensor().rank() != 2 {
+    if mat1.tensor()?.rank() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "mat1 must be a matrix, got {}-D tensor",
-            mat1.tensor().rank()
+            mat1.tensor()?.rank()
         )));
     }
-    if mat2.tensor().rank() != 2 {
+    if mat2.tensor()?.rank() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "mat2 must be a matrix, got {}-D tensor",
-            mat2.tensor().rank()
+            mat2.tensor()?.rank()
         )));
     }
     if mat1.tag() != mat2.tag() {
@@ -846,8 +1150,8 @@ fn addmm_default(
         )));
     }
 
-    let a = mat1.tensor().dims().to_vec();
-    let b = mat2.tensor().dims().to_vec();
+    let a = mat1.tensor()?.dims().to_vec();
+    let b = mat2.tensor()?.dims().to_vec();
     if a[1] != b[0] {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "mat1 and mat2 shapes cannot be multiplied ({}x{} and {}x{})",
@@ -859,7 +1163,7 @@ fn addmm_default(
     // `self` expanded to the product's shape, with torch's own two messages
     // for the two ways that fails. Done here rather than left to candle so the
     // caller reads the same sentence upstream would have given.
-    let self_dims = bias.tensor().dims().to_vec();
+    let self_dims = bias.tensor()?.dims().to_vec();
     if self_dims.len() > target.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expand(torch.{}Tensor{{{:?}}}, size={:?}): the number of sizes provided ({}) \
@@ -905,12 +1209,13 @@ fn addmm_default(
     let acc_dtype = gemm_accumulate_in(storage);
     let mut acc: Option<Tensor> = None;
     if !alpha_zero {
+        let mat2_inner = mat2.tensor()?;
         let product = mat1
-            .tensor()
+            .tensor()?
             .to_dtype(acc_dtype)
             .and_then(|l| l.contiguous())
             .and_then(|l| {
-                mat2.tensor()
+                mat2_inner
                     .to_dtype(acc_dtype)
                     .and_then(|r| r.contiguous())
                     .and_then(|r| l.matmul(&r))
@@ -920,7 +1225,7 @@ fn addmm_default(
     }
     if !beta_zero {
         let expanded = bias
-            .tensor()
+            .tensor()?
             .to_dtype(acc_dtype)
             .and_then(|t| t.broadcast_as(target.as_slice()))
             .and_then(|t| t.contiguous())
@@ -935,7 +1240,7 @@ fn addmm_default(
         Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
         // Both factors zero: torch still answers with a correctly shaped,
         // correctly typed tensor of zeros rather than raising.
-        None => Tensor::zeros(target.as_slice(), storage, mat1.tensor().device())
+        None => Tensor::zeros(target.as_slice(), storage, mat1.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?,
     };
     finish(py, out, tag)
@@ -974,12 +1279,12 @@ fn baddbmm_default(
     let batch1 = tensor_arg(OP, args, kwargs, 1, "batch1")?;
     let batch2 = tensor_arg(OP, args, kwargs, 2, "batch2")?;
 
-    if batch1.tensor().rank() != 3 {
+    if batch1.tensor()?.rank() != 3 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "batch1 must be a 3D tensor",
         ));
     }
-    if batch2.tensor().rank() != 3 {
+    if batch2.tensor()?.rank() != 3 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "batch2 must be a 3D tensor",
         ));
@@ -1010,8 +1315,8 @@ fn baddbmm_default(
         )));
     }
 
-    let a = batch1.tensor().dims().to_vec();
-    let b = batch2.tensor().dims().to_vec();
+    let a = batch1.tensor()?.dims().to_vec();
+    let b = batch2.tensor()?.dims().to_vec();
     if a[0] != b[0] || a[2] != b[1] {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "Expected size for first two dimensions of batch2 tensor to be: \
@@ -1023,7 +1328,7 @@ fn baddbmm_default(
 
     // Same expand check `addmm_default` runs on its bias, generalised to a
     // 3-D target.
-    let self_dims = bias.tensor().dims().to_vec();
+    let self_dims = bias.tensor()?.dims().to_vec();
     if self_dims.len() > target.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expand(torch.{}Tensor{{{:?}}}, size={:?}): the number of sizes provided ({}) \
@@ -1064,13 +1369,13 @@ fn baddbmm_default(
     let acc_dtype = gemm_accumulate_in(storage);
     let mut acc: Option<Tensor> = None;
     if !alpha_zero {
+        let batch2_inner = batch2.tensor()?;
         let product = batch1
-            .tensor()
+            .tensor()?
             .to_dtype(acc_dtype)
             .and_then(|l| l.contiguous())
             .and_then(|l| {
-                batch2
-                    .tensor()
+                batch2_inner
                     .to_dtype(acc_dtype)
                     .and_then(|r| r.contiguous())
                     .and_then(|r| l.matmul(&r))
@@ -1080,7 +1385,7 @@ fn baddbmm_default(
     }
     if !beta_zero {
         let expanded = bias
-            .tensor()
+            .tensor()?
             .to_dtype(acc_dtype)
             .and_then(|t| t.broadcast_as(target.as_slice()))
             .and_then(|t| t.contiguous())
@@ -1093,7 +1398,7 @@ fn baddbmm_default(
     }
     let out = match acc {
         Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
-        None => Tensor::zeros(target.as_slice(), storage, batch1.tensor().device())
+        None => Tensor::zeros(target.as_slice(), storage, batch1.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?,
     };
     finish(py, out, tag)
@@ -1160,7 +1465,7 @@ fn sdpa_flash_cpu(
         ));
     }
     for operand in [&query, &key, &value] {
-        if operand.tensor().rank() != 4 {
+        if operand.tensor()?.rank() != 4 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "scaled_dot_product_attention_flash_attention: Accept only 4 dims inputs \
                  shape of {B, H, T, K}",
@@ -1187,9 +1492,9 @@ fn sdpa_flash_cpu(
     })?;
 
     let widen = |t: &Tensor| t.to_dtype(acc).and_then(|t| t.contiguous());
-    let q = widen(query.tensor()).map_err(|e| candle_err(OP, e))?;
-    let k = widen(key.tensor()).map_err(|e| candle_err(OP, e))?;
-    let v = widen(value.tensor()).map_err(|e| candle_err(OP, e))?;
+    let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
+    let k = widen(key.tensor()?).map_err(|e| candle_err(OP, e))?;
+    let v = widen(value.tensor()?).map_err(|e| candle_err(OP, e))?;
 
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
@@ -1220,7 +1525,7 @@ fn sdpa_flash_cpu(
     }
     if let Some(mask) = attn_mask.as_ref() {
         let mask = mask
-            .tensor()
+            .tensor()?
             .to_dtype(acc)
             .map_err(|e| candle_err(OP, e))?;
         scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
@@ -1321,7 +1626,22 @@ fn arange(
         kwargs,
         &[(options_at + 1, "layout"), (options_at + 3, "pin_memory")],
     )?;
-    let device = device_arg(args, kwargs, options_at + 2, "device")?;
+    let label = device_arg_or_label(args, kwargs, options_at + 2, "device", &PyDevice::cpu())?;
+    if label.is_meta() {
+        // Length before dtype: `arange` is the one factory whose shape is
+        // computed rather than given, and `arange_length` is the same
+        // arithmetic the dense path below does -- shared, not restated, so the
+        // two cannot disagree about how many elements the real call would have
+        // produced.
+        //
+        // `arange_has_cpu_kernel` is deliberately *not* consulted here. It
+        // reproduces an upstream CPU gap, and upstream's meta kernel does not
+        // have that gap: `torch.arange(5, dtype=torch.uint16, device="meta")`
+        // is a tensor while the CPU spelling raises. Measured.
+        let n = arange_length(op, &start, &end, &step, integral)?;
+        return meta_result(py, vec![n], dtype);
+    }
+    let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(op)?;
 
     // torch has no `arange_cpu` kernel for these, and the golden harness
@@ -1339,26 +1659,12 @@ fn arange(
         )));
     }
 
-    if step.as_f64() == 0.0 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err("step must be nonzero"));
-    }
-    // torch's own wording. `arange(5, 0)` raises rather than returning empty,
-    // while `arange(0, 0)` is a legal empty tensor -- the check is on the
-    // *sign*, not on emptiness.
-    let (s, e, d) = (start.as_f64(), end.as_f64(), step.as_f64());
-    if (d > 0.0 && e < s) || (d < 0.0 && e > s) {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "upper bound and lower bound inconsistent with step sign",
-        ));
-    }
-
+    // The zero-step and sign refusals live in `arange_length` -- one copy, so
+    // the meta path cannot skip a check the dense path makes.
+    let (s, d) = (start.as_f64(), step.as_f64());
+    let n = arange_length(op, &start, &end, &step, integral)? as i64;
     let tensor = if integral {
-        let (s, e, d) = (start.as_i64(), end.as_i64(), step.as_i64());
-        let n = if d > 0 {
-            (e - s + d - 1).div_euclid(d).max(0)
-        } else {
-            (s - e + (-d) - 1).div_euclid(-d).max(0)
-        };
+        let (s, d) = (start.as_i64(), step.as_i64());
         // `s + i * d`, never an accumulator: candle's own `arange_step` adds
         // repeatedly, which drifts on floats and is the kind of divergence the
         // golden harness exists to catch.
@@ -1366,7 +1672,6 @@ fn arange(
         let len = values.len();
         Tensor::from_vec(values, len, &device)
     } else {
-        let n = (((e - s) / d).ceil()).max(0.0) as i64;
         let values: Vec<f64> = (0..n).map(|i| s + (i as f64) * d).collect();
         let len = values.len();
         Tensor::from_vec(values, len, &device)
@@ -1375,6 +1680,46 @@ fn arange(
     .map_err(|err| candle_err(op, err))?;
 
     finish(py, tensor, dtype)
+}
+
+/// How many elements `arange(start, end, step)` produces.
+///
+/// Split out of the kernel because the meta path needs the count without the
+/// values, and a second copy of this arithmetic is exactly the kind of thing
+/// that drifts: the integral branch is not `ceil((e-s)/d)` in floating point,
+/// it is an integer ceiling-divide, and the two disagree at the boundaries the
+/// golden harness already pins.
+///
+/// The sign and zero-step checks stay in the kernel: they are refusals, and a
+/// meta call has to make the same ones before it can claim a shape.
+fn arange_length(
+    op: &str,
+    start: &Scalar,
+    end: &Scalar,
+    step: &Scalar,
+    integral: bool,
+) -> PyResult<usize> {
+    if step.as_f64() == 0.0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("step must be nonzero"));
+    }
+    let (fs, fe, fd) = (start.as_f64(), end.as_f64(), step.as_f64());
+    if (fd > 0.0 && fe < fs) || (fd < 0.0 && fe > fs) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "upper bound and lower bound inconsistent with step sign",
+        ));
+    }
+    let _ = op;
+    let n = if integral {
+        let (s, e, d) = (start.as_i64(), end.as_i64(), step.as_i64());
+        if d > 0 {
+            (e - s + d - 1).div_euclid(d).max(0)
+        } else {
+            (s - e + (-d) - 1).div_euclid(-d).max(0)
+        }
+    } else {
+        (((fe - fs) / fd).ceil()).max(0.0) as i64
+    };
+    Ok(n as usize)
 }
 
 /// `aten::ones(SymInt[] size, *, ScalarType? dtype=None, ...)` and
@@ -1401,7 +1746,15 @@ fn zeros_or_ones(
         kwargs,
         &[(2, "layout"), (4, "pin_memory"), (5, "memory_format")],
     )?;
-    let device = device_arg(args, kwargs, 3, "device")?;
+    let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::cpu())?;
+    // `meta` before `storage()`, and the order is the claim: a meta tensor
+    // never has to be storable by candle, so `torch.empty(2,
+    // dtype=torch.complex64, device="meta")` is representable here exactly as
+    // it is upstream, while its CPU counterpart is refused by name.
+    if label.is_meta() {
+        return meta_result(py, size, dtype);
+    }
+    let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(op)?;
 
     let tensor = if one {
@@ -1448,7 +1801,7 @@ fn rsqrt_default(
     };
     let storage = PyDtype::new(tag).storage(OP)?;
     let tensor = input
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .and_then(|t| t.sqrt())
         .and_then(|t| t.recip())
@@ -1557,10 +1910,10 @@ fn pow_tensor_scalar(
     let exponent = scalar_arg(OP, args, kwargs, 1, "exponent")?
         .ok_or_else(|| missing(OP, "exponent"))?;
     let tag = pow_result_tag(OP, base.tag(), !exponent.is_int())?;
-    let shape = base.tensor().dims().to_vec();
-    let bases = side_from_tensor(OP, base.tensor(), tag)?;
+    let shape = base.tensor()?.dims().to_vec();
+    let bases = side_from_tensor(OP, base.tensor()?, tag)?;
     let exponents = side_from_scalar(&exponent, tag);
-    pow_from_pairs(py, OP, bases, exponents, shape, tag, base.tensor().device())
+    pow_from_pairs(py, OP, bases, exponents, shape, tag, base.tensor()?.device())
 }
 
 fn pow_scalar(
@@ -1572,10 +1925,10 @@ fn pow_scalar(
     let base = scalar_arg(OP, args, kwargs, 0, "self")?.ok_or_else(|| missing(OP, "self"))?;
     let exponent = tensor_arg(OP, args, kwargs, 1, "exponent")?;
     let tag = pow_result_tag(OP, exponent.tag(), !base.is_int())?;
-    let shape = exponent.tensor().dims().to_vec();
+    let shape = exponent.tensor()?.dims().to_vec();
     let bases = side_from_scalar(&base, tag);
-    let exponents = side_from_tensor(OP, exponent.tensor(), tag)?;
-    pow_from_pairs(py, OP, bases, exponents, shape, tag, exponent.tensor().device())
+    let exponents = side_from_tensor(OP, exponent.tensor()?, tag)?;
+    pow_from_pairs(py, OP, bases, exponents, shape, tag, exponent.tensor()?.device())
 }
 
 fn pow_tensor_tensor(
@@ -1589,9 +1942,9 @@ fn pow_tensor_tensor(
     let tag = pow_result_tag(OP, same_dtype(OP, &base, &exponent)?, false)?;
 
     let shape = base
-        .tensor()
+        .tensor()?
         .shape()
-        .broadcast_shape_binary_op(exponent.tensor().shape(), "pow")
+        .broadcast_shape_binary_op(exponent.tensor()?.shape(), "pow")
         .map_err(|err| candle_err(OP, err))?;
     let dims = shape.dims().to_vec();
     let broadcast = |t: &Tensor| -> PyResult<Tensor> {
@@ -1599,9 +1952,9 @@ fn pow_tensor_tensor(
             .and_then(|t| t.contiguous())
             .map_err(|err| candle_err(OP, err))
     };
-    let bases = side_from_tensor(OP, &broadcast(base.tensor())?, tag)?;
-    let exponents = side_from_tensor(OP, &broadcast(exponent.tensor())?, tag)?;
-    pow_from_pairs(py, OP, bases, exponents, dims, tag, base.tensor().device())
+    let bases = side_from_tensor(OP, &broadcast(base.tensor()?)?, tag)?;
+    let exponents = side_from_tensor(OP, &broadcast(exponent.tensor()?)?, tag)?;
+    pow_from_pairs(py, OP, bases, exponents, dims, tag, base.tensor()?.device())
 }
 
 fn side_from_tensor(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<PowSide> {
@@ -1652,10 +2005,13 @@ fn cat_default(
             )));
         }
     }
-    let rank = tensors[0].tensor().rank();
+    let rank = tensors[0].tensor()?.rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
 
-    let inner: Vec<&Tensor> = tensors.iter().map(|t| t.tensor()).collect();
+    let mut inner: Vec<&Tensor> = Vec::with_capacity(tensors.len());
+    for t in &tensors {
+        inner.push(t.tensor()?);
+    }
     let tensor = Tensor::cat(&inner, dim).map_err(|err| candle_err(OP, err))?;
     finish(py, tensor, tag)
 }
@@ -1720,14 +2076,14 @@ fn stack_default(
             )));
         }
     }
-    let first = tensors[0].tensor().dims().to_vec();
+    let first = tensors[0].tensor()?.dims().to_vec();
     for (index, other) in tensors.iter().enumerate().skip(1) {
-        if other.tensor().dims() != first.as_slice() {
+        if other.tensor()?.dims() != first.as_slice() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "stack expects each tensor to be equal size, but got {:?} at entry 0 \
                  and {:?} at entry {index}",
                 first,
-                other.tensor().dims()
+                other.tensor()?.dims()
             )));
         }
     }
@@ -1749,7 +2105,7 @@ fn stack_default(
 
     let contiguous: Vec<Tensor> = tensors
         .iter()
-        .map(|t| t.tensor().contiguous().map_err(|e| candle_err(OP, e)))
+        .map(|t| t.tensor()?.contiguous().map_err(|e| candle_err(OP, e)))
         .collect::<PyResult<_>>()?;
     let tensor = Tensor::stack(&contiguous, dim as usize).map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, tag)
@@ -1802,13 +2158,17 @@ fn scalar_tensor_default(
     let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(DEFAULT_FLOAT);
     reject_layout(OP, args, kwargs, 2)?;
     reject_unsupported(OP, args, kwargs, &[(4, "pin_memory")])?;
-    let device = device_arg(args, kwargs, 3, "device")?;
+    let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::cpu())?;
 
     // A 0-D tensor is one element, so the numel==1 branch of the upstream
     // check is the one that applies -- see the note above.
     if !raw.is_instance_of::<PyTensorBase>() {
         checked_convert(&raw, raw.is_instance_of::<pyo3::types::PyInt>(), dtype, 1)?;
     }
+    if label.is_meta() {
+        return meta_result(py, Vec::new(), dtype);
+    }
+    let device = label.resolve()?;
 
     if dtype == TorchDType::Bool {
         let truthy = u8::from(value.as_f64() != 0.0);
@@ -1848,7 +2208,7 @@ fn argmax_default(
 
     let tensor = match dim {
         None => {
-            let flat = input.tensor().flatten_all().map_err(|e| candle_err(OP, e))?;
+            let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(OP, e))?;
             let reduced = flat.argmax(0).map_err(|e| candle_err(OP, e))?;
             if keepdim {
                 reduced.reshape(1).map_err(|e| candle_err(OP, e))?
@@ -1857,11 +2217,11 @@ fn argmax_default(
             }
         }
         Some(dim) => {
-            let dim = normalise_dim(OP, dim, input.tensor().rank())?;
+            let dim = normalise_dim(OP, dim, input.tensor()?.rank())?;
             if keepdim {
-                input.tensor().argmax_keepdim(dim)
+                input.tensor()?.argmax_keepdim(dim)
             } else {
-                input.tensor().argmax(dim)
+                input.tensor()?.argmax(dim)
             }
             .map_err(|e| candle_err(OP, e))?
         }
@@ -1901,22 +2261,22 @@ fn embedding_default(
         }
     }
 
-    if weight.tensor().rank() != 2 {
+    if weight.tensor()?.rank() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{OP}: weight must be 2D, got {}D",
-            weight.tensor().rank()
+            weight.tensor()?.rank()
         )));
     }
-    let mut shape = indices.tensor().dims().to_vec();
-    shape.push(weight.tensor().dims()[1]);
+    let mut shape = indices.tensor()?.dims().to_vec();
+    shape.push(weight.tensor()?.dims()[1]);
 
     let flat = indices
-        .tensor()
+        .tensor()?
         .flatten_all()
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let tensor = weight
-        .tensor()
+        .tensor()?
         .index_select(&flat, 0)
         .and_then(|t| t.reshape(shape))
         .map_err(|e| candle_err(OP, e))?;
@@ -1962,17 +2322,17 @@ fn isin_tensor_tensor(
     // promotion step that could round one side onto the other.
     let (haystack, needles) = if tag.is_floating_point() {
         (
-            side_from_tensor(OP, elements.tensor(), tag)?.as_f64(),
-            side_from_tensor(OP, test.tensor(), tag)?.as_f64(),
+            side_from_tensor(OP, elements.tensor()?, tag)?.as_f64(),
+            side_from_tensor(OP, test.tensor()?, tag)?.as_f64(),
         )
     } else {
         (
-            side_from_tensor(OP, elements.tensor(), tag)?
+            side_from_tensor(OP, elements.tensor()?, tag)?
                 .as_i64()
                 .into_iter()
                 .map(|v| v as f64)
                 .collect(),
-            side_from_tensor(OP, test.tensor(), tag)?
+            side_from_tensor(OP, test.tensor()?, tag)?
                 .as_i64()
                 .into_iter()
                 .map(|v| v as f64)
@@ -1984,7 +2344,7 @@ fn isin_tensor_tensor(
         .iter()
         .map(|value| u8::from(needles.iter().any(|n| n == value) != invert))
         .collect();
-    let tensor = Tensor::from_vec(bytes, elements.tensor().dims().to_vec(), elements.tensor().device())
+    let tensor = Tensor::from_vec(bytes, elements.tensor()?.dims().to_vec(), elements.tensor()?.device())
         .map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, TorchDType::Bool)
 }
@@ -2042,14 +2402,21 @@ fn randint(
         kwargs,
         &[(options_at + 1, "layout"), (options_at + 3, "pin_memory")],
     )?;
-    let device = device_arg(args, kwargs, options_at + 2, "device")?;
-    let storage = PyDtype::new(dtype).storage(op)?;
+    let label = device_arg_or_label(args, kwargs, options_at + 2, "device", &PyDevice::cpu())?;
 
     if high <= low {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "random_ expects 'from' to be less than 'to', but got from={low} >= to={high}"
         )));
     }
+    // After the bound check, before the allocation: upstream's meta kernel
+    // raises for `high <= low` too, so the meta answer is not a way around a
+    // check the real call makes.
+    if label.is_meta() {
+        return meta_result(py, size, dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(op)?;
     let span = (high - low) as f64;
     let tensor = Tensor::rand(0f64, 1f64, size, &device)
         .and_then(|t| t.affine(span, low as f64))
@@ -2159,11 +2526,11 @@ fn arith_tensor(
     let storage = PyDtype::new(tag).storage(op)?;
 
     let left = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(op, e))?;
     let mut right = rhs
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
@@ -2187,7 +2554,7 @@ fn arith_scalar(
     let storage = PyDtype::new(tag).storage(op)?;
 
     let left = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
@@ -2230,7 +2597,7 @@ fn rsub_scalar(
     let storage = PyDtype::new(tag).storage(OP)?;
 
     let mut right = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(OP, e))?;
     let alpha = alpha_arg(OP, args, kwargs)?;
@@ -2264,24 +2631,25 @@ fn matmul_default(
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
     let tag = same_dtype(OP, &lhs, &rhs)?;
-    if lhs.tensor().rank() < 2 || rhs.tensor().rank() < 2 {
+    if lhs.tensor()?.rank() < 2 || rhs.tensor()?.rank() < 2 {
         // torch's 1-D rules prepend/append a dimension and remove it again.
         // Not measured as used, and guessing them is what this shim refuses.
         return Err(not_implemented(format!(
             "{OP}: matmul with a 1-D operand ({}D x {}D) is not implemented in \
              torch._C shim -- torch's vector rules were not measured",
-            lhs.tensor().rank(),
-            rhs.tensor().rank()
+            lhs.tensor()?.rank(),
+            rhs.tensor()?.rank()
         )));
     }
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
+    let rhs_inner = rhs.tensor()?;
     let out = lhs
-        .tensor()
+        .tensor()?
         .to_dtype(acc)
         .and_then(|l| l.contiguous())
         .and_then(|l| {
-            rhs.tensor()
+            rhs_inner
                 .to_dtype(acc)
                 .and_then(|r| r.contiguous())
                 .and_then(|r| l.broadcast_matmul(&r))
@@ -2340,8 +2708,8 @@ fn compare_tensor(
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
     let tag = same_dtype(op, &lhs, &rhs)?;
     let floating = tag.is_floating_point();
-    let left = compare_common(op, lhs.tensor(), floating)?;
-    let right = compare_common(op, rhs.tensor(), floating)?;
+    let left = compare_common(op, lhs.tensor()?, floating)?;
+    let right = compare_common(op, rhs.tensor()?, floating)?;
     // candle's comparisons yield U8 with 0/1, which is exactly the invariant
     // `boolean()` asserts (BOOL.md §6.3).
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
@@ -2358,7 +2726,7 @@ fn compare_scalar(
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
     let floating = lhs.tag().is_floating_point() || !other.is_int();
-    let left = compare_common(op, lhs.tensor(), floating)?;
+    let left = compare_common(op, lhs.tensor()?, floating)?;
     let right = if floating {
         Tensor::full(other.as_f64(), (), left.device())
     } else {
@@ -2404,9 +2772,9 @@ fn bitwise_binary(
     }
 
     let shape = lhs
-        .tensor()
+        .tensor()?
         .shape()
-        .broadcast_shape_binary_op(rhs.tensor().shape(), "bitwise")
+        .broadcast_shape_binary_op(rhs.tensor()?.shape(), "bitwise")
         .map_err(|e| candle_err(op, e))?;
     let dims = shape.dims().to_vec();
     let broadcast = |t: &Tensor| -> PyResult<Vec<i64>> {
@@ -2417,7 +2785,7 @@ fn bitwise_binary(
             .and_then(|t| t.to_vec1::<i64>())
             .map_err(|e| candle_err(op, e))
     };
-    let (a, b) = (broadcast(lhs.tensor())?, broadcast(rhs.tensor())?);
+    let (a, b) = (broadcast(lhs.tensor()?)?, broadcast(rhs.tensor()?)?);
     let values: Vec<i64> = a
         .iter()
         .zip(b.iter())
@@ -2429,12 +2797,12 @@ fn bitwise_binary(
 
     if tag == TorchDType::Bool {
         let bytes: Vec<u8> = values.into_iter().map(|v| u8::from(v != 0)).collect();
-        let out = Tensor::from_vec(bytes, dims, lhs.tensor().device())
+        let out = Tensor::from_vec(bytes, dims, lhs.tensor()?.device())
             .map_err(|e| candle_err(op, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(op)?;
-    let out = Tensor::from_vec(values, dims, lhs.tensor().device())
+    let out = Tensor::from_vec(values, dims, lhs.tensor()?.device())
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
@@ -2470,9 +2838,9 @@ fn bitwise_scalar(
         )));
     }
     let rhs = other.as_i64();
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let values: Vec<i64> = input
-        .tensor()
+        .tensor()?
         .flatten_all()
         .and_then(|t| t.to_dtype(candle_core::DType::I64))
         .and_then(|t| t.to_vec1::<i64>())
@@ -2486,12 +2854,12 @@ fn bitwise_scalar(
 
     if tag == TorchDType::Bool {
         let bytes: Vec<u8> = values.into_iter().map(|v| u8::from(v != 0)).collect();
-        let out = Tensor::from_vec(bytes, dims, input.tensor().device())
+        let out = Tensor::from_vec(bytes, dims, input.tensor()?.device())
             .map_err(|e| candle_err(op, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(op)?;
-    let out = Tensor::from_vec(values, dims, input.tensor().device())
+    let out = Tensor::from_vec(values, dims, input.tensor()?.device())
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
@@ -2513,9 +2881,9 @@ fn bitwise_not_default(
             scalar_type_name(tag)
         )));
     }
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let values: Vec<i64> = input
-        .tensor()
+        .tensor()?
         .flatten_all()
         .and_then(|t| t.to_dtype(candle_core::DType::I64))
         .and_then(|t| t.to_vec1::<i64>())
@@ -2523,13 +2891,13 @@ fn bitwise_not_default(
 
     if tag == TorchDType::Bool {
         let bytes: Vec<u8> = values.into_iter().map(|v| u8::from(v == 0)).collect();
-        let out = Tensor::from_vec(bytes, dims, input.tensor().device())
+        let out = Tensor::from_vec(bytes, dims, input.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
     let out = Tensor::from_vec(values.into_iter().map(|v| !v).collect::<Vec<i64>>(), dims,
-                               input.tensor().device())
+                               input.tensor()?.device())
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
@@ -2568,7 +2936,7 @@ fn unary_float(
     };
     let storage = PyDtype::new(tag).storage(op)?;
     let out = input
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .and_then(|t| match kind {
             Unary::Cos => t.cos(),
@@ -2624,16 +2992,16 @@ fn neg_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     if tag.is_floating_point() {
         let out = input
-            .tensor()
+            .tensor()?
             .to_dtype(storage)
             .and_then(|t| t.neg())
             .map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
     }
 
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let values: Vec<i64> = input
-        .tensor()
+        .tensor()?
         .contiguous()
         .and_then(|t| t.flatten_all())
         .and_then(|t| t.to_dtype(candle_core::DType::I64))
@@ -2642,7 +3010,7 @@ fn neg_default(
     let out = Tensor::from_vec(
         values.into_iter().map(|v| v.wrapping_neg()).collect::<Vec<i64>>(),
         dims,
-        input.tensor().device(),
+        input.tensor()?.device(),
     )
     .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(OP, e))?;
@@ -2687,7 +3055,7 @@ fn relu_default(
             "Boolean inputs not supported for relu",
         ));
     }
-    let source = input.tensor().contiguous().map_err(|e| candle_err(OP, e))?;
+    let source = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
     let zeros = source.zeros_like().map_err(|e| candle_err(OP, e))?;
     let out = source
         .lt(&zeros)
@@ -2727,7 +3095,7 @@ fn silu_default(
         other => other,
     };
     let out = input
-        .tensor()
+        .tensor()?
         .to_dtype(acc)
         .and_then(|t| t.silu())
         .and_then(|t| t.to_dtype(storage))
@@ -2840,7 +3208,7 @@ fn gelu_default(
         candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
         other => other,
     };
-    let x = input.tensor().to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    let x = input.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
 
     let out = if use_tanh {
         // `0.5 · v · (1 + tanh(β·(v + κ·v³)))`, ATen's association exactly.
@@ -2922,7 +3290,7 @@ fn sum_or_mean(
     has_dim: bool,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let (dim_at, keepdim_at, dtype_at) = if has_dim { (1, 2, 3) } else { (99, 99, 1) };
     let dims = if has_dim {
         reduce_dims(op, args, kwargs, dim_at, rank)?
@@ -2958,7 +3326,7 @@ fn sum_or_mean(
     let storage = PyDtype::new(tag).storage(op)?;
 
     let source = input
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(op, e))?;
     let out = match dims {
@@ -2989,7 +3357,7 @@ fn cumsum_default(
     let dim = normalise_dim(
         OP,
         dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
-        input.tensor().rank(),
+        input.tensor()?.rank(),
     )?;
     let natural = if input.tag().is_floating_point() {
         input.tag()
@@ -3009,14 +3377,14 @@ fn cumsum_default(
     // once at the end, so this is the same shape of computation with a wider
     // accumulator: it can differ from torch in the last bit of a long
     // `bfloat16` run, in the more-accurate direction. docs/TENSORBASE.md.
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let n = dims[dim];
     let inner: usize = dims[dim + 1..].iter().product();
     let outer: usize = dims[..dim].iter().product();
 
     let out = if storage.is_int() {
         let mut flat: Vec<i64> = input
-            .tensor()
+            .tensor()?
             .flatten_all()
             .and_then(|t| t.to_dtype(candle_core::DType::I64))
             .and_then(|t| t.to_vec1::<i64>())
@@ -3031,10 +3399,10 @@ fn cumsum_default(
                 }
             }
         }
-        Tensor::from_vec(flat, dims, input.tensor().device())
+        Tensor::from_vec(flat, dims, input.tensor()?.device())
     } else {
         let mut flat: Vec<f64> = input
-            .tensor()
+            .tensor()?
             .flatten_all()
             .and_then(|t| t.to_dtype(candle_core::DType::F64))
             .and_then(|t| t.to_vec1::<f64>())
@@ -3047,7 +3415,7 @@ fn cumsum_default(
                 }
             }
         }
-        Tensor::from_vec(flat, dims, input.tensor().device())
+        Tensor::from_vec(flat, dims, input.tensor()?.device())
     }
     .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(OP, e))?;
@@ -3063,13 +3431,13 @@ fn max_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.max.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    if input.tensor().elem_count() == 0 {
+    if input.tensor()?.elem_count() == 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "max(): Expected reduction dim to be specified for input.numel() == 0.",
         ));
     }
     let out = input
-        .tensor()
+        .tensor()?
         .flatten_all()
         .and_then(|t| t.max(0))
         .map_err(|e| candle_err(OP, e))?;
@@ -3088,8 +3456,8 @@ fn max_other(
     let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
     let tag = same_dtype(OP, &lhs, &rhs)?;
     let out = lhs
-        .tensor()
-        .broadcast_maximum(rhs.tensor())
+        .tensor()?
+        .broadcast_maximum(rhs.tensor()?)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3123,7 +3491,7 @@ fn max_dim(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.max.dim";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim = normalise_dim(
         OP,
         dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
@@ -3133,11 +3501,11 @@ fn max_dim(
 
     let (values, indices) = if keepdim {
         (
-            input.tensor().max_keepdim(dim),
-            input.tensor().argmax_keepdim(dim),
+            input.tensor()?.max_keepdim(dim),
+            input.tensor()?.argmax_keepdim(dim),
         )
     } else {
-        (input.tensor().max(dim), input.tensor().argmax(dim))
+        (input.tensor()?.max(dim), input.tensor()?.argmax(dim))
     };
     let values = values.map_err(|e| candle_err(OP, e))?;
     // int64, like `argmax` above: candle yields u32, which would be a visible
@@ -3173,12 +3541,12 @@ fn any_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.any.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    if input.tensor().elem_count() == 0 {
-        let out = Tensor::zeros((), candle_core::DType::U8, input.tensor().device())
+    if input.tensor()?.elem_count() == 0 {
+        let out = Tensor::zeros((), candle_core::DType::U8, input.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?;
         return finish(py, out, TorchDType::Bool);
     }
-    let out = any_from(OP, input.tensor())?
+    let out = any_from(OP, input.tensor()?)?
         .flatten_all()
         .and_then(|t| t.max(0))
         .map_err(|e| candle_err(OP, e))?;
@@ -3193,10 +3561,10 @@ fn any_dim(
     list_form: bool,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dims = reduce_dims(op, args, kwargs, 1, rank)?;
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
-    let mask = any_from(op, input.tensor())?;
+    let mask = any_from(op, input.tensor()?)?;
 
     let dims = match dims {
         Some(dims) => dims,
@@ -3240,11 +3608,11 @@ fn masked_fill(
 
     let tag = input.tag();
     let storage = PyDtype::new(tag).storage(op)?;
-    let shape = input.tensor().shape().clone();
-    let device = input.tensor().device();
+    let shape = input.tensor()?.shape().clone();
+    let device = input.tensor()?.device();
 
     let condition = mask
-        .tensor()
+        .tensor()?
         .broadcast_as(shape.clone())
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(op, e))?;
@@ -3256,7 +3624,7 @@ fn masked_fill(
     .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(op, e))?;
     let source = input
-        .tensor()
+        .tensor()?
         .contiguous()
         .map_err(|e| candle_err(op, e))?;
 
@@ -3326,11 +3694,12 @@ fn where_self(
     // the three -- not the condition's. `where(tensor(True), ones(2,3),
     // zeros(3))` is `(2, 3)`, measured, where a condition-shaped answer would
     // be `()`.
+    let rhs_shape = rhs.tensor()?.shape().clone();
     let shape = condition
-        .tensor()
+        .tensor()?
         .shape()
-        .broadcast_shape_binary_op(lhs.tensor().shape(), "where")
-        .and_then(|s| s.broadcast_shape_binary_op(rhs.tensor().shape(), "where"))
+        .broadcast_shape_binary_op(lhs.tensor()?.shape(), "where")
+        .and_then(|s| s.broadcast_shape_binary_op(&rhs_shape, "where"))
         .map_err(|e| candle_err(OP, e))?;
 
     let spread = |t: &Tensor| -> PyResult<Tensor> {
@@ -3341,14 +3710,14 @@ fn where_self(
     // A `uint8` condition is truthiness, not a bit pattern: `where_cond` reads
     // "not zero", which is the same rule, but the tag is normalised to 0/1
     // first so the two dtypes take identical paths.
-    let mask = spread(condition.tensor())?;
+    let mask = spread(condition.tensor()?)?;
     let mask = if condition.tag() == TorchDType::Bool {
         mask
     } else {
         mask.ne(0u8).map_err(|e| candle_err(OP, e))?
     };
-    let on_true = spread(&lhs.tensor().to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
-    let on_false = spread(&rhs.tensor().to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
+    let on_true = spread(&lhs.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
+    let on_false = spread(&rhs.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
 
     let out = mask
         .where_cond(&on_true, &on_false)
@@ -3420,7 +3789,7 @@ fn expand_default(
     const OP: &str = "aten.expand.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let requested = shape_arg(OP, args, kwargs, 1, "size")?;
-    let dims = input.tensor().dims();
+    let dims = input.tensor()?.dims();
     if requested.len() < dims.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expand(torch._C.TensorBase{dims:?}, size={requested:?}): the number of \
@@ -3450,7 +3819,7 @@ fn expand_default(
         }
     }
     let out = input
-        .tensor()
+        .tensor()?
         .broadcast_as(target)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -3471,9 +3840,9 @@ fn reshape_like(
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let requested = shape_arg(op, args, kwargs, 1, name)?;
-    let target = resolve_shape(op, &requested, input.tensor().elem_count())?;
+    let target = resolve_shape(op, &requested, input.tensor()?.elem_count())?;
     let out = input
-        .tensor()
+        .tensor()?
         .contiguous()
         .and_then(|t| t.reshape(target))
         .map_err(|e| candle_err(op, e))?;
@@ -3487,7 +3856,7 @@ fn transpose_int(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.transpose.int";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim0 = normalise_dim(
         OP,
         dim_arg(args, kwargs, 1, "dim0")?.ok_or_else(|| missing(OP, "dim0"))?,
@@ -3499,7 +3868,7 @@ fn transpose_int(
         rank,
     )?;
     let out = input
-        .tensor()
+        .tensor()?
         .transpose(dim0, dim1)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -3548,7 +3917,7 @@ fn permute_default(
     const OP: &str = "aten.permute.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let requested = shape_arg(OP, args, kwargs, 1, "dims")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if requested.len() != rank {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "permute(sparse_coo): number of dimensions in the tensor input does not \
@@ -3558,7 +3927,7 @@ fn permute_default(
         )));
     }
     if rank == 0 {
-        return finish(py, input.tensor().clone(), input.tag());
+        return finish(py, input.tensor()?.clone(), input.tag());
     }
 
     let mut order = Vec::with_capacity(rank);
@@ -3572,7 +3941,7 @@ fn permute_default(
         order.push(dim);
     }
     let out = input
-        .tensor()
+        .tensor()?
         .permute(order)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -3595,7 +3964,7 @@ fn t_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.t.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank > 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "t() expects a tensor with <= 2 dimensions, but self is {rank}D"
@@ -3603,11 +3972,11 @@ fn t_default(
     }
     let out = if rank == 2 {
         input
-            .tensor()
+            .tensor()?
             .transpose(0, 1)
             .map_err(|e| candle_err(OP, e))?
     } else {
-        input.tensor().clone()
+        input.tensor()?.clone()
     };
     finish(py, out, input.tag())
 }
@@ -3621,7 +3990,7 @@ fn unsqueeze_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     // `unsqueeze` is the one place the legal range is `[-(rank+1), rank]`:
     // the new dimension can go after the last existing one.
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
     let extent = rank as isize + 1;
     let dim = if raw < 0 { raw + extent } else { raw };
@@ -3633,7 +4002,7 @@ fn unsqueeze_default(
         )));
     }
     let out = input
-        .tensor()
+        .tensor()?
         .unsqueeze(dim as usize)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -3715,7 +4084,7 @@ fn contiguous_default(
     const OP: &str = "aten.contiguous.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor().contiguous().map_err(|e| candle_err(OP, e))?;
+    let out = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -3731,7 +4100,7 @@ fn clone_default(
     const OP: &str = "aten.clone.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor().copy().map_err(|e| candle_err(OP, e))?;
+    let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -3750,7 +4119,7 @@ fn detach_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.detach.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    finish(py, input.tensor().clone(), input.tag())
+    finish(py, input.tensor()?.clone(), input.tag())
 }
 
 /// `aten::alias(Tensor(a) self) -> Tensor(a)`
@@ -3771,7 +4140,7 @@ fn alias_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.alias.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    finish(py, input.tensor().clone(), input.tag())
+    finish(py, input.tensor()?.clone(), input.tag())
 }
 
 /// `aten::_to_copy(Tensor self, *, ScalarType? dtype=None, ...)`
@@ -3789,12 +4158,21 @@ fn to_copy_default(
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
     reject_memory_format(OP, args, kwargs, 6)?;
-    // `device=None` keeps the input where it is. See `device_arg_or`.
-    let device = device_arg_or(args, kwargs, 3, "device", input.tensor().device())?;
+    // `device=None` keeps the input where it is. See `device_arg_or_label`.
+    let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
+    // **cpu -> meta is the only transfer this build can perform, and it is a
+    // discard rather than a copy.** Upstream agrees --
+    // `torch.zeros(2).to("meta")` is a meta tensor, measured -- and it is the
+    // one direction that needs no bytes: going the other way is
+    // `Cannot copy out of meta tensor; no data!`, which `meta_to_copy` raises.
+    if label.is_meta() {
+        return meta_result(py, input.dims().to_vec(), tag);
+    }
+    let device = label.resolve()?;
 
     if tag == TorchDType::Bool {
         let out = input
-            .tensor()
+            .tensor()?
             .to_device(&device)
             .and_then(|t| t.to_dtype(candle_core::DType::F64))
             .and_then(|t| t.ne(0f64))
@@ -3803,7 +4181,7 @@ fn to_copy_default(
     }
     let storage = PyDtype::new(tag).storage(OP)?;
     let out = input
-        .tensor()
+        .tensor()?
         .to_device(&device)
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
@@ -3823,10 +4201,11 @@ fn new_ones_default(
     let size: Vec<usize> = required(OP, args, kwargs, 1, "size")?.extract()?;
     let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
-    let device = match optional(args, kwargs, 4, "device")? {
-        Some(value) if !value.is_none() => device_arg(args, kwargs, 4, "device")?,
-        _ => input.tensor().device().clone(),
-    };
+    let label = device_arg_or_label(args, kwargs, 4, "device", &input.device_label())?;
+    if label.is_meta() {
+        return meta_result(py, size, tag);
+    }
+    let device = label.resolve()?;
     let storage = PyDtype::new(tag).storage(OP)?;
     let out = Tensor::ones(size, storage, &device).map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
@@ -3844,14 +4223,14 @@ fn local_scalar_dense(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten._local_scalar_dense.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    if input.tensor().elem_count() != 1 {
+    if input.tensor()?.elem_count() != 1 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "a Tensor with {} elements cannot be converted to Scalar",
-            input.tensor().elem_count()
+            input.tensor()?.elem_count()
         )));
     }
     let flat = input
-        .tensor()
+        .tensor()?
         .flatten_all()
         .map_err(|e| candle_err(OP, e))?;
     if input.tag() == TorchDType::Bool {
@@ -3893,7 +4272,7 @@ fn select_int(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.select.int";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(pyo3::exceptions::PyIndexError::new_err(
             "invalid index of a 0-dim tensor",
@@ -3907,10 +4286,10 @@ fn select_int(
     let index = normalise_index(
         OP,
         int_arg(args, kwargs, 2, "index")?.ok_or_else(|| missing(OP, "index"))? as isize,
-        input.tensor().dims()[dim],
+        input.tensor()?.dims()[dim],
     )?;
     let out = input
-        .tensor()
+        .tensor()?
         .narrow(dim, index, 1)
         .and_then(|t| t.squeeze(dim))
         .map_err(|e| candle_err(OP, e))?;
@@ -3930,9 +4309,9 @@ fn slice_tensor(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.slice.Tensor";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
-    let extent = input.tensor().dims()[dim] as i64;
+    let extent = input.tensor()?.dims()[dim] as i64;
     let step = int_arg(args, kwargs, 4, "step")?.unwrap_or(1);
     if step <= 0 {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -3954,7 +4333,7 @@ fn slice_tensor(
     let length = (end - start).max(0) as usize;
 
     let narrowed = input
-        .tensor()
+        .tensor()?
         .narrow(dim, start as usize, length)
         .map_err(|e| candle_err(OP, e))?;
     let out = if step == 1 {
@@ -3962,7 +4341,7 @@ fn slice_tensor(
     } else {
         let picks: Vec<i64> = (0..length as i64).step_by(step as usize).collect();
         let count = picks.len();
-        let index = Tensor::from_vec(picks, count, input.tensor().device())
+        let index = Tensor::from_vec(picks, count, input.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?;
         narrowed
             .contiguous()
@@ -4011,17 +4390,17 @@ fn index_tensor(
         Some(pair) => pair,
         // `x[None]`-only index lists never reach here (bootstrap.py handles
         // `None` with `unsqueeze`), so an all-None list is an identity.
-        None => return finish(py, input.tensor().clone(), input.tag()),
+        None => return finish(py, input.tensor()?.clone(), input.tag()),
     };
 
-    let dims = input.tensor().dims().to_vec();
-    let device = input.tensor().device();
-    let source = input.tensor().contiguous().map_err(|e| candle_err(OP, e))?;
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device();
+    let source = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
 
     // Both supported forms collapse to the same three-part reshape: everything
     // before the indexed block, the block itself, everything after.
     let (block_rank, picks, result_middle) = if index.tag() == TorchDType::Bool {
-        let mask_dims = index.tensor().dims().to_vec();
+        let mask_dims = index.tensor()?.dims().to_vec();
         if position + mask_dims.len() > dims.len()
             || dims[position..position + mask_dims.len()] != mask_dims[..]
         {
@@ -4039,7 +4418,7 @@ fn index_tensor(
             )));
         }
         let bytes = index
-            .tensor()
+            .tensor()?
             .flatten_all()
             .and_then(|t| t.to_vec1::<u8>())
             .map_err(|e| candle_err(OP, e))?;
@@ -4054,7 +4433,7 @@ fn index_tensor(
     } else {
         let extent = dims.get(position).copied().unwrap_or(0) as i64;
         let raw = index
-            .tensor()
+            .tensor()?
             .flatten_all()
             .and_then(|t| t.to_dtype(candle_core::DType::I64))
             .and_then(|t| t.to_vec1::<i64>())
@@ -4063,7 +4442,7 @@ fn index_tensor(
             .into_iter()
             .map(|v| normalise_index(OP, v as isize, extent as usize).map(|v| v as i64))
             .collect::<PyResult<Vec<i64>>>()?;
-        (1, picks, index.tensor().dims().to_vec())
+        (1, picks, index.tensor()?.dims().to_vec())
     };
 
     let pre: usize = dims[..position].iter().product();
@@ -4130,9 +4509,9 @@ fn fill_inplace(
         let borrowed = receiver.borrow();
         (
             borrowed.tag(),
-            borrowed.tensor().shape().clone(),
-            borrowed.tensor().device().clone(),
-            borrowed.tensor().elem_count(),
+            borrowed.tensor()?.shape().clone(),
+            borrowed.tensor()?.device().clone(),
+            borrowed.tensor()?.elem_count(),
         )
     };
     // The same `c10::checked_convert` reproduction `full` uses, and the golden
@@ -4200,8 +4579,8 @@ fn zero_inplace(
         let borrowed = receiver.borrow();
         (
             borrowed.tag(),
-            borrowed.tensor().shape().clone(),
-            borrowed.tensor().device().clone(),
+            borrowed.tensor()?.shape().clone(),
+            borrowed.tensor()?.device().clone(),
         )
     };
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -4231,11 +4610,11 @@ fn copy_inplace(
     let source = tensor_arg(OP, args, kwargs, 1, "src")?;
     let (tag, shape) = {
         let borrowed = receiver.borrow();
-        (borrowed.tag(), borrowed.tensor().shape().clone())
+        (borrowed.tag(), borrowed.tensor()?.shape().clone())
     };
 
     let widened = source
-        .tensor()
+        .tensor()?
         .broadcast_as(shape)
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
@@ -4296,7 +4675,7 @@ fn add_inplace(
 
     let (tag, shape) = {
         let borrowed = receiver.borrow();
-        (borrowed.tag(), borrowed.tensor().shape().clone())
+        (borrowed.tag(), borrowed.tensor()?.shape().clone())
     };
     if tag == TorchDType::Bool {
         return Err(not_implemented(format!(
@@ -4308,12 +4687,12 @@ fn add_inplace(
     let lhs = {
         let borrowed = receiver.borrow();
         borrowed
-            .tensor()
+            .tensor()?
             .to_dtype(storage)
             .map_err(|e| candle_err(OP, e))?
     };
     let mut rhs = other
-        .tensor()
+        .tensor()?
         .to_dtype(storage)
         .and_then(|t| t.broadcast_as(shape))
         .and_then(|t| t.contiguous())
@@ -4424,10 +4803,10 @@ fn rng_target(op: &str, receiver: &Bound<'_, PyTensorBase>) -> PyResult<RngTarge
     Ok(RngTarget {
         tag,
         storage: rng_float_dtype(op, tag)?,
-        shape: borrowed.tensor().shape().clone(),
-        device: borrowed.tensor().device().clone(),
-        numel: borrowed.tensor().elem_count(),
-        contiguous: borrowed.tensor().is_contiguous(),
+        shape: borrowed.tensor()?.shape().clone(),
+        device: borrowed.tensor()?.device().clone(),
+        numel: borrowed.tensor()?.elem_count(),
+        contiguous: borrowed.tensor()?.is_contiguous(),
     })
 }
 
@@ -4745,7 +5124,7 @@ fn order_along(
     descending: bool,
     keep: Option<usize>,
 ) -> PyResult<Ordered> {
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     // A 0-d tensor is one lane of one element; torch answers `sort`/`topk` on
     // one with a 0-d value and a 0-d index of 0, rather than refusing.
     let (outer, n, inner) = if dims.is_empty() {
@@ -4759,7 +5138,7 @@ fn order_along(
     };
     let keep = keep.unwrap_or(n);
 
-    let source = read_flat(op, input.tensor(), input.tag())?;
+    let source = read_flat(op, input.tensor()?, input.tag())?;
     let mut values = source.empty_like(outer * keep * inner);
     let mut indices = vec![0i64; outer * keep * inner];
 
@@ -4869,11 +5248,11 @@ fn sort_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.sort.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
     let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
     let ordered = order_along(OP, &input, dim, descending, None)?;
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
     finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
 }
 
@@ -4891,7 +5270,7 @@ fn topk_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.topk.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let k = int_arg(args, kwargs, 1, "k")?.ok_or_else(|| missing(OP, "k"))?;
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
     let largest = bool_arg(args, kwargs, 3, "largest")?.unwrap_or(true);
@@ -4900,7 +5279,7 @@ fn topk_default(
     // within that licence.
     let _sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
 
-    let extent = if rank == 0 { 1 } else { input.tensor().dims()[dim] };
+    let extent = if rank == 0 { 1 } else { input.tensor()?.dims()[dim] };
     if k < 0 || k as usize > extent {
         // torch's own wording, and torch's own conflation of "negative" with
         // "too large" -- `topk(x, -1)` gives this same message upstream.
@@ -4909,7 +5288,7 @@ fn topk_default(
         ));
     }
     let ordered = order_along(OP, &input, dim, largest, Some(k as usize))?;
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
     finish_ordered(py, OP, &TOPK_RESULT, "topk", ordered, input.tag(), &device)
 }
 
@@ -4926,7 +5305,7 @@ fn squeeze_dim(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.squeeze.dim";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim = normalise_dim(
         OP,
         dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
@@ -4935,12 +5314,12 @@ fn squeeze_dim(
     // A 0-d tensor has nothing to remove; `normalise_dim` already accepted
     // dim 0 and -1 on it, as torch does.
     if rank == 0 {
-        return finish(py, input.tensor().clone(), input.tag());
+        return finish(py, input.tensor()?.clone(), input.tag());
     }
     // candle's `squeeze` carries the same "size != 1 is a no-op" rule and does
     // it without a contiguous copy, so a strided view survives.
     let out = input
-        .tensor()
+        .tensor()?
         .squeeze(dim)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -4982,7 +5361,7 @@ fn split_tensor(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.split.Tensor";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "split expects at least a 1-dimensional tensor",
@@ -4990,7 +5369,7 @@ fn split_tensor(
     }
     let split_size = int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(OP, "split_size"))?;
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
-    let extent = input.tensor().dims()[dim];
+    let extent = input.tensor()?.dims()[dim];
 
     if split_size < 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -5010,14 +5389,14 @@ fn split_tensor(
         // `split_size == 0` and `split_size == 3`.
         chunks.push(crate::tensor::promote(
             py,
-            finish(py, input.tensor().clone(), input.tag())?,
+            finish(py, input.tensor()?.clone(), input.tag())?,
         )?);
     } else {
         let mut start = 0usize;
         while start < extent {
             let length = split_size.min(extent - start);
             let chunk = input
-                .tensor()
+                .tensor()?
                 .narrow(dim, start, length)
                 .map_err(|e| candle_err(OP, e))?;
             chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
@@ -5060,7 +5439,7 @@ fn split_with_sizes(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.split_with_sizes.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "split expects at least a 1-dimensional tensor",
@@ -5068,7 +5447,7 @@ fn split_with_sizes(
     }
     let sizes_raw: Vec<i64> = required(OP, args, kwargs, 1, "split_sizes")?.extract()?;
     let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
-    let extent = input.tensor().dims()[dim];
+    let extent = input.tensor()?.dims()[dim];
 
     if sizes_raw.iter().any(|&s| s < 0) {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -5088,7 +5467,7 @@ fn split_with_sizes(
     for &size in &sizes_raw {
         let length = size as usize;
         let chunk = input
-            .tensor()
+            .tensor()?
             .narrow(dim, start, length)
             .map_err(|e| candle_err(OP, e))?;
         chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
@@ -5155,7 +5534,7 @@ fn native_layer_norm_default(
         ));
     }
 
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let k = normalized.len();
     let suffix_matches = dims.len() >= k
         && dims[dims.len() - k..]
@@ -5181,11 +5560,11 @@ fn native_layer_norm_default(
 
     for (label, param) in [("weight", &weight), ("bias", &bias)] {
         if let Some(param) = param {
-            if param.tensor().dims() != ns.as_slice() {
+            if param.tensor()?.dims() != ns.as_slice() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "Expected {label} to be of same shape as normalized_shape, but got \
                      {label} of shape {:?} and normalized_shape = {ns:?}",
-                    param.tensor().dims()
+                    param.tensor()?.dims()
                 )));
             }
         }
@@ -5241,7 +5620,7 @@ fn native_layer_norm_default(
         .copied()
         .chain(std::iter::repeat(1).take(k))
         .collect();
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
 
     // No rows to reduce over: every result is empty, and candle's reductions
     // have nothing to say about a zero-length axis.
@@ -5264,7 +5643,7 @@ fn native_layer_norm_default(
     }
 
     let flat = input
-        .tensor()
+        .tensor()?
         .contiguous()
         .and_then(|t| t.to_dtype(acc))
         .and_then(|t| t.reshape((rows, cols)))
@@ -5283,7 +5662,7 @@ fn native_layer_norm_default(
     let mut out = centred.broadcast_mul(&rstd).map_err(|e| candle_err(OP, e))?;
     if let Some(weight) = &weight {
         let row = weight
-            .tensor()
+            .tensor()?
             .contiguous()
             .and_then(|t| t.to_dtype(acc))
             .and_then(|t| t.reshape((1, cols)))
@@ -5292,7 +5671,7 @@ fn native_layer_norm_default(
     }
     if let Some(bias) = &bias {
         let row = bias
-            .tensor()
+            .tensor()?
             .contiguous()
             .and_then(|t| t.to_dtype(acc))
             .and_then(|t| t.reshape((1, cols)))
@@ -5364,10 +5743,10 @@ fn softmax_default(
             scalar_type_name(tag)
         )));
     }
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     let dim = normalise_dim(OP, dim_raw, rank)?;
 
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let (outer, n, inner) = if dims.is_empty() {
         (1usize, 1usize, 1usize)
     } else {
@@ -5378,7 +5757,7 @@ fn softmax_default(
         )
     };
 
-    let source = match read_flat(OP, input.tensor(), tag)? {
+    let source = match read_flat(OP, input.tensor()?, tag)? {
         Flat::Float(v) => v,
         Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
     };
@@ -5386,7 +5765,7 @@ fn softmax_default(
     let double_acc = storage == candle_core::DType::F64;
     let out = softmax_body(&source, outer, n, inner, double_acc, false);
 
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
     let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
     finish(py, tensor, tag)
 }
@@ -5500,12 +5879,12 @@ fn safe_softmax_default(
         Some(want) => {
             let storage = PyDtype::new(want).storage(OP)?;
             let cast = input
-                .tensor()
+                .tensor()?
                 .to_dtype(storage)
                 .map_err(|e| candle_err(OP, e))?;
             (cast, want)
         }
-        None => (input.tensor().clone(), input.tag()),
+        None => (input.tensor()?.clone(), input.tag()),
     };
     if !tag.is_floating_point() {
         return Err(not_implemented(format!(
@@ -5587,16 +5966,16 @@ fn scatter_src(
         )));
     }
 
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank == 0 {
         return Err(not_implemented(
             "aten.scatter.src: 0-dim self not implemented in torch._C shim",
         ));
     }
     let dim = normalise_dim(OP, dim_raw, rank)?;
-    let self_dims = input.tensor().dims().to_vec();
-    let idx_dims = index.tensor().dims().to_vec();
-    let src_dims = src.tensor().dims().to_vec();
+    let self_dims = input.tensor()?.dims().to_vec();
+    let idx_dims = index.tensor()?.dims().to_vec();
+    let src_dims = src.tensor()?.dims().to_vec();
     if idx_dims.len() != rank {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "Index tensor must have the same number of dimensions as self tensor",
@@ -5616,9 +5995,9 @@ fn scatter_src(
         }
     }
 
-    let mut out = read_flat(OP, input.tensor(), tag)?;
-    let source = read_flat(OP, src.tensor(), tag)?;
-    let positions = match read_flat(OP, index.tensor(), index.tag())? {
+    let mut out = read_flat(OP, input.tensor()?, tag)?;
+    let source = read_flat(OP, src.tensor()?, tag)?;
+    let positions = match read_flat(OP, index.tensor()?, index.tag())? {
         Flat::Int(v) => v,
         Flat::Float(_) => unreachable!("the index dtype was checked above"),
     };
@@ -5658,7 +6037,7 @@ fn scatter_src(
         }
     }
 
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
     let tensor = write_flat(OP, out, self_dims, &device, tag)?;
     finish(py, tensor, tag)
 }
@@ -5720,12 +6099,12 @@ fn gather_default(
     // `ensure_nonempty_dim`/`ensure_nonempty_size`: a 0-d tensor counts as one
     // dimension of extent 1 for the purposes of both the rank check and the
     // bounds check. The *output* still gets the index's real shape.
-    let self_dims: Vec<usize> = if input.tensor().rank() == 0 {
+    let self_dims: Vec<usize> = if input.tensor()?.rank() == 0 {
         vec![1]
     } else {
-        input.tensor().dims().to_vec()
+        input.tensor()?.dims().to_vec()
     };
-    let idx_shape = index.tensor().dims().to_vec();
+    let idx_shape = index.tensor()?.dims().to_vec();
     let idx_dims: Vec<usize> = if idx_shape.is_empty() {
         vec![1]
     } else {
@@ -5736,7 +6115,7 @@ fn gather_default(
             "Index tensor must have the same number of dimensions as input tensor",
         ));
     }
-    let dim = normalise_dim(OP, dim_raw, input.tensor().rank())?;
+    let dim = normalise_dim(OP, dim_raw, input.tensor()?.rank())?;
     for d in 0..self_dims.len() {
         if d != dim && idx_dims[d] > self_dims[d] {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -5746,8 +6125,8 @@ fn gather_default(
         }
     }
 
-    let source = read_flat(OP, input.tensor(), tag)?;
-    let positions = match read_flat(OP, index.tensor(), index.tag())? {
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let positions = match read_flat(OP, index.tensor()?, index.tag())? {
         Flat::Int(v) => v,
         Flat::Float(_) => unreachable!("the index dtype was checked above"),
     };
@@ -5790,7 +6169,7 @@ fn gather_default(
         }
     }
 
-    let device = input.tensor().device().clone();
+    let device = input.tensor()?.device().clone();
     let tensor = write_flat(OP, out, idx_shape, &device, tag)?;
     finish(py, tensor, tag)
 }
@@ -5874,13 +6253,13 @@ fn multinomial_default(
             scalar_type_name(tag)
         )));
     }
-    let rank = input.tensor().rank();
+    let rank = input.tensor()?.rank();
     if rank != 1 && rank != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "prob_dist must be 1 or 2 dim",
         ));
     }
-    let dims = input.tensor().dims().to_vec();
+    let dims = input.tensor()?.dims().to_vec();
     let n_categories = dims[rank - 1];
     let n_dist = if rank == 2 { dims[0] } else { 1 };
     if num_samples <= 0 {
@@ -5896,8 +6275,8 @@ fn multinomial_default(
     }
 
     let storage = PyDtype::new(tag).storage(OP)?;
-    let device = input.tensor().device().clone();
-    let probs = match read_flat(OP, input.tensor(), tag)? {
+    let device = input.tensor()?.device().clone();
+    let probs = match read_flat(OP, input.tensor()?, tag)? {
         Flat::Float(v) => v,
         Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
     };
@@ -6126,14 +6505,14 @@ fn scalar_arg(
     // overload resolver in bootstrap.py binds one here for the same reason, so
     // refusing it at the kernel would make the two disagree.
     if let Ok(tensor) = value.extract::<PyTensorBase>() {
-        if tensor.tensor().rank() != 0 {
+        if tensor.tensor()?.rank() != 0 {
             return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                 "{op}: argument '{name}' as a tensor must be zero-dim, got {}D",
-                tensor.tensor().rank()
+                tensor.tensor()?.rank()
             )));
         }
         let as_f64 = tensor
-            .tensor()
+            .tensor()?
             .to_dtype(candle_core::DType::F64)
             .and_then(|t| t.to_scalar::<f64>())
             .map_err(|err| candle_err(op, err))?;
@@ -6289,41 +6668,29 @@ fn optional_tensor_arg(
     }
 }
 
-/// A factory op's `device=` slot. Absent means the default device, which for
-/// this shim is always the CPU -- `torch.set_default_device` is not one of the
-/// names implemented here (docs/DEVICE_ABS.md §5), so there is no global to
-/// consult and the constant is the truthful answer rather than a placeholder.
-fn device_arg(
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-    index: usize,
-    name: &str,
-) -> PyResult<Device> {
-    device_arg_or(args, kwargs, index, name, &Device::Cpu)
-}
-
-/// The same slot, for ops whose default is **not** the global default but the
-/// device of a tensor they were handed.
+/// A factory op's `device=` slot, as a **label**.
 ///
-/// `aten::_to_copy(self, dtype=None, ..., device=None, ...)` is the one that
-/// matters: `device=None` means "stay where you are", and reading it as "go to
-/// the CPU" is a silent transfer. It is unobservable while there is one device
-/// -- which is exactly why it survived to be found by reading rather than by a
-/// failing test -- and it is wrong the day there are two. docs/DEVICE_ABS.md §4.
-fn device_arg_or(
+/// The label rather than a resolved handle, because `meta` has no handle to
+/// resolve to: a factory has to see `meta` and build a storage-less tensor
+/// instead of allocating one. `device_arg` below is this plus `resolve()`, for
+/// the kernels that have no meta path and should fail loudly if handed one.
+///
+/// Absent means `fallback`. For most factories that is the CPU -- the
+/// process-wide default device lives above this layer, in the torch-function
+/// mode stack that `bootstrap.py` consults before a call ever reaches the
+/// dispatcher (docs/META.md §8), which is where upstream puts it too.
+fn device_arg_or_label(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
     name: &str,
-    fallback: &Device,
-) -> PyResult<Device> {
+    fallback: &PyDevice,
+) -> PyResult<PyDevice> {
     match optional(args, kwargs, index, name)? {
-        Some(value) if !value.is_none() => {
-            // torch accepts a plain string, another `device`, or an integer
-            // wherever a device is taken; `coerce` is the one place that knows
-            // which of those are legal and what each means.
-            PyDevice::coerce(&value)?.resolve()
-        }
+        // torch accepts a plain string, another `device`, or an integer
+        // wherever a device is taken; `coerce` is the one place that knows
+        // which of those are legal and what each means.
+        Some(value) if !value.is_none() => PyDevice::coerce(&value),
         _ => Ok(fallback.clone()),
     }
 }

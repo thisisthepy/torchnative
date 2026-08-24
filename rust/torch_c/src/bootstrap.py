@@ -1344,6 +1344,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_behaviour(module, dispatch)
+    _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
     _install_serialization(module)
 
@@ -1522,6 +1523,109 @@ def _install_serialization(module) -> None:
     module._check_sparse_tensor_invariants = lambda: False
 
 
+# ---------------------------------------------------------------------------
+# The torch-function mode stack
+# ---------------------------------------------------------------------------
+#
+# `with torch.device("meta"):` is not a device feature. Upstream implements it
+# as a `TorchFunctionMode` -- `torch/utils/_device.py:DeviceContext` -- pushed
+# onto a stack that every factory function consults, and `torch.device.__enter__`
+# in `torch/csrc/Device.cpp` does nothing but push it. So the context manager
+# and `torch.set_default_device` are the same mechanism wearing two names, and
+# neither can be built without the stack.
+#
+# **The stack alone would have been worse than nothing**, and that is the whole
+# reason this file grew a mode dispatch as well. docs/DEVICE_ABS.md §7.2 said
+# it in advance: push a `DeviceContext` and never consult it and
+# `with torch.device("meta"): torch.zeros(2)` returns a *CPU* tensor, silently,
+# with the block appearing to work. A `NotImplementedError` is better than a
+# wrong answer, so either both halves land or neither does.
+#
+# Everything above `_C` is already vendored and needs nothing written here:
+# `torch/overrides.py` has `TorchFunctionMode`, `_push_mode`, `_pop_mode` and
+# `_get_current_function_mode_stack`; `torch/utils/_device.py` has
+# `DeviceContext`; `torch/__init__.py` has `set_default_device` and
+# `get_default_device`. All five `_C` names they bottom out in are below.
+#
+# **The stack is process-wide where upstream's is thread-local.**
+# `PythonTorchFunctionTLS` is per-thread; this is one list. Recorded rather than
+# fixed: a mode entered on one thread would be seen by another, which upstream
+# would not do. Nothing in this shim's measured paths is multi-threaded, and the
+# fix (a `threading.local`) is a two-line change in this block if that stops
+# being true.
+_MODE_STACK: list = []
+
+
+def _through_torch_function_modes(func, args, kwargs):
+    """Run `func` under the innermost mode, upstream's way.
+
+    The top mode is **popped for the duration**, which is not bookkeeping but
+    the thing that makes modes work at all: every `__torch_function__`
+    implementation ends by calling `func(*args, **kwargs)` again, and without
+    the pop that call would find the same mode still on top and recurse
+    forever. Upstream does the same with a `StashTorchFunctionModeGuard`.
+
+    `types` is passed empty. Upstream fills it with the argument types that
+    override `__torch_function__`, and this shim answers `False` to every
+    `_has_torch_function*` predicate for the reason recorded above
+    `_DISCOVERED_RETURNS` -- no type in the vendored tree overrides it. So the
+    honest tuple is the empty one, and `DeviceContext.__torch_function__` (the
+    only mode that reaches here today) does not read it.
+    """
+    mode = _MODE_STACK.pop()
+    try:
+        return mode.__torch_function__(func, (), args, kwargs)
+    finally:
+        _MODE_STACK.append(mode)
+
+
+def _install_torch_function_modes(module) -> None:
+    """The five `_C` names `torch/overrides.py` bottoms out in."""
+
+    def _push_on_torch_function_stack(mode):
+        _MODE_STACK.append(mode)
+
+    def _pop_torch_function_stack():
+        if not _MODE_STACK:
+            # Upstream raises here too; `DeviceContext.__exit__` relies on the
+            # stack being non-empty and would otherwise unwind past its own
+            # entry silently.
+            raise RuntimeError(
+                "torch._C shim: pop from an empty torch function mode stack"
+            )
+        return _MODE_STACK.pop()
+
+    def _len_torch_function_stack():
+        return len(_MODE_STACK)
+
+    def _get_function_stack_at(index):
+        return _MODE_STACK[index]
+
+    def _is_torch_function_mode_enabled():
+        return bool(_MODE_STACK)
+
+    # `_is_torch_function_enabled` is a *different* question from the one above
+    # and keeps its old answer: upstream returns whether the torch-function
+    # protocol is enabled for subclasses at all, which is what gates the
+    # `has_torch_function*` predicates. No type here overrides
+    # `__torch_function__`, so `False` stays the fact -- see the note above
+    # `_DISCOVERED_RETURNS`. Only the *mode* half became real.
+    def _is_torch_function_enabled():
+        return False
+
+    for fn in (
+        _push_on_torch_function_stack,
+        _pop_torch_function_stack,
+        _len_torch_function_stack,
+        _get_function_stack_at,
+        _is_torch_function_mode_enabled,
+        _is_torch_function_enabled,
+    ):
+        fn.__qualname__ = fn.__name__
+        fn.__module__ = "torch._C"
+        setattr(module, fn.__name__, fn)
+
+
 def _torch_level_function(name: str, dispatch, overloads):
     """A `torch.<name>` harvested from `_VariableFunctions`.
 
@@ -1541,9 +1645,22 @@ def _torch_level_function(name: str, dispatch, overloads):
     """
     entry = overloads.get(name)
 
+    # The mode check is written out in both branches rather than wrapped around
+    # them, and that is a cost decision. A decorator would add a Python frame to
+    # every one of ~985 functions on every call; a module-global truthiness test
+    # is a `LOAD_GLOBAL` and a jump. It costs nothing measurable when no mode is
+    # entered, which is every call this shim has ever made outside a
+    # `with torch.device(...)` block.
+    #
+    # `fn` passes *itself* as `func`. That is required, not stylistic:
+    # `DeviceContext.__torch_function__` tests `func in _device_constructors()`,
+    # a set built by reading `torch.zeros`, `torch.empty` and 34 more names off
+    # the `torch` module -- which are these exact closure objects.
     if entry is None:
 
         def fn(*args, **kwargs):
+            if _MODE_STACK:
+                return _through_torch_function_modes(fn, args, kwargs)
             raise NotImplementedError(
                 f"not implemented in torch._C shim: torch.{name}(...) -- overload "
                 f"resolution has no table entry for this op "
@@ -1555,6 +1672,8 @@ def _torch_level_function(name: str, dispatch, overloads):
     else:
 
         def fn(*args, **kwargs):
+            if _MODE_STACK:
+                return _through_torch_function_modes(fn, args, kwargs)
             key, bound = entry.resolve(args, _strip_python_only_kwargs(name, kwargs))
             return dispatch(key, **bound)
 
@@ -2152,6 +2271,15 @@ def _tensor_factory(module, dispatch):
     """
 
     def tensor(data, *, dtype=None, device=None, requires_grad=False, pin_memory=False):
+        # `torch.tensor` is one of the 36 names `DeviceContext` treats as a
+        # device constructor, so it has to consult the mode stack like every
+        # `_torch_level_function` does. It is spelled out here rather than
+        # shared because this function is not built by that factory -- see the
+        # docstring.
+        if _MODE_STACK:
+            kwargs = {"dtype": dtype, "device": device,
+                      "requires_grad": requires_grad, "pin_memory": pin_memory}
+            return _through_torch_function_modes(tensor, (data,), kwargs)
         if requires_grad:
             raise NotImplementedError(
                 "not implemented in torch._C shim: torch.tensor(requires_grad=True) "
@@ -2309,13 +2437,17 @@ _DISCOVERED_RETURNS = {
     "_has_torch_function": False,
     "_has_torch_function_unary": False,
     "_has_torch_function_variadic": False,
-    # The mode stack, which `torch/overrides.py` and
-    # `torch/utils/_python_dispatch.py` consult before the predicates above.
-    # No mode is ever pushed here, so the stack is empty and disabled.
-    "_is_torch_function_enabled": False,
-    "_is_torch_function_mode_enabled": False,
+    # The *dispatch*-mode stack, which `torch/utils/_python_dispatch.py`
+    # consults. Nothing pushes onto it here, so it is empty and disabled.
+    #
+    # Its torch-*function* sibling used to be beside it as another pair of
+    # constants (`_len_torch_function_stack: 0`,
+    # `_is_torch_function_mode_enabled: False`). It is a real stack now --
+    # `_install_torch_function_modes` below -- because `with torch.device(...)`
+    # is a torch-function mode and nothing else, and a stack that always
+    # answered zero would have made `with torch.device("meta"):` a block that
+    # succeeded and changed nothing. docs/META.md §8.
     "_is_torch_function_all_disabled": False,
-    "_len_torch_function_stack": 0,
     "_len_torch_dispatch_stack": 0,
 }
 

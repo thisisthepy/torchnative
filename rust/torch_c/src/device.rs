@@ -133,6 +133,30 @@ impl PyDevice {
         }
     }
 
+    /// The one `meta` device.
+    ///
+    /// Index-less on purpose and by measurement, not by simplification:
+    /// upstream normalises every meta index away, so `torch.zeros(2,
+    /// device="meta:7").device` is `device(type='meta')`, exactly as
+    /// `device="cpu:3"` reports plain `cpu`. `meta:7` is still a *label* that
+    /// constructs (the closed vocabulary accepts it and `==` distinguishes it
+    /// from bare `meta`); it is only tensors that forget the index.
+    pub fn meta() -> Self {
+        Self {
+            kind: "meta".to_string(),
+            index: None,
+        }
+    }
+
+    /// Does this label name the meta device?
+    ///
+    /// The one place a device kind is branched on outside `resolve`, because
+    /// meta is the one kind that is *not* a candle backend: it resolves to no
+    /// handle at all rather than to a handle this build lacks.
+    pub fn is_meta(&self) -> bool {
+        self.kind == "meta"
+    }
+
     /// Build from a validated type/index pair. The only constructor Rust code
     /// should use, so that no path can create a label the Python constructor
     /// would have refused.
@@ -209,6 +233,17 @@ impl PyDevice {
     pub fn resolve(&self) -> PyResult<Device> {
         match self.kind.as_str() {
             "cpu" => Ok(Device::Cpu),
+            // `meta` is not a backend this build is missing -- it is a device
+            // with no backend *by definition*, so it never becomes a candle
+            // handle. A caller that reaches here with `meta` has forgotten to
+            // branch on `is_meta()` before resolving, and saying so is more
+            // use than repeating the "not available" message the other
+            // nineteen kinds share.
+            "meta" => Err(not_implemented(
+                "torch._C shim: the meta device has no backend to resolve to -- a \
+                 meta tensor holds shape and dtype and no storage, so this call site \
+                 has to branch on PyDevice::is_meta() before resolving (docs/META.md)",
+            )),
             other => Err(not_implemented(format!(
                 "device not available in torch._C shim: {other}"
             ))),
@@ -341,6 +376,53 @@ impl PyDevice {
                 })
             }
         }
+    }
+
+    /// `with torch.device("meta"): ...`
+    ///
+    /// **A device is not a context manager; it makes one.** Upstream's
+    /// `THPDevice_enter` (`torch/csrc/Device.cpp`) imports
+    /// `torch.utils._device`, builds a `DeviceContext` -- a `TorchFunctionMode`
+    /// -- pushes it onto the torch-function stack and returns *`self`*, not the
+    /// mode. That last detail is measured, not guessed:
+    /// `with torch.device("meta") as d: repr(d)` is `device(type='meta')`.
+    ///
+    /// It pushes directly rather than calling `DeviceContext.__enter__`, again
+    /// following upstream. The Python `__enter__` does an unstack/restack dance
+    /// to force the mode to the *bottom* of the stack, which is what
+    /// `torch.set_default_device` wants (a default should not shadow a mode
+    /// entered after it) and what a lexically nested `with` block must not have
+    /// (the inner device has to win). Measured both ways: nested
+    /// `with meta: with cpu:` gives `cpu` inside and `meta` outside.
+    ///
+    /// The whole thing hangs on a real mode stack existing, and on every
+    /// factory consulting it. `bootstrap.py` `_install_torch_function_modes`
+    /// and `_torch_level_function` are the other two thirds; without them this
+    /// method would make `with torch.device("meta"):` a block that succeeded
+    /// and changed nothing, which docs/DEVICE_ABS.md §7.2 argued is worse than
+    /// refusing.
+    fn __enter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let context = py
+            .import("torch.utils._device")?
+            .getattr("DeviceContext")?
+            .call1((slf,))?;
+        py.import("torch._C")?
+            .getattr("_push_on_torch_function_stack")?
+            .call1((context,))?;
+        Ok(slf.clone().into_any())
+    }
+
+    /// Pops what `__enter__` pushed. The arguments are the exception triple
+    /// the protocol passes and upstream ignores; a `None` return propagates any
+    /// exception, which is what a device context should do.
+    #[pyo3(signature = (*_exc))]
+    fn __exit__(slf: &Bound<'_, Self>, _exc: &Bound<'_, PyTuple>) -> PyResult<()> {
+        let py = slf.py();
+        py.import("torch._C")?
+            .getattr("_pop_torch_function_stack")?
+            .call0()?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {

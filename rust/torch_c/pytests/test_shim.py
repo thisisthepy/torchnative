@@ -272,14 +272,12 @@ def test_the_two_accelerator_questions_get_two_different_answers():
 
 
 def test_mixed_device_gate_lets_agreeing_tensors_through():
-    """Two halves, and only one of them is reachable in this build.
+    """The passing half of the gate. The refusing half is the next test.
 
     `_aten_dispatch` refuses an op whose tensor arguments disagree about their
-    device (`check_devices_agree` in aten.rs). The refusing half **cannot fire
-    here** -- `PyDevice::resolve` accepts no label but `cpu`, so every tensor is
-    on the CPU and the scan always finds one device. What is reachable is the
-    traversal: agreeing tensors must still dispatch, through a plain argument
-    and through the `Tensor[]` a top-level-only scan would miss.
+    device (`check_devices_agree` in aten.rs). This half -- agreeing tensors
+    still dispatch, through a plain argument and through the `Tensor[]` a
+    top-level-only scan would miss -- is the one that runs on every call.
 
     `_shim_same_device` is the *label*-level version of the comparison -- what a
     device-carrying tensor would need (docs/DEVICE_ABS.md §3.2). It has no other
@@ -2083,7 +2081,6 @@ for name, call in (
     ("tensor_to_cuda", lambda: t.to("cuda")),
     ("tensor_cuda_method", lambda: t.cuda()),
     ("factory_cuda", lambda: torch.zeros(2, device="cuda")),
-    ("tensor_to_meta", lambda: t.to("meta")),
 ):
     try:
         call()
@@ -2179,8 +2176,406 @@ def test_device_road_through_the_vendored_tree():
     assert r["tensor_to_cuda"] == "refused:cuda", r["tensor_to_cuda"]
     assert r["tensor_cuda_method"] == "refused:cuda", r["tensor_cuda_method"]
     assert r["factory_cuda"] == "refused:cuda", r["factory_cuda"]
-    assert r["tensor_to_meta"] == "refused:meta", r["tensor_to_meta"]
     assert r["typo_refused"] is True, r["typo_refused"]
+
+    # `meta` used to be in the loop above, refused alongside `cuda`. It is not
+    # the same kind of thing and now it does not behave like one: `cuda` is a
+    # backend this build does not link, `meta` is a device that needs no
+    # backend at all. `t.to("meta")` returns a tensor here now, and the
+    # measurement that it is the *right* tensor lives in
+    # `test_meta_tensors_carry_shape_and_dtype_and_no_data`. docs/META.md.
+
+
+# --- the meta device (docs/META.md) -----------------------------------------
+#
+# `meta` is the second device this build has, and the first one that needed no
+# backend. That is what it is *for* here: every claim docs/DEVICE_ABS.md had to
+# argue about "when there are two devices" is testable now, and the tests below
+# are that argument turned into assertions.
+
+
+def test_meta_tensors_carry_shape_and_dtype_and_no_data():
+    """The whole of what a meta tensor is, and the whole of what it is not.
+
+    Every expected value here was measured on upstream torch 2.13.0 first
+    (docs/META.md §2) -- including the two *different* refusals, which are not
+    tidied into one: `.tolist()` is
+    `NotImplementedError: Cannot copy out of meta tensor; no data!` and
+    `.item()` is `RuntimeError: Tensor.item() cannot be called on meta
+    tensors`. A shim that unified them would be reporting a shape upstream
+    does not have.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+
+    t = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
+    assert tuple(t.shape) == (2, 3)
+    assert t.dtype == _C.float32
+    assert t.device == meta
+    assert t.is_meta is True
+    assert t.is_cpu is False
+    assert t.is_cuda is False
+    assert t.numel() == 6
+    assert t.dim() == 2
+    assert t.element_size() == 4
+    assert t.size(0) == 2 and t.size(-1) == 3
+
+    # No bytes, and it says so rather than producing any.
+    try:
+        t.tolist()
+    except NotImplementedError as e:
+        assert str(e) == "Cannot copy out of meta tensor; no data!", str(e)
+    else:
+        raise AssertionError("tolist() on a meta tensor returned data")
+
+    one = d("aten.empty.memory_format", [1], _C.float32, device=meta)
+    try:
+        d("aten._local_scalar_dense.default", one)
+    except RuntimeError as e:
+        assert str(e) == "Tensor.item() cannot be called on meta tensors", str(e)
+    else:
+        raise AssertionError("item() on a meta tensor returned a scalar")
+
+
+def test_meta_drops_the_device_index_where_cpu_does_too():
+    """Measured, not tidied: upstream normalises every meta index away.
+
+    `torch.zeros(2, device="meta:7").device` is `device(type='meta')`, exactly
+    as `device="cpu:3"` reports plain `cpu`. That is why `Repr::Meta` stores no
+    label -- there is only one meta device, so the label is a constant, and
+    `PyDevice::from_candle`'s hardcoded index (docs/DEVICE_ABS.md §3.2) is not
+    the thing that answers for it.
+
+    The *label* `meta:7` still exists and is still unequal to bare `meta`;
+    it is tensors that forget the index, not labels.
+    """
+    d = _C._aten_dispatch
+    for spelling in ("meta", "meta:0", "meta:7"):
+        t = d("aten.empty.memory_format", [2], device=_C.device(spelling))
+        assert t.device == _C.device("meta"), (spelling, t.device)
+    assert _C.device("meta:7") != _C.device("meta")
+    assert _C._shim_same_device(_C.device("meta"), _C.device("meta:7"))
+
+
+def test_the_gate_refuses_a_mixed_device_op_and_finds_it_in_a_sequence():
+    """**The half of `check_devices_agree` that had never run.**
+
+    docs/DEVICE_ABS.md §10 recorded it as untested and unreachable: with `cpu`
+    the only resolvable label, an input that disagreed could not be built. It
+    can now, and running it found a real hole -- the keyword loop did not
+    descend into sequences, and every torch-level call arrives with its
+    arguments bound by *name*, so `cat([cpu, meta])` went straight past the
+    gate. docs/META.md §5.
+
+    Both argument shapes are pinned here for that reason: a plain tensor
+    argument and a `Tensor[]`, each positionally *and* by keyword.
+    """
+    d = _C._aten_dispatch
+    cpu = d("aten.full.default", [2], 1.0)
+    meta = d("aten.empty.memory_format", [2], _C.float32, device=_C.device("meta"))
+
+    def refuses(*args, **kwargs):
+        try:
+            d(*args, **kwargs)
+        except RuntimeError as e:
+            assert "at least two devices" in str(e), str(e)
+            return True
+        except NotImplementedError as e:  # pragma: no cover - the bug this pins
+            raise AssertionError(
+                "the gate did not fire; the call reached a kernel and died "
+                f"there instead: {e}"
+            )
+        return False
+
+    assert refuses("aten.add.Tensor", cpu, meta)
+    assert refuses("aten.add.Tensor", meta, cpu)
+    assert refuses("aten.add.Tensor", self=cpu, other=meta)
+    assert refuses("aten.cat.default", [cpu, meta])
+    assert refuses("aten.cat.default", (cpu, meta))
+    assert refuses("aten.cat.default", tensors=[cpu, meta])
+    assert refuses("aten.cat.default", tensors=(meta, cpu))
+
+    # And the passing half still passes, on both devices.
+    assert d("aten.add.Tensor", cpu, cpu).tolist() == [2.0, 2.0]
+    assert d("aten.detach.default", meta).is_meta is True
+
+    # `copy_` is the exception upstream carves out, because transferring is
+    # the definition of the op. The direction decides what happens:
+    # meta <- cpu is a no-op that keeps the receiver on meta (upstream warns
+    # about exactly this in `load_state_dict`), cpu <- meta has nothing to read.
+    assert d("aten.copy_.default", meta, cpu).is_meta is True
+    try:
+        d("aten.copy_.default", cpu, meta)
+    except NotImplementedError as e:
+        assert str(e) == "Cannot copy out of meta tensor; no data!", str(e)
+    else:
+        raise AssertionError("cpu.copy_(meta) read bytes that do not exist")
+
+
+def test_meta_transfers_go_one_way_only():
+    """`cpu -> meta` discards; `meta -> cpu` refuses. Both are upstream's.
+
+    This is the property `meta` exists for, and the one a shim could most
+    easily get wrong in the expensive direction: materialising zeros for
+    `meta.to("cpu")` would turn "these weights were never loaded" into "these
+    weights are zero", which is the failure `docs/CKPT.md`'s `filled` guard
+    exists to stop one layer down.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+    cpu = _C.device("cpu")
+
+    dense = d("aten.full.default", [2], 1.0)
+    moved = d("aten._to_copy.default", dense, device=meta)
+    assert moved.is_meta is True and tuple(moved.shape) == (2,)
+    assert dense.tolist() == [1.0, 1.0]  # the source is untouched
+
+    # dtype changes stay on meta, including when `device=` is absent -- absent
+    # means "stay where you are", not "go to the CPU" (docs/DEVICE_ABS.md §5.2,
+    # observable for the first time now that there are two devices).
+    cast = d("aten._to_copy.default", moved, _C.float64)
+    assert cast.is_meta is True and cast.dtype == _C.float64
+
+    for kwargs in ({"device": cpu}, {"device": cpu, "dtype": _C.float64}):
+        try:
+            d("aten._to_copy.default", moved, **kwargs)
+        except NotImplementedError as e:
+            assert str(e) == "Cannot copy out of meta tensor; no data!", str(e)
+        else:
+            raise AssertionError(f"meta -> cpu succeeded for {kwargs}")
+
+
+def test_ops_without_a_meta_kernel_name_themselves():
+    """DESIGN.md §6's instrument, pointed at the meta device.
+
+    Shape inference for an op is a real kernel (upstream keeps thousands of
+    lines of them in `torch/_meta_registrations.py`), so the ops that have one
+    here are a short list and everything else refuses **with its own name in
+    the message**. That is the difference between a recorded boundary and a
+    hole: running a model under `with torch.device("meta")` prints the work
+    queue in frequency order rather than producing a wrong shape.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+    a = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
+    b = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
+
+    for op, args in (
+        ("aten.add.Tensor", (a, b)),
+        ("aten.mm.default", (a, a)),
+        ("aten.view.default", (a, [3, 2])),
+        ("aten.slice.Tensor", (a, 0, 0, 1)),
+        ("aten.sum.default", (a,)),
+    ):
+        try:
+            d(op, *args)
+        except NotImplementedError as e:
+            assert op in str(e), (op, str(e))
+            assert "no meta kernel" in str(e), (op, str(e))
+        else:
+            raise AssertionError(f"{op} answered on meta without a meta kernel")
+
+    # `_aten_implemented()` is untouched by any of this: it means "has a kernel
+    # *and* tools/golden/cases.py compares it against upstream", and a meta
+    # tensor has no values to compare. Meta support is a property of ops
+    # already on that list. docs/META.md §7.
+    assert "aten.add.Tensor" in _C._aten_implemented()
+
+
+def test_the_initialisers_a_module_constructor_runs_are_no_ops_on_meta():
+    """`nn.Linear.__init__` ends in `kaiming_uniform_`, which is `uniform_`.
+
+    Without these, `with torch.device("meta"): nn.Linear(4, 8)` stops before it
+    can produce a single parameter -- which is the entire call
+    `accelerate.init_empty_weights` is built around. Writing nothing into a
+    tensor that holds no bytes is upstream's meta kernel for them too; the
+    refusal that matters (reading the values back) is still `tolist`'s.
+    """
+    d = _C._aten_dispatch
+    t = d("aten.empty.memory_format", [2, 3], _C.float32, device=_C.device("meta"))
+    for op, args in (
+        ("aten.uniform_.default", (t, 0.0, 1.0)),
+        ("aten.normal_.default", (t, 0.0, 1.0)),
+        ("aten.zero_.default", (t,)),
+        ("aten.fill_.Scalar", (t, 3.0)),
+    ):
+        out = d(op, *args)
+        assert out is t, op
+        assert out.is_meta is True and tuple(out.shape) == (2, 3), op
+
+
+# `with torch.device(...)` needs the *vendored* tree: `torch.device.__enter__`
+# builds a `torch.utils._device.DeviceContext`, which lives in Python, and the
+# factories it rewrites are `torch._C._VariableFunctions` members reached
+# through `torch`. None of that exists around the standalone `_C` the tests
+# above import, so this one runs in the same subprocess shape as
+# `test_device_road_through_the_vendored_tree`.
+_META_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+import torch.nn as nn
+
+out = {}
+
+# -- the mode stack is real, and balanced -----------------------------------
+out["stack_before"] = torch._C._len_torch_function_stack()
+with torch.device("meta"):
+    out["stack_inside"] = torch._C._len_torch_function_stack()
+    out["zeros_device"] = str(torch.zeros(2).device)
+    out["tensor_device"] = str(torch.tensor([1.0, 2.0]).device)
+    out["empty_device"] = str(torch.empty(2, 3).device)
+    # An explicit device beats the context, which is what upstream's
+    # `kwargs.get("device") is None` guard means.
+    out["explicit_wins"] = str(torch.zeros(2, device="cpu").device)
+    out["default_inside"] = repr(torch.get_default_device())
+out["stack_after"] = torch._C._len_torch_function_stack()
+out["zeros_after"] = str(torch.zeros(2).device)
+
+# `__enter__` returns the *device*, not the mode (measured on upstream).
+with torch.device("meta") as handle:
+    out["enter_returns"] = repr(handle)
+
+# Nested: the inner block wins inside, the outer one is restored after.
+with torch.device("meta"):
+    with torch.device("cpu"):
+        out["nested_inner"] = str(torch.zeros(2).device)
+    out["nested_outer"] = str(torch.zeros(2).device)
+
+# -- set_default_device is the same mechanism, held open ---------------------
+torch.set_default_device("meta")
+out["default_device_set"] = str(torch.zeros(2).device)
+out["default_device_read"] = repr(torch.get_default_device())
+torch.set_default_device(None)
+out["default_device_cleared"] = str(torch.zeros(2).device)
+
+# -- `accelerate.init_empty_weights`, which is what all of it is for ---------
+with torch.device("meta"):
+    model = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 2))
+out["empty_params"] = [
+    [name, list(p.shape), str(p.device), type(p).__name__]
+    for name, p in model.named_parameters()
+]
+out["empty_state_dict"] = {
+    k: [str(v.device), list(v.shape)] for k, v in model.state_dict().items()
+}
+
+# ... and the weights land on it afterwards, and it computes.
+model.load_state_dict(
+    {
+        "0.weight": torch.ones(8, 4), "0.bias": torch.zeros(8),
+        "1.weight": torch.ones(2, 8), "1.bias": torch.zeros(2),
+    },
+    assign=True,
+)
+out["after_load_device"] = str(next(model.parameters()).device)
+out["after_load_forward"] = model(torch.ones(1, 4)).tolist()
+
+# -- tensor-side spellings through the vendored `Tensor` --------------------
+t = torch.zeros(2, 3)
+out["to_meta_device"] = str(t.to("meta").device)
+out["to_meta_is_not_self"] = t.to("meta") is not t
+m = t.to("meta")
+out["meta_to_meta_is_self"] = m.to("meta") is m
+out["meta_is_meta"] = m.is_meta
+try:
+    m.cpu()
+except NotImplementedError as e:
+    out["meta_cpu"] = str(e)
+else:
+    out["meta_cpu"] = "ACCEPTED"
+try:
+    torch.zeros(2) + torch.zeros(2, device="meta")
+except RuntimeError as e:
+    out["mixed_add"] = str(e)
+else:
+    out["mixed_add"] = "ACCEPTED"
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _meta_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _META_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"meta-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_meta_road_through_the_vendored_tree():
+    """`with torch.device("meta")` end to end, and the reason it had to be.
+
+    docs/DEVICE_ABS.md §7.2 refused to build the mode stack on its own, because
+    a stack nothing consults makes `with torch.device("meta"): torch.zeros(2)`
+    return a **CPU** tensor with the block appearing to work. Every assertion
+    below is the other half of that: the stack exists *and* the factories
+    consult it.
+
+    Each expected value was measured on upstream torch 2.13.0 first
+    (docs/META.md §2/§8), including the ones that are easy to guess wrong --
+    `__enter__` returns the device rather than the mode, and an explicit
+    `device=` beats the context.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    r = _meta_road_fixture()
+
+    # The stack is real and it balances. A leak here would leave every later
+    # factory call routing through a dead mode.
+    assert r["stack_before"] == 0
+    assert r["stack_inside"] == 1
+    assert r["stack_after"] == 0
+
+    # Factories consult it -- the half that would otherwise be silent.
+    assert r["zeros_device"] == "meta", r["zeros_device"]
+    assert r["tensor_device"] == "meta", r["tensor_device"]
+    assert r["empty_device"] == "meta", r["empty_device"]
+    assert r["explicit_wins"] == "cpu", r["explicit_wins"]
+    assert r["default_inside"] == "device(type='meta')", r["default_inside"]
+    assert r["zeros_after"] == "cpu", r["zeros_after"]
+    assert r["enter_returns"] == "device(type='meta')", r["enter_returns"]
+    assert r["nested_inner"] == "cpu", r["nested_inner"]
+    assert r["nested_outer"] == "meta", r["nested_outer"]
+
+    # `set_default_device` is `DeviceContext` held open, and it has to be
+    # closeable again.
+    assert r["default_device_set"] == "meta", r["default_device_set"]
+    assert r["default_device_read"] == "device(type='meta')"
+    assert r["default_device_cleared"] == "cpu", r["default_device_cleared"]
+
+    # `init_empty_weights`: a whole module with shapes, dtypes and `Parameter`
+    # identity, and not one byte allocated for its weights.
+    assert r["empty_params"] == [
+        ["0.weight", [8, 4], "meta", "Parameter"],
+        ["0.bias", [8], "meta", "Parameter"],
+        ["1.weight", [2, 8], "meta", "Parameter"],
+        ["1.bias", [2], "meta", "Parameter"],
+    ], r["empty_params"]
+    assert r["empty_state_dict"]["0.weight"] == ["meta", [8, 4]]
+
+    # ... then the real weights arrive and it computes. The number is upstream's
+    # -- the same script on torch 2.13.0 gives [[32.0, 32.0]] (docs/META.md §8).
+    assert r["after_load_device"] == "cpu", r["after_load_device"]
+    assert r["after_load_forward"] == [[32.0, 32.0]], r["after_load_forward"]
+
+    # One way only, through the vendored `Tensor.to`.
+    assert r["to_meta_device"] == "meta"
+    assert r["to_meta_is_not_self"] is True
+    assert r["meta_to_meta_is_self"] is True  # upstream: `t.to("meta") is t`
+    assert r["meta_is_meta"] is True
+    assert r["meta_cpu"] == "Cannot copy out of meta tensor; no data!", r["meta_cpu"]
+    assert "at least two devices" in r["mixed_add"], r["mixed_add"]
 
 
 def _main():

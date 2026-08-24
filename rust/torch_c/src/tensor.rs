@@ -20,9 +20,45 @@ use crate::device::PyDevice;
 use crate::dtype::{PyDtype, TorchDType};
 use crate::err::{candle_err, not_implemented};
 
+/// What a `TensorBase` is made of.
+///
+/// **The reason this is an enum is `meta`.** Upstream's meta tensor has shape,
+/// dtype and stride and *no bytes* -- `torch.zeros(2, 3, device="meta")
+/// .data_ptr()` is `0`, measured. candle has no such thing: every
+/// `candle_core::Tensor` owns storage, and `Tensor::zeros` allocates. So a
+/// meta tensor cannot be a candle tensor wearing a label; allocating and
+/// calling it `meta` would invert the one property meta exists for.
+/// docs/META.md §3.
+///
+/// The cost of the enum is paid once, at `tensor()`: it returns a `PyResult`
+/// instead of a `&Tensor`, so **no kernel can read storage off a meta tensor
+/// without handling the failure.** That is the point -- the refusal is
+/// structural rather than a check each of the 96 kernels has to remember, which
+/// is the same argument `check_devices_agree` makes for living at the door.
+#[derive(Clone)]
+pub enum Repr {
+    Dense(Tensor),
+    /// `meta`: shape and dtype, no storage.
+    ///
+    /// Stride is deliberately absent. `TensorBase` has no `.stride()` in this
+    /// shim (dense tensors do not report one either), so modelling strides here
+    /// would give meta a surface the dense side does not have. Recorded in
+    /// docs/META.md §6 as a narrowing, since upstream's meta *does* carry
+    /// stride (`torch.zeros(2,3,device="meta").t().stride()` is `(1, 3)`).
+    ///
+    /// The device label is not stored either, and that is measured rather than
+    /// assumed: upstream normalises every meta index away --
+    /// `torch.zeros(2, device="meta:7").device` is `device(type='meta')`, same
+    /// as `meta:0` and bare `meta`. So there is exactly one meta device and the
+    /// label is a constant. If a device kind ever arrives where the index
+    /// *survives*, this is the field that has to appear, and
+    /// docs/DEVICE_ABS.md §3.2 is the argument for it.
+    Meta { shape: Vec<usize> },
+}
+
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
 pub struct PyTensorBase {
-    inner: Tensor,
+    inner: Repr,
     /// The torch-level dtype. Not derivable from `inner.dtype()`: `torch.bool`
     /// and `torch.uint8` share candle's `U8` storage and differ only here.
     /// BOOL.md §5-B is the decision; §6.3 is the invariant that comes with it
@@ -66,6 +102,16 @@ impl Clone for PyTensorBase {
     }
 }
 
+/// The refusal every read of a meta tensor's bytes ends at.
+///
+/// Upstream's own wording, character for character, measured on torch 2.13.0:
+/// `torch.zeros(2, device="meta").tolist()`, `.cpu()`, `.to("cpu")` and
+/// `torch.zeros(2).copy_(meta)` all raise
+/// `NotImplementedError: Cannot copy out of meta tensor; no data!`.
+pub fn no_data() -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err("Cannot copy out of meta tensor; no data!")
+}
+
 impl PyTensorBase {
     /// A tensor whose torch dtype is whatever candle is already storing.
     pub fn new(inner: Tensor) -> PyResult<Self> {
@@ -76,11 +122,28 @@ impl PyTensorBase {
             ))
         })?;
         Ok(Self {
-            inner,
+            inner: Repr::Dense(inner),
             tag,
             requires_grad: false,
             backward_hooks: None,
         })
+    }
+
+    /// A tensor on the `meta` device: shape and dtype, no allocation.
+    ///
+    /// Unlike `new`/`boolean` there is no dtype narrowing to do -- `meta`
+    /// carries the torch tag directly and never has to be storable by candle.
+    /// That is a real widening over the dense side: `torch.empty(2,
+    /// dtype=torch.complex64, device="meta")` is representable here while its
+    /// CPU counterpart is not, which is also true upstream on a build without a
+    /// kernel for a dtype. docs/META.md §6.
+    pub fn meta(shape: Vec<usize>, tag: TorchDType) -> Self {
+        Self {
+            inner: Repr::Meta { shape },
+            tag,
+            requires_grad: false,
+            backward_hooks: None,
+        }
     }
 
     /// The single entrance for the `torch.bool` tag (BOOL.md §6.3 item 1).
@@ -106,15 +169,69 @@ impl PyTensorBase {
             }
         }
         Ok(Self {
-            inner,
+            inner: Repr::Dense(inner),
             tag: TorchDType::Bool,
             requires_grad: false,
             backward_hooks: None,
         })
     }
 
-    pub fn tensor(&self) -> &Tensor {
+    /// The storage. **Refuses on `meta`**, which has none.
+    ///
+    /// Every kernel in `aten.rs` reads its inputs through this, so the enum's
+    /// one `?` is what makes "no kernel computes on a meta tensor" a property
+    /// of the type rather than a rule 96 kernels have to remember. The door's
+    /// meta gate (`aten.rs::check_meta`) refuses first and with a better
+    /// message; this is the backstop under it, and it is the reason a kernel
+    /// added tomorrow without being told about meta is safe.
+    #[inline]
+    pub fn tensor(&self) -> PyResult<&Tensor> {
+        match &self.inner {
+            Repr::Dense(tensor) => Ok(tensor),
+            Repr::Meta { .. } => Err(no_data()),
+        }
+    }
+
+    #[inline]
+    pub fn repr(&self) -> &Repr {
         &self.inner
+    }
+
+    #[inline]
+    pub fn is_meta_repr(&self) -> bool {
+        matches!(self.inner, Repr::Meta { .. })
+    }
+
+    /// The shape, for either representation. This is the half of a tensor meta
+    /// still has.
+    #[inline]
+    pub fn dims(&self) -> &[usize] {
+        match &self.inner {
+            Repr::Dense(tensor) => tensor.dims(),
+            Repr::Meta { shape } => shape,
+        }
+    }
+
+    #[inline]
+    pub fn elem_count(&self) -> usize {
+        match &self.inner {
+            Repr::Dense(tensor) => tensor.elem_count(),
+            Repr::Meta { shape } => shape.iter().product(),
+        }
+    }
+
+    /// The device label, for either representation.
+    ///
+    /// For a dense tensor this is `PyDevice::from_candle`, with the lossy
+    /// index reconstruction that documents. For a meta tensor there is no
+    /// candle handle to reconstruct from and none is needed: `meta` is a
+    /// constant, because upstream normalises every index off it (measured --
+    /// `device="meta:7"` reports `device(type='meta')`).
+    pub fn device_label(&self) -> PyDevice {
+        match &self.inner {
+            Repr::Dense(tensor) => PyDevice::from_candle(tensor.device()),
+            Repr::Meta { .. } => PyDevice::meta(),
+        }
     }
 
     pub fn tag(&self) -> TorchDType {
@@ -337,7 +454,7 @@ impl PyTensorBase {
     /// compatible, and the difference is recorded in docs/TORCH_C.md.
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.inner.dims())
+        PyTuple::new(py, self.dims())
     }
 
     #[getter]
@@ -347,7 +464,7 @@ impl PyTensorBase {
 
     #[getter]
     fn device(&self) -> PyDevice {
-        PyDevice::from_candle(self.inner.device())
+        self.device_label()
     }
 
     /// `tensor.is_meta`. Derived from the device rather than returned as a
@@ -365,7 +482,7 @@ impl PyTensorBase {
     /// question the shim can answer.
     #[getter]
     fn is_meta(&self) -> bool {
-        PyDevice::from_candle(self.inner.device()).kind == "meta"
+        self.device_label().kind == "meta"
     }
 
     /// `tensor.is_cpu` / `tensor.is_cuda`. Same shape as `is_meta` and derived
@@ -378,12 +495,12 @@ impl PyTensorBase {
     /// upstream never takes into a hard stop.
     #[getter]
     fn is_cpu(&self) -> bool {
-        PyDevice::from_candle(self.inner.device()).kind == "cpu"
+        self.device_label().kind == "cpu"
     }
 
     #[getter]
     fn is_cuda(&self) -> bool {
-        PyDevice::from_candle(self.inner.device()).kind == "cuda"
+        self.device_label().kind == "cuda"
     }
 
     // `tensor.get_device()` is *not* here, and the reason is a PyO3 collision
@@ -396,11 +513,11 @@ impl PyTensorBase {
 
     #[getter]
     fn ndim(&self) -> usize {
-        self.inner.rank()
+        self.dims().len()
     }
 
     fn dim(&self) -> usize {
-        self.inner.rank()
+        self.dims().len()
     }
 
     #[getter]
@@ -554,7 +671,7 @@ impl PyTensorBase {
     }
 
     fn numel(&self) -> usize {
-        self.inner.elem_count()
+        PyTensorBase::elem_count(self)
     }
 
     #[pyo3(signature = (dim = None))]
@@ -562,7 +679,7 @@ impl PyTensorBase {
         match dim {
             None => Ok(self.shape(py)?.into_any()),
             Some(dim) => {
-                let rank = self.inner.rank() as isize;
+                let rank = self.dims().len() as isize;
                 let index = if dim < 0 { dim + rank } else { dim };
                 if index < 0 || index >= rank {
                     return Err(pyo3::exceptions::PyIndexError::new_err(format!(
@@ -571,13 +688,25 @@ impl PyTensorBase {
                         rank - 1
                     )));
                 }
-                self.inner.dims()[index as usize].into_bound_py_any(py)
+                self.dims()[index as usize].into_bound_py_any(py)
             }
         }
     }
 
+    /// `tensor.is_contiguous()`.
+    ///
+    /// A meta tensor answers `True` unconditionally, and that is a narrowing
+    /// rather than an answer: upstream tracks stride on meta and
+    /// `torch.zeros(2,3,device="meta").t().is_contiguous()` is `False`. Here
+    /// `Repr::Meta` carries no stride (see its comment) and no meta kernel can
+    /// produce a transposed one, so every meta tensor this shim can make *is*
+    /// contiguous. It stops being true the day a meta `t`/`permute` kernel
+    /// lands, and that kernel is the thing that has to add the stride field.
     fn is_contiguous(&self) -> bool {
-        self.inner.is_contiguous()
+        match &self.inner {
+            Repr::Dense(tensor) => tensor.is_contiguous(),
+            Repr::Meta { .. } => true,
+        }
     }
 
     /// See the field comment: stored, reported, read by nothing.
@@ -594,17 +723,21 @@ impl PyTensorBase {
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only
     /// way to read values out at the moment, so tests can compare numbers
     /// against real torch without any further surface being built first.
+    ///
+    /// On `meta` it raises upstream's own `NotImplementedError: Cannot copy
+    /// out of meta tensor; no data!` -- the same refusal, from the same place,
+    /// as `.cpu()` and `.to("cpu")`, because it is the same question.
     fn tolist(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let flat = flat_objects(py, &self.inner, self.tag)?;
-        nest(py, &flat, self.inner.dims())
+        let flat = flat_objects(py, self.tensor()?, self.tag)?;
+        nest(py, &flat, self.dims())
     }
 
     fn __repr__(&self) -> String {
         format!(
             "TensorBase(shape={:?}, dtype={}, device={})",
-            self.inner.dims(),
+            self.dims(),
             self.tag.name(),
-            PyDevice::from_candle(self.inner.device()).__str__()
+            self.device_label().__str__()
         )
     }
 }
