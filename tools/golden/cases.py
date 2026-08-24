@@ -6049,11 +6049,13 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
         _baddbmm_case(
             torch_module, c_module, torch_call, "float32",
             *_BADDBMM_SELF, *inf_b1, *_BADDBMM_B2, kwargs=dict(alpha=0),
+            expect="diverge",
             note="KNOWN KERNEL BUG (docs/TAIL.md): torch does NOT skip the multiply for "
                  "baddbmm's alpha=0 the way it does for addmm's -- NaN from 0*inf leaks "
                  "through on real torch; the shim wrongly assumes the same quick return "
-                 "addmm has and answers a clean self instead. This case is meant to fail "
-                 "until that's fixed.",
+                 "addmm has and answers a clean self instead. Recorded as a divergence "
+                 "rather than left red: the run has to stay usable as a gate, and this "
+                 "fails by itself the moment the two sides start agreeing.",
         )
     )
 
