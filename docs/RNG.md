@@ -140,7 +140,7 @@ RNG 커널은 `cpu_serial_kernel` / 뮤텍스 잠금이라 스레드 수와 무�
 ## 2. candle 의 RNG — 실체
 
 소스는 `/Users/ibrew/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/candle-core-0.11.0/`.
-BrainWave 의 `rust/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
+torchnative 의 `rust/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
 (`Cargo.lock:866-868`, `:895-898`; candle 의 요구는 `Cargo.toml:231-234` 의 `rand 0.9.0` /
 `rand_distr 0.5.1`).
 

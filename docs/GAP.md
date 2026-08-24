@@ -29,9 +29,9 @@
 **중요한 구조적 발견 — 분해 테이블은 eager 실행에 적용되지 않습니다.**
 
 > **정정 (조율 세션).** 이 절의 결론은 맞지만 **근거가 틀려서 아래로 대체합니다.** 초안은
-> "`torch/_decomp` 가 벤더링되어 있지 않다"고 했는데, `vendor/torch/_decomp/` 는 560K 로
+> "`torch/_decomp` 가 벤더링되어 있지 않다"고 했는데, `torchnative/src/main/torch/_decomp/` 는 560K 로
 > **벤더링되어 있고** `decompositions.py` 도 있습니다 — `rust/torch_c/src/lib.rs:4` 가 명시적으로
-> 그렇게 적고 있습니다. 초안이 확인한 `torchbrain/src/main/torch/` 는 이 저장소에 없는 경로입니다.
+> 그렇게 적고 있습니다. 초안이 확인한 `torchnative/src/main/torch/` 는 이 저장소에 없는 경로입니다.
 
 진짜 이유는 벤더링 여부가 아니라 **분해가 적용되는 시점**입니다. 분해표는 추적·컴파일
 (`torch.compile` / `export`) 시점의 그래프 변환이지, eager 디스패치의 폴백이 아닙니다.

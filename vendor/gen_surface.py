@@ -14,7 +14,7 @@ them off an *installed* upstream `_C.so`, which is right for an instrument
 from the binary we are replacing, and it would tie the build to having real
 torch installed).
 
-This script reads `vendor/torch/_C/*.pyi` instead. Those files are part of
+This script reads `torchnative/src/main/torch/_C/*.pyi` instead. Those files are part of
 the vendored BSD Python tree -- upstream ships them precisely so that other
 tools can know `_C`'s interface without loading it. They are also the
 tree's *own* statement of what it expects, which is the thing the shim has
@@ -347,7 +347,17 @@ def build(vendor_dir: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--vendor-dir", default=os.path.join(REPO, "vendor"))
+    # The tree lands in the package rather than beside it, so that one build
+    # sees both `torch` and `torchnative` as top-level packages. The scripts
+    # that assemble it stay here in vendor/; only the destination moved. Same
+    # override the shell scripts take.
+    ap.add_argument(
+        "--vendor-dir",
+        default=os.environ.get(
+            "TORCHNATIVE_VENDOR_DIR",
+            os.path.join(REPO, "torchnative", "src", "main"),
+        ),
+    )
     ap.add_argument(
         "--out", default=os.path.join(REPO, "rust", "torch_c", "src", "surface.json")
     )

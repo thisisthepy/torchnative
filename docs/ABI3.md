@@ -518,7 +518,7 @@ cpython-3.15.0rc1-macos-aarch64-none (uv, python3.15) exit=0, 8/8 통과
 > "free-threading is a desktop-only capability for as long as that holds, and the flag should stay
 > off by default."
 
-**BrainWave 는 기기 추론이 목표이므로 이 손실은 현재 목표와 겹치지 않습니다.**
+**torchnative 는 기기 추론이 목표이므로 이 손실은 현재 목표와 겹치지 않습니다.**
 데스크톱에서 free-threaded 추론을 하고 싶어지면 그때 재검토 항목입니다.
 
 ### 6b. 벌크 접근의 지름길이 없다
