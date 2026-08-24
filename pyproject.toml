@@ -7,7 +7,16 @@ name = "torchnative"
 version = "0.0.1a0"
 description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
 readme = { file = "README.md", content-type = "text/markdown" }
-license = "MIT"
+# Our own code is MIT; the rest of the expression is upstream PyTorch's, copied
+# verbatim from its own `License-Expression` (torch 2.13.0). A platform wheel
+# carries the upstream Python tree, so declaring MIT alone would describe a few
+# thousand lines of this distribution and misdescribe two million.
+#
+# The upstream licence texts themselves ride along -- `tools/wheel/build.py`
+# injects torch's dist-info, third-party notices included -- so this line is
+# about the metadata being true, not about supplying attribution that was
+# missing.
+license = "MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 
