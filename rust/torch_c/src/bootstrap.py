@@ -153,6 +153,20 @@ class _Unimplemented:
     mode of `vendor/probe.py` uses one of those, which is right for an
     instrument and wrong here, because a placeholder that answers every
     question quietly produces wrong behaviour instead of a work item.
+
+    `__bool__` is part of that, and it was missing. Without it every instance
+    is truthy, so `if torch._C._has_cudnn:` answered *yes* -- the class doing
+    precisely what its own docstring says it must not. One site was measured to
+    reach that branch on the `import torch` path
+    (`torch/backends/cudnn/__init__.py:231`, a class body: `benchmark_limit`
+    became a pair of placeholders where upstream without cuDNN leaves it
+    `None`). It raises now.
+
+    Note which question this refuses. Names the stubs declare as functions come
+    from `_make_function` and are ordinary Python functions -- truthy, as
+    upstream's builtins are. An `_Unimplemented` is what is left when the stubs
+    say *nothing* about a name, so "is it there?" is a question the shim has no
+    grounds to answer either way, and saying so is the honest reply.
     """
 
     __slots__ = ("_qualname", "__dict__")
@@ -163,6 +177,13 @@ class _Unimplemented:
     def __call__(self, *args, **kwargs):
         raise NotImplementedError(
             f"not implemented in torch._C shim: {self._qualname}"
+        )
+
+    def __bool__(self):
+        raise NotImplementedError(
+            "torch._C shim cannot answer whether this exists: "
+            f"{self._qualname}. It is a placeholder, and a truth test on one "
+            "used to silently mean yes."
         )
 
     def __repr__(self) -> str:
@@ -1283,6 +1304,21 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             continue
         if kind == "function":
             setattr(module, name, _make_function(f"torch._C.{name}", name))
+        elif kind == "bool":
+            # A build-configuration flag. `_BUILD_FLAGS` installs the value
+            # later (after `_install_behaviour`); what happens here is the
+            # check that there *is* one. Falling through to a placeholder
+            # would put a truthy object in a branch, which is the bug this
+            # kind exists to prevent -- so the surface refuses to build
+            # instead, naming the flag that needs deciding.
+            if name not in _BUILD_FLAGS:
+                raise RuntimeError(
+                    f"torch._C shim: the stubs declare {name} as a build "
+                    "flag (_bool) and _BUILD_FLAGS has no answer for it. A "
+                    "flag has two answers and both change behaviour; decide "
+                    "one in bootstrap.py rather than leaving a placeholder, "
+                    "which is truthy."
+                )
         elif name.lstrip("_")[:1].isupper():
             # Capitalised means a type, and it has to really be one: the names
             # the stubs miss turn up in *annotations*, which Python evaluates
@@ -1999,11 +2035,69 @@ _DISCOVERED_RETURNS = {
 # `False` by a different route; this makes the rest of the family agree with
 # it instead of each guarding site getting a different answer depending on
 # which spelling it happened to use.
+#
+# The table is no longer a hand list of the ones that happened to cost a wall.
+# `install` requires an entry for **every** module-level name the stubs
+# annotate `_bool` (`surface.json` kind `"bool"`), because a build flag has
+# exactly two answers and both change behaviour -- there is no third,
+# placeholder-shaped answer to fall back on. Adding a `_bool` to the stubs and
+# not deciding here is now an import-time error naming the flag, rather than a
+# truthy object waiting in a branch.
+#
+# Every value below is `False`, and that is a fact about this build rather than
+# a default: candle on the CPU links none of these libraries. Two entries are
+# worth their own note --
+#
+#   `_has_kleidiai`  Upstream on the host that measured this answers *True*
+#                    (KleidiAI is ARM's kernel library and an arm64 mac build
+#                    picks it up). That is a fact about upstream's build, not
+#                    about the API, and copying it would be the same error as
+#                    the truthy placeholder in a politer form.
+#
+#   `_GLIBCXX_USE_CXX11_ABI`
+#                    The only one where the question does not really apply:
+#                    there is no libstdc++ under this shim at all, so neither
+#                    answer describes it. `False` is chosen because it is the
+#                    one that cannot make a caller assume a GNU C++ ABI is
+#                    present. `torch/__init__.py:2354`
+#                    (`compiled_with_cxx11_abi`) is the only reader and nothing
+#                    on the `import torch` path calls it. Before this it was
+#                    not even a value -- the install loop reads a leading
+#                    capital as a type name, so `_GLIBCXX_USE_CXX11_ABI` was
+#                    being answered with a *class*.
 _BUILD_FLAGS = {
+    # Reached through `torch.backends.<name>.is_available()`, one per line.
     "_has_mps": False,
     "_has_cuda": False,
     "_has_xpu": False,
     "_has_mkldnn": False,
+    # `torch/backends/cudnn/__init__.py:126`, and :231 in a class body -- the
+    # one flag measured to change a branch during `import torch`.
+    "_has_cudnn": False,
+    # `torch/backends/cusparselt/__init__.py:51`.
+    "_has_cusparselt": False,
+    # `torch/backends/kleidiai/__init__.py:7`. See the note above.
+    "_has_kleidiai": False,
+    # `torch/cuda/__init__.py:155` -- `has_magma: bool = torch._C._has_magma`,
+    # a module-level assignment, so the placeholder was being published as
+    # `torch.cuda.has_magma` for anyone who read it.
+    "_has_magma": False,
+    # `torch/backends/mkldnn/__init__.py:25`. ACL is a sub-capability of
+    # MKLDNN, so `True` here would contradict `_has_mkldnn` above.
+    "_has_mkldnn_acl": False,
+    # `torch/backends/mkl/__init__.py:7`, and `_meta_registrations.py:2864`,
+    # which registers a meta kernel for `torch.ops.mkl._mkl_linear` when true.
+    # This build has no such op, so the registration was for nothing.
+    "has_mkl": False,
+    # No LAPACK is linked; `torch.linalg` has no kernels here.
+    "has_lapack": False,
+    # candle parallelises with rayon, not OpenMP.
+    "has_openmp": False,
+    # FFT support. No `aten.fft*` kernel exists in this build.
+    "has_spectral": False,
+    # See the note above: the question does not apply, and this is the answer
+    # that claims the least.
+    "_GLIBCXX_USE_CXX11_ABI": False,
 }
 
 # The same, for members of synthesised `_C` types: `"<Type>.<member>": value`.
