@@ -212,7 +212,19 @@ pub fn aten_dispatch(
     // wears the registered Python tensor class (`tensor::promote`). Doing it
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
-    crate::tensor::promote(py, out)
+    let out = crate::tensor::promote(py, out)?;
+    // The graph capture hook (docs/CAPTURE.md). It is here rather than in
+    // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
+    // too, and the identity the recorder registers has to be the object
+    // *Python will hold*, which is `promote`'s result rather than the kernel's.
+    //
+    // When capture is off -- which is always, unless something asked for it --
+    // this is one relaxed atomic load and a branch that is not taken. That is
+    // the entire cost added to the single door, measured in docs/CAPTURE.md §7.
+    if crate::capture::is_active() {
+        crate::capture::record(py, op, args, kwargs, &out);
+    }
+    Ok(out)
 }
 
 /// Where a dispatched tensor argument lives, comparable without allocating.
