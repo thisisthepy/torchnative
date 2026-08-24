@@ -224,7 +224,7 @@ class DefaultBackend(
 
 ### 3-3. 타깃별 링크 비대칭 — 흡수 지점
 
-`/Volumes/macMini/thisisthepy/BrainWave/docs/RUST_CROSSBUILD.md` §0.5 에서 실측된 비대칭(같은 문서
+`/Volumes/macMini/thisisthepy/torchnative/docs/RUST_CROSSBUILD.md` §0.5 에서 실측된 비대칭(같은 문서
 49-100줄)을 그대로 인용하면:
 
 | 타깃 | 필요한 것 | 성격 |

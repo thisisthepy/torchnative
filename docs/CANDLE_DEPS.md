@@ -91,7 +91,7 @@ tokenizers dependency optional (left on by default though) in candle-core"
   - `fbbbkaya`(2026-07-30) — **PR 의 존재를 모른 채** `x86_64-pc-windows-gnu`(MinGW) 에서
     `onig_sys` 가 `uid_t`/`gid_t` 재정의 충돌로 빌드가 깨진다고 보고하며, **거의 동일한 패치를
     스스로 다시 유도**했습니다. candle 의 타깃 매트릭스(DESIGN.md "타깃 매트릭스")에 Windows
-    x86_64 가 들어 있으므로 BrainWave 에도 잠재적으로 관련됩니다(단, 기본 툴체인이 MSVC 인지
+    x86_64 가 들어 있으므로 torchnative 에도 잠재적으로 관련됩니다(단, 기본 툴체인이 MSVC 인지
     GNU 인지는 **미확인**).
 - **main 브랜치 재확인**: `git show origin/main:candle-core/Cargo.toml`(2026-08-24, 최신 커밋
   `81f247a8` / 2026-08-23) 에서 `tokenizers` 는 여전히 `optional` 없이 필수입니다. **PR 은
@@ -264,11 +264,11 @@ Cargo.toml` 을 건드려야 적용되므로 **이 조사 세션의 범위 밖**
 | 항목 | 상태 |
 |---|---|
 | PR #3490 작성자의 "109 개 테스트 통과" 자체 보고 | 본인 보고, 제3자 검증 안 됨 |
-| BrainWave 의 Windows 빌드가 MSVC/GNU 중 무엇을 쓰는지 | 미확인 — `onig_sys` MinGW 버그(§2a) 관련 여부 불명 |
+| torchnative 의 Windows 빌드가 MSVC/GNU 중 무엇을 쓰는지 | 미확인 — `onig_sys` MinGW 버그(§2a) 관련 여부 불명 |
 | Android/iOS 크로스컴파일에서의 크레이트 수·빌드시간 감소폭 | 미측정 — 호스트(macOS arm64)에서만 잼 |
 | 스트립 후 바이너리 크기에 `tokenizers` 제거가 주는 영향 | 미측정 |
 | burn 의 실제 의존 트리 크기 | 미조사 — 정적 랭크로 이미 기각되어 조사 불필요 판단 |
-| WASM 타깃에서 이 이슈의 관련성 | candle 자체가 이미 `cfg(not(target_arch = "wasm32"))` 로 걸러둠 — BrainWave 타깃 매트릭스에도 WASM 없음, 무관 |
+| WASM 타깃에서 이 이슈의 관련성 | candle 자체가 이미 `cfg(not(target_arch = "wasm32"))` 로 걸러둠 — torchnative 타깃 매트릭스에도 WASM 없음, 무관 |
 
 ---
 
@@ -287,7 +287,7 @@ cd /Volumes/macMini/caches/candle-probe/patched  && cargo clean && /usr/bin/time
 ```
 
 `patched/Cargo.toml` 은 `/Volumes/macMini/caches/candle-probe/candle-src`(candle 0.11.0 태그에
-§2c 의 3 줄 diff 적용)를 `path` 의존으로 가리킵니다. `candle-src/` 는 조사용 클론이며 BrainWave
+§2c 의 3 줄 diff 적용)를 `path` 의존으로 가리킵니다. `candle-src/` 는 조사용 클론이며 torchnative
 저장소의 일부가 아닙니다.
 
 ---

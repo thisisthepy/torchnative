@@ -171,7 +171,7 @@ record 모드는 상류 `_C` 의 **이름과 종류만** 읽습니다(`--dump-su
 ### 1 `[S]` `torch/__init__.py:444` — 파이썬 트리가 네이티브 라이브러리를 먼저 찾는다
 
 ```
-OSError: dlopen(vendor/torch/lib/libtorch_global_deps.dylib): no such file
+OSError: dlopen(torchnative/src/main/torch/lib/libtorch_global_deps.dylib): no such file
 ```
 
 `_load_global_deps()` 가 `ctypes.CDLL(torch/lib/libtorch_global_deps.dylib, RTLD_GLOBAL)` 을
@@ -190,7 +190,7 @@ OSError: dlopen(vendor/torch/lib/libtorch_global_deps.dylib): no such file
 
 ```
 ImportError: cannot import name '_initExtension' from 'torch._C'
-    (vendor/torch/_C.abi3.so)
+    (torchnative/src/main/torch/_C.abi3.so)
 ```
 
 **이것이 정직한 답입니다.** 우리 `_C` 로 `import torch` 는 `torch/__init__.py` 3087 행 중
@@ -221,7 +221,7 @@ TORCH_C.md 가 `TensorBase` 라는 **이름**을 미리 맞춰 둔 판단은 옳
 ### 4 `[R]` `torch/__init__.py:2179` — `torch/bin/torch_shm_manager` 가 **존재**해야 한다
 
 ```
-RuntimeError: Unable to find torch_shm_manager at vendor/torch/bin/torch_shm_manager
+RuntimeError: Unable to find torch_shm_manager at torchnative/src/main/torch/bin/torch_shm_manager
 ```
 
 `_manager_path()` 가 Windows 가 아닌 모든 플랫폼에서 **무조건** 이 파일의 존재를 확인하고, 없으면
@@ -603,7 +603,7 @@ IMPORT_WALLS 4 차는 A(candle + shim) 에 "파이썬 트리 prune 이 싸지 �
 |---|---|
 | `rust/torch_c/Cargo.toml` | `abi3-py313` 추가 |
 | `rust/torch_c/pytests/run.sh` | 산출물 이름 `_C.so` → `_C.abi3.so` |
-| `.gitignore` | `/vendor/torch/` · `/vendor/torch-*.dist-info/` · `/vendor/.stamp` |
+| `.gitignore` | `/torchnative/src/main/torch/` · `/torchnative/src/main/torch-*.dist-info/` · `/vendor/.stamp` |
 | `vendor/vendor_torch.sh` | 신규 |
 | `vendor/install_shim.sh` | 신규 |
 | `vendor/probe.py` | 신규 |
@@ -614,8 +614,8 @@ IMPORT_WALLS 4 차는 A(candle + shim) 에 "파이썬 트리 prune 이 싸지 �
 두 가지**입니다.
 
 ```
-$ diff -rq --exclude=__pycache__ <상류>/torch vendor/torch | grep -v '^Only in <상류>'
-Only in vendor/torch: _C.abi3.so                     # 우리 것 (§2 의 구멍)
+$ diff -rq --exclude=__pycache__ <상류>/torch torchnative/src/main/torch | grep -v '^Only in <상류>'
+Only in torchnative/src/main/torch: _C.abi3.so                     # 우리 것 (§2 의 구멍)
 Files .../bin/torch_shm_manager and ... differ       # 벽 4 의 0 바이트 표식
 ```
 

@@ -99,7 +99,7 @@ Python.framework/Headers/Python.h       # 헤더
 `Py_Finalize` 만 하도록 했다(Info.plist, 번들 구조, 코드 서명 엔타이틀먼트 없음).
 
 ```c
-// /tmp/ios_sim_check/driver.c (BrainWave/PythonMultiplatform 저장소 밖)
+// /tmp/ios_sim_check/driver.c (torchnative/PythonMultiplatform 저장소 밖)
 #include <Python.h>
 int main(void) {
     Py_Initialize();

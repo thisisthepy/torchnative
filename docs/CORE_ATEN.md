@@ -1,6 +1,6 @@
 # Core ATen Operator Set 분석
 
-BrainWave 프로젝트의 요구 사항을 검증하기 위해 PyTorch Core ATen 공식 스펙과 실제 모델의 aten op 사용 현황을 대조한 문서입니다.
+torchnative 프로젝트의 요구 사항을 검증하기 위해 PyTorch Core ATen 공식 스펙과 실제 모델의 aten op 사용 현황을 대조한 문서입니다.
 
 > **검증 결과 (조율 세션).** 초안은 서브 에이전트가 작성했고, **핵심 결론이 틀려 아래 §0 으로
 > 대체합니다.** 초안은 Core ATen 목록을 얻지 못한 채 "분해 테이블에 없음 → Core ATen 원시" 로
@@ -252,7 +252,7 @@ Core ATen 원시" 로 넘어갔는데, **§0 이 그 추론을 무효로 판정�
 
 - **Core ATen 공식 정의:** https://docs.pytorch.org/executorch/stable/ir-ops-set-definition.html
 - **PyTorch Decomposition Table:** https://pytorch.org/docs/main/generated/torch._decomp.core_aten_decompositions.html (또는 로컬: `torch._decomp.core_aten_decompositions()`)
-- **BrainWave DESIGN.md §5:** "사양서는 이미 공개되어 있다"
+- **torchnative DESIGN.md §5:** "사양서는 이미 공개되어 있다"
 
 ---
 

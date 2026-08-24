@@ -43,7 +43,7 @@ The three rules
 
 Where the names come from
 -------------------------
-`vendor/gen_surface.py`, from `vendor/torch/_C/*.pyi` -- the vendored tree's
+`vendor/gen_surface.py`, from `torchnative/src/main/torch/_C/*.pyi` -- the vendored tree's
 own stubs. Not from an installed upstream `_C.so`. The distinction matters:
 the stubs are the tree's statement of what it expects, they ship under the
 same BSD licence as the rest of the vendored tree, and using them keeps the

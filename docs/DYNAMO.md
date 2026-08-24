@@ -139,7 +139,7 @@ from transformers.generation.utils import GenerationMixin
 `torch.compile` 을 쓰지 않는 한 아무도 관측하지 않습니다. 그러므로 시그니처(인자 개수·타입)만
 맞는 아무 동작 없는 no-op 이면 충분합니다 — 예외만 던지지 않으면 됩니다.
 
-`.pyi` 스텁(`vendor/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
+`.pyi` 스텁(`torchnative/src/main/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
 
 ```python
 def set_guard_error_hook(hook: DynamoGuardHook) -> None: ...
@@ -261,7 +261,7 @@ IMPORT_TORCH.md 의 관문 조건(`transformers` 가 요구하는 `torch >= 2.5.
    (`_SubmoduleFinder`, `rust/torch_c/src/bootstrap.py:260` 부근)을 그대로 재사용하면 됩니다.
    이미 있는 인프라입니다.
 2. **52개 이름을 채웁니다** — 소스는 이미 벤더링된 `.pyi` 3개
-   (`vendor/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
+   (`torchnative/src/main/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
    교집합입니다. 클래스(19개)는 빈 몸체의 자리표 타입으로, 함수(29개, 호출 2개 제외)는
    시그니처만 맞춘 no-op 으로 충분합니다 — **호출되지 않으므로 동작을 구현할 필요가 없습니다.**
 3. **`set_guard_error_hook` · `set_code_exec_strategy` 2개만 신경 씁니다** — 인자 개수와
@@ -289,7 +289,7 @@ IMPORT_TORCH.md 의 관문 조건(`transformers` 가 요구하는 `torch >= 2.5.
 | 1 | `utils.pyi` 가 벤더링 트리에 없는 이유, 필요해지는 경로가 있는지 | 미확인. 이번 경로에선 0회 접근 |
 | 2 | `_export/` 도 `gen_surface.py` 의 같은 미탐지 버그 영향을 받는지 | 존재는 확인(§5), 내용은 미조사 — 이 작업 범위 밖 |
 | 3 | `transformers.masking_utils` 의 `torch >= 2.6` 조건을 낮춰 dynamo 임포트를 우회하는 것이 실제로 더 적은 피해로 가능한지 | 미실측. DESIGN.md §1 전제와 충돌 가능성이 커서 시도하지 않았음 |
-| 4 | `torch._dynamo` **파이썬 패키지**(93개 `.py`) 쪽에서 벤더링한 소스 자체가 추가로 요구하는 것(순수 파이썬 의존성, 예: `sympy` — `eval_frame.py:9` 에서 확인됨)이 전부 충족 가능한지 | 이번 측정 환경(spike-venv)엔 이미 있어 막히지 않았음. BrainWave 최종 벤더링 tree 기준으로는 미확인 |
+| 4 | `torch._dynamo` **파이썬 패키지**(93개 `.py`) 쪽에서 벤더링한 소스 자체가 추가로 요구하는 것(순수 파이썬 의존성, 예: `sympy` — `eval_frame.py:9` 에서 확인됨)이 전부 충족 가능한지 | 이번 측정 환경(spike-venv)엔 이미 있어 막히지 않았음. torchnative 최종 벤더링 tree 기준으로는 미확인 |
 | 5 | `GenerationMixin` 이외의 다른 transformers 진입점(비-생성형 모델, 트레이닝 경로)이 `_C._dynamo` 의 다른 이름을 추가로 요구하는지 | 미측정. 이 문서는 `from_config`/`generate` 경로만 봄(OVERLOAD.md §8과 동일 범위) |
 | 6 | `torch.compile` 을 실수로라도 트리거하는 transformers 내부 경로가 있는지(예: 일부 최신 모델의 `attn_implementation="sdpa"` 선택 로직이 조건부로 `torch.compile` 래핑을 시도하는 경우) | 미확인. 이번 측정은 `do_sample=False`, 기본 config 만 사용 |
 

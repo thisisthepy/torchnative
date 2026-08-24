@@ -1,4 +1,4 @@
-# BrainWave 설계 방향
+# torchnative 설계 방향
 
 온디바이스에서 PyTorch 생태계를 그대로 돌리기 위한 설계와, 그 판단의 근거를 정리한 문서입니다.
 
@@ -6,7 +6,7 @@
 
 ## 0. 이 문서가 답하는 것
 
-BrainWave 는 **온디바이스 인공지능 라이브러리**입니다. 연합학습(FL) 뿐 아니라
+torchnative 는 **온디바이스 인공지능 라이브러리**입니다. 연합학습(FL) 뿐 아니라
 TTL 전반(그 안에 TTA 와 TTT 가 포함됩니다 — §3)을 커버하고, 그 위에 flash-attention /
 flash-linear-attention 같은
 **커널 최적화를 멀티플랫폼으로** 제공하는 것을 목표로 합니다.
@@ -46,7 +46,7 @@ Kotlin Multiplatform (Android / iOS / Desktop / GraalVM native image)
 └─ 임베디드 CPython 3.13                          ← PythonMultiplatform 이 이미 제공
    ├─ transformers (진짜, 또는 thelethe 의 포크)
    ├─ tokenizers · safetensors · huggingface_hub    ← 이미 torch-free, 일부는 이미 Rust
-   ├─ ttadapters · thelethe · torchbrain            ← 무수정으로 동작해야 함
+   ├─ ttadapters · thelethe · torchnative            ← 무수정으로 동작해야 함
    ├─ kernels                                       ← HF 표준. 인터페이스는 채용, 배포는 역전 (§8)
    │  └─ 번들 리졸버 → 앱 번들 안의 AOT 커널
    └─ torch                                         ← 만들 것
@@ -71,14 +71,14 @@ BSD 라이선스라 벤더링에 법적 문제가 없고, `nn.Module` · `Parame
 위쪽(파이썬)이므로 re-vendoring 으로 추적됩니다. 추격 대상이 "torch API 전체" 가 아니라
 "aten op 집합" 으로 줄어들고, aten 은 훨씬 안정적입니다.
 
-### BrainWave 자체의 표면
+### torchnative 자체의 표면
 
-위 그림에서 BrainWave 가 차지하는 자리는 `torchbrain` 한 줄이지만, 그것이 이 라이브러리가 하는
-일의 전부입니다. **BrainWave 는 torch 를 대체하지 않습니다** — torch 계층은 이 프로젝트가 성립하기
-위한 *전제*이고, BrainWave 는 그 위에서 §3 의 네 가지 능력을 제공합니다.
+위 그림에서 torchnative 가 차지하는 자리는 `torchnative` 한 줄이지만, 그것이 이 라이브러리가 하는
+일의 전부입니다. **torchnative 는 torch 를 대체하지 않습니다** — torch 계층은 이 프로젝트가 성립하기
+위한 *전제*이고, torchnative 는 그 위에서 §3 의 네 가지 능력을 제공합니다.
 
 ```
-torchbrain/
+torchnative/
 ├─ delta/          ← 핵심 추상. 수명이 타입에 박힌 가중치 델타 (§3)
 │                    수명 이름은 미정 — 벤치마크 시나리오에서 가져오지 않는다 (§3)
 ├─ adapt/          ← 단일 기기 안에서 닫히는 적응
@@ -86,7 +86,7 @@ torchbrain/
 │  └─ gradient/      엔트로피 · 보조과제 등          (단계 1)
 ├─ federated/      ← adapt 위에 얹히는 층. 집계 · 통신 · 프라이버시
 ├─ kernels/        ← 번들 리졸버. HF kernels 탐색 API 를 만족 (§8)
-└─ api/            ← BrainWaveAPI. 배포 · 수명 정책 · 기기 오케스트레이션
+└─ api/            ← TorchNativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
 ```
 
 설계상 강제해야 할 것 셋:
@@ -101,7 +101,7 @@ torchbrain/
 
 ### `torch.nn.federated` 네임스페이스 주입
 
-현재 `torch/nn/federated.py` 가 `torchbrain.nn.federated` 를 `torch` 네임스페이스에 얹는
+현재 `torch/nn/federated.py` 가 `torchnative.nn.federated` 를 `torch` 네임스페이스에 얹는
 add-hook 형태입니다. **우리가 `torch` 파이썬 트리를 소유하게 되면 이 주입이 해킹이 아니라 정식
 경로가 됩니다.** 다만 두 가지를 정해야 합니다.
 
@@ -144,7 +144,7 @@ layers or introducing new model branches during training**" 이라고 못박습�
 걸친 집계**입니다. 그래서 FL 은 형제가 아니라 위에 얹히는 층입니다 — 로컬 스텝 자체는 TTL 의
 기제를 쓰고, 그 위에 집계·통신·프라이버시가 붙습니다.
 
-**따라서 BrainWave 의 범위는 "TTL + FL" 입니다.** TTA 와 TTT 는 별도로 커버할 대상이 아니라
+**따라서 torchnative 의 범위는 "TTL + FL" 입니다.** TTA 와 TTT 는 별도로 커버할 대상이 아니라
 TTL 안의 좁은 영역이고, 라이브러리 구조도 넷을 나열할 것이 아니라 이 중첩을 반영해야 합니다.
 
 ### 아키텍처로서의 TTT 는 이 중첩에 들어가지 않는다
@@ -163,13 +163,13 @@ TTL 안의 좁은 영역이고, 라이브러리 구조도 넷을 나열할 것�
 | **적응 방법 축** | 그 모델을 테스트 타임에 어떻게 다룰 것인가. TTL ⊃ TTA ⊃ TTT | `ttadapters/methods/` |
 
 TTT-Linear 모델 위에 TTA 를 돌릴 수도 있고 ResNet 위에 돌릴 수도 있습니다. **모델 내부에
-가중치 갱신이 있다는 것은 그 모델의 성질이지 BrainWave 의 방법이 아닙니다.**
+가중치 갱신이 있다는 것은 그 모델의 성질이지 torchnative 의 방법이 아닙니다.**
 
 설계에 미치는 결론이 분명해집니다.
 
-- **`adapt/` 아래에 아키텍처를 두지 않습니다.** 아키텍처는 BrainWave 의 *입력*이지 구성 요소가
+- **`adapt/` 아래에 아키텍처를 두지 않습니다.** 아키텍처는 torchnative 의 *입력*이지 구성 요소가
   아닙니다.
-- **아키텍처 내부의 fast weight 갱신은 미분 단계 축의 항목이 아닙니다.** BrainWave 입장에서
+- **아키텍처 내부의 fast weight 갱신은 미분 단계 축의 항목이 아닙니다.** torchnative 입장에서
   `model(x)` 안에서 일어나는 일이므로 그냥 forward 입니다. `torch._C` 가 그 op 들을 제공해야
   한다는 요구는 남지만, 그것은 §6 사다리의 대상(모델 목록)이지 §3 의 방법 분류가 아닙니다.
 
@@ -205,7 +205,7 @@ TTT-Linear 모델 위에 TTA 를 돌릴 수도 있고 ResNet 위에 돌릴 수�
 근거가 없어 버렸고, 한 번은 남의 평가 분류를 가져왔다가 층이 달라 버렸습니다. 세 질문에 답이 필요한
 것은 확실하니, 이름은 §11 의 1~3 단계에서 실제 사용처가 드러난 뒤에 붙입니다.
 
-**`ScenarioType` 이 무의미한 것은 아닙니다.** BrainWave 가 적응 방법을 제공한다면 벤치마크 수치를
+**`ScenarioType` 이 무의미한 것은 아닙니다.** torchnative 가 적응 방법을 제공한다면 벤치마크 수치를
 재현할 수 있어야 하고, 그러려면 리셋 프로토콜을 지원하는 평가 하네스가 필요합니다. 그것은 이미
 `ttadapters` 가 하는 일이고, **평가 쪽에 있어야지 `delta/` 에 있어서는 안 됩니다.**
 
@@ -296,7 +296,7 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 적응 방법들을 관통하는 것은 **베이스 가중치 위의 델타**입니다 — TTA 가 적응시킨 파라미터와 FL 의
 로컬 업데이트가 같은 물건이고 **수명과 행선지만 다릅니다.**
 
-따라서 BrainWave 의 중심 타입은 "적응 방법" 이 아니라 **수명이 타입에 박힌 가중치 델타** 여야
+따라서 torchnative 의 중심 타입은 "적응 방법" 이 아니라 **수명이 타입에 박힌 가중치 델타** 여야
 합니다. 그러면 `reset()` · 체크포인팅 · 집계 · 영속화가 각 방법마다 재구현되지 않고 델타의 수명
 정책 하나로 정리됩니다. (`ttadapters` 가 지금 `base_state` 로 전체 가중치 사본을 들고 있는 문제도
 여기서 해소됩니다 — §9 항목 5.)
@@ -304,7 +304,7 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 **아키텍처 내부의 fast weight 는 이 델타가 아닙니다.** TTT-Linear 의 `TTTLinearCache` 처럼 모델이
 스스로 관리하는 상태이고, 수명도 모델의 캐시 수명이지 시나리오 정책이 아닙니다. `delta/` 가 이것까지
 소유하려 들면 §3 의 직교성이 깨지고 — 모델을 바꿀 때마다 `delta/` 를 고치게 됩니다. **경계는
-`model(x)` 입니다.** 그 안은 모델의 것, 그 밖이 BrainWave 의 것.
+`model(x)` 입니다.** 그 안은 모델의 것, 그 밖이 torchnative 의 것.
 
 TTL 은 이 델타가 사는 범위이고 (§3 의 중첩), TTA · TTT 는 그 안의 좁은 영역입니다. 따라서
 **`adapt/` 아래에 TTA 와 TTT 를 나란한 모듈로 두면 안 됩니다** — 중첩을 평평하게 펴는 것이라,
@@ -845,9 +845,9 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 
 ### 이 저장소
 
-- `torchbrain/api/__init__.py:4` — `def __init__(self, *args, *kwargs)` 는 **SyntaxError**
+- `torchnative/api/__init__.py:4` — `def __init__(self, *args, *kwargs)` 는 **SyntaxError**
   입니다 (`**kwargs` 여야 함). 현재 이 모듈은 import 되지 않습니다.
-- `torchbrain/nn/federated/__init__.py:1` — `from . import DistributedDataFederated` 인데 해당
+- `torchnative/nn/federated/__init__.py:1` — `from . import DistributedDataFederated` 인데 해당
   모듈이 디렉터리에 없어 ImportError 입니다.
 
 둘 다 blank template 단계라 의도된 미완성일 수 있으나, 첫 실행 전에 걸립니다.
@@ -861,25 +861,25 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 macOS · Linux · Windows · WASM 을 대상으로 합니다. **C · C++ · Rust 확장 빌드를 지원**하므로
 `torch._C` 를 크로스 컴파일할 도구가 이미 있습니다.
 
-그리고 **pypackpack 스펙에 이미 BrainWave 가 들어 있습니다.** 배포 채널이 셋으로 갈라져 있고
-그중 가중치를 BrainWave 가 맡습니다.
+그리고 **pypackpack 스펙에 이미 torchnative 가 들어 있습니다.** 배포 채널이 셋으로 갈라져 있고
+그중 가중치를 torchnative 가 맡습니다.
 
 | pypackpack `deploy/` | 무엇 |
 |---|---|
 | `code/FastTrackAPI.kt` | 코드 배포 |
 | `resource/ResourceHubAPI.kt` | 리소스 배포 |
-| **`weight/BrainWaveAPI.kt`** | **가중치 배포 클라이언트** |
+| **`weight/TorchNativeAPI.kt`** | **가중치 배포 클라이언트** |
 
-즉 `torchbrain/api/BrainWaveAPI` 는 그 **기기 쪽 상대편**입니다.
+즉 `torchnative/api/TorchNativeAPI` 는 그 **기기 쪽 상대편**입니다.
 
 ### 디렉터리
 
 ```
-BrainWave/
+torchnative/
 ├─ pyproject.toml                루트 워크스페이스, [tool.ppp] 타깃
 ├─ uv.lock  .python-version
 │
-├─ torchbrain/                   pypackpack 패키지 — 하나
+├─ torchnative/                   pypackpack 패키지 — 하나
 │  ├─ pyproject.toml
 │  └─ src/
 │     ├─ main/                   ← 여기를 스캔해 최상위 파이썬 패키지를 찾음
@@ -888,12 +888,12 @@ BrainWave/
 │     │  │  ├─ _decomp/          Core ATen 분해표
 │     │  │  ├─ _C/               Rust + PyO3 → candle
 │     │  │  └─ nn/federated.py   add-hook. 편의이지 의존이 아님 (§2)
-│     │  └─ torchbrain/
+│     │  └─ torchnative/
 │     │     ├─ delta/            핵심 추상. 수명 이름 미정 (§3)
 │     │     ├─ adapt/            TTL 방법
 │     │     ├─ nn/federated/     FL
 │     │     ├─ kernels/          번들 리졸버 (§8)
-│     │     └─ api/              BrainWaveAPI
+│     │     └─ api/              TorchNativeAPI
 │     ├─ android/  ios/  macos/  linux/  windows/
 │     └─ test/
 │
@@ -905,10 +905,10 @@ BrainWave/
 
 `torch` 는 **최상위 이름 `torch` 로 임포트되어야 합니다** — §1 의 전제가 그것입니다. pypackpack 이
 `src/main` 을 스캔해 최상위 파이썬 패키지들을 찾으므로 (SPEC.md:427), 한 패키지가 `torch` 와
-`torchbrain` 을 함께 제공할 수 있습니다.
+`torchnative` 을 함께 제공할 수 있습니다.
 
-**별도 저장소로 빼지 않습니다.** BrainWave 는 `theRiverLethe` 와 `ttadapters` 를 참조하지 않고
-(소스 내 참조 0 건), 아키텍처는 §3 에서 정리한 대로 BrainWave 의 *입력*이므로 의존 방향이 생기지
+**별도 저장소로 빼지 않습니다.** torchnative 는 `theRiverLethe` 와 `ttadapters` 를 참조하지 않고
+(소스 내 참조 0 건), 아키텍처는 §3 에서 정리한 대로 torchnative 의 *입력*이므로 의존 방향이 생기지
 않습니다. `PythonMultiplatform` 이 CPython 배포본을 `binary/` 에 두어 라이브러리와 같은 저장소에서
 관리하는 것과 같은 형태입니다.
 
@@ -932,9 +932,9 @@ pypackpack 의 코드 fast-track 은 **파이썬(소스 · 바이트코드)에�
 
 | 무엇 | 채널 |
 |---|---|
-| 파이썬 계층 (`torchbrain`, 벤더링한 `torch/` 트리) | fast-track 가능 |
+| 파이썬 계층 (`torchnative`, 벤더링한 `torch/` 트리) | fast-track 가능 |
 | `torch._C`, 융합 커널 | **번들만** |
-| 모델 가중치 | BrainWaveAPI |
+| 모델 가중치 | TorchNativeAPI |
 
 ### 빌드 레벨은 두 번째 손잡이다
 
@@ -1003,6 +1003,50 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 | 5 | 사다리 3~5 단 | 아키텍처별 한계 비용 |
 | 6 | 기기 (Android 먼저 — iOS 보다 제약이 적음) | |
 | 7 | GraalVM 네이티브 이미지 경로 | `PythonMultiplatform` 의 요구사항 |
+
+### 11.1 1 단계가 멈춘 지점과, 거기서 나온 순서 (2026-08-24 갱신)
+
+**1 단계가 완료되지 않았습니다.** `import transformers` 가 아직 안 됩니다 —
+`torch.distributed.Store` 재수출이 끊겨서이고, 그 진단과 결정은 `docs/SURFACE_HONESTY.md` §2 에
+있습니다. **벤더 트리에 패치를 대지 않기로 정했으므로**, 이 벽은 `torch.distributed` 를
+`world_size = 1` 부터 실체로 구현하면서 부수 효과로 열립니다.
+
+그래서 3 · 5 단계의 "골든 대조" 는 지금까지 **전부 손으로 옮겨 적은 모델**로 해 왔습니다.
+아키텍처 20 개 중 15 개가 미구현 op 0 이고 Llama · GPT-2 가 상류와 토큰·로짓이 맞지만,
+**`from_pretrained` 와 실제 체크포인트 경로는 아직 한 번도 실행되지 않았습니다.** 그 둘은
+이 벽 뒤에 있습니다.
+
+**분산은 우회가 아니라 범위 안입니다.** FL 이 처음부터 목표에 있었고 연합 학습은 집합 통신
+위에 섭니다 — `broadcast` · `gather` · 가중 `all_reduce` 가 곧 FedAvg 입니다.
+
+**계획한 스택** (위가 아래에 의존):
+
+```
+torchnative.nn.federated   라운드 · 클라이언트 선택 · 집계 · 이탈 처리
+  └ torch.distributed     ProcessGroup · 집합 통신 (전송 추상)
+      └ 백엔드             register_backend 로 우리 것
+          └ 장치 추상       CPU · Metal · Vulkan · NPU
+```
+
+**공통 기반은 분산 표면이 아니라 그 아래 장치 추상입니다.** 랭크가 장치를 가리키려면
+`torch.device` 와 장치별 디스패치가 먼저 있어야 하고, 가속기도 전부 그 위에 얹힙니다.
+분산을 먼저 세워도 랭크가 가리킬 것이 없으면 껍데기입니다.
+
+가속기의 실제 지형 — **`candle` 에 `metal` feature 가 있고**, 우리 `Cargo.toml` 이 그것을 끈
+것은 능력 부재가 아니라 "상류의 미래 기본값이 조용히 링크하지 못하게" 하는 격리 목적이었습니다.
+되돌릴 수 있는 결정입니다.
+
+| 가속기 | 상태 | 필요한 일 |
+|---|---|---|
+| Apple GPU (Metal) · Accelerate | candle 에 있음, 우리가 껐음 | feature + 장치 개념 |
+| 안드로이드 GPU | candle 에 백엔드 없음 (`kernels` 표준에도 `vulkan` 슬롯 없음) | Vulkan/wgpu 백엔드 도입 또는 작성 |
+| NPU (ANE · NNAPI · QNN) | **구조가 다름** | 그래프 캡처 층 |
+
+**NPU 가 진짜 설계 문제입니다.** 그것들은 즉시 실행 장치가 아니라 **그래프를 통째로 받아 미리
+컴파일하는 실행기**라, op 단위로 `_aten_dispatch` 를 지나는 이 구조와 정면으로 어긋납니다.
+다만 **문이 하나라는 것이 캡처에 유리합니다** — 모든 op 이 반드시 한 곳을 지나므로 그 자리가
+부분 그래프를 기록하기에 맞습니다. `_C._dynamo` 를 no-op 으로 둔 것(§7)과 모순되지 않습니다.
+캡처가 필요해지면 상류 것을 켜는 것이 아니라 **우리 문에서 우리가** 합니다.
 
 **1 단계에서 나오는 벽의 개수가 이 계획의 실현 가능성을 거의 다 말해줍니다.** 그리고 이제 이것이
 맨 앞입니다 — 가장 값싸고 가장 많이 알려주며, A 와 B 어느 쪽을 고르든 필요한 일입니다.

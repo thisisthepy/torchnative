@@ -98,7 +98,7 @@ dir(_C._nn) = 70,  전부 function,  호출 결과 Counter({'NotImplementedError
 `1 - x` 는 메서드처럼 보이지만, 벤더링된 트리는 이렇게 씁니다.
 
 ```python
-# vendor/torch/_tensor.py:1108
+# torchnative/src/main/torch/_tensor.py:1108
 def __rsub__(self, other):
     return _C._VariableFunctions.rsub(self, other)
 ```
@@ -186,7 +186,7 @@ Llama 는 `repeat_kv` 를 스스로 하고 `False` 로 넘기므로 경로에 �
 
 ```
 상류  /Volumes/macMini/caches/spike-venv/.../torch/__init__.py
-셰임  /Volumes/macMini/thisisthepy/BrainWave/vendor/torch/__init__.py
+셰임  /Volumes/macMini/thisisthepy/torchnative/torchnative/src/main/torch/__init__.py
 ```
 
 | 케이스 | n | 최대 상대오차 |
