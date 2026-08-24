@@ -221,19 +221,24 @@ pip install torchnative
 ```
 
 > [!IMPORTANT]
-> **`0.0.1a0` is a name reservation, not a working install.** It is tagged `py3-none-any` and
-> contains only the `torchnative` API skeleton — no `_C` extension and no vendored `torch`. So
-> `import torch` will not work from a released wheel yet. Everything in [Status](#status) is
-> measured from a source build.
+> **What is on PyPI as `0.0.1a0` is a name reservation, not a working install.** It is tagged
+> `py3-none-any` and contains only the `torchnative` API skeleton — no `_C` extension and no
+> vendored `torch` — so `import torch` fails after it installs cleanly. Nothing has been
+> uploaded to replace it yet.
 >
-> The extension is native, so the shipping shape is platform wheels for macOS, Linux, Android
-> and iOS. Producing them needs a Cargo build backend that is designed but not written
-> ([`docs/CARGO_KT.md`](docs/CARGO_KT.md)). Until then, build from source:
+> A **platform wheel that does work** is now buildable, and the recipe is four commands
+> ([Building a wheel](#building-a-wheel)). It is tagged `cp313-abi3-macosx_11_0_arm64`, carries
+> the `_C` extension and the vendored tree, and has been installed into a clean virtualenv where
+> `import torch`, `torch.ops.aten.mm.default` and an `nn.Linear` forward all run —
+> [`docs/WHEEL.md`](docs/WHEEL.md) §2 has the output. Being `abi3`, the same binary also runs
+> unmodified on CPython 3.14.
 >
-> ```sh
-> git clone https://github.com/thisisthepy/torchnative && cd torchnative
-> bash vendor/vendor_torch.sh && bash vendor/install_shim.sh
-> ```
+> Two things it does not do yet. `print(tensor)` raises `NotImplementedError` — tensor
+> *formatting* reaches at least eight `_C` names the shim does not implement, which reproduces
+> identically in a source build and is a gap in the extension, not in the packaging
+> ([`docs/WHEEL.md`](docs/WHEEL.md) §5). And **only the host wheel exists**: the extension
+> cross-builds for Android today, but a cross wheel cannot be verified without a device, so none
+> was produced ([`docs/WHEEL.md`](docs/WHEEL.md) §7).
 
 ### Building from source
 
@@ -243,6 +248,22 @@ Requires a Rust toolchain and CPython 3.13+.
 bash vendor/vendor_torch.sh     # assemble the vendored torch tree
 bash vendor/install_shim.sh     # build the extension and install it
 ```
+
+### Building a wheel
+
+Additionally requires `pip`, `setuptools` and `wheel` in the building interpreter, and a C
+compiler for the empty `libtorch_global_deps` (see [`docs/WHEEL.md`](docs/WHEEL.md) §3.2).
+
+```sh
+bash vendor/vendor_torch.sh
+bash vendor/install_shim.sh
+python tools/wheel/build.py                            # -> dist/*.whl
+python tools/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
+```
+
+`verify.py` is the part that matters: it installs into a throwaway virtualenv and asserts that
+`torch.__file__` resolves *inside* it. A check that lets the development tree answer proves
+nothing about the wheel.
 
 Cross-compilation is documented in [`docs/RUST_CROSSBUILD.md`](docs/RUST_CROSSBUILD.md),
 including the PyO3 configuration iOS needs in order not to link `libpython`.
@@ -255,6 +276,7 @@ including the PyO3 configuration iOS needs in order not to link `libpython`.
 torchnative/     the Python library
 rust/torch_c/    the torch._C replacement (Rust · PyO3 · candle)
 tools/golden/    the upstream comparison harness
+tools/wheel/     build a platform wheel, and prove it installs (docs/WHEEL.md)
 vendor/          scripts that assemble the vendored torch tree (not checked in)
 docs/            design, measurements, and the reasoning behind open decisions
 ```

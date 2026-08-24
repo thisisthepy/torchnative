@@ -190,6 +190,13 @@ cython_debug/
 !/torchnative/src/main/torch/nn/federated.py
 /torchnative/src/main/torch-*.dist-info/
 /torchnative/src/main/.stamp
+# The torch distribution installs three top-level packages, not one (its own
+# top_level.txt names them), and the wheel needs all three -- `import torch`
+# reaches `import torchgen` by way of `torch/utils/_python_dispatch.py`.
+# Nothing of ours lives in these two, so they are blanket-ignored rather than
+# negated the way `torch/` above has to be.
+/torchnative/src/main/torchgen/
+/torchnative/src/main/functorch/
 /vendor/probe/
 
 # The tree used to land in /vendor. Kept ignored so a checkout made before the
