@@ -11,15 +11,32 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 
-# `torch` is a real dependency and is declared as one. On desktop this library
-# runs on top of upstream PyTorch -- DESIGN.md §11 keeps every verification step
-# on upstream torch precisely so the API never assumes it owns that tree. On
-# device the same import is satisfied by the vendored tree plus our `_C`, which
-# pypackpack assembles rather than pip.
+# `import torchnative.api` needs `torch`, so the dependency is declared rather
+# than left to fail at import time. But it cannot be declared unconditionally:
+# upstream publishes no Android or iOS wheel (macosx_14_0_arm64, manylinux
+# aarch64/x86_64 and win_amd64 are the whole list), so an unmarked `torch`
+# requirement is unresolvable on exactly the two platforms this library exists
+# for.
 #
-# Leaving this empty made the wheel install cleanly and then fail at
-# `import torchnative.api`, which is the failure mode worth avoiding.
-dependencies = ["torch>=2.5"]
+# The marker splits it by who supplies `torch`:
+#
+#   desktop  upstream PyTorch. Our `_C` is not used there at all -- DESIGN.md
+#            §11 keeps every verification step on upstream torch so the API
+#            never starts assuming it owns that tree.
+#   device   this project. The Android and iOS wheels carry the vendored tree
+#            and our `_C`, so there is nothing to depend on.
+#
+# The version is pinned to what is actually verified. This shim implements one
+# specific release's `_C` surface, and a Python tree from a different release
+# expects different symbols from it, so a wide floor like `>=2.5` claims
+# compatibility nobody has measured. 2.13.x is what the golden harness compares
+# against.
+#
+# `sys_platform` values come from PEP 738 (Android) and PEP 730 (iOS); they are
+# taken from the PEPs and have not been confirmed on a running target yet.
+dependencies = [
+    'torch>=2.13,<2.14; sys_platform != "android" and sys_platform != "ios"',
+]
 authors = [{ name = "thisisthepy" }]
 keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-adaptation"]
 
