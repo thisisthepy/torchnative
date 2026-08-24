@@ -190,7 +190,7 @@ rustflags = ["-C", "link-arg=-F/Volumes/macMini/caches/target-python/arm64-iphon
 
 | 변수 | 누가 주는가 | 언제 |
 |---|---|---|
-| `BRAINWAVE_PYTHON_FRAMEWORK_DIR` | 빌드 드라이버 (`Cargo.kt`, 또는 개발 셸) | **iOS 실기기 타깃만** |
+| `TORCHNATIVE_PYTHON_FRAMEWORK_DIR` | 빌드 드라이버 (`Cargo.kt`, 또는 개발 셸) | **iOS 실기기 타깃만** |
 | `PYO3_CONFIG_FILE` (`suppress_build_script_link_lines=true`) | 같음 | **iOS 실기기 타깃만** |
 
 `build.rs` 가 `TARGET` 을 보고 iOS 실기기일 때만 다음을 방출합니다.
@@ -208,7 +208,7 @@ cargo::rustc-link-lib=framework=Python       # clang 의 -framework Python
 
 | 조건 | 결과 |
 |---|---|
-| 변수 미설정 | **EXIT=101**, `BRAINWAVE_PYTHON_FRAMEWORK_DIR is not set, and target aarch64-apple-ios has no linkable libpython …` |
+| 변수 미설정 | **EXIT=101**, `TORCHNATIVE_PYTHON_FRAMEWORK_DIR is not set, and target aarch64-apple-ios has no linkable libpython …` |
 | 변수가 엉뚱한 디렉터리(`…/lib`) | **EXIT=101**, `does not contain Python.framework. It must point at the directory holding the framework …` |
 | 변수가 **원래와 다른 경로**(`/tmp/bw-alt-fw`) | **EXIT=0**, `otool -L` 에 `@rpath/Python.framework/Python` |
 
@@ -231,7 +231,7 @@ cargo::rustc-link-lib=framework=Python       # clang 의 -framework Python
 ## 4. 세 타깃 빌드 결과
 
 **판정은 전부 종료 코드입니다.** 명령과 환경은 RUST_CROSSBUILD.md §0.5 그대로이고, iOS 에만
-`BRAINWAVE_PYTHON_FRAMEWORK_DIR` 이 추가됐습니다.
+`TORCHNATIVE_PYTHON_FRAMEWORK_DIR` 이 추가됐습니다.
 
 | 타깃 | 종료 코드 | 산출물 | 검증 |
 |---|---|---|---|
@@ -379,7 +379,7 @@ PYO3_CROSS_LIB_DIR=$DIST/aarch64-linux-android/prefix/lib \
 cargo ndk -t arm64-v8a --platform 21 build --release; echo "EXIT=$?"
 
 # iOS — PYO3_CONFIG_FILE 내용은 RUST_CROSSBUILD.md §0.5 참고
-BRAINWAVE_PYTHON_FRAMEWORK_DIR=$DIST/arm64-iphoneos \
+TORCHNATIVE_PYTHON_FRAMEWORK_DIR=$DIST/arm64-iphoneos \
 PYO3_CONFIG_FILE=<config> \
 PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
 PYO3_CROSS_LIB_DIR=$DIST/arm64-iphoneos/lib \

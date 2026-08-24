@@ -106,6 +106,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.randint.low",
     "aten.reciprocal.default",
     "aten.relu.default",
+    "aten.relu_.default",
     "aten.rsqrt.default",
     "aten.rsub.Scalar",
     "aten.scalar_tensor.default",
@@ -663,6 +664,7 @@ fn aten_dispatch_inner(
         "aten.neg.default" => neg_default(py, args, kwargs),
         "aten.silu.default" => silu_default(py, args, kwargs),
         "aten.relu.default" => relu_default(py, args, kwargs),
+        "aten.relu_.default" => relu_inplace(py, args, kwargs),
 
         "aten.sum.default" => sum_or_mean(py, args, kwargs, "aten.sum.default", Reduce::Sum, false),
         "aten.sum.dim_IntList" => {
@@ -1253,16 +1255,24 @@ fn addmm_default(
 /// batch2)`, needed to open `bloom` (docs/TAIL.md) -- its attention builds the
 /// scaled QK^T scores with this one op rather than a separate scale-then-add.
 ///
-/// The zero-fast-return and integral-truncation rules are `addmm`'s, reused
-/// rather than re-derived, and measured to still hold batched: `baddbmm(self,
-/// b1, b2, beta=0)` on a `nan`-filled `self` gives a clean product (no `nan`
-/// leaks through the skipped multiply), `baddbmm(self, inf_b1, b2, alpha=0)`
-/// gives back `self` unchanged, and `alpha=1.9`/`alpha=1` agree bit for bit on
-/// an `int64` triple -- the same `Scalar` truncates toward zero before it
-/// multiplies (`addmm_scale`). Refusals are `addmm`'s dtype-mismatch pair too
-/// (`batch1`/`batch2` compared first, `self`/`batch2` second), plus `bmm`'s
-/// rank checks in place of `mm`'s, since the batch dimension is what `bmm`
-/// added and `addmm` never had.
+/// The `beta=0` quick return is `addmm`'s, reused batched and re-measured to
+/// still hold: `baddbmm(self, b1, b2, beta=0)` on a `nan`-filled `self` gives
+/// a clean product (no `nan` leaks through the skipped add). `alpha=0` is
+/// **not** the mirror-image quick return, despite the kernel used to claim
+/// so and despite `addmm` itself skipping the multiply on `alpha=0` --
+/// measured against torch 2.13.0 (docs/TAIL.md §2.1):
+/// `baddbmm(zeros_self, inf_batch1, batch2, alpha=0)` comes back with `nan`
+/// in it, so upstream still runs the real IEEE multiply and only then scales
+/// by zero (`0 * inf == nan`, not skipped). This kernel now does the same:
+/// the product is always computed and scaled through `addmm_scale`, and only
+/// the `self` term is quick-returned on `beta=0`. One consequence: dtypes
+/// candle has no matmul kernel for (`_MM_C_ERROR_DTYPES` in
+/// `tools/golden/cases.py`) now raise on `alpha=0` too, where the old
+/// unconditional skip used to dodge the missing kernel -- that dodge was
+/// itself part of the bug, not a feature to preserve. Refusals are `addmm`'s
+/// dtype-mismatch pair too (`batch1`/`batch2` compared first, `self`/`batch2`
+/// second), plus `bmm`'s rank checks in place of `mm`'s, since the batch
+/// dimension is what `bmm` added and `addmm` never had.
 ///
 /// `self` broadcasts to the `(batch, n, p)` output the same way `addmm`'s
 /// bias does -- rank up to 3, trailing dimensions either matching or `1` --
@@ -1358,31 +1368,38 @@ fn baddbmm_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let beta = scalar_arg(OP, args, kwargs, 3, "beta")?.unwrap_or(Scalar::Int(1));
     let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?.unwrap_or(Scalar::Int(1));
-    let (beta_zero, alpha_zero) = if storage.is_int() {
-        (beta.as_i64() == 0, alpha.as_i64() == 0)
+    // `alpha` has no quick return (see the kernel doc above) so only
+    // `beta`'s zero-ness is decided ahead of time.
+    let beta_zero = if storage.is_int() {
+        beta.as_i64() == 0
     } else {
-        (beta.as_f64() == 0.0, alpha.as_f64() == 0.0)
+        beta.as_f64() == 0.0
     };
 
     // Same accumulation-dtype rule as `mm`/`bmm`/`addmm` -- see
     // `gemm_accumulate_in`.
     let acc_dtype = gemm_accumulate_in(storage);
-    let mut acc: Option<Tensor> = None;
-    if !alpha_zero {
-        let batch2_inner = batch2.tensor()?;
-        let product = batch1
-            .tensor()?
-            .to_dtype(acc_dtype)
-            .and_then(|l| l.contiguous())
-            .and_then(|l| {
-                batch2_inner
-                    .to_dtype(acc_dtype)
-                    .and_then(|r| r.contiguous())
-                    .and_then(|r| l.matmul(&r))
-            })
-            .map_err(|e| candle_err(OP, e))?;
-        acc = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
-    }
+    // Unlike `addmm`, `alpha == 0` is NOT a quick return here -- measured
+    // against torch 2.13.0 (docs/TAIL.md §2.1): the multiply still runs and
+    // its NaNs/Infs still leak through, only the *scale* is skipped. So the
+    // product is always computed; `addmm_scale` folds the `alpha == 1` case
+    // back down to a plain clone, same as it always did.
+    //
+    // The `?` on each `tensor()` is the meta change: a meta tensor has no bytes
+    // to read, and the type says so rather than each kernel remembering to.
+    let batch2_inner = batch2.tensor()?;
+    let product = batch1
+        .tensor()?
+        .to_dtype(acc_dtype)
+        .and_then(|l| l.contiguous())
+        .and_then(|l| {
+            batch2_inner
+                .to_dtype(acc_dtype)
+                .and_then(|r| r.contiguous())
+                .and_then(|r| l.matmul(&r))
+        })
+        .map_err(|e| candle_err(OP, e))?;
+    let mut acc: Option<Tensor> = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
     if !beta_zero {
         let expanded = bias
             .tensor()?
@@ -4701,6 +4718,67 @@ fn add_inplace(
         rhs = rhs.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?;
     }
     let out = lhs.add(&rhs).map_err(|e| candle_err(OP, e))?;
+    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::relu_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// The in-place sibling of `relu.default`, needed because `F.relu(x,
+/// inplace=True)` traces to this overload specifically -- `torch.relu_` is a
+/// genuinely separate op from `torch.relu`, not an alternate spelling of it
+/// (measured: `torch.ops.aten.relu_.default` and `torch.ops.aten.relu.default`
+/// are different `OpOverload` objects with different schemas,
+/// `Tensor(a!) self` vs plain `Tensor self`), and `aten.rs` had a kernel for
+/// neither name before this (docs/SPELLINGS.md §6.6 measured zero).
+///
+/// **Aliasing is `replace_with`'s, same limitation as `add_inplace`/
+/// `copy_inplace`/every other in-place op in this file** (see `add_inplace`'s
+/// doc comment and docs/OPS4.md §8): the receiver's storage is swapped for a
+/// freshly computed tensor, not written through, so a view or alias taken
+/// *before* this call does not observe the update. Upstream `relu_` really is
+/// an alias-preserving in-place write (measured:
+/// `y = x.view(-1); x.relu_(); y` shows the update through the view on real
+/// torch) -- this shim does not reproduce that, and fixing it is the same
+/// `replace_with` redesign `add_inplace` already flagged as out of scope. Not
+/// attempted here either.
+///
+/// The value and the refusal are `relu.default`'s, reused rather than
+/// re-derived: `torch.bool` raises with upstream's exact wording ("Boolean
+/// inputs not supported for relu", measured on both the out-of-place and
+/// in-place overloads), and every other dtype computes `x < 0 ? 0 : x`
+/// element-wise, preserving `nan` and the sign of `-0.0` the same way
+/// `relu_default`'s doc comment measured.
+fn relu_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.relu_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Boolean inputs not supported for relu",
+        ));
+    }
+    let source = {
+        let borrowed = receiver.borrow();
+        // `?` because `tensor()` now returns a Result -- a meta tensor has no
+        // bytes to make contiguous. This kernel arrived on the other branch, so
+        // the two changes never textually conflicted and the compiler is what
+        // caught it.
+        borrowed
+            .tensor()?
+            .contiguous()
+            .map_err(|e| candle_err(OP, e))?
+    };
+    let zeros = source.zeros_like().map_err(|e| candle_err(OP, e))?;
+    let out = source
+        .lt(&zeros)
+        .and_then(|negative| negative.where_cond(&zeros, &source))
+        .map_err(|e| candle_err(OP, e))?;
     receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
     let _ = py;
     Ok(receiver.into_any().unbind())

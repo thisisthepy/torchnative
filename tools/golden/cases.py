@@ -5846,6 +5846,79 @@ def relu_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.relu_.default ------------------------------------------------------
+#
+# `relu.default`'s in-place sibling -- `F.relu(x, inplace=True)` traces to
+# this overload, not `relu.default` (docs/SPELLINGS.md §6.6 measured the
+# kernel gap: zero hits before this). The value is `relu.default`'s
+# unchanged; what's new here is the in-place contract, so the cases below
+# follow `add__tensor_cases`'s shape (mutated-receiver comparisons) rather
+# than re-deriving `relu_cases`' value coverage from scratch.
+
+
+def relu__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.relu_.default"
+    cases: list[Case] = []
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [-2, -1, 0, 1, 2], (5,), dtype_name)
+        cases.append(
+            Case(
+                name=f"relu_(dtype={dtype_name}) [in-place: compares the mutated receiver]",
+                op=op,
+                run_torch=lambda dst_t=dst_t: torch_call(dst_t),
+                run_c=lambda dst_c=dst_c: c_module._aten_dispatch(op, dst_c),
+                note="negatives clamp, non-negatives pass through, same as relu.default",
+            )
+        )
+
+    # uint8: identity, same reasoning `relu_cases` gives for the out-of-place
+    # overload (no unsigned element is negative).
+    dst_u8_t, dst_u8_c = pair_from_flat(torch_module, c_module, [0, 1, 2, 255], (4,), "uint8")
+    cases.append(
+        Case(
+            name="relu_(dtype=uint8) [identity, in-place]",
+            op=op,
+            run_torch=lambda: torch_call(dst_u8_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_u8_c),
+            note="on an unsigned dtype relu_ is the identity -- no element is negative",
+        )
+    )
+
+    # The two values that separate `x < 0 ? 0 : x` from `max(x, 0)`, re-hit
+    # in-place -- measured on real torch to make sure the in-place overload
+    # answers the same values relu.default does rather than assuming it.
+    dst_special_t, dst_special_c = pair_from_flat(
+        torch_module, c_module,
+        [float("nan"), float("inf"), float("-inf"), -0.0, 0.0], (5,), "float32",
+    )
+    cases.append(
+        Case(
+            name="relu_(float32, [nan, inf, -inf, -0.0, 0.0]) [NOT max(x,0), in-place]",
+            op=op,
+            run_torch=lambda: torch_call(dst_special_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_special_c),
+            note="measured upstream: [nan, inf, 0.0, -0.0, 0.0] -- nan survives, -0.0 keeps its "
+                 "sign, same as relu.default",
+        )
+    )
+
+    bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="relu_(dtype=bool) [upstream refuses bool, in-place too]",
+            op=op,
+            run_torch=lambda: torch_call(bool_t),
+            run_c=lambda: c_module._aten_dispatch(op, bool_c),
+            expect="both_error",
+            note="'Boolean inputs not supported for relu' -- same refusal wording as "
+                 "relu.default, measured on the in-place overload too",
+        )
+    )
+    return cases
+
+
 # --- aten.le.Tensor ----------------------------------------------------------
 #
 # The Tensor-overload sibling of `le.Scalar`. It exists as its own key for the
@@ -6029,33 +6102,29 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # alpha=0 is NOT the mirror-image quick return, and this is a genuine,
-    # measured kernel bug -- not a case-writing mistake. addmm's alpha=0
-    # really does skip the multiply entirely on real torch (addmm_cases
-    # above proves it with an inf mat1). baddbmm's kernel doc comment
-    # claims the same "quick return... still holds batched" and cites this
-    # exact scenario, but re-measuring it against torch 2.13.0 shows
-    # otherwise: `baddbmm(self=zeros, inf_batch1, batch2, alpha=0)` gives
-    # `[[nan, nan], [0, 0]], [[0, 0], [0, 0]]]` -- NaN leaks through on real
-    # torch. The shim's `alpha_zero` branch skips the matmul unconditionally
-    # (copying addmm_scale's rule) and answers a clean `self` (all zeros)
-    # instead, which is the addmm behaviour, not baddbmm's. Left as
-    # `expect="match"` -- NOT loosened to `c_error`/`torch_error`, neither
-    # of which fits (both sides *succeed*, they just disagree) -- exactly
-    # `_FULL_FILLS`' own precedent above: a live regression trap that stays
-    # red until rust/torch_c is fixed, rather than quietly filed away.
+    # alpha=0 is NOT the mirror-image quick return -- addmm's alpha=0 really
+    # does skip the multiply entirely on real torch (addmm_cases above proves
+    # it with an inf mat1), but baddbmm's does not: `baddbmm(self=zeros,
+    # inf_batch1, batch2, alpha=0)` gives `[[nan, nan], [0, 0]], [[0, 0],
+    # [0, 0]]]` on real torch -- NaN leaks through the multiply, which is
+    # only *scaled* away afterward, not skipped. This used to be a live
+    # regression trap (`expect="diverge"`, docs/TAIL.md §2.1) because the
+    # kernel's `alpha_zero` branch skipped the matmul unconditionally
+    # (copying addmm_scale's rule) and answered a clean `self` instead.
+    # Fixed: the kernel now always runs the multiply and only skips the
+    # *scale* on alpha==1 (inside `addmm_scale`), so this is a plain `match`
+    # again -- promoted per compare.py's own instruction the moment the
+    # divergence closed (re-measured: both sides now give the same NaN
+    # pattern above).
     inf_b1 = ([float("inf")] + list(range(2, 13)), (2, 2, 3))
     cases.append(
         _baddbmm_case(
             torch_module, c_module, torch_call, "float32",
             *_BADDBMM_SELF, *inf_b1, *_BADDBMM_B2, kwargs=dict(alpha=0),
-            expect="diverge",
-            note="KNOWN KERNEL BUG (docs/TAIL.md): torch does NOT skip the multiply for "
-                 "baddbmm's alpha=0 the way it does for addmm's -- NaN from 0*inf leaks "
-                 "through on real torch; the shim wrongly assumes the same quick return "
-                 "addmm has and answers a clean self instead. Recorded as a divergence "
-                 "rather than left red: the run has to stay usable as a gate, and this "
-                 "fails by itself the moment the two sides start agreeing.",
+            note="alpha=0 with an inf in batch1 -- 0*inf is nan, and unlike addmm's bias "
+                 "quick return, baddbmm's multiply is NOT skipped on real torch, so the NaN "
+                 "leaks through on both sides now (was a KNOWN KERNEL BUG, fixed; see "
+                 "docs/TAIL.md §2.1 and docs/KERNELS.md)",
         )
     )
 
@@ -6101,7 +6170,11 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 torch_module, c_module, torch_call, dtype_name,
                 [0, 0, 0, 0], (1, 2, 2), [1, 2, 3, 4], (1, 2, 2), [1, 0, 0, 1], (1, 2, 2),
                 kwargs=dict(alpha=0),
-                note=f"{dtype_name} with alpha=0 -- no matmul happens, so the gap above does not apply",
+                expect="c_error",
+                note=f"{dtype_name} with alpha=0 -- used to dodge the gap above (the kernel's old "
+                     "alpha_zero quick return skipped the matmul unconditionally, matching torch by "
+                     "accident); now that the multiply always runs (docs/TAIL.md §2.1 fix), this hits "
+                     "the exact same missing-integral-matmul gap as alpha!=0 above",
             )
         )
 
@@ -6759,4 +6832,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._safe_softmax.default": safe_softmax_cases,
     "aten.add_.Tensor": add__tensor_cases,
     "aten.mul.Scalar": mul_scalar_cases,
+    # docs/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces
+    # to, landed as its own kernel (was a measured gap, docs/SPELLINGS.md §6.6).
+    "aten.relu_.default": relu__cases,
 }
