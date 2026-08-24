@@ -36,8 +36,11 @@ use crate::tensor::PyTensorBase;
 /// that meaning.
 pub const IMPLEMENTED: &[&str] = &[
     "aten._local_scalar_dense.default",
+    "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._to_copy.default",
+    "aten._unsafe_view.default",
     "aten.add.Tensor",
+    "aten.alias.default",
     "aten.any.default",
     "aten.any.dim",
     "aten.arange.default",
@@ -49,6 +52,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bitwise_not.default",
     "aten.bitwise_or.Scalar",
     "aten.bitwise_or.Tensor",
+    "aten.bmm.default",
     "aten.cat.default",
     "aten.clone.default",
     "aten.copy_.default",
@@ -78,6 +82,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mul.Tensor",
     "aten.ne.Scalar",
     "aten.ne.Tensor",
+    "aten.neg.default",
     "aten.new_ones.default",
     "aten.normal_.default",
     "aten.ones.default",
@@ -87,12 +92,15 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.randint.low",
     "aten.reciprocal.default",
     "aten.rsqrt.default",
+    "aten.rsub.Scalar",
     "aten.select.int",
+    "aten.silu.default",
     "aten.sin.default",
     "aten.slice.Tensor",
     "aten.sub.Tensor",
     "aten.sum.default",
     "aten.sum.dim_IntList",
+    "aten.t.default",
     "aten.transpose.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
@@ -176,10 +184,12 @@ fn aten_dispatch_inner(
 ) -> PyResult<Py<PyAny>> {
     match op {
         "aten.add.Tensor" => add_tensor(py, args, kwargs),
+        "aten.alias.default" => alias_default(py, args, kwargs),
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
+        "aten.bmm.default" => bmm_default(py, args, kwargs),
         "aten.cat.default" => cat_default(py, args, kwargs),
         "aten.embedding.default" => embedding_default(py, args, kwargs),
         "aten.empty.memory_format" => empty_memory_format(py, args, kwargs),
@@ -195,6 +205,12 @@ fn aten_dispatch_inner(
         "aten.randint.default" => randint(py, args, kwargs, false),
         "aten.randint.low" => randint(py, args, kwargs, true),
         "aten.rsqrt.default" => rsqrt_default(py, args, kwargs),
+        "aten.rsub.Scalar" => rsub_scalar(py, args, kwargs),
+
+        // -- attention (docs/OPS8.md) --------------------------------------
+        "aten._scaled_dot_product_flash_attention_for_cpu.default" => {
+            sdpa_flash_cpu(py, args, kwargs)
+        }
 
         // -- the TensorBase surface (docs/TENSORBASE.md) -------------------
         "aten.add.Scalar" => arith_scalar(py, args, kwargs, "aten.add.Scalar", Arith::Add),
@@ -224,6 +240,8 @@ fn aten_dispatch_inner(
         "aten.reciprocal.default" => {
             unary_float(py, args, kwargs, "aten.reciprocal.default", Unary::Reciprocal)
         }
+        "aten.neg.default" => neg_default(py, args, kwargs),
+        "aten.silu.default" => silu_default(py, args, kwargs),
 
         "aten.sum.default" => sum_or_mean(py, args, kwargs, "aten.sum.default", Reduce::Sum, false),
         "aten.sum.dim_IntList" => {
@@ -245,7 +263,16 @@ fn aten_dispatch_inner(
         "aten.expand.default" => expand_default(py, args, kwargs),
         "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
         "aten.view.default" => reshape_like(py, args, kwargs, "aten.view.default", "size"),
+        // Upstream's `_unsafe_view` differs from `view` only in what it
+        // promises the autograd engine about aliasing -- the value is
+        // `view`'s. There is no autograd here, so it is the same kernel, and
+        // the key stays distinct because `reshape()`'s non-contiguous path
+        // emits this one and not `view`.
+        "aten._unsafe_view.default" => {
+            reshape_like(py, args, kwargs, "aten._unsafe_view.default", "size")
+        }
         "aten.transpose.int" => transpose_int(py, args, kwargs),
+        "aten.t.default" => t_default(py, args, kwargs),
         "aten.unsqueeze.default" => unsqueeze_default(py, args, kwargs),
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
         "aten.clone.default" => clone_default(py, args, kwargs),
@@ -445,6 +472,224 @@ fn mm_default(
         .matmul(rhs.tensor())
         .map_err(|e| candle_err(OP, e))?;
     Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// `aten::bmm(Tensor self, Tensor mat2) -> Tensor`
+///
+/// **Not a one-line route into `matmul_default`.** The kernel underneath is
+/// indeed the same candle call, and `matmul_default` already batches -- but it
+/// batches by *broadcasting*, and `bmm` does not. Upstream refuses
+/// `bmm((1,3,4), (2,4,5))` ("Expected size for first two dimensions of batch2
+/// tensor to be: [1, 4] but got: [2, 4]") where `broadcast_matmul` happily
+/// expands the batch of 1. Sending `aten.bmm.default` at `matmul_default`
+/// would therefore implement a *different* op -- one that computes where
+/// torch raises, which is the silent-divergence direction DESIGN.md §5 exists
+/// to keep out.
+///
+/// So the shared part is the multiply and the distinct part is the contract:
+/// both operands strictly 3-D, batch extents equal, no broadcasting.
+fn bmm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.bmm.default";
+
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 1, "mat2")?;
+
+    if lhs.tensor().rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "batch1 must be a 3D tensor",
+        ));
+    }
+    if rhs.tensor().rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "batch2 must be a 3D tensor",
+        ));
+    }
+    let tag = same_dtype(OP, &lhs, &rhs)?;
+
+    // torch checks batch2's leading pair against batch1's (batch, k) and says
+    // so in exactly these words. Reproduced rather than paraphrased: the
+    // message is the work item a caller reads.
+    let a = lhs.tensor().dims();
+    let b = rhs.tensor().dims();
+    if a[0] != b[0] || a[2] != b[1] {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected size for first two dimensions of batch2 tensor to be: \
+             [{}, {}] but got: [{}, {}].",
+            a[0], a[2], b[0], b[1]
+        )));
+    }
+
+    let out = lhs
+        .tensor()
+        .contiguous()
+        .and_then(|l| rhs.tensor().contiguous().and_then(|r| l.matmul(&r)))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::_scaled_dot_product_flash_attention_for_cpu(Tensor query, Tensor key,
+///     Tensor value, float dropout_p=0., bool is_causal=False, *,
+///     Tensor? attn_mask=None, float? scale=None) -> (Tensor, Tensor)`
+///
+/// The one fused op in this file, and the only one that answers with a pair of
+/// tensors rather than one. Everything about it below was measured against
+/// torch 2.13.0 rather than inferred, because the name says "flash attention"
+/// and the observable contract is not what that name suggests:
+///
+///   * `is_causal` is **upper-left aligned**, not bottom-right: row `t`
+///     attends keys `0..=t` even when the key sequence is longer than the
+///     query one. Measured on a (q=2, kv=5) pair -- the bottom-right reading
+///     disagrees on every element.
+///   * `is_causal` and `attn_mask` **compose**. `F.scaled_dot_product_attention`
+///     refuses to take both; this aten op accepts both and adds them, measured.
+///   * the second result is `logsumexp` over the *masked, scaled* scores, so
+///     it has to be computed after both masks land, not from the raw product.
+///   * for `float16`/`bfloat16` inputs the output comes back in the input
+///     dtype but the logsumexp comes back **`float32`** -- which is upstream
+///     telling us the accumulation happens in float. This follows that:
+///     reduced-precision inputs are widened to `f32` for the whole body and
+///     only the output is narrowed again.
+///
+/// `dropout_p > 0` is refused here because upstream refuses it too ("Currently
+/// do not support dropout > 0"), not because the shim lacks an RNG.
+fn sdpa_flash_cpu(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._scaled_dot_product_flash_attention_for_cpu.default";
+
+    let query = tensor_arg(OP, args, kwargs, 0, "query")?;
+    let key = tensor_arg(OP, args, kwargs, 1, "key")?;
+    let value = tensor_arg(OP, args, kwargs, 2, "value")?;
+    let dropout_p = float_arg(args, kwargs, 3, "dropout_p", 0.0)?;
+    let is_causal = bool_arg(args, kwargs, 4, "is_causal")?.unwrap_or(false);
+    let attn_mask = match optional(args, kwargs, 5, "attn_mask")? {
+        Some(value) if !value.is_none() => Some(value.extract::<PyTensorBase>()?),
+        _ => None,
+    };
+    let scale = match optional(args, kwargs, 6, "scale")? {
+        Some(value) if !value.is_none() => Some(value.extract::<f64>()?),
+        _ => None,
+    };
+
+    same_dtype(OP, &query, &key)?;
+    let tag = same_dtype(OP, &query, &value)?;
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "scaled_dot_product_attention_flash_attention: Expected data type in \
+             FP32, FP64, BF16, FP16, but got {} instead.",
+            scalar_type_name(tag)
+        )));
+    }
+    if dropout_p > 0.0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "scaled_dot_product_attention_flash_attention: Currently do not support dropout > 0",
+        ));
+    }
+    for operand in [&query, &key, &value] {
+        if operand.tensor().rank() != 4 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "scaled_dot_product_attention_flash_attention: Accept only 4 dims inputs \
+                 shape of {B, H, T, K}",
+            ));
+        }
+    }
+    if let Some(mask) = attn_mask.as_ref() {
+        if mask.tag() != tag {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "scaled_dot_product_attention_flash_attention: Attention mask is the same \
+                 data type as query",
+            ));
+        }
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    // The widening upstream's `float32` logsumexp reports (see the doc comment).
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let acc_tag = TorchDType::from_storage(acc).ok_or_else(|| {
+        not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
+    })?;
+
+    let widen = |t: &Tensor| t.to_dtype(acc).and_then(|t| t.contiguous());
+    let q = widen(query.tensor()).map_err(|e| candle_err(OP, e))?;
+    let k = widen(key.tensor()).map_err(|e| candle_err(OP, e))?;
+    let v = widen(value.tensor()).map_err(|e| candle_err(OP, e))?;
+
+    let head_dim = q.dims()[3];
+    let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
+
+    let mut scores = k
+        .transpose(2, 3)
+        .and_then(|kt| kt.contiguous())
+        .and_then(|kt| q.matmul(&kt))
+        .and_then(|s| s.affine(scale, 0.0))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let (rows, cols) = {
+        let dims = scores.dims();
+        (dims[2], dims[3])
+    };
+    if is_causal {
+        // Upper-left aligned, per the measurement above.
+        let mut mask = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                mask.push(if c <= r { 0.0f64 } else { f64::NEG_INFINITY });
+            }
+        }
+        let mask = Tensor::from_vec(mask, (rows, cols), scores.device())
+            .and_then(|t| t.to_dtype(acc))
+            .map_err(|e| candle_err(OP, e))?;
+        scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+    }
+    if let Some(mask) = attn_mask.as_ref() {
+        let mask = mask
+            .tensor()
+            .to_dtype(acc)
+            .map_err(|e| candle_err(OP, e))?;
+        scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+    }
+
+    // Softmax written out: candle-core has no `softmax` (that lives in
+    // candle-nn, which DESIGN.md §4 does not pull in). Shifting by the row
+    // maximum first is not an optimisation -- without it a masked row's
+    // `exp(-inf)` and a large logit's `exp(big)` land on the same NaN.
+    let row_max = scores.max_keepdim(3).map_err(|e| candle_err(OP, e))?;
+    let weights = scores
+        .broadcast_sub(&row_max)
+        .and_then(|s| s.exp())
+        .map_err(|e| candle_err(OP, e))?;
+    let row_sum = weights.sum_keepdim(3).map_err(|e| candle_err(OP, e))?;
+    let out = weights
+        .broadcast_div(&row_sum)
+        .and_then(|p| p.contiguous())
+        .and_then(|p| p.matmul(&v))
+        .and_then(|o| o.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
+
+    // logsumexp(x) = max(x) + log(sum(exp(x - max(x)))), on the same masked,
+    // scaled scores the weights came from.
+    let logsumexp = row_sum
+        .log()
+        .and_then(|l| l.broadcast_add(&row_max))
+        .and_then(|l| l.squeeze(3))
+        .map_err(|e| candle_err(OP, e))?;
+
+    // Promoted element by element: `promote` at the dispatcher's exit does not
+    // look inside a tuple, the same reason `max.dim` promotes its own pair.
+    let pair = [
+        crate::tensor::promote(py, finish(py, out, tag)?)?,
+        crate::tensor::promote(py, finish(py, logsumexp, acc_tag)?)?,
+    ];
+    Ok(PyTuple::new(py, pair)?.into_any().unbind())
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1471,45 @@ fn arith_scalar(
     finish(py, apply_arith(op, kind, &left, &right)?, tag)
 }
 
+/// `aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor`
+///
+/// `other - alpha * self`. The reversed operand order is the whole op: torch
+/// reaches it for `scalar - tensor`, which a Llama forward does in mask
+/// construction, and it is *not* `sub.Scalar` with the sign flipped -- `alpha`
+/// scales `self`, the subtrahend, not the scalar.
+///
+/// Dtype follows `sub.Scalar`'s rule exactly (`arith_tag` with `Arith::Sub`),
+/// including the refusal on `torch.bool`: upstream raises there too
+/// ("Subtraction, the `-` operator, with a bool tensor is not supported"),
+/// so both sides refuse rather than one of them inventing a number.
+fn rsub_scalar(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.rsub.Scalar";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let other = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
+    let tag = arith_tag(OP, Arith::Sub, lhs.tag(), Some(!other.is_int()))?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+
+    let mut right = lhs
+        .tensor()
+        .to_dtype(storage)
+        .map_err(|e| candle_err(OP, e))?;
+    let alpha = alpha_arg(OP, args, kwargs)?;
+    if alpha != 1.0 {
+        right = right.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?;
+    }
+    let left = if storage.is_int() {
+        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.to_dtype(storage))
+    } else {
+        Tensor::full(other.as_f64(), (), right.device()).and_then(|t| t.to_dtype(storage))
+    }
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, apply_arith(OP, Arith::Sub, &left, &right)?, tag)
+}
+
 /// `aten::matmul(Tensor self, Tensor other) -> Tensor`
 ///
 /// **Named where the parser names it, not where the dispatcher does.** torch's
@@ -1532,6 +1816,114 @@ fn unary_float(
             Unary::Reciprocal => t.recip(),
         })
         .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::neg(Tensor self) -> Tensor`
+///
+/// **Not `unary_float`.** `neg` keeps the input dtype instead of promoting an
+/// integral input to the default float -- `int64` in, `int64` out -- so it
+/// cannot share that helper.
+///
+/// The integral path does not go through candle either. `candle_core`'s `neg`
+/// is a `unary_op!`, and that macro's integer arms are `todo!()`: calling it on
+/// an `i64` tensor **panics** rather than returning an error, which would take
+/// the interpreter down instead of raising. So the integers are negated through
+/// an `i64` round trip, the same shape `bitwise_not` already uses for the same
+/// reason. `to_dtype` back to `u8` truncates, which is torch's answer too --
+/// `neg(uint8 [1, 2, 0])` is `[255, 254, 0]`, measured.
+///
+/// Two refusals, both copied from upstream rather than invented: `bool` (torch
+/// points at `~`/`logical_not()` instead) and the wide unsigned dtypes, which
+/// have no `neg_cpu` kernel upstream at all.
+fn neg_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.neg.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Negation, the `-` operator, on a bool tensor is not supported. If you are \
+             trying to invert a mask, use the `~` or `logical_not()` operator instead.",
+        ));
+    }
+    if matches!(
+        tag,
+        TorchDType::UInt16 | TorchDType::UInt32 | TorchDType::UInt64
+    ) {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"neg_cpu\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    if tag.is_floating_point() {
+        let out = input
+            .tensor()
+            .to_dtype(storage)
+            .and_then(|t| t.neg())
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let dims = input.tensor().dims().to_vec();
+    let values: Vec<i64> = input
+        .tensor()
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .and_then(|t| t.to_vec1::<i64>())
+        .map_err(|e| candle_err(OP, e))?;
+    let out = Tensor::from_vec(
+        values.into_iter().map(|v| v.wrapping_neg()).collect::<Vec<i64>>(),
+        dims,
+        input.tensor().device(),
+    )
+    .and_then(|t| t.to_dtype(storage))
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::silu(Tensor self) -> Tensor` -- `x * sigmoid(x)`, SwiGLU's activation.
+///
+/// Float only, and the refusal is upstream's: there is no `silu_cpu` for an
+/// integral or boolean input, so an integer tensor raises here rather than
+/// being promoted the way `cos`/`sin` promote theirs. (That difference is why
+/// this is not another `Unary` variant.)
+///
+/// `float16`/`bfloat16` are computed in `f32` and narrowed once at the end.
+/// candle's `silu` evaluates `v / (1 + exp(-v))` **in the input type**, which
+/// rounds three times where upstream's vectorised CPU kernel rounds once, and
+/// the shim's job is upstream's answer rather than candle's.
+fn silu_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.silu.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"silu_cpu\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let out = input
+        .tensor()
+        .to_dtype(acc)
+        .and_then(|t| t.silu())
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
@@ -2077,6 +2469,40 @@ fn transpose_int(
     finish(py, out, input.tag())
 }
 
+/// `aten::t(Tensor(a) self) -> Tensor(a)`
+///
+/// `nn.Linear` reaches this on every projection (`x @ w.t()`), which is why a
+/// Llama forward calls it more than anything else in this file.
+///
+/// Rank decides the behaviour and torch's rule is not "transpose the last two
+/// dims": 0-D and 1-D come back **unchanged**, 2-D swaps, and 3-D or more is a
+/// hard error rather than a batched transpose. Measured -- guessing it as
+/// `transpose(-2, -1)` would silently compute on a 3-D input where upstream
+/// raises.
+fn t_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.t.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    if rank > 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "t() expects a tensor with <= 2 dimensions, but self is {rank}D"
+        )));
+    }
+    let out = if rank == 2 {
+        input
+            .tensor()
+            .transpose(0, 1)
+            .map_err(|e| candle_err(OP, e))?
+    } else {
+        input.tensor().clone()
+    };
+    finish(py, out, input.tag())
+}
+
 fn unsqueeze_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -2177,6 +2603,27 @@ fn detach_default(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.detach.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    finish(py, input.tensor().clone(), input.tag())
+}
+
+/// `aten::alias(Tensor(a) self) -> Tensor(a)`
+///
+/// Upstream's cheapest op: a new tensor object over the same storage, with no
+/// autograd stripping and no copy. The aliasing half is the half this shim does
+/// not reproduce -- for the same reason `detach` above does not, and with the
+/// same consequence, which is that a later in-place write through one of the
+/// two will not be seen by the other.
+///
+/// It reaches a Llama forward through GQA's `expand`/`reshape` chain, where the
+/// result is read and never written, so the divergence does not bite there. It
+/// would bite a KV-cache write, and that is recorded rather than papered over.
+fn alias_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.alias.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     finish(py, input.tensor().clone(), input.tag())
 }

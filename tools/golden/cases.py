@@ -2474,6 +2474,573 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- the eight ops a greedy 2-layer Llama forward stopped on (docs/GAP.md §3) --
+#
+# These are not "more coverage". Before them `_aten_dispatch` refused eight
+# names the forward pass reaches, so the model could not run at all; docs/OPS8.md
+# records the run that follows from landing them.
+#
+# Two of the eight are not shaped like anything else in this file and get their
+# own treatment below:
+#
+#   * `bmm` is the batched matmul, and it inherits `mm`'s dtype gap exactly --
+#     candle has no matmul kernel for the integer dtypes or bfloat16, so the
+#     same split into match / c_error / both_error that `mm_cases` uses applies
+#     here verbatim. It also has three *refusals* worth pinning: 2-D input,
+#     mismatched dtypes, and -- the one that matters -- a batch of 1 against a
+#     batch of 2. `matmul` broadcasts that; `bmm` must not, and a case is the
+#     only thing that keeps a later "simplification" from routing one at the
+#     other.
+#   * `_scaled_dot_product_flash_attention_for_cpu` answers with a *pair*
+#     (output, logsumexp) and the two halves do not even share a dtype: for a
+#     `float16` input the output is `float16` and the logsumexp is `float32`.
+#     `_sdpa_pair_check` below compares both halves including that asymmetry,
+#     because it is the observable evidence that the accumulation happens in
+#     float, and a shim that returned `float16` there would be wrong in a way
+#     no value comparison would catch.
+
+
+def _deterministic(n: int, seed: int = 1) -> list[float]:
+    """`n` reproducible values in roughly [-1, 1].
+
+    Not `random` and not `torch.randn`: both sides of every case have to be
+    fed *the same* numbers, and the only way to guarantee that across two
+    tensor libraries is to compute them in plain Python and hand the same
+    list to each. Values stay near unit magnitude so that `bfloat16`'s
+    tolerance (6e-2, dtypes.py) is still a real check rather than a rubber
+    stamp.
+    """
+    out, state = [], seed
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append(round((state / 2147483648.0) * 2.0 - 1.0, 4))
+    return out
+
+
+def bmm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bmm.default"
+    cases: list[Case] = []
+
+    # (2, 3, 4) @ (2, 4, 5) -- attention's shape, and a batch big enough that
+    # a kernel that quietly dropped the batch dimension would show up.
+    a_flat, a_shape = list(range(24)), (2, 3, 4)
+    b_flat, b_shape = list(range(40)), (2, 4, 5)
+    # (1, 2, 2) @ (1, 2, 2) -- a batch of one, where the answer is `mm`'s and
+    # can be checked by hand: [[1,2],[3,4]] @ [[5,6],[7,8]] == [[19,22],[43,50]].
+    unit_a, unit_b = [1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]
+
+    for dtype_name in _MM_MATCH_DTYPES:
+        for af, ash, bf, bsh, note in [
+            (a_flat, a_shape, b_flat, b_shape, "batched (2,3,4)x(2,4,5) -- attention's QK^T shape"),
+            (unit_a, (1, 2, 2), unit_b, (1, 2, 2), "batch of one, hand-checkable 2x2"),
+        ]:
+            at, ac = pair_from_flat(torch_module, c_module, af, ash, dtype_name)
+            bt, bc = pair_from_flat(torch_module, c_module, bf, bsh, dtype_name)
+            cases.append(
+                Case(
+                    name=f"bmm(dtype={dtype_name}, {ash}x{bsh}) [{note}]",
+                    op=op,
+                    run_torch=lambda at=at, bt=bt: torch_call(at, bt),
+                    run_c=lambda ac=ac, bc=bc: c_module._aten_dispatch(op, ac, bc),
+                    note=note,
+                )
+            )
+
+    # The same candle gap `mm_cases` records, re-checked through `bmm`: if it
+    # ever closes for one op it should close for both, and these cases say so.
+    for dtype_name in _MM_C_ERROR_DTYPES:
+        at, ac = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+        bt, bc = pair_from_flat(torch_module, c_module, b_flat, b_shape, dtype_name)
+        cases.append(
+            Case(
+                name=f"bmm(dtype={dtype_name}, batched)",
+                op=op,
+                run_torch=lambda at=at, bt=bt: torch_call(at, bt),
+                run_c=lambda ac=ac, bc=bc: c_module._aten_dispatch(op, ac, bc),
+                expect="c_error",
+                note=(
+                    f"candle's matmul has no kernel for {dtype_name}; torch's CPU baddbmm "
+                    "does. Same gap mm_cases records for mm -- tracked separately so "
+                    "closing it for one op cannot silently look like closing it for both."
+                ),
+            )
+        )
+
+    at, ac = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (1, 2, 2), "uint32")
+    cases.append(
+        Case(
+            name="bmm(dtype=uint32, batched)",
+            op=op,
+            run_torch=lambda: torch_call(at, at),
+            run_c=lambda: c_module._aten_dispatch(op, ac, ac),
+            expect="both_error",
+            note="neither torch nor candle has a uint32 matmul; neither should invent one.",
+        )
+    )
+
+    # The three refusals. The batch-broadcast one is the load-bearing case:
+    # `matmul.default`'s kernel (candle's `broadcast_matmul`) computes here,
+    # and `bmm` must not.
+    two_t, two_c = pair_from_flat(torch_module, c_module, [1.0] * 12, (3, 4), "float32")
+    three_t, three_c = pair_from_flat(torch_module, c_module, [1.0] * 20, (4, 5), "float32")
+    cases.append(
+        Case(
+            name="bmm(2D input rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(two_t, three_t),
+            run_c=lambda: c_module._aten_dispatch(op, two_c, three_c),
+            expect="both_error",
+            note="torch: 'batch1 must be a 3D tensor'. bmm must not stand in for mm.",
+        )
+    )
+
+    one_t, one_c = pair_from_flat(torch_module, c_module, [1.0] * 12, (1, 3, 4), "float32")
+    many_t, many_c = pair_from_flat(torch_module, c_module, [1.0] * 40, (2, 4, 5), "float32")
+    cases.append(
+        Case(
+            name="bmm(batch 1 x batch 2 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(one_t, many_t),
+            run_c=lambda: c_module._aten_dispatch(op, one_c, many_c),
+            expect="both_error",
+            note=(
+                "bmm does not broadcast its batch dimension -- torch: 'Expected size for "
+                "first two dimensions of batch2 tensor to be: [1, 4] but got: [2, 4].' "
+                "This is exactly the case a one-line route into matmul_default would get "
+                "wrong, because candle's broadcast_matmul computes it."
+            ),
+        )
+    )
+
+    f32_t, f32_c = pair_from_flat(torch_module, c_module, [1.0] * 24, (2, 3, 4), "float32")
+    f64_t, f64_c = pair_from_flat(torch_module, c_module, [1.0] * 40, (2, 4, 5), "float64")
+    cases.append(
+        Case(
+            name="bmm(float32 x float64 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(f32_t, f64_t),
+            run_c=lambda: c_module._aten_dispatch(op, f32_c, f64_c),
+            expect="both_error",
+            note="torch: 'expected scalar type Float but found Double'; _C: same_dtype refuses.",
+        )
+    )
+    return cases
+
+
+def unsafe_view_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._unsafe_view.default"
+    cases: list[Case] = []
+    # Deliberately the same shape battery `view_cases` uses. `_unsafe_view` is
+    # `view`'s value with a different promise to autograd, and there is no
+    # autograd here -- so what these cases pin is that the two keys keep
+    # answering the same thing, which is the claim the shared kernel makes.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        for size, note in [
+            ([6], "flatten -- the spelling reshape() emits on a non-contiguous input"),
+            ([3, 2], "reshape to a different rank-2 shape"),
+            ([-1], "-1 means 'infer this dim's size'"),
+            ([1, 2, 3], "add a leading axis"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"_unsafe_view(dtype={dtype_name}, (2,3)->{size})",
+                    op=op,
+                    run_torch=lambda a_t=a_t, size=size: torch_call(a_t, size),
+                    run_c=lambda a_c=a_c, size=size: c_module._aten_dispatch(op, a_c, size),
+                    note=note,
+                )
+            )
+    return cases
+
+
+def alias_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.alias.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        for flat, shape in [([0], ()), ([1, 2, 3], (3,)), ([1, 2, 3, 4], (2, 2))]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name, flat, shape,
+                    "identity view -- the storage sharing is not reproduced, only the value",
+                )
+            )
+    return cases
+
+
+_NEG_INT_DTYPES = ["int64", "int32", "int16", "uint8"]
+
+
+def neg_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.neg.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, note in [
+            ([1.0, -2.0, 0.0, 0.5], (2, 2), "assorted signs, including -0.0 from 0.0"),
+            ([_FLOAT_ADD_MAGNITUDE[dtype_name], -_FLOAT_ADD_MAGNITUDE[dtype_name]], (2,), "large magnitudes"),
+            ([1.5], (), "0-d"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+
+    for dtype_name in _NEG_INT_DTYPES:
+        # `neg` keeps the input dtype -- it does *not* promote an integral
+        # input to float the way cos/sin/reciprocal do -- so the integer
+        # dtypes are the cases that would catch a wrong helper being reused.
+        signed = dtype_name != "uint8"
+        flat = [1, -2, 0, 7] if signed else [0, 1, 2, 255]
+        note = (
+            "signed integers keep their dtype (not promoted to float)"
+            if signed
+            else "unsigned wraps: neg(uint8 1) == 255, matching torch's modular answer"
+        )
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, (2, 2), note))
+
+    ut, uc = pair_from_flat(torch_module, c_module, [1, 2], (2,), "uint32")
+    cases.append(
+        Case(
+            name="neg(dtype=uint32) [no neg_cpu kernel upstream]",
+            op=op,
+            run_torch=lambda: torch_call(ut),
+            run_c=lambda: c_module._aten_dispatch(op, uc),
+            expect="both_error",
+            note="torch: NotImplementedError(\"neg_cpu\" not implemented for 'UInt32'); _C copies the refusal.",
+        )
+    )
+
+    # Bool is built inside the lambdas rather than shared, the same deferral
+    # masked_fill_cases uses -- `_tensor_from_flat` is the only route to a bool
+    # tensor in `_C` and it is worth keeping this case's construction failure,
+    # if it ever comes back, inside one case instead of the whole harness run.
+    cases.append(
+        Case(
+            name="neg(dtype=bool) [torch points at ~ instead]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False])),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool)
+            ),
+            expect="both_error",
+            note=(
+                "torch: 'Negation, the `-` operator, on a bool tensor is not supported.' "
+                "A shim that computed here would turn a mask negation into arithmetic."
+            ),
+        )
+    )
+    return cases
+
+
+def rsub_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.rsub.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for scalar, alpha, note in [
+            (1.0, None, "1 - x, the mask-building shape"),
+            (0.0, None, "0 - x, i.e. negation by another spelling"),
+            (2.5, 2.0, "alpha scales *self*, not the scalar"),
+            (-1.0, -0.5, "negative scalar and negative alpha"),
+        ]:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [1.0, -2.0, 0.0, 0.5], (2, 2), dtype_name
+            )
+            args = (scalar,) if alpha is None else (scalar, alpha)
+            cases.append(
+                Case(
+                    name=f"rsub(dtype={dtype_name}, other={scalar}, alpha={alpha}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, args=args: torch_call(a_t, *args),
+                    run_c=lambda a_c=a_c, args=args: c_module._aten_dispatch(op, a_c, *args),
+                    note=note,
+                )
+            )
+
+    # The dtype rule, which is `sub.Scalar`'s: an integral tensor stays
+    # integral under an int scalar and floats under a float one (torch's
+    # "wrapped number" rule), and `uint8` wraps rather than clamping.
+    for dtype_name, flat, scalar, alpha, note in [
+        ("int64", [1, 2, 3, 4], 5, None, "int tensor, int scalar -> int64"),
+        ("int64", [1, 2, 3, 4], 5.0, None, "int tensor, FLOAT scalar -> float32"),
+        ("int32", [1, 2, 3, 4], 3, 2, "int32 with alpha=2 -> 3 - 2*x"),
+        ("int16", [1, 2, 3, 4], 0, None, "0 - x on int16"),
+        ("uint8", [1, 2, 3, 4], 1, None, "unsigned wraps: 1 - 2 == 255"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (2, 2), dtype_name)
+        args = (scalar,) if alpha is None else (scalar, alpha)
+        cases.append(
+            Case(
+                name=f"rsub(dtype={dtype_name}, other={scalar!r}, alpha={alpha}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, args=args: torch_call(a_t, *args),
+                run_c=lambda a_c=a_c, args=args: c_module._aten_dispatch(op, a_c, *args),
+                note=note,
+            )
+        )
+
+    cases.append(
+        Case(
+            name="rsub(dtype=bool) [torch refuses subtraction on masks]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False]), 1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool), 1
+            ),
+            expect="both_error",
+            note="torch: 'Subtraction, the `-` operator, with a bool tensor is not supported.'",
+        )
+    )
+    return cases
+
+
+def silu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.silu.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, note in [
+            ([1.0, -1.0, 0.0, 3.5], (2, 2), "assorted signs -- SwiGLU's gate input"),
+            ([-8.0, -4.0, 4.0, 8.0], (2, 2), "saturating tails, where sigmoid rounds to 0/1"),
+            ([0.0], (), "0-d"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+
+    # The refusal, and it is the reason silu is not another `Unary` variant:
+    # cos/sin/reciprocal promote an integral input to the default float,
+    # silu has no integral kernel upstream at all.
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"silu(dtype={dtype_name}) [no silu_cpu kernel upstream]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note=(
+                    "torch: NotImplementedError(\"silu_cpu\" not implemented for 'Long'). "
+                    "Unlike cos/sin, silu does NOT promote an integral input -- a shim "
+                    "that reused the unary-float helper here would compute where torch refuses."
+                ),
+            )
+        )
+    return cases
+
+
+def t_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.t.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        for flat, shape, note in [
+            ([5], (), "0-d comes back unchanged"),
+            ([1, 2, 3], (3,), "1-d comes back unchanged -- NOT transposed"),
+            ([1, 2, 3, 4, 5, 6], (2, 3), "2-d swaps, as nn.Linear's x @ w.t() needs"),
+            ([1, 2, 3, 4], (1, 4), "row vector -> column vector"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0] * 24, (2, 3, 4), "float32")
+    cases.append(
+        Case(
+            name="t(3D input rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+            expect="both_error",
+            note=(
+                "torch: 't() expects a tensor with <= 2 dimensions, but self is 3D'. "
+                "t() is not transpose(-2, -1) -- reading it that way would compute on a "
+                "batched input where upstream raises."
+            ),
+        )
+    )
+    return cases
+
+
+def _sdpa_pair_check(t_res, c_res) -> tuple[bool, str]:
+    """For `_scaled_dot_product_flash_attention_for_cpu`, which returns
+    `(output, logsumexp)`.
+
+    Both halves are checked for dtype, shape and value, and the dtypes are
+    checked *independently*: for a `float16` input torch answers
+    `(float16, float32)`, and that asymmetry is the only externally visible
+    evidence that the kernel accumulates in float. Comparing the pair as if
+    it shared one dtype would let a shim that computed the whole thing in
+    `float16` pass.
+    """
+    try:
+        halves = [(t_res[0], c_res[0], "output"), (t_res[1], c_res[1], "logsumexp")]
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (output, logsumexp) result on both sides: {e!r}"
+
+    seen = []
+    for t_half, c_half, label in halves:
+        t_dtype, c_dtype = dt.dtype_name(t_half.dtype), dt.dtype_name(c_half.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_half.shape)
+        c_shape = tuple(int(x) for x in c_half.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        tol = dt.tolerance_for(t_dtype)
+        t_flat, c_flat = _flatten_values(t_half.tolist()), _flatten_values(c_half.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            if math.isinf(xf) or math.isinf(yf):
+                if xf != yf:
+                    return False, f"{label}[{i}] inf mismatch: torch={x!r} c={y!r}"
+                continue
+            if not math.isclose(xf, yf, rel_tol=tol.rtol, abs_tol=tol.atol):
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+        seen.append(f"{label} dtype={t_dtype} shape={t_shape}")
+    return True, ", ".join(seen)
+
+
+_SDPA_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+
+def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+    cases: list[Case] = []
+
+    b, h, t, e = 1, 2, 3, 4
+    n = b * h * t * e
+    q_flat, k_flat, v_flat = _deterministic(n, 1), _deterministic(n, 2), _deterministic(n, 3)
+    shape = (b, h, t, e)
+
+    for dtype_name in _SDPA_DTYPES:
+        for extra_args, kwargs, note in [
+            ((0.0, False), {}, "plain attention, default scale = 1/sqrt(head_dim)"),
+            ((0.0, True), {}, "is_causal -- upper-left aligned, measured not assumed"),
+            ((0.0, False), {"scale": 0.25}, "explicit scale overrides 1/sqrt(head_dim)"),
+        ]:
+            q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, shape, dtype_name)
+            k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, shape, dtype_name)
+            v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"sdpa_flash_cpu(dtype={dtype_name}, args={extra_args}, kwargs={kwargs}) [{note}]",
+                    op=op,
+                    run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t, extra_args=extra_args, kwargs=kwargs: torch_call(
+                        q_t, k_t, v_t, *extra_args, **kwargs
+                    ),
+                    run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c, extra_args=extra_args, kwargs=kwargs: c_module._aten_dispatch(
+                        op, q_c, k_c, v_c, *extra_args, **kwargs
+                    ),
+                    value_check=_sdpa_pair_check,
+                    note=note + " -- (output, logsumexp), see _sdpa_pair_check",
+                )
+            )
+
+    # An additive mask, including a `-inf` column: this is how a padding or
+    # causal mask actually arrives from transformers, and it is the case that
+    # proves the softmax subtracts the row maximum first -- without that,
+    # `exp(-inf)` and `exp(large)` both land on NaN.
+    mask_shape = (1, 1, t, t)
+    mask_flat = [0.0, 0.0, float("-inf")] * t
+    for dtype_name in ["float64", "float32"]:
+        for is_causal, note in [
+            (False, "additive mask with a -inf column"),
+            (True, "is_causal AND attn_mask together -- upstream composes them, measured"),
+        ]:
+            q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, shape, dtype_name)
+            k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, shape, dtype_name)
+            v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, shape, dtype_name)
+            m_t, m_c = pair_from_flat(torch_module, c_module, mask_flat, mask_shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"sdpa_flash_cpu(dtype={dtype_name}, attn_mask, is_causal={is_causal}) [{note}]",
+                    op=op,
+                    run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t, m_t=m_t, is_causal=is_causal: torch_call(
+                        q_t, k_t, v_t, 0.0, is_causal, attn_mask=m_t
+                    ),
+                    run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c, m_c=m_c, is_causal=is_causal: c_module._aten_dispatch(
+                        op, q_c, k_c, v_c, 0.0, is_causal, attn_mask=m_c
+                    ),
+                    value_check=_sdpa_pair_check,
+                    note=note,
+                )
+            )
+
+    # Key/value longer than query, causal. This is the shape a decode step with
+    # a KV cache has, and it is where the two possible readings of `is_causal`
+    # disagree: upper-left (row i attends keys 0..i) vs bottom-right (row i
+    # attends keys 0..i+kv-q). Every element differs between them.
+    kv = 5
+    q2 = _deterministic(1 * 1 * 2 * e, 4)
+    k2 = _deterministic(1 * 1 * kv * e, 5)
+    v2 = _deterministic(1 * 1 * kv * e, 6)
+    for dtype_name in ["float64", "float32"]:
+        q_t, q_c = pair_from_flat(torch_module, c_module, q2, (1, 1, 2, e), dtype_name)
+        k_t, k_c = pair_from_flat(torch_module, c_module, k2, (1, 1, kv, e), dtype_name)
+        v_t, v_c = pair_from_flat(torch_module, c_module, v2, (1, 1, kv, e), dtype_name)
+        cases.append(
+            Case(
+                name=f"sdpa_flash_cpu(dtype={dtype_name}, q_len=2, kv_len=5, is_causal=True)",
+                op=op,
+                run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t: torch_call(q_t, k_t, v_t, 0.0, True),
+                run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c: c_module._aten_dispatch(
+                    op, q_c, k_c, v_c, 0.0, True
+                ),
+                value_check=_sdpa_pair_check,
+                note="pins the causal alignment: upper-left, not bottom-right",
+            )
+        )
+
+    # The refusals, all four measured on upstream first.
+    q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, shape, "float32")
+    k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, shape, "float32")
+    v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, shape, "float32")
+    cases.append(
+        Case(
+            name="sdpa_flash_cpu(dropout_p=0.5 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(q_t, k_t, v_t, 0.5, False),
+            run_c=lambda: c_module._aten_dispatch(op, q_c, k_c, v_c, 0.5, False),
+            expect="both_error",
+            note=(
+                "torch: 'Currently do not support dropout > 0'. The shim refuses for the "
+                "same reason upstream does, not for want of an RNG."
+            ),
+        )
+    )
+
+    q3_t, q3_c = pair_from_flat(torch_module, c_module, _deterministic(h * t * e, 7), (h, t, e), "float32")
+    cases.append(
+        Case(
+            name="sdpa_flash_cpu(3D input rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(q3_t, q3_t, q3_t, 0.0, False),
+            run_c=lambda: c_module._aten_dispatch(op, q3_c, q3_c, q3_c, 0.0, False),
+            expect="both_error",
+            note="torch: 'Accept only 4 dims inputs shape of {B, H, T, K}'.",
+        )
+    )
+
+    qi_t, qi_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4] * (n // 4), shape, "int64")
+    cases.append(
+        Case(
+            name="sdpa_flash_cpu(int64 input rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(qi_t, qi_t, qi_t, 0.0, False),
+            run_c=lambda: c_module._aten_dispatch(op, qi_c, qi_c, qi_c, 0.0, False),
+            expect="both_error",
+            note="torch: 'Expected data type in FP32, FP64, BF16, FP16, but got Long instead.'",
+        )
+    )
+
+    m64_t, m64_c = pair_from_flat(torch_module, c_module, [0.0] * (t * t), mask_shape, "float64")
+    cases.append(
+        Case(
+            name="sdpa_flash_cpu(float32 query with float64 mask rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(q_t, k_t, v_t, 0.0, False, attn_mask=m64_t),
+            run_c=lambda: c_module._aten_dispatch(op, q_c, k_c, v_c, 0.0, False, attn_mask=m64_c),
+            expect="both_error",
+            note="torch: 'Attention mask is the same data type as query'.",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -2540,4 +3107,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.copy_.default": copy__cases,
     "aten.normal_.default": normal__cases,
     "aten.uniform_.default": uniform__cases,
+    # The eight docs/GAP.md §3 measured a greedy 2-layer Llama stopping on.
+    "aten.bmm.default": bmm_cases,
+    "aten._unsafe_view.default": unsafe_view_cases,
+    "aten.alias.default": alias_cases,
+    "aten.neg.default": neg_cases,
+    "aten.rsub.Scalar": rsub_scalar_cases,
+    "aten.silu.default": silu_cases,
+    "aten.t.default": t_cases,
+    "aten._scaled_dot_product_flash_attention_for_cpu.default": sdpa_flash_cpu_cases,
 }
