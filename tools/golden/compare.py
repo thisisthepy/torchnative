@@ -29,10 +29,20 @@ otherwise. Never grep stdout for a success marker -- this project's own
 traceback text has, twice, printed source lines that accidentally matched a
 success grep. Read the exit code.
 
-Self-test: `--inject-fault {value,shape,dtype}` deliberately corrupts one
-real, already-computed `_C` result before comparison, to prove the
-comparator actually rejects a wrong answer rather than rubber-stamping
-everything. See the final report for what this caught.
+Self-test
+---------
+`--inject-fault MODE` deliberately corrupts a real, already-computed `_C`
+result before comparison, to prove the comparator actually rejects a wrong
+answer rather than rubber-stamping everything. It injects into **one
+representative case per comparator**, not one case for the whole run --
+see the FAULT INJECTION block below for why that distinction was a hole
+big enough to hide 404 of 1781 cases in.
+
+`--self-test` runs the whole matrix (every fault mode against every
+comparator) and prints a coverage table. Exit code is 0 iff every
+comparator rejected every fault it is supposed to reject. That is the
+gate; `--inject-fault MODE` keeps its historical "should exit 1"
+semantics because a caught fault fails a case.
 """
 
 from __future__ import annotations
@@ -56,6 +66,12 @@ class Outcome:
     case: Case
     passed: bool
     detail: str
+    # Whether --inject-fault actually managed to build a corrupted result for
+    # this case. Not every fault mode is constructible against every result
+    # shape (there is no "last chunk" to pad in a result that is one tensor),
+    # and a mode that was never injected must never be read as a mode that was
+    # injected and caught.
+    fault_applied: bool = False
 
 
 def _flatten(x) -> list:
@@ -111,6 +127,17 @@ def _summarize(result) -> str:
 
 
 def _run_one(case: Case, inject_fault: str | None) -> Outcome:
+    """Run one case. `fault_applied` on the returned Outcome says whether the
+    requested corruption was actually constructible for this result shape --
+    without it, "the run stayed green" is ambiguous between "the comparator
+    caught nothing" and "nothing was ever injected"."""
+    tag_box: list[str] = [""]
+    outcome = _run_one_body(case, inject_fault, tag_box)
+    outcome.fault_applied = bool(tag_box[0])
+    return outcome
+
+
+def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> Outcome:
     t_res = t_exc = c_res = c_exc = None
     try:
         t_res = case.run_torch()
@@ -124,6 +151,7 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
     fault_tag = ""
     if inject_fault and t_res is not None and c_res is not None:
         c_res, fault_tag = _corrupt(c_res, inject_fault)
+        tag_box[0] = fault_tag
 
     t_ok, c_ok = t_exc is None, c_exc is None
 
@@ -190,8 +218,7 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
         ok, detail = case.value_check(t_res, c_res)
         if not ok:
             return Outcome(case, False, f"{prefix}{detail}")
-        suffix = f" [{fault_tag} did not get caught -- COMPARATOR BUG]" if fault_tag else ""
-        return Outcome(case, True, f"{prefix}{detail}{suffix}")
+        return Outcome(case, True, f"{prefix}{detail}{_uncaught_suffix(case, fault_tag, inject_fault)}")
 
     t_dtype = dt.dtype_name(t_res.dtype)
     c_dtype = dt.dtype_name(c_res.dtype)
@@ -216,29 +243,121 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
             False,
             f"{prefix}value mismatch ({detail}); torch={t_res.tolist()!r} c={c_res.tolist()!r} dtype={t_dtype}",
         )
-    suffix = f" [{fault_tag} did not get caught -- COMPARATOR BUG]" if fault_tag else ""
-    return Outcome(case, True, f"dtype={t_dtype} shape={t_shape}{suffix}")
+    return Outcome(
+        case, True, f"dtype={t_dtype} shape={t_shape}{_uncaught_suffix(case, fault_tag, inject_fault)}"
+    )
 
 
-def _corrupt(result, mode: str) -> tuple[Any, str]:
-    """Only used by --inject-fault, to prove the comparator rejects a wrong
-    answer. Mutates a copy of an already-correct `_C` result."""
-    if not hasattr(result, "tolist"):
-        # Not a tensor-like result (e.g. the plain bool from
-        # is_floating_point). run() steers the fault injection away from
-        # value_check cases already; this is a defensive fallback in case
-        # that selection logic ever changes.
-        return result, ""
-    if mode == "value":
-        flat = _flatten(result.tolist())
-        if not flat:
-            return result, ""
-        return _FakeResult(_bump_first(result), result.dtype, result.shape), "INJECTED value fault"
-    if mode == "shape":
-        return _FakeResult(result.tolist(), result.dtype, tuple(result.shape) + (1,)), "INJECTED shape fault"
-    if mode == "dtype":
-        return _FakeResult(result.tolist(), _FakeDtype("torch.int16" if "int" not in str(result.dtype) else "torch.float32"), result.shape), "INJECTED dtype fault"
-    return result, ""
+# ============================================================================
+# FAULT INJECTION
+# ============================================================================
+#
+# What this used to be, and why it was not enough.
+#
+# The original `--inject-fault` corrupted exactly ONE result in the whole run:
+# the first `expect="match"` case with `value_check is None`. The skip of
+# `value_check` cases was correct when it was written -- at that point the only
+# three custom checkers were `empty` (uninitialized memory: there IS no correct
+# value, so a value fault legitimately must not be caught), `is_floating_point`
+# (a plain Python bool with no `.tolist()` for `_corrupt` to touch), and
+# `randint` (a random draw). Corrupting those would have produced a false
+# "COMPARATOR BUG" report, so steering around them was the right call.
+#
+# It stopped being the right call as the harness grew. `value_check` is now how
+# every multi-result op is compared -- (values, indices), (output, logsumexp),
+# (out, mean, rstd), a list of chunks -- and those checkers do real numeric
+# work. Measured on this tree: 404 of 1781 cases (22.7%), across 9 distinct
+# comparators, sat behind that skip and were never self-tested. `--inject-fault`
+# exiting 1 proved that ONE comparator on ONE case rejects ONE kind of wrong
+# answer. It said nothing about the other nine.
+#
+# So the injection now works per COMPARATOR, not per run, and the fault modes
+# are shaped after what a plausible wrong implementation of each op would
+# actually get wrong:
+#
+#   value / value-last   a wrong number, in the first or the last member of a
+#                        multi-result (the `indices` half of a pair, `rstd` of
+#                        a layer-norm triple, the last chunk of a split)
+#   shape / shape-last   a wrong shape, same two positions
+#   dtype / dtype-last   a wrong dtype, same two positions. `-last` is the one
+#                        that says whether `logsumexp`'s float32-under-float16
+#                        asymmetry is really being checked
+#   permute              the FIRST member's elements reordered and nothing
+#                        else. In a (values, indices) pair that is not an
+#                        ordering fault at all, it is a PAIRING fault: value
+#                        i now claims index j. A multiset comparator catches
+#                        that and should
+#   permute-all          every member reordered in lockstep -- the real
+#                        ordering fault, and the one a multiset comparator is
+#                        entitled to ignore. Splitting these two apart was not
+#                        planned: the first table run flagged `permute` as
+#                        caught by `_topk_multiset_check`, which the
+#                        blindness table said was impossible, and the mode was
+#                        wrong rather than the table
+#   constant             every element collapsed to the first -- the shape a
+#                        broken RNG takes, and what a pure range check misses
+#   chunk-count          a chunk dropped
+#   chunk-pad            the last chunk PADDED to full width instead of left
+#                        short. docs/GPT2.md names this as the most plausible
+#                        misimplementation of `split`, and it is invisible to
+#                        any element-by-element comparison
+#
+# A mode that is not constructible against a given result shape reports itself
+# as such (`fault_applied=False`) instead of silently passing.
+
+FAULT_MODES: tuple[str, ...] = (
+    "value",
+    "value-last",
+    "shape",
+    "shape-last",
+    "dtype",
+    "dtype-last",
+    "permute",
+    "permute-all",
+    "constant",
+    "chunk-count",
+    "chunk-pad",
+)
+
+# (comparator, mode) pairs where NOT catching the fault is the documented,
+# intended behaviour. These are not gaps -- each one is a promise the
+# comparator deliberately declines to make, and the reason is quoted from the
+# comparator's own docstring in cases.py. `--self-test` fails if one of these
+# is unexpectedly caught, because that means this table has gone stale.
+BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
+    ("_dtype_shape_only_check", "value"): "aten.empty returns uninitialized memory -- there is no correct value to diff, only dtype and shape are meaningful",
+    ("_dtype_shape_only_check", "value-last"): "same: uninitialized memory has no correct value",
+    ("_dtype_shape_only_check", "permute"): "same: uninitialized memory has no correct order",
+    ("_dtype_shape_only_check", "permute-all"): "same: uninitialized memory has no correct order",
+    ("_dtype_shape_only_check", "constant"): "same: uninitialized memory has no correct distribution",
+    ("_range_check", "permute"): "two independent RNGs cannot be seeded to agree, so the sequence is deliberately unchecked -- only membership of [lo, hi) is asserted",
+    ("_range_check", "permute-all"): "same: the sequence is deliberately unchecked",
+    ("_range_check", "constant"): "same: only membership of [lo, hi) is asserted, never the distribution. A shim returning a constant in range passes, and that limit is documented in cases.py",
+    ("_topk_multiset_check", "permute-all"): "upstream's own order under ties / sorted=False is a partition artefact, not a promise -- pinning it would pin an implementation detail. Note this is `permute-all` (values and indices moved together); plain `permute` breaks the value/index pairing and IS caught",
+}
+
+# (comparator, mode) pairs that are NOT caught and are NOT intended: real holes
+# this matrix found on its first run. Recorded here so `--self-test` can stay
+# usable as a gate while each hole stays loudly visible, printed as `GAP`
+# rather than `blind` and re-listed under KNOWN GAP at the end of every run.
+# The fix for all three is in tools/golden/cases.py, which this change does not
+# own. `_verdict_for` fails the run if one of these is ever caught, so a fixed
+# gap cannot be left parked here.
+KNOWN_GAP: dict[tuple[str, str], str] = {
+    ("_pair_result_check", "dtype-last"): (
+        "the `indices` half's DTYPE is never compared -- cases.py checks only its shape and its "
+        "flattened values. torch hands back int64 indices; a shim returning int32 with identical "
+        "values passes. Fix: one dt.dtype_name() comparison beside the existing indices shape check"
+    ),
+    ("_topk_multiset_check", "shape-last"): (
+        "the `indices` half's SHAPE is never compared -- cases.py checks the values' shape and the "
+        "(value, index) multiset only, and the multiset survives a reshape of the indices. "
+        "_pair_result_check does check this; the multiset variant does not"
+    ),
+    ("_topk_multiset_check", "dtype-last"): (
+        "the `indices` half's DTYPE is never compared, same hole as _pair_result_check + dtype-last"
+    ),
+}
 
 
 class _FakeDtype:
@@ -259,29 +378,214 @@ class _FakeResult:
         return self._values
 
 
-def _bump_first(result):
-    values = result.tolist()
+def comparator_name(case: Case) -> str:
+    """Which checker decides this case. `None` means compare.py's own
+    dtype/shape/value pipeline; otherwise the function's own name, with the
+    `.<locals>.check` tail of the closure-built ones (`_range_check`,
+    `_rng_stream_check`) folded back onto the factory that made them."""
+    vc = case.value_check
+    if vc is None:
+        return "<default pipeline>"
+    name = getattr(vc, "__qualname__", None) or getattr(vc, "__name__", None) or repr(vc)
+    return name.split(".")[0]
 
-    def bump(x):
+
+def _is_tensorish(x) -> bool:
+    return hasattr(x, "tolist") and hasattr(x, "dtype") and hasattr(x, "shape")
+
+
+def _decompose(result) -> tuple[str, list]:
+    """Split a result into its comparable members. `("tuple", [values,
+    indices])`, `("list", [chunk, chunk, ...])`, `("tensor", [t])`,
+    `("scalar", [x])`, or `("unknown", [])` when nothing can be built."""
+    if _is_tensorish(result):
+        return "tensor", [result]
+    if isinstance(result, (bool, int, float)):
+        return "scalar", [result]
+    if isinstance(result, (list, tuple)):
+        parts = list(result)
+        if parts and all(_is_tensorish(p) for p in parts):
+            return ("list" if isinstance(result, list) else "tuple"), parts
+        return "unknown", []
+    try:
+        parts = list(result)
+    except TypeError:
+        return "unknown", []
+    if parts and all(_is_tensorish(p) for p in parts):
+        return "list", parts
+    return "unknown", []
+
+
+def _recompose(kind: str, members: list):
+    if kind in ("tensor", "scalar"):
+        return members[0]
+    if kind == "list":
+        return list(members)
+    return tuple(members)
+
+
+def _numel(shape) -> int:
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return n
+
+
+def _reshape(flat: list, shape) -> Any:
+    if not shape:
+        return flat[0]
+    if len(shape) == 1:
+        return list(flat[: int(shape[0])])
+    step = _numel(shape[1:])
+    return [_reshape(flat[i * step : (i + 1) * step], shape[1:]) for i in range(int(shape[0]))]
+
+
+def _wrong(x):
+    """A value the correct answer is not. Deliberately far away rather than
+    one ULP off: this is proving the comparator is awake at all, and a
+    perturbation inside the dtype's own tolerance would prove the opposite of
+    what it looks like it proves."""
+    if isinstance(x, bool):
+        return not x
+    if isinstance(x, int):
+        return x + 1000
+    return float(x) + 1000.0
+
+
+def _set_leaf(values, which: int, fn):
+    """Apply `fn` to the first (which=0) or last (which=-1) scalar leaf of a
+    nested list, leaving the rest alone. Returns None if there are no leaves."""
+    flat = _flatten(values)
+    if not flat:
+        return None
+    target = len(flat) - 1 if which == -1 else 0
+    seen = [0]
+
+    def walk(x):
         if isinstance(x, list):
-            return [bump(v) for v in x]
-        if isinstance(x, bool):
-            return not x
-        if isinstance(x, int):
-            return x + 1000
-        return float(x) + 1000.0
+            return [walk(v) for v in x]
+        i = seen[0]
+        seen[0] += 1
+        return fn(x) if i == target else x
 
-    flat_done = [False]
+    return walk(values)
 
-    def bump_once(x):
-        if isinstance(x, list):
-            return [bump_once(v) for v in x]
-        if flat_done[0]:
-            return x
-        flat_done[0] = True
-        return bump(x)
 
-    return bump_once(values)
+def _corrupt_member(target, base_mode: str, last: bool):
+    """Corrupt one tensor-like member. Returns None if this mode cannot be
+    built for this member (e.g. `permute` on a single element)."""
+    values = target.tolist()
+    shape = tuple(int(v) for v in target.shape)
+    if base_mode == "value":
+        new = _set_leaf(values, -1 if last else 0, _wrong)
+        if new is None:
+            return None
+        return _FakeResult(new, target.dtype, shape)
+    if base_mode == "shape":
+        return _FakeResult(values, target.dtype, shape + (1,))
+    if base_mode == "dtype":
+        other = "torch.int16" if "int" not in str(target.dtype) else "torch.float32"
+        return _FakeResult(values, _FakeDtype(other), shape)
+    if base_mode == "permute":
+        flat = _flatten(values)
+        if len(flat) < 2 or flat == flat[::-1]:
+            return None
+        return _FakeResult(_reshape(flat[::-1], shape), target.dtype, shape)
+    if base_mode == "constant":
+        flat = _flatten(values)
+        if len(flat) < 2 or all(v == flat[0] for v in flat):
+            return None
+        return _FakeResult(_reshape([flat[0]] * len(flat), shape), target.dtype, shape)
+    return None
+
+
+def _corrupt(result, mode: str) -> tuple[Any, str]:
+    """Only used by --inject-fault / --self-test, to prove the comparator
+    rejects a wrong answer. Returns `(result, "")` unchanged -- never a
+    silent pass-through that looks injected -- when the mode does not apply
+    to this result's shape."""
+    kind, members = _decompose(result)
+    if not members:
+        return result, ""
+
+    if kind == "scalar":
+        # `is_floating_point` -> bool, `_local_scalar_dense` -> int/float.
+        # No dtype and no shape to get wrong; the only wrong answer available
+        # is a wrong value (and, for the bool, a flipped one).
+        if mode in ("value", "value-last"):
+            return _wrong(members[0]), f"INJECTED {mode} fault"
+        return result, ""
+
+    if mode in ("chunk-count", "chunk-pad"):
+        if kind != "list" or len(members) < 2:
+            return result, ""
+        if mode == "chunk-count":
+            return (
+                _recompose(kind, members[:-1]),
+                "INJECTED chunk-count fault (last chunk dropped)",
+            )
+        first, last_chunk = members[0], members[-1]
+        f_shape = tuple(int(v) for v in first.shape)
+        l_flat = _flatten(last_chunk.tolist())
+        if _numel(f_shape) <= len(l_flat):
+            # Uniform split: there is nothing to pad, so this mode does not
+            # apply to this case. Say so rather than pretend.
+            return result, ""
+        pad_value = l_flat[-1] if l_flat else 0
+        padded_flat = l_flat + [pad_value] * (_numel(f_shape) - len(l_flat))
+        padded = _FakeResult(_reshape(padded_flat, f_shape), last_chunk.dtype, f_shape)
+        return (
+            _recompose(kind, members[:-1] + [padded]),
+            "INJECTED chunk-pad fault (last chunk padded to full width, not left short)",
+        )
+
+    if mode == "permute-all":
+        # Every member reordered the same way: in a (values, indices) pair
+        # that keeps each value with its own index and only moves the pair,
+        # which is what "wrong order, right elements" actually means.
+        new_members = []
+        changed = False
+        for m in members:
+            fake = _corrupt_member(m, "permute", last=False)
+            if fake is None:
+                new_members.append(m)
+            else:
+                new_members.append(fake)
+                changed = True
+        if not changed:
+            return result, ""
+        return _recompose(kind, new_members), "INJECTED permute-all fault (every member reordered in lockstep)"
+
+    last = mode.endswith("-last")
+    base = mode[: -len("-last")] if last else mode
+    if base not in ("value", "shape", "dtype", "permute", "constant"):
+        return result, ""
+    if last and len(members) == 1 and base in ("shape", "dtype"):
+        # A one-member result has no distinct "last member": running this
+        # would duplicate the non-`-last` mode and inflate the coverage table
+        # with a catch that was already counted.
+        return result, ""
+
+    idx = -1 if last else 0
+    fake = _corrupt_member(members[idx], base, last)
+    if fake is None:
+        return result, ""
+    members = list(members)
+    members[idx] = fake
+    return _recompose(kind, members), f"INJECTED {mode} fault"
+
+
+def _uncaught_suffix(case: Case, fault_tag: str, mode: str | None) -> str:
+    """What to say when an injected fault sailed through. Only "COMPARATOR
+    BUG" if the comparator was supposed to catch it."""
+    if not fault_tag or mode is None:
+        return ""
+    key = (comparator_name(case), mode)
+    if key in BLIND_BY_DESIGN:
+        return f" [{fault_tag} not caught -- blind BY DESIGN: {BLIND_BY_DESIGN[key]}]"
+    if key in KNOWN_GAP:
+        return f" [{fault_tag} not caught -- KNOWN GAP: {KNOWN_GAP[key]}]"
+    return f" [{fault_tag} did not get caught -- COMPARATOR BUG]"
 
 
 def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
@@ -315,7 +619,12 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
     all_outcomes: list[Outcome] = []
     missing_builders: list[str] = []
-    already_injected = inject_fault is None
+    # comparator name -> (case, outcome) for the one case this comparator got
+    # the fault injected into. One per COMPARATOR rather than one per run: an
+    # injection that only ever lands on compare.py's default pipeline says
+    # nothing about the nine other checkers cases.py hands out.
+    injected: dict[str, tuple[Case, Outcome]] = {}
+    seen_comparators: set[str] = set()
 
     for op_name in implemented:
         builder = CASE_BUILDERS.get(op_name)
@@ -336,18 +645,19 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
 
         cases = builder(torch, c_module, torch_call)
         for case in cases:
+            cmp_name = comparator_name(case)
+            seen_comparators.add(cmp_name)
             fault_for_this_case = None
-            # Cases with a custom value_check (bool results, uninitialized
-            # memory, random draws -- see cases.py) aren't good self-test
-            # targets: _corrupt() assumes a tensor-like result with
-            # .tolist(), and the point of --inject-fault is to prove the
-            # *standard* dtype/shape/value pipeline rejects a wrong answer,
-            # which doesn't apply to those checkers. Skip them and keep
-            # looking for a plain "match" case.
-            if not already_injected and case.expect == "match" and case.value_check is None:
+            # Keep offering the fault to successive cases of a comparator
+            # until one of them can actually be corrupted this way: not every
+            # mode is constructible against every result (there is no last
+            # chunk to pad in a uniform split). `fault_applied` below is what
+            # says whether it landed.
+            if inject_fault and case.expect == "match" and cmp_name not in injected:
                 fault_for_this_case = inject_fault
-                already_injected = True
             outcome = _run_one(case, fault_for_this_case)
+            if fault_for_this_case and outcome.fault_applied:
+                injected[cmp_name] = (case, outcome)
             all_outcomes.append(outcome)
             if verbose or not outcome.passed:
                 status = "PASS" if outcome.passed else "FAIL"
@@ -364,15 +674,193 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
     failed = sum(1 for o in all_outcomes if not o.passed) + len(missing_builders)
     passed = total - failed
 
+    if inject_fault:
+        _print_injection_verdict(inject_fault, seen_comparators, injected)
+
     print()
+    # The gaps are listed here and not only under `--self-test`, because a green
+    # SUMMARY is what anyone actually reads. A comparator that cannot see a
+    # whole class of wrong answer is part of what this run does not prove, and
+    # saying so only where a separate flag is passed hides it from every reader
+    # who does not pass it.
+    if KNOWN_GAP:
+        print(
+            f"KNOWN GAP: {len(KNOWN_GAP)} comparator blind spot(s) below -- this run does "
+            f"not prove what they cover. Run --self-test for the full matrix."
+        )
+        for (cmp_name, mode), why in sorted(KNOWN_GAP.items()):
+            print(f"  {cmp_name} + {mode}: {why}")
+        print()
+
     print(
         f"SUMMARY: {passed}/{total} cases passed, {failed} failed, "
         f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}"
     )
-    if inject_fault and already_injected and inject_fault is not None:
-        pass  # informational; actual detection is visible in the per-case FAIL line above
 
     return 1 if failed else 0
+
+
+def _verdict_for(cmp_name: str, mode: str, outcome: Outcome | None) -> tuple[str, str]:
+    """(verdict, note). `outcome is None` means the fault was never
+    constructible for anything this comparator judges."""
+    key = (cmp_name, mode)
+    if outcome is None:
+        return "n/a", "fault not constructible for this result shape"
+    if not outcome.passed:
+        if key in BLIND_BY_DESIGN:
+            return "CAUGHT", "UNEXPECTED -- BLIND_BY_DESIGN says this should not be caught; that table is stale"
+        if key in KNOWN_GAP:
+            return "CAUGHT", "UNEXPECTED -- KNOWN_GAP says this should not be caught; that entry is fixed, remove it"
+        return "CAUGHT", ""
+    if key in BLIND_BY_DESIGN:
+        return "blind", BLIND_BY_DESIGN[key]
+    if key in KNOWN_GAP:
+        return "GAP", KNOWN_GAP[key]
+    return "MISSED", "the comparator accepted a wrong answer"
+
+
+def _print_injection_verdict(mode: str, seen_comparators: set[str], injected: dict) -> None:
+    print()
+    print(f"INJECTION VERDICT (--inject-fault {mode}) -- one representative case per comparator:")
+    for cmp_name in sorted(seen_comparators):
+        entry = injected.get(cmp_name)
+        verdict, note = _verdict_for(cmp_name, mode, entry[1] if entry else None)
+        where = f"  [{entry[0].op}]" if entry else ""
+        tail = f" -- {note}" if note else ""
+        print(f"  {verdict:<7} {cmp_name:<24}{where}{tail}")
+    print(
+        "  (exit code stays 1 whenever any fault was CAUGHT, which is the documented "
+        "behaviour of --inject-fault. Use --self-test for the pass/fail gate.)"
+    )
+
+
+def _group_cases_by_comparator(torch, c_module) -> dict[str, list[Case]]:
+    groups: dict[str, list[Case]] = {}
+    for op_name in c_module._aten_implemented():
+        builder = CASE_BUILDERS.get(op_name)
+        if builder is None:
+            continue
+        try:
+            torch_call = resolve_torch_overload(torch, op_name)
+        except ShimLoadError:
+            continue
+        for case in builder(torch, c_module, torch_call):
+            if case.expect != "match":
+                continue
+            groups.setdefault(comparator_name(case), []).append(case)
+    return groups
+
+
+def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
+    """Every fault mode against every comparator, printed as a table.
+
+    "This comparator is covered" means "at least one deliberately wrong
+    answer was rejected by it". Anything else -- a mode that no case could
+    express, a mode the comparator declines to check on purpose, a mode it
+    should have caught and did not -- is named, not folded into a total.
+    """
+    try:
+        c_module = load_shim(artefact)
+    except ShimLoadError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        return 2
+
+    import torch
+
+    print(f"target={c_module._shim_target()}")
+    groups = _group_cases_by_comparator(torch, c_module)
+    print(f"comparators={len(groups)} over {sum(len(v) for v in groups.values())} expect=match cases")
+    print()
+
+    matrix: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for cmp_name in sorted(groups):
+        group = groups[cmp_name]
+        pending = set(FAULT_MODES)
+        for case in group[:scan_limit]:
+            if not pending:
+                break
+            for mode in sorted(pending):
+                outcome = _run_one(case, mode)
+                if not outcome.fault_applied:
+                    continue
+                verdict, note = _verdict_for(cmp_name, mode, outcome)
+                matrix[(cmp_name, mode)] = (verdict, note, f"{case.op} :: {case.name}")
+                pending.discard(mode)
+        for mode in pending:
+            verdict, note = _verdict_for(cmp_name, mode, None)
+            matrix[(cmp_name, mode)] = (verdict, note, "")
+
+    width = max(len(c) for c in groups)
+    header = f"{'comparator':<{width}} | " + " | ".join(f"{m:<11}" for m in FAULT_MODES)
+    print(header)
+    print("-" * len(header))
+    for cmp_name in sorted(groups):
+        cells = []
+        for mode in FAULT_MODES:
+            cells.append(f"{matrix[(cmp_name, mode)][0]:<11}")
+        print(f"{cmp_name:<{width}} | " + " | ".join(cells))
+    print()
+
+    problems: list[str] = []
+    uncovered: list[str] = []
+    for cmp_name in sorted(groups):
+        caught = [m for m in FAULT_MODES if matrix[(cmp_name, m)][0] == "CAUGHT"]
+        if not caught:
+            uncovered.append(cmp_name)
+        for mode in FAULT_MODES:
+            verdict, note, where = matrix[(cmp_name, mode)]
+            if verdict == "MISSED":
+                problems.append(f"{cmp_name} + {mode}: {note} ({where})")
+            elif verdict == "CAUGHT" and note:
+                problems.append(f"{cmp_name} + {mode}: {note}")
+            if verbose and verdict in ("blind", "GAP", "n/a"):
+                print(f"NOTE {verdict:<5} {cmp_name} + {mode}: {note}")
+
+    for cmp_name in sorted(groups):
+        caught = [m for m in FAULT_MODES if matrix[(cmp_name, m)][0] == "CAUGHT"]
+        blind = [m for m in FAULT_MODES if matrix[(cmp_name, m)][0] == "blind"]
+        gaps = [m for m in FAULT_MODES if matrix[(cmp_name, m)][0] == "GAP"]
+        line = f"{cmp_name}: caught {len(caught)}/{len(FAULT_MODES)} ({', '.join(caught) or 'NOTHING'})"
+        if blind:
+            line += f"; blind by design on {', '.join(blind)}"
+        if gaps:
+            line += f"; KNOWN GAP on {', '.join(gaps)}"
+        print(line)
+
+    print()
+    live_gaps = [
+        (cmp_name, mode)
+        for cmp_name in sorted(groups)
+        for mode in FAULT_MODES
+        if matrix[(cmp_name, mode)][0] == "GAP"
+    ]
+    if live_gaps:
+        print(
+            f"KNOWN GAP: {len(live_gaps)} (comparator, fault) pair(s) let a wrong answer through "
+            "on purpose-of-record, not by design. These do not fail the run, but they are real:"
+        )
+        for cmp_name, mode in live_gaps:
+            print(f"  {cmp_name} + {mode}: {matrix[(cmp_name, mode)][1]}")
+        print()
+
+    if uncovered:
+        print(
+            "COMPARATOR NEVER EXERCISED: "
+            + ", ".join(uncovered)
+            + " -- no fault mode was rejected by it. Either the modes cannot express "
+            "a wrong answer for that result shape, or the comparator checks nothing."
+        )
+    for p in problems:
+        print(f"PROBLEM: {p}")
+
+    ok = not problems and not uncovered
+    print()
+    print(
+        f"SELF-TEST: {'PASS' if ok else 'FAIL'} -- {len(groups)} comparators x "
+        f"{len(FAULT_MODES)} fault modes, {len(problems)} problem(s), "
+        f"{len(uncovered)} comparator(s) never exercised"
+    )
+    return 0 if ok else 1
 
 
 def main() -> int:
@@ -381,11 +869,34 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="print every case, not just failures")
     parser.add_argument(
         "--inject-fault",
-        choices=["value", "shape", "dtype"],
+        choices=list(FAULT_MODES),
         default=None,
-        help="self-test: deliberately corrupt the first eligible result before comparison, to prove the comparator catches it. Should always exit non-zero when set.",
+        help=(
+            "self-test: deliberately corrupt one representative result PER COMPARATOR before "
+            "comparison, to prove each comparator catches it. Should always exit non-zero when set "
+            "(a caught fault fails its case)."
+        ),
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "run every fault mode against every comparator and print the coverage table. "
+            "Exit 0 iff every comparator rejected every fault it is supposed to reject. "
+            "This is the gate; --inject-fault is the single-mode probe."
+        ),
+    )
+    parser.add_argument(
+        "--self-test-scan",
+        type=int,
+        default=120,
+        help="how many cases per comparator --self-test may try before declaring a mode inexpressible (default 120)",
     )
     args = parser.parse_args()
+    if args.self_test:
+        if args.inject_fault:
+            parser.error("--self-test runs every mode; do not also pass --inject-fault")
+        return self_test(args.artefact, args.verbose, args.self_test_scan)
     return run(args.artefact, args.verbose, args.inject_fault)
 
 
