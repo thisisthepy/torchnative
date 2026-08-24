@@ -34,6 +34,7 @@ mod dtype;
 mod err;
 mod info;
 mod rng;
+mod storage;
 mod tensor;
 
 use crate::device::PyDevice;
@@ -365,38 +366,15 @@ fn _frombuffer(
     let start = offset as usize;
     let end = start + (numel * itemsize) as usize;
     let slice = &bytes[start..end];
-    let shape = [numel as usize];
-    let device = candle_core::Device::Cpu;
 
-    // `torch.bool` again: candle stores it as `U8`, and the 0/1 invariant
-    // (BOOL.md §6.3) has to hold by construction. Raw checkpoint bytes under a
-    // bool tag are not guaranteed normalised, so they are reduced with `!= 0`
-    // -- which is exactly what torch guarantees a bool tensor *reads* as
-    // (BOOL.md §2.6), so no value changes. Same reduction `_tensor_from_flat`
-    // makes, for the same reason.
-    if dtype.tag() == crate::dtype::TorchDType::Bool {
-        let normalised: Vec<u8> = slice.iter().map(|b| u8::from(*b != 0)).collect();
-        let tensor = Tensor::from_vec(normalised, shape.to_vec(), &device)
-            .map_err(|e| candle_err(OP, e))?;
-        return crate::tensor::promote(
-            py,
-            PyTensorBase::boolean(tensor)?.into_pyobject(py)?.into_any().unbind(),
-        );
-    }
-
-    // `dtype.storage()` refuses by name for the dtypes candle cannot hold --
-    // `int8`, `uint16`, `uint64`, the complex family. Upstream `frombuffer`
-    // accepts all of them (measured: `torch.int8` and `torch.uint16` both
-    // return tensors), so this is a real narrowing of the surface, and refusing
-    // loudly is the point. A checkpoint in one of those dtypes stops here with
-    // the dtype in the message instead of being reinterpreted as something else.
-    let storage = dtype.storage(OP)?;
-    let tensor =
-        Tensor::from_raw_buffer(slice, storage, &shape, &device).map_err(|e| candle_err(OP, e))?;
-    crate::tensor::promote(
-        py,
-        PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind(),
-    )
+    // The bytes-to-tensor step is shared with `TensorBase.set_`, which reads
+    // the same little-endian payload out of a storage instead of out of a
+    // buffer. Sharing it means the dtype narrowing and the `torch.bool`
+    // normalisation cannot drift between the safetensors path and the
+    // `torch.load` path -- both are checkpoint readers, and the two agreeing is
+    // exactly what docs/CKPT.md §1 measures (worst difference: 0.0).
+    let wrapped = crate::tensor::from_le_bytes(OP, slice, &[numel as usize], dtype.tag())?;
+    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
 /// The triple this artefact was built for. Three targets are cross-compiled and
@@ -463,6 +441,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tensor::register(m)?;
     aten::register(m)?;
     rng::register(m)?;
+    storage::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
