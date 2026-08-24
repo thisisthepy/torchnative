@@ -179,6 +179,20 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
 
     prefix = f"[{fault_tag}] " if fault_tag else ""
 
+    if case.value_check is not None:
+        # Ops whose result isn't a plain value-comparable tensor (a Python
+        # bool from is_floating_point, uninitialized memory from empty,
+        # a random draw from randint whose *sequence* can't be matched
+        # across two independent RNG implementations even with the same
+        # seed) supply their own checker instead of the default
+        # dtype/shape/value pipeline below. See cases.py for what each one
+        # actually checks and why.
+        ok, detail = case.value_check(t_res, c_res)
+        if not ok:
+            return Outcome(case, False, f"{prefix}{detail}")
+        suffix = f" [{fault_tag} did not get caught -- COMPARATOR BUG]" if fault_tag else ""
+        return Outcome(case, True, f"{prefix}{detail}{suffix}")
+
     t_dtype = dt.dtype_name(t_res.dtype)
     c_dtype = dt.dtype_name(c_res.dtype)
     if t_dtype != c_dtype:
@@ -209,6 +223,12 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
 def _corrupt(result, mode: str) -> tuple[Any, str]:
     """Only used by --inject-fault, to prove the comparator rejects a wrong
     answer. Mutates a copy of an already-correct `_C` result."""
+    if not hasattr(result, "tolist"):
+        # Not a tensor-like result (e.g. the plain bool from
+        # is_floating_point). run() steers the fault injection away from
+        # value_check cases already; this is a defensive fallback in case
+        # that selection logic ever changes.
+        return result, ""
     if mode == "value":
         flat = _flatten(result.tolist())
         if not flat:
@@ -279,6 +299,20 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         for name, reason in dt.EXCLUDED_DTYPES.items():
             print(f"NOTE: dtype {name!r} excluded from all cases -- {reason}")
 
+    # The mirror image of `missing_builders` below: a case builder exists in
+    # cases.py for an op that `_aten_implemented()` does NOT (yet) advertise.
+    # This is deliberate -- see cases.py's module docstring on pre-seeding
+    # builders for ops another change is actively implementing -- and must
+    # stay silent (not a failure, doesn't touch the pass/fail count) since
+    # it is expected to be non-empty until rust/torch_c catches up. It is
+    # still printed so "how much coverage is waiting" is visible at a glance.
+    pending_builders = sorted(op for op in CASE_BUILDERS if op not in implemented)
+    if pending_builders:
+        print(
+            f"PENDING: {len(pending_builders)} case builder(s) registered for ops not yet "
+            f"in _aten_implemented() -- waiting, not failing: {pending_builders}"
+        )
+
     all_outcomes: list[Outcome] = []
     missing_builders: list[str] = []
     already_injected = inject_fault is None
@@ -303,7 +337,14 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         cases = builder(torch, c_module, torch_call)
         for case in cases:
             fault_for_this_case = None
-            if not already_injected and case.expect == "match":
+            # Cases with a custom value_check (bool results, uninitialized
+            # memory, random draws -- see cases.py) aren't good self-test
+            # targets: _corrupt() assumes a tensor-like result with
+            # .tolist(), and the point of --inject-fault is to prove the
+            # *standard* dtype/shape/value pipeline rejects a wrong answer,
+            # which doesn't apply to those checkers. Skip them and keep
+            # looking for a plain "match" case.
+            if not already_injected and case.expect == "match" and case.value_check is None:
                 fault_for_this_case = inject_fault
                 already_injected = True
             outcome = _run_one(case, fault_for_this_case)
@@ -324,7 +365,10 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
     passed = total - failed
 
     print()
-    print(f"SUMMARY: {passed}/{total} cases passed, {failed} failed, ops covered={len(implemented)}")
+    print(
+        f"SUMMARY: {passed}/{total} cases passed, {failed} failed, "
+        f"ops covered={len(implemented)}, pending case builders={len(pending_builders)}"
+    )
     if inject_fault and already_injected and inject_fault is not None:
         pass  # informational; actual detection is visible in the per-case FAIL line above
 
