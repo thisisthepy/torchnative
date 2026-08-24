@@ -368,6 +368,32 @@ impl PyTensorBase {
         PyDevice::from_candle(self.inner.device()).kind == "meta"
     }
 
+    /// `tensor.is_cpu` / `tensor.is_cuda`. Same shape as `is_meta` and derived
+    /// the same way, so all three agree with `device` by construction rather
+    /// than by three separate constants that could drift apart.
+    ///
+    /// `is_cuda` in particular is read as a *guard* all over the vendored tree
+    /// (`if t.is_cuda:` before a CUDA-only path), so answering it is what keeps
+    /// those paths from being entered; a stub that raised turned a branch
+    /// upstream never takes into a hard stop.
+    #[getter]
+    fn is_cpu(&self) -> bool {
+        PyDevice::from_candle(self.inner.device()).kind == "cpu"
+    }
+
+    #[getter]
+    fn is_cuda(&self) -> bool {
+        PyDevice::from_candle(self.inner.device()).kind == "cuda"
+    }
+
+    // `tensor.get_device()` is *not* here, and the reason is a PyO3 collision
+    // rather than a decision: `#[pymethods]` derives the slot name
+    // `__pymethod_get_device__` from the `device` getter above and from a
+    // method named `get_device` alike, and the crate is built without
+    // `multiple-pymethods`, so the two cannot coexist in this block. It is
+    // installed from `bootstrap.py` instead, where it is one line over the
+    // `device` property this file already exposes.
+
     #[getter]
     fn ndim(&self) -> usize {
         self.inner.rank()
@@ -499,6 +525,32 @@ impl PyTensorBase {
         drop(storage);
         slf.borrow_mut().replace_with(replacement);
         Ok(slf.clone())
+    }
+
+    /// `tensor.data = other`, the write half of the `.data` property that
+    /// `bootstrap.py` installs.
+    ///
+    /// **This is the last wall on `nn.Module.to(device)`.** `Module._apply`
+    /// converts a parameter, asks `_has_compatible_shallow_copy_type` whether
+    /// the result can take the old one's place, and on `True` -- which is what
+    /// upstream answers for two dense tensors -- assigns
+    /// `param.data = param_applied` (`torch/nn/modules/module.py:995`). With no
+    /// setter that assignment is an `AttributeError`, so every `.to()`,
+    /// `.cpu()`, `.float()` and `.half()` on a module died there.
+    ///
+    /// It is `replace_with`, which means it inherits that method's recorded
+    /// divergence: the wrapper starts pointing at a different candle tensor
+    /// rather than the storage being rewritten, so a view taken *before* the
+    /// assignment does not follow it. Upstream's `.data =` swaps the TensorImpl
+    /// too, so pre-existing views do not follow there either -- for this
+    /// spelling the two agree, and docs/OPS4.md §8's open aliasing question is
+    /// about writes through views, which this is not. docs/DEVICE_ABS.md §4.
+    ///
+    /// `requires_grad` is deliberately left alone: upstream's `.data =` does
+    /// not touch it, and `_apply` relies on that to keep a `Parameter` a
+    /// parameter.
+    fn _shim_set_data(slf: &Bound<'_, Self>, value: PyTensorBase) {
+        slf.borrow_mut().replace_with(value);
     }
 
     fn numel(&self) -> usize {

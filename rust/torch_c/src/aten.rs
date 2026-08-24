@@ -198,11 +198,101 @@ pub fn aten_dispatch(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
+    check_devices_agree(op, args, kwargs)?;
     // One exit as well as one entrance: every tensor leaving the dispatcher
     // wears the registered Python tensor class (`tensor::promote`). Doing it
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
     crate::tensor::promote(py, aten_dispatch_inner(py, op, args, kwargs)?)
+}
+
+/// Refuse an op whose tensor arguments are not all on one device.
+///
+/// **Where this lives is the design decision, not whether it exists.**
+/// Upstream has no such gate: the check is inside each kernel, which is why the
+/// message it gives depends on which kernel you hit -- `a + m` says *"Expected
+/// all tensors to be on the same device, but found at least two devices, mps:0
+/// and cpu!"*, `torch.mm` says *"Tensor for argument #1 'mat1' is on CPU, but
+/// expected it to be on GPU"*, and `torch.cat([cpu, mps])` **segfaults** the
+/// process on torch 2.13.0 (measured on this host, docs/DEVICE_ABS.md §6). A
+/// per-kernel check is a check every new kernel has to remember; putting it at
+/// the single door means no kernel can forget it, and this shim has a single
+/// door precisely so that things like this have somewhere to go.
+///
+/// The message is upstream's most common one, verbatim, so that code matching
+/// on it keeps working.
+///
+/// **This cannot fire today and that is recorded, not hidden.** `resolve()`
+/// refuses every non-CPU label, so every tensor in this build is on the CPU and
+/// the loop always finds one device. What the tests can reach is the positive
+/// half -- that agreeing tensors still dispatch, including through the
+/// `Tensor[]` argument a top-level-only scan would miss.
+///
+/// **The comparison is on candle's handles, not on reconstructed labels, and
+/// that is a measured decision.** Building a `PyDevice` per tensor argument
+/// costs a `String` allocation each, and it showed: an interleaved A/B of two
+/// artefacts differing only in the call above measured **+78 ns per dispatch**
+/// for `add.Tensor` (346 -> 424 ns) and **+86 ns** for `cat.default`
+/// (392 -> 479 ns) -- +22% on the cheapest op this door has. Comparing `Device`
+/// directly is an enum discriminant test; a label is built only on the failing
+/// path, where an allocation is free next to raising. docs/DEVICE_ABS.md §6 has
+/// the numbers from both versions.
+fn check_devices_agree(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    let mut first: Option<Device> = None;
+
+    // Returns whether the value *was* a tensor, so the caller can skip the
+    // sequence casts for the overwhelmingly common case.
+    let mut visit = |value: &Bound<'_, PyAny>| -> PyResult<bool> {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return Ok(false);
+        };
+        let borrowed = tensor.borrow();
+        let device = borrowed.tensor().device();
+        match &first {
+            None => first = Some(device.clone()),
+            Some(seen) if seen.same_device(device) => {}
+            Some(seen) => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Expected all tensors to be on the same device, but found at least two \
+                     devices, {} and {}! ({op} in torch._C shim)",
+                    PyDevice::from_candle(seen).__str__(),
+                    PyDevice::from_candle(device).__str__(),
+                )));
+            }
+        }
+        Ok(true)
+    };
+
+    for value in args.iter() {
+        // Tensor first, sequence second, and the order is the measurement:
+        // almost every argument that is anything is a tensor, so trying the
+        // list and tuple casts first paid for two failed type checks on the
+        // hot path. `cat`/`stack` take `Tensor[]`, so the sequence branch
+        // cannot be dropped -- it is exactly the ops most likely to mix
+        // devices that hide their tensors one level down.
+        if visit(&value)? {
+            continue;
+        }
+        if let Ok(sequence) = value.cast::<PyList>() {
+            for item in sequence.iter() {
+                visit(&item)?;
+            }
+        } else if let Ok(sequence) = value.cast::<PyTuple>() {
+            for item in sequence.iter() {
+                visit(&item)?;
+            }
+        }
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            visit(&value)?;
+        }
+    }
+    Ok(())
 }
 
 fn aten_dispatch_inner(
@@ -3699,7 +3789,8 @@ fn to_copy_default(
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
     reject_memory_format(OP, args, kwargs, 6)?;
-    let device = device_arg(args, kwargs, 3, "device")?;
+    // `device=None` keeps the input where it is. See `device_arg_or`.
+    let device = device_arg_or(args, kwargs, 3, "device", input.tensor().device())?;
 
     if tag == TorchDType::Bool {
         let out = input
@@ -6198,22 +6289,42 @@ fn optional_tensor_arg(
     }
 }
 
+/// A factory op's `device=` slot. Absent means the default device, which for
+/// this shim is always the CPU -- `torch.set_default_device` is not one of the
+/// names implemented here (docs/DEVICE_ABS.md §5), so there is no global to
+/// consult and the constant is the truthful answer rather than a placeholder.
 fn device_arg(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
     name: &str,
 ) -> PyResult<Device> {
+    device_arg_or(args, kwargs, index, name, &Device::Cpu)
+}
+
+/// The same slot, for ops whose default is **not** the global default but the
+/// device of a tensor they were handed.
+///
+/// `aten::_to_copy(self, dtype=None, ..., device=None, ...)` is the one that
+/// matters: `device=None` means "stay where you are", and reading it as "go to
+/// the CPU" is a silent transfer. It is unobservable while there is one device
+/// -- which is exactly why it survived to be found by reading rather than by a
+/// failing test -- and it is wrong the day there are two. docs/DEVICE_ABS.md §4.
+fn device_arg_or(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+    fallback: &Device,
+) -> PyResult<Device> {
     match optional(args, kwargs, index, name)? {
         Some(value) if !value.is_none() => {
-            let device = match value.extract::<PyDevice>() {
-                Ok(device) => device,
-                // torch accepts a plain string wherever a device is taken.
-                Err(_) => PyDevice::new(&value.extract::<String>()?, None)?,
-            };
-            device.resolve()
+            // torch accepts a plain string, another `device`, or an integer
+            // wherever a device is taken; `coerce` is the one place that knows
+            // which of those are legal and what each means.
+            PyDevice::coerce(&value)?.resolve()
         }
-        _ => Ok(Device::Cpu),
+        _ => Ok(fallback.clone()),
     }
 }
 
