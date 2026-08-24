@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchnative"
+version = "0.0.1a0"
+description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.13"
+
+# `torch` is a real dependency and is declared as one. On desktop this library
+# runs on top of upstream PyTorch -- DESIGN.md §11 keeps every verification step
+# on upstream torch precisely so the API never assumes it owns that tree. On
+# device the same import is satisfied by the vendored tree plus our `_C`, which
+# pypackpack assembles rather than pip.
+#
+# Leaving this empty made the wheel install cleanly and then fail at
+# `import torchnative.api`, which is the failure mode worth avoiding.
+dependencies = ["torch>=2.5"]
+authors = [{ name = "thisisthepy" }]
+keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-adaptation"]
+
+# Pre-alpha on purpose. The Python surface here is still a skeleton; the working
+# part of this project is the `torch._C` replacement under `rust/torch_c`, which
+# is not yet built into this wheel. See the README's Status section.
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: Android",
+    "Operating System :: iOS",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Homepage = "https://github.com/thisisthepy/torchnative"
+Documentation = "https://github.com/thisisthepy/torchnative/tree/develop/docs"
+Source = "https://github.com/thisisthepy/torchnative"
+
+[project.optional-dependencies]
+# Aggregation, transport and privacy live behind this extra so that using
+# adaptation alone does not pull in the federated stack. See docs/DESIGN.md §10.
+federated = []
+
+# Without this, setuptools auto-discovery treats `src` as the root and ships
+# `main/` and `test/` as importable packages -- which is what it did, so a wheel
+# built before this section answered `import main.torchnative` and not
+# `import torchnative`. The source-set layout has to be spelled out.
+[tool.setuptools]
+package-dir = { "" = "torchnative/src/main" }
+
+[tool.setuptools.packages.find]
+where = ["torchnative/src/main"]
+# `torch` is deliberately not shipped from this distribution. src/main/torch is
+# the add-hook that grafts `torchnative.nn.federated` onto the torch namespace
+# (DESIGN.md §2), and writing files into another distribution's package would
+# collide with an installed PyTorch, break its uninstall, and conflict outright
+# if upstream ever adds that path. It stays a build-time graft against the
+# vendored tree we assemble ourselves.
+include = ["torchnative*"]
+
+[tool.ppp]
+# Platform source sets follow the pypackpack layout: src/main is scanned for
+# top-level Python packages, which is what lets one package provide both
+# `torch` and `torchnative`. See docs/DESIGN.md §10.

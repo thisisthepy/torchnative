@@ -1,7 +1,7 @@
 from torch import nn
 
 
-class torchnativeAPI(object):
+class TorchNativeAPI(object):
     def __init__(self, *args, **kwargs):
         pass
 

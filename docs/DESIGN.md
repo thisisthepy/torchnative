@@ -86,7 +86,7 @@ torchnative/
 │  └─ gradient/      엔트로피 · 보조과제 등          (단계 1)
 ├─ federated/      ← adapt 위에 얹히는 층. 집계 · 통신 · 프라이버시
 ├─ kernels/        ← 번들 리졸버. HF kernels 탐색 API 를 만족 (§8)
-└─ api/            ← torchnativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
+└─ api/            ← TorchNativeAPI. 배포 · 수명 정책 · 기기 오케스트레이션
 ```
 
 설계상 강제해야 할 것 셋:
@@ -868,9 +868,9 @@ macOS · Linux · Windows · WASM 을 대상으로 합니다. **C · C++ · Rust
 |---|---|
 | `code/FastTrackAPI.kt` | 코드 배포 |
 | `resource/ResourceHubAPI.kt` | 리소스 배포 |
-| **`weight/torchnativeAPI.kt`** | **가중치 배포 클라이언트** |
+| **`weight/TorchNativeAPI.kt`** | **가중치 배포 클라이언트** |
 
-즉 `torchnative/api/torchnativeAPI` 는 그 **기기 쪽 상대편**입니다.
+즉 `torchnative/api/TorchNativeAPI` 는 그 **기기 쪽 상대편**입니다.
 
 ### 디렉터리
 
@@ -893,7 +893,7 @@ torchnative/
 │     │     ├─ adapt/            TTL 방법
 │     │     ├─ nn/federated/     FL
 │     │     ├─ kernels/          번들 리졸버 (§8)
-│     │     └─ api/              torchnativeAPI
+│     │     └─ api/              TorchNativeAPI
 │     ├─ android/  ios/  macos/  linux/  windows/
 │     └─ test/
 │
@@ -934,7 +934,7 @@ pypackpack 의 코드 fast-track 은 **파이썬(소스 · 바이트코드)에�
 |---|---|
 | 파이썬 계층 (`torchnative`, 벤더링한 `torch/` 트리) | fast-track 가능 |
 | `torch._C`, 융합 커널 | **번들만** |
-| 모델 가중치 | torchnativeAPI |
+| 모델 가중치 | TorchNativeAPI |
 
 ### 빌드 레벨은 두 번째 손잡이다
 
