@@ -26,10 +26,10 @@ model.generate(...)                                # on the device
 ```
 
 > [!WARNING]
-> **Pre-alpha.** The operator layer matches upstream PyTorch numerically and 15 of 20 tested
-> architectures reach zero missing operators — but `import transformers` does not work yet, no
-> checkpoint has ever been loaded, and no device has run the built artefact.
-> See [Status](#status) before depending on this.
+> **Pre-alpha.** The operator layer matches upstream PyTorch numerically, 18 of 20 tested
+> architectures reach zero missing operators, real checkpoints load, and an Android device runs
+> the built artefact — but `import transformers` does not work yet and there is no accelerator
+> backend. See [Status](#status) before depending on this.
 
 ---
 
@@ -140,15 +140,17 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>91</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>2095 / 2095</b> — values, shapes, dtypes</td></tr>
-<tr><td>Python spellings</td><td><b>204</b> verified against upstream signatures</td></tr>
-<tr><td>Architectures complete</td><td><b>15 of 20</b> measured</td></tr>
+<tr><td>ATen operators</td><td><b>97</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>2268 / 2268</b> — values, shapes, dtypes</td></tr>
+<tr><td>Python spellings</td><td><b>233</b> verified against upstream signatures</td></tr>
+<tr><td>Architectures complete</td><td><b>18 of 20</b> measured</td></tr>
+<tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Linux · Android arm64 · iOS arm64</td></tr>
+<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 97 ops, <code>nn</code> forward</td></tr>
 </table>
 
 Complete: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT · StarCoder2 ·
-Persimmon · Cohere · StableLM · OLMo · Phi · BERT
+Persimmon · Cohere · StableLM · OLMo · Phi · BERT · Falcon · BLOOM · GPT-BigCode
 
 `uniform_` and `normal_` are **bit-identical** to upstream, and `multinomial` consumes the same
 generator stream — a seeded run reproduces exactly.
@@ -158,9 +160,10 @@ generator stream — a seeded run reproduces exactly.
 - `import transformers` fails — `torch.distributed` is unimplemented and an unguarded import
   inside `torch._dynamo` reaches `dist.Store`. Every result above was measured against models
   transcribed by hand.
-- No checkpoint has ever been loaded. All weights so far are randomly initialised.
-- Mobile is link-verified only — the artefacts build and link, but no device has loaded one.
+- Mamba and Mixtral are the two incomplete architectures — in-place overloads and `_grouped_mm`.
 - CPU only. No GPU or NPU backend.
+- The Android run is an emulator, not a phone. No number here describes real silicon.
+- Android arithmetic is slow: matmul runs ~12x upstream there, against ~1x on Apple.
 
 Tracked with the measurements behind them in [`docs/DESIGN.md`](docs/DESIGN.md) §11.1.
 
@@ -202,19 +205,31 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 | **Device abstraction** | `torch.device`, per-device dispatch. Everything else waits on it. |
 | **Metal** | candle already has the backend; disabled here for build isolation, not absent. |
 | **`torch.distributed`** | From `world_size = 1` upward. Unblocks `transformers` as a side effect. |
-| **Android GPU** | No candle backend and no `vulkan` slot in the `kernels` contract — genuinely new work. |
-| **NPU** | ANE, NNAPI and QNN take a whole graph ahead of time, so this needs a capture layer rather than another device. The single door is where it attaches. |
+| **Vulkan** | No candle backend and no `vulkan` slot in the `kernels` contract — genuinely new work. Wiring and correctness are testable on an emulator; only the performance question needs a phone. |
+| **NPU** | NNAPI, CoreML and QNN compile at runtime, so no export step is added — but they take a whole subgraph, not one operator. That needs a capture layer, and the single door is where it attaches. |
 
 ---
 
 ## Install
 
-> Not published yet. The alpha will carry platform wheels for macOS, Linux, Android and iOS —
-> the extension is native, so `py3-none-any` is not the shape this ships in.
-
 ```sh
 pip install torchnative
 ```
+
+> [!IMPORTANT]
+> **`0.0.1a0` is a name reservation, not a working install.** It is tagged `py3-none-any` and
+> contains only the `torchnative` API skeleton — no `_C` extension and no vendored `torch`. So
+> `import torch` will not work from a released wheel yet. Everything in [Status](#status) is
+> measured from a source build.
+>
+> The extension is native, so the shipping shape is platform wheels for macOS, Linux, Android
+> and iOS. Producing them needs a Cargo build backend that is designed but not written
+> ([`docs/CARGO_KT.md`](docs/CARGO_KT.md)). Until then, build from source:
+>
+> ```sh
+> git clone https://github.com/thisisthepy/torchnative && cd torchnative
+> bash vendor/vendor_torch.sh && bash vendor/install_shim.sh
+> ```
 
 ### Building from source
 
