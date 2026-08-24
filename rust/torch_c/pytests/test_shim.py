@@ -426,6 +426,55 @@ def test_variable_functions_members_do_not_bind():
     assert fn.__module__ == "torch"
 
 
+def test_a_placeholder_refuses_a_truth_test():
+    # The whole point of `_Unimplemented` is that it is not a chameleon. A
+    # truth test is a question, and answering it is what a chameleon does.
+    #
+    # This is not hypothetical. `_has_cudnn` was one of these, and
+    # `torch/backends/cudnn/__init__.py:231` -- a class body, so it runs during
+    # `import torch` -- is `if is_available():` over `return
+    # torch._C._has_cudnn`. A truthy placeholder took the "cuDNN is here"
+    # branch and bound `CudnnModule.benchmark_limit` to a pair of placeholders,
+    # where upstream without cuDNN leaves it `None`.
+    #
+    # The name sampled here is undeclared by the stubs (it reaches the surface
+    # only through the tree text scan), so the shim genuinely does not know
+    # whether it is a flag or a function. "I cannot answer that" is the true
+    # state, and raising is how it is said.
+    assert isinstance(_C._is_cow_tensor, type(_C._is_alias_of))
+    try:
+        bool(_C._is_cow_tensor)
+    except NotImplementedError as e:
+        assert "_is_cow_tensor" in str(e)
+    else:
+        raise AssertionError("a placeholder must not answer a truth test")
+
+
+def test_every_build_flag_the_stubs_declare_answers_with_a_real_bool():
+    # `surface.json` marks the module-level names the stubs annotate `_bool`.
+    # Each is a build-configuration flag: it has exactly two possible answers
+    # and both change behaviour, so there is no honest placeholder for one.
+    # Nothing here checks *which* bool -- that is a fact about this build and
+    # lives in `_BUILD_FLAGS` with its reason. What is checked is that the
+    # question is answered in kind, which is the property a truthy placeholder
+    # silently broke for `_has_cudnn`.
+    import json
+    import os
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, os.pardir, "src", "surface.json")) as fh:
+        surface = json.load(fh)
+    declared = [n for n, kind in surface["module"].items() if kind == "bool"]
+    assert len(declared) >= 14, declared
+    off = set(_C._shim_off_switches)
+    for name in declared:
+        if name in off:
+            assert not hasattr(_C, name), f"{name} is an off-switch and must be absent"
+            continue
+        value = getattr(_C, name)
+        assert type(value) is bool, f"{name} answers {type(value).__name__}, not bool"
+
+
 def test_off_switches_stay_off():
     # VENDOR.md wall 11: the vendored tree turns subsystems off by asking
     # whether `_C` has a name. A module-level catch-all would answer yes to

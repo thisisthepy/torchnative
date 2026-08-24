@@ -51,6 +51,19 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # found here.
 NAMESPACE_TYPES = ("dtype", "layout", "memory_format", "qscheme")
 
+# Module-level names the stubs annotate `_bool`. They are carried through as
+# their own kind rather than flattened into "value" because a placeholder is
+# *not* an acceptable answer for one, and the shim can only enforce that if it
+# can tell them apart.
+#
+# The reason is measured, not stylistic. `_Unimplemented` has no `__bool__`, so
+# it is truthy, and `torch/backends/cudnn/__init__.py:231` -- a class body, so
+# it runs during `import torch` -- reads `_has_cudnn` through `is_available()`
+# and took the "cuDNN is present" branch. Every one of these names is read that
+# way somewhere; a build flag has two answers and both change behaviour.
+# `bootstrap.install` refuses to build a surface that leaves one unanswered.
+BOOL_VALUE_TYPE = "_bool"
+
 
 def _is_ellipsis(node) -> bool:
     return isinstance(node, ast.Constant) and node.value is Ellipsis
@@ -313,7 +326,7 @@ def build(vendor_dir: str) -> dict:
     for name in main["types"]:
         module[name] = "type"
     for name, kind in main["values"].items():
-        module.setdefault(name, "value")
+        module.setdefault(name, "bool" if kind == BOOL_VALUE_TYPE else "value")
     for name in submodules:
         module[name] = "module"
     # Names the tree reaches for that the stubs never declare. They land as
@@ -359,6 +372,8 @@ def main() -> int:
     print(f"  submodules     {len(surface['submodules'])}")
     print(f"  torch namespace {len(surface['namespace'])}")
     print(f"  probed (off-switches) {len(surface['probes'])}")
+    print(f"  build flags (_bool)   "
+          f"{sum(1 for k in surface['module'].values() if k == 'bool')}")
     if args.print_summary:
         for name, sub in sorted(surface["submodules"].items()):
             print(f"    {name}: {len(sub['functions'])} fn, "
