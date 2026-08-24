@@ -297,8 +297,18 @@ feature:android.software.vulkan.deqp.level=132711169
 ```
 
 게스트 확장에 `ANDROID_EMU_vulkan`, `ANDROID_EMU_deferred_vulkan_commands`,
-`ANDROID_EMU_vulkan_async_queue_submit`, 그리고 **`ANDROID_EMU_vulkan_shader_float16_int8`**
-이 있습니다 — 마지막 것은 fp16·int8 셰이더가 된다는 뜻이라 양자화 경로까지 시험 대상입니다.
+`ANDROID_EMU_vulkan_async_queue_submit`, 그리고 `ANDROID_EMU_vulkan_shader_float16_int8`
+이 있습니다.
+
+> **정정 (2026-08-25).** 이 절의 초판은 마지막 항목을 근거로 *"fp16·int8 셰이더가 되니
+> 양자화 경로까지 시험 대상"* 이라고 썼습니다. **너무 강한 주장이었습니다.** `docs/VULKAN.md`
+> 의 프로브가 어댑터를 **`"Apple M1"`** 으로, wgpu 쪽은 드라이버를 **`MoltenVK`** 로 보고합니다 —
+> 저 피처 비트는 gfxstream 이 **호스트의 것을 그대로 전달한 것**입니다. Adreno 나 Mali 가
+> `shaderFloat16` 을 주는지는 **여기서 답할 수 없습니다.** 양자화 경로는 여전히 열린 문제입니다.
+>
+> 같은 절에서 배운 두 번째 것: **확장 문자열을 세면 거짓 음성이 난다.** `VK_KHR_8bit_storage`
+> 는 "absent" 로 나오는데 `storageBuffer8BitAccess` 는 YES 입니다 — 코어로 승격된 확장은
+> 목록에 안 나옵니다. `Vulkan11Features`/`Vulkan12Features` 를 조회해야 합니다.
 
 드라이버는 `ro.hardware.vulkan = ranchu` (에뮬레이터의 virtio-gpu) 로, **게스트 Vulkan 을 호스트로
 번역**합니다.
@@ -307,7 +317,8 @@ feature:android.software.vulkan.deqp.level=132711169
 
 | | 지금 가능 | 근거 |
 |---|---|---|
-| Vulkan 경로가 도는지 | **예** | 컴퓨트 · fp16 확장 존재 |
+| Vulkan 경로가 도는지 | **예** | 실제로 돌렸다 — `docs/VULKAN.md` |
+| 양자화(fp16·int8) 셰이더가 실기에서 되는지 | **아니오** | 위 정정 참고 — 호스트 비트다 |
 | 값이 CPU 와 맞는지 | **예** | §4 의 비트 단위 대조 방식 그대로 |
 | ExecuTorch `vulkan` 델리게이트 배선 | **예** | |
 | **성능이 Adreno·Mali 를 대표하는가** | **아니오** | `ranchu` 가 호스트 GPU 로 번역한다 |
