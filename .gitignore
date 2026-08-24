@@ -197,3 +197,7 @@ cython_debug/
 /vendor/torch/
 /vendor/torch-*.dist-info/
 /vendor/.stamp
+
+# macOS Finder metadata. Three of these had been committed, and the sdist
+# carried them to PyPI.
+.DS_Store
