@@ -13,6 +13,8 @@ Written with plain asserts so it runs under pytest or on its own, without
 adding a test dependency to a package that has none.
 """
 
+import math
+
 import _C
 
 
@@ -885,6 +887,360 @@ def test_the_dispatch_table_matches_the_two_lists():
             raise AssertionError(f"{key} is listed but not dispatched: {e}") from None
         except Exception:
             pass  # missing arguments -- the key itself resolved
+
+
+# --- against real upstream torch, live in the same process (docs/E2E.md) ---
+#
+# Every measurement below was a one-off until now: it lived in a probe script
+# under a `caches/` directory that is not committed and evaporates with the
+# next `git worktree` cleanup, so nobody would notice if a future change to
+# `aten.rs` or `rng.rs` broke the property "the shim's tokens match upstream
+# torch's tokens". These tests pin that property into the suite that runs on
+# every change.
+#
+# The approach: `import torch` here is the *real* upstream package (nothing
+# on `sys.path` shadows it -- this file never adds `vendor/` to the path),
+# and `_C` (imported at the top of this file) is the shim, loaded standalone
+# as a module literally named `_C`, never as `torch._C`. The two do not
+# collide in one process -- confirmed by running the model-comparison probes
+# this section is built from directly, both here and previously as throwaway
+# scripts under `caches/bw-sample-probe/`. docs/E2E.md records that check and
+# why it is not the two-process split this file's callers expected going in.
+#
+# This makes the tests below option (b) from that discussion -- live against
+# upstream, not frozen constants -- but without the subprocess: same process,
+# so no serialization boundary and no per-test interpreter startup cost. The
+# honest cost is the same as (b) would have had: upstream `torch` has to be
+# importable. It usually is not (this file's own docstring promises no test
+# dependency on a package that has none), so every test in this section
+# no-ops rather than fails when `torch` is missing, and docs/E2E.md says so.
+try:
+    import torch as _upstream_torch
+except ImportError:  # pragma: no cover - most interpreters running this file
+    _upstream_torch = None
+
+
+def _e2e_det(n, seed):
+    """A linear congruential generator, not a real init scheme -- the point
+    is that both backends receive bit-identical weights without sharing an
+    RNG, not that the numbers are good ones to train with."""
+    out, state = [], seed
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append(round(((state / 2147483648.0) * 2.0 - 1.0) * 0.2, 6))
+    return out
+
+
+_E2E_H, _E2E_HEADS, _E2E_INTER, _E2E_VOCAB, _E2E_LAYERS = 64, 2, 128, 100, 2
+_E2E_HD = _E2E_H // _E2E_HEADS
+
+
+def _e2e_weights():
+    H, INTER, VOCAB, LAYERS = _E2E_H, _E2E_INTER, _E2E_VOCAB, _E2E_LAYERS
+    w = {}
+    s = 1
+    for name, n in [("embed", VOCAB * H), ("lm_head", VOCAB * H), ("final_norm", H)]:
+        w[name] = _e2e_det(n, s)
+        s += 1
+    for layer in range(LAYERS):
+        for name, n in [
+            ("q", H * H), ("k", H * H), ("v", H * H), ("o", H * H),
+            ("gate", INTER * H), ("up", INTER * H), ("down", H * INTER),
+            ("in_norm", H), ("post_norm", H),
+        ]:
+            w[f"{layer}.{name}"] = _e2e_det(n, s)
+            s += 1
+    # RMSNorm weights start near 1.0, not near 0.0 -- a norm layer initialized
+    # like a linear layer zeroes its own output.
+    norm_keys = ("final_norm",) + tuple(
+        f"{layer}.{n}" for layer in range(LAYERS) for n in ("in_norm", "post_norm")
+    )
+    for k in norm_keys:
+        w[k] = [1.0 + v for v in w[k]]
+    return w
+
+
+class _E2EBackend:
+    """Runs the same op sequence against either the shim (`_C`) or real
+    upstream `torch.ops.aten`, so the model-building code below is written
+    once and executed through both."""
+
+    def __init__(self, kind):
+        assert kind in ("shim", "upstream")
+        self.kind = kind
+
+    def t(self, flat, shape, dtype="float32"):
+        if self.kind == "upstream":
+            dt = getattr(_upstream_torch, dtype)
+            return _upstream_torch.tensor(list(flat), dtype=dt).reshape(list(shape))
+        return _C._tensor_from_flat(list(flat), list(shape), dtype=getattr(_C, dtype))
+
+    def op(self, name, *args, **kw):
+        if self.kind == "upstream":
+            ns, o, ov = name.split(".")
+            return getattr(getattr(getattr(_upstream_torch.ops, ns), o), ov)(*args, **kw)
+        return _C._aten_dispatch(name, *args, **kw)
+
+    def seed(self, s):
+        if self.kind == "upstream":
+            _upstream_torch.manual_seed(s)
+        else:
+            _C._shim_manual_seed(s)
+
+
+def _e2e_build(b, w):
+    H = _E2E_H
+    return {
+        k: b.t(
+            v,
+            (len(v) // H, H) if k in ("embed", "lm_head") else
+            (_E2E_INTER, H) if k.endswith(("gate", "up")) else
+            (H, _E2E_INTER) if k.endswith("down") else
+            (H, H) if k.split(".")[-1] in ("q", "k", "v", "o") else (H,),
+        )
+        for k, v in w.items()
+    }
+
+
+def _e2e_rms_norm(b, x, w, eps=1e-6):
+    sq = b.op("aten.mul.Tensor", x, x)
+    mean = b.op("aten.mean.dim", sq, [-1], True)
+    var = b.op("aten.add.Tensor", mean, b.t([eps], ()))
+    inv = b.op("aten.rsqrt.default", var)
+    return b.op("aten.mul.Tensor", b.op("aten.mul.Tensor", x, inv), w)
+
+
+def _e2e_linear(b, x, w):
+    """`nn.Linear` without bias: `x @ w.t()`, decomposed the way
+    docs/NN_SURFACE.md §5 measured upstream actually calling it."""
+    dims = list(x.shape)
+    flat = b.op("aten.view.default", x, [-1, dims[-1]])
+    out = b.op("aten.mm.default", flat, b.op("aten.t.default", w))
+    return b.op("aten.view.default", out, dims[:-1] + [int(out.shape[-1])])
+
+
+def _e2e_rope_tables(b, seq, hd, base=10000.0):
+    cos, sin = [], []
+    for p in range(seq):
+        row_c, row_s = [], []
+        for i in range(hd // 2):
+            inv = 1.0 / (base ** (2 * i / hd))
+            row_c.append(math.cos(p * inv))
+            row_s.append(math.sin(p * inv))
+        cos.append(row_c + row_c)
+        sin.append(row_s + row_s)
+    flat_c = [v for r in cos for v in r]
+    flat_s = [v for r in sin for v in r]
+    return b.t(flat_c, (1, 1, seq, hd)), b.t(flat_s, (1, 1, seq, hd))
+
+
+def _e2e_rotate_half(b, x):
+    hd = int(x.shape[-1])
+    x1 = b.op("aten.slice.Tensor", x, 3, 0, hd // 2, 1)
+    x2 = b.op("aten.slice.Tensor", x, 3, hd // 2, hd, 1)
+    return b.op("aten.cat.default", [b.op("aten.neg.default", x2), x1], 3)
+
+
+def _e2e_apply_rope(b, x, cos, sin):
+    return b.op(
+        "aten.add.Tensor",
+        b.op("aten.mul.Tensor", x, cos),
+        b.op("aten.mul.Tensor", _e2e_rotate_half(b, x), sin),
+    )
+
+
+def _e2e_forward(b, w, ids, seq):
+    """A 2-layer Llama-shaped decoder -- RMSNorm, RoPE, flash `sdpa`, SwiGLU
+    MLP -- op-for-op the sequence transformers' `LlamaModel` produces
+    (docs/NN_SURFACE.md §5-6)."""
+    H, HD, HEADS = _E2E_H, _E2E_HD, _E2E_HEADS
+    idx = b.t(ids, (len(ids),), "int64")
+    h = b.op("aten.embedding.default", w["embed"], idx)
+    h = b.op("aten.view.default", h, [1, seq, H])
+    cos, sin = _e2e_rope_tables(b, seq, HD)
+    for layer in range(_E2E_LAYERS):
+        resid = h
+        x = _e2e_rms_norm(b, h, w[f"{layer}.in_norm"])
+        q = _e2e_linear(b, x, w[f"{layer}.q"])
+        k = _e2e_linear(b, x, w[f"{layer}.k"])
+        v = _e2e_linear(b, x, w[f"{layer}.v"])
+
+        def heads(t):
+            t = b.op("aten.view.default", t, [1, seq, HEADS, HD])
+            return b.op("aten.transpose.int", t, 1, 2)
+
+        q, k, v = heads(q), heads(k), heads(v)
+        q = _e2e_apply_rope(b, q, cos, sin)
+        k = _e2e_apply_rope(b, k, cos, sin)
+        att = b.op(
+            "aten._scaled_dot_product_flash_attention_for_cpu.default", q, k, v, 0.0, True
+        )[0]
+        att = b.op("aten.transpose.int", att, 1, 2)
+        contig = b.op("aten.contiguous.default", att) if b.kind == "shim" else att.contiguous()
+        att = b.op("aten._unsafe_view.default", contig, [1, seq, H])
+        h = b.op("aten.add.Tensor", resid, _e2e_linear(b, att, w[f"{layer}.o"]))
+        resid = h
+        x = _e2e_rms_norm(b, h, w[f"{layer}.post_norm"])
+        gate = b.op("aten.silu.default", _e2e_linear(b, x, w[f"{layer}.gate"]))
+        up = _e2e_linear(b, x, w[f"{layer}.up"])
+        h = b.op(
+            "aten.add.Tensor",
+            resid,
+            _e2e_linear(b, b.op("aten.mul.Tensor", gate, up), w[f"{layer}.down"]),
+        )
+    h = _e2e_rms_norm(b, h, w["final_norm"])
+    return _e2e_linear(b, h, w["lm_head"])
+
+
+def _e2e_flatten(x):
+    if isinstance(x, list):
+        out = []
+        for v in x:
+            out.extend(_e2e_flatten(v))
+        return out
+    return [x]
+
+
+def test_two_layer_llama_greedy_matches_upstream_token_for_token():
+    # Regression-pins the claim measured in docs/NN_SURFACE.md §7 and
+    # docs/SAMPLING.md §3's aten-level model: an aten-level 2-layer decoder,
+    # decoded greedily, produces the exact same tokens as real torch.
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    ids, steps = [7, 42, 3, 88], 4
+    results = {}
+    for kind in ("upstream", "shim"):
+        b = _E2EBackend(kind)
+        w = _e2e_build(b, _e2e_weights())
+        out = list(ids)
+        last_logits = None
+        for _ in range(steps):
+            logits = _e2e_forward(b, w, out, len(out))
+            last = b.op("aten.slice.Tensor", logits, 1, len(out) - 1, len(out), 1)
+            nxt = b.op("aten.argmax.default", last, -1, False)
+            v = nxt.tolist()
+            while isinstance(v, list):
+                v = v[0]
+            out.append(int(v))
+            last_logits = logits
+        results[kind] = (out, _e2e_flatten(last_logits.tolist()))
+    (t_out, t_last), (c_out, c_last) = results["upstream"], results["shim"]
+    assert t_out == c_out, (t_out, c_out)
+    # Tolerance is the golden harness's own float32 bound
+    # (tools/golden/dtypes.py `TOLERANCES["float32"]`, atol=rtol=1e-5), not a
+    # number invented for this test. Measured max gap here today: ~2.3e-06 --
+    # float32 rounding from 2 layers x ~12 matmuls each, well inside it. A
+    # wrong kernel misses by far more than an order of magnitude (see
+    # docs/E2E.md for the deliberately-broken run this was checked against).
+    max_diff = max(abs(a - b_) for a, b_ in zip(t_last, c_last))
+    assert max_diff < 1e-5, max_diff
+
+
+_E2E_FILTER = float("-inf")
+
+
+def _e2e_top_k_warp(b, scores, top_k):
+    """`transformers.TopKLogitsWarper`, transcribed op for op."""
+    kth = b.op("aten.topk.default", scores, top_k, -1, True, True)[0]
+    kth = b.op("aten.slice.Tensor", kth, 1, top_k - 1, top_k, 1)
+    remove = b.op("aten.lt.Tensor", scores, kth)
+    return b.op("aten.masked_fill.Scalar", scores, remove, _E2E_FILTER)
+
+
+def _e2e_top_p_warp(b, scores, top_p):
+    """`transformers.TopPLogitsWarper`, transcribed op for op."""
+    sorted_logits, sorted_indices = b.op("aten.sort.default", scores, -1, False)
+    probs = b.op("aten._softmax.default", sorted_logits, -1, False)
+    cum = b.op("aten.cumsum.default", probs, -1)
+    remove = b.op("aten.le.Scalar", cum, 1.0 - top_p)
+    n = int(scores.shape[-1])
+    rows = int(scores.shape[0])
+    keep_idx = b.t([n - 1] * rows, (rows, 1), "int64")
+    false_src = b.op("aten.le.Scalar", b.t([1.0] * rows, (rows, 1)), 0.0)
+    remove = b.op("aten.scatter.src", remove, 1, keep_idx, false_src)
+    remove = b.op("aten.scatter.src", remove, 1, sorted_indices, remove)
+    return b.op("aten.masked_fill.Scalar", scores, remove, _E2E_FILTER)
+
+
+def _e2e_sample_step(b, logits, seq, temperature, top_k, top_p, seed, vocab):
+    last = b.op("aten.slice.Tensor", logits, 1, seq - 1, seq, 1)
+    last = b.op("aten.view.default", last, [1, vocab])
+    scores = b.op("aten.div.Tensor", last, b.t([temperature], ()))
+    scores = _e2e_top_k_warp(b, scores, top_k)
+    scores = _e2e_top_p_warp(b, scores, top_p)
+    probs = b.op("aten._softmax.default", scores, -1, False)
+    if seed is not None:
+        b.seed(seed)
+    tok = b.op("aten.multinomial.default", probs, 1, False)
+    return b.op("aten.squeeze.dim", tok, 1)
+
+
+def _e2e_generate(kind, ids, steps, temperature, top_k, top_p, seed, reseed_each_step):
+    b = _E2EBackend(kind)
+    w = _e2e_build(b, _e2e_weights())
+    out = list(ids)
+    if not reseed_each_step:
+        b.seed(seed)
+    for step in range(steps):
+        logits = _e2e_forward(b, w, out, len(out))
+        tok = _e2e_sample_step(
+            b, logits, len(out), temperature, top_k, top_p,
+            seed + step if reseed_each_step else None, _E2E_VOCAB,
+        )
+        out.append(int(tok.tolist()[0]))
+    return out
+
+
+def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
+    # Regression-pins docs/SAMPLING.md §3's judgment call: 15 configurations x
+    # 6 greedy-sampled tokens = 90 tokens, all matching upstream. Nine configs
+    # reseed before every draw (same starting point -> same value); six seed
+    # once and let the stream run across all 6 steps, which is the stronger
+    # claim -- it only matches if both sides consume the same *number* of
+    # random words per step, not merely the same value from a fresh seed.
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    ids, steps = [7, 42, 3, 88], 6
+    checked = 0
+    for temperature, top_k, top_p in ((1.0, 50, 0.95), (0.7, 20, 0.9), (1.3, 100, 1.0)):
+        for seed in (0, 1, 1234):
+            t_out = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, True)
+            c_out = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, True)
+            assert t_out == c_out, ("reseed", temperature, top_k, top_p, seed, t_out, c_out)
+            checked += steps
+    for temperature, top_k, top_p in ((1.0, 50, 0.95), (0.7, 20, 0.9)):
+        for seed in (0, 1, 1234):
+            t_out = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, False)
+            c_out = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, False)
+            assert t_out == c_out, ("running", temperature, top_k, top_p, seed, t_out, c_out)
+            checked += steps
+    assert checked == 90, checked
+
+
+def test_multinomial_matches_upstream_through_a_second_draw():
+    # docs/SAMPLING.md §2: `multinomial` takes one of two algorithms
+    # (Gumbel-style argmax/topk, or cumsum + binary search) depending on
+    # `!replacement or n_sample == 1`, and the fast path consumes a fixed word
+    # count regardless of `n_sample`/`replacement`. A single draw matching by
+    # coincidence would not show that; a *second* draw right after, with no
+    # reseed in between, only matches if the first draw consumed exactly the
+    # same number of generator words on both sides.
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    cases = [(5, 1, False), (5, 3, True), (8, 1, True), (100, 1, False), (100, 3, True)]
+    for n_cat, n_sample, replacement in cases:
+        flat = [round(((i * 2654435761 + 1) % 1000) / 1000.0 + 0.01, 6) for i in range(n_cat)]
+        for seed in (0, 1, 1234):
+            t_probs = _upstream_torch.tensor(flat, dtype=_upstream_torch.float32)
+            c_probs = _C._tensor_from_flat(flat, [n_cat], dtype=_C.float32)
+            _upstream_torch.manual_seed(seed)
+            t1 = _upstream_torch.ops.aten.multinomial.default(t_probs, n_sample, replacement)
+            _C._shim_manual_seed(seed)
+            c1 = _C._aten_dispatch("aten.multinomial.default", c_probs, n_sample, replacement)
+            t2 = _upstream_torch.ops.aten.multinomial.default(t_probs, n_sample, replacement)
+            c2 = _C._aten_dispatch("aten.multinomial.default", c_probs, n_sample, replacement)
+            assert t1.tolist() == c1.tolist(), (n_cat, n_sample, replacement, seed, "draw1")
+            assert t2.tolist() == c2.tolist(), (n_cat, n_sample, replacement, seed, "draw2")
 
 
 def _main():
