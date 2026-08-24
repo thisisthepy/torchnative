@@ -301,6 +301,12 @@ PARITY: ok
 이 문서는 그것을 고치지 않습니다 — 1~2 ULP 를 면제할지는 허용오차 정책의 판단이고,
 이 작업의 범위 밖입니다. **다만 지금 `parity` 는 exit 1 입니다.**
 
+> **고쳐졌습니다 (2026-08-25).** 면제 목록을 늘리는 대신, `parity` 가 **호스트 쪽을
+> `accelerate` 없이 따로 빌드**해서 gemm 대 gemm 으로 비교하도록 바꿨습니다 — 이 절이
+> 실측한 그 구성입니다. 면제 목록은 원래의 둘로 유지되고 `PARITY: ok` 로 돌아왔습니다.
+> **배송 빌드는 바뀌지 않았습니다.** 근거는 `docs/DEVICE.md` §5.2 이고, Apple ↔ 안드로이드
+> 사이에 실제로 남는 8 건의 차이는 §5.1 에 기록해 두었습니다.
+
 ---
 
 ## 7. 재현
@@ -344,17 +350,23 @@ $ADB shell "cd $D && BW_STUB_MULTIPROCESSING=1 TORCH_USE_RTLD_GLOBAL=1 \
 ### 7.2 호스트 A/B (백엔드 비교)
 
 `accelerate` 는 `Cargo.toml` 의 `[target.'cfg(target_vendor = "apple")'.dependencies]` 절에
-있습니다. 끄려면 그 줄의 `features = ["accelerate"]` 를 지우고 별도 `CARGO_TARGET_DIR` 로
-빌드한 뒤 **되돌립니다.**
+있습니다. **이 문서를 쓸 때는 그 줄을 손으로 지웠다 되돌려야 했지만, 지금은 그럴 필요가
+없습니다** — 그 절이 `not(torch_c_no_accelerate)` 로 게이팅되어 있어 명령줄에서 끕니다
+(2026-08-25, `parity` 가 쓰는 것과 같은 경로).
 
 ```sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-blas-noaccel
-( cd rust/torch_c && cargo build --release )
+( cd rust/torch_c && cargo build --release \
+    --config 'target."cfg(target_vendor = \"apple\")".rustflags = ["--cfg", "torch_c_no_accelerate"]' )
 otool -L $CARGO_TARGET_DIR/release/lib_C.dylib | grep -c Accelerate   # 0 이어야 함
 cp $CARGO_TARGET_DIR/release/lib_C.dylib torchnative/src/main/torch/_C.abi3.so
 RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
     /Volumes/macMini/caches/spike-venv/bin/python <bench.py> host-noaccel-t1
 ```
+
+**`RUSTFLAGS="--cfg torch_c_no_accelerate"` 로 주지 마십시오.** 환경 변수 쪽은
+`.cargo/config.toml` 의 rustflags 를 더하는 것이 아니라 **대체**하므로 호스트 링크가
+`-undefined dynamic_lookup` 을 잃고 `_Py*` 미해결 심볼 더미로 실패합니다(실측).
 
 상류 쪽은 `PYTHONPATH` 없이 `/Volumes/macMini/caches/spike-venv/bin/python` 을 그대로 씁니다
 (벤더 트리를 `PYTHONPATH` 에 넣지 마십시오).

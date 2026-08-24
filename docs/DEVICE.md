@@ -151,6 +151,67 @@ bionic 의 `expf`/`tanhf` 가 서로 다른 구현일 뿐이다. §2 의 미해�
 "libm 이 다르면 다 다르다" 가 아니라 **함수별** 현상이고, 그래서 아래처럼 함수 이름으로
 면제 목록을 둔다.
 
+### 5.1 Apple 사용자와 안드로이드 사용자는 실제로 다른 값을 받는다 (2026-08-25)
+
+**이 절은 위 대조가 답하지 않는 것을 적는다.** 위의 "30/32 비트 동일" 은 양쪽이 같은
+행렬곱 커널(candle 의 `gemm`)을 쓸 때의 값이다. **배송되는 빌드는 그렇지 않다.**
+`docs/PERF.md` §3 이 Apple 타깃에만 `accelerate` 를 켰으므로,
+
+| | 행렬곱 | 초월함수 |
+|---|---|---|
+| macOS · iOS 배송 빌드 | Accelerate (AMX 코프로세서) | vForce + Apple libm |
+| 안드로이드 배송 빌드 | candle `gemm` (NEON) | bionic libm |
+
+두 벌은 **비트 동일할 수 없다.** 서로 다른 BLAS 는 누적 순서가 다르고, 그 사실은
+`docs/PERF.md` §3 이 `accelerate` 를 켤 때 골든을 다시 돌려야 했던 이유이기도 하다.
+
+**실측 (같은 기기 `.so`, 호스트만 배송 빌드로 바꿔 대조):**
+
+```
+identical 23/33
+MISMATCH addmm.default             3/9  elements, max 1 ULP
+MISMATCH bmm.default               3/9  elements, max 1 ULP
+MISMATCH mm.default                1/9  elements, max 1 ULP
+MISMATCH native_layer_norm.default 3/12 elements, max 2 ULP
+MISMATCH nn.Linear forward         3/9  elements, max 2 ULP
+MISMATCH cos.default               6/12 elements, max 1 ULP
+MISMATCH sin.default               3/12 elements, max 1 ULP
+MISMATCH rsqrt.default             1/12 elements, max 1 ULP
+```
+
+앞의 다섯은 BLAS 누적 순서, 뒤의 셋은 vForce 가 스칼라 `sinf`/`cosf`/`rsqrt` 를 벡터
+근사로 대체하는 것이다. **1~2 ULP 이고, 어느 쪽이 틀린 것이 아니다** — §5 의 `_softmax`
+분석과 같은 성격이다.
+
+**이것은 결함이 아니다.** 상류 torch 도 플랫폼마다 다른 BLAS(MKL · Accelerate · OpenBLAS)
+를 링크하므로 같은 성질을 갖는다. 다만 **결함이 아니라는 것과 존재하지 않는다는 것은
+다르다.** 다음 두 가지가 여기서 나온다.
+
+- **비트 재현성을 요구하는 기능(체크포인트 해시, 결정론적 재생, 크로스 플랫폼 골든)은
+  이 차이 위에 세울 수 없다.** f32 행렬곱을 지나는 순간 플랫폼이 답을 바꾼다.
+- **`scripts/device_android.sh parity` 는 이 차이를 재지 않는다.** 그 스크립트는 호스트
+  쪽을 `accelerate` 없이 따로 빌드해서(`rust/torch_c/Cargo.toml` 의
+  `torch_c_no_accelerate` cfg) **gemm 대 gemm** 으로 비교한다.
+
+### 5.2 왜 parity 는 배송 빌드를 재지 않는가
+
+위 8 건을 면제 목록에 추가하는 선택지도 있었고, **그것을 고르지 않았다.**
+
+이 검사가 답하는 질문은 **"같은 코드가 다른 CPU 에서 같은 답을 내는가"** 다. AMX 와 NEON 을
+비교하면 **이미 아는 사실**(다른 BLAS 는 다른 답을 낸다)만 확인하게 되고, 정작 잡아야 할
+기기 고유 커널 결함은 그 1~2 ULP 잡음에 묻힌다. 면제 목록이 열 항목이 되는 순간 그것은
+"알려진 예외 목록" 이 아니라 이 스크립트가 갖지 않기로 한 **전역 허용오차**가 된다
+(§9 의 판정 원칙).
+
+그래서 `parity` 는 호스트 쪽만 `accelerate` 를 끈 채 다시 빌드하고, **그 산출물이 정말
+Accelerate 를 링크하지 않는지 `otool` 로 확인한 뒤에만** 잰다. cfg 가 어느 날 동작을
+멈추면 그 결과는 오류가 아니라 **기기 회귀처럼 보이는 조용한 8 건**이므로, 플래그를 믿지
+않고 산출물을 본다. (음성 대조: cfg 이름을 일부러 어긋나게 바꾸고 돌리면
+`refusing to measure ...: it still links Accelerate` 로 exit 1 이다 — 확인함.)
+
+**대가를 분명히 해 둔다: `PARITY: ok` 는 배송되는 Apple 아티팩트에 대해 아무 말도 하지
+않는다.** 그것에 대해 말하는 것은 이 §5.1 이고, 위 8 건이 그 전부다.
+
 ## 6. 벽 하나 — Android CPython 에 `_multiprocessing` 이 없다
 
 ```
@@ -194,6 +255,11 @@ NotImplementedError: not implemented in torch._C shim: torch.relu(...)
 
 **이 문서는 `rust/` 를 고치지 않았다.** 수정은 별도 작업이다.
 
+> **이후 고쳐졌다 (2026-08-25 확인).** 오버로드 테이블에 그 스펠링이 들어가면서 `nn.ReLU`
+> 가 양쪽에서 돈다. 같은 배터리를 지금 돌리면 `cases=33 ok=33 failed=0` 이고 양쪽
+> 실패 목록이 비어 있으며, 비교 가능한 33 건 중 **31 건이 비트 동일**(나머지 둘은 §5 의
+> 면제된 libm 두 건)이다. 위 32 건·30 건은 그 시점의 기록으로 남긴다.
+
 ## 8. 대략적인 시간 (측정 아님 — 부하 있는 기계, 에뮬레이터)
 
 load average 2.98 인 상태에서 잰 값이고 에뮬레이터다. **회귀 판정에 쓰지 마라.**
@@ -213,9 +279,10 @@ load average 2.98 인 상태에서 잰 값이고 에뮬레이터다. **회귀 �
 ```sh
 export PATH="$HOME/.cargo/bin:$HOME/Library/Android/sdk/platform-tools:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-device2
+export ANDROID_SERIAL=emulator-5554  # 여러 대가 붙어 있으면 필수
 
 bash vendor/vendor_torch.sh          # 벤더링 트리
-bash vendor/install_shim.sh          # 호스트 _C (호스트 기준선용)
+bash vendor/install_shim.sh          # 호스트 _C (배송 설정 — 골든·pytests 용)
 sh scripts/device_android.sh build   # 안드로이드 _C
 sh scripts/device_android.sh stage   # 기기에 올림
 sh scripts/device_android.sh parity  # 양쪽 실행 + 비트 대조
@@ -223,19 +290,41 @@ sh scripts/device_android.sh parity  # 양쪽 실행 + 비트 대조
 
 `parity` 는 실패하면 종료 코드 1 과 `PARITY: ...` 한 줄을 낸다.
 
+**`ANDROID_SERIAL` 을 주지 않아도 되는 것은 기기가 한 대일 때뿐이다.** 여러 대가 붙어 있고
+고르지 않으면, 스크립트는 예전처럼 도중에 `adb: more than one device/emulator` 로 죽지 않고
+**시작 전에 목록을 대고 거절한다.**
+
+### `parity` 는 자기 호스트 아티팩트를 직접 만든다
+
+**`install_shim.sh` 가 설치한 것을 재지 않는다.** §5.2 의 이유로 호스트 쪽을 `accelerate`
+없이 따로 빌드해서(`$CARGO_TARGET_DIR-hostgemm`, `PARITY_HOST_TARGET_DIR` 로 덮어쓸 수 있음)
+`$TMPDIR/bw_parity_host` 에 벤더 트리를 심볼릭 링크로 비추고 `_C.abi3.so` **하나만** 그
+빌드로 바꿔 임포트한다. 벤더 트리에 설치된 아티팩트는 건드리지 않는다 — 그것을 잠깐
+바꿔치기했다가 중간에 죽으면 `run.sh` 의 도로 테스트 넷이 잘못된 것을 읽게 된다
+(`docs/CAPTURE.md` §8).
+
+같은 이유로 **기기 쪽도 조용히 낡을 수 없게** 했다. `parity` 는 시작할 때
+`$DEVICE_ROOT/site/torch/_C.abi3.so` 의 md5 를 방금 빌드한 `lib_C.so` 와 대조하고, 다르면
+두 해시를 대고 거절한다. `stage` 를 잊은 채 며칠 전 산출물에 대해 `PARITY: ok` 가 나오는
+것이 이 검사의 최악의 실패 모드다.
+
 ### 판정은 허용치가 아니라 **이름 기반 면제 목록**이다
 
 `cmd_diff` 는 `EXPECTED_LIBM_DIVERGENCE = {"_softmax.default": 1, "tanh.default": 1}`
 바깥의 어떤 비트 차이도 실패로 본다. 전역 허용치를 두면 `mm` 이나 `cumsum` 의 진짜
-불일치까지 함께 삼키는데, 이 스크립트는 바로 그것을 잡으려고 있다.
+불일치까지 함께 삼키는데, 이 스크립트는 바로 그것을 잡으려고 있다. **이 목록이 둘로
+유지되는 것이 §5.2 의 설계를 고른 이유**이고, 늘어나기 시작하면 그것이 허용오차다.
 
-**계측기가 실제로 울리는지 확인했다** (`device_android.sh diff <host> <doctored>`):
+**계측기가 실제로 울리는지 확인했다** (`device_android.sh diff <host> <doctored>`,
+2026-08-25 재확인):
 
 | 대조군 | 결과 |
 |---|---|
 | 면제 목록에 없는 `mm.default` 를 1 ULP 틀어놓음 | `EXIT=1  PARITY: unexpected bit divergence: ['mm.default']` |
 | 면제된 `tanh.default` 를 5 ULP 로 키움 | `EXIT=1  PARITY: unexpected bit divergence: ['tanh.default']` |
 | 손대지 않은 원본 | `EXIT=0  PARITY: ok` |
+| `torch_c_no_accelerate` cfg 이름을 어긋나게 함 | `EXIT=1  refusing to measure ...: it still links Accelerate` |
+| 기기에 다른 빌드를 올려둔 채 `parity` | `EXIT=1  refusing to measure: the staged _C.abi3.so is not ...` |
 
 bionic 쪽이 나중에 고쳐지면 면제 항목이 남아돌게 되는데, 그때는 실패가 아니라
 `note: expected-divergence entries that now agree: [...]` 로 알린다.

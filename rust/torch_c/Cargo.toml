@@ -54,5 +54,42 @@ gemm = "0.19.0"
 #
 # Cargo unions features across a dependency's entries, so this adds `accelerate`
 # on top of the pinned-off base rather than replacing it.
-[target.'cfg(target_vendor = "apple")'.dependencies]
+#
+# `not(torch_c_no_accelerate)` is the one opt-out, and it exists for exactly one
+# caller: `scripts/device_android.sh parity` builds its host end with that cfg
+# set, into its own CARGO_TARGET_DIR, and measures that build rather than the
+# shipped one. Cargo evaluates these `cfg()` keys against `rustc --print cfg`
+# *with the target's rustflags applied*, so a `--cfg` in rustflags reaches this
+# table (measured -- a probe crate lost its dependency entirely under that flag).
+#
+# It has to arrive as `--config target."cfg(...)".rustflags`, not as the
+# `RUSTFLAGS` environment variable. `RUSTFLAGS` *replaces* the rustflags from
+# `.cargo/config.toml` rather than adding to them, which silently drops this
+# crate's `-undefined dynamic_lookup` and the host link then fails with a wall
+# of undefined `_Py*` symbols (measured -- same trap as building from the wrong
+# working directory, docs/TORCH_C.md §3). Two `--config`/config-file rustflags
+# entries for the same target are joined, so the link wiring survives.
+#
+# Why a cfg and not a Cargo feature: a dependency entry's `features = [...]`
+# list is static, so making the exception switchable means making the *entry*
+# switchable, and the only switchable entries are optional ones -- which have to
+# be renamed to be referenced by `dep:`, and a renamed `candle-core` alongside
+# the plain one is rejected outright ("depends on crate `candle-core` multiple
+# times with different names"). The cfg key switches the entry without
+# duplicating it, and it leaves `cargo build --release` -- what
+# `vendor/install_shim.sh`, `rust/torch_c/pytests/run.sh` and
+# `scripts/device_android.sh build` all run -- spelled exactly as before, with
+# no `--no-default-features` sitting around for a future shipping path to copy.
+#
+# Why parity wants it: with Accelerate on the host and `gemm` on the device the
+# two ends run different BLAS, so a bit comparison between them can only restate
+# something already known (docs/DEVICE.md §5.1). Off, it is gemm against gemm,
+# which is the comparison that can catch a device-specific kernel fault.
+#
+# What must not happen is this going off for a *shipped* build: that is a 7x
+# model-level regression (docs/PERF.md §3) with no other symptom. `parity`
+# guards the other direction too -- it refuses to measure a host artefact that
+# still links Accelerate, so a cfg key that stops working is a loud failure and
+# not a quietly meaningless comparison.
+[target.'cfg(all(target_vendor = "apple", not(torch_c_no_accelerate)))'.dependencies]
 candle-core = { version = "0.11.0", default-features = false, features = ["accelerate"] }
