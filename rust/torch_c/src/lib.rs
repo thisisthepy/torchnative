@@ -33,6 +33,7 @@ mod device;
 mod dtype;
 mod err;
 mod info;
+mod rng;
 mod tensor;
 
 use crate::device::PyDevice;
@@ -334,6 +335,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     info::register(m)?;
     tensor::register(m)?;
     aten::register(m)?;
+    rng::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;

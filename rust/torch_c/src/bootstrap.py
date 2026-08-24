@@ -1181,6 +1181,55 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         setattr(module, name, sub)
         sys.modules[f"{prefix}.{name}"] = sub
 
+    # -- `_dynamo.eval_frame` real no-ops ---------------------------------
+    #
+    # DYNAMO.md: `torch._dynamo` is an unconditional import (`transformers`
+    # pulls it in through `masking_utils.py:42` on `torch >= 2.6`, no
+    # `hasattr` gate exists to skip it -- DYNAMO.md §6). It reaches 52 names
+    # under `_C._dynamo`, but only two are ever *called* rather than merely
+    # referenced: `eval_frame.set_guard_error_hook` and
+    # `eval_frame.set_code_exec_strategy`, both at module scope in
+    # `torch/_dynamo/guards.py:5457` and `torch/_dynamo/decorators.py:125`.
+    # Both calls discard the return value -- they register a hook / tag a
+    # code object for an eval-frame hooking mechanism that only
+    # `torch.compile` installs, which this project never calls (DYNAMO.md
+    # §3.2). So the only requirement is that the call not raise.
+    #
+    # `_SubmoduleFinder` above already answers `torch._C._dynamo.<anything>`
+    # generically -- including two levels deep, since it only checks that the
+    # first path segment (`_dynamo`) is a known root -- so every other name
+    # under `eval_frame`, `guards`, `utils` and `compiled_autograd` already
+    # exists via the lazily-created catch-all module (DYNAMO.md §3.3, §7
+    # item 4: `utils`/`compiled_autograd` are 0-access in this path and stay
+    # empty). Only these two need a real body instead of the catch-all's
+    # `_Unimplemented`, which raises on call. Pre-registering the module here
+    # (rather than teaching the finder to special-case two names) means the
+    # finder never runs for this particular submodule: Python's import system
+    # checks `sys.modules` before consulting `sys.meta_path`.
+    if "_dynamo" in roots:
+        eval_frame = types.ModuleType(f"{prefix}._dynamo.eval_frame")
+        eval_frame.__path__ = []
+        _attach_module_catchall(eval_frame)
+
+        def set_guard_error_hook(hook):
+            return None
+
+        def set_code_exec_strategy(code, strategy):
+            return None
+
+        set_guard_error_hook.__name__ = set_guard_error_hook.__qualname__ = (
+            "set_guard_error_hook"
+        )
+        set_code_exec_strategy.__name__ = set_code_exec_strategy.__qualname__ = (
+            "set_code_exec_strategy"
+        )
+        eval_frame.set_guard_error_hook = set_guard_error_hook
+        eval_frame.set_code_exec_strategy = set_code_exec_strategy
+
+        dynamo_sub = getattr(module, "_dynamo")
+        setattr(dynamo_sub, "eval_frame", eval_frame)
+        sys.modules[f"{prefix}._dynamo.eval_frame"] = eval_frame
+
     # -- _VariableFunctions ----------------------------------------------
     #
     # VENDOR.md wall 5. `torch.add`, `torch.mm`, `torch.full` and ~620 more
@@ -1874,6 +1923,20 @@ _DISCOVERED_RETURNS = {
     # support compiled in; this one does not. Same shape of answer, same
     # reason the name cannot simply be absent.
     "_mtia_isBuilt": False,
+    # `torch/mtia/__init__.py:81`, reached from `torch/random.py:82` -- that
+    # is, from `torch.manual_seed`, which walks every accelerator's seeding
+    # entry point before it reaches the CPU generator it was actually asked
+    # about. Upstream answers "was this process forked after MTIA was
+    # initialised?"; MTIA is never initialised here, so `False` is true and
+    # `manual_seed_all` then queues its callback instead of running it.
+    "_mtia_isInBadFork": False,
+    # `torch/random.py:127`, the last stop in `torch.manual_seed` before the
+    # CPU generator. Upstream's default is the literal string
+    # `"privateuseone"`, and the caller then does `hasattr(torch, name)` --
+    # nothing is registered under that name here, so the branch is skipped
+    # exactly as it is upstream on a stock build. Returning the real default
+    # rather than `None` matters: `hasattr(torch, None)` is a TypeError.
+    "_get_privateuse1_backend_name": "privateuseone",
     # `torch/nn/modules/module.py:530` -- the first line of
     # `nn.Module.__init__`, so *every* module ever constructed calls it, which
     # makes it the very next wall after `import torch` on the road to
@@ -1916,6 +1979,31 @@ _DISCOVERED_RETURNS = {
     "_is_torch_function_all_disabled": False,
     "_len_torch_function_stack": 0,
     "_len_torch_dispatch_stack": 0,
+}
+
+# Build-configuration flags: plain `bool` *values* upstream, not callables, so
+# they cannot go in `_DISCOVERED_RETURNS` above (which wraps everything in a
+# function).
+#
+# These were being answered by `_Unimplemented`, which is **truthy**. That is
+# the one shape of placeholder that is worse than absence for a name spelled
+# `_has_<backend>`: every `if torch._C._has_mps:` in the tree took the branch
+# that assumes a backend exists, and did so silently. It cost a wall to
+# notice -- `torch.manual_seed(0)` reaches `torch/mps/__init__.py:67`, whose
+# whole guard is `if not torch._C._has_mps: return`, and went straight past it
+# into `_mps_get_default_generator`.
+#
+# `False` is not a stand-in here, it is the fact: this shim's tensor engine is
+# candle on the CPU (DESIGN.md §4) and there is no CUDA, MPS, XPU or MKLDNN
+# behind any of these names. `torch.cuda.is_available()` already answered
+# `False` by a different route; this makes the rest of the family agree with
+# it instead of each guarding site getting a different answer depending on
+# which spelling it happened to use.
+_BUILD_FLAGS = {
+    "_has_mps": False,
+    "_has_cuda": False,
+    "_has_xpu": False,
+    "_has_mkldnn": False,
 }
 
 # The same, for members of synthesised `_C` types: `"<Type>.<member>": value`.
@@ -2275,6 +2363,8 @@ def _install_behaviour(module, dispatch) -> None:
     # as opposed to the vast majority which are only looked up.
     for name, value in _DISCOVERED_RETURNS.items():
         setattr(module, name, _constant_function(f"torch._C.{name}", value))
+    for name, value in _BUILD_FLAGS.items():
+        setattr(module, name, value)
     for dotted, value in _DISCOVERED_TYPE_RETURNS.items():
         type_name, member = dotted.split(".", 1)
         owner = getattr(module, type_name, None)
@@ -2285,3 +2375,62 @@ def _install_behaviour(module, dispatch) -> None:
     module._jit_get_operation = _jit_get_operation
     module._get_operation_overload = _get_operation_overload
     module._get_schema = _get_schema
+
+    _install_default_generator(module)
+
+
+def _install_default_generator(module) -> None:
+    """`torch.default_generator` -- an object with state, not a placeholder.
+
+    `torch/random.py:24` is `from torch._C import default_generator` and every
+    function in that module is a method call on it, so the name has to exist
+    before `import torch` finishes. It has existed all along as an
+    `_Unimplemented`; what changes here is that the CPU RNG behind it is real
+    (`rng.rs`), so `manual_seed` can mean what it means upstream -- the same
+    seed gives the same numbers as torch, bit for bit for `uniform_`.
+
+    It is an *instance of the synthesised `Generator` class*, not a new type,
+    for two reasons that both bite:
+
+      * `_TypeChecker._base` answers the schema's `Generator?` parameter with
+        `isinstance(value, module.Generator)`, so anything else would fail to
+        bind `tensor.uniform_(a, b, generator=torch.default_generator)`.
+      * `Generator` has to stay a heap type -- `_set_generator_metaclass`
+        reassigns its `__class__` (VENDOR.md wall 19), which a PyO3 static type
+        cannot do.
+
+    Three methods are real and the rest keep refusing. `get_state`/`set_state`
+    are the notable absence: upstream's is a 5056-byte legacy blob whose layout
+    is the MT19937 struct itself (docs/RNG.md §1.1), and exchanging that blob
+    with real torch is a separate piece of work from reproducing the stream.
+    Left refusing by name rather than given a format of our own, because a
+    round-trippable-but-incompatible blob is the kind of thing that looks like
+    interop until someone tries it.
+    """
+    generator = module.Generator()
+
+    # Read by `generator_arg` in aten.rs: it is how a kernel tells "the default
+    # generator was named explicitly" from "some other generator was", and the
+    # second is refused rather than quietly served from this stream.
+    generator._shim_is_default_generator = True
+
+    def manual_seed(seed):
+        module._shim_manual_seed(int(seed))
+        return generator
+
+    def seed():
+        return module._shim_reseed()
+
+    def initial_seed():
+        return module._shim_initial_seed()
+
+    generator.manual_seed = manual_seed
+    generator.seed = seed
+    generator.initial_seed = initial_seed
+    # `.device` is left alone on purpose: the synthesised `Generator` carries
+    # it as a *property* (it is one on upstream's type too), and a property has
+    # no setter, so an instance attribute cannot shadow it. Overwriting the
+    # class attribute would change it for every `Generator`, which is the wrong
+    # shape for a per-instance value -- and nothing reads it on this path.
+
+    module.default_generator = generator

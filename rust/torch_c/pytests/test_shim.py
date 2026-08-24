@@ -680,17 +680,120 @@ def test_operator_dunders_decline_rather_than_raise():
     assert (x == None) is False  # noqa: E711
 
 
-def test_the_rng_ops_are_the_wall_and_they_name_themselves():
-    # docs/TENSORBASE.md: `uniform_` and `normal_` resolve to the right aten
-    # key and stop there, because the generator question is a separate task.
+def test_the_rng_ops_have_kernels_now():
+    # This used to be `test_the_rng_ops_are_the_wall_and_they_name_themselves`,
+    # asserting that both ops resolved to the right aten key and then stopped
+    # (docs/TENSORBASE.md §7, wall 6). `rng.rs` is that wall coming down: the
+    # assertion is inverted rather than deleted, so the file still records
+    # that these two are the pair `from_config` needed.
+    x = _t([0.0] * 6, [2, 3])
+    assert x.uniform_(-1.0, 1.0) is x
+    assert all(-1.0 <= v < 1.0 for row in x.tolist() for v in row)
+    assert x.normal_(0.0, 0.02) is x
+    assert "aten.uniform_.default" in _C._aten_implemented()
+    assert "aten.normal_.default" in _C._aten_implemented()
+
+
+def test_the_same_seed_gives_the_same_stream():
+    # The point of porting torch's generator rather than using candle's: a
+    # seed has to mean something. candle's CPU backend refuses `set_seed`
+    # outright (docs/RNG.md §2.1), so this test is unimplementable on top of
+    # it -- not merely failing, unimplementable.
+    _C._shim_manual_seed(1234)
+    first = _t([0.0] * 5, [5])
+    first.uniform_(0.0, 1.0)
+    _C._shim_manual_seed(1234)
+    second = _t([0.0] * 5, [5])
+    second.uniform_(0.0, 1.0)
+    assert first.tolist() == second.tolist()
+    assert _C._shim_initial_seed() == 1234
+
+
+def test_uniform_matches_torchs_stream_bit_for_bit():
+    # Values lifted from real torch 2.13.0 on this host:
+    #     torch.manual_seed(0); torch.empty(4).uniform_()
+    # Not a range check -- `uniform_` is integer masking and one fused
+    # multiply-add, so upstream's exact bits are reproducible, and anything
+    # weaker would not notice a transformation that is subtly wrong.
+    _C._shim_manual_seed(0)
+    x = _t([0.0] * 4, [4])
+    x.uniform_()
+    assert x.tolist() == [
+        0.49625658988952637,
+        0.7682217955589294,
+        0.08847743272781372,
+        0.13203048706054688,
+    ]
+
+
+def test_normal_takes_a_different_path_at_sixteen_elements():
+    # The trap docs/RNG.md §1.3 measured and §5 item 2 asked to be cased:
+    # `normal_kernel` branches on `size >= 16 && is_contiguous()`, so one seed
+    # gives two unrelated sequences either side of the boundary, and a size
+    # that is not a multiple of 16 redraws its last 16 elements over values it
+    # already wrote. Reproducing Box-Muller correctly and missing this looks
+    # like a numerical bug.
+    def draw(n):
+        _C._shim_manual_seed(0)
+        t = _t([0.0] * n, [n])
+        t.normal_()
+        return t.tolist()
+
+    fifteen, sixteen, seventeen = draw(15), draw(16), draw(17)
+    # Upstream's heads, measured. Path B, then path A, then path A with the
+    # tail redraw.
+    assert round(fifteen[0], 4) == 1.541
+    assert round(sixteen[0], 4) == -1.1258
+    assert round(seventeen[0], 4) == -1.1258
+    assert round(seventeen[1], 4) == -1.6959 != round(sixteen[1], 4)
+    assert fifteen[:4] != sixteen[:4]
+
+
+def test_normal_caches_the_other_half_of_the_pair_on_the_generator():
+    # Box-Muller yields two samples; upstream returns one and keeps the other
+    # *on the generator*, so an odd-sized draw changes the next call's output.
+    # Dropping the cache would still give a correct Gaussian and the wrong
+    # numbers.
+    _C._shim_manual_seed(7)
+    first = _t([0.0] * 5, [5])
+    first.normal_()
+    second = _t([0.0] * 5, [5])
+    second.normal_()
+    # If the cache were dropped between calls, the second draw would restart
+    # from a fresh Box-Muller pair rather than consuming the held one.
+    assert second.tolist() != first.tolist()
+    _C._shim_manual_seed(7)
+    again = _t([0.0] * 5, [5])
+    again.normal_()
+    assert again.tolist() == first.tolist()
+
+
+def test_uniform_refuses_a_generator_it_does_not_own():
+    # There is one generator here. A `torch.Generator()` of one's own has no
+    # state, and serving it from the default stream would look like it worked.
+    other = _C.Generator()
     x = _t([0.0, 0.0], [2])
-    for call in (lambda: x.uniform_(-1.0, 1.0), lambda: x.normal_(0.0, 0.02)):
+    try:
+        x.uniform_(0.0, 1.0, generator=other)
+    except NotImplementedError as e:
+        assert "torch.default_generator" in str(e)
+    else:
+        raise AssertionError("a foreign generator was accepted")
+    # The default one is fine, named explicitly.
+    assert x.uniform_(0.0, 1.0, generator=_C.default_generator) is x
+
+
+def test_rng_ops_refuse_integer_tensors():
+    # `AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, ...)` is the whole
+    # dispatch set; an int tensor reaches `random_` upstream, a different op.
+    x = _t([0, 0], [2], _C.int64)
+    for call in (lambda: x.uniform_(), lambda: x.normal_()):
         try:
             call()
         except NotImplementedError as e:
-            assert "aten.uniform_.default" in str(e) or "aten.normal_.default" in str(e)
+            assert "int64" in str(e)
         else:
-            raise AssertionError("the RNG ops have no kernel yet")
+            raise AssertionError("an integer tensor was filled")
 
 
 def test_grad_mode_state_round_trips():

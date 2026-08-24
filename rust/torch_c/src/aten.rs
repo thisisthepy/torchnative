@@ -79,6 +79,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.ne.Scalar",
     "aten.ne.Tensor",
     "aten.new_ones.default",
+    "aten.normal_.default",
     "aten.ones.default",
     "aten.pow.Scalar",
     "aten.pow.Tensor_Scalar",
@@ -93,6 +94,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sum.default",
     "aten.sum.dim_IntList",
     "aten.transpose.int",
+    "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.view.default",
 ];
@@ -260,6 +262,8 @@ fn aten_dispatch_inner(
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
         "aten.copy_.default" => copy_inplace(py, args, kwargs),
+        "aten.uniform_.default" => uniform_inplace(py, args, kwargs),
+        "aten.normal_.default" => normal_inplace(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -2604,6 +2608,293 @@ fn copy_inplace(
     };
     receiver.borrow_mut().replace_with(replacement);
     let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
+// The two RNG ops
+//
+// docs/RNG.md is the standing decision behind these: candle's CPU backend
+// refuses to be seeded at all, so its `rand_uniform`/`rand_normal` cannot be
+// used here even in principle, and torch's own CPU generator is ported into
+// `rng.rs` instead. What is left for this file is the part that depends on
+// the *tensor* rather than on the stream -- which accumulate type the kernel
+// runs in, which of `normal_`'s two paths a given size and layout takes, and
+// where the narrowing cast happens relative to `uniform_`'s upper-bound clamp.
+// Getting any of those wrong reproduces the stream perfectly and still
+// produces different numbers.
+// ---------------------------------------------------------------------------
+
+/// The floating dtype an RNG op is allowed to fill, with its candle storage.
+///
+/// `AT_DISPATCH_FLOATING_TYPES_AND2(kHalf, kBFloat16, ...)` is the whole
+/// permitted set for both kernels; an integer tensor reaches a different op
+/// upstream (`random_`), so accepting one here would be implementing something
+/// else under this name.
+fn rng_float_dtype(op: &str, tag: TorchDType) -> PyResult<candle_core::DType> {
+    match tag {
+        TorchDType::Float64 => Ok(candle_core::DType::F64),
+        TorchDType::Float32 => Ok(candle_core::DType::F32),
+        TorchDType::Float16 => Ok(candle_core::DType::F16),
+        TorchDType::BFloat16 => Ok(candle_core::DType::BF16),
+        other => Err(not_implemented(format!(
+            "{op}: not implemented in torch._C shim for torch.{} -- upstream \
+             dispatches this op over floating dtypes only, and an integer \
+             tensor reaches `random_`, a different op",
+            other.name()
+        ))),
+    }
+}
+
+/// The `Generator? generator=None` tail both schemas carry.
+///
+/// There is exactly one generator here -- the process-wide default that
+/// `torch.default_generator` names -- so a *different* generator is refused by
+/// name rather than silently served from the default stream, which would make
+/// `torch.Generator().manual_seed(0)` look like it worked while sharing state
+/// with everything else. `None` is the common case and never even arrives:
+/// the overload resolver drops arguments equal to their schema default.
+fn generator_arg(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<()> {
+    let Some(value) = optional(args, kwargs, index, name)? else {
+        return Ok(());
+    };
+    if value.is_none() {
+        return Ok(());
+    }
+    if value
+        .getattr("_shim_is_default_generator")
+        .is_ok_and(|flag| flag.is_truthy().unwrap_or(false))
+    {
+        return Ok(());
+    }
+    Err(not_implemented(format!(
+        "{op}: only torch.default_generator is implemented in torch._C shim; \
+         a separate torch.Generator has no state of its own here"
+    )))
+}
+
+fn float_arg(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+    fallback: f64,
+) -> PyResult<f64> {
+    match optional(args, kwargs, index, name)? {
+        Some(value) if !value.is_none() => value.extract::<f64>(),
+        _ => Ok(fallback),
+    }
+}
+
+/// Shape, device, dtype and layout of an in-place RNG op's receiver.
+struct RngTarget {
+    tag: TorchDType,
+    storage: candle_core::DType,
+    shape: candle_core::Shape,
+    device: Device,
+    numel: usize,
+    contiguous: bool,
+}
+
+fn rng_target(op: &str, receiver: &Bound<'_, PyTensorBase>) -> PyResult<RngTarget> {
+    let borrowed = receiver.borrow();
+    let tag = borrowed.tag();
+    Ok(RngTarget {
+        tag,
+        storage: rng_float_dtype(op, tag)?,
+        shape: borrowed.tensor().shape().clone(),
+        device: borrowed.tensor().device().clone(),
+        numel: borrowed.tensor().elem_count(),
+        contiguous: borrowed.tensor().is_contiguous(),
+    })
+}
+
+/// Round a value through the storage dtype and back, so it can be compared in
+/// the accumulate type. For `float32` this is the identity; for `float16` and
+/// `bfloat16` it is the narrowing `static_cast<scalar_t>` that upstream's
+/// clamp is written in terms of. candle's `to_dtype` rounds to nearest even,
+/// which is what the C++ cast does.
+fn narrow_roundtrip_f32(op: &str, value: f32, storage: candle_core::DType, device: &Device) -> PyResult<f32> {
+    if storage == candle_core::DType::F32 {
+        return Ok(value);
+    }
+    Tensor::from_vec(vec![value], 1, device)
+        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.to_dtype(candle_core::DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+        .map(|values| values[0])
+        .map_err(|e| candle_err(op, e))
+}
+
+/// `aten::uniform_(Tensor(a!) self, float from=0., float to=1., *,
+///                 Generator? generator=None) -> Tensor(a!)`
+///
+/// This is the sixth wall on the way to `from_config` (docs/TENSORBASE.md §7):
+/// `nn.init.kaiming_uniform_` ends in `tensor.uniform_(-bound, bound)`, so no
+/// `nn.Linear` exists until it does.
+///
+/// Two things here are not the RNG and are still part of the answer.
+///
+/// *The accumulate type follows `opmath_type<scalar_t>`, not the dtype.* A
+/// `float16` tensor draws **one** 32-bit word per element and transforms it in
+/// float; only `float64` draws two. Reading the dtype instead would consume
+/// the stream at the wrong rate and desynchronise everything after it.
+///
+/// *The upper bound is enforced after the cast, not before.* Upstream's
+/// kernel ends `return value == to_scalar ? from_scalar : value;` -- because
+/// narrowing a float that is just under `to` can round it *up to* `to`, and
+/// `uniform_` promises a half-open range. On `float16` with `to=1.0` that is
+/// roughly one draw in 4096, so a shim without the clamp passes casual
+/// inspection and fails the golden harness's range check.
+fn uniform_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.uniform_.default";
+
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let from = float_arg(args, kwargs, 1, "from", 0.0)?;
+    let to = float_arg(args, kwargs, 2, "to", 1.0)?;
+    generator_arg(OP, args, kwargs, 3, "generator")?;
+    let target = rng_target(OP, &receiver)?;
+
+    // torch's own check, message included.
+    if !(from <= to) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "uniform_ expects to return a [from, to) range, but found from={from} > to={to}"
+        )));
+    }
+
+    let mut gen = crate::rng::default_generator();
+    let replacement = if target.storage == candle_core::DType::F64 {
+        let mut values = crate::rng::uniform_fill_f64(&mut gen, target.numel, from, to);
+        for value in values.iter_mut() {
+            if *value == to {
+                *value = from;
+            }
+        }
+        Tensor::from_vec(values, target.shape, &target.device).map_err(|e| candle_err(OP, e))?
+    } else {
+        let (from_f32, to_f32) = (from as f32, to as f32);
+        let values = crate::rng::uniform_fill_f32(&mut gen, target.numel, from_f32, to_f32);
+        // The cast first, then the comparison: `to_scalar` is
+        // `static_cast<scalar_t>(to_)`, and both sides of `==` are in
+        // `scalar_t`. Round-tripping through the storage dtype is how that
+        // comparison is made without hand-rolling half-precision rounding.
+        let narrowed = Tensor::from_vec(values, target.numel, &target.device)
+            .and_then(|t| t.to_dtype(target.storage))
+            .and_then(|t| t.to_dtype(candle_core::DType::F32))
+            .and_then(|t| t.to_vec1::<f32>())
+            .map_err(|e| candle_err(OP, e))?;
+        let to_scalar = narrow_roundtrip_f32(OP, to_f32, target.storage, &target.device)?;
+        let clamped: Vec<f32> = narrowed
+            .into_iter()
+            .map(|v| if v == to_scalar { from_f32 } else { v })
+            .collect();
+        Tensor::from_vec(clamped, target.shape, &target.device)
+            .and_then(|t| t.to_dtype(target.storage))
+            .map_err(|e| candle_err(OP, e))?
+    };
+
+    drop(gen);
+    receiver.borrow_mut().replace_with(PyTensorBase::new(replacement)?);
+    let _ = (py, target.tag);
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::normal_(Tensor(a!) self, float mean=0., float std=1., *,
+///                Generator? generator=None) -> Tensor(a!)`
+///
+/// The op where the *shape of the kernel* is observable output. `normal_kernel`
+/// branches on `size >= 16 && self.is_contiguous()`, and the two sides share
+/// nothing:
+///
+///   * **Path B** (small or strided) runs Box-Muller one element at a time in
+///     `double` -- for every dtype, `float16` included -- and leaves the
+///     unused half of each pair *cached on the generator*, so an odd-sized
+///     `normal_` changes what the next one returns.
+///   * **Path A** fills the whole buffer with uniforms first and then applies
+///     Box-Muller over it in blocks of 16, pairing element `j` with `j+8`.
+///     When the size is not a multiple of 16 it steps back to `size - 16` and
+///     redraws those sixteen *over values it already wrote*.
+///
+/// So `n=15` and `n=16` produce entirely different sequences from one seed,
+/// and `n=17` differs from `n=16` in its first element too. docs/RNG.md §1.3
+/// measured all three; the harness cases below them are the regression.
+fn normal_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.normal_.default";
+
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let mean = float_arg(args, kwargs, 1, "mean", 0.0)?;
+    let std = float_arg(args, kwargs, 2, "std", 1.0)?;
+    generator_arg(OP, args, kwargs, 3, "generator")?;
+    let target = rng_target(OP, &receiver)?;
+
+    if !(std >= 0.0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "normal expects std >= 0.0, but found std {std}"
+        )));
+    }
+
+    let mut gen = crate::rng::default_generator();
+    let values_f64: Option<Vec<f64>>;
+    let values_f32: Option<Vec<f32>>;
+
+    if target.numel >= 16 && target.contiguous {
+        match target.storage {
+            candle_core::DType::F64 => {
+                values_f64 = Some(crate::rng::normal_fill_f64(&mut gen, target.numel, mean, std));
+                values_f32 = None;
+            }
+            candle_core::DType::F32 => {
+                values_f64 = None;
+                values_f32 = Some(crate::rng::normal_fill_f32(
+                    &mut gen,
+                    target.numel,
+                    mean as f32,
+                    std as f32,
+                ));
+            }
+            // float16 / bfloat16 -- the stack-buffer branch.
+            _ => {
+                values_f64 = None;
+                values_f32 = Some(crate::rng::normal_fill_reduced(
+                    &mut gen,
+                    target.numel,
+                    mean as f32,
+                    std as f32,
+                ));
+            }
+        }
+    } else {
+        // Path B is `double` for every dtype; the narrowing happens once, at
+        // the end, in `to_dtype`.
+        values_f64 = Some(crate::rng::normal_serial(&mut gen, target.numel, mean, std));
+        values_f32 = None;
+    }
+    drop(gen);
+
+    let filled = match (values_f64, values_f32) {
+        (Some(values), _) => Tensor::from_vec(values, target.shape, &target.device),
+        (_, Some(values)) => Tensor::from_vec(values, target.shape, &target.device),
+        _ => unreachable!("one of the two accumulate types is always produced"),
+    }
+    .and_then(|t| t.to_dtype(target.storage))
+    .map_err(|e| candle_err(OP, e))?;
+
+    receiver.borrow_mut().replace_with(PyTensorBase::new(filled)?);
+    let _ = (py, target.tag);
     Ok(receiver.into_any().unbind())
 }
 
