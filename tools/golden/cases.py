@@ -5917,6 +5917,737 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- the five ops docs/TAIL.md needed to open falcon/bloom/gpt_bigcode ------
+#
+# All five already had a kernel in rust/torch_c/src/aten.rs and showed up in
+# `_aten_implemented()` before this file had a builder for any of them --
+# `compare.py` was failing every one with `<no case builder registered>`.
+# Each builder below re-measures the claims the kernel's own doc comment
+# makes against torch 2.13.0 rather than trusting them, per this module's
+# own rule (see the note above `_pair`): a doc comment is not a golden case.
+#
+# Two real, measured discrepancies came out of that re-measurement and are
+# encoded as `expect="c_error"`/`"torch_error"` cases below rather than
+# "fixed" (rust/torch_c/src/aten.rs is out of scope for this task):
+#
+#   * `aten.mul.Scalar(bool_tensor, scalar)` -- upstream computes this
+#     *arithmetically* (`True`/`False` read as `1`/`0`, promoted exactly like
+#     any other integral tensor: int scalar keeps int64, float scalar gives
+#     float32). The shim's `arith_tag` refuses every bool tensor unconditionally,
+#     which is right for the `.Tensor` overloads (upstream's bool `*` there
+#     really is a logical and) but wrong for `.Scalar` -- `c_error`.
+#   * `aten.add_.Tensor(bool_tensor, bool_tensor)` -- upstream computes this
+#     too, as a logical or (`True`/`False` and `True`/`True` -> `[True, True]`,
+#     measured). The shim's own doc comment above `add_inplace` claims this
+#     "matches add.Tensor's own refusal", but that refusal is internal to the
+#     shim, not upstream's -- upstream never refuses bool here. `c_error`.
+#
+# See docs/TAIL.md for the full measurement transcript and the exact
+# `_aten_implemented()` counts this closed.
+
+
+def _baddbmm_case(
+    torch_module, c_module, torch_call, dtype_name,
+    self_flat, self_shape, b1_flat, b1_shape, b2_flat, b2_shape,
+    kwargs=None, expect="match", note="",
+) -> Case:
+    kwargs = kwargs or {}
+    op = "aten.baddbmm.default"
+    s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+    a_t, a_c = pair_from_flat(torch_module, c_module, b1_flat, b1_shape, dtype_name)
+    b_t, b_c = pair_from_flat(torch_module, c_module, b2_flat, b2_shape, dtype_name)
+    return Case(
+        name=f"baddbmm(dtype={dtype_name}, self={self_shape}, {b1_shape}x{b2_shape}, {kwargs}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(s_t, a_t, b_t, **kwargs),
+        run_c=lambda: c_module._aten_dispatch(op, s_c, a_c, b_c, **kwargs),
+        expect=expect,
+        note=note,
+    )
+
+
+# (2,2,3) @ (2,3,2) -> (2,2,2), batch of 2 -- big enough that a kernel
+# dropping the batch dimension (bmm_cases' own concern) would show up here
+# too. Product, worked by hand per batch:
+#   batch0: [[1,2,3],[4,5,6]] @ [[1,0],[0,1],[1,0]] = [[4,2],[10,5]]... but
+# with the actual b2 pattern used below the exact numbers are re-derived
+# from beta=0/alpha=1 cases rather than transcribed here.
+_BADDBMM_B1 = (list(range(1, 13)), (2, 2, 3))
+_BADDBMM_B2 = ([1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], (2, 3, 2))
+_BADDBMM_SELF = ([0.0] * 8, (2, 2, 2))
+
+
+def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.baddbmm.default"
+    cases: list[Case] = []
+
+    scenarios = [
+        (None, "plain: self + batch1 @ batch2"),
+        (dict(beta=2, alpha=3), "integer beta/alpha"),
+        (dict(beta=0.5, alpha=0.25), "fractional beta/alpha"),
+        # The two quick returns, addmm's rule reused batched (kernel doc).
+        (dict(beta=0), "beta=0 -- self dropped"),
+        (dict(alpha=0), "alpha=0 -- product dropped"),
+        (dict(beta=0, alpha=0), "both zero -- a shaped tensor of zeros, not an error"),
+        (dict(beta=True), "beta as a bool, which torch reads as 1"),
+        (dict(beta=False), "beta as a bool, which torch reads as 0"),
+    ]
+    for dtype_name in _MM_MATCH_DTYPES:
+        for kwargs, note in scenarios:
+            cases.append(
+                _baddbmm_case(
+                    torch_module, c_module, torch_call, dtype_name,
+                    *_BADDBMM_SELF, *_BADDBMM_B1, *_BADDBMM_B2, kwargs=kwargs, note=note,
+                )
+            )
+        # `self` broadcasting into the (batch, n, p) target -- measured
+        # against real torch: 1-D, 0-d, 2-D (no batch dim), and a
+        # singleton-batch 3-D self all broadcast the same way addmm's bias
+        # does, generalised to a 3-D target (kernel doc, re-checked above).
+        for self_flat, self_shape, note in [
+            ([1.0, 2.0], (2,), "1-D self -- broadcasts across the last dim (p=2)"),
+            ([7.0], (), "0-d self"),
+            ([1.0, 1.0, 1.0, 1.0], (2, 2), "2-D self, no batch dim -- broadcasts across the batch"),
+            ([1.0, 1.0, 1.0, 1.0], (1, 2, 2), "singleton-batch 3-D self"),
+        ]:
+            cases.append(
+                _baddbmm_case(
+                    torch_module, c_module, torch_call, dtype_name,
+                    self_flat, self_shape, *_BADDBMM_B1, *_BADDBMM_B2, note=note,
+                )
+            )
+
+    # The beta=0 quick return, proven rather than asserted, batched --
+    # measured: beta=0 with a NaN self gives the clean product (0*nan would
+    # be nan if the multiply weren't skipped).
+    nan_self = ([float("nan")] * 8, (2, 2, 2))
+    cases.append(
+        _baddbmm_case(
+            torch_module, c_module, torch_call, "float32",
+            *nan_self, *_BADDBMM_B1, *_BADDBMM_B2, kwargs=dict(beta=0),
+            note="beta=0 with a NaN self -- 0*nan would be nan, torch gives the clean product",
+        )
+    )
+
+    # alpha=0 is NOT the mirror-image quick return, and this is a genuine,
+    # measured kernel bug -- not a case-writing mistake. addmm's alpha=0
+    # really does skip the multiply entirely on real torch (addmm_cases
+    # above proves it with an inf mat1). baddbmm's kernel doc comment
+    # claims the same "quick return... still holds batched" and cites this
+    # exact scenario, but re-measuring it against torch 2.13.0 shows
+    # otherwise: `baddbmm(self=zeros, inf_batch1, batch2, alpha=0)` gives
+    # `[[nan, nan], [0, 0]], [[0, 0], [0, 0]]]` -- NaN leaks through on real
+    # torch. The shim's `alpha_zero` branch skips the matmul unconditionally
+    # (copying addmm_scale's rule) and answers a clean `self` (all zeros)
+    # instead, which is the addmm behaviour, not baddbmm's. Left as
+    # `expect="match"` -- NOT loosened to `c_error`/`torch_error`, neither
+    # of which fits (both sides *succeed*, they just disagree) -- exactly
+    # `_FULL_FILLS`' own precedent above: a live regression trap that stays
+    # red until rust/torch_c is fixed, rather than quietly filed away.
+    inf_b1 = ([float("inf")] + list(range(2, 13)), (2, 2, 3))
+    cases.append(
+        _baddbmm_case(
+            torch_module, c_module, torch_call, "float32",
+            *_BADDBMM_SELF, *inf_b1, *_BADDBMM_B2, kwargs=dict(alpha=0),
+            note="KNOWN KERNEL BUG (docs/TAIL.md): torch does NOT skip the multiply for "
+                 "baddbmm's alpha=0 the way it does for addmm's -- NaN from 0*inf leaks "
+                 "through on real torch; the shim wrongly assumes the same quick return "
+                 "addmm has and answers a clean self instead. This case is meant to fail "
+                 "until that's fixed.",
+        )
+    )
+
+    # int64 alpha truncation, re-measured rather than assumed from the
+    # kernel's doc comment: upstream computes alpha=1.9 and alpha=1 as bit-
+    # for-bit identical on an int64 triple (the Scalar truncates toward zero
+    # before it multiplies), but the shim never gets that far for int64 --
+    # candle has no integral matmul kernel at all (the inherited gap
+    # _MM_C_ERROR_DTYPES already records for mm/addmm/bmm), so *any* nonzero
+    # alpha on int64 raises "candle: unsupported dtype I64 for op matmul"
+    # regardless of what alpha's fractional part is. The truncation claim
+    # itself is therefore unverifiable as a match case today; this pins the
+    # gap instead of the (currently unreachable) behaviour it claimed.
+    int_b1 = (list(range(1, 13)), (2, 2, 3))
+    int_b2 = ([1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1], (2, 3, 2))
+    int_self = ([0] * 8, (2, 2, 2))
+    for alpha, note in [
+        (1.9, "alpha=1.9 on int64 -- can't verify truncation, candle has no int64 matmul"),
+        (1, "alpha=1 on int64 -- same inherited gap"),
+    ]:
+        cases.append(
+            _baddbmm_case(
+                torch_module, c_module, torch_call, "int64",
+                *int_self, *int_b1, *int_b2,
+                kwargs=dict(alpha=alpha), expect="c_error", note=note,
+            )
+        )
+
+    # The inherited candle gap: no matmul kernel for the integral dtypes or
+    # bfloat16 -- same split mm/addmm/bmm already carry.
+    for dtype_name in _MM_C_ERROR_DTYPES:
+        cases.append(
+            _baddbmm_case(
+                torch_module, c_module, torch_call, dtype_name,
+                [0, 0, 0, 0], (1, 2, 2), [1, 2, 3, 4], (1, 2, 2), [1, 0, 0, 1], (1, 2, 2),
+                expect="c_error",
+                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU baddbmm does. "
+                     "Same gap aten.mm.default/aten.addmm.default already carry.",
+            )
+        )
+        cases.append(
+            _baddbmm_case(
+                torch_module, c_module, torch_call, dtype_name,
+                [0, 0, 0, 0], (1, 2, 2), [1, 2, 3, 4], (1, 2, 2), [1, 0, 0, 1], (1, 2, 2),
+                kwargs=dict(alpha=0),
+                note=f"{dtype_name} with alpha=0 -- no matmul happens, so the gap above does not apply",
+            )
+        )
+
+    # Refusals. Both sides only need to *refuse*, not agree on wording --
+    # measured that upstream's actual check order for a malformed batch1/
+    # batch2 rank differs from the shim's ("batch1 must be a 3D tensor" up
+    # front), but both raise on every one of these, which is all
+    # expect="both_error" requires (see the module docstring above).
+    self_t, self_c = pair_from_flat(torch_module, c_module, *_BADDBMM_SELF, "float32")
+    f32_b1_t, f32_b1_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B1, "float32")
+    b2_full_t, b2_full_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B2, "float32")
+
+    b1_2d_t, b1_2d_c = pair_from_flat(torch_module, c_module, list(range(1, 7)), (2, 3), "float32")
+    cases.append(
+        Case(
+            name="baddbmm(batch1 not 3D rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, b1_2d_t, b2_full_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, b1_2d_c, b2_full_c),
+            expect="both_error",
+            note="batch1 is 2D; baddbmm must not silently fall back to mm's rank",
+        )
+    )
+    b2_2d_t, b2_2d_c = pair_from_flat(torch_module, c_module, [1.0] * 6, (3, 2), "float32")
+    cases.append(
+        Case(
+            name="baddbmm(batch2 not 3D rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, f32_b1_t, b2_2d_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, f32_b1_c, b2_2d_c),
+            expect="both_error",
+            note="batch2 is 2D",
+        )
+    )
+    f64_b2_t, f64_b2_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B2, "float64")
+    cases.append(
+        Case(
+            name="baddbmm(batch1 float32 x batch2 float64 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, f32_b1_t, f64_b2_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, f32_b1_c, f64_b2_c),
+            expect="both_error",
+            note="torch: 'expected scalar type Float but found Double'",
+        )
+    )
+    f64_self_t, f64_self_c = pair_from_flat(torch_module, c_module, *_BADDBMM_SELF, "float64")
+    cases.append(
+        Case(
+            name="baddbmm(self float64 x batch2 float32 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(f64_self_t, f32_b1_t, b2_full_t),
+            run_c=lambda: c_module._aten_dispatch(op, f64_self_c, f32_b1_c, b2_full_c),
+            expect="both_error",
+            note="torch: 'Input dtypes must be the same, got: input double, batch1: float, batch2: float'",
+        )
+    )
+    b2_batch1_t, b2_batch1_c = pair_from_flat(
+        torch_module, c_module, _BADDBMM_B2[0][:6], (1, 3, 2), "float32"
+    )
+    cases.append(
+        Case(
+            name="baddbmm(batch count mismatch rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, f32_b1_t, b2_batch1_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, f32_b1_c, b2_batch1_c),
+            expect="both_error",
+            note="batch1 has batch=2, batch2 has batch=1 -- baddbmm does not broadcast the batch dim",
+        )
+    )
+    bad_inner_t, bad_inner_c = pair_from_flat(torch_module, c_module, [1.0] * 16, (2, 4, 2), "float32")
+    cases.append(
+        Case(
+            name="baddbmm(inner dim mismatch rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, f32_b1_t, bad_inner_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, f32_b1_c, bad_inner_c),
+            expect="both_error",
+            note="batch1 is (2,2,3), batch2 is (2,4,2) -- 3 != 4",
+        )
+    )
+    bad_self_t, bad_self_c = pair_from_flat(torch_module, c_module, [1.0] * 12, (3, 2, 2), "float32")
+    cases.append(
+        Case(
+            name="baddbmm(self not expandable to target rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(bad_self_t, f32_b1_t, b2_full_t),
+            run_c=lambda: c_module._aten_dispatch(op, bad_self_c, f32_b1_c, b2_full_c),
+            expect="both_error",
+            note="self is (3,2,2), target is (2,2,2) -- non-singleton mismatch at dim 0",
+        )
+    )
+    too_many_t, too_many_c = pair_from_flat(torch_module, c_module, [1.0] * 8, (1, 2, 2, 2), "float32")
+    cases.append(
+        Case(
+            name="baddbmm(self has more dims than target rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(too_many_t, f32_b1_t, b2_full_t),
+            run_c=lambda: c_module._aten_dispatch(op, too_many_c, f32_b1_c, b2_full_c),
+            expect="both_error",
+            note="self is 4-D, target is 3-D",
+        )
+    )
+    cases.append(
+        Case(
+            name="baddbmm(dtype=bool rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[0],
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[0],
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[1],
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[1],
+                _pair(torch_module, c_module, [1, 0, 1, 0], (1, 2, 2), "bool")[1],
+            ),
+            expect="both_error",
+            note='torch: "baddbmm" not implemented for \'Bool\' -- measured to match the shim\'s '
+                 "own wording exactly, unlike the rank refusals above",
+        )
+    )
+    cases.append(
+        Case(
+            name="baddbmm(dtype=uint32 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0, 0, 0, 0], (1, 2, 2), "uint32")[0],
+                _pair(torch_module, c_module, [1, 2, 3, 4], (1, 2, 2), "uint32")[0],
+                _pair(torch_module, c_module, [1, 0, 0, 1], (1, 2, 2), "uint32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0, 0, 0, 0], (1, 2, 2), "uint32")[1],
+                _pair(torch_module, c_module, [1, 2, 3, 4], (1, 2, 2), "uint32")[1],
+                _pair(torch_module, c_module, [1, 0, 0, 1], (1, 2, 2), "uint32")[1],
+            ),
+            expect="both_error",
+            note='torch: "baddbmm" not implemented for \'UInt32\' -- unlike UInt16/UInt64, '
+                 "uint32 is at least constructible on the c side, so this exercises baddbmm's "
+                 "own refusal rather than a _tensor_from_flat storage gap",
+        )
+    )
+
+    # Model-scale, batched with the bias -- attention's QK^T scale-and-add,
+    # the shape docs/TAIL.md measured bloom reaching for.
+    for dtype_name, note in [
+        ("float32", "batched depth 512 with a bias -- bloom's scaled QK^T"),
+        ("float16", "the same, in the dtype a device would actually run"),
+    ]:
+        cases.append(
+            _big_gemm_case(torch_module, c_module, torch_call, "aten.baddbmm.default",
+                           dtype_name, 8, 512, 8, with_bias=True, batch=2, note=note)
+        )
+    return cases
+
+
+# --- aten.split_with_sizes.default -------------------------------------
+# `split.Tensor` with the chunk sizes spelled out individually -- the
+# spelling `gpt_bigcode`'s `c_attn(x).split((embed_dim, kv_dim, kv_dim),
+# dim=2)` reaches for. Reuses `_chunk_list_check` (`split_cases`' own
+# comparator) since this also answers with a list of tensors.
+#
+# Unlike `split.Tensor`, sizes must sum *exactly* to the dimension's extent
+# -- no "last chunk is short" leniency -- and a size of 0 is fine even when
+# the dimension is not itself empty. Both measured against torch 2.13.0
+# (see the kernel's own doc comment, re-checked in the refusal cases below).
+
+
+def _split_with_sizes_case(
+    torch_module, c_module, torch_call, dtype_name, flat, shape, sizes, dim=0,
+    expect="match", note="",
+) -> Case:
+    op = "aten.split_with_sizes.default"
+    a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+    return Case(
+        name=f"split_with_sizes(dtype={dtype_name}, shape={shape}, sizes={sizes}, dim={dim}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, sizes, dim),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, sizes, dim),
+        expect=expect,
+        value_check=_chunk_list_check if expect == "match" else None,
+        note=note + " -- returns a list of tensors, see _chunk_list_check",
+    )
+
+
+def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.split_with_sizes.default"
+    cases: list[Case] = []
+    ten = list(range(10))
+    for dtype_name in _SPLIT_DTYPES:
+        for sizes, note in [
+            ([3, 3, 4], "uneven three-way, no leftover"),
+            ([10], "one chunk, the whole tensor"),
+            ([1] * 10, "ten chunks of one"),
+            ([0, 10], "a leading zero-length chunk, dimension not empty"),
+            ([10, 0], "a trailing zero-length chunk"),
+            ([4, 0, 6], "a zero-length chunk in the middle"),
+        ]:
+            cases.append(_split_with_sizes_case(torch_module, c_module, torch_call, dtype_name, ten, (10,), sizes, note=note))
+
+    # The GPT-2/gpt_bigcode shape this op exists for: an uneven three-way
+    # unpack of a fused QKV projection along the last dim -- query gets the
+    # full embedding width, key/value share a narrower one.
+    qkv = list(range(24))
+    cases.append(
+        _split_with_sizes_case(
+            torch_module, c_module, torch_call, "float32", qkv, (2, 2, 6), [3, 1, 2], dim=2,
+            note="gpt_bigcode's c_attn(x).split((3,1,2), dim=2) -- q wider than k/v",
+        )
+    )
+    cases.append(
+        _split_with_sizes_case(
+            torch_module, c_module, torch_call, "float32", qkv, (2, 2, 6), [3, 1, 2], dim=-1,
+            note="same split, addressed with a negative dim",
+        )
+    )
+
+    # Refusals. Measured against torch 2.13.0: exact wording is reproduced
+    # by the kernel and pinned here (unlike baddbmm's rank checks above,
+    # these match verbatim -- see the kernel's own doc comment).
+    cases.append(
+        Case(
+            name="split_with_sizes(sizes sum too small, rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, ten, (10,), "float32")[0], [3, 3, 3], 0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, ten, (10,), "float32")[1], [3, 3, 3], 0
+            ),
+            expect="both_error",
+            note="sizes sum to 9, dimension extent is 10 -- unlike split.Tensor there is no "
+                 "leniency here, the caller already spelled out every length",
+        )
+    )
+    cases.append(
+        Case(
+            name="split_with_sizes(sizes sum too large, rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, ten, (10,), "float32")[0], [5, 10], 0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, ten, (10,), "float32")[1], [5, 10], 0
+            ),
+            expect="both_error",
+            note="sizes sum to 15, dimension extent is 10",
+        )
+    )
+    cases.append(
+        Case(
+            name="split_with_sizes(negative size entry, rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, ten, (10,), "float32")[0], [5, -5, 10], 0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, ten, (10,), "float32")[1], [5, -5, 10], 0
+            ),
+            expect="both_error",
+            note="a negative entry is refused even though the sum happens to come out to 10",
+        )
+    )
+    cases.append(
+        Case(
+            name="split_with_sizes(0-d tensor, rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [5.0], (), "float32")[0], [], 0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [5.0], (), "float32")[1], [], 0
+            ),
+            expect="both_error",
+            note="torch: 'split expects at least a 1-dimensional tensor' -- the same wording "
+                 "split.Tensor gives; upstream does not distinguish the two overloads here",
+        )
+    )
+    return cases
+
+
+# --- aten._safe_softmax.default -----------------------------------------
+# torch's own decomposition (`torch/_decomp/decompositions.py::safe_softmax`):
+# `out = softmax(self, dim); masked = all(self == -inf, dim); where(masked, 0, out)`.
+# The one place this disagrees with `_softmax.default` (`softmax_cases`
+# above) is a row that is *entirely* -inf: plain softmax gives NaN there
+# (0/0 from `-inf - (-inf)`), `_safe_softmax` gives a clean 0 -- exactly the
+# shape of a fully-masked attention row. Both re-measured against torch
+# 2.13.0 below rather than trusted from the kernel's own doc comment.
+
+
+def safe_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._safe_softmax.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), -1, "last dim -- the vectorised path"),
+        ([1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), 0, "first dim -- the strided path"),
+        ([1.0, 2.0, 3.0], (3,), 0, "1-D"),
+        ([3.0], (), -1, "0-d: the single element is the whole distribution, so 1.0"),
+    ]
+    for dtype_name in _SOFTMAX_DTYPES:
+        for flat, shape, dim, note in scenarios:
+            cases.append(
+                Case(
+                    name=f"_safe_softmax(dtype={dtype_name}, shape={shape}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: torch_call(
+                        _pair(torch_module, c_module, flat, shape, dtype_name)[0], dim
+                    ),
+                    run_c=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], dim
+                    ),
+                    note=note,
+                )
+            )
+
+    # The divergence from `_softmax.default` this op exists for: a fully
+    # -inf row gives a clean 0 (not NaN), while a partially-masked row still
+    # matches plain softmax (the max-subtraction already makes that one
+    # safe). Both measured against real torch.
+    edge = [
+        ([1.0, float("-inf"), 2.0], (3,), "one masked position -- same as plain softmax here"),
+        ([float("-inf"), float("-inf")], (2,), "a fully masked row -- 0, not NaN (the divergence)"),
+        ([float("-inf"), float("-inf"), float("-inf")], (1, 3), "fully masked, batched over dim 0"),
+        ([1.0, 2.0, float("-inf"), float("-inf")], (2, 2), "one masked row, one live row, same call"),
+        ([1000.0, 1001.0, 999.0], (3,), "large logits -- max subtraction still applies"),
+    ]
+    for flat, shape, note in edge:
+        cases.append(
+            Case(
+                name=f"_safe_softmax(float32, {shape}) [{note}]",
+                op=op,
+                run_torch=lambda flat=flat, shape=shape: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], -1
+                ),
+                run_c=lambda flat=flat, shape=shape: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], -1
+                ),
+                note=note,
+            )
+        )
+
+    # `dtype` casts *before* the integral refusal runs -- measured:
+    # _safe_softmax(int64_tensor, 0, torch.float32) succeeds, unlike plain
+    # _softmax which has no dtype-cast path exercised here at all.
+    cases.append(
+        Case(
+            name="_safe_softmax(int64 input, dtype=float32 -- casts before the integral refusal)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0], 0,
+                dt.torch_dtype(torch_module, "float32"),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1], 0,
+                dt.c_dtype(c_module, "float32"),
+            ),
+            note="dtype casts self before the floating-point check runs, so this succeeds "
+                 "even though a bare int64 input (below) is refused",
+        )
+    )
+    cases.append(
+        Case(
+            name="_safe_softmax(int64 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0], -1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1], -1
+            ),
+            expect="both_error",
+            note='torch: NotImplementedError, "softmax_lastdim_kernel_impl" not implemented for \'Long\'',
+        )
+    )
+    return cases
+
+
+# --- aten.add_.Tensor -----------------------------------------------------
+# The in-place sibling of `add.Tensor`, needed for falcon's residual
+# connections (`hidden_states += attn_output`, which traces to this
+# overload rather than a rebind). Fresh operands per case, same as
+# fill__cases/copy__cases above (the module note on in-place ops) --
+# sharing an operand across cases would carry one case's mutation into the
+# next.
+#
+# Two real gaps came out of re-measuring the kernel's own doc comment
+# against actual torch 2.13.0 (see the block comment above `_baddbmm_case`
+# for the other one):
+#
+#   * `int32.add_(float32_tensor)` -- upstream refuses ("result type Float
+#     can't be cast to the desired output type Int"); the shim casts
+#     `other` into the receiver's dtype and computes. `torch_error`.
+#   * `bool.add_(bool)` -- upstream computes a logical or (`[True,False]
+#     .add_([True,True])` -> `[True,True]`, measured); the shim refuses
+#     unconditionally. `c_error`, not the `both_error` the kernel's doc
+#     comment implies (it matches `add.Tensor`'s *own* refusal, not
+#     upstream's actual behaviour).
+
+
+def add__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.add_.Tensor"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [10, 20, 30, 40], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"add_(dtype={dtype_name}, same shape)",
+                op=op,
+                run_torch=lambda dst_t=dst_t, src_t=src_t: torch_call(dst_t, src_t),
+                run_c=lambda dst_c=dst_c, src_c=src_c: c_module._aten_dispatch(op, dst_c, src_c),
+                note="in-place: compares the mutated dst operand add_ returns",
+            )
+        )
+
+    for dtype_name, alpha, note in [
+        ("float32", 2.0, "alpha scales other before it's added"),
+        ("float32", -1.0, "negative alpha -- effectively an in-place subtract"),
+        ("int32", 3, "integer alpha"),
+    ]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [10, 20, 30, 40], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"add_(dtype={dtype_name}, alpha={alpha}) [{note}]",
+                op=op,
+                run_torch=lambda dst_t=dst_t, src_t=src_t, alpha=alpha: torch_call(dst_t, src_t, alpha=alpha),
+                run_c=lambda dst_c=dst_c, src_c=src_c, alpha=alpha: c_module._aten_dispatch(op, dst_c, src_c, alpha=alpha),
+                note=note,
+            )
+        )
+
+    dst2_t, dst2_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), "float32")
+    src2_t, src2_c = pair_from_flat(torch_module, c_module, [9, 8], (1, 2), "float32")
+    cases.append(
+        Case(
+            name="add_(dtype=float32, broadcast src)",
+            op=op,
+            run_torch=lambda: torch_call(dst2_t, src2_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst2_c, src2_c),
+            note="src (1,2) broadcasts to fill dst (2,2) in place",
+        )
+    )
+
+    # The two measured gaps -- see the module note above.
+    int32_dst_t, int32_dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
+    float_src_t, float_src_c = pair_from_flat(torch_module, c_module, [1.5, 2.5, 3.5, 4.5], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="add_(dtype=int32, other=float32 -- c computes, torch refuses)",
+            op=op,
+            run_torch=lambda: torch_call(int32_dst_t, float_src_t),
+            run_c=lambda: c_module._aten_dispatch(op, int32_dst_c, float_src_c),
+            expect="torch_error",
+            note="torch: 'result type Float can't be cast to the desired output type Int'; "
+                 "the shim casts other into the receiver's dtype instead of refusing the unsafe cast",
+        )
+    )
+    bool_dst_t, bool_dst_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    bool_src_t, bool_src_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "bool")
+    cases.append(
+        Case(
+            name="add_(dtype=bool -- torch computes a logical or, c refuses)",
+            op=op,
+            run_torch=lambda: torch_call(bool_dst_t, bool_src_t),
+            run_c=lambda: c_module._aten_dispatch(op, bool_dst_c, bool_src_c),
+            expect="c_error",
+            note="torch: [True,False].add_([True,True]) -> [True,True] (logical or, measured); "
+                 "the shim's blanket bool refusal in arith_tag over-refuses here",
+        )
+    )
+    return cases
+
+
+# --- aten.mul.Scalar -------------------------------------------------------
+# `wrapped_scalar_tensor`'s counterpart to `mul.Tensor` -- reached only when
+# the *parser* keeps the RHS as a `Scalar` rather than promoting it to a 0-d
+# tensor first (see `arith_scalar`'s own doc comment). The promotion rule is
+# `arith_tag`'s, the same one `rsub_scalar_cases` already pins for
+# `rsub.Scalar`: an integral tensor stays integral under an int scalar and
+# promotes to the default float under a float one.
+
+
+def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mul.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, -2.0, 0.0, 3.5], (2, 2), dtype_name)
+        for scalar, note in [
+            (2.0, "plain scalar multiply"),
+            (0.0, "multiply by zero"),
+            (-1.5, "negative scalar"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"mul.Scalar(dtype={dtype_name}, other={scalar}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, scalar=scalar: torch_call(a_t, scalar),
+                    run_c=lambda a_c=a_c, scalar=scalar: c_module._aten_dispatch(op, a_c, scalar),
+                    note=note,
+                )
+            )
+
+    # The "wrapped number" dtype rule: an integral tensor stays integral
+    # under an int scalar and promotes to the default float under a float
+    # one -- re-measured here rather than assumed from rsub.Scalar's case.
+    for dtype_name, flat, scalar, note in [
+        ("int64", [1, 2, 3, 4], 5, "int tensor, int scalar -> int64"),
+        ("int64", [1, 2, 3, 4], 5.0, "int tensor, FLOAT scalar -> float32"),
+        ("int32", [1, 2, 3, 4], -3, "negative int scalar"),
+        ("int16", [10, 20, 30, 40], 2, "int16 * int scalar"),
+        ("uint8", [80, 90, 100, 110], 3, "uint8 wraps mod 256: 90*3=270 -> 14, 100*3=300 -> 44"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"mul.Scalar(dtype={dtype_name}, other={scalar!r}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, scalar=scalar: torch_call(a_t, scalar),
+                run_c=lambda a_c=a_c, scalar=scalar: c_module._aten_dispatch(op, a_c, scalar),
+                note=note,
+            )
+        )
+
+    # The measured gap: upstream computes `bool * scalar` arithmetically
+    # (True/False read as 1/0, promoted exactly like any other integral
+    # tensor -- int scalar keeps int64, float scalar gives float32). The
+    # shim's `arith_tag` refuses every bool tensor unconditionally, which is
+    # right for `mul.Tensor` (upstream's bool `*` there really is a logical
+    # and) but wrong here. `c_error`, re-measured rather than assumed.
+    bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    cases.append(
+        Case(
+            name="mul.Scalar(dtype=bool, other=3 -- torch computes arithmetically, c refuses)",
+            op=op,
+            run_torch=lambda: torch_call(bool_t, 3),
+            run_c=lambda: c_module._aten_dispatch(op, bool_c, 3),
+            expect="c_error",
+            note="torch: bool*3 -> tensor([3,0,3], dtype=int64) (arithmetic, not logical); "
+                 "the shim's blanket bool refusal in arith_tag over-refuses the .Scalar overload",
+        )
+    )
+    bool_float_t, bool_float_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    cases.append(
+        Case(
+            name="mul.Scalar(dtype=bool, other=2.5 -- float scalar promotes to float32)",
+            op=op,
+            run_torch=lambda: torch_call(bool_float_t, 2.5),
+            run_c=lambda: c_module._aten_dispatch(op, bool_float_c, 2.5),
+            expect="c_error",
+            note="torch: bool*2.5 -> tensor([2.5,0.,2.5], dtype=float32); same gap, float scalar",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -6020,4 +6751,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.permute.default": permute_cases,
     "aten.stack.default": stack_cases,
     "aten.relu.default": relu_cases,
+    # The five ops docs/TAIL.md needed to open falcon/bloom/gpt_bigcode.
+    "aten.baddbmm.default": baddbmm_cases,
+    "aten.split_with_sizes.default": split_with_sizes_cases,
+    "aten._safe_softmax.default": safe_softmax_cases,
+    "aten.add_.Tensor": add__tensor_cases,
+    "aten.mul.Scalar": mul_scalar_cases,
 }
