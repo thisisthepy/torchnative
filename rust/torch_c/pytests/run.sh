@@ -32,4 +32,17 @@ else
     exit 1
 fi
 
-PYTHONPATH="$stage" exec "${PYTHON:-python3}" "$crate_dir/pytests/test_shim.py"
+PYTHONPATH="$stage" "${PYTHON:-python3}" "$crate_dir/pytests/test_shim.py" || exit $?
+
+# The golden harness has its own self-test -- it injects a fault shaped like a
+# plausible misimplementation at each comparator and checks the comparator
+# rejects it. Nothing invoked it, so the gate existed without ever being pulled;
+# it caught that the previous injection reached exactly one case out of 1781.
+# It builds nothing, so it costs a few seconds here.
+#
+# TORCH_C_ARTEFACT points it at the artefact this script just staged, since
+# tools/golden/loader.py otherwise falls back to a fixed cache path that may
+# hold an entirely different build.
+repo_root=$(CDPATH='' cd -- "$crate_dir/../.." && pwd)
+TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
+    exec "${PYTHON:-python3}" "$repo_root/tools/golden/compare.py" --self-test
