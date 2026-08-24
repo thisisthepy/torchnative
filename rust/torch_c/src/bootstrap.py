@@ -733,26 +733,38 @@ _SCHEMA_BASE_TYPES = frozenset(
 
 
 def _decompose_type(spelling: str):
-    """`SymInt[]?` -> `("SymInt", True, True)`, `Tensor(a!)` -> `("Tensor", False, False)`.
+    """`SymInt[]?` -> `("SymInt", True, True, 0)`, `Tensor(a!)` -> `("Tensor", False, False, None)`.
 
-    Returns `(base, is_list, is_optional)`. The order of the strips matters:
-    `?` binds outermost (`int[]?` is an optional list, not a list of optional
-    ints), and an alias annotation is attached to the base.
+    Returns `(base, is_list, is_optional, list_size)`. The order of the strips
+    matters: `?` binds outermost (`int[]?` is an optional list, not a list of
+    optional ints), and an alias annotation is attached to the base.
+
+    `list_size` is the number inside the brackets -- `int[1]` gives `1`, a bare
+    `int[]` gives `0`, and a non-list gives `None`. It is not decoration:
+    `FunctionParameter::check` accepts a *bare int* wherever the declared list
+    has a size, which is the whole reason `x.sum(0)` binds
+    `sum.dim_IntList(Tensor self, int[1]? dim, ...)`. Dropping the number and
+    demanding a real sequence would make that call report "no matching
+    overload" -- a wrong answer in the shape of a right one.
     """
     text = spelling.strip()
     optional = text.endswith("?")
     if optional:
         text = text[:-1].strip()
     is_list = False
+    list_size = None
     if text.endswith("]"):
         is_list = True
-        text = text[: text.rindex("[")].strip()
+        open_bracket = text.rindex("[")
+        inside = text[open_bracket + 1 : -1].strip()
+        list_size = int(inside) if inside.isdigit() else 0
+        text = text[:open_bracket].strip()
     # `Tensor(a!)`, `Tensor(a)` -- the alias annotation is `_AliasInfo`'s
     # business (it is what `is_mutable()` reads); for type checking it is not
     # part of the type.
     if text.endswith(")") and "(" in text:
         text = text[: text.index("(")].strip()
-    return text, is_list, optional
+    return text, is_list, optional, list_size
 
 
 class _TypeChecker:
@@ -786,14 +798,42 @@ class _TypeChecker:
         self._generator = getattr(module, "Generator", None)
 
     def check(self, spelling, value) -> bool:
-        base, is_list, optional = _decompose_type(str(spelling))
+        base, is_list, optional, list_size = _decompose_type(str(spelling))
         if optional and value is None:
             return True
         if is_list:
             if isinstance(value, (list, tuple)):
                 return all(self._base(base, item) for item in value)
-            return False
+            # torch: "if a size is specified (e.g. IntArrayRef[2]) we also
+            # allow passing a single int". `x.sum(0)` is that rule.
+            return (
+                list_size is not None
+                and list_size > 0
+                and base in ("int", "SymInt")
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+            )
         return self._base(base, value)
+
+    @staticmethod
+    def coerce(spelling, value):
+        """The value to actually bind, once `check` has said yes.
+
+        Only one rule: a bare int that satisfied a sized int list is widened to
+        a one-element tuple, so the kernel behind the key always sees a list
+        where the schema says list. torch does the same thing one layer down
+        (`IntArrayRef` of length one).
+        """
+        base, is_list, _, list_size = _decompose_type(str(spelling))
+        if (
+            is_list
+            and list_size
+            and base in ("int", "SymInt")
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        ):
+            return (value,)
+        return value
 
     def _base(self, base: str, value) -> bool:
         if base == "Tensor":
@@ -858,12 +898,23 @@ def _is_schema_default(value, default_source) -> bool:
 
 
 class _Overloads:
-    """The ordered signature list for one `torch.<name>`."""
+    """The ordered signature list for one `torch.<name>` or one `Tensor.<name>`.
 
-    __slots__ = ("name", "schemas", "keys", "_checker_source")
+    `self_bound` is the only difference between the two. A method's receiver is
+    already chosen before any signature is considered -- upstream binds it
+    outside `PythonArgParser` entirely -- so it is passed in as `args[0]` and
+    the parts of the algorithm that count positional arguments skip over it.
+    Concretely that is the varargs int-list rule: `x.view(2, 3)` has to mean
+    `view([2, 3])`, and the precondition for that rule is "the signature has
+    exactly one positional argument", which is only true of `view` once `self`
+    is out of the count.
+    """
 
-    def __init__(self, name: str, schemas, checker_source) -> None:
+    __slots__ = ("name", "schemas", "keys", "self_bound", "_checker_source")
+
+    def __init__(self, name: str, schemas, checker_source, self_bound: bool = False) -> None:
         self.name = name
+        self.self_bound = self_bound
         self.schemas = [_Schema.parse(text) for text in schemas]
         # A callable rather than a `_TypeChecker`: `layout` and `memory_format`
         # are synthesised later in `install` than this table is parsed, and the
@@ -874,8 +925,13 @@ class _Overloads:
         for schema in self.schemas:
             namespace, _, op = schema.name.partition("::")
             self.keys.append(f"{namespace}.{op}.{schema.overload_name or 'default'}")
+            if self_bound and not schema.arguments:
+                raise RuntimeError(
+                    f"torch._C shim: methods.json entry {name!r} has a schema with "
+                    f"no `self` to bind the receiver into: {schema}"
+                )
             for argument in schema.arguments:
-                base, _, _ = _decompose_type(str(argument.type))
+                base, _, _, _ = _decompose_type(str(argument.type))
                 if base not in _SCHEMA_BASE_TYPES:
                     # At install time, not at call time. A spelling nobody
                     # taught `_TypeChecker` would otherwise make every call to
@@ -897,21 +953,24 @@ class _Overloads:
         checker = self._checker_source()
         positional = [a for a in schema.arguments if not a.kwarg_only]
         by_name = {a.name: a for a in schema.arguments}
+        # `self` is bound before any signature is looked at, so it is not part
+        # of what the parser counts (see the class docstring).
+        skip = 1 if self.self_bound else 0
 
         # The varargs int-list rule, with torch's exact precondition: it
         # applies only when the signature has a *single* positional argument
         # and that argument is an int list, which is what makes
         # `torch.ones(2, 3)` mean `ones([2, 3])` while `torch.full(2, 3)` stays
         # an error rather than becoming `full([2], 3)`.
-        if len(positional) == 1 and args:
-            base, is_list, _ = _decompose_type(str(positional[0].type))
+        if len(positional) - skip == 1 and len(args) > skip:
+            base, is_list, _, _ = _decompose_type(str(positional[skip].type))
             if (
                 is_list
                 and base in ("int", "SymInt")
-                and isinstance(args[0], int)
-                and not isinstance(args[0], bool)
+                and isinstance(args[skip], int)
+                and not isinstance(args[skip], bool)
             ):
-                args = (tuple(args),)
+                args = tuple(args[:skip]) + (tuple(args[skip:]),)
 
         if len(args) > len(positional):
             return None
@@ -922,7 +981,7 @@ class _Overloads:
                 return None  # given twice
             if not checker.check(parameter.type, value):
                 return None
-            bound[parameter.name] = value
+            bound[parameter.name] = checker.coerce(parameter.type, value)
 
         for key, value in kwargs.items():
             parameter = by_name.get(key)
@@ -930,7 +989,7 @@ class _Overloads:
                 return None
             if not checker.check(parameter.type, value):
                 return None
-            bound[key] = value
+            bound[key] = checker.coerce(parameter.type, value)
 
         for parameter in schema.arguments:
             if parameter.name not in bound and not parameter.has_default_value():
@@ -947,9 +1006,11 @@ class _Overloads:
             bound = self._bind(schema, args, kwargs)
             if bound is not None:
                 return key, bound
+        owner = "Tensor." if self.self_bound else "torch."
+        shown = args[1:] if self.self_bound else args
         raise TypeError(
-            f"torch.{self.name}(): no matching overload in torch._C shim for "
-            f"({_describe_call(args, kwargs)}). Candidates tried, in order:\n"
+            f"{owner}{self.name}(): no matching overload in torch._C shim for "
+            f"({_describe_call(shown, kwargs)}). Candidates tried, in order:\n"
             + "\n".join(f"  {schema}" for schema in self.schemas)
         )
 
@@ -982,7 +1043,7 @@ def _strip_python_only_kwargs(name: str, kwargs: dict) -> dict:
     return kwargs
 
 
-def install(module, surface_json: str, overloads_json: str) -> None:
+def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
     real = set(vars(module))
@@ -1013,6 +1074,19 @@ def install(module, surface_json: str, overloads_json: str) -> None:
     # reading the table back out of the artefact.
     module._shim_overloads = {
         name: list(entry.keys) for name, entry in sorted(overloads.items())
+    }
+
+    # The same table, for `tensor.<method>(...)`. Separate file and separate
+    # dict because they are separate bindings upstream (see methods.json's
+    # `_README`), and separate here so `_shim_overloads` keeps meaning exactly
+    # "what `torch.<op>` can reach".
+    methods = {
+        name: _Overloads(name, schemas, _checker_source, self_bound=True)
+        for name, schemas in json.loads(methods_json).items()
+        if not name.startswith("_README")
+    }
+    module._shim_methods = {
+        name: list(entry.keys) for name, entry in sorted(methods.items())
     }
 
     # -- types ------------------------------------------------------------
@@ -1059,6 +1133,15 @@ def install(module, surface_json: str, overloads_json: str) -> None:
     for member in surface["tensorbase"]["attrs"]:
         if _wanted(member):
             setattr(tensorbase, member, _make_property(f"TensorBase.{member}"))
+
+    # ...and then the ones that are not stubs. Installed *after* the stub loop
+    # so a real implementation always wins over the placeholder that the stub
+    # surface would otherwise have left in place, and installed unconditionally
+    # rather than through `_wanted` -- several of these (`__eq__`, `__ne__`)
+    # are in `UNSAFE_DUNDERS`, which is a rule about *raising* stand-ins, not
+    # about working implementations. A raising `__eq__` breaks dict and set
+    # use; one that returns a mask is what upstream has.
+    _install_tensor_methods(module, tensorbase, dispatch, methods)
 
     # `type(TensorBase)`. Upstream's is a distinct pybind11-adjacent metatype;
     # ours is plain `type`, because a PyO3 type's metatype cannot be replaced
@@ -1140,6 +1223,7 @@ def install(module, surface_json: str, overloads_json: str) -> None:
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
+    _install_grad_mode(module, varfns)
 
     # -- the enum instances `_initExtension` writes into `torch` -----------
     _install_namespace_types(module, surface["namespace"])
@@ -1211,6 +1295,457 @@ def _torch_level_function(name: str, dispatch, overloads):
     fn.__name__ = name
     fn.__qualname__ = name
     return fn
+
+
+# ---------------------------------------------------------------------------
+# `TensorBase` members that do something
+# ---------------------------------------------------------------------------
+#
+# docs/C_SURFACE.md §4 measured a small Llama forward plus greedy `generate`
+# and found 50 of `TensorBase`'s 694 members actually used. Everything here
+# serves that list, and nothing here is a second entrance: a method resolves an
+# overload and calls `_C._aten_dispatch`, exactly like `torch.<op>` does.
+#
+# Three groups, and the difference between them is worth keeping visible:
+#
+#   1. table-driven (`methods.json`)  -- the overload machine, `self` bound in.
+#   2. Python-level                   -- `to`, `item`, `__bool__`, `__getitem__`.
+#      Upstream's binding for each of these is not a plain overload set either:
+#      `THPVariable_to` reads its arguments and picks between several aten
+#      calls, `THPVariable_getitem` walks the index and emits a *sequence* of
+#      them. So these are written out, and each one still ends at the one door.
+#   3. autograd-shaped               -- `requires_grad`, `grad_fn`, `data`.
+#      These are the honest edge of the shim; see `_install_autograd_shape`.
+
+
+def _tensor_method(name: str, dispatch, entry):
+    """One `TensorBase.<name>`, resolving against `entry` with `self` bound.
+
+    Operator dunders answer `NotImplemented` when nothing binds, rather than
+    raising. That is upstream's behaviour and it is load-bearing rather than
+    polite: the vendored tree compares tensors against strings and against
+    `None` in several places, and Python only gets to fall back to its own
+    identity comparison if `__eq__` declines. A `TypeError` out of `__eq__`
+    would turn `x == "cpu"` into a crash where upstream gives `False`.
+    """
+    is_dunder = name.startswith("__") and name.endswith("__")
+
+    def method(self, *args, **kwargs):
+        try:
+            key, bound = entry.resolve(
+                (self,) + args, _strip_python_only_kwargs(name, kwargs)
+            )
+        except TypeError:
+            if is_dunder:
+                return NotImplemented
+            raise
+        return dispatch(key, **bound)
+
+    method.__name__ = name
+    method.__qualname__ = f"TensorBase.{name}"
+    return method
+
+
+def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
+    for name, entry in methods.items():
+        setattr(tensorbase, name, _tensor_method(name, dispatch, entry))
+
+    _install_tensor_conversions(module, tensorbase, dispatch)
+    _install_tensor_scalars(tensorbase, dispatch)
+    _install_tensor_indexing(tensorbase, dispatch)
+    _install_autograd_shape(tensorbase)
+
+
+# `x.float()` and friends. Upstream has no `aten::float`: `THPVariable_float`
+# is `self.to(ScalarType::Float)`, and a `TorchDispatchMode` logger confirms it
+# -- `f.float()` on a tensor that is already float32 produces *no* aten record
+# at all, while `i.float()` produces `aten._to_copy.default`. Both halves are
+# reproduced below: the no-change case returns `self` without dispatching, and
+# the change case names `_to_copy`, which is the key upstream's dispatcher
+# really sees. (The parser-level key would be `aten.to.dtype`; that overload is
+# composite and never reaches a kernel. Naming the one that does keeps the work
+# queue of DESIGN.md §6 pointing at something implementable.)
+_DTYPE_METHODS = {
+    "float": "float32",
+    "double": "float64",
+    "half": "float16",
+    "bfloat16": "bfloat16",
+    "long": "int64",
+    "int": "int32",
+    "short": "int16",
+    "char": "int8",
+    "byte": "uint8",
+    "bool": "bool",
+}
+
+
+def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
+    def _to_copy(self, dtype=None, device=None, copy=False):
+        if isinstance(device, str):
+            device = module.device(device)
+        # `!=`, not `is not`: `self.dtype` builds a fresh `PyDtype` on every
+        # read (dtype.rs owns the tag, not a singleton table), so identity is
+        # never true even for the same dtype. Both types define `__eq__`.
+        wants_dtype = dtype is not None and dtype != self.dtype
+        wants_device = device is not None and device != self.device
+        if not (wants_dtype or wants_device or copy):
+            return self
+        return dispatch(
+            "aten._to_copy.default",
+            self,
+            dtype=dtype if wants_dtype else None,
+            device=device if wants_device else None,
+        )
+
+    for name, dtype_name in _DTYPE_METHODS.items():
+        def convert(self, _dtype_name=dtype_name):
+            return _to_copy(self, dtype=getattr(module, _dtype_name))
+
+        convert.__name__ = name
+        convert.__qualname__ = f"TensorBase.{name}"
+        setattr(tensorbase, name, convert)
+
+    def to(self, *args, **kwargs):
+        """`Tensor.to`, in upstream's own argument shapes.
+
+        This is the clearest case of docs/OVERLOAD.md §9 item 7 -- a Python
+        binding whose signatures do not line up with any aten schema. torch's
+        parser takes `to(Device device=None, ScalarType dtype=None, ...)`,
+        `to(ScalarType dtype, ...)` and `to(Tensor other, ...)`; the aten
+        overloads are `to.dtype`, `to.device` (which requires *both*),
+        `to.other` and `to.dtype_layout` (all-keyword). `x.to('cpu')` binds the
+        first parser signature and none of the aten ones, so a table entry
+        would report "no matching overload" for a call real torch accepts.
+        """
+        kwargs = dict(kwargs)
+        copy = bool(kwargs.pop("copy", False))
+        kwargs.pop("non_blocking", None)
+        kwargs.pop("memory_format", None)
+        dtype = kwargs.pop("dtype", None)
+        device = kwargs.pop("device", None)
+        other = kwargs.pop("other", None)
+        if kwargs:
+            raise TypeError(
+                f"Tensor.to(): unexpected keyword argument(s) "
+                f"{sorted(kwargs)} in torch._C shim"
+            )
+        for value in args:
+            if isinstance(value, module.dtype):
+                dtype = value
+            elif isinstance(value, (module.device, str)):
+                device = value
+            elif isinstance(value, tensorbase):
+                other = value
+            elif isinstance(value, bool):
+                copy = copy or value  # non_blocking, then copy -- both bools
+            else:
+                raise TypeError(
+                    f"Tensor.to(): torch._C shim does not understand argument "
+                    f"{value!r} of type {type(value).__name__}"
+                )
+        if other is not None:
+            dtype, device = other.dtype, other.device
+        return _to_copy(self, dtype=dtype, device=device, copy=copy)
+
+    to.__name__ = "to"
+    to.__qualname__ = "TensorBase.to"
+    setattr(tensorbase, "to", to)
+    setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
+
+
+def _install_tensor_scalars(tensorbase, dispatch) -> None:
+    """`item()` and `__bool__`, both of which leave the tensor world.
+
+    `aten::item` exists, but it is not what upstream reaches: a
+    `TorchDispatchMode` logger over `t.item()` records exactly
+    `aten._local_scalar_dense.default`, and over `bool(t)` the same one. So
+    that is the key, and the numel check that upstream does before it stays on
+    this side, where it can carry torch's own message.
+    """
+
+    def item(self):
+        if self.numel() != 1:
+            raise RuntimeError(
+                f"a Tensor with {self.numel()} elements cannot be converted to Scalar"
+            )
+        return dispatch("aten._local_scalar_dense.default", self)
+
+    def __bool__(self):
+        if self.numel() == 0:
+            raise RuntimeError("Boolean value of Tensor with no values is ambiguous")
+        if self.numel() != 1:
+            raise RuntimeError(
+                "Boolean value of Tensor with more than one value is ambiguous"
+            )
+        return bool(dispatch("aten._local_scalar_dense.default", self))
+
+    def __float__(self):
+        return float(item(self))
+
+    def __int__(self):
+        return int(item(self))
+
+    def __index__(self):
+        value = item(self)
+        if isinstance(value, float):
+            raise TypeError(
+                "only integer tensors of a single element can be converted to an index"
+            )
+        return int(value)
+
+    for name, fn in (
+        ("item", item),
+        ("__bool__", __bool__),
+        ("__float__", __float__),
+        ("__int__", __int__),
+        ("__index__", __index__),
+    ):
+        fn.__name__ = name
+        fn.__qualname__ = f"TensorBase.{name}"
+        setattr(tensorbase, name, fn)
+
+
+def _install_tensor_indexing(tensorbase, dispatch) -> None:
+    """`x[...]`, decomposed the way `THPVariable_getitem` decomposes it.
+
+    Upstream's indexing is not one aten call; it is a walk over the index that
+    emits `select.int` for an integer, `slice.Tensor` for a slice, `unsqueeze`
+    for a `None`, and one `index.Tensor` at the end if any index was a tensor.
+    Measured, on torch 2.13.0:
+
+        f[0]        -> [select.int]
+        f[0, 1]     -> [select.int, select.int]
+        f[:, 1]     -> [select.int]          (the full slice emits nothing)
+        f[0:1]      -> [slice.Tensor]
+        f[None]     -> [unsqueeze]
+        f[bool_t]   -> [index.Tensor]
+
+    So this reproduces the walk rather than inventing a single `getitem` op,
+    and every step goes through `_aten_dispatch`. What it does *not* do is
+    mixed basic-and-advanced indexing: an index containing both a tensor and a
+    non-trivial slice is refused by name instead of being approximated.
+    """
+
+    def __getitem__(self, index):
+        if not isinstance(index, tuple):
+            index = (index,)
+        # Located with `is`, never with `==` or `.index()`: an index tuple may
+        # hold a tensor, and `TensorBase.__eq__` now answers with a mask.
+        # `tuple.index(Ellipsis)` would compare its way there elementwise.
+        ellipses = [k for k, item in enumerate(index) if item is Ellipsis]
+        if ellipses:
+            if len(ellipses) > 1:
+                raise IndexError("an index can only have a single ellipsis ('...')")
+            consumed = sum(
+                1 for item in index if item is not None and item is not Ellipsis
+            )
+            at = ellipses[0]
+            fill = (slice(None),) * max(self.dim() - consumed, 0)
+            index = index[:at] + fill + index[at + 1 :]
+
+        def _is_full_slice(item):
+            return (
+                isinstance(item, slice)
+                and item.start is None
+                and item.stop is None
+                and item.step is None
+            )
+
+        if any(isinstance(item, tensorbase) for item in index):
+            if any(
+                not (item is None or isinstance(item, tensorbase) or _is_full_slice(item))
+                for item in index
+            ):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__getitem__ mixing "
+                    "a tensor index with integer or slice indices -- upstream applies "
+                    "basic indexing first and then aten.index.Tensor, and this shim "
+                    "does not reproduce that composition yet"
+                )
+            indices = [item if isinstance(item, tensorbase) else None for item in index]
+            return dispatch("aten.index.Tensor", self, indices)
+
+        result = self
+        dim = 0
+        for item in index:
+            if item is None:
+                result = dispatch("aten.unsqueeze.default", result, dim)
+                dim += 1
+            elif isinstance(item, bool):
+                # torch treats a plain `True`/`False` as a zero-dim mask, which
+                # adds a dimension of length 1 or 0. Not measured as used, and
+                # guessing it is the kind of thing this shim refuses.
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__getitem__ with a "
+                    "Python bool index"
+                )
+            elif isinstance(item, int):
+                result = dispatch("aten.select.int", result, dim, item)
+            elif isinstance(item, slice):
+                if _is_full_slice(item):
+                    dim += 1
+                    continue
+                result = dispatch(
+                    "aten.slice.Tensor",
+                    result,
+                    dim,
+                    item.start,
+                    item.stop,
+                    1 if item.step is None else item.step,
+                )
+                dim += 1
+            else:
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: TensorBase.__getitem__ with "
+                    f"an index of type {type(item).__name__}"
+                )
+        return result
+
+    __getitem__.__name__ = "__getitem__"
+    __getitem__.__qualname__ = "TensorBase.__getitem__"
+    setattr(tensorbase, "__getitem__", __getitem__)
+
+    def __len__(self):
+        if self.dim() == 0:
+            raise TypeError("len() of a 0-d tensor")
+        return self.shape[0]
+
+    setattr(tensorbase, "__len__", __len__)
+
+
+def _install_autograd_shape(tensorbase) -> None:
+    """`requires_grad`, `grad_fn`, `data` -- the papered-over part.
+
+    **This is the one group here that is not an implementation.** There is no
+    autograd behind this shim (DESIGN.md §3 stage 0), and `from_config` reaches
+    `TensorBase.requires_grad_` before it reaches anything else interesting, so
+    the choice was between stopping there and carrying an inert flag.
+
+    The flag is carried, and the boundary is drawn where it can be seen:
+
+      * `requires_grad` stores and reports what was set. Nothing reads it.
+      * `grad_fn` and `grad` are always `None`, which is the truth -- no graph
+        node was ever created and no gradient was ever accumulated.
+      * `backward()` stays a raising stub, so code that actually depends on
+        the flag meaning something fails by name rather than silently getting
+        zeros.
+
+    `data` returns `self`, not a detached alias. Upstream's `.data` shares
+    storage with the original, so `p.data.normal_()` writes through to `p`;
+    returning `self` gives that same write-through with the same object, and
+    differs in that our `.data` still reports the original `requires_grad`.
+    Recorded in docs/TENSORBASE.md rather than hidden.
+    """
+
+    def _make_subclass(cls, data, require_grad=False, dispatch_strides=False,
+                       dispatch_device=False, device_for_backend_keys=None):
+        """`torch.Tensor._make_subclass`, which is how a `Parameter` is born.
+
+        `torch/nn/parameter.py:57` is `torch.Tensor._make_subclass(cls, data,
+        requires_grad)` and two more sites do the same. Upstream re-wraps the
+        same `TensorImpl` in a new Python object of class `cls`; here `cls(data)`
+        reaches `TensorBase`'s `#[new]`, which PyO3 allocates with the subtype
+        it was called on -- so the result really is a `Parameter`, and
+        `nn.Module.__setattr__`'s `isinstance(value, Parameter)` is satisfied.
+
+        The trailing three arguments are dispatch-key plumbing for subclasses
+        that override strides or device; there is no dispatcher key set here,
+        so they are accepted and ignored rather than refused -- refusing would
+        stop a call that upstream makes with their defaults.
+        """
+        # `TensorBase.__new__(cls, ...)`, not `cls(...)`. `Parameter.__new__`
+        # is the caller here, and calling `cls(data)` would re-enter it --
+        # measured, as a `RecursionError` five frames deep. Upstream allocates
+        # directly too; `_make_subclass` is below `__new__`, not above it.
+        made = tensorbase.__new__(cls, data)
+        made.requires_grad = bool(require_grad)
+        return made
+
+    # A *static* method, not a class method: upstream's is called as
+    # `torch.Tensor._make_subclass(cls, data, requires_grad)` with the target
+    # class passed explicitly, so binding the receiver would shift every
+    # argument one place left and `Parameter` would arrive as the data.
+    tensorbase._make_subclass = staticmethod(_make_subclass)
+
+    def requires_grad_(self, mode=True):
+        self.requires_grad = bool(mode)
+        return self
+
+    requires_grad_.__name__ = "requires_grad_"
+    requires_grad_.__qualname__ = "TensorBase.requires_grad_"
+    setattr(tensorbase, "requires_grad_", requires_grad_)
+    setattr(tensorbase, "grad_fn", property(lambda self: None))
+    setattr(tensorbase, "grad", property(lambda self: None))
+    setattr(tensorbase, "is_leaf", property(lambda self: True))
+    setattr(tensorbase, "data", property(lambda self: self))
+    setattr(tensorbase, "retain_grad", lambda self: None)
+
+
+def _install_grad_mode(module, varfns) -> None:
+    """The grad-mode flags `torch.no_grad()` turns on and off.
+
+    docs/FROM_CONFIG.md §2.2 measured `_set_grad_enabled` at **84 calls** during
+    `AutoModelForCausalLM.from_config` -- the single most-called name in the
+    whole trace, because every `@torch.no_grad()`-decorated initialiser flips it
+    twice. So this is not an edge case that can be left refusing.
+
+    **What is implemented is the flag, not what the flag means.** The state
+    round-trips exactly: `no_grad()` reads the previous value, sets `False`,
+    restores it, and gets back what it stored. That is the whole of the
+    observable contract at this layer, and `torch/autograd/grad_mode.py` needs
+    nothing else. What does *not* exist is the thing the flag would govern --
+    there is no graph, so turning recording "on" records nothing either. It is
+    the same boundary `TensorBase.requires_grad` draws (see
+    `_install_autograd_shape`), and it is drawn in the same place: `backward()`
+    stays a raising stub.
+
+    `is_grad_enabled` is overwritten on `_VariableFunctions` as well as on the
+    module. `torch/__init__.py` harvests `torch.is_grad_enabled` off that
+    object, so leaving the harvested copy as the table-less refusal would make
+    `torch.is_grad_enabled()` and `torch._C.is_grad_enabled()` disagree.
+    """
+    state = {
+        "grad": True,
+        # `torch/autograd/grad_mode.py:340` and `:393`. Both are real
+        # backend-configuration switches (thread pool, layout enforcement) with
+        # nothing behind them here, and both are context managers that restore
+        # what they read -- so, like `grad`, they have to round-trip.
+        "multithreading": True,
+        "layout_enforcement": False,
+    }
+
+    def is_grad_enabled():
+        return state["grad"]
+
+    def _set_grad_enabled(mode):
+        state["grad"] = bool(mode)
+
+    def _is_multithreading_enabled():
+        return state["multithreading"]
+
+    def _set_multithreading_enabled(mode):
+        state["multithreading"] = bool(mode)
+
+    def _is_grad_layout_enforcement_enabled():
+        return state["layout_enforcement"]
+
+    def _set_grad_layout_enforcement_enabled(mode):
+        state["layout_enforcement"] = bool(mode)
+
+    for name, fn in (
+        ("is_grad_enabled", is_grad_enabled),
+        ("_set_grad_enabled", _set_grad_enabled),
+        ("_is_multithreading_enabled", _is_multithreading_enabled),
+        ("_set_multithreading_enabled", _set_multithreading_enabled),
+        ("_is_grad_layout_enforcement_enabled", _is_grad_layout_enforcement_enabled),
+        ("_set_grad_layout_enforcement_enabled", _set_grad_layout_enforcement_enabled),
+    ):
+        fn.__name__ = name
+        fn.__qualname__ = f"torch._C.{name}"
+        setattr(module, name, fn)
+    varfns.is_grad_enabled = is_grad_enabled
+    # Readable so the state can be inspected rather than inferred.
+    module._shim_grad_state = state
 
 
 def _tensor_factory(module, dispatch):
@@ -1339,6 +1874,48 @@ _DISCOVERED_RETURNS = {
     # support compiled in; this one does not. Same shape of answer, same
     # reason the name cannot simply be absent.
     "_mtia_isBuilt": False,
+    # `torch/nn/modules/module.py:530` -- the first line of
+    # `nn.Module.__init__`, so *every* module ever constructed calls it, which
+    # makes it the very next wall after `import torch` on the road to
+    # `from_config`. Upstream increments an internal usage counter and returns
+    # nothing; there is no counter here and nothing reads the result. This is
+    # the cleanest member of docs/C_SURFACE.md §7's second tier -- a name whose
+    # existence is the whole requirement.
+    "_log_api_usage_once": None,
+    # `torch/nn/modules/module.py`, the same shape: upstream records that a
+    # module of this class was instantiated. Returns nothing, read by nobody.
+    "_log_api_usage_metadata": None,
+    # The `__torch_function__` fast-path predicates. `torch/nn/init.py:597`
+    # is the first of hundreds of sites: *every* function in `torch/nn/init.py`,
+    # `torch/nn/functional.py` and `torch/_tensor.py` opens with
+    # `if torch.overrides.has_torch_function_variadic(...)`, and upstream's C
+    # implementation answers "does any argument's type override
+    # `__torch_function__`?".
+    #
+    # `False` is the true answer here, not a stand-in: the protocol is a real
+    # dispatch mechanism this shim does not implement, and there is no type in
+    # the vendored tree's inference path that overrides it -- `Parameter` and
+    # `Tensor` inherit the default. If a subclass ever does override it, this
+    # is the single place that has to learn to say so, and until then a `True`
+    # would send every one of those call sites into a handler that cannot run.
+    # `torch/_tensor.py:1186`, in `Tensor.__len__`, and a dozen more places
+    # that warn only while TorchScript tracing. Upstream returns the active
+    # `TracingState` or `None`; there is no tracer here, so `None` is the true
+    # answer -- and it has to be *callable and answering*, not merely present,
+    # because `len(tensor)` is on the path. (docs/C_SURFACE.md §1-3 noticed
+    # this name being looked up during `import torch`; it is called later.)
+    "_get_tracing_state": None,
+    "_has_torch_function": False,
+    "_has_torch_function_unary": False,
+    "_has_torch_function_variadic": False,
+    # The mode stack, which `torch/overrides.py` and
+    # `torch/utils/_python_dispatch.py` consult before the predicates above.
+    # No mode is ever pushed here, so the stack is empty and disabled.
+    "_is_torch_function_enabled": False,
+    "_is_torch_function_mode_enabled": False,
+    "_is_torch_function_all_disabled": False,
+    "_len_torch_function_stack": 0,
+    "_len_torch_dispatch_stack": 0,
 }
 
 # The same, for members of synthesised `_C` types: `"<Type>.<member>": value`.
@@ -1579,6 +2156,22 @@ def _install_behaviour(module, dispatch) -> None:
         torch_module = sys.modules.get("torch")
         if torch_module is None:
             return
+        # Wall 20, and the one that decides whether a model can have
+        # parameters at all. Upstream's `_C` never returns a bare `TensorBase`
+        # -- `THPVariable_Wrap` instantiates `THPVariableClass`, which is
+        # `torch._tensor.Tensor` -- and `torch/nn/parameter.py:54` branches on
+        # `type(data) is torch.Tensor`. Get that wrong and `Parameter(...)`
+        # takes its custom-tensor path, returns something that is not a
+        # `Parameter`, and `nn.Module.__setattr__` files it as a plain
+        # attribute: the model builds and has no parameters.
+        #
+        # This is the right moment for it, and it is upstream's own moment:
+        # `torch/__init__.py:1931` runs `from torch._tensor import Tensor` and
+        # `:2189` calls this function, so the class exists and no tensor has
+        # been made yet.
+        tensor_cls = getattr(torch_module, "Tensor", None)
+        if tensor_cls is not None:
+            module._set_tensor_class(tensor_cls)
         kinds = (module.dtype, module.layout, module.memory_format, module.qscheme)
         for name, value in list(vars(module).items()):
             # Filtered on the *type*, not on the leading underscore. Skipping

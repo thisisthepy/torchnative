@@ -65,14 +65,28 @@ fn _tensor_from_flat(
     }
     let device = device.unwrap_or_else(PyDevice::cpu).resolve()?;
     // BOOL.md §6.3 lists this function as one of the two ways the `torch.bool`
-    // invariant could be broken quietly, since arbitrary values come in here.
-    // It refuses the tag instead: this is scaffolding due for deletion, and it
-    // should not be the thing that teaches the shim to lie about booleans.
+    // invariant could be broken quietly, since arbitrary `f64`s come in here.
+    // It used to refuse the tag outright. It now *normalises* instead, for the
+    // reason docs/OVERLOAD.md §6.7 gave when `_tensor_new_from_data` was added:
+    // the invariant is kept by construction, not by hope, as long as every byte
+    // under a `bool` tag goes through `PyTensorBase::boolean` after being
+    // reduced to 0/1. `!= 0` is that reduction, and it is also what torch
+    // guarantees a bool tensor *reads* as (BOOL.md §2.6).
+    //
+    // The refusal had become load-bearing in the wrong direction:
+    // `tools/golden/build.py` builds every operand through this function, so a
+    // mask could not be built at all, and `masked_fill` and `index.Tensor`
+    // -- both of which take a `torch.bool` argument -- could not be compared
+    // against upstream. An op that cannot be golden-checked is worse than a
+    // constructor that normalises.
     if dtype.is_some_and(|d| d.tag() == crate::dtype::TorchDType::Bool) {
-        return Err(crate::err::not_implemented(
-            "_tensor_from_flat: torch.bool is not accepted here -- a bool tensor \
-             must come from an op that guarantees 0/1 bytes (BOOL.md §6.3)",
-        ));
+        let bytes: Vec<u8> = values.iter().map(|v| u8::from(*v != 0.0)).collect();
+        let tensor = Tensor::from_vec(bytes, shape, &device)
+            .map_err(|e| candle_err("_tensor_from_flat", e))?;
+        return crate::tensor::promote(
+            py,
+            PyTensorBase::boolean(tensor)?.into_pyobject(py)?.into_any().unbind(),
+        );
     }
     let target = dtype
         .map(|d| d.storage("_tensor_from_flat"))
@@ -81,10 +95,10 @@ fn _tensor_from_flat(
     let tensor = Tensor::from_vec(values, shape, &device)
         .and_then(|t| t.to_dtype(target))
         .map_err(|e| candle_err("_tensor_from_flat", e))?;
-    Ok(PyTensorBase::new(tensor)?
-        .into_pyobject(py)?
-        .into_any()
-        .unbind())
+    crate::tensor::promote(
+        py,
+        PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind(),
+    )
 }
 
 /// One element of a nested Python sequence handed to `torch.tensor(...)`,
@@ -254,7 +268,7 @@ fn _tensor_new_from_data(
     } else {
         PyTensorBase::new(tensor)?
     };
-    Ok(wrapped.into_pyobject(py)?.into_any().unbind())
+    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
 /// The triple this artefact was built for. Three targets are cross-compiled and
@@ -277,6 +291,14 @@ const SURFACE: &str = include_str!("surface.json");
 /// `pytests/verify_schemas.py` against an installed upstream torch. Compiled
 /// in the same way: nothing is read from disk at runtime.
 const OVERLOADS: &str = include_str!("overloads.json");
+
+/// The same, for `tensor.<method>(...)`. A separate table because upstream has
+/// a separate binding: `THPVariable_mul` (a `TensorBase` method) and the
+/// `_VariableFunctions` entry are different C functions with different
+/// signature lists, which is why docs/C_SURFACE.md counted the two surfaces
+/// apart -- 50 `TensorBase` members called against 13 hoisted functions.
+/// Checked by the same `pytests/verify_schemas.py`.
+const METHODS: &str = include_str!("methods.json");
 
 /// Everything that is a name rather than a behaviour is built in Python, from
 /// `SURFACE`, at module init.
@@ -301,7 +323,7 @@ fn run_bootstrap(m: &Bound<'_, PyModule>) -> PyResult<()> {
         c"torch_c_bootstrap.py",
         c"_torch_c_bootstrap",
     )?;
-    boot.getattr("install")?.call1((m, SURFACE, OVERLOADS))?;
+    boot.getattr("install")?.call1((m, SURFACE, OVERLOADS, METHODS))?;
     Ok(())
 }
 

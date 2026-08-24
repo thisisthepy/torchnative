@@ -487,6 +487,254 @@ def test_finfo_and_iinfo_report_torchs_numbers():
         raise AssertionError("torch refuses iinfo(bool); so must the shim")
 
 
+# --- TensorBase methods (docs/TENSORBASE.md) --------------------------------
+#
+# These run against the bare artefact, with no vendored tree: `TensorBase` is
+# the class the methods are installed on, so nothing here needs `torch.Tensor`
+# to exist. That is also why every result below is a `TensorBase` and not a
+# `Tensor` -- `_set_tensor_class` is called by `_initExtension`, which only a
+# real `import torch` reaches.
+
+
+def _t(values, shape, dtype=None):
+    return _C._tensor_from_flat(values, shape, dtype)
+
+
+def test_tensor_methods_reach_the_one_door():
+    # Every method in the table resolves to an aten key and goes through
+    # `_aten_dispatch`; none of them computes on the `TensorBase` type itself.
+    assert isinstance(_C._shim_methods, dict)
+    assert _C._shim_methods["__mul__"] == ["aten.mul.Tensor", "aten.mul.Scalar"]
+    # `item`, `to`, `float`, `__bool__` and `__getitem__` are deliberately
+    # *not* in the table -- upstream's binding for each is not a plain overload
+    # set, so they are written out in `bootstrap.py` (docs/TENSORBASE.md §3).
+    # They still end at `_aten_dispatch`; they just do not resolve first.
+    for python_level in ("item", "to", "float", "__bool__", "__getitem__"):
+        assert python_level not in _C._shim_methods
+        assert callable(getattr(_C.TensorBase, python_level))
+    # `sum` has no dim in its first signature, so `x.sum()` cannot bind the
+    # second one -- the order is not what decides it, the arity is.
+    assert _C._shim_methods["sum"] == ["aten.sum.default", "aten.sum.dim_IntList"]
+
+
+def test_method_overload_resolution_picks_by_argument_type():
+    x = _t([1.0, 2.0, 3.0, 4.0], [2, 2])
+    y = _t([5.0, 6.0, 7.0, 8.0], [2, 2])
+    assert (x * y).tolist() == [[5.0, 12.0], [21.0, 32.0]]
+    # A Python scalar picks the `Scalar` overload at the *parser* level, which
+    # is what this shim reproduces -- upstream's dispatcher then records
+    # `mul.Tensor` one layer down (docs/TENSORBASE.md).
+    assert (x * 2).tolist() == [[2.0, 4.0], [6.0, 8.0]]
+    assert (x * 2.5).tolist() == [[2.5, 5.0], [7.5, 10.0]]
+
+
+def test_a_scalar_does_not_widen_a_tensor_of_the_same_category():
+    # torch's "wrapped number" rule, the same one `pow` follows.
+    ints = _t([1.0, 2.0, 3.0, 4.0], [2, 2], _C.int64)
+    assert (ints * 3).dtype == _C.int64
+    assert (ints * 3.0).dtype == _C.float32
+    # ...except true division, which always floats.
+    assert (ints / ints).dtype == _C.float32
+
+
+def test_comparisons_answer_bool_and_only_bool():
+    x = _t([1.0, 2.0, 3.0, 4.0], [2, 2])
+    for result in (x == 3.0, x != 3.0, x < 3.0, x == x):
+        assert result.dtype == _C.bool
+    assert (x < 3.0).tolist() == [[True, True], [False, False]]
+
+
+def test_varargs_rule_applies_after_self_is_bound():
+    # `x.view(2, 2)` has to mean `view([2, 2])`. The precondition for torch's
+    # varargs int-list rule is "the signature has exactly one positional
+    # argument", which is only true of `view` once `self` is out of the count.
+    x = _t([1.0, 2.0, 3.0, 4.0], [4])
+    assert x.view(2, 2).shape == (2, 2)
+    assert x.view([2, 2]).shape == (2, 2)
+    assert x.reshape(-1, 1).shape == (4, 1)
+
+
+def test_a_bare_int_binds_a_sized_int_list():
+    # `sum.dim_IntList(Tensor self, int[1]? dim, ...)`. Demanding a real
+    # sequence would make `x.sum(0)` report "no matching overload" -- a wrong
+    # answer in the shape of a right one.
+    x = _t([1.0, 2.0, 3.0, 4.0], [2, 2])
+    assert x.sum(0).tolist() == [4.0, 6.0]
+    assert x.sum([0]).tolist() == [4.0, 6.0]
+    assert x.sum(0, True).shape == (1, 2)
+
+
+def test_sum_promotes_integral_inputs_and_mean_refuses_them():
+    ints = _t([1.0, 2.0, 3.0, 4.0], [2, 2], _C.int32)
+    assert ints.sum().dtype == _C.int64
+    try:
+        ints.mean()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("torch refuses mean() on an integral tensor")
+
+
+def test_getitem_decomposes_into_aten_calls():
+    x = _t([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])
+    assert x[0].tolist() == [1.0, 2.0]
+    assert x[-1].tolist() == [5.0, 6.0]
+    assert x[1, 0].tolist() == 3.0
+    assert x[:, 1].tolist() == [2.0, 4.0, 6.0]
+    assert x[None].shape == (1, 3, 2)
+    assert x[:, None].shape == (3, 1, 2)
+    assert x[0:2].tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert x[..., 0].tolist() == [1.0, 3.0, 5.0]
+    mask = _t([1.0, 0.0, 1.0], [3], _C.bool)
+    assert x[mask].tolist() == [[1.0, 2.0], [5.0, 6.0]]
+
+
+def test_getitem_refuses_mixing_a_tensor_with_a_slice():
+    x = _t([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])
+    mask = _t([1.0, 0.0, 1.0], [3], _C.bool)
+    try:
+        x[mask, 0:1]
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("mixed basic/advanced indexing is not implemented")
+
+
+def test_in_place_ops_mutate_the_receiver():
+    x = _t([1.0, 2.0, 3.0, 4.0], [2, 2])
+    assert x.fill_(7.0) is x
+    assert x.tolist() == [[7.0, 7.0], [7.0, 7.0]]
+    src = _t([9.0, 9.0, 9.0, 9.0], [2, 2])
+    assert x.copy_(src) is x
+    assert x.tolist() == [[9.0, 9.0], [9.0, 9.0]]
+    # `copy_` keeps the destination's dtype, not the source's -- torch's
+    # asymmetry, measured.
+    ints = _t([0.0, 0.0], [2], _C.int64)
+    ints.copy_(_t([1.5, 2.5], [2]))
+    assert ints.dtype == _C.int64 and ints.tolist() == [1, 2]
+
+
+def test_fill_refuses_a_value_the_dtype_cannot_hold():
+    # The same `checked_convert` rule `full` follows, and the same upstream
+    # numel==1 hole: `fill_` *is* where that hole lives.
+    small = _t([0.0, 0.0, 0.0, 0.0], [2, 2], _C.int32)
+    try:
+        small.fill_(2 ** 31)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("torch refuses an int32 fill of 2**31")
+
+
+def test_item_leaves_the_tensor_world_with_torchs_own_message():
+    assert _t([2.5], [1]).item() == 2.5
+    assert _t([1.0], [1], _C.int64).item() == 1
+    assert _t([1.0], [1], _C.bool).item() is True
+    assert bool(_t([0.0], [1])) is False
+    try:
+        _t([1.0, 2.0], [2]).item()
+    except RuntimeError as e:
+        assert "cannot be converted to Scalar" in str(e)
+    else:
+        raise AssertionError("item() needs exactly one element")
+
+
+def test_to_returns_self_when_nothing_changes():
+    # Measured upstream: `f.to(torch.float32)` on a float32 tensor produces no
+    # aten record at all, and `f.float()` likewise.
+    x = _t([1.0, 2.0], [2])
+    assert x.to(_C.float32) is x
+    assert x.float() is x
+    assert x.to(_C.float64).dtype == _C.float64
+    assert x.long().dtype == _C.int64
+
+
+def test_bitwise_is_logical_on_bool_and_bitwise_on_ints():
+    # BOOL.md §3: this is one of the six guardrails that survive only because
+    # `bool` is not aliased onto `uint8`.
+    mask = _t([1.0, 0.0], [2], _C.bool)
+    other = _t([1.0, 1.0], [2], _C.bool)
+    assert (mask & other).tolist() == [True, False]
+    assert (mask | other).tolist() == [True, True]
+    assert (~mask).tolist() == [False, True]
+    ints = _t([12.0, 10.0], [2], _C.int64)
+    assert (ints & 10).tolist() == [8, 10]
+    assert (~ints).tolist() == [-13, -11]
+
+
+def test_masked_fill_refuses_a_non_bool_mask():
+    x = _t([1.0, 2.0], [2])
+    try:
+        x.masked_fill(_t([1.0, 0.0], [2], _C.uint8), 0.0)
+    except RuntimeError as e:
+        assert "boolean masks" in str(e)
+    else:
+        raise AssertionError("torch refuses a uint8 mask")
+
+
+def test_operator_dunders_decline_rather_than_raise():
+    # `NotImplemented`, so Python can fall back. The vendored tree compares
+    # tensors against strings and against None in several places.
+    x = _t([1.0, 2.0], [2])
+    assert (x == "cpu") is False
+    assert (x == None) is False  # noqa: E711
+
+
+def test_the_rng_ops_are_the_wall_and_they_name_themselves():
+    # docs/TENSORBASE.md: `uniform_` and `normal_` resolve to the right aten
+    # key and stop there, because the generator question is a separate task.
+    x = _t([0.0, 0.0], [2])
+    for call in (lambda: x.uniform_(-1.0, 1.0), lambda: x.normal_(0.0, 0.02)):
+        try:
+            call()
+        except NotImplementedError as e:
+            assert "aten.uniform_.default" in str(e) or "aten.normal_.default" in str(e)
+        else:
+            raise AssertionError("the RNG ops have no kernel yet")
+
+
+def test_grad_mode_state_round_trips():
+    # 84 calls during `from_config` (docs/FROM_CONFIG.md §2.2). The flag is
+    # real; what it would govern is not.
+    assert _C.is_grad_enabled() is True
+    _C._set_grad_enabled(False)
+    assert _C.is_grad_enabled() is False
+    _C._set_grad_enabled(True)
+    assert _C.is_grad_enabled() is True
+    assert _C._VariableFunctions.is_grad_enabled is _C.is_grad_enabled
+
+
+def test_make_subclass_produces_the_subclass():
+    # This is what `nn.Parameter` needs: `_make_subclass(cls, data, rg)` has to
+    # return an instance of `cls`, or `Module.__setattr__` files the result as
+    # a plain attribute and the model ends up with no parameters.
+    class Param(_C.TensorBase):
+        pass
+
+    data = _t([1.0, 2.0], [2])
+    made = _C.TensorBase._make_subclass(Param, data, True)
+    assert type(made) is Param
+    assert made.requires_grad is True
+    assert made.tolist() == [1.0, 2.0]
+    assert data.requires_grad is False
+
+
+def test_the_dispatch_table_matches_the_two_lists():
+    # An op that answers but is in neither list would be invisible to the
+    # golden harness *and* to the work queue.
+    listed = set(_C._aten_all_implemented())
+    assert listed == set(_C._aten_implemented()) | set(
+        _C._aten_implemented_awaiting_golden()
+    )
+    for key in sorted(listed):
+        try:
+            _C._aten_dispatch(key)
+        except NotImplementedError as e:
+            raise AssertionError(f"{key} is listed but not dispatched: {e}") from None
+        except Exception:
+            pass  # missing arguments -- the key itself resolved
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -30,6 +30,15 @@ pub struct PyTensorBase {
     /// (the bytes under a `bool` tag are 0 or 1), which is why `boolean()` is
     /// the only way to attach that tag.
     tag: TorchDType,
+    /// **Inert.** Stored and reported, read by nothing. There is no autograd
+    /// here (DESIGN.md §3 stage 0), so no graph node is ever created from it
+    /// and `grad_fn` is always `None`. It exists because `from_config` calls
+    /// `TensorBase.requires_grad_` before it calls anything else interesting,
+    /// and the alternative was stopping there. `backward()` stays a raising
+    /// stub so that code which really depends on the flag meaning something
+    /// fails by name rather than silently getting nothing. Recorded as a
+    /// papered-over item in docs/TENSORBASE.md, not as an implementation.
+    requires_grad: bool,
 }
 
 impl PyTensorBase {
@@ -41,7 +50,11 @@ impl PyTensorBase {
                 inner.dtype().as_str()
             ))
         })?;
-        Ok(Self { inner, tag })
+        Ok(Self {
+            inner,
+            tag,
+            requires_grad: false,
+        })
     }
 
     /// The single entrance for the `torch.bool` tag (BOOL.md §6.3 item 1).
@@ -69,6 +82,7 @@ impl PyTensorBase {
         Ok(Self {
             inner,
             tag: TorchDType::Bool,
+            requires_grad: false,
         })
     }
 
@@ -79,10 +93,102 @@ impl PyTensorBase {
     pub fn tag(&self) -> TorchDType {
         self.tag
     }
+
+    /// The write half of the in-place ops (`fill_`, `copy_`, `uniform_`,
+    /// `normal_`).
+    ///
+    /// It takes a whole `PyTensorBase` rather than a bare candle tensor so
+    /// that the replacement has already been through `new()` or `boolean()` --
+    /// BOOL.md §6.3's rule that only one constructor may attach the `bool`
+    /// tag survives a mutating API only if the mutation cannot bypass it.
+    ///
+    /// **This replaces the wrapper's tensor; it does not write into storage.**
+    /// The difference is visible: upstream's `y = x.detach(); y.fill_(0)`
+    /// writes through to `x` because the two share storage, and here it does
+    /// not, because `y` is a different wrapper. Mutating through the *same*
+    /// Python object (`p.data.fill_(0)`, since `.data` returns `self`) does
+    /// behave like upstream. Recorded in docs/TENSORBASE.md.
+    pub fn replace_with(&mut self, replacement: PyTensorBase) {
+        self.inner = replacement.inner;
+        self.tag = replacement.tag;
+    }
+}
+
+/// The Python class an op result should wear.
+///
+/// Upstream, `_C` never hands back a bare `TensorBase`: `THPVariable_Wrap`
+/// instantiates `THPVariableClass`, which C++ resolves to `torch._tensor.Tensor`
+/// -- the Python subclass. The vendored tree depends on that in ways that have
+/// no workaround, and `torch/nn/parameter.py:54` is the sharpest:
+///
+/// ```python
+/// if type(data) is torch.Tensor or type(data) is Parameter:
+///     return torch.Tensor._make_subclass(cls, data, requires_grad)
+/// # otherwise: the custom-tensor path, which returns something that is not
+/// # a Parameter, and `nn.Module.__setattr__` then classifies it as a plain
+/// # attribute instead of registering it. A model built that way has no
+/// # parameters at all.
+/// ```
+///
+/// So the class is registered here, at the same moment upstream registers it
+/// (`_initExtension`, after `from torch._tensor import Tensor` has run), and
+/// `promote` puts every op result into it.
+///
+/// When nothing has registered a class -- which is exactly the standalone
+/// `_C` that `tools/golden/loader.py` imports, with no `torch` package around
+/// it -- `promote` is the identity and results stay `TensorBase`.
+static TENSOR_CLASS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+#[pyfunction]
+#[pyo3(name = "_set_tensor_class")]
+pub fn set_tensor_class(cls: Py<PyAny>) {
+    // First registration wins; `_initExtension` is idempotent upstream too.
+    let _ = TENSOR_CLASS.set(cls);
+}
+
+/// Wrap a bare `TensorBase` in the registered Python tensor class.
+///
+/// Idempotent and narrow on purpose: anything that is already an instance of a
+/// *subclass* (a `Tensor`, a `Parameter`) is returned untouched, so an
+/// in-place op still hands back the object it mutated.
+pub fn promote(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
+    let cls = match TENSOR_CLASS.get() {
+        Some(cls) => cls,
+        None => return Ok(value),
+    };
+    let bound = value.bind(py);
+    if bound.get_type().is(&py.get_type::<PyTensorBase>()) {
+        return Ok(cls.bind(py).call1((bound,))?.unbind());
+    }
+    Ok(value)
 }
 
 #[pymethods]
 impl PyTensorBase {
+    /// `TensorBase(other)` -- the constructor `promote` calls.
+    ///
+    /// PyO3's generated `tp_new` allocates with the *subtype* it was called
+    /// with, so `Tensor(base)` produces a `Tensor` and `Parameter(base)` a
+    /// `Parameter`, each sharing the candle tensor. That is what makes
+    /// `_make_subclass` a three-line Python function in `bootstrap.py` rather
+    /// than another piece of native machinery.
+    ///
+    /// It takes a tensor and nothing else. Upstream's `torch.Tensor(2, 3)`
+    /// (the legacy uninitialised-storage constructor) is a different function
+    /// wearing the same name, is not used anywhere on the inference path, and
+    /// is refused by name rather than guessed at.
+    #[new]
+    fn py_new(data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        data.extract::<Self>().map_err(|_| {
+            not_implemented(format!(
+                "torch._C shim: TensorBase(...) takes an existing tensor to re-wrap; \
+                 upstream's legacy `torch.Tensor({})` storage constructor is not \
+                 implemented",
+                data.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })
+    }
+
     /// torch returns `torch.Size`, itself a C-defined tuple subclass. The shim
     /// does not own that type yet, so this is a plain tuple -- structurally
     /// compatible, and the difference is recorded in docs/TORCH_C.md.
@@ -135,6 +241,17 @@ impl PyTensorBase {
 
     fn is_contiguous(&self) -> bool {
         self.inner.is_contiguous()
+    }
+
+    /// See the field comment: stored, reported, read by nothing.
+    #[getter]
+    fn requires_grad(&self) -> bool {
+        self.requires_grad
+    }
+
+    #[setter]
+    fn set_requires_grad(&mut self, value: bool) {
+        self.requires_grad = value;
     }
 
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only
@@ -216,5 +333,6 @@ fn nest(py: Python<'_>, flat: &[Py<PyAny>], dims: &[usize]) -> PyResult<Py<PyAny
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
+    m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
     Ok(())
 }

@@ -42,6 +42,7 @@ from failing the harness before they exist.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -1250,6 +1251,1229 @@ def lift_fresh_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- pre-seeded case builders for the ops backing TensorBase's 50 --------
+# actually-used members (docs/C_SURFACE.md §4)
+#
+# docs/C_SURFACE.md traced a small Llama forward+generate() against real
+# upstream torch (torch 2.13.0) and found 50 `TensorBase` members actually
+# get accessed via a `torch.Tensor` instance -- 49 real API names plus the
+# `__class__` bookkeeping dunder (not a real API, not covered here). Another
+# change is implementing the rust/torch_c side of these; the builders below
+# are written ahead of that landing, exactly like the 16 pre-seeded above,
+# so coverage activates the moment each op appears in `_aten_implemented()`
+# -- see the module note above `arange_default_cases` for how `compare.py`
+# keeps an unimplemented op's builder inert (PENDING, not FAIL) until then.
+#
+# **Methods are not functions -- overloads were measured, not guessed.**
+# `x * 2`, `x + 2`, `x - 2`, `x / 2` (dunder-operator paths) were checked
+# with a real `TorchDispatchMode` probe against torch 2.13.0 before writing
+# any of this, because the difference between an op's overloads takes
+# different arguments and there is no way to guess it correctly from the
+# method name alone (see the `full`/`add`/`mm` docstring above). Two results
+# were surprising enough to call out explicitly:
+#
+#   - `x * 2`, `x + 2`, `x - 2`, `x / 2` all dispatch through the *.Tensor*
+#     overload (`mul.Tensor`, `add.Tensor`, `sub.Tensor`, `div.Tensor`) --
+#     the Python scalar is silently wrapped into a 0-d tensor by the dunder
+#     before the dispatcher ever sees it. There is no reachable `.Scalar`
+#     overload for these dunders.
+#   - `x & True`, `x | True`, `x == 2`, `x < 2`, `x.ne(2)` do the opposite:
+#     the Python scalar stays a Scalar and dispatches to the `.Scalar`
+#     overload (`bitwise_and.Scalar`, `bitwise_or.Scalar`, `eq.Scalar`,
+#     `lt.Scalar`, `ne.Scalar`). Same "dunder/method given a Python number"
+#     shape as the arithmetic ops above, opposite dispatch behaviour --
+#     each family was probed independently rather than assumed to match.
+#
+# `__matmul__` needs no new builder here: the probe showed it dispatches to
+# `aten.mm.default`, already covered by `mm_cases` above.
+#
+# **Nine of the 50 names never reach the ATen dispatcher at all.** `device`,
+# `dim`, `dtype`, `grad_fn`, `ndim`, `numel`, `requires_grad`,
+# `requires_grad_`, `shape`, `size` were probed the same way (called inside
+# a `TorchDispatchMode`) and produced zero recorded dispatcher calls --
+# they read (or, for `requires_grad_`, mutate) metadata already sitting on
+# the TensorImpl without going through the aten op dispatch this harness
+# compares. There is no aten overload for `_aten_dispatch` to be given for
+# these, so they intentionally have no case builder; this is a property of
+# the harness's aten-op-granularity design, not an oversight.
+#
+# **In-place methods compare differently.** `fill_`, `copy_`, `normal_`,
+# `uniform_` mutate their operand rather than returning a fresh value.
+# Structurally this needs no different harness machinery than any other
+# case -- `torch.ops.aten.<op>_.<overload>` returns the same (now mutated)
+# object, so the existing run_torch/run_c/compare pipeline already compares
+# the *result* of an in-place call correctly -- but it does mean every
+# in-place case here builds a **fresh** operand pair per case (never shares
+# one tensor across two cases), or an earlier case's mutation would leak
+# into a later one that expects a clean starting value. `normal_` and
+# `uniform_` are also non-deterministic -- see their builders below for how
+# that is handled with `Case.value_check` instead of the default pipeline
+# (same idea `randint_low_cases` above already established).
+#
+# `contiguous()` needs no separate builder: on a non-contiguous input it
+# dispatches to `aten.clone.default`, the same op `clone()` uses (probed);
+# on an already-contiguous input it is a no-op that never reaches the
+# dispatcher, so there is nothing there to compare either.
+#
+# `reshape()` needs no separate builder for the same reason: on a
+# contiguous input it dispatches to `aten.view.default` (the same op
+# `view()` uses, see `view_cases`); on a non-contiguous input it instead
+# dispatches to `aten.clone.default` + `aten._unsafe_view.default` -- a
+# second op this harness's single-op-per-case design does not attempt to
+# chain, matching the same granularity limitation already documented for
+# `contiguous()`.
+
+
+def _binary_tensor_case(
+    torch_module, c_module, op, torch_call, dtype_name, a_flat, a_shape, b_flat, b_shape, note, kwargs=None
+) -> Case:
+    kwargs = kwargs or {}
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, b_shape, dtype_name)
+    short = op.split(".", 2)[1]
+    name = f"{short}(dtype={dtype_name}, a_shape={a_shape}, b_shape={b_shape}) [{note}]"
+    return Case(
+        name=name,
+        op=op,
+        run_torch=lambda: torch_call(a_t, b_t, **kwargs),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, b_c, **kwargs),
+        note=note,
+    )
+
+
+def _binary_scalar_case(torch_module, c_module, op, torch_call, dtype_name, a_flat, a_shape, scalar, note) -> Case:
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    short = op.split(".", 2)[1]
+    name = f"{short}(dtype={dtype_name}, a_shape={a_shape}, scalar={scalar!r}) [{note}]"
+    return Case(
+        name=name,
+        op=op,
+        run_torch=lambda: torch_call(a_t, scalar),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, scalar),
+        note=note,
+    )
+
+
+def _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note, kwargs=None) -> Case:
+    kwargs = kwargs or {}
+    a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+    short = op.split(".", 2)[1]
+    name = f"{short}(dtype={dtype_name}, shape={shape}) [{note}]"
+    return Case(
+        name=name,
+        op=op,
+        run_torch=lambda: torch_call(a_t, **kwargs),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, **kwargs),
+        note=note,
+    )
+
+
+_ELEMENTWISE_SCENARIOS: list[dict] = [
+    dict(a_flat=[1, 2, 3, 4], a_shape=(2, 2), b_flat=[5, 6, 7, 8], b_shape=(2, 2), note="elementwise"),
+    dict(a_flat=[7], a_shape=(), b_flat=[1, 2, 3, 4], b_shape=(2, 2), note="scalar (0-d) broadcast"),
+    dict(a_flat=[1, 2, 3, 4, 5, 6], a_shape=(2, 3), b_flat=[10, 20, 30], b_shape=(3,), note="row broadcast"),
+]
+
+
+def _elementwise_boundary_scenario(big) -> dict:
+    return dict(
+        a_flat=[0, -5, big, -big],
+        a_shape=(2, 2),
+        b_flat=[0, 5, -big, big],
+        b_shape=(2, 2),
+        note="boundary values (0/neg/large)",
+    )
+
+
+# --- aten.sub.Tensor -------------------------------------------------------
+# `__sub__` -- probe confirmed the `.Tensor` overload even for `x - 2`
+# (scalar wrapped to a 0-d tensor), same shape as `add.Tensor` above, so
+# this reuses `add_cases`' own scenario generators verbatim.
+
+
+def sub_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sub.Tensor"
+    cases: list[Case] = []
+
+    for dtype_name in _FLOAT_ADD_DTYPES:
+        for scenario in _float_add_scenarios(_FLOAT_ADD_MAGNITUDE[dtype_name]):
+            a_t, a_c = pair_from_flat(torch_module, c_module, scenario["a_flat"], scenario["a_shape"], dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, scenario["b_flat"], scenario["b_shape"], dtype_name)
+            alpha = scenario["alpha"]
+            kwargs = {} if alpha is None else {"alpha": alpha}
+            name = (
+                f"sub(dtype={dtype_name}, a_shape={scenario['a_shape']}, b_shape={scenario['b_shape']}, "
+                f"alpha={alpha}) [{scenario['note']}]"
+            )
+            cases.append(
+                Case(
+                    name=name,
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, kwargs=kwargs: torch_call(a_t, b_t, **kwargs),
+                    run_c=lambda a_c=a_c, b_c=b_c, kwargs=kwargs: c_module._aten_dispatch(op, a_c, b_c, **kwargs),
+                )
+            )
+
+    for dtype_name, big in [("int64", 10**9), ("int32", 10**6), ("int16", 1000)]:
+        for scenario in _int_add_scenarios_signed(big):
+            a_t, a_c = pair_from_flat(torch_module, c_module, scenario["a_flat"], scenario["a_shape"], dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, scenario["b_flat"], scenario["b_shape"], dtype_name)
+            alpha = scenario["alpha"]
+            kwargs = {} if alpha is None else {"alpha": alpha}
+            name = (
+                f"sub(dtype={dtype_name}, a_shape={scenario['a_shape']}, b_shape={scenario['b_shape']}, "
+                f"alpha={alpha}) [{scenario['note']}]"
+            )
+            cases.append(
+                Case(
+                    name=name,
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, kwargs=kwargs: torch_call(a_t, b_t, **kwargs),
+                    run_c=lambda a_c=a_c, b_c=b_c, kwargs=kwargs: c_module._aten_dispatch(op, a_c, b_c, **kwargs),
+                )
+            )
+
+    return cases
+
+
+# --- aten.mul.Tensor / aten.div.Tensor -------------------------------------
+# `__mul__`/`__truediv__` -- same probe result as sub: `.Tensor` overload
+# even for a Python-scalar RHS, no `.Scalar` overload reachable from these
+# dunders.
+
+_MUL_DIV_FLOAT_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_MUL_DIV_INT_DTYPES = ["int64", "int32", "int16"]
+_MUL_MAGNITUDE = {
+    "float64": 1e3,
+    "float32": 1e3,
+    "float16": 10.0,
+    "bfloat16": 100.0,
+    "int64": 1000,
+    "int32": 100,
+    "int16": 50,
+}
+
+
+def mul_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mul.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES + _MUL_DIV_INT_DTYPES:
+        big = _MUL_MAGNITUDE[dtype_name]
+        for sc in _ELEMENTWISE_SCENARIOS + [_elementwise_boundary_scenario(big)]:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    # uint8 wraparound -- both sides should wrap identically (modular
+    # arithmetic), same precedent as add_cases' uint8 wraparound case.
+    cases.append(
+        _binary_tensor_case(
+            torch_module, c_module, op, torch_call, "uint8",
+            [200, 200], (2,), [100, 2], (2,), "uint8 overflow wraps (both sides modular)",
+        )
+    )
+    return cases
+
+
+def div_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.div.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES + _MUL_DIV_INT_DTYPES:
+        for sc in _ELEMENTWISE_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    # Division by zero: `div.Tensor` is always true division (confirmed by
+    # probe -- it never does integer floor division, even for integer
+    # inputs, and promotes to a floating dtype), and IEEE-754 makes 0
+    # division well-defined (inf/-inf/nan) rather than an error. Both sides
+    # are expected to *compute* the same pattern, not refuse.
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1.0, -1.0, 0.0, 5.0], (2, 2), [0.0, 0.0, 0.0, 2.0], (2, 2),
+                "division by zero -> inf/-inf/nan, not an error",
+            )
+        )
+    return cases
+
+
+# --- aten.bitwise_and.{Tensor,Scalar} / aten.bitwise_or.{Tensor,Scalar} ----
+# `__and__`/`__or__` -- probe confirmed these *do* keep a Python scalar as a
+# Scalar (unlike the arithmetic dunders above), so both overloads are
+# reachable and both get builders.
+#
+# **No `dtype=bool` scenario here (or in bitwise_not/select/slice/clone/
+# local_scalar_dense/any below).** `_C`'s own `_tensor_from_flat` refuses to
+# construct a bool tensor directly (found while smoke-testing these
+# builders against real torch): `NotImplementedError: _tensor_from_flat:
+# torch.bool is not accepted here -- a bool tensor must come from an op
+# that guarantees 0/1 bytes (BOOL.md §6.3)`. That refusal happens at
+# case-*list*-construction time (`cases = builder(...)` in compare.py's
+# `run()`), which is not wrapped in a try/except the way a single case's
+# run_torch/run_c is -- so an eager `pair_from_flat(..., "bool")` call in a
+# module-level scope here would crash the *entire* harness run the moment
+# this op lands in `_aten_implemented()`, not just fail one case. Real,
+# attention-mask-flavoured bool coverage is still int-dtype-representative
+# via `_BITWISE_INT_DTYPES` (bitwise ops are defined identically on bool
+# and integer types), so nothing is silently lost by leaving bool out here.
+# `masked_fill_cases` and `index_tensor_cases` below need an actual bool
+# mask (schema-mandated), so those defer construction into the run_torch/
+# run_c lambdas instead of dropping it -- see their module notes.
+
+_BITWISE_INT_DTYPES = ["int64", "int32", "int16", "uint8"]
+
+
+def bitwise_and_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bitwise_and.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [0b1100, 0b1010, 0b1111, 0], (2, 2), [0b1010, 0b0110, 0b0000, 0b1111], (2, 2), "elementwise AND",
+            )
+        )
+    return cases
+
+
+def bitwise_and_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bitwise_and.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [0b1100, 0b1010, 0b1111, 0], (2, 2), 0b1010, "x & 0b1010",
+            )
+        )
+    return cases
+
+
+def bitwise_or_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bitwise_or.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [0b1100, 0b1010, 0b0000, 0], (2, 2), [0b0010, 0b0100, 0b1111, 0b0001], (2, 2), "elementwise OR",
+            )
+        )
+    return cases
+
+
+def bitwise_or_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bitwise_or.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [0b1100, 0b1010, 0b0000, 0], (2, 2), 0b0001, "x | 0b0001",
+            )
+        )
+    return cases
+
+
+# --- aten.bitwise_not.default -----------------------------------------------
+# `__invert__`. See the bool-construction note above bitwise_and_tensor_cases.
+
+_BITWISE_NOT_SIGNED = [0, -1, 5, -5]
+_BITWISE_NOT_UNSIGNED = [0, 1, 5, 250]
+
+
+def bitwise_not_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bitwise_not.default"
+    cases: list[Case] = []
+    for dtype_name in ["int64", "int32", "int16"]:
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, _BITWISE_NOT_SIGNED, (2, 2), "bitwise not, signed"))
+    cases.append(_unary_case(torch_module, c_module, op, torch_call, "uint8", _BITWISE_NOT_UNSIGNED, (2, 2), "bitwise not, unsigned"))
+    return cases
+
+
+# --- aten.eq.{Tensor,Scalar} / aten.lt.{Tensor,Scalar} / aten.ne.{Tensor,Scalar} --
+# `__eq__`, `__lt__`, `ne` -- probe confirmed Scalar-overload comparisons
+# keep the Python scalar as a Scalar (same family as bitwise_and/or above).
+
+_CMP_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32", "int16", "uint8"]
+_CMP_SCENARIOS: list[dict] = [
+    dict(a_flat=[1, 2, 3, 4], a_shape=(2, 2), b_flat=[1, 5, 3, 0], b_shape=(2, 2), note="mixed equal/unequal"),
+    dict(a_flat=[7], a_shape=(), b_flat=[1, 7, 3, 4], b_shape=(2, 2), note="scalar (0-d) broadcast"),
+]
+
+
+def eq_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.eq.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    return cases
+
+
+def eq_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.eq.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3, "x == 3, as reached from __eq__ with a python scalar",
+            )
+        )
+    return cases
+
+
+def lt_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.lt.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    return cases
+
+
+def lt_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.lt.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3, "x < 3, as reached from __lt__ with a python scalar",
+            )
+        )
+    return cases
+
+
+def ne_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.ne.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    return cases
+
+
+def ne_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.ne.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3, "x.ne(3) -- attention-mask padding check style",
+            )
+        )
+    return cases
+
+
+# --- aten._local_scalar_dense.default ---------------------------------------
+# `__bool__` -- probe: `bool(tensor)` dispatches straight to
+# `_local_scalar_dense` for an already-0-d tensor (no `lift_fresh` involved
+# once the tensor exists). Returns a plain Python scalar, not a Tensor, so
+# this reuses `_scalar_match_check` like `is_floating_point_cases` above.
+
+_LOCAL_SCALAR_DENSE_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32", "int16", "uint8"]
+
+
+def local_scalar_dense_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._local_scalar_dense.default"
+    cases: list[Case] = []
+    for dtype_name in _LOCAL_SCALAR_DENSE_DTYPES:
+        for value, note in [(0, "falsy scalar -- backs bool(x)"), (1, "truthy scalar -- backs bool(x)")]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [value], (), dtype_name)
+            cases.append(
+                Case(
+                    name=f"_local_scalar_dense(dtype={dtype_name}, value={value})",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                    value_check=_scalar_match_check,
+                    note=note + " -- returns a plain Python scalar, not a Tensor; backs __bool__ extraction",
+                )
+            )
+    return cases
+
+
+# --- aten.select.int / aten.slice.Tensor / aten.index.Tensor ---------------
+# `__getitem__` -- probe found three distinct overloads depending on the
+# index expression's shape: an int index -> select.int, a slice -> slice.
+# Tensor, a tensor/bool-mask index -> index.Tensor (via a Tensor?[] list of
+# indices). All three are given builders since real code hits all three
+# forms.
+
+_SELECT_DTYPES = ["float64", "float32", "int64", "int32", "uint8"]
+
+
+def select_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.select.int"
+    cases: list[Case] = []
+    for dtype_name in _SELECT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"select(dtype={dtype_name}, dim=0, index=1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0, 1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, 1),
+                note="x[1] -- first-axis row selection",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"select(dtype={dtype_name}, dim=-1, index=-1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, -1, -1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -1, -1),
+                note="negative dim and index",
+            )
+        )
+    return cases
+
+
+def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.slice.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _SELECT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6, 7, 8], (2, 4), dtype_name)
+        cases.append(
+            Case(
+                name=f"slice(dtype={dtype_name}, dim=1, start=1, end=3, step=1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 1, 1, 3, 1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, 1, 3, 1),
+                note="x[:, 1:3] -- last-axis slicing",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"slice(dtype={dtype_name}, dim=1, start=None, end=None, step=1) [identity]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 1, None, None, 1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, None, None, 1),
+                note="x[:, :] -- identity slice",
+            )
+        )
+    return cases
+
+
+def index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.index.Tensor"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        idx_t, idx_c = pair_from_flat(torch_module, c_module, [0, 1], (2,), "int64")
+        cases.append(
+            Case(
+                name=f"index(dtype={dtype_name}, integer index tensor)",
+                op=op,
+                run_torch=lambda a_t=a_t, idx_t=idx_t: torch_call(a_t, [idx_t]),
+                run_c=lambda a_c=a_c, idx_c=idx_c: c_module._aten_dispatch(op, a_c, [idx_c]),
+                note="x[idx_tensor] -- advanced (fancy) indexing",
+            )
+        )
+        # Boolean-mask indexing needs an actual bool tensor. `_C`'s
+        # `_tensor_from_flat` refuses to build one directly (BOOL.md §6.3,
+        # see the note above bitwise_and_tensor_cases) and no other
+        # bool-producing op is implemented yet either, so construction is
+        # deferred into each lambda -- run_c's failure is then caught by
+        # compare.py's normal per-case try/except instead of crashing the
+        # whole harness run at case-list-build time.
+        a_flat, a_shape = [1, 2, 3, 4, 5, 6], (2, 3)
+        mask_flat = [True, False, True, False, True, False]
+        cases.append(
+            Case(
+                name=f"index(dtype={dtype_name}, boolean mask)",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name, a_flat=a_flat, a_shape=a_shape, mask_flat=mask_flat: torch_call(
+                    torch_module.tensor(a_flat, dtype=dt.torch_dtype(torch_module, dtype_name)).reshape(list(a_shape)),
+                    [torch_module.tensor(mask_flat).reshape(list(a_shape))],
+                ),
+                run_c=lambda dtype_name=dtype_name, a_flat=a_flat, a_shape=a_shape, mask_flat=mask_flat: c_module._aten_dispatch(
+                    op,
+                    c_module._tensor_from_flat(a_flat, list(a_shape), dtype=dt.c_dtype(c_module, dtype_name)),
+                    [c_module._tensor_from_flat([int(v) for v in mask_flat], list(a_shape), dtype=c_module.bool)],
+                ),
+                note="x[bool_mask] -- boolean mask indexing, as in attention masking",
+            )
+        )
+    return cases
+
+
+# --- aten.any.default / aten.any.dim ----------------------------------------
+# `any` -- probed on int input (`torch.any` treats any nonzero element as
+# true regardless of dtype), avoiding the bool-construction constraint
+# noted above bitwise_and_tensor_cases entirely rather than working around
+# it, since int input exercises the real op just as well.
+
+def any_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.any.default"
+    cases: list[Case] = []
+    for flat, shape, note in [
+        ([1, 0, 1, 0], (2, 2), "some true"),
+        ([0, 0, 0, 0], (2, 2), "all false"),
+        ([1, 1, 1, 1], (2, 2), "all true"),
+    ]:
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, "int64", flat, shape, note))
+    return cases
+
+
+def any_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.any.dim"
+    cases: list[Case] = []
+    scenarios = [
+        dict(flat=[1, 0, 0, 0, 1, 1], shape=(2, 3), dim=1, keepdim=False, note="along last dim"),
+        dict(flat=[1, 0, 0, 0, 1, 1], shape=(2, 3), dim=1, keepdim=True, note="along last dim, keepdim"),
+        dict(flat=[1, 0, 0, 0, 1, 1], shape=(2, 3), dim=0, keepdim=False, note="along first dim"),
+    ]
+    for sc in scenarios:
+        a_t, a_c = pair_from_flat(torch_module, c_module, sc["flat"], sc["shape"], "int64")
+        dim, keepdim = sc["dim"], sc["keepdim"]
+        cases.append(
+            Case(
+                name=f"any(dtype=int64, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
+                note=sc["note"],
+            )
+        )
+    return cases
+
+
+# --- aten.clone.default / aten.detach.default -------------------------------
+# `clone` (also backs `contiguous()` on a non-contiguous input, see the
+# module note above) and `detach` (identity view, drops autograd tracking).
+
+
+def clone_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.clone.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        for flat, shape in [([0], ()), ([1, 2, 3], (3,)), ([1, 2, 3, 4], (2, 2))]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name, flat, shape,
+                    "identity copy -- also backs contiguous() on a non-contiguous input",
+                )
+            )
+    return cases
+
+
+def detach_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.detach.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        for flat, shape in [([0], ()), ([1, 2, 3, 4], (2, 2))]:
+            cases.append(
+                _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, "identity view, drops autograd tracking")
+            )
+    return cases
+
+
+# --- aten.cos.default / aten.sin.default / aten.reciprocal.default ---------
+# RoPE (cos/sin) and RMSNorm (reciprocal, alongside pow/mean above) inputs.
+
+_TRIG_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_TRIG_SCENARIOS = [
+    ([0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966], (2, 2), "0/pi-over-2/pi/-pi-over-2 -- RoPE angle boundary values"),
+    ([0.1, 0.5, 1.0, 2.0], (2, 2), "assorted angles"),
+    ([0.0], (), "0-d"),
+]
+
+
+def cos_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.cos.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, note in _TRIG_SCENARIOS:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+def sin_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sin.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, note in _TRIG_SCENARIOS:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+def reciprocal_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.reciprocal.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, note in [
+            ([1.0, 2.0, 4.0, 0.5], (2, 2), "assorted magnitudes"),
+            ([0.0], (1,), "zero -> +inf"),
+            ([-1.0, -4.0], (2,), "negative values"),
+            ([2.0], (), "0-d"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+# --- aten.cumsum.default -----------------------------------------------------
+
+def cumsum_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.cumsum.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"cumsum(dtype={dtype_name}, dim=0)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                note="running total along first dim",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"cumsum(dtype={dtype_name}, dim=-1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, -1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -1),
+                note="running total along last dim, negative dim",
+            )
+        )
+    return cases
+
+
+# --- aten.expand.default -----------------------------------------------------
+
+def expand_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.expand.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2], (2, 1), dtype_name)
+        cases.append(
+            Case(
+                name=f"expand(dtype={dtype_name}, (2,1)->(2,3))",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, 3]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, 3]),
+                note="broadcast a singleton dim, as in expanding a KV head across query heads",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"expand(dtype={dtype_name}, (2,1)->(2,-1)) [keep-dim sentinel]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, -1]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, -1]),
+                note="-1 means 'keep this dim's existing size'",
+            )
+        )
+    a3_t, a3_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="expand(non-singleton dim rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(a3_t, [2, 5]),
+            run_c=lambda: c_module._aten_dispatch(op, a3_c, [2, 5]),
+            expect="both_error",
+            note="expand can only broadcast size-1 dims.",
+        )
+    )
+    return cases
+
+
+# --- aten.masked_fill.Scalar --------------------------------------------------
+
+def masked_fill_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.masked_fill.Scalar"
+    cases: list[Case] = []
+    # `mask` must be an actual bool tensor -- torch's own masked_fill_
+    # refuses a non-bool mask (probed: "masked_fill_ only supports boolean
+    # masks"). `_C`'s `_tensor_from_flat` refuses to build a bool tensor
+    # directly (BOOL.md §6.3, see the note above bitwise_and_tensor_cases),
+    # and there is no other sanctioned way to get a bool tensor into `_C`
+    # either, so -- unlike the ops above that could just drop bool coverage
+    # -- masked_fill genuinely cannot be exercised yet. Mask construction is
+    # deferred into the run_torch/run_c lambdas (built fresh each call,
+    # rather than shared like every other case here) so that, until BOOL.md's
+    # gap is closed, this surfaces as an ordinary per-case failure the
+    # moment masked_fill lands in `_aten_implemented()` -- not a hard crash
+    # of the whole harness run at case-list-construction time.
+    a_flat, a_shape = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3)
+    mask_flat = [True, False, True, False, True, False]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        big = _FLOAT_ADD_MAGNITUDE[dtype_name]
+        for value, note in [(0.0, "zero fill"), (-big, "large negative -- attention masking style")]:
+            cases.append(
+                Case(
+                    name=f"masked_fill(dtype={dtype_name}, value={value}) [{note}]",
+                    op=op,
+                    run_torch=lambda dtype_name=dtype_name, value=value: torch_call(
+                        torch_module.tensor(a_flat, dtype=dt.torch_dtype(torch_module, dtype_name)).reshape(list(a_shape)),
+                        torch_module.tensor(mask_flat).reshape(list(a_shape)),
+                        value,
+                    ),
+                    run_c=lambda dtype_name=dtype_name, value=value: c_module._aten_dispatch(
+                        op,
+                        c_module._tensor_from_flat(a_flat, list(a_shape), dtype=dt.c_dtype(c_module, dtype_name)),
+                        c_module._tensor_from_flat([int(v) for v in mask_flat], list(a_shape), dtype=c_module.bool),
+                        value,
+                    ),
+                    note=note,
+                )
+            )
+    return cases
+
+
+# --- aten.max.default / aten.max.dim -----------------------------------------
+# `max.dim` returns a (values, indices) pair (torch: a `torch.return_types.
+# max` namedtuple, 2-tuple-indexable) -- see `_pair_result_check` below.
+
+_REDUCE_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
+
+
+def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.max.default"
+    cases: list[Case] = []
+    for dtype_name in _REDUCE_DTYPES:
+        for flat, shape, note in [
+            ([1, 5, 2, 9, 0, 3], (2, 3), "global max, flattened"),
+            ([-5, -1, -9, -3], (2, 2), "all-negative values"),
+            ([7], (1,), "single element"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
+    """For ops returning a (values, indices) pair, like `max.dim` -- torch
+    returns a `torch.return_types.max` namedtuple, indexable like a plain
+    2-tuple. `values` is compared like any tensor result (dtype/shape/value
+    within tolerance); `indices` must match exactly (integer positions)."""
+    try:
+        t_values, t_indices = t_res[0], t_res[1]
+        c_values, c_indices = c_res[0], c_res[1]
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (values, indices) result on both sides: {e!r}"
+
+    t_dtype, c_dtype = dt.dtype_name(t_values.dtype), dt.dtype_name(c_values.dtype)
+    if t_dtype != c_dtype:
+        return False, f"values dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_shape = tuple(int(x) for x in t_values.shape)
+    c_shape = tuple(int(x) for x in c_values.shape)
+    if t_shape != c_shape:
+        return False, f"values shape mismatch: torch={t_shape} c={c_shape}"
+
+    tol = dt.tolerance_for(t_dtype)
+    t_flat, c_flat = _flatten_values(t_values.tolist()), _flatten_values(c_values.tolist())
+    if len(t_flat) != len(c_flat):
+        return False, f"values length differs: torch={len(t_flat)} c={len(c_flat)}"
+    for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+        if not math.isclose(float(x), float(y), rel_tol=tol.rtol, abs_tol=tol.atol):
+            return False, f"values[{i}] mismatch: torch={x!r} c={y!r}"
+
+    t_idx_shape = tuple(int(x) for x in t_indices.shape)
+    c_idx_shape = tuple(int(x) for x in c_indices.shape)
+    if t_idx_shape != c_idx_shape:
+        return False, f"indices shape mismatch: torch={t_idx_shape} c={c_idx_shape}"
+    t_idx_flat, c_idx_flat = _flatten_values(t_indices.tolist()), _flatten_values(c_indices.tolist())
+    if t_idx_flat != c_idx_flat:
+        return False, f"indices mismatch: torch={t_idx_flat!r} c={c_idx_flat!r}"
+    return True, f"values dtype={t_dtype} shape={t_shape}, indices matched exactly"
+
+
+def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.max.dim"
+    cases: list[Case] = []
+    # Flat values chosen so the maximum is unique in every reduced slice --
+    # ties are implementation-defined, same reasoning as argmax_cases above.
+    scenarios = [
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=1, keepdim=False, note="along last dim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=1, keepdim=True, note="along last dim, keepdim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=0, keepdim=False, note="along first dim"),
+        dict(flat=[-5, -1, -9, -3], shape=(2, 2), dim=1, keepdim=False, note="all-negative values"),
+    ]
+    for dtype_name in _REDUCE_DTYPES:
+        for sc in scenarios:
+            a_t, a_c = pair_from_flat(torch_module, c_module, sc["flat"], sc["shape"], dtype_name)
+            dim, keepdim = sc["dim"], sc["keepdim"]
+            cases.append(
+                Case(
+                    name=f"max(dtype={dtype_name}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                    run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
+                    value_check=_pair_result_check,
+                    note=sc["note"] + " -- returns (values, indices), see _pair_result_check",
+                )
+            )
+    return cases
+
+
+# --- aten.mean.default / aten.mean.dim / aten.sum.default / aten.sum.dim_IntList --
+
+def mean_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mean.default"
+    cases: list[Case] = []
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        for flat, shape, note in [
+            ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), "global mean, flattened"),
+            ([-2.0, 2.0], (2,), "symmetric around zero -> 0"),
+            ([5.0], (), "0-d"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+def mean_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mean.dim"
+    cases: list[Case] = []
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), dtype_name)
+        for dim, keepdim, note in [
+            ([-1], True, "RMSNorm-style: reduce last dim, keepdim"),
+            ([0], False, "reduce first dim"),
+            (None, False, "dim=None -- reduce all"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"mean(dtype={dtype_name}, dim={dim}, keepdim={keepdim}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                    run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
+                    note=note,
+                )
+            )
+    return cases
+
+
+def sum_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sum.default"
+    cases: list[Case] = []
+    for dtype_name in _REDUCE_DTYPES:
+        for flat, shape, note in [
+            ([1, 2, 3, 4, 5, 6], (2, 3), "global sum, flattened"),
+            ([-2, 2], (2,), "cancelling values -> 0"),
+            ([7], (), "0-d"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    return cases
+
+
+def sum_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sum.dim_IntList"
+    cases: list[Case] = []
+    for dtype_name in _REDUCE_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        for dim, keepdim, note in [
+            ([-1], True, "reduce last dim, keepdim"),
+            ([0], False, "reduce first dim"),
+            (None, False, "dim=None -- reduce all"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"sum(dtype={dtype_name}, dim={dim}, keepdim={keepdim}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                    run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
+                    note=note,
+                )
+            )
+    return cases
+
+
+# --- aten.new_ones.default ----------------------------------------------------
+
+def new_ones_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.new_ones.default"
+    cases: list[Case] = []
+    for self_dtype in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), self_dtype)
+        cases.append(
+            Case(
+                name=f"new_ones(self_dtype={self_dtype}, shape=[2,3]) [dtype inherited from self]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, 3]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, 3]),
+                note="dtype inherited from the self tensor, not a default",
+            )
+        )
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"new_ones(self_dtype=float32, shape=[2,2], dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, [2, 2], dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, [2, 2], dtype=c_dt),
+                note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    return cases
+
+
+# --- aten.transpose.int / aten.unsqueeze.default / aten.view.default -------
+
+def transpose_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.transpose.int"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"transpose(dtype={dtype_name}, dim0=0, dim1=1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0, 1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, 1),
+                note="swap the two axes of a 2D tensor",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"transpose(dtype={dtype_name}, dim0=-2, dim1=-1)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, -2, -1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -2, -1),
+                note="negative dims, as in attention's q @ k.transpose(-2, -1)",
+            )
+        )
+    return cases
+
+
+def unsqueeze_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.unsqueeze.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (4,), dtype_name)
+        for dim, note in [(0, "prepend a new axis"), (-1, "append a new axis (negative dim)"), (1, "insert in the middle")]:
+            cases.append(
+                Case(
+                    name=f"unsqueeze(dtype={dtype_name}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                    run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                    note=note,
+                )
+            )
+    return cases
+
+
+def view_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.view.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"view(dtype={dtype_name}, (2,3)->(6,)) [also backs reshape() on a contiguous input]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [6]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [6]),
+                note=(
+                    "flatten -- reshape()'s non-contiguous fallback (clone + "
+                    "_unsafe_view) is a different op pair, outside this harness's "
+                    "per-op comparison granularity; see the module note above."
+                ),
+            )
+        )
+        cases.append(
+            Case(
+                name=f"view(dtype={dtype_name}, (2,3)->(3,2))",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [3, 2]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [3, 2]),
+                note="reshape to a different rank-2 shape",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"view(dtype={dtype_name}, (2,3)->(-1,)) [inferred dim]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [-1]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [-1]),
+                note="-1 means 'infer this dim's size'",
+            )
+        )
+    return cases
+
+
+# --- aten._to_copy.default ----------------------------------------------------
+# `float()`, `long()`, `to(dtype)` all dispatch to the same cast op.
+
+def to_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._to_copy.default"
+    cases: list[Case] = []
+    conversions = [
+        ("int64", "float32", "backs .float()"),
+        ("float32", "int64", "backs .long()"),
+        ("float32", "float64", "backs .to(dtype) upcast"),
+        ("float64", "float32", "backs .to(dtype) downcast"),
+        ("float32", "float16", "backs .to(dtype), precision loss"),
+        ("int32", "int64", "backs .to(dtype), int widening"),
+        ("uint8", "float32", "backs .to(dtype), unsigned to float"),
+    ]
+    for src_dtype, dst_dtype, note in conversions:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1, 2, 3], (2, 2), src_dtype)
+        t_dt = dt.torch_dtype(torch_module, dst_dtype)
+        c_dt = dt.c_dtype(c_module, dst_dtype)
+        cases.append(
+            Case(
+                name=f"_to_copy({src_dtype} -> {dst_dtype}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
+                note=note,
+            )
+        )
+    return cases
+
+
+# --- in-place methods: aten.fill_.Scalar / aten.copy_.default / -------------
+# aten.normal_.default / aten.uniform_.default
+#
+# See the module note above on why in-place cases build a fresh operand
+# pair per case rather than sharing one across cases.
+
+def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.fill_.Scalar"
+    cases: list[Case] = []
+    # Reuses the fill-value/boundary table from full_cases above for
+    # dtype/boundary coverage parity between "construct filled" (full) and
+    # "fill in place" (fill_) -- including its two live regression traps
+    # (the float16-overflow and int32-overflow entries). Those are still
+    # `expect="match"` in the table itself (never `"c_error"`, per
+    # full_cases' own docstring), and a probe against real torch confirmed
+    # `fill_.Scalar` refuses the same overflowing values `full.default`
+    # does (`RuntimeError: value cannot be converted to type ... without
+    # overflow`) -- so the same trap applies here unchanged: this stays
+    # `expect="match"` and will only fail if `_C`'s eventual fill_ silently
+    # computes instead of refusing, exactly like the original trap's intent.
+    # `expect != "match"` guards against `_FULL_FILLS` growing a non-match
+    # entry later; it is a no-op today since every current entry is "match".
+    for dtype_name in dt.DEFAULT_DTYPES:
+        for fill, expect, note in _FULL_FILLS[dtype_name]:
+            if expect != "match":
+                continue
+            a_t, a_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
+            cases.append(
+                Case(
+                    name=f"fill_(dtype={dtype_name}, value={fill!r})",
+                    op=op,
+                    run_torch=lambda a_t=a_t, fill=fill: torch_call(a_t, fill),
+                    run_c=lambda a_c=a_c, fill=fill: c_module._aten_dispatch(op, a_c, fill),
+                    note=(note or "in-place fill") + " -- compares the mutated operand fill_ returns",
+                )
+            )
+    return cases
+
+
+def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.copy_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"copy_(dtype={dtype_name}, same shape)",
+                op=op,
+                run_torch=lambda dst_t=dst_t, src_t=src_t: torch_call(dst_t, src_t),
+                run_c=lambda dst_c=dst_c, src_c=src_c: c_module._aten_dispatch(op, dst_c, src_c),
+                note="in-place: compares the mutated dst operand copy_ returns",
+            )
+        )
+    dst2_t, dst2_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), "float32")
+    src2_t, src2_c = pair_from_flat(torch_module, c_module, [9, 8], (1, 2), "float32")
+    cases.append(
+        Case(
+            name="copy_(dtype=float32, broadcast src)",
+            op=op,
+            run_torch=lambda: torch_call(dst2_t, src2_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst2_c, src2_c),
+            note="src (1,2) broadcasts to fill dst (2,2) in place",
+        )
+    )
+    return cases
+
+
+def normal__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.normal_.default"
+    cases: list[Case] = []
+    # Random draw: like randint_low_cases above, the *sequence* of two
+    # independent RNG implementations can never be made to match, even with
+    # "the same" seed -- a seed pins one generator's stream, not another's
+    # algorithm. Unlike uniform_ below, a Gaussian draw has no hard value
+    # bound either (mean/std describe a distribution, not a range), so
+    # there is no meaningful value_check beyond dtype/shape -- reusing
+    # `_dtype_shape_only_check` (same one `empty_cases` uses for
+    # uninitialized memory, for the same underlying reason: no single
+    # "correct" value exists to diff against).
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        for mean, std, note in [(0.0, 1.0, "standard normal -- typical init"), (0.0, 0.02, "small std, transformer-init style")]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), dtype_name)
+            cases.append(
+                Case(
+                    name=f"normal_(dtype={dtype_name}, mean={mean}, std={std}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, mean=mean, std=std: torch_call(a_t, mean, std),
+                    run_c=lambda a_c=a_c, mean=mean, std=std: c_module._aten_dispatch(op, a_c, mean, std),
+                    value_check=_dtype_shape_only_check,
+                    note=(
+                        note + " -- random draw, sequence unchecked (see module note above); "
+                        "no hard value bound either, so only dtype/shape are meaningful"
+                    ),
+                )
+            )
+    return cases
+
+
+def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.uniform_.default"
+    cases: list[Case] = []
+    # Random draw with a hard [from, to) bound -- unlike normal_ above, this
+    # one can reuse the same range-check idea as randint_low_cases (the
+    # sequence still can't be synchronized across two independent RNGs, but
+    # every value is provably confined to [from, to)).
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        for lo, hi, note in [(0.0, 1.0, "default range"), (-1.0, 1.0, "range straddling zero")]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), dtype_name)
+            cases.append(
+                Case(
+                    name=f"uniform_(dtype={dtype_name}, from={lo}, to={hi}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, lo=lo, hi=hi: torch_call(a_t, lo, hi),
+                    run_c=lambda a_c=a_c, lo=lo, hi=hi: c_module._aten_dispatch(op, a_c, lo, hi),
+                    value_check=_range_check(lo, hi),
+                    note=note + " -- random draw, sequence unchecked (see module note above)",
+                )
+            )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -1271,4 +2495,49 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.randint.low": randint_low_cases,
     "aten.rsqrt.default": rsqrt_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
+    # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
+    # members (docs/C_SURFACE.md §4) -- see the longer module note above.
+    "aten.sub.Tensor": sub_cases,
+    "aten.mul.Tensor": mul_cases,
+    "aten.div.Tensor": div_cases,
+    "aten.bitwise_and.Tensor": bitwise_and_tensor_cases,
+    "aten.bitwise_and.Scalar": bitwise_and_scalar_cases,
+    "aten.bitwise_or.Tensor": bitwise_or_tensor_cases,
+    "aten.bitwise_or.Scalar": bitwise_or_scalar_cases,
+    "aten.bitwise_not.default": bitwise_not_cases,
+    "aten.eq.Tensor": eq_tensor_cases,
+    "aten.eq.Scalar": eq_scalar_cases,
+    "aten.lt.Tensor": lt_tensor_cases,
+    "aten.lt.Scalar": lt_scalar_cases,
+    "aten.ne.Tensor": ne_tensor_cases,
+    "aten.ne.Scalar": ne_scalar_cases,
+    "aten._local_scalar_dense.default": local_scalar_dense_cases,
+    "aten.select.int": select_cases,
+    "aten.slice.Tensor": slice_cases,
+    "aten.index.Tensor": index_tensor_cases,
+    "aten.any.default": any_default_cases,
+    "aten.any.dim": any_dim_cases,
+    "aten.clone.default": clone_cases,
+    "aten.detach.default": detach_cases,
+    "aten.cos.default": cos_cases,
+    "aten.sin.default": sin_cases,
+    "aten.reciprocal.default": reciprocal_cases,
+    "aten.cumsum.default": cumsum_cases,
+    "aten.expand.default": expand_cases,
+    "aten.masked_fill.Scalar": masked_fill_cases,
+    "aten.max.default": max_default_cases,
+    "aten.max.dim": max_dim_cases,
+    "aten.mean.default": mean_default_cases,
+    "aten.mean.dim": mean_dim_cases,
+    "aten.sum.default": sum_default_cases,
+    "aten.sum.dim_IntList": sum_dim_cases,
+    "aten.new_ones.default": new_ones_cases,
+    "aten.transpose.int": transpose_cases,
+    "aten.unsqueeze.default": unsqueeze_cases,
+    "aten.view.default": view_cases,
+    "aten._to_copy.default": to_copy_cases,
+    "aten.fill_.Scalar": fill__cases,
+    "aten.copy_.default": copy__cases,
+    "aten.normal_.default": normal__cases,
+    "aten.uniform_.default": uniform__cases,
 }
