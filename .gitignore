@@ -172,3 +172,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Rust: build output lives in CARGO_TARGET_DIR on the external volume
+/rust/*/target/
+
+# Vendored upstream trees (docs/VENDOR.md). The torch Python tree alone is
+# ~1084 modules; it is reproduced by vendor/vendor_torch.sh, never committed.
+/vendor/torch/
+/vendor/torch-*.dist-info/
+/vendor/.stamp
+/vendor/probe/

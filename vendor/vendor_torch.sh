@@ -1,0 +1,87 @@
+#!/bin/sh
+# Vendor the upstream PyTorch *Python* tree, and nothing else.
+#
+# DESIGN.md §2 is the bet this script exists to test: "파이썬 계층은 벤더링하고
+# `_C` 만 교체한다". That sentence is only meaningful if the vendored tree has
+# exactly one hole in it, so the copy is defined by what it *drops*:
+#
+#   torch/lib/         353 MB of libtorch/libc10 dylibs -- the native runtime
+#   torch/include/      61 MB of C++ headers, build inputs only
+#   torch/bin/           7 MB of host tools
+#   torch/test/          upstream's own test binaries
+#   *.so *.dylib *.a     every compiled artefact anywhere in the tree
+#
+# In torch 2.13.0 that last line removes exactly one file from the Python tree:
+# `_C.cpython-313-darwin.so`. Everything else under `torch/` is Python source.
+# That is the measurement, not an assumption -- `find` it yourself if in doubt.
+#
+# The result is a torch that cannot import until `install_shim.sh` puts our
+# `_C` in the hole, which is the property we want: if the tree could import
+# without it, the experiment would be proving nothing.
+#
+# The tree is NOT committed (see /.gitignore). It is ~1084 modules and tens of
+# megabytes of third-party source; this script is the reproduction.
+set -eu
+
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+dest=${BRAINWAVE_VENDOR_DIR:-$repo/vendor}
+
+# The spike venv that IMPORT_WALLS 3차/5차 measured against. Override to vendor
+# from a different upstream; the stamp records which one was used.
+src=${BRAINWAVE_TORCH_SRC:-/Volumes/macMini/caches/spike-venv/lib/python3.13/site-packages}
+
+if [ ! -d "$src/torch" ]; then
+    echo "no torch under $src -- set BRAINWAVE_TORCH_SRC" >&2
+    exit 1
+fi
+
+version=$(sed -n "s/^__version__ = '\\(.*\\)'/\\1/p" "$src/torch/version.py")
+if [ -z "$version" ]; then
+    echo "could not read __version__ from $src/torch/version.py" >&2
+    exit 1
+fi
+
+echo "vendoring torch $version"
+echo "  from $src"
+echo "  into $dest"
+
+mkdir -p "$dest"
+rm -rf "$dest/torch" "$dest"/torch-*.dist-info
+
+rsync -a \
+    --exclude '/lib/' \
+    --exclude '/include/' \
+    --exclude '/bin/' \
+    --exclude '/test/' \
+    --exclude '__pycache__/' \
+    --exclude '*.so' \
+    --exclude '*.dylib' \
+    --exclude '*.dll' \
+    --exclude '*.pyd' \
+    --exclude '*.a' \
+    --exclude '*.lib' \
+    "$src/torch/" "$dest/torch/"
+
+# IMPORT_WALLS 1차 §"관문은 is_torch_available() 하나다": transformers gates on
+# `importlib.metadata.version("torch") >= 2.5.0`, so the distribution metadata is
+# load-bearing, not decoration. Copying upstream's dist-info makes the vendored
+# tree declare the version it actually came from.
+if [ -d "$src/torch-$version.dist-info" ]; then
+    rsync -a --exclude 'RECORD' --exclude '__pycache__/' \
+        "$src/torch-$version.dist-info/" "$dest/torch-$version.dist-info/"
+else
+    echo "  warning: no torch-$version.dist-info in $src -- is_torch_available() will fail" >&2
+fi
+
+# What is left behind, so a later reader does not have to re-derive it.
+{
+    echo "source=$src"
+    echo "version=$version"
+    echo "vendored_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "py_modules=$(find "$dest/torch" -name '*.py' | wc -l | tr -d ' ')"
+    echo "native_left=$(find "$dest/torch" \( -name '*.so' -o -name '*.dylib' \) | wc -l | tr -d ' ')"
+} > "$dest/.stamp"
+
+cat "$dest/.stamp"
+echo
+echo "next: vendor/install_shim.sh"

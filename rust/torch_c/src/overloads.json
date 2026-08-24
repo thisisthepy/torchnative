@@ -1,0 +1,278 @@
+{
+  "_README": [
+    "Overload resolution table for `torch.<op>(...)`.",
+    "",
+    "Each key is a name `torch/__init__.py` hoists off `_C._VariableFunctions`.",
+    "Each value is the ordered list of aten schemas that torch's *Python*",
+    "binding exposes under that name -- not every aten overload of that name.",
+    "The distinction is load-bearing: `aten::pow` has fifteen overloads, of",
+    "which eleven (`pow.int`, `pow.float_complex`, `pow.Scalar_Scalar`, ...)",
+    "are TorchScript numeric builtins that `torch.pow` will not accept, and",
+    "listing them would make `torch.pow(2, 3)` return a float where real torch",
+    "raises TypeError.",
+    "",
+    "ORDER IS THE ALGORITHM. The resolver takes the first schema that binds,",
+    "exactly as `PythonArgParser::raw_parse` does, so the order here is not",
+    "cosmetic. Two places where a plausible order is the wrong one, both",
+    "measured against torch 2.13.0 with a `TorchDispatchMode` logger rather",
+    "than reasoned about (docs/OVERLOAD.md §3):",
+    "",
+    "  * `.out` variants come first. They take `out` as a required kwarg-only",
+    "    argument, so they bind only when the caller passed `out=`, and putting",
+    "    them last would let the non-out schema swallow the call and drop the",
+    "    output tensor on the floor.",
+    "  * `arange.start` comes before `arange.start_step`, even though",
+    "    `start_step`'s `step=1` default makes it bind a two-argument call too.",
+    "    Real torch sends `torch.arange(0, 5)` to `arange.start`, and reversing",
+    "    these two would name the wrong key in the work queue.",
+    "",
+    "Provenance: the schema strings are `str(torch.ops.aten.<op>.<ov>._schema)`",
+    "from torch 2.13.0, transcribed here. Unlike `surface.json` this could not",
+    "come from the vendored tree -- see docs/OVERLOAD.md §2 for what the tree",
+    "does and does not carry -- so `pytests/verify_schemas.py` re-derives them",
+    "from upstream and diffs, which keeps the table from drifting silently.",
+    "That script needs real torch; the build does not.",
+    "",
+    "Notes on the entries docs/NN_SURFACE.md added, where the reason is not",
+    "self-evident:",
+    "",
+    "  * `where` -- `.self_out` first, per the `.out` rule above. The scalar",
+    "    mixes cannot shadow each other (`ScalarSelf` needs a scalar in the",
+    "    second slot, `ScalarOther` in the third), so their relative order is",
+    "    cosmetic, but it follows the vendored `.pyi` declaration order anyway.",
+    "    The bare `where(Tensor condition) -> Tensor[]` goes last: it is the",
+    "    `nonzero`-shaped overload and binds one argument, which nothing else",
+    "    does.",
+    "  * `bmm` carries `.dtype`/`.dtype_out` because the vendored",
+    "    `_VariableFunctions.pyi` really does expose an `out_dtype` parameter.",
+    "    Leaving them out would make `torch.bmm(a, b, out_dtype=...)` report",
+    "    'no matching overload' where upstream accepts it.",
+    "  * `rsub` is here rather than in `methods.json` because that is the route",
+    "    the vendored tree takes: `torch/_tensor.py:1108` spells `Tensor.",
+    "    __rsub__` as `_C._VariableFunctions.rsub(self, other)`. `1 - x` is",
+    "    measured 8 times in a Llama `generate` (docs/NN_SURFACE.md §3).",
+    "",
+    "Three names a model path calls are deliberately NOT here, because they",
+    "are `CompositeImplicitAutograd` upstream and an overload entry would",
+    "invent a kernel requirement upstream does not have: `linear`, `dropout`,",
+    "and `layer_norm`. All three are Python-level compositions in",
+    "`bootstrap.py` (`_install_nn`, `_install_composites`), and all three",
+    "still end at `_C._aten_dispatch`.",
+    "",
+    "`layer_norm` specifically: `torch.ops.aten.layer_norm.default` exists as",
+    "a schema, but a `TorchDispatchMode` logger on torch 2.13.0 never sees it",
+    "fire -- `F.layer_norm`, `torch.layer_norm` and `nn.LayerNorm` all bottom",
+    "out at `aten.native_layer_norm.default` only, because `layer_norm` is a",
+    "thin C++ wrapper that calls `native_layer_norm` and keeps the first of",
+    "its three results. Listing `aten::layer_norm(...)` here would resolve",
+    "correctly and then name a kernel this shim will never implement, where",
+    "the honest key is one it already has -- same shape of problem as",
+    "`methods.json`'s `softmax` note. `native_layer_norm` itself has no such",
+    "mismatch (it *is* the leaf op), so it gets a normal entry above.",
+    "",
+    "`split` above lists only `split.Tensor` (the int-size overload), not the",
+    "full `torch.ops.aten.split.*` overload set. That is deliberate and",
+    "different from `methods.json`'s `split`, which lists both `split.Tensor`",
+    "and `split_with_sizes`: `_VariableFunctions.split` (`torch._VF.split`)",
+    "is, measured, only ever called by the vendored tree with an int --",
+    "`torch/_tensor.py:Tensor.split` is what looks at the argument type and",
+    "routes a list/tuple to `torch._VF.split_with_sizes` instead, which is",
+    "why that op gets its own `split_with_sizes` key rather than being folded",
+    "in here."
+  ],
+
+  "arange": [
+    "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::arange.start(Scalar start, Scalar end, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::arange.start_step(Scalar start, Scalar end, Scalar step=1, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::arange(Scalar end, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "argmax": [
+    "aten::argmax.out(Tensor self, int? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
+
+  "topk": [
+    "aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)"
+  ],
+
+  "sort": [
+    "aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)",
+    "aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)"
+  ],
+
+  "squeeze": [
+    "aten::squeeze(Tensor(a) self) -> Tensor(a)",
+    "aten::squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)",
+    "aten::squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)"
+  ],
+
+  "multinomial": [
+    "aten::multinomial.out(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor"
+  ],
+
+  "select": [
+    "aten::select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)"
+  ],
+
+  "scatter": [
+    "aten::scatter.src_out(Tensor self, int dim, Tensor index, Tensor src, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.reduce_out(Tensor self, int dim, Tensor index, Tensor src, *, str reduce, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.value_out(Tensor self, int dim, Tensor index, Scalar value, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.value_reduce_out(Tensor self, int dim, Tensor index, Scalar value, *, str reduce, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
+    "aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *, str reduce) -> Tensor",
+    "aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor",
+    "aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value, *, str reduce) -> Tensor"
+  ],
+
+  "gather": [
+    "aten::gather.out(Tensor self, int dim, Tensor index, *, bool sparse_grad=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
+  ],
+
+  "split": [
+    "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]"
+  ],
+
+  "split_with_sizes": [
+    "aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]"
+  ],
+
+  "native_layer_norm": [
+    "aten::native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)"
+  ],
+
+  "cat": [
+    "aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::cat(Tensor[] tensors, int dim=0) -> Tensor"
+  ],
+
+  "embedding": [
+    "aten::embedding.out(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False) -> Tensor"
+  ],
+
+  "empty": [
+    "aten::empty.out(SymInt[] size, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::empty.memory_format(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor"
+  ],
+
+  "full": [
+    "aten::full.out(SymInt[] size, Scalar fill_value, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "is_floating_point": [
+    "aten::is_floating_point(Tensor self) -> bool"
+  ],
+
+  "isin": [
+    "aten::isin.Tensor_Tensor_out(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Tensor_Scalar_out(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Scalar_Tensor_out(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor",
+    "aten::isin.Tensor_Scalar(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False) -> Tensor",
+    "aten::isin.Scalar_Tensor(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor"
+  ],
+
+  "mm": [
+    "aten::mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::mm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+
+  "addmm": [
+    "aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::addmm.dtype_out(Tensor self, Tensor mat1, Tensor mat2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::addmm.dtype(Tensor self, Tensor mat1, Tensor mat2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1) -> Tensor",
+    "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
+  ],
+
+  "ones": [
+    "aten::ones.out(SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::ones(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "pow": [
+    "aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor",
+    "aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor",
+    "aten::pow.Scalar(Scalar self, Tensor exponent) -> Tensor"
+  ],
+
+  "randint": [
+    "aten::randint.low_generator_out(SymInt low, SymInt high, SymInt[] size, *, Generator? generator, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.generator_out(SymInt high, SymInt[] size, *, Generator? generator, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.low_out(SymInt low, SymInt high, SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.out(SymInt high, SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.low_generator(SymInt low, SymInt high, SymInt[] size, *, Generator? generator, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint.generator(SymInt high, SymInt[] size, *, Generator? generator, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint.low(SymInt low, SymInt high, SymInt[] size, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint(SymInt high, SymInt[] size, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "rsqrt": [
+    "aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::rsqrt(Tensor self) -> Tensor"
+  ],
+
+  "tanh": [
+    "aten::tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::tanh(Tensor self) -> Tensor"
+  ],
+
+  "zeros": [
+    "aten::zeros.out(SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::zeros(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "add": [
+    "aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "bmm": [
+    "aten::bmm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::bmm.dtype_out(Tensor self, Tensor mat2, ScalarType out_dtype, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::bmm.dtype(Tensor self, Tensor mat2, ScalarType out_dtype) -> Tensor",
+    "aten::bmm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+
+  "matmul": [
+    "aten::matmul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::matmul(Tensor self, Tensor other) -> Tensor"
+  ],
+
+  "neg": [
+    "aten::neg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::neg(Tensor self) -> Tensor"
+  ],
+
+  "t": [
+    "aten::t(Tensor(a) self) -> Tensor(a)"
+  ],
+
+  "rsub": [
+    "aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "where": [
+    "aten::where.self_out(Tensor condition, Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor",
+    "aten::where.ScalarSelf(Tensor condition, Scalar self, Tensor other) -> Tensor",
+    "aten::where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor",
+    "aten::where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor",
+    "aten::where(Tensor condition) -> Tensor[]"
+  ],
+
+  "zero_": [
+    "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
+  ]
+}

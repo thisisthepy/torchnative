@@ -1,0 +1,30 @@
+[package]
+name = "torch_c"
+version = "0.0.0"
+edition = "2021"
+
+# Produces the `torch._C` extension module. Rust prefixes cdylib output with
+# `lib`, so the artefact is renamed on install -- Python will only load `_C.so`.
+[lib]
+name = "_C"
+crate-type = ["cdylib"]
+
+[dependencies]
+# `abi3-py313` is ABI3.md §7's recommendation, and the floor is exactly 3.13:
+# lowering it gives up the 3.13 stable-ABI replacements (`PyObject_GetOptionalAttr`
+# and friends, §2c); raising it turns `Py_TYPE` into a call (§4d). The decisive
+# argument is not performance but the asymmetry of reverting -- Limited API is a
+# subset, so abi3 -> version-pinned needs no source change, while the reverse
+# means hunting down every private/struct API already in use (§8).
+#
+# It also removes a silent failure mode: a version-pinned `_C.so` carries no tag
+# and loads into an interpreter it was not built for (§5d). The platform is
+# CPython 3.14.7, not the 3.13 this crate had been compiled against.
+pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py313"] }
+
+# The tensor engine (DESIGN.md §4). `candle-core` only -- `candle-transformers`
+# re-implements model architectures in Rust, which is the approach §1 rejects.
+# Upstream's default feature set is already empty; it is pinned off here so a
+# future upstream default can never quietly link Accelerate/Metal/MKL/CUDA into
+# a device build.
+candle-core = { version = "0.11.0", default-features = false }
