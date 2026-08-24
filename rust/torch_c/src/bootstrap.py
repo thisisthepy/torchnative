@@ -53,8 +53,11 @@ build from needing real torch present.
 from __future__ import annotations
 
 import builtins
+import contextlib
+import datetime
 import enum
 import importlib.util
+import inspect
 import json
 import sys
 import types
@@ -89,6 +92,25 @@ EXTRA_OFF_SWITCHES = frozenset(
         "_XpuEventBase",
     }
 )
+
+# Probes the scan finds but that this shim answers YES to.
+#
+# `gen_surface.py` derives the off-switch list by scanning the tree for
+# `hasattr(torch._C, "...")`, so every subsystem the tree can be asked about
+# lands in "probes" whether or not it is built here. That is the right default
+# -- absence is how upstream says "not built" -- but it means a subsystem that
+# *does* get built has to be taken back out by name, here, rather than by the
+# surface generator guessing.
+#
+# `_c10d_init` is the switch for `torch.distributed`
+# (`torch/distributed/__init__.py:28`). docs/DISTRIBUTED.md is what it costs and
+# what it buys; `_install_distributed_c10d` is the implementation. Answering it
+# is not free: with it off, `torch.distributed` is a five-line stub, and with it
+# on the tree walks straight into `_C._distributed_c10d` while `import torch`
+# is still running (`torch/utils/data/dataloader.py:26` pulls it in), so the
+# subsystem has to be complete enough to finish that import before this line
+# can be true.
+ANSWERED_PROBES = frozenset({"_c10d_init"})
 
 # Dunders `TensorBase` must *not* be given, even though the stub declares them.
 #
@@ -293,18 +315,31 @@ class _SubmoduleFinder:
     The finder answers only for names below a submodule it already created.
     An unknown `torch._C.<name>` still fails, so `try: import ... except
     ImportError` stays a working question.
+
+    `closed` names it for the submodules where that last sentence has to hold
+    *inside* them too. `from torch._C._distributed_c10d import ProcessGroupGloo`
+    tries the attribute first and the import second, so a module `__getattr__`
+    that raises `AttributeError` is not enough on its own -- this finder was
+    then handing back an empty module, `_GLOO_AVAILABLE` came out True, and
+    `init_process_group` reached for a backend that is not there. A closed
+    submodule keeps its own catch-all; what it loses is the second chance to
+    answer as a *module*.
     """
 
-    def __init__(self, prefix: str, roots: set[str]) -> None:
+    def __init__(self, prefix: str, roots: set[str], closed=()) -> None:
         self._prefix = prefix + "."
         self._depth = prefix.count(".") + 1
         self._roots = roots
+        self._closed = frozenset(closed)
 
     def find_spec(self, fullname, path=None, target=None):
         if not fullname.startswith(self._prefix):
             return None
-        head = fullname[len(self._prefix) :].split(".")[0]
+        tail = fullname[len(self._prefix) :]
+        head = tail.split(".")[0]
         if head not in self._roots:
+            return None
+        if head in self._closed and "." in tail:
             return None
         return importlib.util.spec_from_loader(fullname, self)
 
@@ -479,6 +514,79 @@ class _SchemaType:
     def __hash__(self) -> int:
         return hash(self._spelling)
 
+    # The TorchScript type singletons carry no spelling of their own, but the
+    # class they are instances of is named for the type -- `TensorType.get()`
+    # is a `TensorType`. That is a reading, not a correspondence: it does not
+    # make a `_SchemaType` *be* one of those objects, which is what the
+    # docstring above declines to claim.
+    _SINGLETON_SPELLINGS = {
+        "TensorType": "Tensor",
+        "IntType": "int",
+        "SymIntType": "SymInt",
+        "FloatType": "float",
+        "ComplexType": "complex",
+        "BoolType": "bool",
+        "StringType": "str",
+        "NumberType": "Scalar",
+        "NoneType": "None",
+        "DeviceObjType": "Device",
+        "GeneratorType": "Generator",
+        "AnyType": "Any",
+    }
+
+    @classmethod
+    def _spelling_of(cls, other) -> str:
+        if isinstance(other, _SchemaType):
+            return other._spelling
+        spelling = cls._SINGLETON_SPELLINGS.get(type(other).__name__)
+        if spelling is None:
+            raise NotImplementedError(
+                "torch._C shim: FunctionSchema types can be compared against "
+                "the scalar TorchScript type singletons only, and "
+                f"{type(other).__name__} is not one of them. A parametrised "
+                "type (ListType.ofInts() and friends) would need a real type "
+                "lattice, which this shim does not have"
+            )
+        return spelling
+
+    def isSubtypeOf(self, other) -> bool:
+        """Equality on the normalised spelling, plus `Any` on top.
+
+        `torch/_subclasses/fake_impls.py:145` asks this of every argument of
+        every prim (`torch/_prims/__init__.py:368`), and it used not to be here
+        at all -- the question never arrived, because `_get_schema` answered
+        with an empty argument list and `any(...)` over nothing is False. Once
+        the schemas became real the question became real too.
+
+        Only the two relations the callers need are answered. `T` is a subtype
+        of `T` and of `Any`; `T?` and `T[]` are *not* subtypes of `T`, which is
+        upstream's rule and is why `contains_tensor_types` recurses through
+        `containedTypes()` rather than relying on this. Anything wider would be
+        a type lattice, and inventing one would let a wrong answer through
+        quietly.
+        """
+        other_spelling = self._spelling_of(other)
+        if other_spelling == "Any":
+            return True
+        mine = _decompose_type(self._spelling)
+        theirs = _decompose_type(other_spelling)
+        return mine[:3] == theirs[:3]
+
+    def containedTypes(self) -> list:
+        """The element type of a container, one layer at a time.
+
+        `Tensor[]?` yields `Tensor[]`, which yields `Tensor` -- so
+        `contains_tensor_types`'s recursion terminates and finds the tensor
+        inside an optional list.
+        """
+        text = self._spelling.strip()
+        if text.endswith("?"):
+            return [_SchemaType(text[:-1].strip())]
+        if text.endswith("]"):
+            base, _, _, _ = _decompose_type(text)
+            return [_SchemaType(base)]
+        return []
+
 
 class _AliasInfo:
     __slots__ = ("is_write", "before_set", "after_set")
@@ -599,7 +707,23 @@ class _Schema:
                 schema.returns.append(_parse_argument(chunk, False))
         return schema
 
+    @property
     def is_mutable(self) -> bool:
+        """A *property*, because that is what upstream's is.
+
+        `torch/_library/utils.py:104` reads `if schema.is_mutable:` and fifteen
+        more sites in the vendored tree read `._schema.is_mutable` the same
+        way. This was a method, and a bound method is truthy -- so every schema
+        answered "mutable", `is_functional_schema` was False everywhere, and
+        `torch.library.register_autograd` refused every op it was given
+        (`torch/distributed/_functional_collectives.py:637` is where that
+        surfaced). The always-true predicate, again.
+
+        It hid because the only test covering it used the shim's own spelling,
+        `is_mutable()`, which reads correctly whichever it is. `_is_view_op`
+        below stays a method: `torch/distributed/tensor/_dispatch.py:569` calls
+        it with parentheses.
+        """
         return any(
             a.alias_info is not None and a.alias_info.is_write for a in self.arguments
         )
@@ -1068,7 +1192,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
     real = set(vars(module))
-    off = frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES
+    off = (frozenset(surface.get("probes", ())) | EXTRA_OFF_SWITCHES) - ANSWERED_PROBES
     # Readable from Python so the decision can be inspected rather than
     # reverse-engineered from what is absent.
     module._shim_off_switches = sorted(off)
@@ -1185,7 +1309,9 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # shim was reaching into a namespace it does not own.
     prefix = module.__name__
     roots = set(surface["submodules"]) | set(EXTRA_SUBMODULES)
-    sys.meta_path.append(_SubmoduleFinder(prefix, roots))
+    # `_distributed_c10d` is closed: `_install_distributed_c10d` builds it whole
+    # and its absent names have to stay absent (see `absent_backends` there).
+    sys.meta_path.append(_SubmoduleFinder(prefix, roots, closed={"_distributed_c10d"}))
     for name in sorted(roots):
         spec = surface["submodules"].get(name, {})
         sub = types.ModuleType(f"{prefix}.{name}")
@@ -1201,6 +1327,34 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         _attach_module_catchall(sub)
         setattr(module, name, sub)
         sys.modules[f"{prefix}.{name}"] = sub
+
+    # -- `_monitor._WaitCounter` -- a block that can be entered -------------
+    #
+    # `torch/distributed/c10d_logger.py:96` wraps every public collective in
+    # `with _WaitCounter(f"pytorch.wait_counter.c10d.{name}").guard():`, and
+    # `distributed_c10d.py:3403` does the same around object serialisation, so
+    # this is on the path of every c10d call rather than a diagnostic corner.
+    # Upstream's counts elapsed time into a process-global registry that
+    # nothing in this project reads. Nothing here measures anything; the whole
+    # requirement is that `guard()` return something a `with` can enter.
+    class _WaitCounter:
+        __module__ = "torch._C._monitor"
+
+        def __init__(self, key):
+            self.key = key
+
+        def guard(self):
+            return contextlib.nullcontext()
+
+    module._monitor._WaitCounter = _WaitCounter
+
+    # -- `_distributed_c10d`, which needs structure rather than names -------
+    #
+    # Replaces what the loop above built for it. Must run before the
+    # `surface["module"]` loop below, which skips any name already set --
+    # `_c10d_init` is installed from in here.
+    _install_distributed_c10d(
+        module, surface["submodules"].get("_distributed_c10d", {}))
 
     # -- `_dynamo.eval_frame` real no-ops ---------------------------------
     #
@@ -1299,6 +1453,23 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # implementation instead. It is the entire cost of the safetensors load
     # path; see `_frombuffer` in lib.rs and docs/CKPT.md.
     varfns.frombuffer = module._frombuffer
+    # `torch.get_default_dtype` is the third. It is not an aten op at all --
+    # upstream binds `THPModule_getDefaultDtype` straight onto `_C`
+    # (`torch/_C/__init__.pyi:1399`) *and* lists it among the variable
+    # functions, so overload resolution was never going to find a table entry
+    # and the refusal it produced named a `torch.ops.aten.get_default_dtype`
+    # that does not exist. `torch/distributed/_shard/sharded_tensor/
+    # metadata.py:20` calls it in a dataclass field default, at import time.
+    #
+    # The value is not a free choice here: it has to be the same dtype
+    # `aten.rs`'s `DEFAULT_FLOAT` gives factory functions, or a caller reading
+    # this to decide what it will get would be told the wrong thing. There is
+    # no setter -- `set_default_dtype` would have to reach a Rust constant, so
+    # it stays refused by name rather than silently accepting and changing
+    # nothing.
+    _default_dtype = _constant_function("torch._C.get_default_dtype", module.float32)
+    varfns.get_default_dtype = _default_dtype
+    module.get_default_dtype = _default_dtype
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -2156,6 +2327,23 @@ def _install_autograd_shape(tensorbase) -> None:
         made.requires_grad = bool(require_grad)
         return made
 
+    # Upstream's is a C builtin, and `inspect.signature` raises `ValueError` on
+    # it. `torch/_dynamo/decorators.py:966` catches exactly that and skips its
+    # signature comparison, so upstream never compares. A Python function *has*
+    # a readable signature, so the comparison ran here -- and rejected it,
+    # because `torch/_dynamo/polyfills/tensor.py:12` spells the flag
+    # `requires_grad` while the keyword upstream actually accepts is
+    # `require_grad` (measured on 2.13.0: `requires_grad=` is a `TypeError`
+    # there), which is also what `torch/_C/__init__.pyi:2389` declares.
+    #
+    # Renaming to match the polyfill would make this shim accept a keyword
+    # upstream rejects and reject the one it accepts. So the signature is
+    # withheld instead, which is the same amount of information upstream gives
+    # -- and `sig_ident(...) != sig_ident(wildcard_sig)` in that same function
+    # is dynamo's own allowance for a callable that declares nothing. The `def`
+    # above and the stub remain the statement of what is accepted.
+    _make_subclass.__signature__ = inspect.signature(lambda *args, **kwargs: None)
+
     # A *static* method, not a class method: upstream's is called as
     # `torch.Tensor._make_subclass(cls, data, requires_grad)` with the target
     # class passed explicitly, so binding the receiver would shift every
@@ -2323,6 +2511,65 @@ def _install_namespace_types(module, namespace) -> None:
             setattr(module, name, instance)
             cls.__repr__ = lambda self: f"torch.{self._shim_name}"
             cls.__str__ = cls.__repr__
+
+
+# Operator schemas that live in C++ upstream and in no `.pyi`.
+#
+# `_get_schema` answered every op with a `_Schema` carrying no arguments and no
+# returns. For `aten::` that is only a missing answer -- `_aten_dispatch` is
+# what runs an op, and it reads `overloads.json`, not this. For these three
+# namespaces it is a *wrong* answer: `torch/distributed/_functional_collectives.py`
+# registers autograd formulas at import time and
+# `torch/library.py:1417` refuses unless `is_functional_schema(schema)`, which
+# needs arguments and returns to have really been read. An empty schema has no
+# returns, so it is never functional, so the import stops.
+#
+# These are registered from `torch/csrc/distributed/c10d/Functional.cpp` and
+# friends -- i.e. from the half of torch this shim replaces -- so there is
+# nowhere else they could come from. The text is transcribed from upstream
+# 2.13.0's own registry (`torch._C._jit_get_all_schemas()` filtered by
+# namespace, after importing `torch.distributed._functional_collectives`), not
+# written by hand; `pytests/verify_schemas.py` re-derives it the same way.
+#
+# Whether an op *runs* is a separate question from whether its schema is known,
+# and this table answers only the second. Calling one still goes through
+# `_op_callable` to the one door in `aten.rs`, which has no kernel for the
+# `_c10d_functional` namespace and refuses by name.
+_NON_ATEN_SCHEMA_TEXT = (
+    "_c10d_functional::_wrap_tensor_autograd(Tensor input) -> Tensor",
+    "_c10d_functional::all_gather_into_tensor(Tensor input, int group_size, Any group_name) -> Tensor",
+    "_c10d_functional::all_gather_into_tensor_coalesced(Tensor[] inputs, int group_size, Any group_name) -> Tensor[]",
+    "_c10d_functional::all_gather_into_tensor_out(Tensor input, int group_size, Any group_name, *, Tensor(a!) out) -> Tensor(a!)",
+    "_c10d_functional::all_reduce(Tensor input, str reduce_op, Any group_name) -> Tensor",
+    "_c10d_functional::all_reduce_(Tensor(a!) input, str reduce_op, Any group_name) -> Tensor(a!)",
+    "_c10d_functional::all_reduce_coalesced(Tensor[] inputs, str reduce_op, Any group_name) -> Tensor[]",
+    "_c10d_functional::all_reduce_coalesced_(Tensor[](a!) inputs, str reduce_op, Any group_name) -> Tensor[](a!)",
+    "_c10d_functional::all_to_all_single(Tensor input, SymInt[] output_split_sizes, SymInt[] input_split_sizes, Any group_name) -> Tensor",
+    "_c10d_functional::batch_p2p_ops(str[] op_list, int[] peer_list, int[] tag_list, Tensor[] tensors, str group_name) -> Tensor[]",
+    "_c10d_functional::broadcast(Tensor input, int src, Any group_name) -> Tensor",
+    "_c10d_functional::broadcast_(Tensor(a!) input, int src, Any group_name) -> Tensor(a!)",
+    "_c10d_functional::irecv(Tensor tensor, int src, int tag, str group_name) -> Tensor",
+    "_c10d_functional::isend(Tensor tensor, int dst, int tag, str group_name) -> Tensor",
+    "_c10d_functional::reduce_scatter_tensor(Tensor input, str reduce_op, int group_size, Any group_name) -> Tensor",
+    "_c10d_functional::reduce_scatter_tensor_coalesced(Tensor[] inputs, str reduce_op, int group_size, Any group_name) -> Tensor[]",
+    "_c10d_functional::reduce_scatter_tensor_out(Tensor input, str reduce_op, int group_size, Any group_name, *, Tensor(a!) out) -> Tensor(a!)",
+    "_c10d_functional::wait_tensor(Tensor tensor) -> Tensor",
+    "_c10d_functional_autograd::all_gather_into_tensor(Tensor input, int group_size, Any group_name) -> Tensor",
+    "_c10d_functional_autograd::all_to_all_single(Tensor input, SymInt[] output_split_sizes, SymInt[] input_split_sizes, Any group_name) -> Tensor",
+    "_c10d_functional_autograd::reduce_scatter_tensor(Tensor input, str reduce_op, int group_size, Any group_name) -> Tensor",
+    "_dtensor::shard_dim_alltoall(Tensor input, int gather_dim, int shard_dim, Any group_name) -> Tensor",
+)
+
+
+def _build_non_aten_schemas():
+    out = {}
+    for text in _NON_ATEN_SCHEMA_TEXT:
+        parsed = _Schema.parse(text)
+        out[(parsed.name, parsed.overload_name)] = parsed
+    return out
+
+
+_NON_ATEN_SCHEMAS = _build_non_aten_schemas()
 
 
 def _constant_function(qualname: str, value):
@@ -2676,7 +2923,7 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_key_parse = _parse_dispatch_key
 
 
-def _install_library(module) -> None:
+def _install_library(module, schemas) -> None:
     """`torch._C._dispatch_library` -- the operator registry, as a recorder.
 
     `torch/library.py:244` builds one of these per `Library(...)`, and
@@ -2714,6 +2961,27 @@ def _install_library(module) -> None:
             # the op name -- upstream returns exactly that.
             name = schema.split("(")[0].strip()
             registrations.append(("define", self.ns, name, schema))
+            # Keep the text, not just the fact that it arrived. Upstream's
+            # dispatcher parses it here and `torch.ops.<ns>.<op>._schema`
+            # reads it back later; the shim used to drop it and then answer
+            # that read with an empty schema, which is a *wrong* answer rather
+            # than a missing one -- an empty schema has no returns, so
+            # `is_functional_schema` is False and
+            # `torch.library.register_autograd` refuses every custom op.
+            # `transformers/integrations/moe.py:253` is where that showed up.
+            #
+            # This is the one thing `define` does that is not merely recorded,
+            # and it does not narrow the gap the docstring above describes:
+            # knowing an op's schema is not knowing how to run it, and
+            # `_aten_dispatch` still has no kernel for any of these.
+            try:
+                parsed = _Schema.parse(f"{self.ns}::{schema}")
+            except Exception:  # noqa: BLE001 -- a schema this cannot parse is
+                # not worth failing a registration over; the caller gets the
+                # same empty schema it got before.
+                pass
+            else:
+                schemas[(parsed.name, parsed.overload_name)] = parsed
             return name
 
         def impl(self, name, dispatch_key, fn, with_keyset=False):
@@ -3127,7 +3395,10 @@ def _install_behaviour(module, dispatch) -> None:
     module._set_generator_metaclass = _set_generator_metaclass
 
     _install_dispatch_keys(module)
-    _install_library(module)
+    # Seeded with the schemas that exist only in C++ upstream, then added to
+    # by every `define()` the tree makes -- see `_DispatchLibrary.define`.
+    schemas = dict(_NON_ATEN_SCHEMAS)
+    _install_library(module, schemas)
 
     # -- op registry ------------------------------------------------------
     def _jit_get_operation(qualname):
@@ -3150,6 +3421,9 @@ def _install_behaviour(module, dispatch) -> None:
         return op, op_dk, []
 
     def _get_schema(qualname, overload):
+        known = schemas.get((qualname, overload))
+        if known is not None:
+            return known
         return _Schema(qualname, overload)
 
     # A plain function, not `_Schema.parse` itself: `torch/__init__.py:1091`
@@ -3395,6 +3669,1174 @@ def _install_device(module, varfns, tensorbase) -> None:
     # `_make_property` put one there and the callers reach for the descriptor.
     _cpu = module.device("cpu")
     module.Generator.device = property(lambda self: _cpu)
+
+
+def _install_distributed_c10d(module, spec) -> None:
+    """`torch._C._distributed_c10d`, at world_size 1.
+
+    docs/DISTRIBUTED.md. This subsystem was **off**: `_c10d_init` was one of the
+    names in the "Deliberate omissions" set at the top of this file, because
+    `torch/distributed/__init__.py:28` is `hasattr(torch._C, "_c10d_init")` and
+    absence is the switch upstream provides. Turning it on is not a one-line
+    change, and docs/SURFACE_HONESTY.md §2.4 is the measurement that says why:
+    an instrument that answered *every* attribute still could not finish
+    `import torch`, because `distributed_c10d.py:547` walks
+    `ReduceOp.RedOpType.__members__` and `distributed_c10d.py:321` reads
+    `ProcessGroup.BackendType.UNDEFINED`. What the tree wants here is structure,
+    not names -- real enums, nested types, subclassable bases -- so the generic
+    submodule builder above cannot produce it and this replaces its output.
+
+    **What is real and what is refused.** At world_size 1 a great deal of this
+    is not a stand-in for anything:
+
+      * The **store** is a genuine key/value store. "Distributed store" and
+        "local dict" are the same object when this process is the only writer,
+        so `Store`/`HashStore`/`PrefixStore` here are implementations, not
+        placeholders. `Store.wait` is the one that has to be careful: at
+        world_size 1 an absent key is not "not yet", it is "never", so it
+        raises rather than blocking or returning.
+      * **Work** is always complete, because every collective a single rank can
+        perform finishes before the call returns. There is nothing to wait for
+        and saying so is accurate.
+      * `TCPStore` **refuses by name**. There is no peer at the other end of
+        that socket, and a store that silently behaved like a local dict while
+        claiming to be a rendezvous point is exactly the failure docs/CKPT.md
+        recorded -- it looks like it worked.
+      * `ProcessGroupGloo`/`Nccl`/`Ucc`/`Xccl`/`Mpi` are **absent**, not stubbed.
+        `distributed_c10d.py:204-242` imports each in its own
+        `try/except ImportError` and sets an availability flag, so absence is
+        the answer the tree is written to receive. Providing an empty class
+        would set the flag to True and route real collectives into it.
+
+    `_c10d_init` is the tree's own initialisation hook, and this module uses it
+    for the one thing that cannot happen at `import torch._C` time -- see
+    `_c10d_init` below.
+    """
+    name = f"{module.__name__}._distributed_c10d"
+    mod = types.ModuleType(name)
+    mod.__path__ = []
+
+    def refuse(what, why):
+        raise NotImplementedError(f"torch._C._distributed_c10d.{what}: {why}")
+
+    # -- ReduceOp ----------------------------------------------------------
+    #
+    # `RedOpType` must be an `enum.Enum` and not merely enum-shaped:
+    # `distributed_c10d.py:547` iterates `__members__.items()`, and
+    # `ReduceOp.SUM` is a default argument value in seven `def`s, so both are
+    # read while the module body runs.
+    class _RedOpType(enum.Enum):
+        SUM = 0
+        AVG = 1
+        PRODUCT = 2
+        MIN = 3
+        MAX = 4
+        BAND = 5
+        BOR = 6
+        BXOR = 7
+        PREMUL_SUM = 8
+        UNUSED = 9
+
+        def __call__(self, factor):
+            # Upstream: only PREMUL_SUM is callable, and it carries a factor.
+            if self is not _RedOpType.PREMUL_SUM:
+                raise TypeError(
+                    "torch._C._distributed_c10d: only ReduceOp.PREMUL_SUM takes "
+                    f"a factor, not {self.name}"
+                )
+            op = _ReduceOp(_RedOpType.PREMUL_SUM)
+            op._factor = factor
+            return op
+
+    class _ReduceOp:
+        RedOpType = _RedOpType
+
+        def __init__(self, op=_RedOpType.SUM):
+            if isinstance(op, _ReduceOp):
+                op = op.op
+            self.op = op
+            self._factor = None
+
+        @property
+        def factor(self):
+            return self._factor
+
+        def __eq__(self, other):
+            if isinstance(other, _ReduceOp):
+                return self.op == other.op
+            if isinstance(other, _RedOpType):
+                return self.op == other
+            return NotImplemented
+
+        def __hash__(self):
+            return hash(self.op)
+
+        def __repr__(self):
+            return f"<torch.distributed.distributed_c10d.ReduceOp.{self.op.name}: {self.op.value}>"
+
+    for member in _RedOpType:
+        setattr(_ReduceOp, member.name, member)
+
+    _ReduceOp.__name__ = _ReduceOp.__qualname__ = "ReduceOp"
+    _RedOpType.__qualname__ = "ReduceOp.RedOpType"
+
+    # -- the store ---------------------------------------------------------
+    class Store:
+        """A key/value store with one participant.
+
+        Not a stand-in. Upstream's `HashStore` is an in-process dict too; the
+        difference between it and `TCPStore` is who else can reach it, and at
+        world_size 1 the answer is nobody either way.
+        """
+
+        def __init__(self, *args, **kwargs):
+            self._entries = {}
+            self._queues = {}
+            self._timeout = datetime.timedelta(seconds=300)
+
+        @staticmethod
+        def _as_bytes(value):
+            if isinstance(value, str):
+                return value.encode()
+            return bytes(value)
+
+        def set(self, key, value):
+            self._entries[key] = self._as_bytes(value)
+
+        def get(self, key):
+            if key not in self._entries:
+                raise RuntimeError(f"Key {key} not found in store")
+            return self._entries[key]
+
+        def add(self, key, value):
+            total = int(self._entries.get(key, b"0")) + value
+            self._entries[key] = str(total).encode()
+            return total
+
+        def check(self, keys):
+            return all(k in self._entries for k in keys)
+
+        def compare_set(self, key, expected_value, desired_value):
+            expected = self._as_bytes(expected_value)
+            desired = self._as_bytes(desired_value)
+            current = self._entries.get(key)
+            if current is None:
+                # Upstream treats an empty expected value as "set if absent".
+                if expected == b"":
+                    self._entries[key] = desired
+                    return desired
+                return expected
+            if current == expected:
+                self._entries[key] = desired
+                return desired
+            return current
+
+        def delete_key(self, key):
+            return self._entries.pop(key, None) is not None
+
+        def multi_get(self, keys):
+            return [self.get(k) for k in keys]
+
+        def multi_set(self, keys, values):
+            for key, value in zip(keys, values):
+                self.set(key, value)
+
+        def num_keys(self):
+            return len(self._entries)
+
+        def list_keys(self):
+            return list(self._entries)
+
+        def set_timeout(self, timeout):
+            self._timeout = timeout
+
+        @property
+        def timeout(self):
+            return self._timeout
+
+        def wait(self, keys, timeout=None):
+            """Refuse rather than block.
+
+            Upstream blocks until another rank writes the key. There is no
+            other rank, so the key is either already here or it is never
+            coming -- and a `wait` that returned quietly on an absent key would
+            let the caller proceed as though a peer had answered.
+            """
+            missing = [k for k in keys if k not in self._entries]
+            if missing:
+                raise RuntimeError(
+                    f"torch._C._distributed_c10d.Store.wait: {missing} absent. "
+                    "At world_size 1 this process is the only writer, so no "
+                    "other rank can ever set these keys"
+                )
+
+        def queue_push(self, key, value):
+            self._queues.setdefault(key, []).append(self._as_bytes(value))
+
+        def queue_pop(self, key, block=True):
+            queue = self._queues.get(key) or []
+            if not queue:
+                raise RuntimeError(
+                    f"torch._C._distributed_c10d.Store.queue_pop: queue {key!r} "
+                    "is empty and, at world_size 1, nothing else can fill it"
+                )
+            return queue.pop(0)
+
+        def queue_len(self, key):
+            return len(self._queues.get(key) or [])
+
+    class HashStore(Store):
+        pass
+
+    class FileStore(Store):
+        """Backed by the dict, not by the file.
+
+        The path is remembered and reported so the caller can see what it
+        asked for, but nothing is written: a file store exists so that two
+        processes can find each other, and there is only one.
+        """
+
+        def __init__(self, path, numWorkers=-1):
+            super().__init__()
+            self.path = path
+
+    class TCPStore(Store):
+        def __init__(self, *args, **kwargs):
+            refuse(
+                "TCPStore",
+                "no transport is built into this shim, and at world_size 1 "
+                "there is no peer to reach. Pass a HashStore, or pass "
+                "store=... to init_process_group",
+            )
+
+    class PrefixStore(Store):
+        """A real view onto another store, not a copy.
+
+        `_new_process_group_helper` nests these two deep
+        (`{group}/` then `{device}/`), and `distributed_c10d` relies on two
+        groups sharing one underlying store without colliding.
+        """
+
+        def __init__(self, prefix, store):
+            super().__init__()
+            self.prefix = prefix
+            self.underlying_store = store
+
+        def _key(self, key):
+            return f"{self.prefix}{key}" if self.prefix.endswith("/") else f"{self.prefix}/{key}"
+
+        def set(self, key, value):
+            self.underlying_store.set(self._key(key), value)
+
+        def get(self, key):
+            return self.underlying_store.get(self._key(key))
+
+        def add(self, key, value):
+            return self.underlying_store.add(self._key(key), value)
+
+        def check(self, keys):
+            return self.underlying_store.check([self._key(k) for k in keys])
+
+        def compare_set(self, key, expected_value, desired_value):
+            return self.underlying_store.compare_set(
+                self._key(key), expected_value, desired_value)
+
+        def delete_key(self, key):
+            return self.underlying_store.delete_key(self._key(key))
+
+        def multi_get(self, keys):
+            return self.underlying_store.multi_get([self._key(k) for k in keys])
+
+        def multi_set(self, keys, values):
+            self.underlying_store.multi_set([self._key(k) for k in keys], values)
+
+        def num_keys(self):
+            return self.underlying_store.num_keys()
+
+        def wait(self, keys, timeout=None):
+            return self.underlying_store.wait([self._key(k) for k in keys])
+
+    # -- Work --------------------------------------------------------------
+    class Work:
+        """Always complete.
+
+        `distributed_c10d.py:2809` subclasses this at module scope, so it has
+        to be a genuine type. Every collective a single rank can perform is
+        done by the time the call returns -- there is no peer to wait for --
+        so `is_completed()` is True rather than optimistic.
+        """
+
+        def __init__(self, result=None):
+            self._result = [] if result is None else list(result)
+
+        def is_completed(self):
+            return True
+
+        def is_success(self):
+            return True
+
+        def exception(self):
+            return None
+
+        def wait(self, timeout=None):
+            return True
+
+        def block_current_stream(self):
+            return None
+
+        def synchronize(self):
+            return None
+
+        def source_rank(self):
+            return 0
+
+        def _source_rank(self):
+            return 0
+
+        def result(self):
+            return self._result
+
+        def get_future(self):
+            refuse("Work.get_future",
+                   "there is no torch.futures.Future in this shim; the work is "
+                   "already complete, so wait() is the whole of it")
+
+        def boxed(self):
+            refuse("Work.boxed", "no TorchScript ScriptObject in this shim")
+
+        @staticmethod
+        def unbox(obj):
+            refuse("Work.unbox", "no TorchScript ScriptObject in this shim")
+
+    class FakeWork(Work):
+        pass
+
+    # -- the options structs ----------------------------------------------
+    #
+    # Plain records. `distributed_c10d` fills the fields in and hands them to a
+    # backend; nothing here reads them, and the backend that would is the one
+    # that does not exist yet.
+    def _options_type(type_name, fields, bases=()):
+        def __init__(self, **kwargs):
+            for field, default in fields.items():
+                setattr(self, field, default() if callable(default) else default)
+            for field, value in kwargs.items():
+                setattr(self, field, value)
+
+        def __repr__(self):
+            shown = ", ".join(f"{f}={getattr(self, f)!r}" for f in fields)
+            return f"{type_name}({shown})"
+
+        return type(type_name, bases or (), {
+            "__module__": name, "__init__": __init__, "__repr__": __repr__})
+
+    def _default_timeout():
+        return datetime.timedelta(minutes=30)
+
+    def _default_reduce_op():
+        return _ReduceOp(_RedOpType.SUM)
+
+    AllreduceOptions = _options_type("AllreduceOptions", {
+        "reduceOp": _default_reduce_op, "timeout": _default_timeout,
+        "asyncOp": True, "sparseIndices": None})
+    option_types = {
+        "BroadcastOptions": _options_type("BroadcastOptions", {
+            "rootRank": 0, "rootTensor": 0, "timeout": _default_timeout,
+            "asyncOp": True}),
+        "AllreduceOptions": AllreduceOptions,
+        "AllreduceCoalescedOptions": _options_type("AllreduceCoalescedOptions", {
+            "reduceOp": _default_reduce_op, "timeout": _default_timeout,
+            "asyncOp": True}, bases=(AllreduceOptions,)),
+        "ReduceOptions": _options_type("ReduceOptions", {
+            "reduceOp": _default_reduce_op, "rootRank": 0, "rootTensor": 0,
+            "timeout": _default_timeout, "asyncOp": True}),
+        "AllgatherOptions": _options_type("AllgatherOptions", {
+            "timeout": _default_timeout, "asyncOp": True}),
+        "GatherOptions": _options_type("GatherOptions", {
+            "rootRank": 0, "timeout": _default_timeout, "asyncOp": True}),
+        "ScatterOptions": _options_type("ScatterOptions", {
+            "rootRank": 0, "timeout": _default_timeout, "asyncOp": True}),
+        "ReduceScatterOptions": _options_type("ReduceScatterOptions", {
+            "reduceOp": _default_reduce_op, "timeout": _default_timeout,
+            "asyncOp": True}),
+        "BarrierOptions": _options_type("BarrierOptions", {
+            "device_ids": list, "device": None, "timeout": _default_timeout,
+            "asyncOp": True}),
+        "AllToAllOptions": _options_type("AllToAllOptions", {
+            "timeout": _default_timeout, "asyncOp": True}),
+    }
+
+    # -- the flat enums ----------------------------------------------------
+    class DebugLevel(enum.Enum):
+        OFF = 0
+        INFO = 1
+        DETAIL = 2
+
+    class ErrorType(enum.Enum):
+        SUCCESS = 0
+        TIMEOUT = 1
+        COMM_ERROR = 2
+        REMOTE_ERROR = 3
+
+    class BuiltinCommHookType(enum.Enum):
+        ALLREDUCE = 0
+        FP16_COMPRESS = 1
+
+    debug_level = [DebugLevel.OFF]
+
+    def get_debug_level():
+        return debug_level[0]
+
+    def set_debug_level(level):
+        debug_level[0] = level
+
+    def set_debug_level_from_env():
+        # `torch/distributed/__init__.py:170` calls this at import. Upstream
+        # reads TORCH_DISTRIBUTED_DEBUG; the level only selects how much C++
+        # logging happens, and there is none here.
+        return None
+
+    # -- Backend -----------------------------------------------------------
+    class _BackendOptions:
+        """`Backend.Options`.
+
+        `device_mesh.py:72` evaluates `C10dBackend.Options | None` at module
+        scope, which is a `TypeError` unless this is a real type -- so it is a
+        nested class rather than an attribute holding something type-shaped.
+        """
+
+        def __init__(self, backend="undefined", timeout=None):
+            self._backend = backend
+            self._timeout = timeout if timeout is not None else _default_timeout()
+            self.global_ranks_in_group = []
+            self.group_name = ""
+            self.use_pg_for_symm_mem_rendezvous = False
+
+        @property
+        def backend(self):
+            return self._backend
+
+    class Backend:
+        """The base every concrete backend derives from.
+
+        No concrete backend is registered here. `ProcessGroupGloo` and the rest
+        stay *absent* rather than empty, because `distributed_c10d.py:204-242`
+        reads their absence as `_GLOO_AVAILABLE = False` and routes around
+        them; an empty class would set that flag True and send real collectives
+        into a body that does nothing.
+        """
+
+        Options = _BackendOptions
+
+        def __init__(self, rank=0, size=1):
+            self._rank = rank
+            self._size = size
+            self._options = _BackendOptions()
+            self._timeout = _default_timeout()
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return self._size
+
+        def name(self):
+            return type(self).__name__
+
+        @property
+        def supports_splitting(self):
+            return False
+
+        @property
+        def supports_coalescing(self):
+            return False
+
+        @property
+        def supports_time_estimate(self):
+            return False
+
+        @property
+        def options(self):
+            return self._options
+
+        def set_timeout(self, timeout):
+            self._timeout = timeout
+
+        def _set_default_timeout(self, timeout):
+            self._timeout = timeout
+
+        def _set_sequence_number_for_group(self):
+            return None
+
+        def abort(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def eager_connect_single_device(self, device=None):
+            return None
+
+        def get_error(self):
+            return ErrorType.SUCCESS
+
+        def supports_tensor_alloc(self, device):
+            return False
+
+        def allocate_tensor(self, size, *, dtype=None, device=None):
+            refuse("Backend.allocate_tensor",
+                   "no backend owns memory here; tensors come from the aten "
+                   "dispatcher")
+
+        @property
+        def mem_allocator(self):
+            return None
+
+    class FakeProcessGroup(Backend):
+        """`torch/testing/_internal/distributed/fake_pg.py` registers this as
+        the `fake` backend at import time, and that module is on the road to
+        `transformers` (`fsdp/_flat_param.py:31`). It exists so the
+        registration succeeds.
+
+        Upstream's own docstring says a fake process group "would produce wrong
+        results for every collective", so nothing here tries to make it useful.
+        """
+
+        @staticmethod
+        def _create_internal(rank, size, opts=None):
+            return FakeProcessGroup(rank, size)
+
+    # -- ProcessGroup ------------------------------------------------------
+    class _ProcessGroupMeta(type):
+        """A heap-type metaclass, so the metaclass can be replaced later.
+
+        `device_mesh._register_distributed_opaque_types` demands that
+        `ProcessGroup` carry `torch._opaque_base.OpaqueBaseMeta`, which
+        upstream's pybind11 class does (measured on 2.13.0 -- `Work`, `Store`
+        and `Backend` do not). `_C` cannot import the tree at its own import
+        time, so that binding is late, and `__class__` assignment refuses when
+        the *old* metaclass is `type`, because `type` is a static type. This
+        exists to give it a heap type to start from. See `_c10d_init`.
+        """
+
+    class ProcessGroup(metaclass=_ProcessGroupMeta):
+        BackendType = None  # replaced below; the enum needs the class to exist
+
+        def __init__(self, store=None, rank=0, size=1, options=None):
+            self._store = store
+            self._rank = rank
+            self._size = size
+            self._backends = {}
+            self._default_backend_type = ProcessGroup.BackendType.UNDEFINED
+            self._group_name = ""
+            self._group_desc = ""
+            self.bound_device_id = None
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return self._size
+
+        def name(self):
+            return self._group_name
+
+        def _get_backend_name(self):
+            return self._default_backend_type.name.lower()
+
+        def get_group_store(self):
+            return self._store
+
+        def _set_default_backend(self, backend_type):
+            self._default_backend_type = backend_type
+
+        def _register_backend(self, device, backend_type, backend):
+            self._backends[torch_device_key(device)] = (backend_type, backend)
+            self._default_backend_type = backend_type
+
+        def _get_backend(self, device):
+            entry = self._backends.get(torch_device_key(device))
+            if entry is None:
+                raise RuntimeError(
+                    f"torch._C._distributed_c10d.ProcessGroup: no backend "
+                    f"registered for device {device}"
+                )
+            return entry[1]
+
+        def _has_hooks(self):
+            return False
+
+        def _set_group_name(self, group_name):
+            self._group_name = group_name
+
+        def _set_group_desc(self, group_desc):
+            self._group_desc = group_desc
+
+        @property
+        def group_name(self):
+            return self._group_name
+
+        @property
+        def group_desc(self):
+            return self._group_desc
+
+        def _set_sequence_number_for_group(self):
+            return None
+
+        def _set_default_timeout(self, timeout):
+            return None
+
+        def set_timeout(self, timeout):
+            return None
+
+        def abort(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def _end_coalescing(self, *args, **kwargs):
+            return Work()
+
+        def _start_coalescing(self, *args, **kwargs):
+            return None
+
+        def __repr__(self):
+            return (f"<torch.distributed.ProcessGroup rank={self._rank} "
+                    f"size={self._size} name={self._group_name!r}>")
+
+    class _BackendType(enum.Enum):
+        UNDEFINED = 0
+        GLOO = 1
+        NCCL = 2
+        UCC = 3
+        MPI = 4
+        XCCL = 5
+        CUSTOM = 6
+
+    _BackendType.__qualname__ = "ProcessGroup.BackendType"
+    ProcessGroup.BackendType = _BackendType
+
+    def torch_device_key(device):
+        # `_register_backend` is keyed on `torch.device`, which is not
+        # hashable-by-value in every spelling; its `type` is what selects a
+        # backend, so that is the key.
+        return getattr(device, "type", device)
+
+    # -- the one backend this build has ------------------------------------
+    #
+    # DESIGN.md §11.1 puts a backend layer between `torch.distributed` and the
+    # device abstraction, registered through `Backend.register_backend`. This
+    # is that layer's world_size-1 member, and it is registered from
+    # `torchnative`, not from here -- `register_backend` is a
+    # `distributed_c10d` API and this module is imported before that file
+    # exists.
+    #
+    # **Every method here is either exact or a refusal.** At world_size 1 a
+    # collective has one contribution, so:
+    #
+    #   all_reduce      identity, for SUM/PRODUCT/MIN/MAX/BAND/BOR/BXOR --
+    #                   a reduction over one element is that element -- and
+    #                   for AVG, because the divisor is the world size.
+    #                   **PREMUL_SUM is refused**: it computes
+    #                   `sum(factor * x_i)`, which is `factor * x` and not `x`,
+    #                   so identity would be a wrong answer rather than a
+    #                   missing one.
+    #   broadcast       no-op. The root can only be rank 0, which is this
+    #                   process, so the tensor is already what it will be.
+    #   barrier         no-op, and genuinely so: a barrier with one
+    #                   participant is satisfied the moment it is reached.
+    #   gather/scatter/
+    #   all_gather/
+    #   reduce_scatter/
+    #   all_to_all      a copy. The buffers have one slot each and the data has
+    #                   to move into them, so these are the ones that do work.
+    #   send/recv       **refused by name.** There is no second rank, so there
+    #                   is no correct behaviour to fall back on. A silent no-op
+    #                   here would be the `filled` guard from docs/CKPT.md
+    #                   again: the caller would read an unwritten buffer and
+    #                   never learn why.
+    #
+    # A root rank other than 0 is refused rather than clamped -- asking rank 3
+    # to be the root of a one-rank group is a bug in the caller, and answering
+    # it would hide that.
+    class ProcessGroupLocal(Backend):
+        """The collectives of a group whose only member is this process.
+
+        Named `Local` rather than after a transport because there is none: the
+        peer set is `{self}`. That is not a degenerate case to be tolerated --
+        it is the case federated learning starts from (DESIGN.md §11.1), where
+        one device holds one shard and aggregation happens a layer up.
+        """
+
+        def __init__(self, rank=0, size=1, store=None):
+            if size != 1:
+                raise NotImplementedError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal: world_size "
+                    f"{size} needs a transport, and this build has none. Only "
+                    "world_size 1 is implemented"
+                )
+            if rank != 0:
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal: rank "
+                    f"{rank} is not in a world of size 1"
+                )
+            super().__init__(rank, size)
+            self._store = store
+
+        def name(self):
+            return "local"
+
+        # -- reductions ----------------------------------------------------
+        @staticmethod
+        def _check_reduce_op(opts, what):
+            op = getattr(opts, "reduceOp", None)
+            kind = getattr(op, "op", op)
+            if kind is _RedOpType.PREMUL_SUM:
+                refuse(
+                    f"ProcessGroupLocal.{what} with ReduceOp.PREMUL_SUM",
+                    "PREMUL_SUM is `sum(factor * x_i)`, which at world_size 1 "
+                    "is `factor * x` and not `x` -- so this is not the identity "
+                    "the other reductions are, and it is not implemented",
+                )
+            if kind is _RedOpType.UNUSED:
+                refuse(f"ProcessGroupLocal.{what} with ReduceOp.UNUSED",
+                       "UNUSED names no reduction")
+
+        @staticmethod
+        def _check_root(opts, what):
+            root = getattr(opts, "rootRank", 0)
+            if root not in (0, -1):
+                raise ValueError(
+                    f"torch._C._distributed_c10d.ProcessGroupLocal.{what}: "
+                    f"rootRank {root} is not in a world of size 1"
+                )
+
+        def allreduce(self, tensors, opts=None):
+            # Identity: one contribution reduced with itself is itself.
+            self._check_reduce_op(opts, "allreduce")
+            return Work(tensors)
+
+        def allreduce_coalesced(self, tensors, opts=None):
+            self._check_reduce_op(opts, "allreduce_coalesced")
+            return Work(tensors)
+
+        def reduce(self, tensors, opts=None):
+            self._check_reduce_op(opts, "reduce")
+            self._check_root(opts, "reduce")
+            return Work(tensors)
+
+        # -- movement ------------------------------------------------------
+        def broadcast(self, tensors, opts=None):
+            self._check_root(opts, "broadcast")
+            return Work(tensors)
+
+        def allgather(self, output_tensors, input_tensors, opts=None):
+            for outputs, source in zip(output_tensors, input_tensors):
+                if len(outputs) != 1:
+                    raise ValueError(
+                        "torch._C._distributed_c10d.ProcessGroupLocal.allgather: "
+                        f"output list has {len(outputs)} slots for a world of size 1"
+                    )
+                outputs[0].copy_(source)
+            return Work([t for group in output_tensors for t in group])
+
+        def _allgather_base(self, output, input, opts=None):
+            output.copy_(input)
+            return Work([output])
+
+        # 2.13's spelling of `_allgather_base`;
+        # `distributed_c10d.py:4387` calls this one and `all_gather_into_tensor`
+        # is the deprecated alias for it.
+        def all_gather_single(self, output, input, opts=None):
+            return self._allgather_base(output, input, opts)
+
+        def all_gather_single_coalesced(self, outputs, inputs, opts=None):
+            for output, source in zip(outputs, inputs):
+                output.copy_(source)
+            return Work(list(outputs))
+
+        def allgather_into_tensor_coalesced(self, outputs, inputs, opts=None):
+            for output, source in zip(outputs, inputs):
+                output.copy_(source)
+            return Work(list(outputs))
+
+        def allgather_coalesced(self, output_lists, input_list, opts=None):
+            for outputs, source in zip(output_lists, input_list):
+                outputs[0].copy_(source)
+            return Work(input_list)
+
+        def gather(self, output_tensors, input_tensors, opts=None):
+            self._check_root(opts, "gather")
+            for outputs, source in zip(output_tensors, input_tensors):
+                outputs[0].copy_(source)
+            return Work([t for group in output_tensors for t in group])
+
+        def scatter(self, output_tensors, input_tensors, opts=None):
+            self._check_root(opts, "scatter")
+            for output, sources in zip(output_tensors, input_tensors):
+                output.copy_(sources[0])
+            return Work(list(output_tensors))
+
+        def reduce_scatter(self, output_tensors, input_tensors, opts=None):
+            self._check_reduce_op(opts, "reduce_scatter")
+            for output, sources in zip(output_tensors, input_tensors):
+                # One rank, so the scatter picks slot 0 and the reduction over
+                # a single element is that element.
+                output.copy_(sources[0])
+            return Work(list(output_tensors))
+
+        def _reduce_scatter_base(self, output, input, opts=None):
+            self._check_reduce_op(opts, "_reduce_scatter_base")
+            output.copy_(input)
+            return Work([output])
+
+        def reduce_scatter_single(self, output, input, opts=None):
+            return self._reduce_scatter_base(output, input, opts)
+
+        def reduce_scatter_single_coalesced(self, outputs, inputs, opts=None):
+            self._check_reduce_op(opts, "reduce_scatter_single_coalesced")
+            for output, source in zip(outputs, inputs):
+                output.copy_(source)
+            return Work(list(outputs))
+
+        def reduce_scatter_tensor_coalesced(self, outputs, inputs, opts=None):
+            self._check_reduce_op(opts, "reduce_scatter_tensor_coalesced")
+            for output, source in zip(outputs, inputs):
+                output.copy_(source)
+            return Work(list(outputs))
+
+        def alltoall(self, output_tensors, input_tensors, opts=None):
+            for output, source in zip(output_tensors, input_tensors):
+                output.copy_(source)
+            return Work(list(output_tensors))
+
+        def alltoall_base(self, output, input, output_split_sizes=None,
+                          input_split_sizes=None, opts=None):
+            output.copy_(input)
+            return Work([output])
+
+        # `distributed_c10d.py:5131`'s spelling. With one rank the split sizes
+        # describe a single chunk that goes to itself, so this is the copy.
+        def all_to_all_single(self, output, input, output_split_sizes=None,
+                              input_split_sizes=None, opts=None):
+            return self.alltoall_base(
+                output, input, output_split_sizes, input_split_sizes, opts)
+
+        def barrier(self, opts=None):
+            return Work()
+
+        # -- point to point ------------------------------------------------
+        #
+        # Named refusals. These are the operations that cannot be made true by
+        # any amount of local work.
+        def send(self, tensors, dst_rank, tag=0):
+            refuse("ProcessGroupLocal.send",
+                   f"no rank {dst_rank} exists in a world of size 1, and this "
+                   "build has no transport to reach one")
+
+        def recv(self, tensors, src_rank, tag=0):
+            refuse("ProcessGroupLocal.recv",
+                   f"no rank {src_rank} exists in a world of size 1, and this "
+                   "build has no transport to reach one")
+
+        def recv_anysource(self, tensors, tag=0):
+            refuse("ProcessGroupLocal.recv_anysource",
+                   "no other rank exists in a world of size 1")
+
+        def _start_coalescing(self, *args, **kwargs):
+            return None
+
+        def _end_coalescing(self, *args, **kwargs):
+            return Work()
+
+    # The collectives `distributed_c10d` calls on the *group* object, forwarded
+    # to whichever backend the group registered. Upstream's ProcessGroup does
+    # this dispatch in C++ and picks the backend by the tensors' device; here
+    # there is at most one backend, so the lookup is the registration itself.
+    def _forwarded(method_name):
+        def forward(self, *args, **kwargs):
+            backend = self._sole_backend(method_name)
+            return getattr(backend, method_name)(*args, **kwargs)
+
+        forward.__name__ = method_name
+        forward.__qualname__ = f"ProcessGroup.{method_name}"
+        return forward
+
+    def _sole_backend(self, method_name):
+        if not self._backends:
+            raise RuntimeError(
+                f"torch._C._distributed_c10d.ProcessGroup.{method_name}: this "
+                "group has no backend registered. init_process_group has to "
+                "choose one, and this build only has 'local' -- which "
+                "torchnative registers"
+            )
+        return next(iter(self._backends.values()))[1]
+
+    ProcessGroup._sole_backend = _sole_backend
+    for _method in (
+        "allreduce", "allreduce_coalesced", "reduce", "broadcast",
+        "allgather", "_allgather_base", "allgather_coalesced",
+        "allgather_into_tensor_coalesced",
+        "all_gather_single", "all_gather_single_coalesced",
+        "gather", "scatter",
+        "reduce_scatter", "_reduce_scatter_base", "reduce_scatter_single",
+        "reduce_scatter_single_coalesced", "reduce_scatter_tensor_coalesced",
+        "alltoall", "alltoall_base", "all_to_all_single", "barrier",
+        "send", "recv", "recv_anysource",
+    ):
+        setattr(ProcessGroup, _method, _forwarded(_method))
+
+    # -- module contents ---------------------------------------------------
+    mod.ReduceOp = _ReduceOp
+    mod.Store = Store
+    mod.HashStore = HashStore
+    mod.FileStore = FileStore
+    mod.TCPStore = TCPStore
+    mod.PrefixStore = PrefixStore
+    mod.Work = Work
+    mod.FakeWork = FakeWork
+    mod.DebugLevel = DebugLevel
+    mod.ErrorType = ErrorType
+    mod.BuiltinCommHookType = BuiltinCommHookType
+    mod.get_debug_level = get_debug_level
+    mod.set_debug_level = set_debug_level
+    mod.set_debug_level_from_env = set_debug_level_from_env
+    mod.Backend = Backend
+    mod.FakeProcessGroup = FakeProcessGroup
+    mod.ProcessGroupLocal = ProcessGroupLocal
+    mod.ProcessGroup = ProcessGroup
+    for type_name, option_type in option_types.items():
+        setattr(mod, type_name, option_type)
+
+    # A class body does not see the enclosing function's locals, so
+    # `__module__` is assigned here rather than written inside each `class`.
+    for value in list(vars(mod).values()):
+        if isinstance(value, type) or isinstance(value, enum.EnumMeta):
+            value.__module__ = name
+    _BackendOptions.__module__ = name
+    _BackendOptions.__qualname__ = "Backend.Options"
+    _RedOpType.__module__ = name
+    _BackendType.__module__ = name
+
+    # `distributed_c10d.py` reads these as values, not as calls.
+    #
+    # `constants.py:12` is `default_pg_timeout = _DEFAULT_PG_TIMEOUT`, which is
+    # then a default argument in a dozen signatures, so a placeholder here
+    # would be carried into all of them.
+    mod._DEFAULT_FIRST_BUCKET_BYTES = 1024 * 1024
+    mod._DEFAULT_NO_TIMEOUT = datetime.timedelta(milliseconds=-1)
+    mod._DEFAULT_PG_TIMEOUT = datetime.timedelta(minutes=30)
+    mod._DEFAULT_PG_NCCL_TIMEOUT = datetime.timedelta(minutes=10)
+
+    # A per-process registry, which is what upstream's is -- the group objects
+    # live in C++ there and in `_world` here, and `_resolve_process_group` is
+    # how the functional collectives get from a name back to a group.
+    registered_groups = {}
+
+    def _register_process_group(group_name, process_group):
+        registered_groups[group_name] = process_group
+
+    def _resolve_process_group(group_name):
+        group = registered_groups.get(group_name)
+        if group is None:
+            raise ValueError(
+                f"torch._C._distributed_c10d._resolve_process_group: no group "
+                f"named {group_name!r} has been registered"
+            )
+        return group
+
+    def _unregister_process_group(group_name):
+        registered_groups.pop(group_name, None)
+
+    def _unregister_all_process_groups():
+        registered_groups.clear()
+
+    # Process-global bookkeeping. Upstream keeps these in C++ statics; nothing
+    # about them needs a peer, so they are implemented rather than refused.
+    # `_update_default_pg` (distributed_c10d.py:1448) calls `_set_global_rank`
+    # on every `init_process_group`, so a refusal here stops initialisation.
+    global_state = {"rank": -1, "pg": None, "inflight_as_graph_input": False}
+
+    def _set_global_rank(rank):
+        global_state["rank"] = rank
+
+    def _get_global_rank():
+        return global_state["rank"]
+
+    def _set_process_group(pg):
+        global_state["pg"] = pg
+
+    def _current_process_group():
+        pg = global_state["pg"]
+        if pg is None:
+            raise RuntimeError(
+                "torch._C._distributed_c10d._current_process_group: none is "
+                "current; call init_process_group first"
+            )
+        return pg
+
+    def _set_allow_inflight_collective_as_graph_input(value):
+        global_state["inflight_as_graph_input"] = bool(value)
+
+    def _allow_inflight_collective_as_graph_input():
+        return global_state["inflight_as_graph_input"]
+
+    def _get_work_registry_size():
+        # Nothing is ever in flight: every Work this module hands back is
+        # already complete, so the registry of pending work is empty by
+        # construction rather than by not being kept.
+        return 0
+
+    mod._set_global_rank = _set_global_rank
+    mod._get_global_rank = _get_global_rank
+    mod._set_process_group = _set_process_group
+    mod._current_process_group = _current_process_group
+    mod._set_allow_inflight_collective_as_graph_input = (
+        _set_allow_inflight_collective_as_graph_input)
+    mod._allow_inflight_collective_as_graph_input = (
+        _allow_inflight_collective_as_graph_input)
+    mod._get_work_registry_size = _get_work_registry_size
+    mod._shim_global_state = global_state
+
+    mod._register_process_group = _register_process_group
+    mod._resolve_process_group = _resolve_process_group
+    mod._unregister_process_group = _unregister_process_group
+    mod._unregister_all_process_groups = _unregister_all_process_groups
+    mod._shim_registered_process_groups = registered_groups
+
+    # Everything not named above. `torch/distributed/__init__.py:49-75` imports
+    # a dozen more names (`Reducer`, `Logger`, `GradBucket`,
+    # `_broadcast_coalesced`, ...) and only binds them; they belong to DDP's
+    # gradient-bucketing machinery, which needs a second rank to mean anything.
+    # They exist and refuse, which is what DESIGN.md §6 asks for -- the message
+    # names the missing thing rather than the caller discovering a no-op later.
+    class _MissingC10d:
+        __slots__ = ("_shim_name",)
+
+        def __init__(self, missing_name):
+            self._shim_name = missing_name
+
+        def __call__(self, *args, **kwargs):
+            refuse(self._shim_name,
+                   "not implemented; world_size 1 has no peer, so this has no "
+                   "meaning here")
+
+        def __bool__(self):
+            # Rule 2 from `_Unimplemented`: a placeholder must not answer a
+            # truth test, because a truthy stub silently selects a branch.
+            raise NotImplementedError(
+                f"torch._C._distributed_c10d.{self._shim_name} was asked for a "
+                "truth value, and a placeholder has no honest answer"
+            )
+
+        def __repr__(self):
+            return f"<unimplemented torch._C._distributed_c10d.{self._shim_name}>"
+
+    # Names that must stay *absent*, not become placeholders.
+    #
+    # `distributed_c10d.py:204-242` imports each of these in its own
+    # `try/except ImportError` and records the result as `_GLOO_AVAILABLE` and
+    # friends. `from ... import X` turns an `AttributeError` from a module
+    # `__getattr__` into an `ImportError`, so absence is how the tree is told
+    # "this backend is not built" -- and that is true here.
+    #
+    # The catch-all below would otherwise synthesise them, because they are
+    # capitalised and it treats capitalised names as types. It did, and the
+    # result was `_GLOO_AVAILABLE = True` followed by
+    # `init_process_group(backend="gloo")` getting a hollow object instead of
+    # the tree's own "Distributed package doesn't have GLOO built in". A
+    # placeholder here does not refuse -- it *changes the answer to a question
+    # about what exists*, which is the distinction the "Deliberate omissions"
+    # block at the top of this file draws.
+    absent_backends = frozenset({
+        "ProcessGroupGloo", "ProcessGroupNCCL", "ProcessGroupUCC",
+        "ProcessGroupXCCL", "ProcessGroupMPI", "_ProcessGroupWrapper",
+    })
+    mod._shim_absent_backends = sorted(absent_backends)
+
+    def _module_getattr(missing_name):
+        if missing_name.startswith("__") and missing_name.endswith("__"):
+            raise AttributeError(missing_name)
+        if missing_name in absent_backends:
+            raise AttributeError(
+                f"torch._C._distributed_c10d has no {missing_name}: this build "
+                "has no transport, so no wire backend is compiled in. The "
+                "absence is the answer distributed_c10d.py's try/except is "
+                "written to read"
+            )
+        if missing_name[:1].isupper() or missing_name.lstrip("_")[:1].isupper():
+            # Capitalised means a type, and `distributed_c10d.py` puts several
+            # of them in annotations, which are evaluated at def time -- `|` on
+            # a non-type is a `TypeError`. Same reasoning as the `_ShimMeta`
+            # branch in `install`.
+            value = _ShimMeta(missing_name, (),
+                              {"__module__": name, "__init__": _permissive_init})
+        else:
+            value = _MissingC10d(missing_name)
+        setattr(mod, missing_name, value)
+        return value
+
+    # The names the stubs declare and this module does not implement.
+    #
+    # Built the same way the generic submodule loop above builds every other
+    # `_C` submodule -- `_build_type` gives each declared type its declared
+    # members as `_Unimplemented`, so `Reducer().prepare_for_backward(...)`
+    # raises `NotImplementedError` naming the member. Reaching them through the
+    # catch-all instead produced a bare type whose methods were an
+    # `AttributeError`, which says "no such thing" where the truth is "not
+    # built" -- a different answer to a different question.
+    #
+    # Most of what lands here is DDP's gradient-bucketing machinery (`Reducer`,
+    # `Logger`, `GradBucket`, `_broadcast_coalesced`,
+    # `_compute_bucket_assignment_by_size`), which needs a second rank before
+    # any of it means anything.
+    declared_types = {}
+    for type_name, type_spec in _order_types(spec.get("types", {})):
+        if hasattr(mod, type_name) or type_name in absent_backends:
+            continue
+        declared_types[type_name] = _build_type(
+            type_name, type_spec, name, declared_types)
+        setattr(mod, type_name, declared_types[type_name])
+    for fn_name in spec.get("functions", ()):
+        if not hasattr(mod, fn_name):
+            setattr(mod, fn_name, _MissingC10d(fn_name))
+    for value_name in spec.get("values", ()):
+        if not hasattr(mod, value_name):
+            setattr(mod, value_name, _MissingC10d(value_name))
+
+    mod.__getattr__ = _module_getattr
+
+    setattr(module, "_distributed_c10d", mod)
+    sys.modules[name] = mod
+
+    # -- the switch --------------------------------------------------------
+    def _c10d_init():
+        """`torch/distributed/__init__.py:38`, the tree's own init hook.
+
+        Two things happen here that cannot happen when `_C` is imported.
+
+        The first is the reason this function has a body at all: upstream's
+        `ProcessGroup` carries `torch._opaque_base.OpaqueBaseMeta` as its
+        metaclass, and `device_mesh._register_distributed_opaque_types`
+        refuses anything that does not. `_C` cannot reach into the Python tree
+        while `torch/__init__.py` is still running -- and must not, when it is
+        loaded standalone as `_C` by the golden harness, where `import torch`
+        would pull in a *different* torch. By the time this is called,
+        `torch.distributed` is being imported, so the tree is certainly there.
+
+        The shape is `_set_generator_metaclass`'s (VENDOR.md wall 19) with the
+        direction reversed: there the tree pushes the metaclass in, here `_C`
+        pulls it, because nothing in the tree offers to push this one.
+        """
+        if module.__name__ == "torch._C":
+            from torch._opaque_base import OpaqueBaseMeta
+
+            if type(ProcessGroup) is not OpaqueBaseMeta:
+                ProcessGroup.__class__ = OpaqueBaseMeta
+        return True
+
+    module._c10d_init = _c10d_init
 
 
 def _install_default_generator(module) -> None:
