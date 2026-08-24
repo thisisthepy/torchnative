@@ -1313,6 +1313,423 @@ def test_multinomial_matches_upstream_through_a_second_draw():
             assert t2.tolist() == c2.tolist(), (n_cat, n_sample, replacement, seed, "draw2")
 
 
+# --- checkpoint round trip: torch.load / safetensors read what upstream
+# wrote, and the `filled` guard refuses to fabricate zeros (docs/CKPT.md) ----
+#
+# docs/CKPT.md measured this by hand under /Volumes/macMini/caches/ckpt-probe/
+# (not committed, evaporates with the worktree) and said so itself: "이 중
+# 아무것도 회귀로부터 보호되지 않는다." This section pins those measurements.
+#
+# Unlike the `_E2EBackend` section above, this cannot use the "one process,
+# two names" trick (`_C` standalone + `import torch` for upstream) --
+# `torch.load`/`nn.Module`/`state_dict` live in *pure-Python* torch
+# (`torch/serialization.py`, `torch/nn/modules.py`, ...), and reaching them
+# through the shim means importing the *vendored* `torch` package, which has
+# `torch/_C.abi3.so` replaced by the shim (vendor/install_shim.sh). That
+# package is named `torch`, same as upstream -- the two cannot both be the
+# `torch` module in one interpreter. It would also mean `dlopen`-ing the
+# shim's native library a second time from a second path in a process that
+# already loaded it once as standalone `_C`, which nothing here has measured
+# as safe. So this uses a *second interpreter*, exactly the two-script recipe
+# docs/CKPT.md §7 already validated (`make_ckpt.py` then `verify.py`): a
+# subprocess with `torchnative/src/main` on `PYTHONPATH` gets the vendored
+# `torch` (shim-backed); this process keeps plain upstream `torch`
+# (`_upstream_torch` above, already guarded for its absence).
+#
+# The subprocess needs `torchnative/src/main/torch/_C.abi3.so` to exist,
+# which `vendor/install_shim.sh` places there -- a *different* build step
+# than the one `pytests/run.sh` runs for the standalone `_C` every other test
+# in this file uses. So the guard below checks for that file too, not just
+# `_upstream_torch is None`, and skips the same way (silently, no pytest.skip
+# -- see docs/E2E.md's reasoning, which applies here unchanged) when it is
+# missing.
+import functools
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+_CKPT_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_CKPT_VENDOR_DIR = os.path.join(_CKPT_REPO_ROOT, "torchnative", "src", "main")
+_CKPT_VENDOR_SHIM = os.path.join(_CKPT_VENDOR_DIR, "torch", "_C.abi3.so")
+
+_CKPT_V, _CKPT_H, _CKPT_F = 32, 16, 32  # vocab, hidden, ffn -- same shape as caches/ckpt-probe/make_ckpt.py's Tiny
+_CKPT_IDS = [3, 7, 1, 19]
+
+
+def _ckpt_det(n, seed, lo=-1000, hi=1000):
+    """Deterministic, RNG-free weights -- same generator as
+    caches/ckpt-probe/make_ckpt.py's and make_hard.py's `det()`, and the same
+    idea as `_e2e_det` above: checkpoint content must not depend on which
+    RNG (upstream's or the shim's) happens to run."""
+    return [((seed * 1103515245 + i * 12345) % (hi - lo) + lo) / 4000.0 for i in range(n)]
+
+
+def _ckpt_shim_available():
+    return _upstream_torch is not None and os.path.isfile(_CKPT_VENDOR_SHIM)
+
+
+# Runs in a *fresh* interpreter, with the vendored (shim-backed) `torch` on
+# PYTHONPATH. Reads the checkpoint this file's process (upstream) wrote,
+# forward-passes it through the same architecture, and reports everything as
+# one JSON object on stdout -- one subprocess launch buys every check below,
+# instead of one launch per property (each launch pays a real `import torch`
+# + `import safetensors`, not free -- see the wall-time note at the bottom of
+# this section).
+_CKPT_SHIM_SCRIPT = r"""
+import json, os, struct, sys
+import torch
+import torch.nn as nn
+
+cfg = json.load(sys.stdin)
+d = cfg["dir"]
+V, H, F = cfg["vocab"], cfg["hidden"], cfg["ffn"]
+ids_list, ref_logits, ref_keys, hard_meta = cfg["ids"], cfg["logits"], cfg["keys"], cfg["hard_meta"]
+result = {}
+
+
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(V, H)
+        self.norm = nn.LayerNorm(H)
+        self.gate = nn.Linear(H, F, bias=False)
+        self.up = nn.Linear(H, F, bias=False)
+        self.down = nn.Linear(F, H, bias=True)
+        self.final_norm = nn.LayerNorm(H)
+        self.lm_head = nn.Linear(H, V, bias=False)
+
+    def forward(self, ids):
+        h = self.embed(ids)
+        x = self.norm(h)
+        h = h + self.down(torch.nn.functional.silu(self.gate(x)) * self.up(x))
+        return self.lm_head(self.final_norm(h))
+
+
+def logit_diff(sd):
+    m = Tiny()
+    ids = torch.tensor(ids_list, dtype=torch.int64)
+    before = max(abs(a - b) for a, b in zip(m(ids).reshape(-1).tolist(), ref_logits))
+    m.load_state_dict(sd)
+    after = max(abs(a - b) for a, b in zip(m(ids).reshape(-1).tolist(), ref_logits))
+    return before, after
+
+
+sd_true = torch.load(os.path.join(d, "tiny.pt"), weights_only=True)
+result["keys_match"] = sorted(sd_true) == sorted(ref_keys)
+result["shapes_dtypes_match"] = all(
+    list(sd_true[k].shape) == ref_keys[k][0] and str(sd_true[k].dtype) == ref_keys[k][1] for k in ref_keys
+)
+b, a = logit_diff(sd_true)
+result["random_init_diff"] = b
+result["zip_weights_only_true_diff"] = a
+
+sd_false = torch.load(os.path.join(d, "tiny.pt"), weights_only=False)
+_, a2 = logit_diff(sd_false)
+result["zip_weights_only_false_diff"] = a2
+
+from safetensors.torch import load as sload, load_file
+
+raw = open(os.path.join(d, "tiny.safetensors"), "rb").read()
+sd_st = sload(raw)
+_, a3 = logit_diff(sd_st)
+result["safetensors_bytes_diff"] = a3
+
+sd_pr = load_file(os.path.join(d, "tiny.safetensors"), backend="pread")
+_, a4 = logit_diff(sd_pr)
+result["safetensors_pread_diff"] = a4
+
+result["reader_agreement_worst"] = max(
+    max(abs(x - y) for x, y in zip(sd_true[k].reshape(-1).tolist(), sd_st[k].reshape(-1).tolist()))
+    for k in sd_true
+)
+
+# Negative control: a checkpoint that was NOT perturbed would be worthless
+# evidence -- this shows a one-float bump actually moves the logits.
+hlen = struct.unpack("<Q", raw[:8])[0]
+header = json.loads(raw[8 : 8 + hlen])
+name, info = next((k, v) for k, v in header.items() if k != "__metadata__" and v["data_offsets"][0] == 0)
+off = 8 + hlen + info["data_offsets"][0]
+orig = struct.unpack("<f", raw[off : off + 4])[0]
+bumped = bytearray(raw)
+bumped[off : off + 4] = struct.pack("<f", orig + 1.0)
+_, ap = logit_diff(sload(bytes(bumped)))
+result["negative_control_diff"] = ap
+
+try:
+    torch.load(os.path.join(d, "tiny_legacy.pt"), weights_only=True)
+    result["legacy_refused"] = False
+except NotImplementedError as e:
+    result["legacy_refused"] = True
+    result["legacy_error"] = str(e)
+
+try:
+    load_file(os.path.join(d, "tiny.safetensors"), backend="mmap")
+    result["mmap_refused"] = False
+except NotImplementedError:
+    result["mmap_refused"] = True
+
+s = torch.UntypedStorage(16)
+t = torch.empty((0,), dtype=torch.float32)
+try:
+    t.set_(s, 0, [4], [1])
+    result["unfilled_refused"] = False
+except NotImplementedError as e:
+    result["unfilled_refused"] = True
+    result["unfilled_error"] = str(e)
+
+s._shim_fill(struct.pack("<4f", 0.0, 1.0, 2.0, 3.0))
+t.set_(s, 0, [2, 2], [2, 1])
+result["contiguous_read"] = t.reshape(-1).tolist()
+
+t2 = torch.empty((0,), dtype=torch.float32)
+t2.set_(s, 0, [2, 2], [1, 2])
+result["transposed_read"] = t2.reshape(-1).tolist()
+
+t3 = torch.empty((0,), dtype=torch.float32)
+t3.set_(s, 2, [2], [1])
+result["offset_read"] = t3.reshape(-1).tolist()
+
+t4 = torch.empty((0,), dtype=torch.float32)
+try:
+    t4.set_(s, 0, [9], [1])
+    result["past_end_refused"] = False
+except RuntimeError as e:
+    result["past_end_refused"] = True
+    result["past_end_error"] = str(e)
+
+t5 = torch.empty((0,), dtype=torch.float32)
+try:
+    t5.set_(s, 0, [2, 2], [-1, 1])
+    result["negative_stride_refused"] = False
+except NotImplementedError as e:
+    result["negative_stride_refused"] = True
+    result["negative_stride_error"] = str(e)
+
+sd_hard = torch.load(os.path.join(d, "hard.pt"), weights_only=True)
+hard_results = {}
+for key, want in hard_meta.items():
+    got = sd_hard[key]
+    vals = got.float().reshape(-1).tolist()
+    worst_k = max((abs(x - y) for x, y in zip(vals, want["values"])), default=0.0)
+    hard_results[key] = {
+        "dtype_ok": str(got.dtype) == want["dtype"],
+        "shape_ok": list(got.shape) == want["shape"],
+        "worst": worst_k,
+    }
+result["hard"] = hard_results
+result["tied_equal"] = sd_hard["tied_a"].reshape(-1).tolist() == sd_hard["tied_b"].reshape(-1).tolist()
+
+sys.stdout.write(json.dumps(result))
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def _ckpt_fixture():
+    """Builds a checkpoint with upstream torch (in this process), then reads
+    it back with the shim (in a subprocess -- see the section comment above)
+    and runs the identical forward pass on both sides. `lru_cache` computes
+    this once no matter how many of the five `test_ckpt_*` functions below
+    call it -- if it raises, `lru_cache` does not cache the exception, so
+    each caller re-runs it and independently fails (rather than one caller
+    absorbing the error and the rest silently reporting nothing)."""
+    torch = _upstream_torch
+    nn = torch.nn
+
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(_CKPT_V, _CKPT_H)
+            self.norm = nn.LayerNorm(_CKPT_H)
+            self.gate = nn.Linear(_CKPT_H, _CKPT_F, bias=False)
+            self.up = nn.Linear(_CKPT_H, _CKPT_F, bias=False)
+            self.down = nn.Linear(_CKPT_F, _CKPT_H, bias=True)
+            self.final_norm = nn.LayerNorm(_CKPT_H)
+            self.lm_head = nn.Linear(_CKPT_H, _CKPT_V, bias=False)
+
+        def forward(self, ids):
+            h = self.embed(ids)
+            x = self.norm(h)
+            h = h + self.down(torch.nn.functional.silu(self.gate(x)) * self.up(x))
+            return self.lm_head(self.final_norm(h))
+
+    m = Tiny()
+    with torch.no_grad():
+        for i, (name, p) in enumerate(sorted(m.state_dict().items())):
+            flat = _ckpt_det(p.numel(), i + 1)
+            m.state_dict()[name].copy_(torch.tensor(flat, dtype=torch.float32).reshape(p.shape))
+    m.eval()
+    ids_t = torch.tensor(_CKPT_IDS, dtype=torch.int64)
+    with torch.no_grad():
+        logits = m(ids_t)
+    sd = m.state_dict()
+
+    tmpdir = tempfile.mkdtemp(prefix="ckpt-harness-")
+    torch.save(sd, os.path.join(tmpdir, "tiny.pt"))
+    torch.save(sd, os.path.join(tmpdir, "tiny_legacy.pt"), _use_new_zipfile_serialization=False)
+    from safetensors.torch import save_file
+
+    save_file({k: v.contiguous() for k, v in sd.items()}, os.path.join(tmpdir, "tiny.safetensors"))
+    keys = {k: [list(v.shape), str(v.dtype)] for k, v in sd.items()}
+
+    # The 14-case "hard" checkpoint: dtypes and views a real checkpoint has
+    # that Tiny above does not (docs/CKPT.md §5-6).
+    hard = {}
+    hard["w_f32"] = torch.tensor(_ckpt_det(24, 101), dtype=torch.float32).reshape(4, 6)
+    hard["w_f16"] = hard["w_f32"].half()
+    hard["w_bf16"] = hard["w_f32"].bfloat16()
+    hard["w_f64"] = torch.tensor(_ckpt_det(12, 104), dtype=torch.float64).reshape(3, 4)
+    hard["buf_i64"] = torch.arange(10, dtype=torch.int64)
+    hard["buf_i32"] = torch.arange(10, dtype=torch.int32)
+    hard["buf_bool"] = torch.arange(10) % 3 == 0
+    hard["scalar"] = torch.tensor(1.25)
+    hard["empty"] = torch.zeros(0, dtype=torch.float32)
+    hard["rank3"] = torch.tensor(_ckpt_det(24, 105), dtype=torch.float32).reshape(2, 3, 4)
+    tied = torch.tensor(_ckpt_det(20, 106), dtype=torch.float32).reshape(4, 5)
+    hard["tied_a"], hard["tied_b"] = tied, tied
+    base = torch.tensor(_ckpt_det(12, 107), dtype=torch.float32).reshape(3, 4)
+    hard["transposed"] = base.t()
+    big = torch.tensor(_ckpt_det(20, 108), dtype=torch.float32)
+    hard["slice_offset"] = big[5:13]
+    torch.save(hard, os.path.join(tmpdir, "hard.pt"))
+    hard_meta = {
+        k: {"shape": list(v.shape), "dtype": str(v.dtype), "values": v.float().reshape(-1).tolist()}
+        for k, v in hard.items()
+    }
+
+    cfg = {
+        "dir": tmpdir,
+        "vocab": _CKPT_V, "hidden": _CKPT_H, "ffn": _CKPT_F,
+        "ids": _CKPT_IDS,
+        "logits": logits.reshape(-1).tolist(),
+        "keys": keys,
+        "hard_meta": hard_meta,
+    }
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    # Not a workaround -- upstream ships this switch for builds without
+    # libtorch_global_deps, which is exactly this one (docs/CKPT.md §7,
+    # VENDOR.md:181).
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _CKPT_SHIM_SCRIPT],
+        input=json.dumps(cfg),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"checkpoint subprocess (shim side) exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"checkpoint subprocess produced non-JSON stdout: {proc.stdout!r}") from e
+
+
+def test_ckpt_torch_load_zip_round_trip_matches_upstream_within_measured_tolerance():
+    # docs/CKPT.md §1: torch.load (zip, both weights_only=True and False)
+    # measured 2.98e-08 today, inside the "normal float32 rounding" range
+    # (2.3e-09~5.2e-06) that table itself states -- the same range
+    # `_E2E_LOGIT_ATOL` above is grounded in, so this reuses that constant
+    # rather than inventing a second one for the same evidence.
+    if not _ckpt_shim_available():
+        return  # no upstream torch, or vendor shim not installed -- see docs/CKPT.md
+    r = _ckpt_fixture()
+    assert r["keys_match"]
+    assert r["shapes_dtypes_match"]
+    # Negative control: a freshly initialized model must NOT already sit at
+    # the target logits, or "small diff after loading" would prove nothing.
+    assert r["random_init_diff"] > 1e-3, r["random_init_diff"]
+    assert r["zip_weights_only_true_diff"] < _E2E_LOGIT_ATOL, r["zip_weights_only_true_diff"]
+    assert r["zip_weights_only_false_diff"] < _E2E_LOGIT_ATOL, r["zip_weights_only_false_diff"]
+
+
+def test_ckpt_safetensors_two_readers_agree_with_torch_load_bit_for_bit():
+    # docs/CKPT.md §1, §3.1: both safetensors backends load correctly, and
+    # agree with torch.load's reading of the *same weights* to exactly 0.0 --
+    # not an approximation, because both go through the shared `from_le_bytes`
+    # (docs/CKPT.md §6) rather than two independent dtype/bool paths.
+    if not _ckpt_shim_available():
+        return
+    r = _ckpt_fixture()
+    assert r["safetensors_bytes_diff"] < _E2E_LOGIT_ATOL, r["safetensors_bytes_diff"]
+    assert r["safetensors_pread_diff"] < _E2E_LOGIT_ATOL, r["safetensors_pread_diff"]
+    assert r["reader_agreement_worst"] == 0.0, r["reader_agreement_worst"]
+    # Negative control on the safetensors payload itself (not just the model):
+    # a one-float bump must move the logits, or "bit exact" would be checking
+    # two readers that both ignore their input.
+    assert r["negative_control_diff"] > 1e-3, r["negative_control_diff"]
+
+
+def test_ckpt_legacy_format_and_mmap_backend_are_refused_by_name():
+    # docs/CKPT.md §3.3, §4: legacy (non-zip) torch.load and safetensors'
+    # default mmap backend are the two paths this shim does NOT implement,
+    # and both must refuse loudly (NotImplementedError) rather than silently
+    # produce zeros or wrong data. The legacy refusal is the `filled` guard
+    # firing transitively through `_rebuild_tensor` -> `set_`.
+    if not _ckpt_shim_available():
+        return
+    r = _ckpt_fixture()
+    assert r["legacy_refused"], "legacy (non-zip) torch.load did NOT refuse -- check for zeros!"
+    assert "never been filled" in r["legacy_error"], r["legacy_error"]
+    assert r["mmap_refused"], "safetensors mmap backend did NOT refuse"
+
+
+def test_ckpt_filled_guard_refuses_set_on_unfilled_storage_then_gathers_strided_views():
+    # docs/CKPT.md §4: the single most important safety property in this
+    # work. Without it, `torch.load` of a legacy-format checkpoint succeeds,
+    # `load_state_dict` reports "All keys matched successfully", and every
+    # loaded weight is silently 0.0 -- no exception anywhere (docs/CKPT.md §4
+    # reproduces that exact failure). `set_` on a storage that was never
+    # filled must refuse by name; once filled, `set_` must gather strided
+    # views correctly (docs/CKPT.md §5: contiguous, transposed, and a nonzero
+    # storage_offset), and must still refuse bounds violations and negative
+    # strides rather than guess.
+    if not _ckpt_shim_available():
+        return
+    r = _ckpt_fixture()
+    assert r["unfilled_refused"], "set_ on an unfilled storage did NOT refuse -- IT RETURNED ZEROS"
+    assert "never been filled" in r["unfilled_error"], r["unfilled_error"]
+    assert r["contiguous_read"] == [0.0, 1.0, 2.0, 3.0], r["contiguous_read"]
+    assert r["transposed_read"] == [0.0, 2.0, 1.0, 3.0], r["transposed_read"]
+    assert r["offset_read"] == [2.0, 3.0], r["offset_read"]
+    assert r["past_end_refused"], "set_ past the end of the storage did NOT refuse"
+    assert "storage" in r["past_end_error"], r["past_end_error"]
+    assert r["negative_stride_refused"], "set_ with a negative stride did NOT refuse"
+    assert "egative stride" in r["negative_stride_error"], r["negative_stride_error"]
+
+
+def test_ckpt_fourteen_hard_dtypes_and_views_round_trip_bit_exact():
+    # docs/CKPT.md §5: f16/bf16/f64/i64/i32/bool/scalar/empty/rank-3, tied
+    # weights, a transposed view, and a nonzero storage_offset slice -- all
+    # loaded from a checkpoint upstream wrote. docs/CKPT.md's own bar for
+    # these is bit-exact ("키마다 비트 일치"), not a tolerance: float16 and
+    # bfloat16 round-trip exactly through float32, so a nonzero diff here is
+    # a real regression, not rounding.
+    if not _ckpt_shim_available():
+        return
+    r = _ckpt_fixture()
+    hard = r["hard"]
+    expected_keys = {
+        "w_f32", "w_f16", "w_bf16", "w_f64", "buf_i64", "buf_i32", "buf_bool",
+        "scalar", "empty", "rank3", "tied_a", "tied_b", "transposed", "slice_offset",
+    }
+    assert set(hard) == expected_keys, set(hard) ^ expected_keys
+    for key, got in hard.items():
+        assert got["dtype_ok"], (key, "dtype mismatch")
+        assert got["shape_ok"], (key, "shape mismatch")
+        assert got["worst"] == 0.0, (key, got["worst"])
+    # Weight tying is preserved in value (not identity -- docs/CKPT.md §5's
+    # one recorded gap, which this does not re-litigate).
+    assert r["tied_equal"]
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):
