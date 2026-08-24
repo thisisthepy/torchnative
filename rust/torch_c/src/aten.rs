@@ -37,6 +37,7 @@ use crate::tensor::PyTensorBase;
 pub const IMPLEMENTED: &[&str] = &[
     "aten._local_scalar_dense.default",
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
+    "aten._softmax.default",
     "aten._to_copy.default",
     "aten._unsafe_view.default",
     "aten.add.Tensor",
@@ -66,10 +67,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.eq.Tensor",
     "aten.expand.default",
     "aten.fill_.Scalar",
+    "aten.fill_.Tensor",
     "aten.full.default",
     "aten.index.Tensor",
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
+    "aten.le.Scalar",
     "aten.lift_fresh.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
@@ -80,6 +83,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mean.dim",
     "aten.mm.default",
     "aten.mul.Tensor",
+    "aten.multinomial.default",
     "aten.ne.Scalar",
     "aten.ne.Tensor",
     "aten.neg.default",
@@ -93,14 +97,18 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.reciprocal.default",
     "aten.rsqrt.default",
     "aten.rsub.Scalar",
+    "aten.scatter.src",
     "aten.select.int",
     "aten.silu.default",
     "aten.sin.default",
     "aten.slice.Tensor",
+    "aten.sort.default",
+    "aten.squeeze.dim",
     "aten.sub.Tensor",
     "aten.sum.default",
     "aten.sum.dim_IntList",
     "aten.t.default",
+    "aten.topk.default",
     "aten.transpose.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
@@ -127,7 +135,6 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.any.dims",
     "aten.contiguous.default",
     "aten.div.Scalar",
-    "aten.fill_.Tensor",
     "aten.masked_fill.Tensor",
     "aten.matmul.default",
     "aten.max.other",
@@ -228,6 +235,7 @@ fn aten_dispatch_inner(
         "aten.ne.Scalar" => compare_scalar(py, args, kwargs, "aten.ne.Scalar", Cmp::Ne),
         "aten.lt.Tensor" => compare_tensor(py, args, kwargs, "aten.lt.Tensor", Cmp::Lt),
         "aten.lt.Scalar" => compare_scalar(py, args, kwargs, "aten.lt.Scalar", Cmp::Lt),
+        "aten.le.Scalar" => compare_scalar(py, args, kwargs, "aten.le.Scalar", Cmp::Le),
 
         "aten.bitwise_and.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_and.Tensor", Bitwise::And),
         "aten.bitwise_or.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_or.Tensor", Bitwise::Or),
@@ -274,6 +282,7 @@ fn aten_dispatch_inner(
         "aten.transpose.int" => transpose_int(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
         "aten.unsqueeze.default" => unsqueeze_default(py, args, kwargs),
+        "aten.squeeze.dim" => squeeze_dim(py, args, kwargs),
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
         "aten.clone.default" => clone_default(py, args, kwargs),
         "aten.detach.default" => detach_default(py, args, kwargs),
@@ -291,6 +300,13 @@ fn aten_dispatch_inner(
         "aten.copy_.default" => copy_inplace(py, args, kwargs),
         "aten.uniform_.default" => uniform_inplace(py, args, kwargs),
         "aten.normal_.default" => normal_inplace(py, args, kwargs),
+
+        // -- the eight `do_sample=True` stops on (docs/SAMPLING.md) ---------
+        "aten._softmax.default" => softmax_default(py, args, kwargs),
+        "aten.scatter.src" => scatter_src(py, args, kwargs),
+        "aten.sort.default" => sort_default(py, args, kwargs),
+        "aten.topk.default" => topk_default(py, args, kwargs),
+        "aten.multinomial.default" => multinomial_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -1551,6 +1567,7 @@ enum Cmp {
     Eq,
     Ne,
     Lt,
+    Le,
 }
 
 /// The comparison ops all answer `torch.bool`, and both operands are read in
@@ -1572,6 +1589,7 @@ fn apply_cmp(op: &str, kind: Cmp, lhs: &Tensor, rhs: &Tensor) -> PyResult<Tensor
         Cmp::Eq => lhs.broadcast_eq(rhs),
         Cmp::Ne => lhs.broadcast_ne(rhs),
         Cmp::Lt => lhs.broadcast_lt(rhs),
+        Cmp::Le => lhs.broadcast_le(rhs),
     }
     .map_err(|e| candle_err(op, e))
 }
@@ -3343,6 +3361,831 @@ fn normal_inplace(
     receiver.borrow_mut().replace_with(PyTensorBase::new(filled)?);
     let _ = (py, target.tag);
     Ok(receiver.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
+// The eight ops `do_sample=True` stops on
+//
+// docs/GAP.md §4 predicted ten; the coordinating session re-measured a real
+// transformers Llama against `_aten_implemented()` and found eight still
+// missing. docs/SAMPLING.md records what each one turned out to be.
+//
+// Seven of the eight are ordinary kernels. `multinomial` is not: it is the only
+// op in this file that *draws*, and a sampled token is only reproducible if it
+// consumes torch's stream in torch's order. That made "read the upstream
+// algorithm" a requirement rather than a nicety, and reading it produced two
+// facts guessing would have missed -- see `multinomial_default`.
+//
+// One thing is deliberately *not* reproduced, and it is worth naming here
+// rather than only at the call site: `topk`'s `sorted=False` order. Upstream
+// leaves it unspecified and its CPU kernel returns a partition artefact
+// (measured: `k=3` of an 8-element tensor answers `[7, 6, 0]` where `sorted=True`
+// answers `[6, 7, 0]`). This shim always returns the sorted order, which is a
+// legal answer to the same question; the harness compares those cases as
+// multisets so it cannot accidentally pin an order upstream does not promise.
+// ---------------------------------------------------------------------------
+
+/// A tensor's elements read into the one representation that can hold them
+/// exactly: `f64` for the floating dtypes (widening f32/f16/bf16 and back is
+/// lossless), `i64` for everything else.
+///
+/// Reading floats as `i64` or `int64` as `f64` would both lose information the
+/// ops below depend on -- `sort` on `int64` values beyond 2^53 would start
+/// declaring ties that are not ties.
+enum Flat {
+    Float(Vec<f64>),
+    Int(Vec<i64>),
+}
+
+impl Flat {
+    fn empty_like(&self, n: usize) -> Flat {
+        match self {
+            Flat::Float(_) => Flat::Float(vec![0.0; n]),
+            Flat::Int(_) => Flat::Int(vec![0; n]),
+        }
+    }
+}
+
+fn read_flat(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<Flat> {
+    let flat = tensor
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(op, e))?;
+    if tag.is_floating_point() {
+        Ok(Flat::Float(
+            flat.to_dtype(candle_core::DType::F64)
+                .and_then(|t| t.to_vec1::<f64>())
+                .map_err(|e| candle_err(op, e))?,
+        ))
+    } else {
+        Ok(Flat::Int(
+            flat.to_dtype(candle_core::DType::I64)
+                .and_then(|t| t.to_vec1::<i64>())
+                .map_err(|e| candle_err(op, e))?,
+        ))
+    }
+}
+
+fn write_flat(
+    op: &str,
+    values: Flat,
+    dims: Vec<usize>,
+    device: &Device,
+    tag: TorchDType,
+) -> PyResult<Tensor> {
+    let storage = PyDtype::new(tag).storage(op)?;
+    match values {
+        Flat::Float(v) => Tensor::from_vec(v, dims, device),
+        Flat::Int(v) => Tensor::from_vec(v, dims, device),
+    }
+    .and_then(|t| t.to_dtype(storage))
+    .map_err(|e| candle_err(op, e))
+}
+
+/// torch's ordering of floats, which is not `f64`'s.
+///
+/// IEEE says every comparison against NaN is false; torch sorts NaN as
+/// *greatest*, so ascending puts it last and descending puts it first, and
+/// `topk(largest=True)` picks it before `+inf` (all three measured). A
+/// `partial_cmp().unwrap()` here would panic on the first NaN instead.
+fn cmp_torch_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+    }
+}
+
+/// The (values, indices) result `sort` and `topk` share, in the layout
+/// upstream produces.
+struct Ordered {
+    values: Flat,
+    indices: Vec<i64>,
+    dims: Vec<usize>,
+}
+
+/// Reorder every lane along `dim`, keeping `keep` of each.
+///
+/// **The sort is stable, and for `sort` that is a measurement, not a
+/// convenience.** Upstream's CPU `sort` keeps the original index order among
+/// equal values in *both* directions: `[3,1,3,1,2,3]` descending answers
+/// indices `[0,2,5,4,1,3]`, not the reverse of the ascending run, and an
+/// 80-element all-ties tensor comes back as `0..79`. An unstable
+/// `sort_unstable_by` here would be a silent behaviour change with no failing
+/// test anywhere near it.
+///
+/// **`topk` is a different story and the difference is recorded rather than
+/// hidden.** Upstream's `topk` is a partial selection, not a sort, and its tie
+/// order is stable only sometimes: on the same `[3,1,3,1,2,3]`, `k=3` answers
+/// `[0,2,5]` (stable, and this shim agrees) but `k=6` answers `[0,2,5,4,3,1]`
+/// -- the two 1.0s come back reversed. Reproducing that would mean
+/// transcribing the partition, and upstream promises nothing about it. This
+/// shim answers `[0,2,5,4,1,3]` there. It matters for nothing measured: the
+/// `top_k` warper reads only `values[..., -1]`, and `multinomial`'s
+/// no-replacement path feeds `topk` continuous ratios where ties do not occur.
+/// docs/SAMPLING.md §4 has the measurement; the golden cases keep `topk`'s
+/// index comparison to tie-free inputs and compare the tied ones by value.
+fn order_along(
+    op: &str,
+    input: &PyTensorBase,
+    dim: usize,
+    descending: bool,
+    keep: Option<usize>,
+) -> PyResult<Ordered> {
+    let dims = input.tensor().dims().to_vec();
+    // A 0-d tensor is one lane of one element; torch answers `sort`/`topk` on
+    // one with a 0-d value and a 0-d index of 0, rather than refusing.
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+    let keep = keep.unwrap_or(n);
+
+    let source = read_flat(op, input.tensor(), input.tag())?;
+    let mut values = source.empty_like(outer * keep * inner);
+    let mut indices = vec![0i64; outer * keep * inner];
+
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    for o in 0..outer {
+        for i in 0..inner {
+            let at = |j: usize| o * n * inner + j * inner + i;
+            order.clear();
+            order.extend(0..n);
+            match &source {
+                Flat::Float(v) => order.sort_by(|&a, &b| {
+                    let (x, y) = (v[at(a)], v[at(b)]);
+                    if descending {
+                        cmp_torch_f64(y, x)
+                    } else {
+                        cmp_torch_f64(x, y)
+                    }
+                }),
+                Flat::Int(v) => order.sort_by(|&a, &b| {
+                    let (x, y) = (v[at(a)], v[at(b)]);
+                    if descending {
+                        y.cmp(&x)
+                    } else {
+                        x.cmp(&y)
+                    }
+                }),
+            }
+            for (slot, &j) in order.iter().take(keep).enumerate() {
+                let dst = o * keep * inner + slot * inner + i;
+                indices[dst] = j as i64;
+                match (&source, &mut values) {
+                    (Flat::Float(src), Flat::Float(out)) => out[dst] = src[at(j)],
+                    (Flat::Int(src), Flat::Int(out)) => out[dst] = src[at(j)],
+                    _ => unreachable!("values was allocated from source's own variant"),
+                }
+            }
+        }
+    }
+
+    let mut out_dims = dims;
+    if !out_dims.is_empty() {
+        out_dims[dim] = keep;
+    }
+    Ok(Ordered {
+        values,
+        indices,
+        dims: out_dims,
+    })
+}
+
+static SORT_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static TOPK_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// The `(values, indices)` namedtuple `sort` and `topk` answer with, built the
+/// same way `max.dim`'s is and cached for the same reason.
+fn values_indices_type(
+    py: Python<'_>,
+    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    name: &str,
+) -> PyResult<&'static Py<PyAny>> {
+    if let Some(cached) = cell.get() {
+        return Ok(cached);
+    }
+    let namedtuple = py
+        .import("collections")?
+        .getattr("namedtuple")?
+        .call1((name, ("values", "indices")))?
+        .unbind();
+    let _ = cell.set(namedtuple);
+    Ok(cell.get().expect("just set"))
+}
+
+fn finish_ordered(
+    py: Python<'_>,
+    op: &str,
+    cell: &'static std::sync::OnceLock<Py<PyAny>>,
+    name: &str,
+    ordered: Ordered,
+    tag: TorchDType,
+    device: &Device,
+) -> PyResult<Py<PyAny>> {
+    let values = write_flat(op, ordered.values, ordered.dims.clone(), device, tag)?;
+    let indices = Tensor::from_vec(ordered.indices, ordered.dims, device)
+        .map_err(|e| candle_err(op, e))?;
+    // Promoted here rather than at the dispatcher's exit, for the reason
+    // `max.dim` gives: the pair leaves inside a namedtuple, which `promote`
+    // does not look into.
+    let pair = (
+        crate::tensor::promote(py, finish(py, values, tag)?)?,
+        crate::tensor::promote(py, finish(py, indices, TorchDType::Int64)?)?,
+    );
+    Ok(values_indices_type(py, cell, name)?
+        .bind(py)
+        .call1(pair)?
+        .unbind())
+}
+
+/// `aten::sort(Tensor self, int dim=-1, bool descending=False)
+///     -> (Tensor values, Tensor indices)`
+///
+/// Reached by `TopPLogitsWarper`, which sorts the whole vocabulary row before
+/// taking a cumulative sum of the softmax over it.
+fn sort_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.sort.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
+    let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
+    let ordered = order_along(OP, &input, dim, descending, None)?;
+    let device = input.tensor().device().clone();
+    finish_ordered(py, OP, &SORT_RESULT, "sort", ordered, input.tag(), &device)
+}
+
+/// `aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
+///             bool sorted=True) -> (Tensor values, Tensor indices)`
+///
+/// Reached by `TopKLogitsWarper`, which only ever reads `values[..., -1]` --
+/// the k-th largest logit, used as a threshold. The indices still have to be
+/// right, because the same op is how `multinomial` picks more than one sample
+/// without replacement.
+fn topk_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.topk.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    let k = int_arg(args, kwargs, 1, "k")?.ok_or_else(|| missing(OP, "k"))?;
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+    let largest = bool_arg(args, kwargs, 3, "largest")?.unwrap_or(true);
+    // Read and discarded: see the section note. `sorted=False` licenses an
+    // unspecified order and this shim answers with the sorted one, which is
+    // within that licence.
+    let _sorted = bool_arg(args, kwargs, 4, "sorted")?.unwrap_or(true);
+
+    let extent = if rank == 0 { 1 } else { input.tensor().dims()[dim] };
+    if k < 0 || k as usize > extent {
+        // torch's own wording, and torch's own conflation of "negative" with
+        // "too large" -- `topk(x, -1)` gives this same message upstream.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "selected index k out of range",
+        ));
+    }
+    let ordered = order_along(OP, &input, dim, largest, Some(k as usize))?;
+    let device = input.tensor().device().clone();
+    finish_ordered(py, OP, &TOPK_RESULT, "topk", ordered, input.tag(), &device)
+}
+
+/// `aten::squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)`
+///
+/// The one thing to get right is that a dimension whose size is not 1 is a
+/// **no-op, not an error** -- `squeeze(1)` on a `(1,3,1,2)` tensor answers
+/// `(1,3,1,2)` unchanged (measured). Refusing there would break the generation
+/// loop's `next_tokens.squeeze(1)` the moment a batch had one row.
+fn squeeze_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.squeeze.dim";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        rank,
+    )?;
+    // A 0-d tensor has nothing to remove; `normalise_dim` already accepted
+    // dim 0 and -1 on it, as torch does.
+    if rank == 0 {
+        return finish(py, input.tensor().clone(), input.tag());
+    }
+    // candle's `squeeze` carries the same "size != 1 is a no-op" rule and does
+    // it without a contiguous copy, so a strided view survives.
+    let out = input
+        .tensor()
+        .squeeze(dim)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `aten::_softmax(Tensor self, int dim, bool half_to_float) -> Tensor`
+///
+/// Two refusals are reproduced rather than papered over, both measured:
+///
+///   * `half_to_float=True` is **not supported on CPU at all**, for any dtype
+///     -- `float16`, `bfloat16` and `float32` inputs all raise. It is a CUDA-only
+///     fusion. A shim that quietly honoured it would return `float32` where
+///     upstream raises.
+///   * an integral input raises `NotImplementedError`, naming the kernel, not
+///     a `RuntimeError`.
+///
+/// The accumulate type follows `opmath_type<scalar_t>` -- `float` for
+/// `float16`/`bfloat16`/`float32`, `double` for `float64` -- so the reduced
+/// dtypes compute in float and narrow once at the end, which is why they agree
+/// with upstream to better than their own epsilon.
+///
+/// The max is subtracted before the exponential for the reason docs/OPS8.md §3
+/// gives for the attention kernel: without it a masked `-inf` and a large logit
+/// both come out NaN. With it, `exp(-inf - max)` is a clean zero. A row that is
+/// *entirely* `-inf` still gives NaN on both sides, and a case pins that.
+fn softmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._softmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let half_to_float = bool_arg(args, kwargs, 2, "half_to_float")?
+        .ok_or_else(|| missing(OP, "half_to_float"))?;
+    if half_to_float {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "softmax with half to float conversion is not supported on CPU",
+        ));
+    }
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(not_implemented(format!(
+            "\"softmax_lastdim_kernel_impl\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let rank = input.tensor().rank();
+    let dim = normalise_dim(OP, dim_raw, rank)?;
+
+    let dims = input.tensor().dims().to_vec();
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+
+    let source = match read_flat(OP, input.tensor(), tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let double_acc = storage == candle_core::DType::F64;
+    let mut out = vec![0.0f64; source.len()];
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let at = |j: usize| o * n * inner + j * inner + i;
+            if double_acc {
+                let mut max = f64::NEG_INFINITY;
+                for j in 0..n {
+                    let v = source[at(j)];
+                    if !(v <= max) {
+                        max = v;
+                    }
+                }
+                let mut sum = 0.0f64;
+                for j in 0..n {
+                    let e = (source[at(j)] - max).exp();
+                    out[at(j)] = e;
+                    sum += e;
+                }
+                for j in 0..n {
+                    out[at(j)] /= sum;
+                }
+            } else {
+                let mut max = f32::NEG_INFINITY;
+                for j in 0..n {
+                    let v = source[at(j)] as f32;
+                    if !(v <= max) {
+                        max = v;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for j in 0..n {
+                    let e = ((source[at(j)] as f32) - max).exp();
+                    out[at(j)] = e as f64;
+                    sum += e;
+                }
+                for j in 0..n {
+                    out[at(j)] = ((out[at(j)] as f32) / sum) as f64;
+                }
+            }
+        }
+    }
+
+    let device = input.tensor().device().clone();
+    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// Row-major strides for a contiguous shape, as element counts.
+fn contiguous_strides(dims: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1];
+    }
+    strides
+}
+
+/// `aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor`
+///
+/// Written out by hand rather than routed to `candle`'s `scatter`, because the
+/// two do not agree on what a valid call is: candle requires
+/// `index.dims() == src.dims()` and `self.dims() == src.dims()` off the scatter
+/// axis, while torch requires only that `index` be **no larger than** either.
+/// The generation loop uses exactly the shape candle rejects -- `scatter` of a
+/// `(batch, k)` index into a `(batch, vocab)` row of logits -- so borrowing
+/// candle's checks would refuse the call that matters.
+///
+/// Duplicate indices resolve to the *last* write in iteration order, matching
+/// upstream (measured: scattering `[1,2,3]` at index `[0,0,0]` leaves 3).
+fn scatter_src(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.scatter.src";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let src = tensor_arg(OP, args, kwargs, 3, "src")?;
+
+    let tag = input.tag();
+    if src.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "scatter(): Expected self.dtype to be equal to src.dtype",
+        ));
+    }
+    // torch accepts both int32 and int64 here (measured -- an `int32` index is
+    // *not* refused, unlike a `uint8` mask in `masked_fill`).
+    if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "scatter(): Expected dtype int32 or int64 for index, got {}",
+            index.tag().name()
+        )));
+    }
+
+    let rank = input.tensor().rank();
+    if rank == 0 {
+        return Err(not_implemented(
+            "aten.scatter.src: 0-dim self not implemented in torch._C shim",
+        ));
+    }
+    let dim = normalise_dim(OP, dim_raw, rank)?;
+    let self_dims = input.tensor().dims().to_vec();
+    let idx_dims = index.tensor().dims().to_vec();
+    let src_dims = src.tensor().dims().to_vec();
+    if idx_dims.len() != rank {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as self tensor",
+        ));
+    }
+    if src_dims.len() != rank {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as src tensor",
+        ));
+    }
+    for d in 0..rank {
+        if idx_dims[d] > src_dims[d] || (d != dim && idx_dims[d] > self_dims[d]) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected index {idx_dims:?} to be no larger than self {self_dims:?} apart \
+                 from dimension {dim} and to be no larger size than src {src_dims:?}"
+            )));
+        }
+    }
+
+    let mut out = read_flat(OP, input.tensor(), tag)?;
+    let source = read_flat(OP, src.tensor(), tag)?;
+    let positions = match read_flat(OP, index.tensor(), index.tag())? {
+        Flat::Int(v) => v,
+        Flat::Float(_) => unreachable!("the index dtype was checked above"),
+    };
+
+    let self_strides = contiguous_strides(&self_dims);
+    let idx_strides = contiguous_strides(&idx_dims);
+    let src_strides = contiguous_strides(&src_dims);
+    let count: usize = idx_dims.iter().product();
+
+    let mut coord = vec![0usize; rank];
+    for _ in 0..count {
+        let idx_off: usize = coord.iter().zip(&idx_strides).map(|(c, s)| c * s).sum();
+        let target = positions[idx_off];
+        if target < 0 || target as usize >= self_dims[dim] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index {target} is out of bounds for dimension {dim} with size {}",
+                self_dims[dim]
+            )));
+        }
+        let src_off: usize = coord.iter().zip(&src_strides).map(|(c, s)| c * s).sum();
+        let self_off: usize = coord
+            .iter()
+            .enumerate()
+            .map(|(d, c)| if d == dim { target as usize } else { *c } * self_strides[d])
+            .sum();
+        match (&source, &mut out) {
+            (Flat::Float(s), Flat::Float(o)) => o[self_off] = s[src_off],
+            (Flat::Int(s), Flat::Int(o)) => o[self_off] = s[src_off],
+            _ => unreachable!("self and src share a dtype, checked above"),
+        }
+        for d in (0..rank).rev() {
+            coord[d] += 1;
+            if coord[d] < idx_dims[d] {
+                break;
+            }
+            coord[d] = 0;
+        }
+    }
+
+    let device = input.tensor().device().clone();
+    let tensor = write_flat(OP, out, self_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// Round a vector through the storage dtype and back, in one candle pass.
+///
+/// `multinomial`'s fast path needs this twice, because upstream writes both
+/// intermediates into tensors of the input's dtype: `q = empty_like(self)`
+/// narrows the exponential draws, and `at::div_out(q, self, q)` narrows the
+/// ratio. Doing the arithmetic in `f64` throughout and narrowing once at the
+/// end would give a *different argmax* wherever two categories are within an
+/// ulp of each other, which is precisely where a sampler's choice is decided.
+fn narrow_through(
+    op: &str,
+    values: Vec<f64>,
+    storage: candle_core::DType,
+    device: &Device,
+) -> PyResult<Vec<f64>> {
+    if storage == candle_core::DType::F64 {
+        return Ok(values);
+    }
+    let n = values.len();
+    if n == 0 {
+        return Ok(values);
+    }
+    Tensor::from_vec(values, n, device)
+        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.to_dtype(candle_core::DType::F64))
+        .and_then(|t| t.to_vec1::<f64>())
+        .map_err(|e| candle_err(op, e))
+}
+
+/// `aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False,
+///                    *, Generator? generator=None) -> Tensor`
+///
+/// The only op here that draws, and therefore the only one whose *answer*
+/// depends on consuming torch's stream in torch's order. Two facts decide it,
+/// and both were measured rather than assumed (docs/SAMPLING.md §2):
+///
+/// **1. There are two algorithms, and the branch is not the one the argument
+/// name suggests.** `multinomial_out` takes a Gumbel-style fast path when
+/// `!replacement` **or `num_samples == 1`** -- so the call
+/// `GenerationMixin._sample` makes, `multinomial(probs, num_samples=1)`, takes
+/// it even though `replacement` defaults to False and the docs describe the
+/// cumulative-sum kernel. The fast path is
+///
+///     q = empty_like(self).exponential_(1);  q = self / q;  argmax(q, -1, keepdim)
+///
+/// (`topk` instead of `argmax` when more than one sample is wanted), which
+/// consumes `2 * numel` 32-bit words regardless of `num_samples`. The
+/// with-replacement kernel consumes `2 * n_dist * num_samples`. Counting words
+/// on real torch is what distinguished them: `multinomial(ones(100), 1)`
+/// advances the generator by 200 words, `multinomial(ones(100), 3,
+/// replacement=True)` by 6.
+///
+/// **2. Every intermediate is narrowed to the input dtype.** See
+/// `narrow_through`.
+///
+/// The with-replacement kernel's cumulative sum accumulates *in the input
+/// dtype* (`scalar_t sum = 0; sum += val;`), sets the last bucket to exactly 1
+/// before searching, and compares `cum_prob < uniform_sample` with the
+/// left-biased binary search transcribed below. Both paths were checked against
+/// upstream on a `(3, 11)` distribution over six seeds: 12/12 identical index
+/// lists, no tolerance involved.
+fn multinomial_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.multinomial.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let num_samples =
+        int_arg(args, kwargs, 1, "num_samples")?.ok_or_else(|| missing(OP, "num_samples"))?;
+    let replacement = bool_arg(args, kwargs, 2, "replacement")?.unwrap_or(false);
+    generator_arg(OP, args, kwargs, 3, "generator")?;
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "multinomial only supports floating-point dtypes for input, got: {}",
+            scalar_type_name(tag)
+        )));
+    }
+    let rank = input.tensor().rank();
+    if rank != 1 && rank != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "prob_dist must be 1 or 2 dim",
+        ));
+    }
+    let dims = input.tensor().dims().to_vec();
+    let n_categories = dims[rank - 1];
+    let n_dist = if rank == 2 { dims[0] } else { 1 };
+    if num_samples <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "cannot sample n_sample <= 0 samples",
+        ));
+    }
+    let n_sample = num_samples as usize;
+    if !replacement && n_sample > n_categories {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "cannot sample n_sample > prob_dist.size(-1) samples without replacement",
+        ));
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let device = input.tensor().device().clone();
+    let probs = match read_flat(OP, input.tensor(), tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let out_dims: Vec<usize> = if rank == 2 {
+        vec![n_dist, n_sample]
+    } else {
+        vec![n_sample]
+    };
+
+    let picks: Vec<i64> = if !replacement || n_sample == 1 {
+        // Upstream's sanity checks, in upstream's order. `(max < INFINITY) &
+        // (min >= 0)` is a single expression there; a NaN anywhere fails it
+        // because every comparison against NaN is false.
+        if probs.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "probability tensor contains either `inf`, `nan` or element < 0",
+            ));
+        }
+        for row in probs.chunks(n_categories.max(1)) {
+            if row.iter().sum::<f64>() == 0.0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "invalid multinomial distribution (sum of probabilities <= 0)",
+                ));
+            }
+        }
+
+        let q = {
+            let mut gen = crate::rng::default_generator();
+            crate::rng::exponential_serial(&mut gen, probs.len(), 1.0)
+        };
+        let q = narrow_through(OP, q, storage, &device)?;
+        // `at::div_out(q, self, q)` runs in `opmath_type<scalar_t>` -- float
+        // for everything but float64 -- and stores back into `scalar_t`.
+        let ratio: Vec<f64> = if storage == candle_core::DType::F64 {
+            probs.iter().zip(&q).map(|(p, d)| p / d).collect()
+        } else {
+            probs
+                .iter()
+                .zip(&q)
+                .map(|(p, d)| ((*p as f32) / (*d as f32)) as f64)
+                .collect()
+        };
+        let ratio = narrow_through(OP, ratio, storage, &device)?;
+
+        let mut picks = Vec::with_capacity(n_dist * n_sample);
+        for i in 0..n_dist {
+            let row = &ratio[i * n_categories..(i + 1) * n_categories];
+            if n_sample == 1 {
+                // `at::argmax_out` -- the *first* maximum wins.
+                let mut best = 0usize;
+                for j in 1..n_categories {
+                    if cmp_torch_f64(row[j], row[best]) == std::cmp::Ordering::Greater {
+                        best = j;
+                    }
+                }
+                picks.push(best as i64);
+            } else {
+                // `at::topk_out(vals, result, q, n_sample)` -- largest first,
+                // sorted, and stable among ties for the reason `order_along`
+                // records.
+                let mut order: Vec<usize> = (0..n_categories).collect();
+                order.sort_by(|&a, &b| cmp_torch_f64(row[b], row[a]));
+                picks.extend(order.into_iter().take(n_sample).map(|j| j as i64));
+            }
+        }
+        picks
+    } else {
+        // `multinomial_with_replacement_apply`.
+        //
+        // **The cumulative distribution is *not* kept in the input's dtype**,
+        // and that is the one thing here that had to be measured rather than
+        // read off the shape of the rest of this file. A `bfloat16` input runs
+        // the accumulation and the normalising division in `float`, with no
+        // narrowing anywhere; carrying `scalar_t` through instead -- which is
+        // what the surrounding code makes the natural guess -- put this shim on
+        // a different bucket from upstream on 2 of 140 measured bf16 draws.
+        //
+        // The measurement is in docs/SAMPLING.md §5: 20,000 draws from a known
+        // MT stream bracket every one of the eleven bucket boundaries, and the
+        // brackets are ~2e-4 wide, which is a fifth of `bfloat16`'s spacing
+        // there. A `bfloat16` cumulative distribution lands outside six of the
+        // eleven; a `float` one lands inside all eleven, for `float16` too.
+        //
+        // So the accumulate type is `at::acc_type<scalar_t, false>` -- float
+        // for float16/bfloat16/float32, double for float64 -- exactly as the
+        // *other* kernels here use `opmath_type`, and the fast path above is
+        // the odd one out precisely because it materialises real tensors of
+        // `self`'s dtype.
+        let double_acc = storage == candle_core::DType::F64;
+        let add_acc = |a: f64, b: f64| -> f64 {
+            if double_acc {
+                a + b
+            } else {
+                ((a as f32) + (b as f32)) as f64
+            }
+        };
+        let div_acc = |a: f64, b: f64| -> f64 {
+            if double_acc {
+                a / b
+            } else {
+                ((a as f32) / (b as f32)) as f64
+            }
+        };
+        let mut picks = Vec::with_capacity(n_dist * n_sample);
+        let mut gen = crate::rng::default_generator();
+        for i in 0..n_dist {
+            let row = &probs[i * n_categories..(i + 1) * n_categories];
+            let mut cum = vec![0.0f64; n_categories];
+            let mut sum = 0.0f64;
+            for (j, &val) in row.iter().enumerate() {
+                if val < 0.0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "invalid multinomial distribution (encountering probability entry < 0)",
+                    ));
+                }
+                if !val.is_finite() {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "invalid multinomial distribution (encountering probability entry = infinity or NaN)",
+                    ));
+                }
+                sum = add_acc(sum, val);
+                cum[j] = sum;
+            }
+            if !(sum > 0.0) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "invalid multinomial distribution (sum of probabilities <= 0)",
+                ));
+            }
+            for slot in cum.iter_mut() {
+                *slot = div_acc(*slot, sum);
+            }
+            // "Make sure the last cumulative distribution bucket sums to 1",
+            // upstream's comment and upstream's assignment -- it is written
+            // inside the sample loop there, which is the same thing done once.
+            cum[n_categories - 1] = 1.0;
+            for _ in 0..n_sample {
+                let sample = crate::rng::uniform_sample_f64(&mut gen, 0.0, 1.0);
+                let (mut left, mut right) = (0usize, n_categories);
+                while right - left > 0 {
+                    let mid = left + (right - left) / 2;
+                    if cum[mid] < sample {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                picks.push(left as i64);
+            }
+        }
+        drop(gen);
+        picks
+    };
+
+    let out = Tensor::from_vec(picks, out_dims, &device).map_err(|e| candle_err(OP, e))?;
+    finish(py, out, TorchDType::Int64)
 }
 
 // ---------------------------------------------------------------------------

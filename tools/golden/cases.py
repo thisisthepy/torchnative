@@ -43,6 +43,7 @@ from failing the harness before they exist.
 from __future__ import annotations
 
 import math
+import platform
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -1306,9 +1307,9 @@ def lift_fresh_cases(torch_module, c_module, torch_call) -> list[Case]:
 # in-place case here builds a **fresh** operand pair per case (never shares
 # one tensor across two cases), or an earlier case's mutation would leak
 # into a later one that expects a clean starting value. `normal_` and
-# `uniform_` are also non-deterministic -- see their builders below for how
-# that is handled with `Case.value_check` instead of the default pipeline
-# (same idea `randint_low_cases` above already established).
+# `uniform_` still use `Case.value_check` instead of the default pipeline,
+# but no longer because they are unmatchable -- see their builders below, and
+# `_rng_stream_check`, for what they compare now.
 #
 # `contiguous()` needs no separate builder: on a non-contiguous input it
 # dispatches to `aten.clone.default`, the same op `clone()` uses (probed);
@@ -2091,7 +2092,17 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     if len(t_flat) != len(c_flat):
         return False, f"values length differs: torch={len(t_flat)} c={len(c_flat)}"
     for i, (x, y) in enumerate(zip(t_flat, c_flat)):
-        if not math.isclose(float(x), float(y), rel_tol=tol.rtol, abs_tol=tol.atol):
+        xf, yf = float(x), float(y)
+        # NaN is a *result* for these ops, not a failure: torch orders NaN as
+        # the greatest element, so `sort` and `topk` hand it back and it
+        # arrives here. `math.isclose(nan, nan)` is False, so without this the
+        # two sides agreeing on NaN reads as a mismatch -- which is exactly
+        # what happened the first time a NaN case was added.
+        if math.isnan(xf) or math.isnan(yf):
+            if math.isnan(xf) and math.isnan(yf):
+                continue
+            return False, f"values[{i}] mismatch: torch={x!r} c={y!r} (NaN on one side only)"
+        if not math.isclose(xf, yf, rel_tol=tol.rtol, abs_tol=tol.atol):
             return False, f"values[{i}] mismatch: torch={x!r} c={y!r}"
 
     t_idx_shape = tuple(int(x) for x in t_indices.shape)
@@ -2420,57 +2431,249 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# The RNG ops' streams are the SAME stream, and these two builders say so.
+#
+# When they were written, `_C` drew from candle and the module note above was
+# right: two independent generators cannot be lined up by a seed. docs/RNG.md
+# then established that candle's CPU backend *refuses* to be seeded at all, so
+# there was no version of that plan, and torch's own CPU generator was ported
+# into `rust/torch_c/src/rng.rs` instead. That makes the seed mean the same
+# thing on both sides, and these cases were promoted off `_range_check` to say
+# so: seed both generators to the same value inside the run lambdas, then
+# compare the draws **element by element**.
+#
+# What each op may be held to is not the same, and docs/RNG.md §3.3 and §5
+# item 3 are the authority for the split:
+#
+#   * `uniform_` is a masked integer times a power-of-two divisor and an
+#     affine step. No libm, no vector specialisation, so **bit-for-bit on
+#     every platform**.
+#   * `normal_` is Box-Muller through `log`/`cos`/`sin`. Bit-for-bit was
+#     *measured* on aarch64, where `NormalFill16`'s AVX2/VSX specialisations
+#     do not compile and upstream runs the same scalar libm calls this shim
+#     does. On a host where the vector path is live, nobody has measured
+#     whether upstream's `sincos256_ps` agrees with libm -- RNG.md §6 records
+#     it as unmeasured, and demanding bit equality there would be asserting
+#     something no one knows. So: exact on aarch64, dtype tolerance elsewhere.
+#
+# The tolerance fallback is not a weaker version of the same claim; it is a
+# different claim, and `_rng_stream_check` prints which one it made.
+
+_BITWISE_NORMAL_FILL = platform.machine().lower() in ("arm64", "aarch64")
+
+
+def _same_float(x, y) -> bool:
+    """Exact equality, with NaN equal to NaN.
+
+    `tolist()` widens float16/bfloat16/float32 to Python floats losslessly, so
+    `==` here really is a comparison of the stored bits -- with the two
+    exceptions Python's `==` has: NaN (handled) and -0.0 == 0.0 (left alone;
+    neither `uniform_` nor `normal_` can produce a signed zero from a nonzero
+    std or a nondegenerate range)."""
+    xf, yf = float(x), float(y)
+    if math.isnan(xf) or math.isnan(yf):
+        return math.isnan(xf) and math.isnan(yf)
+    return xf == yf
+
+
+def _rng_stream_check(*, bitwise: bool, bounds=None):
+    """dtype, shape, optional [lo, hi) bound, and then the draws themselves.
+
+    `bitwise=True` demands exact agreement -- the strongest statement this
+    harness can make about a random op, and the whole point of porting the
+    generator. `bitwise=False` falls back to the dtype's tolerance and says so
+    in its message, so a run on an unmeasured platform cannot be read as
+    having proved bit equality.
+    """
+
+    def check(t_res, c_res) -> tuple[bool, str]:
+        t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+        if t_dtype != c_dtype:
+            return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_res.shape)
+        c_shape = tuple(int(x) for x in c_res.shape)
+        if t_shape != c_shape:
+            return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+        t_flat = _flatten_values(t_res.tolist())
+        c_flat = _flatten_values(c_res.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"length differs: torch={len(t_flat)} c={len(c_flat)}"
+        if bounds is not None:
+            lo, hi = bounds
+            for label, flat in (("torch", t_flat), ("c", c_flat)):
+                for v in flat:
+                    if not (lo <= v < hi):
+                        return False, f"{label} produced {v!r}, outside requested range [{lo}, {hi})"
+        if bitwise:
+            for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+                if not _same_float(x, y):
+                    return (
+                        False,
+                        f"stream divergence at index {i}: torch={x!r} c={y!r} "
+                        "-- same seed, same generator, different value",
+                    )
+            return True, f"dtype={t_dtype} shape={t_shape}, {len(t_flat)} draws identical bit-for-bit"
+        tol = dt.tolerance_for(t_dtype)
+        ok, detail = _values_close_local(t_flat, c_flat, tol.atol, tol.rtol)
+        if not ok:
+            return False, detail
+        return True, (
+            f"dtype={t_dtype} shape={t_shape}, {len(t_flat)} draws within "
+            f"atol={tol.atol}/rtol={tol.rtol} (bit equality NOT asserted: "
+            f"machine={platform.machine()!r} is outside what docs/RNG.md §3.3 measured)"
+        )
+
+    return check
+
+
+def _values_close_local(t_flat, c_flat, atol, rtol) -> tuple[bool, str]:
+    for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+        xf, yf = float(x), float(y)
+        if math.isnan(xf) or math.isnan(yf):
+            if not (math.isnan(xf) and math.isnan(yf)):
+                return False, f"index {i}: torch={x!r} c={y!r} (NaN mismatch)"
+            continue
+        if not math.isclose(xf, yf, rel_tol=rtol, abs_tol=atol):
+            return False, f"index {i}: torch={x!r} c={y!r} (|diff|={abs(xf - yf):.6g})"
+    return True, ""
+
+
+def _seeded_inplace(torch_module, c_module, torch_call, op, dtype_name, shape, seed, args):
+    """Both sides seeded to the same value, then the same in-place call.
+
+    The seeding lives inside the lambdas rather than beside them because
+    `compare.py` runs `run_torch` and `run_c` one after the other, and each has
+    to start from the beginning of the stream rather than from wherever the
+    other left it."""
+    numel = 1
+    for d in shape:
+        numel *= d
+
+    def run_torch():
+        torch_module.manual_seed(seed)
+        target = pair_from_flat(torch_module, c_module, [0.0] * numel, shape, dtype_name)[0]
+        return torch_call(target, *args)
+
+    def run_c():
+        c_module._shim_manual_seed(seed)
+        target = pair_from_flat(torch_module, c_module, [0.0] * numel, shape, dtype_name)[1]
+        return c_module._aten_dispatch(op, target, *args)
+
+    return run_torch, run_c
+
+
 def normal__cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.normal_.default"
     cases: list[Case] = []
-    # Random draw: like randint_low_cases above, the *sequence* of two
-    # independent RNG implementations can never be made to match, even with
-    # "the same" seed -- a seed pins one generator's stream, not another's
-    # algorithm. Unlike uniform_ below, a Gaussian draw has no hard value
-    # bound either (mean/std describe a distribution, not a range), so
-    # there is no meaningful value_check beyond dtype/shape -- reusing
-    # `_dtype_shape_only_check` (same one `empty_cases` uses for
-    # uninitialized memory, for the same underlying reason: no single
-    # "correct" value exists to diff against).
+    # The sizes are not arbitrary. `normal_kernel` branches on
+    # `size >= 16 && is_contiguous()`, and docs/RNG.md §5 item 2 names exactly
+    # these five as the ones that cover both sides of it plus the tail
+    # redraw: 15 is path B, 16 is path A with no tail, 17 and 20 are path A
+    # *rewriting sixteen elements it already computed*, and 32 is path A with
+    # the tail case skipped again. From one seed, n=15 and n=16 share not a
+    # single value; n=17 differs from n=16 in its first element too. A shim
+    # that reproduced the stream and missed the blocking would pass a
+    # distribution test and fail every one of these.
+    sizes = [
+        (6, "path B (size < 16), the size this case used before the port"),
+        (15, "path B, one below the boundary"),
+        (16, "path A, exactly one block, no tail redraw"),
+        (17, "path A + tail: the last 16 elements are drawn again over the top"),
+        (20, "path A + tail, mid-block"),
+        (32, "path A, two whole blocks, no tail"),
+    ]
     for dtype_name in _MUL_DIV_FLOAT_DTYPES:
-        for mean, std, note in [(0.0, 1.0, "standard normal -- typical init"), (0.0, 0.02, "small std, transformer-init style")]:
-            a_t, a_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), dtype_name)
-            cases.append(
-                Case(
-                    name=f"normal_(dtype={dtype_name}, mean={mean}, std={std}) [{note}]",
-                    op=op,
-                    run_torch=lambda a_t=a_t, mean=mean, std=std: torch_call(a_t, mean, std),
-                    run_c=lambda a_c=a_c, mean=mean, std=std: c_module._aten_dispatch(op, a_c, mean, std),
-                    value_check=_dtype_shape_only_check,
-                    note=(
-                        note + " -- random draw, sequence unchecked (see module note above); "
-                        "no hard value bound either, so only dtype/shape are meaningful"
-                    ),
-                )
-            )
+        for mean, std, why in [
+            (0.0, 1.0, "standard normal -- typical init"),
+            (0.0, 0.02, "small std, transformer-init style"),
+        ]:
+            for n, path in sizes:
+                for seed in (0, 42):
+                    run_torch, run_c = _seeded_inplace(
+                        torch_module, c_module, torch_call, op, dtype_name, (n,), seed, (mean, std)
+                    )
+                    cases.append(
+                        Case(
+                            name=(
+                                f"normal_(dtype={dtype_name}, n={n}, mean={mean}, std={std}, "
+                                f"seed={seed}) [{path}]"
+                            ),
+                            op=op,
+                            run_torch=run_torch,
+                            run_c=run_c,
+                            value_check=_rng_stream_check(bitwise=_BITWISE_NORMAL_FILL),
+                            note=why + " -- " + path,
+                        )
+                    )
+    cases.append(
+        Case(
+            name="normal_(float32, std < 0 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")[0], 0.0, -1.0
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")[1], 0.0, -1.0
+            ),
+            expect="both_error",
+            note="torch: 'normal expects std >= 0.0, but found std -1'",
+        )
+    )
     return cases
 
 
 def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.uniform_.default"
     cases: list[Case] = []
-    # Random draw with a hard [from, to) bound -- unlike normal_ above, this
-    # one can reuse the same range-check idea as randint_low_cases (the
-    # sequence still can't be synchronized across two independent RNGs, but
-    # every value is provably confined to [from, to)).
+    # `(2.0, 7.5)` is here for a specific reason: every range anyone tries
+    # first -- (0,1), (-1,1), (-0.5,0.5) -- has a power-of-two width, which
+    # makes the affine step's multiply exact and hides whether it was written
+    # as `x*(to-from)+from` or as the fused multiply-add clang actually
+    # compiles. rng.rs' comment records ~9.5% of draws coming out 1 ulp low
+    # before that was `mul_add`. Only a non-power-of-two width can see it, and
+    # only a bit-exact comparison can report it.
+    ranges = [
+        (0.0, 1.0, "default range"),
+        (-1.0, 1.0, "range straddling zero"),
+        (2.0, 7.5, "non-power-of-two width -- the only range that sees the fused multiply-add"),
+    ]
     for dtype_name in _MUL_DIV_FLOAT_DTYPES:
-        for lo, hi, note in [(0.0, 1.0, "default range"), (-1.0, 1.0, "range straddling zero")]:
-            a_t, a_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), dtype_name)
-            cases.append(
-                Case(
-                    name=f"uniform_(dtype={dtype_name}, from={lo}, to={hi}) [{note}]",
-                    op=op,
-                    run_torch=lambda a_t=a_t, lo=lo, hi=hi: torch_call(a_t, lo, hi),
-                    run_c=lambda a_c=a_c, lo=lo, hi=hi: c_module._aten_dispatch(op, a_c, lo, hi),
-                    value_check=_range_check(lo, hi),
-                    note=note + " -- random draw, sequence unchecked (see module note above)",
-                )
-            )
+        for lo, hi, why in ranges:
+            for n in (6, 17, 1000):
+                for seed in (0, 42):
+                    run_torch, run_c = _seeded_inplace(
+                        torch_module, c_module, torch_call, op, dtype_name, (n,), seed, (lo, hi)
+                    )
+                    cases.append(
+                        Case(
+                            name=f"uniform_(dtype={dtype_name}, n={n}, from={lo}, to={hi}, seed={seed}) [{why}]",
+                            op=op,
+                            run_torch=run_torch,
+                            run_c=run_c,
+                            # The bound is kept alongside the exact comparison,
+                            # not replaced by it: the half-open guarantee is
+                            # enforced by a clamp applied *after* the narrowing
+                            # cast, and on float16 with to=1.0 that clamp fires
+                            # about one draw in 4096. A shim missing it agrees
+                            # with the stream everywhere else.
+                            value_check=_rng_stream_check(bitwise=True, bounds=(lo, hi)),
+                            note=why + " -- bit-for-bit; docs/RNG.md §5 item 3 allows this on every platform",
+                        )
+                    )
+    cases.append(
+        Case(
+            name="uniform_(float32, from > to rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")[0], 1.0, 0.0
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")[1], 1.0, 0.0
+            ),
+            expect="both_error",
+            note="torch: 'uniform_ expects to return a [from, to) range, but found from=1 > to=0'",
+        )
+    )
     return cases
 
 
@@ -3041,6 +3244,853 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- the eight ops `do_sample=True` stops on (docs/SAMPLING.md) --------------
+#
+# docs/GAP.md §4 predicted ten; the coordinating session re-measured a real
+# transformers Llama with `TorchDispatchMode` and found eight `_aten_dispatch`
+# still refused. These are their cases.
+#
+# Every builder below defers tensor construction into the `run_torch`/`run_c`
+# lambdas, the way `masked_fill_cases` does. For the in-place `fill_.Tensor`
+# that is load-bearing (a shared operand would carry one case's mutation into
+# the next); for the rest it is uniformity, and it keeps a builder from being
+# able to crash the whole harness at case-list time.
+
+
+def _pair(torch_module, c_module, flat, shape, dtype_name):
+    """The two operands, built fresh. Same numbers on both sides by
+    construction -- see build.pair_from_flat, which this is the deferred form
+    of."""
+    return pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+
+
+# --- aten._softmax.default ---------------------------------------------------
+#
+# `_softmax` is the op behind `nn.functional.softmax`, and in the sampling loop
+# it is what turns logits into the probability vector `multinomial` draws from.
+#
+# Both of its refusals are reproduced and both are pinned here, because each
+# would otherwise be a silent success:
+#
+#   * `half_to_float=True` raises on CPU for *every* dtype -- float16,
+#     bfloat16 and float32 alike (measured). It is a CUDA-only fusion. A shim
+#     that honoured it would answer float32 where upstream raises.
+#   * an integral input raises `NotImplementedError` naming the kernel, not a
+#     `RuntimeError`.
+#
+# The `-inf` cases are the ones that matter numerically: a masked attention
+# row and an all-masked row are both real inputs, and the max-subtraction is
+# the only thing standing between the first one and a NaN.
+
+_SOFTMAX_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+
+def softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._softmax.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), -1, "last dim -- the vectorised path"),
+        ([1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), 0, "first dim -- the strided path"),
+        ([1.0, 2.0, 3.0], (3,), 0, "1-D"),
+        ([3.0], (), -1, "0-d: the single element is the whole distribution, so 1.0"),
+    ]
+    for dtype_name in _SOFTMAX_DTYPES:
+        for flat, shape, dim, note in scenarios:
+            cases.append(
+                Case(
+                    name=f"_softmax(dtype={dtype_name}, shape={shape}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: torch_call(
+                        _pair(torch_module, c_module, flat, shape, dtype_name)[0], dim, False
+                    ),
+                    run_c=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], dim, False
+                    ),
+                    note=note,
+                )
+            )
+
+    edge = [
+        ([1.0, float("-inf"), 2.0], (3,), "one masked position",
+         "exp(-inf - max) is a clean zero only because the max is subtracted first"),
+        ([float("-inf"), float("-inf")], (2,), "a fully masked row",
+         "NaN on both sides, and that agreement is the point"),
+        ([1000.0, 1001.0, 999.0], (3,), "large logits",
+         "without the max subtraction every exp overflows to inf"),
+        ([], (0,), "empty", "no lane to reduce"),
+    ]
+    for flat, shape, label, note in edge:
+        cases.append(
+            Case(
+                name=f"_softmax(float32, {label})",
+                op=op,
+                run_torch=lambda flat=flat, shape=shape: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], -1, False
+                ),
+                run_c=lambda flat=flat, shape=shape: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], -1, False
+                ),
+                note=note,
+            )
+        )
+
+    for dtype_name, why in [
+        ("float32", "torch: 'softmax with half to float conversion is not supported on CPU'"),
+        ("float16", "the same refusal, for the dtype whose name the flag comes from"),
+    ]:
+        cases.append(
+            Case(
+                name=f"_softmax(dtype={dtype_name}, half_to_float=True rejected on both sides)",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name: torch_call(
+                    _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), dtype_name)[0], -1, True
+                ),
+                run_c=lambda dtype_name=dtype_name: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), dtype_name)[1], -1, True
+                ),
+                expect="both_error",
+                note=why,
+            )
+        )
+    cases.append(
+        Case(
+            name="_softmax(int64 rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0], -1, False
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1], -1, False
+            ),
+            expect="both_error",
+            note='torch: NotImplementedError, "softmax_lastdim_kernel_impl" not implemented for \'Long\'',
+        )
+    )
+    cases.append(
+        Case(
+            name="_softmax(dim out of range rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")[0], 5, False
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")[1], 5, False
+            ),
+            expect="both_error",
+            note="IndexError on both sides",
+        )
+    )
+    return cases
+
+
+# --- aten.le.Scalar ----------------------------------------------------------
+# The same family as lt/eq/ne above; `x <= v` keeps the Python number as a
+# Scalar rather than lifting it to a tensor. Reached by the repetition-penalty
+# and min-length warpers.
+
+
+def le_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.le.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3,
+                "x <= 3, as reached from __le__ with a python scalar -- note 3 itself is "
+                "included, which is the whole difference from lt.Scalar",
+            )
+        )
+    cases.append(
+        Case(
+            name="le(float32, nan <= 1.0) [every comparison against NaN is false]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[0], 1.0
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[1], 1.0
+            ),
+            note="NaN is not <= anything, including itself",
+        )
+    )
+    return cases
+
+
+# --- aten.squeeze.dim --------------------------------------------------------
+#
+# The generation loop's `next_tokens.squeeze(1)`. The rule that has to be right
+# is the one that looks like a bug: **a dimension whose size is not 1 is a
+# no-op, not an error** (measured). Refusing there would break the loop the
+# moment a batch had a single row.
+
+
+def squeeze_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.squeeze.dim"
+    cases: list[Case] = []
+    flat, shape = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (1, 3, 1, 2)
+    for dim, note in [
+        (0, "leading size-1 dim removed"),
+        (2, "interior size-1 dim removed"),
+        (1, "size 3 -- NO-OP, not an error"),
+        (-1, "size 2 via a negative dim -- also a no-op"),
+        (-4, "the leading dim again, addressed from the end"),
+    ]:
+        cases.append(
+            Case(
+                name=f"squeeze({shape}, dim={dim}) [{note}]",
+                op=op,
+                run_torch=lambda dim=dim: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], dim
+                ),
+                run_c=lambda dim=dim: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], dim
+                ),
+                note=note,
+            )
+        )
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        cases.append(
+            Case(
+                name=f"squeeze(dtype={dtype_name}, (2,1) dim=1)",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name: torch_call(
+                    _pair(torch_module, c_module, [1, 2], (2, 1), dtype_name)[0], 1
+                ),
+                run_c=lambda dtype_name=dtype_name: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, [1, 2], (2, 1), dtype_name)[1], 1
+                ),
+                note="the shape the sampling loop actually squeezes: (batch, 1) -> (batch,)",
+            )
+        )
+    cases.append(
+        Case(
+            name="squeeze(0-d, dim=0) [torch accepts dim 0 and -1 on a 0-d tensor]",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [5.0], (), "float32")[0], 0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [5.0], (), "float32")[1], 0
+            ),
+            note="nothing to remove, so the 0-d tensor comes back unchanged",
+        )
+    )
+    cases.append(
+        Case(
+            name="squeeze(dim out of range rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, flat, shape, "float32")[0], 9),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, flat, shape, "float32")[1], 9
+            ),
+            expect="both_error",
+            note="IndexError on both sides -- a no-op dim is not the same as a nonexistent one",
+        )
+    )
+    return cases
+
+
+# --- aten.sort.default / aten.topk.default -----------------------------------
+#
+# Both answer a (values, indices) pair, so both reuse `_pair_result_check`.
+# What they do *not* share is how far the agreement goes, and that difference
+# is measured, not assumed:
+#
+#   * **`sort` is stable, in both directions.** `[3,1,3,1,2,3]` descending
+#     answers indices `[0,2,5,4,1,3]` -- the three 3.0s in increasing index
+#     order, not reversed. An 80-element all-ties tensor comes back as
+#     `0..79`. So ties can be compared exactly and are.
+#   * **`topk` is a partial selection and its tie order is not stable.** On
+#     that same input `k=3` agrees with a stable sort (`[0,2,5]`) but `k=6`
+#     does not: upstream answers `[0,2,5,4,3,1]`, reversing the two 1.0s.
+#     Upstream promises nothing there, so the tied `topk` case below compares
+#     values only, via `_topk_multiset_check`, and every case that compares
+#     indices uses tie-free input. docs/SAMPLING.md §4.
+#
+# `sorted=False` is the same situation one step further: upstream returns a
+# partition artefact (`k=3` of an 8-element tensor gives `[7,6,0]` where
+# `sorted=True` gives `[6,7,0]`), so those cases are multiset-compared too.
+
+_ORDER_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]
+
+_TIED = [3.0, 1.0, 3.0, 1.0, 2.0, 3.0]
+_DISTINCT = [5.0, 1.0, 4.0, 2.0, 3.0, 0.0]
+
+
+def _topk_multiset_check(t_res, c_res) -> tuple[bool, str]:
+    """dtype and shape exactly; values as a sorted multiset; indices only
+    through the (value, index) pairing.
+
+    For the cases where upstream's own order is an artefact of its partition
+    rather than a promise -- ties, and `sorted=False`. Pinning the order there
+    would be pinning an implementation detail; dropping the check entirely
+    would let a shim return the wrong *elements*. This checks the elements.
+    """
+    try:
+        t_values, t_indices = t_res[0], t_res[1]
+        c_values, c_indices = c_res[0], c_res[1]
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (values, indices) result on both sides: {e!r}"
+    t_dtype, c_dtype = dt.dtype_name(t_values.dtype), dt.dtype_name(c_values.dtype)
+    if t_dtype != c_dtype:
+        return False, f"values dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_shape = tuple(int(x) for x in t_values.shape)
+    c_shape = tuple(int(x) for x in c_values.shape)
+    if t_shape != c_shape:
+        return False, f"values shape mismatch: torch={t_shape} c={c_shape}"
+    t_pairs = sorted(zip(_flatten_values(t_values.tolist()), _flatten_values(t_indices.tolist())))
+    c_pairs = sorted(zip(_flatten_values(c_values.tolist()), _flatten_values(c_indices.tolist())))
+    if t_pairs != c_pairs:
+        return False, f"selected elements differ: torch={t_pairs!r} c={c_pairs!r}"
+    return True, (
+        f"values dtype={t_dtype} shape={t_shape}, same {len(t_pairs)} (value, index) pairs "
+        "-- order deliberately unchecked, see the note above"
+    )
+
+
+def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sort.default"
+    cases: list[Case] = []
+    for dtype_name in _ORDER_DTYPES:
+        for descending in (False, True):
+            cases.append(
+                Case(
+                    name=f"sort(dtype={dtype_name}, descending={descending}) [ties at 3.0 and 1.0]",
+                    op=op,
+                    run_torch=lambda dtype_name=dtype_name, d=descending: torch_call(
+                        _pair(torch_module, c_module, _TIED, (6,), dtype_name)[0], -1, d
+                    ),
+                    run_c=lambda dtype_name=dtype_name, d=descending: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, _TIED, (6,), dtype_name)[1], -1, d
+                    ),
+                    value_check=_pair_result_check,
+                    note="ties compared exactly -- upstream's CPU sort is stable in both directions",
+                )
+            )
+    for dim in (0, 1, -1):
+        cases.append(
+            Case(
+                name=f"sort(float32, (2,3), dim={dim})",
+                op=op,
+                run_torch=lambda dim=dim: torch_call(
+                    _pair(torch_module, c_module, [3, 1, 3, 2, 2, 1], (2, 3), "float32")[0], dim, False
+                ),
+                run_c=lambda dim=dim: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, [3, 1, 3, 2, 2, 1], (2, 3), "float32")[1], dim, False
+                ),
+                value_check=_pair_result_check,
+                note="lane extraction along a non-last dim",
+            )
+        )
+    nan_flat = [1.0, float("nan"), 0.0, float("inf"), float("-inf")]
+    for descending in (False, True):
+        cases.append(
+            Case(
+                name=f"sort(float32, NaN/inf, descending={descending})",
+                op=op,
+                run_torch=lambda d=descending: torch_call(
+                    _pair(torch_module, c_module, nan_flat, (5,), "float32")[0], -1, d
+                ),
+                run_c=lambda d=descending: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, nan_flat, (5,), "float32")[1], -1, d
+                ),
+                value_check=_pair_result_check,
+                note=(
+                    "torch orders NaN as GREATEST -- last ascending, first descending. "
+                    "IEEE says every comparison against it is false, so this is a choice "
+                    "torch made and a shim has to copy rather than inherit."
+                ),
+            )
+        )
+    cases.append(
+        Case(
+            name="sort(float32, 80 elements all tied two ways, descending) [stability at scale]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1.0] * 40 + [0.0] * 40, (80,), "float32")[0], -1, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1.0] * 40 + [0.0] * 40, (80,), "float32")[1], -1, True
+            ),
+            value_check=_pair_result_check,
+            note="indices must come back as 0..79 -- an unstable sort would pass a value check and fail this",
+        )
+    )
+    for flat, shape, note in [([5.0], (), "0-d: value and index both 0-d"), ([], (0,), "empty")]:
+        cases.append(
+            Case(
+                name=f"sort(float32, {note})",
+                op=op,
+                run_torch=lambda flat=flat, shape=shape: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], -1, False
+                ),
+                run_c=lambda flat=flat, shape=shape: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], -1, False
+                ),
+                value_check=_pair_result_check,
+                note=note,
+            )
+        )
+    cases.append(
+        Case(
+            name="sort(dim out of range rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, _TIED, (6,), "float32")[0], 3, False
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, _TIED, (6,), "float32")[1], 3, False
+            ),
+            expect="both_error",
+            note="IndexError on both sides",
+        )
+    )
+    return cases
+
+
+def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.topk.default"
+    cases: list[Case] = []
+    for dtype_name in _ORDER_DTYPES:
+        for k in (1, 3, 6):
+            for largest in (True, False):
+                cases.append(
+                    Case(
+                        name=f"topk(dtype={dtype_name}, k={k}, largest={largest}) [distinct values]",
+                        op=op,
+                        run_torch=lambda dtype_name=dtype_name, k=k, lg=largest: torch_call(
+                            _pair(torch_module, c_module, _DISTINCT, (6,), dtype_name)[0], k, -1, lg, True
+                        ),
+                        run_c=lambda dtype_name=dtype_name, k=k, lg=largest: c_module._aten_dispatch(
+                            op, _pair(torch_module, c_module, _DISTINCT, (6,), dtype_name)[1], k, -1, lg, True
+                        ),
+                        value_check=_pair_result_check,
+                        note="no ties, so the indices are determined and compared exactly",
+                    )
+                )
+    cases.append(
+        Case(
+            name="topk(float32, k=3, largest=True) [ties -- values and selection only]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, _TIED, (6,), "float32")[0], 3, -1, True, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, _TIED, (6,), "float32")[1], 3, -1, True, True
+            ),
+            value_check=_topk_multiset_check,
+            note="upstream's tie order here is a partition artefact -- see the note above",
+        )
+    )
+    cases.append(
+        Case(
+            name="topk(float32, k=6, largest=True) [ties, k == n -- upstream reverses the tied pair]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, _TIED, (6,), "float32")[0], 6, -1, True, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, _TIED, (6,), "float32")[1], 6, -1, True, True
+            ),
+            value_check=_topk_multiset_check,
+            note=(
+                "MEASURED DIVERGENCE, deliberately not chased: upstream answers indices "
+                "[0,2,5,4,3,1] and this shim answers [0,2,5,4,1,3]. Same six elements, "
+                "different order among equal values. torch.topk documents no order for "
+                "ties; the values -- which is all TopKLogitsWarper reads -- are identical."
+            ),
+        )
+    )
+    for k in (1, 3):
+        cases.append(
+            Case(
+                name=f"topk(float32, k={k}, sorted=False) [order unspecified upstream]",
+                op=op,
+                run_torch=lambda k=k: torch_call(
+                    _pair(torch_module, c_module, [5.0, 1.0, 4.0, 2.0, 3.0, 0.0, 9.0, 7.0], (8,), "float32")[0],
+                    k, -1, True, False,
+                ),
+                run_c=lambda k=k: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, [5.0, 1.0, 4.0, 2.0, 3.0, 0.0, 9.0, 7.0], (8,), "float32")[1],
+                    k, -1, True, False,
+                ),
+                value_check=_topk_multiset_check,
+                note=(
+                    "sorted=False licenses any order and upstream uses it: k=3 answers "
+                    "[7,6,0] where sorted=True answers [6,7,0]. This shim always sorts, "
+                    "which is within the licence."
+                ),
+            )
+        )
+    cases.append(
+        Case(
+            name="topk(float32, (2,3), k=2, dim=0)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [3, 1, 3, 2, 2, 1], (2, 3), "float32")[0], 2, 0, True, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [3, 1, 3, 2, 2, 1], (2, 3), "float32")[1], 2, 0, True, True
+            ),
+            value_check=_pair_result_check,
+            note="selection along a non-last dim; no ties within a lane",
+        )
+    )
+    cases.append(
+        Case(
+            name="topk(float32, 0-d, k=1)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [5.0], (), "float32")[0], 1, -1, True, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [5.0], (), "float32")[1], 1, -1, True, True
+            ),
+            value_check=_pair_result_check,
+            note="torch answers a 0-d value and a 0-d index of 0 rather than refusing",
+        )
+    )
+    cases.append(
+        Case(
+            name="topk(float32, k=0)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, _DISTINCT, (6,), "float32")[0], 0, -1, True, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, _DISTINCT, (6,), "float32")[1], 0, -1, True, True
+            ),
+            value_check=_pair_result_check,
+            note="k=0 is legal and gives empty results, unlike k<0",
+        )
+    )
+    for k, why in [(7, "k > n"), (-1, "k < 0 -- torch gives the same 'out of range' message")]:
+        cases.append(
+            Case(
+                name=f"topk(k={k} rejected on both sides) [{why}]",
+                op=op,
+                run_torch=lambda k=k: torch_call(
+                    _pair(torch_module, c_module, _DISTINCT, (6,), "float32")[0], k, -1, True, True
+                ),
+                run_c=lambda k=k: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, _DISTINCT, (6,), "float32")[1], k, -1, True, True
+                ),
+                expect="both_error",
+                note="torch: RuntimeError 'selected index k out of range'",
+            )
+        )
+    return cases
+
+
+# --- aten.scatter.src --------------------------------------------------------
+#
+# Written against torch's shape rule, which is looser than candle's: torch asks
+# only that `index` be **no larger** than `self` (off the scatter axis) and than
+# `src`, while candle demands equality. The generation loop uses exactly the
+# shape candle rejects -- a `(batch, k)` index scattered into a `(batch, vocab)`
+# row -- so the two `index smaller than src/self` cases below are the ones that
+# would break if someone "simplified" this onto `Tensor::scatter`.
+
+
+def scatter_src_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.scatter.src"
+    cases: list[Case] = []
+
+    def case(name, self_arg, dim, idx_arg, src_arg, note, expect="match"):
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: torch_call(
+                    _pair(torch_module, c_module, *self_arg)[0],
+                    dim,
+                    _pair(torch_module, c_module, *idx_arg)[0],
+                    _pair(torch_module, c_module, *src_arg)[0],
+                ),
+                run_c=lambda: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, *self_arg)[1],
+                    dim,
+                    _pair(torch_module, c_module, *idx_arg)[1],
+                    _pair(torch_module, c_module, *src_arg)[1],
+                ),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    src_35 = (list(range(1, 16)), (3, 5), "float32")
+    zeros_35 = ([0.0] * 15, (3, 5), "float32")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        case(
+            f"scatter(dtype={dtype_name}, dim=1, index (3,3) into self (3,5))",
+            ([0] * 15, (3, 5), dtype_name),
+            1,
+            ([0, 1, 2] * 3, (3, 3), "int64"),
+            (list(range(1, 16)), (3, 5), dtype_name),
+            "index smaller than both self and src along the scatter axis -- the shape "
+            "candle's own scatter refuses",
+        )
+    case(
+        "scatter(float32, dim=0, index (1,5) into self (3,5))",
+        zeros_35, 0, ([0, 1, 2, 0, 0], (1, 5), "int64"), src_35,
+        "index smaller than self along a non-scatter axis",
+    )
+    case(
+        "scatter(float32, duplicate indices -- last write wins)",
+        ([0.0] * 5, (1, 5), "float32"), 1, ([0, 0, 0], (1, 3), "int64"), ([1.0, 2.0, 3.0, 0.0, 0.0], (1, 5), "float32"),
+        "three writes to column 0; torch leaves the last (3.0), measured",
+    )
+    case(
+        "scatter(float32, 1-D)",
+        ([0.0] * 5, (5,), "float32"), 0, ([4, 0], (2,), "int64"), ([9.0, 8.0], (2,), "float32"),
+        "rank 1 -- the scatter axis is the only axis",
+    )
+    case(
+        "scatter(float32, int32 index accepted)",
+        ([0.0] * 3, (3,), "float32"), 0, ([1], (1,), "int32"), ([1.0], (1,), "float32"),
+        "torch accepts int32 here -- unlike masked_fill's mask, which must be exactly bool",
+    )
+    case(
+        "scatter(float32, index out of bounds rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([5], (1,), "int64"), ([1.0], (1,), "float32"),
+        "torch: 'index 5 is out of bounds for dimension 0 with size 3'",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, negative index rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([-1], (1,), "int64"), ([1.0], (1,), "float32"),
+        "unlike a dim, a scatter index is not wrapped -- torch refuses -1",
+        expect="both_error",
+    )
+    case(
+        "scatter(self/src dtype mismatch rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([1], (1,), "int64"), ([1], (1,), "int64"),
+        "torch: 'scatter(): Expected self.dtype to be equal to src.dtype' -- no promotion",
+        expect="both_error",
+    )
+    case(
+        "scatter(index rank mismatch rejected on both sides)",
+        zeros_35, 1, ([0, 1, 2], (3,), "int64"), src_35,
+        "torch: 'Index tensor must have the same number of dimensions as self tensor'",
+        expect="both_error",
+    )
+    case(
+        "scatter(index larger than src rejected on both sides)",
+        zeros_35, 1, ([0, 1, 2], (1, 3), "int64"), ([1.0, 2.0], (1, 2), "float32"),
+        "'no larger than self ... and no larger size than src' -- this violates the src half",
+        expect="both_error",
+    )
+    return cases
+
+
+# --- aten.fill_.Tensor -------------------------------------------------------
+#
+# `fill_` with a 0-d tensor rather than a Python number. It was implemented
+# alongside `fill_.Scalar` and parked in `IMPLEMENTED_AWAITING_GOLDEN` for want
+# of exactly this builder; these cases are what moved it across.
+#
+# The difference from `fill_.Scalar` is not cosmetic: the `c10::checked_convert`
+# overflow refusal that `fill_.Scalar` reproduces does **not** apply to a tensor
+# value. `fill_(float16_tensor, tensor(1e6))` gives `inf` on upstream too
+# (measured), where `fill_(float16_tensor, 1e6)` raises. So the float16 case
+# below is the mirror image of `full_cases`' live regression trap, and it is
+# `expect="match"` for the opposite reason: here `inf` is the right answer.
+
+
+def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.fill_.Tensor"
+    cases: list[Case] = []
+    for dtype_name in dt.DEFAULT_DTYPES:
+        cases.append(
+            Case(
+                name=f"fill_.Tensor(dtype={dtype_name}, 0-d value of the same dtype)",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name: torch_call(
+                    _pair(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)[0],
+                    _pair(torch_module, c_module, [3], (), dtype_name)[0],
+                ),
+                run_c=lambda dtype_name=dtype_name: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)[1],
+                    _pair(torch_module, c_module, [3], (), dtype_name)[1],
+                ),
+                note="in-place: compares the mutated operand fill_ returns",
+            )
+        )
+    cases.append(
+        Case(
+            name="fill_.Tensor(int64 <- 0-d float32 2.7) [the value is cast to self's dtype, truncating]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0, 0], (2,), "int64")[0],
+                _pair(torch_module, c_module, [2.7], (), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0, 0], (2,), "int64")[1],
+                _pair(torch_module, c_module, [2.7], (), "float32")[1],
+            ),
+            note="self keeps its dtype; the value does not widen it",
+        )
+    )
+    cases.append(
+        Case(
+            name="fill_.Tensor(float16 <- 0-d 1e6) [overflows to inf on BOTH sides, unlike fill_.Scalar]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0.0] * 3, (3,), "float16")[0],
+                _pair(torch_module, c_module, [1e6], (), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0.0] * 3, (3,), "float16")[1],
+                _pair(torch_module, c_module, [1e6], (), "float32")[1],
+            ),
+            note=(
+                "the mirror of full_cases' float16 trap: c10::checked_convert guards the "
+                "*Scalar* overload, not this one, so inf is upstream's own answer here"
+            ),
+        )
+    )
+    cases.append(
+        Case(
+            name="fill_.Tensor(1-D value rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0.0] * 3, (3,), "float32")[0],
+                _pair(torch_module, c_module, [1.0], (1,), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0.0] * 3, (3,), "float32")[1],
+                _pair(torch_module, c_module, [1.0], (1,), "float32")[1],
+            ),
+            expect="both_error",
+            note=(
+                "torch: 'fill_ only supports 0-dimension value tensor but got tensor with "
+                "1 dimensions.' The shim raises TypeError rather than RuntimeError; "
+                "both_error accepts either, and the refusal is the point."
+            ),
+        )
+    )
+    return cases
+
+
+# --- aten.multinomial.default ------------------------------------------------
+#
+# The only op in this file that draws, and therefore the only one whose cases
+# have to say *when* each side draws. Both sides are seeded inside the
+# `run_torch`/`run_c` lambdas -- `torch.manual_seed(s)` and
+# `_C._shim_manual_seed(s)` -- so each case starts both generators at the same
+# point in the same stream and the sampled indices can be compared **exactly**.
+#
+# That is only meaningful because docs/RNG.md's port makes the two streams the
+# same object. The module note above still says a seed cannot synchronise two
+# independent RNGs; it is right about *independent* ones and no longer
+# describes this codebase (see the uniform_/normal_ builders, which were
+# promoted off `_range_check` for the same reason).
+#
+# The cases have to cross the branch that decides which algorithm runs, because
+# the branch is not where the argument names suggest: upstream takes the
+# Gumbel-style fast path when `!replacement` **or `num_samples == 1`**, so
+# `multinomial(probs, 1)` -- the call `GenerationMixin._sample` makes -- takes
+# it even with `replacement` left False. `num_samples=3, replacement=True` is
+# the only combination below that reaches the cumulative-sum kernel.
+
+_MULTINOMIAL_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_MULTINOMIAL_SEEDS = [0, 1, 42, 1234]
+
+
+def _seeded_multinomial(torch_module, c_module, torch_call, op, flat, shape, dtype_name, n_sample, replacement, seed):
+    def run_torch():
+        torch_module.manual_seed(seed)
+        return torch_call(
+            _pair(torch_module, c_module, flat, shape, dtype_name)[0], n_sample, replacement
+        )
+
+    def run_c():
+        c_module._shim_manual_seed(seed)
+        return c_module._aten_dispatch(
+            op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], n_sample, replacement
+        )
+
+    return run_torch, run_c
+
+
+def multinomial_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.multinomial.default"
+    cases: list[Case] = []
+    # Deliberately unnormalised and deliberately not uniform: upstream
+    # normalises by the row sum itself, and a uniform row would hide any
+    # ordering mistake.
+    row = [(i % 7) + 1 for i in range(11)]
+    grid = [
+        (row, (11,), 1, False, "1-D, one sample -- the fast path, and the call the sampler makes"),
+        (row, (11,), 1, True, "replacement=True with one sample still takes the FAST path"),
+        (row, (11,), 3, False, "no replacement, three samples -- fast path via topk"),
+        (row, (11,), 3, True, "the cumulative-sum kernel, the only combination that reaches it"),
+        (row * 3, (3, 11), 1, False, "2-D: one sample per row"),
+        (row * 3, (3, 11), 5, True, "2-D cumulative-sum kernel, five samples per row"),
+    ]
+    for dtype_name in _MULTINOMIAL_DTYPES:
+        for flat, shape, n_sample, replacement, note in grid:
+            for seed in _MULTINOMIAL_SEEDS:
+                run_torch, run_c = _seeded_multinomial(
+                    torch_module, c_module, torch_call, op, flat, shape, dtype_name,
+                    n_sample, replacement, seed,
+                )
+                cases.append(
+                    Case(
+                        name=(
+                            f"multinomial(dtype={dtype_name}, shape={shape}, num_samples={n_sample}, "
+                            f"replacement={replacement}, seed={seed})"
+                        ),
+                        op=op,
+                        run_torch=run_torch,
+                        run_c=run_c,
+                        note=note + " -- both generators seeded to the same value; indices compared exactly",
+                    )
+                )
+
+    def refusal(name, flat, shape, dtype_name, n_sample, replacement, note):
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: torch_call(
+                    _pair(torch_module, c_module, flat, shape, dtype_name)[0], n_sample, replacement
+                ),
+                run_c=lambda: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], n_sample, replacement
+                ),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    refusal("multinomial(num_samples=0 rejected on both sides)", row, (11,), "float32", 0, False,
+            "torch: 'cannot sample n_sample <= 0 samples'")
+    refusal("multinomial(num_samples > categories without replacement rejected on both sides)",
+            row, (11,), "float32", 12, False,
+            "torch: 'cannot sample n_sample > prob_dist.size(-1) samples without replacement'")
+    refusal("multinomial(int64 input rejected on both sides)", [1, 2, 3], (3,), "int64", 1, False,
+            "torch: 'multinomial only supports floating-point dtypes for input, got: Long'")
+    refusal("multinomial(3-D input rejected on both sides)", [1.0] * 8, (2, 2, 2), "float32", 1, False,
+            "torch: 'prob_dist must be 1 or 2 dim'")
+    refusal("multinomial(negative probability rejected on both sides)", [-1.0, 2.0], (2,), "float32", 1, False,
+            "torch: 'probability tensor contains either `inf`, `nan` or element < 0'")
+    refusal("multinomial(inf probability rejected on both sides)", [float("inf"), 2.0], (2,), "float32", 1, False,
+            "same check -- max() < INFINITY is false")
+    refusal("multinomial(NaN probability rejected on both sides)", [float("nan"), 2.0], (2,), "float32", 1, False,
+            "same check -- every comparison against NaN is false, so both halves of it fail")
+    refusal("multinomial(all-zero row rejected on both sides)", [0.0, 0.0], (2,), "float32", 1, False,
+            "torch: 'invalid multinomial distribution (sum of probabilities <= 0)'")
+    refusal("multinomial(all-zero row, with replacement, rejected on both sides)", [0.0, 0.0], (2,), "float32", 2, True,
+            "the same refusal from the other kernel -- reached by a different check upstream")
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -3116,4 +4166,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.silu.default": silu_cases,
     "aten.t.default": t_cases,
     "aten._scaled_dot_product_flash_attention_for_cpu.default": sdpa_flash_cpu_cases,
+    # The eight docs/SAMPLING.md measured `do_sample=True` stopping on.
+    "aten._softmax.default": softmax_cases,
+    "aten.fill_.Tensor": fill__tensor_cases,
+    "aten.le.Scalar": le_scalar_cases,
+    "aten.multinomial.default": multinomial_cases,
+    "aten.scatter.src": scatter_src_cases,
+    "aten.sort.default": sort_cases,
+    "aten.squeeze.dim": squeeze_dim_cases,
+    "aten.topk.default": topk_cases,
 }
