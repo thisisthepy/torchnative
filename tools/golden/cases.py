@@ -2131,10 +2131,21 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     c_idx_shape = tuple(int(x) for x in c_indices.shape)
     if t_idx_shape != c_idx_shape:
         return False, f"indices shape mismatch: torch={t_idx_shape} c={c_idx_shape}"
+    # The indices' *dtype*, not just their values. Upstream promises `int64`
+    # here, and that index goes straight into `index_select`/`gather`/
+    # `embedding`; a shim returning value-identical `int32` passes every other
+    # check in this function and breaks downstream instead. `--self-test`
+    # reported this as `_pair_result_check + dtype-last` (docs/HARNESS.md §6).
+    t_idx_dtype, c_idx_dtype = dt.dtype_name(t_indices.dtype), dt.dtype_name(c_indices.dtype)
+    if t_idx_dtype != c_idx_dtype:
+        return False, f"indices dtype mismatch: torch={t_idx_dtype} c={c_idx_dtype}"
     t_idx_flat, c_idx_flat = _flatten_values(t_indices.tolist()), _flatten_values(c_indices.tolist())
     if t_idx_flat != c_idx_flat:
         return False, f"indices mismatch: torch={t_idx_flat!r} c={c_idx_flat!r}"
-    return True, f"values dtype={t_dtype} shape={t_shape}, indices matched exactly"
+    return True, (
+        f"values dtype={t_dtype} shape={t_shape}, "
+        f"indices matched exactly (dtype={t_idx_dtype})"
+    )
 
 
 def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -3571,12 +3582,26 @@ def _topk_multiset_check(t_res, c_res) -> tuple[bool, str]:
     c_shape = tuple(int(x) for x in c_values.shape)
     if t_shape != c_shape:
         return False, f"values shape mismatch: torch={t_shape} c={c_shape}"
+    # The indices' shape and dtype, both of which the multiset below is blind
+    # to: it flattens, so a reshaped index tensor survives it, and it compares
+    # values, so an `int32` index survives it. The *order* is what this
+    # comparator deliberately does not check -- the shape and the dtype are
+    # promises, not partition artefacts. `--self-test` reported both as
+    # `_topk_multiset_check + shape-last` / `+ dtype-last` (docs/HARNESS.md §6).
+    t_idx_shape = tuple(int(x) for x in t_indices.shape)
+    c_idx_shape = tuple(int(x) for x in c_indices.shape)
+    if t_idx_shape != c_idx_shape:
+        return False, f"indices shape mismatch: torch={t_idx_shape} c={c_idx_shape}"
+    t_idx_dtype, c_idx_dtype = dt.dtype_name(t_indices.dtype), dt.dtype_name(c_indices.dtype)
+    if t_idx_dtype != c_idx_dtype:
+        return False, f"indices dtype mismatch: torch={t_idx_dtype} c={c_idx_dtype}"
     t_pairs = sorted(zip(_flatten_values(t_values.tolist()), _flatten_values(t_indices.tolist())))
     c_pairs = sorted(zip(_flatten_values(c_values.tolist()), _flatten_values(c_indices.tolist())))
     if t_pairs != c_pairs:
         return False, f"selected elements differ: torch={t_pairs!r} c={c_pairs!r}"
     return True, (
         f"values dtype={t_dtype} shape={t_shape}, same {len(t_pairs)} (value, index) pairs "
+        f"(indices dtype={t_idx_dtype} shape={t_idx_shape}) "
         "-- order deliberately unchecked, see the note above"
     )
 
@@ -5266,6 +5291,632 @@ def _big_gemm_case(torch_module, c_module, torch_call, op, dtype_name, m, k, n,
     )
 
 
+# --- the four ops falcon/gptj/bloom/mpt all ask for, plus stack and relu -----
+#
+# docs/ARCH.md measured 32 architectures and found the largest single cluster in
+# the tail: `falcon`, `gptj`, `bloom` and `mpt` are missing *exactly* the same
+# four ops -- `le.Tensor`, `scalar_tensor.default`, `where.self` and
+# `permute.default`. All four are the same idiom, and re-tracing the four models
+# shows it end to end (docs/OPS4.md §1):
+#
+#     mask   = arange(...) <= arange(...)          aten.le.Tensor      (int64)
+#     fill   = scalar_tensor(finfo(dtype).min)     aten.scalar_tensor  (0-d f32)
+#     scores = where(mask, fill, scores)           aten.where.self
+#     q/k/v  = permute(x, [0, 2, 1, 3])            aten.permute.default
+#
+# `stack.default` (gptj, cohere, helium, mamba) and `relu.default` (opt,
+# nemotron, persimmon) ride along as the next two by architecture count.
+#
+# Every case below builds its tensors *inside* the lambdas, for the reason the
+# note above `_pair` gives: a builder must not be able to crash the whole run at
+# case-list time.
+
+
+def _scalar_tensor_case(torch_module, c_module, torch_call, value, dtype_name=None,
+                        kwargs=None, expect="match", note="") -> Case:
+    op = "aten.scalar_tensor.default"
+    kwargs = kwargs or {}
+
+    def t_kw():
+        out = dict(kwargs)
+        if dtype_name is not None:
+            out["dtype"] = dt.torch_dtype(torch_module, dtype_name)
+        return out
+
+    def c_kw():
+        out = dict(kwargs)
+        if dtype_name is not None:
+            out["dtype"] = dt.c_dtype(c_module, dtype_name)
+        return out
+
+    extra = "".join(f", {k}={v!r}" for k, v in kwargs.items())
+    return Case(
+        name=f"scalar_tensor({value!r}, dtype={dtype_name or 'inferred'}{extra}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(value, **t_kw()),
+        run_c=lambda: c_module._aten_dispatch(op, value, **c_kw()),
+        expect=expect,
+        note=note,
+    )
+
+
+def scalar_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+
+    # The rule that would have been got wrong by copying `full`: the fill
+    # value's category is *ignored*. `full([], 3)` is int64 and `full([], True)`
+    # is bool, but `scalar_tensor` of either is float32 (measured). These four
+    # cases are the whole difference and they are the reason the op has its own
+    # kernel rather than a route into `full_default`.
+    for value, note in [
+        (1.5, "python float -> the default float, as expected"),
+        (3, "python INT -> float32, NOT int64 -- `full([], 3)` would be int64"),
+        (True, "python BOOL -> float32, NOT bool -- `full([], True)` would be bool"),
+        (-2, "negative int, same rule"),
+        (0.0, "zero is not a special case"),
+        (float("nan"), "nan survives into the default float"),
+        (float("inf"), "inf survives into the default float"),
+    ]:
+        cases.append(_scalar_tensor_case(torch_module, c_module, torch_call, value, note=note))
+
+    # Every storable dtype, from each of the three scalar categories, since the
+    # inference rule above means the category can only show up through the
+    # conversion and never through the result dtype.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8", "bool"]:
+        for value in [3, 1.5, True]:
+            cases.append(
+                _scalar_tensor_case(
+                    torch_module, c_module, torch_call, value, dtype_name,
+                    note="explicit dtype -- the conversion, not the inference",
+                )
+            )
+
+    # `checked_convert` at numel == 1, which is where upstream's own fast-path
+    # hole lives. The float16/bfloat16 rows must NOT raise and the float32 one
+    # must -- getting that backwards is the failure this pins.
+    for value, dtype_name, note in [
+        (1e6, "float16", "OVERFLOWS float16 and is NOT refused: numel==1 takes upstream's "
+                         "unchecked fast path and saturates to inf (`full([3], 1e6, float16)` raises)"),
+        (1e300, "bfloat16", "same hole, bfloat16"),
+        (1e300, "float32", "float32 is NOT in the hole -- upstream checks it even at one element"),
+        (2 ** 40, "int32", "integer overflow is refused at any numel"),
+        (-1, "uint8", "negative into unsigned WRAPS to 255 -- allowed, magnitude fits"),
+        (300, "uint8", "magnitude does not fit -- refused"),
+        (-1.5, "int64", "float into int TRUNCATES toward zero, giving -1 (not -2)"),
+        (float("nan"), "int64", "int64 has no nan -- refused"),
+        (float("inf"), "int64", "int64 has no inf -- refused"),
+        (float("inf"), "float16", "float16 does have inf -- not an overflow"),
+        (2, "bool", "any nonzero is True; bool never overflows"),
+        (0.0, "bool", "zero is False"),
+    ]:
+        cases.append(
+            _scalar_tensor_case(torch_module, c_module, torch_call, value, dtype_name, note=note)
+        )
+
+    # The factory keyword arguments. `layout=torch.strided` is passed
+    # *explicitly* by bloom, mpt and gptj at this call site (measured), so it
+    # has to be accepted rather than refused -- see `reject_layout`.
+    cases.append(
+        _scalar_tensor_case(
+            torch_module, c_module, torch_call, 2.5, "float32",
+            kwargs={"device": "cpu"}, note="device given as a string",
+        )
+    )
+    cases.append(
+        Case(
+            name="scalar_tensor(2.5, layout=torch.strided) [the real call sites pass this]",
+            op="aten.scalar_tensor.default",
+            run_torch=lambda: torch_call(2.5, layout=torch_module.strided),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.scalar_tensor.default", 2.5, layout=torch_module.strided
+            ),
+            note="bloom/mpt/gptj send layout=torch.strided; it names the only layout "
+                 "the shim has, so refusing it would block them on nothing",
+        )
+    )
+    cases.append(
+        Case(
+            name="scalar_tensor(2.5, layout=torch.sparse_coo) [any other layout still refuses]",
+            op="aten.scalar_tensor.default",
+            run_torch=lambda: torch_call(2.5, layout=torch_module.sparse_coo),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.scalar_tensor.default", 2.5, layout=torch_module.sparse_coo
+            ),
+            expect="c_error",
+            note="torch answers a dense tensor and ignores the request at this size; the "
+                 "shim has no sparse layout and says so rather than silently answering dense",
+        )
+    )
+    # The exact call the four architectures make.
+    cases.append(
+        Case(
+            name="scalar_tensor(finfo(float32).min, dtype=float32) [the mask fill value, verbatim]",
+            op="aten.scalar_tensor.default",
+            run_torch=lambda: torch_call(
+                torch_module.finfo(torch_module.float32).min, dtype=torch_module.float32
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.scalar_tensor.default",
+                torch_module.finfo(torch_module.float32).min,
+                dtype=c_module.float32,
+            ),
+            note="falcon/gptj/bloom/mpt all build their attention mask fill this way",
+        )
+    )
+    return cases
+
+
+# --- aten.where.self ---------------------------------------------------------
+
+
+def _where_case(torch_module, c_module, torch_call, cond, lhs, rhs,
+                expect="match", note="") -> Case:
+    """`cond`/`lhs`/`rhs` are `(flat, shape, dtype_name)` triples, built inside
+    the lambdas."""
+    op = "aten.where.self"
+
+    def build(index):
+        return tuple(
+            _pair(torch_module, c_module, flat, shape, dtype_name)[index]
+            for flat, shape, dtype_name in (cond, lhs, rhs)
+        )
+
+    return Case(
+        name=f"where(cond={cond[1]}/{cond[2]}, self={lhs[1]}/{lhs[2]}, "
+             f"other={rhs[1]}/{rhs[2]}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(*build(0)),
+        run_c=lambda: c_module._aten_dispatch(op, *build(1)),
+        expect=expect,
+        note=note,
+    )
+
+
+def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+    mask4 = ([1, 0, 1, 0], (4,), "bool")
+
+    # Both branches in every storable dtype. `where` moves elements rather than
+    # computing on them, so unlike `mm` there is no kernel-coverage split.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8", "bool"]:
+        cases.append(
+            _where_case(
+                torch_module, c_module, torch_call, mask4,
+                ([1, 2, 3, 4], (4,), dtype_name), ([9, 8, 7, 6], (4,), dtype_name),
+                note="elementwise select, matched dtypes",
+            )
+        )
+
+    # The shape rules. The third is the one a condition-shaped implementation
+    # gets wrong: the result is the join of all THREE, not the condition's.
+    for cond, lhs, rhs, note in [
+        (([1, 0, 0, 1], (2, 2), "bool"), ([1.0], (), "float32"), ([-1.0], (), "float32"),
+         "0-D BRANCHES broadcast up to the mask -- exactly what the four architectures do"),
+        (([1], (), "bool"), ([float(i) for i in range(6)], (2, 3), "float32"),
+         ([0.0, 0.0, 0.0], (3,), "float32"),
+         "0-D CONDITION: result is (2,3), the join of all three, not the condition's ()"),
+        (([1, 0], (2, 1), "bool"), ([1.0, 2.0, 3.0], (1, 3), "float32"), ([0.0], (1, 1), "float32"),
+         "all three broadcast against each other"),
+        (([1], (), "bool"), ([1.0], (), "float32"), ([2.0], (), "float32"),
+         "everything 0-D -> a 0-D result"),
+        (([], (0,), "bool"), ([], (0,), "float32"), ([], (0,), "float32"),
+         "empty in, empty out -- not an error"),
+        (([1, 0, 1], (3,), "bool"), ([1.0, 2.0], (2,), "float32"), ([0.0, 0.0], (2,), "float32"),
+         "shapes that do not broadcast are refused by both"),
+    ]:
+        cases.append(
+            _where_case(torch_module, c_module, torch_call, cond, lhs, rhs,
+                        expect="both_error" if "refused" in note else "match", note=note)
+        )
+
+    # The condition's dtype. `uint8` is ACCEPTED here (deprecated upstream but
+    # answered), which is the opposite of `masked_fill`'s rule -- copying that
+    # refusal over would have refused a call torch answers.
+    cases.append(
+        _where_case(
+            torch_module, c_module, torch_call, ([2, 0, 5, 0], (4,), "uint8"),
+            ([1.0, 2.0, 3.0, 4.0], (4,), "float32"), ([-1.0, -2.0, -3.0, -4.0], (4,), "float32"),
+            note="uint8 condition is ACCEPTED (deprecated upstream, still answered) and read "
+                 "as truthiness -- 2 and 5 both select the first branch",
+        )
+    )
+    for cond_dtype in ["int64", "int32", "float32"]:
+        cases.append(
+            _where_case(
+                torch_module, c_module, torch_call, ([1, 0, 1, 0], (4,), cond_dtype),
+                ([1.0, 2.0, 3.0, 4.0], (4,), "float32"), ([0.0, 0.0, 0.0, 0.0], (4,), "float32"),
+                expect="both_error",
+                note=f"a {cond_dtype} condition is refused -- only bool and (deprecated) uint8",
+            )
+        )
+
+    # Values that a blend rather than a select would get wrong.
+    cases.append(
+        _where_case(
+            torch_module, c_module, torch_call, ([1, 0], (2,), "bool"),
+            ([float("nan"), 1.0], (2,), "float32"), ([2.0, float("inf")], (2,), "float32"),
+            note="nan and inf are selected, not arithmetic -- the result is [nan, inf]",
+        )
+    )
+    cases.append(
+        _where_case(
+            torch_module, c_module, torch_call, ([1], (1,), "bool"),
+            ([1.0], (1,), "float32"), ([float("nan")], (1,), "float32"),
+            note="the UNSELECTED branch is never read for its value: nan there is not "
+                 "contagious (measured upstream)",
+        )
+    )
+
+    # The gap: upstream promotes, this shim refuses. The full 9x9 table is in
+    # docs/OPS4.md §2; these are the four rows that would be got wrong by
+    # assuming "the wider one wins" (an integral branch never widens a floating
+    # one, and float16 with bfloat16 escapes to float32).
+    for lhs_dtype, rhs_dtype, upstream, note in [
+        ("float32", "float64", "float64", "the ordinary widening"),
+        ("float16", "int64", "float16", "an INTEGRAL branch does not widen a floating one"),
+        ("float16", "bfloat16", "float32", "two reduced floats promote OUT to float32"),
+        ("bool", "int64", "int64", "bool is the bottom of the lattice"),
+    ]:
+        cases.append(
+            _where_case(
+                torch_module, c_module, torch_call, mask4,
+                ([1, 2, 3, 4], (4,), lhs_dtype), ([9, 8, 7, 6], (4,), rhs_dtype),
+                expect="c_error",
+                note=f"upstream promotes to {upstream} ({note}); the shim refuses rather than "
+                     "guessing a promotion -- see same_dtype in rust/torch_c/src/aten.rs",
+            )
+        )
+
+    # The idiom itself, at the shape falcon/gptj/bloom/mpt actually produce.
+    cases.append(
+        _where_case(
+            torch_module, c_module, torch_call,
+            ([1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1], (1, 1, 4, 4), "bool"),
+            ([0.0], (), "float32"), ([-3.4028234663852886e38], (), "float32"),
+            note="the causal-mask idiom verbatim: a (1,1,S,S) bool mask selecting between "
+                 "two 0-D scalar_tensor results",
+        )
+    )
+    return cases
+
+
+# --- aten.permute.default ----------------------------------------------------
+
+
+def _permute_case(torch_module, c_module, torch_call, flat, shape, dims,
+                  dtype_name="float32", expect="match", note="") -> Case:
+    op = "aten.permute.default"
+    return Case(
+        name=f"permute(dtype={dtype_name}, shape={shape}, dims={dims}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(
+            _pair(torch_module, c_module, flat, shape, dtype_name)[0], list(dims)
+        ),
+        run_c=lambda: c_module._aten_dispatch(
+            op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], list(dims)
+        ),
+        expect=expect,
+        note=note,
+    )
+
+
+def permute_cases(torch_module, c_module, torch_call) -> list[Case]:
+    six = [float(i) for i in range(6)]
+    cases: list[Case] = []
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8", "bool"]:
+        values = [1, 0, 0, 1, 1, 0] if dtype_name == "bool" else six
+        cases.append(
+            _permute_case(torch_module, c_module, torch_call, values, (2, 3), [1, 0],
+                          dtype_name, note="the 2-D transpose spelling, every dtype")
+        )
+
+    for flat, shape, dims, note in [
+        (six, (2, 3), [0, 1], "the identity permutation is a legal no-op"),
+        (six, (2, 3), [-1, -2], "negative entries normalise: [-1,-2] == [1,0]"),
+        ([float(i) for i in range(24)], (2, 3, 4), [2, 0, 1], "3-D rotate -> (4,2,3)"),
+        ([float(i) for i in range(24)], (2, 3, 4), [1, 2, 0], "3-D the other way -> (3,4,2)"),
+        ([float(i) for i in range(24)], (1, 2, 3, 4), [0, 2, 1, 3],
+         "the attention spelling all four architectures call"),
+        ([7.0], (), [], "0-D takes an EMPTY dims list and comes back unchanged"),
+        ([1.0, 2.0, 3.0], (3,), [0], "1-D identity"),
+        ([], (0, 3), [1, 0], "an empty extent permutes to (3,0)"),
+    ]:
+        cases.append(
+            _permute_case(torch_module, c_module, torch_call, flat, shape, dims, note=note)
+        )
+
+    # The refusals. The length rule is exact -- `rank.max(1)` would let the
+    # 0-D/[0] case through, and upstream refuses it.
+    for flat, shape, dims, note in [
+        ([7.0], (), [0], "0-D with a 1-element dims list IS refused (rank is 0, not max(0,1))"),
+        (six, (2, 3), [0], "too few dims"),
+        (six, (2, 3), [0, 1, 2], "too many dims"),
+        (six, (2, 3), [0, 0], "a duplicate dim is refused -- it is not a permutation"),
+        (six, (2, 3), [2, 0], "out of range, positive"),
+        (six, (2, 3), [-3, 0], "out of range, negative"),
+    ]:
+        cases.append(
+            _permute_case(torch_module, c_module, torch_call, flat, shape, dims,
+                          expect="both_error", note=note)
+        )
+    return cases
+
+
+# --- aten.stack.default ------------------------------------------------------
+
+
+def _stack_case(torch_module, c_module, torch_call, entries, dim=None,
+                expect="match", note="") -> Case:
+    """`entries` is a list of `(flat, shape, dtype_name)` triples."""
+    op = "aten.stack.default"
+    args = () if dim is None else (dim,)
+
+    def build(index):
+        return [_pair(torch_module, c_module, f, s, d)[index] for f, s, d in entries]
+
+    shapes = [e[1] for e in entries]
+    dtypes = sorted({e[2] for e in entries})
+    return Case(
+        name=f"stack(n={len(entries)}, shapes={shapes}, dtypes={dtypes}, "
+             f"dim={'default 0' if dim is None else dim}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(build(0), *args),
+        run_c=lambda: c_module._aten_dispatch(op, build(1), *args),
+        expect=expect,
+        note=note,
+    )
+
+
+def stack_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8", "bool"]:
+        a = ([1, 0] if dtype_name == "bool" else [1, 2], (2,), dtype_name)
+        b = ([0, 1] if dtype_name == "bool" else [3, 4], (2,), dtype_name)
+        cases.append(
+            _stack_case(torch_module, c_module, torch_call, [a, b],
+                        note="two 1-D entries on a new leading axis, every dtype")
+        )
+
+    a = ([1.0, 2.0], (2,), "float32")
+    b = ([3.0, 4.0], (2,), "float32")
+    # The dim rule, which is `unsqueeze`'s and NOT `cat`'s: the new axis may go
+    # after the last existing one, so dim == rank is legal.
+    for dim, note in [
+        (0, "explicit dim 0 -> (2,2), rows are the entries"),
+        (1, "dim == RANK is legal (cat would refuse it) -> (2,2), columns are the entries"),
+        (-1, "-1 is the new last axis, same as dim=1 here"),
+        (-2, "-2 is the new first axis, same as dim=0 here"),
+    ]:
+        cases.append(_stack_case(torch_module, c_module, torch_call, [a, b], dim, note=note))
+    for dim in [2, -3]:
+        cases.append(
+            _stack_case(torch_module, c_module, torch_call, [a, b], dim, expect="both_error",
+                        note=f"dim={dim} is outside [-(rank+1), rank]")
+        )
+
+    scalar_a = ([1.0], (), "float32")
+    scalar_b = ([2.0], (), "float32")
+    for entries, dim, expect, note in [
+        ([a], None, "match", "a single entry still gets the new axis -> (1,2)"),
+        ([a, b, a], 1, "match", "three entries, dim=1 -> (2,3)"),
+        ([scalar_a, scalar_b], None, "match", "0-D entries stack into a 1-D result"),
+        ([scalar_a, scalar_b], 1, "both_error", "0-D entries have no dim 1"),
+        ([([], (0,), "float32"), ([], (0,), "float32")], None, "match",
+         "empty entries give shape (2,0), not an error"),
+        ([([float(i) for i in range(6)], (2, 3), "float32")] * 2, 1, "match",
+         "2-D entries, new axis in the middle -> (2,2,3)"),
+        ([([float(i) for i in range(8)], (1, 2, 2, 2), "float32")] * 2, -1, "match",
+         "the gptj rotary spelling: two 4-D halves stacked on a new last axis"),
+    ]:
+        cases.append(
+            _stack_case(torch_module, c_module, torch_call, entries, dim, expect=expect, note=note)
+        )
+
+    # The size rule, which is `stack`'s alone: `cat` lets the join axis differ,
+    # `stack` requires every entry to be identical, rank included.
+    cases.append(
+        _stack_case(
+            torch_module, c_module, torch_call,
+            [a, ([1.0, 2.0, 3.0], (3,), "float32")], expect="both_error",
+            note="differing extents are refused -- cat on dim 0 would accept these",
+        )
+    )
+    cases.append(
+        _stack_case(
+            torch_module, c_module, torch_call,
+            [a, ([1.0, 2.0], (2, 1), "float32")], expect="both_error",
+            note="differing RANK is refused too, even at the same element count",
+        )
+    )
+    cases.append(
+        Case(
+            name="stack([]) [an empty list has no shape to invent]",
+            op="aten.stack.default",
+            run_torch=lambda: torch_call([]),
+            run_c=lambda: c_module._aten_dispatch("aten.stack.default", []),
+            expect="both_error",
+            note="upstream: 'stack expects a non-empty TensorList'",
+        )
+    )
+
+    # The gap: upstream promotes here as well.
+    for lhs_dtype, rhs_dtype, upstream in [
+        ("float32", "float64", "float64"),
+        ("int64", "float32", "float32"),
+        ("bool", "int64", "int64"),
+    ]:
+        cases.append(
+            _stack_case(
+                torch_module, c_module, torch_call,
+                [([1, 2], (2,), lhs_dtype), ([3, 4], (2,), rhs_dtype)],
+                expect="c_error",
+                note=f"upstream promotes the entries to {upstream}; the shim refuses, the same "
+                     "way cat_default does",
+            )
+        )
+    return cases
+
+
+# --- aten.relu.default -------------------------------------------------------
+
+
+def relu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.relu.default"
+    cases: list[Case] = []
+
+    # relu has an integral CPU kernel upstream (silu does not), so the integral
+    # dtypes belong here as matches rather than refusals.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16"]:
+        cases.append(
+            _unary_case(torch_module, c_module, op, torch_call, dtype_name,
+                        [-2, -1, 0, 1, 2], (5,), "negatives clamp, non-negatives pass through")
+        )
+    # uint8 with non-negative literals only: `torch.tensor(-1, uint8)` wraps to
+    # 255 while `_C._tensor_from_flat` saturates to 0, a constructor difference
+    # docs/GPT2.md §7 already recorded and which has nothing to do with relu.
+    cases.append(
+        _unary_case(torch_module, c_module, op, torch_call, "uint8",
+                    [0, 1, 2, 255], (4,),
+                    "on an unsigned dtype relu is the identity -- no element is negative")
+    )
+    cases.append(
+        Case(
+            name="relu(dtype=bool, shape=(2,)) [upstream refuses bool]",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [1, 0], (2,), "bool")[0]),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1, 0], (2,), "bool")[1]
+            ),
+            expect="both_error",
+            note="'Boolean inputs not supported for relu' -- a bool relu would be the identity, "
+                 "and upstream would rather say no than answer it",
+        )
+    )
+
+    # The two inputs that separate `x < 0 ? 0 : x` from `max(x, 0)`. A max-shaped
+    # implementation passes everything above and fails exactly here.
+    cases.append(
+        Case(
+            name="relu(float32, [nan, inf, -inf, -0.0, 0.0]) [NOT max(x,0)]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module,
+                      [float("nan"), float("inf"), float("-inf"), -0.0, 0.0], (5,), "float32")[0]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module,
+                      [float("nan"), float("inf"), float("-inf"), -0.0, 0.0], (5,), "float32")[1],
+            ),
+            note="measured upstream: [nan, inf, 0.0, -0.0, 0.0]. nan SURVIVES (so this is not a "
+                 "comparison-ordered maximum) and -0.0 keeps its sign (so this is not a clamp "
+                 "that normalises) -- both fall out of `x < 0 ? 0 : x`",
+        )
+    )
+    cases.append(
+        Case(
+            name="relu(float64, [nan, -0.0]) [the same two, at double precision]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), -0.0], (2,), "float64")[0]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [float("nan"), -0.0], (2,), "float64")[1]
+            ),
+            note="not a float32-only accident",
+        )
+    )
+
+    for flat, shape, note in [
+        ([-3.0], (), "0-D input"),
+        ([], (0,), "empty input"),
+        ([float(i) - 3 for i in range(12)], (3, 4), "2-D, straddling zero"),
+        ([-1e30, 1e30, -1e-30, 1e-30], (4,), "magnitudes far from 1"),
+    ]:
+        cases.append(
+            _unary_case(torch_module, c_module, op, torch_call, "float32", flat, shape, note)
+        )
+    return cases
+
+
+# --- aten.le.Tensor ----------------------------------------------------------
+#
+# The Tensor-overload sibling of `le.Scalar`. It exists as its own key for the
+# same reason `lt.Tensor`/`lt.Scalar` do -- different schemas -- and it is the
+# op the four architectures build their causal mask with.
+
+
+def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.le.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    cases.append(
+        Case(
+            name="le(float32, nan <= nan) [every comparison against NaN is false, including <=]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[0],
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[1],
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[1],
+            ),
+            note="nan <= nan is False even though the two sides are the same object; "
+                 "1.0 <= 1.0 in the same call is True, so this is not a blanket False",
+        )
+    )
+    cases.append(
+        Case(
+            name="le(int64, causal mask idiom) [arange(S)[None] <= arange(S)[:,None]]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 1, 4), "int64")[0],
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 4, 1), "int64")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 1, 4), "int64")[1],
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 4, 1), "int64")[1],
+            ),
+            note="the lower-triangular mask falcon/gptj/bloom/mpt all build, at the exact "
+                 "(1,1,S,1) vs (1,1,1,S) broadcast they use",
+        )
+    )
+    cases.append(
+        Case(
+            name="le(bool, [T,F] <= [F,T]) [False <= True, so bool ordering is False < True]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 0], (2,), "bool")[0],
+                _pair(torch_module, c_module, [0, 1], (2,), "bool")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 0], (2,), "bool")[1],
+                _pair(torch_module, c_module, [0, 1], (2,), "bool")[1],
+            ),
+            note="bool compares as 0/1, giving [False, True]",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -5360,4 +6011,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.gelu.default": gelu_cases,
     "aten.gather.default": gather_cases,
     "aten.zero_.default": zero__cases,
+    # The four docs/ARCH.md measured falcon, gptj, bloom and mpt all missing --
+    # the same four, in all four models -- plus the next two by architecture
+    # count (docs/OPS4.md).
+    "aten.le.Tensor": le_tensor_cases,
+    "aten.scalar_tensor.default": scalar_tensor_cases,
+    "aten.where.self": where_self_cases,
+    "aten.permute.default": permute_cases,
+    "aten.stack.default": stack_cases,
+    "aten.relu.default": relu_cases,
 }

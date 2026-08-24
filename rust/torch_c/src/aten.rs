@@ -76,6 +76,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
     "aten.le.Scalar",
+    "aten.le.Tensor",
     "aten.lift_fresh.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
@@ -94,13 +95,16 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.new_ones.default",
     "aten.normal_.default",
     "aten.ones.default",
+    "aten.permute.default",
     "aten.pow.Scalar",
     "aten.pow.Tensor_Scalar",
     "aten.pow.Tensor_Tensor",
     "aten.randint.low",
     "aten.reciprocal.default",
+    "aten.relu.default",
     "aten.rsqrt.default",
     "aten.rsub.Scalar",
+    "aten.scalar_tensor.default",
     "aten.scatter.src",
     "aten.select.int",
     "aten.silu.default",
@@ -109,6 +113,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sort.default",
     "aten.split.Tensor",
     "aten.squeeze.dim",
+    "aten.stack.default",
     "aten.sub.Tensor",
     "aten.sum.default",
     "aten.sum.dim_IntList",
@@ -119,6 +124,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.view.default",
+    "aten.where.self",
     "aten.zero_.default",
 ];
 
@@ -206,6 +212,8 @@ fn aten_dispatch_inner(
         "aten.argmax.default" => argmax_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
         "aten.cat.default" => cat_default(py, args, kwargs),
+        "aten.stack.default" => stack_default(py, args, kwargs),
+        "aten.scalar_tensor.default" => scalar_tensor_default(py, args, kwargs),
         "aten.embedding.default" => embedding_default(py, args, kwargs),
         "aten.empty.memory_format" => empty_memory_format(py, args, kwargs),
         "aten.full.default" => full_default(py, args, kwargs),
@@ -247,6 +255,7 @@ fn aten_dispatch_inner(
         "aten.lt.Tensor" => compare_tensor(py, args, kwargs, "aten.lt.Tensor", Cmp::Lt),
         "aten.lt.Scalar" => compare_scalar(py, args, kwargs, "aten.lt.Scalar", Cmp::Lt),
         "aten.le.Scalar" => compare_scalar(py, args, kwargs, "aten.le.Scalar", Cmp::Le),
+        "aten.le.Tensor" => compare_tensor(py, args, kwargs, "aten.le.Tensor", Cmp::Le),
 
         "aten.bitwise_and.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_and.Tensor", Bitwise::And),
         "aten.bitwise_or.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_or.Tensor", Bitwise::Or),
@@ -262,6 +271,7 @@ fn aten_dispatch_inner(
         "aten.tanh.default" => unary_float(py, args, kwargs, "aten.tanh.default", Unary::Tanh),
         "aten.neg.default" => neg_default(py, args, kwargs),
         "aten.silu.default" => silu_default(py, args, kwargs),
+        "aten.relu.default" => relu_default(py, args, kwargs),
 
         "aten.sum.default" => sum_or_mean(py, args, kwargs, "aten.sum.default", Reduce::Sum, false),
         "aten.sum.dim_IntList" => {
@@ -279,6 +289,7 @@ fn aten_dispatch_inner(
 
         "aten.masked_fill.Scalar" => masked_fill(py, args, kwargs, "aten.masked_fill.Scalar"),
         "aten.masked_fill.Tensor" => masked_fill(py, args, kwargs, "aten.masked_fill.Tensor"),
+        "aten.where.self" => where_self(py, args, kwargs),
 
         "aten.expand.default" => expand_default(py, args, kwargs),
         "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
@@ -292,6 +303,7 @@ fn aten_dispatch_inner(
             reshape_like(py, args, kwargs, "aten._unsafe_view.default", "size")
         }
         "aten.transpose.int" => transpose_int(py, args, kwargs),
+        "aten.permute.default" => permute_default(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
         "aten.unsqueeze.default" => unsqueeze_default(py, args, kwargs),
         "aten.squeeze.dim" => squeeze_dim(py, args, kwargs),
@@ -1385,6 +1397,174 @@ fn cat_default(
     finish(py, tensor, tag)
 }
 
+/// `aten::stack(Tensor[] tensors, int dim=0) -> Tensor`
+///
+/// **Not `cat` with a different name.** `cat` joins along an existing axis and
+/// lets the extents differ there; `stack` inserts a *new* axis and therefore
+/// requires every entry to have exactly the same size, rank included. Measured:
+/// `stack([zeros(2), zeros(2,1)])` raises `stack expects each tensor to be
+/// equal size, but got [2] at entry 0 and [2, 1] at entry 1`, where the
+/// corresponding `cat` is a legal call on a different axis. Routing this key at
+/// `cat_default` would compute a different op.
+///
+/// Reached by GPT-J's rotary embedding, which is the only architecture of the
+/// four this op was added for that calls it: `stack([x1, x2], dim=-1)` on a
+/// pair of `(batch, seq, heads, dim/2)` slices, then a flatten. docs/ARCH.md
+/// counts three more callers (`cohere`, `helium`, `mamba`).
+///
+/// Three rules were measured rather than inferred, and two of them differ from
+/// `cat`:
+///
+///   * **`dim` runs to `rank`, not `rank - 1`.** The new axis can go after the
+///     last existing one, so the legal range is `[-(rank+1), rank]` -- the same
+///     widened range `unsqueeze` has and `cat` does not. `stack([a, b], 1)` on
+///     two 1-D tensors is legal; `cat` at `dim=1` on the same pair is not.
+///   * **an empty list is refused** (`stack expects a non-empty TensorList`),
+///     because there is no shape to invent for the result. `cat` refuses too,
+///     with different wording.
+///   * **upstream promotes dtypes here** -- `stack([bool, int64])` gives
+///     `int64` and `stack([int64, float32])` gives `float32`, both measured.
+///     This shim refuses instead, the same way `cat_default` and `same_dtype`
+///     do and for the reason written at `same_dtype`. The four architectures
+///     this op was added for never mix (GPT-J stacks two `float32` halves of
+///     one tensor), so the refusal costs nothing measured; the golden cases
+///     record the promotion as `c_error` so it stays visible as a gap rather
+///     than being forgotten.
+///
+/// Entries are made contiguous first. Upstream accepts a non-contiguous entry
+/// and answers a contiguous result (measured on a transposed input), and
+/// candle's `cat` -- which `Tensor::stack` reaches after unsqueezing -- wants
+/// contiguous inputs.
+fn stack_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.stack.default";
+    let tensors: Vec<PyTensorBase> = required(OP, args, kwargs, 0, "tensors")?.extract()?;
+    if tensors.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "stack expects a non-empty TensorList",
+        ));
+    }
+    let tag = tensors[0].tag();
+    for other in &tensors[1..] {
+        if other.tag() != tag {
+            return Err(not_implemented(format!(
+                "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                tag.name(),
+                other.tag().name()
+            )));
+        }
+    }
+    let first = tensors[0].tensor().dims().to_vec();
+    for (index, other) in tensors.iter().enumerate().skip(1) {
+        if other.tensor().dims() != first.as_slice() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "stack expects each tensor to be equal size, but got {:?} at entry 0 \
+                 and {:?} at entry {index}",
+                first,
+                other.tensor().dims()
+            )));
+        }
+    }
+
+    // The widened range: `normalise_dim` clamps to `rank.max(1)`, which is the
+    // right rule for an *existing* axis and one short for a new one. A 0-D
+    // entry stacks at `dim=0` only, and `stack([tensor(1.), tensor(2.)], 1)`
+    // is an IndexError upstream -- so the extent is `rank + 1`, uniformly.
+    let raw = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0);
+    let extent = first.len() as isize + 1;
+    let dim = if raw < 0 { raw + extent } else { raw };
+    if dim < 0 || dim >= extent {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "{OP}: Dimension out of range (expected to be in range of [{}, {}], but got {raw})",
+            -extent,
+            extent - 1
+        )));
+    }
+
+    let contiguous: Vec<Tensor> = tensors
+        .iter()
+        .map(|t| t.tensor().contiguous().map_err(|e| candle_err(OP, e)))
+        .collect::<PyResult<_>>()?;
+    let tensor = Tensor::stack(&contiguous, dim as usize).map_err(|e| candle_err(OP, e))?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::scalar_tensor(Scalar s, *, ScalarType? dtype=None, Layout? layout=None,
+///     Device? device=None, bool? pin_memory=None) -> Tensor`
+///
+/// A 0-D tensor holding one number. It is how `falcon`, `gptj`, `bloom` and
+/// `mpt` build their attention mask fill value -- all four call
+/// `scalar_tensor(finfo(dtype).min, dtype=..., device=...)` and hand the result
+/// straight to `where.self` (measured, docs/OPS4.md §1).
+///
+/// **The dtype rule is not `full`'s, and inferring it from `full` would be
+/// wrong.** `full` reads the fill value's category (`full([], 3)` is `int64`,
+/// `full([], True)` is `bool`); `scalar_tensor` ignores it entirely and always
+/// answers the default float:
+///
+/// ```text
+/// scalar_tensor(3)      -> float32   (full([], 3)     -> int64)
+/// scalar_tensor(True)   -> float32   (full([], True)  -> bool)
+/// scalar_tensor(1.5)    -> float32
+/// ```
+///
+/// Measured on torch 2.13.0 over int, bool, float, `nan` and `inf`. A shim that
+/// shared `full`'s inference would give `int64` where torch gives `float32`,
+/// and the mask value would then be silently truncated.
+///
+/// The overflow rule *is* `full`'s, including its numel==1 hole, and that too
+/// is measured rather than assumed: `scalar_tensor(1e6, float16)` is `inf`
+/// while `scalar_tensor(1e300, float32)` raises, which is exactly what
+/// `checked_convert` at `numel = 1` reproduces (only the reduced-precision
+/// floats take the unchecked fast path). `scalar_tensor(-1, uint8)` is `255`
+/// and `scalar_tensor(300, uint8)` raises -- the two's-complement wrap
+/// allowance, same as `full`.
+///
+/// `layout=torch.strided` is accepted rather than refused. `reject_unsupported`
+/// would turn it away, and the measured call sites pass it explicitly (`bloom`,
+/// `mpt` and `gptj` all send `layout=torch.strided`), so refusing it would
+/// block the four architectures this op exists to open on an argument that
+/// names the only layout the shim has. Any other layout still refuses.
+fn scalar_tensor_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.scalar_tensor.default";
+    let raw = required(OP, args, kwargs, 0, "s")?;
+    let value = scalar_arg(OP, args, kwargs, 0, "s")?.ok_or_else(|| missing(OP, "s"))?;
+    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(DEFAULT_FLOAT);
+    reject_layout(OP, args, kwargs, 2)?;
+    reject_unsupported(OP, args, kwargs, &[(4, "pin_memory")])?;
+    let device = device_arg(args, kwargs, 3, "device")?;
+
+    // A 0-D tensor is one element, so the numel==1 branch of the upstream
+    // check is the one that applies -- see the note above.
+    if !raw.is_instance_of::<PyTensorBase>() {
+        checked_convert(&raw, raw.is_instance_of::<pyo3::types::PyInt>(), dtype, 1)?;
+    }
+
+    if dtype == TorchDType::Bool {
+        let truthy = u8::from(value.as_f64() != 0.0);
+        let tensor = Tensor::full(truthy, (), &device).map_err(|e| candle_err(OP, e))?;
+        return finish(py, tensor, dtype);
+    }
+    let storage = PyDtype::new(dtype).storage(OP)?;
+    let tensor = if storage.is_int() {
+        // Upstream truncates toward zero rather than rounding:
+        // `scalar_tensor(-1.5, dtype=int64)` is `-1`, measured.
+        Tensor::full(value.as_i64(), (), &device)
+    } else {
+        Tensor::full(value.as_f64(), (), &device)
+    }
+    .and_then(|t| t.to_dtype(storage))
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, tensor, dtype)
+}
+
 /// `aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor`
 ///
 /// `dim=None` flattens first, and `keepdim=True` alongside it gives shape
@@ -1860,6 +2040,12 @@ enum Cmp {
 /// one common representation so the comparison is exact: `f64` if either side
 /// is floating, `i64` otherwise. There is no promotion step that could round
 /// one side onto the other.
+///
+/// `le.Tensor` joined this family for `falcon`/`gptj`/`bloom`/`mpt`, which all
+/// build their causal mask as `arange(...) <= arange(...)` on two `int64`
+/// tensors (measured, docs/OPS4.md §1). It is a separate key from `le.Scalar`
+/// -- different schema, different overload -- but the same kernel, exactly as
+/// `lt.Tensor`/`lt.Scalar` already are.
 fn compare_common(op: &str, tensor: &Tensor, floating: bool) -> PyResult<Tensor> {
     tensor
         .to_dtype(if floating {
@@ -2197,6 +2383,53 @@ fn neg_default(
     )
     .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::relu(Tensor self) -> Tensor`
+///
+/// Opened `opt`, `nemotron` and `persimmon` (docs/ARCH.md). The whole op is one
+/// line of arithmetic and every interesting thing about it is in *which* line.
+///
+/// **`relu` is not `max(x, 0)`.** Two measured results rule that reading out:
+///
+/// ```text
+/// relu([nan, inf, -inf, -0.0, 0.0]) == [nan, inf, 0.0, -0.0, 0.0]
+/// signbit(relu(-0.0)) == True
+/// ```
+///
+/// `nan` survives, so it is not a maximum against zero that would let either
+/// operand win by comparison order; and `-0.0` comes back with its sign, so it
+/// is not "clamp then normalise". Both fall out of `x < 0 ? 0 : x`, which is
+/// what this computes: `-0.0 < 0` is false so the element passes through
+/// untouched, and `nan < 0` is false for the same reason. A `max`-shaped
+/// implementation would pass every ordinary test and differ on exactly these
+/// two inputs -- the golden cases pin both.
+///
+/// **Unlike `silu`, the integral dtypes are not refused.** `relu` has an
+/// integral CPU kernel upstream and `silu` does not, so the refusal that
+/// belongs one function down does not belong here; only `bool` is refused, with
+/// upstream's wording. On `uint8` it is the identity, which is correct rather
+/// than a special case: no unsigned element is negative.
+fn relu_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.relu.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Boolean inputs not supported for relu",
+        ));
+    }
+    let source = input.tensor().contiguous().map_err(|e| candle_err(OP, e))?;
+    let zeros = source.zeros_like().map_err(|e| candle_err(OP, e))?;
+    let out = source
+        .lt(&zeros)
+        .and_then(|negative| negative.where_cond(&zeros, &source))
+        .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
@@ -2770,6 +3003,96 @@ fn masked_fill(
     finish(py, out, tag)
 }
 
+/// `aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor`
+///
+/// The three-tensor select. `falcon`, `gptj`, `bloom` and `mpt` all reach it
+/// the same way -- a `bool` causal mask and two **0-D** `float32` branches
+/// (`scalar_tensor(finfo.min)` and `scalar_tensor(0.0)`) broadcast up to the
+/// mask's shape (measured, docs/OPS4.md §1). That is why all three operands
+/// broadcast here rather than only two: the branches carry no shape at all.
+///
+/// **The condition's dtype rule is not `masked_fill`'s.** `masked_fill`
+/// refuses a `uint8` mask because upstream refuses one (BOOL.md §3 lists that
+/// as a guardrail worth keeping). `where` *accepts* `uint8`, with a deprecation
+/// warning, and refuses every other non-`bool` dtype:
+///
+/// ```text
+/// where(bool  cond, ...)  -> computes
+/// where(uint8 cond, ...)  -> computes, "where received a uint8 condition
+///                            tensor. This behavior is deprecated..."
+/// where(int64 cond, ...)  -> RuntimeError: where expected condition to be a
+///                            boolean tensor, but got a tensor with dtype Long
+/// ```
+///
+/// All four measured. Carrying `masked_fill`'s refusal over would have refused
+/// a call upstream answers, which is the noisier direction but still a
+/// divergence; carrying `uint8` acceptance into `masked_fill` would have been
+/// the silent one. They are different ops and this shim keeps them different.
+///
+/// **Upstream promotes the two branches; this shim does not.** The full 9x9
+/// table was measured and it is torch's ordinary promotion lattice -- notably
+/// `where(float16, bfloat16) -> float32`, and an integral branch never widens a
+/// floating one (`where(float16, int64) -> float16`). The shim refuses through
+/// `same_dtype` for the reason written there, and the golden cases record the
+/// promoting combinations as `c_error` so the gap stays visible. **No measured
+/// call site mixes**: all four architectures pass two `float32` branches.
+///
+/// The unselected branch is never read for its value, only for its shape and
+/// dtype -- `where(True, 1.0, nan)` is `1.0`, measured -- and `where_cond`
+/// selects rather than blends, so that holds here too.
+fn where_self(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.where.self";
+    let condition = tensor_arg(OP, args, kwargs, 0, "condition")?;
+    let lhs = tensor_arg(OP, args, kwargs, 1, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 2, "other")?;
+
+    if condition.tag() != TorchDType::Bool && condition.tag() != TorchDType::UInt8 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "where expected condition to be a boolean tensor, but got a tensor with dtype {}",
+            scalar_type_name(condition.tag())
+        )));
+    }
+    let tag = same_dtype(OP, &lhs, &rhs)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+
+    // torch broadcasts all three together, and the result shape is the join of
+    // the three -- not the condition's. `where(tensor(True), ones(2,3),
+    // zeros(3))` is `(2, 3)`, measured, where a condition-shaped answer would
+    // be `()`.
+    let shape = condition
+        .tensor()
+        .shape()
+        .broadcast_shape_binary_op(lhs.tensor().shape(), "where")
+        .and_then(|s| s.broadcast_shape_binary_op(rhs.tensor().shape(), "where"))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let spread = |t: &Tensor| -> PyResult<Tensor> {
+        t.broadcast_as(shape.clone())
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))
+    };
+    // A `uint8` condition is truthiness, not a bit pattern: `where_cond` reads
+    // "not zero", which is the same rule, but the tag is normalised to 0/1
+    // first so the two dtypes take identical paths.
+    let mask = spread(condition.tensor())?;
+    let mask = if condition.tag() == TorchDType::Bool {
+        mask
+    } else {
+        mask.ne(0u8).map_err(|e| candle_err(OP, e))?
+    };
+    let on_true = spread(&lhs.tensor().to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
+    let on_false = spread(&rhs.tensor().to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
+
+    let out = mask
+        .where_cond(&on_true, &on_false)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
 /// A shape argument with torch's placeholders resolved: `-1` in `reshape`
 /// means "whatever is left", `-1` in `expand` means "keep this dimension".
 fn resolve_shape(op: &str, requested: &[isize], numel: usize) -> PyResult<Vec<usize>> {
@@ -2919,6 +3242,79 @@ fn transpose_int(
     finish(py, out, input.tag())
 }
 
+/// `aten::permute(Tensor(a) self, int[] dims) -> Tensor(a)`
+///
+/// The most-called op of the four this round opens: `falcon` sends every weight
+/// through `permute([1, 0])` and all four send attention through
+/// `permute([0, 2, 1, 3])` (measured, docs/OPS4.md §1).
+///
+/// **Upstream this is an alias, and this shim's is not.** Measured on torch
+/// 2.13.0: `permute(x, [1, 0])` shares `x.data_ptr()`, comes back
+/// non-contiguous with the strides swapped, and writing through it changes `x`.
+/// candle's `permute` also shares storage (it clones the `Arc` and permutes the
+/// layout), but that is not what makes an alias observable here -- the in-place
+/// ops in this file never write into storage, they hand `replace_with` a new
+/// tensor (see the "In-place ops" note). So a write through a permuted result
+/// does not reach the base, and cannot, until that changes. **This is the same
+/// unanswered question `slice.Tensor` and `split.Tensor` already carry**
+/// (docs/GPT2.md §7); it is not answered here, it is measured and written down.
+/// docs/OPS4.md §5 has the probe.
+///
+/// The refusals were read off torch rather than invented, and the first one
+/// would not have been guessed -- it names a layout nobody asked for:
+///
+/// ```text
+/// len(dims) != rank  ->  "permute(sparse_coo): number of dimensions in the
+///                         tensor input does not match the length of the
+///                         desired ordering of dimensions i.e. input.dim() = 2
+///                         is not equal to len(dims) = 3"
+/// duplicate entry    ->  "permute(): duplicate dims are not allowed."
+/// out of range       ->  IndexError, torch's usual wording
+/// ```
+///
+/// Negative entries are allowed and normalised (`permute(x, [-1, -2])` equals
+/// `permute(x, [1, 0])` on a 2-D input, measured), and a 0-D tensor takes
+/// `dims=[]` and comes back unchanged -- so the rank check has to be exact
+/// rather than `rank.max(1)`, which is why `normalise_dim` is not used for the
+/// length test.
+fn permute_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.permute.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let requested = shape_arg(OP, args, kwargs, 1, "dims")?;
+    let rank = input.tensor().rank();
+    if requested.len() != rank {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "permute(sparse_coo): number of dimensions in the tensor input does not \
+             match the length of the desired ordering of dimensions i.e. input.dim() \
+             = {rank} is not equal to len(dims) = {}",
+            requested.len()
+        )));
+    }
+    if rank == 0 {
+        return finish(py, input.tensor().clone(), input.tag());
+    }
+
+    let mut order = Vec::with_capacity(rank);
+    for &value in &requested {
+        let dim = normalise_dim(OP, value, rank)?;
+        if order.contains(&dim) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "permute(): duplicate dims are not allowed.",
+            ));
+        }
+        order.push(dim);
+    }
+    let out = input
+        .tensor()
+        .permute(order)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
 /// `aten::t(Tensor(a) self) -> Tensor(a)`
 ///
 /// `nn.Linear` reaches this on every projection (`x @ w.t()`), which is why a
@@ -3006,6 +3402,43 @@ fn reject_memory_format(
                     "{op}: memory_format=torch.{name} is not implemented in torch._C shim"
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// `layout=`, for the factories that are actually *called* with one.
+///
+/// `reject_unsupported` refuses any non-`None` layout, which is the right
+/// default -- a dropped `layout=torch.sparse_coo` is a wrong answer with no
+/// trace. But `torch.strided` names the dense layout this shim already has, and
+/// the measured `scalar_tensor` call sites in `bloom`, `mpt` and `gptj` pass it
+/// explicitly. Refusing there would block those architectures on an argument
+/// that asks for exactly what is being handed back. Everything else still
+/// refuses, with the layout named.
+///
+/// Deliberately *not* applied to `full`/`ones`/`empty`: those already refuse
+/// every layout and no measured call site passes one, so widening them here
+/// would change behaviour nothing has asked to change.
+fn reject_layout(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+) -> PyResult<()> {
+    if let Some(value) = optional(args, kwargs, index, "layout")? {
+        // `memory_format_name` reads `_shim_name`, which `bootstrap.py` puts on
+        // every one of these label objects -- layouts, memory formats and
+        // qschemes alike -- so it reads a layout as well as it reads a format.
+        // Both spellings are accepted because both arrive: the shim's own label
+        // answers `strided` from `_shim_name`, and a *real* `torch.strided`
+        // (which the golden harness hands to both sides) has no `_shim_name` and
+        // falls back to its `str()`, `torch.strided`.
+        let name = memory_format_name(&value);
+        if !value.is_none() && name != "strided" && name != "torch.strided" {
+            return Err(not_implemented(format!(
+                "{op}: argument 'layout' not implemented in torch._C shim (got {value})"
+            )));
         }
     }
     Ok(())
