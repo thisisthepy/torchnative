@@ -461,7 +461,7 @@ import torch        1.15 s           (이전 1.15 s — 변화 없음)
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
-cd /Volumes/macMini/thisisthepy/BrainWave
+cd /Volumes/macMini/thisisthepy/torchnative
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 ./vendor/install_shim.sh                       # 빌드 + 구멍에 넣기

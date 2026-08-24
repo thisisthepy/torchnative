@@ -8,7 +8,7 @@ torch 위에서** 이뤄지므로, 지금 이 디렉터리가 `torch` 를 가리
 
 ## 미해결 — add-hook 을 어떻게 합치나
 
-`nn/federated.py` 는 `torchbrain.nn.federated` 를 `torch` 네임스페이스에 얹는 add-hook 입니다.
+`nn/federated.py` 는 `torchnative.nn.federated` 를 `torch` 네임스페이스에 얹는 add-hook 입니다.
 상류 torch 를 소유하기 전까지 이것을 실제 `torch.nn` 아래로 합치는 방법이 정해지지 않았습니다.
-§2 의 규칙은 **add-hook 은 편의이지 의존이 아니어야 한다** 는 것이므로, 이것 없이도 `torchbrain`
+§2 의 규칙은 **add-hook 은 편의이지 의존이 아니어야 한다** 는 것이므로, 이것 없이도 `torchnative`
 이 온전히 동작해야 합니다.

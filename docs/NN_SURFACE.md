@@ -186,7 +186,7 @@ Llama 는 `repeat_kv` 를 스스로 하고 `False` 로 넘기므로 경로에 �
 
 ```
 상류  /Volumes/macMini/caches/spike-venv/.../torch/__init__.py
-셰임  /Volumes/macMini/thisisthepy/BrainWave/vendor/torch/__init__.py
+셰임  /Volumes/macMini/thisisthepy/torchnative/vendor/torch/__init__.py
 ```
 
 | 케이스 | n | 최대 상대오차 |

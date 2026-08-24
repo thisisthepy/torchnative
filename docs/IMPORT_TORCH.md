@@ -532,7 +532,7 @@ import torch          1.15 s
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
-cd /Volumes/macMini/thisisthepy/BrainWave
+cd /Volumes/macMini/thisisthepy/torchnative
 
 ./vendor/vendor_torch.sh          # 없으면
 ./vendor/gen_surface.py           # .pyi -> rust/torch_c/src/surface.json

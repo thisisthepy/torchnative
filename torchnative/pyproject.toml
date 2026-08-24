@@ -1,5 +1,5 @@
 [project]
-name = "torchbrain"
+name = "torchnative"
 version = "0.0.0"
 description = "On-device test-time learning and federated learning"
 requires-python = ">=3.13"
@@ -13,4 +13,4 @@ federated = []
 [tool.ppp]
 # Platform source sets follow the pypackpack layout: src/main is scanned for
 # top-level Python packages, which is what lets one package provide both
-# `torch` and `torchbrain`. See docs/DESIGN.md §10.
+# `torch` and `torchnative`. See docs/DESIGN.md §10.

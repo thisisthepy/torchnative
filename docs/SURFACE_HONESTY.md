@@ -325,7 +325,7 @@ STOP at [import torch]: ModuleNotFoundError: No module named 'torch.testing._int
 하나이므로 그것은 축소판이 아니라 정상 구성입니다. `Store` 가 실제로 바인딩되면서
 `functions.py:102` 의 벽은 **부수 효과로** 열립니다.
 
-그리고 이것은 우회가 아니라 **범위 안의 작업**입니다. BrainWave 의 목표에 FL 이 처음부터
+그리고 이것은 우회가 아니라 **범위 안의 작업**입니다. torchnative 의 목표에 FL 이 처음부터
 들어 있고, 연합 학습은 집합 통신 위에 세워집니다 — `all_reduce` · `broadcast` · `gather` 가
 곧 FedAvg 입니다. 지금까지 "온디바이스에서 쓸 일 없다" 며 꺼둔 서브시스템이 사실 **FL 축의
 기반**이었습니다.
@@ -342,8 +342,8 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 세 가지 주의:
 
 1. **FL 층의 이름공간은 이미 정해져 있습니다 — 이 항목은 저장소를 안 보고 쓴 것이라 정정합니다.**
-   구현은 `torchbrain.nn.federated` 에 있고, `torch/nn/federated.py` 는 그것을 `torch`
-   이름공간에 얹는 **한 줄 add-hook** (`from torchbrain.nn.federated import *`) 입니다.
+   구현은 `torchnative.nn.federated` 에 있고, `torch/nn/federated.py` 는 그것을 `torch`
+   이름공간에 얹는 **한 줄 add-hook** (`from torchnative.nn.federated import *`) 입니다.
    `torch.federated` 를 새로 만드는 것이 아니라 `torch.nn` 아래이고, 구현이 아니라 재수출입니다.
 
    **이것은 위의 "패치를 두지 않는다" 결정과 충돌하지 않습니다.** 패치는 상류에 이미 있는 파일을
@@ -353,7 +353,7 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 
    `DESIGN.md` §2 가 이미 두 가지를 못 박아뒀습니다 — **주입 지점을 하나로 모을 것**, 그리고
    **add-hook 은 편의이지 의존이 아닐 것**(데스크톱에서 상류 torch 위에서도 동작해야 하므로).
-   `torchbrain/src/main/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
+   `torchnative/src/main/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
    그것은 여전히 열린 항목입니다.
 2. **`ProcessGroup` 의 가정은 cross-device FL 과 안 맞습니다.** 그것은 고정 세계 크기 ·
    전원 참석 · 동기 · 신뢰를 전제하는데, FL 은 부분 참여 · 이탈 · 비동기가 정상입니다.

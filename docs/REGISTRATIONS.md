@@ -302,7 +302,7 @@ shim 에만 있고 진짜 torch 에는 없는 것:   210개  (전부 실재하�
 ## 6. 재현
 
 ```bash
-cd /Volumes/macMini/thisisthepy/BrainWave
+cd /Volumes/macMini/thisisthepy/torchnative
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 # 1549건 자체 (shim)

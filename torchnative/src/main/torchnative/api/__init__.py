@@ -1,7 +1,7 @@
 from torch import nn
 
 
-class BrainWaveAPI(object):
+class torchnativeAPI(object):
     def __init__(self, *args, **kwargs):
         pass
 
