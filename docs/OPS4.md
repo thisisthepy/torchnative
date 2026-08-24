@@ -148,6 +148,11 @@ mixtral   ops=65    12     9    남음: _grouped_mm, clamp_, div_, empty_like, f
 미구현 0 인 아키텍처: before=5  after=14  (실측 20 개 중)
 ```
 
+> **정정 (§13):** 위 표의 `mamba`/`mixtral` 줄은 이 시점의 실측이고, 이후 낡았습니다.
+> `split_with_sizes.default` 는 다음 회차에서 이미 구현됐고, §13 이 마저 다 구현해
+> 둘 다 미구현 0 으로 만들었습니다(`mixtral` 은 `_grouped_mm.default` 하나만 범위 밖으로
+> 남겼습니다). 권위 있는 값은 이 표가 아니라 `_aten_implemented()` 실측입니다.
+
 ### 3.1 전제가 틀렸다 — 그리고 어디서 틀렸는지 확인했다
 
 작업 지시는 "넷을 넣으면 아키텍처 4 개가 한꺼번에 열린다" 였습니다. **열린 것은 `mpt` 하나입니다.**
@@ -516,6 +521,99 @@ $PY tools/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"   # 1 
 $PY rust/torch_c/pytests/verify_schemas.py > /tmp/sch.log 2>&1; echo "EXIT=$?"  # 0
 PYTHON=$PY sh rust/torch_c/pytests/run.sh  > /tmp/run.log 2>&1; echo "EXIT=$?" # 1 (§9.2)
 ```
+
+---
+
+## 13. `mamba` 와 `mixtral` — 실측 20 개 중 마지막 둘
+
+§3 의 표가 남긴 두 아키텍처를 마저 열었습니다. 시작 전에 §3 의 목록부터 다시 쟀는데,
+**낡아 있었습니다**: `split_with_sizes.default` 는 다른 작업에서 이미 구현되어
+`_aten_implemented()` 에 들어 있었고, 문서만 그 사실을 반영하지 못한 채 남아 있었습니다.
+`aten.rs` 를 grep 해서 "미구현 분기 이름" 까지 걸리는 상위집합을 만드는 대신,
+`_C._aten_implemented()` 를 빌드된 산출물에서 직접 읽어 진짜 남은 것을 확정했습니다.
+
+```
+재확인 (구현 전):
+mamba     남음: convolution.default, exp.default, softplus.default, zeros_like.default   (5 -> 4, split_with_sizes 는 이미 구현됨)
+mixtral   남음: _grouped_mm.default, clamp_.default, div_.Tensor, empty_like.default,
+                floor_divide.default, ge.Scalar, histc.default, index_put_.default,
+                masked_fill_.Scalar   (9, 낡지 않음)
+```
+
+### 13.1 실제 호출을 먼저 트레이스했다
+
+§1 이 falcon/gptj/bloom/mpt 에 했던 것과 같은 방법 -- `TorchDispatchMode` 로 실제
+`transformers` 5.15.1 모델(2 층 · hidden 64 · heads 2)을 한 번 돌려, dtype·shape·인자까지
+기록한 뒤 구현했습니다. 커널 doc comment 를 베끼지 않고 상류 torch 2.13.0 으로 재확인하라는
+지시를 따른 결과, 세 가지가 트레이스에서만 보였습니다:
+
+- **`floor_divide.default` 의 `other` 가 텐서가 아니라 맨 파이썬 `int` 로 옵니다.**
+  `perm // num_top_k` (mixtral 의 그룹드 MoE 라우팅, `transformers` 의
+  `integrations/moe.py::grouped_mm_experts_forward`) 가 스키마상 `(Tensor, Tensor)` 인
+  `.default` 오버로드를 그대로 호출하면서 스칼라 변환을 커널에 남겨 둡니다.
+  `floor_divide.Scalar` 오버로드가 아니라 `.default` 가 선택된다는 것 자체가 스키마만 읽어서는
+  못 봤을 사실입니다.
+- **`aten.convolution.default` 는 depthwise causal 1-D conv 하나뿐입니다.**
+  `groups == in_channels == out_channels == 128`, `padding == kernel_size - 1 == 3`
+  (양쪽 다), `transposed=False`. `candle_core::Tensor::conv1d` 가 `groups` 를 그대로
+  받아서, 재구현 없이 바로 맞았습니다.
+- **`index_put_.default` 는 `inv_perm[perm] = torch.arange(...)` 하나뿐입니다.** 인덱스
+  텐서 하나, `accumulate=False`, 전부 1-D -- 이미 있는 `scatter.src` 가 정확히 같은 산수이므로
+  (`self[index[i]] = src[i]`, dim=0), 새로 쓰는 대신 그 호출을 조립해 재사용했습니다.
+
+### 13.2 재확인해서 문서 초안과 달라진 지점 셋
+
+1. **`clamp_(None, None)` 은 no-op 이 아니라 거부입니다.** "바꿀 게 없으니 자기 자신을
+   반환"이 그럴듯한 추측이지만 틀렸습니다 -- 실측: `tensor.clamp_(None, None)` 은
+   `"torch.clamp: At least one of 'min' or 'max' must not be None"` 을 던집니다. 골든
+   하니스가 정확히 이 케이스에서 `SILENT DIVERGENCE` 로 잡아냈습니다(구현을 no-op 으로 먼저
+   썼다가, 케이스를 쓰면서 재확인하지 않았다면 조용히 남았을 차이).
+2. **`histc` 의 `min == max` 규칙은 "둘 다 0" 이 아니라 "값이 같으면"입니다.** `min=5,
+   max=5` (0 이 아닌 값)도 데이터의 실제 min/max 로 대체됩니다, 실측. 그리고 데이터 자체가
+   상수라 그 자동 범위마저 퇴화하면 (`min==max` 가 다시 성립하면) `[value-1, value+1]` 로
+   한 번 더 대체됩니다 -- 같은 폴백을 두 번 적용한 것으로 재현했습니다.
+3. **`clamp_` 는 `min > max` 를 거부하지 않습니다.** `min(max(x, min_val), max_val)` 공식을
+   조건 없이 적용해서 `min=8, max=2` 가 상수 `2` 로 무너집니다(실측). `candle_core::Tensor::
+   clamp` 가 이미 정확히 이 공식(`maximum(min).minimum(max)`)이라, 손으로 다시 구현하지
+   않고 그대로 재사용했습니다.
+
+### 13.3 거절한 것
+
+**`_grouped_mm.default` 는 구현하지 않았습니다.** MoE 전용 그룹드 행렬곱으로, 다른 여덟
+개와 성격이 다릅니다 -- 오프셋 기반 배치 GEMM 을 요구하고, 이 셰임에 배치 GEMM 커널이 아직
+없습니다(`bmm`/`baddbmm` 은 있지만 오프셋 나눗셈은 다른 문제입니다). 지시대로 범위 밖으로
+남겼습니다: mixtral 은 `_grouped_mm.default` 하나만 미구현으로 남고, 그 사실이
+`_aten_implemented()` 로 바로 드러납니다 -- 숨겨지지 않았습니다.
+
+### 13.4 결과
+
+```
+                 before  after
+mamba     ops=53     5     0    ← 미구현 0 (split_with_sizes 는 이미 구현되어 있었음)
+mixtral   ops=65     9     1    남음: _grouped_mm.default (범위 밖, §13.3)
+
+미구현 0 인 아키텍처: 14 -> 15  (mamba, 실측 20 개 중)
+```
+
+| | 이전 | 이후 |
+|---|---|---|
+| 골든 케이스 | 2268 | **2383** (실패 0, pending 0, exit 0) |
+| `_aten_implemented()` | 97 | **109** |
+| `_aten_all_implemented()` | 108 | **120** |
+| 스키마 | 233/233 | 233/233 (변화 없음) |
+| `run.sh` | 113 ok | 113 ok |
+
+**기능 추가:** `exp.default`, `softplus.default`, `convolution.default`, `zeros_like.default`,
+`empty_like.default`, `ge.Scalar`, `floor_divide.default`, `histc.default`, `clamp_.default`,
+`div_.Tensor`, `masked_fill_.Scalar`, `index_put_.default` -- op 12 개, 골든 케이스 115 개.
+**결함 수정:** 없음(이번 작업의 구현 자체에서 났던 `clamp_(None,None)` 오분류는 착지 전에
+잡아 고쳤으므로 회귀가 아닙니다). **문서 정정:** §3 의 `mamba`/`mixtral` 낡은 목록에 정정
+각주 추가(위). **삭제:** 없음.
+
+**못 한 것:** `_grouped_mm.default` (§13.3, 이유 기록하고 범위 밖으로 남김). `mixtral` 의
+그룹드 MoE 를 aten 레벨로 조립해 상류와 대조하는 §4 급 판정(HF 모듈 vs aten 전사 vs 셰임)은
+이번 작업에 포함되지 않았습니다 -- 골든 케이스가 op 단위 값 일치를 이미 확인하지만, `mpt`
+처럼 끝까지 조립해 로짓을 비교하는 것은 별도 작업입니다.
 
 `compare.py`/`verify_schemas.py` 는 `PYTHONPATH=$PWD/vendor` **없이** 돌립니다.
 파이프로 종료 코드를 읽지 마십시오 — 파일로 리다이렉트한 뒤 `$?` 를 읽습니다.

@@ -6723,6 +6723,704 @@ def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- mamba / mixtral -- the last two of the 20 measured architectures ------
+# (docs/OPS4.md) with anything unimplemented. Every rule pinned below was
+# re-measured against torch 2.13.0 with a real `TorchDispatchMode` over
+# `transformers` 5.15.1 rather than copied from a kernel's doc comment --
+# docs/OPS4.md's own note is that doc comments have been wrong about
+# upstream three times before.
+
+
+def exp_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.exp.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([0.0, 1.0, -1.0, 2.0, -2.0], (5,), "assorted"),
+        ([0.0], (), "0-d"),
+        ([float("nan"), float("inf"), float("-inf")], (3,), "NaN/+-inf -- nan, inf, 0.0"),
+        # Overflows to +inf and underflows to 0.0 in every floating dtype
+        # tested here -- not the mamba-relevant range (mamba's A_log stays
+        # small), but exercising the boundary rather than assuming a naive
+        # `exp` implementation gets it right.
+        ([-1000.0, 1000.0], (2,), "far outside range -- underflow to 0.0, overflow to inf"),
+    ]
+    for dtype_name in _TANH_DTYPES:
+        for flat, shape, note in scenarios:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    # The promotion rule, which is `cos`/`sin`/`tanh`'s and not `silu`'s: an
+    # integral input gives float32 rather than raising. `mamba`'s `A =
+    # -exp(A_log)` always calls with `A_log` already `float32`, but the rule
+    # is re-measured here rather than assumed from the other unary ops.
+    for dtype_name in _TANH_PROMOTING_DTYPES:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [0, 1, 2, 3], (2, 2),
+                "integral input promotes to the default float, same rule as tanh/cos/sin",
+            )
+        )
+    return cases
+
+
+def softplus_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.softplus.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([-5.0, -1.0, 0.0, 1.0, 5.0], (5,), "assorted, well inside the default threshold"),
+        ([-1000.0, 1000.0], (2,), "far outside the default threshold -- 0.0 and exactly x"),
+        ([0.0], (), "0-d"),
+    ]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for flat, shape, note in scenarios:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+
+    # beta/threshold overrides -- mamba always calls with the defaults, but
+    # the schema accepts both and the kernel's numerically-stable formula
+    # has to answer them correctly too, not just the default pair.
+    for beta, threshold, note in [
+        (2.0, 20.0, "beta scales the input before the formula"),
+        (1.0, 5.0, "a lower threshold moves the linear cutoff earlier"),
+    ]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, "float32",
+                [-5.0, -1.0, 0.0, 1.0, 5.0, 10.0], (6,), note,
+                kwargs={"beta": beta, "threshold": threshold},
+            )
+        )
+
+    # Refused, not promoted -- unlike exp/tanh, measured `softplus_cpu`
+    # raises `NotImplementedError` naming the dtype rather than widening an
+    # integral input to the default float.
+    int_t, int_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(
+        Case(
+            name="softplus(dtype=int64) [refused, NOT promoted -- unlike exp/tanh]",
+            op=op,
+            run_torch=lambda: torch_call(int_t),
+            run_c=lambda: c_module._aten_dispatch(op, int_c),
+            expect="both_error",
+            note="torch: NotImplementedError('\"softplus_cpu\" not implemented for \\'Long\\'')",
+        )
+    )
+    return cases
+
+
+def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.convolution.default"
+    cases: list[Case] = []
+
+    def make(dtype_name, in_flat, in_shape, w_flat, w_shape, bias_flat, stride, padding, dilation, groups, note):
+        x_t, x_c = pair_from_flat(torch_module, c_module, in_flat, in_shape, dtype_name)
+        w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+        if bias_flat is None:
+            b_t, b_c = None, None
+        else:
+            b_t, b_c = pair_from_flat(torch_module, c_module, bias_flat, (w_shape[0],), dtype_name)
+        return Case(
+            name=f"convolution(dtype={dtype_name}, in={in_shape}, w={w_shape}, groups={groups}) [{note}]",
+            op=op,
+            run_torch=lambda: torch_call(
+                x_t, w_t, b_t, list(stride), list(padding), list(dilation), False, [0], groups
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x_c, w_c, b_c, list(stride), list(padding), list(dilation), False, [0], groups
+            ),
+            note=note,
+        )
+
+    for dtype_name in ["float64", "float32"]:
+        # mamba's exact shape: depthwise causal 1-D conv -- groups ==
+        # in_channels == out_channels, padding == kernel_size - 1 (both
+        # sides; the model slices `[..., :seq_len]` afterwards to keep it
+        # causal, which is the caller's job, not this kernel's).
+        cases.append(
+            make(
+                dtype_name,
+                [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, 0.5, 2.0, -2.0, 1.0, 0.0, 1.0, -1.0, 2.0, 3.0],
+                (1, 3, 5),
+                [1.0, -1.0, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5, -1.0, 1.0, 0.0, 2.0],
+                (3, 1, 4),
+                [0.1, -0.2, 0.3],
+                (1,), (3,), (1,), 3,
+                "depthwise causal 1-D conv, mamba's exact shape (padding=kernel-1, groups=channels)",
+            )
+        )
+        # groups=1 (ordinary, non-depthwise conv), no bias -- broader
+        # coverage of `conv1d`'s groups argument than mamba alone exercises.
+        cases.append(
+            make(
+                dtype_name,
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                (1, 2, 3),
+                [1.0, 0.0, -1.0, 1.0, 0.5, -0.5, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0],
+                (2, 2, 3),
+                None,
+                (1,), (1,), (1,), 1,
+                "groups=1, no bias",
+            )
+        )
+
+    x_t, x_c = pair_from_flat(torch_module, c_module, list(range(1, 16)), (1, 3, 5), "float32")
+    w_t, w_c = pair_from_flat(torch_module, c_module, list(range(1, 13)), (3, 1, 4), "float32")
+
+    # transposed=True: torch computes it (the weight-shape convention it
+    # uses is compatible here too, measured), the shim refuses by name --
+    # not measured/needed by mamba or mixtral, so a documented gap rather
+    # than a guess.
+    cases.append(
+        Case(
+            name="convolution(transposed=True) [c_error -- torch computes, shim refuses]",
+            op=op,
+            run_torch=lambda: torch_call(x_t, w_t, None, [1], [3], [1], True, [0], 3),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, w_c, None, [1], [3], [1], True, [0], 3),
+            expect="c_error",
+            note="transposed convolution is not implemented in torch._C shim",
+        )
+    )
+    # A non-zero output_padding: also computes on real torch (measured),
+    # also refused here for the same reason.
+    cases.append(
+        Case(
+            name="convolution(output_padding=[1]) [c_error -- torch computes, shim refuses]",
+            op=op,
+            run_torch=lambda: torch_call(x_t, w_t, None, [1], [3], [1], False, [1], 3),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, w_c, None, [1], [3], [1], False, [1], 3),
+            expect="c_error",
+            note="a non-zero output_padding is not implemented in torch._C shim",
+        )
+    )
+    # A 2-D input: both sides refuse (measured on real torch: "Expected
+    # 3-dimensional input for 3-dimensional weight").
+    x2d_t, x2d_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="convolution(2-D input) [both_error -- neither side does 2-D here]",
+            op=op,
+            run_torch=lambda: torch_call(x2d_t, w_t, None, [1], [3], [1], False, [0], 3),
+            run_c=lambda: c_module._aten_dispatch(op, x2d_c, w_c, None, [1], [3], [1], False, [0], 3),
+            expect="both_error",
+            note="torch: 'Expected 3-dimensional input for 3-dimensional weight [3, 1, 4], "
+                 "but got 2-dimensional input of size [2, 3] instead'",
+        )
+    )
+    return cases
+
+
+def zeros_like_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.zeros_like.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"zeros_like(dtype={dtype_name}, shape=(2,3)) [dtype/shape inherited from self]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="mamba seeds the SSM's running state this way",
+            )
+        )
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"zeros_like(self_dtype=float32, dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
+                note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    return cases
+
+
+def empty_like_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.empty_like.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"empty_like(dtype={dtype_name}, shape=(2,3))",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                value_check=_dtype_shape_only_check,
+                note="uninitialized memory -- only dtype/shape are meaningful (mixtral's routing "
+                     "immediately overwrites every element via index_put_ before reading it)",
+            )
+        )
+    return cases
+
+
+def ge_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.ge.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3,
+                "x >= 3 -- mixtral's sentinel_mask = expert_ids_g >= num_experts",
+            )
+        )
+    cases.append(
+        Case(
+            name="ge(float32, nan >= 1.0) [every comparison against NaN is false]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[0], 1.0
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[1], 1.0
+            ),
+            note="NaN is not >= anything, including itself",
+        )
+    )
+    return cases
+
+
+def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.floor_divide.default"
+    cases: list[Case] = []
+
+    # Tensor,Tensor -- mixed sign, re-measured against real torch: floors
+    # toward -inf like Python's `//`, not toward zero like C's truncation.
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [-7, -6, -1, 0, 1, 6, 7], (7,), dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [2, 2, 2, 2, 2, 2, 2], (7,), dtype_name)
+        cases.append(
+            Case(
+                name=f"floor_divide(dtype={dtype_name}, tensor/tensor, mixed-sign self / positive divisor)",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="[-7,-6,-1,0,1,6,7] // 2 == [-4,-3,-1,0,0,3,3], measured -- floors toward "
+                     "-inf, does not truncate toward zero",
+            )
+        )
+        c_t, c_c = pair_from_flat(torch_module, c_module, [-7, -6, -1, 0, 1, 6, 7], (7,), dtype_name)
+        d_t, d_c = pair_from_flat(torch_module, c_module, [-2, -2, -2, -2, -2, -2, -2], (7,), dtype_name)
+        cases.append(
+            Case(
+                name=f"floor_divide(dtype={dtype_name}, tensor/tensor, mixed-sign self / negative divisor)",
+                op=op,
+                run_torch=lambda c_t=c_t, d_t=d_t: torch_call(c_t, d_t),
+                run_c=lambda c_c=c_c, d_c=d_c: c_module._aten_dispatch(op, c_c, d_c),
+                note="[-7,-6,-1,0,1,6,7] // -2 == [3,3,0,0,-1,-3,-4], measured",
+            )
+        )
+
+    # Tensor,Scalar -- mixtral's exact call shape (`perm // num_top_k`, a
+    # bare Python int reaching the (Tensor, Tensor) overload's `other` slot
+    # -- see the kernel's own doc comment).
+    e_t, e_c = pair_from_flat(torch_module, c_module, [-7, -6, -1, 0, 1, 6, 7], (7,), "int64")
+    cases.append(
+        Case(
+            name="floor_divide(dtype=int64, tensor // python-int scalar)",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 2),
+            note="mixtral's exact call shape: perm // num_top_k",
+        )
+    )
+
+    # Floating dtype: division by zero is not an error (IEEE inf/-inf/nan).
+    f_t, f_c = pair_from_flat(torch_module, c_module, [1.0, -1.0, 0.0], (3,), "float32")
+    g_t, g_c = pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="floor_divide(dtype=float32, division by zero -- inf/-inf/nan, not an error)",
+            op=op,
+            run_torch=lambda: torch_call(f_t, g_t),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, g_c),
+            note="measured: [1.,-1.,0.] // [0.,0.,0.] == [inf,-inf,nan]",
+        )
+    )
+
+    # Integral dtype: division by zero raises, matching upstream's exact
+    # message (measured: RuntimeError('ZeroDivisionError')).
+    h_t, h_c = pair_from_flat(torch_module, c_module, [1, 0, -1], (3,), "int64")
+    i_t, i_c = pair_from_flat(torch_module, c_module, [2, 0, -2], (3,), "int64")
+    cases.append(
+        Case(
+            name="floor_divide(dtype=int64, division by zero) [raises]",
+            op=op,
+            run_torch=lambda: torch_call(h_t, i_t),
+            run_c=lambda: c_module._aten_dispatch(op, h_c, i_c),
+            expect="both_error",
+            note="torch: RuntimeError('ZeroDivisionError'), same wording reproduced here",
+        )
+    )
+    return cases
+
+
+def histc_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.histc.default"
+    cases: list[Case] = []
+
+    # mixtral's exact call shape: float32 input, bins=num_experts, min=0,
+    # max=num_experts-1.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, 3.0, 3.0, -1.0, 4.0], (7,), "float32")
+    cases.append(
+        Case(
+            name="histc(dtype=float32, bins=4, min=0, max=3) [out-of-range values dropped]",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 4, 0, 3),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 4, 0, 3),
+            note="-1.0 and 4.0 fall outside [0,3] and are not counted, measured",
+        )
+    )
+
+    for dtype_name in ["float64", "float32", "float16"]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"histc(dtype={dtype_name}, bins=4, min=0, max=3)",
+                op=op,
+                run_torch=lambda b_t=b_t: torch_call(b_t, 4, 0, 3),
+                run_c=lambda b_c=b_c: c_module._aten_dispatch(op, b_c, 4, 0, 3),
+                note="output dtype follows the input's, not a fixed default",
+            )
+        )
+
+    # min == max: falls back to the data's own [min, max] -- re-measured on
+    # real torch with a *non-zero* equal bound too, not only min=max=0.
+    c_t, c_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="histc(min==max==5, non-zero) [falls back to the data's own min/max]",
+            op=op,
+            run_torch=lambda: torch_call(c_t, 4, 5, 5),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, 4, 5, 5),
+            note="measured: ignores the literal value 5 entirely, uses the data's range [1,3]",
+        )
+    )
+
+    # Degenerate: the data itself is constant, so even the auto-detected
+    # range collapses -- falls back a second time to [value-1, value+1].
+    d_t, d_c = pair_from_flat(torch_module, c_module, [2.0, 2.0, 2.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="histc(constant data, min=max=0) [degenerate range -> [value-1, value+1]]",
+            op=op,
+            run_torch=lambda: torch_call(d_t, 4, 0, 0),
+            run_c=lambda: c_module._aten_dispatch(op, d_c, 4, 0, 0),
+            note="measured: [2,2,2] bins=4 -> [0,0,3,0], i.e. range [1,3], not [2,2]",
+        )
+    )
+
+    # Refusals, both with upstream's exact wording (measured).
+    e_t, e_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="histc(bins=0) [refused]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 0, 0, 3),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 0, 0, 3),
+            expect="both_error",
+            note="torch: 'bins must be > 0, but got 0 for dimension 0'",
+        )
+    )
+    f_t, f_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="histc(min > max, explicit) [refused]",
+            op=op,
+            run_torch=lambda: torch_call(f_t, 4, 3, 1),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, 4, 3, 1),
+            expect="both_error",
+            note="torch: 'torch.histc: max must be larger than min'",
+        )
+    )
+
+    # Refused dtype: no CPU kernel for integral input, matching upstream's
+    # exact wording.
+    g_t, g_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(
+        Case(
+            name="histc(dtype=int64) [refused -- histc has no CPU kernel for integral dtypes]",
+            op=op,
+            run_torch=lambda: torch_call(g_t, 4, 0, 3),
+            run_c=lambda: c_module._aten_dispatch(op, g_c, 4, 0, 3),
+            expect="both_error",
+            note="torch: NotImplementedError('\"histogram_cpu\" not implemented for \\'Long\\'')",
+        )
+    )
+    return cases
+
+
+def clamp__default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.clamp_.default"
+    cases: list[Case] = []
+
+    # mixtral's exact call shape: max only, min absent (None).
+    for dtype_name in ["int64", "int32", "float32", "float64"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"clamp_(dtype={dtype_name}, min=None, max=3) [mixtral's exact call shape]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, None, 3),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, None, 3),
+                note="in-place: compares the mutated receiver clamp_ returns",
+            )
+        )
+
+    for dtype_name in ["int64", "float32"]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"clamp_(dtype={dtype_name}, min=2, max=8)",
+                op=op,
+                run_torch=lambda b_t=b_t: torch_call(b_t, 2, 8),
+                run_c=lambda b_c=b_c: c_module._aten_dispatch(op, b_c, 2, 8),
+                note="both bounds present",
+            )
+        )
+
+    # min > max: NOT refused -- collapses to a constant (measured formula
+    # min(max(x,min_val),max_val), applied unconditionally regardless of
+    # whether min_val <= max_val).
+    c_t, c_c = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), "int64")
+    cases.append(
+        Case(
+            name="clamp_(min=8, max=2) [min > max collapses to a constant, NOT refused]",
+            op=op,
+            run_torch=lambda: torch_call(c_t, 8, 2),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, 8, 2),
+            note="measured: [1,5,10,-3].clamp_(min=8,max=2) == [2,2,2,2]",
+        )
+    )
+
+    # NaN propagates through both the floor and the ceiling.
+    d_t, d_c = pair_from_flat(torch_module, c_module, [float("nan"), 1.0, -1.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="clamp_(dtype=float32, [nan,1.,-1.], min=0, max=2) [NaN propagates]",
+            op=op,
+            run_torch=lambda: torch_call(d_t, 0.0, 2.0),
+            run_c=lambda: c_module._aten_dispatch(op, d_c, 0.0, 2.0),
+            note="measured: [nan,1.,-1.].clamp_(0,2) == [nan,1.,0.]",
+        )
+    )
+
+    # Both bounds absent: refused -- NOT a no-op. Measured on real torch
+    # (naively guessable as "nothing to do, return self unchanged", and
+    # wrong): `tensor.clamp_(None, None)` raises "At least one of 'min' or
+    # 'max' must not be None".
+    e_t, e_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="clamp_(min=None, max=None) [refused, NOT a no-op]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, None, None),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, None, None),
+            expect="both_error",
+            note="torch: \"torch.clamp: At least one of 'min' or 'max' must not be None\"",
+        )
+    )
+
+    # Refused: a float bound against an integral receiver, regardless of
+    # whether the bound's value is exactly representable.
+    f_t, f_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int32")
+    cases.append(
+        Case(
+            name="clamp_(dtype=int32, max=2.0 [a FLOAT]) [refused, even though 2.0 is exact]",
+            op=op,
+            run_torch=lambda: torch_call(f_t, None, 2.0),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, None, 2.0),
+            expect="both_error",
+            note="torch: \"result type Float can't be cast to the desired output type Int\"",
+        )
+    )
+    return cases
+
+
+def div__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.div_.Tensor"
+    cases: list[Case] = []
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [2.0, 4.0, 5.0], (3, 1), dtype_name)
+        cases.append(
+            Case(
+                name=f"div_(dtype={dtype_name}, other (3,1) broadcasts into receiver (3,2))",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="mixtral's exact call shape: "
+                     "top_k_weights.div_(top_k_weights.sum(-1, keepdim=True))",
+            )
+        )
+
+    c_t, c_c = pair_from_flat(torch_module, c_module, [1.0, -1.0, 0.0, 5.0], (2, 2), "float32")
+    d_t, d_c = pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0, 2.0], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="div_(dtype=float32, division by zero -- inf/-inf/nan, not an error)",
+            op=op,
+            run_torch=lambda: torch_call(c_t, d_t),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, d_c),
+            note="in-place true division, IEEE 0-division rules, same as div.Tensor",
+        )
+    )
+
+    # Refused: an integral receiver cannot hold the true-division result.
+    e_t, e_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    f_t, f_c = pair_from_flat(torch_module, c_module, [2, 2, 2], (3,), "int64")
+    cases.append(
+        Case(
+            name="div_(dtype=int64) [refused -- true division can't write back into int64]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, f_t),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, f_c),
+            expect="both_error",
+            note="torch: \"result type Float can't be cast to the desired output type Long\"",
+        )
+    )
+
+    # Refused: other's shape does not broadcast INTO the receiver's own
+    # shape -- in-place can only shrink what's applied, never grow self.
+    g_t, g_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3, 1), "float32")
+    h_t, h_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (1, 2), "float32")
+    cases.append(
+        Case(
+            name="div_(receiver (3,1), other (1,2)) [refused -- other would grow the receiver]",
+            op=op,
+            run_torch=lambda: torch_call(g_t, h_t),
+            run_c=lambda: c_module._aten_dispatch(op, g_c, h_c),
+            expect="both_error",
+            note="torch: \"output with shape [3, 1] doesn't match the broadcast shape [3, 2]\"",
+        )
+    )
+    return cases
+
+
+def masked_fill__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.masked_fill_.Scalar"
+    cases: list[Case] = []
+    # Same bool-mask construction workaround `masked_fill_cases` documents
+    # above -- `_C`'s `_tensor_from_flat` refuses to build a bool tensor
+    # directly, so the mask is built from an int 0/1 flat list with an
+    # explicit `dtype=c_module.bool`.
+    a_flat, a_shape = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3)
+    mask_flat = [True, False, True, False, True, False]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        big = _FLOAT_ADD_MAGNITUDE[dtype_name]
+        for value, note in [
+            (0.0, "zero fill"),
+            (-big, "large negative -- sentinel masking, mixtral's exact use"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"masked_fill_(dtype={dtype_name}, value={value}) [in-place]",
+                    op=op,
+                    run_torch=lambda dtype_name=dtype_name, value=value: torch_call(
+                        torch_module.tensor(a_flat, dtype=dt.torch_dtype(torch_module, dtype_name)).reshape(
+                            list(a_shape)
+                        ),
+                        torch_module.tensor(mask_flat).reshape(list(a_shape)),
+                        value,
+                    ),
+                    run_c=lambda dtype_name=dtype_name, value=value: c_module._aten_dispatch(
+                        op,
+                        c_module._tensor_from_flat(a_flat, list(a_shape), dtype=dt.c_dtype(c_module, dtype_name)),
+                        c_module._tensor_from_flat([int(v) for v in mask_flat], list(a_shape), dtype=c_module.bool),
+                        value,
+                    ),
+                    note=note,
+                )
+            )
+
+    # Broadcasting mask -- mixtral's exact shape: `sentinel_mask` is
+    # `(N,1)`, the receiver is `(N,hidden_dim)`.
+    b_flat = [float(v) for v in range(1, 9)]
+    b_shape = (4, 2)
+    bmask_flat = [True, False, True, False]
+    cases.append(
+        Case(
+            name="masked_fill_(dtype=float32, mask (4,1) broadcasts into receiver (4,2))",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor(b_flat).reshape(list(b_shape)),
+                torch_module.tensor(bmask_flat).reshape([4, 1]),
+                -1.0,
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat(b_flat, list(b_shape), dtype=c_module.float32),
+                c_module._tensor_from_flat([int(v) for v in bmask_flat], [4, 1], dtype=c_module.bool),
+                -1.0,
+            ),
+            note="mixtral's exact call shape: "
+                 "selected_hidden_states_g.masked_fill_(sentinel_mask, 0.0)",
+        )
+    )
+    return cases
+
+
+def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.index_put_.default"
+    cases: list[Case] = []
+
+    # mixtral's exact call shape: inv_perm[perm] = torch.arange(perm.size(0))
+    # -- a single int64 index tensor, no accumulate, 1-D self/index/values.
+    for dtype_name in ["int64", "int32", "float32"]:
+        zero_flat = [0.0] * 5 if dtype_name == "float32" else [0] * 5
+        values_flat = [10.0, 20.0, 30.0, 40.0, 50.0] if dtype_name == "float32" else [10, 20, 30, 40, 50]
+        self_t, self_c = pair_from_flat(torch_module, c_module, zero_flat, (5,), dtype_name)
+        idx_t, idx_c = pair_from_flat(torch_module, c_module, [4, 3, 2, 1, 0], (5,), "int64")
+        values_t, values_c = pair_from_flat(torch_module, c_module, values_flat, (5,), dtype_name)
+        cases.append(
+            Case(
+                name=f"index_put_(dtype={dtype_name}, self[index]=values, no accumulate)",
+                op=op,
+                run_torch=lambda self_t=self_t, idx_t=idx_t, values_t=values_t: torch_call(
+                    self_t, [idx_t], values_t, False
+                ),
+                run_c=lambda self_c=self_c, idx_c=idx_c, values_c=values_c: c_module._aten_dispatch(
+                    op, self_c, [idx_c], values_c, False
+                ),
+                note="mixtral's exact call shape: inv_perm[perm] = torch.arange(perm.size(0))",
+            )
+        )
+
+    # Repeated index -- last write wins (measured), the same rule
+    # `scatter.src`'s doc comment already documents and this reuses.
+    self2_t, self2_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    idx2_t, idx2_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    values2_t, values2_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(repeated index) [last write wins]",
+            op=op,
+            run_torch=lambda: torch_call(self2_t, [idx2_t], values2_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, self2_c, [idx2_c], values2_c, False),
+            note="measured: index [0,0,0] with values [1,2,3] leaves self[0] == 3",
+        )
+    )
+
+    # Refused: accumulate=True is not measured/implemented.
+    self3_t, self3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    idx3_t, idx3_c = pair_from_flat(torch_module, c_module, [0, 1, 2], (3,), "int64")
+    values3_t, values3_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(accumulate=True) [c_error -- torch computes, shim refuses]",
+            op=op,
+            run_torch=lambda: torch_call(self3_t, [idx3_t], values3_t, True),
+            run_c=lambda: c_module._aten_dispatch(op, self3_c, [idx3_c], values3_c, True),
+            expect="c_error",
+            note="torch computes accumulate=True; the shim refuses it by name (not measured/needed)",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -6835,4 +7533,18 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # docs/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces
     # to, landed as its own kernel (was a measured gap, docs/SPELLINGS.md §6.6).
     "aten.relu_.default": relu__cases,
+    # mamba and mixtral, the last two of the 20 measured architectures
+    # (docs/OPS4.md) with anything unimplemented.
+    "aten.exp.default": exp_cases,
+    "aten.softplus.default": softplus_cases,
+    "aten.convolution.default": convolution_cases,
+    "aten.zeros_like.default": zeros_like_cases,
+    "aten.empty_like.default": empty_like_cases,
+    "aten.ge.Scalar": ge_scalar_cases,
+    "aten.floor_divide.default": floor_divide_cases,
+    "aten.histc.default": histc_cases,
+    "aten.clamp_.default": clamp__default_cases,
+    "aten.div_.Tensor": div__tensor_cases,
+    "aten.masked_fill_.Scalar": masked_fill__scalar_cases,
+    "aten.index_put_.default": index_put__cases,
 }
