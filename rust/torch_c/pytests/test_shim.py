@@ -2578,6 +2578,642 @@ def test_meta_road_through_the_vendored_tree():
     assert "at least two devices" in r["mixed_add"], r["mixed_add"]
 
 
+# --- the capture layer (docs/CAPTURE.md) ------------------------------------
+#
+# DESIGN.md §11.1 named the reason this exists: an NPU is not an eager device,
+# it is an executor that takes a whole graph. The single door is what makes
+# recording one cheap -- every op goes through `_aten_dispatch`, so the record
+# is taken in one place rather than in 97 kernels.
+#
+# The proof these tests are after is *not* "the recorder produced a list". It
+# is that the recorded graph, replayed with different inputs and detached from
+# the Python that produced it, computes the same function as eager -- because
+# that is exactly what a delegate does with it. Everything else here is the
+# other half: the conditions under which that equality is allowed to be
+# claimed (the guards), and the refusals that keep it from being claimed when
+# it does not hold.
+
+
+def _flat(t):
+    """A tensor's values as a flat list, for bit-exact comparison."""
+
+    def walk(v, into):
+        if isinstance(v, list):
+            for item in v:
+                walk(item, into)
+        else:
+            into.append(v)
+
+    out = []
+    walk(t.tolist(), out)
+    return out
+
+
+def test_capture_is_off_until_it_is_asked_for():
+    """The door stays a door. Nothing is recorded unless recording is on."""
+    assert _C._capture_active() is False
+    assert _C._capture_reason() is None
+    # And the ordinary path still answers while capture is off.
+    t = _C._aten_dispatch("aten.full.default", [2], 1.0)
+    assert t.tolist() == [1.0, 1.0]
+    assert _C._capture_active() is False
+
+
+def test_capture_records_ops_in_order_with_input_and_output_metadata():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    b = _C._tensor_new_from_data([[5.0, 6.0], [7.0, 8.0]])
+    bias = _C._tensor_new_from_data([1.0, -100.0])
+
+    _C._capture_begin([a, b])
+    assert _C._capture_active() is True
+    x = d("aten.mm.default", a, b)
+    y = d("aten.add.Tensor", x, bias)
+    z = d("aten.relu.default", y)
+    trace = _C._capture_end(z)
+    assert _C._capture_active() is False
+
+    assert len(trace) == 3
+    assert [n["op"] for n in trace.nodes] == [
+        "aten.mm.default",
+        "aten.add.Tensor",
+        "aten.relu.default",
+    ]
+
+    # Values are references, not copies: an argument is either a placeholder,
+    # a constant, or the output of an earlier node. That is the whole content
+    # of "straight-line segment".
+    v = _C._capture_value
+    assert trace.nodes[0]["args"] == [v("input", 0), v("input", 1)]
+    assert trace.nodes[1]["args"] == [v("node", 0), v("const", 0)]
+    assert trace.nodes[2]["args"] == [v("node", 1)]
+    assert trace.outputs == [v("node", 2)]
+
+    # Each node carries the shape and dtype of what it produced ...
+    for node in trace.nodes:
+        assert node["outputs"] == [
+            {"shape": [2, 2], "dtype": "torch.float32", "device": "cpu"}
+        ], node
+
+    # ... and the placeholders carry the shape, dtype and device of what came
+    # in. `bias` was never declared an input, so it is a constant -- which is
+    # the split `ExportedProgram.graph_signature` makes between user inputs and
+    # lifted parameters.
+    assert trace.guards == [
+        {"index": 0, "shape": [2, 2], "dtype": "torch.float32", "device": "cpu"},
+        {"index": 1, "shape": [2, 2], "dtype": "torch.float32", "device": "cpu"},
+    ]
+    assert trace.constants == [
+        {"index": 0, "shape": [2], "dtype": "torch.float32", "device": "cpu"}
+    ]
+
+
+def test_capture_replay_matches_eager_bit_for_bit():
+    """The proof. Same graph, different inputs, same answer as eager.
+
+    Not "close": equal. Replay re-enters the same door with the same op names
+    and the same non-tensor arguments, so any difference at all would mean the
+    record had lost something -- an argument, an order, a dtype.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    b = _C._tensor_new_from_data([[5.0, 6.0], [7.0, 8.0]])
+    bias = _C._tensor_new_from_data([1.0, -100.0])
+
+    def eager(p, q):
+        x = d("aten.mm.default", p, q)
+        y = d("aten.add.Tensor", x, bias)
+        y = d("aten.relu.default", y)
+        y = d("aten.sum.dim_IntList", y, [1])
+        return d("aten.mul.Scalar", y, 2.5)
+
+    _C._capture_begin([a, b])
+    recorded = eager(a, b)
+    trace = _C._capture_end(recorded)
+
+    # Same inputs first: the record has to reproduce what it just watched.
+    (again,) = trace.replay([a, b])
+    assert _flat(again) == _flat(recorded)
+
+    # Then the point of it -- inputs it has never seen.
+    for pv, qv in (
+        ([[0.5, -1.5], [2.0, 9.0]], [[1.25, 0.0], [-3.0, 4.0]]),
+        ([[1e-8, 1e8], [-7.0, 0.0]], [[3.5, -2.5], [0.125, 6.0]]),
+    ):
+        p = _C._tensor_new_from_data(pv)
+        q = _C._tensor_new_from_data(qv)
+        (replayed,) = trace.replay([p, q])
+        assert _flat(replayed) == _flat(eager(p, q)), (pv, qv)
+
+
+def test_capture_replay_carries_keyword_and_literal_arguments():
+    """Non-tensor arguments are burned into the graph, and that is a guard too.
+
+    A trace is only a function of its *tensor* inputs. Every dim, every scalar,
+    every dtype seen at record time is a constant afterwards -- so a `dim=1`
+    trace replayed on a program that meant `dim=0` is not a near miss, it is a
+    different function. The record keeps them verbatim so that no later reader
+    has to reconstruct them.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+
+    _C._capture_begin([a])
+    s = d("aten.sum.dim_IntList", a, [1], keepdim=True)
+    c = d("aten.cat.default", [s, s], dim=1)
+    out = d("aten._to_copy.default", c, _C.float64)
+    trace = _C._capture_end(out)
+
+    assert trace.nodes[0]["args"][1] == [1]
+    assert trace.nodes[0]["kwargs"] == {"keepdim": True}
+    assert trace.nodes[1]["kwargs"] == {"dim": 1}
+    assert trace.nodes[2]["args"][1] == _C.float64
+    assert trace.nodes[2]["outputs"][0]["dtype"] == "torch.float64"
+
+    b = _C._tensor_new_from_data([[9.0, 8.0, 7.0], [0.5, 0.25, 0.125]])
+    (replayed,) = trace.replay([b])
+    expect = d(
+        "aten._to_copy.default",
+        d("aten.cat.default", [d("aten.sum.dim_IntList", b, [1], keepdim=True)] * 2, dim=1),
+        _C.float64,
+    )
+    assert _flat(replayed) == _flat(expect)
+    assert replayed.dtype == _C.float64
+
+
+def test_capture_replay_handles_ops_that_return_more_than_one_tensor():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    w = _C._tensor_new_from_data([1.0, 1.0])
+    bias = _C._tensor_new_from_data([0.0, 0.0])
+
+    _C._capture_begin([a])
+    ln = d("aten.native_layer_norm.default", a, [2], w, bias, 1e-5)
+    out = d("aten.mul.Scalar", ln[0], 3.0)
+    trace = _C._capture_end(out)
+
+    # Three results, and the record knows which one was consumed.
+    assert len(trace.nodes[0]["outputs"]) == 3
+    assert trace.nodes[1]["args"][0] == _C._capture_value("node", 0, 0)
+
+    b = _C._tensor_new_from_data([[-1.0, 4.0], [0.0, 0.25], [7.0, 7.5]])
+    (replayed,) = trace.replay([b])
+    expect = d("aten.mul.Scalar", d("aten.native_layer_norm.default", b, [2], w, bias, 1e-5)[0], 3.0)
+    assert _flat(replayed) == _flat(expect)
+
+
+def test_capture_replay_returns_every_declared_output():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+
+    _C._capture_begin([a])
+    lo = d("aten.mul.Scalar", a, 2.0)
+    hi = d("aten.add.Scalar", a, 10.0)
+    trace = _C._capture_end([lo, hi])
+
+    assert len(trace.outputs) == 2
+    b = _C._tensor_new_from_data([[0.5, 0.5], [0.5, 0.5]])
+    got_lo, got_hi = trace.replay([b])
+    assert _flat(got_lo) == _flat(d("aten.mul.Scalar", b, 2.0))
+    assert _flat(got_hi) == _flat(d("aten.add.Scalar", b, 10.0))
+
+
+# --- the guards -------------------------------------------------------------
+
+
+def _one_op_trace():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    _C._capture_begin([a])
+    out = d("aten.mul.Scalar", a, 2.0)
+    return _C._capture_end(out)
+
+
+def test_capture_guard_refuses_a_different_shape():
+    """A capture without guards is a capture that is quietly wrong.
+
+    The record holds concrete shapes -- every intermediate shape in it was
+    computed from the shapes that came in. Replaying with a different one does
+    not merely risk a wrong answer, it makes every recorded output shape a lie.
+    Dynamic shapes are out of scope here (docs/CAPTURE.md §4), and this is what
+    "out of scope" has to mean: refused by name, not attempted.
+    """
+    trace = _one_op_trace()
+    wrong = _C._tensor_new_from_data([[1.0, 2.0, 3.0]])
+    try:
+        trace.replay([wrong])
+    except RuntimeError as e:
+        assert "shape" in str(e), str(e)
+        assert "[2, 2]" in str(e) and "[1, 3]" in str(e), str(e)
+        assert "input 0" in str(e), str(e)
+    else:
+        raise AssertionError("replay accepted a differently shaped input")
+
+
+def test_capture_guard_refuses_a_different_dtype():
+    trace = _one_op_trace()
+    wrong = _C._aten_dispatch(
+        "aten._to_copy.default",
+        _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]]),
+        _C.float64,
+    )
+    try:
+        trace.replay([wrong])
+    except RuntimeError as e:
+        assert "dtype" in str(e), str(e)
+        assert "torch.float32" in str(e) and "torch.float64" in str(e), str(e)
+    else:
+        raise AssertionError("replay accepted a differently typed input")
+
+
+def test_capture_guard_refuses_a_different_device():
+    trace = _one_op_trace()
+    wrong = _C._aten_dispatch(
+        "aten.empty.memory_format", [2, 2], _C.float32, device=_C.device("meta")
+    )
+    try:
+        trace.replay([wrong])
+    except RuntimeError as e:
+        assert "device" in str(e), str(e)
+        assert "meta" in str(e) and "cpu" in str(e), str(e)
+    else:
+        raise AssertionError("replay accepted an input on another device")
+
+
+def test_capture_guard_refuses_the_wrong_number_of_inputs():
+    trace = _one_op_trace()
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    for bad in ([], [a, a]):
+        try:
+            trace.replay(bad)
+        except RuntimeError as e:
+            assert "1 input" in str(e), str(e)
+        else:
+            raise AssertionError(f"replay accepted {len(bad)} inputs for a 1-input trace")
+
+
+def test_capture_guard_refuses_a_non_tensor_input():
+    trace = _one_op_trace()
+    try:
+        trace.replay([3.0])
+    except TypeError as e:
+        assert "input 0" in str(e), str(e)
+    else:
+        raise AssertionError("replay accepted a float where a tensor was recorded")
+
+
+# --- the refusals -----------------------------------------------------------
+
+
+def _capture_refusal(body, inputs):
+    """Run `body` under recording and return the reason capture gave up.
+
+    Poisoning rather than raising at the op: capture is an observation, and an
+    observation that changes the program it observes is not one. The model runs
+    to completion either way; what fails is the *claim* that it was captured.
+    """
+    _C._capture_begin(inputs)
+    body()
+    reason = _C._capture_reason()
+    try:
+        _C._capture_end(None)
+    except NotImplementedError as e:
+        assert reason is not None and reason in str(e), (reason, str(e))
+        assert _C._capture_active() is False
+        return str(e)
+    raise AssertionError("capture claimed a trace it should have refused")
+
+
+def test_capture_refuses_reading_a_tensor_value_onto_the_host():
+    """`.item()` and `bool(t)` are where a graph stops being a graph.
+
+    DESIGN.md §6 lists branching on a tensor value as one of the things the
+    static scan hunts for, and this is the runtime half of the same rule: the
+    value is not in the record, so a Python `if` taken on it is a decision the
+    replay cannot know it made. The recorded straight line would be *one arm*
+    of a branch, replayed unconditionally.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0])
+    got = _capture_refusal(
+        lambda: d("aten._local_scalar_dense.default", d("aten.sum.default", a)),
+        [a],
+    )
+    assert "aten._local_scalar_dense.default" in got, got
+    # It ran. Capture gave up; the program did not.
+    assert d("aten._local_scalar_dense.default", d("aten.sum.default", a)) == 3.0
+
+
+def test_capture_refuses_in_place_ops():
+    """Mutation is what makes aliasing observable, so refusing it removes both.
+
+    In-place aliasing is out of scope (docs/CAPTURE.md §4). Rather than model
+    it, capture refuses every mutating overload -- and with no mutation in the
+    segment, whether two recorded values share storage cannot be observed. The
+    trace is single-assignment by construction rather than by hope.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0])
+    b = _C._tensor_new_from_data([3.0, 4.0])
+    for op, args in (
+        ("aten.add_.Tensor", (a, b)),
+        ("aten.relu_.default", (a,)),
+        ("aten.fill_.Scalar", (a, 1.0)),
+        ("aten.zero_.default", (a,)),
+        ("aten.copy_.default", (a, b)),
+    ):
+        got = _capture_refusal(lambda op=op, args=args: d(op, *args), [a, b])
+        assert op in got, (op, got)
+        assert "in place" in got, (op, got)
+
+
+def test_capture_refuses_ops_that_draw_random_numbers():
+    """A replay that does not equal eager cannot be checked against eager.
+
+    Not a claim that the graph is invalid -- it is a claim that this layer has
+    no story yet for seeding a delegate, and a trace whose replay differs from
+    eager for a legitimate reason would hide one that differs for a bad one.
+    docs/CAPTURE.md §4.
+    """
+    d = _C._aten_dispatch
+    probs = _C._tensor_new_from_data([0.25, 0.75])
+    got = _capture_refusal(lambda: d("aten.multinomial.default", probs, 1), [probs])
+    assert "aten.multinomial.default" in got, got
+    assert "random" in got, got
+
+    got = _capture_refusal(lambda: d("aten.randint.default", 10, [2]), [probs])
+    assert "aten.randint.default" in got, got
+
+
+def test_capture_refuses_an_op_that_returns_something_other_than_tensors():
+    """The line is metadata versus data.
+
+    `is_floating_point` reads only the dtype, and the dtype is guarded, so its
+    answer is fixed for every input the trace admits -- it is recorded and its
+    result burned in. `_local_scalar_dense` reads the *bytes*, which the guards
+    say nothing about. Only the second is a refusal, and the reason is written
+    down here so the allowlist cannot grow by accident.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0])
+
+    _C._capture_begin([a])
+    assert d("aten.is_floating_point.default", a) is True
+    out = d("aten.mul.Scalar", a, 2.0)
+    trace = _C._capture_end(out)
+    assert [n["op"] for n in trace.nodes] == [
+        "aten.is_floating_point.default",
+        "aten.mul.Scalar",
+    ]
+    assert trace.nodes[0]["outputs"] == [None]  # recorded, not tracked
+
+
+def test_capture_refuses_to_nest_or_to_replay_while_recording():
+    a = _C._tensor_new_from_data([1.0, 2.0])
+    trace = _one_op_trace()
+
+    _C._capture_begin([a])
+    try:
+        try:
+            _C._capture_begin([a])
+        except RuntimeError as e:
+            assert "already" in str(e), str(e)
+        else:
+            raise AssertionError("capture nested")
+
+        try:
+            trace.replay([_C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])])
+        except RuntimeError as e:
+            assert "while recording" in str(e), str(e)
+        else:
+            raise AssertionError("replayed inside a recording")
+    finally:
+        _C._capture_abandon()
+    assert _C._capture_active() is False
+
+
+def test_capture_refuses_to_end_without_beginning():
+    assert _C._capture_active() is False
+    for call in (lambda: _C._capture_end(None), _C._capture_abandon):
+        try:
+            call()
+        except RuntimeError as e:
+            assert "not recording" in str(e), str(e)
+        else:
+            raise AssertionError("capture answered while not recording")
+
+
+def test_capture_refuses_an_output_it_never_saw():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0])
+    stranger = _C._tensor_new_from_data([9.0])
+    _C._capture_begin([a])
+    d("aten.mul.Scalar", a, 2.0)
+    try:
+        _C._capture_end(stranger)
+    except RuntimeError as e:
+        assert "output 0" in str(e), str(e)
+    else:
+        raise AssertionError("capture accepted an output produced outside the trace")
+    assert _C._capture_active() is False
+
+
+def test_capture_abandon_leaves_nothing_behind():
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0])
+    _C._capture_begin([a])
+    d("aten.mul.Scalar", a, 2.0)
+    _C._capture_abandon()
+    assert _C._capture_active() is False
+    assert _C._capture_reason() is None
+    # And the next recording starts from zero rather than from the abandoned one.
+    _C._capture_begin([a])
+    d("aten.add.Scalar", a, 1.0)
+    trace = _C._capture_end(d("aten.add.Scalar", a, 1.0))
+    assert len(trace) == 2
+
+
+# --- the shape of the record ------------------------------------------------
+
+
+def test_capture_graph_is_shaped_like_an_exported_program():
+    """docs/CAPTURE.md §5: is this structure one that can become Edge dialect?
+
+    The judgement is recorded as a test rather than only as prose, because the
+    answer is a claim about *this* data structure and it is cheap to pin. FX's
+    graph is placeholders, `get_attr` constants, `call_function` nodes whose
+    args are references or literals, and one `output`. That is what `graph()`
+    emits, with the op named by its aten overload -- the same key
+    `torch.ops.aten.<op>.<overload>` resolves, which is what an Edge lowering
+    needs to look each node up.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    w = _C._tensor_new_from_data([[1.0, 0.0], [0.0, 1.0]])
+    _C._capture_begin([a])
+    out = d("aten.mm.default", a, w)
+    graph = _C._capture_end(out).graph()
+
+    assert sorted(graph) == ["constants", "nodes", "outputs", "placeholders"]
+    assert graph["placeholders"] == [
+        {"index": 0, "shape": [2, 2], "dtype": "torch.float32", "device": "cpu"}
+    ]
+    assert graph["constants"] == [
+        {"index": 0, "shape": [2, 2], "dtype": "torch.float32", "device": "cpu"}
+    ]
+    assert graph["nodes"][0]["op"] == "aten.mm.default"
+    assert graph["outputs"] == [_C._capture_value("node", 0, 0)]
+
+    # Every op name in the record is one the dispatcher answers, so nothing in
+    # a trace is un-lowerable for want of a key.
+    known = set(_C._aten_all_implemented())
+    for node in graph["nodes"]:
+        assert node["op"] in known, node["op"]
+
+
+def test_capture_value_reads_like_an_fx_node():
+    v = _C._capture_value
+    assert repr(v("input", 0)) == "%in0"
+    assert repr(v("const", 2)) == "%c2"
+    assert repr(v("node", 3)) == "%3"
+    assert repr(v("node", 3, 1)) == "%3#1"
+    assert v("node", 3) == v("node", 3, 0)
+    assert v("node", 3) != v("node", 3, 1)
+    assert v("input", 0) != v("const", 0)
+    assert len({v("node", 3), v("node", 3, 0)}) == 1
+
+
+# `nn.Module` forward passes need the *vendored* tree: the module layer, the
+# functional layer and `Tensor.__matmul__` are all Python, and only the ops
+# they lower to reach `_C`. So the end-to-end proof runs in the same subprocess
+# shape as the checkpoint and device roads above.
+_CAPTURE_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+out = {}
+
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+model.eval()
+
+x = torch.ones(2, 4)
+eager_first = model(x)
+
+torch._C._capture_begin([x])
+y = model(x)
+trace = torch._C._capture_end(y)
+
+out["ops"] = [n["op"] for n in trace.nodes]
+out["n_placeholders"] = len(trace.guards)
+out["n_constants"] = len(trace.constants)
+out["guard"] = trace.guards[0]
+out["recorded"] = y.reshape(-1).tolist()
+out["eager_first"] = eager_first.reshape(-1).tolist()
+
+# Replay with the same input, then with inputs the trace has never seen, and
+# compare each against eager on the same input.
+(same,) = trace.replay([x])
+out["replay_same"] = same.reshape(-1).tolist()
+
+pairs = []
+for scale in (0.5, -2.0, 7.25):
+    z = torch.ones(2, 4) * scale
+    (replayed,) = trace.replay([z])
+    pairs.append([replayed.reshape(-1).tolist(), model(z).reshape(-1).tolist()])
+out["pairs"] = pairs
+
+# The guard is what makes any of that a claim rather than a hope.
+try:
+    trace.replay([torch.ones(3, 4)])
+except RuntimeError as e:
+    out["wrong_batch"] = str(e)
+else:
+    out["wrong_batch"] = "ACCEPTED"
+
+# A branch on a tensor value inside the traced region is refused by name.
+torch._C._capture_begin([x])
+h = model(x)
+if h.sum().item() > -1e30:
+    h = h * 2
+out["branch_reason"] = torch._C._capture_reason()
+try:
+    torch._C._capture_end(h)
+except NotImplementedError as e:
+    out["branch_refusal"] = str(e)
+else:
+    out["branch_refusal"] = "ACCEPTED"
+out["active_after"] = torch._C._capture_active()
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _capture_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _CAPTURE_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"capture-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_capture_road_through_the_vendored_tree():
+    """A real `nn.Module` forward, captured and replayed, against eager.
+
+    This is the assertion the rest of the file exists to reach. The tests above
+    drive `_aten_dispatch` by hand, which proves the recorder but not that a
+    model *reaches* it in a capturable shape -- two `nn.Linear` layers and a
+    `ReLU` do, and the ops that come out are the record.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _capture_road_fixture()
+
+    # A Linear is an addmm; the record says so rather than being trusted to.
+    assert r["ops"].count("aten.addmm.default") == 2, r["ops"]
+    assert "aten.relu.default" in r["ops"], r["ops"]
+    # Weights and biases were never declared inputs, so they are constants --
+    # four of them, which is `graph_signature`'s lifted-parameter half.
+    assert r["n_placeholders"] == 1, r["n_placeholders"]
+    assert r["n_constants"] == 4, r["n_constants"]
+    assert r["guard"] == {
+        "index": 0, "shape": [2, 4], "dtype": "torch.float32", "device": "cpu",
+    }, r["guard"]
+
+    # Recording changed nothing about the answer.
+    assert r["recorded"] == r["eager_first"], (r["recorded"], r["eager_first"])
+    # Replay reproduces it, bit for bit ...
+    assert r["replay_same"] == r["recorded"], (r["replay_same"], r["recorded"])
+    # ... and agrees with eager on inputs it never saw.
+    for replayed, eager in r["pairs"]:
+        assert replayed == eager, (replayed, eager)
+
+    # The batch dimension is *not* free. Nothing in this layer makes it so, and
+    # a capture that pretended otherwise would be wrong on the first model with
+    # a shape-dependent constant in it.
+    assert "shape" in r["wrong_batch"], r["wrong_batch"]
+    assert "ACCEPTED" not in r["wrong_batch"], r["wrong_batch"]
+
+    # `.item()` behind a Python `if` is refused by name, and the refusal comes
+    # at the end rather than in the middle -- the model still ran.
+    assert "aten._local_scalar_dense.default" in r["branch_reason"], r["branch_reason"]
+    assert "aten._local_scalar_dense.default" in r["branch_refusal"], r["branch_refusal"]
+    assert r["active_after"] is False
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

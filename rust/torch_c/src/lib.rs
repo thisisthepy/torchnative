@@ -15,6 +15,7 @@
 //! | `dtype` | `torch.float32` and friends, as `_C`-owned instances |
 //! | `device` | `torch.device`, a label rather than a live backend handle |
 //! | `aten` | the single dispatch entrance, and the ops behind it |
+//! | `capture` | recording a straight-line region at that entrance, and replaying it |
 //! | `err` | the message shapes; §6's discovery mechanism lives on these |
 //!
 //! This is a floor, not a coverage effort. Three ops are implemented. Everything
@@ -29,6 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 mod aten;
+mod capture;
 mod device;
 mod dtype;
 mod err;
@@ -459,6 +461,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     info::register(m)?;
     tensor::register(m)?;
     aten::register(m)?;
+    capture::register(m)?;
     rng::register(m)?;
     storage::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
