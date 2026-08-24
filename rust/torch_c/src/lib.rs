@@ -272,6 +272,133 @@ fn _tensor_new_from_data(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
+/// `torch.frombuffer(buffer, *, dtype, count=-1, offset=0, requires_grad=False)`.
+///
+/// Not an aten op, and deliberately not routed through `_aten_dispatch`:
+/// upstream has no `aten::frombuffer` (checked -- `torch.ops.aten.frombuffer`
+/// raises `AttributeError` on torch 2.13.0). It is a `_C` binding,
+/// `THPVariable_frombuffer` in `torch/csrc/utils/tensor_new.cpp`, reachable
+/// only as `torch._C._VariableFunctions.frombuffer`. So this is the same split
+/// `_tensor_factory` already makes for `torch.tensor`: `_C` builds the data,
+/// and the door stays one door because there is no aten call to make.
+///
+/// It is here because it is the *entire* cost of reading a safetensors
+/// checkpoint. `safetensors.torch.load(bytes)` decodes the container in its own
+/// Rust extension and then calls exactly one torch function per tensor --
+/// `torch.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])`
+/// (`safetensors/torch.py:468`). Measured: with this function and nothing else,
+/// that path goes from its first wall to a full state dict. See docs/CKPT.md.
+///
+/// **This copies; upstream aliases.** `torch.frombuffer` upstream returns a
+/// tensor that shares memory with the buffer -- writing to the buffer changes
+/// the tensor, which is measured and is why upstream warns about non-writable
+/// buffers. candle owns its storage, so the bytes are copied in and the two are
+/// independent afterwards. For loading a checkpoint that difference is
+/// invisible (the buffer is read once and dropped), and it is recorded rather
+/// than fixed because fixing it means a storage concept candle does not have.
+/// Anything that relies on the aliasing gets wrong answers quietly, so it is
+/// written down here and in docs/CKPT.md rather than left to be discovered.
+///
+/// The `ValueError` messages are upstream's, transcribed from torch 2.13.0 by
+/// running each failing case. Behaviour, not just wording: `count == 0` is an
+/// error even when the buffer is non-empty, and any `count < 0` -- not just
+/// `-1` -- means "all the rest".
+#[pyfunction]
+#[pyo3(signature = (buffer, *, dtype, count = -1, offset = 0, requires_grad = false))]
+fn _frombuffer(
+    py: Python<'_>,
+    buffer: &Bound<'_, PyAny>,
+    dtype: PyDtype,
+    count: i64,
+    offset: i64,
+    requires_grad: bool,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "torch.frombuffer";
+
+    if requires_grad {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}(requires_grad=True) -- there is no autograd behind this shim"
+        )));
+    }
+
+    // The buffer protocol rather than a `bytes`/`bytearray` downcast: upstream
+    // takes anything that implements it, and `safetensors` hands over a
+    // `bytearray` while pickle frames arrive as `memoryview`. `PyBuffer` is
+    // available under the Limited API from 3.11 (`pyo3/src/buffer.rs`), and
+    // this crate's floor is 3.13.
+    let view = pyo3::buffer::PyBuffer::<u8>::get(buffer)?;
+    let bytes = view.to_vec(py)?;
+    let len = bytes.len() as i64;
+    let itemsize = dtype.tag().itemsize() as i64;
+
+    if offset < 0 || offset > (len - 1).max(0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "offset ({offset} bytes) must be non-negative and no greater than \
+             buffer length ({len} bytes) minus 1"
+        )));
+    }
+    if len == 0 || count == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "both buffer length ({len}) and count ({count}) must not be 0"
+        )));
+    }
+
+    let numel = if count < 0 {
+        if (len - offset) % itemsize != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "buffer length ({len} bytes) after offset ({offset} bytes) must \
+                 be a multiple of element size ({itemsize})"
+            )));
+        }
+        (len - offset) / itemsize
+    } else {
+        if count * itemsize + offset > len {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "requested buffer length ({count} * {itemsize} bytes) after \
+                 offset ({offset} bytes) must not be greater than actual buffer \
+                 length ({len} bytes)"
+            )));
+        }
+        count
+    };
+
+    let start = offset as usize;
+    let end = start + (numel * itemsize) as usize;
+    let slice = &bytes[start..end];
+    let shape = [numel as usize];
+    let device = candle_core::Device::Cpu;
+
+    // `torch.bool` again: candle stores it as `U8`, and the 0/1 invariant
+    // (BOOL.md §6.3) has to hold by construction. Raw checkpoint bytes under a
+    // bool tag are not guaranteed normalised, so they are reduced with `!= 0`
+    // -- which is exactly what torch guarantees a bool tensor *reads* as
+    // (BOOL.md §2.6), so no value changes. Same reduction `_tensor_from_flat`
+    // makes, for the same reason.
+    if dtype.tag() == crate::dtype::TorchDType::Bool {
+        let normalised: Vec<u8> = slice.iter().map(|b| u8::from(*b != 0)).collect();
+        let tensor = Tensor::from_vec(normalised, shape.to_vec(), &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return crate::tensor::promote(
+            py,
+            PyTensorBase::boolean(tensor)?.into_pyobject(py)?.into_any().unbind(),
+        );
+    }
+
+    // `dtype.storage()` refuses by name for the dtypes candle cannot hold --
+    // `int8`, `uint16`, `uint64`, the complex family. Upstream `frombuffer`
+    // accepts all of them (measured: `torch.int8` and `torch.uint16` both
+    // return tensors), so this is a real narrowing of the surface, and refusing
+    // loudly is the point. A checkpoint in one of those dtypes stops here with
+    // the dtype in the message instead of being reinterpreted as something else.
+    let storage = dtype.storage(OP)?;
+    let tensor =
+        Tensor::from_raw_buffer(slice, storage, &shape, &device).map_err(|e| candle_err(OP, e))?;
+    crate::tensor::promote(
+        py,
+        PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind(),
+    )
+}
+
 /// The triple this artefact was built for. Three targets are cross-compiled and
 /// the results are indistinguishable once renamed to `_C.so`, so the build
 /// records it here rather than leaving it to be guessed from a file path.
@@ -338,6 +465,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rng::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
+    m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;
     run_bootstrap(m)?;
     Ok(())

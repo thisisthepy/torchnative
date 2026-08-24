@@ -207,6 +207,24 @@ impl PyTensorBase {
         PyDevice::from_candle(self.inner.device())
     }
 
+    /// `tensor.is_meta`. Derived from the device rather than returned as a
+    /// constant `False`, so it stays true to whatever `device()` reports if a
+    /// meta-like device ever appears; today candle has three device kinds
+    /// (`Cpu`, `Cuda`, `Metal`, see `PyDevice::from_candle`) and none of them
+    /// is `meta`, so it always answers `False`.
+    ///
+    /// It is here because `Module.load_state_dict` reads it on every single
+    /// parameter -- `torch/nn/modules/module.py:2449`, `if param.is_meta:`,
+    /// before the shape check and before the copy. It was the only wall left on
+    /// that path once the weights themselves could be read (docs/CKPT.md).
+    /// A stub property raising by name stopped `load_state_dict` outright,
+    /// which is the right behaviour for a hole and the wrong answer for a
+    /// question the shim can answer.
+    #[getter]
+    fn is_meta(&self) -> bool {
+        PyDevice::from_candle(self.inner.device()).kind == "meta"
+    }
+
     #[getter]
     fn ndim(&self) -> usize {
         self.inner.rank()

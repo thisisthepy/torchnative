@@ -1290,6 +1290,15 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # `torch.tensor` is the one name on this object that is not an overload set
     # -- see `_tensor_factory`.
     varfns.tensor = _tensor_factory(module, dispatch)
+    # `torch.frombuffer` is the second, and for the same reason: upstream has no
+    # `aten::frombuffer` at all (`torch.ops.aten.frombuffer` raises
+    # `AttributeError` on 2.13.0), only the `_C` binding. The loop above had
+    # installed a refusal that pointed the caller at
+    # `torch.ops.aten.frombuffer.<overload>` -- a work item nobody could ever
+    # close, because there is nothing there to reach. Point it at the real
+    # implementation instead. It is the entire cost of the safetensors load
+    # path; see `_frombuffer` in lib.rs and docs/CKPT.md.
+    varfns.frombuffer = module._frombuffer
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
