@@ -34,7 +34,21 @@
     "torch 2.13.0, transcribed. `pytests/verify_schemas.py` re-derives both",
     "tables from an installed upstream torch and diffs, so a transcription",
     "slip or an upstream drift fails loudly instead of silently binding the",
-    "wrong overload."
+    "wrong overload.",
+    "",
+    "An entry here does not promise a kernel. `le`/`__le__` resolve correctly",
+    "and then raise `aten op not implemented in torch._C shim: aten.le.Scalar`",
+    "from `aten.rs`, which is the point: a resolved-but-unimplemented overload",
+    "is a precise work item, where a missing table entry is only a vague one.",
+    "`div.Tensor_mode` has been in that state since this table was written.",
+    "",
+    "`softmax` is the one measured method deliberately left out. `F.softmax`",
+    "spells itself `input.softmax(dim)`, so it would belong here -- but the",
+    "parser-level key is `aten.softmax.int` while the key upstream's dispatcher",
+    "actually sees is `aten._softmax.default` (measured, docs/NN_SURFACE.md",
+    "§6). Listing `softmax.int` would name a work item this shim will never",
+    "implement, which is worse than naming none. Same reasoning as `to.dtype`",
+    "versus `_to_copy` in `_install_tensor_conversions`."
   ],
 
   "mul": [
@@ -82,12 +96,29 @@
     "aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
   ],
+  "__rsub__": [
+    "aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "neg": [
+    "aten::neg(Tensor self) -> Tensor"
+  ],
+  "__neg__": [
+    "aten::neg(Tensor self) -> Tensor"
+  ],
 
   "matmul": [
     "aten::matmul(Tensor self, Tensor other) -> Tensor"
   ],
   "__matmul__": [
     "aten::matmul(Tensor self, Tensor other) -> Tensor"
+  ],
+  "bmm": [
+    "aten::bmm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+  "t": [
+    "aten::t(Tensor(a) self) -> Tensor(a)"
   ],
 
   "eq": [
@@ -113,6 +144,14 @@
   "__lt__": [
     "aten::lt.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::lt.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "le": [
+    "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__le__": [
+    "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
 
   "bitwise_and": [

@@ -31,7 +31,32 @@
     "come from the vendored tree -- see docs/OVERLOAD.md §2 for what the tree",
     "does and does not carry -- so `pytests/verify_schemas.py` re-derives them",
     "from upstream and diffs, which keeps the table from drifting silently.",
-    "That script needs real torch; the build does not."
+    "That script needs real torch; the build does not.",
+    "",
+    "Notes on the entries docs/NN_SURFACE.md added, where the reason is not",
+    "self-evident:",
+    "",
+    "  * `where` -- `.self_out` first, per the `.out` rule above. The scalar",
+    "    mixes cannot shadow each other (`ScalarSelf` needs a scalar in the",
+    "    second slot, `ScalarOther` in the third), so their relative order is",
+    "    cosmetic, but it follows the vendored `.pyi` declaration order anyway.",
+    "    The bare `where(Tensor condition) -> Tensor[]` goes last: it is the",
+    "    `nonzero`-shaped overload and binds one argument, which nothing else",
+    "    does.",
+    "  * `bmm` carries `.dtype`/`.dtype_out` because the vendored",
+    "    `_VariableFunctions.pyi` really does expose an `out_dtype` parameter.",
+    "    Leaving them out would make `torch.bmm(a, b, out_dtype=...)` report",
+    "    'no matching overload' where upstream accepts it.",
+    "  * `rsub` is here rather than in `methods.json` because that is the route",
+    "    the vendored tree takes: `torch/_tensor.py:1108` spells `Tensor.",
+    "    __rsub__` as `_C._VariableFunctions.rsub(self, other)`. `1 - x` is",
+    "    measured 8 times in a Llama `generate` (docs/NN_SURFACE.md §3).",
+    "",
+    "Two names a model path calls are deliberately NOT here, because they are",
+    "`CompositeImplicitAutograd` upstream and an overload entry would invent a",
+    "kernel requirement upstream does not have: `linear` and `dropout`. Both",
+    "are Python-level compositions in `bootstrap.py` (`_install_nn`,",
+    "`_install_composites`), and both still end at `_C._aten_dispatch`."
   ],
 
   "arange": [
@@ -124,5 +149,40 @@
     "aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
     "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "bmm": [
+    "aten::bmm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::bmm.dtype_out(Tensor self, Tensor mat2, ScalarType out_dtype, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::bmm.dtype(Tensor self, Tensor mat2, ScalarType out_dtype) -> Tensor",
+    "aten::bmm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+
+  "matmul": [
+    "aten::matmul.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::matmul(Tensor self, Tensor other) -> Tensor"
+  ],
+
+  "neg": [
+    "aten::neg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::neg(Tensor self) -> Tensor"
+  ],
+
+  "t": [
+    "aten::t(Tensor(a) self) -> Tensor(a)"
+  ],
+
+  "rsub": [
+    "aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "where": [
+    "aten::where.self_out(Tensor condition, Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor",
+    "aten::where.ScalarSelf(Tensor condition, Scalar self, Tensor other) -> Tensor",
+    "aten::where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor",
+    "aten::where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor",
+    "aten::where(Tensor condition) -> Tensor[]"
   ]
 }

@@ -1295,6 +1295,10 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module._TensorBase = module.TensorBase
     _install_grad_mode(module, varfns)
 
+    # -- `_C._nn`, and the two composites that are not overload sets -------
+    _install_nn(module, dispatch)
+    _install_composites(module, varfns, dispatch)
+
     # -- the enum instances `_initExtension` writes into `torch` -----------
     _install_namespace_types(module, surface["namespace"])
 
@@ -2310,6 +2314,211 @@ def _install_library(module) -> None:
             return recorder
 
     module._dispatch_library = _DispatchLibrary
+
+
+# ---------------------------------------------------------------------------
+# `torch._C._nn` -- the three names a model path actually calls
+# ---------------------------------------------------------------------------
+#
+# The submodule loop above gives `_nn` all 70 names the stubs declare, every
+# one of them a raising stub. docs/NN_SURFACE.md measured which of them a
+# 2-layer Llama forward plus greedy `generate` calls, on upstream torch 2.13.0,
+# by wrapping each builtin rather than by reading the tree:
+#
+#     _C._nn.linear                          150 calls
+#     _C._nn.scaled_dot_product_attention      10
+#     _C._nn.silu                              20
+#     ...and nothing else. 3 of 96.
+#
+# So this is not a port of `_C._nn`; it is the three names, and the other 67
+# stay raising stubs on purpose (rule 2 -- a hole, never a switch).
+#
+# WHY THESE ARE PYTHON-LEVEL COMPOSITIONS AND NOT NEW KERNELS. `aten::linear`
+# and `aten::dropout` are `CompositeImplicitAutograd` upstream: they have no
+# kernel at all, and what a `TorchDispatchMode` logger sees under
+# `F.linear(...)` is `t` + `addmm`/`mm` + `view`, never `aten.linear.default`.
+# Reproducing that decomposition here is therefore *following* upstream rather
+# than routing around it, and it keeps DESIGN.md §6's single door: every step
+# below goes through `_C._aten_dispatch` with a key the golden harness already
+# compares against upstream. Nothing here computes.
+#
+# `scaled_dot_product_attention` is the opposite shape -- upstream picks a
+# backend and calls one fused op -- so it is a selection, not a decomposition.
+
+
+def _install_nn(module, dispatch) -> None:
+    nn = module._nn
+    reachable = frozenset(module._aten_all_implemented())
+
+    def _t(weight):
+        return dispatch("aten.t.default", weight)
+
+    # `aten::linear`, transcribed from what upstream *does*, measured branch by
+    # branch against torch 2.13.0 (docs/NN_SURFACE.md §4):
+    #
+    #     2-D  + bias      t, addmm
+    #     N-D  + bias      view, t, addmm, view          (contiguous input)
+    #     any  + bias      t, ..., matmul, ..., add      (non-contiguous input)
+    #     2-D, no bias     t, mm
+    #     N-D, no bias     t, view, mm, _unsafe_view     (i.e. plain matmul)
+    #
+    # The no-bias case is exactly `matmul(input, weight.t())` in every rank, so
+    # it is spelled that way -- `aten.matmul.default` has a kernel here and it
+    # is the op upstream's own `at::native::linear` calls.
+    #
+    # PATCHED, AND SAY SO: the bias branches want `aten.addmm.default`, which
+    # this shim has no kernel for. Until it does, bias goes through
+    # `matmul` + `add.Tensor` -- which is a real upstream path (it is the
+    # non-contiguous branch above), just taken under a condition upstream would
+    # not take it under. The numbers agree to float rounding; the accumulation
+    # does not, because `addmm` is a fused GEMM and this is a GEMM followed by
+    # a separate broadcast add. The `if` below is written against
+    # `_aten_all_implemented()` rather than hardcoded, so the day an `addmm`
+    # kernel lands this takes upstream's path with no edit here.
+    _HAS_ADDMM = "aten.addmm.default" in reachable
+
+    def linear(input, weight, bias=None):
+        wt = _t(weight)
+        if bias is None:
+            return dispatch("aten.matmul.default", input, wt)
+        if _HAS_ADDMM and input.dim() == 2:
+            return dispatch("aten.addmm.default", bias, input, wt)
+        if _HAS_ADDMM and input.dim() > 2 and input.is_contiguous():
+            sizes = tuple(input.shape)
+            flat = dispatch("aten.view.default", input, [-1, sizes[-1]])
+            out = dispatch("aten.addmm.default", bias, flat, wt)
+            return dispatch(
+                "aten.view.default", out, list(sizes[:-1]) + [tuple(out.shape)[-1]]
+            )
+        return dispatch(
+            "aten.add.Tensor", dispatch("aten.matmul.default", input, wt), bias
+        )
+
+    def silu(input):
+        return dispatch("aten.silu.default", input)
+
+    # Upstream's `scaled_dot_product_attention` is a *backend selection*, and
+    # the selection was measured rather than assumed (docs/NN_SURFACE.md §5).
+    # On CPU, 4-D float inputs with `dropout_p == 0` go to
+    # `aten._scaled_dot_product_flash_attention_for_cpu` -- for float32,
+    # float64, float16 and bfloat16 alike, with or without a mask, with or
+    # without `is_causal`, and (measured) with both at once. Everything else
+    # falls back to the math backend, which is a different op sequence
+    # (`mul.Scalar`, `expand`, `view`, `bmm`, `_safe_softmax`, ...).
+    #
+    # Only the flash path is wired. The math fallback is refused by name rather
+    # than approximated, because `aten._safe_softmax.default` has no kernel
+    # here and silently substituting a plain softmax would differ from upstream
+    # exactly on the fully-masked rows that `_safe_softmax` exists for.
+    #
+    # The aten op returns `(output, logsumexp)`; upstream's binding returns the
+    # first. `logsumexp` is dropped here for the same reason upstream drops it:
+    # it is a backward-pass residual and this shim has no backward.
+    _FLASH = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+
+    def scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        *,
+        scale=None,
+        enable_gqa=False,
+    ):
+        if dropout_p != 0.0:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                "scaled_dot_product_attention(dropout_p != 0) -- upstream drops to "
+                "the math backend here, which needs aten._safe_softmax.default, "
+                "aten.bernoulli_.float and aten.div_.Scalar; none has a kernel"
+            )
+        if query.dim() != 4:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                f"scaled_dot_product_attention on a {query.dim()}-D query -- upstream "
+                "drops to the math backend for anything but 4-D {B, H, T, K}, which "
+                "needs aten._safe_softmax.default; it has no kernel"
+            )
+        if attn_mask is not None and attn_mask.dtype == module.bool:
+            # Measured: upstream converts a bool mask to an additive float one
+            # with `scalar_tensor` + `where.self` and *then* calls flash.
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                "scaled_dot_product_attention(attn_mask=<bool tensor>) -- upstream "
+                "converts it with aten.scalar_tensor.default and aten.where.self "
+                "before calling flash attention; neither has a kernel"
+            )
+        if enable_gqa:
+            # Upstream hands the mismatched head counts straight to the flash
+            # op, which broadcasts them. This shim's kernel does not.
+            # transformers' Llama calls `repeat_kv` itself and leaves this
+            # False, which is why it is refused rather than implemented.
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                "scaled_dot_product_attention(enable_gqa=True) -- upstream's flash "
+                "kernel broadcasts the key/value head dimension internally; this "
+                "shim's does not. Repeat the heads before calling."
+            )
+        return dispatch(
+            _FLASH,
+            query,
+            key,
+            value,
+            dropout_p,
+            is_causal,
+            attn_mask=attn_mask,
+            scale=scale,
+        )[0]
+
+    for fn, name in (
+        (linear, "linear"),
+        (silu, "silu"),
+        (scaled_dot_product_attention, "scaled_dot_product_attention"),
+    ):
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C._nn"
+        setattr(nn, name, fn)
+
+    # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
+    # names does something should be answerable by asking.
+    module._shim_nn_implemented = ["linear", "scaled_dot_product_attention", "silu"]
+
+
+def _install_composites(module, varfns, dispatch) -> None:
+    """`torch.dropout`, the other `CompositeImplicitAutograd` on the path.
+
+    `torch/nn/functional.py:1491` is `_VF.dropout(input, p, training)`, so
+    every `nn.Dropout` in a model reaches `torch._C._VariableFunctions.dropout`
+    -- 10 times in the measured Llama `generate` (docs/NN_SURFACE.md §3).
+
+    It is not in `overloads.json` because it is not an overload set in the
+    sense that table means. `aten::dropout`'s body short-circuits before the
+    dispatcher: `if (p == 0 || !train || input.numel() == 0) return input;`.
+    Measured, and the measurement is the point -- `F.dropout(x, 0.0, False)`
+    produces *no* aten record at all on upstream torch. An eval-mode model
+    therefore needs no dropout kernel, and routing this name through the
+    overload table would have invented a requirement upstream does not have.
+
+    `train=True` still resolves to `aten.dropout.default` and still raises from
+    the one door, naming the kernel an inference-only shim does not need yet.
+    """
+
+    def dropout(input, p, train):
+        if p == 0 or not train or input.numel() == 0:
+            return input
+        return dispatch("aten.dropout.default", input, p, train)
+
+    def dropout_(input, p, train):
+        if p == 0 or not train or input.numel() == 0:
+            return input
+        return dispatch("aten.dropout_.default", input, p, train)
+
+    for fn, name in ((dropout, "dropout"), (dropout_, "dropout_")):
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C"
+        setattr(varfns, name, fn)
 
 
 def _install_behaviour(module, dispatch) -> None:
