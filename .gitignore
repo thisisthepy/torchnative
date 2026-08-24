@@ -178,7 +178,22 @@ cython_debug/
 
 # Vendored upstream trees (docs/VENDOR.md). The torch Python tree alone is
 # ~1084 modules; it is reproduced by vendor/vendor_torch.sh, never committed.
+#
+# It now lands inside the package, at torchnative/src/main/torch/, so that one
+# build sees both `torch` and `torchnative` as top-level packages. That
+# directory therefore holds two kinds of file: upstream's, ignored here, and our
+# add-hook, which is tracked -- hence the negations rather than a blanket rule.
+/torchnative/src/main/torch/*
+!/torchnative/src/main/torch/README.md
+!/torchnative/src/main/torch/nn/
+/torchnative/src/main/torch/nn/*
+!/torchnative/src/main/torch/nn/federated.py
+/torchnative/src/main/torch-*.dist-info/
+/torchnative/src/main/.stamp
+/vendor/probe/
+
+# The tree used to land in /vendor. Kept ignored so a checkout made before the
+# move -- a worktree, say -- does not fill `git status` with 2286 files.
 /vendor/torch/
 /vendor/torch-*.dist-info/
 /vendor/.stamp
-/vendor/probe/

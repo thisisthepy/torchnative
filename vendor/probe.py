@@ -35,7 +35,17 @@ import types
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SHIM = os.path.join(HERE, "torch", "_C.abi3.so")
+
+# This script used to sit *inside* the vendored tree's directory, so `HERE` and
+# the tree were the same place. They are not any more: the tree lands in the
+# package, at torchnative/src/main/, so that one build sees both `torch` and
+# `torchnative` as top-level packages, while the scripts that assemble it stay
+# in vendor/. Same override the shell scripts take.
+VENDOR = os.environ.get(
+    "TORCHNATIVE_VENDOR_DIR",
+    os.path.join(os.path.dirname(HERE), "torchnative", "src", "main"),
+)
+SHIM = os.path.join(VENDOR, "torch", "_C.abi3.so")
 
 # Names the Python tree uses as *capability probes* rather than as functions:
 #
@@ -262,10 +272,12 @@ def dump_surface(path):
     taken -- no code, no values -- because the point is to size the hole our
     `_C` has to fill, not to borrow anything from upstream at runtime.
     """
-    # `sys.path[0]` is this script's directory, which *is* the vendor dir, so
-    # the vendored tree would shadow the installed one. Drop it -- this mode is
-    # the one place that must reach upstream.
-    sys.path = [p for p in sys.path if os.path.abspath(p or ".") != HERE]
+    # The vendored tree would shadow the installed one, and this mode is the one
+    # place that must reach upstream. Drop both the vendor dir and this script's
+    # own directory: they used to be the same path and no longer are, so
+    # dropping only `HERE` would leave the tree in front of upstream.
+    _shadow = {os.path.abspath(HERE), os.path.abspath(VENDOR)}
+    sys.path = [p for p in sys.path if os.path.abspath(p or ".") not in _shadow]
 
     import torch._C as real  # noqa: PLC0415 -- upstream, deliberately
 

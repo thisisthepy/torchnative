@@ -139,7 +139,7 @@ from transformers.generation.utils import GenerationMixin
 `torch.compile` 을 쓰지 않는 한 아무도 관측하지 않습니다. 그러므로 시그니처(인자 개수·타입)만
 맞는 아무 동작 없는 no-op 이면 충분합니다 — 예외만 던지지 않으면 됩니다.
 
-`.pyi` 스텁(`vendor/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
+`.pyi` 스텁(`torchnative/src/main/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
 
 ```python
 def set_guard_error_hook(hook: DynamoGuardHook) -> None: ...
@@ -261,7 +261,7 @@ IMPORT_TORCH.md 의 관문 조건(`transformers` 가 요구하는 `torch >= 2.5.
    (`_SubmoduleFinder`, `rust/torch_c/src/bootstrap.py:260` 부근)을 그대로 재사용하면 됩니다.
    이미 있는 인프라입니다.
 2. **52개 이름을 채웁니다** — 소스는 이미 벤더링된 `.pyi` 3개
-   (`vendor/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
+   (`torchnative/src/main/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
    교집합입니다. 클래스(19개)는 빈 몸체의 자리표 타입으로, 함수(29개, 호출 2개 제외)는
    시그니처만 맞춘 no-op 으로 충분합니다 — **호출되지 않으므로 동작을 구현할 필요가 없습니다.**
 3. **`set_guard_error_hook` · `set_code_exec_strategy` 2개만 신경 씁니다** — 인자 개수와
