@@ -431,6 +431,48 @@ pub fn normal_serial(gen: &mut CpuGenerator, size: usize, mean: f64, stdv: f64) 
     (0..size).map(|_| normal_sample_f64(gen, mean, stdv)).collect()
 }
 
+/// One `uniform_real_distribution<double>(from, to)` draw.
+///
+/// `multinomial`'s with-replacement kernel constructs the distribution *inside*
+/// its per-sample loop rather than filling a buffer, so it needs the single-draw
+/// form; the vector fills above are the wrong shape of API for it, not merely a
+/// slower one. Two 32-bit words per call, high word first.
+pub fn uniform_sample_f64(gen: &mut CpuGenerator, from: f64, to: f64) -> f64 {
+    uniform_real_f64(gen.random64(), from, to)
+}
+
+/// `at::exponential_distribution<double>::operator()`.
+///
+/// `exponential_kernel` (`DistributionTemplates.h:336-343`) is a
+/// `cpu_serial_kernel` that instantiates `exponential_distribution<double>` for
+/// every dtype, exactly as `normal_kernel`'s path B does -- so a `float16`
+/// tensor consumes 64-bit uniforms here too and only rounds at the very end.
+///
+/// The transformation is `TransformationHelper.h:129-145`, and the branch that
+/// matters is the one this build does *not* take: the CUDA arm clamps the log
+/// away from zero, the CPU arm is a plain `-1/lambda * log1p(-val)`. Writing
+/// `log(1 - val)` instead would agree to about fifteen digits and disagree in
+/// the last bits -- enough to move a sampled token when two categories are
+/// close, which is the only place the difference would ever be noticed.
+#[inline]
+fn exponential_sample_f64(gen: &mut CpuGenerator, lambda: f64) -> f64 {
+    let val = uniform_real_f64(gen.random64(), 0.0, 1.0);
+    (-1.0f64 / lambda) * (-val).ln_1p()
+}
+
+/// `exponential_` over a whole tensor, in the order the serial kernel walks it.
+///
+/// This exists for `aten.multinomial.default`, whose fast path is
+/// `empty_like(self).exponential_(1)` followed by an argmax of `self / q`
+/// (docs/SAMPLING.md §2). `aten.exponential_` itself is deliberately not
+/// implemented: nothing measured calls it directly, and advertising an op this
+/// shim has never been asked for is the direction docs/TORCH_C.md §1 refuses.
+pub fn exponential_serial(gen: &mut CpuGenerator, size: usize, lambda: f64) -> Vec<f64> {
+    (0..size)
+        .map(|_| exponential_sample_f64(gen, lambda))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Seeding, as `torch.default_generator` sees it
 // ---------------------------------------------------------------------------
