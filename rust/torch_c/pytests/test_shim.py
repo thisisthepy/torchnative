@@ -1101,6 +1101,42 @@ def _e2e_flatten(x):
     return [x]
 
 
+# A token match is necessary, not sufficient: docs/ARCH.md §5.1 measured a
+# case (Gemma, wrong `gelu` approximation) where greedy decoding produced the
+# *same* tokens at three weight scales while the logits behind them differed
+# by 5.87e-04 -- 379x the 1.55e-06 the correct kernel gave on the same model.
+# A token-only suite would have shipped that bug green. So every model-forward
+# comparison below checks logits too, not just the tokens they produced.
+#
+# `_E2E_LOGIT_ATOL` is the line between "normal float32 rounding" and "wrong
+# math", picked from measurements, not invented:
+#
+#   this file's own aten-level 2-layer decoder ................ up to 5.2e-06
+#     (greedy, 4 steps: ~2.3e-06; do_sample, 6 steps x 12 configs: ~5.2e-06)
+#   torch.nn-assembled 2-layer decoder (docs/NN_SURFACE.md §7) ... rel 5.8e-07
+#   aten-level 2-layer Llama (docs/SAMPLING.md §3) ................ 2.3e-09
+#   GPT-2, 2 layers (docs/GPT2.md) ................................. 4.1e-08
+#   Gemma, 2 layers (docs/ARCH.md §5) .............................. 1.55e-06
+#   BERT, 2 layers (docs/ARCH.md §5): hidden 1.43e-06, pooled ...... 9.39e-07
+#   -------------------------------------------------------------------------
+#   Gemma with the wrong gelu approximation (docs/ARCH.md §5.1) .... 5.87e-04
+#
+# Every normal measurement across five different architectures and two
+# measurement methods (this file's own live comparison, and the aten-level
+# transcriptions docs/ARCH.md and friends built independently) lands at or
+# below 5.2e-06. The one case known to be *wrong* lands at 5.87e-04 -- roughly
+# 113x the worst normal figure. `_E2E_LOGIT_ATOL = 1e-5` sits in that gap: the
+# golden harness's own float32 bound (tools/golden/dtypes.py
+# `TOLERANCES["float32"]`, atol=rtol=1e-5), not a number invented for this
+# file, and close to the geometric mean of the two clusters
+# (sqrt(5.2e-06 * 5.87e-04) ~= 5.5e-05, same order of magnitude). It leaves
+# ~2x margin above the worst normal figure measured in this file and ~59x
+# margin below the one documented wrong-math figure -- see the do_sample test
+# below for a direct check that this bound actually catches an error of that
+# size, and docs/E2E.md for how it was confirmed.
+_E2E_LOGIT_ATOL = 1e-5
+
+
 def test_two_layer_llama_greedy_matches_upstream_token_for_token():
     # Regression-pins the claim measured in docs/NN_SURFACE.md §7 and
     # docs/SAMPLING.md §3's aten-level model: an aten-level 2-layer decoder,
@@ -1126,14 +1162,12 @@ def test_two_layer_llama_greedy_matches_upstream_token_for_token():
         results[kind] = (out, _e2e_flatten(last_logits.tolist()))
     (t_out, t_last), (c_out, c_last) = results["upstream"], results["shim"]
     assert t_out == c_out, (t_out, c_out)
-    # Tolerance is the golden harness's own float32 bound
-    # (tools/golden/dtypes.py `TOLERANCES["float32"]`, atol=rtol=1e-5), not a
-    # number invented for this test. Measured max gap here today: ~2.3e-06 --
-    # float32 rounding from 2 layers x ~12 matmuls each, well inside it. A
-    # wrong kernel misses by far more than an order of magnitude (see
-    # docs/E2E.md for the deliberately-broken run this was checked against).
+    # Measured max gap here today: ~2.3e-06 -- float32 rounding from 2 layers
+    # x ~12 matmuls each, well inside _E2E_LOGIT_ATOL. See the comment above
+    # this test for where the bound comes from and how wide the margin is on
+    # both sides.
     max_diff = max(abs(a - b_) for a, b_ in zip(t_last, c_last))
-    assert max_diff < 1e-5, max_diff
+    assert max_diff < _E2E_LOGIT_ATOL, max_diff
 
 
 _E2E_FILTER = float("-inf")
@@ -1176,19 +1210,36 @@ def _e2e_sample_step(b, logits, seq, temperature, top_k, top_p, seed, vocab):
 
 
 def _e2e_generate(kind, ids, steps, temperature, top_k, top_p, seed, reseed_each_step):
+    """Returns `(tokens, raw_logits)`, where `raw_logits[step]` is the flat
+    last-position logit vector *before* temperature/top-k/top-p (the same
+    quantity docs/ARCH.md §5.1 showed a token-only check cannot tell apart
+    from a wrong kernel). Callers that only need tokens can ignore the second
+    element; `test_do_sample_matches_upstream_across_configs_and_reseed_modes`
+    below uses both."""
     b = _E2EBackend(kind)
     w = _e2e_build(b, _e2e_weights())
     out = list(ids)
+    raw_logits = []
     if not reseed_each_step:
         b.seed(seed)
     for step in range(steps):
         logits = _e2e_forward(b, w, out, len(out))
+        last = b.op("aten.slice.Tensor", logits, 1, len(out) - 1, len(out), 1)
+        raw_logits.append(_e2e_flatten(last.tolist()))
         tok = _e2e_sample_step(
             b, logits, len(out), temperature, top_k, top_p,
             seed + step if reseed_each_step else None, _E2E_VOCAB,
         )
         out.append(int(tok.tolist()[0]))
-    return out
+    return out, raw_logits
+
+
+def _e2e_max_logit_diff(t_logits, c_logits):
+    return max(
+        abs(a - b_)
+        for t_step, c_step in zip(t_logits, c_logits)
+        for a, b_ in zip(t_step, c_step)
+    )
 
 
 def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
@@ -1198,23 +1249,38 @@ def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
     # once and let the stream run across all 6 steps, which is the stronger
     # claim -- it only matches if both sides consume the same *number* of
     # random words per step, not merely the same value from a fresh seed.
+    #
+    # Tokens are necessary but not sufficient (see the comment above
+    # `_E2E_LOGIT_ATOL`), so every configuration below also compares the raw
+    # logits `_e2e_generate` now returns alongside the tokens.
     if _upstream_torch is None:
         return  # no upstream torch in this interpreter -- see docs/E2E.md
     ids, steps = [7, 42, 3, 88], 6
     checked = 0
+    max_diff = 0.0
     for temperature, top_k, top_p in ((1.0, 50, 0.95), (0.7, 20, 0.9), (1.3, 100, 1.0)):
         for seed in (0, 1, 1234):
-            t_out = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, True)
-            c_out = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, True)
+            t_out, t_logits = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, True)
+            c_out, c_logits = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, True)
             assert t_out == c_out, ("reseed", temperature, top_k, top_p, seed, t_out, c_out)
+            diff = _e2e_max_logit_diff(t_logits, c_logits)
+            assert diff < _E2E_LOGIT_ATOL, ("reseed", temperature, top_k, top_p, seed, diff)
+            max_diff = max(max_diff, diff)
             checked += steps
     for temperature, top_k, top_p in ((1.0, 50, 0.95), (0.7, 20, 0.9)):
         for seed in (0, 1, 1234):
-            t_out = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, False)
-            c_out = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, False)
+            t_out, t_logits = _e2e_generate("upstream", ids, steps, temperature, top_k, top_p, seed, False)
+            c_out, c_logits = _e2e_generate("shim", ids, steps, temperature, top_k, top_p, seed, False)
             assert t_out == c_out, ("running", temperature, top_k, top_p, seed, t_out, c_out)
+            diff = _e2e_max_logit_diff(t_logits, c_logits)
+            assert diff < _E2E_LOGIT_ATOL, ("running", temperature, top_k, top_p, seed, diff)
+            max_diff = max(max_diff, diff)
             checked += steps
     assert checked == 90, checked
+    # Measured max gap across all 15 configurations today: ~5.2e-06, inside
+    # _E2E_LOGIT_ATOL with room to spare -- see the comment above that
+    # constant for the full range and where the bound comes from.
+    assert max_diff < _E2E_LOGIT_ATOL, max_diff
 
 
 def test_multinomial_matches_upstream_through_a_second_draw():
