@@ -142,6 +142,50 @@ def submodule_stubs(c_dir: str) -> dict[str, str]:
     return out
 
 
+def _submodule_entry(parsed: dict, nested: dict[str, dict] | None = None) -> dict:
+    entry = {
+        "functions": parsed["functions"],
+        "types": {
+            k: {"methods": v["methods"], "attrs": v["attrs"], "bases": v["bases"]}
+            for k, v in parsed["types"].items()
+        },
+        "values": sorted(parsed["values"]),
+    }
+    # Only stamped on when there is something to nest, so directory stubs
+    # with no sibling `.pyi` files (`_acc/`, today) stay byte-identical to
+    # the pre-recursion output -- the point is to add names, not to touch
+    # entries that were already complete.
+    if nested:
+        entry["submodules"] = nested
+    return entry
+
+
+def parse_package_stub(dir_path: str) -> dict:
+    """Recursively parse a directory-shaped `.pyi` package.
+
+    `submodule_stubs()` registers a directory stub (`_dynamo/`, `_export/`)
+    by its `__init__.pyi` alone, which is what made `_dynamo.guards` and
+    `_dynamo.eval_frame` invisible to the surface even though the vendored
+    tree declares them in full (docs/DYNAMO.md §5: 8 of 137 names known,
+    6%). This walks the rest of the directory -- sibling `.pyi` files and,
+    in case a package ever nests a package, sibling subdirectories with
+    their own `__init__.pyi` -- and files each one under `submodules`,
+    keyed by its own name. `_dynamo.guards.<name>` is then reachable as
+    `surface["submodules"]["_dynamo"]["submodules"]["guards"]`.
+    """
+    parsed = parse_stub(os.path.join(dir_path, "__init__.pyi"))
+    nested: dict[str, dict] = {}
+    for entry in sorted(os.listdir(dir_path)):
+        if entry == "__init__.pyi":
+            continue
+        full = os.path.join(dir_path, entry)
+        if entry.endswith(".pyi"):
+            nested[entry[: -len(".pyi")]] = _submodule_entry(parse_stub(full))
+        elif os.path.isdir(full) and os.path.isfile(os.path.join(full, "__init__.pyi")):
+            nested[entry] = parse_package_stub(full)
+    return _submodule_entry(parsed, nested)
+
+
 # `torch._C.<name>` / `_C.<name>` attribute reads, and `from torch._C import
 # <name>`. Both spellings occur; `torch/nn/functional.py:12` uses the second.
 _ATTR_RE = re.compile(r"(?:torch\._C|(?<![\w.])_C)\.([A-Za-z_]\w*)")
@@ -238,19 +282,16 @@ def build(vendor_dir: str) -> dict:
     for name, path in submodule_stubs(c_dir).items():
         if name == "_VariableFunctions":
             continue
-        parsed = parse_stub(path)
-        submodules[name] = {
-            "functions": parsed["functions"],
-            # `bases` is carried, not dropped: `torch._C._functorch`'s
-            # `TransformType` is an `Enum`, and `torch/_ops.py:139` asserts on
-            # `isinstance`, so losing the base turns its members into
-            # properties and the assertion fires with `got <class 'property'>`.
-            "types": {
-                k: {"methods": v["methods"], "attrs": v["attrs"], "bases": v["bases"]}
-                for k, v in parsed["types"].items()
-            },
-            "values": sorted(parsed["values"]),
-        }
+        # `bases` is carried, not dropped: `torch._C._functorch`'s
+        # `TransformType` is an `Enum`, and `torch/_ops.py:139` asserts on
+        # `isinstance`, so losing the base turns its members into
+        # properties and the assertion fires with `got <class 'property'>`.
+        # (See `_submodule_entry` for where `bases` actually gets kept.)
+        entry_dir = os.path.join(c_dir, name)
+        if os.path.isdir(entry_dir):
+            submodules[name] = parse_package_stub(entry_dir)
+        else:
+            submodules[name] = _submodule_entry(parse_stub(path))
 
     tensorbase = main["types"].pop("TensorBase", {"methods": [], "attrs": []})
     known = set(tensorbase["methods"]) | set(tensorbase["attrs"])
