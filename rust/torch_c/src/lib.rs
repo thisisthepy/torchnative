@@ -454,8 +454,46 @@ fn run_bootstrap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// How much arithmetic a matmul must contain before `gemm` is allowed to spread
+/// it over threads. `gemm`'s own default is `48 * 48 * 256 = 589_824`, and on
+/// both machines this repository can measure, that number is too low: it hands
+/// a job that takes tens of microseconds on one core to four or eight cores and
+/// pays more in wakeups than it saves.
+///
+/// `docs/PERF_ANDROID.md` §4 has the sweep. On the host (M1, 8 cores, idle) a
+/// 96x96x96 matmul is 0.0247 ms on one thread and 0.042-0.049 ms threaded --
+/// threading loses 1.7-2.0x -- while 192x192x192 and up win 2-3.4x. The
+/// crossover sits at 2-4 M multiply-adds. On the Android device the crossover
+/// is much higher still (128x128x128 is 0.051 ms single, 0.35 ms threaded, a
+/// 6.9x loss), so a value chosen from the host is the conservative one.
+///
+/// This cannot change any result. `gemm` parallelises by splitting the *output
+/// columns* between threads; the `k` accumulation loop is outside that split
+/// and runs identically either way, so every output element is the same
+/// sequence of operations. That is checked rather than assumed -- §5 of the
+/// same document hashes `mm` output over n = 96..512 at three thresholds
+/// (fully parallel, this value, fully serial) and gets one digest. The golden
+/// suite cannot check it: every shape in it is below even gemm's own default,
+/// so it is single-threaded on both sides of the change.
+const GEMM_THREADING_THRESHOLD: usize = 4_000_000;
+
+/// `candle` hands every matmul to `gemm` with `Parallelism::Rayon(n)` and lets
+/// `gemm` decide whether to use the threads. That decision is a process-global
+/// `AtomicUsize` with a public setter, so this is the whole of the fix.
+///
+/// `BW_GEMM_THREADING_THRESHOLD` overrides it so the measurement in
+/// `docs/PERF_ANDROID.md` can be re-run without a rebuild.
+fn apply_gemm_threading_threshold() {
+    let value = std::env::var("BW_GEMM_THREADING_THRESHOLD")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(GEMM_THREADING_THRESHOLD);
+    gemm::set_threading_threshold(value);
+}
+
 #[pymodule]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    apply_gemm_threading_threshold();
     dtype::register(m)?;
     device::register(m)?;
     info::register(m)?;
