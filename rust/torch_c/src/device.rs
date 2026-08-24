@@ -6,11 +6,115 @@
 //! carries a live handle, so it cannot represent a device this build has no
 //! backend for. Storing the label and resolving it on use keeps torch's
 //! semantics and makes the failure land where torch puts it.
+//!
+//! docs/DEVICE_ABS.md §3 is where that decision was re-examined once there was
+//! something to measure it against. Two things came out of it and live here:
+//!
+//! *The label is validated.* A label that accepts any string is not a label,
+//! it is a free-form note -- `torch.device("cuad")` used to construct fine and
+//! then fail at `resolve()` with a message naming a device type nobody asked
+//! for. Upstream rejects at construction against a closed list of device
+//! types, and that list is the vocabulary `torch.distributed`'s backend
+//! registration keys off, so it has to be the same list.
+//!
+//! *The label is the authority on the index; candle is not.* `from_candle`
+//! below reconstructs a label from a live handle, and that direction is lossy:
+//! candle's `Cuda`/`Metal` variants do not surface an ordinal through the API
+//! this crate builds against, so the reconstruction hardcodes 0. That is sound
+//! only while every device kind this build can produce has exactly one device.
+//! It is true today (CPU only) and it stops being true the moment a second
+//! accelerator of the same kind is addressable -- at which point `PyTensorBase`
+//! has to carry the label the way it already carries `tag` for dtype. See
+//! docs/DEVICE_ABS.md §3.2.
 use candle_core::Device;
 use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use pyo3::types::{PyDict, PyModule, PyTuple};
+use pyo3::IntoPyObjectExt;
 
 use crate::err::not_implemented;
+
+/// The closed vocabulary of device types, in upstream's own order.
+///
+/// Transcribed from the `RuntimeError` torch 2.13.0 raises for an unknown
+/// device string, character for character, so that the message this shim
+/// produces for the same mistake is the message the user would have got:
+///
+/// ```text
+/// >>> torch.device("nosuchdevice")
+/// RuntimeError: Expected one of cpu, cuda, ipu, xpu, mkldnn, opengl, opencl,
+/// ideep, hip, ve, fpga, maia, xla, lazy, vulkan, mps, meta, hpu, mtia,
+/// privateuseone device type at start of device string: nosuchdevice
+/// ```
+///
+/// Note what is *not* in it: there is no `npu` spelling at all (DESIGN.md
+/// §11.1's accelerator table). `vulkan` is already a torch device type, so a
+/// future Vulkan backend needs no new spelling here; an NPU would have to
+/// arrive as `privateuseone`, which is the slot upstream reserves for exactly
+/// that.
+pub const DEVICE_TYPES: [&str; 20] = [
+    "cpu",
+    "cuda",
+    "ipu",
+    "xpu",
+    "mkldnn",
+    "opengl",
+    "opencl",
+    "ideep",
+    "hip",
+    "ve",
+    "fpga",
+    "maia",
+    "xla",
+    "lazy",
+    "vulkan",
+    "mps",
+    "meta",
+    "hpu",
+    "mtia",
+    "privateuseone",
+];
+
+fn runtime_err(message: String) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(message)
+}
+
+/// Split `"cuda:1"` into `("cuda", Some(1))`, rejecting what upstream rejects.
+///
+/// Every branch here is a measured upstream refusal, not a guess:
+///
+/// | input | torch 2.13.0 |
+/// |---|---|
+/// | `""` | `RuntimeError: Device string must not be empty` |
+/// | `" cpu"` | `RuntimeError: Invalid device string: ' cpu'` |
+/// | `"CPU"` | `RuntimeError: Expected one of cpu, ... device type ...` |
+/// | `"cuda:-1"` | `RuntimeError: Device index must not be negative` |
+fn parse_device_string(text: &str) -> PyResult<(String, Option<i64>)> {
+    if text.is_empty() {
+        return Err(runtime_err("Device string must not be empty".to_string()));
+    }
+    let (kind, index) = match text.split_once(':') {
+        Some((kind, digits)) => {
+            // Upstream's parser wants digits -- `"cuda:+1"` and `"cuda:1 "` are
+            // `Invalid device string`, not a negative-index error, because the
+            // negative check happens after a successful parse.
+            let parsed: i64 = digits
+                .parse()
+                .map_err(|_| runtime_err(format!("Invalid device string: '{text}'")))?;
+            (kind, Some(parsed))
+        }
+        None => (text, None),
+    };
+    if !DEVICE_TYPES.contains(&kind) {
+        return Err(runtime_err(format!(
+            "Expected one of {} device type at start of device string: {text}",
+            DEVICE_TYPES.join(", ")
+        )));
+    }
+    if index.is_some_and(|i| i < 0) {
+        return Err(runtime_err("Device index must not be negative".to_string()));
+    }
+    Ok((kind.to_string(), index))
+}
 
 #[pyclass(name = "device", module = "torch._C", frozen, from_py_object)]
 #[derive(Clone)]
@@ -29,10 +133,79 @@ impl PyDevice {
         }
     }
 
+    /// Build from a validated type/index pair. The only constructor Rust code
+    /// should use, so that no path can create a label the Python constructor
+    /// would have refused.
+    pub fn checked(kind: &str, index: Option<i64>) -> PyResult<Self> {
+        let (kind, parsed) = parse_device_string(kind)?;
+        if parsed.is_some() && index.is_some() {
+            return Err(runtime_err(format!(
+                "type (string) must not include an index because index was passed \
+                 explicitly: {kind}"
+            )));
+        }
+        let index = index.or(parsed);
+        if index.is_some_and(|i| i < 0) {
+            return Err(runtime_err("Device index must not be negative".to_string()));
+        }
+        Ok(Self { kind, index })
+    }
+
+    /// `torch.device(x)` for any `x` torch accepts there: a string, another
+    /// `device`, or an integer index.
+    ///
+    /// Taking `Bound<PyAny>` rather than `&str` is the point. `torch.device`
+    /// is idempotent upstream -- `torch.device(torch.device("cpu"))` is a
+    /// no-op copy -- and the vendored tree relies on that: `Module.to`'s
+    /// argument, `_parse_to`'s device slot and every `device=` keyword are
+    /// normalised by calling `torch.device` on whatever arrived. Refusing a
+    /// `device` there (as this used to, with `'device' object is not an
+    /// instance of 'str'`) breaks the normalisation everything else assumes.
+    pub fn coerce(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(device) = value.extract::<PyDevice>() {
+            return Ok(device);
+        }
+        if let Ok(text) = value.extract::<String>() {
+            let (kind, index) = parse_device_string(&text)?;
+            return Ok(Self { kind, index });
+        }
+        // `bool` is a subclass of `int` in Python and upstream rejects
+        // `torch.device(True)` at the parser, so it is filtered before the
+        // integer branch rather than caught by it.
+        if value.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "device() received an invalid combination of arguments - got (bool)",
+            ));
+        }
+        if let Ok(index) = value.extract::<i64>() {
+            // Upstream reads a bare integer as "index `n` of the current
+            // accelerator" -- measured on this host, `torch.device(0)` is
+            // `device(type='mps', index=0)`, i.e. it goes through
+            // `torch.accelerator.current_accelerator()`. This build has no
+            // accelerator (see `_get_accelerator` in bootstrap.py), so there is
+            // no device type to attach the index to, and saying that is more
+            // use than the `'int' object is not an instance of 'str'` this
+            // used to raise.
+            return Err(runtime_err(format!(
+                "torch._C shim: torch.device({index}) means index {index} of the current \
+                 accelerator, and this build has none -- name the device type instead, \
+                 e.g. torch.device(\"cpu\", {index})"
+            )));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "device() received an invalid combination of arguments - got ({})",
+            value.get_type().name()?,
+        )))
+    }
+
     /// The backend this label resolves to. Only CPU exists today; Metal and
     /// CUDA are feature-gated off in `Cargo.toml` on purpose (device builds
     /// must not link them), so asking for one is a loud failure, not a silent
     /// fallback to CPU.
+    ///
+    /// The index is deliberately *not* checked against a device count: there is
+    /// exactly one CPU, and `cpu:3` resolves to it the way upstream's does
+    /// (measured: `torch.zeros(2, device="cpu:3").device` is `device(type='cpu')`).
     pub fn resolve(&self) -> PyResult<Device> {
         match self.kind.as_str() {
             "cpu" => Ok(Device::Cpu),
@@ -42,6 +215,17 @@ impl PyDevice {
         }
     }
 
+    /// A label for a live candle handle.
+    ///
+    /// **This direction is lossy and the loss is load-bearing.** candle's
+    /// `Cuda`/`Metal` variants carry an ordinal that this crate cannot read
+    /// (both features are off, so the inner types are opaque here), so the
+    /// index is hardcoded to 0. Sound while each kind has at most one device;
+    /// wrong the moment it does not. Nothing in this build can reach those two
+    /// arms -- `resolve()` refuses every non-CPU label before a handle could be
+    /// made -- so the hardcoding is unreachable rather than merely untested,
+    /// and it is left visible instead of `unreachable!()` so that turning a
+    /// feature on fails a review rather than silently mislabelling a tensor.
     pub fn from_candle(device: &Device) -> Self {
         match device {
             Device::Cpu => Self::cpu(),
@@ -55,34 +239,108 @@ impl PyDevice {
             },
         }
     }
+
+    /// Do two labels name the same physical device?
+    ///
+    /// Not `==`. `torch.device("cpu")` and `torch.device("cpu:0")` are
+    /// *unequal* upstream (measured: `False`, and their hashes differ too), but
+    /// a tensor made with either reports plain `cpu` and the two interoperate
+    /// freely. Equality is a property of the label; this is a property of what
+    /// the label points at, and the mixed-device check in `aten.rs` wants the
+    /// second one.
+    pub fn same_physical_device(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && match (self.index, other.index) {
+                (Some(a), Some(b)) => a == b,
+                // An index-less label means "the current device of this kind",
+                // and with one device per kind that is device 0.
+                _ => true,
+            }
+    }
 }
 
 #[pymethods]
 impl PyDevice {
-    /// `torch.device("cpu")` / `torch.device("cuda", 0)`.
+    /// `torch.device("cpu")`, `torch.device("cuda", 0)`, `torch.device(other)`.
+    ///
+    /// Hand-parsed rather than declared with `#[pyo3(signature = ...)]`
+    /// because the first parameter has two names upstream and PyO3 gives a
+    /// parameter one. Both are reachable in the wild and both were measured:
+    /// `torch.device(type="cuda", index=1)` and `torch.device(device="cuda:1")`
+    /// each produce `device(type='cuda', index=1)` on torch 2.13.0.
     #[new]
-    #[pyo3(signature = (device, index = None))]
-    pub fn new(device: &str, index: Option<i64>) -> PyResult<Self> {
-        let (kind, parsed_index) = match device.split_once(':') {
-            Some((kind, idx)) => {
-                let idx: i64 = idx.parse().map_err(|_| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Invalid device string: '{device}'"
-                    ))
-                })?;
-                (kind.to_string(), Some(idx))
-            }
-            None => (device.to_string(), None),
-        };
-        if index.is_some() && parsed_index.is_some() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "type (string) must not include an index because index was passed explicitly",
-            ));
+    #[pyo3(signature = (*args, **kwargs))]
+    pub fn new(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        let mut first: Option<Bound<'_, PyAny>> = None;
+        let mut index: Option<i64> = None;
+
+        if args.len() > 2 {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "device() takes from 0 to 2 positional arguments but {} were given",
+                args.len()
+            )));
         }
-        Ok(Self {
-            kind,
-            index: index.or(parsed_index),
-        })
+        if !args.is_empty() {
+            first = Some(args.get_item(0)?);
+        }
+        if args.len() == 2 {
+            index = Some(args.get_item(1)?.extract()?);
+        }
+        if let Some(kwargs) = kwargs {
+            for (key, value) in kwargs.iter() {
+                let key: String = key.extract()?;
+                match key.as_str() {
+                    "type" | "device" => {
+                        if first.is_some() {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                                "device() got multiple values for argument '{key}'"
+                            )));
+                        }
+                        first = Some(value);
+                    }
+                    "index" => {
+                        if index.is_some() {
+                            return Err(pyo3::exceptions::PyTypeError::new_err(
+                                "device() got multiple values for argument 'index'",
+                            ));
+                        }
+                        index = Some(value.extract()?);
+                    }
+                    other => {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                            "device() got an unexpected keyword argument '{other}'"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let Some(first) = first else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "device() missing required argument 'type' (pos 1)",
+            ));
+        };
+
+        let base = PyDevice::coerce(&first)?;
+        match index {
+            None => Ok(base),
+            Some(index) => {
+                if let Some(already) = base.index {
+                    return Err(runtime_err(format!(
+                        "type (string) must not include an index because index was passed \
+                         explicitly: {}:{already}",
+                        base.kind,
+                    )));
+                }
+                if index < 0 {
+                    return Err(runtime_err("Device index must not be negative".to_string()));
+                }
+                Ok(Self {
+                    kind: base.kind,
+                    index: Some(index),
+                })
+            }
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -114,9 +372,49 @@ impl PyDevice {
         hash.wrapping_mul(31)
             .wrapping_add(self.index.unwrap_or(-1) as u64)
     }
+
+    /// Makes a device picklable, which `torch.save`/`torch.load` and every
+    /// `copy.deepcopy` of a config object need.
+    ///
+    /// Upstream's shape, measured: `torch.device('cuda', 1).__reduce__()` is
+    /// `(<class 'torch.device'>, ('cuda', 1))` and the index-less form drops
+    /// the second element rather than passing `None` -- which matters, because
+    /// `torch.device('cpu', None)` is not the same call as `torch.device('cpu')`
+    /// once `index` is parsed positionally.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
+        let py = slf.py();
+        let this = slf.get();
+        let kind = this.kind.clone().into_py_any(py)?;
+        let args = match this.index {
+            Some(index) => PyTuple::new(py, [kind, index.into_py_any(py)?])?,
+            None => PyTuple::new(py, [kind])?,
+        };
+        PyTuple::new(py, [slf.get_type().into_py_any(py)?, args.into_py_any(py)?])
+    }
+}
+
+/// The rule `check_devices_agree` applies, exposed so it can be tested.
+///
+/// It is `_shim_`-prefixed for the reason `_shim_overloads` and `_shim_target`
+/// are: upstream has no such name, and shim-only introspection should be
+/// impossible to mistake for surface.
+///
+/// The reason it exists at all is that the rule is otherwise unreachable. The
+/// mixed-device gate in `aten.rs` cannot fire while `resolve()` refuses every
+/// non-CPU label, and this crate has **no runnable Rust unit tests** -- it is
+/// `crate-type = ["cdylib"]` with pyo3's `extension-module`, so `cargo test`
+/// builds a harness that aborts on the first `_Py*` symbol
+/// (`dyld: symbol not found in flat namespace '_PyExc_BaseException'`, which is
+/// how it behaved before this file had a `#[cfg(test)]` block too). A
+/// `#[test]` here would have looked like coverage and run nowhere.
+#[pyfunction]
+#[pyo3(name = "_shim_same_device")]
+fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
+    left.same_physical_device(&right)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
+    m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     Ok(())
 }

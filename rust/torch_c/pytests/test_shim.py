@@ -49,6 +49,273 @@ def test_device_is_a_label_not_a_backend():
     assert _C.device("cuda") != _C.device("cpu")
 
 
+# --- the device layer (docs/DEVICE_ABS.md) ----------------------------------
+
+
+def test_device_label_is_validated_against_a_closed_vocabulary():
+    """A label that accepts anything is not a label.
+
+    Each refusal below is upstream's, measured on torch 2.13.0 and reproduced
+    with the same exception type; before this the shim accepted all of them and
+    only failed later, at `resolve()`, naming a device type nobody had asked
+    for. The list matters beyond typos: it is the vocabulary
+    `torch.distributed`'s backend registration keys off (DESIGN.md §11.1), so
+    it has to be upstream's exact list rather than a superset.
+    """
+    for bad in ("nosuchdevice", "CPU", " cpu", "", "cuda:-1", "cuda:x"):
+        try:
+            _C.device(bad)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"torch.device({bad!r}) must be refused")
+
+    # ... and every accepted one really is accepted, including the two a future
+    # accelerator would have to arrive as.
+    for good in ("cpu", "cuda", "mps", "meta", "vulkan", "xpu", "privateuseone"):
+        assert _C.device(good).type == good
+
+
+def test_device_accepts_every_spelling_torch_normalises_through():
+    # `torch.device(x)` is idempotent upstream and the vendored tree relies on
+    # it: `_parse_to`, `Module.to` and every `device=` keyword normalise by
+    # calling it on whatever arrived. Refusing a `device` there breaks the
+    # normalisation everything else assumes.
+    assert _C.device(_C.device("cuda:1")) == _C.device("cuda", 1)
+    assert _C.device(type="cuda", index=1) == _C.device("cuda:1")
+    assert _C.device(device="cuda:1") == _C.device("cuda:1")
+
+    # An index cannot arrive twice, and a bare integer has no device type to
+    # attach to on a build with no accelerator (upstream reads it as an index
+    # of `torch.accelerator.current_accelerator()`).
+    for call in (lambda: _C.device("cuda:0", 1),
+                 lambda: _C.device("cuda", -1),
+                 lambda: _C.device(0)):
+        try:
+            call()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("must be refused")
+
+
+def test_device_is_picklable():
+    # `torch.save`/`torch.load` and every `copy.deepcopy` of a config carry
+    # devices through pickle. Upstream's shape, measured:
+    # `torch.device('cuda', 1).__reduce__()` is `(torch.device, ('cuda', 1))`,
+    # and the index-less form drops the second element rather than passing
+    # `None` -- which matters, because `device('cpu', None)` is not the same
+    # call as `device('cpu')` once `index` is parsed positionally.
+    #
+    # The `__reduce__` *shape* is what is checked here rather than a
+    # `pickle.dumps` round trip, and the reason is a property of this harness,
+    # not of the code: this file imports the artefact as the top-level module
+    # `_C`, so `torch._C` is not in `sys.modules` and pickle cannot resolve the
+    # class by name ("it's not the same object as torch._C.device"). The round
+    # trip is exercised where the name does resolve -- in the vendored-tree
+    # subprocess, `test_device_road_through_the_vendored_tree`.
+    for spelling, expected in (("cpu", ("cpu",)),
+                               ("cpu:0", ("cpu", 0)),
+                               ("cuda:1", ("cuda", 1)),
+                               ("meta", ("meta",))):
+        factory, args = _C.device(spelling).__reduce__()
+        assert factory is _C.device, spelling
+        assert args == expected, (spelling, args)
+        assert factory(*args) == _C.device(spelling), spelling
+
+
+def test_indexed_and_bare_labels_are_unequal_but_name_one_device():
+    # Two different relations, and the shim needs both. `cpu` != `cpu:0`
+    # upstream (measured, hashes differ too), yet a tensor made with either
+    # reports plain `cpu` and the two interoperate. Equality is a property of
+    # the label; the mixed-device check needs the other one.
+    assert _C.device("cpu") != _C.device("cpu:0")
+    assert hash(_C.device("cpu")) != hash(_C.device("cpu:0"))
+    made = _C._aten_dispatch("aten.full.default", [2], 1.0, device="cpu:0")
+    assert made.device == _C.device("cpu")
+
+
+def test_tensor_reports_its_device_through_every_spelling():
+    t = _C._aten_dispatch("aten.full.default", [2, 3], 1.5)
+    assert t.device == _C.device("cpu")
+    assert t.is_cpu
+    assert not t.is_cuda
+    assert not t.is_meta
+    # `-1` is not an error code: it is how torch spells "this device kind is
+    # not indexed" (measured: `torch.zeros(2).get_device()` is `-1`).
+    assert t.get_device() == -1
+    assert t.cpu() is t
+    assert t.is_floating_point()
+    assert not t.is_complex()
+
+
+def test_to_copy_with_no_device_keeps_the_tensor_where_it_is():
+    """`device=None` means "stay", not "go to the CPU".
+
+    Unobservable while there is one device -- which is why it survived to be
+    found by reading rather than by a failing test -- and wrong the day there
+    are two. Pinned here as the *contract*; the only observable it has today is
+    that a dtype-only `_to_copy` does not lose the device on the way through.
+    """
+    t = _C._aten_dispatch("aten.full.default", [3], 2.0)
+    cast = _C._aten_dispatch("aten._to_copy.default", t, _C.float64)
+    assert cast.dtype == _C.float64
+    assert cast.device == t.device
+
+
+def test_unavailable_device_fails_where_torch_fails_it():
+    # The label constructs; only using it raises. That is the whole point of
+    # storing a label instead of a live handle.
+    cuda = _C.device("cuda")
+    assert cuda.type == "cuda"
+    try:
+        _C._aten_dispatch("aten.full.default", [2], 1.0, device=cuda)
+    except NotImplementedError as e:
+        assert "cuda" in str(e)
+    else:
+        raise AssertionError("an unavailable device must raise at use")
+
+
+def test_data_setter_replaces_the_tensor_behind_a_parameter():
+    # `nn.Module._apply` ends every `.to()`/`.cpu()`/`.float()` with
+    # `param.data = param_applied`. Without a setter that assignment is an
+    # AttributeError, which is where the whole module-side device road died.
+    t = _C._aten_dispatch("aten.full.default", [2], 1.0)
+    t.requires_grad = True
+    replacement = _C._aten_dispatch("aten.full.default", [3], 7.0, dtype=_C.float64)
+    t.data = replacement
+    assert t.shape == (3,)
+    assert t.dtype == _C.float64
+    assert t.tolist() == [7.0, 7.0, 7.0]
+    # Upstream's `.data =` does not touch `requires_grad`, and `_apply` relies
+    # on that to keep a Parameter a parameter.
+    assert t.requires_grad
+    try:
+        t.data = 5
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Tensor.data must only accept a TensorBase")
+
+
+def test_parse_to_matches_the_real_parser_not_the_dynamo_polyfill():
+    """`torch._C._nn._parse_to` -- the single entrance for `nn.Module.to`.
+
+    Every shape below was measured against torch 2.13.0's own parser. Three of
+    them are places where the vendored tree's own reimplementation
+    (`torch/_dynamo/polyfills/torch_c_nn.py`) and the real binding disagree:
+    the polyfill takes one positional where the real one takes three, accepts
+    `memory_format` positionally where the real one is keyword-only, and says
+    nothing about `copy`, which the real one rejects outright.
+    """
+    parse = _C._nn._parse_to
+    assert parse() == (None, None, False, None)
+    assert parse(None) == (None, None, False, None)
+    assert parse("cpu") == (_C.device("cpu"), None, False, None)
+    assert parse(_C.device("cpu")) == (_C.device("cpu"), None, False, None)
+    assert parse(_C.float16) == (None, _C.float16, False, None)
+    assert parse("cpu", _C.float16) == (_C.device("cpu"), _C.float16, False, None)
+    assert parse("cpu", _C.float16, True) == (_C.device("cpu"), _C.float16, True, None)
+    assert parse(dtype=_C.float16) == (None, _C.float16, False, None)
+    assert parse(device="cpu", dtype=None, non_blocking=False, memory_format=None) == (
+        _C.device("cpu"), None, False, None,
+    )
+    # `to(other)` takes both the device and the dtype from the tensor.
+    other = _C._aten_dispatch("aten.full.default", [1], 1.0, dtype=_C.float64)
+    assert parse(other) == (_C.device("cpu"), _C.float64, False, None)
+    # Measured: `RuntimeError: .to() does not accept copy argument`, whether it
+    # arrives as the second boolean positional or by name.
+    for call in (lambda: parse("cpu", _C.float32, False, True),
+                 lambda: parse(_C.float32, False, True),
+                 lambda: parse("cpu", copy=True)):
+        try:
+            call()
+        except RuntimeError as e:
+            assert "copy" in str(e)
+        else:
+            raise AssertionError("_parse_to must refuse a copy argument")
+
+
+def test_shallow_copy_compatibility_answers_for_dense_tensors_only():
+    # `Module._apply` decides in-place-vs-replace with this. Upstream answers
+    # `True` for two dense tensors of different dtype, of different device, and
+    # for a Parameter against a Tensor (all measured); the only `False` is for
+    # a subclass with its own impl, which this shim cannot produce -- so
+    # anything that is not a TensorBase is refused rather than guessed.
+    ask = _C._VariableFunctions._has_compatible_shallow_copy_type
+    a = _C._aten_dispatch("aten.full.default", [2], 1.0)
+    b = _C._aten_dispatch("aten.full.default", [3], 1.0, dtype=_C.float64)
+    assert ask(a, b)
+    try:
+        ask(a, 5)
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("a non-tensor must be refused, not guessed")
+
+
+def test_the_two_accelerator_questions_get_two_different_answers():
+    """They are read by two callers with opposite `None` handling.
+
+    `torch.get_device_module()` does `torch._C._get_accelerator().type` with no
+    guard (`torch/__init__.py:2978`), and its own docstring says the
+    no-accelerator answer is the CPU device. `torch.accelerator.
+    current_accelerator()` does `if (acc := torch._C._accelerator_getAccelerator())
+    is not None` (`torch/accelerator/__init__.py:128`) and returns `None` when
+    it fires. Answering both the same way breaks one of them.
+    """
+    assert _C._get_accelerator() == _C.device("cpu")
+    assert _C._accelerator_getAccelerator() is None
+    # Upstream returns the *string* 'cpu' here, not a device.
+    assert _C._get_default_device() == "cpu"
+    assert _C._mps_is_available() is False
+
+
+def test_mixed_device_gate_lets_agreeing_tensors_through():
+    """Two halves, and only one of them is reachable in this build.
+
+    `_aten_dispatch` refuses an op whose tensor arguments disagree about their
+    device (`check_devices_agree` in aten.rs). The refusing half **cannot fire
+    here** -- `PyDevice::resolve` accepts no label but `cpu`, so every tensor is
+    on the CPU and the scan always finds one device. What is reachable is the
+    traversal: agreeing tensors must still dispatch, through a plain argument
+    and through the `Tensor[]` a top-level-only scan would miss.
+
+    `_shim_same_device` is the *label*-level version of the comparison -- what a
+    device-carrying tensor would need (docs/DEVICE_ABS.md §3.2). It has no other
+    caller today, because the gate reads candle's handles directly: building a
+    label per argument cost a measured 78 ns per dispatch. It is pinned here
+    because it is deliberately *not* `==`; `cpu` and `cpu:0` are unequal labels
+    that name one device.
+    """
+    same = _C._shim_same_device
+    d = _C.device
+    assert same(d("cpu"), d("cpu:0"))
+    assert same(d("cpu:0"), d("cpu"))
+    assert same(d("cpu"), d("cuda:1")) is False
+    assert same(d("cuda:0"), d("cuda:1")) is False
+    assert same(d("cuda"), d("cuda:1"))
+    assert same(d("cuda:0"), d("cuda:0"))
+    assert same(d("mps"), d("meta")) is False
+
+    # The positive half of the gate does run on every dispatch: an op whose
+    # tensors agree must still go through, including through the `Tensor[]`
+    # argument that `cat` takes (the traversal a top-level-only scan misses).
+    a = _C._aten_dispatch("aten.full.default", [2], 1.0)
+    b = _C._aten_dispatch("aten.full.default", [2], 2.0)
+    assert _C._aten_dispatch("aten.add.Tensor", a, b).tolist() == [3.0, 3.0]
+    assert _C._aten_dispatch("aten.cat.default", [a, b]).tolist() == [1.0, 1.0, 2.0, 2.0]
+
+
+def test_generator_reports_a_device():
+    # Every Generator this build can make is a CPU generator, because
+    # `PyDevice::resolve` refuses every other label -- so there is no second
+    # value for a per-instance attribute to hold. This stops being true the day
+    # a second backend lands.
+    assert _C.default_generator.device == _C.device("cpu")
+    assert _C.Generator().device == _C.device("cpu")
+
+
 def test_tensor_exposes_shape_dtype_device():
     t = _C._aten_dispatch("aten.full.default", [2, 3], 1.5)
     assert isinstance(t, _C.TensorBase)
@@ -1730,6 +1997,190 @@ def test_ckpt_fourteen_hard_dtypes_and_views_round_trip_bit_exact():
     # Weight tying is preserved in value (not identity -- docs/CKPT.md §5's
     # one recorded gap, which this does not re-litigate).
     assert r["tied_equal"]
+
+
+# ---------------------------------------------------------------------------
+# The device road, end to end through the vendored tree (docs/DEVICE_ABS.md §5)
+# ---------------------------------------------------------------------------
+#
+# Everything above tests `_C` in isolation, which is where the pieces live but
+# not where they are used. `nn.Module.to("cpu")` is four of them in a row --
+# `_parse_to`, `Tensor.to`, `_has_compatible_shallow_copy_type`, `Tensor.data =`
+# -- and it was dead on each of them in turn, one wall at a time. Only the
+# vendored tree can prove the chain, so this runs in a subprocess with the
+# shim-backed `torch` on PYTHONPATH, the same way the checkpoint tests do.
+
+_DEVICE_ROAD_SCRIPT = r"""
+import json, pickle, sys
+import torch
+import torch.nn as nn
+
+out = {}
+# Two Linears and no activation on purpose: `nn.ReLU`'s forward goes through
+# `torch.relu`, which has no overload-table entry, and this test is about the
+# device road rather than about that hole. `nn.Linear` forward is the one
+# docs/DEVICE.md measured as bit-identical to upstream.
+m = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 2))
+before = [id(p) for p in m.parameters()]
+
+out["to_str_returns_self"] = m.to("cpu") is m
+out["to_device_returns_self"] = m.to(torch.device("cpu")) is m
+out["cpu_returns_self"] = m.cpu() is m
+out["to_dtype_returns_self"] = m.to(torch.float32) is m
+out["to_device_and_dtype"] = m.to("cpu", torch.float32) is m
+out["float_returns_self"] = m.float() is m
+# `_apply` on the set-data path keeps parameter object identity, which is what
+# upstream's `param.data = ...` branch is for. Replacing them instead would
+# silently break anything holding a reference (an optimizer, a weight tie).
+out["param_identity_preserved"] = [id(p) for p in m.parameters()] == before
+out["param_device"] = str(next(m.parameters()).device)
+
+# A real cast has to actually cast, or "returns self" would be satisfied by
+# doing nothing at all.
+m.double()
+out["double_dtype"] = str(next(m.parameters()).dtype)
+m.float()
+out["back_to_float_dtype"] = str(next(m.parameters()).dtype)
+
+# ... and the model still computes afterwards.
+x = torch.zeros(3, 4)
+out["forward_shape"] = list(m(x).shape)
+
+# Tensor-side spellings.
+t = torch.zeros(2, 3)
+out["t_device"] = str(t.device)
+out["t_is_cpu"] = t.is_cpu
+out["t_is_cuda"] = t.is_cuda
+out["t_get_device"] = t.get_device()
+out["t_cpu_is_self"] = t.cpu() is t
+out["t_to_cpu_is_self"] = t.to("cpu") is t
+out["t_to_cpu0_is_self"] = t.to("cpu:0") is t
+out["t_to_cpu0_device"] = str(t.to("cpu:0").device)
+out["t_to_copy_is_not_self"] = t.to("cpu", copy=True) is not t
+out["t_to_dtype_device"] = str(t.to(torch.device("cpu"), torch.float64).dtype)
+
+# The label round-trips through pickle only when `torch._C` is importable by
+# name, which is exactly the situation here and not in the bare-`_C` harness.
+out["pickle_round_trip"] = [
+    str(pickle.loads(pickle.dumps(torch.device(s))))
+    for s in ("cpu", "cpu:0", "cuda:1", "meta")
+]
+
+# The two accelerator questions, through their real callers.
+out["get_device_module_none"] = torch.get_device_module().__name__
+out["get_device_module_cpu"] = torch.get_device_module("cpu").__name__
+out["current_accelerator"] = repr(torch.accelerator.current_accelerator())
+out["accelerator_count"] = torch.accelerator.device_count()
+out["accelerator_available"] = torch.accelerator.is_available()
+out["default_device"] = repr(torch.get_default_device())
+out["cuda_available"] = torch.cuda.is_available()
+out["mps_available"] = torch.backends.mps.is_available()
+out["generator_device"] = str(torch.default_generator.device)
+
+# An unavailable device is refused at use, by name, wherever it is asked for.
+for name, call in (
+    ("module_to_cuda", lambda: m.to("cuda")),
+    ("tensor_to_cuda", lambda: t.to("cuda")),
+    ("tensor_cuda_method", lambda: t.cuda()),
+    ("factory_cuda", lambda: torch.zeros(2, device="cuda")),
+    ("tensor_to_meta", lambda: t.to("meta")),
+):
+    try:
+        call()
+    except NotImplementedError as e:
+        out[name] = "refused:" + ("cuda" if "cuda" in str(e) else "meta" if "meta" in str(e) else "?")
+    except BaseException as e:
+        out[name] = f"{type(e).__name__}: {e}"
+    else:
+        out[name] = "ACCEPTED"
+
+# A typo is refused at construction, not at use.
+try:
+    torch.device("cuad")
+except RuntimeError:
+    out["typo_refused"] = True
+except BaseException as e:
+    out["typo_refused"] = f"{type(e).__name__}"
+else:
+    out["typo_refused"] = False
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _device_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _DEVICE_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"device-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_device_road_through_the_vendored_tree():
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    r = _device_road_fixture()
+
+    # `nn.Module.to(...)` in every spelling `Module.to`'s docstring offers.
+    for key in ("to_str_returns_self", "to_device_returns_self", "cpu_returns_self",
+                "to_dtype_returns_self", "to_device_and_dtype", "float_returns_self",
+                "param_identity_preserved"):
+        assert r[key] is True, key
+    assert r["param_device"] == "cpu"
+    # The cast is real, not a no-op that trivially satisfies "returns self".
+    assert r["double_dtype"] == "torch.float64", r["double_dtype"]
+    assert r["back_to_float_dtype"] == "torch.float32", r["back_to_float_dtype"]
+    assert r["forward_shape"] == [3, 2], r["forward_shape"]
+
+    # Tensor-side. `.to()` to where you already are is an alias, and a real
+    # `copy=True` is not -- measured on torch 2.13.0, both ways.
+    assert r["t_device"] == "cpu"
+    assert r["t_is_cpu"] is True and r["t_is_cuda"] is False
+    assert r["t_get_device"] == -1
+    for key in ("t_cpu_is_self", "t_to_cpu_is_self", "t_to_copy_is_not_self"):
+        assert r[key] is True, key
+    # `cpu:0` is *not* the label a plain-cpu tensor wears, so `.to("cpu:0")`
+    # copies even though it lands on the same device -- and the copy then
+    # reports plain `cpu`, because the tensor's label comes from the backend it
+    # ended up on rather than from the string that was asked for. Both halves
+    # measured on torch 2.13.0, and both are the reason `same_physical_device`
+    # exists next to `__eq__`.
+    assert r["t_to_cpu0_is_self"] is False, r["t_to_cpu0_is_self"]
+    assert r["t_to_cpu0_device"] == "cpu", r["t_to_cpu0_device"]
+    assert r["t_to_dtype_device"] == "torch.float64"
+
+    assert r["pickle_round_trip"] == ["cpu", "cpu:0", "cuda:1", "meta"]
+
+    # The two accelerator questions, and the callers that disagree about None.
+    assert r["get_device_module_none"] == "torch.cpu", r["get_device_module_none"]
+    assert r["get_device_module_cpu"] == "torch.cpu"
+    assert r["current_accelerator"] == "None", r["current_accelerator"]
+    assert r["accelerator_count"] == 0
+    assert r["accelerator_available"] is False
+    assert r["default_device"] == "device(type='cpu')", r["default_device"]
+    assert r["cuda_available"] is False
+    assert r["mps_available"] is False
+    assert r["generator_device"] == "cpu"
+
+    # An unavailable device is refused at *use*; a typo is refused at
+    # *construction*. Those are the two halves of "a device is a label".
+    assert r["module_to_cuda"] == "refused:cuda", r["module_to_cuda"]
+    assert r["tensor_to_cuda"] == "refused:cuda", r["tensor_to_cuda"]
+    assert r["tensor_cuda_method"] == "refused:cuda", r["tensor_cuda_method"]
+    assert r["factory_cuda"] == "refused:cuda", r["factory_cuda"]
+    assert r["tensor_to_meta"] == "refused:meta", r["tensor_to_meta"]
+    assert r["typo_refused"] is True, r["typo_refused"]
 
 
 def _main():

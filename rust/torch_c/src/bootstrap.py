@@ -1344,6 +1344,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_behaviour(module, dispatch)
+    _install_device(module, varfns, module.TensorBase)
     _install_serialization(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
@@ -1695,15 +1696,38 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
                 f"Tensor.to(): unexpected keyword argument(s) "
                 f"{sorted(kwargs)} in torch._C shim"
             )
+        # The two trailing positional booleans are `non_blocking` then `copy`,
+        # in that order, and only the second one means anything here. Counting
+        # them rather than folding both into `copy` (which is what this did)
+        # matters as soon as anything passes `non_blocking` positionally -- and
+        # `nn.Module.to` does, on every call: `module.py:1369` is
+        # `t.to(device, dtype, non_blocking)`. With both bools read as `copy`,
+        # `model.to("cpu", non_blocking=True)` would have copied every
+        # parameter it was asked to leave alone.
+        bools_seen = 0
         for value in args:
-            if isinstance(value, module.dtype):
+            if isinstance(value, bool):
+                bools_seen += 1
+                if bools_seen == 2:
+                    copy = copy or value
+                elif bools_seen > 2:
+                    raise TypeError(
+                        "Tensor.to(): too many boolean positional arguments in "
+                        "torch._C shim"
+                    )
+                # `non_blocking` is accepted and ignored: there is no async
+                # copy engine here, so every transfer is already synchronous,
+                # which is what upstream does on a CPU-only build too.
+            elif isinstance(value, module.dtype):
                 dtype = value
             elif isinstance(value, (module.device, str)):
                 device = value
             elif isinstance(value, tensorbase):
                 other = value
-            elif isinstance(value, bool):
-                copy = copy or value  # non_blocking, then copy -- both bools
+            elif value is None:
+                # `Module.to` passes its parsed device through even when it is
+                # `None` ("dtype only"), so this is a normal call shape.
+                continue
             else:
                 raise TypeError(
                     f"Tensor.to(): torch._C shim does not understand argument "
@@ -1717,6 +1741,57 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     to.__qualname__ = "TensorBase.to"
     setattr(tensorbase, "to", to)
     setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
+
+    # -- the device spellings that are `.to()` in disguise -------------------
+    #
+    # `x.cpu()` and `x.cuda()` are what upstream's `TensorBase` exposes next to
+    # `to`, and they are the spellings model code actually writes. Both are
+    # routed through the same `_to_copy` rather than given their own path, so
+    # the "already there, return self" short-circuit and the refusal for an
+    # unavailable backend are decided in one place. Measured against torch
+    # 2.13.0: `x.cpu() is x` is `True` for a CPU tensor and the call records no
+    # dispatcher traffic at all.
+    def cpu(self, *args, **kwargs):
+        return _to_copy(self, device=module.device("cpu"))
+
+    def cuda(self, device=None, non_blocking=False, memory_format=None):
+        # Upstream on a build without CUDA raises `AssertionError: Torch not
+        # compiled with CUDA enabled` from `torch/cuda/__init__.py`. This
+        # instead reaches `PyDevice::resolve`, which refuses the label by name
+        # -- the same shape of answer, from the one place that knows which
+        # backends are linked, rather than a second hardcoded claim.
+        return _to_copy(self, device=module.device("cuda") if device is None
+                        else module.device(device))
+
+    # `-1` is not an error code: it is how torch spells "this device kind is
+    # not indexed" (measured, `torch.zeros(2).get_device()` is `-1` while an
+    # mps tensor's is `0`), and `torch/_utils.py:_get_device_index` branches on
+    # exactly that. Lives here rather than in tensor.rs only because PyO3
+    # derives the same slot name for a `get_device` method and the `device`
+    # getter, and the crate is built without `multiple-pymethods`.
+    def get_device(self):
+        index = self.device.index
+        return -1 if index is None else index
+
+    # Dtype predicates rather than device ones, but on the same road and dead
+    # for the same reason: `nn.Module.to`'s `convert(t)` calls
+    # `t.is_floating_point()` on every parameter (`module.py:1365`), so
+    # `.float()` and `.double()` stopped here. They read the dtype the tensor
+    # already carries -- `dtype.rs` owns both flags -- and record no dispatcher
+    # traffic upstream, so they are metadata reads, not a bypass of the door.
+    for name, flag in (("is_floating_point", "is_floating_point"),
+                       ("is_complex", "is_complex")):
+        def predicate(self, _flag=flag):
+            return getattr(self.dtype, _flag)
+
+        predicate.__name__ = name
+        predicate.__qualname__ = f"TensorBase.{name}"
+        setattr(tensorbase, name, predicate)
+
+    for fn, name in ((cpu, "cpu"), (cuda, "cuda"), (get_device, "get_device")):
+        fn.__name__ = name
+        fn.__qualname__ = f"TensorBase.{name}"
+        setattr(tensorbase, name, fn)
 
 
 def _install_tensor_softmax(tensorbase, dispatch) -> None:
@@ -1978,7 +2053,18 @@ def _install_autograd_shape(tensorbase) -> None:
     setattr(tensorbase, "grad_fn", property(lambda self: None))
     setattr(tensorbase, "grad", property(lambda self: None))
     setattr(tensorbase, "is_leaf", property(lambda self: True))
-    setattr(tensorbase, "data", property(lambda self: self))
+    # The getter is `self` (docs/TENSORBASE.md records why it is not a detached
+    # view). The *setter* is what `nn.Module._apply` needs -- see
+    # `_shim_set_data` in tensor.rs for what it costs and what it agrees with.
+    def _set_data(self, value):
+        if not isinstance(value, tensorbase):
+            raise TypeError(
+                "torch._C shim: Tensor.data can only be set to a TensorBase, got "
+                f"{type(value).__name__}"
+            )
+        self._shim_set_data(value)
+
+    setattr(tensorbase, "data", property(lambda self: self, _set_data))
     setattr(tensorbase, "retain_grad", lambda self: None)
 
 
@@ -2967,6 +3053,216 @@ def _install_behaviour(module, dispatch) -> None:
     module._get_schema = _get_schema
 
     _install_default_generator(module)
+
+
+def _install_device(module, varfns, tensorbase) -> None:
+    """The device layer -- the `_C` names that make `.to(device)` mean something.
+
+    docs/DEVICE_ABS.md is the measurement this was built from; §2 is the table
+    of what `torch.device` could and could not do before it. The short version
+    is that the *label* worked and everything that consumed a label did not:
+    `nn.Module.to("cpu")`, `Module.cpu()`, `Module.float()` and every
+    `Module._apply` were dead on `torch._C._nn._parse_to` and
+    `torch._has_compatible_shallow_copy_type`, which is the whole road a
+    checkpoint travels.
+
+    Nothing here reaches the aten dispatcher, and that is measured rather than
+    assumed. Run inside a `TorchDispatchMode` on torch 2.13.0, `x.cpu()`,
+    `x.to("cpu")`, `x.get_device()`, `x.is_floating_point()`, `x.is_complex()`,
+    `m.to("cpu")`, `m.cpu()` and `Generator.device` each record **zero**
+    dispatcher calls -- they read metadata off the TensorImpl. Only a `.to()`
+    that actually changes something records one, and that is
+    `aten._to_copy.default`, which already has a kernel and golden cases. So
+    these are not a second door into the dispatcher (DESIGN.md §6); they are
+    the same nine-names-that-never-dispatch family `tools/golden/cases.py`
+    already documents, and they need no case builders for the same reason
+    `device`, `dim` and `dtype` need none.
+    """
+
+    # -- "what device is this process defaulting to?" ----------------------
+    #
+    # Two names, two questions, two different answers on the same build, and
+    # the difference is not cosmetic -- one of the callers does not check for
+    # `None` and the other does.
+    #
+    #   `_get_default_device`  is what `torch.get_default_device()` reads and
+    #       upstream returns the *string* `'cpu'` from it (measured, torch
+    #       2.13.0). Not a `device` -- the Python wrapper builds that.
+    #
+    #   `_get_accelerator`     is read by `torch.get_device_module()` at
+    #       `torch/__init__.py:2978` as `torch._C._get_accelerator().type`,
+    #       with no `None` guard, and that function's own docstring says "If no
+    #       accelerator is available, it automatically returns CPU device". So
+    #       the no-accelerator answer is `device('cpu')`, not `None`.
+    #
+    #   `_accelerator_getAccelerator` is read by
+    #       `torch/accelerator/__init__.py:128` as
+    #       `if (acc := torch._C._accelerator_getAccelerator()) is not None:`
+    #       -- an explicit `None` check, and `current_accelerator()` returns
+    #       `None` when it fires. So *this* one answers `None` here.
+    #
+    # The last two were read out of the vendored source rather than measured,
+    # because this host has MPS and therefore cannot exhibit the
+    # no-accelerator branch of either.
+    module._get_default_device = _constant_function(
+        "torch._C._get_default_device", "cpu"
+    )
+    module._get_accelerator = _constant_function(
+        "torch._C._get_accelerator", module.device("cpu")
+    )
+    module._accelerator_getAccelerator = _constant_function(
+        "torch._C._accelerator_getAccelerator", None
+    )
+    # `torch.backends.mps.is_available()`. `False` is the honest answer and it
+    # is a *different* claim from `_has_mps` (the build flag): candle's `metal`
+    # feature is off in Cargo.toml, so there is no Metal backend linked in,
+    # which is why `PyDevice::resolve` refuses an `mps` label. DESIGN.md §11.1
+    # records that this is a reversible decision, not a capability gap.
+    module._mps_is_available = _constant_function("torch._C._mps_is_available", False)
+
+    # -- `torch._has_compatible_shallow_copy_type` -------------------------
+    #
+    # `nn.Module._apply` (`torch/nn/modules/module.py:938`) is the only caller
+    # on this road, and what it decides with the answer is whether to move a
+    # converted parameter in place (`param.data = param_applied`) or to build a
+    # fresh `Parameter`. It is therefore load-bearing for every `.to()`,
+    # `.float()` and `.cpu()` on a module.
+    #
+    # Upstream's C++ asks whether `input`'s TensorImpl accepts `from_`'s
+    # `DispatchKeySet` for a shallow copy. There are no dispatch keys here, so
+    # the question has no local meaning and the answer is measured instead:
+    # on torch 2.13.0 it is `True` for two plain dense tensors of *different*
+    # dtype, of different device (cpu vs mps), and for a `Parameter` against a
+    # `Tensor`. The one thing it is not `True` for is a tensor subclass with its
+    # own impl -- `FakeTensor`, which `_apply` filters separately anyway, and
+    # which this shim cannot produce.
+    #
+    # So: both dense tensors of this shim => True, and anything else is refused
+    # rather than guessed, because a wrong `True` here silently aliases a
+    # parameter that should have been replaced.
+    def _has_compatible_shallow_copy_type(input, from_):
+        if isinstance(input, tensorbase) and isinstance(from_, tensorbase):
+            return True
+        raise NotImplementedError(
+            "not implemented in torch._C shim: "
+            "torch._has_compatible_shallow_copy_type on something that is not a "
+            f"TensorBase ({type(input).__name__}, {type(from_).__name__}) -- upstream "
+            "answers from the DispatchKeySet, which this shim does not have"
+        )
+
+    _has_compatible_shallow_copy_type.__name__ = "_has_compatible_shallow_copy_type"
+    _has_compatible_shallow_copy_type.__qualname__ = "_has_compatible_shallow_copy_type"
+    _has_compatible_shallow_copy_type.__module__ = "torch._C"
+    setattr(varfns, "_has_compatible_shallow_copy_type", _has_compatible_shallow_copy_type)
+
+    # -- `torch._C._nn._parse_to` ------------------------------------------
+    #
+    # The single entrance for `nn.Module.to(...)`: `module.py:1340` unpacks its
+    # four-tuple and builds the `convert(t)` closure from it. Everything a
+    # module can be moved or cast by goes through here, so with it refusing,
+    # `.to()`, `.cpu()`, `.float()`, `.half()` and `.double()` were all dead.
+    #
+    # It is *not* an overload-table entry, for docs/OVERLOAD.md §9 item 7's
+    # reason -- there is no `aten::_parse_to`; it is a hand-written argument
+    # parser in `python_nn_functions.cpp` with no schema at all. The vendored
+    # tree carries its own reimplementation at
+    # `torch/_dynamo/polyfills/torch_c_nn.py:14`, which is the reference this
+    # follows, corrected in three places where the polyfill and the real parser
+    # disagree and the real one was measured:
+    #
+    #   * the polyfill takes at most one positional; the real parser takes up
+    #     to three (`_parse_to('cpu', torch.float32, False)` binds fine), and
+    #     `Module.to("cpu", torch.float32)` is a documented spelling.
+    #   * the polyfill accepts a `memory_format` positionally; the real one is
+    #     keyword-only there (measured: passing it fourth is a TypeError).
+    #   * `copy` is in the `.pyi` overloads and the real parser rejects it at
+    #     runtime -- `RuntimeError: .to() does not accept copy argument`.
+    #     Reproduced, because silently accepting it would make
+    #     `Module.to(copy=True)` a no-op instead of an error.
+    def _parse_to(*args, **kwargs):
+        device = None
+        dtype = None
+        non_blocking = False
+        memory_format = None
+        bools_seen = 0
+
+        def _reject_copy():
+            raise RuntimeError(".to() does not accept copy argument")
+
+        # Four positional slots, and the fourth is `copy` -- which is parsed and
+        # then refused, not rejected as arity. Measured:
+        # `_parse_to('cpu', torch.float32, False, True)` is
+        # `RuntimeError: .to() does not accept copy argument`, while a fifth
+        # argument is `TypeError: to() takes from 0 to 4 positional arguments
+        # but 5 were given`. Two different mistakes, two different errors.
+        if len(args) > 4:
+            raise TypeError(
+                f"to() takes from 0 to 4 positional arguments but {len(args)} were given"
+            )
+        for value in args:
+            if value is None:
+                # `_parse_to(None)` is `(None, None, False, None)` upstream --
+                # an explicit "no device", not an error.
+                continue
+            if isinstance(value, bool):
+                # First bool is `non_blocking`; a second one is the `copy`
+                # argument the parser refuses.
+                bools_seen += 1
+                if bools_seen > 1:
+                    _reject_copy()
+                non_blocking = value
+            elif isinstance(value, module.dtype):
+                dtype = value
+            elif isinstance(value, tensorbase):
+                device, dtype = value.device, value.dtype
+            elif isinstance(value, (str, module.device)):
+                device = module.device(value)
+            else:
+                raise TypeError(
+                    "to() received an invalid combination of arguments - got "
+                    f"({type(value).__name__}) in torch._C shim"
+                )
+
+        for name, value in kwargs.items():
+            if name == "device":
+                device = None if value is None else module.device(value)
+            elif name == "dtype":
+                dtype = value
+            elif name == "non_blocking":
+                non_blocking = bool(value)
+            elif name == "memory_format":
+                memory_format = value
+            elif name == "copy":
+                _reject_copy()
+            else:
+                raise TypeError(
+                    f"to() got an unexpected keyword argument '{name}' in torch._C shim"
+                )
+        return (device, dtype, non_blocking, memory_format)
+
+    _parse_to.__name__ = "_parse_to"
+    _parse_to.__qualname__ = "_parse_to"
+    _parse_to.__module__ = "torch._C._nn"
+    setattr(module._nn, "_parse_to", _parse_to)
+    module._shim_nn_implemented = sorted(
+        set(module._shim_nn_implemented) | {"_parse_to"}
+    )
+
+    # -- `Generator.device` -------------------------------------------------
+    #
+    # Overwriting the *class* attribute, which an earlier note in
+    # `_install_default_generator` argued against on the grounds that a device
+    # is a per-instance value. That argument is right about upstream and wrong
+    # about here: `PyDevice::resolve` refuses every label but `cpu`, so every
+    # `Generator` this shim can make is a CPU generator, and there is no second
+    # value for an instance attribute to hold. It becomes wrong again the day a
+    # second backend lands -- at which point the generator has to carry its own
+    # device, the same way a tensor will (docs/DEVICE_ABS.md §3.2).
+    #
+    # It has to be a property rather than a plain attribute because
+    # `_make_property` put one there and the callers reach for the descriptor.
+    _cpu = module.device("cpu")
+    module.Generator.device = property(lambda self: _cpu)
 
 
 def _install_default_generator(module) -> None:
