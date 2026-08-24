@@ -337,27 +337,17 @@ BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
 }
 
 # (comparator, mode) pairs that are NOT caught and are NOT intended: real holes
-# this matrix found on its first run. Recorded here so `--self-test` can stay
-# usable as a gate while each hole stays loudly visible, printed as `GAP`
-# rather than `blind` and re-listed under KNOWN GAP at the end of every run.
-# The fix for all three is in tools/golden/cases.py, which this change does not
-# own. `_verdict_for` fails the run if one of these is ever caught, so a fixed
-# gap cannot be left parked here.
-KNOWN_GAP: dict[tuple[str, str], str] = {
-    ("_pair_result_check", "dtype-last"): (
-        "the `indices` half's DTYPE is never compared -- cases.py checks only its shape and its "
-        "flattened values. torch hands back int64 indices; a shim returning int32 with identical "
-        "values passes. Fix: one dt.dtype_name() comparison beside the existing indices shape check"
-    ),
-    ("_topk_multiset_check", "shape-last"): (
-        "the `indices` half's SHAPE is never compared -- cases.py checks the values' shape and the "
-        "(value, index) multiset only, and the multiset survives a reshape of the indices. "
-        "_pair_result_check does check this; the multiset variant does not"
-    ),
-    ("_topk_multiset_check", "dtype-last"): (
-        "the `indices` half's DTYPE is never compared, same hole as _pair_result_check + dtype-last"
-    ),
-}
+# this matrix finds. Recorded here so `--self-test` stays usable as a gate while
+# each hole stays loudly visible, printed as `GAP` rather than `blind` and
+# re-listed at the end of every run. `_verdict_for` fails the run if one of
+# these is ever caught, so a fixed gap cannot be left parked here.
+#
+# Empty because the three it held are fixed: the indices half of a pair now has
+# its dtype and its shape compared, so a shim returning int32 or reshaped
+# indices no longer passes. The entries did not rot -- the self-test refused to
+# go green until they were removed, which is the whole reason for parking them
+# here rather than in a comment.
+KNOWN_GAP: dict[tuple[str, str], str] = {}
 
 
 class _FakeDtype:

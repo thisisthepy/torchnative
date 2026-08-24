@@ -74,14 +74,17 @@ def test_tensor_base_is_subclassable():
 
 
 def test_unimplemented_op_names_itself():
-    # `aten.embedding.default` used to stand here and now has a kernel, which
-    # is the right failure mode for this test -- it goes red when the op it
-    # samples stops being a sample. `relu` is the example docs/TORCH_C.md §1
-    # uses and is on no current work list.
+    # `embedding` stood here, then `relu`, and both gained kernels -- which is
+    # the right failure mode for this test: it goes red when the op it samples
+    # stops being a sample. Both were plausible sample choices *because* they
+    # were plausible implementation targets, which is exactly what makes them
+    # bad ones. `ormqr` multiplies by a Householder product from a LAPACK
+    # factorisation; nothing in the architecture tails of docs/ARCH.md or
+    # docs/OPS4.md reaches for it, and on-device inference has no reason to.
     try:
-        _C._aten_dispatch("aten.relu.default")
+        _C._aten_dispatch("aten.ormqr.default")
     except NotImplementedError as e:
-        assert str(e) == "aten op not implemented in torch._C shim: aten.relu.default"
+        assert str(e) == "aten op not implemented in torch._C shim: aten.ormqr.default"
     else:
         raise AssertionError("an unimplemented op must raise")
 
@@ -493,11 +496,12 @@ def test_op_registry_routes_to_the_one_door():
     # blind.
     op, overloads = _C._jit_get_operation("aten::mm")
     assert callable(op) and overloads
-    op, op_dk, tags = _C._get_operation_overload("aten::relu", "default")
+    # `ormqr` for the same reason as test_unimplemented_op_names_itself above.
+    op, op_dk, tags = _C._get_operation_overload("aten::ormqr", "default")
     try:
         op()
     except NotImplementedError as e:
-        assert "aten.relu.default" in str(e)
+        assert "aten.ormqr.default" in str(e)
     else:
         raise AssertionError("an unimplemented op must name itself")
     # ... and a name that is not an op is refused, so `getattr(ns, x, None)`
