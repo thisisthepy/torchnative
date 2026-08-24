@@ -70,6 +70,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
     "aten.full.default",
+    "aten.gather.default",
+    "aten.gelu.default",
     "aten.index.Tensor",
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
@@ -117,6 +119,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.view.default",
+    "aten.zero_.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -307,9 +310,14 @@ fn aten_dispatch_inner(
 
         "aten.fill_.Scalar" => fill_inplace(py, args, kwargs, "aten.fill_.Scalar"),
         "aten.fill_.Tensor" => fill_inplace(py, args, kwargs, "aten.fill_.Tensor"),
+        "aten.zero_.default" => zero_inplace(py, args, kwargs),
         "aten.copy_.default" => copy_inplace(py, args, kwargs),
         "aten.uniform_.default" => uniform_inplace(py, args, kwargs),
         "aten.normal_.default" => normal_inplace(py, args, kwargs),
+
+        // -- what widening past the Llama/GPT-2 family asks for (docs/ARCH.md) --
+        "aten.gelu.default" => gelu_default(py, args, kwargs),
+        "aten.gather.default" => gather_default(py, args, kwargs),
 
         // -- the eight `do_sample=True` stops on (docs/SAMPLING.md) ---------
         "aten._softmax.default" => softmax_default(py, args, kwargs),
@@ -464,6 +472,42 @@ fn add_tensor(
     Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind())
 }
 
+/// The dtype torch accumulates a GEMM of this storage dtype in.
+///
+/// **`float16` and `bfloat16` GEMMs accumulate in `float32` upstream**
+/// (`at::opmath_type<Half> == float`), and this is measured, not inferred:
+/// `mm(half a, half b)` is *bitwise* equal to `half(mm(float(a), float(b)))`
+/// at k = 4, 64 and 512, and the same holds for `bmm` and `addmm`.
+///
+/// candle has no such notion -- `Tensor::matmul` accumulates in the storage
+/// dtype -- so routing a `float16` matmul straight at it computes a different
+/// function, and the difference is not a rounding-order nicety: at k = 512
+/// with unit-magnitude inputs, **15 of 64 outputs land outside this harness's
+/// `float16` tolerance**, with a maximum absolute error of 0.078 against a
+/// tolerance of 5e-3. It grows with the reduction depth (1/64 outputs already
+/// wrong at k = 64), so a real model in `float16` drifts layer by layer.
+///
+/// That went unnoticed because every GEMM case in `tools/golden/cases.py` was
+/// small enough for `float16` accumulation to be lossless; docs/GPT2.md §7
+/// listed "the error at real layer sizes" as unmeasured, and this was in it.
+/// The large-size cases added alongside this function are what found it.
+///
+/// The same widening incidentally gives `bfloat16` a matmul at all: candle has
+/// no BF16 matmul kernel (`unsupported dtype BF16 for op matmul`), which
+/// `mm`/`bmm`/`addmm` had been recording as a capability gap. Accumulating in
+/// `float32` is not a workaround for that gap -- it is what upstream does --
+/// so the gap closes as a side effect rather than being papered over.
+///
+/// The integral dtypes are deliberately *not* widened. candle having no
+/// integral matmul is a real gap, and `float32` cannot hold an `int64` product
+/// exactly; standing one in would answer a different question.
+fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
+    match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    }
+}
+
 /// `aten::mm(Tensor self, Tensor mat2)`
 ///
 /// The matmul. Chosen over the other elementwise ops because it is the one op
@@ -491,13 +535,18 @@ fn mm_default(
             rhs.tensor().rank()
         )));
     }
-    same_dtype(OP, &lhs, &rhs)?;
+    let tag = same_dtype(OP, &lhs, &rhs)?;
 
+    // Accumulate where torch accumulates -- see `gemm_accumulate_in`.
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = gemm_accumulate_in(storage);
     let out = lhs
         .tensor()
-        .matmul(rhs.tensor())
+        .to_dtype(acc)
+        .and_then(|l| rhs.tensor().to_dtype(acc).and_then(|r| l.matmul(&r)))
+        .and_then(|p| p.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
-    Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind())
+    finish(py, out, tag)
 }
 
 /// `aten::bmm(Tensor self, Tensor mat2) -> Tensor`
@@ -549,10 +598,19 @@ fn bmm_default(
         )));
     }
 
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = gemm_accumulate_in(storage);
     let out = lhs
         .tensor()
-        .contiguous()
-        .and_then(|l| rhs.tensor().contiguous().and_then(|r| l.matmul(&r)))
+        .to_dtype(acc)
+        .and_then(|l| l.contiguous())
+        .and_then(|l| {
+            rhs.tensor()
+                .to_dtype(acc)
+                .and_then(|r| r.contiguous())
+                .and_then(|r| l.matmul(&r))
+        })
+        .and_then(|p| p.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -722,29 +780,42 @@ fn addmm_default(
         (beta.as_f64() == 0.0, alpha.as_f64() == 0.0)
     };
 
+    // The whole body runs in the accumulation dtype and is narrowed once at the
+    // end, which is upstream's shape: `addmm(half ...)` is bitwise equal to
+    // `half(addmm(float ...))` (measured). Narrowing the product first and then
+    // adding the bias in `float16` would round twice where torch rounds once.
+    // See `gemm_accumulate_in`.
+    let acc_dtype = gemm_accumulate_in(storage);
     let mut acc: Option<Tensor> = None;
     if !alpha_zero {
         let product = mat1
             .tensor()
-            .contiguous()
-            .and_then(|l| mat2.tensor().contiguous().and_then(|r| l.matmul(&r)))
+            .to_dtype(acc_dtype)
+            .and_then(|l| l.contiguous())
+            .and_then(|l| {
+                mat2.tensor()
+                    .to_dtype(acc_dtype)
+                    .and_then(|r| r.contiguous())
+                    .and_then(|r| l.matmul(&r))
+            })
             .map_err(|e| candle_err(OP, e))?;
-        acc = Some(addmm_scale(OP, &product, alpha, storage)?);
+        acc = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
     }
     if !beta_zero {
         let expanded = bias
             .tensor()
-            .broadcast_as(target.as_slice())
+            .to_dtype(acc_dtype)
+            .and_then(|t| t.broadcast_as(target.as_slice()))
             .and_then(|t| t.contiguous())
             .map_err(|e| candle_err(OP, e))?;
-        let scaled = addmm_scale(OP, &expanded, beta, storage)?;
+        let scaled = addmm_scale(OP, &expanded, beta, acc_dtype)?;
         acc = Some(match acc {
             Some(product) => product.add(&scaled).map_err(|e| candle_err(OP, e))?,
             None => scaled,
         });
     }
     let out = match acc {
-        Some(tensor) => tensor,
+        Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
         // Both factors zero: torch still answers with a correctly shaped,
         // correctly typed tensor of zeros rather than raising.
         None => Tensor::zeros(target.as_slice(), storage, mat1.tensor().device())
@@ -1760,10 +1831,19 @@ fn matmul_default(
             rhs.tensor().rank()
         )));
     }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = gemm_accumulate_in(storage);
     let out = lhs
         .tensor()
-        .contiguous()
-        .and_then(|l| rhs.tensor().contiguous().and_then(|r| l.broadcast_matmul(&r)))
+        .to_dtype(acc)
+        .and_then(|l| l.contiguous())
+        .and_then(|l| {
+            rhs.tensor()
+                .to_dtype(acc)
+                .and_then(|r| r.contiguous())
+                .and_then(|r| l.broadcast_matmul(&r))
+        })
+        .and_then(|p| p.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -2156,6 +2236,144 @@ fn silu_default(
         .and_then(|t| t.silu())
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::gelu(Tensor self, *, str approximate="none") -> Tensor`
+///
+/// **The op has two different functions behind one name, and picking the wrong
+/// one is not a rounding error.** `approximate="none"` is the exact
+/// `x·Φ(x)` written with `erf`; `approximate="tanh"` is Hendrycks' cubic
+/// approximation. Measured over `[-3, 3]` in `float32` they differ by up to
+/// **4.12e-04** -- four orders of magnitude past this shim's `float32` golden
+/// tolerance (`1e-5`), so a shim that silently answered with the other formula
+/// would not be caught by "close enough", it would be caught by a wrong token.
+///
+/// The default is `"none"` (upstream's schema string, re-read from
+/// `torch.ops.aten.gelu.default._schema` rather than remembered). Which
+/// architectures ask for which was measured, not guessed:
+///
+/// | architecture | `approximate` |
+/// |---|---|
+/// | **Gemma / Gemma-2** | **`"tanh"`** (`gelu_pytorch_tanh`) |
+/// | BERT · RoBERTa · ELECTRA · DistilBERT · DeBERTa-v2 | `"none"` |
+/// | BART · Falcon · GPT-NeoX · GPT-BigCode · Starcoder2 · MPT · ViT | `"none"` |
+///
+/// GPT-2 is the interesting absentee: it *is* a tanh-gelu model, but HF spells
+/// `gelu_new` in Python, so it reaches `aten.tanh.default` and never this op.
+/// Both spellings therefore have to agree, which is why the tanh branch below
+/// is composed rather than delegated (see next paragraph).
+///
+/// **Neither branch is candle's own `gelu`/`gelu_erf`, and the reason is
+/// measured.** candle's `Tensor::gelu` factors the cubic as
+/// `β·v·(1 + κ·v·v)` where upstream ATen writes `β·(v + κ·v³)`; algebraically
+/// identical, not identical in `float32`, and the gap is 2.98e-08 on
+/// `[-3, 3]`. Writing upstream's association here makes the `float32` and
+/// `float64` tanh branch reproduce torch **bit for bit** instead of merely
+/// within tolerance. (The exact branch does delegate to `gelu_erf`, which is
+/// `libm::erff` and lands 4.47e-08 from torch's own kernel -- there is no
+/// composition that closes that one, since the two `erf` implementations
+/// differ, and 4.47e-08 is a quarter-ulp at magnitude 1.)
+///
+/// `float16`/`bfloat16` compute in `float32` and narrow once, which is not a
+/// convenience: it is what upstream does (`at::opmath_type<Half> = float`),
+/// and it was verified rather than assumed -- `gelu(half x)` is *bitwise*
+/// equal to `half(gelu(float(x)))` for both approximations, at every probe
+/// point. The same rule `silu_default` above already follows.
+///
+/// Integral and boolean inputs are refused, with upstream's own message. This
+/// is `silu`'s side of the split, not `tanh`'s: there is no `GeluKernelImpl`
+/// for `Long`, and a shim that reused the promoting unary helper would compute
+/// where torch raises.
+fn gelu_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.gelu.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+
+    // `approximate` is keyword-only in the schema (`*` before it), and upstream
+    // enforces that: `gelu(x, "tanh")` is a TypeError-shaped RuntimeError, not
+    // a tanh gelu. Reproduced, because the natural way to write this helper
+    // (`optional(args, kwargs, 1, ...)`) would accept the positional form and
+    // quietly implement a laxer op.
+    if args.len() > 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "aten::gelu() takes 1 positional argument(s) but {} was/were given.  \
+             Declaration: aten::gelu(Tensor self, *, str approximate=\"none\") -> Tensor",
+            args.len()
+        )));
+    }
+    let approximate = match kwargs.and_then(|kw| kw.get_item("approximate").ok().flatten()) {
+        Some(value) => {
+            if value.is_none() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "aten::gelu() Expected a value of type 'str' for argument \
+                     'approximate' but instead found type 'NoneType'.",
+                ));
+            }
+            value.extract::<String>()?
+        }
+        None => "none".to_string(),
+    };
+
+    let tag = input.tag();
+    if !tag.is_floating_point() || tag == TorchDType::Float8E4M3FN {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"GeluKernelImpl\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    // The string is validated before any arithmetic, so a typo raises on an
+    // empty tensor too -- upstream refuses `gelu(zeros(0), approximate="TANH")`
+    // and a shim that only checked inside a loop would answer `[]`.
+    let use_tanh = match approximate.as_str() {
+        "none" => false,
+        "tanh" => true,
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "approximate argument must be either none or tanh.",
+            ))
+        }
+    };
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let x = input.tensor().to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+
+    let out = if use_tanh {
+        // `0.5 · v · (1 + tanh(β·(v + κ·v³)))`, ATen's association exactly.
+        // `affine(mul, add)` narrows both constants to the tensor's dtype
+        // before it multiplies, so β arrives as the `float32` nearest for a
+        // `float32` tensor -- which is what upstream's `opmath_t` constant is.
+        const BETA: f64 = std::f64::consts::FRAC_2_SQRT_PI * std::f64::consts::SQRT_2 * 0.5;
+        const KAPPA: f64 = 0.044715;
+        let cube = x
+            .mul(&x)
+            .and_then(|sq| sq.mul(&x))
+            .map_err(|e| candle_err(OP, e))?;
+        let inner = cube
+            .affine(KAPPA, 0.0)
+            .and_then(|scaled| x.add(&scaled))
+            .and_then(|sum| sum.affine(BETA, 0.0))
+            .map_err(|e| candle_err(OP, e))?;
+        let half = x.affine(0.5, 0.0).map_err(|e| candle_err(OP, e))?;
+        inner
+            .tanh()
+            .and_then(|t| t.affine(1.0, 1.0))
+            .and_then(|t| half.mul(&t))
+            .map_err(|e| candle_err(OP, e))?
+    } else {
+        // `(erf(v/√2) + 1) · 0.5 · v` -- candle's `gelu_erf`, `libm::erf(f)`.
+        x.gelu_erf().map_err(|e| candle_err(OP, e))?
+    };
+
+    let out = out.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
@@ -3245,6 +3463,56 @@ fn fill_inplace(
         .and_then(|t| t.to_dtype(storage))
         .map_err(|e| candle_err(op, e))?;
         PyTensorBase::new(filled)?
+    };
+    receiver.borrow_mut().replace_with(replacement);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::zero_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// **Not a spelling of `fill_(0)`, even though it computes the same values.**
+/// It is a separate overload upstream, and overloads are part of this shim's
+/// key (see the module note), so folding it into `fill_inplace` would make
+/// `_aten_implemented()` claim one op where two were asked for.
+///
+/// It is here because of where it fires, which was measured rather than
+/// assumed: **`zero_` never appears in a forward pass.** Recording
+/// `TorchDispatchMode` over construction and over inference separately,
+/// `nn.LayerNorm(8)`'s constructor calls `empty.memory_format` ×2,
+/// `fill_.Scalar` ×1 (the weight, to 1) and `zero_.default` ×1 (the bias),
+/// and the forward calls neither. `nn.Linear` does not call it at all --
+/// its `reset_parameters` uses `uniform_`. So `zero_` is not on the op-count
+/// tail the architecture sweep measures; it is on the path *before* it, and a
+/// model that cannot be constructed never reaches the tail at all. That is
+/// why docs/GPT2.md saw `nn.LayerNorm` fail twice over: answering
+/// `_C._get_cudnn_enabled` only moves the failure to this kernel.
+///
+/// Zero is representable exactly in every dtype this shim stores, so unlike
+/// `fill_` there is no `checked_convert` here -- there is no value to overflow.
+/// `bool` zeroes to `False` and a `nan`/`inf` element is overwritten like any
+/// other (both measured).
+fn zero_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.zero_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let (tag, shape, device) = {
+        let borrowed = receiver.borrow();
+        (
+            borrowed.tag(),
+            borrowed.tensor().shape().clone(),
+            borrowed.tensor().device().clone(),
+        )
+    };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let zeros = Tensor::zeros(shape, storage, &device).map_err(|e| candle_err(OP, e))?;
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(zeros)?
+    } else {
+        PyTensorBase::new(zeros)?
     };
     receiver.borrow_mut().replace_with(replacement);
     let _ = py;
@@ -4445,6 +4713,138 @@ fn scatter_src(
 
     let device = input.tensor().device().clone();
     let tensor = write_flat(OP, out, self_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor`
+///
+/// `scatter.src` read backwards, and written the same way for the same reason:
+/// candle's `Tensor::gather` exists but does not agree with torch about what a
+/// valid call is, so borrowing it would move the disagreement out of sight
+/// rather than remove it. Three measured differences, each of which would be a
+/// silent divergence:
+///
+/// 1. **Index dtype.** candle accepts `u8`/`u32`/`i64`; torch accepts exactly
+///    `int32` and `int64` and refuses the rest by name. A `uint8` index is a
+///    *mask* everywhere else in this shim, and candle would silently read it as
+///    positions.
+/// 2. **Out of range.** candle's `i64` path reaches `as_usize()` on a negative
+///    index, so `-1` becomes a huge `usize` and the error names that number
+///    instead of `-1`. torch says `index -1 is out of bounds for dimension 1
+///    with size 3`, and that text is what a caller debugs against. There is no
+///    negative-index convention here: unlike `select`/`slice`, `gather` does
+///    **not** wrap (measured).
+/// 3. **Contiguity.** candle refuses a non-contiguous `self` or `index`
+///    outright (`RequiresContiguous`); torch gathers from a transposed tensor
+///    without comment (measured on `arange(12).reshape(3,4).t()`), and BERT's
+///    path arrives that way.
+///
+/// The rank rule is upstream's `ensure_nonempty_dim`, i.e. `max(rank, 1)` on
+/// both sides, which is why a 0-d `self` accepts a 1-d index (`gather(tensor(7.),
+/// 0, tensor([0,0]))` -> `[7., 7.]`) and a 1-d `self` accepts a 0-d index
+/// (-> 0-d), but a 0-d `self` with a 2-d index is refused. Guessing "ranks must
+/// be equal" would have refused two calls torch answers.
+///
+/// The output has the **index's** shape, not `self`'s: off-axis the index may
+/// be *smaller* than `self` (and the extra rows are simply not read), and along
+/// `dim` it may be *longer* (values repeat). Both measured.
+///
+/// `sparse_grad` is accepted and ignored -- it selects an autograd
+/// representation, and there is no autograd here. Upstream's forward answer is
+/// the same for either value (measured).
+fn gather_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.gather.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
+
+    if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "gather(): Expected dtype int32/int64 for index",
+        ));
+    }
+
+    let tag = input.tag();
+    // `ensure_nonempty_dim`/`ensure_nonempty_size`: a 0-d tensor counts as one
+    // dimension of extent 1 for the purposes of both the rank check and the
+    // bounds check. The *output* still gets the index's real shape.
+    let self_dims: Vec<usize> = if input.tensor().rank() == 0 {
+        vec![1]
+    } else {
+        input.tensor().dims().to_vec()
+    };
+    let idx_shape = index.tensor().dims().to_vec();
+    let idx_dims: Vec<usize> = if idx_shape.is_empty() {
+        vec![1]
+    } else {
+        idx_shape.clone()
+    };
+    if idx_dims.len() != self_dims.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as input tensor",
+        ));
+    }
+    let dim = normalise_dim(OP, dim_raw, input.tensor().rank())?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] > self_dims[d] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Size does not match at dimension {d} expected index {idx_dims:?} \
+                 to be no larger than self {self_dims:?} apart from dimension {dim}"
+            )));
+        }
+    }
+
+    let source = read_flat(OP, input.tensor(), tag)?;
+    let positions = match read_flat(OP, index.tensor(), index.tag())? {
+        Flat::Int(v) => v,
+        Flat::Float(_) => unreachable!("the index dtype was checked above"),
+    };
+
+    let self_strides = contiguous_strides(&self_dims);
+    let idx_strides = contiguous_strides(&idx_dims);
+    let count: usize = idx_dims.iter().product();
+    let rank = self_dims.len();
+
+    let mut out = match &source {
+        Flat::Float(_) => Flat::Float(vec![0.0f64; count]),
+        Flat::Int(_) => Flat::Int(vec![0i64; count]),
+    };
+    let mut coord = vec![0usize; rank];
+    for _ in 0..count {
+        let idx_off: usize = coord.iter().zip(&idx_strides).map(|(c, s)| c * s).sum();
+        let target = positions[idx_off];
+        if target < 0 || target as usize >= self_dims[dim] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index {target} is out of bounds for dimension {dim} with size {}",
+                self_dims[dim]
+            )));
+        }
+        let self_off: usize = coord
+            .iter()
+            .enumerate()
+            .map(|(d, c)| if d == dim { target as usize } else { *c } * self_strides[d])
+            .sum();
+        match (&source, &mut out) {
+            (Flat::Float(s), Flat::Float(o)) => o[idx_off] = s[self_off],
+            (Flat::Int(s), Flat::Int(o)) => o[idx_off] = s[self_off],
+            _ => unreachable!("out was built from source's own variant"),
+        }
+        for d in (0..rank).rev() {
+            coord[d] += 1;
+            if coord[d] < idx_dims[d] {
+                break;
+            }
+            coord[d] = 0;
+        }
+    }
+
+    let device = input.tensor().device().clone();
+    let tensor = write_flat(OP, out, idx_shape, &device, tag)?;
     finish(py, tensor, tag)
 }
 

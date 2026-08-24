@@ -327,8 +327,15 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.mm.default -------------------------------------------------------
 
-_MM_MATCH_DTYPES = ["float32", "float64", "float16"]
-_MM_C_ERROR_DTYPES = ["int64", "int32", "int16", "uint8", "bfloat16"]
+# `bfloat16` moved from the gap list to the match list when `mm`/`bmm`/`addmm`
+# started accumulating reduced-precision GEMMs in float32, which is what torch
+# does (`at::opmath_type`, measured bitwise -- see `gemm_accumulate_in` in
+# rust/torch_c/src/aten.rs). candle still has no BF16 matmul kernel; the point
+# is that it is never asked for one, because upstream does not ask for one
+# either. The integral dtypes stay: that gap is real, and float32 cannot stand
+# in for an int64 product.
+_MM_MATCH_DTYPES = ["float32", "float64", "float16", "bfloat16"]
+_MM_C_ERROR_DTYPES = ["int64", "int32", "int16", "uint8"]
 
 
 def _mm_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, b_flat, b_shape, expect="match", note=""):
@@ -431,6 +438,21 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="mm must not silently fall back to a batched matmul.",
         )
     )
+
+    # Model-scale reduction depths -- the docs/GPT2.md §7 gap. See the long
+    # note above `_gemm_scale_check`.
+    for dtype_name, m, k, n, note in [
+        ("float32", 8, 512, 8, "GPT-2 small's per-head depth, narrow output"),
+        ("float32", 8, 1024, 8, "the first depth at which the shim and torch stop agreeing bitwise"),
+        ("float32", 64, 1024, 64, "4096 outputs at depth 1024"),
+        ("float64", 8, 1024, 8, "float64 at the same depth, for contrast"),
+        ("float16", 8, 512, 8, "float16 at depth 512 -- the accumulation-dtype question"),
+        ("bfloat16", 8, 512, 8, "bfloat16, which only has a matmul at all because of that"),
+    ]:
+        cases.append(
+            _big_gemm_case(torch_module, c_module, torch_call, "aten.mm.default",
+                           dtype_name, m, k, n, note=note)
+        )
 
     return cases
 
@@ -2827,6 +2849,18 @@ def bmm_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: 'expected scalar type Float but found Double'; _C: same_dtype refuses.",
         )
     )
+
+    # Model-scale, batched. Attention's QK^T is a bmm of depth head_dim and
+    # its AV is a bmm of depth seq_len, so this is where a large k actually
+    # shows up in a transformer -- see the note above `_gemm_scale_check`.
+    for dtype_name, note in [
+        ("float32", "batched depth 512 -- attention's AV at seq_len 512"),
+        ("float16", "the same, in the dtype a device would actually run"),
+    ]:
+        cases.append(
+            _big_gemm_case(torch_module, c_module, torch_call, "aten.bmm.default",
+                           dtype_name, 8, 512, 8, batch=2, note=note)
+        )
     return cases
 
 
@@ -4308,6 +4342,18 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=f"{dtype_name} with alpha=0 -- no matmul happens, so the gap above does not apply",
             )
         )
+
+    # Model-scale, with the bias -- this is `nn.Linear` at a real width, which
+    # is the shape docs/GPT2.md §3.3 measured and §7 left uncovered here.
+    for dtype_name, m, k, n, note in [
+        ("float32", 64, 512, 64, "nn.Linear(512, 64) on a batch of 64"),
+        ("float32", 8, 1024, 8, "depth 1024, where mm's agreement with torch ends"),
+        ("float16", 8, 512, 8, "float16 at depth 512 -- the accumulation-dtype question"),
+    ]:
+        cases.append(
+            _big_gemm_case(torch_module, c_module, torch_call, "aten.addmm.default",
+                           dtype_name, m, k, n, with_bias=True, note=note)
+        )
     return cases
 
 
@@ -4674,6 +4720,552 @@ def native_layer_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.gelu.default -------------------------------------------------------
+#
+# The op with two functions behind one name. `approximate="none"` is the exact
+# erf form, `approximate="tanh"` is Hendrycks' cubic; on `[-3, 3]` in float32
+# they differ by up to **4.12e-04**, against this harness's float32 tolerance of
+# 1e-5. So the three variants below (default / explicit "none" / explicit
+# "tanh") are not redundant coverage -- the default-vs-tanh pair is a live trap
+# for a shim that picked the wrong formula for the unqualified call, and it
+# would fire with 40x the tolerance, not at the edge of it.
+#
+# Measured (docs/ARCH.md §2): Gemma and Gemma-2 pass `"tanh"`; BERT, RoBERTa,
+# ELECTRA, DistilBERT, DeBERTa-v2, BART, Falcon, GPT-NeoX, GPT-BigCode,
+# Starcoder2, MPT and ViT all take the default.
+
+_GELU_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_GELU_APPROX: list[tuple[dict, str]] = [
+    ({}, "unqualified -- upstream's schema default is 'none', the erf form"),
+    ({"approximate": "none"}, "explicit 'none' -- must equal the unqualified call"),
+    ({"approximate": "tanh"}, "explicit 'tanh' -- Gemma's gelu_pytorch_tanh"),
+]
+_GELU_SCENARIOS: list[tuple[list, tuple, str]] = [
+    ([-3.0, -1.0, -0.5, 0.0], (2, 2), "the negative lobe, where the two formulas diverge most"),
+    ([0.5, 1.0, 2.0, 3.0], (2, 2), "the positive side"),
+    ([-8.0, 8.0, -0.001, 0.001], (2, 2), "saturating tails and near-zero"),
+    ([0.5], (), "0-d"),
+    ([], (0,), "empty"),
+]
+
+
+def gelu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.gelu.default"
+    cases: list[Case] = []
+    for dtype_name in _GELU_DTYPES:
+        for kwargs, kw_note in _GELU_APPROX:
+            for flat, shape, note in _GELU_SCENARIOS:
+                cases.append(
+                    _unary_case(
+                        torch_module, c_module, op, torch_call, dtype_name, flat, shape,
+                        f"{note}; {kw_note}", kwargs=kwargs,
+                    )
+                )
+        # gelu(-inf) is `nan`, not 0: the exact form multiplies -inf by
+        # (1 + erf(-inf)) == 0, and the tanh form multiplies it by
+        # (1 + tanh(-inf)) == 0. Both give the indeterminate product, on both
+        # sides. Kept because a kernel written as "clamp then scale" would give
+        # -0.0 here and pass every other case in this file.
+        for kwargs, kw_note in _GELU_APPROX:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    [float("nan"), float("inf"), float("-inf")], (3,),
+                    f"nan/+-inf -- +inf passes through, -inf gives NaN; {kw_note}",
+                    kwargs=kwargs,
+                )
+            )
+
+    # The refusals. This is `silu`'s side of the promotion split, not
+    # `tanh`'s: there is no GeluKernelImpl for an integral or boolean input,
+    # so a shim built on the promoting unary helper would compute where torch
+    # raises. bool is deferred into the lambdas for the usual reason (see
+    # masked_fill_cases).
+    for dtype_name in ["int64", "int32", "int16", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1, 2, 3], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"gelu(dtype={dtype_name}) [no GeluKernelImpl for an integral input]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note="torch: NotImplementedError(\"GeluKernelImpl\" not implemented for 'Long').",
+            )
+        )
+    cases.append(
+        Case(
+            name="gelu(dtype=bool) [no GeluKernelImpl for a mask either]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False])),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool)
+            ),
+            expect="both_error",
+            note="torch: NotImplementedError(\"GeluKernelImpl\" not implemented for 'Bool').",
+        )
+    )
+
+    # The two ways to get `approximate` wrong. Both are RuntimeErrors upstream
+    # and both must stay refusals: a shim that fell back to "none" on an
+    # unrecognised string would answer a Gemma typo with a BERT activation.
+    x_t, x_c = pair_from_flat(torch_module, c_module, [1.0, -1.0], (2,), "float32")
+    for bad in ["TANH", "erf", ""]:
+        cases.append(
+            Case(
+                name=f"gelu(approximate={bad!r}) [only 'none' and 'tanh' exist]",
+                op=op,
+                run_torch=lambda x_t=x_t, bad=bad: torch_call(x_t, approximate=bad),
+                run_c=lambda x_c=x_c, bad=bad: c_module._aten_dispatch(op, x_c, approximate=bad),
+                expect="both_error",
+                note="torch: 'approximate argument must be either none or tanh.'",
+            )
+        )
+    cases.append(
+        Case(
+            name="gelu(x, 'tanh') positionally [approximate is keyword-only]",
+            op=op,
+            run_torch=lambda: torch_call(x_t, "tanh"),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, "tanh"),
+            expect="both_error",
+            note=(
+                "The schema is `gelu(Tensor self, *, str approximate=\"none\")`. Accepting "
+                "the positional form would let `gelu(x, 'tanh')` mean the tanh formula in "
+                "the shim and be an error upstream -- divergence in the loudest direction."
+            ),
+        )
+    )
+    cases.append(
+        Case(
+            name="gelu(approximate=None) [the schema says str, not str?]",
+            op=op,
+            run_torch=lambda: torch_call(x_t, approximate=None),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, approximate=None),
+            expect="both_error",
+            note="torch: Expected a value of type 'str' ... but instead found type 'NoneType'.",
+        )
+    )
+    return cases
+
+
+# --- aten.gather.default -----------------------------------------------------
+#
+# `scatter.src` read backwards. The cases below are the three places candle's
+# own `Tensor::gather` and torch disagree (index dtype, out-of-range handling,
+# contiguity), plus the rank rule that is easy to get wrong in the safe-looking
+# direction -- see the kernel's docstring in rust/torch_c/src/aten.rs.
+
+_GATHER_SELF = ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3))
+
+
+def _gather_case(torch_module, c_module, torch_call, dtype_name, self_flat, self_shape,
+                 dim, idx_flat, idx_shape, idx_dtype="int64", kwargs=None,
+                 expect="match", note="") -> Case:
+    op = "aten.gather.default"
+    kwargs = kwargs or {}
+    s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+    i_t, i_c = pair_from_flat(torch_module, c_module, idx_flat, idx_shape, idx_dtype)
+    return Case(
+        name=f"gather(dtype={dtype_name}, self={self_shape}, dim={dim}, "
+             f"index={idx_shape}/{idx_dtype}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(s_t, dim, i_t, **kwargs),
+        run_c=lambda: c_module._aten_dispatch(op, s_c, dim, i_c, **kwargs),
+        expect=expect,
+        note=note,
+    )
+
+
+def gather_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.gather.default"
+    flat, shape = _GATHER_SELF
+    cases: list[Case] = []
+
+    # Every storable dtype, including bool -- gather moves bits, it does not
+    # compute, so there is no kernel-coverage split here the way there is for
+    # mm. bool goes through the deferred-construction form.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8"]:
+        cases.append(
+            _gather_case(torch_module, c_module, torch_call, dtype_name, flat, shape,
+                         1, [0, 2, 1, 0], (2, 2), note="along the last dim")
+        )
+    cases.append(
+        Case(
+            name="gather(dtype=bool, dim=1) [a mask is gathered like anything else]",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor([[True, False, True], [False, True, False]]),
+                1,
+                torch_module.tensor([[0, 2], [1, 0]]),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat([1, 0, 1, 0, 1, 0], [2, 3], dtype=c_module.bool),
+                1,
+                c_module._tensor_from_flat([0, 2, 1, 0], [2, 2], dtype=c_module.int64),
+            ),
+            note="the bool tag has to survive the round trip through the flat reader",
+        )
+    )
+
+    # Shape and axis coverage.
+    for dim, idx_flat, idx_shape, note in [
+        (0, [0, 1, 0, 1, 0, 1], (2, 3), "along dim 0"),
+        (-1, [0, 1, 1, 0], (2, 2), "negative dim"),
+        (1, [0], (1, 1), "index SMALLER than self off-axis -- the extra row is never read"),
+        (1, [0, 1, 2, 0, 1], (1, 5), "index LONGER than self along the axis -- values repeat"),
+        (1, [], (2, 0), "empty index gives an empty result, not an error"),
+        (1, [2, 2, 2, 2, 2, 2], (2, 3), "every index the same -- a broadcast written as a gather"),
+    ]:
+        cases.append(
+            _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                         dim, idx_flat, idx_shape, note=note)
+        )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, 2, 1, 0], (2, 2), idx_dtype="int32",
+                     note="int32 index -- torch accepts exactly int32 and int64")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, 1], (1, 2), kwargs={"sparse_grad": True},
+                     note="sparse_grad picks an autograd representation; the forward answer "
+                          "is identical either way (measured)")
+    )
+    # 3-d, which is the shape BERT's path actually produces.
+    cases.append(
+        _gather_case(
+            torch_module, c_module, torch_call, "float32",
+            [float(i) for i in range(24)], (2, 3, 4), 2,
+            [0, 3, 1, 2, 3, 0, 2, 2, 0, 1, 3, 3], (2, 3, 2),
+            note="3-d gather along the last axis",
+        )
+    )
+
+    # The rank rule, which is `max(rank, 1)` on BOTH sides and not "the ranks
+    # must be equal". Guessing the stricter rule refuses two calls torch
+    # answers; guessing a looser one accepts a call torch refuses.
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", [7.0], (), 0,
+                     [0, 0], (2,), note="0-d self with a 1-d index -> shape (2,)")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", [7.0], (), 0,
+                     [0], (), note="0-d self with a 0-d index -> 0-d")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", [1.0, 2.0], (2,), 0,
+                     [1], (), note="1-d self with a 0-d index -> 0-d")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", [7.0], (), 0,
+                     [0], (1, 1), expect="both_error",
+                     note="0-d self with a 2-d index IS refused -- max(rank,1) is 1, not 2")
+    )
+
+    # The refusals, one per disagreement with candle's own gather.
+    for idx_dtype in ["uint8", "int16", "float32"]:
+        cases.append(
+            _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                         1, [0, 1], (1, 2), idx_dtype=idx_dtype, expect="both_error",
+                         note="torch: 'gather(): Expected dtype int32/int64 for index'. candle's "
+                              "own gather accepts u8/u32 -- a uint8 mask would be read as positions")
+        )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, 3], (1, 2), expect="both_error",
+                     note="index past the axis extent")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, -1], (1, 2), expect="both_error",
+                     note="gather does NOT take negative indices, unlike select/slice. candle's "
+                          "i64 path would reach as_usize() and name a huge number instead of -1")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, 1], (2,), expect="both_error",
+                     note="index rank must match self rank")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     1, [0, 0, 0], (3, 1), expect="both_error",
+                     note="index LARGER than self off-axis is refused (the mirror of the "
+                          "'smaller' case above, which is allowed)")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", flat, shape,
+                     2, [0, 0, 0, 0], (2, 2), expect="both_error",
+                     note="dim out of range")
+    )
+    cases.append(
+        _gather_case(torch_module, c_module, torch_call, "float32", [], (2, 0), 1,
+                     [0, 0], (2, 1), expect="both_error",
+                     note="a zero-extent axis has no valid index at all")
+    )
+
+    # Non-contiguous self. candle's gather refuses this outright
+    # (RequiresContiguous); torch answers. Built through `transpose.int` so the
+    # non-contiguity is real on both sides rather than asserted.
+    cases.append(
+        Case(
+            name="gather(non-contiguous self via transpose) [candle's own gather refuses this]",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.ops.aten.transpose.int(
+                    torch_module.tensor([float(i) for i in range(12)]).reshape(3, 4), 0, 1
+                ),
+                1,
+                torch_module.tensor([[0, 2], [1, 0], [2, 1], [0, 0]]),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._aten_dispatch(
+                    "aten.transpose.int",
+                    c_module._tensor_from_flat([float(i) for i in range(12)], [3, 4],
+                                               dtype=c_module.float32),
+                    0, 1,
+                ),
+                1,
+                c_module._tensor_from_flat([0, 2, 1, 0, 2, 1, 0, 0], [4, 2], dtype=c_module.int64),
+            ),
+            note="torch gathers from a transposed tensor without comment; candle's kernel "
+                 "raises RequiresContiguous, which is why this shim reads the elements itself.",
+        )
+    )
+    return cases
+
+
+# --- aten.zero_.default ------------------------------------------------------
+#
+# Not a spelling of `fill_(0)` -- a separate overload upstream, so a separate
+# op here and a separate set of cases. Unlike `fill_` there is no overflow
+# table to reuse: zero is exact in every dtype, so what is worth checking is
+# the dtype tag surviving, the in-place identity, and the degenerate shapes.
+#
+# Where it fires was measured, and it is not the forward pass:
+# `nn.LayerNorm(8)`'s *constructor* calls it once (the bias), the forward calls
+# it never. See the kernel docstring.
+
+
+def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.zero_.default"
+    cases: list[Case] = []
+    for dtype_name in dt.DEFAULT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"zero_(dtype={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="in-place: compares the mutated operand zero_ returns",
+            )
+        )
+    cases.append(
+        Case(
+            name="zero_(dtype=bool) [False, not 0]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([[True, True], [False, True]])),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat([1, 1, 0, 1], [2, 2], dtype=c_module.bool)
+            ),
+            note="the bool tag must survive -- a shim that zeroed through uint8 would "
+                 "return a uint8 tensor and the dtype check would catch it",
+        )
+    )
+    for label, flat, shape in [
+        ("0-d", [3.0], ()),
+        ("empty", [], (0,)),
+        ("nan/inf overwritten", [float("nan"), float("inf"), float("-inf")], (3,)),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"zero_({label})",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note=label,
+            )
+        )
+    return cases
+
+
+# --- large-size GEMM cases ---------------------------------------------------
+#
+# docs/GPT2.md §7 left this open: the golden harness only ever multiplied
+# matrices small enough that accumulation order could not matter, so "does the
+# shim's GEMM agree with torch's at model scale" had never been asked here.
+# These cases ask it. What they found is written up in docs/ARCH.md §4; the
+# short version is that the answer is dtype-dependent and the *flat* tolerance
+# in dtypes.py is the wrong instrument for a reduction of depth k.
+#
+# Why a flat atol cannot describe a GEMM. dtypes.py sizes its tolerances at
+# "roughly one ULP at magnitude ~1" -- by its own docstring. A dot product of
+# length k does not produce a magnitude-1 answer from magnitude-1 inputs; it
+# produces one of magnitude ~sqrt(k), and the standard forward error bound for
+# a floating-point dot product is proportional to k*u*sum|a_i*b_i|, i.e. it
+# grows with BOTH the depth and the output's own scale. Comparing that against
+# a constant is a category error: it will pass a large tensor whose every
+# element is wrong by a relative 1e-3 (if the elements are small) and fail a
+# correct one (if they are large).
+#
+# So these cases carry their own checker, which asserts
+#
+#     max|torch - c|  <=  C * u(accumulate) * sqrt(k) * max|torch|
+#                          + 1 ulp of the STORAGE dtype at that magnitude
+#
+# with C = 4 for headroom. Three things about that formula are load-bearing:
+#
+#   * `sqrt(k)`, not `k`. The textbook forward bound for a length-k dot product
+#     is linear in k because it assumes every rounding error has the same sign.
+#     They do not, and a linear bound is loose enough to pass an actively wrong
+#     kernel. sqrt(k) is the statistical growth and still holds with margin at
+#     every size measured (docs/ARCH.md §4 tabulates them).
+#
+#   * `u(accumulate)`, not `u(storage)`. **torch's CPU GEMM accumulates in
+#     float32 no matter what the tensors are stored as** -- `at::opmath_type`.
+#     That is measured, not assumed: `mm(half a, half b)` is *bitwise* equal to
+#     `half(mm(float(a), float(b)))` at k = 4, 64 and 512, and the same for bmm
+#     and addmm. Sizing a float16 GEMM's tolerance by float16's own unit
+#     roundoff (4.9e-4) would let a kernel that accumulates in float16 pass
+#     with 20x room to spare -- which is precisely the bug this checker was
+#     rewritten to catch, after it did exactly that on the first attempt.
+#
+#   * the trailing ulp term. torch rounds once, at the end. A shim that also
+#     accumulates in float32 lands within that single rounding, so the term is
+#     what makes "match torch's method" the passing condition rather than
+#     "be lucky".
+#
+# It is NOT a widened tolerance. At every size measured it is between 5x and
+# 20x tighter than the answer, and it *fails* on an accumulation-dtype
+# mismatch by a factor of 4.4 -- see docs/ARCH.md §4.
+#
+# The checker also re-derives what the default flat-tolerance pipeline would
+# have said, so a verbose run prints both verdicts side by side and nobody has
+# to take this note's word for it.
+
+_GEMM_UNIT_ROUNDOFF = {
+    "float64": 2.0 ** -53,
+    "float32": 2.0 ** -24,
+    "float16": 2.0 ** -11,
+    "bfloat16": 2.0 ** -8,
+}
+# What torch accumulates a GEMM of this storage dtype in (`at::opmath_type`).
+_GEMM_ACCUMULATE_IN = {
+    "float64": "float64",
+    "float32": "float32",
+    "float16": "float32",
+    "bfloat16": "float32",
+}
+_GEMM_ERROR_CONSTANT = 4.0
+
+
+def _gemm_lcg(n: int, seed: int) -> list[float]:
+    """White noise in [-1, 1), identical on both sides because both sides are
+    handed this same list. Deliberately not `random` -- a golden case that
+    changes its inputs between runs cannot be bisected."""
+    out: list[float] = []
+    x = seed
+    for _ in range(n):
+        x = (1103515245 * x + 12345) % (1 << 31)
+        out.append((x / (1 << 30)) - 1.0)
+    return out
+
+
+def _gemm_scale_check(dtype_name: str, k: int):
+    """A value_check for a GEMM of reduction depth `k`. Replaces the whole
+    default pipeline, so it has to check dtype and shape itself."""
+    tol = dt.tolerance_for(dtype_name)
+    u_acc = _GEMM_UNIT_ROUNDOFF[_GEMM_ACCUMULATE_IN[dtype_name]]
+    u_out = _GEMM_UNIT_ROUNDOFF[dtype_name]
+    # C*u_acc*sqrt(k) for the accumulation, + 2*u_out for the single final
+    # rounding into the storage dtype (2u is one ulp; u is half of one).
+    bound_factor = _GEMM_ERROR_CONSTANT * u_acc * math.sqrt(k) + 2.0 * u_out
+
+    def check(t_res, c_res) -> tuple[bool, str]:
+        t_name, c_name = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+        if t_name != c_name:
+            return False, f"dtype mismatch: torch={t_name} c={c_name}"
+        t_shape = tuple(int(x) for x in t_res.shape)
+        c_shape = tuple(int(x) for x in c_res.shape)
+        if t_shape != c_shape:
+            return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+
+        def flatten(v):
+            if isinstance(v, list):
+                out = []
+                for item in v:
+                    out.extend(flatten(item))
+                return out
+            return [v]
+
+        tv, cv = flatten(t_res.tolist()), flatten(c_res.tolist())
+        scale = max((abs(v) for v in tv), default=0.0)
+        max_abs = 0.0
+        max_rel = 0.0
+        flat_tol_failures = 0
+        for x, y in zip(tv, cv):
+            d = abs(x - y)
+            if d > max_abs:
+                max_abs = d
+            if x != 0.0 and d / abs(x) > max_rel:
+                max_rel = d / abs(x)
+            if not math.isclose(x, y, rel_tol=tol.rtol, abs_tol=tol.atol):
+                flat_tol_failures += 1
+        bound = bound_factor * scale
+        flat_verdict = (
+            "would also pass" if flat_tol_failures == 0
+            else f"would FAIL on {flat_tol_failures}/{len(tv)} elements"
+        )
+        detail = (
+            f"k={k} n={len(tv)} max|d|={max_abs:.4g} max_rel={max_rel:.4g} "
+            f"|out|max={scale:.4g} bound={bound:.4g} "
+            f"(={_GEMM_ERROR_CONSTANT:g}*u[{_GEMM_ACCUMULATE_IN[dtype_name]}]"
+            f"*sqrt(k)+2*u[{dtype_name}], scaled by |out|max); "
+            f"flat atol={tol.atol:g}/rtol={tol.rtol:g} {flat_verdict}"
+        )
+        if max_abs > bound:
+            return False, (
+                "GEMM error exceeds the scale-aware bound -- this is an accumulation "
+                f"difference, not rounding: {detail}"
+            )
+        return True, detail
+
+    return check
+
+
+def _big_gemm_case(torch_module, c_module, torch_call, op, dtype_name, m, k, n,
+                   with_bias=False, batch=None, note="") -> Case:
+    """One large mm / bmm / addmm case, checked against the scale-aware bound."""
+    b = batch or 1
+    a_flat = _gemm_lcg(b * m * k, 1)
+    w_flat = _gemm_lcg(b * k * n, 2)
+    a_shape = (b, m, k) if batch else (m, k)
+    w_shape = (b, k, n) if batch else (k, n)
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+    if with_bias:
+        bias_flat = _gemm_lcg(n, 3)
+        bias_t, bias_c = pair_from_flat(torch_module, c_module, bias_flat, (n,), dtype_name)
+        run_torch = lambda: torch_call(bias_t, a_t, w_t)  # noqa: E731
+        run_c = lambda: c_module._aten_dispatch(op, bias_c, a_c, w_c)  # noqa: E731
+    else:
+        run_torch = lambda: torch_call(a_t, w_t)  # noqa: E731
+        run_c = lambda: c_module._aten_dispatch(op, a_c, w_c)  # noqa: E731
+    short = op.split(".", 2)[1]
+    return Case(
+        name=f"{short}(dtype={dtype_name}, {a_shape}x{w_shape}) [model-scale, k={k}: {note}]",
+        op=op,
+        run_torch=run_torch,
+        run_c=run_c,
+        note=note,
+        value_check=_gemm_scale_check(dtype_name, k),
+    )
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -4764,4 +5356,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.native_layer_norm.default": native_layer_norm_cases,
     "aten.split.Tensor": split_cases,
     "aten.tanh.default": tanh_cases,
+    # What widening past the Llama/GPT-2 family asks for (docs/ARCH.md).
+    "aten.gelu.default": gelu_cases,
+    "aten.gather.default": gather_cases,
+    "aten.zero_.default": zero__cases,
 }
