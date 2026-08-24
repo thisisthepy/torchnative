@@ -686,7 +686,303 @@ def _op_callable(dispatch, qualname: str, overload: str):
     return op
 
 
-def install(module, surface_json: str) -> None:
+# ---------------------------------------------------------------------------
+# Overload resolution -- `torch.<op>(...)` -> `aten.<op>.<overload>`
+# ---------------------------------------------------------------------------
+#
+# `torch.full` is not an aten op. Upstream it is a C binding that reads the
+# actual arguments, picks one of several native functions, and calls it; the
+# aten overload name is a property of the *native function it picked*, not of
+# the name the caller typed. So a shim that stops at `torch.ops.aten.<op>.<ov>`
+# leaves the whole user-facing API dark, which is where this project was:
+#
+#     torch.ops.aten.full.default([2], True).dtype   ->  torch.bool
+#     torch.full((2,), True)                         ->  NotImplementedError
+#
+# and the vendored tree plus transformers call the second spelling.
+#
+# What is reproduced here is `PythonArgParser::raw_parse`: a signature list per
+# name, tried in order, first one that binds wins. That is deliberately the
+# same algorithm rather than a lookup table of special cases, because the
+# ordering *is* the semantics -- see the note in `overloads.json` about
+# `arange.start` versus `arange.start_step`.
+#
+# The single door is untouched. Resolution decides *which key* to hand
+# `_C._aten_dispatch`; it never computes, never reaches a kernel by another
+# route, and an op it resolves to but that has no kernel raises the same
+# `aten op not implemented in torch._C shim: <key>` as before. A name with no
+# table entry keeps the old refusal. So the instrument gains resolution without
+# gaining a second entrance.
+
+_SCHEMA_BASE_TYPES = frozenset(
+    {
+        "Tensor",
+        "Scalar",
+        "SymInt",
+        "int",
+        "float",
+        "bool",
+        "str",
+        "ScalarType",
+        "Layout",
+        "Device",
+        "MemoryFormat",
+        "Generator",
+    }
+)
+
+
+def _decompose_type(spelling: str):
+    """`SymInt[]?` -> `("SymInt", True, True)`, `Tensor(a!)` -> `("Tensor", False, False)`.
+
+    Returns `(base, is_list, is_optional)`. The order of the strips matters:
+    `?` binds outermost (`int[]?` is an optional list, not a list of optional
+    ints), and an alias annotation is attached to the base.
+    """
+    text = spelling.strip()
+    optional = text.endswith("?")
+    if optional:
+        text = text[:-1].strip()
+    is_list = False
+    if text.endswith("]"):
+        is_list = True
+        text = text[: text.rindex("[")].strip()
+    # `Tensor(a!)`, `Tensor(a)` -- the alias annotation is `_AliasInfo`'s
+    # business (it is what `is_mutable()` reads); for type checking it is not
+    # part of the type.
+    if text.endswith(")") and "(" in text:
+        text = text[: text.index("(")].strip()
+    return text, is_list, optional
+
+
+class _TypeChecker:
+    """"Does this Python value satisfy this schema type?"
+
+    `FunctionParameter::check` in `python_arg_parser.cpp`, restricted to the
+    spellings the table contains -- `install` refuses to start if the table
+    grows one this does not know, so the restriction is enforced rather than
+    assumed.
+
+    Three of these rules are torch's and would be got wrong by intuition:
+
+      * `bool` does **not** satisfy `int`. `bool` subclasses `int` in Python,
+        but torch's `THPUtils_checkLong` excludes it explicitly, and it has to
+        -- `torch.full((2,), True)` must reach `Scalar` as a bool so the result
+        is `torch.bool` and not `int64`.
+      * `int` **does** satisfy `float`, one way only.
+      * a zero-dim tensor satisfies `Scalar`. torch's `DOUBLE`/`SCALAR` case
+        falls through to accepting a 0-dim `THPVariable`, which is why
+        `torch.pow(t, other_0d_tensor)` picks `pow.Tensor_Tensor` -- declared
+        first -- rather than `pow.Tensor_Scalar`.
+    """
+
+    def __init__(self, module) -> None:
+        self._module = module
+        self._tensor = module.TensorBase
+        self._dtype = module.dtype
+        self._layout = getattr(module, "layout", None)
+        self._memory_format = getattr(module, "memory_format", None)
+        self._device = module.device
+        self._generator = getattr(module, "Generator", None)
+
+    def check(self, spelling, value) -> bool:
+        base, is_list, optional = _decompose_type(str(spelling))
+        if optional and value is None:
+            return True
+        if is_list:
+            if isinstance(value, (list, tuple)):
+                return all(self._base(base, item) for item in value)
+            return False
+        return self._base(base, value)
+
+    def _base(self, base: str, value) -> bool:
+        if base == "Tensor":
+            return isinstance(value, self._tensor)
+        if base == "Scalar":
+            if isinstance(value, (bool, int, float, complex)):
+                return True
+            return isinstance(value, self._tensor) and value.dim() == 0
+        if base in ("int", "SymInt"):
+            return isinstance(value, int) and not isinstance(value, bool)
+        if base == "float":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if base == "bool":
+            return isinstance(value, bool)
+        if base == "str":
+            return isinstance(value, str)
+        if base == "ScalarType":
+            return isinstance(value, self._dtype)
+        if base == "Layout":
+            return self._layout is not None and isinstance(value, self._layout)
+        if base == "MemoryFormat":
+            return self._memory_format is not None and isinstance(
+                value, self._memory_format
+            )
+        if base == "Device":
+            # torch takes a bare string wherever a device is taken, and
+            # `device_arg` in aten.rs already accepts one.
+            return isinstance(value, (self._device, str))
+        if base == "Generator":
+            return self._generator is not None and isinstance(value, self._generator)
+        raise RuntimeError(f"torch._C shim: unhandled schema type: {base}")
+
+
+def _is_schema_default(value, default_source) -> bool:
+    """Is this the value the schema would have used anyway?
+
+    Arguments equal to their own default carry no information, and dropping
+    them is what keeps `torch.ones(2, pin_memory=False)` from arriving at a
+    kernel that refuses every non-`None` `pin_memory`. It also means a kernel
+    only ever sees arguments a caller actually asked for.
+
+    Comparison is restricted to literal defaults against scalar values on
+    purpose: `==` against a `TensorBase` would go through a synthesised
+    `__eq__` that raises.
+    """
+    if default_source is None:
+        return False
+    if default_source == "None":
+        return value is None
+    if default_source == "True":
+        return value is True
+    if default_source == "False":
+        return value is False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    for parse in (int, float):
+        try:
+            return value == parse(default_source)
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+class _Overloads:
+    """The ordered signature list for one `torch.<name>`."""
+
+    __slots__ = ("name", "schemas", "keys", "_checker_source")
+
+    def __init__(self, name: str, schemas, checker_source) -> None:
+        self.name = name
+        self.schemas = [_Schema.parse(text) for text in schemas]
+        # A callable rather than a `_TypeChecker`: `layout` and `memory_format`
+        # are synthesised later in `install` than this table is parsed, and the
+        # first *call* is long after both. Parsing and validating the table
+        # still happens now -- see the `_SCHEMA_BASE_TYPES` check below.
+        self._checker_source = checker_source
+        self.keys = []
+        for schema in self.schemas:
+            namespace, _, op = schema.name.partition("::")
+            self.keys.append(f"{namespace}.{op}.{schema.overload_name or 'default'}")
+            for argument in schema.arguments:
+                base, _, _ = _decompose_type(str(argument.type))
+                if base not in _SCHEMA_BASE_TYPES:
+                    # At install time, not at call time. A spelling nobody
+                    # taught `_TypeChecker` would otherwise make every call to
+                    # that overload silently fail to match, which reads as "no
+                    # overload matched" -- a wrong answer wearing the shape of
+                    # a right one.
+                    raise RuntimeError(
+                        f"torch._C shim: overloads.json entry {name!r} uses schema "
+                        f"type {base!r}, which _TypeChecker does not handle: "
+                        f"{schema}"
+                    )
+
+    def _bind(self, schema, args, kwargs):
+        """torch's `FunctionSignature::parse`, minus the parts nothing uses.
+
+        Returns the bound arguments, or `None` if this schema does not accept
+        the call.
+        """
+        checker = self._checker_source()
+        positional = [a for a in schema.arguments if not a.kwarg_only]
+        by_name = {a.name: a for a in schema.arguments}
+
+        # The varargs int-list rule, with torch's exact precondition: it
+        # applies only when the signature has a *single* positional argument
+        # and that argument is an int list, which is what makes
+        # `torch.ones(2, 3)` mean `ones([2, 3])` while `torch.full(2, 3)` stays
+        # an error rather than becoming `full([2], 3)`.
+        if len(positional) == 1 and args:
+            base, is_list, _ = _decompose_type(str(positional[0].type))
+            if (
+                is_list
+                and base in ("int", "SymInt")
+                and isinstance(args[0], int)
+                and not isinstance(args[0], bool)
+            ):
+                args = (tuple(args),)
+
+        if len(args) > len(positional):
+            return None
+
+        bound = {}
+        for value, parameter in zip(args, positional):
+            if parameter.name in kwargs:
+                return None  # given twice
+            if not checker.check(parameter.type, value):
+                return None
+            bound[parameter.name] = value
+
+        for key, value in kwargs.items():
+            parameter = by_name.get(key)
+            if parameter is None or key in bound:
+                return None
+            if not checker.check(parameter.type, value):
+                return None
+            bound[key] = value
+
+        for parameter in schema.arguments:
+            if parameter.name not in bound and not parameter.has_default_value():
+                return None
+
+        return {
+            name: value
+            for name, value in bound.items()
+            if not _is_schema_default(value, by_name[name].default_value)
+        }
+
+    def resolve(self, args, kwargs):
+        for schema, key in zip(self.schemas, self.keys):
+            bound = self._bind(schema, args, kwargs)
+            if bound is not None:
+                return key, bound
+        raise TypeError(
+            f"torch.{self.name}(): no matching overload in torch._C shim for "
+            f"({_describe_call(args, kwargs)}). Candidates tried, in order:\n"
+            + "\n".join(f"  {schema}" for schema in self.schemas)
+        )
+
+
+def _describe_call(args, kwargs) -> str:
+    parts = [type(a).__name__ for a in args]
+    parts += [f"{k}={type(v).__name__}" for k, v in kwargs.items()]
+    return ", ".join(parts)
+
+
+# Python-level keyword arguments torch's factory functions accept that no aten
+# schema mentions. They are the autograd knob, and this shim has no autograd
+# (DESIGN.md §3 stage 0) -- so `requires_grad=False` is dropped and
+# `requires_grad=True` is refused by name rather than ignored, which would hand
+# back a tensor that silently does not record anything.
+def _strip_python_only_kwargs(name: str, kwargs: dict) -> dict:
+    kwargs = dict(kwargs)
+    if kwargs.pop("requires_grad", False):
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: torch.{name}(requires_grad=True) "
+            f"-- there is no autograd behind this shim, and returning a tensor "
+            f"that quietly records nothing would be worse than refusing"
+        )
+    # An explicit `out=None` is how the vendored tree spells "no out tensor".
+    # Left in place it would fail to bind the `.out` overload (`out` is not
+    # optional there) *and* fail to bind the plain one (`out` is not an
+    # argument of it), so the call would report no matching overload.
+    if "out" in kwargs and kwargs["out"] is None:
+        del kwargs["out"]
+    return kwargs
+
+
+def install(module, surface_json: str, overloads_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
     real = set(vars(module))
@@ -694,6 +990,30 @@ def install(module, surface_json: str) -> None:
     # Readable from Python so the decision can be inspected rather than
     # reverse-engineered from what is absent.
     module._shim_off_switches = sorted(off)
+
+    # -- overload resolution ----------------------------------------------
+    #
+    # Parsed and validated now, so a malformed table stops `import _C` at the
+    # line that is wrong. The `_TypeChecker` it will use is built on first
+    # call, because `layout` and `memory_format` do not exist yet.
+    checker_cell = []
+
+    def _checker_source():
+        if not checker_cell:
+            checker_cell.append(_TypeChecker(module))
+        return checker_cell[0]
+
+    overloads = {
+        name: _Overloads(name, schemas, _checker_source)
+        for name, schemas in json.loads(overloads_json).items()
+        if not name.startswith("_")  # the table's embedded README
+    }
+    # Inspectable for the same reason as `_shim_off_switches`: which aten key a
+    # `torch.<op>` call can reach should be answerable by asking, not by
+    # reading the table back out of the artefact.
+    module._shim_overloads = {
+        name: list(entry.keys) for name, entry in sorted(overloads.items())
+    }
 
     # -- types ------------------------------------------------------------
     resolved = {}
@@ -805,7 +1125,7 @@ def install(module, surface_json: str) -> None:
         def __getattr__(self, name):
             if name.startswith("__") and name.endswith("__"):
                 raise AttributeError(name)
-            fn = _torch_level_function(name)
+            fn = _torch_level_function(name, dispatch, overloads)
             setattr(self, name, fn)
             return fn
 
@@ -813,7 +1133,10 @@ def install(module, surface_json: str) -> None:
     for name in surface["varfns"]:
         if name.startswith("__"):
             continue
-        setattr(varfns, name, _torch_level_function(name))
+        setattr(varfns, name, _torch_level_function(name, dispatch, overloads))
+    # `torch.tensor` is the one name on this object that is not an overload set
+    # -- see `_tensor_factory`.
+    varfns.tensor = _tensor_factory(module, dispatch)
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -849,27 +1172,83 @@ def install(module, surface_json: str) -> None:
     )
 
 
-def _torch_level_function(name: str):
+def _torch_level_function(name: str, dispatch, overloads):
     """A `torch.<name>` harvested from `_VariableFunctions`.
 
-    It does not guess an overload. `torch.add(...)` in real torch resolves
-    among `add.Tensor`, `add.Scalar` and `add.out` by argument types, and
-    picking `.default` here would send every call to a key that mostly does
-    not exist -- which would poison the very instrument (§6's work queue) that
-    the single door is for. So it refuses and points at the spelling that does
-    carry an overload.
-    """
+    With a table entry it resolves: the arguments choose an aten overload and
+    the call goes through `_C._aten_dispatch` with the resolved key. Without
+    one it still refuses, and still will not guess -- `torch.add(...)` picks
+    among `add.Tensor`, `add.Scalar` and `add.out` by argument type, and
+    sending every call to `.default` would name a key that mostly does not
+    exist, poisoning the work queue DESIGN.md §6 is built on.
 
-    def fn(*args, **kwargs):
-        raise NotImplementedError(
-            f"not implemented in torch._C shim: torch.{name}(...) -- overload "
-            f"resolution is not implemented; call torch.ops.aten.{name}.<overload>, "
-            f"which carries the overload and reaches the same dispatcher"
-        )
+    Note what stays true either way: resolution decides *which key*, and the
+    key still goes to the one door. An op that resolves but has no kernel
+    raises `aten op not implemented in torch._C shim: <key>` from `aten.rs` --
+    which is a strictly better work item than the old blanket refusal, because
+    it names the overload the caller actually needed rather than the whole
+    family.
+    """
+    entry = overloads.get(name)
+
+    if entry is None:
+
+        def fn(*args, **kwargs):
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch.{name}(...) -- overload "
+                f"resolution has no table entry for this op "
+                f"(rust/torch_c/src/overloads.json); call "
+                f"torch.ops.aten.{name}.<overload>, which carries the overload "
+                f"and reaches the same dispatcher"
+            )
+
+    else:
+
+        def fn(*args, **kwargs):
+            key, bound = entry.resolve(args, _strip_python_only_kwargs(name, kwargs))
+            return dispatch(key, **bound)
 
     fn.__name__ = name
     fn.__qualname__ = name
     return fn
+
+
+def _tensor_factory(module, dispatch):
+    """`torch.tensor(...)`, which has no overload set to resolve against.
+
+    Every other name in `overloads.json` maps to aten overloads. This one does
+    not: upstream's `torch.tensor` is `THPVariable_tensor` ->
+    `internal_new_from_data`, a `_C` function, and a real `torch.tensor([1, 2])`
+    produces exactly one aten record -- `aten.lift_fresh.default` (measured).
+    `aten::tensor` does exist, but it is a TorchScript builtin that this path
+    never reaches, so routing here would have named a key upstream never names.
+
+    So the split is upstream's own: `_C` builds the data, and the single aten
+    call upstream really makes is the single aten call made here. The door is
+    still one door -- `lift_fresh` goes through `_aten_dispatch` like anything
+    else.
+    """
+
+    def tensor(data, *, dtype=None, device=None, requires_grad=False, pin_memory=False):
+        if requires_grad:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.tensor(requires_grad=True) "
+                "-- there is no autograd behind this shim"
+            )
+        if pin_memory:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.tensor(pin_memory=True)"
+            )
+        if isinstance(device, str):
+            device = module.device(device)
+        return dispatch(
+            "aten.lift_fresh.default",
+            module._tensor_new_from_data(data, dtype, device),
+        )
+
+    tensor.__name__ = "tensor"
+    tensor.__qualname__ = "tensor"
+    return tensor
 
 
 def _install_namespace_types(module, namespace) -> None:
@@ -942,6 +1321,24 @@ _DISCOVERED_RETURNS = {
     # `None` says so. The override machinery still records itself, and still has
     # nothing to override.
     "_dispatch_get_computed_kernel_for_dispatch_key": None,
+    # `torch/xpu/__init__.py:278`, reached from `torch.xpu.is_available()`,
+    # reached from `transformers/masking_utils.py:39` -- at *import* of
+    # `transformers.generation.utils`, which is the lazy import
+    # docs/IMPORT_TORCH.md §11 item 3 recorded `from_config` as dying in.
+    #
+    # This one is a real answer, not a stand-in: upstream returns the number of
+    # XPU devices, and a build with no XPU support has none. The name has to
+    # exist -- `torch.xpu` is an ordinary Python package that is always
+    # importable, so the absence trick (VENDOR.md wall 11) does not apply here;
+    # `hasattr` never gets a chance to be the question.
+    "_xpu_getDeviceCount": 0,
+    # `torch/mtia/__init__.py:152`, reached from
+    # `torch/_dynamo/device_interface.py:297` at module scope, reached from
+    # `torch/_inductor/utils.py:115`, reached from the same transformers lazy
+    # import as the entry above. Upstream returns whether the build has MTIA
+    # support compiled in; this one does not. Same shape of answer, same
+    # reason the name cannot simply be absent.
+    "_mtia_isBuilt": False,
 }
 
 # The same, for members of synthesised `_C` types: `"<Type>.<member>": value`.

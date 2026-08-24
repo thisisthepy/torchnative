@@ -1,0 +1,123 @@
+{
+  "_README": [
+    "Overload resolution table for `torch.<op>(...)`.",
+    "",
+    "Each key is a name `torch/__init__.py` hoists off `_C._VariableFunctions`.",
+    "Each value is the ordered list of aten schemas that torch's *Python*",
+    "binding exposes under that name -- not every aten overload of that name.",
+    "The distinction is load-bearing: `aten::pow` has fifteen overloads, of",
+    "which eleven (`pow.int`, `pow.float_complex`, `pow.Scalar_Scalar`, ...)",
+    "are TorchScript numeric builtins that `torch.pow` will not accept, and",
+    "listing them would make `torch.pow(2, 3)` return a float where real torch",
+    "raises TypeError.",
+    "",
+    "ORDER IS THE ALGORITHM. The resolver takes the first schema that binds,",
+    "exactly as `PythonArgParser::raw_parse` does, so the order here is not",
+    "cosmetic. Two places where a plausible order is the wrong one, both",
+    "measured against torch 2.13.0 with a `TorchDispatchMode` logger rather",
+    "than reasoned about (docs/OVERLOAD.md §3):",
+    "",
+    "  * `.out` variants come first. They take `out` as a required kwarg-only",
+    "    argument, so they bind only when the caller passed `out=`, and putting",
+    "    them last would let the non-out schema swallow the call and drop the",
+    "    output tensor on the floor.",
+    "  * `arange.start` comes before `arange.start_step`, even though",
+    "    `start_step`'s `step=1` default makes it bind a two-argument call too.",
+    "    Real torch sends `torch.arange(0, 5)` to `arange.start`, and reversing",
+    "    these two would name the wrong key in the work queue.",
+    "",
+    "Provenance: the schema strings are `str(torch.ops.aten.<op>.<ov>._schema)`",
+    "from torch 2.13.0, transcribed here. Unlike `surface.json` this could not",
+    "come from the vendored tree -- see docs/OVERLOAD.md §2 for what the tree",
+    "does and does not carry -- so `pytests/verify_schemas.py` re-derives them",
+    "from upstream and diffs, which keeps the table from drifting silently.",
+    "That script needs real torch; the build does not."
+  ],
+
+  "arange": [
+    "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::arange.start(Scalar start, Scalar end, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::arange.start_step(Scalar start, Scalar end, Scalar step=1, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::arange(Scalar end, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "argmax": [
+    "aten::argmax.out(Tensor self, int? dim=None, bool keepdim=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
+
+  "cat": [
+    "aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::cat(Tensor[] tensors, int dim=0) -> Tensor"
+  ],
+
+  "embedding": [
+    "aten::embedding.out(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::embedding(Tensor weight, Tensor indices, SymInt padding_idx=-1, bool scale_grad_by_freq=False, bool sparse=False) -> Tensor"
+  ],
+
+  "empty": [
+    "aten::empty.out(SymInt[] size, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::empty.memory_format(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor"
+  ],
+
+  "full": [
+    "aten::full.out(SymInt[] size, Scalar fill_value, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "is_floating_point": [
+    "aten::is_floating_point(Tensor self) -> bool"
+  ],
+
+  "isin": [
+    "aten::isin.Tensor_Tensor_out(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Tensor_Scalar_out(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Scalar_Tensor_out(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)",
+    "aten::isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor",
+    "aten::isin.Tensor_Scalar(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False) -> Tensor",
+    "aten::isin.Scalar_Tensor(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor"
+  ],
+
+  "mm": [
+    "aten::mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::mm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+
+  "ones": [
+    "aten::ones.out(SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::ones(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "pow": [
+    "aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor",
+    "aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor",
+    "aten::pow.Scalar(Scalar self, Tensor exponent) -> Tensor"
+  ],
+
+  "randint": [
+    "aten::randint.low_generator_out(SymInt low, SymInt high, SymInt[] size, *, Generator? generator, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.generator_out(SymInt high, SymInt[] size, *, Generator? generator, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.low_out(SymInt low, SymInt high, SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.out(SymInt high, SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randint.low_generator(SymInt low, SymInt high, SymInt[] size, *, Generator? generator, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint.generator(SymInt high, SymInt[] size, *, Generator? generator, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint.low(SymInt low, SymInt high, SymInt[] size, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randint(SymInt high, SymInt[] size, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "rsqrt": [
+    "aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::rsqrt(Tensor self) -> Tensor"
+  ],
+
+  "add": [
+    "aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ]
+}

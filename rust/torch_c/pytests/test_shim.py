@@ -72,12 +72,14 @@ def test_tensor_base_is_subclassable():
 
 
 def test_unimplemented_op_names_itself():
+    # `aten.embedding.default` used to stand here and now has a kernel, which
+    # is the right failure mode for this test -- it goes red when the op it
+    # samples stops being a sample. `relu` is the example docs/TORCH_C.md §1
+    # uses and is on no current work list.
     try:
-        _C._aten_dispatch("aten.embedding.default")
+        _C._aten_dispatch("aten.relu.default")
     except NotImplementedError as e:
-        assert str(e) == (
-            "aten op not implemented in torch._C shim: aten.embedding.default"
-        )
+        assert str(e) == "aten op not implemented in torch._C shim: aten.relu.default"
     else:
         raise AssertionError("an unimplemented op must raise")
 
@@ -85,13 +87,149 @@ def test_unimplemented_op_names_itself():
 def test_every_advertised_op_is_actually_dispatchable():
     # A name in the list that falls through to the fallback would make the
     # instrument lie about what is covered.
-    for op in _C._aten_implemented():
+    for op in _C._aten_implemented() + _C._aten_implemented_awaiting_golden():
         try:
             _C._aten_dispatch(op)
         except NotImplementedError as e:  # pragma: no cover - regression guard
             raise AssertionError(f"{op} is advertised but not dispatchable: {e}")
         except TypeError:
             pass  # missing arguments: reached the kernel, which is the point
+
+
+def test_the_two_op_lists_are_disjoint():
+    # `_aten_implemented_awaiting_golden()` under-reports on purpose (it is
+    # kept out of the harness's coverage count until a case builder exists).
+    # An op appearing in both would make it over-report instead, which is the
+    # direction docs/TORCH_C.md §1 says the instrument must never take.
+    advertised = set(_C._aten_implemented())
+    parked = set(_C._aten_implemented_awaiting_golden())
+    assert not (advertised & parked)
+
+
+# --- overload resolution (docs/OVERLOAD.md) ---------------------------------
+#
+# `torch.<op>` lives on `_C._VariableFunctions`; `torch/__init__.py` hoists it
+# onto the `torch` namespace at import. These tests reach it at the source, so
+# they run against the bare artefact with no vendored tree present.
+
+
+def _vf(name):
+    return getattr(_C._VariableFunctions, name)
+
+
+def _resolved_key(name, *args, **kwargs):
+    """Which aten key does this call land on?
+
+    Asked by making the call fail at the dispatcher, which is the only place
+    that knows -- an assertion on the *message* would be asserting on wording.
+    So instead the call is aimed at an op whose kernel exists and the answer is
+    read from the result, except here where the point is the key itself: an
+    unimplemented overload names itself, and that name is the answer.
+    """
+    try:
+        _vf(name)(*args, **kwargs)
+    except NotImplementedError as e:
+        text = str(e)
+        marker = "aten op not implemented in torch._C shim: "
+        assert marker in text, text
+        return text.split(marker, 1)[1].strip()
+    raise AssertionError(f"torch.{name} was expected to reach an unimplemented op")
+
+
+def test_overload_resolution_picks_the_same_key_torch_picks():
+    # Each of these was measured on real torch 2.13.0 with a TorchDispatchMode
+    # logger (docs/OVERLOAD.md §3). The two arange rows are the ones a
+    # plausible reading of the schemas gets wrong: `start_step` has a default
+    # for `step`, so it would happily swallow the two-argument call.
+    t = _C._aten_dispatch("aten.full.default", [2], 1.0)
+    assert _vf("arange")(5).dtype == _C.int64
+    assert _vf("arange")(0.0, 5).dtype == _C.float32
+    assert _vf("ones")(2, 3).shape == (2, 3)
+    assert _vf("full")([2], True).dtype == _C.bool
+    # `out=` selects the `.out` variant, which has no kernel -- so the key it
+    # names is the proof it was selected.
+    assert _resolved_key("full", [2], 1.0, out=t) == "aten.full.out"
+    assert _resolved_key("arange", 5, out=t) == "aten.arange.out"
+    assert _resolved_key("mm", t, t, out=t) == "aten.mm.out"
+
+
+def test_overload_resolution_refuses_rather_than_guessing():
+    # `torch.full` has two positional arguments, so the varargs int-list rule
+    # does not apply and `full(2, 3)` is not `full([2], 3)`.
+    try:
+        _vf("full")(2, 3)
+    except TypeError as e:
+        assert "no matching overload" in str(e)
+        # The candidates are listed, because the work item is "which signature
+        # did I mean", not "something went wrong".
+        assert "aten::full" in str(e)
+    else:
+        raise AssertionError("full(2, 3) must not resolve")
+
+    # An op with no table entry keeps the old refusal rather than guessing
+    # `.default`.
+    try:
+        _vf("relu")(1)
+    except NotImplementedError as e:
+        assert "no table entry" in str(e)
+    else:
+        raise AssertionError("an op with no table entry must refuse")
+
+
+def test_varargs_intlist_rule_matches_torchs_precondition():
+    # torch allows `ones(2, 3)` only because `ones`'s single positional
+    # argument is an int list. The same spelling on a two-positional signature
+    # is an error, which the previous test covers from the other side.
+    assert _vf("ones")(2, 3).shape == (2, 3)
+    assert _vf("ones")((2, 3)).shape == (2, 3)
+    assert _vf("ones")(2).shape == (2,)
+
+
+def test_requires_grad_is_refused_not_ignored():
+    try:
+        _vf("ones")(2, requires_grad=True)
+    except NotImplementedError as e:
+        assert "autograd" in str(e)
+    else:
+        raise AssertionError("requires_grad=True must not be silently dropped")
+    # ... and the falsy spelling, which the vendored tree passes constantly,
+    # goes through.
+    assert _vf("ones")(2, requires_grad=False).shape == (2,)
+
+
+def test_torch_tensor_builds_data_and_goes_through_lift_fresh():
+    tensor = _vf("tensor")
+    assert tensor([1, 2]).dtype == _C.int64
+    assert tensor([1.0, 2]).dtype == _C.float32
+    # The category test is the reason this is not just "is it a number":
+    # `bool` subclasses `int`, and a bool list is a mask.
+    assert tensor([True, False]).dtype == _C.bool
+    assert tensor([True, False]).tolist() == [True, False]
+    assert tensor(5).shape == ()
+    assert tensor([[1, 2], [3, 4]]).shape == (2, 2)
+    try:
+        tensor([[1], 2])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a ragged nested sequence must be refused")
+
+
+def test_the_overload_table_is_inspectable():
+    # Same reason as `_shim_off_switches`: which keys a `torch.<op>` call can
+    # reach should be answerable by asking, not by reading the table back out
+    # of the artefact.
+    table = _C._shim_overloads
+    assert table["full"] == ["aten.full.out", "aten.full.default"]
+    assert "aten.arange.start" in table["arange"]
+    # Every key the table can produce is either implemented or refuses by
+    # name; nothing in between.
+    for keys in table.values():
+        for key in keys:
+            try:
+                _C._aten_dispatch(key)
+            except (NotImplementedError, TypeError):
+                pass
 
 
 # --- implemented ops --------------------------------------------------------
