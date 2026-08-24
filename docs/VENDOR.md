@@ -115,7 +115,7 @@ torch/test/                상류 자체 테스트
 
 ```bash
 # 1. 벤더링 (기본 소스는 spike-venv 의 torch 2.13.0)
-./vendor/vendor_torch.sh                       # BRAINWAVE_TORCH_SRC 로 소스 변경 가능
+./vendor/vendor_torch.sh                       # TORCHNATIVE_TORCH_SRC 로 소스 변경 가능
 
 # 2. 우리 _C 를 넣기
 export PATH="$HOME/.cargo/bin:$PATH"

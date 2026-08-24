@@ -524,11 +524,11 @@ print((x*x).tolist(), x.sum().item(), x[0].tolist(), (x==2.0).tolist())"
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c "import torch.nn as nn; nn.Linear(4,3)"
 ```
 
-iOS 빌드는 `BRAINWAVE_PYTHON_FRAMEWORK_DIR` 도 필요합니다 (`build.rs` 가 없으면 그 자리에서
+iOS 빌드는 `TORCHNATIVE_PYTHON_FRAMEWORK_DIR` 도 필요합니다 (`build.rs` 가 없으면 그 자리에서
 메시지를 내고 멈춥니다):
 
 ```bash
-BRAINWAVE_PYTHON_FRAMEWORK_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos \
+TORCHNATIVE_PYTHON_FRAMEWORK_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos \
 PYO3_CONFIG_FILE=<suppress_build_script_link_lines=true 인 설정> \
 PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
 PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos/lib \

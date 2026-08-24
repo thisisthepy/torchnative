@@ -11,7 +11,7 @@
 //!
 //! | variable | who sets it | when |
 //! |---|---|---|
-//! | `BRAINWAVE_PYTHON_FRAMEWORK_DIR` | the build driver (`Cargo.kt`, or the dev shell) | iOS targets only |
+//! | `TORCHNATIVE_PYTHON_FRAMEWORK_DIR` | the build driver (`Cargo.kt`, or the dev shell) | iOS targets only |
 //! | `PYO3_CONFIG_FILE` | same, with `suppress_build_script_link_lines=true` | iOS targets only |
 //!
 //! Both are needed together and neither is sufficient alone -- PyO3 hardcodes
@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-const FRAMEWORK_DIR_VAR: &str = "BRAINWAVE_PYTHON_FRAMEWORK_DIR";
+const FRAMEWORK_DIR_VAR: &str = "TORCHNATIVE_PYTHON_FRAMEWORK_DIR";
 
 fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
