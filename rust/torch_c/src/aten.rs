@@ -36,11 +36,13 @@ use crate::tensor::PyTensorBase;
 /// that meaning.
 pub const IMPLEMENTED: &[&str] = &[
     "aten._local_scalar_dense.default",
+    "aten._safe_softmax.default",
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
     "aten._unsafe_view.default",
     "aten.add.Tensor",
+    "aten.add_.Tensor",
     "aten.addmm.default",
     "aten.alias.default",
     "aten.any.default",
@@ -49,6 +51,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start",
     "aten.arange.start_step",
     "aten.argmax.default",
+    "aten.baddbmm.default",
     "aten.bitwise_and.Scalar",
     "aten.bitwise_and.Tensor",
     "aten.bitwise_not.default",
@@ -86,6 +89,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mean.default",
     "aten.mean.dim",
     "aten.mm.default",
+    "aten.mul.Scalar",
     "aten.mul.Tensor",
     "aten.multinomial.default",
     "aten.native_layer_norm.default",
@@ -112,6 +116,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.slice.Tensor",
     "aten.sort.default",
     "aten.split.Tensor",
+    "aten.split_with_sizes.default",
     "aten.squeeze.dim",
     "aten.stack.default",
     "aten.sub.Tensor",
@@ -143,6 +148,11 @@ pub const IMPLEMENTED: &[&str] = &[
 /// `torch.randint(10, (2,))` works -- but the coverage number stays honest in
 /// the conservative direction (it under-reports rather than over-reports).
 /// The fix is one case builder and one line move.
+///
+/// `aten.mul.Scalar` was the first to get that fix (docs/TAIL.md): a
+/// re-measurement of `falcon` under `_aten_all_implemented()` found the
+/// kernel already dispatching, so the remaining work was exactly the case
+/// builder the comment above describes, plus this one line move.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.add.Scalar",
     "aten.any.dims",
@@ -151,7 +161,6 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.masked_fill.Tensor",
     "aten.matmul.default",
     "aten.max.other",
-    "aten.mul.Scalar",
     "aten.randint.default",
     "aten.reshape.default",
     "aten.sub.Scalar",
@@ -337,6 +346,12 @@ fn aten_dispatch_inner(
         "aten.sort.default" => sort_default(py, args, kwargs),
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
+
+        // -- falcon / bloom / gpt_bigcode (docs/TAIL.md) --------------------
+        "aten._safe_softmax.default" => safe_softmax_default(py, args, kwargs),
+        "aten.add_.Tensor" => add_inplace(py, args, kwargs),
+        "aten.baddbmm.default" => baddbmm_default(py, args, kwargs),
+        "aten.split_with_sizes.default" => split_with_sizes(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -831,6 +846,164 @@ fn addmm_default(
         // Both factors zero: torch still answers with a correctly shaped,
         // correctly typed tensor of zeros rather than raising.
         None => Tensor::zeros(target.as_slice(), storage, mat1.tensor().device())
+            .map_err(|e| candle_err(OP, e))?,
+    };
+    finish(py, out, tag)
+}
+
+/// `aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1,
+///     Scalar alpha=1) -> Tensor`
+///
+/// `bmm`'s batching composed with `addmm`'s `beta * self + alpha * (batch1 @
+/// batch2)`, needed to open `bloom` (docs/TAIL.md) -- its attention builds the
+/// scaled QK^T scores with this one op rather than a separate scale-then-add.
+///
+/// The zero-fast-return and integral-truncation rules are `addmm`'s, reused
+/// rather than re-derived, and measured to still hold batched: `baddbmm(self,
+/// b1, b2, beta=0)` on a `nan`-filled `self` gives a clean product (no `nan`
+/// leaks through the skipped multiply), `baddbmm(self, inf_b1, b2, alpha=0)`
+/// gives back `self` unchanged, and `alpha=1.9`/`alpha=1` agree bit for bit on
+/// an `int64` triple -- the same `Scalar` truncates toward zero before it
+/// multiplies (`addmm_scale`). Refusals are `addmm`'s dtype-mismatch pair too
+/// (`batch1`/`batch2` compared first, `self`/`batch2` second), plus `bmm`'s
+/// rank checks in place of `mm`'s, since the batch dimension is what `bmm`
+/// added and `addmm` never had.
+///
+/// `self` broadcasts to the `(batch, n, p)` output the same way `addmm`'s
+/// bias does -- rank up to 3, trailing dimensions either matching or `1` --
+/// so a `(n, p)` or scalar `self` is as valid here as a fully-batched one,
+/// matching `nn.Linear`-style bias broadcasting into a batched matmul.
+fn baddbmm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.baddbmm.default";
+
+    let bias = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let batch1 = tensor_arg(OP, args, kwargs, 1, "batch1")?;
+    let batch2 = tensor_arg(OP, args, kwargs, 2, "batch2")?;
+
+    if batch1.tensor().rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "batch1 must be a 3D tensor",
+        ));
+    }
+    if batch2.tensor().rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "batch2 must be a 3D tensor",
+        ));
+    }
+    if batch1.tag() != batch2.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "batch1 and batch2 must have the same dtype, but got {} and {}",
+            scalar_type_name(batch1.tag()),
+            scalar_type_name(batch2.tag())
+        )));
+    }
+    if bias.tag() != batch2.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "self and batch2 must have the same dtype, but got {} and {}",
+            scalar_type_name(bias.tag()),
+            scalar_type_name(batch2.tag())
+        )));
+    }
+
+    let tag = batch2.tag();
+    if matches!(
+        tag,
+        TorchDType::Bool | TorchDType::UInt16 | TorchDType::UInt32 | TorchDType::UInt64
+    ) {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"baddbmm\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let a = batch1.tensor().dims().to_vec();
+    let b = batch2.tensor().dims().to_vec();
+    if a[0] != b[0] || a[2] != b[1] {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected size for first two dimensions of batch2 tensor to be: \
+             [{}, {}] but got: [{}, {}].",
+            a[0], a[2], b[0], b[1]
+        )));
+    }
+    let target = vec![a[0], a[1], b[2]];
+
+    // Same expand check `addmm_default` runs on its bias, generalised to a
+    // 3-D target.
+    let self_dims = bias.tensor().dims().to_vec();
+    if self_dims.len() > target.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expand(torch.{}Tensor{{{:?}}}, size={:?}): the number of sizes provided ({}) \
+             must be greater or equal to the number of dimensions in the tensor ({})",
+            scalar_type_name(tag),
+            self_dims,
+            target,
+            target.len(),
+            self_dims.len()
+        )));
+    }
+    let offset = target.len() - self_dims.len();
+    for (i, &extent) in self_dims.iter().enumerate() {
+        let wanted = target[i + offset];
+        if extent != wanted && extent != 1 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "The expanded size of the tensor ({wanted}) must match the existing size \
+                 ({extent}) at non-singleton dimension {}.  Target sizes: {:?}.  \
+                 Tensor sizes: {:?}",
+                i + offset,
+                target,
+                self_dims
+            )));
+        }
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let beta = scalar_arg(OP, args, kwargs, 3, "beta")?.unwrap_or(Scalar::Int(1));
+    let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?.unwrap_or(Scalar::Int(1));
+    let (beta_zero, alpha_zero) = if storage.is_int() {
+        (beta.as_i64() == 0, alpha.as_i64() == 0)
+    } else {
+        (beta.as_f64() == 0.0, alpha.as_f64() == 0.0)
+    };
+
+    // Same accumulation-dtype rule as `mm`/`bmm`/`addmm` -- see
+    // `gemm_accumulate_in`.
+    let acc_dtype = gemm_accumulate_in(storage);
+    let mut acc: Option<Tensor> = None;
+    if !alpha_zero {
+        let product = batch1
+            .tensor()
+            .to_dtype(acc_dtype)
+            .and_then(|l| l.contiguous())
+            .and_then(|l| {
+                batch2
+                    .tensor()
+                    .to_dtype(acc_dtype)
+                    .and_then(|r| r.contiguous())
+                    .and_then(|r| l.matmul(&r))
+            })
+            .map_err(|e| candle_err(OP, e))?;
+        acc = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
+    }
+    if !beta_zero {
+        let expanded = bias
+            .tensor()
+            .to_dtype(acc_dtype)
+            .and_then(|t| t.broadcast_as(target.as_slice()))
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let scaled = addmm_scale(OP, &expanded, beta, acc_dtype)?;
+        acc = Some(match acc {
+            Some(product) => product.add(&scaled).map_err(|e| candle_err(OP, e))?,
+            None => scaled,
+        });
+    }
+    let out = match acc {
+        Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
+        None => Tensor::zeros(target.as_slice(), storage, batch1.tensor().device())
             .map_err(|e| candle_err(OP, e))?,
     };
     finish(py, out, tag)
@@ -3991,6 +4164,78 @@ fn copy_inplace(
     Ok(receiver.into_any().unbind())
 }
 
+/// `aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)`
+///
+/// The in-place sibling of `add.Tensor`, needed to open `falcon` (docs/TAIL.md)
+/// -- its residual connections write `hidden_states += attn_output` rather
+/// than rebinding the name, so the trace calls this overload, not `add.Tensor`.
+///
+/// **Aliasing is `replace_with`'s, the same as every other in-place op in this
+/// file** (`fill_inplace`/`zero_inplace`/`copy_inplace` above): the receiver's
+/// storage is swapped for a freshly computed tensor, not written through. An
+/// alias taken *before* this call does not observe the update -- the same
+/// limitation docs/OPS4.md recorded for `permute`/`t`/`transpose`/`slice`
+/// (their `replace_with` never reaches the original storage either), now
+/// extended to an arithmetic in-place op rather than only view-producing ones.
+/// Fixing it is a `replace_with` redesign, out of this task's scope.
+///
+/// Two rules narrower than upstream, both borrowed rather than re-derived:
+///
+///   * `torch.bool` is refused, matching `add.Tensor`'s own refusal --
+///     upstream's in-place bool add is a logical or (measured:
+///     `tensor([True,False]).add_(tensor([True,True]))` gives
+///     `[True, True]`), and this shim implements that arithmetic in neither
+///     the out-of-place nor the in-place overload, so `add_` does not
+///     silently acquire a capability `add.Tensor` lacks.
+///   * `other` is cast into the receiver's dtype rather than promoted --
+///     `copy_inplace`'s rule. Upstream additionally refuses some *safe*-
+///     looking casts (measured: `int32.add_(float_tensor)` raises "result
+///     type Float can't be cast to the desired output type Int") that this
+///     shim accepts instead. Not hit by falcon/bloom/gpt_bigcode, whose
+///     residual adds already agree in dtype, so left as a known gap.
+fn add_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.add_.Tensor";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let other = tensor_arg(OP, args, kwargs, 1, "other")?;
+    let alpha = alpha_arg(OP, args, kwargs)?;
+
+    let (tag, shape) = {
+        let borrowed = receiver.borrow();
+        (borrowed.tag(), borrowed.tensor().shape().clone())
+    };
+    if tag == TorchDType::Bool {
+        return Err(not_implemented(format!(
+            "{OP}: torch.bool addition is logical or, not arithmetic, and is \
+             not implemented in torch._C shim"
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let lhs = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()
+            .to_dtype(storage)
+            .map_err(|e| candle_err(OP, e))?
+    };
+    let mut rhs = other
+        .tensor()
+        .to_dtype(storage)
+        .and_then(|t| t.broadcast_as(shape))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    if alpha != 1.0 {
+        rhs = rhs.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?;
+    }
+    let out = lhs.add(&rhs).map_err(|e| candle_err(OP, e))?;
+    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
 // ---------------------------------------------------------------------------
 // The two RNG ops
 //
@@ -4691,6 +4936,76 @@ fn split_tensor(
     Ok(PyList::new(py, chunks)?.into_any().unbind())
 }
 
+/// `aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int
+///     dim=0) -> Tensor(a)[]`
+///
+/// `split.Tensor` with the chunk sizes spelled out individually rather than
+/// as one repeated size -- the spelling `gpt_bigcode` (docs/TAIL.md) reaches
+/// for `c_attn(x).split((embed_dim, kv_dim, kv_dim), dim=2)`, an *uneven*
+/// three-way unpack (query gets the full embedding width, key and value share
+/// a narrower one under multi-query attention) that `split.Tensor`'s single
+/// repeated size cannot express. `methods.json` already spells this op to a
+/// single kernel key (docs/SPELLINGS.md §4); only the kernel was missing.
+///
+/// Measured against torch 2.13.0:
+///
+///   * sizes must be **non-negative** and **sum exactly** to the dimension's
+///     extent -- unlike `split.Tensor`, there is no "last chunk is short"
+///     leniency here, because the caller already spelled out every length.
+///     Both refusals are reproduced (`split_with_sizes expects split_sizes
+///     have only non-negative entries...` / `...expects split_sizes to sum
+///     exactly to N...`).
+///   * an **individual size of 0 is fine** even when the dimension itself is
+///     not empty, as long as the sizes still sum correctly -- `split(arange(10),
+///     [0, 10], 0)` gives an empty first chunk and the whole tensor as the
+///     second, both measured.
+///   * a **0-d tensor raises**, the same refusal `split.Tensor` gives and the
+///     same wording ("split expects at least a 1-dimensional tensor") --
+///     upstream's message does not distinguish the two overloads.
+fn split_with_sizes(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.split_with_sizes.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor().rank();
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "split expects at least a 1-dimensional tensor",
+        ));
+    }
+    let sizes_raw: Vec<i64> = required(OP, args, kwargs, 1, "split_sizes")?.extract()?;
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
+    let extent = input.tensor().dims()[dim];
+
+    if sizes_raw.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "split_with_sizes expects split_sizes have only non-negative entries, but got split_sizes={sizes_raw:?}"
+        )));
+    }
+    let total: i64 = sizes_raw.iter().sum();
+    if total as usize != extent {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "split_with_sizes expects split_sizes to sum exactly to {extent} (input tensor's \
+             size at dimension {dim}), but got split_sizes={sizes_raw:?}"
+        )));
+    }
+
+    let mut chunks: Vec<Py<PyAny>> = Vec::new();
+    let mut start = 0usize;
+    for &size in &sizes_raw {
+        let length = size as usize;
+        let chunk = input
+            .tensor()
+            .narrow(dim, start, length)
+            .map_err(|e| candle_err(OP, e))?;
+        chunks.push(crate::tensor::promote(py, finish(py, chunk, input.tag())?)?);
+        start += length;
+    }
+    Ok(PyList::new(py, chunks)?.into_any().unbind())
+}
+
 /// `aten::native_layer_norm(Tensor input, SymInt[] normalized_shape,
 ///     Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)`
 ///
@@ -4978,6 +5293,26 @@ fn softmax_default(
     };
     let storage = PyDtype::new(tag).storage(OP)?;
     let double_acc = storage == candle_core::DType::F64;
+    let out = softmax_body(&source, outer, n, inner, double_acc, false);
+
+    let device = input.tensor().device().clone();
+    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The reduction shared by `_softmax.default` and `_safe_softmax.default`:
+/// max-subtract, exponentiate, normalise, over the `(outer, n, inner)` view of
+/// a dim-`dim` softmax (`outer`/`inner` are the product of the extents on
+/// either side of `dim`; `n` is `dim`'s own extent).
+///
+/// `safe` is the only difference between the two ops, and it is applied where
+/// the divergence is measured to live: a row whose max is `-inf` (every
+/// element `-inf`, since `-inf` is softmax's own floor) computes `0` for
+/// every element instead of running the usual exponential, which on that row
+/// is a `NaN` produced by `-inf - (-inf)`. `safe=false` skips the check
+/// entirely, so `_softmax.default`'s behaviour (a `NaN` row, matching
+/// upstream, per this file's docs above) is untouched by this refactor.
+fn softmax_body(source: &[f64], outer: usize, n: usize, inner: usize, double_acc: bool, safe: bool) -> Vec<f64> {
     let mut out = vec![0.0f64; source.len()];
 
     for o in 0..outer {
@@ -4990,6 +5325,12 @@ fn softmax_default(
                     if !(v <= max) {
                         max = v;
                     }
+                }
+                if safe && max == f64::NEG_INFINITY {
+                    for j in 0..n {
+                        out[at(j)] = 0.0;
+                    }
+                    continue;
                 }
                 let mut sum = 0.0f64;
                 for j in 0..n {
@@ -5008,6 +5349,12 @@ fn softmax_default(
                         max = v;
                     }
                 }
+                if safe && max == f32::NEG_INFINITY {
+                    for j in 0..n {
+                        out[at(j)] = 0.0;
+                    }
+                    continue;
+                }
                 let mut sum = 0.0f32;
                 for j in 0..n {
                     let e = ((source[at(j)] as f32) - max).exp();
@@ -5020,10 +5367,86 @@ fn softmax_default(
             }
         }
     }
+    out
+}
 
-    let device = input.tensor().device().clone();
-    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
-    finish(py, tensor, tag)
+/// `aten::_safe_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor`
+///
+/// torch's own decomposition is the spec this reproduces
+/// (`torch/_decomp/decompositions.py::safe_softmax`, `register_decomposition(aten._safe_softmax)`):
+///
+/// ```text
+/// out = torch.softmax(self, dim=dim, dtype=dtype)
+/// masked_rows = torch.all(self.eq(-inf), dim=dim, keepdim=True)
+/// return torch.where(masked_rows, zeros, out)
+/// ```
+///
+/// So the one place this disagrees with `_softmax.default` is a row that is
+/// *entirely* `-inf`: measured on torch 2.13.0, plain `_softmax` answers `nan`
+/// there (see that op's docs above) and `_safe_softmax` answers `0` for every
+/// element of the row instead. That is exactly the shape of a fully-masked
+/// attention row -- every key excluded by the causal mask plus padding -- and
+/// `nan` there would poison every downstream matmul rather than staying
+/// contained the way a `0` attention weight does.
+///
+/// `dtype`, when given, casts `self` **before** the integral/boolean refusal
+/// below runs, not after -- measured: `_safe_softmax(int64_tensor, 0,
+/// torch.float32)` succeeds. Composite `torch.softmax(self, dim, dtype)`
+/// upcasts first and then calls the kernel in that dtype, and the refusal is
+/// the kernel's, so a shim that checked the *original* dtype would reject a
+/// call upstream accepts.
+fn safe_softmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._safe_softmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let dtype = dtype_arg(args, kwargs, 2, "dtype")?;
+
+    let (tensor, tag) = match dtype {
+        Some(want) => {
+            let storage = PyDtype::new(want).storage(OP)?;
+            let cast = input
+                .tensor()
+                .to_dtype(storage)
+                .map_err(|e| candle_err(OP, e))?;
+            (cast, want)
+        }
+        None => (input.tensor().clone(), input.tag()),
+    };
+    if !tag.is_floating_point() {
+        return Err(not_implemented(format!(
+            "\"softmax_lastdim_kernel_impl\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let rank = tensor.rank();
+    let dim = normalise_dim(OP, dim_raw, rank)?;
+
+    let dims = tensor.dims().to_vec();
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+
+    let source = match read_flat(OP, &tensor, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let double_acc = storage == candle_core::DType::F64;
+    let out = softmax_body(&source, outer, n, inner, double_acc, true);
+
+    let device = tensor.device().clone();
+    let result = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, result, tag)
 }
 
 /// Row-major strides for a contiguous shape, as element counts.

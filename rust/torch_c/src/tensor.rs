@@ -21,7 +21,6 @@ use crate::dtype::{PyDtype, TorchDType};
 use crate::err::{candle_err, not_implemented};
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
-#[derive(Clone)]
 pub struct PyTensorBase {
     inner: Tensor,
     /// The torch-level dtype. Not derivable from `inner.dtype()`: `torch.bool`
@@ -39,6 +38,32 @@ pub struct PyTensorBase {
     /// fails by name rather than silently getting nothing. Recorded as a
     /// papered-over item in docs/TENSORBASE.md, not as an implementation.
     requires_grad: bool,
+    /// **Inert**, for the same reason as `requires_grad`: there is no autograd
+    /// here, so nothing ever fires a backward hook. It is a real slot rather
+    /// than a refusing property because `torch/_utils.py:246
+    /// _rebuild_tensor_v2` *assigns* to it on every tensor of every
+    /// `torch.load`, unconditionally and before anyone could have registered a
+    /// hook -- so on this path the value written is always the empty
+    /// `OrderedDict()` that `_rebuild_tensor_v2`'s own comment insists on
+    /// ("we must give an EMPTY OrderedDict(), if you pass a None you'll run
+    /// afoul #12219"). Refusing the assignment stopped `torch.load`; accepting
+    /// it stores something nothing reads. Recorded in docs/CKPT.md §6 as
+    /// papered over, not implemented.
+    backward_hooks: Option<Py<PyAny>>,
+}
+
+/// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
+/// incrementing a Python refcount needs the interpreter attached, which
+/// `#[derive(Clone)]` has no way to ask for.
+impl Clone for PyTensorBase {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            inner: self.inner.clone(),
+            tag: self.tag,
+            requires_grad: self.requires_grad,
+            backward_hooks: self.backward_hooks.as_ref().map(|h| h.clone_ref(py)),
+        })
+    }
 }
 
 impl PyTensorBase {
@@ -54,6 +79,7 @@ impl PyTensorBase {
             inner,
             tag,
             requires_grad: false,
+            backward_hooks: None,
         })
     }
 
@@ -83,6 +109,7 @@ impl PyTensorBase {
             inner,
             tag: TorchDType::Bool,
             requires_grad: false,
+            backward_hooks: None,
         })
     }
 
@@ -112,6 +139,122 @@ impl PyTensorBase {
         self.inner = replacement.inner;
         self.tag = replacement.tag;
     }
+}
+
+/// A tensor from a little-endian payload, under a torch dtype tag.
+///
+/// The one place raw checkpoint bytes become a tensor. `torch.frombuffer` (the
+/// safetensors path) and `TensorBase.set_` (the `torch.load` path) both come
+/// here, so the two readers cannot disagree about a dtype.
+///
+/// Endianness is not checked, and cannot be from here: the caller has the
+/// container's byte-order field (safetensors is little-endian by
+/// specification; `torch.save` writes a `byteorder` record and
+/// `torch/serialization.py` byteswaps before this point). Every target this
+/// crate builds for is little-endian.
+pub fn from_le_bytes(
+    op: &str,
+    bytes: &[u8],
+    shape: &[usize],
+    tag: TorchDType,
+) -> PyResult<PyTensorBase> {
+    let device = candle_core::Device::Cpu;
+
+    // `torch.bool`: candle stores it as `U8`, and the 0/1 invariant
+    // (BOOL.md §6.3) has to hold by construction. Raw checkpoint bytes under a
+    // bool tag are not guaranteed normalised, so they are reduced with `!= 0`
+    // -- which is exactly what torch guarantees a bool tensor *reads* as
+    // (BOOL.md §2.6), so no value changes. Same reduction `_tensor_from_flat`
+    // makes, for the same reason.
+    if tag == TorchDType::Bool {
+        let normalised: Vec<u8> = bytes.iter().map(|b| u8::from(*b != 0)).collect();
+        let tensor =
+            Tensor::from_vec(normalised, shape.to_vec(), &device).map_err(|e| candle_err(op, e))?;
+        return PyTensorBase::boolean(tensor);
+    }
+
+    // `storage()` refuses by name for the dtypes candle cannot hold -- `int8`,
+    // `uint16`, `uint64`, the complex family, and the fourteen sub-byte integer
+    // tags. Upstream accepts several of them (measured: `torch.frombuffer` with
+    // `torch.int8` and `torch.uint16` both return tensors), so this is a real
+    // narrowing of the surface, and refusing loudly is the point. A checkpoint
+    // in one of those dtypes stops here with the dtype in the message instead
+    // of being reinterpreted as something else.
+    let storage = tag.storage().ok_or_else(|| {
+        not_implemented(format!(
+            "{op}: dtype not storable by the candle backend in torch._C shim: torch.{}",
+            tag.name()
+        ))
+    })?;
+    let tensor =
+        Tensor::from_raw_buffer(bytes, storage, shape, &device).map_err(|e| candle_err(op, e))?;
+    PyTensorBase::new(tensor)
+}
+
+/// The contiguous (row-major) stride for a shape, in elements.
+fn contiguous_stride(size: &[usize]) -> Vec<i64> {
+    let mut stride = vec![1i64; size.len()];
+    for i in (0..size.len().saturating_sub(1)).rev() {
+        stride[i] = stride[i + 1] * size[i + 1] as i64;
+    }
+    stride
+}
+
+/// Read a `(storage_offset, size, stride)` view out of a byte buffer into a
+/// contiguous, row-major copy of it.
+///
+/// This is what makes `TensorBase.set_` correct for a *view*, and views are not
+/// exotic in a checkpoint: `torch.save` records each tensor's stride and offset
+/// as it finds them, so a `state_dict` that holds `w.t()`, or a slice of a
+/// larger buffer, arrives here non-contiguous. A reader that took the first
+/// `numel` elements instead would return the transpose's storage read in the
+/// wrong order -- right dtype, right shape, wrong numbers, no error. Measured:
+/// a `4x3` tensor saved as `base.t()` of a `3x4`.
+///
+/// The walk is over element indices rather than bytes so it is dtype-agnostic;
+/// `itemsize` only decides how wide each copied element is. The contiguous case
+/// is not special-cased into a memcpy because `from_le_bytes` is already the
+/// hot path's cost and the gather is a single pass either way -- one code path
+/// means the contiguous case cannot pass while the strided case rots.
+fn gather_strided(
+    op: &str,
+    bytes: &[u8],
+    storage_offset: usize,
+    size: &[usize],
+    stride: &[i64],
+    itemsize: usize,
+    numel: usize,
+) -> PyResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(numel * itemsize);
+    let mut index = vec![0usize; size.len()];
+
+    for _ in 0..numel {
+        let mut element = storage_offset;
+        for (d, i) in index.iter().enumerate() {
+            element += i * stride[d] as usize;
+        }
+        let start = element * itemsize;
+        let end = start + itemsize;
+        if end > bytes.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: the view (offset {storage_offset}, size {size:?}, stride \
+                 {stride:?}) reaches byte {end} of a storage holding {}",
+                bytes.len()
+            )));
+        }
+        out.extend_from_slice(&bytes[start..end]);
+
+        // Odometer, last dimension fastest -- row-major, which is the order
+        // `from_le_bytes` will read the result back in.
+        for d in (0..size.len()).rev() {
+            index[d] += 1;
+            if index[d] < size[d] {
+                break;
+            }
+            index[d] = 0;
+        }
+    }
+    Ok(out)
 }
 
 /// The Python class an op result should wear.
@@ -207,6 +350,24 @@ impl PyTensorBase {
         PyDevice::from_candle(self.inner.device())
     }
 
+    /// `tensor.is_meta`. Derived from the device rather than returned as a
+    /// constant `False`, so it stays true to whatever `device()` reports if a
+    /// meta-like device ever appears; today candle has three device kinds
+    /// (`Cpu`, `Cuda`, `Metal`, see `PyDevice::from_candle`) and none of them
+    /// is `meta`, so it always answers `False`.
+    ///
+    /// It is here because `Module.load_state_dict` reads it on every single
+    /// parameter -- `torch/nn/modules/module.py:2449`, `if param.is_meta:`,
+    /// before the shape check and before the copy. It was the only wall left on
+    /// that path once the weights themselves could be read (docs/CKPT.md).
+    /// A stub property raising by name stopped `load_state_dict` outright,
+    /// which is the right behaviour for a hole and the wrong answer for a
+    /// question the shim can answer.
+    #[getter]
+    fn is_meta(&self) -> bool {
+        PyDevice::from_candle(self.inner.device()).kind == "meta"
+    }
+
     #[getter]
     fn ndim(&self) -> usize {
         self.inner.rank()
@@ -214,6 +375,130 @@ impl PyTensorBase {
 
     fn dim(&self) -> usize {
         self.inner.rank()
+    }
+
+    #[getter]
+    fn _backward_hooks(&self) -> Option<&Py<PyAny>> {
+        self.backward_hooks.as_ref()
+    }
+
+    #[setter]
+    fn set__backward_hooks(&mut self, value: Option<Py<PyAny>>) {
+        self.backward_hooks = value;
+    }
+
+    /// `tensor.element_size()` -- bytes per element, from the torch dtype tag
+    /// and not from candle's, so `torch.bool` answers 1 rather than borrowing
+    /// `uint8`'s answer by accident. (They agree; the point is that the tag is
+    /// the authority, per BOOL.md §5-B.)
+    fn element_size(&self) -> usize {
+        self.tag.itemsize()
+    }
+
+    /// `tensor.set_(storage, storage_offset, size, stride)` -- **a copy, where
+    /// upstream aliases.**
+    ///
+    /// The only caller that matters is `torch/_utils.py:198 _rebuild_tensor`,
+    /// which every `torch.load` of every tensor goes through:
+    ///
+    /// ```python
+    /// t = torch.empty((0,), dtype=storage.dtype, device=...)
+    /// return t.set_(storage._untyped_storage, storage_offset, size, stride)
+    /// ```
+    ///
+    /// Upstream this makes `t` a *view* of the storage. Here candle owns its
+    /// memory, so the bytes are copied out and the tensor is independent of the
+    /// storage afterwards. Two consequences, both refused rather than papered
+    /// over, because either one produces silently wrong weights:
+    ///
+    /// 1. **The storage must already hold its payload.** See storage.rs -- the
+    ///    legacy `torch.save` format fills storages *after* `_rebuild_tensor`
+    ///    runs, and a copying `set_` there yields a checkpoint of zeros with no
+    ///    error anywhere. Measured. So an unfilled storage is refused by name.
+    ///
+    /// 2. **The result is contiguous even when the view was not.** A saved
+    ///    tensor may be a strided view of its storage -- `w.t()`, or a slice of
+    ///    a larger buffer -- and `gather_strided` reads it in row-major order
+    ///    into a fresh buffer. Upstream would have kept the view; here the copy
+    ///    holds the same numbers with contiguous stride. That is visible to
+    ///    anything that reads `.stride()`, and it is why `set_` cannot be used
+    ///    to build an aliasing view on purpose.
+    #[pyo3(signature = (source, storage_offset = 0, size = None, stride = None))]
+    fn set_<'py>(
+        slf: &Bound<'py, Self>,
+        source: &Bound<'py, PyAny>,
+        storage_offset: usize,
+        size: Option<Vec<usize>>,
+        stride: Option<Vec<i64>>,
+    ) -> PyResult<Bound<'py, Self>> {
+        const OP: &str = "TensorBase.set_";
+
+        let storage: PyRef<'_, crate::storage::PyStorageBase> =
+            source.extract().map_err(|_| {
+                let got = source
+                    .get_type()
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                not_implemented(format!(
+                    "{OP}: expected a torch.UntypedStorage, got {got} -- the \
+                     no-argument and tensor-argument spellings of set_ are not \
+                     implemented in this shim"
+                ))
+            })?;
+
+        let size = size.ok_or_else(|| {
+            not_implemented(format!(
+                "{OP}(storage) without an explicit size is not implemented -- it \
+                 would mean adopting the storage's whole extent, which is the \
+                 aliasing behaviour this shim does not have"
+            ))
+        })?;
+
+        let tag = slf.borrow().tag;
+        let itemsize = tag.itemsize();
+        let numel: usize = size.iter().product();
+
+        if numel > 0 && !storage.is_filled() {
+            return Err(not_implemented(format!(
+                "{OP}: the storage has never been filled. This shim's set_ copies \
+                 out of the storage instead of aliasing it, so a tensor built \
+                 from an empty storage would be silently zero. The caller must \
+                 deliver the bytes before set_, not after (see storage.rs and \
+                 docs/CKPT.md §4)."
+            )));
+        }
+
+        let stride = stride.unwrap_or_else(|| contiguous_stride(&size));
+        if stride.len() != size.len() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: size {size:?} has {} dimensions but stride {stride:?} has {}",
+                size.len(),
+                stride.len()
+            )));
+        }
+        if stride.iter().any(|s| *s < 0) {
+            return Err(not_implemented(format!(
+                "{OP}: negative stride in {stride:?}. torch itself does not produce \
+                 these, so this is refused rather than guessed at."
+            )));
+        }
+
+        let bytes = storage.bytes();
+        let gathered = gather_strided(
+            OP,
+            bytes,
+            storage_offset,
+            &size,
+            &stride,
+            itemsize,
+            numel,
+        )?;
+
+        let replacement = from_le_bytes(OP, &gathered, &size, tag)?;
+        drop(storage);
+        slf.borrow_mut().replace_with(replacement);
+        Ok(slf.clone())
     }
 
     fn numel(&self) -> usize {

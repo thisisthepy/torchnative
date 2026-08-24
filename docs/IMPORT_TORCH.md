@@ -66,7 +66,7 @@ rust/torch_c/src/bootstrap.py    그 표로 표면을 짓는 코드 (1297 행)
 옳지만(구멍을 재는 것이니까) shim 의 입력으로는 틀립니다 — 우리가 교체하려는 바로 그 바이너리에서
 빌려오는 것이고, 빌드가 진짜 torch 설치를 요구하게 됩니다.
 
-`vendor/gen_surface.py` 는 대신 `vendor/torch/_C/*.pyi` 를 읽습니다. **벤더링한 BSD 트리의 일부**
+`vendor/gen_surface.py` 는 대신 `torchnative/src/main/torch/_C/*.pyi` 를 읽습니다. **벤더링한 BSD 트리의 일부**
 이고, 상류가 "다른 도구가 `_C` 를 로드하지 않고도 인터페이스를 알 수 있도록" 넣어 둔 파일이며,
 무엇보다 **트리 자신이 무엇을 기대하는지에 대한 진술**입니다.
 

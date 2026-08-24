@@ -24,14 +24,14 @@
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-dest=${BRAINWAVE_VENDOR_DIR:-$repo/vendor}
+dest=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/src/main}
 
 # The spike venv that IMPORT_WALLS 3차/5차 measured against. Override to vendor
 # from a different upstream; the stamp records which one was used.
-src=${BRAINWAVE_TORCH_SRC:-/Volumes/macMini/caches/spike-venv/lib/python3.13/site-packages}
+src=${TORCHNATIVE_TORCH_SRC:-/Volumes/macMini/caches/spike-venv/lib/python3.13/site-packages}
 
 if [ ! -d "$src/torch" ]; then
-    echo "no torch under $src -- set BRAINWAVE_TORCH_SRC" >&2
+    echo "no torch under $src -- set TORCHNATIVE_TORCH_SRC" >&2
     exit 1
 fi
 
@@ -46,9 +46,16 @@ echo "  from $src"
 echo "  into $dest"
 
 mkdir -p "$dest"
-rm -rf "$dest/torch" "$dest"/torch-*.dist-info
+rm -rf "$dest"/torch-*.dist-info
 
-rsync -a \
+# `--delete` rather than `rm -rf "$dest/torch"`: the destination is now inside
+# the package (DESIGN.md §2's "주입 지점을 일원화"), so it already holds files
+# that are tracked in git -- the add-hook and its README. Deleting the whole
+# directory would take those with it. The excludes below are that union: rsync
+# still removes anything stale from a previous upstream, and leaves ours alone.
+rsync -a --delete \
+    --exclude '/nn/federated.py' \
+    --exclude '/README.md' \
     --exclude '/lib/' \
     --exclude '/include/' \
     --exclude '/bin/' \
@@ -80,6 +87,7 @@ fi
     echo "vendored_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "py_modules=$(find "$dest/torch" -name '*.py' | wc -l | tr -d ' ')"
     echo "native_left=$(find "$dest/torch" \( -name '*.so' -o -name '*.dylib' \) | wc -l | tr -d ' ')"
+    echo "add_hooks=$(find "$dest/torch" -name 'federated.py' | wc -l | tr -d ' ')"
 } > "$dest/.stamp"
 
 cat "$dest/.stamp"

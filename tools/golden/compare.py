@@ -188,6 +188,37 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
             )
         return Outcome(case, True, f"known gap still present: torch refused ({t_exc!r})")
 
+    if case.expect == "diverge":
+        # Both sides compute, they disagree, and that disagreement is a kernel
+        # bug we have measured and not yet fixed.
+        #
+        # This case arrived as a deliberately red `expect="match"`, which keeps
+        # the bug visible at the cost of the gate: a suite that exits 1 by
+        # design cannot tell anyone apart the divergence it knows about from the
+        # one they just introduced, and a suite read that way stops being read.
+        # Same reasoning as KNOWN_GAP for comparators -- record it, surface it
+        # every run, and fail if it silently heals.
+        if not (t_ok and c_ok):
+            return Outcome(
+                case,
+                False,
+                f"expected both sides to compute and disagree (known divergence: "
+                f"{case.note}); got torch_ok={t_ok} c_ok={c_ok} "
+                f"(torch={t_exc!r}, c={c_exc!r})",
+            )
+        if t_res.tolist() == c_res.tolist():
+            return Outcome(
+                case,
+                False,
+                f"divergence appears CLOSED -- both sides now agree. Promote this case "
+                f"to expect=match and drop the note. Was: {case.note}",
+            )
+        return Outcome(
+            case,
+            True,
+            f"known divergence still present: torch={t_res.tolist()!r} c={c_res.tolist()!r}",
+        )
+
     # expect == "match"
     if t_ok != c_ok:
         refusing_side = "torch" if not t_ok else "c"
@@ -680,6 +711,20 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         )
         for (cmp_name, mode), why in sorted(KNOWN_GAP.items()):
             print(f"  {cmp_name} + {mode}: {why}")
+        print()
+
+    # Same reason the gaps above are printed here rather than behind a flag: a
+    # green SUMMARY is what anyone actually reads, and these are cases that pass
+    # *because* the two sides disagree. Saying so is the price of counting them
+    # as passing at all.
+    diverging = [o.case for o in all_outcomes if o.case.expect == "diverge" and o.passed]
+    if diverging:
+        print(
+            f"KNOWN DIVERGENCE: {len(diverging)} case(s) pass because the shim and torch "
+            f"disagree in a way that is recorded, not fixed. Each fails if they start agreeing."
+        )
+        for case in diverging:
+            print(f"  {case.op}: {case.note}")
         print()
 
     print(

@@ -12,7 +12,7 @@
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-dest=${BRAINWAVE_VENDOR_DIR:-$repo/vendor}
+dest=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/src/main}
 crate=$repo/rust/torch_c
 target_dir=${CARGO_TARGET_DIR:-$crate/target}
 

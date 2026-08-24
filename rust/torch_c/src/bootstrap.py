@@ -43,7 +43,7 @@ The three rules
 
 Where the names come from
 -------------------------
-`vendor/gen_surface.py`, from `vendor/torch/_C/*.pyi` -- the vendored tree's
+`vendor/gen_surface.py`, from `torchnative/src/main/torch/_C/*.pyi` -- the vendored tree's
 own stubs. Not from an installed upstream `_C.so`. The distinction matters:
 the stubs are the tree's statement of what it expects, they ship under the
 same BSD licence as the rest of the vendored tree, and using them keeps the
@@ -1290,6 +1290,15 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # `torch.tensor` is the one name on this object that is not an overload set
     # -- see `_tensor_factory`.
     varfns.tensor = _tensor_factory(module, dispatch)
+    # `torch.frombuffer` is the second, and for the same reason: upstream has no
+    # `aten::frombuffer` at all (`torch.ops.aten.frombuffer` raises
+    # `AttributeError` on 2.13.0), only the `_C` binding. The loop above had
+    # installed a refusal that pointed the caller at
+    # `torch.ops.aten.frombuffer.<overload>` -- a work item nobody could ever
+    # close, because there is nothing there to reach. Point it at the real
+    # implementation instead. It is the entire cost of the safetensors load
+    # path; see `_frombuffer` in lib.rs and docs/CKPT.md.
+    varfns.frombuffer = module._frombuffer
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -1335,6 +1344,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
     _install_behaviour(module, dispatch)
+    _install_serialization(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
     # -- which is how most of the `torch` namespace comes into being
@@ -1343,6 +1353,172 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module.__all__ = sorted(
         n for n in vars(module) if not n.startswith("_") and n not in off
     )
+
+
+# ---------------------------------------------------------------------------
+# Reading a checkpoint: the `torch.save` zip container
+# ---------------------------------------------------------------------------
+#
+# This is the one place in this file that parses a format, and the module
+# docstring's "nothing here computes" deserves an answer rather than an
+# exception.
+#
+# The rule is about *tensor* computation: no arithmetic may happen outside the
+# one door in `aten.rs`, because that door is DESIGN.md §6's instrument. Nothing
+# below touches a tensor -- it locates byte ranges in a container and hands them
+# to `StorageBase`, which is in Rust with the invariant that matters (see
+# storage.rs). What is left here is container parsing, and it is here because
+# the container is an ordinary zip archive and CPython ships a correct zip
+# reader. The alternatives were a hand-written zip parser in Rust, or a new
+# crate dependency on all three cross-compiled targets; both are worse trades
+# for a format the standard library already reads, and neither buys anything
+# `zipfile` does not already give.
+#
+# What is *not* here is as deliberate as what is. `get_record_offset_no_read`
+# and the mmap path are left refusing, because closing them means reproducing
+# torch's record-alignment arithmetic, and a wrong offset does not raise -- it
+# reads the neighbouring tensor's bytes. docs/CKPT.md §6.
+
+
+class _RecordHolder:
+    """What `PyTorchFileReader.get_storage_from_record` hands back.
+
+    Upstream returns a **Tensor** -- `at::empty({...}).set_(storage)` -- and
+    `torch/serialization.py:2128` immediately unwraps it again with
+    `._typed_storage()._untyped_storage`. That round trip only makes sense
+    because upstream's tensor is a *view* of the storage, so wrapping and
+    unwrapping is free and loses nothing.
+
+    Here it would not be free: this shim's tensors copy (storage.rs), so
+    returning a real Tensor would copy every byte of the checkpoint into a
+    tensor that exists only to be thrown away, and -- worse -- the storage that
+    came back out of it would have to be a second copy to be honest about not
+    aliasing. So the two calls the caller actually makes are answered directly,
+    and the object says what it is rather than pretending to be a Tensor.
+    """
+
+    __slots__ = ("_typed",)
+
+    def __init__(self, typed):
+        self._typed = typed
+
+    def _typed_storage(self):
+        return self._typed
+
+
+class _ZipRecords:
+    """`torch._C.PyTorchFileReader` over CPython's `zipfile`.
+
+    Upstream this is miniz behind `caffe2/serialize/inline_container.cc`. The
+    names below are the ones `torch/serialization.py` actually calls, measured
+    by running `torch.load` against a reader that logged every attribute it was
+    asked for; everything else keeps the type catch-all's refusal.
+    """
+
+    def __init__(self, name_or_buffer):
+        import zipfile
+
+        self._zf = zipfile.ZipFile(name_or_buffer)
+        names = self._zf.namelist()
+        if not names:
+            raise RuntimeError("torch._C shim: empty archive, no records")
+        # Every record lives under one top-level directory named for the
+        # archive; upstream derives it the same way, from the first entry.
+        head = names[0].split("/")[0]
+        self._prefix = f"{head}/" if f"{head}/" == names[0][: len(head) + 1] else ""
+
+    def _full(self, name):
+        return self._prefix + name
+
+    def has_record(self, name):
+        try:
+            self._zf.getinfo(self._full(name))
+        except KeyError:
+            return False
+        return True
+
+    def get_record(self, name):
+        return self._zf.read(self._full(name))
+
+    def get_all_records(self):
+        n = len(self._prefix)
+        return [entry[n:] for entry in self._zf.namelist()]
+
+    def get_record_offset(self, name):
+        """Where this record's payload starts in the file.
+
+        Read out of the local file header on disk rather than recomputed with
+        `ZipInfo.FileHeader()`: `torch.save` pads the header's *extra* field to
+        align payloads (`.storage_alignment`, 64 bytes by default), and a
+        regenerated header does not carry that padding. The two answers differ
+        by the padding, silently, and the number is used to slice storages.
+        """
+        info = self._zf.getinfo(self._full(name))
+        fp = self._zf.fp
+        here = fp.tell()
+        try:
+            fp.seek(info.header_offset)
+            header = fp.read(30)
+            if header[:4] != b"PK\x03\x04":
+                raise RuntimeError(
+                    f"torch._C shim: no local file header for record {name!r} "
+                    f"at offset {info.header_offset}"
+                )
+            name_len = int.from_bytes(header[26:28], "little")
+            extra_len = int.from_bytes(header[28:30], "little")
+        finally:
+            fp.seek(here)
+        return info.header_offset + 30 + name_len + extra_len
+
+    def get_record_header_offset(self, name):
+        return self._zf.getinfo(self._full(name)).header_offset
+
+    def get_storage_from_record(self, name, nbytes, cls):
+        """The payload of one record, as a storage.
+
+        Note the order this establishes, which `TensorBase.set_` depends on and
+        storage.rs explains: the bytes are in the storage *before* the storage
+        is handed back, so by the time `_rebuild_tensor` calls `set_` there is
+        something to copy. The legacy container does it the other way round,
+        which is why this shim reads one format and refuses the other.
+        """
+        import torch
+
+        data = self._zf.read(self._full(name))
+        if len(data) != nbytes:
+            raise RuntimeError(
+                f"torch._C shim: record {name!r} is {len(data)} bytes, but the "
+                f"checkpoint's pickle says {nbytes}"
+            )
+        storage = cls(nbytes)
+        storage._shim_fill(data)
+        return _RecordHolder(
+            torch.storage.TypedStorage(
+                wrap_storage=storage, dtype=torch.uint8, _internal=True
+            )
+        )
+
+    def serialization_id(self):
+        """Upstream writes this record so two checkpoints can be compared
+        without reading them. It is optional, and `torch/serialization.py` uses
+        it only for a telemetry callback, so an absent one is an empty string
+        rather than an error."""
+        try:
+            return self._zf.read(self._full(".data/serialization_id")).decode()
+        except KeyError:
+            return ""
+
+
+def _install_serialization(module) -> None:
+    module.PyTorchFileReader = _ZipRecords
+
+    # `torch/_utils.py:290 _validate_loaded_sparse_tensors` runs at the end of
+    # every `torch.load`, and asks this before it looks at what was loaded.
+    # `False` is upstream's default state (the checks are opt-in, via
+    # `torch.sparse.check_sparse_tensor_invariants`), and it is the honest
+    # answer here for a second reason: this shim has no sparse tensors, so the
+    # list those checks would run over is always empty.
+    module._check_sparse_tensor_invariants = lambda: False
 
 
 def _torch_level_function(name: str, dispatch, overloads):

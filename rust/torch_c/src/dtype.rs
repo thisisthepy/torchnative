@@ -66,6 +66,40 @@ pub enum TorchDType {
     Bits4x2,
     Bits8,
     Bits16,
+    // The sub-byte integer tags. These are *not* in `torch/_C/__init__.pyi`
+    // (which is where the rest of this enum came from) -- upstream registers
+    // them from C++ without a stub entry, so the generated surface never
+    // named them and the shim did not either.
+    //
+    // They are here because `torch.load` demands them by name.
+    // `torch/_weights_only_unpickler.py:194` builds its allowlist with
+    //
+    //     for t in [getattr(torch, f"uint{x}") for x in range(1, 8)]: ...
+    //     for t in [getattr(torch, f"int{x}") for x in range(1, 8)]: ...
+    //
+    // unconditionally, before a single byte of the checkpoint is read. Missing
+    // any one of the fourteen makes *every* `torch.load` raise
+    // `AttributeError: module 'torch' has no attribute 'uint1'` -- measured,
+    // and it was the second wall on that path (docs/CKPT.md §2).
+    //
+    // Nothing can be stored under them: `storage()` returns `None` for all
+    // fourteen, so a tensor tagged with one refuses by name rather than
+    // quietly becoming `uint8`. They are names on the allowlist, and that is
+    // the whole of what they are.
+    UInt1,
+    UInt2,
+    UInt3,
+    UInt4,
+    UInt5,
+    UInt6,
+    UInt7,
+    Int1,
+    Int2,
+    Int3,
+    Int4,
+    Int5,
+    Int6,
+    Int7,
 }
 
 use TorchDType::*;
@@ -104,6 +138,20 @@ pub const ALL: &[TorchDType] = &[
     Bits4x2,
     Bits8,
     Bits16,
+    UInt1,
+    UInt2,
+    UInt3,
+    UInt4,
+    UInt5,
+    UInt6,
+    UInt7,
+    Int1,
+    Int2,
+    Int3,
+    Int4,
+    Int5,
+    Int6,
+    Int7,
 ];
 
 /// torch's short spellings. `torch.float is torch.float32` is `True` upstream,
@@ -155,6 +203,20 @@ impl TorchDType {
             Bits4x2 => "bits4x2",
             Bits8 => "bits8",
             Bits16 => "bits16",
+            UInt1 => "uint1",
+            UInt2 => "uint2",
+            UInt3 => "uint3",
+            UInt4 => "uint4",
+            UInt5 => "uint5",
+            UInt6 => "uint6",
+            UInt7 => "uint7",
+            Int1 => "int1",
+            Int2 => "int2",
+            Int3 => "int3",
+            Int4 => "int4",
+            Int5 => "int5",
+            Int6 => "int6",
+            Int7 => "int7",
         }
     }
 
@@ -234,6 +296,13 @@ impl TorchDType {
             UInt8 | UInt16
                 | UInt32
                 | UInt64
+                | UInt1
+                | UInt2
+                | UInt3
+                | UInt4
+                | UInt5
+                | UInt6
+                | UInt7
                 | Bool
                 | QUInt8
                 | QUInt4x2
@@ -285,14 +354,56 @@ impl TorchDType {
             Bits4x2 => "b4x2",
             Bits8 => "b8x1",
             Bits16 => "b16x1",
+            // Upstream has no abbreviation for these: `dtype_abbrs` is built
+            // from `_get_all_dtypes()`, which leaves all fourteen out, and
+            // `torch.uint1.abbr` reads back as the full name (measured on
+            // torch 2.13.0). Spelling them out here says the same thing.
+            UInt1 => "uint1",
+            UInt2 => "uint2",
+            UInt3 => "uint3",
+            UInt4 => "uint4",
+            UInt5 => "uint5",
+            UInt6 => "uint6",
+            UInt7 => "uint7",
+            Int1 => "int1",
+            Int2 => "int2",
+            Int3 => "int3",
+            Int4 => "int4",
+            Int5 => "int5",
+            Int6 => "int6",
+            Int7 => "int7",
         }
     }
 
     /// Whether `torch._C._get_all_dtypes()` lists this one. torch leaves the
-    /// five quantised dtypes out of that list (measured: 27 of 32), and
-    /// `torch/utils/_dtype_abbrs.py` builds a dict keyed on exactly that list.
+    /// five quantised dtypes out of that list, and the fourteen sub-byte
+    /// integer tags too -- upstream torch 2.13.0 returns exactly 27 entries,
+    /// re-measured after `uint1..7`/`int1..7` were added here. That count is
+    /// the reason those fourteen are excluded rather than a guess about them:
+    /// `torch/utils/_dtype_abbrs.py` builds a dict keyed on exactly this list.
     pub fn in_all_dtypes(self) -> bool {
-        !matches!(self, QInt8 | QUInt8 | QInt32 | QUInt4x2 | QUInt2x4)
+        !matches!(
+            self,
+            QInt8
+                | QUInt8
+                | QInt32
+                | QUInt4x2
+                | QUInt2x4
+                | UInt1
+                | UInt2
+                | UInt3
+                | UInt4
+                | UInt5
+                | UInt6
+                | UInt7
+                | Int1
+                | Int2
+                | Int3
+                | Int4
+                | Int5
+                | Int6
+                | Int7
+        )
     }
 
     /// Bytes per element. torch reports 1 for `bool`, the same as `uint8`
