@@ -59,23 +59,32 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bitwise_or.Tensor",
     "aten.bmm.default",
     "aten.cat.default",
+    "aten.clamp_.default",
     "aten.clone.default",
+    "aten.convolution.default",
     "aten.copy_.default",
     "aten.cos.default",
     "aten.cumsum.default",
     "aten.detach.default",
     "aten.div.Tensor",
+    "aten.div_.Tensor",
     "aten.embedding.default",
     "aten.empty.memory_format",
+    "aten.empty_like.default",
     "aten.eq.Scalar",
     "aten.eq.Tensor",
+    "aten.exp.default",
     "aten.expand.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
+    "aten.floor_divide.default",
     "aten.full.default",
     "aten.gather.default",
+    "aten.ge.Scalar",
     "aten.gelu.default",
+    "aten.histc.default",
     "aten.index.Tensor",
+    "aten.index_put_.default",
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
     "aten.le.Scalar",
@@ -84,6 +93,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
+    "aten.masked_fill_.Scalar",
     "aten.max.default",
     "aten.max.dim",
     "aten.mean.default",
@@ -115,6 +125,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.silu.default",
     "aten.sin.default",
     "aten.slice.Tensor",
+    "aten.softplus.default",
     "aten.sort.default",
     "aten.split.Tensor",
     "aten.split_with_sizes.default",
@@ -132,6 +143,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.view.default",
     "aten.where.self",
     "aten.zero_.default",
+    "aten.zeros_like.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -748,6 +760,20 @@ fn aten_dispatch_inner(
         "aten.add_.Tensor" => add_inplace(py, args, kwargs),
         "aten.baddbmm.default" => baddbmm_default(py, args, kwargs),
         "aten.split_with_sizes.default" => split_with_sizes(py, args, kwargs),
+
+        // -- mamba / mixtral (docs/OPS4.md) ---------------------------------
+        "aten.exp.default" => unary_float(py, args, kwargs, "aten.exp.default", Unary::Exp),
+        "aten.softplus.default" => softplus_default(py, args, kwargs),
+        "aten.convolution.default" => convolution_default(py, args, kwargs),
+        "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
+        "aten.empty_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.empty_like.default"),
+        "aten.ge.Scalar" => compare_scalar(py, args, kwargs, "aten.ge.Scalar", Cmp::Ge),
+        "aten.floor_divide.default" => floor_divide_default(py, args, kwargs),
+        "aten.histc.default" => histc_default(py, args, kwargs),
+        "aten.clamp_.default" => clamp_inplace_default(py, args, kwargs),
+        "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
+        "aten.masked_fill_.Scalar" => masked_fill_inplace(py, args, kwargs, "aten.masked_fill_.Scalar"),
+        "aten.index_put_.default" => index_put_inplace(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -2694,6 +2720,7 @@ enum Cmp {
     Ne,
     Lt,
     Le,
+    Ge,
 }
 
 /// The comparison ops all answer `torch.bool`, and both operands are read in
@@ -2722,6 +2749,7 @@ fn apply_cmp(op: &str, kind: Cmp, lhs: &Tensor, rhs: &Tensor) -> PyResult<Tensor
         Cmp::Ne => lhs.broadcast_ne(rhs),
         Cmp::Lt => lhs.broadcast_lt(rhs),
         Cmp::Le => lhs.broadcast_le(rhs),
+        Cmp::Ge => lhs.broadcast_ge(rhs),
     }
     .map_err(|e| candle_err(op, e))
 }
@@ -2938,9 +2966,10 @@ enum Unary {
     Sin,
     Reciprocal,
     Tanh,
+    Exp,
 }
 
-/// `cos`, `sin`, `reciprocal`, `tanh` -- torch's unary float promotion, the
+/// `cos`, `sin`, `reciprocal`, `tanh`, `exp` -- torch's unary float promotion, the
 /// same rule `rsqrt` above already implements: a floating input keeps its own
 /// dtype (`float16` in, `float16` out, *not* widened), and an integral or
 /// boolean input becomes the default float.
@@ -2950,6 +2979,11 @@ enum Unary {
 /// integral CPU kernel upstream and raises, while `tanh(int64 tensor)` returns
 /// `float32` -- so `tanh` follows the promoting rule and `silu` does not.
 /// (`tanh(bool)` promotes too: `[True, False]` gives `[0.7615942, 0.0]`.)
+///
+/// `exp` joined this family for `mamba` (docs/OPS4.md), which computes
+/// `A = -exp(A_log)` (`A_log` a plain `float32` parameter) -- measured
+/// `torch.exp` on `int64`/`bool` promotes to `float32` exactly like `tanh`
+/// does, and a `float16` input stays `float16`.
 fn unary_float(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -2972,6 +3006,7 @@ fn unary_float(
             Unary::Sin => t.sin(),
             Unary::Reciprocal => t.recip(),
             Unary::Tanh => t.tanh(),
+            Unary::Exp => t.exp(),
         })
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
@@ -5564,6 +5599,689 @@ fn split_with_sizes(
         start += length;
     }
     Ok(PyList::new(py, chunks)?.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
+// mamba / mixtral -- the last two of the 20 measured architectures
+// (docs/OPS4.md) with anything unimplemented. Traced with a real
+// `TorchDispatchMode` over `transformers` 5.15.1 + torch 2.13.0 rather than
+// read off a doc comment: docs/OPS4.md's own §0 note is that doc comments
+// have been wrong about upstream three times before, so every rule below was
+// re-measured, not copied from a kernel's docstring.
+// ---------------------------------------------------------------------------
+
+/// `aten::softplus(Tensor self, Scalar beta=1, Scalar threshold=20) -> Tensor`
+///
+/// `mamba`'s selective-scan `dt` (the discretisation step size) is
+/// `softplus(dt_proj(x) + dt_bias)`, always `float32`, always the default
+/// `beta`/`threshold` (measured: `softplus.default(float32(1,128,6))`, two
+/// positional args absent).
+///
+/// **Not implemented for integral/boolean input** -- measured on real torch,
+/// `softplus_cpu` raises `NotImplementedError` naming the dtype rather than
+/// promoting the way `exp`/`tanh` do; softplus is refused, not widened.
+///
+/// The formula is upstream's numerically-stable split, not the naive
+/// `log(1+exp(beta*x))/beta` a doc comment would suggest: writing `y =
+/// beta*x`, `log(1+exp(y)) == max(y,0) + log(1+exp(-|y|))`, which never
+/// overflows `exp` for large `y` and keeps `log`'s argument in `[1,2]` (never
+/// the near-`1.0` region where `log(1+tiny)` loses precision). Above
+/// `threshold`, upstream skips the formula entirely and returns `x` itself,
+/// not an evaluation of it -- measured `softplus(20.1) == 20.1` exactly,
+/// which the formula alone would not promise. Every measured call in `mamba`
+/// stays well inside the default `threshold=20`, so that branch is exercised
+/// by the golden cases, not by the model.
+fn softplus_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.softplus.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    if !input.tag().is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"softplus_cpu\" not implemented for '{}'",
+            scalar_type_name(input.tag())
+        )));
+    }
+    let beta = scalar_arg(OP, args, kwargs, 1, "beta")?
+        .map(Scalar::as_f64)
+        .unwrap_or(1.0);
+    let threshold = scalar_arg(OP, args, kwargs, 2, "threshold")?
+        .map(Scalar::as_f64)
+        .unwrap_or(20.0);
+
+    let tag = input.tag();
+    let x = input.tensor()?.clone();
+    let y = x.affine(beta, 0.0).map_err(|e| candle_err(OP, e))?;
+    let abs_y = y.abs().map_err(|e| candle_err(OP, e))?;
+    // max(y, 0) == (y + |y|) / 2 -- avoids needing a `maximum` against a
+    // freshly-built zero tensor.
+    let positive = y
+        .add(&abs_y)
+        .and_then(|t| t.affine(0.5, 0.0))
+        .map_err(|e| candle_err(OP, e))?;
+    let log_term = abs_y
+        .affine(-1.0, 0.0)
+        .and_then(|t| t.exp())
+        .and_then(|t| t.affine(1.0, 1.0))
+        .and_then(|t| t.log())
+        .map_err(|e| candle_err(OP, e))?;
+    let full_formula = positive
+        .add(&log_term)
+        .and_then(|t| t.affine(1.0 / beta, 0.0))
+        .map_err(|e| candle_err(OP, e))?;
+    let over_threshold = y.gt(threshold).map_err(|e| candle_err(OP, e))?;
+    let out = over_threshold
+        .where_cond(&x, &full_formula)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[]
+///     stride, SymInt[] padding, SymInt[] dilation, bool transposed,
+///     SymInt[] output_padding, SymInt groups) -> Tensor`
+///
+/// `mamba`'s short causal depthwise conv over the SSM's `(x, B, C)` sequence:
+/// measured `convolution.default(float32(1,128,6), float32(128,1,4),
+/// float32(128,), stride=[1], padding=[3], dilation=[1], transposed=False,
+/// output_padding=[0], groups=128)` -- `groups == in_channels == out_channels`
+/// (depthwise), `padding == kernel_size - 1` on *both* sides (the caller
+/// slices `[..., :seq_len]` afterwards to keep it causal, which is the
+/// model's job, not this kernel's).
+///
+/// Only that shape is implemented: **not transposed**, a zero
+/// `output_padding` (irrelevant when not transposed, but checked so an
+/// unmeasured combination fails loudly rather than being silently ignored),
+/// a 3-D input (`(batch, channels, length)` -- the 1-D conv `nn.Conv1d`
+/// lowers to), and floating dtypes only. `candle_core::Tensor::conv1d`
+/// already accepts `groups`, and its symmetric `padding` argument is the
+/// same convention `aten::convolution` uses for a non-transposed 1-D
+/// convolution, so no reshaping trick is needed to reuse it.
+///
+/// Bias is `(out_channels,)` and is not something `conv1d` applies itself --
+/// added afterwards, reshaped to `(1, out_channels, 1)` to broadcast over the
+/// batch and length axes.
+fn convolution_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.convolution.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let weight = tensor_arg(OP, args, kwargs, 1, "weight")?;
+    let bias = optional_tensor_arg(OP, args, kwargs, 2, "bias")?;
+    let stride = shape_arg(OP, args, kwargs, 3, "stride")?;
+    let padding = shape_arg(OP, args, kwargs, 4, "padding")?;
+    let dilation = shape_arg(OP, args, kwargs, 5, "dilation")?;
+    let transposed = bool_arg(args, kwargs, 6, "transposed")?.unwrap_or(false);
+    let output_padding = shape_arg(OP, args, kwargs, 7, "output_padding")?;
+    let groups = required(OP, args, kwargs, 8, "groups")?.extract::<i64>()?;
+
+    if transposed {
+        return Err(not_implemented(format!(
+            "{OP}: transposed convolution not implemented in torch._C shim"
+        )));
+    }
+    if output_padding.iter().any(|&v| v != 0) {
+        return Err(not_implemented(format!(
+            "{OP}: a non-zero output_padding is not implemented in torch._C shim \
+             (only meaningful for transposed convolution, which is also not implemented)"
+        )));
+    }
+    let rank = input.tensor()?.rank();
+    if rank != 3 {
+        return Err(not_implemented(format!(
+            "{OP}: only 1-D convolution (3-D input, (batch, channels, length)) is \
+             implemented in torch._C shim, got {rank}-D"
+        )));
+    }
+    if stride.len() != 1 || padding.len() != 1 || dilation.len() != 1 {
+        return Err(not_implemented(format!(
+            "{OP}: only a single-element stride/padding/dilation (1-D convolution) is \
+             implemented in torch._C shim"
+        )));
+    }
+    if stride[0] <= 0 || padding[0] < 0 || dilation[0] <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: stride and dilation must be positive, padding must be non-negative"
+        )));
+    }
+    if groups <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: groups must be a positive integer"
+        )));
+    }
+
+    let tag = same_dtype(OP, &input, &weight)?;
+    if !tag.is_floating_point() {
+        return Err(not_implemented(format!(
+            "{OP}: only floating-point convolution is implemented in torch._C shim, \
+             got {}",
+            scalar_type_name(tag)
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let x = input.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    let w = weight.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    let raw = x
+        .conv1d(
+            &w,
+            padding[0] as usize,
+            stride[0] as usize,
+            dilation[0] as usize,
+            groups as usize,
+        )
+        .map_err(|e| candle_err(OP, e))?;
+    let out = match bias {
+        Some(b) => {
+            if b.tag() != tag {
+                return Err(not_implemented(format!(
+                    "{OP}: bias dtype must match input/weight dtype in torch._C shim"
+                )));
+            }
+            let c_out = raw.dim(1).map_err(|e| candle_err(OP, e))?;
+            let b_reshaped = b
+                .tensor()?
+                .to_dtype(storage)
+                .and_then(|t| t.reshape((1, c_out, 1)))
+                .map_err(|e| candle_err(OP, e))?;
+            raw.broadcast_add(&b_reshaped).map_err(|e| candle_err(OP, e))?
+        }
+        None => raw,
+    };
+    finish(py, out, tag)
+}
+
+/// `aten::zeros_like`/`aten::empty_like(Tensor self, *, ScalarType? dtype=None,
+///     Layout? layout=None, Device? device=None, bool? pin_memory=None,
+///     MemoryFormat? memory_format=None) -> Tensor`
+///
+/// `mamba`'s selective-scan state is seeded with `zeros_like(...)`, and
+/// `mixtral`'s grouped-MoE routing (`transformers`'
+/// `integrations/moe.py::grouped_mm_experts_forward`) allocates
+/// `torch.empty_like(perm)` purely to be overwritten in full two lines later
+/// (`inv_perm[perm] = torch.arange(...)`) -- so, exactly like
+/// `empty.memory_format` above, "empty" answers zeros here: the shim is
+/// deterministic where upstream is not, and both measured call sites read
+/// every element back before using it.
+///
+/// Structured like `new_ones_default`: the reference tensor supplies the
+/// defaults (shape always, dtype/device unless overridden) a bare factory
+/// would otherwise take from the process-wide default.
+fn zeros_or_empty_like(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+    reject_unsupported(
+        op,
+        args,
+        kwargs,
+        &[(2, "layout"), (4, "pin_memory"), (5, "memory_format")],
+    )?;
+    let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
+    let shape = input.tensor()?.dims().to_vec();
+    if label.is_meta() {
+        return meta_result(py, shape, tag);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(tag).storage(op)?;
+    let out = Tensor::zeros(shape, storage, &device).map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::floor_divide(Tensor self, Tensor other) -> Tensor`
+///
+/// `mixtral`'s grouped-MoE routing recovers each selected token's row with
+/// `hidden_states[perm // num_top_k]` -- `perm` an `int64` tensor, `//` a
+/// **Python `int`**, not a tensor. Measured with a real `TorchDispatchMode`:
+/// the dispatched call is `floor_divide.default(int64_tensor, 2)`, a bare
+/// Python `int` reaching the `(Tensor, Tensor)` overload's `other` slot
+/// rather than the `floor_divide.Scalar` overload the schema alternative
+/// would suggest -- torch's own frontend picks `.default` here and leaves the
+/// scalar-to-tensor conversion for the kernel, not the dispatcher. Both
+/// shapes are accepted below.
+///
+/// **Floors toward negative infinity, matching Python's `//` -- not C's
+/// truncation.** Measured on torch 2.13.0 with mixed-sign input: `[-7, -6,
+/// -1, 0, 1, 6, 7] // 2 == [-4, -3, -1, 0, 0, 3, 3]` (not `[-3, -3, 0, 0, 0,
+/// 3, 3]`, which is what truncating division would give for the negative
+/// entries). Implemented as truncating division with the standard correction
+/// (subtract one from the truncated quotient when the remainder is non-zero
+/// and its sign disagrees with the divisor's), which reproduces the measured
+/// table exactly.
+///
+/// **Dtype is preserved, not promoted** -- unlike `div.Tensor`'s true
+/// division, `int64 // int64` stays `int64` (measured), so this does not
+/// route through `arith_tag`.
+///
+/// **Division by zero on an integral dtype raises**, matching upstream's
+/// measured `RuntimeError('ZeroDivisionError')` exactly (message and all) --
+/// checked eagerly, before any division happens, so every element of a
+/// zero-divisor call fails together the way upstream's does. Division by
+/// zero on a floating dtype is not refused (`1.0 // 0.0 == inf`, `-1.0 //
+/// 0.0 == -inf`, `0.0 // 0.0 == nan`, all measured) -- ordinary `f64`
+/// division already answers this correctly, no special case needed.
+fn floor_divide_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.floor_divide.default";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = lhs.tag();
+    if tag == TorchDType::Bool {
+        return Err(not_implemented(format!(
+            "{OP}: torch.bool operands are not implemented in torch._C shim"
+        )));
+    }
+    let raw_other = required(OP, args, kwargs, 1, "other")?;
+    let n = lhs.tensor()?.elem_count();
+    let other_flat: Flat = if let Ok(other_tensor) = raw_other.extract::<PyTensorBase>() {
+        if other_tensor.tag() != tag {
+            return Err(not_implemented(format!(
+                "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                tag.name(),
+                other_tensor.tag().name()
+            )));
+        }
+        let flat = read_flat(OP, other_tensor.tensor()?, tag)?;
+        let count = other_tensor.tensor()?.elem_count();
+        if count != n && count != 1 {
+            return Err(not_implemented(format!(
+                "{OP}: broadcasting other than a scalar or an exact shape match is not \
+                 implemented in torch._C shim"
+            )));
+        }
+        flat
+    } else {
+        let scalar = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
+        if tag.is_floating_point() {
+            Flat::Float(vec![scalar.as_f64()])
+        } else {
+            Flat::Int(vec![scalar.as_i64()])
+        }
+    };
+
+    let self_flat = read_flat(OP, lhs.tensor()?, tag)?;
+    let out_flat = match (self_flat, other_flat) {
+        (Flat::Float(a), Flat::Float(b)) => {
+            let get = |i: usize| if b.len() == 1 { b[0] } else { b[i] };
+            Flat::Float(a.iter().enumerate().map(|(i, &x)| (x / get(i)).floor()).collect())
+        }
+        (Flat::Int(a), Flat::Int(b)) => {
+            let get = |i: usize| if b.len() == 1 { b[0] } else { b[i] };
+            let mut out = Vec::with_capacity(a.len());
+            for (i, &x) in a.iter().enumerate() {
+                let d = get(i);
+                if d == 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err("ZeroDivisionError"));
+                }
+                let q = x / d;
+                let r = x % d;
+                out.push(if r != 0 && (r < 0) != (d < 0) { q - 1 } else { q });
+            }
+            Flat::Int(out)
+        }
+        _ => unreachable!("self and other share a dtype, checked above"),
+    };
+
+    let dims = lhs.tensor()?.dims().to_vec();
+    let device = lhs.tensor()?.device().clone();
+    let out = write_flat(OP, out_flat, dims, &device, tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor`
+///
+/// `mixtral`'s grouped-MoE routing counts tokens per expert with
+/// `torch.histc(expert_ids_g.float(), bins=num_experts, min=0,
+/// max=num_experts-1)` (`transformers`' `integrations/moe.py`, CPU path --
+/// the comment there notes `histc` doesn't support integer dtypes on CPU,
+/// which measured confirms: `NotImplementedError("histogram_cpu" not
+/// implemented for 'Long')`, so only floating input is implemented here).
+///
+/// **`min == max` means "ignore both and use the data's own min/max"** --
+/// measured on torch 2.13.0 with *non-zero* equal bounds too
+/// (`histc(x, min=5, max=5)` on data ranging `[1,3]` bins over `[1,3]`, not
+/// `[5,5]`), so the rule is "min equals max", not "both are zero". A
+/// genuinely degenerate range (the data itself is constant) is a second,
+/// nested case: measured `histc([2,2,2], bins=4, min=0, max=0)` answers
+/// `[0,0,3,0]`, which is exactly what falling back to `[value-1, value+1]`
+/// produces (bin width `0.5`, `2.0` lands in `[2.0,2.5)`, the third of four
+/// bins) -- reproduced here as the same fallback applied twice rather than
+/// as a separately-derived formula.
+///
+/// Range is inclusive on both ends (`x == max` counts in the last bin,
+/// measured), and elements strictly outside `[min, max]` are dropped, not
+/// clamped into an edge bin (measured: `-1` and `4` are absent from
+/// `histc([..., -1, 4], bins=4, min=0, max=3)`'s counts).
+///
+/// `bins <= 0` and an explicit `min > max` are refused with upstream's exact
+/// wording (both measured): `"bins must be > 0, but got {bins} for dimension
+/// 0"` and `"torch.histc: max must be larger than min"`.
+fn histc_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.histc.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"histogram_cpu\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let bins = int_arg(args, kwargs, 1, "bins")?.unwrap_or(100);
+    if bins <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch.histogram(): bins must be > 0, but got {bins} for dimension 0"
+        )));
+    }
+    let min_arg = scalar_arg(OP, args, kwargs, 2, "min")?.map(Scalar::as_f64).unwrap_or(0.0);
+    let max_arg = scalar_arg(OP, args, kwargs, 3, "max")?.map(Scalar::as_f64).unwrap_or(0.0);
+
+    let values = read_flat(OP, input.tensor()?, tag)?;
+    let values = match values {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("floating dtype checked above"),
+    };
+
+    let (mut lo, mut hi) = if min_arg == max_arg {
+        let mut data_lo = f64::INFINITY;
+        let mut data_hi = f64::NEG_INFINITY;
+        for &v in &values {
+            if v < data_lo {
+                data_lo = v;
+            }
+            if v > data_hi {
+                data_hi = v;
+            }
+        }
+        if values.is_empty() {
+            (0.0, 0.0)
+        } else {
+            (data_lo, data_hi)
+        }
+    } else {
+        (min_arg, max_arg)
+    };
+    if lo > hi {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch.histc: max must be larger than min",
+        ));
+    }
+    if lo == hi {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+
+    let mut counts = vec![0.0f64; bins as usize];
+    let width = (hi - lo) / bins as f64;
+    for &v in &values {
+        if v < lo || v > hi || v.is_nan() {
+            continue;
+        }
+        let mut bin = ((v - lo) / width).floor() as i64;
+        if bin >= bins {
+            bin = bins - 1;
+        }
+        if bin < 0 {
+            bin = 0;
+        }
+        counts[bin as usize] += 1.0;
+    }
+
+    let device = input.tensor()?.device().clone();
+    let out = write_flat(OP, Flat::Float(counts), vec![bins as usize], &device, tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)`
+///
+/// `mixtral`'s grouped-MoE routing keeps a per-row expert-bias gather
+/// in-bounds with `expert_ids_g.clamp_(max=self.num_experts - 1)` (`min`
+/// absent) -- measured `clamp_.default(int64(12,), None, 3)`.
+///
+/// **The formula is `min(max(x, min_val), max_val)`, applied in that order
+/// unconditionally** -- not "refuse if `min > max`". Measured:
+/// `x.clamp_(min=8, max=2)` on `[1,5,10,-3]` gives `[2,2,2,2]` (every element
+/// hits the floor first, then the ceiling clips it down again), which is
+/// exactly what `candle_core::Tensor::clamp` already computes
+/// (`maximum(min).minimum(max)`), so this reuses it rather than reproducing
+/// it by hand. NaN propagates through both steps for the same reason
+/// (Rust's `<`/`>` are false against NaN, so `maximum`/`minimum` return
+/// whichever operand *is* NaN) -- measured `[nan,1.,-1.].clamp_(0,2) ==
+/// [nan,1.,0.]`.
+///
+/// **A float bound against an integral receiver is refused outright,
+/// regardless of the bound's actual value** -- measured `int32.clamp_(max=2.0)`
+/// raises `"result type Float can't be cast to the desired output type
+/// Int"` even though `2.0` is exactly representable as an int; torch does
+/// not special-case exact values, so this does not either.
+///
+/// **Both bounds absent is refused, not a no-op** -- measured
+/// `tensor.clamp_(None, None)` raises `"torch.clamp: At least one of 'min'
+/// or 'max' must not be None"` rather than returning the receiver
+/// unchanged, which "nothing to clamp against" would otherwise suggest.
+fn clamp_inplace_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.clamp_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let min = scalar_arg(OP, args, kwargs, 1, "min")?;
+    let max = scalar_arg(OP, args, kwargs, 2, "max")?;
+    if min.is_none() && max.is_none() {
+        // Measured, not a guess this shim could have gotten away with
+        // skipping: `tensor.clamp_(None, None)` raises on real torch rather
+        // than being an accepted no-op.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch.clamp: At least one of 'min' or 'max' must not be None",
+        ));
+    }
+    let tag = receiver.borrow().tag();
+    if !tag.is_floating_point() {
+        for bound in [min, max].into_iter().flatten() {
+            if !bound.is_int() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "result type Float can't be cast to the desired output type {}",
+                    scalar_type_name(tag)
+                )));
+            }
+        }
+    }
+    let source = receiver.borrow().tensor()?.clone();
+    let mut out = source;
+    if let Some(bound) = min {
+        out = if tag.is_floating_point() {
+            out.maximum(bound.as_f64())
+        } else {
+            out.maximum(bound.as_i64())
+        }
+        .map_err(|e| candle_err(OP, e))?;
+    }
+    if let Some(bound) = max {
+        out = if tag.is_floating_point() {
+            out.minimum(bound.as_f64())
+        } else {
+            out.minimum(bound.as_i64())
+        }
+        .map_err(|e| candle_err(OP, e))?;
+    }
+    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)`
+///
+/// `mixtral`'s router normalises top-k weights in place:
+/// `top_k_weights.div_(top_k_weights.sum(dim=-1, keepdim=True))`, measured
+/// `div_.Tensor(float32(6,2), float32(6,1))` -- `other` broadcasting *into*
+/// the receiver's shape, never the other way around, which is in-place's
+/// general rule (`add_inplace` above) and is exactly what this call needs
+/// (`(6,1)` into `(6,2)`).
+///
+/// **True division, and the receiver's dtype cannot change to accommodate
+/// it** -- unlike `div.Tensor`, which promotes an integral pair to
+/// `float32` (`arith_tag`), the in-place form has nowhere to put a wider
+/// result: measured `int64_tensor.div_(int64_tensor)` raises `"result type
+/// Float can't be cast to the desired output type Long"`. So this refuses
+/// non-floating receivers by name rather than silently truncating back to
+/// int, which would be a wrong answer with no trace.
+fn div_inplace_tensor(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.div_.Tensor";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let other = tensor_arg(OP, args, kwargs, 1, "other")?;
+
+    let (tag, shape) = {
+        let borrowed = receiver.borrow();
+        (borrowed.tag(), borrowed.tensor()?.shape().clone())
+    };
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type Float can't be cast to the desired output type {}",
+            scalar_type_name(tag)
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let lhs = {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+    };
+    let rhs = other
+        .tensor()?
+        .to_dtype(storage)
+        .and_then(|t| t.broadcast_as(shape))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let out = lhs.broadcast_div(&rhs).map_err(|e| candle_err(OP, e))?;
+    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::masked_fill_.Scalar(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)`
+///
+/// `mixtral`'s grouped-MoE routing zeroes sentinel rows twice, once each
+/// side of the grouped matmul: `selected_hidden_states_g.masked_fill_(
+/// sentinel_mask, 0.0)` and `weighted_out.masked_fill_(sentinel_mask, 0.0)`
+/// (`transformers`' `integrations/moe.py`) -- measured
+/// `masked_fill_.Scalar(float32(12,64), bool(12,1), 0.0)`, the mask
+/// broadcasting from `(12,1)` into the receiver's `(12,64)`.
+///
+/// Not a new kernel: the value and every refusal are `masked_fill.Scalar`'s
+/// (a `torch.bool` mask required, same as that op's doc comment measures),
+/// computed once and written into the receiver via `replace_with` -- the
+/// same "aliases created before this call do not see the write" limitation
+/// `add_inplace`'s doc comment already states for every in-place op in this
+/// file.
+fn masked_fill_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let receiver = tensor_receiver(op, args, kwargs)?;
+    let result = masked_fill(py, args, kwargs, op)?;
+    let replacement = result.extract::<PyTensorBase>(py)?;
+    receiver.borrow_mut().replace_with(replacement);
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool
+///     accumulate=False) -> Tensor(a!)`
+///
+/// `mixtral`'s grouped-MoE routing builds the inverse of a sort permutation
+/// with `inv_perm[perm] = torch.arange(perm.size(0))` (`transformers`'
+/// `integrations/moe.py`), which lowers to `index_put_` with a single index
+/// tensor -- measured `index_put_.default(int64(12,), [int64(12,)],
+/// int64(12,), accumulate=False (default, absent))`.
+///
+/// **Restricted to exactly the shape measured**: one non-`None` index
+/// tensor, `self`/`index`/`values` all rank 1 with matching element counts,
+/// `accumulate=False`. That single-index, non-accumulating, 1-D case is
+/// `self[index[i]] = values[i]` for each `i` -- which is `scatter.src` along
+/// dimension 0 with `index` and `values` standing in for `scatter`'s `index`
+/// and `src` (both already require `self`'s dtype and an int32/int64 index,
+/// which is exactly what `index_put_`'s schema also demands here). Rather
+/// than re-deriving that arithmetic, this builds the `(dim=0, index, src)`
+/// call `scatter.src` already implements and writes the result back into the
+/// receiver through `replace_with`. A wider index list, `accumulate=True`,
+/// or non-1-D operands are refused by name: not measured, so not guessed at.
+fn index_put_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index_put_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let raw_indices = required(OP, args, kwargs, 1, "indices")?;
+    let items: Vec<Bound<'_, PyAny>> = raw_indices.extract()?;
+    let values = tensor_arg(OP, args, kwargs, 2, "values")?;
+    let accumulate = bool_arg(args, kwargs, 3, "accumulate")?.unwrap_or(false);
+    if accumulate {
+        return Err(not_implemented(format!(
+            "{OP}: accumulate=True is not implemented in torch._C shim"
+        )));
+    }
+
+    let mut chosen: Option<PyTensorBase> = None;
+    for item in &items {
+        if item.is_none() {
+            continue;
+        }
+        let tensor = item.extract::<PyTensorBase>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{OP}: indices must be tensors or None, got {}",
+                item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?;
+        if chosen.is_some() {
+            return Err(not_implemented(format!(
+                "{OP}: more than one index tensor is not implemented in torch._C shim"
+            )));
+        }
+        chosen = Some(tensor);
+    }
+    let index = chosen.ok_or_else(|| {
+        not_implemented(format!("{OP}: an all-None index list is not implemented in torch._C shim"))
+    })?;
+
+    let self_rank = receiver.borrow().tensor()?.rank();
+    if self_rank != 1 || index.tensor()?.rank() != 1 || values.tensor()?.rank() != 1 {
+        return Err(not_implemented(format!(
+            "{OP}: only a 1-D self/index/values is implemented in torch._C shim"
+        )));
+    }
+
+    // `scatter.src`'s own dim/dtype/index-dtype rules apply unchanged --
+    // build the call it expects and let it do the work.
+    let scatter_args = PyTuple::new(
+        py,
+        [
+            receiver.clone().into_any(),
+            0i64.into_pyobject(py)?.into_any(),
+            index.into_pyobject(py)?.into_any(),
+            values.into_pyobject(py)?.into_any(),
+        ],
+    )?;
+    let result = scatter_src(py, &scatter_args, None)?;
+    let replacement = result.extract::<PyTensorBase>(py)?;
+    receiver.borrow_mut().replace_with(replacement);
+    Ok(receiver.into_any().unbind())
 }
 
 /// `aten::native_layer_norm(Tensor input, SymInt[] normalized_shape,
