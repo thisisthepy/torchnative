@@ -578,3 +578,22 @@ $PY tools/golden/compare.py; echo "EXIT=$?"
 **candle 의 철자로는 `torch.bool` 과 `torch.uint8` 을 구별할 수 없습니다** — 아래에서는 둘 다
 `u8` 입니다. 그 구별을 못 하는 메시지는 이 구별이 존재하는 이유인 버그를 보고할 수 없습니다.
 동작 변경이 의도된 것이므로 단언을 따라 옮겼습니다.
+
+
+> **정정 (`docs/REGISTRATIONS.md`).** 이 절이 `_dispatch_has_kernel` 을 `True` 로 고른 이유로
+> "`False` 로 하면 973 항목짜리 분해 테이블이 비어버린다" 를 들었는데, **그 숫자와 그 인과가 모두
+> 틀렸습니다.**
+>
+> 실측하면 진짜 torch 의 `decomposition_table` 은 **1097**(`core_aten_decompositions()` 는 940)
+> 이고, 우리 shim 은 **592** 입니다. 즉 `True` 로 골랐는데도 테이블이 절반가량입니다 —
+> **그 선택이 목적을 달성하지 못했습니다.**
+>
+> 부족분의 원인은 `_dispatch_has_kernel` 이 아니라 **`_jit_get_operation` 이 항상
+> `overload_names=["default"]` 를 돌려주는 것**입니다. `OpOverloadPacket.op_overloads()` 가 op 마다
+> 오버로드를 하나씩만 지어내서, 진짜 오버로드 715 개(`.out` · `.Scalar` · in-place)가 빠지고
+> 대응물 없는 유령 `.default` 210 개가 생깁니다.
+>
+> 그리고 `_dispatch_has_kernel=True` 는 **혼자 설 수 없는 거짓말**입니다. 진짜 torch 에 같은 값을
+> 강제하면 테이블이 1097 → 1348 로 늘고, torch 자신의 `activate_meta()` 가 그 251 개를 검증하다
+> **`RuntimeError` 로 죽습니다.** 우리 shim 이 살아남는 것은 `_dispatch_has_kernel_for_dispatch_key`
+> 도 이름을 검증하지 않고 항상 `False` 를 돌려주기 때문입니다 — **두 플래그가 짝입니다.**
