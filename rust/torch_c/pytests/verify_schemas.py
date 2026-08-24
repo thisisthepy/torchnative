@@ -29,8 +29,10 @@ Exit code is 0 iff every entry matched. Read the exit code; do not grep.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +94,76 @@ def check(label: str, path: str, torch) -> tuple[int, int]:
     return checked, failures
 
 
+# The `_c10d_functional` family, which is not a JSON table but a tuple literal
+# in `bootstrap.py`. Same problem, same answer: the text was transcribed from
+# upstream's own registry (docs/DISTRIBUTED.md), so it needs the same check.
+#
+# It is read out of the source with `ast` rather than imported, because
+# importing `bootstrap.py` means importing the shim, and this script has to run
+# with *upstream* torch on the path -- putting both in one interpreter is the
+# thing the golden harness goes to a second process to avoid.
+BOOTSTRAP = os.path.join(SRC, "bootstrap.py")
+NON_ATEN_NAMESPACES = ("_c10d_functional", "_c10d_functional_autograd", "_dtensor")
+
+
+def _non_aten_schema_table() -> list:
+    with open(BOOTSTRAP, encoding="utf-8") as fh:
+        source = fh.read()
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "_NON_ATEN_SCHEMA_TEXT" in targets:
+            return list(ast.literal_eval(node.value))
+    raise RuntimeError(f"_NON_ATEN_SCHEMA_TEXT not found in {BOOTSTRAP}")
+
+
+def check_non_aten(torch) -> tuple[int, int]:
+    """Both directions, unlike the aten tables.
+
+    A *missing* entry matters here in a way it does not for aten: the aten
+    tables are deliberately a subset of what the dispatcher knows, but this
+    table's whole job is to be the schemas the tree will ask for, and the tree
+    asks for all of them. So an op upstream registers in one of these
+    namespaces and this table lacks is reported.
+    """
+    # Importing this is what registers the namespaces; without it upstream's
+    # own registry does not have them either.
+    import torch.distributed._functional_collectives  # noqa: F401
+
+    upstream = {}
+    for schema in torch._C._jit_get_all_schemas():
+        namespace = schema.name.split("::")[0]
+        if namespace in NON_ATEN_NAMESPACES:
+            upstream[str(schema).split("(")[0]] = str(schema)
+
+    table = _non_aten_schema_table()
+    failures = 0
+    seen = set()
+    for text in table:
+        head = text.split("(")[0]
+        seen.add(head)
+        candidate = upstream.get(head)
+        if candidate is None:
+            failures += 1
+            print(f"FAIL c10d schemas {head}: upstream has no such operator")
+        elif _normalise(candidate) != _normalise(text):
+            failures += 1
+            print(f"FAIL c10d schemas {head}:")
+            print(f"     table:    {text}")
+            print(f"     upstream: {candidate}")
+    for head in sorted(set(upstream) - seen):
+        failures += 1
+        print(f"FAIL c10d schemas {head}: upstream registers it and the table "
+              "does not carry it")
+    return len(table), failures
+
+
+def _normalise(schema: str) -> str:
+    return re.sub(r"\s+", " ", schema).strip()
+
+
 def main() -> int:
     try:
         import torch
@@ -108,6 +180,11 @@ def main() -> int:
         print(f"  {label}: {checked - failures}/{checked} matched")
         total += checked
         failed += failures
+
+    checked, failures = check_non_aten(torch)
+    print(f"  bootstrap.py _NON_ATEN_SCHEMA_TEXT: {checked - failures}/{checked} matched")
+    total += checked
+    failed += failures
 
     # The other direction is deliberately *not* an error. The tables list the
     # overloads torch's Python bindings expose, which is a subset: `aten::pow`

@@ -1006,6 +1006,16 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 
 ### 11.1 1 단계가 멈춘 지점과, 거기서 나온 순서 (2026-08-24 갱신)
 
+> **(2026-08-25 추기) 이 벽은 열렸습니다 — `docs/DISTRIBUTED.md`.** 아래 문단이 예상한 그대로,
+> `torch.distributed` 를 `world_size = 1` 부터 실체로 구현하면서 부수 효과로 열렸고, 벤더 트리는
+> 한 줄도 고치지 않았습니다. `from transformers import AutoModelForCausalLM` 과
+> `AutoModelForCausalLM.from_config(...)` 이 통과합니다 — 손으로 옮겨 적은 것이 아닌 **진짜
+> transformers 모델 객체**가 만들어집니다.
+>
+> **다만 순전파는 아직입니다.** 다음 벽은 분산이 아니라 `torch._C.is_autocast_enabled`
+> (`transformers/utils/generic.py:250`) 이고, 따라서 바로 아래 문단이 말하는
+> `from_pretrained` · 실제 체크포인트 경로는 **여전히 한 번도 실행되지 않았습니다.**
+
 **1 단계가 완료되지 않았습니다.** `import transformers` 가 아직 안 됩니다 —
 `torch.distributed.Store` 재수출이 끊겨서이고, 그 진단과 결정은 `docs/SURFACE_HONESTY.md` §2 에
 있습니다. **벤더 트리에 패치를 대지 않기로 정했으므로**, 이 벽은 `torch.distributed` 를

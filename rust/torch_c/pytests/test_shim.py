@@ -751,10 +751,17 @@ def test_off_switches_stay_off():
     # VENDOR.md wall 11: the vendored tree turns subsystems off by asking
     # whether `_C` has a name. A module-level catch-all would answer yes to
     # all of them at once.
-    assert not hasattr(_C, "_c10d_init")
     assert not hasattr(_C, "_cuda_getDeviceCount")
     assert not hasattr(_C, "_rpc_init")
     assert _C._shim_off_switches, "the off-switch list must be inspectable"
+
+    # `_c10d_init` used to be on this list and is now answered -- see
+    # `ANSWERED_PROBES` in bootstrap.py and docs/DISTRIBUTED.md. The switch is
+    # inverted rather than removed: a subsystem that is built has to say so,
+    # and the list must not still be claiming it is off.
+    assert hasattr(_C, "_c10d_init")
+    assert _C._c10d_init() is True
+    assert "_c10d_init" not in _C._shim_off_switches
 
 
 def test_op_registry_routes_to_the_one_door():
@@ -785,9 +792,11 @@ def test_parsed_schema_really_reads_the_schema():
     assert schema.arguments[0].alias_info is not None
     assert schema.arguments[0].alias_info.is_write
     assert schema.arguments[1].alias_info is None
-    assert schema.is_mutable()
+    # A property, as upstream's is -- see
+    # `test_schema_is_mutable_is_a_property_not_a_call` for why that matters.
+    assert schema.is_mutable
     functional = _C.parse_schema("aten::mm(Tensor self, Tensor mat2) -> Tensor")
-    assert not functional.is_mutable()
+    assert not functional.is_mutable
     kwonly = _C.parse_schema(
         "aten::full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None) -> Tensor"
     )
@@ -3213,6 +3222,533 @@ def test_capture_road_through_the_vendored_tree():
     assert "aten._local_scalar_dense.default" in r["branch_refusal"], r["branch_refusal"]
     assert r["active_after"] is False
 
+
+# --- torch.distributed at world_size 1 (docs/DISTRIBUTED.md) -----------------
+#
+# `torch.distributed` was off, because `_c10d_init` was one of the names the
+# surface deliberately omits (bootstrap.py's "Deliberate omissions"). Turning it
+# on is not a one-line switch: `torch/distributed/__init__.py` reaches straight
+# into `torch._C._distributed_c10d` and what it needs there is *structure* --
+# real enums iterated with `__members__`, nested types, subclassable bases --
+# not names. docs/SURFACE_HONESTY.md §2.4 measured that a catch-all answering
+# every question still could not finish `import torch`.
+#
+# The tests below are grouped by what they hold down:
+#   * the four `_C` defects the walk uncovered, none of them distributed;
+#   * the shape of `_distributed_c10d` itself;
+#   * the road through the vendored tree, in a subprocess.
+
+
+def test_schema_is_mutable_is_a_property_not_a_call():
+    """`is_mutable` is a property upstream and was a method here.
+
+    `torch/_library/utils.py:104` is `if schema.is_mutable:` and there are
+    fifteen more `._schema.is_mutable` sites in the vendored tree, every one of
+    them an attribute read. A bound method is truthy, so the shim answered
+    "mutable" for *every* schema and `is_functional_schema` was False
+    everywhere -- the always-true predicate this repository has been bitten by
+    before. It never showed up because the one test that covered it used the
+    shim's own spelling, `is_mutable()`, which works either way.
+
+    `_is_view_op` stays a method: `torch/distributed/tensor/_dispatch.py:569`
+    calls it with parentheses.
+    """
+    mutating = _C.parse_schema("aten::add_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)")
+    functional = _C.parse_schema("aten::mm(Tensor self, Tensor mat2) -> Tensor")
+    # `is True` / `is False`, not truthiness -- truthiness is what hid this.
+    assert mutating.is_mutable is True
+    assert functional.is_mutable is False
+    assert callable(functional._is_view_op)
+
+
+def test_the_c10d_functional_namespace_has_real_schemas():
+    """`_get_schema` answered every op with an empty argument list.
+
+    `torch/distributed/_functional_collectives.py:637` registers an autograd
+    formula for `_c10d_functional::wait_tensor`, and `register_autograd`
+    refuses unless the schema is *functional* -- which needs arguments and
+    returns to actually be there. These ops live in C++ upstream, so there is
+    nowhere else for them to come from.
+    """
+    wait = _C._get_schema("_c10d_functional::wait_tensor", "")
+    assert [a.name for a in wait.arguments] == ["tensor"], wait
+    assert len(wait.returns) == 1, wait
+    assert wait.is_mutable is False
+
+    # The in-place variant is mutable, so the table is not just "everything
+    # is functional".
+    inplace = _C._get_schema("_c10d_functional::all_reduce_", "")
+    assert inplace.is_mutable is True, inplace
+
+    # And an op that is genuinely absent still refuses rather than inventing
+    # an empty schema that would answer "functional" to the same question.
+    for qualname in ("_c10d_functional::all_reduce",
+                     "_c10d_functional_autograd::all_to_all_single",
+                     "_dtensor::shard_dim_alltoall"):
+        s = _C._get_schema(qualname, "")
+        assert s.arguments, qualname
+        assert s.returns, qualname
+
+
+def test_make_subclass_does_not_advertise_a_signature_the_polyfill_rejects():
+    """Upstream's `_make_subclass` is a C builtin with no readable signature.
+
+    `torch/_dynamo/decorators.py:966` wraps `inspect.signature(original_fn)` in
+    `except ValueError: pass`, so upstream never runs the comparison at all.
+    Ours is a Python function, so the comparison ran and rejected it -- the
+    polyfill spells the flag `requires_grad` while the real (measured) keyword
+    upstream accepts is `require_grad`, which is also what
+    `torch/_C/__init__.pyi:2389` declares.
+
+    Matching the polyfill's spelling would have made the shim accept a keyword
+    upstream rejects and reject the one it accepts, so the signature is
+    withheld instead -- which is the same amount of information upstream gives.
+    """
+    import inspect
+
+    sig = inspect.signature(_C.TensorBase._make_subclass)
+    kinds = [p.kind for p in sig.parameters.values()]
+    assert kinds == [inspect.Parameter.VAR_POSITIONAL,
+                     inspect.Parameter.VAR_KEYWORD], sig
+
+    # Withholding the signature must not have changed what it accepts.
+    x = _C._VariableFunctions.zeros([2])
+    made = _C.TensorBase._make_subclass(_C.TensorBase, x, require_grad=True)
+    assert made.requires_grad is True
+    assert _C.TensorBase._make_subclass(_C.TensorBase, x).requires_grad is False
+
+
+def test_default_dtype_answers_with_the_dtype_the_dispatcher_actually_uses():
+    """`torch.get_default_dtype()` had no overload-table entry and refused.
+
+    `torch/distributed/_shard/sharded_tensor/metadata.py:20` calls it in a
+    dataclass field default, at import time. It is not an aten op -- upstream
+    binds it straight onto `_C` -- so overload resolution was never going to
+    find it.
+
+    The value is not a free choice: `aten.rs`'s `DEFAULT_FLOAT` is what factory
+    functions infer, so this asks the dispatcher rather than asserting a
+    constant.
+    """
+    assert _C.get_default_dtype() is _C.float32
+    # `==`, not `is`. Upstream interns dtypes so `torch.zeros(1).dtype is
+    # torch.float32` holds; here a tensor's `.dtype` builds a fresh instance,
+    # so the two are equal and not identical. That is a real difference and it
+    # is *not* what this test is about -- it predates this change and is
+    # recorded here rather than asserted away.
+    assert _C._VariableFunctions.zeros([1]).dtype == _C.get_default_dtype()
+
+    # `set_default_dtype` would have to reach a Rust constant, so it stays
+    # refused -- by name, not by silently doing nothing.
+    try:
+        _C._VariableFunctions.set_default_dtype(_C.float64)
+    except NotImplementedError as e:
+        assert "set_default_dtype" in str(e), e
+    else:
+        raise AssertionError("set_default_dtype silently accepted")
+
+
+def test_wait_counter_guard_is_a_context_manager():
+    """Every `@_exception_logger` c10d entry point opens one.
+
+    `torch/distributed/c10d_logger.py:96` wraps each public collective in
+    `with _WaitCounter(...).guard():`. Nothing here measures anything; the
+    requirement is only that the block can be entered.
+    """
+    with _C._monitor._WaitCounter("pytorch.wait_counter.test").guard():
+        pass
+
+
+def test_reduce_op_is_a_real_enum_that_can_be_walked():
+    """`distributed_c10d.py:560` runs `reduce_op = _reduce_op()` at module scope,
+    whose `__init__` iterates `ReduceOp.RedOpType.__members__.items()`.
+
+    docs/SURFACE_HONESTY.md §2.4 stopped exactly here: a placeholder that
+    answers every attribute still has no `__members__` to walk.
+    """
+    c10d = _C._distributed_c10d
+    members = c10d.ReduceOp.RedOpType.__members__
+    assert set(members) == {
+        "SUM", "AVG", "PRODUCT", "MIN", "MAX",
+        "BAND", "BOR", "BXOR", "PREMUL_SUM", "UNUSED",
+    }, sorted(members)
+    # Used as a default argument value in seven `def`s, so it is read at import.
+    assert c10d.ReduceOp.SUM is members["SUM"]
+    assert c10d.ReduceOp(c10d.ReduceOp.SUM) == c10d.ReduceOp.SUM
+
+
+def test_backend_type_has_the_seven_members_the_table_names():
+    """`distributed_c10d.py:320-328` builds `backend_type_map` in a class body,
+    naming seven members. Seven, not "at least seven": `FAKE` maps to `CUSTOM`
+    rather than to a member of its own.
+    """
+    bt = _C._distributed_c10d.ProcessGroup.BackendType
+    assert set(bt.__members__) == {
+        "UNDEFINED", "GLOO", "NCCL", "UCC", "MPI", "XCCL", "CUSTOM",
+    }, sorted(bt.__members__)
+
+
+def test_the_c10d_types_are_real_types():
+    """Three separate structural demands, all at import time.
+
+    `class _IllegalWork(Work)` (distributed_c10d.py:2809) needs a subclassable
+    base. `_export_c_types()` (line 202) assigns `__module__` on sixteen of
+    them. `device_mesh.py:72` evaluates `C10dBackend.Options | None`, which is
+    a `TypeError` unless `Options` is a genuine nested type.
+    """
+    c10d = _C._distributed_c10d
+
+    class _Sub(c10d.Work):
+        pass
+
+    assert _Sub().is_completed() is True
+
+    for name in ("AllreduceCoalescedOptions", "AllreduceOptions", "AllToAllOptions",
+                 "BarrierOptions", "BroadcastOptions", "GatherOptions", "PrefixStore",
+                 "ProcessGroup", "ReduceOp", "ReduceOptions", "ReduceScatterOptions",
+                 "ScatterOptions", "Store", "DebugLevel", "Work"):
+        obj = getattr(c10d, name)
+        obj.__module__ = "torch.distributed.distributed_c10d"
+        assert obj.__module__ == "torch.distributed.distributed_c10d", name
+    c10d.get_debug_level.__module__ = "torch.distributed.distributed_c10d"
+
+    assert isinstance(c10d.Backend.Options, type)
+    assert c10d.Backend.Options | None is not None
+
+
+def test_process_group_can_take_the_opaque_metaclass():
+    """`device_mesh._register_distributed_opaque_types` demands that
+    `ProcessGroup` carry `torch._opaque_base.OpaqueBaseMeta`, which upstream's
+    pybind class does (measured on 2.13.0).
+
+    `_C` cannot import the tree at its own import time, so the binding is late
+    -- the same shape as `_C._set_generator_metaclass`, pulled rather than
+    pushed, and `_c10d_init()` is where the tree asks for it. What this test
+    holds down is the precondition: `__class__` assignment refuses when the old
+    metaclass is `type`, because `type` is a static type.
+    """
+    pg = _C._distributed_c10d.ProcessGroup
+    assert type(pg) is not type, "ProcessGroup's metaclass must be a heap type"
+    assert issubclass(type(pg), type)
+
+    class _Meta(type):
+        pass
+
+    original = type(pg)
+    try:
+        pg.__class__ = _Meta
+    finally:
+        pg.__class__ = original
+
+
+def test_the_store_is_a_real_key_value_store():
+    """At world_size 1 the store is not a stand-in for anything -- this process
+    is the only writer and the only reader, so a dict *is* the rendezvous.
+    """
+    c10d = _C._distributed_c10d
+    s = c10d.HashStore()
+    s.set("k", "v")
+    assert s.get("k") == b"v"
+    assert s.add("counter", 3) == 3
+    assert s.add("counter", 4) == 7
+    assert s.check(["k"]) is True and s.check(["nope"]) is False
+    assert s.num_keys() == 2
+    assert s.delete_key("k") is True and s.check(["k"]) is False
+
+    p = c10d.PrefixStore("pfx", s)
+    p.set("a", "1")
+    assert p.get("a") == b"1"
+    assert s.get("pfx/a") == b"1"
+
+
+def test_the_store_refuses_to_wait_for_a_rank_that_cannot_exist():
+    """A silent no-op `wait` is the failure mode this repository named in
+    docs/CKPT.md: it looks like it worked. At world_size 1 nobody else can ever
+    set the key, so waiting is not "not yet", it is "never".
+    """
+    s = _C._distributed_c10d.HashStore()
+    s.set("here", "1")
+    s.wait(["here"])  # present: returns
+    try:
+        s.wait(["never"])
+    except RuntimeError as e:
+        assert "never" in str(e), e
+    else:
+        raise AssertionError("Store.wait silently returned for an absent key")
+
+
+def test_transports_that_need_a_peer_refuse_by_name():
+    """DESIGN.md §6. `TCPStore` cannot be honest at world_size 1 -- there is
+    nothing at the other end of the socket -- so it says so instead of
+    pretending to connect.
+    """
+    try:
+        _C._distributed_c10d.TCPStore("127.0.0.1", 29500, 1, True)
+    except NotImplementedError as e:
+        assert "TCPStore" in str(e), e
+    else:
+        raise AssertionError("TCPStore pretended to connect")
+
+
+# --- the road through the vendored tree (docs/DISTRIBUTED.md) ---------------
+#
+# Everything above drives `_C` directly. What this section holds down is the
+# thing the work was for: that the *tree* gets somewhere it could not get
+# before. It runs in a subprocess with `torchnative/src/main` on PYTHONPATH,
+# the same two-interpreter shape as the checkpoint, device, meta and capture
+# roads above and for the same reason (see that section's comment).
+
+_DIST_ROAD_SCRIPT = r"""
+import json, sys, traceback
+
+out = {}
+
+def step(name, code):
+    try:
+        exec(code, globals())
+    except BaseException:
+        out[name] = "FAILED: " + traceback.format_exc(limit=0).strip().splitlines()[-1]
+    else:
+        out[name] = "OK"
+
+import torch
+import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
+
+out["is_available"] = dist.is_available()
+out["has_Store"] = hasattr(dist, "Store")
+# The wire backends must stay *absent*, so the tree's own availability flags
+# come out False and it refuses by name rather than reaching for a hollow
+# object. docs/SURFACE_HONESTY.md 2.4's regression lives here.
+out["gloo_available"] = c10d._GLOO_AVAILABLE
+out["nccl_available"] = c10d._NCCL_AVAILABLE
+out["mpi_available"] = c10d._MPI_AVAILABLE
+out["ucc_available"] = c10d._UCC_AVAILABLE
+try:
+    dist.init_process_group(backend="gloo", rank=0, world_size=1,
+                            store=dist.HashStore())
+except RuntimeError as e:
+    out["gloo_refusal"] = str(e)
+else:
+    out["gloo_refusal"] = "ACCEPTED"
+
+step("fsdp", "import torch.distributed.fsdp")
+step("transformers", "import transformers")
+step("AutoModelForCausalLM", "from transformers import AutoModelForCausalLM")
+step("LlamaForCausalLM",
+     "from transformers.models.llama.modeling_llama import LlamaForCausalLM")
+
+import torchnative.distributed as tnd
+out["backend_name"] = tnd.BACKEND_NAME
+out["registered"] = tnd.BACKEND_NAME.upper() in dist.Backend._plugins
+
+dist.init_process_group(backend=tnd.BACKEND_NAME, rank=0, world_size=1,
+                        store=dist.HashStore())
+out["rank"] = dist.get_rank()
+out["world_size"] = dist.get_world_size()
+out["backend"] = dist.get_backend()
+
+def record(name, fn):
+    try:
+        out[name] = fn()
+    except NotImplementedError as e:
+        out[name] = "REFUSED: " + str(e).split(":")[0]
+    except BaseException as e:
+        out[name] = "%s: %s" % (type(e).__name__, e)
+
+def src():
+    return torch.tensor([1.0, -2.0, 3.5])
+
+for op_name in ("SUM", "AVG", "PRODUCT", "MIN", "MAX"):
+    def run(op_name=op_name):
+        x = src()
+        dist.all_reduce(x, op=getattr(dist.ReduceOp, op_name))
+        return x.tolist()
+    record("all_reduce_" + op_name, run)
+
+record("all_reduce_PREMUL_SUM", lambda: (
+    lambda x: (dist.all_reduce(x, op=dist.ReduceOp.PREMUL_SUM), x.tolist())[1])(src()))
+record("broadcast", lambda: (
+    lambda x: (dist.broadcast(x, src=0), x.tolist())[1])(src()))
+record("reduce", lambda: (
+    lambda x: (dist.reduce(x, dst=0), x.tolist())[1])(src()))
+record("barrier", lambda: dist.barrier())
+
+def all_gather():
+    buf = [torch.zeros(3)]
+    dist.all_gather(buf, src())
+    return [t.tolist() for t in buf]
+record("all_gather", all_gather)
+
+def all_gather_single():
+    buf = torch.zeros(3)
+    dist.all_gather_single(buf, src())
+    return buf.tolist()
+record("all_gather_single", all_gather_single)
+
+def gather():
+    buf = [torch.zeros(3)]
+    dist.gather(src(), buf, dst=0)
+    return [t.tolist() for t in buf]
+record("gather", gather)
+
+def scatter():
+    buf = torch.zeros(3)
+    dist.scatter(buf, [src()], src=0)
+    return buf.tolist()
+record("scatter", scatter)
+
+def reduce_scatter():
+    buf = torch.zeros(3)
+    dist.reduce_scatter(buf, [src()])
+    return buf.tolist()
+record("reduce_scatter", reduce_scatter)
+
+def reduce_scatter_single():
+    buf = torch.zeros(3)
+    dist.reduce_scatter_single(buf, src())
+    return buf.tolist()
+record("reduce_scatter_single", reduce_scatter_single)
+
+def all_to_all_single():
+    buf = torch.zeros(3)
+    dist.all_to_all_single(buf, src())
+    return buf.tolist()
+record("all_to_all_single", all_to_all_single)
+
+record("send_to_1", lambda: dist.send(src(), dst=1))
+record("recv_from_1", lambda: dist.recv(src(), src=1))
+
+# A store that is asked to wait on a key nobody can ever write.
+try:
+    s = dist.HashStore()
+    s.wait(["nobody-will-write-this"])
+except RuntimeError as e:
+    out["store_wait"] = "REFUSED"
+else:
+    out["store_wait"] = "RETURNED"
+
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.cache
+def _dist_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _DIST_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"distributed-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_distributed_is_on_and_the_wire_backends_are_still_off():
+    """Both halves of the switch, because only having one is the bug.
+
+    docs/SURFACE_HONESTY.md §2.4 turned `_c10d_init` on once before and
+    `import torch` stopped. It gets on the road now -- and the second half
+    matters just as much: `ProcessGroupGloo` and its siblings must stay
+    *absent*, or `distributed_c10d.py:220` sets `_GLOO_AVAILABLE = True` and
+    `init_process_group(backend="gloo")` reaches for something hollow instead
+    of getting the tree's own "doesn't have Gloo built in".
+
+    That is not hypothetical: the first version of this work synthesised them,
+    twice -- once through the module catch-all and once through
+    `_SubmoduleFinder`, which answered the same name as an empty *module* after
+    the attribute lookup had correctly refused.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    r = _dist_road_fixture()
+    assert r["is_available"] is True
+    assert r["has_Store"] is True
+    for flag in ("gloo_available", "nccl_available", "mpi_available", "ucc_available"):
+        assert r[flag] is False, (flag, r[flag])
+    assert "doesn't have Gloo built in" in r["gloo_refusal"], r["gloo_refusal"]
+
+
+def test_the_road_reaches_transformers():
+    """The thing this was for.
+
+    `import transformers` on its own never needed torch (IMPORT_WALLS.md), so
+    it is not the measurement -- `AutoModelForCausalLM` is, because that is
+    what pulls `GenerationMixin` and with it `torch._dynamo`, `fsdp`, DTensor
+    and the functional collectives. DESIGN.md §11.1 recorded this as the wall
+    that stopped step 1.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _dist_road_fixture()
+    for step_name in ("fsdp", "transformers", "AutoModelForCausalLM",
+                      "LlamaForCausalLM"):
+        assert r[step_name] == "OK", (step_name, r[step_name])
+
+
+def test_world_size_one_collectives_agree_with_upstream_gloo():
+    """The values are not asserted from first principles -- they were measured.
+
+    The same script was run against upstream torch 2.13.0 with `backend="gloo"`
+    at `world_size=1`, and every value-producing collective below came back
+    identical. The three that differ are the three that *fail on both sides*:
+    upstream fails PREMUL_SUM with a pybind argument error and send/recv with
+    `IndexError: vector`, and this build refuses all three by name.
+
+    `[1.0, -2.0, 3.5]` throughout is the input, so this is a statement that a
+    world of one changes nothing -- which is exactly the claim, and it is
+    checked rather than assumed. A collective that silently did nothing at all
+    would produce the same answer for the reductions and `[0, 0, 0]` for the
+    gather/scatter family, which is why those are in the list.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _dist_road_fixture()
+    assert r["registered"] is True
+    assert (r["rank"], r["world_size"], r["backend"]) == (0, 1, "local"), r
+
+    unchanged = [1.0, -2.0, 3.5]
+    for key in ("all_reduce_SUM", "all_reduce_AVG", "all_reduce_PRODUCT",
+                "all_reduce_MIN", "all_reduce_MAX", "broadcast", "reduce"):
+        assert r[key] == unchanged, (key, r[key])
+    # These moved data into a zeroed buffer, so agreeing is not the same as
+    # doing nothing.
+    for key in ("all_gather_single", "scatter", "reduce_scatter",
+                "reduce_scatter_single", "all_to_all_single"):
+        assert r[key] == unchanged, (key, r[key])
+    for key in ("all_gather", "gather"):
+        assert r[key] == [unchanged], (key, r[key])
+    assert r["barrier"] is None
+
+
+def test_what_needs_a_peer_refuses_by_name():
+    """DESIGN.md §6, and the specific accident docs/CKPT.md recorded.
+
+    `send`/`recv` cannot be made true by any amount of local work, and a
+    `recv` that quietly did nothing would leave the caller reading an unwritten
+    buffer. `PREMUL_SUM` is the subtler one: every other reduction is the
+    identity at world_size 1, and PREMUL_SUM is not -- it is `factor * x` --
+    so treating it like the others would be a wrong answer wearing the shape of
+    a right one.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _dist_road_fixture()
+    assert r["send_to_1"].startswith("REFUSED"), r["send_to_1"]
+    assert "send" in r["send_to_1"], r["send_to_1"]
+    assert r["recv_from_1"].startswith("REFUSED"), r["recv_from_1"]
+    assert "recv" in r["recv_from_1"], r["recv_from_1"]
+    assert r["all_reduce_PREMUL_SUM"].startswith("REFUSED"), r["all_reduce_PREMUL_SUM"]
+    assert "PREMUL_SUM" in r["all_reduce_PREMUL_SUM"], r["all_reduce_PREMUL_SUM"]
+    assert r["store_wait"] == "REFUSED", r["store_wait"]
 
 def _main():
     failures = 0
