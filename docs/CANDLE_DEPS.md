@@ -140,7 +140,7 @@ PR #3490 의 패치를 그대로 `candle-core 0.11.0`(현재 `torch_c` 가 고�
 **`torch_c/Cargo.toml` 을 추가로 고칠 필요가 없습니다** — `tokenizers` feature 를 명시적으로
 요청하지 않는 한 자동으로 빠집니다.
 
-적용 수단은 워크스페이스 루트의 `[patch.crates.io]` 로 거는 것이 표준이지만, **`rust/torch_c` 는
+적용 수단은 워크스페이스 루트의 `[patch.crates-io]` 로 거는 것이 표준이지만, **`rust/torch_c` 는
 `[workspace]` 를 선언하지 않은 단독 크레이트이고 `rust/Cargo.toml` 워크스페이스 루트도 없습니다**
 (`find . -iname Cargo.toml` 결과 `rust/torch_c/Cargo.toml` 하나뿐). Cargo 규약상 `[patch]` 는
 그 크레이트 자신의 루트 매니페스트에 적어야 하므로, **적용하려면 `rust/torch_c/Cargo.toml` 을
@@ -148,11 +148,15 @@ PR #3490 의 패치를 그대로 `candle-core 0.11.0`(현재 `torch_c` 가 고�
 모양(다른 워크스트림이 가져다 쓸 수 있도록 기록):
 
 ```toml
-[patch.crates.io]
+[patch.crates-io]
 candle-core = { git = "<우리 포크 URL>", rev = "<커밋>" }
 # 또는
 candle-core = { path = "<vendor 경로>" }
 ```
+
+(주의: 테이블 이름은 `crates-io` — 대시입니다. `[patch.crates.io]` 로 쓰면 Cargo 가 `crates`
+를 레지스트리 이름, `io` 를 그 아래 키로 파싱하려다 "should be a URL or registry name" 에러를
+냅니다. §8 에서 실제로 이 오타를 밟고 고쳤습니다.)
 
 포크/vendor 소스는 위 3 줄 diff 를 candle 0.11.0 태그에 적용한 것이면 충분합니다. 업스트림
 PR #3490 이 머지되고 새 버전이 나오면 이 `[patch]` 를 지우고 버전만 올리면 되므로, **되돌리기
@@ -230,7 +234,7 @@ DESIGN.md §4("텐서 엔진은 candle")가 candle 을 고른 근거 셋:
 
 ## 5. 권고와 우선순위 판단
 
-**권고:** §2c 의 3 줄 패치를 `[patch.crates.io]` 로 걸어 지금 뗄 수 있고, 위험은 낮습니다
+**권고:** §2c 의 3 줄 패치를 `[patch.crates-io]` 로 걸어 지금 뗄 수 있고, 위험은 낮습니다
 (diff 가 상류 PR #3490 과 동일한 모양이라 즉흥 패치가 아니라 커뮤니티가 이미 검토한 형태이고,
 `torch_c` 는 해당 기능을 아예 쓰지 않아 회귀 위험이 없습니다). 다만 이 패치는 `rust/torch_c/
 Cargo.toml` 을 건드려야 적용되므로 **이 조사 세션의 범위 밖**입니다 — 해당 파일을 담당하는
@@ -285,3 +289,129 @@ cd /Volumes/macMini/caches/candle-probe/patched  && cargo clean && /usr/bin/time
 `patched/Cargo.toml` 은 `/Volumes/macMini/caches/candle-probe/candle-src`(candle 0.11.0 태그에
 §2c 의 3 줄 diff 적용)를 `path` 의존으로 가리킵니다. `candle-src/` 는 조사용 클론이며 BrainWave
 저장소의 일부가 아닙니다.
+
+---
+
+## 8. 적용함 (2026-08-24)
+
+§5 의 권고를 실행했습니다. `rust/torch_c/Cargo.toml` 에 `[patch.crates-io]` 블록을 추가해
+`candle-core` 를 §2c 의 패치가 적용된 로컬 vendor 사본으로 바꿔 끼웠습니다.
+
+### 8a. 적용 방법
+
+```toml
+[patch.crates-io]
+candle-core = { path = "/Volumes/macMini/caches/candle-vendor/candle-0.11.0-patched/candle-core" }
+```
+
+vendor 사본은 §2c 조사 때 만든 `/Volumes/macMini/caches/candle-probe/candle-src`(candle 0.11.0
+태그, 커밋 `31f35b1`)를 `/Volumes/macMini/caches/candle-vendor/candle-0.11.0-patched` 로 복사하고,
+§2c 의 3 줄 diff 를 로컬 커밋 하나(`e3b39f9`)로 고정한 것입니다. `torch_c/Cargo.toml` 자체는 3 줄
+patch 블록 추가 외에 바꾸지 않았습니다 — `default-features = false` 가 이미 있어서 새로 생긴
+`tokenizers` feature 를 아무도 요청하지 않으므로 그대로 빠집니다.
+
+**표 이름 오타 주의:** 표준 이름은 `crates-io`(대시)입니다. §2·§5 초안에 `[patch.crates.io]`(점)로
+적어둔 곳이 있었는데, 그대로 걸었더니 Cargo 가 `crates.io` 를 "레지스트리 `crates` 아래의 키
+`io`"로 파싱하려다 `should be a URL or registry name` 에러를 냈습니다. 문서의 두 곳(§2c, §5)을
+고쳤습니다.
+
+### 8b. 재현성 — 그대로 로컬 경로 한계입니다
+
+이 `[patch]` 는 `/Volumes/macMini/caches/candle-vendor/candle-0.11.0-patched` 라는 이 기계의
+절대 경로를 가리킵니다. **다른 기계에서는 그 경로가 없으므로 그대로 깨집니다.** 재현 수단은
+`rust/torch_c/Cargo.toml` 의 patch 블록 옆 주석에 그대로 적어 두었습니다 — candle 0.11.0 태그를
+그 경로에 얕은 클론하고, §2c 의 diff 를 `candle-core/Cargo.toml` 과
+`candle-core/src/quantized/mod.rs` 에 적용해 로컬 커밋 하나로 고정하면 됩니다. §2c 에서 이미
+검토했듯 상류 포크(`git` 소스)로 옮기는 편이 더 재현 가능하지만, 그러려면 GitHub 에 새 포크를
+만들어 커밋을 push 해야 하는데 이번 세션은 그 권한 범위 밖이라(자동 승인 분류기가 거부) 시도하지
+않았습니다. `[workspace]` 를 가진 전체 candle 저장소(24MB, `candle-core` 가 `version.workspace =
+true` 등으로 워크스페이스 상속을 쓰기 때문에 `candle-core` 디렉터리만 떼어 vendor 할 수 없습니다)를
+이 저장소 git 에 커밋하는 방법도 검토했으나, 이번 작업 범위(`Cargo.toml` + 문서)를 벗어나는 대량
+추가라 하지 않았습니다. 상류 PR #3490 이 머지되면 이 `[patch]` 블록을 지우고 `candle-core` 버전만
+올리면 되므로, 어느 경로든 되돌리기 비용은 낮습니다.
+
+### 8c. 다시 잰 숫자
+
+**크레이트 수** — 이번엔 probe 가 아니라 `rust/torch_c` 실물 `Cargo.lock` 으로 직접 셌습니다
+(`grep -c '^name = ' rust/torch_c/Cargo.lock`):
+
+| | 패키지 수 |
+|---|---|
+| 패치 전 (`git show HEAD:rust/torch_c/Cargo.lock`) | **150** |
+| 패치 후 | **106** |
+| 차이 | **−44** (§3a 의 probe 측정과 정확히 일치) |
+
+패치 후 lockfile 에 `tokenizers`/`onig`/`onig_sys` 가 전혀 없음을 확인했습니다.
+
+**빌드 시간** — §3b 는 최소 probe 크레이트(candle-core 만 의존)를 단독 load 5.22 에서 쟀습니다.
+이번엔 **`rust/torch_c` 실물 크레이트**를 `cargo clean && /usr/bin/time -p cargo build --release`
+로 쟀습니다(`CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-deps`, 다른 에이전트 전용
+디렉터리와 분리). **주의: 이 기계는 이 세션 내내 다른 에이전트 둘이 Android/iOS 빌드를 돌리고
+있어 load 가 요동쳤습니다(측정 시작 시 8.7, 베이스라인 완료 시점엔 30 까지 치솟음, 패치 빌드
+동안엔 18→14) — §3b 처럼 깨끗한 단독 측정이 아닙니다.** 그래도 두 빌드가 수 분 간격으로 붙어 있어
+외부 load 가 상대적으로는 비슷하게 걸렸을 가능성이 높고, 방향은 §3b 와 일치합니다:
+
+| | wall (`real`) | user CPU | 측정 시 load(1분 평균) |
+|---|---|---|---|
+| 패치 전 | 85.64s | 250.97s | 시작 8.7, 종료 시점 30 (급등) |
+| 패치 후 | 50.38s | 169.11s | 시작 18.5, 종료 시점 14 |
+| 감소 | **−41%** | **−33%** | — |
+
+이 숫자는 §3b 의 −36%(user CPU, load 5.22 단독)와 같은 방향·비슷한 크기입니다. 다만 load 가
+오염되어 있었다는 것을 그대로 적습니다 — **정밀한 재현치가 필요하면 load 가 낮을 때
+`rust/torch_c` 에서 §7 재현 절차를 다시 돌리는 편이 낫습니다.** 크레이트 수(−44, §8c 위)는 load 와
+무관한 지표라 그대로 신뢰할 수 있습니다.
+
+### 8d. 판정 기준 확인
+
+```
+$PY tools/golden/compare.py                 # SUMMARY: 1212/1212 cases passed, 0 failed, ops covered=70   EXIT=0
+$PY rust/torch_c/pytests/verify_schemas.py  # SUMMARY: 127/127 table entries matched upstream, 0 failed    EXIT=0
+sh rust/torch_c/pytests/run.sh              # 62/62 스모크 테스트 전부 ok                                   EXIT=0
+```
+
+3 타깃:
+
+| 타깃 | 명령 | 결과 |
+|---|---|---|
+| 호스트 (`aarch64-apple-darwin`) | `pytests/run.sh` (위) | **exit 0** |
+| Android (`aarch64-linux-android`, `arm64-v8a`) | `cargo ndk -t arm64-v8a --platform 21 build --release` | **exit 0**, `Finished release ... in 47.37s` |
+| iOS (`aarch64-apple-ios`) | `cargo build --release --target aarch64-apple-ios` (`PYO3_CONFIG_FILE=/Volumes/macMini/caches/bw-pyo3-ios.config`) | **exit 0**, `Finished release ... in 38.52s` |
+
+전부 통과했습니다. 기능 회귀는 없습니다 — `torch_c` 는 애초에 `tokenizers`/`quantized::tokenizer`
+를 쓰지 않으므로 이 패치로 잃는 표면이 없고, 골든·스키마·스모크 숫자는 패치 전(§0 이 인용하는
+`docs/OPS8.md` 의 1212/1212, covered=70, 127/127)과 그대로 같습니다.
+
+### 8e. 남은 일
+
+- **재현성 한계(§8b)를 되도록 빨리 좁힐 것.** 지금은 이 기계 한 대에서만 재현됩니다. 후속 세션이
+  GitHub 포크 생성 권한을 받으면, §2a 의 상류 PR #3490 브랜치를 `0.11.0` 에 리베이스해 우리
+  포크에 올리고 `[patch.crates-io]` 를 `git` 소스로 바꾸는 편이 vendor 경로보다 낫습니다.
+- **load 가 낮을 때 §8c 의 빌드 시간을 다시 잴 것.** 지금 수치는 방향은 맞지만 오염되어 있습니다.
+- 상류 PR #3490 에 코멘트로 §3 의 측정치를 보태는 것(§5 가 이미 제안)은 이번에도 하지
+  않았습니다 — 이 세션 권한 범위 밖입니다.
+
+---
+
+## 9. 조율 세션의 판정 — 패치는 착지시키지 않습니다
+
+§8 의 `[patch.crates-io]` 블록은 **검증됐지만 커밋하지 않았습니다.** 문서만 착지시킵니다.
+
+이유는 하나입니다. 그 블록이 `/Volumes/macMini/caches/candle-vendor/...` 라는 **이 기계의
+절대 경로**를 가리키고, `[patch]` 의 경로가 없으면 cargo 는 경고가 아니라 **에러로 죽습니다.**
+즉 커밋하는 순간 이 기계 밖의 모든 체크아웃에서 빌드가 불가능해집니다. 라이브러리가 될
+저장소에서 로컬 빌드 40% 단축과 바꿀 만한 것이 아닙니다.
+
+**측정과 진단은 유효하므로 남깁니다** — 크레이트 −44 개는 실제 `Cargo.lock` 으로 재확인됐고,
+`[patch.crates.io]` (점)가 유효한 TOML 이 아니라는 §2c 의 오타 수정은 이 문서를 따라 하는
+사람이 반드시 만나는 함정입니다.
+
+착지 가능한 형태는 셋입니다:
+
+1. 상류 PR #3490 이 머지된다 — 그러면 `[patch]` 자체가 필요 없습니다
+2. 공개 포크에 패치를 올리고 `[patch]` 를 `git` 소스로 건다 — 이번 회차에 시도했으나
+   포크 생성이 권한에서 막혔습니다
+3. candle 을 이 저장소에 벤더링한다 — 24MB 가 git 히스토리에 들어갑니다
+
+**셋 중 하나가 되기 전에는 이 최적화를 켜지 않습니다.** 각자 로컬에서 §8 대로 적용하는 것은
+자유이고, 그것이 지금의 권장 형태입니다.
