@@ -52,7 +52,23 @@
     "`_install_tensor_conversions`. `Tensor.softmax` is still installed --",
     "as a Python-level composite, `_install_tensor_softmax` in bootstrap.py,",
     "which calls `_to_copy` then `_softmax.default` exactly as the measured",
-    "dispatch trace shows, the same way `to`/`item`/`__getitem__` are."
+    "dispatch trace shows, the same way `to`/`item`/`__getitem__` are.",
+    "",
+    "`split` is the one entry here whose schemas do not share one op name --",
+    "`aten::split.Tensor` and `aten::split_with_sizes` are genuinely different",
+    "aten ops, not two overloads of the same op. Upstream's own",
+    "`torch/_tensor.py:Tensor.split` is exactly this branch (measured with a",
+    "`TorchDispatchMode` logger): `isinstance(split_size, int)` picks",
+    "`torch._VF.split`, anything else picks `torch._VF.split_with_sizes`. The",
+    "resolver here does not care whether a key's schemas share an op name --",
+    "it tries each schema in order and keys off whichever one binds -- so",
+    "listing both under `split` reproduces that exact branch: an int argument",
+    "binds `split.Tensor` (kernel present), a list/tuple binds",
+    "`split_with_sizes` (kernel absent, named precisely). `split_with_sizes`",
+    "also gets its own entry, because `Tensor.split_with_sizes` is a real",
+    "method upstream too. This is unlike `softmax` above -- there the parser",
+    "key and the dispatch key genuinely disagree and no table entry could ever",
+    "be right; here both keys are real and simply depend on the argument."
   ],
 
   "mul": [
@@ -120,6 +136,12 @@
   ],
   "bmm": [
     "aten::bmm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+  "mm": [
+    "aten::mm(Tensor self, Tensor mat2) -> Tensor"
+  ],
+  "addmm": [
+    "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
   ],
   "t": [
     "aten::t(Tensor(a) self) -> Tensor(a)"
@@ -220,6 +242,9 @@
   "rsqrt": [
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
+  "tanh": [
+    "aten::tanh(Tensor self) -> Tensor"
+  ],
 
   "masked_fill": [
     "aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor",
@@ -243,6 +268,22 @@
   ],
   "multinomial": [
     "aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor"
+  ],
+  "select": [
+    "aten::select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)"
+  ],
+  "scatter": [
+    "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
+    "aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *, str reduce) -> Tensor",
+    "aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value, *, str reduce) -> Tensor",
+    "aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor"
+  ],
+  "split": [
+    "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]",
+    "aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]"
+  ],
+  "split_with_sizes": [
+    "aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]"
   ],
 
   "expand": [

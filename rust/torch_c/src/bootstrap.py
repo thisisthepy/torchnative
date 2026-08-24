@@ -2556,9 +2556,63 @@ def _install_composites(module, varfns, dispatch) -> None:
         fn.__module__ = "torch._C"
         setattr(varfns, name, fn)
 
+    def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5,
+                    cudnn_enable=True):
+        """`torch.layer_norm` / `F.layer_norm` / `nn.LayerNorm`'s forward.
+
+        `aten::layer_norm` is `CompositeImplicitAutograd` -- measured with a
+        `TorchDispatchMode` logger on torch 2.13.0, `F.layer_norm(...)`,
+        `torch.layer_norm(...)` and a `nn.LayerNorm` forward all bottom out at
+        `aten.native_layer_norm.default` only; `aten.layer_norm.default` never
+        fires. Upstream's C++ body is exactly `std::get<0>(native_layer_norm(
+        input, normalized_shape, weight, bias, eps))` -- the mean/rstd that
+        `native_layer_norm` also returns are what backward would need, and
+        there is no backward here, so they are computed and discarded.
+
+        `cudnn_enable` is accepted and ignored, matching what happens on a CPU
+        tensor upstream (`native_layer_norm`'s CPU kernel does not consult
+        it). Overloads.json does not carry `layer_norm` for the reason
+        `softmax` is not in `methods.json`: the parser-level key would be
+        `aten.layer_norm.default`, which is never the key upstream's own
+        dispatcher answers to, so the table would name a work item that is
+        not the real one.
+        """
+        result = dispatch(
+            "aten.native_layer_norm.default", input, normalized_shape,
+            weight, bias, eps,
+        )
+        return result[0]
+
+    layer_norm.__name__ = layer_norm.__qualname__ = "layer_norm"
+    layer_norm.__module__ = "torch._C"
+    setattr(varfns, "layer_norm", layer_norm)
+
 
 def _install_behaviour(module, dispatch) -> None:
     """The names that have to *do* something for the import to finish."""
+
+    # `torch/backends/cudnn/__init__.py:223` builds `enabled =
+    # ContextProp(torch._C._get_cudnn_enabled, torch._C._set_cudnn_enabled)`
+    # at import time, and `torch/nn/functional.py:2987`'s `F.layer_norm` reads
+    # `torch.backends.cudnn.enabled` on every call to pass it through as
+    # `aten::layer_norm`'s `cudnn_enable` argument (which this shim's
+    # `layer_norm` composite, `_install_composites`, accepts and ignores --
+    # there is no cudnn backend here regardless of the flag). `_has_cudnn` is
+    # `False` (see `_BUILD_FLAGS` below), but that only answers
+    # `is_available()`; the getter/setter pair is a plain module-level boolean
+    # state cell and has to work whether or not a backend exists, or
+    # `F.layer_norm` never gets past reading the flag. Measured wall,
+    # docs/GPT2.md.
+    _cudnn_enabled_cell = [True]  # upstream's own default
+
+    def _get_cudnn_enabled():
+        return _cudnn_enabled_cell[0]
+
+    def _set_cudnn_enabled(value):
+        _cudnn_enabled_cell[0] = bool(value)
+
+    module._get_cudnn_enabled = _get_cudnn_enabled
+    module._set_cudnn_enabled = _set_cudnn_enabled
 
     def _add_docstr(obj, doc):
         # `torch/_tensor.py` and `torch/_torch_docs.py` call this thousands of

@@ -169,3 +169,114 @@ out 변형(`sort.values`, `sort.values_stable`)은 넣지 않았다 — 커널�
 
 모든 스키마 문자열은 `str(torch.ops.aten.<op>.<ov>._schema)` (torch 2.13.0)에서 그대로
 전사했다 — 지어낸 것이 없다. `pytests/verify_schemas.py` 가 그것을 재확인한다(170/170).
+
+---
+
+## 4. 두 번째 회차 — 커널이 82 개로 늘어난 뒤 (`addmm`/`native_layer_norm`/`split.Tensor`/`tanh`)
+
+`docs/GPT2.md`가 이 넷을 구현해 커널이 78 → 82 개가 됐고, §5에 "커널은 있는데 스펠링이 없다"는
+표를 명시적으로 남겼다. 이 회차는 그 표를 메우는 작업이다. 근거는 두 가지뿐이었다 — `_aten_implemented()`가
+돌려주는 82개 목록(권위 있는 출처, `aten.rs`를 grep하지 않았다)과, 상류 `torch.ops.aten.<op>.overloads()` /
+벤더링된 `.pyi`.
+
+### 4.0 82개 전부 감사
+
+지난 회차가 열어 둔 14개(`flatten masked_fill repeat split chunk narrow squeeze permute clamp
+tril triu flip gather index_select`) 중 커널이 **새로 생긴 것은 `split` 하나뿐**이다
+(`aten.split.Tensor`). `masked_fill`/`squeeze`는 커널도 스펠링도 지난 회차 그대로(부분)이고,
+나머지 11개는 여전히 커널 자체가 없다 — 이번에도 건드리지 않았다.
+
+그래서 판단 기준을 "14개 목록"에서 "82개 커널 전부"로 넓혔다. `_aten_implemented()`의 82개
+각각에 대해 `overloads.json`/`methods.json`의 스키마를 파싱해 `(op, overload)` 키를 뽑고,
+82개와 대조하는 감사 스크립트를 돌렸다. 결과: **82개 전부가 어떤 형태로든 스펠링을 갖고
+있다** — 표 항목(대다수), Python 레벨 합성(`softmax`/`to`/`item`/`__getitem__`/`linear`/
+`silu`/`sdpa`/`layer_norm`, 기존 + 이번에 추가한 `layer_norm`), 또는 상류 자체에 공개
+스펠링이 없는 내부 전용 op(`alias.default` — `hasattr(torch.Tensor, "alias")` /
+`hasattr(torch, "alias")` 둘 다 실측 결과 `False`, 감쌀 스펠링이 존재하지 않는다).
+
+### 4.1 채운 것
+
+| 이름 | 파일 | 상류와 값 대조 |
+|---|---|---|
+| `tanh` (함수+메서드) | `overloads.json`/`methods.json` | 일치 (`torch.tanh(x)` == `x.tanh()`) |
+| `addmm` (함수+메서드) | `overloads.json`/`methods.json` | 일치 |
+| `mm` (메서드 — 함수는 이미 있었다) | `methods.json` | 일치 |
+| `select` (함수+메서드) | `overloads.json`/`methods.json` | 일치 |
+| `scatter` (함수+메서드) | `overloads.json`/`methods.json` | `.src` 일치. `.value`/`.reduce`/`.value_reduce`는 커널이 없어 정확한 이름으로 거부 (실측) |
+| `split` (함수+메서드, int 형태) | `overloads.json`/`methods.json` | 일치 (`torch.split(x,1,0)` == `x.split(1,0)`) |
+| `split_with_sizes` (함수+메서드) | `overloads.json`/`methods.json` | 커널 없음 — 정확한 이름으로 거부 (실측, 아래 4.2) |
+| `native_layer_norm` (함수) | `overloads.json` | 3-튜플(out, mean, rstd) 전부 일치 |
+| `layer_norm` (함수, Python 합성) | `bootstrap.py` `_install_composites` | 일치 (`F.layer_norm`/`torch.layer_norm`/`nn.LayerNorm`이 전부 도달하는 지점) |
+| `_get_cudnn_enabled`/`_set_cudnn_enabled` | `bootstrap.py` `_install_behaviour` | 상태 게터/세터, `F.layer_norm`이 읽는 값을 실제로 반환 |
+
+전부 `tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해
+`TensorBase.<method>`와 `_VariableFunctions.<fn>` 양쪽을 실측했다 (이전 회차와 같은 방법).
+`torch 2.13.0`을 상류로 두고 동일 입력에 `torch.allclose`로 비교했으며, 전부 일치했다
+(`tanh`/`addmm`/`mm`/`select`/`scatter.src`/`split`/`layer_norm`/`native_layer_norm`의
+세 출력 전부).
+
+**전체 vendor 트리(`import torch`)로도 시도했으나 판단 근거로 쓰지 않았다.** `TORCH_USE_RTLD_GLOBAL=1`로
+`vendor/`를 얹어 실제로 실행해 보면, `x.argmax()`처럼 이미 동작이 확인된 기존 스펠링조차
+`torch._C._functorch.is_functorch_wrapped_tensor`에서 막힌다 — 이번 회차가 만든 문제가
+아니라 vendor 트리를 통한 메서드 호출 전반에 걸친 기존 벽이다(범위 밖의 `_functorch` 서브모듈
+배선 문제로 보인다, 원인은 추적하지 않았다). 그래서 지난 회차와 같은 방법(`loader.load_shim()`로
+`_C`를 직접 로드해 `TensorBase`/`_VariableFunctions`를 부르는 것)으로 판단했다 — `docs/GPT2.md` §4가
+판정을 aten 레벨로 내린 것과 같은 이유다.
+
+### 4.2 `split`의 스키마 두 개가 이름이 다른 이유
+
+`methods.json`의 `split` 항목은 `aten::split.Tensor`와 `aten::split_with_sizes`를 **한 키
+아래** 담고 있다 — 이 표에서 유일하게 스키마들이 op 이름을 공유하지 않는 항목이다. 상류
+`torch/_tensor.py:Tensor.split`을 직접 읽으면(`TorchDispatchMode`로도 재확인)
+`isinstance(split_size, int)`로 분기해서 `torch._VF.split`과 `torch._VF.split_with_sizes`
+중 하나를 호출한다 — 진짜로 다른 두 aten op다. `_Overloads.resolve()`는 키와 스키마의 op
+이름이 같은지 검사하지 않고 스키마를 순서대로 시도하다 바인딩되는 것을 쓰므로, 이 방식으로도
+정확히 상류와 같은 분기를 재현한다: int 인자는 `split.Tensor`(커널 있음)에 바인딩되고
+list/tuple 인자는 `split_with_sizes`(커널 없음, `aten.split_with_sizes.default`로 정확히
+거부)에 바인딩된다. `overloads.json`은 다르다 — `_VariableFunctions.split`은 실측상 int
+형태로만 불리므로(벤더 트리가 리스트를 항상 `split_with_sizes`로 직접 보낸다)
+`split`/`split_with_sizes`를 별개 키로 깔끔하게 나눴다.
+
+### 4.3 `F.layer_norm`이 실제로 가는 키
+
+`TorchDispatchMode` 로거로 재확인(torch 2.13.0): `F.layer_norm(...)`, `torch.layer_norm(...)`,
+`nn.LayerNorm`의 forward가 **전부 `aten.native_layer_norm.default` 하나로만** 기록되고,
+`aten.layer_norm.default`는 한 번도 찍히지 않는다. `torch/nn/functional.py:2966`의
+`F.layer_norm`은 `torch.layer_norm(input, normalized_shape, weight, bias, eps,
+torch.backends.cudnn.enabled)`을 그대로 부르고, `aten::layer_norm`은 `Composite
+ImplicitAutograd`라 실제 커널을 갖지 않는다 — C++ 본체가 `std::get<0>(native_layer_norm(...))`
+그 자체다. 그래서 `layer_norm`을 `overloads.json`에 원본 스키마로 넣지 않고
+(`softmax`가 `methods.json`에서 빠진 것과 정확히 같은 이유 — 파서 키와 실제 디스패치 키가
+다르면 표 항목은 절대 구현되지 않을 작업 항목의 이름만 짓는다), `bootstrap.py`
+`_install_composites`에 `native_layer_norm.default`를 부르고 첫 번째 결과만 돌려주는
+Python 합성으로 심었다. `native_layer_norm` 자체는 진짜 leaf 커널이라(디스패치 키가 그대로)
+`overloads.json`에 평범한 표 항목으로 넣었다.
+
+`F.layer_norm`은 이 합성에 닿기 전에 `torch.backends.cudnn.enabled`부터 읽는데, 이건
+`torch._C._get_cudnn_enabled()`를 부르는 프로퍼티다. 이 함수가 지난 회차까지 raising 스텁이라
+`F.layer_norm`이 그 자리에서 막혔다(`docs/GPT2.md` §5가 정확히 이 지점을 지목했다). 진짜
+cuDNN 백엔드는 없어도(`_has_cudnn=False`, 안 바뀜) 게터/세터 자체는 평범한 불리언 상태
+셀이면 되므로 `_install_behaviour`에 실제 게터/세터를 심었다(기본값 `True`, 상류 기본값과
+동일).
+
+**`nn.LayerNorm(...)`은 여전히 안 된다 — `TensorBase.zero_`가 다른 에이전트 담당이라 손대지
+않았다.** `reset_parameters`가 `init.zeros_(self.bias)`를 부르는 자리에서 정확히 그 이름으로
+막힌다(실측, `docs/GPT2.md`가 예고한 그대로). `F.layer_norm(x, [C], weight, bias)`처럼 이미
+만들어진 파라미터 텐서를 직접 넘기는 경로는 `zero_`를 거치지 않으므로 이번 수정만으로 된다.
+
+### 4.4 스키마 숫자
+
+`verify_schemas.py`: **170/170 → 199/199** (+29 — `overloads.json` 72→90, `methods.json`
+98→109). 골든 하네스는 **1781/1781, ops covered=82 그대로**(무회귀 — 스펠링 추가는 커널
+집합을 바꾸지 않는다, `_aten_implemented()`가 유일한 출처이기 때문). `--inject-fault
+value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`) exit 0. 3 타깃
+(host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0.
+
+### 4.5 손대지 않은 것
+
+`flatten repeat chunk narrow permute clamp tril triu flip gather index_select` — 여전히
+`aten.rs`에 커널이 없다(`_aten_implemented()`에 없음). `masked_fill`/`squeeze`도 커널·스펠링
+모두 지난 회차 상태 그대로 다시 확인만 했다. `torch.softmax`/`F.softmax`(함수 레벨)는
+`Tensor.softmax`와 별개로 여전히 스펠링이 없다 — 지난 회차가 메서드 폼만 고쳤고 이번 회차도
+지시 범위(14개 목록 + GPT2.md의 넷) 밖이라 손대지 않았다, 실측만 남긴다
+(`_VariableFunctions.softmax`가 여전히 "overload resolution has no table entry" 로 거부).

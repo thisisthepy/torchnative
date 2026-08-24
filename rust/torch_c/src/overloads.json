@@ -52,11 +52,33 @@
     "    __rsub__` as `_C._VariableFunctions.rsub(self, other)`. `1 - x` is",
     "    measured 8 times in a Llama `generate` (docs/NN_SURFACE.md §3).",
     "",
-    "Two names a model path calls are deliberately NOT here, because they are",
-    "`CompositeImplicitAutograd` upstream and an overload entry would invent a",
-    "kernel requirement upstream does not have: `linear` and `dropout`. Both",
-    "are Python-level compositions in `bootstrap.py` (`_install_nn`,",
-    "`_install_composites`), and both still end at `_C._aten_dispatch`."
+    "Three names a model path calls are deliberately NOT here, because they",
+    "are `CompositeImplicitAutograd` upstream and an overload entry would",
+    "invent a kernel requirement upstream does not have: `linear`, `dropout`,",
+    "and `layer_norm`. All three are Python-level compositions in",
+    "`bootstrap.py` (`_install_nn`, `_install_composites`), and all three",
+    "still end at `_C._aten_dispatch`.",
+    "",
+    "`layer_norm` specifically: `torch.ops.aten.layer_norm.default` exists as",
+    "a schema, but a `TorchDispatchMode` logger on torch 2.13.0 never sees it",
+    "fire -- `F.layer_norm`, `torch.layer_norm` and `nn.LayerNorm` all bottom",
+    "out at `aten.native_layer_norm.default` only, because `layer_norm` is a",
+    "thin C++ wrapper that calls `native_layer_norm` and keeps the first of",
+    "its three results. Listing `aten::layer_norm(...)` here would resolve",
+    "correctly and then name a kernel this shim will never implement, where",
+    "the honest key is one it already has -- same shape of problem as",
+    "`methods.json`'s `softmax` note. `native_layer_norm` itself has no such",
+    "mismatch (it *is* the leaf op), so it gets a normal entry above.",
+    "",
+    "`split` above lists only `split.Tensor` (the int-size overload), not the",
+    "full `torch.ops.aten.split.*` overload set. That is deliberate and",
+    "different from `methods.json`'s `split`, which lists both `split.Tensor`",
+    "and `split_with_sizes`: `_VariableFunctions.split` (`torch._VF.split`)",
+    "is, measured, only ever called by the vendored tree with an int --",
+    "`torch/_tensor.py:Tensor.split` is what looks at the argument type and",
+    "routes a list/tuple to `torch._VF.split_with_sizes` instead, which is",
+    "why that op gets its own `split_with_sizes` key rather than being folded",
+    "in here."
   ],
 
   "arange": [
@@ -90,6 +112,33 @@
   "multinomial": [
     "aten::multinomial.out(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor"
+  ],
+
+  "select": [
+    "aten::select.int(Tensor(a) self, int dim, SymInt index) -> Tensor(a)"
+  ],
+
+  "scatter": [
+    "aten::scatter.src_out(Tensor self, int dim, Tensor index, Tensor src, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.reduce_out(Tensor self, int dim, Tensor index, Tensor src, *, str reduce, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.value_out(Tensor self, int dim, Tensor index, Scalar value, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.value_reduce_out(Tensor self, int dim, Tensor index, Scalar value, *, str reduce, Tensor(a!) out) -> Tensor(a!)",
+    "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
+    "aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *, str reduce) -> Tensor",
+    "aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor",
+    "aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value, *, str reduce) -> Tensor"
+  ],
+
+  "split": [
+    "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]"
+  ],
+
+  "split_with_sizes": [
+    "aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]"
+  ],
+
+  "native_layer_norm": [
+    "aten::native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)"
   ],
 
   "cat": [
@@ -130,6 +179,13 @@
     "aten::mm(Tensor self, Tensor mat2) -> Tensor"
   ],
 
+  "addmm": [
+    "aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::addmm.dtype_out(Tensor self, Tensor mat1, Tensor mat2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::addmm.dtype(Tensor self, Tensor mat1, Tensor mat2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1) -> Tensor",
+    "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
+  ],
+
   "ones": [
     "aten::ones.out(SymInt[] size, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::ones(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
@@ -158,6 +214,11 @@
   "rsqrt": [
     "aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::rsqrt(Tensor self) -> Tensor"
+  ],
+
+  "tanh": [
+    "aten::tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::tanh(Tensor self) -> Tensor"
   ],
 
   "zeros": [
