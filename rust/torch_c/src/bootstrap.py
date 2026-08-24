@@ -1442,6 +1442,7 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_conversions(module, tensorbase, dispatch)
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(tensorbase, dispatch)
+    _install_tensor_softmax(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
 
 
@@ -1540,6 +1541,41 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     to.__qualname__ = "TensorBase.to"
     setattr(tensorbase, "to", to)
     setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
+
+
+def _install_tensor_softmax(tensorbase, dispatch) -> None:
+    """`Tensor.softmax(dim, dtype=None)`.
+
+    `methods.json`'s `_README` explains why this is not a table entry: the
+    parser-level key for `Tensor.softmax` is `aten::softmax.int`, which is
+    `CompositeImplicitAutograd` and never reaches a kernel, while the key
+    upstream's dispatcher actually sees is `aten._softmax.default` (measured
+    with a `TorchDispatchMode` logger on torch 2.13.0, docs/NN_SURFACE.md §6):
+
+        x.softmax(dim)                      -> aten._softmax.default(x, dim, False)
+        x.softmax(dim, dtype=torch.float64)  -> aten._to_copy.default(x, dtype=float64)
+                                                 then aten._softmax.default(_, dim, False)
+        x.softmax(dim, dtype=x.dtype)        -> aten._softmax.default(x, dim, False)
+                                                 (no `_to_copy` -- measured: a no-op dtype
+                                                 emits no conversion call either)
+
+    `half_to_float` stays `False` unconditionally: it is an autocast signal
+    (true only when the dispatcher itself decides to keep a fp16 input in
+    fp32 accumulation), this shim has no autocast, and the trace above shows
+    upstream's own eager path never sets it for a plain `dtype=None` call or
+    an explicit-`dtype` one either. Same reasoning, same shape as `to.dtype`
+    versus `_to_copy` in `_install_tensor_conversions`.
+    """
+
+    def softmax(self, dim, dtype=None):
+        source = self
+        if dtype is not None and dtype != self.dtype:
+            source = dispatch("aten._to_copy.default", self, dtype=dtype)
+        return dispatch("aten._softmax.default", source, dim, False)
+
+    softmax.__name__ = "softmax"
+    softmax.__qualname__ = "TensorBase.softmax"
+    setattr(tensorbase, "softmax", softmax)
 
 
 def _install_tensor_scalars(tensorbase, dispatch) -> None:

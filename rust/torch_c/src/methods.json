@@ -42,13 +42,17 @@
     "is a precise work item, where a missing table entry is only a vague one.",
     "`div.Tensor_mode` has been in that state since this table was written.",
     "",
-    "`softmax` is the one measured method deliberately left out. `F.softmax`",
-    "spells itself `input.softmax(dim)`, so it would belong here -- but the",
-    "parser-level key is `aten.softmax.int` while the key upstream's dispatcher",
-    "actually sees is `aten._softmax.default` (measured, docs/NN_SURFACE.md",
-    "§6). Listing `softmax.int` would name a work item this shim will never",
-    "implement, which is worse than naming none. Same reasoning as `to.dtype`",
-    "versus `_to_copy` in `_install_tensor_conversions`."
+    "`softmax` is the one measured method deliberately left out of *this*",
+    "table. `F.softmax` spells itself `input.softmax(dim)`, so it would",
+    "belong here -- but the parser-level key is `aten.softmax.int` while the",
+    "key upstream's dispatcher actually sees is `aten._softmax.default`",
+    "(measured, docs/NN_SURFACE.md §6). Listing `softmax.int` would name a",
+    "work item this shim will never implement, which is worse than naming",
+    "none. Same reasoning as `to.dtype` versus `_to_copy` in",
+    "`_install_tensor_conversions`. `Tensor.softmax` is still installed --",
+    "as a Python-level composite, `_install_tensor_softmax` in bootstrap.py,",
+    "which calls `_to_copy` then `_softmax.default` exactly as the measured",
+    "dispatch trace shows, the same way `to`/`item`/`__getitem__` are."
   ],
 
   "mul": [
@@ -220,6 +224,25 @@
   "masked_fill": [
     "aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor",
     "aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor"
+  ],
+
+  "argmax": [
+    "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
+  "topk": [
+    "aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)"
+  ],
+  "sort": [
+    "aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)",
+    "aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)"
+  ],
+  "squeeze": [
+    "aten::squeeze(Tensor(a) self) -> Tensor(a)",
+    "aten::squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)",
+    "aten::squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)"
+  ],
+  "multinomial": [
+    "aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor"
   ],
 
   "expand": [

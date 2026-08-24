@@ -72,6 +72,26 @@
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
   ],
 
+  "topk": [
+    "aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)"
+  ],
+
+  "sort": [
+    "aten::sort.stable(Tensor self, *, bool? stable, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)",
+    "aten::sort(Tensor self, int dim=-1, bool descending=False) -> (Tensor values, Tensor indices)"
+  ],
+
+  "squeeze": [
+    "aten::squeeze(Tensor(a) self) -> Tensor(a)",
+    "aten::squeeze.dim(Tensor(a) self, int dim) -> Tensor(a)",
+    "aten::squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)"
+  ],
+
+  "multinomial": [
+    "aten::multinomial.out(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor"
+  ],
+
   "cat": [
     "aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::cat(Tensor[] tensors, int dim=0) -> Tensor"
