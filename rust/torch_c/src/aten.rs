@@ -1048,13 +1048,19 @@ fn add_tensor(
         )));
     }
 
-    let (lhs, rhs) = (lhs.tensor()?.clone(), rhs.tensor()?.clone());
-    let rhs = if alpha == 1.0 {
-        rhs
-    } else {
-        rhs.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?
-    };
-    let out = lhs.broadcast_add(&rhs).map_err(|e| candle_err(OP, e))?;
+    // Widened, added, and narrowed once -- `opmath_in`. `alpha` is applied
+    // *after* the widening on purpose: upstream converts it to `opmath_t` and
+    // multiplies there, so scaling in `bfloat16` first would round the
+    // multiply and the add separately where torch rounds only the result.
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = opmath_in(storage);
+    let lhs = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    let rhs = rhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
+    let out = lhs
+        .broadcast_add(&rhs)
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
 
     Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind())
 }
@@ -1089,10 +1095,92 @@ fn add_tensor(
 /// integral matmul is a real gap, and `float32` cannot hold an `int64` product
 /// exactly; standing one in would answer a different question.
 fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
+    opmath_in(storage)
+}
+
+/// `at::opmath_type` -- the dtype torch *computes* in for a given storage
+/// dtype. `float` for both reduced floats, the storage dtype for everything
+/// else.
+///
+/// This is one rule, not a GEMM rule: torch widens `bfloat16` and `float16`
+/// for **every** arithmetic kernel, computes there, and narrows back exactly
+/// once, with round-to-nearest-even. `gemm_accumulate_in` above is this
+/// function under the name the matmuls found it by; the elementwise ops and
+/// the reductions need it for the same reason and were missing it.
+///
+/// **What that cost, measured.** candle's `bfloat16` add narrows by
+/// truncating, and only on its vectorised path -- correct below 32 elements,
+/// wrong at 32 and above, which is why every case in `tools/golden/cases.py`
+/// (all at most 24 elements) passed. Truncation is *biased*: it moves every
+/// rounded element toward zero instead of splitting them evenly, so the error
+/// accumulates down a residual stream instead of cancelling. On
+/// SmolLM2-135M's default `bfloat16` path that reached a maximum logit
+/// difference of 11.75 against upstream and changed the generated text; with
+/// the widening it is 0.0 and the tokens match. docs/BF16.md.
+///
+/// Widening is not "more accurate than torch" here -- it is what torch does.
+/// `add` on two `bfloat16` values is `float(a) + float(b)` narrowed once
+/// upstream too, so this reproduces the operation rather than improving it.
+/// The integral dtypes are deliberately untouched: widening an `int64` to
+/// `float32` would lose bits rather than keep them.
+fn opmath_in(storage: candle_core::DType) -> candle_core::DType {
     match storage {
         candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
         other => other,
     }
+}
+
+/// `alpha * operand`, where `operand` is already widened to `opmath_in`.
+///
+/// `add` and `sub` are the only ops with an `alpha`, and it is **not** simply
+/// a factor applied in the widened dtype. Two things about it were measured
+/// against torch 2.13.0 over 20000 elements per alpha, because both are the
+/// kind of thing that is invisible at `alpha=1` (the only value any caller in
+/// this repository passes) and wrong everywhere else:
+///
+///   * **`alpha` is narrowed to the storage dtype first.** With
+///     `alpha=0.3` on `bfloat16`, torch multiplies by `0.30078125`, not by
+///     `0.3`. Keeping the `f64` the parser produced disagrees on 312/20000
+///     elements.
+///   * **On `bfloat16` the product is narrowed too, and on `float16` it is
+///     not.** This asymmetry is measured, not derived, and it is not a
+///     rounding accident: on `bfloat16`, narrowing the product agrees with
+///     upstream on 0/20000 elements for every one of `alpha` in
+///     {3, 2, 0.3, -1.5, 1.7}, while leaving it in `float` disagrees on up to
+///     1607. On `float16` it is the other way round -- narrowing the product
+///     disagrees on up to 1246 where leaving it in `float` disagrees on 0 or
+///     1. The two reduced floats reach different kernels upstream.
+///
+/// The single residual `float16` disagreement (1/20000 at `alpha=1.7`) is a
+/// double-rounding edge and is left as measured rather than papered over.
+fn scale_by_alpha(
+    op: &str,
+    operand: &Tensor,
+    alpha: f64,
+    storage: candle_core::DType,
+) -> PyResult<Tensor> {
+    if alpha == 1.0 {
+        return Ok(operand.clone());
+    }
+    let acc = opmath_in(storage);
+    if acc == storage {
+        return operand.affine(alpha, 0.0).map_err(|e| candle_err(op, e));
+    }
+    let narrowed = Tensor::full(alpha, (), operand.device())
+        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.to_dtype(candle_core::DType::F64))
+        .and_then(|t| t.to_scalar::<f64>())
+        .map_err(|e| candle_err(op, e))?;
+    let scaled = operand
+        .affine(narrowed, 0.0)
+        .map_err(|e| candle_err(op, e))?;
+    if storage == candle_core::DType::BF16 {
+        return scaled
+            .to_dtype(storage)
+            .and_then(|t| t.to_dtype(acc))
+            .map_err(|e| candle_err(op, e));
+    }
+    Ok(scaled)
 }
 
 /// `aten::mm(Tensor self, Tensor mat2)`
@@ -2923,19 +3011,18 @@ fn arith_tensor(
     let tag = arith_tag(op, kind, operand, None)?;
     let storage = PyDtype::new(tag).storage(op)?;
 
-    let left = lhs
-        .tensor()?
-        .to_dtype(storage)
-        .map_err(|e| candle_err(op, e))?;
-    let mut right = rhs
-        .tensor()?
-        .to_dtype(storage)
-        .map_err(|e| candle_err(op, e))?;
+    // Computed in `opmath_in(storage)` and narrowed once at the end -- see
+    // that function. `alpha` scales inside the widened dtype for the same
+    // reason `add_tensor` does it there.
+    let acc = opmath_in(storage);
+    let left = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
+    let right = rhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
-    if alpha != 1.0 {
-        right = right.affine(alpha, 0.0).map_err(|e| candle_err(op, e))?;
-    }
-    finish(py, apply_arith(op, kind, &left, &right)?, tag)
+    let right = scale_by_alpha(op, &right, alpha, storage)?;
+    let out = apply_arith(op, kind, &left, &right)?
+        .to_dtype(storage)
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
 }
 
 fn arith_scalar(
@@ -2951,25 +3038,34 @@ fn arith_scalar(
     let tag = arith_tag(op, kind, lhs.tag(), Some(!other.is_int()))?;
     let storage = PyDtype::new(tag).storage(op)?;
 
-    let left = lhs
-        .tensor()?
-        .to_dtype(storage)
-        .map_err(|e| candle_err(op, e))?;
+    let acc = opmath_in(storage);
+    let left = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
     // A zero-dim tensor, which is what torch's own `Scalar` overloads become
     // one layer down (`wrapped_scalar_tensor`) -- a `TorchDispatchMode` logger
     // over `f * 2` reports `aten.mul.Tensor`, not `mul.Scalar`, for exactly
     // this reason. The key stays `mul.Scalar` here because that is what the
     // *parser* picked, and the parser is what this shim reproduces.
+    //
+    // Built at `acc`, not at `storage`: narrowing the scalar first would round
+    // `0.3` to `bfloat16` and then round the result again, where torch rounds
+    // once. `opmath_in` has the measurement.
     let right = if storage.is_int() {
-        Tensor::full(other.as_i64() * (alpha as i64), (), left.device())
-            .and_then(|t| t.to_dtype(storage))
+        Tensor::full(other.as_i64() * (alpha as i64), (), left.device()).and_then(|t| t.to_dtype(acc))
     } else {
+        // Narrowed to `storage` and widened back, not built at `acc`: torch's
+        // promotion makes a python float beside a `bfloat16` tensor a
+        // `bfloat16` operand (docs/GENERATE.md §3.2), so `x + 0.3` adds
+        // `0.30078125`. Building the scalar at `float` would add `0.3`.
         Tensor::full(other.as_f64() * alpha, (), left.device())
             .and_then(|t| t.to_dtype(storage))
+            .and_then(|t| t.to_dtype(acc))
     }
     .map_err(|e| candle_err(op, e))?;
-    finish(py, apply_arith(op, kind, &left, &right)?, tag)
+    let out = apply_arith(op, kind, &left, &right)?
+        .to_dtype(storage)
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
 }
 
 /// `aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor`
@@ -2994,21 +3090,22 @@ fn rsub_scalar(
     let tag = arith_tag(OP, Arith::Sub, lhs.tag(), Some(!other.is_int()))?;
     let storage = PyDtype::new(tag).storage(OP)?;
 
-    let mut right = lhs
-        .tensor()?
-        .to_dtype(storage)
-        .map_err(|e| candle_err(OP, e))?;
+    let acc = opmath_in(storage);
+    let right = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
     let alpha = alpha_arg(OP, args, kwargs)?;
-    if alpha != 1.0 {
-        right = right.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?;
-    }
+    let right = scale_by_alpha(OP, &right, alpha, storage)?;
     let left = if storage.is_int() {
-        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.to_dtype(storage))
+        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.to_dtype(acc))
     } else {
-        Tensor::full(other.as_f64(), (), right.device()).and_then(|t| t.to_dtype(storage))
+        Tensor::full(other.as_f64(), (), right.device())
+            .and_then(|t| t.to_dtype(storage))
+            .and_then(|t| t.to_dtype(acc))
     }
     .map_err(|e| candle_err(OP, e))?;
-    finish(py, apply_arith(OP, Arith::Sub, &left, &right)?, tag)
+    let out = apply_arith(OP, Arith::Sub, &left, &right)?
+        .to_dtype(storage)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
 }
 
 /// `aten::matmul(Tensor self, Tensor other) -> Tensor`
@@ -4008,9 +4105,15 @@ fn sum_or_mean(
     let tag = dtype_arg(args, kwargs, dtype_at, "dtype")?.unwrap_or(natural);
     let storage = PyDtype::new(tag).storage(op)?;
 
+    // Reduced in `acc_type<T>` -- `float` for both reduced floats -- and
+    // narrowed once, which is what torch's reduction kernels do and what
+    // `cumsum_default` below already says in its own doc comment. Reducing in
+    // `bfloat16` instead rounds after every partial sum: measured, 168 of 200
+    // rows of a 64-wide `bfloat16` sum differed from upstream. `opmath_in`.
+    let acc = opmath_in(storage);
     let source = input
         .tensor()?
-        .to_dtype(storage)
+        .to_dtype(acc)
         .map_err(|e| candle_err(op, e))?;
     // torch: an empty `dim` list reduces *every* dimension (it is not the
     // same as reducing none), so it is equivalent to naming every axis.
@@ -4027,6 +4130,7 @@ fn sum_or_mean(
             (Reduce::Mean, false) => source.mean(dims),
         },
     }
+    .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -5393,11 +5497,102 @@ fn slice_tensor(
     finish(py, out, input.tag())
 }
 
+/// A bool/uint8 mask of rank `k` at `axis`, as the `k` integer index tensors
+/// torch replaces it with.
+///
+/// This is upstream's own move (`at::native::expandTensors`): where the
+/// gather happens a mask is not a separate kind of index, it is the
+/// coordinates of its true elements. Doing the same here is what lets masks
+/// and integer indices mix in one call without a second code path, and the
+/// `k` tensors it produces are adjacent and equal-length by construction, so
+/// the ordinary placement rule below puts them in the right place.
+///
+/// Measured: `x[mask3d]` on `(2,3,4,5)` with three true elements gives
+/// `(3,5)` -- exactly what three adjacent index tensors of shape `(3,)` at
+/// axes 0,1,2 produce.
+fn mask_to_indices(
+    op: &str,
+    mask: &Tensor,
+    axis: usize,
+    dims: &[usize],
+) -> PyResult<Vec<(usize, Vec<i64>, Vec<usize>)>> {
+    let mask_dims = mask.dims().to_vec();
+    if mask_dims.is_empty() {
+        // Upstream does not answer here either: it trips an internal assertion
+        // ("ntensor >= 3 INTERNAL ASSERT FAILED", measured), which is a bug
+        // rather than a rule. Refusing by name beats reproducing a crash or
+        // inventing the semantics it would have had.
+        return Err(not_implemented(format!(
+            "{op}: a 0-dim boolean mask is not implemented in torch._C shim -- \
+             upstream reaches an internal assertion on this input rather than \
+             defining it"
+        )));
+    }
+    if axis + mask_dims.len() > dims.len() || dims[axis..axis + mask_dims.len()] != mask_dims[..] {
+        // torch names the *first mismatching dimension*, and names it twice --
+        // once relative to the mask and once relative to the tensor.
+        let at = (0..mask_dims.len())
+            .find(|&i| dims.get(axis + i) != Some(&mask_dims[i]))
+            .unwrap_or(0);
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "The shape of the mask {mask_dims:?} at index {at} does not match the \
+             shape of the indexed tensor {dims:?} at index {}",
+            axis + at
+        )));
+    }
+    let bytes = mask
+        .flatten_all()
+        .and_then(|t| t.to_dtype(candle_core::DType::U8))
+        .and_then(|t| t.to_vec1::<u8>())
+        .map_err(|e| candle_err(op, e))?;
+    let mut coords: Vec<Vec<i64>> = vec![Vec::new(); mask_dims.len()];
+    for (flat, &byte) in bytes.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        let mut rest = flat;
+        for d in (0..mask_dims.len()).rev() {
+            coords[d].push((rest % mask_dims[d]) as i64);
+            rest /= mask_dims[d];
+        }
+    }
+    let count = coords[0].len();
+    Ok(coords
+        .into_iter()
+        .enumerate()
+        .map(|(d, values)| (axis + d, values, vec![count]))
+        .collect())
+}
+
 /// `aten::index.Tensor(Tensor self, Tensor?[] indices) -> Tensor`
 ///
-/// Advanced indexing, restricted to a single index tensor -- which is what
-/// `x[mask]` and `x[positions]` are. Two index tensors at once (`x[i, j]`) has
-/// broadcasting rules this shim has not measured, so it is refused by name.
+/// Advanced ("fancy") indexing with any number of index tensors, integer or
+/// boolean, in any positions. Every rule below was measured against torch
+/// 2.13.0 rather than recalled, and three of them are what make this op easy
+/// to get *plausibly* wrong -- right shape, wrong contents:
+///
+///   * **Where the result axes land.** If the indexed axes are *adjacent*,
+///     the broadcast shape is spliced in at the first of them. If any
+///     un-indexed axis *separates* them, the broadcast shape moves to the
+///     **front** and the un-indexed axes follow in their original order.
+///     Measured on `(2,3,4,5)` with index shapes `(2,1)` and `(3,)`:
+///     `[i,None,j]` gives `(2,3,3,5)` (fronted) and `[None,i,j)` gives
+///     `(2,2,3,5)` (spliced at axis 1). A kernel that always splices, or
+///     always fronts, is right for half the calls and silently transposed
+///     for the other half.
+///   * **A `None` entry separates.** At this layer `None` does not mean "new
+///     axis": torch has already unsqueezed `self` by the time the op is
+///     called, and the `None` left in the list is an ordinary un-indexed
+///     axis that breaks adjacency exactly like a `:`. Measured: the
+///     `indices` lists for `x[i,None,j]` and `x[i,:,j]` are identical.
+///   * **`uint8` is a mask, not an index.** Upstream accepts `long`, `int`,
+///     `byte` and `bool`, and treats `byte` as a deprecated spelling of
+///     `bool` -- `x[uint8_tensor]` gathers the *true* positions, not the
+///     positions its values name. Reading it as an integer index is wrong
+///     with a plausible shape, which is the failure mode this op invites.
+///
+/// A list shorter than the tensor's rank leaves the trailing axes alone;
+/// upstream does not pad it out with `None`, and neither does this.
 fn index_tensor(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -5408,9 +5603,22 @@ fn index_tensor(
     let raw = required(OP, args, kwargs, 1, "indices")?;
     let items: Vec<Bound<'_, PyAny>> = raw.extract()?;
 
-    let mut chosen: Option<(usize, PyTensorBase)> = None;
-    for (position, item) in items.iter().enumerate() {
+    let dims = input.tensor()?.dims().to_vec();
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+
+    // (axis, values, shape), one entry per *indexed axis* -- masks having
+    // already been expanded into one entry per axis they cover.
+    let mut picks: Vec<(usize, Vec<i64>, Vec<usize>)> = Vec::new();
+    let mut axis = 0usize;
+    for item in items.iter() {
         if item.is_none() {
+            axis += 1;
             continue;
         }
         let tensor = item.extract::<PyTensorBase>().map_err(|_| {
@@ -5419,89 +5627,153 @@ fn index_tensor(
                 item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
             ))
         })?;
-        if chosen.is_some() {
-            return Err(not_implemented(format!(
-                "{OP}: more than one index tensor is not implemented in torch._C shim \
-                 -- torch broadcasts the index tensors against each other and this \
-                 shim has not measured that rule"
-            )));
+        match tensor.tag() {
+            TorchDType::Int64 | TorchDType::Int32 => {
+                let values = tensor
+                    .tensor()?
+                    .flatten_all()
+                    .and_then(|t| t.to_dtype(candle_core::DType::I64))
+                    .and_then(|t| t.to_vec1::<i64>())
+                    .map_err(|e| candle_err(OP, e))?;
+                picks.push((axis, values, tensor.tensor()?.dims().to_vec()));
+                axis += 1;
+            }
+            TorchDType::Bool | TorchDType::UInt8 => {
+                let expanded = mask_to_indices(OP, tensor.tensor()?, axis, &dims)?;
+                axis += tensor.tensor()?.rank();
+                picks.extend(expanded);
+            }
+            _ => {
+                // Upstream's own wording, and it names four dtypes rather
+                // than the one that was passed.
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
         }
-        chosen = Some((position, tensor));
     }
-    let (position, index) = match chosen {
-        Some(pair) => pair,
+
+    if picks.is_empty() {
         // `x[None]`-only index lists never reach here (bootstrap.py handles
-        // `None` with `unsqueeze`), so an all-None list is an identity.
-        None => return finish(py, input.tensor()?.clone(), input.tag()),
-    };
+        // `None` with `unsqueeze`), and upstream trips an internal assertion
+        // on an all-`None` list, so this stays the identity it always was.
+        return finish(py, input.tensor()?.clone(), input.tag());
+    }
 
-    let dims = input.tensor()?.dims().to_vec();
-    let device = input.tensor()?.device();
-    let source = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
-
-    // Both supported forms collapse to the same three-part reshape: everything
-    // before the indexed block, the block itself, everything after.
-    let (block_rank, picks, result_middle) = if index.tag() == TorchDType::Bool {
-        let mask_dims = index.tensor()?.dims().to_vec();
-        if position + mask_dims.len() > dims.len()
-            || dims[position..position + mask_dims.len()] != mask_dims[..]
-        {
-            // torch names the *first mismatching dimension*, not the position
-            // of the mask in the index tuple, and it names it twice -- once
-            // relative to the mask and once relative to the tensor. Matched
-            // so a caller reading the message gets the same numbers.
-            let at = (0..mask_dims.len())
-                .find(|&i| dims.get(position + i) != Some(&mask_dims[i]))
-                .unwrap_or(0);
+    // The index tensors broadcast against each other, right-aligned.
+    let broadcast_rank = picks.iter().map(|(_, _, shape)| shape.len()).max().unwrap_or(0);
+    let mut broadcast: Vec<usize> = vec![1; broadcast_rank];
+    for (_, _, shape) in &picks {
+        let offset = broadcast_rank - shape.len();
+        for (k, &extent) in shape.iter().enumerate() {
+            let slot = &mut broadcast[offset + k];
+            if *slot == extent || extent == 1 {
+                continue;
+            }
+            if *slot == 1 {
+                *slot = extent;
+                continue;
+            }
+            let named = picks
+                .iter()
+                .map(|(_, _, s)| format!("{s:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "The shape of the mask {mask_dims:?} at index {at} does not match the \
-                 shape of the indexed tensor {dims:?} at index {}",
-                position + at
+                "shape mismatch: indexing tensors could not be broadcast together \
+                 with shapes {named}"
             )));
         }
-        let bytes = index
-            .tensor()?
-            .flatten_all()
-            .and_then(|t| t.to_vec1::<u8>())
-            .map_err(|e| candle_err(OP, e))?;
-        let picks: Vec<i64> = bytes
-            .iter()
-            .enumerate()
-            .filter(|(_, &b)| b != 0)
-            .map(|(i, _)| i as i64)
-            .collect();
-        let count = picks.len();
-        (mask_dims.len(), picks, vec![count])
-    } else {
-        let extent = dims.get(position).copied().unwrap_or(0) as i64;
-        let raw = index
-            .tensor()?
-            .flatten_all()
-            .and_then(|t| t.to_dtype(candle_core::DType::I64))
-            .and_then(|t| t.to_vec1::<i64>())
-            .map_err(|e| candle_err(OP, e))?;
-        let picks = raw
-            .into_iter()
-            .map(|v| normalise_index(OP, v as isize, extent as usize).map(|v| v as i64))
-            .collect::<PyResult<Vec<i64>>>()?;
-        (1, picks, index.tensor()?.dims().to_vec())
-    };
+    }
 
-    let pre: usize = dims[..position].iter().product();
-    let block: usize = dims[position..position + block_rank].iter().product();
-    let post: usize = dims[position + block_rank..].iter().product();
-    let count = picks.len();
-    let index_tensor = Tensor::from_vec(picks, count, device).map_err(|e| candle_err(OP, e))?;
+    // Each index tensor's stride *through the broadcast shape*: zero where it
+    // is being stretched, its own row-major stride where it is not.
+    let mut strides: Vec<Vec<usize>> = Vec::with_capacity(picks.len());
+    for (_, _, shape) in &picks {
+        let mut own = vec![1usize; shape.len()];
+        for k in (0..shape.len().saturating_sub(1)).rev() {
+            own[k] = own[k + 1] * shape[k + 1];
+        }
+        let offset = broadcast_rank - shape.len();
+        let mut over = vec![0usize; broadcast_rank];
+        for k in 0..shape.len() {
+            over[offset + k] = if shape[k] == 1 { 0 } else { own[k] };
+        }
+        strides.push(over);
+    }
 
-    let mut shape: Vec<usize> = dims[..position].to_vec();
-    shape.extend(result_middle);
-    shape.extend_from_slice(&dims[position + block_rank..]);
+    // Strides of the gathered subspace, in indexed-axis order.
+    let indexed: Vec<usize> = picks.iter().map(|(axis, _, _)| *axis).collect();
+    let mut sub = vec![1usize; picks.len()];
+    for j in (0..picks.len().saturating_sub(1)).rev() {
+        sub[j] = sub[j + 1] * dims[indexed[j + 1]];
+    }
 
-    let out = source
-        .reshape((pre, block, post))
-        .and_then(|t| t.index_select(&index_tensor, 1))
+    let total: usize = broadcast.iter().product();
+    let mut flat: Vec<i64> = Vec::with_capacity(total);
+    let mut coords = vec![0usize; broadcast_rank];
+    for linear in 0..total {
+        let mut rest = linear;
+        for k in (0..broadcast_rank).rev() {
+            coords[k] = rest % broadcast[k];
+            rest /= broadcast[k];
+        }
+        let mut offset = 0usize;
+        for (j, (at, values, _)) in picks.iter().enumerate() {
+            let mut position = 0usize;
+            for k in 0..broadcast_rank {
+                position += coords[k] * strides[j][k];
+            }
+            let raw = values[position];
+            let extent = dims[*at] as i64;
+            let resolved = if raw < 0 { raw + extent } else { raw };
+            if resolved < 0 || resolved >= extent {
+                // Upstream names the dimension being indexed and its size,
+                // not the index tensor's own shape.
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "index {raw} is out of bounds for dimension {at} with size {extent}"
+                )));
+            }
+            offset += (resolved as usize) * sub[j];
+        }
+        flat.push(offset as i64);
+    }
+
+    // Indexed axes to the front, gather along them as one flat axis, then put
+    // the result axes where the placement rule says they go.
+    let untouched: Vec<usize> = (0..rank).filter(|a| !indexed.contains(a)).collect();
+    let mut order = indexed.clone();
+    order.extend(untouched.iter().copied());
+    let block: usize = indexed.iter().map(|&a| dims[a]).product();
+    let trailing: Vec<usize> = untouched.iter().map(|&a| dims[a]).collect();
+    let span: usize = trailing.iter().product();
+
+    let index = Tensor::from_vec(flat, total, input.tensor()?.device())
+        .map_err(|e| candle_err(OP, e))?;
+    let mut shape: Vec<usize> = broadcast.clone();
+    shape.extend(trailing.iter().copied());
+    let mut out = input
+        .tensor()?
+        .permute(order)
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.reshape((block, span)))
+        .and_then(|t| t.index_select(&index, 0))
         .and_then(|t| t.reshape(shape))
         .map_err(|e| candle_err(OP, e))?;
+
+    // Adjacent indexed axes splice in place; separated ones stay at the front,
+    // which is where `out` already has them.
+    let adjacent = indexed.windows(2).all(|pair| pair[1] == pair[0] + 1);
+    let at = indexed[0];
+    if adjacent && at > 0 {
+        let mut permutation: Vec<usize> = (0..at).map(|k| broadcast_rank + k).collect();
+        permutation.extend(0..broadcast_rank);
+        permutation.extend((at..trailing.len()).map(|k| broadcast_rank + k));
+        out = out
+            .permute(permutation)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+    }
     finish(py, out, input.tag())
 }
 
@@ -5726,23 +5998,27 @@ fn add_inplace(
         )));
     }
     let storage = PyDtype::new(tag).storage(OP)?;
+    // Same widening as `add.Tensor` -- the in-place spelling must not compute
+    // a different function from the out-of-place one. See `opmath_in`.
+    let acc = opmath_in(storage);
     let lhs = {
         let borrowed = receiver.borrow();
         borrowed
             .tensor()?
-            .to_dtype(storage)
+            .to_dtype(acc)
             .map_err(|e| candle_err(OP, e))?
     };
-    let mut rhs = other
+    let rhs = other
         .tensor()?
-        .to_dtype(storage)
+        .to_dtype(acc)
         .and_then(|t| t.broadcast_as(shape))
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
-    if alpha != 1.0 {
-        rhs = rhs.affine(alpha, 0.0).map_err(|e| candle_err(OP, e))?;
-    }
-    let out = lhs.add(&rhs).map_err(|e| candle_err(OP, e))?;
+    let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
+    let out = lhs
+        .add(&rhs)
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
     receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
     let _ = py;
     Ok(receiver.into_any().unbind())
