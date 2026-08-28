@@ -11,6 +11,9 @@
 //! Arithmetic does not: it goes through the aten dispatcher (`aten.rs`) so that
 //! every operation passes the one choke point where an unimplemented op names
 //! itself. A convenience method here would be a second, unmeasured entrance.
+use std::sync::Arc;
+
+use candle_core::quantized::QTensor;
 use candle_core::{DType, Tensor};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule, PyTuple};
@@ -54,6 +57,29 @@ pub enum Repr {
     /// *survives*, this is the field that has to appear, and
     /// docs/DEVICE_ABS.md §3.2 is the argument for it.
     Meta { shape: Vec<usize> },
+    /// A GGML block-quantised weight.
+    ///
+    /// **The reason this is a third arm and not a `Tensor` wearing a label is
+    /// that candle's quantisation is not a `DType`.** `QTensor` lives in a
+    /// separate type system (`candle_core::quantized`) with its own element
+    /// enumeration (`GgmlDType`), its own storage, and its own matmul
+    /// (`QMatMul`); it is not convertible to `&Tensor` without dequantising,
+    /// which allocates and throws away the whole point. docs/QUANT.md §5.1 and
+    /// docs/DTYPE.md §6.3.
+    ///
+    /// So `tensor()` refuses on this arm exactly as it refuses on `Meta`, and
+    /// for the same structural reason: **no kernel can read dense storage off
+    /// a quantised tensor by forgetting to check.** The 96 kernels in
+    /// `aten.rs` inherit the refusal from the type rather than from a rule
+    /// each of them has to remember. Only the ops taught the quantised arm by
+    /// name (`quant.rs`) can compute on one.
+    ///
+    /// `Arc` rather than the value: `QTensor` is not `Clone` (it carries a
+    /// `OnceLock` cache of the repacked blocks that `cpu_fwd` fills on first
+    /// use), and `QMatMul::from_arc` wants an `Arc` anyway. Sharing it also
+    /// means that cache survives across calls, which is where the repacked
+    /// Q4K path's cost is amortised.
+    Quantized(Arc<QTensor>),
 }
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
@@ -112,6 +138,22 @@ pub fn no_data() -> PyErr {
     pyo3::exceptions::PyNotImplementedError::new_err("Cannot copy out of meta tensor; no data!")
 }
 
+/// The refusal every dense read of a quantised tensor ends at.
+///
+/// Not upstream's wording, because upstream has no equivalent: its quantised
+/// tensors *do* have dense storage (an `int8` buffer plus a scale), and
+/// `.int_repr()` hands it over. A GGML block format has no such buffer -- the
+/// bytes are interleaved scales and packed sub-byte quants -- so there is
+/// nothing to hand over and the honest answer names the format and points at
+/// the one operation that does produce numbers.
+pub fn no_dense_storage(format: &str) -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err(format!(
+        "torch._C shim: this tensor is block-quantised ({format}); it has no dense \
+         storage for a kernel to read. Use torch._C._dequantize(t) to materialise \
+         float32, or torch._C._quantized_linear(x, w, b) to compute against it."
+    ))
+}
+
 impl PyTensorBase {
     /// A tensor whose torch dtype is whatever candle is already storing.
     pub fn new(inner: Tensor) -> PyResult<Self> {
@@ -140,6 +182,31 @@ impl PyTensorBase {
     pub fn meta(shape: Vec<usize>, tag: TorchDType) -> Self {
         Self {
             inner: Repr::Meta { shape },
+            tag,
+            requires_grad: false,
+            backward_hooks: None,
+        }
+    }
+
+    /// The single entrance for the quantised representation.
+    ///
+    /// The tag is **the dtype this weight produces**, not a `q*` tag. Upstream
+    /// would say `torch.qint8` here, and that was rejected on purpose: a
+    /// `qint8` tag sends every reader down upstream's per-tensor-affine
+    /// quantised path, which wants `q_scale()`/`q_zero_point()`/`int_repr()`
+    /// and a single scale for the whole tensor -- none of which a GGML k-quant
+    /// has (Q4K carries eight 6-bit sub-scales and two `f16` super-scales per
+    /// 256 elements). It would also be a tag with no meaning for Q4K, there
+    /// being no 4-bit torch dtype that is storable here (docs/QUANT.md §2.1).
+    ///
+    /// So `.dtype` answers what comes out of `_dequantize`/`_quantized_linear`
+    /// and `.is_quantized` answers that it is quantised; the *format* is a
+    /// separate question with a separate answer, `_quantized_format()`. This
+    /// is a narrowing against upstream and is recorded as one in
+    /// docs/QUANT2.md §4.
+    pub fn quantized(inner: Arc<QTensor>, tag: TorchDType) -> Self {
+        Self {
+            inner: Repr::Quantized(inner),
             tag,
             requires_grad: false,
             backward_hooks: None,
@@ -189,6 +256,7 @@ impl PyTensorBase {
         match &self.inner {
             Repr::Dense(tensor) => Ok(tensor),
             Repr::Meta { .. } => Err(no_data()),
+            Repr::Quantized(q) => Err(no_dense_storage(crate::quant::format_name(q.dtype()))),
         }
     }
 
@@ -202,6 +270,24 @@ impl PyTensorBase {
         matches!(self.inner, Repr::Meta { .. })
     }
 
+    /// The quantised storage, for the ops that were taught this arm by name.
+    /// Refuses on the other two, so `quant.rs` cannot be handed a dense tensor
+    /// by accident and silently treat it as a weight.
+    #[inline]
+    pub fn qtensor(&self, op: &str) -> PyResult<&Arc<QTensor>> {
+        match &self.inner {
+            Repr::Quantized(q) => Ok(q),
+            Repr::Dense(_) | Repr::Meta { .. } => Err(not_implemented(format!(
+                "{op}: expected a block-quantised tensor (torch._C._quantize), \
+                 got a {} one",
+                match &self.inner {
+                    Repr::Dense(_) => "dense",
+                    _ => "meta",
+                }
+            ))),
+        }
+    }
+
     /// The shape, for either representation. This is the half of a tensor meta
     /// still has.
     #[inline]
@@ -209,6 +295,7 @@ impl PyTensorBase {
         match &self.inner {
             Repr::Dense(tensor) => tensor.dims(),
             Repr::Meta { shape } => shape,
+            Repr::Quantized(q) => q.shape().dims(),
         }
     }
 
@@ -217,6 +304,7 @@ impl PyTensorBase {
         match &self.inner {
             Repr::Dense(tensor) => tensor.elem_count(),
             Repr::Meta { shape } => shape.iter().product(),
+            Repr::Quantized(q) => q.shape().elem_count(),
         }
     }
 
@@ -231,6 +319,11 @@ impl PyTensorBase {
         match &self.inner {
             Repr::Dense(tensor) => PyDevice::from_candle(tensor.device()),
             Repr::Meta { .. } => PyDevice::meta(),
+            // A `QTensor` owns a real device, and `device()` returns it by
+            // value rather than by reference (its storage enum holds the
+            // backend handle, not a `&Device`), so this binds a temporary
+            // rather than borrowing like the dense arm.
+            Repr::Quantized(q) => PyDevice::from_candle(&q.device()),
         }
     }
 
@@ -603,26 +696,29 @@ impl PyTensorBase {
     /// forces a `clone` and `is_neg` forces a `resolve_neg`.
     ///
     /// **They are an exhaustive `match` over `Repr`, not a `false`.** That is
-    /// the whole of the argument for them, and it is deliberately structural:
-    /// this shim has exactly two representations, candle's dense strided
-    /// buffer and the shape-and-dtype-only `Meta` arm, and neither is nested,
-    /// sparse, quantised, a `ZeroTensor` or a negative-bit view. Writing it as
-    /// a match means a third arm cannot be added to `Repr` without the
-    /// compiler asking what these six answer for it -- where a bare `false`
-    /// would inherit silently, which is exactly the shape of the `is_mutable`
-    /// accident in docs/DISTRIBUTED.md §8.1.
+    /// the whole of the argument for them, and it is deliberately structural.
+    /// Writing it as a match means an arm cannot be added to `Repr` without
+    /// the compiler asking what these six answer for it -- where a bare
+    /// `false` would inherit silently, which is exactly the shape of the
+    /// `is_mutable` accident in docs/DISTRIBUTED.md §8.1.
+    ///
+    /// **That is no longer a hypothetical: `Repr::Quantized` landed and the
+    /// compiler asked.** Five of the six answered `false` again; `is_quantized`
+    /// did not, and so this family is now a live predicate with a constructor
+    /// behind it rather than a set of constants (docs/QUANT2.md §4).
     ///
     /// The other half of the argument is in `pytests/test_shim.py`
     /// (`test_the_alternative_representations_have_no_constructors`): each of
-    /// these representations has exactly one way into existence and every one
-    /// of those ways refuses by name, so `False` is derivable from the
-    /// constructor set rather than asserted. If any of them ever lands, that
-    /// test fails and these stop being answerable this way.
+    /// the representations *still* answering `False` has exactly one way into
+    /// existence and every one of those ways refuses by name, so `False` is
+    /// derivable from the constructor set rather than asserted. If any of them
+    /// ever lands, that test fails and these stop being answerable this way.
     #[getter]
     fn is_nested(&self) -> bool {
         match self.inner {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
+            Repr::Quantized(_) => false,
         }
     }
 
@@ -631,15 +727,52 @@ impl PyTensorBase {
         match self.inner {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
+            Repr::Quantized(_) => false,
         }
     }
 
+    /// **The one of the six that is no longer a constant.** `Repr::Quantized`
+    /// landed, so this predicate now has something to say -- which is the
+    /// point of writing it as a match: the arm asked the question rather than
+    /// inheriting a `False`.
+    ///
+    /// It is upstream's *name* over a representation upstream does not have
+    /// (GGML k-quant blocks, not per-tensor-affine `int8`), so agreeing with
+    /// the name is a claim about the shape of the storage and not about the
+    /// scheme. Anything that reads `True` here and then reaches for
+    /// `qscheme()`/`q_scale()` gets a refusal that names the difference, which
+    /// is why `qscheme` exists on this class at all.
     #[getter]
     fn is_quantized(&self) -> bool {
         match self.inner {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
+            Repr::Quantized(_) => true,
         }
+    }
+
+    /// `tensor.qscheme()` -- **a refusal on every arm**, and it is here rather
+    /// than absent so that the refusal names the reason.
+    ///
+    /// `torch/_tensor_str.py` calls this the moment `is_quantized` is `True`,
+    /// so without it `print(qweight)` would die with `AttributeError:
+    /// 'TensorBase' object has no attribute 'qscheme'` -- a message that tells
+    /// the reader nothing about *why*. Upstream raises on a dense tensor too
+    /// (`RuntimeError: Could not run 'aten::qscheme' with arguments from the
+    /// 'CPU' backend`), so refusing on both arms is not an invention.
+    fn qscheme(&self) -> PyResult<()> {
+        Err(match &self.inner {
+            Repr::Quantized(q) => not_implemented(format!(
+                "torch._C shim: a {} tensor has no torch qscheme. GGML block \
+                 formats carry per-block scales (and, for the k-quants, per-\
+                 sub-block scales and minima) rather than the single scale and \
+                 zero point torch.per_tensor_affine names.",
+                crate::quant::format_name(q.dtype())
+            )),
+            _ => pyo3::exceptions::PyRuntimeError::new_err(
+                "Could not run 'aten::qscheme' with arguments from the 'CPU' backend.",
+            ),
+        })
     }
 
     /// A *method* upstream, not a property -- `_tensor_str.py:336` spells it
@@ -650,6 +783,7 @@ impl PyTensorBase {
         match self.inner {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
+            Repr::Quantized(_) => false,
         }
     }
 
@@ -661,6 +795,7 @@ impl PyTensorBase {
         match self.inner {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
+            Repr::Quantized(_) => false,
         }
     }
 
@@ -680,6 +815,13 @@ impl PyTensorBase {
             // Upstream's meta tensors are strided too -- `torch.zeros(2, 3,
             // device="meta").layout` is `torch.strided`, measured.
             Repr::Meta { .. } => "strided",
+            // So are upstream's quantised tensors:
+            // `torch.quantize_per_tensor(torch.zeros(4), 0.1, 0,
+            // torch.qint8).layout` is `torch.strided`, measured on 2.13.0.
+            // `torch.layout` names how the *elements* are addressed, and there
+            // is no GGML entry in that enumeration to report even if one
+            // wanted to -- the format is reported by `_quantized_format()`.
+            Repr::Quantized(_) => "strided",
         }
     }
 
@@ -714,8 +856,27 @@ impl PyTensorBase {
     /// and not from candle's, so `torch.bool` answers 1 rather than borrowing
     /// `uint8`'s answer by accident. (They agree; the point is that the tag is
     /// the authority, per BOOL.md §5-B.)
-    fn element_size(&self) -> usize {
-        self.tag.itemsize()
+    ///
+    /// **A quantised tensor refuses instead of answering.** Its tag is the
+    /// dtype it dequantises to (`float32`), so answering from the tag would
+    /// report 4 bytes per element for a Q4K weight that stores 0.5625 -- a
+    /// number wrong by 7.1x, in the direction that makes a compression claim
+    /// look worse than it is and a memory budget look better. `numel() *
+    /// element_size()` is how upstream code sizes a buffer, so this is exactly
+    /// the read that must not silently succeed. `_quantized_nbytes()` is the
+    /// answerable question.
+    fn element_size(&self) -> PyResult<usize> {
+        match &self.inner {
+            Repr::Dense(_) | Repr::Meta { .. } => Ok(self.tag.itemsize()),
+            Repr::Quantized(q) => Err(not_implemented(format!(
+                "TensorBase.element_size: a {} tensor has no whole number of \
+                 bytes per element ({} bytes per {} elements). Use \
+                 torch._C._quantized_nbytes(t) for the storage size.",
+                crate::quant::format_name(q.dtype()),
+                q.dtype().type_size(),
+                q.dtype().block_size(),
+            ))),
+        }
     }
 
     /// `tensor.set_(storage, storage_offset, size, stride)` -- **a copy, where
@@ -886,6 +1047,13 @@ impl PyTensorBase {
         match &self.inner {
             Repr::Dense(tensor) => tensor.is_contiguous(),
             Repr::Meta { .. } => true,
+            // A `QTensor` has no `Layout` and therefore no stride at all: its
+            // blocks are laid out in one flat, row-major run, and candle
+            // offers no way to build a strided view of one. So every quantised
+            // tensor this shim can make is contiguous for the same reason
+            // `Meta` is -- there is no operation that could produce a
+            // non-contiguous one.
+            Repr::Quantized(_) => true,
         }
     }
 
