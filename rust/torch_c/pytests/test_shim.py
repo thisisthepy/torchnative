@@ -5603,6 +5603,470 @@ def test_an_unloaded_model_is_far_from_the_truth_logits():
     assert diff > 1e-3, diff
 
 
+# ---------------------------------------------------------------------------
+# Schema text (docs/SCHEMA.md)
+# ---------------------------------------------------------------------------
+#
+# `_get_schema` used to answer every aten op with `_Schema(qualname, overload)`
+# -- no arguments, no returns. Every predicate reading it was therefore a
+# constant. docs/DISTRIBUTED.md §8.1 caught `is_mutable`, which had just been
+# fixed from always-true to always-*false* and was still wrong for the seven
+# in-place ops among the implemented set. It is not one predicate: 66 sites in
+# the vendored tree read `._schema.arguments`, 38 read `.returns`, 18 read
+# `.is_mutable` and 2 call `._is_view_op()`, and all of them were reading an
+# empty schema.
+#
+# These tests run in the vendored tree, because that is where the schema text
+# comes from: `torchgen/packaged/ATen/native/native_functions.yaml`, which ships
+# in the wheel beside `torch/`. The bare `_C` on this file's PYTHONPATH has no
+# such sibling, so it can only be asked the questions that need no table.
+
+_SCHEMA_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+
+request = json.load(sys.stdin)
+out = {}
+out["source"] = torch._C._shim_schema_source()
+
+ops = {}
+for key in torch._C._aten_implemented():
+    namespace, _, rest = key.partition(".")
+    name, _, overload = rest.rpartition(".")
+    schema = torch._C._get_schema(f"{namespace}::{name}",
+                                  "" if overload == "default" else overload)
+    entry = {"text": str(schema), "placeholder": schema.is_placeholder}
+    entry["is_mutable"] = None if schema.is_placeholder else schema.is_mutable
+    # The route the op actually takes, not a second lookup: `torch.ops` is what
+    # every reader in the tree goes through, and if `_get_schema` were right
+    # while `torch.ops.aten.<op>.<ov>._schema` were not, nothing would be fixed.
+    packet = getattr(torch.ops.aten, name)
+    entry["via_ops"] = str(getattr(packet, overload)._schema)
+    ops[key] = entry
+out["ops"] = ops
+
+# Every (op, overload) the transcribed tables carry, whether or not it is
+# implemented. These strings are `str(...._schema)` from upstream 2.13.0, so
+# they are an in-repo oracle for the normalisation -- no upstream torch needed.
+table = {}
+for qualname, overload in request["table_keys"]:
+    schema = torch._C._get_schema(qualname, overload)
+    table[f"{qualname}|{overload}"] = {
+        "text": str(schema), "placeholder": schema.is_placeholder,
+        "from": torch._C._shim_schema_provenance(qualname, overload),
+    }
+out["table"] = table
+
+# An op nothing can have text for. It answers, and the answer is counted.
+absent = torch._C._get_schema("aten::not_an_operator_this_repo_will_ever_have", "")
+out["absent_placeholder"] = absent.is_placeholder
+out["absent_text"] = str(absent)
+out["absent_is_mutable"] = absent.is_mutable
+out["absent_is_view_op"] = absent._is_view_op()
+out["placeholders_listed"] = torch._C._shim_placeholder_schemas()
+out["unanswered"] = torch._C._shim_unanswered_predicates()
+
+# The registry, not the schema: an in-place variant the file does not declare
+# is not an operator, and a name the file simply omits still is.
+registry = {}
+for name in ("convolution_", "mm_", "add_", "quantized_lstm", "zero", "relu_"):
+    try:
+        registry[name] = sorted(getattr(torch.ops.aten, name).overloads())
+    except AttributeError as error:
+        registry[name] = f"AttributeError: {error}"
+out["registry"] = registry
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _schema_table_keys():
+    """`(qualname, overload)` for every entry of the two transcribed tables.
+
+    Keyed off the schema string rather than the table key, for the reason
+    `verify_schemas.py:_aten_name` gives: `methods.json`'s key is the Python
+    method name (`__mul__`, `item`) and not the aten op.
+    """
+    keys = {}
+    for filename in ("overloads.json", "methods.json"):
+        path = os.path.join(_CKPT_REPO_ROOT, "rust", "torch_c", "src", filename)
+        with open(path, encoding="utf-8") as fh:
+            table = json.load(fh)
+        for name, schemas in table.items():
+            if name.startswith("_README"):
+                continue
+            for text in schemas:
+                head = text.split("(", 1)[0].strip()
+                _, _, rest = head.rpartition("::")
+                op, _, overload = rest.partition(".")
+                keys[(f"aten::{op}", overload)] = text
+    return keys
+
+
+@functools.lru_cache(maxsize=None)
+def _schema_road_fixture():
+    keys = _schema_table_keys()
+    request = json.dumps({"table_keys": [list(k) for k in sorted(keys)]})
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _SCHEMA_ROAD_SCRIPT],
+        input=request,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"schema-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return keys, json.loads(proc.stdout)
+
+
+#: The mutating ops among the implemented set, as upstream 2.13.0 answers for
+#: the same overloads (`verify_schemas.py` re-derives this against real torch;
+#: it is written out here so the check needs no upstream install).
+#:
+#: docs/DISTRIBUTED.md §8.1 named seven -- `add_ copy_ fill_ normal_ relu_
+#: uniform_ zero_ ` -- against the 97 ops implemented when it was written. The
+#: set is 117 now and five more of them mutate, which is the other half of that
+#: section's point: the wrong direction was "does not mutate", so growing the
+#: op set grew the silent lie rather than exposing it.
+#:
+#: Listed as full keys rather than derived from the trailing underscore. A
+#: name rule would agree with a name-based implementation for the wrong reason,
+#: and it would also get `index_put_` right while getting `fill_.Tensor` and
+#: `fill_.Scalar` -- which differ only by overload -- for free, hiding whether
+#: the overload was resolved at all.
+_EXPECTED_MUTABLE = (
+    "aten.add_.Tensor",
+    "aten.clamp_.default",
+    "aten.copy_.default",
+    "aten.div_.Tensor",
+    "aten.fill_.Scalar",
+    "aten.fill_.Tensor",
+    "aten.index_put_.default",
+    "aten.masked_fill_.Scalar",
+    "aten.normal_.default",
+    "aten.relu_.default",
+    "aten.uniform_.default",
+    "aten.zero_.default",
+)
+
+#: The seven docs/DISTRIBUTED.md §8.1 named, as the judgement it set.
+_SECTION_8_1_MUTABLE = ("add_", "copy_", "fill_", "normal_", "relu_", "uniform_",
+                        "zero_")
+
+
+def _native_functions_keys():
+    """`(op, overload)` for every `- func:` in the vendored yaml.
+
+    Read here, in the test, rather than asked of the shim: the point of the
+    checks below is to compare what the shim answers against what the file
+    says, and asking the shim for both sides would make the comparison vacuous.
+    """
+    path = os.path.join(_CKPT_VENDOR_DIR, "torchgen", "packaged", "ATen",
+                        "native", "native_functions.yaml")
+    keys = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.startswith("- func:"):
+                continue
+            text = line[len("- func:"):].strip()
+            name, _, overload = text.split("(", 1)[0].partition(".")
+            keys[(f"aten::{name}", overload)] = text
+    return keys
+
+
+def test_every_implemented_op_has_schema_text():
+    """The 117 implemented ops, and how many of them are still placeholders.
+
+    A placeholder is not a missing answer, it is a wrong one: `arguments` is
+    empty, so `any(a.alias_info.is_write for a in schema.arguments)` is False
+    and `is_functional_schema` is True, for every op. This asserts the count is
+    zero rather than "small", because the source (`native_functions.yaml`,
+    vendored) carries all 2584 aten entries and there is no reason for a
+    shortfall to be tolerated silently.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    _, report = _schema_road_fixture()
+    assert report["source"].endswith("native_functions.yaml"), report["source"]
+    placeholders = sorted(k for k, v in report["ops"].items() if v["placeholder"])
+    assert placeholders == [], placeholders
+    assert len(report["ops"]) == 117, len(report["ops"])
+    for key, entry in sorted(report["ops"].items()):
+        assert entry["text"] != f"{key}(...) -> ...", key
+        assert entry["text"].startswith("aten::"), (key, entry["text"])
+        # The route the tree takes has to carry the same text.
+        assert entry["via_ops"] == entry["text"], (key, entry)
+
+
+def test_the_seven_in_place_ops_say_that_they_mutate():
+    """docs/DISTRIBUTED.md §8.1's judgement, in one assertion.
+
+    `add_.Tensor` is `aten::add_.Tensor(Tensor(a!) self, ...)` -- the `!` on
+    `self`'s alias annotation is the whole content of `is_mutable`, and it can
+    only be read if the argument list was really parsed.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    mutable = sorted(k for k, v in report["ops"].items() if v["is_mutable"])
+    assert mutable == sorted(_EXPECTED_MUTABLE), mutable
+    # §8.1's own list, checked as it was written -- by op name, so that the
+    # judgement survives the expected set above being re-measured.
+    for name in _SECTION_8_1_MUTABLE:
+        hits = [k for k in mutable if k.split(".")[1] == name]
+        assert hits, name
+    # And the functional sibling is not mutable, so the predicate is not
+    # answering "yes" to everything sharing a stem.
+    assert report["ops"]["aten.add.Tensor"]["is_mutable"] is False
+    assert report["ops"]["aten.add_.Tensor"]["is_mutable"] is True
+
+
+def test_is_mutable_is_not_constant_over_the_implemented_ops():
+    """The failure this work exists to remove, stated as its own check.
+
+    `is_mutable` has been wrong in both directions -- always True while it was
+    a method (a bound method is truthy), then always False once it was a
+    property reading an empty argument list. Both times the shape of the defect
+    was the same: a predicate that cannot take two values. This asserts the
+    partition is non-trivial in *both* directions, which is the only thing that
+    fails for either version.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    values = [v["is_mutable"] for v in report["ops"].values()]
+    assert values.count(True) == 12, values.count(True)
+    assert values.count(False) == 105, values.count(False)
+    assert None not in values
+
+
+def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
+    """The normalisation, checked against an oracle that is already in the repo.
+
+    `native_functions.yaml` is not quite what upstream prints: it spells float
+    defaults `0`/`1.0` where upstream prints `0.`/`1.`, quotes strings with
+    `'`, writes `ScalarType? dtype=long` where upstream writes `=4`, and leaves
+    `SymInt[2] stride=1` unexpanded. So the yaml text has to be re-printed the
+    way upstream's `FunctionSchema` printer does, and a re-printer is a place to
+    be quietly wrong.
+
+    `overloads.json` and `methods.json` are the oracle: every string in them is
+    `str(torch.ops.aten.<op>.<ov>._schema)` transcribed from upstream 2.13.0,
+    and `verify_schemas.py` keeps them honest. 173 distinct overloads, 7 of
+    which exercise a normalisation rule -- if the re-printer drops one, those
+    seven stop matching. This needs no upstream torch.
+
+    The provenance assertion is not decoration. In the first working version
+    `_get_schema` consulted the tables *before* the file, so these 173 lookups
+    were answered by the oracle itself and the comparison was the oracle
+    against itself: deleting the float printer entirely left this test green
+    (measured). 169 of the 173 have to come from the file for the comparison to
+    mean anything, and the four that cannot -- `.out` variants torchgen
+    generates and the file does not declare -- are named.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    keys, report = _schema_road_fixture()
+    declared = _native_functions_keys()
+    mismatched = []
+    shadowed = []
+    for (qualname, overload), expected in sorted(keys.items()):
+        got = report["table"][f"{qualname}|{overload}"]
+        if got["placeholder"] or got["text"] != expected:
+            mismatched.append((qualname, overload, expected, got["text"]))
+        if (qualname, overload) in declared and got["from"] != "native_functions.yaml":
+            shadowed.append((qualname, overload, got["from"]))
+    assert mismatched == [], mismatched[:5]
+    assert shadowed == [], shadowed[:5]
+    assert len(keys) == 173, len(keys)
+    from_tables = sorted(
+        k for k in keys
+        if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
+    )
+    assert from_tables == [
+        ("aten::div", "Scalar_mode_out"),
+        ("aten::div", "Scalar_out"),
+        ("aten::embedding", "out"),
+        ("aten::empty_like", "out"),
+    ], from_tables
+
+
+def test_a_predicate_answered_without_text_is_counted_as_such():
+    """"I do not know" has to be distinguishable from "no" -- and countable.
+
+    Raising from `is_mutable` was tried first, because a refusal is the version
+    of "I do not know" that cannot be mistaken for an answer. It does not
+    survive contact with the tree: with the refusal in, a full run reads
+    `is_mutable` on 102 ops with no text, and `import transformers` stops on
+    the first (`aten::convolution_`, then `aten::_native_batch_norm_legit_
+    functional`). 84 of those 102 are names upstream has no operator for at
+    all -- `torch/distributed/tensor/_ops/autogen.py` synthesises `<base>_` and
+    `<base>_functional` and probes them, and `torch/_ops.py` asks every packet
+    for a `default` overload -- so upstream answers with AttributeError and the
+    caller's guard reaches the same branch that `False` reaches here.
+
+    So the placeholder answers, and the answer is recorded. This test pins the
+    receipt, not the value: the pair is in `_shim_unanswered_predicates()`, so
+    the set can be diffed instead of rediscovered by instrumenting the build.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    absent = "aten::not_an_operator_this_repo_will_ever_have"
+    assert report["absent_placeholder"] is True
+    assert report["absent_text"] == f"{absent}(...) -> ...", report["absent_text"]
+    assert report["absent_is_mutable"] is False
+    assert report["absent_is_view_op"] is False
+    assert absent in [entry[0] for entry in report["placeholders_listed"]], \
+        report["placeholders_listed"]
+    unanswered = {tuple(entry) for entry in report["unanswered"]}
+    assert (absent, "is_mutable") in unanswered, sorted(unanswered)[:10]
+    assert (absent, "_is_view_op()") in unanswered, sorted(unanswered)[:10]
+
+
+def test_no_operator_upstream_has_is_answered_from_an_empty_schema():
+    """The property the transcribed table exists to hold.
+
+    A predicate answered without text is only harmless while the op it is about
+    does not exist. Every op that *does* exist and gets asked has to have text,
+    or the answer is a claim about a real operator -- which is what
+    `aten::native_dropout_backward.out` was: mutable upstream, False here,
+    silently, because `torchgen` generates its schema at build time and no data
+    file in this tree carries it.
+
+    Stated as an equivalence over the recorded set rather than as a list of
+    ops. `verify_schemas.py --unanswered` is the half that needs a real torch:
+    it takes this same set and asks upstream whether each op exists. Here, with
+    no upstream available, what is checkable is that every recorded op is one
+    the shim itself has no text for by *either* route -- the file or the
+    transcribed tables -- so a regression that stops consulting one of them
+    shows up as a longer list.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    keys = _native_functions_keys()
+    table = _schema_table_keys()
+    leaked = []
+    for spelling, _predicate in report["unanswered"]:
+        qualname, _, overload = spelling.partition(".")
+        if not qualname.startswith("aten::"):
+            continue
+        if (qualname, overload) in keys or (qualname, overload) in table:
+            leaked.append(spelling)
+    assert leaked == [], sorted(set(leaked))[:10]
+    # `_fused_adam` and the sixteen beside it are in `_GENERATED_ATEN_SCHEMA_TEXT`
+    # now, so they must *not* be in the recorded set at all.
+    for gone in ("aten::native_dropout_backward.out",
+                 "aten::_native_batch_norm_legit_functional",
+                 "aten::_fused_adam",
+                 "aten::add"):
+        assert gone not in [s for s, _ in report["unanswered"]], gone
+
+
+def test_every_remaining_placeholder_is_an_op_the_source_really_lacks():
+    """Placeholder must mean "absent from the source", not "lookup missed".
+
+    `_shim_placeholder_schemas()` is the readable form of the gap, the same
+    shape as `_shim_registrations` and `_shim_overloads`. Asserting the list is
+    empty would be false -- `import torch` asks about 345 ops this build has no
+    text for, most of them `prims::` (defined through `Library.define` in
+    `torch/_prims`) and aten *packet* names with no default overload
+    (`aten::add` is `add.Tensor`/`add.Scalar` upstream and nothing else). So
+    what is asserted is the implication: every aten placeholder is a key
+    `native_functions.yaml` genuinely does not carry.
+
+    This is the check that fails for the defect that actually happened. The
+    first working version of this table keyed the default overload as `""` and
+    was asked for `"default"` by `torch/_library/effects.py:55`, so 201 aten
+    ops came back empty from a file that has every one of them. Both this test
+    and `test_every_implemented_op_has_schema_text` were green at the time --
+    the implemented 117 arrive spelled `""` -- and only the equivalence below
+    names the ones that did not.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    keys = _native_functions_keys()
+    table = _schema_table_keys()
+    wrongly_placeheld = []
+    for qualname, overload in report["placeholders_listed"]:
+        if not qualname.startswith("aten::"):
+            continue  # another namespace; the yaml says nothing about those
+        if (qualname, overload) in keys or (qualname, overload) in table:
+            wrongly_placeheld.append((qualname, overload))
+    assert wrongly_placeheld == [], wrongly_placeheld[:10]
+    # And the list is not empty for a trivial reason -- if nothing were ever
+    # asked, the implication above would hold vacuously.
+    assert len(report["placeholders_listed"]) > 100, len(report["placeholders_listed"])
+
+
+def test_an_in_place_variant_the_file_does_not_declare_is_not_an_operator():
+    """The registry stops inventing `<base>_`, and stops only that.
+
+    `torch/distributed/tensor/_ops/autogen.py:244` builds `f"{base_name}_"` and
+    asks the packet whether it is mutable, to discover whether an in-place
+    variant exists. Upstream answers AttributeError -- there is no
+    `aten::convolution_` -- and this shim answered with an operator carrying an
+    empty schema, so the question was answered by the absence of arguments
+    rather than by the operator. The schema layer cannot fix that; the packet
+    has to not exist.
+
+    `native_functions.yaml` is a sound oracle for exactly this question and not
+    for the general one. Measured on 2.13.0: of the 1348 names of the form
+    `<yaml base>_` the file does not declare, upstream registers none. Of the
+    aten names the file lacks *in general* there are 176, and `quantized_lstm`
+    is one -- `torch/__init__.py:2395` reads it unconditionally, so a rule
+    keyed on "absent from the file" stops `import torch` there. It did; that is
+    why the rule is the narrow one, and why `quantized_lstm` is asserted here
+    beside `convolution_`.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    _, report = _schema_road_fixture()
+    registry = report["registry"]
+    for absent in ("convolution_", "mm_"):
+        assert isinstance(registry[absent], str), (absent, registry[absent])
+        assert "no attribute" in registry[absent], (absent, registry[absent])
+    for present in ("add_", "relu_", "quantized_lstm", "zero"):
+        assert not isinstance(registry[present], str), (present, registry[present])
+
+
+def test_the_bare_shim_says_why_it_has_no_schema_table():
+    """No `torchgen` beside it, and it says so rather than answering False.
+
+    This file's `_C` is loaded from a staging directory with no vendored tree,
+    which is exactly the shape of a build where the data file went missing. The
+    contract is that the shim reports the absence -- `_shim_schema_source()`
+    returns the reason instead of a path -- and that predicates over the
+    schemas it consequently lacks refuse.
+    """
+    source = _C._shim_schema_source()
+    assert isinstance(source, str) and source, source
+    if source.endswith("native_functions.yaml"):
+        return  # a tree is on the path after all; the vendored tests cover it
+    assert "native_functions.yaml" in source, source
+    schema = _C._get_schema("aten::add_", "Tensor")
+    assert schema.is_placeholder is True
+    assert str(schema) == "aten::add_.Tensor(...) -> ..."
+    assert schema.is_mutable is False  # no text, so no writer to find
+    assert ("aten::add_.Tensor", "is_mutable") in _C._shim_unanswered_predicates()
+    # The transcribed tables still answer without the file, so the shim is not
+    # uniformly blind here -- `_c10d_functional` and the generated aten
+    # schemas are compiled into the artefact.
+    wired = _C._get_schema("_c10d_functional::all_reduce_", "")
+    assert wired.is_placeholder is False
+    assert wired.is_mutable is True
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):
