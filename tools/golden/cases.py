@@ -322,6 +322,146 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    cases.extend(_reduced_float_add_cases(torch_module, c_module, torch_call))
+
+    return cases
+
+
+# --- reduced-float exact narrowing -----------------------------------------
+#
+# torch computes `bfloat16`/`float16` arithmetic in `at::opmath_type` (float
+# for both) and narrows back **once**, with round-to-nearest-even. Getting
+# that wrong costs exactly one ulp per element, which every tolerance in
+# `tools/golden/dtypes.py` accepts -- so the cases below opt out of the
+# tolerance pipeline entirely and demand bit-exact agreement.
+#
+# Two things made this a live gap rather than a hypothetical one, and both
+# are why the cases look the way they do:
+#
+#   * **Size.** Every other case in this file is at most 24 elements. The
+#     shim's `bfloat16` add narrowed correctly below 32 elements and
+#     truncated at 32 and above (measured; docs/BF16.md §3), because the
+#     wrong rule lived on a vectorised path nothing here was big enough to
+#     reach. These probes are 64 and 256 elements on purpose.
+#   * **Values.** Tidy constants round the same way under every rule --
+#     0.5 + 0.25 cannot distinguish truncation from round-to-nearest. The
+#     probe below is an LCG so that a useful fraction of the exact sums land
+#     on or beside a narrowing boundary.
+#
+# The failure this guards against is not "slightly less accurate". A biased
+# narrowing pushes every rounded element the same direction, so a residual
+# stream accumulates it: docs/BF16.md measures it reaching an O(1) logit
+# difference and different generated text after 30 layers.
+_REDUCED_FLOAT_DTYPES = ["float16", "bfloat16"]
+
+
+def _reduced_float_probe(n: int, seed: int, scale: float = 1.0) -> list[float]:
+    out, state = [], seed
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append(round(((state / 2147483648.0) * 2.0 - 1.0) * scale, 6))
+    return out
+
+
+def _exact_value_check(t_res, c_res) -> tuple[bool, str]:
+    """dtype, shape, and every value bit-for-bit -- no tolerance.
+
+    Reduced-float values are exactly representable as Python floats, so
+    equality here really is bitwise and not an accident of formatting.
+    """
+    t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+    if t_dtype != c_dtype:
+        return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_shape = tuple(int(x) for x in t_res.shape)
+    c_shape = tuple(int(x) for x in c_res.shape)
+    if t_shape != c_shape:
+        return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+    t_vals = _flatten_values(t_res.tolist())
+    c_vals = _flatten_values(c_res.tolist())
+    wrong = [i for i, (t, c) in enumerate(zip(t_vals, c_vals)) if t != c]
+    if wrong:
+        i = wrong[0]
+        return False, (
+            f"not bit-exact: {len(wrong)}/{len(t_vals)} elements differ, first "
+            f"at index {i} (torch={t_vals[i]!r} c={c_vals[i]!r}); reduced-float "
+            f"arithmetic must narrow once, round-to-nearest-even"
+        )
+    return True, f"dtype={t_dtype} shape={t_shape}, all {len(t_vals)} values bit-exact"
+
+
+def _reduced_float_add_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+    for dtype_name in _REDUCED_FLOAT_DTYPES:
+        a64 = _reduced_float_probe(64, 20260828)
+        b64 = _reduced_float_probe(64, 7654321, scale=0.03125)
+        for shape, alpha, note in [
+            ((64,), None, "64 elements -- above the vectorised-path threshold"),
+            ((8, 8), None, "64 elements, 2-D"),
+            ((64,), 3.0, "64 elements, alpha=3 (alpha is applied in opmath too)"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, a64, shape, dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, b64, shape, dtype_name)
+            if alpha is None:
+                run_torch = lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t)
+                run_c = lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch("aten.add.Tensor", a_c, b_c)
+            else:
+                run_torch = lambda a_t=a_t, b_t=b_t, al=alpha: torch_call(a_t, b_t, alpha=al)
+                run_c = lambda a_c=a_c, b_c=b_c, al=alpha: c_module._aten_dispatch(
+                    "aten.add.Tensor", a_c, b_c, alpha=al
+                )
+            cases.append(
+                Case(
+                    name=f"add(dtype={dtype_name}, shape={shape}, alpha={alpha}) [exact narrowing: {note}]",
+                    op="aten.add.Tensor",
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    value_check=_exact_value_check,
+                    note="bit-exact, no tolerance -- see the section note above",
+                )
+            )
+        # Broadcast, because rotary embedding's add really is broadcast over
+        # the head axis and that is one of the two adds this bug corrupted.
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _reduced_float_probe(128, 4242), (2, 64), dtype_name
+        )
+        b_t, b_c = pair_from_flat(
+            torch_module, c_module, _reduced_float_probe(64, 99, scale=0.03125), (1, 64), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"add(dtype={dtype_name}, shape=(2, 64) + (1, 64)) [exact narrowing: broadcast]",
+                op="aten.add.Tensor",
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch("aten.add.Tensor", a_c, b_c),
+                value_check=_exact_value_check,
+                note="bit-exact, no tolerance -- see the section note above",
+            )
+        )
+    return cases
+
+
+def _reduced_float_reduce_cases(torch_module, c_module, op, torch_call) -> list[Case]:
+    """`sum`/`mean` accumulate in `acc_type<T>` -- float for both reduced
+    floats -- and narrow once. `cumsum_default` already states this rule in
+    its own doc comment; these check that the other two reductions obey it,
+    over a row long enough for the accumulator width to matter."""
+    cases: list[Case] = []
+    label = op.split(".")[1]
+    for dtype_name in _REDUCED_FLOAT_DTYPES:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _reduced_float_probe(256, 31337), (4, 64), dtype_name
+        )
+        for dim, keepdim in [([1], False), ([1], True), ([0], False)]:
+            cases.append(
+                Case(
+                    name=f"{label}(dtype={dtype_name}, shape=(4, 64), dim={dim}, keepdim={keepdim}) [exact narrowing]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, d=dim, k=keepdim: torch_call(a_t, d, k),
+                    run_c=lambda a_c=a_c, d=dim, k=keepdim: c_module._aten_dispatch(op, a_c, d, k),
+                    value_check=_exact_value_check,
+                    note="bit-exact, no tolerance -- reductions accumulate in float and narrow once",
+                )
+            )
     return cases
 
 
@@ -2087,6 +2227,194 @@ def index_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="x[bool_mask] -- boolean mask indexing, as in attention masking",
             )
         )
+    cases.extend(_multi_index_cases(torch_module, c_module, torch_call))
+    return cases
+
+
+# The rank-4 corpus for multi-tensor advanced indexing.
+#
+# Shape agreement is the weak half of this check; the value comparison is the
+# strong half. The failure this op invites is a result of exactly the right
+# shape with the axes in the wrong order: on a `(2,3,4,5)` tensor both
+# `x[i,:,j]` and `x[:,i,j]` give a rank-4 result, and a kernel that always
+# splices the broadcast block in place -- or always moves it to the front --
+# gets one of them right and silently transposes the other. `compare.py`'s
+# default pipeline compares every element, so these catch it; the cases where
+# that is the whole point say ORDER-SENSITIVE in their note.
+#
+# Everything here was measured against torch 2.13.0: shapes, values, and the
+# exact text of all four refusals.
+_MULTI_INDEX_SHAPE = (2, 3, 4, 5)
+
+
+def _multi_index_specs():
+    """(name, spec, note). A spec names index tensors as
+    `(flat, shape, dtype)` and un-indexed axes as `None`, so each backend
+    builds its own tensors instead of sharing one."""
+    i2 = ([0, 1], (2, 1), "int64")
+    j3 = ([0, 1, 2], (3,), "int64")
+    i2f = ([0, 1], (2,), "int64")
+    j2 = ([0, 2], (2,), "int64")
+    k2 = ([1, 3], (2,), "int64")
+    return [
+        ("adjacent-leading", [i2, j3], "broadcast (2,3) splices at axis 0"),
+        ("adjacent-middle", [None, i2, j3],
+         "ORDER-SENSITIVE: broadcast splices at axis 1, not at the front"),
+        ("adjacent-trailing", [None, None, i2f, j2],
+         "ORDER-SENSITIVE: broadcast splices at axis 2"),
+        ("separated-by-one", [i2, None, j3],
+         "ORDER-SENSITIVE: separated, so the broadcast moves to the FRONT"),
+        ("separated-by-two", [i2, None, None, j3],
+         "ORDER-SENSITIVE: separated by two axes, broadcast moves to the front"),
+        ("separated-outer", [None, i2, None, j3],
+         "ORDER-SENSITIVE: axes 1 and 3 indexed, broadcast moves to the front"),
+        ("three-adjacent", [i2f, j2, k2], "three index tensors, all adjacent"),
+        ("three-separated", [i2f, None, j2, k2],
+         "ORDER-SENSITIVE: three index tensors, the first separated from the rest"),
+        ("negative-indices", [([-1, 0], (2,), "int64"), ([0, 1], (2,), "int64")],
+         "negative indices wrap, as in Python"),
+        ("zero-dim-pair", [([1], (), "int64"), ([2], (), "int64")],
+         "0-d index tensors contribute no result axes"),
+        ("zero-dim-mixed", [([1], (), "int64"), j2], "0-d broadcast against 1-d"),
+        ("empty-pair", [([], (0,), "int64"), ([], (0,), "int64")],
+         "empty index tensors give a zero-length result axis"),
+        ("int32-index", [([0, 1], (2,), "int32"), j2],
+         "int32 is accepted alongside int64"),
+        ("single-index-unchanged", [i2f],
+         "the pre-existing single-index path must keep working"),
+    ]
+
+
+def _build_index_list(module, spec, is_c):
+    out = []
+    for entry in spec:
+        if entry is None:
+            out.append(None)
+            continue
+        flat, shape, dtype_name = entry
+        if is_c:
+            out.append(module._tensor_from_flat(list(flat), list(shape),
+                                                dtype=dt.c_dtype(module, dtype_name)))
+        else:
+            out.append(module.tensor(
+                list(flat), dtype=dt.torch_dtype(module, dtype_name)).reshape(list(shape)))
+    return out
+
+
+def _multi_index_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.index.Tensor"
+    cases: list[Case] = []
+    n = 1
+    for d in _MULTI_INDEX_SHAPE:
+        n *= d
+    flat = list(range(n))
+
+    for name, spec, note in _multi_index_specs():
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, _MULTI_INDEX_SHAPE, "float32")
+        cases.append(
+            Case(
+                name=f"index(rank-4, {name})",
+                op=op,
+                run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                    a_t, _build_index_list(torch_module, spec, False)),
+                run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                    op, a_c, _build_index_list(c_module, spec, True)),
+                note=note,
+            )
+        )
+
+    # Boolean masks, one of them mixed with an integer index. Built inside the
+    # lambdas for the same reason the single-mask case above is: `_C` cannot
+    # construct a bool tensor at case-list-build time without the failure
+    # taking down the whole harness run.
+    mask_specs = [
+        ("mask-1d", [True, False], (2,), None, "a rank-1 mask covers one axis"),
+        ("mask-2d", [True, False, True, False, True, False], (2, 3), None,
+         "a rank-2 mask covers two axes and yields one result axis"),
+        ("mask-plus-int", [True, False], (2,), ([0, 1, 2], (3,)),
+         "a mask's nonzero count broadcasts against an integer index"),
+    ]
+    # `uint8` is upstream's deprecated spelling of `bool`, NOT an integer
+    # index: `x[uint8([0, 1])]` gathers the *true* positions (one of them),
+    # giving a leading axis of 1, where reading it as an integer index would
+    # give a leading axis of 2 and different rows entirely. Measured on torch
+    # 2.13.0, which emits a deprecation warning confirming the mask reading.
+    cases.append(
+        Case(
+            name="index(rank-4, uint8-is-a-mask-not-an-index)",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor(flat, dtype=dt.torch_dtype(torch_module, "float32")).reshape(
+                    list(_MULTI_INDEX_SHAPE)),
+                [torch_module.tensor([0, 1], dtype=torch_module.uint8)],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat(flat, list(_MULTI_INDEX_SHAPE),
+                                           dtype=dt.c_dtype(c_module, "float32")),
+                [c_module._tensor_from_flat([0, 1], [2], dtype=c_module.uint8)],
+            ),
+            note="uint8 indexes as a boolean mask (deprecated spelling), not by value",
+        )
+    )
+    for name, mask_flat, mask_shape, extra, note in mask_specs:
+        def run(module, is_c, mask_flat=mask_flat, mask_shape=mask_shape, extra=extra):
+            if is_c:
+                base = module._tensor_from_flat(flat, list(_MULTI_INDEX_SHAPE),
+                                                dtype=dt.c_dtype(module, "float32"))
+                idx = [module._tensor_from_flat([int(v) for v in mask_flat],
+                                                list(mask_shape), dtype=module.bool)]
+                if extra is not None:
+                    idx.append(module._tensor_from_flat(list(extra[0]), list(extra[1]),
+                                                        dtype=module.int64))
+                return module._aten_dispatch(op, base, idx)
+            base = module.tensor(flat, dtype=dt.torch_dtype(module, "float32")).reshape(
+                list(_MULTI_INDEX_SHAPE))
+            idx = [module.tensor(mask_flat).reshape(list(mask_shape))]
+            if extra is not None:
+                idx.append(module.tensor(list(extra[0])).reshape(list(extra[1])))
+            return torch_call(base, idx)
+        cases.append(
+            Case(
+                name=f"index(rank-4, {name})",
+                op=op,
+                run_torch=lambda run=run: run(torch_module, False),
+                run_c=lambda run=run: run(c_module, True),
+                note=note,
+            )
+        )
+
+    # The four refusals, each measured on upstream first. `both_error` rather
+    # than `c_error`: upstream raises here too, and the point is that the shim
+    # does not compute where upstream declines to.
+    refusals = [
+        ("incompatible-broadcast",
+         [([0, 1], (2,), "int64"), ([0, 1, 2], (3,), "int64")],
+         "IndexError: shape mismatch -- (2,) and (3,) do not broadcast"),
+        ("out-of-range",
+         [([0, 1], (2,), "int64"), ([0, 7], (2,), "int64")],
+         "IndexError: 7 is out of bounds for dimension 1, which has size 3"),
+        ("negative-out-of-range",
+         [([-3], (1,), "int64"), ([0], (1,), "int64")],
+         "IndexError: -3 is out of bounds for dimension 0, which has size 2"),
+        ("too-many-indices",
+         [([0], (1,), "int64")] * 5,
+         "IndexError: too many indices for a rank-4 tensor"),
+    ]
+    for name, spec, note in refusals:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, _MULTI_INDEX_SHAPE, "float32")
+        cases.append(
+            Case(
+                name=f"index(rank-4, {name})",
+                op=op,
+                run_torch=lambda a_t=a_t, spec=spec: torch_call(
+                    a_t, _build_index_list(torch_module, spec, False)),
+                run_c=lambda a_c=a_c, spec=spec: c_module._aten_dispatch(
+                    op, a_c, _build_index_list(c_module, spec, True)),
+                expect="both_error",
+                note=note,
+            )
+        )
     return cases
 
 
@@ -2490,6 +2818,7 @@ def mean_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="duplicate dim index -- both sides must refuse",
             )
         )
+    cases.extend(_reduced_float_reduce_cases(torch_module, c_module, op, torch_call))
     return cases
 
 
@@ -2550,6 +2879,7 @@ def sum_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="duplicate dim index -- both sides must refuse",
             )
         )
+    cases.extend(_reduced_float_reduce_cases(torch_module, c_module, op, torch_call))
     return cases
 
 

@@ -4981,40 +4981,54 @@ def test_greedy_generate_matches_upstream_token_for_token():
         assert 1 < new <= _GQA_NEW_TOKENS, (attn, got["generated"])
 
 
-# Which attention implementations reach the end of `generate()`. The *forward*
-# works on both (the test above proves it); `generate` does not, and the
-# difference is one op, named in `test_eager_generate_stops_at_index_tensor`.
-_GENERATE_PATHS = ("sdpa",)
+# Which attention implementations reach the end of `generate()`.
+#
+# `eager` joined `sdpa` here when `aten.index.Tensor` learned multi-tensor
+# advanced indexing (docs/BF16.md §5). The wall it used to be behind was
+# reached from the eager mask builder, not from any attention kernel, which
+# is why the *forward* had always worked on both while `generate` worked on
+# only one. `test_eager_generate_stops_at_index_tensor_and_says_so` used to
+# pin that refusal by name and was deleted rather than relaxed: the thing it
+# described no longer happens, and a test kept alive by weakening its
+# assertion stops being evidence of anything.
+_GENERATE_PATHS = ("sdpa", "eager")
 
 
-def test_eager_generate_stops_at_index_tensor_and_says_so():
-    """The wall `generate(attn_implementation="eager")` is still behind.
+def test_eager_generate_reaches_the_end_and_uses_multi_tensor_indexing():
+    """`generate(attn_implementation="eager")` completes, and for the reason
+    claimed.
 
-    This is a `c_error`-shaped test in the sense docs/TORCH_C.md gives the
-    term: upstream completes, the shim refuses, and the refusal is pinned by
-    name so that it stays a work item instead of becoming folklore. Two
-    things would break it, and both should:
-
-      * the shim learns multi-tensor advanced indexing -- then this fails and
-        `eager` belongs in `_GENERATE_PATHS`, where the real comparison is;
-      * `generate` starts failing somewhere EARLIER -- then the op name in
-        the message changes and this fails too, rather than quietly agreeing
-        that eager still does not work.
-
-    The wall is `aten.index.Tensor` with more than one index tensor, reached
-    from `GenerationMixin._prefill` (`generation/utils.py:2868`) through the
-    eager mask builder. It is not an attention kernel and it is not
-    reachable from the eager *forward*, which is why the forward comparison
-    above passes on both implementations while this one does not.
+    The completion alone is checked by
+    `test_greedy_generate_matches_upstream_token_for_token`, which now runs
+    both paths. What this adds is the *why*: it calls the op that used to be
+    the wall, with the shape the eager mask builder calls it with (measured:
+    `self` bool `(1, kv)`, indices `(1,1,1,1)` and `(1,1,1,kv)`, both int64),
+    so that "eager generates now" cannot be satisfied by `generate` quietly
+    taking some other route.
     """
     if not _ckpt_shim_available() or _upstream_transformers is None:
         return
     got = _gqa_road_fixture("eager")
-    # The forward has to have succeeded, or this is testing the wrong thing.
     assert got["forward"] == "OK", got["forward"]
-    assert got["generate"].startswith("FAILED"), got["generate"][:200]
-    assert "aten.index.Tensor" in got["generate"], got["generate"][-400:]
-    assert "more than one index tensor" in got["generate"], got["generate"][-400:]
+    assert got["generate"] == "OK", got["generate"][:400]
+
+    # The call the mask builder makes, at the shape it makes it.
+    kv = 4
+    mask = _C._tensor_from_flat([1, 1, 0, 1], [1, kv], dtype=_C.bool)
+    batch = _C._tensor_from_flat([0], [1, 1, 1, 1], dtype=_C.int64)
+    keys = _C._tensor_from_flat(list(range(kv)), [1, 1, 1, kv], dtype=_C.int64)
+    out = _C._aten_dispatch("aten.index.Tensor", mask, [batch, keys])
+    assert out.tolist() == [[[[True, True, False, True]]]], out.tolist()
+
+    if _upstream_torch is not None:
+        want = _upstream_torch.ops.aten.index.Tensor(
+            _upstream_torch.tensor([[True, True, False, True]]),
+            [
+                _upstream_torch.tensor([0]).reshape(1, 1, 1, 1),
+                _upstream_torch.arange(kv).reshape(1, 1, 1, kv),
+            ],
+        )
+        assert out.tolist() == want.tolist(), (out.tolist(), want.tolist())
 
 
 def test_the_two_grouped_attention_walls_are_refused_by_name_not_by_shape():
@@ -6404,6 +6418,168 @@ def test_the_bare_shim_says_why_it_has_no_schema_table():
     wired = _C._get_schema("_c10d_functional::all_reduce_", "")
     assert wired.is_placeholder is False
     assert wired.is_mutable is True
+
+
+# --- reduced-float rounding -------------------------------------------------
+#
+# torch computes reduced-float arithmetic in `at::opmath_type` -- `float` for
+# both `bfloat16` and `float16` -- and narrows back **once**, at the end, with
+# round-to-nearest-even. A kernel that instead computes in the storage dtype,
+# or that narrows by truncating, lands within one ulp of the right answer on
+# every element, and is therefore invisible to every tolerance-based check in
+# this repository: the golden harness compares with
+# `tools/golden/dtypes.py::TOLERANCES`, and one bfloat16 ulp is far inside it.
+#
+# It is not invisible in a model, because the error does not cancel. A biased
+# narrowing pushes every rounded element the same way, so 30 residual layers
+# accumulate it instead of averaging it out. docs/BF16.md measures exactly
+# that: the shim's `add` truncated, the divergence reached an O(1) logit
+# difference, and SmolLM2-135M produced different text from upstream on the
+# **default** dtype path.
+#
+# So these tests assert **exact** agreement. That is the only bound that can
+# tell "one ulp because addition is hard" apart from "one ulp every time, in
+# the same direction". They are also the reason the fix is checkable at all:
+# a tolerance here would pass both the right kernel and the wrong one.
+_REDUCED_FLOATS = ("bfloat16", "float16")
+
+
+def _rounding_operands(n):
+    """Two deterministic operand lists whose exact sums land on bfloat16
+    rounding boundaries often enough to be decisive.
+
+    Not "nice" numbers: 0.5 + 0.25 rounds the same way under every rule, so a
+    probe built from tidy constants cannot fail. These come from the same LCG
+    the end-to-end tests use, at two magnitudes, so that roughly a quarter of
+    the pairs have a tie or near-tie in the discarded bits.
+    """
+    a = _e2e_det(n, 20260828)
+    b = [v * 0.03125 for v in _e2e_det(n, 7654321)]
+    return a, b
+
+
+def _reduced_float_cases(b, dtype, n=256):
+    """The op calls this section checks, built on one backend."""
+    x = b.t(_rounding_operands(n)[0], (n,), dtype)
+    y = b.t(_rounding_operands(n)[1], (n,), dtype)
+    grid = b.t(_rounding_operands(n)[0], (16, 16), dtype)
+    return {
+        # The op the model actually rides on: every residual join and the
+        # `(q*cos) + (rotate_half(q)*sin)` of rotary embedding is this one.
+        "add.Tensor": lambda: b.op("aten.add.Tensor", x, y),
+        "add.Tensor alpha": lambda: b.op("aten.add.Tensor", x, y, alpha=3.0),
+        "add.Scalar": lambda: b.op("aten.add.Scalar", x, 0.3),
+        "sub.Tensor": lambda: b.op("aten.sub.Tensor", x, y),
+        "mul.Tensor": lambda: b.op("aten.mul.Tensor", x, y),
+        "div.Tensor": lambda: b.op("aten.div.Tensor", x, y),
+        # Reductions accumulate in `acc_type<T>` upstream, which is `float`
+        # for both reduced floats -- the same rule `cumsum_default` already
+        # states in its doc comment.
+        "sum.dim_IntList": lambda: b.op("aten.sum.dim_IntList", grid, [1], False),
+        "mean.dim": lambda: b.op("aten.mean.dim", grid, [1], False),
+    }
+
+
+def _flat_values(result):
+    out = []
+    stack = [result.tolist()]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(reversed(item))
+        else:
+            out.append(item)
+    return out
+
+
+def test_reduced_float_arithmetic_narrows_exactly_like_upstream():
+    """Every reduced-float op agrees with upstream to the last bit.
+
+    Exact, not close. See the section comment for why a tolerance here would
+    be a check that cannot fail.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    for dtype in _REDUCED_FLOATS:
+        shim = _reduced_float_cases(_E2EBackend("shim"), dtype)
+        upstream = _reduced_float_cases(_E2EBackend("upstream"), dtype)
+        for name in upstream:
+            want = _flat_values(upstream[name]())
+            got = _flat_values(shim[name]())
+            assert len(got) == len(want), (dtype, name, len(got), len(want))
+            wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+            assert not wrong, (
+                f"{dtype} {name}: {len(wrong)}/{len(want)} elements differ from "
+                f"upstream; first at {wrong[0]} "
+                f"(shim {got[wrong[0]]!r} vs upstream {want[wrong[0]]!r})"
+            )
+
+
+def test_reduced_float_operands_survive_construction():
+    """The premise of the test above: both sides start from the same bits.
+
+    Without this, a narrowing bug in `_tensor_from_flat` would show up as a
+    difference in every op downstream and be misread as an arithmetic bug.
+    """
+    if _upstream_torch is None:
+        return
+    for dtype in _REDUCED_FLOATS:
+        for flat in _rounding_operands(256):
+            got = _flat_values(_E2EBackend("shim").t(flat, (256,), dtype))
+            want = _flat_values(_E2EBackend("upstream").t(flat, (256,), dtype))
+            assert got == want, dtype
+
+
+def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
+    """Names the wrong rule, so the test fails if the shim adopts it.
+
+    Each pair below is exactly halfway between two representable bfloat16
+    values, which is where round-to-nearest-even and truncation disagree by
+    construction. `truncated` is what this shim returned before docs/BF16.md
+    -- it is asserted *against*, so that a regression to the old behaviour
+    fails here with the rule named rather than as a drift somewhere in a
+    model.
+
+    Upstream is still consulted for the expected value; the literals are a
+    second opinion, not the source of truth (`tools/golden/cases.py`'s `_pair`
+    note is the standing rule).
+
+    **The length matters and is the reason this went unseen.** Measured: the
+    same four pairs narrow correctly at 31 elements and incorrectly at 32, so
+    the wrong rule lived on a vectorised path that only ran on tensors bigger
+    than any case in `tools/golden/cases.py`. Both lengths are asserted here;
+    testing only the short one is testing the path that was never broken.
+    """
+    # (a, b, round-to-nearest-even sum, truncated sum)
+    ties = [
+        (-0.69140625, -0.228515625, -0.921875, -0.91796875),
+        (0.189453125, 0.030761719, 0.220703125, 0.2197265625),
+        (-0.48046875, 0.020019531, -0.4609375, -0.458984375),
+        (0.85546875, -0.000652313, 0.85546875, 0.8515625),
+    ]
+
+    def sums(backend, reps):
+        rows = ties * reps
+        n = len(rows)
+        return _flat_values(
+            backend.op(
+                "aten.add.Tensor",
+                backend.t([r[0] for r in rows], (n,), "bfloat16"),
+                backend.t([r[1] for r in rows], (n,), "bfloat16"),
+            )
+        )
+
+    shim = _E2EBackend("shim")
+    for reps in (1, 16):  # 4 elements (scalar path) and 64 (vectorised path)
+        rows = ties * reps
+        got = sums(shim, reps)
+        assert got == [r[2] for r in rows], (reps, got[:8])
+        assert got != [r[3] for r in rows], (
+            f"shim truncates instead of rounding to nearest even at "
+            f"{len(rows)} elements"
+        )
+        if _upstream_torch is not None:
+            assert got == sums(_E2EBackend("upstream"), reps), reps
 
 
 def _main():
