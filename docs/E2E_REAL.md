@@ -1,5 +1,18 @@
 # 진짜 모델을 끝까지 — `print(tensor)` 와 순전파
 
+> **§6.2 와 §7 의 1·2 번, §9 의 3 번은 뒤에 나온 측정으로 바뀌었습니다 — `docs/CKPT2.md`.**
+> `UntypedStorage.from_file` 이 구현되어 **`from_pretrained` 가 가중치를 읽습니다.**
+> 상류가 쓴 체크포인트를 네 경로(safetensors mmap/bytes, `.bin` mmap/no-mmap) 전부로 읽어
+> 가중치가 **비트 단위로 일치**하고, 순전파 로짓이 상류와 **2.235e-08** 입니다.
+> 허브의 진짜 사전학습 모델(SmolLM2-135M, 273 텐서)도 **가중치는 전부 읽습니다**;
+> 그 모델의 순전파는 커널 둘이 남아 아직 안 됩니다(CKPT2.md §7.1).
+> **§7 의 미측정 항목 셋** — shared tensor · sharded index · `_metadata` — 도
+> 전부 측정되어 통과했습니다(CKPT2.md §6).
+>
+> 아래 §6.2 의 한 문장은 그 자리에서 **틀렸습니다**: `disable_mmap=True` 가 우회하지
+> 못하는 것은 `.bin` 경로뿐이고, safetensors 쪽은 그때 이미 21/21 텐서를 읽고 있었으며
+> 막고 있던 것은 `torch.empty_like` 였습니다. CKPT2.md §3.1 에 그 회차별 진행이 있습니다.
+
 `docs/DISTRIBUTED.md` 가 열어 둔 자리에서 이어지는 작업의 기록입니다. 그 회차는
 `AutoModelForCausalLM.from_config(...)` 로 **진짜 `LlamaForCausalLM` 을 만드는 데까지** 갔고,
 두 가지에서 멈췄습니다 — 순전파가 `torch._C.is_autocast_enabled` 에서 죽었고,

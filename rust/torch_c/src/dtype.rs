@@ -169,6 +169,36 @@ pub const ALIASES: &[(&str, TorchDType)] = &[
 ];
 
 impl TorchDType {
+    /// The name torch's *C++* `ScalarType` prints, which is not the Python one.
+    ///
+    /// `torch.uint8` is `Byte` in a C++ error message, `torch.float32` is
+    /// `Float`, `torch.int64` is `Long`. This exists because `aten::view.dtype`
+    /// raises from C++ and its message names both dtypes -- "must be divisible
+    /// by 4 to view Byte as Float" -- and a shim that reproduced the sentence
+    /// but not the vocabulary would hand callers a message that is upstream's
+    /// everywhere except where it identifies the problem.
+    ///
+    /// Only the dtypes this build can hold are spelled out; the rest fall back
+    /// to the Python name, which is what a caller who reaches them will
+    /// already have been told by `storage()`'s refusal. All measured on 2.13.0.
+    pub fn cpp_name(self) -> &'static str {
+        match self {
+            Float32 => "Float",
+            Float64 => "Double",
+            Float16 => "Half",
+            BFloat16 => "BFloat16",
+            UInt8 => "Byte",
+            Int8 => "Char",
+            Int16 => "Short",
+            Int32 => "Int",
+            Int64 => "Long",
+            UInt32 => "UInt32",
+            Bool => "Bool",
+            Float8E4M3FN => "Float8_e4m3fn",
+            other => other.name(),
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Float32 => "float32",

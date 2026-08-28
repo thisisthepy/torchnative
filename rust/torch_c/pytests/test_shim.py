@@ -1740,11 +1740,23 @@ except NotImplementedError as e:
     result["legacy_refused"] = True
     result["legacy_error"] = str(e)
 
+# safetensors' *default* backend. docs/CKPT.md §3.1 recorded this refusing --
+# it goes through `UntypedStorage.from_file`, which did not exist -- and
+# docs/CKPT2.md §2 is the round that implemented it. What is recorded now is
+# not "it works" but "it agrees": a third reader of the same file, reaching the
+# bytes by a third route (whole-file storage, sliced, `asarray`, `view.dtype`),
+# has to land on the same numbers as the two docs/CKPT.md §1 already compared.
 try:
-    load_file(os.path.join(d, "tiny.safetensors"), backend="mmap")
-    result["mmap_refused"] = False
-except NotImplementedError:
-    result["mmap_refused"] = True
+    sd_mm = load_file(os.path.join(d, "tiny.safetensors"), backend="mmap")
+    result["mmap_backend"] = "OK"
+    result["mmap_vs_pread_worst"] = max(
+        max(abs(x - y) for x, y in zip(
+            sd_st[k].reshape(-1).tolist(), sd_mm[k].reshape(-1).tolist()))
+        for k in sd_st
+    )
+    _, result["mmap_logit_diff"] = logit_diff(sd_mm)
+except BaseException as e:
+    result["mmap_backend"] = "%s: %s" % (type(e).__name__, str(e)[:200])
 
 s = torch.UntypedStorage(16)
 t = torch.empty((0,), dtype=torch.float32)
@@ -1943,18 +1955,32 @@ def test_ckpt_safetensors_two_readers_agree_with_torch_load_bit_for_bit():
     assert r["negative_control_diff"] > 1e-3, r["negative_control_diff"]
 
 
-def test_ckpt_legacy_format_and_mmap_backend_are_refused_by_name():
-    # docs/CKPT.md §3.3, §4: legacy (non-zip) torch.load and safetensors'
-    # default mmap backend are the two paths this shim does NOT implement,
-    # and both must refuse loudly (NotImplementedError) rather than silently
-    # produce zeros or wrong data. The legacy refusal is the `filled` guard
-    # firing transitively through `_rebuild_tensor` -> `set_`.
+def test_ckpt_legacy_format_is_refused_by_name_and_the_mmap_backend_agrees():
+    """The two halves of this used to be one claim, and are now opposites.
+
+    docs/CKPT.md §3.3 listed legacy `torch.load` and safetensors' default mmap
+    backend together, as the two paths that refused. They were never the same
+    kind of thing, and docs/CKPT2.md §2 separated them:
+
+      * **legacy stays refused, and must.** Its container fills the storage
+        *after* `set_`, and this shim's `set_` copies, so an implementation
+        that did not refuse would return a state dict of `0.0` with no error
+        (docs/CKPT.md §4). The refusal is the `filled` guard firing through
+        `_rebuild_tensor` -> `set_`, so this also checks the guard is what is
+        doing it, by message.
+      * **mmap is implemented, so the assertion becomes agreement.** It reads
+        the same file by a third route, and the bar is bit-for-bit equality
+        with the `pread` backend -- the same `== 0.0` §1 holds the other two
+        readers to. "It returned tensors" would pass on garbage.
+    """
     if not _ckpt_shim_available():
         return
     r = _ckpt_fixture()
     assert r["legacy_refused"], "legacy (non-zip) torch.load did NOT refuse -- check for zeros!"
     assert "never been filled" in r["legacy_error"], r["legacy_error"]
-    assert r["mmap_refused"], "safetensors mmap backend did NOT refuse"
+    assert r["mmap_backend"] == "OK", r["mmap_backend"]
+    assert r["mmap_vs_pread_worst"] == 0.0, r["mmap_vs_pread_worst"]
+    assert r["mmap_logit_diff"] < _E2E_LOGIT_ATOL, r["mmap_logit_diff"]
 
 
 def test_ckpt_filled_guard_refuses_set_on_unfilled_storage_then_gathers_strided_views():
@@ -5058,6 +5084,472 @@ def test_capture_trace_hands_out_the_constants_it_burned_in():
     assert list(held.shape) == trace.constants[0]["shape"]
 
 
+# --- `from_pretrained` with real weights (docs/CKPT2.md) ---------------------
+#
+# docs/E2E_REAL.md §6.2 left `from_pretrained` stopped at
+# `torch.UntypedStorage.from_file`: the model was built, the weights were not
+# read. These tests are the other side of that line. They are deliberately not
+# "did it load" tests -- docs/CKPT.md §4 measured a load path that reported
+# `<All keys matched successfully>` with every weight at `0.0` and no exception
+# anywhere, so "it loaded" is exactly the claim that failure makes.
+#
+# The judgement here is values, at two depths:
+#
+#   * every loaded parameter is compared to upstream's, **bit for bit** -- this
+#     is what catches zeros, and also what catches an mmap offset that is off
+#     by a record header and hands back the neighbouring tensor's bytes;
+#   * the forward pass of the loaded model is compared to upstream's logits.
+#
+# and with a negative control, because a comparison that cannot fail is not a
+# comparison: the same model with its weights left at initialisation must be
+# *far* from the truth logits. If that control ever comes out close, the
+# comparison above is measuring nothing.
+
+_FROM_PRETRAINED_SCRIPT = r"""
+import json, os, sys, traceback
+import torch
+
+ST = sys.argv[1]      # safetensors checkpoint directory
+BIN = sys.argv[2]     # .bin checkpoint directory
+PAYLOAD = sys.argv[3] # a plain file of known bytes, for from_file itself
+IDS = json.loads(sys.argv[4])
+
+out = {}
+
+
+def flat(v):
+    if isinstance(v, list):
+        r = []
+        for e in v:
+            r.extend(flat(e))
+        return r
+    return [v]
+
+
+# --- `UntypedStorage.from_file` on its own, against the same file the
+# --- expected side measured upstream.
+n = os.path.getsize(PAYLOAD)
+ff = {}
+
+
+def probe(key, fn):
+    try:
+        ff[key] = fn()
+    except BaseException as e:
+        ff[key] = "%s: %s" % (type(e).__name__, str(e)[:200])
+
+
+probe("nbytes_full", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, n).nbytes())
+probe("nbytes_16", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, 16).nbytes())
+probe("nbytes_0", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, 0).nbytes())
+probe("kwargs", lambda: torch.UntypedStorage.from_file(PAYLOAD, shared=False, nbytes=8).nbytes())
+probe("default_nbytes", lambda: torch.UntypedStorage.from_file(PAYLOAD, False).nbytes())
+probe("first8", lambda: [torch.UntypedStorage.from_file(PAYLOAD, False, n)[i] for i in range(8)])
+probe("slice_16_24", lambda: [torch.UntypedStorage.from_file(PAYLOAD, False, n)[16:24][i] for i in range(8)])
+probe("slice_len_0", lambda: len(torch.UntypedStorage.from_file(PAYLOAD, False, n)[0:0]))
+probe("slice_clamped", lambda: len(torch.UntypedStorage.from_file(PAYLOAD, False, n)[n - 4:n + 8]))
+probe("slice_negative", lambda: len(torch.UntypedStorage.from_file(PAYLOAD, False, n)[-8:]))
+probe("slice_offset_ptr",
+      lambda: torch.UntypedStorage.from_file(PAYLOAD, False, n)[16:24].data_ptr()
+              - torch.UntypedStorage.from_file(PAYLOAD, False, n).data_ptr())
+probe("filename", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, n).filename)
+probe("element_size", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, n).element_size())
+probe("device", lambda: str(torch.UntypedStorage.from_file(PAYLOAD, False, n).device))
+probe("too_big", lambda: torch.UntypedStorage.from_file(PAYLOAD, False, n + 1).nbytes())
+probe("missing", lambda: torch.UntypedStorage.from_file(PAYLOAD + ".nope", False, 8).nbytes())
+probe("step_2", lambda: len(torch.UntypedStorage.from_file(PAYLOAD, False, n)[::2]))
+probe("shared_true", lambda: torch.UntypedStorage.from_file(PAYLOAD, True, n).nbytes())
+out["from_file"] = ff
+
+# --- `torch.load(mmap=True)` must agree with `mmap=False`, which docs/CKPT.md
+# --- already proved correct. This is the cross-check that an offset error
+# --- cannot survive: the two readers reach the payload by different routes.
+try:
+    ck = os.path.join(BIN, "pytorch_model.bin")
+    a = torch.load(ck, mmap=True, weights_only=True)
+    b = torch.load(ck, mmap=False, weights_only=True)
+    worst = 0.0
+    for k in sorted(b):
+        va, vb = flat(a[k].tolist()), flat(b[k].tolist())
+        if len(va) != len(vb):
+            raise AssertionError("shape drift on " + k)
+        for x, y in zip(va, vb):
+            worst = max(worst, abs(float(x) - float(y)))
+except BaseException:
+    out["mmap_vs_read"] = "FAILED: " + traceback.format_exc(limit=4)
+else:
+    out["mmap_vs_read"] = "OK"
+    out["mmap_vs_read_worst"] = worst
+    out["mmap_vs_read_keys"] = sorted(b)
+
+# --- `from_pretrained`, four ways.
+from transformers import AutoModelForCausalLM
+
+
+def load(tag, path, **kw):
+    try:
+        model = AutoModelForCausalLM.from_pretrained(path, **kw)
+        model.eval()
+        with torch.no_grad():
+            logits = model(torch.tensor([IDS])).logits
+        sd = {k: flat(v.tolist()) for k, v in sorted(model.state_dict().items())}
+    except BaseException:
+        out[tag] = "FAILED: " + traceback.format_exc(limit=6)
+    else:
+        out[tag] = "OK"
+        out[tag + "_shape"] = [int(d) for d in logits.shape]
+        out[tag + "_logits"] = flat(logits.tolist())
+        out[tag + "_argmax"] = [int(x) for x in logits[0].argmax(-1).tolist()]
+        out[tag + "_state_dict"] = sd
+
+
+load("st_mmap", ST)
+load("st_nommap", ST, disable_mmap=True)
+load("bin_mmap", BIN)
+load("bin_nommap", BIN, disable_mmap=True)
+
+# The three checkpoint *shapes* docs/E2E_REAL.md §6.2 listed as unmeasured,
+# plus bfloat16, which is what real checkpoints are actually stored in.
+for tag, sub in (("tied", "tied"), ("shard", "shard"), ("bf16", "bf16"),
+                 ("meta", "meta")):
+    load("hard_" + tag, os.path.join(sys.argv[5], sub))
+
+# --- the negative control: the same architecture, weights never loaded.
+try:
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    cfg = AutoModelForCausalLM.from_pretrained(ST).config if False else None
+    import json as _json
+    with open(os.path.join(ST, "config.json")) as fh:
+        raw = _json.load(fh)
+    fresh = AutoModelForCausalLM.from_config(LlamaConfig(**{
+        k: raw[k] for k in (
+            "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
+            "num_attention_heads", "num_key_value_heads", "max_position_embeddings",
+            "tie_word_embeddings") if k in raw}))
+    fresh.eval()
+    with torch.no_grad():
+        out["unloaded_logits"] = flat(fresh(torch.tensor([IDS])).logits.tolist())
+except BaseException:
+    out["unloaded_logits"] = "FAILED: " + traceback.format_exc(limit=4)
+
+json.dump(out, sys.stdout)
+"""
+
+
+_FROM_FILE_PAYLOAD = bytes(range(256)) * 4
+
+
+@functools.lru_cache(maxsize=1)
+def _from_pretrained_fixture():
+    """Write real checkpoints with upstream torch; read them with the shim.
+
+    Two interpreters for docs/CKPT.md §8.2's reason -- `from_pretrained` lives
+    in pure-Python `transformers` on top of pure-Python `torch`, so the shim
+    has to be `torch` by name, and a process has only one of those.
+
+    The expected side is computed here, on upstream torch, from the same
+    `_LLAMA_FILL` source text the rest of this file uses; nothing below is a
+    number copied out of a previous run.
+    """
+    torch = _upstream_torch
+    import shutil
+    import tempfile
+
+    from transformers import AutoModelForCausalLM
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    root = tempfile.mkdtemp(prefix="from-pretrained-")
+    st = os.path.join(root, "st")
+    binned = os.path.join(root, "bin")
+    payload = os.path.join(root, "payload.bin")
+    with open(payload, "wb") as fh:
+        fh.write(_FROM_FILE_PAYLOAD)
+
+    ns = {}
+    exec(_LLAMA_FILL, ns)
+    model = AutoModelForCausalLM.from_config(LlamaConfig(**_LLAMA_CFG))
+    model.eval()
+    ns["_fill"](model, torch)
+    with torch.no_grad():
+        logits = model(torch.tensor([_LLAMA_IDS])).logits
+
+    model.save_pretrained(st, safe_serialization=True)
+    # transformers 5 writes safetensors whatever `safe_serialization` says, so
+    # the `.bin` container -- the one that reaches `torch.load(mmap=True)` --
+    # is written directly.
+    os.makedirs(binned, exist_ok=True)
+    for name in ("config.json", "generation_config.json"):
+        src = os.path.join(st, name)
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(binned, name))
+    torch.save(model.state_dict(), os.path.join(binned, "pytorch_model.bin"))
+
+    expected = {
+        "logits": _e2e_flatten(logits.tolist()),
+        "shape": [int(d) for d in logits.shape],
+        "argmax": [int(x) for x in logits[0].argmax(-1).tolist()],
+        "state_dict": {
+            k: _e2e_flatten(v.tolist()) for k, v in sorted(model.state_dict().items())
+        },
+    }
+
+    # --- the checkpoint shapes docs/E2E_REAL.md §6.2 left unmeasured ---------
+    #
+    # Each is a *container* property, not a numeric one, and each has its own
+    # way of going quietly wrong:
+    #
+    #   tied   one storage, two state-dict keys. safetensors refuses to write
+    #          the duplicate and records it in the header instead, so a reader
+    #          that ignores that lands a model missing its lm_head.
+    #   shard  the weights are spread over N files behind an index. A reader
+    #          that stops after the first file gets a model that is mostly
+    #          freshly initialised -- and reports no error.
+    #   bf16   what real checkpoints are stored in, and the one case where the
+    #          bytes are not float32.
+    #   meta   `nn.Module.state_dict()` attaches a `_metadata` attribute that
+    #          `torch.save` pickles alongside the tensors.
+    hard = os.path.join(root, "hard")
+    for tag, kw, extra in (
+        ("tied", dict(tie_word_embeddings=True), {}),
+        ("shard", dict(num_hidden_layers=3), dict(max_shard_size="6KB")),
+        ("bf16", {}, {}),
+        ("meta", {}, {}),
+    ):
+        conf = dict(_LLAMA_CFG)
+        conf.update(kw)
+        m = AutoModelForCausalLM.from_config(LlamaConfig(**conf))
+        m.eval()
+        ns["_fill"](m, torch)
+        if tag == "bf16":
+            m = m.to(torch.bfloat16)
+        with torch.no_grad():
+            lg = m(torch.tensor([_LLAMA_IDS])).logits
+        expected["hard_" + tag] = {
+            "logits": _e2e_flatten(lg.float().tolist()),
+            "argmax": [int(x) for x in lg[0].argmax(-1).tolist()],
+            "state_dict": {
+                k: _e2e_flatten(v.float().tolist())
+                for k, v in sorted(m.state_dict().items())
+            },
+        }
+        d = os.path.join(hard, tag)
+        if tag == "meta":
+            # `save_pretrained` always writes safetensors on transformers 5,
+            # and safetensors has nowhere to put `_metadata`. The `.bin`
+            # container does, so this one is written by hand.
+            os.makedirs(d, exist_ok=True)
+            shutil.copy(os.path.join(st, "config.json"), os.path.join(d, "config.json"))
+            state = m.state_dict()
+            assert hasattr(state, "_metadata"), "state_dict() should carry _metadata"
+            torch.save(state, os.path.join(d, "pytorch_model.bin"))
+        else:
+            m.save_pretrained(d, **extra)
+    assert len([n for n in os.listdir(os.path.join(hard, "shard"))
+                if n.endswith(".safetensors")]) > 1, "the shard case must shard"
+
+    # The same `from_file` probes the subprocess runs, answered by upstream.
+    n = len(_FROM_FILE_PAYLOAD)
+    ff = {}
+
+    def probe(key, fn):
+        try:
+            ff[key] = fn()
+        except BaseException as e:  # noqa: BLE001
+            ff[key] = "%s: %s" % (type(e).__name__, str(e)[:200])
+
+    U = torch.UntypedStorage
+    probe("nbytes_full", lambda: U.from_file(payload, False, n).nbytes())
+    probe("nbytes_16", lambda: U.from_file(payload, False, 16).nbytes())
+    probe("nbytes_0", lambda: U.from_file(payload, False, 0).nbytes())
+    probe("kwargs", lambda: U.from_file(payload, shared=False, nbytes=8).nbytes())
+    probe("default_nbytes", lambda: U.from_file(payload, False).nbytes())
+    probe("first8", lambda: [U.from_file(payload, False, n)[i] for i in range(8)])
+    probe("slice_16_24", lambda: [U.from_file(payload, False, n)[16:24][i] for i in range(8)])
+    probe("slice_len_0", lambda: len(U.from_file(payload, False, n)[0:0]))
+    probe("slice_clamped", lambda: len(U.from_file(payload, False, n)[n - 4:n + 8]))
+    probe("slice_negative", lambda: len(U.from_file(payload, False, n)[-8:]))
+    probe("slice_offset_ptr",
+          lambda: U.from_file(payload, False, n)[16:24].data_ptr()
+                  - U.from_file(payload, False, n).data_ptr())
+    probe("filename", lambda: U.from_file(payload, False, n).filename)
+    probe("element_size", lambda: U.from_file(payload, False, n).element_size())
+    probe("device", lambda: str(U.from_file(payload, False, n).device))
+    expected["from_file"] = ff
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _FROM_PRETRAINED_SCRIPT, st, binned, payload,
+         json.dumps(_LLAMA_IDS), hard],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"from_pretrained subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return expected, json.loads(proc.stdout)
+
+
+def _worst_state_dict_drift(expected, got):
+    """Bit-for-bit, per parameter. Returns (worst, name-of-worst).
+
+    Not a tolerance: the shim reads the same little-endian float32 bytes
+    upstream wrote, so anything other than `0.0` here means the bytes that
+    arrived were not the bytes on disk.
+    """
+    assert sorted(expected) == sorted(got), (sorted(expected), sorted(got))
+    worst, where = 0.0, None
+    for k in sorted(expected):
+        a, b = expected[k], got[k]
+        assert len(a) == len(b), (k, len(a), len(b))
+        for x, y in zip(a, b):
+            d = abs(float(x) - float(y))
+            if d > worst:
+                worst, where = d, k
+    return worst, where
+
+
+def test_from_file_answers_what_upstream_answers_for_a_private_mapping():
+    """`from_file(shared=False)` is a private mapping, and this shim copies.
+
+    docs/CKPT2.md §2 has the measurement that makes copying the right answer
+    rather than a shortcut: upstream's default is `MAP_PRIVATE`, writes through
+    such a mapping never reach the file and are invisible to a second mapping,
+    so a read of the same bytes is observationally the same object. What is
+    asserted here is the observable surface, against upstream's own answers for
+    the same file -- sizes, contents, slicing, the offset arithmetic that
+    `torch/serialization.py` slices storages with, and the two errors.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    ff = got["from_file"]
+    for key, want in expected["from_file"].items():
+        assert ff[key] == want, (key, ff[key], want)
+    # The two refusals upstream raises are `RuntimeError`, and the shim must
+    # raise them too rather than hand back a short buffer or an empty one.
+    assert ff["too_big"].startswith("RuntimeError"), ff["too_big"]
+    assert ff["missing"].startswith("RuntimeError"), ff["missing"]
+    assert ff["step_2"].startswith("RuntimeError"), ff["step_2"]
+    # `shared=True` is the one thing here that cannot be copied: it means
+    # writes go back to the file. docs/CKPT2.md §2.1. Refused, by name.
+    assert isinstance(ff["shared_true"], str) and "shared" in ff["shared_true"], (
+        ff["shared_true"])
+
+
+def test_mmap_and_read_paths_of_torch_load_agree_on_every_tensor():
+    """Two routes to the same bytes, and they have to meet.
+
+    `mmap=False` goes through `zipfile.read`, which docs/CKPT.md validated.
+    `mmap=True` goes through `from_file` plus `get_record_offset` -- byte
+    arithmetic over the archive's local file headers. An offset that is wrong
+    by a header does not raise: it silently returns the neighbouring tensor.
+    Comparing the two routes is the check that arithmetic cannot dodge.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    _, got = _from_pretrained_fixture()
+    assert got["mmap_vs_read"] == "OK", got["mmap_vs_read"]
+    assert got["mmap_vs_read_worst"] == 0.0, got["mmap_vs_read_worst"]
+    assert len(got["mmap_vs_read_keys"]) > 0
+
+
+def test_from_pretrained_loads_the_real_weights_bit_for_bit_on_all_four_paths():
+    """The weights that arrive are the weights on disk -- not zeros, not neighbours.
+
+    Four routes reach the checkpoint and all four are asserted, because they
+    are genuinely different code: safetensors' mmap backend and its byte
+    backend, and `torch.load` with mmap on and off. docs/E2E_REAL.md §6.2 had
+    three of the four stopped at the same name.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    for tag in ("st_mmap", "st_nommap", "bin_mmap", "bin_nommap"):
+        assert got[tag] == "OK", (tag, got[tag])
+        worst, where = _worst_state_dict_drift(
+            expected["state_dict"], got[tag + "_state_dict"])
+        assert worst == 0.0, (tag, where, worst)
+
+
+def test_from_pretrained_forward_matches_upstream_logits():
+    """Loading is not the claim; computing the same answer is.
+
+    The bound is `_REAL_LLAMA_ATOL`, for the reason its own comment gives --
+    this is the same model at the same width, so the same sensitivity limit
+    applies and the file default would be ~20% of a logit.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    for tag in ("st_mmap", "st_nommap", "bin_mmap", "bin_nommap"):
+        assert got[tag] == "OK", (tag, got[tag])
+        assert got[tag + "_shape"] == expected["shape"], (tag, got[tag + "_shape"])
+        assert got[tag + "_argmax"] == expected["argmax"], (
+            tag, got[tag + "_argmax"], expected["argmax"])
+        diff = max(abs(a - b) for a, b in zip(got[tag + "_logits"], expected["logits"]))
+        assert diff < _REAL_LLAMA_ATOL, (tag, diff)
+
+
+def test_the_four_hard_checkpoint_shapes_load_with_the_right_weights():
+    """Shared tensors, shards, bfloat16, and a `_metadata` state dict.
+
+    docs/E2E_REAL.md §6.2 named the first, second and fourth of these as
+    unmeasured; docs/CKPT2.md §6 is the measurement. The bar is the same as the
+    plain case -- every parameter bit-for-bit against upstream's -- because
+    every one of these fails *quietly*: a reader that ignores safetensors'
+    shared-tensor header loses `lm_head` and initialises it fresh, and a reader
+    that stops at the first shard keeps only the layers in it. Neither raises.
+
+    **bfloat16 is asserted on weights only, and that is the honest bar.** Its
+    logits are compared separately and loosely below, because this build
+    upcasts `bf16` to `f32` inside several kernels (`aten.rs`), so it computes
+    the forward pass in *more* precision than upstream and the two are expected
+    to differ by roughly bf16's own resolution. The load is exact regardless,
+    which is what this test is about.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    for tag in ("tied", "shard", "bf16", "meta"):
+        key = "hard_" + tag
+        assert got[key] == "OK", (tag, got[key])
+        worst, where = _worst_state_dict_drift(
+            expected[key]["state_dict"], got[key + "_state_dict"])
+        assert worst == 0.0, (tag, where, worst)
+        assert got[key + "_argmax"] == expected[key]["argmax"], (
+            tag, got[key + "_argmax"], expected[key]["argmax"])
+        diff = max(abs(a - b)
+                   for a, b in zip(got[key + "_logits"], expected[key]["logits"]))
+        # bf16's ulp near 1.0 is ~0.0078; the measured divergence is 0.042 on
+        # logits whose scale is ~0.4, which is the accumulation difference
+        # described above rather than a load error. The other three are held to
+        # the same bound as the plain case.
+        bound = 0.1 if tag == "bf16" else _REAL_LLAMA_ATOL
+        assert diff < bound, (tag, diff)
+
+
+def test_an_unloaded_model_is_far_from_the_truth_logits():
+    """The negative control for the three tests above.
+
+    If a model that never read the checkpoint landed within `_REAL_LLAMA_ATOL`
+    of the truth, then those tests would pass whether or not any weight was
+    ever read, and docs/CKPT.md §4's failure -- a full state dict of `0.0` --
+    would sail through. The threshold is deliberately coarse: what is being
+    established is that loading moves the answer at all.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    unloaded = got["unloaded_logits"]
+    assert not isinstance(unloaded, str), unloaded
+    diff = max(abs(a - b) for a, b in zip(unloaded, expected["logits"]))
+    assert diff > 1e-3, diff
 
 
 def _main():
