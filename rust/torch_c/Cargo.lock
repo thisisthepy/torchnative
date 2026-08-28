@@ -1266,6 +1266,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "gemm",
+ "half",
  "pyo3",
 ]
 

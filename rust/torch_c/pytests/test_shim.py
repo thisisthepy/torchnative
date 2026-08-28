@@ -6582,6 +6582,188 @@ def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
             assert got == sums(_E2EBackend("upstream"), reps), reps
 
 
+# --- the fused reduced-float kernels (docs/DTYPE.md) ------------------------
+#
+# `rust/torch_c/src/reduced.rs` replaced two things the ops above used to do
+# through candle: the `{float16,bfloat16} <-> float32` conversions, and the
+# three-pass shape of widen / compute / narrow. Both are claimed to compute the
+# *same function* as before, only faster, and that claim is what the tests
+# below are for -- the speed is measured elsewhere, in docs/DTYPE.md.
+#
+# The interesting failure is not "wrong everywhere". A vectorised kernel that
+# handles eight elements per iteration with a scalar tail has three regions and
+# two boundaries, and a fault in the tail is invisible at any length that is a
+# multiple of eight. docs/BF16.md §2.3 records this repository losing a whole
+# class of defect to exactly that -- the wrong rounding rule lived on a path no
+# case in the golden harness was long enough to reach. So the lengths here
+# straddle the vector width deliberately rather than being round.
+
+# 7 is tail-only, 8 is body-only, 9..15 are body plus tail, and 1000/1001 are
+# long enough that a kernel carrying per-block state has room to lose it.
+_REDUCED_LENGTHS = (1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000, 1001)
+
+
+def _f32_from_bits(bits):
+    """A float32 by its bit pattern, widened to the Python float that carries
+    it. The payload survives the round trip -- checked on this host -- for
+    everything except a signalling NaN, which the hardware quiets."""
+    import struct
+
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def test_fused_reduced_float_arithmetic_matches_upstream_at_every_vector_boundary():
+    """add/sub/mul/div in both reduced floats, exactly, at 13 lengths.
+
+    All four ops rather than just `add` because the fused kernel is one
+    function with the arithmetic as a parameter: a fault in the widening or the
+    narrowing shows up in all four, and a fault in the dispatch shows up in
+    exactly one. Telling those apart is worth the extra assertions.
+    """
+    if _upstream_torch is None:
+        return
+    shim, up = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for n in _REDUCED_LENGTHS:
+            a, b = _rounding_operands(n)
+            # Nothing near zero in the divisor: division by zero is a different
+            # question from rounding and the golden cases already fix it.
+            b = [v if abs(v) > 1e-3 else 0.5 for v in b]
+            for op in ("add.Tensor", "sub.Tensor", "mul.Tensor", "div.Tensor"):
+                got = _flat_values(
+                    shim.op("aten." + op, shim.t(a, (n,), dtype), shim.t(b, (n,), dtype))
+                )
+                want = _flat_values(
+                    up.op("aten." + op, up.t(a, (n,), dtype), up.t(b, (n,), dtype))
+                )
+                wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+                assert not wrong, (
+                    f"{dtype} {op} n={n}: {len(wrong)}/{n} differ, first at "
+                    f"{wrong[0]} (shim {got[wrong[0]]!r} vs upstream "
+                    f"{want[wrong[0]]!r})"
+                )
+
+
+def test_fused_reduced_float_arithmetic_matches_upstream_when_an_operand_broadcasts():
+    """The rotary shape: a `(1, k)` table against an `(m, k)` activation.
+
+    The fused kernel materialises the broadcast operand rather than declining
+    it, so this is the arm where it could produce a correctly-shaped wrong
+    answer by pairing the wrong elements. A shape check would pass that.
+    """
+    if _upstream_torch is None:
+        return
+    shim, up = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for (m, k) in ((3, 40), (5, 8), (2, 1001)):
+            a, b = _rounding_operands(m * k)
+            row = b[:k]
+            for op in ("add.Tensor", "mul.Tensor"):
+                got = _flat_values(
+                    shim.op("aten." + op, shim.t(a, (m, k), dtype), shim.t(row, (1, k), dtype))
+                )
+                want = _flat_values(
+                    up.op("aten." + op, up.t(a, (m, k), dtype), up.t(row, (1, k), dtype))
+                )
+                assert got == want, (dtype, op, m, k)
+
+
+def test_reduced_float_arithmetic_matches_upstream_on_non_contiguous_operands():
+    """A transposed operand does not reach the fused kernel, and must not have
+    to. This pins that the fallback still agrees.
+
+    A transpose rather than a slice, because it leaves the layout
+    non-contiguous without changing the element count -- so a fast path that
+    ignored strides would read the right *number* of elements in the wrong
+    order and produce a wrong answer of the right shape.
+    """
+    if _upstream_torch is None:
+        return
+    shim, up = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        a, b = _rounding_operands(12 * 7)
+        xs = shim.t(a, (12, 7), dtype)
+        ys = shim.op("aten.t.default", shim.t(b, (7, 12), dtype))
+        xu = up.t(a, (12, 7), dtype)
+        yu = up.op("aten.t.default", up.t(b, (7, 12), dtype))
+        for op, swap in (("add.Tensor", False), ("mul.Tensor", True)):
+            l, r = (ys, xs) if swap else (xs, ys)
+            lu, ru = (yu, xu) if swap else (xu, yu)
+            got = _flat_values(shim.op("aten." + op, l, r))
+            want = _flat_values(up.op("aten." + op, lu, ru))
+            assert got == want, (dtype, op)
+
+
+def test_reduced_float_conversion_carries_the_values_no_shift_would():
+    """`_to_copy` both ways, over the values a plausible converter gets wrong.
+
+    The `bfloat16` narrowing in `reduced.rs` is integer arithmetic with a select
+    for NaN, and the select is not decoration: without it the rounding add turns
+    the signalling NaN `0x7f80_0001` into `0x7f80`, which reads back as
+    **infinity**. Subnormals, signed zero and the overflow edge are here for the
+    same reason -- they are where a converter that looks right stops agreeing.
+    """
+    if _upstream_torch is None:
+        return
+    specials = [
+        float("inf"), float("-inf"), 0.0, -0.0, 1.0, -1.0,
+        6.103515625e-05,        # smallest normal float16
+        5.960464477539063e-08,  # smallest subnormal float16
+        1e-45,                  # float32 subnormal: underflows both
+        65504.0, -65504.0,      # largest finite float16
+        65536.0,                # overflows float16 to inf, ordinary in bfloat16
+        3.3895313892515355e+38, # near the float32 top, finite in bfloat16
+        0.30000001192092896,
+        -0.69140625,
+    ]
+    # A length that is not a multiple of eight, so the scalar tail converts too.
+    flat = specials + [i * 0.007 - 0.5 for i in range(13)]
+    n = len(flat)
+    shim, up = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        got = _flat_values(shim.t(flat, (n,), dtype))
+        want = _flat_values(up.t(flat, (n,), dtype))
+        assert repr(got) == repr(want), (dtype, "narrowing", got, want)
+        back_got = _flat_values(
+            shim.op("aten._to_copy.default", shim.t(flat, (n,), dtype), dtype=_C.float32)
+        )
+        back_want = _flat_values(
+            up.op(
+                "aten._to_copy.default",
+                up.t(flat, (n,), dtype),
+                dtype=_upstream_torch.float32,
+            )
+        )
+        assert repr(back_got) == repr(back_want), (dtype, "widening")
+        # NaN separately: it does not compare equal to itself, so the checks
+        # above would pass whatever came back for it. The payloads are the
+        # point. `0x7fff_ffff` is a NaN whose mantissa is all ones, and the
+        # rounding add alone carries into the exponent and turns it into
+        # `0x8000` -- **negative zero**, silently, for a value that was not a
+        # number. The quiet default `0x7fc0_0000` does *not* expose that, so a
+        # NaN probe built from `float("nan")` passes either way; measured.
+        nans = [
+            _f32_from_bits(0x7FFFFFFF),
+            _f32_from_bits(0xFFFFFFFF),
+            _f32_from_bits(0x7F800001),  # signalling; the host quiets it
+            float("nan"),
+        ] * 3  # 12 elements, so the vectorised body runs and the tail does not
+        narrowed = shim.op(
+            "aten._to_copy.default",
+            shim.t(nans, (12,), "float32"),
+            dtype=getattr(_C, dtype),
+        )
+        for where, side in (
+            ("narrowed", _flat_values(narrowed)),
+            (
+                "widened",
+                _flat_values(shim.op("aten._to_copy.default", narrowed, dtype=_C.float32)),
+            ),
+        ):
+            bad = [(i, v) for i, v in enumerate(side) if v == v]
+            assert not bad, f"{dtype} {where}: NaN came back as {bad}"
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

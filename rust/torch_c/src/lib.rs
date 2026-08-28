@@ -35,6 +35,7 @@ mod device;
 mod dtype;
 mod err;
 mod info;
+mod reduced;
 mod rng;
 mod storage;
 mod tensor;
