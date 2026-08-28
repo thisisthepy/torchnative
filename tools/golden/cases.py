@@ -1497,6 +1497,135 @@ def mul_cases(torch_module, c_module, torch_call) -> list[Case]:
             [200, 200], (2,), [100, 2], (2,), "uint8 overflow wraps (both sides modular)",
         )
     )
+    cases.extend(_mul_promotion_cases(torch_module, c_module, torch_call))
+    return cases
+
+
+# --- mul.Tensor dtype promotion ---------------------------------------------
+#
+# `mul.Tensor` promotes; `add`/`sub`/`div` in this shim still refuse through
+# `same_dtype`. That split is not tidiness, it is the "no unmeasured
+# implementation" rule (docs/E2E_REAL.md §1.2): `generate()` on a real
+# pretrained model reaches exactly one promoting multiply and no promoting
+# add. transformers' `_prepare_attention_mask_for_generation` computes
+#
+#     attention_mask_from_padding * can_infer_attention_mask
+#         + default_attention_mask * ~can_infer_attention_mask
+#
+# where each `*` has an `int64` left operand (`.long()`) and a 0-D `bool`
+# right one (`.any()`), and the `+` joining them is int64 with int64. Read
+# off the running model, not the source: a `TorchDispatchMode` over
+# `model.generate` reports `aten.mul.Tensor(int64, bool)` and
+# `aten.add.Tensor(int64, int64)`.
+#
+# The table is `torch.promote_types` over every dtype `TorchDType::storage()`
+# can hold, measured on 2.13.0 and separately checked cell by cell against
+# `mul.Tensor`'s OWN result dtype -- they agree in every cell where both are
+# defined, which is why one rule can serve both. Two rows are the ones a
+# plausible-looking shortcut gets wrong:
+#
+#     int64 x float16    -> float16    an integral operand never widens a float
+#     float16 x bfloat16 -> float32    two reduced floats promote OUT, not to
+#                                      either input
+#
+# `uint32` mixed with `bool` or a signed integer is a real UPSTREAM refusal
+# ("Promotion for uint16, uint32, uint64 types is not supported"), not a shim
+# gap, so those cells are `both_error` -- a shim that promoted them would
+# answer where torch raises.
+
+_PROMOTE_DTYPES = ["bool", "uint8", "uint32", "int16", "int32", "int64",
+                   "float16", "bfloat16", "float32", "float64"]
+
+# The cells upstream refuses. Measured, not derived: every other cell of the
+# 10x10 is expected to compute, and compare.py checks dtype, shape and value
+# against upstream directly rather than against any table written here.
+_PROMOTE_FLOATS = {"float16", "bfloat16", "float32", "float64"}
+_PROMOTE_REFUSED = {
+    (a, b)
+    for a in _PROMOTE_DTYPES
+    for b in _PROMOTE_DTYPES
+    if "uint32" in (a, b) and a != b and not ({a, b} & _PROMOTE_FLOATS)
+}
+
+# The rows worth naming in the report, so the rule is legible without running
+# the harness. Checked by the sweep below like every other cell; listed here
+# only so a reader sees which way each one goes.
+_PROMOTE_NOTABLE = {
+    ("int64", "bool"): "int64 -- the cell generate() actually needs",
+    ("bool", "int64"): "int64 -- and it is symmetric",
+    ("bool", "bool"): "bool -- product IS logical and under the 0/1 invariant",
+    ("int64", "float16"): "float16 -- an INTEGRAL operand never widens a float",
+    ("float16", "bfloat16"): "float32 -- two reduced floats promote OUT",
+    ("uint8", "int16"): "int16 -- unsigned meets signed",
+    ("float32", "float64"): "float64 -- the ordinary widening",
+    ("bool", "float32"): "float32 -- bool is the bottom of the lattice",
+}
+
+
+def _promote_flat(dtype_name: str, which: str) -> list[int]:
+    """Small exact operands, representable in every dtype of the sweep.
+
+    Deliberately not `_deterministic`: `bool` can only hold 0/1 and `uint8`
+    only non-negatives, and the point of these cases is the dtype of the
+    result, so the values are chosen to be exact everywhere and to make a
+    *wrong* promotion visible in the values too -- `bool` operands carry a
+    zero, so reading them as anything but 0/1 changes the product.
+    """
+    if dtype_name == "bool":
+        return [1, 0, 1, 1] if which == "a" else [1, 1, 0, 1]
+    return [1, 2, 3, 4] if which == "a" else [3, 0, 2, 1]
+
+
+def _mul_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mul.Tensor"
+    cases: list[Case] = []
+    for a_dtype in _PROMOTE_DTYPES:
+        for b_dtype in _PROMOTE_DTYPES:
+            refused = (a_dtype, b_dtype) in _PROMOTE_REFUSED
+            note = _PROMOTE_NOTABLE.get((a_dtype, b_dtype), "")
+            if refused:
+                note = ("upstream refuses: no promotion for uint16/uint32/uint64 -- "
+                        "the shim refuses by name rather than answering")
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, _promote_flat(a_dtype, "a"), (2, 2), a_dtype
+            )
+            b_t, b_c = pair_from_flat(
+                torch_module, c_module, _promote_flat(b_dtype, "b"), (2, 2), b_dtype
+            )
+            cases.append(
+                Case(
+                    name=f"mul.Tensor(promote {a_dtype} x {b_dtype})"
+                         + (f" [{note}]" if note else ""),
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                    run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                    expect="both_error" if refused else "match",
+                    note=note,
+                )
+            )
+
+    # The call site verbatim, at its real shape: an `int64` (1, N) mask times
+    # a 0-D `bool`. The 0-D right operand is what makes this more than another
+    # cell of the sweep -- it broadcasts AND promotes at once, and a kernel
+    # that promoted by casting the result back to the *left* operand's shape
+    # would still pass the (2,2) x (2,2) cells.
+    for flag, note in [(1, "can_infer=True -> the padding mask survives"),
+                       (0, "can_infer=False -> the padding mask is zeroed")]:
+        mask_t, mask_c = pair_from_flat(
+            torch_module, c_module, [1, 1, 0, 1], (1, 4), "int64"
+        )
+        flag_t, flag_c = pair_from_flat(torch_module, c_module, [flag], (), "bool")
+        cases.append(
+            Case(
+                name=f"mul.Tensor(int64 (1,4) x 0-D bool={bool(flag)}) [{note}]",
+                op=op,
+                run_torch=lambda mask_t=mask_t, flag_t=flag_t: torch_call(mask_t, flag_t),
+                run_c=lambda mask_c=mask_c, flag_c=flag_c: c_module._aten_dispatch(
+                    op, mask_c, flag_c
+                ),
+                note="_prepare_attention_mask_for_generation verbatim -- " + note,
+            )
+        )
     return cases
 
 
@@ -1563,6 +1692,89 @@ def bitwise_and_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                 [0b1100, 0b1010, 0b1111, 0], (2, 2), [0b1010, 0b0110, 0b0000, 0b1111], (2, 2), "elementwise AND",
             )
         )
+
+    # --- dtype promotion -----------------------------------------------------
+    #
+    # The second promoting op, found the same way as the first: by running
+    # `generate()` and reading where it stopped. Past
+    # `_prepare_attention_mask_for_generation` (which needed `mul.Tensor`),
+    # the sampling loop's own stopping condition is
+    #
+    #     unfinished_sequences = unfinished_sequences & ~stopping_criteria(...)
+    #
+    # at `generation/utils.py:2936` -- `int64 & bool`, because
+    # `unfinished_sequences` is `torch.ones(..., dtype=torch.long)` and the
+    # criteria return `bool`.
+    #
+    # `bitwise_and.Tensor` and `bitwise_or.Tensor` were BOTH re-measured
+    # against `torch.promote_types` over the storable dtypes and agree with
+    # it in every cell, so the same table serves both. Only `and` is wired,
+    # because only `and` has a measured caller; the `or` cases below stay
+    # `c_error` and say why, so the day a caller turns up the gap is already
+    # written down rather than rediscovered.
+    #
+    # A floating operand is refused by UPSTREAM here, not by the shim --
+    # `"bitwise_and_cpu" not implemented for 'Float'` -- so promotion
+    # reaching a float dtype has to end in a refusal on both sides rather
+    # than in an answer.
+    for a_dtype, b_dtype, note in [
+        ("int64", "bool", "int64 -- the cell generate() actually needs"),
+        ("bool", "int64", "int64 -- and it is symmetric"),
+        ("uint8", "int16", "int16 -- unsigned meets signed"),
+        ("int16", "int64", "int64 -- the ordinary widening"),
+        ("bool", "uint8", "uint8 -- bool is the bottom of the lattice here too"),
+    ]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(a_dtype, "a"), (2, 2), a_dtype
+        )
+        b_t, b_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(b_dtype, "b"), (2, 2), b_dtype
+        )
+        cases.append(
+            Case(
+                name=f"bitwise_and.Tensor(promote {a_dtype} x {b_dtype}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note=note,
+            )
+        )
+    for a_dtype, b_dtype, note in [
+        ("float32", "bool", "upstream: \"bitwise_and_cpu\" not implemented for 'Float'"),
+        ("int64", "uint32", "upstream has no promotion for uint32 against a signed int"),
+    ]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(a_dtype, "a"), (2, 2), a_dtype
+        )
+        b_t, b_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(b_dtype, "b"), (2, 2), b_dtype
+        )
+        cases.append(
+            Case(
+                name=f"bitwise_and.Tensor(promote {a_dtype} x {b_dtype} -- refused by both)",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    # The call site verbatim: a 1-element `int64` counter ANDed with a `bool`
+    # from the stopping criteria.
+    for flag, note in [(1, "not finished -- the counter survives"),
+                       (0, "finished -- the counter is cleared")]:
+        uf_t, uf_c = pair_from_flat(torch_module, c_module, [1], (1,), "int64")
+        st_t, st_c = pair_from_flat(torch_module, c_module, [flag], (1,), "bool")
+        cases.append(
+            Case(
+                name=f"bitwise_and.Tensor(int64 counter & bool={bool(flag)}) [{note}]",
+                op=op,
+                run_torch=lambda uf_t=uf_t, st_t=st_t: torch_call(uf_t, st_t),
+                run_c=lambda uf_c=uf_c, st_c=st_c: c_module._aten_dispatch(op, uf_c, st_c),
+                note="generation/utils.py:2936 verbatim -- " + note,
+            )
+        )
     return cases
 
 
@@ -1587,6 +1799,38 @@ def bitwise_or_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             _binary_tensor_case(
                 torch_module, c_module, op, torch_call, dtype_name,
                 [0b1100, 0b1010, 0b0000, 0], (2, 2), [0b0010, 0b0100, 0b1111, 0b0001], (2, 2), "elementwise OR",
+            )
+        )
+
+    # The deliberate asymmetry with `bitwise_and`, pinned so it stays
+    # deliberate. `or` was measured to follow the SAME promotion table as
+    # `and` -- both agree with `torch.promote_types` in every storable cell --
+    # and it is left refusing only because no measured caller reaches it
+    # (docs/E2E_REAL.md §1.2). If a caller turns up, wiring it is one word in
+    # `bitwise_binary` and these cases become "match".
+    #
+    # `c_error` and not "both_error": torch computes here, and recording it
+    # as a mutual refusal would misdescribe which side is missing something.
+    for a_dtype, b_dtype, upstream in [
+        ("int64", "bool", "int64"),
+        ("uint8", "int16", "int16"),
+    ]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(a_dtype, "a"), (2, 2), a_dtype
+        )
+        b_t, b_c = pair_from_flat(
+            torch_module, c_module, _promote_flat(b_dtype, "b"), (2, 2), b_dtype
+        )
+        cases.append(
+            Case(
+                name=f"bitwise_or.Tensor(promote {a_dtype} x {b_dtype} -- torch gives "
+                     f"{upstream}, the shim refuses)",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                expect="c_error",
+                note="same table as bitwise_and, wired only for bitwise_and because only "
+                     "bitwise_and has a measured caller",
             )
         )
     return cases
@@ -3395,6 +3639,155 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: 'Attention mask is the same data type as query'.",
         )
     )
+    cases.extend(_sdpa_gqa_cases(torch_module, c_module, torch_call))
+    return cases
+
+
+# --- grouped-query attention: the aten op broadcasts the KV head dimension ---
+#
+# SmolLM2-135M is `num_attention_heads=9, num_key_value_heads=3`, so a real
+# pretrained forward goes down this path and nothing in the Llama/GPT-2 work
+# before it did (docs/CKPT2.md §7.1).
+#
+# Where the repetition belongs was MEASURED, and the answer is "here, in the
+# aten op" -- not in `F.scaled_dot_product_attention`:
+#
+#   * a `TorchDispatchMode` over `F.scaled_dot_product_attention(q, k, v,
+#     enable_gqa=True)` with q=(2,9,4,8) and k=v=(2,3,4,8) reports exactly one
+#     op, `aten._scaled_dot_product_flash_attention_for_cpu.default`, with the
+#     key and value STILL (2,3,4,8). Nothing repeats them on the way in.
+#   * calling the aten op directly with those mismatched shapes -- no
+#     `enable_gqa` argument exists at this level -- answers (2,9,4,8), and
+#     matches `enable_gqa=True` to 0.0.
+#
+# So the aten op always broadcasts and has no flag; `enable_gqa` is a
+# validation switch in the Python-level wrapper, and that half is tested in
+# rust/torch_c/pytests/test_shim.py where the wrapper lives.
+#
+# **Which repetition** is the part that fails plausibly rather than loudly.
+# Measured three ways on q=(2,9,4,8), k=v=(2,3,4,8):
+#
+#     repeat_interleave(3, dim=1)             0.0
+#     transformers' repeat_kv (expand+reshape) 0.0
+#     repeat(1, 3, 1, 1)  ("tile")             2.82
+#
+# Both correct spellings give query head `i` the key/value head `i // 3`;
+# tiling gives it `i % 3`. Tiling produces a same-shaped, same-magnitude,
+# entirely wrong answer -- the failure mode docs/ARCH.md's `gelu` note calls
+# out, where the logits look fine and are not. The two GQA cases below are
+# built so that the two readings disagree: `n_rep` is 3 and every KV head
+# carries different numbers, so `i // 3` and `i % 3` select different rows
+# for six of the nine query heads.
+
+
+def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+    cases: list[Case] = []
+    b, e = 1, 4
+
+    for h_q, h_kv, t, s, is_causal, note in [
+        (9, 3, 4, 4, False, "SmolLM2-135M's own head counts: 9 query heads, 3 KV heads"),
+        (9, 3, 4, 4, True, "the same, causal -- the mask is per (row, col), not per head"),
+        (4, 1, 3, 3, False, "multi-query attention: ONE KV head broadcast to all four"),
+        (2, 2, 3, 3, False, "n_rep == 1 -- the matched case must not regress"),
+        (6, 3, 2, 5, True, "kv longer than q AND grouped: both broadcasts at once"),
+    ]:
+        q_flat = _deterministic(b * h_q * t * e, 11)
+        k_flat = _deterministic(b * h_kv * s * e, 12)
+        v_flat = _deterministic(b * h_kv * s * e, 13)
+        for dtype_name in ["float64", "float32"]:
+            q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, (b, h_q, t, e), dtype_name)
+            k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, (b, h_kv, s, e), dtype_name)
+            v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, (b, h_kv, s, e), dtype_name)
+            cases.append(
+                Case(
+                    name=f"sdpa_flash_cpu(GQA dtype={dtype_name}, h_q={h_q}, h_kv={h_kv}, "
+                         f"t={t}, s={s}, is_causal={is_causal}) [{note}]",
+                    op=op,
+                    run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t, is_causal=is_causal: torch_call(
+                        q_t, k_t, v_t, 0.0, is_causal
+                    ),
+                    run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c, is_causal=is_causal: (
+                        c_module._aten_dispatch(op, q_c, k_c, v_c, 0.0, is_causal)
+                    ),
+                    value_check=_sdpa_pair_check,
+                    note=note,
+                )
+            )
+
+    # A grouped call with an additive mask, because the mask is indexed by
+    # (batch, head, row, col) and a kernel that repeated the heads AFTER
+    # adding the mask would broadcast a (1,1,T,S) mask fine and a per-head
+    # one wrong. This mask is per-head over the NINE query heads, which only
+    # exists after the repetition.
+    h_q, h_kv, t, s = 9, 3, 4, 4
+    q_flat = _deterministic(b * h_q * t * e, 11)
+    k_flat = _deterministic(b * h_kv * s * e, 12)
+    v_flat = _deterministic(b * h_kv * s * e, 13)
+    mask_flat = _deterministic(b * h_q * t * s, 14)
+    for dtype_name in ["float64", "float32"]:
+        q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, (b, h_q, t, e), dtype_name)
+        k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, (b, h_kv, s, e), dtype_name)
+        v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, (b, h_kv, s, e), dtype_name)
+        m_t, m_c = pair_from_flat(torch_module, c_module, mask_flat, (b, h_q, t, s), dtype_name)
+        cases.append(
+            Case(
+                name=f"sdpa_flash_cpu(GQA dtype={dtype_name}, PER-QUERY-HEAD attn_mask)",
+                op=op,
+                run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t, m_t=m_t: torch_call(
+                    q_t, k_t, v_t, 0.0, False, attn_mask=m_t
+                ),
+                run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c, m_c=m_c: c_module._aten_dispatch(
+                    op, q_c, k_c, v_c, 0.0, False, attn_mask=m_c
+                ),
+                value_check=_sdpa_pair_check,
+                note="the mask has 9 head rows, which only exist after the KV heads are "
+                     "repeated -- pins the ORDER of repetition and masking",
+            )
+        )
+
+    # Non-divisible head counts. The aten op does not refuse these -- it
+    # answers, deterministically, and the answer is partly garbage. Measured
+    # per query head against `kv_head = q_head // (h_q // h_kv)`:
+    #
+    #     h_q=9 h_kv=4   heads 0..7 agree to 0.0, head 8 differs by 0.93
+    #     h_q=9 h_kv=2   heads 0..7 agree to 0.0, head 8 differs by 2.28
+    #     h_q=6 h_kv=4   heads 0..3 agree to 0.0, head 4 by 0.78,
+    #                    head 5 by 2.38e+31
+    #
+    # That is the same rule as the divisible case for the first
+    # `h_kv * (h_q // h_kv)` heads and an out-of-bounds read for the
+    # remainder -- 2.38e+31 is not a number an attention output can take with
+    # unit-magnitude inputs. So there is nothing here to reproduce, and the
+    # shim refuses by name instead. `c_error`, not `both_error`: torch really
+    # does return a tensor, and pretending otherwise would misdescribe it.
+    #
+    # This is reachable only by calling the aten op directly. Every caller
+    # that goes through `F.scaled_dot_product_attention` is stopped one layer
+    # up by the divisibility check, which upstream also has and which
+    # test_shim.py covers.
+    for h_q, h_kv, note in [
+        (9, 2, "remainder head reads past the end of the KV tensor"),
+        (9, 4, "same, one leftover head"),
+        (4, 6, "more KV heads than query heads -- no repetition exists"),
+    ]:
+        q_flat = _deterministic(b * h_q * 3 * e, 21)
+        kv_flat = _deterministic(b * h_kv * 3 * e, 22)
+        q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, (b, h_q, 3, e), "float64")
+        k_t, k_c = pair_from_flat(torch_module, c_module, kv_flat, (b, h_kv, 3, e), "float64")
+        cases.append(
+            Case(
+                name=f"sdpa_flash_cpu(h_q={h_q}, h_kv={h_kv} -- NOT divisible) [{note}]",
+                op=op,
+                run_torch=lambda q_t=q_t, k_t=k_t: torch_call(q_t, k_t, k_t, 0.0, False),
+                run_c=lambda q_c=q_c, k_c=k_c: c_module._aten_dispatch(
+                    op, q_c, k_c, k_c, 0.0, False
+                ),
+                expect="c_error",
+                note="torch answers with a partly out-of-bounds result; the shim refuses "
+                     "by name rather than reproducing uninitialised memory -- " + note,
+            )
+        )
     return cases
 
 
@@ -5686,6 +6079,235 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([0.0], (), "float32"), ([-3.4028234663852886e38], (), "float32"),
             note="the causal-mask idiom verbatim: a (1,1,S,S) bool mask selecting between "
                  "two 0-D scalar_tensor results",
+        )
+    )
+    return cases
+
+
+# --- aten.where.ScalarOther --------------------------------------------------
+#
+# `torch.where(mask, tensor, python_scalar)`. transformers' `eager_mask`
+# reaches it verbatim -- `masking_utils.py:603` is
+#
+#     mask = torch.where(mask, torch.tensor(0.0, device=..., dtype=dtype), min_dtype)
+#
+# with `min_dtype = torch.finfo(dtype).min`, a Python float. It was the one
+# op standing between this shim and a real pretrained model's EAGER forward
+# (docs/CKPT2.md §7.1).
+#
+# What the overload does was measured, not read off the schema. A
+# `TorchDispatchMode` over the call above reports
+#
+#     aten.scalar_tensor.default(-3.5, dtype=<PROMOTED dtype>)
+#     aten.where.self(cond, self, that)
+#
+# -- the scalar becomes a 0-D tensor *at the promoted dtype*, and then it is
+# ordinary `where.self` with matched branches. The kernel does the same two
+# steps rather than growing a third select path.
+#
+# The promotion is torch's "wrapped number" rule and every cell below was
+# measured on 2.13.0. Three of them break a plausible-looking shortcut:
+#
+#   float16 tensor + FLOAT scalar   -> float16, not float32. A Python float
+#                                      does not widen a float tensor.
+#   int64 tensor + FLOAT scalar     -> float32 (the DEFAULT float), not
+#                                      float64 and not int64.
+#   bool tensor + `True`            -> bool, but bool tensor + `1` -> int64.
+#                                      Same numeric value, different Python
+#                                      TYPE, different answer -- which is why
+#                                      the kernel inspects the raw object for
+#                                      `PyBool` instead of reading the shim's
+#                                      `Scalar`, whose `Int`/`Float` split
+#                                      folds `bool` into `Int`.
+
+# (tensor dtype, scalar, upstream result dtype). Measured.
+_WHERE_SCALAR_OTHER_PROMOTION = [
+    ("bool", True, "bool"),
+    ("bool", False, "bool"),
+    ("bool", 1, "int64"),
+    ("bool", 3, "int64"),
+    ("bool", 2.5, "float32"),
+    ("uint8", True, "uint8"),
+    ("uint8", 7, "uint8"),
+    ("uint8", 2.5, "float32"),
+    ("int16", 7, "int16"),
+    ("int16", 2.5, "float32"),
+    ("int32", 7, "int32"),
+    ("int32", 2.5, "float32"),
+    ("int64", True, "int64"),
+    ("int64", 7, "int64"),
+    ("int64", 2.5, "float32"),
+    ("float16", True, "float16"),
+    ("float16", 7, "float16"),
+    ("float16", 2.5, "float16"),
+    ("bfloat16", 7, "bfloat16"),
+    ("bfloat16", 2.5, "bfloat16"),
+    ("float32", 7, "float32"),
+    ("float32", 2.5, "float32"),
+    ("float64", 7, "float64"),
+    ("float64", 2.5, "float64"),
+]
+
+
+def _where_scalar_other_case(torch_module, c_module, torch_call, cond, self_, scalar,
+                             expect="match", note="") -> Case:
+    """`cond`/`self_` are `(flat, shape, dtype_name)` triples; `scalar` is a
+    plain Python number and is passed through untouched, because its Python
+    type is part of what the op reads."""
+    op = "aten.where.ScalarOther"
+
+    def build(index):
+        return tuple(
+            _pair(torch_module, c_module, flat, shape, dtype_name)[index]
+            for flat, shape, dtype_name in (cond, self_)
+        )
+
+    return Case(
+        name=f"where.ScalarOther(cond={cond[1]}/{cond[2]}, self={self_[1]}/{self_[2]}, "
+             f"other={scalar!r}:{type(scalar).__name__}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(*build(0), scalar),
+        run_c=lambda: c_module._aten_dispatch(op, *build(1), scalar),
+        expect=expect,
+        note=note,
+    )
+
+
+def where_scalar_other_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+    mask4 = ([1, 0, 1, 0], (4,), "bool")
+
+    for dtype_name, scalar, upstream in _WHERE_SCALAR_OTHER_PROMOTION:
+        flat = [1, 0, 1, 1] if dtype_name == "bool" else [1, 2, 3, 4]
+        cases.append(
+            _where_scalar_other_case(
+                torch_module, c_module, torch_call, mask4, (flat, (4,), dtype_name), scalar,
+                note=f"{dtype_name} tensor with a {type(scalar).__name__} scalar "
+                     f"-> {upstream}",
+            )
+        )
+
+    # The idiom itself, at both dtypes SmolLM2-135M can arrive in. `finfo.min`
+    # is the actual argument `eager_mask` passes and it sits exactly ON the
+    # dtype's boundary, which is where an overflow check written with `>=`
+    # instead of `>` would refuse a call upstream answers.
+    for dtype_name, min_value in [
+        ("float32", -3.4028234663852886e38),
+        ("bfloat16", -3.3895313892515355e38),
+    ]:
+        cases.append(
+            _where_scalar_other_case(
+                torch_module, c_module, torch_call,
+                ([1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1], (1, 1, 4, 4), "bool"),
+                ([0.0], (), dtype_name), min_value,
+                note="masking_utils.py:603 verbatim -- a (1,1,S,S) bool mask, a 0-D 0.0, "
+                     "and finfo(dtype).min ON the dtype boundary",
+            )
+        )
+
+    # Shapes. The 0-D `self` above already covers the branch carrying no
+    # shape; these cover the other direction and the empty case.
+    for self_, note in [
+        (([1.0, 2.0, 3.0, 4.0], (2, 2), "float32"), "self shaped, cond shaped, equal"),
+        (([], (0,), "float32"), "empty in, empty out -- not an error"),
+    ]:
+        cond = ([1, 0, 1, 0], (2, 2), "bool") if self_[1] == (2, 2) else ([], (0,), "bool")
+        cases.append(
+            _where_scalar_other_case(
+                torch_module, c_module, torch_call, cond, self_, -1.0, note=note
+            )
+        )
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call,
+            ([1, 0, 1], (3,), "bool"), ([1.0, 2.0], (2,), "float32"), 0.0,
+            expect="both_error", note="shapes that do not broadcast are refused by both",
+        )
+    )
+
+    # The condition's dtype rule is `where.self`'s, re-measured here rather
+    # than inherited: `uint8` is answered (with a deprecation warning
+    # upstream), everything else non-bool is refused.
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, ([2, 0, 5, 0], (4,), "uint8"),
+            ([1.0, 2.0, 3.0, 4.0], (4,), "float32"), 3.0,
+            note="uint8 condition is ACCEPTED and read as truthiness, same as where.self",
+        )
+    )
+    for cond_dtype in ["int64", "float32"]:
+        cases.append(
+            _where_scalar_other_case(
+                torch_module, c_module, torch_call, ([1, 0, 1, 0], (4,), cond_dtype),
+                ([1.0, 2.0, 3.0, 4.0], (4,), "float32"), 0.0, expect="both_error",
+                note=f"a {cond_dtype} condition is refused -- only bool and (deprecated) uint8",
+            )
+        )
+
+    # A scalar that does not fit the promoted dtype. Upstream converts through
+    # the same checked path `scalar_tensor` uses, so the two answers have to
+    # agree on BOTH sides of the boundary -- `-1` into `uint8` wraps to 255
+    # and is answered, `300` overflows and is refused.
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, mask4, ([1, 2, 3, 4], (4,), "uint8"), -1,
+            note="-1 into uint8 WRAPS to 255 and is answered (two's complement allowance)",
+        )
+    )
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, mask4, ([1, 2, 3, 4], (4,), "uint8"), 300,
+            expect="both_error",
+            note="300 does not fit uint8: 'value cannot be converted to type uint8_t "
+                 "without overflow' on both sides",
+        )
+    )
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, mask4, ([1, 2, 3, 4], (4,), "int16"), 2 ** 40,
+            expect="both_error", note="2**40 does not fit int16 -- refused by both",
+        )
+    )
+
+    # The unselected branch is never read for its value: `nan` in the scalar
+    # position is not contagious when the condition is all-true. Same property
+    # `where.self` pins, re-measured for this overload.
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, ([1, 1], (2,), "bool"),
+            ([1.0, 2.0], (2,), "float32"), float("nan"),
+            note="the UNSELECTED scalar branch is not contagious -- the result is [1., 2.]",
+        )
+    )
+    cases.append(
+        _where_scalar_other_case(
+            torch_module, c_module, torch_call, ([0, 0], (2,), "bool"),
+            ([1.0, 2.0], (2,), "float32"), float("-inf"),
+            note="-inf IS selected when the condition is false -- selected, not blended",
+        )
+    )
+
+    # `other` as a 0-D tensor. `scalar_arg` accepts one everywhere else in
+    # this shim (torch takes a 0-D tensor wherever a `Scalar` is taken), but
+    # this overload is the exception: upstream's own binding refuses it
+    # ("aten::where() Expected a value of type 'number' for argument 'other'
+    # but instead found type Tensor"), measured. Answering it would compute
+    # where torch raises.
+    def _tensor_other(index):
+        cond_t = _pair(torch_module, c_module, [1, 0], (2,), "bool")[index]
+        self_t = _pair(torch_module, c_module, [1.0, 2.0], (2,), "float32")[index]
+        other_t = _pair(torch_module, c_module, [3.0], (), "float32")[index]
+        return cond_t, self_t, other_t
+
+    cases.append(
+        Case(
+            name="where.ScalarOther(other given as a 0-D TENSOR -- refused by both)",
+            op="aten.where.ScalarOther",
+            run_torch=lambda: torch_call(*_tensor_other(0)),
+            run_c=lambda: c_module._aten_dispatch("aten.where.ScalarOther", *_tensor_other(1)),
+            expect="both_error",
+            note="upstream's binding wants a number here even though a 0-D tensor is a "
+                 "Scalar everywhere else; the shim refuses for the same reason",
         )
     )
     return cases
@@ -8043,6 +8665,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.le.Tensor": le_tensor_cases,
     "aten.scalar_tensor.default": scalar_tensor_cases,
     "aten.where.self": where_self_cases,
+    # The eager attention mask's own op (docs/GENERATE.md): `torch.where(mask,
+    # tensor, python_scalar)` at masking_utils.py:603.
+    "aten.where.ScalarOther": where_scalar_other_cases,
     "aten.permute.default": permute_cases,
     "aten.stack.default": stack_cases,
     "aten.relu.default": relu_cases,

@@ -3182,16 +3182,41 @@ def _install_nn(module, dispatch) -> None:
                 "converts it with aten.scalar_tensor.default and aten.where.self "
                 "before calling flash attention; neither has a kernel"
             )
+        # Grouped-query attention. The repetition itself is NOT here -- it is
+        # in the aten kernel, because that is where upstream does it: a
+        # TorchDispatchMode over `enable_gqa=True` reports one op, with the
+        # key and value still at their original head count (see
+        # `repeat_kv_heads` in aten.rs for the measurement). What lives at
+        # this level is the two checks upstream does at this level, both
+        # measured on 2.13.0:
+        #
+        #   enable_gqa=False, mismatched heads
+        #       "The size of tensor a (9) must match the size of tensor b (3)
+        #        at non-singleton dimension 1"
+        #   enable_gqa=True, head counts that do not divide
+        #       "Number of heads in key and value must divide the number of
+        #        heads in "
+        #
+        # The second one really does end mid-sentence upstream; it is
+        # reproduced verbatim rather than tidied, for the reason docs/CKPT2.md
+        # §4 gives about `view.dtype`'s messages -- a message that differs
+        # from upstream's only in wording is useless exactly where it is
+        # needed.
+        #
+        # A single key/value head is NOT a mismatch: it is an ordinary
+        # singleton broadcast and upstream accepts it with `enable_gqa=False`
+        # (measured). Refusing it here would have refused multi-query
+        # attention, which several architectures use.
+        q_heads, kv_heads = query.shape[1], key.shape[1]
         if enable_gqa:
-            # Upstream hands the mismatched head counts straight to the flash
-            # op, which broadcasts them. This shim's kernel does not.
-            # transformers' Llama calls `repeat_kv` itself and leaves this
-            # False, which is why it is refused rather than implemented.
-            raise NotImplementedError(
-                "not implemented in torch._C shim: "
-                "scaled_dot_product_attention(enable_gqa=True) -- upstream's flash "
-                "kernel broadcasts the key/value head dimension internally; this "
-                "shim's does not. Repeat the heads before calling."
+            if kv_heads == 0 or q_heads % kv_heads != 0:
+                raise RuntimeError(
+                    "Number of heads in key and value must divide the number of heads in "
+                )
+        elif kv_heads != q_heads and kv_heads != 1:
+            raise RuntimeError(
+                f"The size of tensor a ({q_heads}) must match the size of tensor b "
+                f"({kv_heads}) at non-singleton dimension 1"
             )
         return dispatch(
             _FLASH,

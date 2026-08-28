@@ -4742,6 +4742,329 @@ def test_min_and_max_refuse_an_empty_reduction_the_same_way():
             raise AssertionError(f"{op} on an empty tensor must raise")
 
 
+# --- grouped-query attention and greedy generate (docs/GENERATE.md) ---------
+#
+# docs/CKPT2.md §7.1 and §8 left three kernels between this shim and a real
+# pretrained model actually producing text. All three are exercised here, on
+# a model `transformers` builds rather than one this file transcribes:
+#
+#   1. `sdpa(enable_gqa=True)`     the SDPA path, when the KV heads are fewer
+#                                  than the query heads
+#   2. `aten.where.ScalarOther`    the EAGER path's mask, masking_utils.py:603
+#   3. `aten.mul.Tensor(int64, bool)`   `generate()`'s attention-mask inference
+#
+# The config below differs from `_LLAMA_CFG` in one field --
+# `num_key_value_heads=2` against `num_attention_heads=4` -- and that one
+# field is what routes the forward through (1). `_LLAMA_CFG` has them equal,
+# which is why every Llama comparison before this round missed the whole
+# grouped path (docs/CKPT2.md §7.1 says so explicitly).
+#
+# **Tokens are checked AND logits are checked.** docs/ARCH.md §5.1 is the
+# reason: a wrong `gelu` approximation once produced identical greedy tokens
+# with logits 379x further apart than the correct kernel's. A token-only
+# assertion would have passed it. The bound is the same `_REAL_LLAMA_ATOL`
+# the ungrouped forward uses, and it was checked to be a live bound rather
+# than inherited on faith -- see the docstring on the GQA test.
+
+_GQA_CFG = dict(
+    vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+    num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=32,
+    tie_word_embeddings=False,
+)
+_GQA_IDS = [3, 7, 1, 19]
+_GQA_NEW_TOKENS = 8
+
+
+@functools.lru_cache(maxsize=4)
+def _upstream_gqa(attn):
+    """The expected side: upstream torch, in this interpreter."""
+    torch = _upstream_torch
+    from transformers import AutoModelForCausalLM
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    ns = {}
+    exec(_LLAMA_FILL, ns)
+    model = AutoModelForCausalLM.from_config(
+        LlamaConfig(**_GQA_CFG), attn_implementation=attn
+    )
+    model.eval()
+    ns["_fill"](model, torch)
+    ids = torch.tensor([_GQA_IDS])
+    with torch.no_grad():
+        logits = model(ids).logits
+        generated = model.generate(
+            ids, max_new_tokens=_GQA_NEW_TOKENS, do_sample=False,
+            use_cache=False, pad_token_id=0,
+        )
+    return {
+        "shape": [int(d) for d in logits.shape],
+        "logits": _e2e_flatten(logits.tolist()),
+        "argmax": [int(x) for x in logits[0].argmax(-1).tolist()],
+        "generated": [int(x) for x in generated[0].tolist()],
+    }
+
+
+_GQA_ROAD_SCRIPT = r"""
+import json, sys, traceback
+import torch
+
+out = {}
+FILL = __FILL__
+CFG = __CFG__
+IDS = __IDS__
+NEW = __NEW__
+ATTN = sys.argv[1]
+try:
+    from transformers import AutoModelForCausalLM
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    ns = {}
+    exec(FILL, ns)
+    model = AutoModelForCausalLM.from_config(
+        LlamaConfig(**CFG), attn_implementation=ATTN
+    )
+    model.eval()
+    ns["_fill"](model, torch)
+    ids = torch.tensor([IDS])
+    with torch.no_grad():
+        logits = model(ids).logits
+except BaseException:
+    out["forward"] = "FAILED: " + traceback.format_exc(limit=4)
+else:
+    out["forward"] = "OK"
+    out["shape"] = [int(d) for d in logits.shape]
+    def flat(v):
+        if isinstance(v, list):
+            r = []
+            for e in v:
+                r.extend(flat(e))
+            return r
+        return [v]
+    out["logits"] = flat(logits.tolist())
+    out["argmax"] = [int(x) for x in logits[0].argmax(-1).tolist()]
+
+# Deliberately a SECOND try block: `generate` is behind a different set of
+# kernels than the forward (docs/CKPT2.md §8 item 2), and one failing must
+# not hide the other's result. docs/CKPT2.md §3 used the same shape of probe
+# for the four checkpoint paths and it is why that round could report which
+# wall each path stopped at.
+try:
+    generated = model.generate(
+        torch.tensor([IDS]), max_new_tokens=NEW, do_sample=False,
+        use_cache=False, pad_token_id=0,
+    )
+except BaseException:
+    out["generate"] = "FAILED: " + traceback.format_exc(limit=4)
+else:
+    out["generate"] = "OK"
+    out["generated"] = [int(x) for x in generated[0].tolist()]
+json.dump(out, sys.stdout)
+""".replace("__FILL__", repr(_LLAMA_FILL)).replace(
+    "__CFG__", repr(_GQA_CFG)).replace("__IDS__", repr(_GQA_IDS)).replace(
+    "__NEW__", repr(_GQA_NEW_TOKENS))
+
+
+@functools.lru_cache(maxsize=4)
+def _gqa_road_fixture(attn):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _GQA_ROAD_SCRIPT, attn],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gqa-road subprocess ({attn}) exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_grouped_query_attention_forward_matches_upstream_on_both_paths():
+    """9 query heads to 3 KV heads is what a real pretrained model looks like.
+
+    `num_key_value_heads < num_attention_heads` is the ordinary case in the
+    pretrained checkpoints this project targets -- SmolLM2-135M is 9 and 3 --
+    and it is the case every Llama comparison in this file missed, because
+    `_LLAMA_CFG` sets the two equal.
+
+    Both attention implementations are checked because they fail
+    *differently*, and each one hides the other's wall:
+
+        sdpa    routes into `F.scaled_dot_product_attention(enable_gqa=True)`,
+                which hands the UNREPEATED key and value to the aten flash op
+                and expects the op to broadcast the head dimension. Measured
+                with a `TorchDispatchMode`: one op, key still (B, 3, S, K).
+        eager   never touches sdpa and instead builds an additive mask with
+                `torch.where(mask, tensor(0.0), finfo.min)` --
+                `aten.where.ScalarOther`.
+
+    The two must also agree with EACH OTHER on this shim, which is a check
+    upstream passes for free and a shim need not: they share no kernel on the
+    attention path, so agreeing to within float32 noise is evidence that
+    neither one is quietly computing a different attention.
+
+    **The logit bound is live here, not inherited.** `_REAL_LLAMA_ATOL` was
+    measured for the ungrouped model in
+    `test_a_real_transformers_llama_forward_matches_upstream`. It is reused
+    because this model has the same width and vocabulary, and it was checked
+    to still bite: repeating the KV heads by tiling (`repeat`) instead of
+    `repeat_interleave` -- the plausible wrong spelling, which gives query
+    head `i` the KV head `i % n` instead of `i // n` -- moves these logits by
+    far more than 5e-7. That measurement is in docs/GENERATE.md; the golden
+    harness pins the same distinction at the kernel.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    seen = {}
+    for attn in ("sdpa", "eager"):
+        got = _gqa_road_fixture(attn)
+        assert got["forward"] == "OK", (attn, got["forward"])
+        want = _upstream_gqa(attn)
+        assert got["shape"] == want["shape"], (attn, got["shape"], want["shape"])
+        assert got["argmax"] == want["argmax"], (attn, got["argmax"], want["argmax"])
+        worst = max(abs(a - b) for a, b in zip(got["logits"], want["logits"]))
+        assert worst < _REAL_LLAMA_ATOL, (attn, worst)
+        seen[attn] = got["logits"]
+
+    # The two implementations of the same attention, on this shim, against
+    # each other. Upstream's own two agree to 2e-7 on this model (measured),
+    # so the bound is that plus room for the shim's own reassociation.
+    cross = max(abs(a - b) for a, b in zip(seen["sdpa"], seen["eager"]))
+    assert cross < 1e-5, cross
+
+
+def test_greedy_generate_matches_upstream_token_for_token():
+    """`generate()`, which is the thing docs/CKPT2.md §8 item 2 left open.
+
+    `do_sample=False` on purpose: greedy decoding has no RNG in it, so a
+    token mismatch is a kernel disagreement and nothing else. With sampling
+    the two sides would have to share a random stream to be comparable at
+    all, and docs/SAMPLING.md already covers that surface separately.
+
+    The wall this opens is neither of the attention ones. Before reaching any
+    layer, `_prepare_attention_mask_for_generation` computes
+
+        attention_mask_from_padding * can_infer_attention_mask
+            + default_attention_mask * ~can_infer_attention_mask
+
+    whose multiplies are `int64` by a 0-D `bool` -- `aten.mul.Tensor` with two
+    different dtypes, which this shim refused for every op until now.
+
+    **Tokens alone would not be enough and are not what is asserted.** The
+    forward test above pins the logits; this one pins the sequence those
+    logits decode to, on both attention implementations. docs/ARCH.md §5.1 is
+    the case that makes the distinction non-theoretical.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    for attn in _GENERATE_PATHS:
+        got = _gqa_road_fixture(attn)
+        assert got["generate"] == "OK", (attn, got["generate"])
+        want = _upstream_gqa(attn)
+        assert got["generated"] == want["generated"], (
+            attn, got["generated"], want["generated"]
+        )
+        # The prompt has to still be there, and something has to follow it:
+        # `generate` returns prompt + continuation, and a shim that produced
+        # nothing at all would still satisfy the equality above if the
+        # expected side also produced nothing.
+        assert got["generated"][:len(_GQA_IDS)] == _GQA_IDS, got["generated"]
+        new = len(got["generated"]) - len(_GQA_IDS)
+        # Not `== _GQA_NEW_TOKENS`: `max_new_tokens` is a ceiling, and this
+        # model's stopping criteria fire first -- upstream returns 7 new
+        # tokens for a ceiling of 8, measured. Asserting the ceiling would
+        # have been asserting something upstream does not do.
+        assert 1 < new <= _GQA_NEW_TOKENS, (attn, got["generated"])
+
+
+# Which attention implementations reach the end of `generate()`. The *forward*
+# works on both (the test above proves it); `generate` does not, and the
+# difference is one op, named in `test_eager_generate_stops_at_index_tensor`.
+_GENERATE_PATHS = ("sdpa",)
+
+
+def test_eager_generate_stops_at_index_tensor_and_says_so():
+    """The wall `generate(attn_implementation="eager")` is still behind.
+
+    This is a `c_error`-shaped test in the sense docs/TORCH_C.md gives the
+    term: upstream completes, the shim refuses, and the refusal is pinned by
+    name so that it stays a work item instead of becoming folklore. Two
+    things would break it, and both should:
+
+      * the shim learns multi-tensor advanced indexing -- then this fails and
+        `eager` belongs in `_GENERATE_PATHS`, where the real comparison is;
+      * `generate` starts failing somewhere EARLIER -- then the op name in
+        the message changes and this fails too, rather than quietly agreeing
+        that eager still does not work.
+
+    The wall is `aten.index.Tensor` with more than one index tensor, reached
+    from `GenerationMixin._prefill` (`generation/utils.py:2868`) through the
+    eager mask builder. It is not an attention kernel and it is not
+    reachable from the eager *forward*, which is why the forward comparison
+    above passes on both implementations while this one does not.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    got = _gqa_road_fixture("eager")
+    # The forward has to have succeeded, or this is testing the wrong thing.
+    assert got["forward"] == "OK", got["forward"]
+    assert got["generate"].startswith("FAILED"), got["generate"][:200]
+    assert "aten.index.Tensor" in got["generate"], got["generate"][-400:]
+    assert "more than one index tensor" in got["generate"], got["generate"][-400:]
+
+
+def test_the_two_grouped_attention_walls_are_refused_by_name_not_by_shape():
+    """What the kernel does when it cannot do the right thing.
+
+    Both refusals were measured on upstream first and neither is a guess:
+
+      * `enable_gqa=False` with mismatched heads is an upstream error, and it
+        comes from the broadcast rather than from a head check: "The size of
+        tensor a (4) must match the size of tensor b (2) at non-singleton
+        dimension 1". The shim must not answer here just because its kernel
+        now knows how to repeat heads -- the flag is what asks for it.
+      * `enable_gqa=True` with head counts that do not divide is an upstream
+        error too: "Number of heads in key and value must divide the number
+        of heads in query".
+
+    The aten op underneath has neither check -- it answers both, and for the
+    non-divisible case part of the answer is an out-of-bounds read (measured:
+    one head came back at 2.4e+31 with unit-magnitude inputs). So the shim's
+    aten kernel refuses non-divisible counts by name, and this test asserts
+    the refusal names the op rather than surfacing as a candle shape error,
+    which is the difference between a work item and a mystery.
+    """
+    def q(h):
+        return _C._tensor_from_flat(
+            _e2e_det(1 * h * 3 * 4, 11), [1, h, 3, 4], _C.float32
+        )
+
+    # Divisible: the kernel answers.
+    out = _C._aten_dispatch(
+        "aten._scaled_dot_product_flash_attention_for_cpu.default",
+        q(4), q(2), q(2), 0.0, False,
+    )
+    assert tuple(out[0].shape) == (1, 4, 3, 4), out[0].shape
+
+    # Non-divisible, both directions: refused, by name.
+    for h_q, h_kv in [(4, 3), (3, 4), (9, 2)]:
+        try:
+            _C._aten_dispatch(
+                "aten._scaled_dot_product_flash_attention_for_cpu.default",
+                q(h_q), q(h_kv), q(h_kv), 0.0, False,
+            )
+        except NotImplementedError as e:
+            text = str(e)
+            assert "_scaled_dot_product_flash_attention_for_cpu" in text, text
+            assert str(h_q) in text and str(h_kv) in text, text
+        else:
+            raise AssertionError(f"h_q={h_q} h_kv={h_kv} must be refused")
+
+
 # --- the decomposition pass (docs/DECOMP.md) ---------------------------------
 #
 # `_capture_end` records ATen; ExecuTorch's Edge dialect is defined over Core

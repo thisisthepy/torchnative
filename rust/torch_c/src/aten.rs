@@ -149,6 +149,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.unsqueeze.default",
     "aten.view.default",
     "aten.view.dtype",
+    "aten.where.ScalarOther",
     "aten.where.self",
     "aten.zero_.default",
     "aten.zeros_like.default",
@@ -827,6 +828,7 @@ fn aten_dispatch_inner(
         "aten.masked_fill.Scalar" => masked_fill(py, args, kwargs, "aten.masked_fill.Scalar"),
         "aten.masked_fill.Tensor" => masked_fill(py, args, kwargs, "aten.masked_fill.Tensor"),
         "aten.where.self" => where_self(py, args, kwargs),
+        "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
 
         "aten.expand.default" => expand_default(py, args, kwargs),
         "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
@@ -1610,6 +1612,16 @@ fn baddbmm_default(
 ///
 /// `dropout_p > 0` is refused here because upstream refuses it too ("Currently
 /// do not support dropout > 0"), not because the shim lacks an RNG.
+///
+/// **Grouped-query attention lives here, not in the wrapper.** See
+/// `repeat_kv_heads`.
+///
+/// Key and value are repeated to the query's head count *before* anything
+/// else touches them, so `is_causal`, `attn_mask` and the logsumexp all see
+/// the full head count. That order is not cosmetic: an `attn_mask` is indexed
+/// by `(batch, head, row, col)` and upstream's has the *query* head count, so
+/// repeating after masking would broadcast a per-head mask onto the wrong
+/// heads.
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -1674,8 +1686,12 @@ fn sdpa_flash_cpu(
 
     let widen = |t: &Tensor| t.to_dtype(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
-    let k = widen(key.tensor()?).map_err(|e| candle_err(OP, e))?;
-    let v = widen(value.tensor()?).map_err(|e| candle_err(OP, e))?;
+    let k = repeat_kv_heads(OP, &widen(key.tensor()?).map_err(|e| candle_err(OP, e))?, q.dims()[1])?;
+    let v = repeat_kv_heads(
+        OP,
+        &widen(value.tensor()?).map_err(|e| candle_err(OP, e))?,
+        q.dims()[1],
+    )?;
 
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
@@ -2669,6 +2685,15 @@ fn randint(
 //     and names both. torch would promote; a wrong promotion is the silent
 //     numerical drift DESIGN.md §5 calls candle's main risk, and a refusal is
 //     a work item.
+//
+//     `mul.Tensor` and `bitwise_and.Tensor` are now the exceptions, and they
+//     are *not* a relaxation of that rule -- they are two work items closed.
+//     They promote through `promote_types`, whose table was measured cell by
+//     cell against upstream and is pinned by the golden harness over every
+//     storable pair. `add`/`sub`/`div`/`bitwise_or` still refuse, because no
+//     measured caller needs them to promote and inventing the answer would be
+//     exactly what the rule forbids. See `promote_operands` for the two
+//     callers that made these two measured.
 //   * **A Python scalar does not widen a tensor of the same category.** That
 //     is torch's "wrapped number" rule, measured for `pow` in
 //     docs/OVERLOAD.md §6.3 and re-measured here for the arithmetic ops:
@@ -2757,6 +2782,130 @@ fn alpha_arg(
         .unwrap_or(1.0))
 }
 
+/// Where a dtype sits in torch's promotion lattice: the category, then the
+/// width within it.
+///
+/// Only the dtypes `TorchDType::storage()` can hold appear; everything else
+/// comes back `None` from `promote_types` below, which this shim would have
+/// to refuse anyway since it cannot build the operand.
+fn promotion_rank(dtype: TorchDType) -> Option<(u8, u8)> {
+    use TorchDType::*;
+    Some(match dtype {
+        Bool => (0, 0),
+        UInt8 => (1, 1),
+        Int16 => (1, 2),
+        Int32 => (1, 3),
+        Int64 => (1, 4),
+        // The two reduced floats are deliberately the SAME rank. They are not
+        // ordered with respect to each other -- neither can hold the other --
+        // and the tie is broken by escaping upwards, which is exactly the
+        // `float16 x bfloat16 -> float32` cell.
+        Float16 | BFloat16 => (2, 1),
+        Float32 => (2, 2),
+        Float64 => (2, 3),
+        _ => return None,
+    })
+}
+
+/// torch's `promote_types`, over the dtypes this shim can store.
+///
+/// Measured, not derived. The full 10x10 table over `{bool, uint8, uint32,
+/// int16, int32, int64, float16, bfloat16, float32, float64}` was read off
+/// `torch.promote_types` on 2.13.0 and separately checked cell by cell
+/// against `aten.mul.Tensor`'s own result dtype -- they agree in every cell
+/// where both are defined, which is why one function can serve the op.
+/// Three cells break a plausible-looking shortcut:
+///
+/// ```text
+/// int64   x float16   -> float16    an integral operand never widens a float
+/// float16 x bfloat16  -> float32    two reduced floats promote OUT
+/// uint8   x int16     -> int16      unsigned meets signed, no escape needed
+/// ```
+///
+/// `uint32` (and torch's other unsigned types above `uint8`) has no promotion
+/// with `bool` or a signed integer *upstream* -- "Promotion for uint16,
+/// uint32, uint64 types is not supported" -- so `None` there is reproducing a
+/// refusal, not admitting a gap. Against a float it does promote, and that
+/// cell is answered.
+fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
+    if lhs == rhs {
+        return Some(lhs);
+    }
+    // Handled before the rank lookup, because `promotion_rank` has no entry
+    // for these either and the two reasons must not be conflated: one is
+    // upstream's refusal, the other would be this shim's.
+    let unsigned_wide = |d: TorchDType| {
+        matches!(
+            d,
+            TorchDType::UInt16 | TorchDType::UInt32 | TorchDType::UInt64
+        )
+    };
+    for (a, b) in [(lhs, rhs), (rhs, lhs)] {
+        if unsigned_wide(a) {
+            return if b.is_floating_point() { Some(b) } else { None };
+        }
+    }
+
+    let (lhs_cat, lhs_width) = promotion_rank(lhs)?;
+    let (rhs_cat, rhs_width) = promotion_rank(rhs)?;
+    if lhs_cat != rhs_cat {
+        // A higher category wins outright, whatever the widths are:
+        // `int64 x float16` is `float16`, not `float32`.
+        return Some(if lhs_cat > rhs_cat { lhs } else { rhs });
+    }
+    match lhs_width.cmp(&rhs_width) {
+        std::cmp::Ordering::Greater => Some(lhs),
+        std::cmp::Ordering::Less => Some(rhs),
+        // Equal rank but different dtypes: only `float16` with `bfloat16`
+        // reaches here, and it escapes to `float32` rather than picking one.
+        std::cmp::Ordering::Equal => Some(TorchDType::Float32),
+    }
+}
+
+/// The dtype a promoting binary op computes in, with both operands named when
+/// there is no answer.
+///
+/// **Two ops call this: `mul.Tensor` and `bitwise_and.Tensor`.** Everything
+/// else -- `add`, `sub`, `div`, `bitwise_or` -- still goes through
+/// `same_dtype` and still refuses. That split is the "no unmeasured
+/// implementation" rule (docs/E2E_REAL.md §1.2) rather than an oversight:
+/// these are the two ops a real `generate()` was measured stopping on, and
+/// they were found one at a time, by running it.
+///
+/// `_prepare_attention_mask_for_generation` computes
+///
+/// ```text
+/// attention_mask_from_padding * can_infer_attention_mask
+///     + default_attention_mask * ~can_infer_attention_mask
+/// ```
+///
+/// where each `*` has an `int64` left operand (`.long()`) and a 0-D `bool`
+/// right one (`.any()`), while the `+` joining them is int64 with int64 --
+/// which is why `mul` needed this and `add` did not. Then, once past that,
+/// the sampling loop's own stopping condition
+///
+/// ```text
+/// unfinished_sequences = unfinished_sequences & ~stopping_criteria(...)
+/// ```
+///
+/// is `int64 & bool` (`generation/utils.py:2936`). `bitwise_and.Tensor` and
+/// `bitwise_or.Tensor` were both re-measured against `torch.promote_types`
+/// over the storable dtypes and agree with it in every cell, so the same
+/// table serves them; only `bitwise_and` has a measured caller and only
+/// `bitwise_and` is wired.
+fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
+    if lhs.tag() == rhs.tag() {
+        return Ok(lhs.tag());
+    }
+    promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
+        not_implemented(format!(
+            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+            lhs.tag().name(),
+            rhs.tag().name()
+        ))
+    })
+}
+
 fn arith_tensor(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -2766,7 +2915,12 @@ fn arith_tensor(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    let tag = arith_tag(op, kind, same_dtype(op, &lhs, &rhs)?, None)?;
+    let operand = if kind == Arith::Mul {
+        promote_operands(op, &lhs, &rhs)?
+    } else {
+        same_dtype(op, &lhs, &rhs)?
+    };
+    let tag = arith_tag(op, kind, operand, None)?;
     let storage = PyDtype::new(tag).storage(op)?;
 
     let left = lhs
@@ -3007,7 +3161,15 @@ fn bitwise_binary(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    let tag = same_dtype(op, &lhs, &rhs)?;
+    // `bitwise_and` promotes; `bitwise_or` does not, for the reason
+    // `promote_operands` gives -- one has a measured caller and the other
+    // does not. Both were measured to follow the SAME table, so when a
+    // caller for `or` turns up this is a one-word change.
+    let tag = if matches!(kind, Bitwise::And) {
+        promote_operands(op, &lhs, &rhs)?
+    } else {
+        same_dtype(op, &lhs, &rhs)?
+    };
     if tag.is_floating_point() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "\"bitwise_{}_cpu\" not implemented for '{}'",
@@ -4042,6 +4204,79 @@ fn max_other(
     finish(py, out, tag)
 }
 
+/// Grouped-query attention: the key/value head dimension repeated up to the
+/// query's.
+///
+/// **This belongs in the aten op, and that was measured rather than
+/// assumed.** A `TorchDispatchMode` over
+/// `F.scaled_dot_product_attention(q, k, v, enable_gqa=True)` with
+/// `q = (2, 9, 4, 8)` and `k = v = (2, 3, 4, 8)` reports exactly one op --
+/// `aten._scaled_dot_product_flash_attention_for_cpu.default` -- with the key
+/// and value *still* `(2, 3, 4, 8)`. Nothing repeats them on the way in, and
+/// the aten op has no `enable_gqa` argument at all: calling it directly with
+/// those mismatched shapes answers `(2, 9, 4, 8)` and agrees with the
+/// `enable_gqa=True` result to `0.0`. So the flag is a validation switch in
+/// the Python wrapper and the broadcast is the op's own behaviour.
+///
+/// **Which repetition** is the part that fails plausibly rather than loudly.
+/// Measured three ways on those shapes:
+///
+/// ```text
+/// repeat_interleave(3, dim=1)               0.0
+/// transformers' repeat_kv (expand+reshape)  0.0
+/// repeat(1, 3, 1, 1)  ("tile")              2.82
+/// ```
+///
+/// Both correct spellings give query head `i` the key/value head `i / n_rep`;
+/// tiling gives it `i % n_rep`. Tiling produces a same-shaped,
+/// same-magnitude, entirely wrong answer -- the failure mode docs/ARCH.md
+/// §5.1 records for `gelu`, where the logits look reasonable and are not.
+/// This uses the `unsqueeze`/`expand`/`reshape` spelling, which is
+/// `repeat_interleave` along one axis and is what transformers' own
+/// `repeat_kv` does; it moves bytes and computes nothing, so there is no
+/// rounding question attached to the choice.
+///
+/// **Non-divisible head counts are refused by name.** Upstream does not
+/// refuse them -- it answers, deterministically, and part of the answer is
+/// garbage. Measured per query head against `kv_head = q_head / (h_q /
+/// h_kv)`:
+///
+/// ```text
+/// h_q=9 h_kv=4   heads 0..7 agree to 0.0, head 8 differs by 0.93
+/// h_q=9 h_kv=2   heads 0..7 agree to 0.0, head 8 differs by 2.28
+/// h_q=6 h_kv=4   heads 0..3 agree to 0.0, head 4 by 0.78, head 5 by 2.38e+31
+/// ```
+///
+/// That is this same rule for the first `h_kv * (h_q / h_kv)` heads and an
+/// out-of-bounds read for the remainder -- 2.38e+31 is not a value an
+/// attention output can take with unit-magnitude inputs. There is nothing
+/// there to reproduce, so this refuses and says so. Every caller arriving
+/// through `F.scaled_dot_product_attention` is stopped one layer earlier by
+/// the divisibility check upstream also has.
+fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor> {
+    let dims = kv.dims().to_vec();
+    let kv_heads = dims[1];
+    if kv_heads == query_heads {
+        return Ok(kv.clone());
+    }
+    if kv_heads == 0 || query_heads % kv_heads != 0 {
+        return Err(not_implemented(format!(
+            "{op}: grouped-query attention with {query_heads} query heads and {kv_heads} \
+             key/value heads is not implemented in torch._C shim -- the head counts do not \
+             divide. Upstream answers here, but its answer reads past the end of the \
+             key/value tensor for the leftover heads (measured), so there is nothing to \
+             reproduce"
+        )));
+    }
+    let n_rep = query_heads / kv_heads;
+    let (b, s, e) = (dims[0], dims[2], dims[3]);
+    kv.unsqueeze(2)
+        .and_then(|t| t.expand((b, kv_heads, n_rep, s, e)))
+        .and_then(|t| t.reshape((b, query_heads, s, e)))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(op, e))
+}
+
 /// The `(values, indices)` pair `max.dim` returns.
 ///
 /// Upstream's is a *structseq* from `torch.return_types`, built by `_C` and
@@ -4268,24 +4503,42 @@ fn where_self(
         )));
     }
     let tag = same_dtype(OP, &lhs, &rhs)?;
-    let storage = PyDtype::new(tag).storage(OP)?;
+    let out = where_select(OP, &condition, lhs.tensor()?, rhs.tensor()?, tag)?;
+    finish(py, out, tag)
+}
+
+/// The select `where.self` and `where.ScalarOther` share.
+///
+/// Both branches arrive already agreed on `tag`; this does the three-way
+/// broadcast, the condition's truthiness normalisation, and the selection.
+/// Split out when `where.ScalarOther` landed rather than duplicated: the two
+/// overloads differ only in where the second branch comes from, and a second
+/// copy of the broadcast rule is a second place for it to drift.
+fn where_select(
+    op: &str,
+    condition: &PyTensorBase,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    tag: TorchDType,
+) -> PyResult<Tensor> {
+    let storage = PyDtype::new(tag).storage(op)?;
 
     // torch broadcasts all three together, and the result shape is the join of
     // the three -- not the condition's. `where(tensor(True), ones(2,3),
     // zeros(3))` is `(2, 3)`, measured, where a condition-shaped answer would
     // be `()`.
-    let rhs_shape = rhs.tensor()?.shape().clone();
+    let rhs_shape = rhs.shape().clone();
     let shape = condition
         .tensor()?
         .shape()
-        .broadcast_shape_binary_op(lhs.tensor()?.shape(), "where")
+        .broadcast_shape_binary_op(lhs.shape(), "where")
         .and_then(|s| s.broadcast_shape_binary_op(&rhs_shape, "where"))
-        .map_err(|e| candle_err(OP, e))?;
+        .map_err(|e| candle_err(op, e))?;
 
     let spread = |t: &Tensor| -> PyResult<Tensor> {
         t.broadcast_as(shape.clone())
             .and_then(|t| t.contiguous())
-            .map_err(|e| candle_err(OP, e))
+            .map_err(|e| candle_err(op, e))
     };
     // A `uint8` condition is truthiness, not a bit pattern: `where_cond` reads
     // "not zero", which is the same rule, but the tag is normalised to 0/1
@@ -4294,14 +4547,151 @@ fn where_self(
     let mask = if condition.tag() == TorchDType::Bool {
         mask
     } else {
-        mask.ne(0u8).map_err(|e| candle_err(OP, e))?
+        mask.ne(0u8).map_err(|e| candle_err(op, e))?
     };
-    let on_true = spread(&lhs.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
-    let on_false = spread(&rhs.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?)?;
+    let on_true = spread(&lhs.to_dtype(storage).map_err(|e| candle_err(op, e))?)?;
+    let on_false = spread(&rhs.to_dtype(storage).map_err(|e| candle_err(op, e))?)?;
 
-    let out = mask
-        .where_cond(&on_true, &on_false)
-        .map_err(|e| candle_err(OP, e))?;
+    mask.where_cond(&on_true, &on_false)
+        .map_err(|e| candle_err(op, e))
+}
+
+/// The dtype `where.ScalarOther` promotes to, given the tensor branch's dtype
+/// and which Python type the scalar arrived as.
+///
+/// torch's "wrapped number" rule, and every cell measured on 2.13.0 rather
+/// than derived from the general promotion lattice -- they are *not* the same
+/// function. `promote_types(int64, float32)` is `float32` and so is
+/// `where(cond, int64_t, 2.5)`, but that agreement is a coincidence of the
+/// default dtype: `promote_types(float16, float32)` is `float32` while
+/// `where(cond, float16_t, 2.5)` is `float16`, because a Python float is not
+/// a `float32` tensor. A scalar names a *category*, not a width.
+///
+/// ```text
+/// scalar         bool tensor   integral tensor   floating tensor
+/// True/False     bool          the tensor's      the tensor's
+/// 3              int64         the tensor's      the tensor's
+/// 2.5            float32       float32           the tensor's
+/// ```
+///
+/// The `bool` column is the one that needs the Python *type* and not the
+/// value: `where(cond, bool_t, True)` is `bool` and `where(cond, bool_t, 1)`
+/// is `int64`, measured. `Scalar` in this file folds `bool` into `Int` (it
+/// says so, and every other op wants that), so this rule reads the raw
+/// object instead of going through `Scalar`.
+fn where_scalar_tag(tensor: TorchDType, scalar_is_bool: bool, scalar_is_int: bool) -> TorchDType {
+    if scalar_is_bool {
+        return tensor;
+    }
+    if scalar_is_int {
+        return if tensor == TorchDType::Bool {
+            TorchDType::Int64
+        } else {
+            tensor
+        };
+    }
+    if tensor.is_floating_point() {
+        tensor
+    } else {
+        default_float()
+    }
+}
+
+/// `aten::where.ScalarOther(Tensor condition, Tensor self, Scalar other) -> Tensor`
+///
+/// `torch.where(mask, tensor, python_scalar)`. transformers' `eager_mask`
+/// reaches it verbatim at `masking_utils.py:603`:
+///
+/// ```text
+/// mask = torch.where(mask, torch.tensor(0.0, device=..., dtype=dtype), min_dtype)
+/// ```
+///
+/// with `min_dtype = torch.finfo(dtype).min`. That single call was the whole
+/// of what stood between this shim and a real pretrained model's *eager*
+/// forward (docs/CKPT2.md §7.1), and the schema for it was already in
+/// `overloads.json` -- only the kernel was missing, so the dispatcher was
+/// resolving the call and then refusing it by name.
+///
+/// **What the overload does was measured, not read off the schema.** A
+/// `TorchDispatchMode` over the call above reports two ops:
+///
+/// ```text
+/// aten.scalar_tensor.default(-3.5, dtype=<the PROMOTED dtype>)
+/// aten.where.self(cond, self, that)
+/// ```
+///
+/// so upstream itself turns the scalar into a 0-D tensor *at the promoted
+/// dtype* and then runs ordinary `where.self`. This does the same two steps,
+/// through the same `checked_convert` `scalar_tensor` uses, rather than
+/// growing a third select path -- which also means the overflow rule comes
+/// out identical for free: `-1` into `uint8` wraps to 255 and is answered,
+/// `300` does not fit and is refused, both measured on both sides.
+///
+/// **A 0-D tensor is not accepted here, and that is upstream's rule rather
+/// than a shortcut.** `scalar_arg` takes a 0-D tensor anywhere a `Scalar` is
+/// wanted, because torch does; this overload is the exception, measured:
+///
+/// ```text
+/// aten::where() Expected a value of type 'number' for argument 'other'
+///   but instead found type Tensor
+/// ```
+///
+/// Answering it would compute where torch raises.
+///
+/// `where.ScalarSelf` and `where.Scalar` stay unimplemented. They are in the
+/// same `overloads.json` entry and would each be a few lines, but no measured
+/// caller reaches them -- the rule docs/E2E_REAL.md §1.2 sets, and the reason
+/// this kernel exists at all is that a caller *was* measured reaching it.
+fn where_scalar_other(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.where.ScalarOther";
+    let condition = tensor_arg(OP, args, kwargs, 0, "condition")?;
+    let lhs = tensor_arg(OP, args, kwargs, 1, "self")?;
+    let raw = required(OP, args, kwargs, 2, "other")?;
+
+    if condition.tag() != TorchDType::Bool && condition.tag() != TorchDType::UInt8 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "where expected condition to be a boolean tensor, but got a tensor with dtype {}",
+            scalar_type_name(condition.tag())
+        )));
+    }
+    if raw.is_instance_of::<PyTensorBase>() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "aten::where() Expected a value of type 'number' for argument 'other' \
+             but instead found type Tensor",
+        ));
+    }
+
+    // Order matters, as it does in `scalar_arg`: Python's `bool` is a subclass
+    // of `int`, and here the two give different answers.
+    let scalar_is_bool = raw.is_instance_of::<pyo3::types::PyBool>();
+    let scalar_is_int = scalar_is_bool || raw.is_instance_of::<pyo3::types::PyInt>();
+    let value = scalar_arg(OP, args, kwargs, 2, "other")?.ok_or_else(|| missing(OP, "other"))?;
+
+    let tag = where_scalar_tag(lhs.tag(), scalar_is_bool, scalar_is_int);
+    // The same check `scalar_tensor` runs, at the same numel: upstream builds
+    // a one-element tensor here, so the numel==1 hole that check reproduces
+    // applies to this call too.
+    checked_convert(&raw, scalar_is_int, tag, 1)?;
+
+    let device = lhs.tensor()?.device().clone();
+    let other = if tag == TorchDType::Bool {
+        Tensor::full(u8::from(value.as_f64() != 0.0), (), &device).map_err(|e| candle_err(OP, e))?
+    } else {
+        let storage = PyDtype::new(tag).storage(OP)?;
+        if storage.is_int() {
+            Tensor::full(value.as_i64(), (), &device)
+        } else {
+            Tensor::full(value.as_f64(), (), &device)
+        }
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?
+    };
+
+    let out = where_select(OP, &condition, lhs.tensor()?, &other, tag)?;
     finish(py, out, tag)
 }
 
