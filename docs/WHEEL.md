@@ -17,24 +17,30 @@ PyPI 의 `torchnative 0.0.1a0` 은 **껍데기**입니다. 열어 보면 `torchn
 
 | | 이전 (`0.0.1a0` on PyPI) | 지금 |
 |---|---|---|
-| 태그 | `py3-none-any` | **`cp313-abi3-macosx_11_0_arm64`** |
-| `_C` 확장 | 없음 | **`torch/_C.abi3.so`** 3,185,936 B |
+| 태그 | `py3-none-any` 하나 | **플랫폼 휠 4 개** (아래) |
+| `_C` 확장 | 없음 | **`torch/_C.abi3.so`**, 타깃별로 진짜 그 플랫폼의 바이너리 |
 | 벤더링 트리 | 없음 | **`torch` · `torchgen` · `functorch`**, `.py` 2372 개 |
-| 파일 수 | 8 | **2,683** |
-| 압축 크기 | 8 KB | **13.2 MB** (13,175,324 B) |
-| 설치 후 크기 | — | **56.6 MB** (`.pyc` 생성 후 114 MB) |
+| 파일 수 | 8 | **2,686** (네 휠 모두 같음) |
 | `pip install` → `import torch` | **ImportError** | **동작** (§2) |
 | `torch.ops.aten.mm.default` | 도달 불가 | **동작**, 값 일치 |
 | `nn.Linear` 순전파 | 도달 불가 | **동작** |
 | `importlib.metadata.version("torch")` | 없음 | **`2.13.0`** |
 | CPython 3.14.7 | — | **같은 휠로 동작** (§2.3) |
-| `twine check` | — | **PASSED** |
+| `twine check` | — | **4/4 PASSED** |
 
-기존 검증은 그대로입니다 — shim 테스트 **113/113**, 골든 하네스 **2268/2268, ops=97**.
+| 휠 | 압축 | 설치 후 | `_C` | 어디까지 확인됐나 |
+|---|---|---|---|---|
+| `cp313-abi3-macosx_11_0_arm64` | 13,287,413 B | 56.9 MB | 3,509,008 B | **계산됨** — 깨끗한 venv (§2) |
+| `cp313-abi3-android_21_arm64_v8a` | 13,623,651 B | 58.2 MB | 4,821,448 B | **계산됨** — 에뮬레이터 (§7.3) |
+| `cp313-abi3-ios_12_0_arm64_iphoneos` | 13,313,090 B | 57.1 MB | 3,618,000 B | **아티팩트까지** (§7.4) |
+| `cp313-abi3-ios_14_0_arm64_iphonesimulator` | 13,270,683 B | 56.9 MB | 3,476,720 B | **아티팩트까지** (§7.4) |
+
+기존 검증은 그대로입니다 — shim 테스트 **168/168**, 골든 하네스 **2702/2702, ops=118**.
 둘 다 이 작업 전후로 같은 값이고, 종료 코드로 판정했습니다.
 
-**아직 안 되는 것**: `print(tensor)`. 휠 문제가 아니라 shim 표면의 구멍이고 개발 트리에서 똑같이
-재현됩니다. §5 에 정확한 목록이 있습니다.
+**아직 안 되는 것**: iOS 휠이 로드·임포트·계산되는지는 **측정하지 않았습니다** (§7.0).
+안드로이드는 `_multiprocessing` 스텁이 여전히 필요한데, 휠이 아니라 안드로이드 CPython
+배포본의 성질입니다 (§7.3.2).
 
 ---
 
@@ -47,8 +53,10 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wheel   # 선택
 bash vendor/vendor_torch.sh      # 상류 파이썬 트리 3 개 패키지를 가져온다
 bash vendor/install_shim.sh      # _C 를 빌드해 트리의 구멍에 넣는다
 python tools/wheel/build.py      # 휠을 만든다  -> dist/*.whl
-python tools/wheel/verify.py dist/torchnative-*.whl   # 진짜 되는지 본다
+python tools/wheel/verify.py dist/torchnative-*macosx*.whl   # 진짜 되는지 본다
 ```
+
+안드로이드 · iOS 휠은 `--target` 을 줍니다. 배선과 판정은 §7 에 있습니다.
 
 빌드 인터프리터에는 `pip` · `setuptools` · `wheel` 이 필요합니다 (`build` 는 필요 없습니다 —
 `tools/wheel/build.py` 가 `pip wheel --no-build-isolation` 으로 몰아넣습니다). 이 기록은
@@ -62,12 +70,12 @@ python tools/wheel/verify.py dist/torchnative-*.whl   # 진짜 되는지 본다
 
 | | 왜 |
 |---|---|
-| **preflight** | 벤더링 트리와 `_C` 가 없으면 **빌드를 거부**한다. 둘 다 `.gitignore` 라서 새 클론에는 없고, 그 상태로 setuptools 를 돌리면 **PyPI 에 있는 그 껍데기가 다시 나온다**. 조용히 실패하면 안 되는 지점이다 |
-| **global-deps 스텁** | `torch/lib/libtorch_global_deps.dylib` 를 빈 라이브러리로 만들어 넣는다 (§3.2) |
-| **retag** | `universal2` → `arm64`. setuptools 는 확장의 실제 아키텍처를 보지 않는다 (§3.3) |
-| **install name** | cargo 가 박아 넣은 빌드 머신 절대경로를 `@rpath/_C.abi3.so` 로 바꾼다 (§3.4) |
+| **preflight** | 벤더링 트리와 `_C` 가 없으면 **빌드를 거부**한다. 둘 다 `.gitignore` 라서 새 클론에는 없고, 그 상태로 setuptools 를 돌리면 **PyPI 에 있는 그 껍데기가 다시 나온다**. 조용히 실패하면 안 되는 지점이다. `--target` 을 줘도 이 검사는 **그대로 돕니다** — 크로스 산출물은 그 위에 얹는 *추가* 요구사항이지 대체가 아니다 |
+| **global-deps 스텁** | `torch/lib/libtorch_global_deps.{dylib,so}` 를 빈 라이브러리로 만들어 넣는다. **타깃의 컴파일러로** 만들고, 만든 것이 정말 그 플랫폼인지 확인한다 (§3.2 · §7.4) |
+| **retag** | 호스트: `universal2` → `arm64`, setuptools 는 확장의 실제 아키텍처를 보지 않는다 (§3.3). 크로스: PEP 738/730 태그를 타깃 CPython 에서 유도한다 (§7.2) |
+| **install name** | cargo 가 박아 넣은 빌드 머신 절대경로를 `@rpath/_C.abi3.so` 로 바꾼다 (§3.4). 이미지 형식을 보고 판단하므로 ELF(안드로이드)에는 걸지 않는다 |
 | **상류 dist-info 주입** | `importlib.metadata.version("torch")` 가 답하게 한다 (§3.5) |
-| **verify** | 아카이브를 소스 트리와 **파일 단위로 대조**하고 빠진 것이 있으면 실패한다. 작기만 한 휠은 설치는 되고 나중에 아무 임포트에서나 죽는다 |
+| **verify** | 아카이브를 소스 트리와 **파일 단위로 대조**하고 빠진 것이 있으면 실패한다. 작기만 한 휠은 설치는 되고 나중에 아무 임포트에서나 죽는다. 크로스면 완성된 아카이브 안의 바이너리를 다시 열어 플랫폼을 확인한다 |
 
 ---
 
@@ -209,6 +217,28 @@ Accelerate 에 대해 자기완결적입니다). 즉 **비어 있는 것이 스�
 `install_shim.sh` 가 아니라 휠 빌드에서 만드는 이유: 소스 트리는 기존 문서가 기술하는 대로
 그대로 두기 위해서입니다. 벽 1 은 거기서 여전히 서 있고, 환경변수를 설정하는 스위트들은
 자기가 잰다고 말하는 것을 계속 잽니다.
+
+**이 파일이 실제로 로드되고 있다는 것은 이후에 기기에서 확인됐습니다** — 에뮬레이터에서 이
+파일만 치우면 `import torch` 가 `dlopen failed: ... libtorch_global_deps.so not found` 로 죽습니다
+(§7.3.1). 처음 만들 때는 "있으면 우회 분기를 안 탄다" 는 논증뿐이었습니다.
+
+#### 3.2.1 파일 이름과 배포 대상 — 나중에 드러난 두 가지
+
+**이름은 `.dylib` 가 아닐 수 있습니다.** `_load_global_deps()` 는
+`".dylib" if platform.system() == "Darwin" else ".so"` 로 이름을 만드는데, `platform.system()` 은
+**안드로이드에서 `"Android"`, iOS 에서 `"iOS"`** 입니다. 즉 **iOS 도 `.so` 를 찾습니다** — 내용은
+Mach-O dylib 인 채로. 이것을 틀리면 조용합니다: `CDLL` 이 던진 `OSError` 를
+`_load_global_deps` 가 `_preload_cuda_deps` 경로로 삼켜서, 임포트는 전혀 관계없는 곳에서 죽습니다.
+
+**호스트용도 배포 대상이 틀려 있었습니다** — 이번에 고쳤습니다. 호스트 `cc` 는 자기가 가진 SDK
+로 스탬프를 찍으므로 `macosx_11_0_arm64` 로 태그된 휠 안에 `Mach-O arm64 macos 26.0+` 짜리
+파일이 들어가 있었습니다. dyld 는 그 필드를 강제하므로 **태그가 약속한 macOS 대부분에서 로드할
+수 없는 파일**입니다. §3.3 과 같은 종류의 불일치이고, 같은 방향입니다 — 남의 기계에서만 드러나는
+쪽. 지금은 빌드 인터프리터의 `MACOSX_DEPLOYMENT_TARGET` 을 `-mmacosx-version-min` 으로 넘겨
+`macos 11.0+` 로 맞춥니다.
+
+(이 결함이 실제로 사용자를 깨뜨린 것은 확인하지 않았습니다 — macOS 11~25 인 기계가 없습니다.
+고친 근거는 재현이 아니라 **아카이브 내용과 태그가 어긋나 있다**는 것 자체입니다.)
 
 ### 3.3 태그의 아키텍처가 거짓말이었다
 
@@ -401,56 +431,274 @@ TensorBase._is_zerotensor
 
 ## 7. 호스트 밖 — Android · iOS
 
-**지금 되는 것은 호스트 휠 하나뿐입니다.** 나머지는 아래가 정확한 현황입니다.
+**이제 네 개의 휠이 있습니다.** 다만 넷이 같은 정도로 증명된 것은 아니고, 그 차이가 이 절의
+전부입니다.
 
-### 7.1 확장은 오늘 크로스 빌드된다 — 실측
+### 7.0 어디까지 확인됐는가
 
-Android 확장을 이 작업 중에 직접 빌드했습니다.
+| | 빌드됨 | 설치됨 | 임포트됨 | 계산됨 |
+|---|---|---|---|---|
+| `macosx_11_0_arm64` | ✅ | ✅ 깨끗한 venv 에 `pip install` (§2) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+| `android_21_arm64_v8a` | ✅ | ✅ **에뮬레이터의 site-packages 에 언팩** (§7.3) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+| `ios_12_0_arm64_iphoneos` | ✅ | ❌ 실기 없음 | ❌ | ❌ |
+| `ios_14_0_arm64_iphonesimulator` | ✅ | ❌ 시뮬레이터 하네스 없음 | ❌ | ❌ |
+
+**iOS 두 개에 대해 이 문서가 주장하는 것은 "아티팩트가 맞다" 까지입니다** — 태그가 설치기가
+매칭할 형태이고, 안의 바이너리가 진짜 그 플랫폼용이고, 기기용 쪽이 `Python.framework` 를
+링크한다는 것. **로드된다·임포트된다·계산한다는 어느 것도 측정하지 않았습니다.** iOS 확장을
+실행하려면 앱 번들과 서명이 필요하고 이 기계에 그 하네스가 없습니다.
+
+빈 칸을 채우는 방법은 §7.6 에 적어 두었습니다.
+
+### 7.1 만드는 법
 
 ```sh
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wheel2
 export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/27.1.12297006
-export PYO3_CROSS=1
-export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/aarch64-linux-android/prefix/lib
-cargo ndk -t arm64-v8a --platform 21 build --release
+TP=/Volumes/macMini/caches/target-python
+
+# 1) _C 를 타깃별로 크로스 빌드한다
+scripts/device_android.sh build                       # aarch64-linux-android
+
+cat > /tmp/pyo3-ios.cfg <<'EOF'
+implementation=CPython
+version=3.13
+shared=true
+lib_name=Python
+pointer_width=64
+suppress_build_script_link_lines=true
+EOF
+
+( cd rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+  PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
+  PYO3_CROSS_LIB_DIR=$TP/arm64-iphoneos/lib \
+  TORCHNATIVE_PYTHON_FRAMEWORK_DIR=$TP/arm64-iphoneos \
+  cargo build --release --target aarch64-apple-ios )
+
+( cd rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+  PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
+  PYO3_CROSS_LIB_DIR=$TP/arm64-iphonesimulator/lib \
+  cargo build --release --target aarch64-apple-ios-sim )
+
+# 2) 휠을 만든다
+python tools/wheel/build.py --target android-arm64-v8a
+python tools/wheel/build.py --target ios-arm64
+python tools/wheel/build.py --target ios-arm64-sim
+
+# 3) 판정한다
+python tools/wheel/verify_cross.py   dist/torchnative-*android*.whl
+python tools/wheel/verify_cross.py   --self-test dist/torchnative-*android*.whl
+ANDROID_SERIAL=emulator-5554 \
+  python tools/wheel/verify_android.py dist/torchnative-*android*.whl
 ```
 
+**시뮬레이터도 `PYO3_CONFIG_FILE` 이 필요합니다.** RUST_CROSSBUILD.md §0.5 는 그것을 실기
+전용으로 적어 두었는데(`.cargo/config.toml` 주석과 `build.rs` 의 `is_ios_device` 도 같습니다),
+실제로 돌려 보니 시뮬레이터 배포본에도 `libpython3.13.{a,dylib}` 이 없어 PyO3 의 `-lpython3.13`
+이 그대로 실패합니다.
+
 ```
-EXIT=0
-lib_C.so  4,471,688 B
-ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked
+ld: warning: -undefined dynamic_lookup is deprecated on iOS-simulator
+ld: library 'python3.13' not found
 ```
 
-iOS 배선은 docs/RUST_CROSSBUILD.md §0.5 가 기술하고 있고 (`PYO3_CONFIG_FILE` +
-`TORCHNATIVE_PYTHON_FRAMEWORK_DIR`), 이번에 다시 돌리지는 않았습니다.
+`suppress_build_script_link_lines=true` 만 추가하면 통과합니다 — 실기와 달리 `-framework Python`
+은 필요 없고, `.cargo/config.toml` 이 이미 주는 `-undefined dynamic_lookup` 으로 해소됩니다.
+그래서 시뮬레이터 산출물에는 `Python.framework` 의존이 **없고**, 그것이 정상입니다.
+(`build.rs` 와 `.cargo/config.toml` 은 이 작업의 소유 범위 밖이라 손대지 않았습니다. 고칠 곳은
+그 두 파일의 주석이지 배선이 아닙니다.)
 
-즉 **막고 있는 것은 컴파일이 아닙니다.**
-
-### 7.2 크로스 휠에 필요한 것 — 항목별
+### 7.2 태그 — 추측하지 않고 확인한 것
 
 | | Android | iOS |
 |---|---|---|
-| `_C` 크로스 빌드 | **된다** (위 실측) | 배선 문서화됨, 이번 미실행 |
-| 플랫폼 태그 | PEP 738 `android_<api>_<abi>`, 예 `android_21_arm64_v8a` | PEP 730 `ios_<ver>_<arch>_iphoneos` / `_iphonesimulator` |
-| 태그를 다는 방법 | `tools/wheel/build.py` 는 지금 **호스트 전용**이다. 산출물 경로와 태그를 인자로 받게 열어야 한다 | 같음 |
-| global-deps 스텁 | **NDK `cc` 로 함께 크로스 컴파일해야 한다.** 지금은 호스트 `cc` 로 만든다 — 그대로 넣으면 Mach-O 를 안드로이드에 싣게 된다 | 같음 (`xcrun --sdk iphoneos cc`) |
-| 의존성 해소 | `filelock` 등 7 개는 전부 순수 파이썬이라 `py3-none-any` 로 받아진다 | 같음 |
-| 설치 주체 | 기기의 pip 가 아니라 앱 패키징 도구가 언팩한다 | 같음 |
-| **검증** | **기기/에뮬레이터 필요.** 이번 작업 범위 밖 | 시뮬레이터 필요 |
+| PEP | 738 | 730 |
+| 형태 | `android_<api>_<abi>` | `ios_<major>_<minor>_<multiarch>` |
+| 실제 값 | `android_21_arm64_v8a` | `ios_12_0_arm64_iphoneos` · `ios_14_0_arm64_iphonesimulator` |
+| 그 숫자의 출처 | 타깃 CPython 의 `ANDROID_API_LEVEL` | 타깃 CPython 의 `IPHONEOS_DEPLOYMENT_TARGET`, **단 산출물 쪽이 더 높으면 그쪽** |
+| 숫자의 의미 | **하한**. `packaging` 은 기기의 레벨에서 16 까지 내려가며 태그를 만든다 | **하한**. 12.0 까지 내려간다 |
 
-**마지막 줄이 핵심입니다.** 크로스 휠을 만드는 것 자체는 위 네 항목이면 되지만, 만든 것이
-동작하는지는 기기에서만 알 수 있습니다. 검증하지 않은 크로스 휠을 내는 것은 지금 PyPI 에 있는
-껍데기와 같은 종류의 약속입니다 — 설치는 되고 동작은 확인된 바 없는 것. **그래서 만들지
-않았습니다.**
+두 가지를 실제로 확인했습니다.
 
-(Android 기기에서 `import torch` 와 97 개 연산이 도는 것 자체는 별도로 측정돼 있습니다 —
-README Status 와 docs/DEVICE.md. 다만 그것은 `PYTHONPATH` 로 트리를 얹은 것이지 휠 설치가
-아닙니다.)
+**하나. 형태를 명세가 아니라 `packaging` 에 물었습니다.** pip 가 "이 휠이 내 것인가" 를 판정할 때
+쓰는 코드가 `packaging.tags.{android,ios}_platforms` 이므로, 거기서 나오는 목록에 우리 태그가
+들어 있는지를 빌드가 검사합니다. 들어 있지 않으면 빌드가 실패합니다.
 
-### 7.3 `docs/CARGO_KT.md` 와의 관계
+```
+  tag android_21_arm64_v8a accepted by packaging.tags.android_platforms
+  tag ios_12_0_arm64_iphoneos accepted by packaging.tags.ios_platforms
+```
+
+이 기계의 `packaging` 은 26.3 이고 두 생성기를 모두 가지고 있습니다. 없는 버전이면 검사를
+**건너뛰었다고 출력**합니다 — 조용히 통과시키지 않습니다.
+
+**둘. 시뮬레이터의 하한은 CPython 이 아니라 산출물이 정했습니다.** Rust 의
+`aarch64-apple-ios-sim` 기본 배포 대상이 14.0 이라, CPython 의 12.0 을 그대로 쓰면 **자기 확장을
+로드할 수 없는 OS 를 광고하는 휠**이 됩니다. `LC_BUILD_VERSION` 의 `minos` 를 읽어 더 높은 쪽을
+택합니다.
+
+```
+  tag floor from the artefact (14.0), not from CPython (12.0)
+```
+
+실기 쪽은 반대로 산출물이 10.0(`LC_VERSION_MIN_IPHONEOS`)이라 CPython 의 12.0 이 이겼습니다.
+
+### 7.3 Android — 기기에서 실제로 임포트하고 계산한다
+
+`tools/wheel/verify_android.py` 가 하는 것은 §2 의 판정을 기기로 옮긴 것입니다. 판정 문장이
+같습니다 — **`torch.__file__` 이 설치 위치 안을 가리켜야 한다.**
+
+`PYTHONPATH` 를 쓰지 않는 것이 이전 측정과의 차이입니다. docs/DEVICE.md 의 모든 안드로이드
+측정은 `PYTHONPATH=$ROOT/site` 로 트리를 얹은 것이고, **`PYTHONPATH` 엔트리는 망가진 설치를
+가려 줄 수 있는 바로 그것**입니다. 여기서는 휠을 기기 CPython 의 **site-packages** 에 풀고,
+`-s -P` 로(유저 site 없음, 작업 디렉터리 없음) 돌립니다.
+
+```
+$ ANDROID_SERIAL=emulator-5554 python tools/wheel/verify_android.py \
+      dist/torchnative-0.0.1a0-cp313-abi3-android_21_arm64_v8a.whl
+
+  sys.path  ['/data/local/tmp/bw_wheel/lib/python313.zip',
+             '/data/local/tmp/bw_wheel/lib/python3.13',
+             '/data/local/tmp/bw_wheel/lib/python3.13/lib-dynload',
+             '/data/local/tmp/bw_wheel/lib/python3.13/site-packages']
+
+  torch_file   .../site-packages/torch/__init__.py
+  C_file       .../site-packages/torch/_C.abi3.so
+  C_names      1249   aten_ops 896
+  aten.mm      [[4.0, 4.0], [4.0, 4.0], [4.0, 4.0]]
+  x + x        [2.0, 2.0, 2.0, 2.0]
+  nn.Linear    [2, 3] torch.float32
+  metadata     torch 2.13.0
+
+PASS -- torchnative-0.0.1a0-cp313-abi3-android_21_arm64_v8a.whl unpacks into an
+        Android CPython's site-packages and its torch computes on the device
+```
+
+`sys.path` 에 저장소로 이어지는 항목이 하나도 없습니다. 기기에는 개발 트리 자체가 없으므로
+`torch.__file__` 검사는 §2 만큼 날카롭지는 않지만, **`PYTHONPATH` 를 쓰지 않는다는 것**이 그
+자리를 대신합니다.
+
+`pip install` 은 아닙니다 — 기기 CPython 용 pip 가 이 기계에 없고 기기에서 받게 하면 네트워크가
+필요합니다. 대신 이 휠이 실제로 쓰는 PEP 427 설치 동작만 흉내 냅니다: 아카이브를 site-packages
+에 풀고, `.data/purelib/` 를 그 위로 옮기고(그래서 `importlib.metadata.version("torch")` 가
+`2.13.0` 을 답합니다), 휠의 `Requires-Dist` 가 이름 대는 순수 파이썬 배포본들을 옆에 놓습니다.
+그 목록은 여기 적어 둔 것이 아니라 **휠의 METADATA 를 읽어서** 만듭니다.
+
+#### 7.3.1 `TORCH_USE_RTLD_GLOBAL` 이 더 이상 필요 없다
+
+docs/DEVICE.md §4 는 이 변수를 안드로이드에서 **필수**로 기록했습니다. 그 측정은
+`torch/lib/libtorch_global_deps.so` 가 **없는** 트리에 대한 것이었고, 휠은 그것을 싣습니다
+(§3.2). 그래서 같은 기기에서 셋을 다 돌렸습니다.
+
+| 실행 | 결과 |
+|---|---|
+| 스텁만, `TORCH_USE_RTLD_GLOBAL` 없이 | **성공** — 위 출력 |
+| 스텁 + `TORCH_USE_RTLD_GLOBAL=1` | 성공, 같은 값 |
+| 스텁, 변수 없이, **기기의 global-deps 파일을 치우고** | **실패** |
+
+세 번째가 음성 대조입니다. 파일 이름만 바꾸고 같은 명령을 돌리면:
+
+```
+OSError: dlopen failed: library ".../site-packages/torch/lib/libtorch_global_deps.so" not found
+  ctypes.CDLL(global_deps_lib_path, mode=ctypes.RTLD_GLOBAL)
+```
+
+**즉 그 파일은 장식이 아니라 실제로 로드되고 있고, 그것이 있어서 우회 변수가 필요 없어진
+것입니다.** 이것으로 VENDOR.md 벽 1 이 기기에서도 닫혔습니다.
+
+#### 7.3.2 아직 필요한 것 — `_multiprocessing` 스텁
+
+`_multiprocessing` 스텁 없이 돌리면 여전히 죽습니다.
+
+```
+torch/multiprocessing/__init__.py:110  from multiprocessing.resource_tracker import ...
+  -> lib/python3.13/multiprocessing/resource_tracker.py:41  import _multiprocessing
+ModuleNotFoundError: No module named '_multiprocessing'
+```
+
+**이것은 휠의 결함이 아니라 안드로이드 CPython 배포본의 성질입니다** — 그 배포본은
+`_multiprocessing` 도 `_posixshmem` 도 빌드하지 않습니다(안드로이드에 SysV IPC 가 없습니다).
+`scripts/device_parity.py` 가 같은 이유로 같은 스텁을 답니다. `verify_android.py` 는 스텁 없이도
+한 번 돌려서 그 실패를 **출력에 남깁니다** — 필요한 것을 배경에 숨기지 않기 위해서입니다.
+
+이것을 진짜로 닫으려면 안드로이드 CPython 을 다시 빌드하거나 `torch/multiprocessing` 을
+지연 임포트로 바꿔야 하고, 둘 다 휠 작업의 몫이 아닙니다.
+
+### 7.4 iOS — 아티팩트까지가 답할 수 있는 전부다
+
+실기도, 시뮬레이터 앱 하네스도 없으므로 **로드·임포트·계산은 측정하지 않았습니다.** 확인한
+것은 파일 안에 무엇이 들어 있는가입니다.
+
+```
+torchnative-0.0.1a0-cp313-abi3-ios_12_0_arm64_iphoneos.whl
+  binaries            2
+    torch/_C.abi3.so                   Mach-O arm64 ios 10.0+
+    torch/lib/libtorch_global_deps.so  Mach-O arm64 ios 12.0+
+  ext suffix          .abi3.so present in Python
+  file list           identical to torchnative-...-macosx_11_0_arm64.whl (2,684 entries)
+```
+
+각 줄이 무엇을 말하는지:
+
+| | |
+|---|---|
+| `Mach-O arm64 ios` | `LC_BUILD_VERSION`/`LC_VERSION_MIN_*` 의 플랫폼 필드를 직접 읽은 것. **`ios`(2) 와 `iossimulator`(7) 은 이것 말고 구별되지 않습니다** — 크기도 아키텍처도 심볼도 같습니다 |
+| `Python.framework` | 실기 산출물의 `LC_LOAD_DYLIB` 에 `@rpath/Python.framework/Python` 이 있습니다. 실기에는 폴백할 libpython 이 없으므로 이것이 없으면 로드 자체가 불가능합니다. 시뮬레이터 쪽에는 없고, 그것이 맞습니다(§7.1) |
+| `.so` 인데 Mach-O | 파일 **이름**이 `.so` 여야 합니다. `_load_global_deps()` 가 `".dylib" if platform.system() == "Darwin" else ".so"` 로 이름을 만드는데 **iOS 에서 `platform.system()` 은 `"iOS"`** 입니다. 내용은 Mach-O dylib 이고 `dlopen` 은 확장자를 보지 않습니다 |
+| `ext suffix` | `.abi3.so` 라는 문자열이 그 배포본의 `Python.framework/Python` 안에 실제로 있습니다. CPython 의 `_PyImport_DynLoadFiletab` 이 `{SOABI 접미사, ".abi3.so", SHLIB_SUFFIX}` 이고 그 상수들이 인터프리터에 컴파일되어 들어가므로, **기기 없이 이 질문에 답할 수 있는 가장 강한 형태**입니다. 안드로이드 쪽은 기기에서 직접 목록을 찍은 측정이 따로 있습니다(`scripts/device_android.sh` 주석) |
+| `file list identical` | 트리가 하나도 빠지지 않았다는 것. 호스트 휠과 엔트리 집합이 정확히 같습니다 |
+
+**여기까지가 이 문서가 iOS 에 대해 주장하는 전부입니다.** "빌드된다" 는 판정이 아니라는 것을
+호스트 휠에서 배웠고, 그 교훈은 여기에도 그대로 적용됩니다 — 다만 지금은 판정할 수단이 없다는
+것이 답입니다.
+
+또 하나 미결로 남는 것: iOS 앱은 App Store 규칙상 바이너리 모듈을 `.framework` 로 담아야 하고,
+PEP 730 휠 안의 `.so` 를 프레임워크로 바꾸는 것은 **앱 패키징 도구의 일**입니다(briefcase 가
+그렇게 합니다). 이 휠은 규격대로 `.so` 를 싣고, 그 변환이 이 저장소 안에서 일어나는지는
+아직 아무도 정하지 않았습니다.
+
+### 7.5 검증이 실제로 실패하는지 확인했다
+
+"실패할 수 없는 검증은 검증이 아니다". `verify_cross.py --self-test` 는 좋은 휠을 아홉 가지로
+망가뜨린 뒤, 각각이 **올바른 이유로** 거절되는지 봅니다. 종료 코드만 보지 않고 보고 문구를
+맞춰 보는 이유는, 파일 목록 비교가 나머지 여덟 개를 전부 흡수해 버리기 때문입니다.
+
+```
+SELF-TEST against torchnative-0.0.1a0-cp313-abi3-android_21_arm64_v8a.whl
+  caught      extension built for the wrong platform
+  caught      global-deps library missing
+  caught      global-deps library under the host's name
+  caught      wall-4 marker missing
+  caught      a member edited without updating RECORD
+  caught      part of the vendored tree dropped
+  caught      WHEEL Tag: out of step with the filename
+  caught      platform tag no installer would generate
+  caught      abi tag downgraded from abi3
+
+SELF-TEST: PASS -- 9/9 fault modes rejected
+```
+
+세 크로스 휠 전부에서 9/9 입니다. 손상은 헤더 필드를 직접 고쳐 만들므로 — ELF 의 `e_machine`,
+Mach-O 의 `LC_BUILD_VERSION.platform` — **디스크에 다른 아티팩트가 있든 없든 아홉 개가 매번 다
+돕니다.** 건너뛴 항목이 통과처럼 보이는 일이 없습니다.
+
+기기 쪽 음성 대조는 §7.3.1 의 세 번째 줄입니다.
+
+### 7.6 남은 칸을 채우려면
+
+| 빈 칸 | 필요한 것 |
+|---|---|
+| iOS 시뮬레이터 임포트 | 최소 앱 번들 + `xcrun simctl` 로 실행하는 하네스. `Python.framework` 를 번들에 넣고 휠을 그 앱의 `app_packages` 에 풀면 `verify_android.py` 와 같은 프로브를 돌릴 수 있습니다 |
+| iOS 실기 | 기기 · 프로비저닝 프로파일. 이 기계에 없습니다 |
+| Android `_multiprocessing` | 배포본 재빌드, 또는 상류 `torch/multiprocessing` 지연 임포트 |
+| `pip install` 로서의 안드로이드 설치 | 기기용 pip. 지금은 언팩으로 대신하고 있고, 그 차이를 §7.3 이 적어 두었습니다 |
+
+### 7.7 `docs/CARGO_KT.md` 와의 관계
 
 설계 문서는 이 배선을 `pypackpack` 저장소의 Cargo 백엔드가 맡는 것으로 상정합니다. **이 작업은
-그 저장소를 건드리지 않았습니다.** `tools/wheel/build.py` 는 그 백엔드가 생기기 전까지의 경로이고,
-그때 옮겨질 것이라는 전제로 짧게 유지했습니다.
+그 저장소를 건드리지 않았습니다.** `tools/wheel/build.py` 의 `--target` 은 그 백엔드가 생기기
+전까지의 경로이고, `TARGETS` 표가 그때 옮겨질 것 — 타깃 하나는 "산출물 경로 · 컴파일러 ·
+태그" 세 답이고, 그 세 개가 `Cargo.kt` 가 인코딩해야 할 것과 같습니다.
 
 ---
 
@@ -460,11 +708,12 @@ README Status 와 docs/DEVICE.md. 다만 그것은 `PYTHONPATH` 로 트리를 �
 
 | | |
 |---|---|
-| `twine check` | **PASSED** |
-| 파일 크기 | 12.6 MiB — 기본 한도 100 MB 대비 여유 |
-| 프로젝트 총량 | 플랫폼당 ~13 MB. macOS(arm64/x86_64) · Linux · Android · iOS 를 다 내도 기본 총량 한도에 한참 못 미친다 |
-| 태그 | `cp313-abi3-macosx_11_0_arm64`. abi3 이므로 **파이썬 버전마다 낼 필요가 없다** — 3.13 · 3.14 를 하나로 덮는 것을 §2.3 에서 확인했다 |
-| 여러 플랫폼 | 태그가 다르므로 같은 버전에 여러 파일을 올린다. 크로스 휠은 §7.2 가 끝나야 한다 |
+| `twine check` | **4/4 PASSED** (macOS · Android · iOS · iOS 시뮬레이터) |
+| 파일 크기 | 12.7~13.0 MiB — 기본 한도 100 MB 대비 여유 |
+| 프로젝트 총량 | 플랫폼당 ~13 MB. 지금 있는 넷을 다 내도 기본 총량 한도에 한참 못 미친다 |
+| 태그 | 전부 `cp313-abi3-*`. abi3 이므로 **파이썬 버전마다 낼 필요가 없다** — 3.13 · 3.14 를 하나로 덮는 것을 §2.3 에서 확인했다 |
+| 여러 플랫폼 | 태그가 다르므로 같은 버전에 여러 파일을 올린다 |
+| **iOS 두 개** | 만들어졌고 아티팩트는 맞지만 **한 번도 실행된 적이 없다** (§7.0). 검증되지 않은 휠을 올리는 것은 지금 PyPI 에 있는 껍데기와 같은 종류의 약속이다 — 설치는 되고 동작은 확인된 바 없는 것. **업로드 판단이 필요한 지점이고, 이 작업은 아무것도 올리지 않았다** |
 | **라이선스** | §6 의 첫 줄. **이것이 업로드 전 진짜 블로커다** |
 | `0.0.1a0` 재사용 불가 | PyPI 는 같은 버전에 같은 파일명을 다시 받지 않는다. 지금 `0.0.1a0` 에는 `py3-none-any` 가 이미 올라가 있다. 플랫폼 휠은 파일명이 다르므로 **같은 버전에 추가**할 수는 있는데, 그러면 그 버전이 "설치는 되는데 안 되는 것" 과 "되는 것" 을 동시에 갖게 된다. 새 버전을 쓰는 편이 낫다 — 판단 필요 |
 
@@ -503,9 +752,59 @@ README Status 와 docs/DEVICE.md. 다만 그것은 `PYTHONPATH` 로 트리를 �
 - 벤더링 트리 자체 — 전부 `vendor_torch.sh` 가 생성한 것
 - `pypackpack` 저장소
 
+---
+
+## 10. 크로스 휠 회차 (2026-08-28) — 만든 것 / 고친 것
+
+앞 절들은 호스트 휠을 처음 만든 기록이고, 이 절은 안드로이드 · iOS 를 붙인 회차입니다.
+칸을 나눈 이유는 CLAUDE.md §5.3 입니다 — 테스트 수는 진척이 아니고, 무엇이 어느 칸인지
+밝히지 않으면 삭제와 구현이 같은 줄에 섞입니다.
+
+**기능 추가**
+
+- `tools/wheel/build.py --target {android-arm64-v8a,ios-arm64,ios-arm64-sim}` —
+  크로스 산출물 주입 · 타깃 컴파일러로 global-deps · PEP 738/730 태그 유도. 호스트 경로는
+  동작이 바뀌지 않았고, 태그도 그대로 `macosx_11_0_arm64` 입니다
+- `tools/wheel/binfmt.py` — Mach-O / ELF 를 직접 읽는다. `LC_BUILD_VERSION` ·
+  `LC_VERSION_MIN_*` · `LC_LOAD_DYLIB` · ELF `e_machine`. 아카이브 안의 **바이트**에 대해
+  물어야 하므로 `file(1)` 로는 안 됩니다
+- `tools/wheel/verify_cross.py` — 크로스 휠 정적 판정 + `--self-test` (9 개 오류 모드)
+- `tools/wheel/verify_android.py` — 기기 site-packages 설치 + `import torch` + 연산 판정
+
+**결함 수정**
+
+- `tools/wheel/build.py` — 호스트 global-deps 가 빌드 SDK 의 배포 대상(`macos 26.0+`)으로
+  스탬프되어 태그(`macosx_11_0`)와 어긋나 있던 것 (§3.2.1)
+
+**측정 (새 사실)**
+
+- 안드로이드 휠에서 **`TORCH_USE_RTLD_GLOBAL=1` 이 더 이상 필요 없다.** docs/DEVICE.md §4 는
+  이것을 필수로 기록하고 있고, 그 표는 이 결과로 정정되어야 합니다 (§7.3.1). 파일을 치우면
+  다시 실패하는 것까지 확인했습니다
+- iOS **시뮬레이터도 `PYO3_CONFIG_FILE` 이 필요하다.** RUST_CROSSBUILD.md §0.5 와
+  `rust/torch_c/build.rs` 주석은 실기 전용으로 적고 있습니다 (§7.1)
+- 세 타깃 산출물의 배포 대상: 실기 `ios 10.0+`, 시뮬레이터 `iossimulator 14.0+`,
+  안드로이드 API 21. 시뮬레이터 쪽이 CPython 의 12.0 보다 높아 **태그 하한을 산출물이 정합니다**
+
+**문서**
+
+- 이 문서 §0 · §1 · §3.2 · §7 · §8. §0 의 호스트 숫자와 스위트 수(113/2268 → 168/2702)가
+  낡아 있어 실측으로 갱신했습니다
+
+**손대지 않은 것**
+
+- `rust/torch_c/` · `tools/golden/` · `scripts/` · `vendor/` — 한 줄도
+- `rust/torch_c/build.rs` 와 `.cargo/config.toml` — §7.1 이 지적하는 것은 그 두 파일의
+  **주석**이지 배선이 아니고, 소유 범위 밖이라 남겼습니다
+- `docs/DEVICE.md` — §7.3.1 이 그 문서의 표를 정정해야 하지만 소유 범위 밖입니다
+- 업로드. 아무것도 PyPI 에 올리지 않았습니다
+
 **기존 검증** (이 작업 전후 동일, 종료 코드로 판정)
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   ->  EXIT=0,  ok 113
-$PY tools/golden/compare.py                 ->  EXIT=0,  2268/2268, ops=97
+PYTHON=$PY sh rust/torch_c/pytests/run.sh   ->  EXIT=0,  ok 168
+$PY tools/golden/compare.py                 ->  EXIT=0,  2702/2702, ops=118
+$BPY tools/wheel/build.py                   ->  EXIT=0
+$BPY tools/wheel/verify.py dist/*macosx*    ->  EXIT=0,  PASS
+$BPY -m twine check dist/*.whl              ->  EXIT=0,  4/4 PASSED
 ```

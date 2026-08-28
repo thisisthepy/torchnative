@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Build a platform wheel that actually contains a torch you can import.
 
-    python tools/wheel/build.py
+    python tools/wheel/build.py                            # this machine
+    python tools/wheel/build.py --target android-arm64-v8a
+    python tools/wheel/build.py --target ios-arm64
+    python tools/wheel/build.py --target ios-arm64-sim
 
 The distribution on PyPI as `torchnative 0.0.1a0` is `py3-none-any` and holds
 only the `torchnative/` skeleton: no `_C`, no vendored tree. `pip install
@@ -29,9 +32,27 @@ What it does beyond `pip wheel .`:
               anything missing. A wheel that is merely *smaller* than it should
               be installs fine and breaks later, at some import nobody ran.
 
+Cross targets (`--target`) reuse all of that and swap three things, which are
+exactly the three that are platform-shaped (§ `TARGETS`):
+
+  the extension   `torch/_C.abi3.so` comes from the cross build's target
+                  directory instead of from the source tree. The source tree
+                  keeps the host artefact, so the suites that read it keep
+                  measuring the host.
+  global deps     built by the target's compiler, and named `.so` rather than
+                  `.dylib` on iOS as well as Android -- `_load_global_deps()`
+                  picks the extension with `platform.system() == "Darwin"`,
+                  which is False on iOS.
+  the tag         `android_<api>_<abi>` / `ios_<major>_<minor>_<multiarch>`,
+                  derived from the *target CPython distribution* rather than
+                  written down here, and cross-checked against what the
+                  artefact itself says it needs.
+
 Then check it for real -- building is not the proof:
 
-    python tools/wheel/verify.py dist/<wheel>
+    python tools/wheel/verify.py dist/<host wheel>        # installs it
+    python tools/wheel/verify_cross.py dist/<cross wheel> # inspects it
+    python tools/wheel/verify_android.py dist/<android wheel>   # imports it
 """
 
 from __future__ import annotations
@@ -44,11 +65,13 @@ import io
 import os
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from binfmt import describe, elf_info, macho_arches, macho_info  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "torchnative" / "src" / "main"
@@ -160,7 +183,13 @@ def _fix_install_name(data: bytes) -> bytes:
     Doing it here rather than in `vendor/install_shim.sh` keeps the file that
     the test suites load byte-identical to the one cargo emitted, so a green
     suite is evidence about the artefact and not about this rewrite.
+
+    Applies to the iOS artefacts too -- cargo does the same thing there. Not to
+    the Android one: that is an ELF, and `install_name_tool` on an ELF is not a
+    no-op but an error, so the format is checked rather than the host platform.
     """
+    if macho_info(data) is None:
+        return data
     if sys.platform != "darwin" or not shutil.which("install_name_tool"):
         return data
     import tempfile
@@ -190,36 +219,6 @@ def _fix_install_name(data: bytes) -> bytes:
             print("  ! no codesign, keeping original install name")
             return data
         return path.read_bytes()
-
-
-# Mach-O, enough of it to answer "which CPUs does this run on". cputype values
-# from <mach/machine.h>; the 0x01000000 bit is CPU_ARCH_ABI64.
-_FAT_MAGICS = {0xCAFEBABE, 0xCAFEBABF}
-_THIN_MAGICS = {0xFEEDFACE, 0xFEEDFACF}
-_CPU_NAMES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "i386"}
-
-
-def macho_arches(data: bytes) -> list[str]:
-    """Architectures actually present in a Mach-O image."""
-    if len(data) < 8:
-        return []
-    magic_be = struct.unpack_from(">I", data)[0]
-    if magic_be in _FAT_MAGICS:
-        # `fat_arch` is 20 bytes, `fat_arch_64` (magic ...BF) is 32; both start
-        # with cputype, which is the only field wanted here.
-        stride = 20 if magic_be == 0xCAFEBABE else 32
-        count = struct.unpack_from(">I", data, 4)[0]
-        out = []
-        for i in range(count):
-            cputype = struct.unpack_from(">I", data, 8 + i * stride)[0]
-            out.append(_CPU_NAMES.get(cputype, f"cpu{cputype:#x}"))
-        return out
-    for endian in ("<", ">"):
-        magic = struct.unpack_from(endian + "I", data)[0]
-        if magic in _THIN_MAGICS:
-            cputype = struct.unpack_from(endian + "I", data, 4)[0]
-            return [_CPU_NAMES.get(cputype, f"cpu{cputype:#x}")]
-    return []
 
 
 def honest_macos_plat(plat: str, so_data: bytes) -> str:
@@ -263,32 +262,336 @@ def _retag(name: str, plat: str) -> str:
     return "-".join(parts) + ".whl"
 
 
-def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str) -> Path:
+# ------------------------------------------------------------- cross targets
+#
+# Everything platform-shaped about a wheel is one of three things: which
+# `_C.abi3.so` goes in it, which compiler builds the empty global-deps library
+# beside it, and what the tag says. A target is those three answers.
+#
+# The tag is *derived*, not written down. Both PEP 738 and PEP 730 encode a
+# minimum OS version, and the honest value for that is a property of the CPython
+# distribution the extension is built against -- `ANDROID_API_LEVEL` and
+# `IPHONEOS_DEPLOYMENT_TARGET` in its `_sysconfigdata_*.py`. Hardcoding either
+# would mean the tag stays put when the distribution is replaced, which is the
+# same class of lie as the `universal2` tag in §3.3 of docs/WHEEL.md.
+
+TARGET_PYTHON_ROOT = Path(os.environ.get(
+    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
+
+# Where `cargo` put the cross artefacts. Cargo's own default is `<crate>/target`
+# and every build wiring in this repository overrides it, so read the same
+# variable rather than inventing a third convention.
+CARGO_TARGET_DIR = Path(os.environ.get(
+    "CARGO_TARGET_DIR", REPO / "rust" / "torch_c" / "target"))
+
+# NDK ABI names, keyed by the architecture half of CPython's `MULTIARCH`. This
+# is the NDK's own mapping (developer.android.com/ndk/guides/abis), not a guess;
+# `packaging.tags.android_platforms` normalises the hyphen to an underscore and
+# that normalisation is applied here too, by `_normalise`.
+_ANDROID_ABIS = {
+    "aarch64": "arm64-v8a",
+    "arm": "armeabi-v7a",
+    "x86_64": "x86_64",
+    "i686": "x86",
+}
+
+
+def _normalise(s: str) -> str:
+    """`packaging.tags._normalize_string`: hyphens and periods become `_`."""
+    return s.replace("-", "_").replace(".", "_")
+
+
+def target_sysconfig(root: Path) -> dict[str, object]:
+    """`build_time_vars` of a cross-compiled CPython, without importing it.
+
+    The file is CPython's own generated `_sysconfigdata_<abi>_<multiarch>.py`,
+    a single dict literal. Reading it is how the wheel tag gets to be a fact
+    about the interpreter the extension will actually be loaded by, rather than
+    a constant in this file.
+    """
+    found = sorted(root.glob("lib/python3.*/_sysconfigdata_*.py"))
+    if not found:
+        _fail(f"no _sysconfigdata_*.py under {root}/lib/python3.* -- "
+              f"is {root} a cross-compiled CPython distribution?")
+    namespace: dict[str, object] = {}
+    exec(compile(found[0].read_text(), str(found[0]), "exec"), namespace)
+    variables = namespace.get("build_time_vars")
+    if not isinstance(variables, dict):
+        _fail(f"{found[0]} defines no build_time_vars")
+    return variables
+
+
+class Target:
+    """One cross target: an artefact, a compiler, and a derived tag."""
+
+    def __init__(self, key: str, rust_target: str, python_root: Path,
+                 artefact_name: str):
+        self.key = key
+        self.rust_target = rust_target
+        self.python_root = python_root
+        self.artefact = CARGO_TARGET_DIR / rust_target / "release" / artefact_name
+
+    # The name `_load_global_deps()` will look for. It picks the extension with
+    # `".dylib" if platform.system() == "Darwin" else ".so"` -- and
+    # `platform.system()` is "iOS" on iOS and "Android" on Android, so both of
+    # them want `.so` even though the iOS file is a Mach-O dylib. Getting this
+    # wrong is silent: the `ctypes.CDLL` raises OSError, `_load_global_deps`
+    # swallows it into `_preload_cuda_deps`, and the import fails somewhere else.
+    global_deps_name = "libtorch_global_deps.so"
+
+    def sysconfig(self) -> dict[str, object]:
+        return target_sysconfig(self.python_root)
+
+    def platform_tag(self, artefact: bytes) -> str:      # pragma: no cover
+        raise NotImplementedError
+
+    def cc(self) -> list[str]:                           # pragma: no cover
+        raise NotImplementedError
+
+    def check_image(self, data: bytes, what: str) -> None:  # pragma: no cover
+        """Is this machine code for this target? Raises through `_fail`."""
+        raise NotImplementedError
+
+    def check_artefact(self, data: bytes) -> None:
+        self.check_image(data, str(self.artefact))
+
+    def check_global_deps(self, data: bytes) -> None:
+        self.check_image(data, f"the global-deps library from {self.cc()[0]}")
+
+
+class AndroidTarget(Target):
+    """PEP 738: `android_<api-level>_<abi>`.
+
+    The API level in the tag is a *floor*: `packaging.tags.android_platforms`
+    yields every level from the device's own down to 16, so a device at API 34
+    accepts an `android_21_` wheel and a device at API 19 does not. The floor
+    that is true for this build is the one CPython itself was configured with
+    -- `scripts/device_android.sh build` passes `--platform 21` to `cargo ndk`
+    for the same reason, and the two agreeing is checked below rather than
+    assumed.
+    """
+
+    def __init__(self):
+        super().__init__(
+            "android-arm64-v8a", "aarch64-linux-android",
+            TARGET_PYTHON_ROOT / "aarch64-linux-android" / "prefix", "lib_C.so",
+        )
+
+    def _api_and_abi(self) -> tuple[int, str]:
+        variables = self.sysconfig()
+        api = int(variables["ANDROID_API_LEVEL"])
+        arch = str(variables["MULTIARCH"]).split("-")[0]
+        if arch not in _ANDROID_ABIS:
+            _fail(f"unknown Android architecture {arch!r} in MULTIARCH="
+                  f"{variables['MULTIARCH']!r}")
+        return api, _normalise(_ANDROID_ABIS[arch])
+
+    def platform_tag(self, artefact: bytes) -> str:
+        api, abi = self._api_and_abi()
+        tag = f"android_{api}_{abi}"
+        _confirm_with_packaging(tag, "android", api_level=api, abi=abi)
+        return tag
+
+    def cc(self) -> list[str]:
+        api, _ = self._api_and_abi()
+        ndk = Path(os.environ.get(
+            "ANDROID_NDK_HOME",
+            Path.home() / "Library/Android/sdk/ndk/27.1.12297006"))
+        found = sorted(ndk.glob(
+            f"toolchains/llvm/prebuilt/*/bin/aarch64-linux-android{api}-clang"))
+        if not found:
+            _fail(
+                f"no aarch64-linux-android{api}-clang under {ndk} -- set "
+                "ANDROID_NDK_HOME. Without it the global-deps library would be "
+                "built by the host cc, which puts a Mach-O inside an Android "
+                "wheel and makes `import torch` fail on the device only"
+            )
+        return [str(found[0]), "-shared", "-fPIC"]
+
+    def check_image(self, data: bytes, what: str) -> None:
+        info = elf_info(data)
+        if info is None:
+            _fail(f"{what} is not an ELF image ({describe(data)}) -- "
+                  "an Android wheel cannot carry it")
+        if (info["bits"], info["machine"], info["type"]) != (64, "aarch64", "dyn"):
+            _fail(f"{what} is {describe(data)}, expected ELF 64-bit aarch64 dyn")
+
+
+class IOSTarget(Target):
+    """PEP 730: `ios_<major>_<minor>_<multiarch>`.
+
+    Same floor semantics as Android -- `packaging.tags.ios_platforms` walks down
+    to 12.0 -- so the version comes from `IPHONEOS_DEPLOYMENT_TARGET`, and the
+    `multiarch` half straight from CPython's `MULTIARCH`, which is exactly the
+    `sys.implementation._multiarch` that `ios_platforms` reads at run time.
+
+    The device and the simulator are two targets, not one: their Mach-O images
+    differ only in the platform field of `LC_BUILD_VERSION` (2 against 7), so a
+    wheel carrying the wrong one is indistinguishable by size, architecture or
+    symbol table and fails only when a real device tries to load it.
+    """
+
+    def __init__(self, key: str, rust_target: str, subdir: str, sdk: str,
+                 platform_id: str):
+        super().__init__(key, rust_target, TARGET_PYTHON_ROOT / subdir,
+                         "lib_C.dylib")
+        self.sdk = sdk
+        self.platform_id = platform_id
+
+    def _multiarch_and_min(self) -> tuple[str, tuple[int, int]]:
+        variables = self.sysconfig()
+        multiarch = _normalise(str(variables["MULTIARCH"]))
+        major, _, minor = str(variables["IPHONEOS_DEPLOYMENT_TARGET"]).partition(".")
+        return multiarch, (int(major), int(minor or 0))
+
+    def platform_tag(self, artefact: bytes) -> str:
+        multiarch, (major, minor) = self._multiarch_and_min()
+        # The artefact has its own floor, from `-mios-version-min`. Rust's
+        # default for these targets need not match CPython's, and if it is
+        # *higher* then the interpreter's number is the wrong one to publish --
+        # the wheel would claim to run on an iOS that cannot load its own
+        # extension. Take the higher of the two and say which won.
+        info = macho_info(artefact) or {}
+        art_min = info.get("minos")
+        if art_min and art_min[:2] > (major, minor):
+            print(f"  tag floor from the artefact ({art_min[0]}.{art_min[1]}), "
+                  f"not from CPython ({major}.{minor})")
+            major, minor = art_min[0], art_min[1]
+        tag = f"ios_{major}_{minor}_{multiarch}"
+        _confirm_with_packaging(tag, "ios", version=(major, minor),
+                                multiarch=multiarch)
+        return tag
+
+    def cc(self) -> list[str]:
+        _, (major, minor) = self._multiarch_and_min()
+        triple = f"arm64-apple-ios{major}.{minor}"
+        if self.platform_id == "iossimulator":
+            triple += "-simulator"
+        return [
+            "xcrun", "--sdk", self.sdk, "clang",
+            "-target", triple, "-dynamiclib",
+            "-install_name", f"@rpath/{self.global_deps_name}",
+        ]
+
+    def check_image(self, data: bytes, what: str) -> None:
+        info = macho_info(data)
+        if info is None:
+            _fail(f"{what} is not a thin 64-bit Mach-O ({describe(data)})")
+        if info["arch"] != "arm64":
+            _fail(f"{what} is {info['arch']}, expected arm64")
+        if info["platform"] != self.platform_id:
+            _fail(
+                f"{what} is built for {info['platform']!r}, not "
+                f"{self.platform_id!r}. A wheel tagged for one and holding the "
+                "other installs and then fails only on the real thing"
+            )
+
+    def check_artefact(self, data: bytes) -> None:
+        super().check_artefact(data)
+        # Device only. The simulator resolves CPython symbols the way macOS
+        # does -- `.cargo/config.toml` gives it `-undefined dynamic_lookup`, so
+        # it carries no Python dependency at all and demanding one here would
+        # fail a correct artefact. On a physical device there is no libpython to
+        # fall back on, so the framework has to be named in the load commands.
+        info = macho_info(data) or {}
+        if self.platform_id == "ios" and not any(
+            "Python.framework" in d for d in info.get("dylibs", ())
+        ):
+            _fail(
+                f"{self.artefact} does not link Python.framework "
+                f"(LC_LOAD_DYLIB: {info.get('dylibs')}). See "
+                "docs/RUST_CROSSBUILD.md §0.5, and check "
+                "TORCHNATIVE_PYTHON_FRAMEWORK_DIR"
+            )
+
+
+def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
+    """Ask `packaging` whether an installer would accept this tag.
+
+    The point is not to *derive* the tag from packaging -- its generators need a
+    running target interpreter's answers, which is precisely what a cross build
+    does not have. It is to check the spelling against the code pip actually
+    uses, so that a mistake here is a build failure rather than a wheel that no
+    device will match. Skipped, loudly, if `packaging` is too old to know the
+    family: that is the state in which the check is worthless, not the state in
+    which it passes.
+    """
+    try:
+        from packaging import tags as ptags
+    except ImportError:
+        print("  ! packaging not importable -- tag spelling unchecked")
+        return
+    generator = getattr(ptags, f"{family}_platforms", None)
+    if generator is None:
+        print(f"  ! packaging {getattr(__import__('packaging'), '__version__', '?')}"
+              f" has no {family}_platforms -- tag spelling unchecked")
+        return
+    accepted = list(generator(**kwargs))
+    if tag not in accepted:
+        _fail(f"packaging.tags.{family}_platforms{kwargs} does not yield {tag!r};"
+              f" it starts {accepted[:3]}")
+    print(f"  tag {tag} accepted by packaging.tags.{family}_platforms")
+
+
+TARGETS: dict[str, Target] = {
+    t.key: t for t in (
+        AndroidTarget(),
+        IOSTarget("ios-arm64", "aarch64-apple-ios", "arm64-iphoneos",
+                  "iphoneos", "ios"),
+        IOSTarget("ios-arm64-sim", "aarch64-apple-ios-sim",
+                  "arm64-iphonesimulator", "iphonesimulator", "iossimulator"),
+    )
+}
+
+
+def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
+            plat: str | None = None,
+            overrides: dict[str, bytes] | None = None) -> Path:
     """Rewrite the archive with `extra` added and RECORD regenerated.
 
     zipfile cannot delete or replace a member, so the whole archive is rebuilt.
     RECORD has to be regenerated anyway: it is a hash manifest, and pip verifies
     it on install, so appending files without touching it produces a wheel that
     fails at exactly the moment it looks like it worked.
+
+    `plat` forces the platform tag (cross builds know theirs; the host derives
+    it below from the extension). `overrides` replaces the content of members
+    that are already there -- which is how a cross wheel gets the cross `_C`
+    without the source tree ever holding it.
     """
     tmp = wheel.with_suffix(".whl.tmp")
     record_name = f"{dist_info}/RECORD"
     wheel_name = f"{dist_info}/WHEEL"
     rows: list[tuple[str, str, str]] = []
-    new_plat: str | None = None
+    overrides = overrides or {}
+    old_plat = wheel.stem.split("-")[-1]
+    new_plat: str | None = plat if plat and plat != old_plat else None
 
     # The architecture correction has to be known before WHEEL is written, and
-    # it comes out of the extension, so read that first.
-    with zipfile.ZipFile(wheel) as src:
-        so = next((n for n in src.namelist() if n.endswith("torch/_C.abi3.so")), None)
-        if so is not None and sys.platform == "darwin":
-            so_data = src.read(so)
-            old_plat = wheel.stem.split("-")[-1]
-            honest = honest_macos_plat(old_plat, so_data)
-            if honest != old_plat:
-                print(f"  retag: {old_plat} -> {honest} "
-                      f"(extension is {'+'.join(macho_arches(so_data))})")
-                new_plat = honest
+    # it comes out of the extension, so read that first. Only for the host: a
+    # cross target was told its tag and must not have it second-guessed by a
+    # macOS-shaped rule.
+    if plat is None:
+        with zipfile.ZipFile(wheel) as src:
+            so = next(
+                (n for n in src.namelist() if n.endswith("torch/_C.abi3.so")), None
+            )
+            if so is not None and sys.platform == "darwin":
+                so_data = src.read(so)
+                honest = honest_macos_plat(old_plat, so_data)
+                if honest != old_plat:
+                    print(f"  retag: {old_plat} -> {honest} "
+                          f"(extension is {'+'.join(macho_arches(so_data))})")
+                    new_plat = honest
+    elif new_plat:
+        print(f"  retag: {old_plat} -> {new_plat}")
+
+    unused = set(overrides) - set(zipfile.ZipFile(wheel).namelist())
+    if unused:
+        # An override that matches nothing is the wheel keeping its host
+        # extension while everything else says it is a cross wheel -- silent,
+        # and exactly the failure this whole path exists to avoid.
+        _fail(f"override(s) name members the wheel does not have: {sorted(unused)}")
 
     with zipfile.ZipFile(wheel) as src, zipfile.ZipFile(
         tmp, "w", zipfile.ZIP_DEFLATED
@@ -296,7 +599,7 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str) -> Path:
         for item in src.infolist():
             if item.filename == record_name:
                 continue  # regenerated at the end
-            data = src.read(item.filename)
+            data = overrides.get(item.filename) or src.read(item.filename)
             if item.filename.endswith("torch/_C.abi3.so"):
                 data = _fix_install_name(data)
                 item = zipfile.ZipInfo(item.filename, date_time=item.date_time)
@@ -346,7 +649,7 @@ const char torchnative_global_deps_note[] =
 """
 
 
-def global_deps_stub() -> dict[str, bytes]:
+def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
     """An empty `torch/lib/libtorch_global_deps` so `import torch` needs no env.
 
     Wall 1 in docs/VENDOR.md: `torch/__init__.py:_load_global_deps()` does an
@@ -375,29 +678,62 @@ def global_deps_stub() -> dict[str, bytes]:
     behaving exactly as every existing doc describes -- wall 1 still stands
     there, and the suites that set the variable are still measuring what they
     say they measure.
+
+    For a cross target the compiler is the target's, not the host's. Handing the
+    host `cc` an Android wheel puts a Mach-O where the device expects an ELF;
+    `CDLL` then raises OSError, `_load_global_deps` swallows it into the
+    `_preload_cuda_deps` path, and the import dies somewhere with no mention of
+    this file. The name changes too -- see `Target.global_deps_name`.
     """
     import tempfile
 
-    ext = ".dylib" if sys.platform == "darwin" else ".so"
-    cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
-    if not cc:
-        _fail(
-            "no C compiler (set CC) -- cannot build the empty "
-            f"torch/lib/libtorch_global_deps{ext}, without which the installed "
-            "wheel cannot `import torch` unless the user sets "
-            "TORCH_USE_RTLD_GLOBAL=1 (docs/VENDOR.md wall 1)"
-        )
+    if target is None:
+        name = "libtorch_global_deps" + (
+            ".dylib" if sys.platform == "darwin" else ".so")
+        cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            _fail(
+                "no C compiler (set CC) -- cannot build the empty "
+                f"torch/lib/{name}, without which the installed "
+                "wheel cannot `import torch` unless the user sets "
+                "TORCH_USE_RTLD_GLOBAL=1 (docs/VENDOR.md wall 1)"
+            )
+        argv = [cc, "-shared", "-fPIC"]
+        # Match the deployment target the wheel will be *tagged* with. Without
+        # this the host `cc` stamps LC_BUILD_VERSION with the SDK it happens to
+        # have -- measured at `macos 26.0+` inside a wheel tagged
+        # `macosx_11_0_arm64` -- and dyld enforces that field, so the file the
+        # tag promises would be unloadable on every macOS the tag claims. Same
+        # class of mistake as the `universal2` tag in docs/WHEEL.md §3.3: the
+        # archive contents and the tag disagreeing, in the direction that only
+        # shows up on somebody else's machine.
+        if sys.platform == "darwin":
+            import sysconfig
+            floor = sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET")
+            if floor:
+                argv.append(f"-mmacosx-version-min={floor}")
+    else:
+        name = target.global_deps_name
+        argv = target.cc()
+
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "global_deps.c"
-        out = Path(tmp) / f"libtorch_global_deps{ext}"
+        out = Path(tmp) / name
         src.write_text(_GLOBAL_DEPS_C)
-        r = subprocess.run([cc, "-shared", "-fPIC", "-o", str(out), str(src)],
+        r = subprocess.run([*argv, "-o", str(out), str(src)],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            _fail(f"{cc} could not build the global-deps stub:\n{r.stderr}")
-        print(f"  + torch/lib/libtorch_global_deps{ext} "
-              f"({out.stat().st_size:,} B, empty by design -- VENDOR.md wall 1)")
-        return {f"torch/lib/libtorch_global_deps{ext}": out.read_bytes()}
+            _fail(f"{argv[0]} could not build the global-deps stub:\n{r.stderr}")
+        data = out.read_bytes()
+        # The compiler was asked for a target; check that it produced one. A
+        # wrong `--sdk` or a host `cc` on $PATH is otherwise invisible until the
+        # device refuses the file.
+        if target is not None:
+            target.check_global_deps(data)
+        print(f"  + torch/lib/{name} "
+              f"({len(data):,} B, empty by design -- VENDOR.md wall 1)"
+              f"\n      {describe(data)}")
+        return {f"torch/lib/{name}": data}
 
 
 def upstream_dist_info(version: str) -> dict[str, bytes]:
@@ -432,25 +768,51 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
     return out
 
 
-def verify(wheel: Path, expected: set[str]) -> None:
+def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
     with zipfile.ZipFile(wheel) as zf:
         names = set(zf.namelist())
-    missing = sorted(n for n in expected if n not in names)
-    if missing:
-        head = "\n".join("    " + m for m in missing[:20])
-        _fail(
-            f"{len(missing)} file(s) present in {SRC} but absent from the wheel:\n"
-            f"{head}\n"
-            + ("    ...\n" if len(missing) > 20 else "")
-            + "  a wheel that is merely smaller than the tree installs fine and\n"
-            "  fails later, at whichever import first needs the missing file"
+        missing = sorted(n for n in expected if n not in names)
+        if missing:
+            head = "\n".join("    " + m for m in missing[:20])
+            _fail(
+                f"{len(missing)} file(s) present in {SRC} but absent from the "
+                f"wheel:\n{head}\n"
+                + ("    ...\n" if len(missing) > 20 else "")
+                + "  a wheel that is merely smaller than the tree installs fine "
+                "and\n  fails later, at whichever import first needs the "
+                "missing file"
+            )
+        if "-none-any" in wheel.name:
+            _fail(f"{wheel.name} is tagged py3-none-any -- setup.py's "
+                  "BinaryDistribution did not take effect")
+        if "-abi3-" not in wheel.name:
+            _fail(f"{wheel.name} is not abi3-tagged -- the bdist_wheel "
+                  "py_limited_api option did not take effect")
+
+        if target is None:
+            return
+
+        # Read the finished archive rather than trusting that the override and
+        # the extra went in. This is the only place that looks at what is
+        # actually in the file that will be published.
+        plat = wheel.stem.split("-")[-1]
+        member = next(n for n in names if n.endswith("torch/_C.abi3.so"))
+        target.check_image(zf.read(member), f"{wheel.name}::{member}")
+        deps = f"torch/lib/{target.global_deps_name}"
+        if deps not in names:
+            _fail(f"{wheel.name} has no {deps}")
+        target.check_image(zf.read(deps), f"{wheel.name}::{deps}")
+        strays = sorted(
+            n for n in names
+            if n.startswith("torch/lib/libtorch_global_deps") and n != deps
         )
-    if "-none-any" in wheel.name:
-        _fail(f"{wheel.name} is tagged py3-none-any -- setup.py's "
-              "BinaryDistribution did not take effect")
-    if "-abi3-" not in wheel.name:
-        _fail(f"{wheel.name} is not abi3-tagged -- the bdist_wheel "
-              "py_limited_api option did not take effect")
+        if strays:
+            # `_load_global_deps` looks for exactly one name. A second one is a
+            # host artefact that came along for the ride.
+            _fail(f"{wheel.name} carries {strays} beside {deps}")
+        if not plat.startswith(("android_", "ios_")):
+            _fail(f"{wheel.name} was built for {target.key} but is tagged "
+                  f"{plat!r}")
 
 
 def main() -> None:
@@ -458,25 +820,54 @@ def main() -> None:
     ap.add_argument("--python", default=sys.executable,
                     help="interpreter whose pip/setuptools drive the build")
     ap.add_argument("--outdir", default=str(REPO / "dist"), type=Path)
+    ap.add_argument("--target", default="host",
+                    choices=["host", *sorted(TARGETS)],
+                    help="cross target; default is this machine")
     args = ap.parse_args()
 
+    target = None if args.target == "host" else TARGETS[args.target]
+
+    # The host preflight runs for cross builds too, unchanged: `pip wheel` walks
+    # the same source tree either way, so a missing vendored tree or a missing
+    # host `_C` produces the same empty shell it always did. The cross artefact
+    # is an *additional* requirement, never a substitute for those.
     stamp = preflight()
     print(f"vendored torch {stamp.get('version', '?')} "
           f"({stamp.get('py_modules', '?')} modules) + _C.abi3.so "
           f"({SHIM.stat().st_size:,} B)")
 
+    overrides: dict[str, bytes] = {}
+    plat: str | None = None
+    if target is not None:
+        if not target.artefact.exists():
+            _fail(
+                f"no cross-built extension at {target.artefact}\n"
+                f"  build it for {target.rust_target} first "
+                "(scripts/device_android.sh build, or docs/RUST_CROSSBUILD.md "
+                "§0.5 for iOS)\n"
+                "  CARGO_TARGET_DIR is currently "
+                f"{CARGO_TARGET_DIR}"
+            )
+        cross = target.artefact.read_bytes()
+        target.check_artefact(cross)
+        print(f"target {target.key}: {target.artefact.name} "
+              f"({len(cross):,} B)\n      {describe(cross)}")
+        plat = target.platform_tag(cross)
+        overrides["torch/_C.abi3.so"] = cross
+
     args.outdir.mkdir(parents=True, exist_ok=True)
     wheel = run_pip_wheel(args.python, args.outdir)
 
     version = wheel.name.split("-")[1]
-    extra = {**upstream_dist_info(version), **global_deps_stub()}
-    wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info")
+    extra = {**upstream_dist_info(version), **global_deps_stub(target)}
+    wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
+                    plat=plat, overrides=overrides)
 
     expected: set[str] = set()
     for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
         if pkg and (SRC / pkg).is_dir():
             expected |= tree_files(SRC / pkg)
-    verify(wheel, expected)
+    verify(wheel, expected, target)
 
     with zipfile.ZipFile(wheel) as zf:
         entries = zf.namelist()
@@ -488,7 +879,13 @@ def main() -> None:
           f"{uncompressed / 1e6:.1f} MB installed")
     print(f"  tag: {'-'.join(wheel.stem.split('-')[2:])}")
     print()
-    print(f"next: python tools/wheel/verify.py {wheel}")
+    if target is None:
+        print(f"next: python tools/wheel/verify.py {wheel}")
+    elif target.key.startswith("android"):
+        print(f"next: python tools/wheel/verify_cross.py {wheel}")
+        print(f"      python tools/wheel/verify_android.py {wheel}")
+    else:
+        print(f"next: python tools/wheel/verify_cross.py {wheel}")
 
 
 if __name__ == "__main__":

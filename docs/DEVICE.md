@@ -84,7 +84,7 @@ bw_device/            399 MB
 | 변수 | 빼면 | 판정 |
 |---|---|---|
 | `LD_LIBRARY_PATH=$ROOT/lib` | `CANNOT LINK EXECUTABLE "./bin/python3.13": library "libpython3.13.so" not found`, 종료 134 | **필수** |
-| `TORCH_USE_RTLD_GLOBAL=1` | `OSError: dlopen failed: library ".../torch/lib/libtorch_global_deps.so" not found` | **필수** |
+| `TORCH_USE_RTLD_GLOBAL=1` | `OSError: dlopen failed: library ".../torch/lib/libtorch_global_deps.so" not found` | **필수 — 단, 이 스테이징 방식에서만. §4.1** |
 | `PYTHONPATH=$ROOT/site` | (자명) | **필수** |
 | `PYTHONHOME=$ROOT` | **없어도 성공한다** | **불필요** |
 | `BW_STUB_MULTIPROCESSING=1` | `ModuleNotFoundError: No module named '_multiprocessing'` | **필수** (§6) |
@@ -93,6 +93,29 @@ bw_device/            399 MB
 argv[0] 에서 prefix 를 유도하기 때문이다. `DEVICE_LOAD.md` 는 이것을 주고 있었지만,
 **필요해서 준 것이 아니었다.** 앱 안에서는 실행 파일이 아니라 임베딩된 인터프리터이므로
 이 결론이 그대로 넘어가지 않는다 — 그때는 다시 재야 한다.
+
+### 4.1 정정 (2026-08-28) — 휠로 설치하면 이 변수가 필요 없다
+
+위 표의 "필수" 는 **이 문서의 스테이징 방식에 대해서만** 참입니다. 그때 기기에 올린 트리에는
+`torch/lib/libtorch_global_deps.so` 가 아예 없었고, 그래서 `_load_global_deps()` 를 건너뛰는
+스위치가 필요했습니다. **없는 파일을 우회한 것이지 안드로이드의 성질이 아닙니다.**
+
+플랫폼 휠은 그 파일을 싣습니다(`docs/WHEEL.md`). 그러니 휠로 설치하면:
+
+```
+torch       : /data/local/tmp/bw_wheel/lib/python3.13/site-packages/torch/__init__.py
+RTLD_GLOBAL : False          ← 주지 않았다
+repo on path: []             ← 개발 트리가 아니라 진짜 설치본이다
+mm          : [[3.0, 3.0], [3.0, 3.0]]
+```
+
+**음성 대조로 확인했습니다.** 기기에서 그 `.so` 의 이름을 바꾸면 예전 에러가 그대로 돌아오고,
+되돌리면 다시 계산합니다. 즉 이 변수를 몰아낸 것은 정확히 그 파일입니다.
+
+`_multiprocessing` 과 `_posixshmem` 스텁은 **여전히 필요합니다.** 그쪽은 휠이 아니라
+**안드로이드 CPython 배포본이 그 둘을 빌드하지 않는** 성질입니다. 조율 세션이 검증 중
+빈 `_posixshmem` 으로는 부족한 것도 확인했습니다 — `resource_tracker.py:54` 가 `shm_unlink` 를
+가드 없이 읽으므로 그 이름은 존재해야 하고, 실제로 쓰이면 실패하도록 두는 것이 맞습니다.
 
 `TORCH_USE_RTLD_GLOBAL` 은 회피가 아니라 상류가 그 목적으로 둔 스위치다
 (`torch/__init__.py:406`). 켜면 `sys.setdlopenflags(RTLD_GLOBAL)` 로 `torch._C` 를 직접
