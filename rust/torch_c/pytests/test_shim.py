@@ -6121,7 +6121,15 @@ def test_every_implemented_op_has_schema_text():
     assert report["source"].endswith("native_functions.yaml"), report["source"]
     placeholders = sorted(k for k, v in report["ops"].items() if v["placeholder"])
     assert placeholders == [], placeholders
-    assert len(report["ops"]) == 117, len(report["ops"])
+    # Derived from `_aten_implemented()`, not pinned to a number. A literal
+    # here says "117 operators" where what is meant is "every one of them", so
+    # it reddens on the next operator added and teaches the reader to bump the
+    # constant -- which is how a coverage assertion decays into a change
+    # detector. It did exactly that on the merge that brought the 118th.
+    assert len(report["ops"]) == len(_C._aten_implemented()), (
+        len(report["ops"]),
+        len(_C._aten_implemented()),
+    )
     for key, entry in sorted(report["ops"].items()):
         assert entry["text"] != f"{key}(...) -> ...", key
         assert entry["text"].startswith("aten::"), (key, entry["text"])
@@ -6166,8 +6174,16 @@ def test_is_mutable_is_not_constant_over_the_implemented_ops():
         return
     _, report = _schema_road_fixture()
     values = [v["is_mutable"] for v in report["ops"].values()]
-    assert values.count(True) == 12, values.count(True)
-    assert values.count(False) == 105, values.count(False)
+    # What this test is for is that the predicate can take both values -- the
+    # defect it was written against answered one of them for everything. Pinning
+    # the two counts instead turns it into a change detector that reddens
+    # whenever the operator set moves, which it did on the merge that brought
+    # the 118th. Which operators are mutable is asserted by name in
+    # `test_the_seven_in_place_ops_say_that_they_mutate`, where a wrong answer
+    # is legible; here only the shape of the answer matters.
+    assert values.count(True) > 0, values.count(True)
+    assert values.count(False) > 0, values.count(False)
+    assert values.count(True) + values.count(False) == len(values)
     assert None not in values
 
 
