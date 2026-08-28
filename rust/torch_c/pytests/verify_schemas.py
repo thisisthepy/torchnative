@@ -294,6 +294,42 @@ for key in torch._C._aten_implemented():
         "placeholder": schema.is_placeholder,
     }
 out["unanswered"] = torch._C._shim_unanswered_predicates()
+
+# docs/DECOMP.md §3. `_jit_get_operation` used to report `["default"]` for
+# every packet, so `@register_decomposition(aten.transpose)` landed on
+# `aten.transpose.default` -- an overload no torch has. The overload list is
+# read out of `native_functions.yaml` now, and upstream is what it is diffed
+# against. Restricted to the packets of implemented ops: the file declares
+# 1554 aten names and walking all of them here would trade a measurement for
+# a wait.
+_packets = sorted({key.rsplit(".", 1)[0] for key in torch._C._aten_implemented()})
+out["overloads"] = {}
+for _key in _packets:
+    _namespace, _, _name = _key.partition(".")
+    out["overloads"][_key] = getattr(
+        getattr(torch.ops, _namespace), _name).overloads()
+
+# The other half of §3: `core_aten_decompositions()` raised here because
+# `CustomDecompTable.__init__` enumerates CompositeImplicitAutograd through
+# this query. It is answered from the same file now.
+out["cia"] = torch._C._dispatch_get_registrations_for_dispatch_key(
+    "CompositeImplicitAutograd")
+
+# docs/DECOMP.md §2: `OpOverload.tags` was `[]` for every op.
+out["tags"] = {}
+for _key in torch._C._aten_implemented():
+    _ns, _name, _ov = _key.split(".")
+    out["tags"][_key] = sorted(
+        tag.name for tag in
+        getattr(getattr(torch.ops, _ns), _name).__getattr__(_ov).tags)
+out["unknown_tags"] = torch._C._shim_unknown_tags()
+try:
+    torch._C._dispatch_get_registrations_for_dispatch_key("CPU")
+except NotImplementedError as _error:
+    out["cia_backend_refusal"] = str(_error)
+else:
+    out["cia_backend_refusal"] = None
+
 json.dump(out, sys.stdout)
 """
 
@@ -446,6 +482,200 @@ def check_unanswered(torch) -> tuple[int, int]:
     return len(pairs), failures
 
 
+def check_overload_names(torch) -> tuple[int, int]:
+    """Every implemented op's packet must list the overloads upstream lists.
+
+    docs/DECOMP.md §3 is what this exists for. `_jit_get_operation` answered
+    `["default"]` for every packet, and nothing in the repository could see
+    that: the schema checks above ask about one `(name, overload)` at a time
+    and are right whatever the *list* says, and in-tree tests have no upstream
+    to compare a list to. The visible symptom was two numbers in an unrelated
+    place -- the decomposition registry holding 592 entries against upstream's
+    1097, 525 of ours ending in `.default` against upstream's 456.
+
+    **The two directions are not the same claim, and only one of them is a
+    failure.**
+
+    An overload this lists that upstream does not have is the defect itself,
+    one shape smaller: a packet-level rule would land on a key no dispatcher
+    knows, which is exactly what `.default` was. That fails.
+
+    An overload upstream has and this does not is expected and mostly
+    *desirable*. `native_functions.yaml` declares 2584 entries and upstream's
+    registry has 3754, the difference being torchgen's generated `.out`
+    variants and TorchScript's numeric builtins -- `aten::sub.float_int`,
+    `aten::sort.bool`. Upstream throws that second group away itself:
+    `torch/_decomp/__init__.py:88` filters `op_overloads()` through
+    `_dispatch_has_kernel` with the comment "TorchScript dumps a bunch of extra
+    nonsense overloads which don't have corresponding dispatcher entries". So
+    the missing direction is failed on one criterion only, and it is the one
+    that costs something: **upstream registers a decomposition for it, and it
+    is not an `.out` variant.**
+
+    The `.out` carve-out is not a convenience. Every missing overload that
+    carries a rule is one of torchgen's generated `.out` variants
+    (docs/SCHEMA.md §12's 1148, which need `pyyaml` to generate), and no
+    `.out` aten key is implemented in this build -- asserted below rather than
+    said -- so no recording can contain one and no rule for one can be
+    wanted. If a missing overload with a rule ever has another shape, that is
+    a real loss and this fails with its name.
+    """
+    report = _shim_report()
+    import torch._decomp as decomp
+
+    registered = {str(key) for key in decomp.decomposition_table}
+    failures = 0
+    missing_total = 0
+    unreachable: list = []
+    for packet, overloads in sorted(report["overloads"].items()):
+        namespace, _, name = packet.partition(".")
+        try:
+            upstream = getattr(getattr(torch.ops, namespace), name).overloads()
+        except AttributeError:
+            failures += 1
+            print(f"FAIL overloads {packet}: upstream has no such packet")
+            continue
+        invented = sorted(set(overloads) - set(upstream))
+        if invented:
+            failures += 1
+            print(f"FAIL overloads {packet}: not overloads of the upstream op: "
+                  f"{invented}")
+            print(f"     upstream: {sorted(upstream)}")
+        missing = sorted(set(upstream) - set(overloads))
+        missing_total += len(missing)
+        for overload in missing:
+            if f"{packet}.{overload}" not in registered:
+                continue
+            if overload == "out" or overload.endswith("_out"):
+                unreachable.append(f"{packet}.{overload}")
+                continue
+            failures += 1
+            print(f"FAIL overloads {packet}: upstream registers a "
+                  f"decomposition for {overload!r} and this packet does not "
+                  f"list it, and it is not an out-variant")
+
+    # The carve-out's premise, checked rather than asserted in prose: if an
+    # `.out` key were implemented, a trace could contain one and the rules
+    # above would stop being unwanted.
+    implemented_out = sorted(
+        key for key in report["ops"]
+        if key.rsplit(".", 1)[1] == "out" or key.endswith("_out")
+    )
+    if implemented_out:
+        failures += 1
+        print(f"FAIL overloads: this build implements out-variants "
+              f"({implemented_out[:5]}), so the {len(unreachable)} "
+              f"decompositions skipped above are no longer unreachable")
+
+    print(f"    overloads upstream has and the file does not declare: "
+          f"{missing_total}; {len(unreachable)} of them carry a decomposition "
+          f"and all are out-variants no recording can contain")
+    return len(report["overloads"]), failures
+
+
+def check_tags(torch) -> tuple[int, int]:
+    """`OpOverload.tags`, per implemented op, against upstream's.
+
+    It was `[]` for everything. docs/DECOMP.md §2 measured one consequence
+    (`torch.Tag.core in op.tags` False for every op) and the CIA collection
+    above is the other (`maybe_aliasing_or_mutating` unreadable, so
+    `aten.dropout.default` was collected where upstream excludes it). Both are
+    "an empty answer read as a negative", the same shape as
+    docs/DISTRIBUTED.md §8.1 -- and the same reason this is diffed against a
+    real torch rather than asserted in-repo.
+
+    A tag name dropped for want of a `_C.Tag` member is a failure here even
+    though the shim only records it: `Tag`'s members come from the vendored
+    `.pyi` and the tags come from the vendored yaml, so a name in one and not
+    the other means the two halves of one release disagree.
+    """
+    report = _shim_report()
+    failures = 0
+    for key, ours in sorted(report["tags"].items()):
+        namespace, name, overload = key.split(".")
+        try:
+            upstream = sorted(
+                tag.name for tag in
+                getattr(getattr(torch.ops, namespace), name).__getattr__(
+                    overload).tags)
+        except AttributeError:
+            failures += 1
+            print(f"FAIL tags {key}: upstream has no such overload")
+            continue
+        if ours != upstream:
+            failures += 1
+            print(f"FAIL tags {key}: {ours} here, {upstream} upstream")
+    if report["unknown_tags"]:
+        failures += 1
+        print(f"FAIL tags: the file used tag names `_C.Tag` has no member for: "
+              f"{report['unknown_tags']}")
+    return len(report["tags"]), failures
+
+
+def check_cia_registrations(torch) -> tuple[int, int]:
+    """The CompositeImplicitAutograd list, against the real dispatcher.
+
+    `_dispatch_get_registrations_for_dispatch_key` is answered here from
+    `native_functions.yaml` -- explicit `CompositeImplicitAutograd:` entries
+    plus `torchgen/model.py:872`'s default, which gives the key to every entry
+    with no `dispatch:` block that is neither structured nor a structured
+    delegate. That second rule is most of the list, so a scan that only looked
+    for the literal word would be quietly short.
+
+    Both directions fail, on different criteria.
+
+    A name here that upstream does not register would materialise an operator
+    that is not CIA and hand `CustomDecompTable` a decomposition for it. That
+    fails outright.
+
+    A name upstream registers and this does not is allowed **only if the file
+    does not declare that operator at all** -- the file is not a complete list
+    of aten names (docs/SCHEMA.md §8.2), and 2.13.0's one absentee here is
+    `aten::get_gradients`, a TorchScript builtin. A missing name the file
+    *does* declare means the scan lost it, which is what dropping
+    `torchgen/model.py:872`'s implicit default would do to two thirds of the
+    list -- and a check that only looked for invented names would stay green
+    through exactly that.
+    """
+    report = _shim_report()
+    ours = set(report["cia"])
+    upstream = {
+        name for name in torch._C._dispatch_get_registrations_for_dispatch_key(
+            "CompositeImplicitAutograd")
+        if name.startswith("aten::")
+    }
+    failures = 0
+    invented = sorted(ours - upstream)
+    if invented:
+        failures += len(invented)
+        for name in invented[:10]:
+            print(f"FAIL cia {name}: upstream does not register this under "
+                  f"CompositeImplicitAutograd")
+    # The file's own `- func:` list, spelled the way the dispatcher spells a
+    # registration (`aten::max.other`, `aten::broadcast_tensors`).
+    declared = set()
+    for key in (report.get("declared") or {}):
+        qualname, _, overload = key.partition("|")
+        declared.add(f"{qualname}.{overload}" if overload else qualname)
+    missing = sorted(upstream - ours)
+    lost = [name for name in missing if name in declared]
+    if lost:
+        failures += len(lost)
+        for name in lost[:10]:
+            print(f"FAIL cia {name}: upstream registers this and the file "
+                  f"declares it, so the scan lost it")
+    if missing:
+        print(f"    (upstream has {len(missing)} the file does not declare: "
+              f"{', '.join(missing[:5])})")
+    if report["cia_backend_refusal"] is None:
+        failures += 1
+        print("FAIL cia: a backend key was answered from the same file, which "
+              "claims kernels this build does not have")
+    # The union rather than either side: both directions are failures here, so
+    # the population being diffed is every name either has.
+    return len(ours | upstream), failures
+
+
 def main() -> int:
     try:
         import torch
@@ -493,6 +723,23 @@ def main() -> int:
         checked, failures = check_unanswered(torch)
         print(f"  predicates answered without text: {checked}, "
               f"{checked - failures}/{checked} about ops upstream does not have")
+        total += checked
+        failed += failures
+
+        checked, failures = check_overload_names(torch)
+        print(f"  packet overload lists: {checked - failures}/{checked} "
+              f"matched upstream")
+        total += checked
+        failed += failures
+
+        checked, failures = check_tags(torch)
+        print(f"  OpOverload.tags: {checked - failures}/{checked} matched upstream")
+        total += checked
+        failed += failures
+
+        checked, failures = check_cia_registrations(torch)
+        print(f"  CompositeImplicitAutograd registrations: "
+              f"{checked - failures}/{checked} are upstream's")
         total += checked
         failed += failures
     else:

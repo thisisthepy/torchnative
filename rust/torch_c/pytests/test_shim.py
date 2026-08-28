@@ -5197,6 +5197,131 @@ else:
 d = torch._C._aten_dispatch
 
 
+# -- the op docs/CAPTURE.md §5 named ------------------------------------------
+#
+# `aten.t.default` takes two rounds: its own rule emits `aten.transpose.int`,
+# whose rule emits `aten.permute.default`, which is Core ATen. Both rounds were
+# blocked until this build could see them -- the second one twice over, first
+# because `_jit_get_operation` reported `["default"]` for every packet so
+# upstream's `transpose` rule sat on a key that does not exist, and then
+# because the recording spells its arguments with the *schema's* names and
+# upstream's rule does not use them.
+_t_tensor = torch.ones(4, 8)
+torch._C._capture_begin([_t_tensor])
+_t_trace = torch._C._capture_end(d("aten.t.default", _t_tensor))
+_t_lowered = decompose(_t_trace)
+out["t_ops_before"] = [n["op"] for n in _t_trace.nodes]
+out["t_ops_after"] = _t_lowered.ops
+(_t_replayed,) = _t_lowered.replay([_t_tensor])
+(_t_captured,) = _t_trace.replay([_t_tensor])
+out["t_shape"] = list(_t_replayed.shape)
+out["t_bits"] = [
+    _t_replayed.reshape(-1).tolist(),
+    _t_captured.reshape(-1).tolist(),
+    d("aten.t.default", _t_tensor).reshape(-1).tolist(),
+]
+
+# The same two-round road, entered at the second round.
+torch._C._capture_begin([_t_tensor])
+_tr_trace = torch._C._capture_end(torch.transpose(_t_tensor, 0, 1))
+out["transpose_kwargs"] = sorted(_tr_trace.nodes[0]["kwargs"])
+out["transpose_ops_after"] = decompose(_tr_trace).ops
+
+# Arithmetic, not data movement: `matmul` reaches `mm`, and `isin` reaches
+# three ops that actually compute. §5 of docs/DECOMP.md is about whether the
+# answer survives, so these are replayed against eager below.
+_mm_a, _mm_b = torch.ones(3, 4) * 0.5, torch.ones(4, 5) * 0.25
+torch._C._capture_begin([_mm_a, _mm_b])
+_mm_trace = torch._C._capture_end(d("aten.matmul.default", _mm_a, _mm_b))
+_mm_lowered = decompose(_mm_trace)
+out["matmul_ops_after"] = _mm_lowered.ops
+(_mm_replayed,) = _mm_lowered.replay([_mm_a, _mm_b])
+out["matmul_bits"] = [
+    _mm_replayed.reshape(-1).tolist(),
+    d("aten.matmul.default", _mm_a, _mm_b).reshape(-1).tolist(),
+]
+
+_isin_a = d("aten.arange.start_step", 0, 6, 1)
+_isin_b = d("aten.arange.start_step", 2, 4, 1)
+torch._C._capture_begin([_isin_a, _isin_b])
+_isin_trace = torch._C._capture_end(d("aten.isin.Tensor_Tensor", _isin_a, _isin_b))
+_isin_lowered = decompose(_isin_trace)
+out["isin_ops_after"] = _isin_lowered.ops
+(_isin_replayed,) = _isin_lowered.replay([_isin_a, _isin_b])
+out["isin_bits"] = [
+    _isin_replayed.reshape(-1).tolist(),
+    d("aten.isin.Tensor_Tensor", _isin_a, _isin_b).reshape(-1).tolist(),
+]
+
+# What the CompositeImplicitAutograd half of the table is now worth: the four
+# alias keys the file is authoritative for, and the one this unblocked.
+out["cia_registrations"] = len(
+    torch._C._dispatch_get_registrations_for_dispatch_key("CompositeImplicitAutograd")
+)
+try:
+    torch._C._dispatch_get_registrations_for_dispatch_key("CPU")
+except NotImplementedError as error:
+    out["cia_backend_key"] = str(error)
+else:
+    out["cia_backend_key"] = "ANSWERED"
+
+# The whole of docs/CAPTURE.md §5's example, end to end. Upstream's answer
+# for the same module (quoted in docs/DECOMP.md §7) is
+#   aten.permute.default, aten.addmm.default, aten.relu.default,
+#   aten.permute.default, aten.addmm.default
+# and that is what this has to produce, op for op.
+import torch.nn as _nn
+
+torch.manual_seed(0)
+_model = _nn.Sequential(_nn.Linear(4, 8), _nn.ReLU(), _nn.Linear(8, 3))
+_model_x = torch.ones(2, 4)
+torch._C._capture_begin([_model_x])
+_model_y = _model(_model_x)
+out["model_reason"] = torch._C._capture_reason()
+_model_trace = torch._C._capture_end(_model_y)
+out["model_ops_before"] = [n["op"] for n in _model_trace.nodes]
+out["model_non_core_before"] = non_core_ops(out["model_ops_before"])
+_model_lowered = decompose(_model_trace)
+out["model_ops_after"] = _model_lowered.ops
+out["model_non_core_after"] = non_core_ops(_model_lowered.ops)
+out["model_pairs"] = []
+for _scale in (1.0, 0.5, -2.0, 7.25):
+    _z = torch.ones(2, 4) * _scale
+    (_lowered_result,) = _model_lowered.replay([_z])
+    (_captured_result,) = _model_trace.replay([_z])
+    out["model_pairs"].append([
+        _lowered_result.reshape(-1).tolist(),
+        _captured_result.reshape(-1).tolist(),
+        _model(_z).reshape(-1).tolist(),
+    ])
+
+# `OpOverload.tags`, which used to be `[]` for everything (docs/DECOMP.md §2).
+out["tags_addmm"] = [t.name for t in torch.ops.aten.addmm.default.tags]
+out["tags_dropout"] = sorted(t.name for t in torch.ops.aten.dropout.default.tags)
+out["unknown_tags"] = torch._C._shim_unknown_tags()
+_tagged_core = set()
+for _key in torch._C._aten_all_implemented():
+    _ns, _name, _ov = _key.split(".")
+    if torch.Tag.core in getattr(getattr(torch.ops, _ns), _name).__getattr__(_ov).tags:
+        _tagged_core.add(_key)
+out["tag_core_vs_file"] = sorted(
+    _tagged_core ^ {k for k in torch._C._aten_all_implemented() if is_core(k)}
+)
+out["tag_core_count"] = len(_tagged_core)
+
+# The packet collapse itself, at the level it happened.
+out["overloads_transpose"] = torch.ops.aten.transpose.overloads()
+out["overloads_rsub"] = torch.ops.aten.rsub.overloads()
+out["overloads_relu"] = torch.ops.aten.relu.overloads()
+import torch._decomp as _D
+
+out["registry"] = len(_D.global_decomposition_table["post_autograd"])
+out["registry_default"] = sum(
+    1 for k in _D.global_decomposition_table["post_autograd"]
+    if str(k).endswith(".default")
+)
+
+
 def refusal(tensor, call):
     # The tensor is built *before* recording opens, on purpose: anything
     # allocated inside the region is an op in the record too, and a one-op
@@ -5211,13 +5336,20 @@ def refusal(tensor, call):
     return "ACCEPTED"
 
 
-# No rule at all in the table this build can reach.
+# No rule at all -- not in the reachable table and not upstream's either.
+# `aten.transpose.int` used to stand here, and it does not any more: its rule
+# was always in the tree, keyed on an overload that did not exist
+# (docs/DECOMP.md §3). `aten.reshape.default` is the honest replacement --
+# upstream has no Python rule for it at all, so it is the wall itself rather
+# than a wall this build put up.
 out["refuse_no_rule"] = refusal(
-    torch.ones(3, 4), lambda t: d("aten.transpose.int", t, 0, 1)
+    torch.ones(3, 4), lambda t: d("aten.reshape.default", t, [4, 3])
 )
 # A rule exists, and running it hits something the shim does not have.
+# `aten.t.default` used to stand here too and now lowers; `aten.zeros_like`
+# is blocked one layer down, on `torch.full_like` having no overload entry.
 out["refuse_unrunnable"] = refusal(
-    torch.ones(4, 8), lambda t: d("aten.t.default", t)
+    torch.ones(4, 8), lambda t: d("aten.zeros_like.default", t)
 )
 # A rule exists, runs, and produces a result the recording disagrees with.
 # `aten.baddbmm.default`'s decomposition multiplies by the Python floats
@@ -5308,24 +5440,215 @@ def test_decompose_reads_core_aten_out_of_the_vendored_tree():
         assert r["yaml_diff"] == [], r["yaml_diff"]
 
 
-def test_decompose_says_which_upstream_table_it_could_get():
-    """A silent fallback to a smaller table is a silent loss of coverage.
+def test_decompose_gets_the_full_upstream_table_now():
+    """The fuller table arrived, and this is the assertion that said so.
 
-    `core_aten_decompositions()` is the table this pass wants. It cannot be
-    built here: its constructor enumerates every CompositeImplicitAutograd
-    registration through `torch._C._dispatch_get_registrations_for_dispatch_key`,
-    and this `_C` has no C++ dispatcher to enumerate. So the pass falls back to
-    `_core_aten_decompositions_post_autograd()` and *reports that it did*.
+    `core_aten_decompositions()` is the table this pass wants, and it used to
+    raise: its constructor enumerates every CompositeImplicitAutograd
+    registration through `torch._C._dispatch_get_registrations_for_dispatch_key`
+    and this `_C` has no C++ dispatcher. The shim answers that query now, out of
+    `native_functions.yaml` -- 743 aten names against upstream's 744, the one
+    difference being a TorchScript builtin the file does not carry
+    (docs/DECOMP.md §3).
 
-    Pinned as a test rather than a comment because the day the shim answers
-    that query, this assertion is what tells us the fuller table arrived.
+    Backend keys are *not* answered, and that is asserted here rather than
+    left as a comment: the same file lists which ops upstream's C++ registers
+    under `CPU`, and answering with it would claim about 1500 kernels this
+    build does not have.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
     r = _decomp_road_fixture()
-    assert r["table_source"] == "_core_aten_decompositions_post_autograd", r["table_source"]
-    assert "_dispatch_get_registrations_for_dispatch_key" in (r["table_reason"] or ""), r
-    assert r["table_size"] == 224, r["table_size"]
+    assert r["table_source"] == "core_aten_decompositions", r["table_source"]
+    assert r["table_reason"] is None, r["table_reason"]
+    assert r["table_size"] == 414, r["table_size"]
+    assert r["cia_registrations"] == 743, r["cia_registrations"]
+    assert r["cia_backend_key"] != "ANSWERED"
+    assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
+
+
+def test_a_packet_reports_the_overloads_the_file_declares():
+    """`_jit_get_operation` answered `["default"]` for every packet.
+
+    That is one line of `bootstrap.py` and it cost the decomposition registry
+    half its entries. `torch/_decomp/__init__.py:82` expands a packet-level
+    `@register_decomposition(aten.transpose)` by walking
+    `packet.op_overloads()`, so upstream's rule for `transpose` was registered
+    against `aten.transpose.default` -- an overload that does not exist in any
+    torch. The rule was in the vendored tree the whole time, under a name
+    nothing would look up.
+
+    The numbers are the measurement: the registry held 592 entries of which
+    525 ended in `.default`, against upstream's 1097 and 456. Reading the
+    overload names out of `native_functions.yaml` puts it at 1004/461.
+
+    `relu` is here as the control. It really does have exactly one, unnamed,
+    overload, so `["default"]` was the right answer for it -- which is why the
+    bug was invisible to anything that only looked at simple ops.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    # `transpose` is the one docs/DECOMP.md §3 measured: upstream's packet has
+    # exactly one overload and it is *not* `default`, which is what made
+    # `["default"]` a wrong answer rather than a lossy one.
+    assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
+    assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
+    assert r["overloads_relu"] == ["default"], r["overloads_relu"]
+    assert r["registry"] == 1004, r["registry"]
+    assert r["registry_default"] == 461, r["registry_default"]
+
+
+def test_core_ops_and_op_tags_agree():
+    """`OpOverload.tags` answered `[]` for every op, and two things read it.
+
+    docs/DECOMP.md §2 measured the first: `torch.Tag.core in op.tags` was False
+    for all 120 implemented ops, so a Core ATen classifier built the obvious
+    way answers "nothing is core" and refuses whole programs. `core_ops()`
+    routed around it by reading `native_functions.yaml` itself, which was right
+    for that module and did nothing for the tree's own readers.
+
+    The second is `torch/_decomp/__init__.py:57`, which reads
+    `maybe_aliasing_or_mutating` to decide whether an op may be preserved
+    rather than decomposed. With `[]` that question was always False, and
+    `_collect_all_valid_cia_ops` collected `aten.dropout.default` and
+    `aten.unsafe_chunk.default`, which upstream excludes for exactly that tag.
+
+    Tags come from the file now. The two classifiers are diffed against each
+    other here rather than each being asserted alone -- one source read twice
+    would agree with itself, and these are two different scans of it reaching
+    two different consumers.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    # `pt2_compliant_tag` is on every aten entry and is not written on any of
+    # them: `torchgen/model.py:756` adds it while parsing. Three tags work that
+    # way (`out` and `inplace` are the others) and leaving them out put 0 of
+    # 118 implemented ops in agreement with upstream.
+    assert r["tags_addmm"] == ["core", "pt2_compliant_tag"], r["tags_addmm"]
+    assert r["tags_dropout"] == [
+        "maybe_aliasing_or_mutating",
+        "nondeterministic_seeded",
+        "pt2_compliant_tag",
+    ], r["tags_dropout"]
+    # A tag name the file uses that `_C.Tag` has no member for would be dropped
+    # silently; this is the count of that happening.
+    assert r["unknown_tags"] == [], r["unknown_tags"]
+    assert r["tag_core_vs_file"] == [], r["tag_core_vs_file"]
+    assert r["tag_core_count"] == 77, r["tag_core_count"]
+
+
+def test_decompose_lowers_the_op_capture_md_named():
+    """`aten.t.default` -- the op the smallest model in docs/CAPTURE.md emits.
+
+    Two rounds, and upstream's own answer for the same model:
+    `t` -> `transpose.int` -> `permute`, which is Core ATen. Both rules are
+    upstream's; nothing about the road is written in this repository.
+
+    Three walls stood between here and this and all three were somewhere else:
+    `_jit_get_operation` collapsing every packet onto `.default` (so the
+    `transpose` rule was unreachable), `overloads.json` having no `transpose`
+    or `permute` entry (so neither rule could *run*), and the pass calling a
+    rule with the recording's kwargs, whose names are the aten schema's and
+    not the rule's (`TypeError: transpose() got an unexpected keyword argument
+    'self'`).
+
+    The last one is asserted directly, through the recorded kwarg names, so
+    that a regression that goes back to forwarding them fails here and not
+    only through the two-round road above.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["t_ops_before"] == ["aten.t.default"], r["t_ops_before"]
+    assert r["t_ops_after"] == ["aten.permute.default"], r["t_ops_after"]
+    assert r["t_shape"] == [8, 4], r["t_shape"]
+    lowered, captured, eager = r["t_bits"]
+    assert lowered == eager, (lowered, eager)
+    assert captured == eager, (captured, eager)
+    # The recording really does spell its operands with the schema's names --
+    # this is the input the pass has to re-order, not a hypothetical.
+    assert r["transpose_kwargs"] == ["dim0", "dim1", "self"], r["transpose_kwargs"]
+    assert r["transpose_ops_after"] == ["aten.permute.default"], r[
+        "transpose_ops_after"
+    ]
+
+
+def test_the_smallest_model_lowers_the_way_upstream_lowers_it():
+    """docs/CAPTURE.md §5's example, whole, against upstream's own answer.
+
+    That section chose `nn.Sequential(Linear, ReLU, Linear)` because it is the
+    smallest thing anyone would export and it already emits `aten.t.default`,
+    which Edge will not take. docs/DECOMP.md §7 then asked upstream what it
+    does with the same module:
+
+        ep.run_decompositions(core_aten_decompositions())
+        # -> aten.permute.default, aten.addmm.default, aten.relu.default,
+        #    aten.permute.default, aten.addmm.default
+
+    This asserts that list, op for op and in order. It is the only test here
+    that is about a *module* rather than a hand-built trace, and it is the one
+    that says the chain from capture to Core ATen is connected rather than
+    connected in the places that were measured.
+
+    Three inputs the trace never saw are replayed as well, because a lowering
+    that only agrees on the recorded input would agree for the wrong reason.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["model_reason"] is None, r["model_reason"]
+    assert r["model_ops_before"] == [
+        "aten.t.default",
+        "aten.addmm.default",
+        "aten.relu.default",
+        "aten.t.default",
+        "aten.addmm.default",
+    ], r["model_ops_before"]
+    assert r["model_non_core_before"] == ["aten.t.default"], r[
+        "model_non_core_before"
+    ]
+    assert r["model_ops_after"] == [
+        "aten.permute.default",
+        "aten.addmm.default",
+        "aten.relu.default",
+        "aten.permute.default",
+        "aten.addmm.default",
+    ], r["model_ops_after"]
+    assert r["model_non_core_after"] == [], r["model_non_core_after"]
+    assert len(r["model_pairs"]) == 4
+    for lowered, captured, eager in r["model_pairs"]:
+        assert lowered == eager, (lowered, eager)
+        assert captured == eager, (captured, eager)
+
+
+def test_the_newly_opened_decompositions_still_agree_with_eager():
+    """§5 again, on rules that are not pure data movement.
+
+    The bit-for-bit result in `test_decomposed_replay_matches_eager_bit_for_
+    bit` is evidence about *those* rules: `stack`->`cat`+`view`,
+    `split`->`split_with_sizes`, `_unsafe_view`->`view` all move bytes and do
+    no arithmetic, so there was nothing for the last bit to disagree about.
+
+    `matmul`->`mm` and `isin`->`view`+`eq`+`any` are the first newly-reachable
+    rules that compute. They agree exactly too, and that is measured here
+    rather than assumed -- if a future rule does diverge, the reply is to
+    record how far (docs/DEVICE.md §5), not to widen a comparison.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["matmul_ops_after"] == ["aten.mm.default"], r["matmul_ops_after"]
+    lowered, eager = r["matmul_bits"]
+    assert lowered == eager, (lowered, eager)
+    assert r["isin_ops_after"] == [
+        "aten.view.default",
+        "aten.eq.Tensor",
+        "aten.any.dims",
+    ], r["isin_ops_after"]
+    lowered, eager = r["isin_bits"]
+    assert lowered == eager, (lowered, eager)
 
 
 def test_decompose_lowers_a_trace_to_core_aten():
@@ -5391,16 +5714,19 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
         return
     r = _decomp_road_fixture()
 
-    # 1. Nothing in the reachable table has a rule for it.
+    # 1. Nothing has a rule for it -- upstream included. `aten.transpose.int`
+    #    used to be this example and it lowers now: its rule existed all along
+    #    and the packet collapse hid it (docs/DECOMP.md §3). The replacement is
+    #    an op upstream really has no Python rule for.
     assert r["refuse_no_rule"] != "ACCEPTED"
-    assert "aten.transpose.int" in r["refuse_no_rule"], r["refuse_no_rule"]
+    assert "aten.reshape.default" in r["refuse_no_rule"], r["refuse_no_rule"]
     assert "no rule" in r["refuse_no_rule"], r["refuse_no_rule"]
 
     # 2. A rule exists and running it reaches something the shim lacks. The
     #    refusal carries the underlying reason, so the gap is findable.
     assert r["refuse_unrunnable"] != "ACCEPTED"
-    assert "aten.t.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
-    assert "torch.transpose" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "aten.zeros_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "torch.full_like" in r["refuse_unrunnable"], r["refuse_unrunnable"]
 
     # 3. A rule exists, runs, and produces a result the recording disagrees
     #    with -- `aten.baddbmm.default`'s decomposition promotes float32 to
@@ -6213,15 +6539,19 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
 
     `overloads.json` and `methods.json` are the oracle: every string in them is
     `str(torch.ops.aten.<op>.<ov>._schema)` transcribed from upstream 2.13.0,
-    and `verify_schemas.py` keeps them honest. 173 distinct overloads, 7 of
+    and `verify_schemas.py` keeps them honest. 175 distinct overloads, 7 of
     which exercise a normalisation rule -- if the re-printer drops one, those
     seven stop matching. This needs no upstream torch.
+
+    173 until docs/DECOMP.md's `transpose`/`permute`/`sub` entries arrived;
+    three of those five schema strings were already reachable through
+    `methods.json`, so the union grew by `aten::permute` and `aten::sub.out`.
 
     The provenance assertion is not decoration. In the first working version
     `_get_schema` consulted the tables *before* the file, so these 173 lookups
     were answered by the oracle itself and the comparison was the oracle
     against itself: deleting the float printer entirely left this test green
-    (measured). 169 of the 173 have to come from the file for the comparison to
+    (measured). All but four have to come from the file for the comparison to
     mean anything, and the four that cannot -- `.out` variants torchgen
     generates and the file does not declare -- are named.
     """
@@ -6239,7 +6569,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
             shadowed.append((qualname, overload, got["from"]))
     assert mismatched == [], mismatched[:5]
     assert shadowed == [], shadowed[:5]
-    assert len(keys) == 173, len(keys)
+    assert len(keys) == 175, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

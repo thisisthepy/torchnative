@@ -4,18 +4,24 @@
 
 - **분해 패스가 섰는가.** 섰습니다. `torchnative.export.decompose` 이고, 규칙은 한 줄도
   여기서 쓰지 않았습니다 — 상류의 `torch/_decomp` 를 *실행*합니다 (§1).
-- **무엇이 덮이고 무엇이 안 덮이는가.** §4 가 실측 표이고, **덮이지 않는 것 전부에 이름과
-  원인이 붙어 있습니다.** 원인은 네 가지로 갈리고 각각 고치는 자리가 다릅니다.
-- **분해 후 값이 달라지는가.** §5. 이 트레이스에서는 **비트 단위로 안 달라졌습니다.**
-  달라질 수 있다는 것을 기대했고, 안 달라진 것을 측정으로 적습니다.
-- **ExecuTorch Edge 까지 얼마나 남았는가.** §7. 분해는 필요조건이고 충분조건이 아닙니다 —
-  남은 것 중 가장 큰 것은 **functionalization** 이고 이 패스가 하는 일이 아닙니다.
-- **이 작업이 찾은 결함.** §6. 패스가 "낮추지 못했다" 가 아니라 **"낮추면 답이 달라진다"**
-  로 거절한 것이 둘 있고, 둘 다 이 저장소의 진짜 버그입니다.
+- **`aten.t.default` 이 낮아지는가.** **낮아집니다.** docs/CAPTURE.md §5 가 "가장 작은 예제에서
+  이미 일어나는 일" 로 지목한 그 op 이고, 이제 `aten.permute.default` 가 됩니다. **그 예제
+  전체**(`nn.Sequential(Linear, ReLU, Linear)`)가 Core ATen 으로 완전히 내려가고, 결과는
+  상류가 같은 모듈에 내놓는 것과 op 단위로 같습니다 (§5).
+- **몇 개가 낮아지는가.** **37 개 중 9 개.** 이전 회차의 32 개 중 4 개에서 올랐고, 무엇이
+  올렸는지와 남은 27 개가 왜 남았는지는 §4 가 전부 이름으로 적습니다.
+- **무엇이 막고 있었는가.** 두 가지였고 둘 다 열렸습니다 — `_jit_get_operation` 이 모든 패킷의
+  오버로드를 `["default"]` 로 답하던 것(§3.1)과 `_dispatch_get_registrations_for_dispatch_key`
+  가 없던 것(§3.2). 세 번째는 이 작업이 찾은 것입니다: **패스가 규칙을 기록된 kwarg 이름으로
+  부르고 있었습니다**(§3.4).
+- **분해 후 값이 달라지는가.** §6. 이번에 열린 규칙 중 **산술을 하는 것 두 개**(`matmul`,
+  `isin`)까지 포함해 여전히 비트 단위로 일치합니다.
+- **ExecuTorch Edge 까지 얼마나 남았는가.** §8. 분해는 필요조건이고 충분조건이 아닙니다.
 
-구현은 `torchnative/src/main/torchnative/export/decompose.py`, 트레이스가 상수 텐서를 내주도록
-`rust/torch_c/src/capture.rs` 에 게터 하나(`constant_values`)가 늘었고, 테스트는
-`rust/torch_c/pytests/test_shim.py` 의 decompose 절 6 개와 capture 절에 1 개입니다.
+바뀐 파일: `rust/torch_c/src/bootstrap.py`, `rust/torch_c/src/overloads.json`,
+`torchnative/src/main/torchnative/export/decompose.py`,
+`rust/torch_c/pytests/test_shim.py`, `rust/torch_c/pytests/verify_schemas.py`,
+그리고 §4 의 표를 만드는 `rust/torch_c/pytests/decomp_sweep.py`.
 
 ---
 
@@ -38,6 +44,9 @@ docs/CAPTURE.md §5 가 이 문제를 이렇게 적었습니다 — **기록되�
 분해표를 손으로 옮겨 적는 것은 이 프로젝트의 전제("재구현이 아니라 진짜 파이썬 생태계를 돌린다")를
 정면으로 어깁니다. 193 개의 op 이름을 옮겨 적는 것도 한 치수 작은 같은 실수입니다. 둘 다 상류가
 고치면 우리 쪽이 조용히 낡습니다.
+
+**이번 회차도 같은 규칙을 지켰습니다.** 열린 5 개는 규칙을 새로 써서 열린 것이 아니라,
+상류의 규칙이 *찾아지고* *실행되게* 만들어서 열렸습니다. §3 의 넷은 전부 배선 결함입니다.
 
 ### 한 노드를 낮추는 방법 — 기록기를 트레이서로 쓴다
 
@@ -63,26 +72,14 @@ docs/CAPTURE.md §5 가 이 문제를 이렇게 적었습니다 — **기록되�
 
 고정점 뒤에 남은 non-core op 은 **이름을 대고 거절**합니다. 조용히 통과시키면 ExecuTorch 가
 나중에 프로그램을 거부하는데 **어느 op 때문인지, 어느 패스의 책임인지 아무것도 가리키지
-않습니다.** 거절은 네 가지 벽 중 어디에 부딪혔는지까지 말합니다 (§4 의 분류가 그 네 가지입니다).
+않습니다.**
 
 ---
 
-## 2. Core ATen 을 무엇으로 판정하는가 — `torch.Tag.core` 는 이 빌드에서 못 씁니다
+## 2. Core ATen 을 무엇으로 판정하는가
 
-docs/CAPTURE.md §5 의 108/70/38 은 **상류 torch 위에서** 잰 것입니다. 벤더 트리 위에서 같은 것을
-재면 이렇게 나옵니다:
-
-```
-_aten_all_implemented()                     120
-그중 torch.Tag.core 가 붙은 것                0     ← 전부
-```
-
-원인은 `bootstrap.py` 의 `_get_operation_overload` 가 태그 목록으로 항상 `[]` 를 돌려주는 것입니다.
-즉 이 빌드에서 태그로 판정하면 **"아무것도 core 가 아니다"** 가 나오고, 패스는 프로그램 전체를
-거절합니다.
-
-그래서 판정은 벤더 트리의 `native_functions.yaml` 을 읽습니다. **그 파일이 상류가
-`torch.Tag.core` 를 생성하는 원본입니다.**
+판정은 벤더 트리의 `native_functions.yaml` 을 읽습니다. **그 파일이 상류가 `torch.Tag.core` 를
+생성하는 원본입니다.**
 
 | | 개수 |
 |---|---|
@@ -91,251 +88,370 @@ _aten_all_implemented()                     120
 | 차이 | 4 — `adaptive_avg_pool1d.default` · `avg_pool1d.default` · `resize_.default` · `sym_is_contiguous.default` |
 
 넷은 파일에 core 로 적혀 있는데 상류의 `OpOverload.tags` 로는 나타나지 않습니다. **넓은 쪽을
-택했습니다** — 이 차이는 패스가 노드를 *받아들이게* 만들 수는 있어도 거절하게 만들 수는 없고,
-넷 다 상류 자신의 파일이 core 라고 부르는 것입니다.
+택했습니다** — 이 차이는 패스가 노드를 *받아들이게* 만들 수는 있어도 거절하게 만들 수는 없습니다.
+
+### 이전 판본의 이유는 사라졌고, 결정은 남았습니다
+
+이전 판본은 파일을 읽는 이유를 이렇게 적었습니다: **이 빌드에서는 `OpOverload.tags` 가 전부
+비어 있으므로 태그로 판정하면 "아무것도 core 가 아니다" 가 나온다.** 그것은 사실이었고,
+이번에 고쳤습니다 (§3.3). 지금은:
+
+```
+구현된 op                       129
+그중 torch.Tag.core 가 붙은 것   77
+파일이 core 라고 부르는 것        77      ← 같음
+2584 개 전체에 대해 상류와 대조   2584/2584
+```
+
+**그래도 `core_ops()` 는 계속 파일을 읽습니다.** 위 4 개 때문입니다 — 태그 기반 판정은 상류에서도
+좁은 쪽이고, 좁은 쪽은 이 패스를 더 많이 거절하게 만듭니다. 두 판정은
+`test_core_ops_and_op_tags_agree` 가 **서로 대조**합니다. 한 출처를 두 번 읽으면 자기 자신과
+일치할 뿐이므로, 두 스캔이 두 소비자에게 도달하는 것을 확인하는 것이 검사의 내용입니다.
 
 읽는 방법은 YAML 파서가 아니라 줄 스캐너입니다. `pyyaml` 이 이 배포판의 선언된 의존성이 아니기
-때문입니다(pyproject.toml 은 상류 torch 의 순수 파이썬 의존성만 싣고, 거기에 pyyaml 은 없습니다) —
-여기서 `import yaml` 하면 올바르게 설치된 휠에서 이 모듈이 임포트 실패합니다. 대신
+때문입니다 — 여기서 `import yaml` 하면 올바르게 설치된 휠에서 이 모듈이 임포트 실패합니다. 대신
 `test_decompose_reads_core_aten_out_of_the_vendored_tree` 가 **스캔 결과를 진짜 YAML 파스와
-diff** 합니다. 상류가 형식을 바꾸면 조용히 짧아진 목록이 아니라 빨간 테스트가 됩니다.
+diff** 합니다.
 
 ---
 
-## 3. 어느 분해표에 닿을 수 있는가 — 세 개의 숫자가 다르다
+## 3. 무엇이 막고 있었는가 — 네 개의 배선 결함
 
-| | 항목 | 크기 |
-|---|---|---:|
-| A | 상류 `core_aten_decompositions()` | **940** |
-| B | 상류 `_core_aten_decompositions_post_autograd()` | **435** |
-| C | **벤더 트리에서 실제로 얻은 것** (= B 를 여기서 부른 것) | **224** |
+### 3.1 `_jit_get_operation` 이 모든 패킷의 오버로드로 `["default"]` 를 답했다
 
-패스는 A 를 **매번 먼저 시도**하고, 실패하면 C 로 내려가면서 `decomposition_table_source()` 에
-그 이유를 남깁니다. 하드코딩하지 않은 것은 의도입니다 — shim 이 아래의 빠진 함수를 구현하는 날
-이 코드는 수정 없이 더 큰 표를 집습니다. 그리고 **조용한 폴백은 조용한 커버리지 손실**이므로
-테스트가 현재 값을 못박고 있습니다.
-
-### A → B 를 막는 것
-
-```
-NotImplementedError: not implemented in torch._C shim:
-    torch._C._dispatch_get_registrations_for_dispatch_key
-```
-
-`core_aten_decompositions()` 는 `CustomDecompTable` 이고, 그 생성자가 C++ 디스패처에 등록된
-`CompositeImplicitAutograd` op 을 전부 열거합니다. 이 `_C` 는 파이썬 셰임이라 열거할 C++ 디스패처가
-없습니다. **이것이 표의 CIA 절반(940 − 435 = 505 개 규칙)을 통째로 못 쓰게 만듭니다.**
-
-### B → C 를 막는 것 — 이것이 더 근본적입니다
-
-상류와 벤더 트리에서 `torch._decomp.global_decomposition_table["post_autograd"]` 를 세면:
+`torch/_decomp/__init__.py:82` 는 패킷 단위 등록(`@register_decomposition(aten.transpose)`)을
+`packet.op_overloads()` 로 펼칩니다. 그 목록이 `["default"]` 이면 상류의 `transpose` 규칙이
+**`aten.transpose.default`** 에 내려앉는데, 그런 오버로드는 어느 torch 에도 없습니다. 규칙은
+트리 안에 있었고, **아무도 찾을 수 없는 이름 아래** 있었습니다.
 
 | | 레지스트리 항목 | 그중 `.default` |
 |---|---:|---:|
 | 상류 | 1097 | 456 |
-| 벤더 트리 | **592** | **525** |
+| 고치기 전 | 592 | 525 |
+| **고친 뒤** | **1004** | **461** |
 
-원인은 `bootstrap.py` 의 `_jit_get_operation` 이 **모든 패킷의 오버로드 목록으로 `["default"]` 를
-돌려주는 것**입니다. 그래서 `torch.ops.aten.transpose.op_overloads()` 가 여기서는
-`[aten.transpose.default]` 를 내는데, 상류에서는 `[aten.transpose.int]` 입니다 — `transpose` 에는
-`default` 오버로드가 **존재하지 않습니다.**
+고친 방법: 오버로드 이름을 `native_functions.yaml` 에서 읽습니다. 세 출처의 합집합이고
+(파일 · `Library.define()` 이 만든 스키마 · `overloads.json`/`methods.json`), 셋 다 침묵하면
+`["default"]` 로 떨어져 레지스트리를 열어 둡니다 (docs/SCHEMA.md §12). **거꾸로는 하지
+않습니다** — 오버로드를 아는 패킷에 `default` 를 덧붙이지 않습니다. 그것이 고치려는 결함입니다.
 
-`@register_decomposition(aten.transpose)` 처럼 **패킷 단위**로 등록된 규칙은 `_add_op_to_registry`
-가 `op_overloads()` 로 펼치므로, 전부 실재하지 않는 `.default` 키에 내려앉습니다. 규칙은 트리
-안에 있는데 **아무도 찾을 수 없는 이름 아래 있습니다.**
+`verify_schemas.py` 의 `check_overload_names` 가 구현된 op 의 패킷 99 개를 상류와 대조합니다
+(99/99). 방향이 둘이고 **같은 주장이 아닙니다**:
 
-§4 에서 "규칙 없음(상류에는 있음)" 으로 분류된 7 개 중 **5 개가 정확히 이 현상**입니다:
+- 상류에 없는 오버로드를 여기서 내놓는 것 → **실패.** 없는 키에 규칙을 얹는 것이 곧 결함입니다.
+- 상류에 있고 여기 없는 것 → 대개 **바람직합니다.** 175 개이고 전부 torchgen 이 생성하는
+  `.out` 변형과 TorchScript 의 숫자 빌트인(`aten::sub.float_int`)입니다. 상류 자신이
+  `_dispatch_has_kernel` 로 후자를 버립니다. 그중 규칙을 가진 18 개는 전부 `.out` 변형이고,
+  이 빌드는 `.out` 키를 하나도 구현하지 않으므로 **어떤 기록에도 들어올 수 없습니다** —
+  그 전제까지 같은 검사가 확인합니다.
+
+**이 결함은 저장소 안에서는 보이지 않았습니다.** 스키마 검사들은 `(이름, 오버로드)` 하나씩을
+묻고 *목록*이 무엇이든 옳으며, 저장소 안 테스트에는 대조할 상류가 없습니다. 보이는 증상은
+전혀 다른 자리의 숫자 둘(592/525)뿐이었습니다.
+
+### 3.2 `_dispatch_get_registrations_for_dispatch_key` 가 없었다
+
+`core_aten_decompositions()` 는 `CustomDecompTable` 이고, 그 생성자가
+`CompositeImplicitAutograd` 등록을 전부 열거합니다. 이 `_C` 에는 열거할 C++ 디스패처가
+없어서 예외를 던졌고, 패스는 더 작은 표로 떨어졌습니다.
+
+같은 파일이 답을 가지고 있습니다. `torchgen/model.py:872` 가 **`dispatch:` 블록이 없고
+structured 도 structured_delegate 도 아닌 모든 항목**에 CIA 를 부여합니다 — 목록의 대부분이
+거기서 나오므로, 글자 `CompositeImplicitAutograd` 만 찾는 스캔은 3 분의 1 만 찾습니다.
 
 ```
-aten.transpose.int        규칙이 aten.transpose.default 에 있음
-aten.rsub.Scalar          규칙이 aten.rsub.default 에 있음
-aten.masked_fill.Scalar   규칙이 aten.masked_fill.default 에 있음
-aten.masked_fill.Tensor   같음
-aten.isin.Tensor_Tensor   규칙이 aten.isin.default 에 있음
+파일에서 파생한 aten CIA 이름     743
+상류 디스패처가 답하는 것          744
+여기 있고 상류에 없는 것             0
+상류에 있고 파일에 없는 것           1   aten::get_gradients (TorchScript 빌트인)
 ```
 
-**`.default` 키를 폴백으로 읽는 우회는 하지 않았습니다.** 패킷 등록과 진짜 `.default` 오버로드
-등록이 구분되지 않으므로, 그 우회는 **어떤 오버로드에 다른 오버로드의 규칙을 조용히 적용**할 수
-있습니다. 결과 메타 검사(§6)가 대부분 잡겠지만 "대부분" 은 이 자리에서 쓸 수 있는 단어가
-아닙니다. 고쳐야 할 곳은 `_jit_get_operation` 이고, 그것은 이번 작업의 범위가 아니라 **이름을 댄
-항목**입니다.
+**백엔드 키는 답하지 않고 이름을 대고 거절합니다.** 같은 파일이 `CPU` 에 무엇이 등록되는지도
+적어 두었지만, 그것으로 답하면 이 빌드가 갖고 있지 않은 커널 1500 개를 주장하게 됩니다.
+답하는 것은 파일이 권위를 갖는 **별칭 키 넷**뿐입니다.
+
+이 목록은 *구체화*에만 쓰입니다 — `_materialize_cpp_cia_ops` 가 이름을 훑어
+`torch.ops.aten.<name>.<overload>` 를 존재하게 만들 뿐이고, 여기서 진짜 CIA 인지 판정하는 것은
+`op.py_kernels` 를 보는 `_is_cia_op` 입니다. 그러므로 넉넉한 목록이 무언가를 몰래 들여올 수는
+없고, 무언가를 빠뜨릴 수만 있습니다.
+
+| | 표 크기 |
+|---|---:|
+| 상류 `core_aten_decompositions()` | 940 |
+| 상류 `_core_aten_decompositions_post_autograd()` | 435 |
+| 고치기 전 (여기) | 224 |
+| **고친 뒤 (여기)** | **414** |
+
+414 와 940 의 차이는 §7 이 셉니다.
+
+### 3.3 `OpOverload.tags` 가 전부 `[]` 였다
+
+두 곳이 이것을 읽습니다. 하나는 §2 가 이미 잰 Core ATen 판정이고, 다른 하나는
+`torch/_decomp/__init__.py:57` 의 `maybe_aliasing_or_mutating` 입니다 — 그것이 항상 거짓이어서
+`_collect_all_valid_cia_ops` 가 `aten.dropout.default` 와 `aten.unsafe_chunk.default` 를
+수집했습니다. 상류는 정확히 그 태그로 둘을 제외합니다.
+
+태그도 같은 파일에서 읽습니다. 옮겨 적는 것이 아니라 **torchgen 의 규칙을 따라가는 것**이고,
+그 규칙에는 파일에 안 적힌 것이 셋 있습니다 (`torchgen/model.py:756-765`):
+
+```
+pt2_compliant_tag   모든 aten 항목에 무조건
+out                 out 인자를 가진 항목   (이름이 `out` 인 인자가 아니라 "변경 가능한 kwarg-only 인자")
+inplace             이름이 `_` 로 끝나는 항목 (그리고 `__iand__` 류 — `_` 하나로 안 끝납니다)
+```
+
+셋을 빼면 **118 개 중 0 개**가 상류와 일치합니다. `pt2_compliant_tag` 하나가 전부에 붙기
+때문입니다.
+
+**여기서 결함이 하나 더 나왔습니다.** 셋을 넣고도 2584 개 중 3 개가 남았습니다 —
+`sinh.out` · `rsub.Scalar` · `tanh_backward.default` 가 `pointwise` 를 잃었습니다. 원인은
+파일 형식이었습니다: 그 셋은 항목과 자기 `tags:` 줄 사이에 **0 번째 칸에서 시작하는 주석**이
+끼어 있고, 스캐너가 그것을 항목의 끝으로 읽었습니다. YAML 은 주석을 보지 않습니다.
+`decompose.py` 의 `_scan_core_tags` 도 같은 결함을 가지고 있었습니다(`core` 태그는 하나도
+그 뒤에 없어서 결과는 같았습니다). 둘 다 고쳤습니다.
+
+```
+OpOverload.tags, 파일이 선언한 2584 개 전부:   2584/2584 상류와 일치
+```
+
+### 3.4 패스가 규칙을 기록된 kwarg 이름으로 불렀다
+
+§3.1 을 고치고 `overloads.json` 에 `transpose`/`permute` 를 넣었더니 `aten.t.default` 이
+**둘째 회차**에서 죽었습니다:
+
+```
+TypeError: transpose() got an unexpected keyword argument 'self'
+```
+
+기록기는 shim 의 `torch.<fn>` 해석기가 넘긴 것을 그대로 적습니다. 그 해석기는 aten 스키마에
+바인딩하고 **스키마의 이름**으로 넘기므로, `torch.transpose(x, 0, 1)` 은
+`aten.transpose.int(self=%0, dim0=0, dim1=1)` 로 기록됩니다. 그런데 상류의 규칙은
+`torch._refs.transpose(a, dim0, dim1)` 이고 첫 인자 이름이 `a` 입니다.
+
+**상류에는 이 문제가 없습니다** — C++ 디스패처는 커널에 인자를 위치로 넘기고, 분해 함수의
+파라미터 이름은 그 함수의 사정입니다. 그래서 패스가 호출을 그 모양으로 되돌립니다:
+스키마가 `*` 앞에 선언한 인자는 전부 위치로, 진짜 kwarg-only 인 것만 이름으로. 스키마 텍스트가
+없거나 스키마가 모르는 kwarg 이 있으면 **기록 그대로 넘깁니다** — 그러면 이 함수가 지어낸
+재작성이 아니라 규칙 자신의 오류로 실패합니다.
+
+이것은 §3.1 · §3.2 와 성격이 다릅니다. 저 둘은 shim 의 결함이고, **이것은 이 패스의
+결함**이었습니다. 앞의 둘을 고치기 전에는 도달할 수 없어서 보이지 않았습니다.
+
+### 3.5 `overloads.json` 의 구멍 셋
+
+§3.4 를 고칠 수 있게 만든 것들입니다. 이것들은 **모델 경로가 부르는 이름이 아니라,
+분해 규칙이 도는 동안 *상류 자신의 규칙*이 부르는 이름**입니다:
+
+```
+torch.transpose   aten.t.default 의 규칙이 부른다      → aten::transpose.int
+torch.permute     aten.transpose.int 의 규칙이 부른다  → aten::permute
+torch.sub         aten.rsub.Scalar 의 규칙이 부른다    → aten::sub.{out,Tensor,Scalar}
+```
+
+셋 다 **이 빌드가 이미 구현한 aten 키**를 가리키므로, 표 항목이 수정의 전부입니다 — 커널을
+지어내지 않았습니다. `verify_schemas.py` 가 스키마 문자열을 상류와 대조합니다 (131/131).
 
 ---
 
 ## 4. 실측 — 무엇이 덮이고 무엇이 안 덮이는가
 
+`rust/torch_c/pytests/decomp_sweep.py` 가 이 표를 만듭니다.
+
 ### 모집단
 
 | | 개수 |
 |---|---:|
-| `_aten_all_implemented()` | **120** |
-| └ Core ATen | 73 |
-| └ Core ATen 밖 | **47** |
+| `_aten_all_implemented()` | **129** |
+| └ Core ATen | 77 |
+| └ Core ATen 밖 | **52** |
 | &nbsp;&nbsp;&nbsp;└ 캡처가 애초에 거절하는 것 (변이 12 · 난수 3) | 15 |
-| &nbsp;&nbsp;&nbsp;└ **트레이스에 나타날 수 있는 non-core op** | **32** |
+| &nbsp;&nbsp;&nbsp;└ **트레이스에 나타날 수 있는 non-core op** | **37** |
 
 변이·난수 15 개를 뺀 것은 편의가 아닙니다 — docs/CAPTURE.md §4 가 그것들을 이름을 대고
-거절하므로 **어떤 트레이스에도 들어올 수 없습니다.** 분해 대상이 아니라 캡처 대상이 아닙니다.
+거절하므로 **어떤 트레이스에도 들어올 수 없습니다.**
 
-### 그 32 개에 패스를 돌린 결과
+> **이전 회차의 32 와 지금의 37 은 같은 모집단이 아닙니다.** 그 사이에 구현된 op 이
+> 120 → 129 로 늘었고, 늘어난 것 중 다섯(`masked_select` · `min.default` · `unbind.int` ·
+> `view.dtype` · `where.ScalarOther`)이 non-core 입니다. **이 회차 시작 시점의 판정은
+> 37 개 중 5 개**였습니다(`sum.default` 가 커널 수정으로 §7.1 에서 이미 열려 있었음).
+> 이 작업이 올린 것은 **5 → 9** 입니다.
 
-| 판정 | 개수 |
-|---|---:|
-| **Core ATen 으로 낮춰짐** | **4** |
-| 규칙이 이 빌드에서 실행되지 않음 | 13 |
-| 닿을 수 있는 표에 규칙 없음 — **상류 전체 표에는 있음** | 7 |
-| 규칙이 상류에도 없음 | 5 |
-| 규칙이 기록과 다른 결과를 냄 (→ 거절) | 2 |
-| 캡처가 구간 출력으로 거절 | 1 |
+### 판정
 
-각 항목의 이름을 전부 답니다.
+| 판정 | 이번 | 이 회차 시작 시점 |
+|---|---:|---:|
+| **Core ATen 으로 낮춰짐** | **9** | 5 |
+| 규칙을 찾았고, 이 빌드에서 실행되지 않음 | 15 | 13 |
+| 규칙이 상류에 있는데 여기서 **닿을 수 없음** | **2** | 9 |
+| 규칙이 어디에도 없음 (상류 포함) | 9 | 8 |
+| 규칙이 기록과 다른 결과를 냄 (→ 거절) | 1 | 1 |
+| 캡처가 구간 출력으로 거절 | 1 | 1 |
 
-#### 낮춰짐 (4)
+**세 번째 줄이 이 작업의 숫자입니다: 9 → 2.** 닿을 수 없던 9 개 중 6 개는 §3.1 의 패킷 붕괴
+(`isin` · `transpose.int` · `rsub.Scalar` · `masked_fill.Scalar` · `masked_fill.Tensor` ·
+`unbind.int`), 3 개는 §3.2 의 CIA 절반(`matmul` · `max.other` · `where.ScalarOther`)이었습니다.
+남은 2 개는 상류 규칙 자체가 "C++ CIA 커널을 불러라" 인 것들입니다.
 
-```
-aten._unsafe_view.default   →  aten.view.default
-aten.detach.default         →  aten.alias.default
-aten.split.Tensor           →  aten.split_with_sizes.default
-aten.stack.default          →  aten.cat.default + aten.view.default
-```
+**두 번째 줄이 늘어난 것은 후퇴가 아닙니다.** 규칙이 *찾아졌기* 때문에 벽이 한 칸 아래로
+내려간 것이고, 새 벽은 전부 이름이 있습니다 (아래 표). 네 번째 줄이 하나 는 것도 같은 이유로,
+`masked_fill.Tensor` 의 규칙이 이제 돌아서 `aten.contiguous.default` 를 내는데 그것에 규칙이
+없습니다.
 
-#### 규칙은 있는데 이 빌드에서 실행되지 않음 (13) — 벽이 shim 쪽에 있습니다
-
-| op | 무엇에 막혔나 |
-|---|---|
-| `aten.t.default` | `torch.transpose` — `overloads.json` 에 항목 없음 |
-| `aten.silu.default` | `torch.sigmoid` — 같음 |
-| `aten._safe_softmax.default` | `torch.softmax` — 같음 |
-| `aten.zeros_like.default` | `torch.full_like` — 같음 |
-| `aten.ones.default` · `aten.zeros.default` | `aten.full.default` 의 `layout` 인자 미구현 |
-| `aten.arange.default` · `aten.arange.start` | `aten.arange.start_step` 의 `layout` 인자 미구현 |
-| `aten.empty_like.default` · `aten.new_ones.default` | `TensorBase.layout` 미구현 |
-| `aten.floor_divide.default` | `aten.div.Tensor_mode` 커널 없음 |
-| `aten._scaled_dot_product_flash_attention_for_cpu.default` | `aten._scaled_dot_product_attention_math` 커널 없음 |
-| `aten.softplus.default` | `torch._C._dynamo.eval_frame.set_eval_frame` 미구현 |
-
-넷으로 갈립니다 — **`torch.<fn>` 오버로드 표의 구멍 4 개**, **`layout` 인자/속성 5 개**,
-**커널 2 개**, **dynamo 1 개**. `layout` 다섯 개는 하나의 원인이므로 가장 값싼 다음 걸음입니다.
-
-#### 닿을 수 있는 표에 규칙이 없음 — 상류 전체 표에는 있음 (7)
+#### 낮춰짐 (9)
 
 ```
-aten.transpose.int        §3 의 패킷 붕괴
-aten.rsub.Scalar          §3 의 패킷 붕괴
-aten.masked_fill.Scalar   §3 의 패킷 붕괴
-aten.masked_fill.Tensor   §3 의 패킷 붕괴
-aten.isin.Tensor_Tensor   §3 의 패킷 붕괴
-aten.matmul.default       CIA 절반에만 있음 (§3 의 A→B). py_kernel 은 실재함
-aten.max.other            상류 규칙이 "C++ CIA 커널을 돌려라" 자체 — 파이썬 규칙이 없음
+aten.t.default         →  aten.permute.default              ← CAPTURE.md §5 가 지목한 op
+aten.transpose.int     →  aten.permute.default
+aten.matmul.default    →  aten.mm.default
+aten.isin.Tensor_Tensor→  aten.view.default + eq.Tensor + any.dims
+aten.sum.default       →  aten.sum.dim_IntList
+aten._unsafe_view.default → aten.view.default
+aten.detach.default    →  aten.alias.default
+aten.split.Tensor      →  aten.split_with_sizes.default
+aten.stack.default     →  aten.cat.default + aten.view.default
 ```
 
-마지막 줄이 별개의 벽입니다. 상류의 그 항목은
-`functools.partial(_special_op_to_decompose_cia)` 이고, 그것이 하는 일은 **C++ 의
-CompositeImplicitAutograd 커널을 호출하는 것**입니다. 파이썬 트리만 벤더링한 이 빌드에는 그
-커널이 없으므로, §3 의 A→B 를 고쳐도 이 항목은 열리지 않습니다.
+앞의 넷이 이 작업이 연 것입니다. `t` · `transpose` 는 §3.1 · §3.4 · §3.5 셋이 동시에 걸려
+있었고, `matmul` 은 §3.2 (CIA 절반), `isin` 은 §3.1 (패킷 붕괴) 이었습니다.
 
-#### 규칙이 상류에도 없음 (5)
+#### 규칙을 찾았고 실행되지 않음 (15) — 벽이 shim 쪽에 있습니다
+
+| op | 무엇에 막혔나 | 어느 파일 |
+|---|---|---|
+| `aten.ones.default` · `aten.zeros.default` · `aten.new_ones.default` | `aten.full.default` 의 `layout` 인자 미구현 | `aten.rs` |
+| `aten.arange.default` · `aten.arange.start` | `aten.arange.start_step` 의 `layout` 인자 미구현 | `aten.rs` |
+| `aten.empty_like.default` | `TensorBase.stride` 미구현 | `tensor.rs` |
+| `aten.floor_divide.default` | `aten.div.Tensor_mode` 커널 없음 | `aten.rs` |
+| `aten.masked_fill.Scalar` | `aten.where.ScalarSelf` 커널 없음 | `aten.rs` |
+| `aten._scaled_dot_product_flash_attention_for_cpu.default` | `aten._scaled_dot_product_attention_math` 커널 없음 | `aten.rs` |
+| `aten.silu.default` | `torch.sigmoid` — `overloads.json` 에 항목 없음, **그리고 커널도 없음** | 둘 다 |
+| `aten._safe_softmax.default` | `torch.softmax` — 같음. `softmax.int` 는 상류에서 CIA 이므로 자리는 `_install_composites` 입니다 | `bootstrap.py` |
+| `aten.zeros_like.default` | `torch.full_like` — 같음 | 둘 다 |
+| `aten.unbind.int` | `torch.tensor_split` — 같음 | 둘 다 |
+| `aten.softplus.default` | `torch._C._dynamo.eval_frame.set_eval_frame` 미구현 | `bootstrap.py` |
+| `aten.rsub.Scalar` | `torch.sub(스칼라, 텐서)` 를 해석기가 바인딩하지 못함 (§7.3) | `bootstrap.py` |
+
+**`layout` 다섯 개가 여전히 가장 값싼 다음 걸음입니다** — 하나의 원인이 다섯을 막고 있고,
+그 원인은 `aten.rs` 안의 인자 하나입니다.
+
+`transpose`/`permute`/`sub` 와 달리 `sigmoid` · `full_like` · `tensor_split` 은
+`overloads.json` 항목만으로 열리지 않습니다. **그 aten 키에 커널이 없기 때문입니다** —
+표만 넣으면 에러 메시지가 "표에 없다" 에서 "커널이 없다" 로 바뀔 뿐입니다. 그래서 넣지
+않았습니다.
+
+#### 규칙이 상류에도 없음 (9)
 
 ```
-aten.contiguous.default
-aten.histc.default
-aten.lift_fresh.default
-aten.max.default
-aten.reshape.default
+aten.contiguous.default     aten.max.default            aten.reshape.default
+aten.histc.default          aten.min.default            aten.view.dtype
+aten.lift_fresh.default     aten.masked_select.default  aten.masked_fill.Tensor
 ```
 
 `lift_fresh.default` 와 `max.default` 는 docs/CORE_ATEN.md §0 이 이미 "분해로도 안 풀림" 으로
-재 둔 둘입니다 — **그 측정이 재확인됐고, 목록이 셋 늘었습니다.** 이 다섯은 §7 의 "네 번째 층"
-(어느 쪽에도 안 걸리는 잔여) 이고, 직접 구현하거나 상류에 분해를 넣는 것 외에 길이 없습니다.
+재 둔 둘입니다. 이 열은 직접 구현하거나 상류에 분해를 넣는 것 외에 길이 없습니다.
+
+`aten.masked_fill.Tensor` 는 이 열에 있지만 **자기 규칙 때문이 아닙니다.** 규칙이 있고 돌고,
+그것이 `aten.contiguous.default` 를 내는데 그것에 규칙이 없습니다. 즉 `contiguous` 하나가
+둘을 막습니다.
+
+#### 규칙이 상류에 있는데 여기서 닿을 수 없음 (2)
+
+```
+aten.max.other          상류 규칙이 functools.partial(_special_op_to_decompose_cia)
+aten.where.ScalarOther  같음
+```
+
+상류의 그 항목이 하는 일은 **C++ 의 CIA 커널을 호출하는 것**입니다. 파이썬 트리만 벤더링한 이
+빌드에는 그 커널이 없으므로, §3.2 를 고쳐도 이 둘은 열리지 않습니다 — `_is_cia_op` 가
+`py_kernels` 를 보고 애초에 수집하지 않습니다. **이것이 940 과 414 의 차이를 만드는 벽이고,
+§7 이 그 크기를 셉니다.**
 
 #### 캡처가 거절 (1)
 
 `aten.is_floating_point.default` 는 텐서가 아닌 결과를 냅니다. 구간의 *출력*으로는 캡처가 이름을
-대고 거절하고, 구간 *안의* 노드로는 기록될 수 있습니다(docs/CAPTURE.md §4 의 메타데이터 허용목록).
-후자로 들어오면 이 패스는 "non-core 인데 규칙이 없다" 로 거절합니다.
+대고 거절하고, 구간 *안의* 노드로는 기록될 수 있습니다.
+
+#### 규칙이 기록과 다른 결과를 냄 (1)
+
+`aten.baddbmm.default` — §7.2.
 
 ---
 
-## 5. 판정 — 분해 전후로 재생 결과가 일치하는가
+## 5. `aten.t.default`, 그리고 docs/CAPTURE.md §5 의 예제 전체
 
-**일치합니다. 비트 단위로.**
-
-측정한 프로그램(테스트 `test_decompose_lowers_a_trace_to_core_aten` ·
-`test_decomposed_replay_matches_eager_bit_for_bit` 가 도는 것과 같은 것):
+CAPTURE.md §5 는 이 op 을 "가장 작은 예제에서 이미 일어나는 일" 로 지목했습니다. 이제 그
+예제 전체가 내려갑니다:
 
 ```python
-def program(x, w):
-    h = aten.stack.default([x, x * 2.0])   # ← Core ATen 밖
-    h = h.view(4, 4)
-    y = torch.relu(torch.mm(h, w))
-    lo, hi = aten.split.Tensor(y, 2)       # ← Core ATen 밖
-    return lo + hi
+m = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 3))
+
+기록      aten.t.default  aten.addmm.default  aten.relu.default  aten.t.default  aten.addmm.default
+분해 후   aten.permute.default  aten.addmm.default  aten.relu.default  aten.permute.default  aten.addmm.default
+
+Core ATen 밖:  분해 전 [aten.t.default]  →  분해 후 []
 ```
 
+**상류에게 같은 모듈을 물었을 때의 답과 op 단위로 같습니다** (이전 판본의 §7 이 인용해 둔 것):
+
+```python
+ep = torch.export.export(m, (x,))
+ep.run_decompositions(core_aten_decompositions())
+# → aten.permute.default, aten.addmm.default, aten.relu.default,
+#   aten.permute.default, aten.addmm.default
 ```
-기록      7 노드   mul.Scalar  stack.default  view  mm  relu  split.Tensor  add.Tensor
-분해 후   8 노드   mul.Scalar  cat.default  view  view  mm  relu  split_with_sizes  add.Tensor
 
-Core ATen 밖:  분해 전 [split.Tensor, stack.default]  →  분해 후 []
-```
+두 회차가 필요합니다: `t` → `transpose.int` → `permute`. 둘째 회차가 §3.1 · §3.4 두 벽에
+동시에 걸려 있었습니다.
 
-노드가 **늘어난 것**이 요점입니다. 분해는 op 하나를 여럿으로 바꾸므로, 개수가 그대로인 패스는
-아무 일도 안 한 것입니다.
+`test_the_smallest_model_lowers_the_way_upstream_lowers_it` 이 이 목록을 순서까지 못박고,
+기록에 쓰이지 않은 입력 셋으로 재생해 eager 와 대조합니다.
 
-| 입력 | 분해된 트레이스 재생 | 기록된 트레이스 재생 | eager |
+---
+
+## 6. 판정 — 분해 전후로 재생 결과가 일치하는가
+
+**일치합니다. 비트 단위로.** 이전 회차의 경고가 여기서 시험을 받았습니다.
+
+이전 판본은 이렇게 적었습니다 — 그때 열린 세 치환(`stack`→`cat`+`view`,
+`split`→`split_with_sizes`, `_unsafe_view`→`view`)은 전부 **데이터 이동이지 산술이 아니므로**,
+비트 동일은 "분해는 비트 동일하다" 의 증거가 아니라 "이 분해들은 산술을 건드리지 않는다" 의
+증거라고. **그러니 산술을 하는 규칙이 열리는 날 다시 재라고.**
+
+이번에 둘이 열렸습니다:
+
+| 규칙 | 무엇이 되는가 | 산술인가 | 결과 |
 |---|---|---|---|
-| `ones(2,4)` (기록에 쓰인 것) | 같음 | 같음 | 기준 |
-| `× 0.5` · `× -2.0` · `× 7.25` (처음 보는 것) | **세 번 모두 완전 일치** | 완전 일치 | 기준 |
+| `aten.matmul.default` | `aten.mm.default` | **예** — 곱셈 누산 | 완전 일치 |
+| `aten.isin.Tensor_Tensor` | `view` + `eq.Tensor` + `any.dims` | **예** — 비교와 축약 | 완전 일치 |
+| `aten.t.default` | `aten.permute.default` | 아니오 | 완전 일치 |
 
-**비트 동일을 기대하지 않았던 것을 적어 둡니다.** 분해는 같은 수학이지만 연산 순서가 달라지므로
-부동소수점의 마지막 비트가 달라질 자격이 있습니다. 이 트레이스에서는 달라지지 않았고, 이유도
-구조적입니다 — 여기서 일어난 세 치환(`stack`→`cat`+`view`, `split`→`split_with_sizes`,
-`_unsafe_view`→`view`)은 전부 **데이터 이동이지 산술이 아닙니다.** 즉 이 결과는 "분해는 비트
-동일하다" 의 증거가 아니라 **"이 분해들은 산술을 건드리지 않는다"** 의 증거입니다. 산술을
-재배열하는 규칙(`silu`, `_safe_softmax`, `baddbmm`)이 열리는 날 이 표는 다시 재야 하고, 그때
-차이가 나오면 **허용치를 넓히는 것이 아니라 크기를 재서 여기에 적어야 합니다**
+`matmul` → `mm` 이 비트 동일한 것에는 구조적 이유가 있습니다: 이 shim 에서 두 이름이 같은
+커널에 닿습니다. 그러므로 **이것도 "분해 일반" 의 증거가 아닙니다.** 진짜 시험은 산술 순서를
+바꾸는 규칙(`silu`, `_safe_softmax`, `baddbmm`)이고, 그것들은 §4 의 두 번째 열에 있습니다.
+그때 차이가 나오면 **허용치를 넓히는 것이 아니라 크기를 재서 여기에 적어야 합니다**
 (docs/DEVICE.md §5 — 허용치보다 이름 붙인 예외).
+
+§5 의 프로그램과 이전 판본의 7→8 노드 프로그램 둘 다, 기록에 쓰이지 않은 입력 셋
+(`× 0.5` · `× -2.0` · `× 7.25`)에서 낮춘 트레이스 · 기록된 트레이스 · eager 가 전부 일치합니다.
 
 가드는 낮추기를 통과해도 가드로 남습니다: 분해된 트레이스에 `ones(3,4)` 를 주면 `[2, 4]` 를
 이름에 담아 거절합니다. **낮추기는 트레이스를 일반화하지 않습니다.**
 
 ---
 
-## 6. 이 패스가 찾은 것 — 미구현이 아니라 결함 둘
+## 7. 이 패스가 찾은 것 — 미구현이 아니라 결함
 
 패스는 분해 결과의 shape·dtype·device 를 **기록된 것과 대조**합니다. 분해는 같은 함수여야
-하므로, 다르면 무언가가 틀린 것이고 그대로 내보내면 아무도 다시 보지 않는 그래프가 아래로
-내려갑니다. 그 검사가 두 개를 잡았고, **둘 다 이 저장소의 진짜 버그입니다.**
+하므로, 다르면 무언가가 틀린 것입니다.
 
-### 6.1 `aten.sum.dim_IntList` 의 빈 `dim` 목록 — **고쳐짐**
+### 7.1 `aten.sum.dim_IntList` 의 빈 `dim` 목록 — **고쳐짐** (2026-08-28)
 
-> **2026-08-28 수정.** `rust/torch_c/src/aten.rs::sum_or_mean` 이 빈 `dim` 목록을 모든 축으로
-> 확장하도록 고쳐졌습니다 (`dims.map(|d| if d.is_empty() { (0..rank).collect() } else { d })`).
-> 아래는 그 전까지의 상태를 남긴 기록입니다.
+`rust/torch_c/src/aten.rs::sum_or_mean` 이 빈 `dim` 목록을 모든 축으로 확장하도록 고쳐졌습니다.
+그 전에는 입력을 그대로 돌려줬고, `aten.sum.default` 의 상류 규칙이
+`sum(x, dim=[], dtype=None)` 을 만들어 그 경로의 첫 호출자가 되었습니다. `mean.dim` 이 같은
+커널을 공유해 같은 수정으로 함께 고쳐졌습니다.
 
-상류 규칙은 `sum(x)` 를 `sum(x, dim=[], dtype=None)` 으로 다시 씁니다. **빈 `dim` 목록은 "모든
-차원을 축약하라" 는 뜻입니다.**
-
-```
-                        shape        값
-상류  sum(ones(3,4), [])   []        12.0
-여기  sum(ones(3,4), [])   [3, 4]    입력 그대로   ← 고치기 전
-```
-
-고치기 전 커널은 입력을 그대로 돌려줬습니다. `aten.sum.default` 는 골든 하네스가 검사했지만
-(당시 2383/2383 통과), **`aten.sum.dim_IntList` 에 빈 리스트를 주는 케이스는 아무도 만들지
-않았습니다.** 분해 패스가 그 인자를 만들어내는 첫 호출자였습니다. `dim=[0,1]`(명시적 전체
-축약)·`keepdim=True` 조합·중복 `dim`(양쪽 다 거절, candle 이 이미 잡고 있었음)도 상류 2.13.0
-과 대조해 `tools/golden/cases.py`의 `sum_dim_cases`/`mean_dim_cases`에 케이스로 남겼습니다 —
-같은 함정이 `mean.dim`에도 있었는지 확인하는 것이 목적이었고, 있었습니다(같은 커널을 공유).
-
-이 결함을 잡았던 테스트 `test_decompose_refuses_a_rule_that_disagrees_with_the_recording` 는
-`test_decompose_lowers_sum_default_now_that_the_kernel_agrees` 로 이름이 바뀌었습니다 — 커널이
-고쳐졌으므로 이제 거절이 아니라 **낮추기가 성공하는 것**을 못박습니다. "규칙이 recording과
-불일치하면 거절한다"는 세 번째 벽 자체는 `test_decompose_refuses_by_name_what_it_cannot_lower`
-가 `aten.baddbmm.default`(§6.2, 아직 안 고쳐짐)로 커버리지를 이어받았습니다.
-
-### 6.2 `aten.baddbmm.default` 분해의 dtype 승격
+### 7.2 `aten.baddbmm.default` 분해의 dtype 승격 — **아직**
 
 ```
                        입력           분해 결과 dtype
@@ -344,121 +460,160 @@ Core ATen 밖:  분해 전 [split.Tensor, stack.default]  →  분해 후 []
 ```
 
 상류의 `baddbmm` 분해는 `beta`/`alpha` 를 파이썬 float 로 곱합니다. 상류에서는 파이썬 스칼라가
-텐서의 dtype 을 끌어올리지 않는데(type promotion 규칙), 여기서는 float64 로 승격됩니다.
-**이것은 분해 경로만의 문제가 아니라 스칼라 승격 규칙의 발산**이므로 다른 경로에서도 나올 수
-있습니다. 아직 어느 op 에서 나오는지 좁히지 않았습니다 — 여기 적어 두는 것이 지금 할 수 있는
-전부입니다.
+텐서의 dtype 을 끌어올리지 않는데, 여기서는 float64 로 승격됩니다. **분해 경로만의 문제가
+아니라 스칼라 승격 규칙의 발산**입니다. 아직 어느 op 에서 나오는지 좁히지 않았습니다.
+
+### 7.3 스칼라가 앞에 오는 호출 — 새로 드러남
+
+`aten.rsub.Scalar` 의 상류 규칙은 `torch.sub(other, self, alpha=alpha)` 이고, `other` 가
+스칼라입니다. 상류의 `PythonArgParser` 는 그것을 0 차원 텐서로 감싸 `sub.Tensor` 로 보냅니다.
+이 shim 의 해석기는 그렇게 하지 않아 거절합니다:
+
+```
+TypeError: torch.sub(): no matching overload in torch._C shim for (float, Tensor, alpha=int)
+```
+
+`overloads.json` 에 `sub` 를 넣은 뒤에야 보이게 된 벽입니다. **표의 문제가 아니라 해석기의
+문제**이고, `torch.add(1.0, t)` 같은 모든 호출에 같은 벽이 있습니다. 이 회차에서는 고치지
+않았습니다 — 해석기의 바인딩 규칙을 건드리는 변경이라 영향 범위가 이 패스보다 넓습니다.
+
+### 7.4 파일의 0 번째 칸 주석 — §3.3
+
+세 개의 `pointwise` 태그를 잃고 있었습니다. 스캐너 둘이 같은 결함을 가지고 있었습니다.
 
 ---
 
-## 7. ExecuTorch Edge 까지 남은 거리
+## 8. ExecuTorch Edge 까지 남은 거리
 
-**분해는 필요조건이고 충분조건이 아닙니다.** 상류에게 같은 모델을 물어보면 답이 이렇습니다:
+**분해는 필요조건이고 충분조건이 아닙니다.**
 
-```python
-ep = torch.export.export(nn.Sequential(Linear(4,8), ReLU(), Linear(8,3)), (x,))
-ep.run_decompositions(core_aten_decompositions())
-# → aten.permute.default, aten.addmm.default, aten.relu.default,
-#   aten.permute.default, aten.addmm.default
-```
+### 표가 아직 940 이 아니다
 
-`aten.t.default` 가 `permute` 가 됩니다 — `t` → `transpose.int` → `permute` 의 두 단계이고,
-둘째 단계는 §3 이 막고 있는 CIA 절반에 있습니다. **즉 docs/CAPTURE.md §5 가 지목한 바로 그
-op 은 아직 안 됩니다.** 이 패스가 여는 것은 그 옆의 4 개이고, `t` 는 §3 · §4 의 벽 두 개가
-동시에 걸려 있습니다.
+| | 표 | 여기 |
+|---|---:|---:|
+| `_core_aten_decompositions_post_autograd()` | 435 | **383** |
+| `_collect_all_valid_cia_ops()` 로 더해지는 것 | 469 | **33** |
+| 합계 (`core_aten_decompositions()`) | 940 | **414** |
 
-그리고 Core ATen 에 닿아도 Edge 는 아직입니다.
+두 줄의 원인이 다릅니다.
+
+- **post_autograd 에서 빠진 52 개는 전부 `.out` 변형**입니다. torchgen 이 빌드 타임에
+  생성하고 파일에는 없는 1148 개(docs/SCHEMA.md §12)의 일부이고, `pyyaml` 을 의존성으로
+  받아들이면 전부 채워집니다. **이 빌드는 `.out` 키를 하나도 구현하지 않으므로 어떤 기록에도
+  들어올 수 없습니다** — `verify_schemas.py` 가 그 전제를 매번 확인합니다.
+- **CIA 에서 빠진 436 개는 C++ 커널입니다.** 상류의 `_is_cia_op` 는 C++ 디스패처에 물어보고,
+  여기서는 `op.py_kernels` 만 답할 수 있습니다. 파이썬 CIA 커널이 있는 것 33 개는 열렸고,
+  나머지는 **파이썬 트리만 벤더링한다는 이 프로젝트의 전제 자체에 걸려 있습니다.**
+  `aten.max.other` · `aten.where.ScalarOther` 가 그 벽의 이름입니다 (§4).
+
+### 그리고 Core ATen 에 닿아도 Edge 는 아직입니다
 
 | 남은 것 | 왜 이 패스가 아닌가 |
 |---|---|
-| **functionalization (view → `_copy`)** | Edge 는 `view_copy` · `permute_copy` · `transpose_copy` 를 씁니다. 그것들은 `tags: view_copy` 이지 `core` 가 아니고, **Core ATen 은 `view`/`permute` 를 그대로 둡니다.** 변환은 `to_edge` 의 일이고 분해표에 없습니다 |
-| **stride / dim order** | `TensorBase` 에 `.stride()` 가 없습니다 (docs/META.md §6). 텐서 표현이 바뀌는 날의 문제 (docs/CAPTURE.md §5-2) |
-| **`graph_signature` 의 이름** | 상수가 인덱스로만 식별됩니다. `constant_values` 가 생겨서 값은 나오지만 FQN 은 위층에서 붙여야 합니다 (§5-3) |
+| **functionalization (view → `_copy`)** | Edge 는 `view_copy` · `permute_copy` · `transpose_copy` 를 씁니다. 그것들은 `tags: view_copy` 이지 `core` 가 아니고, **Core ATen 은 `view`/`permute` 를 그대로 둡니다.** 변환은 `to_edge` 의 일이고 분해표에 없습니다. **§5 의 결과가 `permute` 인 것이 곧 이 항목의 크기입니다** |
+| **stride / dim order** | `TensorBase` 에 `.stride()` 가 없습니다 (docs/META.md §6). `empty_like` 이 §4 에서 여기 걸립니다 |
+| **`graph_signature` 의 이름** | 상수가 인덱스로만 식별됩니다. 값은 `constant_values` 로 나오지만 FQN 은 위층에서 붙여야 합니다 |
 | **직렬화** | 트레이스가 프로세스 밖으로 못 나갑니다. `.pte` 로 가는 길이 여기를 지납니다 |
 | **변이 · 별칭** | 캡처가 거절합니다. KV 캐시가 먼저 부딪힙니다 |
 
 DESIGN.md §5 의 3 층 구조에서 **2 층("분해 테이블을 벤더링 — 롱테일이 자동으로 core op 으로
-분해됨")이 이제 배선됐습니다.** 다만 "자동으로" 는 과했습니다 — docs/GAP.md §0 이 이미
-"분해는 eager 폴백이 아니라 트레이싱 시점의 변환" 이라고 정정했고, 이번 작업이 그 트레이싱
-시점을 만들었습니다. 그리고 그 위에서 재보니 **32 개 중 4 개**입니다. CORE_ATEN.md §4.2 가
-요구한 "네 번째 층 — 어느 쪽에도 안 걸리는 잔여" 는 이제 이름이 5 개입니다 (§4).
+분해됨")이 배선됐고, 이번 회차에 그 배선의 네 결함이 제거됐습니다.** 다만 "자동으로" 는
+여전히 과합니다 — 37 개 중 9 개입니다.
 
 ---
 
-## 8. 판정 — 전부 종료 코드로
+## 9. 판정 — 전부 종료 코드로
 
 | 검사 | 결과 |
 |---|---|
 | `cargo build --release` | 0 |
-| `PYTHON=... sh rust/torch_c/pytests/run.sh` | 0 — **136/136 통과** (decompose 6 개 + capture 상수 1 개 포함) |
-| `python tools/golden/compare.py` | 0 — **2383/2383**, ops=109, KNOWN DIVERGENCE 0 |
-| `python rust/torch_c/pytests/verify_schemas.py` | 0 — **255/255** |
+| `PYTHON=... sh rust/torch_c/pytests/run.sh` | 0 — **176/176 통과** (이전 169) |
+| `python tools/golden/compare.py` | 0 — **2744/2744**, ops=118 |
+| `python rust/torch_c/pytests/verify_schemas.py` | 0 — **4200/4200** (이전 3076) |
 
-### 테스트가 실패할 수 있는지 확인했다
+`verify_schemas.py` 가 새로 확인하는 것 셋:
 
-초록을 받았으므로 무력화해 보고 빨개지는지 두 번 확인했습니다.
+```
+packet overload lists:                     99/99    상류와 대조 (§3.1)
+OpOverload.tags:                         118/118    상류와 대조 (§3.3)
+CompositeImplicitAutograd registrations: 744/744    상류와 대조 (§3.2)
+```
 
-- **`is_core()` 가 항상 True 를 돌려주게 했더니** — 패스가 아무것도 낮추지 않고 고정점 검사에
-  걸려 `gave up after 8 rounds with these ops still outside Core ATen: aten.split.Tensor,
-  aten.stack.default` 로 죽었습니다. `test_decompose_lowers_a_trace_to_core_aten` 과
-  `test_decomposed_replay_matches_eager_bit_for_bit` 이 그것으로 빨개집니다.
-- **결과 메타 대조(`_meta_matches`) 한 줄을 끊었더니** — §6.1 의 `aten.sum.default` 가
-  **통과했습니다.** 8 노드짜리 도로는 그대로 초록이고 오직 그 테스트만 빨개지는데, 그것이
-  이 검사가 무엇을 위해 있는지 그대로 보여줍니다: 낮추기가 되는지가 아니라 **낮춘 것이 같은
-  함수인지**를 보는 검사입니다.
+### 검사가 실패할 수 있는지 확인했다
 
-무력화 뒤에는 `git status --short` 로 원상복구를 확인했습니다.
+초록을 받았으므로 결함을 주입해 각 검사가 실제로 빨개지는지 확인했습니다.
+
+| 주입한 결함 | 잡은 검사 | 결과 |
+|---|---|---|
+| `_overload_names` 를 `["default"]` 로 되돌림 | `verify_schemas check_overload_names` | 86 개 패킷 지목, exit 1 |
+| CIA 의 암묵 기본값(`torchgen/model.py:872`) 삭제 | `verify_schemas check_cia_registrations` | 653 개 지목, exit 1 |
+| `_as_the_dispatcher_would_call_it` 무력화 | `test_decompose_lowers_the_op_capture_md_named` 외 8 개 | exit 1 |
+| 태그의 암묵 규칙 셋 삭제 (개발 중 실측) | `verify_schemas check_tags` | **118 개 중 0 개 일치**, exit 1 |
+| 0 번째 칸 주석 처리 누락 (개발 중 실측) | 같은 검사 | 3 개 지목 (`sinh.out` · `rsub.Scalar` · `tanh_backward.default`) |
+
+마지막 두 줄은 주입이 아니라 **개발 중에 실제로 났던 상태**입니다. 검사가 그것을 잡아서
+§3.3 이 존재합니다.
+
+주입 뒤에는 `cp` 백업에서 복구하고 `git status --short` 로 확인했습니다.
 
 ---
 
-## 9. 미완으로 남긴 것
+## 10. 미완으로 남긴 것
 
 | | 상태 |
 |---|---|
-| `t` · `silu` · `softmax` 등 산술을 재배열하는 분해 | **안 됨.** §4 의 벽 두 종류가 걸려 있습니다. 이것들이 열려야 §5 의 "비트 동일" 이 진짜 시험을 받습니다 |
-| `overloads.json` 의 구멍 4 개 (`transpose` · `sigmoid` · `softmax` · `full_like`) | 안 채웠습니다. 채우는 것은 기계적이고 `verify_schemas.py` 가 상류와 대조해 줍니다 |
-| `layout` 인자/속성 5 개 | 안 채웠습니다. **가장 값싼 다음 걸음** — 하나의 원인이 5 개 op 을 막고 있습니다 |
-| `_jit_get_operation` 의 오버로드 목록 (§3) | 안 고쳤습니다. `bootstrap.py` 는 이번 회차에 다른 작업이 열려 있어 건드리지 않았습니다. **규칙 505 개가 이것 하나에 걸려 있습니다** |
-| `_dispatch_get_registrations_for_dispatch_key` (§3) | 안 구현했습니다. 구현해도 CIA 항목의 상당수는 C++ 커널을 부르므로 다 열리지는 않습니다 |
-| §6.1 `sum.dim_IntList([])` | **2026-08-28 고쳐졌습니다** — 빈 `dim` 목록이 모든 축으로 확장됩니다. `mean.dim` 이 같은 커널을 공유해 같은 수정으로 같이 고쳐졌습니다 |
-| §6.2 `baddbmm` dtype | **고치지 않았습니다.** 스칼라 승격 규칙의 문제이고, 테스트가 현재 동작을 못박아 두었습니다 |
-| functionalization (view → `_copy`) | 없음 (§7). 이 패스가 아닙니다 |
-| 여러 트레이스에 걸친 측정 | 없음. §4 의 32 개는 **구현된 op 을 하나씩 단독 트레이스로** 돌린 것이지, 실제 모델 트레이스의 분포가 아닙니다 |
+| `layout` 인자 5 개 (`aten.rs`) | **가장 값싼 다음 걸음.** 하나의 원인이 5 개 op 을 막습니다 |
+| `contiguous` 의 규칙 | 상류에 없습니다. 하나가 `masked_fill.Tensor` 까지 둘을 막습니다 |
+| `sigmoid` · `full_like` · `tensor_split` 커널 | 표만으로는 안 열립니다 (§4). `aten.rs` |
+| `softmax` 합성 | `softmax.int` 는 상류에서 CIA 이므로 `overloads.json` 이 아니라 `_install_composites` 가 자리입니다. `_safe_softmax` 하나가 걸려 있습니다 |
+| 스칼라 선행 인자 (§7.3) | 해석기의 바인딩 규칙 문제. `rsub.Scalar` 가 여기 걸립니다 |
+| §7.2 `baddbmm` dtype | 고치지 않았습니다. 테스트가 현재 동작을 못박아 두었습니다 |
+| C++ CIA 커널 436 개 (§8) | 프로젝트의 전제에 걸려 있습니다. 열 방법이 있는지부터 미정입니다 |
+| `.out` 변형 1148 개 | `pyyaml` 을 의존성으로 받아들이면 전부. 지금은 도달 불가라는 것이 확인됩니다 (§8) |
+| functionalization (view → `_copy`) | 없음 (§8). 이 패스가 아닙니다 |
+| **여러 트레이스에 걸친 측정** | 여전히 없음. §4 의 "37 개 중 9 개" 는 **op 개수 비율**이지 "모델의 몇 %가 낮춰진다" 가 아닙니다 |
 
-마지막 줄이 이 측정의 가장 큰 한계입니다. §4 의 "32 개 중 4 개" 는 **op 개수 비율**이지
-"모델의 몇 %가 낮춰진다" 가 아닙니다. 실제 모델에서는 소수의 op 이 대부분의 노드를 차지하므로
-두 숫자는 전혀 다를 수 있고, 어느 쪽으로 다를지는 재지 않았습니다.
+마지막 줄이 이 측정의 가장 큰 한계입니다 — 다만 §5 가 그 방향으로 한 걸음입니다. 실제 모듈
+하나에 대해서는 **5 노드 중 5 노드**가 낮춰졌고, 두 숫자가 얼마나 다른지를 처음으로 보여줍니다.
 
 ---
 
-## 10. 재현
+## 11. 재현
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-decomp
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-accel
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 bash vendor/vendor_torch.sh                  # 새 worktree 만
-PYTHON=$PY bash vendor/install_shim.sh       # 도로 테스트는 벤더 트리의 산출물을 읽는다
+PYTHON=$PY bash vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh    # decompose 6 개 포함
-$PY tools/golden/compare.py                  # 벤더 트리를 PYTHONPATH 에 넣지 말 것
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh rust/torch_c/pytests/run.sh    # 176
+$PY tools/golden/compare.py                  # 2744/2744 ops=118
+$PY rust/torch_c/pytests/verify_schemas.py   # 4200/4200
 ```
 
-§2 · §3 · §4 의 실측:
+§4 의 표:
 
 ```sh
-# 표 크기 셋, Core ATen 판정, 그리고 32 개 스윕
+PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+    $PY rust/torch_c/pytests/decomp_sweep.py          # --json 이면 거절문까지
+```
+
+§3 의 숫자:
+
+```sh
 PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c '
 import torch, torch._decomp as D
 from torchnative.export import core_ops, decomposition_table, decomposition_table_source
 print("core:", len(core_ops()))
 print("table:", decomposition_table_source(), len(decomposition_table()))
 print("registry:", len(D.global_decomposition_table["post_autograd"]))
-print("overloads of aten.transpose:", torch.ops.aten.transpose.op_overloads())
-print("tags of aten.addmm.default:", torch.ops.aten.addmm.default.tags)'
+print("overloads of aten.transpose:", torch.ops.aten.transpose.overloads())
+print("tags of aten.addmm.default:", torch.ops.aten.addmm.default.tags)
+print("CIA:", len(torch._C._dispatch_get_registrations_for_dispatch_key(
+    "CompositeImplicitAutograd")))'
 ```
 
 같은 것을 상류 torch 로 (벤더 트리를 `PYTHONPATH` 에서 빼고) 돌리면 §3 의 비교 열이 나옵니다.
