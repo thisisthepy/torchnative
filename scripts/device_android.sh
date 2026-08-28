@@ -301,25 +301,36 @@ cmd_diff() {
 import json, sys
 
 # Measured on emulator-5554 (pmp_api26, API 26, arm64-v8a) against an
-# aarch64-darwin host -- docs/DEVICE.md records the run. These two cases and
-# only these two differ, by at most 1 ULP, and both sides straddle the
+# aarch64-darwin host -- docs/DEVICE.md records the run. These four cases and
+# only these four differ, by at most 1 ULP, and both sides straddle the
 # correctly-rounded double-precision reference in both directions, so neither is
 # "the wrong one": Apple's libm and bionic's are different implementations of
 # expf/tanhf. Everything else -- including the two nn.Module forwards -- is
 # bit-identical.
 #
+# `exp.default` and `softplus.default` joined `_softmax.default` and
+# `tanh.default` when the battery grew past its original 33 cases
+# (docs/DEVICE.md records the reference-value check): `softplus` calls `exp`
+# internally, so its own 1-ULP divergence is inherited, not independent --
+# the same `expf` call underneath, the same directionless straddle.
+#
 # Listing them by name rather than by a global tolerance is the point. A
 # tolerance would also swallow a real divergence in `mm` or `cumsum`, which is
 # exactly what this script exists to catch. Anything not on this list is a
-# regression, including any of these two growing past 1 ULP.
+# regression, including any of these four growing past 1 ULP.
 #
-# The list stays at two because `cmd_parity` builds the host end with Accelerate
-# off. Against the *shipped* Apple artefact it would need eight more entries at
-# 1-2 ULP -- `mm`/`addmm`/`bmm`/`native_layer_norm`/`nn.Linear` from BLAS
-# accumulating in a different order, `sin`/`cos`/`rsqrt` from vForce -- and a
-# list that long stops being a list of known exceptions and starts being the
-# tolerance this comparison refused to have.
-EXPECTED_LIBM_DIVERGENCE = {"_softmax.default": 1, "tanh.default": 1}
+# The list stays this short because `cmd_parity` builds the host end with
+# Accelerate off. Against the *shipped* Apple artefact it would need eight
+# more entries at 1-2 ULP -- `mm`/`addmm`/`bmm`/`native_layer_norm`/`nn.Linear`
+# from BLAS accumulating in a different order, `sin`/`cos`/`rsqrt` from vForce
+# -- and a list that long stops being a list of known exceptions and starts
+# being the tolerance this comparison refused to have.
+EXPECTED_LIBM_DIVERGENCE = {
+    "_softmax.default": 1,
+    "tanh.default": 1,
+    "exp.default": 1,
+    "softplus.default": 1,
+}
 
 host = json.load(open(sys.argv[1]))
 device = json.load(open(sys.argv[2]))

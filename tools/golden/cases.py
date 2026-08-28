@@ -2213,6 +2213,17 @@ def mean_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([-1], True, "RMSNorm-style: reduce last dim, keepdim"),
             ([0], False, "reduce first dim"),
             (None, False, "dim=None -- reduce all"),
+            # An empty `dim` list is not the same as `dim=None`: torch
+            # documents it as reducing *every* dimension too, but it is a
+            # distinct code path (`sum.dim_IntList`/`mean.dim` vs
+            # `sum.default`/`mean.default`) and this shim's kernel used to
+            # take the empty list literally -- "reduce over these zero
+            # axes" -- and hand the input back unchanged. Measured against
+            # upstream torch 2.13.0 (not copied from a doc comment):
+            # torch.mean(ones(3,4), dim=[]) -> shape (), value 1.0.
+            ([], False, "dim=[] -- reduce all (empty dim list, not dim=None)"),
+            ([], True, "dim=[] keepdim=True -- reduce all, every axis kept at size 1"),
+            ([0, 1], False, "dim=[0,1] -- explicit reduce of every axis"),
         ]:
             cases.append(
                 Case(
@@ -2223,6 +2234,18 @@ def mean_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=note,
                 )
             )
+        # torch refuses a repeated dim ("dim 0 appears multiple times in
+        # the list of dims"); measured against upstream 2.13.0.
+        cases.append(
+            Case(
+                name=f"mean(dtype={dtype_name}, dim=[0, 0], keepdim=False) [duplicate dim]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [0, 0], False),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [0, 0], False),
+                expect="both_error",
+                note="duplicate dim index -- both sides must refuse",
+            )
+        )
     return cases
 
 
@@ -2248,6 +2271,17 @@ def sum_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([-1], True, "reduce last dim, keepdim"),
             ([0], False, "reduce first dim"),
             (None, False, "dim=None -- reduce all"),
+            # docs/DECOMP.md §6.1: the decomposition pass rewrites
+            # `sum(x)` to `sum(x, dim=[], dtype=None)`, and nothing had
+            # ever exercised an empty `dim` list before that pass existed
+            # -- this shim's kernel took it literally as "reduce over
+            # these zero axes" and returned the input unchanged instead of
+            # reducing every dimension. Measured against upstream torch
+            # 2.13.0, not copied from the bug report:
+            # torch.sum(ones(3,4), dim=[]) -> shape (), value 12.0.
+            ([], False, "dim=[] -- reduce all (empty dim list, not dim=None)"),
+            ([], True, "dim=[] keepdim=True -- reduce all, every axis kept at size 1"),
+            ([0, 1], False, "dim=[0,1] -- explicit reduce of every axis"),
         ]:
             cases.append(
                 Case(
@@ -2258,6 +2292,20 @@ def sum_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=note,
                 )
             )
+        # torch refuses a repeated dim ("dim 0 appears multiple times in
+        # the list of dims"); measured against upstream 2.13.0. Candle
+        # already refuses too (`sum: duplicate dim index`), so this is a
+        # regression pin, not a fix.
+        cases.append(
+            Case(
+                name=f"sum(dtype={dtype_name}, dim=[0, 0], keepdim=False) [duplicate dim]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [0, 0], False),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [0, 0], False),
+                expect="both_error",
+                note="duplicate dim index -- both sides must refuse",
+            )
+        )
     return cases
 
 

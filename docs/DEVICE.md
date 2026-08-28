@@ -2,8 +2,10 @@
 
 **결론: `import torch` 가 되고, aten op 이 돌고, `nn.Linear`/`nn.Sequential` 순전파가
 호스트와 비트 단위로 일치한다.** 목표(“`import torch` 가 되고 aten op 하나가 도는 것”)를
-넘어 33개 케이스 배터리 전체를 돌렸고, 호스트와 비교 가능한 32개 중 **30개가 비트 동일**,
-나머지 2개는 **1 ULP** 차이다.
+넘어 배터리를 돌렸다. **2026-08-28 기준 배터리는 54개 케이스**(원래 33개 + mamba·mixtral
+12개 op·repr 커널 6개·`cat`/`max` 결함 수정·gemm 스레딩 임계값·`sum` 결함 수정 각각의 검증
+케이스)이고, 호스트와 비교 가능한 54개 중 **50개가 비트 동일**, 나머지 4개는 **1 ULP** 차이다
+(§5.3).
 
 이전 단계와의 구분:
 
@@ -212,6 +214,125 @@ Accelerate 를 링크하지 않는지 `otool` 로 확인한 뒤에만** 잰다. 
 **대가를 분명히 해 둔다: `PARITY: ok` 는 배송되는 Apple 아티팩트에 대해 아무 말도 하지
 않는다.** 그것에 대해 말하는 것은 이 §5.1 이고, 위 8 건이 그 전부다.
 
+### 5.3 배터리 확장 (2026-08-28) — ops 97→116 가 기기에서 한 번도 확인되지 않았다
+
+**여기서 재확인한 것.** `parity` 가 마지막으로 초록이었던 것은 `_aten_implemented()` 가
+97 이던 시점이다. 그 뒤로 op 이 **116** 개가 됐다:
+
+- mamba·mixtral 12 개 (`clamp_.default` · `convolution.default` · `div_.Tensor` ·
+  `empty_like.default` · `exp.default` · `floor_divide.default` · `ge.Scalar` ·
+  `histc.default` · `index_put_.default` · `masked_fill_.Scalar` · `softplus.default` ·
+  `zeros_like.default`, `3b9a67a`)
+- "repr 커널" 6 개 (`abs.default` · `ceil.default` · `gt.Scalar`/`gt.Tensor` · `min.default` ·
+  `masked_select.default` · `unbind.int`, `test_the_six_repr_kernels_dispatch` 가 도로 이름이다)
+- `cat.default` 의 legacy-empty 규칙 변경 (`test_cat_skips_a_tensor_of_shape_zero_and_only_that_shape`)
+- `max.default` 의 NaN 전파 수정 (candle 이 NaN 을 건너뛰던 것을 IEEE `maximum` 규칙으로 고침)
+- gemm 스레딩 임계값 589,824 → 4,000,000 (`25a79df`) — n=128 이 기기에서 6.9배 빨라졌다는
+  주장이 있었지만 **정확성 쪽은 기기에서 한 번도 재지 않았다**
+- `sum.dim_IntList`([]) 결함 수정 (`docs/DECOMP.md` §6.1, 이 회차에 같이 고쳤다)
+
+**이 중 어느 것도 기기에서 확인된 적이 없었다.** `scripts/device_parity.py` 의 배터리는
+33 케이스에 멈춰 있었고 위 항목 전부가 빠져 있었다.
+
+#### 무엇을 더했는가
+
+`scripts/device_parity.py` 에 21 케이스를 더해 **54 개**로 늘렸다 (원래 33 개는 그대로 두고
+추가만 했다 — 기존 케이스 이름과 겹치지 않는 새 키를 썼다):
+
+```
+abs.default   ceil.default   gt.Scalar   masked_select.default   min.default   unbind.int
+max.default                              ← NaN 을 포함한 입력, IEEE 전파 규칙 확인
+cat.default (empty)                      ← legacy-empty 규칙: (0,) 1-D 는 스킵, 다른 empty 는 아님
+clamp_.default   convolution.default   div_.Tensor   exp.default   floor_divide.default
+ge.Scalar   histc.default   index_put_.default   masked_fill_.Scalar   softplus.default
+zeros_like.default                       ← mamba·mixtral 12 개 중 11 개 (mixtral 값은 doc-comment
+                                            를 베끼지 않고 tools/golden/cases.py 의 이미 측정된
+                                            픽스처 값을 그대로 재사용했다)
+mm.default (n=128, gemm threading threshold)  ← 정확성만, 성능은 안 쟀다 (CLAUDE.md)
+sum.dim_IntList (dim=[])                 ← 이번에 고친 커널이 기기에서도 같은 값을 내는지
+```
+
+**뺀 것 하나, 의도적으로.** `empty_like.default` 는 안 넣었다 — 초기화되지 않은 메모리는
+비트로 비교할 대상이 없다. `tools/golden/cases.py` 의 `_dtype_shape_only_check` 가 골든
+하네스에서 이미 같은 이유로 값 비교를 건너뛰고, 이 배터리는 값 비교(비트 대조)가 전부이므로
+같은 논리로 뺐다 — shape/dtype 만 비교하는 별도 경로는 이 스크립트에 없다.
+
+#### 결과
+
+```
+host   darwin/arm64   torch 2.13.0  kernels 116
+device android/aarch64 torch 2.13.0 kernels 116
+identical 50/54
+host failures:   []
+device failures: []
+PARITY: ok
+```
+
+**새로 추가한 20 케이스(원래 33 개 + `sum.dim_IntList([])` 를 뺀 나머지) 전부 비트 동일했다
+— `max.default` 의 NaN 전파, `cat.default` 의 empty 스킵, `sum.dim_IntList([])` 의 전체 축약,
+`mm.default` n=128 (gemm 스레딩 경로 변경), mamba·mixtral 11 개 op 모두.** 원래 33 개는
+30 개 비트 동일 · 2 개(`tanh.default` · `_softmax.default`) 1 ULP 그대로였다 — op 이
+97→116 으로 늘어난 것이 기존 케이스의 답을 바꾸지 않았다는 뜻이다.
+
+**딱 둘, 새로 갈렸다: `exp.default` 와 `softplus.default`, 둘 다 1 ULP.** 면제 목록을 늘리기
+전에 먼저 쟀다 (§9 의 원칙 그대로):
+
+```
+exp.default 입력 12/7 (index 11)
+  배정밀도 기준 (올림)  40b1afc8
+  호스트                40b1afc9   ← 기준보다 +1
+  기기                  40b1afc8   ← 기준과 정확히 일치
+
+softplus.default 입력 5/7 (index 4)
+  배정밀도 기준 (올림)  3f8e6ebb
+  호스트                3f8e6ebb   ← 기준과 정확히 일치
+  기기                  3f8e6eba   ← 기준보다 −1
+```
+
+**한쪽이 항상 이기지 않는다** — `exp` 에서는 기기가 정확 반올림이고 호스트가 벗어났는데,
+`softplus` 에서는 반대다. §5 의 `tanh`/`_softmax` 분석과 같은 모양이다: Apple libm 과
+bionic 의 `expf` 가 서로 다른 구현일 뿐, 어느 쪽도 "틀린" 것이 아니다. `softplus` 가
+내부적으로 `exp` 를 부르므로(`log(1+exp(βx))` 형태), 이 발산은 **독립된 결함이 아니라
+같은 `expf` 차이가 한 겹 위로 전파된 것**이다 — 새 op 이 아니라 새로 이 `expf` 경로를
+지나는 op 일 뿐이다.
+
+그래서 `scripts/device_android.sh` 의 `EXPECTED_LIBM_DIVERGENCE` 에 두 항목을 추가했다:
+
+```python
+EXPECTED_LIBM_DIVERGENCE = {
+    "_softmax.default": 1,
+    "tanh.default": 1,
+    "exp.default": 1,
+    "softplus.default": 1,
+}
+```
+
+#### 계측기가 우는지 확인했다
+
+새 케이스를 늘렸다고 감도가 죽지 않았는지 음성 대조 두 개로 확인했다 (`device_android.sh
+diff` 에 손댄 JSON을 준 것 — §9 의 기존 대조군과 같은 방법):
+
+| 대조군 | 결과 |
+|---|---|
+| 면제 목록에 없는 새 op(`masked_fill_.Scalar`)을 1 ULP 틀어놓음 | `EXIT=1  PARITY: unexpected bit divergence: ['masked_fill_.Scalar']` |
+| 새로 면제한 `exp.default` 를 5 ULP 로 키움(예산 1 ULP 초과) | `EXIT=1  PARITY: unexpected bit divergence: ['exp.default']` |
+| 손대지 않은 원본 | `EXIT=0  PARITY: ok` |
+
+둘 다 정확히 잡혔다. 면제 목록이 넷으로 늘어난 뒤에도 새 op 을 1 ULP 만 틀어도 실패하고,
+면제된 op 이 예산을 넘겨도 실패한다 — 배터리를 키운 것이 계측기를 무디게 만들지 않았다.
+
+#### 이 확장이 답하지 않은 것
+
+**54 개는 116 개 전부가 아니다.** `eq`/`ne`/`lt`/`le` 의 Tensor 오버로드, `bitwise_and`/
+`bitwise_or`/`bitwise_not`, `isin.Tensor_Tensor`, `rsub.Scalar`, `transpose.int`,
+`stack.default`, `split.Tensor`/`split_with_sizes.default`, `scatter.src`, `gather.default`,
+`index.Tensor`, `select.int`, `squeeze.dim`, `expand.default`, `arange.*`, `scalar_tensor.default`,
+`neg.default`, `fill_.*`, `copy_.default`, `any.*` 는 여전히 기기에서 한 번도 안 돌았다.
+이것들 중 다수는 부동소수점 libm 을 부르지 않는 정수/비트 연산이라 플랫폼 발산 가능성이
+낮다고 **추정**은 할 수 있지만, 그것은 추정이지 이 회차가 잰 것이 아니다. `randint`/
+`normal_`/`uniform_`/`multinomial` 은 기존 33개 배터리부터 의도적으로 빠져 있다 — RNG 스트림
+자체가 플랫폼 비교 대상이 아니다.
+
 ## 6. 벽 하나 — Android CPython 에 `_multiprocessing` 이 없다
 
 ```
@@ -310,10 +431,12 @@ sh scripts/device_android.sh parity  # 양쪽 실행 + 비트 대조
 
 ### 판정은 허용치가 아니라 **이름 기반 면제 목록**이다
 
-`cmd_diff` 는 `EXPECTED_LIBM_DIVERGENCE = {"_softmax.default": 1, "tanh.default": 1}`
-바깥의 어떤 비트 차이도 실패로 본다. 전역 허용치를 두면 `mm` 이나 `cumsum` 의 진짜
-불일치까지 함께 삼키는데, 이 스크립트는 바로 그것을 잡으려고 있다. **이 목록이 둘로
-유지되는 것이 §5.2 의 설계를 고른 이유**이고, 늘어나기 시작하면 그것이 허용오차다.
+`cmd_diff` 는 `EXPECTED_LIBM_DIVERGENCE` 바깥의 어떤 비트 차이도 실패로 본다. §5.3 이후
+넷이다 — `_softmax.default` · `tanh.default` · `exp.default` · `softplus.default`, 전부
+1 ULP, 전부 `expf` 를 부르는 경로. 전역 허용치를 두면 `mm` 이나 `cumsum` 의 진짜 불일치까지
+함께 삼키는데, 이 스크립트는 바로 그것을 잡으려고 있다. **이 목록이 짧게 유지되는 것이
+§5.2 의 설계를 고른 이유**이고, 늘어나기 시작하면 그것이 허용오차다 — 늘 때마다 §5.3 처럼
+배정밀도 기준과 대조해 방향이 없는 발산인지 재고 나서 늘렸다.
 
 **계측기가 실제로 울리는지 확인했다** (`device_android.sh diff <host> <doctored>`,
 2026-08-25 재확인):

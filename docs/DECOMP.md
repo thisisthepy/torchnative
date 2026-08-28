@@ -307,7 +307,11 @@ Core ATen 밖:  분해 전 [split.Tensor, stack.default]  →  분해 후 []
 하므로, 다르면 무언가가 틀린 것이고 그대로 내보내면 아무도 다시 보지 않는 그래프가 아래로
 내려갑니다. 그 검사가 두 개를 잡았고, **둘 다 이 저장소의 진짜 버그입니다.**
 
-### 6.1 `aten.sum.dim_IntList` 의 빈 `dim` 목록
+### 6.1 `aten.sum.dim_IntList` 의 빈 `dim` 목록 — **고쳐짐**
+
+> **2026-08-28 수정.** `rust/torch_c/src/aten.rs::sum_or_mean` 이 빈 `dim` 목록을 모든 축으로
+> 확장하도록 고쳐졌습니다 (`dims.map(|d| if d.is_empty() { (0..rank).collect() } else { d })`).
+> 아래는 그 전까지의 상태를 남긴 기록입니다.
 
 상류 규칙은 `sum(x)` 를 `sum(x, dim=[], dtype=None)` 으로 다시 씁니다. **빈 `dim` 목록은 "모든
 차원을 축약하라" 는 뜻입니다.**
@@ -315,15 +319,21 @@ Core ATen 밖:  분해 전 [split.Tensor, stack.default]  →  분해 후 []
 ```
                         shape        값
 상류  sum(ones(3,4), [])   []        12.0
-여기  sum(ones(3,4), [])   [3, 4]    입력 그대로
+여기  sum(ones(3,4), [])   [3, 4]    입력 그대로   ← 고치기 전
 ```
 
-우리 커널은 입력을 그대로 돌려줍니다. `aten.sum.default` 는 골든 하네스가 검사하지만
-(2383/2383 통과), **`aten.sum.dim_IntList` 에 빈 리스트를 주는 케이스는 아무도 만들지
-않았습니다.** 분해 패스가 그 인자를 만들어내는 첫 호출자입니다.
+고치기 전 커널은 입력을 그대로 돌려줬습니다. `aten.sum.default` 는 골든 하네스가 검사했지만
+(당시 2383/2383 통과), **`aten.sum.dim_IntList` 에 빈 리스트를 주는 케이스는 아무도 만들지
+않았습니다.** 분해 패스가 그 인자를 만들어내는 첫 호출자였습니다. `dim=[0,1]`(명시적 전체
+축약)·`keepdim=True` 조합·중복 `dim`(양쪽 다 거절, candle 이 이미 잡고 있었음)도 상류 2.13.0
+과 대조해 `tools/golden/cases.py`의 `sum_dim_cases`/`mean_dim_cases`에 케이스로 남겼습니다 —
+같은 함정이 `mean.dim`에도 있었는지 확인하는 것이 목적이었고, 있었습니다(같은 커널을 공유).
 
-테스트 `test_decompose_refuses_a_rule_that_disagrees_with_the_recording` 이 거절과 **그 밑의
-발산을 둘 다** 못박고 있습니다. 커널을 고치면 그 테스트가 빨개지면서 그렇게 말합니다.
+이 결함을 잡았던 테스트 `test_decompose_refuses_a_rule_that_disagrees_with_the_recording` 는
+`test_decompose_lowers_sum_default_now_that_the_kernel_agrees` 로 이름이 바뀌었습니다 — 커널이
+고쳐졌으므로 이제 거절이 아니라 **낮추기가 성공하는 것**을 못박습니다. "규칙이 recording과
+불일치하면 거절한다"는 세 번째 벽 자체는 `test_decompose_refuses_by_name_what_it_cannot_lower`
+가 `aten.baddbmm.default`(§6.2, 아직 안 고쳐짐)로 커버리지를 이어받았습니다.
 
 ### 6.2 `aten.baddbmm.default` 분해의 dtype 승격
 
@@ -410,7 +420,8 @@ DESIGN.md §5 의 3 층 구조에서 **2 층("분해 테이블을 벤더링 — 
 | `layout` 인자/속성 5 개 | 안 채웠습니다. **가장 값싼 다음 걸음** — 하나의 원인이 5 개 op 을 막고 있습니다 |
 | `_jit_get_operation` 의 오버로드 목록 (§3) | 안 고쳤습니다. `bootstrap.py` 는 이번 회차에 다른 작업이 열려 있어 건드리지 않았습니다. **규칙 505 개가 이것 하나에 걸려 있습니다** |
 | `_dispatch_get_registrations_for_dispatch_key` (§3) | 안 구현했습니다. 구현해도 CIA 항목의 상당수는 C++ 커널을 부르므로 다 열리지는 않습니다 |
-| §6.1 `sum.dim_IntList([])` · §6.2 `baddbmm` dtype | **고치지 않았습니다.** 둘 다 커널/승격 규칙의 문제이고, 테스트가 현재 동작을 못박아 두었습니다 |
+| §6.1 `sum.dim_IntList([])` | **2026-08-28 고쳐졌습니다** — 빈 `dim` 목록이 모든 축으로 확장됩니다. `mean.dim` 이 같은 커널을 공유해 같은 수정으로 같이 고쳐졌습니다 |
+| §6.2 `baddbmm` dtype | **고치지 않았습니다.** 스칼라 승격 규칙의 문제이고, 테스트가 현재 동작을 못박아 두었습니다 |
 | functionalization (view → `_copy`) | 없음 (§7). 이 패스가 아닙니다 |
 | 여러 트레이스에 걸친 측정 | 없음. §4 의 32 개는 **구현된 op 을 하나씩 단독 트레이스로** 돌린 것이지, 실제 모델 트레이스의 분포가 아닙니다 |
 

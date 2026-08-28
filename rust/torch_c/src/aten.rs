@@ -3802,6 +3802,9 @@ fn sum_or_mean(
         .tensor()?
         .to_dtype(storage)
         .map_err(|e| candle_err(op, e))?;
+    // torch: an empty `dim` list reduces *every* dimension (it is not the
+    // same as reducing none), so it is equivalent to naming every axis.
+    let dims = dims.map(|d| if d.is_empty() { (0..rank).collect() } else { d });
     let out = match dims {
         None => match kind {
             Reduce::Sum => source.sum_all(),

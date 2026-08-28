@@ -4857,11 +4857,41 @@ out["refuse_unrunnable"] = refusal(
     torch.ones(4, 8), lambda t: d("aten.t.default", t)
 )
 # A rule exists, runs, and produces a result the recording disagrees with.
-out["refuse_disagrees"] = refusal(
-    torch.ones(3, 4), lambda t: d("aten.sum.default", t)
-)
-# The divergence underneath that last one, stated directly.
+# `aten.baddbmm.default`'s decomposition multiplies by the Python floats
+# `beta`/`alpha`, which promotes float32 to float64 here (docs/DECOMP.md
+# §6.2 -- a scalar-promotion divergence, unfixed and out of scope for the
+# `sum` fix below).
+_bb_c, _bb_a, _bb_b = torch.ones(2, 3, 5), torch.ones(2, 3, 4), torch.ones(2, 4, 5)
+torch._C._capture_begin([_bb_c, _bb_a, _bb_b])
+_bb_produced = d("aten.baddbmm.default", _bb_c, _bb_a, _bb_b)
+_bb_trace = torch._C._capture_end(_bb_produced)
+try:
+    decompose(_bb_trace)
+except DecompositionRefused as error:
+    out["refuse_disagrees"] = str(error)
+else:
+    out["refuse_disagrees"] = "ACCEPTED"
+
+# `aten.sum.default` used to land here too: upstream's rule rewrites it to
+# `sum(x, dim=[], dtype=None)`, and this shim's `aten.sum.dim_IntList` used
+# to return the input unchanged for an empty `dim` list instead of reducing
+# every dimension, so the pass caught the divergence and refused. The kernel
+# is fixed now (an empty `dim` list expands to every axis, matching
+# upstream), so this proves the fix by lowering the recording instead of
+# refusing it.
+_sum_tensor = torch.ones(3, 4)
+torch._C._capture_begin([_sum_tensor])
+_sum_produced = d("aten.sum.default", _sum_tensor)
+_sum_trace = torch._C._capture_end(_sum_produced)
+_sum_lowered = decompose(_sum_trace)
+out["sum_default_ops_after"] = _sum_lowered.ops
+(_sum_replayed,) = _sum_lowered.replay([_sum_tensor])
+out["sum_default_replayed"] = _sum_replayed.reshape(-1).tolist()
+# The divergence that used to live underneath the refusal, stated directly.
 out["sum_all_dims"] = list(d("aten.sum.dim_IntList", torch.ones(3, 4), []).shape)
+out["sum_all_dims_keepdim"] = list(
+    d("aten.sum.dim_IntList", torch.ones(3, 4), [], keepdim=True).shape
+)
 
 json.dump(out, sys.stdout)
 """
@@ -5009,32 +5039,53 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     assert "aten.t.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
     assert "torch.transpose" in r["refuse_unrunnable"], r["refuse_unrunnable"]
 
+    # 3. A rule exists, runs, and produces a result the recording disagrees
+    #    with -- `aten.baddbmm.default`'s decomposition promotes float32 to
+    #    float64 (docs/DECOMP.md §6.2, unfixed). `aten.sum.default` used to
+    #    be this example; it moved once the kernel bug it caught was fixed
+    #    (test_decompose_lowers_sum_default_now_that_the_kernel_agrees).
+    assert r["refuse_disagrees"] != "ACCEPTED"
+    assert "aten.baddbmm.default" in r["refuse_disagrees"], r["refuse_disagrees"]
+    assert "torch.float64" in r["refuse_disagrees"], r["refuse_disagrees"]
+    assert "torch.float32" in r["refuse_disagrees"], r["refuse_disagrees"]
 
-def test_decompose_refuses_a_rule_that_disagrees_with_the_recording():
-    """The check that found a real bug rather than a missing feature.
 
-    `aten.sum.default` has a rule, it runs, and what it produces is not what
-    the recording says the op returned: shape `[3, 4]` against shape `[]`.
-    Upstream's rule rewrites `sum(x)` to `sum(x, dim=[])`, and an empty `dim`
-    list means *reduce every dimension* -- upstream returns a scalar 12.0 for
-    a 3x4 of ones. This shim's `aten.sum.dim_IntList` returns the input
-    unchanged for that argument.
+def test_decompose_lowers_sum_default_now_that_the_kernel_agrees():
+    """The check that found a real bug rather than a missing feature -- and
+    the regression pin for the fix.
 
-    So the pass is not merely refusing: it is refusing because it caught a
-    divergence that nothing else in this repository was looking at. Both halves
-    are asserted -- the refusal, and the shape that causes it -- so that fixing
-    the kernel turns this test red and says so.
+    `aten.sum.default` has a rule, and it rewrites `sum(x)` to
+    `sum(x, dim=[], dtype=None)`. An empty `dim` list means *reduce every
+    dimension*: upstream returns a scalar 12.0, shape `[]`, for a 3x4 of
+    ones. This shim's `aten.sum.dim_IntList` used to return the input
+    unchanged for that argument (shape `[3, 4]`), so the decompose pass
+    caught the divergence between the sub-trace it ran and the recording,
+    and refused rather than emit a lowered graph that silently disagreed
+    with eager.
+
+    The kernel is fixed (`rust/torch_c/src/aten.rs::sum_or_mean` now expands
+    an empty `dim` list to every axis before reducing), so the rule and the
+    recording agree and the pass lowers the trace instead of refusing it.
+    Both are asserted directly: `sum.dim_IntList([])` itself, and that
+    `decompose` accepts a one-op `sum.default` trace and replays it to the
+    same scalar. If the kernel regresses to returning the input unchanged,
+    the shape assertions here go red before anyone reaches for the refusal
+    path again.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
     r = _decomp_road_fixture()
-    assert r["refuse_disagrees"] != "ACCEPTED"
-    assert "aten.sum.default" in r["refuse_disagrees"], r["refuse_disagrees"]
-    assert "shape [3, 4]" in r["refuse_disagrees"], r["refuse_disagrees"]
-    assert "shape []" in r["refuse_disagrees"], r["refuse_disagrees"]
-    # The divergence itself. Upstream: `[]`. Here: `[3, 4]`. When this becomes
-    # `[]`, the assertion above is the thing that has to be revisited.
-    assert r["sum_all_dims"] == [3, 4], r["sum_all_dims"]
+    # The divergence itself, fixed: empty `dim` reduces every axis.
+    assert r["sum_all_dims"] == [], r["sum_all_dims"]
+    # `keepdim=True` with an empty `dim` list keeps every axis, size 1 each,
+    # rather than reducing to a 0-d scalar.
+    assert r["sum_all_dims_keepdim"] == [1, 1], r["sum_all_dims_keepdim"]
+    # The rule and the recording now agree, so `sum.default` lowers cleanly
+    # to `sum.dim_IntList` instead of being refused.
+    assert r["sum_default_ops_after"] == ["aten.sum.dim_IntList"], r[
+        "sum_default_ops_after"
+    ]
+    assert r["sum_default_replayed"] == [12.0], r["sum_default_replayed"]
 
 
 def test_capture_trace_hands_out_the_constants_it_burned_in():
