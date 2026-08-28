@@ -34,6 +34,7 @@ mod capture;
 mod device;
 mod dtype;
 mod err;
+mod flash;
 mod info;
 mod rng;
 mod storage;

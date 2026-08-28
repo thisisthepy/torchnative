@@ -6912,6 +6912,169 @@ def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
             assert got == sums(_E2EBackend("upstream"), reps), reps
 
 
+# --- the flash-attention kernel, bit for bit --------------------------------
+#
+# `aten::_scaled_dot_product_flash_attention_for_cpu` is a *blocked* kernel
+# with an online softmax, and for `bfloat16`/`float16` inputs every step of it
+# happens in portable code -- upstream reaches its own kernel rather than a
+# BLAS. `rust/torch_c/src/flash.rs` reproduces that arrangement, and
+# docs/SDPA.md is the measurement. These tests assert the consequence: **exact**
+# agreement, with no tolerance.
+#
+# A tolerance here would not be a check. docs/SDPA.md §3 has the numbers: the
+# formulation this replaced sat inside `tools/golden/dtypes.py`'s bfloat16
+# tolerance (6e-2) on every element while disagreeing with upstream on 32% of
+# them, and the golden harness passed it for months. One bfloat16 ulp is
+# 1/256 of the value; the tolerance is fifteen times that.
+#
+# The shapes below are not arbitrary. Each crosses a boundary inside the
+# kernel that a naive reading does not have:
+#
+#   (26, 26)   SmolLM2-135M's own prefill, 9 query heads over 3 KV heads
+#   (33, 33)   one past the 32-row query block, so a second block runs
+#   (70, 70)   three query blocks, and 70 % 8 == 6 -- the mask's vector body
+#              stops at 64, not 68 (see the second test)
+#   (40, 600)  past the 512-column key split, so the online rescale runs
+_SDPA_OP = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+
+_SDPA_SHAPES = [
+    # (batch, query heads, kv heads, q_len, kv_len, head_dim)
+    (1, 2, 2, 8, 8, 16),
+    (1, 9, 3, 26, 26, 64),
+    (1, 2, 2, 33, 33, 8),
+    (1, 2, 2, 70, 70, 8),
+    (1, 1, 1, 40, 600, 8),
+    (1, 1, 1, 2, 5, 4),
+]
+
+
+def _sdpa_det(n, seed):
+    """`n` values of the form k/128.
+
+    Every one is exactly representable in bfloat16, float16, float32 and
+    float64 alike, so `_tensor_from_flat` and `torch.tensor` cannot disagree
+    about the *inputs* and be misread as a disagreement about the kernel.
+    `test_reduced_float_operands_survive_construction` makes the same premise
+    explicit for the section above.
+    """
+    out, state = [], seed * 2654435761 % 2147483647
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append((state % 321 - 160) / 128.0)
+    return out
+
+
+def _sdpa_call(b, batch, heads, kv_heads, q_len, kv_len, head_dim, dtype, causal, mask):
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    kw = {}
+    if mask:
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        # A wholly masked-out column, which is the shape a padding mask has and
+        # the reason the kernel writes zeros instead of `exp(-inf - -inf)`.
+        for i in range(0, len(flat), 7):
+            flat[i] = float("-inf")
+        kw["attn_mask"] = b.t(flat, (batch, heads, q_len, kv_len), dtype)
+    return b.op(_SDPA_OP, q, k, v, 0.0, causal, **kw)
+
+
+def test_sdpa_reduced_float_matches_upstream_to_the_last_bit():
+    """Both halves of the pair, every shape, no tolerance.
+
+    The logsumexp half is checked as carefully as the output half and is not
+    redundant: it comes back in `float32` even for a `bfloat16` call, so it is
+    the only place a one-ulp disagreement in the row sum is *visible* --
+    narrowing the output to bfloat16 hides it. The defect docs/SDPA.md §4.4
+    describes showed up in exactly that asymmetry and nowhere else.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                for mask in (False, True):
+                    args = (*shape, dtype, causal, mask)
+                    got_pair = _sdpa_call(shim, *args)
+                    want_pair = _sdpa_call(upstream, *args)
+                    for half, label in ((0, "output"), (1, "logsumexp")):
+                        got = _flat_values(got_pair[half])
+                        want = _flat_values(want_pair[half])
+                        assert len(got) == len(want), (dtype, shape, label)
+                        wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+                        assert not wrong, (
+                            f"{dtype} {shape} causal={causal} mask={mask} {label}: "
+                            f"{len(wrong)}/{len(want)} elements differ from upstream; "
+                            f"first at {wrong[0]} (shim {got[wrong[0]]!r} vs "
+                            f"upstream {want[wrong[0]]!r})"
+                        )
+
+
+def test_sdpa_mask_body_strides_by_the_mask_dtype_not_the_accumulator():
+    """Names the wrong rule, so a regression to it fails here with the cause.
+
+    Upstream fuses `qk * scale + mask` in a loop that strides by
+    `Vectorized<mask_t>::size()`, and `mask_t` is the *input* dtype. For a
+    reduced float that is eight lanes, not the accumulator's four, so a
+    70-column block leaves six columns to the scalar remainder -- and the
+    remainder is one C statement, hence fused, where the body is not.
+
+    Reading that stride as four is a difference of two columns out of seventy.
+    It moved **one element in 226136** (docs/SDPA.md §4.4), in the logsumexp
+    and not the output, because the shift cancels between the row maximum and
+    the log of the row sum. Nothing shaped like a tolerance can see it, and
+    the general test above only sees it because it uses none.
+    """
+    if _upstream_torch is None:
+        return
+    shape = (1, 2, 2, 70, 70, 32)
+    assert shape[4] % 8 == 6, "the point of this shape is the six-column remainder"
+    for dtype in _REDUCED_FLOATS:
+        got = _flat_values(_sdpa_call(_E2EBackend("shim"), *shape, dtype, False, True)[1])
+        want = _flat_values(
+            _sdpa_call(_E2EBackend("upstream"), *shape, dtype, False, True)[1]
+        )
+        wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+        assert not wrong, (
+            f"{dtype} logsumexp differs on {len(wrong)}/{len(want)} rows; the mask "
+            f"body is probably striding by four lanes instead of eight "
+            f"(first row {wrong[0]}: shim {got[wrong[0]]!r} vs upstream "
+            f"{want[wrong[0]]!r})"
+        )
+
+
+def test_sdpa_wide_float_is_close_but_not_promised_exact():
+    """The other side of the claim, pinned so it cannot quietly become one.
+
+    For `float32` upstream hands both matrix products to the platform BLAS
+    (Accelerate here), whose summation order is not portable, so this kernel
+    is *not* bit-identical there and docs/SDPA.md §5 says so. The bound below
+    is the measured worst case over the same shapes, not a guess; asserting a
+    bound rather than equality is what keeps the two claims apart.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    bounds = {"float32": 1e-6, "float64": 1e-14}
+    for dtype, bound in bounds.items():
+        worst = 0.0
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                args = (*shape, dtype, causal, False)
+                got_pair = _sdpa_call(shim, *args)
+                want_pair = _sdpa_call(upstream, *args)
+                for half in (0, 1):
+                    for g, w in zip(_flat_values(got_pair[half]), _flat_values(want_pair[half])):
+                        if g == w or math.isinf(g) or math.isinf(w):
+                            continue
+                        worst = max(worst, abs(g - w))
+        assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

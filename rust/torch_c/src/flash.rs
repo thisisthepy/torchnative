@@ -4,24 +4,37 @@
 //! formula. It is a *blocked* kernel with an online softmax, and the order in
 //! which it recombines the blocks is observable: writing the same mathematics
 //! out flat disagrees with it on **float32** inputs, on most elements, before
-//! any reduced-precision narrowing is involved. docs/SDPA.md has the
-//! measurement that opened this file (3562 of 4096 elements, 4.17e-07 apart)
-//! and the one that closes it.
+//! any reduced-precision narrowing is involved -- 3562 of 4096, 4.17e-07
+//! apart, measured against upstream alone (docs/SDPA.md §3).
 //!
 //! Everything here is a shape of arithmetic rather than a shape of code, so it
 //! is written out longhand instead of being expressed with tensor operations:
 //! the answer depends on which additions happen in which order, and a tensor
 //! library's reductions are free to choose their own order.
 //!
-//! **What this buys, and what it does not.** For `bfloat16` and `float16` the
-//! result is bit-identical to upstream -- every arithmetic step is either
-//! exact or reproducible in portable code, because the two matrix products
-//! upstream reaches for reduced-precision inputs are *its own* portable
-//! kernel and not a BLAS. For `float32` upstream calls the platform BLAS
-//! (Accelerate on this host), whose summation order is not portable, so the
-//! agreement there is close but not exact. docs/SDPA.md §5 is explicit about
-//! that split, and about the larger point that matching this one kernel does
-//! not make `bfloat16` inference reproducible in general.
+//! **What this buys, measured.** For `bfloat16` and `float16` the result is
+//! bit-identical to upstream: 0 of 226136 elements differ across eleven shapes
+//! crossed with causal and masked, and 0 of 103680 inside a real SmolLM2-135M
+//! forward (docs/SDPA.md §3, §6). Every arithmetic step is either exact or
+//! reproducible in portable code, because the two matrix products upstream
+//! reaches for reduced-precision inputs are *its own* portable kernel and not
+//! a BLAS.
+//!
+//! **What it does not buy.** For `float32`/`float64` upstream calls the
+//! platform BLAS (Accelerate on this host), whose summation order is not
+//! portable: 159706 of 226136 elements differ, by at most 2.4e-07
+//! (docs/SDPA.md §5). And matching this one kernel does **not** make
+//! `bfloat16` inference reproducible in general -- perturbing only the GEMM's
+//! accumulation order makes upstream disagree with *itself* on one prompt in
+//! three, so no independent implementation can promise token identity there
+//! (docs/SDPA.md §1).
+//!
+//! Two defects were found in this file by checking those claims rather than
+//! believing the comment that used to assert them, and neither is visible to a
+//! tolerance: eleven of the polynomial constants were decimal literals that
+//! re-rounded the hex values in their own comments (docs/SDPA.md §4.1), and
+//! the masked `qk * scale + mask` strode by the accumulator's vector width
+//! instead of the mask dtype's (§4.4).
 
 use candle_core::{DType, Device, Tensor};
 
@@ -113,12 +126,19 @@ pub fn narrow_f16(x: f32) -> f32 {
 /// Nothing here couples the lanes: both out-of-range cases are per-lane
 /// selects, so walking the lanes one at a time gives the vector's answer.
 fn fexp_u20(x: f32) -> f32 {
-    const LOWER: f32 = -8.7346344e1; // -0x1.5ebb82p+6
-    const UPPER: f32 = 8.837626e1; //  0x1.61814ap+6
-    const INV_LN2: f32 = 1.442695e0; //  0x1.715476p+0
-    const LN2: f32 = 6.9314724e-1; //  0x1.62e43p-1
-    const C2: f32 = 1.6675568e-1; //  0x1.5592ecp-3
-    const C3: f32 = 5.0143164e-1; //  0x1.017d34p-1
+    // Spelled as bit patterns, not decimals. Rust has no hexadecimal float
+    // literal, and a decimal one is a *re-rounding* of the constant: the
+    // eight-digit decimals that stood here before disagreed with the hex
+    // values in the comments -- `LN2` by one ulp, `C3` by 0.0015 -- and the
+    // resulting kernel differed from upstream on 11% of `bfloat16` elements.
+    // Nine significant digits would round-trip, but nothing checks that a
+    // literal has nine; a bit pattern cannot be one digit short.
+    const LOWER: f32 = f32::from_bits(0xc2af_5dc1); // -0x1.5ebb82p+6
+    const UPPER: f32 = f32::from_bits(0x42b0_c0a5); //  0x1.61814ap+6
+    const INV_LN2: f32 = f32::from_bits(0x3fb8_aa3b); //  0x1.715476p+0
+    const LN2: f32 = f32::from_bits(0x3f31_7218); //  0x1.62e43p-1
+    const C2: f32 = f32::from_bits(0x3e2a_c976); //  0x1.5592ecp-3
+    const C3: f32 = f32::from_bits(0x3f00_be9a); //  0x1.017d34p-1
     let below = x < LOWER;
     let above = x > UPPER;
     let n = (x * INV_LN2).round();
@@ -142,14 +162,15 @@ fn fexp_u20(x: f32) -> f32 {
 /// lane -- valid only when the *whole* four-lane group is in range. See
 /// [`exp_u20_group_bails`].
 fn exp_u20(x: f32) -> f32 {
-    const INV_LN2: f32 = 1.442695e0; // 0x1.715476p+0
-    const LN2_HI: f32 = 6.93145e-1; // 0x1.62e4p-1
-    const LN2_LO: f32 = 1.4286068e-6; // 0x1.7f7d1cp-20
-    const C0: f32 = 8.2477882e-3; // 0x1.0e4020p-7
-    const C1: f32 = 4.2050107e-2; // 0x1.573e2ep-5
-    const C2: f32 = 1.6666277e-1; // 0x1.555e66p-3
-    const C3: f32 = 4.9999377e-1; // 0x1.fffdb6p-2
-    const C4: f32 = 9.9999928e-1; // 0x1.ffffecp-1
+    // Bit patterns, for the reason given in [`fexp_u20`].
+    const INV_LN2: f32 = f32::from_bits(0x3fb8_aa3b); // 0x1.715476p+0
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200); // 0x1.62e4p-1
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e); // 0x1.7f7d1cp-20
+    const C0: f32 = f32::from_bits(0x3c07_2010); // 0x1.0e4020p-7
+    const C1: f32 = f32::from_bits(0x3d2b_9f17); // 0x1.573e2ep-5
+    const C2: f32 = f32::from_bits(0x3e2a_af33); // 0x1.555e66p-3
+    const C3: f32 = f32::from_bits(0x3eff_fedb); // 0x1.fffdb6p-2
+    const C4: f32 = f32::from_bits(0x3f7f_fff6); // 0x1.ffffecp-1
     let n = (x * INV_LN2).round();
     let mut r = (-n).mul_add(LN2_HI, x);
     r = (-n).mul_add(LN2_LO, r);
@@ -171,7 +192,7 @@ fn exp_u20(x: f32) -> f32 {
 /// with the right BLAS -- the `-inf` a masked column carries trips the bail
 /// for its whole group, and the replacement is Sleef's kernel, which this
 /// substitutes the platform `expf` for (docs/SDPA.md §5.2).
-const U20_SPECIAL_BOUND: f32 = 8.7336548e1; // 0x1.5d5e2ap+6
+const U20_SPECIAL_BOUND: f32 = f32::from_bits(0x42ae_af15); // 0x1.5d5e2ap+6
 
 fn exp_u20_group_bails(group: &[f32]) -> bool {
     group.iter().any(|x| !(x.abs() <= U20_SPECIAL_BOUND))
@@ -212,6 +233,10 @@ pub trait FlashFloat: Copy + PartialOrd + std::fmt::Debug {
     fn read(tensor: &Tensor) -> candle_core::Result<Vec<Self>>;
     fn build(values: Vec<Self>, shape: Vec<usize>, device: &Device)
         -> candle_core::Result<Tensor>;
+    /// The `scale` argument arrives as a `double` on the op's schema whatever
+    /// the input dtype is; upstream narrows it to the accumulate type before
+    /// the multiply, so this does too.
+    fn from_f64(value: f64) -> Self;
     /// The exponential the fusion kernel uses when the probabilities stay in
     /// this dtype. `bails` carries the lane coupling of `exp_u20`.
     fn soft_exp(self, bails: bool) -> Self;
@@ -253,6 +278,9 @@ impl FlashFloat for f32 {
     }
     fn build(values: Vec<f32>, shape: Vec<usize>, device: &Device) -> candle_core::Result<Tensor> {
         Tensor::from_vec(values, shape, device)
+    }
+    fn from_f64(value: f64) -> f32 {
+        value as f32
     }
     fn soft_exp(self, bails: bool) -> f32 {
         if bails {
@@ -307,6 +335,9 @@ impl FlashFloat for f64 {
     }
     fn build(values: Vec<f64>, shape: Vec<usize>, device: &Device) -> candle_core::Result<Tensor> {
         Tensor::from_vec(values, shape, device)
+    }
+    fn from_f64(value: f64) -> f64 {
+        value
     }
     /// `Vectorized<double>::exp_u20()` is `exp()`, so there is no polynomial
     /// and no lane coupling here.
@@ -542,8 +573,22 @@ pub fn attend_head<A: FlashFloat>(
                     // scalar remainder is one statement and therefore fused
                     // (both measured -- fusing the body disagrees with
                     // upstream on float16, docs/SDPA.md §4.3).
+                    //
+                    // The body stops at a multiple of the *mask* dtype's
+                    // vector width, not the accumulator's: upstream strides
+                    // this loop by `Vectorized<mask_t>::size()`, and the mask
+                    // arrives in the input dtype. For a `bfloat16` mask that
+                    // is eight, so a 70-column block leaves six columns to the
+                    // fused remainder rather than two. Reading it as four cost
+                    // one element in 226136 -- one logsumexp, whose output was
+                    // unaffected because the shift cancels (docs/SDPA.md §4.4).
                     let mask_row = &input.mask[(m + row) * kv_len + n..];
-                    let body = A::LANES * (kv_block / A::LANES);
+                    let lanes = if narrow == Narrowing::None {
+                        A::LANES
+                    } else {
+                        8
+                    };
+                    let body = lanes * (kv_block / lanes);
                     for column in 0..body {
                         slice[column] = slice[column].mul(scale).add(mask_row[column]);
                     }
@@ -650,4 +695,72 @@ pub fn attend_head<A: FlashFloat>(
 
         m += q_split;
     }
+}
+
+/// The whole `[batch, heads, seq, head_dim]` call, one `(batch, head)` slice at
+/// a time.
+///
+/// `q`, `k` and `v` are expected in the accumulate dtype and contiguous, with
+/// the key/value head count already grown to the query's (upstream repeats them
+/// before the kernel too -- see `repeat_kv_heads` in `aten.rs`). `mask`, when
+/// present, is `[batch, heads, q_len, kv_len]`, already broadcast, in the same
+/// dtype.
+///
+/// Upstream parallelises this loop over `(batch, head, q_block)`; the order of
+/// that loop is not observable because the slices do not interact, so walking
+/// them serially answers the same bits.
+pub fn attend<A: FlashFloat>(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+    is_causal: bool,
+    narrow: Narrowing,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    let (batch, heads, q_len, head_dim) = q.dims4()?;
+    let (_, _, kv_len, _) = k.dims4()?;
+
+    let q_values = A::read(q)?;
+    let k_values = A::read(k)?;
+    let v_values = A::read(v)?;
+    let mask_values = match mask {
+        Some(mask) => A::read(mask)?,
+        None => Vec::new(),
+    };
+
+    let mut out = vec![A::ZERO; batch * heads * q_len * head_dim];
+    let mut lse = vec![A::ZERO; batch * heads * q_len];
+    let scale = A::from_f64(scale);
+
+    for slice in 0..batch * heads {
+        let q_at = slice * q_len * head_dim;
+        let kv_at = slice * kv_len * head_dim;
+        let mask_at = slice * q_len * kv_len;
+        attend_head(
+            Inputs {
+                q: &q_values[q_at..q_at + q_len * head_dim],
+                k: &k_values[kv_at..kv_at + kv_len * head_dim],
+                v: &v_values[kv_at..kv_at + kv_len * head_dim],
+                mask: if mask_values.is_empty() {
+                    &[]
+                } else {
+                    &mask_values[mask_at..mask_at + q_len * kv_len]
+                },
+            },
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            is_causal,
+            narrow,
+            &mut out[q_at..q_at + q_len * head_dim],
+            &mut lse[slice * q_len..(slice + 1) * q_len],
+        );
+    }
+
+    Ok((
+        A::build(out, vec![batch, heads, q_len, head_dim], q.device())?,
+        A::build(lse, vec![batch, heads, q_len], q.device())?,
+    ))
 }
