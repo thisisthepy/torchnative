@@ -34,6 +34,7 @@ mod capture;
 mod device;
 mod dtype;
 mod err;
+mod flash;
 mod info;
 mod reduced;
 mod rng;
@@ -501,6 +502,30 @@ fn _shim_target() -> &'static str {
     env!("TORCH_C_TARGET")
 }
 
+/// Reads, and optionally sets, whether `sdpa` computes with `crate::flash` --
+/// upstream's blocked kernel reproduced bit for bit -- instead of candle's
+/// tensor ops. Answers the value that was in force before the call, so a
+/// caller can restore it.
+///
+/// Off by default: the reference kernel costs 20x at T=512. `crate::flash`
+/// carries the measurement, the argument, and -- in `apply_env` -- why this is
+/// a name of ours rather than one of upstream's.
+///
+/// A setter and not only `BW_SDPA_REFERENCE`, because the things that have to
+/// run with it on are individual cases inside a suite that must stay fast:
+/// `pytests/test_shim.py`'s three tolerance-free sdpa tests and
+/// `tools/golden/cases.py`'s sixteen block-boundary cases, both of which flip
+/// it and flip it back. An env-only switch would mean a second process for
+/// them, which neither harness has a place to spawn.
+#[pyfunction]
+#[pyo3(signature = (enabled=None))]
+fn _shim_sdpa_reference(enabled: Option<bool>) -> bool {
+    match enabled {
+        Some(enabled) => crate::flash::set_reference(enabled),
+        None => crate::flash::reference_enabled(),
+    }
+}
+
 /// The name surface the vendored tree expects `_C` to present, extracted from
 /// the tree's own `.pyi` stubs by `vendor/gen_surface.py` and compiled in so
 /// the artefact needs nothing on disk at runtime. See `bootstrap.py`.
@@ -589,6 +614,7 @@ fn apply_gemm_threading_threshold() {
 #[pymodule]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     apply_gemm_threading_threshold();
+    flash::apply_env();
     dtype::register(m)?;
     device::register(m)?;
     info::register(m)?;
@@ -602,6 +628,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
     m.add_function(wrap_pyfunction!(_asarray, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_sdpa_reference, m)?)?;
     run_bootstrap(m)?;
     Ok(())
 }

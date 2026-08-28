@@ -1724,6 +1724,34 @@ fn baddbmm_default(
 /// by `(batch, head, row, col)` and upstream's has the *query* head count, so
 /// repeating after masking would broadcast a per-head mask onto the wrong
 /// heads.
+///
+/// **There are two arithmetics here, and the default is not the exact one.**
+/// The body below forks on `crate::flash::reference_enabled()`:
+///
+///   * **default** -- candle's tensor ops, written out the textbook way: one
+///     matmul, one softmax, another matmul. That is the right *mathematics*
+///     and it is upstream's *arithmetic* only to within a tolerance, because
+///     upstream's kernel is blocked with an online softmax and the order in
+///     which it recombines those blocks is observable. The flat formulation
+///     disagrees with upstream on 3562 of 4096 elements at `float32`
+///     (docs/SDPA.md §3) and on 32% of the attention outputs of a real
+///     SmolLM2-135M forward -- all inside the golden harness's tolerance.
+///   * **reference** -- `crate::flash`, which reproduces the blocking and
+///     brings both of those numbers to 0 for `bfloat16`/`float16`. Not 0 for
+///     `float32`/`float64`, where upstream calls a BLAS: docs/SDPA.md §5 has
+///     that split. It costs **20x** at T=512 (docs/SDPA.md §12), which is why
+///     it is not the default in a library whose point is running on a phone.
+///
+/// The blocking the reference reproduces is upstream's, not a choice: 32 query
+/// rows (64 or 256 for longer queries) by 512 key columns, and the mask's
+/// fused multiply-add strides by the *mask* dtype's vector width. Both are the
+/// kind of detail that no tolerance can check, so `pytests/test_shim.py`
+/// checks them with none -- with the switch on.
+///
+/// Nothing above the fork differs between the two: the argument checks, the
+/// dtype rules, the widening, the GQA repetition and the default `scale` are
+/// one copy, so the switch cannot change what this op *accepts*, only how it
+/// adds up.
 fn sdpa_flash_cpu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -1798,62 +1826,138 @@ fn sdpa_flash_cpu(
     let head_dim = q.dims()[3];
     let scale = scale.unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
 
-    let mut scores = k
-        .transpose(2, 3)
-        .and_then(|kt| kt.contiguous())
-        .and_then(|kt| q.matmul(&kt))
-        .and_then(|s| s.affine(scale, 0.0))
-        .map_err(|e| candle_err(OP, e))?;
-
-    let (rows, cols) = {
-        let dims = scores.dims();
-        (dims[2], dims[3])
-    };
-    if is_causal {
-        // Upper-left aligned, per the measurement above.
-        let mut mask = Vec::with_capacity(rows * cols);
-        for r in 0..rows {
-            for c in 0..cols {
-                mask.push(if c <= r { 0.0f64 } else { f64::NEG_INFINITY });
+    // The fork. One relaxed atomic load per call, against a kernel whose
+    // cheapest measured shape is tens of microseconds -- see
+    // `crate::flash::reference_enabled` for why the default path cannot feel
+    // it, and docs/SDPA.md §12 for why the exact kernel is not the default.
+    let (out, logsumexp) = if crate::flash::reference_enabled() {
+        // ------------------------------------------------------------------
+        // Reference: `crate::flash`, upstream's blocked kernel reproduced.
+        // Bit-identical to upstream for bfloat16/float16, and 20x slower.
+        // ------------------------------------------------------------------
+        let (batch, heads, q_len) = {
+            let dims = q.dims();
+            (dims[0], dims[1], dims[2])
+        };
+        let kv_len = k.dims()[2];
+        // `crate::flash` walks raw slices, so a shape that does not describe
+        // one attention would index past a buffer rather than raise. The
+        // default branch gets the same rejection from candle's `matmul`, which
+        // is why this check is here rather than above the fork: it is not a
+        // second opinion, it is the same opinion that branch already has.
+        for (name, operand) in [("key", &k), ("value", &v)] {
+            let dims = operand.dims();
+            if dims[0] != batch || dims[2] != kv_len || dims[3] != head_dim {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{OP}: query {:?} and {name} {:?} do not describe one attention -- \
+                     batch, key length and head dimension all have to agree",
+                    q.dims(),
+                    dims
+                )));
             }
         }
-        let mask = Tensor::from_vec(mask, (rows, cols), scores.device())
-            .and_then(|t| t.fast_to(acc))
-            .map_err(|e| candle_err(OP, e))?;
-        scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
-    }
-    if let Some(mask) = attn_mask.as_ref() {
-        let mask = mask
-            .tensor()?
-            .fast_to(acc)
-            .map_err(|e| candle_err(OP, e))?;
-        scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
-    }
 
-    // Softmax written out: candle-core has no `softmax` (that lives in
-    // candle-nn, which DESIGN.md §4 does not pull in). Shifting by the row
-    // maximum first is not an optimisation -- without it a masked row's
-    // `exp(-inf)` and a large logit's `exp(big)` land on the same NaN.
-    let row_max = scores.max_keepdim(3).map_err(|e| candle_err(OP, e))?;
-    let weights = scores
-        .broadcast_sub(&row_max)
-        .and_then(|s| s.exp())
-        .map_err(|e| candle_err(OP, e))?;
-    let row_sum = weights.sum_keepdim(3).map_err(|e| candle_err(OP, e))?;
-    let out = weights
-        .broadcast_div(&row_sum)
-        .and_then(|p| p.contiguous())
-        .and_then(|p| p.matmul(&v))
-        .and_then(|o| o.fast_to(storage))
-        .map_err(|e| candle_err(OP, e))?;
+        // The mask is broadcast to the full `[batch, head, q_len, kv_len]`
+        // here rather than inside the kernel, because the kernel reads one
+        // contiguous row of it per query row -- upstream materialises it the
+        // same way. `to_dtype` and not `fast_to`: this is the branch whose
+        // bits are asserted with no tolerance, so it keeps the spelling those
+        // assertions were measured against.
+        let mask = match attn_mask.as_ref() {
+            Some(mask) => Some(
+                mask.tensor()?
+                    .to_dtype(acc)
+                    .and_then(|m| m.broadcast_as((batch, heads, q_len, kv_len)))
+                    .and_then(|m| m.contiguous())
+                    .map_err(|e| candle_err(OP, e))?,
+            ),
+            None => None,
+        };
 
-    // logsumexp(x) = max(x) + log(sum(exp(x - max(x)))), on the same masked,
-    // scaled scores the weights came from.
-    let logsumexp = row_sum
-        .log()
-        .and_then(|l| l.broadcast_add(&row_max))
-        .and_then(|l| l.squeeze(3))
-        .map_err(|e| candle_err(OP, e))?;
+        // Which storage dtype the probabilities are narrowed to between the
+        // two matrix products. `storage`, not `acc`: the narrowing follows the
+        // *input* dtype, which is the whole reason reduced precision has a
+        // separate path upstream. See `crate::flash` and docs/SDPA.md.
+        let narrowing = match storage {
+            candle_core::DType::BF16 => crate::flash::Narrowing::BFloat16,
+            candle_core::DType::F16 => crate::flash::Narrowing::Float16,
+            _ => crate::flash::Narrowing::None,
+        };
+        let attended = match acc {
+            candle_core::DType::F64 => {
+                crate::flash::attend::<f64>(&q, &k, &v, mask.as_ref(), scale, is_causal, narrowing)
+            }
+            _ => {
+                crate::flash::attend::<f32>(&q, &k, &v, mask.as_ref(), scale, is_causal, narrowing)
+            }
+        };
+        let (out, logsumexp) = attended.map_err(|e| candle_err(OP, e))?;
+        // Exact: the kernel already narrowed every element it wrote.
+        let out = out.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+        (out, logsumexp)
+    } else {
+        // ------------------------------------------------------------------
+        // Default: candle's tensor ops. The right mathematics, and an
+        // arithmetic that is upstream's only to within a tolerance.
+        // ------------------------------------------------------------------
+        let mut scores = k
+            .transpose(2, 3)
+            .and_then(|kt| kt.contiguous())
+            .and_then(|kt| q.matmul(&kt))
+            .and_then(|s| s.affine(scale, 0.0))
+            .map_err(|e| candle_err(OP, e))?;
+
+        let (rows, cols) = {
+            let dims = scores.dims();
+            (dims[2], dims[3])
+        };
+        if is_causal {
+            // Upper-left aligned, per the measurement above.
+            let mut mask = Vec::with_capacity(rows * cols);
+            for r in 0..rows {
+                for c in 0..cols {
+                    mask.push(if c <= r { 0.0f64 } else { f64::NEG_INFINITY });
+                }
+            }
+            let mask = Tensor::from_vec(mask, (rows, cols), scores.device())
+                .and_then(|t| t.fast_to(acc))
+                .map_err(|e| candle_err(OP, e))?;
+            scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+        }
+        if let Some(mask) = attn_mask.as_ref() {
+            let mask = mask
+                .tensor()?
+                .fast_to(acc)
+                .map_err(|e| candle_err(OP, e))?;
+            scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
+        }
+
+        // Softmax written out: candle-core has no `softmax` (that lives in
+        // candle-nn, which DESIGN.md §4 does not pull in). Shifting by the row
+        // maximum first is not an optimisation -- without it a masked row's
+        // `exp(-inf)` and a large logit's `exp(big)` land on the same NaN.
+        let row_max = scores.max_keepdim(3).map_err(|e| candle_err(OP, e))?;
+        let weights = scores
+            .broadcast_sub(&row_max)
+            .and_then(|s| s.exp())
+            .map_err(|e| candle_err(OP, e))?;
+        let row_sum = weights.sum_keepdim(3).map_err(|e| candle_err(OP, e))?;
+        let out = weights
+            .broadcast_div(&row_sum)
+            .and_then(|p| p.contiguous())
+            .and_then(|p| p.matmul(&v))
+            .and_then(|o| o.fast_to(storage))
+            .map_err(|e| candle_err(OP, e))?;
+
+        // logsumexp(x) = max(x) + log(sum(exp(x - max(x)))), on the same
+        // masked, scaled scores the weights came from.
+        let logsumexp = row_sum
+            .log()
+            .and_then(|l| l.broadcast_add(&row_max))
+            .and_then(|l| l.squeeze(3))
+            .map_err(|e| candle_err(OP, e))?;
+        (out, logsumexp)
+    };
 
     // Promoted element by element: `promote` at the dispatcher's exit does not
     // look inside a tuple, the same reason `max.dim` promotes its own pair.

@@ -7093,6 +7093,260 @@ def test_reduced_float_conversion_carries_the_values_no_shift_would():
             bad = [(i, v) for i, v in enumerate(side) if v == v]
             assert not bad, f"{dtype} {where}: NaN came back as {bad}"
 
+# --- the flash-attention kernel, bit for bit --------------------------------
+#
+# `aten::_scaled_dot_product_flash_attention_for_cpu` is a *blocked* kernel
+# with an online softmax, and for `bfloat16`/`float16` inputs every step of it
+# happens in portable code -- upstream reaches its own kernel rather than a
+# BLAS. `rust/torch_c/src/flash.rs` reproduces that arrangement, and
+# docs/SDPA.md is the measurement. These tests assert the consequence: **exact**
+# agreement, with no tolerance.
+#
+# A tolerance here would not be a check. docs/SDPA.md §3 has the numbers: the
+# formulation this replaced sat inside `tools/golden/dtypes.py`'s bfloat16
+# tolerance (6e-2) on every element while disagreeing with upstream on 32% of
+# them, and the golden harness passed it for months. One bfloat16 ulp is
+# 1/256 of the value; the tolerance is fifteen times that.
+#
+# **That formulation is still the default, so these tests turn the kernel on.**
+# It costs 20x (docs/SDPA.md §12), so `sdpa` reaches it only when asked. Every
+# test below therefore runs inside `_sdpa_reference()`, which flips
+# `_C._shim_sdpa_reference` and flips it back -- the switch is process-global,
+# and leaking it would make the six hundred cases that follow this section slow
+# for no reason. `test_sdpa_reference_switch_is_off_by_default_and_restores`
+# is what keeps that wiring honest: without it, a switch stuck on would make
+# every test here pass while costing the default path 20x, and a switch stuck
+# off would make them all fail loudly, which is the harmless direction.
+#
+# The shapes below are not arbitrary. Each crosses a boundary inside the
+# kernel that a naive reading does not have:
+#
+#   (26, 26)   SmolLM2-135M's own prefill, 9 query heads over 3 KV heads
+#   (33, 33)   one past the 32-row query block, so a second block runs
+#   (70, 70)   three query blocks, and 70 % 8 == 6 -- the mask's vector body
+#              stops at 64, not 68 (see the second test)
+#   (40, 600)  past the 512-column key split, so the online rescale runs
+_SDPA_OP = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+
+_SDPA_SHAPES = [
+    # (batch, query heads, kv heads, q_len, kv_len, head_dim)
+    (1, 2, 2, 8, 8, 16),
+    (1, 9, 3, 26, 26, 64),
+    (1, 2, 2, 33, 33, 8),
+    (1, 2, 2, 70, 70, 8),
+    (1, 1, 1, 40, 600, 8),
+    (1, 1, 1, 2, 5, 4),
+]
+
+
+class _sdpa_reference:
+    """Turns the exact kernel on for the block, and puts it back afterwards.
+
+    Restores the *previous* value rather than `False`, so that running the
+    suite under `BW_SDPA_REFERENCE=1` -- which is how the kernel gets exercised
+    end to end, past this section -- is not silently undone here.
+    """
+
+    def __enter__(self):
+        self.was = _C._shim_sdpa_reference(True)
+        return self
+
+    def __exit__(self, *exc):
+        _C._shim_sdpa_reference(self.was)
+        return False
+
+
+def _sdpa_det(n, seed):
+    """`n` values of the form k/128.
+
+    Every one is exactly representable in bfloat16, float16, float32 and
+    float64 alike, so `_tensor_from_flat` and `torch.tensor` cannot disagree
+    about the *inputs* and be misread as a disagreement about the kernel.
+    `test_reduced_float_operands_survive_construction` makes the same premise
+    explicit for the section above.
+    """
+    out, state = [], seed * 2654435761 % 2147483647
+    for _ in range(n):
+        state = (state * 1103515245 + 12345) % 2147483648
+        out.append((state % 321 - 160) / 128.0)
+    return out
+
+
+def _sdpa_call(b, batch, heads, kv_heads, q_len, kv_len, head_dim, dtype, causal, mask):
+    q = b.t(_sdpa_det(batch * heads * q_len * head_dim, 1),
+            (batch, heads, q_len, head_dim), dtype)
+    k = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 2),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    v = b.t(_sdpa_det(batch * kv_heads * kv_len * head_dim, 3),
+            (batch, kv_heads, kv_len, head_dim), dtype)
+    kw = {}
+    if mask:
+        flat = _sdpa_det(batch * heads * q_len * kv_len, 4)
+        # A wholly masked-out column, which is the shape a padding mask has and
+        # the reason the kernel writes zeros instead of `exp(-inf - -inf)`.
+        for i in range(0, len(flat), 7):
+            flat[i] = float("-inf")
+        kw["attn_mask"] = b.t(flat, (batch, heads, q_len, kv_len), dtype)
+    # The one funnel all three tests below go through, so the switch is flipped
+    # here rather than in each of them. It wraps the *call* and nothing else:
+    # building the tensors does not read it, and the upstream backend does not
+    # have it. `b.kind == "upstream"` still enters the block, harmlessly -- the
+    # alternative is a branch that makes the two backends take different code
+    # here, which is the one thing this helper exists to avoid.
+    with _sdpa_reference():
+        return b.op(_SDPA_OP, q, k, v, 0.0, causal, **kw)
+
+
+def test_sdpa_reduced_float_matches_upstream_to_the_last_bit():
+    """Both halves of the pair, every shape, no tolerance.
+
+    The logsumexp half is checked as carefully as the output half and is not
+    redundant: it comes back in `float32` even for a `bfloat16` call, so it is
+    the only place a one-ulp disagreement in the row sum is *visible* --
+    narrowing the output to bfloat16 hides it. The defect docs/SDPA.md §4.4
+    describes showed up in exactly that asymmetry and nowhere else.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    for dtype in _REDUCED_FLOATS:
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                for mask in (False, True):
+                    args = (*shape, dtype, causal, mask)
+                    got_pair = _sdpa_call(shim, *args)
+                    want_pair = _sdpa_call(upstream, *args)
+                    for half, label in ((0, "output"), (1, "logsumexp")):
+                        got = _flat_values(got_pair[half])
+                        want = _flat_values(want_pair[half])
+                        assert len(got) == len(want), (dtype, shape, label)
+                        wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+                        assert not wrong, (
+                            f"{dtype} {shape} causal={causal} mask={mask} {label}: "
+                            f"{len(wrong)}/{len(want)} elements differ from upstream; "
+                            f"first at {wrong[0]} (shim {got[wrong[0]]!r} vs "
+                            f"upstream {want[wrong[0]]!r})"
+                        )
+
+
+def test_sdpa_mask_body_strides_by_the_mask_dtype_not_the_accumulator():
+    """Names the wrong rule, so a regression to it fails here with the cause.
+
+    Upstream fuses `qk * scale + mask` in a loop that strides by
+    `Vectorized<mask_t>::size()`, and `mask_t` is the *input* dtype. For a
+    reduced float that is eight lanes, not the accumulator's four, so a
+    70-column block leaves six columns to the scalar remainder -- and the
+    remainder is one C statement, hence fused, where the body is not.
+
+    Reading that stride as four is a difference of two columns out of seventy.
+    It moved **one element in 226136** (docs/SDPA.md §4.4), in the logsumexp
+    and not the output, because the shift cancels between the row maximum and
+    the log of the row sum. Nothing shaped like a tolerance can see it, and
+    the general test above only sees it because it uses none.
+    """
+    if _upstream_torch is None:
+        return
+    shape = (1, 2, 2, 70, 70, 32)
+    assert shape[4] % 8 == 6, "the point of this shape is the six-column remainder"
+    for dtype in _REDUCED_FLOATS:
+        got = _flat_values(_sdpa_call(_E2EBackend("shim"), *shape, dtype, False, True)[1])
+        want = _flat_values(
+            _sdpa_call(_E2EBackend("upstream"), *shape, dtype, False, True)[1]
+        )
+        wrong = [i for i, (g, w) in enumerate(zip(got, want)) if g != w]
+        assert not wrong, (
+            f"{dtype} logsumexp differs on {len(wrong)}/{len(want)} rows; the mask "
+            f"body is probably striding by four lanes instead of eight "
+            f"(first row {wrong[0]}: shim {got[wrong[0]]!r} vs upstream "
+            f"{want[wrong[0]]!r})"
+        )
+
+
+def test_sdpa_wide_float_is_close_but_not_promised_exact():
+    """The other side of the claim, pinned so it cannot quietly become one.
+
+    For `float32` upstream hands both matrix products to the platform BLAS
+    (Accelerate here), whose summation order is not portable, so this kernel
+    is *not* bit-identical there and docs/SDPA.md §5 says so. The bound below
+    is the measured worst case over the same shapes, not a guess; asserting a
+    bound rather than equality is what keeps the two claims apart.
+    """
+    if _upstream_torch is None:
+        return
+    shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
+    bounds = {"float32": 1e-6, "float64": 1e-14}
+    for dtype, bound in bounds.items():
+        worst = 0.0
+        for shape in _SDPA_SHAPES:
+            for causal in (False, True):
+                args = (*shape, dtype, causal, False)
+                got_pair = _sdpa_call(shim, *args)
+                want_pair = _sdpa_call(upstream, *args)
+                for half in (0, 1):
+                    for g, w in zip(_flat_values(got_pair[half]), _flat_values(want_pair[half])):
+                        if g == w or math.isinf(g) or math.isinf(w):
+                            continue
+                        worst = max(worst, abs(g - w))
+        assert worst <= bound, f"{dtype} sdpa drifted to {worst:.4g}, over {bound:.4g}"
+
+
+def test_sdpa_reference_switch_is_off_by_default_and_restores():
+    """The switch is the claim; this is the test that can fail if it breaks.
+
+    Three separate things, because three separate ways of getting it wrong all
+    end with the suite green:
+
+      * **off by default.** If the switch defaulted on, every test above would
+        pass while every forward pass in the library paid 20x. Nothing else
+        here would notice -- the two paths agree to within a tolerance, which
+        is precisely why this cost went unnoticed for as long as it did.
+      * **the two paths actually differ.** A switch wired to nothing also makes
+        the tests above pass, because they would then be measuring the path
+        that is already bit-exact... or not measuring anything. So this asks
+        for a shape where the default answer and the reference answer are
+        *different bits*, and fails if they are the same. That shape is not
+        exotic: it is the first entry of `_SDPA_SHAPES`, where 93 of 256
+        bfloat16 elements move.
+      * **it restores.** `_sdpa_call` flips the switch on every call, so a
+        context manager that failed to put it back would leave the rest of
+        this file -- and, under `run.sh`, everything after it -- on the slow
+        path.
+    """
+    # `BW_SDPA_REFERENCE` is the env spelling of the same switch, so a suite run
+    # under it has legitimately changed the default. Everything else here still
+    # holds; only the claim about the default is that run's to make.
+    asked_by_env = os.environ.get("BW_SDPA_REFERENCE") not in (None, "", "0")
+    resting = _C._shim_sdpa_reference()
+    assert resting is asked_by_env, (
+        f"the reference kernel is {'on' if resting else 'off'} at rest with "
+        f"BW_SDPA_REFERENCE={os.environ.get('BW_SDPA_REFERENCE')!r}; it costs 20x "
+        "(docs/SDPA.md §12) and must be reached only when asked for"
+    )
+
+    shim = _E2EBackend("shim")
+    q = shim.t(_sdpa_det(2 * 8 * 16, 1), (1, 2, 8, 16), "bfloat16")
+    k = shim.t(_sdpa_det(2 * 8 * 16, 2), (1, 2, 8, 16), "bfloat16")
+    v = shim.t(_sdpa_det(2 * 8 * 16, 3), (1, 2, 8, 16), "bfloat16")
+
+    def run():
+        return _flat_values(_C._aten_dispatch(_SDPA_OP, q, k, v, 0.0, False)[0])
+
+    _C._shim_sdpa_reference(False)
+    fast = run()
+    with _sdpa_reference() as ctx:
+        assert ctx.was is False
+        assert _C._shim_sdpa_reference() is True
+        exact = run()
+    assert _C._shim_sdpa_reference() is False, "the switch did not come back off"
+    _C._shim_sdpa_reference(resting)
+
+    assert len(fast) == len(exact)
+    differing = [i for i, (a, b) in enumerate(zip(fast, exact)) if a != b]
+    assert differing, (
+        "the default and reference paths gave identical bits, so the switch is "
+        "not selecting anything -- the tests above are then vacuous"
+    )
+
 
 def _main():
     failures = 0

@@ -4118,6 +4118,113 @@ def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
                      "by name rather than reproducing uninitialised memory -- " + note,
             )
         )
+    cases.extend(_sdpa_block_cases(torch_module, c_module, torch_call))
+    return cases
+
+
+# --- the shapes that cross the kernel's own block boundaries ----------------
+#
+# Every sdpa case above is 3 or 5 keys long, which is shorter than any block
+# `aten::_scaled_dot_product_flash_attention_for_cpu` splits on. So they all
+# take one path through it -- one query block, one key block, no online
+# rescale -- and the blocked structure the kernel is named for went
+# unexercised by this harness for as long as the op has been in it.
+#
+# The three boundaries, and the shape here that crosses each:
+#
+#   32 query rows    the block size the kernel picks for short queries;
+#                    q_len=33 makes a second block run, with the first
+#                    block's row maximum carried into it
+#   512 key columns  the key split; kv_len=600 makes the online rescale run,
+#                    which is the only path that multiplies the accumulator
+#                    by `exp(previous_max - this_max)`
+#   8 mask lanes     the fused `qk * scale + mask` strides by the *mask*
+#                    dtype's vector width; kv_len=70 leaves a six-column
+#                    remainder that is fused where the body is not
+#
+# These are tolerance checks like every other case in this file. The exact
+# ones live in `pytests/test_shim.py` -- see the section comment there for why
+# one bfloat16 ulp is invisible to `dtypes.py::TOLERANCES`, and what that cost.
+#
+# **These sixteen run with the reference kernel switched on; the sdpa cases
+# above do not.** `crate::flash` is opt-in because it costs 20x (docs/SDPA.md
+# §7), so each case here asks for it in `run_c` and puts the switch back. The
+# split is deliberate rather than left over: the cases before this point are
+# the only coverage the *default* path has in this harness, and moving them
+# across would leave the path every forward pass actually takes unmeasured
+# here. Boundaries are what these sixteen are for, and a boundary inside a
+# blocked kernel does not exist on a path that has no blocks.
+def _sdpa_block_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._scaled_dot_product_flash_attention_for_cpu.default"
+    cases: list[Case] = []
+    e = 8
+
+    def with_reference(call):
+        """Wraps a `run_c` so it selects `crate::flash`, and restores after.
+
+        Restores the *previous* value rather than `False`, so a whole run under
+        `BW_SDPA_REFERENCE=1` is not undone case by case. The `finally` matters
+        more than it looks: `compare.py --inject-fault` and `--self-test`
+        deliberately make cases fail, and a switch left on by a raised
+        exception would quietly move every case after this section onto a path
+        20x slower than the one they are meant to measure.
+        """
+
+        def run():
+            was = c_module._shim_sdpa_reference(True)
+            try:
+                return call()
+            finally:
+                c_module._shim_sdpa_reference(was)
+
+        return run
+
+    for dtype_name in _SDPA_DTYPES:
+        for q_len, kv_len, use_mask, is_causal, note in [
+            (33, 33, False, False, "33 query rows -- a second 32-row query block"),
+            (33, 33, False, True, "second query block, causal"),
+            (70, 70, True, False, "70 keys with a mask -- six columns past the mask's eight lanes"),
+            (20, 600, False, False, "600 keys -- past the 512-column key split"),
+        ]:
+            q_flat = _deterministic(q_len * e, 31)
+            k_flat = _deterministic(kv_len * e, 32)
+            v_flat = _deterministic(kv_len * e, 33)
+            q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, (1, 1, q_len, e), dtype_name)
+            k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, (1, 1, kv_len, e), dtype_name)
+            v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, (1, 1, kv_len, e), dtype_name)
+            kw_t: dict = {}
+            kw_c: dict = {}
+            if use_mask:
+                mask_flat = _deterministic(q_len * kv_len, 34)
+                # Every seventh column masked out entirely: a padding mask's
+                # shape, and the reason the kernel writes zeros rather than
+                # `exp(-inf - -inf)`.
+                for i in range(0, len(mask_flat), 7):
+                    mask_flat[i] = float("-inf")
+                m_t, m_c = pair_from_flat(
+                    torch_module, c_module, mask_flat, (1, 1, q_len, kv_len), dtype_name
+                )
+                kw_t["attn_mask"] = m_t
+                kw_c["attn_mask"] = m_c
+            cases.append(
+                Case(
+                    name=(
+                        f"sdpa_flash_cpu(dtype={dtype_name}, q_len={q_len}, "
+                        f"kv_len={kv_len}, mask={use_mask}, is_causal={is_causal}) [{note}]"
+                    ),
+                    op=op,
+                    run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t, is_causal=is_causal, kw_t=kw_t: (
+                        torch_call(q_t, k_t, v_t, 0.0, is_causal, **kw_t)
+                    ),
+                    run_c=with_reference(
+                        lambda q_c=q_c, k_c=k_c, v_c=v_c, is_causal=is_causal, kw_c=kw_c: (
+                            c_module._aten_dispatch(op, q_c, k_c, v_c, 0.0, is_causal, **kw_c)
+                        )
+                    ),
+                    value_check=_sdpa_pair_check,
+                    note=note,
+                )
+            )
     return cases
 
 
