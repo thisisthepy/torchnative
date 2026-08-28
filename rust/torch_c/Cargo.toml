@@ -47,6 +47,18 @@ candle-core = { version = "0.11.0", default-features = false }
 # tuning a crate nobody calls any more.
 gemm = "0.19.0"
 
+# The `float16`/`bfloat16` scalar types, named for the same reason `gemm` is:
+# `src/reduced.rs` calls them, and the version is the one candle-core already
+# resolves, so this adds no code to the artefact.
+#
+# It is the reference implementation and not merely a convenience type. Every
+# kernel in `reduced.rs` is checked bitwise against the `half` function it
+# replaces -- over all 65536 bit patterns where that set is finite -- and the
+# numbers docs/BF16.md pinned this shim to were produced by these very
+# functions, so "agrees with `half`" and "agrees with what shipped" are one
+# statement rather than two.
+half = "2.7"
+
 # Apple only. `target_vendor = "apple"` covers macOS and iOS, device and
 # simulator alike, and excludes Android and Linux -- where turning this on would
 # not merely be useless but would fail to link, there being no Accelerate

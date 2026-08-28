@@ -23,6 +23,7 @@ use pyo3::IntoPyObjectExt;
 use crate::device::PyDevice;
 use crate::dtype::{default_float, PyDtype, TorchDType};
 use crate::err::{aten_not_implemented, candle_err, not_implemented};
+use crate::reduced::{FastDType, Fused};
 use crate::tensor::PyTensorBase;
 
 /// Every op with a real kernel behind it. Kept sorted; `_aten_implemented()`
@@ -1009,7 +1010,7 @@ fn full_default(
         let value: f64 = fill.extract()?;
         Tensor::full(value, size, &device)
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
@@ -1054,12 +1055,25 @@ fn add_tensor(
     // multiply and the add separately where torch rounds only the result.
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = opmath_in(storage);
-    let lhs = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
-    let rhs = rhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    // The whole widen/add/narrow in one pass when the operands allow it. It
+    // computes the same function -- `reduced::fused_arith` refuses rather than
+    // approximating -- and `alpha != 1` is left to the slow path because
+    // `scale_by_alpha` is a rule of its own (§3.1 of docs/BF16.md) and folding
+    // it in here would be a second place for that rule to live.
+    if alpha == 1.0 {
+        if let Some(out) =
+            crate::reduced::fused_arith(Fused::Add, lhs.tensor()?, rhs.tensor()?, storage)
+        {
+            let out = out.map_err(|e| candle_err(OP, e))?;
+            return Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind());
+        }
+    }
+    let lhs = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
+    let rhs = rhs.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
     let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
     let out = lhs
         .broadcast_add(&rhs)
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
 
     Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind())
@@ -1167,7 +1181,7 @@ fn scale_by_alpha(
         return operand.affine(alpha, 0.0).map_err(|e| candle_err(op, e));
     }
     let narrowed = Tensor::full(alpha, (), operand.device())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .and_then(|t| t.to_dtype(candle_core::DType::F64))
         .and_then(|t| t.to_scalar::<f64>())
         .map_err(|e| candle_err(op, e))?;
@@ -1176,8 +1190,8 @@ fn scale_by_alpha(
         .map_err(|e| candle_err(op, e))?;
     if storage == candle_core::DType::BF16 {
         return scaled
-            .to_dtype(storage)
-            .and_then(|t| t.to_dtype(acc))
+            .fast_to(storage)
+            .and_then(|t| t.fast_to(acc))
             .map_err(|e| candle_err(op, e));
     }
     Ok(scaled)
@@ -1218,9 +1232,9 @@ fn mm_default(
     let rhs_inner = rhs.tensor()?;
     let out = lhs
         .tensor()?
-        .to_dtype(acc)
-        .and_then(|l| rhs_inner.to_dtype(acc).and_then(|r| l.matmul(&r)))
-        .and_then(|p| p.to_dtype(storage))
+        .fast_to(acc)
+        .and_then(|l| rhs_inner.fast_to(acc).and_then(|r| l.matmul(&r)))
+        .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -1279,15 +1293,15 @@ fn bmm_default(
     let rhs_inner = rhs.tensor()?;
     let out = lhs
         .tensor()?
-        .to_dtype(acc)
+        .fast_to(acc)
         .and_then(|l| l.contiguous())
         .and_then(|l| {
             rhs_inner
-                .to_dtype(acc)
+                .fast_to(acc)
                 .and_then(|r| r.contiguous())
                 .and_then(|r| l.matmul(&r))
         })
-        .and_then(|p| p.to_dtype(storage))
+        .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -1312,7 +1326,7 @@ fn addmm_scale(
             return Ok(tensor.clone());
         }
         let scale = Tensor::full(k, (), tensor.device())
-            .and_then(|t| t.to_dtype(storage))
+            .and_then(|t| t.fast_to(storage))
             .map_err(|e| candle_err(op, e))?;
         tensor.broadcast_mul(&scale).map_err(|e| candle_err(op, e))
     } else {
@@ -1493,7 +1507,7 @@ fn addmm_default(
         });
     }
     let out = match acc {
-        Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
+        Some(tensor) => tensor.fast_to(storage).map_err(|e| candle_err(OP, e))?,
         // Both factors zero: torch still answers with a correctly shaped,
         // correctly typed tensor of zeros rather than raising.
         None => Tensor::zeros(target.as_slice(), storage, mat1.tensor()?.device())
@@ -1668,7 +1682,7 @@ fn baddbmm_default(
         });
     }
     let out = match acc {
-        Some(tensor) => tensor.to_dtype(storage).map_err(|e| candle_err(OP, e))?,
+        Some(tensor) => tensor.fast_to(storage).map_err(|e| candle_err(OP, e))?,
         None => Tensor::zeros(target.as_slice(), storage, batch1.tensor()?.device())
             .map_err(|e| candle_err(OP, e))?,
     };
@@ -1772,7 +1786,7 @@ fn sdpa_flash_cpu(
         not_implemented(format!("{OP}: no torch dtype for the accumulate type {acc:?}"))
     })?;
 
-    let widen = |t: &Tensor| t.to_dtype(acc).and_then(|t| t.contiguous());
+    let widen = |t: &Tensor| t.fast_to(acc).and_then(|t| t.contiguous());
     let q = widen(query.tensor()?).map_err(|e| candle_err(OP, e))?;
     let k = repeat_kv_heads(OP, &widen(key.tensor()?).map_err(|e| candle_err(OP, e))?, q.dims()[1])?;
     let v = repeat_kv_heads(
@@ -1804,14 +1818,14 @@ fn sdpa_flash_cpu(
             }
         }
         let mask = Tensor::from_vec(mask, (rows, cols), scores.device())
-            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.fast_to(acc))
             .map_err(|e| candle_err(OP, e))?;
         scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
     }
     if let Some(mask) = attn_mask.as_ref() {
         let mask = mask
             .tensor()?
-            .to_dtype(acc)
+            .fast_to(acc)
             .map_err(|e| candle_err(OP, e))?;
         scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
     }
@@ -1830,7 +1844,7 @@ fn sdpa_flash_cpu(
         .broadcast_div(&row_sum)
         .and_then(|p| p.contiguous())
         .and_then(|p| p.matmul(&v))
-        .and_then(|o| o.to_dtype(storage))
+        .and_then(|o| o.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
 
     // logsumexp(x) = max(x) + log(sum(exp(x - max(x)))), on the same masked,
@@ -1961,7 +1975,7 @@ fn arange(
         let len = values.len();
         Tensor::from_vec(values, len, &device)
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|err| candle_err(op, err))?;
 
     finish(py, tensor, dtype)
@@ -2087,7 +2101,7 @@ fn rsqrt_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let tensor = input
         .tensor()?
-        .to_dtype(storage)
+        .fast_to(storage)
         .and_then(|t| t.sqrt())
         .and_then(|t| t.recip())
         .map_err(|err| candle_err(OP, err))?;
@@ -2157,7 +2171,7 @@ fn pow_from_pairs(
         }
         Tensor::from_vec(values, shape, device)
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|err| candle_err(op, err))?;
     finish(py, tensor, tag)
 }
@@ -2332,7 +2346,7 @@ fn cat_default(
         // dtype without ever looking at `dim`.
         let storage = PyDtype::new(tag).storage(OP)?;
         let out = Tensor::from_vec(Vec::<f64>::new(), 0usize, tensors[0].tensor()?.device())
-            .and_then(|t| t.to_dtype(storage))
+            .and_then(|t| t.fast_to(storage))
             .map_err(|err| candle_err(OP, err))?;
         return finish(py, out, tag);
     }
@@ -2510,7 +2524,7 @@ fn scalar_tensor_default(
     } else {
         Tensor::full(value.as_f64(), (), &device)
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, dtype)
 }
@@ -2752,7 +2766,7 @@ fn randint(
         // `high` after rounding; the clamp keeps the half-open contract that
         // callers actually rely on.
         .and_then(|t| t.clamp(low as f64, (high - 1) as f64))
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
     finish(py, tensor, dtype)
 }
@@ -2795,6 +2809,22 @@ enum Arith {
     Sub,
     Mul,
     Div,
+}
+
+impl Arith {
+    /// The same operation as seen by the fused reduced-precision kernels.
+    ///
+    /// It is a total function today and is written to return an `Option`
+    /// anyway: adding an arm here that `reduced::Fused` does not have should
+    /// fall back to the widening path rather than fail to compile into it.
+    fn fused(self) -> Option<Fused> {
+        Some(match self {
+            Arith::Add => Fused::Add,
+            Arith::Sub => Fused::Sub,
+            Arith::Mul => Fused::Mul,
+            Arith::Div => Fused::Div,
+        })
+    }
 }
 
 /// The result dtype of an arithmetic op, given the tensor's dtype and (for the
@@ -3015,12 +3045,23 @@ fn arith_tensor(
     // that function. `alpha` scales inside the widened dtype for the same
     // reason `add_tensor` does it there.
     let acc = opmath_in(storage);
-    let left = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
-    let right = rhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
+    // One pass instead of three, when the operands allow it -- see
+    // `add_tensor`, which takes the same fast path for the same reason.
+    if alpha == 1.0 {
+        if let Some(fused) = kind.fused() {
+            if let Some(out) =
+                crate::reduced::fused_arith(fused, lhs.tensor()?, rhs.tensor()?, storage)
+            {
+                return finish(py, out.map_err(|e| candle_err(op, e))?, tag);
+            }
+        }
+    }
+    let left = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(op, e))?;
+    let right = rhs.tensor()?.fast_to(acc).map_err(|e| candle_err(op, e))?;
     let right = scale_by_alpha(op, &right, alpha, storage)?;
     let out = apply_arith(op, kind, &left, &right)?
-        .to_dtype(storage)
+        .fast_to(storage)
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -3039,7 +3080,7 @@ fn arith_scalar(
     let storage = PyDtype::new(tag).storage(op)?;
 
     let acc = opmath_in(storage);
-    let left = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(op, e))?;
+    let left = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(op, e))?;
     let alpha = alpha_arg(op, args, kwargs)?;
     // A zero-dim tensor, which is what torch's own `Scalar` overloads become
     // one layer down (`wrapped_scalar_tensor`) -- a `TorchDispatchMode` logger
@@ -3051,19 +3092,19 @@ fn arith_scalar(
     // `0.3` to `bfloat16` and then round the result again, where torch rounds
     // once. `opmath_in` has the measurement.
     let right = if storage.is_int() {
-        Tensor::full(other.as_i64() * (alpha as i64), (), left.device()).and_then(|t| t.to_dtype(acc))
+        Tensor::full(other.as_i64() * (alpha as i64), (), left.device()).and_then(|t| t.fast_to(acc))
     } else {
         // Narrowed to `storage` and widened back, not built at `acc`: torch's
         // promotion makes a python float beside a `bfloat16` tensor a
         // `bfloat16` operand (docs/GENERATE.md §3.2), so `x + 0.3` adds
         // `0.30078125`. Building the scalar at `float` would add `0.3`.
         Tensor::full(other.as_f64() * alpha, (), left.device())
-            .and_then(|t| t.to_dtype(storage))
-            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.fast_to(acc))
     }
     .map_err(|e| candle_err(op, e))?;
     let out = apply_arith(op, kind, &left, &right)?
-        .to_dtype(storage)
+        .fast_to(storage)
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -3091,19 +3132,19 @@ fn rsub_scalar(
     let storage = PyDtype::new(tag).storage(OP)?;
 
     let acc = opmath_in(storage);
-    let right = lhs.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    let right = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
     let alpha = alpha_arg(OP, args, kwargs)?;
     let right = scale_by_alpha(OP, &right, alpha, storage)?;
     let left = if storage.is_int() {
-        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.to_dtype(acc))
+        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.fast_to(acc))
     } else {
         Tensor::full(other.as_f64(), (), right.device())
-            .and_then(|t| t.to_dtype(storage))
-            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.fast_to(acc))
     }
     .map_err(|e| candle_err(OP, e))?;
     let out = apply_arith(OP, Arith::Sub, &left, &right)?
-        .to_dtype(storage)
+        .fast_to(storage)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3141,15 +3182,15 @@ fn matmul_default(
     let rhs_inner = rhs.tensor()?;
     let out = lhs
         .tensor()?
-        .to_dtype(acc)
+        .fast_to(acc)
         .and_then(|l| l.contiguous())
         .and_then(|l| {
             rhs_inner
-                .to_dtype(acc)
+                .fast_to(acc)
                 .and_then(|r| r.contiguous())
                 .and_then(|r| l.broadcast_matmul(&r))
         })
-        .and_then(|p| p.to_dtype(storage))
+        .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3310,7 +3351,7 @@ fn bitwise_binary(
     }
     let storage = PyDtype::new(tag).storage(op)?;
     let out = Tensor::from_vec(values, dims, lhs.tensor()?.device())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -3367,7 +3408,7 @@ fn bitwise_scalar(
     }
     let storage = PyDtype::new(tag).storage(op)?;
     let out = Tensor::from_vec(values, dims, input.tensor()?.device())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -3405,7 +3446,7 @@ fn bitwise_not_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let out = Tensor::from_vec(values.into_iter().map(|v| !v).collect::<Vec<i64>>(), dims,
                                input.tensor()?.device())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3450,7 +3491,7 @@ fn unary_float(
     let storage = PyDtype::new(tag).storage(op)?;
     let out = input
         .tensor()?
-        .to_dtype(storage)
+        .fast_to(storage)
         .and_then(|t| match kind {
             Unary::Cos => t.cos(),
             Unary::Sin => t.sin(),
@@ -3507,7 +3548,7 @@ fn neg_default(
     if tag.is_floating_point() {
         let out = input
             .tensor()?
-            .to_dtype(storage)
+            .fast_to(storage)
             .and_then(|t| t.neg())
             .map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
@@ -3526,7 +3567,7 @@ fn neg_default(
         dims,
         input.tensor()?.device(),
     )
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3589,7 +3630,7 @@ fn abs_default(
         })
         .collect();
     let out = Tensor::from_vec(wrapped, dims, input.tensor()?.device())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3876,9 +3917,9 @@ fn silu_default(
     };
     let out = input
         .tensor()?
-        .to_dtype(acc)
+        .fast_to(acc)
         .and_then(|t| t.silu())
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -3988,7 +4029,7 @@ fn gelu_default(
         candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
         other => other,
     };
-    let x = input.tensor()?.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+    let x = input.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
 
     let out = if use_tanh {
         // `0.5 · v · (1 + tanh(β·(v + κ·v³)))`, ATen's association exactly.
@@ -4017,7 +4058,7 @@ fn gelu_default(
         x.gelu_erf().map_err(|e| candle_err(OP, e))?
     };
 
-    let out = out.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    let out = out.fast_to(storage).map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
@@ -4113,7 +4154,7 @@ fn sum_or_mean(
     let acc = opmath_in(storage);
     let source = input
         .tensor()?
-        .to_dtype(acc)
+        .fast_to(acc)
         .map_err(|e| candle_err(op, e))?;
     // torch: an empty `dim` list reduces *every* dimension (it is not the
     // same as reducing none), so it is equivalent to naming every axis.
@@ -4130,7 +4171,7 @@ fn sum_or_mean(
             (Reduce::Mean, false) => source.mean(dims),
         },
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
@@ -4207,7 +4248,7 @@ fn cumsum_default(
         }
         Tensor::from_vec(flat, dims, input.tensor()?.device())
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -4276,7 +4317,7 @@ fn extremum_default(
         if nan_count > 0 {
             let storage = PyDtype::new(tag).storage(op)?;
             let out = Tensor::full(f64::NAN, (), flat.device())
-                .and_then(|t| t.to_dtype(storage))
+                .and_then(|t| t.fast_to(storage))
                 .map_err(|e| candle_err(op, e))?;
             return finish(py, out, tag);
         }
@@ -4540,7 +4581,7 @@ fn masked_fill(
     } else {
         Tensor::full(value.as_f64(), shape.clone(), device)
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))?;
     let source = input
         .tensor()?
@@ -4653,8 +4694,8 @@ fn where_select(
     } else {
         mask.ne(0u8).map_err(|e| candle_err(op, e))?
     };
-    let on_true = spread(&lhs.to_dtype(storage).map_err(|e| candle_err(op, e))?)?;
-    let on_false = spread(&rhs.to_dtype(storage).map_err(|e| candle_err(op, e))?)?;
+    let on_true = spread(&lhs.fast_to(storage).map_err(|e| candle_err(op, e))?)?;
+    let on_false = spread(&rhs.fast_to(storage).map_err(|e| candle_err(op, e))?)?;
 
     mask.where_cond(&on_true, &on_false)
         .map_err(|e| candle_err(op, e))
@@ -4791,7 +4832,7 @@ fn where_scalar_other(
         } else {
             Tensor::full(value.as_f64(), (), &device)
         }
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?
     };
 
@@ -5329,7 +5370,7 @@ fn to_copy_default(
     let out = input
         .tensor()?
         .to_device(&device)
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -5850,7 +5891,7 @@ fn fill_inplace(
         } else {
             Tensor::full(value.as_f64(), shape, &device)
         }
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
         PyTensorBase::new(filled)?
     };
@@ -5941,7 +5982,7 @@ fn copy_inplace(
         )?
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
-        PyTensorBase::new(widened.to_dtype(storage).map_err(|e| candle_err(OP, e))?)?
+        PyTensorBase::new(widened.fast_to(storage).map_err(|e| candle_err(OP, e))?)?
     };
     receiver.borrow_mut().replace_with(replacement);
     let _ = py;
@@ -6005,19 +6046,19 @@ fn add_inplace(
         let borrowed = receiver.borrow();
         borrowed
             .tensor()?
-            .to_dtype(acc)
+            .fast_to(acc)
             .map_err(|e| candle_err(OP, e))?
     };
     let rhs = other
         .tensor()?
-        .to_dtype(acc)
+        .fast_to(acc)
         .and_then(|t| t.broadcast_as(shape))
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
     let out = lhs
         .add(&rhs)
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
     let _ = py;
@@ -6199,7 +6240,7 @@ fn narrow_roundtrip_f32(op: &str, value: f32, storage: candle_core::DType, devic
         return Ok(value);
     }
     Tensor::from_vec(vec![value], 1, device)
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .and_then(|t| t.to_dtype(candle_core::DType::F32))
         .and_then(|t| t.to_vec1::<f32>())
         .map(|values| values[0])
@@ -6447,7 +6488,7 @@ fn write_flat(
         Flat::Float(v) => Tensor::from_vec(v, dims, device),
         Flat::Int(v) => Tensor::from_vec(v, dims, device),
     }
-    .and_then(|t| t.to_dtype(storage))
+    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))
 }
 
@@ -7016,8 +7057,8 @@ fn convolution_default(
         )));
     }
     let storage = PyDtype::new(tag).storage(OP)?;
-    let x = input.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
-    let w = weight.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?;
+    let x = input.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
+    let w = weight.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
     let raw = x
         .conv1d(
             &w,
@@ -7037,7 +7078,7 @@ fn convolution_default(
             let c_out = raw.dim(1).map_err(|e| candle_err(OP, e))?;
             let b_reshaped = b
                 .tensor()?
-                .to_dtype(storage)
+                .fast_to(storage)
                 .and_then(|t| t.reshape((1, c_out, 1)))
                 .map_err(|e| candle_err(OP, e))?;
             raw.broadcast_add(&b_reshaped).map_err(|e| candle_err(OP, e))?
@@ -7413,11 +7454,11 @@ fn div_inplace_tensor(
     let storage = PyDtype::new(tag).storage(OP)?;
     let lhs = {
         let borrowed = receiver.borrow();
-        borrowed.tensor()?.to_dtype(storage).map_err(|e| candle_err(OP, e))?
+        borrowed.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?
     };
     let rhs = other
         .tensor()?
-        .to_dtype(storage)
+        .fast_to(storage)
         .and_then(|t| t.broadcast_as(shape))
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
@@ -7707,7 +7748,7 @@ fn native_layer_norm_default(
     let flat = input
         .tensor()?
         .contiguous()
-        .and_then(|t| t.to_dtype(acc))
+        .and_then(|t| t.fast_to(acc))
         .and_then(|t| t.reshape((rows, cols)))
         .map_err(|e| candle_err(OP, e))?;
     let mean = flat.mean_keepdim(1).map_err(|e| candle_err(OP, e))?;
@@ -7726,7 +7767,7 @@ fn native_layer_norm_default(
         let row = weight
             .tensor()?
             .contiguous()
-            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.fast_to(acc))
             .and_then(|t| t.reshape((1, cols)))
             .map_err(|e| candle_err(OP, e))?;
         out = out.broadcast_mul(&row).map_err(|e| candle_err(OP, e))?;
@@ -7735,14 +7776,14 @@ fn native_layer_norm_default(
         let row = bias
             .tensor()?
             .contiguous()
-            .and_then(|t| t.to_dtype(acc))
+            .and_then(|t| t.fast_to(acc))
             .and_then(|t| t.reshape((1, cols)))
             .map_err(|e| candle_err(OP, e))?;
         out = out.broadcast_add(&row).map_err(|e| candle_err(OP, e))?;
     }
 
     let out = out
-        .to_dtype(storage)
+        .fast_to(storage)
         .and_then(|t| t.reshape(dims.as_slice()))
         .map_err(|e| candle_err(OP, e))?;
     let reshape_stat = |t: Tensor| {
@@ -7942,7 +7983,7 @@ fn safe_softmax_default(
             let storage = PyDtype::new(want).storage(OP)?;
             let cast = input
                 .tensor()?
-                .to_dtype(storage)
+                .fast_to(storage)
                 .map_err(|e| candle_err(OP, e))?;
             (cast, want)
         }
@@ -8258,7 +8299,7 @@ fn narrow_through(
         return Ok(values);
     }
     Tensor::from_vec(values, n, device)
-        .and_then(|t| t.to_dtype(storage))
+        .and_then(|t| t.fast_to(storage))
         .and_then(|t| t.to_dtype(candle_core::DType::F64))
         .and_then(|t| t.to_vec1::<f64>())
         .map_err(|e| candle_err(op, e))
