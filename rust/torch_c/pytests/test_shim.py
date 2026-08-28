@@ -3750,6 +3750,348 @@ def test_what_needs_a_peer_refuses_by_name():
     assert "PREMUL_SUM" in r["all_reduce_PREMUL_SUM"], r["all_reduce_PREMUL_SUM"]
     assert r["store_wait"] == "REFUSED", r["store_wait"]
 
+# --- the decomposition pass (docs/DECOMP.md) ---------------------------------
+#
+# `_capture_end` records ATen; ExecuTorch's Edge dialect is defined over Core
+# ATen. docs/CAPTURE.md §5 measured that gap and found it is already open in
+# the smallest example there. `torchnative.export.decompose` closes it by
+# running upstream's own decomposition rules -- which means the tests need the
+# vendored tree, the same subprocess shape the capture road above uses.
+
+_DECOMP_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+from torchnative.export import (
+    DecompositionRefused,
+    core_ops,
+    decompose,
+    decomposition_table,
+    decomposition_table_source,
+    is_core,
+    non_core_ops,
+)
+from torchnative.export.decompose import _native_functions_path
+
+out = {}
+
+# -- what Core ATen is, and that the scanner reading it is not lying ----------
+out["n_core"] = len(core_ops())
+out["t_is_core"] = is_core("aten.t.default")
+out["addmm_is_core"] = is_core("aten.addmm.default")
+try:
+    import yaml
+except ImportError:
+    out["yaml_diff"] = None
+else:
+    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    with open(_native_functions_path()) as handle:
+        entries = yaml.load(handle, Loader=loader)
+    reference = set()
+    for entry in entries:
+        tags = entry.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        if "core" not in tags:
+            continue
+        signature = entry["func"].split("(", 1)[0]
+        if "." in signature:
+            name, overload = signature.split(".", 1)
+        else:
+            name, overload = signature, "default"
+        reference.add("aten.%s.%s" % (name, overload))
+    out["yaml_diff"] = sorted(reference ^ set(core_ops()))
+
+# -- which upstream table answered, and why not the fuller one ----------------
+source, reason = decomposition_table_source()
+out["table_source"] = source
+out["table_reason"] = reason
+out["table_size"] = len(decomposition_table())
+
+# -- the proof: capture, lower, replay, compare ------------------------------
+#
+# Written with `torch.ops.aten.*` spellings rather than `torch.stack` /
+# `torch.split` because neither has an entry in the shim's `torch.<fn>`
+# overload table yet (docs/DECOMP.md §4). The recorded region is identical
+# either way -- capture records at the dispatcher, and both spellings arrive
+# there -- so this costs the test nothing and keeps it about decomposition.
+def program(x, w):
+    h = torch.ops.aten.stack.default([x, x * 2.0])   # not Core ATen
+    h = h.view(4, 4)
+    y = torch.mm(h, w)
+    y = torch.relu(y)
+    lo, hi = torch.ops.aten.split.Tensor(y, 2)       # not Core ATen
+    return lo + hi
+
+x = torch.ones(2, 4)
+w = torch.ones(4, 3) * 0.5
+
+torch._C._capture_begin([x])
+captured_out = program(x, w)
+out["capture_reason"] = torch._C._capture_reason()
+trace = torch._C._capture_end(captured_out)
+
+out["ops_before"] = [n["op"] for n in trace.nodes]
+out["non_core_before"] = non_core_ops(out["ops_before"])
+out["n_constants_before"] = len(trace.constants)
+
+lowered = decompose(trace)
+out["ops_after"] = lowered.ops
+out["non_core_after"] = non_core_ops(lowered.ops)
+out["n_nodes"] = [len(trace), len(lowered)]
+out["n_constants_after"] = len(lowered.constants)
+out["repr"] = repr(lowered)
+out["graph_keys"] = sorted(lowered.graph())
+out["guards"] = lowered.guards
+
+pairs = []
+for scale in (1.0, 0.5, -2.0, 7.25):
+    z = torch.ones(2, 4) * scale
+    (lowered_result,) = lowered.replay([z])
+    (captured_result,) = trace.replay([z])
+    pairs.append([
+        lowered_result.reshape(-1).tolist(),
+        captured_result.reshape(-1).tolist(),
+        program(z, w).reshape(-1).tolist(),
+    ])
+out["pairs"] = pairs
+
+# The guard survives the rewrite: a lowered trace is no more general than the
+# one it was lowered from.
+try:
+    lowered.replay([torch.ones(3, 4)])
+except RuntimeError as error:
+    out["wrong_shape"] = str(error)
+else:
+    out["wrong_shape"] = "ACCEPTED"
+
+
+d = torch._C._aten_dispatch
+
+
+def refusal(tensor, call):
+    # The tensor is built *before* recording opens, on purpose: anything
+    # allocated inside the region is an op in the record too, and a one-op
+    # trace is what these three cases are about.
+    torch._C._capture_begin([tensor])
+    produced = call(tensor)
+    trace = torch._C._capture_end(produced)
+    try:
+        decompose(trace)
+    except DecompositionRefused as error:
+        return str(error)
+    return "ACCEPTED"
+
+
+# No rule at all in the table this build can reach.
+out["refuse_no_rule"] = refusal(
+    torch.ones(3, 4), lambda t: d("aten.transpose.int", t, 0, 1)
+)
+# A rule exists, and running it hits something the shim does not have.
+out["refuse_unrunnable"] = refusal(
+    torch.ones(4, 8), lambda t: d("aten.t.default", t)
+)
+# A rule exists, runs, and produces a result the recording disagrees with.
+out["refuse_disagrees"] = refusal(
+    torch.ones(3, 4), lambda t: d("aten.sum.default", t)
+)
+# The divergence underneath that last one, stated directly.
+out["sum_all_dims"] = list(d("aten.sum.dim_IntList", torch.ones(3, 4), []).shape)
+
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def _decomp_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _DECOMP_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"decompose-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_decompose_reads_core_aten_out_of_the_vendored_tree():
+    """The Core ATen set is upstream's data, not a list transcribed here.
+
+    `torchgen/packaged/ATen/native/native_functions.yaml` carries a
+    `tags: core` annotation per entry, and it is the same file upstream
+    generates `torch.Tag.core` from. Reading it is what makes "is this op
+    core" answerable in a build whose `_C` is a Python shim -- in this build
+    `torch.ops.aten.<op>.<ov>.tags` is empty for every op, so the tag route
+    would classify the whole program as non-core.
+
+    The scan is a line scanner rather than a YAML parse, because `pyyaml` is
+    not a declared dependency of this distribution. This test diffs the scan
+    against a real YAML parse so that a format change upstream is a failure
+    here rather than a quietly shorter list.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _decomp_road_fixture()
+    assert r["n_core"] == 193, r["n_core"]
+    assert r["addmm_is_core"] is True
+    # The op docs/CAPTURE.md §5 named: the smallest model already emits one
+    # that Edge will not take.
+    assert r["t_is_core"] is False
+    if r["yaml_diff"] is not None:
+        assert r["yaml_diff"] == [], r["yaml_diff"]
+
+
+def test_decompose_says_which_upstream_table_it_could_get():
+    """A silent fallback to a smaller table is a silent loss of coverage.
+
+    `core_aten_decompositions()` is the table this pass wants. It cannot be
+    built here: its constructor enumerates every CompositeImplicitAutograd
+    registration through `torch._C._dispatch_get_registrations_for_dispatch_key`,
+    and this `_C` has no C++ dispatcher to enumerate. So the pass falls back to
+    `_core_aten_decompositions_post_autograd()` and *reports that it did*.
+
+    Pinned as a test rather than a comment because the day the shim answers
+    that query, this assertion is what tells us the fuller table arrived.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["table_source"] == "_core_aten_decompositions_post_autograd", r["table_source"]
+    assert "_dispatch_get_registrations_for_dispatch_key" in (r["table_reason"] or ""), r
+    assert r["table_size"] == 224, r["table_size"]
+
+
+def test_decompose_lowers_a_trace_to_core_aten():
+    """The pass does what it says: non-core in, Core ATen out.
+
+    Node count going *up* is the point rather than an incidental -- a
+    decomposition replaces one op with several, and a pass that left the count
+    alone would not have done anything. `aten.stack.default` becomes
+    `cat` + `view` and `aten.split.Tensor` becomes `split_with_sizes`, both
+    upstream's rules, neither written here.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["capture_reason"] is None, r["capture_reason"]
+    assert r["non_core_before"] == ["aten.split.Tensor", "aten.stack.default"], r
+    assert r["non_core_after"] == [], r["non_core_after"]
+    assert r["n_nodes"] == [7, 8], r["n_nodes"]
+    assert "aten.cat.default" in r["ops_after"], r["ops_after"]
+    assert "aten.split_with_sizes.default" in r["ops_after"], r["ops_after"]
+    # The record keeps its shape across the rewrite: same reader, same keys.
+    assert r["graph_keys"] == ["constants", "nodes", "outputs", "placeholders"]
+    assert r["guards"] == [
+        {"index": 0, "shape": [2, 4], "dtype": "torch.float32", "device": "cpu"}
+    ], r["guards"]
+    assert r["repr"].startswith("<DecomposedTrace 8 nodes, 1 inputs"), r["repr"]
+
+
+def test_decomposed_replay_matches_eager_bit_for_bit():
+    """The judgement. Lowering must not change the answer.
+
+    A decomposition is the same mathematics in a different order, and a
+    different order of floating-point operations is entitled to a different
+    last bit. So this is a measurement, not an assumption: on this trace, over
+    four inputs of which three the trace never saw, the lowered graph, the
+    captured graph and eager all produce **identical** lists. If that ever
+    stops being true the honest response is to record the size of the
+    difference here (docs/DEVICE.md §5 prefers a named exception to a
+    tolerance), not to widen the comparison.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert len(r["pairs"]) == 4
+    for lowered, captured, eager in r["pairs"]:
+        assert lowered == eager, (lowered, eager)
+        assert captured == eager, (captured, eager)
+    # And the guard is still a guard: lowering does not generalise a trace.
+    assert r["wrong_shape"] != "ACCEPTED"
+    assert "[2, 4]" in r["wrong_shape"], r["wrong_shape"]
+
+
+def test_decompose_refuses_by_name_what_it_cannot_lower():
+    """Three different ways to fail, and each one says the op it failed on.
+
+    Passing a non-core op through quietly is the expensive failure: ExecuTorch
+    rejects the program later, with nothing pointing at which op or which pass
+    was responsible. So each refusal names the op *and* which of the three
+    walls it hit -- no rule, the rule will not run here, or the rule disagreed
+    with the recording.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+
+    # 1. Nothing in the reachable table has a rule for it.
+    assert r["refuse_no_rule"] != "ACCEPTED"
+    assert "aten.transpose.int" in r["refuse_no_rule"], r["refuse_no_rule"]
+    assert "no rule" in r["refuse_no_rule"], r["refuse_no_rule"]
+
+    # 2. A rule exists and running it reaches something the shim lacks. The
+    #    refusal carries the underlying reason, so the gap is findable.
+    assert r["refuse_unrunnable"] != "ACCEPTED"
+    assert "aten.t.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "torch.transpose" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+
+
+def test_decompose_refuses_a_rule_that_disagrees_with_the_recording():
+    """The check that found a real bug rather than a missing feature.
+
+    `aten.sum.default` has a rule, it runs, and what it produces is not what
+    the recording says the op returned: shape `[3, 4]` against shape `[]`.
+    Upstream's rule rewrites `sum(x)` to `sum(x, dim=[])`, and an empty `dim`
+    list means *reduce every dimension* -- upstream returns a scalar 12.0 for
+    a 3x4 of ones. This shim's `aten.sum.dim_IntList` returns the input
+    unchanged for that argument.
+
+    So the pass is not merely refusing: it is refusing because it caught a
+    divergence that nothing else in this repository was looking at. Both halves
+    are asserted -- the refusal, and the shape that causes it -- so that fixing
+    the kernel turns this test red and says so.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    assert r["refuse_disagrees"] != "ACCEPTED"
+    assert "aten.sum.default" in r["refuse_disagrees"], r["refuse_disagrees"]
+    assert "shape [3, 4]" in r["refuse_disagrees"], r["refuse_disagrees"]
+    assert "shape []" in r["refuse_disagrees"], r["refuse_disagrees"]
+    # The divergence itself. Upstream: `[]`. Here: `[3, 4]`. When this becomes
+    # `[]`, the assertion above is the thing that has to be revisited.
+    assert r["sum_all_dims"] == [3, 4], r["sum_all_dims"]
+
+
+def test_capture_trace_hands_out_the_constants_it_burned_in():
+    """A rewrite needs the weights, and metadata is not the weights.
+
+    `CaptureTrace.constants` is shape/dtype/device -- enough to *read* a
+    trace, not enough to build a second one that computes the same thing.
+    `constant_values` is the other half, and it hands out the same references
+    replay uses rather than copies: two records of one region must not drift
+    apart from each other or from the module they came from.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+    w = _C._tensor_new_from_data([[1.0, 0.0], [0.0, 1.0]])
+    _C._capture_begin([a])
+    trace = _C._capture_end(d("aten.mm.default", a, w))
+
+    assert len(trace.constant_values) == len(trace.constants) == 1
+    held = trace.constant_values[0]
+    assert held is w
+    assert list(held.shape) == trace.constants[0]["shape"]
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -604,6 +604,22 @@ impl PyCaptureTrace {
         PyList::new(py, out)
     }
 
+    /// The constant tensors themselves, in the order `constants` describes
+    /// them.
+    ///
+    /// `constants` is metadata, which is all a *reader* of the trace needs.
+    /// Anything that rewrites the trace needs the objects: a pass that lowers
+    /// this record to another dialect has to carry the burned-in weights
+    /// across, and a Python-side pass cannot get at them through the metadata.
+    /// So this getter exists for exactly one caller shape -- a rewrite that
+    /// produces a new trace -- and hands out the same references replay uses,
+    /// not copies, because a copy would silently decouple the two records from
+    /// the weights and from each other.
+    #[getter]
+    fn constant_values<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(py, self.const_objects.iter().map(|c| c.clone_ref(py)))
+    }
+
     #[getter]
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let mut out = Vec::with_capacity(self.nodes.len());
