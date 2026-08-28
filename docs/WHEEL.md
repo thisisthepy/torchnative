@@ -441,12 +441,21 @@ TensorBase._is_zerotensor
 | `macosx_11_0_arm64` | ✅ | ✅ 깨끗한 venv 에 `pip install` (§2) | ✅ | ✅ `aten.mm`, `nn.Linear` |
 | `android_21_arm64_v8a` | ✅ | ✅ **에뮬레이터의 site-packages 에 언팩** (§7.3) | ✅ | ✅ `aten.mm`, `nn.Linear` |
 | `ios_12_0_arm64_iphoneos` | ✅ | ❌ 실기 없음 | ❌ | ❌ |
-| `ios_14_0_arm64_iphonesimulator` | ✅ | ❌ 시뮬레이터 하네스 없음 | ❌ | ❌ |
+| `ios_14_0_arm64_iphonesimulator` | ✅ | ✅ **시뮬레이터 CPython 의 site-packages 에 언팩** (§7.4) | ✅ | ✅ `aten.mm`, `nn.Linear` |
 
-**iOS 두 개에 대해 이 문서가 주장하는 것은 "아티팩트가 맞다" 까지입니다** — 태그가 설치기가
-매칭할 형태이고, 안의 바이너리가 진짜 그 플랫폼용이고, 기기용 쪽이 `Python.framework` 를
-링크한다는 것. **로드된다·임포트된다·계산한다는 어느 것도 측정하지 않았습니다.** iOS 확장을
-실행하려면 앱 번들과 서명이 필요하고 이 기계에 그 하네스가 없습니다.
+**시뮬레이터 칸은 채워졌습니다** (2026-08-28). `tools/wheel/verify_ios_sim.py` 가 시뮬레이터
+안에서 휠을 임포트하고 계산시키며, 값이 호스트와 정확히 일치합니다. 전체 기록은
+**`docs/IOS.md`** 에 있습니다.
+
+**실기(`ios_12_0_arm64_iphoneos`)에 대해 이 문서가 주장하는 것은 여전히 "아티팩트가 맞다"
+까지입니다** — 태그가 설치기가 매칭할 형태이고, 안의 바이너리가 진짜 그 플랫폼용이고,
+`Python.framework` 를 링크한다는 것. **로드·임포트·계산은 측정하지 않았습니다.**
+
+**그리고 시뮬레이터 결과가 실기 칸을 채워 주지 않습니다.** 둘은 Mach-O
+`LC_BUILD_VERSION.platform` 이 7 과 2 로 다른 별개 아티팩트이고, 링크 방식마저 다릅니다 —
+실기 쪽만 `Python.framework` 를 링크하고 시뮬레이터 쪽은 `-undefined dynamic_lookup` 으로
+해소합니다(§7.1). 서로 다른 메커니즘이라 한쪽의 성공이 다른 쪽의 근거가 되지 않습니다
+(`docs/IOS.md` §7).
 
 빈 칸을 채우는 방법은 §7.6 에 적어 두었습니다.
 
@@ -624,10 +633,21 @@ ModuleNotFoundError: No module named '_multiprocessing'
 이것을 진짜로 닫으려면 안드로이드 CPython 을 다시 빌드하거나 `torch/multiprocessing` 을
 지연 임포트로 바꿔야 하고, 둘 다 휠 작업의 몫이 아닙니다.
 
-### 7.4 iOS — 아티팩트까지가 답할 수 있는 전부다
+### 7.4 iOS — 시뮬레이터는 계산까지, 실기는 아티팩트까지
 
-실기도, 시뮬레이터 앱 하네스도 없으므로 **로드·임포트·계산은 측정하지 않았습니다.** 확인한
-것은 파일 안에 무엇이 들어 있는가입니다.
+**시뮬레이터는 더 이상 아티팩트 검사에 머물지 않습니다.** `tools/wheel/verify_ios_sim.py` 가
+시뮬레이터 CPython 의 site-packages 에 휠을 풀고, 시뮬레이터 프로세스 안에서 `import torch` 를
+시키고, `aten.mm`·`x+x`·`nn.Linear` 를 계산시킵니다. `dir(torch._C)` 1251 개와
+`dir(torch.ops.aten)` 896 개까지 호스트와 정확히 같습니다.
+
+iOS 배포본에는 실행 파일이 없어서(`Python.framework/Python` 은 `MH_DYLIB`) 하네스가
+`Py_BytesMain` 3줄로 시뮬레이터용 `python3.13` 을 직접 컴파일합니다. 그 런처는 **UIKit 를
+링크해야 합니다** — iOS 의 `platform.system()` 이 `UIDevice` 에 물어보는데, 맨
+`simctl spawn` 프로세스에는 UIKit 가 없어 `torch/__init__.py:370` 에서 죽습니다. 전체 기록과
+환경 변수 절제 측정은 **`docs/IOS.md`** 에 있습니다.
+
+**아래는 실기 쪽 이야기입니다.** 실기가 없으므로 **로드·임포트·계산은 측정하지 않았습니다.**
+확인한 것은 파일 안에 무엇이 들어 있는가입니다.
 
 ```
 torchnative-0.0.1a0-cp313-abi3-ios_12_0_arm64_iphoneos.whl
@@ -688,8 +708,9 @@ Mach-O 의 `LC_BUILD_VERSION.platform` — **디스크에 다른 아티팩트가
 
 | 빈 칸 | 필요한 것 |
 |---|---|
-| iOS 시뮬레이터 임포트 | 최소 앱 번들 + `xcrun simctl` 로 실행하는 하네스. `Python.framework` 를 번들에 넣고 휠을 그 앱의 `app_packages` 에 풀면 `verify_android.py` 와 같은 프로브를 돌릴 수 있습니다 |
-| iOS 실기 | 기기 · 프로비저닝 프로파일. 이 기계에 없습니다 |
+| ~~iOS 시뮬레이터 임포트~~ | **채워졌습니다** — `tools/wheel/verify_ios_sim.py`, `docs/IOS.md`. 앱 번들은 결국 필요 없었습니다: `Py_BytesMain` 으로 만든 최소 실행 파일을 `simctl spawn` 으로 돌리는 것으로 충분했고, 앱 번들보다 훨씬 쌉니다 |
+| iOS 실기 | 기기 · 프로비저닝 프로파일. 이 기계에 없습니다. 시뮬레이터 결과로 대신할 수 없습니다 (`docs/IOS.md` §7) |
+| iOS 실제 앱 번들 경로 | `Python.framework` 를 `Embed & Sign` 으로 넣고 앱 프로세스가 스스로 `Py_Initialize` 를 부르는 형태. rpath 해석이 `@executable_path/Frameworks` 로 바뀝니다 |
 | Android `_multiprocessing` | 배포본 재빌드, 또는 상류 `torch/multiprocessing` 지연 임포트 |
 | `pip install` 로서의 안드로이드 설치 | 기기용 pip. 지금은 언팩으로 대신하고 있고, 그 차이를 §7.3 이 적어 두었습니다 |
 
