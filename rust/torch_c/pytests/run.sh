@@ -51,9 +51,34 @@ fi
 # rebuild of dtype.rs reproduced the previous dylib exactly on this
 # toolchain), so a byte compare does not nag on a no-op rebuild the way an
 # mtime check would.
+#
+# `cmp` distinguishes three outcomes and this has to distinguish them too: 0 is
+# same, 1 is differ, anything above 1 is "the comparison itself failed". Reading
+# every non-zero as "stale" conflates the check with its own failure -- which
+# happened: under memory pressure from a concurrent build the kernel killed
+# `cmp` with SIGKILL, the guard read exit 137 as a difference, and the suite
+# refused with a message telling the reader to reinstall a shim that was already
+# current. That is the repeated defect of this repository wearing a new hat, so
+# the two are separated and only one of them is a staleness claim.
 vendor_dir=${TORCHNATIVE_VENDOR_DIR:-$repo_root/torchnative/src/main}
 vendor_shim="$vendor_dir/torch/_C.abi3.so"
-if [ -f "$vendor_shim" ] && ! cmp -s "$stage/_C.abi3.so" "$vendor_shim"; then
+if [ -f "$vendor_shim" ]; then
+    cmp -s "$stage/_C.abi3.so" "$vendor_shim" && cmp_status=0 || cmp_status=$?
+else
+    cmp_status=0
+fi
+if [ "$cmp_status" -gt 1 ]; then
+    cat >&2 <<EOF
+run.sh: refusing to run -- could not compare against $vendor_shim.
+
+\`cmp\` exited $cmp_status, which is neither "same" (0) nor "different" (1), so
+whether the vendored shim is current is unknown. This is not a staleness
+report. A SIGKILL here has meant memory pressure from a concurrent build;
+re-running once the machine is quieter has been enough.
+EOF
+    exit 1
+fi
+if [ "$cmp_status" -eq 1 ]; then
     cat >&2 <<EOF
 run.sh: refusing to run -- $vendor_shim is stale.
 
