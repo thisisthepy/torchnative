@@ -1453,7 +1453,15 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # implementation instead. It is the entire cost of the safetensors load
     # path; see `_frombuffer` in lib.rs and docs/CKPT.md.
     varfns.frombuffer = module._frombuffer
-    # `torch.get_default_dtype` is the third. It is not an aten op at all --
+    # `torch.asarray` is the third, and it is `frombuffer`'s sibling in every
+    # respect: no `aten::asarray` exists either (`torch.ops.aten.asarray` raises
+    # `AttributeError` on 2.13.0), so the refusal the loop installed named a
+    # work item that could never be closed. It is what safetensors' *default*
+    # backend calls -- `frombuffer` serves the `pread` and bytes backends -- so
+    # between the two, every safetensors route reaches a real reader. See
+    # `_asarray` in lib.rs and docs/CKPT2.md §4.
+    varfns.asarray = module._asarray
+    # `torch.get_default_dtype` is the fourth. It is not an aten op at all --
     # upstream binds `THPModule_getDefaultDtype` straight onto `_C`
     # (`torch/_C/__init__.pyi:1399`) *and* lists it among the variable
     # functions, so overload resolution was never going to find a table entry

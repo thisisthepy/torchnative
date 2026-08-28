@@ -36,18 +36,55 @@
 //! never filled. That makes the legacy order impossible to take by accident:
 //! anyone who later implements `_set_from_file` gets a refusal naming this
 //! invariant instead of a checkpoint of zeros.
+//!
+//! Note the shape of that invariant, because `from_file` below is the second
+//! thing that may set it: `filled` is not "one function may set this", it is
+//! **"only something that actually delivered bytes may set this"**. `_shim_fill`
+//! takes a buffer, `from_file` reads a file; a plain allocation sets nothing.
+//!
+//! # `from_file` and why a copy is the right answer
+//!
+//! `torch.load(mmap=True)` and safetensors' default backend both arrive at
+//! `UntypedStorage.from_file(path, shared, nbytes)`, and both pass
+//! `shared=False`, because `torch.serialization.get_default_mmap_options()` is
+//! `mmap.MAP_PRIVATE`. A private mapping is copy-on-write: measured on upstream
+//! 2.13.0, writing through one does not change the file, and a second mapping
+//! of the same file does not see the write. Its observable contents are exactly
+//! the file's bytes. So reading those bytes into a buffer is not an
+//! approximation of `shared=False` -- it is the same object, differing only in
+//! residency (eager and whole, rather than lazy and per page) and in
+//! `_get_filename()`, which upstream itself answers `None` for `shared=False`.
+//!
+//! `shared=True` is a different request and is refused by name. It means
+//! `MAP_SHARED`: writes must reach the file and other processes. A copy cannot
+//! do that, and quietly handing one back would be the same class of failure as
+//! the zeros above -- an answer that looks right until someone writes.
+//!
+//! Slices are real views. `torch/serialization.py:2115` cuts one storage per
+//! tensor out of the whole-file storage, so making each slice a copy would
+//! double the checkpoint in memory and, worse, would make `data_ptr()` --
+//! which upstream's loader uses to tell storages apart -- unrelated to where
+//! the bytes actually live. The buffer is behind an `Arc` and a view holds an
+//! offset into it, which is what a mapping's slice is.
+use std::sync::Arc;
+
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule};
+use pyo3::types::{PyBytes, PyModule, PySlice, PyType};
 
 use crate::device::PyDevice;
 use crate::err::not_implemented;
 
 #[pyclass(name = "StorageBase", module = "torch._C", subclass)]
 pub struct PyStorageBase {
-    buf: Vec<u8>,
+    /// The backing bytes, shared with any views taken of this storage.
+    buf: Arc<Vec<u8>>,
+    /// Where this storage starts inside `buf`. Non-zero only for a view.
+    off: usize,
+    /// How many bytes of `buf` this storage is.
+    len: usize,
     /// Whether bytes were ever written in. See the module docstring -- this is
     /// the guard that makes the copy/alias difference loud instead of silent.
-    /// Allocation does not set it; only `_shim_fill` does.
+    /// Allocation does not set it; only delivering bytes does.
     filled: bool,
     /// Storages are CPU-only here. `torch.load` asks for `device="meta"` when
     /// it is loading under a fake mode, and that is refused at construction
@@ -57,12 +94,41 @@ pub struct PyStorageBase {
 
 impl PyStorageBase {
     pub fn bytes(&self) -> &[u8] {
-        &self.buf
+        &self.buf[self.off..self.off + self.len]
     }
 
     pub fn is_filled(&self) -> bool {
         self.filled
     }
+}
+
+/// Build an instance of `cls` -- `torch.UntypedStorage`, normally -- holding a
+/// view of `parent`'s bytes.
+///
+/// It goes through `cls(0)` rather than `Py::new` so the result is an instance
+/// of the *Python* subclass: `torch/storage.py:836` checks
+/// `isinstance(wrap_storage, torch.UntypedStorage)` and a bare `StorageBase`
+/// would be rejected there. The Rust fields are then replaced, which is the
+/// only way to hand a subclass instance a buffer it did not allocate.
+fn view_of<'py>(
+    cls: &Bound<'py, PyType>,
+    parent: &PyStorageBase,
+    off: usize,
+    len: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let obj = cls.call1((0usize,))?;
+    {
+        let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
+        me.buf = Arc::clone(&parent.buf);
+        me.off = parent.off + off;
+        me.len = len;
+        // A view of bytes that arrived is bytes that arrived; a view of an
+        // allocation is still an allocation. Inheriting rather than asserting
+        // is what keeps `set_`'s guard meaningful one level down.
+        me.filled = parent.filled;
+        me.device = parent.device.clone();
+    }
+    Ok(obj)
 }
 
 #[pymethods]
@@ -88,7 +154,9 @@ impl PyStorageBase {
             }
         };
         Ok(Self {
-            buf: vec![0u8; size],
+            buf: Arc::new(vec![0u8; size]),
+            off: 0,
+            len: size,
             filled: false,
             device,
         })
@@ -96,22 +164,156 @@ impl PyStorageBase {
 
     /// Write the payload in. Not an upstream name: upstream fills a storage
     /// through `_set_from_file` / `_write_file` / the C++ reader, none of which
-    /// are implemented here. This is the one door, so `filled` cannot be set by
-    /// anything that did not actually deliver bytes.
+    /// are implemented here.
+    ///
+    /// Refuses on a storage that shares its buffer -- that is, on a view, or on
+    /// a storage some view was taken of. Upstream a write through either would
+    /// be seen by the other; here it would not, and a fill that is invisible to
+    /// half its aliases is the aliasing bug this module exists to make loud.
     fn _shim_fill(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
         let view = pyo3::buffer::PyBuffer::<u8>::get(data)?;
         let bytes = view.to_vec(data.py())?;
-        if bytes.len() != self.buf.len() {
+        if bytes.len() != self.len {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "torch._C shim: UntypedStorage._shim_fill got {} bytes for a \
                  storage of {} bytes",
                 bytes.len(),
-                self.buf.len()
+                self.len
             )));
         }
-        self.buf.copy_from_slice(&bytes);
+        let off = self.off;
+        let len = self.len;
+        let Some(buf) = Arc::get_mut(&mut self.buf) else {
+            return Err(not_implemented(
+                "torch._C shim: UntypedStorage._shim_fill on a storage whose \
+                 bytes are shared with a view -- this shim's views alias, so \
+                 the fill would be visible to some holders and not others. \
+                 Fill the storage before slicing it (see storage.rs)",
+            ));
+        };
+        buf[off..off + len].copy_from_slice(&bytes);
         self.filled = true;
         Ok(())
+    }
+
+    /// `torch.UntypedStorage.from_file(filename, shared=False, nbytes=0)`.
+    ///
+    /// The entry point `torch.load(mmap=True)` (`serialization.py:1594`) and
+    /// safetensors' default `mmap` backend both reach. See the module docstring
+    /// for why `shared=False` is answered with a read and `shared=True` is
+    /// refused rather than approximated.
+    ///
+    /// The two errors are upstream's, reproduced with upstream's wording
+    /// because a caller that catches on the message should not have to care
+    /// which torch it is talking to.
+    #[classmethod]
+    #[pyo3(signature = (filename, shared = false, nbytes = 0))]
+    fn from_file<'py>(
+        cls: &Bound<'py, PyType>,
+        filename: &str,
+        shared: bool,
+        nbytes: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if shared {
+            return Err(not_implemented(format!(
+                "torch._C shim: UntypedStorage.from_file({filename:?}, shared=True) \
+                 -- shared=True is MAP_SHARED, which requires writes through the \
+                 storage to reach the file and other processes. This shim's \
+                 storages are owned buffers and cannot do that; shared=False is \
+                 MAP_PRIVATE and is supported, which is what \
+                 torch.load(mmap=True) and safetensors both ask for"
+            )));
+        }
+        if nbytes < 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "unable to mmap {nbytes} bytes from file <{filename}>: Invalid argument (22)"
+            )));
+        }
+        let nbytes = nbytes as u64;
+        let meta = std::fs::metadata(filename).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "unable to open file <{filename}> in read-only mode: {} ({})",
+                io_reason(&e),
+                e.raw_os_error().unwrap_or(0)
+            ))
+        })?;
+        let size = meta.len();
+        if nbytes > size {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "file <{filename}> size <{size}> is smaller than the required \
+                 mapping size <{nbytes}>"
+            )));
+        }
+        let want = nbytes as usize;
+        let mut data = std::fs::read(filename).map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "unable to open file <{filename}> in read-only mode: {} ({})",
+                io_reason(&e),
+                e.raw_os_error().unwrap_or(0)
+            ))
+        })?;
+        // The file may have grown between the stat and the read; a mapping of
+        // `nbytes` sees only the first `nbytes` either way.
+        if data.len() < want {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "file <{filename}> size <{}> is smaller than the required \
+                 mapping size <{nbytes}>",
+                data.len()
+            )));
+        }
+        data.truncate(want);
+        let obj = cls.call1((0usize,))?;
+        {
+            let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
+            me.len = data.len();
+            me.off = 0;
+            me.buf = Arc::new(data);
+            // Bytes actually arrived, from the file the caller named. This is
+            // the second thing in this module allowed to set `filled`, and it
+            // qualifies for the same reason `_shim_fill` does.
+            me.filled = true;
+        }
+        Ok(obj)
+    }
+
+    /// `storage[i]` and `storage[a:b]`.
+    ///
+    /// An integer index answers a byte, as upstream's untyped storage does. A
+    /// slice answers a storage that *views* this one -- upstream's does too,
+    /// and `torch/serialization.py:2115` relies on the offset arithmetic being
+    /// real when it cuts one storage per tensor out of a whole-file mapping.
+    ///
+    /// A step other than 1 is upstream's own refusal, verbatim: a strided
+    /// storage has no representation on either side.
+    fn __getitem__<'py>(
+        slf: &Bound<'py, Self>,
+        idx: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let me = slf.borrow();
+        let len = me.len;
+        if let Ok(slice) = idx.cast::<PySlice>() {
+            let step = slice.getattr("step")?;
+            if !step.is_none() && step.extract::<i64>()? != 1 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Trying to slice with a step of {}, but only a step of 1 is supported",
+                    step.extract::<i64>()?
+                )));
+            }
+            let info = slice.indices(len as isize)?;
+            let (start, stop) = (info.start.max(0) as usize, info.stop.max(0) as usize);
+            let stop = stop.max(start);
+            return view_of(&slf.get_type(), &me, start, stop - start);
+        }
+        let i = idx.extract::<i64>()?;
+        let n = len as i64;
+        let at = if i < 0 { i + n } else { i };
+        if at < 0 || at >= n {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "index {i} out of range for storage of size {len}"
+            )));
+        }
+        let byte = me.buf[me.off + at as usize];
+        Ok(byte.into_pyobject(slf.py())?.into_any())
     }
 
     /// Readable from Python so the invariant in the module docstring can be
@@ -122,15 +324,44 @@ impl PyStorageBase {
     }
 
     fn nbytes(&self) -> usize {
-        self.buf.len()
+        self.len
     }
 
     fn size(&self) -> usize {
-        self.buf.len()
+        self.len
     }
 
     fn __len__(&self) -> usize {
-        self.buf.len()
+        self.len
+    }
+
+    /// `UntypedStorage.filename` reads this (`torch/storage.py:484`). Upstream
+    /// answers the path only for a storage made by `from_file(shared=True)`,
+    /// and `None` for everything else -- including `from_file(shared=False)`,
+    /// measured on 2.13.0. `shared=True` is refused here, so `None` is not a
+    /// stub: it is the same answer upstream gives to every storage this build
+    /// can construct.
+    fn _get_filename(&self) -> Option<String> {
+        None
+    }
+
+    /// `False`, and this is one of the places where the shim answers something
+    /// upstream does not.
+    ///
+    /// Measured on 2.13.0: `from_file(p, False, n).is_shared()` is `True` even
+    /// though the mapping is `MAP_PRIVATE` -- upstream is reporting "this came
+    /// from a file mapping", not "writes are shared" -- while a slice of it and
+    /// a plain `UntypedStorage(n)` are both `False`. This build's storage is an
+    /// owned buffer with no file behind it, so `False` is what is true of it.
+    /// Answering `True` to match the label would claim a relationship to a file
+    /// that does not exist.
+    ///
+    /// Nothing on the load path reads it; it is implemented because
+    /// `_StorageBase.is_shared` in the vendored tree is a bare
+    /// `raise NotImplementedError` with no message, which is the anonymous
+    /// refusal DESIGN.md §6 forbids and which cannot be fixed where it lives.
+    fn is_shared(&self) -> bool {
+        false
     }
 
     /// Upstream's untyped storage reports 1: it is a byte buffer, and the
@@ -139,11 +370,15 @@ impl PyStorageBase {
         1
     }
 
-    /// The address of the buffer. Real, and stable for the life of the storage,
-    /// because `torch/serialization.py` and `safetensors` both use it only to
-    /// tell two storages apart -- never to read through it.
+    /// The address of this storage's first byte. Real, and stable for the life
+    /// of the storage, because `torch/serialization.py` and `safetensors` both
+    /// use it only to tell two storages apart -- never to read through it.
+    ///
+    /// A view's address is the parent's plus its offset, which is what makes
+    /// two slices of one checkpoint distinguishable; that is the same relation
+    /// upstream's mapping has, measured.
     fn data_ptr(&self) -> usize {
-        self.buf.as_ptr() as usize
+        self.buf.as_ptr() as usize + self.off
     }
 
     #[getter]
@@ -180,9 +415,14 @@ impl PyStorageBase {
 
     fn __repr__(&self) -> String {
         format!(
-            "<torch._C.StorageBase {} bytes on {}{}>",
-            self.buf.len(),
+            "<torch._C.StorageBase {} bytes on {}{}{}>",
+            self.len,
             self.device,
+            if self.off == 0 {
+                String::new()
+            } else {
+                format!(", view at +{}", self.off)
+            },
             if self.filled { "" } else { ", unfilled" }
         )
     }
@@ -190,7 +430,19 @@ impl PyStorageBase {
     /// `bytes(storage)`, for tests and for anything that wants the payload back
     /// without going through a tensor.
     fn _shim_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.buf)
+        PyBytes::new(py, self.bytes())
+    }
+}
+
+/// The text upstream's `from_file` errors carry after "in read-only mode: ".
+/// It is `strerror(errno)`, and Rust's `Display` for `io::Error` appends
+/// " (os error N)" which upstream does not have, so the message is rebuilt
+/// rather than forwarded.
+fn io_reason(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
     }
 }
 

@@ -308,6 +308,66 @@ pub fn from_le_bytes(
     PyTensorBase::new(tensor)
 }
 
+/// The little-endian payload of a tensor, row-major -- `from_le_bytes`'s inverse.
+///
+/// The pair is used by `aten::view.dtype`, which reinterprets one dtype's bytes
+/// as another's. Going out through bytes and back in through `from_le_bytes`
+/// rather than converting element-wise is what makes the reinterpretation
+/// *exact*: `view` is a bit-level operation, and any route that passed through
+/// a numeric type would round.
+///
+/// Written as the mirror of `from_le_bytes` on purpose, including the dtype
+/// list -- the two are only usable together if they agree about which tags this
+/// build can hold, and `storage()` is the single place that decides.
+///
+/// `torch.bool` is emitted as the 0/1 bytes candle stores, which is what
+/// upstream's bool storage holds too (BOOL.md §2.6): measured, a `bool` tensor
+/// viewed as `uint8` upstream gives exactly 0s and 1s.
+///
+/// **The half-width floats are refused here, and the asymmetry is deliberate.**
+/// Getting at an `f16`/`bf16` tensor's bits through candle means naming the
+/// `half` crate's types, and this crate does not depend on `half` -- it arrives
+/// only as candle's own dependency, and CANDLE_DEPS.md is about not acquiring
+/// dependencies by accident. The refusal costs nothing on the path that
+/// exists: a checkpoint arrives as *bytes*, so `bf16` weights go
+/// `uint8 -> bf16` through `from_le_bytes`, which reads a raw buffer and never
+/// asks this function anything. Only the reverse direction --
+/// `bf16_tensor.view(torch.uint8)` -- is closed, and nothing has reached it.
+pub fn to_le_bytes(op: &str, tensor: &Tensor) -> PyResult<Vec<u8>> {
+    let flat = tensor
+        .flatten_all()
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(op, e))?;
+    macro_rules! pour {
+        ($ty:ty) => {{
+            let v = flat.to_vec1::<$ty>().map_err(|e| candle_err(op, e))?;
+            let mut out = Vec::with_capacity(v.len() * std::mem::size_of::<$ty>());
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out
+        }};
+    }
+    Ok(match flat.dtype() {
+        DType::U8 => flat.to_vec1::<u8>().map_err(|e| candle_err(op, e))?,
+        DType::U32 => pour!(u32),
+        DType::I16 => pour!(i16),
+        DType::I32 => pour!(i32),
+        DType::I64 => pour!(i64),
+        DType::F32 => pour!(f32),
+        DType::F64 => pour!(f64),
+        other => {
+            return Err(not_implemented(format!(
+                "{op}: torch._C shim cannot read the raw bytes of candle dtype \
+                 {other:?} -- reaching its bit pattern means naming the `half` \
+                 crate's types, which this crate deliberately does not depend on \
+                 (see tensor.rs::to_le_bytes). Reading a checkpoint *into* this \
+                 dtype goes the other way, through `from_le_bytes`, and works"
+            )))
+        }
+    })
+}
+
 /// The contiguous (row-major) stride for a shape, in elements.
 fn contiguous_stride(size: &[usize]) -> Vec<i64> {
     let mut stride = vec![1i64; size.len()];

@@ -2426,6 +2426,54 @@ def view_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.view.dtype ----------------------------------------------------------
+# The bit-reinterpreting `view`, which is *not* a cast: `1.0` viewed as int32 is
+# 1065353216, not 1. It is how safetensors' default backend spells a
+# checkpoint's dtype (docs/CKPT2.md §4), and the reason it needs comparing
+# against upstream rather than reasoning about is that every one of its answers
+# is a bit pattern -- an implementation that quietly converted instead of
+# reinterpreting would produce clean, plausible, wrong numbers.
+
+def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.view.dtype"
+    cases: list[Case] = []
+    # Widths 1/2/4/8 in both directions, so the last-dim arithmetic is checked
+    # narrowing and widening, plus same-width pairs where no shape changes.
+    plans = [
+        ("uint8", (24,), "float32", "the safetensors shape: bytes become floats"),
+        ("uint8", (2, 12), "float32", "only the last dim takes part"),
+        ("uint8", (2, 3, 4), "float32", "rank 3, last dim exactly one element wide"),
+        ("uint8", (16,), "int64", "widest widening this build can hold"),
+        ("float32", (6,), "uint8", "narrowing: each float becomes four bytes"),
+        ("float32", (6,), "int32", "same width, different family -- the bits, not the value"),
+        ("float32", (6,), "float64", "widening between floats"),
+        ("int64", (3,), "int16", "narrowing between integers"),
+        ("int32", (4,), "float32", "same width, integer to float"),
+        ("uint8", (0,), "float32", "empty is not an error upstream"),
+    ]
+    for src, shape, dst, note in plans:
+        numel = 1
+        for d in shape:
+            numel *= d
+        # Values chosen so consecutive elements differ: a kernel that returned
+        # the right shape but read from the wrong offset could otherwise pass
+        # on a buffer of repeated bytes.
+        flat = [(i * 7 + 1) % 251 for i in range(numel)]
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, src)
+        t_dt = dt.torch_dtype(torch_module, dst)
+        c_dt = dt.c_dtype(c_module, dst)
+        cases.append(
+            Case(
+                name=f"view.dtype({src}{tuple(shape)} -> {dst})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, c_dt),
+                note=note,
+            )
+        )
+    return cases
+
+
 # --- aten._to_copy.default ----------------------------------------------------
 # `float()`, `long()`, `to(dtype)` all dispatch to the same cast op.
 
@@ -7955,6 +8003,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.transpose.int": transpose_cases,
     "aten.unsqueeze.default": unsqueeze_cases,
     "aten.view.default": view_cases,
+    "aten.view.dtype": view_dtype_cases,
     "aten._to_copy.default": to_copy_cases,
     "aten.fill_.Scalar": fill__cases,
     "aten.copy_.default": copy__cases,

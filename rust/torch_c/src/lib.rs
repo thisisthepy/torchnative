@@ -398,6 +398,100 @@ fn _frombuffer(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
+/// `torch.asarray(obj, *, dtype=None, device=None, copy=None, requires_grad=False)`,
+/// narrowed to the one shape that reaches it: a storage.
+///
+/// Like `frombuffer` above, not an aten op -- `torch.ops.aten.asarray` does not
+/// exist on 2.13.0, the function is `torch::utils::asarray` behind
+/// `_C._VariableFunctions.asarray` -- so it is here rather than behind the
+/// dispatcher, for the same reason and with the same shared byte reader.
+///
+/// **Who calls it.** safetensors' default `mmap` backend, once per tensor.
+/// Measured by wrapping `torch.asarray` and running `safe_open(..., backend=
+/// "mmap")`: it is called with a `torch.UntypedStorage` and
+/// `dtype=torch.uint8`, plus `device="cpu"` on the `get_tensor` path. The
+/// result is then `.view(real_dtype).reshape(shape)`. Together with
+/// `UntypedStorage.from_file` and `aten::view.dtype` this is what the default
+/// `from_pretrained` route to a safetensors checkpoint costs; docs/CKPT2.md §4.
+///
+/// **The narrowing is real and is refused by name.** Upstream's `asarray` also
+/// takes tensors, sequences, scalars, numpy arrays and buffer objects, and
+/// implementing those would be re-deriving `torch.tensor`'s conversion rules
+/// with no measured caller -- docs/E2E_REAL.md §1.2 is about exactly that kind
+/// of speculative surface. Anything but a storage stops here with the type it
+/// was given and a pointer at the two functions that do take those.
+///
+/// **This copies; upstream aliases**, the same divergence `_frombuffer`
+/// records, and invisible for the same reason: the storage is read once while
+/// a checkpoint is being loaded and nothing writes through either handle.
+#[pyfunction]
+#[pyo3(signature = (obj, *, dtype = None, device = None, copy = None, requires_grad = false))]
+fn _asarray(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    dtype: Option<PyDtype>,
+    device: Option<&Bound<'_, PyAny>>,
+    copy: Option<bool>,
+    requires_grad: bool,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "torch.asarray";
+
+    if requires_grad {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}(requires_grad=True) -- there is no autograd behind this shim"
+        )));
+    }
+    if copy == Some(false) {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}(copy=False) -- upstream would alias the source's memory, and \
+             this shim's tensors own theirs (see `_frombuffer`). Refusing rather \
+             than copying, because a caller that asked for no copy asked for the \
+             aliasing, not for the values"
+        )));
+    }
+    if let Some(d) = device {
+        let label = d.str()?.to_string();
+        if label != "cpu" {
+            return Err(crate::err::not_implemented(format!(
+                "{OP}(device={label:?}) -- storages in this shim are CPU byte \
+                 buffers, so there is nothing to read on another device"
+            )));
+        }
+    }
+
+    let Ok(storage) = obj.extract::<PyRef<'_, crate::storage::PyStorageBase>>() else {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}: torch._C shim implements this only for a torch.UntypedStorage, \
+             which is the form safetensors calls it with; got {}. For a buffer use \
+             torch.frombuffer, for a sequence or scalar use torch.tensor",
+            obj.get_type().name()?,
+        )));
+    };
+
+    let tag = dtype
+        .ok_or_else(|| {
+            crate::err::not_implemented(format!(
+                "{OP}(storage) without dtype -- an untyped storage is bytes, so \
+                 there is no dtype to infer. safetensors always passes one"
+            ))
+        })?
+        .tag();
+    let bytes = storage.bytes();
+    let itemsize = tag.itemsize();
+    if bytes.len() % itemsize != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{OP}: storage of {} bytes is not a whole number of torch.{} elements \
+             ({itemsize} bytes each)",
+            bytes.len(),
+            tag.name()
+        )));
+    }
+    // Same byte reader as `frombuffer` and `TensorBase.set_`; see the comment
+    // at the end of `_frombuffer`.
+    let wrapped = crate::tensor::from_le_bytes(OP, bytes, &[bytes.len() / itemsize], tag)?;
+    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
+}
+
 /// The triple this artefact was built for. Three targets are cross-compiled and
 /// the results are indistinguishable once renamed to `_C.so`, so the build
 /// records it here rather than leaving it to be guessed from a file path.
@@ -505,6 +599,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
+    m.add_function(wrap_pyfunction!(_asarray, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;
     run_bootstrap(m)?;
     Ok(())

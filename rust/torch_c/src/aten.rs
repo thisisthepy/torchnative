@@ -148,6 +148,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.view.default",
+    "aten.view.dtype",
     "aten.where.self",
     "aten.zero_.default",
     "aten.zeros_like.default",
@@ -524,6 +525,52 @@ fn meta_dispatch(
                 }
             }
         }
+        // `aten::empty_like` on a meta input -- the op that carries a model off
+        // the meta device.
+        //
+        // `from_pretrained` builds the whole module tree under
+        // `init_empty_weights`, so every parameter and buffer starts on meta.
+        // Anything the checkpoint did not supply -- missing keys, and every
+        // non-persistent buffer, which is never in a checkpoint by definition
+        // -- is brought across by `torch.empty_like(param, device=...)` in
+        // `transformers/modeling_utils.py:4763,4771`. Without this the load
+        // reads the whole file and then stops one step before the model is
+        // usable, which is exactly where docs/CKPT2.md §3 found it.
+        //
+        // Shape, dtype and device rules are the dense kernel's, restated with
+        // the same helpers in the same argument order, for the reason
+        // docs/E2E_REAL.md §6.1 gives: a meta kernel that promises a different
+        // dtype than the dense one hands the caller an allocation the dense
+        // kernel then refuses to compute into.
+        //
+        // Like the dense kernel, "empty" answers zeros. That is safe *here*
+        // for a reason worth stating rather than assuming: every value this
+        // produces is overwritten before it is read -- missing keys by
+        // `_initialize_missing_keys`, non-persistent buffers by the module's
+        // own initialisation -- and if one ever were not, the zeros would
+        // reach the forward pass, where `pytests/test_shim.py` compares logits
+        // against upstream.
+        "aten.empty_like.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+            reject_unsupported(
+                op,
+                args,
+                kwargs,
+                &[(2, "layout"), (4, "pin_memory"), (5, "memory_format")],
+            )?;
+            let shape = input.dims().to_vec();
+            match device_arg_or_label(args, kwargs, 3, "device", &PyDevice::meta())? {
+                label if label.is_meta() => meta_result(py, shape, tag),
+                label => {
+                    let device = label.resolve()?;
+                    let storage = PyDtype::new(tag).storage(op)?;
+                    let out =
+                        Tensor::zeros(shape, storage, &device).map_err(|e| candle_err(op, e))?;
+                    finish(py, out, tag)
+                }
+            }
+        }
         // `aten::div.Scalar` and `aten::mul.Scalar` -- shape is the input's,
         // dtype is `arith_tag`'s.
         //
@@ -784,6 +831,7 @@ fn aten_dispatch_inner(
         "aten.expand.default" => expand_default(py, args, kwargs),
         "aten.reshape.default" => reshape_like(py, args, kwargs, "aten.reshape.default", "shape"),
         "aten.view.default" => reshape_like(py, args, kwargs, "aten.view.default", "size"),
+        "aten.view.dtype" => view_dtype(py, args, kwargs),
         // Upstream's `_unsafe_view` differs from `view` only in what it
         // promises the autograd engine about aliasing -- the value is
         // `view`'s. There is no autograd here, so it is the same kernel, and
@@ -4355,6 +4403,78 @@ fn expand_default(
         .broadcast_as(target)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
+}
+
+/// `aten::view.dtype(Tensor(a) self, ScalarType dtype) -> Tensor(a)` --
+/// reinterpret the bytes, do not convert the numbers.
+///
+/// This is how a safetensors checkpoint becomes tensors. safetensors' `mmap`
+/// backend hands torch a byte storage, makes a `uint8` tensor of it with
+/// `torch.asarray`, and then spells the dtype with `.view(dtype)`; measured
+/// with a `TorchDispatchMode` around `safe_open(...).get_tensor(k)`, the ops
+/// are `empty` / `set_` / `view.dtype` / `view.default`. So this is not a
+/// numeric op at all -- `1.0` viewed as `int32` is `1065353216`.
+///
+/// **The route is bytes out and bytes in**, `to_le_bytes` then
+/// `from_le_bytes`, which is the same function the `torch.load` reader and
+/// `torch.frombuffer` use. Anything that went through a numeric conversion
+/// instead would round, and a checkpoint reader that rounds is worse than one
+/// that refuses.
+///
+/// The three refusals are upstream's, measured on 2.13.0 including the C++
+/// spelling of the dtype names (`dtype.rs::cpp_name`):
+///
+/// ```text
+///   0-dim, different widths  self.dim() cannot be 0 to view Float as Byte ...
+///   last dim indivisible     self.size(-1) must be divisible by 4 to view Byte as Float ...
+///   last dim not packed      self.stride(-1) must be 1 to view Byte as Float ...
+/// ```
+///
+/// The last one is why this kernel checks a stride even though it then makes a
+/// contiguous copy. `stride(-1) == 1` is exactly the condition under which the
+/// copy and upstream's genuine view agree: the reinterpretation only merges or
+/// splits bytes *inside* the last dimension, so as long as that dimension is
+/// packed, reading row-major and re-reading gives the same bytes in the same
+/// places. Dropping the check would silently answer a shape upstream rejects.
+fn view_dtype(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.view.dtype";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let want = dtype_arg(args, kwargs, 1, "dtype")?.ok_or_else(|| missing(OP, "dtype"))?;
+    let have = input.tag();
+    let (old, new) = (have.itemsize(), want.itemsize());
+    let mut dims = input.dims().to_vec();
+
+    if old != new {
+        let (a, b) = (have.cpp_name(), want.cpp_name());
+        let Some(&last) = dims.last() else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "self.dim() cannot be 0 to view {a} as {b} (different element sizes)"
+            )));
+        };
+        if input.tensor()?.stride().last() != Some(&1) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "self.stride(-1) must be 1 to view {a} as {b} (different element \
+                 sizes), but got {}",
+                input.tensor()?.stride().last().copied().unwrap_or(0)
+            )));
+        }
+        if (last * old) % new != 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "self.size(-1) must be divisible by {} to view {a} as {b} \
+                 (different element sizes), but got {last}",
+                new / old
+            )));
+        }
+        *dims.last_mut().expect("checked non-empty above") = last * old / new;
+    }
+
+    let bytes = crate::tensor::to_le_bytes(OP, input.tensor()?)?;
+    let wrapped = crate::tensor::from_le_bytes(OP, &bytes, &dims, want)?;
+    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
 /// `reshape` and `view`. **They are the same kernel here and are not the same
