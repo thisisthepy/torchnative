@@ -373,7 +373,7 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 | **구간 자동 선택** | 없음. `begin`/`end` 를 사람이 부른다. 진짜 델리게이트는 "어디부터 어디까지" 를 스스로 정해야 하고, 그 정책은 아직 없다 |
 | **트레이스 직렬화** | 없음. 프로세스 밖으로 못 나간다. `.pte` 로 가려면 필요하다 |
 | **가드 캐시** | 없음. 같은 형태가 다시 들어와도 자동으로 재사용되지 않는다. 재사용은 호출자가 `replay` 를 부르는 것뿐 |
-| 분해 패스 (→ Core ATen) | **생겼다 — 부분적으로만 닿는다.** `torchnative.export.decompose`. 트레이스에 나타날 수 있는 non-core op 32 개 중 4 개를 낮추고, 나머지는 전부 이름과 원인을 대고 거절한다. 이 §5-1 이 지목한 `aten.t.default` 는 **아직 그 4 개가 아니다.** docs/DECOMP.md |
+| 분해 패스 (→ Core ATen) | **생겼다 — 부분적으로만 닿는다.** `torchnative.export.decompose`. 트레이스에 나타날 수 있는 non-core op 37 개 중 9 개를 낮추고, 나머지는 전부 이름과 원인을 대고 거절한다. 이 §5-1 이 지목한 `aten.t.default` 는 **이제 그 안에 있고**, §5-1 의 예제 모듈은 5 노드 전부가 Core ATen 으로 내려간다. docs/DECOMP.md |
 | stride / dim order | 없음 (§5-2). 이 층 밖 |
 | 파라미터 FQN | 없음 (§5-3) |
 | **멀티스레드** | 플래그는 전역, 레코더는 스레드 로컬. 스레드 A 가 기록 중일 때 스레드 B 의 op 은 **오염 없이 그냥 기록되지 않는다.** 단일 스레드에서만 검증했고, 다중 스레드 프로그램에서는 조용히 불완전한 트레이스가 나올 수 있다 |
@@ -388,12 +388,20 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 순서에 근거가 있습니다 — 각 단계가 다음 단계에 필요한 것을 만듭니다.
 
 1. ~~**분해 패스.**~~ **섰습니다 — docs/DECOMP.md.** 상류의 `torch/_decomp` 를 실행해서 낮추고,
-   `stack` · `split` · `detach` · `_unsafe_view` 넷이 Core ATen 으로 내려가며, 분해된 트레이스의
-   재생이 eager 와 비트 단위로 일치합니다. **다만 §5-1 이 지목한 `aten.t.default` 는 아직
-   안 됩니다** — 상류의 규칙이 실재하는데 두 가지 배선 결함(`overloads.json` 의 `torch.transpose`
-   누락, `_jit_get_operation` 의 오버로드 목록 붕괴)에 막혀 있고, 둘 다 DECOMP.md §3 · §4 에
-   이름이 있습니다. 그러므로 "Edge 로 갈 수 있다" 는 여전히 주장이고, 남은 거리는 DECOMP.md §7
-   입니다.
+   `stack` · `split` · `detach` · `_unsafe_view` · `sum` 에 더해 **`t` · `transpose` ·
+   `matmul` · `isin` 이 Core ATen 으로 내려갑니다.** 분해된 트레이스의 재생은 여전히 eager 와
+   비트 단위로 일치합니다 — 이번에는 데이터 이동뿐 아니라 산술을 하는 규칙 둘을 포함해서.
+
+   **§5-1 이 지목한 `aten.t.default` 가 열렸고, 이 §5-1 의 예제 모듈 전체가 내려갑니다**
+   (`permute · addmm · relu · permute · addmm` — 상류가 같은 모듈에 내놓는 것과 op 단위로 같음).
+   막고 있던 것은 세 가지 배선 결함이었고 셋 다 DECOMP.md §3 에 이름이 있습니다:
+   `_jit_get_operation` 의 오버로드 목록 붕괴, `overloads.json` 의 `torch.transpose`/`torch.permute`
+   누락, 그리고 패스가 규칙을 **기록된 kwarg 이름**으로 부르던 것. 여기에
+   `_dispatch_get_registrations_for_dispatch_key` 가 더해져 분해표가 224 → 414 로 늘었습니다.
+
+   그래도 "Edge 로 갈 수 있다" 는 여전히 주장입니다 — 남은 거리는 DECOMP.md §8 이고, 그중
+   가장 큰 것은 functionalization 입니다. 위 결과가 `permute` 인 것이 곧 그 항목의 크기입니다
+   (Edge 는 `permute_copy` 를 씁니다).
 2. **구간 선택과 가드 캐시.** 어디부터 어디까지 캡처할지, 그리고 가드가 맞으면 다시 캡처하지
    않는 것. 디코드 루프가 이것의 첫 수혜자입니다 (DESIGN.md §7 — 디코드는 같은 형태의 반복).
 3. **직렬화.** 트레이스를 프로세스 밖으로. `.pte` 로 가는 길이 여기를 지납니다.

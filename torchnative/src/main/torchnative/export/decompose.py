@@ -136,6 +136,12 @@ def _scan_core_tags(text: str) -> frozenset[str]:
                 else:
                     name, overload = signature, "default"
                 core.add(f"aten.{name}.{overload}")
+        elif line.startswith("#"):
+            # A comment at column 0 does not end an entry; YAML never sees it.
+            # No `core` tag sits behind one today (the yaml diff below would
+            # say so), but three `pointwise` tags do, and treating a comment as
+            # a terminator lost them from the shim's `OpOverload.tags`.
+            continue
         elif line and not line.startswith(" "):
             signature = None
     return frozenset(core)
@@ -154,11 +160,16 @@ def core_ops() -> frozenset[str]:
     op upstream's own file calls core.
 
     Reading the tags out of the vendored file rather than off
-    `torch.ops.aten.<op>.<ov>.tags` is not a preference: in this build those
-    tags are empty. `_get_operation_overload` in the `_C` shim returns `[]` for
-    every op, so `torch.Tag.core in op.tags` is False for all 120 implemented
-    ops -- a classifier that answers "nothing is core" and would make this pass
-    refuse the entire program. docs/DECOMP.md §2.
+    `torch.ops.aten.<op>.<ov>.tags` began as a necessity: `_get_operation_
+    overload` in the `_C` shim answered `[]` for every op, so
+    `torch.Tag.core in op.tags` was False for all 120 implemented ops and a
+    classifier built on it would call nothing core and refuse whole programs
+    (docs/DECOMP.md §2). The shim reads the file's real tags now, and the two
+    agree on every implemented op -- `test_core_ops_and_op_tags_agree` diffs
+    them, so this is a measured agreement and not a second copy of one answer.
+
+    The file stays the source here anyway, for the four ops above: an
+    `OpOverload.tags` classifier is the narrower set even upstream.
     """
     with open(_native_functions_path(), encoding="utf-8") as handle:
         return _scan_core_tags(handle.read())
@@ -491,6 +502,66 @@ def _resolve_meta(ref, builder, node_metas):
     return meta
 
 
+def _schema_of(op: str):
+    """The `FunctionSchema` for an `aten.<name>.<overload>` node, or None.
+
+    None when the shim has no text for it -- a placeholder schema answers
+    `arguments` with an empty list, which is indistinguishable from a nullary
+    op, so it has to be told apart here rather than silently used
+    (docs/SCHEMA.md §6).
+    """
+    import torch
+
+    parts = op.split(".")
+    if len(parts) != 3:
+        return None
+    namespace, name, overload = parts
+    schema = torch._C._get_schema(f"{namespace}::{name}", overload)
+    if schema is None or getattr(schema, "is_placeholder", False):
+        return None
+    return schema
+
+
+def _as_the_dispatcher_would_call_it(op, args, kwargs):
+    """Recorded `(args, kwargs)`, re-spelled in the schema's positional order.
+
+    **A decomposition is called positionally, and the recording is not.** The
+    shim's `torch.<fn>` resolver binds a call against the aten schema and
+    forwards it by *schema* name, so `torch.transpose(x, 0, 1)` is recorded as
+    `aten.transpose.int(self=%0, dim0=0, dim1=1)` -- and upstream's rule for
+    that op is `torch._refs.transpose(a, dim0, dim1)`, whose first parameter is
+    `a`. Calling it with the recording's kwargs raises `TypeError: transpose()
+    got an unexpected keyword argument 'self'`, which is what
+    `aten.t.default` -- the op docs/CAPTURE.md §5 named -- used to die of on
+    its *second* round, after its own rule had already succeeded.
+
+    Upstream never has this problem because the C++ dispatcher hands a kernel
+    its arguments positionally; the parameter names of a decomposition are its
+    own business. So this puts the call back into that shape: every argument
+    the schema declares before its `*` is passed by position, and only
+    genuinely kwarg-only ones stay named.
+
+    A kwarg the schema does not declare, or an op with no schema text, is left
+    exactly as recorded -- the pass then fails with the rule's own error rather
+    than with a rewrite this function invented.
+    """
+    if not kwargs:
+        return list(args), dict(kwargs)
+    schema = _schema_of(op)
+    if schema is None:
+        return list(args), dict(kwargs)
+    positional = [a.name for a in schema.arguments if not a.kwarg_only]
+    if not set(kwargs) <= {a.name for a in schema.arguments}:
+        return list(args), dict(kwargs)
+    remaining = dict(kwargs)
+    ordered = list(args)
+    for name in positional[len(args):]:
+        if name not in remaining:
+            break  # a defaulted argument was not passed; the rest must stay named
+        ordered.append(remaining.pop(name))
+    return ordered, remaining
+
+
 def _sub_capture(op, fn, args, kwargs, placeholders, sequence):
     """Run one upstream decomposition and record what it issued."""
     import torch
@@ -547,8 +618,9 @@ def _lower_node(node, builder, node_metas, table):
             order.append(ref)
         return made[ref]
 
-    args = [_walk(a, placeholder_for) for a in node["args"]]
-    kwargs = {k: _walk(v, placeholder_for) for k, v in node["kwargs"].items()}
+    args, kwargs = _as_the_dispatcher_would_call_it(op, node["args"], node["kwargs"])
+    args = [_walk(a, placeholder_for) for a in args]
+    kwargs = {k: _walk(v, placeholder_for) for k, v in kwargs.items()}
     sub = _sub_capture(
         op, fn, args, kwargs, [made[ref] for ref in order], node["sequence"]
     )

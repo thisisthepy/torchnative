@@ -1170,12 +1170,342 @@ def _aten_schema_index() -> dict:
         name, _, overload = head.partition(".")
         _ATEN_SCHEMA_INDEX[(f"aten::{name}", overload)] = f"aten::{text}"
         _ATEN_SCHEMA_NAMES.add(name)
+        # File order, not sorted: `OpOverloadPacket.overloads()` is a list and
+        # upstream's is registration order, which for aten is the order of this
+        # file. Nothing here depends on the order, and reproducing it costs
+        # nothing.
+        _ATEN_OVERLOADS_BY_NAME.setdefault(f"aten::{name}", []).append(overload)
     return _ATEN_SCHEMA_INDEX
 
 
 #: Every aten op *name* the file declares, ignoring overloads. Built with the
 #: index, and empty when there is no file.
 _ATEN_SCHEMA_NAMES: set = set()
+
+#: `aten::<name>` -> the overload names the file declares for it, `""` for the
+#: unnamed one (upstream's spelling; `OpOverloadPacket.overloads()` turns it
+#: into `"default"`). Built with the index, and the reason it exists is
+#: docs/DECOMP.md §3: `_jit_get_operation` used to answer `["default"]` for
+#: every packet, and `aten::transpose` has no `default` overload.
+_ATEN_OVERLOADS_BY_NAME: dict = {}
+
+
+def _aten_overload_names(qualname: str) -> list:
+    """What overloads `native_functions.yaml` declares for one packet.
+
+    Empty when the file does not declare the name at all -- which is a real
+    outcome and not an error: 176 of upstream's 1730 aten names are absent from
+    it (`_is_absent_inplace_variant` measures the same gap from the other
+    side), and every non-aten namespace is absent by construction.
+    """
+    _aten_schema_index()
+    return list(_ATEN_OVERLOADS_BY_NAME.get(qualname, ()))
+
+
+#: `(qualname, overload)` -> the tag *names* the file writes on that entry.
+_ATEN_TAGS: dict = {}
+#: Tag names the file used that `_C.Tag` has no member for. Read through
+#: `_C._shim_unknown_tags()`; an empty list is the claim that nothing was
+#: dropped, and a non-empty one names what was.
+_UNKNOWN_TAGS: set = set()
+
+
+def _scan_aten_tags() -> dict:
+    """The `tags:` line of every `- func:` entry.
+
+    `torchnative/export/decompose.py:_scan_core_tags` reads the same line for
+    `core` alone and documents the format: a flow scalar or a one-line flow
+    list, two spaces in, with zero block sequences across all 2584 entries of
+    2.13.0's file. This reads all of them rather than one, because the tag
+    upstream's export path asks about first is not `core` --
+    `torch/_decomp/__init__.py:57` reads `maybe_aliasing_or_mutating` to decide
+    whether an op may be preserved, and `_get_operation_overload` answering
+    `[]` made that question always false.
+
+    **Three tags are not on the line and are not optional.**
+    `torchgen/model.py:756-765` adds them while parsing, and an entry's real
+    tag set is the written ones plus these:
+
+        pt2_compliant_tag   every aten entry, unconditionally
+        out                 entries with an `out` argument
+        inplace             entries whose name ends in `_`
+
+    Measured: without them 0 of 118 implemented ops match upstream's
+    `OpOverload.tags`, because `pt2_compliant_tag` alone is on all of them.
+    """
+    if _ATEN_TAGS:
+        return _ATEN_TAGS
+    source = _native_functions_source()
+    if not os.path.isabs(source or ""):
+        return _ATEN_TAGS
+    try:
+        with open(source, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return _ATEN_TAGS
+    key = None
+    for line in lines:
+        if line.startswith("- func:"):
+            signature = line[len("- func:"):].strip()
+            head = signature.split("(", 1)[0]
+            name, _, overload = head.partition(".")
+            key = (f"aten::{name}", overload)
+            # torchgen/model.py:756-765, in its order.
+            implicit = ["pt2_compliant_tag"]
+            if _has_out_argument(signature):
+                implicit.append("out")
+            if _is_inplace_name(name):
+                implicit.append("inplace")
+            _ATEN_TAGS[key] = implicit
+        elif key is not None and line.startswith("  tags:"):
+            text = line[len("  tags:"):].split("#", 1)[0].strip().strip("[]")
+            written = [tag.strip() for tag in text.split(",") if tag.strip()]
+            _ATEN_TAGS[key] = written + _ATEN_TAGS[key]
+        elif line.startswith("#"):
+            # A comment at column 0 does not end the entry -- YAML does not see
+            # it at all. Treating it as a terminator is not hypothetical: the
+            # file puts a two-line comment between `rsub.Scalar` and its own
+            # `tags: pointwise`, and between the same pair for `sinh.out` and
+            # `tanh_backward.grad_input`. Those three were exactly the residual
+            # against upstream's `OpOverload.tags` before this line existed.
+            continue
+        elif line and not line.startswith(" "):
+            key = None
+    return _ATEN_TAGS
+
+
+#: `torchgen/model.py:2663`. The dunder in-place spellings are `__i<name>__`
+#: for exactly these, and nothing else -- `__int__` would be a false positive
+#: for a rule that only looked for a leading `i`, which is why torchgen keeps
+#: the list rather than the prefix.
+_AUGMENTED_ASSIGNMENT_NAMES = frozenset(
+    {"add", "sub", "mul", "div", "mod", "pow", "lshift", "rshift", "and",
+     "xor", "or"}
+)
+
+
+def _is_inplace_name(name: str) -> bool:
+    """`BaseOperatorName.parse(...).inplace` (`torchgen/model.py:2716`).
+
+    Two shapes, and the second is why this is not `name.endswith("_")`:
+    `aten::__iand__` is in place and does not end in a single underscore. Ten
+    of the file's entries are that shape.
+    """
+    match = re.match(r"^__([^_]+)__$", name)
+    if match is not None:
+        inner = match.group(1)
+        return inner.startswith("i") and inner[1:] in _AUGMENTED_ASSIGNMENT_NAMES
+    return name.endswith("_")
+
+
+def _has_out_argument(signature: str) -> bool:
+    """`FunctionSchema.is_out_fn()` (`torchgen/model.py:1688`).
+
+    Upstream's definition is quoted there and is *not* "an argument called
+    `out`": it is **any keyword-only argument that is mutable**. The names
+    differ -- `binary_cross_entropy_backward.grad_input` is an out function
+    whose out argument is called `grad_input` -- so a rule keyed on the name
+    misses those.
+
+    Read off the text rather than off a parsed `_Schema`, because this runs
+    while the index is being built and parsing 2584 schemas to answer one
+    question about each is the cost `_aten_schema_index` exists to avoid. The
+    close paren is found by depth, not by `rfind`: the return type of an out
+    function ends in `-> Tensor(a!)`, so the last `)` on the line is not the
+    one that closes the argument list.
+    """
+    open_paren = signature.find("(")
+    if open_paren < 0:
+        return False
+    depth, close_paren = 0, -1
+    for index in range(open_paren, len(signature)):
+        if signature[index] == "(":
+            depth += 1
+        elif signature[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = index
+                break
+    if close_paren < 0:
+        return False
+    seen_star = False
+    for chunk in _split_top_level(signature[open_paren + 1 : close_paren]):
+        chunk = chunk.strip()
+        if chunk == "*":
+            seen_star = True
+            continue
+        if seen_star and "!)" in chunk.split("=", 1)[0]:
+            return True
+    return False
+
+
+def _aten_tags(module, qualname: str, overload: str) -> list:
+    """`OpOverload.tags`, as `_C.Tag` members, from the file.
+
+    This answered `[]` for every op and docs/DECOMP.md §2 measured what that
+    cost: `torch.Tag.core in op.tags` was False for all 120 implemented ops, so
+    a classifier built on it would call nothing Core ATen and refuse whole
+    programs. `decompose.core_ops()` went around it by reading the same file
+    directly, which was right for that module and did nothing for the tree's
+    own readers -- `_should_decompose_because_unsafe_op` among them.
+
+    A tag name `_C.Tag` has no member for is dropped and recorded rather than
+    raised on: `Tag`'s members come from the vendored `.pyi`, so a mismatch
+    means the two halves of one upstream release disagree, and stopping
+    `import torch` over it would be out of proportion to a tag nobody reads.
+    `_C._shim_unknown_tags()` is how the drop is countable instead of silent.
+    """
+    tag_type = getattr(module, "Tag", None)
+    if tag_type is None:
+        return []
+    key = (qualname, "" if overload == "default" else overload)
+    tags = []
+    for name in _scan_aten_tags().get(key, ()):
+        member = getattr(tag_type, name, None)
+        if member is None:
+            _UNKNOWN_TAGS.add(name)
+            continue
+        tags.append(member)
+    return tags
+
+
+#: `<dispatch key>` -> `["aten::<name>[.<overload>]", ...]`, built on first use.
+_DISPATCH_REGISTRATIONS: dict = {}
+
+#: The keys `native_functions.yaml` is authoritative about. These four are
+#: *alias* keys: they say how an op is put together, not which backend runs it,
+#: so the file declaring them is a fact about the operator and not a claim
+#: about this build. Backend keys (`CPU`, `CUDA`, `MPS`, ...) are the opposite
+#: -- the file lists what upstream's C++ build registers, and answering with
+#: that here would claim 1500 kernels this shim does not have. Those are
+#: refused by name; see `_dispatch_registrations`.
+_FILE_DECLARED_DISPATCH_KEYS = (
+    "CompositeImplicitAutograd",
+    "CompositeImplicitAutogradNestedTensor",
+    "CompositeExplicitAutograd",
+    "CompositeExplicitAutogradNonFunctional",
+)
+
+
+def _scan_dispatch_registrations() -> dict:
+    """Which ops the file declares under each alias dispatch key.
+
+    A line scan, for `_aten_schema_index`'s reason (`pyyaml` is not a declared
+    dependency of this distribution). The format relied on is one more level
+    deep than the schema scan: entries begin at column 0 with `- func:`, their
+    properties are indented two spaces, and a `dispatch:` block's keys are
+    indented four. A key line may name several keys at once
+    (`CPU, CUDA: foo`).
+
+    **`CompositeImplicitAutograd` is not only what the file writes down.**
+    `torchgen/model.py:872` gives it to every entry that has no `dispatch:`
+    block at all and is neither `structured` nor a `structured_delegate` --
+    that default is where most CIA ops come from, and a scan that only looked
+    for the literal word would find a third of them.
+
+    Measured against upstream 2.13.0's dispatcher: this yields **743** aten
+    names and `_dispatch_get_registrations_for_dispatch_key` answers **744**,
+    with **zero** names on this side that are not on upstream's. The one
+    upstream has and the file does not is `aten::get_gradients`, a TorchScript
+    builtin -- the same 176-name gap `_is_absent_inplace_variant` documents,
+    seen from another side.
+    """
+    if _DISPATCH_REGISTRATIONS:
+        return _DISPATCH_REGISTRATIONS
+    for key in _FILE_DECLARED_DISPATCH_KEYS:
+        _DISPATCH_REGISTRATIONS[key] = []
+    source = _native_functions_source()
+    if not os.path.isabs(source or ""):
+        return _DISPATCH_REGISTRATIONS
+    try:
+        with open(source, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return _DISPATCH_REGISTRATIONS
+
+    state = {"name": None, "keys": set(), "dispatch": False,
+             "structured": False, "delegate": False, "in_block": False}
+
+    def flush():
+        name = state["name"]
+        if name is None:
+            return
+        keys = set(state["keys"])
+        if not state["dispatch"] and not state["structured"] and not state["delegate"]:
+            keys.add("CompositeImplicitAutograd")
+        for key in keys:
+            if key in _DISPATCH_REGISTRATIONS:
+                _DISPATCH_REGISTRATIONS[key].append(f"aten::{name}")
+
+    for line in lines:
+        if line.startswith("- func:"):
+            flush()
+            state.update(
+                name=line[len("- func:"):].strip().split("(", 1)[0],
+                keys=set(), dispatch=False, structured=False, delegate=False,
+                in_block=False,
+            )
+            continue
+        if state["name"] is None:
+            continue
+        if line.startswith("#"):
+            continue  # a column-0 comment does not end an entry -- see
+            # `_scan_aten_tags`, where treating it as one lost three tags
+        if line and not line.startswith(" "):
+            flush()
+            state["name"] = None
+            continue
+        stripped = line.strip()
+        if line.startswith("  ") and not line.startswith("   "):
+            state["in_block"] = False
+            property_name = stripped.split(":", 1)[0]
+            if property_name == "dispatch":
+                state["dispatch"] = True
+                state["in_block"] = True
+            elif property_name == "structured":
+                state["structured"] = stripped.split(":", 1)[1].strip() == "True"
+            elif property_name == "structured_delegate":
+                state["delegate"] = True
+            continue
+        if state["in_block"] and stripped and not stripped.startswith("#"):
+            for key in stripped.split(":", 1)[0].split(","):
+                state["keys"].add(key.strip())
+    flush()
+    return _DISPATCH_REGISTRATIONS
+
+
+def _dispatch_registrations(key: str) -> list:
+    """`torch._C._dispatch_get_registrations_for_dispatch_key`, from the file.
+
+    docs/DECOMP.md §3 named this function as what costs the decomposition table
+    its CompositeImplicitAutograd half: `CustomDecompTable.__init__` enumerates
+    every CIA registration through it, so `core_aten_decompositions()` raised
+    here and the pass fell back to the post-autograd table.
+
+    The list this returns is a statement about *upstream's operators*, not
+    about this build's kernels, and the caller uses it that way:
+    `torch/_export/utils.py:1298 _materialize_cpp_cia_ops` only walks the names
+    to force `torch.ops.aten.<name>.<overload>` into existence, and the filter
+    that decides whether an op is really CIA *here* is `_is_cia_op`, which asks
+    `op.py_kernels` -- a Python-side registration this tree does make. So a
+    generous materialisation list cannot smuggle anything in; it can only fail
+    to mention something.
+
+    Backend keys are refused rather than answered. See
+    `_FILE_DECLARED_DISPATCH_KEYS`.
+    """
+    name = getattr(key, "name", key)
+    registrations = _scan_dispatch_registrations()
+    if name not in registrations:
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: "
+            f"_dispatch_get_registrations_for_dispatch_key({name!r}). "
+            f"native_functions.yaml is authoritative for the alias keys "
+            f"{', '.join(_FILE_DECLARED_DISPATCH_KEYS)}, and answering for a "
+            f"backend key from the same file would claim kernels this build "
+            f"does not have"
+        )
+    return list(registrations[name])
 
 
 def _is_absent_inplace_variant(qualname: str) -> bool:
@@ -3446,6 +3776,11 @@ def _install_dispatch_keys(module) -> None:
     # conservatively, because a `True` there would claim a specific kernel.
     module._dispatch_has_kernel_for_dispatch_key = lambda *a, **k: False
     module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
+    # "Which ops are registered under this key?" Answered from
+    # `native_functions.yaml` for the four alias keys it declares, and refused
+    # by name for backend keys. docs/DECOMP.md §3 -- this is what
+    # `core_aten_decompositions()` stopped at.
+    module._dispatch_get_registrations_for_dispatch_key = _dispatch_registrations
 
     # A `DispatchKeySet` *value*, not a function.
     # `torch/_subclasses/functional_tensor.py:146` does
@@ -4026,13 +4361,56 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     _install_library(module, schemas)
 
     # -- op registry ------------------------------------------------------
+    def _overload_names(qualname):
+        """The overload names of one packet, from every table that knows any.
+
+        **This used to be `["default"]` for every op, and docs/DECOMP.md §3 is
+        what that cost.** `torch/_decomp/__init__.py:82` expands a
+        packet-level `@register_decomposition(aten.transpose)` by calling
+        `packet.op_overloads()`, which walks exactly this list -- so with
+        `["default"]` in it, upstream's rule for `transpose` landed on
+        `aten.transpose.default`, an overload that does not exist. The rule was
+        in the tree, under a name nothing would ever look up. Measured: 592
+        registry entries here against upstream's 1097, and 525 of ours ended in
+        `.default` against upstream's 456.
+
+        Three sources, unioned, because no one of them is complete:
+
+        1. `native_functions.yaml`, which is authoritative for the 1554 aten
+           names it declares and says nothing about the other 176;
+        2. `schemas` -- `_TRANSCRIBED_SCHEMAS` plus every `Library.define()`
+           the tree has made so far, which is where `prims::` and
+           `_c10d_functional::` overloads come from and where the generated
+           `.out` variants the file does not carry come from;
+        3. `transcribed` -- `overloads.json` and `methods.json`.
+
+        Falling back to `["default"]` when all three are silent keeps the
+        registry open (docs/SCHEMA.md §12): a name nobody has declared still
+        yields a callable, and `_aten_dispatch` refuses it at call time with
+        the op named. What is *not* done is the reverse -- adding `default` to
+        a packet whose overloads are known. That is the bug being fixed, and
+        re-adding it "for safety" would put every packet-level rule back on the
+        non-existent key.
+        """
+        known: list = []
+        for overload in _aten_overload_names(qualname):
+            if overload not in known:
+                known.append(overload)
+        for table in (schemas, transcribed):
+            for entry_name, entry_overload in table:
+                if entry_name == qualname and entry_overload not in known:
+                    known.append(entry_overload)
+        return known or ["default"]
+
     def _jit_get_operation(qualname):
         if "::" not in qualname:
             raise RuntimeError(f"torch._C shim: not a qualified op name: {qualname}")
         name = qualname.split("::", 1)[1]
         if _is_refused_op_name(name) or _is_absent_op(qualname):
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
-        return _op_callable(dispatch, qualname, ""), ["default"]
+        return _op_callable(dispatch, qualname, ""), _overload_names(qualname)
+
+    module._shim_overload_names = _overload_names
 
     def _get_operation_overload(qualname, overload):
         name = qualname.split("::", 1)[-1]
@@ -4043,7 +4421,9 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         def op_dk(dispatch_key, *args, **kwargs):
             return op(*args, **kwargs)
 
-        return op, op_dk, []
+        return op, op_dk, _aten_tags(module, qualname, overload)
+
+    module._shim_unknown_tags = lambda: sorted(_UNKNOWN_TAGS)
 
     # Handed out when there is no text. Kept so that the ones given away can be
     # listed -- `_shim_placeholder_schemas()` is to schema text what

@@ -100,7 +100,17 @@
     "    about a schema that resolves to a kernel this shim will never reach.",
     "    `mean` does not have this gap -- `mean(x, out=o)` (no `dim`) resolves",
     "    to `mean.dtype_out`, a real reachable overload -- so `mean` lists all",
-    "    four."
+    "    four.",
+    "",
+    "`transpose`, `permute` and `sub` came from docs/DECOMP.md §4: they are",
+    "not names a model path calls, they are names *upstream's own",
+    "decomposition rules* call while the decomposition pass runs them. The",
+    "rule for `aten.t.default` calls `torch.transpose`, the rule for",
+    "`aten.transpose.int` calls `torch.permute`, and the rule for",
+    "`aten.rsub.Scalar` calls `torch.sub`. Every one of the three names an",
+    "aten key this shim already implements, so the entry is the whole fix --",
+    "no kernel is invented. `sub` mirrors `add` above and omits",
+    "`sub.Scalar_out` for the same reason `add` omits `add.Scalar_out`."
   ],
 
   "arange": [
@@ -359,5 +369,19 @@
   "masked_select": [
     "aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
+  ],
+
+  "transpose": [
+    "aten::transpose.int(Tensor(a) self, int dim0, int dim1) -> Tensor(a)"
+  ],
+
+  "permute": [
+    "aten::permute(Tensor(a) self, int[] dims) -> Tensor(a)"
+  ],
+
+  "sub": [
+    "aten::sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
+    "aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+    "aten::sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
   ]
 }
