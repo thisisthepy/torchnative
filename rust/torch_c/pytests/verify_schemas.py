@@ -30,9 +30,11 @@ Exit code is 0 iff every entry matched. Read the exit code; do not grep.
 from __future__ import annotations
 
 import ast
+import functools
 import json
 import os
 import re
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +108,7 @@ BOOTSTRAP = os.path.join(SRC, "bootstrap.py")
 NON_ATEN_NAMESPACES = ("_c10d_functional", "_c10d_functional_autograd", "_dtensor")
 
 
-def _non_aten_schema_table() -> list:
+def _literal_table(name: str) -> list:
     with open(BOOTSTRAP, encoding="utf-8") as fh:
         source = fh.read()
     tree = ast.parse(source)
@@ -114,9 +116,63 @@ def _non_aten_schema_table() -> list:
         if not isinstance(node, ast.Assign):
             continue
         targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-        if "_NON_ATEN_SCHEMA_TEXT" in targets:
+        if name in targets:
             return list(ast.literal_eval(node.value))
-    raise RuntimeError(f"_NON_ATEN_SCHEMA_TEXT not found in {BOOTSTRAP}")
+    raise RuntimeError(f"{name} not found in {BOOTSTRAP}")
+
+
+def _non_aten_schema_table() -> list:
+    return _literal_table("_NON_ATEN_SCHEMA_TEXT")
+
+
+def check_generated_aten(torch) -> tuple[int, int]:
+    """`_GENERATED_ATEN_SCHEMA_TEXT`, the other half of the same problem.
+
+    `native_functions.yaml` declares 2584 aten schemas and upstream's registry
+    has 3754; the difference is what `torchgen/native_function_generation.py`
+    synthesises at build time. That generator is vendored and cannot be run
+    here (it parses the YAML, and `pyyaml` is not a dependency of this
+    distribution), so the handful of generated schemas the tree asks questions
+    about are transcribed. Transcribed means checked -- same as the `c10d`
+    table above.
+
+    Both directions again, but the reverse direction is a different claim:
+    every entry has to be an operator upstream *and* has to be one
+    `native_functions.yaml` does not carry. An entry the file does carry is
+    dead weight that would silently shadow the file's own text.
+    """
+    table = _literal_table("_GENERATED_ATEN_SCHEMA_TEXT")
+    declared = set()
+    yaml_path = os.path.join(
+        HERE, os.pardir, os.pardir, os.pardir, "torchnative", "src", "main",
+        "torchgen", "packaged", "ATen", "native", "native_functions.yaml")
+    if os.path.isfile(yaml_path):
+        with open(yaml_path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("- func:"):
+                    declared.add(line[len("- func:"):].strip().split("(", 1)[0])
+
+    failures = 0
+    for text in table:
+        head = text.split("(", 1)[0].strip()
+        _, _, rest = head.rpartition("::")
+        op, overload = _aten_name(text)
+        try:
+            upstream = str(getattr(getattr(torch.ops.aten, op), overload)._schema)
+        except Exception as exc:  # noqa: BLE001
+            failures += 1
+            print(f"FAIL generated aten {rest}: upstream has no such operator: {exc}")
+            continue
+        if _normalise(upstream) != _normalise(text):
+            failures += 1
+            print(f"FAIL generated aten {rest}:")
+            print(f"     table:    {text}")
+            print(f"     upstream: {upstream}")
+        if declared and rest in declared:
+            failures += 1
+            print(f"FAIL generated aten {rest}: native_functions.yaml declares "
+                  "this, so the entry shadows the file rather than filling a gap")
+    return len(table), failures
 
 
 def check_non_aten(torch) -> tuple[int, int]:
@@ -164,6 +220,232 @@ def _normalise(schema: str) -> str:
     return re.sub(r"\s+", " ", schema).strip()
 
 
+# ---------------------------------------------------------------------------
+# What the shim actually answers (docs/SCHEMA.md)
+# ---------------------------------------------------------------------------
+#
+# The three checks above compare *tables* against upstream. A table can be
+# right and the answer still wrong: docs/DISTRIBUTED.md §8.1 is exactly that
+# case, `overloads.json` matching upstream 255/255 while
+# `torch.ops.aten.add_.Tensor._schema.is_mutable` was False, because the
+# schema the tree reads never came from a table at all. So this asks the shim
+# itself, in a subprocess with the vendored tree on the path, and diffs.
+#
+# It must be a subprocess: this script needs *upstream* torch importable, and
+# the shim needs the vendored tree, and one interpreter cannot have both --
+# the same reason `tools/golden/compare.py` goes to a second process.
+
+REPO_ROOT = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir, os.pardir))
+VENDOR_DIR = os.path.join(REPO_ROOT, "torchnative", "src", "main")
+VENDOR_SHIM = os.path.join(VENDOR_DIR, "torch", "_C.abi3.so")
+
+_SHIM_REPORT_SCRIPT = r"""
+import json, os, sys
+import torch
+
+# `import torch` alone reaches no placeholder predicate. The reads happen in
+# the modules that *probe* the registry -- `torch/distributed/tensor/_ops/
+# autogen.py` synthesises `<base>_` and `<base>_functional` per op and asks each
+# one `is_mutable` -- so the check below is vacuous unless they are imported.
+# This is the same trap as `check_non_aten` importing
+# `torch.distributed._functional_collectives` to make upstream's own registry
+# have the namespace at all.
+out = {"probed": []}
+for name in ("torch._refs", "torch._decomp", "torch._prims",
+             "torch._meta_registrations", "torch._subclasses.functional_tensor",
+             "torch.distributed.tensor", "torch.distributed.tensor._ops.autogen",
+             "torch._functorch.partitioners", "torch._inductor.ir"):
+    try:
+        __import__(name)
+    except Exception as error:  # noqa: BLE001
+        out["probed"].append(f"{name}: {type(error).__name__}: {error}")
+    else:
+        out["probed"].append(name)
+
+out["source"] = torch._C._shim_schema_source()
+out["ops"] = {}
+
+# Every `- func:` the file declares, as this shim re-prints it. 2584 entries,
+# so this is the only check that reaches all five normalisation rules -- the
+# implemented 117 exercise three of them and the transcribed tables exercise
+# the same three.
+declared = {}
+if os.path.isabs(out["source"]):
+    with open(out["source"], encoding="utf-8") as handle:
+        for line in handle:
+            if not line.startswith("- func:"):
+                continue
+            head = line[len("- func:"):].strip().split("(", 1)[0]
+            name, _, overload = head.partition(".")
+            key = f"aten::{name}|{overload}"
+            declared[key] = {
+                "text": str(torch._C._get_schema(f"aten::{name}", overload)),
+                "from": torch._C._shim_schema_provenance(f"aten::{name}", overload),
+            }
+out["declared"] = declared
+for key in torch._C._aten_implemented():
+    namespace, _, rest = key.partition(".")
+    name, _, overload = rest.rpartition(".")
+    schema = getattr(getattr(torch.ops, namespace), name)
+    schema = getattr(schema, overload)._schema
+    out["ops"][key] = {
+        "text": str(schema),
+        "is_mutable": schema.is_mutable,
+        "placeholder": schema.is_placeholder,
+    }
+out["unanswered"] = torch._C._shim_unanswered_predicates()
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _shim_report():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _SHIM_REPORT_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"shim subprocess exited {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
+    return json.loads(proc.stdout)
+
+
+def check_shim_schemas(torch) -> tuple[int, int]:
+    """Every implemented op's `_schema`, character for character, plus
+    `is_mutable`.
+
+    The judgement docs/DISTRIBUTED.md §8.1 set. `is_mutable` is checked
+    separately from the text rather than being taken as implied by it, because
+    the two failures this predicate has had were both invisible in the text:
+    it was a bound method (always truthy), then a property over an empty
+    argument list (always False).
+    """
+    report = _shim_report()
+    if not os.path.isabs(report["source"]):
+        print(f"FAIL shim schemas: no schema source -- {report['source']}")
+        return 1, 1
+    failures = 0
+    for key, entry in sorted(report["ops"].items()):
+        _, _, rest = key.partition(".")
+        op, _, overload = rest.rpartition(".")
+        upstream = getattr(getattr(torch.ops.aten, op), overload)._schema
+        if entry["placeholder"]:
+            failures += 1
+            print(f"FAIL shim schemas {key}: still a placeholder")
+            continue
+        if _normalise(entry["text"]) != _normalise(str(upstream)):
+            failures += 1
+            print(f"FAIL shim schemas {key}:")
+            print(f"     shim:     {entry['text']}")
+            print(f"     upstream: {upstream}")
+        if entry["is_mutable"] != upstream.is_mutable:
+            failures += 1
+            print(f"FAIL shim schemas {key}: is_mutable is "
+                  f"{entry['is_mutable']}, upstream says {upstream.is_mutable}")
+    # The predicate must be able to take both values over this set. A run where
+    # every op agrees with upstream *and* every op answers the same thing would
+    # pass the loop above while reproducing the defect, if upstream's answer
+    # were ever uniform.
+    answers = {entry["is_mutable"] for entry in report["ops"].values()}
+    if answers != {True, False}:
+        failures += 1
+        print(f"FAIL shim schemas: is_mutable took only {answers} over "
+              f"{len(report['ops'])} ops -- a constant predicate")
+    return len(report["ops"]), failures
+
+
+def check_declared_schemas(torch) -> tuple[int, int]:
+    """All 2584 `- func:` entries, re-printed and diffed against upstream.
+
+    This is the check the re-printer needs and the other two do not provide.
+    `check_shim_schemas` covers the implemented 117 and the in-repo round-trip
+    test covers the 173 in the transcribed tables; between them they exercise
+    three of the five normalisation rules (float defaults, string quoting,
+    enum-valued defaults). The list-broadcast rule -- `SymInt[2] stride=1` ->
+    `[1, 1]`, and the `int[N>1]` exception that keeps `int[2] padding=0` a
+    scalar -- appears on 101 arguments, none of them in either of those sets.
+    Deleting it would leave both green.
+
+    Residual was 165/2584 before the re-printer and is 0 after.
+    """
+    report = _shim_report()
+    declared = report.get("declared") or {}
+    if not declared:
+        print("FAIL declared schemas: the shim reported no native_functions.yaml")
+        return 1, 1
+    failures = 0
+    for key, entry in sorted(declared.items()):
+        qualname, _, overload = key.partition("|")
+        op = qualname[len("aten::"):]
+        try:
+            upstream = str(getattr(getattr(torch.ops.aten, op),
+                                   overload or "default")._schema)
+        except Exception:  # noqa: BLE001 -- declared here, not registered
+            # upstream. `_foreach_*` entries behind a build flag land here.
+            continue
+        if _normalise(entry["text"]) != _normalise(upstream):
+            failures += 1
+            print(f"FAIL declared schemas {op}.{overload or 'default'}:")
+            print(f"     shim:     {entry['text']}")
+            print(f"     upstream: {upstream}")
+        elif entry["from"] != "native_functions.yaml":
+            failures += 1
+            print(f"FAIL declared schemas {op}.{overload or 'default'}: the file "
+                  f"declares this and `{entry['from']}` answered instead, so the "
+                  "re-printer was not exercised")
+    return len(declared), failures
+
+
+def check_unanswered(torch) -> tuple[int, int]:
+    """No operator upstream has may be answered from an empty schema.
+
+    A placeholder answers `is_mutable` with False and records the fact
+    (`_C._shim_unanswered_predicates()`). That is tolerable exactly while the
+    ops involved do not exist -- upstream raises AttributeError at the packet
+    and the caller's guard takes the same branch. The moment one of them is a
+    real operator, `False` is a claim about it, which is how
+    `aten::native_dropout_backward.out` (mutable upstream) was being answered.
+
+    So the check is: for every recorded pair, upstream must have no such
+    operator. This is the direction the in-repo test cannot take, because it is
+    the one that needs a real torch.
+    """
+    report = _shim_report()
+    failures = 0
+    pairs = report["unanswered"]
+    # Which probing imports actually landed. Not decoration: some of these fail
+    # in this build (`torch._inductor.ir` reaches an `_Unimplemented`), and if
+    # they all failed the check below would be vacuously green over an empty
+    # set. Printed rather than asserted, because which of them import is a
+    # property of the shim's coverage and moves on its own.
+    landed = [name for name in report["probed"] if ":" not in name]
+    print(f"    probes that imported: {len(landed)}/{len(report['probed'])}")
+    for entry in report["probed"]:
+        if ":" in entry:
+            print(f"      (not probed) {entry.split(':')[0]}")
+    if not landed:
+        print("FAIL unanswered: no probing import landed, so the set is empty "
+              "for the wrong reason")
+        return 0, 1
+    for spelling, predicate in pairs:
+        qualname, _, overload = spelling.partition(".")
+        namespace, _, name = qualname.partition("::")
+        try:
+            packet = getattr(getattr(torch.ops, namespace), name)
+            upstream = getattr(packet, overload or "default")._schema
+        except Exception:  # noqa: BLE001 -- no such operator, which is the pass
+            continue
+        failures += 1
+        print(f"FAIL unanswered {spelling}: upstream has this operator, and "
+              f"`{predicate}` was answered here from an empty schema")
+        print(f"     upstream: {upstream}")
+        print(f"     add it to _GENERATED_ATEN_SCHEMA_TEXT in bootstrap.py")
+    return len(pairs), failures
+
+
 def main() -> int:
     try:
         import torch
@@ -185,6 +467,38 @@ def main() -> int:
     print(f"  bootstrap.py _NON_ATEN_SCHEMA_TEXT: {checked - failures}/{checked} matched")
     total += checked
     failed += failures
+
+    checked, failures = check_generated_aten(torch)
+    print(f"  bootstrap.py _GENERATED_ATEN_SCHEMA_TEXT: "
+          f"{checked - failures}/{checked} matched")
+    total += checked
+    failed += failures
+
+    # The tables are not the answer; what the shim hands the tree is. Needs a
+    # built vendored shim, which is a separate build step (`install_shim.sh`),
+    # so its absence is reported rather than treated as a pass.
+    if os.path.isfile(VENDOR_SHIM):
+        checked, failures = check_shim_schemas(torch)
+        print(f"  shim _schema text and is_mutable: "
+              f"{checked - failures}/{checked} matched upstream")
+        total += checked
+        failed += failures
+
+        checked, failures = check_declared_schemas(torch)
+        print(f"  native_functions.yaml re-printed: "
+              f"{checked - failures}/{checked} matched upstream")
+        total += checked
+        failed += failures
+
+        checked, failures = check_unanswered(torch)
+        print(f"  predicates answered without text: {checked}, "
+              f"{checked - failures}/{checked} about ops upstream does not have")
+        total += checked
+        failed += failures
+    else:
+        print(f"  shim _schema text: SKIPPED -- no {VENDOR_SHIM}")
+        print("    (run vendor/install_shim.sh; this is the check that would "
+              "have caught docs/DISTRIBUTED.md §8.1)")
 
     # The other direction is deliberately *not* an error. The tables list the
     # overloads torch's Python bindings expose, which is a subset: `aten::pow`

@@ -59,6 +59,9 @@ import enum
 import importlib.util
 import inspect
 import json
+import math
+import os
+import re
 import sys
 import types
 
@@ -588,6 +591,12 @@ class _SchemaType:
         return []
 
 
+#: `(op spelling, predicate)` for every question answered from a schema with no
+#: text behind it. Read through `_C._shim_unanswered_predicates()`; see
+#: `_Schema._answer_without_text` for what is and is not in here.
+_UNANSWERED_PREDICATES: set = set()
+
+
 class _AliasInfo:
     __slots__ = ("is_write", "before_set", "after_set")
 
@@ -616,11 +625,24 @@ class _Argument:
 
 
 def _split_top_level(text: str) -> list:
-    """Split on commas that are not inside (), [] or ''."""
+    """Split on commas that are not inside (), [] or ''.
+
+    Backslash escapes are honoured inside a quoted run, because upstream's own
+    schemas contain one: `aten::_test_string_default(Tensor dummy,
+    str a='\\"\\'\\\\', ...)` closes its single-quoted default with an *escaped*
+    quote, and a scanner that stops at the first bare `'` splits that argument
+    in half.
+    """
     out, depth, quote, start = [], 0, "", 0
+    escaped = False
     for i, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
         if quote:
-            if ch == quote:
+            if ch == "\\":
+                escaped = True
+            elif ch == quote:
                 quote = ""
         elif ch in "\"'":
             quote = ch
@@ -652,14 +674,64 @@ class _Schema:
     `ns::name.overload(Type(alias) name=default, *, ...) -> (R1, R2)`.
     """
 
-    __slots__ = ("name", "overload_name", "arguments", "returns", "_source")
+    __slots__ = ("name", "overload_name", "arguments", "returns", "_source",
+                 "_placeholder")
 
-    def __init__(self, qualname: str, overload: str, source: str = "") -> None:
+    def __init__(self, qualname: str, overload: str, source: str = "",
+                 placeholder: bool = False) -> None:
         self.name = qualname
         self.overload_name = overload
         self.arguments = []
         self.returns = []
         self._source = source
+        self._placeholder = placeholder
+
+    @property
+    def is_placeholder(self) -> bool:
+        """Whether this schema is a stand-in with no text behind it.
+
+        Not upstream's -- upstream has no such thing, because upstream always
+        has the text. It is here because this shim sometimes does not, and the
+        alternative to saying so is an object that answers every question with
+        the answer an empty argument list implies. Read
+        `_C._shim_placeholder_schemas()` for the ones handed out so far.
+        """
+        return self._placeholder
+
+    def _spelling(self) -> str:
+        suffix = f".{self.overload_name}" if self.overload_name else ""
+        return f"{self.name}{suffix}"
+
+    def _answer_without_text(self, question: str, answer):
+        """Record a predicate answered from an empty schema, and answer it.
+
+        Raising here was tried and is wrong, and the measurement is why. With
+        the refusal in place, a full run (import, the transformers road, FSDP,
+        the decomposition pass) hits it for 102 distinct `(op, predicate)`
+        pairs -- and **84 of those ops do not exist upstream at all.** They are
+        names the tree *synthesises* and probes: `torch/distributed/tensor/_ops/
+        autogen.py` builds `<base>_` and `<base>_functional`, and
+        `torch/_ops.py` asks every packet for a `default` overload that
+        `aten::add` and `aten::mul` (which are `add.Tensor`/`add.Scalar`
+        upstream) do not have. Upstream answers all 84 with AttributeError at
+        the packet lookup, and every caller's guard for that -- `packet is
+        None`, `except AttributeError` -- reaches the same branch as
+        `is_mutable == False`. Refusing turns a question upstream answers into
+        an import failure.
+
+        Of the 18 that do exist upstream, 17 are `is_mutable == False` and one
+        is not (`aten::native_dropout_backward.out`). All 18 are transcribed in
+        `_GENERATED_ATEN_SCHEMA_TEXT`, so no op upstream has is answered from an
+        empty schema -- which is the claim `verify_schemas.py --unanswered`
+        re-checks against a real torch.
+
+        What is left is therefore a lie only about ops that do not exist, and
+        it is not a silent one: every pair that gets here is listed by
+        `_C._shim_unanswered_predicates()`, so the set can be diffed rather
+        than rediscovered.
+        """
+        _UNANSWERED_PREDICATES.add((self._spelling(), question))
+        return answer
 
     @classmethod
     def parse(cls, text: str) -> "_Schema":
@@ -723,7 +795,18 @@ class _Schema:
         `is_mutable()`, which reads correctly whichever it is. `_is_view_op`
         below stays a method: `torch/distributed/tensor/_dispatch.py:569` calls
         it with parentheses.
+
+        Being a property was only half of it. The value stayed constant -- now
+        always *False* -- because the argument list it reads was empty for every
+        aten op: `_get_schema` handed out a placeholder and `any([])` is False
+        (docs/DISTRIBUTED.md §8.1). The schemas are real now, so the `any` below
+        reads something. The placeholder branch is written out rather than left
+        to `any([])` because it is a *different* statement -- "answered from no
+        text" rather than "read the arguments and found no writer" -- and
+        `_answer_without_text` is what keeps the two countable apart.
         """
+        if self._placeholder:
+            return self._answer_without_text("is_mutable", False)
         return any(
             a.alias_info is not None and a.alias_info.is_write for a in self.arguments
         )
@@ -735,7 +818,13 @@ class _Schema:
         `@torch.library.custom_op` registration, which runs at import.
         Replicated from `MathBitsFallback.h`, the same rule `OpOverload`
         applies to its own schema (`torch/_ops.py:838`).
+
+        Counted separately on a placeholder for the same reason `is_mutable` is:
+        with no arguments the `if not writes` below is taken and the answer is
+        False for every op, which is a claim rather than an absence.
         """
+        if self._placeholder:
+            return self._answer_without_text("_is_view_op()", False)
         writes = [
             a.alias_info.is_write for a in self.arguments if a.alias_info is not None
         ]
@@ -746,25 +835,42 @@ class _Schema:
     def __str__(self) -> str:
         if self._source:
             return self._source
-        suffix = f".{self.overload_name}" if self.overload_name else ""
-        return f"{self.name}{suffix}(...) -> ..."
+        return f"{self._spelling()}(...) -> ..."
 
     def __repr__(self) -> str:
         return str(self)
 
 
-def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
-    default = None
-    depth = 0
+def _split_default(chunk: str):
+    """`Tensor(a!) self=[0, 0]` -> `("Tensor(a!) self", "[0, 0]")`.
+
+    The `=` that separates a default is the one at depth zero and outside a
+    quoted run. `str a='='` is not in aten today, but the scanner costs the
+    same either way and getting it wrong would silently truncate a type.
+    """
+    depth, quote, escaped = 0, "", False
     for i, ch in enumerate(chunk):
-        if ch in "([":
+        if escaped:
+            escaped = False
+            continue
+        if quote:
+            if ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
         elif ch == "=" and depth == 0:
-            default = chunk[i + 1 :].strip()
-            chunk = chunk[:i].strip()
-            break
+            return chunk[:i].strip(), chunk[i + 1 :].strip()
+    return chunk.strip(), None
+
+
+def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
+    chunk, default = _split_default(chunk)
 
     spelling, _, name = chunk.rpartition(" ")
     if not spelling:
@@ -777,6 +883,367 @@ def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
         alias_info = _AliasInfo("!" in inner, inner.replace("!", "").split("|"))
     return _Argument(name.strip(), _SchemaType(spelling.strip()), kwarg_only, default,
                      alias_info)
+
+
+# ---------------------------------------------------------------------------
+# Re-printing a `native_functions.yaml` entry the way upstream prints a schema
+# ---------------------------------------------------------------------------
+#
+# The vendored tree carries `torchgen/packaged/ATen/native/native_functions.yaml`
+# -- 2584 `- func:` lines, each an aten schema, shipped in the wheel as a data
+# file (pyproject.toml) and already read at runtime for the Core ATen tag set
+# (`torchnative/export/decompose.py`, docs/DECOMP.md §2). It is the source of
+# the schema text: it is upstream's own file rather than a transcription, and it
+# needs no upstream torch, which a wheel does not have.
+#
+# It is not *quite* what upstream prints, though. `str(FunctionSchema)` is a C++
+# printer working from parsed IValues, and it renormalises the defaults on the
+# way out. Measured over all 2584 entries against torch 2.13.0's
+# `_jit_get_all_schemas()`, 165 differ, in exactly five ways -- and after the
+# five rules below the residual is 0/2584. Each rule states what it reproduces:
+#
+#   1. `DeviceIndex` is spelled `int` in the printed schema.
+#   2. `float`-typed defaults go through C++'s double printer (rule 4), always;
+#      `Scalar`-typed ones only when the literal is written as a float, since a
+#      `Scalar` default of `1` is an int IValue and prints as `1`.
+#   3. String defaults print double-quoted with `'`, `"` and `\` escaped.
+#   4. Sized-list defaults broadcast: `SymInt[2] stride=1` -> `[1, 1]`. `int[N]`
+#      is the exception and it is upstream's own: its printer re-collapses a
+#      uniform `int` list of length > 1 back to the scalar, with the comment
+#      "we want to faithfully replicate the schema string". So `int[2]
+#      padding=0` stays `0` while `int[1] padding=0` (length 1, so the collapse
+#      does not apply) prints `[0]`. Both spellings occur; 101 arguments across
+#      the file split along exactly that line.
+#   5. Enum-valued defaults print as their integer.
+#
+# What this is not: it is not a schema *parser* for the tree to use. The parsing
+# is `_Schema.parse`'s, unchanged. This only fixes the spelling of defaults so
+# that `str(op._schema)` is upstream's string, which is what `verify_schemas.py`
+# now diffs.
+
+
+def _print_double(value: float) -> str:
+    """C++'s `operator<<(ostream&, double)` as `torch::jit` configures it.
+
+    Two branches, both visible in aten's schemas: a finite value below 1e10
+    that is integral prints as the integer plus a bare `.` (`1.`, `0.`, and
+    `-0.` for negative zero), and everything else prints at
+    `max_digits10 == 17` significant digits -- which is why upstream spells
+    `1/3` as `0.33333333333333331` where the yaml writes `0.3333333333333333`.
+    """
+    if math.isfinite(value) and abs(value) < 1e10:
+        whole = int(value)
+        if float(whole) == value:
+            negative_zero = value == 0.0 and math.copysign(1.0, value) < 0
+            return f"{whole}{'-.' if negative_zero else '.'}"
+    return f"{value:.17g}"
+
+
+#: `printQuotedString` in `function_schema.cpp`. Both quote characters are
+#: escaped even though the output is double-quoted, which is why upstream's
+#: `_test_string_default` reads `str a="\"\'\\"`.
+_SCHEMA_STRING_ESCAPES = {
+    "\\": "\\\\", "'": "\\'", '"': '\\"',
+    "\a": "\\a", "\b": "\\b", "\f": "\\f",
+    "\n": "\\n", "\r": "\\r", "\t": "\\t", "\v": "\\v",
+}
+
+#: Defaults written as an enumerator in the yaml and as its integer in the
+#: printed schema. These three are the whole list -- the file's only non-`None`,
+#: non-boolean word-shaped defaults are `Mean` (33 uses), `long` (8) and
+#: `contiguous_format` (4). The values are the C++ enumerator values:
+#: `at::Reduction::Mean == 1` (None/Mean/Sum), `c10::ScalarType::Long == 4`
+#: (Byte, Char, Short, Int, Long -- the order `torchgen/model.py`'s `ScalarType`
+#: declares), and `c10::MemoryFormat::Contiguous == 0`.
+_SCHEMA_ENUM_DEFAULTS = {"Mean": "1", "long": "4", "contiguous_format": "0"}
+
+_SIZED_LIST_TYPE = re.compile(r"^(.*)\[(\d*)\]$")
+
+
+def _unquote_schema_string(literal: str) -> str:
+    out, escaped = [], False
+    for ch in literal[1:-1]:
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _quote_schema_string(text: str) -> str:
+    return '"' + "".join(_SCHEMA_STRING_ESCAPES.get(c, c) for c in text) + '"'
+
+
+def _element_type_of(spelling: str):
+    """`(element type, list length or None, is a list)` for a type spelling."""
+    base = re.sub(r"\([^)]*\)", "", spelling).strip()
+    if base.endswith("?"):
+        base = base[:-1].strip()
+    match = _SIZED_LIST_TYPE.match(base)
+    if match is None:
+        return base, None, False
+    size = match.group(2)
+    return match.group(1), (int(size) if size else None), True
+
+
+#: A `Scalar` default written as a float. `Scalar alpha=1` is an int IValue and
+#: prints back as `1`; `Scalar alpha=1.0` is a double and prints as `1.`. So the
+#: test is on the spelling, not on whether `float()` accepts it.
+_FLOAT_LITERAL = re.compile(
+    r"^[-+]?((\d+\.\d*|\.\d+)([eE][-+]?\d+)?|\d+[eE][-+]?\d+)$"
+)
+
+
+def _normalise_scalar_default(element: str, literal: str) -> str:
+    if literal in _SCHEMA_ENUM_DEFAULTS:
+        return _SCHEMA_ENUM_DEFAULTS[literal]
+    if len(literal) >= 2 and literal[0] in "\"'" and literal[-1] == literal[0]:
+        return _quote_schema_string(_unquote_schema_string(literal))
+    if element == "float":
+        try:
+            return _print_double(float(literal))
+        except ValueError:
+            return literal
+    if element == "Scalar" and _FLOAT_LITERAL.match(literal):
+        return _print_double(float(literal))
+    return literal
+
+
+def _normalise_default(spelling: str, literal: str) -> str:
+    element, size, is_list = _element_type_of(spelling)
+    if not is_list:
+        return _normalise_scalar_default(element, literal)
+    if literal == "None":
+        return literal
+    if literal.startswith("[") and literal.endswith("]"):
+        items = [
+            _normalise_scalar_default(element, item)
+            for item in _split_top_level(literal[1:-1])
+        ]
+    elif size:
+        items = [_normalise_scalar_default(element, literal)] * size
+    else:
+        return _normalise_scalar_default(element, literal)
+    if element == "int" and len(items) > 1 and len(set(items)) == 1:
+        return items[0]
+    return "[" + ", ".join(items) + "]"
+
+
+def _normalise_argument(chunk: str) -> str:
+    chunk, default = _split_default(chunk)
+    spelling, _, name = chunk.rpartition(" ")
+    if not spelling:
+        spelling, name = chunk, ""
+    spelling = spelling.replace("DeviceIndex", "int")
+    head = f"{spelling} {name}".strip()
+    if default is None:
+        return head
+    return f"{head}={_normalise_default(spelling, default)}"
+
+
+def _normalise_schema_text(text: str) -> str:
+    """A `native_functions.yaml` entry, spelled the way upstream prints it."""
+    open_paren = text.index("(")
+    depth, close_paren = 0, -1
+    for i in range(open_paren, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = i
+                break
+    if close_paren < 0:
+        raise RuntimeError(f"torch._C shim: unbalanced schema: {text}")
+    head = text[:open_paren]
+    body = text[open_paren + 1 : close_paren]
+    tail = text[close_paren + 1 :].replace("DeviceIndex", "int")
+    arguments = [
+        chunk if chunk == "*" else _normalise_argument(chunk)
+        for chunk in _split_top_level(body)
+    ]
+    return f"{head}({', '.join(arguments)}){tail}"
+
+
+# ---------------------------------------------------------------------------
+# Where the aten schema text comes from
+# ---------------------------------------------------------------------------
+
+_NATIVE_FUNCTIONS_RELPATH = os.path.join(
+    "torchgen", "packaged", "ATen", "native", "native_functions.yaml"
+)
+
+#: `[answer, roots it was derived from]`. The roots are kept so that a *failed*
+#: lookup is retried once the tree it was looking for arrives -- `_get_schema`
+#: can be reached from `torch/_ops.py` while `import torch` is still running,
+#: and caching "not found" from that moment would make it permanent. Read
+#: through `_C._shim_schema_source()`.
+_SCHEMA_SOURCE_CELL: list = []
+
+
+def _native_functions_roots() -> list:
+    roots = []
+    for name in ("torch", "torch._C", "_C"):
+        candidate = getattr(sys.modules.get(name), "__file__", None)
+        if candidate:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(candidate)))
+            if root not in roots:
+                roots.append(root)
+    roots.extend(path for path in sys.path if path)
+    return roots
+
+
+def _native_functions_source() -> str:
+    """The vendored `native_functions.yaml`, or why there is not one.
+
+    Located relative to `torch.__file__` first, as
+    `torchnative/export/decompose.py` does and for its reason: `torch/` and
+    `torchgen/` are siblings both in an installed wheel and in the source tree,
+    and if two trees are on the path the answer has to come from the one whose
+    ops are being asked about. `_C.__file__` is the fallback for the same
+    layout seen from inside the extension, and a `sys.path` sweep is the last
+    resort.
+
+    Never raises. A build without the data file is a build whose schemas are
+    placeholders, and a placeholder says so when asked a question it cannot
+    answer -- that is a better failure than `import torch` stopping here.
+    """
+    roots = _native_functions_roots()
+    if _SCHEMA_SOURCE_CELL and (os.path.isabs(_SCHEMA_SOURCE_CELL[0])
+                                or _SCHEMA_SOURCE_CELL[1] == roots):
+        return _SCHEMA_SOURCE_CELL[0]
+    found = None
+    for root in roots:
+        path = os.path.join(root, _NATIVE_FUNCTIONS_RELPATH)
+        if os.path.isfile(path):
+            found = path
+            break
+    answer = found or (
+        "no native_functions.yaml on this path: looked for "
+        f"{_NATIVE_FUNCTIONS_RELPATH} beside torch/ and along sys.path. Every "
+        "aten schema is a placeholder in this process (docs/SCHEMA.md)"
+    )
+    del _SCHEMA_SOURCE_CELL[:]
+    _SCHEMA_SOURCE_CELL.extend((answer, roots))
+    return answer
+
+
+#: `(qualname, overload_name)` -> the raw `- func:` text, built on first use.
+_ATEN_SCHEMA_INDEX: dict = {}
+#: The same key -> the parsed `_Schema`, built one op at a time.
+_ATEN_SCHEMA_CACHE: dict = {}
+
+
+def _aten_schema_index() -> dict:
+    """A line scan of the `- func:` entries, not a YAML parse.
+
+    Same constraint as `decompose._scan_core_tags`: `pyyaml` is not a declared
+    dependency of this distribution, so importing `yaml` here would make a
+    correctly-installed wheel fail at `import torch`. The format relied on is
+    one line per entry, beginning at column 0 with `- func:` -- true for all
+    2584 entries of 2.13.0's file, and `verify_schemas.py` diffs the result
+    against upstream's registry so a format change is a failure rather than a
+    quietly shorter table.
+
+    Indexing is one pass over 15789 lines and does no parsing; the normalise +
+    parse happens per op in `_aten_schema`, so a process that asks for twelve
+    schemas pays for twelve.
+    """
+    if _ATEN_SCHEMA_INDEX:
+        return _ATEN_SCHEMA_INDEX
+    source = _native_functions_source()
+    if not os.path.isabs(source or ""):
+        return _ATEN_SCHEMA_INDEX
+    try:
+        with open(source, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:  # a data file that is present but unreadable
+        return _ATEN_SCHEMA_INDEX
+    for line in lines:
+        if not line.startswith("- func:"):
+            continue
+        text = line[len("- func:") :].strip()
+        head = text.split("(", 1)[0]
+        name, _, overload = head.partition(".")
+        _ATEN_SCHEMA_INDEX[(f"aten::{name}", overload)] = f"aten::{text}"
+        _ATEN_SCHEMA_NAMES.add(name)
+    return _ATEN_SCHEMA_INDEX
+
+
+#: Every aten op *name* the file declares, ignoring overloads. Built with the
+#: index, and empty when there is no file.
+_ATEN_SCHEMA_NAMES: set = set()
+
+
+def _is_absent_inplace_variant(qualname: str) -> bool:
+    """`aten::<base>_` where the file declares `<base>` and not `<base>_`.
+
+    The registry is otherwise open on purpose: `_jit_get_operation` hands back a
+    callable for any name and `_aten_dispatch` refuses at call time, which is
+    the discovery mechanism DESIGN.md §6 asks for. That is fine for a name
+    somebody typed and wrong for a name somebody *synthesised* --
+    `torch/distributed/tensor/_ops/autogen.py:244` builds `<base>_` and asks the
+    resulting packet `is_mutable`, to find out whether an in-place variant
+    exists at all. Upstream answers with AttributeError (there is no
+    `aten::convolution_`); this shim answered with an operator whose schema was
+    empty, and the empty schema then answered the question. False before this
+    work and a refusal after it -- neither is upstream's answer, and the
+    difference is one level above the schema.
+
+    The rule is exactly this shape and no wider, because
+    `native_functions.yaml` is *not* a complete list of aten operators: 176 of
+    upstream's 1730 aten names are absent from it (`quantized_lstm`, which
+    `torch/__init__.py:2395` reads unconditionally at import, `zero`, `resize`,
+    the TorchScript numeric builtins), and refusing on "absent from the file"
+    stops `import torch` on line 2395. What the file *is* complete for is the
+    in-place variant of an op it declares: `add_` sits beside `add`, `relu_`
+    beside `relu`. Measured on 2.13.0 -- of the 1348 names of the form
+    `<yaml base>_` that the file does not declare, upstream has zero, and of
+    the upstream in-place names the file lacks, none has its base in the file.
+    So this refuses 1348 names and none of them is an operator.
+    """
+    namespace, _, name = qualname.partition("::")
+    if namespace != "aten" or not name.endswith("_") or name.endswith("__"):
+        return False
+    _aten_schema_index()
+    if not _ATEN_SCHEMA_NAMES:
+        return False  # no file, so nothing is known to be absent
+    return name not in _ATEN_SCHEMA_NAMES and name[:-1] in _ATEN_SCHEMA_NAMES
+
+
+def _aten_schema(qualname: str, overload: str):
+    """The parsed schema for an aten op, or None if the file has no entry.
+
+    None is a real outcome: upstream's registry has 3754 aten schemas and this
+    file has 2584, the difference being the `.out`/functional variants
+    `torchgen`'s `native_function_generation.py` synthesises at build time
+    rather than writing down. Four of them (`embedding.out`, `empty_like.out`,
+    `div.Scalar_out`, `div.Scalar_mode_out`) are in the transcribed tables and
+    are answered from there; the rest are placeholders and say so.
+    """
+    # `""` and `"default"` name the same overload and both spellings arrive.
+    # `torch/_ops.py:1245` converts one to the other on the way in
+    # (`use_key = "" if key == "default" else key`) and
+    # `torch/_library/effects.py:55` does not, so an index keyed on only one of
+    # them answers half the callers with a placeholder -- which is how
+    # `aten::_adaptive_avg_pool2d` came back empty from a file that has it.
+    key = (qualname, "" if overload == "default" else overload)
+    if key in _ATEN_SCHEMA_CACHE:
+        return _ATEN_SCHEMA_CACHE[key]
+    raw = _aten_schema_index().get(key)
+    parsed = None
+    if raw is not None:
+        try:
+            parsed = _Schema.parse(_normalise_schema_text(raw))
+        except Exception:  # noqa: BLE001 -- an entry this cannot read is a
+            # placeholder, which announces itself; raising here would stop
+            # `import torch` on a schema nobody asked a question about.
+            parsed = None
+    _ATEN_SCHEMA_CACHE[key] = parsed
+    return parsed
 
 
 # aten really does have dunder-named operators, and the tree registers
@@ -1527,7 +1994,22 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         else:
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
 
-    _install_behaviour(module, dispatch)
+    # The overload tables, re-keyed by aten `(qualname, overload)` so that
+    # `_get_schema` can answer from them. They are already parsed -- one
+    # `_Schema` per entry, built at the top of this function -- and their text
+    # is upstream's own `str(op._schema)`, so nothing is re-derived here.
+    #
+    # Keyed off the parsed schema rather than off the table key, which is the
+    # only thing that works for both: `overloads.json`'s key is the op name but
+    # `methods.json`'s is the Python method name, and the two differ (`item` is
+    # `_local_scalar_dense`, `__mul__` is `mul`). Same rule as
+    # `verify_schemas.py:_aten_name`.
+    transcribed = {}
+    for entry in list(overloads.values()) + list(methods.values()):
+        for schema in entry.schemas:
+            transcribed.setdefault((schema.name, schema.overload_name), schema)
+
+    _install_behaviour(module, dispatch, transcribed)
     _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
     _install_repr_surface(module, varfns, module.TensorBase)
@@ -2575,15 +3057,66 @@ _NON_ATEN_SCHEMA_TEXT = (
 )
 
 
-def _build_non_aten_schemas():
+# aten schemas that are *generated* rather than declared, and so are in no data
+# file this tree carries.
+#
+# `native_functions.yaml` has 2584 entries and upstream's registry has 3754 aten
+# schemas. The difference is `torchgen/native_function_generation.py`, which
+# synthesises `.out`, functional and mutable variants at build time from the
+# declared ones. That code is vendored, but running it means parsing the YAML
+# with `pyyaml`, which is not a dependency of this distribution (the same wall
+# `decompose._scan_core_tags` is written around), so the generated half cannot
+# be re-derived here.
+#
+# This is not the whole generated half -- it is the part the tree asks a
+# *question* about, measured rather than guessed. With placeholders instrumented,
+# a full run (import, the transformers road, FSDP, the decomposition pass) reads
+# `is_mutable` or `_is_view_op()` on 102 ops with no text; 84 of those do not
+# exist upstream either, and these 18 do. Transcribing them is what makes
+# "no operator upstream has is answered from an empty schema" true, and
+# `verify_schemas.py` re-derives them from a real torch the same way it does
+# `_NON_ATEN_SCHEMA_TEXT`.
+#
+# One of the 18 is the reason the list is not optional:
+# `native_dropout_backward.out` is mutable upstream and a placeholder answers
+# False. The other 17 agree with the placeholder's answer today, and are here so
+# that "agrees today" is not what the property rests on.
+_GENERATED_ATEN_SCHEMA_TEXT = (
+    "aten::_batch_norm_with_update_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)",
+    "aten::_fused_adam(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
+    "aten::_fused_adam.tensor_lr(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
+    "aten::_fused_adamw(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, float lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
+    "aten::_fused_adamw.tensor_lr(Tensor[] self, Tensor[] grads, Tensor[] exp_avgs, Tensor[] exp_avg_sqs, Tensor[] max_exp_avg_sqs, Tensor[] state_steps, *, Tensor lr, float beta1, float beta2, float weight_decay, float eps, bool amsgrad, bool maximize, Tensor? grad_scale=None, Tensor? found_inf=None) -> (Tensor[] self_out, Tensor[] grads_out, Tensor[] exp_avgs_out, Tensor[] exp_avg_sqs_out, Tensor[] max_exp_avg_sqs_out)",
+    "aten::_index_put_impl(Tensor self, Tensor?[] indices, Tensor values, bool accumulate=False, bool unsafe=False) -> Tensor",
+    "aten::_native_batch_norm_legit_functional(Tensor input, Tensor? weight, Tensor? bias, Tensor running_mean, Tensor running_var, bool training, float momentum, float eps) -> (Tensor, Tensor, Tensor, Tensor running_mean_out, Tensor running_var_out)",
+    # The four TorchScript numeric builtins the tree probes as `.default`.
+    # `aten::add` really is `(Scalar, Scalar) -> Scalar` upstream -- the tensor
+    # overloads are `add.Tensor`/`add.Scalar` -- which is why
+    # `overloads.json`'s README refuses to put these in the *resolution* table.
+    # Knowing an op's schema is not making `torch.add` reach it.
+    "aten::add(Scalar a, Scalar b) -> Scalar",
+    "aten::copysign(Scalar a, Scalar b) -> float",
+    "aten::div(Scalar a, Scalar b) -> float",
+    "aten::mul(Scalar a, Scalar b) -> Scalar",
+    "aten::sub(Scalar a, Scalar b) -> Scalar",
+    "aten::exponential(Tensor self, float lambd=1., *, Generator? generator=None) -> Tensor",
+    "aten::geometric(Tensor self, float p, *, Generator? generator=None) -> Tensor",
+    "aten::log_normal(Tensor self, float mean=1., float std=2., *, Generator? generator=None) -> Tensor",
+    "aten::native_dropout_backward.out(Tensor grad_output, Tensor mask, float scale, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::rrelu_with_noise_functional(Tensor self, Tensor noise, Scalar lower=0.125, Scalar upper=0.33333333333333331, bool training=False, Generator? generator=None) -> (Tensor, Tensor noise_out)",
+    "aten::uniform(Tensor self, float from=0., float to=1., *, Generator? generator=None) -> Tensor",
+)
+
+
+def _build_transcribed_schemas():
     out = {}
-    for text in _NON_ATEN_SCHEMA_TEXT:
+    for text in _NON_ATEN_SCHEMA_TEXT + _GENERATED_ATEN_SCHEMA_TEXT:
         parsed = _Schema.parse(text)
         out[(parsed.name, parsed.overload_name)] = parsed
     return out
 
 
-_NON_ATEN_SCHEMAS = _build_non_aten_schemas()
+_TRANSCRIBED_SCHEMAS = _build_transcribed_schemas()
 
 
 def _constant_function(qualname: str, value):
@@ -3356,8 +3889,13 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "isfinite", isfinite)
 
 
-def _install_behaviour(module, dispatch) -> None:
-    """The names that have to *do* something for the import to finish."""
+def _install_behaviour(module, dispatch, transcribed) -> None:
+    """The names that have to *do* something for the import to finish.
+
+    `transcribed` is `(qualname, overload) -> _Schema` for every entry of
+    `overloads.json` and `methods.json` -- see `_get_schema` below for why the
+    overload tables are also a schema source.
+    """
 
     # `torch/backends/cudnn/__init__.py:223` builds `enabled =
     # ContextProp(torch._C._get_cudnn_enabled, torch._C._set_cudnn_enabled)`
@@ -3480,9 +4018,11 @@ def _install_behaviour(module, dispatch) -> None:
     module._set_generator_metaclass = _set_generator_metaclass
 
     _install_dispatch_keys(module)
-    # Seeded with the schemas that exist only in C++ upstream, then added to
-    # by every `define()` the tree makes -- see `_DispatchLibrary.define`.
-    schemas = dict(_NON_ATEN_SCHEMAS)
+    # Seeded with the schemas that exist only in C++ upstream, or only in
+    # torchgen's build-time generation -- this tree carries neither -- then
+    # added to by every `define()` the tree makes; see
+    # `_DispatchLibrary.define`.
+    schemas = dict(_TRANSCRIBED_SCHEMAS)
     _install_library(module, schemas)
 
     # -- op registry ------------------------------------------------------
@@ -3490,13 +4030,13 @@ def _install_behaviour(module, dispatch) -> None:
         if "::" not in qualname:
             raise RuntimeError(f"torch._C shim: not a qualified op name: {qualname}")
         name = qualname.split("::", 1)[1]
-        if _is_refused_op_name(name):
+        if _is_refused_op_name(name) or _is_absent_op(qualname):
             raise RuntimeError(f"torch._C shim: no operator {qualname}")
         return _op_callable(dispatch, qualname, ""), ["default"]
 
     def _get_operation_overload(qualname, overload):
         name = qualname.split("::", 1)[-1]
-        if _is_refused_op_name(name):
+        if _is_refused_op_name(name) or _is_absent_op(qualname):
             return None
         op = _op_callable(dispatch, qualname, overload)
 
@@ -3505,11 +4045,95 @@ def _install_behaviour(module, dispatch) -> None:
 
         return op, op_dk, []
 
-    def _get_schema(qualname, overload):
-        known = schemas.get((qualname, overload))
+    # Handed out when there is no text. Kept so that the ones given away can be
+    # listed -- `_shim_placeholder_schemas()` is to schema text what
+    # `_shim_registrations` is to `Library.impl`: the size of the gap, readable
+    # from Python instead of inferred from what is absent.
+    placeholders: dict = {}
+
+    def _is_absent_op(qualname):
+        """`_is_absent_inplace_variant`, minus anything actually registered.
+
+        A `Library.define()` for `<base>_` -- or a transcribed table entry --
+        is evidence the op exists that the file does not have, and it wins.
+        """
+        if not _is_absent_inplace_variant(qualname):
+            return False
+        return not any(name == qualname
+                       for table in (schemas, transcribed)
+                       for name, _ in table)
+
+    def _schema_route(qualname, overload):
+        """`(source name, schema)` -- four sources, in this order.
+
+        1. `registered` -- the `_c10d_functional` family and the generated aten
+           schemas, which exist only in C++ or in torchgen upstream, plus every
+           `Library.define()` the tree made at import. None of these is in
+           `native_functions.yaml`; `verify_schemas.py` checks that, because an
+           entry the file *does* carry would silently shadow the file.
+        2. `native_functions.yaml`, re-printed (`_normalise_schema_text`).
+        3. `tables` -- `overloads.json` and `methods.json`, whose strings are
+           `str(op._schema)` copied from upstream 2.13.0. Four of their 173
+           overloads are `.out` variants torchgen synthesises, which the file
+           does not carry; the other 169 are also in the file, and reaching them
+           here would mean the file failed to answer.
+
+           **The order of 2 and 3 is load-bearing and was the other way round.**
+           The tables are the oracle `test_schema_text_survives_the_round_trip_
+           through_the_transcribed_tables` re-prints against, and while they
+           were consulted first they *answered* those 173 lookups -- so the test
+           compared the tables with themselves and passed with the float printer
+           deleted (measured). A check that cannot fail is not a check.
+        4. A placeholder, which answers `arguments`/`returns` with nothing and
+           records every predicate it is asked.
+
+        Before this there was only 1 and 4, so every one of the 117 implemented
+        aten ops took route 4 -- and docs/DISTRIBUTED.md §8.1 is what that cost.
+        """
+        # `""` is upstream's spelling of "the default overload" and is what
+        # `_Schema.parse` puts in `overload_name`; `"default"` is what
+        # `torch/_library/effects.py:55` passes. One key for both.
+        key = (qualname, "" if overload == "default" else overload)
+        known = schemas.get(key)
         if known is not None:
-            return known
-        return _Schema(qualname, overload)
+            return "registered", known
+        known = _aten_schema(*key)
+        if known is not None:
+            return "native_functions.yaml", known
+        known = transcribed.get(key)
+        if known is not None:
+            return "tables", known
+        if key not in placeholders:
+            placeholders[key] = _Schema(*key, placeholder=True)
+        return "placeholder", placeholders[key]
+
+    def _get_schema(qualname, overload):
+        return _schema_route(qualname, overload)[1]
+
+    def _shim_schema_source():
+        return _native_functions_source()
+
+    def _shim_schema_provenance(qualname, overload=""):
+        """Which of the four sources answered, without reading the artefact.
+
+        The layering is invisible from the outside -- every route returns a
+        `_Schema` and they mostly agree -- so "the file answered this" is not
+        checkable by looking at the text. It has to be askable, or a reordering
+        that quietly stops consulting the file passes every test that compares
+        text.
+        """
+        return _schema_route(qualname, overload)[0]
+
+    def _shim_placeholder_schemas():
+        return sorted(placeholders)
+
+    def _shim_unanswered_predicates():
+        return sorted(_UNANSWERED_PREDICATES)
+
+    module._shim_schema_source = _shim_schema_source
+    module._shim_schema_provenance = _shim_schema_provenance
+    module._shim_placeholder_schemas = _shim_placeholder_schemas
+    module._shim_unanswered_predicates = _shim_unanswered_predicates
 
     # A plain function, not `_Schema.parse` itself: `torch/__init__.py:1091`
     # walks every public name in `dir(_C)` and assigns `__module__` on each
