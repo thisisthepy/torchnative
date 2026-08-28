@@ -267,6 +267,13 @@ impl Where {
         match tensor.repr() {
             crate::tensor::Repr::Dense(inner) => Where::Dense(inner.device().clone()),
             crate::tensor::Repr::Meta { .. } => Where::Meta,
+            // A quantised tensor is on a real device, so it compares as one.
+            // It will refuse a page later at `tensor()` for any dense kernel,
+            // but it must not refuse *here* with a device message -- the
+            // reason a Q4K weight cannot go through `aten.mm` is its
+            // representation, not where it lives, and the door should not
+            // mis-name that.
+            crate::tensor::Repr::Quantized(q) => Where::Dense(q.device()),
         }
     }
 
@@ -405,6 +412,10 @@ fn visit_for_device(
             seen.same_device(inner.device())
         }
         (Some(Where::Meta), crate::tensor::Repr::Meta { .. }) => true,
+        // Same reasoning as `Where::of`: a quantised tensor's device is real,
+        // so it agrees with a dense argument on the same device and the op
+        // goes on to refuse for the right reason.
+        (Some(Where::Dense(seen)), crate::tensor::Repr::Quantized(q)) => seen.same_device(&q.device()),
         _ => false,
     };
     if agrees {

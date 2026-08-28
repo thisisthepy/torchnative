@@ -1,0 +1,247 @@
+"""Quantisation by module replacement.
+
+    import torchnative.quant as q
+    report = q.quantize_(model, format="q8_0")
+    print(report)     # what was replaced, what was not, and why not
+
+**Why replacement and not a dtype.** `torch.int8` tensors cannot be built on
+this stack at all -- candle-core 0.11's `DType` has no `I8`, so the storage
+does not exist (docs/QUANT.md §2.1) -- and candle's quantisation is not a
+`DType` either: `QTensor`/`GgmlDType` is a separate type system that
+`Tensor`/`DType` never sees (§5.1). Teaching `aten.mm` a new element type
+would therefore reach none of candle's fast kernels. Swapping the leaf reaches
+them, and it is the same move `torchao` and `bitsandbytes` make, and the same
+one Intel's (now archived) NPU library offered beside `torch.compile`:
+
+    intel_npu_acceleration_library.compile(model, dtype=torch.int8)
+
+The model stays real `transformers`; nothing is rewritten, subclassed or
+patched. Instances are exchanged.
+
+**The ceiling that comes with it.** A replaced leaf is all this covers. There
+is no fusion, no view of the surrounding graph, and nothing inside a module
+boundary is reachable -- an attention block handed over whole needs a graph,
+which is docs/DECOMP.md's path and not this one. The two are not exclusive.
+
+**What this module does not do.** It does not quantise activations (the
+activation stays `float32`, and candle quantises it per call inside `vec_dot`),
+it does not calibrate, and it has no importance matrix. Every scale comes from
+the block it belongs to and nothing else.
+"""
+
+import torch
+
+__all__ = ["QuantizedLinear", "quantize_", "storage_bytes", "FORMATS"]
+
+
+def FORMATS():
+    """The formats `_C` will accept, in GGUF's spelling."""
+    return torch._C._quantized_formats()
+
+
+class QuantizedLinear(torch.nn.Module):
+    """`nn.Linear` with a block-quantised weight.
+
+    Interface-compatible with what a transformer actually calls: `forward`,
+    `in_features`, `out_features`, `bias`. Not compatible with what tooling
+    calls -- see the two deliberate gaps below.
+
+    **`weight` is not a `Parameter` and not a buffer.** It is a plain
+    attribute, so it is absent from `parameters()`, `buffers()` and
+    `state_dict()`. That is not an oversight to fix later:
+
+      * `parameters()` feeds optimisers, and there is no gradient for a packed
+        4-bit block -- appearing there would offer training that cannot happen.
+      * `state_dict()` feeds `torch.save`, and `_apply`/`.to()` walks buffers
+        calling dense ops on them, which a quantised tensor refuses by name
+        (`Repr::Quantized` has no dense storage). Registering it would turn
+        `model.to(...)` -- which `from_pretrained` calls -- into a failure.
+
+    So a quantised model here is a runtime object, not a serialisable one.
+    Writing one out means writing GGUF, which is `_C._quantized_blob()` plus a
+    container this repository does not have (docs/QUANT2.md §7).
+
+    **The bias stays dense `float32`.** It is `out_features` numbers against a
+    weight of `in_features * out_features`, so quantising it would buy a
+    fraction of a percent and cost the one part of the layer where an absolute
+    error is not attenuated by a dot product.
+    """
+
+    def __init__(self, in_features, out_features, qweight, bias, fmt):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.format = fmt
+        # Assigned before `bias` on purpose: `nn.Module.__setattr__` routes a
+        # `Parameter` into `_parameters` and anything else into `__dict__`, and
+        # `qweight` must take the second path. It does, because `_C._quantize`
+        # returns a plain `torch.Tensor` and never a `Parameter`.
+        self.qweight = qweight
+        self.bias = bias
+
+    @classmethod
+    def from_linear(cls, mod, fmt):
+        """Build the replacement, or raise saying why the layer cannot take it.
+
+        The raise is the point. A silent skip on a shape the format cannot hold
+        would report a quantised model that is mostly dense -- and the shape in
+        question is not exotic: SmolLM2-135M is 576 wide, which no 256-element
+        k-quant can hold (docs/QUANT2.md §5.2).
+        """
+        weight = mod.weight
+        out_features, in_features = weight.shape
+        qweight = torch._C._quantize(weight, fmt)
+        return cls(in_features, out_features, qweight, mod.bias, fmt)
+
+    def forward(self, x):
+        return torch._C._quantized_linear(x, self.qweight, self.bias)
+
+    def extra_repr(self):
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, format={self.format}"
+        )
+
+
+class _Report:
+    """What `quantize_` did, and what it refused to do.
+
+    A count of replacements on its own is the metric CLAUDE.md §5.3 warns
+    about: it goes up whether or not anything was gained. So this also carries
+    the bytes on both sides and every skip with its reason, and `__str__`
+    prints all three.
+    """
+
+    def __init__(self, fmt):
+        self.format = fmt
+        self.replaced = []
+        self.skipped = []
+        self.dense_bytes = 0
+        self.quantized_bytes = 0
+
+    @property
+    def ratio(self):
+        if self.quantized_bytes == 0:
+            return float("nan")
+        return self.dense_bytes / self.quantized_bytes
+
+    def __str__(self):
+        lines = [
+            f"format={self.format} replaced={len(self.replaced)} "
+            f"skipped={len(self.skipped)}",
+            # Say which bytes. This counts the weights that were *replaced*,
+            # and nothing else in the model shrank -- SmolLM2's embedding is
+            # 113 MB that stays dense, so a reader who takes this ratio for the
+            # model's is off by nearly two (3.76x here against 2.10x all-in,
+            # docs/QUANT2.md §8). A true number that reads as a bigger claim
+            # than it supports is the failure this repository keeps paying for.
+            f"replaced weight bytes {self.dense_bytes} -> {self.quantized_bytes} "
+            f"({self.ratio:.2f}x); unreplaced parameters are unchanged"
+            if self.replaced else "weight bytes 0 -> 0",
+        ]
+        reasons = {}
+        for name, why in self.skipped:
+            reasons.setdefault(why, []).append(name)
+        for why, names in sorted(reasons.items()):
+            lines.append(f"  skipped ({len(names)}): {why}")
+            lines.append(f"    e.g. {names[0]}")
+        return "\n".join(lines)
+
+
+def quantize_(model, format="q8_0", predicate=None):
+    """Replace every `nn.Linear` in `model` with a `QuantizedLinear`, in place.
+
+    `predicate(name, module) -> bool` narrows it; the default takes all of
+    them. Returns a `_Report`; the model is modified in place and also
+    returned by `.model`-free convention (the caller already has it).
+
+    **`lm_head` is not special-cased.** It is the largest single weight in a
+    small model (49152 x 576 in SmolLM2-135M, 63% of the parameters) and also
+    the one whose error lands directly on the logits with no further layer to
+    attenuate it. Both facts are real and pull opposite ways, so the choice is
+    left to `predicate` rather than made here silently -- docs/QUANT2.md §5.3
+    has the measurement of what skipping it costs and buys.
+    """
+    report = _Report(format)
+    targets = []
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if not isinstance(child, torch.nn.Linear):
+                continue
+            full = f"{name}.{child_name}" if name else child_name
+            if predicate is not None and not predicate(full, child):
+                report.skipped.append((full, "excluded by predicate"))
+                continue
+            targets.append((module, child_name, full, child))
+
+    for parent, child_name, full, child in targets:
+        try:
+            replacement = QuantizedLinear.from_linear(child, format)
+        except NotImplementedError as exc:
+            report.skipped.append((full, _reason(exc)))
+            continue
+        setattr(parent, child_name, replacement)
+        report.replaced.append(full)
+        report.dense_bytes += child.weight.numel() * 4
+        report.quantized_bytes += torch._C._quantized_nbytes(replacement.qweight)
+    return report
+
+
+def _reason(exc):
+    """The refusal, shortened to its distinguishing clause.
+
+    Kept as the message rather than an error code because the messages are the
+    discovery mechanism this shim is built around (DESIGN.md §6): grouping
+    skips by their text is how a new wall shows up as a new line in the report
+    instead of as a number that got smaller.
+    """
+    text = str(exc)
+    marker = "must have their last dim divisible by block size"
+    if marker in text:
+        return "in_features is not a multiple of the format's block size"
+    return text.split("\n")[0][:120]
+
+
+def storage_bytes(model):
+    """`(dense, quantised)` weight bytes over the whole model.
+
+    Counts `QuantizedLinear.qweight` through `_C._quantized_nbytes` and
+    everything else through `numel() * element_size()`. It has to be counted
+    this way round: `element_size()` *refuses* on a quantised tensor, because
+    answering from the dtype tag would report 4 bytes per element for a weight
+    that stores 0.5625 (tensor.rs, `element_size`).
+
+    **Tied weights are counted once**, by object identity, and that is not
+    bookkeeping pedantry -- it changes the answer. SmolLM2-135M has
+    `tie_word_embeddings=True`, so `lm_head.weight is embed_tokens.weight` and
+    the dense model is 538 MB rather than the 651 MB a naive walk reports.
+    Measured: without the dedupe this function claimed 226 MB of dense weight
+    for a model holding 113 MB of it.
+
+    That identity has a consequence worth knowing before quantising:
+    **replacing a tied `lm_head` breaks the tie and costs memory.** The dense
+    tensor stays alive inside the embedding, and the quantised head is an
+    additional copy -- so on SmolLM2-135M, `format="q8_0"` over everything
+    lands at 2.10x while the same format *skipping* `lm_head` lands at 2.38x
+    (docs/QUANT2.md §5.4). It is still worth doing for speed, because the
+    dense `lm_head` is where the time is; it is a trade and not a free win.
+    """
+    dense = 0
+    quantised = 0
+    seen = set()
+    for module in model.modules():
+        if isinstance(module, QuantizedLinear):
+            if id(module.qweight) not in seen:
+                seen.add(id(module.qweight))
+                quantised += torch._C._quantized_nbytes(module.qweight)
+            tensors = [module.bias] if module.bias is not None else []
+        else:
+            tensors = list(module.parameters(recurse=False)) + list(
+                module.buffers(recurse=False)
+            )
+        for t in tensors:
+            if id(t) in seen:
+                continue
+            seen.add(id(t))
+            dense += t.numel() * t.element_size()
+    return dense, quantised

@@ -1622,6 +1622,7 @@ def test_multinomial_matches_upstream_through_a_second_draw():
 import functools
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -4228,19 +4229,26 @@ def test_the_alternative_representations_have_no_constructors():
 
     Six of the predicates `repr` reads -- `is_nested`, `is_sparse`,
     `is_quantized`, `_is_zerotensor`, `is_neg` and `_is_functional_tensor` --
-    ask "which representation is this tensor?", and this build has exactly
-    one: candle's dense strided buffer, or the shape-and-dtype-only `Meta`
-    arm. So they answer `False` today, and CLAUDE.md §5.5 is right to be
+    ask "which representation is this tensor?". Five of them answer `False`
+    for every tensor this build can make, and CLAUDE.md §5.5 is right to be
     suspicious of that: a predicate that cannot say anything else is not a
     predicate.
 
-    What makes it a fact rather than a constant is *this* test. Each of these
-    representations has exactly one way into existence, and every one of those
-    ways refuses by name. If any of them ever lands, this test fails, and the
-    predicate that quietly said `False` becomes a lie that something noticed.
-    That is the difference between an invariant and an assumption -- the
-    `is_mutable` accident in docs/DISTRIBUTED.md §8.1 is what an unguarded one
-    looks like.
+    What makes it a fact rather than a constant is *this* test. Each of those
+    five representations has exactly one way into existence, and every one of
+    those ways refuses by name. If any of them ever lands, this test fails,
+    and the predicate that quietly said `False` becomes a lie that something
+    noticed. That is the difference between an invariant and an assumption --
+    the `is_mutable` accident in docs/DISTRIBUTED.md §8.1 is what an unguarded
+    one looks like.
+
+    **The sixth is no longer in that group.** `Repr::Quantized` landed, so
+    `is_quantized` has a constructor behind it and answers `True` for a
+    block-quantised weight -- `test_is_quantized_is_no_longer_a_constant`.
+    `torch.quantize_per_tensor` is still checked here and still refuses,
+    because that is a different representation: upstream's per-tensor-affine
+    `int8` with a scale and a zero point, not a GGML block format. The way in
+    is `torch._C._quantize`, and it does not wear an aten name (quant.rs).
 
     `layout` is in the same family and is checked here for the same reason:
     it reports `torch.strided`, and the sparse layouts have no constructor.
@@ -4280,6 +4288,10 @@ def test_the_repr_predicates_are_derived_not_asserted():
       `_is_zerotensor`/`is_neg`/`layout` are an exhaustive `match` over the
       shim's `Repr` enum, so adding an arm to it fails the build rather than
       inheriting a `False`. The constructor guard above is the other half.
+      That mechanism has since fired for real: the `Repr::Quantized` arm made
+      the compiler ask all six, and `is_quantized` answered differently
+      (tensor.rs). The tensor in *this* fixture is dense, so the five `False`
+      answers below are still the right ones for it.
 
     * **A real, empty stack.** `is_functorch_wrapped_tensor` is not a constant
       here either: it is `maybe_get_level(t) != -1`, and `maybe_get_level`
@@ -7346,6 +7358,684 @@ def test_sdpa_reference_switch_is_off_by_default_and_restores():
         "the default and reference paths gave identical bits, so the switch is "
         "not selecting anything -- the tests above are then vacuous"
     )
+
+
+# --- block quantisation (docs/QUANT2.md) ------------------------------------
+#
+# **The section that had to build its own judge.** Everything above decides by
+# bit equality against upstream, and quantisation cannot be decided that way:
+# it is lossy on purpose, so "differs from upstream" is its normal state and a
+# tolerance loose enough to accept a correct Q4K weight is loose enough to
+# accept a broken one. docs/QUANT2.md §2 is the argument; these are the checks.
+#
+# The axis has three layers and only the third has a tolerance in it:
+#
+#   1. **The bytes.** `pytests/ggml_ref.py` reimplements the Q8_0 and Q4_0
+#      quantisers from the format and the blob is compared byte for byte.
+#   2. **The reconstruction.** The same file reimplements the dequantisers for
+#      those two plus Q4K, and the `float32` output is compared bit for bit.
+#   3. **The loss.** What is genuinely lossy is held to a bound *derived from
+#      the format*, with a floor as well as a ceiling -- because a "quantiser"
+#      that returned its input would pass any ceiling.
+#
+# And the matmul is checked exactly, which is the part that looked impossible:
+# on operands the format represents without loss, `_quantized_linear` through a
+# Q8_0 weight is **bit identical** to a dense `linear`. See
+# `test_a_quantised_matmul_is_exact_on_operands_the_format_holds_exactly`.
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ggml_ref  # noqa: E402
+
+
+_QUANT_SEED = 20260828
+
+
+def _lcg(seed):
+    """A generator this file owns, so the fixtures do not depend on the shim's
+    RNG being right -- these tests are about quantisation, and borrowing
+    `_shim_manual_seed` would couple a failure here to a failure there."""
+    state = seed & 0xFFFFFFFF
+
+    def nxt():
+        nonlocal state
+        state = (1103515245 * state + 12345) & 0x7FFFFFFF
+        return state / 0x7FFFFFFF
+
+    return nxt
+
+
+def _gauss_flat(n, seed=_QUANT_SEED):
+    """Box-Muller over the LCG. Gaussian rather than uniform because it is the
+    input quantisation is *worst* at -- docs/QUANT.md §7 measured 7.5% relative
+    RMS on random Gaussian weights and called it an upper bound for that
+    reason."""
+    nxt = _lcg(seed)
+    out = []
+    while len(out) < n:
+        u1 = max(nxt(), 1e-12)
+        u2 = nxt()
+        r = math.sqrt(-2.0 * math.log(u1))
+        out.append(r * math.cos(2 * math.pi * u2))
+        out.append(r * math.sin(2 * math.pi * u2))
+    return out[:n]
+
+
+def _exactly_representable(rows, cols, amax=127, seed=_QUANT_SEED):
+    """Values Q8_0 stores with **no** loss, which is what makes the matmul
+    check exact rather than approximate.
+
+    Two conditions, and both are needed:
+
+      * every entry is a whole number, so `round(x/d)` is `x/d`;
+      * every 32-element block has absmax exactly `amax = 127`, so the scale is
+        `127/127 = 1.0` -- which is representable in `f16`, so storing it costs
+        nothing either.
+
+    Then `dequantize(quantize(w)) == w` bit for bit, the dot products are sums
+    of products of integers below 127, and every partial sum stays under
+    `2**24` where `float32` is exact on integers. So **every** accumulation
+    order gives the same bits, and the comparison does not depend on which BLAS
+    ran or how it blocked the loop.
+    """
+    nxt = _lcg(seed)
+    out = []
+    for _ in range(rows):
+        row = [float(int(nxt() * (2 * amax - 2)) - (amax - 1)) for _ in range(cols)]
+        for b in range(cols // 32):
+            # One entry per block pinned to the extreme, so the scale is 1.0.
+            row[b * 32 + int(nxt() * 31)] = float(amax if nxt() < 0.5 else -amax)
+        out.append(row)
+    return out
+
+
+def _quant_fixture(rows, cols, fmt, seed=_QUANT_SEED):
+    flat = _gauss_flat(rows * cols, seed)
+    dense = _C._tensor_from_flat(flat, [rows, cols], dtype=_C.float32)
+    q = _C._quantize(dense, fmt)
+    return flat, dense, q
+
+
+def test_quantised_blobs_match_an_independent_reimplementation_byte_for_byte():
+    """Layer 1: the bytes, not the numbers.
+
+    `ggml_ref.quantize_q8_0` and `quantize_q4_0` are written from the format --
+    block size, scale derivation, rounding mode, nibble interleave -- and the
+    result is compared to `_C._quantized_blob()` with `==` on `bytes`. There is
+    no tolerance to widen and no shape of near-miss that passes.
+
+    This is the strongest statement available about a lossy operation: it does
+    not say the answer is close, it says **the function is the same function**.
+    Two of the three easy mistakes it catches are in Q4_0 alone -- the scale is
+    `max / -8` and keeps the sign of the largest-magnitude element, and element
+    `j` and element `j + 16` share a byte rather than `j` and `j + 1`.
+
+    What it cannot catch is in `ggml_ref`'s own docstring: a misreading shared
+    by both implementations.
+    """
+    for fmt in sorted(ggml_ref.QUANTIZERS):
+        for rows, cols in ((4, 32), (3, 256), (2, 512), (7, 64)):
+            flat, _, q = _quant_fixture(rows, cols, fmt)
+            got = _C._quantized_blob(q)
+            want = ggml_ref.QUANTIZERS[fmt](flat)
+            assert len(got) == len(want), (fmt, rows, cols, len(got), len(want))
+            assert got == want, (
+                fmt,
+                (rows, cols),
+                [i for i, (a, b) in enumerate(zip(got, want)) if a != b][:8],
+            )
+
+
+def test_quantised_blob_sizes_are_the_format_and_not_a_coincidence():
+    """`_quantized_nbytes` against the format's own arithmetic.
+
+    `blocks * type_size`, with `type_size` written out in `ggml_ref.TYPE_SIZE`
+    from the struct definition rather than read back from candle. It is the
+    check that a format silently changing block layout under a version bump
+    fails loudly here instead of shifting every number in QUANT2.md by a few
+    percent.
+    """
+    for fmt, type_size in sorted(ggml_ref.TYPE_SIZE.items()):
+        block = ggml_ref.BLOCK_SIZE[fmt]
+        rows, cols = 3, block * 2
+        _, _, q = _quant_fixture(rows, cols, fmt)
+        want = (rows * cols // block) * type_size
+        assert _C._quantized_nbytes(q) == want, (fmt, _C._quantized_nbytes(q), want)
+        assert len(_C._quantized_blob(q)) == want, fmt
+        # And it is actually smaller than the float32 it replaced, which is the
+        # entire reason for the exercise. `f32` as a "format" is the control
+        # and is excluded by not being in TYPE_SIZE.
+        assert want < rows * cols * 4, fmt
+
+
+def test_dequantisation_matches_the_reference_reconstruction_bit_for_bit():
+    """Layer 2: the reader, over a blob neither side is free to choose.
+
+    The blob comes from `_C._quantized_blob`, so both implementations
+    reconstruct *the same bytes* and the comparison isolates the reader from
+    the writer. Q4K is here even though its quantiser is not: the k-quant
+    *writer* is an iterative least-squares search and transcribing a search
+    would not produce an independent answer, but the *reader* is a pure format
+    -- two f16 super-scales, eight 6-bit sub-scales, eight 6-bit minima packed
+    across twelve bytes -- and that is transcribed and checked.
+
+    Bit for bit, through `repr`, so a `-0.0` that came back as `0.0` fails.
+    """
+    for fmt in ("q8_0", "q4_0", "q4_k"):
+        block = ggml_ref.BLOCK_SIZE[fmt]
+        for rows, cols in ((3, block), (2, block * 3), (5, block * 2)):
+            _, _, q = _quant_fixture(rows, cols, fmt)
+            blob = _C._quantized_blob(q)
+            got = _flat_values(_C._dequantize(q))
+            want = ggml_ref.DEQUANTIZERS[fmt](blob, rows * cols)
+            assert len(got) == len(want), (fmt, len(got), len(want))
+            assert repr(got) == repr(want), (
+                fmt,
+                (rows, cols),
+                [(i, a, b) for i, (a, b) in enumerate(zip(got, want)) if a != b][:6],
+            )
+
+
+def test_the_quantisation_axis_fails_when_the_reference_is_perturbed():
+    """**The check on the checks.** CLAUDE.md §5.5: a verification that cannot
+    fail is not a verification.
+
+    Six faults, each shaped like a mistake somebody would actually make while
+    writing a GGML codec, are injected into the *reference* and the two layers
+    above are re-run. Every one must be caught. The golden harness's
+    `--self-test` makes exactly this argument for its comparators; this is the
+    same argument for this axis.
+
+    The faults are chosen so that a naive "close enough" comparison would let
+    at least four of them through: truncation instead of rounding moves each
+    quant by less than one step, dropping the `f16` storage of the scale moves
+    the reconstruction by a part in 2048, and off-by-one on the nibble
+    interleave leaves the *set* of reconstructed values unchanged. Only exact
+    comparison catches those.
+    """
+    flat = _gauss_flat(256)
+    dense = _C._tensor_from_flat(flat, [1, 256], dtype=_C.float32)
+
+    q8 = _C._quantize(dense, "q8_0")
+    blob8 = _C._quantized_blob(q8)
+    q4 = _C._quantize(dense, "q4_0")
+    blob4 = _C._quantized_blob(q4)
+    deq8 = _flat_values(_C._dequantize(q8))
+
+    caught = []
+
+    # 1. Truncation where the format rounds. Python's int() on a positive
+    #    value is exactly this mistake.
+    bad = bytearray()
+    for i in range(0, 256, 32):
+        block = [ggml_ref.f32(v) for v in flat[i : i + 32]]
+        amax = max(abs(v) for v in block)
+        d = ggml_ref.f32(amax / 127.0)
+        inv = ggml_ref.f32(1.0 / d) if d else 0.0
+        bad += ggml_ref.f16_bytes(d)
+        for v in block:
+            bad.append(ggml_ref.as_i8(int(ggml_ref.f32(v * inv))) & 0xFF)
+    caught.append(("q8_0 truncates instead of rounding", bytes(bad) != blob8))
+
+    # 2. Banker's rounding where the format rounds half away from zero. This
+    #    is what Python's `round()` does, and it is the one a reviewer would
+    #    not see.
+    #
+    #    It needs its own fixture, and that is the point rather than an
+    #    inconvenience: the fault only shows on a tie, and no tie occurred
+    #    anywhere in the Gaussian block above (checked -- the injection came
+    #    out byte-identical). A fault that the fixture cannot reach is a fault
+    #    the axis is not testing, so the tie is constructed instead of hoped
+    #    for. Absmax exactly 127 makes the scale exactly 1.0, so a half-integer
+    #    entry lands exactly on the boundary: Rust rounds 0.5 to 1, Python's
+    #    `round` rounds it to 0.
+    ties = []
+    for j in range(32):
+        ties.append(127.0 if j == 0 else float(j - 16) + 0.5)
+    tie_dense = _C._tensor_from_flat(ties, [1, 32], dtype=_C.float32)
+    tie_blob = _C._quantized_blob(_C._quantize(tie_dense, "q8_0"))
+    assert ggml_ref.quantize_q8_0(ties) == tie_blob, "the reference misses the tie fixture"
+    bad = bytearray()
+    d = ggml_ref.f32(127.0 / 127.0)
+    inv = ggml_ref.f32(1.0 / d)
+    bad += ggml_ref.f16_bytes(d)
+    for v in ties:
+        bad.append(ggml_ref.as_i8(float(round(ggml_ref.f32(v * inv)))) & 0xFF)
+    caught.append(("q8_0 uses banker's rounding", bytes(bad) != tie_blob))
+
+    # 3. The scale kept in f32 rather than narrowed to f16. A part in 2048 --
+    #    invisible to any tolerance anyone would write.
+    bad = bytearray()
+    for i in range(0, 256, 32):
+        block = [ggml_ref.f32(v) for v in flat[i : i + 32]]
+        amax = max(abs(v) for v in block)
+        d = ggml_ref.f32(amax / 127.0)
+        inv = ggml_ref.f32(1.0 / d) if d else 0.0
+        bad += ggml_ref.f16_bytes(d)
+        for v in block:
+            bad.append(ggml_ref.as_i8(ggml_ref.rust_round(ggml_ref.f32(v * inv))) & 0xFF)
+    unnarrowed = []
+    off = 0
+    for i in range(8):
+        block = [ggml_ref.f32(v) for v in flat[i * 32 : (i + 1) * 32]]
+        d = ggml_ref.f32(max(abs(v) for v in block) / 127.0)  # f32, not f16
+        qs = struct.unpack("<32b", bytes(bad)[off + 2 : off + 34])
+        unnarrowed.extend(ggml_ref.f32(qv * d) for qv in qs)
+        off += 34
+    caught.append(("q8_0 scale kept in f32", repr(unnarrowed) != repr(deq8)))
+
+    # 4. Q4_0's nibble interleave read as adjacent pairs.
+    wrong = [0.0] * 256
+    off = 0
+    for i in range(8):
+        d = ggml_ref.f16_from_bytes(blob4[off : off + 2])
+        qs = blob4[off + 2 : off + 18]
+        for j in range(16):
+            wrong[i * 32 + 2 * j] = ggml_ref.f32(((qs[j] & 0x0F) - 8) * d)
+            wrong[i * 32 + 2 * j + 1] = ggml_ref.f32(((qs[j] >> 4) - 8) * d)
+        off += 18
+    caught.append(
+        ("q4_0 read as adjacent pairs", repr(wrong) != repr(ggml_ref.dequantize_q4_0(blob4, 256)))
+    )
+
+    # 5. Q4_0's scale taken as `amax / 8` rather than `max / -8` -- the sign
+    #    dropped. Half the blocks come out negated.
+    bad = bytearray()
+    for i in range(0, 256, 32):
+        block = [ggml_ref.f32(v) for v in flat[i : i + 32]]
+        amax = max(abs(v) for v in block)
+        d = ggml_ref.f32(amax / -8.0)
+        inv = ggml_ref.f32(1.0 / d) if d else 0.0
+        bad += ggml_ref.f16_bytes(d)
+        for j in range(16):
+            x0 = ggml_ref.f32(block[j] * inv)
+            x1 = ggml_ref.f32(block[16 + j] * inv)
+            bad.append(
+                min(15, ggml_ref.as_u8(ggml_ref.f32(x0 + 8.5)))
+                | (min(15, ggml_ref.as_u8(ggml_ref.f32(x1 + 8.5))) << 4)
+            )
+    caught.append(("q4_0 scale loses the sign of max", bytes(bad) != blob4))
+
+    # 6. Q4K's 6-bit scale unpack done with the simple branch throughout --
+    #    correct for the first four sub-blocks and wrong for the last four.
+    q4k = _C._quantize(dense, "q4_k")
+    blobk = _C._quantized_blob(q4k)
+    ref_k = ggml_ref.dequantize_q4_k(blobk, 256)
+    d = ggml_ref.f16_from_bytes(blobk[0:2])
+    dmin = ggml_ref.f16_from_bytes(blobk[2:4])
+    scales = blobk[4:16]
+    qs = blobk[16:144]
+    wrong = []
+    is_ = 0
+    for j in range(0, 256, 64):
+        q = qs[j // 2 : j // 2 + 32]
+        sc, m = scales[is_ % 4] & 63, scales[is_ % 4 + 4] & 63
+        d1, m1 = ggml_ref.f32(d * sc), ggml_ref.f32(dmin * m)
+        sc, m = scales[(is_ + 1) % 4] & 63, scales[(is_ + 1) % 4 + 4] & 63
+        d2, m2 = ggml_ref.f32(d * sc), ggml_ref.f32(dmin * m)
+        wrong.extend(ggml_ref.f32(ggml_ref.f32(d1 * (b & 0xF)) - m1) for b in q)
+        wrong.extend(ggml_ref.f32(ggml_ref.f32(d2 * (b >> 4)) - m2) for b in q)
+        is_ += 2
+    caught.append(("q4_k 6-bit scale unpack without the split branch", repr(wrong) != repr(ref_k)))
+
+    missed = [name for name, did in caught if not did]
+    assert not missed, f"the axis did not notice: {missed}"
+
+
+def test_a_quantised_matmul_is_exact_on_operands_the_format_holds_exactly():
+    """**The one that makes this landable.** A lossy kernel, checked with `==`.
+
+    Quantised arithmetic is not approximate *everywhere*. Restrict both
+    operands to what Q8_0 stores without loss -- whole numbers, each 32-element
+    block reaching absmax exactly 127 so the scale is 1.0 -- and the entire
+    pipeline becomes integer arithmetic that `float32` carries exactly:
+    `dequantize(quantize(x)) == x`, every product is an integer below 16129,
+    every partial sum stays under `2**24`. So the result cannot depend on the
+    accumulation order, and `_quantized_linear` through a Q8_0 weight must be
+    **bit identical** to a dense `linear` over the same numbers.
+
+    That converts the whole quantised matmul path -- the weight blocks, the
+    activation quantisation candle does inside `vec_dot`, the block dot
+    product, the scale multiply, the accumulation across blocks, the bias --
+    into a bit comparison. `k` runs to 256, past the point where the NEON
+    kernels take over from the scalar fallback, so the vector path is what is
+    being checked and not the reference one.
+
+    It is not a claim that quantisation is lossless. It is the claim that
+    everything *except* the rounding is right, which is the half a tolerance
+    can never separate out.
+    """
+    for k in (32, 64, 256, 512):
+        for m in (1, 2, 8):
+            for n in (1, 3, 5):
+                w_rows = _exactly_representable(m, k, seed=_QUANT_SEED + k + m)
+                x_rows = _exactly_representable(n, k, seed=_QUANT_SEED + k + n + 1)
+                w_flat = [v for row in w_rows for v in row]
+                x_flat = [v for row in x_rows for v in row]
+                w = _C._tensor_from_flat(w_flat, [m, k], dtype=_C.float32)
+                x = _C._tensor_from_flat(x_flat, [n, k], dtype=_C.float32)
+                q = _C._quantize(w, "q8_0")
+
+                # The weight itself survives, which is the premise.
+                assert repr(_flat_values(_C._dequantize(q))) == repr(w_flat), (k, m)
+
+                got = _flat_values(_C._quantized_linear(x, q, None))
+                want = [
+                    float(sum(x_rows[i][t] * w_rows[j][t] for t in range(k)))
+                    for i in range(n)
+                    for j in range(m)
+                ]
+                assert repr(got) == repr(want), (k, m, n, got[:4], want[:4])
+
+
+def test_the_f32_control_path_is_a_dense_linear_to_the_bit():
+    """The wiring, separated from the rounding.
+
+    `GgmlDType::F32` is a "quantised" format that stores `float32` unchanged,
+    and `QMatMul::from_arc` dequantises it up front and takes an ordinary
+    `matmul`. So `_quantized_linear` with `format="f32"` has to reproduce a
+    dense `linear` exactly, and what it is checking is everything that is not
+    arithmetic: the transpose convention (`weight` is
+    `(out_features, in_features)`, as `nn.Linear` stores it), the bias
+    broadcast, the batch dimensions, the contiguity copy.
+
+    Integer-valued operands again, and for the same reason as above rather than
+    for convenience: on **random** operands this path differs from `addmm` by
+    up to 2 ULP, because `QMatMul` passes the weight to BLAS as a transposed
+    view where `addmm` passes it differently and the two reassociate the sum.
+    Measured, 20 of 35 elements, max 2.9e-06 -- real, and not a defect on
+    either side. On integer operands reassociation cannot change the answer, so
+    the comparison is exact and still catches every wiring fault, which move
+    numbers by far more than an ULP.
+    """
+    for k, m in ((32, 4), (64, 3), (256, 2)):
+        w_rows = _exactly_representable(m, k, amax=64, seed=_QUANT_SEED + k)
+        x_rows = _exactly_representable(3, k, amax=64, seed=_QUANT_SEED + k + 9)
+        w_flat = [v for row in w_rows for v in row]
+        x_flat = [v for row in x_rows for v in row]
+        w = _C._tensor_from_flat(w_flat, [m, k], dtype=_C.float32)
+        x = _C._tensor_from_flat(x_flat, [3, k], dtype=_C.float32)
+        b_flat = [float(i - m // 2) for i in range(m)]
+        b = _C._tensor_from_flat(b_flat, [m], dtype=_C.float32)
+        qf = _C._quantize(w, "f32")
+
+        for bias, bias_flat in ((None, [0.0] * m), (b, b_flat)):
+            got = _flat_values(_C._quantized_linear(x, qf, bias))
+            want = [
+                float(sum(x_rows[i][t] * w_rows[j][t] for t in range(k)) + bias_flat[j])
+                for i in range(3)
+                for j in range(m)
+            ]
+            assert repr(got) == repr(want), (k, m, bias is not None)
+
+        # And the batch rank the module replacement actually feeds it: a
+        # transformer hands `linear` a `(batch, seq, hidden)` activation.
+        x3 = _C._tensor_from_flat(x_flat, [1, 3, k], dtype=_C.float32)
+        got3 = _flat_values(_C._quantized_linear(x3, qf, b))
+        want3 = [
+            float(sum(x_rows[i][t] * w_rows[j][t] for t in range(k)) + b_flat[j])
+            for i in range(3)
+            for j in range(m)
+        ]
+        assert repr(got3) == repr(want3), (k, m, "rank 3")
+
+
+def test_the_round_trip_loss_is_under_the_formats_bound_and_over_zero():
+    """Layer 3, the only one with a number in it -- and it has two.
+
+    The ceiling is derived, not observed: Q8_0 reconstructs `round(x/d) * d`
+    with `d = absmax/127`, so no element can move by more than half a step.
+    Q4_0's step is eight times coarser and its bound is eight times looser.
+    `ggml_ref.round_trip_bound` computes both per block.
+
+    **The floor is the half that can fail for the interesting reason.** A
+    ceiling alone is passed perfectly by a "quantiser" that returns its input,
+    which is exactly the failure mode a compression claim has to rule out -- so
+    the error is also required to be *non-zero*, and the formats are required
+    to come out in the order the bit widths predict (`q8_0` strictly better
+    than `q4_0`, `q4_k` strictly better than `q4_0` at the same 4 bits, which
+    is the entire reason k-quants exist).
+    """
+    rows, cols = 8, 512
+    flat = _gauss_flat(rows * cols)
+    dense = _C._tensor_from_flat(flat, [rows, cols], dtype=_C.float32)
+
+    rms = {}
+    for fmt in ("q8_0", "q4_0", "q4_k", "q6_k"):
+        back = _flat_values(_C._dequantize(_C._quantize(dense, fmt)))
+        err = [ggml_ref.f32(a) - b for a, b in zip(flat, back)]
+        assert any(e != 0.0 for e in err), f"{fmt} changed nothing -- that is not quantisation"
+        rms[fmt] = math.sqrt(sum(e * e for e in err) / len(err)) / math.sqrt(
+            sum(ggml_ref.f32(v) ** 2 for v in flat) / len(flat)
+        )
+        if fmt in ("q8_0", "q4_0"):
+            block = ggml_ref.BLOCK_SIZE[fmt]
+            for start in range(0, len(flat), block):
+                chunk = flat[start : start + block]
+                bound = ggml_ref.round_trip_bound(fmt, chunk)
+                worst = max(abs(e) for e in err[start : start + block])
+                assert worst <= bound, (fmt, start, worst, bound)
+
+    assert rms["q8_0"] < rms["q4_k"] < rms["q4_0"], rms
+    assert rms["q6_k"] < rms["q4_k"], rms
+    # And the ordering is not marginal: 8 bits should be several times better
+    # than 4, or something is scaling wrong rather than rounding.
+    assert rms["q4_0"] > 4 * rms["q8_0"], rms
+
+
+def test_a_quantised_tensor_refuses_every_dense_kernel_by_name():
+    """The third `Repr` arm earns its keep the way the second one did.
+
+    `tensor()` returns `Err` for `Repr::Quantized` exactly as it does for
+    `Repr::Meta`, so the 96 kernels behind the dispatcher refuse without any of
+    them having been told about quantisation. That is the property the enum
+    exists for (tensor.rs, `Repr`), and this is the test that it holds rather
+    than that somebody remembered to write a check.
+
+    Each refusal is checked to *name* the format, not merely to raise: a
+    `NotImplementedError` that says "meta tensor" about a Q4K weight would be
+    the same defect one layer down.
+    """
+    _, dense, q = _quant_fixture(4, 64, "q8_0")
+    probes = [
+        ("aten.mm.default", (q, dense)),
+        ("aten.mm.default", (dense, q)),
+        ("aten.add.Tensor", (q, dense)),
+        ("aten.mul.Tensor", (q, q)),
+        ("aten.sum.default", (q,)),
+        ("aten.t.default", (q,)),
+        ("aten._to_copy.default", (q,)),
+    ]
+    for name, args in probes:
+        try:
+            _C._aten_dispatch(name, *args)
+        except NotImplementedError as exc:
+            assert "q8_0" in str(exc) or "block-quantised" in str(exc), (name, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            # An op that refuses earlier for its own reason (an unimplemented
+            # overload) is not a failure of this property, but it must not
+            # have *computed* something.
+            assert "not implemented" in str(exc).lower(), (name, type(exc).__name__, str(exc))
+        else:
+            raise AssertionError(f"{name} computed on a quantised tensor")
+
+    # `tolist` is the direct read and it refuses too, which is why `print()` of
+    # a quantised weight cannot produce numbers that are not there.
+    try:
+        q.tolist()
+    except NotImplementedError as exc:
+        assert "block-quantised" in str(exc), str(exc)
+    else:
+        raise AssertionError("tolist read a quantised tensor")
+
+
+def test_element_size_refuses_rather_than_guessing_on_a_quantised_tensor():
+    """`numel() * element_size()` is how upstream code sizes a buffer.
+
+    The dtype tag on a quantised tensor is `float32` -- it is what
+    `_dequantize` produces -- so answering from the tag would say 4 bytes per
+    element for a Q4K weight that stores 0.5625, wrong by 7.1x in the direction
+    that flatters a memory budget. It refuses and names the arithmetic
+    (`type_size` per `block_size`), and `_quantized_nbytes` answers the
+    question that has an answer.
+    """
+    _, dense, q = _quant_fixture(4, 256, "q4_k")
+    assert dense.element_size() == 4
+    try:
+        q.element_size()
+    except NotImplementedError as exc:
+        assert "144 bytes per 256 elements" in str(exc), str(exc)
+        assert "_quantized_nbytes" in str(exc), str(exc)
+    else:
+        raise AssertionError("element_size answered for a quantised tensor")
+    assert _C._quantized_nbytes(q) == 4 * 144
+    assert q.numel() == 1024
+    # The compression this actually buys, stated the only honest way.
+    assert q.numel() * 4 / _C._quantized_nbytes(q) > 7.0
+
+
+def test_is_quantized_is_no_longer_a_constant():
+    """docs/QUANT2.md §4, and the reason the six predicates were a `match`.
+
+    tensor.rs wrote `is_nested`/`is_sparse`/`is_quantized`/`_is_zerotensor`/
+    `is_neg`/`layout` as an exhaustive match over `Repr` so that a third arm
+    could not inherit a `False` silently, and recorded that
+    `test_the_alternative_representations_have_no_constructors` was the other
+    half of the argument -- `False` was derivable because nothing could build
+    the representation.
+
+    A third arm landed. Five of the six still answer `False`; this one does
+    not, and now has a constructor behind it. The predicate that was
+    suspicious for being unfalsifiable is now falsifiable.
+    """
+    _, dense, q = _quant_fixture(2, 64, "q8_0")
+    assert dense.is_quantized is False
+    assert q.is_quantized is True
+    # The other five did answer, and answered `False`.
+    for name in ("is_nested", "is_sparse"):
+        assert getattr(q, name) is False, name
+    assert q._is_zerotensor() is False
+    assert q.is_neg() is False
+    assert q._layout_name() == "strided"
+    # `qscheme` exists so that a reader who believes `is_quantized` gets told
+    # what kind of quantised, rather than an AttributeError from _tensor_str.
+    for t in (dense, q):
+        try:
+            t.qscheme()
+        except (NotImplementedError, RuntimeError) as exc:
+            assert "qscheme" in str(exc), str(exc)
+        else:
+            raise AssertionError("qscheme answered")
+
+
+def test_a_format_that_cannot_hold_a_shape_refuses_at_the_door_by_name():
+    """The wall SmolLM2 walks into, checked here so it is not a surprise there.
+
+    A GGML block must be filled, so a format with a 256-element block cannot
+    store a weight whose last dimension is 576 -- and 576 is SmolLM2-135M's
+    hidden size, not an exotic number. Every k-quant is therefore unavailable
+    for that model and the 32-element formats are not (docs/QUANT2.md §5.2).
+
+    Refused in `quant.rs` rather than left to candle, so the message names the
+    format and the multiple it wanted; `torchnative.quant` groups its skips by
+    that text, which is how a wall shows up as a line in the report.
+    """
+    w = _C._tensor_from_flat(_gauss_flat(576 * 4), [4, 576], dtype=_C.float32)
+    for fmt in ("q2_k", "q3_k", "q4_k", "q5_k", "q6_k"):
+        try:
+            _C._quantize(w, fmt)
+        except NotImplementedError as exc:
+            assert "divisible by block size" in str(exc), (fmt, str(exc))
+            assert "576" in str(exc) and "256" in str(exc), (fmt, str(exc))
+        else:
+            raise AssertionError(f"{fmt} accepted a 576-column weight")
+    for fmt in ("q4_0", "q8_0", "q5_0"):
+        assert _C._quantized_format(_C._quantize(w, fmt)) == fmt
+
+    # The activation-side formats refuse for a different reason and say so.
+    for fmt in ("q8_1", "q8_k"):
+        try:
+            _C._quantize(_C._tensor_from_flat(_gauss_flat(256), [1, 256], dtype=_C.float32), fmt)
+        except NotImplementedError as exc:
+            assert "activation-side" in str(exc), (fmt, str(exc))
+        else:
+            raise AssertionError(f"{fmt} accepted a weight")
+
+    # And an unknown name lists what there is instead of picking a default.
+    try:
+        _C._quantize(w, "q4_K")
+    except NotImplementedError as exc:
+        assert "unknown quantisation format" in str(exc), str(exc)
+    else:
+        raise AssertionError("a misspelled format was accepted")
+
+
+def test_a_blob_round_trips_through_python_unchanged():
+    """`_quantized_blob` and `_quantized_from_blob` are inverses.
+
+    Needed for the axis rather than for its own sake: without a way in,
+    `dequantize(quantize(x))` could only compare candle to itself, and the
+    reference dequantisers could never be driven by a blob candle did not
+    write. It is also what a GGUF writer would be built on, which is the
+    reason it is a pair and not a one-way debug hook.
+
+    The size check is part of the contract: a blob of the wrong length for the
+    shape is a `ValueError` naming both, not a reinterpretation of whatever
+    bytes arrived.
+    """
+    for fmt in ("q8_0", "q4_0", "q4_k"):
+        block = ggml_ref.BLOCK_SIZE[fmt]
+        _, _, q = _quant_fixture(3, block * 2, fmt)
+        blob = _C._quantized_blob(q)
+        back = _C._quantized_from_blob(blob, [3, block * 2], fmt)
+        assert _C._quantized_format(back) == fmt
+        assert _C._quantized_blob(back) == blob
+        assert repr(_flat_values(_C._dequantize(back))) == repr(_flat_values(_C._dequantize(q)))
+        try:
+            _C._quantized_from_blob(blob[:-1], [3, block * 2], fmt)
+        except ValueError as exc:
+            assert "bytes" in str(exc), str(exc)
+        else:
+            raise AssertionError("a short blob was accepted")
+
+
+def test_a_quantised_activation_is_refused_and_a_reduced_float_one_too():
+    """Two refusals that would otherwise be silent widenings.
+
+    `QMatMul::forward` takes `f32` or `f16` and this shim's reduced-precision
+    path is `bfloat16` (docs/DTYPE.md §6.2), so a `bfloat16` activation has to
+    be widened by somebody. Doing it inside `_quantized_linear` would hide the
+    conversion cost from whoever is measuring -- the exact mistake docs/DTYPE.md
+    §2 spent a document unpicking -- so it refuses and says why.
+
+    And the weight argument must be quantised: handing `_quantized_linear` a
+    dense weight would otherwise work through the F32 arm and quietly measure
+    nothing.
+    """
+    _, dense, q = _quant_fixture(4, 64, "q8_0")
+    x32 = _C._tensor_from_flat(_gauss_flat(2 * 64), [2, 64], dtype=_C.float32)
+    xbf = _C._aten_dispatch("aten._to_copy.default", x32, dtype=_C.bfloat16)
+    try:
+        _C._quantized_linear(xbf, q, None)
+    except NotImplementedError as exc:
+        assert "bfloat16" in str(exc) and "float32" in str(exc), str(exc)
+    else:
+        raise AssertionError("a bfloat16 activation was accepted")
+
+    try:
+        _C._quantized_linear(x32, dense, None)
+    except NotImplementedError as exc:
+        assert "block-quantised" in str(exc), str(exc)
+    else:
+        raise AssertionError("a dense weight was accepted as a quantised one")
+
+    # A shape mismatch is upstream's message, not a candle one.
+    bad = _C._tensor_from_flat(_gauss_flat(2 * 32), [2, 32], dtype=_C.float32)
+    try:
+        _C._quantized_linear(bad, q, None)
+    except RuntimeError as exc:
+        assert "shapes cannot be multiplied" in str(exc), str(exc)
+    else:
+        raise AssertionError("a mismatched activation was accepted")
 
 
 def _main():

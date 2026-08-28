@@ -16,6 +16,7 @@
 //! | `device` | `torch.device`, a label rather than a live backend handle |
 //! | `aten` | the single dispatch entrance, and the ops behind it |
 //! | `capture` | recording a straight-line region at that entrance, and replaying it |
+//! | `quant` | block-quantised weights: candle's `QTensor` behind the third `Repr` arm |
 //! | `err` | the message shapes; §6's discovery mechanism lives on these |
 //!
 //! This is a floor, not a coverage effort. Three ops are implemented. Everything
@@ -36,6 +37,7 @@ mod dtype;
 mod err;
 mod flash;
 mod info;
+mod quant;
 mod reduced;
 mod rng;
 mod storage;
@@ -623,6 +625,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     capture::register(m)?;
     rng::register(m)?;
     storage::register(m)?;
+    quant::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
