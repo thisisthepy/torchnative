@@ -224,7 +224,7 @@ fn _tensor_new_from_data(
     let inferred = if all_bool {
         crate::dtype::TorchDType::Bool
     } else if any_float || leaves.is_empty() {
-        crate::aten::DEFAULT_FLOAT
+        crate::dtype::default_float()
     } else {
         crate::dtype::TorchDType::Int64
     };

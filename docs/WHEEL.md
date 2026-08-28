@@ -336,6 +336,15 @@ torchnative-0.0.1a0.dist-info/
 
 ## 5. 이 휠로 아직 안 되는 것 — `print(tensor)`
 
+> **닫혔습니다 (2026-08-28). `docs/E2E_REAL.md` §2 를 보십시오.** 아래 측정은 그대로 두되,
+> 이 절이 "최소 8개" 라고 적은 목록은 **거절한 이름의 목록이지 필요한 셈의 목록이 아니었습니다.**
+> 상류의 `repr` 이 실제로 무슨 op 을 디스패치하는지 재 보니 없던 것은 커널 6개였고,
+> 여기 3번으로 적힌 `torch.get_default_dtype` 은 그 사이에 이미 구현되었으며
+> (`docs/DISTRIBUTED.md` §3.4), 반대로 이 목록에 없던 `abs`·`ceil`·`gt.Scalar`·`min`·
+> `unbind.int`·`masked_select` 가 필요했습니다. 그 차이를 만든 것이 계측기의 위치입니다 —
+> `_str` 은 `_disable_current_modes()` 로 시작하므로 `TorchDispatchMode` 를 **밖에** 걸면
+> 아무것도 기록되지 않습니다.
+
 작업 지시의 판정 스니펫은 이렇게 되어 있었습니다.
 
 ```python

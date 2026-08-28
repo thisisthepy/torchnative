@@ -2354,6 +2354,216 @@ def test_meta_transfers_go_one_way_only():
             raise AssertionError(f"meta -> cpu succeeded for {kwargs}")
 
 
+def test_meta_arith_scalar_promotes_by_the_same_rule_the_dense_kernel_uses():
+    """`from_pretrained` builds the rotary embedding under a meta context.
+
+    `transformers/models/llama/modeling_llama.py:108` computes
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+
+    inside `LlamaRotaryEmbedding.__init__`, which `from_pretrained` runs under
+    `init_empty_weights`. Two of its links are `Scalar`-overload arithmetic on
+    a meta tensor -- the `/ dim`, and the `* other` that
+    `torch/_tensor.py:1112` turns `1.0 / t` into.
+
+    The dtype is not "the input's". True division always floats; multiplication
+    follows torch's wrapped-number rule, where a Python `float` floats an
+    integral tensor and a Python `int` does not. Both rules already exist in
+    `arith_tag`, and the meta kernels call it rather than restating it -- a
+    meta kernel that promised a dtype the dense kernel would not produce is
+    worse than none, because the shape and dtype it hands back are what the
+    caller then allocates against.
+
+    Measured on torch 2.13.0 (`torch.empty(..., device="meta") <op> s`):
+
+        float32 / 2      float32      float32 * 2      float32
+        float32 / 2.0    float32      float32 * 2.0    float32
+        float64 / 2      float64      int64   * 2      int64
+        float16 / 2      float16      int64   * 2.0    float32
+        int64   / 2      float32      bool    * 2      int64
+        int64   / 2.0    float32      bool    * 2.0    float32
+        int32   / 2      float32
+        bool    / 2      float32
+
+    and under `set_default_dtype(torch.float64)` every row that floats an
+    integral operand becomes float64 -- the same coupling the dense path has.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+
+    def empty(shape, dtype):
+        return d("aten.empty.memory_format", shape, dtype, device=meta)
+
+    for op, dtype, scalar, want in (
+        ("aten.div.Scalar", _C.float32, 2, _C.float32),
+        ("aten.div.Scalar", _C.float32, 2.0, _C.float32),
+        ("aten.div.Scalar", _C.float64, 2, _C.float64),
+        ("aten.div.Scalar", _C.float16, 2, _C.float16),
+        ("aten.div.Scalar", _C.int64, 2, _C.float32),
+        ("aten.div.Scalar", _C.int64, 2.0, _C.float32),
+        ("aten.div.Scalar", _C.int32, 2, _C.float32),
+        ("aten.mul.Scalar", _C.float32, 2, _C.float32),
+        ("aten.mul.Scalar", _C.float32, 2.0, _C.float32),
+        ("aten.mul.Scalar", _C.float64, 2.0, _C.float64),
+        # The row that separates the two rules: `*` keeps an integral tensor
+        # integral under an `int` scalar, `/` does not.
+        ("aten.mul.Scalar", _C.int64, 2, _C.int64),
+        ("aten.mul.Scalar", _C.int64, 2.0, _C.float32),
+        ("aten.mul.Scalar", _C.int32, 2, _C.int32),
+    ):
+        out = d(op, empty([2, 3], dtype), scalar)
+        assert out.is_meta is True, (op, dtype, scalar)
+        assert tuple(out.shape) == (2, 3), (op, dtype, scalar, tuple(out.shape))
+        assert out.dtype == want, (op, dtype, scalar, out.dtype)
+
+    # The promotion reads the default dtype, so it moves with it. This is the
+    # same cell `set_default_dtype` writes; if a meta kernel had hardcoded
+    # float32 this would be the assertion that said so.
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.div.Scalar", empty([4], _C.int64), 2).dtype == _C.float64
+        assert d("aten.div.Scalar", empty([4], _C.float32), 2).dtype == _C.float32
+        assert d("aten.mul.Scalar", empty([4], _C.int64), 2.0).dtype == _C.float64
+        assert d("aten.mul.Scalar", empty([4], _C.int64), 2).dtype == _C.int64
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+    # `torch.bool` is the one row above that is *not* reproduced: the dense
+    # kernel refuses a boolean operand by name (BOOL.md §2.2) and the meta
+    # kernel shares that rule rather than advertising a computation this build
+    # would then refuse to perform. Upstream answers float32 and int64 for
+    # these two; that divergence is the dense one, and this asserts it stays a
+    # single divergence rather than becoming two answers.
+    for op in ("aten.div.Scalar", "aten.mul.Scalar"):
+        try:
+            d(op, empty([2], _C.bool), 2)
+        except NotImplementedError as e:
+            assert "torch.bool" in str(e), (op, str(e))
+        else:
+            raise AssertionError(f"meta {op} accepted a bool the dense path refuses")
+
+
+def test_meta_pow_scalar_keeps_the_wrapped_number_rule():
+    """The next link in the same `LlamaRotaryEmbedding.__init__` expression.
+
+    `base ** (...)` with a Python `base` is `aten::pow.Scalar(Scalar self,
+    Tensor exponent)` -- the scalar is the *base* and the tensor is the
+    exponent, which is the opposite of `pow.Tensor_Scalar` and the reason the
+    two cannot share a kernel.
+
+    The rule is torch's wrapped-number rule, not "widest wins": an `int` base
+    does not float an integral exponent, a `float` base does. Measured on
+    2.13.0 over `s ** torch.empty(..., device="meta")`:
+
+        2   ** float32  float32     2   ** int64  int64
+        2.0 ** float32  float32     2.0 ** int64  float32
+        2   ** float16  float16     2   ** int32  int32
+        2   ** float64  float64     2.0 ** int32  float32
+
+    `pow_result_tag` is that rule and the meta kernel calls it, so the two
+    cannot drift apart.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+
+    def empty(shape, dtype):
+        return d("aten.empty.memory_format", shape, dtype, device=meta)
+
+    for base, dtype, want in (
+        (2, _C.float32, _C.float32),
+        (2.0, _C.float32, _C.float32),
+        (2, _C.float64, _C.float64),
+        (2, _C.float16, _C.float16),
+        (2, _C.int64, _C.int64),
+        (2.0, _C.int64, _C.float32),
+        (2, _C.int32, _C.int32),
+        (2.0, _C.int32, _C.float32),
+    ):
+        out = d("aten.pow.Scalar", base, empty([2, 3], dtype))
+        assert out.is_meta is True, (base, dtype)
+        assert tuple(out.shape) == (2, 3), (base, dtype, tuple(out.shape))
+        assert out.dtype == want, (base, dtype, out.dtype)
+
+    # Only the float-base-over-integral-exponent row reads the default dtype,
+    # which is exactly the row upstream floats. If the kernel had hardcoded
+    # float32 the first of these would say so; if it had floated everything the
+    # second would.
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.pow.Scalar", 2.0, empty([4], _C.int64)).dtype == _C.float64
+        assert d("aten.pow.Scalar", 2, empty([4], _C.int64)).dtype == _C.int64
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+    # As with `div.Scalar`: upstream answers `int64` for `2 ** bool_meta`, the
+    # dense kernel refuses a boolean operand by name, and the meta kernel
+    # refuses with it rather than promising a second answer.
+    try:
+        d("aten.pow.Scalar", 2, empty([2], _C.bool))
+    except NotImplementedError as e:
+        assert "torch.bool" in str(e), str(e)
+    else:
+        raise AssertionError("meta pow.Scalar accepted a bool the dense path refuses")
+
+
+def test_meta_reciprocal_floats_an_integral_input():
+    """The last link: `1.0 / t` is `t.reciprocal() * 1.0` in the vendored tree.
+
+    `torch/_tensor.py:1112` spells `__rdiv__` that way, so
+    `LlamaRotaryEmbedding.__init__` reaches `aten::reciprocal` and then
+    `aten::mul.Scalar` rather than an `rdiv` op.
+
+    `reciprocal` is in the `unary_float` family: a floating input keeps its
+    dtype, anything else becomes the default float. Measured on 2.13.0 over
+    `torch.empty(..., device="meta").reciprocal()` -- float32/float64/float16/
+    bfloat16 are preserved, int64/int32 give float32, and under
+    `set_default_dtype(torch.float64)` the integral rows give float64 while the
+    float32 row stays float32.
+
+    Only `reciprocal` is added here. `cos`/`sin`/`tanh`/`exp`/`rsqrt` share the
+    dense helper and would share this rule, but nothing has asked for them on
+    meta -- a meta kernel nobody reached is a claim nobody checked.
+    """
+    d = _C._aten_dispatch
+    meta = _C.device("meta")
+
+    def empty(shape, dtype):
+        return d("aten.empty.memory_format", shape, dtype, device=meta)
+
+    for dtype, want in (
+        (_C.float32, _C.float32),
+        (_C.float64, _C.float64),
+        (_C.float16, _C.float16),
+        (_C.bfloat16, _C.bfloat16),
+        (_C.int64, _C.float32),
+        (_C.int32, _C.float32),
+    ):
+        out = d("aten.reciprocal.default", empty([2, 3], dtype))
+        assert out.is_meta is True, dtype
+        assert tuple(out.shape) == (2, 3), (dtype, tuple(out.shape))
+        assert out.dtype == want, (dtype, out.dtype)
+
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.reciprocal.default", empty([4], _C.int64)).dtype == _C.float64
+        assert d("aten.reciprocal.default", empty([4], _C.float32)).dtype == _C.float32
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+    # The links either side of it, in the order the rope expression runs them.
+    # Asserting the chain rather than the link is what catches a kernel that is
+    # right in isolation and wrong in place -- `arange` already answered on
+    # meta, and `div.Scalar`/`pow.Scalar` were the two walls before this one.
+    chain = d("aten.arange.start_step", 0, 8, 2, _C.float32, device=meta)
+    assert tuple(chain.shape) == (4,), tuple(chain.shape)
+    chain = d("aten.div.Scalar", chain, 8)
+    chain = d("aten.pow.Scalar", 10000.0, chain)
+    chain = d("aten.mul.Scalar", d("aten.reciprocal.default", chain), 1.0)
+    assert chain.is_meta is True
+    assert tuple(chain.shape) == (4,), tuple(chain.shape)
+    assert chain.dtype == _C.float32, chain.dtype
+
+
 def test_ops_without_a_meta_kernel_name_themselves():
     """DESIGN.md §6's instrument, pointed at the meta device.
 
@@ -3326,9 +3536,13 @@ def test_default_dtype_answers_with_the_dtype_the_dispatcher_actually_uses():
     binds it straight onto `_C` -- so overload resolution was never going to
     find it.
 
-    The value is not a free choice: `aten.rs`'s `DEFAULT_FLOAT` is what factory
-    functions infer, so this asks the dispatcher rather than asserting a
-    constant.
+    The value is not a free choice: `dtype.rs`'s `default_float()` is what
+    factory functions infer, so this asks the dispatcher rather than asserting
+    a constant.
+
+    This test asserts the *resting* value. That it can be moved, and that
+    moving it moves the inference rules, is
+    `test_set_default_dtype_moves_every_rule_that_reads_the_default`.
     """
     assert _C.get_default_dtype() is _C.float32
     # `==`, not `is`. Upstream interns dtypes so `torch.zeros(1).dtype is
@@ -3338,14 +3552,133 @@ def test_default_dtype_answers_with_the_dtype_the_dispatcher_actually_uses():
     # recorded here rather than asserted away.
     assert _C._VariableFunctions.zeros([1]).dtype == _C.get_default_dtype()
 
-    # `set_default_dtype` would have to reach a Rust constant, so it stays
-    # refused -- by name, not by silently doing nothing.
+
+# The dtypes upstream's `set_default_dtype` accepts, and what each of the two
+# refusal branches says. Measured on torch 2.13.0 across every `torch.dtype`
+# the module exposes (45 of them); the split is exact, not sampled.
+#
+#   accepted                       float32 float64 float16 bfloat16
+#   TypeError, "only floating-      every non-floating-point tag, the
+#     point types are supported       complex and quantised ones included
+#     as the default type"
+#   TypeError, "couldn't find      the six float8/float4 tags -- they pass
+#     storage object <X>Storage"      upstream's floating-point gate and then
+#                                     fail its storage-class lookup
+#   TypeError, "invalid dtype      anything that is not a `torch.dtype` at
+#     object: only floating-point     all, `None` included
+#     types are supported as the
+#     default type"
+_DEFAULT_DTYPE_ACCEPTS = ("float32", "float64", "float16", "bfloat16")
+_DEFAULT_DTYPE_NOT_FLOAT = ("int64", "bool", "complex64", "quint8", "bits16", "uint4")
+_DEFAULT_DTYPE_NO_STORAGE = (
+    ("float8_e4m3fn", "Float8_e4m3fnStorage"),
+    ("float8_e5m2", "Float8_e5m2Storage"),
+    ("float4_e2m1fn_x2", "Float4_e2m1fn_x2Storage"),
+)
+
+
+def test_set_default_dtype_moves_every_rule_that_reads_the_default():
+    """A setter that leaves `torch.ones(3).dtype` alone is worse than a refusal.
+
+    docs/DISTRIBUTED.md §3.4 refused `set_default_dtype` by name because the
+    value lived in a Rust `const` and a setter cannot reach one. `transformers`
+    ends the argument: `modeling_utils.py:239` (`local_torch_dtype`, entered
+    from `from_pretrained` at line 4304) calls `torch.set_default_dtype(dtype)`
+    unconditionally, so `from_pretrained` cannot start without it.
+
+    The point of this test is that the global is *load-bearing*. Every site
+    listed below reads "the default float dtype" in the shim today, and each is
+    asserted to follow -- if any one of them kept its own copy, the setter
+    would be a lie in exactly the way the refusal was not.
+    """
+    assert _C.get_default_dtype() is _C.float32
     try:
-        _C._VariableFunctions.set_default_dtype(_C.float64)
-    except NotImplementedError as e:
-        assert "set_default_dtype" in str(e), e
-    else:
-        raise AssertionError("set_default_dtype silently accepted")
+        _C._set_default_dtype(_C.float64)
+        assert _C.get_default_dtype() is _C.float64
+
+        f64 = _C.float64
+        ints = _C._VariableFunctions.zeros([2], dtype=_C.int64)
+        # Each entry names the site in the shim that reads the default.
+        followers = {
+            # aten.rs `empty_like_family` -- ones/zeros/empty
+            "ones": _C._VariableFunctions.ones([3]).dtype,
+            "zeros": _C._VariableFunctions.zeros([3]).dtype,
+            "empty": _C._VariableFunctions.empty([3]).dtype,
+            # aten.rs `arange` -- a non-integral endpoint floats the result
+            "arange": _C._VariableFunctions.arange(0.0, 3.0).dtype,
+            # lib.rs `_tensor_new_from_data` -- `torch.tensor`
+            "tensor": _C._tensor_new_from_data([1.0]).dtype,
+            # ... including the empty-list case, which has no float in it
+            "tensor([])": _C._tensor_new_from_data([]).dtype,
+            # aten.rs `full` -- a float fill value
+            "full": _C._VariableFunctions.full([2], 1.0).dtype,
+            # aten.rs `scalar_tensor`
+            "scalar_tensor": _C._aten_dispatch("aten.scalar_tensor.default", 1.5).dtype,
+            # aten.rs `rsqrt_default` -- integral in, default float out
+            "rsqrt": _C._aten_dispatch("aten.rsqrt.default", ints).dtype,
+            # aten.rs `unary_float` -- same rule, shared by cos/sin/exp/tanh
+            "cos": _C._aten_dispatch("aten.cos.default", ints).dtype,
+            # aten.rs `pow_result_tag` -- integral base, float exponent
+            "pow": _C._aten_dispatch("aten.pow.Tensor_Scalar", ints, 2.0).dtype,
+            # aten.rs `arith_result_tag`, both halves: a float scalar against
+            # an integral tensor, and true division of an integral pair
+            "mul.Scalar": _C._aten_dispatch("aten.mul.Scalar", ints, 1.5).dtype,
+            "div.Tensor": _C._aten_dispatch("aten.div.Tensor", ints, ints).dtype,
+        }
+        stayed = {k: str(v) for k, v in followers.items() if v != f64}
+        assert not stayed, stayed
+        # info.rs `PyFinfo::new` -- `torch.finfo()` with no argument reports the
+        # default dtype, and its comment used to cite this setter's absence.
+        assert _C.finfo().dtype == "float64", _C.finfo()
+
+        # It moves back, and it moves to the other two upstream accepts.
+        for name in _DEFAULT_DTYPE_ACCEPTS:
+            want = getattr(_C, name)
+            _C._set_default_dtype(want)
+            assert _C.get_default_dtype() is want, name
+            assert _C._VariableFunctions.ones([1]).dtype == want, name
+
+        # -- what it refuses, in upstream's words ------------------------
+        for name in _DEFAULT_DTYPE_NOT_FLOAT:
+            try:
+                _C._set_default_dtype(getattr(_C, name))
+            except TypeError as e:
+                assert str(e) == (
+                    "only floating-point types are supported as the default type"
+                ), (name, str(e))
+            else:
+                raise AssertionError(f"set_default_dtype accepted torch.{name}")
+
+        # These three pass the floating-point gate upstream and still refuse,
+        # on a storage-class lookup. `float8_e4m3fn` is the one candle *can*
+        # store, so accepting it would have been a divergence nothing else
+        # would have caught.
+        for name, storage in _DEFAULT_DTYPE_NO_STORAGE:
+            try:
+                _C._set_default_dtype(getattr(_C, name))
+            except TypeError as e:
+                assert str(e) == f"couldn't find storage object {storage}", (
+                    name, str(e))
+            else:
+                raise AssertionError(f"set_default_dtype accepted torch.{name}")
+
+        for bad in (None, 3, "float64", _C.device("cpu")):
+            try:
+                _C._set_default_dtype(bad)
+            except TypeError as e:
+                assert str(e) == (
+                    "invalid dtype object: only floating-point types are "
+                    "supported as the default type"
+                ), (bad, str(e))
+            else:
+                raise AssertionError(f"set_default_dtype accepted {bad!r}")
+
+        # A refused call must not have moved anything.
+        assert _C.get_default_dtype() is _C.bfloat16
+    finally:
+        _C._set_default_dtype(_C.float32)
+    assert _C.get_default_dtype() is _C.float32
+    assert _C._VariableFunctions.ones([1]).dtype == _C.float32
 
 
 def test_wait_counter_guard_is_a_context_manager():
@@ -3749,6 +4082,639 @@ def test_what_needs_a_peer_refuses_by_name():
     assert r["all_reduce_PREMUL_SUM"].startswith("REFUSED"), r["all_reduce_PREMUL_SUM"]
     assert "PREMUL_SUM" in r["all_reduce_PREMUL_SUM"], r["all_reduce_PREMUL_SUM"]
     assert r["store_wait"] == "REFUSED", r["store_wait"]
+
+
+# --- printing a tensor (docs/E2E_REAL.md) -----------------------------------
+#
+# `print(tensor)` was the one thing docs/WHEEL.md §5 recorded the built wheel
+# could not do, and it was not a packaging fault: `torch/_tensor_str.py` walks
+# a surface this shim had holes in. The spec for closing it is not a guess --
+# it is a `TorchDispatchMode` logger placed *inside* `_str`'s
+# `_disable_current_modes()` guard on upstream torch 2.13.0, over fourteen
+# tensors chosen to reach every branch of `_str_intern` (empty, 0-d, integral,
+# bool, summarised, sci-mode, all-zero, inf/nan, requires_grad). Upstream's
+# `repr` dispatches exactly 21 aten ops across those; fifteen already had
+# kernels here and six did not:
+#
+#     aten.abs.default   aten.ceil.default    aten.gt.Scalar
+#     aten.min.default   aten.unbind.int      aten.masked_select.default
+#
+# `torch.isfinite` is *not* on that list, and that is the measurement paying
+# for itself: upstream's `isfinite` is `CompositeImplicitAutograd`, so the
+# logger sees it as `eq.Tensor`/`abs`/`ne.Scalar`/`bitwise_and.Tensor` and it
+# belongs in `_install_composites`, not in the kernel table. Naming it a
+# kernel would have invented a work item upstream does not have -- the same
+# mistake `overloads.json`'s note about `layer_norm` describes.
+
+
+_REPR_CASES = [
+    ("2d float", "torch.ones(3, 2) * 4.0"),
+    ("0d", "torch.ones(()) * 1.5"),
+    ("1d empty", "torch.ones(0)"),
+    ("2d empty", "torch.ones(0, 3)"),
+    ("int64", "torch.arange(0, 5)"),
+    ("bool", "torch.arange(0, 4).ne(2)"),
+    ("summarised", "torch.arange(0, 2000).to(torch.float32)"),
+    ("3d", "torch.ones(2, 3, 4)"),
+    ("fractional", "torch.arange(0, 6).to(torch.float32) / 7.0 - 0.4"),
+    ("sci-mode high", "torch.arange(0, 4).to(torch.float32) * 1.0e9"),
+    ("sci-mode low", "torch.arange(1, 5).to(torch.float32) * 1.0e-7"),
+    ("all zeros", "torch.zeros(3, 3)"),
+    ("inf and nan", "torch.tensor([float('inf'), float('nan'), -float('inf'), 1.0])"),
+    ("requires_grad", "(torch.ones(2, 2) * 2.0).requires_grad_(True)"),
+    ("wide int64", "torch.arange(0, 3) * 123456789"),
+    ("negative int64", "torch.arange(0, 5) - 2"),
+    ("mm result", "torch.ops.aten.mm.default(torch.ones(3, 4), torch.ones(4, 2))"),
+]
+
+_REPR_ROAD_SCRIPT = r"""
+import json, sys, traceback
+import torch
+
+CASES = %r
+out = {}
+for label, expr in CASES:
+    try:
+        out[label] = repr(eval(expr))
+    except BaseException:
+        out[label] = "RAISED: " + traceback.format_exc(limit=0).strip().splitlines()[-1]
+json.dump(out, sys.stdout)
+""" % (_REPR_CASES,)
+
+
+@functools.lru_cache(maxsize=1)
+def _repr_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _REPR_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"repr-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_repr_matches_upstream_character_for_character():
+    """Working and correct are different things.
+
+    The comparison is the *string*, not "did it come back without raising".
+    Tensor formatting is where a shim looks finished and is not: the value
+    can be right while the width, the precision, the `...` elision, the
+    `dtype=` suffix or the line breaks are wrong, and every one of those is a
+    thing a user reads. So the expected side is upstream torch 2.13.0 in this
+    interpreter, the actual side is the vendored tree in a subprocess, and
+    they must be equal with `==`.
+
+    The case list is the one the dispatch trace was taken over, so each entry
+    is here because it reaches a branch: `_tensor_str` elides above
+    `PRINT_OPTS.threshold`, switches to scientific notation on the
+    max/min ratio, prints `dtype=` only when it is not the default, prints
+    `size=` only for an empty tensor whose shape is not `(0,)`, and appends
+    `requires_grad=True` from the autograd surface rather than from the
+    formatter.
+    """
+    if not _ckpt_shim_available():
+        return
+    got = _repr_road_fixture()
+    mismatches = []
+    for label, expr in _REPR_CASES:
+        expected = repr(eval(expr, {"torch": _upstream_torch}))
+        actual = got[label]
+        if actual != expected:
+            mismatches.append(f"[{label}] {expr}\n  upstream: {expected!r}\n  shim:     {actual!r}")
+    if mismatches:
+        raise AssertionError(
+            "repr() differs from upstream torch 2.13.0 in "
+            f"{len(mismatches)}/{len(_REPR_CASES)} cases:\n" + "\n".join(mismatches)
+        )
+
+
+def test_the_alternative_representations_have_no_constructors():
+    """Why `is_sparse` and its family are allowed to be one answer.
+
+    Six of the predicates `repr` reads -- `is_nested`, `is_sparse`,
+    `is_quantized`, `_is_zerotensor`, `is_neg` and `_is_functional_tensor` --
+    ask "which representation is this tensor?", and this build has exactly
+    one: candle's dense strided buffer, or the shape-and-dtype-only `Meta`
+    arm. So they answer `False` today, and CLAUDE.md §5.5 is right to be
+    suspicious of that: a predicate that cannot say anything else is not a
+    predicate.
+
+    What makes it a fact rather than a constant is *this* test. Each of these
+    representations has exactly one way into existence, and every one of those
+    ways refuses by name. If any of them ever lands, this test fails, and the
+    predicate that quietly said `False` becomes a lie that something noticed.
+    That is the difference between an invariant and an assumption -- the
+    `is_mutable` accident in docs/DISTRIBUTED.md §8.1 is what an unguarded one
+    looks like.
+
+    `layout` is in the same family and is checked here for the same reason:
+    it reports `torch.strided`, and the sparse layouts have no constructor.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _repr_predicate_fixture()
+    for maker in (
+        "torch.sparse_coo_tensor",
+        "torch.sparse_csr_tensor",
+        "torch._efficientzerotensor",
+        "torch._neg_view",
+        "torch._to_functional_tensor",
+        "torch.quantize_per_tensor",
+        "torch.nested.nested_tensor",
+        "torch._nested_tensor_from_tensor_list",
+        "torch.Tensor.to_sparse",
+        "torch._C._functorch._wrap_for_grad",
+        "torch._C._functorch._add_batch_dim",
+        "torch._C._functorch._vmap_increment_nesting",
+    ):
+        assert r["makers"][maker].startswith("REFUSED"), (maker, r["makers"][maker])
+
+
+def test_the_repr_predicates_are_derived_not_asserted():
+    """Each of the eleven, and where its answer comes from.
+
+    Three groups, three different kinds of grounds:
+
+    * **Device.** `is_mps`, `is_xpu` and `is_maia` are `device.type == ...`,
+      the same derivation `is_cpu`/`is_cuda`/`is_meta` already use in
+      tensor.rs. They are not constants at all -- `torch.zeros(2,
+      device="meta").is_meta` is `True` on this build -- so the test asserts
+      agreement with `.device`, which is what would break if one drifted.
+
+    * **Representation.** `is_nested`/`is_sparse`/`is_quantized`/
+      `_is_zerotensor`/`is_neg`/`layout` are an exhaustive `match` over the
+      shim's `Repr` enum, so adding an arm to it fails the build rather than
+      inheriting a `False`. The constructor guard above is the other half.
+
+    * **A real, empty stack.** `is_functorch_wrapped_tensor` is not a constant
+      here either: it is `maybe_get_level(t) != -1`, and `maybe_get_level`
+      reads the functorch dynamic layer stack, whose depth is 0 because
+      everything that pushes onto it refuses. Upstream agrees on both halves
+      -- measured on 2.13.0, `maybe_get_level(plain) == -1` outside `vmap`
+      and `1` inside it.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _repr_predicate_fixture()
+    # Device-derived: the three new ones agree with `.device`, and the meta
+    # tensor proves the derivation is live rather than a fixed False.
+    assert r["cpu_device_type"] == "cpu"
+    assert r["cpu_is_mps"] is False
+    assert r["cpu_is_xpu"] is False
+    assert r["cpu_is_maia"] is False
+    assert r["cpu_is_cpu"] is True
+    assert r["meta_is_meta"] is True, "is_meta must follow the device, not a constant"
+    assert r["meta_is_cpu"] is False
+    # Representation-derived.
+    assert r["is_nested"] is False
+    assert r["is_sparse"] is False
+    assert r["is_quantized"] is False
+    assert r["is_zerotensor"] is False
+    assert r["is_neg"] is False
+    assert r["layout"] == "torch.strided"
+    assert r["is_functional"] is False
+    # The functorch stack is real and empty, and the predicate reads it.
+    assert r["functorch_stack_depth"] == 0
+    assert r["maybe_get_level"] == -1
+    assert r["is_functorch_wrapped"] is False
+
+
+_REPR_PREDICATE_SCRIPT = r"""
+import json, sys, traceback
+import torch
+
+out = {}
+t = torch.ones(2, 2)
+m = torch.zeros(2, 2, device="meta")
+
+out["cpu_device_type"] = t.device.type
+out["cpu_is_mps"] = t.is_mps
+out["cpu_is_xpu"] = t.is_xpu
+out["cpu_is_maia"] = t.is_maia
+out["cpu_is_cpu"] = t.is_cpu
+out["meta_is_meta"] = m.is_meta
+out["meta_is_cpu"] = m.is_cpu
+out["is_nested"] = t.is_nested
+out["is_sparse"] = t.is_sparse
+out["is_quantized"] = t.is_quantized
+out["is_zerotensor"] = t._is_zerotensor()
+out["is_neg"] = t.is_neg()
+out["layout"] = str(t.layout)
+out["is_functional"] = torch._is_functional_tensor(t)
+out["functorch_stack_depth"] = torch._C._functorch.get_dynamic_layer_stack_depth()
+out["maybe_get_level"] = torch._C._functorch.maybe_get_level(t)
+out["is_functorch_wrapped"] = torch._C._functorch.is_functorch_wrapped_tensor(t)
+
+makers = {}
+def maker(name, fn):
+    try:
+        fn()
+    except NotImplementedError as e:
+        makers[name] = "REFUSED: " + str(e)[:100]
+    except BaseException as e:
+        makers[name] = "%s: %s" % (type(e).__name__, str(e)[:100])
+    else:
+        makers[name] = "MADE"
+
+idx = torch.arange(0, 2).reshape(1, 2)
+maker("torch.sparse_coo_tensor", lambda: torch.sparse_coo_tensor(idx, torch.ones(2)))
+maker("torch.sparse_csr_tensor",
+      lambda: torch.sparse_csr_tensor(torch.arange(0, 3), torch.arange(0, 2), torch.ones(2)))
+maker("torch._efficientzerotensor", lambda: torch._efficientzerotensor((2, 2)))
+maker("torch._neg_view", lambda: torch._neg_view(t))
+maker("torch._to_functional_tensor", lambda: torch._to_functional_tensor(t))
+maker("torch.quantize_per_tensor", lambda: torch.quantize_per_tensor(t, 0.1, 0, torch.qint8))
+maker("torch.nested.nested_tensor", lambda: torch.nested.nested_tensor([t]))
+maker("torch._nested_tensor_from_tensor_list",
+      lambda: torch._nested_tensor_from_tensor_list([t]))
+maker("torch.Tensor.to_sparse", lambda: t.to_sparse())
+maker("torch._C._functorch._wrap_for_grad", lambda: torch._C._functorch._wrap_for_grad(t, 0))
+maker("torch._C._functorch._add_batch_dim", lambda: torch._C._functorch._add_batch_dim(t, 0, 1))
+maker("torch._C._functorch._vmap_increment_nesting",
+      lambda: torch._C._functorch._vmap_increment_nesting(1, "error"))
+out["makers"] = makers
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _repr_predicate_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _REPR_PREDICATE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"repr-predicate subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_the_six_repr_kernels_dispatch():
+    """The kernels themselves, at the `_C` door.
+
+    `tools/golden/cases.py` is what checks these against upstream value by
+    value; what this holds down is that the dispatcher *reaches* them under
+    the exact keys the trace named, because a kernel registered under a key
+    nothing resolves to is invisible to both.
+    """
+    for op in (
+        "aten.abs.default",
+        "aten.ceil.default",
+        "aten.gt.Scalar",
+        "aten.gt.Tensor",
+        "aten.masked_select.default",
+        "aten.min.default",
+        "aten.unbind.int",
+    ):
+        assert op in _C._aten_all_implemented(), op
+
+    x = _C._tensor_from_flat([-2.0, -0.5, 0.0, 3.25], [4], _C.float32)
+    assert _C._aten_dispatch("aten.abs.default", x).tolist() == [2.0, 0.5, 0.0, 3.25]
+    assert _C._aten_dispatch("aten.ceil.default", x).tolist() == [-2.0, -0.0, 0.0, 4.0]
+    assert _C._aten_dispatch("aten.gt.Scalar", x, 0.0).tolist() == [False, False, False, True]
+    assert _C._aten_dispatch("aten.min.default", x).tolist() == -2.0
+
+    mask = _C._tensor_from_flat([1, 0, 0, 1], [4], _C.bool)
+    assert _C._aten_dispatch("aten.masked_select.default", x, mask).tolist() == [-2.0, 3.25]
+
+    y = _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [2, 2], _C.float32)
+    rows = _C._aten_dispatch("aten.unbind.int", y, 0)
+    assert [r.tolist() for r in rows] == [[1.0, 2.0], [3.0, 4.0]]
+    cols = _C._aten_dispatch("aten.unbind.int", y, 1)
+    assert [c.tolist() for c in cols] == [[1.0, 3.0], [2.0, 4.0]]
+
+    z = _C._tensor_from_flat([1.0, 5.0], [2], _C.float32)
+    w = _C._tensor_from_flat([3.0, 3.0], [2], _C.float32)
+    assert _C._aten_dispatch("aten.gt.Tensor", z, w).tolist() == [False, True]
+
+
+def test_cat_skips_a_tensor_of_shape_zero_and_only_that_shape():
+    """torch's "legacy empty" rule, and the line it is drawn at.
+
+    `transformers`' KV cache is `torch.tensor([])` until the first decoder
+    step and then `torch.cat([self.keys, key_states], dim=-2)`
+    (`cache_utils.py:144`), so the very first attention layer of every model
+    concatenates a 1-D empty against a 4-D tensor. This shim raised
+    `IndexError` there and the forward pass stopped -- docs/E2E_REAL.md.
+
+    The four assertions below are the rule's *edges*, measured on 2.13.0,
+    because "skip empty tensors" is the plausible over-generalisation and it
+    is wrong: `torch.ones(0, 5)` is empty and is **not** skipped.
+    """
+    empty = _C._tensor_from_flat([], [0], _C.float32)
+    body = _C._tensor_from_flat([float(i) for i in range(24)], [1, 2, 3, 4], _C.float32)
+
+    joined = _C._aten_dispatch("aten.cat.default", [empty, body], -2)
+    assert tuple(joined.shape) == (1, 2, 3, 4), joined.shape
+    assert joined.tolist() == body.tolist()
+
+    # Every entry skipped: `(0,)` back, and `dim` is never looked at.
+    both = _C._aten_dispatch("aten.cat.default", [empty, empty], 5)
+    assert tuple(both.shape) == (0,), both.shape
+
+    # A *non-empty* 1-D entry does not get the exemption.
+    one_d = _C._tensor_from_flat([1.0, 2.0], [2], _C.float32)
+    try:
+        _C._aten_dispatch("aten.cat.default", [one_d, body], -2)
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("cat must not skip a non-empty 1-D tensor")
+
+    # Empty but not `(0,)`: upstream refuses on the rank mismatch, so this
+    # must not be skipped either.
+    wide_empty = _C._tensor_from_flat([], [0, 5], _C.float32)
+    try:
+        _C._aten_dispatch("aten.cat.default", [wide_empty, body], -2)
+    except (RuntimeError, IndexError):
+        pass
+    else:
+        raise AssertionError("cat must not skip an empty tensor of shape (0, 5)")
+
+
+def test_autocast_is_off_and_cannot_be_turned_on():
+    """`torch._C.is_autocast_enabled` -- the wall docs/DISTRIBUTED.md §7 named.
+
+    `transformers/utils/generic.py:250` opens `maybe_autocast` with
+    `if torch.is_autocast_enabled(device_type) or enabled:`, and
+    `modeling_llama.py:121` wraps the rotary embedding in it. So the first
+    forward pass of the first real `transformers` model this project ever
+    built stopped on this name.
+
+    **The answer is not a constant, and the refusal beside it is why.**
+    Autocast is a dispatch key that casts an op's inputs to a lower precision;
+    this shim has no such key, so a `True` here would promise casting that
+    never happens and hand back `float32` results claiming to be `bfloat16`
+    ones. `is_autocast_enabled` therefore reads a real flag, and
+    `set_autocast_enabled(device_type, True)` **refuses by name** -- the flag
+    cannot be raised, so the read is derived rather than asserted, the same
+    shape as the functorch stack in `_install_repr_surface`.
+
+    Setting it to `False` is accepted, because that is already true.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _forward_road_fixture()
+    assert r["autocast_cpu"] is False
+    assert r["autocast_enable_refused"].startswith("REFUSED"), r["autocast_enable_refused"]
+    assert "autocast" in r["autocast_enable_refused"], r["autocast_enable_refused"]
+    assert r["autocast_disable_ok"] == "OK", r["autocast_disable_ok"]
+    # ... and upstream agrees about the value outside an autocast block.
+    assert _upstream_torch._C.is_autocast_enabled("cpu") is False
+
+
+def test_is_tracing_agrees_with_the_tracing_state():
+    """Two names, one fact.
+
+    `torch/jit/_trace.py:1269` asks `_is_tracing()`; `torch/_tensor.py:1186`
+    asks `_get_tracing_state()`. Upstream's `_is_tracing()` is
+    "is there a tracing state?", and `_get_tracing_state` was already
+    answering `None` here (see `_DISCOVERED_RETURNS`). So this is derived from
+    that one rather than being a second constant that could drift away from
+    it -- which is the whole content of the assertion below.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _forward_road_fixture()
+    assert r["tracing_state"] is None
+    assert r["is_tracing"] is False
+    assert r["is_tracing"] == (r["tracing_state"] is not None)
+    assert _upstream_torch._C._is_tracing() is False
+
+
+def test_a_real_transformers_llama_forward_matches_upstream():
+    """The thing this round was for.
+
+    Every model comparison in this file until now used a decoder **this file
+    transcribes op by op** (`_e2e_build`/`_e2e_forward`). That proves the
+    kernels and proves nothing about the tree: a transcription can agree with
+    upstream while `transformers`' own `LlamaForCausalLM` cannot run at all,
+    and until this round it could not -- docs/DISTRIBUTED.md §8 item 1 lists
+    the forward pass as untried.
+
+    This one builds the real thing on both sides:
+    `AutoModelForCausalLM.from_config(LlamaConfig(...))`, the same
+    `transformers` 5.15.1 in both interpreters, differing only in which
+    `torch` is underneath. Weights are pushed in through `load_state_dict`
+    from an RNG-free generator, so neither side depends on the other's
+    random stream, and both `state_dict` key order and shapes come from
+    `transformers` rather than from this file.
+
+    Tokens *and* logits, for the reason the comment above
+    `_E2E_LOGIT_ATOL` gives: docs/ARCH.md §5.1 measured a real bug that
+    produced identical greedy tokens with logits 379x further apart than the
+    correct kernel's.
+
+    **`_E2E_LOGIT_ATOL` is the wrong bound for this test, and the one used
+    below was measured rather than chosen.** That constant is 1e-5
+    *absolute*, sized for the 64-wide, 100-vocab decoder the rest of this file
+    compares. This model is 16-wide with a 32-token vocabulary and its logits
+    sit around 0.05, so 1e-5 is roughly 20% of a logit: the assertion could
+    not fail. Measured, by scaling `aten.silu.default`'s output on the shim
+    side only and re-running this comparison (docs/E2E_REAL.md):
+
+        clean                        2.24e-08
+        silu x 1.0001 (0.01% high)   1.42e-07    under 1e-5 -- not caught
+        silu x 1.001  (0.1%  high)   1.44e-06    under 1e-5 -- not caught
+
+    So the bound here is 5e-7: 22x above the clean measurement, and it does
+    catch the 0.1% error the file-wide constant lets through. It does **not**
+    catch the 0.01% one, and that is said rather than hidden -- a model this
+    small dilutes a single activation error, and the answer to that is a
+    bigger model, not a tighter number.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    r = _forward_road_fixture()
+    assert r["forward"] == "OK", r["forward"]
+    expected = _upstream_llama_logits()
+    assert r["logits_shape"] == expected["shape"], (r["logits_shape"], expected["shape"])
+    assert r["argmax"] == expected["argmax"], (r["argmax"], expected["argmax"])
+    max_diff = max(abs(a - b) for a, b in zip(r["logits"], expected["logits"]))
+    assert max_diff < _REAL_LLAMA_ATOL, max_diff
+    # And the logits are printable, which is the other half of this round.
+    assert r["logits_repr"].startswith("tensor("), r["logits_repr"][:80]
+
+
+# See the docstring above for the three measurements this comes from.
+_REAL_LLAMA_ATOL = 5e-7
+
+
+try:
+    import transformers as _upstream_transformers
+except Exception:  # pragma: no cover - transformers is not a test dependency
+    _upstream_transformers = None
+
+
+# The config is small on purpose -- big enough to exercise attention, rotary
+# embeddings, the MLP and the LM head, small enough that `load_state_dict`
+# from a Python list is not the thing being measured.
+_LLAMA_CFG = dict(
+    vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+    num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=32,
+    tie_word_embeddings=False,
+)
+_LLAMA_IDS = [3, 7, 1, 19]
+
+# Shared by both interpreters, as source text: the two sides must fill the
+# weights by *the same procedure*, not by two transcriptions of one idea.
+_LLAMA_FILL = r'''
+def _fill(model, torch):
+    sd = model.state_dict()
+    new = {}
+    for i, key in enumerate(sorted(sd)):
+        ref = sd[key]
+        n = 1
+        for d in ref.shape:
+            n *= int(d)
+        state = (i + 1) * 7919
+        vals = []
+        for _ in range(n):
+            state = (state * 1103515245 + 12345) % 2147483648
+            vals.append(round(((state / 2147483648.0) * 2.0 - 1.0) * 0.2, 6))
+        t = torch.tensor(vals, dtype=torch.float32)
+        new[key] = t.reshape(list(int(d) for d in ref.shape)) if len(ref.shape) != 1 else t
+    model.load_state_dict(new)
+    return model
+'''
+
+
+@functools.lru_cache(maxsize=1)
+def _upstream_llama_logits():
+    """The expected side, in this interpreter, on upstream torch."""
+    torch = _upstream_torch
+    from transformers import AutoModelForCausalLM
+    from transformers.models.llama.configuration_llama import LlamaConfig
+
+    ns = {}
+    exec(_LLAMA_FILL, ns)
+    model = AutoModelForCausalLM.from_config(LlamaConfig(**_LLAMA_CFG))
+    model.eval()
+    ns["_fill"](model, torch)
+    with torch.no_grad():
+        logits = model(torch.tensor([_LLAMA_IDS])).logits
+    flat = _e2e_flatten(logits.tolist())
+    return {
+        "shape": list(int(d) for d in logits.shape),
+        "logits": flat,
+        "argmax": [int(x) for x in logits[0].argmax(-1).tolist()],
+    }
+
+
+_FORWARD_ROAD_SCRIPT = r"""
+import json, sys, traceback
+import torch
+
+out = {}
+
+out["autocast_cpu"] = torch._C.is_autocast_enabled("cpu")
+try:
+    torch._C.set_autocast_enabled("cpu", True)
+except NotImplementedError as e:
+    out["autocast_enable_refused"] = "REFUSED: " + str(e)[:160]
+except BaseException as e:
+    out["autocast_enable_refused"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+else:
+    out["autocast_enable_refused"] = "ACCEPTED"
+try:
+    torch._C.set_autocast_enabled("cpu", False)
+except BaseException as e:
+    out["autocast_disable_ok"] = "%s: %s" % (type(e).__name__, str(e)[:120])
+else:
+    out["autocast_disable_ok"] = "OK"
+
+out["tracing_state"] = torch._C._get_tracing_state()
+out["is_tracing"] = torch._C._is_tracing()
+
+FILL = __FILL__
+CFG = __CFG__
+IDS = __IDS__
+try:
+    from transformers import AutoModelForCausalLM
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    ns = {}
+    exec(FILL, ns)
+    model = AutoModelForCausalLM.from_config(LlamaConfig(**CFG))
+    model.eval()
+    ns["_fill"](model, torch)
+    out["model_class"] = type(model).__name__
+    with torch.no_grad():
+        logits = model(torch.tensor([IDS])).logits
+except BaseException:
+    out["forward"] = "FAILED: " + traceback.format_exc(limit=4)
+else:
+    out["forward"] = "OK"
+    out["logits_shape"] = [int(d) for d in logits.shape]
+    def flat(v):
+        if isinstance(v, list):
+            r = []
+            for e in v:
+                r.extend(flat(e))
+            return r
+        return [v]
+    out["logits"] = flat(logits.tolist())
+    out["argmax"] = [int(x) for x in logits[0].argmax(-1).tolist()]
+    out["logits_repr"] = repr(logits)
+json.dump(out, sys.stdout)
+""".replace("__FILL__", repr(_LLAMA_FILL)).replace(
+    "__CFG__", repr(_LLAMA_CFG)).replace("__IDS__", repr(_LLAMA_IDS))
+
+
+@functools.lru_cache(maxsize=1)
+def _forward_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _FORWARD_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"forward-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_min_and_max_refuse_an_empty_reduction_the_same_way():
+    """`min.default` is `max.default`'s mirror, including the refusal.
+
+    Upstream raises `RuntimeError: min(): Expected reduction dim to be
+    specified for input.numel() == 0.` -- the identity element is what a
+    whole-tensor min of nothing would need, and there isn't one. The shim
+    already reproduced this for `max`; the point of asserting both here is
+    that the new kernel is the mirror rather than a fresh guess.
+    """
+    empty = _C._tensor_from_flat([], [0], _C.float32)
+    for op in ("aten.min.default", "aten.max.default"):
+        try:
+            _C._aten_dispatch(op, empty)
+        except RuntimeError as e:
+            assert "numel() == 0" in str(e), (op, str(e))
+        else:
+            raise AssertionError(f"{op} on an empty tensor must raise")
+
 
 def _main():
     failures = 0

@@ -142,6 +142,24 @@ aten op 이 아닙니다 — 상류가 `THPModule_getDefaultDtype` 을 `_C` 에 
 대신 디스패처에 물어서 확인합니다. `set_default_dtype` 은 **이름을 대고 거절**합니다 —
 Rust 상수에 닿아야 하는데 닿을 수 없으므로, 받아놓고 아무것도 안 하는 것보다 거절이 맞습니다.
 
+> **거절이 닫혔습니다 (2026-08-28).** `transformers` 의 `modeling_utils.py:239` 이
+> `from_pretrained` 로 들어가는 길에 `torch.set_default_dtype(dtype)` 을 무조건 부르므로,
+> 상수를 프로세스 전역으로 바꿨습니다 — `dtype.rs` 의 `DEFAULT_FLOAT_CHOICE`(`AtomicU8`)
+> 와 `default_float()`. 위 문단의 `aten.rs` `DEFAULT_FLOAT` 는 더 이상 없습니다.
+>
+> **핵심은 그 전역이 실제로 읽히는가입니다.** `ones`·`zeros`·`empty`·`arange`·
+> `torch.tensor`·`full`·`scalar_tensor`·`rsqrt`·`cos`·`pow`·`mul.Scalar`·`div.Scalar`·
+> `torch.finfo()` 가 전부 따라가는 것을 단언합니다
+> (`test_set_default_dtype_moves_every_rule_that_reads_the_default`). 그중 `full` 과
+> `finfo()` 는 상수를 직접 적고 있었으므로 같이 고쳤습니다 — 안 고쳤다면 그 둘만 float32 에
+> 남는, **아무것도 안 하는 세터보다 나쁜** 상태가 됐을 것입니다.
+>
+> 받고 거절하는 것은 상류를 재서 그대로 옮겼습니다: float32·float64·float16·bfloat16 만
+> 받고, 부동소수가 아닌 태그는 `TypeError: only floating-point types are supported as the
+> default type`, float8/float4 여섯은 상류의 저장소 클래스 탐색을 그대로 재현해
+> `couldn't find storage object <X>Storage`, dtype 이 아닌 객체는 `invalid dtype object: ...`
+> 입니다. `set_default_tensor_type` 은 다른 이름이고, 걸음이 요구하지 않아 그대로 둡니다.
+
 ---
 
 ## 4. `_distributed_c10d` — 무엇이 실물이고 무엇이 거절인가
@@ -297,6 +315,12 @@ $PY rust/torch_c/pytests/verify_schemas.py  exit 0   255/255 (전 233, +22)
 ---
 
 ## 7. 다음 벽 — 분산이 아닙니다
+
+> **열렸습니다 (2026-08-28). `docs/E2E_REAL.md` §4 를 보십시오.** `from_config` 로 만든
+> `LlamaForCausalLM` 이 순전파를 돌고, 로짓이 상류와 2.24e-08 안에서 일치합니다. 이 이름
+> 외에 실제로 필요했던 것은 `torch._C._is_tracing` 하나와 `cat` 의 legacy-empty 규칙뿐이었고,
+> 다음 벽은 `from_pretrained` 의 `torch._C._set_default_dtype` — 즉 §3.4 가 남겨 둔 그
+> 항목입니다.
 
 ```
 torch._C.is_autocast_enabled
