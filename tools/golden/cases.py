@@ -2087,6 +2087,19 @@ def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([7], (1,), "single element"),
         ]:
             cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    # The case this builder was missing, and its absence was hiding a wrong
+    # answer rather than leaving a gap in coverage: candle's reduction *skips*
+    # NaN, so `max([3, nan, 1])` came back `3.0` here where upstream gives
+    # `nan` (docs/E2E_REAL.md). Every case above passed throughout. The kernel
+    # tests for NaN explicitly now, on `max` and `min` alike, and this pins it;
+    # `min_default_cases` carries the mirror.
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float32", [3.0, float("nan"), 1.0], (3,),
+            "NaN propagates: max() of a tensor containing NaN is NaN (measured) -- "
+            "torch's rule is IEEE maximum, not fmax",
+        )
+    )
     return cases
 
 
@@ -7421,6 +7434,418 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.abs.default / aten.ceil.default / aten.gt.{Scalar,Tensor} /
+#     aten.masked_select.default / aten.min.default / aten.unbind.int -------
+#
+# The six ops `repr(tensor)` dispatches that this shim lacked -- measured
+# with a `TorchDispatchMode` logger wrapped around
+# `torch._tensor_str._str_intern` and diffed against `_aten_implemented()`.
+# rust/torch_c is landing kernels for these concurrently with this change;
+# they may not appear in `_aten_implemented()` yet (see the "PENDING"
+# printout in compare.py's `run()`), which is expected -- the point of
+# adding builders now is that the harness fails loudly, not silently, the
+# moment each kernel lands without one.
+
+
+def abs_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.abs.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, [1.0, -2.0, 0.0, 0.5], (2, 2), "assorted signs"))
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, [-0.0], (), "-0.0 abs's to 0.0 (measured)"))
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [float("inf"), float("-inf"), float("nan")], (3,),
+                "inf/nan: both infinities become +inf, nan stays nan (measured)",
+            )
+        )
+
+    # Signed integers, including each dtype's most-negative value. That value
+    # has no positive representation, and upstream's abs() wraps it straight
+    # back to itself instead of refusing (measured) -- the same two's
+    # complement wraparound `neg_cases` and `_FULL_FILLS["int32"]` already
+    # pin elsewhere in this file, not a new discrepancy.
+    _ABS_INT_MIN = {"int64": -9223372036854775808, "int32": -2147483648, "int16": -32768}
+    for dtype_name in ["int64", "int32", "int16"]:
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, [1, -2, 0, 7], (2, 2), "signed integers"))
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [_ABS_INT_MIN[dtype_name]], (1,),
+                f"{dtype_name} min has no positive representation -- abs() wraps back to "
+                "the same negative value upstream (measured), it does not raise",
+            )
+        )
+    cases.append(_unary_case(torch_module, c_module, op, torch_call, "uint8", [0, 1, 255], (3,), "unsigned: abs is the identity"))
+
+    cases.append(
+        Case(
+            name="abs(dtype=bool) [torch refuses]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False])),
+            run_c=lambda: c_module._aten_dispatch(op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool)),
+            expect="both_error",
+            note="torch: NotImplementedError(\"abs_cpu\" not implemented for 'Bool') (measured)",
+        )
+    )
+    return cases
+
+
+def ceil_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.ceil.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1.2, -1.2, -0.5, 0.5, 2.0, -2.0], (2, 3),
+                "fractional values, including -0.5 -- torch gives -0., not 0. (measured)",
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1.0, -1.0, 0.0, 5.0], (2, 2), "already-integral values are a no-op",
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [float("inf"), float("-inf"), float("nan")], (3,), "inf/nan pass through unchanged (measured)",
+            )
+        )
+
+    # Integer dtypes: ceil is an identity, not a refusal (measured) -- unlike
+    # `abs`/`neg` there is no sign/overflow question here, so no dtype-min case.
+    for dtype_name in ["int64", "int32", "int16", "uint8"]:
+        flat = [1, 2, 3] if dtype_name == "uint8" else [1, -2, 3]
+        cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, (3,), "integers: ceil is the identity (measured)"))
+
+    cases.append(
+        Case(
+            name="ceil(dtype=bool) [torch refuses]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False])),
+            run_c=lambda: c_module._aten_dispatch(op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool)),
+            expect="both_error",
+            note="torch: NotImplementedError(\"ceil_vml_cpu\" not implemented for 'Bool') (measured)",
+        )
+    )
+    return cases
+
+
+def gt_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.gt.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    cases.append(
+        Case(
+            name="gt(int64, x > x is False) [equality boundary]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0],
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1],
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1],
+            ),
+            note="every element compared against itself -- strict >, so all False",
+        )
+    )
+    cases.append(
+        Case(
+            name="gt(float32, nan > nan and nan > 1.0) [every comparison against NaN is false]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 3.0, 2.0], (3,), "float32")[0],
+                _pair(torch_module, c_module, [float("nan"), 2.0, float("nan")], (3,), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [float("nan"), 3.0, 2.0], (3,), "float32")[1],
+                _pair(torch_module, c_module, [float("nan"), 2.0, float("nan")], (3,), "float32")[1],
+            ),
+            note="NaN on either side (or both) makes that element False, even 3.0 > nan",
+        )
+    )
+    cases.append(
+        Case(
+            name="gt(bool, [T,F,T] > [F,F,T]) [bool compares as 0/1]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 0, 1], (3,), "bool")[0],
+                _pair(torch_module, c_module, [0, 0, 1], (3,), "bool")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 0, 1], (3,), "bool")[1],
+                _pair(torch_module, c_module, [0, 0, 1], (3,), "bool")[1],
+            ),
+            note="True > False is True, True > True is False (measured)",
+        )
+    )
+    return cases
+
+
+def gt_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.gt.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        cases.append(
+            _binary_scalar_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 4], (2, 2), 3, "x > 3, as reached from __gt__ with a python scalar",
+            )
+        )
+    cases.append(
+        Case(
+            name="gt(int64, x > 4) [equality boundary -- 4 itself is not > 4]",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int64")[0], 4),
+            run_c=lambda: c_module._aten_dispatch(op, _pair(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int64")[1], 4),
+            note="the largest element equals the scalar -- strict >, so it is False",
+        )
+    )
+    cases.append(
+        Case(
+            name="gt(int64 tensor, float scalar 2.5) [int-vs-float scalar]",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0], 2.5),
+            run_c=lambda: c_module._aten_dispatch(op, _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1], 2.5),
+            note="a float Scalar against an int tensor -- torch compares numerically, "
+                 "no dtype promotion of the result (still bool) (measured)",
+        )
+    )
+    cases.append(
+        Case(
+            name="gt(float32, nan > 1.0) [every comparison against NaN is false]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[0], 1.0
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")[1], 1.0
+            ),
+            note="NaN is not > anything, including a value smaller than the other element",
+        )
+    )
+    cases.append(
+        Case(
+            name="gt(bool, [T,F] > 0) [bool compares as 0/1 against an int scalar]",
+            op=op,
+            run_torch=lambda: torch_call(_pair(torch_module, c_module, [1, 0], (2,), "bool")[0], 0),
+            run_c=lambda: c_module._aten_dispatch(op, _pair(torch_module, c_module, [1, 0], (2,), "bool")[1], 0),
+            note="True > 0 is True, False > 0 is False (measured)",
+        )
+    )
+    return cases
+
+
+def masked_select_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.masked_select.default"
+    cases: list[Case] = []
+
+    # 2-D self, 2-D bool mask, same shape -- the base case. Mask construction
+    # follows `masked_fill__scalar_cases`'s pattern: `_C`'s `_tensor_from_flat`
+    # takes an int 0/1 flat list with an explicit `dtype=c_module.bool`; torch
+    # builds the mask straight from a python bool list.
+    a_flat, a_shape = [1, 2, 3, 4, 5, 6], (2, 3)
+    mask_flat = [True, False, True, False, True, False]
+    for dtype_name in ["float64", "float32", "int64", "int32", "uint8"]:
+        a_flat_typed = [float(v) for v in a_flat] if "float" in dtype_name else a_flat
+        cases.append(
+            Case(
+                name=f"masked_select(dtype={dtype_name}, self=(2,3), mask=(2,3)) [checkerboard mask]",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name, a=a_flat_typed: torch_call(
+                    torch_module.tensor(a, dtype=dt.torch_dtype(torch_module, dtype_name)).reshape(list(a_shape)),
+                    torch_module.tensor(mask_flat).reshape(list(a_shape)),
+                ),
+                run_c=lambda dtype_name=dtype_name, a=a_flat_typed: c_module._aten_dispatch(
+                    op,
+                    c_module._tensor_from_flat(a, list(a_shape), dtype=dt.c_dtype(c_module, dtype_name)),
+                    c_module._tensor_from_flat([int(v) for v in mask_flat], list(a_shape), dtype=c_module.bool),
+                ),
+                note="same-shape mask, three True and three False -- a 1-D result of length 3",
+            )
+        )
+
+    # Broadcasting mask: (N,1) against a (N,hidden) receiver -- the same
+    # sentinel-mask shape `masked_fill__scalar_cases` documents for mixtral,
+    # measured here to also broadcast (not refuse) under masked_select.
+    b_flat, b_shape = [float(v) for v in range(1, 9)], (4, 2)
+    bmask_flat = [True, False, True, False]
+    cases.append(
+        Case(
+            name="masked_select(dtype=float32, mask (4,1) broadcasts into self (4,2))",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor(b_flat).reshape(list(b_shape)),
+                torch_module.tensor(bmask_flat).reshape([4, 1]),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat(b_flat, list(b_shape), dtype=c_module.float32),
+                c_module._tensor_from_flat([int(v) for v in bmask_flat], [4, 1], dtype=c_module.bool),
+            ),
+            note="mask broadcasts along the last dim (measured) -- rows 0 and 2 survive whole",
+        )
+    )
+
+    # All-False: an empty result, not a refusal (measured). Shape and dtype
+    # still matter -- an empty result is exactly the kind of thing a shim
+    # could get right in dtype/shape and still return as the wrong rank.
+    cases.append(
+        Case(
+            name="masked_select(dtype=int64, all-False mask) [empty result]",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor(a_flat, dtype=torch_module.int64).reshape(list(a_shape)),
+                torch_module.zeros(a_shape, dtype=torch_module.bool),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat(a_flat, list(a_shape), dtype=c_module.int64),
+                c_module._tensor_from_flat([0] * 6, list(a_shape), dtype=c_module.bool),
+            ),
+            note="torch gives a 1-D, 0-element int64 tensor -- not a refusal, and not 0-d (measured)",
+        )
+    )
+
+    # All-True: the whole tensor, flattened.
+    cases.append(
+        Case(
+            name="masked_select(dtype=int64, all-True mask) [whole tensor, flattened]",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.tensor(a_flat, dtype=torch_module.int64).reshape(list(a_shape)),
+                torch_module.ones(a_shape, dtype=torch_module.bool),
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                c_module._tensor_from_flat(a_flat, list(a_shape), dtype=c_module.int64),
+                c_module._tensor_from_flat([1] * 6, list(a_shape), dtype=c_module.bool),
+            ),
+            note="every element survives, in row-major flattened order",
+        )
+    )
+    return cases
+
+
+def min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.min.default"
+    cases: list[Case] = []
+    # Mirrors `max_default_cases`' own scenarios exactly (same dtypes, same
+    # shapes) -- the point is the same kernel-selection risk in the opposite
+    # direction, not a different set of inputs.
+    for dtype_name in _REDUCE_DTYPES:
+        for flat, shape, note in [
+            ([1, 5, 2, 9, 0, 3], (2, 3), "global min, flattened"),
+            ([-5, -1, -9, -3], (2, 2), "all-negative values"),
+            ([7], (1,), "single element"),
+        ]:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    # NaN propagates rather than being ignored (measured) -- torch does not
+    # treat min as nan-skipping the way e.g. nanmin would.
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float32", [1.0, float("nan"), 2.0], (3,),
+            "NaN propagates: min() of a tensor containing NaN is NaN (measured)",
+        )
+    )
+    # No empty-tensor case: `max_default_cases` does not have one either --
+    # measured, torch's `min()` raises on an empty input ("Expected reduction
+    # dim to be specified for input.numel() == 0"), so it is out of scope for
+    # the same reason that one is.
+    return cases
+
+
+def unbind_int_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.unbind.int"
+    cases: list[Case] = []
+
+    for dtype_name in ["float32", "int64"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, list(range(6)), (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"unbind(dtype={dtype_name}, shape=(2,3), dim=0) [two rows]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                value_check=_chunk_list_check,
+                note="dim=0 on a 2-D tensor -- a list of two 1-D tensors, see _chunk_list_check",
+            )
+        )
+
+    b_t, b_c = pair_from_flat(torch_module, c_module, list(range(6)), (2, 3), "float32")
+    cases.append(
+        Case(
+            name="unbind(dtype=float32, shape=(2,3), dim=1) [non-zero dim, three columns]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, 1),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, 1),
+            value_check=_chunk_list_check,
+            note="dim=1 -- a list of three 1-D tensors, one per column",
+        )
+    )
+    cases.append(
+        Case(
+            name="unbind(dtype=float32, shape=(2,3), dim=-1) [negative dim]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, -1),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, -1),
+            value_check=_chunk_list_check,
+            note="dim=-1 addresses the same axis as dim=1 (measured identical result)",
+        )
+    )
+
+    c_t, c_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "float32")
+    cases.append(
+        Case(
+            name="unbind(dtype=float32, shape=(3,), dim=0) [1-D self -- 0-d results]",
+            op=op,
+            run_torch=lambda: torch_call(c_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, 0),
+            value_check=_chunk_list_check,
+            note="a 1-D input unbinds into a list of 0-d tensors (measured)",
+        )
+    )
+
+    d_t, d_c = pair_from_flat(torch_module, c_module, list(range(24)), (2, 3, 4), "float32")
+    cases.append(
+        Case(
+            name="unbind(dtype=float32, shape=(2,3,4), dim=1) [3-D self]",
+            op=op,
+            run_torch=lambda: torch_call(d_t, 1),
+            run_c=lambda: c_module._aten_dispatch(op, d_c, 1),
+            value_check=_chunk_list_check,
+            note="a list of three (2,4) tensors -- the unbound dim disappears from every chunk",
+        )
+    )
+
+    e_t, e_c = pair_from_flat(torch_module, c_module, [], (0, 3), "float32")
+    cases.append(
+        Case(
+            name="unbind(dtype=float32, shape=(0,3), dim=0) [extent 0 along the unbind dim]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 0),
+            value_check=_chunk_list_check,
+            note="zero rows to unbind -- an empty list, not an error (measured)",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
@@ -7547,4 +7972,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.div_.Tensor": div__tensor_cases,
     "aten.masked_fill_.Scalar": masked_fill__scalar_cases,
     "aten.index_put_.default": index_put__cases,
+    # The six ops `repr(tensor)` dispatches that this shim lacked, measured
+    # with a TorchDispatchMode logger around torch._tensor_str._str_intern.
+    "aten.abs.default": abs_cases,
+    "aten.ceil.default": ceil_cases,
+    "aten.gt.Tensor": gt_tensor_cases,
+    "aten.gt.Scalar": gt_scalar_cases,
+    "aten.masked_select.default": masked_select_cases,
+    "aten.min.default": min_default_cases,
+    "aten.unbind.int": unbind_int_cases,
 }

@@ -503,6 +503,126 @@ impl PyTensorBase {
         self.device_label().kind == "cuda"
     }
 
+    /// `tensor.is_mps` / `is_xpu` / `is_maia`, the three remaining device
+    /// predicates `torch/_tensor_str.py` reads before it prints anything.
+    ///
+    /// Same derivation as `is_cpu`/`is_cuda`/`is_meta` above, and here for the
+    /// same reason those are: `_tensor_str.py:121-123` branches on all three
+    /// (`tensor_totype` picks `float` over `double` on MPS and on Maia, and
+    /// asks `xpu.get_device_properties(...).has_fp64` on XPU), and a raising
+    /// stub made `print(tensor)` a hard stop on a line upstream skips.
+    ///
+    /// They answer `False` today because `PyDevice::from_candle` reports only
+    /// `cpu`, `cuda` and `metal` -- but that is a fact about the device layer
+    /// rather than a constant written here, which is the difference this
+    /// spelling preserves. Note `mps` in particular: `torch.device("mps")` is
+    /// a *constructible* label in this shim (there is a smoke test for it), so
+    /// this predicate is one working backend away from answering `True` on its
+    /// own.
+    #[getter]
+    fn is_mps(&self) -> bool {
+        self.device_label().kind == "mps"
+    }
+
+    #[getter]
+    fn is_xpu(&self) -> bool {
+        self.device_label().kind == "xpu"
+    }
+
+    #[getter]
+    fn is_maia(&self) -> bool {
+        self.device_label().kind == "maia"
+    }
+
+    /// The five "which representation is this?" predicates, and `layout`.
+    ///
+    /// `torch/_tensor_str.py` reads every one of them before it prints a
+    /// number: `is_nested` picks the `nested_tensor(` prefix, `is_sparse` and
+    /// `layout` pick the COO and the compressed-sparse formatters,
+    /// `is_quantized` adds the `quantization_scheme=` suffix, `_is_zerotensor`
+    /// forces a `clone` and `is_neg` forces a `resolve_neg`.
+    ///
+    /// **They are an exhaustive `match` over `Repr`, not a `false`.** That is
+    /// the whole of the argument for them, and it is deliberately structural:
+    /// this shim has exactly two representations, candle's dense strided
+    /// buffer and the shape-and-dtype-only `Meta` arm, and neither is nested,
+    /// sparse, quantised, a `ZeroTensor` or a negative-bit view. Writing it as
+    /// a match means a third arm cannot be added to `Repr` without the
+    /// compiler asking what these six answer for it -- where a bare `false`
+    /// would inherit silently, which is exactly the shape of the `is_mutable`
+    /// accident in docs/DISTRIBUTED.md §8.1.
+    ///
+    /// The other half of the argument is in `pytests/test_shim.py`
+    /// (`test_the_alternative_representations_have_no_constructors`): each of
+    /// these representations has exactly one way into existence and every one
+    /// of those ways refuses by name, so `False` is derivable from the
+    /// constructor set rather than asserted. If any of them ever lands, that
+    /// test fails and these stop being answerable this way.
+    #[getter]
+    fn is_nested(&self) -> bool {
+        match self.inner {
+            Repr::Dense(_) => false,
+            Repr::Meta { .. } => false,
+        }
+    }
+
+    #[getter]
+    fn is_sparse(&self) -> bool {
+        match self.inner {
+            Repr::Dense(_) => false,
+            Repr::Meta { .. } => false,
+        }
+    }
+
+    #[getter]
+    fn is_quantized(&self) -> bool {
+        match self.inner {
+            Repr::Dense(_) => false,
+            Repr::Meta { .. } => false,
+        }
+    }
+
+    /// A *method* upstream, not a property -- `_tensor_str.py:336` spells it
+    /// `self._is_zerotensor()`. Getting that wrong is not a subtle failure
+    /// (`'bool' object is not callable` is what a property gives), but it is
+    /// the kind that is only visible by running the tree.
+    fn _is_zerotensor(&self) -> bool {
+        match self.inner {
+            Repr::Dense(_) => false,
+            Repr::Meta { .. } => false,
+        }
+    }
+
+    /// Also a method (`_tensor_str.py:341`). The negative bit is set only by
+    /// `torch._neg_view`; `neg()` materialises here exactly as it does
+    /// upstream, so a negated tensor is a new buffer rather than a view
+    /// wearing a flag.
+    fn is_neg(&self) -> bool {
+        match self.inner {
+            Repr::Dense(_) => false,
+            Repr::Meta { .. } => false,
+        }
+    }
+
+    /// The name of `tensor.layout`, resolved to the `torch.layout` object in
+    /// `bootstrap.py`.
+    ///
+    /// Split that way on purpose: the *fact* is about the representation and
+    /// belongs beside the other five, while the `torch.strided` object is
+    /// synthesised in Python (`_install_namespace_types`) and cannot be
+    /// constructed here. `bootstrap.py` refuses by name for any string it does
+    /// not recognise, so a new arm cannot leak through as `None`.
+    fn _layout_name(&self) -> &'static str {
+        match self.inner {
+            // candle's tensors carry a stride and are dense; there is no
+            // sparse or compressed storage anywhere in this build.
+            Repr::Dense(_) => "strided",
+            // Upstream's meta tensors are strided too -- `torch.zeros(2, 3,
+            // device="meta").layout` is `torch.strided`, measured.
+            Repr::Meta { .. } => "strided",
+        }
+    }
+
     // `tensor.get_device()` is *not* here, and the reason is a PyO3 collision
     // rather than a decision: `#[pymethods]` derives the slot name
     // `__pymethod_get_device__` from the `device` getter above and from a

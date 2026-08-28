@@ -21,7 +21,7 @@ use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::device::PyDevice;
-use crate::dtype::{PyDtype, TorchDType};
+use crate::dtype::{default_float, PyDtype, TorchDType};
 use crate::err::{aten_not_implemented, candle_err, not_implemented};
 use crate::tensor::PyTensorBase;
 
@@ -41,6 +41,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._softmax.default",
     "aten._to_copy.default",
     "aten._unsafe_view.default",
+    "aten.abs.default",
     "aten.add.Tensor",
     "aten.add_.Tensor",
     "aten.addmm.default",
@@ -59,6 +60,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bitwise_or.Tensor",
     "aten.bmm.default",
     "aten.cat.default",
+    "aten.ceil.default",
     "aten.clamp_.default",
     "aten.clone.default",
     "aten.convolution.default",
@@ -82,6 +84,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.gather.default",
     "aten.ge.Scalar",
     "aten.gelu.default",
+    "aten.gt.Scalar",
+    "aten.gt.Tensor",
     "aten.histc.default",
     "aten.index.Tensor",
     "aten.index_put_.default",
@@ -94,10 +98,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
     "aten.masked_fill_.Scalar",
+    "aten.masked_select.default",
     "aten.max.default",
     "aten.max.dim",
     "aten.mean.default",
     "aten.mean.dim",
+    "aten.min.default",
     "aten.mm.default",
     "aten.mul.Scalar",
     "aten.mul.Tensor",
@@ -138,6 +144,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.tanh.default",
     "aten.topk.default",
     "aten.transpose.int",
+    "aten.unbind.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.view.default",
@@ -194,12 +201,11 @@ pub fn all_implemented() -> Vec<&'static str> {
     out
 }
 
-/// torch's default floating dtype. `torch.set_default_dtype` is not one of the
-/// names this shim implements, so it is a constant rather than a global: the
-/// dtype-inference rules below ("integral arguments give int64, anything else
-/// gives the default float") read it, and if `set_default_dtype` ever arrives
-/// this is the single place it has to reach.
-pub const DEFAULT_FLOAT: TorchDType = TorchDType::Float32;
+// `set_default_dtype` arrived, so the default float dtype is no longer a
+// constant here -- it is `dtype::default_float()`, a process-global. The
+// dtype-inference rules below ("integral arguments give int64, anything else
+// gives the default float") call it rather than reading a copy, which is the
+// whole of what makes the setter load-bearing rather than decorative.
 
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
@@ -518,6 +524,64 @@ fn meta_dispatch(
                 }
             }
         }
+        // `aten::div.Scalar` and `aten::mul.Scalar` -- shape is the input's,
+        // dtype is `arith_tag`'s.
+        //
+        // Both are reached by `LlamaRotaryEmbedding.__init__`
+        // (`transformers/models/llama/modeling_llama.py:108`), which
+        // `from_pretrained` runs under `init_empty_weights`: the `/ dim`
+        // directly, and the `*` that `torch/_tensor.py:1112` turns the leading
+        // `1.0 /` into. There is no broadcasting to get right, a `Scalar`
+        // overload having only one tensor, so the whole kernel is the
+        // promotion -- and the promotion is `arith_tag`'s rather than a
+        // restatement of it, so the dtype this advertises is by construction
+        // the dtype the dense kernel would produce, refusals included.
+        //
+        // `add.Scalar` and `sub.Scalar` are the other two members of that
+        // helper and are deliberately absent: nothing has reached them on
+        // meta.
+        "aten.div.Scalar" | "aten.mul.Scalar" => {
+            let kind = if op == "aten.div.Scalar" {
+                Arith::Div
+            } else {
+                Arith::Mul
+            };
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let other =
+                scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+            let tag = arith_tag(op, kind, input.tag(), Some(!other.is_int()))?;
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::pow.Scalar(Scalar self, Tensor exponent)` -- the next link in
+        // the same expression. The scalar is the *base* here, so the shape
+        // comes from argument 1, and the dtype is torch's wrapped-number rule
+        // (`pow_result_tag`): an integer base leaves an integral exponent
+        // integral, a float base floats it.
+        "aten.pow.Scalar" => {
+            let base = scalar_arg(op, args, kwargs, 0, "self")?.ok_or_else(|| missing(op, "self"))?;
+            let exponent = tensor_arg(op, args, kwargs, 1, "exponent")?;
+            let tag = pow_result_tag(op, exponent.tag(), !base.is_int())?;
+            meta_result(py, exponent.dims().to_vec(), tag)
+        }
+        // `aten::reciprocal` -- the last link. `torch/_tensor.py:1112` spells
+        // `1.0 / t` as `t.reciprocal() * 1.0`, so this is what the rope
+        // expression reaches rather than an `rdiv` op.
+        //
+        // Its dense counterpart is the `unary_float` family, whose rule is
+        // "floating in, same out; anything else becomes the default float".
+        // The other five members of that family (`cos`, `sin`, `tanh`, `exp`,
+        // and `rsqrt`, which shares the rule from its own function) are
+        // deliberately *not* listed here: nothing has reached them on meta, so
+        // adding them would be a claim no test could have failed on.
+        "aten.reciprocal.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = if input.tag().is_floating_point() {
+                input.tag()
+            } else {
+                default_float()
+            };
+            meta_result(py, input.dims().to_vec(), tag)
+        }
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
              dtype and no storage, so this op would have to infer its output shape without \
@@ -646,6 +710,14 @@ fn aten_dispatch_inner(
         "aten.rsqrt.default" => rsqrt_default(py, args, kwargs),
         "aten.rsub.Scalar" => rsub_scalar(py, args, kwargs),
 
+        // -- what upstream's `repr(tensor)` dispatches (docs/E2E_REAL.md) ----
+        "aten.abs.default" => abs_default(py, args, kwargs),
+        "aten.ceil.default" => ceil_default(py, args, kwargs),
+        "aten.gt.Tensor" => compare_tensor(py, args, kwargs, "aten.gt.Tensor", Cmp::Gt),
+        "aten.gt.Scalar" => compare_scalar(py, args, kwargs, "aten.gt.Scalar", Cmp::Gt),
+        "aten.masked_select.default" => masked_select_default(py, args, kwargs),
+        "aten.unbind.int" => unbind_int(py, args, kwargs),
+
         // -- attention (docs/OPS8.md) --------------------------------------
         "aten._scaled_dot_product_flash_attention_for_cpu.default" => {
             sdpa_flash_cpu(py, args, kwargs)
@@ -697,7 +769,8 @@ fn aten_dispatch_inner(
         "aten.mean.default" => sum_or_mean(py, args, kwargs, "aten.mean.default", Reduce::Mean, false),
         "aten.mean.dim" => sum_or_mean(py, args, kwargs, "aten.mean.dim", Reduce::Mean, true),
         "aten.cumsum.default" => cumsum_default(py, args, kwargs),
-        "aten.max.default" => max_default(py, args, kwargs),
+        "aten.max.default" => extremum_default(py, args, kwargs, Extremum::Max),
+        "aten.min.default" => extremum_default(py, args, kwargs, Extremum::Min),
         "aten.max.dim" => max_dim(py, args, kwargs),
         "aten.max.other" => max_other(py, args, kwargs),
         "aten.any.default" => any_default(py, args, kwargs),
@@ -840,7 +913,12 @@ fn full_default(
         Some(value) if !value.is_none() => value.extract::<PyDtype>()?.tag(),
         _ if fill_is_bool => TorchDType::Bool,
         _ if fill_is_int => TorchDType::Int64,
-        _ => TorchDType::Float32,
+        // `default_float()`, not a literal `Float32`: this arm *is* the "and
+        // the default float dtype otherwise" half of the rule the comment
+        // above states, and leaving it a constant would have made `full` the
+        // one factory that ignores `set_default_dtype`. Measured upstream
+        // under a float64 default: `torch.full((2,), 1.0).dtype` is float64.
+        _ => default_float(),
     };
 
     reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
@@ -1674,7 +1752,7 @@ fn arange(
     // what matter, so a single float argument floats the whole result.
     let integral = start.is_int() && end.is_int() && step.is_int();
     let dtype = dtype_arg(args, kwargs, options_at, "dtype")?
-        .unwrap_or(if integral { TorchDType::Int64 } else { DEFAULT_FLOAT });
+        .unwrap_or(if integral { TorchDType::Int64 } else { default_float() });
     reject_unsupported(
         op,
         args,
@@ -1794,7 +1872,7 @@ fn zeros_or_ones(
     one: bool,
 ) -> PyResult<Py<PyAny>> {
     let size: Vec<usize> = required(op, args, kwargs, 0, "size")?.extract()?;
-    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(DEFAULT_FLOAT);
+    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(default_float());
     reject_unsupported(
         op,
         args,
@@ -1852,7 +1930,7 @@ fn rsqrt_default(
     let tag = if input.tag().is_floating_point() {
         input.tag()
     } else {
-        DEFAULT_FLOAT
+        default_float()
     };
     let storage = PyDtype::new(tag).storage(OP)?;
     let tensor = input
@@ -1885,7 +1963,7 @@ fn pow_result_tag(op: &str, tensor: TorchDType, scalar_is_float: bool) -> PyResu
         )));
     }
     Ok(if scalar_is_float && !tensor.is_floating_point() {
-        DEFAULT_FLOAT
+        default_float()
     } else {
         tensor
     })
@@ -2038,6 +2116,34 @@ fn side_from_scalar(value: &Scalar, tag: TorchDType) -> PowSide {
 }
 
 /// `aten::cat(Tensor[] tensors, int dim=0) -> Tensor`
+///
+/// **A tensor of shape exactly `(0,)` is skipped, not concatenated.** This is
+/// torch's "legacy empty" rule, and it is not a corner case anyone can avoid:
+/// `transformers`' KV cache starts every layer as `torch.tensor([])` and grows
+/// it with `torch.cat([self.keys, key_states], dim=-2)`
+/// (`cache_utils.py:144`), so the *first* decoder step of every model is a cat
+/// of a 1-D empty against a 4-D tensor. Without the rule this shim raised
+/// `IndexError: Dimension out of range` and the forward pass stopped there
+/// (docs/E2E_REAL.md).
+///
+/// The rule is narrow, and measured on 2.13.0 rather than inferred:
+///
+///   * only shape `(0,)` qualifies. `torch.ones(0, 5)` does **not** -- it
+///     raises `Tensors must have same number of dimensions: got 2 and 4`,
+///     so "empty" is not the test, `(0,)` is.
+///   * a skipped entry takes no part in the rank check, the `dim` check or
+///     the extent check -- `cat([tensor([]), ones(1,2,3,4)], dim=-2)` is
+///     `(1, 2, 3, 4)`, while a *non*-empty 1-D entry in the same position
+///     still raises `IndexError` on `dim=-2`.
+///   * when every entry is skipped the result is `(0,)`, whatever `dim` was;
+///     `cat([tensor([]), tensor([])], dim=5)` is `(0,)` rather than an
+///     `IndexError`.
+///
+/// It does still take part in **dtype**: upstream promotes, so
+/// `cat([int64 (0,), int32 (2,3)])` is `int64` rather than `int32`. This shim
+/// refuses mixed dtypes here as it did before -- promotion is a separate gap
+/// with its own refusal, and skipping the shape while silently dropping the
+/// dtype would have been a third behaviour belonging to neither.
 fn cat_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -2060,14 +2166,28 @@ fn cat_default(
             )));
         }
     }
-    let rank = tensors[0].tensor()?.rank();
-    let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
 
-    let mut inner: Vec<&Tensor> = Vec::with_capacity(tensors.len());
+    // The legacy-empty partition, before anything reads a rank.
+    let mut kept: Vec<&Tensor> = Vec::with_capacity(tensors.len());
     for t in &tensors {
-        inner.push(t.tensor()?);
+        let inner = t.tensor()?;
+        if inner.dims() != [0] {
+            kept.push(inner);
+        }
     }
-    let tensor = Tensor::cat(&inner, dim).map_err(|err| candle_err(OP, err))?;
+    if kept.is_empty() {
+        // Every entry was `(0,)`. Upstream hands back a `(0,)` of the same
+        // dtype without ever looking at `dim`.
+        let storage = PyDtype::new(tag).storage(OP)?;
+        let out = Tensor::from_vec(Vec::<f64>::new(), 0usize, tensors[0].tensor()?.device())
+            .and_then(|t| t.to_dtype(storage))
+            .map_err(|err| candle_err(OP, err))?;
+        return finish(py, out, tag);
+    }
+
+    let rank = kept[0].rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
+    let tensor = Tensor::cat(&kept, dim).map_err(|err| candle_err(OP, err))?;
     finish(py, tensor, tag)
 }
 
@@ -2210,7 +2330,7 @@ fn scalar_tensor_default(
     const OP: &str = "aten.scalar_tensor.default";
     let raw = required(OP, args, kwargs, 0, "s")?;
     let value = scalar_arg(OP, args, kwargs, 0, "s")?.ok_or_else(|| missing(OP, "s"))?;
-    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(DEFAULT_FLOAT);
+    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(default_float());
     reject_layout(OP, args, kwargs, 2)?;
     reject_unsupported(OP, args, kwargs, &[(4, "pin_memory")])?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::cpu())?;
@@ -2528,7 +2648,28 @@ fn arith_tag(
     // (BOOL.md §2.2), and `bool + bool` is a logical or. candle would give 2
     // where both are true -- still truthy, therefore silently wrong
     // downstream. `add.Tensor` already refuses this; the rest follow.
-    if tensor == TorchDType::Bool {
+    //
+    // **`mul.Tensor` is the one exception, and it is an exception because the
+    // two operations coincide rather than because it was convenient.** Under
+    // the invariant BOOL.md §6.3 attaches to the `bool` tag -- the bytes are 0
+    // or 1, enforced by `boolean()` being the only constructor that may attach
+    // it -- an arithmetic product *is* the logical and: 1·1=1, 1·0=0, 0·0=0,
+    // and no other pair of operands exists. So candle's `broadcast_mul`
+    // computes torch's answer exactly, values and dtype both
+    // (`tensor([T,F]) * tensor([T,T])` is `tensor([True, False])`,
+    // `torch.bool`, measured on 2.13.0). That is not true of `+`, which would
+    // give 2 and need clamping; `-` and `/` are refused by upstream itself.
+    //
+    // It is here because `torch.isfinite` needs it: upstream's own body is
+    // `(self == self) * (self.abs() != inf)`, a multiply of two bool tensors,
+    // and that is on the `print(tensor)` path (docs/E2E_REAL.md).
+    //
+    // The **scalar** overload stays refused, and that is a real difference
+    // rather than caution: `bool_tensor * 2` promotes to `int64` upstream and
+    // `bool_tensor * 1.5` to `float32`, so the scalar form is not a logical
+    // and at all, and the promotion it needs is not implemented here.
+    // `scalar_is_float.is_none()` is exactly "this is the Tensor overload".
+    if tensor == TorchDType::Bool && !(kind == Arith::Mul && scalar_is_float.is_none()) {
         return Err(not_implemented(format!(
             "{op}: torch.bool operands are logical, not arithmetic, in torch \
              (BOOL.md §2.2) and are not implemented in torch._C shim"
@@ -2536,12 +2677,12 @@ fn arith_tag(
     }
     let mut tag = tensor;
     if scalar_is_float == Some(true) && !tag.is_floating_point() {
-        tag = DEFAULT_FLOAT;
+        tag = default_float();
     }
     // torch's `/` is true division: it floats an integral pair rather than
     // truncating. `torch.tensor([1]) / torch.tensor([2])` is `0.5`, measured.
     if kind == Arith::Div && !tag.is_floating_point() {
-        tag = DEFAULT_FLOAT;
+        tag = default_float();
     }
     Ok(tag)
 }
@@ -2721,6 +2862,7 @@ enum Cmp {
     Lt,
     Le,
     Ge,
+    Gt,
 }
 
 /// The comparison ops all answer `torch.bool`, and both operands are read in
@@ -2750,6 +2892,7 @@ fn apply_cmp(op: &str, kind: Cmp, lhs: &Tensor, rhs: &Tensor) -> PyResult<Tensor
         Cmp::Lt => lhs.broadcast_lt(rhs),
         Cmp::Le => lhs.broadcast_le(rhs),
         Cmp::Ge => lhs.broadcast_ge(rhs),
+        Cmp::Gt => lhs.broadcast_gt(rhs),
     }
     .map_err(|e| candle_err(op, e))
 }
@@ -2995,7 +3138,7 @@ fn unary_float(
     let tag = if input.tag().is_floating_point() {
         input.tag()
     } else {
-        DEFAULT_FLOAT
+        default_float()
     };
     let storage = PyDtype::new(tag).storage(op)?;
     let out = input
@@ -3079,6 +3222,272 @@ fn neg_default(
     .and_then(|t| t.to_dtype(storage))
     .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
+}
+
+/// `aten::abs(Tensor self) -> Tensor`
+///
+/// The float path is candle's `abs`, which is IEEE `fabs`: `abs(-0.0)` is
+/// `0.0`, `abs(-inf)` is `inf`, and `abs(nan)` is `nan` -- all three measured
+/// against upstream 2.13.0 and all three agree.
+///
+/// **The integral path is `wrapping_abs`, not `abs`.** Upstream's answer for
+/// the most negative element of a signed type is that element again:
+/// `abs(int64 min)` is `int64 min`, measured. Rust's `i64::abs` panics on that
+/// input in a debug build, so the round trip uses `wrapping_abs`, the same
+/// shape `neg_default` above uses `wrapping_neg` for the same reason. The
+/// width matters: an `int32` tensor wraps at `i32::MIN`, not at `i64::MIN`, so
+/// the wrap is applied in the *storage* width before widening back.
+///
+/// It goes through `i64` rather than candle for the same reason `neg` does --
+/// candle's `abs` is a `unary_op!` whose integer arms are `todo!()`, which
+/// panics and takes the interpreter down instead of raising.
+///
+/// `uint8`/`uint32` are the identity, which is a fact rather than a special
+/// case: no unsigned element is negative. `bool` is refused with upstream's
+/// wording (`"abs_cpu" not implemented for 'Bool'`).
+fn abs_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.abs.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"abs_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    if tag.is_floating_point() {
+        let out = input.tensor()?.abs().map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    let values: Vec<i64> = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .and_then(|t| t.to_vec1::<i64>())
+        .map_err(|e| candle_err(OP, e))?;
+    let wrapped: Vec<i64> = values
+        .into_iter()
+        .map(|v| match storage {
+            candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
+            candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
+            // Unsigned storages cannot hold a negative, so this is the
+            // identity; `i64` is the only remaining signed width.
+            _ => v.wrapping_abs(),
+        })
+        .collect();
+    let out = Tensor::from_vec(wrapped, dims, input.tensor()?.device())
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::ceil(Tensor self) -> Tensor`
+///
+/// Float: candle's `ceil`. `ceil(-0.5)` is `-0.0` and keeps its sign bit,
+/// `ceil(inf)` is `inf`, `ceil(nan)` is `nan` -- measured against upstream,
+/// and the `-0.0` one is why `repr` cares: `_tensor_str` compares
+/// `value != torch.ceil(value)` to decide whether a float tensor prints in
+/// integer mode, and `repr(tensor([-0.5]))` prints `-0.` upstream.
+///
+/// **Integral dtypes are the identity, not a refusal.** Measured:
+/// `torch.arange(3).ceil()` is `tensor([0, 1, 2])`. Only `bool` refuses, with
+/// upstream's own kernel name (`"ceil_vml_cpu" not implemented for 'Bool'`) --
+/// note it is a different name from `abs`'s, because upstream reaches a
+/// different kernel, and copying the wrong one would send a reader to the
+/// wrong place.
+fn ceil_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.ceil.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"ceil_vml_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    if !tag.is_floating_point() {
+        // Already integral: upstream hands the tensor straight back.
+        let out = input.tensor()?.clone();
+        return finish(py, out, tag);
+    }
+    let out = input.tensor()?.ceil().map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::masked_select(Tensor self, Tensor mask) -> Tensor`
+///
+/// Always 1-D, whatever the input rank -- it is "the elements where the mask
+/// is true, in row-major order", and there is no shape that could describe
+/// that in general.
+///
+/// Three measured behaviours it would have been easy to get wrong:
+///
+///   * **The mask must be `torch.bool`.** A `uint8` mask -- which reads like
+///     a mask, and which old torch accepted -- raises
+///     `masked_select: expected BoolTensor for mask` on 2.13.0, and so does an
+///     `int64` one. Accepting them would silently treat `2` as true, which is
+///     right for that value and wrong for the caller who meant a count.
+///   * **Both sides broadcast**, not just the mask. `tensor([1., 2.])`
+///     against a `(2, 2)` mask of `[[T,F],[T,T]]` gives `[1., 1., 2.]` --
+///     the *self* tensor is the one that expanded.
+///   * **An all-false mask is an empty tensor, not an error**, and it keeps
+///     the input's dtype (`tensor([], dtype=torch.int64)`).
+///
+/// The selection is `index_select` over the flattened, broadcast input rather
+/// than a per-element rebuild, so the input dtype is carried by candle instead
+/// of being reconstructed -- which is what keeps `float16`/`bfloat16` exact
+/// (an `f64` round trip would not be).
+fn masked_select_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.masked_select.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let mask = tensor_arg(OP, args, kwargs, 1, "mask")?;
+    if mask.tag() != TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "masked_select: expected BoolTensor for mask",
+        ));
+    }
+    let tag = input.tag();
+    let shape = broadcast_shape(OP, input.tensor()?.dims(), mask.tensor()?.dims())?;
+
+    let flat_self = input
+        .tensor()?
+        .broadcast_as(shape.as_slice())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(OP, e))?;
+    let flat_mask: Vec<u8> = mask
+        .tensor()?
+        .broadcast_as(shape.as_slice())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(candle_core::DType::U8))
+        .and_then(|t| t.to_vec1::<u8>())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let picked: Vec<u32> = flat_mask
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m != 0)
+        .map(|(i, _)| i as u32)
+        .collect();
+
+    if picked.is_empty() {
+        // `narrow` rather than an empty `index_select`: it needs no index
+        // tensor at all and cannot depend on how candle handles a zero-length
+        // one. The result is `(0,)` in the input's dtype, as upstream's is.
+        let out = flat_self.narrow(0, 0, 0).map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+    let count = picked.len();
+    let index =
+        Tensor::from_vec(picked, count, flat_self.device()).map_err(|e| candle_err(OP, e))?;
+    let out = flat_self
+        .index_select(&index, 0)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// numpy/torch broadcast shape agreement, right-aligned: each pair of extents
+/// must be equal or one of them 1, and the result takes the larger.
+///
+/// candle has `broadcast_as` but no public "what shape would these two
+/// broadcast to?", and `masked_select` needs the answer before it can expand
+/// either side. The refusal reproduces upstream's wording, which names both
+/// extents and the axis -- a bare "shapes do not match" would make a broadcast
+/// mistake much harder to place.
+fn broadcast_shape(op: &str, lhs: &[usize], rhs: &[usize]) -> PyResult<Vec<usize>> {
+    let rank = lhs.len().max(rhs.len());
+    let mut out = vec![0usize; rank];
+    for i in 0..rank {
+        let a = if i < rank - lhs.len() {
+            1
+        } else {
+            lhs[i - (rank - lhs.len())]
+        };
+        let b = if i < rank - rhs.len() {
+            1
+        } else {
+            rhs[i - (rank - rhs.len())]
+        };
+        out[i] = if a == b {
+            a
+        } else if a == 1 {
+            b
+        } else if b == 1 {
+            a
+        } else {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: The size of tensor a ({a}) must match the size of tensor b ({b}) at \
+                 non-singleton dimension {i}"
+            )));
+        };
+    }
+    Ok(out)
+}
+
+/// `aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]`
+///
+/// Every slice along `dim`, with `dim` *removed* -- which is what separates it
+/// from `split`, whose chunks keep the dimension with extent 1. `Tensor.
+/// __iter__` is this op (`torch/_tensor.py:1215`), so `for row in tensor:` and
+/// every `repr` of a tensor with more than one dimension goes through it.
+///
+/// Returns a `list`, not a tuple: `torch.ops.aten.unbind.int(x, 0)` on 2.13.0
+/// hands back a `list` even though `Tensor.unbind` (the method binding, which
+/// packs it) gives a tuple. The op-level spelling is what `_tensor_str.py:597`
+/// uses, so that is the one reproduced here, matching `split.Tensor` above.
+///
+/// Two measured refusals rather than invented ones:
+///
+///   * a **0-d** input raises `IndexError: Dimension specified as 0 but tensor
+///     has no dimensions` -- note `normalise_dim` would happily accept `dim=0`
+///     for rank 0 (torch treats a scalar as 1-D *for indexing*), so this has
+///     to be checked before it, not by it.
+///   * an out-of-range `dim` raises `IndexError` naming the valid range, which
+///     `normalise_dim` already spells the way upstream does.
+///
+/// An extent of 0 along `dim` is an **empty list**, not an error.
+fn unbind_int(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.unbind.int";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let requested = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0);
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension specified as {requested} but tensor has no dimensions"
+        )));
+    }
+    let dim = normalise_dim(OP, requested, rank)?;
+    let extent = input.tensor()?.dims()[dim];
+    let tag = input.tag();
+
+    let mut slices: Vec<Py<PyAny>> = Vec::with_capacity(extent);
+    for i in 0..extent {
+        let slice = input
+            .tensor()?
+            .narrow(dim, i, 1)
+            .and_then(|t| t.squeeze(dim))
+            .map_err(|e| candle_err(OP, e))?;
+        slices.push(crate::tensor::promote(py, finish(py, slice, tag)?)?);
+    }
+    Ok(PyList::new(py, slices)?.into_any().unbind())
 }
 
 /// `aten::relu(Tensor self) -> Tensor`
@@ -3486,26 +3895,82 @@ fn cumsum_default(
     finish(py, out, tag)
 }
 
-/// `aten::max(Tensor self) -> Tensor` -- the whole-tensor form, a zero-dim
-/// result in the input's own dtype.
-fn max_default(
+#[derive(Clone, Copy)]
+enum Extremum {
+    Max,
+    Min,
+}
+
+/// `aten::max(Tensor self) -> Tensor` and `aten::min(Tensor self) -> Tensor` --
+/// the whole-tensor forms, a zero-dim result in the input's own dtype.
+///
+/// **NaN propagates, and candle does not do that for us.** This started as
+/// `max` alone, written as `flatten_all().max(0)`, and that was a wrong answer
+/// nobody had asked the right question of: candle's reduction skips NaN, so
+/// `max([3, nan, 1])` came back `3.0` where upstream 2.13.0 gives `nan`
+/// (measured, both sides, docs/E2E_REAL.md). Torch's rule is the IEEE
+/// *maximum*/*minimum* rule rather than `fmax`/`fmin` -- a NaN anywhere in the
+/// input is the answer, because there is no ordering that would let a real
+/// number beat it.
+///
+/// It went unnoticed because `max_default_cases` had no NaN case; the
+/// `_pair_result_check` in the same harness has explicit NaN handling for
+/// `sort`/`topk`, so the harness could always have caught this and simply was
+/// never asked. It is caught now, on both ops.
+///
+/// The NaN test is one extra vectorised pass (`x != x`, summed), not a
+/// per-element scan, and it only runs for floating dtypes -- an integer or
+/// boolean tensor has no NaN to find, so those take candle's reduction
+/// directly.
+///
+/// `min` is here rather than beside it as a copy because the two differ in one
+/// token; upstream's empty-input refusal names the op, so that message is
+/// built from the same `match`.
+fn extremum_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    which: Extremum,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let (op, name) = match which {
+        Extremum::Max => ("aten.max.default", "max"),
+        Extremum::Min => ("aten.min.default", "min"),
+    };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     if input.tensor()?.elem_count() == 0 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-            "max(): Expected reduction dim to be specified for input.numel() == 0.",
-        ));
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{name}(): Expected reduction dim to be specified for input.numel() == 0."
+        )));
     }
-    let out = input
+    let tag = input.tag();
+    let flat = input
         .tensor()?
         .flatten_all()
-        .and_then(|t| t.max(0))
-        .map_err(|e| candle_err(OP, e))?;
-    finish(py, out, input.tag())
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(op, e))?;
+
+    if tag.is_floating_point() {
+        let nan_count = flat
+            .ne(&flat)
+            .and_then(|m| m.to_dtype(candle_core::DType::I64))
+            .and_then(|m| m.sum_all())
+            .and_then(|s| s.to_scalar::<i64>())
+            .map_err(|e| candle_err(op, e))?;
+        if nan_count > 0 {
+            let storage = PyDtype::new(tag).storage(op)?;
+            let out = Tensor::full(f64::NAN, (), flat.device())
+                .and_then(|t| t.to_dtype(storage))
+                .map_err(|e| candle_err(op, e))?;
+            return finish(py, out, tag);
+        }
+    }
+
+    let out = match which {
+        Extremum::Max => flat.max(0),
+        Extremum::Min => flat.min(0),
+    }
+    .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
 }
 
 /// `aten::max.other(Tensor self, Tensor other)` -- elementwise, and upstream

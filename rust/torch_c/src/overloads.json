@@ -344,5 +344,15 @@
 
   "zero_": [
     "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
+  "ceil": [
+    "aten::ceil.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::ceil(Tensor self) -> Tensor"
+  ],
+
+  "masked_select": [
+    "aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
   ]
 }

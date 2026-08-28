@@ -1462,14 +1462,19 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # metadata.py:20` calls it in a dataclass field default, at import time.
     #
     # The value is not a free choice here: it has to be the same dtype
-    # `aten.rs`'s `DEFAULT_FLOAT` gives factory functions, or a caller reading
-    # this to decide what it will get would be told the wrong thing. There is
-    # no setter -- `set_default_dtype` would have to reach a Rust constant, so
-    # it stays refused by name rather than silently accepting and changing
-    # nothing.
-    _default_dtype = _constant_function("torch._C.get_default_dtype", module.float32)
-    varfns.get_default_dtype = _default_dtype
-    module.get_default_dtype = _default_dtype
+    # `dtype.rs`'s `default_float()` gives factory functions, or a caller
+    # reading this to decide what it will get would be told the wrong thing.
+    # That used to be arranged by installing a *constant* function returning
+    # `module.float32`, because the value lived in a Rust `const` and
+    # `set_default_dtype` refused by name for want of anywhere to write.
+    #
+    # It is a process-global now (`_set_default_dtype`, which
+    # `torch/__init__.py:1385` forwards to and `transformers` calls on the way
+    # into `from_pretrained`), so both names come from Rust and read the same
+    # cell. A constant function here would have re-introduced the divergence
+    # from the other side: `torch.get_default_dtype()` still saying float32
+    # after the factories had moved.
+    varfns.get_default_dtype = module.get_default_dtype
     module._VariableFunctions = varfns
     module._VariableFunctionsClass = type(varfns)
     module._TensorBase = module.TensorBase
@@ -1517,6 +1522,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_behaviour(module, dispatch)
     _install_torch_function_modes(module)
     _install_device(module, varfns, module.TensorBase)
+    _install_repr_surface(module, varfns, module.TensorBase)
     _install_serialization(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
@@ -3270,6 +3276,52 @@ def _install_composites(module, varfns, dispatch) -> None:
     layer_norm.__module__ = "torch._C"
     setattr(varfns, "layer_norm", layer_norm)
 
+    def isfinite(input):
+        """`torch.isfinite` -- the third `CompositeImplicitAutograd` here.
+
+        `torch/_tensor_str.py:155` is the caller: the formatter selects the
+        finite non-zero elements before it decides column width, precision and
+        whether to switch to scientific notation, so `print(tensor)` cannot
+        take a step without this.
+
+        It is a composite rather than an `overloads.json` entry for exactly
+        the reason the note above `layer_norm` gives, and this time the
+        measurement is unambiguous. A `TorchDispatchMode` logger on torch
+        2.13.0 shows `torch.isfinite` bottoming out as:
+
+            floating input:  eq.Tensor -> abs.default -> ne.Scalar -> mul.Tensor
+            integral input:  ones_like.default
+
+        `aten.isfinite.default` never fires. Naming it in the overload table
+        would have added a seventh kernel to the `repr` work item and it would
+        have been a kernel upstream does not have either.
+
+        The two branches are upstream's own C++ body, transcribed:
+        `(self == self) * (self.abs() != inf)` for floats -- `self == self` is
+        the NaN test and the `abs() != inf` is the infinity test -- and an
+        all-true tensor for anything integral, because no integral value is
+        infinite or NaN.
+
+        The `*` really is a multiply on two `bool` tensors, not a rename of
+        `&`. `mul.Tensor` is what upstream dispatches and what this calls, so
+        a gap would name the key upstream names. Complex dtypes take
+        upstream's third branch, which this shim cannot reach: there is no
+        complex storage in candle, so `is_complex` never holds here.
+        """
+        if not input.dtype.is_floating_point:
+            return dispatch(
+                "aten.full.default", list(input.shape), True, dtype=module.bool
+            )
+        finite_mask = dispatch(
+            "aten.ne.Scalar", dispatch("aten.abs.default", input), float("inf")
+        )
+        not_nan = dispatch("aten.eq.Tensor", input, input)
+        return dispatch("aten.mul.Tensor", not_nan, finite_mask)
+
+    isfinite.__name__ = isfinite.__qualname__ = "isfinite"
+    isfinite.__module__ = "torch._C"
+    setattr(varfns, "isfinite", isfinite)
+
 
 def _install_behaviour(module, dispatch) -> None:
     """The names that have to *do* something for the import to finish."""
@@ -3458,7 +3510,127 @@ def _install_behaviour(module, dispatch) -> None:
     module._get_operation_overload = _get_operation_overload
     module._get_schema = _get_schema
 
+    _install_autocast(module)
     _install_default_generator(module)
+
+
+# Upstream's own device vocabulary for the autocast entry points, transcribed
+# from the refusal it raises (`torch._C.is_autocast_enabled("nosuch")` on
+# 2.13.0). It is *not* the same list `torch.device` accepts -- `opengl`,
+# `ideep`, `ve` and `fpga` are autocast-only -- so it cannot be borrowed from
+# `PyDevice::resolve` and is written out here instead.
+_AUTOCAST_DEVICE_TYPES = (
+    "cpu", "cuda", "ipu", "xpu", "mkldnn", "opengl", "opencl", "ideep", "hip",
+    "ve", "fpga", "maia", "xla", "lazy", "vulkan", "mps", "meta", "hpu",
+    "mtia", "privateuseone",
+)
+
+
+def _install_autocast(module) -> None:
+    """`torch._C.is_autocast_enabled` and the switch beside it.
+
+    docs/E2E_REAL.md. `transformers/utils/generic.py:250` opens
+    `maybe_autocast` with `if torch.is_autocast_enabled(device_type) or
+    enabled:`, and `modeling_llama.py:121` wraps the rotary embedding in it --
+    so this name is the first thing a real `LlamaForCausalLM` forward pass
+    asks for, and docs/DISTRIBUTED.md §7 named it as the wall that round
+    stopped at.
+
+    **The read is not a constant; the write is a refusal, and that is the
+    argument for the read.** Autocast is a dispatch key: when it is on,
+    upstream intercepts each op and casts its inputs to a lower precision
+    before the kernel sees them. There is no such key here and no kernel casts
+    anything, so a `True` from this predicate would mean every op in the block
+    ran in `float32` while the caller believed it ran in `bfloat16` --
+    right-shaped numbers, wrong ones. So:
+
+      * `is_autocast_enabled(device_type)` reads a real per-device flag,
+      * `set_autocast_enabled(device_type, True)` refuses by name,
+      * `set_autocast_enabled(device_type, False)` is accepted, because it is
+        already true and a caller restoring the previous state (which is what
+        `torch.autocast.__exit__` does) must not fail.
+
+    The flag can therefore never be raised, which is what makes the read
+    derived rather than asserted -- the same shape as the functorch dynamic
+    layer stack in `_install_repr_surface`, and the test that pins it is
+    `test_autocast_is_off_and_cannot_be_turned_on`.
+
+    `get_autocast_dtype` answers upstream's per-device *default*, which is a
+    real value even when autocast is off: `torch._C.get_autocast_dtype("cpu")`
+    is `torch.bfloat16` on 2.13.0 with no autocast block anywhere, measured.
+    Reporting it enables nothing -- nothing consults it while the flag is down
+    -- and answering `float32` instead would have been a made-up number that
+    happens to describe what the kernels do.
+    """
+    enabled = {}
+
+    def _check_device(device_type):
+        if device_type is None:
+            # Upstream's no-argument spelling answers for the default device
+            # type; measured, `torch._C.is_autocast_enabled()` is `False`.
+            return "cpu"
+        if not isinstance(device_type, str) or device_type not in _AUTOCAST_DEVICE_TYPES:
+            raise RuntimeError(
+                "Expected one of " + ", ".join(_AUTOCAST_DEVICE_TYPES)
+                + f" device type at start of device string: {device_type}"
+            )
+        return device_type
+
+    def is_autocast_enabled(device_type=None):
+        return enabled.get(_check_device(device_type), False)
+
+    def set_autocast_enabled(device_type, value=None):
+        # Upstream has both `set_autocast_enabled(bool)` (deprecated,
+        # CUDA-only) and `set_autocast_enabled(str, bool)`. Only the second
+        # spelling is reachable from the vendored tree.
+        if value is None:
+            device_type, value = "cuda", device_type
+        name = _check_device(device_type)
+        if value:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: enabling autocast for "
+                f"{name!r}. Autocast is a dispatch key that casts each op's "
+                "inputs to a lower precision; this shim has no such key and "
+                "no kernel casts anything, so a raised flag would report a "
+                "reduced-precision run that did not happen. Disabling it "
+                "(the False case) is accepted, because it is already true."
+            )
+        enabled[name] = False
+
+    def get_autocast_dtype(device_type=None):
+        name = _check_device(device_type)
+        # Upstream's per-device defaults, measured on 2.13.0. Only the two
+        # this build could be asked about are known; anything else refuses
+        # rather than guessing, because the value decides what a cast makes.
+        defaults = {"cpu": module.bfloat16, "cuda": module.float16}
+        try:
+            return defaults[name]
+        except KeyError:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                f"torch._C.get_autocast_dtype({name!r}) -- upstream's default "
+                "autocast dtype for this device type was not measured"
+            ) from None
+
+    def _is_tracing():
+        """`torch/jit/_trace.py:1269`.
+
+        Derived from `_get_tracing_state` rather than standing beside it as a
+        second constant: upstream's `_is_tracing()` is "is there a tracing
+        state?", and there is exactly one answer to that in this process. Two
+        independent constants could drift apart; this cannot.
+        """
+        return module._get_tracing_state() is not None
+
+    for fn, name in (
+        (is_autocast_enabled, "is_autocast_enabled"),
+        (set_autocast_enabled, "set_autocast_enabled"),
+        (get_autocast_dtype, "get_autocast_dtype"),
+        (_is_tracing, "_is_tracing"),
+    ):
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C"
+        setattr(module, name, fn)
 
 
 def _install_device(module, varfns, tensorbase) -> None:
@@ -3669,6 +3841,142 @@ def _install_device(module, varfns, tensorbase) -> None:
     # `_make_property` put one there and the callers reach for the descriptor.
     _cpu = module.device("cpu")
     module.Generator.device = property(lambda self: _cpu)
+
+
+def _install_repr_surface(module, varfns, tensorbase) -> None:
+    """What `torch/_tensor_str.py` asks that is neither a kernel nor a device.
+
+    docs/E2E_REAL.md is the measurement. `print(tensor)` was the one thing
+    docs/WHEEL.md §5 recorded the built wheel could not do, and walking the
+    refusals one at a time produced a list of eleven names -- six kernels
+    (`aten.rs`), three device predicates and five representation predicates
+    (`tensor.rs`), and the three below, which need something Rust cannot
+    reach: a `torch.layout` instance, and a stack that lives in Python.
+
+    None of the three is a constant. Each reads something that could answer
+    differently, and the thing it reads is the argument for the answer.
+    """
+
+    # -- `tensor.layout` ----------------------------------------------------
+    #
+    # The fact is in Rust (`_layout_name`, an exhaustive match over `Repr`);
+    # the object is here, because `torch.strided` is synthesised by
+    # `_install_namespace_types` and does not exist on the Rust side.
+    #
+    # The lookup refuses by name for an unrecognised string rather than
+    # returning `None`. That matters more than it looks: `_tensor_str.py`
+    # branches on `self.layout != torch.strided` in four places, and a `None`
+    # would take every one of those branches -- printing a dense tensor
+    # through the sparse formatter -- instead of stopping.
+    _LAYOUTS = {}
+    for _name in ("strided", "sparse_coo", "sparse_csr", "sparse_csc",
+                  "sparse_bsr", "sparse_bsc", "_mkldnn", "jagged"):
+        _value = getattr(module, _name, None)
+        if _value is not None and not isinstance(_value, _Unimplemented):
+            _LAYOUTS[_name] = _value
+
+    def _layout(self):
+        name = self._layout_name()
+        try:
+            return _LAYOUTS[name]
+        except KeyError:
+            raise NotImplementedError(
+                f"torch._C shim: TensorBase._layout_name() said {name!r}, which "
+                "is not a torch.layout this build publishes. A representation "
+                "was added in tensor.rs without a layout to name it."
+            ) from None
+
+    tensorbase.layout = property(_layout)
+
+    # -- the functorch dynamic layer stack ----------------------------------
+    #
+    # `_tensor_str.py:409` is the very first line of `_str_intern`:
+    #
+    #     if torch._C._functorch.is_functorch_wrapped_tensor(inp):
+    #
+    # Upstream's answer is `maybe_get_level(tensor) != -1`, and `maybe_get_level`
+    # reads the *dynamic layer stack* -- the one `vmap`/`grad`/`jvp` push an
+    # interpreter onto for the duration of a transform. Measured on 2.13.0:
+    # `maybe_get_level(plain)` is `-1` outside `vmap` and `1` inside it, and
+    # `is_functorch_wrapped_tensor` follows it exactly.
+    #
+    # So this is not "answer False and move on". The stack is a real list, it
+    # is empty, and the predicate reads it -- because everything that pushes
+    # onto it (`_wrap_for_grad`, `_add_batch_dim`, `_vmap_increment_nesting`
+    # and its `_grad`/`_jvp`/`_func` siblings) is a raising stub, which
+    # `pytests/test_shim.py` asserts. A tensor cannot acquire a level here
+    # without one of those first, so `-1` is derived from the stack rather
+    # than written down. If functorch ever lands, the pushers change and these
+    # three follow without being touched.
+    _dynamic_layer_stack = []
+
+    def get_dynamic_layer_stack_depth():
+        return len(_dynamic_layer_stack)
+
+    def peek_interpreter_stack():
+        # Upstream returns the top interpreter or `None`.
+        # `_tensor_str.py:668` reads it to decide whether to print a wrapper.
+        return _dynamic_layer_stack[-1] if _dynamic_layer_stack else None
+
+    def maybe_get_level(tensor):
+        # Upstream returns the level the tensor is wrapped at, or -1. A
+        # tensor can only carry a level if a transform put it there, and no
+        # transform can start while the stack cannot be pushed to.
+        if not _dynamic_layer_stack:
+            return -1
+        raise NotImplementedError(
+            "not implemented in torch._C shim: "
+            "torch._C._functorch.maybe_get_level with a non-empty dynamic "
+            "layer stack -- something pushed an interpreter and this shim has "
+            "no wrapper tensors to report a level for"
+        )
+
+    def maybe_current_level():
+        return len(_dynamic_layer_stack) if _dynamic_layer_stack else None
+
+    def is_functorch_wrapped_tensor(tensor):
+        return maybe_get_level(tensor) != -1
+
+    for _fn, _name in (
+        (get_dynamic_layer_stack_depth, "get_dynamic_layer_stack_depth"),
+        (peek_interpreter_stack, "peek_interpreter_stack"),
+        (maybe_get_level, "maybe_get_level"),
+        (maybe_current_level, "maybe_current_level"),
+        (is_functorch_wrapped_tensor, "is_functorch_wrapped_tensor"),
+    ):
+        _fn.__name__ = _fn.__qualname__ = _name
+        _fn.__module__ = "torch._C._functorch"
+        setattr(module._functorch, _name, _fn)
+
+    # -- `torch._is_functional_tensor` --------------------------------------
+    #
+    # `_tensor_str.py:597`, choosing the `_to_functional_tensor(` prefix.
+    # Functionalisation wraps a tensor so that mutations are recorded rather
+    # than performed; the wrapper is made by `torch._to_functional_tensor`,
+    # which is a raising stub here (asserted alongside the others).
+    #
+    # Not in `_DISCOVERED_RETURNS`: that table wraps its values in
+    # `_constant_function`, which ignores its arguments, and a predicate that
+    # does not look at what it was asked about is the shape of answer this
+    # file's own docstring warns against. This one looks -- and refuses a
+    # non-tensor the way upstream does, rather than answering `False` about
+    # an object it was never asked to classify.
+    def _is_functional_tensor(t):
+        if not isinstance(t, tensorbase):
+            raise TypeError(
+                "_is_functional_tensor(): argument 'tensor' (position 1) must "
+                f"be Tensor, not {type(t).__name__}"
+            )
+        # There is exactly one wrapper maker and it refuses, so no tensor in
+        # this process can be a functional wrapper. Same argument, and the
+        # same guard, as the representation predicates in tensor.rs.
+        return False
+
+    _is_functional_tensor.__name__ = "_is_functional_tensor"
+    _is_functional_tensor.__qualname__ = "_is_functional_tensor"
+    _is_functional_tensor.__module__ = "torch._C"
+    module._is_functional_tensor = _is_functional_tensor
+    setattr(varfns, "_is_functional_tensor", _is_functional_tensor)
 
 
 def _install_distributed_c10d(module, spec) -> None:

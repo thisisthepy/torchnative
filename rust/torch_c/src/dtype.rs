@@ -540,6 +540,137 @@ pub fn get_all_dtypes() -> Vec<PyDtype> {
         .collect()
 }
 
+// --- the default floating dtype ---------------------------------------------
+//
+// `torch.set_default_dtype` / `torch.get_default_dtype`, and the value every
+// dtype-inference rule in `aten.rs` and `lib.rs` reads when the caller did not
+// name a dtype. This used to be `aten::DEFAULT_FLOAT`, a `const`; docs/
+// DISTRIBUTED.md §3.4 refused the setter on the grounds that it would have to
+// reach a Rust constant. `transformers` ended that argument --
+// `modeling_utils.py:239` calls `torch.set_default_dtype(dtype)` on the way
+// into `from_pretrained`, so the const had to become a global.
+//
+// **Representation: an `AtomicU8` index into `DEFAULT_FLOAT_CHOICES`.** The
+// alternatives and why not:
+//
+//   `RwLock<TorchDType>`   Reads happen on the dispatcher's hottest path -- a
+//                          factory call, an integral-to-float promotion -- and
+//                          each would pay an atomic read-modify-write plus a
+//                          poison check to guard a value that is one byte
+//                          wide. A `Relaxed` load of an `AtomicU8` is a plain
+//                          byte load.
+//   `OnceLock`             Cannot change, which is the entire requirement.
+//   `static mut`           Unsound under any concurrent read, and Rust 2024
+//                          makes even taking a reference to one an error.
+//
+// `Relaxed` is the right ordering, not a shortcut: the dtype tag is the whole
+// of the payload. Nothing else is being published alongside it, so there is no
+// happens-before edge for a stronger ordering to establish. (Upstream's own is
+// a plain non-atomic C++ global, so this is if anything stricter.) In practice
+// every read and every write here happens under the GIL as well.
+//
+// The value is an index into `DEFAULT_FLOAT_CHOICES` rather than the enum's
+// discriminant so that no `transmute` and no `#[repr(u8)]` is needed, and so
+// that the accept set has exactly one spelling: `set_default_dtype` refuses
+// anything `position()` cannot find, and `default_float()` can only ever
+// return something from that list.
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The dtypes `torch.set_default_dtype` accepts, measured against upstream
+/// 2.13.0 over every `torch.dtype` it exposes. The float8/float4 tags are
+/// deliberately absent: they pass upstream's floating-point gate and then fail
+/// its storage-class lookup, which is a different refusal and is reproduced as
+/// one below.
+///
+/// Index 0 is the value torch starts at, and `DEFAULT_FLOAT_CHOICE` starts at
+/// 0 to match.
+const DEFAULT_FLOAT_CHOICES: &[TorchDType] = &[Float32, Float64, Float16, BFloat16];
+
+static DEFAULT_FLOAT_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// The current default floating dtype. Every "the caller named no dtype" rule
+/// in the shim goes through here; `set_default_dtype` is only load-bearing to
+/// the extent that they do.
+pub fn default_float() -> TorchDType {
+    // Total by construction: the only writer is `set_default_dtype`, and the
+    // only value it writes is a `position()` within this same slice.
+    DEFAULT_FLOAT_CHOICES[DEFAULT_FLOAT_CHOICE.load(Ordering::Relaxed) as usize]
+}
+
+/// `torch._C._set_default_dtype`, which `torch.set_default_dtype` forwards to
+/// (`torch/__init__.py:1385`).
+///
+/// The three refusals are upstream's, reproduced by message rather than
+/// invented; the table in `test_shim.py` above
+/// `test_set_default_dtype_moves_every_rule_that_reads_the_default` records
+/// the measurement that produced them.
+#[pyfunction]
+#[pyo3(name = "_set_default_dtype")]
+pub fn set_default_dtype(dtype: &Bound<'_, PyAny>) -> PyResult<()> {
+    let tag = dtype
+        .extract::<PyDtype>()
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "invalid dtype object: only floating-point types are supported \
+                 as the default type",
+            )
+        })?
+        .tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "only floating-point types are supported as the default type",
+        ));
+    }
+    let choice = DEFAULT_FLOAT_CHOICES
+        .iter()
+        .position(|d| *d == tag)
+        .ok_or_else(|| {
+            // Upstream gets here by looking for a `torch.<Name>Storage` class
+            // and not finding one, so it names the class rather than the
+            // dtype. The spelling is the dtype name with its first character
+            // capitalised: `float8_e4m3fn` -> `Float8_e4m3fnStorage`.
+            let mut name = tag.name().to_owned();
+            name[..1].make_ascii_uppercase();
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "couldn't find storage object {name}Storage"
+            ))
+        })?;
+    DEFAULT_FLOAT_CHOICE.store(choice as u8, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch.get_default_dtype()`. Upstream binds `THPModule_getDefaultDtype`
+/// straight onto `_C` (`torch/_C/__init__.pyi:1399`) rather than routing it
+/// through the operator table; `bootstrap.py` used to install a constant
+/// function here, which is what made this a getter with only one answer.
+///
+/// It returns the *interned* object, so `torch.get_default_dtype() is
+/// torch.float32` holds as it does upstream -- dtypes are used as dict keys
+/// across the vendored tree.
+#[pyfunction]
+#[pyo3(name = "get_default_dtype")]
+pub fn get_default_dtype(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    interned(py, default_float())
+}
+
+/// The module-level `torch.float32` and friends, kept so that anything handing
+/// a dtype back to Python can hand back *the* object rather than an equal one.
+static INTERNED: std::sync::OnceLock<Vec<(TorchDType, Py<PyAny>)>> =
+    std::sync::OnceLock::new();
+
+fn interned(py: Python<'_>, tag: TorchDType) -> PyResult<Py<PyAny>> {
+    INTERNED
+        .get()
+        .and_then(|made| made.iter().find(|(d, _)| *d == tag))
+        .map(|(_, object)| object.clone_ref(py))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim: torch.{} was never registered on the module",
+                tag.name()
+            ))
+        })
+}
+
 /// Look a dtype up by its torch spelling, aliases included.
 pub fn by_name(name: &str) -> Option<TorchDType> {
     ALL.iter()
@@ -559,6 +690,8 @@ pub fn by_name(name: &str) -> Option<TorchDType> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDtype>()?;
     m.add_function(wrap_pyfunction!(get_all_dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(set_default_dtype, m)?)?;
+    m.add_function(wrap_pyfunction!(get_default_dtype, m)?)?;
 
     // One Python object per dtype, shared with its aliases. torch guarantees
     // `torch.float is torch.float32`, and the tree uses dtypes as dict keys
@@ -579,5 +712,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
             .expect("every alias names a dtype in ALL");
         m.add(*alias, object)?;
     }
+    // Keep them reachable from Rust, for `get_default_dtype` -- see `interned`.
+    // A second call would be a second module init, which this build does not
+    // support (no multi-interpreter slot), so losing the race is not a case
+    // that can arise; `set` rather than `get_or_init` says so by ignoring it.
+    let _ = INTERNED.set(made);
     Ok(())
 }
