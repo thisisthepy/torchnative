@@ -190,12 +190,13 @@ only exists on a platform. Every ✅ has a run behind it.
 
 | | macOS<br>arm64 | Android<br>arm64 | iOS<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
-| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ *not listed* |
-| rust target installed | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
-| target CPython | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
-| extension builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
-| wheel builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
-| symbols resolve | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
+| rust target installed | ✅ | ✅ | ✅ | ✅ | 🔲 | ✅ |
+| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | 🔲 |
+| candle builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | ✅ |
+| extension builds | ✅ | ✅ | ✅ | ❌ *needs a C driver* | 🔲 | ⚠️ *wasip1 probe only* |
+| wheel builds | ✅ | ✅ | ✅ | ⚠️ *target wired, artefact missing* | 🔲 | ❌ *WASI has no `dlopen`* |
+| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF has no two-level namespace* | 🔲 | 🔲 |
 | installs | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
 | `import torch` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
 | computes | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
@@ -261,15 +262,26 @@ Android Q4K is **1.60× f32 at prefill** as shipped, and 3.29× with `+dotprod` 
 turned on, candle having no runtime dispatch and ARMv8.0 devices no `sdot`
 ([`docs/QUANT.md`](docs/QUANT.md)).
 
-### The three that are 🔲
+### Linux, Windows and WASM
 
-`Linux x86_64` and `Windows x86_64` are in [`docs/DESIGN.md`](docs/DESIGN.md)'s target matrix and
-have never been built: no rust target installed, no target CPython distribution.
-[`docs/ABI3.md`](docs/ABI3.md) §644 logged the same gap.
+**Linux x86_64** crosses four of six layers ([`docs/LINUX.md`](docs/LINUX.md)). One thing blocks
+it, and it is not the linker — `rust-lld` ships with rustup and links ELF fine. It is that
+`x86_64-unknown-linux-gnu` is the one target rustup ships no glibc stubs for, and that
+`candle → tokenizers → onig → onig_sys` is a C crate, so the build stops at
+`failed to find tool "x86_64-linux-gnu-gcc"` before linking is even reached. `cargo-zigbuild`
+supplies all of it and is not installed; that is a decision, not an oversight.
 
-**WASM is not in the matrix at all**, and whether it belongs there is an open question rather than
-an oversight — candle excludes `wasm32` from parts of itself, and CPython on WASM is a different
-embedding shape from the one this project uses everywhere else.
+**Windows x86_64** has its CPython distribution and nothing else yet.
+
+**WASM** is answered in [`docs/WASM.md`](docs/WASM.md), and the answer is that layer three splits.
+candle builds for `wasm32` — better than elsewhere, since the `onig` subtree drops out and the
+dependency count falls 129 → 80 — and PyO3's `abi3` extension module links. But **WASI has no
+`dlopen`**, so `torch._C` cannot be a wheel there at all, and **Emscripten voids `abi3`**, whose
+whole point here is one binary per platform across CPython versions. PEP 783 also forbids
+`-pthread`, so the honest line is scalar and single-threaded.
+
+It is absent from the matrix on purpose: that table is a `kernels` *backend* matrix, and `kernels`
+has no wasm backend — the same gap it already records for `vulkan`.
 
 ---
 
