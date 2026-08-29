@@ -181,64 +181,89 @@ Tracked with the measurements behind them in [`docs/DESIGN.md`](docs/DESIGN.md) 
 ## Platform support
 
 Three axes, and they are not independent: a dtype only means something on a device, and a device
-only exists on a platform. Every ✅ has a run behind it — where a cell is blank it is *unmeasured*,
-which is a different claim from unsupported.
+only exists on a platform. Every ✅ has a run behind it.
 
-**The axes are identical across platforms because the code is.** Android was probed on the device
-rather than assumed: same 11 storable dtypes, same two devices, same 119 operators as the host.
+**Legend** — ✅ measured working · ❌ measured refusing · ⚠️ built, never executed ·
+🔲 not built · — not applicable to that platform
+
+### Platforms
+
+| | macOS<br>arm64 | Android<br>arm64 | iOS<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ *not listed* |
+| rust target installed | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| target CPython | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| extension builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| wheel builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| symbols resolve | ✅ | ✅ | ✅ | 🔲 | 🔲 | 🔲 |
+| installs | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
+| `import torch` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
+| computes | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
+| **on PyPI `0.0.2a0`** | ✅ | ✅ | ✅ | — | — | — |
+| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ❌ |
+
+The last row is why the columns differ. iOS, Linux, Windows and WASM have no runtime on this
+machine — no device, and no `docker`, `colima`, `podman`, `lima`, `qemu`, `node` or `wasmtime`
+either — so the deepest rung any of them can reach here is *symbols resolve*.
 
 ### Devices
 
-| device | macOS | Android | iOS | what it is |
-|---|:--:|:--:|:--:|---|
-| `cpu` | ✅ | ✅ | ⚠️ | the only device that holds a tensor |
-| `meta` | ✅ | ✅ | ⚠️ | shape and dtype, no storage |
-| `mps` | ❌ | — | ❌ | candle has the backend; not enabled |
-| `vulkan` | — | ❌ | — | refuses by name; compute proven in a probe, not wired |
-| NNAPI · CoreML | — | ❌ | ❌ | needs the graph path, blocked at decomposition |
-| `cuda` | ❌ | ❌ | ❌ | constructible as a label, refuses to allocate |
-
-⚠️ iOS is **built and its symbols resolve**; nothing has been executed, for want of a device.
+| device | macOS | Android | iOS | Linux | Windows | WASM | what it is |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|---|
+| `cpu` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 | the only device that holds a tensor |
+| `meta` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 | shape and dtype, no storage |
+| `mps` | ❌ | — | ❌ | — | — | — | candle has the backend; not enabled |
+| `vulkan` | — | ❌ | — | 🔲 | 🔲 | — | refuses by name; compute proven in a probe, not wired |
+| NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
+| `cuda` | ❌ | ❌ | ❌ | 🔲 | 🔲 | — | constructible as a label, refuses to allocate |
+| WebGPU | — | — | — | — | — | 🔲 | the only accelerator a browser offers |
 
 ### dtypes on `cpu`
 
-11 of 46 are storable, and the same 11 on every platform measured.
+11 of 46 storable, and the same 11 on both platforms measured — Android was probed on the device
+rather than inferred from the host.
 
-| dtype | state | arithmetic path |
-|---|:--:|---|
-| `float32` | ✅ | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
-| `float64` | ✅ | `gemm` |
-| `bfloat16` · `float16` | ✅ | widened to `f32`, computed, narrowed — upstream's rule, so **slower than `f32`** |
-| `bool` `uint8` `uint32` `int16` `int32` `int64` | ✅ | integer kernels |
-| `float8_e4m3fn` | ⚠️ | constructs, then hangs on most paths — excluded from the golden suite |
-| `int8` `qint8` `quint8` | ❌ | candle's `DType` has no `I8`: the tensor cannot be created |
-| the other 35 | ❌ | complex, other float8, 4-bit — refuse by name |
+| dtype | macOS | Android | iOS | Linux · Windows · WASM | arithmetic path |
+|---|:--:|:--:|:--:|:--:|---|
+| `float32` | ✅ | ✅ | ⚠️ | 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
+| `float64` | ✅ | ✅ | ⚠️ | 🔲 | `gemm` |
+| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | 🔲 | widened to `f32` and narrowed — upstream's rule, so **slower than `f32`** |
+| `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | 🔲 | integer kernels |
+| `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | 🔲 | constructs, then hangs on most paths — excluded from the golden suite |
+| `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created |
+| the other 35 | ❌ | ❌ | ❌ | ❌ | complex, other float8, 4-bit — refuse by name |
+
+The last two rows are ❌ everywhere rather than 🔲, because the cause is in candle's type system
+and does not vary by platform.
 
 ### Quantisation — beside the dtype system, not inside it
 
 candle keeps quantisation in a separate `QTensor` type, which is why `int8` being unstorable does
 not block it. Reached through `torchnative.quant`, which swaps `nn.Linear`.
 
-| format | macOS | Android | note |
-|---|:--:|:--:|---|
-| Q8_0 | ✅ | ✅ | lossless on integer operands — bit-identical to a dense `linear` |
-| Q4_0 | ✅ | ✅ | 29.5% logit RMS on SmolLM2; degrades generation |
-| Q4K | ✅ | ✅ | a k-quant, so it needs `k % 256` — **a model constraint, not a platform one** |
+| format | macOS | Android | iOS | Linux · Windows · WASM | note |
+|---|:--:|:--:|:--:|:--:|---|
+| Q8_0 | ✅ | ✅ | ⚠️ | 🔲 | lossless on integer operands — bit-identical to a dense `linear` |
+| Q4_0 | ✅ | ✅ | ⚠️ | 🔲 | 29.5% logit RMS on SmolLM2; degrades generation |
+| Q4K | ✅ | ✅ | ⚠️ | 🔲 | a k-quant, needing `k % 256` — **a model constraint, not a platform one** |
 
-All three work on both, measured with the same probe. SmolLM2 cannot use the k-quants because its
-layers are 576 wide and 576 is not a multiple of 256 — that is about the model, and an earlier
-draft of this table wrongly put it in the platform column.
+All three were measured on macOS and on the Android device with the same probe. SmolLM2 cannot use
+the k-quants because its layers are 576 wide and 576 is not a multiple of 256 — that is about the
+model, and an earlier draft of this table wrongly put it in the platform column.
 
 Android Q4K is **1.60× f32 at prefill** as shipped, and 3.29× with `+dotprod` — which cannot be
 turned on, candle having no runtime dispatch and ARMv8.0 devices no `sdot`
 ([`docs/QUANT.md`](docs/QUANT.md)).
 
-### Platforms not yet built
+### The three that are 🔲
 
 `Linux x86_64` and `Windows x86_64` are in [`docs/DESIGN.md`](docs/DESIGN.md)'s target matrix and
-have never been built — no rust target installed, no target CPython. WASM is not in the matrix at
-all. All three are being worked on now; none of them can be *executed* on this machine either, so
-what they can reach here is what iOS reached: built, and symbols resolved.
+have never been built: no rust target installed, no target CPython distribution.
+[`docs/ABI3.md`](docs/ABI3.md) §644 logged the same gap.
+
+**WASM is not in the matrix at all**, and whether it belongs there is an open question rather than
+an oversight — candle excludes `wasm32` from parts of itself, and CPython on WASM is a different
+embedding shape from the one this project uses everywhere else.
 
 ---
 
