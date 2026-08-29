@@ -56,6 +56,7 @@ import builtins
 import contextlib
 import datetime
 import enum
+import functools
 import importlib.util
 import inspect
 import json
@@ -1674,12 +1675,20 @@ _SCHEMA_BASE_TYPES = frozenset(
 )
 
 
+@functools.lru_cache(maxsize=4096)
 def _decompose_type(spelling: str):
     """`SymInt[]?` -> `("SymInt", True, True, 0)`, `Tensor(a!)` -> `("Tensor", False, False, None)`.
 
     Returns `(base, is_list, is_optional, list_size)`. The order of the strips
     matters: `?` binds outermost (`int[]?` is an optional list, not a list of
     optional ints), and an alias annotation is attached to the base.
+
+    Memoised because it is a pure function of its string: the answer depends on
+    nothing but the characters, there is no context in which `"int[1]?"` means
+    two different things, and the returned tuple is immutable so a caller
+    cannot corrupt the entry for the next one. The bound is there because
+    `parse_schema` will happily accept text from outside the tables; the tables
+    themselves contain a few hundred distinct spellings.
 
     `list_size` is the number inside the brackets -- `int[1]` gives `1`, a bare
     `int[]` gives `0`, and a non-list gives `None`. It is not decoration:
@@ -1756,6 +1765,131 @@ class _TypeChecker:
                 and not isinstance(value, bool)
             )
         return self._base(base, value)
+
+    # -- the same rules, compiled once per schema argument ------------------
+    #
+    # `check` above re-derives everything on every call: it re-parses the
+    # spelling, then walks `_base`'s twelve-way string chain. Both answers are
+    # fixed the moment the schema is parsed, and the schema outlives the
+    # process. `predicate_for` returns a closure that answers exactly what
+    # `check` answers for the same argument, with the parsing and the chain
+    # already done. `check` is kept, unchanged, as the readable statement of the
+    # rule; `coerce`'s one rule is inlined at the call site in `_bind`, guarded
+    # by `_ArgPlan.sized_int_list`, which is its precondition precomputed.
+    #
+    # `check` and `coerce` were also tried *fused* into a single
+    # value-or-sentinel closure, which is one fewer call and one fewer attribute
+    # load per bound argument. It measured within noise of this (view 1.84 vs
+    # 1.80 us, transpose 1.52 vs 1.51) and it needed a second copy of the twelve
+    # `_base` rules with a different return shape, so it was dropped: two
+    # spellings of the zero-dim-tensor-satisfies-Scalar rule is a real hazard
+    # bought with no measurable time. See docs/BIND.md.
+    #
+    # Built lazily, on the first call that needs it, for the same reason the
+    # `_TypeChecker` itself is: `layout` and `memory_format` do not exist when
+    # the tables are parsed. Once built they are fixed, which is already true
+    # of the attributes `check` reads -- `__init__` snapshots them.
+
+    def _base_predicate(self, base: str):
+        """`self._base(base, ·)` with `base` already decided."""
+        tensor = self._tensor
+        if base == "Tensor":
+            return lambda value: isinstance(value, tensor)
+        if base == "Scalar":
+
+            def scalar(value):
+                if isinstance(value, (bool, int, float, complex)):
+                    return True
+                return isinstance(value, tensor) and value.dim() == 0
+
+            return scalar
+        if base in ("int", "SymInt"):
+            # `type(value) is int` implies both halves of the test below and is
+            # true of nearly every value that reaches here, so it is tried
+            # first; the full test still decides everything else. `bool` is
+            # excluded deliberately -- see the class docstring.
+            return lambda value: type(value) is int or (
+                isinstance(value, int) and not isinstance(value, bool)
+            )
+        if base == "float":
+            return lambda value: isinstance(value, (int, float)) and not isinstance(
+                value, bool
+            )
+        if base == "bool":
+            return lambda value: isinstance(value, bool)
+        if base == "str":
+            return lambda value: isinstance(value, str)
+        if base == "ScalarType":
+            dtype = self._dtype
+            return lambda value: isinstance(value, dtype)
+        if base == "Layout":
+            layout = self._layout
+            if layout is None:
+                return lambda value: False
+            return lambda value: isinstance(value, layout)
+        if base == "MemoryFormat":
+            memory_format = self._memory_format
+            if memory_format is None:
+                return lambda value: False
+            return lambda value: isinstance(value, memory_format)
+        if base == "Device":
+            device = self._device
+            return lambda value: isinstance(value, (device, str))
+        if base == "Generator":
+            generator = self._generator
+            if generator is None:
+                return lambda value: False
+            return lambda value: isinstance(value, generator)
+        raise RuntimeError(f"torch._C shim: unhandled schema type: {base}")
+
+    def predicate_for(self, base: str, is_list: bool, optional: bool, sized_int_list: bool):
+        """`lambda value: self.check(<that spelling>, value)`, precomputed."""
+        base_ok = self._base_predicate(base)
+        if is_list:
+            # An explicit loop rather than `all(base_ok(item) for item in
+            # value)`: the generator costs a frame per element plus one to stop,
+            # and shape lists are the hottest thing this checks. Short-circuits
+            # in the same place `all` does.
+            #
+            # The `return` at the bottom of each is torch's "if a size is
+            # specified (e.g. IntArrayRef[2]) we also allow passing a single
+            # int" -- `x.sum(0)` is that rule. `sized_int_list` is false unless
+            # the base is `int`/`SymInt`, so the non-int loop below can only
+            # ever answer False there.
+            if base in ("int", "SymInt"):
+                # `SymInt[]` is every shape argument -- `view`, `transpose`,
+                # `expand`, `sum(dim=...)`. Worth not paying a call per element.
+                def int_list_ok(value):
+                    if isinstance(value, (list, tuple)):
+                        for item in value:
+                            if type(item) is int:
+                                continue
+                            if not isinstance(item, int) or isinstance(item, bool):
+                                return False
+                        return True
+                    return (
+                        sized_int_list
+                        and isinstance(value, int)
+                        and not isinstance(value, bool)
+                    )
+
+                inner = int_list_ok
+            else:
+
+                def list_ok(value):
+                    if isinstance(value, (list, tuple)):
+                        for item in value:
+                            if not base_ok(item):
+                                return False
+                        return True
+                    return False
+
+                inner = list_ok
+        else:
+            inner = base_ok
+        if optional:
+            return lambda value: value is None or inner(value)
+        return inner
 
     @staticmethod
     def coerce(spelling, value):
@@ -1839,6 +1973,110 @@ def _is_schema_default(value, default_source) -> bool:
     return False
 
 
+class _ArgPlan:
+    """One schema argument with everything that is fixed already computed.
+
+    `_bind` used to re-derive all of this on every call -- `_decompose_type`
+    was the third-hottest function in a SmolLM2 forward pass at 35030 calls,
+    re-parsing a few dozen distinct strings. The spelling of an argument's type
+    is settled when the schema is parsed and never changes afterwards
+    (`_Schema.parse` fills `arguments` once and nothing writes to them), so
+    there is no context in which the same argument decomposes two ways.
+
+    `predicate` is the exception: it needs a `_TypeChecker`, which cannot exist
+    until `install` has synthesised `layout` and `memory_format`. It is filled
+    in by `_SchemaPlan.arm` on the first call.
+    """
+
+    __slots__ = (
+        "name",
+        "base",
+        "is_list",
+        "optional",
+        "sized_int_list",
+        "default_source",
+        "has_default",
+        "predicate",
+    )
+
+    def __init__(self, argument) -> None:
+        base, is_list, optional, list_size = _decompose_type(str(argument.type))
+        self.name = argument.name
+        self.base = base
+        self.is_list = is_list
+        self.optional = optional
+        # `check`'s "a sized int list also takes a bare int" precondition and
+        # `coerce`'s "widen it to a one-tuple" precondition are the same
+        # predicate on the type; `list_size` is never None when `is_list`.
+        self.sized_int_list = bool(is_list and list_size and base in ("int", "SymInt"))
+        # `_Argument.has_default_value()` is exactly this test.
+        self.default_source = argument.default_value
+        self.has_default = argument.default_value is not None
+        self.predicate = None
+
+
+class _SchemaPlan:
+    """One schema's binding invariants, computed once instead of per call.
+
+    Everything here was a list comprehension, a dict comprehension, or a
+    `_decompose_type` inside `_Overloads._bind`. None of it depends on the
+    arguments of the call.
+    """
+
+    __slots__ = (
+        "arguments",
+        "positional",
+        "by_name",
+        "varargs_intlist",
+        "required",
+        "any_defaults",
+        "n_arguments",
+        "n_positional",
+        "armed",
+    )
+
+    def __init__(self, schema, self_bound: bool) -> None:
+        plans = [_ArgPlan(argument) for argument in schema.arguments]
+        self.arguments = tuple(plans)
+        self.positional = tuple(
+            plan
+            for plan, argument in zip(plans, schema.arguments)
+            if not argument.kwarg_only
+        )
+        # Last spelling wins, as the dict comprehension it replaces did.
+        self.by_name = {plan.name: plan for plan in plans}
+        # The varargs int-list rule's *static* half. Its precondition is "the
+        # signature has exactly one positional argument (past `self`) and that
+        # argument is an int list"; only "and the caller passed an int there"
+        # is left for call time. When the count matches, the index is in range
+        # by construction: `len(positional) - skip == 1` means
+        # `len(positional) == skip + 1`.
+        skip = 1 if self_bound else 0
+        self.varargs_intlist = len(self.positional) - skip == 1 and (
+            self.positional[skip].is_list
+            and self.positional[skip].base in ("int", "SymInt")
+        )
+        # "every argument without a default was bound" -- the arguments *with*
+        # one can never fail that test, so they need not be walked.
+        self.required = tuple(plan.name for plan in plans if not plan.has_default)
+        # Whether the "drop arguments equal to their own default" pass has
+        # anything at all to look at. `view(Tensor self, SymInt[] size)` and
+        # every other pure-shape schema has no defaults, so the pass is a
+        # second dict built to hold exactly what the first one held.
+        self.any_defaults = any(plan.default_source is not None for plan in plans)
+        self.n_arguments = len(plans)
+        self.n_positional = len(self.positional)
+        self.armed = False
+
+    def arm(self, checker) -> None:
+        """Attach the type predicates. Called once, on the first bind."""
+        for plan in self.arguments:
+            plan.predicate = checker.predicate_for(
+                plan.base, plan.is_list, plan.optional, plan.sized_int_list
+            )
+        self.armed = True
+
+
 class _Overloads:
     """The ordered signature list for one `torch.<name>` or one `Tensor.<name>`.
 
@@ -1852,11 +2090,20 @@ class _Overloads:
     is out of the count.
     """
 
-    __slots__ = ("name", "schemas", "keys", "self_bound", "_checker_source")
+    __slots__ = (
+        "name",
+        "schemas",
+        "keys",
+        "self_bound",
+        "_checker_source",
+        "_candidates",
+        "_skip",
+    )
 
     def __init__(self, name: str, schemas, checker_source, self_bound: bool = False) -> None:
         self.name = name
         self.self_bound = self_bound
+        self._skip = 1 if self_bound else 0
         self.schemas = [_Schema.parse(text) for text in schemas]
         # A callable rather than a `_TypeChecker`: `layout` and `memory_format`
         # are synthesised later in `install` than this table is parsed, and the
@@ -1885,67 +2132,106 @@ class _Overloads:
                         f"type {base!r}, which _TypeChecker does not handle: "
                         f"{schema}"
                     )
+        # `(plan, key)` in declaration order -- the order overload resolution
+        # walks, which is part of the answer (`pow.Tensor_Tensor` before
+        # `pow.Tensor_Scalar`). Zipped once here rather than on every call.
+        self._candidates = tuple(
+            (_SchemaPlan(schema, self_bound), key)
+            for schema, key in zip(self.schemas, self.keys)
+        )
 
-    def _bind(self, schema, args, kwargs):
+    def _bind(self, plan, args, kwargs):
         """torch's `FunctionSignature::parse`, minus the parts nothing uses.
 
         Returns the bound arguments, or `None` if this schema does not accept
         the call.
+
+        Everything that does not depend on `args`/`kwargs` lives in `plan` and
+        was computed when the table was parsed; see `_SchemaPlan`. What is left
+        here is only the part that reads the actual call.
         """
-        checker = self._checker_source()
-        positional = [a for a in schema.arguments if not a.kwarg_only]
-        by_name = {a.name: a for a in schema.arguments}
+        if not plan.armed:
+            plan.arm(self._checker_source())
+        positional = plan.positional
+        by_name = plan.by_name
         # `self` is bound before any signature is looked at, so it is not part
         # of what the parser counts (see the class docstring).
-        skip = 1 if self.self_bound else 0
+        skip = self._skip
 
         # The varargs int-list rule, with torch's exact precondition: it
         # applies only when the signature has a *single* positional argument
         # and that argument is an int list, which is what makes
         # `torch.ones(2, 3)` mean `ones([2, 3])` while `torch.full(2, 3)` stays
-        # an error rather than becoming `full([2], 3)`.
-        if len(positional) - skip == 1 and len(args) > skip:
-            base, is_list, _, _ = _decompose_type(str(positional[skip].type))
-            if (
-                is_list
-                and base in ("int", "SymInt")
-                and isinstance(args[skip], int)
-                and not isinstance(args[skip], bool)
-            ):
+        # an error rather than becoming `full([2], 3)`. The half of the
+        # precondition that reads the signature is `plan.varargs_intlist`.
+        if plan.varargs_intlist and len(args) > skip:
+            head = args[skip]
+            if isinstance(head, int) and not isinstance(head, bool):
                 args = tuple(args[:skip]) + (tuple(args[skip:]),)
 
-        if len(args) > len(positional):
+        if len(args) > plan.n_positional:
             return None
 
         bound = {}
+        if kwargs:
+            # "given twice" -- hoisted out of the loop below so the far more
+            # common no-keyword call does not pay a dict lookup per argument.
+            # It was interleaved with the type checks before; both spellings
+            # answer `None` for the same calls, and neither has a side effect,
+            # so which of the two reasons is found first is not observable.
+            for parameter in positional[: len(args)]:
+                if parameter.name in kwargs:
+                    return None
+
         for value, parameter in zip(args, positional):
-            if parameter.name in kwargs:
-                return None  # given twice
-            if not checker.check(parameter.type, value):
+            if not parameter.predicate(value):
                 return None
-            bound[parameter.name] = checker.coerce(parameter.type, value)
+            # `coerce`'s only rule, with its precondition precomputed.
+            if (
+                parameter.sized_int_list
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+            ):
+                value = (value,)
+            bound[parameter.name] = value
 
-        for key, value in kwargs.items():
-            parameter = by_name.get(key)
-            if parameter is None or key in bound:
-                return None
-            if not checker.check(parameter.type, value):
-                return None
-            bound[key] = checker.coerce(parameter.type, value)
+        if kwargs:
+            for key, value in kwargs.items():
+                parameter = by_name.get(key)
+                if parameter is None or key in bound:
+                    return None
+                if not parameter.predicate(value):
+                    return None
+                if (
+                    parameter.sized_int_list
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                ):
+                    value = (value,)
+                bound[key] = value
 
-        for parameter in schema.arguments:
-            if parameter.name not in bound and not parameter.has_default_value():
-                return None
+        # If every argument got a value the "was everything required bound?"
+        # test cannot fail, so it need not be walked. `bound`'s keys are always
+        # argument names, so equal counts means equal sets. (A schema with a
+        # repeated argument name has fewer distinct names than arguments, so
+        # the counts cannot match and the walk still happens.)
+        if len(bound) != plan.n_arguments:
+            for name in plan.required:
+                if name not in bound:
+                    return None
 
-        return {
-            name: value
-            for name, value in bound.items()
-            if not _is_schema_default(value, by_name[name].default_value)
-        }
+        if not plan.any_defaults:
+            return bound
+        result = {}
+        for name, value in bound.items():
+            source = by_name[name].default_source
+            if source is None or not _is_schema_default(value, source):
+                result[name] = value
+        return result
 
     def resolve(self, args, kwargs):
-        for schema, key in zip(self.schemas, self.keys):
-            bound = self._bind(schema, args, kwargs)
+        for plan, key in self._candidates:
+            bound = self._bind(plan, args, kwargs)
             if bound is not None:
                 return key, bound
         owner = "Tensor." if self.self_bound else "torch."
@@ -1969,6 +2255,11 @@ def _describe_call(args, kwargs) -> str:
 # `requires_grad=True` is refused by name rather than ignored, which would hand
 # back a tensor that silently does not record anything.
 def _strip_python_only_kwargs(name: str, kwargs: dict) -> dict:
+    # Nothing to strip out of nothing, and the overwhelming majority of calls
+    # arrive with no keyword arguments at all. A fresh dict rather than the
+    # caller's, so the result is still something the caller may keep.
+    if not kwargs:
+        return {}
     kwargs = dict(kwargs)
     if kwargs.pop("requires_grad", False):
         raise NotImplementedError(
@@ -2671,7 +2962,12 @@ def _torch_level_function(name: str, dispatch, overloads):
         def fn(*args, **kwargs):
             if _MODE_STACK:
                 return _through_torch_function_modes(fn, args, kwargs)
-            key, bound = entry.resolve(args, _strip_python_only_kwargs(name, kwargs))
+            # `_strip_python_only_kwargs({})` is `{}`, and `**kwargs` already
+            # handed us a fresh dict, so the call is skippable when it would
+            # have nothing to strip. Most calls are in that case.
+            key, bound = entry.resolve(
+                args, _strip_python_only_kwargs(name, kwargs) if kwargs else kwargs
+            )
             return dispatch(key, **bound)
 
     fn.__name__ = name
@@ -2714,8 +3010,10 @@ def _tensor_method(name: str, dispatch, entry):
 
     def method(self, *args, **kwargs):
         try:
+            # See `_torch_function` above for why the empty case skips the call.
             key, bound = entry.resolve(
-                (self,) + args, _strip_python_only_kwargs(name, kwargs)
+                (self,) + args,
+                _strip_python_only_kwargs(name, kwargs) if kwargs else kwargs,
             )
         except TypeError:
             if is_dunder:
