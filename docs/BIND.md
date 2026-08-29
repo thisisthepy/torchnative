@@ -250,6 +250,27 @@ Pairwise across the four alternating rounds: before 1.1340 / 1.1444 / 1.1486 /
 **2.99 ms of the 5.16 ms gap is gone — 58% of it.** (Gap before
 41.067 − 35.912 = 5.155 ms; after 38.096 − 35.933 = 2.163 ms.)
 
+#### What the residual is, and is not, resolved to
+
+Three independent runs put the *after* ratio at 1.019, 1.033 (median 1.021) and
+1.060. The improvement is not in doubt — the before and after bands above do not
+overlap, and every reading lands far below 1.1435. **The residual itself is not
+resolved to a percent, and this document should not be read as claiming 1.06
+exactly.**
+
+The reason is the noise floor rather than a disagreement about method. A
+four-round re-measurement taken at load 3.2 scattered pairwise 0.915 / 1.012 /
+1.039 / 1.045 — one round came out *faster* than upstream. A spread that
+straddles 1.00 cannot resolve a 2–6% residual, so the correct summary is a
+range: **within a few percent of upstream on desktop CPU, from 14% behind.**
+
+This machine cannot be made quiet on demand. The load is a windowing server, a
+user application, and two Android emulators that are shared with other projects
+and must not be killed. Pinning the residual would need either a quiet machine
+or enough rounds to average the interference out; neither was done, so the range
+stands. The Android numbers in §7 are less affected because the effect there is
+1.8–2.75x — an order of magnitude above the same noise.
+
 ### Microbench, µs/call
 
 | | upstream | before | after | still |
