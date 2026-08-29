@@ -1123,6 +1123,117 @@ fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
     opmath_in(storage)
 }
 
+/// Is this candle error "I cannot consume that layout" rather than anything
+/// else?
+///
+/// `MatMulUnexpectedStriding` is the only error `MatMul` raises for a layout,
+/// and it is raised *before* the destination is allocated on both backends, so
+/// catching it costs a stride check and not a GEMM. `bt()` wraps the variant in
+/// `WithBacktrace` whenever backtraces are enabled, which is why this recurses
+/// instead of matching one level.
+fn is_matmul_striding_refusal(e: &candle_core::Error) -> bool {
+    match e {
+        candle_core::Error::MatMulUnexpectedStriding(_) => true,
+        candle_core::Error::WithBacktrace { inner, .. } => is_matmul_striding_refusal(inner),
+        _ => false,
+    }
+}
+
+/// Multiply two GEMM operands **in the layout they arrived in**, copying only
+/// if candle refuses that layout.
+///
+/// The copy this replaces was unconditional, and for `F.linear` it was the
+/// dominant cost of the whole call: `bootstrap.py::linear` hands the kernel
+/// `t(weight)`, a free transpose *view*, and `.contiguous()` on that view is a
+/// strided gather of the entire weight. On SmolLM2-135M's `lm_head` that is
+/// 113 MB re-written per forward pass (docs/QUANT2.md §6, docs/LINEAR.md).
+///
+/// **candle does not need it.** Both CPU backends read `lhs_l.stride()` and
+/// `rhs_l.stride()` and hand the last two of them to the multiply:
+///
+/// - Accelerate/MKL (`cpu_backend/mod.rs`, `#[cfg(feature = "accelerate")]`)
+///   picks `transa`/`transb` from those strides, so a transposed operand
+///   becomes `CblasTrans` -- which is exactly the case `linear` produces. Any
+///   *other* non-contiguous layout (a strided slice, say) it refuses with
+///   `MatMulUnexpectedStriding`.
+/// - The `gemm` backend (every non-Apple target) passes `lhs_cs`/`lhs_rs` and
+///   `rhs_cs`/`rhs_rs` straight through and so accepts arbitrary strides on
+///   the last two dimensions.
+///
+/// Both share `MatMul::ab_skip`, which needs the *batch* strides to be one of
+/// four recognised shapes and refuses otherwise -- reachable from rank 4 and
+/// up, where two batch axes can be swapped.
+///
+/// So the accepted set differs between backends and between ranks, and this
+/// deliberately does not try to restate it. Restating it would mean keeping a
+/// copy of candle's predicate in sync with candle, and getting that copy wrong
+/// in the permissive direction is a wrong answer rather than a failure. Asking
+/// candle and copying only when it says no cannot be wrong in that direction:
+/// the layouts that reach the multiply are exactly the ones candle accepts, and
+/// nothing is passed through silently.
+///
+/// `aten.mm.default` has never called `.contiguous()`, so the "candle takes a
+/// strided operand" half of this was already shipping and golden-compared; what
+/// is new is the fallback and the other four kernels.
+fn gemm_with_layout_fallback(
+    lhs: &Tensor,
+    rhs: &Tensor,
+    multiply: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
+) -> candle_core::Result<Tensor> {
+    match multiply(lhs, rhs) {
+        Err(e) if is_matmul_striding_refusal(&e) => {
+            multiply(&lhs.contiguous()?, &rhs.contiguous()?)
+        }
+        other => other,
+    }
+}
+
+/// `matmul` over operands that may disagree in rank -- **folding the batch
+/// into the rows when the right operand has none**, which is what upstream
+/// does and is the difference between one GEMM and one copy of the weight.
+///
+/// candle's `broadcast_matmul` equalises the ranks by broadcasting and then
+/// concretising: `rhs.broadcast_as(&r_shape)?.contiguous()?`, with a
+/// `// TODO: Avoid concretising the broadcasted matrixes via contiguous.`
+/// above it. For `(1, seq, k) @ (k, n)` -- the shape *every* transformer
+/// activation has -- that materialises the whole weight on every call, which
+/// is the same 113 MB `lm_head` copy `gemm_with_layout_fallback` exists to
+/// remove, just performed one level down. Removing our `.contiguous()` alone
+/// does nothing here: measured 85.8 ms before, 88.3 ms after, against 4.7 ms
+/// upstream (docs/LINEAR.md).
+///
+/// `at::native::matmul` does not broadcast this case at all. When the right
+/// operand is 2-D it *folds*: the left operand's leading dimensions collapse
+/// into the row dimension, one 2-D GEMM runs, and the result is unflattened.
+/// `at::native::linear` spells the same thing out for the no-bias N-D branch
+/// as `t, view, mm, _unsafe_view` -- which `bootstrap.py::_install_nn` already
+/// transcribes in a comment above the `linear` it installs.
+///
+/// The fold is exact rather than an approximation of the batched form: with a
+/// 2-D right operand every batch element multiplies the *same* matrix, so
+/// stacking the rows computes the identical set of dot products. It is only
+/// reachable when the right operand is 2-D and the left has more; everything
+/// else still goes to `broadcast_matmul`, so the broadcasting semantics this
+/// kernel had are unchanged for every other shape.
+///
+/// The `reshape` is free for a contiguous left operand and copies for a
+/// non-contiguous one -- but that copy is of the *activation*, which is the
+/// small operand, and candle's `broadcast_matmul` would have copied the
+/// weight instead.
+fn batched_matmul(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
+    if lhs.rank() > 2 && rhs.rank() == 2 {
+        let dims = lhs.dims();
+        let (lead, k) = dims.split_at(dims.len() - 1);
+        let rows: usize = lead.iter().product();
+        let folded = lhs.reshape((rows, k[0]))?;
+        let product = gemm_with_layout_fallback(&folded, rhs, |a, b| a.matmul(b))?;
+        let mut out_shape = lead.to_vec();
+        out_shape.push(rhs.dims()[1]);
+        return product.reshape(out_shape);
+    }
+    gemm_with_layout_fallback(lhs, rhs, |a, b| a.broadcast_matmul(b))
+}
+
 /// `at::opmath_type` -- the dtype torch *computes* in for a given storage
 /// dtype. `float` for both reduced floats, the storage dtype for everything
 /// else.
@@ -1305,12 +1416,10 @@ fn bmm_default(
     let out = lhs
         .tensor()?
         .fast_to(acc)
-        .and_then(|l| l.contiguous())
         .and_then(|l| {
             rhs_inner
                 .fast_to(acc)
-                .and_then(|r| r.contiguous())
-                .and_then(|r| l.matmul(&r))
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
         })
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
@@ -1494,12 +1603,10 @@ fn addmm_default(
         let product = mat1
             .tensor()?
             .to_dtype(acc_dtype)
-            .and_then(|l| l.contiguous())
             .and_then(|l| {
                 mat2_inner
                     .to_dtype(acc_dtype)
-                    .and_then(|r| r.contiguous())
-                    .and_then(|r| l.matmul(&r))
+                    .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
             })
             .map_err(|e| candle_err(OP, e))?;
         acc = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
@@ -1670,12 +1777,10 @@ fn baddbmm_default(
     let product = batch1
         .tensor()?
         .to_dtype(acc_dtype)
-        .and_then(|l| l.contiguous())
         .and_then(|l| {
             batch2_inner
                 .to_dtype(acc_dtype)
-                .and_then(|r| r.contiguous())
-                .and_then(|r| l.matmul(&r))
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
         })
         .map_err(|e| candle_err(OP, e))?;
     let mut acc: Option<Tensor> = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
@@ -3298,13 +3403,7 @@ fn matmul_default(
     let out = lhs
         .tensor()?
         .fast_to(acc)
-        .and_then(|l| l.contiguous())
-        .and_then(|l| {
-            rhs_inner
-                .fast_to(acc)
-                .and_then(|r| r.contiguous())
-                .and_then(|r| l.broadcast_matmul(&r))
-        })
+        .and_then(|l| rhs_inner.fast_to(acc).and_then(|r| batched_matmul(&l, &r)))
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
