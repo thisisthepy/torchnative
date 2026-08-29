@@ -194,9 +194,11 @@ only exists on a platform. Every ✅ has a run behind it.
 | rust target installed | ✅ | ✅ | ✅ | ✅ | 🔲 | ✅ |
 | target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | 🔲 |
 | candle builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | ✅ |
-| extension builds | ✅ | ✅ | ✅ | ❌ *needs a C driver* | 🔲 | ⚠️ *wasip1 probe only* |
+| candle **computes** | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | ✅ *under Node* |
+| extension builds | ✅ | ✅ | ✅ | ❌ *needs a C driver* | 🔲 | ✅ *emscripten* |
 | wheel builds | ✅ | ✅ | ✅ | ⚠️ *target wired, artefact missing* | 🔲 | ❌ *WASI has no `dlopen`* |
-| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF has no two-level namespace* | 🔲 | 🔲 |
+| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF has no two-level namespace* | 🔲 | ⚠️ *stubs, not errors* |
+| `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
 | installs | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
 | `import torch` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
 | computes | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
@@ -273,12 +275,18 @@ supplies all of it and is not installed; that is a decision, not an oversight.
 
 **Windows x86_64** has its CPython distribution and nothing else yet.
 
-**WASM** is answered in [`docs/WASM.md`](docs/WASM.md), and the answer is that layer three splits.
-candle builds for `wasm32` — better than elsewhere, since the `onig` subtree drops out and the
-dependency count falls 129 → 80 — and PyO3's `abi3` extension module links. But **WASI has no
-`dlopen`**, so `torch._C` cannot be a wheel there at all, and **Emscripten voids `abi3`**, whose
-whole point here is one binary per platform across CPython versions. PEP 783 also forbids
-`-pthread`, so the honest line is scalar and single-threaded.
+**WASM** runs. Under Emscripten and the Node in this machine's emsdk, candle computes a
+quantised matmul to `511.96875` — bit-identical to the host, the same quantisation error rather
+than a round number agreeing — and `dlopen` loads our own `cdylib`, whose `PyInit_` executes and
+returns a module definition ([`docs/WASM.md`](docs/WASM.md) §7). The `onig` subtree drops out
+there, so the dependency count falls 129 → 80.
+
+**What it costs is `abi3`.** Pyodide pins CPython 3.13, 3.14 and 3.15 to Emscripten 4.0.9, 5.0.3
+and 6.0.5 — three releases, three compilers — so WASM would be one binary per CPython feature
+release rather than one per platform. That is a different distribution model from the other five,
+not a variation on it. WASI is separately blocked: no `dlopen`, so `torch._C` cannot be a wheel
+there at all. And PEP 783 forbids `-pthread`, so the honest line is scalar and single-threaded —
+`simd128` is off because candle's own WASM SIMD backend does not compile.
 
 It is absent from the matrix on purpose: that table is a `kernels` *backend* matrix, and `kernels`
 has no wasm backend — the same gap it already records for `vulkan`.
