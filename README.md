@@ -202,9 +202,15 @@ only exists on a platform. Every ✅ has a run behind it.
 | **on PyPI `0.0.2a0`** | ✅ | ✅ | ✅ | — | — | — |
 | can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ❌ |
 
-The last row is why the columns differ. iOS, Linux, Windows and WASM have no runtime on this
-machine — no device, and no `docker`, `colima`, `podman`, `lima`, `qemu`, `node` or `wasmtime`
-either — so the deepest rung any of them can reach here is *symbols resolve*.
+The last row is why the columns differ. iOS, Linux and Windows have no runtime on this machine —
+no device, and no `docker`, `colima`, `podman`, `lima` or `qemu` — so the deepest rung any of them
+can reach here is *symbols resolve*.
+
+WASM is the exception and an earlier version of this line got it wrong. A complete emsdk with
+`emcc` and a bundled Node 24 sits in this machine's cache; `command -v node` finds nothing only
+because it is not on `PATH`. So WASM is the one of the three that *could* be executed here
+without installing anything — it has not been, and that is a different claim
+([`docs/WASM.md`](docs/WASM.md)).
 
 ### Devices
 
