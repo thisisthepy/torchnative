@@ -186,7 +186,13 @@ torchnative = ["**/*"]
 # *building* interpreter would also pin the wheel to that interpreter's magic
 # number, which is the one thing an abi3 wheel must not do.
 [tool.setuptools.exclude-package-data]
-"*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo"]
+# `.DS_Store` is here because one got into a wheel. Finder writes it into any
+# directory it displays, `.gitignore` cannot help -- the vendored tree is not in
+# git -- and `build.py` skipped it only on the path that copies the tree, not on
+# the one setuptools takes. The copy at `torchnative/src/main/.DS_Store` is the
+# package root, so it landed at the archive root, and it was caught by the iOS
+# check comparing the two wheels member by member: 2,566 shared, 1 differing.
+"*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
 # Platform source sets follow the pypackpack layout: src/main is scanned for

@@ -99,6 +99,12 @@ STAMP = SRC / ".stamp"
 
 SKIP_SUFFIXES = (".pyc", ".pyo")
 SKIP_DIRS = {"__pycache__"}
+#: Finder metadata. Excluded in pyproject too, but that only reaches files
+#: *inside* a package -- the copy at the package root lands at the archive
+#: root, which setuptools' package-data globs never see. Named here so the
+#: preflight can refuse rather than ship one, as it did in 0.0.2a0's first
+#: build.
+SKIP_NAMES = {".DS_Store"}
 
 
 def _fail(msg: str) -> None:
@@ -120,6 +126,25 @@ def preflight() -> dict[str, str]:
             "  run: bash vendor/install_shim.sh\n"
             "  (without it the tree cannot import; that is by design --\n"
             "   vendor_torch.sh drops upstream's _C so the hole is visible)"
+        )
+
+    # Finder metadata, refused rather than merely excluded. `.DS_Store` got into
+    # 0.0.2a0's first build: the copy at the package root lands at the *archive*
+    # root, where setuptools' package-data globs never look, and `.gitignore`
+    # cannot see it because the vendored tree is not in git. Excluding it fixes
+    # this build; refusing is what makes the next one say so instead of quietly
+    # shipping whatever Finder left behind. It was caught by the iOS check
+    # comparing two wheels member by member -- 2,566 shared, 1 differing -- which
+    # is a long way round for a file that should never have been packageable.
+    junk = sorted(
+        str(p.relative_to(SRC)) for name in SKIP_NAMES
+        for p in SRC.rglob(name)
+    )
+    if junk:
+        _fail(
+            "the source tree carries files that must not be packaged:\n"
+            + "".join(f"   {j}\n" for j in junk)
+            + "   remove them and re-run (find . -name .DS_Store -delete)"
         )
 
     stamp: dict[str, str] = {}
