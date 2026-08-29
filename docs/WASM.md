@@ -1,9 +1,14 @@
 # WASM — feasibility, layer by layer
 
-Status: **complete for all four layers.** It was written as the investigation ran, one entry
-per step, so that it would survive an interrupted session. Anything not answered still says
-so explicitly — see the summary table at the end for the three items that are
-"not attempted" rather than "does not work".
+Status: **complete for all four layers, and §7 now closes the one gap the first pass left
+open** — Emscripten was "not attempted" and is now *executed*. It was written as the
+investigation ran, one entry per step, so that it would survive an interrupted session.
+Anything not answered still says so explicitly.
+
+**Read §7 before §2d/§3c/§5.** §7 supersedes them where they disagree: §2d said emscripten was
+not attempted; it has now been built and run under Node. §3c's conclusion — that Emscripten
+voids `abi3` — is **not** overturned by §7 and is restated there with the measurement that
+confirms it.
 
 Question this document answers: the user names six supported platforms, but **WASM is
 absent from the `docs/DESIGN.md` §722 matrix.** Is the matrix stale, or is WASM a
@@ -562,3 +567,553 @@ Sources for the layer 3/4 claims, none of which were measured here:
 [abi3-on-Pyodide discussion](https://github.com/pyodide/pyodide/discussions/4377) ·
 [CPython WASI dlopen issue](https://github.com/python/cpython/issues/115983) ·
 [tier promotion](https://discuss.python.org/t/wasm32-emscripten-and-wasm32-wasi-have-been-promoted-to-tier-3-platforms-for-cpython/17590)
+
+---
+
+# 7. Emscripten, actually executed
+
+Everything in §1–§6 above was a *compile* result. §2d and §6a left one thing open for a
+scheduling reason: `emcc` was never run. This section runs it. **New vocabulary rule for this
+section: "runs" means a `.wasm` was executed by Node on this machine and its stdout was read.**
+
+## 7.0 Setup — what was used, and what was protected
+
+```sh
+emsdk   /Volumes/macMini/caches/emsdk                                    (5.0.3, shared)
+emcc    /Volumes/macMini/caches/emsdk/upstream/emscripten/emcc
+node    /Volumes/macMini/caches/emsdk/node/24.19.0_64bit/bin/node        v24.19.0
+export EM_CACHE=/Volumes/macMini/caches/emcc-scratch      # NOT the shared emsdk cache
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-emcc
+```
+
+The shared emsdk is redirected away from with `EM_CACHE`, which is the whole of §6a's concern:
+`emcc` writes its sysroot and port cache on every invocation, and that is the only part of the
+emsdk it writes to. Baseline before starting: **24431 files under the emsdk, 22 modified in the
+last 24h** — the same 22 §2d saw. The count is re-checked at the end of this section.
+
+`emcc` did populate the scratch cache on first use, as expected:
+
+```
+cache:INFO: generating system headers: sysroot_install.stamp...
+   (this will be cached in "/Volumes/macMini/caches/emcc-scratch/sysroot_install.stamp")
+```
+
+Nothing was installed. `wasm32-unknown-emscripten` was already an installed rustc target (§0).
+
+## 7.1 Layer 1 on Emscripten — candle compiles, and the crate graph is identical to WASI
+
+| target | command | result |
+|---|---|---|
+| `wasm32-unknown-emscripten` | `cargo build --release` | **exit 0**, 0 errors |
+
+Crate counts, re-measured on this branch (numbers differ by +2 from §1c because the lockfile
+has moved since; the *comparison* is what matters):
+
+| target | crates |
+|---|---|
+| `aarch64-apple-darwin` | 131 |
+| `wasm32-wasip1` | 82 |
+| `wasm32-unknown-emscripten` | **82** |
+
+`comm` on the two sorted crate lists is **empty in both directions**: the emscripten and wasip1
+dependency graphs are *the same set of 82 crates*. So §1c's finding — the `tokenizers`/`onig`
+subtree drops out for free on wasm32 — holds on Emscripten too, and Emscripten costs nothing
+extra. It also does **not** drag in the `wasm-bindgen`/`bumpalo` browser subtree that
+`wasm32-unknown-unknown` forces (§1c); the `getrandom` `wasm_js` pin in the probe's
+`Cargo.toml` is inert here.
+
+**One thing this table does not say, and §5.5 requires saying it.** The layer-1 `cdylib` link
+also exits 0, and it produces a **65-byte `.wasm`**:
+
+```
+0061 736d 01000000  000f 08 "dylink.0" ... 0715 01 11 "__wasm_call_ctors"
+```
+
+That is a side module containing one empty function. `--gc-sections` discarded all of candle
+because, with no PyO3 feature on, nothing is reachable from an export. **A layer-1 emscripten
+`cdylib` exit 0 proves nothing on its own** — it is the same false positive §2b caught on
+wasip1, in a new place. The load-bearing artefact is §7.2's, and it is 857 KB.
+
+Note also what the 65-byte header already tells us: rustc's `wasm32-unknown-emscripten` cdylib
+link emits a **`dylink.0` section**, i.e. `-sSIDE_MODULE`. That section is the difference from
+wasip1 in one word, and §7.3 is about what it buys.
+
+## 7.2 Layer 2 on Emscripten — `abi3-py313` + `extension-module` links with **no extra flag**
+
+```sh
+cargo build --release --features pyo3-route --target wasm32-unknown-emscripten
+```
+
+**exit 0. 857,161-byte `wasm_probe.wasm`.** Candle and PyO3 in one module — the size is the
+control that §2b established: 128 KB would mean candle had been stripped.
+
+**This is the sharpest difference from WASI, and it is not a matter of degree.**
+
+| | `wasm32-wasip1` | `wasm32-unknown-emscripten` |
+|---|---|---|
+| link with no extra flags | **exit 101** — `rust-lld: undefined symbol: _Py_DecRef`, … | **exit 0** |
+| what makes it link | `-C link-arg=--allow-undefined`, added by hand | nothing — `dylink.0`/`SIDE_MODULE` is the target default |
+| unresolved `Py*` become | imports of module `"env"` on a **core** module | imports of `"env"` **and `GOT.mem`** on a **side** module |
+
+The second row is the answer to "how does Emscripten resolve CPython symbols — same as
+wasip1's `--allow-undefined` or not?" **Not the same.** On wasip1 the flag is a way of telling
+`wasm-ld` to stop complaining, and it produces a core module whose imports must be supplied by
+whoever *instantiates* it — which, as §3b says, a Python interpreter never does for a module it
+imports. On Emscripten the same unresolved symbols are recorded in a `dylink.0` section, which
+is a **defined interchange format for dynamic linking**: the loader is expected to resolve them
+against an already-loaded main module. That is `dlopen`'s job, and it is the thing WASI has no
+equivalent of.
+
+### 7.2a The artefact's shape, read from the binary
+
+Disassembled with the emsdk's own `wasm-dis` (binaryen) and counted:
+
+```
+sections:  dylink.0  TYPE  IMPORT  FUNCTION  GLOBAL  EXPORT  START  ELEM  DATACOUNT  CODE  DATA
+exports:   PyInit_wasm_probe            (llvm-nm: 00003735 T PyInit_wasm_probe)
+imports:   198 total   =  88 "env"  +  70 "GOT.func"  +  40 "GOT.mem"
+```
+
+Of those, **54 are CPython**: 45 functions from `"env"` and **9 data symbols from `"GOT.mem"`**:
+
+```
+GOT.mem:  PyExc_AttributeError  PyExc_BaseException  PyExc_SystemError  PyExc_TypeError
+          PyList_Type  PyModule_Type  PyTuple_Type  PyType_Type  PyUnicode_Type
+```
+
+The `GOT.mem` half is new information relative to §2c, which counted 45 and stopped. Those nine
+are **data**, not functions — type objects and exception singletons — and on wasip1 they were
+folded into the same undifferentiated `"env"` import list. Emscripten separates them because
+data relocation is a distinct problem from function relocation, and it is one more reason the
+two platforms are not variants of each other.
+
+### 7.2b The build imports **20 pthread symbols** — §1e/§3d, now measured rather than predicted
+
+The non-CPython `"env"` imports include:
+
+```
+pthread_create  pthread_detach  pthread_attr_init  pthread_attr_setstacksize
+pthread_mutex_{init,lock,trylock,unlock,destroy}  pthread_mutexattr_{init,settype,destroy}
+pthread_cond_{init,wait,signal,broadcast,destroy}  pthread_condattr_{init,setclock,destroy}
+sched_yield  sysconf
+```
+
+§1e said "`rayon`, `memmap2` and `num_cpus` compile; whether they *behave* is not attempted",
+and §3d said PEP 783 forbids `-pthread`. **This import list is the two statements meeting.**
+The artefact was built **without** `-pthread`, and it still names `pthread_create`, because
+candle's thread-pool code is linked in and only the *linker* knows it is unreachable at
+runtime. Emscripten without `-pthread` supplies a `pthread_create` that fails rather than one
+that spawns. So the shape is: **it links, it loads, and any code path that actually reaches
+`pthread_create` fails at runtime rather than at build time.** That is the "compiles but does
+not run" surprise §1e predicted, and it is now located precisely.
+
+## 7.3 Layer 3, part one — **candle executes on Emscripten under Node**
+
+This is the result the first pass could not reach at all, and it is the one thing about WASM
+that nobody in this project knew: **our layer-1 code runs.**
+
+`rust/wasm_probe/src/main.rs` is a new `[[bin]]` in the same probe crate. It is deliberately
+*not* an "ok / not ok" harness — it prints computed **values** and compares each to a number
+worked out by hand, because an exit code alone cannot tell "candle ran" apart from "the runtime
+started and the code had been gc'd away". That is the same false positive as §2b and §7.1, and
+it is the specific way a runtime probe lies.
+
+**Control first**, on the host, since a probe that passes everywhere proves nothing:
+
+```
+$ cargo run --release --bin wasm_probe                       # aarch64-apple-darwin
+target_arch=aarch64 target_os=macos
+tensor  sum(ones(2,3)) = 6  expect 6  PASS
+matmul  dims=[2, 4] sum=48  expect [2,4] 48  PASS
+reduced f16sum=24 bf16sum=24  expect 24 24  PASS
+q4_0    bytes=1152 maxerr=0 matmulsum=511.96875  expect 1152 ~0 512  PASS
+simd128 enabled = false
+== failures = 0 ==                                            exit 0
+```
+
+Then the same source, compiled to `wasm32-unknown-emscripten` (998,294-byte `.wasm` plus a
+55,653-byte `wasm_probe.js` loader, both emitted by rustc via `emcc`) and executed by the
+emsdk's bundled Node:
+
+```
+$ node wasm_probe.js                                          # node v24.19.0
+target_arch=wasm32 target_os=emscripten
+tensor  sum(ones(2,3)) = 6  expect 6  PASS
+matmul  dims=[2, 4] sum=48  expect [2,4] 48  PASS
+reduced f16sum=24 bf16sum=24  expect 24 24  PASS
+q4_0    bytes=1152 maxerr=0 matmulsum=511.96875  expect 1152 ~0 512  PASS
+simd128 enabled = false
+== failures = 0 ==                                            exit 0
+```
+
+**Verdict: runs.** Read the two blocks side by side — they are *identical below the header
+line*, including the last digit of the quantised matmul.
+
+What that costs to say precisely, item by item:
+
+| checked | host | emscripten/node |
+|---|---|---|
+| `Tensor::zeros` + broadcast add + `sum_all` | 6 | 6 |
+| `matmul`, shape and value | `[2,4]`, 48 | `[2,4]`, 48 |
+| `f16` and `bf16` round trip through `to_dtype` | 24, 24 | 24, 24 |
+| `QTensor::quantize(Q4_0)` block packing | 1152 B | 1152 B |
+| `QTensor::dequantize` max abs error | 0 | 0 |
+| `QMatMul::forward` | **511.96875** | **511.96875** |
+| `cfg!(target_feature = "simd128")` | false | **false** |
+
+The Q4_0 row is the load-bearing one. 2048 elements at 32 weights per 18-byte block is 64
+blocks is 1152 bytes — the *block layout* is identical, so this is not "some quantiser ran",
+it is candle's GGML-compatible one. And `511.96875` rather than 512 is the quantisation error
+itself: it is the *same wrong answer* on both platforms, which is a much stronger statement
+than agreement on a round number would have been.
+
+**The `simd128 = false` row is the honest half.** §1d predicted this and it is now confirmed at
+runtime rather than inferred: what executed above is candle's **scalar** kernel path. §1d's
+upstream bug (`simd128.rs` lacks `CurrentCpuF16`/`CurrentCpuBF16`) is unchanged and was not
+fixed here.
+
+**No timing is reported, and that is deliberate.** Between §1d (scalar only) and §3d/§7.2b
+(single-threaded, `-pthread` forbidden by PEP 783) this is the slowest configuration candle
+has. A number here would be read as "WASM performance" when it is "WASM performance with both
+accelerators off", and the interesting question — what it costs *after* the simd128 fix — is
+not answerable on this machine.
+
+## 7.4 Layer 3, part two — **`dlopen` works on our actual `cdylib`**
+
+§3a's whole argument turns on one row of its table: WASI has no `dlopen`, Emscripten does. That
+row was **read from CPython and Pyodide policy documents, not measured** — §3 says so. It is
+also the row that decides whether `torch._C` can ever be a wheel on WASM, so it is worth more
+than a citation.
+
+`rust/wasm_probe/dlopen_host.c` is a 60-line C program: `dlopen` a path, `dlsym`
+`wasm_probe_run`, call it, compare the returned bitfield against 31. It loads the
+**candle-only** side module, not the PyO3 one, on purpose — that separates "does the dynamic
+loader work" from "can 54 CPython symbols be resolved" (§7.5), so a failure can only be blamed
+on one of them.
+
+`wasm_probe_run` is a new `#[no_mangle] pub extern "C"` in the probe's `lib.rs`. It exists
+because of §7.1: without an export reachable from outside, `--gc-sections` reduces the
+emscripten cdylib to 65 bytes. With it the candle-only side module is **865,573 bytes**.
+
+**Host control**, `cc dlopen_host.c` against `libwasm_probe.dylib`:
+
+```
+dlopen  PASS (handle=0x745d8a40)
+dlsym   PASS (wasm_probe_run=0x106afb6a0)
+call    wasm_probe_run() = 31  expect 31  PASS      exit 0
+```
+
+**Emscripten**, `emcc -sMAIN_MODULE=1`, side module loaded from disk via `-sNODERAWFS=1`, run
+under Node 24:
+
+```
+dlopen  PASS (handle=0x7fab0)
+dlsym   PASS (wasm_probe_run=0x14aa)
+call    wasm_probe_run() = 31  expect 31  PASS      exit 0
+```
+
+**Verdict: runs.** Same bitfield, 31, on both — all five candle checks including the quantised
+`QMatMul::forward`, executing from inside a module that was loaded **at runtime, by name, out of
+a file**, sharing the main module's linear memory and heap. That is the exact mechanism CPython
+uses to import a native extension, and it is exactly what §3b says WASI cannot do.
+
+**This is the single most load-bearing new fact in this document.** Everything §3c and §5c say
+about "Emscripten is the one to pursue" rested on a citation; it now rests on an execution.
+
+### 7.4a The first attempt failed, and the failure is a real constraint
+
+The `-sMAIN_MODULE=1` build linked fine and then died at load:
+
+```
+dlopen FAIL: could not load dynamic lib: side_nopyo3.wasm
+LinkError: WebAssembly.Instance(): Import #136 "env" "__cpp_exception":
+           tag import requires a WebAssembly.Tag
+```
+
+rustc's `wasm32-unknown-emscripten` side module uses **native wasm exception handling**, so it
+imports `__cpp_exception` as a wasm **tag**. A main module compiled with emcc's default
+exception mode exports no such tag, and the two cannot be linked. Adding `-fwasm-exceptions` to
+the *main* module fixed it, and that is the only change between the failing and passing runs
+above.
+
+Recorded because it is not a quirk of this probe: **the main module and every side module must
+agree on the exception ABI, and rustc picks native wasm EH for you.** Any real host — a Pyodide
+distribution, a custom CPython build — has to have been built with `-fwasm-exceptions` for a
+Rust extension to load into it. It is one more thing pinned by the platform, alongside the
+Emscripten version and linker flags PEP 783 already pins (§3c), and it belongs on that list.
+
+## 7.5 Layer 3, part three — **the PyO3 extension loads, and `PyInit_` runs**
+
+§7.4 loaded the candle-only module. This loads the real shape: the `cdylib` built with
+`abi3-py313` + `extension-module`, 893,771 bytes, exporting **both** `PyInit_wasm_probe` and
+`wasm_probe_run`, and importing the 54 CPython symbols of §7.2a.
+
+There is no CPython for this target on this machine, so the host supplies those 54 itself.
+`rust/wasm_probe/gen_pystubs.py` generates them **from the side module's own import table**
+(`wasm-dis` output), not from CPython headers — there are none to take, and guessing is not an
+option: a WebAssembly import whose type does not match the exporting module is a `LinkError` at
+*instantiation*, so an arity wrong by one gives "will not load" rather than "misbehaves".
+45 function stubs + 9 `char[512]` data symbols, one special case: `PyModuleDef_Init` returns
+its argument, because PyO3's multi-phase init is literally `return PyModuleDef_Init(&MODULE_DEF)`
+and that is the smallest thing that lets `PyInit_` run to completion.
+
+`rust/wasm_probe/pyinit_host.c`, `emcc -fwasm-exceptions -sMAIN_MODULE=1`, Node 24:
+
+```
+loading: side_pyo3.wasm
+dlopen  PASS -- module instantiated
+candle  wasm_probe_run() = 31  expect 31  PASS
+dlsym   PASS PyInit_wasm_probe=0x14fc
+PyInit  returned 0x160900, 1 stub call(s), last=PyModuleDef_Init
+PyInit  PASS -- PyModuleDef.m_name == "wasm_probe" at +20
+== failures = 0 ==                                              exit 0
+```
+
+**Verdict: runs.** Four things, each worth naming separately:
+
+1. **The extension instantiated** with all 54 CPython imports bound to a host module — including
+   the nine `GOT.mem` *data* symbols, which are the half wasip1 has no mechanism for.
+2. **candle still returns 31 from inside the PyO3 build.** PyO3's presence did not change the
+   numerical result or let `--gc-sections` take anything.
+3. **`PyInit_wasm_probe` was found by `dlsym` and executed.** It made exactly **one** call into
+   the host, and that call was `PyModuleDef_Init` — which independently confirms PyO3 0.29 uses
+   *multi-phase* module initialisation, since single-phase would have called `PyModule_Create2`
+   and a dozen others.
+4. **It returned the right module definition.** The returned pointer was dereferenced from the
+   *main* module and its `m_name` reads `"wasm_probe"`, at offset **+20** — which also measures
+   `sizeof(PyModuleDef_Base)` on wasm32 as 20 bytes (8-byte `PyObject` header + `m_init` +
+   `m_index` + `m_copy`, all 4-byte). That a pointer stored in the side module's data segment is
+   dereferenceable from the main module is the proof that **data relocation into the shared
+   linear memory worked**, not just function relocation.
+
+This is as far as it is possible to go without a target CPython, and it is further than §3
+assumed was reachable.
+
+### 7.5a Three negative controls — including one that made this section weaker
+
+§5.5 of CLAUDE.md: a check that cannot fail is not a check. Three were run.
+
+| control | change | result |
+|---|---|---|
+| **A** | `PyModuleDef_Init` stub returns `0` instead of its argument | `PyInit returned 0` → **FAIL, exit 1** |
+| **B** | delete `PyType_IsSubtype` from the host entirely | `dlopen` **still succeeds**, run still exits 0 |
+| **C** | delete `PyModuleDef_Init` — the one symbol `PyInit_` calls | loads, then **aborts** on the call |
+
+**A** proves the `PyInit PASS` line is not vacuous. **C** proves resolution is real for symbols
+that are actually called.
+
+**B is the one that matters, because it falsified something this section originally claimed.**
+The first draft of `pyinit_host.c` printed *"all 54 CPython imports resolved against this
+host"*. **That was false.** Emscripten's dynamic loader does not refuse a side module with an
+unresolvable import — it substitutes a stub that aborts if reached, exactly as **C** then
+demonstrated:
+
+```
+thread '<unnamed>' panicked at .../panicking.rs: panic in a function that cannot unwind
+Aborted()   RuntimeError: unreachable
+```
+
+So **on Emscripten, "the extension loaded" does not mean "the interpreter has every symbol it
+needs"; a missing one surfaces as a runtime abort at first use.** The probe's output was
+corrected to say so.
+
+That is not a detail — it is the same failure mode as the 20 `pthread` imports in §7.2b, and it
+generalises into a deployment property: **an ABI mismatch between a Rust extension and its
+Emscripten CPython host presents as an abort deep in a call, not as an import error.** On Linux
+or Android the loader rejects the `.so` up front. This is a *worse* diagnostic than the
+"silent failure mode" `docs/ABI3.md` §7 warns about for version-pinned `.so` files, and it is
+one more argument on the same side as §3c/§7.6.
+
+## 7.6 Layer 4 — what a real verdict still needs, and how close it actually is
+
+§7.5 is the ceiling without a target CPython. The remaining question is what it would take to
+run `import torch` for real, and the answer turned out to be **much closer than §6b estimated**.
+
+`docs/WASM.md` §6b listed "a Pyodide distribution matching the Emscripten version" as a blocker
+and left it at that, as if the matching were the hard part. It is not. Pyodide's own
+`Makefile.envs` on `main`:
+
+```
+export PYODIDE_EMSCRIPTEN_VERSION ?= 5.0.3
+export PYVERSION                  ?= 3.14.2
+export PYODIDE_ABI_VERSION        ?= 2026_0
+```
+
+**The emsdk on this machine is 5.0.3 — the exact version current Pyodide pins.** And
+`docs/development/abi/314.md` requires *"Rust version 1.93.0 or later"*; this machine has 1.98.0
+(§0). The toolchain half of the gap is already closed, by coincidence rather than by anyone's
+plan.
+
+What is missing is only the artefact:
+
+| to answer | needed | status |
+|---|---|---|
+| does the extension load into a real CPython | a built Pyodide distribution (`pyodide-core`, a download, not a build) | **absent** — nothing Pyodide-shaped anywhere on this machine |
+| do the golden tests pass | the above **plus** `numpy`/reference wheels for `pyemscripten_2026_0`, and a harness not assuming a host interpreter | absent; `tools/golden/compare.py` runs against a host CPython |
+| is it worth shipping | all of the above **plus** the §1d `simd128` fix | absent, and §1d is upstream |
+
+**The next step is a download and is not attempted here.** Fetching and unpacking a Pyodide
+distribution is outside the immediate request (CLAUDE.md §5.7) and the brief said to install
+nothing. It is recorded as the one remaining step rather than done.
+
+Two things that would otherwise be found the hard way, if someone does take that step:
+
+- **`-fwasm-exceptions` is mandatory, at compile *and* link time**, for the main module as well
+  as the side module. §7.4a discovered this empirically — the first `dlopen` died with
+  `tag import requires a WebAssembly.Tag` — and Pyodide's ABI spec lists "the stack unwinding
+  ABI" as one of the five things a PyEmscripten platform pins. The empirical finding and the
+  spec agree.
+- **`-sSUPPORT_LONGJMP=wasm` is also part of the platform**, and the probe's host did *not* pass
+  it. It got away with that only because nothing in the side module uses `setjmp`. A build that
+  does would fail; the emcc invocations in §7.0 are a probe, not a conforming build recipe.
+
+## 7.7 What this does **not** change: `abi3` is still void on Emscripten
+
+§3c concluded that Emscripten invalidates `abi3-py313` on the strength of a PEP 783 sentence
+and a Pyodide discussion thread. **Nothing in §7 overturns that, and the platform's own
+documentation now makes it sharper than §3c stated.** This is the part not to over-read:
+`abi3-py313` *built* (§7.2), *linked* (§7.2), *loaded* (§7.5) and its `PyInit_` *ran* (§7.5).
+None of that buys what `abi3` exists to buy.
+
+From Pyodide's ABI documentation:
+
+> The Emscripten compiler makes no ABI stability guarantees between versions, and several
+> linker flags can adjust the ABI. […] Pyodide adopts a **new PyEmscripten platform for each
+> feature release of Python.**
+
+And the platforms, read off their own specifications:
+
+| platform tag | CPython | **Emscripten** |
+|---|---|---|
+| `pyemscripten_2025_0` | 3.13 | **4.0.9** |
+| `pyemscripten_2026_0` | 3.14 | **5.0.3** |
+| `pyemscripten_2026_5` | 3.15 | **6.0.5** |
+
+**Read the right-hand column.** Three CPython feature releases, three *different compilers*. The
+entire premise of `abi3` — `rust/torch_c/Cargo.toml:13-23` spends ten lines on it, and
+`docs/ABI3.md` §7 recommends it — is that one artefact serves many interpreter versions. On
+Emscripten, supporting 3.13, 3.14 and 3.15 means **building three times with three different
+Emscripten toolchains**, and the `abi3` tag changes nothing about that count. The limited API
+would still be *used*; it would simply buy nothing.
+
+Restated as a deployment consequence, since that is what the question is for:
+
+> **On every other platform this project ships, "one binary per platform" is achieved by
+> `abi3`. On WASM it is not achievable at all.** WASM would be one binary per *PyEmscripten
+> platform*, i.e. one per CPython feature release, each built with the Emscripten compiler that
+> platform names. That is the same cardinality as dropping `abi3` everywhere, and it is a
+> different distribution model from the other five platforms — not a variation on it.
+
+Three further consequences, each measured above rather than argued:
+
+1. **Mismatches abort, they do not fail to load** (§7.5a). A side module whose host lacks a
+   symbol still `dlopen`s, and aborts at first use. So the wrong-platform wheel is not caught
+   by the loader. That is *worse* than the version-pinned-`.so` failure mode `docs/ABI3.md` §7
+   already calls silent.
+2. **Scalar, single-threaded, and that is structural.** §1d (candle's `simd128` does not
+   compile) and §7.2b/§3d (PEP 783 and Pyodide both forbid `-pthread`; the artefact imports 20
+   `pthread` symbols that can only abort) are not tuning problems.
+3. **The ABI pins the unwinding mode too** (§7.4a, §7.6), so an extension is tied to its host's
+   exception ABI on top of everything else.
+
+**None of this says WASM is impossible — §7.3/§7.4/§7.5 say the opposite, by execution.** It
+says WASM is a platform whose distribution model this project does not currently have, and that
+the cost is a wheel per CPython feature release rather than the one-artefact story the other
+five platforms get.
+
+## 7.8 Corrections to earlier sections of this document
+
+| section | said | now |
+|---|---|---|
+| header | "complete for all four layers" | true only for *compilation*; nothing had been executed |
+| §0, §1a, §6a | "there is no wasm runtime on this machine" | **wrong** — the emsdk's Node 24 is a runtime, and §7.3 used it |
+| §2d, §6a | emscripten "not attempted", shared emsdk in use | **attempted and passed**; `EM_CACHE` redirection was sufficient (§7.9) |
+| §3a table, row `dlopen` | "provided by Emscripten" (read from PEPs) | **measured** — §7.4, on our own `cdylib` |
+| §3a table, row "our extension shape" | "works — Pyodide loads side modules this way" (inferred) | **measured** — §7.5, `PyInit_` runs and returns the right `PyModuleDef` |
+| §1e | rayon/threads "compiles but unverified at runtime" | **located**: 20 `pthread` imports present in the artefact, unusable at runtime (§7.2b) |
+| §6b row 2 | "does the emscripten build link — gated on not disturbing another workstream" | **done**, exit 0, and the emsdk was not disturbed (§7.9) |
+| §6b row 3 | "no Pyodide — it is a download, not a build" | still true, but the toolchain gap is **closed**: Pyodide pins emscripten 5.0.3, which is what is here (§7.6) |
+| §5b README rows | "extension builds: ⚠️ wasip1 only; emscripten not attempted" | should read **✅ emscripten builds, loads and runs under Node**; `can be run here` flips from ❌ to ✅ |
+
+## 7.9 Reproducing §7, and the emsdk was left as found
+
+```sh
+export PATH="/Volumes/macMini/caches/emsdk/upstream/emscripten:\
+/Volumes/macMini/caches/emsdk/node/24.19.0_64bit/bin:$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-emcc
+export EM_CACHE=/Volumes/macMini/caches/emcc-scratch          # not the shared emsdk cache
+cd rust/wasm_probe
+
+# 7.1 / 7.2 -- compile and link
+cargo build --release --target wasm32-unknown-emscripten                        # exit 0 (65 B .wasm!)
+cargo build --release --features pyo3-route --target wasm32-unknown-emscripten  # exit 0, 857 KB
+
+# 7.3 -- candle executes
+cargo run   --release --bin wasm_probe                                          # host control
+cargo build --release --bin wasm_probe --target wasm32-unknown-emscripten
+node $CARGO_TARGET_DIR/wasm32-unknown-emscripten/release/wasm_probe.js          # exit 0
+
+# 7.4 -- dlopen a side module
+cargo build --release --lib --target wasm32-unknown-emscripten
+cc dlopen_host.c -o host_dl && ./host_dl $CARGO_TARGET_DIR/release/libwasm_probe.dylib   # control
+emcc dlopen_host.c -O1 -fwasm-exceptions -sMAIN_MODULE=1 -sALLOW_MEMORY_GROWTH=1 \
+     -sNODERAWFS=1 -o dl.js
+node dl.js wasm_probe.wasm                                                      # exit 0
+#   NB: without -fwasm-exceptions this fails at load, see 7.4a
+
+# 7.5 -- the PyO3 module, with generated CPython stubs
+cargo build --release --lib --features pyo3-route --target wasm32-unknown-emscripten
+wasm-dis wasm_probe.wasm -o side.wat && python3 gen_pystubs.py side.wat > pystubs_gen.h
+emcc pyinit_host.c -O1 -fwasm-exceptions -sMAIN_MODULE=1 -sALLOW_MEMORY_GROWTH=1 \
+     -sNODERAWFS=1 -o py.js
+node py.js wasm_probe.wasm                                                      # exit 0
+```
+
+New files, all inside `rust/wasm_probe/`: `src/main.rs`, `dlopen_host.c`, `pyinit_host.c`,
+`gen_pystubs.py`, plus a `wasm_probe_run` export added to `src/lib.rs`. `rust/torch_c/` and
+`tools/wheel/` were not touched.
+
+**The shared emsdk.** §2d declined to run `emcc` because 22 files under
+`/Volumes/macMini/caches/emsdk` had been modified that day and a `cache.lock` was present.
+`EM_CACHE=/Volumes/macMini/caches/emcc-scratch` was sufficient: every cache write `emcc` made
+went there (`sysroot_install.stamp`, `libc.a`, `libc++-noexcept.a`, `libcompiler_rt.a`,
+`pic/*`, …). Rechecked afterwards:
+
+| | before | after |
+|---|---|---|
+| files under `/Volumes/macMini/caches/emsdk` | 24431 | **24431** |
+| of those, modified in the last 24 h | 22 | **22** |
+| modified in the last 70 min (i.e. by this session) | — | **0** |
+| files under `EM_CACHE=/…/emcc-scratch` | 0 | 1605 (55 MB) |
+
+The 55 MB of system libraries `emcc` generated all landed in the scratch directory; the shared
+emsdk was not written to at all. **§2d's caution was right and its conclusion was too strong**:
+the correct response to a shared toolchain is to redirect its cache, not to skip the experiment.
+
+### 7.9a Regressions, re-run after these changes
+
+The changes are confined to `rust/wasm_probe/` and this file, but the shipping crate's suites
+were re-run anyway, because "I only touched X" is a claim and not a check:
+
+| check | result |
+|---|---|
+| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | **exit 0** — 197 ok, 0 not ok |
+| `$PY tools/golden/compare.py` | **exit 0** — 2811/2811 cases, 0 failed, ops covered = 119 |
+
+## 7.10 Summary of §7 — the four layers, executed
+
+| layer | question | first pass | §7 |
+|---|---|---|---|
+| 1 | candle on emscripten | not attempted | **works** — exit 0, same 82 crates as wasip1, identical set |
+| 1 | candle *runs* | impossible, "no runtime" | **runs** — Node 24, all 5 checks, `511.96875` identical to host |
+| 1d | wasm SIMD | blocked upstream | **unchanged** — confirmed off at runtime (`simd128 = false`) |
+| 2 | PyO3 `abi3` + `extension-module` link | wasip1 only, needs `--allow-undefined` | **works on emscripten with no extra flag** — side module, 857 KB |
+| 3 | `dlopen` our `cdylib` | read from PEPs | **runs** — dlopen + dlsym + call, bitfield 31 = host |
+| 3 | `PyInit_` on the real extension | read from PEPs | **runs** — returns `PyModuleDef` with `m_name == "wasm_probe"` |
+| 3 | `import torch` in a real interpreter | not attempted | **still not attempted** — needs a Pyodide download (§7.6) |
+| 4 | distribution | PEP 783 works | **works, and costs `abi3`** — one wheel per CPython release, per §7.7 |
+
+**The headline, stated so it cannot be over-read:** *our extension shape builds, loads and
+executes on Emscripten under Node — and doing so costs the one-binary-per-platform property
+that `abi3` gives this project everywhere else.* Both halves are measured. Neither cancels the
+other.

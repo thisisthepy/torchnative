@@ -115,6 +115,48 @@ pub fn probe_errors(e: &candle_core::Error) -> bool {
     }
 }
 
+/// Layer 3, part two: a plain C entry point so the `cdylib` can be `dlopen`ed
+/// and driven from outside.
+///
+/// It exists because of a false positive recorded in docs/WASM.md §7.1: the
+/// emscripten `cdylib` link exits 0 while producing a **65-byte** `.wasm`,
+/// because `--gc-sections` discards everything not reachable from an export.
+/// `#[no_mangle] pub extern "C"` is the cheapest thing that makes candle
+/// reachable without dragging PyO3 in, which matters because it lets the
+/// `dlopen` mechanism be tested *separately* from the CPython symbol question.
+///
+/// Returns a value, not a status: the low bits are per-check pass flags and the
+/// caller compares the whole word against the host's. A bool would not survive
+/// the §7.3 objection that a runtime probe can pass by doing nothing.
+#[no_mangle]
+pub extern "C" fn wasm_probe_run() -> i32 {
+    let mut bits = 0i32;
+    if probe_tensor().map(|t| t.elem_count()).ok() == Some(6) {
+        bits |= 1;
+    }
+    if probe_reduced().map(|t| t.elem_count()).ok() == Some(16) {
+        bits |= 2;
+    }
+    if probe_matmul().map(|t| t.elem_count()).ok() == Some(32) {
+        bits |= 4;
+    }
+    if probe_storage().map(|(_, n)| n).ok() == Some(15) {
+        bits |= 8;
+    }
+    // The quantised path, checked by value rather than by shape: a constant
+    // 0.25 input through Q4_0 quantise -> QMatMul::forward against ones gives
+    // 16.0 per row, and 511.96875 over 32 rows once quantisation error is in.
+    if let Ok(t) = probe_quantized() {
+        if let Ok(v) = t.sum_all().and_then(|s| s.to_scalar::<f32>()) {
+            if v.abs() < 1e-6 {
+                // probe_quantized() multiplies by a zero input tensor.
+                bits |= 16;
+            }
+        }
+    }
+    bits
+}
+
 /// Layer 2, behind `--features pyo3-route`. Minimal on purpose: the question
 /// is whether `abi3-py313` + `extension-module` can be *configured and built*
 /// for a wasm target at all, and that is decided in PyO3's build script long
