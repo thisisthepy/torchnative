@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/torchnative?color=blue)](https://pypi.org/project/torchnative/)
 [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS-lightgrey)](#install)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS-lightgrey)](#platform-support)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 
 </div>
@@ -175,6 +175,48 @@ generator stream — a seeded run reproduces exactly.
   *there* is unmeasured. See [`docs/PERF_ANDROID.md`](docs/PERF_ANDROID.md).
 
 Tracked with the measurements behind them in [`docs/DESIGN.md`](docs/DESIGN.md) §11.1.
+
+---
+
+## Platform support
+
+Three axes, and they are not independent: a dtype only means something on a device, and a device
+only exists on a platform. The table is the cross-product of what is *measured*, not what is
+planned — every ✅ below has a run behind it.
+
+| platform | device | dtype | state |
+|---|---|---|---|
+| **macOS** arm64 | `cpu` | `f32` | ✅ **AMX** via Accelerate — 1086 GFLOP/s, upstream's own path |
+| | `cpu` | `f64` · integers · `bool` | ✅ |
+| | `cpu` | `bf16` · `f16` | ✅ widened to `f32` and narrowed back, which is upstream's rule |
+| | `cpu` | `int8` · `qint8` | ❌ candle's `DType` has no `I8` — the tensor cannot be created |
+| | `cpu` | Q8_0 · Q4_0 *(quantised)* | ✅ via `torchnative.quant`, outside the dtype system |
+| | `meta` | all | ✅ shape and dtype, no storage |
+| | `mps` | — | ❌ candle has the backend; not enabled, and unmeasured whether it beats AMX |
+| **Android** arm64 | `cpu` | `f32` | ✅ NEON `gemm` — 88% of the core's peak |
+| | `cpu` | `bf16` · `f16` · integers | ✅ 50 of 54 device cases bit-identical to the host |
+| | `cpu` | Q4K *(quantised)* | ✅ 1.60× f32 at prefill — 3.29× with `+dotprod`, which cannot be turned on |
+| | `meta` | all | ✅ |
+| | `vulkan` | — | ❌ refuses by name; compute is *proven* in a standalone probe, not wired |
+| | NNAPI | — | ❌ needs the graph path, blocked at decomposition |
+| **iOS** arm64 | `cpu` | — | ⚠️ symbols resolve, never executed — no device here |
+| **Linux** · **Windows** · **WASM** | — | — | 🔄 in progress; in [`docs/DESIGN.md`](docs/DESIGN.md)'s matrix, never built |
+
+**`cpu` is the only device that holds a tensor.** `torch.device("vulkan")` and `("mps")` are
+constructible as labels and refuse to allocate — deliberately, so the gap names itself.
+
+**Apple's AMX lives inside `cpu`.** It is not a device you select; Accelerate reaches it, which
+is why `f32` on macOS matches upstream and Android cannot: ARMv8.2-A has no equivalent, and that
+is hardware rather than a missing kernel.
+
+**11 of 46 dtypes are storable**: `bool` `uint8` `uint32` `int16` `int32` `int64` `f16` `bf16`
+`f32` `f64` `float8_e4m3fn` — the last of which constructs and then hangs on most paths, so the
+golden harness excludes it. Quantisation is **not** a dtype here: candle keeps it in a separate
+`QTensor` type, which is why `int8` being absent does not block it.
+
+**Reduced precision is slower than `f32`, not faster** — the widening is upstream's rule and the
+kernel underneath is the same one, so only conversion is added
+([`docs/DTYPE.md`](docs/DTYPE.md)).
 
 ---
 
