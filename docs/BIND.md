@@ -324,3 +324,107 @@ residue was not chased — it is on the C side, and this work was scoped to
 the same `bootstrap.py` is embedded there and the change is pure interpreter
 work with no host-specific path, so the share it occupies is if anything larger
 on a slower CPU. That is an argument, not a measurement.
+
+---
+
+## 7. Android measurement (in progress)
+
+Turning §6's closing claim into a number. Device: `emulator-5556`, API 36,
+arm64-v8a. There is no upstream torch for Android (no wheel is published,
+which is a large part of why this project exists), so this section reports
+**old/new ratios on the same device**, not a ratio to upstream.
+
+### 7.1 `bootstrap.py` is baked into the artefact, not loaded from disk
+
+`rust/torch_c/src/lib.rs:568` does
+`std::ffi::CString::new(include_str!("bootstrap.py"))` — the source text is
+compiled into `lib_C.so` at Rust build time. Swapping the `.py` file on the
+device without rebuilding does nothing; the interpreter never reads a
+`bootstrap.py` file at all on either platform. **Both sides were rebuilt** for
+`aarch64-linux-android` via `scripts/device_android.sh build`:
+
+* new (HEAD, `972dfe4`): `rust/torch_c/src/bootstrap.py` unchanged, built as-is.
+* old (`972dfe4^`): `git show 972dfe4^:rust/torch_c/src/bootstrap.py` copied
+  over `rust/torch_c/src/bootstrap.py`, built, then the working tree file was
+  immediately restored from a `cp` backup (`git status --short` confirmed a
+  clean diff afterward).
+
+Both `.so` artefacts were saved to `/tmp/bw_bind_android/lib_C.{old,new}.so`
+(distinct md5s) before restoring the tree, so rounds alternate by swapping the
+staged file rather than rebuilding per round: `_C.abi3.so` is the only file
+that differs between old and new, so once the rest of the tree (CPython
+runtime + vendored `torch` + deps) is staged once via
+`scripts/device_android.sh stage`, alternation is a single `adb push` of the
+5.4 MB `.so` to `/data/local/tmp/bw_device/site/torch/_C.abi3.so` — no re-stage
+of the ~440 MB tree per round.
+
+### 7.2 Method
+
+Same shapes as the host (§2): a `(1, 6, 9, 64)` float32 tensor, 200 warmups,
+minimum of 5 blocks of 20 000 calls per round. Three microbenchmarks:
+`.view(1, 6, 576)`, `.transpose(1, 2)`, and `t + t` (the dispatch-bound loop —
+smallest possible op, so the Python binding layer dominates the per-call cost).
+Rounds alternate old, new, old, new, ... and the minimum per side across
+rounds is reported, per the host methodology. A control round swaps the *same*
+artefact in for both labels to check the harness itself reads ~1.00x.
+
+Load stayed 2.27–2.78 for every measured round (`uptime`, checked immediately
+before each push and each run); no round was taken above that. The one 3.55
+reading during an earlier import smoke-test (not a timed round) was discarded
+and re-checked before measurement began.
+
+### 7.3 Result
+
+Minimum of 3 alternating rounds per side, µs/call:
+
+| | old (`972dfe4^`) | new (`972dfe4`) | ratio old/new |
+|---|---|---|---|
+| `.view(1, 6, 576)` | 9.172 | 3.331 | **2.75x** |
+| `.transpose(1, 2)` | 6.891 | 2.742 | **2.51x** |
+| `t + t` (dispatch-bound) | 6.164 | 3.418 | **1.80x** |
+
+All three rounds per side agreed within ~1.3% of their own minimum (e.g. view:
+9.172 / 9.204 / 9.249 old; 3.331 / 3.412 / 3.421 new) — tight enough that
+old and new do not overlap on any metric.
+
+**Control** (same `new` artefact pushed and measured twice, under labels A and
+B, through the identical harness): view 1.038x, transpose 1.033x, add 1.033x.
+All three land at 1.03–1.04x, not exactly 1.00 but an order of magnitude below
+the 1.80–2.75x the real comparison shows, and it sets the noise floor the
+above spreads (~1.3%) are already comfortably inside of. Harness bias is not
+what is producing the win.
+
+**The win transfers, and transfers more strongly than the host measurement.**
+Host (§5) showed view 2.25x-still-slow-but-improved (5.212 → 1.790 µs, a 2.91x
+speedup) and transpose 4.039 → 1.460 µs (2.77x); device shows 2.75x and 2.51x
+on the same two calls, plus 1.80x on the dispatch-bound `t + t` the host table
+also carries (3.744 → 1.943 µs there, 1.93x — comparable). The device ratios
+land in the same range as the host's, not a different regime, and if anything
+the interpreter-bound share is if anything larger here: absolute per-call
+times are 2–3x the host's on both sides (e.g. new-view 3.33 µs on device vs.
+1.79 µs on host), consistent with §7's opening argument that a slower
+interpreter makes the Python layer's share larger rather than smaller. **This
+device measurement supports, rather than merely assumes, the transfer.**
+
+### 7.4 Method notes
+
+* **Rebuild required, `.py` swap alone does not work** (§7.1) — both artefacts
+  were built via `scripts/device_android.sh build` for `aarch64-linux-android`,
+  saved to `/tmp/bw_bind_android/lib_C.{old,new}.so` (verified distinct md5),
+  and `rust/torch_c/src/bootstrap.py` was restored to HEAD (`cp` backup, not
+  `git checkout`) immediately after the old build — `git status --short` was
+  clean on that file before device rounds began.
+* Only `/data/local/tmp/bw_device/site/torch/_C.abi3.so` was swapped between
+  rounds (direct `adb push`, not a full re-stage) — the CPython runtime,
+  vendored `torch` tree and dependencies were staged once via
+  `scripts/device_android.sh stage` and are identical across all rounds; the
+  `.so` is the only variable.
+* `_multiprocessing`/`_posixshmem` stubs from `scripts/device_parity.py`
+  (`_install_android_stubs`, gated on `BW_STUB_MULTIPROCESSING=1`) were copied
+  into the microbenchmark script — `torch/multiprocessing/__init__.py` imports
+  `multiprocessing.resource_tracker` unconditionally and Android's CPython
+  ships neither extension; without the stub `import torch` fails before any
+  timing runs.
+* Raw per-round JSON and build/stage logs are under `/tmp/bw_bind_android/`
+  (`out_{old,new,controlA,controlB}_r*.json`, `build_{old,new}.log`,
+  `stage_new.log`) for anyone who wants to re-check the arithmetic above.
