@@ -5,6 +5,7 @@
     python tools/wheel/build.py --target android-arm64-v8a
     python tools/wheel/build.py --target ios-arm64
     python tools/wheel/build.py --target ios-arm64-sim
+    python tools/wheel/build.py --target linux-x86_64      # refuses; see below
 
 The distribution on PyPI as `torchnative 0.0.1a0` is `py3-none-any` and holds
 only the `torchnative/` skeleton: no `_C`, no vendored tree. `pip install
@@ -56,6 +57,20 @@ exactly the three that are platform-shaped (§ `TARGETS`):
                   written down here, and cross-checked against what the
                   artefact itself says it needs.
 
+                  `manylinux_<major>_<minor>_x86_64` inverts that, and it is the
+                  one case where the distribution is the wrong source: glibc
+                  compatibility is not a property of the interpreter build, so
+                  the Linux `_sysconfigdata_*.py` has no field for it. The floor
+                  comes from the artefact's own `.gnu.version_r`, which is where
+                  auditwheel reads it (§ `LinuxTarget`, docs/LINUX.md §5).
+
+`--target linux-x86_64` exists and currently **refuses**: no toolchain on this
+machine can cross-compile the crate to Linux (docs/LINUX.md §2, §4 -- a glibc
+sysroot, target libc headers and a target C driver are all missing, and the last
+of those stops the build before it reaches the linker). It is listed rather than
+omitted so the refusal names what is missing, instead of the target looking like
+one nobody thought about.
+
 Then check it for real -- building is not the proof:
 
     python tools/wheel/verify.py dist/<host wheel>        # installs it
@@ -79,13 +94,15 @@ import io
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from binfmt import describe, elf_info, macho_arches, macho_info  # noqa: E402
+from binfmt import (describe, elf_dynamic, elf_info, macho_arches,  # noqa: E402
+                    macho_info)
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "torchnative" / "src" / "main"
@@ -846,6 +863,224 @@ class IOSTarget(Target):
             )
 
 
+class LinuxTarget(Target):
+    """PEP 600: `manylinux_<glibcmajor>_<glibcminor>_<arch>`.
+
+    The floor comes from a **different place than on Android and iOS**, and that
+    is the whole of what is interesting here.
+
+    Both of those read it off the target CPython: `ANDROID_API_LEVEL` and
+    `IPHONEOS_DEPLOYMENT_TARGET` are fields in the distribution's
+    `_sysconfigdata_*.py`, so the tag is a fact about the interpreter the
+    extension will be loaded by. The Linux distribution has no such field --
+    `ANDROID_API_LEVEL` is literally `0` in it -- because glibc compatibility is
+    not a property of the interpreter build. It is a property of *this* artefact:
+    the set of `GLIBC_x.y` symbol versions its own code references, which the
+    linker recorded in `.gnu.version_r`. The highest of them is the oldest glibc
+    that can load the file, and nothing else is.
+
+    So `platform_tag` reads the artefact and ignores the interpreter for the
+    floor. That is what `auditwheel` does, for the same reason. The interpreter
+    is still consulted -- `MULTIARCH` has to say `x86_64-linux-gnu`, or this is
+    not the distribution the extension was built against -- but it does not set
+    the number.
+
+    A wheel is manylinux only if it *also* depends on nothing outside the
+    policy's library list, so `DT_NEEDED` is checked against it. Skipping that
+    would let a wheel linking, say, `libopenblas.so` claim a tag whose entire
+    promise is that it does not.
+
+    Nothing on this machine can build the artefact this class describes -- see
+    docs/LINUX.md §2 and §4. It refuses by name when it is missing, which is the
+    point: an unbuildable target must say so rather than be absent from
+    `--target`'s choices and look like it was never considered.
+    """
+
+    #: PEP 599's external-library list for manylinux2014, which PEP 600 carries
+    #: forward unchanged for `manylinux_2_17` and later. The dynamic loader
+    #: itself is not in PEP 599's table because it is never a `DT_NEEDED` in the
+    #: usual sense, but it appears as one on x86-64 and is always present.
+    POLICY_LIBRARIES = frozenset({
+        "libgcc_s.so.1", "libstdc++.so.6", "libm.so.6", "libdl.so.2",
+        "librt.so.1", "libc.so.6", "libnsl.so.1", "libutil.so.1",
+        "libpthread.so.0", "libresolv.so.2", "libX11.so.6", "libXext.so.6",
+        "libXrender.so.1", "libICE.so.6", "libSM.so.6", "libGL.so.1",
+        "libgobject-2.0.so.0", "libgthread-2.0.so.0", "libglib-2.0.so.0",
+        "ld-linux-x86-64.so.2",
+    })
+
+    #: `GLIBC_ABI_DT_RELR` is the one version name in glibc that is not
+    #: `GLIBC_<numbers>`; it was added in 2.36 and means exactly that. Mapping it
+    #: here rather than discarding it matters, because discarding it lowers the
+    #: floor -- an artefact needing 2.36 would be tagged for whatever numeric
+    #: version happened to be second-highest, and the wheel would install on a
+    #: glibc that cannot load it. Any *other* non-numeric name is refused rather
+    #: than guessed at, for the same reason.
+    NAMED_VERSIONS = {"GLIBC_ABI_DT_RELR": (2, 36)}
+
+    def __init__(self):
+        super().__init__(
+            "linux-x86_64", "x86_64-unknown-linux-gnu",
+            # No `prefix/` subdirectory: this distribution is
+            # python-build-standalone's `install_only` layout, like the iOS ones
+            # and unlike the Android one. docs/LINUX.md §3 compares the four.
+            TARGET_PYTHON_ROOT / "x86_64-unknown-linux-gnu", "lib_C.so",
+        )
+
+    rebuild_hint = (
+        "docs/LINUX.md §2.5 -- no toolchain on this machine can produce it yet. "
+        "The shortest route measured there is `cargo zigbuild --release --target "
+        "x86_64-unknown-linux-gnu.2.17`, which needs zig and cargo-zigbuild "
+        "installed first"
+    )
+
+    def _multiarch(self) -> str:
+        variables = self.sysconfig()
+        multiarch = str(variables["MULTIARCH"])
+        if multiarch != "x86_64-linux-gnu":
+            _fail(f"{self.python_root} has MULTIARCH={multiarch!r}, not "
+                  "'x86_64-linux-gnu' -- it is not the x86-64 Linux "
+                  "distribution this target builds against")
+        return multiarch
+
+    def _glibc_floor(self, artefact: bytes) -> tuple[int, int]:
+        """The oldest glibc that can load this image, from its own version needs."""
+        info = elf_dynamic(artefact)
+        if info is None:
+            _fail(f"{self.artefact} could not be read as a 64-bit ELF with "
+                  "section headers, so its glibc requirements -- which are the "
+                  "only source for the manylinux floor -- are unavailable")
+
+        wanted: set[str] = set()
+        for library, names in info["versions"].items():
+            if library.startswith(("libc.so", "libm.so", "libpthread.so",
+                                   "libdl.so", "librt.so", "libutil.so",
+                                   "ld-linux")):
+                wanted |= names
+        if not wanted:
+            # The §2.6 trap. An image linked against empty stand-in libraries has
+            # no version requirements at all, and `max()` over that is not a low
+            # floor -- it is no answer. Saying `manylinux_2_5` here would be the
+            # check reporting its own failure as a finding about the artefact.
+            _fail(
+                f"{self.artefact} records no glibc symbol versions at all "
+                f"(DT_NEEDED: {info['needed'] or 'none'}).\n"
+                "  This is NOT a claim that it runs on an old glibc -- it is the\n"
+                "  question having no answer, and the two must not be confused.\n"
+                "  An ELF gets version requirements from the libc it was linked\n"
+                "  against; an image linked with `-shared` against no libc at all\n"
+                "  links cleanly and lands here (docs/LINUX.md §2.6).\n"
+                f"  Fix: {self.rebuild_hint}"
+            )
+
+        floor = (2, 0)
+        for name in sorted(wanted):
+            if not name.startswith("GLIBC_"):
+                continue
+            rest = name[len("GLIBC_"):]
+            parts = rest.split(".")
+            if all(p.isdigit() for p in parts) and len(parts) >= 2:
+                version = (int(parts[0]), int(parts[1]))
+            elif name in self.NAMED_VERSIONS:
+                version = self.NAMED_VERSIONS[name]
+            else:
+                _fail(
+                    f"{self.artefact} requires glibc symbol version {name!r}, "
+                    "which this does not know how to order.\n"
+                    "  Refused rather than skipped: skipping an unknown version "
+                    "can only lower the\n  floor, and a floor that is too low is "
+                    "a wheel that installs where it cannot load.\n"
+                    f"  Add it to {type(self).__name__}.NAMED_VERSIONS with the "
+                    "glibc release that introduced it."
+                )
+            floor = max(floor, version)
+        return floor
+
+    def _check_policy(self, artefact: bytes) -> list[str]:
+        info = elf_dynamic(artefact) or {"needed": []}
+        needed = list(info["needed"])
+        outside = sorted(set(needed) - self.POLICY_LIBRARIES)
+        if outside:
+            _fail(
+                f"{self.artefact} links {outside}, which manylinux's external-"
+                "library policy does not\n  allow (PEP 599). The tag's entire "
+                "promise is that the wheel needs nothing\n  beyond the listed "
+                "libraries, so tagging this one manylinux would be false.\n"
+                f"  It links: {needed}"
+            )
+        return needed
+
+    def platform_tag(self, artefact: bytes) -> str:
+        self._multiarch()
+        needed = self._check_policy(artefact)
+        major, minor = self._glibc_floor(artefact)
+        tag = f"manylinux_{major}_{minor}_x86_64"
+        print(f"  tag floor from the artefact's .gnu.version_r "
+              f"(glibc {major}.{minor}), not from CPython -- the distribution "
+              f"records no glibc minimum at all")
+        print(f"  DT_NEEDED within the PEP 599 policy list: {needed}")
+        _confirm_with_packaging(tag, "manylinux")
+        _confirm_pep600_spelling(tag)
+        return tag
+
+    def cc(self) -> list[str]:
+        """A driver that compiles *and links* an ELF x86-64 shared object.
+
+        Both halves in one command, because that is what `global_deps_stub`
+        runs. This machine can do the two halves separately -- Apple clang emits
+        ELF x86-64 objects and rustup's `rust-lld` links them, measured in
+        docs/LINUX.md §2.7 -- and still cannot do them in one: driving lld
+        through `clang --ld-path=` dies on `Library not loaded:
+        @rpath/libLLVM.dylib`, because SIP strips `DYLD_LIBRARY_PATH` when
+        `/usr/bin/clang` execs. So the separate-halves result is a fact about
+        the machine, not a route this can take.
+        """
+        override = (os.environ.get("CC_x86_64_unknown_linux_gnu")
+                    or os.environ.get("TARGET_CC"))
+        if override:
+            return [*override.split(), "-shared", "-fPIC"]
+        zig = shutil.which("zig")
+        if zig:
+            major, minor = 2, 17
+            return [zig, "cc", "-target",
+                    f"x86_64-linux-gnu.{major}.{minor}", "-shared", "-fPIC"]
+        _fail(
+            "no C compiler that targets x86_64-unknown-linux-gnu.\n"
+            "  Tried, in order: $CC_x86_64_unknown_linux_gnu, $TARGET_CC, `zig` "
+            "on PATH.\n"
+            "  Without one, the empty torch/lib/libtorch_global_deps.so would "
+            "have to be built\n"
+            "  by the host cc, which puts a Mach-O inside a Linux wheel and "
+            "makes `import torch`\n"
+            "  fail on Linux only (docs/VENDOR.md wall 1).\n"
+            "  Fix: install zig (docs/LINUX.md §2.5), or point "
+            "CC_x86_64_unknown_linux_gnu at a\n"
+            "  cross gcc such as x86_64-linux-gnu-gcc."
+        )
+
+    def check_image(self, data: bytes, what: str) -> None:
+        info = elf_info(data)
+        if info is None:
+            _fail(f"{what} is not an ELF image ({describe(data)}) -- "
+                  "a Linux wheel cannot carry it")
+        if (info["bits"], info["machine"], info["type"]) != (64, "x86_64", "dyn"):
+            _fail(f"{what} is {describe(data)}, expected ELF 64-bit x86_64 dyn")
+
+
+def _confirm_pep600_spelling(tag: str) -> None:
+    """The tag has to be a name PEP 600 defines, not merely a plausible one."""
+    match = re.fullmatch(r"manylinux_(\d+)_(\d+)_(\w+)", tag)
+    if not match:
+        _fail(f"{tag!r} is not PEP 600's manylinux_<major>_<minor>_<arch>")
+    major, minor = int(match[1]), int(match[2])
+    if (major, minor) < (2, 5):
+        # PEP 600 defines the scheme downwards to manylinux1's 2.5 and no
+        # further; below that there is no manylinux, and pip matches nothing.
+        _fail(f"{tag!r} claims glibc {major}.{minor}, below manylinux1's 2.5 -- "
+              "no installer matches that")
+    print(f"  tag {tag} is PEP 600-shaped (glibc {major}.{minor}, x86_64)")
+
+
 def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
     """Ask `packaging` whether an installer would accept this tag.
 
@@ -881,8 +1116,14 @@ TARGETS: dict[str, Target] = {
                   "iphoneos", "ios"),
         IOSTarget("ios-arm64-sim", "aarch64-apple-ios-sim",
                   "arm64-iphonesimulator", "iphonesimulator", "iossimulator"),
+        LinuxTarget(),
     )
 }
+
+#: Prefixes `verify` will accept as a cross tag. One entry per target family, so
+#: that adding a family and forgetting this is a build failure rather than a
+#: wheel tagged for one platform and checked as another.
+CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_")
 
 
 def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
@@ -1151,9 +1392,9 @@ def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
             # `_load_global_deps` looks for exactly one name. A second one is a
             # host artefact that came along for the ride.
             _fail(f"{wheel.name} carries {strays} beside {deps}")
-        if not plat.startswith(("android_", "ios_")):
+        if not plat.startswith(CROSS_TAG_PREFIXES):
             _fail(f"{wheel.name} was built for {target.key} but is tagged "
-                  f"{plat!r}")
+                  f"{plat!r}, which is none of {CROSS_TAG_PREFIXES}")
 
 
 def self_test() -> None:
@@ -1258,6 +1499,194 @@ def self_test() -> None:
           "specified")
 
 
+def _minimal_elf(machine: int = 0x3E, etype: int = 3,
+                 with_sections: bool = True) -> bytes:
+    """A 64-bit little-endian ELF with nothing in it. For the self-test.
+
+    Hand-built rather than compiled, because the point of the cases that use it
+    is what happens when an image carries *no* version requirements, and this
+    machine cannot produce such a file through the normal route (docs/LINUX.md
+    §2.7 builds one, but only with tools that a self-test may not assume).
+    """
+    ehdr = bytearray(64)
+    ehdr[0:4] = b"\x7fELF"
+    ehdr[4] = 2                                     # ELFCLASS64
+    ehdr[5] = 1                                     # ELFDATA2LSB
+    ehdr[6] = 1                                     # EV_CURRENT
+    struct.pack_into("<HH", ehdr, 16, etype, machine)
+    if not with_sections:
+        return bytes(ehdr)
+    # Two section headers: the mandatory null one and a shstrtab holding "\0".
+    shoff = 64
+    struct.pack_into("<Q", ehdr, 0x28, shoff)
+    struct.pack_into("<HHH", ehdr, 0x3A, 64, 2, 1)  # shentsize, shnum, shstrndx
+    null = bytes(64)
+    shstr = bytearray(64)
+    struct.pack_into("<IIQQQQIIQQ", shstr, 0,
+                     0, 3, 0, 0, shoff + 128, 1, 0, 0, 1, 0)
+    return bytes(ehdr) + null + bytes(shstr) + b"\0"
+
+
+def self_test_linux() -> int:
+    """The Linux tag derivation, against real Linux ELF images.
+
+    Separate from `self_test` and reported separately, because it answers a
+    different question and can be *skipped* -- it reads files out of the target
+    CPython distribution, which is not in the repository. A skip is printed as a
+    skip; it never counts as a pass. `_confirm_with_packaging` has the same
+    shape and the same reason.
+
+    What is real here and what is not, stated plainly: the ELF parsing, the
+    glibc floor and the policy check run against genuine Linux x86-64 shared
+    objects that were built by somebody's real toolchain. **No artefact of this
+    crate is among them**, because none can be built on this machine (§
+    `LinuxTarget`, docs/LINUX.md §4). So this exercises the derivation, not the
+    wheel.
+    """
+    target = TARGETS["linux-x86_64"]
+    root = target.python_root
+    fixtures = {
+        # (path under the distribution, why it is here)
+        "clean": root / "lib" / "thread3.0.6" / "libtcl9thread3.0.6.so",
+        "outside_policy": root / "lib" / "libpython3.so",
+    }
+
+    print("\nLINUX SELF-TEST of the manylinux tag derivation")
+    missing = sorted(str(p) for p in fixtures.values() if not p.exists())
+    if missing:
+        print("  ! skipped -- the target CPython distribution is not on this")
+        print(f"    machine ({root} does not hold {len(missing)} fixture(s)).")
+        print("    This is a SKIP, not a pass: the derivation is unexercised.")
+        return 0
+
+    def refusal(fn, *args) -> str:
+        try:
+            fn(*args)
+        except SystemExit as exc:
+            return str(exc)
+        return ""
+
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. A real Linux x86-64 shared object, inside the policy list, gives a
+    #    floor that comes from its own `.gnu.version_r`. libtcl9thread requires
+    #    GLIBC_2.2.5, 2.3.4, 2.4, 2.7 and 2.14, and the answer is the highest.
+    #
+    #    2.14 rather than 2.7 is not a detail: sorting these names as *strings*
+    #    puts "GLIBC_2.7" last, and this expectation said 2.7 until the test was
+    #    run. A floor one that is too low is a wheel that installs on a glibc
+    #    which cannot load it, so the ordering has to be numeric and it has to be
+    #    checked on a fixture whose versions straddle the ten boundary.
+    clean = fixtures["clean"].read_bytes()
+    floor = target._glibc_floor(clean)
+    checks.append((
+        f"glibc floor read off a real ELF -> {floor[0]}.{floor[1]}",
+        floor == (2, 14),
+        f"expected (2, 14) from {fixtures['clean'].name} -- its highest "
+        f"requirement, which is not its lexicographically last -- got {floor}",
+    ))
+    # ...and the interpreter is genuinely not the source. This is the premise of
+    # the whole class, so it is asserted rather than assumed: if a future
+    # distribution grows a glibc field, the derivation should be revisited and
+    # this is what will say so. (`HAVE_GLIBC_MEMMOVE_BUG` is in there and is a
+    # feature probe, not a floor -- hence matching on the *value* shape too.)
+    variables = target.sysconfig()
+    versioned = sorted(k for k, v in variables.items()
+                       if isinstance(v, str) and v.startswith("GLIBC_"))
+    checks.append((
+        "the target CPython records no glibc minimum to derive from",
+        not versioned
+        and int(variables.get("ANDROID_API_LEVEL") or 0) == 0
+        and not variables.get("IPHONEOS_DEPLOYMENT_TARGET"),
+        f"expected none; GLIBC_-valued keys={versioned}, ANDROID_API_LEVEL="
+        f"{variables.get('ANDROID_API_LEVEL')!r}, IPHONEOS_DEPLOYMENT_TARGET="
+        f"{variables.get('IPHONEOS_DEPLOYMENT_TARGET')!r}",
+    ))
+
+    # 2. The image passes the PEP 599 external-library policy, and the tag it
+    #    yields is one PEP 600 defines.
+    needed = target._check_policy(clean)
+    checks.append((
+        f"DT_NEEDED {needed} accepted by the PEP 599 list",
+        needed == ["libc.so.6"],
+        f"expected ['libc.so.6'], got {needed}",
+    ))
+    tag = f"manylinux_{floor[0]}_{floor[1]}_x86_64"
+    spelling = refusal(_confirm_pep600_spelling, tag)
+    checks.append((
+        f"{tag} accepted as PEP 600-shaped",
+        spelling == "",
+        f"refused: {spelling}",
+    ))
+    # ...and a floor below manylinux1's is refused, because no installer matches
+    # it. Without this the spelling check only ever sees values that pass.
+    spelling = refusal(_confirm_pep600_spelling, "manylinux_2_4_x86_64")
+    checks.append((
+        "a floor below manylinux1's glibc 2.5 is refused",
+        "below manylinux1's 2.5" in spelling,
+        f"got: {spelling[:200]!r}",
+    ))
+
+    # 3. An image that links something off the list is refused *by name*. This
+    #    one links `$ORIGIN/../lib/libpython3.13.so.1.0`, which is exactly the
+    #    kind of private dependency the manylinux promise excludes.
+    said = refusal(target._check_policy, fixtures["outside_policy"].read_bytes())
+    checks.append((
+        "an off-policy DT_NEEDED is refused, naming it",
+        "libpython3.13.so.1.0" in said and "PEP 599" in said,
+        f"got: {said[:200]!r}",
+    ))
+
+    # 4. The docs/LINUX.md §2.6 trap. An ELF with no version requirements is the
+    #    check having no answer, and must not read as a low floor -- that is the
+    #    same fold-two-outcomes-into-one mistake `artefact_verdict` exists to
+    #    avoid, in the direction that silently passes.
+    said = refusal(target._glibc_floor, _minimal_elf())
+    checks.append((
+        "no version requirements -> refused, and disclaimed as a finding",
+        "records no glibc symbol versions" in said and "NOT a claim" in said,
+        f"got: {said[:200]!r}",
+    ))
+
+    # 5. Bytes that are not a readable ELF are a third outcome again.
+    said = refusal(target._glibc_floor, b"\xcf\xfa\xed\xfe" + b"\0" * 60)
+    checks.append((
+        "unreadable image -> refused as unavailable, not as a floor",
+        "could not be read" in said,
+        f"got: {said[:200]!r}",
+    ))
+
+    # 6. `check_image` keeps the wrong machine out. An aarch64 ELF is the one
+    #    that would otherwise sail through -- it is an ELF, it is 64-bit, and it
+    #    is a shared object.
+    said = refusal(target.check_image, _minimal_elf(machine=0xB7), "an aarch64 ELF")
+    checks.append((
+        "an aarch64 ELF is refused by the x86-64 target",
+        "expected ELF 64-bit x86_64 dyn" in said,
+        f"got: {said[:200]!r}",
+    ))
+    said = refusal(target.check_image, b"\xcf\xfa\xed\xfe" + b"\0" * 60, "a Mach-O")
+    checks.append((
+        "a Mach-O is refused by the Linux target",
+        "not an ELF image" in said,
+        f"got: {said[:200]!r}",
+    ))
+
+    bad = 0
+    for label, ok, detail in checks:
+        bad += not ok
+        print(f"  {'ok    ' if ok else 'WRONG '}{label}")
+        if not ok:
+            print(f"          {detail}")
+    if bad:
+        print(f"LINUX SELF-TEST: FAIL -- {bad}/{len(checks)} wrong")
+    else:
+        print(f"LINUX SELF-TEST: PASS -- {len(checks)}/{len(checks)} cases; "
+              "derivation exercised on real Linux ELF, no artefact of this "
+              "crate (none is buildable here)")
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
@@ -1273,6 +1702,8 @@ def main() -> None:
 
     if args.self_test:
         self_test()
+        if self_test_linux():
+            sys.exit("SELF-TEST: FAIL -- the Linux tag derivation")
         return
 
     target = None if args.target == "host" else TARGETS[args.target]
@@ -1296,11 +1727,15 @@ def main() -> None:
     plat: str | None = None
     if target is not None:
         if not target.artefact.exists():
+            # `rebuild_hint` rather than a list of every target's build command:
+            # the same three lines used to name Android's script and iOS's doc
+            # for *any* missing artefact, so a Linux user was told to run
+            # `scripts/device_android.sh build`. Each target already carries the
+            # answer for itself, and it is the answer the staleness path quotes.
             _fail(
                 f"no cross-built extension at {target.artefact}\n"
-                f"  build it for {target.rust_target} first "
-                "(scripts/device_android.sh build, or docs/RUST_CROSSBUILD.md "
-                "§0.5 for iOS)\n"
+                f"  build it for {target.rust_target} first.\n"
+                f"  Fix: {target.rebuild_hint}\n"
                 "  CARGO_TARGET_DIR is currently "
                 f"{CARGO_TARGET_DIR}"
             )
@@ -1343,6 +1778,9 @@ def main() -> None:
     elif target.key.startswith("android"):
         print(f"next: python tools/wheel/verify_cross.py {wheel}")
         print(f"      python tools/wheel/verify_android.py {wheel}")
+    elif target.key.startswith("linux"):
+        print(f"next: python tools/wheel/verify_cross.py {wheel}")
+        print(f"      python tools/wheel/verify_linux.py {wheel}")
     else:
         print(f"next: python tools/wheel/verify_cross.py {wheel}")
 
