@@ -8,7 +8,8 @@ Linux x86_64 가 올라 있는데 실제로 만든 적이 없다. 이 문서는 
 **실행 검증은 이 기계에서 불가능하다** — `docker` · `colima` · `podman` · `lima` · `qemu` 가 전부 없고
 설치하지 않는다. 도달 가능한 최하단은 iOS 가 도달한 것과 같다: **빌드 + 심볼 해결**.
 
-작업 트리: `/Volumes/macMini/worktrees/bw-linux` (브랜치 `work/linux`). 커밋하지 않는다.
+작업 트리: 1회차 `/Volumes/macMini/worktrees/bw-linux` (`work/linux`, develop 에 머지됨),
+2회차 `/Volumes/macMini/worktrees/bw-desk2` (`work/desk2`). 커밋하지 않는다.
 
 ---
 
@@ -17,26 +18,19 @@ Linux x86_64 가 올라 있는데 실제로 만든 적이 없다. 이 문서는 
 | 층 | 항목 | 상태 | 한 줄 |
 |---|---|---|---|
 | 1 | rust 타깃 `x86_64-unknown-linux-gnu` | **넘음** | 이미 설치되어 있었다. `rustup target add` 는 no-op |
-| 2 | 링커 (맥 → Linux ELF) | **막힘** | 링커(`rust-lld`)는 **있다**. 없는 것은 glibc 스켈레톤·헤더·`TARGET_CC` |
+| 2 | 링커 (맥 → Linux ELF) | **넘음 (2회차)** | `cargo-zigbuild` 설치로 열렸다. `zig cc` 가 드라이버·헤더·glibc stub·링커 넷을 다 준다 — §9 |
 | 3 | 타깃 CPython (`PYO3_CROSS_LIB_DIR`) | **넘음** | 배포본이 이미 캐시에 있다. `build.py` 가 쓸 것이 전부 들어 있다 |
-| 4 | `cargo build --target ...` | **막힘** | `onig_sys` 가 타깃 C 컴파일러를 요구해 **링크에 닿지도 못한다** |
-| 5 | `build.py --target linux-x86_64` | **넘음** | `LinuxTarget` 추가. 태그 유도가 진짜 Linux ELF 로 끝까지 돌았다. 자체검사 10/10 |
-| 6 | 심볼 해결 검증 | **넘음(약함)** | `verify_linux.py` 추가, 자체검사 5/5. **iOS 만큼 강하지 않다** — §6.1 |
+| 4 | `cargo build --target ...` | **넘음 (2회차)** | `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` — §9.2 |
+| 5 | `build.py --target linux-x86_64` | **넘음** | `LinuxTarget` 추가. 1회차는 스탠드인 ELF 로, 2회차는 **우리 아티팩트로** 돌았다 |
+| 6 | 심볼 해결 검증 | **넘음(약함)** | `verify_linux.py`. **iOS 만큼 강하지 않다** — §6.1 |
+| 7 | Linux 에서 실행 | **불가** | 컨테이너 런타임도 Linux 기계도 없고 설치하지 않는다 — §7.2 |
 
-**막힌 것은 층 2 하나이고, 층 4 는 그 결과다.** 남은 것은 도구 설치 결정 하나이며
-(§2.5 · §7.1), **설치하지 않았다 — 사용자가 정한다.**
+**1회차가 남긴 진단이 정확했다.** 막고 있던 것은 링커가 아니라 glibc 스텁·타깃 헤더·C 드라이버
+셋이었고, 권고했던 `cargo-zigbuild` 가 그 셋을 한 번에 채웠다. 2회차는 설치 허가를 받아 그것을
+실행했을 뿐이고 **설계 판단은 바꾸지 않았다.**
 
 기존 셋은 그대로다: pytests **197**, golden **2811/2811 ops=119**, `build.py --self-test` **8/8**,
 호스트 휠은 빌드되고 깨끗한 venv 에 설치되어 계산까지 한다 (§4.1, §8).
-
-건드린 파일 넷, 전부 지정된 영역 안이다. **커밋하지 않았다. 업로드하지 않았다.**
-
-```
- M tools/wheel/binfmt.py      elf_dynamic() · elf_symbols() 추가
- M tools/wheel/build.py       LinuxTarget · self_test_linux() · 거절 메시지 정정
-?? tools/wheel/verify_linux.py
-?? docs/LINUX.md
-```
 
 `.cargo/config.toml` 은 **손대지 않았다.** 이유는 §4.4.
 
@@ -698,42 +692,12 @@ SELF-TEST: PASS -- 5/5 cases, on real Linux ELF from the target distribution.
 
 ## 7. 실행 검증에 필요한 것
 
-이 기계에서 도달한 최하단은 iOS 기기가 도달한 것과 같다 — **빌드(막힘) + 심볼 해결(부분)**.
-아래는 각 칸을 올리는 데 실제로 무엇이 필요한지다.
+> **2회차 정정.** 이 절은 층 4 가 막혀 있을 때 쓰였다. 그 층은 §9 에서 열렸으므로
+> **§7.1 은 §9.1 · §9.2 로 대체되었다.** 실행 검증(§7.2)만 그대로 남는다.
 
-### 7.1 층 4 를 열려면 (빌드)
+### 7.1 층 4 를 열려면 (빌드) — **§9 에서 실행됨**
 
-사용자가 정할 사항. **설치하지 않았다.**
-
-```sh
-pip install ziglang          # 또는 brew install zig
-cargo install cargo-zigbuild # 또는 pip install cargo-zigbuild
-```
-
-그다음:
-
-```sh
-export PATH="$HOME/.cargo/bin:$PATH"
-export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linux
-cd /Volumes/macMini/worktrees/bw-linux/rust/torch_c
-PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib \
-  cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
-```
-
-`2.17` 은 manylinux2014 = `manylinux_2_17_x86_64` 다. 이 숫자를 바꾸면 §5 의 태그가 따라 바뀐다 —
-`build.py` 는 하드코딩하지 않고 아티팩트에서 읽으므로 **따로 고칠 곳이 없다.**
-
-그다음 휠:
-
-```sh
-cd /Volumes/macMini/worktrees/bw-linux
-BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
-$BPY tools/wheel/build.py --target linux-x86_64
-$BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl
-$BPY tools/wheel/verify_linux.py dist/torchnative-*manylinux*.whl
-```
-
-**아직 아무것도 검증되지 않은 명령이다.** 여기까지 오면 §6 의 검증이 우리 아티팩트로 처음 돈다.
+1회차가 여기에 적어둔 명령이 그대로 맞았다. 실제로 돌린 것과 실측은 §9 에 있다.
 
 ### 7.2 실행 검증을 하려면
 
@@ -750,16 +714,19 @@ $BPY tools/wheel/verify_linux.py dist/torchnative-*manylinux*.whl
 `libc.so.6` 파일만 있어도 버저닝된 84개 심볼을 그 파일에 대조할 수 있다. zig 를 설치하면
 zig 가 들고 오는 glibc stub 이 그 대조 대상이 될 수 있는지는 **재보지 않았다.**
 
-### 7.3 사다리
+### 7.3 사다리 (2회차 기준)
 
 ```
-built              막힘   -- 툴체인 없음 (§2, §4). 남은 것은 설치 결정 하나
-tagged             됨     -- manylinux_2_17_x86_64, 진짜 Linux ELF 로 끝까지 유도 (§5.5)
-symbols resolve    부분   -- CPython 쪽 됨, glibc 쪽은 링커의 말을 믿음 (§6.5).
-                            우리 아티팩트로는 한 번도 안 돌았음
+built              됨     -- cargo-zigbuild. lib_C.so 4,809,768 B, ELF x86-64 dyn (§9.2)
+tagged             됨     -- manylinux_2_17_x86_64, 우리 아티팩트에서 유도 (§9.3)
+symbols resolve    부분   -- 우리 아티팩트로 돌았고 unresolved 0. 다만 glibc 쪽 117개는
+                            여전히 링커의 말을 믿는다 (§6.5 · §9.4)
 imports on Linux   불가   -- Linux 기계나 컨테이너 필요 (§7.2)
 computes           불가   -- 같음
 ```
+
+1회차 사다리는 위 두 칸이 `막힘`/`됨(스탠드인으로)` 이었다. 바뀐 것은 그 둘이고,
+**아래 세 칸은 그대로다** — 도구를 설치했다고 실행 검증이 열리지는 않는다.
 
 ---
 
@@ -794,3 +761,364 @@ Android · iOS 검증기가 읽는 것은 바뀌지 않았고, 위 마지막 줄
 
 Android · iOS 타깃은 이 워크트리에 아티팩트가 없어 휠까지 가지 못한다(기기·시뮬레이터 금지).
 도달 가능한 지점까지는 확인했다 — §5.4 의 세 거절 메시지가 각각 자기 타깃의 지시를 낸다.
+
+---
+
+# 2회차 — 툴체인을 설치하고 층 2·4 를 열었다
+
+작업 트리 `/Volumes/macMini/worktrees/bw-desk2` (`work/desk2`). 사용자가 빌드 도구 설치를 허가했고,
+1회차가 §2.5 에서 권고한 그대로 `cargo-zigbuild` 를 설치했다. **설계 판단은 하나도 바꾸지 않았다** —
+1회차의 진단(막는 것은 링커가 아니라 glibc 스텁·타깃 헤더·C 드라이버 셋)이 정확했고, 그 셋을 채우자
+남은 층이 전부 열렸다.
+
+## 9. 설치한 것
+
+### 9.1 정확히 무엇을 설치했나
+
+```sh
+# (a) zig 0.16.0 — 전용 venv 에. 기존 두 venv 를 오염시키지 않는다
+/usr/bin/python3 -m venv /Volumes/macMini/caches/zig-venv
+/Volumes/macMini/caches/zig-venv/bin/pip install ziglang
+/Volumes/macMini/caches/zig-venv/bin/python -m ziglang version    # 0.16.0
+
+# (b) cargo-zigbuild 0.23.3 — ~/.cargo/bin 에
+cargo install cargo-zigbuild
+```
+
+**`brew install zig` 를 쓰지 않았다.** `ziglang` 휠은 같은 컴파일러를 파이썬 패키지로 담고 있고,
+전용 venv 안에 있으므로 지우는 것이 디렉터리 하나 삭제다. brew 는 시스템 상태를 바꾼다.
+
+**`zig` 는 PATH 에 실행 파일로 존재하지 않는다.** `ziglang` 휠은 `zig` 콘솔 스크립트를 만들지 않고
+`<python> -m ziglang` 로만 부른다. `cargo-zigbuild` 는 이 경우를 알고 있어서 `zig` 를 못 찾으면
+`python3 -m ziglang` → `python -m ziglang` 순으로 찾는다. 그래서 zig-venv 의 `bin` 을 PATH 앞에
+두는 것만으로 배선이 끝난다 — **`zig` 셸 셰임을 만들지 않았고, 어떤 설정 파일에도 경로를 박지 않았다.**
+
+`build.py` 쪽은 이것을 몰라서 §9.5 에서 고쳤다.
+
+### 9.2 층 2·4 — `cargo zigbuild` 로 한 번에 열렸다
+
+먼저 자명한 cdylib 하나로 링크만 확인했다 (1회차 §2.3 과 같은 프로브):
+
+```sh
+export PATH="/Volumes/macMini/caches/zig-venv/bin:$HOME/.cargo/bin:$PATH"
+export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
+cd /Volumes/macMini/caches/linux-probe
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
+#   EXIT=0, 2.83s
+file .../libprobe.so
+#   ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, stripped
+```
+
+1회차 §2.4 에서 `-lc` 부터 일곱 줄로 죽던 자리다. 그다음 진짜 크레이트:
+
+```sh
+export PATH="/Volumes/macMini/caches/zig-venv/bin:$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-desk2
+export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
+export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib
+cd /Volumes/macMini/worktrees/bw-desk2/rust/torch_c
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
+#   EXIT=0, Finished `release` profile in 59.22s
+```
+
+**`onig_sys` 가 그냥 지나갔다.** 1회차 §4.2 가 `failed to find tool "x86_64-linux-gnu-gcc"` 로
+죽던 곳이다 — `cargo-zigbuild` 가 `CC_x86_64_unknown_linux_gnu` 등을 `zig cc` 로 설정해 주므로
+`cc-rs` 가 드라이버를 찾는다. §4.3 표의 넷(**드라이버 · 헤더 · glibc 스텁 · 링커**)이 한 번에 채워졌다.
+
+`.cargo/config.toml` 은 **여전히 손대지 않았다.** 위 명령은 전부 환경변수이고, 링커는
+`cargo-zigbuild` 가 스스로 지정한다 (1회차 §4.4 가 예상한 그대로).
+
+경고 한 줄이 나오는데 무해하다: `linker stderr: ignoring deprecated linker optimization setting '1'`
+— rustc 가 `-O1` 을 넘기고 zig 0.16 의 lld 가 그것을 무시한다는 뜻이다. 프로브에서도 나온다.
+
+```
+lib_C.so   4,809,768 B   ELF 64-bit LSB shared object, x86-64, dynamically linked, stripped
+SONAME     없음
+DT_NEEDED  libm.so.6, libc.so.6, ld-linux-x86-64.so.2, libpthread.so.0, libdl.so.2
+```
+
+### 9.3 층 5 — 휠. 태그가 **우리 아티팩트에서** 나왔다
+
+1회차는 배포본의 `_dbm...so` 를 스탠드인으로 놓고 태그 유도를 돌렸다. 이번엔 진짜다:
+
+```sh
+$BPY tools/wheel/build.py --target linux-x86_64
+```
+
+```
+target linux-x86_64: lib_C.so (4,809,768 B)
+      ELF 64-bit little-endian x86_64 dyn
+  tag floor from the artefact's .gnu.version_r (glibc 2.17), not from CPython
+      -- the distribution records no glibc minimum at all
+  DT_NEEDED within the PEP 599 policy list:
+      ['libm.so.6', 'libc.so.6', 'ld-linux-x86-64.so.2', 'libpthread.so.0', 'libdl.so.2']
+  ! packaging 26.3 has no manylinux_platforms -- tag spelling unchecked
+  tag manylinux_2_17_x86_64 is PEP 600-shaped (glibc 2.17, x86_64)
+  + torch/lib/libtorch_global_deps.so (2,752 B, empty by design -- VENDOR.md wall 1)
+  retag: macosx_11_0_universal2 -> manylinux_2_17_x86_64
+
+dist/torchnative-0.0.2a0-cp313-abi3-manylinux_2_17_x86_64.whl
+  2,687 entries, 13.9 MB compressed, 58.2 MB installed
+```
+
+아티팩트가 실제로 요구하는 버전 집합은 이렇다 (`.gnu.version_r`):
+
+| 라이브러리 | 요구 |
+|---|---|
+| `libc.so.6` | 2.2.5, 2.3, 2.3.4, 2.9, 2.14, 2.15, 2.16, **2.17** |
+| `libm.so.6` | 2.2.5 |
+| `libpthread.so.0` | 2.2.5, 2.12 |
+| `libdl.so.2` | 2.2.5 |
+| `ld-linux-x86-64.so.2` | 2.3 |
+
+최댓값이 2.17 이고 그것이 태그다. **`--target ...gnu.2.17` 이라는 입력이 출력 태그를 정한 것이
+맞지만, `build.py` 는 그 입력을 모르고 아티팩트만 읽는다** — 즉 둘이 어긋나면 태그가 아티팩트를
+따라간다. `2.28` 로 다시 빌드하면 태그도 따라 올라간다는 뜻이고, 고칠 곳은 없다.
+
+**빈 global-deps 스텁은 버전 요구를 하나도 기록하지 않는다** (`DT_NEEDED []`, undefined 0).
+설계상 비어 있으므로 libc 심볼을 참조하지 않기 때문이다. 이것이 `LinuxTarget.GLIBC_TARGET` 과
+아티팩트 floor 사이에 **교차 검사를 넣지 않은 이유**다 — 넣어도 실패할 수 없다 (CLAUDE.md §5.5).
+
+### 9.4 층 6 — `verify_linux.py` 가 처음으로 우리 아티팩트를 봤다
+
+```sh
+$BPY tools/wheel/verify_linux.py dist/torchnative-*manylinux*.whl     # EXIT=0
+```
+
+```
+  torch/_C.abi3.so
+    243 undefined (1 exported)
+       1  -> ld-linux-x86-64.so.2  (needs GLIBC_2.3)
+      87  -> libc.so.6             (needs GLIBC_2.14 … 2.17)
+       2  -> libdl.so.2            (needs GLIBC_2.2.5)
+      14  -> libm.so.6             (needs GLIBC_2.2.5)
+      13  -> libpthread.so.0       (needs GLIBC_2.12, 2.2.5)
+     118  unversioned -- ELF records no library for these; checked as a union
+           118  found in libpython (target distribution)
+       8  weak, allowed to stay unresolved (__cxa_thread_atexit_impl, getrandom, gettid…)
+       0  unresolved
+
+  torch/lib/libtorch_global_deps.so
+    0 undefined (1 exported)          DT_NEEDED []
+       0  unresolved
+```
+
+**§6.5 의 두 번째 칸이 닫혔다** — "우리 확장으로는 한 번도 돌지 않았다" 가 이제 거짓이다.
+**첫 번째 칸은 그대로 열려 있다**: 버전 붙은 117개는 라이브러리와 최소 glibc 를 명시하지만
+대조할 glibc 가 이 기계에 없다. §6.1 의 사다리(iOS 만큼 강하지 않다)는 **바뀌지 않았다.**
+
+1회차 §7.2 가 남긴 미확인 항목 하나에 답한다: **zig 가 들고 오는 glibc stub 을 대조 대상으로
+쓸 수 있는가.** 쓸 수 있다 — `ziglang/lib/libc/glibc/abilists` 가 심볼별로 어느 glibc 버전부터
+있는지를 담은 단일 바이너리 테이블이고(`bits/ csu/ include/ …` 가 나머지 소스), zig 는 링크
+시점에 여기서 `libc.so.6` 을 합성한다. **다만 하지 않았다.** 그렇게 만든 대조
+대상은 링커가 이 아티팩트를 링크할 때 쓴 바로 그 데이터이므로, 그것으로 검증하면
+**링커의 말을 링커에게 확인받는 것**이 된다. §6.5 가 "링커의 말을 믿는다" 고 적은 상태에서
+한 발짝도 나아가지 않으면서 초록만 하나 늘어난다.
+
+### 9.5 `build.py` 를 두 군데 고쳤다 — 실행해 보니 드러난 것
+
+**(a) `cc()` 가 `zig` 실행 파일만 찾고 있었다.** `shutil.which("zig")` 하나였고, `ziglang` 휠은
+실행 파일을 만들지 않는다(§9.1). 그대로 뒀으면 아티팩트는 `cargo-zigbuild` 가 zig 로 만들고
+스텁은 "zig 가 없다" 며 거절하는, **한 휠의 두 네이티브 멤버가 다른 툴체인을 요구하는** 상태가 된다.
+`LinuxTarget.zig_command()` 를 추가해 **`cargo-zigbuild` 와 같은 순서**로 찾게 했다:
+`zig` → `python3 -m ziglang` → `python -m ziglang` → `sys.executable -m ziglang`.
+`CC_x86_64_unknown_linux_gnu` / `TARGET_CC` 오버라이드는 그대로 우선한다.
+
+**(b) `2, 17` 하드코딩을 `GLIBC_TARGET` 으로 올렸다.** `cc()` 안에 있던 매직 넘버이고,
+§9.2 의 `cargo zigbuild --target ...gnu.2.17` 과 같은 숫자여야 하는데 그 사실이 어디에도 없었다.
+**태그를 정하지는 않는다** — 태그는 아티팩트에서 나온다(§9.3). 그 점을 주석에 적었다.
+
+낡은 문구 둘도 정정했다: `LinuxTarget` 독스트링의 "Nothing on this machine can build the artefact"
+와 `rebuild_hint` 의 "no toolchain on this machine can produce it yet". 둘 다 §9.2 로 거짓이 되었고,
+`rebuild_hint` 는 이제 **실제로 통한 명령**을 인용한다.
+
+### 9.6 `verify_cross.py` 가 manylinux 를 거절하고 있었다
+
+`build.py` 는 Linux 휠을 만들고 나서 `next: verify_cross.py …` 를 찍는데, 그것을 실행하면:
+
+```
+'manylinux_2_17_x86_64' is neither a PEP 738 android_* nor a PEP 730 ios_* tag.
+```
+
+**1회차에는 보일 수 없던 결함이다** — 거절당할 휠이 존재하지 않았다. `verify_linux.py` 는 심볼만
+보므로, 이 상태에서는 **RECORD 해시 · 확장자 검색 가능성 · WHEEL Tag 일치 · 파일 목록 대조**를
+Linux 휠에 대해서만 아무도 안 했다. `LinuxExpectation` 을 추가했다.
+
+Android · iOS 와 다른 두 가지만 적는다:
+
+- **`packaging` 이 철자를 확인해 주지 못한다.** `manylinux_platforms` 생성기가 없기 때문이고
+  (matching 이 실행 중 인터프리터의 glibc 를 봐야 해서 인자로 만들 수 없다), `build.py` 가 이미
+  같은 이유로 시끄럽게 건너뛰고 있었다. 여기서도 **문제로 올리지 않고 출력에 남긴다** —
+  이 한 칸이 Android · iOS 보다 약하다는 것이 사실이고, FAIL 로 만들면 그 사실이 사라진다.
+- **태그의 glibc 하한을 멤버와 대조한다.** iOS 의 `minos` 검사와 같은 모양이다. Android 에는
+  대응물이 없다(ELF 는 API 레벨을 기록하지 않는다). 이것이 이 계열에서 **유효 범위 안에서
+  재태깅해도 틀릴 수 있는** 유일한 자리다: `manylinux_2_5_x86_64` 는 어떤 최신 배포판이든 매칭하는
+  멀쩡한 태그이고, 그 휠은 2.17 을 요구하는 `_C.abi3.so` 를 로드 못 하는 glibc 에 설치된다.
+
+PEP 599 목록과 `GLIBC_ABI_DT_RELR` 순서 규칙은 **`build.LinuxTarget` 에서 import** 했다.
+복사하면 둘이 조용히 어긋난다.
+
+```
+$BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl      # EXIT=0
+  tag                 manylinux_2_17_x86_64  (PEP 600-shaped: glibc 2.17, x86_64)
+  ! packaging has no manylinux_platforms, so unlike the android and ios tags
+    this spelling is not confirmed against pip's own generator
+  glibc               torch/_C.abi3.so needs 2.17 <= the tag's 2.17
+  glibc               torch/lib/libtorch_global_deps.so records no requirement
+  binaries            2   (둘 다 ELF 64-bit little-endian x86_64 dyn)
+  ext suffix          .abi3.so present in libpython3.13.so
+  file list           identical to …macosx_11_0_arm64.whl (2,685 entries)
+```
+
+### 9.7 자체검사가 **자기 자신에서** 실패할 수 없는 검사를 하나 찾아냈다
+
+`verify_cross.py --self-test` 를 Linux 휠로 처음 돌리자 9개 중 하나가 안 잡혔다:
+
+```
+  NOT CAUGHT  extension built for the wrong platform
+```
+
+`_wrong_elf_machine()` 이 `e_machine := EM_X86_64` **대입**이었다. aarch64 Android 휠에는 손상이지만
+**x86-64 manylinux 휠에는 무연산이다.** 그 결함 모드는 "없어서" 통과하고 있었다 —
+CLAUDE.md §5.5 가 말하는 바로 그 모양이고, **Linux 휠이 존재하기 전까지는 드러날 수 없었다.**
+대입을 뒤집기(x86_64 ↔ aarch64)로 바꿨다. Android 쪽 동작은 그대로다(aarch64 → x86_64).
+
+그리고 이 계열 전용 결함 모드를 하나 더 넣었다 — §9.6 의 하한 검사가 실제로 실패하는지:
+
+```
+$BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl --self-test   # EXIT=0
+
+  caught      extension built for the wrong platform
+  caught      global-deps library missing
+  caught      global-deps library under the host's name
+  caught      wall-4 marker missing
+  caught      a member edited without updating RECORD
+  caught      part of the vendored tree dropped
+  caught      WHEEL Tag: out of step with the filename
+  caught      platform tag no installer would generate
+  caught      abi tag downgraded from abi3
+  caught      tag floor below the glibc the members actually need     <-- 새것
+SELF-TEST: PASS -- 10/10 fault modes rejected
+```
+
+### 9.8 자체검사에 비순환 케이스를 하나 넣었다
+
+`self_test_linux()` 의 케이스 1~6 은 전부 배포본의 ELF 를 읽고 **그 파서가 읽어낸 것**을 확인한다.
+아티팩트가 존재하지 않을 때는 그것이 할 수 있는 최선이었다. 이제 케이스 7 을 넣었다:
+
+> **`cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` 에 준 버전이, 유도를 거쳐 그대로
+> 돌아오는가.** 다른 도구에 준 *입력*을 이 코드의 *출력*과 대조하므로 순환하지 않는다.
+> zig 가 요청한 버전을 무시했거나, 의존성이 더 새 glibc 심볼을 끌어왔거나,
+> `GLIBC_TARGET` 이 §9.2 의 명령과 어긋나면 실패한다.
+
+**세 갈래를 다 실측했다.**
+
+```
+정상            ok    our own lib_C.so derives manylinux_2_17_x86_64, the version zig was asked for
+                LINUX SELF-TEST: PASS -- 11/11 cases on real Linux ELF, including this crate's own artefact
+
+GLIBC_TARGET 을 (2,28) 로 바꿈:
+                TAMPERED_EXIT=1
+                WRONG our own lib_C.so derives manylinux_2_28_x86_64, ...
+                      got manylinux_2_17_x86_64; either rebuild at 2.28 or move GLIBC_TARGET to match
+                LINUX SELF-TEST: FAIL -- 1/11 wrong          (되돌린 뒤 다시 0)
+
+아티팩트 없음 (CARGO_TARGET_DIR 미설정):
+                ! case 7 skipped -- no cross-built lib_C.so (...)
+                  This is a SKIP, not a pass: the one non-circular case did not run.
+                  Build it with: PYO3_CROSS_LIB_DIR=... cargo zigbuild --release --target ...
+                LINUX SELF-TEST: PASS -- 10/10 ...; this crate's own artefact was NOT among them
+```
+
+세 번째가 중요하다. **PASS 줄이 자기가 무엇을 안 봤는지 말한다** — 아티팩트가 없는 기계에서
+`11/11` 이 `10/10` 으로 조용히 줄어들면 그것은 초록으로 읽힌다.
+
+---
+
+## 10. 2회차 회귀 — 기존 셋이 그대로인지
+
+```sh
+export PATH="/Volumes/macMini/caches/zig-venv/bin:$HOME/.cargo/bin:$PATH"
+cd /Volumes/macMini/worktrees/bw-desk2
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-desk2
+export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
+export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
+BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
+PY=/Volumes/macMini/caches/spike-venv/bin/python
+bash vendor/vendor_torch.sh          # py_modules=2372, native_left=0
+bash vendor/install_shim.sh
+```
+
+| 명령 | 기준선 | 2회차 |
+|---|---|---|
+| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | exit 0, 197 | **exit 0, `^ok ` 197줄** |
+| `$PY tools/golden/compare.py` | exit 0, 2811/2811 ops=119 | **exit 0, 2811/2811 ops=119** |
+| `$BPY tools/wheel/build.py --self-test` | exit 0, 8/8 + 10/10 | **exit 0, 8/8 + 11/11** (케이스 7 추가, §9.8) |
+| `$BPY tools/wheel/verify_linux.py --self-test` | exit 0, 5/5 | **exit 0, 5/5** |
+| `$BPY tools/wheel/build.py` (호스트 휠) | exit 0, `macosx_11_0_arm64` | **exit 0**, 2,687 entries |
+| `$BPY tools/wheel/verify.py <위 휠>` | exit 0 | **exit 0**, 깨끗한 venv 에서 `aten.mm.default` 계산 |
+| `$BPY tools/wheel/build.py --target linux-x86_64` | (1회차엔 불가) | **exit 0**, `manylinux_2_17_x86_64`, 2,687 entries |
+| `$BPY tools/wheel/verify_cross.py <manylinux 휠>` | (1회차엔 거절) | **exit 0** |
+| `$BPY tools/wheel/verify_cross.py <manylinux 휠> --self-test` | (신규) | **exit 0, 11/11** |
+| `$BPY tools/wheel/verify_linux.py <manylinux 휠>` | (1회차엔 불가) | **exit 0**, unresolved 0 |
+
+> **10/10 이 아니라 11/11 인 이유.** 이 절을 처음 쓸 때는 10개였다. Windows 를 붙이면서
+> (`docs/WINDOWS.md`) 결함 목록이 계열별로 구성되게 바뀌었고, 그때 "확장 모듈 자체가 없음" 이
+> 별도 결함 모드로 분리됐다. Linux 쪽 결함 11개는 위 표의 나머지 줄을 바꾸지 않는다.
+
+**Android · iOS 검증기에 대한 회귀 우려 한 가지를 직접 확인했다.** §9.7 에서
+`_wrong_elf_machine()` 을 대입에서 뒤집기로 바꿨는데, Android 휠(aarch64)에서는 전과 같은 방향
+(aarch64 → x86_64)으로 동작한다. `verify_cross.py` 의 나머지 변경은 **`manylinux` 로 시작하는
+태그에서만 도는 새 분기**이고, `Expectation.parse` 의 android/ios 두 줄은 그대로다.
+이 워크트리에는 Android · iOS 아티팩트가 없어 그 휠들을 실제로 만들 수 없다(기기·시뮬레이터 금지) —
+**그러므로 위 문장은 코드를 읽은 결과이지 실측이 아니다.** Android · iOS 휠이 있는 트리에서
+`verify_cross.py --self-test` 를 한 번 돌리는 것이 남아 있다.
+
+## 11. 설치 목록 — 다음 사람이 같은 환경을 만들려면
+
+2회차에서 새로 설치한 것은 **둘뿐이고, 둘 다 빌드 도구다.**
+
+| 설치한 것 | 버전 | 위치 | 명령 |
+|---|---|---|---|
+| `ziglang` (zig 컴파일러) | 0.16.0 | `/Volumes/macMini/caches/zig-venv` | `/usr/bin/python3 -m venv <위>` 후 `pip install ziglang` |
+| `cargo-zigbuild` | 0.23.3 | `~/.cargo/bin/cargo-zigbuild` | `cargo install cargo-zigbuild` |
+
+부수적으로 생기는 것:
+
+| 경로 | 무엇 | 지워도 되나 |
+|---|---|---|
+| `/Volumes/macMini/caches/zig-cache` | `ZIG_GLOBAL_CACHE_DIR`. 합성된 glibc stub 과 컴파일 캐시 | 예 (다시 만들어진다) |
+| `/Volumes/macMini/caches/cargo-target-desk2/x86_64-unknown-linux-gnu/` | 크로스 빌드 산출물 | 예 |
+| `/Volumes/macMini/caches/linux-probe*` | §9.2 의 프로브 크레이트 | 예 |
+
+**설치하지 않은 것과 그 이유:**
+
+- `docker` · `colima` · `podman` · `lima` · `qemu` — 지시에서 금지. 실행 검증은 그래서 열리지 않는다
+- `brew install zig` — 시스템 상태를 바꾼다. venv 쪽이 되돌리기 쉽다 (§9.1)
+- `cross` — docker 를 요구한다 (1회차 §2.5)
+- crosstool-ng (`messense/macos-cross-toolchains`) — 1 GB 이고 glibc 버전이 툴체인에 박힌다 (1회차 §2.5)
+
+**설정 파일에 아무것도 박지 않았다.** `.cargo/config.toml` · `~/.zshrc` · 저장소의 어떤 파일에도
+`zig` 경로나 링커 경로가 들어가지 않는다. 배선은 전부 위 표의 `export` 로만 이루어진다.
+
+---
+
+## 12. 다음 — Windows
+
+Linux 가 선 뒤 같은 사다리를 Windows x86_64 에 대해 밟았고, 그 기록은 **`docs/WINDOWS.md`** 에 있다.
+한 줄로 옮기면:
+
+| | Linux x86_64 | Windows x86_64 |
+|---|---|---|
+| 툴체인 | `cargo-zigbuild` (한 프로그램이 넷을 다 준다) | `cargo-xwin` + **셰임 넷** (xwin 은 데이터만 준다) |
+| 태그 | `manylinux_2_17_x86_64`, **아티팩트에서 유도** | `win_amd64`, **고정 이름. 유도할 것이 없다** |
+| 휠 안의 확장 이름 | `torch/_C.abi3.so` | **`torch/_C.pyd`** (Windows 의 dynload 표에 `.abi3.so` 가 없다) |
+| global-deps 라이브러리 | 빈 `.so` 를 싣는다 | **싣지 않는다** (`_load_global_deps()` 가 Windows 에서 즉시 return) |
+| 심볼 해결 | **iOS 만큼 강하지 않다** — 버저닝된 것만 귀속 | **iOS 만큼 강하다** — import table 이 심볼마다 DLL 을 적는다 |
+
+마지막 줄이 이 두 문서를 나란히 읽어야 하는 이유다. §6.1 이 ELF 의 한계로 지목한 것이
+PE 에는 없고, 그 차이는 도구가 아니라 **파일 형식**에서 온다.
+
+**Windows 를 넣으면서 공유 코드를 건드렸으므로**(`Target.extension_member`,
+`global_deps_name = None`, `_repack(renames=…)`), 위 §10 의 Linux 회귀는 그 변경 **이후**
+숫자로 갱신되어 있다. `docs/WINDOWS.md` §9 가 두 타깃을 한 표에 놓은 것이다.

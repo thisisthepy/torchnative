@@ -396,6 +396,189 @@ def elf_symbols(data: bytes) -> dict | None:
     return {"defined": defined, "undefined": undefined}
 
 
+# ----------------------------------------------------------------------- PE
+#
+# PE is the format where the "which library does this symbol come from" question
+# is *easiest*, which is the opposite of ELF. An import is not a name the loader
+# searches for: it is an entry in a table that is indexed by DLL, so every
+# undefined symbol arrives already attached to the file that has to provide it.
+# That is the same guarantee Mach-O's two-level namespace gives and the one
+# `.gnu.version_r` gives only for versioned symbols (docs/LINUX.md §6.1).
+#
+# The layout read here, from PE/COFF:
+#
+#   "MZ" .. e_lfanew(0x3C) -> "PE\0\0" + COFF header + optional header
+#   optional header magic 0x20B = PE32+ (64-bit), 0x10B = PE32
+#   data directory 1 = import table, 12 = delay import, 0 = export table
+#   each IMAGE_IMPORT_DESCRIPTOR: OriginalFirstThunk, .., Name(RVA), FirstThunk
+#   the thunk array is IMAGE_THUNK_DATA: high bit set = import by ordinal,
+#   otherwise an RVA to IMAGE_IMPORT_BY_NAME { WORD Hint; char Name[] }
+
+PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64", 0x14C: "i386",
+               0x1C0: "arm", 0x1C4: "armnt"}
+
+IMAGE_FILE_DLL = 0x2000
+
+
+def _pe_headers(data: bytes):
+    """(coff_offset, machine, magic, characteristics, sections) or None."""
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+    (lfanew,) = struct.unpack_from("<I", data, 0x3C)
+    if lfanew + 24 > len(data) or data[lfanew:lfanew + 4] != b"PE\0\0":
+        return None
+    coff = lfanew + 4
+    machine, nsections = struct.unpack_from("<HH", data, coff)
+    opt_size, characteristics = struct.unpack_from("<HH", data, coff + 16)
+    if opt_size < 2:
+        return None
+    (magic,) = struct.unpack_from("<H", data, coff + 20)
+    sections = []
+    base = coff + 20 + opt_size
+    for i in range(nsections):
+        off = base + i * 40
+        if off + 40 > len(data):
+            break
+        name = data[off:off + 8].rstrip(b"\0").decode("ascii", "replace")
+        vsize, vaddr, rawsize, rawptr = struct.unpack_from("<IIII", data, off + 8)
+        sections.append((name, vaddr, vsize, rawptr, rawsize))
+    return coff, machine, magic, characteristics, sections
+
+
+def pe_info(data: bytes) -> dict | None:
+    """Machine, bitness and DLL-ness, or None if these bytes are not PE."""
+    parsed = _pe_headers(data)
+    if parsed is None:
+        return None
+    _, machine, magic, characteristics, _ = parsed
+    if magic not in (0x10B, 0x20B):
+        return None
+    return {
+        "machine": PE_MACHINES.get(machine, f"0x{machine:x}"),
+        "bits": 64 if magic == 0x20B else 32,
+        "dll": bool(characteristics & IMAGE_FILE_DLL),
+    }
+
+
+def _rva_to_offset(sections, rva: int) -> int | None:
+    for _, vaddr, vsize, rawptr, rawsize in sections:
+        if vaddr <= rva < vaddr + max(vsize, rawsize):
+            delta = rva - vaddr
+            if delta < rawsize:
+                return rawptr + delta
+            return None
+    return None
+
+
+def _cstring(data: bytes, offset: int) -> str:
+    end = data.find(b"\0", offset)
+    return data[offset:end if end >= 0 else len(data)].decode("ascii", "replace")
+
+
+def _data_directory(data: bytes, coff: int, magic: int, index: int):
+    # The directory array starts after the optional header's fixed part, whose
+    # size differs between PE32 (96 bytes) and PE32+ (112).
+    fixed = 112 if magic == 0x20B else 96
+    base = coff + 20 + fixed
+    (count,) = struct.unpack_from("<I", data, base - 4)
+    if index >= count:
+        return 0, 0
+    return struct.unpack_from("<II", data, base + index * 8)
+
+
+def pe_imports(data: bytes) -> dict[str, set[str]] | None:
+    """`{dll name: {imported symbol, ...}}`, straight out of the import table.
+
+    Ordinal-only imports appear as `#<n>`, because that is all the file records:
+    the name lives in the exporting DLL's ordinal table and is not recoverable
+    from here. Delay-loaded imports (directory 12) are merged in -- they resolve
+    at first call rather than at load, so they are still symbols this image
+    requires from that DLL, and leaving them out would understate the
+    dependency.
+    """
+    parsed = _pe_headers(data)
+    if parsed is None:
+        return None
+    coff, _, magic, _, sections = parsed
+    if magic not in (0x10B, 0x20B):
+        return None
+    ptr_size = 8 if magic == 0x20B else 4
+    ordinal_flag = 1 << (ptr_size * 8 - 1)
+    fmt = "<Q" if ptr_size == 8 else "<I"
+
+    result: dict[str, set[str]] = {}
+    for directory, descriptor_size, name_field, thunk_fields in (
+            (1, 20, 12, (0, 16)), (12, 32, 4, (16, 12))):
+        rva, _size = _data_directory(data, coff, magic, directory)
+        if not rva:
+            continue
+        table = _rva_to_offset(sections, rva)
+        if table is None:
+            continue
+        while table + descriptor_size <= len(data):
+            fields = struct.unpack_from(f"<{descriptor_size // 4}I", data, table)
+            if not any(fields):
+                break
+            name_rva = fields[name_field // 4]
+            name_off = _rva_to_offset(sections, name_rva)
+            if name_off is None:
+                break
+            # The delay-load directory used image-relative addresses in its
+            # original form and RVAs since VS2015; both appear in the wild, and
+            # a value that does not land in a section means the former.
+            dll = _cstring(data, name_off)
+            names = result.setdefault(dll, set())
+            for field in thunk_fields:
+                thunk_rva = fields[field // 4]
+                thunk = _rva_to_offset(sections, thunk_rva) if thunk_rva else None
+                if thunk is None:
+                    continue
+                while thunk + ptr_size <= len(data):
+                    (entry,) = struct.unpack_from(fmt, data, thunk)
+                    if entry == 0:
+                        break
+                    if entry & ordinal_flag:
+                        names.add(f"#{entry & 0xFFFF}")
+                    else:
+                        hint = _rva_to_offset(sections, entry & 0x7FFFFFFF)
+                        if hint is not None:
+                            names.add(_cstring(data, hint + 2))
+                    thunk += ptr_size
+                break  # the first thunk array that resolves is enough
+            table += descriptor_size
+    return result
+
+
+def pe_exports(data: bytes) -> set[str] | None:
+    """Names in the export directory. Used to resolve another image's imports."""
+    parsed = _pe_headers(data)
+    if parsed is None:
+        return None
+    coff, _, magic, _, sections = parsed
+    if magic not in (0x10B, 0x20B):
+        return None
+    rva, _size = _data_directory(data, coff, magic, 0)
+    if not rva:
+        return set()
+    table = _rva_to_offset(sections, rva)
+    if table is None or table + 40 > len(data):
+        return set()
+    count, names_rva = struct.unpack_from("<I", data, table + 24)[0], \
+        struct.unpack_from("<I", data, table + 32)[0]
+    names_off = _rva_to_offset(sections, names_rva)
+    if names_off is None:
+        return set()
+    exported: set[str] = set()
+    for i in range(count):
+        if names_off + i * 4 + 4 > len(data):
+            break
+        (name_rva,) = struct.unpack_from("<I", data, names_off + i * 4)
+        offset = _rva_to_offset(sections, name_rva)
+        if offset is not None:
+            exported.add(_cstring(data, offset))
+    return exported
+
+
 def describe(data: bytes) -> str:
     """One line, for printing next to a filename."""
     macho = macho_info(data)
@@ -409,6 +592,10 @@ def describe(data: bytes) -> str:
     if elf:
         return (f"ELF {elf['bits']}-bit {elf['endian']}-endian "
                 f"{elf['machine']} {elf['type']}")
+    pe = pe_info(data)
+    if pe:
+        return (f"PE{'32+' if pe['bits'] == 64 else '32'} "
+                f"{pe['machine']} {'dll' if pe['dll'] else 'exe'}")
     if macho_arches(data):
         return "Mach-O fat: " + "+".join(macho_arches(data))
     return "not a recognised binary"

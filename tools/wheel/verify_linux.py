@@ -52,11 +52,12 @@ method:
     requirement is *internally consistent* and within the manylinux policy; that
     the symbols exist in a real glibc of that version is taken on the linker's
     word.
-  * **there is no artefact yet.** No toolchain here can cross-compile the crate
-    to Linux (docs/LINUX.md §2, §4), so this script has never been run against a
-    torchnative wheel. `--self-test` runs it against real Linux x86-64 CPython
-    extension modules from the target distribution instead, which exercises the
-    resolver but says nothing about our extension.
+  * **`--self-test` still does not use our artefact.** It runs against real
+    Linux x86-64 CPython extension modules from the target distribution, which
+    exercises the resolver but says nothing about our extension. Passing a
+    wheel does use ours: since docs/LINUX.md §9.2 the crate cross-compiles with
+    cargo-zigbuild, and §9.4 is the first run of this script over
+    `torch/_C.abi3.so` -- 243 undefined, 0 unresolved.
 """
 
 from __future__ import annotations

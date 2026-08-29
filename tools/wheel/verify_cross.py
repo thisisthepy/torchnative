@@ -51,7 +51,12 @@ import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from binfmt import describe, elf_info, macho_info  # noqa: E402
+from binfmt import (describe, elf_dynamic, elf_info,  # noqa: E402
+                    macho_info, pe_imports, pe_info)
+# The manylinux checks have to agree with the builder about what PEP 599 allows
+# and how glibc version names order. Importing rather than restating is the
+# difference between one rule and two that can drift apart silently.
+import build as _build  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -80,10 +85,14 @@ class Expectation:
             return AndroidExpectation(plat)
         if plat.startswith("ios_"):
             return IOSExpectation(plat)
+        if plat.startswith("manylinux"):
+            return LinuxExpectation(plat)
+        if plat.startswith("win"):
+            return WindowsExpectation(plat)
         raise SystemExit(
-            f"{plat!r} is neither a PEP 738 android_* nor a PEP 730 ios_* tag. "
-            "For a host wheel use tools/wheel/verify.py, which actually "
-            "installs it."
+            f"{plat!r} is not a PEP 738 android_*, PEP 730 ios_*, PEP 600 "
+            "manylinux_* or win* tag. For a host wheel use "
+            "tools/wheel/verify.py, which actually installs it."
         )
 
     # -- checks --------------------------------------------------------------
@@ -94,11 +103,21 @@ class Expectation:
     def check_binary(self, name: str, data: bytes, problems: list[str]) -> None:
         raise NotImplementedError
 
-    def global_deps_name(self) -> str:
+    #: Where the extension sits in the archive. Windows overrides it: its
+    #: dynload table has no `.abi3.so` in it. Mirrors
+    #: `build.Target.extension_member`, which is what put the file there.
+    extension_member = "torch/_C.abi3.so"
+
+    #: `_manager_path()` checks this exists -- but only on non-Windows, where it
+    #: returns `b""` before looking. docs/VENDOR.md wall 4.
+    shm_manager_required = True
+
+    def global_deps_name(self) -> str | None:
         # `_load_global_deps()` builds the filename with
         #     ".dylib" if platform.system() == "Darwin" else ".so"
         # and `platform.system()` is "Android" / "iOS" on these targets -- so
         # both want `.so`, including iOS where the file is a Mach-O dylib.
+        # `None` means the platform loads no such library at all (Windows).
         return "libtorch_global_deps.so"
 
 
@@ -202,6 +221,222 @@ class IOSExpectation(Expectation):
                     f"(LC_LOAD_DYLIB: {info['dylibs']})")
 
 
+class LinuxExpectation(Expectation):
+    """PEP 600 `manylinux_<major>_<minor>_<arch>`.
+
+    Two things here have no counterpart in the Android and iOS branches.
+
+    First, `packaging` cannot check the spelling. It has `android_platforms` and
+    `ios_platforms` but no `manylinux_platforms`, because matching a manylinux
+    tag needs the glibc of the interpreter doing the matching -- it is not a
+    function of arguments. So the tag is checked against PEP 600's grammar and
+    the skip is printed rather than hidden. This branch is one step weaker than
+    the other two and says so.
+
+    Second, the floor in the tag is a claim about *content*, not about a target
+    SDK, so it can be checked against the members: `.gnu.version_r` records the
+    `GLIBC_x.y` each image needs, and a wheel tagged below the highest of those
+    installs onto a glibc that cannot load it. iOS's `minos` check is the same
+    shape; Android has no equivalent because an ELF records no API level.
+    """
+
+    family = "manylinux"
+
+    #: PEP 599's external-library list, read from the builder rather than copied
+    #: so the two cannot drift into disagreeing about what manylinux promises.
+    POLICY_LIBRARIES = _build.LinuxTarget.POLICY_LIBRARIES
+    NAMED_VERSIONS = _build.LinuxTarget.NAMED_VERSIONS
+
+    #: Tag arch -> ELF machine, for the archs this repository has a CPython for.
+    MACHINES = {"x86_64": "x86_64", "aarch64": "aarch64", "i686": "i386"}
+
+    def __init__(self, plat: str):
+        super().__init__(plat)
+        m = re.match(r"^manylinux_(\d+)_(\d+)_(.+)$", plat)
+        if not m:
+            raise SystemExit(
+                f"malformed manylinux tag {plat!r}. The legacy aliases "
+                "(manylinux1/2010/2014) are deliberately not accepted -- this "
+                "repository tags with PEP 600 only")
+        self.glibc = (int(m.group(1)), int(m.group(2)))
+        self.arch = m.group(3)
+        if self.arch not in self.MACHINES:
+            raise SystemExit(f"unknown manylinux arch {self.arch!r} in {plat!r}")
+        triple = {"x86_64": "x86_64-unknown-linux-gnu"}.get(self.arch)
+        lib = TARGET_PYTHON_ROOT / triple / "lib" if triple else None
+        self.interpreters = sorted(lib.glob("libpython3.*.so")) if lib else []
+
+    def check_tag(self, problems: list[str]) -> None:
+        if self.glibc < (2, 5):
+            problems.append(
+                f"the tag claims glibc {self.glibc[0]}.{self.glibc[1]}, below "
+                "manylinux1's 2.5 -- PEP 600 defines the scheme no lower and no "
+                "installer matches it")
+            return
+        print(f"  tag                 {self.plat}  "
+              f"(PEP 600-shaped: glibc {self.glibc[0]}.{self.glibc[1]}, "
+              f"{self.arch})")
+        print("  ! packaging has no manylinux_platforms, so unlike the android "
+              "and ios tags\n"
+              "    this spelling is not confirmed against pip's own generator")
+
+    def check_binary(self, name: str, data: bytes, problems: list[str]) -> None:
+        info = elf_info(data)
+        if info is None:
+            problems.append(f"{name} is not an ELF image: {describe(data)}")
+            return
+        want = self.MACHINES[self.arch]
+        if info["machine"] != want:
+            problems.append(
+                f"{name} is {info['machine']}, but the tag says {self.arch}")
+        if info["type"] != "dyn":
+            problems.append(f"{name} is ELF type {info['type']}, expected dyn")
+
+        dynamic = elf_dynamic(data)
+        if dynamic is None:
+            problems.append(
+                f"{name} has no readable dynamic section, so neither its glibc "
+                "requirement nor its library dependencies can be checked "
+                "against the tag")
+            return
+
+        outside = sorted(set(dynamic["needed"]) - self.POLICY_LIBRARIES)
+        if outside:
+            problems.append(
+                f"{name} links {outside}, which PEP 599's external-library "
+                "policy does not allow -- the manylinux tag's whole promise is "
+                "that it needs nothing beyond that list")
+
+        needs = self._glibc_needed(name, dynamic, problems)
+        if needs and needs > self.glibc:
+            problems.append(
+                f"{name} needs glibc {needs[0]}.{needs[1]}, above the tag's "
+                f"{self.glibc[0]}.{self.glibc[1]} -- the wheel claims a glibc "
+                "that cannot load it")
+        elif needs:
+            print(f"  glibc               {name} needs {needs[0]}.{needs[1]} "
+                  f"<= the tag's {self.glibc[0]}.{self.glibc[1]}")
+        else:
+            # The empty global-deps stub lands here and is right to: it
+            # references no libc symbol, so it constrains nothing. Saying "no
+            # requirement" out loud keeps that from reading as a passed check.
+            print(f"  glibc               {name} records no requirement "
+                  "(it references no versioned symbol)")
+
+    def _glibc_needed(self, name: str, dynamic: dict,
+                      problems: list[str]) -> tuple[int, int] | None:
+        floor: tuple[int, int] | None = None
+        for library, versions in dynamic["versions"].items():
+            for version in sorted(versions):
+                if not version.startswith("GLIBC_"):
+                    continue
+                parts = version[len("GLIBC_"):].split(".")
+                if all(p.isdigit() for p in parts) and len(parts) >= 2:
+                    value = (int(parts[0]), int(parts[1]))
+                elif version in self.NAMED_VERSIONS:
+                    value = self.NAMED_VERSIONS[version]
+                else:
+                    problems.append(
+                        f"{name} needs glibc symbol version {version!r} from "
+                        f"{library}, which this does not know how to order; "
+                        "refused rather than skipped, because skipping one can "
+                        "only make the requirement look lower than it is")
+                    continue
+                floor = value if floor is None else max(floor, value)
+        return floor
+
+
+class WindowsExpectation(Expectation):
+    """`win_amd64` and its two siblings, which are names rather than derivations.
+
+    There is no version in a Windows wheel tag -- no API level, no deployment
+    target, no glibc floor -- so unlike the other three families there is
+    nothing here that can be *derived* wrongly. The whole of what the tag claims
+    is an architecture, and that is checked against the PE header.
+
+    The two interesting things are structural rather than about the tag, and
+    both come from upstream torch and CPython rather than from a choice here:
+
+      the member is `torch/_C.pyd`     `dynload_win.c` has no `.abi3.so` in its
+                                       table, so the POSIX name would never be
+                                       found; plain `.pyd` is the abi3 spelling
+                                       (`.cp313-win_amd64.pyd` is the
+                                       version-locked one)
+      no global-deps library at all    `_load_global_deps()` returns before
+                                       doing anything on Windows, and
+                                       `_load_dll_libraries()` LoadLibrary's
+                                       every `torch/lib/*.dll` -- so an empty
+                                       one would be a load for nothing
+
+    `torch/bin/torch_shm_manager` is likewise not required: `_manager_path()`
+    returns `b""` on Windows before it checks.
+    """
+
+    family = "windows"
+
+    MACHINES = {"win_amd64": "x86_64", "win32": "i386", "win_arm64": "aarch64"}
+
+    extension_member = "torch/_C.pyd"
+    shm_manager_required = False
+
+    def __init__(self, plat: str):
+        super().__init__(plat)
+        if plat not in self.MACHINES:
+            raise SystemExit(
+                f"unknown Windows tag {plat!r}; the only ones pip generates are "
+                f"{sorted(self.MACHINES)}")
+        self.arch = self.MACHINES[plat]
+        root = TARGET_PYTHON_ROOT / "x86_64-pc-windows-msvc"
+        # python313.dll, not python3.dll: the dynload table is a set of string
+        # constants compiled into the interpreter, and python3.dll is only a
+        # forwarder with no code of its own.
+        self.interpreters = sorted(root.glob("python3??.dll"))
+
+    def global_deps_name(self) -> str | None:
+        return None
+
+    def check_tag(self, problems: list[str]) -> None:
+        # `packaging.tags` has no windows_platforms: on Windows it derives the
+        # tag from `sysconfig.get_platform()` of the *running* interpreter, so
+        # there is no generator to hand arguments to. Same shape of gap as
+        # manylinux, and reported the same way rather than hidden.
+        print(f"  tag                 {self.plat}  "
+              f"(a fixed name; {self.arch}, no version component)")
+        print("  ! packaging has no windows_platforms, so unlike the android "
+              "and ios tags\n"
+              "    this spelling is not confirmed against pip's own generator")
+
+    def check_binary(self, name: str, data: bytes, problems: list[str]) -> None:
+        info = pe_info(data)
+        if info is None:
+            problems.append(f"{name} is not a PE image: {describe(data)}")
+            return
+        if info["machine"] != self.arch:
+            problems.append(
+                f"{name} is {info['machine']}, but the tag says {self.plat} "
+                f"(= {self.arch})")
+        if info["bits"] != (32 if self.plat == "win32" else 64):
+            problems.append(f"{name} is PE{info['bits']}, wrong for {self.plat}")
+        if not info["dll"]:
+            problems.append(
+                f"{name} is a PE executable, not a DLL -- an extension module "
+                "has to be a DLL for LoadLibrary to take it")
+        if name != self.extension_member:
+            return
+        # The abi3 promise, checked against the file rather than the build
+        # flags: an extension bound to python313.dll serves 3.13 alone, however
+        # the wheel is tagged. PE says which, because every import names its DLL.
+        imports = pe_imports(data) or {}
+        if "python3.dll" not in imports:
+            problems.append(
+                f"{name} imports from {sorted(imports) or 'nothing'} and not "
+                "from python3.dll -- an abi3 extension binds the stable-ABI "
+                "forwarder, and binding python313.dll makes the abi3 tag false")
+        else:
+            print(f"  abi3 binding        {len(imports['python3.dll'])} imports "
+                  "from python3.dll (the stable-ABI forwarder)")
+
+
 def _packaging_accepts(exp: Expectation, problems: list[str], **kwargs) -> None:
     """Would pip's own tag generator produce this platform tag?
 
@@ -234,7 +469,8 @@ def _packaging_accepts(exp: Expectation, problems: list[str], **kwargs) -> None:
 
 
 def _is_binary(data: bytes) -> bool:
-    return macho_info(data) is not None or elf_info(data) is not None
+    return (macho_info(data) is not None or elf_info(data) is not None
+            or pe_info(data) is not None)
 
 
 def check_record(zf: zipfile.ZipFile, dist_info: str,
@@ -284,20 +520,27 @@ def check_suffix_is_searched(exp: Expectation, problems: list[str]) -> None:
     (For Android this is also directly measured -- `scripts/device_android.sh`
     records the list from the device as
     `['.cpython-313-aarch64-linux-android.so', '.abi3.so', '.so']`.)
+
+    Windows has a different table in a different file: `dynload_win.c` gives
+    `{"_d.pyd", ".cp313-win_amd64.pyd", ".pyd"}` and no `.abi3.so` anywhere. So
+    the suffix asked about comes from the expectation rather than being written
+    down here -- which is the same fact that makes the member `_C.pyd`.
     """
     if not exp.interpreters:
         problems.append(
             "no target CPython found to check the extension suffix against "
             f"(looked under {TARGET_PYTHON_ROOT}); set TORCHNATIVE_TARGET_PYTHON")
         return
+    suffix = "." + exp.extension_member.split("_C.", 1)[1]
+    needle = suffix.encode() + b"\x00"
     for path in exp.interpreters:
         blob = path.read_bytes()
-        if b".abi3.so\x00" not in blob:
+        if needle not in blob:
             problems.append(
-                f"{path} does not contain the extension suffix '.abi3.so' -- "
-                "this interpreter would never find torch/_C.abi3.so")
+                f"{path} does not contain the extension suffix {suffix!r} -- "
+                f"this interpreter would never find {exp.extension_member}")
         else:
-            print(f"  ext suffix          .abi3.so present in {path.name}")
+            print(f"  ext suffix          {suffix} present in {path.name}")
 
 
 # ------------------------------------------------------------------ self-test
@@ -316,10 +559,34 @@ def _patch(data: bytes, offset: int, raw: bytes) -> bytes:
     return data[:offset] + raw + data[offset + len(raw):]
 
 
-def _wrong_elf_machine(data: bytes) -> bytes:
-    """e_machine := EM_X86_64. An aarch64 tag over an x86_64 ELF."""
+def _wrong_pe_machine(data: bytes) -> bytes:
+    """COFF `Machine` := the other 64-bit one. An aarch64 DLL under an amd64 tag."""
     import struct as _s
-    return _patch(data, 18, _s.pack("<H", 0x3E))
+    from binfmt import _pe_headers
+    coff = _pe_headers(data)[0]
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64 = 0x8664, 0xAA64
+    (current,) = _s.unpack_from("<H", data, coff)
+    other = (IMAGE_FILE_MACHINE_ARM64 if current == IMAGE_FILE_MACHINE_AMD64
+             else IMAGE_FILE_MACHINE_AMD64)
+    return _patch(data, coff, _s.pack("<H", other))
+
+
+def _wrong_elf_machine(data: bytes) -> bytes:
+    """Retarget the image at an architecture the tag does not claim.
+
+    Flipped rather than assigned. Written as `e_machine := EM_X86_64` it damaged
+    an aarch64 Android wheel and silently did nothing to an x86-64 manylinux
+    one, so the fault mode passed by being absent -- exactly the shape CLAUDE.md
+    §5.5 warns about, and it survived until a Linux wheel existed to run it on.
+    """
+    import struct as _s
+    EM_X86_64, EM_AARCH64 = 0x3E, 0xB7
+    current = _s.unpack_from("<H", data, 18)[0]
+    other = EM_AARCH64 if current == EM_X86_64 else EM_X86_64
+    if current == other:                                  # pragma: no cover
+        raise SystemExit("cannot flip e_machine away from itself -- "
+                         "self-test cannot run")
+    return _patch(data, 18, _s.pack("<H", other))
 
 
 def _wrong_macho_platform(data: bytes) -> bytes:
@@ -377,13 +644,28 @@ def self_test(wheel: Path, reference: Path | None) -> int:
     import subprocess
     import tempfile
 
-    with zipfile.ZipFile(wheel) as zf:
-        ext_data = zf.read("torch/_C.abi3.so")
-    is_macho = macho_info(ext_data) is not None
     stem = wheel.stem
-    name, version, plat = stem.split("-")[0], stem.split("-")[1], stem.split("-")[-1]
+    plat = stem.split("-")[-1]
+    exp = Expectation.parse(plat)
+    with zipfile.ZipFile(wheel) as zf:
+        ext_data = zf.read(exp.extension_member)
+    is_macho = macho_info(ext_data) is not None
+    is_pe = pe_info(ext_data) is not None
+    is_manylinux = plat.startswith("manylinux")
+    name, version = stem.split("-")[0], stem.split("-")[1]
     dist_info = f"{name}-{version}.dist-info"
-    deps = "torch/lib/libtorch_global_deps.so"
+    deps_name = exp.global_deps_name()
+    deps = f"torch/lib/{deps_name}" if deps_name else None
+
+    if is_pe:
+        damage = _wrong_pe_machine
+        expect_platform = "but the tag says"
+    elif is_macho:
+        damage = _wrong_macho_platform
+        expect_platform = "built for"
+    else:
+        damage = _wrong_elf_machine
+        expect_platform = "but the tag says"
 
     # Each entry: what is broken, how, and the words the report must contain.
     # Matching on the message rather than only on the exit code is what keeps a
@@ -391,35 +673,72 @@ def self_test(wheel: Path, reference: Path | None) -> int:
     # comparison would otherwise absorb almost all of these.
     faults: list[tuple[str, dict, str]] = [
         ("extension built for the wrong platform",
-         {"replace": {"torch/_C.abi3.so":
-                      _wrong_macho_platform if is_macho else _wrong_elf_machine}},
-         "built for" if is_macho else "but the tag says"),
-        ("global-deps library missing",
-         {"drop": (deps,)},
-         "_load_global_deps"),
-        ("global-deps library under the host's name",
-         {"drop": (deps,),
-          "add": {"torch/lib/libtorch_global_deps.dylib": deps}},
-         "beside"),
-        ("wall-4 marker missing",
-         {"drop": ("torch/bin/torch_shm_manager",)},
-         "torch_shm_manager"),
+         {"replace": {exp.extension_member: damage}},
+         expect_platform),
         ("a member edited without updating RECORD",
          {"replace": {"torch/version.py": lambda d: d + b"\n# tampered\n"}},
          "RECORD says"),
         ("part of the vendored tree dropped",
          {"drop": tuple(_some_tree_files(wheel))},
          "are missing here"),
+        ("extension under the POSIX name this platform does not search"
+         if is_pe else "extension missing",
+         {"drop": (exp.extension_member,),
+          **({"add": {"torch/_C.abi3.so": exp.extension_member}} if is_pe else {})},
+         "beside torch/_C.pyd" if is_pe else f"no {exp.extension_member}"),
         ("WHEEL Tag: out of step with the filename",
          {"wheel_tag": f"cp313-abi3-{plat}-BOGUS"},
          "declares Tag:"),
         ("platform tag no installer would generate",
-         {"rename": stem.replace(plat, _impossible(plat)) + ".whl"},
-         "does not yield"),
+         {"rename": stem.replace(plat, _impossible(plat)) + ".whl",
+          "wheel_tag": f"cp313-abi3-{_impossible(plat)}"},
+         "below manylinux1's 2.5" if is_manylinux
+         else "the only ones pip generates" if plat.startswith("win")
+         else "does not yield"),
         ("abi tag downgraded from abi3",
          {"rename": stem.replace("-abi3-", "-cp313-") + ".whl"},
          "not 'abi3'"),
     ]
+
+    if deps:
+        faults[1:1] = [
+            ("global-deps library missing",
+             {"drop": (deps,)},
+             "_load_global_deps"),
+            ("global-deps library under the host's name",
+             {"drop": (deps,),
+              "add": {"torch/lib/libtorch_global_deps.dylib": deps}},
+             "beside"),
+        ]
+    else:
+        # The absence is by design here, so the fault mode is the *presence* of
+        # one -- `_load_dll_libraries()` would LoadLibrary it for nothing, and
+        # a failure there is raised rather than swallowed.
+        faults.insert(1, (
+            "a global-deps library on a platform that loads none",
+            {"add": {"torch/lib/libtorch_global_deps.dll": exp.extension_member}},
+            "returns before looking",
+        ))
+
+    if exp.shm_manager_required:
+        faults.insert(-2, ("wall-4 marker missing",
+                           {"drop": ("torch/bin/torch_shm_manager",)},
+                           "torch_shm_manager"))
+
+    if is_manylinux:
+        # Only this family can be retagged *within* its own valid range and
+        # still be wrong: the floor is a claim about the members' own
+        # `.gnu.version_r`, not about a target SDK. manylinux_2_5 is a tag
+        # every installer on a modern distro happily matches, and the wheel
+        # would then be handed to a glibc that cannot load `_C.abi3.so`.
+        # Android has no counterpart at all; iOS's is the `minos` check.
+        floor = "manylinux_2_5_" + plat.split("_", 3)[3]
+        faults.append((
+            "tag floor below the glibc the members actually need",
+            {"rename": stem.replace(plat, floor) + ".whl",
+             "wheel_tag": f"cp313-abi3-{floor}"},
+            "above the tag's 2.5",
+        ))
 
     print(f"SELF-TEST against {wheel.name}")
     print(f"  {len(faults)} fault modes; each must be reported, with the "
@@ -463,14 +782,23 @@ def _some_tree_files(wheel: Path) -> list[str]:
 
 
 def _impossible(plat: str) -> str:
-    """A same-shaped tag that `packaging.tags` will never yield.
+    """A same-shaped tag no installer would ever match.
 
-    Below each family's own floor -- API 15 for Android, iOS 11 -- so the
-    rejection comes from packaging's generator and not from a spelling rule
-    invented here.
+    Below each family's own floor -- API 15 for Android, iOS 11, glibc 2.1 --
+    so the rejection comes from the family's own defined lower bound and not
+    from a spelling rule invented here. For Android and iOS that bound is
+    enforced by `packaging`'s generator; for manylinux `packaging` has no
+    generator, so it is PEP 600's own floor of 2.5 (manylinux1).
     """
     if plat.startswith("android_"):
         return re.sub(r"^android_\d+", "android_15", plat)
+    if plat.startswith("manylinux"):
+        return re.sub(r"^manylinux_\d+_\d+", "manylinux_2_1", plat)
+    if plat.startswith("win"):
+        # No version to lower, so the impossible tag is an architecture pip has
+        # no name for. `WindowsExpectation` refuses it by the same rule that
+        # says there are only three.
+        return "win_ia64"
     return re.sub(r"^ios_\d+_\d+", "ios_11_0", plat)
 
 
@@ -557,21 +885,35 @@ def main() -> None:
                 "no binary members at all -- this is the py3-none-any shell "
                 "again, in a platform-tagged wrapper")
 
-        # 3. The three files `import torch` reaches for by name.
-        ext = "torch/_C.abi3.so"
+        # 3. The files `import torch` reaches for by name. Which files those
+        #    are is a property of the platform, not a constant: Windows renames
+        #    one and does not load another at all.
+        ext = exp.extension_member
         if ext not in names:
             problems.append(f"no {ext}")
-        deps = f"torch/lib/{exp.global_deps_name()}"
-        if deps not in names:
+        stale = [n for n in names
+                 if n.endswith("torch/_C.abi3.so") and n != ext]
+        if stale:
+            problems.append(
+                f"{stale} beside {ext} -- the extension is under two names and "
+                "the interpreter would find whichever its table lists first")
+        deps_name = exp.global_deps_name()
+        deps = f"torch/lib/{deps_name}" if deps_name else None
+        if deps and deps not in names:
             problems.append(
                 f"no {deps} -- `_load_global_deps()` computes exactly this name "
                 "on this platform, and without it `import torch` needs "
                 "TORCH_USE_RTLD_GLOBAL=1 (docs/VENDOR.md wall 1)")
         strays = [n for n in names
                   if n.startswith("torch/lib/libtorch_global_deps") and n != deps]
-        if strays:
+        if strays and deps:
             problems.append(f"{strays} beside {deps}; only one is looked for")
-        if "torch/bin/torch_shm_manager" not in names:
+        elif strays:
+            problems.append(
+                f"{strays}, but `_load_global_deps()` returns before looking on "
+                "this platform -- `_load_dll_libraries()` would LoadLibrary it "
+                "for nothing")
+        if exp.shm_manager_required and "torch/bin/torch_shm_manager" not in names:
             problems.append(
                 "no torch/bin/torch_shm_manager -- `_manager_path()` checks it "
                 "exists on every non-Windows platform (docs/VENDOR.md wall 4)")
@@ -598,11 +940,18 @@ def main() -> None:
             with zipfile.ZipFile(reference) as ref:
                 ref_names = set(ref.namelist())
             here = set(names)
-            # The global-deps filename differs by design (.dylib vs .so), so it
-            # is excluded from the comparison on both sides rather than
-            # special-cased into an allowance that would also hide a loss.
+            # Two members are expected to differ and both are excluded on both
+            # sides rather than allowed one-directionally, which would also hide
+            # a loss. The global-deps filename differs by design (.dylib vs .so,
+            # or absent entirely on Windows); the extension's *name* differs
+            # only where the target interpreter searches for another one, and
+            # that it is present under the right name was already checked
+            # against `exp.extension_member` above -- so folding both spellings
+            # to one here weakens nothing.
+            renamed = {"torch/_C.abi3.so", exp.extension_member}
+
             def strip(s):
-                return {n for n in s
+                return {"torch/_C" if n in renamed else n for n in s
                         if not n.startswith("torch/lib/libtorch_global_deps")
                         and not n.endswith("/RECORD")}
             lost = sorted(strip(ref_names) - strip(here))
