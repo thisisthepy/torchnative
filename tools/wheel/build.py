@@ -102,6 +102,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from binfmt import (describe, elf_dynamic, elf_info, macho_arches,  # noqa: E402
+                    pe_imports, pe_info,
                     macho_info)
 
 REPO = Path(__file__).resolve().parents[2]
@@ -682,7 +683,21 @@ class Target:
     # them want `.so` even though the iOS file is a Mach-O dylib. Getting this
     # wrong is silent: the `ctypes.CDLL` raises OSError, `_load_global_deps`
     # swallows it into `_preload_cuda_deps`, and the import fails somewhere else.
-    global_deps_name = "libtorch_global_deps.so"
+    # `None` means this platform loads no global-deps library at all and the
+    # wheel must not carry one. Only Windows: `_load_global_deps()` opens with
+    # `if platform.system() == "Windows": return`, while `_load_dll_libraries()`
+    # globs `torch/lib/*.dll` and LoadLibrary's every hit -- so an empty stub
+    # there would be loaded for nothing, and a failure to load it would be
+    # raised rather than swallowed. See docs/WINDOWS.md §4.3.
+    global_deps_name: str | None = "libtorch_global_deps.so"
+
+    # Where the extension sits in the archive, which is not the same question as
+    # what the file is called on the build machine. The name has to be one the
+    # target interpreter's `_PyImport_DynLoadFiletab` contains, and for an abi3
+    # extension that is `.abi3.so` everywhere CPython builds with POSIX dynload
+    # -- but Windows has its own table (`_d.pyd`, `.cp313-win_amd64.pyd`,
+    # `.pyd`) with no `.abi3.so` in it, so there the member is `_C.pyd`.
+    extension_member = "torch/_C.abi3.so"
 
     # How to produce this artefact. Named rather than run -- see the freshness
     # block comment for why this script refuses instead of rebuilding.
@@ -890,10 +905,9 @@ class LinuxTarget(Target):
     would let a wheel linking, say, `libopenblas.so` claim a tag whose entire
     promise is that it does not.
 
-    Nothing on this machine can build the artefact this class describes -- see
-    docs/LINUX.md §2 and §4. It refuses by name when it is missing, which is the
-    point: an unbuildable target must say so rather than be absent from
-    `--target`'s choices and look like it was never considered.
+    The artefact is buildable on this machine as of docs/LINUX.md §9, with
+    cargo-zigbuild; before that it was not, and this class still refuses by name
+    when the file is missing rather than dropping out of `--target`'s choices.
     """
 
     #: PEP 599's external-library list for manylinux2014, which PEP 600 carries
@@ -928,10 +942,10 @@ class LinuxTarget(Target):
         )
 
     rebuild_hint = (
-        "docs/LINUX.md §2.5 -- no toolchain on this machine can produce it yet. "
-        "The shortest route measured there is `cargo zigbuild --release --target "
-        "x86_64-unknown-linux-gnu.2.17`, which needs zig and cargo-zigbuild "
-        "installed first"
+        "PYO3_CROSS_LIB_DIR=<target-python>/lib cargo zigbuild --release "
+        "--target x86_64-unknown-linux-gnu.2.17, from rust/torch_c "
+        "(docs/LINUX.md §9.2 has the whole environment; §9.1 installs "
+        "cargo-zigbuild and ziglang, which it needs)"
     )
 
     def _multiarch(self) -> str:
@@ -1023,6 +1037,42 @@ class LinuxTarget(Target):
         _confirm_pep600_spelling(tag)
         return tag
 
+    #: The glibc `cc()` compiles the global-deps stub against, and the number
+    #: docs/LINUX.md §9.2 passes to `cargo zigbuild --target
+    #: x86_64-unknown-linux-gnu.<here>` for the Rust artefact. Kept in one place
+    #: so the two members of the wheel are named the same version, but it does
+    #: **not** set the tag: the tag is read off the artefact (see the class
+    #: docstring), and lowering this constant would not lower the tag. The stub
+    #: is empty, so it references no glibc symbol at all and records no version
+    #: requirement whatever this says -- measured in docs/LINUX.md §9.3. That is
+    #: why there is no cross-check between the two here: it could not fail.
+    GLIBC_TARGET = (2, 17)
+
+    @staticmethod
+    def zig_command() -> list[str] | None:
+        """`zig`, however it is installed -- the order cargo-zigbuild uses.
+
+        zig ships two ways and only one of them is a binary on PATH. The
+        `ziglang` wheel puts the compiler inside a Python package and is run as
+        `<python> -m ziglang`; that is how cargo-zigbuild finds it when there is
+        no `zig` executable, and this has to agree with cargo-zigbuild or the
+        wheel's two native members get built by different toolchains.
+        """
+        binary = shutil.which("zig")
+        if binary:
+            return [binary]
+        seen = set()
+        for name in ("python3", "python", sys.executable):
+            interpreter = shutil.which(name) if not os.path.isabs(name) else name
+            if not interpreter or interpreter in seen:
+                continue
+            seen.add(interpreter)
+            probe = subprocess.run([interpreter, "-m", "ziglang", "version"],
+                                   capture_output=True)
+            if probe.returncode == 0:
+                return [interpreter, "-m", "ziglang"]
+        return None
+
     def cc(self) -> list[str]:
         """A driver that compiles *and links* an ELF x86-64 shared object.
 
@@ -1039,23 +1089,27 @@ class LinuxTarget(Target):
                     or os.environ.get("TARGET_CC"))
         if override:
             return [*override.split(), "-shared", "-fPIC"]
-        zig = shutil.which("zig")
+        zig = self.zig_command()
         if zig:
-            major, minor = 2, 17
-            return [zig, "cc", "-target",
+            major, minor = self.GLIBC_TARGET
+            return [*zig, "cc", "-target",
                     f"x86_64-linux-gnu.{major}.{minor}", "-shared", "-fPIC"]
         _fail(
             "no C compiler that targets x86_64-unknown-linux-gnu.\n"
             "  Tried, in order: $CC_x86_64_unknown_linux_gnu, $TARGET_CC, `zig` "
-            "on PATH.\n"
+            "on PATH, and\n"
+            "  `<python> -m ziglang` -- the same order cargo-zigbuild uses, so "
+            "that whatever\n"
+            "  built the artefact also builds this stub.\n"
             "  Without one, the empty torch/lib/libtorch_global_deps.so would "
             "have to be built\n"
             "  by the host cc, which puts a Mach-O inside a Linux wheel and "
             "makes `import torch`\n"
             "  fail on Linux only (docs/VENDOR.md wall 1).\n"
-            "  Fix: install zig (docs/LINUX.md §2.5), or point "
-            "CC_x86_64_unknown_linux_gnu at a\n"
-            "  cross gcc such as x86_64-linux-gnu-gcc."
+            "  Fix: `pip install ziglang` into any interpreter on PATH "
+            "(docs/LINUX.md §9.1),\n"
+            "  or point CC_x86_64_unknown_linux_gnu at a cross gcc such as "
+            "x86_64-linux-gnu-gcc."
         )
 
     def check_image(self, data: bytes, what: str) -> None:
@@ -1079,6 +1133,129 @@ def _confirm_pep600_spelling(tag: str) -> None:
         _fail(f"{tag!r} claims glibc {major}.{minor}, below manylinux1's 2.5 -- "
               "no installer matches that")
     print(f"  tag {tag} is PEP 600-shaped (glibc {major}.{minor}, x86_64)")
+
+
+class WindowsTarget(Target):
+    """`win_amd64`, which is a name and not a derivation.
+
+    Every other target here computes a floor from something: Android and iOS
+    read a minimum OS out of the target CPython, Linux reads a glibc version out
+    of the artefact. **Windows has no floor to compute.** The tag is one of
+    three fixed strings (`win32`, `win_amd64`, `win_arm64`) and carries no
+    version at all; PE records a `MajorSubsystemVersion`, but no installer looks
+    at it and pip will hand a `win_amd64` wheel to any 64-bit Windows. So there
+    is nothing here to get subtly wrong, and correspondingly nothing this can
+    check about the tag beyond the architecture matching.
+
+    What it does check instead is the two things Windows *does* make decidable,
+    both in `check_image`: the image is a PE32+ x86-64 DLL, and -- in
+    `verify_windows.py` -- every symbol it imports is attributed to a named DLL
+    by the import table. That second one has no Linux counterpart
+    (docs/LINUX.md §6.1) and is as strong as the iOS device check.
+
+    Two structural differences from every other target, both forced by upstream
+    torch rather than chosen here:
+
+    * the member is `torch/_C.pyd`, not `torch/_C.abi3.so` -- `Target.extension_member`
+    * the wheel carries no global-deps library at all -- `Target.global_deps_name`
+    """
+
+    #: `python3.lib` is the abi3 import library: linking it is what makes the
+    #: extension bind to `python3.dll` (the stable-ABI forwarder) rather than to
+    #: `python313.dll`, and therefore what makes one file serve 3.13 and later.
+    #: `PYO3_CROSS_LIB_DIR` must point at the directory holding it.
+    ABI3_IMPORT_LIB = "python3.lib"
+
+    global_deps_name = None
+    extension_member = "torch/_C.pyd"
+
+    def __init__(self):
+        super().__init__(
+            "windows-x86_64", "x86_64-pc-windows-msvc",
+            TARGET_PYTHON_ROOT / "x86_64-pc-windows-msvc",
+            # cargo names a `cdylib` after the crate with no `lib` prefix on
+            # Windows, so this is `_C.dll` and not `lib_C.dll`.
+            "_C.dll",
+        )
+
+    rebuild_hint = (
+        "PYO3_CROSS_LIB_DIR=<target-python>/libs PYO3_CROSS_PYTHON_VERSION=3.13 "
+        "cargo xwin build --release --target x86_64-pc-windows-msvc, from "
+        "rust/torch_c (docs/WINDOWS.md §3 has the whole environment, including "
+        "the four MSVC tool shims §3.2 installs, which cargo-xwin needs and "
+        "this machine does not otherwise have)"
+    )
+
+    def sysconfig(self) -> dict[str, object]:
+        """Windows CPython ships no `_sysconfigdata_*.py`, and that is correct.
+
+        `sysconfig` only generates that file on POSIX; on Windows the values
+        come from `_init_non_posix`, which computes them from `sys.prefix` at
+        runtime. So the base class's reader cannot work here, and there is
+        nothing equivalent to read -- which is also why `platform_tag` derives
+        nothing from the interpreter.
+        """
+        _fail(
+            f"{self.python_root} is a Windows CPython, which ships no "
+            "_sysconfigdata_*.py --\n"
+            "  sysconfig generates that only on POSIX. Nothing in the Windows "
+            "tag needs it;\n"
+            "  `_check_distribution` checks the distribution by its files "
+            "instead."
+        )
+
+    def _check_distribution(self) -> None:
+        """Is this the distribution the extension was linked against?
+
+        Both files, not either: `python3.lib` is what the build linked and
+        `python3.dll` is what `verify_windows.py` resolves imports against, and
+        a distribution missing one of them fails in a different place.
+        """
+        for relative in (f"libs/{self.ABI3_IMPORT_LIB}", "python3.dll",
+                         "python313.dll"):
+            if not (self.python_root / relative).exists():
+                _fail(
+                    f"{self.python_root} has no {relative} -- it is not an "
+                    "x86-64 Windows CPython\n"
+                    "  distribution of the shape this target builds against "
+                    "(docs/WINDOWS.md §2)."
+                )
+
+    def platform_tag(self, artefact: bytes) -> str:
+        self._check_distribution()
+        tag = "win_amd64"
+        print("  tag is a fixed name, not a derivation -- Windows wheel tags "
+              "carry no OS version\n"
+              "      floor for either the interpreter or the artefact to supply")
+        imports = pe_imports(artefact) or {}
+        if "python3.dll" not in imports:
+            _fail(
+                f"{self.artefact} does not import from python3.dll "
+                f"(it imports from {sorted(imports) or 'nothing'}).\n"
+                "  An abi3 extension has to bind the stable-ABI forwarder; "
+                "binding python313.dll\n"
+                "  instead makes the wheel serve 3.13 alone while its abi3 tag "
+                "promises 3.13+.\n"
+                f"  Fix: link {self.ABI3_IMPORT_LIB}, not python313.lib."
+            )
+        print(f"  imports {len(imports['python3.dll'])} names from python3.dll "
+              "(the abi3 forwarder), so the\n"
+              f"      abi3 tag is about the file and not only about the build "
+              "flags")
+        _confirm_with_packaging(tag, "windows")
+        return tag
+
+    def cc(self) -> list[str]:            # pragma: no cover - never reached
+        _fail("the Windows wheel carries no global-deps library, so no C "
+              "compiler is needed for it (docs/WINDOWS.md §4.3)")
+
+    def check_image(self, data: bytes, what: str) -> None:
+        info = pe_info(data)
+        if info is None:
+            _fail(f"{what} is not a PE image ({describe(data)}) -- "
+                  "a Windows wheel cannot carry it")
+        if (info["bits"], info["machine"], info["dll"]) != (64, "x86_64", True):
+            _fail(f"{what} is {describe(data)}, expected PE32+ x86_64 dll")
 
 
 def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
@@ -1117,18 +1294,20 @@ TARGETS: dict[str, Target] = {
         IOSTarget("ios-arm64-sim", "aarch64-apple-ios-sim",
                   "arm64-iphonesimulator", "iphonesimulator", "iossimulator"),
         LinuxTarget(),
+        WindowsTarget(),
     )
 }
 
 #: Prefixes `verify` will accept as a cross tag. One entry per target family, so
 #: that adding a family and forgetting this is a build failure rather than a
 #: wheel tagged for one platform and checked as another.
-CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_")
+CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_", "win_")
 
 
 def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
             plat: str | None = None,
-            overrides: dict[str, bytes] | None = None) -> Path:
+            overrides: dict[str, bytes] | None = None,
+            renames: dict[str, str] | None = None) -> Path:
     """Rewrite the archive with `extra` added and RECORD regenerated.
 
     zipfile cannot delete or replace a member, so the whole archive is rebuilt.
@@ -1139,13 +1318,17 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
     `plat` forces the platform tag (cross builds know theirs; the host derives
     it below from the extension). `overrides` replaces the content of members
     that are already there -- which is how a cross wheel gets the cross `_C`
-    without the source tree ever holding it.
+    without the source tree ever holding it. `renames` moves a member, which
+    only Windows needs: its interpreter has no `.abi3.so` in
+    `_PyImport_DynLoadFiletab`, so the same bytes have to arrive as `_C.pyd`
+    (`Target.extension_member`).
     """
     tmp = wheel.with_suffix(".whl.tmp")
     record_name = f"{dist_info}/RECORD"
     wheel_name = f"{dist_info}/WHEEL"
     rows: list[tuple[str, str, str]] = []
     overrides = overrides or {}
+    renames = renames or {}
     old_plat = wheel.stem.split("-")[-1]
     new_plat: str | None = plat if plat and plat != old_plat else None
 
@@ -1168,7 +1351,7 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
     elif new_plat:
         print(f"  retag: {old_plat} -> {new_plat}")
 
-    unused = set(overrides) - set(zipfile.ZipFile(wheel).namelist())
+    unused = (set(overrides) | set(renames)) - set(zipfile.ZipFile(wheel).namelist())
     if unused:
         # An override that matches nothing is the wheel keeping its host
         # extension while everything else says it is a cross wheel -- silent,
@@ -1184,7 +1367,8 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
             data = overrides.get(item.filename) or src.read(item.filename)
             if item.filename.endswith("torch/_C.abi3.so"):
                 data = _fix_install_name(data)
-                item = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                name = renames.get(item.filename, item.filename)
+                item = zipfile.ZipInfo(name, date_time=item.date_time)
                 item.external_attr = 0o755 << 16
                 item.compress_type = zipfile.ZIP_DEFLATED
             elif item.filename == wheel_name and new_plat:
@@ -1268,6 +1452,17 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
     this file. The name changes too -- see `Target.global_deps_name`.
     """
     import tempfile
+
+    if target is not None and target.global_deps_name is None:
+        # Not "we could not build one" -- there is nothing for it to do. Said
+        # out loud, because a wheel silently missing this file is the exact
+        # failure this function exists to prevent on every other platform.
+        print("  + no torch/lib/ global-deps library: _load_global_deps() "
+              "returns immediately on\n"
+              "      Windows, and _load_dll_libraries() would LoadLibrary an "
+              "empty one for nothing\n"
+              "      (docs/WINDOWS.md §4.3)")
+        return {}
 
     if target is None:
         name = "libtorch_global_deps" + (
@@ -1353,6 +1548,13 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
 def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
     with zipfile.ZipFile(wheel) as zf:
         names = set(zf.namelist())
+        if target is not None and target.extension_member != Target.extension_member:
+            # The source tree always holds the host shim under the POSIX name;
+            # this target's wheel holds the same slot under another one. Rewrite
+            # the expectation rather than dropping it, so the member is still
+            # required -- just under the name that will actually be searched for.
+            expected = {target.extension_member if n == Target.extension_member
+                        else n for n in expected}
         missing = sorted(n for n in expected if n not in names)
         if missing:
             head = "\n".join("    " + m for m in missing[:20])
@@ -1378,20 +1580,40 @@ def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
         # the extra went in. This is the only place that looks at what is
         # actually in the file that will be published.
         plat = wheel.stem.split("-")[-1]
-        member = next(n for n in names if n.endswith("torch/_C.abi3.so"))
+        member = next(
+            (n for n in names if n.endswith(target.extension_member)), None)
+        if member is None:
+            _fail(f"{wheel.name} has no {target.extension_member} -- the "
+                  "extension is either missing or under a name this target's "
+                  "interpreter does not search")
         target.check_image(zf.read(member), f"{wheel.name}::{member}")
-        deps = f"torch/lib/{target.global_deps_name}"
-        if deps not in names:
-            _fail(f"{wheel.name} has no {deps}")
-        target.check_image(zf.read(deps), f"{wheel.name}::{deps}")
-        strays = sorted(
-            n for n in names
-            if n.startswith("torch/lib/libtorch_global_deps") and n != deps
-        )
-        if strays:
-            # `_load_global_deps` looks for exactly one name. A second one is a
-            # host artefact that came along for the ride.
-            _fail(f"{wheel.name} carries {strays} beside {deps}")
+        if target.extension_member != Target.extension_member:
+            # The rename is the whole point on Windows, so a wheel carrying both
+            # names is the rename half-applied and the interpreter finding the
+            # wrong file first.
+            stale = [n for n in names if n.endswith(Target.extension_member)]
+            if stale:
+                _fail(f"{wheel.name} carries {stale} as well as {member}")
+        if target.global_deps_name is None:
+            strays = sorted(
+                n for n in names
+                if n.startswith("torch/lib/libtorch_global_deps"))
+            if strays:
+                _fail(f"{wheel.name} carries {strays}, but this target loads no "
+                      "global-deps library at all (docs/WINDOWS.md §4.3)")
+        else:
+            deps = f"torch/lib/{target.global_deps_name}"
+            if deps not in names:
+                _fail(f"{wheel.name} has no {deps}")
+            target.check_image(zf.read(deps), f"{wheel.name}::{deps}")
+            strays = sorted(
+                n for n in names
+                if n.startswith("torch/lib/libtorch_global_deps") and n != deps
+            )
+            if strays:
+                # `_load_global_deps` looks for exactly one name. A second one is
+                # a host artefact that came along for the ride.
+                _fail(f"{wheel.name} carries {strays} beside {deps}")
         if not plat.startswith(CROSS_TAG_PREFIXES):
             _fail(f"{wheel.name} was built for {target.key} but is tagged "
                   f"{plat!r}, which is none of {CROSS_TAG_PREFIXES}")
@@ -1538,10 +1760,16 @@ def self_test_linux() -> int:
 
     What is real here and what is not, stated plainly: the ELF parsing, the
     glibc floor and the policy check run against genuine Linux x86-64 shared
-    objects that were built by somebody's real toolchain. **No artefact of this
-    crate is among them**, because none can be built on this machine (§
-    `LinuxTarget`, docs/LINUX.md §4). So this exercises the derivation, not the
-    wheel.
+    objects that were built by somebody's real toolchain. Cases 1-6 take those
+    out of the target CPython distribution, so they exercise the derivation and
+    not the wheel -- and they are circular in one respect, since the thing they
+    check is what this same parser read.
+
+    Case 7 is the one that is not. It runs on this crate's own cross-built
+    `lib_C.so` and asserts that the glibc version handed to `cargo zigbuild`
+    comes back out of the derivation, which is an input to another tool compared
+    against an output of this one. It only exists because the artefact became
+    buildable (docs/LINUX.md §9.2); before that it is skipped, loudly.
     """
     target = TARGETS["linux-x86_64"]
     root = target.python_root
@@ -1672,6 +1900,33 @@ def self_test_linux() -> int:
         f"got: {said[:200]!r}",
     ))
 
+    # 7. On our own artefact, if it has been cross-built: the glibc version
+    #    handed to `cargo zigbuild --target x86_64-unknown-linux-gnu.<v>` has to
+    #    be the one that comes back out of the derivation. This is the only case
+    #    here that is not circular -- every other one reads an ELF and checks
+    #    what this same code read out of it, while this one compares the *input*
+    #    given to a different tool against the *output* of the derivation. It
+    #    fails if zig ignored the requested version, if a dependency pulled in a
+    #    newer glibc symbol, or if GLIBC_TARGET drifted from the command in
+    #    docs/LINUX.md §9.2.
+    ours = target.artefact
+    if not ours.exists():
+        print("  ! case 7 skipped -- no cross-built lib_C.so "
+              f"({ours}).\n"
+              "    This is a SKIP, not a pass: the one non-circular case did "
+              "not run.\n"
+              f"    Build it with: {target.rebuild_hint}")
+    else:
+        want = f"manylinux_2_{target.GLIBC_TARGET[1]}_x86_64"
+        floor = target._glibc_floor(ours.read_bytes())
+        got = f"manylinux_{floor[0]}_{floor[1]}_x86_64"
+        checks.append((
+            f"our own lib_C.so derives {want}, the version zig was asked for",
+            got == want,
+            f"got {got}; either rebuild at {target.GLIBC_TARGET[0]}."
+            f"{target.GLIBC_TARGET[1]} or move GLIBC_TARGET to match",
+        ))
+
     bad = 0
     for label, ok, detail in checks:
         bad += not ok
@@ -1681,9 +1936,11 @@ def self_test_linux() -> int:
     if bad:
         print(f"LINUX SELF-TEST: FAIL -- {bad}/{len(checks)} wrong")
     else:
-        print(f"LINUX SELF-TEST: PASS -- {len(checks)}/{len(checks)} cases; "
-              "derivation exercised on real Linux ELF, no artefact of this "
-              "crate (none is buildable here)")
+        print(f"LINUX SELF-TEST: PASS -- {len(checks)}/{len(checks)} cases on "
+              "real Linux ELF"
+              + (", including this crate's own artefact"
+                 if ours.exists() else
+                 "; this crate's own artefact was NOT among them"))
     return bad
 
 
@@ -1748,6 +2005,12 @@ def main() -> None:
               f"({len(cross):,} B)\n      {describe(cross)}")
         plat = target.platform_tag(cross)
         overrides["torch/_C.abi3.so"] = cross
+    renames: dict[str, str] = {}
+    if target is not None and target.extension_member != Target.extension_member:
+        renames["torch/_C.abi3.so"] = target.extension_member
+        print(f"  member: torch/_C.abi3.so -> {target.extension_member} "
+              "(this interpreter's dynload table\n"
+              "      has no .abi3.so in it)")
 
     args.outdir.mkdir(parents=True, exist_ok=True)
     wheel = run_pip_wheel(args.python, args.outdir)
@@ -1755,7 +2018,7 @@ def main() -> None:
     version = wheel.name.split("-")[1]
     extra = {**upstream_dist_info(version), **global_deps_stub(target)}
     wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
-                    plat=plat, overrides=overrides)
+                    plat=plat, overrides=overrides, renames=renames)
 
     expected: set[str] = set()
     for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
