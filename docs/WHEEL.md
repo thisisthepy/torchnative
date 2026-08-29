@@ -32,15 +32,20 @@ PyPI 의 `torchnative 0.0.1a0` 은 **껍데기**입니다. 열어 보면 `torchn
 |---|---|---|---|---|
 | `cp313-abi3-macosx_11_0_arm64` | 13,287,413 B | 56.9 MB | 3,509,008 B | **계산됨** — 깨끗한 venv (§2) |
 | `cp313-abi3-android_21_arm64_v8a` | 13,623,651 B | 58.2 MB | 4,821,448 B | **계산됨** — 에뮬레이터 (§7.3) |
-| `cp313-abi3-ios_12_0_arm64_iphoneos` | 13,313,090 B | 57.1 MB | 3,618,000 B | **아티팩트까지** (§7.4) |
-| `cp313-abi3-ios_14_0_arm64_iphonesimulator` | 13,270,683 B | 56.9 MB | 3,476,720 B | **아티팩트까지** (§7.4) |
+| `cp313-abi3-ios_12_0_arm64_iphoneos` | 13,313,090 B | 57.1 MB | 3,618,000 B | **링크 해결까지** — 미해결 심볼 0/222 (§7.4.1). 로드·임포트·계산은 실기 필요 |
+| `cp313-abi3-ios_14_0_arm64_iphonesimulator` | 13,270,683 B | 56.9 MB | 3,476,720 B | **계산됨** — 시뮬레이터 (§7.4, `docs/IOS.md`) |
+
+*(이 표의 바이트 수는 2026-08-28 회차의 것입니다. 2026-08-29 재빌드에서는 엔트리 2,687 개,
+휠 13.5 MB, iOS 실기 `_C` 4,160,720 B 로 커졌습니다 — 그 사이 `rust/torch_c` 에 착지한 것들
+때문입니다. 네 번째 휠(안드로이드)을 이 회차에 다시 만들지 않아 표 전체를 갱신하지 않았습니다.)*
 
 기존 검증은 그대로입니다 — shim 테스트 **168/168**, 골든 하네스 **2702/2702, ops=118**.
 둘 다 이 작업 전후로 같은 값이고, 종료 코드로 판정했습니다.
 
-**아직 안 되는 것**: iOS 휠이 로드·임포트·계산되는지는 **측정하지 않았습니다** (§7.0).
-안드로이드는 `_multiprocessing` 스텁이 여전히 필요한데, 휠이 아니라 안드로이드 CPython
-배포본의 성질입니다 (§7.3.2).
+**아직 안 되는 것**: iOS **실기** 휠이 로드·임포트·계산되는지는 **측정하지 않았습니다**
+(§7.0). 시뮬레이터 쪽은 채워졌고(§7.4), 실기 쪽은 **링크가 풀리는 것까지** 확인됐습니다
+(§7.4.1) — 그 위는 기기가 있어야 합니다. 안드로이드는 `_multiprocessing` 스텁이 여전히
+필요한데, 휠이 아니라 안드로이드 CPython 배포본의 성질입니다 (§7.3.2).
 
 ---
 
@@ -71,6 +76,7 @@ python tools/wheel/verify.py dist/torchnative-*macosx*.whl   # 진짜 되는지 
 | | 왜 |
 |---|---|
 | **preflight** | 벤더링 트리와 `_C` 가 없으면 **빌드를 거부**한다. 둘 다 `.gitignore` 라서 새 클론에는 없고, 그 상태로 setuptools 를 돌리면 **PyPI 에 있는 그 껍데기가 다시 나온다**. 조용히 실패하면 안 되는 지점이다. `--target` 을 줘도 이 검사는 **그대로 돕니다** — 크로스 산출물은 그 위에 얹는 *추가* 요구사항이지 대체가 아니다 |
+| **신선도** | 담을 `_C` 가 **지금 디스크에 있는 소스로 빌드된 것인지** 확인하고, 아니면 이름을 대고 거부한다. 호스트와 크로스 양쪽 다. `preflight` 가 *존재*만 묻던 자리인데, 5 일 묵은 산출물도 그 질문에는 똑같이 답한다 — 실제로 그렇게 통과한 적이 있다 (§11) |
 | **global-deps 스텁** | `torch/lib/libtorch_global_deps.{dylib,so}` 를 빈 라이브러리로 만들어 넣는다. **타깃의 컴파일러로** 만들고, 만든 것이 정말 그 플랫폼인지 확인한다 (§3.2 · §7.4) |
 | **retag** | 호스트: `universal2` → `arm64`, setuptools 는 확장의 실제 아키텍처를 보지 않는다 (§3.3). 크로스: PEP 738/730 태그를 타깃 CPython 에서 유도한다 (§7.2) |
 | **install name** | cargo 가 박아 넣은 빌드 머신 절대경로를 `@rpath/_C.abi3.so` 로 바꾼다 (§3.4). 이미지 형식을 보고 판단하므로 ELF(안드로이드)에는 걸지 않는다 |
@@ -436,26 +442,33 @@ TensorBase._is_zerotensor
 
 ### 7.0 어디까지 확인됐는가
 
-| | 빌드됨 | 설치됨 | 임포트됨 | 계산됨 |
-|---|---|---|---|---|
-| `macosx_11_0_arm64` | ✅ | ✅ 깨끗한 venv 에 `pip install` (§2) | ✅ | ✅ `aten.mm`, `nn.Linear` |
-| `android_21_arm64_v8a` | ✅ | ✅ **에뮬레이터의 site-packages 에 언팩** (§7.3) | ✅ | ✅ `aten.mm`, `nn.Linear` |
-| `ios_12_0_arm64_iphoneos` | ✅ | ❌ 실기 없음 | ❌ | ❌ |
-| `ios_14_0_arm64_iphonesimulator` | ✅ | ✅ **시뮬레이터 CPython 의 site-packages 에 언팩** (§7.4) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+| | 빌드됨 | 심볼 해결됨 | 설치됨 | 임포트됨 | 계산됨 |
+|---|---|---|---|---|---|
+| `macosx_11_0_arm64` | ✅ | ✅ (설치돼서 돌았으므로) | ✅ 깨끗한 venv 에 `pip install` (§2) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+| `android_21_arm64_v8a` | ✅ | ✅ (설치돼서 돌았으므로) | ✅ **에뮬레이터의 site-packages 에 언팩** (§7.3) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+| `ios_12_0_arm64_iphoneos` | ✅ | ✅ **222/222 정적 대조** (§7.4.1) | ❌ 실기 없음 | ❌ | ❌ |
+| `ios_14_0_arm64_iphonesimulator` | ✅ | ✅ | ✅ **시뮬레이터 CPython 의 site-packages 에 언팩** (§7.4) | ✅ | ✅ `aten.mm`, `nn.Linear` |
+
+**"심볼 해결됨" 칸을 새로 나눴습니다** (2026-08-29). 앞의 셋에서는 이 칸이 뒤 칸들에 흡수돼
+있었지만 — 임포트됐다면 심볼은 당연히 풀린 것이므로 — **실기 칸에서는 이것만 따로 답할 수
+있고, 실제로 답이 나옵니다.** 나누지 않으면 그 답을 적을 자리가 없습니다.
 
 **시뮬레이터 칸은 채워졌습니다** (2026-08-28). `tools/wheel/verify_ios_sim.py` 가 시뮬레이터
 안에서 휠을 임포트하고 계산시키며, 값이 호스트와 정확히 일치합니다. 전체 기록은
 **`docs/IOS.md`** 에 있습니다.
 
-**실기(`ios_12_0_arm64_iphoneos`)에 대해 이 문서가 주장하는 것은 여전히 "아티팩트가 맞다"
-까지입니다** — 태그가 설치기가 매칭할 형태이고, 안의 바이너리가 진짜 그 플랫폼용이고,
-`Python.framework` 를 링크한다는 것. **로드·임포트·계산은 측정하지 않았습니다.**
+**실기(`ios_12_0_arm64_iphoneos`)의 로드·임포트·계산은 여전히 측정하지 않았습니다.** 다만
+"아티팩트가 맞다" 에서 멈춰 있던 것이 한 칸 나아갔습니다 — 기기 산출물이 링크하는
+`Python.framework` 의 심볼 118 개와 SDK 시스템 라이브러리의 104 개, 합쳐 **222 개 전부가 각자
+묶여 있는 그 라이브러리에서 실제로 export 된다**는 것을 확인했습니다 (§7.4.1,
+`tools/wheel/verify_ios_device.py`).
 
-**그리고 시뮬레이터 결과가 실기 칸을 채워 주지 않습니다.** 둘은 Mach-O
+**그래도 시뮬레이터 결과가 실기 칸을 채워 주지는 않습니다.** 둘은 Mach-O
 `LC_BUILD_VERSION.platform` 이 7 과 2 로 다른 별개 아티팩트이고, 링크 방식마저 다릅니다 —
 실기 쪽만 `Python.framework` 를 링크하고 시뮬레이터 쪽은 `-undefined dynamic_lookup` 으로
 해소합니다(§7.1). 서로 다른 메커니즘이라 한쪽의 성공이 다른 쪽의 근거가 되지 않습니다
-(`docs/IOS.md` §7).
+(`docs/IOS.md` §7). **§7.4.1 이 하는 것은 시뮬레이터 결과를 실기로 옮기는 것이 아니라, 실기
+쪽 메커니즘을 그 자체로 검사하는 것입니다.**
 
 빈 칸을 채우는 방법은 §7.6 에 적어 두었습니다.
 
@@ -668,9 +681,53 @@ torchnative-0.0.1a0-cp313-abi3-ios_12_0_arm64_iphoneos.whl
 | `ext suffix` | `.abi3.so` 라는 문자열이 그 배포본의 `Python.framework/Python` 안에 실제로 있습니다. CPython 의 `_PyImport_DynLoadFiletab` 이 `{SOABI 접미사, ".abi3.so", SHLIB_SUFFIX}` 이고 그 상수들이 인터프리터에 컴파일되어 들어가므로, **기기 없이 이 질문에 답할 수 있는 가장 강한 형태**입니다. 안드로이드 쪽은 기기에서 직접 목록을 찍은 측정이 따로 있습니다(`scripts/device_android.sh` 주석) |
 | `file list identical` | 트리가 하나도 빠지지 않았다는 것. 호스트 휠과 엔트리 집합이 정확히 같습니다 |
 
-**여기까지가 이 문서가 iOS 에 대해 주장하는 전부입니다.** "빌드된다" 는 판정이 아니라는 것을
-호스트 휠에서 배웠고, 그 교훈은 여기에도 그대로 적용됩니다 — 다만 지금은 판정할 수단이 없다는
-것이 답입니다.
+**"빌드된다" 는 판정이 아니라는 것을 호스트 휠에서 배웠고, 그 교훈은 여기에도 그대로
+적용됩니다.** 위 표는 2026-08-28 에 "판정할 수단이 없다" 로 끝났는데, 그것이 사실이 아니었던
+부분이 §7.4.1 입니다.
+
+#### 7.4.1 실기 휠 — 실행하지 않고 확인할 수 있는 것 (2026-08-29)
+
+`tools/wheel/verify_ios_device.py`. 전체 기록은 **`docs/IOS.md` §11** 에 있고, 여기에는
+판정만 적습니다.
+
+**실행은 여전히 불가능하고, 그것을 주장이 아니라 dyld 의 말로 확인했습니다.** 기기 슬라이스를
+시뮬레이터의 site-packages 에 넣으면 `incompatible platform (have 'iOS', need 'iOS-sim')`,
+macOS 에서 `dlopen` 하면 `(have 'iOS', need 'macOS')` 입니다. 도구는 후자를 **매 실행 첫 줄에
+찍습니다** — "심볼이 풀린다" 를 "돌아간다" 로 읽지 않게 하려고요.
+
+**그런데 두 슬라이스의 실질적 차이는 심볼을 푸는 방식 하나이고, 그것은 정적으로 답이 나옵니다.**
+
+```
+torch/_C.abi3.so   222 undefined
+  Accelerate     16  <- Accelerate.tbd  (iPhoneOS26.5.sdk)
+  Python        118  <- Python  (the device CPython distribution)
+  libSystem      88  <- libSystem.B.tbd  (iPhoneOS26.5.sdk)
+  unresolved      0
+```
+
+**합집합이 아니라 라이브러리별로 묻습니다.** `nm -m` 은 2단계 네임스페이스 이미지의 각 미해결
+심볼에 대해 **링커가 적어 둔 소속 라이브러리**를 알려 주므로, `_Py*` 심볼이 우연히 libSystem 에
+있어도 통과해 버리는 합집합 검사와 달리 dyld 가 실제로 보는 곳에 있는지를 묻습니다.
+
+그리고 **확장과 메타데이터를 빼면 두 iOS 휠은 바이트 단위로 같습니다** (공유 멤버 2,565 개, 차이
+0). 즉 `verify_ios_sim.py` 가 시뮬레이터 안에서 임포트한 벤더링 파이썬 트리가 실기 휠 안의
+그것과 같은 파일입니다. §7.4 가 말로 적어 둔 "파일 목록이 동일하다" 를 내용 비교로 바꾼 것입니다.
+
+**과장하지 않기 위해 도구가 사다리를 찍습니다.**
+
+```
+[yes] built · [yes] symbols resolved · [yes] same tree as the simulator wheel
+[NO ] installed · [NO ] imported · [NO ] computed
+```
+
+남는 것은 **런타임 로드**(dyld 가 실행 시점에 `@rpath/Python.framework/Python` 을 *찾는가* —
+앱에서는 `@executable_path/Frameworks` 로 해석됩니다), **코드 서명**, **`import torch` 완주**,
+**계산과 성능**입니다. 전부 실기가 있어야 합니다.
+
+도구는 다섯 가지로 스스로를 망가뜨려 보고 각각이 **올바른 종류의 답**으로 깨지는지 확인합니다
+(`--self-test`, 5/5). 특히 **"휠에 대한 발견"(`FAIL:`)과 "검사가 못 봄"(`CANNOT JUDGE:`)을
+섞지 않습니다** — 프레임워크를 엉뚱한 Mach-O 로 바꾸면 118 개 미해결로 `FAIL`, 프레임워크를
+아예 치우면 `CANNOT JUDGE` 입니다.
 
 또 하나 미결로 남는 것: iOS 앱은 App Store 규칙상 바이너리 모듈을 `.framework` 로 담아야 하고,
 PEP 730 휠 안의 `.so` 를 프레임워크로 바꾸는 것은 **앱 패키징 도구의 일**입니다(briefcase 가
@@ -709,7 +766,8 @@ Mach-O 의 `LC_BUILD_VERSION.platform` — **디스크에 다른 아티팩트가
 | 빈 칸 | 필요한 것 |
 |---|---|
 | ~~iOS 시뮬레이터 임포트~~ | **채워졌습니다** — `tools/wheel/verify_ios_sim.py`, `docs/IOS.md`. 앱 번들은 결국 필요 없었습니다: `Py_BytesMain` 으로 만든 최소 실행 파일을 `simctl spawn` 으로 돌리는 것으로 충분했고, 앱 번들보다 훨씬 쌉니다 |
-| iOS 실기 | 기기 · 프로비저닝 프로파일. 이 기계에 없습니다. 시뮬레이터 결과로 대신할 수 없습니다 (`docs/IOS.md` §7) |
+| ~~iOS 실기 **링크 해결**~~ | **채워졌습니다** — `tools/wheel/verify_ios_device.py`, §7.4.1, `docs/IOS.md` §11. 실기가 필요한 것은 *실행*이지 *대조*가 아니었습니다 |
+| iOS 실기 **로드·임포트·계산** | 기기 · 프로비저닝 프로파일. 이 기계에 없습니다. 시뮬레이터 결과로 대신할 수 없습니다 (`docs/IOS.md` §7). 심볼이 푸는 것은 필요조건이지 충분조건이 아닙니다 — dyld 가 실행 시점에 프레임워크를 *찾는* 것과 코드 서명이 남습니다 |
 | iOS 실제 앱 번들 경로 | `Python.framework` 를 `Embed & Sign` 으로 넣고 앱 프로세스가 스스로 `Py_Initialize` 를 부르는 형태. rpath 해석이 `@executable_path/Frameworks` 로 바뀝니다 |
 | Android `_multiprocessing` | 배포본 재빌드, 또는 상류 `torch/multiprocessing` 지연 임포트 |
 | `pip install` 로서의 안드로이드 설치 | 기기용 pip. 지금은 언팩으로 대신하고 있고, 그 차이를 §7.3 이 적어 두었습니다 |
@@ -829,3 +887,206 @@ $BPY tools/wheel/build.py                   ->  EXIT=0
 $BPY tools/wheel/verify.py dist/*macosx*    ->  EXIT=0,  PASS
 $BPY -m twine check dist/*.whl              ->  EXIT=0,  4/4 PASSED
 ```
+
+---
+
+## 11. 낡은 아티팩트가 어떻게 걸리는가 (2026-08-29)
+
+### 11.1 무엇이 일어났는가
+
+측정된 사실입니다.
+
+```
+CARGO_TARGET_DIR/release/lib_C.dylib                 2026-08-29 10:18   ← 그날
+CARGO_TARGET_DIR/aarch64-apple-ios/release/...       2026-08-25 02:53   ← 4 일 전
+CARGO_TARGET_DIR/aarch64-apple-ios-sim/release/...   2026-08-24 11:17   ← 5 일 전
+```
+
+`python tools/wheel/build.py --target ios-arm64-sim` 이 **exit 0 을 내면서 다시 빌드하지
+않았습니다.** 당연합니다 — `build.py` 는 크로스 산출물을 **만들지 않고**
+`CARGO_TARGET_DIR/<triple>/release/` 에서 **집어옵니다** (§7.1 이 cargo 를 먼저 돌리라고 적어
+둔 이유가 그것입니다). 그리고 `preflight` 는 벤더 트리와 호스트 `_C` 만 봤습니다.
+
+**결과는 5 일 묵은 소스로 만들어진 시뮬레이터 휠이었고, 그 사이 착지한 bf16 수정 · 스키마 ·
+분해 · dtype · 양자화 · linear · 골든이 하나도 들어 있지 않았습니다.** 그런데 검증은
+통과했습니다 — 태그도, 플랫폼 검사도, 파일 목록도, `verify_cross.py` 도, **아무것도 코드의
+나이를 보지 않기 때문입니다.** 알아챈 것은 실행 중 나온 에러 문구가 **현재 소스에 없는
+것**("overload resolution is not implemented")이었기 때문이고, 그것은 운입니다.
+
+### 11.2 무엇으로 판정하는가 — cargo 의 dep-info
+
+`build.py` 는 이제 담을 `_C` 가 **지금 디스크에 있는 소스로 빌드된 것인지** 확인합니다. 기준은
+여기에 적어 둔 glob 이 아니라 **cargo 가 산출물 옆에 써 둔 `lib_C.d`** 입니다.
+
+```
+$ cat $CARGO_TARGET_DIR/aarch64-apple-ios/release/lib_C.d
+.../aarch64-apple-ios/release/lib_C.dylib: .../build.rs .../src/aten.rs .../src/bootstrap.py
+  .../src/methods.json .../src/overloads.json .../src/surface.json ... (18 개)
+```
+
+그것을 고른 이유가 셋입니다.
+
+| | |
+|---|---|
+| **빌드가 실제로 읽은 것**이 적혀 있다 | 이 크레이트는 `src/methods.json` · `src/overloads.json` · `src/surface.json` · `src/bootstrap.py` 를 `include_str!` 합니다. 손으로 쓴 glob 이 그중 하나를 빠뜨리면 **그 파일의 변경에만 조용히 눈이 먼 검사**가 됩니다 |
+| **타깃별**이다 | 자기가 설명하는 산출물 바로 옆에 있으므로, 실기 답과 시뮬레이터 답이 섞일 수 없습니다 |
+| **절대경로**다 | 다른 체크아웃에서 빌드된 산출물이 보입니다. 소스 glob 은 이것을 **아예 볼 수 없습니다** — 이 트리의 mtime 을 남의 트리에서 나온 바이너리와 비교하고 최신이라고 답할 것입니다 |
+
+**바이트 비교가 아니라 mtime 인 이유.** `rust/torch_c/pytests/run.sh` 는 바이트를 비교하는데,
+그쪽은 **직접 빌드해서** 비교 기준이 손에 있고, 그래야 no-op 재빌드에서 헛경보가 나지 않기
+때문입니다. 여기서는 빌드하지 않기로 했으므로(§11.3) 비교할 대상이 없습니다. 남는 것은 mtime
+이고, 그것을 dep-info 에서 읽으면 **cargo 가 재빌드를 결정할 때 던지는 것과 같은 질문**이
+됩니다 — 여기서 새로 발명한 더 엄한 질문이 아니라. (확인함: 소스를 `touch` 하고 재빌드하면
+cargo 는 바이트 동일한 산출물을 내면서 mtime 을 갱신하므로, 헛경보가 나지 않습니다.)
+
+### 11.3 거절인가 재빌드인가 — 거절입니다
+
+`run.sh` 가 낡은 shim 을 발견했을 때 설치하지 않고 거절한 것과 같은 이유입니다.
+
+1. **여기서 빌드한다는 것은 크로스 빌드의 두 번째 철자를 적는다는 뜻입니다.** 실기 쪽은
+   `PYO3_CONFIG_FILE`(그 내용은 이 저장소가 아니라 §7.1 에 적혀 있습니다) ·
+   `PYO3_CROSS_LIB_DIR` · `TORCHNATIVE_PYTHON_FRAMEWORK_DIR` 이 필요하고, 안드로이드 쪽은
+   `scripts/device_android.sh build` 와 `cargo ndk --platform 21` 을 거칩니다. 두 번째 철자는
+   첫 번째와 어긋날 수 있고, **어긋난 것이 기기가 파일을 거절할 때까지 안 보이는 것**이 이
+   저장소가 반복해 온 결함의 종류입니다.
+2. **`build.py` 는 이미 산출물이 *없을* 때 거절하고 그 문서를 가리킵니다.** 낡음은 그 질문의
+   한 칸 안쪽이고, 다르게 답하면 "없는 것은 네 문제, 낡은 것은 내 문제" 가 됩니다.
+
+### 11.4 세 갈래를 다 시험했습니다
+
+**`cmp` 는 같음(0) · 다름(1) · 비교 실패(>1) 를 구분하고, 뒤의 둘을 합치면 검사가 자기 실패와
+검사 대상을 구분하지 못합니다.** `run.sh` 주석에 그 사고가 적혀 있습니다 — 동시 빌드의 메모리
+압박으로 커널이 `cmp` 를 SIGKILL 했고, 종료 코드 137 을 "다름" 으로 읽어 **멀쩡한 shim 을 낡았다고
+보고**했습니다.
+
+같은 함정이 여기에도 있고, 방향이 반대라 더 빠지기 쉽습니다. **빈 의존성 목록에 대한 `max()`
+는 던질 에러가 없습니다** — 그냥 "산출물보다 새로운 것이 없다" 고 답합니다. 즉 읽을 수 없거나,
+파싱할 수 없거나, 남의 체크아웃에서 온 dep-info 가 **`fresh` 로 읽힙니다.**
+
+그래서 답이 셋이고, **낡음을 주장하는 것은 그중 하나뿐입니다.**
+
+```
+$ $BPY tools/wheel/build.py --self-test
+SELF-TEST of the artefact freshness check (8 cases)
+  ok    fresh   current artefact
+  ok    stale   a prerequisite modified after the build
+  ok    unknown no dep-info at all
+  ok    unknown dep-info with no rule in it
+  ok    unknown dep-info describing a different artefact
+  ok    unknown rule with no prerequisites
+  ok    unknown a prerequisite that is gone
+  ok    unknown prerequisites from another checkout
+
+  1 staleness report(s), 6 'cannot judge', 1 clean -- and the two refusal texts
+  assert they are not each other
+SELF-TEST: PASS -- 8/8 cases answered as specified
+```
+
+self-test 는 **판정 문자열까지 맞춰 봅니다** — `stale` 메시지는 `is stale.` 을 담고
+`NOT a staleness report` 를 담지 않아야 하고, `unknown` 메시지는 그 반대여야 합니다. 검사가
+그 둘을 섞으면 self-test 가 깨집니다.
+
+### 11.5 배선이 실제로 발동하는지 확인했습니다
+
+self-test 는 함수를 시험하는 것이고, 그 함수가 **빌드 경로에 실제로 걸려 있는지**는 다른
+질문입니다. §11.1 의 상황을 그대로 재현했습니다 — 소스를 `touch` 하고, **호스트만 다시
+빌드**한 뒤 크로스 휠을 만들었습니다.
+
+```
+$ $BPY tools/wheel/build.py --target ios-arm64
+vendored torch 2.13.0 (2372 modules) + _C.abi3.so (4,047,888 B)
+  current: 18 recorded inputs, newest rust/torch_c/src/aten.rs, 0.0 h before it
+  current: torch/_C.abi3.so is byte-identical to lib_C.dylib
+tools/wheel/build.py: .../aarch64-apple-ios/release/lib_C.dylib is stale.
+  rust/torch_c/src/aten.rs was modified 0.2 h (554 s) after lib_C.dylib was written,
+  and it is one of the 18 inputs that build read.
+  ...
+  Fix: re-run the cross build for this target -- docs/WHEEL.md §7.1 has the exact
+  command (cargo build --release --target aarch64-apple-ios, with PYO3_CONFIG_FILE
+  and PYO3_CROSS_LIB_DIR, TORCHNATIVE_PYTHON_FRAMEWORK_DIR)   [EXIT=1]
+```
+
+**호스트 두 줄은 통과하고 크로스만 거절합니다.** 전부 거절하는 검사는 아무것도 구분하지 않는
+검사이므로, 이 비대칭이 확인 대상이었습니다.
+
+### 11.6 호스트도 같이 걸립니다 — 다만 질문이 두 겹입니다
+
+호스트 휠의 `_C` 는 `vendor/install_shim.sh` 가 `cargo build` 후 **복사한 사본**이고, 사본에는
+무엇이 만들었는지가 적혀 있지 않습니다. 그래서 두 겹으로 묻습니다.
+
+| | 어떻게 | 왜 그 방법인가 |
+|---|---|---|
+| cargo 산출물이 최신인가 | dep-info (§11.2) | 위와 같음 |
+| shim 이 **그** 산출물인가 | **바이트 비교** | `cp` 는 사본에 새 mtime 을 찍으므로 mtime 은 "더 새롭다" 고만 말하고 아무 의미가 없습니다. `run.sh` 가 벤더 shim 에 대해 하는 것과 같은 검사입니다 |
+
+`CARGO_TARGET_DIR` 아래에 호스트 산출물이 아예 없으면 **`CANNOT JUDGE` 로 거절합니다** — 다른
+`CARGO_TARGET_DIR` 로 shim 을 설치했을 수 있고, 그때 이 검사가 할 수 있는 정직한 답은 "모른다"
+이지 "낡았다" 가 아닙니다. 메시지가 그렇게 말하고 `CARGO_TARGET_DIR` 을 가리킵니다.
+
+크로스 경로에는 이 두 번째 겹이 필요 없습니다 — cargo 산출물을 **직접** 읽으므로 사이에 사본이
+없습니다.
+
+---
+
+## 12. 이 회차 (2026-08-29) — 만든 것 / 고친 것
+
+**결함 수정**
+
+- `tools/wheel/build.py` — **크로스 산출물의 나이를 아무도 보지 않던 것** (§11). 5 일 묵은
+  아티팩트가 exit 0 으로 휠에 들어가고 모든 검증을 통과했습니다. 호스트 shim 도 같은
+  구멍이었고 (§11.6) 함께 막았습니다
+
+**기능 추가**
+
+- `tools/wheel/build.py --self-test` — 신선도 판정의 8 개 사례. 빌드하지 않습니다 (§11.4)
+- `tools/wheel/verify_ios_device.py` — 기기 휠의 링크 해결 검사 + `--self-test` (5 개 오류
+  모드). `verify_ios_sim.py` 가 시뮬레이터에 대해 하는 것의 **기기판이 아니라**, 기기에서
+  *정적으로 답이 나오는 것*만 골라 답하는 도구입니다 (§7.4.1, `docs/IOS.md` §11)
+
+**측정 (새 사실)**
+
+- 기기 `_C.abi3.so` 의 미해결 심볼 **222 개가 전부 자기가 묶인 라이브러리에서 풀립니다** —
+  `Python.framework` 118, iOS SDK 104, 미해결 0
+- 기기/시뮬레이터 두 슬라이스는 **미해결 심볼의 성질이 다릅니다.** 시뮬레이터 쪽 118 개는
+  `dynamically looked up` 이고 기기 쪽은 `Python` 에 이름으로 묶여 있습니다. `docs/IOS.md` §7
+  의 "심볼도 같다" 는 서술을 이것으로 정정했습니다
+- 두 iOS 휠은 확장과 dist-info 를 빼면 **바이트 단위로 동일**합니다 (공유 2,565, 차이 0)
+- 기기 슬라이스는 시뮬레이터에서 `incompatible platform (have 'iOS', need 'iOS-sim')`,
+  macOS 에서 `(have 'iOS', need 'macOS')` — 실행 검증이 실기에서만 가능한 이유를 dyld 의
+  말로 확인했습니다
+
+**문서 정정**
+
+- `docs/IOS.md` §3 의 `len(dir(torch._C))` 가 1251 로 낡아 있었습니다. 재측정 1260 이고,
+  **호스트와 시뮬레이터가 여전히 같다**는 것이 그 표의 요지입니다
+- 이 문서 §7.0 의 판정표에 **"심볼 해결됨" 칸**을 나눴습니다. 앞의 세 휠에서는 뒤 칸에 흡수돼
+  있던 구분인데, 실기 칸에서만 따로 답이 나옵니다
+
+**손대지 않은 것**
+
+- `rust/torch_c/` · `tools/golden/` · `scripts/` · `vendor/` — 한 줄도
+- 업로드. 아무것도 PyPI 에 올리지 않았습니다
+
+**검증** (전부 종료 코드로 판정)
+
+```
+PYTHON=$PY sh rust/torch_c/pytests/run.sh              ->  EXIT=0,  ok 197
+$PY tools/golden/compare.py                            ->  EXIT=0,  2811/2811, ops=119
+$PY rust/torch_c/pytests/verify_schemas.py             ->  EXIT=0,  4203/4203
+$BPY tools/wheel/build.py --self-test                  ->  EXIT=0,  8/8
+$BPY tools/wheel/build.py                              ->  EXIT=0
+$BPY tools/wheel/build.py --target ios-arm64           ->  EXIT=0
+$BPY tools/wheel/build.py --target ios-arm64-sim       ->  EXIT=0
+$BPY tools/wheel/verify.py       dist/*macosx*         ->  EXIT=0,  PASS
+$BPY tools/wheel/verify_cross.py dist/*ios*  (2 개)     ->  EXIT=0,  PASS
+$BPY tools/wheel/verify_cross.py --self-test (2 개)     ->  EXIT=0,  9/9
+$PY  tools/wheel/verify_ios_sim.py    dist/*iphonesimulator*  ->  EXIT=0,  PASS
+$PY  tools/wheel/verify_ios_device.py dist/*iphoneos*         ->  EXIT=0,  PASS
+$PY  tools/wheel/verify_ios_device.py --self-test dist/*iphoneos*  ->  EXIT=0,  5/5
+```
+
+안드로이드는 이 회차에서 돌리지 않았습니다 — 이 worktree 의 `CARGO_TARGET_DIR` 에 안드로이드
+산출물을 만들지 않았습니다. **`build.py --target android-arm64-v8a` 를 실제로 돌려 확인한
+결과**는 신선도 검사가 아니라 그 앞 단계인 **기존의 "산출물이 없다" 거절**입니다 (EXIT=1).
+§11.3 의 2 번이 말하는 대칭이 그것입니다 — 없음과 낡음이 같은 자리에서 같은 문서를 가리킵니다.
+호스트 두 줄은 그 앞에서 통과했습니다.

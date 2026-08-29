@@ -19,6 +19,14 @@ What it does beyond `pip wheel .`:
               and setuptools would happily emit the empty shell again -- which
               is how the PyPI one came to exist. The failure has to be loud.
 
+  freshness   Refuse to build unless the `_C` about to be packaged was built
+              from the source on disk now, read off cargo's own dep-info. This
+              script does not *build* the cross artefacts -- it picks them up
+              from `CARGO_TARGET_DIR/<triple>/release/` -- and until 2026-08-29
+              nothing looked at their age, so a five-day-old extension shipped
+              with an exit code of 0 and passed every check downstream (§
+              `artefact_verdict`, docs/WHEEL.md §11).
+
   repack      Two fixes that have no setuptools spelling, applied to the
               finished archive (§ `_repack`):
                 - `torch-<v>.dist-info/` from upstream, so that
@@ -52,7 +60,13 @@ Then check it for real -- building is not the proof:
 
     python tools/wheel/verify.py dist/<host wheel>        # installs it
     python tools/wheel/verify_cross.py dist/<cross wheel> # inspects it
-    python tools/wheel/verify_android.py dist/<android wheel>   # imports it
+    python tools/wheel/verify_android.py dist/<android wheel>    # imports it
+    python tools/wheel/verify_ios_sim.py dist/<ios sim wheel>    # imports it
+    python tools/wheel/verify_ios_device.py dist/<ios device wheel>  # links it
+
+And check this script itself, which builds nothing and takes a second:
+
+    python tools/wheel/build.py --self-test
 """
 
 from __future__ import annotations
@@ -284,6 +298,295 @@ TARGET_PYTHON_ROOT = Path(os.environ.get(
 CARGO_TARGET_DIR = Path(os.environ.get(
     "CARGO_TARGET_DIR", REPO / "rust" / "torch_c" / "target"))
 
+CRATE = REPO / "rust" / "torch_c"
+
+# ------------------------------------------------------- artefact freshness
+#
+# The failure this exists to catch, measured 2026-08-29:
+#
+#     CARGO_TARGET_DIR/release/lib_C.dylib                 today
+#     CARGO_TARGET_DIR/aarch64-apple-ios/release/...       4 days old
+#     CARGO_TARGET_DIR/aarch64-apple-ios-sim/release/...   5 days old
+#
+# `build.py --target ios-arm64-sim` exited 0 and packaged the 5-day-old file.
+# It does not build the cross artefact -- it picks one up from
+# `CARGO_TARGET_DIR/<triple>/release/` -- and `preflight` looks only at the
+# vendored tree and the host `_C`. So a wheel got built, verified and *passed*
+# against source that had been superseded by a week of landed commits; the tell
+# was an error message quoting a phrase no longer in the tree.
+#
+# Refuse rather than rebuild, for the reason `rust/torch_c/pytests/run.sh`
+# refuses to install the shim it found stale:
+#
+#   * building here means writing down a second spelling of the cross build.
+#     The device one needs PYO3_CONFIG_FILE (whose contents live in
+#     docs/WHEEL.md §7.1, not in this repository), PYO3_CROSS_LIB_DIR and
+#     TORCHNATIVE_PYTHON_FRAMEWORK_DIR; the Android one goes through
+#     `scripts/device_android.sh build` and `cargo ndk --platform 21`. A second
+#     spelling can drift from the first, and this repository's whole class of
+#     recurring defect is a drift that is invisible until a device refuses the
+#     file.
+#   * this script already refuses when the artefact is *absent*, and points at
+#     those same docs. Staleness is that question one notch further in;
+#     answering it differently would mean "missing is your problem, stale is
+#     mine".
+#
+# The criterion is cargo's own dep-info file (`lib_C.d`, next to the artefact),
+# not a glob written here. That matters three ways:
+#
+#   * it lists what the build actually read, `include_str!` included -- this
+#     crate pulls in `src/methods.json`, `src/overloads.json`, `src/surface.json`
+#     and `src/bootstrap.py`, and a hand-written glob that missed one would be
+#     silently blind to changes in it;
+#   * it is per-target, sitting beside the artefact it describes, so the device
+#     and simulator answers cannot be confused for each other;
+#   * it records *absolute* paths, so an artefact built from a different
+#     checkout is visible. A source glob cannot see that at all -- it would
+#     compare this tree's mtimes against a binary built somewhere else and call
+#     it fresh.
+#
+# `run.sh` compares bytes rather than mtimes, and deliberately: it *builds*, so
+# it has a fresh reference, and a byte compare does not nag when a rebuild
+# reproduces the previous output. Here there is nothing to compare against
+# without building, which is what was just ruled out. mtime is what remains --
+# and reading it off the dep-info makes it the same question cargo asks when it
+# decides whether to rebuild, rather than a stricter one invented here.
+#
+# Three outcomes, kept apart. `run.sh` learned this from `cmp`, which
+# distinguishes same (0), different (1) and "the comparison itself failed"
+# (>1); folding the last into the middle once produced a staleness report about
+# an artefact that was current. The same trap is here in the other direction and
+# is the easier one to fall into: `max()` over an empty dependency list has no
+# error to report, it just answers "nothing is newer than the artefact" -- so an
+# unreadable, unparseable or foreign dep-info would read as *fresh*. Every path
+# out of `artefact_verdict` therefore names which of the three it is, and only
+# one of them is a staleness claim.
+
+FRESH, STALE, UNKNOWN = "fresh", "stale", "unknown"
+
+
+def _unescape_make(path: str) -> str:
+    r"""Undo the `\ ` that cargo writes for a space inside a path."""
+    return re.sub(r"\\(.)", r"\1", path)
+
+
+def _make_rules(text: str) -> list[tuple[str, list[str]]]:
+    r"""Split a Makefile-format dep-info into `(target, prerequisites)`.
+
+    Only the shape cargo emits is handled: one rule per line, no line
+    continuations, spaces inside paths escaped with a backslash. A line without
+    an unescaped `:` is not a rule and is skipped -- cargo writes bare
+    `<dep>:` lines in some configurations and those carry no information here.
+    """
+    rules: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        # First unescaped colon that is not `C:\...`; cargo writes POSIX paths
+        # on this platform, so the drive-letter case cannot arise, but the scan
+        # is written to skip escaped colons regardless.
+        idx = -1
+        i = 0
+        while i < len(line):
+            if line[i] == "\\":
+                i += 2
+                continue
+            if line[i] == ":":
+                idx = i
+                break
+            i += 1
+        if idx < 0:
+            continue
+        target = _unescape_make(line[:idx].strip())
+        rest = line[idx + 1:]
+        deps = [_unescape_make(tok)
+                for tok in re.split(r"(?<!\\)\s+", rest.strip()) if tok]
+        rules.append((target, deps))
+    return rules
+
+
+def artefact_verdict(artefact: Path) -> tuple[str, str]:
+    """Was `artefact` built from the source that is on disk now?
+
+    Returns `(FRESH | STALE | UNKNOWN, detail)`. `UNKNOWN` is never a staleness
+    claim -- it means the question could not be answered, and the detail says
+    why. See the block comment above for why the three are kept apart.
+    """
+    dep_file = artefact.with_suffix(".d")
+    if not dep_file.exists():
+        return UNKNOWN, (
+            f"cargo wrote no dep-info beside it ({dep_file} does not exist), so "
+            "what that build read is not recorded anywhere")
+    try:
+        text = dep_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return UNKNOWN, f"{dep_file} could not be read: {exc!r}"
+
+    rules = _make_rules(text)
+    if not rules:
+        return UNKNOWN, f"{dep_file} holds no Makefile rule this can read"
+
+    want = os.path.realpath(artefact)
+    deps: list[str] | None = None
+    for target, prerequisites in rules:
+        if os.path.realpath(target) == want:
+            deps = prerequisites
+            break
+    if deps is None:  # a target dir moved after the build; match on the name
+        for target, prerequisites in rules:
+            if os.path.basename(target) == artefact.name:
+                deps = prerequisites
+                break
+    if deps is None:
+        return UNKNOWN, (
+            f"{dep_file} describes {[t for t, _ in rules][:3]}, none of which is "
+            f"{artefact} -- it is some other build's record")
+    if not deps:
+        return UNKNOWN, (
+            f"{dep_file} names {artefact.name} but lists no inputs, so there is "
+            "nothing to compare it against")
+
+    # Absolute paths from the machine that built it. If they are not inside this
+    # crate then the artefact came out of a different checkout, and comparing it
+    # against *this* tree's mtimes would answer a question nobody asked.
+    crate = os.path.realpath(CRATE)
+    foreign = [d for d in deps if not os.path.realpath(d).startswith(crate + os.sep)]
+    if foreign:
+        return UNKNOWN, (
+            f"the build read {len(foreign)} input(s) from outside {CRATE}, e.g. "
+            f"{foreign[0]} -- this artefact was built from a different checkout, "
+            "so its age relative to this one says nothing")
+
+    try:
+        artefact_ns = artefact.stat().st_mtime_ns
+    except OSError as exc:
+        return UNKNOWN, f"{artefact} could not be stat'ed: {exc!r}"
+
+    newest: tuple[int, str] | None = None
+    for dep in deps:
+        try:
+            dep_ns = os.stat(dep).st_mtime_ns
+        except OSError as exc:
+            return UNKNOWN, (
+                f"the build read {dep}, which cannot be stat'ed now: {exc!r}. "
+                "Whether the artefact is current is therefore unknown")
+        if newest is None or dep_ns > newest[0]:
+            newest = (dep_ns, dep)
+
+    assert newest is not None  # `deps` is non-empty and every stat succeeded
+    if newest[0] > artefact_ns:
+        gap = (newest[0] - artefact_ns) / 1e9
+        return STALE, (
+            f"{os.path.relpath(newest[1], REPO)} was modified {gap / 3600:.1f} h "
+            f"({gap:.0f} s) after {artefact.name} was written, and it is one of "
+            f"the {len(deps)} inputs that build read")
+    gap = (artefact_ns - newest[0]) / 1e9
+    return FRESH, (
+        f"{len(deps)} recorded inputs, newest "
+        f"{os.path.relpath(newest[1], REPO)}, {gap / 3600:.1f} h before it")
+
+
+def _render_refusal(verdict: str, artefact: Path, detail: str,
+                    rebuild_hint: str) -> str:
+    """The text a reader gets. Separate from `require_current` so the self-test
+    can check that a staleness report and a "cannot judge" read as different
+    things, which is the whole reason the two verdicts exist."""
+    if verdict == STALE:
+        return (
+            f"{artefact} is stale.\n"
+            f"  {detail}.\n"
+            "  Packaging it would put superseded machine code in the wheel, and\n"
+            "  everything downstream -- the tag, the platform check, the file\n"
+            "  list, verify_cross.py -- would pass, because none of them looks at\n"
+            "  the age of the code. That has happened: a simulator wheel was built\n"
+            "  and verified against source five days out of date, and the tell was\n"
+            "  an error message quoting a phrase no longer in the tree.\n"
+            f"  Fix: {rebuild_hint}"
+        )
+    return (
+        f"cannot tell whether {artefact} is current.\n"
+        f"  {detail}.\n"
+        "  This is NOT a staleness report -- the artefact may well be fine. It is\n"
+        "  the check failing to run, which is reported separately so that it is\n"
+        "  never mistaken for a finding about the artefact.\n"
+        f"  Fix: {rebuild_hint}, which writes the dep-info this reads."
+    )
+
+
+def require_current(artefact: Path, rebuild_hint: str) -> None:
+    """`_fail` unless `artefact` was built from the source now on disk."""
+    verdict, detail = artefact_verdict(artefact)
+    if verdict == FRESH:
+        print(f"  current: {detail}")
+        return
+    _fail(_render_refusal(verdict, artefact, detail, rebuild_hint))
+
+
+HOST_REBUILD_HINT = "bash vendor/install_shim.sh"
+
+
+def check_host_shim() -> None:
+    """The host wheel's `_C` is a *copy*; check the thing it was copied from.
+
+    `preflight` establishes that `torch/_C.abi3.so` exists. It cannot establish
+    that it is current, because the file carries no record of what built it --
+    `vendor/install_shim.sh` runs `cargo build --release` and then `cp`s the
+    result into the vendored tree, and nothing ties the copy back to its source
+    afterwards.
+
+    So the question is asked in two halves, which is what
+    `rust/torch_c/pytests/run.sh` already does for its own reasons: is the host
+    cargo artefact current (dep-info), and is the shim that same artefact
+    (bytes). Both have to hold. Bytes rather than mtime for the second half for
+    run.sh's reason -- `cp` sets a fresh mtime on the copy, so mtime would say
+    "newer" and mean nothing.
+
+    The cross path does not need this second half: it reads the cargo artefact
+    directly, so there is no copy in between.
+    """
+    host = None
+    for name in ("lib_C.dylib", "lib_C.so"):
+        candidate = CARGO_TARGET_DIR / "release" / name
+        if candidate.exists():
+            host = candidate
+            break
+    if host is None:
+        _fail(
+            "cannot tell whether the host _C.abi3.so is current.\n"
+            f"  There is no lib_C.dylib or lib_C.so under {CARGO_TARGET_DIR}/"
+            "release,\n"
+            "  so the build it was copied from is not on this machine to compare\n"
+            "  against. This is NOT a staleness report -- the shim may be fine.\n"
+            "  CARGO_TARGET_DIR selects where to look; if the shim was installed\n"
+            "  with a different one, set it to that.\n"
+            f"  Fix: {HOST_REBUILD_HINT}"
+        )
+    require_current(host, HOST_REBUILD_HINT)
+
+    try:
+        installed = SHIM.read_bytes()
+        built = host.read_bytes()
+    except OSError as exc:
+        _fail(
+            f"cannot tell whether {SHIM} is the artefact {host} holds.\n"
+            f"  Reading one of them failed: {exc!r}.\n"
+            "  This is NOT a staleness report -- it is the comparison itself\n"
+            "  failing, and the two are kept apart on purpose (see run.sh, where\n"
+            "  a SIGKILLed `cmp` once got reported as a stale shim).\n"
+            f"  Fix: retry; if it persists, {HOST_REBUILD_HINT}"
+        )
+    if installed != built:
+        _fail(
+            f"{SHIM} is not the artefact under {CARGO_TARGET_DIR}/release.\n"
+            f"  {len(installed):,} B installed vs {len(built):,} B built.\n"
+            "  install_shim.sh copies one to the other, so they differ only if\n"
+            "  the crate has been rebuilt since -- meaning the wheel would carry\n"
+            "  the older of the two, silently.\n"
+            f"  Fix: {HOST_REBUILD_HINT}"
+        )
+    print(f"  current: torch/_C.abi3.so is byte-identical to {host.name}")
+
+
 # NDK ABI names, keyed by the architecture half of CPython's `MULTIARCH`. This
 # is the NDK's own mapping (developer.android.com/ndk/guides/abis), not a guess;
 # `packaging.tags.android_platforms` normalises the hyphen to an underscore and
@@ -339,6 +642,10 @@ class Target:
     # swallows it into `_preload_cuda_deps`, and the import fails somewhere else.
     global_deps_name = "libtorch_global_deps.so"
 
+    # How to produce this artefact. Named rather than run -- see the freshness
+    # block comment for why this script refuses instead of rebuilding.
+    rebuild_hint = "rebuild the cross artefact"
+
     def sysconfig(self) -> dict[str, object]:
         return target_sysconfig(self.python_root)
 
@@ -376,6 +683,8 @@ class AndroidTarget(Target):
             "android-arm64-v8a", "aarch64-linux-android",
             TARGET_PYTHON_ROOT / "aarch64-linux-android" / "prefix", "lib_C.so",
         )
+
+    rebuild_hint = "scripts/device_android.sh build"
 
     def _api_and_abi(self) -> tuple[int, str]:
         variables = self.sysconfig()
@@ -437,6 +746,13 @@ class IOSTarget(Target):
                          "lib_C.dylib")
         self.sdk = sdk
         self.platform_id = platform_id
+        self.rebuild_hint = (
+            "re-run the cross build for this target -- docs/WHEEL.md §7.1 has "
+            f"the exact command (cargo build --release --target {rust_target}, "
+            "with PYO3_CONFIG_FILE and PYO3_CROSS_LIB_DIR"
+            + (", TORCHNATIVE_PYTHON_FRAMEWORK_DIR"
+               if platform_id == "ios" else "")
+            + ")")
 
     def _multiarch_and_min(self) -> tuple[str, tuple[int, int]]:
         variables = self.sysconfig()
@@ -815,6 +1131,108 @@ def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
                   f"{plat!r}")
 
 
+def self_test() -> None:
+    """Drive `artefact_verdict` through all three of its answers.
+
+    A freshness check has one way to be useless and it is not being wrong: it
+    is answering "fresh" for a reason that has nothing to do with the artefact.
+    Six of the eight cases below are the check *failing to run*, and each has to
+    come back `unknown` rather than `fresh` -- particularly `no inputs listed`,
+    where `max()` over an empty list has no error to raise and would simply
+    conclude that nothing is newer than the artefact.
+
+    Costs no build: the artefact is a scratch file with a chosen mtime and the
+    dep-info is written by hand. The prerequisites are real files under
+    `rust/torch_c`, because the containment rule is one of the things under
+    test.
+    """
+    import tempfile
+
+    real = sorted(str(p) for p in (CRATE / "src").glob("*.rs"))
+    if len(real) < 2:
+        _fail(f"self-test needs source files under {CRATE / 'src'}; found {real}")
+    hour = 3600 * 10**9
+
+    cases: list[tuple[str, str, str]] = []   # (label, expected, fragment)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+
+        def scenario(name: str, dep_text: str | None, *, artefact_age_h: float
+                     ) -> tuple[str, str]:
+            art = tmpdir / f"{name}.dylib"
+            art.write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 60)
+            when = art.stat().st_mtime_ns - int(artefact_age_h * hour)
+            os.utime(art, ns=(when, when))
+            dep = art.with_suffix(".d")
+            if dep_text is not None:
+                dep.write_text(dep_text.replace("@ART@", str(art)))
+            return artefact_verdict(art)
+
+        checks: list[tuple[str, str, str, str | None, float]] = [
+            # label, expected verdict, expected phrase, dep-info, artefact age
+            ("current artefact", FRESH, "recorded inputs",
+             "@ART@: " + " ".join(real[:2]), 0.0),
+            ("a prerequisite modified after the build", STALE,
+             "was modified", "@ART@: " + " ".join(real[:2]), 48.0),
+            ("no dep-info at all", UNKNOWN, "does not exist", None, 0.0),
+            ("dep-info with no rule in it", UNKNOWN, "no Makefile rule",
+             "not a makefile\njust prose\n", 0.0),
+            ("dep-info describing a different artefact", UNKNOWN,
+             "some other build's record",
+             "/elsewhere/lib_Other.dylib: " + real[0], 0.0),
+            ("rule with no prerequisites", UNKNOWN, "lists no inputs",
+             "@ART@:", 0.0),
+            ("a prerequisite that is gone", UNKNOWN, "cannot be stat'ed now",
+             f"@ART@: {CRATE}/src/deleted_by_the_test.rs", 0.0),
+            ("prerequisites from another checkout", UNKNOWN,
+             "different checkout",
+             "@ART@: /some/other/worktree/rust/torch_c/src/lib.rs", 0.0),
+        ]
+
+        print(f"SELF-TEST of the artefact freshness check ({len(checks)} cases)")
+        bad = 0
+        for i, (label, expected, phrase, dep_text, age) in enumerate(checks):
+            verdict, detail = scenario(f"case{i}", dep_text, artefact_age_h=age)
+            ok = verdict == expected and phrase in detail
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}{verdict:<8}{label}")
+            if not ok:
+                print(f"          expected {expected} containing {phrase!r}")
+                print(f"          got      {verdict}: {detail}")
+            cases.append((label, verdict, detail))
+
+    # The verdict is internal; what reaches a reader is the refusal message. The
+    # trap this shape exists to avoid is a check reporting its own failure as a
+    # finding about the artefact, so assert on the rendered text of both kinds
+    # -- a `stale` message has to make the staleness claim and an `unknown` one
+    # has to disclaim it, in so many words.
+    counts = {FRESH: 0, STALE: 0, UNKNOWN: 0}
+    for _, verdict, _ in cases:
+        counts[verdict] += 1
+    if not (counts[STALE] and counts[UNKNOWN] and counts[FRESH]):
+        _fail(f"SELF-TEST: the cases do not reach all three verdicts: {counts}")
+    for verdict, phrase, must_not in (
+        (STALE, "is stale.", "NOT a staleness report"),
+        (UNKNOWN, "This is NOT a staleness report", "is stale."),
+    ):
+        for label, got, detail in cases:
+            if got != verdict:
+                continue
+            rendered = _render_refusal(verdict, Path("/scratch/x.dylib"), detail,
+                                       "REBUILD-HINT")
+            if phrase not in rendered or must_not in rendered:
+                _fail(f"SELF-TEST: the {verdict} message for {label!r} does not "
+                      f"read as one -- it must contain {phrase!r} and must not "
+                      f"contain {must_not!r}:\n{rendered}")
+    print(f"\n  {counts[STALE]} staleness report(s), "
+          f"{counts[UNKNOWN]} 'cannot judge', {counts[FRESH]} clean -- and the "
+          "two refusal texts assert they are not each other")
+    if bad:
+        sys.exit(f"SELF-TEST: FAIL -- {bad}/{len(cases)} cases answered wrongly")
+    print(f"SELF-TEST: PASS -- {len(cases)}/{len(cases)} cases answered as "
+          "specified")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
@@ -823,7 +1241,14 @@ def main() -> None:
     ap.add_argument("--target", default="host",
                     choices=["host", *sorted(TARGETS)],
                     help="cross target; default is this machine")
+    ap.add_argument("--self-test", action="store_true",
+                    help="exercise the artefact freshness check and exit; "
+                         "builds nothing")
     args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
 
     target = None if args.target == "host" else TARGETS[args.target]
 
@@ -835,6 +1260,12 @@ def main() -> None:
     print(f"vendored torch {stamp.get('version', '?')} "
           f"({stamp.get('py_modules', '?')} modules) + _C.abi3.so "
           f"({SHIM.stat().st_size:,} B)")
+
+    # Every build packages the host shim -- a cross build overrides the member
+    # afterwards, but `pip wheel` still walks the source tree to get there, and
+    # `verify` compares the archive against that same tree. So the host artefact
+    # is checked on both paths, exactly as `preflight` is.
+    check_host_shim()
 
     overrides: dict[str, bytes] = {}
     plat: str | None = None
@@ -848,6 +1279,9 @@ def main() -> None:
                 "  CARGO_TARGET_DIR is currently "
                 f"{CARGO_TARGET_DIR}"
             )
+        # Existence was the only question this asked until 2026-08-29, and a
+        # five-day-old artefact answers it just as well as a current one.
+        require_current(target.artefact, target.rebuild_hint)
         cross = target.artefact.read_bytes()
         target.check_artefact(cross)
         print(f"target {target.key}: {target.artefact.name} "
