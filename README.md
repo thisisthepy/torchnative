@@ -191,19 +191,19 @@ only exists on a platform. Every ✅ has a run behind it.
 | | macOS<br>arm64 | Android<br>arm64 | iOS<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
-| rust target installed | ✅ | ✅ | ✅ | ✅ | 🔲 | ✅ |
+| rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | 🔲 |
-| candle builds | ✅ | ✅ | ✅ | 🔲 | 🔲 | ✅ |
-| candle **computes** | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | ✅ *under Node* |
-| extension builds | ✅ | ✅ | ✅ | ❌ *needs a C driver* | 🔲 | ✅ *emscripten* |
-| wheel builds | ✅ | ✅ | ✅ | ⚠️ *target wired, artefact missing* | 🔲 | ❌ *WASI has no `dlopen`* |
-| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF has no two-level namespace* | 🔲 | ⚠️ *stubs, not errors* |
+| candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| candle **computes** | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
+| extension builds | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
+| wheel builds | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
+| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ⚠️ *stubs, not errors* |
 | `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
-| `import torch` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
-| computes | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 |
+| installs | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
+| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
+| computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
 | **on PyPI `0.0.2a0`** | ✅ | ✅ | ✅ | — | — | — |
-| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ❌ |
+| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ✅ *Node* |
 
 The last row is why the columns differ. iOS, Linux and Windows have no runtime on this machine —
 no device, and no `docker`, `colima`, `podman`, `lima` or `qemu` — so the deepest rung any of them
