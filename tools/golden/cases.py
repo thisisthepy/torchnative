@@ -597,6 +597,396 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.matmul.default ------------------------------------------------------
+#
+# Landed in `_aten_implemented()` from `IMPLEMENTED_AWAITING_GOLDEN` alongside
+# this builder. docs/LINEAR.md's layout-fallback fix (`gemm_with_layout_fallback`,
+# skip the unconditional `.contiguous()` and copy only when candle refuses the
+# layout) and its N-D x 2-D fold (`batched_matmul`: stack the batch into rows
+# and run one 2-D GEMM instead of broadcasting the 2-D operand up to the
+# batch, which is what candle's own `broadcast_matmul` otherwise does) both
+# live inside this kernel, and it was the single most bit-changed kernel in
+# that change -- 48 of 507 bitprobe cases moved, 35 of those newly agreeing
+# with upstream torch, 0 regressed away from it -- while sitting in
+# `IMPLEMENTED_AWAITING_GOLDEN`, where the 2760-case golden suite never ran
+# it at all (docs/LINEAR.md §4.3).
+#
+# The cases below are picked to land on exactly the axes docs/LINEAR.md names
+# as touched:
+#   * rank combinations -- the fold only fires when the right operand is 2-D
+#     and the left has more dimensions; every other combination still goes
+#     through `broadcast_matmul`, so both branches need cases.
+#   * a transposed-view operand (`t(weight)`) -- the literal shape
+#     `bootstrap.py::linear` hands the kernel for every one of the 211
+#     `F.linear` calls in one SmolLM2-135M forward pass (docs/LINEAR.md §1).
+#   * a non-transpose strided operand and a swapped-batch-axis 4-D operand --
+#     both are layouts Accelerate's `MatMul` refuses outright
+#     (`MatMulUnexpectedStriding`/`ab_skip`, docs/LINEAR.md §2) and only reach
+#     a correct answer through the copy-on-refusal fallback.
+#   * broadcasting batch dimensions -- the shape `bmm_cases` above proves
+#     `bmm` itself must refuse, but `matmul`'s own kernel (`broadcast_matmul`)
+#     is exactly what has to compute it.
+#
+# The dtype split is `mm`'s, for `mm`'s reason: the multiply is candle's
+# `matmul`, which has no integral or (unwidened) bf16/f16 kernel of its own.
+#
+# **Why the fold/transpose/strided/batch-swap cases below use `_gemm_lcg`
+# noise instead of `list(range(...))`, and `_exact_value_check` instead of
+# the default tolerance pipeline.** Measured directly (deleting the fold
+# branch and, separately, forcing `gemm_with_layout_fallback` to copy
+# unconditionally, then re-running against real upstream torch): with
+# `list(range(...))`-style small-integer data, sums of exact integers round
+# to the same bits regardless of which order candle adds them in, so a fold
+# vs. broadcast (or copy vs. no-copy) difference is invisible no matter the
+# shape -- confirmed up to real model scale (`(1,6,576) x t((49152,576))`,
+# the literal `lm_head` call). With noisy `_gemm_lcg` floats it reappears,
+# but **only below a reduction-depth threshold measured between k=256 and
+# k=300 on this host** (Apple M1, Accelerate) -- above that, Accelerate's
+# `sgemm` apparently converges on the same blocked summation order
+# regardless of how the call arrived, and below it, it does not. Every case
+# below that needs to catch a fold/layout regression therefore uses `k` at
+# or under the toy shapes already in this file (k=3-4), which is deliberately
+# smaller than `_matmul_model_case`'s k=512 rows -- those stay on
+# `_gemm_scale_check`'s tolerance-bound because a real implementation is not
+# expected to be bit-exact with upstream at that depth (`mm_cases`' own
+# model-scale rows document the same k=1024 boundary). And the difference
+# this produces is 1-2 ULP (~1e-7 on float32 magnitude-1 values), well under
+# the default pipeline's `rtol=1e-5` -- so `_exact_value_check` is not
+# decoration here, it is the only comparator that can see it.
+_MATMUL_MATCH_DTYPES = _MM_MATCH_DTYPES
+_MATMUL_C_ERROR_DTYPES = _MM_C_ERROR_DTYPES
+
+
+def _matmul_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, b_flat, b_shape, expect="match", note="", value_check=None):
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, b_shape, dtype_name)
+    name = f"matmul(dtype={dtype_name}, a_shape={a_shape}, b_shape={b_shape}) [{note or 'plain'}]"
+    return Case(
+        name=name,
+        op="aten.matmul.default",
+        run_torch=lambda: torch_call(a_t, b_t),
+        run_c=lambda: c_module._aten_dispatch("aten.matmul.default", a_c, b_c),
+        expect=expect,
+        note=note,
+        value_check=value_check,
+    )
+
+
+def _matmul_transposed_rhs_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, w_flat, w_shape, note="", value_check=None):
+    """The right operand fed in as `t(...)` -- exactly the view
+    `bootstrap.py::linear`'s `_t(weight)` produces (`aten.t.default`, never
+    materialised) before handing it to this op. `w_shape` names the shape
+    *before* the transpose; the case multiplies against its transpose."""
+    op = "aten.matmul.default"
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    wbase_t, wbase_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+    w_t = wbase_t.t()
+    w_c = c_module._aten_dispatch("aten.t.default", wbase_c)
+    out_w_shape = (w_shape[1], w_shape[0])
+    return Case(
+        name=f"matmul(dtype={dtype_name}, a_shape={a_shape}, w_shape={w_shape} transposed view -> {out_w_shape}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, w_t),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, w_c),
+        note=note,
+        value_check=value_check,
+    )
+
+
+def _matmul_transposed_lhs_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, w_flat, w_shape, note="", value_check=None):
+    """The mirror image of `_matmul_transposed_rhs_case`: the *left* operand
+    is the transposed view. `bootstrap.py::linear` never produces this shape,
+    but `gemm_with_layout_fallback` treats both operands identically, so it
+    is worth one direct check rather than trusting symmetry."""
+    op = "aten.matmul.default"
+    abase_t, abase_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+    a_t = abase_t.t()
+    a_c = c_module._aten_dispatch("aten.t.default", abase_c)
+    out_a_shape = (a_shape[1], a_shape[0])
+    return Case(
+        name=f"matmul(dtype={dtype_name}, a_shape={a_shape} transposed view -> {out_a_shape}, w_shape={w_shape}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, w_t),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, w_c),
+        note=note,
+        value_check=value_check,
+    )
+
+
+def _matmul_model_case(torch_module, c_module, torch_call, dtype_name, batch, m, k, n, transpose_w, note):
+    """Model-scale, checked against the scale-aware GEMM bound (`_gemm_scale_check`)
+    rather than a flat tolerance -- see the long note above it. `transpose_w`
+    reproduces the exact `(activation 3-D) x t(weight)` shape `F.linear` passes."""
+    op = "aten.matmul.default"
+    a_flat = _gemm_lcg(batch * m * k, 101)
+    a_shape = (batch, m, k)
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+    if transpose_w:
+        w_flat = _gemm_lcg(n * k, 102)
+        wbase_t, wbase_c = pair_from_flat(torch_module, c_module, w_flat, (n, k), dtype_name)
+        w_t = wbase_t.t()
+        w_c = c_module._aten_dispatch("aten.t.default", wbase_c)
+        w_note = f"({n},{k}) transposed view -> ({k},{n})"
+    else:
+        w_flat = _gemm_lcg(k * n, 102)
+        w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, (k, n), dtype_name)
+        w_note = f"({k},{n})"
+    return Case(
+        name=f"matmul(dtype={dtype_name}, {a_shape}x{w_note}) [model-scale, k={k}: {note}]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, w_t),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, w_c),
+        note=note,
+        value_check=_gemm_scale_check(dtype_name, k),
+    )
+
+
+def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+
+    # -- rank combinations. Only "left rank > 2, right rank == 2" folds
+    # (`batched_matmul`'s first branch); everything else, including left
+    # rank == right rank == 2, goes through `gemm_with_layout_fallback` +
+    # candle's `broadcast_matmul`. Both branches get the full dtype sweep on
+    # at least one shape apiece.
+    square = [1.0, 2.0, 3.0, 4.0]
+    square_b = [5.0, 6.0, 7.0, 8.0]  # torch.mm([[1,2],[3,4]],[[5,6],[7,8]]) == [[19,22],[43,50]]
+    for dtype_name in _MATMUL_MATCH_DTYPES:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, dtype_name,
+                        square, (2, 2), square_b, (2, 2),
+                        note="2D x 2D -- rank equal, NOT the fold branch, known 2x2 answer")
+        )
+
+    # Noisy (not small-integer) data and a bit-exact check -- see the long
+    # note above `_MATMUL_MATCH_DTYPES` on why: at this depth (k=4), folding
+    # the batch into rows and running one GEMM is not always bit-identical to
+    # candle's own broadcast-and-batch path, and only noise plus an exact
+    # comparator can see that.
+    fold_a, fold_a_shape = _gemm_lcg(24, 11), (2, 3, 4)
+    fold_w, fold_w_shape = _gemm_lcg(20, 12), (4, 5)
+    for dtype_name in _MATMUL_MATCH_DTYPES:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, dtype_name,
+                        fold_a, fold_a_shape, fold_w, fold_w_shape,
+                        note="3D x 2D, batch=2 -- the fold branch (batched_matmul's first arm)",
+                        value_check=_exact_value_check)
+        )
+
+    # batch=1 is the literal shape every one of the 211 `F.linear` calls in a
+    # SmolLM2-135M forward pass takes (docs/LINEAR.md §1's table) -- the fold
+    # branch still fires (rank 3 > rank 2), but this is worth its own case
+    # because a kernel that special-cased "batch of one" differently from
+    # "batch of several" would only be caught here.
+    b1_a, b1_a_shape = _gemm_lcg(24, 13), (1, 6, 4)
+    for dtype_name in _MATMUL_MATCH_DTYPES:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, dtype_name,
+                        b1_a, b1_a_shape, fold_w, fold_w_shape,
+                        note="3D x 2D, batch=1 -- F.linear's own activation rank, still folds",
+                        value_check=_exact_value_check)
+        )
+
+    batch3_a, batch3_a_shape = list(range(24)), (2, 3, 4)
+    batch3_b, batch3_b_shape = list(range(40)), (2, 4, 5)
+    for dtype_name in _MATMUL_MATCH_DTYPES:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, dtype_name,
+                        batch3_a, batch3_a_shape, batch3_b, batch3_b_shape,
+                        note="3D x 3D, matching batch -- broadcast_matmul, not the fold")
+        )
+
+    # Broadcasting batch dimensions -- `broadcast_matmul` must do this even
+    # though `bmm_cases` proves `aten.bmm.default` must refuse the identical
+    # shapes (its own "batch 1 x batch 2" case above).
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "float32",
+                    list(range(12)), (1, 3, 4), batch3_b, batch3_b_shape,
+                    note="3D x 3D, batch broadcasts 1 -> 2 -- broadcast_matmul's own job, "
+                         "the shape bmm_cases proves bmm must refuse")
+    )
+
+    # Rank 4, both branches. The fold row reuses the noisy/exact treatment
+    # above -- it is the same fold branch, one rank higher.
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "float32",
+                    _gemm_lcg(48, 14), (2, 2, 3, 4), fold_w, fold_w_shape,
+                    note="4D x 2D -- the fold branch at rank 4",
+                    value_check=_exact_value_check)
+    )
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "float32",
+                    list(range(48)), (2, 2, 3, 4), batch3_b, batch3_b_shape,
+                    note="4D x 3D -- broadcast_matmul broadcasts the (2,) batch3 leading dim "
+                         "against 4D's leading (2,2)")
+    )
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "float32",
+                    list(range(48)), (2, 2, 3, 4), list(range(80)), (2, 2, 4, 5),
+                    note="4D x 4D, matching batch")
+    )
+
+    # -- a transposed-view operand, dtype-swept -- the actual `F.linear`
+    # shape, and the case docs/LINEAR.md's fold-rule change is really about.
+    # Noisy data + `_exact_value_check` again (see the note above
+    # `_MATMUL_MATCH_DTYPES`): this is the strongest of the fold/layout
+    # cases, since it exercises the fold branch *and* a non-contiguous
+    # operand together. bf16/f16 are included on purpose even though
+    # docs/LINEAR.md §4.1 measured that the layout fallback is a no-op for
+    # them (`opmath_in`'s widening to float32 already materialises a
+    # contiguous tensor, so the transposed view never survives to
+    # `gemm_with_layout_fallback`) -- that is a claim this suite should
+    # stand behind with a passing case, not just a doc comment.
+    tw_base, tw_base_shape = _gemm_lcg(20, 15), (5, 4)  # transposes to (4, 5)
+    for dtype_name in _MATMUL_MATCH_DTYPES:
+        cases.append(
+            _matmul_transposed_rhs_case(torch_module, c_module, torch_call, dtype_name,
+                                        b1_a, b1_a_shape, tw_base, tw_base_shape,
+                                        note="rhs = t(weight), batch=1 activation -- F.linear's exact shape",
+                                        value_check=_exact_value_check)
+        )
+        cases.append(
+            _matmul_transposed_rhs_case(torch_module, c_module, torch_call, dtype_name,
+                                        _gemm_lcg(72, 16), (3, 6, 4), tw_base, tw_base_shape,
+                                        note="rhs = t(weight), batch=3 activation",
+                                        value_check=_exact_value_check)
+        )
+    cases.append(
+        _matmul_transposed_lhs_case(torch_module, c_module, torch_call, "float32",
+                                    _gemm_lcg(12, 17), (4, 3), fold_w, fold_w_shape,
+                                    note="lhs is the transposed view instead -- gemm_with_layout_fallback "
+                                         "treats both operands the same, checked directly rather than "
+                                         "assumed symmetric",
+                                    value_check=_exact_value_check)
+    )
+
+    # -- a genuinely strided (non-transpose) operand: a column-strided slice,
+    # which Accelerate's MatMul refuses outright (MatMulUnexpectedStriding,
+    # docs/LINEAR.md §2) and only a correct answer comes back through the
+    # copy-on-refusal fallback in `gemm_with_layout_fallback`. Noisy data +
+    # exact check, same reasoning.
+    strided_base_t, strided_base_c = pair_from_flat(torch_module, c_module, _gemm_lcg(64, 18), (4, 16), "float32")
+    strided_t = strided_base_t[:, ::2]
+    strided_c = c_module._aten_dispatch("aten.slice.Tensor", strided_base_c, 1, 0, 16, 2)
+    sw_t, sw_c = pair_from_flat(torch_module, c_module, _gemm_lcg(40, 19), (8, 5), "float32")
+    cases.append(
+        Case(
+            name="matmul(dtype=float32, a_shape=(4,16) sliced [:, ::2] -> (4,8) strided, w_shape=(8,5))",
+            op="aten.matmul.default",
+            run_torch=lambda: torch_call(strided_t, sw_t),
+            run_c=lambda: c_module._aten_dispatch("aten.matmul.default", strided_c, sw_c),
+            note="a non-transpose strided operand -- Accelerate's MatMul refuses this layout "
+                 "outright; only the copy-on-refusal fallback answers correctly",
+            value_check=_exact_value_check,
+        )
+    )
+
+    # -- a swapped-batch-axis 4-D operand: candle's shared `MatMul::ab_skip`
+    # needs the batch strides in one of four recognised shapes and refuses a
+    # swapped pair, reachable only at rank 4+ (docs/LINEAR.md §2). Noisy
+    # data + exact check, same reasoning.
+    swap_base_t, swap_base_c = pair_from_flat(torch_module, c_module, _gemm_lcg(120, 20), (2, 3, 4, 5), "float32")
+    swap_t = swap_base_t.transpose(0, 1)
+    swap_c = c_module._aten_dispatch("aten.transpose.int", swap_base_c, 0, 1)
+    swap_rhs_t, swap_rhs_c = pair_from_flat(torch_module, c_module, _gemm_lcg(180, 21), (3, 2, 5, 6), "float32")
+    cases.append(
+        Case(
+            name="matmul(dtype=float32, a_shape=(2,3,4,5) transpose(0,1) -> (3,2,4,5) swapped-batch-axis, w_shape=(3,2,5,6))",
+            op="aten.matmul.default",
+            run_torch=lambda: torch_call(swap_t, swap_rhs_t),
+            run_c=lambda: c_module._aten_dispatch("aten.matmul.default", swap_c, swap_rhs_c),
+            note="swapped batch axes at rank 4 -- ab_skip refuses this batch stride shape "
+                 "outright; only the copy-on-refusal fallback answers correctly",
+            value_check=_exact_value_check,
+        )
+    )
+
+    # -- the inherited candle gap: no matmul kernel for the integral dtypes,
+    # exactly as aten.mm.default/aten.bmm.default/aten.addmm.default already
+    # record.
+    for dtype_name in _MATMUL_C_ERROR_DTYPES:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, dtype_name,
+                        [1, 2, 3, 4], (2, 2), [1, 0, 0, 1], (2, 2), expect="c_error",
+                        note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU matmul does. "
+                             "Same gap aten.mm.default already carries.")
+        )
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "uint32",
+                    [1, 2, 3, 4], (2, 2), [1, 0, 0, 1], (2, 2), expect="both_error",
+                    note="torch: NotImplementedError (\"addmm_impl_cpu_\" not implemented for 'UInt32'); "
+                         "_C: candle has no matmul kernel for U32 either.")
+    )
+
+    # dtype mismatch -- torch and the shim both refuse, with different words
+    # (measured): torch raises "expected m1 and m2 to have the same dtype,
+    # but got: float != double"; the shim's same_dtype refuses with its own
+    # NotImplementedError. expect="both_error" only requires both refuse.
+    f32_mm_t, f32_mm_c = pair_from_flat(torch_module, c_module, [1.0] * 4, (2, 2), "float32")
+    f64_mm_t, f64_mm_c = pair_from_flat(torch_module, c_module, [1.0] * 4, (2, 2), "float64")
+    cases.append(
+        Case(
+            name="matmul(float32 x float64 rejected on both sides)",
+            op="aten.matmul.default",
+            run_torch=lambda: torch_call(f32_mm_t, f64_mm_t),
+            run_c=lambda: c_module._aten_dispatch("aten.matmul.default", f32_mm_c, f64_mm_c),
+            expect="both_error",
+            note="torch: 'expected m1 and m2 to have the same dtype, but got: float != double'; "
+                 "_C: same_dtype refuses with its own message -- expect=both_error only needs both "
+                 "to refuse, not to agree on wording.",
+        )
+    )
+
+    # -- 1-D operands. torch's `matmul` has real vector rules (dot product,
+    # matrix-vector, batched matrix-vector, all with the extra dimension
+    # prepended/appended and then squeezed back out); this shim's
+    # `matmul_default` refuses any operand under rank 2 outright rather than
+    # guess at rules that were never measured (its own doc comment says so).
+    # torch computes in every one of these; the shim refuses -- a real,
+    # documented capability gap, not a shape error, hence expect="c_error"
+    # rather than "both_error".
+    for a_flat, a_shape, b_flat, b_shape, note in [
+        ([1.0, 2.0, 3.0, 4.0], (4,), [1.0, 2.0, 3.0, 4.0], (4,), "1D x 1D -- dot product"),
+        ([1.0, 2.0, 3.0], (3,), list(range(1, 13)), (3, 4), "1D x 2D -- vector-matrix"),
+        (list(range(1, 13)), (4, 3), [1.0, 2.0, 3.0], (3,), "2D x 1D -- matrix-vector"),
+        (list(range(1, 25)), (2, 4, 3), [1.0, 2.0, 3.0], (3,), "3D x 1D -- batched matrix-vector"),
+        ([1.0, 2.0, 3.0], (3,), list(range(1, 25)), (2, 3, 4), "1D x 3D -- vector broadcast into a batch"),
+    ]:
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, "float32",
+                        a_flat, a_shape, b_flat, b_shape, expect="c_error",
+                        note=f"{note}; torch computes it, the shim's own doc comment says its "
+                             "1-D vector rules were never measured and refuses unconditionally")
+        )
+
+    # -- model scale, checked against the scale-aware GEMM bound rather than a
+    # flat tolerance (see `_gemm_scale_check`'s note). The transposed-view row
+    # is the one that matters most: it is `(activation) x t(weight)` at the
+    # depth (512) where mm_cases' own model-scale rows stop agreeing with
+    # torch bitwise, so it is the strongest single check that the fold and
+    # the layout fallback are both still computing the right numbers once
+    # accumulation actually has somewhere to go wrong.
+    cases.append(
+        _matmul_model_case(torch_module, c_module, torch_call, "float32", 4, 8, 512, 8,
+                           transpose_w=False,
+                           note="contiguous weight, fold path -- gate/up_proj's depth")
+    )
+    cases.append(
+        _matmul_model_case(torch_module, c_module, torch_call, "float32", 4, 8, 512, 8,
+                           transpose_w=True,
+                           note="t(weight) view, fold path -- the exact shape F.linear passes")
+    )
+    cases.append(
+        _matmul_model_case(torch_module, c_module, torch_call, "float16", 1, 6, 512, 8,
+                           transpose_w=True,
+                           note="float16, batch=1 -- the accumulation-dtype question at F.linear's "
+                                "own batch size")
+    )
+
+    return cases
+
+
 # --- pre-seeded case builders for ops rust/torch_c does not implement yet --
 #
 # docs/C_SURFACE.md traced a small Llama forward+generate() against real
@@ -5156,10 +5546,65 @@ def _addmm_case(
     )
 
 
+def _addmm_t_case(
+    torch_module, c_module, torch_call, dtype_name,
+    self_flat, self_shape, m1_flat, m1_shape, w_flat, w_shape, note="",
+) -> Case:
+    """`mat2` fed in as `t(weight)` -- `bootstrap.py::linear`'s bias branch is
+    literally `dispatch("aten.addmm.default", bias, input, _t(weight))`
+    (docs/LINEAR.md §1), and `addmm_default` reaches the same
+    `gemm_with_layout_fallback` `matmul_default` does, so this is the same
+    fix exercised through the other kernel it landed in. `w_shape` names the
+    shape *before* the transpose."""
+    op = "aten.addmm.default"
+    s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+    a_t, a_c = pair_from_flat(torch_module, c_module, m1_flat, m1_shape, dtype_name)
+    wbase_t, wbase_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+    w_t = wbase_t.t()
+    w_c = c_module._aten_dispatch("aten.t.default", wbase_c)
+    out_w_shape = (w_shape[1], w_shape[0])
+    return Case(
+        name=f"addmm(dtype={dtype_name}, self={self_shape}, {m1_shape}x{w_shape} transposed view -> {out_w_shape}) [{note}]",
+        op=op,
+        run_torch=lambda: torch_call(s_t, a_t, w_t),
+        run_c=lambda: c_module._aten_dispatch(op, s_c, a_c, w_c),
+        note=note,
+    )
+
+
+def _addmm_t_model_case(torch_module, c_module, torch_call, dtype_name, m, k, n, note) -> Case:
+    """Model-scale sibling of `_addmm_t_case`, checked against the
+    scale-aware GEMM bound (`_gemm_scale_check`) the way `_big_gemm_case`'s
+    other rows are -- this is `nn.Linear(bias=True)` at a real depth, with
+    `mat2` the transposed weight view it actually receives."""
+    op = "aten.addmm.default"
+    a_flat = _gemm_lcg(m * k, 201)
+    w_flat = _gemm_lcg(n * k, 202)  # base shape (n, k), transposed -> (k, n)
+    bias_flat = _gemm_lcg(n, 203)
+    a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, (m, k), dtype_name)
+    wbase_t, wbase_c = pair_from_flat(torch_module, c_module, w_flat, (n, k), dtype_name)
+    w_t = wbase_t.t()
+    w_c = c_module._aten_dispatch("aten.t.default", wbase_c)
+    bias_t, bias_c = pair_from_flat(torch_module, c_module, bias_flat, (n,), dtype_name)
+    return Case(
+        name=f"addmm(dtype={dtype_name}, self=({n},), ({m},{k})x({n},{k}) transposed view -> ({k},{n})) [model-scale, k={k}: {note}]",
+        op=op,
+        run_torch=lambda: torch_call(bias_t, a_t, w_t),
+        run_c=lambda: c_module._aten_dispatch(op, bias_c, a_c, w_c),
+        note=note,
+        value_check=_gemm_scale_check(dtype_name, k),
+    )
+
+
 # (3x2) @ (2x3) -> (3x3); the product is [[1,2,8],[3,4,18],[5,6,28]].
 _ADDMM_M1 = ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2))
 _ADDMM_M2 = ([1.0, 0.0, 2.0, 0.0, 1.0, 3.0], (2, 3))
 _ADDMM_SELF = ([1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0], (3, 3))
+# transpose(_ADDMM_W_BASE) == _ADDMM_M2 exactly (content, not just shape):
+# [[1,0],[0,1],[2,3]].t() == [[1,0,2],[0,1,3]] -- so the transposed-view
+# cases below are hand-checkable against the same known 3x3 answer the plain
+# "self + mat1 @ mat2" scenario above already pins.
+_ADDMM_W_BASE = ([1.0, 0.0, 0.0, 1.0, 2.0, 3.0], (3, 2))
 
 
 def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -5318,6 +5763,32 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
             _big_gemm_case(torch_module, c_module, torch_call, "aten.addmm.default",
                            dtype_name, m, k, n, with_bias=True, note=note)
         )
+
+    # `mat2` fed in as `t(weight)` -- the view nn.Linear(bias=True) actually
+    # passes (docs/LINEAR.md §1). Dtype-swept and hand-checkable: same
+    # numbers as the "plain" scenario above, since transpose(_ADDMM_W_BASE)
+    # == _ADDMM_M2.
+    for dtype_name in _MM_MATCH_DTYPES:
+        cases.append(
+            _addmm_t_case(
+                torch_module, c_module, torch_call, dtype_name,
+                *_ADDMM_SELF, *_ADDMM_M1, *_ADDMM_W_BASE,
+                note="mat2 = t(weight) -- the view nn.Linear(bias=True) actually passes",
+            )
+        )
+    # ...and at model scale, alongside the contiguous-mat2 rows above.
+    cases.append(
+        _addmm_t_model_case(
+            torch_module, c_module, torch_call, "float32", 8, 512, 8,
+            note="t(weight) view, nn.Linear(512, 8) bias=True at the real shape",
+        )
+    )
+    cases.append(
+        _addmm_t_model_case(
+            torch_module, c_module, torch_call, "float16", 8, 512, 8,
+            note="t(weight) view, float16 accumulation-dtype question",
+        )
+    )
     return cases
 
 
@@ -9140,4 +9611,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.masked_select.default": masked_select_cases,
     "aten.min.default": min_default_cases,
     "aten.unbind.int": unbind_int_cases,
+    # docs/LINEAR.md: the layout-fallback fix + N-D x 2-D fold, and the case
+    # builder that moves this op from IMPLEMENTED_AWAITING_GOLDEN into the
+    # 2760-case golden suite (docs/LINEAR.md §4.3, §6 item 2).
+    "aten.matmul.default": matmul_cases,
 }
