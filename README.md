@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/torchnative?color=blue)](https://pypi.org/project/torchnative/)
 [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-lightgrey)](#install)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS-lightgrey)](#install)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 
 </div>
@@ -71,9 +71,14 @@ out = model.generate(**tok("On-device inference is", return_tensors="pt"),
                      max_new_tokens=32, do_sample=True)
 ```
 
-**Today:** the operator layer under this is complete for 15 of 20 architectures, and Llama and
-GPT-2 match upstream **token for token and logit for logit** in both greedy and sampling mode.
-The `from_pretrained` path itself is still blocked — see [Status](#status).
+**Today:** this runs. `SmolLM2-135M` is pulled from the Hub through `from_pretrained` — 273
+tensors, weights bit-identical to upstream — and `generate` emits the same twenty tokens upstream
+does when the model is loaded in `float32`.
+
+Loaded in the checkpoint's native `bfloat16`, which is what you get if you pass no `dtype`, the
+tokens diverge. That is not a defect to fix: upstream disagrees with *itself* on one prompt in
+three under a mathematically equivalent change of accumulation order, so bitwise agreement in
+bf16 is not a bar any independent implementation can clear. See [Status](#status).
 
 ### 2 · Federated learning
 
@@ -88,8 +93,9 @@ engine = federated.Engine(model, rounds=..., aggregator=federated.FedAvg())
 engine.participate()          # local epochs, then contribute a delta
 ```
 
-**Today:** planned. `torch.distributed` is being implemented from `world_size = 1` upward, which
-is a truthful description of a single device rather than a stub.
+**Today:** the transport under it stands. `torch.distributed` works at `world_size = 1`, and its
+sixteen value-producing collectives are byte-identical to upstream's `gloo`; what needs a second
+rank refuses by name rather than pretending. `torchnative.nn.federated` above it is still empty.
 
 ### 3 · Test-time adaptation & training
 
@@ -140,13 +146,13 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>97</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>2268 / 2268</b> — values, shapes, dtypes</td></tr>
-<tr><td>Python spellings</td><td><b>233</b> verified against upstream signatures</td></tr>
-<tr><td>Architectures complete</td><td><b>18 of 20</b> measured</td></tr>
+<tr><td>ATen operators</td><td><b>119</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>2811 / 2811</b> — values, shapes, dtypes</td></tr>
+<tr><td>Signature and schema tables</td><td><b>4203</b> entries checked against upstream</td></tr>
+<tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
-<tr><td>Build targets</td><td>macOS · Linux · Android arm64 · iOS arm64</td></tr>
-<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 97 ops, <code>nn</code> forward</td></tr>
+<tr><td>Build targets</td><td>macOS arm64 · Android arm64 · iOS arm64 — <b>Linux and Windows are in the target matrix and not yet built</b> (<a href="docs/DESIGN.md">DESIGN.md</a> §722)</td></tr>
+<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward</td></tr>
 </table>
 
 Complete: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT · StarCoder2 ·
@@ -157,10 +163,9 @@ generator stream — a seeded run reproduces exactly.
 
 **Not working yet**
 
-- `import transformers` fails — `torch.distributed` is unimplemented and an unguarded import
-  inside `torch._dynamo` reaches `dist.Store`. Every result above was measured against models
-  transcribed by hand.
-- Mamba and Mixtral are the two incomplete architectures — in-place overloads and `_grouped_mm`.
+- Mixtral is the one incomplete architecture — `_grouped_mm`, an offset-based grouped GEMM
+  with no equivalent here yet.
+- `torch.compile` does not work; it stops inside Dynamo. Eager execution is the supported path.
 - CPU only. No GPU or NPU backend.
 - The Android run is an emulator, not a phone. No number here describes real silicon.
 - Apple is much faster than Android at `f32` matmul, and that is the hardware. Accelerate
@@ -220,25 +225,39 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 pip install torchnative
 ```
 
+`0.0.2a0` ships three platform wheels, all `cp313-abi3` — one binary per platform, loadable by
+CPython 3.13 and every later release. Each carries the `_C` extension and the vendored upstream
+tree, so `import torch` resolves to *this* build.
+
+**They are not all verified to the same depth, and the table says which is which.**
+
+| wheel | built | installed | `import torch` | computes |
+|---|:--:|:--:|:--:|:--:|
+| `macosx_11_0_arm64` | ✅ | ✅ | ✅ | ✅ |
+| `android_21_arm64_v8a` | ✅ | ✅ | ✅ | ✅ |
+| `ios_12_0_arm64_iphoneos` | ✅ | — | — | — |
+
+macOS is checked in a clean virtualenv and Android on a device, unpacked into its CPython's
+`site-packages` — in both, `torch.__file__` lands inside the install, `aten.mm` returns the right
+answer and an `nn.Linear` forward runs ([`docs/WHEEL.md`](docs/WHEEL.md) §7).
+
 > [!IMPORTANT]
-> **What is on PyPI as `0.0.1a0` is a name reservation, not a working install.** It is tagged
-> `py3-none-any` and contains only the `torchnative` API skeleton — no `_C` extension and no
-> vendored `torch` — so `import torch` fails after it installs cleanly. Nothing has been
-> uploaded to replace it yet.
+> **The iOS wheel has never been executed.** What is verified is everything short of running it:
+> its 222 undefined symbols all resolve against the device `Python.framework` and the iOS SDK,
+> checked through the two-level namespace bindings dyld itself uses, and every file in it outside
+> the extension is byte-identical to the simulator wheel, which does import and compute. What is
+> not verified is the load itself, `@rpath` resolution inside a real app bundle, and code signing
+> — none of which can be answered without a device ([`docs/IOS.md`](docs/IOS.md)).
 >
-> A **platform wheel that does work** is now buildable, and the recipe is four commands
-> ([Building a wheel](#building-a-wheel)). It is tagged `cp313-abi3-macosx_11_0_arm64`, carries
-> the `_C` extension and the vendored tree, and has been installed into a clean virtualenv where
-> `import torch`, `torch.ops.aten.mm.default` and an `nn.Linear` forward all run —
-> [`docs/WHEEL.md`](docs/WHEEL.md) §2 has the output. Being `abi3`, the same binary also runs
-> unmodified on CPython 3.14.
+> If you run it on a phone, we would like to hear either way.
+
+> [!NOTE]
+> `0.0.1a0` is still on PyPI and does **not** work — it is `py3-none-any` and carries the
+> `torchnative` skeleton alone, no `_C` and no `torch`, so it installs cleanly and then fails to
+> import. Ask for `0.0.2a0` or later.
 >
-> Two things it does not do yet. `print(tensor)` raises `NotImplementedError` — tensor
-> *formatting* reaches at least eight `_C` names the shim does not implement, which reproduces
-> identically in a source build and is a gap in the extension, not in the packaging
-> ([`docs/WHEEL.md`](docs/WHEEL.md) §5). And **only the host wheel exists**: the extension
-> cross-builds for Android today, but a cross wheel cannot be verified without a device, so none
-> was produced ([`docs/WHEEL.md`](docs/WHEEL.md) §7).
+> There is no source distribution. Building needs a Rust toolchain and a vendoring step that
+> `pip` cannot drive, so an sdist would install and then fail; the recipe is below instead.
 
 ### Building from source
 

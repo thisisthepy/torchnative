@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnative"
-version = "0.0.1a0"
+version = "0.0.2a0"
 description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
 readme = { file = "README.md", content-type = "text/markdown" }
 # Our own code is MIT; the rest of the expression is upstream PyTorch's, copied
@@ -79,7 +79,10 @@ classifiers = [
     "Operating System :: Android",
     "Operating System :: iOS",
     "Operating System :: MacOS",
-    "Operating System :: POSIX :: Linux",
+    # Linux and Windows are in DESIGN.md's target matrix but have never been
+    # built: no rust target installed, no target CPython distribution. Claiming
+    # them here would be the same defect as the README line that did.
+    # "Operating System :: POSIX :: Linux",
 ]
 
 [project.urls]
@@ -91,6 +94,31 @@ Source = "https://github.com/thisisthepy/torchnative"
 # Aggregation, transport and privacy live behind this extra so that using
 # adaptation alone does not pull in the federated stack. See docs/DESIGN.md §10.
 federated = []
+
+# Backend selection, and the shape of it is forced by packaging rather than
+# chosen (docs/WHEEL.md §13). A wheel filename carries no backend axis -- pip
+# selects on the python, abi and platform tags alone, and the `build tag` slot
+# it does have is a tie-breaker it never selects on -- so CPU, GPU and NPU
+# builds cannot sit side by side under one platform tag. Upstream torch hits
+# exactly this and answers it by leaving PyPI: its 24 files for one version are
+# 4 platforms by 6 pythons, and the CUDA builds live on a separate index.
+#
+# So one binary carries all three and chooses at runtime. That is possible here
+# because the accelerator paths are dlopened rather than linked: docs/VULKAN.md
+# measured `libvulkan` absent from NEEDED, so a device with no driver loses the
+# GPU path and not `import torch`, and NNAPI and CoreML compile at runtime with
+# the same property.
+#
+# **These three install the same wheel.** An extra cannot change what is in it;
+# it can only add dependencies. What belongs here is whatever a backend needs on
+# the Python side at runtime -- and nothing does yet, because no accelerator has
+# left `cpu`: torch.device("vulkan") still refuses by name. The names are
+# declared so that `torchnative[gpu]` resolves rather than errors, and so the
+# eventual contents have somewhere to land. They are deliberately empty, not
+# accidentally.
+cpu = []
+gpu = []
+npu = []
 
 # Upstream PyTorch, as the thing the golden harness diffs against -- not as a
 # runtime dependency. Pinned to what is actually compared: this shim implements
