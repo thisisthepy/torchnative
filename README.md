@@ -148,10 +148,10 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>121</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>2971 / 2971</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>223</b></td></tr>
-<tr><td>Signature and schema tables</td><td><b>4231</b> entries checked against upstream</td></tr>
+<tr><td>ATen operators</td><td><b>122</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>3037 / 3037</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>225</b></td></tr>
+<tr><td>Signature and schema tables</td><td><b>4233</b> entries checked against upstream</td></tr>
 <tr><td>Architectures complete</td><td><b>20 of 20</b> measured. Mixtral was the last: it runs unpatched, agreeing with upstream on every argmax and every generated token, logits within one float32 ulp (<a href="docs/GROUPED_MM.md">GROUPED_MM.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
