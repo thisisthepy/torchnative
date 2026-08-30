@@ -2541,8 +2541,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # DYNAMO.md: `torch._dynamo` is an unconditional import (`transformers`
     # pulls it in through `masking_utils.py:42` on `torch >= 2.6`, no
     # `hasattr` gate exists to skip it -- DYNAMO.md §6). It reaches 52 names
-    # under `_C._dynamo`, but only two are ever *called* rather than merely
-    # referenced: `eval_frame.set_guard_error_hook` and
+    # under `_C._dynamo`, but only two were ever *called* rather than merely
+    # referenced at that point: `eval_frame.set_guard_error_hook` and
     # `eval_frame.set_code_exec_strategy`, both at module scope in
     # `torch/_dynamo/guards.py:5457` and `torch/_dynamo/decorators.py:125`.
     # Both calls discard the return value -- they register a hook / tag a
@@ -2550,15 +2550,37 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # `torch.compile` installs, which this project never calls (DYNAMO.md
     # §3.2). So the only requirement is that the call not raise.
     #
+    # docs/ARCH26.md added a third and fourth: `set_eval_frame` and
+    # `set_eval_frame_isolate_recompiles_id`. `torch/_dynamo/__init__.py:133`
+    # rebinds `torch.manual_seed = torch._disable_dynamo(torch.manual_seed)`
+    # **unconditionally at `torch._dynamo` import time** -- so merely
+    # `import transformers` (which imports `torch._dynamo` for the reason
+    # above) is enough to make every later `torch.manual_seed(...)` call route
+    # through `torch/_dynamo/eval_frame.py`'s `_fn`, which calls
+    # `prior = set_eval_frame(None)` before the wrapped call and
+    # `set_eval_frame(prior)` after (also `set_eval_frame_isolate_recompiles_id`
+    # a few lines away, on the same call shape). Neither is a hook
+    # registration like the first two -- both are a **get-and-set**, and the
+    # caller relies on the return value to restore the prior state, so unlike
+    # the two above these cannot be unconditional `None`-returning no-ops:
+    # a nested `_fn` call has to see what the outer one set. `deberta`'s toy
+    # forward (docs/ARCH26.md) is what surfaced this -- none of the twenty
+    # architectures in docs/ARCH20.md called `torch.manual_seed` after
+    # `transformers` had already pulled in `torch._dynamo`.
+    #
+    # `torch.compile` is never invoked here, so there is no real eval-frame
+    # hook to install -- the state cell is honest about being exactly that: a
+    # place to remember what the (never-consulted) hook was last set to.
+    #
     # `_SubmoduleFinder` above already answers `torch._C._dynamo.<anything>`
     # generically -- including two levels deep, since it only checks that the
     # first path segment (`_dynamo`) is a known root -- so every other name
     # under `eval_frame`, `guards`, `utils` and `compiled_autograd` already
     # exists via the lazily-created catch-all module (DYNAMO.md §3.3, §7
     # item 4: `utils`/`compiled_autograd` are 0-access in this path and stay
-    # empty). Only these two need a real body instead of the catch-all's
+    # empty). Only these four need a real body instead of the catch-all's
     # `_Unimplemented`, which raises on call. Pre-registering the module here
-    # (rather than teaching the finder to special-case two names) means the
+    # (rather than teaching the finder to special-case four names) means the
     # finder never runs for this particular submodule: Python's import system
     # checks `sys.modules` before consulting `sys.meta_path`.
     if "_dynamo" in roots:
@@ -2572,14 +2594,40 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         def set_code_exec_strategy(code, strategy):
             return None
 
+        # Two independent cells: upstream's `set_eval_frame` and
+        # `set_eval_frame_isolate_recompiles_id` are separate C functions with
+        # separate storage (`torch/csrc/dynamo/eval_frame.c`), and nothing here
+        # ever reads one while writing the other, but conflating them would be
+        # a guess this shim has no call site to check.
+        _eval_frame_cell = [None]
+        _eval_frame_isolate_cell = [None]
+
+        def set_eval_frame(callback):
+            prior = _eval_frame_cell[0]
+            _eval_frame_cell[0] = callback
+            return prior
+
+        def set_eval_frame_isolate_recompiles_id(recompiles_id):
+            prior = _eval_frame_isolate_cell[0]
+            _eval_frame_isolate_cell[0] = recompiles_id
+            return prior
+
         set_guard_error_hook.__name__ = set_guard_error_hook.__qualname__ = (
             "set_guard_error_hook"
         )
         set_code_exec_strategy.__name__ = set_code_exec_strategy.__qualname__ = (
             "set_code_exec_strategy"
         )
+        set_eval_frame.__name__ = set_eval_frame.__qualname__ = "set_eval_frame"
+        set_eval_frame_isolate_recompiles_id.__name__ = (
+            set_eval_frame_isolate_recompiles_id.__qualname__
+        ) = "set_eval_frame_isolate_recompiles_id"
         eval_frame.set_guard_error_hook = set_guard_error_hook
         eval_frame.set_code_exec_strategy = set_code_exec_strategy
+        eval_frame.set_eval_frame = set_eval_frame
+        eval_frame.set_eval_frame_isolate_recompiles_id = (
+            set_eval_frame_isolate_recompiles_id
+        )
 
         dynamo_sub = getattr(module, "_dynamo")
         setattr(dynamo_sub, "eval_frame", eval_frame)
@@ -3276,6 +3324,56 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     to.__qualname__ = "TensorBase.to"
     setattr(tensorbase, "to", to)
     setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
+
+    # `Tensor.new_tensor` -- docs/ARCH26.md, `zoedepth`'s wall (through
+    # `Dinov2`'s `_init_weights`, `transformers/initialization.py`'s
+    # `trunc_normal_`, `torch/nn/init.py`'s `_no_grad_trunc_normal_`, which
+    # reads a scalar bound back with `tensor.new_tensor(a, device="cpu").item()`
+    # -- not one of the twenty in docs/ARCH20.md, none of which triggered
+    # `trunc_normal_`'s truncated-bounds path during construction).
+    #
+    # A `TorchDispatchMode` logger on 2.13.0 shows `x.new_tensor(5.0,
+    # device="cpu")` firing exactly one record, `aten.lift_fresh.default` --
+    # the same single op `torch.tensor(...)` makes (`_tensor_factory`'s own
+    # docstring measured that already, for the top-level function). So this is
+    # the same construction, minus the mode-stack detour: `torch.tensor` is
+    # one of `DeviceContext`'s 36 names that has to consult
+    # `with torch.device(...):`, but `Tensor.new_tensor` is a method, not one
+    # of those 36, and defaults `dtype`/`device` from the receiver rather than
+    # from nothing -- upstream's doc is explicit that the defaults come from
+    # `self`, not from a global default, and that `requires_grad` defaults to
+    # `False` regardless of `self.requires_grad`.
+    #
+    # `_tensor_factory` builds `varfns.tensor` (harvested into `torch.tensor`
+    # by `torch/__init__.py` after this module returns), not `module.tensor`
+    # (`module` here is `_C`, which has no such attribute) -- so this cannot
+    # simply call that function's build result. It calls the two primitives
+    # `_tensor_factory`'s body calls, in the same order, with the same
+    # `requires_grad`/`pin_memory` refusals, instead.
+    def new_tensor(self, data, *, dtype=None, device=None, requires_grad=False,
+                    pin_memory=False):
+        if requires_grad:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: TensorBase.new_tensor("
+                "requires_grad=True) -- there is no autograd behind this shim"
+            )
+        if pin_memory:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: TensorBase.new_tensor("
+                "pin_memory=True)"
+            )
+        dtype = self.dtype if dtype is None else dtype
+        device = self.device if device is None else device
+        if isinstance(device, str):
+            device = module.device(device)
+        return dispatch(
+            "aten.lift_fresh.default",
+            module._tensor_new_from_data(data, dtype, device),
+        )
+
+    new_tensor.__name__ = "new_tensor"
+    new_tensor.__qualname__ = "TensorBase.new_tensor"
+    setattr(tensorbase, "new_tensor", new_tensor)
 
     # -- the device spellings that are `.to()` in disguise -------------------
     #
@@ -5412,6 +5510,86 @@ def _install_composites(module, varfns, dispatch) -> None:
     conv1d.__name__ = conv1d.__qualname__ = "conv1d"
     conv1d.__module__ = "torch._C"
     setattr(varfns, "conv1d", conv1d)
+
+    def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        """`torch.conv2d` -- docs/ARCH26.md, `zoedepth`'s wall (`Dinov2`'s
+        patch-embedding `nn.Conv2d`, through `F.conv2d`, which
+        `torch/nn/functional.py` binds straight to `torch.conv2d` the same way
+        it binds `F.conv1d` to `torch.conv1d` above).
+
+        Same composite as `conv1d` immediately above -- `aten::conv2d` is
+        `CompositeImplicitAutograd` and a `TorchDispatchMode` logger on 2.13.0
+        shows every form of the call firing exactly one record:
+
+            conv2d(x, w, b, stride=2, padding=1, dilation=1, groups=1)
+              -> convolution(x, w, b, [2, 2], [1, 1], [1, 1], False, [0, 0], 1)
+
+        The only difference from `conv1d` is arity: two spatial dims instead
+        of one, so a scalar `stride`/`padding`/`dilation` widens to **two**
+        elements, not one -- measured in the trace above, where `stride=2`
+        reaches `convolution` as `[2, 2]`. `nn.Conv2d.__init__` already
+        normalises its own `stride`/`padding`/`dilation` attributes to 2-tuples
+        via `_pair` before `_conv_forward` calls here, so in practice the
+        widening below mostly serves a caller that spells `F.conv2d` directly
+        with a bare int -- but it is upstream's own rule either way, not a
+        convenience added here.
+
+        `padding="same"`/`"valid"` follow `conv1d`'s rule component-wise: each
+        of the two `dilation[i] * (kernel[i] - 1)` totals must be even, and
+        either being odd is refused by name for the reason `conv1d` refuses
+        it -- upstream pads that axis asymmetrically, and picking a half would
+        shift the output by one sample on that axis.
+        """
+        def _as_list(value, n=2):
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            return [value] * n
+
+        stride = _as_list(stride)
+        dilation = _as_list(dilation)
+        if isinstance(padding, str):
+            if padding == "valid":
+                padding = [0, 0]
+            elif padding == "same":
+                if any(s != 1 for s in stride):
+                    raise RuntimeError(
+                        "padding='same' is not supported for strided convolutions"
+                    )
+                kernel = list(weight.shape[-2:])
+                totals = [dilation[i] * (kernel[i] - 1) for i in range(2)]
+                if any(total % 2 != 0 for total in totals):
+                    raise NotImplementedError(
+                        "not implemented in torch._C shim: torch.conv2d("
+                        "padding='same') where dilation*(kernel-1) is odd on "
+                        "some axis -- upstream pads that axis asymmetrically "
+                        "with aten::constant_pad_nd before convolving, and "
+                        "picking either half of the split here would shift "
+                        "the output by one sample on that axis"
+                    )
+                padding = [total // 2 for total in totals]
+            else:
+                raise ValueError(
+                    f"conv2d: padding must be 'valid', 'same', or an int/pair, got {padding!r}"
+                )
+        else:
+            padding = _as_list(padding)
+
+        return dispatch(
+            "aten.convolution.default",
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            False,
+            [0, 0],
+            groups,
+        )
+
+    conv2d.__name__ = conv2d.__qualname__ = "conv2d"
+    conv2d.__module__ = "torch._C"
+    setattr(varfns, "conv2d", conv2d)
 
     # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
     #
