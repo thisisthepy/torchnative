@@ -610,9 +610,15 @@ impl PyTensorBase {
         PyTuple::new(py, self.dims())
     }
 
+    /// Returns *the* module-level `torch.float32` rather than an equal copy.
+    /// `PyDtype::new` here made `t.dtype is torch.float32` false for every
+    /// tensor, which `==` hides -- and upstream's own `get_higher_dtype` opens
+    /// with `if a is b: return a` as its guard against the `ordered_datatypes`
+    /// table, so two float32 operands fell through it and promoted to float64
+    /// (docs/DECOMP.md §7.2, which had the symptom but not the cause).
     #[getter]
-    fn dtype(&self) -> PyDtype {
-        PyDtype::new(self.tag)
+    fn dtype(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::dtype::interned(py, self.tag)
     }
 
     #[getter]
