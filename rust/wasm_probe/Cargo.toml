@@ -52,6 +52,12 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 # -- abi3-py313 plus extension-module -- build for wasm".
 [features]
 pyo3-route = ["dep:pyo3"]
+# docs/WASM.md §7 (this session's addition): an unresolvable `extern "C"`
+# symbol, exposed as its own pyfunction, for the aborting-stub negative
+# control against a *real* Emscripten CPython host. Off by default -- it is
+# never linkable, on purpose, so it must not be part of the artefact anyone
+# else loads.
+bogus-symbol-test = ["pyo3-route"]
 
 [dependencies.pyo3]
 version = "0.29.2"

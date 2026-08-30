@@ -180,9 +180,36 @@ pub mod pyo3_route {
         Ok(n)
     }
 
+    // docs/WASM.md §7.5a ran this control against a *synthetic* stub host that
+    // this crate itself generated (`gen_pystubs.py`). That leaves open whether
+    // a real CPython's Emscripten dynamic linker behaves the same way. This
+    // repeats the control against whatever host actually loads the module --
+    // on Pyodide that is the real interpreter, not a hand-written table.
+    //
+    // The imported symbol is a name that cannot exist in any CPython: no
+    // `Py`/`_Py` prefix, so it can never collide with a real one added by a
+    // future CPython release. If `import wasm_probe` still succeeds with this
+    // present, that alone proves an unresolved import does not block loading.
+    // If calling `probe_bogus_symbol()` then succeeds too, the loader is
+    // silently no-op'ing missing symbols; if it aborts, it is substituting an
+    // aborting stub -- distinguishing those two is the entire point of §5.5's
+    // "a check that cannot fail is not a check".
+    #[cfg(feature = "bogus-symbol-test")]
+    unsafe extern "C" {
+        fn Wasm4Probe_DoesNotExistInAnyCPython() -> i32;
+    }
+
+    #[cfg(feature = "bogus-symbol-test")]
+    #[pyfunction]
+    fn probe_bogus_symbol() -> i32 {
+        unsafe { Wasm4Probe_DoesNotExistInAnyCPython() }
+    }
+
     #[pymodule]
     fn wasm_probe(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(probe_all, m)?)?;
+        #[cfg(feature = "bogus-symbol-test")]
+        m.add_function(wrap_pyfunction!(probe_bogus_symbol, m)?)?;
         Ok(())
     }
 }
