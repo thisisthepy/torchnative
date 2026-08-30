@@ -50,6 +50,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.add_.Tensor",
     "aten.addmm.default",
     "aten.alias.default",
+    "aten.amax.default",
     "aten.any.default",
     "aten.any.dim",
     "aten.arange.default",
@@ -846,6 +847,7 @@ fn aten_dispatch_inner(
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
+        "aten.amax.default" => amax_default(py, args, kwargs),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
         "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
@@ -2764,7 +2766,15 @@ fn sdpa_flash_cpu(
         // candle-nn, which DESIGN.md §4 does not pull in). Shifting by the row
         // maximum first is not an optimisation -- without it a masked row's
         // `exp(-inf)` and a large logit's `exp(big)` land on the same NaN.
-        let row_max = scores.max_keepdim(3).map_err(|e| candle_err(OP, e))?;
+        //
+        // `amax_keepdim`, not candle's `max_keepdim`: this wants a maximum
+        // *value* and candle only has the reduction that also computes an
+        // argmax, which measured 57x slower than upstream's `amax` at the score
+        // shape this very line produces and was 24.3% of a `float32` prefill.
+        // docs/SEQLEN.md §7. The two agree bit for bit on every input this line
+        // can produce -- §7.2 has the argument, and it is an argument rather
+        // than a tolerance.
+        let row_max = crate::tensor::amax_keepdim(&scores, 3).map_err(|e| candle_err(OP, e))?;
         let weights = scores
             .broadcast_sub(&row_max)
             .and_then(|s| s.exp())
@@ -5523,6 +5533,101 @@ fn extremum_default(
     }
     .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
+}
+
+/// `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor`
+///
+/// The maximum *value* over some dimensions, with no indices -- which is what
+/// every softmax wants and what candle does not have. `crate::tensor::
+/// amax_keepdim` is the kernel and its header carries the argument for why it
+/// exists; this is the op key that makes it reachable and comparable.
+///
+/// Four behaviours are upstream's, measured on torch 2.13.0 rather than
+/// inferred, and three of them differ from the `sum`/`mean` reductions next
+/// door:
+///
+///   * **`dim=[]` reduces *everything*.** For `sum.dim_IntList` an empty list
+///     reduces nothing (`reduce_dims`' own comment says so); for `amax` it is
+///     the schema default and it answers a scalar. Copying `sum`'s reading here
+///     would make the no-argument call a no-op.
+///   * **A repeated dimension is refused**, `RuntimeError: dim 1 appears
+///     multiple times in the list of dims`. `sum` accepts one.
+///   * **An empty input raises two different exceptions**, and which one
+///     depends on whether a dim was named: `numel() == 0` with no dim is a
+///     `RuntimeError` telling the caller to pass one, and a named dim of extent
+///     zero is an `IndexError`. Both messages are transcribed.
+///   * **Every dtype is allowed, `torch.bool` included** (`bool_t.amax()` is
+///     `torch.bool`), and the result keeps the input's dtype -- no `int64`
+///     promotion of the kind `sum` does.
+fn amax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.amax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let named = reduce_dims(OP, args, kwargs, 1, rank)?;
+    let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+
+    // `None` (absent) and `Some([])` are the same request here -- the schema's
+    // default is `[]` and it means every dimension.
+    let all_dims = named.as_ref().map_or(true, |d| d.is_empty());
+    let mut dims: Vec<usize> = match named {
+        Some(d) if !d.is_empty() => d,
+        _ => (0..rank).collect(),
+    };
+
+    if let Some(repeated) = first_repeat(&dims) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "dim {repeated} appears multiple times in the list of dims"
+        )));
+    }
+
+    let extents = input.tensor()?.dims().to_vec();
+    if input.tensor()?.elem_count() == 0 {
+        if all_dims {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "amax(): Expected reduction dim to be specified for input.numel() == 0. \
+                 Specify the reduction dim with the 'dim' argument.",
+            ));
+        }
+        if let Some(&empty) = dims.iter().find(|&&d| extents[d] == 0) {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "amax(): Expected reduction dim {empty} to have non-zero size."
+            )));
+        }
+    }
+
+    // Descending, so the squeezes below run outermost-last and each index is
+    // still valid when its turn comes. The maximum itself does not care about
+    // the order -- it is associative and commutative.
+    dims.sort_unstable();
+    dims.dedup();
+    let mut out = input.tensor()?.clone();
+    for &dim in dims.iter() {
+        out = crate::tensor::amax_keepdim(&out, dim).map_err(|e| candle_err(OP, e))?;
+    }
+    if !keepdim {
+        for &dim in dims.iter().rev() {
+            out = out.squeeze(dim).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    finish(py, out, input.tag())
+}
+
+/// The first value that occurs twice in `dims`, if any. Written out rather than
+/// sorted-and-scanned because the message upstream prints names the *repeated
+/// dimension*, not its position, and sorting would lose which one arrived first
+/// only if there were more than one -- there is not, because this returns at
+/// the first.
+fn first_repeat(dims: &[usize]) -> Option<usize> {
+    for (i, d) in dims.iter().enumerate() {
+        if dims[..i].contains(d) {
+            return Some(*d);
+        }
+    }
+    None
 }
 
 /// `aten::max.other(Tensor self, Tensor other)` -- elementwise, and upstream

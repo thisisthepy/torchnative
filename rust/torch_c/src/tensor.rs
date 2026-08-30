@@ -1482,8 +1482,505 @@ fn nest(py: Python<'_>, flat: &[Py<PyAny>], dims: &[usize]) -> PyResult<Py<PyAny
     }
 }
 
+// ---------------------------------------------------------------------------
+// `amax` -- a maximum *value* along one dimension, without the argmax.
+//
+// candle has no such kernel. `Tensor::max`, `max_keepdim`, `min`, `min_keepdim`
+// and `max_all` are all public, and all five funnel into
+// `Tensor::reduce_impl(.., ReduceOp::Max)`, which is `cpu_backend::ReduceIndex`
+// -- the *index-tracking* reduction that `argmax` also uses. Its inner loop is
+//
+//     for (src_i, &s) in src.iter().enumerate() {
+//         if f(val, s) { acc = src_i; val = s }
+//     }
+//
+// a data-dependent compare-and-select with a loop-carried dependency on `val`,
+// one element at a time. `ReduceSum` next to it in the same file gets a
+// vectorised path; this one does not. docs/SEQLEN.md §4.3 measured the
+// consequence: at `[1, 9, 512, 512]` `float32`, candle's max over the last
+// dimension takes 5.69 ms against upstream's 0.099 ms `amax` -- 57x -- and it
+// was 24.3% of a `float32` prefill's main thread.
+//
+// So this is the second of the three routes docs/SEQLEN.md §5 left open. There
+// is **no** public candle API that returns a maximum without the index (route
+// one), and forking candle (route three) is not needed: `CustomOp1` +
+// `Tensor::apply_op1_no_bwd` are `pub`, they hand a kernel the storage *and*
+// the layout, and they are the same mechanism `WriteThrough` above already
+// uses for in-place writes (docs/VIEWS.md §6.2). No `unsafe`, no fork.
+//
+// **The reduction is not the same function candle computes**, and the one place
+// it differs is NaN. candle's predicate is `|x, y| x < y` -- "replace the
+// accumulator when it is smaller than the candidate" -- and every comparison
+// against a NaN is false, so a NaN that is not the *first* element is silently
+// skipped. `max([3, nan, 1])` comes back `3.0` there, where upstream answers
+// `nan` (docs/E2E_REAL.md; `aten.max.default` already works around it with a
+// separate `x != x` pass, and `max.other` had the same fault in its second
+// operand, docs/SPELLINGS.md). This kernel propagates, which is upstream's rule
+// and also IEEE-754 `maximum`.
+// ---------------------------------------------------------------------------
+
+/// The two scalar predicates `amax_row` needs, over the dtypes `CpuStorage`
+/// holds.
+///
+/// `is_nan` is a constant `false` for the integral arms, so the extra test in
+/// the inner loop folds away entirely for them rather than costing a compare.
+trait MaxScalar: Copy {
+    fn is_nan(self) -> bool;
+    /// The NaN of this type -- the answer when `is_nan` held for any element.
+    /// The integral arms cannot reach it, since their `is_nan` is a constant
+    /// `false`, so they return a value that is never read.
+    fn nan() -> Self;
+    /// Ordered greater-than: `false` if either side is NaN.
+    fn greater(self, other: Self) -> bool;
+}
+
+macro_rules! max_scalar_float {
+    ($ty:ty, $nan:expr) => {
+        impl MaxScalar for $ty {
+            #[inline(always)]
+            fn is_nan(self) -> bool {
+                self != self
+            }
+            #[inline(always)]
+            fn nan() -> Self {
+                $nan
+            }
+            #[inline(always)]
+            fn greater(self, other: Self) -> bool {
+                self > other
+            }
+        }
+    };
+}
+
+macro_rules! max_scalar_int {
+    ($ty:ty) => {
+        impl MaxScalar for $ty {
+            #[inline(always)]
+            fn is_nan(self) -> bool {
+                false
+            }
+            #[inline(always)]
+            fn nan() -> Self {
+                0
+            }
+            #[inline(always)]
+            fn greater(self, other: Self) -> bool {
+                self > other
+            }
+        }
+    };
+}
+
+max_scalar_float!(f32, f32::NAN);
+max_scalar_float!(f64, f64::NAN);
+max_scalar_float!(half::f16, half::f16::NAN);
+max_scalar_float!(half::bf16, half::bf16::NAN);
+max_scalar_int!(u8);
+max_scalar_int!(u32);
+max_scalar_int!(i16);
+max_scalar_int!(i32);
+max_scalar_int!(i64);
+
+/// How many independent accumulators the row reduction carries.
+///
+/// **This is most of the speed-up, and it is not about the argmax.** Dropping
+/// the index removes a store; what removes the 20x is that a single accumulator
+/// serialises the reduction on the latency of one compare-and-select per
+/// element. Sixteen of them break that chain into sixteen independent ones, and
+/// a fixed-size inner loop over them is what lets LLVM emit vector compares
+/// rather than scalar ones. A maximum is associative and commutative, so
+/// splitting the row across lanes cannot change the answer -- see `amax_row`'s
+/// note for the one respect in which that is not quite true and why it is
+/// unobservable.
+///
+/// Sixteen and not eight or thirty-two: measured, at the real score shape, 0.26
+/// / 0.28 / 0.31 ms for 8 / 16 / 32 lanes on the shape below. docs/SEQLEN.md §7.3.
+const AMAX_LANES: usize = 16;
+
+/// The maximum of one contiguous row, NaN-propagating.
+///
+/// **The NaN test is a separate accumulator and that is a measurement, not a
+/// preference.** The direct spelling of an IEEE-754 `maximum` --
+/// `if v > acc || v.is_nan() { acc = v }` -- is correct and **8x slower than
+/// this** (2.27 ms against 0.28 at the score shape), because the compound
+/// condition stops LLVM recognising the loop as a max reduction. Carrying "did
+/// any element fail to be a number" in its own lane array leaves the max itself
+/// a plain `if v > acc`, which vectorises, and costs 0.08 ms.
+///
+/// The lane array is `u32` rather than `bool` for the same reason: `bool` lanes
+/// are one byte against the value's four, so the two accumulators have
+/// different vector widths and LLVM pays to reconcile them on every iteration
+/// -- 0.83 ms with `bool`, 0.28 with `u32`, same arithmetic. All five variants
+/// and their timings are in docs/SEQLEN.md §7.3.
+///
+/// The one-comparison spelling `!(v <= acc)` is not merely slower, it is
+/// **wrong**: once `acc` is a NaN every subsequent `v <= NaN` is false, so the
+/// next ordinary value replaces the NaN and it is lost again.
+///
+/// **Order.** A maximum involves no arithmetic, so there is no rounding to
+/// reassociate and the multi-accumulator answer is the single-accumulator
+/// answer -- for every input except one: a row containing both `-0.0` and
+/// `+0.0`. The rule here, like candle's and like upstream's (measured:
+/// `amax([-0., 0.])` is `-0.` and `amax([0., -0.])` is `0.`), keeps the *first*
+/// of two equal elements, and splitting a row across lanes can change which
+/// equal element is first. That distinguishes `-0.0` from `+0.0` and nothing
+/// else, because those two compare equal. docs/SEQLEN.md §7.2 works through why
+/// it cannot reach SDPA's output.
+#[inline(always)]
+fn amax_row<T: MaxScalar>(row: &[T]) -> T {
+    // The caller checked; an empty row has no maximum to return.
+    debug_assert!(!row.is_empty());
+    let mut acc = [row[0]; AMAX_LANES];
+    let mut nan = [0u32; AMAX_LANES];
+    let mut chunks = row.chunks_exact(AMAX_LANES);
+    for chunk in &mut chunks {
+        // `zip`, not `acc[lane]`: indexing a fixed-size array by a loop
+        // variable leaves a bounds check the vectoriser will not cross.
+        for ((slot, flag), &v) in acc.iter_mut().zip(nan.iter_mut()).zip(chunk.iter()) {
+            if v.greater(*slot) {
+                *slot = v;
+            }
+            *flag |= v.is_nan() as u32;
+        }
+    }
+    let mut best = acc[0];
+    let mut any_nan = 0u32;
+    for lane in 0..AMAX_LANES {
+        if acc[lane].greater(best) {
+            best = acc[lane];
+        }
+        any_nan |= nan[lane];
+    }
+    for &v in chunks.remainder() {
+        if v.greater(best) {
+            best = v;
+        }
+        any_nan |= v.is_nan() as u32;
+    }
+    // The seed is `row[0]`, so a leading NaN is already sitting in every lane
+    // and `greater` never displaces it -- but it is also flagged, so the answer
+    // comes from here either way.
+    if any_nan != 0 {
+        T::nan()
+    } else {
+        best
+    }
+}
+
+/// The same reduction over a row whose elements are `stride` apart.
+///
+/// Reached when the reduced dimension is not the innermost one. It gets the
+/// lanes but not the contiguity, which is the part that matters least: the
+/// dependency chain is what the lanes break.
+#[inline(always)]
+fn amax_strided<T: MaxScalar>(src: &[T], start: usize, n: usize, stride: usize) -> T {
+    debug_assert!(n > 0);
+    let mut acc = [src[start]; AMAX_LANES];
+    let mut nan = [0u32; AMAX_LANES];
+    let full = n - (n % AMAX_LANES);
+    let mut i = 0;
+    while i < full {
+        for lane in 0..AMAX_LANES {
+            let v = src[start + (i + lane) * stride];
+            if v.greater(acc[lane]) {
+                acc[lane] = v;
+            }
+            nan[lane] |= v.is_nan() as u32;
+        }
+        i += AMAX_LANES;
+    }
+    let mut best = acc[0];
+    let mut any_nan = 0u32;
+    for lane in 0..AMAX_LANES {
+        if acc[lane].greater(best) {
+            best = acc[lane];
+        }
+        any_nan |= nan[lane];
+    }
+    while i < n {
+        let v = src[start + i * stride];
+        if v.greater(best) {
+            best = v;
+        }
+        any_nan |= v.is_nan() as u32;
+        i += 1;
+    }
+    if any_nan != 0 {
+        T::nan()
+    } else {
+        best
+    }
+}
+
+/// `amax_row`/`amax_strided` over every slice of a **contiguous** layout.
+///
+/// Contiguity is the caller's job (`amax_keepdim` makes it so), which is what
+/// keeps this to two branches instead of candle's three: there is no strided
+/// odometer here, because there is no strided input.
+fn amax_reduce<T: MaxScalar>(
+    src: &[T],
+    layout: &Layout,
+    dim: usize,
+) -> candle_core::Result<Vec<T>> {
+    let dims = layout.dims();
+    let n = dims[dim];
+    let dst_len: usize = dims.iter().product::<usize>() / n;
+    let (o1, o2) = layout.contiguous_offsets().ok_or_else(|| {
+        candle_core::Error::Msg(
+            "torch._C shim: amax reached its kernel with a non-contiguous layout -- \
+             tensor.rs::amax_keepdim is supposed to have made it contiguous first"
+                .to_string(),
+        )
+    })?;
+    if src.len() < o2 {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: amax's layout addresses {o2} elements of a {}-element buffer",
+            src.len()
+        )));
+    }
+    let src = &src[o1..o2];
+    let stride = layout.stride()[dim];
+    let mut dst = Vec::with_capacity(dst_len);
+    if stride == 1 {
+        for i in 0..dst_len {
+            dst.push(amax_row(&src[i * n..i * n + n]));
+        }
+    } else {
+        // Contiguous, but reducing an outer dimension: slice `i` starts at
+        // `(i / stride) * stride * n + (i % stride)`. This is candle's own
+        // decomposition of the same index, and it is exact because the layout
+        // is contiguous, so `stride` is the product of the extents below `dim`.
+        for i in 0..dst_len {
+            let start = (i / stride) * stride * n + (i % stride);
+            dst.push(amax_strided(src, start, n, stride));
+        }
+    }
+    Ok(dst)
+}
+
+/// The `CustomOp1` that carries `amax_reduce` across candle's storage boundary.
+struct AMax {
+    dim: usize,
+}
+
+impl candle_core::CustomOp1 for AMax {
+    fn name(&self) -> &'static str {
+        "torch._C shim: amax"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &CpuStorage,
+        layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, candle_core::Shape)> {
+        let dims = layout.dims();
+        if self.dim >= dims.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "torch._C shim: amax over dimension {} of a rank-{} tensor",
+                self.dim,
+                dims.len()
+            )));
+        }
+        if dims.iter().product::<usize>() == 0 {
+            return Err(candle_core::Error::Msg(
+                "torch._C shim: amax of an empty tensor".to_string(),
+            ));
+        }
+        let mut out_dims = dims.to_vec();
+        out_dims[self.dim] = 1;
+        macro_rules! reduce {
+            ($arm:ident, $values:expr) => {
+                CpuStorage::$arm(amax_reduce($values, layout, self.dim)?)
+            };
+        }
+        let out = match storage {
+            CpuStorage::U8(v) => reduce!(U8, v),
+            CpuStorage::U32(v) => reduce!(U32, v),
+            CpuStorage::I16(v) => reduce!(I16, v),
+            CpuStorage::I32(v) => reduce!(I32, v),
+            CpuStorage::I64(v) => reduce!(I64, v),
+            CpuStorage::BF16(v) => reduce!(BF16, v),
+            CpuStorage::F16(v) => reduce!(F16, v),
+            CpuStorage::F32(v) => reduce!(F32, v),
+            CpuStorage::F64(v) => reduce!(F64, v),
+            // The remaining `CpuStorage` arms are candle's sub-byte float
+            // types, which this shim has no `TorchDType` for at all -- so a
+            // tensor cannot be carrying one when it reaches here.
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "torch._C shim: amax has no kernel for this candle dtype -- \
+                     tensor.rs::AMax names the ones it reduces"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok((out, candle_core::Shape::from(out_dims)))
+    }
+}
+
+/// The maximum along `dim`, keeping the reduced dimension as `1`.
+///
+/// Drop-in for `Tensor::max_keepdim(dim)` apart from the NaN rule above, and
+/// the reason to prefer it is docs/SEQLEN.md §7.
+pub(crate) fn amax_keepdim(source: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
+    // Free when it already is one -- candle's `contiguous` clones the handle
+    // rather than the buffer in that case, which is every call SDPA makes.
+    let source = source.contiguous()?;
+    source.apply_op1_no_bwd(&AMax { dim })
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod amax_tests {
+    use super::*;
+
+    fn cpu() -> candle_core::Device {
+        candle_core::Device::Cpu
+    }
+
+    /// The row reduction against a plain sequential fold, over lengths that
+    /// straddle the lane count in every direction -- so a remainder bug, a
+    /// seeding bug and a lane-combining bug each have a length that shows them.
+    #[test]
+    fn amax_matches_a_sequential_fold_at_every_length() {
+        // A cheap deterministic sequence with negatives, duplicates and a run
+        // of equal maxima.
+        let make = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 33) as i64 as f32) / 1.0e6 - 4096.0
+                })
+                .collect()
+        };
+        for n in 1..=(AMAX_LANES * 4 + 3) {
+            for seed in [1u64, 7, 99] {
+                let row = make(n, seed);
+                let mut want = row[0];
+                for &v in &row[1..] {
+                    if v > want {
+                        want = v;
+                    }
+                }
+                let got = amax_row(&row);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "n={n} seed={seed}: amax_row {got} vs sequential {want}"
+                );
+            }
+        }
+        // **The maximum walked through every position of every length.** The
+        // random rows above leave it wherever it happens to fall, and that was
+        // measured to be insufficient: a deliberate fault dropping exactly one
+        // accumulator lane from the combining step survived all three seeds at
+        // all 67 lengths, because none of them put the maximum in that lane.
+        // This does not depend on luck -- if a lane is skipped, the length and
+        // offset that land the maximum there fail here.
+        for n in 1..=(AMAX_LANES * 4 + 3) {
+            for at in 0..n {
+                let mut row: Vec<f32> = (0..n).map(|i| -(i as f32) - 1.0).collect();
+                row[at] = 4242.0;
+                assert_eq!(
+                    amax_row(&row),
+                    4242.0,
+                    "n={n}: the maximum at position {at} was not found"
+                );
+            }
+        }
+        // The same walk through `amax_strided`, which the contiguous rows above
+        // never enter -- it is the branch that runs when the reduced dimension
+        // is not the innermost one, and it has its own remainder and combine.
+        for n in 1..=(AMAX_LANES * 2 + 5) {
+            for stride in [1usize, 3, 7] {
+                for at in 0..n {
+                    let mut src: Vec<f32> = (0..n * stride + 3).map(|i| -(i as f32) - 1.0).collect();
+                    src[2 + at * stride] = 4242.0;
+                    assert_eq!(
+                        amax_strided(&src, 2, n, stride),
+                        4242.0,
+                        "n={n} stride={stride}: the maximum at position {at} was not found"
+                    );
+                }
+            }
+        }
+    }
+
+    /// NaN propagates from **any** position, which is the half of the rule
+    /// candle gets wrong (docs/E2E_REAL.md: `max([3, nan, 1])` is `3.0` there)
+    /// and the half a one-comparison `!(v <= acc)` would get wrong is the
+    /// other one -- a NaN early in a long row surviving to the end.
+    #[test]
+    fn nan_propagates_from_every_position() {
+        for n in [1usize, 2, 5, AMAX_LANES, AMAX_LANES + 1, AMAX_LANES * 3 + 7] {
+            for at in 0..n {
+                let mut row: Vec<f32> = (0..n).map(|i| i as f32).collect();
+                row[at] = f32::NAN;
+                assert!(
+                    amax_row(&row).is_nan(),
+                    "n={n}: a NaN at position {at} did not reach the result"
+                );
+            }
+        }
+    }
+
+    /// An all-`-inf` row -- a fully masked attention row -- answers `-inf`,
+    /// not NaN and not the seed of an empty fold.
+    #[test]
+    fn an_all_negative_infinity_row_is_negative_infinity() {
+        for n in [1usize, AMAX_LANES - 1, AMAX_LANES, AMAX_LANES * 2 + 5] {
+            let row = vec![f32::NEG_INFINITY; n];
+            assert_eq!(amax_row(&row), f32::NEG_INFINITY, "n={n}");
+        }
+    }
+
+    /// The tensor-level entry, against candle's own `max_keepdim`, on the two
+    /// layouts `amax_reduce` branches on -- innermost dimension (contiguous
+    /// rows) and an outer one (strided slices) -- plus a non-contiguous input,
+    /// which `amax_keepdim` is supposed to make contiguous before the kernel
+    /// ever sees it.
+    #[test]
+    fn amax_keepdim_agrees_with_candle_where_candle_is_right() {
+        let n = 3 * 5 * 7;
+        let values: Vec<f32> = (0..n).map(|i| ((i * 37 % 101) as f32) - 50.0).collect();
+        let t = Tensor::from_vec(values, (3, 5, 7), &cpu()).unwrap();
+        for dim in 0..3 {
+            let want = t.max_keepdim(dim).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let got = amax_keepdim(&t, dim).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(got, want, "dim={dim}");
+            assert_eq!(
+                amax_keepdim(&t, dim).unwrap().dims(),
+                t.max_keepdim(dim).unwrap().dims(),
+                "dim={dim} shape"
+            );
+        }
+        // Non-contiguous: a transpose, reduced along each dimension.
+        let tr = t.transpose(0, 2).unwrap();
+        assert!(!tr.is_contiguous());
+        for dim in 0..3 {
+            let want = tr.max_keepdim(dim).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let got = amax_keepdim(&tr, dim).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(got, want, "transposed dim={dim}");
+        }
+    }
+
+    /// The divergence from candle, stated as a test rather than left in a
+    /// comment: on a tensor containing a NaN that is not first, candle's
+    /// `max_keepdim` answers a number and this answers NaN. If candle ever
+    /// fixes its reduction this fails, which is the notification wanted.
+    #[test]
+    fn candle_drops_the_nan_this_kernel_keeps() {
+        let t = Tensor::from_vec(vec![3.0f32, f32::NAN, 1.0], (1, 3), &cpu()).unwrap();
+        let candle = t.max_keepdim(1).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        let ours = amax_keepdim(&t, 1).unwrap().to_vec2::<f32>().unwrap()[0][0];
+        assert_eq!(candle, 3.0, "candle's ReduceIndex no longer skips NaN");
+        assert!(ours.is_nan(), "amax must propagate NaN, upstream's rule");
+    }
 }

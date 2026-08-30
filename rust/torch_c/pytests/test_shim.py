@@ -6724,7 +6724,11 @@ def test_core_ops_and_op_tags_agree():
     # (`sub_`, `mul_`, `neg_`, `exp_` and the `Scalar` overloads) are NOT core
     # upstream and do not appear here -- checked, not assumed, which is what
     # makes 82 the right number rather than 85.
-    assert r["tag_core_count"] == 82, r["tag_core_count"]
+    # 83 with `aten.amax.default` (docs/SEQLEN.md §7). Read off
+    # `torch.ops.aten.amax.default.tags` -- `['core', 'pt2_compliant_tag',
+    # 'reduction']` -- rather than inferred from its neighbours, because
+    # `max.dim` sitting next to it in this shim is *not* core.
+    assert r["tag_core_count"] == 83, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -8519,6 +8523,169 @@ def _sdpa_call(b, batch, heads, kv_heads, q_len, kv_len, head_dim, dtype, causal
     # here, which is the one thing this helper exists to avoid.
     with _sdpa_reference():
         return b.op(_SDPA_OP, q, k, v, 0.0, causal, **kw)
+
+
+def test_amax_at_a_real_score_row_width_agrees_with_upstream_exactly():
+    """`amax` at the row width attention actually produces, not a toy one.
+
+    The golden suite's rows are 3 to 40 elements wide. That covers the
+    accumulator lanes and the remainder, and it cannot cover the regime this
+    kernel was written for: a 512-wide row is 32 full chunks, and a bug in the
+    lane-combining step that a 40-element row happens to survive (because the
+    maximum sits in a lane the short combine reaches first) does not survive
+    32 of them. So this walks the maximum through every one of the 512
+    positions and demands the answer exactly -- a maximum has no arithmetic in
+    it, so `==` is the right comparison and a tolerance would be hiding
+    something.
+
+    docs/SEQLEN.md §7 is why this shape and not another: `[1, 9, S, S]` with
+    `S=512` is what a SmolLM2-135M prefill hands its softmax, and it is the
+    shape at which candle's index-tracking reduction measured 56x upstream.
+    """
+    n = 512
+    for at in list(range(0, n, 37)) + [n - 1, 0, 1]:
+        flat = [float((i * 7) % 101) - 50.0 for i in range(n)]
+        flat[at] = 1234.5
+        row = _C._tensor_from_flat(flat, [1, n], dtype=_C.float32)
+        got = _C._aten_dispatch("aten.amax.default", row, [1], False)
+        assert got.tolist() == [1234.5], f"maximum at position {at}: {got.tolist()}"
+        assert got.dtype == _C.float32
+        assert list(got.shape) == [1]
+    # And the two-dimensional form, so the reduction runs 9 rows at a time the
+    # way SDPA drives it rather than once.
+    rows = 9
+    flat = []
+    for r in range(rows):
+        flat.extend(float((i * 13 + r) % 199) - 99.0 for i in range(n))
+        flat[r * n + (r * 41) % n] = 500.0 + r
+    t = _C._tensor_from_flat(flat, [rows, n], dtype=_C.float32)
+    got = _C._aten_dispatch("aten.amax.default", t, [1], True)
+    assert list(got.shape) == [rows, 1]
+    assert got.tolist() == [[500.0 + r] for r in range(rows)], got.tolist()
+
+
+def test_amax_propagates_nan_where_candles_own_reduction_drops_it():
+    """The divergence this kernel exists to *not* inherit.
+
+    `aten.max.default` answered `3.0` for `max([3, nan, 1])` before
+    docs/E2E_REAL.md, because candle's reduction compares with `x < y` and
+    every comparison against a NaN is false, so a NaN that is not the first
+    element is skipped. `max.other` had the same hole in its second operand
+    (docs/SPELLINGS.md). Two ops, one predicate, so the third op to use that
+    predicate would have had it too.
+
+    `amax` does not use it. This checks the NaN survives from a position past
+    the first accumulator chunk -- the position a kernel gets *wrong* by
+    accident, since a NaN in element 0 seeds every lane and is preserved even
+    by a wrong reduction.
+    """
+    n = 200
+    for at in (0, 1, 17, 63, 199):
+        flat = [float(i) for i in range(n)]
+        flat[at] = float("nan")
+        t = _C._tensor_from_flat(flat, [1, n], dtype=_C.float32)
+        got = _C._aten_dispatch("aten.amax.default", t, [1], False).tolist()[0]
+        assert math.isnan(got), f"a NaN at position {at} of {n} came back as {got}"
+    # `max.dim` on the same data still answers a number, which is candle's
+    # behaviour and not this kernel's. Asserted rather than left implicit so
+    # that the day candle fixes its reduction, this says so.
+    flat = [float(i) for i in range(n)]
+    flat[17] = float("nan")
+    t = _C._tensor_from_flat(flat, [1, n], dtype=_C.float32)
+    values = _C._aten_dispatch("aten.max.dim", t, 1, False)[0].tolist()[0]
+    assert not math.isnan(values), (
+        "candle's max.dim no longer skips a NaN -- amax's separate NaN pass may "
+        "now be redundant, and docs/SEQLEN.md §7.2 should be revisited"
+    )
+
+
+def test_a_fully_masked_attention_row_reduces_to_negative_infinity():
+    """Every element `-inf` is a real shape, not a pathological one.
+
+    It is what a causal mask plus padding produces, and it is the row where a
+    reduction seeded with a neutral element rather than with the data answers
+    something finite. `-inf` is the right answer and it is what upstream gives
+    (measured). The softmax that follows then produces NaN for that row, which
+    is `_softmax`'s documented behaviour and `_safe_softmax`'s zero -- neither
+    of which this op is allowed to pre-empt by answering something else here.
+    """
+    for n in (1, 5, 16, 17, 512):
+        t = _C._tensor_from_flat([float("-inf")] * n, [1, n], dtype=_C.float32)
+        got = _C._aten_dispatch("aten.amax.default", t, [1], False).tolist()[0]
+        assert got == float("-inf"), f"n={n}: an all -inf row gave {got}"
+    # One finite element among 511 `-inf` still wins, from the last position.
+    flat = [float("-inf")] * 512
+    flat[511] = -12.5
+    t = _C._tensor_from_flat(flat, [1, 512], dtype=_C.float32)
+    assert _C._aten_dispatch("aten.amax.default", t, [1], False).tolist() == [-12.5]
+
+
+def test_amax_has_no_python_spelling_yet_and_says_so_by_name():
+    """`torch.amax` and `Tensor.amax` do **not** resolve, and that is a gap.
+
+    The kernel and the aten key exist; what does not exist is an entry in
+    `src/overloads.json` (free function) or `src/methods.json` (member), which
+    is what routes a Python name to an overload. Until one is added, the only
+    reachable spelling is `torch.ops.aten.amax.default`, which is the one the
+    golden suite compares.
+
+    This is here because docs/SURFACE_HONESTY.md's whole argument is that a
+    missing name must refuse by name rather than resolve to something else, and
+    because the golden harness is structurally blind to it: it dispatches by
+    key, so it would go on passing with no Python spelling at all. When the
+    table entry lands, this test fails -- which is the notification wanted, not
+    a nuisance.
+    """
+    a = _C._tensor_from_flat([1.0, 5.0, 2.0, 9.0], [2, 2], dtype=_C.float32)
+    assert _C._aten_dispatch("aten.amax.default", a, [1], False).tolist() == [5.0, 9.0]
+    if not _ckpt_shim_available():
+        return
+    got = _amax_spelling_fixture()
+    assert got["aten_key"] == [5.0, 9.0], got
+    for label in ("torch.amax", "Tensor.amax"):
+        answer = got[label]
+        assert answer.startswith("NotImplementedError"), (
+            f"{label} now resolves ({answer}) -- add a golden case through the "
+            f"spelling and update docs/SEQLEN.md §7.5"
+        )
+        assert "amax" in answer, f"{label} refused without naming itself: {answer}"
+
+
+_AMAX_SPELLING_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {}
+t = torch.tensor([[1.0, 5.0], [2.0, 9.0]])
+out["aten_key"] = torch.ops.aten.amax.default(t, [1], False).tolist()
+for label, call in (("torch.amax", lambda x: torch.amax(x, 1)),
+                    ("Tensor.amax", lambda x: x.amax(1))):
+    try:
+        out[label] = "resolved: %r" % (call(t).tolist(),)
+    except NotImplementedError as e:
+        out[label] = "NotImplementedError: %s" % e
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _amax_spelling_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _AMAX_SPELLING_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"amax-spelling subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
 
 
 def test_sdpa_reduced_float_matches_upstream_to_the_last_bit():

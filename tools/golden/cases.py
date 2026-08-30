@@ -1282,6 +1282,201 @@ def arange_start_step_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.amax.default -------------------------------------------------------
+#
+# `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor` -- the
+# maximum *value*, no indices. docs/SEQLEN.md §7 is why it exists: SDPA's
+# softmax wants a maximum for numerical stability and never wants the index,
+# and candle only has the index-producing reduction.
+#
+# **Three of these cases exist because the family has form.** `max.default`
+# answered `3.0` for `max([3, nan, 1])` where upstream answers `nan`, and every
+# case that builder had passed throughout (docs/E2E_REAL.md); `max.other`
+# dropped a NaN that was present only in its second operand
+# (docs/SPELLINGS.md). Both are candle's `|x, y| x < y` predicate, which is
+# false against a NaN and therefore skips one. So NaN is checked here from the
+# first position, the middle and the last -- the middle one being the position
+# a wrong kernel gets right by accident.
+
+_AMAX_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
+
+
+def amax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.amax.default"
+    cases: list[Case] = []
+
+    scenarios = [
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[1], keepdim=False, note="along last dim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[1], keepdim=True, note="along last dim, keepdim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[0], keepdim=False, note="along first dim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[-1], keepdim=False, note="dim=-1"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[0, 1], keepdim=False, note="both dims"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[0, 1], keepdim=True, note="both dims, keepdim"),
+        # The schema default. It is *not* `sum.dim_IntList`'s reading of an
+        # empty list (which reduces nothing) -- measured, `amax(a, [])` is a
+        # scalar.
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=[], keepdim=False, note="dim=[] reduces everything"),
+        dict(flat=[-5, -1, -9, -3], shape=(2, 2), dim=[1], keepdim=False, note="all-negative values"),
+        dict(flat=[7], shape=(1,), dim=[0], keepdim=False, note="single element"),
+        dict(flat=[7], shape=(), dim=[], keepdim=False, note="0-d tensor, nothing to reduce"),
+        # Rank 3, so the kernel's outer-dimension branch (strided slices) runs
+        # as well as its innermost-dimension one (contiguous rows).
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=[2], keepdim=False, note="3D, innermost dim"),
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=[1], keepdim=False, note="3D, middle dim (strided slices)"),
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=[0], keepdim=True, note="3D, outermost dim, keepdim"),
+        # Longer than the kernel's 16 accumulator lanes, with the maximum past
+        # the first full chunk -- a lane-combining bug survives every short row
+        # above and dies here.
+        dict(
+            flat=[float(i % 7) for i in range(70)] + [99.0] + [1.0] * 9,
+            shape=(2, 40),
+            dim=[1],
+            keepdim=False,
+            note="rows longer than the 16 accumulator lanes, max in the tail",
+        ),
+    ]
+
+    for dtype_name in _AMAX_DTYPES:
+        for sc in scenarios:
+            a_t, a_c = pair_from_flat(torch_module, c_module, sc["flat"], sc["shape"], dtype_name)
+            dim, keepdim = sc["dim"], sc["keepdim"]
+            cases.append(
+                Case(
+                    name=f"amax(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                    run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
+                    note=sc["note"],
+                )
+            )
+
+    # NaN, from every position a wrong reduction could skip. The `float32`
+    # spelling is the one candle gets wrong today.
+    nan = float("nan")
+    for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
+        flat = [3.0, 5.0, 1.0, 2.0]
+        flat[at] = nan
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name, flat, (4,),
+                    f"NaN in the {where} position propagates -- upstream's rule is IEEE "
+                    f"maximum, and candle's reduction skips a NaN it does not start on",
+                    kwargs=dict(dim=[0], keepdim=False),
+                )
+            )
+    # A NaN far enough in that it lands in a later accumulator lane, which the
+    # four-element rows above cannot reach.
+    for dtype_name in ["float32", "float64"]:
+        long_nan = [float(i) for i in range(40)]
+        long_nan[23] = nan
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, long_nan, (40,),
+                "NaN past the first accumulator chunk still reaches the result",
+                kwargs=dict(dim=[0], keepdim=False),
+            )
+        )
+
+    # A fully masked attention row. Every element `-inf` is a real shape in
+    # causal attention, and the answer is `-inf` -- not NaN, and not the
+    # neutral element of an empty fold.
+    ninf = float("-inf")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [ninf] * 5, (5,),
+                "an all -inf row -- a fully masked attention row -- reduces to -inf",
+                kwargs=dict(dim=[0], keepdim=False),
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [ninf, ninf, -2.0, ninf], (4,),
+                "-inf everywhere but one position",
+                kwargs=dict(dim=[0], keepdim=False),
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [ninf, ninf, ninf, ninf, ninf, ninf, ninf, ninf,
+                 ninf, ninf, ninf, ninf, ninf, ninf, ninf, ninf, ninf, ninf], (18,),
+                "an all -inf row longer than the accumulator lane count",
+                kwargs=dict(dim=[0], keepdim=False),
+            )
+        )
+        # +inf alongside -inf: the maximum is +inf, and nothing here may turn
+        # the pair into a NaN the way a *sum*-shaped accumulator would.
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [ninf, float("inf"), 0.0], (3,),
+                "-inf and +inf in one row is +inf, not NaN",
+                kwargs=dict(dim=[0], keepdim=False),
+            )
+        )
+
+    # `torch.bool` -- amax keeps the input dtype rather than promoting, which
+    # is the opposite of what `sum` does.
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "bool", [1, 0, 0, 0], (2, 2),
+            "bool input keeps torch.bool -- no int64 promotion, unlike sum",
+            kwargs=dict(dim=[1], keepdim=False),
+        )
+    )
+
+    # The refusals, all four measured on torch 2.13.0.
+    err_t, err_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
+    for name, dim in [
+        ("a repeated dimension is refused (sum accepts one)", [1, 1]),
+        ("a dimension out of range is refused", [5]),
+    ]:
+        cases.append(
+            Case(
+                name=f"amax({name})",
+                op=op,
+                run_torch=lambda t=err_t, dim=dim: torch_call(t, dim, False),
+                run_c=lambda c=err_c, dim=dim: c_module._aten_dispatch(op, c, dim, False),
+                expect="both_error",
+                note=name,
+            )
+        )
+    empty_t, empty_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="amax(empty tensor with no dim named -- refused, and it is a RuntimeError)",
+            op=op,
+            run_torch=lambda: torch_call(empty_t, [], False),
+            run_c=lambda: c_module._aten_dispatch(op, empty_c, [], False),
+            expect="both_error",
+            note="numel()==0 and dim=[] -- upstream asks for a dim by name",
+        )
+    )
+    cases.append(
+        Case(
+            name="amax(a named reduction dim of extent zero -- refused, and it is an IndexError)",
+            op=op,
+            run_torch=lambda: torch_call(empty_t, [0], False),
+            run_c=lambda: c_module._aten_dispatch(op, empty_c, [0], False),
+            expect="both_error",
+            note="numel()==0 with dim=[0] -- a different exception from the case above",
+        )
+    )
+
+    # Keyword coverage, the same shape argmax_cases carries.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="amax(self=/dim=/keepdim= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=[1], keepdim=True),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=[1], keepdim=True),
+        )
+    )
+    return cases
+
+
 # --- aten.argmax.default -----------------------------------------------------
 
 _ARGMAX_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
@@ -13160,6 +13355,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.select.int": select_cases,
     "aten.slice.Tensor": slice_cases,
     "aten.index.Tensor": index_tensor_cases,
+    "aten.amax.default": amax_cases,
     "aten.any.default": any_default_cases,
     "aten.any.dim": any_dim_cases,
     "aten.clone.default": clone_cases,
