@@ -3088,10 +3088,33 @@ def _tensor_method(name: str, dispatch, entry):
     return method
 
 
+def _install_tensor_T(tensorbase) -> None:
+    """`Tensor.T`, upstream's dimension-reversing transpose alias.
+
+    No aten op named `T` exists upstream: a `TorchDispatchMode` logger around
+    `x.T` on 2.13.0 fires exactly one record, `aten.permute.default`, with
+    dims reversed (`x.permute(*range(x.dim() - 1, -1, -1))`) -- confirmed for
+    both a 2-D tensor (the ordinary transpose) and a 1-D one (upstream still
+    dispatches `permute(0)` rather than returning `self`, even though the
+    values are unchanged; measured with `is`, which came back `False`). So
+    this is Python-level surface over the `permute` member `methods.json`
+    already carries, not a second kernel.
+
+    `falcon`'s attention module is what asked for this (docs/COMPAT.md,
+    transformers 4.x compatibility sweep).
+    """
+
+    def getter(self):
+        return self.permute(*range(self.dim() - 1, -1, -1))
+
+    tensorbase.T = property(getter)
+
+
 def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     for name, entry in methods.items():
         setattr(tensorbase, name, _tensor_method(name, dispatch, entry))
 
+    _install_tensor_T(tensorbase)
     _install_tensor_conversions(module, tensorbase, dispatch)
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(module, tensorbase, dispatch)
@@ -5440,20 +5463,34 @@ def _install_autocast(module) -> None:
             )
         enabled[name] = False
 
+    # Upstream's per-device *defaults*, measured on 2.13.0. Only the two this
+    # build could be asked about were measured; anything else refuses on
+    # first read rather than guessing, because the value decides what a cast
+    # would make -- until `set_autocast_dtype` (below) gives it one, which is
+    # the same round trip `autocast.__enter__`/`__exit__` already does for
+    # `self.fast_dtype` (read the current value, install a new one for the
+    # region, restore the old one on exit). A dict rather than the previous
+    # fixed pair, because `set_autocast_dtype` needs somewhere to write.
+    _autocast_dtype = {"cpu": module.bfloat16, "cuda": module.float16}
+
     def get_autocast_dtype(device_type=None):
         name = _check_device(device_type)
-        # Upstream's per-device defaults, measured on 2.13.0. Only the two
-        # this build could be asked about are known; anything else refuses
-        # rather than guessing, because the value decides what a cast makes.
-        defaults = {"cpu": module.bfloat16, "cuda": module.float16}
         try:
-            return defaults[name]
+            return _autocast_dtype[name]
         except KeyError:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 f"torch._C.get_autocast_dtype({name!r}) -- upstream's default "
                 "autocast dtype for this device type was not measured"
             ) from None
+
+    def set_autocast_dtype(device_type, dtype):
+        # `_check_device` rather than `_autocast_dtype`'s current keys: a
+        # caller may set a dtype for a device type this shim never measured
+        # a default for, exactly as upstream would, and that write is what
+        # lets a later `get_autocast_dtype` on the same device type succeed.
+        name = _check_device(device_type)
+        _autocast_dtype[name] = dtype
 
     def _is_tracing():
         """`torch/jit/_trace.py:1269`.
@@ -5465,11 +5502,97 @@ def _install_autocast(module) -> None:
         """
         return module._get_tracing_state() is not None
 
+    # Upstream's build-time registration of which device types have an
+    # Autocast dispatch key at all -- measured on 2.13.0
+    # (`torch._C._is_autocast_available(<name>)` for every name
+    # `_AUTOCAST_DEVICE_TYPES` accepts), not inferred from what this CPU-only
+    # build could plausibly support. It does not move when CUDA hardware is
+    # absent: `_is_autocast_available("cuda")` is `True` on a CPU-only host
+    # too, because the predicate answers "was a key registered for this
+    # backend" rather than "is the device physically present" -- confirmed by
+    # running the check on this machine (no CUDA) and getting `True`.
+    #
+    # docs/COMPAT.md has the full argument for why this is `True` rather than
+    # `False` for `"cpu"`. In short: a `False` here does not make
+    # `torch.autocast(..., enabled=False)` a no-op the way a caller might
+    # expect -- `autocast.__init__` (`torch/amp/autocast_mode.py`) calls this
+    # predicate *unconditionally*, before it even looks at `enabled`, and
+    # raises `RuntimeError("User specified an unsupported autocast
+    # device_type ...")` if it comes back `False`. That was checked by
+    # monkeypatching upstream's own `_is_autocast_available` to `False` and
+    # entering `torch.autocast(device_type="cpu", enabled=False)`: it still
+    # raises. So `False` would not "let the enabled=False path through" --
+    # it would break it, on every device type, unconditionally. `True` for
+    # the registered set is what makes `enabled=False` the no-op it already
+    # was designed to be (`is_autocast_enabled`/`set_autocast_enabled` above
+    # already pin the flag itself to permanently `False`).
+    _AUTOCAST_AVAILABLE_DEVICE_TYPES = frozenset((
+        "cpu", "cuda", "xpu", "hpu", "mtia", "maia", "ipu", "xla", "mps",
+        "privateuseone",
+    ))
+
+    def _is_autocast_available(device_type):
+        # Upstream's signature takes a required positional `str`; `None` is a
+        # `TypeError` there (measured), not the "default to cpu" convenience
+        # `is_autocast_enabled()` and friends give -- so this does not reuse
+        # `_check_device`, which special-cases `None`.
+        if not isinstance(device_type, str):
+            raise TypeError(
+                "_is_autocast_available(): argument 'device_type' (position "
+                f"1) must be str, not {type(device_type).__name__}"
+            )
+        if device_type not in _AUTOCAST_DEVICE_TYPES:
+            raise RuntimeError(
+                "Expected one of " + ", ".join(_AUTOCAST_DEVICE_TYPES)
+                + f" device type at start of device string: {device_type}"
+            )
+        return device_type in _AUTOCAST_AVAILABLE_DEVICE_TYPES
+
+    # The rest of `autocast.__enter__`/`__exit__` (`torch/amp/autocast_mode.py`
+    # 314-352) reads and restores three more names before and after the
+    # region, none of them gated by `enabled` -- so all three are reached
+    # even by `torch.autocast(..., enabled=False)`, the no-op path
+    # `_is_autocast_available` above exists to unblock. Each is bookkeeping
+    # around a cache this shim never populates (no dispatch key ever casts
+    # anything here, per `is_autocast_enabled` above), so there is no
+    # precision question the way there was for the enabled-flag: a cache
+    # tracking nothing is safe to report as enabled, and a nesting counter is
+    # safe to count honestly, because neither one changes what a kernel
+    # computes.
+    _autocast_cache_enabled = [True]  # upstream's default, measured
+    _autocast_nesting = [0]
+
+    def is_autocast_cache_enabled():
+        return _autocast_cache_enabled[0]
+
+    def set_autocast_cache_enabled(enabled):
+        _autocast_cache_enabled[0] = bool(enabled)
+
+    def autocast_increment_nesting():
+        _autocast_nesting[0] += 1
+        return _autocast_nesting[0]
+
+    def autocast_decrement_nesting():
+        _autocast_nesting[0] -= 1
+        return _autocast_nesting[0]
+
+    def clear_autocast_cache():
+        # Upstream drops cached casts here; this shim never populated any,
+        # so there is nothing to drop. Measured to return `None`.
+        return None
+
     for fn, name in (
         (is_autocast_enabled, "is_autocast_enabled"),
         (set_autocast_enabled, "set_autocast_enabled"),
         (get_autocast_dtype, "get_autocast_dtype"),
+        (set_autocast_dtype, "set_autocast_dtype"),
         (_is_tracing, "_is_tracing"),
+        (_is_autocast_available, "_is_autocast_available"),
+        (is_autocast_cache_enabled, "is_autocast_cache_enabled"),
+        (set_autocast_cache_enabled, "set_autocast_cache_enabled"),
+        (autocast_increment_nesting, "autocast_increment_nesting"),
+        (autocast_decrement_nesting, "autocast_decrement_nesting"),
+        (clear_autocast_cache, "clear_autocast_cache"),
     ):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C"
