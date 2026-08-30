@@ -29,7 +29,7 @@ model.generate(...)                                # on the device
 > **Pre-alpha.** The operator layer matches upstream PyTorch numerically, 19 of 20 tested
 > architectures reach zero missing operators, real checkpoints load, `transformers` imports and
 > generates, and an Android device runs the built artefact — but there is no accelerator backend,
-> `torch.compile` does not work, and only two of six platforms have been executed rather than
+> `torch.compile` does not work, and three of six platforms have been executed rather than
 > merely built. See [Status](#status) and [Platform support](#platform-support) before depending
 > on this.
 
@@ -154,7 +154,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
-<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward</td></tr>
+<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
 <tr><td>Speed vs upstream</td><td>desktop CPU: <b>within a few percent</b> on SmolLM2-135M <code>float32</code> prefill, from 14% behind. The kernels were already ahead; the gap was argument binding (<a href="docs/BIND.md">BIND.md</a>)</td></tr>
 </table>
 
@@ -200,16 +200,16 @@ only exists on a platform. Every ✅ has a run behind it.
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
 | in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
 | rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | 🔲 |
+| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ *Pyodide 3.14* |
 | candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | candle **computes** | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
 | extension builds | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
 | wheel builds | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
-| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ⚠️ *stubs, not errors* |
+| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
 | `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
-| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
-| computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
+| installs | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *mounted, no wheel* |
+| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
+| computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
 | **on PyPI `0.0.3a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ✅ *Node* |
 
@@ -217,17 +217,21 @@ The last row is why the columns differ. iOS, Linux and Windows have no runtime o
 no device, and no `docker`, `colima`, `podman`, `lima` or `qemu` — so the deepest rung any of them
 can reach here is *symbols resolve*.
 
-WASM is the exception and an earlier version of this line got it wrong. A complete emsdk with
-`emcc` and a bundled Node 24 sits in this machine's cache; `command -v node` finds nothing only
-because it is not on `PATH`. So WASM is the one of the three that *could* be executed here
-without installing anything — it has not been, and that is a different claim
-([`docs/WASM.md`](docs/WASM.md)).
+WASM is the exception, and it has now been executed. A complete emsdk with `emcc` and a bundled
+Node 24 sits in this machine's cache — `command -v node` finds nothing only because it is not on
+`PATH`, which an earlier draft of this line published as "no node on this machine". Under a real
+Pyodide the extension loads, `import torch` returns 2.13.0 from the vendored tree, and `a @ b` and
+an `nn.Linear` forward match a host build. Two things keep it short of the others: Pyodide ships
+CPython **3.14**, not 3.13, so the module is tied to one interpreter rather than to an abi3 floor
+— Emscripten voids abi3 regardless — and `torch/__init__.py` imports `torch.multiprocessing`,
+which a browser sandbox cannot supply, so that import is stubbed by the harness rather than solved.
+There is still no WASM wheel ([`docs/WASM.md`](docs/WASM.md)).
 
 ### Devices
 
 | device | macOS | Android | iOS | Linux | Windows | WASM | what it is |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
-| `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | the only device that holds a tensor |
+| `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
 | `mps` | ❌ | — | ❌ | — | — | — | candle has the backend; not enabled |
 | `vulkan` | — | ❌ | — | 🔲 | 🔲 | — | refuses by name; compute proven in a probe, not wired |
