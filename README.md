@@ -148,16 +148,16 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>133</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>3302 / 3302</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>245</b></td></tr>
-<tr><td>Signature and schema tables</td><td><b>4331</b> entries checked against upstream</td></tr>
+<tr><td>ATen operators</td><td><b>134</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>3422 / 3422</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>249</b></td></tr>
+<tr><td>Signature and schema tables</td><td><b>4334</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>20 of 20</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>actually forward</b></td><td><b>19 of 20</b> on this shim, against 20 of 20 on upstream. Only GPT-BigCode is left, on the TorchScript frontend</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
-<tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.16x at 128, 1.97x at 512</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>)</td></tr>
+<tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.64x at 512</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>)</td></tr>
 </table>
 
 **Forwards on this shim** (19): Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT ·
