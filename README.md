@@ -201,6 +201,11 @@ generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_l
   our own throughput on the same core under the same backend, at 88% of that core's NEON peak —
   so the kernels are not the gap. Upstream PyTorch has no Android wheel, so how we compare to it
   *there* is unmeasured. See [`docs/PERF_ANDROID.md`](docs/PERF_ANDROID.md).
+- **Speed work transfers to Android, but not uniformly.** Dispatch-bound wins arrive slightly
+  larger on device than on the host; kernel- and bandwidth-bound ones arrive *smaller* — the
+  attention copy is 3.6x there against 5.25x here. Measured by swapping one `.so` between
+  published wheels, which land the optimisations one at a time
+  ([`docs/PERF_ANDROID.md`](docs/PERF_ANDROID.md) §10).
 
 Tracked with the measurements behind them in [`docs/DESIGN.md`](docs/DESIGN.md) §11.1.
 
