@@ -829,6 +829,16 @@ def test_the_mixtral_member_names_reach_the_kernels_that_were_already_there():
     assert g.__ge__(3).tolist() == [False, True, True]
     assert g.ge(3).tolist() == [False, True, True]
     assert (g >= 3).tolist() == [False, True, True]
+    # ...and the Tensor overload behind those same three spellings, which had
+    # no kernel when §6.4 was written: the name bound and `_aten_dispatch`
+    # refused. `>=` and `>` differ only on the equal element, so the middle
+    # entry is what says this reached `Cmp::Ge` rather than `Cmp::Gt`.
+    other = t([3.0, 3.0, 3.0], [3])
+    assert (g >= other).tolist() == [False, True, True]
+    assert g.ge(other).tolist() == [False, True, True]
+    assert g.__ge__(other).tolist() == [False, True, True]
+    assert (g > other).tolist() == [False, False, True]
+    assert "aten.ge.Tensor" in _C._aten_implemented()
 
     # `expert_ids_g.clamp_(max=...)` -- max only, min absent.
     c = t([1.0, 5.0, 10.0, -3.0], [4])
@@ -874,10 +884,17 @@ def test_setitem_refuses_the_basic_index_write_rather_than_dropping_it():
 
     Upstream's `x[0] = v` narrows to a *view* (`aten.select.int`) and writes
     through it with `aten.copy_.default`. Both kernels exist here and both
-    are correct in isolation -- but a candle tensor is a value, so
-    `select.int` returns a copy and the write lands nowhere. Running
-    upstream's sequence would therefore report success and change nothing,
-    which is worse than refusing.
+    are correct in isolation; running the sequence reports success and
+    changes nothing, which is worse than refusing.
+
+    **The missing half is the write, not the view.** candle's `narrow` and
+    `squeeze` clone the storage `Arc` and rebuild only the layout, so
+    `select.int`'s result really does alias its input's buffer -- measured in
+    docs/VIEWS.md §4 through `slice_set`, which refuses a shared-storage pair
+    and is therefore an oracle for one. The copy happens afterwards, in
+    `PyTensorBase::replace_with`, which swaps the wrapper's tensor instead of
+    writing into the buffer it points at, and which is the write primitive
+    for all 26 in-place sites.
 
     The probe below is the evidence, not an appeal to the docstring: it does
     exactly what upstream does, through the public dispatch keys, and shows
@@ -888,8 +905,8 @@ def test_setitem_refuses_the_basic_index_write_rather_than_dropping_it():
     view = _C._aten_dispatch("aten.select.int", x, 0, 1)
     _C._aten_dispatch("aten.copy_.default", view, _C._tensor_from_flat([3.0], []))
     assert x.tolist() == [0.0] * 5, (
-        "select.int returned a mutable view -- __setitem__'s basic-index "
-        "branch can be implemented now"
+        "the write through select.int reached the base -- __setitem__'s "
+        "basic-index branch can be implemented now"
     )
     sliced = _C._aten_dispatch("aten.slice.Tensor", x, 0, 1, 3, 1)
     _C._aten_dispatch("aten.copy_.default", sliced, _C._tensor_from_flat([1.0, 2.0], [2]))
@@ -902,6 +919,173 @@ def test_setitem_refuses_the_basic_index_write_rather_than_dropping_it():
             assert "mutable views" in str(error), str(error)
         else:
             raise AssertionError(f"__setitem__[{index!r}] silently accepted")
+
+
+def test_index_put_takes_a_mask_a_matrix_and_a_number():
+    """The three `index_put_` gaps docs/GROUPED_MM.md §6.4 recorded, closed.
+
+    All three were the same cause: the kernel delegated to `scatter.src`,
+    which wants an int32/int64 index and index/src/self all of one rank. So a
+    bool mask refused on dtype, a receiver of rank above 1 refused on rank,
+    and `x[t] = 5` refused because the number lifts to a 0-d tensor. None of
+    them was a missing operator and none of them was a missing name -- the
+    walk in `bootstrap.py` emitted `aten.index_put_.default` with the right
+    arguments the whole time.
+
+    Every expectation below is upstream's, measured on torch 2.13.0. The
+    golden suite diffs the values against upstream directly (43 cases on this
+    key); this pins the shapes that were *refused* so a regression to the
+    `scatter` delegation fails here by name rather than only by value.
+    """
+    def t(flat, shape, dtype=None):
+        kw = {} if dtype is None else {"dtype": dtype}
+        return _C._tensor_from_flat(list(flat), list(shape), **kw)
+
+    # 1. A bool mask selects positions, which is a different operation from an
+    #    integer index rather than a cast of one.
+    m = t([0.0] * 4, [4])
+    m[t([1, 0, 1, 0], [4], dtype=_C.bool)] = t([1.0, 2.0], [2])
+    assert m.tolist() == [1.0, 0.0, 2.0, 0.0], m.tolist()
+    # A uint8 mask is upstream's deprecated spelling of the same thing, and it
+    # is emphatically NOT the integer index [1,0,1,0].
+    u = t([0.0] * 4, [4])
+    u[t([1, 0, 1, 0], [4], dtype=_C.uint8)] = t([1.0, 2.0], [2])
+    assert u.tolist() == [1.0, 0.0, 2.0, 0.0], u.tolist()
+    # The mask's RANK decides how many axes it eats: the same values as a
+    # (2,3) mask write three elements and as a (2,) mask write a whole row.
+    two_d = t([0.0] * 6, [2, 3])
+    two_d[t([1, 0, 1, 0, 1, 0], [2, 3], dtype=_C.bool)] = t([1.0, 2.0, 3.0], [3])
+    assert two_d.tolist() == [[1.0, 0.0, 2.0], [0.0, 3.0, 0.0]], two_d.tolist()
+    row = t([0.0] * 6, [2, 3])
+    row[t([1, 0], [2], dtype=_C.bool)] = t([1.0, 2.0, 3.0], [3])
+    assert row.tolist() == [[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]], row.tolist()
+
+    # 2. A receiver of rank above 1 with a 1-D index -- `x[idx] = v` on a
+    #    matrix, which is the common case.
+    mat = t([0.0] * 6, [3, 2])
+    mat[t([0, 2], [2], dtype=_C.int64)] = t([1.0, 2.0, 3.0, 4.0], [2, 2])
+    assert mat.tolist() == [[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]], mat.tolist()
+    # `values` broadcasts right-aligned, and the two broadcasts of the same
+    # two numbers give different answers -- (2,) fills across, (2,1) down.
+    across = t([0.0] * 6, [3, 2])
+    across[t([0, 2], [2], dtype=_C.int64)] = t([1.0, 2.0], [2])
+    assert across.tolist() == [[1.0, 2.0], [0.0, 0.0], [1.0, 2.0]], across.tolist()
+    down = t([0.0] * 6, [3, 2])
+    down[t([0, 2], [2], dtype=_C.int64)] = t([1.0, 2.0], [2, 1])
+    assert down.tolist() == [[1.0, 1.0], [0.0, 0.0], [2.0, 2.0]], down.tolist()
+
+    # 3. `x[t] = 5`: a Python number, lifted to a 0-d tensor and broadcast.
+    #    The lift follows the RECEIVER's dtype, not the number's Python type
+    #    (measured), and `index_put_` refuses a dtype mismatch -- so getting
+    #    the lift wrong refuses a write upstream performs.
+    num = t([0.0] * 6, [3, 2])
+    num[t([0, 2], [2], dtype=_C.int64)] = 5
+    assert num.tolist() == [[5.0, 5.0], [0.0, 0.0], [5.0, 5.0]], num.tolist()
+    trunc = t([0, 0, 0, 0], [4], dtype=_C.int64)
+    trunc[t([0, 2], [2], dtype=_C.int64)] = 5.9
+    assert trunc.tolist() == [5, 0, 5, 0], trunc.tolist()
+    assert trunc.dtype == _C.int64
+    # The pair that tells the two lift rules apart at the *kernel* level: `2`
+    # inferred from the Python type is int64, and `index_put_` refuses a
+    # dtype mismatch, so the old rule turned this write into a refusal.
+    truthy = t([0, 0, 0], [3], dtype=_C.bool)
+    truthy[t([0], [1], dtype=_C.int64)] = 2
+    assert truthy.tolist() == [True, False, False], truthy.tolist()
+    assert truthy.dtype == _C.bool
+    # The other caller of the same lift, which reaches `fill_` and not
+    # `index_put_`. It does NOT discriminate between the two lift rules --
+    # `fill_` takes its dtype from the receiver either way -- and is here
+    # because it is part of `__setitem__`'s measured behaviour.
+    filled = t([0, 0, 0], [3], dtype=_C.int64)
+    filled[:] = 3.0
+    assert filled.tolist() == [3, 3, 3] and filled.dtype == _C.int64, filled.tolist()
+
+    # `x[:, t] = v` -- the `[None, t]` index list, writing columns not rows.
+    cols = t([0.0] * 6, [2, 3])
+    cols[:, t([0, 2], [2], dtype=_C.int64)] = 5.0
+    assert cols.tolist() == [[5.0, 0.0, 5.0], [5.0, 0.0, 5.0]], cols.tolist()
+
+    # Negative indices wrap. `scatter` had no rule for this and refused them.
+    neg = t([0.0] * 5, [5])
+    neg[t([-1, -2], [2], dtype=_C.int64)] = t([1.0, 2.0], [2])
+    assert neg.tolist() == [0.0, 0.0, 0.0, 2.0, 1.0], neg.tolist()
+
+    # ...and out of range still refuses, in upstream's wording.
+    try:
+        t([0.0] * 5, [5])[t([9], [1], dtype=_C.int64)] = 1.0
+    except IndexError as error:
+        assert "index 9 is out of bounds for dimension 0 with size 5" in str(error), str(error)
+    else:
+        raise AssertionError("an out-of-range index must not be clamped")
+
+    # An empty index and an all-false mask write nothing rather than refusing
+    # or zeroing. The receiver is non-zero so both mistakes are visible.
+    empty = t([1.0, 2.0, 3.0], [3])
+    empty[t([], [0], dtype=_C.int64)] = t([], [0])
+    assert empty.tolist() == [1.0, 2.0, 3.0], empty.tolist()
+
+    # Still refused, and still by name: two index tensors, and accumulate.
+    for label, call in (
+        ("two index tensors", lambda: _C._aten_dispatch(
+            "aten.index_put_.default",
+            t([0.0] * 4, [2, 2]),
+            [t([0], [1], dtype=_C.int64), t([1], [1], dtype=_C.int64)],
+            t([1.0], []),
+            False,
+        )),
+        ("accumulate=True", lambda: _C._aten_dispatch(
+            "aten.index_put_.default",
+            t([0.0] * 3, [3]), [t([0], [1], dtype=_C.int64)], t([1.0], [1]), True,
+        )),
+    ):
+        try:
+            call()
+        except NotImplementedError as error:
+            assert "torch._C shim" in str(error), str(error)
+        else:
+            raise AssertionError(f"{label} must still refuse by name")
+
+
+def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
+    """The mutation, read back through the binding that was passed in.
+
+    `index_put_` returns `self`, so every check that reads its return value
+    passes just as well against a kernel that built a fresh tensor and handed
+    it back. This reads the ORIGINAL name afterwards and throws the return
+    value away, which is the only shape that can fail that way.
+
+    It also states the limitation that comes with `replace_with`, rather than
+    leaving it to be discovered: the write lands in the *wrapper*, so a
+    second wrapper made before the call does not see it. That is the same
+    limitation every in-place op here has (docs/TENSORBASE.md), and
+    docs/VIEWS.md §4 is about whether it can be removed.
+    """
+    x = _C._tensor_from_flat([0.0] * 5, [5])
+    returned = _C._aten_dispatch(
+        "aten.index_put_.default",
+        x,
+        [_C._tensor_from_flat([0, 2, 4], [3], dtype=_C.int64)],
+        _C._tensor_from_flat([7.0, 8.0, 9.0], [3]),
+        False,
+    )
+    assert x.tolist() == [7.0, 0.0, 8.0, 0.0, 9.0], x.tolist()
+    assert returned is x, "index_put_ returns self, as its schema says"
+
+    # Through the subscript, where the return value does not exist at all.
+    y = _C._tensor_from_flat([0.0] * 6, [3, 2])
+    y[_C._tensor_from_flat([0, 2], [2], dtype=_C.int64)] = 5
+    assert y.tolist() == [[5.0, 5.0], [0.0, 0.0], [5.0, 5.0]], y.tolist()
+
+    # And the limitation, asserted rather than described: `detach` makes a
+    # second wrapper over the same value, and the write does not reach it.
+    z = _C._tensor_from_flat([0.0] * 4, [4])
+    alias = _C._aten_dispatch("aten.detach.default", z)
+    z[_C._tensor_from_flat([0], [1], dtype=_C.int64)] = 1.0
+    assert z.tolist() == [1.0, 0.0, 0.0, 0.0], z.tolist()
+    assert alias.tolist() == [0.0] * 4, (
+        "an alias saw the write -- storage is shared now, so docs/VIEWS.md §4's "
+        "verdict has to be revisited"
+    )
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
@@ -6181,7 +6365,11 @@ def test_core_ops_and_op_tags_agree():
     # silently; this is the count of that happening.
     assert r["unknown_tags"] == [], r["unknown_tags"]
     assert r["tag_core_vs_file"] == [], r["tag_core_vs_file"]
-    assert r["tag_core_count"] == 77, r["tag_core_count"]
+    # 77 until `aten.ge.Tensor` got a kernel (docs/VIEWS.md §1). This counts
+    # *implemented* ops that upstream tags `core`, so it moves whenever a
+    # core-tagged op is implemented -- and `ge.Tensor` is core upstream
+    # exactly as its `le`/`lt`/`gt` siblings already counted here are.
+    assert r["tag_core_count"] == 78, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():

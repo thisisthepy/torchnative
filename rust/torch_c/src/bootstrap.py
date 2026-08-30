@@ -3524,19 +3524,28 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
     __getitem__.__qualname__ = "TensorBase.__getitem__"
     setattr(tensorbase, "__getitem__", __getitem__)
 
-    # What `torch.tensor(v)` infers for a bare Python number, which is what
-    # upstream's `lift_fresh` is lifting in the traces below. `bool` is tested
-    # first because it subclasses `int` (same rule as `_tensor_factory`).
-    def _lift(value):
+    # The dtype upstream's `lift_fresh` produces for a bare Python number on
+    # the right of a subscript assignment. **It is the receiver's, not the
+    # number's** -- measured with a `TorchDispatchMode` logger on torch
+    # 2.13.0, and it is not what `torch.tensor(v)` would infer:
+    #
+    #     float32 x;  x[t] = 5      ->  lift_fresh(float32()),  then index_put_
+    #     int64   x;  x[t] = 5.0    ->  lift_fresh(int64()),    then index_put_
+    #     float32 x;  x[t] = True   ->  lift_fresh(float32()),  then index_put_
+    #     int64   x;  x[:] = 3.0    ->  lift_fresh(int64()),    then fill_
+    #
+    # This used to infer from the Python type instead, which agreed with
+    # upstream whenever the two happened to line up and diverged otherwise.
+    # It survived because `index_put_` only accepted a 1-D receiver, so the
+    # one call that reached it (`inv_perm[perm] = arange(...)`, int64 on both
+    # sides) was in the agreeing half. Both halves are reachable now, and
+    # `index_put_` requires the dtypes to match exactly -- upstream does too
+    # -- so an inferred `int64` against a `float32` receiver would refuse a
+    # write upstream performs.
+    def _lift(value, like):
         if isinstance(value, tensorbase):
             return value
-        if isinstance(value, bool):
-            dtype = module.bool
-        elif isinstance(value, int):
-            dtype = module.int64
-        else:
-            dtype = module.float32
-        return dispatch("aten.scalar_tensor.default", value, dtype=dtype)
+        return dispatch("aten.scalar_tensor.default", value, dtype=like.dtype)
 
     def __setitem__(self, index, value):
         """`x[...] = v`, and the half of it this shim cannot do.
@@ -3554,18 +3563,39 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             x[0] = 3.0         -> [select.int, copy_.default]
             x[1:3] = tensor    -> [slice.Tensor, copy_.default]
 
-        The first seven are reproduced. **The last two are refused**, and the
-        reason is not a missing kernel: `aten.select.int` and
-        `aten.slice.Tensor` both have kernels here and both return a *copy*,
-        because a candle tensor is a value. Probed on this build:
+        The first seven are reproduced. Three of them only became reachable
+        when `index_put_` stopped delegating to `scatter` (docs/VIEWS.md §2
+        and §3): the bool mask, a receiver of rank above 1, and a number on
+        the right, which arrives as the 0-d tensor `_lift` builds and has to
+        broadcast. **The routing here did not change for any of them** -- the
+        walk always emitted the right key with the right arguments, and the
+        kernel behind it refused. Only `_lift`'s dtype rule moved, and that
+        was a divergence of its own (see its comment).
+
+        **The last two are refused**, and the reason is not a missing kernel:
+        `aten.select.int` and `aten.slice.Tensor` both have kernels and both
+        are correct on their own. Probed on this build:
 
             s = select.int(x, 0, 1); copy_(s, v)   ->  x unchanged
             s = slice.Tensor(y, 0, 1, 3, 1); copy_(s, v) -> y unchanged
 
         So the upstream sequence would run to completion, report success, and
         write nothing. That is the silent-divergence direction DESIGN.md §5
-        exists to keep out, so it refuses by name instead and says what is
-        missing: mutable views, not an operator.
+        exists to keep out, so it refuses by name instead.
+
+        **What is missing is not the view; it is the write to it.** An earlier
+        version of this docstring said select and slice "return a copy,
+        because a candle tensor is a value", and that is measurably wrong:
+        candle's `narrow` and `squeeze` clone the storage `Arc` and rebuild
+        only the layout, so the result of `select.int` really does alias its
+        input's buffer (docs/VIEWS.md §4 measures it through `slice_set`,
+        which refuses a shared-storage pair and is therefore an oracle for
+        one). The copy happens afterwards, in `PyTensorBase::replace_with`,
+        which swaps the *wrapper's* tensor for a freshly computed one instead
+        of writing into the buffer that wrapper points at -- and it is the
+        write primitive for all 26 in-place sites, not just this one. So this
+        is a storage-model change and not a kernel, which is why it is
+        refused here rather than half-built.
         """
         if not isinstance(index, tuple):
             index = (index,)
@@ -3583,7 +3613,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     "does not reproduce that composition yet"
                 )
             indices = [item if isinstance(item, tensorbase) else None for item in index]
-            dispatch("aten.index_put_.default", self, indices, _lift(value), False)
+            dispatch("aten.index_put_.default", self, indices, _lift(value, self), False)
             return
 
         if all(_is_full_slice(item) for item in index):
@@ -3592,16 +3622,19 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             if isinstance(value, tensorbase):
                 dispatch("aten.copy_.default", self, value)
             else:
-                dispatch("aten.fill_.Tensor", self, _lift(value))
+                dispatch("aten.fill_.Tensor", self, _lift(value, self))
             return
 
         raise NotImplementedError(
             "not implemented in torch._C shim: TensorBase.__setitem__ with integer "
             "or partial-slice indices -- upstream narrows to a view with "
             "aten.select.int / aten.slice.Tensor and writes through it with "
-            "aten.copy_.default, and this shim's select and slice return copies "
-            "rather than views, so that sequence would report success and change "
-            "nothing. The gap is mutable views, not an operator"
+            "aten.copy_.default. The narrowing works here and does alias its "
+            "input's storage; what is missing is the write-through, because every "
+            "in-place op replaces the wrapper's tensor rather than writing into "
+            "the buffer it points at. Running the sequence anyway would report "
+            "success and change nothing. The gap is mutable views, and it is a "
+            "storage-model change rather than an operator -- docs/VIEWS.md §4"
         )
 
     __setitem__.__name__ = "__setitem__"

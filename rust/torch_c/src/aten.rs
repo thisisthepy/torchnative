@@ -87,6 +87,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.full.default",
     "aten.gather.default",
     "aten.ge.Scalar",
+    "aten.ge.Tensor",
     "aten.gelu.default",
     "aten.gt.Scalar",
     "aten.gt.Tensor",
@@ -989,6 +990,11 @@ fn aten_dispatch_inner(
         "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
         "aten.empty_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.empty_like.default"),
         "aten.ge.Scalar" => compare_scalar(py, args, kwargs, "aten.ge.Scalar", Cmp::Ge),
+        // The last of the six comparisons to get its Tensor overload. `le`,
+        // `lt` and `gt` all had both halves and `ge` had only `.Scalar`, so
+        // `x >= tensor` resolved through `methods.json` and then refused by
+        // name (docs/GROUPED_MM.md §6.4). Same kernel as its five siblings.
+        "aten.ge.Tensor" => compare_tensor(py, args, kwargs, "aten.ge.Tensor", Cmp::Ge),
         "aten.floor_divide.default" => floor_divide_default(py, args, kwargs),
         "aten.floor_divide.Scalar" => floor_divide_scalar(py, args, kwargs),
         "aten.histc.default" => histc_default(py, args, kwargs),
@@ -8222,19 +8228,63 @@ fn masked_fill_inplace(
 /// tensor -- measured `index_put_.default(int64(12,), [int64(12,)],
 /// int64(12,), accumulate=False (default, absent))`.
 ///
-/// **Restricted to exactly the shape measured**: one non-`None` index
-/// tensor, `self`/`index`/`values` all rank 1 with matching element counts,
-/// `accumulate=False`. That single-index, non-accumulating, 1-D case is
-/// `self[index[i]] = values[i]` for each `i` -- which is `scatter.src` along
-/// dimension 0 with `index` and `values` standing in for `scatter`'s `index`
-/// and `src` (both already require `self`'s dtype and an int32/int64 index,
-/// which is exactly what `index_put_`'s schema also demands here). Rather
-/// than re-deriving that arithmetic, this builds the `(dim=0, index, src)`
-/// call `scatter.src` already implements and writes the result back into the
-/// receiver through `replace_with`. A wider index list, `accumulate=True`,
-/// or non-1-D operands are refused by name: not measured, so not guessed at.
+/// **One non-`None` index tensor**, `accumulate=False`. Within that, `self`
+/// may have any rank, the index may have any shape, the index may be a
+/// boolean (or `uint8`) mask covering several axes, and `values` broadcasts
+/// against the result the way upstream broadcasts it. A second index tensor
+/// and `accumulate=True` are still refused by name.
+///
+/// The first version delegated to `scatter.src` along dimension 0, which is
+/// exactly right for the one call Mixtral makes and wrong for everything
+/// else: `scatter` wants an int32/int64 index and index/src/self all of the
+/// same rank, so it refused a bool mask (`Expected dtype int32 or int64 for
+/// index, got bool`) and refused a matrix receiver. Both refusals were
+/// recorded as gaps in docs/GROUPED_MM.md §6.4 and both are closed here, by
+/// doing the address arithmetic directly instead of borrowing another op's.
+///
+/// **Everything below was measured against torch 2.13.0, not recalled.**
+///
+///   * **A mask is not a cast.** `x[bool_mask] = v` selects the positions
+///     where the mask is true; the natural lowering is mask -> coordinates,
+///     which is upstream's own move (`at::native::expandTensors`) and is
+///     already implemented here as `mask_to_indices` for `index.Tensor`. A
+///     `k`-dimensional mask consumes `k` axes and contributes a single axis
+///     of length `count` to the result, so `x(2,3)[mask(2,3)] = [1,2,3]`
+///     writes three elements and `x(2,3)[mask(2,)] = [1,2,3]` writes a whole
+///     row. Reading the mask as an integer index instead would be wrong with
+///     a plausible shape, which is why this is a different operation rather
+///     than a dtype conversion.
+///   * **The indexing result shape.** With one index group at axis `a`
+///     consuming `m` axes, it is `dims[..a] ++ index_shape ++ dims[a+m..]`.
+///     Only one group can exist here, so `index.Tensor`'s fronting-versus-
+///     splicing rule (which needs two separated groups to matter) cannot
+///     apply and the shape is always the spliced one. Measured:
+///     `index_put_(zeros(2,3), [None, tensor([0,2])], v)` wants `v`
+///     broadcastable to `(2,2)`.
+///   * **`values` broadcasts, right-aligned**, and a value that does not fit
+///     raises `shape mismatch: value tensor of shape [...] cannot be
+///     broadcast to indexing result of shape [...]`. A 0-d `values` is how
+///     `x[idx] = 5` arrives, so this is the path gap 3 needed.
+///   * **dtypes must match exactly.** Upstream does not promote here:
+///     `Index put requires the source and destination dtypes match, got
+///     Float for the destination and Long for the source.` Kept, with
+///     upstream's wording.
+///   * **Negative indices wrap**, and out-of-range ones raise
+///     `index N is out of bounds for dimension A with size E`. The
+///     `scatter`-based version could not wrap, because `scatter` has no
+///     negative-index rule.
+///   * **An empty index or an all-false mask writes nothing** and returns
+///     `self` unchanged, after the broadcast check has still been made.
+///   * **Repeated positions: last write wins**, in row-major order over the
+///     result shape. Same rule the `scatter` version had, re-derived rather
+///     than inherited.
+///
+/// The write goes back into the receiver through `replace_with`, so it
+/// carries the same recorded limitation every in-place op here does: aliases
+/// created before the call do not see it. §4 of docs/VIEWS.md is about
+/// exactly that limitation.
 fn index_put_inplace(
-    py: Python<'_>,
+    _py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
@@ -8250,9 +8300,42 @@ fn index_put_inplace(
         )));
     }
 
-    let mut chosen: Option<PyTensorBase> = None;
+    let (tag, dims, device) = {
+        let borrowed = receiver.borrow();
+        (
+            borrowed.tag(),
+            borrowed.tensor()?.dims().to_vec(),
+            borrowed.tensor()?.device().clone(),
+        )
+    };
+    let rank = dims.len();
+    if items.len() > rank {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "too many indices for tensor of dimension {rank} (got {})",
+            items.len()
+        )));
+    }
+    if values.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Index put requires the source and destination dtypes match, got {} for the \
+             destination and {} for the source.",
+            scalar_type_name(tag),
+            scalar_type_name(values.tag())
+        )));
+    }
+
+    // Row-major strides of `self`, so an index coordinate can be turned into
+    // a flat offset once here rather than once per written element.
+    let self_strides = contiguous_strides(&dims);
+
+    // The single index group: where it starts, how many axes it eats, the
+    // shape it contributes to the result, and one flat within-`self` offset
+    // per position it names.
+    let mut at_axis = 0usize;
+    let mut group: Option<(usize, usize, Vec<usize>, Vec<usize>)> = None;
     for item in &items {
         if item.is_none() {
+            at_axis += 1;
             continue;
         }
         let tensor = item.extract::<PyTensorBase>().map_err(|_| {
@@ -8261,37 +8344,153 @@ fn index_put_inplace(
                 item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
             ))
         })?;
-        if chosen.is_some() {
+        if group.is_some() {
             return Err(not_implemented(format!(
                 "{OP}: more than one index tensor is not implemented in torch._C shim"
             )));
         }
-        chosen = Some(tensor);
+        match tensor.tag() {
+            TorchDType::Int64 | TorchDType::Int32 => {
+                let extent = dims[at_axis] as i64;
+                let raw = match read_flat(OP, tensor.tensor()?, tensor.tag())? {
+                    Flat::Int(v) => v,
+                    Flat::Float(_) => unreachable!("the index dtype was matched above"),
+                };
+                let mut offsets = Vec::with_capacity(raw.len());
+                for value in raw {
+                    // torch wraps a negative index here; `scatter` does not,
+                    // which is one of the reasons this no longer delegates.
+                    let resolved = if value < 0 { value + extent } else { value };
+                    if resolved < 0 || resolved >= extent {
+                        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                            "index {value} is out of bounds for dimension {at_axis} \
+                             with size {extent}"
+                        )));
+                    }
+                    offsets.push(resolved as usize * self_strides[at_axis]);
+                }
+                group = Some((at_axis, 1, tensor.tensor()?.dims().to_vec(), offsets));
+                at_axis += 1;
+            }
+            TorchDType::Bool | TorchDType::UInt8 => {
+                // The mask -> indices lowering, shared with `index.Tensor`.
+                // It also owns the shape check, so a mask that does not line
+                // up raises upstream's `The shape of the mask ... does not
+                // match ...` from one place rather than two.
+                let consumed = tensor.tensor()?.rank();
+                let expanded = mask_to_indices(OP, tensor.tensor()?, at_axis, &dims)?;
+                let count = expanded.first().map_or(0, |(_, values, _)| values.len());
+                let mut offsets = vec![0usize; count];
+                for (axis, coords, _) in &expanded {
+                    for (slot, &coord) in offsets.iter_mut().zip(coords.iter()) {
+                        *slot += coord as usize * self_strides[*axis];
+                    }
+                }
+                group = Some((at_axis, consumed, vec![count], offsets));
+                at_axis += consumed;
+            }
+            _ => {
+                // Upstream's own wording, and it names four dtypes rather
+                // than the one that was passed.
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "tensors used as indices must be long, int, byte or bool tensors",
+                ));
+            }
+        }
     }
-    let index = chosen.ok_or_else(|| {
+    let (at, consumed, index_shape, offsets) = group.ok_or_else(|| {
         not_implemented(format!("{OP}: an all-None index list is not implemented in torch._C shim"))
     })?;
 
-    let self_rank = receiver.borrow().tensor()?.rank();
-    if self_rank != 1 || index.tensor()?.rank() != 1 || values.tensor()?.rank() != 1 {
-        return Err(not_implemented(format!(
-            "{OP}: only a 1-D self/index/values is implemented in torch._C shim"
-        )));
+    // `dims[..at] ++ index_shape ++ dims[at+consumed..]` -- what upstream's
+    // error message calls "the indexing result".
+    let index_rank = index_shape.len();
+    let mut result_shape: Vec<usize> = dims[..at].to_vec();
+    result_shape.extend(index_shape.iter().copied());
+    result_shape.extend(dims[at + consumed..].iter().copied());
+    let result_rank = result_shape.len();
+
+    // `values` broadcast onto that shape, right-aligned: its own stride where
+    // an axis matches, zero where it is being stretched. Checked before the
+    // empty-write shortcut below, because upstream checks it there too.
+    let value_dims = values.tensor()?.dims().to_vec();
+    let broadcast_failure = || {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "shape mismatch: value tensor of shape {value_dims:?} cannot be broadcast \
+             to indexing result of shape {result_shape:?}"
+        ))
+    };
+    if value_dims.len() > result_rank {
+        return Err(broadcast_failure());
+    }
+    let value_contig = contiguous_strides(&value_dims);
+    let align = result_rank - value_dims.len();
+    let mut value_strides = vec![0usize; result_rank];
+    for (k, &extent) in value_dims.iter().enumerate() {
+        if extent == result_shape[align + k] {
+            value_strides[align + k] = value_contig[k];
+        } else if extent != 1 {
+            return Err(broadcast_failure());
+        }
     }
 
-    // `scatter.src`'s own dim/dtype/index-dtype rules apply unchanged --
-    // build the call it expects and let it do the work.
-    let scatter_args = PyTuple::new(
-        py,
-        [
-            receiver.clone().into_any(),
-            0i64.into_pyobject(py)?.into_any(),
-            index.into_pyobject(py)?.into_any(),
-            values.into_pyobject(py)?.into_any(),
-        ],
-    )?;
-    let result = scatter_src(py, &scatter_args, None)?;
-    let replacement = result.extract::<PyTensorBase>(py)?;
+    let total: usize = result_shape.iter().product();
+    if total == 0 {
+        // An empty index, an all-false mask, or a zero-extent axis. Upstream
+        // writes nothing and hands `self` back; so does this, and doing it
+        // here keeps the walk below free of a degenerate case.
+        return Ok(receiver.into_any().unbind());
+    }
+
+    // Destination stride per *result* axis. The index group's axes are not
+    // linear -- they are a lookup into `offsets` -- so they stay at zero and
+    // are added separately.
+    let mut dest_strides = vec![0usize; result_rank];
+    dest_strides[..at].copy_from_slice(&self_strides[..at]);
+    for j in 0..(rank - at - consumed) {
+        dest_strides[at + index_rank + j] = self_strides[at + consumed + j];
+    }
+    let group_strides = contiguous_strides(&index_shape);
+
+    let mut out = {
+        let borrowed = receiver.borrow();
+        read_flat(OP, borrowed.tensor()?, tag)?
+    };
+    let source = read_flat(OP, values.tensor()?, tag)?;
+
+    let mut coord = vec![0usize; result_rank];
+    for _ in 0..total {
+        let mut dest = 0usize;
+        let mut src = 0usize;
+        for d in 0..result_rank {
+            dest += coord[d] * dest_strides[d];
+            src += coord[d] * value_strides[d];
+        }
+        let mut group_flat = 0usize;
+        for j in 0..index_rank {
+            group_flat += coord[at + j] * group_strides[j];
+        }
+        dest += offsets[group_flat];
+        match (&source, &mut out) {
+            (Flat::Float(s), Flat::Float(o)) => o[dest] = s[src],
+            (Flat::Int(s), Flat::Int(o)) => o[dest] = s[src],
+            _ => unreachable!("self and values share a dtype, checked above"),
+        }
+        for d in (0..result_rank).rev() {
+            coord[d] += 1;
+            if coord[d] < result_shape[d] {
+                break;
+            }
+            coord[d] = 0;
+        }
+    }
+
+    let tensor = write_flat(OP, out, dims, &device, tag)?;
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(tensor)?
+    } else {
+        PyTensorBase::new(tensor)?
+    };
     receiver.borrow_mut().replace_with(replacement);
     Ok(receiver.into_any().unbind())
 }
