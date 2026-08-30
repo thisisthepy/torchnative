@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/torchnative?color=blue)](https://pypi.org/project/torchnative/)
 [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS-lightgrey)](#platform-support)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#platform-support)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 
 </div>
@@ -26,10 +26,12 @@ model.generate(...)                                # on the device
 ```
 
 > [!WARNING]
-> **Pre-alpha.** The operator layer matches upstream PyTorch numerically, 18 of 20 tested
-> architectures reach zero missing operators, real checkpoints load, and an Android device runs
-> the built artefact — but `import transformers` does not work yet and there is no accelerator
-> backend. See [Status](#status) before depending on this.
+> **Pre-alpha.** The operator layer matches upstream PyTorch numerically, 19 of 20 tested
+> architectures reach zero missing operators, real checkpoints load, `transformers` imports and
+> generates, and an Android device runs the built artefact — but there is no accelerator backend,
+> `torch.compile` does not work, and only two of six platforms have been executed rather than
+> merely built. See [Status](#status) and [Platform support](#platform-support) before depending
+> on this.
 
 ---
 
@@ -151,8 +153,9 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Signature and schema tables</td><td><b>4203</b> entries checked against upstream</td></tr>
 <tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
-<tr><td>Build targets</td><td>macOS arm64 · Android arm64 · iOS arm64 — <b>Linux and Windows are in the target matrix and not yet built</b> (<a href="docs/DESIGN.md">DESIGN.md</a> §722)</td></tr>
+<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward</td></tr>
+<tr><td>Speed vs upstream</td><td>desktop CPU: <b>within a few percent</b> on SmolLM2-135M <code>float32</code> prefill, from 14% behind. The kernels were already ahead; the gap was argument binding (<a href="docs/BIND.md">BIND.md</a>)</td></tr>
 </table>
 
 Complete: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT · StarCoder2 ·
@@ -219,8 +222,8 @@ without installing anything — it has not been, and that is a different claim
 
 | device | macOS | Android | iOS | Linux | Windows | WASM | what it is |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
-| `cpu` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 | the only device that holds a tensor |
-| `meta` | ✅ | ✅ | ⚠️ | 🔲 | 🔲 | 🔲 | shape and dtype, no storage |
+| `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | the only device that holds a tensor |
+| `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
 | `mps` | ❌ | — | ❌ | — | — | — | candle has the backend; not enabled |
 | `vulkan` | — | ❌ | — | 🔲 | 🔲 | — | refuses by name; compute proven in a probe, not wired |
 | NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
@@ -234,11 +237,11 @@ rather than inferred from the host.
 
 | dtype | macOS | Android | iOS | Linux · Windows · WASM | arithmetic path |
 |---|:--:|:--:|:--:|:--:|---|
-| `float32` | ✅ | ✅ | ⚠️ | 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
-| `float64` | ✅ | ✅ | ⚠️ | 🔲 | `gemm` |
-| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | 🔲 | widened to `f32` and narrowed — upstream's rule, so **slower than `f32`** |
-| `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | 🔲 | integer kernels |
-| `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | 🔲 | constructs, then hangs on most paths — excluded from the golden suite |
+| `float32` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
+| `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm` |
+| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` and narrowed — upstream's rule, so **slower than `f32`** |
+| `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | integer kernels |
+| `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | constructs, then hangs on most paths — excluded from the golden suite |
 | `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created |
 | the other 35 | ❌ | ❌ | ❌ | ❌ | complex, other float8, 4-bit — refuse by name |
 
@@ -252,9 +255,9 @@ not block it. Reached through `torchnative.quant`, which swaps `nn.Linear`.
 
 | format | macOS | Android | iOS | Linux · Windows · WASM | note |
 |---|:--:|:--:|:--:|:--:|---|
-| Q8_0 | ✅ | ✅ | ⚠️ | 🔲 | lossless on integer operands — bit-identical to a dense `linear` |
-| Q4_0 | ✅ | ✅ | ⚠️ | 🔲 | 29.5% logit RMS on SmolLM2; degrades generation |
-| Q4K | ✅ | ✅ | ⚠️ | 🔲 | a k-quant, needing `k % 256` — **a model constraint, not a platform one** |
+| Q8_0 | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | lossless on integer operands — bit-identical to a dense `linear` |
+| Q4_0 | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | 29.5% logit RMS on SmolLM2; degrades generation |
+| Q4K | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | a k-quant, needing `k % 256` — **a model constraint, not a platform one** |
 
 All three were measured on macOS and on the Android device with the same probe. SmolLM2 cannot use
 the k-quants because its layers are 576 wide and 576 is not a multiple of 256 — that is about the

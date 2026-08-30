@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnative"
-version = "0.0.2a0"
+version = "0.0.3a0"
 description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
 readme = { file = "README.md", content-type = "text/markdown" }
 # Our own code is MIT; the rest of the expression is upstream PyTorch's, copied
@@ -79,10 +79,20 @@ classifiers = [
     "Operating System :: Android",
     "Operating System :: iOS",
     "Operating System :: MacOS",
-    # Linux and Windows are in DESIGN.md's target matrix but have never been
-    # built: no rust target installed, no target CPython distribution. Claiming
-    # them here would be the same defect as the README line that did.
-    # "Operating System :: POSIX :: Linux",
+    # These two are now declared because the wheels exist and pip will hand
+    # them to a Linux or Windows user. Shipping a `manylinux_2_17_x86_64` and a
+    # `win_amd64` wheel while withholding the classifier would be the more
+    # misleading of the two options -- the platform tag already made the claim.
+    #
+    # What they have NOT had is an execution: no Linux box, no Windows box, and
+    # no container runtime on this machine. Verification stops at the artefact
+    # -- every import resolved, `tools/wheel/verify_linux.py` and
+    # `verify_windows.py` -- and the README's platform table marks them ⚠️
+    # rather than ✅ for exactly this reason. The earlier revision of this
+    # comment said they "have never been built", which was true when written
+    # and has not been since.
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
