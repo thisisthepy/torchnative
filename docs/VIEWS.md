@@ -13,7 +13,8 @@ Ordered smallest first, which is also the order they were done in.
 | §1 | `aten.ge.Tensor` has no kernel | **kernel, one arm** — closed |
 | §2 | `index_put_` refuses a bool mask | **kernel** — closed |
 | §3 | `index_put_` refuses non-1-D operands | **kernel** — closed |
-| §4 | `select.int`/`slice.Tensor` return copies, not views | **see §4** |
+| §4 | `select.int`/`slice.Tensor` return copies, not views | **see §4** — superseded by §6 |
+| §6 | the write-through redesign §4 specified | **done** — see §6 |
 
 Baseline, before any of it (this worktree, `e50084f`):
 
@@ -265,6 +266,10 @@ question asked of the op §2-§3 just rewrote.
 
 ## 4. `select.int` and `slice.Tensor` — the views question
 
+> **Superseded by §6, which did the redesign this section specifies.** Everything §4 measures is
+> still true and is the reason §6 is shaped the way it is; only its verdict — "not implemented" —
+> has moved. Read §4 for *why the problem is where it is* and §6 for what was built.
+
 **Verdict: a storage-model redesign, not a kernel change. Not implemented, and §6.4's refusal
 stands.** The reason §6.4 gave for it is wrong, though, and the correct reason changes what the
 redesign has to be — so the refusal is kept and its justification is replaced.
@@ -428,3 +433,326 @@ a green run as proof:
 One case was found by that pass to be incapable of failing (`x[:] = 3.0` through `fill_`, which
 takes its dtype from the receiver on both sides regardless of the lift rule) and a discriminating
 one was added beside it rather than the note being left to imply a guarantee it did not give.
+
+---
+
+## 6. The write-through primitive — §4's redesign, built
+
+Baseline for this section is §5's landing: `run.sh` 225 ok, `compare.py` 3037/3037 ops=122,
+`verify_schemas.py` 4233/4233, and `test_setitem_refuses_the_basic_index_write_rather_than_dropping_it`
+green because no write reached a base.
+
+**The change is one method.** `PyTensorBase::write_into` writes a computed replacement into the
+buffer the receiver already points at, through the receiver's own `Layout`, and every in-place
+kernel calls it instead of `replace_with`. Nothing about the kernels' arithmetic moved.
+
+### 6.1 Why the kernels did not have to be rewritten
+
+§4 point 4 predicted the opposite:
+
+> Most in-place kernels here cannot write through without being rewritten. The dominant shape in
+> `aten.rs` is `read_flat` -> compute into a `Vec` -> `write_flat`, which produces a new buffer by
+> construction. Write-through means re-expressing each of them as a masked write into an existing
+> buffer.
+
+**That was wrong, and it was wrong in a way worth naming, because it is what made the job look
+big.** A kernel that produces "a new buffer with the receiver's shape and the receiver's dtype"
+is not an obstacle to write-through; it is *exactly* the input write-through needs. The
+row-major values of that buffer are the values the destination's layout should receive, position
+for position. So the primitive is:
+
+```
+write_into(dest, src):     for the i-th position of dest in row-major order,
+                           dest_storage[layout.offset_of(i)] = src_flat[i]
+```
+
+and every one of the twelve kernels already computed `src_flat`. The migration is one line each.
+The `read_flat -> Vec -> write_flat` shape is not a problem to solve; it is the shape that made
+this a one-line change per call site instead of twelve rewrites.
+
+**The count in §4 is also off, and the corrected one is worth having**: §4 says "26 in-place
+sites", and `replace_with` had **13** callers — eleven in `aten.rs` (twelve op keys, since
+`fill_.Scalar` and `fill_.Tensor` share a kernel) and two in `tensor.rs`. All eleven `aten.rs`
+callers moved to `write_back`; the two in `tensor.rs` stayed, deliberately (§6.6). So the migration
+is complete by the only definition that matters — **no in-place op still swaps a wrapper, and none
+still refuses** — and the number to check against in future is 11 call sites over 12 keys.
+
+What *is* new is the contract, and it is checked on every call rather than assumed:
+
+| checked | why |
+|---|---|
+| `src.dims() == dest.dims()` | an in-place op changes values, not shape |
+| `src.dtype() == dest.dtype()` (candle) | in-place cannot widen; the kernels already cast |
+| `src.tag == dest.tag` (torch) | a write must not attach or drop the `bool` tag (BOOL.md §6.3) |
+
+All three raise with the op's name and the words "internal error". They were not decoration: the
+first run of the migrated build was 3037/3037 green, and that is a *result* — it says no in-place
+kernel was quietly returning a differently shaped or differently tagged receiver, which nothing
+before had asked.
+
+### 6.2 What was rejected, and why `InplaceOp1` and not `InplaceOp2`
+
+§4 named `InplaceOp1/2/3` as the viable route and called it a new component. It is the right
+route; the arity is not free.
+
+* **`Tensor::slice_set`** — rejected, as §4 already argued: both sides must be contiguous, and it
+  *refuses a pair that shares storage*, which is precisely `x[0:2] = x[1:3]`.
+* **`Tensor::inplace_op2`** — rejected, and this is the part §4 could not have known without
+  reading its body:
+
+  ```rust
+  pub fn inplace_op2<C: InplaceOp2>(&self, rhs: &Self, c: &C) -> Result<()> {
+      self.storage_mut().inplace_op2(self.layout(), &rhs.storage(), rhs.layout(), c)
+  }
+  ```
+
+  `storage_mut()` takes the write lock on `self`'s `RwLock`; `rhs.storage()` then takes the read
+  lock on `rhs`'s. **When the two operands alias, that is the same `RwLock`, and a write-then-read
+  on one thread is a deadlock, not an error.** Aliasing operands are not exotic here — they are
+  the case this whole section exists for. So `inplace_op2` is unusable for the one thing it looks
+  built for.
+* **`Tensor::inplace_op1`** — taken. It locks one storage, and the source is read out into an
+  owned `CpuStorage` *before* that lock is acquired.
+
+Reading the source first is not merely a way to dodge the lock. It is what makes an overlapping
+copy mean something: `x[0:1] = x[1:2]` reads row 1 and then writes row 0, which is upstream's
+answer (measured: `[[3,4,5],[3,4,5]]`). A streaming copy would read values it had already
+overwritten.
+
+**There is no `unsafe` anywhere in this change.** candle holds storage in `Arc<RwLock<Storage>>`,
+so aliasing-XOR-mutability is enforced at runtime by the lock rather than by a raw pointer. That
+is also why `write_into` takes `&self` and not `&mut self`, and why `write_back` in `aten.rs` uses
+`borrow()` rather than `borrow_mut()`: the mutation is candle's interior mutability, so the
+Python-level `RefCell` borrow stays shared and a kernel may still be holding a read borrow when it
+calls.
+
+Two details of the walk, both in `tensor.rs::write_strided`:
+
+* **Bounds are proved once, before the loop.** The furthest position reachable is
+  `start_offset + Σ (dim-1)·stride`, since every index runs `0..dim` and candle's strides are
+  `usize`. One check up front means no write in the loop can be out of range, and a wrong layout
+  becomes an error rather than a corrupted neighbouring tensor.
+* **Contiguous destinations take a `copy_from_slice`.** The odometer would give the same answer;
+  the branch exists because it is the common case (`x[0]`, `x[1:3]`, and every whole-tensor
+  in-place op), and it is covered by the same expectations as the strided cases.
+
+### 6.3 The divergences that write-through *created*, and their fixes
+
+This is the part §4 warned about — "the divergence does not get closed by a partial write-through;
+it gets relocated and doubled" — and it is real. The instrument is a probe that asks, of upstream
+and of the shim with one script: *does writing into the result of this op reach its input?*
+Twenty-eight relationships, both sides:
+
+```
+                                 upstream      shim (before)  shim (after)
+alias / detach / lift_fresh       SHARED        SHARED         SHARED
+expand / permute / t / transpose  SHARED        SHARED         SHARED
+select.int (dim 0 and dim 1)      SHARED        SHARED         SHARED
+slice.Tensor step 1               SHARED        SHARED         SHARED
+squeeze.dim / unsqueeze           SHARED        SHARED         SHARED
+view.default / _unsafe_view       SHARED        SHARED         SHARED
+split / split_with_sizes/ unbind  SHARED        SHARED         SHARED
+contiguous (already contiguous)   SHARED        SHARED         SHARED
+contiguous (of a strided input)   independent   independent    independent
+clone                             independent   independent    independent
+zeros_like / empty_like           independent   independent    independent
+neg / abs / relu / masked_fill    independent   independent    independent
+_to_copy (dtype change)           independent   independent    independent
+_to_copy (nothing to convert)     independent   SHARED  <--    independent
+slice.Tensor step 2               SHARED        independent <- independent
+view.dtype                        SHARED        independent <- independent
+```
+
+The "shim (before)" column is not a reconstruction — the probe was run against a build of `HEAD`
+before any of this, and against upstream, with the same script. Every "SHARED" in it was **inert**,
+because no write reached storage; making one write go through turns all twenty-eight into
+correctness questions at once, which is why the table is a smoke test
+(`test_which_ops_share_storage_with_their_input_and_which_do_not`) and not a paragraph.
+
+Two of them were not inert afterwards:
+
+1. **`_to_copy.default` with nothing to convert aliased its input.** `to_device` and `fast_to`
+   both return `self.clone()` when there is nothing to do, and a candle clone is an `Arc` clone.
+   So `y = x.to(torch.float32)` on a float32 tensor handed back an alias, and `y.fill_(0)` would
+   have zeroed `x` where upstream leaves it alone. **This is the sharpest thing found in the whole
+   change**: it is a corruption, not a lost write, and nothing in the golden suite could have
+   caught it — the harness compares values of results, and both sides' *results* were correct.
+   Fixed with `Tensor::copy()` on the no-op path only; the dtype- and device-changing paths have
+   already allocated.
+
+2. **An expanded destination.** `expand` gives stride 0, so several logical positions share one
+   storage element and a write is last-write-wins. Upstream's answer is a table, measured on
+   2.13.0:
+
+   | op | upstream |
+   |---|---|
+   | `fill_.Scalar`, `zero_` | writes |
+   | `masked_fill_`, `index_put_` | writes, with a deprecation warning |
+   | `fill_.Tensor`, `copy_`, `add_`, `relu_`, `clamp_`, `div_`, `uniform_`, `normal_` | **raises** |
+
+   The `fill_` pair is the one that had to be measured rather than reasoned about: two overloads
+   of one kernel, one permitted and one refused. Reproduced as a table in `aten.rs::write_back`,
+   with the detection in `tensor.rs::has_internal_overlap` written to be exactly upstream's
+   `c10::has_internal_overlap` — **including its conservatism**: dense is `No`, a stride of 0 on
+   an axis longer than 1 is `Yes`, and anything else is permitted. A stricter test would refuse
+   strided views upstream writes into happily, which is the divergence in the other direction.
+
+### 6.4 The two that remain, and why candle cannot close them
+
+| | upstream | here |
+|---|---|---|
+| `slice.Tensor`, step > 1 | a view; a write reaches the base | materialised; the write is lost |
+| `view.dtype` | a view; a write reaches the base | materialised; the write is lost |
+
+Both are **write-lost**, not corruption, and both are blocked by candle's storage model rather
+than by its visibility rules:
+
+* A **stepped view** needs a `Layout` whose stride is `step` over the *input's* storage.
+  `Layout::new` is public, but the only public pairing of a storage with a layout is
+  `Tensor::from_storage`, which is documented as contiguous-only and takes a
+  `candle_core::Storage` that `Tensor::storage()` (`pub(crate)`) will not hand over. So this is
+  behind the `pub(crate)` boundary, and closing it means a fork, a vendored candle, or an upstream
+  PR adding a strided-view constructor — none of which this change may do.
+* **`view.dtype`** needs a layout that reinterprets bytes. candle's `Layout` counts *elements* of
+  a storage whose dtype is fixed by the `CpuStorage` variant. There is nothing to construct at any
+  visibility; this one is not a boundary problem, it is a model difference.
+
+Both are pinned three ways rather than described: an `expect="diverge"` golden case each (which
+compares the base against upstream and **fails if either silently starts agreeing**), a smoke test
+that asserts the shim's half on its own, and — for the step case — `__setitem__` refusing a
+`step != 1` slice by name, so the door a caller actually writes through does not reach it.
+
+### 6.5 The one gap that is a cost decision rather than a wall
+
+Upstream refuses a `copy_` whose source and destination **partially** overlap:
+`x[0:2].copy_(x[1:3])` raises *"some elements of the input tensor and the written-to tensor refer
+to a single memory location"*. Disjoint views of one buffer are fine (`x[0:1].copy_(x[1:2])`
+computes, and that is the shape `x[0:1] = x[1:2]` produces, so it has to keep working).
+
+This shim reads the source out before it takes the destination's lock, so it computes a defined
+answer where upstream raises. Reproducing the refusal means upstream's `get_overlap_status`, which
+compares the two storages' **data pointers** — and candle's `storage()` is `pub(crate)`.
+
+It is reachable without a fork, and the route is worth writing down because it is not obvious:
+an `InplaceOp1` whose `cpu_fwd` does nothing but read `CpuStorage::as_ptr()` recovers storage
+identity through a public API. The price is **one extra write-lock acquisition per in-place op
+with a tensor operand**, on the dispatcher's hot path. Not paid here; recorded as an
+`expect="torch_error"` golden case so it prints on every run.
+
+### 6.6 What `replace_with` is for now
+
+Two callers, both of them ones where **rebinding is the operation** and upstream rebinds too:
+
+* `TensorBase.set_` — adopts a different storage, shape and possibly dtype; there is no existing
+  buffer to write into, since the point is to leave it.
+* `tensor.data = other` — upstream swaps the `TensorImpl`, so a view taken before the assignment
+  does not follow it there either (docs/DEVICE_ABS.md §4).
+
+Its doc comment now says so, and says that anything meaning "the receiver's values change but the
+receiver stays the same tensor" must not come there.
+
+### 6.7 `__setitem__`'s basic-index branch
+
+The refusal is gone and the walk is `__getitem__`'s, emitting the same keys with the same
+arguments — an index that reads as `x[0, 1:3]` must narrow to the same view whether it is being
+read or written.
+
+**One measurement in §4-era prose was wrong and is corrected**: the docstring recorded
+`x[0] = 3.0 -> [select.int, copy_.default]`. Re-measured on 2.13.0 it is
+`[lift_fresh, select.int, fill_.Tensor]`. The rule is not "number on the right versus tensor on
+the right"; it is upstream's `copy_to`, and it is about **shapes**:
+
+```
+sizes equal        -> copy_          x[0,1] = 9.0   (0-d destination, 0-d source)
+else source is 0-d -> fill_          x[0]   = 3.0   ((4,) destination, 0-d source)
+else               -> broadcast, copy_
+```
+
+`x[0] = 3.0` and `x[0,1] = 9.0` differ only in shape and land on different ops, which is why both
+are cased. Nine `fill_`/`copy_` member cases pin the arms; the previous rule would have put five
+of them on the wrong key.
+
+### 6.8 `clamp_` on a `torch.bool` receiver, which the guards found
+
+Not a write-through question, but the contract check found it and it is a real defect: the kernel
+produced a `uint8` replacement for a `bool` receiver, and `replace_with` **retagged the receiver**
+from `torch.bool` to `torch.uint8`. Upstream refuses — *"result type Long can't be cast to the
+desired output type bool"*, and *"Float"* in place of *"Long"* when a bound is a float. So this was
+computing where upstream refuses.
+
+Refused at the door now, with upstream's wording; the tag check underneath stays as the structural
+backstop. `uint8` — the dtype `bool` shares candle's `U8` storage with — still computes, and the
+pair is cased together, because that is what makes the refusal a statement about the *tag* rather
+than about the bytes (BOOL.md §5-B).
+
+### 6.9 Sabotage
+
+Eight faults, each injected into the source, rebuilt, installed, and counted. Never a green run
+read as proof.
+
+| injected fault | golden failed | smoke failed |
+|---|---:|---:|
+| **A** `write_back` reverts to `replace_with` (the pre-§6 behaviour) | **27** of 3075 | 5 |
+| **B** `write_strided` ignores the layout's `start_offset` | 17 | 2 |
+| **C** the contiguous fast path taken unconditionally | 10 | *aborted — see below* |
+| **D** `has_internal_overlap` always false | 2 | 1 |
+| **E** `_to_copy` with nothing to convert aliases its input again | 2 | 1 |
+| **F** `__setitem__`'s `copy_to` rule loses its `fill_` arm | **0** | **0** |
+| **G** `__setitem__` stops refusing a `step > 1` slice | 1 | 1 |
+| **H** `write_into` stops checking the replacement's shape and tag | **0** | **0** |
+
+**Fault A is the number that matters.** It restores exactly the behaviour this shim shipped
+before, and it fails 27 golden cases and 5 smoke tests — where before §6 the same behaviour was
+3037/3037 green. That is the measurement of how invisible the defect was, and it is why every one
+of the new cases reads the base rather than the in-place op's return value.
+
+Three of the eight need their result stated rather than tabulated:
+
+* **C aborted the smoke run** with a `PanicException` (`range end index 6 out of range for slice of
+  length 2`) at the first expanded destination, because forcing the fast path invalidates the
+  bounds proof the fault also bypassed. `PanicException` derives from `BaseException`, so the
+  runner's `except Exception` does not catch it and the run stops at test 14 of 229. Caught, but
+  uncountable. Running the two relevant tests past it separately, both fail — so the honest row is
+  "10 golden, and 2 smoke that the abort prevented from being counted".
+
+* **F and H could not fail, and both were checked rather than assumed.**
+
+  **F** — `copy_` broadcasts a 0-d source to exactly the values `fill_` writes, so the arm choice
+  is not observable by value. It is not observable by error either: the overflow refusal that
+  separates the two kernels (`fill_(float16, 1e6)` raises, `copy_` gives `inf`) never fires,
+  because `_lift` narrows the number to a 0-d tensor before either op sees it — measured, both
+  arms give `inf` and both agree with upstream. And the one instrument that would show the op
+  *name*, the capture facility, **refuses to record any region containing an in-place op**. So the
+  distinction is carried because it is upstream's measured lowering, not because anything here
+  guards it, and the case notes say so instead of letting the op key imply otherwise.
+
+  **H** — the contract checks are unreachable, which is itself the measured result: every in-place
+  kernel already broadcasts into the receiver's shape and casts into its dtype, so candle refuses
+  first on every input that would reach them (`copy_((2,),(2,2))`, `add_((2,1),(2,2))`,
+  `masked_fill_((4,1), mask (4,2))` all stop at `broadcast_as`). The one input that *did* reach
+  one — `bool.clamp_(0, 5)`, §6.8 — now refuses at the door. A test for these would have to be a
+  kernel that violates the contract, and the public API cannot produce one.
+
+**One case was found by this pass to be incapable of failing and was given an instrument rather
+than a note**: fault E — `_to_copy` aliasing its input — was invisible at first, 3071/3071 and 229
+smoke tests green. It is the *sharpest* defect in the change (a corruption, not a lost write), and
+nothing could catch it because every existing case compares the op's **result**, which was
+correct. Two golden cases that write into the result and read the **input**, plus a smoke test that
+asserts the whole 28-row aliasing table in both directions, now fail on it.
+
+### 6.10 Where §6 landed
+
+|  | after §5 | after §6 |
+|---|---|---|
+| `run.sh` | 225 ok | **229 ok** |
+| `compare.py` | 3037 / 3037, ops=122 | **3075 / 3075**, ops=122 |
+| `compare.py --self-test` | 13 × 11, 0 problems | unchanged |
+| `verify_schemas.py` | 4233 / 4233 | unchanged |
+| in-place ops visible through a view | none | **all twelve** |
+| `x[0] = v`, `x[:,1] = v`, `x[1:3] = v` | refused by name | kernel |
+| aliasing relationships agreeing with upstream | 25 of 28 | **26 of 28** |
+| SmolLM2-135M float32 prefill | — | **bit-identical logits** |
+
+The prefill check is the one that says this is not an optimisation with a tail: an aliasing change
+that altered a model result would be a bug, and the sha256 of all 245 760 float32 logits is
+unchanged.

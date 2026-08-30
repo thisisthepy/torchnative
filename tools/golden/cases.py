@@ -2693,6 +2693,47 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=1, start=1, end=3, step=1),
         )
     )
+
+    # **The one aliasing relationship in this shim that still disagrees with
+    # upstream**, recorded as a divergence so it prints every run and so the
+    # case *fails if it silently heals*.
+    #
+    # `slice.Tensor` at step 1 narrows and shares storage; above step 1 it
+    # reaches the result through `index_select`, which copies. So a write
+    # through `x[::2]` is seen by `x` upstream and lost here. It cannot be
+    # closed inside candle's public API: a stepped view needs a `Layout` with a
+    # stride of `step` over the *input's* storage, and the only public pairing
+    # of a storage with a layout is `Tensor::from_storage`, documented as
+    # contiguous-only and taking a `Storage` that `Tensor::storage()`
+    # (`pub(crate)`) will not hand over. docs/VIEWS.md §6.4.
+    #
+    # `__setitem__` refuses a step above 1 by name for exactly this reason, so
+    # the door a caller writes through does not reach it; this case reaches it
+    # deliberately, through the dispatch key.
+    def _step_two_write(is_torch, base):
+        if is_torch:
+            view = torch_module.ops.aten.slice.Tensor(base, 0, 0, 4, 2)
+            torch_module.ops.aten.fill_.Scalar(view, 0.0)
+        else:
+            view = c_module._aten_dispatch(op, base, 0, 0, 4, 2)
+            c_module._aten_dispatch("aten.fill_.Scalar", view, 0.0)
+        return base
+
+    cases.append(
+        Case(
+            name="base after fill_(x[0:4:2], 0.0) [reads the BASE] -- step > 1 is a copy here",
+            op=op,
+            run_torch=lambda: _step_two_write(
+                True, torch_module.tensor([1.0, 2.0, 3.0, 4.0])),
+            run_c=lambda: _step_two_write(
+                False, c_module._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [4],
+                                                 dtype=c_module.float32)),
+            expect="diverge",
+            note="a step-2 slice aliases upstream and is materialised here, so the write "
+                 "reaches the base upstream ([0,2,0,4]) and is lost here ([1,2,3,4]). "
+                 "candle has no public constructor for a stepped view -- docs/VIEWS.md §6.4",
+        )
+    )
     return cases
 
 
@@ -3609,6 +3650,44 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=note,
             )
         )
+
+    # **The second of the two aliasing relationships still disagreeing with
+    # upstream** (the other is a step > 1 `slice.Tensor`, in `slice_cases`).
+    #
+    # Upstream's `view.dtype` is a genuine view: the same bytes, reinterpreted,
+    # so writing through the result reaches the input. Here it goes out through
+    # `to_le_bytes` and back in through `from_le_bytes`, which allocates -- and
+    # it *has* to, because candle's `Layout` is measured in elements of a
+    # storage whose dtype is fixed. There is no reinterpreting Layout to build,
+    # publicly or privately, so this is a property of candle's storage model
+    # rather than of its visibility rules. docs/VIEWS.md §6.4.
+    #
+    # Recorded rather than fixed, and recorded as a `diverge` so it fails if it
+    # ever starts agreeing without this note being updated.
+    def _view_dtype_write(is_torch, base):
+        if is_torch:
+            view = torch_call(base, torch_module.float32)
+            torch_module.ops.aten.fill_.Scalar(view, 0.0)
+        else:
+            view = c_module._aten_dispatch(op, base, c_module.float32)
+            c_module._aten_dispatch("aten.fill_.Scalar", view, 0.0)
+        return base
+
+    cases.append(
+        Case(
+            name="base after fill_(x.view(float32), 0.0) [reads the BASE] -- a copy here",
+            op=op,
+            run_torch=lambda: _view_dtype_write(
+                True, torch_module.tensor([1, 2, 3, 4], dtype=torch_module.int32)),
+            run_c=lambda: _view_dtype_write(
+                False, c_module._tensor_from_flat([1, 2, 3, 4], [4], dtype=c_module.int32)),
+            expect="diverge",
+            note="view.dtype aliases upstream and reinterprets through a byte round-trip "
+                 "here, so the write reaches the base upstream ([0,0,0,0]) and is lost "
+                 "here ([1,2,3,4]). candle's Layout counts elements of a fixed-dtype "
+                 "storage -- docs/VIEWS.md §6.4",
+        )
+    )
     return cases
 
 
@@ -3638,6 +3717,47 @@ def to_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
                 run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
                 note=note,
+            )
+        )
+
+    # **`_to_copy` must copy even when there is nothing to convert**, and the
+    # only way to ask is to write into the result and read the *input*.
+    #
+    # This case exists because its absence was measured. `to_device` and
+    # `fast_to` both return `self.clone()` when the dtype and device already
+    # match, and a candle clone is an `Arc` clone -- so `x.to(torch.float32)`
+    # on a float32 tensor handed back an alias. Deleting the `Tensor::copy()`
+    # that fixes it left the whole suite at 3069/3069 and all 228 smoke tests
+    # green: every existing case compares the op's *result*, and the result was
+    # right. Only reading the input afterwards can fail.
+    #
+    # It is the sharpest defect write-through can produce, because it is a
+    # corruption rather than a lost write: upstream leaves `x` alone.
+    # docs/VIEWS.md §6.3.
+    for dtype_name in ["float32", "int64"]:
+        def _write_through_result(is_torch, base, dtype_name=dtype_name):
+            if is_torch:
+                out = torch_call(base, dtype=dt.torch_dtype(torch_module, dtype_name))
+                torch_module.ops.aten.fill_.Scalar(out, 0)
+            else:
+                out = c_module._aten_dispatch(op, base, dtype=dt.c_dtype(c_module, dtype_name))
+                c_module._aten_dispatch("aten.fill_.Scalar", out, 0)
+            return base
+
+        cases.append(
+            Case(
+                name=f"input after fill_(x.to({dtype_name}), 0) with NOTHING to convert "
+                     f"[reads the INPUT]",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name, f=_write_through_result: f(
+                    True, torch_module.tensor(
+                        [1, 2, 3, 4], dtype=dt.torch_dtype(torch_module, dtype_name)
+                    ).reshape([2, 2])),
+                run_c=lambda dtype_name=dtype_name, f=_write_through_result: f(
+                    False, c_module._tensor_from_flat(
+                        [1, 2, 3, 4], [2, 2], dtype=dt.c_dtype(c_module, dtype_name))),
+                note="_to_copy is named for the copy; a no-op conversion that aliased "
+                     "would let a write into the result corrupt the input",
             )
         )
     return cases
@@ -3679,6 +3799,10 @@ def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=(note or "in-place fill") + " -- compares the mutated operand fill_ returns",
                 )
             )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.fill_.Scalar"
+    )
     return cases
 
 
@@ -3710,6 +3834,10 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
     )
     cases.extend(
         c for c in _setitem_member_cases(torch_module, c_module)
+        if c.op == "aten.copy_.default"
+    )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
         if c.op == "aten.copy_.default"
     )
     return cases
@@ -5663,6 +5791,10 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
         c for c in _setitem_member_cases(torch_module, c_module)
         if c.op == "aten.fill_.Tensor"
     )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.fill_.Tensor"
+    )
     return cases
 
 
@@ -6918,6 +7050,10 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=label,
             )
         )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.zero_.default"
+    )
     return cases
 
 
@@ -7988,6 +8124,10 @@ def relu__cases(torch_module, c_module, torch_call) -> list[Case]:
                  "relu.default, measured on the in-place overload too",
         )
     )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.relu_.default"
+    )
     return cases
 
 
@@ -8742,6 +8882,10 @@ def add__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: [True,False].add_([True,True]) -> [True,True] (logical or, measured); "
                  "the shim's blanket bool refusal in arith_tag over-refuses here",
         )
+    )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.add_.Tensor"
     )
     return cases
 
@@ -9555,7 +9699,47 @@ def clamp__default_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: \"result type Float can't be cast to the desired output type Int\"",
         )
     )
+    # `torch.bool` refuses on every spelling of the bounds, and the message
+    # names the *bound's* type rather than the receiver's -- measured on
+    # 2.13.0. It is cased because it used to compute: the kernel produced a
+    # `uint8` replacement and `replace_with` retagged the receiver from
+    # `torch.bool` to `torch.uint8`, which is computing where upstream refuses.
+    # docs/VIEWS.md §6.8.
+    for bounds, note in (
+        ((0, 5), "torch: \"result type Long can't be cast to the desired output type bool\""),
+        ((0.0, 1.0), "float bounds name Float in the same message"),
+        ((None, 1), "one bound is enough"),
+    ):
+        b_t, b_c = pair_from_flat(
+            torch_module, c_module, [True, False, True], (3,), "bool")
+        cases.append(
+            Case(
+                name=f"clamp_(dtype=bool, min={bounds[0]}, max={bounds[1]}) [refused]",
+                op=op,
+                run_torch=lambda b_t=b_t, bounds=bounds: torch_call(b_t, *bounds),
+                run_c=lambda b_c=b_c, bounds=bounds: c_module._aten_dispatch(op, b_c, *bounds),
+                expect="both_error",
+                note=note,
+            )
+        )
+    # ...while `uint8`, the dtype `bool` shares candle storage with, computes.
+    # The pair is what makes the refusal a statement about the *tag* rather
+    # than about the bytes (BOOL.md §5-B).
+    u_t, u_c = pair_from_flat(torch_module, c_module, [3, 5, 0], (3,), "uint8")
+    cases.append(
+        Case(
+            name="clamp_(dtype=uint8, min=0, max=4) [computes -- the bool sibling does not]",
+            op=op,
+            run_torch=lambda: torch_call(u_t, 0, 4),
+            run_c=lambda: c_module._aten_dispatch(op, u_c, 0, 4),
+            note="bool and uint8 share candle's U8 storage and differ only in the tag",
+        )
+    )
     cases.extend(_clamp__member_cases(torch_module, c_module))
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.clamp_.default"
+    )
     return cases
 
 
@@ -9618,6 +9802,10 @@ def div__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     cases.extend(_div__member_cases(torch_module, c_module))
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.div_.Tensor"
+    )
     return cases
 
 
@@ -9682,6 +9870,10 @@ def masked_fill__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     cases.extend(_masked_fill__member_cases(torch_module, c_module))
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.masked_fill_.Scalar"
+    )
     return cases
 
 
@@ -10072,6 +10264,10 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
     )
     cases.extend(
         c for c in _setitem_member_cases(torch_module, c_module)
+        if c.op == "aten.index_put_.default"
+    )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
         if c.op == "aten.index_put_.default"
     )
     return cases
@@ -11303,14 +11499,280 @@ def _chunk_member_cases(torch_module, c_module) -> list[Case]:
     return cases
 
 
+def _view_write_cases(torch_module, c_module) -> list[Case]:
+    """**Every case here throws the in-place op's return value away and
+    compares the BASE.**
+
+    That is the entire point of the builder and it is not a stylistic
+    preference. Every in-place op returns `self`, so a case that compares the
+    return value passes just as well against a kernel that computed into a
+    fresh buffer and handed it back -- which is exactly what this shim did
+    until docs/VIEWS.md §6. The whole suite was 3037 cases green while no
+    in-place write was visible through any view. A case can only fail that way
+    if it reads a name the op never returned.
+
+    So each case: builds a base, narrows a *view* of it, writes through the
+    view, and returns the base. Upstream runs the identical sequence, so the
+    expectation is measured rather than asserted.
+
+    The views are chosen for what they exercise in `tensor.rs::write_strided`:
+
+      * `select.int(base, 1, k)` is **non-contiguous** -- stride `ncols`, so it
+        takes the odometer branch. A shim that only handled contiguous
+        destinations would pass the whole rest of the suite.
+      * `t.default(base)` is non-contiguous in both axes.
+      * `select.int(base, 0, k)` and `slice.Tensor(base, 0, i, j, 1)` are
+        contiguous *with a non-zero start offset*, which is the other half a
+        naive `dst[..numel]` write would get wrong.
+      * `detach(base)` is the whole tensor, offset 0 -- the case that passes
+        even against `replace_with`... except that `replace_with` swaps a
+        *different wrapper*, so it fails there too.
+    """
+    A = torch_module.ops.aten
+
+    def t_call(op, *args):
+        name, over = op[len("aten."):].rsplit(".", 1)
+        return getattr(getattr(A, name), over)(*args)
+
+    def c_call(op, *args):
+        return c_module._aten_dispatch(op, *args)
+
+    cases: list[Case] = []
+
+    def add(op, name, note, base_flat, base_shape, dtype_name, body, expect="match"):
+        """`body(call, base)` narrows and writes; the base is what is compared."""
+        def side(call, module_flat_builder):
+            base = module_flat_builder()
+            body(call, base)
+            return base
+        t_build = lambda: torch_module.tensor(
+            list(base_flat), dtype=dt.torch_dtype(torch_module, dtype_name)
+        ).reshape(list(base_shape))
+        c_build = lambda: c_module._tensor_from_flat(
+            list(base_flat), list(base_shape), dtype=dt.c_dtype(c_module, dtype_name)
+        )
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: side(t_call, t_build),
+                run_c=lambda: side(c_call, c_build),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    grid = [float(v) for v in range(1, 13)]          # 1..12
+    signed = [float(v) for v in range(-6, 6)]        # -6..5
+
+    # --- fill_.Scalar: the two view shapes, plus the whole-tensor alias -----
+    add("aten.fill_.Scalar",
+        "base after fill_(x[:,1], 7.0) [reads the BASE, not the view]",
+        "select.int on dim 1 is a strided view; upstream's fill_ writes through it",
+        grid, (3, 4), "float32",
+        lambda call, base: call("aten.fill_.Scalar", call("aten.select.int", base, 1, 1), 7.0))
+    add("aten.fill_.Scalar",
+        "base after fill_(x[1], 7.0) [reads the BASE]",
+        "select.int on dim 0 is contiguous with a non-zero start offset",
+        grid, (3, 4), "float32",
+        lambda call, base: call("aten.fill_.Scalar", call("aten.select.int", base, 0, 1), 7.0))
+    add("aten.fill_.Scalar",
+        "base after fill_(x.t(), 7.0) [reads the BASE]",
+        "a transposed destination -- non-contiguous in both axes",
+        grid, (3, 4), "float32",
+        lambda call, base: call("aten.fill_.Scalar", call("aten.t.default", base), 7.0))
+    add("aten.fill_.Scalar",
+        "base after fill_(detach(x), 7.0) [reads the BASE]",
+        "detach shares storage upstream and here; before write-through it did not "
+        "share a wrapper, so the write was lost",
+        grid, (3, 4), "float32",
+        lambda call, base: call("aten.fill_.Scalar", call("aten.detach.default", base), 7.0))
+    add("aten.fill_.Scalar",
+        "base after fill_(x[1:3], 7.0) (dtype=int64) [reads the BASE]",
+        "slice.Tensor at step 1 narrows; step > 1 does not, and is a recorded "
+        "divergence in slice_cases",
+        [float(v) for v in range(1, 13)], (3, 4), "int64",
+        lambda call, base: call(
+            "aten.fill_.Scalar", call("aten.slice.Tensor", base, 0, 1, 3, 1), 7))
+
+    # --- zero_ -------------------------------------------------------------
+    add("aten.zero_.default",
+        "base after zero_(x[:,2]) [reads the BASE]",
+        "zero_ is a separate overload from fill_(0) upstream and writes through too",
+        grid, (3, 4), "float32",
+        lambda call, base: call("aten.zero_.default", call("aten.select.int", base, 1, 2)))
+
+    # --- copy_ -------------------------------------------------------------
+    add("aten.copy_.default",
+        "base after x[:,1].copy_(src) [reads the BASE]",
+        "the column is filled from a (3,) source, positions 1, 5, 9 of the base",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.copy_.default", call("aten.select.int", base, 1, 1),
+            call("aten.mul.Scalar", call("aten.select.int", base, 1, 0), 100.0)))
+    add("aten.copy_.default",
+        "base after x.t().copy_(x.t()*0) [reads the BASE]",
+        "a transposed destination fed a transposed source",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.copy_.default", call("aten.t.default", base),
+            call("aten.mul.Scalar", call("aten.t.default", base), 0.0)))
+    # Two aliasing slices that do NOT overlap. Upstream permits this and so
+    # does the shim, and it is the case `x[0:1] = x[1:2]` in `__setitem__`
+    # reaches, so it has to keep working.
+    add("aten.copy_.default",
+        "base after x[0:1].copy_(x[1:2]) -- disjoint slices of one buffer",
+        "measured: upstream permits a copy between two non-overlapping views of the "
+        "same storage, and this is the shape `x[0:1] = x[1:2]` produces",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.copy_.default",
+            call("aten.slice.Tensor", base, 0, 0, 1, 1),
+            call("aten.slice.Tensor", base, 0, 1, 2, 1)))
+    # ...and two that DO. **Recorded as a gap, not as agreement.** Upstream's
+    # `assert_no_partial_overlap` raises "some elements of the input tensor and
+    # the written-to tensor refer to a single memory location"; the shim reads
+    # the source out into an owned buffer before it takes the destination's
+    # lock (`tensor.rs::write_into`), so it computes a defined answer instead.
+    #
+    # Refusing to match would need upstream's `get_overlap_status`, which
+    # compares the two storages' *data pointers* -- and candle's `storage()` is
+    # `pub(crate)`. It is reachable at a price: an `InplaceOp1` that only reads
+    # `CpuStorage::as_ptr` would recover the identity, at one extra write-lock
+    # acquisition per in-place op with a tensor operand, on the hot path.
+    # docs/VIEWS.md §6.5 has the argument for not paying it yet.
+    add("aten.copy_.default",
+        "x[0:2].copy_(x[1:3]) -- PARTIALLY overlapping, which upstream refuses",
+        "known gap: upstream raises on a partial overlap between source and "
+        "destination; this shim reads the source out first and computes "
+        "[[5..8],[9..12],[9..12]] -- docs/VIEWS.md §6.5",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.copy_.default",
+            call("aten.slice.Tensor", base, 0, 0, 2, 1),
+            call("aten.slice.Tensor", base, 0, 1, 3, 1)),
+        expect="torch_error")
+    add("aten.copy_.default",
+        "expand(x, ...).copy_(y) refuses -- destination addresses one element twice",
+        "torch: 'unsupported operation: more than one element of the written-to tensor "
+        "refers to a single memory location'. The source is an independent tensor on "
+        "purpose: `copy_` short-circuits when the two sides are the same view, so an "
+        "expanded source would make this case unable to fail",
+        [1.0, 2.0], (1, 2), "float32",
+        lambda call, base: call(
+            "aten.copy_.default", call("aten.expand.default", base, [3, 2]),
+            call("aten.mul.Scalar", call("aten.expand.default", base, [3, 2]), 0.0)),
+        expect="both_error")
+
+    # --- fill_.Tensor: refused on an expanded destination where .Scalar is not
+    add("aten.fill_.Tensor",
+        "expand(x, ...).fill_(0-d tensor) refuses where fill_.Scalar does not",
+        "measured on torch 2.13.0: the Scalar overload writes an expanded tensor and "
+        "the Tensor overload raises -- an asymmetry between two arms of one kernel",
+        [1.0, 2.0], (1, 2), "float32",
+        lambda call, base: call(
+            "aten.fill_.Tensor", call("aten.expand.default", base, [3, 2]),
+            call("aten.select.int", call("aten.select.int", base, 0, 0), 0, 0)),
+        expect="both_error")
+
+    # --- add_ / relu_ / clamp_ / div_ / masked_fill_ / index_put_ ----------
+    add("aten.add_.Tensor",
+        "base after x[:,1].add_(x[:,0]) [reads the BASE]",
+        "arithmetic in place through a strided view",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.add_.Tensor", call("aten.select.int", base, 1, 1),
+            call("aten.select.int", base, 1, 0)))
+    add("aten.relu_.default",
+        "base after x[:,1].relu_() [reads the BASE]",
+        "the negatives in column 1 clamp to zero and the rest of the base is untouched",
+        signed, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.relu_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.clamp_.default",
+        "base after x[:,1].clamp_(-1, 1) [reads the BASE]",
+        "both bounds, through a strided view",
+        signed, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.clamp_.default", call("aten.select.int", base, 1, 1), -1.0, 1.0))
+    add("aten.div_.Tensor",
+        "base after x[:,1].div_(x[:,2]) [reads the BASE]",
+        "true division in place through a strided view",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.div_.Tensor", call("aten.select.int", base, 1, 1),
+            call("aten.select.int", base, 1, 2)))
+
+    # `masked_fill_` and `index_put_` need a mask/index operand, which
+    # `_tensor_from_flat` will not build as bool directly -- same workaround
+    # `masked_fill__scalar_cases` documents.
+    def masked(call, base, mask):
+        return call("aten.masked_fill_.Scalar", call("aten.select.int", base, 1, 1), mask, -1.0)
+
+    t_mask = torch_module.tensor([True, False, True])
+    c_mask = c_module._tensor_from_flat([1, 0, 1], [3], dtype=c_module.bool)
+    cases.append(
+        Case(
+            name="base after x[:,1].masked_fill_(mask, -1.0) [reads the BASE]",
+            op="aten.masked_fill_.Scalar",
+            run_torch=lambda: (
+                lambda b: (masked(t_call, b, t_mask), b)[1]
+            )(torch_module.tensor(grid).reshape([3, 4])),
+            run_c=lambda: (
+                lambda b: (masked(c_call, b, c_mask), b)[1]
+            )(c_module._tensor_from_flat(grid, [3, 4], dtype=c_module.float32)),
+            note="a masked write through a strided view, read back through the base",
+        )
+    )
+
+    t_idx = torch_module.tensor([0, 2])
+    c_idx = c_module._tensor_from_flat([0, 2], [2], dtype=c_module.int64)
+
+    def put(call, base, idx, values):
+        return call(
+            "aten.index_put_.default", call("aten.select.int", base, 1, 1),
+            [idx], values, False)
+
+    cases.append(
+        Case(
+            name="base after x[:,1].index_put_([0,2], v) [reads the BASE]",
+            op="aten.index_put_.default",
+            run_torch=lambda: (
+                lambda b: (put(t_call, b, t_idx, torch_module.tensor([-1.0, -2.0])), b)[1]
+            )(torch_module.tensor(grid).reshape([3, 4])),
+            run_c=lambda: (
+                lambda b: (
+                    put(c_call, b, c_idx,
+                        c_module._tensor_from_flat([-1.0, -2.0], [2], dtype=c_module.float32)),
+                    b,
+                )[1]
+            )(c_module._tensor_from_flat(grid, [3, 4], dtype=c_module.float32)),
+            note="index_put_ through a strided view, read back through the base",
+        )
+    )
+
+    return cases
+
+
 def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     """`x[...] = v`. `__setitem__` is a walk over the index like
-    `__getitem__`, and only part of that walk is reproducible here -- see the
-    member's docstring in `bootstrap.py`. The reproducible part is cased
-    against upstream; the rest is refused by name and pinned in
-    `test_shim.py::test_setitem_refuses_the_basic_index_write_rather_than_dropping_it`,
-    where the *reason* (select/slice return copies, not views) is what is
-    asserted rather than the refusal alone."""
+    `__getitem__`, and since docs/VIEWS.md §6 the basic-index half of that walk
+    writes through the narrowing instead of refusing -- see the member's
+    docstring in `bootstrap.py`.
+
+    **Which of `copy_` and `fill_` a case lands on is a shape question, not a
+    "number or tensor" question**, and the cases are grouped by op accordingly:
+    upstream's `copy_to` uses `copy_` when the destination and the source have
+    the same size, `fill_` when the source is 0-d, and a broadcast plus `copy_`
+    otherwise. `x[0] = 3.0` is a `fill_` and `x[0,1] = 9.0` is a `copy_`, which
+    is the pair that makes the rule visible.
+
+    What still refuses is a slice with `step != 1` -- not because of the write
+    but because `slice.Tensor` materialises above step 1, so there would be no
+    view to write through. That refusal is pinned in
+    `test_shim.py::test_setitem_writes_the_basic_index_through_to_the_base`,
+    and the underlying divergence has its own `expect="diverge"` case in
+    `slice_cases`."""
 
     def assigned(fn):
         # `__setitem__` returns None, so every case has to hand back the
@@ -11548,6 +12010,115 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
             "member x[:] = 3.0 (dtype=float32) [fill_, not copy_]", "float32", [pair],
             assigned(lambda a: a.__setitem__(slice(None), 3.0)),
             note="measured: upstream lifts the number and dispatches aten.fill_.Tensor",
+        )
+    )
+
+    # --- the basic-index half, which used to refuse ------------------------
+    #
+    # Each of these narrows to a view and writes through it. **The receiver is
+    # what is compared** -- `__setitem__` returns `None`, so `assigned` hands
+    # back the name that was subscripted and there is no return value a
+    # write-into-a-copy could hide behind.
+    #
+    # Grouped by the op the walk lands on, because that is the thing easiest to
+    # get wrong: `x[0] = 3.0` is `fill_` (a (3,) destination, a 0-d source) and
+    # `x[0,1] = 9.0` is `copy_` (both 0-d), and the two differ only in shape.
+
+    def basic(op_key, name, flat, shape, dtype_name, fn, note, extra=None):
+        pairs = [pair_from_flat(torch_module, c_module, flat, shape, dtype_name)]
+        if extra is not None:
+            pairs.append(extra)
+        cases.append(
+            _member_case(
+                torch_module, c_module, op_key, name, dtype_name, pairs,
+                assigned(fn), note=note,
+            )
+        )
+
+    grid = [float(v) for v in range(1, 13)]
+
+    # **These cases cannot tell the two arms apart, and saying so is the
+    # point.** They are filed under the key upstream dispatches and their
+    # values are right, but `copy_` broadcasts a 0-d source to exactly what
+    # `fill_` writes -- so routing every one of them to `copy_` instead leaves
+    # the whole suite at 3075/3075 and all 229 smoke tests green (measured, by
+    # deleting the `fill_` arm and rebuilding).
+    #
+    # Nor is the difference reachable another way here. The overflow refusal
+    # that separates the two kernels (`fill_(float16, 1e6)` raises where
+    # `copy_` gives `inf`) never fires, because `_lift` has already narrowed
+    # the number to a 0-d tensor before either op sees it -- measured, both
+    # sides give `inf` and both agree with upstream. And the capture facility,
+    # which would show the op *name*, refuses to record any region containing
+    # an in-place op at all.
+    #
+    # So the arm choice is carried because it is upstream's measured lowering
+    # and because anything that ever observes the trace will depend on it --
+    # not because these cases guard it. Written here rather than left for the
+    # key to imply, the same way docs/VIEWS.md §2-§3 handled the `x[:] = 3.0`
+    # case that could not discriminate the two `_lift` rules.
+
+    # fill_ arm: destination bigger than the 0-d source.
+    basic("aten.fill_.Tensor", "member x[0] = 3.0 (dtype=float32) [select.int, then fill_]",
+          grid, (3, 4), "float32", lambda a: a.__setitem__(0, 3.0),
+          "measured: [lift_fresh, select.int, fill_.Tensor] -- a row destination and a "
+          "0-d source, so copy_to takes its fill_ arm")
+    basic("aten.fill_.Tensor", "member x[:,1] = 7.0 (dtype=float32) [strided destination]",
+          grid, (3, 4), "float32", lambda a: a.__setitem__((slice(None), 1), 7.0),
+          "the destination is a column -- non-contiguous, which is the write "
+          "tensor.rs::write_strided's odometer branch handles")
+    basic("aten.fill_.Tensor", "member x[1:3] = 5.0 (dtype=float32)",
+          grid, (3, 4), "float32", lambda a: a.__setitem__(slice(1, 3), 5.0),
+          "measured: [lift_fresh, slice.Tensor, fill_.Tensor]")
+    basic("aten.fill_.Tensor", "member x[None] = 4.0 (dtype=float32)",
+          [0.0] * 3, (3,), "float32", lambda a: a.__setitem__(None, 4.0),
+          "measured: [lift_fresh, unsqueeze, fill_.Tensor] -- unsqueeze aliases too")
+    basic("aten.fill_.Tensor", "member x[-1] = 1.0 (dtype=float32) [negative index]",
+          grid, (3, 4), "float32", lambda a: a.__setitem__(-1, 1.0),
+          "select.int wraps a negative index; the write must land in the last row")
+
+    # copy_ arm: destination and source the same size, including both 0-d.
+    basic("aten.copy_.default", "member x[0,1] = 9.0 (dtype=float32) [copy_, not fill_]",
+          grid, (3, 4), "float32", lambda a: a.__setitem__((0, 1), 9.0),
+          "measured: [lift_fresh, select.int, select.int, copy_.default] -- a 0-d "
+          "destination and a 0-d source are the same size, so copy_to takes its first arm")
+    basic("aten.copy_.default", "member x[...] = 3.0 on a 0-d receiver [copy_, not fill_]",
+          [0.0], (), "float32", lambda a: a.__setitem__(Ellipsis, 3.0),
+          "the same rule as x[0,1], reached without any narrowing at all")
+    basic("aten.copy_.default", "member x[0] = 2.7 (dtype=int64) [truncates, no promotion]",
+          [0, 0, 0], (3,), "int64", lambda a: a.__setitem__(0, 2.7),
+          "measured: upstream lifts to the receiver's dtype and copy_ truncates to 2")
+    basic("aten.copy_.default", "member x[0] = True (dtype=bool)",
+          [0, 0, 0], (3,), "bool", lambda a: a.__setitem__(0, True),
+          "a bool receiver keeps its tag through the write")
+
+    src = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    basic("aten.copy_.default", "member x[1:3] = tensor(2,2) (dtype=float32)",
+          [0.0] * 8, (4, 2), "float32", lambda a, s: a.__setitem__(slice(1, 3), s),
+          "measured: [slice.Tensor, copy_.default] -- equal sizes, so no broadcast",
+          extra=src)
+
+    row = pair_from_flat(torch_module, c_module, [9.0, 8.0], (2,), "float32")
+    basic("aten.copy_.default", "member x[1:3] = tensor(2,) (dtype=float32) [broadcast arm]",
+          [0.0] * 8, (4, 2), "float32", lambda a, s: a.__setitem__(slice(1, 3), s),
+          "measured: [slice.Tensor, view, expand, copy_] -- copy_to's third arm, which "
+          "this shim reaches through copy_'s own broadcast",
+          extra=row)
+
+    # A step above 1 refuses here and computes upstream, because `slice.Tensor`
+    # materialises rather than narrowing above step 1. `c_error` is the honest
+    # expectation: the gap is recorded, and the case fails if the refusal ever
+    # turns into a silent no-op.
+    pair = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.copy_.default",
+            "member x[0:4:2] = 0.0 [refused -- a step > 1 slice is not a view here]",
+            "float32", [pair], assigned(lambda a: a.__setitem__(slice(0, 4, 2), 0.0)),
+            expect="c_error",
+            note="upstream writes through the stepped view; this shim refuses by name "
+                 "rather than writing into the copy index_select made. The underlying "
+                 "divergence has its own diverge case in slice_cases -- docs/VIEWS.md §6.4",
         )
     )
     return cases

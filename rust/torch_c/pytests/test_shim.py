@@ -879,46 +879,372 @@ def test_the_mixtral_member_names_reach_the_kernels_that_were_already_there():
     assert "__setitem__" not in _C._shim_methods
 
 
-def test_setitem_refuses_the_basic_index_write_rather_than_dropping_it():
-    """The half of `__setitem__` this shim cannot do, refused by name.
+def test_setitem_writes_the_basic_index_through_to_the_base():
+    """`x[0] = v`, and the one spelling of it that still refuses.
 
-    Upstream's `x[0] = v` narrows to a *view* (`aten.select.int`) and writes
-    through it with `aten.copy_.default`. Both kernels exist here and both
-    are correct in isolation; running the sequence reports success and
-    changes nothing, which is worse than refusing.
+    **This test used to assert the opposite** -- it was written as the signal
+    for docs/VIEWS.md §4, asserting through a probe that a write via
+    `select.int` did *not* reach the base, so that it would go red the day
+    views became mutable. It did, and this is the other side of it.
 
-    **The missing half is the write, not the view.** candle's `narrow` and
-    `squeeze` clone the storage `Arc` and rebuild only the layout, so
-    `select.int`'s result really does alias its input's buffer -- measured in
-    docs/VIEWS.md §4 through `slice_set`, which refuses a shared-storage pair
-    and is therefore an oracle for one. The copy happens afterwards, in
-    `PyTensorBase::replace_with`, which swaps the wrapper's tensor instead of
-    writing into the buffer it points at, and which is the write primitive
-    for all 26 in-place sites.
+    Every assertion reads the ORIGINAL name after the write and never the
+    value the op returned. Every in-place op returns `self`, so a test that
+    reads the return value cannot tell a write-through from a
+    write-into-a-fresh-buffer; that is exactly how the old behaviour survived
+    3037 green golden cases.
 
-    The probe below is the evidence, not an appeal to the docstring: it does
-    exactly what upstream does, through the public dispatch keys, and shows
-    the receiver unchanged. If views ever become mutable this test goes red
-    and `__setitem__`'s refusal branch is what should change.
+    The refusal that is left is a slice with `step != 1`, and it is not a
+    view problem in the same sense: `slice.Tensor` above step 1 reaches its
+    result through `index_select`, which materialises, so there is no shared
+    buffer to write into. docs/VIEWS.md §6.4.
     """
+    # The probe the old version of this test asserted the negative of.
     x = _C._tensor_from_flat([0.0] * 5, [5])
     view = _C._aten_dispatch("aten.select.int", x, 0, 1)
     _C._aten_dispatch("aten.copy_.default", view, _C._tensor_from_flat([3.0], []))
-    assert x.tolist() == [0.0] * 5, (
-        "the write through select.int reached the base -- __setitem__'s "
-        "basic-index branch can be implemented now"
-    )
+    assert x.tolist() == [0.0, 3.0, 0.0, 0.0, 0.0], x.tolist()
+
     sliced = _C._aten_dispatch("aten.slice.Tensor", x, 0, 1, 3, 1)
     _C._aten_dispatch("aten.copy_.default", sliced, _C._tensor_from_flat([1.0, 2.0], [2]))
-    assert x.tolist() == [0.0] * 5, "slice.Tensor returned a mutable view"
+    assert x.tolist() == [0.0, 1.0, 2.0, 0.0, 0.0], x.tolist()
 
-    for index in (0, slice(1, 3), (slice(None), 0)):
+    # ...and through the subscript, where there is no return value at all.
+    # A (3,4) grid so that a column is a genuinely strided destination.
+    grid = lambda: _C._tensor_from_flat([float(v) for v in range(1, 13)], [3, 4])
+
+    a = grid()
+    a[0] = 3.0
+    assert a.tolist() == [[3.0] * 4, [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0]], a.tolist()
+
+    b = grid()
+    b[:, 1] = 7.0
+    assert [row[1] for row in b.tolist()] == [7.0, 7.0, 7.0], b.tolist()
+    assert [row[0] for row in b.tolist()] == [1.0, 5.0, 9.0], (
+        "the strided write spilled into a neighbouring column"
+    )
+
+    c = grid()
+    c[1, 2] = 99.0
+    assert c.tolist()[1][2] == 99.0 and c.tolist()[1][1] == 6.0, c.tolist()
+
+    d = grid()
+    d[1:3] = 0.0
+    assert d.tolist() == [[1.0, 2.0, 3.0, 4.0], [0.0] * 4, [0.0] * 4], d.tolist()
+
+    e = grid()
+    e[-1] = -1.0
+    assert e.tolist()[2] == [-1.0] * 4 and e.tolist()[0] == [1.0, 2.0, 3.0, 4.0], e.tolist()
+
+    # A view of a view: the write has to travel two narrowings back to the base.
+    f = grid()
+    row = f[1]
+    row[2] = 42.0
+    assert f.tolist()[1][2] == 42.0, f.tolist()
+
+    # A step above 1 still refuses, by name, and names the reason.
+    g = grid()
+    try:
+        g[0:3:2] = 0.0
+    except NotImplementedError as error:
+        assert "step-2" in str(error), str(error)
+    else:
+        raise AssertionError("a step-2 slice write was silently accepted")
+    assert g.tolist()[0] == [1.0, 2.0, 3.0, 4.0], "the refused write happened anyway"
+
+
+def test_which_ops_share_storage_with_their_input_and_which_do_not():
+    """The aliasing table, asserted op by op, in both directions.
+
+    Before docs/VIEWS.md §6 this could not have been written: no in-place op
+    reached storage, so every one of these answers was `independent` whatever
+    the op did. Making one write go through makes **all twenty-eight of them
+    correctness questions at once**, which is the reason this table is a test
+    and not a paragraph.
+
+    The instrument is the only one that can answer it from outside candle
+    (`same_storage` is `pub(crate)`): write into the result and read the
+    input. The expectations here were measured against torch 2.13.0 with the
+    same script run twice, and 26 of the 28 agree -- the two that do not have
+    their own test above.
+
+    **The `independent` half is not the boring half.** `_to_copy` with nothing
+    to convert used to alias, because candle's `to_device`/`fast_to` return
+    `self.clone()` on a no-op and a candle clone is an `Arc` clone. Deleting
+    the fix left the entire golden suite green, because every other case reads
+    the op's *result* and the result was correct -- only the input can fail.
+    That defect is a corruption rather than a lost write, which makes this
+    direction the more important one.
+    """
+    def base():
+        return _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])
+
+    def wrote_through(build):
+        x = base()
+        before = x.tolist()
+        result = build(x)
+        _C._aten_dispatch("aten.fill_.Scalar", result, 0.0)
+        return x.tolist() != before
+
+    d = _C._aten_dispatch
+
+    shares = {
+        "aten.alias.default": lambda x: d("aten.alias.default", x),
+        "aten.detach.default": lambda x: d("aten.detach.default", x),
+        "aten.contiguous.default": lambda x: d("aten.contiguous.default", x),
+        "aten.expand.default": lambda x: d("aten.expand.default", x, [2, 3]),
+        "aten.permute.default": lambda x: d("aten.permute.default", x, [1, 0]),
+        "aten.select.int": lambda x: d("aten.select.int", x, 0, 1),
+        "aten.select.int (dim 1)": lambda x: d("aten.select.int", x, 1, 0),
+        "aten.slice.Tensor (step 1)": lambda x: d("aten.slice.Tensor", x, 0, 0, 1, 1),
+        "aten.squeeze.dim": lambda x: d("aten.squeeze.dim", d("aten.unsqueeze.default", x, 0), 0),
+        "aten.t.default": lambda x: d("aten.t.default", x),
+        "aten.transpose.int": lambda x: d("aten.transpose.int", x, 0, 1),
+        "aten.unsqueeze.default": lambda x: d("aten.unsqueeze.default", x, 0),
+        "aten.view.default": lambda x: d("aten.view.default", x, [6]),
+        "aten._unsafe_view.default": lambda x: d("aten._unsafe_view.default", x, [6]),
+        "aten.lift_fresh.default": lambda x: d("aten.lift_fresh.default", x),
+        "aten.split.Tensor[0]": lambda x: d("aten.split.Tensor", x, 1)[0],
+        "aten.split_with_sizes.default[0]": lambda x: d("aten.split_with_sizes.default", x, [1, 1])[0],
+        "aten.unbind.int[0]": lambda x: d("aten.unbind.int", x, 0)[0],
+    }
+    independent = {
+        "aten.clone.default": lambda x: d("aten.clone.default", x),
+        "aten.contiguous.default (of a strided input)":
+            lambda x: d("aten.contiguous.default", d("aten.t.default", x)),
+        # The one that had no test and needed one -- see the docstring.
+        "aten._to_copy.default (nothing to convert)":
+            lambda x: d("aten._to_copy.default", x),
+        "aten._to_copy.default (dtype change)":
+            lambda x: d("aten._to_copy.default", x, _C.float64),
+        "aten.zeros_like.default": lambda x: d("aten.zeros_like.default", x),
+        "aten.empty_like.default": lambda x: d("aten.empty_like.default", x),
+        "aten.neg.default": lambda x: d("aten.neg.default", x),
+        "aten.abs.default": lambda x: d("aten.abs.default", x),
+        "aten.relu.default": lambda x: d("aten.relu.default", x),
+        "aten.masked_fill.Scalar": lambda x: d(
+            "aten.masked_fill.Scalar", x,
+            _C._tensor_from_flat([1, 0, 1, 0, 1, 0], [2, 3], dtype=_C.bool), 9.0),
+    }
+
+    for name, build in sorted(shares.items()):
+        assert wrote_through(build), (
+            f"{name} no longer shares storage with its input -- upstream's does, so a "
+            f"write through it is now silently lost"
+        )
+    for name, build in sorted(independent.items()):
+        assert not wrote_through(build), (
+            f"{name} shares storage with its input -- upstream's does not, so a write "
+            f"through the result now CORRUPTS the input"
+        )
+
+
+def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
+    """The write-lost divergences, asserted so they cannot be forgotten.
+
+    Every other view-producing op in this shim shares storage with its input
+    the way upstream does, and since docs/VIEWS.md §6 a write through any of
+    them reaches the base. Two do not, and both are properties of candle's
+    storage model rather than oversights:
+
+      * **`slice.Tensor` with `step > 1`** goes through `index_select`, which
+        copies. A stepped view would need a `Layout` whose stride is `step`
+        over the input's storage, and the only public pairing of a storage
+        with a layout is `Tensor::from_storage` -- contiguous-only, and
+        taking a `Storage` that `Tensor::storage()` (`pub(crate)`) will not
+        hand over.
+      * **`view.dtype`** reinterprets bytes, and candle's `Layout` counts
+        elements of a storage whose dtype is fixed. There is no reinterpreting
+        layout to build at any visibility.
+
+    Both have `expect="diverge"` golden cases as well, which compare the base
+    against upstream and would fail if either silently started agreeing. This
+    asserts the shim's half on its own, so the gap is recorded even when the
+    golden harness is not being run.
+    """
+    x = _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [4])
+    stepped = _C._aten_dispatch("aten.slice.Tensor", x, 0, 0, 4, 2)
+    _C._aten_dispatch("aten.fill_.Scalar", stepped, 0.0)
+    assert stepped.tolist() == [0.0, 0.0], stepped.tolist()
+    assert x.tolist() == [1.0, 2.0, 3.0, 4.0], (
+        "a step-2 slice is now a view -- update docs/VIEWS.md §6.4, the diverge "
+        "case in slice_cases, and __setitem__'s step refusal"
+    )
+
+    y = _C._tensor_from_flat([1, 2, 3, 4], [4], dtype=_C.int32)
+    reinterpreted = _C._aten_dispatch("aten.view.dtype", y, _C.float32)
+    _C._aten_dispatch("aten.fill_.Scalar", reinterpreted, 0.0)
+    assert y.tolist() == [1, 2, 3, 4], (
+        "view.dtype is now a view -- update docs/VIEWS.md §6.4 and the diverge "
+        "case in view_dtype_cases"
+    )
+
+
+def test_every_in_place_op_writes_through_a_strided_view():
+    """All twelve in-place keys, each through a **non-contiguous** view.
+
+    A column of a `(3,4)` tensor has stride 4, so a write through it exercises
+    `tensor.rs::write_strided`'s odometer rather than its `copy_from_slice`
+    fast path -- and every assertion reads the base, never the return value.
+
+    The two RNG ops are here for *reachability*, not for values: their streams
+    are compared against upstream in the golden suite, and what this pins is
+    that a draw through a view lands in the base's column and leaves the
+    neighbouring columns alone. `zeros` cannot be the check, since a draw may
+    legitimately produce one, so the assertion is on the columns that must
+    NOT have moved.
+    """
+    def grid(dtype=None):
+        kw = {} if dtype is None else {"dtype": dtype}
+        return _C._tensor_from_flat([float(v) for v in range(1, 13)], [3, 4], **kw)
+
+    def column(t, k):
+        return [row[k] for row in t.tolist()]
+
+    def untouched(t, moved):
+        for k in range(4):
+            if k == moved:
+                continue
+            assert column(t, k) == [1.0 + k, 5.0 + k, 9.0 + k], (
+                f"the write through column {moved} disturbed column {k}: {t.tolist()}"
+            )
+
+    def view(t, k=1):
+        return _C._aten_dispatch("aten.select.int", t, 1, k)
+
+    # 1. fill_.Scalar
+    a = grid()
+    _C._aten_dispatch("aten.fill_.Scalar", view(a), 7.0)
+    assert column(a, 1) == [7.0, 7.0, 7.0], a.tolist()
+    untouched(a, 1)
+
+    # 2. fill_.Tensor
+    b = grid()
+    _C._aten_dispatch("aten.fill_.Tensor", view(b), _C._tensor_from_flat([7.0], []))
+    assert column(b, 1) == [7.0, 7.0, 7.0], b.tolist()
+    untouched(b, 1)
+
+    # 3. zero_
+    c = grid()
+    _C._aten_dispatch("aten.zero_.default", view(c))
+    assert column(c, 1) == [0.0, 0.0, 0.0], c.tolist()
+    untouched(c, 1)
+
+    # 4. copy_
+    d = grid()
+    _C._aten_dispatch(
+        "aten.copy_.default", view(d), _C._tensor_from_flat([-1.0, -2.0, -3.0], [3])
+    )
+    assert column(d, 1) == [-1.0, -2.0, -3.0], d.tolist()
+    untouched(d, 1)
+
+    # 5. add_.Tensor
+    e = grid()
+    _C._aten_dispatch(
+        "aten.add_.Tensor", view(e), _C._tensor_from_flat([10.0, 10.0, 10.0], [3])
+    )
+    assert column(e, 1) == [12.0, 16.0, 20.0], e.tolist()
+    untouched(e, 1)
+
+    # 6. relu_
+    f = _C._tensor_from_flat([float(v) for v in range(-6, 6)], [3, 4])
+    _C._aten_dispatch("aten.relu_.default", view(f))
+    assert column(f, 1) == [0.0, 0.0, 3.0], f.tolist()
+    assert column(f, 0) == [-6.0, -2.0, 2.0], f.tolist()
+
+    # 7. clamp_
+    g = grid()
+    _C._aten_dispatch("aten.clamp_.default", view(g), 3.0, 8.0)
+    assert column(g, 1) == [3.0, 6.0, 8.0], g.tolist()
+    untouched(g, 1)
+
+    # 8. div_.Tensor
+    h = grid()
+    _C._aten_dispatch(
+        "aten.div_.Tensor", view(h), _C._tensor_from_flat([2.0, 2.0, 2.0], [3])
+    )
+    assert column(h, 1) == [1.0, 3.0, 5.0], h.tolist()
+    untouched(h, 1)
+
+    # 9. masked_fill_.Scalar
+    i = grid()
+    _C._aten_dispatch(
+        "aten.masked_fill_.Scalar", view(i),
+        _C._tensor_from_flat([1, 0, 1], [3], dtype=_C.bool), -1.0,
+    )
+    assert column(i, 1) == [-1.0, 6.0, -1.0], i.tolist()
+    untouched(i, 1)
+
+    # 10. index_put_
+    j = grid()
+    _C._aten_dispatch(
+        "aten.index_put_.default", view(j),
+        [_C._tensor_from_flat([0, 2], [2], dtype=_C.int64)],
+        _C._tensor_from_flat([-5.0, -6.0], [2]), False,
+    )
+    assert column(j, 1) == [-5.0, 6.0, -6.0], j.tolist()
+    untouched(j, 1)
+
+    # 11-12. uniform_ and normal_: reachability, plus the neighbours.
+    for key, args in (
+        ("aten.uniform_.default", (0.0, 1.0)),
+        ("aten.normal_.default", (0.0, 1.0)),
+    ):
+        k = grid()
+        _C._aten_dispatch(key, view(k), *args)
+        assert column(k, 1) != [2.0, 6.0, 10.0], f"{key} wrote nothing: {k.tolist()}"
+        untouched(k, 1)
+
+
+def test_an_expanded_destination_follows_upstream_op_by_op():
+    """Writing into a tensor that addresses one element twice.
+
+    `expand` gives an axis stride 0, so several logical positions share one
+    storage element. Upstream's answer is **a table, not a rule** (measured on
+    torch 2.13.0): `fill_.Scalar`, `zero_`, `masked_fill_` and `index_put_`
+    write; `fill_.Tensor`, `copy_`, `add_`, `relu_`, `clamp_`, `div_`,
+    `uniform_` and `normal_` raise `unsupported operation: more than one
+    element of the written-to tensor refers to a single memory location`.
+
+    The `fill_` pair is the sharpest: two overloads of one kernel, one
+    permitted and one refused, which is not derivable from anything and had to
+    be measured. Before write-through the question could not arise at all --
+    every in-place op replaced the wrapper, so writing "through" an expanded
+    tensor wrote through nothing.
+    """
+    def expanded():
+        base = _C._tensor_from_flat([1.0, 2.0], [1, 2])
+        return base, _C._aten_dispatch("aten.expand.default", base, [3, 2])
+
+    base, wide = expanded()
+    _C._aten_dispatch("aten.fill_.Scalar", wide, 7.0)
+    assert base.tolist() == [[7.0, 7.0]], base.tolist()
+    assert wide.tolist() == [[7.0, 7.0]] * 3, wide.tolist()
+
+    base, wide = expanded()
+    _C._aten_dispatch("aten.zero_.default", wide)
+    assert base.tolist() == [[0.0, 0.0]], base.tolist()
+
+    refusing = [
+        ("aten.fill_.Tensor", lambda w: (w, _C._tensor_from_flat([1.0], []))),
+        ("aten.copy_.default", lambda w: (w, _C._tensor_from_flat([0.0] * 6, [3, 2]))),
+        ("aten.add_.Tensor", lambda w: (w, _C._tensor_from_flat([1.0] * 6, [3, 2]))),
+        ("aten.relu_.default", lambda w: (w,)),
+        ("aten.clamp_.default", lambda w: (w, 0.0, 1.0)),
+        ("aten.div_.Tensor", lambda w: (w, _C._tensor_from_flat([2.0] * 6, [3, 2]))),
+        ("aten.uniform_.default", lambda w: (w, 0.0, 1.0)),
+        ("aten.normal_.default", lambda w: (w, 0.0, 1.0)),
+    ]
+    for key, build in refusing:
+        base, wide = expanded()
         try:
-            _C._tensor_from_flat([0.0] * 5, [5])[index] = 1.0
-        except NotImplementedError as error:
-            assert "mutable views" in str(error), str(error)
+            _C._aten_dispatch(key, *build(wide))
+        except RuntimeError as error:
+            assert "more than one element of the written-to tensor" in str(error), str(error)
         else:
-            raise AssertionError(f"__setitem__[{index!r}] silently accepted")
+            raise AssertionError(f"{key} wrote into an expanded destination")
+        assert base.tolist() == [[1.0, 2.0]], (
+            f"{key} raised and wrote anyway: {base.tolist()}"
+        )
 
 
 def test_index_put_takes_a_mask_a_matrix_and_a_number():
@@ -1054,11 +1380,12 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
     it back. This reads the ORIGINAL name afterwards and throws the return
     value away, which is the only shape that can fail that way.
 
-    It also states the limitation that comes with `replace_with`, rather than
-    leaving it to be discovered: the write lands in the *wrapper*, so a
-    second wrapper made before the call does not see it. That is the same
-    limitation every in-place op here has (docs/TENSORBASE.md), and
-    docs/VIEWS.md §4 is about whether it can be removed.
+    The third block used to assert the *limitation* that came with
+    `replace_with`: a second wrapper made before the call did not see the
+    write. docs/VIEWS.md §6 removed it, and the assertion is inverted rather
+    than deleted -- `detach` shares storage upstream too, so seeing the write
+    is now the agreeing answer and a regression to wrapper-swapping fails
+    here.
     """
     x = _C._tensor_from_flat([0.0] * 5, [5])
     returned = _C._aten_dispatch(
@@ -1076,16 +1403,20 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
     y[_C._tensor_from_flat([0, 2], [2], dtype=_C.int64)] = 5
     assert y.tolist() == [[5.0, 5.0], [0.0, 0.0], [5.0, 5.0]], y.tolist()
 
-    # And the limitation, asserted rather than described: `detach` makes a
-    # second wrapper over the same value, and the write does not reach it.
+    # And through an alias, which is upstream's behaviour: `detach` shares
+    # storage, so a write to either name is visible through both.
     z = _C._tensor_from_flat([0.0] * 4, [4])
     alias = _C._aten_dispatch("aten.detach.default", z)
     z[_C._tensor_from_flat([0], [1], dtype=_C.int64)] = 1.0
     assert z.tolist() == [1.0, 0.0, 0.0, 0.0], z.tolist()
-    assert alias.tolist() == [0.0] * 4, (
-        "an alias saw the write -- storage is shared now, so docs/VIEWS.md §4's "
-        "verdict has to be revisited"
+    assert alias.tolist() == [1.0, 0.0, 0.0, 0.0], (
+        "the alias did not see the write -- index_put_ has gone back to replacing "
+        "the wrapper instead of writing through the layout (docs/VIEWS.md §6)"
     )
+    # ...and the other way round, which is the direction that fails if only
+    # the receiver's own wrapper is being written.
+    _C._aten_dispatch("aten.fill_.Scalar", alias, 5.0)
+    assert z.tolist() == [5.0] * 4, z.tolist()
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------

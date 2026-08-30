@@ -5745,13 +5745,11 @@ fn transpose_int(
 /// 2.13.0: `permute(x, [1, 0])` shares `x.data_ptr()`, comes back
 /// non-contiguous with the strides swapped, and writing through it changes `x`.
 /// candle's `permute` also shares storage (it clones the `Arc` and permutes the
-/// layout), but that is not what makes an alias observable here -- the in-place
-/// ops in this file never write into storage, they hand `replace_with` a new
-/// tensor (see the "In-place ops" note). So a write through a permuted result
-/// does not reach the base, and cannot, until that changes. **This is the same
-/// unanswered question `slice.Tensor` and `split.Tensor` already carry**
-/// (docs/GPT2.md §7); it is not answered here, it is measured and written down.
-/// docs/OPS4.md §5 has the probe.
+/// layout), and **that is now observable**: since docs/VIEWS.md §6 the in-place
+/// ops write through the receiver's layout into the buffer it points at, so a
+/// write through a permuted result reaches the base exactly as it does
+/// upstream. docs/OPS4.md §5 has the original probe and docs/VIEWS.md §6.3 the
+/// twenty-eight-row table this op is one line of.
 ///
 /// The refusals were read off torch rather than invented, and the first one
 /// would not have been guessed -- it names a layout nobody asked for:
@@ -5969,10 +5967,10 @@ fn clone_default(
 ///
 /// Upstream returns a *view*: a new tensor sharing storage with autograd
 /// history stripped. There is no autograd here, so the history half is a
-/// no-op; the sharing half is not reproduced, because this shim's in-place ops
-/// replace a wrapper's tensor rather than writing into storage
-/// (`PyTensorBase::replace_with`). So `x.detach().fill_(0)` leaves `x` alone
-/// here and does not upstream. Recorded in docs/TENSORBASE.md.
+/// no-op, and **the sharing half now agrees**: `x.detach().fill_(0)` zeroes
+/// `x`, as it does upstream. candle's clone was always an `Arc` clone; what
+/// was missing was a write that reached storage, and that is
+/// `PyTensorBase::write_into` (docs/VIEWS.md §6).
 fn detach_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -5986,14 +5984,13 @@ fn detach_default(
 /// `aten::alias(Tensor(a) self) -> Tensor(a)`
 ///
 /// Upstream's cheapest op: a new tensor object over the same storage, with no
-/// autograd stripping and no copy. The aliasing half is the half this shim does
-/// not reproduce -- for the same reason `detach` above does not, and with the
-/// same consequence, which is that a later in-place write through one of the
-/// two will not be seen by the other.
+/// autograd stripping and no copy. **Both halves agree now** -- for the same
+/// reason `detach` above does, since docs/VIEWS.md §6: an in-place write
+/// through either of the two is seen by the other.
 ///
 /// It reaches a Llama forward through GQA's `expand`/`reshape` chain, where the
-/// result is read and never written, so the divergence does not bite there. It
-/// would bite a KV-cache write, and that is recorded rather than papered over.
+/// result is read and never written, so the old divergence did not bite there.
+/// It would have bitten a KV-cache write, which is the case that now works.
 fn alias_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -6041,11 +6038,29 @@ fn to_copy_default(
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
+    let (had_dtype, stayed_put) = {
+        let t = input.tensor()?;
+        (t.dtype(), t.device().same_device(&device))
+    };
     let out = input
         .tensor()?
         .to_device(&device)
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
+    // **The copy this op is named after.** `to_device` and `fast_to` both
+    // return `self.clone()` when there is nothing to do, and a candle clone is
+    // an `Arc` clone -- so `x.to(torch.float32)` on a float32 tensor used to
+    // hand back an *alias*. That was invisible while no in-place op wrote
+    // through, and became a divergence the moment one did: measured on torch
+    // 2.13.0, `y = x.to(torch.float32); y.fill_(0)` leaves `x` alone upstream,
+    // and without this it would zero `x` here. `Tensor::copy` is candle's deep
+    // copy; the dtype- and device-changing paths skip it, because those have
+    // already allocated. docs/VIEWS.md §6.3.
+    let out = if out.dtype() == had_dtype && stayed_put {
+        out.copy().map_err(|e| candle_err(OP, e))?
+    } else {
+        out
+    };
     finish(py, out, tag)
 }
 
@@ -6496,16 +6511,27 @@ fn index_tensor(
 // In-place ops
 //
 // These are the only ops that write. They take the *receiver object* rather
-// than a copy of it, and hand a replacement to `PyTensorBase::replace_with`.
+// than a copy of it, compute a whole replacement of the receiver's shape and
+// dtype, and hand it to `write_back` below.
 // docs/FROM_CONFIG.md §2.1 measured `fill_.Scalar` five times and
 // `copy_.default` twice during `AutoModelForCausalLM.from_config`, so a shim
 // without them cannot build a model at all.
 //
-// What they do *not* do is write into storage. See `replace_with`'s comment:
-// aliases created by `detach()` or by a view do not see the write, and
-// mutating through the same Python object does. The measured `from_config`
-// path only ever mutates through the same object (`p.data.fill_(...)`, and
-// `.data` returns `self` here).
+// **They write through the receiver's layout into the buffer it already
+// points at** (`PyTensorBase::write_into`). So an alias -- `detach()`,
+// `alias()`, `unsqueeze`, `view`, or the `select.int`/`slice.Tensor`
+// narrowings behind `x[0] = v` -- sees the write, which is what upstream does
+// and what this file did not do before docs/VIEWS.md §6.
+//
+// The kernels themselves did not change shape to get there. Each of them
+// already produced a fresh tensor with the receiver's shape and dtype; what
+// changed is where that tensor's values go. `write_into` checks both
+// properties on every call, so a kernel that starts producing something else
+// raises rather than silently retagging the receiver.
+//
+// **`replace_with` is not a fallback for anything here.** The two callers left
+// on it (`TensorBase.set_` and `tensor.data =`) are the ones where rebinding
+// *is* the operation, and upstream rebinds there too.
 // ---------------------------------------------------------------------------
 
 /// The receiver of an in-place op, as the live Python object.
@@ -6520,6 +6546,49 @@ fn tensor_receiver<'py>(
             "{op}: argument 'self' must be a torch._C.TensorBase"
         ))
     })
+}
+
+/// Put an in-place kernel's computed replacement into the receiver's buffer.
+///
+/// The one line every in-place op in this file ends with, and the reason it is
+/// a named function rather than a method call spelled out twelve times: the
+/// choice between "write through the layout" and "swap the wrapper" is the
+/// storage model, and a storage model with twelve independent spellings is one
+/// that will acquire an exception.
+///
+/// `borrow()` and not `borrow_mut()` -- the mutation is candle's, behind the
+/// `RwLock` in its storage `Arc`, so the Python-level borrow stays shared.
+/// That also means a kernel may still hold a read borrow of the receiver when
+/// it calls this, which several of them do.
+///
+/// The one thing it decides is `Overlap`, and that is a table rather than a
+/// rule because upstream's answer for an *expanded* receiver is a table --
+/// measured on torch 2.13.0 and written out in `tensor.rs::Overlap`. Keying it
+/// on the op string here rather than passing a flag from each kernel keeps the
+/// measurement in one place, where the next reader can compare all twelve
+/// answers at once instead of hunting for the odd one out.
+fn write_back(
+    op: &str,
+    receiver: &Bound<'_, PyTensorBase>,
+    replacement: PyTensorBase,
+) -> PyResult<()> {
+    let overlap = match op {
+        // Measured: upstream writes. `fill_.Scalar` and `zero_` write one
+        // value everywhere, so a position visited twice is written the same
+        // thing twice; `masked_fill_`/`index_put_` upstream warn that the
+        // spelling is deprecated but still write.
+        //
+        // `fill_.Tensor` is deliberately NOT here even though it shares a
+        // kernel with `fill_.Scalar`: upstream raises for it and writes for
+        // the other, which is the sort of asymmetry that only survives being
+        // measured rather than reasoned about.
+        "aten.fill_.Scalar"
+        | "aten.zero_.default"
+        | "aten.masked_fill_.Scalar"
+        | "aten.index_put_.default" => crate::tensor::Overlap::Allow,
+        _ => crate::tensor::Overlap::Refuse,
+    };
+    receiver.borrow().write_into(op, &replacement, overlap)
 }
 
 /// `aten::fill_.Scalar/.Tensor(Tensor(a!) self, X value) -> Tensor(a!)`
@@ -6569,7 +6638,7 @@ fn fill_inplace(
         .map_err(|e| candle_err(op, e))?;
         PyTensorBase::new(filled)?
     };
-    receiver.borrow_mut().replace_with(replacement);
+    write_back(op, &receiver, replacement)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -6619,7 +6688,7 @@ fn zero_inplace(
     } else {
         PyTensorBase::new(zeros)?
     };
-    receiver.borrow_mut().replace_with(replacement);
+    write_back(OP, &receiver, replacement)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -6658,7 +6727,7 @@ fn copy_inplace(
         let storage = PyDtype::new(tag).storage(OP)?;
         PyTensorBase::new(widened.fast_to(storage).map_err(|e| candle_err(OP, e))?)?
     };
-    receiver.borrow_mut().replace_with(replacement);
+    write_back(OP, &receiver, replacement)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -6669,14 +6738,11 @@ fn copy_inplace(
 /// -- its residual connections write `hidden_states += attn_output` rather
 /// than rebinding the name, so the trace calls this overload, not `add.Tensor`.
 ///
-/// **Aliasing is `replace_with`'s, the same as every other in-place op in this
-/// file** (`fill_inplace`/`zero_inplace`/`copy_inplace` above): the receiver's
-/// storage is swapped for a freshly computed tensor, not written through. An
-/// alias taken *before* this call does not observe the update -- the same
-/// limitation docs/OPS4.md recorded for `permute`/`t`/`transpose`/`slice`
-/// (their `replace_with` never reaches the original storage either), now
-/// extended to an arithmetic in-place op rather than only view-producing ones.
-/// Fixing it is a `replace_with` redesign, out of this task's scope.
+/// **Aliasing is `write_back`'s, the same as every other in-place op in this
+/// file**: the sum is computed into a fresh tensor of the receiver's shape and
+/// dtype and then written through the receiver's *layout*, so an alias or a
+/// view taken before this call does observe the update, as upstream's does.
+/// docs/VIEWS.md §6.
 ///
 /// Two rules narrower than upstream, both borrowed rather than re-derived:
 ///
@@ -6734,7 +6800,7 @@ fn add_inplace(
         .add(&rhs)
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
-    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -6749,16 +6815,12 @@ fn add_inplace(
 /// `Tensor(a!) self` vs plain `Tensor self`), and `aten.rs` had a kernel for
 /// neither name before this (docs/SPELLINGS.md §6.6 measured zero).
 ///
-/// **Aliasing is `replace_with`'s, same limitation as `add_inplace`/
-/// `copy_inplace`/every other in-place op in this file** (see `add_inplace`'s
-/// doc comment and docs/OPS4.md §8): the receiver's storage is swapped for a
-/// freshly computed tensor, not written through, so a view or alias taken
-/// *before* this call does not observe the update. Upstream `relu_` really is
-/// an alias-preserving in-place write (measured:
-/// `y = x.view(-1); x.relu_(); y` shows the update through the view on real
-/// torch) -- this shim does not reproduce that, and fixing it is the same
-/// `replace_with` redesign `add_inplace` already flagged as out of scope. Not
-/// attempted here either.
+/// **Aliasing is `write_back`'s, the same as `add_inplace`/`copy_inplace`/
+/// every other in-place op in this file** (docs/VIEWS.md §6): the result is
+/// written through the receiver's layout, so a view or alias taken before this
+/// call observes the update. Upstream `relu_` is an alias-preserving in-place
+/// write (measured: `y = x.view(-1); x.relu_(); y` shows the update through
+/// the view on real torch) and this shim now reproduces that.
 ///
 /// The value and the refusal are `relu.default`'s, reused rather than
 /// re-derived: `torch.bool` raises with upstream's exact wording ("Boolean
@@ -6795,7 +6857,7 @@ fn relu_inplace(
         .lt(&zeros)
         .and_then(|negative| negative.where_cond(&zeros, &source))
         .map_err(|e| candle_err(OP, e))?;
-    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -6993,7 +7055,7 @@ fn uniform_inplace(
     };
 
     drop(gen);
-    receiver.borrow_mut().replace_with(PyTensorBase::new(replacement)?);
+    write_back(OP, &receiver, PyTensorBase::new(replacement)?)?;
     let _ = (py, target.tag);
     Ok(receiver.into_any().unbind())
 }
@@ -7082,7 +7144,7 @@ fn normal_inplace(
     .and_then(|t| t.to_dtype(target.storage))
     .map_err(|e| candle_err(OP, e))?;
 
-    receiver.borrow_mut().replace_with(PyTensorBase::new(filled)?);
+    write_back(OP, &receiver, PyTensorBase::new(filled)?)?;
     let _ = (py, target.tag);
     Ok(receiver.into_any().unbind())
 }
@@ -8106,6 +8168,32 @@ fn clamp_inplace_default(
         ));
     }
     let tag = receiver.borrow().tag();
+    // **`torch.bool` refuses whatever the bounds are**, and the message names
+    // the bound's type rather than the receiver's. Measured on torch 2.13.0:
+    // `clamp_(0, 5)` and `clamp_(None, 1)` give "result type Long can't be
+    // cast to the desired output type bool", `clamp_(0.0, 1.0)` gives the same
+    // with "Float", and `uint8` -- the dtype `bool` shares storage with --
+    // computes normally.
+    //
+    // It is here rather than left to `write_into`'s backstop for a reason that
+    // is about layering, not politeness: without it, `bool.clamp_(0, 5)`
+    // produced a `uint8` replacement and `replace_with` *retagged the
+    // receiver*, computing where upstream refuses. `write_into` refuses that
+    // now, but with an "internal error" message aimed at whoever wrote the
+    // kernel. A user-reachable refusal belongs at the door with upstream's own
+    // wording; the tag check underneath stays as the structural backstop, the
+    // same shape as `check_meta` sitting over `PyTensorBase::tensor`.
+    // docs/VIEWS.md §6.8.
+    if tag == TorchDType::Bool {
+        let saw_float = [min, max]
+            .into_iter()
+            .flatten()
+            .any(|bound| !bound.is_int());
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type {} can't be cast to the desired output type bool",
+            if saw_float { "Float" } else { "Long" }
+        )));
+    }
     if !tag.is_floating_point() {
         for bound in [min, max].into_iter().flatten() {
             if !bound.is_int() {
@@ -8134,7 +8222,7 @@ fn clamp_inplace_default(
         }
         .map_err(|e| candle_err(OP, e))?;
     }
-    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -8186,7 +8274,7 @@ fn div_inplace_tensor(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     let out = lhs.broadcast_div(&rhs).map_err(|e| candle_err(OP, e))?;
-    receiver.borrow_mut().replace_with(PyTensorBase::new(out)?);
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
 }
@@ -8202,10 +8290,13 @@ fn div_inplace_tensor(
 ///
 /// Not a new kernel: the value and every refusal are `masked_fill.Scalar`'s
 /// (a `torch.bool` mask required, same as that op's doc comment measures),
-/// computed once and written into the receiver via `replace_with` -- the
-/// same "aliases created before this call do not see the write" limitation
-/// `add_inplace`'s doc comment already states for every in-place op in this
-/// file.
+/// computed once and written into the receiver through its layout by
+/// `write_back` -- so an alias or view taken before this call sees the write,
+/// as it does upstream. docs/VIEWS.md §6.
+///
+/// It is one of the four keys `write_back` lets write into an *expanded*
+/// destination, because upstream does (with a deprecation warning) where it
+/// raises for `copy_`/`add_`/`clamp_`/`div_`. Measured, not derived.
 fn masked_fill_inplace(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -8215,7 +8306,7 @@ fn masked_fill_inplace(
     let receiver = tensor_receiver(op, args, kwargs)?;
     let result = masked_fill(py, args, kwargs, op)?;
     let replacement = result.extract::<PyTensorBase>(py)?;
-    receiver.borrow_mut().replace_with(replacement);
+    write_back(op, &receiver, replacement)?;
     Ok(receiver.into_any().unbind())
 }
 
@@ -8279,10 +8370,17 @@ fn masked_fill_inplace(
 ///     result shape. Same rule the `scatter` version had, re-derived rather
 ///     than inherited.
 ///
-/// The write goes back into the receiver through `replace_with`, so it
-/// carries the same recorded limitation every in-place op here does: aliases
-/// created before the call do not see it. §4 of docs/VIEWS.md is about
-/// exactly that limitation.
+/// The write goes back into the receiver through `write_back`, which puts it
+/// into the buffer the receiver already points at rather than swapping the
+/// wrapper -- so an alias or a view created before the call does see it, as
+/// upstream's does. That was §4 of docs/VIEWS.md's open question and §6 is
+/// the answer.
+///
+/// The kernel itself did not change for it, and that is the useful part: it
+/// already built a whole `dims`-shaped replacement out of `read_flat`, and a
+/// whole replacement of the receiver's shape is exactly what write-through
+/// consumes. docs/VIEWS.md §6.1 has the argument that this shape was never
+/// the obstacle §4 recorded it as being.
 fn index_put_inplace(
     _py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -8491,7 +8589,7 @@ fn index_put_inplace(
     } else {
         PyTensorBase::new(tensor)?
     };
-    receiver.borrow_mut().replace_with(replacement);
+    write_back(OP, &receiver, replacement)?;
     Ok(receiver.into_any().unbind())
 }
 

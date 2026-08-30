@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use candle_core::quantized::QTensor;
-use candle_core::{DType, Tensor};
+use candle_core::{CpuStorage, DType, InplaceOp1, Layout, Tensor};
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -331,24 +331,351 @@ impl PyTensorBase {
         self.tag
     }
 
-    /// The write half of the in-place ops (`fill_`, `copy_`, `uniform_`,
-    /// `normal_`).
+    /// **Rebinding, not writing.** The wrapper stops pointing at one candle
+    /// tensor and starts pointing at another; the buffer it used to point at
+    /// is untouched, so an alias taken before the call keeps the old values.
     ///
     /// It takes a whole `PyTensorBase` rather than a bare candle tensor so
     /// that the replacement has already been through `new()` or `boolean()` --
     /// BOOL.md §6.3's rule that only one constructor may attach the `bool`
     /// tag survives a mutating API only if the mutation cannot bypass it.
     ///
-    /// **This replaces the wrapper's tensor; it does not write into storage.**
-    /// The difference is visible: upstream's `y = x.detach(); y.fill_(0)`
-    /// writes through to `x` because the two share storage, and here it does
-    /// not, because `y` is a different wrapper. Mutating through the *same*
-    /// Python object (`p.data.fill_(0)`, since `.data` returns `self`) does
-    /// behave like upstream. Recorded in docs/TENSORBASE.md.
+    /// **This is no longer the in-place ops' primitive.** They use
+    /// `write_into` (below), which writes through the layout into the existing
+    /// buffer, so `y = x.detach(); y.fill_(0)` now reaches `x` the way it does
+    /// upstream. What is left here is the two callers for which *rebinding is
+    /// the operation*, and where upstream rebinds too:
+    ///
+    ///   * `TensorBase.set_` -- adopts a different storage, a different shape
+    ///     and possibly a different dtype; there is no "existing buffer" to
+    ///     write into, since the point is to leave it.
+    ///   * `tensor.data = other` -- upstream swaps the `TensorImpl`, so a view
+    ///     taken before the assignment does not follow it there either
+    ///     (docs/DEVICE_ABS.md §4).
+    ///
+    /// Anything that means "the receiver's values change but the receiver
+    /// stays the same tensor" must not come here. docs/VIEWS.md §6.
     pub fn replace_with(&mut self, replacement: PyTensorBase) {
         self.inner = replacement.inner;
         self.tag = replacement.tag;
     }
+
+    /// **The write primitive for every in-place op**: put `source`'s values
+    /// into the buffer this wrapper already points at, through this wrapper's
+    /// layout.
+    ///
+    /// The difference from `replace_with` is the whole of docs/VIEWS.md §6.
+    /// `select.int` and `slice.Tensor` (step 1) return tensors that share
+    /// storage with their input -- candle's `narrow`/`squeeze` clone the
+    /// storage `Arc` and rebuild only the `Layout` -- so a write that lands in
+    /// the *layout* is seen by the base and a write that swaps the wrapper is
+    /// not. `x[0] = 3.0` is the visible case, but every alias in the shim
+    /// (`detach`, `alias`, `unsqueeze`, `view`) has the same question, and
+    /// they now all answer it the same way.
+    ///
+    /// **Contract, checked rather than assumed** -- an in-place op may change
+    /// values and nothing else:
+    ///
+    ///   * `source` has this tensor's shape exactly (no broadcasting here; the
+    ///     kernels broadcast into the receiver's shape before they call);
+    ///   * `source` has this tensor's *candle* dtype exactly (the kernels cast
+    ///     into it, because in-place cannot widen);
+    ///   * the torch tag is this tensor's and does not move -- so the `bool`
+    ///     tag cannot be attached or dropped by a write.
+    ///
+    /// A violation is a defect in the calling kernel, so it raises with the
+    /// op's name rather than being coerced into agreement.
+    ///
+    /// **All three are unreachable today, and that is the measured result
+    /// rather than an assumption.** Every in-place kernel already broadcast
+    /// into the receiver's shape and cast into its dtype, so candle refuses
+    /// first, with its own wording, on every input that would reach them:
+    /// `copy_((2,), (2,2))`, `add_((2,1), (2,2))` and
+    /// `masked_fill_((4,1), mask (4,2))` all stop at `broadcast_as`. The one
+    /// input that *did* reach the tag check -- `bool_tensor.clamp_(0, 5)`,
+    /// which produced a `uint8` replacement and would have retagged the
+    /// receiver -- now refuses at the door with upstream's own message, so
+    /// this is a backstop under a named refusal rather than the refusal
+    /// itself. Same layering as `check_meta` over `tensor()`.
+    ///
+    /// The consequence for testing is stated rather than hidden: **deleting
+    /// these checks changes nothing observable** (measured -- 3075/3075 and
+    /// 229 smoke tests green with the shape and tag checks removed). They
+    /// exist for the kernel that has not been written yet, and a test for
+    /// them would have to be a kernel that violates the contract, which the
+    /// public API cannot produce.
+    ///
+    /// **Reads before it writes.** `source` is copied out into an owned
+    /// `CpuStorage` first, and only then is the destination's lock taken. That
+    /// is not a tidiness choice, it is what makes `x[0:2] = x[1:3]` mean what
+    /// it means: the two sides alias one buffer, and a streaming copy would
+    /// read values it had already overwritten. It is also what keeps the pair
+    /// off candle's `inplace_op2`, whose `self.storage_mut()` and
+    /// `rhs.storage()` are a write lock and a read lock on the *same*
+    /// `RwLock` when the operands alias -- a deadlock, not an error.
+    ///
+    /// **No `unsafe`.** candle holds storage in `Arc<RwLock<Storage>>` and
+    /// `Tensor::inplace_op1` takes the write lock, so aliasing-XOR-mutability
+    /// is enforced at runtime by the lock rather than by a raw pointer. That
+    /// is why this takes `&self` and not `&mut self`: the mutation is
+    /// candle's interior mutability, and the Python-level `RefCell` borrow the
+    /// caller holds stays shared.
+    pub fn write_into(
+        &self,
+        op: &str,
+        source: &PyTensorBase,
+        overlap: Overlap,
+    ) -> PyResult<()> {
+        let dest = self.tensor()?;
+        let src = source.tensor()?;
+
+        if source.tag != self.tag {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: torch._C shim internal error -- an in-place op tried to \
+                 write a torch.{} value into a torch.{} tensor. In-place ops \
+                 cast into the receiver's dtype; changing it is `replace_with`'s \
+                 job, not this one's (tensor.rs::write_into)",
+                source.tag.name(),
+                self.tag.name()
+            )));
+        }
+        if dest.dims() != src.dims() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: torch._C shim internal error -- an in-place op computed a \
+                 {:?} replacement for a {:?} receiver (tensor.rs::write_into)",
+                src.dims(),
+                dest.dims()
+            )));
+        }
+        if dest.dtype() != src.dtype() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: torch._C shim internal error -- an in-place op computed a \
+                 {} replacement for a {} receiver (tensor.rs::write_into)",
+                src.dtype().as_str(),
+                dest.dtype().as_str()
+            )));
+        }
+        if !dest.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "{op}: writing through a view is implemented for the CPU backend \
+                 only in torch._C shim; this tensor is on {}",
+                self.device_label().__str__()
+            )));
+        }
+        if overlap == Overlap::Refuse && has_internal_overlap(dest.layout()) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "unsupported operation: more than one element of the written-to \
+                 tensor refers to a single memory location. Please clone() the \
+                 tensor before performing the operation.",
+            ));
+        }
+
+        // Read first, and let every lock go before the write starts. See the
+        // aliasing note above -- this line is the reason `x[0:2] = x[1:3]`
+        // is correct rather than half-overwritten.
+        let payload = flat_storage(op, src)?;
+        dest.inplace_op1(&WriteThrough { payload })
+            .map_err(|e| candle_err(op, e))
+    }
+}
+
+/// Whether an in-place op may write into a destination that addresses the
+/// same storage element twice -- an *expanded* tensor, whose broadcast axes
+/// have stride 0.
+///
+/// **Upstream is split on this and the split is measured, not guessed**
+/// (torch 2.13.0, `x = torch.tensor([1.,2.]).reshape(1,2).expand(3,2)`):
+///
+/// | op | upstream |
+/// |---|---|
+/// | `fill_.Scalar`, `zero_` | writes; every position gets the same value |
+/// | `masked_fill_`, `index_put_` | writes, with a deprecation warning |
+/// | `fill_.Tensor`, `copy_`, `add_`, `relu_`, `clamp_`, `div_`, `uniform_`, `normal_` | **raises** |
+///
+/// So this is not a property of the destination alone and cannot be decided
+/// here; the op decides, in `aten.rs::write_back`, from the same table. What
+/// this file owns is the *detection*, which has to be upstream's rule and not
+/// a stricter one -- see `has_internal_overlap`.
+///
+/// Before write-through the question could not arise: every in-place op
+/// replaced the wrapper, so writing "through" an expanded tensor wrote through
+/// nothing. Silently letting the last write win would be a new divergence in
+/// the direction this shim refuses -- upstream raising where this computes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Overlap {
+    /// Upstream raises. So does this.
+    Refuse,
+    /// Upstream writes. Every position the walk visits more than once is
+    /// written the same value by these ops, so last-write-wins is not merely
+    /// tolerated, it is the answer.
+    Allow,
+}
+
+/// Does this layout address one storage element more than once?
+///
+/// **Upstream's own rule, including its deliberate incompleteness**
+/// (`c10::has_internal_overlap`): dense and non-overlapping is `No`, a stride
+/// of 0 on an axis longer than 1 is `Yes`, and *anything else is `TooHard` and
+/// permitted*. Reproducing the conservative half matters as much as the
+/// positive half -- a stricter test would refuse strided views that upstream
+/// writes into happily, which is a divergence in the other direction.
+fn has_internal_overlap(layout: &Layout) -> bool {
+    layout
+        .stride()
+        .iter()
+        .zip(layout.dims().iter())
+        .any(|(stride, dim)| *stride == 0 && *dim > 1)
+}
+
+/// `source`, read out row-major into an owned buffer.
+///
+/// Owned, not borrowed: the returned value must outlive every lock on
+/// `source`'s storage, because the caller takes a write lock on a buffer that
+/// may be the same one. See `write_into`.
+fn flat_storage(op: &str, source: &Tensor) -> PyResult<CpuStorage> {
+    let flat = source
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(op, e))?;
+    macro_rules! pour {
+        ($arm:ident, $ty:ty) => {
+            CpuStorage::$arm(flat.to_vec1::<$ty>().map_err(|e| candle_err(op, e))?)
+        };
+    }
+    Ok(match flat.dtype() {
+        DType::U8 => pour!(U8, u8),
+        DType::U32 => pour!(U32, u32),
+        DType::I16 => pour!(I16, i16),
+        DType::I32 => pour!(I32, i32),
+        DType::I64 => pour!(I64, i64),
+        DType::BF16 => pour!(BF16, half::bf16),
+        DType::F16 => pour!(F16, half::f16),
+        DType::F32 => pour!(F32, f32),
+        DType::F64 => pour!(F64, f64),
+        other => {
+            return Err(not_implemented(format!(
+                "{op}: torch._C shim cannot write through a view of candle dtype \
+                 {other:?} -- tensor.rs::flat_storage names the dtypes it can \
+                 read, and this is not one of them"
+            )))
+        }
+    })
+}
+
+/// The `InplaceOp1` behind `write_into`.
+///
+/// candle hands `cpu_fwd` the destination's storage *and its `Layout`*, which
+/// is the only public surface in the crate that does. `slice_set` is the other
+/// public write path and it cannot serve here: it requires both sides
+/// contiguous and it *refuses a pair that shares storage*, which is precisely
+/// `x[0:2] = x[1:3]`. docs/VIEWS.md §6.2 records what was rejected and why.
+struct WriteThrough {
+    /// Row-major, already read out of the source. Same length and dtype as the
+    /// destination view's element count and dtype -- `write_into` checked.
+    payload: CpuStorage,
+}
+
+impl InplaceOp1 for WriteThrough {
+    fn name(&self) -> &'static str {
+        "torch._C shim: write_into"
+    }
+
+    fn cpu_fwd(&self, storage: &mut CpuStorage, layout: &Layout) -> candle_core::Result<()> {
+        macro_rules! scatter {
+            ($dst:expr, $src:expr) => {
+                write_strided($dst, $src, layout)
+            };
+        }
+        match (storage, &self.payload) {
+            (CpuStorage::U8(d), CpuStorage::U8(s)) => scatter!(d, s),
+            (CpuStorage::U32(d), CpuStorage::U32(s)) => scatter!(d, s),
+            (CpuStorage::I16(d), CpuStorage::I16(s)) => scatter!(d, s),
+            (CpuStorage::I32(d), CpuStorage::I32(s)) => scatter!(d, s),
+            (CpuStorage::I64(d), CpuStorage::I64(s)) => scatter!(d, s),
+            (CpuStorage::BF16(d), CpuStorage::BF16(s)) => scatter!(d, s),
+            (CpuStorage::F16(d), CpuStorage::F16(s)) => scatter!(d, s),
+            (CpuStorage::F32(d), CpuStorage::F32(s)) => scatter!(d, s),
+            (CpuStorage::F64(d), CpuStorage::F64(s)) => scatter!(d, s),
+            // `write_into` compared the two candle dtypes before building this,
+            // so a mismatch here is a defect in that check rather than a
+            // reachable input.
+            _ => Err(candle_core::Error::Msg(
+                "torch._C shim: write_into reached cpu_fwd with mismatched \
+                 storage dtypes"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+/// Row-major elements of `src` into the positions `layout` addresses in `dst`.
+///
+/// The walk is the odometer `gather_strided` reads with, run the other way. It
+/// is written out rather than borrowed from candle because `StridedIndex`'s
+/// constructors are `pub(crate)`; `Layout`'s dims, strides and offset are not,
+/// so the arithmetic is reproducible from outside the crate.
+///
+/// **Bounds are proved once, before the loop, rather than per element.** The
+/// furthest position the walk can reach is `start_offset + sum((dim-1) *
+/// stride)`, since every index runs `0..dim` and every stride is
+/// non-negative (candle's strides are `usize`). Checking that one number means
+/// no write in the loop can be out of range -- and the check is what turns a
+/// wrong layout into an error rather than a corrupted neighbouring tensor,
+/// which is the failure this whole file exists to prevent.
+fn write_strided<T: Copy>(dst: &mut [T], src: &[T], layout: &Layout) -> candle_core::Result<()> {
+    let dims = layout.dims();
+    let stride = layout.stride();
+    let numel: usize = dims.iter().product();
+    if src.len() != numel {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: write_into has {} values for a {numel}-element view",
+            src.len()
+        )));
+    }
+    if numel == 0 {
+        return Ok(());
+    }
+    let start = layout.start_offset();
+    let reach = dims
+        .iter()
+        .zip(stride.iter())
+        .map(|(d, s)| (d - 1) * s)
+        .sum::<usize>();
+    if start + reach >= dst.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: write_into's view (offset {start}, dims {dims:?}, \
+             stride {stride:?}) reaches element {} of a storage holding {}",
+            start + reach,
+            dst.len()
+        )));
+    }
+
+    // The contiguous case is the common one (`x[0]`, `x[1:3]`, and every
+    // whole-tensor in-place op) and it is a memcpy. It is not merely an
+    // optimisation: the odometer below would give the same answer, so this
+    // branch is checked against it by every non-contiguous case in the suite
+    // sharing the same expectations.
+    if layout.is_contiguous() {
+        dst[start..start + numel].copy_from_slice(src);
+        return Ok(());
+    }
+
+    let rank = dims.len();
+    let mut index = vec![0usize; rank];
+    let mut offset = start;
+    for value in src.iter() {
+        dst[offset] = *value;
+        for d in (0..rank).rev() {
+            index[d] += 1;
+            if index[d] < dims[d] {
+                offset += stride[d];
+                break;
+            }
+            offset -= (dims[d] - 1) * stride[d];
+            index[d] = 0;
+        }
+    }
+    Ok(())
 }
 
 /// A tensor from a little-endian payload, under a torch dtype tag.
