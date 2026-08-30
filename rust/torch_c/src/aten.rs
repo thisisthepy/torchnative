@@ -46,6 +46,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._unsafe_view.default",
     "aten.abs.default",
     "aten.add.Tensor",
+    "aten.add_.Scalar",
     "aten.add_.Tensor",
     "aten.addmm.default",
     "aten.alias.default",
@@ -64,8 +65,10 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bmm.default",
     "aten.cat.default",
     "aten.ceil.default",
+    "aten.clamp.default",
     "aten.clamp_.default",
     "aten.clone.default",
+    "aten.constant_pad_nd.default",
     "aten.convolution.default",
     "aten.copy_.default",
     "aten.cos.default",
@@ -79,6 +82,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.eq.Scalar",
     "aten.eq.Tensor",
     "aten.exp.default",
+    "aten.exp_.default",
+    "aten.expm1.default",
     "aten.expand.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
@@ -99,6 +104,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.le.Scalar",
     "aten.le.Tensor",
     "aten.lift_fresh.default",
+    "aten.log.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
@@ -113,11 +119,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mm.default",
     "aten.mul.Scalar",
     "aten.mul.Tensor",
+    "aten.mul_.Scalar",
+    "aten.mul_.Tensor",
     "aten.multinomial.default",
     "aten.native_layer_norm.default",
     "aten.ne.Scalar",
     "aten.ne.Tensor",
     "aten.neg.default",
+    "aten.neg_.default",
     "aten.new_ones.default",
     "aten.normal_.default",
     "aten.ones.default",
@@ -144,6 +153,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.squeeze.dim",
     "aten.stack.default",
     "aten.sub.Tensor",
+    "aten.sub_.Scalar",
+    "aten.sub_.Tensor",
     "aten.sum.default",
     "aten.sum.dim_IntList",
     "aten.t.default",
@@ -979,12 +990,19 @@ fn aten_dispatch_inner(
 
         // -- falcon / bloom / gpt_bigcode (docs/TAIL.md) --------------------
         "aten._safe_softmax.default" => safe_softmax_default(py, args, kwargs),
-        "aten.add_.Tensor" => add_inplace(py, args, kwargs),
+        "aten.add_.Tensor" => {
+            arith_inplace_tensor(py, args, kwargs, "aten.add_.Tensor", Arith::Add)
+        }
         "aten.baddbmm.default" => baddbmm_default(py, args, kwargs),
         "aten.split_with_sizes.default" => split_with_sizes(py, args, kwargs),
 
         // -- mamba / mixtral (docs/OPS4.md) ---------------------------------
         "aten.exp.default" => unary_float(py, args, kwargs, "aten.exp.default", Unary::Exp),
+        // `mamba`'s *construction* wall, not its forward (docs/ARCH20.md §4).
+        "aten.log.default" => unary_float(py, args, kwargs, "aten.log.default", Unary::Log),
+        "aten.expm1.default" => expm1_default(py, args, kwargs),
+        // `bert`'s wall: `F.pad` on a bias while the model is being built.
+        "aten.constant_pad_nd.default" => constant_pad_nd(py, args, kwargs),
         "aten.softplus.default" => softplus_default(py, args, kwargs),
         "aten.convolution.default" => convolution_default(py, args, kwargs),
         "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
@@ -999,9 +1017,35 @@ fn aten_dispatch_inner(
         "aten.floor_divide.Scalar" => floor_divide_scalar(py, args, kwargs),
         "aten.histc.default" => histc_default(py, args, kwargs),
         "aten.clamp_.default" => clamp_inplace_default(py, args, kwargs),
+        // `mamba` clamps out of place; only the in-place sibling had a kernel.
+        "aten.clamp.default" => clamp_default(py, args, kwargs),
         "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
         "aten.masked_fill_.Scalar" => masked_fill_inplace(py, args, kwargs, "aten.masked_fill_.Scalar"),
         "aten.index_put_.default" => index_put_inplace(py, args, kwargs),
+
+        // -- the rest of the in-place arithmetic family (docs/ARCH20.md §8) --
+        //
+        // `add_.Tensor` above was the only one of these with a kernel, and
+        // none of the five had a *member*, so `x -= y`, `x *= y`, `x.neg_()`
+        // and `x.exp_()` refused at the door. They are the most common
+        // in-place operations in the language.
+        "aten.add_.Scalar" => {
+            arith_inplace_scalar(py, args, kwargs, "aten.add_.Scalar", Arith::Add)
+        }
+        "aten.sub_.Tensor" => {
+            arith_inplace_tensor(py, args, kwargs, "aten.sub_.Tensor", Arith::Sub)
+        }
+        "aten.sub_.Scalar" => {
+            arith_inplace_scalar(py, args, kwargs, "aten.sub_.Scalar", Arith::Sub)
+        }
+        "aten.mul_.Tensor" => {
+            arith_inplace_tensor(py, args, kwargs, "aten.mul_.Tensor", Arith::Mul)
+        }
+        "aten.mul_.Scalar" => {
+            arith_inplace_scalar(py, args, kwargs, "aten.mul_.Scalar", Arith::Mul)
+        }
+        "aten.neg_.default" => neg_inplace(py, args, kwargs),
+        "aten.exp_.default" => exp_inplace(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -1044,6 +1088,11 @@ pub fn aten_all_implemented() -> Vec<&'static str> {
 ///
 /// The factory. Without one, every tensor has to enter through a back door that
 /// the dispatcher cannot see, which would defeat the instrument above.
+///
+/// `constant_pad_nd` below reuses this function's *fill* half through
+/// `filled_block`; the two must agree on how a `Scalar` becomes bytes of a
+/// given tag or `F.pad(x, ..., value=v)` and `torch.full(shape, v)` would put
+/// different numbers in memory for the same `v`.
 fn full_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -1118,6 +1167,171 @@ fn full_default(
     .map_err(|e| candle_err(OP, e))?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
+}
+
+/// A block of `shape`, every element equal to `value`, in `tag`'s storage.
+///
+/// Split out of `full_default` rather than reimplemented: `constant_pad_nd`'s
+/// padding is `torch.full`'s fill with a different shape, and the two rules
+/// that make it non-obvious both live here. **Truncation toward zero** for a
+/// float value into an integer tag (`constant_pad_nd(int64_t, [1,1], 3.7)`
+/// pads with `3`, measured -- not `4`), and **truthiness** for the `bool` tag,
+/// which is also what keeps the tag's 0/1 invariant holding by construction
+/// (BOOL.md §6.3).
+fn filled_block(
+    op: &str,
+    value: Scalar,
+    tag: TorchDType,
+    shape: &[usize],
+    device: &Device,
+) -> PyResult<Tensor> {
+    if tag == TorchDType::Bool {
+        return Tensor::full(u8::from(value.as_f64() != 0.0), shape, device)
+            .map_err(|e| candle_err(op, e));
+    }
+    let storage = PyDtype::new(tag).storage(op)?;
+    if storage.is_int() {
+        Tensor::full(value.as_i64(), shape, device)
+    } else {
+        Tensor::full(value.as_f64(), shape, device)
+    }
+    .and_then(|t| t.fast_to(storage))
+    .map_err(|e| candle_err(op, e))
+}
+
+/// `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor`
+///
+/// `bert`'s wall, and the only genuinely new *kernel* the twenty-architecture
+/// round needed (docs/ARCH20.md §2). `transformers`'
+/// `modeling_utils.py:2701 _adjust_bias` pads the output-embedding bias when
+/// the head's vocabulary is wider than the embedding it is tied to, so this
+/// runs during `from_config` -- `bert` never reached its own forward.
+///
+/// `torch.nn.functional.pad(x, pad, "constant", v)` is the only route that
+/// reaches it here, and a `TorchDispatchMode` logger confirms upstream lowers
+/// that to exactly one record, `aten.constant_pad_nd.default`. The other
+/// `mode=` values ("reflect", "replicate", "circular") are different aten ops
+/// and are not implemented; `F.pad` picks between them above this layer, so a
+/// caller asking for one still gets a refusal naming the op it wanted.
+///
+/// **`pad` is read back to front and in pairs.** `pad[0..2]` is the last
+/// dimension, `pad[2..4]` the one before it, and so on; a shorter list simply
+/// leaves the leading dimensions alone. That ordering is the half a plausible
+/// implementation gets backwards, so it is pinned by a case whose two
+/// dimensions get *different* pads (`[1, 1, 2, 0]` on a `(2, 3)`), which a
+/// front-to-back reading cannot pass.
+///
+/// **Negative entries crop.** Upstream allows them and this reproduces it
+/// with `narrow`, including upstream's error when the crop exceeds the axis:
+/// "narrow(): length must be non-negative." -- which is upstream's message
+/// verbatim, from upstream's own `narrow`, because upstream's implementation
+/// takes the same route. The three shapes are measured:
+///
+/// ```text
+/// constant_pad_nd([[0..2],[3..5]], [-1,  0])   [[1,2],[4,5]]
+/// constant_pad_nd([[0..2],[3..5]], [-1, -1])   [[1],[4]]
+/// constant_pad_nd([[0..2],[3..5]], [-1,  2])   [[1,2,0,0],[4,5,0,0]]
+/// ```
+///
+/// The last one is why cropping and padding cannot be two passes over the
+/// whole tensor: they happen on the *same* axis, crop first, and a single
+/// axis can do both.
+///
+/// The two shape refusals are upstream's messages transcribed, spacing
+/// included -- "Pad length is 6while the input has 2dimensions." really is
+/// missing both spaces upstream, and is reproduced rather than tidied for the
+/// reason docs/CKPT2.md §4 gives: a message that differs from upstream's only
+/// in wording is useless exactly where it is needed.
+fn constant_pad_nd(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.constant_pad_nd.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let pad: Vec<i64> = required(OP, args, kwargs, 1, "pad")?.extract()?;
+    let raw_value = optional(args, kwargs, 2, "value")?;
+    let value = match raw_value.as_ref() {
+        Some(v) if !v.is_none() => scalar_arg(OP, args, kwargs, 2, "value")?
+            .ok_or_else(|| missing(OP, "value"))?,
+        // The schema default. Written as an integer zero rather than `0.0`
+        // because upstream's `Scalar value=0` is an integer too, and the
+        // difference is observable through `checked_convert` below.
+        _ => Scalar::Int(0),
+    };
+
+    if pad.len() % 2 != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Length of pad must be even but instead it equals {}",
+            pad.len()
+        )));
+    }
+    let rank = input.tensor()?.rank();
+    if pad.len() / 2 > rank {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Length of pad should be no more than twice the number of \
+             dimensions of the input. Pad length is {}while the input has \
+             {rank}dimensions.",
+            pad.len()
+        )));
+    }
+
+    let tag = input.tag();
+    // Same overflow refusal `full` makes, and for the same reason: candle
+    // would wrap an out-of-range integer fill silently. `numel` is the padded
+    // element count only in spirit here -- what it selects is upstream's
+    // "one element skips the reduced-float check" hole, and a pad block is
+    // never the one-element case unless the whole pad is empty, so 2 is the
+    // honest argument rather than a computed size.
+    if let Some(v) = raw_value.as_ref() {
+        if !v.is_none() && !v.is_instance_of::<PyTensorBase>() {
+            checked_convert(v, v.is_instance_of::<pyo3::types::PyInt>(), tag, 2)?;
+        }
+    }
+
+    let device = input.tensor()?.device().clone();
+    let mut out = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
+    for (pair, chunk) in pad.chunks(2).enumerate() {
+        let (left, right) = (chunk[0], chunk[1]);
+        // `pad[0..2]` is the LAST dimension. `rank - 1 - pair` is that rule,
+        // and `pad.len() / 2 <= rank` above is what makes it in range.
+        let axis = rank - 1 - pair;
+
+        // Crop before padding: a single axis can do both (`[-1, 2]`).
+        let drop_front = (-left).max(0) as usize;
+        let drop_back = (-right).max(0) as usize;
+        if drop_front != 0 || drop_back != 0 {
+            let extent = out.dims()[axis];
+            let kept = extent as i64 - drop_front as i64 - drop_back as i64;
+            if kept < 0 {
+                // Upstream's message, from upstream's own `narrow`.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "narrow(): length must be non-negative.",
+                ));
+            }
+            out = out
+                .narrow(axis, drop_front, kept as usize)
+                .map_err(|e| candle_err(OP, e))?;
+        }
+
+        for (amount, before) in [(left.max(0), true), (right.max(0), false)] {
+            if amount == 0 {
+                continue;
+            }
+            let mut shape = out.dims().to_vec();
+            shape[axis] = amount as usize;
+            let block = filled_block(OP, value, tag, &shape, &device)?;
+            let pieces: Vec<&Tensor> = if before {
+                vec![&block, &out]
+            } else {
+                vec![&out, &block]
+            };
+            out = Tensor::cat(&pieces, axis)
+                .and_then(|t| t.contiguous())
+                .map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    finish(py, out, tag)
 }
 
 /// `aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1)`
@@ -2800,12 +3014,41 @@ fn rsqrt_default(
 /// tensor with an integer exponent stays integral (`pow(int64, 2) -> int64`),
 /// and a float on either side floats the result. A Python scalar never widens
 /// a tensor of the same category.
+///
+/// **`tensor` is the *result* category, not necessarily an operand's dtype.**
+/// `pow_tensor_tensor` hands in the promotion of its two operands
+/// (docs/ARCH20.md §6), so a `float32 ** int32` reaches here as `Float32` and
+/// the `Bool` arm below only fires when *both* sides are boolean -- which is
+/// exactly where upstream raises `NotImplementedError: "pow" not implemented
+/// for 'Bool'`, measured. The other two overloads still hand in the tensor
+/// operand's own dtype, so a boolean tensor with a scalar exponent is still
+/// refused here; see the arm's own comment for why that one is deliberate.
 fn pow_result_tag(op: &str, tensor: TorchDType, scalar_is_float: bool) -> PyResult<TorchDType> {
     if tensor == TorchDType::Bool {
+        // Two different situations reach this, and both are refusals rather
+        // than gaps -- but only one of them is upstream's:
+        //
+        //   * `pow.Tensor_Tensor(bool, bool)` -- upstream raises
+        //     `NotImplementedError: "pow" not implemented for 'Bool'`. Refusing
+        //     is agreeing.
+        //   * `pow.Tensor_Scalar(bool, <scalar>)` -- upstream *computes*, and
+        //     the result category is not a promotion rule but a cascade of
+        //     exponent fast paths in `pow_tensor_scalar`: measured on 2.13.0,
+        //     `pow(bool_t, 2)` is `int64`, `pow(bool_t, 0)` is `int64` all-ones
+        //     (the `exp == 0 -> ones_like` path), `pow(bool_t, True)` is
+        //     **bool** (the `exp == 1 -> clone` path, and `True` is the scalar
+        //     1), and `pow(bool_t, 2.0)` is `float32`. Reproducing that means
+        //     reproducing the fast-path ladder, not a dtype table, and no
+        //     measured caller needs it -- `square(bool_t)` is the only reachable
+        //     spelling and nothing in the twenty architectures squares a mask.
+        //     So it stays refused, now with the measurement recorded rather
+        //     than with "has not been measured".
         return Err(not_implemented(format!(
             "{op}: torch.bool operands are not implemented in torch._C shim -- \
-             torch's own result category for a boolean pow has not been measured, \
-             and guessing it is exactly the silent divergence this shim refuses"
+             upstream's boolean pow is a ladder of exponent fast paths (exp 0 \
+             gives int64 ones, exp 1 clones and stays bool, exp 2 gives int64), \
+             not a promotion rule, and reproducing a ladder nothing measured \
+             needs is how a wrong answer gets in"
         )));
     }
     Ok(if scalar_is_float && !tensor.is_floating_point() {
@@ -2813,6 +3056,53 @@ fn pow_result_tag(op: &str, tensor: TorchDType, scalar_is_float: bool) -> PyResu
     } else {
         tensor
     })
+}
+
+/// What upstream does with a *negative integer* exponent, which is not one
+/// rule but two, split by overload. Measured on torch 2.13.0:
+///
+/// ```text
+/// pow.Tensor_Scalar(int64([2,1,-1,0]), -1)          RuntimeError
+/// pow.Tensor_Tensor(int64([2,1,-1,0]), int64(-1))   [0, 1, -1, 0]
+/// pow.Scalar(2, int64([-1, 3]))                     [0, 8]
+/// ```
+///
+/// So only the scalar-exponent overload refuses; the other two compute
+/// `c10::powi`'s answer, which is `1` for base 1, `±1` for base -1 by the
+/// parity of the exponent, and `0` otherwise. This was one refusal for all
+/// three before, which is the safe direction to be wrong in but is still a
+/// divergence -- and widening `Tensor_Tensor`'s dtype acceptance (§6) makes
+/// many more integer pairs reach it.
+#[derive(Clone, Copy, PartialEq)]
+enum NegativeIntExponent {
+    /// `pow.Tensor_Scalar`: upstream raises.
+    Refuse,
+    /// `pow.Tensor_Tensor` and `pow.Scalar`: upstream computes `powi`.
+    Powi,
+}
+
+/// `c10::powi` for a signed base, transcribed. The unsigned dtypes cannot
+/// reach the negative arm at all -- a `uint8` exponent is never below zero --
+/// so the one function serves both.
+fn powi(base: i64, exponent: i64) -> i64 {
+    if exponent < 0 {
+        return match base {
+            1 => 1,
+            -1 => {
+                // Upstream's `(-b) % 2`: odd gives -1, even gives 1.
+                if exponent % 2 == 0 {
+                    1
+                } else {
+                    -1
+                }
+            }
+            _ => 0,
+        };
+    }
+    // Wrapping, like torch's integer kernels: an int64 overflow there
+    // wraps rather than raising, and refusing here would diverge in
+    // the other direction.
+    base.wrapping_pow(exponent.min(u32::MAX as i64) as u32)
 }
 
 fn pow_from_pairs(
@@ -2823,6 +3113,7 @@ fn pow_from_pairs(
     shape: Vec<usize>,
     tag: TorchDType,
     device: &Device,
+    negative: NegativeIntExponent,
 ) -> PyResult<Py<PyAny>> {
     let storage = PyDtype::new(tag).storage(op)?;
     let tensor = if tag.is_floating_point() {
@@ -2838,16 +3129,13 @@ fn pow_from_pairs(
         let mut values = Vec::with_capacity(n);
         for i in 0..n {
             let exponent = e[i % e.len()];
-            if exponent < 0 {
+            if exponent < 0 && negative == NegativeIntExponent::Refuse {
                 // torch's message, verbatim.
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "Integers to negative integer powers are not allowed.",
                 ));
             }
-            // Wrapping, like torch's integer kernels: an int64 overflow there
-            // wraps rather than raising, and refusing here would diverge in
-            // the other direction.
-            values.push(b[i % b.len()].wrapping_pow(exponent.min(u32::MAX as i64) as u32));
+            values.push(powi(b[i % b.len()], exponent));
         }
         Tensor::from_vec(values, shape, device)
     }
@@ -2892,7 +3180,17 @@ fn pow_tensor_scalar(
     let shape = base.tensor()?.dims().to_vec();
     let bases = side_from_tensor(OP, base.tensor()?, tag)?;
     let exponents = side_from_scalar(&exponent, tag);
-    pow_from_pairs(py, OP, bases, exponents, shape, tag, base.tensor()?.device())
+    pow_from_pairs(
+        py,
+        OP,
+        bases,
+        exponents,
+        shape,
+        tag,
+        base.tensor()?.device(),
+        // The one overload where upstream refuses a negative integer exponent.
+        NegativeIntExponent::Refuse,
+    )
 }
 
 fn pow_scalar(
@@ -2907,7 +3205,16 @@ fn pow_scalar(
     let shape = exponent.tensor()?.dims().to_vec();
     let bases = side_from_scalar(&base, tag);
     let exponents = side_from_tensor(OP, exponent.tensor()?, tag)?;
-    pow_from_pairs(py, OP, bases, exponents, shape, tag, exponent.tensor()?.device())
+    pow_from_pairs(
+        py,
+        OP,
+        bases,
+        exponents,
+        shape,
+        tag,
+        exponent.tensor()?.device(),
+        NegativeIntExponent::Powi,
+    )
 }
 
 fn pow_tensor_tensor(
@@ -2918,7 +3225,25 @@ fn pow_tensor_tensor(
     const OP: &str = "aten.pow.Tensor_Tensor";
     let base = tensor_arg(OP, args, kwargs, 0, "self")?;
     let exponent = tensor_arg(OP, args, kwargs, 1, "exponent")?;
-    let tag = pow_result_tag(OP, same_dtype(OP, &base, &exponent)?, false)?;
+    // **Promotes rather than requiring equal dtypes** -- `bloom` is what asked
+    // (docs/ARCH20.md §6): `build_alibi_tensor` computes
+    // `torch.pow(base, powers)` with a `float32` base and an `int32` exponent,
+    // and `same_dtype` refused it by name.
+    //
+    // The rule is `promote_types`, the same table `mul.Tensor` and
+    // `bitwise_and.Tensor` already use, and it was re-measured against
+    // `pow.Tensor_Tensor`'s own result dtype over the full 10x10 grid of
+    // storable dtypes before being reused: every cell agrees with
+    // `torch._prims_common.get_higher_dtype` except `bool ** bool`, where
+    // upstream raises and so does this (`pow_result_tag`'s `Bool` arm).
+    //
+    // Note what `promote_operands` does *not* do: its `lhs.tag() == rhs.tag()`
+    // fast path returns the shared dtype before the rank table is consulted,
+    // which is the only reason a same-rank pair like `float16 ** float16` does
+    // not escape to `float32` the way `float16 ** bfloat16` correctly does
+    // (docs/BIND.md §9 -- `get_higher_dtype`'s `if a is b` guards exactly the
+    // same table for exactly the same reason).
+    let tag = pow_result_tag(OP, promote_operands(OP, &base, &exponent)?, false)?;
 
     let shape = base
         .tensor()?
@@ -2933,7 +3258,16 @@ fn pow_tensor_tensor(
     };
     let bases = side_from_tensor(OP, &broadcast(base.tensor()?)?, tag)?;
     let exponents = side_from_tensor(OP, &broadcast(exponent.tensor()?)?, tag)?;
-    pow_from_pairs(py, OP, bases, exponents, dims, tag, base.tensor()?.device())
+    pow_from_pairs(
+        py,
+        OP,
+        bases,
+        exponents,
+        dims,
+        tag,
+        base.tensor()?.device(),
+        NegativeIntExponent::Powi,
+    )
 }
 
 fn side_from_tensor(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<PowSide> {
@@ -3663,12 +3997,19 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
 /// The dtype a promoting binary op computes in, with both operands named when
 /// there is no answer.
 ///
-/// **Two ops call this: `mul.Tensor` and `bitwise_and.Tensor`.** Everything
-/// else -- `add`, `sub`, `div`, `bitwise_or` -- still goes through
-/// `same_dtype` and still refuses. That split is the "no unmeasured
-/// implementation" rule (docs/E2E_REAL.md §1.2) rather than an oversight:
-/// these are the two ops a real `generate()` was measured stopping on, and
-/// they were found one at a time, by running it.
+/// **Three ops call this: `mul.Tensor`, `bitwise_and.Tensor` and
+/// `pow.Tensor_Tensor`.** Everything else -- `add`, `sub`, `div`,
+/// `bitwise_or` -- still goes through `same_dtype` and still refuses. That
+/// split is the "no unmeasured implementation" rule (docs/E2E_REAL.md §1.2)
+/// rather than an oversight: these are the ops a real forward was measured
+/// stopping on, and they were found one at a time, by running it.
+///
+/// `pow.Tensor_Tensor` is the third and it came from `bloom`
+/// (docs/ARCH20.md §6), whose `build_alibi_tensor` raises a `float32` base to
+/// an `int32` power. Its cells were re-measured against
+/// `pow.Tensor_Tensor`'s own result dtype rather than assumed from `mul`'s:
+/// the two agree everywhere except `bool ** bool`, which `pow_result_tag`
+/// refuses because upstream raises there.
 ///
 /// `_prepare_attention_mask_for_generation` computes
 ///
@@ -4132,9 +4473,10 @@ enum Unary {
     Reciprocal,
     Tanh,
     Exp,
+    Log,
 }
 
-/// `cos`, `sin`, `reciprocal`, `tanh`, `exp` -- torch's unary float promotion, the
+/// `cos`, `sin`, `reciprocal`, `tanh`, `exp`, `log` -- torch's unary float promotion, the
 /// same rule `rsqrt` above already implements: a floating input keeps its own
 /// dtype (`float16` in, `float16` out, *not* widened), and an integral or
 /// boolean input becomes the default float.
@@ -4149,6 +4491,20 @@ enum Unary {
 /// `A = -exp(A_log)` (`A_log` a plain `float32` parameter) -- measured
 /// `torch.exp` on `int64`/`bool` promotes to `float32` exactly like `tanh`
 /// does, and a `float16` input stays `float16`.
+///
+/// `log` joined for `mamba` (docs/ARCH20.md §4), whose `init_mamba_weights`
+/// computes `init.copy_(self.A_log, torch.log(A))` while the model is being
+/// *constructed* -- so it is a `from_config` wall, not a forward one. The same
+/// promotion holds, re-measured rather than assumed from `exp`: `log(int64)`,
+/// `log(int32)`, `log(uint8)` and `log(bool)` all give `float32`, and
+/// `float16`/`bfloat16` stay put.
+///
+/// **`log` has no domain refusal, and that is measured, not an omission.**
+/// Upstream returns `-inf` for `log(0.0)` and `nan` for `log(-1.0)` rather
+/// than raising, which is IEEE's answer and `f64::ln`'s, so nothing here has
+/// to special-case the domain -- but it does have to be *checked*, because
+/// "raises on a negative input" is the plausible wrong guess and `mamba`'s
+/// `A = arange(1, state_size+1)` never leaves the positive half to reveal it.
 fn unary_float(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -4172,8 +4528,61 @@ fn unary_float(
             Unary::Reciprocal => t.recip(),
             Unary::Tanh => t.tanh(),
             Unary::Exp => t.exp(),
+            Unary::Log => t.log(),
         })
         .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::expm1(Tensor self) -> Tensor`
+///
+/// `exp(x) - 1`, computed as one operation rather than two. `mamba`'s wall
+/// (docs/ARCH20.md §4): `init_mamba_weights` inverts softplus with
+/// `dt + torch.log(-torch.expm1(-dt))`, again during construction.
+///
+/// **It is not in the `unary_float` family even though its dtype rule is
+/// exactly that family's** (measured: `int64`/`int32`/`uint8`/`bool` all give
+/// `float32`, and each float dtype keeps its own), and the reason is the whole
+/// point of the op. candle has no `expm1`, and `t.exp()? - 1.0` is *not* it:
+/// near zero the subtraction cancels every significant bit that `exp` just
+/// produced. Measured against upstream at `1e-8`, float64:
+///
+/// ```text
+/// torch.expm1(1e-8)      1.0000000050000001e-08
+/// torch.exp(1e-8) - 1    9.99999993922529e-09      wrong from the 9th digit
+/// ```
+///
+/// So this goes through `f64::exp_m1`, element by element, the same shape of
+/// implementation `pow` and `bitwise_binary` use for the same reason -- there
+/// is no candle kernel and the callers are not hot loops. `read_flat` widens
+/// to `f64` first, which is what makes the `float16`/`bfloat16` cases come out
+/// as one correctly-rounded value rather than two roundings of a cancelled
+/// subtraction.
+fn expm1_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.expm1.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    // `unary_float`'s promotion, restated rather than shared because the
+    // *computation* cannot be shared: the family dispatches into candle and
+    // this does not.
+    let tag = if input.tag().is_floating_point() {
+        input.tag()
+    } else {
+        default_float()
+    };
+    let source = input.tensor()?;
+    // Read at the *result* tag, not the input's: an integral input has to be
+    // read as floats, since `expm1(1) = 1.718...` is not an integer.
+    let values = match read_flat(OP, source, tag)? {
+        Flat::Float(v) => v.into_iter().map(f64::exp_m1).collect::<Vec<f64>>(),
+        // Unreachable -- `tag` is floating by construction above -- but a
+        // `_ => unreachable!()` would be a panic across the FFI boundary.
+        Flat::Int(v) => v.into_iter().map(|x| (x as f64).exp_m1()).collect(),
+    };
+    let out = write_flat(OP, Flat::Float(values), source.dims().to_vec(), source.device(), tag)?;
     finish(py, out, tag)
 }
 
@@ -6732,74 +7141,317 @@ fn copy_inplace(
     Ok(receiver.into_any().unbind())
 }
 
-/// `aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)`
+/// Upstream's `canCast(result, dest)` guard on an in-place write, with
+/// upstream's own message.
 ///
-/// The in-place sibling of `add.Tensor`, needed to open `falcon` (docs/TAIL.md)
-/// -- its residual connections write `hidden_states += attn_output` rather
-/// than rebinding the name, so the trace calls this overload, not `add.Tensor`.
+/// **This is the rule that separates in-place from out-of-place, and it is
+/// the one the previous `add_` kernel did not have.** An out-of-place op may
+/// promote as far as it likes because it allocates the result; an in-place op
+/// has a destination already, so upstream computes the promoted result dtype
+/// and then *refuses* if it cannot be cast back:
+///
+/// ```text
+/// float32.add_(int32_tensor)     ok       promote -> float32, fits
+/// int32.add_(float32_tensor)     RAISE    "result type Float can't be cast
+///                                          to the desired output type Int"
+/// int32.mul_(2.5)                RAISE    same, via the wrapped-number rule
+/// int64.div_(2)                  RAISE    div always floats
+/// int64.exp_()                   RAISE    "... output type Long"
+/// ```
+///
+/// `c10::canCast`, transcribed: a float result may not land in an integral
+/// destination, and a non-bool result may not land in a `bool` one (bool is a
+/// promotion *category*, which is why `bool_tensor += 5` is disallowed even
+/// though every value would fit). Complex has no storage here, so its arm is
+/// unreachable and omitted rather than written and never taken.
+///
+/// The shim used to *compute* in the refusing rows -- `int32.add_(float)` cast
+/// the operand down and returned a wrong-by-truncation answer, recorded as a
+/// `torch_error` golden case rather than fixed. Computing where upstream
+/// raises is the silent-divergence direction, so it is fixed here and the case
+/// is promoted to `both_error`.
+fn inplace_cast_check(op: &str, result: TorchDType, dest: TorchDType) -> PyResult<()> {
+    let refuses = (result.is_floating_point() && !dest.is_floating_point())
+        || (result != TorchDType::Bool && dest == TorchDType::Bool);
+    if refuses {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type {} can't be cast to the desired output type {}",
+            scalar_type_name(result),
+            scalar_type_name(dest)
+        )));
+    }
+    let _ = op;
+    Ok(())
+}
+
+/// `aten::add_.Tensor`, `sub_.Tensor` and `mul_.Tensor` -- one kernel, because
+/// they differ only in `apply_arith`'s arm.
+///
+/// `add_` opened `falcon` (docs/TAIL.md): its residual connections write
+/// `hidden_states += attn_output` rather than rebinding the name, so the trace
+/// calls this overload and not `add.Tensor`. `sub_` and `mul_` joined it in
+/// docs/ARCH20.md §8 -- they had no kernel *and* no member, which is why
+/// `x -= y` and `x *= y` refused outright.
 ///
 /// **Aliasing is `write_back`'s, the same as every other in-place op in this
-/// file**: the sum is computed into a fresh tensor of the receiver's shape and
-/// dtype and then written through the receiver's *layout*, so an alias or a
-/// view taken before this call does observe the update, as upstream's does.
+/// file**: the result is computed into a fresh tensor of the receiver's shape
+/// and dtype and then written through the receiver's *layout*, so an alias or
+/// a view taken before this call does observe the update, as upstream's does.
 /// docs/VIEWS.md §6.
 ///
-/// Two rules narrower than upstream, both borrowed rather than re-derived:
+/// Two rules, both upstream's:
 ///
-///   * `torch.bool` is refused, matching `add.Tensor`'s own refusal --
-///     upstream's in-place bool add is a logical or (measured:
-///     `tensor([True,False]).add_(tensor([True,True]))` gives
-///     `[True, True]`), and this shim implements that arithmetic in neither
-///     the out-of-place nor the in-place overload, so `add_` does not
-///     silently acquire a capability `add.Tensor` lacks.
-///   * `other` is cast into the receiver's dtype rather than promoted --
-///     `copy_inplace`'s rule. Upstream additionally refuses some *safe*-
-///     looking casts (measured: `int32.add_(float_tensor)` raises "result
-///     type Float can't be cast to the desired output type Int") that this
-///     shim accepts instead. Not hit by falcon/bloom/gpt_bigcode, whose
-///     residual adds already agree in dtype, so left as a known gap.
-fn add_inplace(
+///   * **`torch.bool` follows `arith_tag`**, so `mul_` accepts it (a bool
+///     product is the logical and, exactly, under the tag's 0/1 invariant --
+///     and upstream agrees: `tensor([True,False]).mul_(tensor([True,True]))`
+///     is `[True, False]`, measured) while `add_` and `sub_` refuse it.
+///     Upstream's bool `add_` is a logical *or*, which this shim implements in
+///     neither the in-place nor the out-of-place spelling, so `add_` does not
+///     acquire a capability `add.Tensor` lacks.
+///   * **the cast check**, `inplace_cast_check` above. The result dtype is the
+///     one `add.Tensor`/`mul.Tensor` would have produced -- the in-place
+///     spelling must not compute a different function from the out-of-place
+///     one -- and it is refused rather than truncated when it does not fit.
+///
+/// One narrower-than-upstream case remains and is recorded rather than hidden:
+/// when the promoted result is *wider* than the receiver (`float16.add_(
+/// float64_tensor)`), upstream accumulates in the wider type and narrows once,
+/// while this accumulates in `opmath_in(receiver)`. Both narrow to the
+/// receiver; they can differ in the last bit.
+fn arith_inplace_tensor(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    kind: Arith,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.add_.Tensor";
-    let receiver = tensor_receiver(OP, args, kwargs)?;
-    let other = tensor_arg(OP, args, kwargs, 1, "other")?;
-    let alpha = alpha_arg(OP, args, kwargs)?;
+    let receiver = tensor_receiver(op, args, kwargs)?;
+    let other = tensor_arg(op, args, kwargs, 1, "other")?;
+    // `mul_.Tensor` has no `alpha` in its schema; `optional` simply finds
+    // nothing at index 2 and this is 1.0, so the one kernel still serves it.
+    let alpha = alpha_arg(op, args, kwargs)?;
 
     let (tag, shape) = {
         let borrowed = receiver.borrow();
         (borrowed.tag(), borrowed.tensor()?.shape().clone())
     };
-    if tag == TorchDType::Bool {
-        return Err(not_implemented(format!(
-            "{OP}: torch.bool addition is logical or, not arithmetic, and is \
-             not implemented in torch._C shim"
-        )));
-    }
-    let storage = PyDtype::new(tag).storage(OP)?;
-    // Same widening as `add.Tensor` -- the in-place spelling must not compute
-    // a different function from the out-of-place one. See `opmath_in`.
+    let operand = if tag == other.tag() {
+        tag
+    } else {
+        promote_types(tag, other.tag()).ok_or_else(|| {
+            not_implemented(format!(
+                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                tag.name(),
+                other.tag().name()
+            ))
+        })?
+    };
+    let result = arith_tag(op, kind, operand, None)?;
+    inplace_cast_check(op, result, tag)?;
+
+    let storage = PyDtype::new(tag).storage(op)?;
+    // Same widening as the out-of-place sibling -- the in-place spelling must
+    // not compute a different function from it. See `opmath_in`.
     let acc = opmath_in(storage);
     let lhs = {
         let borrowed = receiver.borrow();
         borrowed
             .tensor()?
             .fast_to(acc)
-            .map_err(|e| candle_err(OP, e))?
+            .map_err(|e| candle_err(op, e))?
     };
     let rhs = other
         .tensor()?
         .fast_to(acc)
         .and_then(|t| t.broadcast_as(shape))
         .and_then(|t| t.contiguous())
-        .map_err(|e| candle_err(OP, e))?;
-    let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
-    let out = lhs
-        .add(&rhs)
+        .map_err(|e| candle_err(op, e))?;
+    let rhs = scale_by_alpha(op, &rhs, alpha, storage)?;
+    let out = apply_arith(op, kind, &lhs, &rhs)?
+        .fast_to(storage)
+        .map_err(|e| candle_err(op, e))?;
+    // `tagged` and not `PyTensorBase::new`: `write_into` compares the *torch*
+    // tags, and `boolean()` is the only constructor allowed to attach the
+    // `bool` one (BOOL.md §6.3). Only `mul_` reaches the bool arm --
+    // `arith_tag` refuses it for `add_`/`sub_` -- and it reaches it for the
+    // reason `mul.Tensor` accepts bool out of place: the product *is* the
+    // logical and. The golden case `mul_(dtype=bool)` is what found this.
+    write_back(op, &receiver, tagged(out, tag)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// Wrap a computed tensor with the right torch tag, for the in-place kernels
+/// whose result goes to `write_back` rather than to `finish`.
+///
+/// The same branch `finish` makes, factored out because `write_back` takes a
+/// `PyTensorBase` and not a `Py<PyAny>`. Getting it wrong is not silent --
+/// `write_into` compares tags and refuses with an "internal error" -- but it
+/// is only *not* silent because that check exists; before docs/VIEWS.md §6 it
+/// would have retagged the receiver.
+fn tagged(tensor: Tensor, tag: TorchDType) -> PyResult<PyTensorBase> {
+    if tag == TorchDType::Bool {
+        PyTensorBase::boolean(tensor)
+    } else {
+        PyTensorBase::new(tensor)
+    }
+}
+
+/// `aten::add_.Scalar`, `sub_.Scalar` and `mul_.Scalar`.
+///
+/// **Upstream's *dispatcher* never names these from a Python call**, and that
+/// is measured: `t.add_(2)` reports `aten.add_.Tensor`, because
+/// `add_.Scalar`'s CompositeExplicitAutograd body wraps the number into a 0-d
+/// tensor and redispatches. They exist here for the same reason `add.Scalar`
+/// and `mul.Scalar` do -- the *parser* is what `methods.json` reproduces, and
+/// `x += 2` binds a `Scalar` signature there. Skipping them would make
+/// `x += 2` refuse while `x += tensor(2)` worked, which is a difference no
+/// caller can see a reason for.
+///
+/// The dtype rule is `arith_tag`'s wrapped-number promotion, then the same
+/// `inplace_cast_check`: `int32.mul_(2.5)` refuses ("result type Float can't
+/// be cast to the desired output type Int", upstream's words) rather than
+/// truncating to `int32` behind the caller's back.
+fn arith_inplace_scalar(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    kind: Arith,
+) -> PyResult<Py<PyAny>> {
+    let receiver = tensor_receiver(op, args, kwargs)?;
+    let other = scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+    let alpha = alpha_arg(op, args, kwargs)?;
+
+    let tag = receiver.borrow().tag();
+    let result = arith_tag(op, kind, tag, Some(!other.is_int()))?;
+    inplace_cast_check(op, result, tag)?;
+
+    let storage = PyDtype::new(tag).storage(op)?;
+    let acc = opmath_in(storage);
+    let lhs = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()?
+            .fast_to(acc)
+            .map_err(|e| candle_err(op, e))?
+    };
+    // Built exactly as `arith_scalar` builds it, including the narrow-then-
+    // widen for the float case: torch's promotion makes a Python float beside
+    // a `bfloat16` tensor a `bfloat16` operand, so `x += 0.3` adds
+    // `0.30078125` there (docs/GENERATE.md §3.2). Building at `acc` would add
+    // `0.3` and the in-place form would disagree with the out-of-place one.
+    let rhs = if storage.is_int() {
+        Tensor::full(other.as_i64() * (alpha as i64), (), lhs.device())
+            .and_then(|t| t.fast_to(acc))
+    } else {
+        Tensor::full(other.as_f64() * alpha, (), lhs.device())
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.fast_to(acc))
+    }
+    .map_err(|e| candle_err(op, e))?;
+    let out = apply_arith(op, kind, &lhs, &rhs)?
+        .fast_to(storage)
+        .map_err(|e| candle_err(op, e))?;
+    write_back(op, &receiver, tagged(out, tag)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::neg_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `neg.default`'s value and refusals, written through the receiver. It keeps
+/// the receiver's dtype -- `int64.neg_()` is `int64`, measured -- so there is
+/// no cast check to make; the only refusals are `neg`'s own two, and both are
+/// upstream's: `bool` (upstream points at `~`/`logical_not()` instead) and the
+/// wide unsigned dtypes, which have no `neg_cpu` kernel upstream at all.
+///
+/// The integral path does not go through candle for the reason `neg_default`
+/// gives at length: `candle_core`'s `neg` is a `unary_op!` whose integer arms
+/// are `todo!()`, so calling it on an `i64` tensor **panics** rather than
+/// returning an error. `0 - x` is the same value with no panic.
+fn neg_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.neg_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Negation, the `-` operator, on a bool tensor is not supported. If you are \
+             trying to invert a mask, use the `~` or `logical_not()` operator instead.",
+        ));
+    }
+    if matches!(
+        tag,
+        TorchDType::UInt16 | TorchDType::UInt32 | TorchDType::UInt64
+    ) {
+        return Err(not_implemented(format!(
+            "{OP}: torch has no neg_cpu kernel for {}",
+            tag.name()
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let source = {
+        let borrowed = receiver.borrow();
+        borrowed.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?
+    };
+    let out = source
+        .zeros_like()
+        .and_then(|z| z.sub(&source))
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::exp_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `exp.default`'s value, written through the receiver -- with the one
+/// difference in-place always makes. `exp` *promotes*: `torch.exp(int64_t)` is
+/// `float32`. An in-place `exp_` has nowhere to put that, so upstream refuses
+/// rather than truncating: `int64_tensor.exp_()` raises "result type Float
+/// can't be cast to the desired output type Long", measured. Every floating
+/// dtype keeps its own (`float16` in, `float16` out) exactly as `unary_float`
+/// does out of place.
+///
+/// **The refusal is also load-bearing for safety, which a sabotage run found
+/// rather than the reading.** Disabling `inplace_cast_check` did not produce a
+/// wrong number here -- it produced
+/// `PanicException: not yet implemented: no unary function for i64` and took
+/// the golden harness's interpreter down mid-run. candle's `exp` is a
+/// `unary_op!` whose integer arms are `todo!()`, the same trap `neg_default`
+/// documents from the other side. So the integral path must never reach
+/// candle, and the cast check is what guarantees it: this kernel casts to
+/// `storage` (the *receiver's* dtype, unchanged) rather than to a float, so
+/// without the check an `int64` receiver would hand `i64` bytes to `t.exp()`.
+fn exp_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.exp_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    // `unary_float`'s promotion, then the in-place guard against it.
+    let result = if tag.is_floating_point() {
+        tag
+    } else {
+        default_float()
+    };
+    inplace_cast_check(OP, result, tag)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let out = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| t.exp())
+            .map_err(|e| candle_err(OP, e))?
+    };
     write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
@@ -8168,22 +8820,44 @@ fn clamp_inplace_default(
         ));
     }
     let tag = receiver.borrow().tag();
-    // **`torch.bool` refuses whatever the bounds are**, and the message names
-    // the bound's type rather than the receiver's. Measured on torch 2.13.0:
-    // `clamp_(0, 5)` and `clamp_(None, 1)` give "result type Long can't be
-    // cast to the desired output type bool", `clamp_(0.0, 1.0)` gives the same
-    // with "Float", and `uint8` -- the dtype `bool` shares storage with --
-    // computes normally.
-    //
-    // It is here rather than left to `write_into`'s backstop for a reason that
-    // is about layering, not politeness: without it, `bool.clamp_(0, 5)`
-    // produced a `uint8` replacement and `replace_with` *retagged the
-    // receiver*, computing where upstream refuses. `write_into` refuses that
-    // now, but with an "internal error" message aimed at whoever wrote the
-    // kernel. A user-reachable refusal belongs at the door with upstream's own
-    // wording; the tag check underneath stays as the structural backstop, the
-    // same shape as `check_meta` sitting over `PyTensorBase::tensor`.
-    // docs/VIEWS.md §6.8.
+    clamp_dtype_refusals(tag, min, max)?;
+    let source = receiver.borrow().tensor()?.clone();
+    let out = clamp_values(OP, &source, tag, min, max)?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The dtype refusals `clamp` and `clamp_` share.
+///
+/// **`torch.bool` refuses whatever the bounds are**, and the message names the
+/// *bound's* type rather than the receiver's. Measured on torch 2.13.0:
+/// `clamp_(0, 5)` and `clamp_(None, 1)` give "result type Long can't be cast
+/// to the desired output type bool", `clamp_(0.0, 1.0)` gives the same with
+/// "Float", and `uint8` -- the dtype `bool` shares storage with -- computes
+/// normally.
+///
+/// It is at the door rather than left to `write_into`'s backstop for a reason
+/// that is about layering, not politeness: without it, `bool.clamp_(0, 5)`
+/// produced a `uint8` replacement and `replace_with` *retagged the receiver*,
+/// computing where upstream refuses. `write_into` refuses that now, but with
+/// an "internal error" message aimed at whoever wrote the kernel. A
+/// user-reachable refusal belongs at the door with upstream's own wording; the
+/// tag check underneath stays as the structural backstop, the same shape as
+/// `check_meta` sitting over `PyTensorBase::tensor`. docs/VIEWS.md §6.8.
+///
+/// **A float bound against an integral tensor is refused outright, regardless
+/// of the bound's actual value** -- measured `int32.clamp(max=2.0)` raises
+/// even though `2.0` is exactly representable as an int; torch does not
+/// special-case exact values, so this does not either. Note that the
+/// out-of-place `clamp` refuses here *too*, which is the half that does not
+/// follow from "in-place cannot widen": upstream's `clamp` does not promote at
+/// all, it requires the bound to fit the input.
+fn clamp_dtype_refusals(
+    tag: TorchDType,
+    min: Option<Scalar>,
+    max: Option<Scalar>,
+) -> PyResult<()> {
     if tag == TorchDType::Bool {
         let saw_float = [min, max]
             .into_iter()
@@ -8204,15 +8878,25 @@ fn clamp_inplace_default(
             }
         }
     }
-    let source = receiver.borrow().tensor()?.clone();
-    let mut out = source;
+    Ok(())
+}
+
+/// `min(max(x, min_val), max_val)`, the value half of both clamp spellings.
+fn clamp_values(
+    op: &str,
+    source: &Tensor,
+    tag: TorchDType,
+    min: Option<Scalar>,
+    max: Option<Scalar>,
+) -> PyResult<Tensor> {
+    let mut out = source.clone();
     if let Some(bound) = min {
         out = if tag.is_floating_point() {
             out.maximum(bound.as_f64())
         } else {
             out.maximum(bound.as_i64())
         }
-        .map_err(|e| candle_err(OP, e))?;
+        .map_err(|e| candle_err(op, e))?;
     }
     if let Some(bound) = max {
         out = if tag.is_floating_point() {
@@ -8220,11 +8904,103 @@ fn clamp_inplace_default(
         } else {
             out.minimum(bound.as_i64())
         }
-        .map_err(|e| candle_err(OP, e))?;
+        .map_err(|e| candle_err(op, e))?;
     }
-    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
-    let _ = py;
-    Ok(receiver.into_any().unbind())
+    Ok(out)
+}
+
+/// `aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor`
+///
+/// `mamba`'s wall (docs/ARCH20.md §4): `modeling_mamba.py` clamps `dt` and the
+/// discretisation limits out of place, and only the *in-place* sibling had a
+/// kernel -- `clamp_.default` has been implemented since docs/OPS8.md while
+/// `x.clamp(...)` refused. That asymmetry is the one an in-place-first round
+/// leaves behind, and it is the second instance of it in this file after
+/// `relu`/`relu_` (docs/SPELLINGS.md §6.6) went the other way.
+///
+/// The *value* rule is `clamp_`'s, shared through `clamp_values` -- including
+/// "both bounds absent is an error, not a no-op", which a fresh out-of-place
+/// implementation would plausibly have made a no-op since there is no receiver
+/// to leave unchanged. Measured: `x.clamp()` raises "torch.clamp: At least one
+/// of 'min' or 'max' must not be None".
+///
+/// The *dtype* rule is not `clamp_`'s, and assuming it was is the mistake the
+/// golden cases caught: see the table in the body.
+///
+/// `clamp.Tensor` (tensor bounds) is a separate overload with a separate
+/// kernel and is not implemented; `methods.json` lists it so that
+/// `x.clamp(min=some_tensor)` refuses *by the name of the overload it needed*
+/// rather than by "no matching signature".
+fn clamp_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.clamp.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let min = scalar_arg(OP, args, kwargs, 1, "min")?;
+    let max = scalar_arg(OP, args, kwargs, 2, "max")?;
+    if min.is_none() && max.is_none() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch.clamp: At least one of 'min' or 'max' must not be None",
+        ));
+    }
+    // **The out-of-place form PROMOTES; the in-place one refuses.** That is
+    // the whole dtype difference between the two, it is not obvious, and
+    // sharing `clamp_dtype_refusals` here (which the first draft did) makes
+    // this op refuse four measured rows that upstream computes. Measured on
+    // 2.13.0:
+    //
+    //     clamp(int32,  0,     5)      int32       clamp_ agrees
+    //     clamp(int32,  None,  2.0)    float32     clamp_ RAISES
+    //     clamp(uint8,  None,  2)      uint8
+    //     clamp(uint8,  None,  2.0)    float32
+    //     clamp(float16,None,  2.0)    float16     a python float never widens a float tensor
+    //     clamp(bool,   0,     5)      int64       clamp_ RAISES
+    //     clamp(bool,   0.0,   1.0)    float32
+    //     clamp(bool,   False, True)   RAISES      "clamp_scalar_cpu" not implemented for 'Bool'
+    //
+    // which is `arith_tag`'s wrapped-number rule with one extra: a *boolean*
+    // scalar does not lift a boolean tensor out of the bool category, so the
+    // result stays `bool` and upstream has no kernel for it. `bool` subclasses
+    // `int` in Python and `Scalar` collapses the two, so that last row needs
+    // the raw argument rather than the parsed `Scalar` -- which is why the
+    // `PyBool` checks below read `optional` and not `scalar_arg`.
+    let bound_is_bool = |index: usize, name: &str| -> PyResult<bool> {
+        Ok(match optional(args, kwargs, index, name)? {
+            Some(value) if !value.is_none() => value.is_instance_of::<pyo3::types::PyBool>(),
+            _ => false,
+        })
+    };
+    let saw_float = [min, max].into_iter().flatten().any(|b| !b.is_int());
+    let bool_bounds = (min.is_none() || bound_is_bool(1, "min")?)
+        && (max.is_none() || bound_is_bool(2, "max")?);
+
+    let input_tag = input.tag();
+    let tag = if input_tag == TorchDType::Bool {
+        if bool_bounds {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "\"clamp_scalar_cpu\" not implemented for 'Bool'",
+            ));
+        }
+        if saw_float {
+            default_float()
+        } else {
+            TorchDType::Int64
+        }
+    } else if saw_float && !input_tag.is_floating_point() {
+        default_float()
+    } else {
+        input_tag
+    };
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let source = input
+        .tensor()?
+        .fast_to(storage)
+        .map_err(|e| candle_err(OP, e))?;
+    let out = clamp_values(OP, &source, tag, min, max)?;
+    finish(py, out, tag)
 }
 
 /// `aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)`

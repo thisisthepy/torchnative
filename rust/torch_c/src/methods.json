@@ -102,6 +102,32 @@
     "    kernel here.",
     "  * `masked_fill_` is `masked_fill`'s in-place twin, same order, and its",
     "    `.Tensor` overload is likewise kernel-less.",
+    "  * `add_`/`sub_`/`mul_`/`neg_`/`exp_`/`relu_` and the three `__i*__`",
+    "    dunders arrived together (docs/ARCH20.md §8), and the gap they",
+    "    closed is worth naming: `aten.add_.Tensor` had had a kernel since",
+    "    docs/TAIL.md and `aten.relu_.default` since docs/KERNELS.md, and",
+    "    neither name was reachable from Python -- `x += y` raised",
+    "    `NotImplementedError: TensorBase.__iadd__`, on a kernel that was",
+    "    there and golden-compared. These are the most common mutations in",
+    "    the language and every one of them refused.",
+    "  * The `__i*__` dunders list the same schemas as their named siblings",
+    "    because upstream's `.pyi` gives them the same one signature",
+    "    (`__iadd__(self, other: Tensor | Number | _complex)`). `x += y` and",
+    "    `x.add_(y)` are the same call, and `torch/_tensor.py` does not even",
+    "    define `__iadd__` -- it inherits `_C.TensorBase.__iadd__`, which is",
+    "    why a missing entry here made the operator raise rather than fall",
+    "    back to `__add__`.",
+    "  * `Scalar` overloads are listed for all three arithmetic families and",
+    "    upstream's *dispatcher* never names them: measured, `t.add_(2)`",
+    "    reports `aten.add_.Tensor`, because `add_.Scalar`'s",
+    "    CompositeExplicitAutograd body wraps the number and redispatches.",
+    "    The same divergence `div_.Scalar` records just above, and it is the",
+    "    parser this table reproduces, not the dispatcher. They have kernels",
+    "    here so that `x += 2` computes rather than refusing.",
+    "  * `clamp` joins `clamp_`, in the same Tensor-first `.pyi` order, and",
+    "    only its `default` overload has a kernel -- `clamp.Tensor` names a",
+    "    work item. `mamba` asked for the out-of-place spelling; the in-place",
+    "    one had been implemented since docs/OPS8.md.",
     "",
     "`chunk` and `__setitem__` were part of the same Mixtral batch and are",
     "*not* here: both are Python-level members in bootstrap.py, for the",
@@ -328,6 +354,15 @@
   "rsqrt": [
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
+  "log": [
+    "aten::log(Tensor self) -> Tensor"
+  ],
+  "exp": [
+    "aten::exp(Tensor self) -> Tensor"
+  ],
+  "expm1": [
+    "aten::expm1(Tensor self) -> Tensor"
+  ],
   "tanh": [
     "aten::tanh(Tensor self) -> Tensor"
   ],
@@ -433,5 +468,43 @@
   "clamp_": [
     "aten::clamp_.Tensor(Tensor(a!) self, Tensor? min=None, Tensor? max=None) -> Tensor(a!)",
     "aten::clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)"
+  ],
+  "clamp": [
+    "aten::clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor",
+    "aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+
+  "add_": [
+    "aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "__iadd__": [
+    "aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "sub_": [
+    "aten::sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "__isub__": [
+    "aten::sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "mul_": [
+    "aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "__imul__": [
+    "aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "neg_": [
+    "aten::neg_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "exp_": [
+    "aten::exp_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "relu_": [
+    "aten::relu_(Tensor(a!) self) -> Tensor(a!)"
   ]
 }

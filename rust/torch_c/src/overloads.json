@@ -110,7 +110,32 @@
     "`aten.rsub.Scalar` calls `torch.sub`. Every one of the three names an",
     "aten key this shim already implements, so the entry is the whole fix --",
     "no kernel is invented. `sub` mirrors `add` above and omits",
-    "`sub.Scalar_out` for the same reason `add` omits `add.Scalar_out`."
+    "`sub.Scalar_out` for the same reason `add` omits `add.Scalar_out`.",
+    "",
+    "`log` (docs/ARCH20.md §4) is the second op after `pow` where the",
+    "`aten::` packet is mostly TorchScript numerics, and it is a sharper",
+    "case: **fourteen of `aten::log`'s sixteen overloads are scalar",
+    "builtins** (`log.int`, `log.float`, `log.Scalar`, `log.int_float`,",
+    "`log.complex_complex`, ...), and `torch.log` accepts none of them --",
+    "`torch.log(2.0)` is a TypeError from the arg parser upstream. Only the",
+    "two `Tensor` schemas are listed, and the `.out` one comes first per the",
+    "rule above. Listing the numerics would turn a call upstream refuses into",
+    "a call this shim answers, which is the divergence direction that costs",
+    "the most to find. `exp`, added in the same round for `mamba`, has the",
+    "same shape (four of its overloads are numerics) and gets the same",
+    "treatment; both kernels already existed, so both entries are the whole",
+    "fix.",
+    "",
+    "`stack` (cohere, docs/ARCH20.md §5) had a kernel and no spelling --",
+    "`aten.stack.default` has been in `IMPLEMENTED` and golden-compared since",
+    "docs/ARCH.md, and `torch.stack(...)` still refused. That is the pattern",
+    "the coverage sweep is structurally unable to see: it traces on upstream",
+    "and asks whether every *dispatched* operator is implemented here, so a",
+    "missing `torch.<name>` never appears in it.",
+    "",
+    "`constant_pad_nd` (bert, §2) is the reverse -- a genuinely new kernel.",
+    "Its `.out` sibling is omitted for the reason `sum.out` is: this shim has",
+    "no out-variant kernel, and `F.pad` never asks for one."
   ],
 
   "arange": [
@@ -196,6 +221,10 @@
   "empty_like": [
     "aten::empty_like.out(Tensor self, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::empty_like(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor"
+  ],
+  "zeros_like": [
+    "aten::zeros_like.out(Tensor self, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::zeros_like(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor"
   ],
 
   "full": [
@@ -404,5 +433,29 @@
     "aten::sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
     "aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
+  ],
+
+  "log": [
+    "aten::log.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::log(Tensor self) -> Tensor"
+  ],
+
+  "exp": [
+    "aten::exp.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::exp(Tensor self) -> Tensor"
+  ],
+
+  "expm1": [
+    "aten::expm1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::expm1(Tensor self) -> Tensor"
+  ],
+
+  "stack": [
+    "aten::stack.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::stack(Tensor[] tensors, int dim=0) -> Tensor"
+  ],
+
+  "constant_pad_nd": [
+    "aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor"
   ]
 }

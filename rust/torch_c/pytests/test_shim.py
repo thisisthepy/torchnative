@@ -437,11 +437,17 @@ def test_overload_resolution_refuses_rather_than_guessing():
         raise AssertionError("full(2, 3) must not resolve")
 
     # An op with no table entry keeps the old refusal rather than guessing
-    # `.default`. `flatten` has no kernel (docs/SPELLINGS.md) and so no table
-    # entry either -- `relu` used to be this example, until docs/SPELLINGS.md
-    # §6 gave it one.
+    # `.default`. `cumprod` has no kernel and so no table entry either --
+    # `relu` used to be this example until docs/SPELLINGS.md §6 gave it one,
+    # and `flatten` was it until docs/ARCH20.md §5 gave `cohere` a composite.
+    #
+    # The example keeps having to move, and that is the point rather than an
+    # annoyance: it can only be a name that is *still* unreachable, so choosing
+    # one is choosing a claim that gets falsified the day someone implements
+    # it. `cumprod` is `cumsum`'s sibling and this shim has `cumsum`, which
+    # makes it exactly the kind of name a future round is likely to reach for.
     try:
-        _vf("flatten")(1)
+        _vf("cumprod")(1)
     except NotImplementedError as e:
         assert "no table entry" in str(e)
     else:
@@ -6621,7 +6627,11 @@ def test_decompose_gets_the_full_upstream_table_now():
     r = _decomp_road_fixture()
     assert r["table_source"] == "core_aten_decompositions", r["table_source"]
     assert r["table_reason"] is None, r["table_reason"]
-    assert r["table_size"] == 415, r["table_size"]
+    # 415 until `zeros_like.out` reached the registry -- the same one entry
+    # `test_a_packet_reports_the_overloads_the_file_declares` counts, seen from
+    # the decomposition table's side. `cia_registrations` reads
+    # `native_functions.yaml` directly and so does not move with the tables.
+    assert r["table_size"] == 416, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -6655,7 +6665,15 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
     assert r["overloads_relu"] == ["default"], r["overloads_relu"]
-    assert r["registry"] == 1005, r["registry"]
+    # 1005 until docs/ARCH20.md added a `zeros_like` entry to
+    # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
+    # moved it before (see `test_schema_text_survives_the_round_trip...`): the
+    # table now carries `aten::zeros_like.out`, which the yaml does not declare,
+    # so `register_decomposition(aten.zeros_like)` has a schema to resolve and
+    # reaches one more overload. `registry_default` does not move, because the
+    # new one is `.out` and not `.default` -- which is the check that this is
+    # the same mechanism and not a regression of the `["default"]` bug.
+    assert r["registry"] == 1006, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -6700,7 +6718,13 @@ def test_core_ops_and_op_tags_agree():
     # *implemented* ops that upstream tags `core`, so it moves whenever a
     # core-tagged op is implemented -- and `ge.Tensor` is core upstream
     # exactly as its `le`/`lt`/`gt` siblings already counted here are.
-    assert r["tag_core_count"] == 78, r["tag_core_count"]
+    # 78 until docs/ARCH20.md, which implemented four more ops that upstream
+    # tags `core`: `clamp.default`, `constant_pad_nd.default`, `expm1.default`
+    # and `log.default`. The seven in-place kernels the same round added
+    # (`sub_`, `mul_`, `neg_`, `exp_` and the `Scalar` overloads) are NOT core
+    # upstream and do not appear here -- checked, not assumed, which is what
+    # makes 82 the right number rather than 85.
+    assert r["tag_core_count"] == 82, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -7652,21 +7676,31 @@ def _schema_road_fixture():
 #: `fill_.Scalar` -- which differ only by overload -- for free, hiding whether
 #: the overload was resolved at all.
 _EXPECTED_MUTABLE = (
+    "aten.add_.Scalar",
     "aten.add_.Tensor",
     "aten.clamp_.default",
     "aten.copy_.default",
     "aten.div_.Tensor",
+    "aten.exp_.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
     "aten.index_put_.default",
     "aten.masked_fill_.Scalar",
+    "aten.mul_.Scalar",
+    "aten.mul_.Tensor",
+    "aten.neg_.default",
     "aten.normal_.default",
     "aten.relu_.default",
+    "aten.sub_.Scalar",
+    "aten.sub_.Tensor",
     "aten.uniform_.default",
     "aten.zero_.default",
 )
 
 #: The seven docs/DISTRIBUTED.md §8.1 named, as the judgement it set.
+#: docs/ARCH20.md §8 added `sub_`, `mul_`, `neg_` and `exp_` to the *set* above;
+#: this tuple stays the seven §8.1 named, because it is a record of that
+#: judgement rather than a second copy of the implemented list.
 _SECTION_8_1_MUTABLE = ("add_", "copy_", "fill_", "normal_", "relu_", "uniform_",
                         "zero_")
 
@@ -7832,17 +7866,30 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
             shadowed.append((qualname, overload, got["from"]))
     assert mismatched == [], mismatched[:5]
     assert shadowed == [], shadowed[:5]
-    assert len(keys) == 193, len(keys)
+    # 193 until docs/ARCH20.md, which added 22 distinct `(qualname, overload)`
+    # pairs across the two tables: the six spellings whose kernels already
+    # existed (`exp`, `stack`, `zeros_like`, plus their `.out` siblings), the
+    # three new kernels (`log`, `expm1`, `constant_pad_nd`), `clamp`, and the
+    # in-place family. The `__iadd__`/`__isub__`/`__imul__` entries add none --
+    # they are second spellings of `add_`/`sub_`/`mul_`, and this counts
+    # distinct schema identities, not table keys.
+    assert len(keys) == 215, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
     )
+    # `zeros_like.out` is the sixth table-only entry (docs/ARCH20.md): like the
+    # five before it, torchgen generates it and the yaml does not declare it.
+    # Every other schema this round added IS declared in the yaml, so the list
+    # grew by one rather than by twenty-two -- which is the check that the new
+    # entries are being answered by the file and not by the oracle itself.
     assert from_tables == [
         ("aten::div", "Scalar_mode_out"),
         ("aten::div", "Scalar_out"),
         ("aten::embedding", "out"),
         ("aten::empty_like", "out"),
         ("aten::floor_divide", "Scalar_out"),
+        ("aten::zeros_like", "out"),
     ], from_tables
 
 
@@ -9288,6 +9335,310 @@ def test_a_quantised_activation_is_refused_and_a_reduced_float_one_too():
         assert "shapes cannot be multiplied" in str(exc), str(exc)
     else:
         raise AssertionError("a mismatched activation was accepted")
+
+
+# --- docs/ARCH20.md: names that had kernels and no way in --------------------
+#
+# Every one of these is a *reachability* check, and that is deliberate: the
+# golden harness already compares the kernels against upstream, and it did so
+# for weeks while `x += y` raised `NotImplementedError` and `torch.stack`
+# refused. A kernel case cannot see a missing name. These can, and each one
+# fails if exactly one line is deleted from `methods.json`, `overloads.json`
+# or `bootstrap.py`.
+
+
+def _arch20_tensor(flat, shape=None, dtype=None):
+    shape = list(shape if shape is not None else [len(flat)])
+    return _C._tensor_from_flat(list(flat), shape, dtype=dtype or _C.float32)
+
+
+def test_the_in_place_arithmetic_members_are_bound():
+    """`add_`, `sub_`, `mul_`, `neg_`, `exp_`, `relu_` and the three `__i*__`.
+
+    `aten.add_.Tensor` had had a kernel since docs/TAIL.md and
+    `aten.relu_.default` since docs/KERNELS.md; neither was reachable from
+    Python. The value assertions are deliberately weak -- the golden harness
+    owns correctness -- and the *binding* is what is asserted."""
+    x = _arch20_tensor([1.0, 2.0, 3.0])
+    y = _arch20_tensor([10.0, 20.0, 30.0])
+    assert x.add_(y).tolist() == [11.0, 22.0, 33.0]
+    assert _arch20_tensor([1.0, 2.0]).sub_(_arch20_tensor([0.5, 0.5])).tolist() == [0.5, 1.5]
+    assert _arch20_tensor([2.0, 3.0]).mul_(_arch20_tensor([3.0, 3.0])).tolist() == [6.0, 9.0]
+    assert _arch20_tensor([1.0, -2.0]).neg_().tolist() == [-1.0, 2.0]
+    assert _arch20_tensor([0.0]).exp_().tolist() == [1.0]
+    assert _arch20_tensor([-1.0, 2.0]).relu_().tolist() == [0.0, 2.0]
+
+    # The augmented-assignment spellings, which are a *different*
+    # `methods.json` key from the named members and were the ones `falcon`
+    # needed. `a += b` rebinds the name to whatever `__iadd__` returns, so the
+    # check below would pass even against a non-mutating `__iadd__` -- which is
+    # why the base check follows it.
+    a = _arch20_tensor([1.0, 2.0])
+    a += _arch20_tensor([1.0, 1.0])
+    assert a.tolist() == [2.0, 3.0]
+    b = _arch20_tensor([4.0, 6.0])
+    b -= _arch20_tensor([1.0, 1.0])
+    assert b.tolist() == [3.0, 5.0]
+    c = _arch20_tensor([4.0, 6.0])
+    c *= _arch20_tensor([2.0, 2.0])
+    assert c.tolist() == [8.0, 12.0]
+
+    # The scalar overloads, which need their own kernels because the parser
+    # binds a `Scalar` signature (docs/ARCH20.md §8.4).
+    assert _arch20_tensor([1.0, 2.0]).add_(1.0).tolist() == [2.0, 3.0]
+    assert _arch20_tensor([1.0, 2.0]).sub_(1.0).tolist() == [0.0, 1.0]
+    assert _arch20_tensor([1.0, 2.0]).mul_(3.0).tolist() == [3.0, 6.0]
+
+
+def test_the_in_place_members_write_through_to_the_base():
+    """The half a return-value assertion cannot reach (docs/VIEWS.md §6).
+
+    Every in-place op returns `self`, so `t.add_(1); assert t == expected`
+    passes against a kernel that computed into a fresh buffer and handed it
+    back. These narrow a view, mutate the view, and read the **base**."""
+    for label, mutate, expected in [
+        ("add_", lambda v: v.add_(_arch20_tensor([100.0, 100.0])), [1.0, 2.0, 103.0, 104.0]),
+        ("sub_", lambda v: v.sub_(_arch20_tensor([1.0, 1.0])), [1.0, 2.0, 2.0, 3.0]),
+        ("mul_", lambda v: v.mul_(_arch20_tensor([10.0, 10.0])), [1.0, 2.0, 30.0, 40.0]),
+        ("neg_", lambda v: v.neg_(), [1.0, 2.0, -3.0, -4.0]),
+        ("relu_", lambda v: v.relu_(), [1.0, 2.0, 3.0, 4.0]),
+        ("add_ scalar", lambda v: v.add_(1.0), [1.0, 2.0, 4.0, 5.0]),
+        ("__iadd__", lambda v: v.__iadd__(_arch20_tensor([1.0, 1.0])), [1.0, 2.0, 4.0, 5.0]),
+    ]:
+        base = _arch20_tensor([1.0, 2.0, 3.0, 4.0], (2, 2))
+        mutate(base[1])
+        assert base.tolist() == [expected[:2], expected[2:]], (label, base.tolist())
+
+
+def test_the_in_place_ops_refuse_a_cast_upstream_refuses(): 
+    """`inplace_cast_check` -- docs/ARCH20.md §8.3.
+
+    This shim used to *compute* a truncated answer for the first of these,
+    which is the silent-divergence direction. Upstream raises for all four."""
+    for label, call in [
+        ("int32.add_(float32)",
+         lambda: _arch20_tensor([1, 2], dtype=_C.int32).add_(_arch20_tensor([1.5, 2.5]))),
+        ("int32.mul_(2.5)",
+         lambda: _arch20_tensor([1, 2], dtype=_C.int32).mul_(2.5)),
+        ("int64.exp_()",
+         lambda: _arch20_tensor([1, 2], dtype=_C.int64).exp_()),
+        ("bool.neg_()",
+         lambda: _arch20_tensor([1, 0], dtype=_C.bool).neg_()),
+    ]:
+        try:
+            call()
+        except RuntimeError as e:
+            assert "cast" in str(e) or "not supported" in str(e), (label, str(e))
+        else:
+            raise AssertionError(f"{label} must refuse")
+    # ...and the safe direction still computes, so the check is not a blanket
+    # refusal on any dtype difference.
+    assert _arch20_tensor([1.0, 2.0]).add_(
+        _arch20_tensor([1, 1], dtype=_C.int32)
+    ).tolist() == [2.0, 3.0]
+
+
+def test_the_spellings_whose_kernels_already_existed_now_resolve():
+    """Six names that dispatched to implemented, golden-compared kernels and
+    refused at the Python surface (docs/ARCH20.md §0.3)."""
+    vf = _C._VariableFunctions
+    a = _arch20_tensor([1.0, 2.0])
+    assert vf.stack([a, a]).shape == (2, 2)
+    assert vf.exp(_arch20_tensor([0.0])).tolist() == [1.0]
+    assert vf.zeros_like(a).tolist() == [0.0, 0.0]
+    assert _C._nn.softplus(_arch20_tensor([0.0])).tolist()[0] > 0.0
+    # conv1d: the composite fills in `transposed=False` and `output_padding`.
+    x = _arch20_tensor([float(v) for v in range(8)], (1, 2, 4))
+    w = _arch20_tensor([1.0, 0.0, 0.0, 1.0], (2, 1, 2))
+    assert vf.conv1d(x, w, None, 1, 0, 1, 2).shape == (1, 2, 3)
+    assert vf.flatten(_arch20_tensor([1.0, 2.0, 3.0, 4.0], (2, 2))).shape == (4,)
+
+
+def test_the_three_composites_that_opened_persimmon_and_cohere():
+    vf = _C._VariableFunctions
+    # `square` is `pow(x, 2)` with an INTEGER exponent, which is what keeps an
+    # integral tensor integral.
+    assert vf.square(_arch20_tensor([2.0, 3.0])).tolist() == [4.0, 9.0]
+    squared = vf.square(_arch20_tensor([2, 3], dtype=_C.int64))
+    assert squared.dtype == _C.int64, squared.dtype
+    assert squared.tolist() == [4, 9]
+    # `repeat_interleave`, both dims, because the two answers differ and a
+    # wrong unsqueeze axis passes one of them.
+    m = _arch20_tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (2, 3))
+    assert vf.repeat_interleave(m, 2, dim=-1).tolist() == [
+        [0.0, 0.0, 1.0, 1.0, 2.0, 2.0], [3.0, 3.0, 4.0, 4.0, 5.0, 5.0]
+    ]
+    assert vf.repeat_interleave(m, 2, dim=0).tolist() == [
+        [0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [3.0, 4.0, 5.0]
+    ]
+    assert vf.repeat_interleave(m, 2).shape == (12,)
+    # The tensor-`repeats` overload is refused BY NAME, not approximated.
+    try:
+        vf.repeat_interleave(m, _arch20_tensor([1, 2, 3], dtype=_C.int64), dim=1)
+    except NotImplementedError as e:
+        assert "repeat_interleave.Tensor" in str(e), str(e)
+    else:
+        raise AssertionError("a tensor `repeats` must refuse")
+    # `flatten`'s 0-d arm is a reshape to [1], not a no-op.
+    assert _arch20_tensor([5.0], ()).flatten().shape == (1,)
+
+
+def test_a_list_index_lifts_into_an_index_tensor():
+    """`falcon`'s `fused_qkv[..., [-2], :]` (docs/ARCH20.md §7)."""
+    x = _arch20_tensor([float(v) for v in range(24)], (2, 3, 4))
+    assert x[..., [-2], :].shape == (2, 1, 4)
+    assert x[..., [-2], :].tolist() == [[[4.0, 5.0, 6.0, 7.0]], [[16.0, 17.0, 18.0, 19.0]]]
+    # A tuple item lifts the same way a list one does.
+    assert x[..., (0, 1), :].shape == (2, 2, 4)
+    # A bare list at top level is ONE index tensor...
+    assert x[[0, 1]].shape == (2, 3, 4)
+    # ...unless it contains a slice, in which case upstream reads it as a
+    # tuple of indices (`treatSequenceAsTuple`). Both arms, because picking
+    # either one alone passes half the cases.
+    assert x[[slice(None)]].shape == (2, 3, 4)
+    assert x[[[0, 1]]].shape == (2, 3, 4)
+    # And the write side takes the same route.
+    y = _arch20_tensor([0.0, 0.0, 0.0, 0.0], (2, 2))
+    y[[0]] = _arch20_tensor([7.0, 8.0])
+    assert y.tolist() == [[7.0, 8.0], [0.0, 0.0]]
+
+
+def test_the_determinism_flags_are_state_cells_with_upstreams_defaults():
+    """`bert`'s wall: `F.pad` reads this on every call (docs/ARCH20.md §2)."""
+    assert _C._get_deterministic_algorithms() is False
+    assert _C._get_deterministic_algorithms_warn_only() is False
+    # The one that defaults True -- a blanket "determinism starts off" would
+    # have got exactly this cell wrong.
+    assert _C._get_deterministic_fill_uninitialized_memory() is True
+    assert _C._get_cudnn_deterministic() is False
+    assert _C._get_mkldnn_deterministic() is False
+    try:
+        _C._set_deterministic_algorithms(True, warn_only=True)
+        assert _C._get_deterministic_algorithms() is True
+        assert _C._get_deterministic_algorithms_warn_only() is True
+        # `torch/__init__.py:1585` calls it with one positional argument.
+        _C._set_deterministic_algorithms(False)
+        assert _C._get_deterministic_algorithms() is False
+        assert _C._get_deterministic_algorithms_warn_only() is False
+    finally:
+        _C._set_deterministic_algorithms(False)
+
+
+def test_pad_is_wired_for_constant_mode_and_refuses_the_other_three():
+    padded = _C._nn.pad(_arch20_tensor([1.0, 2.0]), (0, 3), "constant", 0)
+    assert padded.tolist() == [1.0, 2.0, 0.0, 0.0, 0.0]
+    # `pad` is read LAST-dim-first and in pairs; the two dims get different
+    # pads here so a front-to-back reading produces a different shape.
+    grid = _arch20_tensor([float(v) for v in range(6)], (2, 3))
+    assert _C._nn.pad(grid, (1, 1, 2, 0), "constant", 7.0).shape == (4, 5)
+    # A negative entry crops, and crop-and-pad happen on the same axis.
+    assert _C._aten_dispatch("aten.constant_pad_nd.default", grid, [-1, 2]).tolist() == [
+        [1.0, 2.0, 0.0, 0.0], [4.0, 5.0, 0.0, 0.0]
+    ]
+    for mode in ("reflect", "replicate", "circular"):
+        try:
+            _C._nn.pad(_arch20_tensor([1.0, 2.0]), (1, 1), mode, 0)
+        except NotImplementedError as e:
+            assert mode in str(e), str(e)
+        else:
+            raise AssertionError(f"pad(mode={mode!r}) must refuse")
+
+
+def test_autograd_function_apply_runs_the_forward():
+    """`bloom` calls `autograd.Function.apply` on a FORWARD (§6.3).
+
+    `_FunctionBase.apply` is exercised here without the vendored tree, by
+    standing in the two things the tree's metaclass provides: a
+    `_backward_cls` and a `forward`."""
+    assert _C._are_functorch_transforms_active() is False
+    probe = _arch20_tensor([1.0, 2.0])
+    assert _C._functorch.unwrap_if_dead(probe) is probe
+
+    seen = {}
+
+    class Ctx(_C._FunctionBase):
+        def save_for_backward(self, *tensors):
+            seen["saved"] = tensors
+
+    class Combined:
+        _backward_cls = Ctx
+
+        @staticmethod
+        def forward(ctx, value):
+            ctx.save_for_backward(value)
+            seen["needs"] = ctx.needs_input_grad
+            return value.add_(_arch20_tensor([1.0, 1.0]))
+
+    out = _C._FunctionBase.apply.__func__(Combined, probe)
+    assert out.tolist() == [2.0, 3.0]
+    assert seen["saved"] == (probe,)
+    # Read-only upstream (a `getset_descriptor`), so it is a property here and
+    # the forward has to be able to read it.
+    assert seen["needs"] == (False,)
+
+
+def test_clamp_out_of_place_promotes_where_clamp_underscore_refuses():
+    """The dtype rule that is NOT shared between the two (docs/ARCH20.md §4)."""
+    promoted = _arch20_tensor([1, 5, 10], dtype=_C.int32).clamp(max=2.0)
+    assert promoted.dtype == _C.float32, promoted.dtype
+    assert promoted.tolist() == [1.0, 2.0, 2.0]
+    # The in-place sibling refuses the identical call.
+    try:
+        _arch20_tensor([1, 5, 10], dtype=_C.int32).clamp_(max=2.0)
+    except RuntimeError as e:
+        assert "cast" in str(e), str(e)
+    else:
+        raise AssertionError("clamp_ must refuse a float bound on an int receiver")
+    # ...and the receiver of the out-of-place form is untouched.
+    receiver = _arch20_tensor([1.0, 5.0, 10.0])
+    receiver.clamp(max=2.0)
+    assert receiver.tolist() == [1.0, 5.0, 10.0]
+
+
+def test_expm1_is_not_exp_minus_one():
+    """The one case that separates the two (docs/ARCH20.md §4).
+
+    Upstream float64 `expm1(1e-8)` is `1.0000000050000001e-08`;
+    `exp(1e-8) - 1` is `9.99999993922529e-09`, wrong from the ninth digit. A
+    subtraction-based kernel passes every other expm1 case and fails this."""
+    tiny = _C._tensor_from_flat([1e-8], [1], dtype=_C.float64)
+    got = _C._VariableFunctions.expm1(tiny).tolist()[0]
+    assert abs(got - 1.0000000050000001e-08) < 1e-24, got
+    naive = _C._VariableFunctions.exp(tiny).tolist()[0] - 1.0
+    assert abs(naive - got) > 1e-17, (naive, got)
+
+
+def test_pow_promotes_and_refuses_where_upstream_does():
+    """`bloom`'s `torch.pow(float32_base, int32_powers)` (docs/ARCH20.md §6)."""
+    base = _arch20_tensor([2.0, 3.0])
+    powers = _arch20_tensor([2, 3], dtype=_C.int32)
+    out = _C._aten_dispatch("aten.pow.Tensor_Tensor", base, powers)
+    assert out.dtype == _C.float32, out.dtype
+    assert out.tolist() == [4.0, 27.0]
+    # Same-rank reduced floats escape upwards; a same-dtype pair does not.
+    f16 = _C._tensor_from_flat([2.0], [1], dtype=_C.float16)
+    bf16 = _C._tensor_from_flat([3.0], [1], dtype=_C.bfloat16)
+    assert _C._aten_dispatch("aten.pow.Tensor_Tensor", f16, bf16).dtype == _C.float32
+    assert _C._aten_dispatch("aten.pow.Tensor_Tensor", f16, f16).dtype == _C.float16
+    # bool ** bool is where upstream raises, so this does too.
+    mask = _arch20_tensor([1, 0], dtype=_C.bool)
+    try:
+        _C._aten_dispatch("aten.pow.Tensor_Tensor", mask, mask)
+    except NotImplementedError as e:
+        assert "bool" in str(e), str(e)
+    else:
+        raise AssertionError("bool ** bool must refuse")
+    # A negative integer exponent: `powi`, not a refusal -- only the
+    # Tensor_Scalar overload refuses.
+    b = _arch20_tensor([2, 1, -1, 0], dtype=_C.int64)
+    e = _arch20_tensor([-1, -1, -1, -1], dtype=_C.int64)
+    assert _C._aten_dispatch("aten.pow.Tensor_Tensor", b, e).tolist() == [0, 1, -1, 0]
+    try:
+        _C._aten_dispatch("aten.pow.Tensor_Scalar", b, -1)
+    except RuntimeError as e:
+        assert "negative integer powers" in str(e), str(e)
+    else:
+        raise AssertionError("pow.Tensor_Scalar with a negative int must refuse")
 
 
 def _main():

@@ -3387,6 +3387,69 @@ def _install_tensor_chunk(tensorbase, dispatch) -> None:
     chunk.__qualname__ = "TensorBase.chunk"
     setattr(tensorbase, "chunk", chunk)
 
+    def flatten(self, start_dim=0, end_dim=-1):
+        """`Tensor.flatten`, `cohere`'s wall (docs/ARCH20.md §5).
+
+        `aten::flatten.using_ints` is `CompositeImplicitAutograd` and a
+        `TorchDispatchMode` logger on 2.13.0 shows it firing *nothing* of its
+        own: `x.flatten()`, `x.flatten(1)`, `x.flatten(1, 2)` and
+        `x.flatten(0, -2)` each produce exactly one record,
+        `aten.view.default`. So a `methods.json` entry would name
+        `aten.flatten.using_ints`, a key no dispatcher ever sees -- the same
+        complaint that keeps `softmax` and `chunk` out of that table.
+
+        The body is `at::native::flatten`, transcribed:
+
+            wrap both dims; start_dim <= end_dim or raise
+            0-d          -> reshape to [1]      (NOT a no-op: shape (1,), measured)
+            start == end -> self                (no op at all; the view is shared)
+            otherwise    -> reshape with the run collapsed to its product
+
+        `reshape`, not `view`, because that is what upstream's body calls --
+        the single `view.default` in the trace is `reshape` lowering to it for
+        a contiguous input, and a non-contiguous one would take `reshape`'s
+        copying arm. Spelling `view` here would refuse where upstream copies.
+
+        Two refusals, both measured and both upstream's words: `x.flatten(2, 1)`
+        gives "flatten() has invalid args: start_dim cannot come after
+        end_dim", and an out-of-range dim gives the ordinary
+        `Dimension out of range` IndexError -- which `_wrap_dim` below raises
+        with upstream's exact range, because "expected to be in range of
+        [-3, 2]" is the part that tells the caller what to pass instead.
+        """
+        rank = self.dim()
+        extent = max(rank, 1)
+
+        def _wrap_dim(dim):
+            wrapped = dim + extent if dim < 0 else dim
+            if wrapped < 0 or wrapped >= extent:
+                raise IndexError(
+                    f"Dimension out of range (expected to be in range of "
+                    f"[{-extent}, {extent - 1}], but got {dim})"
+                )
+            return wrapped
+
+        start = _wrap_dim(start_dim)
+        end = _wrap_dim(end_dim)
+        if start > end:
+            raise RuntimeError(
+                "flatten() has invalid args: start_dim cannot come after end_dim"
+            )
+        if rank == 0:
+            return dispatch("aten.reshape.default", self, [1])
+        if start == end:
+            return self
+        sizes = list(self.shape)
+        collapsed = 1
+        for extent_at in sizes[start : end + 1]:
+            collapsed *= extent_at
+        shape = sizes[:start] + [collapsed] + sizes[end + 1 :]
+        return dispatch("aten.reshape.default", self, shape)
+
+    flatten.__name__ = "flatten"
+    flatten.__qualname__ = "TensorBase.flatten"
+    setattr(tensorbase, "flatten", flatten)
+
 
 def _install_tensor_scalars(tensorbase, dispatch) -> None:
     """`item()` and `__bool__`, both of which leave the tensor world.
@@ -3454,6 +3517,8 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         f[0:1]      -> [slice.Tensor]
         f[None]     -> [unsqueeze]
         f[bool_t]   -> [index.Tensor]
+        f[[0, 1]]   -> [lift_fresh, index.Tensor]
+        f[..., [-2], :] -> [lift_fresh, index.Tensor]
 
     So this reproduces the walk rather than inventing a single `getitem` op,
     and every step goes through `_aten_dispatch`. What it does *not* do is
@@ -3488,14 +3553,88 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             and item.step is None
         )
 
+    # -- sequence indices (docs/ARCH20.md §7, the `falcon` wall) -------------
+    #
+    # `fused_qkv[..., [-2], :]` (`modeling_falcon.py:283`, `_split_heads`) is a
+    # *list* in an index tuple, and it used to hit the "index of type list"
+    # refusal at the bottom of the walk. Upstream lifts the list into an index
+    # tensor and takes the advanced-indexing path -- measured on 2.13.0:
+    #
+    #     x[..., [-2], :]     -> [lift_fresh.default, index.Tensor]
+    #     x[..., (0, 1), :]   -> [lift_fresh.default, index.Tensor]   (tuple too)
+    #     x[[0, 1]]           -> [lift_fresh.default, index.Tensor]
+    #     x[0, [1, 2]]        -> [select.int, lift_fresh.default, index.Tensor]
+    #
+    # and `torch.equal(x[..., [-2], :], x.index_select(1, tensor([1])))` is
+    # True, so the lifted tensor is an ordinary index tensor with upstream's
+    # ordinary negative-index wrapping. A list of `bool` becomes a *mask*
+    # rather than a positional index (`x[[True, False]]` also lowers to
+    # `lift_fresh` + `index.Tensor`), which is `_tensor_new_from_data`'s own
+    # dtype inference and not something this file decides.
+    def _is_sequence_index(item):
+        return isinstance(item, (list, tuple))
+
+    def _lift_sequence_index(item):
+        """The `lift_fresh(_tensor_new_from_data(...))` pair upstream emits.
+
+        Deliberately the same two steps `torch.tensor` takes (`_tensor_factory`
+        above), because upstream's list index and upstream's `torch.tensor` are
+        the same C++ path (`internal_new_from_data`) and produce the same
+        single aten record."""
+        return dispatch(
+            "aten.lift_fresh.default", module._tensor_new_from_data(item, None, None)
+        )
+
+    def _index_tuple(index):
+        """`treatSequenceAsTuple`, transcribed from
+        `python_variable_indexing.cpp`.
+
+        A **tuple** index is always a tuple of indices. A **list** index is the
+        ambiguous one, and upstream resolves it by looking inside: a short list
+        that contains a slice, an `Ellipsis`, a `None`, a tensor or another
+        sequence is read as a *tuple of indices*; anything else (a plain list
+        of numbers, or any list of 32 or more items) is read as one index
+        tensor. Measured, both arms:
+
+            x[[slice(None)]]  -> [alias.default]              tuple arm
+            x[[[0, 1]]]       -> [lift_fresh, index.Tensor]   tuple arm, inner list lifts
+            x[[0, 1]]         -> [lift_fresh, index.Tensor]   tensor arm
+
+        Upstream also emits a `UserWarning` on the tuple arm ("Using a
+        non-tuple sequence for multidimensional indexing is deprecated"). That
+        warning is *not* reproduced here: it is a deprecation notice about
+        Python-level spelling, it carries no information this shim can act on,
+        and emitting warnings from the indexing hot path is a cost with no
+        caller asking for it. The *behaviour* the warning describes is
+        reproduced exactly.
+        """
+        if isinstance(index, tuple):
+            return index
+        if isinstance(index, list) and len(index) < 32:
+            for item in index:
+                if (
+                    item is Ellipsis
+                    or item is None
+                    or isinstance(item, (slice, list, tuple, str))
+                    or isinstance(item, tensorbase)
+                ):
+                    return tuple(index)
+        return (index,)
+
     def __getitem__(self, index):
-        if not isinstance(index, tuple):
-            index = (index,)
+        index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
 
-        if any(isinstance(item, tensorbase) for item in index):
+        if any(
+            isinstance(item, tensorbase) or _is_sequence_index(item) for item in index
+        ):
             if any(
-                not (item is None or isinstance(item, tensorbase) or _is_full_slice(item))
+                not (
+                    item is None
+                    or isinstance(item, tensorbase)
+                    or _is_sequence_index(item)
+                    or _is_full_slice(item)
+                )
                 for item in index
             ):
                 raise NotImplementedError(
@@ -3504,7 +3643,12 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     "basic indexing first and then aten.index.Tensor, and this shim "
                     "does not reproduce that composition yet"
                 )
-            indices = [item if isinstance(item, tensorbase) else None for item in index]
+            indices = [
+                _lift_sequence_index(item)
+                if _is_sequence_index(item)
+                else (item if isinstance(item, tensorbase) else None)
+                for item in index
+            ]
             return dispatch("aten.index.Tensor", self, indices)
 
         result = self
@@ -3625,14 +3769,25 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             to exist to prevent.
           * Mixed basic and advanced indexing, unchanged and for the same
             reason as in `__getitem__`.
+
+        A **sequence** index (`x[[0, 2]] = v`) takes the advanced arm, lifted
+        by the same `_lift_sequence_index` the read side uses -- the two walks
+        have to agree on what an index *is*, or `x[i] = x[i]` would take two
+        different routes.
         """
-        if not isinstance(index, tuple):
-            index = (index,)
+        index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
 
-        if any(isinstance(item, tensorbase) for item in index):
+        if any(
+            isinstance(item, tensorbase) or _is_sequence_index(item) for item in index
+        ):
             if any(
-                not (item is None or isinstance(item, tensorbase) or _is_full_slice(item))
+                not (
+                    item is None
+                    or isinstance(item, tensorbase)
+                    or _is_sequence_index(item)
+                    or _is_full_slice(item)
+                )
                 for item in index
             ):
                 raise NotImplementedError(
@@ -3641,7 +3796,12 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     "basic indexing first and then aten.index_put_, and this shim "
                     "does not reproduce that composition yet"
                 )
-            indices = [item if isinstance(item, tensorbase) else None for item in index]
+            indices = [
+                _lift_sequence_index(item)
+                if _is_sequence_index(item)
+                else (item if isinstance(item, tensorbase) else None)
+                for item in index
+            ]
             dispatch("aten.index_put_.default", self, indices, _lift(value, self), False)
             return
 
@@ -4649,14 +4809,40 @@ def _install_nn(module, dispatch) -> None:
                 "needs aten._safe_softmax.default; it has no kernel"
             )
         if attn_mask is not None and attn_mask.dtype == module.bool:
-            # Measured: upstream converts a bool mask to an additive float one
-            # with `scalar_tensor` + `where.self` and *then* calls flash.
-            raise NotImplementedError(
-                "not implemented in torch._C shim: "
-                "scaled_dot_product_attention(attn_mask=<bool tensor>) -- upstream "
-                "converts it with aten.scalar_tensor.default and aten.where.self "
-                "before calling flash attention; neither has a kernel"
+            # `convert_boolean_attn_mask`, and it is now built rather than
+            # refused -- `falcon` is what asked (docs/ARCH20.md §7), which
+            # passes a bool mask straight into SDPA.
+            #
+            # **The refusal that used to be here had gone stale, and that is
+            # the interesting part.** Its own text named the two kernels it was
+            # waiting on -- `aten.scalar_tensor.default` and
+            # `aten.where.self` -- and both have been in `IMPLEMENTED`, and
+            # golden-compared, since docs/ARCH.md. Nothing re-read the refusal
+            # when they landed, so an architecture stayed blocked on a wall
+            # that had already been removed. A refusal that names its
+            # dependencies is only better than one that does not if somebody
+            # re-checks them.
+            #
+            # The sequence is upstream's, measured with a TorchDispatchMode
+            # logger on torch 2.13.0 and reproduced op for op and *in order*:
+            #
+            #     scalar_tensor(-inf)                -> the masked-out fill
+            #     scalar_tensor(0.0)                 -> the attend fill
+            #     where.self(mask, zero, neg_inf)    -> the additive mask
+            #     _scaled_dot_product_flash_attention_for_cpu(q, k, v, mask)
+            #
+            # Argument order in the `where` is the half a plausible reading
+            # gets backwards, so it was read off the *values*, not the shapes:
+            # `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0,
+            # -inf]]`. A `True` in a boolean attention mask means *attend*, so
+            # it selects the zero; the `-inf` is what a `False` selects. Both
+            # fills carry the query's dtype, not the default float, which is
+            # what keeps a float16 forward in float16.
+            neg_inf = dispatch(
+                "aten.scalar_tensor.default", float("-inf"), dtype=query.dtype
             )
+            zero = dispatch("aten.scalar_tensor.default", 0.0, dtype=query.dtype)
+            attn_mask = dispatch("aten.where.self", attn_mask, zero, neg_inf)
         # Grouped-query attention. The repetition itself is NOT here -- it is
         # in the aten kernel, because that is where upstream does it: a
         # TorchDispatchMode over `enable_gqa=True` reports one op, with the
@@ -4704,11 +4890,68 @@ def _install_nn(module, dispatch) -> None:
             scale=scale,
         )[0]
 
+    def pad(input, pad, mode="constant", value=None):
+        """`torch._C._nn.pad`, which `F.pad` calls after its own dispatch.
+
+        `bert` is the caller (docs/ARCH20.md §2), through
+        `modeling_utils.py:2701 _adjust_bias` -- so this runs while the model
+        is being *built*, not during a forward.
+
+        `torch/nn/functional.py:5823` hands all four arguments through, and
+        upstream's binding then picks an aten op by `mode`. Only the constant
+        mode is wired: measured with a `TorchDispatchMode` logger,
+        `F.pad(x, (0, 3), "constant", 0)` produces exactly one record,
+        `aten.constant_pad_nd.default`. The other three modes are genuinely
+        different kernels (`reflection_pad{1,2,3}d`, `replication_pad*`, and a
+        `circular` path built out of `cat`), and they are refused by name
+        rather than approximated with the constant one -- a wrong padding is
+        the kind of divergence that shows up as a slightly wrong number rather
+        than as an error.
+
+        `value=None` means zero, and that is upstream's own default rather
+        than a choice here: `constant_pad_nd`'s schema is `Scalar value=0`,
+        and `F.pad(x, (1, 1))` with no value pads with zeros (measured).
+        """
+        if mode != "constant":
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch._C._nn.pad(mode={mode!r}) "
+                f"-- upstream routes this to aten::reflection_pad*/"
+                f"replication_pad*/a circular composition rather than to "
+                f"aten::constant_pad_nd, and none of those has a kernel here; "
+                f"mode='constant' is implemented"
+            )
+        return dispatch(
+            "aten.constant_pad_nd.default",
+            input,
+            list(pad),
+            0 if value is None else value,
+        )
+
+    def softplus(input, beta=1, threshold=20):
+        """`torch._C._nn.softplus`, which `F.softplus` binds directly to.
+
+        `mamba`'s discretisation runs `F.softplus(dt)` on every step
+        (docs/ARCH20.md §4). The kernel -- `aten.softplus.default` -- has been
+        here and golden-compared since docs/OPS4.md; only the name was
+        missing, which is the same shape of gap as `torch.stack`,
+        `torch.exp` and `torch.conv1d` in this round.
+
+        One record, measured, in all three spellings: `F.softplus(x)`,
+        `F.softplus(x, 2.0, 10.0)` and `torch._C._nn.softplus(x, 1, 20)` each
+        fire `aten.softplus.default` and nothing else. The defaults are
+        upstream's schema defaults (`Scalar beta=1, Scalar threshold=20`) and
+        are integers there, which matters to `arith`-style wrapped-number
+        rules elsewhere and is why they are not written as `1.0`/`20.0`.
+        """
+        return dispatch("aten.softplus.default", input, beta, threshold)
+
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
         (gelu, "gelu"),
         (scaled_dot_product_attention, "scaled_dot_product_attention"),
+        (pad, "pad"),
+        (softplus, "softplus"),
     ):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C._nn"
@@ -4716,7 +4959,10 @@ def _install_nn(module, dispatch) -> None:
 
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
-    module._shim_nn_implemented = ["gelu", "linear", "scaled_dot_product_attention", "silu"]
+    module._shim_nn_implemented = [
+        "gelu", "linear", "pad", "scaled_dot_product_attention", "silu",
+        "softplus",
+    ]
 
 
 def _install_composites(module, varfns, dispatch) -> None:
@@ -4831,6 +5077,253 @@ def _install_composites(module, varfns, dispatch) -> None:
     isfinite.__name__ = isfinite.__qualname__ = "isfinite"
     isfinite.__module__ = "torch._C"
     setattr(varfns, "isfinite", isfinite)
+
+    def square(input, *, out=None):
+        """`torch.square` -- `persimmon`'s wall, and a composite, not an op.
+
+        `transformers/activations.py:213` (`ReLUSquaredActivation`) is the
+        caller: `squared = torch.square(relu_applied)`, once per MLP per layer.
+
+        **The measurement is what decides this is not an `overloads.json`
+        entry.** A `TorchDispatchMode` logger on torch 2.13.0 shows
+        `torch.square(x)` firing exactly one record -- `aten.pow.Tensor_Scalar`
+        -- for every dtype tried (float32/64/16, bfloat16, int8..int64, uint8,
+        bool). `aten.square.default` never fires: `aten::square` is
+        `CompositeImplicitAutograd` and its C++ body is `self.pow(2)`. So an
+        overload entry would name a kernel upstream does not have either, which
+        is the complaint `layer_norm`'s note above makes.
+
+        The exponent is the *integer* 2, not `2.0`, and that is load-bearing
+        rather than cosmetic: `pow`'s wrapped-number rule keeps an integral
+        tensor integral under an integer exponent, so `square(int64([2,3]))` is
+        `int64([4,9])` -- measured -- while a `2.0` here would return
+        `float32`. The same rule is why `square(float16)` stays `float16`.
+
+        `out=` is refused by name rather than forwarded. Upstream accepts it
+        (`torch.square(x, out=o)` works), but the route would be
+        `aten::pow.Tensor_Scalar_out`, which this shim has no kernel for; every
+        other `out=` in this file refuses for the same reason.
+
+        `square(bool_t)` is `int64` upstream and refuses here -- see
+        `pow_result_tag`'s `Bool` arm in `aten.rs` for the measurement and for
+        why the exponent fast-path ladder behind it is not reproduced.
+        """
+        if out is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.square(out=...) -- "
+                "upstream routes it to aten::pow.Tensor_Scalar_out, which this "
+                "shim has no kernel for; square into a fresh tensor instead"
+            )
+        return dispatch("aten.pow.Tensor_Scalar", input, 2)
+
+    square.__name__ = square.__qualname__ = "square"
+    square.__module__ = "torch._C"
+    setattr(varfns, "square", square)
+
+    def repeat_interleave(input, repeats, dim=None, *, output_size=None):
+        """`torch.repeat_interleave` -- `cohere`'s wall, also a composite.
+
+        `models/cohere/modeling_cohere.py:115` is the caller, and its own
+        comment says why it is not `cat`: *"diff from Llama: we interleave()
+        instead of cat()"*. So this is on cohere's rotary path, once per
+        forward.
+
+        **Two of upstream's overloads, and only one of them is here.** A
+        `TorchDispatchMode` logger on torch 2.13.0:
+
+            repeat_interleave(x, 2, dim=-1)   unsqueeze, expand, clone, view
+            repeat_interleave(x, 2)           view, unsqueeze, expand, clone, view
+            repeat_interleave(x, tensor, ...) repeat_interleave.Tensor, index_select
+
+        The integer-`repeats` overload (`aten::repeat_interleave.self_int`) is
+        `CompositeImplicitAutograd` and emits *no* record of its own -- it is
+        the four-op expansion above, every one of which this shim already has.
+        The tensor-`repeats` overload is a genuine kernel plus `index_select`,
+        neither of which exists here, so it is refused by name rather than
+        approximated.
+
+        The expansion, transcribed from the trace rather than invented:
+
+            dim is None:  flatten to 1-D first, then dim = 0
+            unsqueeze at dim+1        -> (..., n_dim, 1, ...)
+            expand that axis to repeats
+            clone (expand is a view; the copy is what materialises the repeat)
+            view back with sizes[dim] *= repeats
+
+        Checked against upstream's answers, not just its op sequence:
+        `repeat_interleave([[0,1,2],[3,4,5]], 2, dim=1)` is
+        `[[0,0,1,1,2,2],[3,3,4,4,5,5]]` and `dim=0` is
+        `[[0,1,2],[0,1,2],[3,4,5],[3,4,5]]` -- the two differ, so a wrong
+        unsqueeze axis cannot pass both.
+
+        Three refusals copied from upstream's own messages, all measured:
+        a negative `repeats`, an out-of-range `dim`, and an `output_size` that
+        disagrees with the computed one. `repeats=0` is *not* an error --
+        it produces a zero-length axis, and `repeats=1` is the identity.
+        """
+        if isinstance(input, (list, tuple)) or not isinstance(input, tensorbase):
+            # `aten::repeat_interleave.Tensor(Tensor repeats, ...)` -- the
+            # one-argument spelling, where the only argument is the repeats
+            # tensor. Not reachable from any measured caller and it needs the
+            # kernel this shim does not have, so it is refused with the same
+            # words as the other half below.
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.repeat_interleave(repeats) "
+                "-- the one-argument spelling needs aten::repeat_interleave.Tensor, "
+                "a real kernel this shim does not have"
+            )
+        if isinstance(repeats, tensorbase):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.repeat_interleave with a "
+                "tensor `repeats` -- upstream lowers it to "
+                "aten::repeat_interleave.Tensor followed by aten::index_select, and "
+                "this shim has neither kernel; the integer `repeats` spelling is "
+                "implemented"
+            )
+        repeats = int(repeats)
+        if repeats < 0:
+            raise RuntimeError("Repeats must be non-negative")
+
+        if dim is None:
+            # Upstream's `self.flatten()`; the trace's leading `view.default`.
+            input = dispatch("aten.view.default", input, [-1])
+            axis = 0
+        else:
+            rank = input.dim()
+            axis = dim if dim >= 0 else dim + rank
+            if axis < 0 or axis >= rank:
+                # Upstream's wording, verbatim, including the range it prints.
+                raise IndexError(
+                    f"Dimension out of range (expected to be in range of "
+                    f"[{-rank}, {rank - 1}], but got {dim})"
+                )
+
+        sizes = list(input.shape)
+        expanded = sizes[: axis + 1] + [repeats] + sizes[axis + 1 :]
+        final = list(sizes)
+        final[axis] = sizes[axis] * repeats
+        if output_size is not None and int(output_size) != final[axis]:
+            raise RuntimeError(
+                f"repeat_interleave: Invalid output_size, expected "
+                f"{final[axis]} but got {int(output_size)}"
+            )
+
+        widened = dispatch("aten.unsqueeze.default", input, axis + 1)
+        widened = dispatch("aten.expand.default", widened, expanded)
+        # `expand` is a view with a zero stride on the new axis; the `clone` is
+        # what turns the repeat into real elements, and upstream does the same.
+        widened = dispatch("aten.clone.default", widened)
+        return dispatch("aten.view.default", widened, final)
+
+    repeat_interleave.__name__ = repeat_interleave.__qualname__ = "repeat_interleave"
+    repeat_interleave.__module__ = "torch._C"
+    setattr(varfns, "repeat_interleave", repeat_interleave)
+
+    # Both of the above are reachable as `TensorBase` members too, and a name
+    # with no case is a name nobody checks (docs/GROUPED_MM.md §6.4): the
+    # kernel-level cases passed for weeks while `clamp_`/`chunk`/`__setitem__`
+    # raised `NotImplementedError` through the member. `Tensor.square()` and
+    # `Tensor.repeat_interleave(...)` bind to the same closures, with `self`
+    # in the first slot -- they cannot drift from `torch.square` /
+    # `torch.repeat_interleave` because they *are* those functions.
+    setattr(tensorbase, "square", square)
+    setattr(tensorbase, "repeat_interleave", repeat_interleave)
+
+    # ...and `torch.flatten`, which is the mirror image: the *member* is what
+    # `cohere` called and it is installed in `_install_tensor_chunk`, but
+    # `torch.flatten(x, 1)` is the same composite and would otherwise be a
+    # refusal pointing at `torch.ops.aten.flatten.<overload>` -- a work item
+    # nobody could close, since `aten.flatten.using_ints` is composite and
+    # never reaches a kernel. Bound to the member so the two cannot drift.
+    def flatten(input, start_dim=0, end_dim=-1):
+        return module.TensorBase.flatten(input, start_dim, end_dim)
+
+    flatten.__name__ = flatten.__qualname__ = "flatten"
+    flatten.__module__ = "torch._C"
+    setattr(varfns, "flatten", flatten)
+
+    def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        """`torch.conv1d` -- `mamba`'s depthwise causal convolution.
+
+        `nn.Conv1d.forward` reaches `F.conv1d`, which `torch/nn/functional.py`
+        binds straight to `torch.conv1d` (`_add_docstr(torch.conv1d, ...)`), so
+        this is the name a `nn.Conv1d` actually calls.
+
+        **The kernel was already here.** `aten.convolution.default` has been
+        implemented and golden-compared since docs/OPS4.md, and
+        `torch.conv1d(...)` still refused -- the third instance in this round
+        of a kernel with no spelling (docs/ARCH20.md §5, §9). `aten::conv1d` is
+        `CompositeImplicitAutograd`; measured with a `TorchDispatchMode` logger
+        on 2.13.0, every form of the call fires exactly one record:
+
+            conv1d(x, w, b, 1, 2, 1, 4)  -> convolution(x, w, b, [1], [2], [1],
+                                                        False, [0], 4)
+
+        so the whole of the composite is filling in `transposed=False` and
+        `output_padding=[0]`, the two arguments `conv1d` does not have and
+        `convolution` requires.
+
+        Scalars widen to one-element lists because `convolution`'s schema takes
+        `SymInt[]` for all three, and the trace shows upstream passing `[1]`
+        where the caller wrote `1`.
+
+        `padding` accepts upstream's two string spellings as well as a number.
+        `"valid"` is zero. `"same"` is `dilation * (kernel - 1) // 2`, which is
+        only the whole answer when that product is *even* -- upstream pads the
+        input asymmetrically when it is odd, and that path is refused by name
+        here rather than rounded, since rounding it would silently shift the
+        output by one sample. Measured: `padding="same"` with a 3-tap kernel
+        and dilation 1 reaches `convolution(..., [1], ...)`, which is the even
+        case. Non-unit stride with `"same"` is upstream's own refusal.
+        """
+        def _as_list(value):
+            return list(value) if isinstance(value, (list, tuple)) else [value]
+
+        stride = _as_list(stride)
+        dilation = _as_list(dilation)
+        if isinstance(padding, str):
+            if padding == "valid":
+                padding = [0]
+            elif padding == "same":
+                if any(s != 1 for s in stride):
+                    raise RuntimeError(
+                        "padding='same' is not supported for strided convolutions"
+                    )
+                kernel = weight.shape[-1]
+                total = dilation[0] * (kernel - 1)
+                if total % 2 != 0:
+                    raise NotImplementedError(
+                        "not implemented in torch._C shim: torch.conv1d("
+                        "padding='same') where dilation*(kernel-1) is odd -- "
+                        "upstream pads the input asymmetrically with "
+                        "aten::constant_pad_nd before convolving, and picking "
+                        "either half of the split here would shift the output "
+                        "by one sample"
+                    )
+                padding = [total // 2]
+            else:
+                raise ValueError(
+                    f"conv1d: padding must be 'valid', 'same', or an int, got {padding!r}"
+                )
+        else:
+            padding = _as_list(padding)
+
+        return dispatch(
+            "aten.convolution.default",
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            False,
+            [0],
+            groups,
+        )
+
+    conv1d.__name__ = conv1d.__qualname__ = "conv1d"
+    conv1d.__module__ = "torch._C"
+    setattr(varfns, "conv1d", conv1d)
 
     # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
     #
@@ -5084,6 +5577,95 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._get_cudnn_enabled = _get_cudnn_enabled
     module._set_cudnn_enabled = _set_cudnn_enabled
 
+    # The determinism flags -- the same shape of state cell as `cudnn_enabled`
+    # above, and the wall `bert` stopped on (docs/ARCH20.md §2).
+    #
+    # `F.pad` reads `torch.are_deterministic_algorithms_enabled()` on **every
+    # call**, before it does anything else (`torch/nn/functional.py:5806`), and
+    # that bottoms out at `_C._get_deterministic_algorithms()`. `bert`'s
+    # `tie_weights` pads the output-embedding bias when the head's vocabulary
+    # is wider than the tied embedding's, so the model cannot be *constructed*
+    # without this name -- the failure was in `from_config`, not in the
+    # forward.
+    #
+    # The defaults are upstream's, read off torch 2.13.0 rather than guessed:
+    #
+    #     _get_deterministic_algorithms()                    False
+    #     _get_deterministic_algorithms_warn_only()          False
+    #     _get_deterministic_fill_uninitialized_memory()     True
+    #     _get_cudnn_deterministic()                         False
+    #     _get_mkldnn_deterministic()                        False
+    #
+    # Note `fill_uninitialized_memory` is the one that defaults *True*, which
+    # is the cell a blanket "all determinism flags start off" would have got
+    # wrong. It is only consulted when determinism is on, so it changes nothing
+    # here, but the getter is what `torch.utils.deterministic` reads and a
+    # wrong constant there is a wrong answer to a question the tree asks.
+    #
+    # These are plain state cells, not claims. Setting
+    # `use_deterministic_algorithms(True)` makes this shim *report* determinism
+    # without any kernel changing behaviour -- upstream's flag makes individual
+    # kernels select deterministic implementations and raise on the ones with
+    # none, and there is no such selection here. Refusing the setter would be
+    # worse: `torch/__init__.py:1585` calls it unconditionally from
+    # `set_deterministic_debug_mode`, and every kernel in this shim is a single
+    # implementation with no nondeterministic sibling to pick instead, so the
+    # flag is honest about the only thing it can be honest about -- what it was
+    # last set to.
+    _deterministic_cells = {
+        "algorithms": False,
+        "warn_only": False,
+        "fill_uninitialized_memory": True,
+        "cudnn": False,
+        "mkldnn": False,
+    }
+
+    def _get_deterministic_algorithms():
+        return _deterministic_cells["algorithms"]
+
+    def _set_deterministic_algorithms(mode, warn_only=False):
+        # `torch/__init__.py:1534` passes `warn_only` by keyword and
+        # `:1585`/`:1589` omit it entirely, so both spellings have to bind.
+        _deterministic_cells["algorithms"] = bool(mode)
+        _deterministic_cells["warn_only"] = bool(warn_only)
+
+    def _get_deterministic_algorithms_warn_only():
+        return _deterministic_cells["warn_only"]
+
+    def _get_deterministic_fill_uninitialized_memory():
+        return _deterministic_cells["fill_uninitialized_memory"]
+
+    def _set_deterministic_fill_uninitialized_memory(mode):
+        _deterministic_cells["fill_uninitialized_memory"] = bool(mode)
+
+    def _get_cudnn_deterministic():
+        return _deterministic_cells["cudnn"]
+
+    def _set_cudnn_deterministic(value):
+        _deterministic_cells["cudnn"] = bool(value)
+
+    def _get_mkldnn_deterministic():
+        return _deterministic_cells["mkldnn"]
+
+    def _set_mkldnn_deterministic(value):
+        _deterministic_cells["mkldnn"] = bool(value)
+
+    module._get_deterministic_algorithms = _get_deterministic_algorithms
+    module._set_deterministic_algorithms = _set_deterministic_algorithms
+    module._get_deterministic_algorithms_warn_only = (
+        _get_deterministic_algorithms_warn_only
+    )
+    module._get_deterministic_fill_uninitialized_memory = (
+        _get_deterministic_fill_uninitialized_memory
+    )
+    module._set_deterministic_fill_uninitialized_memory = (
+        _set_deterministic_fill_uninitialized_memory
+    )
+    module._get_cudnn_deterministic = _get_cudnn_deterministic
+    module._set_cudnn_deterministic = _set_cudnn_deterministic
+    module._get_mkldnn_deterministic = _get_mkldnn_deterministic
+    module._set_mkldnn_deterministic = _set_mkldnn_deterministic
+
     def _add_docstr(obj, doc):
         # `torch/_tensor.py` and `torch/_torch_docs.py` call this thousands of
         # times at import. Upstream returns the object; the callers rely on it.
@@ -5144,6 +5726,106 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._autograd_init = lambda: True
     module._jit_init = lambda: True
     module._init_names = lambda *a, **k: None
+
+    # `torch/autograd/function.py:622`, the *first* line of `Function.apply` --
+    # so every `torch.autograd.Function` subclass on a model's forward reaches
+    # it, whether or not a backward is ever wanted. `bloom`'s
+    # `GeLUFunction.apply(x)` is the measured caller (docs/ARCH20.md §6), once
+    # per MLP per layer.
+    #
+    # `False` is upstream's answer outside a transform (measured on 2.13.0),
+    # and it is the only answer this shim can give truthfully: functorch's
+    # transforms are `vmap`/`grad`/`jvp`, none of which exists here, so nothing
+    # is ever pushed onto the interpreter stack this predicate reports on.
+    # `False` is also upstream's *ordinary* branch -- it runs `forward`
+    # directly instead of routing through `_functorch.autograd_function`.
+    module._are_functorch_transforms_active = lambda: False
+
+    # `_C._FunctionBase.apply` -- what `torch.autograd.Function.apply`
+    # delegates to on its ordinary branch (`torch/autograd/function.py:625`,
+    # `return super().apply(*args, **kwargs)`).
+    #
+    # `bloom`'s wall (docs/ARCH20.md §6). Its `BloomGelu` calls
+    # `GeLUFunction.apply(x)` in every MLP, so an inference-only shim reaches
+    # `autograd.Function` on a *forward*, not through anything gradient-shaped.
+    # `_FunctionBase` is one of the synthesised placeholder types, so it was
+    # usable as a base class -- the tree's `class BackwardCFunction(
+    # _C._FunctionBase, ...)` imports fine -- and had no `apply`, which
+    # surfaced as `AttributeError: 'super' object has no attribute 'apply'`
+    # rather than as this shim's own refusal. A `super()` lookup does not go
+    # through `_ShimMeta.__getattr__`, so a stub was never going to appear
+    # here; it has to be a real entry in the class dict.
+    #
+    # **What upstream's version does that this does not, stated rather than
+    # skipped.** `THPFunction_apply` allocates a graph node, records the input
+    # metadata, marks the outputs' `grad_fn`, and handles dirty/
+    # non-differentiable marking. All of that is autograd bookkeeping
+    # (DESIGN.md §3 stage 0: there is none here), and none of it changes the
+    # *value* `forward` returns -- which is the only thing a forward-only shim
+    # can observe. So this runs the user's `forward` with a real ctx and
+    # returns its result.
+    #
+    # Both of upstream's two `forward` shapes are honoured, because a model may
+    # use either and picking one would silently mis-call the other:
+    #
+    #     combined:  forward(ctx, *args)                    -- bloom's shape
+    #     separate:  forward(*args) + setup_context(ctx, inputs, output)
+    #
+    # The `setup_context` test is the tree's own `_is_setup_context_defined`,
+    # read out of `sys.modules` at call time rather than reimplemented -- same
+    # late-binding shape as `_set_generator_metaclass` above, and for the same
+    # reason: the predicate belongs to the tree and would drift if copied.
+    def _function_base_apply(cls, *args, **kwargs):
+        backward_cls = getattr(cls, "_backward_cls", None)
+        if backward_cls is None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: _FunctionBase.apply on a "
+                f"class with no _backward_cls ({cls!r}) -- upstream's version "
+                "allocates a graph node, and this shim only reproduces the "
+                "forward call that autograd.Function's metaclass sets up"
+            )
+        ctx = backward_cls()
+        # Upstream fills this from the inputs' `requires_grad`. Nothing here
+        # requires grad -- `requires_grad=True` is refused at construction --
+        # so it is all-False, and it is provided rather than left missing
+        # because a `forward` is allowed to read it.
+        #
+        # It goes into a private slot and not onto `ctx` directly: upstream's
+        # `needs_input_grad` is a **read-only getset** on the C node
+        # (`type(torch._C._FunctionBase.needs_input_grad)` is
+        # `getset_descriptor`), and the shim's placeholder surface reproduces
+        # that shape as a `property` -- so a plain assignment raises
+        # "property ... has no setter". The property installed below reads this
+        # slot, which keeps the attribute read-only from the model's side, as
+        # upstream's is.
+        ctx._shim_needs_input_grad = tuple(False for _ in args)
+
+        fn_module = sys.modules.get("torch.autograd.function")
+        setup_context = getattr(cls, "setup_context", None)
+        separate = (
+            fn_module is not None
+            and setup_context is not None
+            and getattr(fn_module, "_is_setup_context_defined", None) is not None
+            and fn_module._is_setup_context_defined(setup_context)
+        )
+        if separate:
+            output = cls.forward(*args, **kwargs)
+            # Upstream calls this so the ctx a later backward would read is
+            # populated. There is no backward here, but the user's
+            # `setup_context` may also be where `mark_dirty`/`mark_
+            # non_differentiable` are called, and skipping it would make this
+            # shim run a *different* forward from upstream's.
+            cls.setup_context(ctx, args, output)
+            return output
+        return cls.forward(ctx, *args, **kwargs)
+
+    _function_base_apply.__name__ = "apply"
+    _function_base_apply.__qualname__ = "_FunctionBase.apply"
+    _function_base_apply.__module__ = "torch._C"
+    module._FunctionBase.apply = classmethod(_function_base_apply)
+    module._FunctionBase.needs_input_grad = property(
+        lambda self: getattr(self, "_shim_needs_input_grad", ())
+    )
 
     def _multiprocessing_init():
         """VENDOR.md wall 17 -- C writing into a *Python* package's namespace.
@@ -5903,12 +6585,38 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     def is_functorch_wrapped_tensor(tensor):
         return maybe_get_level(tensor) != -1
 
+    def unwrap_if_dead(tensor):
+        """`torch/autograd/function.py:632`, on the ordinary `apply` path.
+
+        `bloom` is the measured caller (docs/ARCH20.md §6): its `GeLUFunction`
+        is a `torch.autograd.Function`, so every MLP in every layer runs
+        `Function.apply`, and `apply` maps this over its arguments before it
+        calls `forward`.
+
+        Upstream unwraps a `TensorWrapper` whose functorch level has expired
+        and returns anything else unchanged -- measured,
+        `unwrap_if_dead(torch.ones(2))` is that tensor. Derived from the same
+        empty stack the four predicates above read rather than written down as
+        "return the argument": a tensor can only *be* a wrapper if a transform
+        put it there, and every pusher is a raising stub. If functorch ever
+        lands, this refuses instead of silently handing back a live wrapper.
+        """
+        if _dynamic_layer_stack:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                "torch._C._functorch.unwrap_if_dead with a non-empty dynamic "
+                "layer stack -- something pushed an interpreter and this shim "
+                "has no wrapper tensors to unwrap"
+            )
+        return tensor
+
     for _fn, _name in (
         (get_dynamic_layer_stack_depth, "get_dynamic_layer_stack_depth"),
         (peek_interpreter_stack, "peek_interpreter_stack"),
         (maybe_get_level, "maybe_get_level"),
         (maybe_current_level, "maybe_current_level"),
         (is_functorch_wrapped_tensor, "is_functorch_wrapped_tensor"),
+        (unwrap_if_dead, "unwrap_if_dead"),
     ):
         _fn.__name__ = _fn.__qualname__ = _name
         _fn.__module__ = "torch._C._functorch"

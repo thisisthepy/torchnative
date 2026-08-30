@@ -1764,6 +1764,81 @@ def pow_tensor_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
+    # --- MIXED dtypes: the promotion `bloom` needed (docs/ARCH20.md §6) -----
+    #
+    # **Every case above uses a same-dtype pair, so none of them could fail
+    # when this op refused a mismatch by name.** That was found by sabotage:
+    # reverting `pow.Tensor_Tensor` to `same_dtype` broke `bloom` and left the
+    # golden suite entirely green. These are the cases that can fail.
+    #
+    # The grid was read off `pow.Tensor_Tensor`'s own result dtype over the
+    # storable dtypes, not derived from `mul`'s table, and it agrees with
+    # `torch._prims_common.get_higher_dtype` in every cell except `bool ** bool`
+    # (below).
+    for a_dtype, b_dtype, note in [
+        ("float32", "int32", "bloom's own call: a float32 base to an int32 power"),
+        ("float32", "int64", "an integral operand never widens a float"),
+        ("float64", "float32", "the wider float wins"),
+        ("int64", "int32", "the wider integer wins"),
+        ("int32", "int16", "...and it is the width, not the argument order"),
+        ("int32", "float16", "a float16 exponent floats an int32 base TO float16"),
+        ("float16", "bfloat16", "two reduced floats escape UP to float32"),
+        ("float16", "float16", "...but a same-rank identical pair does NOT escape"),
+        # `int8` is deliberately absent: `_tensor_from_flat` cannot build one
+        # (no candle storage for it), so `uint8 x int8 -> int16` is measured on
+        # upstream and recorded in aten.rs rather than being a case here.
+        ("uint8", "int16", "unsigned meets a wider signed: int16"),
+        ("bool", "int32", "bool promotes out of its own category"),
+    ]:
+        base_t, base_c = pair_from_flat(torch_module, c_module, [2, 3], (2,), a_dtype)
+        exp_t, exp_c = pair_from_flat(torch_module, c_module, [2, 1], (2,), b_dtype)
+        cases.append(
+            Case(
+                name=f"pow(base={a_dtype}, exponent={b_dtype}) [{note}]",
+                op=op,
+                run_torch=lambda a=base_t, b=exp_t: torch_call(a, b),
+                run_c=lambda a=base_c, b=exp_c: c_module._aten_dispatch(op, a, b),
+                note=note,
+            )
+        )
+    # The one cell where upstream raises rather than promoting.
+    m_t, m_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    n_t, n_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "bool")
+    cases.append(
+        Case(
+            name="pow(bool, bool) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(m_t, n_t),
+            run_c=lambda: c_module._aten_dispatch(op, m_c, n_c),
+            expect="both_error",
+            note='NotImplementedError: "pow" not implemented for \'Bool\' -- the one cell '
+                 "where the promotion table and upstream's behaviour part company",
+        )
+    )
+
+    # --- negative integer exponents: `powi`, NOT a refusal ------------------
+    #
+    # Also found by sabotage: the shim refused these for all three overloads
+    # while upstream refuses only `Tensor_Scalar`. `c10::powi` gives 1 for base
+    # 1, +-1 for base -1 by the exponent's parity, and 0 otherwise -- so a
+    # blanket `0` passes two of the four columns below and fails the other two.
+    for exps, note in [
+        ([-1, -1, -1, -1], "exponent -1 (odd): base -1 gives -1"),
+        ([-2, -2, -2, -2], "exponent -2 (even): base -1 gives +1"),
+        ([-3, 0, 2, -1], "mixed signs in one call, so the arms cannot be conflated"),
+    ]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, [2, 1, -1, 0], (4,), "int64")
+        e_t, e_c = pair_from_flat(torch_module, c_module, exps, (4,), "int64")
+        cases.append(
+            Case(
+                name=f"pow(int64, int64 exponent={exps}) [{note}]",
+                op=op,
+                run_torch=lambda a=b_t, b=e_t: torch_call(a, b),
+                run_c=lambda a=b_c, b=e_c: c_module._aten_dispatch(op, a, b),
+                note=note,
+            )
+        )
+
     return cases
 
 
@@ -1783,6 +1858,21 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=note,
                 )
             )
+
+    # `pow.Scalar` shares `pow_from_pairs` with `Tensor_Tensor`, so it shares
+    # `powi` -- and it too computes rather than refusing on a negative integer
+    # exponent (measured: `pow.Scalar(2, [-1, 3])` is `[0, 8]`). Only
+    # `Tensor_Scalar` refuses, which is asserted in its own builder.
+    e_t, e_c = pair_from_flat(torch_module, c_module, [-1, 3, -2, 0], (4,), "int64")
+    cases.append(
+        Case(
+            name="pow(base=2, int64 exponent with negatives) [computes, does NOT refuse]",
+            op=op,
+            run_torch=lambda: torch_call(2, e_t),
+            run_c=lambda: c_module._aten_dispatch(op, 2, e_c),
+            note="upstream [0, 8, 0, 1] -- the overload that refuses is Tensor_Scalar",
+        )
+    )
 
     return cases
 
@@ -8124,6 +8214,7 @@ def relu__cases(torch_module, c_module, torch_call) -> list[Case]:
                  "relu.default, measured on the in-place overload too",
         )
     )
+    cases.extend(relu__member_cases(torch_module, c_module))
     cases.extend(
         c for c in _view_write_cases(torch_module, c_module)
         if c.op == "aten.relu_.default"
@@ -8861,13 +8952,15 @@ def add__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     float_src_t, float_src_c = pair_from_flat(torch_module, c_module, [1.5, 2.5, 3.5, 4.5], (2, 2), "float32")
     cases.append(
         Case(
-            name="add_(dtype=int32, other=float32 -- c computes, torch refuses)",
+            name="add_(dtype=int32, other=float32) [refused on BOTH sides -- was a gap]",
             op=op,
             run_torch=lambda: torch_call(int32_dst_t, float_src_t),
             run_c=lambda: c_module._aten_dispatch(op, int32_dst_c, float_src_c),
-            expect="torch_error",
-            note="torch: 'result type Float can't be cast to the desired output type Int'; "
-                 "the shim casts other into the receiver's dtype instead of refusing the unsafe cast",
+            expect="both_error",
+            note="'result type Float can't be cast to the desired output type Int'. This was "
+                 "expect='torch_error' until docs/ARCH20.md §8.3: the shim used to cast `other` "
+                 "down into the receiver's dtype and return a truncated answer where upstream "
+                 "raises. `inplace_cast_check` refuses it now, so the two agree",
         )
     )
     bool_dst_t, bool_dst_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
@@ -8883,6 +8976,7 @@ def add__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                  "the shim's blanket bool refusal in arith_tag over-refuses here",
         )
     )
+    cases.extend(add__member_cases(torch_module, c_module))
     cases.extend(
         c for c in _view_write_cases(torch_module, c_module)
         if c.op == "aten.add_.Tensor"
@@ -11703,6 +11797,72 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
             "aten.div_.Tensor", call("aten.select.int", base, 1, 1),
             call("aten.select.int", base, 1, 2)))
 
+    # --- the rest of the in-place arithmetic family (docs/ARCH20.md §8) -----
+    #
+    # Same shape as `add_.Tensor` above and here for the same reason: every one
+    # of these returns `self`, so a case that read the return value would pass
+    # just as well against a kernel that computed into a fresh buffer and
+    # handed it back. These read the BASE.
+    #
+    # Three view shapes are used across the group on purpose -- `select.int` on
+    # dim 1 (strided), `select.int` on dim 0 (contiguous at a non-zero offset)
+    # and `t.default` (strided in both axes) -- so a write-through that handled
+    # only the contiguous case cannot pass all of them.
+    add("aten.sub_.Tensor",
+        "base after x[:,1].sub_(x[:,0]) [reads the BASE]",
+        "in-place subtract through a strided view",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.sub_.Tensor", call("aten.select.int", base, 1, 1),
+            call("aten.select.int", base, 1, 0)))
+    add("aten.mul_.Tensor",
+        "base after x[1].mul_(x[0]) [reads the BASE]",
+        "in-place multiply through a contiguous view at a non-zero offset",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.mul_.Tensor", call("aten.select.int", base, 0, 1),
+            call("aten.select.int", base, 0, 0)))
+    add("aten.add_.Scalar",
+        "base after x[:,2].add_(10.0) [reads the BASE]",
+        "the Scalar overload writes through the same layout the Tensor one does",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.add_.Scalar", call("aten.select.int", base, 1, 2), 10.0))
+    add("aten.sub_.Scalar",
+        "base after x[:,2].sub_(10.0) [reads the BASE]",
+        "the Scalar overload of sub_, through a strided view",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.sub_.Scalar", call("aten.select.int", base, 1, 2), 10.0))
+    add("aten.mul_.Scalar",
+        "base after x.t().mul_(-1.0) [reads the BASE]",
+        "a transposed destination -- non-contiguous in BOTH axes, so a write that "
+        "walked row-major over the storage would scramble the base rather than "
+        "negate it",
+        grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.mul_.Scalar", call("aten.t.default", base), -1.0))
+    add("aten.neg_.default",
+        "base after x[:,1].neg_() [reads the BASE]",
+        "neg_ keeps the dtype and writes through a strided view; the other three "
+        "columns of the base must come back untouched",
+        signed, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.neg_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.neg_.default",
+        "base after x[1].neg_() (dtype=int64) [reads the BASE]",
+        "the integral path -- candle's `neg` panics on i64, so this is the arm that "
+        "goes through `0 - x`, checked through the base",
+        [float(v) for v in range(-6, 6)], (3, 4), "int64",
+        lambda call, base: call(
+            "aten.neg_.default", call("aten.select.int", base, 0, 1)))
+    add("aten.exp_.default",
+        "base after x[:,0].exp_() [reads the BASE]",
+        "exp_ through a strided view; upstream's exp_ is alias-preserving too",
+        [v / 4.0 for v in range(-6, 6)], (3, 4), "float32",
+        lambda call, base: call(
+            "aten.exp_.default", call("aten.select.int", base, 1, 0)))
+
     # `masked_fill_` and `index_put_` need a mask/index operand, which
     # `_tensor_from_flat` will not build as bool directly -- same workaround
     # `masked_fill__scalar_cases` documents.
@@ -12124,6 +12284,704 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     return cases
 
 
+# --- docs/ARCH20.md: the seven blocked architectures ------------------------
+#
+# Eleven new keys, and the split between them is the round's own finding: only
+# three are new *kernels* (`log`, `expm1`, `constant_pad_nd`) plus one
+# out-of-place sibling of an existing one (`clamp`); the other seven are the
+# in-place arithmetic family, which is job two.
+#
+# Every in-place builder below ends by pulling its own cases out of
+# `_view_write_cases`, which read the BASE rather than the return value. That
+# is the check that can actually fail against a kernel that computes into a
+# fresh buffer -- see that function's docstring for the round where 3037 cases
+# were green while no in-place write was visible through any view.
+
+
+def log_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.log.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([1.0, 2.0, 10.0, 0.5], (2, 2), "assorted positive"),
+        ([1.0], (), "0-d"),
+        # The domain edges, which are *values* upstream returns and not
+        # errors -- measured, and the reason `unary_float` needed no domain
+        # guard. `mamba`'s own input never leaves the positive half, so this
+        # is the half of the op its caller could not have pinned.
+        ([0.0, -1.0, -0.0], (3,), "log(0)=-inf, log(-1)=nan, log(-0.0)=-inf -- NOT errors"),
+        ([float("inf"), float("nan")], (2,), "inf -> inf, nan -> nan"),
+    ]
+    for dtype_name in _TANH_DTYPES:
+        for flat, shape, note in scenarios:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    # The promotion rule, re-measured rather than assumed from `exp`.
+    for dtype_name in _TANH_PROMOTING_DTYPES:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [1, 2, 3, 4], (2, 2),
+                "integral input promotes to the default float, same rule as exp/tanh",
+            )
+        )
+    cases.extend(_log_member_cases(torch_module, c_module))
+    return cases
+
+
+def _log_member_cases(torch_module, c_module) -> list[Case]:
+    """`torch.log(x)` and `x.log()` -- the two spellings `mamba` and a caller
+    reach, as opposed to the dispatch key the builder above uses.
+
+    Deleting the `overloads.json` entry fails the first of these and nothing
+    else; deleting the `methods.json` entry fails the second."""
+    op = "aten.log.default"
+    cases: list[Case] = []
+    for spelling, call in (
+        ("torch.log(x)", lambda m, a: m.log(a) if hasattr(m, "log") else m._VariableFunctions.log(a)),
+        ("x.log()", lambda m, a: a.log()),
+    ):
+        for dtype_name in ["float32", "float64", "int64"]:
+            pair = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+            cases.append(
+                _member_case(
+                    torch_module, c_module, op,
+                    f"spelling {spelling} (dtype={dtype_name})", dtype_name, [pair], call,
+                    note="mamba's init_mamba_weights: init.copy_(A_log, torch.log(A))",
+                )
+            )
+    return cases
+
+
+def expm1_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.expm1.default"
+    cases: list[Case] = []
+    scenarios = [
+        ([0.0, 1.0, -1.0, 2.0], (2, 2), "assorted"),
+        ([0.0], (), "0-d -- expm1(0) is exactly 0.0"),
+        # THE case. `exp(x) - 1` loses every significant bit here; measured
+        # upstream float64 expm1(1e-8) = 1.0000000050000001e-08 against
+        # exp(1e-8)-1 = 9.99999993922529e-09. A subtraction-based kernel
+        # passes every other case in this builder and fails this one.
+        ([1e-8, -1e-8, 1e-12, -1e-12], (4,), "near zero -- where exp(x)-1 cancels"),
+        ([-1000.0, 1000.0], (2,), "underflow to -1.0, overflow to inf"),
+        ([float("nan"), float("inf"), float("-inf")], (3,), "nan, inf, -1.0"),
+    ]
+    for dtype_name in _TANH_DTYPES:
+        for flat, shape, note in scenarios:
+            cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
+    for dtype_name in _TANH_PROMOTING_DTYPES:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [0, 1, 2, 3], (2, 2),
+                "integral input promotes to the default float, same rule as exp",
+            )
+        )
+    return cases
+
+
+def clamp_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """The out-of-place sibling of `clamp_.default`, `mamba`'s wall.
+
+    Deliberately re-measures the rules `clamp_cases`' in-place twin already
+    pins rather than assuming them: an out-of-place op *could* have promoted
+    where the in-place one cannot, and it does not."""
+    op = "aten.clamp.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        for lo, hi, note in [
+            (0, 5, "both bounds"),
+            (None, 3, "max only -- min absent"),
+            (2, None, "min only -- max absent"),
+            (8, 2, "min > max: max(x,8) then min(...,2) gives all 2, NOT an error"),
+        ]:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [1, 5, 10, -3], (4,), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"clamp(dtype={dtype_name}, min={lo}, max={hi}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, lo=lo, hi=hi: torch_call(a_t, lo, hi),
+                    run_c=lambda a_c=a_c, lo=lo, hi=hi: c_module._aten_dispatch(op, a_c, lo, hi),
+                    note=note,
+                )
+            )
+    # NaN propagates through both steps, the same measurement `clamp_` pins.
+    #
+    # **Every lambda below binds its operands as default arguments.** Late
+    # binding bit this builder once already: three cases shared the names
+    # `a_t`/`a_c`, so all three ran against the *last* pair assigned and a
+    # float32 case silently tested an int32 tensor.
+    nan_t, nan_c = pair_from_flat(
+        torch_module, c_module, [float("nan"), 1.0, -1.0], (3,), "float32"
+    )
+    cases.append(
+        Case(
+            name="clamp(float32, [nan,1,-1], 0, 2) [nan survives both bounds]",
+            op=op,
+            run_torch=lambda a=nan_t: torch_call(a, 0.0, 2.0),
+            run_c=lambda a=nan_c: c_module._aten_dispatch(op, a, 0.0, 2.0),
+            note="measured [nan, 1.0, 0.0] -- Rust's maximum/minimum return the NaN operand",
+        )
+    )
+    # Both bounds absent is an ERROR, not a no-op. This is the rule a fresh
+    # out-of-place implementation would most plausibly have got wrong, since
+    # there is no receiver to leave unchanged.
+    none_t, none_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="clamp() with no bounds [refused on both sides, NOT a no-op]",
+            op=op,
+            run_torch=lambda a=none_t: torch_call(a, None, None),
+            run_c=lambda a=none_c: c_module._aten_dispatch(op, a, None, None),
+            expect="both_error",
+            note="torch.clamp: At least one of 'min' or 'max' must not be None",
+        )
+    )
+    # **The dtype rule, which is NOT clamp_'s.** The out-of-place form promotes
+    # where the in-place one refuses, and the first draft of this builder
+    # asserted the opposite -- these are the eight rows that caught it.
+    #
+    #     clamp(int32,  None, 2.0)    float32     clamp_ RAISES
+    #     clamp(bool,   0,    5)      int64       clamp_ RAISES
+    #
+    # Both are read off upstream, not derived from `clamp_`.
+    for dtype_name, flat, lo, hi, note in [
+        ("int32", [1, 5, 10], None, 2.0, "a float bound floats an integral tensor -> float32"),
+        ("int32", [1, 5, 10], 0, 5, "int bounds leave it int32"),
+        ("int64", [1, 5, 10], None, 2.0, "int64 with a float bound -> float32, not float64"),
+        ("uint8", [1, 5], None, 2, "uint8 with an int bound stays uint8"),
+        ("uint8", [1, 5], None, 2.0, "uint8 with a float bound -> float32"),
+        ("float16", [1.0, 5.0], None, 2.0,
+         "a python float does NOT widen a float tensor -- stays float16"),
+        ("float32", [1.0, 5.0, 10.0], 0, 5, "int bounds against a float tensor stay float32"),
+        ("bool", [1, 0], 0, 5, "a bool tensor with int bounds promotes OUT of bool -> int64"),
+        ("bool", [1, 0], 0.0, 1.0, "...and to float32 with float bounds"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (len(flat),), dtype_name)
+        cases.append(
+            Case(
+                name=f"clamp(dtype={dtype_name}, min={lo!r}, max={hi!r}) [{note}]",
+                op=op,
+                run_torch=lambda a=a_t, lo=lo, hi=hi: torch_call(a, lo, hi),
+                run_c=lambda a=a_c, lo=lo, hi=hi: c_module._aten_dispatch(op, a, lo, hi),
+                note=note,
+            )
+        )
+    # The one row where the out-of-place form DOES refuse: a boolean scalar
+    # does not lift a boolean tensor out of the bool category, and upstream has
+    # no bool clamp kernel. `bool` subclasses `int` in Python, so telling this
+    # apart from `clamp(bool_t, 0, 1)` above needs the raw argument.
+    bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="clamp(bool, False, True) [refused -- the result would still be bool]",
+            op=op,
+            run_torch=lambda a=bool_t: torch_call(a, False, True),
+            run_c=lambda a=bool_c: c_module._aten_dispatch(op, a, False, True),
+            expect="both_error",
+            note='NotImplementedError: "clamp_scalar_cpu" not implemented for \'Bool\' -- '
+                 "and it is the case that separates a bool SCALAR from the integer 1",
+        )
+    )
+    cases.extend(_clamp_member_cases_out_of_place(torch_module, c_module))
+    return cases
+
+
+def _clamp_member_cases_out_of_place(torch_module, c_module) -> list[Case]:
+    """`x.clamp(...)`, the spelling `mamba` calls -- the member, not the key."""
+    op = "aten.clamp.default"
+    cases: list[Case] = []
+    for dtype_name in ["float32", "int64"]:
+        pair = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), dtype_name)
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member x.clamp(max=3) (dtype={dtype_name})", dtype_name, [pair],
+                lambda m, a: a.clamp(max=3),
+                note="mamba clamps dt out of place; only clamp_ had a kernel before",
+            )
+        )
+    pair = pair_from_flat(torch_module, c_module, [1.0, 5.0, 10.0, -3.0], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.clamp(0.0, 6.0) (dtype=float32, both bounds positional)",
+            "float32", [pair], lambda m, a: a.clamp(0.0, 6.0),
+            note="positional min/max bind the same overload the keyword form does",
+        )
+    )
+    # The receiver must NOT be mutated -- the whole difference from clamp_.
+    pair = pair_from_flat(torch_module, c_module, [1.0, 5.0, 10.0, -3.0], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.clamp(0, 6) then read x [the RECEIVER, which must be unchanged]",
+            "float32", [pair],
+            lambda m, a: (a.clamp(0, 6), a)[1],
+            note="out-of-place: a kernel that wrote through like clamp_ would pass a "
+                 "return-value case and fail this one",
+        )
+    )
+    # A tensor bound resolves clamp.Tensor, which has no kernel. Upstream
+    # computes; refusing by the name of the overload is the honest answer.
+    pair = pair_from_flat(torch_module, c_module, [1.0, 5.0, 10.0], (3,), "float32")
+    bound = pair_from_flat(torch_module, c_module, [2.0, 2.0, 2.0], (3,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.clamp(min=<tensor>) [resolves clamp.Tensor, which has no kernel]",
+            "float32", [pair, bound], lambda m, a, b: a.clamp(min=b),
+            expect="c_error",
+            note="recorded gap: aten::clamp.Tensor is a separate kernel this shim does "
+                 "not have; methods.json lists it so the refusal names the overload",
+        )
+    )
+    return cases
+
+
+def constant_pad_nd_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.constant_pad_nd.default"
+    cases: list[Case] = []
+
+    def pad_case(name, flat, shape, dtype_name, pad, value, note, expect="match"):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        args_t = (a_t, pad) if value is None else (a_t, pad, value)
+        args_c = (a_c, pad) if value is None else (a_c, pad, value)
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda args_t=args_t: torch_call(*args_t),
+                run_c=lambda args_c=args_c: c_module._aten_dispatch(op, *args_c),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    grid = [float(v) for v in range(6)]
+    # THE ordering case: the two dimensions get *different* pads, so a
+    # front-to-back reading of `pad` produces a differently shaped answer and
+    # cannot pass. Measured upstream: (2,3) -> (4,5).
+    pad_case("constant_pad_nd((2,3), pad=[1,1,2,0], value=7.0) [pad is LAST-dim-first]",
+             grid, (2, 3), "float32", [1, 1, 2, 0], 7.0,
+             "upstream (4,5): pad[0:2] is the last dim, pad[2:4] the one before it")
+    pad_case("constant_pad_nd((2,3), pad=[1,2], value=9.0) [last dim only]",
+             grid, (2, 3), "float32", [1, 2], 9.0, "shorter pad leaves leading dims alone")
+    pad_case("constant_pad_nd((2,3), pad=[1,1]) [default value=0]",
+             grid, (2, 3), "float32", [1, 1], None,
+             "the schema default is 0 and it is an integer there")
+    pad_case("constant_pad_nd((2,3), pad=[]) [empty pad is the identity]",
+             grid, (2, 3), "float32", [], None, "no pairs, nothing to do")
+    pad_case("constant_pad_nd((2,3), pad=[0,0,0,0], value=9.0) [zeros are also identity]",
+             grid, (2, 3), "float32", [0, 0, 0, 0], 9.0, "a zero pad must not add a block")
+    # Negative entries crop, including crop-and-pad on the SAME axis.
+    pad_case("constant_pad_nd((2,3), pad=[-1,0]) [negative crops the front]",
+             grid, (2, 3), "float32", [-1, 0], None, "upstream [[1,2],[4,5]]")
+    pad_case("constant_pad_nd((2,3), pad=[-1,-1]) [crops both ends]",
+             grid, (2, 3), "float32", [-1, -1], None, "upstream [[1],[4]]")
+    pad_case("constant_pad_nd((2,3), pad=[-1,2]) [crop AND pad on one axis]",
+             grid, (2, 3), "float32", [-1, 2], None,
+             "upstream [[1,2,0,0],[4,5,0,0]] -- crop first, then pad")
+    pad_case("constant_pad_nd((2,3), pad=[-2,-2]) [crops past the axis]",
+             grid, (2, 3), "float32", [-2, -2], None,
+             "narrow(): length must be non-negative.", expect="both_error")
+    # 1-D and 0-d.
+    pad_case("constant_pad_nd((4,), pad=[0,3]) [1-D]",
+             [0.0, 1.0, 2.0, 3.0], (4,), "float32", [0, 3], 0.0,
+             "the bert shape: a bias vector extended at the back")
+    pad_case("constant_pad_nd(0-d, pad=[]) [0-d stays 0-d]",
+             [5.0], (), "float32", [], None, "no axis to pad")
+    # Shape refusals, with upstream's exact (mis-spaced) messages.
+    pad_case("constant_pad_nd((2,3), pad=[1]) [odd pad length]",
+             grid, (2, 3), "float32", [1], None,
+             "Length of pad must be even but instead it equals 1", expect="both_error")
+    pad_case("constant_pad_nd((2,3), pad=[1]*6) [more pairs than dimensions]",
+             grid, (2, 3), "float32", [1, 1, 1, 1, 1, 1], None,
+             "Pad length is 6while the input has 2dimensions.", expect="both_error")
+    # dtypes, and the fill conversion rules `filled_block` shares with `full`.
+    for dtype_name, value, note in [
+        ("float64", 2.5, "float64 fill"),
+        ("float16", 2.5, "float16 keeps its own dtype"),
+        ("bfloat16", 2.5, "bfloat16 keeps its own dtype"),
+        ("int64", 3, "integer fill into an integer tensor"),
+        ("int64", 3.7, "a FLOAT fill into an int64 tensor truncates toward zero -> 3"),
+        ("int32", -2, "negative integer fill"),
+        ("uint8", 7, "unsigned"),
+        ("bool", True, "a bool fill is truthiness, and the tag survives"),
+        ("bool", False, "the false fill, so the case is not passed by an all-True answer"),
+    ]:
+        pad_case(f"constant_pad_nd((1,2), pad=[1,1], dtype={dtype_name}, value={value!r}) [{note}]",
+                 [1, 2], (1, 2), dtype_name, [1, 1], value, note)
+    pad_case("constant_pad_nd((2,3), pad=[1,0], value=-inf) [an infinite fill]",
+             grid, (2, 3), "float32", [1, 0], float("-inf"),
+             "the attention-mask shape of fill, which must not become a finite number")
+    # The overflow refusal `full` already makes, reached through the pad fill.
+    pad_case("constant_pad_nd(int32, value=2**40) [fill does not fit the dtype]",
+             [1, 2], (1, 2), "int32", [1, 1], 2 ** 40,
+             "value cannot be converted to type int without overflow", expect="both_error")
+    return cases
+
+
+# --- the in-place arithmetic family (docs/ARCH20.md §8) ---------------------
+
+_INPLACE_ARITH_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
+
+
+def _inplace_tensor_cases(torch_module, c_module, torch_call, op, spell) -> list[Case]:
+    """The shared body of `sub_.Tensor` and `mul_.Tensor`'s builders.
+
+    A fresh operand pair per case, never shared -- an earlier mutation would
+    otherwise leak into a later expectation."""
+    cases: list[Case] = []
+    for dtype_name in _INPLACE_ARITH_DTYPES:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        src_t, src_c = pair_from_flat(torch_module, c_module, [5, 6, 7, 8], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"{spell}(dtype={dtype_name}, same shape)",
+                op=op,
+                run_torch=lambda dst_t=dst_t, src_t=src_t: torch_call(dst_t, src_t),
+                run_c=lambda dst_c=dst_c, src_c=src_c: c_module._aten_dispatch(op, dst_c, src_c),
+                note="in-place: compares the mutated dst operand the op returns",
+            )
+        )
+    # `other` broadcasts INTO the receiver; never the other way round, which
+    # is in-place's general rule.
+    dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (3, 2), "float32")
+    src_t, src_c = pair_from_flat(torch_module, c_module, [2, 4, 5], (3, 1), "float32")
+    cases.append(
+        Case(
+            name=f"{spell}(dtype=float32, other (3,1) broadcasts into (3,2))",
+            op=op,
+            run_torch=lambda: torch_call(dst_t, src_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c, src_c),
+            note="broadcasting the source up to the destination's shape",
+        )
+    )
+    # The cast check, both directions. The safe one computes; the unsafe one
+    # refuses on BOTH sides (it used to compute here -- docs/ARCH20.md §8.3).
+    dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    src_t, src_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
+    cases.append(
+        Case(
+            name=f"{spell}(dtype=float32, other=int32) [promotes to float32, which fits]",
+            op=op,
+            run_torch=lambda: torch_call(dst_t, src_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c, src_c),
+            note="canCast(Float -> Float) holds, so upstream computes and so does this",
+        )
+    )
+    dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
+    src_t, src_c = pair_from_flat(torch_module, c_module, [1.5, 2.5, 3.5, 4.5], (2, 2), "float32")
+    cases.append(
+        Case(
+            name=f"{spell}(dtype=int32, other=float32) [refused on BOTH sides]",
+            op=op,
+            run_torch=lambda: torch_call(dst_t, src_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c, src_c),
+            expect="both_error",
+            note="result type Float can't be cast to the desired output type Int -- this "
+                 "shim used to compute a truncated answer here (docs/ARCH20.md §8.3)",
+        )
+    )
+    return cases
+
+
+def _inplace_scalar_cases(torch_module, c_module, torch_call, op, spell) -> list[Case]:
+    cases: list[Case] = []
+    for dtype_name in _INPLACE_ARITH_DTYPES:
+        for scalar in (2, 2.0 if dtype_name.startswith(("float", "bfloat")) else 3):
+            dst_t, dst_c = pair_from_flat(
+                torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"{spell}(dtype={dtype_name}, other={scalar!r})",
+                    op=op,
+                    run_torch=lambda dst_t=dst_t, s=scalar: torch_call(dst_t, s),
+                    run_c=lambda dst_c=dst_c, s=scalar: c_module._aten_dispatch(op, dst_c, s),
+                    note="the Scalar overload, in place",
+                )
+            )
+    # A float scalar against an integral receiver promotes to float and then
+    # cannot be cast back -- upstream's wrapped-number rule meeting canCast.
+    dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
+    cases.append(
+        Case(
+            name=f"{spell}(dtype=int32, other=2.5) [refused on BOTH sides]",
+            op=op,
+            run_torch=lambda: torch_call(dst_t, 2.5),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c, 2.5),
+            expect="both_error",
+            note="result type Float can't be cast to the desired output type Int",
+        )
+    )
+    return cases
+
+
+def sub__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sub_.Tensor"
+    cases = _inplace_tensor_cases(torch_module, c_module, torch_call, op, "sub_")
+    for alpha, note in [(2.0, "alpha scales other before it is subtracted"),
+                        (-1.0, "a negative alpha turns sub_ into an add")]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        src_t, src_c = pair_from_flat(torch_module, c_module, [10, 20, 30, 40], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"sub_(dtype=float32, alpha={alpha}) [{note}]",
+                op=op,
+                run_torch=lambda dst_t=dst_t, src_t=src_t, alpha=alpha: torch_call(dst_t, src_t, alpha=alpha),
+                run_c=lambda dst_c=dst_c, src_c=src_c, alpha=alpha: c_module._aten_dispatch(op, dst_c, src_c, alpha=alpha),
+                note=note,
+            )
+        )
+    # bool: upstream refuses subtraction on bool outright, and so does this.
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    o_t, o_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "bool")
+    cases.append(
+        Case(
+            name="sub_(dtype=bool) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, o_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, o_c),
+            expect="both_error",
+            note="upstream: 'Subtraction, the `-` operator, with a bool tensor is not "
+                 "supported'; the shim refuses through arith_tag",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.sub_(y)", lambda m, a, b: a.sub_(b)),
+        ("x -= y", lambda m, a, b: _isub(a, b)),
+    ]))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def mul__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mul_.Tensor"
+    cases = _inplace_tensor_cases(torch_module, c_module, torch_call, op, "mul_")
+    # bool: `mul_` is the ONE arithmetic in-place op that accepts it, because
+    # a bool product IS the logical and under the tag's 0/1 invariant.
+    # Measured upstream: [True,False].mul_([True,True]) -> [True, False].
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    o_t, o_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "bool")
+    cases.append(
+        Case(
+            name="mul_(dtype=bool) [computes -- the product IS the logical and]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, o_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, o_c),
+            note="the one bool arm arith_tag allows; add_/sub_ refuse it",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.mul_(y)", lambda m, a, b: a.mul_(b)),
+        ("x *= y", lambda m, a, b: _imul(a, b)),
+    ]))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def add__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.add_.Scalar"
+    cases = _inplace_scalar_cases(torch_module, c_module, torch_call, op, "add_")
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def sub__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sub_.Scalar"
+    cases = _inplace_scalar_cases(torch_module, c_module, torch_call, op, "sub_")
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def mul__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.mul_.Scalar"
+    cases = _inplace_scalar_cases(torch_module, c_module, torch_call, op, "mul_")
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def neg__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.neg_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [-2, -1, 0, 1, 2], (5,), dtype_name)
+        cases.append(
+            Case(
+                name=f"neg_(dtype={dtype_name}) [keeps the dtype -- no promotion]",
+                op=op,
+                run_torch=lambda dst_t=dst_t: torch_call(dst_t),
+                run_c=lambda dst_c=dst_c: c_module._aten_dispatch(op, dst_c),
+                note="int64.neg_() is int64, measured -- unlike exp_, neg does not float",
+            )
+        )
+    # uint8 wraps rather than raising, the same answer `neg.default` gives.
+    dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 0], (3,), "uint8")
+    cases.append(
+        Case(
+            name="neg_(dtype=uint8) [wraps: 1 -> 255, 2 -> 254, 0 -> 0]",
+            op=op,
+            run_torch=lambda: torch_call(dst_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c),
+            note="two's complement truncation, same as neg.default",
+        )
+    )
+    dst_t, dst_c = pair_from_flat(
+        torch_module, c_module, [float("nan"), float("inf"), -0.0, 0.0], (4,), "float32"
+    )
+    cases.append(
+        Case(
+            name="neg_(float32, [nan, inf, -0.0, 0.0]) [signs flip, nan survives]",
+            op=op,
+            run_torch=lambda: torch_call(dst_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c),
+            note="-0.0 becomes 0.0 and 0.0 becomes -0.0; the harness compares bits",
+        )
+    )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="neg_(dtype=bool) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+            expect="both_error",
+            note="upstream points at ~ / logical_not(); the shim uses its exact wording",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.neg_()", lambda m, a: a.neg_()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def exp__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.exp_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        dst_t, dst_c = pair_from_flat(
+            torch_module, c_module, [0.0, 1.0, -1.0, 2.0], (2, 2), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"exp_(dtype={dtype_name})",
+                op=op,
+                run_torch=lambda dst_t=dst_t: torch_call(dst_t),
+                run_c=lambda dst_c=dst_c: c_module._aten_dispatch(op, dst_c),
+                note="in-place exp; the receiver keeps its own float dtype",
+            )
+        )
+    dst_t, dst_c = pair_from_flat(
+        torch_module, c_module,
+        [float("nan"), float("inf"), float("-inf"), -1000.0, 1000.0], (5,), "float32",
+    )
+    cases.append(
+        Case(
+            name="exp_(float32, [nan, inf, -inf, -1000, 1000])",
+            op=op,
+            run_torch=lambda: torch_call(dst_t),
+            run_c=lambda: c_module._aten_dispatch(op, dst_c),
+            note="nan, inf, 0.0, underflow to 0.0, overflow to inf",
+        )
+    )
+    # THE difference between exp_ and exp: exp promotes an integral input,
+    # and the in-place form has nowhere to put the promotion, so it refuses.
+    for dtype_name in ["int64", "int32", "uint8", "bool"]:
+        dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"exp_(dtype={dtype_name}) [refused -- exp promotes and in-place cannot]",
+                op=op,
+                run_torch=lambda dst_t=dst_t: torch_call(dst_t),
+                run_c=lambda dst_c=dst_c: c_module._aten_dispatch(op, dst_c),
+                expect="both_error",
+                note="result type Float can't be cast to the desired output type Long/Int/"
+                     "Byte/Bool -- exp.default computes float32 for exactly these inputs",
+            )
+        )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.exp_()", lambda m, a: a.exp_()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def _isub(a, b):
+    a -= b
+    return a
+
+
+def _imul(a, b):
+    a *= b
+    return a
+
+
+def _iadd(a, b):
+    a += b
+    return a
+
+
+def _inplace_member_cases(torch_module, c_module, op, spellings, operands=2) -> list[Case]:
+    """In-place members, read back through the **base** of a view.
+
+    Not through the return value: every in-place op returns `self`, so a
+    return-value case passes against a kernel that computed into a fresh
+    buffer -- and passes just as well against a *member* that resolved to the
+    wrong overload, as long as that overload happened to compute the same
+    thing. Each case here narrows `base[1]`, applies the member to the narrowed
+    view, and returns the base.
+
+    The `x += y` spellings matter separately from `x.add_(y)`: they go through
+    `TensorBase.__iadd__`, a different `methods.json` key, and it was the
+    missing one (docs/ARCH20.md §8)."""
+    cases: list[Case] = []
+    for label, call in spellings:
+        def through_base(m, *tensors, call=call):
+            base = tensors[0]
+            view = base[1]
+            call(m, view, *tensors[1:])
+            return base
+
+        a = pair_from_flat(
+            torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), "float32"
+        )
+        pairs = [a]
+        if operands == 2:
+            pairs.append(
+                pair_from_flat(torch_module, c_module, [2.0, 4.0], (2,), "float32")
+            )
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member {label} on a VIEW, then read the BASE (dtype=float32)",
+                "float32", pairs, through_base,
+                note="write-through: the mutation must be visible in base[1] afterwards, "
+                     "which a kernel that rebound the view's wrapper would fail",
+            )
+        )
+    return cases
+
+
+def add__member_cases(torch_module, c_module) -> list[Case]:
+    """`add_`/`__iadd__` -- the two members `aten.add_.Tensor` had no way in
+    through until docs/ARCH20.md §8. `falcon`'s residual is `x += y`."""
+    return _inplace_member_cases(torch_module, c_module, "aten.add_.Tensor", [
+        ("x.add_(y)", lambda m, a, b: a.add_(b)),
+        ("x += y", lambda m, a, b: _iadd(a, b)),
+    ])
+
+
+def relu__member_cases(torch_module, c_module) -> list[Case]:
+    """`x.relu_()` -- the member for a kernel that had none since
+    docs/KERNELS.md."""
+    return _inplace_member_cases(torch_module, c_module, "aten.relu_.default", [
+        ("x.relu_()", lambda m, a: a.relu_()),
+    ], operands=1)
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._grouped_mm.default": grouped_mm_cases,
     "aten.full.default": full_cases,
@@ -12254,6 +13112,19 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.floor_divide.Scalar": floor_divide_scalar_cases,
     "aten.histc.default": histc_cases,
     "aten.clamp_.default": clamp__default_cases,
+    # docs/ARCH20.md -- the seven blocked architectures, and the in-place
+    # family that had kernels but no names.
+    "aten.clamp.default": clamp_default_cases,
+    "aten.log.default": log_cases,
+    "aten.expm1.default": expm1_cases,
+    "aten.constant_pad_nd.default": constant_pad_nd_cases,
+    "aten.sub_.Tensor": sub__tensor_cases,
+    "aten.sub_.Scalar": sub__scalar_cases,
+    "aten.mul_.Tensor": mul__tensor_cases,
+    "aten.mul_.Scalar": mul__scalar_cases,
+    "aten.add_.Scalar": add__scalar_cases,
+    "aten.neg_.default": neg__cases,
+    "aten.exp_.default": exp__cases,
     "aten.div_.Tensor": div__tensor_cases,
     "aten.masked_fill_.Scalar": masked_fill__scalar_cases,
     "aten.index_put_.default": index_put__cases,
