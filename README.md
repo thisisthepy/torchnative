@@ -148,31 +148,36 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>122</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>3075 / 3075</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>229</b></td></tr>
-<tr><td>Signature and schema tables</td><td><b>4234</b> entries checked against upstream</td></tr>
+<tr><td>ATen operators</td><td><b>133</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>3302 / 3302</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>241</b></td></tr>
+<tr><td>Signature and schema tables</td><td><b>4295</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>20 of 20</b> reach zero missing operators in the traced sweep</td></tr>
-<tr><td>Architectures — <b>actually forward</b></td><td><b>13 of 20</b> on this shim, against 20 of 20 on upstream. The two numbers are different claims and the gap is real — see below</td></tr>
+<tr><td>Architectures — <b>actually forward</b></td><td><b>19 of 20</b> on this shim, against 20 of 20 on upstream. Only GPT-BigCode is left, on the TorchScript frontend</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
 <tr><td>Speed vs upstream</td><td>desktop CPU: <b>within a few percent</b> on SmolLM2-135M <code>float32</code> prefill, from 14% behind. The kernels were already ahead; the gap was argument binding (<a href="docs/BIND.md">BIND.md</a>)</td></tr>
 </table>
 
-**Forwards on this shim** (13): Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT ·
-MPT · StarCoder2 · StableLM · OLMo · Phi · Mixtral
+**Forwards on this shim** (19): Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT ·
+MPT · StarCoder2 · StableLM · OLMo · Phi · Mixtral · BERT · BLOOM · Cohere · Falcon · Mamba ·
+Persimmon
 
-**Zero missing operators but does not forward** (7): BERT · BLOOM · Cohere · Falcon ·
-GPT-BigCode · Mamba · Persimmon
+**Does not forward** (1): GPT-BigCode, which calls `torch.jit.script` at module scope and so
+needs the TorchScript frontend — a large un-attempted piece, not the abi3 wall
+([`docs/DYNAMO.md`](docs/DYNAMO.md) §12)
 
-The two lists differ because they measure different things, and conflating them is a mistake
-this README made. The coverage sweep traces a forward pass **on upstream torch** and asks
-whether every operator it dispatches is implemented here. It therefore cannot see anything
-that is not an operator — an unbound tensor member, a missing `torch.<name>` spelling, a
-dtype-promotion rule. Those are what the seven hit: `torch.square`, `torch.log`,
-`torch.repeat_interleave`, `pow.Tensor_Tensor` promotion, `__getitem__` with a list index,
-and for GPT-BigCode the TorchScript frontend. Measured by running all twenty on both sides.
+The two rows measure different things, and conflating them is a mistake this README made. The
+coverage sweep traces a forward pass **on upstream torch** and asks whether every operator it
+dispatches is implemented here — so it cannot see anything that is not an operator: an unbound
+tensor member, a missing `torch.<name>` spelling, a dtype-promotion rule.
+
+Closing the six took 11 new kernels, 12 spellings, 16 tensor members, 13 `_C` surface names and 3
+rule changes — and **none of the six stopped on only one wall.** Each had one to five more behind
+it, of a different kind each time: Cohere needed three spellings and no kernel at all, BERT went
+surface then spelling then kernel. "One operator away" was never true of any of them
+([`docs/ARCH20.md`](docs/ARCH20.md)).
 
 Measured against **`transformers` 5.x**, which is what a fresh `pip install transformers`
 resolves today. 4.x costs four more architectures and needs a disjoint set of operators from
