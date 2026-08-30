@@ -243,12 +243,13 @@ the test script, not in the repository.
 
 ---
 
-## 6. What still blocks Mixtral, by name
+## 6. What blocked Mixtral, by name — **all of it is closed** (2026-08-30)
 
 Measured by probing each name against the built shim (`torch.ops.aten._grouped_mm.default` works;
-everything below is the surface above it). Ordered by where the fix belongs.
+everything below is the surface above it). Ordered by where the fix belongs. §6.1 and §6.4 were
+open when this section was written and are closed now; §9 has the run that proves it, unpatched.
 
-### 6.1 `bootstrap.py` — one predicate, and it is the `_grouped_mm` one
+### 6.1 `bootstrap.py` — one predicate, and it is the `_grouped_mm` one — **fixed**
 
 ```python
 overloads = {
@@ -258,16 +259,42 @@ overloads = {
 }
 ```
 
-The comment says `_README`; the predicate says *every underscore-prefixed key*. So an aten op
-whose name begins with `_` can never get a `torch.<op>` binding, and `torch._grouped_mm` — which
-is what `torch.nn.functional.grouped_mm` calls, which is what `transformers` calls — refuses with
-"overload resolution has no table entry for this op" even though the entry is right there in
+The comment said `_README`; the predicate said *every underscore-prefixed key*. So an aten op
+whose name began with `_` could never get a `torch.<op>` binding, and `torch._grouped_mm` — which
+is what `torch.nn.functional.grouped_mm` calls, which is what `transformers` calls — refused with
+"overload resolution has no table entry for this op" even though the entry was right there in
 `overloads.json`.
 
-The sibling comprehension six lines below, for `methods.json`, already spells the intent
-correctly as `startswith("_README")`. Narrowing this one to match is the whole fix.
-`rust/torch_c/pytests/test_shim.py::test_grouped_mm_resolves_from_the_torch_level_name` asserts
-the current state so that the fix cannot land silently.
+The sibling comprehension six lines below, for `methods.json`, already spelled the intent
+correctly as `startswith("_README")`. Narrowing this one to match was the whole fix.
+
+**What the widened predicate now admits, enumerated.** The two predicates differ on exactly one
+key in the table as it stands:
+
+| key in `overloads.json` | old predicate | new predicate |
+|---|---|---|
+| `_README` (a list of prose, not schemas) | excluded | excluded |
+| `_grouped_mm` | **excluded** | **admitted** |
+| the other 50 keys | admitted | admitted |
+
+`_grouped_mm` is the only underscore-prefixed op name in the table, so nothing else changed
+reachability with it. Three things move as a consequence and all three were checked:
+
+- `torch._grouped_mm` and `torch._C._VariableFunctions._grouped_mm` resolve, and they compute
+  what `torch.ops.aten._grouped_mm.default` computes — asserted element-wise, in both the
+  positional and the three-keyword spellings `torch/nn/functional.py:7139` uses.
+- `_C._shim_overloads` gains the key `_grouped_mm`. Anything reading that dict as "what
+  `torch.<op>` can reach" now gets a truthful answer where it got a false one.
+- The `(qualname, overload)` -> schema map `_get_schema` answers from gains
+  `(aten::_grouped_mm, default)`. `verify_schemas.py` re-derives it from upstream and matches.
+
+The risk that remains is forward-looking rather than present: **a future underscore-prefixed
+entry in `overloads.json` will now become a live `torch.<name>` binding without anyone deciding
+that it should.** `test_grouped_mm_resolves_from_the_torch_level_name` asserts the admitted set is
+exactly `["_grouped_mm"]`, so that decision has to be made explicitly rather than inherited.
+
+That test asserted the *broken* state until this landed, so that the fix could not land silently.
+It now asserts the fixed state and the scope above.
 
 ### 6.2 `aten.floor_divide.Scalar` — the one missing *kernel*, now implemented
 
@@ -293,23 +320,80 @@ With a schema to resolve, `register_decomposition(aten.floor_divide)` now reache
 decomposition registry grows from 1004 to 1005 and the table from 414 to 415 — one more real
 upstream decomposition, closer to upstream's own 1097.
 
-### 6.4 `TensorBase` members — six names, six existing kernels
+### 6.4 `TensorBase` members — seven names, seven existing kernels — **all bound**
 
-None of these is a missing operator. Each is a Python-level spelling with a kernel already in
+None of these was a missing operator. Each is a Python-level spelling with a kernel already in
 `_aten_implemented()`.
 
-| refuses | kernel it needs | where |
-|---|---|---|
-| `TensorBase.__idiv__` | `aten::div_.Tensor` | `torch/_tensor.py:1115` spells `__itruediv__` as `_C.TensorBase.__idiv__`; MoE normalises router weights with `/=` |
-| `TensorBase.__ge__` | `aten::ge.Scalar` / `ge.Tensor` | sentinel mask. **`__le__`, `__gt__` and `__lt__` all work** — only `__ge__` is absent, which reads as an oversight rather than a decision |
-| `TensorBase.clamp_` | `aten::clamp_` | `expert_ids_g.clamp_(max=...)` |
-| `TensorBase.masked_fill_` | `aten::masked_fill_.Scalar` | the pre- and post-masks |
-| `TensorBase.div_` | `aten::div_.Tensor` | |
-| `TensorBase.chunk` | composite over `aten::split.Tensor` | `CompositeImplicitAutograd` upstream, so a Python-level composition like `linear`/`dropout` |
-| `TensorBase.__setitem__` | `aten::index_put_.default` | `inv_perm[perm] = arange(...)`. `__getitem__` is already a Python-level member; this is its missing half |
+| refused | kernel it needs | where | where the binding went |
+|---|---|---|---|
+| `TensorBase.__idiv__` | `aten::div_.Tensor` | `torch/_tensor.py:1115` spells `__itruediv__` as `_C.TensorBase.__idiv__`; MoE normalises router weights with `/=` | `methods.json` |
+| `TensorBase.__ge__` | `aten::ge.Scalar` / `ge.Tensor` | sentinel mask. **`__le__`, `__gt__` and `__lt__` all work** — only `__ge__` was absent, which reads as an oversight rather than a decision | `methods.json`, with `ge` alongside it |
+| `TensorBase.clamp_` | `aten::clamp_` | `expert_ids_g.clamp_(max=...)` | `methods.json` |
+| `TensorBase.masked_fill_` | `aten::masked_fill_.Scalar` | the pre- and post-masks | `methods.json` |
+| `TensorBase.div_` | `aten::div_.Tensor` | | `methods.json` |
+| `TensorBase.chunk` | composite over `aten::split.Tensor` | `CompositeImplicitAutograd` upstream, so a Python-level composition like `linear`/`dropout` | `bootstrap.py`, `_install_tensor_chunk` |
+| `TensorBase.__setitem__` | `aten::index_put_.default` | `inv_perm[perm] = arange(...)`. `__getitem__` is already a Python-level member; this is its missing half | `bootstrap.py`, `_install_tensor_indexing` |
 
-`methods.json` covers the first five; `chunk` and `__setitem__` are Python-level members and
-belong with `__getitem__` in `bootstrap.py`.
+`methods.json` covers the first five; `chunk` and `__setitem__` are Python-level members and sit
+with `__getitem__` in `bootstrap.py`. Six things came out of doing it that the table above did not
+say, and four of them are gaps rather than closures.
+
+**`ge` went in beside `__ge__`.** `le`, `lt`, `gt`, `eq` and `ne` each have both a dunder and a
+plain-method entry; `ge` had neither. Adding only the dunder would have left the set asymmetric
+for no reason anyone could later reconstruct.
+
+**`aten.ge.Tensor` has no kernel** — `le.Tensor`, `lt.Tensor` and `gt.Tensor` all do. So
+`x >= tensor` now resolves and then refuses by name, which is a precise work item where the
+missing table entry was a vague one. **This one is a missing kernel, not a missing name**, and it
+is the only comparison overload in that state.
+
+**`chunk` is not `extent // chunks`.** Upstream's composite
+(`at::native::chunk`, `aten/src/ATen/native/TensorShape.cpp`) rounds the split size *up* and then
+lets `split` return however many pieces that produces, so `chunks` is an upper bound rather than a
+promise — `arange(10).chunk(3)` is `(4,4,2)` and not `(3,3,3,1)`, and `arange(3).chunk(7)` returns
+**three** chunks. The zero-extent case is the one branch that must return exactly `chunks`, and it
+is the reason upstream has a `split_with_sizes` path at all: with a split size of 0, `split` would
+discard the count, because any number of empty chunks sums to zero. All of that is transcribed
+rather than reimplemented, and `Tensor.chunk` returns a `tuple` (upstream's `THPVariable_chunk`
+does) where `torch.ops.aten.split.Tensor` returns a `list`.
+
+**`__setitem__` is only half implementable here, and the other half is a missing capability rather
+than a missing operator.** Measured on 2.13.0, upstream's subscript assignment has two shapes:
+
+```
+x[t] = v        -> index_put_.default        reproduced
+x[boolmask] = v -> index_put_.default        resolves, then the kernel refuses (below)
+x[:, t] = v     -> index_put_.default        reproduced, indices [None, t]
+x[:] = tensor   -> copy_.default             reproduced
+x[...] = 3.0    -> fill_.Tensor              reproduced
+x[0] = 3.0      -> select.int, copy_.default REFUSED
+x[1:3] = tensor -> slice.Tensor, copy_       REFUSED
+```
+
+The last two are refused because **`aten.select.int` and `aten.slice.Tensor` return copies, not
+views** — a candle tensor is a value. Both kernels exist and both are correct on their own; it is
+the sequence that is not reproducible. Probed on this build:
+
+```
+s = select.int(x, 0, 1);  copy_(s, v)          ->  x unchanged
+s = slice.Tensor(y, 0, 1, 3, 1); copy_(s, v)   ->  y unchanged
+```
+
+Running upstream's sequence would therefore report success and write nothing, which is the
+silent-divergence direction DESIGN.md §5 exists to keep out. So it refuses by name and says what
+is missing: **mutable views**. `test_setitem_refuses_the_basic_index_write_rather_than_dropping_it`
+asserts the probe above rather than the refusal alone, so if views ever become mutable the test
+goes red and points at the branch to delete.
+
+**`aten.index_put_.default` refuses a bool-mask index**, where upstream accepts one: the kernel is
+written on top of `scatter`, which wants an int32/int64 index
+(`Expected dtype int32 or int64 for index, got bool`). A second kernel gap, recorded as a
+`c_error` golden case rather than left uncased.
+
+**`aten.index_put_.default` also refuses anything but 1-D self/index/values**, which is why
+`x[t] = 5` (a Python number, lifted to a 0-d tensor the way upstream lifts it) refuses and
+`x[t] = tensor_of_the_right_length` does not. Third kernel gap; the same case shape covers it.
 
 ### 6.5 Not a blocker, but on the path
 
@@ -321,16 +405,25 @@ it; it only means a seeded shim run cannot be set up the obvious way.
 
 ## 7. Numbers
 
-| | before | after |
-|---|---|---|
-| Golden cases | 2843 / 2843 | **2918 / 2918**, 0 failed |
-| Ops covered by the golden suite | 119 | **121** |
-| Smoke tests (`pytests/run.sh`) | 211 | **220** |
-| Schema table entries vs upstream | 4203 / 4203 | **4217 / 4217** |
-| Mixtral, operator sweep | 1 missing | **0 missing** (forward and greedy `generate`) |
-| Mixtral, executed on the shim | — | **runs; logits within 2.4e-07 of upstream** (with §6's five name gaps patched in the test script) |
+| | before | after the operator | after the names (§9) |
+|---|---|---|---|
+| Golden cases | 2843 / 2843 | 2918 / 2918 | **2971 / 2971**, 0 failed |
+| Ops covered by the golden suite | 119 | 121 | **121** (no new op — these are name bindings) |
+| Smoke tests (`pytests/run.sh`) | 211 | 220 | **223** |
+| Schema table entries vs upstream | 4203 / 4203 | 4217 / 4217 | **4231 / 4231** |
+| Golden `--self-test` comparators | 12 | 12 | **13** |
+| Mixtral, operator sweep | 1 missing | **0 missing** | 0 missing |
+| Mixtral, executed on the shim | — | runs with §6 patched in the test script | **runs with nothing patched** (§9) |
 
-The golden suite grew by 75: 64 for `_grouped_mm` and 11 for `floor_divide.Scalar`.
+The golden suite grew by 75 for the operator: 64 for `_grouped_mm` and 11 for
+`floor_divide.Scalar`. It grew by a further 53 for the names, and those 53 go through the
+*member* on both sides (`t.clamp_(max=3)` against `t.clamp_(max=3)`) rather than through
+`_aten_dispatch`. That distinction is the whole point: the kernel-level cases passed the entire
+time the members were raising `NotImplementedError`, so they could not have caught this and a
+name with no case is a name nobody checks.
+
+The 13th comparator is `_chunk_tuple_check`, which is `_chunk_list_check` plus the container
+type — `t.chunk(2) + (x,)` works and `list + tuple` does not, so `tuple` is part of the answer.
 
 Both new kernels were checked by sabotage rather than by trusting a green run:
 
@@ -338,9 +431,63 @@ Both new kernels were checked by sabotage rather than by trusting a green run:
 - deleting the 16-byte stride refusal fails **3** cases, each reported as one side computing
   where the other raised.
 
-`--self-test` stays at 12 comparators × 11 fault modes with 0 problems. It briefly went to 13,
-because the first version of the short-`offs` case introduced a comparator that ignored the last
-rows of the result and was therefore blind to the harness's own `value-last` injection. The
-harness said so, and the case now slices the unwritten tail off with `aten.slice.Tensor` instead —
-so `_gemm_scale_check`, whose fault profile is already established, does the comparing.
+`--self-test` was 12 comparators × 11 fault modes with 0 problems, and is 13 × 11 now. It had
+briefly gone to 13 once before and come back, because the first version of the short-`offs` case
+introduced a comparator that ignored the last rows of the result and was therefore blind to the
+harness's own `value-last` injection. The harness said so, and the case now slices the unwritten
+tail off with `aten.slice.Tensor` instead — so `_gemm_scale_check`, whose fault profile is already
+established, does the comparing.
+
+---
+
+## 9. Mixtral, run with nothing patched (2026-08-30)
+
+§5.2 ran Mixtral on the shim and got `2.384e-07` over 800 logits, **with §6's name gaps patched in
+the test script**. Those gaps are closed now, so the same run works against the repository as it
+stands. Nothing is monkey-patched, nothing is stubbed, and the script is byte-identical between
+the two sides — it is run twice, once under upstream torch and once with `PYTHONPATH` pointed at
+the vendored tree, so a difference in the output is a difference in torch.
+
+```
+MixtralForCausalLM   hidden 32 · intermediate 64 · 1 layer · 4 heads · 2 kv heads
+                     4 experts · top-2 · vocab 100 · 8 input tokens
+
+shim logits   [1, 8, 100] float32
+MAX ABS DIFF vs upstream    4.4703e-08      over 800 logits, logit scale 2.2832e-01
+                                             (relative 1.958e-07)
+argmax, all 8 positions     identical       [18, 27, 17, 27, 53, 79, 25, 52]
+generate(max_new_tokens=4)  identical       [3,17,42,8,55,1,90,23, 52,95,45,66]
+```
+
+`4.47e-08` is one ulp of float32 at that magnitude. It is smaller than §5.2's number because the
+weights are smaller, not because anything got more accurate; both are float32 GEMM noise.
+
+Weights are filled by a shared LCG keyed on the sorted `state_dict` index, RNG-free — the same
+procedure §5.2 used, and for the same reason: `torch.manual_seed` still refuses (§6.5), and two
+independent RNG implementations would not produce the same stream even with a matched seed.
+
+**The batch is load-bearing, checked by reverting rather than by assuming.** With
+`bootstrap.py` and `methods.json` restored to their pre-fix state and the artefact rebuilt, the
+same script dies in `MixtralSparseMoeBlock.forward`:
+
+```
+transformers/models/mixtral/modeling_mixtral.py:109
+    router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+NotImplementedError: not implemented in torch._C shim: TensorBase.__idiv__
+```
+
+Which of the seven names the model actually reaches, counted by wrapping each member and running
+the same forward and `generate`:
+
+| member | calls |
+|---|---:|
+| `torch._grouped_mm` | 10 |
+| `masked_fill_` | 10 |
+| `__ge__` | 5 |
+| `clamp_` | 5 |
+| `chunk` | 5 |
+| `__setitem__` | 5 |
+| `__idiv__` | reached, but not countable this way — `torch/_tensor.py` binds `Tensor.__itruediv__` to the unwrapped member at import time, before any wrapper can be installed. The revert above is what shows it |
+| `div_` | 0 — this config never calls it directly; it is in `methods.json` because §6.4 measured it and because `__idiv__` needs the same kernel |
+| `ge` | 0 — added for symmetry with `le`/`lt`/`gt`, not because Mixtral calls it |
 

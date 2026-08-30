@@ -734,53 +734,174 @@ def test_grouped_mm_refuses_a_dtype_the_kernel_has_no_gemm_for():
 
 
 def test_grouped_mm_resolves_from_the_torch_level_name():
-    """...except that it does not, and this test is where that is written down.
+    """...and now it does. The predicate that stopped it, and what it cost.
 
     `torch._grouped_mm` is what `torch.nn.functional.grouped_mm` calls, and
     that is the route `transformers`' MoE layer takes on CPU. `overloads.json`
-    now carries the entry, and the kernel is reachable through
-    `torch.ops.aten._grouped_mm.default` -- but the *name* still refuses,
-    because `bootstrap.py`'s table constructor drops it:
+    carried the entry and the kernel was reachable through
+    `torch.ops.aten._grouped_mm.default`, but the *name* refused, because
+    `bootstrap.py`'s table constructor dropped it:
 
         overloads = {... for name, schemas in json.loads(overloads_json).items()
                      if not name.startswith("_")}      # the table's embedded README
 
-    The comment says README and the predicate says every underscore-prefixed
-    key, so an aten op whose name begins with `_` cannot have a `torch.<op>`
-    binding at all. `methods.json`'s sibling comprehension six lines below
-    already spells the same intent correctly as `startswith("_README")`.
+    The comment said README and the predicate said every underscore-prefixed
+    key, so an aten op whose name began with `_` could not have a `torch.<op>`
+    binding at all. `methods.json`'s sibling comprehension six lines below had
+    always spelled the same intent correctly as `startswith("_README")`;
+    narrowing this one to match was the whole fix. docs/GROUPED_MM.md §6.1.
 
-    Asserted as it is rather than as it should be, because this file is a
-    smoke test and not a wish. When that predicate is narrowed, this test
-    fails and the two assertions below swap for their commented-out forms --
-    which is the point: the fix should not be able to land silently.
-    docs/GROUPED_MM.md §6.
+    This test asserted the broken state until the fix landed, so that it could
+    not land silently. It now asserts the fixed state, and asserts the *scope*
+    of the widening as well: `_grouped_mm` is the only key the wider predicate
+    admits that the narrower one did not, so nothing else changed reachability
+    with it. If a second underscore-prefixed op is added to `overloads.json`
+    later, that assertion is where it announces itself.
     """
     fn = getattr(_C._VariableFunctions, "_grouped_mm")
     assert fn is not None
-    assert "_grouped_mm" not in _C._shim_overloads, (
-        "bootstrap.py's `_`-prefix filter was narrowed -- good. Replace this "
-        "assertion with:  assert _C._shim_overloads['_grouped_mm'] == "
-        "['aten._grouped_mm.default']"
+    assert _C._shim_overloads["_grouped_mm"] == ["aten._grouped_mm.default"], (
+        _C._shim_overloads["_grouped_mm"]
     )
-    try:
-        fn(_C._tensor_from_flat([1.0] * 16, [4, 4]),
-           _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
-           offs=_C._tensor_from_flat([1, 4], [2], dtype=_C.int32))
-    except NotImplementedError as e:
-        assert "overload resolution has no table entry" in str(e), str(e)
-    else:
-        raise AssertionError(
-            "torch._grouped_mm resolved -- the bootstrap.py filter was fixed. "
-            "Replace this block with a value assertion."
-        )
-    # The key itself is dispatchable; only the Python-level name is not.
-    _C._aten_dispatch(
+    # The whole difference the widened predicate makes, enumerated rather
+    # than assumed harmless: `_README` is still excluded (it is a list of
+    # prose, not schemas, and admitting it would fail to parse), and
+    # `_grouped_mm` is the only other underscore-prefixed key in the table.
+    admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
+    assert admitted == ["_grouped_mm"], admitted
+
+    result = fn(
+        _C._tensor_from_flat([1.0] * 16, [4, 4]),
+        _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
+        offs=_C._tensor_from_flat([1, 4], [2], dtype=_C.int32),
+    )
+    # The name and the key reach the same kernel, so they must agree exactly.
+    direct = _C._aten_dispatch(
         "aten._grouped_mm.default",
         _C._tensor_from_flat([1.0] * 16, [4, 4]),
         _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
         _C._tensor_from_flat([1, 4], [2], dtype=_C.int32),
     )
+    assert list(result.shape) == list(direct.shape) == [4, 4]
+    assert result.tolist() == direct.tolist(), (result.tolist(), direct.tolist())
+    # Keyword spelling too -- `torch/nn/functional.py:7139` passes all three
+    # of `offs`, `bias` and `out_dtype`, two of them `None`.
+    kwargs_form = fn(
+        _C._tensor_from_flat([1.0] * 16, [4, 4]),
+        _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
+        offs=_C._tensor_from_flat([1, 4], [2], dtype=_C.int32),
+        bias=None,
+        out_dtype=None,
+    )
+    assert kwargs_form.tolist() == direct.tolist()
+
+
+def test_the_mixtral_member_names_reach_the_kernels_that_were_already_there():
+    """Seven `TensorBase` members, none of them a new operator.
+
+    docs/GROUPED_MM.md §6.4 measured what stopped Mixtral from *executing*
+    after `_grouped_mm` took it to zero missing operators, and every item was
+    a name with a kernel already in `_aten_implemented()`. Five are
+    `methods.json` entries (`__idiv__`, `__ge__`, `clamp_`, `masked_fill_`,
+    `div_`, plus `ge` for symmetry with `le`/`lt`/`gt`); `chunk` and
+    `__setitem__` are Python-level, for the reasons their bootstrap.py
+    docstrings give.
+
+    Each is asserted through the *member*, not through `_aten_dispatch`: the
+    dispatch keys were reachable all along, so a test that called them would
+    have passed before the fix and proved nothing.
+    """
+    def t(flat, shape, dtype=None):
+        kw = {} if dtype is None else {"dtype": dtype}
+        return _C._tensor_from_flat(list(flat), list(shape), **kw)
+
+    # `torch/_tensor.py:1115` assigns `Tensor.__itruediv__ = TensorBase.__idiv__`.
+    x = t([4.0, 8.0], [2])
+    x.__idiv__(t([2.0, 2.0], [2]))
+    assert x.tolist() == [2.0, 4.0], x.tolist()
+    # In place, so the receiver is the thing that changed.
+    y = t([4.0, 8.0], [2])
+    assert y.div_(t([2.0, 4.0], [2])).tolist() == [2.0, 2.0]
+    assert y.tolist() == [2.0, 2.0], y.tolist()
+
+    # `__le__`/`__gt__`/`__lt__` all existed; only `__ge__` was absent.
+    g = t([1.0, 3.0, 5.0], [3])
+    assert g.__ge__(3).tolist() == [False, True, True]
+    assert g.ge(3).tolist() == [False, True, True]
+    assert (g >= 3).tolist() == [False, True, True]
+
+    # `expert_ids_g.clamp_(max=...)` -- max only, min absent.
+    c = t([1.0, 5.0, 10.0, -3.0], [4])
+    assert c.clamp_(max=6).tolist() == [1.0, 5.0, 6.0, -3.0]
+    assert c.tolist() == [1.0, 5.0, 6.0, -3.0], c.tolist()
+
+    m = t([1.0, 2.0, 3.0, 4.0], [4])
+    mask = t([True, False, True, False], [4], dtype=_C.bool)
+    assert m.masked_fill_(mask, 0.0).tolist() == [0.0, 2.0, 0.0, 4.0]
+    assert m.tolist() == [0.0, 2.0, 0.0, 4.0], m.tolist()
+
+    # `chunk` is upstream's composite, not an even division: `chunks` is an
+    # upper bound on how many pieces come back.
+    ten = _C._aten_dispatch("aten.arange.default", 10)
+    assert [c.tolist() for c in ten.chunk(3)] == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+    assert [c.tolist() for c in ten.chunk(4)] == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+    assert [len(c.tolist()) for c in ten.chunk(5)] == [2, 2, 2, 2, 2]
+    three = _C._aten_dispatch("aten.arange.default", 3)
+    assert len(three.chunk(7)) == 3, "chunks is an upper bound, not a promise"
+    assert isinstance(ten.chunk(3), tuple), "upstream's THPVariable_chunk returns a tuple"
+
+    # `inv_perm[perm] = torch.arange(perm.size(0))` -- the missing half of
+    # `__getitem__`, and the one shape of it this shim can do correctly.
+    s = t([0.0] * 5, [5])
+    s[t([0, 2, 4], [3], dtype=_C.int64)] = t([7.0, 8.0, 9.0], [3])
+    assert s.tolist() == [7.0, 0.0, 8.0, 0.0, 9.0], s.tolist()
+    whole = t([0.0] * 3, [3])
+    whole[:] = t([1.0, 2.0, 3.0], [3])
+    assert whole.tolist() == [1.0, 2.0, 3.0], whole.tolist()
+    fill = t([0.0] * 3, [3])
+    fill[...] = 4.0
+    assert fill.tolist() == [4.0, 4.0, 4.0], fill.tolist()
+
+    for name in ("div_", "__idiv__", "ge", "__ge__", "clamp_", "masked_fill_"):
+        assert name in _C._shim_methods, name
+    # ...and the two that are deliberately not table entries.
+    assert "chunk" not in _C._shim_methods
+    assert "__setitem__" not in _C._shim_methods
+
+
+def test_setitem_refuses_the_basic_index_write_rather_than_dropping_it():
+    """The half of `__setitem__` this shim cannot do, refused by name.
+
+    Upstream's `x[0] = v` narrows to a *view* (`aten.select.int`) and writes
+    through it with `aten.copy_.default`. Both kernels exist here and both
+    are correct in isolation -- but a candle tensor is a value, so
+    `select.int` returns a copy and the write lands nowhere. Running
+    upstream's sequence would therefore report success and change nothing,
+    which is worse than refusing.
+
+    The probe below is the evidence, not an appeal to the docstring: it does
+    exactly what upstream does, through the public dispatch keys, and shows
+    the receiver unchanged. If views ever become mutable this test goes red
+    and `__setitem__`'s refusal branch is what should change.
+    """
+    x = _C._tensor_from_flat([0.0] * 5, [5])
+    view = _C._aten_dispatch("aten.select.int", x, 0, 1)
+    _C._aten_dispatch("aten.copy_.default", view, _C._tensor_from_flat([3.0], []))
+    assert x.tolist() == [0.0] * 5, (
+        "select.int returned a mutable view -- __setitem__'s basic-index "
+        "branch can be implemented now"
+    )
+    sliced = _C._aten_dispatch("aten.slice.Tensor", x, 0, 1, 3, 1)
+    _C._aten_dispatch("aten.copy_.default", sliced, _C._tensor_from_flat([1.0, 2.0], [2]))
+    assert x.tolist() == [0.0] * 5, "slice.Tensor returned a mutable view"
+
+    for index in (0, slice(1, 3), (slice(None), 0)):
+        try:
+            _C._tensor_from_flat([0.0] * 5, [5])[index] = 1.0
+        except NotImplementedError as error:
+            assert "mutable views" in str(error), str(error)
+        else:
+            raise AssertionError(f"__setitem__[{index!r}] silently accepted")
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
@@ -5810,21 +5931,86 @@ out["refuse_no_rule"] = refusal(
 out["refuse_unrunnable"] = refusal(
     torch.ones(4, 8), lambda t: d("aten.zeros_like.default", t)
 )
-# A rule exists, runs, and produces a result the recording disagrees with.
-# `aten.baddbmm.default`'s decomposition multiplies by the Python floats
-# `beta`/`alpha`, which promotes float32 to float64 here (docs/DECOMP.md
-# §6.2 -- a scalar-promotion divergence, unfixed and out of scope for the
-# `sum` fix below).
-_bb_c, _bb_a, _bb_b = torch.ones(2, 3, 5), torch.ones(2, 3, 4), torch.ones(2, 4, 5)
-torch._C._capture_begin([_bb_c, _bb_a, _bb_b])
-_bb_produced = d("aten.baddbmm.default", _bb_c, _bb_a, _bb_b)
+# Wall 3 -- "a rule exists, runs, and produces a result the recording
+# disagrees with" -- has no example any more, and this is the census that
+# says so rather than an absence nobody looked for.
+#
+# `aten.baddbmm.default` was the example: its decomposition multiplies by
+# the Python floats `beta`/`alpha` and came out float64 for float32 inputs.
+# The cause is `TensorBase.dtype` returning a fresh object per read, so
+# `a.dtype is b.dtype` was false and upstream's `get_higher_dtype` fell past
+# its `if a is b: return a` guard into the `ordered_datatypes` table
+# (docs/BIND.md §9). Fixed, so `baddbmm` lowers -- recorded below as its own
+# case, the way `sum.default` was when the kernel bug it caught was fixed.
+def verdict(inputs, call):
+    torch._C._capture_begin(list(inputs))
+    produced = call()
+    trace = torch._C._capture_end(produced)
+    try:
+        decompose(trace)
+    except DecompositionRefused as error:
+        text = str(error)
+        if "has no rule for it" in text:
+            return "NO_RULE"
+        if "raised" in text:
+            return "RAISED_INSIDE"
+        return "DISAGREES"
+    return "LOWERED"
+
+
+# Every non-core implemented op that lowers today -- which is the whole
+# population a disagreement could come from, because an op that refuses at
+# wall 1 or wall 2 never reaches the meta comparison at all. Taken from
+# `pytests/decomp_sweep.py`'s LOWERED column, one entry per op.
+_c1, _a1, _b1 = torch.ones(2, 3, 5), torch.ones(2, 3, 4), torch.ones(2, 4, 5)
+_x1, _y1 = torch.ones(3, 4), torch.ones(3, 4) * 2.0
+_m1, _m2 = torch.ones(3, 4), torch.ones(4, 2)
+_i1, _i2 = torch.ones(3, 4), torch.ones(2)
+_census = [
+    ("aten._unsafe_view.default", [_x1], lambda: d("aten._unsafe_view.default", _x1, [4, 3])),
+    ("aten.baddbmm.default", [_c1, _a1, _b1], lambda: d("aten.baddbmm.default", _c1, _a1, _b1)),
+    ("aten.detach.default", [_x1], lambda: d("aten.detach.default", _x1)),
+    ("aten.isin.Tensor_Tensor", [_i1, _i2], lambda: d("aten.isin.Tensor_Tensor", _i1, _i2)),
+    ("aten.matmul.default", [_m1, _m2], lambda: d("aten.matmul.default", _m1, _m2)),
+    ("aten.split.Tensor", [_x1], lambda: d("aten.split.Tensor", _x1, 2, 0)),
+    ("aten.stack.default", [_x1, _y1], lambda: d("aten.stack.default", [_x1, _y1], 0)),
+    ("aten.sum.default", [_x1], lambda: d("aten.sum.default", _x1)),
+    ("aten.t.default", [_x1], lambda: d("aten.t.default", _x1)),
+    ("aten.transpose.int", [_x1], lambda: d("aten.transpose.int", _x1, 0, 1)),
+]
+out["wall3_census"] = {name: verdict(inputs, call) for name, inputs, call in _census}
+
+# A census that reports "none" is worth nothing unless it *can* report one.
+# Force the meta comparison to disagree and check the same probe changes its
+# answer, then put it back and check it changes back. Without this the
+# wall-3 assertion in the test would pass just as happily against a census
+# that had quietly stopped looking.
+_decompose_module = sys.modules[decompose.__module__]
+_real_meta_matches = _decompose_module._meta_matches
+_decompose_module._meta_matches = lambda want, got: False
+out["wall3_control_forced"] = verdict(
+    [_c1, _a1, _b1], lambda: d("aten.baddbmm.default", _c1, _a1, _b1)
+)
+_decompose_module._meta_matches = _real_meta_matches
+out["wall3_control_restored"] = verdict(
+    [_c1, _a1, _b1], lambda: d("aten.baddbmm.default", _c1, _a1, _b1)
+)
+
+# `baddbmm` as a lowers-correctly case -- the `sum.default` treatment.
+torch._C._capture_begin([_c1, _a1, _b1])
+_bb_produced = d("aten.baddbmm.default", _c1, _a1, _b1)
 _bb_trace = torch._C._capture_end(_bb_produced)
-try:
-    decompose(_bb_trace)
-except DecompositionRefused as error:
-    out["refuse_disagrees"] = str(error)
-else:
-    out["refuse_disagrees"] = "ACCEPTED"
+_bb_lowered = decompose(_bb_trace)
+out["baddbmm_ops_after"] = _bb_lowered.ops
+(_bb_replayed,) = _bb_lowered.replay([_c1, _a1, _b1])
+out["baddbmm_replayed_dtype"] = str(_bb_replayed.dtype)
+out["baddbmm_replayed_shape"] = list(_bb_replayed.shape)
+out["baddbmm_replayed"] = _bb_replayed.reshape(-1).tolist()
+out["baddbmm_eager"] = _bb_produced.reshape(-1).tolist()
+# The identity contract the fix restored, asserted where the bug showed up
+# and not only where it was diagnosed.
+out["dtype_is_singleton"] = _x1.dtype is torch.float32
+out["dtype_is_self"] = _x1.dtype is _x1.dtype
 
 # `aten.sum.default` used to land here too: upstream's rule rewrites it to
 # `sum(x, dim=[], dtype=None)`, and this shim's `aten.sum.dim_IntList` used
@@ -6168,6 +6354,24 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     was responsible. So each refusal names the op *and* which of the three
     walls it hit -- no rule, the rule will not run here, or the rule disagreed
     with the recording.
+
+    **Walls 1 and 2 have examples. Wall 3 currently has none**, and that is
+    asserted here as a fact rather than papered over with an invented one.
+    Its last example was `aten.baddbmm.default`, whose decomposition promoted
+    float32 to float64; the cause was `TensorBase.dtype` handing back a fresh
+    object per read (docs/BIND.md §9), it is fixed, and `baddbmm` now lowers
+    (`test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton`).
+    That is the same thing that happened to `aten.sum.default` one round
+    earlier, and to `aten.t.default` before it.
+
+    The wall itself is not gone -- `decompose` still compares every
+    decomposition's meta against the recording and still refuses on a
+    mismatch. What is gone is an op that trips it. So this asserts the census
+    (every op that reaches the comparison agrees) together with a **positive
+    control**: with the comparison forced to disagree, the same probe reports
+    `DISAGREES`. Without that control, "no op disagrees" would pass equally
+    well if the check had stopped running, which is the failure mode
+    docs/DECOMP.md §7.2 now records.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -6188,14 +6392,79 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     assert "torch.full_like" in r["refuse_unrunnable"], r["refuse_unrunnable"]
 
     # 3. A rule exists, runs, and produces a result the recording disagrees
-    #    with -- `aten.baddbmm.default`'s decomposition promotes float32 to
-    #    float64 (docs/DECOMP.md §6.2, unfixed). `aten.sum.default` used to
-    #    be this example; it moved once the kernel bug it caught was fixed
-    #    (test_decompose_lowers_sum_default_now_that_the_kernel_agrees).
-    assert r["refuse_disagrees"] != "ACCEPTED"
-    assert "aten.baddbmm.default" in r["refuse_disagrees"], r["refuse_disagrees"]
-    assert "torch.float64" in r["refuse_disagrees"], r["refuse_disagrees"]
-    assert "torch.float32" in r["refuse_disagrees"], r["refuse_disagrees"]
+    #    with. **No op does this any more.** Every non-core op that reaches
+    #    the meta comparison agrees with the recording, so the census is all
+    #    LOWERED and there is nothing to name here. Asserted per op rather
+    #    than as a count, so a *new* disagreement names itself instead of
+    #    only moving a number.
+    census = r["wall3_census"]
+    assert census, census
+    disagreeing = sorted(k for k, v in census.items() if v == "DISAGREES")
+    assert disagreeing == [], (
+        "wall 3 has an example again -- promote it: make this the named case "
+        f"and give the census a lowers-correctly entry instead. {disagreeing}"
+    )
+    # Every entry must actually have reached the comparison; an op that
+    # started refusing earlier would drop out of the population silently.
+    assert sorted(census) == sorted(
+        [
+            "aten._unsafe_view.default",
+            "aten.baddbmm.default",
+            "aten.detach.default",
+            "aten.isin.Tensor_Tensor",
+            "aten.matmul.default",
+            "aten.split.Tensor",
+            "aten.stack.default",
+            "aten.sum.default",
+            "aten.t.default",
+            "aten.transpose.int",
+        ]
+    ), sorted(census)
+    assert set(census.values()) == {"LOWERED"}, census
+
+    # The positive control: the census can still report a disagreement.
+    assert r["wall3_control_forced"] == "DISAGREES", r["wall3_control_forced"]
+    assert r["wall3_control_restored"] == "LOWERED", r["wall3_control_restored"]
+
+
+def test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton():
+    """Wall 3's last example, turned into proof that its cause is fixed.
+
+    `aten.baddbmm.default`'s upstream rule is `@pw_cast_for_opmath`-decorated,
+    so it runs `elementwise_dtypes` -> `get_higher_dtype`, which opens with
+
+        if a is b: return a
+
+    before it consults `ordered_datatypes`. `TensorBase.dtype` used to build a
+    fresh `PyDtype` on every read, so two float32 operands were never `is`
+    each other, both fell past that guard, and the pair came out **float64**.
+    The decomposition then produced a float64 result where the recording had
+    float32, `decompose` caught the divergence, and refused -- correctly, on a
+    real bug. docs/BIND.md §9 has the diagnosis; docs/DECOMP.md §7.2 had
+    carried it as "cause unknown" until then.
+
+    `dtype` is interned now, so the rule and the recording agree and the trace
+    lowers to `bmm` + `add`. All three links are asserted, so a regression
+    says which one broke: the identity contract itself, the lowered op list,
+    and that replaying the lowered graph reproduces eager's values in
+    float32.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    r = _decomp_road_fixture()
+    # The cause, at the level it lives: `t.dtype` is the module-level object.
+    assert r["dtype_is_singleton"] is True
+    assert r["dtype_is_self"] is True
+    # The rule and the recording agree, so it lowers instead of refusing.
+    assert r["baddbmm_ops_after"] == ["aten.bmm.default", "aten.add.Tensor"], r[
+        "baddbmm_ops_after"
+    ]
+    # ...and the result is float32, which is the divergence stated directly.
+    assert r["baddbmm_replayed_dtype"] == "torch.float32", r["baddbmm_replayed_dtype"]
+    assert r["baddbmm_replayed_shape"] == [2, 3, 5], r["baddbmm_replayed_shape"]
+    # `baddbmm(ones(2,3,5), ones(2,3,4), ones(2,4,5))` is 1 + 4 elementwise.
+    assert r["baddbmm_replayed"] == [5.0] * 30, r["baddbmm_replayed"][:8]
+    assert r["baddbmm_replayed"] == r["baddbmm_eager"], r["baddbmm_eager"][:8]
 
 
 def test_decompose_lowers_sum_default_now_that_the_kernel_agrees():
@@ -7014,6 +7283,14 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     (`test_decompose_gets_the_full_upstream_table_now`): with a schema to
     resolve, `register_decomposition(aten.floor_divide)` now reaches it.
 
+    183 until the seven `TensorBase` members Mixtral needs went into
+    `methods.json` (docs/GROUPED_MM.md §6.4): `div_` with its four overloads,
+    `ge` with two, `masked_fill_` with two and `clamp_` with two -- ten new
+    schema strings, all of them declared in the yaml, so `from_tables` is
+    unchanged at five. `__idiv__` and `__ge__` add none: they are second
+    spellings of `div_.Tensor`/`div_.Scalar` and `ge.Tensor`/`ge.Scalar`, and
+    this count is over distinct `(qualname, overload)` pairs, not table keys.
+
     The provenance assertion is not decoration. In the first working version
     `_get_schema` consulted the tables *before* the file, so these 173 lookups
     were answered by the oracle itself and the comparison was the oracle
@@ -7036,7 +7313,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
             shadowed.append((qualname, overload, got["from"]))
     assert mismatched == [], mismatched[:5]
     assert shadowed == [], shadowed[:5]
-    assert len(keys) == 183, len(keys)
+    assert len(keys) == 193, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

@@ -2352,8 +2352,17 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     overloads = {
         name: _Overloads(name, schemas, _checker_source)
+        # `_README`, not `_`. The predicate used to be `not
+        # name.startswith("_")` while its comment said README, and the
+        # difference was not cosmetic: it made a `torch.<op>` binding
+        # impossible for every aten op whose name begins with an underscore.
+        # `torch._grouped_mm` -- which is what `torch.nn.functional.grouped_mm`
+        # calls and therefore what `transformers`' MoE layer calls -- refused
+        # with "overload resolution has no table entry" while its entry sat in
+        # the table. docs/GROUPED_MM.md §6.1. The sibling comprehension below
+        # always spelled the intent correctly; this one now matches it.
         for name, schemas in json.loads(overloads_json).items()
-        if not name.startswith("_")  # the table's embedded README
+        if not name.startswith("_README")
     }
     # Inspectable for the same reason as `_shim_off_switches`: which aten key a
     # `torch.<op>` call can reach should be answerable by asking, not by
@@ -3085,8 +3094,9 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
 
     _install_tensor_conversions(module, tensorbase, dispatch)
     _install_tensor_scalars(tensorbase, dispatch)
-    _install_tensor_indexing(tensorbase, dispatch)
+    _install_tensor_indexing(module, tensorbase, dispatch)
     _install_tensor_softmax(tensorbase, dispatch)
+    _install_tensor_chunk(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
 
 
@@ -3117,9 +3127,14 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     def _to_copy(self, dtype=None, device=None, copy=False):
         if isinstance(device, str):
             device = module.device(device)
-        # `!=`, not `is not`: `self.dtype` builds a fresh `PyDtype` on every
-        # read (dtype.rs owns the tag, not a singleton table), so identity is
-        # never true even for the same dtype. Both types define `__eq__`.
+        # `!=`, not `is not`. This used to be load-bearing for a bad reason --
+        # `self.dtype` built a fresh `PyDtype` on every read, so identity was
+        # never true even for the same dtype. That is fixed (docs/BIND.md §9;
+        # `t.dtype is torch.float32` holds now, and `aten.baddbmm.default`'s
+        # decomposition stopped promoting float32 to float64 with it). It
+        # stays `!=` anyway, because `device` on the next line has no such
+        # contract upstream and a mixed pair of predicates here would read as
+        # a distinction that means something. Both types define `__eq__`.
         wants_dtype = dtype is not None and dtype != self.dtype
         wants_device = device is not None and device != self.device
         if not (wants_dtype or wants_device or copy):
@@ -3296,6 +3311,60 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     setattr(tensorbase, "softmax", softmax)
 
 
+def _install_tensor_chunk(tensorbase, dispatch) -> None:
+    """`Tensor.chunk(chunks, dim=0)`, transcribed from upstream's composite.
+
+    `aten::chunk` is `CompositeImplicitAutograd`: it never reaches a kernel,
+    it picks between two ops that do. So it is Python-level here for the same
+    reason `softmax` is -- a `methods.json` entry would name
+    `aten.chunk.default`, a key no dispatcher ever sees. The body is
+    `at::native::chunk` (`aten/src/ATen/native/TensorShape.cpp`) line for
+    line, including the zero-extent branch, whose comment upstream says what
+    it is for: `split` with a split size of 0 would discard the requested
+    number of chunks, because an arbitrary number of empty chunks sums to
+    zero all the same.
+
+    Measured with a `TorchDispatchMode` logger on torch 2.13.0:
+
+        arange(10).chunk(3)  -> aten.split.Tensor          shapes 4,4,2
+        arange(10).chunk(4)  -> aten.split.Tensor          shapes 3,3,3,1
+        arange(10).chunk(5)  -> aten.split.Tensor          shapes 2,2,2,2,2
+        arange(3).chunk(7)   -> aten.split.Tensor          shapes 1,1,1  (three, not seven)
+        empty(0).chunk(3)    -> aten.split_with_sizes      shapes 0,0,0  (three, not one)
+
+    The last two are the reason this is the real arithmetic rather than an
+    even division: `chunks` is an upper bound on how many pieces come back,
+    not a promise, and only the zero-extent case is allowed to return exactly
+    `chunks` of them.
+
+    Returns a `tuple`, which is what upstream's `THPVariable_chunk` returns;
+    `_aten_dispatch` hands back a `list` from `split`, so the conversion is
+    here and is not cosmetic (`a, b = t.chunk(2)` works either way, but
+    `t.chunk(2) + (x,)` does not).
+    """
+
+    def chunk(self, chunks, dim=0):
+        if self.dim() == 0:
+            raise RuntimeError("chunk expects at least a 1-dimensional tensor")
+        if chunks <= 0:
+            raise RuntimeError(
+                f"chunk expects `chunks` to be greater than 0, got: {chunks}"
+            )
+        dim_size = self.shape[dim]
+        split_size = (dim_size + chunks - 1) // chunks
+        if split_size == 0 and dim_size == 0:
+            sizes = [split_size] * chunks
+            sizes[chunks - 1] = split_size - (split_size * chunks - dim_size)
+            return tuple(
+                dispatch("aten.split_with_sizes.default", self, sizes, dim)
+            )
+        return tuple(dispatch("aten.split.Tensor", self, split_size, dim))
+
+    chunk.__name__ = "chunk"
+    chunk.__qualname__ = "TensorBase.chunk"
+    setattr(tensorbase, "chunk", chunk)
+
+
 def _install_tensor_scalars(tensorbase, dispatch) -> None:
     """`item()` and `__bool__`, both of which leave the tensor world.
 
@@ -3348,8 +3417,8 @@ def _install_tensor_scalars(tensorbase, dispatch) -> None:
         setattr(tensorbase, name, fn)
 
 
-def _install_tensor_indexing(tensorbase, dispatch) -> None:
-    """`x[...]`, decomposed the way `THPVariable_getitem` decomposes it.
+def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
+    """`x[...]` and `x[...] = v`, decomposed the way upstream decomposes them.
 
     Upstream's indexing is not one aten call; it is a walk over the index that
     emits `select.int` for an integer, `slice.Tensor` for a slice, `unsqueeze`
@@ -3367,32 +3436,39 @@ def _install_tensor_indexing(tensorbase, dispatch) -> None:
     and every step goes through `_aten_dispatch`. What it does *not* do is
     mixed basic-and-advanced indexing: an index containing both a tensor and a
     non-trivial slice is refused by name instead of being approximated.
+
+    `__setitem__` is the same walk read backwards, and the measurements that
+    shape it are in its own docstring.
     """
+
+    # Located with `is`, never with `==` or `.index()`: an index tuple may
+    # hold a tensor, and `TensorBase.__eq__` now answers with a mask.
+    # `tuple.index(Ellipsis)` would compare its way there elementwise.
+    def _expand_ellipsis(self, index):
+        ellipses = [k for k, item in enumerate(index) if item is Ellipsis]
+        if not ellipses:
+            return index
+        if len(ellipses) > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        consumed = sum(
+            1 for item in index if item is not None and item is not Ellipsis
+        )
+        at = ellipses[0]
+        fill = (slice(None),) * max(self.dim() - consumed, 0)
+        return index[:at] + fill + index[at + 1 :]
+
+    def _is_full_slice(item):
+        return (
+            isinstance(item, slice)
+            and item.start is None
+            and item.stop is None
+            and item.step is None
+        )
 
     def __getitem__(self, index):
         if not isinstance(index, tuple):
             index = (index,)
-        # Located with `is`, never with `==` or `.index()`: an index tuple may
-        # hold a tensor, and `TensorBase.__eq__` now answers with a mask.
-        # `tuple.index(Ellipsis)` would compare its way there elementwise.
-        ellipses = [k for k, item in enumerate(index) if item is Ellipsis]
-        if ellipses:
-            if len(ellipses) > 1:
-                raise IndexError("an index can only have a single ellipsis ('...')")
-            consumed = sum(
-                1 for item in index if item is not None and item is not Ellipsis
-            )
-            at = ellipses[0]
-            fill = (slice(None),) * max(self.dim() - consumed, 0)
-            index = index[:at] + fill + index[at + 1 :]
-
-        def _is_full_slice(item):
-            return (
-                isinstance(item, slice)
-                and item.start is None
-                and item.stop is None
-                and item.step is None
-            )
+        index = _expand_ellipsis(self, index)
 
         if any(isinstance(item, tensorbase) for item in index):
             if any(
@@ -3447,6 +3523,90 @@ def _install_tensor_indexing(tensorbase, dispatch) -> None:
     __getitem__.__name__ = "__getitem__"
     __getitem__.__qualname__ = "TensorBase.__getitem__"
     setattr(tensorbase, "__getitem__", __getitem__)
+
+    # What `torch.tensor(v)` infers for a bare Python number, which is what
+    # upstream's `lift_fresh` is lifting in the traces below. `bool` is tested
+    # first because it subclasses `int` (same rule as `_tensor_factory`).
+    def _lift(value):
+        if isinstance(value, tensorbase):
+            return value
+        if isinstance(value, bool):
+            dtype = module.bool
+        elif isinstance(value, int):
+            dtype = module.int64
+        else:
+            dtype = module.float32
+        return dispatch("aten.scalar_tensor.default", value, dtype=dtype)
+
+    def __setitem__(self, index, value):
+        """`x[...] = v`, and the half of it this shim cannot do.
+
+        Measured with a `TorchDispatchMode` logger on torch 2.13.0, with the
+        `zeros`/`ones` that built the operands stripped out:
+
+            x[t] = tensor      -> [lift_fresh, lift_fresh, index_put_.default]
+            x[t] = 5.0         -> [lift_fresh, lift_fresh, index_put_.default]
+            x[boolmask] = 1.0  -> [lift_fresh, lift_fresh, index_put_.default]
+            x[:, t] = tensor   -> [lift_fresh, index_put_.default]  (indices [None, t])
+            x[:] = tensor      -> [copy_.default]
+            x[...] = tensor    -> [copy_.default]
+            x[:] = 3.0         -> [lift_fresh, fill_.Tensor]
+            x[0] = 3.0         -> [select.int, copy_.default]
+            x[1:3] = tensor    -> [slice.Tensor, copy_.default]
+
+        The first seven are reproduced. **The last two are refused**, and the
+        reason is not a missing kernel: `aten.select.int` and
+        `aten.slice.Tensor` both have kernels here and both return a *copy*,
+        because a candle tensor is a value. Probed on this build:
+
+            s = select.int(x, 0, 1); copy_(s, v)   ->  x unchanged
+            s = slice.Tensor(y, 0, 1, 3, 1); copy_(s, v) -> y unchanged
+
+        So the upstream sequence would run to completion, report success, and
+        write nothing. That is the silent-divergence direction DESIGN.md §5
+        exists to keep out, so it refuses by name instead and says what is
+        missing: mutable views, not an operator.
+        """
+        if not isinstance(index, tuple):
+            index = (index,)
+        index = _expand_ellipsis(self, index)
+
+        if any(isinstance(item, tensorbase) for item in index):
+            if any(
+                not (item is None or isinstance(item, tensorbase) or _is_full_slice(item))
+                for item in index
+            ):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__setitem__ mixing "
+                    "a tensor index with integer or slice indices -- upstream applies "
+                    "basic indexing first and then aten.index_put_, and this shim "
+                    "does not reproduce that composition yet"
+                )
+            indices = [item if isinstance(item, tensorbase) else None for item in index]
+            dispatch("aten.index_put_.default", self, indices, _lift(value), False)
+            return
+
+        if all(_is_full_slice(item) for item in index):
+            # `x[:] = ...` narrows nothing, so the "view" upstream writes
+            # through is the tensor itself and there is no view problem.
+            if isinstance(value, tensorbase):
+                dispatch("aten.copy_.default", self, value)
+            else:
+                dispatch("aten.fill_.Tensor", self, _lift(value))
+            return
+
+        raise NotImplementedError(
+            "not implemented in torch._C shim: TensorBase.__setitem__ with integer "
+            "or partial-slice indices -- upstream narrows to a view with "
+            "aten.select.int / aten.slice.Tensor and writes through it with "
+            "aten.copy_.default, and this shim's select and slice return copies "
+            "rather than views, so that sequence would report success and change "
+            "nothing. The gap is mutable views, not an operator"
+        )
+
+    __setitem__.__name__ = "__setitem__"
+    __setitem__.__qualname__ = "TensorBase.__setitem__"
+    setattr(tensorbase, "__setitem__", __setitem__)
 
     def __len__(self):
         if self.dim() == 0:

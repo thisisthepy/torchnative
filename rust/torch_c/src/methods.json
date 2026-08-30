@@ -68,7 +68,47 @@
     "also gets its own entry, because `Tensor.split_with_sizes` is a real",
     "method upstream too. This is unlike `softmax` above -- there the parser",
     "key and the dispatch key genuinely disagree and no table entry could ever",
-    "be right; here both keys are real and simply depend on the argument."
+    "be right; here both keys are real and simply depend on the argument.",
+    "",
+    "The seven entries added for Mixtral (docs/GROUPED_MM.md §6.4), and what",
+    "is worth knowing about each:",
+    "",
+    "  * `__idiv__` is not a typo for `__itruediv__`. `torch/_tensor.py:1115`",
+    "    assigns `Tensor.__itruediv__ = _C.TensorBase.__idiv__` -- the C name",
+    "    kept the Python 2 spelling. Measured: `x /= t` dispatches",
+    "    `aten.div_.Tensor`. MoE normalises router weights with `/=`.",
+    "  * `div_` carries the `_mode` overloads for the same reason `div` does:",
+    "    `str? rounding_mode` has no default, so those two only bind when the",
+    "    caller passes `rounding_mode=`. Neither `_mode` overload has a kernel",
+    "    here, so they name a work item rather than compute one.",
+    "  * `div_.Scalar` is listed and upstream never reaches it: measured,",
+    "    `x.div_(2.0)` dispatches `aten.div_.Tensor`, because torch's frontend",
+    "    wraps the number into a tensor before it picks an overload and this",
+    "    resolver does not. Exactly the divergence `div`/`add`/`sub` already",
+    "    have, and the one docs/GROUPED_MM.md §6.2 records for",
+    "    `floor_divide.Scalar`.",
+    "  * `ge`/`__ge__` complete the comparison set -- `le`, `lt`, `gt`, `eq`",
+    "    and `ne` all had both spellings and `ge` had neither. Note that",
+    "    `ge.Tensor` has **no kernel** in this shim while `le.Tensor`,",
+    "    `lt.Tensor` and `gt.Tensor` do, so `x >= tensor` resolves and then",
+    "    refuses by name. That is a missing kernel, not a missing name, and it",
+    "    is listed here so it is a precise work item.",
+    "  * `clamp_` follows the `.pyi` order -- Tensor overload first -- and the",
+    "    measurement agrees with it rather than contradicting it:",
+    "    `x.clamp_(max=6)` lands on `aten.clamp_.default` because an `int`",
+    "    does not bind `Tensor? max`, and `x.clamp_(max=tensor)` lands on",
+    "    `aten.clamp_.Tensor`. Same shape as `masked_fill`, whose Tensor-first",
+    "    order has held since this table was written. `clamp_.Tensor` has no",
+    "    kernel here.",
+    "  * `masked_fill_` is `masked_fill`'s in-place twin, same order, and its",
+    "    `.Tensor` overload is likewise kernel-less.",
+    "",
+    "`chunk` and `__setitem__` were part of the same Mixtral batch and are",
+    "*not* here: both are Python-level members in bootstrap.py, for the",
+    "reasons given there. `chunk` is `CompositeImplicitAutograd` upstream and",
+    "lowers to `split.Tensor` or `split_with_sizes` depending on its",
+    "arguments, so no single key is right; `__setitem__` is a walk over the",
+    "index like `__getitem__`, not one call."
   ],
 
   "mul": [
@@ -93,6 +133,16 @@
   "__truediv__": [
     "aten::div.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::div.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "div_": [
+    "aten::div_.Tensor_mode(Tensor(a!) self, Tensor other, *, str? rounding_mode) -> Tensor(a!)",
+    "aten::div_.Scalar_mode(Tensor(a!) self, Scalar other, *, str? rounding_mode) -> Tensor(a!)",
+    "aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "__idiv__": [
+    "aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
   ],
 
   "add": [
@@ -190,6 +240,14 @@
     "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
+  "ge": [
+    "aten::ge.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ge.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__ge__": [
+    "aten::ge.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ge.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
 
   "bitwise_and": [
     "aten::bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor",
@@ -281,6 +339,10 @@
     "aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor",
     "aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor"
   ],
+  "masked_fill_": [
+    "aten::masked_fill_.Tensor(Tensor(a!) self, Tensor mask, Tensor value) -> Tensor(a!)",
+    "aten::masked_fill_.Scalar(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)"
+  ],
 
   "argmax": [
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
@@ -364,5 +426,9 @@
   ],
   "zero_": [
     "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "clamp_": [
+    "aten::clamp_.Tensor(Tensor(a!) self, Tensor? min=None, Tensor? max=None) -> Tensor(a!)",
+    "aten::clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)"
   ]
 }

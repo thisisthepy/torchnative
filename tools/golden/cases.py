@@ -3708,6 +3708,10 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
             note="src (1,2) broadcasts to fill dst (2,2) in place",
         )
     )
+    cases.extend(
+        c for c in _setitem_member_cases(torch_module, c_module)
+        if c.op == "aten.copy_.default"
+    )
     return cases
 
 
@@ -5655,6 +5659,10 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             ),
         )
     )
+    cases.extend(
+        c for c in _setitem_member_cases(torch_module, c_module)
+        if c.op == "aten.fill_.Tensor"
+    )
     return cases
 
 
@@ -6253,6 +6261,12 @@ def split_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch("aten.split.Tensor", self=kw_c, split_size=3, dim=0),
             value_check=_chunk_list_check,
         )
+    )
+    # `Tensor.chunk` lowers here (docs/GROUPED_MM.md §6.4). Its cases live
+    # with the other member spellings; this is where they join the suite.
+    cases.extend(
+        c for c in _chunk_member_cases(torch_module, c_module)
+        if c.op == "aten.split.Tensor"
     )
     return cases
 
@@ -8533,6 +8547,10 @@ def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
             value_check=_chunk_list_check,
         )
     )
+    cases.extend(
+        c for c in _chunk_member_cases(torch_module, c_module)
+        if c.op == "aten.split_with_sizes.default"
+    )
     return cases
 
 
@@ -9096,6 +9114,7 @@ def ge_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="NaN is not >= anything, including itself",
         )
     )
+    cases.extend(_ge_member_cases(torch_module, c_module))
     return cases
 
 
@@ -9443,6 +9462,7 @@ def clamp__default_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: \"result type Float can't be cast to the desired output type Int\"",
         )
     )
+    cases.extend(_clamp__member_cases(torch_module, c_module))
     return cases
 
 
@@ -9504,6 +9524,7 @@ def div__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: \"output with shape [3, 1] doesn't match the broadcast shape [3, 2]\"",
         )
     )
+    cases.extend(_div__member_cases(torch_module, c_module))
     return cases
 
 
@@ -9567,6 +9588,7 @@ def masked_fill__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                  "selected_hidden_states_g.masked_fill_(sentinel_mask, 0.0)",
         )
     )
+    cases.extend(_masked_fill__member_cases(torch_module, c_module))
     return cases
 
 
@@ -9640,6 +9662,10 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
                 op, self=kw_self_c, indices=[kw_idx_c], values=kw_val_c, accumulate=False
             ),
         )
+    )
+    cases.extend(
+        c for c in _setitem_member_cases(torch_module, c_module)
+        if c.op == "aten.index_put_.default"
     )
     return cases
 
@@ -10542,6 +10568,381 @@ def grouped_mm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    return cases
+
+
+# --- the Python-level member spellings (docs/GROUPED_MM.md §6.4) ------------
+#
+# Everything above calls `torch.ops.aten.<op>.<ov>` on the torch side and
+# `_C._aten_dispatch(key, ...)` on the shim side. That compares the *kernels*,
+# and it compared them correctly while `tensor.clamp_(...)`,
+# `tensor >= 3`, `tensor.chunk(3)` and `tensor[idx] = v` all still raised
+# `NotImplementedError` -- the seven names Mixtral needed had kernels the whole
+# time and no way in. So the kernel cases could not have caught it, and a name
+# with no case is a name nobody checks.
+#
+# These cases go through the *member* on both sides. `run_torch` calls
+# `t.clamp_(max=3)` on a real `torch.Tensor`, `run_c` calls `t.clamp_(max=3)`
+# on a `TensorBase`, and the harness diffs the two results exactly as before.
+# Deleting a `methods.json` entry, or the `chunk`/`__setitem__` installers in
+# `bootstrap.py`, fails these and nothing else.
+#
+# In-place members follow the same rule as every other in-place case here:
+# a fresh operand pair per case, never shared, or an earlier mutation leaks
+# into a later expectation.
+
+
+def _member_case(torch_module, c_module, op, name, dtype_name, pairs, call, expect="match",
+                 note="", value_check=None) -> Case:
+    """One case whose two sides are the same *member* call on the two tensor
+    types. `pairs` is a list of `(torch_tensor, c_tensor)`; `call` is applied
+    to whichever side's tensors, so the two sides cannot drift apart."""
+    return Case(
+        name=name,
+        op=op,
+        run_torch=lambda: call(torch_module, *[p[0] for p in pairs]),
+        run_c=lambda: call(c_module, *[p[1] for p in pairs]),
+        expect=expect,
+        note=note,
+        value_check=value_check,
+    )
+
+
+def _chunk_tuple_check(t_res, c_res) -> tuple[bool, str]:
+    """`Tensor.chunk` returns a `tuple` upstream (`THPVariable_chunk`), while
+    `torch.ops.aten.split.Tensor` returns a `list`. The container type is part
+    of the answer -- `t.chunk(2) + (x,)` works and `list + tuple` does not --
+    so it is checked before the chunks are."""
+    for label, res in (("torch", t_res), ("c", c_res)):
+        if not isinstance(res, tuple):
+            return False, f"{label} side returned {type(res).__name__}, not tuple"
+    return _chunk_list_check(t_res, c_res)
+
+
+def _ge_member_cases(torch_module, c_module) -> list[Case]:
+    op = "aten.ge.Scalar"
+    cases: list[Case] = []
+    # Three spellings of one kernel. `__ge__` is the one that was missing;
+    # `ge` and the `>=` operator are what a caller actually writes.
+    for spelling, call in (
+        ("x.__ge__(3)", lambda m, a: a.__ge__(3)),
+        ("x.ge(3)", lambda m, a: a.ge(3)),
+        ("x >= 3", lambda m, a: a >= 3),
+    ):
+        for dtype_name in ["float32", "int64", "int32"]:
+            pair = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+            cases.append(
+                _member_case(
+                    torch_module, c_module, op,
+                    f"member {spelling} (dtype={dtype_name})", dtype_name, [pair], call,
+                    note="mixtral's sentinel_mask = expert_ids_g >= num_experts, through "
+                         "the member rather than the dispatch key",
+                )
+            )
+    # NaN is not >= anything, including itself -- the same fact the kernel
+    # case asserts, re-asserted on the path a caller takes.
+    pair = pair_from_flat(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x >= 1.0 with NaN (dtype=float32)", "float32", [pair],
+            lambda m, a: a >= 1.0,
+            note="every comparison against NaN is false, including through __ge__",
+        )
+    )
+    return cases
+
+
+def _div__member_cases(torch_module, c_module) -> list[Case]:
+    op = "aten.div_.Tensor"
+    cases: list[Case] = []
+    # `div_` and `__idiv__` reach the same kernel. `torch/_tensor.py:1115`
+    # spells `Tensor.__itruediv__` as `_C.TensorBase.__idiv__`, which is why
+    # `x /= y` needs the second one and not just the first.
+    for spelling, call in (
+        ("x.div_(y)", lambda m, a, b: a.div_(b)),
+        ("x.__idiv__(y)", lambda m, a, b: a.__idiv__(b)),
+    ):
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            a_pair = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), dtype_name)
+            b_pair = pair_from_flat(torch_module, c_module, [2.0, 4.0, 5.0], (3, 1), dtype_name)
+            cases.append(
+                _member_case(
+                    torch_module, c_module, op,
+                    f"member {spelling} (dtype={dtype_name}, other (3,1) broadcasts)",
+                    dtype_name, [a_pair, b_pair], call,
+                    note="mixtral: top_k_weights /= top_k_weights.sum(-1, keepdim=True)",
+                )
+            )
+    # Refused on both sides: true division cannot write back into an integer
+    # receiver. The member has to refuse it too, not silently truncate.
+    a_pair = pair_from_flat(torch_module, c_module, [4, 8], (2,), "int64")
+    b_pair = pair_from_flat(torch_module, c_module, [2, 4], (2,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.div_(y) (dtype=int64) [refused on both sides]", "int64",
+            [a_pair, b_pair], lambda m, a, b: a.div_(b), expect="both_error",
+            note="result type Float can't be cast to the desired output type Long",
+        )
+    )
+    return cases
+
+
+def _clamp__member_cases(torch_module, c_module) -> list[Case]:
+    op = "aten.clamp_.default"
+    cases: list[Case] = []
+    for dtype_name in ["int64", "int32", "float32", "float64"]:
+        pair = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), dtype_name)
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member x.clamp_(max=3) (dtype={dtype_name})", dtype_name, [pair],
+                lambda m, a: a.clamp_(max=3),
+                note="mixtral's exact call shape: max only, min absent, by keyword",
+            )
+        )
+    pair = pair_from_flat(torch_module, c_module, [1, 5, 10, -3], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.clamp_(2, 8) (dtype=float32, both bounds positional)", "float32",
+            [pair], lambda m, a: a.clamp_(2, 8),
+            note="positional min/max bind the same overload the keyword form does",
+        )
+    )
+    # Both bounds absent. Upstream raises RuntimeError from the kernel; the
+    # shim resolves to `clamp_.Tensor` (the `.pyi` lists the Tensor overload
+    # first and `None` binds it) and refuses by name because that overload has
+    # no kernel. Different message, same refusal -- `both_error` is the
+    # honest expectation, and it is here so that neither side starts
+    # *computing* a no-op.
+    pair = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.clamp_() with no bounds [refused, NOT a no-op]", "float32",
+            [pair], lambda m, a: a.clamp_(), expect="both_error",
+            note="torch: \"At least one of 'min' or 'max' must not be None\"; shim: "
+                 "resolves clamp_.Tensor, which has no kernel",
+        )
+    )
+    return cases
+
+
+def _masked_fill__member_cases(torch_module, c_module) -> list[Case]:
+    op = "aten.masked_fill_.Scalar"
+    cases: list[Case] = []
+    for dtype_name in ["float32", "float64", "int64"]:
+        pair = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (4,), dtype_name)
+        mask = pair_from_flat(torch_module, c_module, [True, False, True, False], (4,), "bool")
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member x.masked_fill_(mask, 0) (dtype={dtype_name})", dtype_name,
+                [pair, mask], lambda m, a, b: a.masked_fill_(b, 0),
+                note="mixtral's pre- and post-masks, through the member",
+            )
+        )
+    # A large negative fill is the sentinel-masking shape mixtral uses, and
+    # the value most likely to expose a dtype-narrowing bug.
+    pair = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    mask = pair_from_flat(torch_module, c_module, [True, False, False, True], (2, 2), "bool")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x.masked_fill_(mask, -1e30) (dtype=float32) [sentinel masking]",
+            "float32", [pair, mask], lambda m, a, b: a.masked_fill_(b, -1e30),
+            note="the large-negative fill an attention mask writes",
+        )
+    )
+    return cases
+
+
+def _chunk_member_cases(torch_module, c_module) -> list[Case]:
+    """`Tensor.chunk` is `CompositeImplicitAutograd`: it lowers to
+    `split.Tensor`, or to `split_with_sizes` when the dimension is empty. Both
+    kernels were already here; the composition was not. Every case below is a
+    place where "divide the extent by `chunks`" gives the wrong answer, which
+    is why the composition is transcribed from upstream rather than guessed."""
+    cases: list[Case] = []
+    for dtype_name in ["float32", "int64"]:
+        for chunks, note in (
+            (3, "10 into 3 -- (4,4,2), NOT (3,3,3,1): the size is rounded UP"),
+            (4, "10 into 4 -- (3,3,3,1)"),
+            (5, "10 into 5 -- exact"),
+            (1, "10 into 1 -- one whole chunk"),
+            (10, "10 into 10 -- ten singletons"),
+        ):
+            pair = pair_from_flat(torch_module, c_module, list(range(10)), (10,), dtype_name)
+            cases.append(
+                _member_case(
+                    torch_module, c_module, "aten.split.Tensor",
+                    f"member x.chunk({chunks}) (dtype={dtype_name}, extent 10)", dtype_name,
+                    [pair], lambda m, a, chunks=chunks: a.chunk(chunks),
+                    value_check=_chunk_tuple_check, note=note,
+                )
+            )
+    # `chunks` is an upper bound, not a promise: 3 elements into 7 chunks
+    # gives THREE chunks, because the size rounds up to 1.
+    pair = pair_from_flat(torch_module, c_module, [0, 1, 2], (3,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.split.Tensor",
+            "member x.chunk(7) on extent 3 [three chunks come back, not seven]",
+            "int64", [pair], lambda m, a: a.chunk(7),
+            value_check=_chunk_tuple_check,
+            note="chunks is an upper bound; ceil(3/7) == 1 so split_size 1 gives three",
+        )
+    )
+    # A non-zero dim, and a negative one.
+    for dim, note in ((1, "chunk on dim 1"), (-1, "chunk on a negative dim")):
+        pair = pair_from_flat(torch_module, c_module, list(range(12)), (3, 4), "float32")
+        cases.append(
+            _member_case(
+                torch_module, c_module, "aten.split.Tensor",
+                f"member x.chunk(3, {dim}) on (3,4)", "float32", [pair],
+                lambda m, a, dim=dim: a.chunk(3, dim),
+                value_check=_chunk_tuple_check, note=note,
+            )
+        )
+    # The zero-extent branch, which is the only one that goes through
+    # `split_with_sizes` and the only one that returns exactly `chunks`.
+    pair = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.split_with_sizes.default",
+            "member x.chunk(3) on an EMPTY dim [three empty chunks, not one]",
+            "float32", [pair], lambda m, a: a.chunk(3),
+            value_check=_chunk_tuple_check,
+            note="split_size is 0 here, and `split` would discard the chunk count -- "
+                 "upstream branches to split_with_sizes for exactly this case",
+        )
+    )
+    # Refusals, both of them upstream's own checks.
+    pair = pair_from_flat(torch_module, c_module, list(range(10)), (10,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.split.Tensor",
+            "member x.chunk(0) [refused]", "float32", [pair],
+            lambda m, a: a.chunk(0), expect="both_error",
+            note="torch: 'chunk expects `chunks` to be greater than 0, got: 0'",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [1.0], (), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.split.Tensor",
+            "member x.chunk(3) on a 0-d tensor [refused]", "float32", [pair],
+            lambda m, a: a.chunk(3), expect="both_error",
+            note="torch: 'chunk expects at least a 1-dimensional tensor'",
+        )
+    )
+    return cases
+
+
+def _setitem_member_cases(torch_module, c_module) -> list[Case]:
+    """`x[...] = v`. `__setitem__` is a walk over the index like
+    `__getitem__`, and only part of that walk is reproducible here -- see the
+    member's docstring in `bootstrap.py`. The reproducible part is cased
+    against upstream; the rest is refused by name and pinned in
+    `test_shim.py::test_setitem_refuses_the_basic_index_write_rather_than_dropping_it`,
+    where the *reason* (select/slice return copies, not views) is what is
+    asserted rather than the refusal alone."""
+
+    def assigned(fn):
+        # `__setitem__` returns None, so every case has to hand back the
+        # mutated receiver for the pipeline to compare.
+        def run(m, a, *rest):
+            fn(a, *rest)
+            return a
+        return run
+
+    cases: list[Case] = []
+    op = "aten.index_put_.default"
+    for dtype_name in ["float32", "int64", "int32"]:
+        zeros = [0] * 5
+        vals = [7, 8, 9]
+        pair = pair_from_flat(torch_module, c_module, zeros, (5,), dtype_name)
+        idx = pair_from_flat(torch_module, c_module, [0, 2, 4], (3,), "int64")
+        values = pair_from_flat(torch_module, c_module, vals, (3,), dtype_name)
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member x[idx] = values (dtype={dtype_name})", dtype_name,
+                [pair, idx, values],
+                assigned(lambda a, i, v: a.__setitem__(i, v)),
+                note="mixtral's exact call shape: inv_perm[perm] = arange(perm.size(0)), "
+                     "written the way the model writes it",
+            )
+        )
+    # A repeated index: last write wins, the same rule the kernel case pins,
+    # re-checked through the subscript.
+    pair = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    idx = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    values = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[idx] = values with a repeated index [last write wins]", "int64",
+            [pair, idx, values], assigned(lambda a, i, v: a.__setitem__(i, v)),
+            note="index [0,0,0] with values [1,2,3] leaves x[0] == 3",
+        )
+    )
+    # A bool mask index. Upstream routes it through the same `index_put_`
+    # (measured: `x[boolmask] = 1.0` dispatches `aten.index_put_.default`),
+    # and this shim resolves the *name* correctly and then refuses inside the
+    # kernel: `rust/torch_c/src/aten.rs`'s `index_put_` is written on top of
+    # `scatter`, which wants an int32/int64 index. **That is a missing kernel
+    # capability, not a missing name** -- the subscript path above works for
+    # integer indices -- so it is recorded as `c_error` rather than left
+    # uncased. Promote to "match" when the kernel grows a mask path.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    mask = pair_from_flat(torch_module, c_module, [True, False, True, False], (4,), "bool")
+    values = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[boolmask] = values (dtype=float32) [c_error -- kernel gap]",
+            "float32", [pair, mask, values],
+            assigned(lambda a, mk, v: a.__setitem__(mk, v)), expect="c_error",
+            note="torch computes [1,0,2,0]; the shim's index_put_ is built on scatter, "
+                 "which raises \"Expected dtype int32 or int64 for index, got bool\"",
+        )
+    )
+    # `x[:] = tensor` narrows nothing, so upstream reaches `copy_` rather than
+    # `index_put_` -- measured -- and so does this.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    src = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.copy_.default",
+            "member x[:] = tensor (dtype=float32)", "float32", [pair, src],
+            assigned(lambda a, s: a.__setitem__(slice(None), s)),
+            note="measured: a full slice emits no narrowing op, so this is aten.copy_",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    src = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.copy_.default",
+            "member x[...] = tensor (dtype=float32)", "float32", [pair, src],
+            assigned(lambda a, s: a.__setitem__(Ellipsis, s)),
+            note="an ellipsis over every dimension expands to full slices",
+        )
+    )
+    # ...and a scalar on the right of a full slice reaches `fill_`, not
+    # `copy_`. Also measured, and the two are easy to conflate.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.fill_.Tensor",
+            "member x[:] = 3.0 (dtype=float32) [fill_, not copy_]", "float32", [pair],
+            assigned(lambda a: a.__setitem__(slice(None), 3.0)),
+            note="measured: upstream lifts the number and dispatches aten.fill_.Tensor",
+        )
+    )
     return cases
 
 

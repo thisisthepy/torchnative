@@ -16,6 +16,10 @@
   부르고 있었습니다**(§3.4).
 - **분해 후 값이 달라지는가.** §6. 이번에 열린 규칙 중 **산술을 하는 것 두 개**(`matmul`,
   `isin`)까지 포함해 여전히 비트 단위로 일치합니다.
+- **패스가 거절하는 세 벽 중 세 번째에 예제가 있는가.** **없습니다** (2026-08-30). 마지막
+  예제였던 `aten.baddbmm.default` 의 dtype 승격이 고쳐졌고(§7.2, 원인은 docs/BIND.md §9),
+  훑어본 결과 그 자리를 물려받는 op 이 없습니다. 벽은 그대로이고 그것을 건드리는 op 이
+  없는 것이며, "없다" 를 확인한 방법과 그 확인이 실패할 수 있다는 것은 §7.2.1 입니다.
 - **ExecuTorch Edge 까지 얼마나 남았는가.** §8. 분해는 필요조건이고 충분조건이 아닙니다.
 
 바뀐 파일: `rust/torch_c/src/bootstrap.py`, `rust/torch_c/src/overloads.json`,
@@ -371,9 +375,11 @@ aten.where.ScalarOther  같음
 `aten.is_floating_point.default` 는 텐서가 아닌 결과를 냅니다. 구간의 *출력*으로는 캡처가 이름을
 대고 거절하고, 구간 *안의* 노드로는 기록될 수 있습니다.
 
-#### 규칙이 기록과 다른 결과를 냄 (1)
+#### 규칙이 기록과 다른 결과를 냄 (0) — 2026-08-30 기준
 
-`aten.baddbmm.default` — §7.2.
+`aten.baddbmm.default` 이 여기 있었고, 지금은 없습니다. dtype 항등성이 고쳐져 낮아집니다
+(§7.2). **이 칸을 채우는 op 이 지금은 하나도 없습니다** — 훑어서 확인한 결과이고, 어떻게
+확인했는지와 그 확인이 실패할 수 있다는 것을 §7.2.1 이 적습니다.
 
 ---
 
@@ -431,6 +437,10 @@ ep.run_decompositions(core_aten_decompositions())
 그때 차이가 나오면 **허용치를 넓히는 것이 아니라 크기를 재서 여기에 적어야 합니다**
 (docs/DEVICE.md §5 — 허용치보다 이름 붙인 예외).
 
+셋 중 `baddbmm` 이 2026-08-30 에 열렸습니다 (§7.2). `bmm` + `add.Tensor` 가 되고, 재생 결과가
+eager 와 값·shape·dtype 모두 일치합니다 — 이번에도 커널이 겹쳐서가 아니라, 분해가 실제로 같은
+함수이기 때문입니다. `silu` 와 `_safe_softmax` 는 여전히 §4 의 두 번째 열에 있습니다.
+
 §5 의 프로그램과 이전 판본의 7→8 노드 프로그램 둘 다, 기록에 쓰이지 않은 입력 셋
 (`× 0.5` · `× -2.0` · `× 7.25`)에서 낮춘 트레이스 · 기록된 트레이스 · eager 가 전부 일치합니다.
 
@@ -451,17 +461,74 @@ ep.run_decompositions(core_aten_decompositions())
 `sum(x, dim=[], dtype=None)` 을 만들어 그 경로의 첫 호출자가 되었습니다. `mean.dim` 이 같은
 커널을 공유해 같은 수정으로 함께 고쳐졌습니다.
 
-### 7.2 `aten.baddbmm.default` 분해의 dtype 승격 — **아직**
+### 7.2 `aten.baddbmm.default` 분해의 dtype 승격 — **고쳐짐** (2026-08-30)
 
 ```
                        입력           분해 결과 dtype
 상류  baddbmm(f32, f32, f32)          float32
-여기  baddbmm(f32, f32, f32)          float64
+전    baddbmm(f32, f32, f32)          float64
+지금  baddbmm(f32, f32, f32)          float32   → aten.bmm.default, aten.add.Tensor 로 낮아집니다
 ```
 
-상류의 `baddbmm` 분해는 `beta`/`alpha` 를 파이썬 float 로 곱합니다. 상류에서는 파이썬 스칼라가
-텐서의 dtype 을 끌어올리지 않는데, 여기서는 float64 로 승격됩니다. **분해 경로만의 문제가
-아니라 스칼라 승격 규칙의 발산**입니다. 아직 어느 op 에서 나오는지 좁히지 않았습니다.
+**원인은 스칼라 승격 규칙이 아니라 `TensorBase.dtype` 의 반환값이었습니다.** 이전 판본은 "아직
+어느 op 에서 나오는지 좁히지 않았습니다" 라고 적어 두었는데, docs/BIND.md §9 가 그것을 찾아냈고
+`b8c3ea1` 이 고쳤습니다.
+
+`tensor.rs` 의 getter 가 읽을 때마다 새 `PyDtype` 를 만들었습니다. `__eq__` 는 태그를 비교하므로
+`t.dtype == torch.float32` 는 언제나 옳았지만, **`t.dtype is torch.float32` 는 어떤 텐서에
+대해서도, 어떤 dtype 에 대해서도, 매번 `False`** 였습니다 — `t.dtype is t.dtype` 조차
+`False` 였습니다.
+
+상류의 `torch/_prims_common/__init__.py::get_higher_dtype` 는 이렇게 시작합니다:
+
+```python
+    a, b = _extract_dtype(a), _extract_dtype(b)
+    if a is b:
+        return a
+```
+
+이 한 줄이 `ordered_datatypes` 표로 떨어지지 않게 막는 가드입니다. `baddbmm` 의 상류 규칙에는
+`@pw_cast_for_opmath` 가 붙어 있어 `elementwise_dtypes` → `get_higher_dtype` 를 지나가는데,
+**float32 두 개가 `is` 로 같지 않으니 가드를 지나쳐 표로 떨어졌고, 거기서 float64 가 나왔습니다.**
+분해 결과가 기록과 다른 dtype 을 내놓았고 패스가 그것을 잡아 거절했습니다 — 정확히 옳은
+동작이었고, 진짜 결함이었습니다.
+
+dtype 이 이제 인턴되므로 규칙과 기록이 일치하고, 트레이스는 거절되는 대신 낮아집니다.
+`test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton` 이 세 고리를 전부
+못박습니다: 항등성 계약 자체, 낮아진 op 목록, 그리고 재생 결과가 eager 와 float32 로 같다는 것.
+
+**그리고 이것이 §7 세 번째 벽의 마지막 예제였습니다.** 아래를 보십시오.
+
+### 7.2.1 벽 3 에는 지금 예제가 없습니다 — 그리고 그것은 발견이지 누락이 아닙니다
+
+`decompose` 의 세 벽은 그대로입니다:
+
+1. 규칙이 아예 없음 — `aten.reshape.default`
+2. 규칙이 있고, 실행하다 이 shim 에 없는 것을 만남 — `aten.zeros_like.default`
+3. 규칙이 있고, 실행되고, **기록과 다른 결과를 냄** — **지금 이것을 하는 op 이 없습니다**
+
+벽 3 자체가 사라진 것이 아닙니다. `decompose` 는 여전히 모든 분해 결과의 meta 를 기록과
+대조하고 여전히 불일치에 거절합니다. 사라진 것은 **그것을 건드리는 op** 입니다.
+
+없다는 것은 찾아보고 내린 결론입니다. 두 가지로 훑었습니다:
+
+- `pytests/decomp_sweep.py` — 구현된 비 Core op 전체(모집단 38 개). 결과: LOWERED 10,
+  REFUSED 26(전부 벽 1 또는 벽 2), CAPTURE_RAISED 1, NO_CASE 2. **DISAGREES 0.**
+- 낮아지는 그 10 개를 dtype 8 종 · 여러 shape · `beta`/`alpha` 조합 · 다중 op 트레이스로 넓혀
+  **188 개 트레이스**를 분해. **DISAGREES 0.**
+
+`aten.sum.default` 가 §7.1 로, `aten.t.default` 가 §3 으로 옮겨간 것과 같은 일이 세 번째로
+일어났고, 이번에는 자리를 물려받을 op 이 없었습니다. **없는 것을 지어내지 않았습니다** — 꾸며낸
+불일치는 이 저장소가 반복해서 잡아내는 "실패할 수 없는 검사" 그 자체입니다.
+
+**없다고 단언하는 검사는 그 자체로 실패할 수 있어야 합니다.** 그래서
+`test_decompose_refuses_by_name_what_it_cannot_lower` 는 인구조사와 **양성 대조**를 함께
+단언합니다: `_meta_matches` 를 강제로 불일치시키면 같은 프로브가 `DISAGREES` 를 보고하고,
+되돌리면 `LOWERED` 로 돌아옵니다. 이 대조가 없으면 "아무 op 도 불일치하지 않는다" 는
+**대조 자체가 조용히 멈춰도 똑같이 통과**합니다 — CLAUDE.md §5.5 가 세 번 잡아낸 그 실패
+양식입니다.
+
+벽 3 에 새 예제가 생기면 그 단언이 이름을 대고 빨개지고, 그때가 이 절을 되돌릴 때입니다.
 
 ### 7.3 스칼라가 앞에 오는 호출 — 새로 드러남
 
@@ -567,7 +634,7 @@ CompositeImplicitAutograd registrations: 744/744    상류와 대조 (§3.2)
 | `sigmoid` · `full_like` · `tensor_split` 커널 | 표만으로는 안 열립니다 (§4). `aten.rs` |
 | `softmax` 합성 | `softmax.int` 는 상류에서 CIA 이므로 `overloads.json` 이 아니라 `_install_composites` 가 자리입니다. `_safe_softmax` 하나가 걸려 있습니다 |
 | 스칼라 선행 인자 (§7.3) | 해석기의 바인딩 규칙 문제. `rsub.Scalar` 가 여기 걸립니다 |
-| §7.2 `baddbmm` dtype | 고치지 않았습니다. 테스트가 현재 동작을 못박아 두었습니다 |
+| ~~§7.2 `baddbmm` dtype~~ | **고쳐졌습니다** (2026-08-30). 원인은 `TensorBase.dtype` 의 비인턴 반환값이었습니다 — docs/BIND.md §9. 벽 3 에는 이제 예제가 없고, 그것을 확인한 방법은 §7.2.1 |
 | C++ CIA 커널 436 개 (§8) | 프로젝트의 전제에 걸려 있습니다. 열 방법이 있는지부터 미정입니다 |
 | `.out` 변형 1148 개 | `pyyaml` 을 의존성으로 받아들이면 전부. 지금은 도달 불가라는 것이 확인됩니다 (§8) |
 | functionalization (view → `_copy`) | 없음 (§8). 이 패스가 아닙니다 |
