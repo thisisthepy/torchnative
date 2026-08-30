@@ -1830,6 +1830,183 @@ pub(crate) fn amax_keepdim(source: &Tensor, dim: usize) -> candle_core::Result<T
     source.apply_op1_no_bwd(&AMax { dim })
 }
 
+// ---------------------------------------------------------------------------
+// Scaling and causal masking, in one pass.
+//
+// `sdpa_flash_cpu`'s default branch used to spend three full passes over the
+// `[batch, head, S, S]` score matrix, plus an `S x S` allocation, getting from
+// the raw `q @ kT` product to a masked, scaled one:
+//
+//     scores.affine(scale, 0.0)                 one pass, read + write
+//     build an S x S `Vec<f64>` of 0 / -inf     scalar push loop, then a
+//                                               narrowing pass to `acc`
+//     scores.broadcast_add(&mask)               another pass, read + write
+//
+// Measured inside the op at S=1024 (docs/SEQLEN.md §8.2): 1.450 + 2.100 +
+// 2.133 = 5.68 ms of a 21.2 ms call, thirty times a forward. The mask is the
+// same mask on all thirty of those calls and on every forward after it.
+//
+// This does the whole of it in one pass and allocates nothing but the output.
+// ---------------------------------------------------------------------------
+
+/// The elements `scale_and_causal_mask` can compute, which are exactly the two
+/// `sdpa_flash_cpu` accumulates in -- `f32`, and `f64` when the caller asked
+/// for `float64`. Reduced precision never reaches here: SDPA widens `f16` and
+/// `bf16` to `f32` before the score matrix exists.
+trait ScoreScalar: Copy {
+    const ZERO: Self;
+    const NEG_INFINITY: Self;
+    /// The multiplier candle would have used. `Affine` narrows the `f64`
+    /// scale to the tensor's own dtype *before* multiplying
+    /// (`T::from_f64(self.0)`), so narrowing here too is not a shortcut --
+    /// multiplying in `f64` and narrowing after would round twice and is a
+    /// different number.
+    fn from_f64(v: f64) -> Self;
+    fn mul_add_zero(self, mul: Self) -> Self;
+    fn add(self, other: Self) -> Self;
+}
+
+macro_rules! score_scalar {
+    ($t:ty) => {
+        impl ScoreScalar for $t {
+            const ZERO: Self = 0.0;
+            const NEG_INFINITY: Self = <$t>::NEG_INFINITY;
+            #[inline(always)]
+            fn from_f64(v: f64) -> Self {
+                v as $t
+            }
+            #[inline(always)]
+            fn mul_add_zero(self, mul: Self) -> Self {
+                // `v * mul + add` with `add` zero, spelled out rather than
+                // simplified to `v * mul`. The `+ 0.0` is not a no-op: it
+                // turns a `-0.0` product into `+0.0`, and candle's `Affine`
+                // does it, so dropping it would be a different answer for
+                // every score whose product is a negative zero.
+                //
+                // Two operations and not `mul_add`: Rust does not contract
+                // this to an FMA and neither does candle, and an FMA would
+                // round once where these round twice.
+                self * mul + Self::ZERO
+            }
+            #[inline(always)]
+            fn add(self, other: Self) -> Self {
+                self + other
+            }
+        }
+    };
+}
+
+score_scalar!(f32);
+score_scalar!(f64);
+
+/// One matrix of the batch: `v * scale + 0.0` everywhere, and `+ -inf` on the
+/// strictly-upper triangle.
+///
+/// **`+ -inf` and not `= -inf`.** For a finite product the two agree, but for
+/// a `+inf` product `+inf + -inf` is a NaN where an assignment would have
+/// written `-inf`, and a NaN product stays a NaN either way. The old two-op
+/// path went through `broadcast_add`, so the addition is what has to be
+/// reproduced -- not the intent behind it.
+#[inline]
+fn scale_and_mask_rows<T: ScoreScalar>(
+    src: &[T],
+    out: &mut Vec<T>,
+    rows: usize,
+    cols: usize,
+    mul: T,
+) {
+    for r in 0..rows {
+        let row = &src[r * cols..(r + 1) * cols];
+        // Upper-left aligned, which is the alignment `sdpa_flash_cpu`
+        // measured upstream to use: column `c` survives when `c <= r`.
+        let keep = (r + 1).min(cols);
+        out.extend(row[..keep].iter().map(|&v| v.mul_add_zero(mul)));
+        out.extend(
+            row[keep..]
+                .iter()
+                .map(|&v| v.mul_add_zero(mul).add(T::NEG_INFINITY)),
+        );
+    }
+}
+
+/// The `CustomOp1` that carries `scale_and_mask_rows` across the storage
+/// boundary, the same mechanism `AMax` above uses and docs/VIEWS.md §6.2
+/// describes.
+struct ScaleCausal {
+    scale: f64,
+}
+
+impl candle_core::CustomOp1 for ScaleCausal {
+    fn name(&self) -> &'static str {
+        "torch._C shim: scale + causal mask"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &CpuStorage,
+        layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, candle_core::Shape)> {
+        let dims = layout.dims();
+        if dims.len() < 2 {
+            return Err(candle_core::Error::Msg(format!(
+                "torch._C shim: a causal mask needs a rank-2 or deeper score \
+                 matrix, got rank {}",
+                dims.len()
+            )));
+        }
+        let (rows, cols) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+        // Contiguity is the caller's job, as it is for `AMax`. `q.matmul(&kt)`
+        // hands back a fresh contiguous tensor, so this never fires from SDPA
+        // -- it is here so that a future caller with a view gets an error
+        // rather than a silently transposed answer.
+        let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
+            candle_core::Error::Msg(
+                "torch._C shim: scale + causal mask wants a contiguous score matrix"
+                    .to_string(),
+            )
+        })?;
+        let n = end - start;
+        macro_rules! run {
+            ($arm:ident, $values:expr, $t:ty) => {{
+                let src = &$values[start..end];
+                let mut out: Vec<$t> = Vec::with_capacity(n);
+                let mul = <$t as ScoreScalar>::from_f64(self.scale);
+                if rows * cols > 0 {
+                    for mat in src.chunks_exact(rows * cols) {
+                        scale_and_mask_rows(mat, &mut out, rows, cols, mul);
+                    }
+                }
+                CpuStorage::$arm(out)
+            }};
+        }
+        let out = match storage {
+            CpuStorage::F32(v) => run!(F32, v, f32),
+            CpuStorage::F64(v) => run!(F64, v, f64),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "torch._C shim: scale + causal mask has a kernel for float32 and \
+                     float64 only -- SDPA widens the reduced precisions before the \
+                     score matrix exists"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok((out, candle_core::Shape::from(dims.to_vec())))
+    }
+}
+
+/// `scores.affine(scale, 0.0)` followed by adding an upper-triangular `-inf`
+/// mask, in one pass and with no mask allocated.
+///
+/// Bit-for-bit the two-op spelling it replaces, element by element -- there is
+/// no reassociation to argue about because nothing is reduced here.
+/// docs/SEQLEN.md §8.3 has the argument and §8.4 the test that would catch it
+/// being wrong.
+pub(crate) fn scale_and_causal_mask(source: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
+    let source = source.contiguous()?;
+    source.apply_op1_no_bwd(&ScaleCausal { scale })
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
@@ -1982,5 +2159,245 @@ mod amax_tests {
         let ours = amax_keepdim(&t, 1).unwrap().to_vec2::<f32>().unwrap()[0][0];
         assert_eq!(candle, 3.0, "candle's ReduceIndex no longer skips NaN");
         assert!(ours.is_nan(), "amax must propagate NaN, upstream's rule");
+    }
+}
+
+#[cfg(test)]
+mod scale_causal_tests {
+    use super::*;
+    use crate::reduced::FastDType;
+
+    fn cpu() -> candle_core::Device {
+        candle_core::Device::Cpu
+    }
+
+    /// The two-op path this replaces, transcribed from the `sdpa_flash_cpu`
+    /// that was there before -- `affine(scale, 0.0)` and then a
+    /// `broadcast_add` of an `f64` upper-triangular mask narrowed to the
+    /// tensor's dtype.
+    ///
+    /// It is written out here rather than referenced so that the test keeps
+    /// comparing against the *old* arithmetic even after the call site is
+    /// gone. If the two ever have to disagree, this is the thing that says so.
+    fn two_op_reference(t: &Tensor, scale: f64) -> Tensor {
+        let dims = t.dims();
+        let (rows, cols) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+        let scaled = t.affine(scale, 0.0).unwrap();
+        let mut mask = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                mask.push(if c <= r { 0.0f64 } else { f64::NEG_INFINITY });
+            }
+        }
+        let mask = Tensor::from_vec(mask, (rows, cols), t.device())
+            .unwrap()
+            .fast_to(t.dtype())
+            .unwrap();
+        scaled.broadcast_add(&mask).unwrap()
+    }
+
+    fn bits32(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// The values that make the three easy mistakes visible.
+    ///
+    /// A kernel written the obvious way -- `= -inf` above the diagonal,
+    /// `v * mul` with the `+ 0.0` dropped, the scale multiplied in `f64` --
+    /// agrees with the reference on every ordinary finite number. It is only
+    /// these that separate them, so a sweep of well-behaved values would be a
+    /// test that cannot fail. Each entry is annotated with which mistake it
+    /// catches.
+    fn awkward() -> Vec<f32> {
+        vec![
+            0.0,                   // -- ordinary
+            -0.0,                  // `+ 0.0` dropped: product stays -0.0
+            -1.0,                  // `+ 0.0` dropped, via a negative product
+            1.0,
+            -2.5,
+            3.75,
+            f32::INFINITY,         // `= -inf` instead of `+ -inf`: NaN vs -inf
+            f32::NEG_INFINITY,
+            f32::NAN,              // must survive as a NaN on both sides
+            f32::MIN_POSITIVE,     // scale narrowing: underflow to zero
+            f32::MIN_POSITIVE / 3.0, // subnormal
+            -f32::MIN_POSITIVE / 3.0,
+            f32::MAX,              // scale narrowing: overflow to inf
+            -f32::MAX,
+            1.0 + f32::EPSILON,    // needs a real rounding
+            16_777_217.0,          // 2^24 + 1, not representable
+        ]
+    }
+
+    /// Bit-for-bit against the two-op path, over shapes that straddle the
+    /// diagonal in both directions and a batch dimension, with the awkward
+    /// values tiled so that each one lands both inside and outside the mask.
+    #[test]
+    fn scaling_and_masking_in_one_pass_matches_the_two_op_path_bit_for_bit() {
+        let vals = awkward();
+        // Scales that are exact, that are not, and that push the extremes over
+        // the edge in both directions.
+        for &scale in &[1.0f64, 0.125, 0.1, 3.0, 1e30, 1e-30, -0.125] {
+            for &(rows, cols) in &[
+                (1usize, 1usize),
+                (1, 5),
+                (5, 1),
+                (2, 2),
+                (3, 4),
+                (4, 3),
+                (7, 7),
+                (17, 16),
+                (16, 17),
+                (33, 33),
+            ] {
+                for &batch in &[1usize, 3] {
+                    let n = batch * rows * cols;
+                    // Rotate the offset with the row length so a value that is
+                    // masked in one shape is kept in another.
+                    let data: Vec<f32> =
+                        (0..n).map(|i| vals[(i * 7 + rows) % vals.len()]).collect();
+                    let t = Tensor::from_vec(data, (batch, rows, cols), &cpu()).unwrap();
+                    let want = two_op_reference(&t, scale);
+                    let got = scale_and_causal_mask(&t, scale).unwrap();
+                    assert_eq!(
+                        got.dims(),
+                        want.dims(),
+                        "shape, batch={batch} {rows}x{cols}"
+                    );
+                    assert_eq!(
+                        bits32(&got),
+                        bits32(&want),
+                        "scale={scale} batch={batch} {rows}x{cols}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The rank-4 shape SDPA actually produces, and the only one the call site
+    /// ever hands over: `[batch, head, S, S]`.
+    #[test]
+    fn the_rank_four_score_shape_sdpa_produces_matches_too() {
+        let vals = awkward();
+        for s in [1usize, 2, 8, 33] {
+            let n = 2 * 3 * s * s;
+            let data: Vec<f32> = (0..n).map(|i| vals[(i * 11 + s) % vals.len()]).collect();
+            let t = Tensor::from_vec(data, (2, 3, s, s), &cpu()).unwrap();
+            let want = two_op_reference(&t, 0.125);
+            let got = scale_and_causal_mask(&t, 0.125).unwrap();
+            assert_eq!(got.dims(), &[2, 3, s, s]);
+            assert_eq!(bits32(&got), bits32(&want), "S={s}");
+        }
+    }
+
+    /// `float64`, which `sdpa_flash_cpu` accumulates in when the caller asked
+    /// for it. Same claim, different scalar -- and the `f64` arm is a separate
+    /// instantiation, so it needs its own check rather than inheriting one.
+    #[test]
+    fn the_float64_arm_matches_the_two_op_path_too() {
+        let vals: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            -1.0,
+            2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            1.0 + f64::EPSILON,
+        ];
+        for &scale in &[1.0f64, 0.125, 0.1, 1e300] {
+            for &(rows, cols) in &[(1usize, 1usize), (5, 5), (17, 16), (16, 17)] {
+                let n = 2 * rows * cols;
+                let data: Vec<f64> = (0..n).map(|i| vals[(i * 3 + cols) % vals.len()]).collect();
+                let t = Tensor::from_vec(data, (2, rows, cols), &cpu()).unwrap();
+                let want = two_op_reference(&t, scale)
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f64>()
+                    .unwrap();
+                let got = scale_and_causal_mask(&t, scale)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f64>()
+                    .unwrap();
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "f64 scale={scale} {rows}x{cols}");
+            }
+        }
+    }
+
+    /// The diagonal itself, isolated: exactly the elements with `c <= r`
+    /// survive. An off-by-one in `keep` moves one element per row, which the
+    /// bit comparison above would also catch -- this says *which* element in a
+    /// failure message, and it fails for a shape with no awkward values in it
+    /// at all.
+    #[test]
+    fn the_mask_keeps_the_diagonal_and_nothing_to_its_right() {
+        let s = 6usize;
+        let data: Vec<f32> = (0..s * s).map(|i| (i + 1) as f32).collect();
+        let got = scale_and_causal_mask(
+            &Tensor::from_vec(data.clone(), (s, s), &cpu()).unwrap(),
+            2.0,
+        )
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+        for r in 0..s {
+            for c in 0..s {
+                let v = got[r * s + c];
+                if c <= r {
+                    assert_eq!(
+                        v,
+                        data[r * s + c] * 2.0,
+                        "row {r} column {c} should have survived"
+                    );
+                } else {
+                    assert_eq!(
+                        v,
+                        f32::NEG_INFINITY,
+                        "row {r} column {c} should have been masked"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A view is refused rather than silently read in storage order. Nothing
+    /// in SDPA can hand one over -- `matmul` returns a fresh contiguous tensor
+    /// -- so this pins the guard, not a behaviour anyone depends on.
+    #[test]
+    fn a_non_contiguous_score_matrix_is_refused() {
+        let t = Tensor::from_vec((0..24).map(|i| i as f32).collect::<Vec<_>>(), (2, 3, 4), &cpu())
+            .unwrap();
+        // `scale_and_causal_mask` makes it contiguous first, so the refusal has
+        // to be provoked at the kernel itself.
+        let tr = t.transpose(0, 2).unwrap();
+        assert!(!tr.is_contiguous());
+        let err = tr.apply_op1_no_bwd(&ScaleCausal { scale: 1.0 });
+        assert!(err.is_err(), "a transposed score matrix must be refused");
+        // ...and the public entry point copes with exactly that tensor.
+        assert_eq!(
+            bits32(&scale_and_causal_mask(&tr, 0.5).unwrap()),
+            bits32(&two_op_reference(&tr.contiguous().unwrap(), 0.5))
+        );
+    }
+
+    /// Rank 1 has no score matrix in it and is told so by name.
+    #[test]
+    fn a_rank_one_tensor_is_refused_by_name() {
+        let t = Tensor::from_vec(vec![1.0f32, 2.0], 2, &cpu()).unwrap();
+        let err = scale_and_causal_mask(&t, 1.0).unwrap_err().to_string();
+        assert!(err.contains("rank-2"), "unhelpful message: {err}");
     }
 }

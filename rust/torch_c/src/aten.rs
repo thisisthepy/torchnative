@@ -3098,30 +3098,37 @@ fn sdpa_flash_cpu(
         // Default: candle's tensor ops. The right mathematics, and an
         // arithmetic that is upstream's only to within a tolerance.
         // ------------------------------------------------------------------
-        let mut scores = k
+        let raw = k
             .transpose(2, 3)
+            // The `contiguous` is not decoration. Dropping it -- letting candle
+            // hand the transposed layout straight to Accelerate as a
+            // `transa='T'` GEMM, which it does support -- works, is 5% faster
+            // at S=512, and **changes the answer at S=6**: the prefill digest
+            // moved, measured. A different GEMM blocking is a different
+            // summation order. docs/SEQLEN.md §8.5.
             .and_then(|kt| kt.contiguous())
             .and_then(|kt| q.matmul(&kt))
-            .and_then(|s| s.affine(scale, 0.0))
             .map_err(|e| candle_err(OP, e))?;
 
-        let (rows, cols) = {
-            let dims = scores.dims();
-            (dims[2], dims[3])
-        };
-        if is_causal {
+        // `affine(scale, 0.0)` and then a `broadcast_add` of an upper-
+        // triangular `-inf` mask was three full passes over
+        // `[batch, head, S, S]` plus an `S x S` `Vec<f64>` rebuilt on every one
+        // of the thirty calls a forward makes -- 5.68 ms of a 21.2 ms call at
+        // S=1024, measured inside the op. One pass now, and nothing allocated
+        // but the output.
+        //
+        // The arithmetic per element is the same arithmetic: element-wise work
+        // has no summation order to reassociate, and
+        // `tensor.rs::scale_and_causal_mask` is checked bit-for-bit against the
+        // two-op spelling it replaces -- including the `+ 0.0` that turns a
+        // negative-zero product positive and the `+ -inf` that turns a positive
+        // infinity into a NaN. docs/SEQLEN.md §8.3.
+        let mut scores = if is_causal {
             // Upper-left aligned, per the measurement above.
-            let mut mask = Vec::with_capacity(rows * cols);
-            for r in 0..rows {
-                for c in 0..cols {
-                    mask.push(if c <= r { 0.0f64 } else { f64::NEG_INFINITY });
-                }
-            }
-            let mask = Tensor::from_vec(mask, (rows, cols), scores.device())
-                .and_then(|t| t.fast_to(acc))
-                .map_err(|e| candle_err(OP, e))?;
-            scores = scores.broadcast_add(&mask).map_err(|e| candle_err(OP, e))?;
-        }
+            crate::tensor::scale_and_causal_mask(&raw, scale).map_err(|e| candle_err(OP, e))?
+        } else {
+            raw.affine(scale, 0.0).map_err(|e| candle_err(OP, e))?
+        };
         if let Some(mask) = attn_mask.as_ref() {
             let mask = mask
                 .tensor()?

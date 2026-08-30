@@ -5469,6 +5469,67 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
+    # The other side of that shape -- MORE query rows than keys, causal. Rows
+    # past the last key attend all of them, so the mask stops widening part way
+    # down and every row below it is entirely unmasked. Both causal cases above
+    # have `q_len <= kv_len` and never reach that, which left the clamp in
+    # `tensor.rs::scale_and_mask_rows` (`keep = (r + 1).min(cols)`) with no
+    # case at all: without it the kernel indexes past the end of the row.
+    # Upstream accepts this shape and answers finitely -- measured at three
+    # shapes before these cases were written. docs/SEQLEN.md §8.
+    for q_len, kv_len in [(5, 2), (9, 3)]:
+        qn = _deterministic(1 * 2 * q_len * e, 7)
+        kn = _deterministic(1 * 2 * kv_len * e, 8)
+        vn = _deterministic(1 * 2 * kv_len * e, 9)
+        for dtype_name in ["float64", "float32"]:
+            q_t, q_c = pair_from_flat(torch_module, c_module, qn, (1, 2, q_len, e), dtype_name)
+            k_t, k_c = pair_from_flat(torch_module, c_module, kn, (1, 2, kv_len, e), dtype_name)
+            v_t, v_c = pair_from_flat(torch_module, c_module, vn, (1, 2, kv_len, e), dtype_name)
+            cases.append(
+                Case(
+                    name=f"sdpa_flash_cpu(dtype={dtype_name}, q_len={q_len}, "
+                    f"kv_len={kv_len}, is_causal=True)",
+                    op=op,
+                    run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t: torch_call(
+                        q_t, k_t, v_t, 0.0, True
+                    ),
+                    run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c: c_module._aten_dispatch(
+                        op, q_c, k_c, v_c, 0.0, True
+                    ),
+                    value_check=_sdpa_pair_check,
+                    note="more query rows than keys -- the causal mask stops widening "
+                    "part way down, the only shape that exercises the clamp",
+                )
+            )
+
+    # A causal block several rows deep with a scale that is not representable.
+    # `0.1` is the value at which narrowing the scale after the multiply rather
+    # than before gives a different `float32` -- the fault docs/SEQLEN.md §8.4
+    # lists seventh -- and the three-by-three cases above all use the default
+    # `1/sqrt(head_dim)`, which for `head_dim=4` is exactly 0.5.
+    wide = 9
+    for dtype_name in ["float64", "float32"]:
+        qn = _deterministic(1 * 2 * wide * e, 10)
+        kn = _deterministic(1 * 2 * wide * e, 11)
+        vn = _deterministic(1 * 2 * wide * e, 12)
+        q_t, q_c = pair_from_flat(torch_module, c_module, qn, (1, 2, wide, e), dtype_name)
+        k_t, k_c = pair_from_flat(torch_module, c_module, kn, (1, 2, wide, e), dtype_name)
+        v_t, v_c = pair_from_flat(torch_module, c_module, vn, (1, 2, wide, e), dtype_name)
+        cases.append(
+            Case(
+                name=f"sdpa_flash_cpu(dtype={dtype_name}, 9x9 is_causal, scale=0.1)",
+                op=op,
+                run_torch=lambda q_t=q_t, k_t=k_t, v_t=v_t: torch_call(
+                    q_t, k_t, v_t, 0.0, True, scale=0.1
+                ),
+                run_c=lambda q_c=q_c, k_c=k_c, v_c=v_c: c_module._aten_dispatch(
+                    op, q_c, k_c, v_c, 0.0, True, scale=0.1
+                ),
+                value_check=_sdpa_pair_check,
+                note="a scale that is not representable, over a mask several rows deep",
+            )
+        )
+
     # The refusals, all four measured on upstream first.
     q_t, q_c = pair_from_flat(torch_module, c_module, q_flat, shape, "float32")
     k_t, k_c = pair_from_flat(torch_module, c_module, k_flat, shape, "float32")
