@@ -3649,9 +3649,9 @@ def test_meta_reciprocal_floats_an_integral_input():
     `set_default_dtype(torch.float64)` the integral rows give float64 while the
     float32 row stays float32.
 
-    Only `reciprocal` is added here. `cos`/`sin`/`tanh`/`exp`/`rsqrt` share the
-    dense helper and would share this rule, but nothing has asked for them on
-    meta -- a meta kernel nobody reached is a claim nobody checked.
+    `cos`/`sin`/`tanh`/`exp`/`log`/`expm1`/`rsqrt` joined it later and share
+    the rule through `unary_float_tag`; they are covered by
+    `test_meta_unary_promotions_are_the_dense_families_own` below.
     """
     d = _C._aten_dispatch
     meta = _C.device("meta")
@@ -3693,6 +3693,557 @@ def test_meta_reciprocal_floats_an_integral_input():
     assert chain.dtype == _C.float32, chain.dtype
 
 
+# --- the elementwise meta family (docs/META.md §7.1) -------------------------
+#
+# Every test below checks **shape and dtype separately and explicitly**. That
+# is not belt-and-braces: a meta kernel's entire output is those two fields, so
+# a test that reads only `.shape` cannot fail on a dtype fault, and the dtype
+# half is the half that is not guessable from the input -- `gt` answers `bool`
+# whatever went in, `div` on two integers answers a float, `where` takes its
+# dtype from the values and its shape from all three operands.
+#
+# The oracle is upstream torch on meta tensors. Every row was read off
+# `torch.ops.aten.<op>(torch.zeros(..., device="meta"), ...)` on 2.13.0.
+
+
+def _meta_empty(shape, dtype):
+    return _C._aten_dispatch(
+        "aten.empty.memory_format", shape, dtype, device=_C.device("meta")
+    )
+
+
+def test_meta_comparisons_answer_bool_whatever_went_in():
+    """The family the user's `from_pretrained` report stopped on.
+
+    `transformers/modeling_rope_utils.py:655` opens `_compute_llama3_parameters`
+    with `torch.where(wavelen > low_freq_wavelen, ...)`, and `>` on a meta
+    tensor is `aten.gt.Scalar`. `from_pretrained` initialises weights on the
+    meta device, so the whole rope computation runs there; SmolLM2 only worked
+    because it has no `rope_scaling` and its default rope init does no
+    comparisons.
+
+    **The dtype is the point.** All twelve keys answer `torch.bool` regardless
+    of the operand dtype -- measured on 2.13.0 across
+    `{float32, float16, bfloat16, float64, int64, int32, int16, uint8, bool}`
+    and both integer and float scalars. A kernel that returned the input dtype
+    would still give the right shape, and every shape-only assertion would
+    still pass, which is why the dtype is asserted on its own line below.
+
+    The `Tensor` overloads add the broadcast. `(1,3)` against `(2,1)` is
+    `(2,3)` and `(2,3)` against a 0-dim is `(2,3)` -- the 0-dim row being the
+    one a "shape is the left operand's" shortcut gets right by accident.
+    """
+    d = _C._aten_dispatch
+    SCALAR = [
+        "aten.eq.Scalar", "aten.ne.Scalar", "aten.lt.Scalar",
+        "aten.le.Scalar", "aten.ge.Scalar", "aten.gt.Scalar",
+    ]
+    TENSOR = [op.replace(".Scalar", ".Tensor") for op in SCALAR]
+    DTYPES = [_C.float32, _C.float16, _C.bfloat16, _C.float64,
+              _C.int64, _C.int32, _C.int16, _C.uint8, _C.bool]
+
+    for op in SCALAR:
+        for dtype in DTYPES:
+            for scalar in (1, 1.5, True):
+                out = d(op, _meta_empty([2, 3], dtype), scalar)
+                assert out.is_meta is True, (op, dtype, scalar)
+                assert tuple(out.shape) == (2, 3), (op, dtype, scalar, tuple(out.shape))
+                assert out.dtype == _C.bool, (op, dtype, scalar, out.dtype)
+        # 0-dim in, 0-dim out -- and still bool.
+        out = d(op, _meta_empty([], _C.float32), 1.0)
+        assert tuple(out.shape) == () and out.dtype == _C.bool, op
+
+    for op in TENSOR:
+        for dtype in DTYPES:
+            for lhs, rhs, want in (
+                ([2, 3], [2, 3], (2, 3)),
+                ([1, 3], [2, 1], (2, 3)),
+                ([2, 3], [], (2, 3)),
+                ([], [2, 3], (2, 3)),
+                ([], [], ()),
+                ([4, 1], [1, 5], (4, 5)),
+                ([2, 3], [3], (2, 3)),
+                ([0, 3], [1, 3], (0, 3)),
+            ):
+                out = d(op, _meta_empty(lhs, dtype), _meta_empty(rhs, dtype))
+                assert tuple(out.shape) == want, (op, dtype, lhs, rhs, tuple(out.shape))
+                assert out.dtype == _C.bool, (op, dtype, lhs, rhs, out.dtype)
+
+    # A shape that cannot broadcast is still an error on meta -- upstream's
+    # message, naming both extents and the axis.
+    try:
+        d("aten.gt.Tensor", _meta_empty([2, 3], _C.float32), _meta_empty([4, 5], _C.float32))
+    except RuntimeError as e:
+        assert "must match the size" in str(e), str(e)
+    else:
+        raise AssertionError("meta gt.Tensor broadcast a pair that does not broadcast")
+
+    # And the dense kernel's dtype refusal is the meta kernel's. Upstream
+    # promotes here; this shim does not, on either device, and the meta path
+    # must not be the one that quietly starts (docs/E2E_REAL.md §6.1).
+    try:
+        d("aten.gt.Tensor", _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+    except NotImplementedError as e:
+        assert "promotion" in str(e), str(e)
+    else:
+        raise AssertionError("meta gt.Tensor promoted where the dense kernel refuses")
+
+
+def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kernel():
+    """`add`/`sub`/`mul`/`div`, both overloads, on meta.
+
+    Two rules, and neither is "the input's dtype":
+
+      * **`div` floats an integral pair.** `int64 / int64` is `float32`,
+        measured, because torch's `/` is true division. A kernel that passed
+        the input dtype through would be right for the three other members and
+        wrong only here.
+      * **`mul.Tensor` promotes its operands; the other three require them
+        equal.** That asymmetry is the dense kernel's (`promote_operands` vs
+        `same_dtype`), and the meta arm calls the same two functions rather
+        than restating either.
+
+    Both are `arith_tag`'s, which is why the two paths cannot drift: the meta
+    kernel calls it, so the dtype it advertises is by construction the dtype
+    the dense kernel would produce.
+    """
+    d = _C._aten_dispatch
+    SHAPES = [([2, 3], [2, 3], (2, 3)), ([1, 3], [2, 1], (2, 3)),
+              ([2, 3], [], (2, 3)), ([], [2, 3], (2, 3)), ([], [], ()),
+              ([4, 1], [1, 5], (4, 5)), ([2, 3], [3], (2, 3)),
+              ([0, 3], [1, 3], (0, 3))]
+
+    for op in ("aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"):
+        floats = op == "aten.div.Tensor"
+        for dtype, want in ((_C.float32, _C.float32), (_C.float16, _C.float16),
+                            (_C.bfloat16, _C.bfloat16), (_C.float64, _C.float64),
+                            (_C.int64, _C.float32 if floats else _C.int64),
+                            (_C.int32, _C.float32 if floats else _C.int32),
+                            (_C.uint8, _C.float32 if floats else _C.uint8)):
+            for lhs, rhs, shape in SHAPES:
+                out = d(op, _meta_empty(lhs, dtype), _meta_empty(rhs, dtype))
+                assert out.is_meta is True, (op, dtype)
+                assert tuple(out.shape) == shape, (op, dtype, lhs, rhs, tuple(out.shape))
+                assert out.dtype == want, (op, dtype, lhs, rhs, out.dtype)
+
+    # `mul.Tensor` is the one member that promotes a mixed pair, and the three
+    # others refuse it. Both halves, so that a meta kernel which promoted
+    # everything and one which refused everything both fail.
+    out = d("aten.mul.Tensor", _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+    assert out.dtype == _C.float32, out.dtype
+    out = d("aten.mul.Tensor", _meta_empty([2], _C.float16), _meta_empty([2], _C.bfloat16))
+    assert out.dtype == _C.float32, ("float16 x bfloat16 escapes upwards", out.dtype)
+    for op in ("aten.add.Tensor", "aten.sub.Tensor", "aten.div.Tensor"):
+        try:
+            d(op, _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+        except NotImplementedError as e:
+            assert "promotion" in str(e), (op, str(e))
+        else:
+            raise AssertionError(f"meta {op} promoted where the dense kernel refuses")
+
+    # The `Scalar` overloads, including the two that were absent until the
+    # `Tensor` ones landed. `int64 * 2` stays `int64`; `int64 * 2.0` floats.
+    for op in ("aten.add.Scalar", "aten.sub.Scalar", "aten.mul.Scalar",
+               "aten.div.Scalar", "aten.rsub.Scalar"):
+        floats = op == "aten.div.Scalar"
+        for dtype, scalar, want in (
+            (_C.float32, 2, _C.float32), (_C.float32, 2.0, _C.float32),
+            (_C.float16, 2, _C.float16), (_C.float64, 2, _C.float64),
+            (_C.int64, 2, _C.float32 if floats else _C.int64),
+            (_C.int64, 2.0, _C.float32),
+            (_C.int32, 2, _C.float32 if floats else _C.int32),
+        ):
+            out = d(op, _meta_empty([2, 3], dtype), scalar)
+            assert tuple(out.shape) == (2, 3), (op, dtype, scalar, tuple(out.shape))
+            assert out.dtype == want, (op, dtype, scalar, out.dtype)
+
+    # The promotion reads `set_default_dtype`, as the dense one does. If a meta
+    # kernel had hardcoded float32 this is the line that says so.
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.div.Tensor", _meta_empty([2], _C.int64),
+                 _meta_empty([2], _C.int64)).dtype == _C.float64
+        assert d("aten.mul.Tensor", _meta_empty([2], _C.int64),
+                 _meta_empty([2], _C.int64)).dtype == _C.int64
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+
+def test_meta_where_broadcasts_three_operands_and_takes_dtype_from_the_values():
+    """`where.self` is the one op here with three operands, and both of its
+    rules are the ones that are easy to get wrong.
+
+    **Shape is the join of all three, not the condition's.** Measured on
+    2.13.0: `where(meta_bool(2,1), meta_f32(1,3), meta_f32(3))` is `(2,3)`
+    where a condition-shaped answer would be `(2,1)`, and
+    `where(meta_bool(), f32(2,3), f32(3))` is `(2,3)` where it would be `()`.
+
+    **Dtype comes from the two value operands, not the condition.** The
+    condition is `bool` and the answer is not.
+
+    `where.ScalarOther` is the same join with the third operand a Python
+    scalar, so it broadcasts two and takes `where_scalar_tag`'s wrapped-number
+    rule: a `bool` scalar leaves the tensor's dtype alone, an `int` one lifts
+    only a boolean tensor, a `float` one floats an integral tensor.
+    """
+    d = _C._aten_dispatch
+
+    for dtype in (_C.float32, _C.float16, _C.bfloat16, _C.float64,
+                  _C.int64, _C.int32, _C.uint8, _C.bool):
+        out = d("aten.where.self", _meta_empty([2, 3], _C.bool),
+                _meta_empty([2, 3], dtype), _meta_empty([2, 3], dtype))
+        assert out.is_meta is True, dtype
+        assert tuple(out.shape) == (2, 3), (dtype, tuple(out.shape))
+        assert out.dtype == dtype, ("dtype came from the condition", dtype, out.dtype)
+
+    for cond, lhs, rhs, want in (
+        ([2, 1], [1, 3], [3], (2, 3)),
+        ([], [2, 3], [3], (2, 3)),
+        ([2, 3], [], [], (2, 3)),
+        ([1, 1, 3], [2, 1], [4, 1, 1], (4, 2, 3)),
+        ([2, 3], [2, 3], [2, 3], (2, 3)),
+    ):
+        out = d("aten.where.self", _meta_empty(cond, _C.bool),
+                _meta_empty(lhs, _C.float32), _meta_empty(rhs, _C.float32))
+        assert tuple(out.shape) == want, (cond, lhs, rhs, tuple(out.shape))
+        assert out.dtype == _C.float32, (cond, lhs, rhs, out.dtype)
+
+    # The condition's dtype is one of the few dense checks a meta tensor can
+    # still run in full, since it is carried and never read for values.
+    try:
+        d("aten.where.self", _meta_empty([2, 3], _C.float32),
+          _meta_empty([2, 3], _C.float32), _meta_empty([2, 3], _C.float32))
+    except RuntimeError as e:
+        assert "boolean tensor" in str(e), str(e)
+    else:
+        raise AssertionError("meta where.self accepted a float condition")
+
+    # And the value operands must agree, as they must on the dense path.
+    try:
+        d("aten.where.self", _meta_empty([2], _C.bool),
+          _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+    except NotImplementedError as e:
+        assert "promotion" in str(e), str(e)
+    else:
+        raise AssertionError("meta where.self promoted where the dense kernel refuses")
+
+    for dtype, scalar, want in (
+        (_C.float32, 0.0, _C.float32), (_C.float32, 0, _C.float32),
+        (_C.int64, 0, _C.int64), (_C.int64, 0.0, _C.float32),
+        (_C.bool, 0, _C.int64), (_C.bool, True, _C.bool),
+        (_C.float16, 0.0, _C.float16),
+    ):
+        out = d("aten.where.ScalarOther", _meta_empty([2, 3], _C.bool),
+                _meta_empty([2, 3], dtype), scalar)
+        assert tuple(out.shape) == (2, 3), (dtype, scalar, tuple(out.shape))
+        assert out.dtype == want, (dtype, scalar, out.dtype)
+    for cond, lhs, want in (([2, 1], [1, 3], (2, 3)), ([], [2, 3], (2, 3)),
+                            ([2, 3], [], (2, 3))):
+        out = d("aten.where.ScalarOther", _meta_empty(cond, _C.bool),
+                _meta_empty(lhs, _C.float32), 0.0)
+        assert tuple(out.shape) == want, (cond, lhs, tuple(out.shape))
+
+
+def test_meta_unary_promotions_are_the_dense_families_own():
+    """Three different unary rules, and the test exists because they differ.
+
+      * **`unary_float`** (`cos`, `sin`, `tanh`, `exp`, `log`, `expm1`,
+        `rsqrt`, `reciprocal`): floating in, the *same* floating dtype out --
+        `float16` stays `float16` and is not widened -- and anything else
+        becomes the default float.
+      * **`neg`**: keeps the input dtype, so `int64` in is `int64` out. It is
+        the counter-example to the family above, and it carries two refusals
+        (`bool`, and the wide unsigned dtypes) that the meta path reproduces.
+      * **`bitwise_not`**: keeps the input dtype and refuses floats.
+
+    A single "shape and dtype pass through" implementation would satisfy `neg`
+    and `bitwise_not` and be wrong for every integral input to the first group;
+    a single "promote to float" one would be wrong the other way. Both
+    directions are asserted.
+    """
+    d = _C._aten_dispatch
+    PROMOTING = ("aten.cos.default", "aten.sin.default", "aten.tanh.default",
+                 "aten.exp.default", "aten.log.default", "aten.expm1.default",
+                 "aten.rsqrt.default", "aten.reciprocal.default")
+
+    for op in PROMOTING:
+        for dtype, want in ((_C.float32, _C.float32), (_C.float16, _C.float16),
+                            (_C.bfloat16, _C.bfloat16), (_C.float64, _C.float64),
+                            (_C.int64, _C.float32), (_C.int32, _C.float32),
+                            (_C.int16, _C.float32), (_C.uint8, _C.float32),
+                            (_C.bool, _C.float32)):
+            for shape in ([2, 3], [], [0, 4], [2, 3, 4]):
+                out = d(op, _meta_empty(shape, dtype))
+                assert out.is_meta is True, (op, dtype)
+                assert tuple(out.shape) == tuple(shape), (op, dtype, shape)
+                assert out.dtype == want, (op, dtype, out.dtype)
+
+    for dtype in (_C.float32, _C.float16, _C.bfloat16, _C.float64,
+                  _C.int64, _C.int32, _C.int16, _C.uint8):
+        for shape in ([2, 3], [], [2, 3, 4]):
+            out = d("aten.neg.default", _meta_empty(shape, dtype))
+            assert tuple(out.shape) == tuple(shape), (dtype, shape)
+            assert out.dtype == dtype, ("neg promoted", dtype, out.dtype)
+    try:
+        d("aten.neg.default", _meta_empty([2], _C.bool))
+    except RuntimeError as e:
+        assert "bool tensor is not supported" in str(e), str(e)
+    else:
+        raise AssertionError("meta neg accepted a bool the dense path refuses")
+
+    for dtype in (_C.int64, _C.int32, _C.int16, _C.uint8, _C.bool):
+        out = d("aten.bitwise_not.default", _meta_empty([2, 3], dtype))
+        assert tuple(out.shape) == (2, 3) and out.dtype == dtype, (dtype, out.dtype)
+    try:
+        d("aten.bitwise_not.default", _meta_empty([2], _C.float32))
+    except RuntimeError as e:
+        assert "bitwise_not_cpu" in str(e), str(e)
+    else:
+        raise AssertionError("meta bitwise_not accepted a float")
+
+    # The promoting group reads the default dtype and `neg` does not.
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.exp.default", _meta_empty([2], _C.int64)).dtype == _C.float64
+        assert d("aten.exp.default", _meta_empty([2], _C.float32)).dtype == _C.float32
+        assert d("aten.neg.default", _meta_empty([2], _C.int64)).dtype == _C.int64
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+
+def test_meta_clamp_and_pow_share_the_dense_kernels_dtype_ladders():
+    """The two ops here whose dtype rule is a ladder rather than a one-liner.
+
+    `clamp` out of place **promotes** where `clamp_` refuses, which is the row
+    the golden cases had to correct once. Measured on meta, 2.13.0:
+
+        clamp(int32,  0,     5)      int32
+        clamp(int32,  None,  2.0)    float32
+        clamp(uint8,  None,  2)      uint8
+        clamp(float16,None,  2.0)    float16    a float never widens a float tensor
+        clamp(bool,   0,     5)      int64
+        clamp(bool,   0.0,   1.0)    float32
+        clamp(bool,   False, True)   refused    a bool scalar does not lift a bool tensor
+
+    `pow.Tensor_Scalar` is the wrapped-number rule: an integral tensor with an
+    integer exponent stays integral, a float on either side floats it.
+    `pow.Tensor_Tensor` promotes its operands first, so it hands the promotion
+    -- not an operand's dtype -- to the same function.
+
+    Both meta arms call the dense kernels' own `clamp_result_tag` and
+    `pow_result_tag`, so a change to either rule moves both paths together.
+    """
+    d = _C._aten_dispatch
+
+    for dtype, mn, mx, want in (
+        (_C.int32, 0, 5, _C.int32),
+        (_C.int32, None, 2.0, _C.float32),
+        (_C.uint8, None, 2, _C.uint8),
+        (_C.uint8, None, 2.0, _C.float32),
+        (_C.float16, None, 2.0, _C.float16),
+        (_C.float32, 0.0, None, _C.float32),
+        (_C.bool, 0, 5, _C.int64),
+        (_C.bool, 0.0, 1.0, _C.float32),
+        (_C.int64, 0, 5, _C.int64),
+    ):
+        out = d("aten.clamp.default", _meta_empty([2, 3], dtype), mn, mx)
+        assert out.is_meta is True, (dtype, mn, mx)
+        assert tuple(out.shape) == (2, 3), (dtype, mn, mx, tuple(out.shape))
+        assert out.dtype == want, (dtype, mn, mx, out.dtype)
+    try:
+        d("aten.clamp.default", _meta_empty([2], _C.bool), False, True)
+    except NotImplementedError as e:
+        assert "clamp_scalar_cpu" in str(e), str(e)
+    else:
+        raise AssertionError("meta clamp accepted bool bounds on a bool tensor")
+    try:
+        d("aten.clamp.default", _meta_empty([2], _C.float32), None, None)
+    except RuntimeError as e:
+        assert "must not be None" in str(e), str(e)
+    else:
+        raise AssertionError("meta clamp with no bounds was a no-op")
+
+    for dtype, exponent, want in (
+        (_C.float32, 2, _C.float32), (_C.float32, 2.0, _C.float32),
+        (_C.float16, 2, _C.float16), (_C.float64, 2, _C.float64),
+        (_C.int64, 2, _C.int64), (_C.int64, 2.0, _C.float32),
+        (_C.int32, 2, _C.int32), (_C.int32, 2.0, _C.float32),
+    ):
+        out = d("aten.pow.Tensor_Scalar", _meta_empty([2, 3], dtype), exponent)
+        assert tuple(out.shape) == (2, 3), (dtype, exponent, tuple(out.shape))
+        assert out.dtype == want, (dtype, exponent, out.dtype)
+
+    for lhs, rhs, want in (
+        (_C.float32, _C.float32, _C.float32),
+        (_C.float32, _C.int32, _C.float32),
+        (_C.int64, _C.int32, _C.int64),
+        (_C.float16, _C.bfloat16, _C.float32),
+        (_C.float16, _C.float16, _C.float16),
+    ):
+        out = d("aten.pow.Tensor_Tensor", _meta_empty([2, 3], lhs), _meta_empty([2, 3], rhs))
+        assert tuple(out.shape) == (2, 3), (lhs, rhs, tuple(out.shape))
+        assert out.dtype == want, (lhs, rhs, out.dtype)
+    out = d("aten.pow.Tensor_Tensor", _meta_empty([1, 3], _C.float32),
+            _meta_empty([2, 1], _C.float32))
+    assert tuple(out.shape) == (2, 3), tuple(out.shape)
+
+
+def test_meta_shape_kernels_drop_expand_and_keep_the_triangle():
+    """The three shape kernels the twenty-architecture meta sweep asked for.
+
+    Each was the *next* wall after the one before it, re-measured rather than
+    planned (ARCH20.md §0.2's "a wall is not one wall"): `select.int` for five
+    architectures, then `tril.default` for `gpt_bigcode`, then
+    `expand.default` for `bert`.
+
+      * `select.int` **removes** the dimension, which is what separates it from
+        `slice`. `(2,3,4)` selected on dim 1 is `(2,4)`.
+      * `tril`/`triu` change *which values are zero* and nothing else, so on
+        meta the whole kernel is the rank refusal.
+      * `expand` prepends new dimensions, resolves `-1` against the existing
+        extent, and refuses to stretch a non-singleton one -- including a
+        **zero** extent, which is not singleton for this rule.
+
+    All rows measured against upstream on meta tensors, refusals included.
+    """
+    d = _C._aten_dispatch
+
+    for dtype in (_C.float32, _C.int64, _C.bool):
+        for shape, dim, index, want in (
+            ([2, 3], 0, 0, (3,)), ([2, 3], 1, 2, (2,)), ([2, 3], -1, -1, (2,)),
+            ([2, 3, 4], 1, 0, (2, 4)), ([5], 0, 4, ()), ([2, 1, 3], 1, 0, (2, 3)),
+        ):
+            out = d("aten.select.int", _meta_empty(shape, dtype), dim, index)
+            assert out.is_meta is True, (shape, dim, index)
+            assert tuple(out.shape) == want, (shape, dim, index, tuple(out.shape))
+            assert out.dtype == dtype, (shape, dim, index, out.dtype)
+    for shape, dim, index, exc in (
+        ([2, 3], 0, 2, IndexError), ([2, 3], 0, -3, IndexError),
+        ([2, 3], 2, 0, IndexError), ([], 0, 0, IndexError),
+        ([0, 3], 0, 0, IndexError),
+    ):
+        try:
+            d("aten.select.int", _meta_empty(shape, _C.float32), dim, index)
+        except exc:
+            pass
+        else:
+            raise AssertionError(f"meta select.int accepted {shape} dim={dim} index={index}")
+
+    for op in ("aten.tril.default", "aten.triu.default"):
+        for dtype in (_C.float32, _C.int64, _C.bool):
+            for shape in ([2, 3], [3, 3], [2, 3, 4]):
+                for diagonal in (0, 1, -1, 100, -100):
+                    out = d(op, _meta_empty(shape, dtype), diagonal)
+                    assert tuple(out.shape) == tuple(shape), (op, shape, diagonal)
+                    assert out.dtype == dtype, (op, shape, diagonal, out.dtype)
+        for shape in ([5], []):
+            try:
+                d(op, _meta_empty(shape, _C.float32), 0)
+            except RuntimeError as e:
+                assert "at least 2 dimensions" in str(e), str(e)
+            else:
+                raise AssertionError(f"meta {op} accepted rank {len(shape)}")
+
+    for dtype in (_C.float32, _C.int64):
+        for base, size, want in (
+            ([2, 1, 3], [2, 5, 3], (2, 5, 3)),
+            ([2, 1, 3], [4, 2, 5, 3], (4, 2, 5, 3)),
+            ([2, 1, 3], [2, 4, -1], (2, 4, 3)),
+            ([2, 1, 3], [-1, 4, 3], (2, 4, 3)),
+            ([2, 1, 3], [-1, -1, -1], (2, 1, 3)),
+            ([1], [3], (3,)),
+            ([], [2, 3], (2, 3)),
+            ([2, 3], [2, 3], (2, 3)),
+            ([2, 1], [-1, 3], (2, 3)),
+            # A singleton expands to **zero**, and that is the asymmetric
+            # half of the zero-extent rule: `(1,3) -> (0,3)` is allowed and
+            # `(0,3) -> (2,3)` is not (below). Measured on 2.13.0.
+            ([1, 3], [0, 3], (0, 3)),
+        ):
+            out = d("aten.expand.default", _meta_empty(base, dtype), size)
+            assert tuple(out.shape) == want, (base, size, tuple(out.shape))
+            assert out.dtype == dtype, (base, size, out.dtype)
+    for base, size, needle in (
+        ([3], [2, 4], "must match the existing size"),
+        ([0, 3], [2, 3], "must match the existing size"),
+        ([2, 1, 3], [2, 4], "must be greater or equal"),
+        # The `-1` here is *not* in a leading position (index 3, offset 1), so
+        # it resolves to the existing extent 3 and the refusal comes from
+        # dimension 1 instead. Upstream reports the requested sizes with the
+        # sentinel still in them, which is what this asserts.
+        ([2, 1, 3], [2, 4, 3, -1], "Target sizes: [2, 4, 3, -1]"),
+        # A **zero** extent is not singleton for this rule, which is the case
+        # a `have <= 1` written for `have != 1` would silently accept.
+        ([0, 3], [2, 3], "must match the existing size"),
+        # A leading `-1` has no existing extent to resolve against.
+        ([2, 3], [-1, 2, 3], "leading, non-existing dimension"),
+    ):
+        try:
+            d("aten.expand.default", _meta_empty(base, _C.float32), size)
+        except RuntimeError as e:
+            assert needle in str(e), (base, size, str(e))
+        else:
+            raise AssertionError(f"meta expand accepted {base} -> {size}")
+
+
+def test_the_llama3_rope_init_runs_on_meta_end_to_end():
+    """The user's report, reduced to the expression that failed.
+
+    `transformers/modeling_rope_utils.py::_compute_llama3_parameters`, run
+    op by op on meta tensors. This is the whole of what `from_pretrained`
+    could not do: the rope init succeeded on `cpu` and failed on `meta`, and
+    `from_pretrained` initialises weights on the meta device.
+
+    Asserted **against the same expression run on cpu**, which is the oracle
+    that does not need a network: the meta answer must have the shape and dtype
+    the dense answer has. A meta kernel that returned the right shape and the
+    wrong dtype passes a shape-only test and fails this one.
+    """
+    d = _C._aten_dispatch
+
+    def rope(device):
+        kw = {"device": device} if device is not None else {}
+        # inv_freq = 1.0 / (base ** (arange(0, dim, 2, float32) / dim))
+        inv_freq = d("aten.arange.start_step", 0, 16, 2, _C.float32, **kw)
+        inv_freq = d("aten.div.Scalar", inv_freq, 16)
+        inv_freq = d("aten.pow.Scalar", 10000.0, inv_freq)
+        inv_freq = d("aten.mul.Scalar", d("aten.reciprocal.default", inv_freq), 1.0)
+        # wavelen = 2 * pi / inv_freq
+        wavelen = d("aten.mul.Scalar", d("aten.reciprocal.default", inv_freq), 6.283185307179586)
+        # inv_freq_llama = where(wavelen > low, inv_freq / factor, inv_freq)
+        high = d("aten.gt.Scalar", wavelen, 32.0)
+        llama = d("aten.where.self", high, d("aten.div.Scalar", inv_freq, 8.0), inv_freq)
+        # smooth = (old / wavelen - low_factor) / (high_factor - low_factor)
+        smooth = d("aten.mul.Scalar", d("aten.reciprocal.default", wavelen), 32.0)
+        smooth = d("aten.sub.Scalar", smooth, 1.0)
+        smooth = d("aten.div.Scalar", smooth, 3.0)
+        # smoothed = (1 - smooth) * llama / factor + smooth * llama
+        smoothed = d("aten.add.Tensor",
+                     d("aten.div.Scalar",
+                       d("aten.mul.Tensor", d("aten.rsub.Scalar", smooth, 1.0), llama), 8.0),
+                     d("aten.mul.Tensor", smooth, llama))
+        # is_medium = ~(wavelen < high) * ~(wavelen > low)
+        medium = d("aten.mul.Tensor",
+                   d("aten.bitwise_not.default", d("aten.lt.Scalar", wavelen, 8.0)),
+                   d("aten.bitwise_not.default", high))
+        return d("aten.where.self", medium, smoothed, llama)
+
+    on_meta = rope(_C.device("meta"))
+    on_cpu = rope(None)
+    assert on_meta.is_meta is True and on_cpu.is_meta is False
+    assert tuple(on_meta.shape) == tuple(on_cpu.shape), (
+        tuple(on_meta.shape), tuple(on_cpu.shape))
+    assert on_meta.dtype == on_cpu.dtype, (on_meta.dtype, on_cpu.dtype)
+    assert tuple(on_meta.shape) == (8,), tuple(on_meta.shape)
+    assert on_meta.dtype == _C.float32, on_meta.dtype
+
+    # The intermediate the report named. `wavelen > low_freq_wavelen` is
+    # `aten.gt.Scalar`, and it is `bool` on both devices -- the dtype that,
+    # had the meta kernel guessed "the input's", would have made `where`
+    # refuse one layer later with a message naming the wrong op.
+    assert d("aten.gt.Scalar", _meta_empty([8], _C.float32), 32.0).dtype == _C.bool
+
+
 def test_ops_without_a_meta_kernel_name_themselves():
     """DESIGN.md §6's instrument, pointed at the meta device.
 
@@ -3708,12 +4259,21 @@ def test_ops_without_a_meta_kernel_name_themselves():
     a = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
     b = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
 
+    # `add.Tensor` used to head this list and is now implemented
+    # (docs/META.md §7.1). It was replaced rather than the test deleted: the
+    # boundary moved, it did not disappear, and the reductions, the
+    # contractions and the remaining views are still behind it.
     for op, args in (
-        ("aten.add.Tensor", (a, b)),
         ("aten.mm.default", (a, a)),
+        ("aten.bmm.default", (a, a)),
         ("aten.view.default", (a, [3, 2])),
+        ("aten.reshape.default", (a, [6])),
         ("aten.slice.Tensor", (a, 0, 0, 1)),
         ("aten.sum.default", (a,)),
+        ("aten.mean.dim", (a, [1])),
+        ("aten.cat.default", ([a, b], 0)),
+        ("aten.t.default", (a,)),
+        ("aten.permute.default", (a, [1, 0])),
     ):
         try:
             d(op, *args)
@@ -3722,6 +4282,20 @@ def test_ops_without_a_meta_kernel_name_themselves():
             assert "no meta kernel" in str(e), (op, str(e))
         else:
             raise AssertionError(f"{op} answered on meta without a meta kernel")
+
+    # And the other direction, so that this test cannot pass by the meta table
+    # being *empty*: the ops §7.1 did implement must not name themselves.
+    cond = d("aten.empty.memory_format", [2, 3], _C.bool, device=meta)
+    for op, args in (
+        ("aten.gt.Scalar", (a, 1.0)),
+        ("aten.where.self", (cond, a, b)),
+        ("aten.div.Tensor", (a, b)),
+        ("aten.select.int", (a, 0, 0)),
+        ("aten.expand.default", (a, [2, 3])),
+        ("aten.tril.default", (a, 0)),
+    ):
+        out = d(op, *args)
+        assert out.is_meta is True, op
 
     # `_aten_implemented()` is untouched by any of this: it means "has a kernel
     # *and* tools/golden/cases.py compares it against upstream", and a meta
@@ -7228,8 +7802,19 @@ load("bin_nommap", BIN, disable_mmap=True)
 # The three checkpoint *shapes* docs/E2E_REAL.md §6.2 listed as unmeasured,
 # plus bfloat16, which is what real checkpoints are actually stored in.
 for tag, sub in (("tied", "tied"), ("shard", "shard"), ("bf16", "bf16"),
-                 ("meta", "meta")):
+                 ("meta", "meta"), ("rope3", "rope3")):
     load("hard_" + tag, os.path.join(sys.argv[5], sub))
+
+# --- and the user's line verbatim, on the llama3-rope checkpoint: not just
+# --- `from_pretrained` but the `generate` that follows it.
+try:
+    m = AutoModelForCausalLM.from_pretrained(os.path.join(sys.argv[5], "rope3"))
+    m.eval()
+    with torch.no_grad():
+        out["rope3_generate"] = m.generate(
+            torch.tensor([IDS]), max_new_tokens=8, do_sample=False).tolist()
+except BaseException:
+    out["rope3_generate"] = "FAILED: " + traceback.format_exc(limit=6)
 
 # --- the negative control: the same architecture, weights never loaded.
 try:
@@ -7325,12 +7910,28 @@ def _from_pretrained_fixture():
     #          bytes are not float32.
     #   meta   `nn.Module.state_dict()` attaches a `_metadata` attribute that
     #          `torch.save` pickles alongside the tensors.
+    #   rope3  `rope_scaling={"rope_type": "llama3", ...}`, which is what
+    #          `meta-llama/Llama-3.2-1B` -- README.md's own headline example --
+    #          has and what a plain `LlamaConfig` does not. It is a *meta*
+    #          case, not a container one: `from_pretrained` builds the module
+    #          tree under `init_empty_weights`, so
+    #          `_compute_llama3_parameters` runs on meta tensors, and its
+    #          first line is `torch.where(wavelen > low_freq_wavelen, ...)`.
+    #          Published 0.0.5a0 stopped there with "no meta kernel for
+    #          aten.gt.Scalar" (docs/META.md §7). The plain case cannot see
+    #          this: with no `rope_scaling` the default rope init does no
+    #          comparisons at all, which is why every other row here passed
+    #          while the flagship model did not load.
     hard = os.path.join(root, "hard")
     for tag, kw, extra in (
         ("tied", dict(tie_word_embeddings=True), {}),
         ("shard", dict(num_hidden_layers=3), dict(max_shard_size="6KB")),
         ("bf16", {}, {}),
         ("meta", {}, {}),
+        ("rope3", dict(rope_theta=10000.0, rope_scaling={
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 16,
+        }), {}),
     ):
         conf = dict(_LLAMA_CFG)
         conf.update(kw)
@@ -7349,6 +7950,20 @@ def _from_pretrained_fixture():
                 for k, v in sorted(m.state_dict().items())
             },
         }
+        if tag == "rope3":
+            # The oracle for the user's line. Greedy, so it is a token
+            # sequence and not a tolerance.
+            with torch.no_grad():
+                expected["rope3_generate"] = m.generate(
+                    torch.tensor([_LLAMA_IDS]), max_new_tokens=8,
+                    do_sample=False).tolist()
+            # The rope config must actually have survived into the saved
+            # checkpoint, or this whole row degenerates into a second copy of
+            # the plain case. transformers 5 renames the key, so both
+            # spellings are accepted -- what is asserted is `llama3`.
+            params = getattr(m.config, "rope_parameters", None) or getattr(
+                m.config, "rope_scaling", None)
+            assert params and params.get("rope_type") == "llama3", params
         d = os.path.join(hard, tag)
         if tag == "meta":
             # `save_pretrained` always writes safetensors on transformers 5,
@@ -7511,6 +8126,45 @@ def test_from_pretrained_forward_matches_upstream_logits():
             tag, got[tag + "_argmax"], expected["argmax"])
         diff = max(abs(a - b) for a, b in zip(got[tag + "_logits"], expected["logits"]))
         assert diff < _REAL_LLAMA_ATOL, (tag, diff)
+
+
+def test_the_llama3_rope_checkpoint_loads_and_generates_like_upstream():
+    """**The user's line**, on a checkpoint that has `rope_type: llama3`.
+
+        model = AutoModelForCausalLM.from_pretrained(...)
+        out = model.generate(**tok(...), max_new_tokens=...)
+
+    Published 0.0.5a0 could not do the first of those for any llama3-rope
+    model -- including `meta-llama/Llama-3.2-1B`, which README.md's own
+    headline example loads. `from_pretrained` builds the module tree under
+    `init_empty_weights`, so `_compute_llama3_parameters` runs on the meta
+    device, and its first line is a comparison
+    (`transformers/modeling_rope_utils.py:655`). docs/META.md §7.
+
+    `meta-llama/Llama-3.2-1B` itself is gated on the Hub and is not in this
+    machine's cache, so the checkpoint here is built by upstream torch with
+    the same `rope_scaling` dict and read back through the same
+    `AutoModelForCausalLM.from_pretrained` -- the real path, not a hand-rolled
+    meta init. The fixture asserts that the `llama3` rope type survived into
+    the saved config, so this cannot quietly become a second copy of the
+    plain case.
+
+    Weights are compared bit-for-bit, logits to the same bound as the plain
+    case, and `generate` as an exact token sequence -- greedy decoding turns
+    the acceptance into an equality rather than a tolerance.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    expected, got = _from_pretrained_fixture()
+    assert got["hard_rope3"] == "OK", got["hard_rope3"]
+    worst, where = _worst_state_dict_drift(
+        expected["hard_rope3"]["state_dict"], got["hard_rope3_state_dict"])
+    assert worst == 0.0, (where, worst)
+    diff = max(abs(a - b) for a, b in
+               zip(got["hard_rope3_logits"], expected["hard_rope3"]["logits"]))
+    assert diff < _REAL_LLAMA_ATOL, diff
+    assert got["rope3_generate"] == expected["rope3_generate"], (
+        got["rope3_generate"], expected["rope3_generate"])
 
 
 def test_the_four_hard_checkpoint_shapes_load_with_the_right_weights():

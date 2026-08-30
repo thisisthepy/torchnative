@@ -242,6 +242,10 @@ dense 커널은 meta 를 몰라도 되고("모르면 `tensor()` 가 거부한다
 | `uniform_` · `normal_` · `zero_` · `fill_.Scalar` | **무동작, 수신자를 돌려준다** |
 | `_local_scalar_dense.default` | `Tensor.item() cannot be called on meta tensors` |
 
+**이 표는 첫 회차의 것입니다.** 그 뒤로 `empty_like`(docs/CKPT2.md §3 이 멈춰 있던 자리),
+`div.Scalar` · `mul.Scalar` · `pow.Scalar` · `reciprocal`(rope 초기화)이 더해졌고, 이번
+회차가 **원소별 계열 전체와 모양 커널 셋**을 더했습니다. 현재 목록은 §7.1 과 §7.2 입니다.
+
 **in-place 초기화 넷이 편의가 아닙니다.** `nn.Linear.__init__` 은 매번
 `init.kaiming_uniform_(self.weight)` 로 끝나므로, 이것들 없이는
 `with torch.device("meta"): nn.Linear(4, 8)` 이 파라미터를 하나도 만들지 못하고 멈춥니다 —
@@ -366,31 +370,145 @@ DEVICE_ABS §3.2 가 남긴 질문: `from_candle` 이 `Cuda`/`Metal` 에 대해 
 
 ---
 
-## 7. 하지 않은 것 — 나머지 op 의 모양 추론
+## 7. 원소별 계열과 모양 커널 셋 — 그리고 아직 남은 것
 
-`add` · `mm` · `view` · `reshape` · `slice` · `t` · `cat` · `sum` · `select` · `eq` — 상류는
-전부 통과시키고 모양을 전파합니다(§2.5). 이 셰임은 **자기 이름을 대고 거부합니다.**
+**§7 의 이전 판은 "나머지 op 의 모양 추론은 하지 않았다" 였습니다.** 그 판단을 뒤집은 것은
+논증이 아니라 **사용자 보고**입니다. 공개된 0.0.5a0 휠에서:
 
-**넣지 않은 이유는 셋입니다.**
+```
+model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+  ... transformers/modeling_rope_utils.py:655 _compute_llama3_parameters
+  inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+NotImplementedError: torch._C shim has no meta kernel for aten.gt.Scalar.
+```
 
-1. **그것은 커널입니다, fallthrough 가 아닙니다.** 상류의
-   `torch/_meta_registrations.py` 는 수천 줄이고, 각 op 의 브로드캐스트 규칙 · dtype 승격 ·
-   축소 규칙 · 뷰의 스트라이드 계산을 따로 씁니다. 모양 규칙을 짐작하는 것은 이 저장소가
-   가장 피하는 종류의 조용한 오답입니다.
-2. **측정된 수요가 없습니다** (DESIGN.md §6). `init_empty_weights` 경로는 모델을 *만들* 뿐
-   *돌리지* 않습니다 — §8 이 그것을 끝까지 열었고, 그 경로가 요구한 것은 팩토리와 in-place
-   초기화뿐이었습니다.
-3. **거부가 작업 큐입니다.** `with torch.device("meta")` 아래에서 모델을 돌리면 빈도순으로
-   필요한 meta 커널 목록이 인쇄됩니다. 미리 쓴 목록보다 나은 정보입니다.
+**윈도우 전용이 아닙니다.** macOS 에서 재현했습니다 — 이 rope 초기화는 `cpu` 에서 성공하고
+`meta` 에서 실패합니다. `from_pretrained` 가 가중치를 meta 에서 초기화하므로 rope 계산이
+거기서 돕니다. SmolLM2 가 되던 것은 `rope_scaling` 이 없어서 기본 rope 초기화가 **비교를
+하지 않기** 때문이었습니다.
 
-**`_aten_implemented()` 는 96 그대로입니다.** 그 상수는 "커널이 있고 *또한*
-`tools/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고 meta 는
-정의상 값이 없습니다.** meta 지원은 이미 목록에 있는 op 들의 *성질*이므로 op 수가 늘지
-않습니다. `<no case builder registered>` 위험이 없는 이유이고, 증거가
-`pytests/test_shim.py` 에 있는 이유입니다(§11).
+그리고 **README 첫 코드 블록이 로드하는 모델이 바로 그것입니다.** 즉 §7 의 이전 판이
+"측정된 수요가 없다" 고 적은 그 자리가, 이 프로젝트의 대표 예시였습니다. 이전 판의 세 근거 중
+1번(짐작하지 말 것)과 3번(거부가 작업 큐다)은 그대로 유효하고 **이번 회차가 그 둘을 따랐습니다** —
+2번만 반증됐습니다.
 
-**스키마도 233 그대로입니다.** `overloads.json`/`methods.json` 에 항목을 넣지 않았습니다 —
-새 철자를 만들지 않았기 때문입니다.
+### 7.1 원소별 계열 — 모양 규칙과 dtype 규칙, 둘 다 빌려온 것
+
+| 계열 | op | 모양 | dtype |
+|---|---|---|---|
+| 비교 | `eq`·`ne`·`lt`·`le`·`ge`·`gt` × `{Scalar, Tensor}` (12) | 입력 / 브로드캐스트 | **무조건 `bool`** |
+| 산술 | `add`·`sub`·`mul`·`div` × `{Tensor, Scalar}` (8), `rsub.Scalar` | 브로드캐스트 / 입력 | `arith_tag` |
+| 선택 | `where.self` · `where.ScalarOther` | **3-피연산자 브로드캐스트** | 값 쪽에서, 조건이 아니라 |
+| 단항 승격 | `cos`·`sin`·`tanh`·`exp`·`log`·`expm1`·`rsqrt`·`reciprocal` | 그대로 | `unary_float_tag` |
+| 단항 보존 | `neg` · `bitwise_not` | 그대로 | 입력 그대로, 거부 포함 |
+| 사다리 | `clamp.default` | 그대로 | `clamp_result_tag` |
+| 거듭제곱 | `pow.Tensor_Scalar` · `pow.Tensor_Tensor` | 입력 / 브로드캐스트 | `pow_result_tag` |
+
+**모양 절반은 기계적이고 dtype 절반은 아닙니다.** 그래서 dtype 규칙을 **한 줄도 다시 쓰지
+않았습니다** — dense 커널이 쓰는 바로 그 함수를 부릅니다. 근거는 docs/E2E_REAL.md §6.1 입니다:
+dense 가 만들지 않을 dtype 을 meta 가 약속하면, 호출자는 그 dtype 으로 할당해 두고 dense 가
+그 자리에서 거부합니다. 같은 함수를 부르면 **구성적으로** 어긋날 수 없고, 거부까지 같아집니다.
+
+그 공유를 위해 dense 커널 안에 인라인으로 있던 규칙 셋을 함수로 꺼냈습니다. dense 의 동작은
+바뀌지 않았고(골든 4284/4284 그대로), 각 함수는 이제 두 경로가 함께 씁니다:
+
+| 꺼낸 함수 | 원래 있던 곳 | meta 가 쓰는 이유 |
+|---|---|---|
+| `unary_float_tag` | `unary_float` · `rsqrt_default` 본문 | "부동은 그대로, 나머지는 기본 float" |
+| `neg_result_tag` | `neg_default` 본문 | dtype 보존 **과 두 거부**(`bool`, 넓은 unsigned) |
+| `clamp_result_tag` | `clamp_default` 본문 | 골든이 한 번 고쳐준 사다리를 두 벌 두지 않기 위해 |
+| `where_condition_check` | `where_self` · `where_scalar_other` 본문 | 조건 dtype 거부를 세 곳이 같은 문면으로 |
+| `expand_target` | `expand_default` 본문 | 랭크 검사와 `-1` 해석 (§7.2) |
+
+**dtype 이 짐작 불가능한 자리 셋**이 이 계열의 전부라고 해도 됩니다. 상류 meta 텐서로 직접
+측정한 것입니다:
+
+```
+gt(float32_meta, 1.0)            torch.bool        입력이 무엇이든
+div(int64_meta, int64_meta)      torch.float32     참 나눗셈이 정수 쌍을 띄운다
+where(bool_meta, f32, f32)       torch.float32     조건이 아니라 값에서
+mul(f16_meta, bf16_meta)         torch.float32     같은 랭크끼리는 위로 탈출
+pow(int64_meta, 2)               torch.int64       정수 지수는 정수를 유지
+pow(int64_meta, 2.0)             torch.float32     실수 지수는 띄운다
+clamp(int32_meta, None, 2.0)     torch.float32     제자리 형제는 여기서 거부한다
+neg(int64_meta)                  torch.int64       단항이라고 다 승격하지 않는다
+```
+
+`where.self` 의 모양은 **세 피연산자의 조인**이지 조건의 것이 아닙니다:
+`where(bool(2,1), f32(1,3), f32(3))` 은 `(2,3)` 이고, 조건 모양을 답하면 `(2,1)` 입니다.
+
+### 7.2 모양 커널 셋 — 그리고 그것을 고른 것은 작업 큐다
+
+원소별 계열만으로 `llama` 는 통과했습니다. 그 다음을 **미리 정하지 않고** 스무 아키텍처를
+`with torch.device("meta")` 아래에서 구성해 큐를 인쇄시켰습니다. ARCH20.md §0.2 의
+*"벽 하나가 벽 하나가 아니다"* 를 따라 **매번 다시 재고** 다음 하나를 넣었습니다.
+
+| 회차 | 통과 | 큐가 인쇄한 것 |
+|---|---|---|
+| 원소별 계열까지 | **14/20** | `aten.select.int` ×5, `aten.tril.default` ×1 |
+| `select.int` · `tril`/`triu` 후 | **19/20** | `aten.expand.default` ×1 (`bert`) |
+| `expand.default` 후 | **20/20** | — |
+
+| op | 모양 규칙 | 함께 재현한 거부 |
+|---|---|---|
+| `select.int` | 그 차원을 **제거** (`slice` 와 다른 점) | 0-차원, `normalise_dim`, `normalise_index` |
+| `tril` · `triu` | 그대로 — 바뀌는 것은 *어느 값이 0 이 되나*뿐 | 랭크 < 2 |
+| `expand.default` | 앞에 차원을 붙이고 `-1` 은 기존 extent | 랭크 부족, 앞자리 `-1`, 비-singleton 확장 |
+
+`expand` 만 dense 와 검사를 **완전히** 공유하지 못합니다. dense 는 extent 검사를 candle 의
+`broadcast_as` 에서 공짜로 받는데 meta 에는 넘길 핸들이 없습니다. 그래서 그 절반만 여기서 직접
+쓰고, 문면은 상류에서 실측해 옮겼습니다. **0 은 이 규칙에서 singleton 이 아닙니다** —
+`(1,3) → (0,3)` 은 통과하고 `(0,3) → (2,3)` 은 거부입니다. `have <= 1` 로 쓰면 조용히 통과합니다.
+
+### 7.3 상류 자신이 cpu 와 meta 에서 다른 답을 하는 자리 셋
+
+§2.6 이 `torch.mm(cpu, meta)` 로 찾은 것과 **같은 종류**입니다. 이번에 셋 더 나왔습니다.
+상류만으로 잰 것이고, 이 셰임은 관여하지 않습니다:
+
+| 호출 | 상류 `cpu` | 상류 `meta` |
+|---|---|---|
+| `bitwise_not(float32)` | `NotImplementedError: "bitwise_not_cpu" not implemented for 'Float'` | **통과**, float32 를 돌려준다 |
+| `clamp(float32, None, None)` | `RuntimeError: torch.clamp: At least one of 'min' or 'max' must not be None` | `ValueError: clamp called but both min and max are none!` |
+| `where(uint8_cond, f32, f32)` | **통과** (deprecation 경고와 함께) | `RuntimeError: expected predicate to be bool, got torch.uint8` |
+
+**이 셰임은 세 자리 모두에서 자기 dense 커널을 따릅니다** = 상류의 `cpu` 를 따릅니다. 문이
+하나이므로 meta 가 dense 와 다른 답을 할 자리가 없고, 그것이 §5 가 `mm` 에 대해 적은 것과 같은
+값입니다.
+
+### 7.4 여전히 남은 것 — 그리고 그 크기
+
+**작은 목록이 아닙니다. 숫자를 적습니다.** 커널이 있는 op 148 개 중 meta 에서 닿는 것은
+**66 개**(이 표 + 자기 dense 커널 안에서 `is_meta()` 로 갈라지는 팩토리 10 개)이고,
+**82 개가 여전히 닿지 않습니다.** 갈래별로:
+
+| 갈래 | 수 | 예 |
+|---|---:|---|
+| 축소 | 22 | `sum` · `mean` · `amax` · `max.dim` · `argmax` · `any` · `cumsum` · `topk` · `sort` |
+| 뷰·모양 | 13 | `view` · `reshape` · `t` · `permute` · `transpose` · `slice` · `squeeze` · `unsqueeze` |
+| 제자리 | 12 | `add_` · `mul_` · `sub_` · `div_` · `exp_` · `neg_` · `relu_` · `clamp_` |
+| 축약 | 8 | `mm` · `bmm` · `matmul` · `addmm` · `baddbmm` · `_grouped_mm` · `convolution` · `embedding` |
+| 인덱싱 | 7 | `index.Tensor` · `gather` · `masked_fill` · `index_put_` · `isin` |
+| 합성·활성 | 6 | `_softmax` · `_safe_softmax` · `native_layer_norm` · SDPA · `gelu` · `silu` · `relu` |
+| 결합·분할 | 4 | `stack` · `unbind` · `split_with_sizes` · `scatter` |
+| 그 외 | 10 | `abs` · `ceil` · `bitwise_and`/`bitwise_or` · `floor_divide` · `constant_pad_nd` · `zeros_like` |
+
+그러므로 **"meta 표면이 완성됐다" 고 읽으면 안 됩니다.** 이번 회차가 연 것은 정확히 하나입니다 —
+**스무 아키텍처의 `init_empty_weights` 구성 경로**. 그것이 `from_pretrained` 가 요구하는
+전부이고(§8.3), 측정으로 확인했습니다(§7.2 의 20/20). meta 텐서로 *순전파*를 돌리는 것 —
+모양 추론 도구로 쓰는 것 — 은 위 표가 그대로 남아 있으므로 **여전히 안 됩니다.**
+
+뷰 계열에는 §12 가 이미 적어둔 전제 조건이 하나 더 붙습니다: **meta 는 스트라이드를 들지
+않습니다.** `t`/`permute` 의 meta 커널이 오는 날 그 커널이 `PyTensorBase` 에 그 필드를 먼저
+추가해야 합니다. 이번 셋(`select`·`tril`·`expand`)은 전부 contiguous 결과라 그 문제를 건드리지
+않습니다 — `expand` 만은 상류에서 stride-0 뷰이므로, **이 셰임의 meta `expand` 는 모양만 맞고
+스트라이드 의미는 없습니다.** dense `expand` 도 `broadcast_as` 후 대개 `contiguous` 되므로 같은
+갈래이고, §12 에 함께 적었습니다.
+
+**`_aten_implemented()` 는 139 그대로이고 스키마도 4353 그대로입니다.** 그 상수는 "커널이 있고
+*또한* `tools/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
+meta 는 정의상 값이 없습니다.** meta 지원은 이미 목록에 있는 op 들의 *성질*이므로 op 수가 늘지
+않고, 새 철자를 만들지 않았으므로 `overloads.json`/`methods.json` 도 그대로입니다. 증거는
+`pytests/test_shim.py` 에 있습니다(§11).
 
 ---
 
@@ -595,6 +713,64 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 | `test_the_initialisers_a_module_constructor_runs_are_no_ops_on_meta` | §4.1 — in-place 넷이 무동작이고 수신자를 돌려주는 것 |
 | `test_meta_road_through_the_vendored_tree` | **§8 전체** — 서브프로세스에서 컨텍스트 매니저 · 중첩 · 명시 인자 우선 · 스택 균형 · `set_default_device` · `init_empty_weights` · `load_state_dict(assign=True)` · 순전파(`[[32.0, 32.0]]`, 상류와 같은 숫자) |
 
+### 11.1 이번 회차 (§7) 의 판정
+
+```
+pytests        260 ok / 0 fail   (253 -> 260)                     EXIT=0
+골든           4284/4284, ops=139, pending 1 (기대치)             EXIT=0
+골든 self-test 13 comparators x 11 fault modes, 0 problem(s)      EXIT=0
+스키마         4353/4353                                          EXIT=0
+20-아키텍처 순전파 스윕      20/20                                EXIT=0
+20-아키텍처 meta 구성 스윕   20/20  (§7.2)                        EXIT=0
+llama3-rope from_pretrained + generate                            EXIT=0
+```
+
+**골든 op 수 139 와 스키마 4353 은 그대로입니다** — 이유는 §7.4.
+
+### 11.2 새로 붙인 테스트 (+7) 과 고친 것 하나
+
+| 테스트 | 무엇을 고정하나 |
+|---|---|
+| `test_meta_comparisons_answer_bool_whatever_went_in` | 12 키 × 9 dtype × 3 스칼라, 그리고 8 가지 브로드캐스트 조합. **`bool` 을 별도 줄로 단언** |
+| `test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kernel` | `div` 가 정수 쌍을 띄우는 것, `mul` 만 승격하고 셋은 거부하는 것, `set_default_dtype` 결합 |
+| `test_meta_where_broadcasts_three_operands_and_takes_dtype_from_the_values` | 3-피연산자 조인, 조건이 dtype 을 주지 않는 것, 조건 dtype 거부 |
+| `test_meta_unary_promotions_are_the_dense_families_own` | 승격 계열 8 개와 **보존** 계열(`neg`·`bitwise_not`) 을 **양방향으로** |
+| `test_meta_clamp_and_pow_share_the_dense_kernels_dtype_ladders` | 골든이 한 번 고쳐준 `clamp` 사다리, `pow` 의 wrapped-number 규칙 |
+| `test_meta_shape_kernels_drop_expand_and_keep_the_triangle` | §7.2 셋의 모양 규칙과 거부 전부. `(1,3)→(0,3)` 통과 / `(0,3)→(2,3)` 거부 |
+| `test_the_llama3_rope_init_runs_on_meta_end_to_end` | **사용자 보고 그 자체.** 같은 식을 `cpu` 로도 돌려 모양과 dtype 을 대조 |
+
+고친 것: `test_ops_without_a_meta_kernel_name_themselves` 가 `add.Tensor` 를 "meta 커널이
+없는 것" 으로 단언하고 있었습니다. 지우지 않고 **경계를 옮겼습니다** — 축소·축약·뷰 열 개로
+바꾸고, **반대 방향 단언을 추가**했습니다(§7.1 이 넣은 것들은 자기 이름을 대면 안 된다).
+그것이 없으면 이 테스트는 meta 표를 통째로 비워도 통과합니다.
+
+### 11.3 사보타주 — 13 개 결함, 13 개 다 잡힘
+
+*"실패할 수 없는 검증은 검증이 아니다"* (CLAUDE.md §5.5). meta 커널의 출력은 모양과 dtype
+**둘뿐**이므로, `.shape` 만 읽는 테스트는 dtype 결함을 구조적으로 못 봅니다. 그래서 규칙마다
+한 줄씩 고장 내고 세었습니다. 각 회차는 재빌드 + 전체 스위트입니다.
+
+| 주입한 결함 | 실패한 테스트 |
+|---|---:|
+| 비교 `Scalar` 가 `bool` 대신 입력 dtype | **2** |
+| 비교 `Tensor` 가 `bool` 대신 입력 dtype | 1 |
+| 산술이 `arith_tag` 대신 피연산자 dtype (`div` 가 안 뜬다) | 1 |
+| 이항 모양이 브로드캐스트 대신 왼쪽 피연산자 | 1 |
+| `where` 가 값이 아니라 조건에서 dtype 을 가져옴 | **2** |
+| `where` 모양이 3-조인 대신 조건의 것 | 1 |
+| 단항 승격 계열이 입력 dtype 을 그대로 통과 | 1 |
+| `neg` 가 보존 대신 승격 | 1 |
+| `clamp` 가 사다리 대신 입력 dtype | 1 |
+| `pow.Tensor_Scalar` 가 wrapped-number 대신 베이스 dtype | 1 |
+| `select.int` 이 차원을 제거하지 않고 1 로 남김 | 1 |
+| `expand` 가 0 extent 를 singleton 으로 취급 | 1 |
+| `tril`/`triu` 가 랭크 거부를 잃음 | 1 |
+
+**0 건이 조용히 통과했습니다.** 두 건이 두 테스트를 깨뜨린 것은 rope 종단 테스트가 같은
+결함을 독립적으로 잡았기 때문입니다 — 단위 테스트와 종단 테스트가 겹치는 것이 의도입니다.
+
+---
+
 마지막 것이 서브프로세스인 이유는 `test_device_road_through_the_vendored_tree` 와 같습니다 —
 `torch.device.__enter__` 는 벤더 트리의 `torch.utils._device` 를 필요로 하고, 독립 `_C` 주위에는
 그것이 없습니다.
@@ -616,15 +792,31 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 - **`Tensor` 메서드는 모드를 상의하지 않습니다** — §8.4. 장치 컨텍스트에 대해서는 차이가
   없지만 다른 종류의 모드에 대해서는 있습니다.
 - **meta 는 스트라이드를 들지 않습니다.** `is_contiguous()` 가 meta 에 대해 무조건 `True` 를
-  답하고, 상류는 `t()` 한 meta 에 대해 `False` 입니다. 지금 이 셰임이 만들 수 있는 meta
-  텐서는 전부 contiguous 이므로 참이지만, meta `t`/`permute` 커널이 오는 날 거짓이 됩니다.
+  답하고, 상류는 `t()` 한 meta 에 대해 `False` 입니다. meta `t`/`permute` 커널이 오는 날
+  그 커널이 `PyTensorBase` 에 그 필드를 먼저 추가해야 합니다 (§7.4).
+  **§7.2 의 `expand` 가 이 항목의 첫 실제 사례입니다.** 상류에서 `expand` 는 stride-0 뷰인데
+  이 셰임의 meta `expand` 는 모양만 맞고 스트라이드 의미가 없습니다. dense `expand` 도
+  `broadcast_as` 뒤에 대개 `contiguous` 되므로 같은 갈래이지만, "meta 가 만든 것은 전부
+  contiguous 다" 라는 문장이 **더 이상 자명하지 않습니다.**
+- **`expand` 의 extent 검사만 dense 와 공유하지 못합니다** (§7.2). dense 는 candle 의
+  `broadcast_as` 에서 받고 meta 는 직접 씁니다. 문면은 상류에서 실측해 옮겼지만, 두 벌인
+  이상 갈라질 수 있는 유일한 자리입니다.
+- **§7.1 의 원소별 커널은 상류의 *meta* 가 아니라 이 셰임의 *dense* 를 따릅니다.** 셋이
+  갈리는 자리가 §7.3 에 있고, 거기서 상류 자신이 `cpu` 와 `meta` 로 다른 답을 합니다.
 - **`arange` 의 `arange_has_cpu_kernel` 을 meta 에서 건너뜁니다** — 상류의 meta 커널이
   그렇다는 실측에 따른 것이고, 두 경로가 다른 검사를 하는 유일한 자리입니다 (§4.2).
 - **게이트 메시지가 상류의 meta 문면과 다릅니다** (§5.1).
 
 ### 못 한 것
 
-- **나머지 90 여 개 op 의 meta 모양 추론** (§7). 근거를 적었습니다.
+- **나머지 82 개 op 의 meta 모양 추론** (§7.4). 축소·축약·뷰·인덱싱·제자리·합성이
+  통째로 남아 있습니다. 열린 것은 **구성 경로 하나**이지 meta 표면 전체가 아닙니다.
+- **`meta-llama/Llama-3.2-1B` 자체로는 확인하지 못했습니다.** Hub 에서 게이트되어 있고
+  `HF_HOME` 에 캐시되어 있지 않습니다(`SmolLM2-135M` 만 있습니다). 대신 상류 torch 로
+  `rope_parameters={"rope_type": "llama3", ...}` 를 가진 작은 Llama 체크포인트를 써 두고,
+  **같은 `AutoModelForCausalLM.from_pretrained` 경로로** 이 셰임에서 읽었습니다 —
+  즉 `_compute_llama3_parameters` 를 meta 에서 실제로 통과시켰고, 손으로 만든 경로가
+  아닙니다. 로짓은 상류와 1e-5 안에서 같고 `generate` 는 토큰 열이 같습니다.
 - **`m.to("cpu")` (meta 모듈을 CPU 로) 와 `m.to_empty(device=...)`.** 둘 다 `empty_like` 에
   걸리는데, 그것은 오버로드 테이블에 항목이 없습니다 — **meta 와 무관한 기존 구멍**이고
   `zeros_like`·`ones_like` 와 같은 갈래입니다(DEVICE_ABS §9 가 `ones_like` 로 이미 기록).

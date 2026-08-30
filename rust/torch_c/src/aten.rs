@@ -693,6 +693,361 @@ fn meta_dispatch(
                 }
             }
         }
+        // ---------------------------------------------------------------
+        // The elementwise family. docs/META.md §7.1.
+        //
+        // Every arm below is the same two-part answer -- a shape rule and a
+        // dtype rule -- and **neither part is restated here.** The shape is
+        // `broadcast_shape`, which `masked_select` already needed and which
+        // reproduces upstream's wording for a mismatch. The dtype is the
+        // dense kernel's own helper, called rather than copied.
+        //
+        // That is not tidiness. docs/E2E_REAL.md §6.1: a meta kernel that
+        // promises a dtype the dense kernel would not produce hands the
+        // caller an allocation the dense kernel then refuses to compute into,
+        // and the divergence surfaces far from here. Calling the same
+        // function makes the two agree by construction, refusals included --
+        // so where the dense kernel declines (`same_dtype` on a mixed pair,
+        // `neg` on a bool, `pow` on a bool), the meta kernel declines with
+        // the identical message rather than advertising a tensor that cannot
+        // be built.
+        // ---------------------------------------------------------------
+
+        // **The comparisons: `bool` out, whatever went in.** The dtype half
+        // is the one that cannot be guessed from the input, and it is why
+        // these needed a kernel rather than a pass-through -- upstream's
+        // `gt(float32_meta, 1.0)` is `torch.bool`, measured, as are all
+        // twelve keys over `{float32, float16, int64, int32, bool}`.
+        //
+        // This is the family the user's `from_pretrained` report stopped on:
+        // `_compute_llama3_parameters` opens with
+        // `torch.where(wavelen > low_freq_wavelen, ...)` and `>` on a meta
+        // tensor is `gt.Scalar` (transformers/modeling_rope_utils.py:655).
+        "aten.eq.Scalar"
+        | "aten.ne.Scalar"
+        | "aten.lt.Scalar"
+        | "aten.le.Scalar"
+        | "aten.ge.Scalar"
+        | "aten.gt.Scalar" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            // Read and dropped. The value cannot affect a shape or a dtype
+            // -- `compare_scalar` uses it only to pick a comparison dtype
+            // for the *computation*, which is not happening -- but reading
+            // it keeps the missing-argument refusal identical to the dense
+            // kernel's, which is the half of the contract a meta kernel can
+            // still honour.
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+            meta_result(py, input.dims().to_vec(), TorchDType::Bool)
+        }
+        // The `Tensor` overloads add the broadcast and keep `same_dtype`.
+        // Upstream promotes here and this shim does not (docs/BIND.md §9);
+        // reproducing the *refusal* is what keeps meta from advertising a
+        // comparison the dense kernel declines to run.
+        //
+        // Measured on 2.13.0, all on meta inputs: `(2,3) vs (2,3)` is
+        // `(2,3)`, `(1,3) vs (2,1)` is `(2,3)`, and `(2,3)` against a 0-dim
+        // is `(2,3)` -- the 0-dim case being the one a "shape is the left
+        // operand's" shortcut gets right by accident and a "shape is the
+        // condition's" one gets wrong.
+        "aten.eq.Tensor"
+        | "aten.ne.Tensor"
+        | "aten.lt.Tensor"
+        | "aten.le.Tensor"
+        | "aten.ge.Tensor"
+        | "aten.gt.Tensor" => {
+            let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+            same_dtype(op, &lhs, &rhs)?;
+            let shape = broadcast_shape(op, lhs.dims(), rhs.dims())?;
+            meta_result(py, shape, TorchDType::Bool)
+        }
+        // **The arithmetic `Tensor` overloads.** `arith_tag` is the whole
+        // dtype half and it is not "the input's": `div` on two `int64`
+        // tensors is `float32` (true division floats an integral pair), and
+        // `mul` is the one member that promotes its operands rather than
+        // requiring them equal. Both facts are the dense kernel's, read off
+        // the same two lines it uses.
+        //
+        // `alpha` is parsed and dropped for the same reason the scalar is
+        // above: it scales values, and there are none, but a caller that
+        // passes a bad one should still hear about it here.
+        "aten.add.Tensor" | "aten.sub.Tensor" | "aten.mul.Tensor" | "aten.div.Tensor" => {
+            let kind = match op {
+                "aten.add.Tensor" => Arith::Add,
+                "aten.sub.Tensor" => Arith::Sub,
+                "aten.mul.Tensor" => Arith::Mul,
+                _ => Arith::Div,
+            };
+            let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+            let operand = if kind == Arith::Mul {
+                promote_operands(op, &lhs, &rhs)?
+            } else {
+                same_dtype(op, &lhs, &rhs)?
+            };
+            let tag = arith_tag(op, kind, operand, None)?;
+            alpha_arg(op, args, kwargs)?;
+            let shape = broadcast_shape(op, lhs.dims(), rhs.dims())?;
+            meta_result(py, shape, tag)
+        }
+        // `aten::rsub.Scalar` -- `other - alpha * self`. Reversed operands,
+        // but the shape is still the tensor's and the dtype is still
+        // `arith_tag`'s `Sub` row, exactly as the dense kernel computes it.
+        "aten.rsub.Scalar" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let other =
+                scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+            let tag = arith_tag(op, Arith::Sub, input.tag(), Some(!other.is_int()))?;
+            alpha_arg(op, args, kwargs)?;
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // **`where.self` broadcasts three operands and takes its dtype from
+        // the two value operands, not the condition.** Both halves are the
+        // ones that are easy to get wrong and both are measured:
+        // `where(meta_bool(2,1), meta_f32(1,3), meta_f32(3))` is `(2,3)`
+        // `float32` upstream, where a condition-shaped answer would be
+        // `(2,1)`, and `where(bool_cond, f32, f32)` is `float32` and not
+        // `bool`.
+        //
+        // The condition's *dtype* check is the dense kernel's, restated in
+        // the sense that the same two accepted tags and the same message are
+        // used -- `where` on a float condition raises upstream and the meta
+        // path has to raise too, since the condition's dtype is one of the
+        // few things a meta tensor does carry.
+        "aten.where.self" => {
+            let condition = tensor_arg(op, args, kwargs, 0, "condition")?;
+            let lhs = tensor_arg(op, args, kwargs, 1, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 2, "other")?;
+            where_condition_check(&condition)?;
+            let tag = same_dtype(op, &lhs, &rhs)?;
+            let shape = broadcast_shape(op, condition.dims(), lhs.dims())?;
+            let shape = broadcast_shape(op, &shape, rhs.dims())?;
+            meta_result(py, shape, tag)
+        }
+        // `where.ScalarOther` is the same three-way join with the third
+        // operand a Python scalar, so it broadcasts two and takes its dtype
+        // from `where_scalar_tag` -- the wrapped-number rule, where a `bool`
+        // scalar leaves the tensor's dtype alone and an `int` one lifts only
+        // a boolean tensor. `checked_convert` runs here for the reason §4.2
+        // gives about the factories: a meta tensor is a claim about what the
+        // real call would have produced, and a claim that skipped the real
+        // call's range check is not a claim.
+        "aten.where.ScalarOther" => {
+            let condition = tensor_arg(op, args, kwargs, 0, "condition")?;
+            let lhs = tensor_arg(op, args, kwargs, 1, "self")?;
+            let raw = required(op, args, kwargs, 2, "other")?;
+            where_condition_check(&condition)?;
+            if raw.is_instance_of::<PyTensorBase>() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "aten::where() Expected a value of type 'number' for argument 'other' \
+                     but instead found type Tensor",
+                ));
+            }
+            let scalar_is_bool = raw.is_instance_of::<pyo3::types::PyBool>();
+            let scalar_is_int = scalar_is_bool || raw.is_instance_of::<pyo3::types::PyInt>();
+            let tag = where_scalar_tag(lhs.tag(), scalar_is_bool, scalar_is_int);
+            checked_convert(&raw, scalar_is_int, tag, 1)?;
+            let shape = broadcast_shape(op, condition.dims(), lhs.dims())?;
+            meta_result(py, shape, tag)
+        }
+        // **The `unary_float` family, shape-preserving, dtype by promotion.**
+        // `unary_float_tag` is the rule and it is the dense family's own
+        // function: a floating input keeps its exact dtype (`float16` in,
+        // `float16` out -- *not* widened), anything else becomes the default
+        // float, which moves with `set_default_dtype`.
+        //
+        // `rsqrt` is in this list even though its dense kernel is separate,
+        // because that kernel now calls the same `unary_float_tag`.
+        // `expm1` is here for the same reason.
+        //
+        // `silu`, `gelu` and `relu` are deliberately **not** here: their
+        // dense kernels do not promote (upstream has no integral `silu`
+        // kernel at all, measured in `unary_float`'s own comment), so they
+        // would need a different rule and nothing has reached them on meta.
+        "aten.cos.default"
+        | "aten.sin.default"
+        | "aten.tanh.default"
+        | "aten.exp.default"
+        | "aten.log.default"
+        | "aten.expm1.default"
+        | "aten.rsqrt.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            meta_result(py, input.dims().to_vec(), unary_float_tag(input.tag()))
+        }
+        // `aten::neg` keeps the input dtype rather than promoting, and it has
+        // two refusals -- `bool` and the wide unsigned dtypes -- which
+        // `neg_result_tag` carries so that both paths decline the same
+        // inputs. A meta `neg` that accepted a bool would promise a tensor
+        // the dense kernel refuses to compute.
+        "aten.neg.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = neg_result_tag(input.tag())?;
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::bitwise_not` -- shape and dtype both the input's, with
+        // upstream's floating-point refusal reproduced. `~mask` in
+        // `_compute_llama3_parameters` is this op, and it is bool in, bool
+        // out; the refusal is here because a float input raises upstream and
+        // the dtype tag is enough to see it.
+        "aten.bitwise_not.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = input.tag();
+            if tag.is_floating_point() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "\"bitwise_not_cpu\" not implemented for '{}'",
+                    scalar_type_name(tag)
+                )));
+            }
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::clamp` -- shape is the input's, dtype is the ladder in
+        // `clamp_result_tag`, including "both bounds absent is an error".
+        // That table is the one the golden cases had to correct once
+        // (out-of-place promotes where in-place refuses), which is the
+        // argument for calling it rather than writing a second copy.
+        "aten.clamp.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let min = scalar_arg(op, args, kwargs, 1, "min")?;
+            let max = scalar_arg(op, args, kwargs, 2, "max")?;
+            let tag = clamp_result_tag(op, args, kwargs, input.tag(), min, max)?;
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::pow.Tensor_Scalar` and `.Tensor_Tensor`. The dtype is
+        // `pow_result_tag`'s wrapped-number rule -- an integer tensor with an
+        // integer exponent stays integral (`pow(int64, 2)` is `int64`,
+        // measured on meta), a float on either side floats the result -- and
+        // for the two-tensor overload the operands promote first, which is
+        // why `pow_tensor_tensor` hands in the *promotion* and not an
+        // operand's own dtype.
+        "aten.pow.Tensor_Scalar" => {
+            let base = tensor_arg(op, args, kwargs, 0, "self")?;
+            let exponent = scalar_arg(op, args, kwargs, 1, "exponent")?
+                .ok_or_else(|| missing(op, "exponent"))?;
+            let tag = pow_result_tag(op, base.tag(), !exponent.is_int())?;
+            meta_result(py, base.dims().to_vec(), tag)
+        }
+        "aten.pow.Tensor_Tensor" => {
+            let base = tensor_arg(op, args, kwargs, 0, "self")?;
+            let exponent = tensor_arg(op, args, kwargs, 1, "exponent")?;
+            let operand = promote_operands(op, &base, &exponent)?;
+            let tag = pow_result_tag(op, operand, false)?;
+            let shape = broadcast_shape(op, base.dims(), exponent.dims())?;
+            meta_result(py, shape, tag)
+        }
+        // ---------------------------------------------------------------
+        // Two shape kernels, and the reason they are the only two.
+        //
+        // Three shape kernels, and the reason they are the only three.
+        //
+        // The elementwise block above got `llama` and thirteen others through
+        // construction on meta. Sweeping all twenty (docs/META.md §7.2)
+        // printed a work queue with exactly two entries behind it --
+        // `select.int` for five architectures and `tril.default` for one --
+        // and re-running it behind those printed one more, `expand.default`
+        // for `bert`. Each of the three is the queue's answer and not a guess
+        // at what might be wanted next; ARCH20.md §0.2's "a wall is not one
+        // wall" is why the sweep was re-run after each rather than after all.
+        // Everything past them is still §7's boundary.
+        // ---------------------------------------------------------------
+
+        // `aten::select.int(Tensor self, int dim, SymInt index)` -- the
+        // dimension is **removed**, which is what separates it from `slice`.
+        //
+        // `gemma`, `opt`, `olmo`, `bert` and `cohere` all reach it while
+        // *constructing* on meta: their rotary/positional buffers are built
+        // with an `x[0]`-shaped indexing step, and `__getitem__` with an
+        // integer is this op.
+        //
+        // Every check the dense kernel runs is run here, and all of them
+        // depend only on metadata: the 0-dim refusal, `normalise_dim`'s
+        // wrapping and range check, and `normalise_index`'s. Skipping them
+        // would make the meta path *accept* an index the dense path raises
+        // on, which §4.2's argument about the factories rules out -- a meta
+        // tensor is a claim about what the real call would have produced.
+        "aten.select.int" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let dims = input.dims().to_vec();
+            if dims.is_empty() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "invalid index of a 0-dim tensor",
+                ));
+            }
+            let dim = normalise_dim(op, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), dims.len())?;
+            normalise_index(
+                op,
+                int_arg(args, kwargs, 2, "index")?.ok_or_else(|| missing(op, "index"))? as isize,
+                dims[dim],
+            )?;
+            let mut shape = dims;
+            shape.remove(dim);
+            meta_result(py, shape, input.tag())
+        }
+        // `aten::tril` / `aten::triu` -- shape and dtype both unchanged; the
+        // whole op is *which values are zeroed*, and a meta tensor has none.
+        // So this is the one place in the table where "same shape, same
+        // dtype" is the complete kernel rather than a shortcut, and the only
+        // thing left to reproduce is the rank refusal, which reads the shape.
+        //
+        // `gpt_bigcode` is the caller: its causal-mask buffer is
+        // `torch.tril(torch.ones((n, n), dtype=torch.bool))` built in
+        // `__init__` (docs/TORCHSCRIPT.md §6), so it runs during
+        // construction and lands on meta.
+        "aten.tril.default" | "aten.triu.default" => {
+            let name = if op == "aten.tril.default" { "tril" } else { "triu" };
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            int_arg(args, kwargs, 1, "diagonal")?;
+            let dims = input.dims().to_vec();
+            if dims.len() < 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{name}: input tensor must have at least 2 dimensions"
+                )));
+            }
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::expand(Tensor self, SymInt[] size, *, bool implicit=False)`
+        // -- `bert`'s remaining wall, reached while building its position-id
+        // buffer during construction.
+        //
+        // The rank check and the `-1` sentinel are `expand_target`, shared
+        // with the dense kernel. The **extent** check is the one thing not
+        // shared, and the reason is structural rather than a choice: the
+        // dense kernel gets it for free from `broadcast_as`, and there is no
+        // candle handle here to hand to it. So it is written out, with
+        // upstream's own wording, measured on 2.13.0 for both `cpu` and
+        // `meta` (they agree, unlike the three ops in §7.3):
+        //
+        //     expand(zeros(3), [2, 4])
+        //       RuntimeError: The expanded size of the tensor (4) must match
+        //       the existing size (3) at non-singleton dimension 1.
+        //       Target sizes: [2, 4].  Tensor sizes: [3]
+        //
+        // A zero extent is *not* singleton for this rule -- `expand(zeros(0,
+        // 3), [2, 3])` raises upstream, naming dimension 0 -- which is the
+        // case a `!= 1` written as `<= 1` would silently accept.
+        "aten.expand.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let requested = shape_arg(op, args, kwargs, 1, "size")?;
+            let dims = input.dims().to_vec();
+            let target = expand_target(op, &dims, &requested)?;
+            let offset = target.len() - dims.len();
+            for (i, &want) in target.iter().enumerate().skip(offset) {
+                let have = dims[i - offset];
+                if have != want && have != 1 {
+                    // `requested` and not `target`: upstream prints the sizes
+                    // as they were *asked for*, `-1` sentinels included --
+                    // `expand(zeros(2,1,3), [2,4,3,-1])` reports
+                    // `Target sizes: [2, 4, 3, -1]`, measured. Printing the
+                    // resolved list instead would name a size the caller
+                    // never wrote.
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "The expanded size of the tensor ({want}) must match the existing \
+                         size ({have}) at non-singleton dimension {i}.  Target sizes: \
+                         {requested:?}.  Tensor sizes: {dims:?}"
+                    )));
+                }
+            }
+            meta_result(py, target, input.tag())
+        }
         // `aten::div.Scalar` and `aten::mul.Scalar` -- shape is the input's,
         // dtype is `arith_tag`'s.
         //
@@ -706,19 +1061,25 @@ fn meta_dispatch(
         // restatement of it, so the dtype this advertises is by construction
         // the dtype the dense kernel would produce, refusals included.
         //
-        // `add.Scalar` and `sub.Scalar` are the other two members of that
-        // helper and are deliberately absent: nothing has reached them on
-        // meta.
-        "aten.div.Scalar" | "aten.mul.Scalar" => {
-            let kind = if op == "aten.div.Scalar" {
-                Arith::Div
-            } else {
-                Arith::Mul
+        // `add.Scalar` and `sub.Scalar` join them now that the `Tensor`
+        // overloads above are here. Leaving two of the four members of one
+        // helper out was defensible while the meta table was four ops wide
+        // and is not now: the rule is the same call, and the asymmetry would
+        // only show up as `x + 1` refusing on a tensor where `x * 1` works.
+        // They carry `alpha`, which `alpha_arg` parses and this drops --
+        // see the `Tensor` arm.
+        "aten.div.Scalar" | "aten.mul.Scalar" | "aten.add.Scalar" | "aten.sub.Scalar" => {
+            let kind = match op {
+                "aten.div.Scalar" => Arith::Div,
+                "aten.mul.Scalar" => Arith::Mul,
+                "aten.add.Scalar" => Arith::Add,
+                _ => Arith::Sub,
             };
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let other =
                 scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
             let tag = arith_tag(op, kind, input.tag(), Some(!other.is_int()))?;
+            alpha_arg(op, args, kwargs)?;
             meta_result(py, input.dims().to_vec(), tag)
         }
         // `aten::pow.Scalar(Scalar self, Tensor exponent)` -- the next link in
@@ -736,20 +1097,12 @@ fn meta_dispatch(
         // `1.0 / t` as `t.reciprocal() * 1.0`, so this is what the rope
         // expression reaches rather than an `rdiv` op.
         //
-        // Its dense counterpart is the `unary_float` family, whose rule is
-        // "floating in, same out; anything else becomes the default float".
-        // The other five members of that family (`cos`, `sin`, `tanh`, `exp`,
-        // and `rsqrt`, which shares the rule from its own function) are
-        // deliberately *not* listed here: nothing has reached them on meta, so
-        // adding them would be a claim no test could have failed on.
+        // Its dense counterpart is the `unary_float` family, and it now calls
+        // that family's `unary_float_tag` rather than restating the rule. The
+        // other members are in the block above.
         "aten.reciprocal.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
-            let tag = if input.tag().is_floating_point() {
-                input.tag()
-            } else {
-                default_float()
-            };
-            meta_result(py, input.dims().to_vec(), tag)
+            meta_result(py, input.dims().to_vec(), unary_float_tag(input.tag()))
         }
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
@@ -3050,11 +3403,7 @@ fn rsqrt_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.rsqrt.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let tag = if input.tag().is_floating_point() {
-        input.tag()
-    } else {
-        default_float()
-    };
+    let tag = unary_float_tag(input.tag());
     let storage = PyDtype::new(tag).storage(OP)?;
     let tensor = input
         .tensor()?
@@ -4668,6 +5017,22 @@ enum Unary {
 /// to special-case the domain -- but it does have to be *checked*, because
 /// "raises on a negative input" is the plausible wrong guess and `mamba`'s
 /// `A = arange(1, state_size+1)` never leaves the positive half to reveal it.
+/// The dtype half of the `unary_float` family, on its own so the meta kernels
+/// can call it instead of restating it.
+///
+/// "Floating in, the same floating out; anything else becomes the default
+/// float." Named rather than inlined because five call sites now share it --
+/// `unary_float`, `rsqrt`, `expm1`, and the two meta arms -- and because it
+/// reads `default_float()` at call time, which is what couples the rule to
+/// `set_default_dtype` rather than to a constant.
+fn unary_float_tag(tag: TorchDType) -> TorchDType {
+    if tag.is_floating_point() {
+        tag
+    } else {
+        default_float()
+    }
+}
+
 fn unary_float(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -4676,11 +5041,7 @@ fn unary_float(
     kind: Unary,
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
-    let tag = if input.tag().is_floating_point() {
-        input.tag()
-    } else {
-        default_float()
-    };
+    let tag = unary_float_tag(input.tag());
     let storage = PyDtype::new(tag).storage(op)?;
     let out = input
         .tensor()?
@@ -4766,14 +5127,12 @@ fn expm1_default(
 /// Two refusals, both copied from upstream rather than invented: `bool` (torch
 /// points at `~`/`logical_not()` instead) and the wide unsigned dtypes, which
 /// have no `neg_cpu` kernel upstream at all.
-fn neg_default(
-    py: Python<'_>,
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.neg.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let tag = input.tag();
+///
+/// The dtype rule *and its two refusals* are `neg_result_tag` below, so that
+/// the meta kernel refuses the same two inputs. A meta kernel that accepted
+/// `neg(bool_meta)` would advertise a tensor the dense kernel then declines to
+/// compute -- the divergence docs/E2E_REAL.md §6.1 names.
+fn neg_result_tag(tag: TorchDType) -> PyResult<TorchDType> {
     if tag == TorchDType::Bool {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "Negation, the `-` operator, on a bool tensor is not supported. If you are \
@@ -4789,6 +5148,17 @@ fn neg_default(
             scalar_type_name(tag)
         )));
     }
+    Ok(tag)
+}
+
+fn neg_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.neg.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = neg_result_tag(input.tag())?;
 
     let storage = PyDtype::new(tag).storage(OP)?;
     if tag.is_floating_point() {
@@ -6268,6 +6638,24 @@ fn masked_fill(
 /// The unselected branch is never read for its value, only for its shape and
 /// dtype -- `where(True, 1.0, nan)` is `1.0`, measured -- and `where_cond`
 /// selects rather than blends, so that holds here too.
+/// What `where` accepts as a condition, on its own so that all three call
+/// sites -- both dense overloads and the meta arms -- refuse the same tensors
+/// with the same message.
+///
+/// `uint8` is accepted beside `bool` because upstream accepts it (as
+/// truthiness, not as a bit pattern); everything else raises. This is one of
+/// the few dense checks a meta tensor can still run in full, since the dtype
+/// tag is carried and the condition's *values* are not consulted.
+fn where_condition_check(condition: &PyTensorBase) -> PyResult<()> {
+    if condition.tag() != TorchDType::Bool && condition.tag() != TorchDType::UInt8 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "where expected condition to be a boolean tensor, but got a tensor with dtype {}",
+            scalar_type_name(condition.tag())
+        )));
+    }
+    Ok(())
+}
+
 fn where_self(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -6278,12 +6666,7 @@ fn where_self(
     let lhs = tensor_arg(OP, args, kwargs, 1, "self")?;
     let rhs = tensor_arg(OP, args, kwargs, 2, "other")?;
 
-    if condition.tag() != TorchDType::Bool && condition.tag() != TorchDType::UInt8 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "where expected condition to be a boolean tensor, but got a tensor with dtype {}",
-            scalar_type_name(condition.tag())
-        )));
-    }
+    where_condition_check(&condition)?;
     let tag = same_dtype(OP, &lhs, &rhs)?;
     let out = where_select(OP, &condition, lhs.tensor()?, rhs.tensor()?, tag)?;
     finish(py, out, tag)
@@ -6434,12 +6817,7 @@ fn where_scalar_other(
     let lhs = tensor_arg(OP, args, kwargs, 1, "self")?;
     let raw = required(OP, args, kwargs, 2, "other")?;
 
-    if condition.tag() != TorchDType::Bool && condition.tag() != TorchDType::UInt8 {
-        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-            "where expected condition to be a boolean tensor, but got a tensor with dtype {}",
-            scalar_type_name(condition.tag())
-        )));
-    }
+    where_condition_check(&condition)?;
     if raw.is_instance_of::<PyTensorBase>() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "aten::where() Expected a value of type 'number' for argument 'other' \
@@ -6533,15 +6911,16 @@ fn shape_arg(
 /// which case the new ones are prepended, and `-1` means "keep whatever is
 /// there". candle's `broadcast_as` has the same alignment-from-the-right rule
 /// once the `-1`s are resolved.
-fn expand_default(
-    py: Python<'_>,
-    args: &Bound<'_, PyTuple>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.expand.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let requested = shape_arg(OP, args, kwargs, 1, "size")?;
-    let dims = input.tensor()?.dims();
+/// Resolving `expand`'s requested size against the tensor's own: the rank
+/// check, the `-1` sentinel, and the negative-size refusal.
+///
+/// Metadata only, which is why it is a function -- the meta kernel needs
+/// exactly this and can share it verbatim. What it deliberately does *not* do
+/// is check that each extent is expandable; the dense path gets that from
+/// `broadcast_as`, and the meta path, which has no candle handle to hand to
+/// `broadcast_as`, does it itself with upstream's wording. That split is
+/// recorded in docs/META.md §7.2 rather than hidden.
+fn expand_target(op: &str, dims: &[usize], requested: &[isize]) -> PyResult<Vec<usize>> {
     if requested.len() < dims.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expand(torch._C.TensorBase{dims:?}, size={requested:?}): the number of \
@@ -6564,12 +6943,24 @@ fn expand_default(
             target.push(dims[i - offset]);
         } else if value < 0 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "{OP}: invalid expand size {value}"
+                "{op}: invalid expand size {value}"
             )));
         } else {
             target.push(value as usize);
         }
     }
+    Ok(target)
+}
+
+fn expand_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.expand.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let requested = shape_arg(OP, args, kwargs, 1, "size")?;
+    let target = expand_target(OP, input.tensor()?.dims(), &requested)?;
     let out = input
         .tensor()?
         .broadcast_as(target)
@@ -9463,37 +9854,21 @@ fn clamp_values(
     Ok(out)
 }
 
-/// `aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor`
+/// The dtype ladder of `clamp.default`, and the two refusals that sit inside
+/// it, extracted so the meta kernel produces the same answer by calling it
+/// rather than by restating a table that took golden cases to get right once.
 ///
-/// `mamba`'s wall (docs/ARCH20.md §4): `modeling_mamba.py` clamps `dt` and the
-/// discretisation limits out of place, and only the *in-place* sibling had a
-/// kernel -- `clamp_.default` has been implemented since docs/OPS8.md while
-/// `x.clamp(...)` refused. That asymmetry is the one an in-place-first round
-/// leaves behind, and it is the second instance of it in this file after
-/// `relu`/`relu_` (docs/SPELLINGS.md §6.6) went the other way.
-///
-/// The *value* rule is `clamp_`'s, shared through `clamp_values` -- including
-/// "both bounds absent is an error, not a no-op", which a fresh out-of-place
-/// implementation would plausibly have made a no-op since there is no receiver
-/// to leave unchanged. Measured: `x.clamp()` raises "torch.clamp: At least one
-/// of 'min' or 'max' must not be None".
-///
-/// The *dtype* rule is not `clamp_`'s, and assuming it was is the mistake the
-/// golden cases caught: see the table in the body.
-///
-/// `clamp.Tensor` (tensor bounds) is a separate overload with a separate
-/// kernel and is not implemented; `methods.json` lists it so that
-/// `x.clamp(min=some_tensor)` refuses *by the name of the overload it needed*
-/// rather than by "no matching signature".
-fn clamp_default(
-    py: Python<'_>,
+/// It reads the *raw* arguments and not only the parsed `Scalar`s, for the
+/// reason the table in the body gives: `bool` subclasses `int` in Python and
+/// `Scalar` collapses the two, but upstream does not.
+fn clamp_result_tag(
+    op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.clamp.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let min = scalar_arg(OP, args, kwargs, 1, "min")?;
-    let max = scalar_arg(OP, args, kwargs, 2, "max")?;
+    input_tag: TorchDType,
+    min: Option<Scalar>,
+    max: Option<Scalar>,
+) -> PyResult<TorchDType> {
     if min.is_none() && max.is_none() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "torch.clamp: At least one of 'min' or 'max' must not be None",
@@ -9530,8 +9905,8 @@ fn clamp_default(
     let bool_bounds = (min.is_none() || bound_is_bool(1, "min")?)
         && (max.is_none() || bound_is_bool(2, "max")?);
 
-    let input_tag = input.tag();
-    let tag = if input_tag == TorchDType::Bool {
+    let _ = op;
+    Ok(if input_tag == TorchDType::Bool {
         if bool_bounds {
             return Err(pyo3::exceptions::PyNotImplementedError::new_err(
                 "\"clamp_scalar_cpu\" not implemented for 'Bool'",
@@ -9546,7 +9921,42 @@ fn clamp_default(
         default_float()
     } else {
         input_tag
-    };
+    })
+}
+
+/// `aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor`
+///
+/// `mamba`'s wall (docs/ARCH20.md §4): `modeling_mamba.py` clamps `dt` and the
+/// discretisation limits out of place, and only the *in-place* sibling had a
+/// kernel -- `clamp_.default` has been implemented since docs/OPS8.md while
+/// `x.clamp(...)` refused. That asymmetry is the one an in-place-first round
+/// leaves behind, and it is the second instance of it in this file after
+/// `relu`/`relu_` (docs/SPELLINGS.md §6.6) went the other way.
+///
+/// The *value* rule is `clamp_`'s, shared through `clamp_values` -- including
+/// "both bounds absent is an error, not a no-op", which a fresh out-of-place
+/// implementation would plausibly have made a no-op since there is no receiver
+/// to leave unchanged. Measured: `x.clamp()` raises "torch.clamp: At least one
+/// of 'min' or 'max' must not be None".
+///
+/// The *dtype* rule is not `clamp_`'s, and assuming it was is the mistake the
+/// golden cases caught: see the table in `clamp_result_tag`, which is where
+/// the rule now lives so that the meta kernel shares it.
+///
+/// `clamp.Tensor` (tensor bounds) is a separate overload with a separate
+/// kernel and is not implemented; `methods.json` lists it so that
+/// `x.clamp(min=some_tensor)` refuses *by the name of the overload it needed*
+/// rather than by "no matching signature".
+fn clamp_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.clamp.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let min = scalar_arg(OP, args, kwargs, 1, "min")?;
+    let max = scalar_arg(OP, args, kwargs, 2, "max")?;
+    let tag = clamp_result_tag(OP, args, kwargs, input.tag(), min, max)?;
 
     let storage = PyDtype::new(tag).storage(OP)?;
     let source = input
