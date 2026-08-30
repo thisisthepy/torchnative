@@ -220,6 +220,19 @@ def full_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # size/fill_value/dtype all by keyword, not just positionally.
+    cases.append(
+        Case(
+            name="full(size=/fill_value=/dtype= all by keyword)",
+            op="aten.full.default",
+            run_torch=lambda: torch_call(size=[2, 2], fill_value=3.0, dtype=dt.torch_dtype(torch_module, "float32")),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.full.default", size=[2, 2], fill_value=3.0, dtype=dt.c_dtype(c_module, "float32")
+            ),
+        )
+    )
+
     return cases
 
 
@@ -323,6 +336,23 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
     cases.extend(_reduced_float_add_cases(torch_module, c_module, torch_call))
+
+    # docs/DISPATCH.md §4.1: every case above calls the shim positionally, so
+    # the keyword path through `_aten_dispatch` (what `bootstrap.py`'s
+    # `dispatch(key, **bound)` actually sends in production) was never
+    # exercised -- a tampered `interned_name` arm for "self"/"other"/"alpha"
+    # passed this whole suite. This closes that for the busiest three names.
+    kw_a_t, kw_a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    kw_b_t, kw_b_c = pair_from_flat(torch_module, c_module, [10.0, 20.0, 30.0, 40.0], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="add(dtype=float32, self=/other=/alpha= all by keyword)",
+            op="aten.add.Tensor",
+            run_torch=lambda: torch_call(self=kw_a_t, other=kw_b_t, alpha=2.0),
+            run_c=lambda: c_module._aten_dispatch("aten.add.Tensor", self=kw_a_c, other=kw_b_c, alpha=2.0),
+            note="keyword-argument coverage -- see the module note above and docs/GOLDEN.md",
+        )
+    )
 
     return cases
 
@@ -1294,6 +1324,18 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/keepdim all by keyword -- also the "dim" tamper's own example.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="argmax(self=/dim=/keepdim= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=1, keepdim=True),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=1, keepdim=True),
+        )
+    )
+
     return cases
 
 
@@ -1374,6 +1416,19 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # tensors/dim both by keyword.
+    kwa_t, kwa_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    kwb_t, kwb_c = pair_from_flat(torch_module, c_module, [5, 6, 7, 8], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="cat(tensors=/dim= both by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(tensors=[kwa_t, kwb_t], dim=0),
+            run_c=lambda: c_module._aten_dispatch(op, tensors=[kwa_c, kwb_c], dim=0),
+        )
+    )
+
     return cases
 
 
@@ -1424,6 +1479,19 @@ def embedding_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="first and last valid row indices",
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # weight/indices both by keyword.
+    kw_w_t, kw_w_c = pair_from_flat(torch_module, c_module, weight_flat, (vocab, dim), "float32")
+    kw_idx_t, kw_idx_c = pair_from_flat(torch_module, c_module, [0, 3, 7, 2], (4,), "int64")
+    cases.append(
+        Case(
+            name="embedding(weight=/indices= both by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(weight=kw_w_t, indices=kw_idx_t),
+            run_c=lambda: c_module._aten_dispatch(op, weight=kw_w_c, indices=kw_idx_c),
+        )
+    )
 
     return cases
 
@@ -1556,6 +1624,19 @@ def isin_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # elements/test_elements both by keyword.
+    kw_e_t, kw_e_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5], (5,), "float32")
+    kw_t_t, kw_t_c = pair_from_flat(torch_module, c_module, [2, 4], (2,), "float32")
+    cases.append(
+        Case(
+            name="isin(elements=/test_elements= both by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(elements=kw_e_t, test_elements=kw_t_t),
+            run_c=lambda: c_module._aten_dispatch(op, elements=kw_e_c, test_elements=kw_t_c),
+        )
+    )
+
     return cases
 
 
@@ -1641,6 +1722,18 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="integers to negative integer powers are not allowed -- torch refuses.",
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/exponent both by keyword.
+    kw_base_t, kw_base_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, -2.0, 4.0], (5,), "float32")
+    cases.append(
+        Case(
+            name="pow(self=/exponent= both by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_base_t, exponent=2),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_base_c, exponent=2),
+        )
+    )
 
     return cases
 
@@ -1729,6 +1822,20 @@ def randint_low_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=sc["note"] + " -- random draw, sequence unchecked (see module note above)",
                 )
             )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # low/high/size/dtype all by keyword.
+    kw_t_dt = dt.torch_dtype(torch_module, "int64")
+    kw_c_dt = dt.c_dtype(c_module, "int64")
+    cases.append(
+        Case(
+            name="randint(low=/high=/size=/dtype= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(low=0, high=10, size=[5], dtype=kw_t_dt),
+            run_c=lambda: c_module._aten_dispatch(op, low=0, high=10, size=[5], dtype=kw_c_dt),
+            value_check=_range_check(0, 10),
+        )
+    )
 
     return cases
 
@@ -2574,6 +2681,18 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="x[:, :] -- identity slice",
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/start/end/step all by keyword.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6, 7, 8], (2, 4), "float32")
+    cases.append(
+        Case(
+            name="slice(self=/dim=/start=/end=/step= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=1, start=1, end=3, step=1),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=1, start=1, end=3, step=1),
+        )
+    )
     return cases
 
 
@@ -2865,6 +2984,29 @@ def clone_cases(torch_module, c_module, torch_call) -> list[Case]:
                     "identity copy -- also backs contiguous() on a non-contiguous input",
                 )
             )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/memory_format both by keyword. `memory_format` is keyword-only
+    # and, unlike every other name here, is never accepted as a value the
+    # kernel *reads* -- it is only ever rejected by name (contiguous_format/
+    # preserve_format are silently accepted no-ops, anything else raises).
+    # So a value the shim accepts cannot tell a working lookup from a
+    # tampered one that treats the argument as absent -- absent and
+    # "contiguous_format" behave identically. A value the shim *refuses*
+    # can: if the lookup silently misses, the refusal never fires and the
+    # case's expect="c_error" flips to "both compute", which fails.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, list(range(24)), (1, 2, 3, 4), "float32")
+    cases.append(
+        Case(
+            name="clone(self=/memory_format= both by keyword) [c_error -- torch computes, shim refuses]",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, memory_format=torch_module.channels_last),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, memory_format=torch_module.channels_last),
+            expect="c_error",
+            note="memory_format=torch.channels_last is not implemented in torch._C shim -- "
+                 "see reject_memory_format in rust/torch_c/src/aten.rs",
+        )
+    )
     return cases
 
 
@@ -3029,6 +3171,26 @@ def masked_fill_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=note,
                 )
             )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/mask/value all by keyword.
+    cases.append(
+        Case(
+            name="masked_fill(self=/mask=/value= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=torch_module.tensor(a_flat, dtype=torch_module.float32).reshape(list(a_shape)),
+                mask=torch_module.tensor(mask_flat).reshape(list(a_shape)),
+                value=0.0,
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                self=c_module._tensor_from_flat(a_flat, list(a_shape), dtype=c_module.float32),
+                mask=c_module._tensor_from_flat([int(v) for v in mask_flat], list(a_shape), dtype=c_module.bool),
+                value=0.0,
+            ),
+        )
+    )
     return cases
 
 
@@ -3330,6 +3492,18 @@ def transpose_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="negative dims, as in attention's q @ k.transpose(-2, -1)",
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim0/dim1 all by keyword -- DISPATCH.md's own microbench example op.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="transpose(self=/dim0=/dim1= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim0=0, dim1=1),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim0=0, dim1=1),
+        )
+    )
     return cases
 
 
@@ -3725,6 +3899,29 @@ def normal__cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: 'normal expects std >= 0.0, but found std -1'",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/mean/std all by keyword, seeded the same way `_seeded_inplace`
+    # seeds every other case above.
+    def _kw_normal_run_torch():
+        torch_module.manual_seed(0)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[0]
+        return torch_call(self=target, mean=0.0, std=1.0)
+
+    def _kw_normal_run_c():
+        c_module._shim_manual_seed(0)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[1]
+        return c_module._aten_dispatch(op, self=target, mean=0.0, std=1.0)
+
+    cases.append(
+        Case(
+            name="normal_(self=/mean=/std= all by keyword)",
+            op=op,
+            run_torch=_kw_normal_run_torch,
+            run_c=_kw_normal_run_c,
+            value_check=_rng_stream_check(bitwise=_BITWISE_NORMAL_FILL),
+        )
+    )
     return cases
 
 
@@ -3778,6 +3975,30 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
             ),
             expect="both_error",
             note="torch: 'uniform_ expects to return a [from, to) range, but found from=1 > to=0'",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/from/to all by keyword. `from` is a Python keyword, so it can only
+    # be spelled through `**{"from": ...}`, not `from=...` at the call site --
+    # which is itself a real shape `dispatch(key, **bound)` can produce.
+    def _kw_uniform_run_torch():
+        torch_module.manual_seed(0)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[0]
+        return torch_call(**{"self": target, "from": 2.0, "to": 7.5})
+
+    def _kw_uniform_run_c():
+        c_module._shim_manual_seed(0)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[1]
+        return c_module._aten_dispatch(op, **{"self": target, "from": 2.0, "to": 7.5})
+
+    cases.append(
+        Case(
+            name="uniform_(self=/from=/to= all by keyword)",
+            op=op,
+            run_torch=_kw_uniform_run_torch,
+            run_c=_kw_uniform_run_c,
+            value_check=_rng_stream_check(bitwise=True, bounds=(2.0, 7.5)),
         )
     )
     return cases
@@ -4360,6 +4581,26 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     cases.extend(_sdpa_gqa_cases(torch_module, c_module, torch_call))
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # query/key/dropout_p/is_causal/scale all by keyword (value stays
+    # positional -- it is not in `interned_name`'s table).
+    kw_q_t, kw_q_c = pair_from_flat(torch_module, c_module, q_flat, shape, "float32")
+    kw_k_t, kw_k_c = pair_from_flat(torch_module, c_module, k_flat, shape, "float32")
+    kw_v_t, kw_v_c = pair_from_flat(torch_module, c_module, v_flat, shape, "float32")
+    cases.append(
+        Case(
+            name="sdpa_flash_cpu(query=/key=/dropout_p=/is_causal=/scale= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                query=kw_q_t, key=kw_k_t, value=kw_v_t, dropout_p=0.0, is_causal=False, scale=0.25
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, query=kw_q_c, key=kw_k_c, value=kw_v_c, dropout_p=0.0, is_causal=False, scale=0.25
+            ),
+            value_check=_sdpa_pair_check,
+        )
+    )
     return cases
 
 
@@ -4754,6 +4995,18 @@ def softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="IndexError on both sides",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/half_to_float all by keyword.
+    kw_t, kw_c = _pair(torch_module, c_module, [1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="_softmax(self=/dim=/half_to_float= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=-1, half_to_float=False),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=-1, half_to_float=False),
+        )
+    )
     return cases
 
 
@@ -5032,6 +5285,19 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="IndexError on both sides",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/descending all by keyword.
+    kw_t, kw_c = _pair(torch_module, c_module, _TIED, (6,), "float32")
+    cases.append(
+        Case(
+            name="sort(self=/dim=/descending= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=-1, descending=True),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=-1, descending=True),
+            value_check=_pair_result_check,
+        )
+    )
     return cases
 
 
@@ -5167,6 +5433,19 @@ def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="torch: RuntimeError 'selected index k out of range'",
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/k/dim/largest/sorted all by keyword.
+    kw_t, kw_c = _pair(torch_module, c_module, _DISTINCT, (6,), "float32")
+    cases.append(
+        Case(
+            name="topk(self=/k=/dim=/largest=/sorted= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, k=2, dim=-1, largest=True, sorted=True),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, k=2, dim=-1, largest=True, sorted=True),
+            value_check=_pair_result_check,
+        )
+    )
     return cases
 
 
@@ -5268,6 +5547,20 @@ def scatter_src_cases(torch_module, c_module, torch_call) -> list[Case]:
         zeros_35, 1, ([0, 1, 2], (1, 3), "int64"), ([1.0, 2.0], (1, 2), "float32"),
         "'no larger than self ... and no larger size than src' -- this violates the src half",
         expect="both_error",
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/index/src all by keyword.
+    kw_self_t, kw_self_c = _pair(torch_module, c_module, *zeros_35)
+    kw_idx_t, kw_idx_c = _pair(torch_module, c_module, [0, 1, 2] * 3, (3, 3), "int64")
+    kw_src_t, kw_src_c = _pair(torch_module, c_module, *src_35)
+    cases.append(
+        Case(
+            name="scatter(self=/dim=/index=/src= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_self_t, dim=1, index=kw_idx_t, src=kw_src_t),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_self_c, dim=1, index=kw_idx_c, src=kw_src_c),
+        )
     )
     return cases
 
@@ -5476,6 +5769,30 @@ def multinomial_cases(torch_module, c_module, torch_call) -> list[Case]:
             "torch: 'invalid multinomial distribution (sum of probabilities <= 0)'")
     refusal("multinomial(all-zero row, with replacement, rejected on both sides)", [0.0, 0.0], (2,), "float32", 2, True,
             "the same refusal from the other kernel -- reached by a different check upstream")
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/num_samples/replacement all by keyword. Seeded like
+    # `_seeded_multinomial` above so the drawn indices compare exactly
+    # rather than only dtype/shape.
+    kw_t, kw_c = _pair(torch_module, c_module, row, (11,), "float32")
+
+    def _kw_multinomial_run_torch():
+        torch_module.manual_seed(0)
+        return torch_call(self=kw_t, num_samples=1, replacement=False)
+
+    def _kw_multinomial_run_c():
+        c_module._shim_manual_seed(0)
+        return c_module._aten_dispatch(op, self=kw_c, num_samples=1, replacement=False)
+
+    cases.append(
+        Case(
+            name="multinomial(self=/num_samples=/replacement= all by keyword)",
+            op=op,
+            run_torch=_kw_multinomial_run_torch,
+            run_c=_kw_multinomial_run_c,
+            note="both generators seeded to the same value; index compared exactly",
+        )
+    )
     return cases
 
 
@@ -5789,6 +6106,22 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="t(weight) view, float16 accumulation-dtype question",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/mat1/mat2/beta/alpha all by keyword.
+    kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, *_ADDMM_SELF, "float32")
+    kw_m1_t, kw_m1_c = pair_from_flat(torch_module, c_module, *_ADDMM_M1, "float32")
+    kw_m2_t, kw_m2_c = pair_from_flat(torch_module, c_module, *_ADDMM_M2, "float32")
+    cases.append(
+        Case(
+            name="addmm(self=/mat1=/mat2=/beta=/alpha= all by keyword)",
+            op="aten.addmm.default",
+            run_torch=lambda: torch_call(self=kw_s_t, mat1=kw_m1_t, mat2=kw_m2_t, beta=2, alpha=3),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.addmm.default", self=kw_s_c, mat1=kw_m1_c, mat2=kw_m2_c, beta=2, alpha=3
+            ),
+        )
+    )
     return cases
 
 
@@ -5908,6 +6241,19 @@ def split_cases(torch_module, c_module, torch_call) -> list[Case]:
                 expect="both_error", note=note,
             )
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/split_size/dim all by keyword.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, ten, (10,), "float32")
+    cases.append(
+        Case(
+            name="split(self=/split_size=/dim= all by keyword)",
+            op="aten.split.Tensor",
+            run_torch=lambda: torch_call(self=kw_t, split_size=3, dim=0),
+            run_c=lambda: c_module._aten_dispatch("aten.split.Tensor", self=kw_c, split_size=3, dim=0),
+            value_check=_chunk_list_check,
+        )
+    )
     return cases
 
 
@@ -6150,6 +6496,25 @@ def native_layer_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="documented gap: upstream's mean (0) and rstd (nan) disagree about "
                  "what a reduction over no elements is, and one observation is not "
                  "enough to reproduce that. See rust/torch_c/src/aten.rs.",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # input/normalized_shape/weight/bias/eps all by keyword. `input`, not
+    # `self`, is this schema's own name for the tensor argument.
+    kw_x_t, kw_x_c = pair_from_flat(torch_module, c_module, _LN_INPUT, (2, 3, 4), "float32")
+    kw_w_t, kw_w_c = pair_from_flat(torch_module, c_module, _LN_WEIGHT, (4,), "float32")
+    kw_b_t, kw_b_c = pair_from_flat(torch_module, c_module, _LN_BIAS, (4,), "float32")
+    cases.append(
+        Case(
+            name="native_layer_norm(input=/normalized_shape=/weight=/bias=/eps= all by keyword)",
+            op="aten.native_layer_norm.default",
+            run_torch=lambda: torch_call(input=kw_x_t, normalized_shape=[4], weight=kw_w_t, bias=kw_b_t, eps=1e-5),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.native_layer_norm.default",
+                input=kw_x_c, normalized_shape=[4], weight=kw_w_c, bias=kw_b_c, eps=1e-5,
+            ),
+            value_check=_triple_result_check,
         )
     )
     return cases
@@ -6467,6 +6832,20 @@ def gather_cases(torch_module, c_module, torch_call) -> list[Case]:
             ),
             note="torch gathers from a transposed tensor without comment; candle's kernel "
                  "raises RequiresContiguous, which is why this shim reads the elements itself.",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dim/index all by keyword (sparse_grad is already exercised by
+    # keyword above, in `_gather_case`'s `kwargs={"sparse_grad": True}`).
+    kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+    kw_i_t, kw_i_c = pair_from_flat(torch_module, c_module, [0, 2, 1, 0], (2, 2), "int64")
+    cases.append(
+        Case(
+            name="gather(self=/dim=/index= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_s_t, dim=1, index=kw_i_t),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_s_c, dim=1, index=kw_i_c),
         )
     )
     return cases
@@ -6854,6 +7233,18 @@ def scalar_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="falcon/gptj/bloom/mpt all build their attention mask fill this way",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1): `s`
+    # (the fill value) by keyword -- `device`/`layout` are already exercised
+    # by keyword above.
+    cases.append(
+        Case(
+            name="scalar_tensor(s=/dtype= both by keyword)",
+            op="aten.scalar_tensor.default",
+            run_torch=lambda: torch_call(s=2.5, dtype=torch_module.float32),
+            run_c=lambda: c_module._aten_dispatch("aten.scalar_tensor.default", s=2.5, dtype=c_module.float32),
+        )
+    )
     return cases
 
 
@@ -6987,6 +7378,22 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([0.0], (), "float32"), ([-3.4028234663852886e38], (), "float32"),
             note="the causal-mask idiom verbatim: a (1,1,S,S) bool mask selecting between "
                  "two 0-D scalar_tensor results",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # condition/self/other all by keyword.
+    kw_cond_t, kw_cond_c = _pair(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+    kw_s_t, kw_s_c = _pair(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    kw_o_t, kw_o_c = _pair(torch_module, c_module, [10.0, 20.0, 30.0, 40.0], (4,), "float32")
+    cases.append(
+        Case(
+            name="where(condition=/self=/other= all by keyword)",
+            op="aten.where.self",
+            run_torch=lambda: torch_call(condition=kw_cond_t, self=kw_s_t, other=kw_o_t),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.where.self", condition=kw_cond_c, self=kw_s_c, other=kw_o_c
+            ),
         )
     )
     return cases
@@ -7282,6 +7689,18 @@ def permute_cases(torch_module, c_module, torch_call) -> list[Case]:
             _permute_case(torch_module, c_module, torch_call, flat, shape, dims,
                           expect="both_error", note=note)
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/dims both by keyword.
+    kw_t, kw_c = _pair(torch_module, c_module, six, (2, 3), "float32")
+    cases.append(
+        Case(
+            name="permute(self=/dims= both by keyword)",
+            op="aten.permute.default",
+            run_torch=lambda: torch_call(self=kw_t, dims=[1, 0]),
+            run_c=lambda: c_module._aten_dispatch("aten.permute.default", self=kw_c, dims=[1, 0]),
+        )
+    )
     return cases
 
 
@@ -7968,6 +8387,22 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
             _big_gemm_case(torch_module, c_module, torch_call, "aten.baddbmm.default",
                            dtype_name, 8, 512, 8, with_bias=True, batch=2, note=note)
         )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/batch1/batch2/beta/alpha all by keyword.
+    kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, *_BADDBMM_SELF, "float32")
+    kw_b1_t, kw_b1_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B1, "float32")
+    kw_b2_t, kw_b2_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B2, "float32")
+    cases.append(
+        Case(
+            name="baddbmm(self=/batch1=/batch2=/beta=/alpha= all by keyword)",
+            op="aten.baddbmm.default",
+            run_torch=lambda: torch_call(self=kw_s_t, batch1=kw_b1_t, batch2=kw_b2_t, beta=2, alpha=3),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.baddbmm.default", self=kw_s_c, batch1=kw_b1_c, batch2=kw_b2_c, beta=2, alpha=3
+            ),
+        )
+    )
     return cases
 
 
@@ -8083,6 +8518,19 @@ def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="both_error",
             note="torch: 'split expects at least a 1-dimensional tensor' -- the same wording "
                  "split.Tensor gives; upstream does not distinguish the two overloads here",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/split_sizes/dim all by keyword.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, ten, (10,), "float32")
+    cases.append(
+        Case(
+            name="split_with_sizes(self=/split_sizes=/dim= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, split_sizes=[3, 3, 4], dim=0),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, split_sizes=[3, 3, 4], dim=0),
+            value_check=_chunk_list_check,
         )
     )
     return cases
@@ -8542,6 +8990,36 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
                  "but got 2-dimensional input of size [2, 3] instead'",
         )
     )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1): every
+    # argument by keyword at once -- `input`/`weight`, not `self`/`other`, are
+    # this schema's own names for the two tensor arguments, and this op alone
+    # accounts for six of the interned-name gap (groups/dilation/padding/
+    # output_padding/stride/transposed).
+    kw_x_t, kw_x_c = pair_from_flat(
+        torch_module, c_module,
+        [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, 0.5, 2.0, -2.0, 1.0, 0.0, 1.0, -1.0, 2.0, 3.0],
+        (1, 3, 5), "float32",
+    )
+    kw_w_t, kw_w_c = pair_from_flat(
+        torch_module, c_module,
+        [1.0, -1.0, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5, -1.0, 1.0, 0.0, 2.0],
+        (3, 1, 4), "float32",
+    )
+    cases.append(
+        Case(
+            name="convolution(every argument by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                input=kw_x_t, weight=kw_w_t, bias=None, stride=[1], padding=[3],
+                dilation=[1], transposed=False, output_padding=[0], groups=3,
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, input=kw_x_c, weight=kw_w_c, bias=None, stride=[1], padding=[3],
+                dilation=[1], transposed=False, output_padding=[0], groups=3,
+            ),
+        )
+    )
     return cases
 
 
@@ -8786,6 +9264,18 @@ def histc_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, g_c, 4, 0, 3),
             expect="both_error",
             note="torch: NotImplementedError('\"histogram_cpu\" not implemented for \\'Long\\'')",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/bins/min/max all by keyword.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, 3.0, 3.0, -1.0, 4.0], (7,), "float32")
+    cases.append(
+        Case(
+            name="histc(self=/bins=/min=/max= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, bins=4, min=0, max=3),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, bins=4, min=0, max=3),
         )
     )
     return cases
@@ -9055,6 +9545,22 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, self3_c, [idx3_c], values3_c, True),
             expect="c_error",
             note="torch computes accumulate=True; the shim refuses it by name (not measured/needed)",
+        )
+    )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # self/indices/values/accumulate all by keyword.
+    kw_self_t, kw_self_c = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
+    kw_idx_t, kw_idx_c = pair_from_flat(torch_module, c_module, [4, 3, 2, 1, 0], (5,), "int64")
+    kw_val_t, kw_val_c = pair_from_flat(torch_module, c_module, [10.0, 20.0, 30.0, 40.0, 50.0], (5,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(self=/indices=/values=/accumulate= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_self_t, indices=[kw_idx_t], values=kw_val_t, accumulate=False),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=kw_self_c, indices=[kw_idx_c], values=kw_val_c, accumulate=False
+            ),
         )
     )
     return cases
