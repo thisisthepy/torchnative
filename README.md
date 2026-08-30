@@ -271,7 +271,7 @@ rather than inferred from the host.
 |---|:--:|:--:|:--:|:--:|---|
 | `float32` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
 | `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm` |
-| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` and narrowed — upstream's rule, so **slower than `f32`** |
+| `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` in registers, accumulated, narrowed once — upstream's rule. Prefill is 1.19x `float32` here and **2.3x faster than upstream's own `bfloat16`**; decode still materialises the widened weight ([`docs/DTYPE_PERF.md`](docs/DTYPE_PERF.md)) |
 | `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | integer kernels |
 | `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | constructs, then hangs on most paths — excluded from the golden suite |
 | `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created |
