@@ -541,11 +541,34 @@ The class §0.3 names is not closed. This is the full remaining inventory — ev
 kernel in `aten.rs` and no `overloads.json` entry, split by whether that is a gap or correct:
 
 **Correct to have no `torch.<name>`** (no such public function upstream, or reached another
-way): `_local_scalar_dense`, `_safe_softmax`, `_scaled_dot_product_flash_attention_for_cpu`,
+way): `_local_scalar_dense`, ~~`_safe_softmax`~~, `_scaled_dot_product_flash_attention_for_cpu`,
 `_softmax`, `_to_copy`, `_unsafe_view`, `alias`, `lift_fresh`, `index`, `index_put_`, `slice`,
 `copy_`, `fill_`, `masked_fill`, `masked_fill_`, `new_ones`, `normal_`, `uniform_`, `view`,
 `contiguous`, `expand`, `detach`, `add_`, `sub_`, `mul_`, `div_`, `neg_`, `exp_`, `clamp_`,
 `relu_` — all of these are members, `_nn` entries, or private.
+
+> **Correction (docs/TRIL.md §2.3): `_safe_softmax` was in the wrong bucket, and both halves of
+> the justification were false.** `hasattr(torch, '_safe_softmax')` is `True` on 2.13.0 —
+> `torch._safe_softmax(x, 1)` is a real, working public function — and it fires
+> `aten._safe_softmax.default`, a *leaf* op, so it is not "reached another way" either. The
+> leading underscore is what put it here: the name reads as private, so nobody called it and
+> nobody checked. It has an `overloads.json` entry now.
+>
+> That mis-bucketing cost more than one missing name. Two refusals in
+> `bootstrap.py::scaled_dot_product_attention` went on naming `aten._safe_softmax.default` as a
+> kernel that did not exist, long after it did — because **a name nothing calls cannot correct
+> the text that says it is missing**. Both are fixed, and a test now asserts the *claim* (every
+> kernel a refusal names as present is in `_aten_implemented()`, every one it names as absent is
+> not) rather than the wording.
+>
+> `_scaled_dot_product_flash_attention_for_cpu` stays in this bucket, but half of its reason is
+> also imprecise: the flat name *does* exist upstream. The verdict is unchanged because the
+> kernel is genuinely reached another way — `F.scaled_dot_product_attention` on the 4-D
+> `dropout_p == 0` path — which is the half that holds.
+>
+> `_softmax` likewise stays, and for a reason that got stronger: `torch.softmax` and
+> `Tensor.softmax` now both reach it as Python-level composites (docs/TRIL.md §2.2), which is
+> what "reached another way" was supposed to mean here.
 
 **A real gap** — a public `torch.<name>` exists upstream, the kernel is here, and the name
 refuses: `abs`, `clamp`, `clone`, `cos`, `sin`, `reciprocal`, `eq`, `ne`, `lt`, `le`, `gt`,

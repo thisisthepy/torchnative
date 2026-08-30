@@ -134,7 +134,21 @@
     "reasons given there. `chunk` is `CompositeImplicitAutograd` upstream and",
     "lowers to `split.Tensor` or `split_with_sizes` depending on its",
     "arguments, so no single key is right; `__setitem__` is a walk over the",
-    "index like `__getitem__`, not one call."
+    "index like `__getitem__`, not one call.",
+    "",
+    "docs/TRIL.md added `amax`, `tril` and `triu` here, mirroring",
+    "`overloads.json` schema-for-schema (its README carries the accounting).",
+    "`Tensor.amax` is the case worth remembering: the kernel behind it landed",
+    "a round earlier and was golden-compared from the day it landed, while",
+    "*both* Python spellings raised. The harness dispatches by key and cannot",
+    "see a missing name; what caught it was a smoke test written by the round",
+    "that created the gap, asserting the refusal by name so that adding the",
+    "entry would break it. It did, and updating it was the notification.",
+    "",
+    "The `min` entry's `.dim` and `.other` schemas are no longer kernel-less",
+    "-- docs/SPELLINGS.md §7.2 listed them here precisely so they would refuse",
+    "by name, and docs/TRIL.md §3 implemented both. `torch.min(x, dim=0)` and",
+    "`torch.min(x, y)` compute now."
   ],
 
   "mul": [
@@ -381,6 +395,15 @@
 
   "argmax": [
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
+  "amax": [
+    "aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor"
+  ],
+  "tril": [
+    "aten::tril(Tensor self, SymInt diagonal=0) -> Tensor"
+  ],
+  "triu": [
+    "aten::triu(Tensor self, SymInt diagonal=0) -> Tensor"
   ],
   "topk": [
     "aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)"

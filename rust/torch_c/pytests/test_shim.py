@@ -759,10 +759,19 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
 
     This test asserted the broken state until the fix landed, so that it could
     not land silently. It now asserts the fixed state, and asserts the *scope*
-    of the widening as well: `_grouped_mm` is the only key the wider predicate
-    admits that the narrower one did not, so nothing else changed reachability
-    with it. If a second underscore-prefixed op is added to `overloads.json`
-    later, that assertion is where it announces itself.
+    of the widening as well: which underscore-prefixed keys the wider predicate
+    admits, enumerated rather than assumed harmless. It said "if a second
+    underscore-prefixed op is added to `overloads.json` later, that assertion
+    is where it announces itself" -- and one was:
+
+    `_safe_softmax` (docs/TRIL.md §2). The leading underscore is why it went
+    missing in the first place. It reads as private, so docs/ARCH20.md §9's
+    inventory filed it under "no such public function upstream" without
+    checking; `hasattr(torch, '_safe_softmax')` is `True` on 2.13.0, it fires
+    `aten._safe_softmax.default` as a leaf op, and this shim has had that
+    kernel golden-compared since docs/SDPA.md. Two refusals in
+    `scaled_dot_product_attention` meanwhile named it as a kernel that did not
+    exist -- see `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`.
     """
     fn = getattr(_C._VariableFunctions, "_grouped_mm")
     assert fn is not None
@@ -771,10 +780,14 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     )
     # The whole difference the widened predicate makes, enumerated rather
     # than assumed harmless: `_README` is still excluded (it is a list of
-    # prose, not schemas, and admitting it would fail to parse), and
-    # `_grouped_mm` is the only other underscore-prefixed key in the table.
+    # prose, not schemas, and admitting it would fail to parse), and these
+    # are the underscore-prefixed keys that reach a `torch.<name>` because of
+    # it. Both have kernels; neither would resolve under the old predicate.
     admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
-    assert admitted == ["_grouped_mm"], admitted
+    assert admitted == ["_grouped_mm", "_safe_softmax"], admitted
+    assert _C._shim_overloads["_safe_softmax"] == ["aten._safe_softmax.default"], (
+        _C._shim_overloads["_safe_softmax"]
+    )
 
     result = fn(
         _C._tensor_from_flat([1.0] * 16, [4, 4]),
@@ -6728,7 +6741,22 @@ def test_core_ops_and_op_tags_agree():
     # `torch.ops.aten.amax.default.tags` -- `['core', 'pt2_compliant_tag',
     # 'reduction']` -- rather than inferred from its neighbours, because
     # `max.dim` sitting next to it in this shim is *not* core.
-    assert r["tag_core_count"] == 83, r["tag_core_count"]
+    #
+    # 84 with docs/TRIL.md, and the *one* is the point: that round put five new
+    # keys into `_aten_implemented()` and only `min.dim` is core. Every one was
+    # read off its own `.tags` rather than inferred from a sibling, which is
+    # what stops this from being 88:
+    #
+    #     min.dim      ['core', 'pt2_compliant_tag', 'reduction']   <- counted
+    #     min.other    ['pointwise', 'pt2_compliant_tag']
+    #     max.other    ['pointwise', 'pt2_compliant_tag']           (promoted, not new)
+    #     tril.default ['pt2_compliant_tag']
+    #     triu.default ['pt2_compliant_tag']
+    #
+    # `min.dim` is core while `max.dim` -- the same overload of the mirror op,
+    # implemented by the same function -- is not. There is no rule to derive
+    # that from; it is upstream's table and it has to be read.
+    assert r["tag_core_count"] == 84, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -7890,7 +7918,19 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # kernel a second, function-shaped door, not a new kernel. Only
     # `scalar_tensor` and `convolution` are new identities: neither has a
     # `Tensor` receiver, so neither was ever a candidate for `methods.json`.
-    assert len(keys) == 217, len(keys)
+    #
+    # 220 with docs/TRIL.md's `amax`, `tril` and `triu`. **+3, not +6**, and
+    # that is the check rather than an aside: each of the three went into
+    # *both* tables in the same change, and this counts distinct
+    # `(qualname, overload)` pairs rather than table keys -- so a `torch.<name>`
+    # and a `Tensor.<name>` naming the same schema are one identity, exactly as
+    # `__iadd__`/`add_` were. Getting +6 here would mean the two tables had
+    # transcribed the same op differently.
+    #
+    # 221 with `_safe_softmax`, which is `overloads.json`-only: upstream has
+    # `torch._safe_softmax` and no `Tensor._safe_softmax`, so it adds one
+    # identity rather than two.
+    assert len(keys) == 221, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -8586,16 +8626,32 @@ def test_amax_propagates_nan_where_candles_own_reduction_drops_it():
         t = _C._tensor_from_flat(flat, [1, n], dtype=_C.float32)
         got = _C._aten_dispatch("aten.amax.default", t, [1], False).tolist()[0]
         assert math.isnan(got), f"a NaN at position {at} of {n} came back as {got}"
-    # `max.dim` on the same data still answers a number, which is candle's
-    # behaviour and not this kernel's. Asserted rather than left implicit so
-    # that the day candle fixes its reduction, this says so.
+    # This used to assert that `aten.max.dim` on the same data still answered a
+    # *number*, as the live proof that candle's predicate had not changed. It
+    # answers NaN now, and the assertion did its job: it failed the moment
+    # docs/TRIL.md §3 fixed `max.dim`, which is exactly the notification it was
+    # written to give.
+    #
+    # **The question that failure asks -- "is amax's own NaN pass now
+    # redundant?" -- is answered no, and the reason is where the callers are.**
+    # `max.dim`'s correction lives in `aten.rs`, above the aten dispatch
+    # boundary. `sdpa_flash_cpu` calls `crate::tensor::amax_keepdim` *directly*
+    # in Rust and never crosses that boundary, so an aten-level correction does
+    # not reach it. candle's own reduction is unchanged and still drops the
+    # NaN; that statement now lives where it can be made against candle
+    # directly rather than through an aten op that has stopped exhibiting it --
+    # `tensor.rs::candle_drops_the_nan_this_kernel_keeps`, a `cargo test`.
     flat = [float(i) for i in range(n)]
     flat[17] = float("nan")
     t = _C._tensor_from_flat(flat, [1, n], dtype=_C.float32)
-    values = _C._aten_dispatch("aten.max.dim", t, 1, False)[0].tolist()[0]
-    assert not math.isnan(values), (
-        "candle's max.dim no longer skips a NaN -- amax's separate NaN pass may "
-        "now be redundant, and docs/SEQLEN.md §7.2 should be revisited"
+    pair = _C._aten_dispatch("aten.max.dim", t, 1, False)
+    values, indices = pair[0].tolist()[0], pair[1].tolist()[0]
+    assert math.isnan(values), (
+        f"aten.max.dim dropped a NaN again -- docs/TRIL.md §3 fixed this; got {values}"
+    )
+    assert indices == 17, (
+        f"aten.max.dim must report the index of the first NaN, not of the "
+        f"maximum among the rest; got {indices}"
     )
 
 
@@ -8620,21 +8676,26 @@ def test_a_fully_masked_attention_row_reduces_to_negative_infinity():
     assert _C._aten_dispatch("aten.amax.default", t, [1], False).tolist() == [-12.5]
 
 
-def test_amax_has_no_python_spelling_yet_and_says_so_by_name():
-    """`torch.amax` and `Tensor.amax` do **not** resolve, and that is a gap.
+def test_amax_now_has_both_python_spellings_and_they_reach_the_kernel():
+    """`torch.amax` and `Tensor.amax` resolve, and give the kernel's answer.
 
-    The kernel and the aten key exist; what does not exist is an entry in
-    `src/overloads.json` (free function) or `src/methods.json` (member), which
-    is what routes a Python name to an overload. Until one is added, the only
-    reachable spelling is `torch.ops.aten.amax.default`, which is the one the
-    golden suite compares.
+    **This test previously asserted the opposite**, by name:
+    `test_amax_has_no_python_spelling_yet_and_says_so_by_name`. The kernel
+    landed in docs/SEQLEN.md §7 and the two Python names did not, so that round
+    wrote down the absence as an executable claim -- "when the table entry
+    lands, this test fails, which is the notification wanted". It did fail, on
+    the first run after the entries went into `src/overloads.json` and
+    `src/methods.json` (docs/TRIL.md §2), and this is the update it asked for.
 
-    This is here because docs/SURFACE_HONESTY.md's whole argument is that a
-    missing name must refuse by name rather than resolve to something else, and
-    because the golden harness is structurally blind to it: it dispatches by
-    key, so it would go on passing with no Python spelling at all. When the
-    table entry lands, this test fails -- which is the notification wanted, not
-    a nuisance.
+    That mechanism is the whole reason the gap did not go another round
+    unnoticed. The golden harness dispatches by key and is structurally blind
+    to a missing name -- `aten.amax.default` had been compared against upstream
+    since the day it landed, with 120 cases, while both Python spellings
+    raised. A kernel-level suite cannot see this class of gap; only a test
+    written *through the name* can.
+
+    So this checks three routes to one kernel and requires them to agree:
+    `torch.ops.aten.amax.default`, `torch.amax`, and `Tensor.amax`.
     """
     a = _C._tensor_from_flat([1.0, 5.0, 2.0, 9.0], [2, 2], dtype=_C.float32)
     assert _C._aten_dispatch("aten.amax.default", a, [1], False).tolist() == [5.0, 9.0]
@@ -8644,11 +8705,20 @@ def test_amax_has_no_python_spelling_yet_and_says_so_by_name():
     assert got["aten_key"] == [5.0, 9.0], got
     for label in ("torch.amax", "Tensor.amax"):
         answer = got[label]
-        assert answer.startswith("NotImplementedError"), (
-            f"{label} now resolves ({answer}) -- add a golden case through the "
-            f"spelling and update docs/SEQLEN.md §7.5"
+        assert answer == [5.0, 9.0], (
+            f"{label} did not reach the kernel: {answer!r} -- the entries are in "
+            f"overloads.json / methods.json, see docs/TRIL.md §2"
         )
-        assert "amax" in answer, f"{label} refused without naming itself: {answer}"
+    # The arguments the entry has to carry, not just the two-positional form:
+    # `keepdim`, a negative `dim`, the schema's `dim=[]` default (which reduces
+    # *everything*, unlike `sum`'s reading of an empty list), and keyword
+    # spellings. A table entry with the wrong signature resolves the simple
+    # call and fails these.
+    assert got["keepdim"] == [[5.0], [9.0]], got["keepdim"]
+    assert got["negative_dim"] == [5.0, 9.0], got["negative_dim"]
+    assert got["no_dim"] == 9.0, got["no_dim"]
+    assert got["by_keyword"] == [5.0, 9.0], got["by_keyword"]
+    assert got["member_keyword"] == [[5.0], [9.0]], got["member_keyword"]
 
 
 _AMAX_SPELLING_SCRIPT = r"""
@@ -8659,9 +8729,14 @@ out = {}
 t = torch.tensor([[1.0, 5.0], [2.0, 9.0]])
 out["aten_key"] = torch.ops.aten.amax.default(t, [1], False).tolist()
 for label, call in (("torch.amax", lambda x: torch.amax(x, 1)),
-                    ("Tensor.amax", lambda x: x.amax(1))):
+                    ("Tensor.amax", lambda x: x.amax(1)),
+                    ("keepdim", lambda x: torch.amax(x, 1, True)),
+                    ("negative_dim", lambda x: torch.amax(x, -1)),
+                    ("no_dim", lambda x: torch.amax(x)),
+                    ("by_keyword", lambda x: torch.amax(x, dim=1, keepdim=False)),
+                    ("member_keyword", lambda x: x.amax(dim=1, keepdim=True))):
     try:
-        out[label] = "resolved: %r" % (call(t).tolist(),)
+        out[label] = call(t).tolist()
     except NotImplementedError as e:
         out[label] = "NotImplementedError: %s" % e
 json.dump(out, sys.stdout)
@@ -9932,16 +10007,38 @@ def _max_dim_member():
 rec("max_dim_member", _max_dim_member)
 rec("min_whole_fn", lambda: torch.min(x).item())
 rec("min_whole_member", lambda: x.min().item())
-try:
-    torch.min(x, y)
-    out["min_other_fn"] = "ACCEPTED"
-except NotImplementedError as e:
-    out["min_other_fn"] = f"refused:{e}"
-try:
-    torch.min(x, dim=0)
-    out["min_dim_fn"] = "ACCEPTED"
-except NotImplementedError as e:
-    out["min_dim_fn"] = f"refused:{e}"
+# `min.other` and `min.dim` were recorded here as *refusals* while their
+# spelling-table entries existed with no kernel behind them (docs/SPELLINGS.md
+# §7.2, deliberately, so the refusal would name the right op). docs/TRIL.md §3
+# implemented both; these now compute, and this is where that shows.
+rec("min_other_fn", lambda: torch.min(x, y).tolist())
+rec("min_other_member", lambda: x.min(y).tolist())
+def _min_dim():
+    vals, idx = torch.min(m2d, 1)
+    return [vals.tolist(), idx.tolist()]
+rec("min_dim_fn", _min_dim)
+def _min_dim_member():
+    vals, idx = m2d.min(1)
+    return [vals.tolist(), idx.tolist()]
+rec("min_dim_member", _min_dim_member)
+
+# --- tril / triu / amax / softmax: docs/TRIL.md's four new names -----------
+tri = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+rec("tril_fn", lambda: torch.tril(tri).tolist())
+rec("tril_member", lambda: tri.tril().tolist())
+rec("tril_diag_fn", lambda: torch.tril(tri, 1).tolist())
+rec("tril_diag_member", lambda: tri.tril(diagonal=-1).tolist())
+rec("triu_fn", lambda: torch.triu(tri).tolist())
+rec("triu_member", lambda: tri.triu().tolist())
+rec("triu_diag_fn", lambda: torch.triu(tri, 1).tolist())
+# GPT-BigCode's own call, verbatim: a bool causal-mask buffer.
+rec("tril_bool_fn", lambda: torch.tril(torch.ones((3, 3), dtype=torch.bool)).tolist())
+rec("tril_bool_dtype", lambda: str(torch.tril(torch.ones((3, 3), dtype=torch.bool)).dtype))
+rec("amax_fn", lambda: torch.amax(m2d, 1).tolist())
+rec("amax_member", lambda: m2d.amax(1).tolist())
+rec("softmax_fn", lambda: torch.softmax(m2d, dim=1).tolist())
+rec("softmax_member", lambda: m2d.softmax(1).tolist())
+rec("softmax_dtype_fn", lambda: str(torch.softmax(m2d, 1, torch.float64).dtype))
 
 # --- mul: Tensor-Tensor and Tensor-Scalar, free function + member ---------
 rec("mul_tensor_fn", lambda: torch.mul(x, y).tolist())
@@ -10088,10 +10185,37 @@ def test_spelling_road_through_the_vendored_tree():
     eq("max_dim_member", [[5.0, 9.0], [1, 0]])
     eq("min_whole_fn", -3.0)
     eq("min_whole_member", -3.0)
-    got = out.get("min_other_fn", "")
-    assert got.startswith("refused:") and "min.other" in got, got
-    got = out.get("min_dim_fn", "")
-    assert got.startswith("refused:") and "min.dim" in got, got
+    # Both of these asserted a *refusal* until docs/TRIL.md §3 gave them
+    # kernels. x = [-1, 2, -3, 4], y = [1, 1, -3, 5].
+    close("min_other_fn", [-1.0, 1.0, -3.0, 4.0])
+    close("min_other_member", [-1.0, 1.0, -3.0, 4.0])
+    eq("min_dim_fn", [[1.0, 0.0], [0, 1]])
+    eq("min_dim_member", [[1.0, 0.0], [0, 1]])
+
+    # docs/TRIL.md's new names, every one through the Python spelling and the
+    # member -- the route the golden harness cannot see.
+    eq("tril_fn", [[1.0, 0.0, 0.0], [4.0, 5.0, 0.0], [7.0, 8.0, 9.0]])
+    eq("tril_member", [[1.0, 0.0, 0.0], [4.0, 5.0, 0.0], [7.0, 8.0, 9.0]])
+    eq("tril_diag_fn", [[1.0, 2.0, 0.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+    eq("tril_diag_member", [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [7.0, 8.0, 0.0]])
+    eq("triu_fn", [[1.0, 2.0, 3.0], [0.0, 5.0, 6.0], [0.0, 0.0, 9.0]])
+    eq("triu_member", [[1.0, 2.0, 3.0], [0.0, 5.0, 6.0], [0.0, 0.0, 9.0]])
+    eq("triu_diag_fn", [[0.0, 2.0, 3.0], [0.0, 0.0, 6.0], [0.0, 0.0, 0.0]])
+    eq("tril_bool_fn", [[True, False, False], [True, True, False], [True, True, True]])
+    eq("tril_bool_dtype", "torch.bool")
+    eq("amax_fn", [5.0, 9.0])
+    eq("amax_member", [5.0, 9.0])
+    # softmax rows: [1, 5, 2] and [9, 0, 3], each normalised along dim 1.
+    for key in ("softmax_fn", "softmax_member"):
+        rows = out.get(key, "<missing>")
+        assert isinstance(rows, list) and len(rows) == 2, f"{key}: {rows!r}"
+        for row, src in zip(rows, ([1.0, 5.0, 2.0], [9.0, 0.0, 3.0])):
+            assert abs(sum(row) - 1.0) < 1e-5, f"{key}: row does not sum to 1: {row!r}"
+            denom = sum(math.exp(v - max(src)) for v in src)
+            for got_v, s in zip(row, src):
+                want = math.exp(s - max(src)) / denom
+                assert abs(got_v - want) < 1e-5, f"{key}: {row!r} vs {src!r}"
+    eq("softmax_dtype_fn", "torch.float64")
 
     close("mul_tensor_fn", [-1.0, 2.0, 9.0, 20.0])
     close("mul_scalar_fn", [-2.0, 4.0, -6.0, 8.0])
@@ -10318,6 +10442,325 @@ def test_an_explicit_pytorch_jit_1_is_not_clobbered_by_the_default():
     r = _jit_explicit_enable_fixture()
     assert r["result"].startswith("REFUSED:"), r
     assert "make_range" in r["result"], r
+
+
+def test_the_whole_max_min_family_agrees_on_one_nan_rule():
+    """Six ops, one predicate, and this is the fourth time it has been repaired.
+
+    candle folds every reduction and every elementwise comparison with
+    `|x, y| x < y`. Comparison against a NaN is false, so a NaN the accumulator
+    does not *start* on is skipped. That single fact has produced four separate
+    wrong answers in this repository, found four separate times:
+
+        max.default / min.default   docs/E2E_REAL.md   value dropped
+        max.other                   docs/SPELLINGS.md  second operand's NaN dropped
+        amax                        docs/SEQLEN.md     avoided by construction, not repaired
+        max.dim, argmax             docs/TRIL.md       value AND index dropped
+
+    Written as one table over all of them rather than as six tests, because
+    what keeps going wrong is not any one kernel -- it is that a new member of
+    the family gets written against candle's primitive and inherits the fault
+    silently. A seventh op added to this table with no NaN handling fails here.
+
+    **Every case puts the NaN somewhere other than position 0 as well as at
+    it.** A NaN in element 0 seeds candle's accumulator and survives even a
+    kernel that does nothing about NaN, so a suite of `at=0` cases passes under
+    the bug -- the hole docs/SEQLEN.md §7.12 found in `amax`'s own first test.
+    """
+    nan = float("nan")
+
+    def t(flat, shape=None):
+        return _C._tensor_from_flat(flat, shape or [len(flat)], dtype=_C.float32)
+
+    for at, where in ((0, "first"), (1, "middle"), (3, "last")):
+        flat = [1.0, 5.0, 2.0, 9.0]
+        flat[at] = nan
+
+        # Whole-tensor reductions: the value is NaN.
+        for op in ("aten.max.default", "aten.min.default"):
+            got = _C._aten_dispatch(op, t(flat)).tolist()
+            assert math.isnan(got), f"{op} at={at} ({where}) gave {got}"
+
+        # amax: value only, no index.
+        got = _C._aten_dispatch("aten.amax.default", t(flat), [0], False).tolist()
+        assert math.isnan(got), f"amax at={at} ({where}) gave {got}"
+
+        # The dim reductions: BOTH halves of the pair. The index is the first
+        # NaN's position (measured upstream), not the position of the largest
+        # non-NaN -- and that distinction is the whole reason `max.dim` could
+        # not simply be routed through `amax`, which has no index to give.
+        for op in ("aten.max.dim", "aten.min.dim"):
+            pair = _C._aten_dispatch(op, t(flat), 0, False)
+            values, indices = pair[0].tolist(), pair[1].tolist()
+            assert math.isnan(values), f"{op} at={at} ({where}) values={values}"
+            assert indices == at, f"{op} at={at} ({where}) indices={indices}, want {at}"
+            # ...and the same through `.values` / `.indices`, which is how a
+            # caller actually spells it.
+            assert math.isnan(pair.values.tolist()), op
+            assert pair.indices.tolist() == at, op
+
+        # argmax: index only, and the same index.
+        got = _C._aten_dispatch("aten.argmax.default", t(flat), 0, False).tolist()
+        assert got == at, f"argmax at={at} ({where}) gave {got}, want {at}"
+
+        # The elementwise pair, with the NaN in each operand in turn. The
+        # asymmetry is the thing: candle's `broadcast_maximum` propagates a NaN
+        # in the *first* operand for free (nothing displaces an accumulator
+        # that already holds one) and drops one that is only in the second, so
+        # a suite testing only the first operand passes under the bug.
+        clean = [1.0, 5.0, 2.0, 9.0]
+        for op in ("aten.max.other", "aten.min.other"):
+            for label, a, b in (("nan in self", flat, clean), ("nan in other", clean, flat)):
+                got = _C._aten_dispatch(op, t(a), t(b)).tolist()
+                assert math.isnan(got[at]), f"{op} {label} at={at}: {got}"
+                # ...and only that lane. A correction that NaNs the whole
+                # tensor passes every isnan check above and fails here.
+                for i, v in enumerate(got):
+                    if i != at:
+                        assert not math.isnan(v), f"{op} {label} at={at} spread to {i}: {got}"
+
+    # Two NaNs: the earlier index wins, for every op that returns one. This is
+    # what separates "report the first NaN" from "report the last".
+    two = [1.0, nan, 2.0, nan]
+    for op in ("aten.max.dim", "aten.min.dim"):
+        assert _C._aten_dispatch(op, t(two), 0, False)[1].tolist() == 1, op
+    assert _C._aten_dispatch("aten.argmax.default", t(two), 0, False).tolist() == 1
+
+    # And the boundary the correction must NOT cross: `-inf` is ordered, not
+    # NaN. A repair keyed on "not finite" rather than on `x != x` passes every
+    # case above and turns a fully masked attention row into NaN here.
+    ninf = float("-inf")
+    row = [ninf, ninf, -2.0, ninf]
+    assert _C._aten_dispatch("aten.amax.default", t(row), [0], False).tolist() == -2.0
+    pair = _C._aten_dispatch("aten.max.dim", t(row), 0, False)
+    assert pair[0].tolist() == -2.0 and pair[1].tolist() == 2, pair
+    assert _C._aten_dispatch("aten.max.default", t([ninf] * 4)).tolist() == ninf
+    got = _C._aten_dispatch("aten.max.other", t([ninf, 1.0]), t([1.0, ninf])).tolist()
+    assert got == [1.0, 1.0], got
+
+    # A NaN in one slice and not the other: the correction is per-slice.
+    rows = _C._tensor_from_flat([1.0, nan, 2.0, 4.0, 9.0, 3.0], [2, 3], dtype=_C.float32)
+    pair = _C._aten_dispatch("aten.max.dim", rows, 1, False)
+    values, indices = pair[0].tolist(), pair[1].tolist()
+    assert math.isnan(values[0]) and values[1] == 9.0, values
+    assert indices == [1, 1], indices
+
+
+def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
+    """A refusal that names a kernel must be re-derived, not just re-worded.
+
+    `scaled_dot_product_attention` refused two inputs -- `dropout_p != 0` and a
+    non-4-D query -- and both messages said `aten._safe_softmax.default` had no
+    kernel. It has had one, golden-compared, since docs/SDPA.md. The
+    architecture that stayed blocked for weeks in docs/TORCHSCRIPT.md was
+    blocked by exactly this shape of mistake, and the bool-mask branch of this
+    same function already carries a note about being the first instance of it.
+
+    So this asserts the *claim*, not the wording: for every kernel a refusal
+    names as present, it must be in `_aten_implemented()`; for every one it
+    names as absent, it must not be. A refusal message that drifts out of
+    agreement with the artefact fails here rather than sitting unread.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _sdpa_refusal_fixture()
+    implemented = set(_C._aten_implemented()) | set(_C._aten_all_implemented())
+
+    for label in ("dropout", "three_d"):
+        message = r[label]
+        assert message.startswith("NotImplementedError"), f"{label}: {message}"
+        assert "math backend" in message, f"{label}: {message}"
+        # Nothing in either message may say a kernel is missing when it is not.
+        assert "_safe_softmax.default; it has no kernel" not in message, message
+        assert "aten._safe_softmax.default, " not in message, message
+
+    # The positive claims, checked against the artefact.
+    assert "aten._safe_softmax.default is " in r["dropout"], r["dropout"]
+    assert "aten._safe_softmax.default" in implemented
+    assert "_safe_softmax" in r["three_d"], r["three_d"]
+    for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
+        assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
+    # ...and the negative ones.
+    for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
+        assert op not in implemented, (
+            f"{op} now has a kernel -- the dropout refusal names it as missing "
+            f"and has gone stale again"
+        )
+
+    # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
+    # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
+    # shim implements, and it refused with "no table entry" the whole time.
+    # docs/ARCH20.md §9 filed it under "no such public function upstream",
+    # which is how a name nothing calls stops correcting the text about it.
+    assert r["safe_softmax_spelling"] is not None, r
+    rows = r["safe_softmax_spelling"]
+    for row in rows:
+        assert abs(sum(row) - 1.0) < 1e-5, rows
+    # The fully-masked row is what distinguishes this op from `_softmax`: it
+    # answers zeros where `_softmax` answers NaN. That difference is the entire
+    # reason the SDPA math fallback refuses instead of substituting.
+    assert r["safe_softmax_masked_row"] == [0.0, 0.0, 0.0], r["safe_softmax_masked_row"]
+
+
+_SDPA_REFUSAL_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {}
+q = torch.randn(1, 2, 3, 4)
+try:
+    torch.nn.functional.scaled_dot_product_attention(q, q, q, dropout_p=0.5)
+    out["dropout"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["dropout"] = "NotImplementedError: %s" % e
+q3 = torch.randn(2, 3, 4)
+try:
+    torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)
+    out["three_d"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["three_d"] = "NotImplementedError: %s" % e
+
+try:
+    out["safe_softmax_spelling"] = torch._safe_softmax(
+        torch.tensor([[1.0, 5.0, 2.0], [9.0, 0.0, 3.0]]), 1).tolist()
+except NotImplementedError as e:
+    out["safe_softmax_spelling"] = None
+try:
+    ninf = float("-inf")
+    out["safe_softmax_masked_row"] = torch._safe_softmax(
+        torch.tensor([[ninf, ninf, ninf]]), 1).tolist()[0]
+except NotImplementedError as e:
+    out["safe_softmax_masked_row"] = None
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _sdpa_refusal_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _SDPA_REFUSAL_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"sdpa-refusal subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_max_min_dim_return_types_are_named_for_their_own_op():
+    """`min.dim`'s pair must not print as `max(...)`.
+
+    Upstream returns a structseq whose type is `torch.return_types.min`; this
+    shim returns a `collections.namedtuple` (docs/TENSORBASE.md says why), and
+    the one thing that has to survive the substitution is the *name*, because
+    it is what `repr()` shows and what a traceback shows. Sharing one cached
+    namedtuple between the two overloads -- the obvious economy, since the
+    field names are identical -- would make every `min` result claim to be a
+    `max`.
+    """
+    a = _C._tensor_from_flat([1.0, 5.0, 2.0, 9.0], [2, 2], dtype=_C.float32)
+    hi = _C._aten_dispatch("aten.max.dim", a, 1, False)
+    lo = _C._aten_dispatch("aten.min.dim", a, 1, False)
+    assert type(hi).__name__ == "max", type(hi).__name__
+    assert type(lo).__name__ == "min", type(lo).__name__
+    assert type(hi) is not type(lo)
+    assert hi._fields == ("values", "indices") == lo._fields
+    assert hi.values.tolist() == [5.0, 9.0] and hi.indices.tolist() == [1, 1]
+    assert lo.values.tolist() == [1.0, 2.0] and lo.indices.tolist() == [0, 0]
+    assert "min(" in repr(lo), repr(lo)
+
+
+def test_tril_and_triu_zero_by_selecting_not_by_multiplying():
+    """The mistake that passes every case built from small integers.
+
+    A 0/1 mask of the input's dtype and a broadcast multiply is the obvious
+    implementation of "zero one side of the diagonal", and `nan * 0` is `nan`
+    while `inf * 0` is `nan` too. Upstream zeroes those positions like any
+    other -- measured, `tril([[1, nan], [inf, -inf]])` is `[[1, 0], [inf,
+    -inf]]` -- so a multiply turns a masked-out `-inf` into a NaN and every
+    test written with `ones` and `arange` goes on passing.
+
+    Also pins the sign convention in both directions, which is the other thing
+    here that fails silently: a swapped `tril`/`triu` produces the same shape,
+    the same dtype and the same magnitudes.
+    """
+    nan, pinf, ninf = float("nan"), float("inf"), float("-inf")
+    m = _C._tensor_from_flat(
+        [1.0, nan, pinf, ninf, nan, 2.0, ninf, pinf, 0.0], [3, 3], dtype=_C.float32
+    )
+
+    def cell(t, i, j):
+        return t.tolist()[i][j]
+
+    lower = _C._aten_dispatch("aten.tril.default", m, 0)
+    # Above the diagonal: zeroed, whatever was there.
+    for i, j in ((0, 1), (0, 2), (1, 2)):
+        assert cell(lower, i, j) == 0.0, f"tril kept ({i},{j}): {cell(lower, i, j)}"
+    # On and below: untouched, NaN and infinities included.
+    assert cell(lower, 0, 0) == 1.0
+    assert math.isnan(cell(lower, 1, 1))
+    assert cell(lower, 1, 0) == ninf and cell(lower, 2, 0) == ninf
+    assert cell(lower, 2, 1) == pinf
+
+    upper = _C._aten_dispatch("aten.triu.default", m, 0)
+    for i, j in ((1, 0), (2, 0), (2, 1)):
+        assert cell(upper, i, j) == 0.0, f"triu kept ({i},{j}): {cell(upper, i, j)}"
+    assert math.isnan(cell(upper, 0, 1))
+    assert cell(upper, 0, 2) == pinf and cell(upper, 1, 2) == 2.0
+
+    # The sign convention, on data where every position is distinguishable.
+    x = _C._tensor_from_flat([float(v) for v in range(1, 10)], [3, 3], dtype=_C.float32)
+    assert _C._aten_dispatch("aten.tril.default", x, 0).tolist() == [
+        [1.0, 0.0, 0.0], [4.0, 5.0, 0.0], [7.0, 8.0, 9.0]]
+    assert _C._aten_dispatch("aten.tril.default", x, 1).tolist() == [
+        [1.0, 2.0, 0.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
+    assert _C._aten_dispatch("aten.tril.default", x, -1).tolist() == [
+        [0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [7.0, 8.0, 0.0]]
+    assert _C._aten_dispatch("aten.triu.default", x, 0).tolist() == [
+        [1.0, 2.0, 3.0], [0.0, 5.0, 6.0], [0.0, 0.0, 9.0]]
+    assert _C._aten_dispatch("aten.triu.default", x, 1).tolist() == [
+        [0.0, 2.0, 3.0], [0.0, 0.0, 6.0], [0.0, 0.0, 0.0]]
+    assert _C._aten_dispatch("aten.triu.default", x, -1).tolist() == [
+        [1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [0.0, 8.0, 9.0]]
+    # Unbounded in both directions -- not clamped, not an index.
+    assert _C._aten_dispatch("aten.tril.default", x, 100).tolist() == x.tolist()
+    assert _C._aten_dispatch("aten.tril.default", x, -100).tolist() == [[0.0] * 3] * 3
+    assert _C._aten_dispatch("aten.triu.default", x, 100).tolist() == [[0.0] * 3] * 3
+    assert _C._aten_dispatch("aten.triu.default", x, -100).tolist() == x.tolist()
+
+    # A transposed (non-contiguous) receiver is masked by position in the
+    # *matrix*, not by position in memory.
+    #
+    # **This assertion cannot currently fail, and saying so is the point.**
+    # Deleting the kernel's `.contiguous()` was injected as a fault and every
+    # gate stayed green (docs/TRIL.md §5, fault 3) -- candle's `WCond` already
+    # falls back to `strided_index()` for a non-contiguous operand. It is here
+    # as coverage of the shape, not as a check of the normalisation; if candle
+    # ever loses that fallback this is where it shows, and until then nobody
+    # should read a green run as evidence the `.contiguous()` is doing work.
+    xt = _C._aten_dispatch("aten.t.default", x)
+    assert _C._aten_dispatch("aten.tril.default", xt, 0).tolist() == [
+        [1.0, 0.0, 0.0], [2.0, 5.0, 0.0], [3.0, 6.0, 9.0]]
+
+    # Rank < 2 refuses with upstream's wording, on both names.
+    for op, name in (("aten.tril.default", "tril"), ("aten.triu.default", "triu")):
+        for flat, shape in (([1.0], []), ([1.0, 2.0], [2])):
+            small = _C._tensor_from_flat(flat, shape, dtype=_C.float32)
+            try:
+                _C._aten_dispatch(op, small, 0)
+            except RuntimeError as e:
+                assert "at least 2 dimensions" in str(e), str(e)
+                assert str(e).startswith(name), str(e)
+            else:
+                raise AssertionError(f"{op} accepted a rank-{len(shape)} input")
 
 
 def _main():

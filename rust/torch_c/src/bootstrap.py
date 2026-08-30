@@ -4804,9 +4804,25 @@ def _install_nn(module, dispatch) -> None:
     # (`mul.Scalar`, `expand`, `view`, `bmm`, `_safe_softmax`, ...).
     #
     # Only the flash path is wired. The math fallback is refused by name rather
-    # than approximated, because `aten._safe_softmax.default` has no kernel
-    # here and silently substituting a plain softmax would differ from upstream
-    # exactly on the fully-masked rows that `_safe_softmax` exists for.
+    # than approximated, because silently substituting a plain softmax for
+    # `_safe_softmax` would differ from upstream exactly on the fully-masked
+    # rows that `_safe_softmax` exists for.
+    #
+    # **The reason given here used to be "`aten._safe_softmax.default` has no
+    # kernel", and that stopped being true.** It has been in `IMPLEMENTED` and
+    # golden-compared since docs/SDPA.md; so have `mul.Scalar`, `expand`,
+    # `view` and `bmm`. Re-checked against the built artefact rather than
+    # against this comment (docs/TRIL.md §2): every kernel the math backend
+    # needs for the 3-D and non-4-D cases is present, and what is missing is
+    # the *composite* -- nobody has transcribed upstream's math-backend op
+    # sequence, its scale handling or its mask expansion. That is a real
+    # reason to refuse and it is a different one. The refusals below say so.
+    #
+    # This is the second time a refusal in this function went stale (the
+    # bool-mask one below is the first), and both times the text named kernels
+    # that had since landed. A refusal is code that never runs on the happy
+    # path, so nothing re-reads it; the rule this repository keeps re-learning
+    # is that touching one means re-deriving its claim, not just its wording.
     #
     # The aten op returns `(output, logsumexp)`; upstream's binding returns the
     # first. `logsumexp` is dropped here for the same reason upstream drops it:
@@ -4828,15 +4844,18 @@ def _install_nn(module, dispatch) -> None:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 "scaled_dot_product_attention(dropout_p != 0) -- upstream drops to "
-                "the math backend here, which needs aten._safe_softmax.default, "
-                "aten.bernoulli_.float and aten.div_.Scalar; none has a kernel"
+                "the math backend here. Its aten._safe_softmax.default is "
+                "implemented; aten.bernoulli_.float and aten.div_.Scalar are not, "
+                "and the math-backend composite itself is not written"
             )
         if query.dim() != 4:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 f"scaled_dot_product_attention on a {query.dim()}-D query -- upstream "
-                "drops to the math backend for anything but 4-D {B, H, T, K}, which "
-                "needs aten._safe_softmax.default; it has no kernel"
+                "drops to the math backend for anything but 4-D {B, H, T, K}. Every "
+                "kernel that backend needs is implemented here "
+                "(_safe_softmax, mul.Scalar, expand, view, bmm); what is missing is "
+                "the composite that sequences them, which nobody has transcribed"
             )
         if attn_mask is not None and attn_mask.dtype == module.bool:
             # `convert_boolean_attn_mask`, and it is now built rather than
@@ -5271,6 +5290,45 @@ def _install_composites(module, varfns, dispatch) -> None:
     flatten.__name__ = flatten.__qualname__ = "flatten"
     flatten.__module__ = "torch._C"
     setattr(varfns, "flatten", flatten)
+
+    # ...and `torch.softmax`, the same shape of gap as `flatten` above, found
+    # by running `torch.softmax(x, dim=1)` rather than by reading a list.
+    #
+    # `Tensor.softmax` has worked since docs/NN_SURFACE.md §6 (installed by
+    # `_install_tensor_softmax`), and `aten._softmax.default` has been
+    # implemented and golden-compared far longer than that -- but the free
+    # function refused with "overload resolution has no table entry", pointing
+    # the caller at `torch.ops.aten.softmax.<overload>`, a work item that
+    # cannot be closed.
+    #
+    # **An `overloads.json` entry would be the wrong fix, and the near-miss is
+    # close enough to be tempting.** The parser-level key for `torch.softmax`
+    # is `aten::softmax.int(Tensor self, int dim, ScalarType? dtype=None)` --
+    # a real ATen op with a real schema, so the table would validate and
+    # `verify_schemas.py` would pass -- but it is `CompositeImplicitAutograd`
+    # and never reaches a kernel. Re-measured for this change with a
+    # `TorchDispatchMode` logger on torch 2.13.0:
+    #
+    #     torch.softmax(x, dim=1)                      -> aten._softmax.default
+    #     torch.softmax(x, dim=1, dtype=torch.float64) -> aten._to_copy.default
+    #                                                     then aten._softmax.default
+    #     x.softmax(1)                                 -> aten._softmax.default
+    #     F.softmax(x, dim=1)                          -> aten._softmax.default
+    #
+    # `aten.softmax.int` never fires, for any of the four. Naming it would move
+    # the refusal from a generic message to a *specific wrong* one -- the
+    # `layer_norm` complaint above, and the reason `methods.json`'s README
+    # keeps `softmax` out of that table too.
+    #
+    # Bound to the member for the same reason `flatten` is: they are one
+    # function, so the free spelling and the member cannot disagree about
+    # `dtype=` handling or about `half_to_float`.
+    def softmax(input, dim, dtype=None):
+        return module.TensorBase.softmax(input, dim, dtype)
+
+    softmax.__name__ = softmax.__qualname__ = "softmax"
+    softmax.__module__ = "torch._C"
+    setattr(varfns, "softmax", softmax)
 
     def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         """`torch.conv1d` -- `mamba`'s depthwise causal convolution.

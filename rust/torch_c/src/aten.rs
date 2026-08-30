@@ -114,9 +114,12 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.matmul.default",
     "aten.max.default",
     "aten.max.dim",
+    "aten.max.other",
     "aten.mean.default",
     "aten.mean.dim",
     "aten.min.default",
+    "aten.min.dim",
+    "aten.min.other",
     "aten.mm.default",
     "aten.mul.Scalar",
     "aten.mul.Tensor",
@@ -162,6 +165,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.tanh.default",
     "aten.topk.default",
     "aten.transpose.int",
+    "aten.tril.default",
+    "aten.triu.default",
     "aten.unbind.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
@@ -193,13 +198,19 @@ pub const IMPLEMENTED: &[&str] = &[
 /// re-measurement of `falcon` under `_aten_all_implemented()` found the
 /// kernel already dispatching, so the remaining work was exactly the case
 /// builder the comment above describes, plus this one line move.
+///
+/// `aten.max.other` was the second, and it is worth recording that the case
+/// builder written for it while it was parked here (docs/SPELLINGS.md §7.3)
+/// *found a live defect* -- a NaN in the second operand was dropped -- and
+/// held it as a deliberately failing case until the kernel could be fixed.
+/// Promotion and fix landed together; a builder written against a parked op is
+/// not a formality.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.add.Scalar",
     "aten.any.dims",
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
-    "aten.max.other",
     "aten.randint.default",
     "aten.reshape.default",
     "aten.sub.Scalar",
@@ -931,8 +942,12 @@ fn aten_dispatch_inner(
         "aten.cumsum.default" => cumsum_default(py, args, kwargs),
         "aten.max.default" => extremum_default(py, args, kwargs, Extremum::Max),
         "aten.min.default" => extremum_default(py, args, kwargs, Extremum::Min),
-        "aten.max.dim" => max_dim(py, args, kwargs),
-        "aten.max.other" => max_other(py, args, kwargs),
+        "aten.max.dim" => extremum_dim(py, args, kwargs, Extremum::Max),
+        "aten.min.dim" => extremum_dim(py, args, kwargs, Extremum::Min),
+        "aten.max.other" => extremum_other(py, args, kwargs, Extremum::Max),
+        "aten.min.other" => extremum_other(py, args, kwargs, Extremum::Min),
+        "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower),
+        "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper),
         "aten.any.default" => any_default(py, args, kwargs),
         "aten.any.dim" => any_dim(py, args, kwargs, "aten.any.dim", false),
         "aten.any.dims" => any_dim(py, args, kwargs, "aten.any.dims", true),
@@ -3672,6 +3687,15 @@ fn scalar_tensor_default(
 ///
 /// The result is int64. candle's `argmax` yields `u32`, which would be a
 /// visible dtype divergence on the very first `generate()` step.
+///
+/// **A NaN wins, and it is the first NaN that wins.** `argmax([1., nan, 3.])`
+/// is `1` upstream (measured) -- there is no ordering under which a real
+/// number beats a NaN, so the reduction stops at the first one it meets. This
+/// build answered `2`, the same dropped-NaN fault `max.dim`, `max.other` and
+/// `max.default` each had in turn, from the same `|x, y| x < y` predicate.
+/// Corrected through the shared `nan_along_dim` rather than a fourth private
+/// repair; the correction runs only when the input really holds a NaN, so
+/// sampling's own `argmax` keeps the exact bits it had.
 fn argmax_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -3681,30 +3705,48 @@ fn argmax_default(
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let dim = dim_arg(args, kwargs, 1, "dim")?;
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+    let tag = input.tag();
 
     let tensor = match dim {
         None => {
+            // `dim=None` flattens, so the whole tensor is one reduced slice and
+            // the answer is a *flat* index -- which is why the correction has
+            // to happen against `flat`, not against the original shape.
             let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(OP, e))?;
-            let reduced = flat.argmax(0).map_err(|e| candle_err(OP, e))?;
+            let mut reduced = flat
+                .argmax_keepdim(0)
+                .and_then(|t| t.to_dtype(candle_core::DType::I64))
+                .map_err(|e| candle_err(OP, e))?;
+            if let Some((any, first)) = nan_along_dim(OP, &flat, 0, tag)? {
+                reduced = any
+                    .where_cond(&first, &reduced)
+                    .map_err(|e| candle_err(OP, e))?;
+            }
             if keepdim {
                 reduced.reshape(1).map_err(|e| candle_err(OP, e))?
             } else {
-                reduced
+                reduced.reshape(()).map_err(|e| candle_err(OP, e))?
             }
         }
         Some(dim) => {
             let dim = normalise_dim(OP, dim, input.tensor()?.rank())?;
-            if keepdim {
-                input.tensor()?.argmax_keepdim(dim)
-            } else {
-                input.tensor()?.argmax(dim)
+            let mut reduced = input
+                .tensor()?
+                .argmax_keepdim(dim)
+                .and_then(|t| t.to_dtype(candle_core::DType::I64))
+                .map_err(|e| candle_err(OP, e))?;
+            if let Some((any, first)) = nan_along_dim(OP, input.tensor()?, dim, tag)? {
+                reduced = any
+                    .where_cond(&first, &reduced)
+                    .map_err(|e| candle_err(OP, e))?;
             }
-            .map_err(|e| candle_err(OP, e))?
+            if keepdim {
+                reduced
+            } else {
+                reduced.squeeze(dim).map_err(|e| candle_err(OP, e))?
+            }
         }
     };
-    let tensor = tensor
-        .to_dtype(candle_core::DType::I64)
-        .map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, TorchDType::Int64)
 }
 
@@ -5616,6 +5658,91 @@ fn amax_default(
     finish(py, out, input.tag())
 }
 
+/// Where the NaNs are along one dimension: `(any, first)`, both keeping the
+/// reduced dimension, or `None` when there is nothing to correct.
+///
+/// **This is the third repair of one predicate and it is meant to be the
+/// last.** candle's reduction and comparison kernels all fold with `|x, y| x <
+/// y`, and every comparison against a NaN is false, so a NaN that is not the
+/// element the accumulator *started* on is skipped. Three ops had shipped that
+/// answer: `max.default`/`min.default` (docs/E2E_REAL.md), `max.other`'s second
+/// operand (docs/SPELLINGS.md §7.2), and `max.dim`, which dropped both the
+/// value and the index. `tensor::amax_keepdim` was written specifically to
+/// avoid it (docs/SEQLEN.md §7.2). Rather than a fourth hand-rolled repair,
+/// every reduction in the family now asks this one function.
+///
+/// **`amax`'s `CustomOp1` is not the mechanism here, and the reason is
+/// structural rather than a preference.** That kernel is fast because it drops
+/// the index, which lets sixteen accumulator lanes run without a loop-carried
+/// compare-and-select. `max.dim`, `min.dim` and `argmax` *need* the index, so
+/// `cpu_backend::ReduceIndex` runs whatever this does; routing their values
+/// through `amax` as well would add a pass rather than remove one. What
+/// transfers is the *rule*, not the kernel -- and the rule costs two
+/// vectorised passes (`ne`, then one reduction over a 0/1 mask), the same
+/// shape of correction `extremum_default` above already pays.
+///
+/// Two measured facts hold this together, both read off torch 2.13.0 rather
+/// than reasoned about:
+///
+///   * `max(dim=)` and `min(dim=)` report the index of the **first** NaN in the
+///     slice, not of the extremum among the non-NaN elements:
+///     `max([1, nan, nan], dim=0)` is `(nan, 1)`.
+///   * `argmax`/`argmin` report that same index -- `argmax([1, nan, 3])` is
+///     `1`, not `2`.
+///
+/// So "the first NaN" is the only position any of them needs, and `argmax` over
+/// the 0/1 NaN mask *is* that position: candle's own reduction keeps the first
+/// of two equal elements, which is the one respect in which its fold is
+/// exactly right.
+///
+/// Returns `None` for an integral or boolean dtype (there is no NaN to find,
+/// and the mask passes would be pure cost) **and** for a float tensor that
+/// happens to contain none. The second case is not just an optimisation: it
+/// keeps a NaN-free reduction bit-for-bit on the path it already took, so the
+/// prefill hash cannot move because of a correction that never applies.
+fn nan_along_dim(
+    op: &str,
+    source: &Tensor,
+    dim: usize,
+    tag: TorchDType,
+) -> PyResult<Option<(Tensor, Tensor)>> {
+    if !tag.is_floating_point() {
+        return Ok(None);
+    }
+    // `f32` rather than the `u8` that `ne` yields: candle generates `argmax`
+    // for the float and wide-integer arms, and `u8` is not one of them.
+    let flags = source
+        .ne(source)
+        .and_then(|m| m.to_dtype(candle_core::DType::F32))
+        .map_err(|e| candle_err(op, e))?;
+    let total = flags
+        .sum_all()
+        .and_then(|s| s.to_scalar::<f32>())
+        .map_err(|e| candle_err(op, e))?;
+    if total == 0.0 {
+        return Ok(None);
+    }
+    let any = flags
+        .max_keepdim(dim)
+        .and_then(|m| m.ne(0f32))
+        .map_err(|e| candle_err(op, e))?;
+    let first = flags
+        .argmax_keepdim(dim)
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .map_err(|e| candle_err(op, e))?;
+    Ok(Some((any, first)))
+}
+
+/// A NaN of `tag`'s dtype, shaped like `like`. Built through `f64` and
+/// `fast_to` for the same reason `extremum_default` does -- `Tensor::full`
+/// takes one Rust scalar type, and the tag decides the storage.
+fn nan_shaped_like(op: &str, like: &Tensor, tag: TorchDType) -> PyResult<Tensor> {
+    let storage = PyDtype::new(tag).storage(op)?;
+    Tensor::full(f64::NAN, like.shape(), like.device())
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(op, e))
+}
+
 /// The first value that occurs twice in `dims`, if any. Written out rather than
 /// sorted-and-scanned because the message upstream prints names the *repeated
 /// dimension*, not its position, and sorting would lose which one arrived first
@@ -5630,21 +5757,181 @@ fn first_repeat(dims: &[usize]) -> Option<usize> {
     None
 }
 
-/// `aten::max.other(Tensor self, Tensor other)` -- elementwise, and upstream
-/// decomposes it to `maximum` (measured).
-fn max_other(
+/// Which side of the diagonal survives.
+#[derive(Clone, Copy)]
+enum Triangle {
+    Lower,
+    Upper,
+}
+
+/// `aten::tril(Tensor self, SymInt diagonal=0) -> Tensor` and
+/// `aten::triu(Tensor self, SymInt diagonal=0) -> Tensor`.
+///
+/// The last two dimensions are read as a matrix and everything on the wrong
+/// side of the `diagonal`-th diagonal is zeroed; leading dimensions are a
+/// batch, and the same mask applies to every matrix in it. **The sign
+/// convention is read off `native_functions.yaml` and then measured, because it
+/// is the one thing here that fails silently if it is backwards:**
+///
+/// ```text
+/// tril  keeps  j - i <= diagonal      triu  keeps  j - i >= diagonal
+///
+/// tril(ones(3,3), -1)   strictly below      triu(ones(3,3), 1)   strictly above
+/// tril(ones(3,3),  1)   one band extra      triu(ones(3,3), -1)  one band extra
+/// ```
+///
+/// A positive `diagonal` moves the boundary *up and right* for both, so it
+/// widens `tril` and narrows `triu`. Both are unbounded -- `tril(x, 100)` is
+/// `x` and `tril(x, -100)` is all zeros -- so the offset is not range-checked,
+/// only compared.
+///
+/// **The zeroing is a select, not a multiply by a mask.** `nan * 0` is `nan`
+/// and `inf * 0` is `nan`, and upstream zeroes those positions like any other
+/// (measured: `tril([[1, nan], [inf, -inf]])` is `[[1, 0], [inf, -inf]]`, and
+/// `triu` of the same drops the `inf` cleanly). A masked multiply would turn a
+/// masked-out `-inf` into a `nan`, which is precisely the kind of
+/// plausible-looking wrong answer this repository keeps finding.
+///
+/// Every dtype passes through unchanged, `torch.bool` included -- which is the
+/// call GPT-BigCode actually makes: `torch.tril(torch.ones((n, n),
+/// dtype=torch.bool))` as its causal-mask buffer (docs/TORCHSCRIPT.md §6).
+///
+/// Rank is checked first and refused with upstream's own wording; a 1-D or
+/// 0-D input has no diagonal to speak of.
+fn tril_triu(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    which: Triangle,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max.other";
-    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
-    let tag = same_dtype(OP, &lhs, &rhs)?;
-    let out = lhs
+    let (op, name) = match which {
+        Triangle::Lower => ("aten.tril.default", "tril"),
+        Triangle::Upper => ("aten.triu.default", "triu"),
+    };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let diagonal = int_arg(args, kwargs, 1, "diagonal")?.unwrap_or(0);
+    let tag = input.tag();
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() < 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{name}: input tensor must have at least 2 dimensions"
+        )));
+    }
+    // Contiguous first -- and this is defensive rather than load-bearing,
+    // which was measured rather than assumed. Removing it was injected as a
+    // deliberate fault (docs/TRIL.md §5, fault 3) and **no test failed**:
+    // candle's `WCond` matches on `contiguous_offsets()` and falls back to
+    // `strided_index()` for all three operands, so a transposed `on_true` is
+    // read by position-in-the-matrix already. `tril(x.t())`,
+    // `tril(z.transpose(1, 2))` and `tril(z[:, :, 1:3])` all answer correctly
+    // without it.
+    //
+    // Kept anyway, and the reason is stated so the next reader does not have
+    // to re-derive it: the mask below is built row-major and handed to
+    // `broadcast_as`, so the kernel's correctness would rest on an internal
+    // detail of candle's cpu backend rather than on anything this function
+    // establishes. One copy on an input that is almost never non-contiguous
+    // (GPT-BigCode's is a fresh `ones`) buys not having that dependency.
+    let source = input
         .tensor()?
-        .broadcast_maximum(rhs.tensor()?)
-        .map_err(|e| candle_err(OP, e))?;
+        .contiguous()
+        .map_err(|e| candle_err(op, e))?;
+    if source.elem_count() == 0 {
+        // `tril(empty(0, 3))` is `empty(0, 3)` -- shape preserved, nothing to
+        // zero. Returned before the mask is built because a zero-extent
+        // `where_cond` is an edge case with no work in it either way.
+        return finish(py, source, tag);
+    }
+
+    let cols = dims[dims.len() - 1];
+    let rows = dims[dims.len() - 2];
+    let mut mask = Vec::with_capacity(rows * cols);
+    for i in 0..rows {
+        for j in 0..cols {
+            let offset = j as i64 - i as i64;
+            let keep = match which {
+                Triangle::Lower => offset <= diagonal,
+                Triangle::Upper => offset >= diagonal,
+            };
+            mask.push(u8::from(keep));
+        }
+    }
+    let mask = Tensor::from_vec(mask, (rows, cols), source.device())
+        .and_then(|m| m.broadcast_as(source.shape()))
+        .and_then(|m| m.contiguous())
+        .map_err(|e| candle_err(op, e))?;
+    let zeros = Tensor::zeros(source.shape(), source.dtype(), source.device())
+        .map_err(|e| candle_err(op, e))?;
+    let out = mask
+        .where_cond(&source, &zeros)
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::max.other(Tensor self, Tensor other)` and
+/// `aten::min.other(Tensor self, Tensor other)` -- elementwise, and upstream
+/// documents both as aliases of `maximum`/`minimum` (measured: `torch.max(a,
+/// b)` dispatches to `aten::maximum`, `torch.min(a, b)` to `aten::minimum`).
+///
+/// **The NaN rule is IEEE `maximum`/`minimum`, not `fmax`/`fmin`: a NaN on
+/// *either* side wins.** candle's `broadcast_maximum` is `|x, y| x > y`
+/// elementwise, which propagates a NaN in the first operand (nothing displaces
+/// it) and drops one in the second. docs/SPELLINGS.md §7.2 found that
+/// asymmetry and pinned it as a failing golden case rather than fixing it;
+/// this is the fix. The correction is a mask over the *broadcast* shape, since
+/// either operand's NaN has to reach every element it broadcasts to --
+/// `max.other([1., 2.], [nan])` is `[nan, nan]` upstream.
+///
+/// Skipped entirely when neither operand holds a NaN, so a NaN-free call keeps
+/// the bits candle's own kernel produced.
+fn extremum_other(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    which: Extremum,
+) -> PyResult<Py<PyAny>> {
+    let op = match which {
+        Extremum::Max => "aten.max.other",
+        Extremum::Min => "aten.min.other",
+    };
+    let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+    let tag = same_dtype(op, &lhs, &rhs)?;
+    let (a, b) = (lhs.tensor()?, rhs.tensor()?);
+    let out = match which {
+        Extremum::Max => a.broadcast_maximum(b),
+        Extremum::Min => a.broadcast_minimum(b),
+    }
+    .map_err(|e| candle_err(op, e))?;
+
+    if !tag.is_floating_point() {
+        return finish(py, out, tag);
+    }
+    // "either side is NaN", broadcast to the result shape. Added rather than
+    // or-ed because candle's logical ops are on masks of one shape and
+    // `broadcast_add` is the operation that already does the shape join; the
+    // sum of two 0/1 masks is non-zero exactly where at least one is set.
+    let either = a
+        .ne(a)
+        .and_then(|m| m.to_dtype(candle_core::DType::F32))
+        .and_then(|m| {
+            b.ne(b)
+                .and_then(|n| n.to_dtype(candle_core::DType::F32))
+                .and_then(|n| m.broadcast_add(&n))
+        })
+        .map_err(|e| candle_err(op, e))?;
+    let total = either
+        .sum_all()
+        .and_then(|s| s.to_scalar::<f32>())
+        .map_err(|e| candle_err(op, e))?;
+    if total == 0.0 {
+        return finish(py, out, tag);
+    }
+    let nans = nan_shaped_like(op, &out, tag)?;
+    let out = either
+        .ne(0f32)
+        .and_then(|cond| cond.where_cond(&nans, &out))
+        .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
 
@@ -5721,65 +6008,116 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
         .map_err(|e| candle_err(op, e))
 }
 
-/// The `(values, indices)` pair `max.dim` returns.
+/// The `(values, indices)` pair `max.dim` and `min.dim` return.
 ///
 /// Upstream's is a *structseq* from `torch.return_types`, built by `_C` and
 /// re-exported by `torch/return_types.py`. This shim does not own that
 /// machinery, so the pair is a `collections.namedtuple` with the same two
 /// field names: index access and `.values`/`.indices` both work, and the type
 /// is not `torch.return_types.max`. Recorded in docs/TENSORBASE.md.
+///
+/// One cache per overload rather than one shared type, because the type's
+/// `__name__` is the only thing distinguishing them and `repr()` prints it:
+/// upstream shows `torch.return_types.min(values=..., indices=...)` for the
+/// minimum, and a shared `max`-named tuple would print the wrong op in every
+/// traceback and doctest that touches it.
 static MAX_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static MIN_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
 
-fn max_result_type(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
-    if let Some(cached) = MAX_RESULT.get() {
+fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py<PyAny>> {
+    let (cell, name) = match which {
+        Extremum::Max => (&MAX_RESULT, "max"),
+        Extremum::Min => (&MIN_RESULT, "min"),
+    };
+    if let Some(cached) = cell.get() {
         return Ok(cached);
     }
     let namedtuple = py
         .import("collections")?
         .getattr("namedtuple")?
-        .call1(("max", ("values", "indices")))?
+        .call1((name, ("values", "indices")))?
         .unbind();
-    let _ = MAX_RESULT.set(namedtuple);
-    Ok(MAX_RESULT.get().expect("just set"))
+    let _ = cell.set(namedtuple);
+    Ok(cell.get().expect("just set"))
 }
 
-fn max_dim(
+/// `aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values,
+/// Tensor indices)` and its `min` mirror.
+///
+/// **Both halves of the pair had the dropped-NaN fault, and dropping the index
+/// is not an option here** -- the pair is the whole reason this overload exists
+/// rather than `amax`. `max([1., nan, 3.], dim=0)` answered `(3.0, 2)` where
+/// upstream answers `(nan, 1)`: candle's `max_keepdim` skipped the NaN it did
+/// not start on, and its `argmax_keepdim` skipped it in exactly the same way,
+/// so the two were consistently wrong together. `nan_along_dim` above supplies
+/// both replacements from one mask -- see its header for why `amax`'s
+/// `CustomOp1` is not the mechanism, and for the measurement that says the
+/// index upstream reports is the *first* NaN's.
+///
+/// `min.dim` had no kernel at all until now; docs/SPELLINGS.md §7.2 left it and
+/// `min.other` named in `overloads.json`/`methods.json` so they would refuse
+/// with the right name and land on this queue. Written as one function with
+/// `max.dim` rather than copied, so a fourth version of the NaN rule cannot
+/// drift away from the third.
+fn extremum_dim(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    which: Extremum,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.max.dim";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let op = match which {
+        Extremum::Max => "aten.max.dim",
+        Extremum::Min => "aten.min.dim",
+    };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let rank = input.tensor()?.rank();
     let dim = normalise_dim(
-        OP,
-        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        op,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?,
         rank,
     )?;
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+    let tag = input.tag();
+    let source = input.tensor()?;
 
-    let (values, indices) = if keepdim {
-        (
-            input.tensor()?.max_keepdim(dim),
-            input.tensor()?.argmax_keepdim(dim),
-        )
-    } else {
-        (input.tensor()?.max(dim), input.tensor()?.argmax(dim))
+    // Reduced with the dimension kept whatever the caller asked for, so the
+    // NaN correction below has one shape to work in; the squeeze is at the end.
+    let (values, indices) = match which {
+        Extremum::Max => (source.max_keepdim(dim), source.argmax_keepdim(dim)),
+        Extremum::Min => (source.min_keepdim(dim), source.argmin_keepdim(dim)),
     };
-    let values = values.map_err(|e| candle_err(OP, e))?;
+    let mut values = values.map_err(|e| candle_err(op, e))?;
     // int64, like `argmax` above: candle yields u32, which would be a visible
     // dtype divergence the first time an index is used.
-    let indices = indices
+    let mut indices = indices
         .and_then(|t| t.to_dtype(candle_core::DType::I64))
-        .map_err(|e| candle_err(OP, e))?;
+        .map_err(|e| candle_err(op, e))?;
+
+    if let Some((any, first)) = nan_along_dim(op, source, dim, tag)? {
+        let nans = nan_shaped_like(op, &values, tag)?;
+        values = any
+            .where_cond(&nans, &values)
+            .map_err(|e| candle_err(op, e))?;
+        indices = any
+            .where_cond(&first, &indices)
+            .map_err(|e| candle_err(op, e))?;
+    }
+
+    if !keepdim {
+        values = values.squeeze(dim).map_err(|e| candle_err(op, e))?;
+        indices = indices.squeeze(dim).map_err(|e| candle_err(op, e))?;
+    }
 
     // Promoted here, not at the dispatcher's exit: the pair leaves inside a
     // namedtuple, which `promote` (rightly) does not look into.
     let pair = (
-        crate::tensor::promote(py, finish(py, values, input.tag())?)?,
+        crate::tensor::promote(py, finish(py, values, tag)?)?,
         crate::tensor::promote(py, finish(py, indices, TorchDType::Int64)?)?,
     );
-    Ok(max_result_type(py)?.bind(py).call1(pair)?.unbind())
+    Ok(extremum_result_type(py, which)?
+        .bind(py)
+        .call1(pair)?
+        .unbind())
 }
 
 /// `any`, in all three of its forms. The result is `torch.bool` whatever the

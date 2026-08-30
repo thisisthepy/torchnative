@@ -1531,6 +1531,75 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    # NaN, and it is an *index* question here rather than a value one, which is
+    # why none of the scenarios above could see it. Upstream: there is no
+    # ordering under which a real number beats a NaN, so the reduction stops at
+    # the first NaN it meets -- `argmax([1., nan, 3.])` is `1`, not `2`
+    # (measured on torch 2.13.0). This build answered `2`: candle's fold is
+    # `|x, y| x < y`, every comparison against a NaN is false, and the
+    # accumulator never moves onto it. The same predicate, the same fault, as
+    # `max.default` (docs/E2E_REAL.md), `max.other` (docs/SPELLINGS.md §7.2)
+    # and `max.dim` (docs/TRIL.md §3).
+    #
+    # Three positions, and the first one is the trap: a NaN at index 0 seeds
+    # the accumulator, so `argmax([nan, 2., 3.])` is `0` even with no NaN
+    # handling at all. A suite with only that case passes under the bug --
+    # the same hole docs/SEQLEN.md §7.12 found in `amax`'s first test.
+    nan = float("nan")
+    for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
+        flat = [1.0, 5.0, 2.0, 9.0]
+        flat[at] = nan
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            for dim, keepdim, shape in [(None, False, (4,)), (0, False, (4,)), (0, True, (4,))]:
+                a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+                note = (
+                    f"NaN in the {where} position wins the argmax -- upstream reports the "
+                    f"index of the *first* NaN, and candle's fold skips a NaN it does not "
+                    f"start on"
+                )
+                cases.append(
+                    Case(
+                        name=f"argmax(dtype={dtype_name}, shape={shape}, dim={dim}, keepdim={keepdim}) [{note}]",
+                        op=op,
+                        run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                        run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(
+                            op, a_c, dim, keepdim
+                        ),
+                        note=note,
+                    )
+                )
+    # Two NaNs: the *earlier* one wins, which distinguishes "report the first
+    # NaN" from "report the last NaN" -- a mask reduction written with the
+    # wrong tie-break passes every single-NaN case above.
+    for dtype_name in ["float64", "float32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, nan, 2.0, nan], (4,), dtype_name)
+        note = "two NaNs -- the earlier index wins"
+        cases.append(
+            Case(
+                name=f"argmax(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0, False),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, False),
+                note=note,
+            )
+        )
+    # A NaN in one row of a 2-D input and not the other: the correction has to
+    # be per-slice, not "the whole tensor has a NaN somewhere".
+    for dtype_name in ["float64", "float32"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1.0, nan, 2.0, 4.0, 9.0, 3.0], (2, 3), dtype_name
+        )
+        note = "NaN in the first row only -- the second row keeps its ordinary argmax"
+        cases.append(
+            Case(
+                name=f"argmax(dtype={dtype_name}, shape=(2, 3), dim=1) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 1, False),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, False),
+                note=note,
+            )
+        )
+
     return cases
 
 
@@ -3543,13 +3612,22 @@ def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     # `nan` (docs/E2E_REAL.md). Every case above passed throughout. The kernel
     # tests for NaN explicitly now, on `max` and `min` alike, and this pins it;
     # `min_default_cases` carries the mirror.
-    cases.append(
-        _unary_case(
-            torch_module, c_module, op, torch_call, "float32", [3.0, float("nan"), 1.0], (3,),
-            "NaN propagates: max() of a tensor containing NaN is NaN (measured) -- "
-            "torch's rule is IEEE maximum, not fmax",
-        )
-    )
+    #
+    # Three positions rather than one -- see `min_default_cases`' note for why
+    # `at=0` alone is a case that cannot fail, and docs/TRIL.md §3 for the
+    # audit that made this uniform across the family.
+    nan = float("nan")
+    for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
+        flat = [1.0, 5.0, 2.0, 9.0]
+        flat[at] = nan
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name, flat, (4,),
+                    f"NaN in the {where} position propagates: max() of a tensor containing "
+                    f"NaN is NaN (measured) -- torch's rule is IEEE maximum, not fmax",
+                )
+            )
     return cases
 
 
@@ -3611,16 +3689,28 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     )
 
 
-def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
-    op = "aten.max.dim"
+def _extremum_dim_cases(torch_module, c_module, torch_call, op, short) -> list[Case]:
+    """`max.dim` and `min.dim` share every case, because they shared the bug.
+
+    One builder rather than two, for the same reason `aten.rs` has one
+    `extremum_dim`: the pair is generated from `torch_call`, which the harness
+    resolves to `torch.ops.aten.<op>` on the upstream side, so the *expected*
+    answers come from upstream separately for each and nothing is mirrored by
+    hand here.
+    """
     cases: list[Case] = []
-    # Flat values chosen so the maximum is unique in every reduced slice --
+    # Flat values chosen so the extremum is unique in every reduced slice --
     # ties are implementation-defined, same reasoning as argmax_cases above.
     scenarios = [
         dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=1, keepdim=False, note="along last dim"),
         dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=1, keepdim=True, note="along last dim, keepdim"),
         dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=0, keepdim=False, note="along first dim"),
+        dict(flat=[1, 5, 2, 9, 0, 3], shape=(2, 3), dim=-1, keepdim=False, note="dim=-1"),
         dict(flat=[-5, -1, -9, -3], shape=(2, 2), dim=1, keepdim=False, note="all-negative values"),
+        dict(flat=[7], shape=(1,), dim=0, keepdim=False, note="single element"),
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=2, keepdim=False, note="3D, innermost dim"),
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=1, keepdim=False, note="3D, middle dim"),
+        dict(flat=list(range(24)), shape=(2, 3, 4), dim=0, keepdim=True, note="3D, outermost dim, keepdim"),
     ]
     for dtype_name in _REDUCE_DTYPES:
         for sc in scenarios:
@@ -3628,7 +3718,7 @@ def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
             dim, keepdim = sc["dim"], sc["keepdim"]
             cases.append(
                 Case(
-                    name=f"max(dtype={dtype_name}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
+                    name=f"{short}(dtype={dtype_name}, shape={sc['shape']}, dim={dim}, keepdim={keepdim}) [{sc['note']}]",
                     op=op,
                     run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
                     run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(op, a_c, dim, keepdim),
@@ -3636,7 +3726,123 @@ def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=sc["note"] + " -- returns (values, indices), see _pair_result_check",
                 )
             )
+
+    # NaN, walked through every position -- the bug this builder was missing.
+    #
+    # Measured against upstream, not asserted from a rule: `max([1., nan, 3.],
+    # dim=0)` is `(nan, 1)` and `min` of the same is `(nan, 1)` too. The value
+    # is NaN because torch's rule is IEEE maximum/minimum, and the *index* is
+    # the first NaN's rather than the extremum-among-the-rest's.
+    #
+    # This build answered `(3.0, 2)` for `max`, and `min.dim` had no kernel at
+    # all. Both halves of the pair were wrong and they were wrong
+    # *consistently* -- `c_values == c_input[c_indices]` held -- so a
+    # self-consistency check would have passed. Only comparison against
+    # upstream catches it, which is the whole argument for this harness.
+    #
+    # **Position matters and `at=0` is the one that cannot fail.** A NaN in
+    # element 0 seeds candle's accumulator and nothing displaces it, so even a
+    # kernel with no NaN handling gets `(nan, 0)` right. docs/SEQLEN.md §7.12
+    # recorded the same hole in `amax`'s first test; the middle and last
+    # positions are what make this a test.
+    nan = float("nan")
+    for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
+        flat = [1.0, 5.0, 2.0, 9.0]
+        flat[at] = nan
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            for dim, keepdim in [(0, False), (0, True)]:
+                a_t, a_c = pair_from_flat(torch_module, c_module, flat, (4,), dtype_name)
+                note = (
+                    f"NaN in the {where} position -- value propagates AND the index is "
+                    f"the first NaN's, not the extremum-among-the-rest's"
+                )
+                cases.append(
+                    Case(
+                        name=f"{short}(dtype={dtype_name}, shape=(4,), dim={dim}, keepdim={keepdim}) [{note}]",
+                        op=op,
+                        run_torch=lambda a_t=a_t, dim=dim, keepdim=keepdim: torch_call(a_t, dim, keepdim),
+                        run_c=lambda a_c=a_c, dim=dim, keepdim=keepdim: c_module._aten_dispatch(
+                            op, a_c, dim, keepdim
+                        ),
+                        value_check=_pair_result_check,
+                        note=note,
+                    )
+                )
+    # Two NaNs -- pins the tie-break to the earlier index.
+    # And a NaN confined to one row of two -- pins the correction as per-slice
+    # rather than whole-tensor, which a `sum_all() > 0` guard applied to the
+    # wrong scope would get wrong.
+    extra = [
+        ([1.0, nan, 2.0, nan], (4,), 0, "two NaNs -- the earlier index wins"),
+        (
+            [1.0, nan, 2.0, 4.0, 9.0, 3.0],
+            (2, 3),
+            1,
+            "NaN in the first row only -- the second row keeps its ordinary answer",
+        ),
+        (
+            [1.0, 2.0, nan, 4.0, 9.0, 3.0],
+            (2, 3),
+            0,
+            "NaN in a strided (non-innermost) slice",
+        ),
+    ]
+    for dtype_name in ["float64", "float32"]:
+        for flat, shape, dim, note in extra:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"{short}(dtype={dtype_name}, shape={shape}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim, False),
+                    run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim, False),
+                    value_check=_pair_result_check,
+                    note=note,
+                )
+            )
+    # `-inf` is not NaN and must not be corrected into one: an all-`-inf` row
+    # is a fully masked attention row and its maximum is `-inf`. A correction
+    # keyed on "not finite" rather than on "not equal to itself" passes every
+    # NaN case above and fails this.
+    ninf = float("-inf")
+    for dtype_name in ["float64", "float32"]:
+        for flat, note in [
+            ([ninf] * 4, "an all -inf row -- a fully masked attention row"),
+            ([ninf, ninf, -2.0, ninf], "-inf everywhere but one position"),
+            ([float("inf"), 1.0, ninf, 2.0], "+inf and -inf together, no NaN"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, (4,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"{short}(dtype={dtype_name}, shape=(4,), dim=0) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t, 0, False),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, False),
+                    value_check=_pair_result_check,
+                    note=note,
+                )
+            )
     return cases
+
+
+def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _extremum_dim_cases(torch_module, c_module, torch_call, "aten.max.dim", "max")
+
+
+# --- aten.min.dim -------------------------------------------------------------
+#
+# A new kernel, not a promotion. docs/SPELLINGS.md §7.2 found that `min.dim`
+# and `min.other` were listed in `overloads.json`/`methods.json` with **no
+# kernel behind either** -- deliberately, so `torch.min(x, dim=0)` would refuse
+# by name rather than be silently absent, and so the next owner of `aten.rs`
+# would find a precise work item. docs/TRIL.md §3 is that owner. Both now
+# compute, both share their implementation with the `max` side, and both share
+# these cases with it -- including the NaN walk, which is the reason they were
+# written together rather than the `min` half being added as a copy.
+
+
+def min_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _extremum_dim_cases(torch_module, c_module, torch_call, "aten.min.dim", "min")
 
 
 # --- aten.max.other -----------------------------------------------------------
@@ -3652,8 +3858,7 @@ def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 # table still spells the free function through this op).
 
 
-def max_other_cases(torch_module, c_module, torch_call) -> list[Case]:
-    op = "aten.max.other"
+def _extremum_other_cases(torch_module, c_module, torch_call, op, short) -> list[Case]:
     cases: list[Case] = []
     for dtype_name in _REDUCE_DTYPES:
         for sc in _ELEMENTWISE_SCENARIOS:
@@ -3671,36 +3876,220 @@ def max_other_cases(torch_module, c_module, torch_call) -> list[Case]:
             [3, 3, 3], (3,), [3, 3, 3], (3,), "every element tied",
         )
     )
-    # NaN propagation -- the same regression `max_default_cases` pins for the
-    # reduction overload, but this is not a duplicate of that case: it is a
-    # *different* kernel (elementwise two-tensor vs. single-tensor reduction),
-    # and it does not pass. `aten::maximum`'s contract (`max.other` is
-    # documented upstream as an alias of it) is IEEE maximum -- NaN on either
-    # side wins. Measured directly against this build (not asserted from the
-    # doc comment): `max.other(a, b)` propagates a NaN that is in `a`
-    # correctly but drops one that is only in `b` -- `max.other([1,nan,3],
-    # [5,2,nan])` gives `[5, nan, 3]` here where upstream gives
-    # `[5, nan, nan]`; `max.other([1],[nan])` gives `[1]` where upstream gives
-    # `[nan]`. Left as `expect="match"` -- NOT "c_error" (that means a clean
-    # refusal, and this kernel does not refuse, it silently returns a
-    # plausible-looking wrong value) -- so this stays a live regression trap
-    # for whoever owns `aten.rs` next, the same way the `float16` overflow
-    # case above stays failing on purpose rather than being filed away as a
-    # known/accepted gap. This is currently reachable only through
-    # `_aten_dispatch("aten.max.other", ...)` directly (the op is still in
-    # `IMPLEMENTED_AWAITING_GOLDEN`, docs/SPELLINGS.md), so it does not yet
-    # fail the main `compare.py` gate -- it will as soon as the op is
-    # promoted into `_aten_implemented()`, which is exactly the point of
-    # adding it now rather than after promotion.
+    # NaN propagation -- the same rule `max_default_cases` pins for the
+    # reduction overload, but not a duplicate of it: this is a different kernel
+    # (elementwise two-tensor vs. single-tensor reduction) and it had a
+    # different, *asymmetric* fault. `aten::maximum`/`aten::minimum` (which
+    # `native_functions.yaml` names these as aliases of) are IEEE
+    # maximum/minimum -- a NaN on either side wins.
+    #
+    # docs/SPELLINGS.md §7.2 added the first of these while the op was parked
+    # in `IMPLEMENTED_AWAITING_GOLDEN`, and it recorded a live defect rather
+    # than passing: `max.other([1,nan,3], [5,2,nan])` gave `[5, nan, 3]` here
+    # against upstream's `[5, nan, nan]`, and `max.other([1],[nan])` gave `[1]`
+    # against `[nan]`. A NaN in the *first* operand propagated correctly
+    # because candle's `|x, y| x > y` never displaces an accumulator that
+    # already holds one; a NaN only in the second was skipped. docs/TRIL.md §3
+    # is the fix, and the op is promoted into `_aten_implemented()` in the same
+    # change -- so these now run in the main `compare.py` gate.
+    #
+    # **Every position, on both sides, and the broadcast case separately.** A
+    # correction that masks by the left operand's NaNs alone passes the `a`
+    # column; one that forgets to broadcast the mask passes every same-shape
+    # case and fails only the last two.
+    nan = float("nan")
+    nan_pairs = [
+        ([1.0, nan, 3.0], (3,), [5.0, 2.0, nan], (3,), "NaN in each operand, different positions"),
+        ([nan, 2.0, 3.0], (3,), [5.0, 2.0, 1.0], (3,), "NaN only in the first operand, first position"),
+        ([1.0, 2.0, nan], (3,), [5.0, 2.0, 1.0], (3,), "NaN only in the first operand, last position"),
+        ([1.0, 2.0, 3.0], (3,), [nan, 2.0, 1.0], (3,), "NaN only in the second operand, first position"),
+        ([1.0, 2.0, 3.0], (3,), [5.0, nan, 1.0], (3,), "NaN only in the second operand, middle position"),
+        ([1.0, 2.0, 3.0], (3,), [5.0, 2.0, nan], (3,), "NaN only in the second operand, last position"),
+        ([nan, nan, nan], (3,), [5.0, 2.0, 1.0], (3,), "every element of the first operand NaN"),
+        ([1.0], (1,), [nan], (1,), "one element each, NaN in the second"),
+        ([1.0, 2.0], (2,), [nan], (), "0-d NaN broadcast over both elements"),
+        ([nan], (), [1.0, 2.0], (2,), "0-d NaN in the first operand, broadcast"),
+    ]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for a_flat, a_shape, b_flat, b_shape, note in nan_pairs:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    a_flat, a_shape, b_flat, b_shape, note,
+                )
+            )
+    # `inf` is ordered, not NaN: a correction keyed on "not finite" would turn
+    # these into NaN and fail here while passing every case above.
+    ninf, pinf = float("-inf"), float("inf")
+    for dtype_name in ["float64", "float32"]:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [pinf, ninf, 1.0], (3,), [1.0, 1.0, ninf], (3,),
+                "infinities on both sides and no NaN -- must not be corrected into NaN",
+            )
+        )
+    return cases
+
+
+def max_other_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _extremum_other_cases(torch_module, c_module, torch_call, "aten.max.other", "max")
+
+
+# --- aten.min.other -----------------------------------------------------------
+#
+# The `min` half of the same story as `min.dim` above: listed in the spelling
+# tables with no kernel, implemented in docs/TRIL.md §3 as one function with
+# `max.other`, and sharing this builder for the same reason. `torch_call`
+# resolves `torch.ops.aten.min.other` on the upstream side, so the expected
+# values are upstream's own and nothing here is mirrored by hand.
+
+
+def min_other_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _extremum_other_cases(torch_module, c_module, torch_call, "aten.min.other", "min")
+
+
+# --- aten.tril.default / aten.triu.default ------------------------------------
+#
+# GPT-BigCode's last wall (docs/TORCHSCRIPT.md §6) and its mirror.
+#
+# The `nan`/`inf` matrix below is the case with a job: the tempting
+# implementation is a 0/1 mask of the input's dtype and a broadcast multiply,
+# and `nan * 0` is `nan` while upstream zeroes that position like any other.
+# Every case built from small integers passes under that mistake.
+#
+# The `diagonal` sweep runs past the matrix in both directions (`|d| > n`)
+# because the offset is unbounded upstream -- `tril(x, 100)` is `x` -- and an
+# implementation that clamped or indexed with it would fault or truncate.
+
+
+def _triangle_cases(torch_module, c_module, torch_call, op, short) -> list[Case]:
+    cases: list[Case] = []
+    nan, pinf, ninf = float("nan"), float("inf"), float("-inf")
+
+    # Square, non-square both ways, and batched. Values are all distinct so a
+    # transposed or mis-broadcast mask cannot coincidentally agree.
+    shapes = [
+        (list(range(1, 10)), (3, 3), "3x3 square"),
+        (list(range(1, 9)), (2, 4), "2x4, wider than tall"),
+        (list(range(1, 9)), (4, 2), "4x2, taller than wide"),
+        (list(range(1, 2)), (1, 1), "1x1"),
+        (list(range(1, 5)), (1, 4), "single row"),
+        (list(range(1, 5)), (4, 1), "single column"),
+        (list(range(24)), (2, 3, 4), "batched: two 3x4 matrices"),
+        (list(range(24)), (2, 2, 3, 2), "batched rank 4"),
+    ]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        for flat, shape, note in shapes:
+            for diagonal in (-4, -1, 0, 1, 4):
+                a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+                full = f"{note}, diagonal={diagonal}"
+                cases.append(
+                    Case(
+                        name=f"{short}(dtype={dtype_name}, shape={shape}, diagonal={diagonal}) [{note}]",
+                        op=op,
+                        run_torch=lambda a_t=a_t, d=diagonal: torch_call(a_t, d),
+                        run_c=lambda a_c=a_c, d=diagonal: c_module._aten_dispatch(op, a_c, d),
+                        note=full,
+                    )
+                )
+
+    # The default `diagonal`, omitted entirely rather than passed as 0 -- the
+    # schema's default has to be applied by the kernel, not by the caller.
+    for dtype_name in ["float32", "int64"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, list(range(1, 10)), (3, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"{short}(dtype={dtype_name}, shape=(3, 3)) [diagonal defaulted, not passed]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="diagonal omitted -- the schema default is 0",
+            )
+        )
+    # ...and by keyword.
+    a_t, a_c = pair_from_flat(torch_module, c_module, list(range(1, 10)), (3, 3), "float32")
     cases.append(
-        _binary_tensor_case(
-            torch_module, c_module, op, torch_call, "float32",
-            [1.0, float("nan"), 3.0], (3,), [5.0, 2.0, float("nan")], (3,),
-            "BUG (found by this case): NaN in the second operand does not "
-            "propagate -- see the long comment above this builder.",
+        Case(
+            name=f"{short}(self=/diagonal= by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=a_t, diagonal=1),
+            run_c=lambda: c_module._aten_dispatch(op, self=a_c, diagonal=1),
         )
     )
+
+    # `torch.bool` -- GPT-BigCode's actual call is
+    # `tril(ones((n, n), dtype=bool))`, and the result must stay `bool` rather
+    # than being promoted by the zeroing.
+    for flat, shape, note in [
+        ([1, 1, 1, 1, 1, 1, 1, 1, 1], (3, 3), "all-True bool mask, GPT-BigCode's own call"),
+        ([1, 0, 1, 0, 1, 0, 1, 0, 1], (3, 3), "mixed bool"),
+    ]:
+        for diagonal in (-1, 0, 1):
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "bool")
+            cases.append(
+                Case(
+                    name=f"{short}(dtype=bool, shape={shape}, diagonal={diagonal}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, d=diagonal: torch_call(a_t, d),
+                    run_c=lambda a_c=a_c, d=diagonal: c_module._aten_dispatch(op, a_c, d),
+                    note=note,
+                )
+            )
+
+    # The case a masked multiply cannot pass.
+    for dtype_name in ["float64", "float32"]:
+        for diagonal in (-1, 0, 1):
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module,
+                [1.0, nan, pinf, ninf, nan, 2.0, ninf, pinf, 0.0], (3, 3), dtype_name,
+            )
+            note = "nan/inf matrix -- zeroing must be a select; nan*0 and inf*0 are nan"
+            cases.append(
+                Case(
+                    name=f"{short}(dtype={dtype_name}, shape=(3, 3), diagonal={diagonal}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, d=diagonal: torch_call(a_t, d),
+                    run_c=lambda a_c=a_c, d=diagonal: c_module._aten_dispatch(op, a_c, d),
+                    note=note,
+                )
+            )
+
+    # Zero-extent inputs, both ways round. Upstream preserves the shape.
+    for shape in [(0, 3), (3, 0), (0, 0), (2, 0, 3)]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [], shape, "float32")
+        cases.append(
+            Case(
+                name=f"{short}(dtype=float32, shape={shape}) [zero-extent, shape preserved]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                note="zero-extent input",
+            )
+        )
+
+    # Rank < 2 is refused on both sides, with upstream's own wording.
+    for flat, shape, note in [([1.0], (), "0-d"), ([1.0, 2.0], (2,), "1-d")]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"{short}(dtype=float32, shape={shape}) [{note} -- refused, needs 2 dimensions]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                expect="both_error",
+                note=note,
+            )
+        )
     return cases
+
+
+def tril_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _triangle_cases(torch_module, c_module, torch_call, "aten.tril.default", "tril")
+
+
+def triu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _triangle_cases(torch_module, c_module, torch_call, "aten.triu.default", "triu")
 
 
 # --- aten.reshape.default ------------------------------------------------------
@@ -11020,12 +11409,26 @@ def min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
             cases.append(_unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note))
     # NaN propagates rather than being ignored (measured) -- torch does not
     # treat min as nan-skipping the way e.g. nanmin would.
-    cases.append(
-        _unary_case(
-            torch_module, c_module, op, torch_call, "float32", [1.0, float("nan"), 2.0], (3,),
-            "NaN propagates: min() of a tensor containing NaN is NaN (measured)",
-        )
-    )
+    #
+    # Walked through three positions rather than left at one. The single case
+    # here had the NaN in the middle, which does exercise the fault, but the
+    # rest of this family was audited in docs/TRIL.md §3 and the audit's rule
+    # is that a NaN suite states its positions: a suite with only `at=0` cannot
+    # fail, because element 0 seeds candle's accumulator and nothing displaces
+    # it. Cheap insurance, and it makes the pattern uniform across the six ops
+    # that now share the rule.
+    nan = float("nan")
+    for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
+        flat = [1.0, 5.0, 2.0, 9.0]
+        flat[at] = nan
+        for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name, flat, (4,),
+                    f"NaN in the {where} position propagates: min() of a tensor containing "
+                    f"NaN is NaN (measured)",
+                )
+            )
     # No empty-tensor case: `max_default_cases` does not have one either --
     # measured, torch's `min()` raises on an empty input ("Expected reduction
     # dim to be specified for input.numel() == 0"), so it is out of scope for
@@ -13475,6 +13878,15 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.matmul.default": matmul_cases,
     # docs/SPELLINGS.md: the two `IMPLEMENTED_AWAITING_GOLDEN` kernels that
     # fell inside this round's 25-name inventory, moved into real coverage.
+    # `max.other`'s builder was written while the op was still parked, and it
+    # found a live NaN defect and held it as a failing case until docs/TRIL.md
+    # §3 fixed the kernel; the op is promoted into `_aten_implemented()` there.
     "aten.max.other": max_other_cases,
     "aten.reshape.default": reshape_cases,
+    # docs/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
+    # of the max/min family, which had spelling-table entries and no kernels.
+    "aten.tril.default": tril_cases,
+    "aten.triu.default": triu_cases,
+    "aten.min.dim": min_dim_cases,
+    "aten.min.other": min_other_cases,
 }
