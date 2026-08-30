@@ -153,8 +153,8 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Smoke tests</td><td><b>261</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4353</b> entries checked against upstream</td></tr>
-<tr><td>Architectures — operator coverage</td><td><b>20 of 20</b> reach zero missing operators in the traced sweep</td></tr>
-<tr><td>Architectures — <b>actually forward</b></td><td><b>20 of 20</b> on this shim, matching upstream. GPT-BigCode was the last: identical argmax at every position, logits within 9e-08</td></tr>
+<tr><td>Architectures — operator coverage</td><td><b>20 of 26</b> reach zero missing operators in the traced sweep</td></tr>
+<tr><td>Architectures — <b>actually forward</b></td><td><b>20 of 26</b>. The original twenty all forward and match upstream; six more were added once the <code>torch.jit.script</code> wall came down and <b>none of them forwards yet</b> — <code>sqrt</code>, 2-D <code>convolution</code>, <code>remainder</code> and <code>set_</code> are what stop them (<a href="docs/ARCH26.md">ARCH26.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
