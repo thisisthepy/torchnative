@@ -227,11 +227,21 @@ only exists on a platform. Every ✅ has a run behind it.
 | wheel builds | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
 | symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
 | `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *mounted, no wheel* |
-| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
+| installs | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ *mounted, no wheel* |
+| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ |
 | computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
 | **on PyPI `0.0.5a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ✅ *Node* |
+| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ *but run elsewhere* | ✅ *Node* |
+
+**Windows moved on a user's report, not on our own run**, and only as far as the report goes. Someone
+installed the published `0.0.5a0` wheel with `uv`, `import torch` succeeded, and `transformers`
+carried them 655 lines into `modeling_rope_utils.py` before hitting a missing **meta** kernel — since
+fixed. That proves install and import; it does **not** prove `computes`, because everything on that
+path ran on the meta device, which by construction computes nothing. So that row stays ⚠️.
+
+The same report settled something else the table has no row for. Their interpreter was **Python
+3.14** and the wheel is `cp313-abi3`. One binary per platform loading on 3.13 and every later
+CPython is the property five published wheels rest on, and until then it had only been argued.
 
 The last row is why the columns differ. iOS, Linux and Windows have no runtime on this machine —
 no device, and no `docker`, `colima`, `podman`, `lima` or `qemu` — so the deepest rung any of them
