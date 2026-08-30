@@ -449,3 +449,335 @@ device measurement supports, rather than merely assumes, the transfer.**
 * Raw per-round JSON and build/stage logs are under `/tmp/bw_bind_android/`
   (`out_{old,new,controlA,controlB}_r*.json`, `build_{old,new}.log`,
   `stage_new.log`) for anyone who wants to re-check the arithmetic above.
+
+---
+
+## 8. Round 3 — merging the per-candidate parse into `resolve`
+
+Picks up from docs/DISPATCH.md §6, which named `resolve` + `_bind` as the
+largest item left and sized it at **~1.5 ms per forward pass, "five times
+everything round 2 removed"**. That figure was derived before round 2 landed,
+by multiplying a per-call cost by the dispatch count. It is roughly **twice**
+what a direct measurement finds, and §8.1 is why.
+
+### 8.1 The profile, as actually found
+
+Counted rather than timed, so the machine's load cannot move it — one
+SmolLM2-135M float32 prefill, probing `_Overloads._bind` and `.resolve` (both
+are looked up on `self` per call, so unlike `_aten_dispatch` they really can be
+wrapped; DISPATCH.md's spy warning applies to the door, not to these):
+
+| per forward pass | count |
+|---|---|
+| `_C._aten_dispatch` calls | 1855 |
+| …of which reach `resolve` | **1188 (64%)** |
+| `_bind` calls (candidates tried) | 1651 |
+| …refusals | 463 (28% of attempts) |
+| `resolve` calls passing any keyword | 183 (15%) |
+| arguments bound | 2375 |
+
+**36% of dispatches never touch the overload machine at all.** They are the
+hand-written paths — `to`, `__getitem__`, the scalar, softmax and indexing
+installers — which call the door directly. DISPATCH.md §6's estimate assumed
+1855 × ~0.8 µs; the population is 1188.
+
+Per-call, decomposed on the current build (minimum of 5 blocks of 20 000 after
+200 warmups, `(1, 6, 9, 64)` float32, load 4.45 — high, so read the shares
+rather than the absolutes):
+
+| µs/call | total | `resolve` | of which `_bind` | `dispatch(key, **bound)` |
+|---|---|---|---|---|
+| `.view(1, 6, 576)` | 1.683 | 0.900 | 0.717 | 0.613 |
+| `.transpose(1, 2)` | 1.277 | 0.612 | 0.522 | 0.543 |
+| `t + t` | 1.797 | 0.759 | 0.670 | 0.880 |
+| `.unsqueeze(0)` | 1.235 | 0.533 | 0.444 | 0.564 |
+
+So `resolve` is **43–53% of an operator call**, and at 1188 calls × ~0.65 µs it
+is **~0.8 ms per prefill, not ~1.5 ms**. The brief's target is real and is
+still the largest single item; it is half the size it was advertised at.
+
+Two further readings from the same run:
+
+* `dispatch_pos` minus `dispatch_kw` is now **0.02–0.03 µs** (e.g. view 0.592
+  vs 0.613). Round 2 did what it said: the keyword convention is spent, and
+  DISPATCH.md §3.1's refusal to pass `bound` positionally costs almost nothing
+  now.
+* Under `cProfile`, `_aten_dispatch` is 0.168 s of 0.220 s across five passes —
+  76%. The profiler inflates Python frames, so it sizes nothing here; it is
+  reported only because it is the same instrument §1 used.
+
+#### Why the 463 refusals are hard to prefilter
+
+Cross-tabulating each refusal by the reason that decided it:
+
+| op | refusals / pass | reason | keywords? |
+|---|---|---|---|
+| `cat` | 121 | required argument missing | yes |
+| `view` | 90 | positional type check | no |
+| `__add__` | 62 | positional type check | no |
+| `pow` | 61 | positional type check | no |
+| `mean` | 61 | arity | yes |
+| `rsqrt` | 61 | required argument missing | no |
+
+Arity, "given twice", unknown-keyword and required-missing are all pure
+functions of (argument count, keyword names) — no value is consulted — so they
+*can* be answered from a precomputed table. Positional type checks cannot: they
+are what decides `add.Tensor` against `add.Scalar`. That splits 248 / 215, and
+only 62 of the 248 are in calls with no keywords, where the table key would be
+a bare integer. A prefilter was therefore **not** built: it addresses 3.8% of
+candidate attempts for a per-call key construction on the other 96%.
+
+### 8.2 What changed
+
+One change. `_bind` — the per-candidate parse — is folded into `resolve`'s
+loop, and the keyword half is split into `_bind_keywords`.
+
+**This is a move, not a copy, and that is the whole argument for doing it.**
+BIND.md §6 item 1 priced merging the frames at "~0.15 ms per prefill at the
+cost of a second copy of the resolution loop", and declined. That price is real
+for `fn` and `_tensor_method`'s `method`, which are **two** call sites into
+`resolve`. It is not real one level down: `_bind` had **exactly one caller**,
+`resolve`, in the whole repository. Folding it in removes 1651 Python frames
+per forward pass and leaves every rule stated exactly once — the positional
+half in `resolve`, the keyword half in `_bind_keywords`.
+
+Three smaller things ride along, each a consequence of the merge:
+
+* **Arming moved from per-plan to per-entry.** `_SchemaPlan` objects are
+  constructed in `_Overloads.__init__` and nowhere else, and are reachable only
+  through their entry, so arming them together is the same work — one flag test
+  per *call* rather than one per *candidate*, and one `_TypeChecker` built
+  rather than one per plan.
+* **`tuple(args[:skip]) + (tuple(args[skip:]),)` → `args[:skip] + (args[skip:],)`.**
+  Slicing a tuple yields a tuple, so both `tuple()` calls were copying
+  something already of the right type. `args` is always a tuple: `fn` and
+  `method` are the only callers of `resolve` and both build one.
+* **"given twice" now runs after the positional type checks** rather than
+  before, because it moved into the keyword half. Both orders refuse the same
+  calls and neither has a side effect, so which reason is found first is not
+  observable — the same argument §3.4 made when this check was first hoisted.
+
+#### `given twice` turns out to be unreachable, and is kept anyway
+
+Two of the tampers in §8.3 disable the "given twice" walk outright and produce
+**zero** mismatches. That is not a blind harness; the check is genuinely
+redundant in the present structure. After the arity gate, `given <=
+n_positional`, and the positional loop zips `call` (length `given`) against
+`positional`, so on reaching the keyword half `bound` holds exactly the names
+of `positional[:given]` — the very slice "given twice" walks. `name in bound`
+therefore answers every call it would. Driven over all 251 plans, of 5570 cases
+where the walk fires, 3120 are caught by `name in bound` and the remaining 2450
+had already been refused by a positional type check.
+
+It is left in place: it is torch's stated rule, it costs a walk only on the 15%
+of calls that pass keywords, and its redundancy is a property of the current
+loop rather than a guarantee. This is recorded so that the next person does not
+read the zero as coverage.
+
+### 8.3 Why this is safe
+
+**A differential over the whole front door.** Round 1 compared `_bind` against a
+verbatim copy of its predecessor. This round compares **`resolve`**, which is a
+superset — it includes candidate ordering, the refusal `TypeError`, and the
+keyword half. The pre-merge `resolve` *and* `_bind` are extracted verbatim from
+`git show HEAD:rust/torch_c/src/bootstrap.py` and exec'd against the live
+module's globals; one substitution is applied and asserted to occur exactly once
+(`self._bind(` → `_old_bind(self, `, since the new class has no `_bind`). The
+new side is likewise loaded from the source file rather than off the class, so
+what is compared is proved to be what is on disk.
+
+Over every installed entry and 8930 call shapes — positional tuples up to
+length 3 over 19 values that exercise every rule the checker has, crossed with
+10 keyword shapes:
+
+```
+{"entries": 123, "call_shapes": 8930, "comparisons": 1098390, "mismatches": 0}
+```
+
+Refusal, chosen key, bound keys in order, and every bound value are compared.
+
+**A method note that cost a false negative, and would have hidden one.** Round
+1's tampers corrupted the precomputed `_SchemaPlan` fields. That cannot work
+here: the old side is HEAD, which is *after* round 1, so it reads **the same
+plan objects** — corrupting one corrupts both sides equally and the harness
+reports a serene zero. The tampers below rewrite the source of the function
+under test instead, and each asserts its anchor occurs the expected number of
+times before firing (three early attempts were rejected on exactly that check,
+having been written against the wrong indentation).
+
+| tamper (new side only) | mismatches |
+|---|---|
+| positional type check disabled | **80 648** |
+| unknown keyword accepted | **12 590** |
+| arity gate disabled | **3 601** |
+| required-argument walk skipped | **1 537** |
+| varargs int-list rule disabled | **381** |
+| varargs widening removed (`call[:skip] + (call[skip:],)`) | **381** |
+| default-valued arguments never dropped | **154** |
+| positional coercion disabled | **84** |
+| keyword coercion disabled | **16** |
+| keyword type check disabled | **8** |
+| "given twice" disabled (in `resolve`) | 0 — §8.2, unreachable |
+| "given twice" disabled (in `_bind_keywords`) | 0 — §8.2, unreachable |
+| arming skipped | 0 — see below |
+
+**The arming tamper reads zero for a harness reason, and it was chased rather
+than accepted.** Evaluation order is new-side-first precisely so the old side
+cannot arm the plans on the new side's behalf — but the *first* call shape is
+the empty tuple, which refuses before any predicate is needed, and the old side
+arms everything on it. Checked separately and directly: 123 of 123 entries are
+cold at start, and calling the new `resolve` with arming suppressed raises a
+non-refusal `TypeError`. The arming path is load-bearing; this tamper simply
+cannot express it.
+
+The repository's gates, on the final artefact:
+
+```
+PYTHON=$PY sh rust/torch_c/pytests/run.sh   -> 211 ok,                        exit 0
+$PY tools/golden/compare.py                 -> 2843/2843, ops covered=119,    exit 0
+$PY tools/golden/compare.py --self-test     -> PASS, 12 x 11 fault modes,     exit 0
+$PY rust/torch_c/pytests/verify_schemas.py  -> 4203/4203,                     exit 0
+```
+
+Golden is a real guard on this path now — it carries 32 keyword cases, which is
+the hole DISPATCH.md §4.1 recorded — and it was not weakened to get here.
+
+**And the model agrees bit for bit.** Every prefill round in §8.4 checksums all
+294 912 logits; old and new produced the identical pair across four rounds:
+
+| | Σ logits | max abs |
+|---|---|---|
+| old (`1f23ac4`) | 4193738.350776 | 29.98118 |
+| **new** | **4193738.350776** | **29.98118** |
+| upstream torch | 4193739.325235 | 29.981203 |
+
+The upstream difference is the shim's pre-existing float divergence, unchanged.
+
+### 8.4 It is faster, on the shape ops, and prefill cannot see it
+
+Method is §2's and DISPATCH.md §5.1's, unchanged so the numbers compose:
+minimum of 5 blocks of 20 000 calls after 200 warmups on a `(1, 6, 9, 64)`
+float32 tensor; **upstream, old and new alternate inside every round**; 4
+rounds. Only `_C.abi3.so` differs between old and new — `bootstrap.py` is
+`include_str!`'d into the artefact, so both sides were built and saved
+(distinct md5s; `strings` confirms `_bind_keywords` present in one and absent
+in the other) and rounds alternate by file swap. Load 2.0–3.3.
+
+µs/call, minimum of 4 rounds, and **two independent runs** of the whole thing:
+
+| | upstream | old | new | old/new run 1 | run 2 | control |
+|---|---|---|---|---|---|---|
+| `.view(1, 6, 576)` | 0.776 | 1.622 | **1.513** | **1.072** | 1.065 | 0.994 |
+| `.view((1, 6, 576))` | 1.034 | 1.787 | **1.699** | **1.052** | 1.065 | 1.007 |
+| `.unsqueeze(0)` | 0.740 | 1.202 | **1.144** | **1.050** | 1.032 | 1.007 |
+| `.transpose(1, 2)` | 0.803 | 1.261 | **1.217** | **1.036** | 1.030 | 1.001 |
+| `t + t` | 0.987 | 1.797 | 1.786 | 1.006 | 1.023 | 0.980 |
+| `.rsqrt()` | 1.475 | 2.457 | 2.445 | 1.005 | 1.013 | 1.000 |
+| `.mean(-1, keepdim=True)` | 2.594 | 2.823 | 2.810 | 1.005 | 1.007 | 1.003 |
+
+Ratio to upstream, old → new: view **2.09 → 1.95**, view-tuple 1.73 → 1.64,
+unsqueeze 1.62 → 1.55, transpose 1.57 → 1.52.
+
+**Control** — the same artefact under both labels through the identical
+harness, 3 rounds: 0.980 / 0.994 / 1.000 / 1.001 / 1.003 / 1.007 / 1.007.
+Range **0.980–1.007**, i.e. this harness reads 1.00x to within 2.0% when there
+is nothing to find.
+
+**What that resolves and what it does not.** The top four cases beat the
+control's worst deviation and their per-round bands do not overlap in either
+run (view: old 1.622/1.625/1.630/1.641, new 1.513/1.515/1.540/1.540). The
+bottom three — `add`, `rsqrt`, `mean` — sit at 1.005–1.023, **inside the
+control's spread**, and their bands overlap. They are reported as **unresolved,
+not as small wins.** `mean` is the honest reason why: at 1.09x upstream it has
+almost no Python share left to remove.
+
+Per-call saving on the four that resolve is **0.04–0.11 µs**, which is one
+Python frame's worth — exactly the size of the thing removed, and about half of
+what round 2 delivered (7.3–15.3%).
+
+#### Prefill, which does not resolve it
+
+SmolLM2-135M float32, 6-token prompt, minimum of 5 timed passes after 2
+warmups; upstream, old and new alternate inside every round; 4 rounds, load
+2.5–2.7.
+
+| | min (ms) | ratio to upstream |
+|---|---|---|
+| upstream | 35.232 | 1.0000 |
+| old (`1f23ac4`) | 37.422 | **1.0622** |
+| **new** | 37.467 | **1.0634** |
+
+Pairwise per round: old 1.0515 / 1.0561 / 1.0618 / 1.0698; new 1.0463 / 1.0655
+/ 1.0631 / 1.0684. **Fully overlapping**, and predicted to be: 1651 candidate
+attempts × ~0.045 µs is ~0.07 ms against a 37 ms measurement whose
+round-to-round spread is ~2%. This is the third round to hit the same wall for
+the same reason (§5, DISPATCH.md §5.2); the prefill run is reported as a
+did-not-regress check and as the source of the §8.3 checksum, not as evidence.
+
+### 8.5 Tried and did not pay
+
+**Building the bound mapping with `dict(zip(names, call))`.** The per-argument
+loop stores into `bound` one key at a time, after three attribute loads on the
+`_ArgPlan`. Replacing it with a predicate-only loop plus a single C-level
+`dict(zip(plan.names, call))` — with the coercion rule lifted into a separate
+pass, justified because only **6 of 251 plans** have a coercible positional
+argument and no schema in either table names two arguments the same (checked:
+0 of 251) — looked like a clear win and was **measurably worse**:
+
+| old/new | view | transpose | add | unsqueeze | view-tuple |
+|---|---|---|---|---|---|
+| merge only | 1.072 | 1.036 | 1.006 | 1.050 | 1.052 |
+| merge + `dict(zip(...))` | **0.974** | **0.941** | **0.931** | **0.928** | 1.006 |
+
+5–7% *slower* than the merge alone, with the per-round bands separated in the
+wrong direction on every case. Building a second `zip` iterator and handing it
+to `dict` costs more than the two or three dict stores and the attribute loads
+it replaces, at the argument counts operators actually have. Reverted; the loop
+is as §8.2 leaves it. Recorded because the C-level spelling is the obvious move
+and it is a trap at this size.
+
+**A candidate prefilter keyed on arity.** Not built — §8.1 measured its reach
+at 3.8% of candidate attempts, against a key construction on every call.
+
+### 8.6 What is left
+
+1. **The per-argument predicate call, ~0.09–0.26 µs per bind.** The largest
+   item still inside `resolve`. Removing it means either code generation or a
+   second statement of the twelve `_base` rules; §3.3 and §6 have both refused
+   the latter twice, once on measurement and once on hazard. A sound middle
+   path exists — annotate each rule at its point of definition with whether it
+   is decided by the value's *type* alone (all of them except `Scalar`, which
+   accepts a 0-dim tensor, and the list rules), then test a cached type
+   identity before calling — but it puts mutable state on the hot path and
+   buys perhaps 0.07 µs. Not taken.
+2. **The `method` → `resolve` frame**, ~1188 per pass. This is the merge BIND.md
+   §6 actually priced, and its objection stands: `fn` and `method` are two call
+   sites, so folding `resolve` into them duplicates the loop.
+3. **`(self,) + args`** in `method` — a tuple concatenation on every method
+   call, avoidable only by changing `resolve`'s signature.
+
+None of these is reachable from prefill on this machine. §8.4's control puts
+the floor at 2%; item 1 is ~4% of a `view` and the rest are smaller.
+
+### 8.7 Method notes
+
+* `bootstrap.py` is compiled into the artefact by `include_str!`, so **swapping
+  the `.py` file changes nothing without a rebuild** (§7.1). Both sides were
+  built and saved to `/tmp/bind2_art/lib_C.{old,new}.dylib`, md5s verified
+  distinct, and the presence/absence of the `_bind_keywords` symbol in
+  `strings` was used to confirm which is which before believing any reading.
+  The final rebuild from the reverted source reproduced `lib_C.new.dylib`
+  byte for byte, which is why §8.4's first run did not need repeating.
+* `TORCH_C_ARTEFACT` was set explicitly for every gate run, per DISPATCH.md's
+  note that `tools/golden/loader.py` otherwise ignores a custom
+  `CARGO_TARGET_DIR` and can compare a stale binary.
+* `uptime` was recorded before every round. No timing round was taken above
+  load 3.3 except the control, which ran at 3.7–4.1 — the direction that makes
+  a control *worse*, so its 0.980–1.007 is an upper bound on harness bias.
+* The working tree was restored from `cp` backups, never `git checkout`.
+* Harnesses and raw per-round output are under `/tmp/bind2/`: `differential.py`
+  (old-vs-new plus the tamper table), `census.py` (§8.1's counts), `inert.py`
+  (the two zero-tamper explanations), `layers.py`, `ablate.py`,
+  `bind2_ab.sh` + `bind2_micro.py` + `bind2_report.py` (§8.4), and the
+  `*.jsonl` per-round records. They are not committed; `differential.py` is the
+  one worth promoting into the repository if this area is touched again.

@@ -2098,12 +2098,19 @@ class _Overloads:
         "_checker_source",
         "_candidates",
         "_skip",
+        "_armed",
     )
 
     def __init__(self, name: str, schemas, checker_source, self_bound: bool = False) -> None:
         self.name = name
         self.self_bound = self_bound
         self._skip = 1 if self_bound else 0
+        # Every plan of one entry is armed together, on the first `resolve`.
+        # A `_SchemaPlan` is constructed here and nowhere else and is only ever
+        # reachable through this entry, so arming per entry is the same work as
+        # arming per plan -- one flag test per *call* instead of one per
+        # *candidate*, and one `_TypeChecker` built instead of one per plan.
+        self._armed = False
         self.schemas = [_Schema.parse(text) for text in schemas]
         # A callable rather than a `_TypeChecker`: `layout` and `memory_format`
         # are synthesised later in `install` than this table is parsed, and the
@@ -2140,52 +2147,36 @@ class _Overloads:
             for schema, key in zip(self.schemas, self.keys)
         )
 
-    def _bind(self, plan, args, kwargs):
-        """torch's `FunctionSignature::parse`, minus the parts nothing uses.
+    def _bind_keywords(self, plan, positional, given, kwargs, bound):
+        """The keyword half of `FunctionSignature::parse`. Mutates `bound`.
 
-        Returns the bound arguments, or `None` if this schema does not accept
-        the call.
+        Answers False if this schema does not accept the keywords.
 
-        Everything that does not depend on `args`/`kwargs` lives in `plan` and
-        was computed when the table was parsed; see `_SchemaPlan`. What is left
-        here is only the part that reads the actual call.
+        This is split out of `resolve` rather than inlined into it because
+        keywords are rare: over a SmolLM2-135M prefill, 183 of 1188 `resolve`
+        calls pass any, and 463 of 1651 candidate attempts are refusals that
+        never reach here. Keeping it out leaves the loop every call runs free
+        of a branch that almost never fires, and it is not a second statement
+        of anything -- the positional half of the rules is in `resolve`, the
+        keyword half is here, each written once.
+
+        `given` is the number of positional arguments the call supplied, after
+        the varargs int-list rewrite.
         """
-        if not plan.armed:
-            plan.arm(self._checker_source())
-        positional = plan.positional
+        # "given twice". In the pre-merge spelling this ran *before* the
+        # positional type checks rather than after; both orders answer False
+        # for the same calls and neither has a side effect, so which of the two
+        # reasons is found first is not observable.
+        for parameter in positional[:given]:
+            if parameter.name in kwargs:
+                return False
         by_name = plan.by_name
-        # `self` is bound before any signature is looked at, so it is not part
-        # of what the parser counts (see the class docstring).
-        skip = self._skip
-
-        # The varargs int-list rule, with torch's exact precondition: it
-        # applies only when the signature has a *single* positional argument
-        # and that argument is an int list, which is what makes
-        # `torch.ones(2, 3)` mean `ones([2, 3])` while `torch.full(2, 3)` stays
-        # an error rather than becoming `full([2], 3)`. The half of the
-        # precondition that reads the signature is `plan.varargs_intlist`.
-        if plan.varargs_intlist and len(args) > skip:
-            head = args[skip]
-            if isinstance(head, int) and not isinstance(head, bool):
-                args = tuple(args[:skip]) + (tuple(args[skip:]),)
-
-        if len(args) > plan.n_positional:
-            return None
-
-        bound = {}
-        if kwargs:
-            # "given twice" -- hoisted out of the loop below so the far more
-            # common no-keyword call does not pay a dict lookup per argument.
-            # It was interleaved with the type checks before; both spellings
-            # answer `None` for the same calls, and neither has a side effect,
-            # so which of the two reasons is found first is not observable.
-            for parameter in positional[: len(args)]:
-                if parameter.name in kwargs:
-                    return None
-
-        for value, parameter in zip(args, positional):
+        for name, value in kwargs.items():
+            parameter = by_name.get(name)
+            if parameter is None or name in bound:
+                return False
             if not parameter.predicate(value):
-                return None
+                return False
             # `coerce`'s only rule, with its precondition precomputed.
             if (
                 parameter.sized_int_list
@@ -2193,47 +2184,109 @@ class _Overloads:
                 and not isinstance(value, bool)
             ):
                 value = (value,)
-            bound[parameter.name] = value
+            bound[name] = value
+        return True
 
-        if kwargs:
-            for key, value in kwargs.items():
-                parameter = by_name.get(key)
-                if parameter is None or key in bound:
-                    return None
+    def resolve(self, args, kwargs):
+        """Choose the overload and bind the call.
+
+        This is torch's `FunctionSignature::parse` -- once per candidate, in
+        declaration order, first acceptance wins -- with everything that does
+        not depend on `args`/`kwargs` already computed into the `_SchemaPlan`s
+        when the table was parsed. What is left here only reads the call.
+
+        The per-candidate parse used to be a separate `_bind` method. It had
+        exactly one caller, this loop, so folding it in removes a Python frame
+        per candidate -- 1651 of them per SmolLM2-135M forward pass -- and
+        duplicates nothing. docs/BIND.md §6 priced "merging the frames" against
+        "a second copy of the resolution loop"; that price is real for `fn` and
+        `method`, which are two call sites into `resolve`, and it was not real
+        here.
+
+        `args` is always a tuple: `_torch_function`'s `fn` and `_tensor_method`'s
+        `method` are the only callers and both build one.
+        """
+        if not self._armed:
+            checker = self._checker_source()
+            for plan, _key in self._candidates:
+                if not plan.armed:
+                    plan.arm(checker)
+            self._armed = True
+
+        # `self` is bound before any signature is looked at, so it is not part
+        # of what the parser counts (see the class docstring).
+        skip = self._skip
+        n_args = len(args)
+
+        for plan, key in self._candidates:
+            call = args
+            given = n_args
+
+            # The varargs int-list rule, with torch's exact precondition: it
+            # applies only when the signature has a *single* positional
+            # argument and that argument is an int list, which is what makes
+            # `torch.ones(2, 3)` mean `ones([2, 3])` while `torch.full(2, 3)`
+            # stays an error rather than becoming `full([2], 3)`. The half of
+            # the precondition that reads the signature is
+            # `plan.varargs_intlist`.
+            if plan.varargs_intlist and given > skip:
+                head = call[skip]
+                if isinstance(head, int) and not isinstance(head, bool):
+                    # Slicing a tuple yields a tuple, so the `tuple()` calls
+                    # this line used to make were copies of something already
+                    # of the right type.
+                    call = call[:skip] + (call[skip:],)
+                    given = skip + 1
+
+            if given > plan.n_positional:
+                continue
+
+            positional = plan.positional
+            bound = {}
+            for value, parameter in zip(call, positional):
                 if not parameter.predicate(value):
-                    return None
+                    bound = None
+                    break
+                # `coerce`'s only rule, with its precondition precomputed.
                 if (
                     parameter.sized_int_list
                     and isinstance(value, int)
                     and not isinstance(value, bool)
                 ):
                     value = (value,)
-                bound[key] = value
+                bound[parameter.name] = value
+            if bound is None:
+                continue
 
-        # If every argument got a value the "was everything required bound?"
-        # test cannot fail, so it need not be walked. `bound`'s keys are always
-        # argument names, so equal counts means equal sets. (A schema with a
-        # repeated argument name has fewer distinct names than arguments, so
-        # the counts cannot match and the walk still happens.)
-        if len(bound) != plan.n_arguments:
-            for name in plan.required:
-                if name not in bound:
-                    return None
+            if kwargs and not self._bind_keywords(
+                plan, positional, given, kwargs, bound
+            ):
+                continue
 
-        if not plan.any_defaults:
-            return bound
-        result = {}
-        for name, value in bound.items():
-            source = by_name[name].default_source
-            if source is None or not _is_schema_default(value, source):
-                result[name] = value
-        return result
+            # If every argument got a value the "was everything required
+            # bound?" test cannot fail, so it need not be walked. `bound`'s
+            # keys are always argument names, so equal counts means equal sets.
+            # (A schema with a repeated argument name has fewer distinct names
+            # than arguments, so the counts cannot match and the walk still
+            # happens.)
+            if len(bound) != plan.n_arguments:
+                for name in plan.required:
+                    if name not in bound:
+                        bound = None
+                        break
+                if bound is None:
+                    continue
 
-    def resolve(self, args, kwargs):
-        for plan, key in self._candidates:
-            bound = self._bind(plan, args, kwargs)
-            if bound is not None:
+            if not plan.any_defaults:
                 return key, bound
+            by_name = plan.by_name
+            result = {}
+            for name, value in bound.items():
+                source = by_name[name].default_source
+                if source is None or not _is_schema_default(value, source):
+                    result[name] = value
+            return key, result
+
         owner = "Tensor." if self.self_bound else "torch."
         shown = args[1:] if self.self_bound else args
         raise TypeError(
