@@ -124,9 +124,58 @@ SKIP_DIRS = {"__pycache__"}
 #: build.
 SKIP_NAMES = {".DS_Store"}
 
+#: setuptools' own build cache. `pip wheel` runs `setup.py build_py`, which
+#: copies package files in here -- and `build_py` never removes a file from a
+#: prior run that it is no longer asked to copy, so anything that lands here
+#: by accident (Finder's `.DS_Store`, a `.pyc` from an interpreter nobody
+#: targets any more, a stale `.so` a previous target left behind) is
+#: re-copied into every wheel built from this checkout afterwards, silently.
+#: This is invisible to the SKIP_NAMES scan above, because that scan reads
+#: the *source* tree and this directory is a copy `pip` made of it on some
+#: earlier run -- possibly before the file it now carries even existed in the
+#: source. It is how `.DS_Store` shipped in all six wheels on 2026-08-30: an
+#: early host build populated `build/lib.macosx-10.13-universal2-cpython-313/`
+#: with one, and nothing after that build ever looked at this directory's age
+#: or contents again.
+BUILD_CACHE = REPO / "build"
+
 
 def _fail(msg: str) -> None:
     sys.exit(f"tools/wheel/build.py: {msg}")
+
+
+def check_build_cache() -> None:
+    """Refuse to build while a setuptools build cache from a prior run exists.
+
+    See `BUILD_CACHE`'s comment for why any pre-existing one is untrustworthy
+    rather than merely worth a glance. Refused rather than cleared: this
+    script has no business deciding on its own that a directory outside the
+    vendored tree is safe to erase, and an automatic clear would make the
+    *next* accidental file in there silent again in exactly the way this
+    refusal exists to end. Each immediate entry is named so the fix stays
+    narrow -- `rm -rf build/` wholesale is not what this asks for, and was
+    blocked by this environment's own safety classifier the day this was
+    found.
+
+    A separate function, not inlined in `preflight`, so a self-test can drive
+    it against a scratch directory instead of the real `build/` beside this
+    checkout.
+    """
+    if BUILD_CACHE.is_dir() and any(BUILD_CACHE.iterdir()):
+        stale = sorted(p.name for p in BUILD_CACHE.iterdir())
+        _fail(
+            f"a setuptools build cache exists at {BUILD_CACHE}\n"
+            "  pip wheel's build_py copies package files in here and never\n"
+            "  removes one from a prior run that it stops being asked to\n"
+            "  copy -- so anything that landed here by accident (a Finder\n"
+            "  .DS_Store, a stale .pyc, a .so a previous target left behind)\n"
+            "  is silently re-copied into every wheel built from this\n"
+            "  checkout afterwards. This is how .DS_Store shipped in all six\n"
+            "  wheels on 2026-08-30.\n"
+            f"  holds: {stale}\n"
+            "  Fix (narrow -- only the stale cache, not the checkout):\n"
+            + "".join(f"    rm -rf {BUILD_CACHE / name}\n" for name in stale)
+        )
 
 
 def preflight() -> dict[str, str]:
@@ -145,6 +194,8 @@ def preflight() -> dict[str, str]:
             "  (without it the tree cannot import; that is by design --\n"
             "   vendor_torch.sh drops upstream's _C so the hole is visible)"
         )
+
+    check_build_cache()
 
     # Finder metadata, refused rather than merely excluded. `.DS_Store` got into
     # 0.0.2a0's first build: the copy at the package root lands at the *archive*
@@ -1545,7 +1596,8 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
     return out
 
 
-def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
+def verify(wheel: Path, expected: set[str], target: "Target | None",
+          extra: dict[str, bytes], dist_info: str) -> None:
     with zipfile.ZipFile(wheel) as zf:
         names = set(zf.namelist())
         if target is not None and target.extension_member != Target.extension_member:
@@ -1572,6 +1624,42 @@ def verify(wheel: Path, expected: set[str], target: "Target | None") -> None:
         if "-abi3-" not in wheel.name:
             _fail(f"{wheel.name} is not abi3-tagged -- the bdist_wheel "
                   "py_limited_api option did not take effect")
+
+        # The other direction: a member nobody asked for. `missing` above is
+        # "smaller than it should be"; this is "bigger than it should be", and
+        # a wheel that ships thousands of legitimate vendored files makes an
+        # allow-list of *names* the wrong shape for it -- there is nothing to
+        # hand-maintain against. What is right-shaped is a comparison against
+        # what the build actually intended to put there: `expected` (the same
+        # source-tree walk `missing` was just checked against -- every
+        # legitimate package file is already named by it) and `extra` (the
+        # exact files *this build* generated: the global-deps stub,
+        # upstream's relocated dist-info). The one thing genuinely open-ended
+        # is this wheel's own `<name>-<version>.dist-info/`, which setuptools
+        # writes and whose member list is not this script's to enumerate --
+        # so that is the one exemption, granted by prefix rather than by name.
+        #
+        # This is what would have caught .DS_Store in all six wheels on
+        # 2026-08-30: a stale `build/lib.../` setuptools cache held a copy
+        # that was in neither the source tree (so `expected` never named it)
+        # nor anything this build generated (so `extra` never named it either)
+        # -- it was simply unaccounted for, and nothing before this check had
+        # a notion of "unaccounted for" at all.
+        known = set(expected) | set(extra)
+        prefix = f"{dist_info}/"
+        unexpected = sorted(
+            n for n in names if n not in known and not n.startswith(prefix))
+        if unexpected:
+            head = "\n".join("    " + u for u in unexpected[:20])
+            _fail(
+                f"{len(unexpected)} file(s) in {wheel.name} that neither the "
+                f"source tree nor this build's own additions account for:\n"
+                f"{head}\n"
+                + ("    ...\n" if len(unexpected) > 20 else "")
+                + "  a wheel that gained content nobody asked for is exactly "
+                "as unverified as\n  one that is missing content -- see the "
+                ".DS_Store incident in docs/WHEEL.md"
+            )
 
         if target is None:
             return
@@ -1944,6 +2032,176 @@ def self_test_linux() -> int:
     return bad
 
 
+def self_test_verify() -> int:
+    """Break `verify`'s unexpected-member check and confirm it notices.
+
+    Reproduces the .DS_Store incident (2026-08-30) without a real build: a
+    scratch source tree and a hand-built zip stand in for the vendored tree
+    and the finished wheel, the same substitution `self_test` above makes for
+    the freshness check. `expected` and the wheel's legitimate members are
+    both built from `tree_files`, the real function `main()` uses -- so this
+    exercises the same source-of-truth `verify` is actually compared against,
+    not a copy of it written here.
+
+    Three cases: a clean wheel has to pass; a file that mirrors the .DS_Store
+    incident exactly (something that landed in a package directory without
+    ever being in the source tree) has to be refused, by name; and so does a
+    stray extension for a target this wheel does not carry, which is the
+    dangerous version of the same defect -- `.DS_Store` was silent because it
+    was inert.
+    """
+    import tempfile
+
+    global SRC
+    original_src = SRC
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            src = tmpdir / "src"
+            (src / "torch" / "lib").mkdir(parents=True)
+            (src / "torch" / "__init__.py").write_text("# torch\n")
+            (src / "torch" / "lib" / "thing.py").write_text("# thing\n")
+            (src / "torchnative").mkdir()
+            (src / "torchnative" / "__init__.py").write_text("# torchnative\n")
+
+            # `tree_files` addresses everything relative to the module-global
+            # SRC, not the `root` it is handed -- swapped here, restored in
+            # `finally`, the same substitution `self_test_preflight_cache`
+            # makes for `BUILD_CACHE`.
+            SRC = src
+            expected = tree_files(src / "torch") | tree_files(src / "torchnative")
+            # The shape `main()` actually builds `extra` in: an empty
+            # global-deps stub, and one file of upstream dist-info relocated
+            # under `.data/`.
+            extra = {
+                "torch/lib/libtorch_global_deps.dylib": b"\0",
+                "torchnative-9.9.9.data/purelib/torch-9.9.9.dist-info/METADATA":
+                    b"Metadata-Version: 2.1\n",
+            }
+            dist_info = "torchnative-9.9.9.dist-info"
+            wheel = tmpdir / "torchnative-9.9.9-cp313-abi3-macosx_11_0_arm64.whl"
+
+            def make_wheel(junk: str | None) -> None:
+                if wheel.exists():
+                    wheel.unlink()
+                with zipfile.ZipFile(wheel, "w") as zf:
+                    for name in sorted(expected):
+                        zf.writestr(name, b"content")
+                    for name, data in extra.items():
+                        zf.writestr(name, data)
+                    zf.writestr(f"{dist_info}/METADATA", b"Metadata-Version: 2.1\n")
+                    zf.writestr(f"{dist_info}/WHEEL", b"Wheel-Version: 1.0\n")
+                    zf.writestr(f"{dist_info}/RECORD", b"")
+                    if junk:
+                        zf.writestr(junk, b"whatever a stale cache left behind")
+
+            def refusal(junk: str | None) -> str:
+                make_wheel(junk)
+                try:
+                    verify(wheel, set(expected), None, extra, dist_info)
+                except SystemExit as exc:
+                    return str(exc)
+                return ""
+
+            cases = [
+                ("a clean wheel", None, ""),
+                ("a .DS_Store the source tree never had (2026-08-30's incident)",
+                 "torch/.DS_Store", "torch/.DS_Store"),
+                ("a stray extension from a previous target",
+                 "torch/_C.cpython-311-darwin.so", "torch/_C.cpython-311-darwin.so"),
+            ]
+            for label, junk, must_contain in cases:
+                said = refusal(junk)
+                ok = (said == "") if junk is None else (must_contain in said)
+                bad += not ok
+                print(f"  {'ok    ' if ok else 'WRONG '}{label}"
+                      + (f" -- refused: {said.splitlines()[0]}" if said else ""))
+                if not ok:
+                    print(f"          expected "
+                          f"{'a clean PASS' if junk is None else 'refused, naming ' + repr(must_contain)}"
+                          f"; got {said or '(passed)'}")
+    finally:
+        SRC = original_src
+    if bad:
+        print(f"VERIFY SELF-TEST: FAIL -- {bad}/{len(cases)} wrong")
+    else:
+        print(f"VERIFY SELF-TEST: PASS -- {len(cases)}/{len(cases)} cases -- "
+              "verify() catching content nobody asked for, and\n"
+              "  letting through a wheel that carries only what the source "
+              "tree and this build's own additions put there")
+    return bad
+
+
+def self_test_preflight_cache() -> int:
+    """Break `preflight`'s stale-build-cache refusal and confirm it notices.
+
+    `BUILD_CACHE` is a module-level constant, not a parameter, because
+    `preflight()` takes none -- it reads global state on purpose, the same as
+    `VENDORED_ROOT` and `SHIM`. So this swaps the module global for the
+    duration of the test rather than touching the real `build/` beside this
+    checkout, and restores it in a `finally` even if an assertion raises.
+    """
+    import tempfile
+
+    global BUILD_CACHE
+    original = BUILD_CACHE
+    bad = 0
+
+    def refusal() -> str:
+        try:
+            check_build_cache()
+        except SystemExit as exc:
+            return str(exc)
+        return ""
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+
+            # 1. No cache at all -- must not be the thing that refuses.
+            BUILD_CACHE = tmpdir / "no-such-build"
+            said = refusal()
+            ok = said == ""
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}"
+                  "no build/ at all -- not what preflight refuses on")
+
+            # 2. An empty build/ -- pip has not run yet; must not refuse.
+            empty = tmpdir / "empty-build"
+            empty.mkdir()
+            BUILD_CACHE = empty
+            said = refusal()
+            ok = said == ""
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}"
+                  "an empty build/ -- not refused either")
+
+            # 3. A populated cache -- the 2026-08-30 shape: a lib.* directory
+            #    left over from an earlier build. Must refuse and name it.
+            stale = tmpdir / "stale-build"
+            (stale / "lib.macosx-10.13-universal2-cpython-313").mkdir(
+                parents=True)
+            BUILD_CACHE = stale
+            said = refusal()
+            ok = ("lib.macosx-10.13-universal2-cpython-313" in said
+                  and "rm -rf" in said)
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}"
+                  "a populated build/ -- refused, naming the stale entry "
+                  "and a narrow rm")
+            if not ok:
+                print(f"          got: {said[:300]!r}")
+    finally:
+        BUILD_CACHE = original
+
+    if bad:
+        print(f"PREFLIGHT-CACHE SELF-TEST: FAIL -- {bad}/3 wrong")
+    else:
+        print("PREFLIGHT-CACHE SELF-TEST: PASS -- 3/3 cases")
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
@@ -1959,8 +2217,15 @@ def main() -> None:
 
     if args.self_test:
         self_test()
+        failed = []
         if self_test_linux():
-            sys.exit("SELF-TEST: FAIL -- the Linux tag derivation")
+            failed.append("the Linux tag derivation")
+        if self_test_verify():
+            failed.append("verify()'s unexpected-member check")
+        if self_test_preflight_cache():
+            failed.append("preflight's stale-build-cache refusal")
+        if failed:
+            sys.exit("SELF-TEST: FAIL -- " + ", ".join(failed))
         return
 
     target = None if args.target == "host" else TARGETS[args.target]
@@ -2024,7 +2289,7 @@ def main() -> None:
     for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
         if pkg and (SRC / pkg).is_dir():
             expected |= tree_files(SRC / pkg)
-    verify(wheel, expected, target)
+    verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
 
     with zipfile.ZipFile(wheel) as zf:
         entries = zf.namelist()

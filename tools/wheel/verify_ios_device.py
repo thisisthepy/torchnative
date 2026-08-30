@@ -460,10 +460,43 @@ def check_same_but_the_binary(device: Path, sibling: Path, findings: Findings,
                   "dist-info are excluded, being the platform-shaped parts)")
 
 
-def find_sibling(device: Path) -> Path | None:
-    for candidate in sorted(device.parent.glob("*iphonesimulator*.whl")):
-        return candidate
-    return None
+def find_sibling(device: Path) -> tuple[Path | None, str]:
+    """The simulator wheel that carries the SAME VERSION as `device`, or why
+    there is none.
+
+    `sorted(glob("*iphonesimulator*.whl"))[0]` -- what this used to be --
+    picks whichever version sorts first in a directory that holds more than
+    one, with no regard for which version `device` is. On 2026-08-30 that
+    compared a 0.0.4a0 device wheel against a 0.0.2a0 simulator wheel and
+    reported PASS; it was harmless only because the vendored Python tree had
+    not changed between those two releases, which is luck, not a check.
+    `check_same_but_the_binary` exists to carry `verify_ios_sim.py`'s import
+    run across to the device wheel -- comparing against the wrong version
+    is a claim about nothing.
+
+    Returns `(None, reason)` rather than falling back to *a* wheel: an absent
+    or version-mismatched sibling has to read as this script unable to
+    compare, not as it having compared successfully.
+    """
+    version = device.name.split("-")[1]
+    candidates = sorted(device.parent.glob("*iphonesimulator*.whl"))
+    matches = [p for p in candidates if p.name.split("-")[1] == version]
+    if not matches:
+        if candidates:
+            return None, (
+                f"{len(candidates)} simulator wheel(s) in {device.parent} "
+                f"({[p.name for p in candidates]}), none of them version "
+                f"{version!r} -- comparing {device.name} against a different "
+                "version is comparing against the wrong artefact, so this "
+                "refuses rather than picking one"
+            )
+        return None, f"no *iphonesimulator*.whl in {device.parent}"
+    if len(matches) > 1:
+        return None, (
+            f"{len(matches)} simulator wheels are version {version!r} "
+            f"({[p.name for p in matches]}) -- ambiguous which one carries "
+            "the import run this compares against; pass --against")
+    return matches[0], ""
 
 
 def ladder(findings: Findings, compared: bool) -> None:
@@ -498,10 +531,11 @@ def self_test(device: Path, sibling: Path | None) -> int:
     """Break each judgement and check it notices.
 
     A resolver that finds everything is indistinguishable from a resolver that
-    looks nowhere, so each of the four faults is aimed at one judgement, and the
-    two kinds of answer -- a finding about the wheel, and the check being unable
-    to look -- are asserted to come back as themselves rather than as each
-    other.
+    looks nowhere, so each fault is aimed at one judgement, and the two kinds
+    of answer -- a finding about the wheel, and the check being unable to
+    look -- are asserted to come back as themselves rather than as each
+    other. The last two cases are `find_sibling` itself, against a scratch
+    multi-version directory shaped exactly like the real `dist/`.
     """
     sdk, error = sdk_root("iphoneos")
     if sdk is None:
@@ -580,6 +614,42 @@ def self_test(device: Path, sibling: Path | None) -> int:
             record("a vendored file differing between the two wheels", "problem",
                    findings, "differ between the device and simulator")
 
+        # 6. `find_sibling` pairing by VERSION. This is the exact incident
+        #    (2026-08-30): several versions of both wheels sitting beside each
+        #    other, and `sorted(glob(...))[0]` picking whichever sorts first
+        #    regardless of which version `device` is. No real device wheel
+        #    needed -- the function only reads filenames.
+        multiversion = tmpdir / "dist"
+        multiversion.mkdir()
+        for v in ("0.0.2a0", "0.0.3a0", "0.0.4a0"):
+            (multiversion /
+             f"torchnative-{v}-cp313-abi3-ios_12_0_arm64_iphoneos.whl").touch()
+        for v in ("0.0.2a0", "0.0.3a0"):
+            (multiversion / f"torchnative-{v}-cp313-abi3-"
+             "ios_14_0_arm64_iphonesimulator.whl").touch()
+        newest_device = (
+            multiversion /
+            "torchnative-0.0.4a0-cp313-abi3-ios_12_0_arm64_iphoneos.whl")
+
+        got, err = find_sibling(newest_device)
+        ok = got is None and "0.0.4a0" in err and "none of them version" in err
+        results.append((
+            "no 0.0.4a0 simulator wheel present -- refuses rather than "
+            "falling back to 0.0.2a0/0.0.3a0 (the actual 2026-08-30 mistake)",
+            "refused", ok, f"got sibling={got}, error={err!r}"[:200]))
+
+        matching_sim = (
+            multiversion / "torchnative-0.0.4a0-cp313-abi3-"
+            "ios_14_0_arm64_iphonesimulator.whl")
+        matching_sim.touch()
+        got, err = find_sibling(newest_device)
+        ok = got == matching_sim and not err
+        results.append((
+            "picks the same-version simulator wheel once it exists, not "
+            "whichever version sorts first",
+            "matched", ok,
+            f"got {got.name if got else got!r}, error={err!r}"[:200]))
+
     print(f"SELF-TEST against {device.name}")
     caught = 0
     for label, want, ok, text in results:
@@ -620,7 +690,11 @@ def main() -> None:
         sys.exit(f"{args.wheel.name} is not an iOS-device wheel. The simulator "
                  "wheel is a different artefact and tools/wheel/verify_ios_sim.py "
                  "runs that one for real.")
-    sibling = args.against if args.against is not None else find_sibling(args.wheel)
+    sibling_error = ""
+    if args.against is not None:
+        sibling = args.against
+    else:
+        sibling, sibling_error = find_sibling(args.wheel)
 
     if args.self_test:
         sys.exit(self_test(args.wheel, sibling))
@@ -651,11 +725,12 @@ def main() -> None:
     print("\n+ the rest of the archive, against the simulator wheel")
     if sibling is None or not sibling.exists():
         findings.blind.append(
-            "no simulator wheel to compare against -- build one with "
-            "`build.py --target ios-arm64-sim` or pass --against. Without it, "
-            "nothing here connects the device wheel to the run that "
-            "verify_ios_sim.py did")
-        print("  (none found)")
+            (sibling_error or
+             "no simulator wheel to compare against -- build one with "
+             "`build.py --target ios-arm64-sim` or pass --against")
+            + ". Without it, nothing here connects the device wheel to the "
+            "run that verify_ios_sim.py did")
+        print(f"  (none -- {sibling_error or 'not found'})")
     else:
         print(f"  {sibling.name}")
         check_same_but_the_binary(args.wheel, sibling, findings)
