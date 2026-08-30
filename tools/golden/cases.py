@@ -3444,6 +3444,142 @@ def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.max.other -----------------------------------------------------------
+#
+# Moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder (docs/SPELLINGS.md):
+# the kernel already existed and `_aten_dispatch("aten.max.other", ...)` already
+# computed, but nothing in this file compared it against upstream. `torch_call`
+# resolves `torch.ops.aten.max.other` directly -- the real ATen op, which
+# `native_functions.yaml` documents as "binary max, alias of maximum" -- so this
+# checks the kernel's *values* regardless of which op name `torch.max(a, b)`'s
+# own Python frontend happens to redirect to (measured: `aten::maximum`, not
+# `max.other` -- see the `overloads.json` README note on `max` for why the
+# table still spells the free function through this op).
+
+
+def max_other_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.max.other"
+    cases: list[Case] = []
+    for dtype_name in _REDUCE_DTYPES:
+        for sc in _ELEMENTWISE_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    # Every element tied, so the case is only useful if the kernel actually
+    # picks *a* correct value rather than, say, one operand unconditionally.
+    cases.append(
+        _binary_tensor_case(
+            torch_module, c_module, op, torch_call, "int64",
+            [3, 3, 3], (3,), [3, 3, 3], (3,), "every element tied",
+        )
+    )
+    # NaN propagation -- the same regression `max_default_cases` pins for the
+    # reduction overload, but this is not a duplicate of that case: it is a
+    # *different* kernel (elementwise two-tensor vs. single-tensor reduction),
+    # and it does not pass. `aten::maximum`'s contract (`max.other` is
+    # documented upstream as an alias of it) is IEEE maximum -- NaN on either
+    # side wins. Measured directly against this build (not asserted from the
+    # doc comment): `max.other(a, b)` propagates a NaN that is in `a`
+    # correctly but drops one that is only in `b` -- `max.other([1,nan,3],
+    # [5,2,nan])` gives `[5, nan, 3]` here where upstream gives
+    # `[5, nan, nan]`; `max.other([1],[nan])` gives `[1]` where upstream gives
+    # `[nan]`. Left as `expect="match"` -- NOT "c_error" (that means a clean
+    # refusal, and this kernel does not refuse, it silently returns a
+    # plausible-looking wrong value) -- so this stays a live regression trap
+    # for whoever owns `aten.rs` next, the same way the `float16` overflow
+    # case above stays failing on purpose rather than being filed away as a
+    # known/accepted gap. This is currently reachable only through
+    # `_aten_dispatch("aten.max.other", ...)` directly (the op is still in
+    # `IMPLEMENTED_AWAITING_GOLDEN`, docs/SPELLINGS.md), so it does not yet
+    # fail the main `compare.py` gate -- it will as soon as the op is
+    # promoted into `_aten_implemented()`, which is exactly the point of
+    # adding it now rather than after promotion.
+    cases.append(
+        _binary_tensor_case(
+            torch_module, c_module, op, torch_call, "float32",
+            [1.0, float("nan"), 3.0], (3,), [5.0, 2.0, float("nan")], (3,),
+            "BUG (found by this case): NaN in the second operand does not "
+            "propagate -- see the long comment above this builder.",
+        )
+    )
+    return cases
+
+
+# --- aten.reshape.default ------------------------------------------------------
+#
+# Also moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder
+# (docs/SPELLINGS.md). Unlike `view.default` above, this shim's `reshape`
+# kernel is not a thin alias: `_install_tensor_views`'s `flatten` composite
+# calls `dispatch("aten.reshape.default", ...)` specifically because the real
+# kernel already carries both of upstream's two decomposition arms -- return a
+# view when the input is contiguous, copy when it is not -- so the case below
+# that starts from a transposed (non-contiguous) view is not decoration, it is
+# the one input `view_cases` above explicitly calls out as outside its own
+# granularity ("reshape()'s non-contiguous fallback ... is a different op
+# pair"). `torch_call` resolves `torch.ops.aten.reshape.default` directly,
+# which runs upstream's own composite body and returns a real value to diff
+# against, not just a schema.
+
+
+def reshape_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.reshape.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name)
+        cases.append(
+            Case(
+                name=f"reshape(dtype={dtype_name}, (2,3)->(6,)) [contiguous -- view arm]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [6]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [6]),
+                note="contiguous input takes reshape's view arm",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"reshape(dtype={dtype_name}, (2,3)->(-1,)) [inferred dim]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [-1]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [-1]),
+                note="-1 means 'infer this dim's size'",
+            )
+        )
+
+        # Non-contiguous input (a transposed view) -- reshape's copy arm.
+        base_t, base_c = pair_from_flat(torch_module, c_module, list(range(12)), (3, 4), dtype_name)
+        nc_t = base_t.t()
+        nc_c = c_module._aten_dispatch("aten.t.default", base_c)
+        cases.append(
+            Case(
+                name=f"reshape(dtype={dtype_name}, (3,4).t()->(12,)) [non-contiguous -- copy arm]",
+                op=op,
+                run_torch=lambda nc_t=nc_t: torch_call(nc_t, [12]),
+                run_c=lambda nc_c=nc_c: c_module._aten_dispatch(op, nc_c, [12]),
+                note=(
+                    "a transposed view is not contiguous, so upstream's own "
+                    "reshape composite copies here instead of viewing -- this is "
+                    "the arm view_cases' module note says is out of its scope"
+                ),
+            )
+        )
+    # 0-d -> [1]: the same edge `_install_tensor_views::flatten` uses reshape
+    # for on a scalar tensor (docs/ARCH20.md §5's cohere note).
+    zerod_t, zerod_c = pair_from_flat(torch_module, c_module, [7.0], (), "float32")
+    cases.append(
+        Case(
+            name="reshape(dtype=float32, ()->[1]) [0-d -- flatten()'s own call shape]",
+            op=op,
+            run_torch=lambda: torch_call(zerod_t, [1]),
+            run_c=lambda: c_module._aten_dispatch(op, zerod_c, [1]),
+            note="0-d is not a no-op: shape becomes (1,)",
+        )
+    )
+    return cases
+
+
 # --- aten.mean.default / aten.mean.dim / aten.sum.default / aten.sum.dim_IntList --
 
 def mean_default_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -13141,4 +13277,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # builder that moves this op from IMPLEMENTED_AWAITING_GOLDEN into the
     # 2760-case golden suite (docs/LINEAR.md §4.3, §6 item 2).
     "aten.matmul.default": matmul_cases,
+    # docs/SPELLINGS.md: the two `IMPLEMENTED_AWAITING_GOLDEN` kernels that
+    # fell inside this round's 25-name inventory, moved into real coverage.
+    "aten.max.other": max_other_cases,
+    "aten.reshape.default": reshape_cases,
 }

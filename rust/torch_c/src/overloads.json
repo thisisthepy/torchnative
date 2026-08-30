@@ -135,7 +135,72 @@
     "",
     "`constant_pad_nd` (bert, §2) is the reverse -- a genuinely new kernel.",
     "Its `.out` sibling is omitted for the reason `sum.out` is: this shim has",
-    "no out-variant kernel, and `F.pad` never asks for one."
+    "no out-variant kernel, and `F.pad` never asks for one.",
+    "",
+    "docs/ARCH20.md §9's 25-name inventory (docs/SPELLINGS.md has the full",
+    "per-name accounting): 22 got a `torch.<name>` entry here, 3",
+    "(`gelu`/`silu`/`softplus`) did not -- measured against torch 2.13.0,",
+    "`hasattr(torch, 'gelu')` is `False`. There is no `torch.gelu` upstream,",
+    "only `torch.nn.functional.gelu` / `torch._C._nn.gelu`, both of which",
+    "this shim already answers (`bootstrap.py`'s `_install_nn`). Adding a",
+    "`torch.gelu` entry here would invent a spelling upstream itself does",
+    "not have -- the same complaint `layer_norm` above makes, from the other",
+    "direction. `scalar_tensor` and `convolution` were checked the same way",
+    "and both *do* have a bare `torch.<name>`, so both get an entry despite",
+    "being the two lowest-level names on the list.",
+    "",
+    "`.out` variants are omitted from every one of the 22 for the reason",
+    "`sum.out`/`constant_pad_nd.out` above are: none of the twenty-two",
+    "kernels has an out-variant, and `torch.<name>(..., out=)` is not a",
+    "call any measured caller makes for these names.",
+    "",
+    "`clamp` and `min` each list a schema with no kernel behind it, in the",
+    "Tensor-first order `methods.json`'s own `clamp`/`min` entries already",
+    "use -- mirrored rather than re-decided, so the two tables agree on the",
+    "same op. Measured (`TorchDispatchMode`, torch 2.13.0):",
+    "`torch.clamp(x, min=t)` (a Tensor bound) resolves `clamp.Tensor`,",
+    "`torch.clamp(x, min=1.0)` and `torch.clamp(x)` (neither given) both",
+    "resolve `clamp.default`/`clamp.Tensor` respectively and this shim has a",
+    "kernel only for the Scalar form (`aten.clamp.default`) -- `clamp.Tensor`",
+    "names a work item, same as `methods.json` already documents for it.",
+    "`min.other` and `min.dim` are the sharper case: this shim has *no*",
+    "kernel for either (`_aten_implemented()` lists only `min.default`,",
+    "measured against the built artefact, not `min.other` or `min.dim`,",
+    "and neither is in `IMPLEMENTED_AWAITING_GOLDEN` either) -- unlike",
+    "`max`, whose `.dim` and `.other` both do have kernels (`.other` was",
+    "sitting in `IMPLEMENTED_AWAITING_GOLDEN`, needing exactly the case",
+    "builder docs/SPELLINGS.md and this round's `cases.py` change add).",
+    "So `torch.min(x, y)` and `torch.min(x, dim=0)` resolve correctly and",
+    "then refuse by name -- a precise work item for whoever owns `aten.rs`",
+    "next, not a wrong answer.",
+    "",
+    "`max`'s two-tensor overload is the one name here where the schema",
+    "listed is not the one upstream's *own* dispatcher shows for that call.",
+    "Measured: `torch.max(a, b)` (two Tensors) fires `aten::maximum`, not",
+    "`aten::max.other` -- `max.other` is native_functions.yaml's own",
+    "comment calls it, verbatim, \"binary max, alias of maximum\", and this",
+    "shim has no `maximum` kernel at all. `max.other` is listed here anyway",
+    "because it is a real, separate ATen op (not a name this shim invents),",
+    "its kernel already exists and is mathematically the same elementwise",
+    "maximum `aten::maximum` computes, and the alternative -- leaving the",
+    "two-tensor overload out entirely -- would refuse a call this shim can",
+    "already answer correctly. This is different from the `layer_norm` case",
+    "above: there, the schema names a kernel this shim will never have;",
+    "here, the kernel exists and is checked against upstream's `torch.max`",
+    "*values*, only the internal ATen op name differs from what upstream's",
+    "own dispatcher happens to pick.",
+    "",
+    "`mul.Scalar` mirrors the `div_.Scalar`/`add_.Scalar` divergence already",
+    "documented above, on the non-in-place side this time: measured,",
+    "`torch.mul(x, 2.0)` dispatches `aten::mul.Tensor` (upstream's own `.pyi`",
+    "even types `mul`'s `input`/`other` as `Tensor | Number`, wrapping the",
+    "scalar before an overload is picked), so `mul.Scalar` is listed as a",
+    "fallback that computes rather than one upstream's dispatcher is",
+    "measured to reach. `torch.mul(2.0, x)` (scalar *first*) is not",
+    "supported -- neither schema's `self` parameter accepts a bare Python",
+    "number, and no measured caller in this repository writes a function",
+    "call with the scalar in the first slot (`2.0 * x` goes through",
+    "`__rmul__`, already a `methods.json` entry)."
   ],
 
   "arange": [
@@ -457,5 +522,107 @@
 
   "constant_pad_nd": [
     "aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor"
+  ],
+
+  "abs": [
+    "aten::abs(Tensor self) -> Tensor"
+  ],
+
+  "cos": [
+    "aten::cos(Tensor self) -> Tensor"
+  ],
+
+  "sin": [
+    "aten::sin(Tensor self) -> Tensor"
+  ],
+
+  "reciprocal": [
+    "aten::reciprocal(Tensor self) -> Tensor"
+  ],
+
+  "clone": [
+    "aten::clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor"
+  ],
+
+  "clamp": [
+    "aten::clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor",
+    "aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+
+  "eq": [
+    "aten::eq.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::eq.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "ne": [
+    "aten::ne.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ne.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "lt": [
+    "aten::lt.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::lt.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "le": [
+    "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "gt": [
+    "aten::gt.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::gt.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "ge": [
+    "aten::ge.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ge.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "max": [
+    "aten::max(Tensor self) -> Tensor",
+    "aten::max.other(Tensor self, Tensor other) -> Tensor",
+    "aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)"
+  ],
+
+  "min": [
+    "aten::min(Tensor self) -> Tensor",
+    "aten::min.other(Tensor self, Tensor other) -> Tensor",
+    "aten::min.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)"
+  ],
+
+  "mul": [
+    "aten::mul.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::mul.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "reshape": [
+    "aten::reshape(Tensor(a) self, SymInt[] shape) -> Tensor(a)"
+  ],
+
+  "unbind": [
+    "aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]"
+  ],
+
+  "bitwise_and": [
+    "aten::bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "bitwise_or": [
+    "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "bitwise_not": [
+    "aten::bitwise_not(Tensor self) -> Tensor"
+  ],
+
+  "scalar_tensor": [
+    "aten::scalar_tensor(Scalar s, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
+  "convolution": [
+    "aten::convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, SymInt[] output_padding, SymInt groups) -> Tensor"
   ]
 }

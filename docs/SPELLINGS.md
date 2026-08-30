@@ -521,3 +521,232 @@ mode, 0 problem) 전부 통과. 3 타깃(host / androidNdk arm64-v8a / aarch64-a
 `are_deterministic_algorithms_enabled`/`tensor`처럼 aten 연산이 아니거나 이미 다른 경로로 다뤄지는
 이름들은 이 조사에서 제외했다(맨 `torch.<name>(...)` AST 호출 패턴에는 잡히지만 aten dispatch
 op가 아니다).
+
+---
+
+## 7. 다섯 번째 회차 — `docs/ARCH20.md` §9의 25개 인벤토리
+
+§4~§6 이후 여러 회차가 이 문서를 갱신하지 않은 채 지나갔고(`docs/ARCH20.md`는 이 문서 §6을
+직접 인용하면서도 자신의 §9에 새 인벤토리를 `overloads.json`/`verify_schemas.py`의 절대
+숫자로만 남겼다 — 151/151, 총 4295/4295), 이번 회차는 그 §9가 "잘 정의된 다음 회차"라고
+남긴 25개 이름을 마저 채우는 것이다. §6까지의 233/233은 이제 오래된 기준선이므로, 이번
+회차는 `docs/ARCH20.md` §9의 기준선(151/151, 4295/4295)에서 이어 쓴다. 파일 범위는
+`overloads.json`/`methods.json`/`bootstrap.py`/`tools/golden/cases.py`/
+`rust/torch_c/pytests/test_shim.py`/이 문서였고, `aten.rs`/`tensor.rs`/`dtype.rs`는 다른
+에이전트가 작업 중이라 금지됐다 — §6의 "표 항목이 커널을 보장하지 않는다"는 원칙이 이번에도
+그대로 적용된다.
+
+### 7.0 25개를 `_aten_implemented()`로 재검증
+
+`docs/ARCH20.md` §9의 목록을 그대로 믿지 않고 `_C._aten_implemented()`/
+`_aten_implemented_awaiting_golden()`로 다시 쟀다:
+
+    abs cos sin reciprocal clone unbind                    IMPLEMENTED, 커널 하나씩
+    eq ne lt le gt ge (Tensor/Scalar)                       IMPLEMENTED, 오버로드 둘씩
+    bitwise_and bitwise_or (Tensor/Scalar) bitwise_not       IMPLEMENTED
+    mul (Tensor/Scalar)                                      IMPLEMENTED
+    scalar_tensor convolution                                IMPLEMENTED
+    clamp                                                     .default 만 IMPLEMENTED, .Tensor 는 커널 없음
+    max                                                       .default/.dim IMPLEMENTED, .other 는 AWAITING_GOLDEN
+    min                                                       .default 만 IMPLEMENTED, .other/.dim 은 커널 자체가 없음
+    reshape                                                    AWAITING_GOLDEN
+    gelu silu softplus                                         IMPLEMENTED — 그러나 아래 §7.1
+
+22개에 `overloads.json` 항목을 새로 넣었다. 3개는 넣지 않았다.
+
+### 7.1 뺀 것 — `gelu`/`silu`/`softplus`: 상류에 `torch.<name>` 자체가 없다
+
+`docs/ARCH20.md` §9는 이 셋을 "real gap"(공개 함수가 있고 커널도 있는데 이름이 없다) 목록에
+넣었는데, 실측하면 전제가 틀렸다:
+
+    hasattr(torch, "gelu")      -> False
+    hasattr(torch, "silu")      -> False
+    hasattr(torch, "softplus")  -> False
+    hasattr(torch.nn.functional, "gelu")  -> True
+    hasattr(torch._C._nn, "gelu")          -> True
+
+`torch.gelu`라는 맨 스펠링은 상류에 처음부터 없다 — `torch.nn.functional.gelu`와
+`torch._C._nn.gelu`뿐이고, 이 빌드는 그 둘 다 이미 답한다(`bootstrap.py`의 `_install_nn`,
+§5.1이 `gelu`를 심은 바로 그 자리 — 이 회차 이전부터 동작). `overloads.json`에
+`torch.gelu` 항목을 넣는 것은 §4.3이 `layer_norm`에서, §5.0이 `gelu` 자체에서 이미 쓴 것과
+같은 실수를 반대 방향으로 짓는 일이다 — 거기서는 스키마는 진짜인데 커널이 절대 없고, 여기서는
+**이름 자체가 상류에 없다.** `docs/ARCH20.md` §9의 분류를 바로잡는다: 이 셋은 "real gap"이
+아니라 "공개 `torch.<name>`이 없는 게 맞다" 쪽에 있어야 했다.
+
+### 7.2 `clamp`, `max`, `min` — 오버로드 단위로 갈랐다
+
+`max`가 세 오버로드(전체-리덕션/두-텐서/축-리덕션)를 갖고 서로 바꿔 쓸 수 없다는 지시의 경고는
+축소해서 말한 것이었다 — `max`와 `min`은 커널 구성 자체가 다르다:
+
+    clamp.Tensor(min/max 가 Tensor)   커널 없음 -- methods.json 의 clamp 항목과 같은 순서(Tensor 먼저)로
+                                       overloads.json 에도 넣었다, 정확한 이름으로 거부하도록
+    clamp.default(min/max 가 Scalar)  커널 있음 -- 실제로 동작
+
+    max.default(무인자)               커널 있음
+    max.dim(dim=)                     커널 있음
+    max.other(두 텐서)                커널은 있는데 AWAITING_GOLDEN(§7.3)
+
+    min.default(무인자)               커널 있음
+    min.other/min.dim                 **커널 자체가 없다** -- IMPLEMENTED 에도 AWAITING_GOLDEN 에도 없음
+
+`min`은 무인자 형태 하나만 채웠다 — 나머지 둘은 `methods.json`의 기존 `min` 항목과 같은 순서로
+`overloads.json`에도 넣어(정확한 이름으로 거부하도록, §6.2가 `sum.out`에 쓴 것과 같은 논리)
+다음 회차의 작업 큐에 정확히 잡히게 했다. `aten.rs`가 금지 파일이라 커널을 만들 수 없었다.
+
+**`max`의 두-텐서 형태가 이번 회차의 진짜 발견이다.** `TorchDispatchMode`로 재보면
+`torch.max(a, b)`(텐서 둘)는 `aten::max.other`가 아니라 **`aten::maximum`**으로 간다 —
+`native_functions.yaml`이 `max.other` 바로 위에 "binary max, alias of maximum"이라고 직접
+적어 뒀고, 이 빌드에는 `maximum`이라는 이름의 커널이 아예 없다. 그래도 `overloads.json`의
+`max` 항목에는 `max.other`를 넣었다 — 지어낸 이름이 아니라 진짜 별개의 ATen op이고, 그 커널이
+계산하는 값은 `maximum`과 수학적으로 같은 원소별 최댓값이며, `torch.max`의 실제 *값*과
+대조한 골든 케이스(§7.3)로 이미 확인했기 때문이다. `layer_norm` 때와는 다르다 — 거기는
+스키마가 이 셈이 절대 갖지 못할 커널의 이름을 짓는 것이었고, 여기는 커널이 있고 값이 맞는데
+상류 디스패처가 내부적으로 고르는 op 이름만 다르다.
+
+**그 케이스를 쓰다가 `max.other` 커널의 실제 버그를 하나 찾았다** — 이번 회차 무관하게
+이미 있던 버그지만, 발견한 김에 고치지 않고(파일 범위 밖) 골든 케이스에 실패하는 채로 박아
+뒀다:
+
+    max.other([1, nan, 3], [5, 2, nan])   상류: [5, nan, nan]   이 빌드: [5, nan, 3]
+    max.other([1], [nan])                 상류: [nan]           이 빌드: [1]
+
+첫 번째 인자의 NaN은 정확히 전파되고, 두 번째 인자의 NaN만 사라진다. `max.other`가 아직
+`AWAITING_GOLDEN`(§7.3)이라 `compare.py`의 본 게이트(3302/3302)에는 안 잡히지만, 승격되는
+순간 바로 깨질 것 — 그게 지금 케이스를 넣어 두는 이유다.
+
+### 7.3 `reshape`/`max.other` — `IMPLEMENTED_AWAITING_GOLDEN` 두 개에 케이스를 지어 줬다
+
+`aten.rs`의 `IMPLEMENTED_AWAITING_GOLDEN` 코멘트가 스스로 적어 둔 절차("케이스 빌더 하나,
+줄 이동 하나")의 앞 절반을 이번 회차가 했다. `tools/golden/cases.py`에 `reshape_cases`(13개)와
+`max_other_cases`(20개)를 새로 넣고 `CASE_BUILDERS`에 등록했다. **줄 이동(`aten.rs`의
+`IMPLEMENTED_AWAITING_GOLDEN` → `IMPLEMENTED`)은 `aten.rs`라 이번 회차가 손댈 수 없다** —
+빠뜨린 게 아니라 다음 담당자에게 넘기는 한 줄짜리 finding이다. `compare.py`를 그대로 돌려
+확인:
+
+    PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
+      -- waiting, not failing: ['aten.max.other', 'aten.reshape.default']
+
+`reshape`의 커널은 `view`의 얇은 별칭이 아니다 — `bootstrap.py`의 `flatten` 합성이
+`dispatch("aten.reshape.default", ...)`를 직접 부르는 이유가, 이 커널이 상류의 두 분해
+가지(contiguous면 view, 아니면 copy)를 이미 다 갖고 있어서다. `reshape_cases`는 전치된
+(non-contiguous) 입력으로 그 copy 가지를 직접 확인한다 — `view_cases`의 기존 모듈 코멘트가
+"이 하네스의 비교 단위 밖"이라고 명시적으로 뺀 바로 그 입력이다. `(3,4).t()`를 `(12,)`로
+reshape한 값을 상류와 비트까지 대조해 확인했다.
+
+### 7.4 나머지 20개 — `methods.json`을 그대로 옮겼다, 새 판단 없이
+
+`abs` `cos` `sin` `reciprocal` `clone` `unbind`, 여섯 비교 연산, 세 비트 연산, `mul`은 전부
+이미 골든 대조된 커널과 이미 정착된 오버로드 순서를 가진 `methods.json` 항목이 있었다.
+`overloads.json` 항목은 그 스키마 목록과 순서를 **그대로** 옮겼다 — 이미 있는 멤버의 커널에
+함수 모양의 두 번째 문을 달아 주는 것이 이번 회차의 전부였지, 새 해석 판단을 더하는 것이
+아니었다. `mul.Scalar`는 따로 적어 둘 만하다: `torch.mul(x, 2.0)`을 재 보면
+`aten::mul.Tensor`로 간다(상류 `.pyi`가 `mul`의 `input`/`other`를 `Tensor | Number`로
+선언해 스칼라를 텐서로 감싼 뒤에 오버로드를 고른다) — §6.2 이전부터 `div_.Scalar`/`add_.Scalar`가
+이미 남긴 것과 같은 어긋남이고, `mul.Scalar`도 그 전례대로 "동작은 하되 상류 디스패처가 실제로
+가리키지는 않는" 대체 항목으로 남겨 뒀다.
+
+`scalar_tensor`/`convolution`은 이번 회차에서 진짜로 새로운 `(qualname, overload)` 정체성
+둘이다 — 둘 다 `Tensor` 수신자가 없어 `methods.json`의 후보가 된 적이 없다. 지시대로
+`hasattr(torch, name)`부터 확인한 뒤 넣었다(둘 다 `True`) — `gelu`/`silu`/`softplus`와
+갈리는 지점이 바로 이 확인이다.
+
+`.out` 변형은 22개 전부에서 뺐다 — `overloads.json`의 기존 `sum.out`/`constant_pad_nd.out`
+코멘트가 남긴 이유 그대로, 이 22개 중 어느 것도 out-변형 커널이 없고 이 저장소 안에서
+`torch.<name>(..., out=)` 형태로 부르는 측정된 호출자가 없다.
+
+### 7.5 사보타지
+
+이 저장소가 매 회차 "케이스는 있는데 스펠링이 빠져도 통과하는 것이 최소 하나는 있다"고
+찾아낸 규칙대로, 두 모양으로 실측했다(`cp` 백업, `git checkout` 아님):
+
+**삭제.** `abs` `max` `bitwise_and` `reshape` `scalar_tensor` `convolution` 여섯 항목을
+`overloads.json`에서 지우고 재빌드, `pytests/run.sh` 재실행. 새로 넣은
+`test_spelling_road_through_the_vendored_tree`가 첫 실패 지점에서 멈췄지만(pytest는
+assert 하나에서 멈춘다), 서브프로세스 스크립트를 직접 돌려 모든 필드를 대조하면 **~70개
+필드 중 15개**가 정확히 지운 여섯 이름의 *함수* 스펠링에서만 "표에 항목이 없다"는
+`NotImplementedError`로 바뀌고, 같은 여섯 이름의 *메서드* 스펠링(`methods.json`은 안
+건드렸으므로)은 전부 그대로 값이 맞았다. 백업에서 복원(`diff`로 바이트 동일 확인), 재빌드,
+재실행 초록 확인.
+
+**잘못된 키.** `max`의 두-텐서 오버로드를 먼저 `aten::min.other`(커널 없음 —
+`NotImplementedError: aten.min.other`로 잡힘)로, 그다음 `aten::mul.Tensor`(진짜 커널, 같은
+`(Tensor, Tensor) -> Tensor` 모양이라 리졸버가 군말 없이 바인딩)로 바꿔치기했다. 두 번째가
+더 날카로운 결과다: `torch.max(x, y)`가 조용히 `mul.Tensor`의 답 `[-1.0, 2.0, 9.0, 20.0]`을
+냈고(정답은 원소별 최댓값 `[1.0, 2.0, -3.0, 5.0]`), 스펠링 로드 테스트가 정확한 값 불일치로
+잡았다: `AssertionError: max_other_fn: expected [1.0, 2.0, -3.0, 5.0], got [-1.0, 2.0, 9.0, 20.0]`.
+이것이 지시가 "거부보다 나쁘다"고 부른 바로 그 실패 모양 — 리졸버가 해석 자체를 실패하는 게
+아니라 진짜 있지만 틀린 오버로드를 고르는 것 — 이고, 이 테스트가 잡도록 지어진 것이다.
+복원, 재빌드, 재실행 초록 확인.
+
+### 7.6 스키마 숫자: 4295 → 4331 (+36), distinct pair 는 215 → 217 (+2)
+
+`verify_schemas.py`의 총합은 두 표에 걸친 스키마 *문자열* 개수이지, distinct
+`(qualname, overload)` 정체성이 아니다. 변경 전 기준선(`git stash`로 세 파일만 되돌림,
+`checkout` 아님)에 대고 재확인:
+
+    기준선 (5a60a1b, 이 회차 시작점)   overloads.json 151/151  ->  SUMMARY 4295/4295
+    이 회차                             overloads.json 187/187  ->  SUMMARY 4331/4331
+
+`overloads.json`에서 +36, 나머지는 그대로(`methods.json` 159/159, `packet overload lists`
+109/109 — 상류에 없는 op 이름을 새로 만든 게 없다는 뜻). +36은 이번에 넣은 22개 이름의
+스키마 문자열 개수 그대로: 단일 오버로드 10개(`abs` `cos` `sin` `reciprocal` `clone`
+`reshape` `unbind` `bitwise_not` `scalar_tensor` `convolution`) + 이중 오버로드 10개(`clamp`
+`eq` `ne` `lt` `le` `gt` `ge` `bitwise_and` `bitwise_or` `mul`, 2개씩) + 삼중 오버로드
+2개(`max` `min`, 3개씩) = 10 + 20 + 6 = 36.
+
+`test_shim.py`의 `test_schema_text_survives_the_round_trip_through_the_transcribed_tables`는
+따로 **distinct** `(qualname, overload)` 쌍의 개수를 못 박는다 — 215 → **217**, +2 (22가
+아니다). 이번에 `overloads.json`에 넣은 스키마는 거의 다 `methods.json`에 이미 있던 정체성
+그대로였고(§7.4), `scalar_tensor`/`convolution`만 진짜 새 정체성이다. 이 테스트는 이번
+회차가 손댄 파일 중 하나(`test_shim.py`)라 직접 고쳤다 — 고치기 전 `AssertionError: 217`로
+빨갛게 잡혔다는 것 자체가, 이 카운트가 실패할 수 있는 검증이라는 증거다.
+
+### 7.7 SmolLM2-135M float32 prefill — 비트까지 동일
+
+`docs/ARCH20.md` §11.4와 같은 방법. 14토큰 고정 프롬프트, `HuggingFaceTB/SmolLM2-135M`,
+`dtype=torch.float32`, 로짓 688,128개 전부 체크섬:
+
+    이전 (5a60a1b, 이 워크트리 시작점)   Σ=13772464.428035617  max=35.017337799072266  sha256=192ad557...1de316
+    이후 (이 회차)                        Σ=13772464.428035617  max=35.017337799072266  sha256=192ad557...1de316
+
+비트까지 동일. `git stash`로 세 파일만 되돌려 "이전" 빌드를 만들고(`checkout` 아님), 되돌린
+파일이 백업과 바이트 동일한지 `diff`로 확인한 뒤 `stash pop`으로 복원, 재빌드. SmolLM2의
+순전파가 이번에 새로 연 22개 스펠링 중 어느 것도 부르지 않는다는 뜻이고, 지시가 요구한
+정확히 그 성질("스펠링을 추가했다고 모델 결과가 바뀌면 안 된다")이 성립함을 보여준다.
+
+### 7.8 20-아키텍처 순전파 스윕 — 여전히 19/20
+
+`docs/ARCH20.md`와 같은 방법(2-layer, hidden 64, 2-head, vocab 64 토이 config,
+`transformers.AutoConfig.for_model`)으로 재실행:
+
+    llama gpt2 qwen2 mistral gemma gpt_neox opt mpt starcoder2 persimmon
+    cohere stablelm olmo phi bert falcon bloom mixtral mamba   -- 전부 PASS
+    gpt_bigcode                                                 -- FAIL (그대로)
+
+`gpt_bigcode`는 `transformers`의 지연 임포트 레이어에서 `ModuleNotFoundError`로 보이지만,
+`__cause__` 체인을 따라가면 `docs/ARCH20.md` §10이 이미 남긴 그 벽 그대로다:
+`NotImplementedError: SourceRangeFactory.make_range`(`@torch.jit.script`가 임포트 시점에
+평가되는 TorchScript 프런트엔드). 이번 회차는 `methods.json`을 하나도 안 건드렸고
+`overloads.json`은 새 키만 추가했으므로(기존 키 수정 없음), 나머지 19개의 리졸루션은 애초에
+움직일 이유가 없었다.
+
+### 7.9 손대지 않은 것 / 이 회차가 검증하지 않은 것
+
+* `max.other`의 NaN 비대칭, `min.other`/`min.dim`의 커널 부재, `clamp.Tensor`의 커널
+  부재(§7.2) — 찾아서 이름 붙였을 뿐 고치지 않았다, `aten.rs` 금지.
+* 혼합 dtype 비교(`torch.eq(int32_tensor, float32_tensor)`) — 이 빌드의 `eq.Tensor` 커널이
+  깔끔하게 거부한다(`NotImplementedError: dtype promotion not implemented`)는 것만
+  스펠링-로드 테스트에 박아 뒀다. 프로모션 자체는 `aten.rs`의 일이다.
+* Android/iOS — 호스트 아티팩트만 빌드·실행했다. 이번 회차가 새 `#[cfg]`나 새 FFI 표면을
+  만들지 않았다는 것과, `docs/ARCH20.md` §11.5가 이미 남긴 같은 범위 제한이라는 것만
+  적어 둔다.
+
+### 7.10 숫자
+
+`verify_schemas.py`: **4295/4295 → 4331/4331** (+36, §7.6). 골든 하네스는
+**3302/3302 그대로, ops covered=133 그대로**(무회귀 — `PENDING: 2`로 `max.other`/
+`reshape.default`가 보류 중임을 보고할 뿐 본 게이트는 건드리지 않는다). `--self-test`
+**13 comparators x 11 fault modes, 0 problem — PASS**. 호스트 스모크(`pytests/run.sh`)
+**242개, exit 0**(새 `test_spelling_road_through_the_vendored_tree` 1개 포함). `verify_schemas.py`
+distinct pair **215 → 217**(+2, §7.6). SmolLM2-135M float32 prefill **비트까지 동일**(§7.7).
+20-아키텍처 스윕 **19/20 그대로**(§7.8).

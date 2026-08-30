@@ -7873,7 +7873,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # in-place family. The `__iadd__`/`__isub__`/`__imul__` entries add none --
     # they are second spellings of `add_`/`sub_`/`mul_`, and this counts
     # distinct schema identities, not table keys.
-    assert len(keys) == 215, len(keys)
+    #
+    # 217 until docs/SPELLINGS.md's 22-name `overloads.json` batch (this
+    # round's fix for docs/ARCH20.md §9's inventory of kernels with no
+    # `torch.<name>`). +2, not +22: every schema this round put in
+    # `overloads.json` was already a distinct identity somewhere in
+    # `methods.json` -- `abs`, `cos`, `sin`, `reciprocal`, `clone`, `clamp`
+    # (both overloads), the six comparisons (both overloads each), `max`
+    # (all three), `min` (all three), `mul` (both), `reshape`, `unbind`,
+    # `bitwise_and`/`bitwise_or` (both overloads each) and `bitwise_not` --
+    # because the whole point of this round was giving an *existing* member's
+    # kernel a second, function-shaped door, not a new kernel. Only
+    # `scalar_tensor` and `convolution` are new identities: neither has a
+    # `Tensor` receiver, so neither was ever a candidate for `methods.json`.
+    assert len(keys) == 217, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -9639,6 +9652,311 @@ def test_pow_promotes_and_refuses_where_upstream_does():
         assert "negative integer powers" in str(e), str(e)
     else:
         raise AssertionError("pow.Tensor_Scalar with a negative int must refuse")
+
+
+# ---------------------------------------------------------------------------
+# The spelling road (docs/SPELLINGS.md, docs/ARCH20.md §9's 25-name inventory)
+# ---------------------------------------------------------------------------
+#
+# Every case above this reaches its kernel one of two ways: `_C._aten_dispatch`
+# directly, or (in the e2e sections) a caller several layers removed from the
+# table this round edited. Neither proves the thing docs/ARCH20.md §9 found
+# missing for 22 names: that `torch.<name>(...)` -- the literal spelling a
+# model's Python source writes -- resolves through `overloads.json` /
+# `methods.json` to the *same* kernel. `tools/golden/cases.py` cannot prove
+# this either (docs/SPELLINGS.md): its `c_module` is the bare `_C` extension,
+# loaded standalone, with no `overloads.json`/`methods.json` resolver
+# installed on it at all -- so a golden case for e.g. `aten.abs.default` was
+# passing for as long as that kernel existed, regardless of whether
+# `torch.abs` had ever been wired to reach it. This is the gap that let a
+# gpt2-shaped case: kernel golden-compared for weeks, `torch.<name>` still
+# `NotImplementedError`.
+#
+# So this section runs in a subprocess with the shim-backed `torch` on
+# `PYTHONPATH` (the same shape `_DEVICE_ROAD_SCRIPT` above uses) and calls
+# every one of the 22 names the way a model actually would: as
+# `torch.<name>(...)`, and as `tensor.<name>(...)` wherever a member exists.
+# Expected values are computed in plain Python (`math.cos`, `==`, `&`, ...)
+# rather than by importing upstream torch a second time, so this section
+# still runs on an interpreter with no torch installed at all, matching this
+# file's own docstring promise.
+#
+# The 3 names docs/ARCH20.md §9 listed that do NOT get an entry here --
+# `gelu`, `silu`, `softplus` -- are deliberately absent from this road too:
+# measured (`hasattr(torch, "gelu")` on real torch 2.13.0) there never was a
+# bare `torch.gelu` upstream, only `torch.nn.functional.gelu` /
+# `torch._C._nn.gelu`, and both of those already work in this shim
+# (`bootstrap.py`'s `_install_nn`) -- there is no gap to close for them, so no
+# `overloads.json` entry and nothing to prove here either.
+
+_SPELL_ROAD_SCRIPT = r"""
+import json, math, sys
+import torch
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+x = torch.tensor([-1.0, 2.0, -3.0, 4.0])
+y = torch.tensor([1.0, 1.0, -3.0, 5.0])
+
+# --- unary, free function + member ------------------------------------------
+rec("abs_fn", lambda: torch.abs(x).tolist())
+rec("abs_member", lambda: x.abs().tolist())
+rec("cos_fn", lambda: torch.cos(x).tolist())
+rec("cos_member", lambda: x.cos().tolist())
+rec("sin_fn", lambda: torch.sin(x).tolist())
+rec("sin_member", lambda: x.sin().tolist())
+rec("reciprocal_fn", lambda: torch.reciprocal(torch.tensor([1.0, 2.0, 4.0])).tolist())
+rec("reciprocal_member", lambda: torch.tensor([1.0, 2.0, 4.0]).reciprocal().tolist())
+
+# clone: a real copy, not an alias -- mutate the clone, check the original.
+def _clone_check():
+    src = x.clone()
+    cloned = torch.clone(src)
+    cloned.fill_(0.0)
+    return [src.tolist(), cloned.tolist()]
+rec("clone_fn_independent", _clone_check)
+def _clone_member_check():
+    src = x.clone()
+    cloned = src.clone()
+    cloned.fill_(0.0)
+    return [src.tolist(), cloned.tolist()]
+rec("clone_member_independent", _clone_member_check)
+
+# --- clamp: both/min-only/max-only (kernel), neither (kernel-less) ---------
+rec("clamp_both_fn", lambda: torch.clamp(x, min=-2.0, max=2.0).tolist())
+rec("clamp_min_fn", lambda: torch.clamp(x, min=-2.0).tolist())
+rec("clamp_max_fn", lambda: torch.clamp(x, max=2.0).tolist())
+rec("clamp_both_member", lambda: x.clamp(min=-2.0, max=2.0).tolist())
+try:
+    torch.clamp(x)
+    out["clamp_neither_fn"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["clamp_neither_fn"] = f"refused:{e}"
+
+# --- comparisons: all six, free function + member, plus mixed-dtype -------
+for name in ("eq", "ne", "lt", "le", "gt", "ge"):
+    rec(f"{name}_fn", lambda name=name: getattr(torch, name)(x, y).tolist())
+    rec(f"{name}_member", lambda name=name: getattr(x, name)(y).tolist())
+try:
+    torch.eq(torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([1.0, 3.0, 2.0]))
+    out["eq_mixed_dtype"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["eq_mixed_dtype"] = f"refused:{e}"
+
+# --- max/min: whole-tensor, two-tensor (max only), dim-reduce (max only) --
+rec("max_whole_fn", lambda: torch.max(x).item())
+rec("max_whole_member", lambda: x.max().item())
+rec("max_other_fn", lambda: torch.max(x, y).tolist())
+rec("max_other_member", lambda: x.max(y).tolist())
+m2d = torch.tensor([[1.0, 5.0, 2.0], [9.0, 0.0, 3.0]])
+def _max_dim():
+    vals, idx = torch.max(m2d, 1)
+    return [vals.tolist(), idx.tolist()]
+rec("max_dim_fn", _max_dim)
+def _max_dim_member():
+    vals, idx = m2d.max(1)
+    return [vals.tolist(), idx.tolist()]
+rec("max_dim_member", _max_dim_member)
+rec("min_whole_fn", lambda: torch.min(x).item())
+rec("min_whole_member", lambda: x.min().item())
+try:
+    torch.min(x, y)
+    out["min_other_fn"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["min_other_fn"] = f"refused:{e}"
+try:
+    torch.min(x, dim=0)
+    out["min_dim_fn"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["min_dim_fn"] = f"refused:{e}"
+
+# --- mul: Tensor-Tensor and Tensor-Scalar, free function + member ---------
+rec("mul_tensor_fn", lambda: torch.mul(x, y).tolist())
+rec("mul_scalar_fn", lambda: torch.mul(x, 2.0).tolist())
+rec("mul_tensor_member", lambda: x.mul(y).tolist())
+
+# --- reshape: contiguous, inferred dim, non-contiguous (copy arm) ---------
+rec("reshape_fn", lambda: torch.reshape(x, (2, 2)).tolist())
+rec("reshape_member", lambda: x.reshape((2, 2)).tolist())
+def _reshape_noncontig():
+    base = torch.arange(12.0).reshape(3, 4).t()
+    return torch.reshape(base, (12,)).tolist()
+rec("reshape_noncontig_fn", _reshape_noncontig)
+
+# --- unbind: default dim and explicit dim, free function + member ---------
+m2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+rec("unbind_default_fn", lambda: [t.tolist() for t in torch.unbind(m2)])
+rec("unbind_dim1_fn", lambda: [t.tolist() for t in torch.unbind(m2, dim=1)])
+rec("unbind_member", lambda: [t.tolist() for t in m2.unbind()])
+
+# --- bitwise family: Tensor + Scalar, free function + member --------------
+bi = torch.tensor([1, 3, 5], dtype=torch.int64)
+bj = torch.tensor([3, 3, 4], dtype=torch.int64)
+rec("bitwise_and_fn", lambda: torch.bitwise_and(bi, bj).tolist())
+rec("bitwise_and_scalar_fn", lambda: torch.bitwise_and(bi, 3).tolist())
+rec("bitwise_and_member", lambda: bi.bitwise_and(bj).tolist())
+rec("bitwise_or_fn", lambda: torch.bitwise_or(bi, bj).tolist())
+rec("bitwise_or_member", lambda: bi.bitwise_or(bj).tolist())
+rec("bitwise_not_fn", lambda: torch.bitwise_not(bi).tolist())
+rec("bitwise_not_member", lambda: bi.bitwise_not().tolist())
+bbool = torch.tensor([True, False, True])
+rec("bitwise_not_bool_fn", lambda: torch.bitwise_not(bbool).tolist())
+
+# --- scalar_tensor: no member (a factory, no receiver) ---------------------
+rec("scalar_tensor_fn", lambda: torch.scalar_tensor(3.5).item())
+rec("scalar_tensor_dtype_fn", lambda: str(torch.scalar_tensor(3.5).dtype))
+
+# --- convolution: 1-D, no member, checked against the raw kernel path -----
+def _convolution_matches_raw_dispatch():
+    w = torch.zeros(2, 3, 3)
+    w[0, 0, 1] = 1.0  # picks out one input channel, identity-ish kernel
+    inp = torch.arange(24.0).reshape(1, 3, 8)
+    via_spelling = torch.convolution(inp, w, None, [1], [0], [1], False, [0], 1)
+    via_raw = torch._C._aten_dispatch(
+        "aten.convolution.default", inp, w, None, [1], [0], [1], False, [0], 1
+    )
+    return [via_spelling.tolist() == via_raw.tolist(), list(via_spelling.shape)]
+rec("convolution_fn_matches_raw", _convolution_matches_raw_dispatch)
+
+# --- spelling reaches the same kernel `_aten_dispatch` does, directly -----
+# (the "reaches the right kernel" half of docs/SPELLINGS.md's split, for a
+# sample of the 22 rather than all of them -- a resolver bug that picked a
+# *different but coincidentally value-compatible* kernel would not be caught
+# by the value checks above alone.)
+rec("abs_matches_raw", lambda: torch.abs(x).tolist() == torch._C._aten_dispatch("aten.abs.default", x).tolist())
+rec("eq_matches_raw", lambda: torch.eq(x, y).tolist() == torch._C._aten_dispatch("aten.eq.Tensor", x, y).tolist())
+rec("max_other_matches_raw", lambda: torch.max(x, y).tolist() == torch._C._aten_dispatch("aten.max.other", x, y).tolist())
+rec("reshape_matches_raw", lambda: torch.reshape(x, (2, 2)).tolist() == torch._C._aten_dispatch("aten.reshape.default", x, [2, 2]).tolist())
+rec("bitwise_and_matches_raw", lambda: torch.bitwise_and(bi, bj).tolist() == torch._C._aten_dispatch("aten.bitwise_and.Tensor", bi, bj).tolist())
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _spell_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _SPELL_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"spelling-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_spelling_road_through_the_vendored_tree():
+    """docs/ARCH20.md §9's 22 fixable names, each through `torch.<name>(...)`
+    (and `tensor.<name>(...)` where a member exists), in a real `import torch`
+    against the shim -- not `_C._aten_dispatch` with the op string typed by
+    the test author, which is exactly what let these 22 sit unreachable while
+    every one of their kernels passed kernel-level golden comparison."""
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _spell_road_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-4):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    close("abs_fn", [1.0, 2.0, 3.0, 4.0])
+    close("abs_member", [1.0, 2.0, 3.0, 4.0])
+    close("cos_fn", [math.cos(v) for v in [-1.0, 2.0, -3.0, 4.0]])
+    close("cos_member", [math.cos(v) for v in [-1.0, 2.0, -3.0, 4.0]])
+    close("sin_fn", [math.sin(v) for v in [-1.0, 2.0, -3.0, 4.0]])
+    close("sin_member", [math.sin(v) for v in [-1.0, 2.0, -3.0, 4.0]])
+    close("reciprocal_fn", [1.0, 0.5, 0.25])
+    close("reciprocal_member", [1.0, 0.5, 0.25])
+
+    eq("clone_fn_independent", [[-1.0, 2.0, -3.0, 4.0], [0.0, 0.0, 0.0, 0.0]])
+    eq("clone_member_independent", [[-1.0, 2.0, -3.0, 4.0], [0.0, 0.0, 0.0, 0.0]])
+
+    close("clamp_both_fn", [-1.0, 2.0, -2.0, 2.0])
+    close("clamp_min_fn", [-1.0, 2.0, -2.0, 4.0])
+    close("clamp_max_fn", [-1.0, 2.0, -3.0, 2.0])
+    close("clamp_both_member", [-1.0, 2.0, -2.0, 2.0])
+    got = out.get("clamp_neither_fn", "")
+    assert got.startswith("refused:") and "clamp.Tensor" in got, got
+
+    x, y = [-1.0, 2.0, -3.0, 4.0], [1.0, 1.0, -3.0, 5.0]
+    eq("eq_fn", [a == b for a, b in zip(x, y)])
+    eq("eq_member", [a == b for a, b in zip(x, y)])
+    eq("ne_fn", [a != b for a, b in zip(x, y)])
+    eq("ne_member", [a != b for a, b in zip(x, y)])
+    eq("lt_fn", [a < b for a, b in zip(x, y)])
+    eq("lt_member", [a < b for a, b in zip(x, y)])
+    eq("le_fn", [a <= b for a, b in zip(x, y)])
+    eq("le_member", [a <= b for a, b in zip(x, y)])
+    eq("gt_fn", [a > b for a, b in zip(x, y)])
+    eq("gt_member", [a > b for a, b in zip(x, y)])
+    eq("ge_fn", [a >= b for a, b in zip(x, y)])
+    eq("ge_member", [a >= b for a, b in zip(x, y)])
+    got = out.get("eq_mixed_dtype", "")
+    assert got.startswith("refused:"), got  # documented gap, not this round's to close
+
+    eq("max_whole_fn", 4.0)
+    eq("max_whole_member", 4.0)
+    close("max_other_fn", [1.0, 2.0, -3.0, 5.0])
+    close("max_other_member", [1.0, 2.0, -3.0, 5.0])
+    eq("max_dim_fn", [[5.0, 9.0], [1, 0]])
+    eq("max_dim_member", [[5.0, 9.0], [1, 0]])
+    eq("min_whole_fn", -3.0)
+    eq("min_whole_member", -3.0)
+    got = out.get("min_other_fn", "")
+    assert got.startswith("refused:") and "min.other" in got, got
+    got = out.get("min_dim_fn", "")
+    assert got.startswith("refused:") and "min.dim" in got, got
+
+    close("mul_tensor_fn", [-1.0, 2.0, 9.0, 20.0])
+    close("mul_scalar_fn", [-2.0, 4.0, -6.0, 8.0])
+    close("mul_tensor_member", [-1.0, 2.0, 9.0, 20.0])
+
+    eq("reshape_fn", [[-1.0, 2.0], [-3.0, 4.0]])
+    eq("reshape_member", [[-1.0, 2.0], [-3.0, 4.0]])
+    eq("reshape_noncontig_fn", [0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0])
+
+    eq("unbind_default_fn", [[1.0, 2.0], [3.0, 4.0]])
+    eq("unbind_dim1_fn", [[1.0, 3.0], [2.0, 4.0]])
+    eq("unbind_member", [[1.0, 2.0], [3.0, 4.0]])
+
+    eq("bitwise_and_fn", [1, 3, 4])
+    eq("bitwise_and_scalar_fn", [1, 3, 1])
+    eq("bitwise_and_member", [1, 3, 4])
+    eq("bitwise_or_fn", [3, 3, 5])
+    eq("bitwise_or_member", [3, 3, 5])
+    eq("bitwise_not_fn", [-2, -4, -6])
+    eq("bitwise_not_member", [-2, -4, -6])
+    eq("bitwise_not_bool_fn", [False, True, False])
+
+    eq("scalar_tensor_fn", 3.5)
+    eq("scalar_tensor_dtype_fn", "torch.float32")
+
+    eq("convolution_fn_matches_raw", [True, [1, 2, 6]])
+
+    eq("abs_matches_raw", True)
+    eq("eq_matches_raw", True)
+    eq("max_other_matches_raw", True)
+    eq("reshape_matches_raw", True)
+    eq("bitwise_and_matches_raw", True)
 
 
 def _main():
