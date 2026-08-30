@@ -290,6 +290,27 @@
     "aten::matmul(Tensor self, Tensor other) -> Tensor"
   ],
 
+  "_grouped_mm": [
+    "aten::_grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor"
+  ],
+
+  "floor_divide": [
+    "aten::floor_divide.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::floor_divide.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::floor_divide(Tensor self, Tensor other) -> Tensor",
+    "aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
+  "cumsum": [
+    "aten::cumsum.out(Tensor self, int dim, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+
+  "histc": [
+    "aten::histc.out(Tensor self, int bins=100, Scalar min=0, Scalar max=0, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
+  ],
+
   "baddbmm": [
     "aten::baddbmm.out(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",
     "aten::baddbmm.dtype_out(Tensor self, Tensor batch1, Tensor batch2, ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)",

@@ -37,6 +37,7 @@ use crate::tensor::PyTensorBase;
 /// against upstream" -- and which Python spelling reaches an op is not part of
 /// that meaning.
 pub const IMPLEMENTED: &[&str] = &[
+    "aten._grouped_mm.default",
     "aten._local_scalar_dense.default",
     "aten._safe_softmax.default",
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
@@ -82,6 +83,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
     "aten.floor_divide.default",
+    "aten.floor_divide.Scalar",
     "aten.full.default",
     "aten.gather.default",
     "aten.ge.Scalar",
@@ -833,6 +835,7 @@ fn aten_dispatch_inner(
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
         "aten.argmax.default" => argmax_default(py, args, kwargs),
+        "aten._grouped_mm.default" => grouped_mm_default(py, args, kwargs),
         "aten.bmm.default" => bmm_default(py, args, kwargs),
         "aten.cat.default" => cat_default(py, args, kwargs),
         "aten.stack.default" => stack_default(py, args, kwargs),
@@ -987,6 +990,7 @@ fn aten_dispatch_inner(
         "aten.empty_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.empty_like.default"),
         "aten.ge.Scalar" => compare_scalar(py, args, kwargs, "aten.ge.Scalar", Cmp::Ge),
         "aten.floor_divide.default" => floor_divide_default(py, args, kwargs),
+        "aten.floor_divide.Scalar" => floor_divide_scalar(py, args, kwargs),
         "aten.histc.default" => histc_default(py, args, kwargs),
         "aten.clamp_.default" => clamp_inplace_default(py, args, kwargs),
         "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
@@ -1507,6 +1511,373 @@ fn bmm_default(
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
+}
+
+/// The dtypes `_grouped_mm`'s CPU kernel accepts, in upstream's own words for
+/// the refusal message.
+///
+/// **Not the meta function's set.** `_meta_grouped_mm_common` in
+/// `torch/_meta_registrations.py` checks `mat_a.dtype == torch.bfloat16` and
+/// refuses everything else, and it is the only readable implementation in the
+/// vendored tree -- so reading it as the specification is the natural mistake.
+/// The CPU kernel takes f32, bf16 and f16, measured, and f32 is the dtype
+/// Mixtral calls it with. docs/GROUPED_MM.md §1.
+fn grouped_mm_dtype_ok(tag: TorchDType) -> bool {
+    matches!(
+        tag,
+        TorchDType::Float32 | TorchDType::BFloat16 | TorchDType::Float16
+    )
+}
+
+/// Upstream's 16-byte stride rule for a `_grouped_mm` operand.
+///
+/// Reproduced rather than skipped, and that is a decision rather than an
+/// oversight -- see docs/GROUPED_MM.md §2.2. candle would multiply these
+/// operands happily; upstream's CPU kernel will not, and `transformers` keeps
+/// a whole fallback path (`torch.ops.transformers.grouped_mm_fallback`) for
+/// programs that would hit it. Computing where upstream raises is the
+/// silent-divergence direction, so the refusal is carried over with upstream's
+/// own wording.
+///
+/// The predicate is `check_valid_strides` from `_meta_registrations.py`,
+/// re-derived here by sweeping shapes on 2.13.0 rather than transcribed. Only
+/// the last two strides are examined: a 3-D operand's batch stride is not
+/// checked, and neither is the data pointer (`transformers`' own
+/// `_can_use_grouped_mm` guards the pointer only for torch <= 2.10).
+fn grouped_mm_strides_ok(tensor: &Tensor, storage: candle_core::DType) -> bool {
+    let dims = tensor.dims();
+    let stride = tensor.stride();
+    let end = dims.len() - 1;
+    // `16 / itemsize`: 4 elements for f32, 8 for the 2-byte floats.
+    let alignment = 16 / storage.size_in_bytes().max(1);
+    if stride[end - 1] == 1 && stride[end] >= dims[end - 1].max(1) {
+        stride[end] % alignment == 0
+    } else if stride[end] == 1 && stride[end - 1] >= dims[end].max(1) {
+        stride[end - 1] % alignment == 0
+    } else {
+        false
+    }
+}
+
+/// Which group owns each index along the partitioned extent, by *simulating
+/// upstream's sequential write loop* rather than assuming the offsets behave.
+///
+/// `offs` is a cumulative end index, so group `g` covers `[offs[g-1], offs[g])`
+/// with `offs[-1]` read as `0`. Two measured behaviours make the obvious
+/// `cat`-of-blocks implementation wrong, and this returns the information
+/// needed to get both right (docs/GROUPED_MM.md §2.3):
+///
+///  * `offs[-1] < extent` leaves the tail **unwritten**. `transformers` relies
+///    on that on purpose for its expert-parallel sentinel rows. Unwritten
+///    indices come back as `None` here and are filled with zeros, which is *a*
+///    valid answer to an uninitialised question -- so nothing asserts on them.
+///  * `offs` is not required to increase. `[9, 5, 24]` writes rows `0..9`, then
+///    nothing, then rows `5..24` -- **overwriting** `5..9`, because a later
+///    group wins. Simulating the loop reproduces that; concatenating blocks
+///    would not.
+///
+/// Out-of-range offsets are clamped. Upstream reads out of bounds there, which
+/// is undefined rather than a behaviour to match.
+///
+/// The result is compressed into maximal runs so the caller issues one
+/// `matmul` per run. For the ordinary monotonic case the runs are exactly the
+/// groups, so the simulation costs nothing; for the pathological case it still
+/// computes each index once, because every row of a grouped product depends
+/// only on its own row of the left operand.
+fn grouped_mm_runs(offs: &[i32], extent: usize) -> Vec<(usize, usize, Option<usize>)> {
+    let mut owner: Vec<Option<usize>> = vec![None; extent];
+    let mut prev = 0usize;
+    for (g, &off) in offs.iter().enumerate() {
+        let end = if off < 0 {
+            0
+        } else {
+            (off as usize).min(extent)
+        };
+        for slot in owner.iter_mut().take(end).skip(prev) {
+            *slot = Some(g);
+        }
+        prev = end;
+    }
+
+    let mut runs: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    for (i, who) in owner.into_iter().enumerate() {
+        match runs.last_mut() {
+            Some(last) if last.2 == who => last.1 = i + 1,
+            _ => runs.push((i, i + 1, who)),
+        }
+    }
+    runs
+}
+
+/// One group's product, in the accumulation dtype, tolerating a transposed
+/// operand the way the other five GEMM kernels do.
+fn grouped_mm_block(
+    op: &str,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    acc: candle_core::DType,
+) -> PyResult<Tensor> {
+    let l = lhs.fast_to(acc).map_err(|e| candle_err(op, e))?;
+    let r = rhs.fast_to(acc).map_err(|e| candle_err(op, e))?;
+    gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)).map_err(|e| candle_err(op, e))
+}
+
+/// `aten::_grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None,
+///     Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor`
+///
+/// The mixture-of-experts GEMM, and the last operator standing between this
+/// shim and Mixtral (docs/OPS4.md §13.3 left it out of scope by name).
+/// Instead of one `(M,K) x (K,N)` it multiplies a stack of *variable-sized*
+/// groups described by a cumulative offset vector, which is how an MoE layer
+/// routes tokens to experts without materialising a tensor per expert.
+///
+/// Four layouts, because `self` and `mat2` may each be 2-D or 3-D, and `offs`
+/// partitions a different axis in each (docs/GROUPED_MM.md §2):
+///
+/// ```text
+///   (M,K) x (G,K,N)  offs over the rows of self         -> (M,N)
+///   (G,M,K) x (K,N)  offs over the columns of mat2      -> (M,N)
+///   (M,K) x (K,N)    offs over the contraction K        -> (G,M,N)
+///   (G,M,K) x (G,K,N)  offs forbidden -- this is bmm    -> (G,M,N)
+/// ```
+///
+/// `bias` and a non-identity `out_dtype` are in the schema and are **not
+/// implemented upstream at all** -- both are refused there, so both are
+/// refused here, in upstream's words. There is no capability gap being
+/// papered over: a shim that computed a bias here would be answering a
+/// question torch does not answer.
+///
+/// The 2-D x 2-D layout has no contraction check on purpose. `offs` slices
+/// both operands with the same range, so the extents outside it are never
+/// read and upstream does not compare them -- `_grouped_mm((8,8), (4,4),
+/// offs=[2,4])` computes. Measured; adding the check that the other layouts
+/// have would refuse a call upstream accepts.
+fn grouped_mm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._grouped_mm.default";
+
+    let mat_a = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let mat_b = tensor_arg(OP, args, kwargs, 1, "mat2")?;
+    let offs = optional_tensor_arg(OP, args, kwargs, 2, "offs")?;
+    let bias = optional_tensor_arg(OP, args, kwargs, 3, "bias")?;
+    let out_dtype = dtype_arg(args, kwargs, 4, "out_dtype")?;
+
+    let a = mat_a.tensor()?;
+    let b = mat_b.tensor()?;
+    if a.rank() != 2 && a.rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mat_a has to be 2 or 3d",
+        ));
+    }
+    if b.rank() != 2 && b.rank() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mat_b has to be 2 or 3d",
+        ));
+    }
+    for (label, tag) in [("mat_a", mat_a.tag()), ("mat_b", mat_b.tag())] {
+        if !grouped_mm_dtype_ok(tag) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected {label} to be Float32, BFloat16 or Float16 matrix, got {}",
+                scalar_type_name(tag)
+            )));
+        }
+    }
+    if mat_a.tag() != mat_b.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected m1 and m2 to have the same dtype, but got: {} != {}",
+            c10_name(mat_a.tag()),
+            c10_name(mat_b.tag())
+        )));
+    }
+    if bias.is_some() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Bias not supported yet",
+        ));
+    }
+    if let Some(requested) = out_dtype {
+        if requested != mat_a.tag() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Grouped gemm output dtype must match `mat_a` dtype",
+            ));
+        }
+    }
+
+    let a_is_2d = a.rank() == 2;
+    let b_is_2d = b.rank() == 2;
+    if (a_is_2d || b_is_2d) != offs.is_some() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Have to provide offsets if there is a 2d matrix, or no offset if \
+             both matrices are 3d",
+        ));
+    }
+
+    let storage = PyDtype::new(mat_a.tag()).storage(OP)?;
+    for operand in [a, b] {
+        if !grouped_mm_strides_ok(operand, storage) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "strides should be multiple of 16 bytes",
+            ));
+        }
+    }
+    let acc = gemm_accumulate_in(storage);
+    let a_dims = a.dims().to_vec();
+    let b_dims = b.dims().to_vec();
+
+    // Both 3-D: no offsets, no groups -- upstream says so in the meta function
+    // ("regular bmm") and the CPU kernel agrees. The batch and contraction
+    // messages are its own, not `bmm`'s.
+    let Some(offs) = offs else {
+        if a_dims[0] != b_dims[0] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "batched dimension has to match",
+            ));
+        }
+        if a_dims[2] != b_dims[1] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "contraction dimension of mat_a and mat_b must match",
+            ));
+        }
+        let out = grouped_mm_block(OP, a, b, acc)?
+            .fast_to(storage)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, mat_a.tag());
+    };
+
+    if offs.tag() != TorchDType::Int32 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Offsets have to be int32",
+        ));
+    }
+    let offs_tensor = offs.tensor()?;
+    if offs_tensor.rank() != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "offs has to be 1D",
+        ));
+    }
+    let groups = offs_tensor
+        .to_vec1::<i32>()
+        .map_err(|e| candle_err(OP, e))?;
+
+    // The contraction check exists for every layout that has a 3-D operand,
+    // and for the 2-D x 2-D layout it deliberately does not -- see the doc
+    // comment.
+    if !a_is_2d || !b_is_2d {
+        let a_k = a_dims[a_dims.len() - 1];
+        let b_k = b_dims[b_dims.len() - 2];
+        if a_k != b_k {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "contraction dimension of mat_a and mat_b must match",
+            ));
+        }
+    }
+
+    let device = a.device().clone();
+    let out = if a_is_2d && !b_is_2d {
+        // (M,K) x (G,K,N): `offs` walks the rows of `self`, one expert per
+        // group. This is Mixtral's shape.
+        if groups.len() != b_dims[0] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "matrix batch sizes have to match",
+            ));
+        }
+        let (m, n) = (a_dims[0], b_dims[2]);
+        let mut blocks: Vec<Tensor> = Vec::new();
+        for (start, end, who) in grouped_mm_runs(&groups, m) {
+            let rows = end - start;
+            blocks.push(match who {
+                Some(g) => {
+                    let lhs = a.narrow(0, start, rows).map_err(|e| candle_err(OP, e))?;
+                    let rhs = b.narrow(0, g, 1).map_err(|e| candle_err(OP, e))?;
+                    let rhs = rhs.squeeze(0).map_err(|e| candle_err(OP, e))?;
+                    grouped_mm_block(OP, &lhs, &rhs, acc)?
+                }
+                None => Tensor::zeros((rows, n), acc, &device).map_err(|e| candle_err(OP, e))?,
+            });
+        }
+        grouped_mm_concat(OP, blocks, (m, n), 0, acc, &device)?
+    } else if !a_is_2d && b_is_2d {
+        // (G,M,K) x (K,N): `offs` walks the *columns* of `mat2`; the output is
+        // still 2-D and each group owns a slab of its columns.
+        if groups.len() != a_dims[0] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "matrix batch sizes have to match",
+            ));
+        }
+        let (m, n) = (a_dims[1], b_dims[1]);
+        let mut blocks: Vec<Tensor> = Vec::new();
+        for (start, end, who) in grouped_mm_runs(&groups, n) {
+            let cols = end - start;
+            blocks.push(match who {
+                Some(g) => {
+                    let lhs = a.narrow(0, g, 1).map_err(|e| candle_err(OP, e))?;
+                    let lhs = lhs.squeeze(0).map_err(|e| candle_err(OP, e))?;
+                    let rhs = b.narrow(1, start, cols).map_err(|e| candle_err(OP, e))?;
+                    grouped_mm_block(OP, &lhs, &rhs, acc)?
+                }
+                None => Tensor::zeros((m, cols), acc, &device).map_err(|e| candle_err(OP, e))?,
+            });
+        }
+        grouped_mm_concat(OP, blocks, (m, n), 1, acc, &device)?
+    } else {
+        // (M,K) x (K,N): `offs` walks the *contraction*, so the groups do not
+        // share an output -- each one is its own matrix and they stack.
+        // A group whose slice is empty contributes a zero matrix, which is
+        // what a length-zero contraction means and what upstream returns.
+        let (m, n) = (a_dims[0], b_dims[1]);
+        let extent = a_dims[1].min(b_dims[0]);
+        let mut prev = 0usize;
+        let mut planes: Vec<Tensor> = Vec::with_capacity(groups.len());
+        for &off in &groups {
+            let end = if off < 0 {
+                0
+            } else {
+                (off as usize).min(extent)
+            };
+            planes.push(if end > prev {
+                let depth = end - prev;
+                let lhs = a.narrow(1, prev, depth).map_err(|e| candle_err(OP, e))?;
+                let rhs = b.narrow(0, prev, depth).map_err(|e| candle_err(OP, e))?;
+                grouped_mm_block(OP, &lhs, &rhs, acc)?
+            } else {
+                Tensor::zeros((m, n), acc, &device).map_err(|e| candle_err(OP, e))?
+            });
+            prev = end;
+        }
+        if planes.is_empty() {
+            Tensor::zeros((0usize, m, n), acc, &device).map_err(|e| candle_err(OP, e))?
+        } else {
+            Tensor::stack(&planes, 0).map_err(|e| candle_err(OP, e))?
+        }
+    };
+
+    let out = out.fast_to(storage).map_err(|e| candle_err(OP, e))?;
+    finish(py, out, mat_a.tag())
+}
+
+/// Join the per-run blocks back into one output, with the degenerate extent
+/// spelled out rather than left to `cat`.
+///
+/// `Tensor::cat` refuses an empty slice, and a zero-extent output produces
+/// exactly that -- `offs=[]` against a zero-batch `mat2` is a shape upstream
+/// accepts.
+fn grouped_mm_concat(
+    op: &str,
+    blocks: Vec<Tensor>,
+    shape: (usize, usize),
+    dim: usize,
+    acc: candle_core::DType,
+    device: &Device,
+) -> PyResult<Tensor> {
+    if blocks.is_empty() {
+        return Tensor::zeros(shape, acc, device).map_err(|e| candle_err(op, e));
+    }
+    if blocks.len() == 1 {
+        return Ok(blocks.into_iter().next().expect("length checked"));
+    }
+    Tensor::cat(&blocks, dim).map_err(|e| candle_err(op, e))
 }
 
 /// `beta`/`alpha` for `addmm`, applied in the *result* dtype.
@@ -7463,35 +7834,84 @@ fn floor_divide_default(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.floor_divide.default";
-    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    floor_divide_impl(py, "aten.floor_divide.default", args, kwargs)
+}
+
+/// `aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor`
+///
+/// The same arithmetic as `.default`, reached by a different route, and the
+/// route is the reason this exists.
+///
+/// The doc comment above `.default` records that upstream sends
+/// `perm // num_top_k` -- a tensor and a bare Python `int` -- to
+/// `floor_divide.default`, because torch's own frontend wraps the number into
+/// a tensor before it picks an overload. **This shim's resolver does not do
+/// that**: `overloads.json` is walked in order and an `int` does not bind a
+/// `Tensor` parameter, so `torch.floor_divide(t, 2)` lands on `.Scalar` here
+/// where upstream lands on `.default`. The same is already true of
+/// `add`/`sub`/`div`, which is why their `.Scalar` overloads are implemented
+/// too; this is that pattern, not a new one.
+///
+/// So the two keys disagree with upstream's *choice* while agreeing on the
+/// *answer*, and closing that gap properly means teaching the resolver
+/// upstream's "numbers as tensors" rule -- a change in `bootstrap.py`, above
+/// this file. Until then, refusing here would stop Mixtral's MoE routing on
+/// an op the shim can already compute. docs/GROUPED_MM.md §6.
+fn floor_divide_scalar(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.floor_divide.Scalar";
+    // A tensor in the `Scalar other` slot is `.default`'s call, not this
+    // one's. Refusing keeps the two keys distinguishable in the work queue
+    // DESIGN.md §6 is built on, rather than quietly folding them together.
+    if required(OP, args, kwargs, 1, "other")?
+        .extract::<PyTensorBase>()
+        .is_ok()
+    {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{OP}: argument 'other' must be a Scalar, not a Tensor -- a tensor \
+             divisor is aten.floor_divide.default"
+        )));
+    }
+    floor_divide_impl(py, OP, args, kwargs)
+}
+
+fn floor_divide_impl(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let tag = lhs.tag();
     if tag == TorchDType::Bool {
         return Err(not_implemented(format!(
-            "{OP}: torch.bool operands are not implemented in torch._C shim"
+            "{op}: torch.bool operands are not implemented in torch._C shim"
         )));
     }
-    let raw_other = required(OP, args, kwargs, 1, "other")?;
+    let raw_other = required(op, args, kwargs, 1, "other")?;
     let n = lhs.tensor()?.elem_count();
     let other_flat: Flat = if let Ok(other_tensor) = raw_other.extract::<PyTensorBase>() {
         if other_tensor.tag() != tag {
             return Err(not_implemented(format!(
-                "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
                 tag.name(),
                 other_tensor.tag().name()
             )));
         }
-        let flat = read_flat(OP, other_tensor.tensor()?, tag)?;
+        let flat = read_flat(op, other_tensor.tensor()?, tag)?;
         let count = other_tensor.tensor()?.elem_count();
         if count != n && count != 1 {
             return Err(not_implemented(format!(
-                "{OP}: broadcasting other than a scalar or an exact shape match is not \
+                "{op}: broadcasting other than a scalar or an exact shape match is not \
                  implemented in torch._C shim"
             )));
         }
         flat
     } else {
-        let scalar = scalar_arg(OP, args, kwargs, 1, "other")?.ok_or_else(|| missing(OP, "other"))?;
+        let scalar = scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
         if tag.is_floating_point() {
             Flat::Float(vec![scalar.as_f64()])
         } else {
@@ -7499,7 +7919,7 @@ fn floor_divide_default(
         }
     };
 
-    let self_flat = read_flat(OP, lhs.tensor()?, tag)?;
+    let self_flat = read_flat(op, lhs.tensor()?, tag)?;
     let out_flat = match (self_flat, other_flat) {
         (Flat::Float(a), Flat::Float(b)) => {
             let get = |i: usize| if b.len() == 1 { b[0] } else { b[i] };
@@ -7524,7 +7944,7 @@ fn floor_divide_default(
 
     let dims = lhs.tensor()?.dims().to_vec();
     let device = lhs.tensor()?.device().clone();
-    let out = write_flat(OP, out_flat, dims, &device, tag)?;
+    let out = write_flat(op, out_flat, dims, &device, tag)?;
     finish(py, out, tag)
 }
 

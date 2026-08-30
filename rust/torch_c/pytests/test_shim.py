@@ -575,6 +575,214 @@ def test_mm_is_2d_only():
         raise AssertionError("candle's batched matmul must not stand in for mm")
 
 
+# --- _grouped_mm (docs/GROUPED_MM.md) ---------------------------------------
+#
+# `tools/golden/cases.py` compares this op against upstream on 64 cases; what
+# these add is the part that is worth being able to check *without* upstream
+# torch installed -- the offset convention, and the refusals, stated as
+# hand-checkable arithmetic.
+#
+# Every shape here is a multiple of four in its last two dimensions, and that
+# is not a coincidence: upstream's CPU kernel refuses operands whose
+# last-two-dimension strides are not a multiple of 16 bytes, so a float32 case
+# with an inner extent of 3 is a refusal, not a test.
+
+_GROUPED_A = [1.0, 2.0, 3.0, 4.0,
+              5.0, 6.0, 7.0, 8.0,
+              9.0, 10.0, 11.0, 12.0,
+              13.0, 14.0, 15.0, 16.0]
+# Two experts: the identity, and twice the identity. Chosen so the answer is
+# readable -- a row multiplied by expert 0 comes back unchanged, and a row
+# multiplied by expert 1 comes back doubled, so *which expert saw which row* is
+# visible in the output rather than inferred from it.
+_GROUPED_B = [1.0, 0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0, 0.0,
+              0.0, 0.0, 1.0, 0.0,
+              0.0, 0.0, 0.0, 1.0,
+              2.0, 0.0, 0.0, 0.0,
+              0.0, 2.0, 0.0, 0.0,
+              0.0, 0.0, 2.0, 0.0,
+              0.0, 0.0, 0.0, 2.0]
+
+
+def _grouped_operands():
+    a = _C._tensor_from_flat(_GROUPED_A, [4, 4])
+    b = _C._tensor_from_flat(_GROUPED_B, [2, 4, 4])
+    return a, b
+
+
+def test_grouped_mm_reads_offsets_as_cumulative_ends_not_lengths():
+    # offs=[1, 3] over four rows. Read as cumulative ends -- which is what it
+    # is -- expert 0 takes row 0, expert 1 takes rows 1 and 2, and row 3 is
+    # written by nobody. Read as *lengths*, expert 1 would take rows 1..3 and
+    # row 3 would come back doubled instead of empty. That single row is the
+    # whole difference between the two readings.
+    a, b = _grouped_operands()
+    offs = _C._tensor_from_flat([1, 3], [2], dtype=_C.int32)
+    out = _C._aten_dispatch("aten._grouped_mm.default", a, b, offs).tolist()
+    assert out[0] == [1.0, 2.0, 3.0, 4.0], out[0]
+    assert out[1] == [10.0, 12.0, 14.0, 16.0], out[1]
+    assert out[2] == [18.0, 20.0, 22.0, 24.0], out[2]
+    # Upstream leaves this row uninitialised and `transformers` masks it rather
+    # than reading it; this shim fills it with zeros so the answer is at least
+    # deterministic. Nothing in the golden suite compares it -- see
+    # docs/GROUPED_MM.md §2.3.
+    assert out[3] == [0.0, 0.0, 0.0, 0.0], out[3]
+
+
+def test_grouped_mm_gives_an_empty_group_no_rows():
+    # A repeated offset is an expert that routed no tokens, which is the normal
+    # state of most experts on a short prompt. offs=[0, 4] means expert 0 got
+    # nothing and expert 1 got everything, so every row comes back doubled.
+    a, b = _grouped_operands()
+    offs = _C._tensor_from_flat([0, 4], [2], dtype=_C.int32)
+    out = _C._aten_dispatch("aten._grouped_mm.default", a, b, offs).tolist()
+    assert out == [[2.0, 4.0, 6.0, 8.0],
+                   [10.0, 12.0, 14.0, 16.0],
+                   [18.0, 20.0, 22.0, 24.0],
+                   [26.0, 28.0, 30.0, 32.0]], out
+
+
+def test_grouped_mm_partitions_the_contraction_when_both_operands_are_2d():
+    # The layout whose output rank goes *up*: (M,K) x (K,N) with offsets over
+    # K gives (G,M,N), one matrix per group, because the groups do not share an
+    # output. [1,2,3,4] . [1,1,1,1] split as K=[0,2) and [2,4) is 3 and 7.
+    a = _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [1, 4])
+    b = _C._tensor_from_flat([1.0] * 16, [4, 4])
+    offs = _C._tensor_from_flat([2, 4], [2], dtype=_C.int32)
+    out = _C._aten_dispatch("aten._grouped_mm.default", a, b, offs)
+    assert list(out.shape) == [2, 1, 4], list(out.shape)
+    assert out.tolist() == [[[3.0, 3.0, 3.0, 3.0]], [[7.0, 7.0, 7.0, 7.0]]], out.tolist()
+
+
+def test_grouped_mm_is_bmm_when_both_operands_are_3d_and_refuses_offsets_there():
+    a = _C._tensor_from_flat(_GROUPED_A, [1, 4, 4])
+    b = _C._tensor_from_flat(_GROUPED_B[16:], [1, 4, 4])  # twice the identity
+    out = _C._aten_dispatch("aten._grouped_mm.default", a, b)
+    assert out.tolist() == [[[2.0, 4.0, 6.0, 8.0],
+                             [10.0, 12.0, 14.0, 16.0],
+                             [18.0, 20.0, 22.0, 24.0],
+                             [26.0, 28.0, 30.0, 32.0]]], out.tolist()
+    offs = _C._tensor_from_flat([4], [1], dtype=_C.int32)
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs)
+    except RuntimeError as e:
+        assert "no offset if both matrices are 3d" in str(e), str(e)
+    else:
+        raise AssertionError("two 3-D operands must not accept offsets")
+
+
+def test_grouped_mm_requires_int32_offsets():
+    a, b = _grouped_operands()
+    offs = _C._tensor_from_flat([1, 4], [2], dtype=_C.int64)
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs)
+    except RuntimeError as e:
+        assert "Offsets have to be int32" in str(e), str(e)
+    else:
+        raise AssertionError("int64 offsets must be refused, as upstream refuses them")
+
+
+def test_grouped_mm_refuses_bias_and_a_foreign_out_dtype():
+    # Both are in the schema and neither is implemented upstream. Computing
+    # either one here would answer a question torch declines to answer.
+    a, b = _grouped_operands()
+    offs = _C._tensor_from_flat([1, 4], [2], dtype=_C.int32)
+    bias = _C._tensor_from_flat([0.0] * 4, [4])
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs, bias=bias)
+    except RuntimeError as e:
+        assert "Bias not supported yet" in str(e), str(e)
+    else:
+        raise AssertionError("bias is unimplemented upstream and must be refused, not computed")
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs, out_dtype=_C.float16)
+    except RuntimeError as e:
+        assert "output dtype must match" in str(e), str(e)
+    else:
+        raise AssertionError("out_dtype other than mat_a's is refused upstream")
+
+
+def test_grouped_mm_refuses_operands_upstreams_cpu_kernel_cannot_align():
+    # candle would multiply these happily. The refusal exists because
+    # upstream's CPU kernel has it -- 16 bytes is 4 float32 elements, and a
+    # contraction of 3 is not a multiple of that. docs/GROUPED_MM.md §2.2.
+    a = _C._tensor_from_flat([1.0] * 12, [4, 3])
+    b = _C._tensor_from_flat([1.0] * 24, [2, 3, 4])
+    offs = _C._tensor_from_flat([1, 4], [2], dtype=_C.int32)
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs)
+    except RuntimeError as e:
+        assert "16 bytes" in str(e), str(e)
+    else:
+        raise AssertionError("computing where upstream raises is silent divergence")
+
+
+def test_grouped_mm_refuses_a_dtype_the_kernel_has_no_gemm_for():
+    # float64 is the interesting one: this shim HAS a float64 matmul and
+    # `mm`/`bmm`/`addmm` all use it, so the refusal is fidelity to upstream's
+    # kernel rather than a missing capability.
+    a = _C._tensor_from_flat([1.0] * 16, [4, 4], dtype=_C.float64)
+    b = _C._tensor_from_flat([1.0] * 32, [2, 4, 4], dtype=_C.float64)
+    offs = _C._tensor_from_flat([1, 4], [2], dtype=_C.int32)
+    try:
+        _C._aten_dispatch("aten._grouped_mm.default", a, b, offs)
+    except RuntimeError as e:
+        assert "Float32, BFloat16 or Float16" in str(e), str(e)
+    else:
+        raise AssertionError("float64 is refused upstream even though candle can multiply it")
+
+
+def test_grouped_mm_resolves_from_the_torch_level_name():
+    """...except that it does not, and this test is where that is written down.
+
+    `torch._grouped_mm` is what `torch.nn.functional.grouped_mm` calls, and
+    that is the route `transformers`' MoE layer takes on CPU. `overloads.json`
+    now carries the entry, and the kernel is reachable through
+    `torch.ops.aten._grouped_mm.default` -- but the *name* still refuses,
+    because `bootstrap.py`'s table constructor drops it:
+
+        overloads = {... for name, schemas in json.loads(overloads_json).items()
+                     if not name.startswith("_")}      # the table's embedded README
+
+    The comment says README and the predicate says every underscore-prefixed
+    key, so an aten op whose name begins with `_` cannot have a `torch.<op>`
+    binding at all. `methods.json`'s sibling comprehension six lines below
+    already spells the same intent correctly as `startswith("_README")`.
+
+    Asserted as it is rather than as it should be, because this file is a
+    smoke test and not a wish. When that predicate is narrowed, this test
+    fails and the two assertions below swap for their commented-out forms --
+    which is the point: the fix should not be able to land silently.
+    docs/GROUPED_MM.md §6.
+    """
+    fn = getattr(_C._VariableFunctions, "_grouped_mm")
+    assert fn is not None
+    assert "_grouped_mm" not in _C._shim_overloads, (
+        "bootstrap.py's `_`-prefix filter was narrowed -- good. Replace this "
+        "assertion with:  assert _C._shim_overloads['_grouped_mm'] == "
+        "['aten._grouped_mm.default']"
+    )
+    try:
+        fn(_C._tensor_from_flat([1.0] * 16, [4, 4]),
+           _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
+           offs=_C._tensor_from_flat([1, 4], [2], dtype=_C.int32))
+    except NotImplementedError as e:
+        assert "overload resolution has no table entry" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "torch._grouped_mm resolved -- the bootstrap.py filter was fixed. "
+            "Replace this block with a value assertion."
+        )
+    # The key itself is dispatchable; only the Python-level name is not.
+    _C._aten_dispatch(
+        "aten._grouped_mm.default",
+        _C._tensor_from_flat([1.0] * 16, [4, 4]),
+        _C._tensor_from_flat([1.0] * 32, [2, 4, 4]),
+        _C._tensor_from_flat([1, 4], [2], dtype=_C.int32),
+    )
+
+
 # --- the dtype tag (BOOL.md option B) ---------------------------------------
 
 
@@ -5712,7 +5920,7 @@ def test_decompose_gets_the_full_upstream_table_now():
     r = _decomp_road_fixture()
     assert r["table_source"] == "core_aten_decompositions", r["table_source"]
     assert r["table_reason"] is None, r["table_reason"]
-    assert r["table_size"] == 414, r["table_size"]
+    assert r["table_size"] == 415, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -5746,7 +5954,7 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
     assert r["overloads_relu"] == ["default"], r["overloads_relu"]
-    assert r["registry"] == 1004, r["registry"]
+    assert r["registry"] == 1005, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -6790,13 +6998,21 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
 
     `overloads.json` and `methods.json` are the oracle: every string in them is
     `str(torch.ops.aten.<op>.<ov>._schema)` transcribed from upstream 2.13.0,
-    and `verify_schemas.py` keeps them honest. 175 distinct overloads, 7 of
+    and `verify_schemas.py` keeps them honest. 176 distinct overloads, 7 of
     which exercise a normalisation rule -- if the re-printer drops one, those
     seven stop matching. This needs no upstream torch.
 
     173 until docs/DECOMP.md's `transpose`/`permute`/`sub` entries arrived;
     three of those five schema strings were already reachable through
     `methods.json`, so the union grew by `aten::permute` and `aten::sub.out`.
+    175 until docs/GROUPED_MM.md added `aten::_grouped_mm` and, with it, the
+    `floor_divide`/`cumsum`/`histc` entries Mixtral's Python surface needs --
+    seven more schema strings. One of the seven is a *fifth* table-only entry:
+    `floor_divide.Scalar_out` is torchgen-generated and the yaml does not
+    declare it, which is why `from_tables` below grew rather than staying at
+    four. That entry is also why the decomposition registry gained one
+    (`test_decompose_gets_the_full_upstream_table_now`): with a schema to
+    resolve, `register_decomposition(aten.floor_divide)` now reaches it.
 
     The provenance assertion is not decoration. In the first working version
     `_get_schema` consulted the tables *before* the file, so these 173 lookups
@@ -6820,7 +7036,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
             shadowed.append((qualname, overload, got["from"]))
     assert mismatched == [], mismatched[:5]
     assert shadowed == [], shadowed[:5]
-    assert len(keys) == 175, len(keys)
+    assert len(keys) == 183, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -6830,6 +7046,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
         ("aten::div", "Scalar_out"),
         ("aten::embedding", "out"),
         ("aten::empty_like", "out"),
+        ("aten::floor_divide", "Scalar_out"),
     ], from_tables
 
 

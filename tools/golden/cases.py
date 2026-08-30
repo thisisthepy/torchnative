@@ -9174,6 +9174,84 @@ def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def floor_divide_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.floor_divide.Scalar` -- the key this shim's resolver picks for
+    `torch.floor_divide(tensor, 2)` where upstream picks `.default`.
+
+    The value is the same arithmetic and the cases are `floor_divide_cases`'
+    scalar half repeated against *this* key, because that is the one Mixtral's
+    routing actually reaches through the Python surface. Both keys are compared
+    against upstream separately, so if the resolver is ever taught upstream's
+    "numbers as tensors" rule, neither side of the change goes unchecked.
+    """
+    op = "aten.floor_divide.Scalar"
+    cases: list[Case] = []
+
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [-7, -6, -1, 0, 1, 6, 7], (7,), dtype_name)
+        for divisor, note in [
+            (2, "[-7,-6,-1,0,1,6,7] // 2 == [-4,-3,-1,0,0,3,3] -- floors toward -inf"),
+            (-2, "[-7,-6,-1,0,1,6,7] // -2 == [3,3,0,0,-1,-3,-4] -- a negative divisor flips the correction"),
+            (1, "the identity divisor, where a wrong floor correction still cannot show"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"floor_divide.Scalar(dtype={dtype_name}, // {divisor})",
+                    op=op,
+                    run_torch=lambda a_t=a_t, d=divisor: torch_call(a_t, d),
+                    run_c=lambda a_c=a_c, d=divisor: c_module._aten_dispatch(op, a_c, d),
+                    note=note,
+                )
+            )
+        cases.append(
+            Case(
+                name=f"floor_divide.Scalar(dtype={dtype_name}, // 0) [raises]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                expect="both_error",
+                note="torch: RuntimeError('ZeroDivisionError') on an integral dtype",
+            )
+        )
+
+    f_t, f_c = pair_from_flat(torch_module, c_module, [1.0, -1.0, 0.0, 7.5, -7.5], (5,), "float32")
+    cases.append(
+        Case(
+            name="floor_divide.Scalar(dtype=float32, // 2.0)",
+            op=op,
+            run_torch=lambda: torch_call(f_t, 2.0),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, 2.0),
+            note="7.5 // 2.0 == 3.0 and -7.5 // 2.0 == -4.0 -- the float path floors too",
+        )
+    )
+    cases.append(
+        Case(
+            name="floor_divide.Scalar(dtype=float32, // 0.0) [inf/-inf/nan, not an error]",
+            op=op,
+            run_torch=lambda: torch_call(f_t, 0.0),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, 0.0),
+            note="a floating zero divisor is IEEE, not a refusal -- unlike the integral one",
+        )
+    )
+
+    # A tensor in the `Scalar other` slot is `.default`'s call. Upstream's own
+    # binding refuses it for this key, and folding the two together here would
+    # make the work queue unable to tell them apart.
+    t_t, t_c = pair_from_flat(torch_module, c_module, [2, 2, 2, 2, 2, 2, 2], (7,), "int64")
+    i_t, i_c = pair_from_flat(torch_module, c_module, [-7, -6, -1, 0, 1, 6, 7], (7,), "int64")
+    cases.append(
+        Case(
+            name="floor_divide.Scalar(a tensor divisor is the other overload) [refused]",
+            op=op,
+            run_torch=lambda: torch_call(i_t, t_t),
+            run_c=lambda: c_module._aten_dispatch(op, i_c, t_c),
+            expect="both_error",
+            note="aten::floor_divide.Scalar takes a Scalar; a Tensor there is aten.floor_divide.default",
+        )
+    )
+    return cases
+
+
 def histc_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.histc.default"
     cases: list[Case] = []
@@ -9978,7 +10056,497 @@ def unbind_int_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten._grouped_mm.default ----------------------------------------------
+#
+# The mixture-of-experts GEMM, and the operator docs/OPS4.md §13.3 named as the
+# one thing keeping Mixtral off the "zero missing operators" list. See
+# docs/GROUPED_MM.md for the schema, the four layouts, and the measurements
+# behind every refusal below.
+#
+# Three dtypes, because upstream's CPU kernel takes exactly three (f32, bf16,
+# f16) and the meta function's bf16-only rule is NOT the CPU contract --
+# reading the meta function as the specification would have refused the dtype
+# Mixtral actually calls this with.
+_GROUPED_MM_DTYPES = ["float32", "bfloat16", "float16"]
+
+# 16 / itemsize, in elements. `_grouped_mm`'s CPU kernel refuses operands whose
+# last-two-dimension strides are not a multiple of 16 bytes, so every "match"
+# case below has to be shaped to satisfy it and the shapes are not free.
+# 16 and 8 clear both (16 % 8 == 0, 8 % 8 == 0), which is why they recur.
+_GROUPED_MM_M, _GROUPED_MM_K, _GROUPED_MM_N = 24, 16, 8
+
+
+def _grouped_offs(torch_module, c_module, values):
+    return pair_from_flat(torch_module, c_module, values, (len(values),), "int32")
+
+
+def _grouped_mm_case(
+    torch_module,
+    c_module,
+    torch_call,
+    name,
+    a_pair,
+    b_pair,
+    offs,
+    dtype_name,
+    k,
+    expect="match",
+    note="",
+    kwargs_t=None,
+    kwargs_c=None,
+    value_check=None,
+):
+    op = "aten._grouped_mm.default"
+    a_t, a_c = a_pair
+    b_t, b_c = b_pair
+    o_t, o_c = offs if offs is not None else (None, None)
+    kwargs_t = kwargs_t or {}
+    kwargs_c = kwargs_c or {}
+    if value_check is None and expect == "match":
+        value_check = _gemm_scale_check(dtype_name, k)
+    return Case(
+        name=f"_grouped_mm(dtype={dtype_name}) [{name}]",
+        op=op,
+        run_torch=lambda: torch_call(a_t, b_t, o_t, **kwargs_t),
+        run_c=lambda: c_module._aten_dispatch(op, a_c, b_c, o_c, **kwargs_c),
+        expect=expect,
+        note=note,
+        value_check=value_check,
+    )
+
+
+def _grouped_short_offs_case(torch_module, c_module, torch_call, a_pair, b_pair, offs, dtype_name, k, written):
+    """`offs[-1] < M` leaves the tail of the output **unwritten** -- upstream
+    returns whatever `torch.empty` gave it, and `transformers` masks those rows
+    itself rather than reading them (`integrations/moe.py`, the expert-parallel
+    sentinel comment). What this case pins is that a short `offs` does not
+    disturb the rows it *does* write, which is a real off-by-one trap in the
+    offset walk and one no full-length `offs` case can reach.
+
+    The tail is dropped **in the case, with `aten.slice.Tensor`, not in a
+    comparator.** A comparator that ignored the last rows would be blind to the
+    harness's own `value-last` fault injection, and `--self-test` says so --
+    correctly, because that blindness would then apply to every case using it.
+    Slicing on the way out instead keeps `_gemm_scale_check`, whose fault
+    profile is already established, as the thing doing the comparing.
+    """
+    op = "aten._grouped_mm.default"
+    a_t, a_c = a_pair
+    b_t, b_c = b_pair
+    o_t, o_c = offs
+
+    def run_torch():
+        full = torch_call(a_t, b_t, o_t)
+        return torch_module.ops.aten.slice.Tensor(full, 0, 0, written)
+
+    def run_c():
+        full = c_module._aten_dispatch(op, a_c, b_c, o_c)
+        return c_module._aten_dispatch("aten.slice.Tensor", full, 0, 0, written)
+
+    return Case(
+        name=(
+            f"_grouped_mm(dtype={dtype_name}) [2Dx3D, offs[-1]={written} < M="
+            f"{_GROUPED_MM_M} -- tail unwritten, compared over rows [0,{written}) only]"
+        ),
+        op=op,
+        run_torch=run_torch,
+        run_c=run_c,
+        value_check=_gemm_scale_check(dtype_name, k),
+        note=(
+            "transformers relies on the unwritten tail for expert-parallel sentinel rows "
+            "and masks it itself; there is no correct value there to compare, so the case "
+            "slices it off rather than teaching a comparator to look away"
+        ),
+    )
+
+
+def grouped_mm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._grouped_mm.default"
+    m, k, n = _GROUPED_MM_M, _GROUPED_MM_K, _GROUPED_MM_N
+    cases: list[Case] = []
+
+    for dtype_name in _GROUPED_MM_DTYPES:
+        a2 = pair_from_flat(torch_module, c_module, _gemm_lcg(m * k, 8101), (m, k), dtype_name)
+        b3 = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * k * n, 8102), (3, k, n), dtype_name)
+
+        # -- 2-D x 3-D, the layout Mixtral calls. Group sizes are deliberately
+        # UNEVEN: equal-sized groups are computed correctly by an offset walk
+        # that is off by one at every boundary, because every boundary is then
+        # a multiple of the same stride. 5 / 4 / 15 shares no factor.
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "2Dx3D, groups 5/4/15 -- uneven on purpose", a2, b3,
+                _grouped_offs(torch_module, c_module, [5, 9, 24]), dtype_name, k,
+                note="equal-sized groups hide an off-by-one in the offset walk; these do not",
+            )
+        )
+        # An empty group in each of the three positions. `offs` is a cumulative
+        # end index, so a repeated value means "this expert got no tokens" --
+        # which is the common case in a real MoE layer with more experts than
+        # a short prompt has tokens, and it is what Mixtral's own trace shows
+        # (offs [5,10,10,16], group 2 empty).
+        for label, values in [
+            ("empty FIRST group", [0, 9, 24]),
+            ("empty MIDDLE group", [5, 5, 24]),
+            ("empty LAST group", [5, 24, 24]),
+        ]:
+            cases.append(
+                _grouped_mm_case(
+                    torch_module, c_module, torch_call,
+                    f"2Dx3D, {label}", a2, b3,
+                    _grouped_offs(torch_module, c_module, values), dtype_name, k,
+                    note="a repeated offset is an expert that routed no tokens; measured in Mixtral's own trace",
+                )
+            )
+        # One group covering everything -- the degenerate case where this op is
+        # just `mm`, and the one where a walk that never advances still passes.
+        b1 = pair_from_flat(torch_module, c_module, _gemm_lcg(k * n, 8103), (1, k, n), dtype_name)
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "2Dx3D, a SINGLE group spanning every row", a2, b1,
+                _grouped_offs(torch_module, c_module, [24]), dtype_name, k,
+                note="G=1: the answer is plain mm, and the offset walk must still produce it",
+            )
+        )
+        # Offsets that go backwards. Upstream does not validate monotonicity;
+        # it is a sequential write loop and a later group overwrites an earlier
+        # one. Nonsense input, but a *defined* answer, and a cat-of-blocks
+        # implementation gets it wrong.
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "2Dx3D, offs [9,5,24] -- DECREASING, later group overwrites", a2, b3,
+                _grouped_offs(torch_module, c_module, [9, 5, 24]), dtype_name, k,
+                note="upstream never checks that offsets increase; the write loop's overwrite is the answer",
+            )
+        )
+        # A short `offs`: the tail is upstream-uninitialised, so the case
+        # slices it off. See `_grouped_short_offs_case`.
+        cases.append(
+            _grouped_short_offs_case(
+                torch_module, c_module, torch_call, a2, b3,
+                _grouped_offs(torch_module, c_module, [5, 9, 20]), dtype_name, k, 20,
+            )
+        )
+
+        # -- 2-D x 3-D with a TRANSPOSED right operand. This is not a variation
+        # for its own sake: `transformers`' `_grouped_linear` passes
+        # `weight.transpose(-2, -1)` on every call unless the checkpoint is
+        # already transposed, so a non-contiguous `mat2` is Mixtral's normal
+        # case rather than its exotic one.
+        wbase_t, wbase_c = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(3 * n * k, 8104), (3, n, k), dtype_name
+        )
+        wt_t = wbase_t.transpose(-2, -1)
+        wt_c = c_module._aten_dispatch("aten.transpose.int", wbase_c, -2, -1)
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "2Dx3D, mat2 a TRANSPOSED view -- transformers' actual weight layout",
+                a2, (wt_t, wt_c),
+                _grouped_offs(torch_module, c_module, [5, 9, 24]), dtype_name, k,
+                note="_grouped_linear passes weight.transpose(-2,-1); the kernel must consume the view, not refuse it",
+            )
+        )
+
+        # -- 3-D x 2-D: `offs` partitions the *columns* of the right operand,
+        # and the output stays 2-D. A kernel that only ever learned the 2Dx3D
+        # layout produces the wrong rank here.
+        a3 = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(3 * _GROUPED_MM_N * k, 8105), (3, n, k), dtype_name
+        )
+        b2wide = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(k * m, 8106), (k, m), dtype_name
+        )
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "3Dx2D, offs over mat2's COLUMNS, uneven 5/4/15", a3, b2wide,
+                _grouped_offs(torch_module, c_module, [5, 9, 24]), dtype_name, k,
+                note="a different axis is partitioned and the output is 2-D, not 3-D",
+            )
+        )
+
+        # -- 2-D x 2-D: `offs` partitions the CONTRACTION, so the groups do not
+        # share an output -- each is its own matrix and they stack to (G,M,N).
+        # This is the layout whose output rank differs from its inputs'.
+        a2k = pair_from_flat(torch_module, c_module, _gemm_lcg(n * m, 8107), (n, m), dtype_name)
+        b2k = pair_from_flat(torch_module, c_module, _gemm_lcg(m * n, 8108), (m, n), dtype_name)
+        for label, values, depth in [
+            ("uneven 8/8/8 split of K=24", [8, 16, 24], 8),
+            ("uneven 5/4/15 split of K=24", [5, 9, 24], 15),
+            ("an EMPTY contraction group -> a zero matrix", [0, 9, 24], 15),
+        ]:
+            cases.append(
+                _grouped_mm_case(
+                    torch_module, c_module, torch_call,
+                    f"2Dx2D, offs over the CONTRACTION, {label}", a2k, b2k,
+                    _grouped_offs(torch_module, c_module, values), dtype_name, depth,
+                    note="output is (G,M,N) -- rank goes UP, unlike every other layout",
+                )
+            )
+
+        # -- 3-D x 3-D: no offsets at all; upstream's meta function calls this
+        # "regular bmm" and the CPU kernel agrees.
+        a3b = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(3 * n * k, 8109), (3, n, k), dtype_name
+        )
+        b3b = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(3 * k * n, 8110), (3, k, n), dtype_name
+        )
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "3Dx3D, NO offsets -- plain bmm", a3b, b3b, None, dtype_name, k,
+                note="both operands 3-D: offsets are forbidden and this degenerates to bmm",
+            )
+        )
+
+        # -- `out_dtype` at its only accepted value. The schema takes a
+        # `ScalarType?` but the kernel accepts only the input dtype, so the
+        # identity is the whole of the supported range and is worth pinning:
+        # a kernel that ignored the argument entirely would also pass a
+        # `None`-only battery.
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                f"2Dx3D, out_dtype={dtype_name} (the identity -- the only value upstream takes)",
+                a2, b3, _grouped_offs(torch_module, c_module, [5, 9, 24]), dtype_name, k,
+                kwargs_t={"out_dtype": dt.torch_dtype(torch_module, dtype_name)},
+                kwargs_c={"out_dtype": dt.c_dtype(c_module, dtype_name)},
+                note="out_dtype is in the schema; the only value that is not refused is mat_a's own",
+            )
+        )
+
+        # -- Model-scale depth. The three dtypes accumulate differently
+        # (float16 accumulates in float32 upstream, and a kernel that
+        # accumulated in float16 is only visibly wrong once k is large), so the
+        # depth here is doing the same job it does in `bmm_cases`' big case.
+        big_k = 128
+        big_a = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(64 * big_k, 8111), (64, big_k), dtype_name
+        )
+        big_b = pair_from_flat(
+            torch_module, c_module, _gemm_lcg(4 * big_k * 32, 8112), (4, big_k, 32), dtype_name
+        )
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                "2Dx3D model-scale, 4 experts x k=128, groups 7/25/1/31", big_a, big_b,
+                _grouped_offs(torch_module, c_module, [7, 32, 33, 64]), dtype_name, big_k,
+                note="depth enough for the accumulation dtype to show; float16 must accumulate in float32",
+            )
+        )
+
+    # -- Refusals. Every message below is upstream's own; see
+    # docs/GROUPED_MM.md §2.1 for the table they were measured into.
+    f32_a = pair_from_flat(torch_module, c_module, _gemm_lcg(m * k, 8201), (m, k), "float32")
+    f32_b3 = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * k * n, 8202), (3, k, n), "float32")
+    offs3 = _grouped_offs(torch_module, c_module, [5, 9, 24])
+
+    # Dtypes outside {f32, bf16, f16}. float64 is the interesting one: candle
+    # has a float64 matmul and mm/bmm/addmm all use it, so this is a case where
+    # the shim has the capability and must decline to use it.
+    for dtype_name, fill, why in [
+        ("float64", 1.0, "candle HAS a float64 matmul and mm uses it; _grouped_mm's CPU kernel does not take it"),
+        ("int64", 1, "no integer grouped GEMM upstream"),
+        ("uint8", 1, "no integer grouped GEMM upstream"),
+    ]:
+        bad_a = pair_from_flat(torch_module, c_module, [fill] * (m * k), (m, k), dtype_name)
+        bad_b = pair_from_flat(torch_module, c_module, [fill] * (3 * k * n), (3, k, n), dtype_name)
+        cases.append(
+            _grouped_mm_case(
+                torch_module, c_module, torch_call,
+                f"REFUSE dtype={dtype_name}", bad_a, bad_b, offs3, dtype_name, k,
+                expect="both_error",
+                note=f"torch: 'Expected mat_a to be Float32, BFloat16 or Float16 matrix, got ...'. {why}",
+            )
+        )
+
+    f16_b3 = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * k * n, 8203), (3, k, n), "float16")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE float32 x float16 -- no promotion", f32_a, f16_b3, offs3, "float32", k,
+            expect="both_error",
+            note="torch: 'expected m1 and m2 to have the same dtype'; this op does not promote",
+        )
+    )
+
+    # The 16-byte stride rule (docs/GROUPED_MM.md §2.2). Both directions:
+    # an unaligned leading stride on the 2-D operand, and on the 3-D one.
+    thin_a = pair_from_flat(torch_module, c_module, _gemm_lcg(8 * 3, 8204), (8, 3), "float32")
+    thin_b = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * 3 * 4, 8205), (3, 3, 4), "float32")
+    offs_thin = _grouped_offs(torch_module, c_module, [2, 5, 8])
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE (8,3)x(3,3,4) float32 -- K=3 is not a multiple of 16 bytes",
+            thin_a, thin_b, offs_thin, "float32", 3,
+            expect="both_error",
+            note=(
+                "torch: 'strides should be multiple of 16 bytes'. candle would multiply these "
+                "happily -- this refusal exists only because upstream's CPU kernel has it, and "
+                "computing here would be silent divergence"
+            ),
+        )
+    )
+    wide_a = pair_from_flat(torch_module, c_module, _gemm_lcg(8 * 4, 8206), (8, 4), "float32")
+    narrow_b = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * 4 * 3, 8207), (3, 4, 3), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE (8,4)x(3,4,3) float32 -- N=3 is not a multiple of 16 bytes",
+            wide_a, narrow_b, offs_thin, "float32", 4,
+            expect="both_error",
+            note="the same rule applied to the right operand's inner stride",
+        )
+    )
+    # bfloat16's alignment is 8 elements, not 4 -- so a shape that is fine in
+    # float32 is refused in bfloat16. A single hardcoded alignment would pass
+    # the float32 cases above and fail here.
+    bf_a = pair_from_flat(torch_module, c_module, _gemm_lcg(8 * 4, 8208), (8, 4), "bfloat16")
+    bf_b = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * 4 * 4, 8209), (3, 4, 4), "bfloat16")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE (8,4)x(3,4,4) bfloat16 -- 4 elements is 8 bytes, not 16",
+            bf_a, bf_b, offs_thin, "bfloat16", 4,
+            expect="both_error",
+            note="alignment is 16/itemsize ELEMENTS; the identical float32 shape is accepted",
+        )
+    )
+
+    # Offsets: dtype, rank, presence, length.
+    offs64 = pair_from_flat(torch_module, c_module, [5, 9, 24], (3,), "int64")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE offs int64 -- must be int32", f32_a, f32_b3, offs64, "float32", k,
+            expect="both_error",
+            note="torch: 'Offsets have to be int32'. transformers builds offs with cumsum(dtype=torch.int32) for this reason",
+        )
+    )
+    offs2d = pair_from_flat(torch_module, c_module, [5, 9, 24], (3, 1), "int32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE offs 2-D", f32_a, f32_b3, offs2d, "float32", k,
+            expect="both_error", note="torch: 'offs has to be 1D'",
+        )
+    )
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE 2Dx3D with NO offsets", f32_a, f32_b3, None, "float32", k,
+            expect="both_error",
+            note="torch: 'Have to provide offsets if there is a 2d matrix, or no offset if both matrices are 3d'",
+        )
+    )
+    f32_a3 = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * n * k, 8210), (3, n, k), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE 3Dx3D WITH offsets", f32_a3, f32_b3, offs3, "float32", k,
+            expect="both_error",
+            note="the same message from the other side: two 3-D operands must NOT carry offsets",
+        )
+    )
+    offs2 = _grouped_offs(torch_module, c_module, [9, 24])
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE offs length 2 against a batch of 3", f32_a, f32_b3, offs2, "float32", k,
+            expect="both_error", note="torch: 'matrix batch sizes have to match'",
+        )
+    )
+
+    # Shape agreement.
+    deep_b = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * m * n, 8211), (3, m, n), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE contraction 16 vs 24", f32_a, deep_b, offs3, "float32", k,
+            expect="both_error", note="torch: 'contraction dimension of mat_a and mat_b must match'",
+        )
+    )
+    two_batch = pair_from_flat(torch_module, c_module, _gemm_lcg(2 * n * k, 8212), (2, n, k), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE 3Dx3D batch 2 vs 3", two_batch, f32_b3, None, "float32", k,
+            expect="both_error", note="torch: 'batched dimension has to match'",
+        )
+    )
+    rank1 = pair_from_flat(torch_module, c_module, _gemm_lcg(k, 8213), (k,), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE 1-D mat_a", rank1, f32_b3, offs3, "float32", k,
+            expect="both_error", note="torch: 'mat_a has to be 2 or 3d'",
+        )
+    )
+    rank4 = pair_from_flat(
+        torch_module, c_module, _gemm_lcg(2 * 2 * k * n, 8214), (2, 2, k, n), "float32"
+    )
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE 4-D mat_b", f32_a, rank4, offs3, "float32", k,
+            expect="both_error", note="torch: 'mat_b has to be 2 or 3d'",
+        )
+    )
+
+    # `bias` and a non-identity `out_dtype`: both are in the schema and neither
+    # is implemented upstream. Refusing them is fidelity, not a capability gap
+    # -- computing a bias here would answer a question torch declines to answer.
+    bias = pair_from_flat(torch_module, c_module, [0.5] * n, (n,), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE bias -- in the schema, unimplemented upstream", f32_a, f32_b3, offs3,
+            "float32", k, expect="both_error",
+            kwargs_t={"bias": bias[0]}, kwargs_c={"bias": bias[1]},
+            note=(
+                "torch: 'Bias not supported yet'. transformers works around it with a "
+                "separate out.add_(bias), which is why _grouped_linear has that line"
+            ),
+        )
+    )
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "REFUSE out_dtype=float16 on float32 operands", f32_a, f32_b3, offs3, "float32", k,
+            expect="both_error",
+            kwargs_t={"out_dtype": dt.torch_dtype(torch_module, "float16")},
+            kwargs_c={"out_dtype": dt.c_dtype(c_module, "float16")},
+            note="torch: 'Grouped gemm output dtype must match `mat_a` dtype'",
+        )
+    )
+
+    # The 2-D x 2-D layout is the one WITHOUT a contraction check, and that is
+    # deliberate upstream: `offs` slices both operands with the same range, so
+    # the extents outside it are never read. Adding the check the other layouts
+    # have would refuse a call upstream computes -- so this case is a "match",
+    # not a refusal, and it is here to keep it that way.
+    mism_a = pair_from_flat(torch_module, c_module, _gemm_lcg(8 * 8, 8215), (8, 8), "float32")
+    mism_b = pair_from_flat(torch_module, c_module, _gemm_lcg(4 * 4, 8216), (4, 4), "float32")
+    cases.append(
+        _grouped_mm_case(
+            torch_module, c_module, torch_call,
+            "2Dx2D with MISMATCHED K (8 vs 4) -- upstream computes, offs=[2,4]",
+            mism_a, mism_b, _grouped_offs(torch_module, c_module, [2, 4]), "float32", 2,
+            note="the 2Dx2D layout has no contraction check; only the offset range is read",
+        )
+    )
+
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
+    "aten._grouped_mm.default": grouped_mm_cases,
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,
     "aten.mm.default": mm_cases,
@@ -10103,6 +10671,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.empty_like.default": empty_like_cases,
     "aten.ge.Scalar": ge_scalar_cases,
     "aten.floor_divide.default": floor_divide_cases,
+    "aten.floor_divide.Scalar": floor_divide_scalar_cases,
     "aten.histc.default": histc_cases,
     "aten.clamp_.default": clamp__default_cases,
     "aten.div_.Tensor": div__tensor_cases,
