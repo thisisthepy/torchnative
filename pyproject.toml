@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "torchnative"
 version = "0.0.5a0"
-description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
+description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
 # Our own code is MIT; the rest of the expression is upstream PyTorch's, copied
 # verbatim from its own `License-Expression` (torch 2.13.0). A platform wheel
