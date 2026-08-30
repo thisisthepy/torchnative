@@ -7226,7 +7226,13 @@ def test_decompose_gets_the_full_upstream_table_now():
     # `test_a_packet_reports_the_overloads_the_file_declares` counts, seen from
     # the decomposition table's side. `cia_registrations` reads
     # `native_functions.yaml` directly and so does not move with the tables.
-    assert r["table_size"] == 416, r["table_size"]
+    # 417 with `ones_like.out`, which is the same one entry again, from the
+    # decomposition table's side: `overloads.json` now carries
+    # `aten::ones_like.out`, the yaml does not declare it, so
+    # `register_decomposition(aten.ones_like)` has a schema to resolve and
+    # reaches one more overload. `cia_registrations` still does not move,
+    # because it reads `native_functions.yaml` directly.
+    assert r["table_size"] == 417, r["table_size"]
     assert r["cia_registrations"] == 743, r["cia_registrations"]
     assert r["cia_backend_key"] != "ANSWERED"
     assert "backend key" in r["cia_backend_key"], r["cia_backend_key"]
@@ -7268,7 +7274,17 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # reaches one more overload. `registry_default` does not move, because the
     # new one is `.out` and not `.default` -- which is the check that this is
     # the same mechanism and not a regression of the `["default"]` bug.
-    assert r["registry"] == 1006, r["registry"]
+    # 1007 with `ones_like`, for the third time by the same mechanism (see
+    # `zeros_like` above and `floor_divide.Scalar_out` before it):
+    # `overloads.json` carries `aten::ones_like.out`, the yaml does not declare
+    # it, so the packet resolves one more overload. `registry_default` is again
+    # unchanged, because the new one is `.out` -- which is the check that this
+    # is that mechanism and not a regression of the `["default"]` bug.
+    #
+    # `detach` went into `overloads.json` in the same change and moved NOTHING
+    # here: `aten::detach` has no `.out` variant, so there is no undeclared
+    # overload for a packet to reach.
+    assert r["registry"] == 1007, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -7355,7 +7371,12 @@ def test_core_ops_and_op_tags_agree():
     # this counts overloads, not ops -- and two overloads of one op do not have
     # to agree (`min.dim` is core while `max.dim` is not, above), so both were
     # read rather than one inferred from the other.
-    assert r["tag_core_count"] == 88, r["tag_core_count"]
+    # 90 with `div.Tensor_mode` and `div.Scalar_mode`, both
+    # `['core', 'pointwise', 'pt2_compliant_tag']` -- read off each overload's
+    # own `.tags` rather than copied from `div.Tensor` beside them, which
+    # happens to carry the same three. +2 for the same reason `remainder` was
+    # +2: this counts overloads.
+    assert r["tag_core_count"] == 90, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -8630,7 +8651,17 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # name), and `methods.json`'s `remainder` and `__mod__` add none -- both
     # name the same `Tensor`/`Scalar` pair, and `__mod__` is a second spelling
     # exactly as `__iadd__` is of `add_`.
-    assert len(keys) == 228, len(keys)
+    #
+    # 230 with `ones_like` and `detach`. **+2, not +3**, and which of the two
+    # contributed is the check: `ones_like` is in neither table before this
+    # change, so its `.out` and default schemas are two new identities, while
+    # `detach` was **already in `methods.json`** -- putting it in
+    # `overloads.json` gives `torch.detach` a door onto a schema
+    # `Tensor.detach` already named, and a second spelling of one schema is one
+    # identity, exactly as `__mod__`/`remainder` and `__iadd__`/`add_` are.
+    # Getting +3 here would mean the two tables had transcribed `detach`
+    # differently.
+    assert len(keys) == 230, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -8640,12 +8671,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # Every other schema this round added IS declared in the yaml, so the list
     # grew by one rather than by twenty-two -- which is the check that the new
     # entries are being answered by the file and not by the oracle itself.
+    #
+    # `ones_like.out` is the seventh, and it is the same generated-not-declared
+    # shape as `zeros_like.out` beside it -- which is why it, and not
+    # `ones_like` itself, is what moved the decomposition registry by one.
+    # `detach` adds nothing here: it is declared in the yaml.
     assert from_tables == [
         ("aten::div", "Scalar_mode_out"),
         ("aten::div", "Scalar_out"),
         ("aten::embedding", "out"),
         ("aten::empty_like", "out"),
         ("aten::floor_divide", "Scalar_out"),
+        ("aten::ones_like", "out"),
         ("aten::zeros_like", "out"),
     ], from_tables
 
@@ -11593,6 +11630,23 @@ def test_sqrt_is_reachable_by_name_not_only_by_dispatch_key():
     # here. Asserted so that adding `__rmod__` without the kernel -- which would
     # make `3 % x` refuse by a name that resolves to nothing -- fails here.
     assert "__rmod__" not in _C._shim_methods
+    # `div`'s four overloads were already in both tables before the two
+    # `_mode` kernels existed -- only the kernels were missing, which is why
+    # the sweep's wall was an `aten op not implemented` rather than an
+    # overload-resolution failure. The ORDER is what makes `torch.div(a, b)`
+    # and `torch.div(a, b, rounding_mode=...)` land on different keys: the
+    # `_mode` entries come first and are skipped when the keyword is absent,
+    # because `str? rounding_mode` is keyword-only *and has no default* in
+    # native_functions.yaml. Reordering these so `div.Tensor` came first would
+    # make every `rounding_mode=` call silently answer true division.
+    assert _C._shim_methods["div"] == [
+        "aten.div.Tensor_mode",
+        "aten.div.Scalar_mode",
+        "aten.div.Tensor",
+        "aten.div.Scalar",
+    ], _C._shim_methods.get("div")
+    for key in ("aten.div.Tensor_mode", "aten.div.Scalar_mode"):
+        assert key in _C._aten_all_implemented(), key
     # `.out` is in the table with no kernel behind it, exactly as `rsqrt.out`
     # is, so that `torch.sqrt(x, out=y)` refuses *by the right name* instead of
     # falling through to "no table entry for this op".
@@ -11858,6 +11912,26 @@ def test_the_legacy_tensor_size_constructor_allocates_and_the_data_form_refuses(
     assert list(spec_embed.shape) == [32]
     assert all(0.0 <= v < 1.0 for v in spec_embed.tolist()), spec_embed.tolist()
 
+    # **Two calls must return independent storage.** Nothing above can see this:
+    # the shape, dtype and refusal assertions all pass for a constructor that
+    # handed out one shared buffer, and so does the `.uniform_()` check, because
+    # a shared buffer is still filled with values in range. The values
+    # themselves are the one thing that cannot be compared against upstream here
+    # (upstream's are uninitialised), so *independence* is what stands in for
+    # them -- the property a caller actually depends on when it writes into the
+    # result. `masked_spec_embed` is constructed once per model, but two models
+    # in one process must not share it.
+    first, second = _C.TensorBase(4), _C.TensorBase(4)
+    _C._aten_dispatch("aten.fill_.Scalar", first, 1.0)
+    _C._aten_dispatch("aten.fill_.Scalar", second, 2.0)
+    assert first.tolist() == [1.0] * 4, first.tolist()
+    # Checked by writing into one and reading the other rather than by
+    # comparing `data_ptr()`, which `TensorBase` does not expose at this level.
+    assert second.tolist() == [2.0] * 4, (
+        "two TensorBase(n) calls must not share storage", second.tolist())
+    assert first.tolist() == [1.0] * 4, (
+        "the second call must not have overwritten the first", first.tolist())
+
 
 def test_set_from_a_tensor_aliases_where_set_from_a_storage_copies():
     """`aten.set_.source_Tensor` -- the wall `vits` AND `sew_d` both stopped
@@ -12064,11 +12138,294 @@ rec("remainder_matches_raw",
 def _sam3_rotary_positions():
     end_x, end_y = 4, 3
     flat = torch.arange(end_x * end_y)
-    # The `% end_x` half only. The `//`-shaped `y_positions` beside it in
-    # `modeling_sam3.py` needs `div.Tensor_mode`, which docs/KERNELS26.md §6
-    # records as still missing.
     return (flat % end_x).tolist()
 rec("sam3_rotary_x_positions", _sam3_rotary_positions)
+
+# --- div rounding modes: free function, member, and both overloads ----------
+dv = torch.tensor([7, 7, -7, -7, 6, -6])
+dd = torch.tensor([3, -3, 3, -3, 3, 3])
+rec("div_floor_fn", lambda: torch.div(dv, dd, rounding_mode="floor").tolist())
+rec("div_trunc_fn", lambda: torch.div(dv, dd, rounding_mode="trunc").tolist())
+rec("div_floor_member", lambda: dv.div(dd, rounding_mode="floor").tolist())
+rec("div_trunc_member", lambda: dv.div(dd, rounding_mode="trunc").tolist())
+# The Scalar_mode overload: a bare Python int in the divisor slot.
+rec("div_floor_scalar", lambda: torch.div(dv, 3, rounding_mode="floor").tolist())
+rec("div_trunc_scalar", lambda: torch.div(dv, 3, rounding_mode="trunc").tolist())
+rec("div_floor_scalar_member", lambda: dv.div(3, rounding_mode="floor").tolist())
+# dtype: the two rounding modes PRESERVE and rounding_mode=None PROMOTES.
+rec("div_floor_dtype", lambda: str(torch.div(dv, dd, rounding_mode="floor").dtype))
+rec("div_none_dtype", lambda: str(torch.div(dv, dd, rounding_mode=None).dtype))
+rec("div_plain_dtype", lambda: str(torch.div(dv, dd).dtype))
+# `rounding_mode=None` must equal the plain `div` -- it delegates to it.
+rec("div_none_equals_plain",
+    lambda: torch.div(dv, dd, rounding_mode=None).tolist() == torch.div(dv, dd).tolist())
+# Which overload each spelling actually resolved to.
+rec("div_scalar_matches_raw",
+    lambda: torch.div(dv, 3, rounding_mode="floor").tolist()
+    == torch._C._aten_dispatch("aten.div.Scalar_mode", dv, 3, rounding_mode="floor").tolist())
+rec("div_tensor_matches_raw",
+    lambda: torch.div(dv, dd, rounding_mode="floor").tolist()
+    == torch._C._aten_dispatch("aten.div.Tensor_mode", dv, dd, rounding_mode="floor").tolist())
+# floor and trunc must DISAGREE where the signs differ and the division is
+# inexact, and AGREE where it is exact. Computed here, not taken from the shim.
+rec("div_floor_trunc_disagree",
+    lambda: [f != t for f, t in zip(torch.div(dv, dd, rounding_mode="floor").tolist(),
+                                    torch.div(dv, dd, rounding_mode="trunc").tolist())])
+# The float corner that kills `floor(a / b)`.
+rec("div_floor_inf_over_finite",
+    lambda: math.isnan(torch.div(torch.tensor([float("inf")]), torch.tensor([3.0]),
+                                 rounding_mode="floor").item()))
+rec("div_trunc_inf_over_finite",
+    lambda: math.isinf(torch.div(torch.tensor([float("inf")]), torch.tensor([3.0]),
+                                 rounding_mode="trunc").item()))
+rec("div_floor_five_over_neg_inf",
+    lambda: torch.div(torch.tensor([5.0]), torch.tensor([float("-inf")]),
+                      rounding_mode="floor").item())
+rec("div_floor_five_over_zero",
+    lambda: math.isinf(torch.div(torch.tensor([5.0]), torch.tensor([0.0]),
+                                 rounding_mode="floor").item()))
+rec("div_floor_neg_zero_sign",
+    lambda: math.copysign(1.0, torch.div(torch.tensor([-0.0]), torch.tensor([3.0]),
+                                         rounding_mode="floor").item()))
+# Integral division by zero raises under a rounding mode and NOT under None.
+def _div_zero_int():
+    try:
+        torch.div(torch.tensor([5]), 0, rounding_mode="floor")
+        return "ACCEPTED"
+    except RuntimeError as e:
+        return "raised:" + str(e)
+rec("div_int_zero_raises", _div_zero_int)
+rec("div_int_zero_none_is_inf",
+    lambda: math.isinf(torch.div(torch.tensor([5]), 0, rounding_mode=None).item()))
+# An unrecognised mode is refused by upstream's own wording.
+def _div_bad_mode():
+    try:
+        torch.div(dv, dd, rounding_mode="ceil")
+        return "ACCEPTED"
+    except RuntimeError as e:
+        return str(e)
+rec("div_bad_mode", _div_bad_mode)
+# The scalar narrows into the result dtype BEFORE dividing.
+rec("div_uint8_narrows",
+    lambda: torch.div(torch.tensor([200], dtype=torch.uint8), -3,
+                      rounding_mode="floor").tolist())
+# `Sam3ViTRotaryEmbedding.__init__` verbatim -- BOTH axes, which is the pair of
+# lines `sam3_video` stopped on. `%` is `remainder`, `//`-shaped `torch.div`
+# with rounding_mode="floor" is this kernel.
+def _sam3_rotary_both_axes():
+    end_x, end_y = 4, 3
+    flat = torch.arange(end_x * end_y)
+    x_positions = flat % end_x
+    y_positions = torch.div(flat, end_x, rounding_mode="floor")
+    return [x_positions.tolist(), y_positions.tolist()]
+rec("sam3_rotary_both_axes", _sam3_rotary_both_axes)
+
+# --- conv_transpose2d: the free function, nn.ConvTranspose2d, and the layout --
+def _convt_layout_by_shape():
+    # in=3, out=5, kernel 2x4. `out_channels` is weight.shape[1]; if the layout
+    # were (out, in, ...) this call would raise instead of answering (2,5,6,10).
+    x = torch.arange(2 * 3 * 5 * 7, dtype=torch.float32).reshape(2, 3, 5, 7) * 0.01
+    w = torch.arange(3 * 5 * 2 * 4, dtype=torch.float32).reshape(3, 5, 2, 4) * 0.02
+    return list(torch.conv_transpose2d(x, w, None, 1, 0, 0, 1, 1).shape)
+rec("convt_layout_by_shape", _convt_layout_by_shape)
+def _convt_wrong_layout_refused():
+    # The same call with the weight transposed: 5 in-channels against a 3-channel
+    # input. Upstream raises here and so must this.
+    x = torch.ones(2, 3, 5, 7); w = torch.ones(5, 3, 2, 4)
+    try:
+        torch.conv_transpose2d(x, w)
+        return "ACCEPTED"
+    except RuntimeError:
+        return "refused"
+rec("convt_wrong_layout_refused", _convt_wrong_layout_refused)
+def _convt_swap_changes_the_answer():
+    # Equal channels and a square kernel -- the shape cannot tell the two
+    # arrangements apart, so this asserts that the VALUES do. If this ever
+    # comes back True the kernel is ignoring the weight's axis order, which is
+    # precisely the failure `zoedepth`'s own square call cannot show.
+    x = torch.arange(1 * 2 * 3 * 3, dtype=torch.float64).reshape(1, 2, 3, 3)
+    # Built from index arithmetic on plain lists rather than with `.transpose`
+    # and `.flip`: `TensorBase.flip` is not implemented in this shim, and a
+    # rearrangement done with ops under test could not be trusted to be the
+    # rearrangement it claims anyway.
+    base = [[[[((i * 2 + o) * 3 + p) * 3 + q for q in range(3)] for p in range(3)]
+             for o in range(2)] for i in range(2)]
+    swapped = [[[[base[o][i][p][q] for q in range(3)] for p in range(3)]
+                for o in range(2)] for i in range(2)]
+    flip = [[[[base[i][o][2 - p][2 - q] for q in range(3)] for p in range(3)]
+             for o in range(2)] for i in range(2)]
+    w = torch.tensor(base, dtype=torch.float64)
+    a = torch.conv_transpose2d(x, w)
+    b = torch.conv_transpose2d(x, torch.tensor(swapped, dtype=torch.float64))
+    flipped = torch.conv_transpose2d(x, torch.tensor(flip, dtype=torch.float64))
+    return {
+        "same_shape": list(a.shape) == list(b.shape) == list(flipped.shape),
+        "swap_equal": a.tolist() == b.tolist(),
+        "flip_equal": a.tolist() == flipped.tolist(),
+        # The spatial flip leaves the SUM identical, so a checksum test cannot
+        # see it. Recorded so that claim is checked rather than asserted.
+        "flip_same_sum": abs(float(a.sum()) - float(flipped.sum())) < 1e-6,
+        "swap_same_sum": abs(float(a.sum()) - float(b.sum())) < 1e-6,
+    }
+rec("convt_swap_changes_the_answer", _convt_swap_changes_the_answer)
+def _nn_conv_transpose2d():
+    # The route zoedepth takes: nn.ConvTranspose2d.forward -> F.conv_transpose2d
+    # -> torch.conv_transpose2d -> aten.convolution.default(transposed=True).
+    m = nn.ConvTranspose2d(2, 3, kernel_size=2, stride=2, padding=0)
+    with torch.no_grad():
+        m.weight.fill_(0.5)
+        m.bias.fill_(0.25)
+        o = m(torch.ones(1, 2, 3, 3))
+    # stride == kernel, so the windows tile: each output element is
+    # 2 in-channels * 0.5 + 0.25.
+    return [list(o.shape), round(float(o.reshape(-1)[0]), 6)]
+rec("nn_conv_transpose2d_forward", _nn_conv_transpose2d)
+rec("convt_matches_raw",
+    lambda: torch.conv_transpose2d(
+        torch.ones(1, 2, 3, 3), torch.ones(2, 3, 2, 2), None, 2, 0, 0, 1, 1).tolist()
+    == torch._C._aten_dispatch(
+        "aten.convolution.default", torch.ones(1, 2, 3, 3), torch.ones(2, 3, 2, 2),
+        None, [2, 2], [0, 0], [1, 1], True, [0, 0], 1).tolist())
+# `F.conv_transpose2d` IS `torch.conv_transpose2d` upstream -- asserted, not
+# assumed, because the whole spelling rests on it.
+import torch.nn.functional as _F
+rec("convt_F_is_torch", lambda: _F.conv_transpose2d is torch.conv_transpose2d)
+# The signature has `groups` BEFORE `dilation`, unlike conv2d. Called
+# positionally with groups=1 and dilation=2: a transcription of conv2d's order
+# would read the 7th positional as `dilation` and the 8th as `groups`, giving
+# dilation=1 and groups=2 -- a different shape, and in fact a refusal.
+rec("convt_positional_signature",
+    lambda: list(torch.conv_transpose2d(
+        torch.ones(1, 2, 4, 4), torch.ones(2, 3, 3, 3), None, 2, 1, 1, 1, 2).shape))
+def _convt_groups_refused():
+    try:
+        torch.conv_transpose2d(torch.ones(1, 4, 4, 4), torch.ones(4, 2, 3, 3),
+                               None, 1, 0, 0, 2, 1)
+        return "ACCEPTED"
+    except NotImplementedError as e:
+        return "refused" if "groups" in str(e) else "refused:" + str(e)[:80]
+rec("convt_groups_refused", _convt_groups_refused)
+def _convt_outpad_bound():
+    try:
+        torch.conv_transpose2d(torch.ones(1, 2, 4, 4), torch.ones(2, 2, 3, 3),
+                               None, 1, 0, 1, 1, 1)
+        return "ACCEPTED"
+    except RuntimeError as e:
+        return str(e)
+rec("convt_outpad_bound", _convt_outpad_bound)
+
+# --- weight_norm: three pieces, and the route that hid all of them -----------
+wn_v = torch.tensor([[3.0, 4.0], [0.0, 5.0]])
+rec("ned_dim0", lambda: torch.norm_except_dim(wn_v, 2, 0).tolist())
+rec("ned_dim1", lambda: torch.norm_except_dim(wn_v, 2, 1).tolist())
+rec("ned_dim_minus1", lambda: torch.norm_except_dim(wn_v, 2, -1).tolist())
+rec("ned_dim0_shape", lambda: list(torch.norm_except_dim(wn_v, 2, 0).shape))
+rec("ned_dim1_shape", lambda: list(torch.norm_except_dim(wn_v, 2, 1).shape))
+rec("ned_dim_minus1_shape", lambda: list(torch.norm_except_dim(wn_v, 2, -1).shape))
+# `torch._weight_norm` returns ONE tensor; `_weight_norm_interface` returns the
+# pair. Both spellings, so the `[0]` in the composite is pinned.
+wn_g = torch.tensor([[2.0], [3.0]])
+rec("weight_norm_fn", lambda: torch._weight_norm(wn_v, wn_g, 0).tolist())
+rec("weight_norm_interface_pair",
+    lambda: [t.tolist() for t in torch._C._aten_dispatch(
+        "aten._weight_norm_interface.default", wn_v, wn_g, 0)])
+rec("weight_norm_matches_interface",
+    lambda: torch._weight_norm(wn_v, wn_g, 0).tolist()
+    == torch._C._aten_dispatch(
+        "aten._weight_norm_interface.default", wn_v, wn_g, 0)[0].tolist())
+# norm.ScalarOpt_dim by its own key, across the p family.
+nrm = torch.tensor([[3.0, -4.0], [0.0, 1.0]])
+rec("norm_p_family", lambda: {
+    str(p): torch._C._aten_dispatch("aten.norm.ScalarOpt_dim", nrm, p, [1], False).tolist()
+    for p in (2, 1, 0, None)})
+rec("norm_p_inf", lambda: [
+    torch._C._aten_dispatch("aten.norm.ScalarOpt_dim", nrm, float("inf"), [1], False).tolist(),
+    torch._C._aten_dispatch("aten.norm.ScalarOpt_dim", nrm, float("-inf"), [1], False).tolist()])
+rec("norm_empty_dim_reduces_all",
+    lambda: torch._C._aten_dispatch("aten.norm.ScalarOpt_dim", nrm, 2, [], False).tolist())
+
+# THE ROUTE: nn.utils.parametrizations.weight_norm, which is what vits and
+# sew_d use. A missing kernel on this path surfaced as
+# `TypeError: _WeightNorm.forward() missing 1 required positional argument`
+# 200 frames away, because ParametrizationList.__init__ has
+# `except NotImplementedError: pass` around right_inverse.
+def _weight_norm_module(dim):
+    m = nn.Conv1d(2, 3, 3, bias=False)
+    with torch.no_grad():
+        m.weight.fill_(0.5)
+    wn = nn.utils.parametrizations.weight_norm(m, name="weight", dim=dim)
+    y = wn(torch.ones(1, 2, 6))
+    return [list(y.shape), round(float(y.reshape(-1)[0]), 5)]
+rec("weight_norm_module_dim0", lambda: _weight_norm_module(0))
+rec("weight_norm_module_dim2", lambda: _weight_norm_module(2))
+# The parametrization really is installed (not silently skipped), and the
+# reconstructed weight equals the original -- right_inverse followed by forward
+# is the identity when the kernels are present. That is the assertion the
+# swallowed NotImplementedError defeated.
+def _weight_norm_roundtrip():
+    m = nn.Conv1d(2, 3, 3, bias=False)
+    with torch.no_grad():
+        m.weight.copy_(torch.arange(18, dtype=torch.float32).reshape(3, 2, 3) * 0.1 - 0.5)
+    before = m.weight.tolist()
+    wn = nn.utils.parametrizations.weight_norm(m, name="weight", dim=0)
+    after = wn.weight.tolist()
+    flat_b = [v for a in before for b in a for v in b]
+    flat_a = [v for a in after for b in a for v in b]
+    return {
+        "parametrized": bool(getattr(wn, "parametrizations", None) is not None
+                             and "weight" in getattr(wn, "parametrizations", {})),
+        "roundtrip_max_abs_diff": max(abs(x - y) for x, y in zip(flat_b, flat_a)),
+        "has_g_and_v": sorted(
+            n for n, _ in wn.parametrizations.weight.named_parameters()),
+    }
+rec("weight_norm_roundtrip", _weight_norm_roundtrip)
+
+# --- the tail: four name gaps over kernels that already existed --------------
+ov_a, ov_b = torch.arange(3.0), torch.arange(1.0, 5.0)
+rec("outer_fn", lambda: torch.outer(ov_a, ov_b).tolist())
+rec("outer_member", lambda: ov_a.outer(ov_b).tolist())
+rec("outer_shape", lambda: list(torch.outer(ov_a, ov_b).shape))
+rec("outer_int_dtype",
+    lambda: str(torch.outer(torch.arange(3), torch.arange(4)).dtype))
+rec("outer_mixed_dtype",
+    lambda: str(torch.outer(torch.arange(3), torch.arange(4.0)).dtype))
+def _outer_rank_refused():
+    try:
+        torch.outer(torch.ones(2, 2), ov_b)
+        return "ACCEPTED"
+    except RuntimeError as e:
+        return str(e)
+rec("outer_rank_refused", _outer_rank_refused)
+
+# `tile` is NOT `repeat`: too few dims are left-padded rather than refused.
+tl = torch.arange(6).reshape(2, 3)
+rec("tile_too_few_dims", lambda: list(tl.tile((2,)).shape))
+rec("tile_varargs", lambda: list(tl.tile(2, 2).shape))
+rec("tile_more_dims", lambda: list(tl.tile((2, 1, 1)).shape))
+rec("tile_free_fn", lambda: list(torch.tile(tl, (2,)).shape))
+rec("tile_values", lambda: tl.tile((2,)).tolist())
+def _repeat_refuses_too_few():
+    # The difference that makes `tile` a separate function: `repeat` needs at
+    # least as many dims as the rank, `tile` pads.
+    try:
+        tl.repeat(2)
+        return "ACCEPTED"
+    except Exception as e:
+        return type(e).__name__
+rec("repeat_refuses_too_few", _repeat_refuses_too_few)
+
+rec("ones_like_values", lambda: torch.ones_like(torch.zeros(2, 3)).tolist())
+rec("ones_like_dtype",
+    lambda: str(torch.ones_like(torch.zeros(2, 2, dtype=torch.int64)).dtype))
+rec("detach_fn", lambda: torch.detach(torch.arange(3.0)).tolist())
+# `detach` returns a view that shares storage upstream; asserted through a
+# write, because that is the property callers depend on.
+def _detach_shares():
+    base = torch.ones(3)
+    d = torch.detach(base)
+    d.fill_(5.0)
+    return base.tolist()
+rec("detach_shares_storage", _detach_shares)
 
 json.dump(out, sys.stdout)
 """
@@ -12160,6 +12517,158 @@ def test_kernels26_road_through_the_vendored_tree():
     # 3*4*4 = 48 ones times 0.01, plus a bias of 0.5.
     eq("nn_conv2d_forward", [[2, 4, 2, 2], round(48 * 0.01 + 0.5, 6)])
     eq("conv2d_asymmetric_refused", "refused")
+
+    # --- div rounding modes -------------------------------------------------
+    # (7, 7, -7, -7, 6, -6) over (3, -3, 3, -3, 3, 3). The last two are the
+    # EXACT pairs, where floor and trunc agree even though the signs differ --
+    # so a case set built only from them could not tell the modes apart.
+    eq("div_floor_fn", [2, -3, -3, 2, 2, -2])
+    eq("div_trunc_fn", [2, -2, -2, 2, 2, -2])
+    eq("div_floor_member", [2, -3, -3, 2, 2, -2])
+    eq("div_trunc_member", [2, -2, -2, 2, 2, -2])
+    eq("div_floor_scalar", [2, 2, -3, -3, 2, -2])
+    eq("div_trunc_scalar", [2, 2, -2, -2, 2, -2])
+    eq("div_floor_scalar_member", [2, 2, -3, -3, 2, -2])
+    # The modes disagree on exactly the opposite-sign INEXACT pairs: indices
+    # 1 and 2. Index 5 is `-6 / 3`, opposite signs but exact, and they agree.
+    eq("div_floor_trunc_disagree", [False, True, True, False, False, False])
+    # dtype is how `None` is told apart from the other two.
+    eq("div_floor_dtype", "torch.int64")
+    eq("div_none_dtype", "torch.float32")
+    eq("div_plain_dtype", "torch.float32")
+    eq("div_none_equals_plain", True)
+    eq("div_scalar_matches_raw", True)
+    eq("div_tensor_matches_raw", True)
+    # The corners that a `floor(a / b)` implementation gets wrong.
+    eq("div_floor_inf_over_finite", True)   # nan, NOT inf
+    eq("div_trunc_inf_over_finite", True)   # inf under trunc, though
+    eq("div_floor_five_over_neg_inf", -1.0)  # not -0.0
+    eq("div_floor_five_over_zero", True)     # inf: the b == 0 early return
+    eq("div_floor_neg_zero_sign", -1.0)      # -0.0 keeps its sign bit
+    got = out.get("div_int_zero_raises", "<missing>")
+    assert got.startswith("raised:") and "ZeroDivisionError" in got, got
+    eq("div_int_zero_none_is_inf", True)     # ... and None does not raise
+    eq(
+        "div_bad_mode",
+        "div expected rounding_mode to be one of None, 'trunc', or 'floor' "
+        "but found 'ceil'",
+    )
+    # `-3` becomes `253` in uint8 before the division, so this is 0, not -66.
+    eq("div_uint8_narrows", [0])
+    # Both axes of the rotary grid `sam3_video` stopped on.
+    eq(
+        "sam3_rotary_both_axes",
+        [[0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]],
+    )
+
+    # --- conv_transpose2d ---------------------------------------------------
+    # The weight is (in, out/groups, kH, kW) -- the OPPOSITE of the forward
+    # convolution's (out, in/groups, kH, kW). in=3, out=5, kernel 2x4, so
+    # out_channels=5 comes from weight.shape[1] and no two axes are
+    # interchangeable.
+    eq("convt_layout_by_shape", [2, 5, 6, 10])
+    eq("convt_wrong_layout_refused", "refused")
+    # `zoedepth`'s own call is ConvTranspose2d(c, c, kernel_size=f, stride=f) --
+    # equal channels and a square kernel -- so its shape cannot reveal the
+    # layout at all. These three assertions are what stands in for that:
+    # the arrangements have the same shape, and different values.
+    swap = out.get("convt_swap_changes_the_answer", "<missing>")
+    assert swap.get("same_shape") is True, swap
+    assert swap.get("swap_equal") is False, (
+        "swapping the weight's first two axes must change the answer; it did "
+        "not, so the kernel is ignoring the axis order", swap)
+    assert swap.get("flip_equal") is False, (
+        "flipping the kernel spatially must change the answer", swap)
+    # ...and the flip keeps the SUM identical, which is why none of this can be
+    # checked with a checksum.
+    assert swap.get("flip_same_sum") is True, swap
+    assert swap.get("swap_same_sum") is False, swap
+    # 2 in-channels * 0.5 + 0.25 bias, tiled because stride == kernel_size.
+    eq("nn_conv_transpose2d_forward", [[1, 3, 6, 6], round(2 * 0.5 + 0.25, 6)])
+    eq("convt_matches_raw", True)
+    eq("convt_F_is_torch", True)
+    # (input, weight, bias, stride=2, padding=1, output_padding=1, groups=1,
+    # dilation=2) -- `groups` is the 7th positional and `dilation` the 8th,
+    # which is NOT conv2d's order. Reading them the other way round gives
+    # dilation=1, groups=2, which is a different shape and in fact a refusal.
+    eq("convt_positional_signature", [1, 3, 10, 10])
+    eq("convt_groups_refused", "refused")
+    eq(
+        "convt_outpad_bound",
+        "output padding must be smaller than either stride or dilation, but got "
+        "output_padding_height: 1 output_padding_width: 1",
+    )
+
+    # --- weight_norm's three pieces -----------------------------------------
+    # v = [[3, 4], [0, 5]]. `norm_except_dim` KEEPS `dim` and reduces the rest,
+    # keepdim -- so dim=0 gives column norms shaped (2,1) and dim=1 gives row
+    # norms shaped (1,2). Those two are different numbers as well as different
+    # shapes, which is what makes the axis choice checkable.
+    eq("ned_dim0", [[5.0], [5.0]])                    # sqrt(9+16), sqrt(0+25)
+    eq("ned_dim0_shape", [2, 1])
+    eq("ned_dim1_shape", [1, 2])
+    rows = out.get("ned_dim1", "<missing>")
+    assert abs(rows[0][0] - 3.0) < 1e-5 and abs(rows[0][1] - math.sqrt(41)) < 1e-5, rows
+    # dim=-1 is NOT "the last axis" here: it is upstream's "no axis is exempt"
+    # spelling, and gives the whole-tensor norm as a 0-d result.
+    eq("ned_dim_minus1_shape", [])
+    close("ned_dim_minus1", math.sqrt(50))
+    # `torch._weight_norm` returns one tensor; the interface returns the pair.
+    eq("weight_norm_fn", [[1.2000000476837158, 1.600000023841858], [0.0, 3.0]])
+    eq(
+        "weight_norm_interface_pair",
+        [[[1.2000000476837158, 1.600000023841858], [0.0, 3.0]], [[5.0], [5.0]]],
+    )
+    eq("weight_norm_matches_interface", True)
+    # The `p` family: five of these are different functions, and
+    # `norm_except_dim` only ever passes 2 -- so nothing on the weight_norm path
+    # would exercise the rest.
+    eq("norm_p_family", {"2": [5.0, 1.0], "1": [7.0, 1.0],
+                         "0": [2.0, 1.0], "None": [5.0, 1.0]})
+    eq("norm_p_inf", [[4.0, 1.0], [3.0, 0.0]])        # max |x|, then min |x|
+    close("norm_empty_dim_reduces_all", math.sqrt(26))  # [] means EVERY axis
+    # The real route, which is what vits and sew_d take. The weight is filled
+    # with 0.5, and weight_norm reproduces it exactly at construction, so a
+    # 2-channel 3-tap convolution of ones is 2*3*0.5 = 3.0 -- for BOTH dims.
+    eq("weight_norm_module_dim0", [[1, 3, 4], 3.0])
+    eq("weight_norm_module_dim2", [[1, 3, 4], 3.0])
+    # ...and the parametrization is genuinely installed rather than silently
+    # skipped. `ParametrizationList.__init__` swallows NotImplementedError
+    # around `right_inverse`, so a missing kernel here leaves a half-built
+    # parametrization that fails 200 frames later with a TypeError naming no
+    # kernel at all. These three assertions are what that defeated.
+    rt = out.get("weight_norm_roundtrip", "<missing>")
+    assert rt.get("parametrized") is True, rt
+    assert rt.get("has_g_and_v") == ["original0", "original1"], (
+        "weight_norm must install BOTH the magnitude and the direction "
+        "parameter; one of them means right_inverse was skipped", rt)
+    assert rt.get("roundtrip_max_abs_diff") < 1e-5, (
+        "right_inverse followed by forward must reproduce the original weight", rt)
+
+    # --- the tail: four name gaps over kernels that already existed ---------
+    # `outer` fires only view+mul, so what is checked is the SHAPE convention
+    # (rows from self, columns from vec2) and the promotion it inherits.
+    eq("outer_fn", [[0.0, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0]])
+    eq("outer_member", [[0.0, 0.0, 0.0, 0.0], [1.0, 2.0, 3.0, 4.0], [2.0, 4.0, 6.0, 8.0]])
+    eq("outer_shape", [3, 4])            # (len(self), len(vec2)), not the reverse
+    eq("outer_int_dtype", "torch.int64")     # inherited from mul, not restated
+    eq("outer_mixed_dtype", "torch.float32")
+    eq("outer_rank_refused", "outer: Expected 1-D argument self, but got 2-D")
+    # `tile` is NOT `repeat`. Too FEW dims are left-padded here and refused
+    # there, which is the whole reason it is a separate function -- and the
+    # padding is on the LEFT, so a (2,3) tiled by 2 is (2,6), not (4,3).
+    eq("tile_too_few_dims", [2, 6])
+    eq("repeat_refuses_too_few", "RuntimeError")
+    eq("tile_varargs", [4, 6])
+    eq("tile_more_dims", [2, 2, 3])      # too many: extra dims lead, as repeat
+    eq("tile_free_fn", [2, 6])
+    eq("tile_values", [[0, 1, 2, 0, 1, 2], [3, 4, 5, 3, 4, 5]])
+    # `ones_like`'s values are defined, unlike its zeros/empty siblings'.
+    eq("ones_like_values", [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+    eq("ones_like_dtype", "torch.int64")
+    # `detach` was already a kernel with no name; it must still be a view.
+    eq("detach_fn", [0.0, 1.0, 2.0])
+    eq("detach_shares_storage", [5.0, 5.0, 5.0])
 
 
 def _main():

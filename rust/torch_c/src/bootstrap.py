@@ -3346,6 +3346,47 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     expand_as.__qualname__ = "TensorBase.expand_as"
     setattr(tensorbase, "expand_as", expand_as)
 
+    # `Tensor.tile` -- `sam3_video`'s wall once `outer` and `ones_like` were
+    # behind it. A *name* gap over `repeat`, and the same kind of check:
+    # `aten::tile` is `CompositeImplicitAutograd` and a `TorchDispatchMode`
+    # trace of `x.tile((2,))` fires exactly one op, `aten.repeat.default`.
+    #
+    # **`tile` and `repeat` differ in what they do with too FEW dims**, which is
+    # the whole reason this is not an alias:
+    #
+    #     x is (2, 3)
+    #     x.repeat(2)      REFUSES  -- repeat needs at least as many as the rank
+    #     x.tile(2)        (2, 6)   -- dims are left-padded with 1s to the rank
+    #
+    # Too MANY is the same on both (the extra dims become new leading axes), so
+    # a case built only from `len(dims) >= rank` cannot tell them apart. Padding
+    # on the LEFT rather than the right is the other half: `x.tile(2)` on a
+    # `(2,3)` is `(2, 6)`, not `(4, 3)`. Both measured.
+    def tile(self, *dims):
+        if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+            dims = tuple(dims[0])
+        dims = [int(d) for d in dims]
+        rank = len(self.shape)
+        if len(dims) < rank:
+            dims = [1] * (rank - len(dims)) + dims
+        return self.repeat(dims)
+
+    tile.__name__ = "tile"
+    tile.__qualname__ = "TensorBase.tile"
+    setattr(tensorbase, "tile", tile)
+
+    # `Tensor.outer` -- upstream has the member as well as the free function
+    # (`hasattr(torch.Tensor, "outer")` is True, measured), and `sam3_video`
+    # reaches the free one. Both are installed because a name that exists
+    # upstream and refuses here is the failure mode this file keeps hitting;
+    # the member delegates so the rank check lives in one place.
+    def outer(self, vec2):
+        return _outer_impl(self, vec2)
+
+    outer.__name__ = "outer"
+    outer.__qualname__ = "TensorBase.outer"
+    setattr(tensorbase, "outer", outer)
+
     # `Tensor.new_tensor` -- docs/ARCH26.md, `zoedepth`'s wall (through
     # `Dinov2`'s `_init_weights`, `transformers/initialization.py`'s
     # `trunc_normal_`, `torch/nn/init.py`'s `_no_grad_trunc_normal_`, which
@@ -5133,6 +5174,34 @@ def _install_nn(module, dispatch) -> None:
     ]
 
 
+def _outer_impl(input, vec2):
+    """`aten::outer(Tensor self, Tensor vec2) -> Tensor`, shared by the free
+    function and the `TensorBase` member so the rank check exists once.
+
+    A **spelling, not a kernel**, and checked as such: `aten::outer` is
+    `CompositeImplicitAutograd` and a `TorchDispatchMode` trace of
+    `torch.outer(a, b)` fires exactly two ops -- `aten.view.default` and
+    `aten.mul.Tensor` -- both of which this shim already implements and already
+    golden-compares. `expand_as`'s shape of fix (docs/KERNELS26.md §6.3).
+
+    Written through `.reshape` and `*` rather than through `dispatch` directly,
+    so it inherits the broadcasting and type promotion the `mul` path already
+    has: `outer(int64, int64)` is `int64` and `outer(int64, float32)` is
+    `float32`, both measured, neither restated here.
+
+    **Both arguments must be 1-D.** Upstream refuses a 0-D or 2-D argument and
+    names which one it was; without the check a 2-D `self` would broadcast into
+    a silently wrong shape instead of raising.
+    """
+    for name, t in (("self", input), ("vec2", vec2)):
+        rank = len(t.shape)
+        if rank != 1:
+            raise RuntimeError(
+                f"outer: Expected 1-D argument {name}, but got {rank}-D"
+            )
+    return input.reshape([input.shape[0], 1]) * vec2
+
+
 def _install_composites(module, varfns, dispatch) -> None:
     """`torch.dropout`, the other `CompositeImplicitAutograd` on the path.
 
@@ -5611,6 +5680,163 @@ def _install_composites(module, varfns, dispatch) -> None:
     conv2d.__name__ = conv2d.__qualname__ = "conv2d"
     conv2d.__module__ = "torch._C"
     setattr(varfns, "conv2d", conv2d)
+
+    def conv_transpose2d(
+        input, weight, bias=None, stride=1, padding=0, output_padding=0,
+        groups=1, dilation=1,
+    ):
+        """`torch.conv_transpose2d` -- `zoedepth`'s wall once `conv2d` and
+        `expand_as` were behind it (docs/KERNELS26.md §7).
+
+        `ZoeDepthUpsample` is `nn.ConvTranspose2d(channels, channels,
+        kernel_size=factor, stride=factor, padding=0)`, reached through
+        `F.conv_transpose2d`, which -- like `F.conv1d` and `F.conv2d` above --
+        **is** `torch.conv_transpose2d` (asserted, not assumed: `F.conv_transpose2d
+        is torch.conv_transpose2d` is True on 2.13.0). `aten::conv_transpose2d`
+        is `CompositeImplicitAutograd`, and a `TorchDispatchMode` logger shows
+        every form of the call firing exactly one record:
+
+            conv_transpose2d(x, w, b, stride=2, padding=1, output_padding=1,
+                             dilation=2)
+              -> convolution(x, w, b, [2,2], [1,1], [2,2], True, [1,1], 1)
+
+        **The signature is NOT `conv2d`'s with an extra argument.** Upstream's
+        is `(input, weight, bias, stride, padding, output_padding, groups,
+        dilation)` -- `groups` comes *before* `dilation`, where `conv2d` has
+        `dilation` before `groups`. Read off `torch.conv_transpose2d.__doc__`
+        and confirmed by calling it positionally, because transcribing
+        `conv2d`'s order here would silently swap the two for every positional
+        caller, and both are small integers that usually produce a
+        plausible-looking tensor rather than an error.
+
+        `padding` here is not `conv2d`'s: there is no `'same'`/`'valid'` form
+        (upstream's transposed signature takes no string), so a string is
+        refused rather than being given `conv2d`'s meaning.
+        """
+        def _as_list(value, n=2):
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            return [value] * n
+
+        if isinstance(padding, str):
+            raise ValueError(
+                "conv_transpose2d: padding must be an int or a pair, got "
+                f"{padding!r} -- 'same'/'valid' are conv2d's forms and upstream's "
+                "transposed signature does not accept them"
+            )
+        return dispatch(
+            "aten.convolution.default",
+            input,
+            weight,
+            bias,
+            _as_list(stride),
+            _as_list(padding),
+            _as_list(dilation),
+            True,
+            _as_list(output_padding),
+            groups,
+        )
+
+    conv_transpose2d.__name__ = conv_transpose2d.__qualname__ = "conv_transpose2d"
+    conv_transpose2d.__module__ = "torch._C"
+    setattr(varfns, "conv_transpose2d", conv_transpose2d)
+
+    def norm_except_dim(v, pow=2, dim=0):
+        """`torch.norm_except_dim` -- the piece of `weight_norm` that a traced
+        sweep cannot see (docs/KERNELS26.md §8.3).
+
+        `aten::norm_except_dim` is `CompositeImplicitAutograd`, and it is called
+        from `_WeightNorm.right_inverse`, which `ParametrizationList.__init__`
+        runs at **construction** time. ARCH26.md §6's trace ran on a forward, so
+        it found `_weight_norm_interface` and missed this one entirely.
+
+        A `TorchDispatchMode` on 2.13.0 shows what it decomposes to, and it is
+        not one shape:
+
+            dim=0  or  dim=v.dim()-1  ->  view, norm.ScalarOpt_dim, view
+            a middle dim              ->  transpose, clone, view, norm..., view, transpose
+            dim=-1                    ->  norm.Scalar   (the whole-tensor norm)
+
+        Those are three routes to one answer: **keep axis `dim`, reduce every
+        other axis, keepdim** -- checked against
+        `v.pow(2).sum(other_dims, keepdim=True).sqrt()` for dim 0, 1 and 2 of a
+        3-D tensor, and against `v.norm()` for `dim=-1`. So this is written as
+        that one statement rather than as upstream's three, since
+        `aten.norm.ScalarOpt_dim` accepts a multi-axis `dim` list directly
+        (measured: `norm(x, 2, [0, 1])` reduces both).
+
+        `dim=-1` is upstream's "no axis is exempt" spelling and gives a 0-d
+        result, not a `v.dim()-1` reduction -- it is the one value of `dim` that
+        does NOT mean an axis index here, which is why it is a branch rather
+        than a normalisation.
+        """
+        rank = len(v.shape)
+        if dim == -1:
+            dims = list(range(rank))
+            keepdim = False
+        else:
+            axis = dim if dim >= 0 else dim + rank
+            if not 0 <= axis < rank:
+                raise IndexError(
+                    f"norm_except_dim: dimension out of range (expected to be in "
+                    f"range of [{-rank}, {rank - 1}], but got {dim})"
+                )
+            dims = [d for d in range(rank) if d != axis]
+            keepdim = True
+        return dispatch("aten.norm.ScalarOpt_dim", v, pow, dims, keepdim)
+
+    norm_except_dim.__name__ = norm_except_dim.__qualname__ = "norm_except_dim"
+    norm_except_dim.__module__ = "torch._C"
+    setattr(varfns, "norm_except_dim", norm_except_dim)
+
+    def _weight_norm(v, g, dim=0):
+        """`torch._weight_norm` -- what `_WeightNorm.forward` calls.
+
+        `aten::_weight_norm` is `CompositeImplicitAutograd` and a
+        `TorchDispatchMode` shows it firing exactly one record,
+        `aten._weight_norm_interface.default`, whose second result (the norms)
+        it discards. So this is that call and a `[0]`.
+
+        `_weight_norm_interface` only accepts `dim == 0` or `dim == v.dim()-1`
+        (upstream trips an internal assertion otherwise). Both measured callers
+        are inside that -- `vits` uses the default `dim=0`, `sew_d` passes
+        `dim=2` on a 3-D `Conv1d` weight -- and a middle dim is refused by the
+        kernel with a message that says so.
+        """
+        return dispatch("aten._weight_norm_interface.default", v, g, dim)[0]
+
+    _weight_norm.__name__ = _weight_norm.__qualname__ = "_weight_norm"
+    _weight_norm.__module__ = "torch._C"
+    setattr(varfns, "_weight_norm", _weight_norm)
+
+    def outer(input, vec2):
+        """`torch.outer` -- `sam3_video`'s wall once `div.Tensor_mode` was behind
+        it, and the third line of the same `Sam3ViTRotaryEmbedding.__init__`
+        that `remainder` and `div` were the first two of.
+
+        Upstream has the member as well (`hasattr(torch.Tensor, "outer")` is
+        True), so both are installed and both go through `_outer_impl`, whose
+        docstring carries the measurement.
+        """
+        return _outer_impl(input, vec2)
+
+    outer.__name__ = outer.__qualname__ = "outer"
+    outer.__module__ = "torch._C"
+    setattr(varfns, "outer", outer)
+
+    def tile(input, *dims):
+        """`torch.tile` -- the free-function spelling of `TensorBase.tile`.
+
+        Upstream has both (`hasattr(torch, "tile")` is True, measured), and both
+        accept the dims either as one sequence or as varargs. Delegates to the
+        member so the left-padding rule lives in exactly one place -- see the
+        comment there for why `tile` is not an alias for `repeat`.
+        """
+        return input.tile(*dims)
+
+    tile.__name__ = tile.__qualname__ = "tile"
+    tile.__module__ = "torch._C"
+    setattr(varfns, "tile", tile)
 
     # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
     #

@@ -44,6 +44,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._softmax.default",
     "aten._to_copy.default",
     "aten._unsafe_view.default",
+    "aten._weight_norm_interface.default",
     "aten.abs.default",
     "aten.add.Tensor",
     "aten.add_.Scalar",
@@ -75,7 +76,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.cos.default",
     "aten.cumsum.default",
     "aten.detach.default",
+    "aten.div.Scalar_mode",
     "aten.div.Tensor",
+    "aten.div.Tensor_mode",
     "aten.div_.Tensor",
     "aten.embedding.default",
     "aten.empty.memory_format",
@@ -132,8 +135,10 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.neg.default",
     "aten.neg_.default",
     "aten.new_ones.default",
+    "aten.norm.ScalarOpt_dim",
     "aten.normal_.default",
     "aten.ones.default",
+    "aten.ones_like.default",
     "aten.permute.default",
     "aten.pow.Scalar",
     "aten.pow.Tensor_Scalar",
@@ -1275,6 +1280,10 @@ fn aten_dispatch_inner(
         "aten.mul.Scalar" => arith_scalar(py, args, kwargs, "aten.mul.Scalar", Arith::Mul),
         "aten.div.Tensor" => arith_tensor(py, args, kwargs, "aten.div.Tensor", Arith::Div),
         "aten.div.Scalar" => arith_scalar(py, args, kwargs, "aten.div.Scalar", Arith::Div),
+        "aten.norm.ScalarOpt_dim" => norm_scalaropt_dim(py, args, kwargs),
+        "aten._weight_norm_interface.default" => weight_norm_interface_default(py, args, kwargs),
+        "aten.div.Tensor_mode" => div_mode(py, args, kwargs, "aten.div.Tensor_mode", false),
+        "aten.div.Scalar_mode" => div_mode(py, args, kwargs, "aten.div.Scalar_mode", true),
         "aten.matmul.default" => matmul_default(py, args, kwargs),
 
         "aten.eq.Tensor" => compare_tensor(py, args, kwargs, "aten.eq.Tensor", Cmp::Eq),
@@ -1393,6 +1402,7 @@ fn aten_dispatch_inner(
         "aten.softplus.default" => softplus_default(py, args, kwargs),
         "aten.convolution.default" => convolution_default(py, args, kwargs),
         "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
+        "aten.ones_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.ones_like.default"),
         "aten.empty_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.empty_like.default"),
         "aten.ge.Scalar" => compare_scalar(py, args, kwargs, "aten.ge.Scalar", Cmp::Ge),
         // The last of the six comparisons to get its Tensor overload. `le`,
@@ -7205,6 +7215,639 @@ fn remainder_op(
     finish(py, out, tag)
 }
 
+/// Which of the three functions `rounding_mode` selects.
+///
+/// **These are three different functions, not one function with a flag.** They
+/// differ in dtype (`True` promotes an integral pair to the default float;
+/// the other two preserve it), in whether division by zero raises, and -- for
+/// `Trunc` vs `Floor` -- in the answer itself. See `div_mode`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoundMode {
+    /// `rounding_mode=None`: true division. Exactly `aten.div.Tensor`.
+    True,
+    /// `rounding_mode="trunc"`: round the quotient toward zero.
+    Trunc,
+    /// `rounding_mode="floor"`: round the quotient toward negative infinity.
+    Floor,
+}
+
+/// Reads the `rounding_mode` slot of `div.{Tensor,Scalar}_mode`.
+///
+/// The schema is `*, str? rounding_mode` -- keyword-only and, in
+/// `native_functions.yaml`, without a default. That absence is what keeps the
+/// four `div` overloads apart in `overloads.json`: `torch.div(a, b)` cannot
+/// bind `div.Tensor_mode` because the required keyword is missing, so it falls
+/// through to `div.Tensor`. Reading index 2 as well as the name costs nothing
+/// and matches every other kernel in this file, which is why it is done here
+/// even though upstream's own binder refuses `torch.div(a, b, "floor")`
+/// positionally (measured: `TypeError: div() received an invalid combination
+/// of arguments`).
+///
+/// An unrecognised string is upstream's `RuntimeError`, reproduced verbatim
+/// with no shim prefix -- the convention `remainder`'s `'Bool'` refusal
+/// follows, because a caller matching on the message should not have to know
+/// which side produced it. Measured on 2.13.0 for `'ceil'`, `''`, `'FLOOR'`
+/// and `'Floor'`: the match is exact and case-sensitive.
+fn rounding_mode_arg(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<RoundMode> {
+    let value = match optional(args, kwargs, 2, "rounding_mode")? {
+        Some(value) if !value.is_none() => value,
+        _ => return Ok(RoundMode::True),
+    };
+    let name = value.extract::<String>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "{op}: argument 'rounding_mode' must be None, 'trunc' or 'floor', got {}",
+            value.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+    match name.as_str() {
+        "trunc" => Ok(RoundMode::Trunc),
+        "floor" => Ok(RoundMode::Floor),
+        other => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "div expected rounding_mode to be one of None, 'trunc', or 'floor' \
+             but found '{other}'"
+        ))),
+    }
+}
+
+/// Rounds an `f64` to the precision of `tag`, so that the arithmetic below
+/// runs at the dtype the *result* is stored in.
+///
+/// **This is not a detail.** `read_flat` hands every floating dtype over as
+/// `f64`, and computing there and narrowing once at the end is the obvious
+/// thing to do -- it is also measurably wrong. Upstream computes `div_floor`
+/// and `div_trunc` in the tensor's own `scalar_t`, and past each dtype's
+/// integer-exactness limit the two disagree: over 42436 `float32` pairs,
+/// computing in `f64` and narrowing missed **68** of `floor` and **358** of
+/// `trunc` (`16777216.0 / 1.3669793605804443` is `12273204.0` upstream and
+/// `12273203.0` that way). `float16` and `bfloat16` were checked the same way
+/// and want their own precision too, not `f32`'s: computing in `f32` missed 4
+/// and 3 of 154 for `f16`. With per-dtype rounding threaded through every
+/// intermediate, all four dtypes matched upstream on every pair.
+///
+/// So the returned closure is applied after each arithmetic step, not once at
+/// the end.
+fn float_narrower(tag: TorchDType) -> fn(f64) -> f64 {
+    match tag {
+        TorchDType::Float64 => |x| x,
+        TorchDType::Float32 => |x| x as f32 as f64,
+        TorchDType::Float16 => |x| half::f16::from_f64(x).to_f64(),
+        TorchDType::BFloat16 => |x| half::bf16::from_f64(x).to_f64(),
+        // Every other floating dtype is one `PyDtype::storage()` refuses, so
+        // the operands could not have been built. Identity keeps this total.
+        _ => |x| x,
+    }
+}
+
+/// `rounding_mode="floor"` on a floating pair, transcribed from upstream's
+/// `div_floor_floating` rather than derived from the name.
+///
+/// **`floor(a / b)` is the plausible implementation and it is wrong.**
+/// Measured on 2.13.0: `inf / 3.0` is **`nan`**, not `inf`; `5.0 / -inf` is
+/// **`-1.0`**, not `-0.0`; `-0.5 / 3.0` is `-1.0`; and `-0.0 / 3.0` keeps its
+/// sign bit. All four fall out of the algorithm below and none is special-cased
+/// here.
+///
+/// The shape of it, and why each line is there:
+///
+/// * **`b == 0` returns the IEEE quotient unrounded.** Upstream has this as an
+///   explicit early return, and it is the reason `5.0 / 0.0` is `inf` while
+///   `inf / 3.0` -- which does *not* take this path -- is `nan`.
+/// * `mod = fmod(a, b)`, then `div = (a - mod) / b`: the exact quotient when
+///   the division is exact, which is what makes the correction below safe.
+///   `fmod(inf, 3.0)` is NaN, and that NaN is what propagates to give upstream's
+///   `nan`. Rust's `%` on `f64` is C's `fmod`; Python's `math.fmod` is *not*
+///   (it raises on `inf`), which is worth recording because the model used to
+///   verify this had to be corrected for exactly that.
+/// * the `(b < 0) != (mod < 0)` correction is `remainder`'s, one level up: it
+///   turns a truncated quotient into a floored one.
+/// * the `div - floordiv > 0.5` nudge recovers the case where `(a - mod) / b`
+///   lands just under an integer through rounding.
+/// * `copysign(0, a / b)` for a zero quotient is what preserves `-0.0`.
+///
+/// Verified as an algorithm, not as a table of corners: over 10609 `f64` pairs
+/// built from infinities, NaNs, signed zeros, subnormals and randoms, this
+/// reproduces upstream **bit for bit, 10609/10609**, compared on the bytes so
+/// that `-0.0` and NaN are not read as equal to their opposites.
+fn div_floor_float(a: f64, b: f64, narrow: fn(f64) -> f64) -> f64 {
+    if b == 0.0 {
+        return narrow(a / b);
+    }
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    let m = narrow(a % b);
+    let mut div = narrow(narrow(a - m) / b);
+    if m != 0.0 && (b < 0.0) != (m < 0.0) {
+        div = narrow(div - 1.0);
+    }
+    if div.is_nan() || div.is_infinite() {
+        return div;
+    }
+    if div != 0.0 {
+        let mut floordiv = div.floor();
+        if div - floordiv > 0.5 {
+            floordiv += 1.0;
+        }
+        narrow(floordiv)
+    } else {
+        // `-0.0` survives here and only here. `copysign` rather than a sign
+        // test, because the sign being carried is the one `==` cannot see.
+        narrow(0.0f64.copysign(a / b))
+    }
+}
+
+/// `rounding_mode="trunc"` on a floating pair: round the quotient toward zero.
+///
+/// Simpler than `floor` -- there is no correction and no early return, because
+/// truncation of `inf`, `-inf` and `nan` is already those values. Verified over
+/// the same 10609 pairs, **10609/10609 bit-identical**, including `-0.5 / 3.0`
+/// answering `-0.0` (sign bit set) where a naive `as i64 as f64` would give
+/// `+0.0`.
+fn div_trunc_float(a: f64, b: f64, narrow: fn(f64) -> f64) -> f64 {
+    let q = narrow(a / b);
+    if q.is_nan() || q.is_infinite() {
+        return q;
+    }
+    narrow(q.trunc())
+}
+
+/// `aten::div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode)`
+/// and `aten::div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode)`.
+///
+/// `sam3_video`'s `Sam3ViTRotaryEmbedding.__init__` builds its rotary position
+/// grid two lines apart: `flattened_indices % end_x` for the x axis, which is
+/// the `remainder` kernel above, and
+/// `torch.div(flattened_indices, end_x, rounding_mode="floor")` for the y axis,
+/// which is this one (`modeling_sam3.py:428`). It is the wall that architecture
+/// landed on the moment `remainder` existed.
+///
+/// **The three modes are three functions.** Measured on 2.13.0:
+///
+/// ```text
+///          a    b   None    trunc  floor
+///          7    3    2.33     2      2
+///          7   -3   -2.33    -2     -3     <- trunc and floor DISAGREE
+///         -7    3   -2.33    -2     -3     <- trunc and floor DISAGREE
+///         -7   -3    2.33     2      2
+///         -6    3   -2.0     -2     -2     <- opposite signs, but EXACT: agree
+///   dtype(int64)      float32  int64  int64
+/// ```
+///
+/// `trunc` and `floor` differ **exactly when the operands' signs differ and the
+/// division is inexact** -- checked rather than asserted, over 210 integer
+/// pairs: they disagree on 64 of them, that set has no same-sign member and no
+/// exact-division member, and it is precisely the 64 opposite-sign inexact
+/// pairs. So a case set built from positive operands passes either
+/// implementation, and one built from opposite signs but exact division
+/// (`-6 / 3`) passes both too. Both the golden builder and the pytest carry all
+/// three kinds.
+///
+/// **`rounding_mode=None` is delegated, not restated.** It is true division and
+/// therefore literally `aten.div.Tensor`/`aten.div.Scalar` -- same promotion to
+/// the default float, same answer, same division-by-zero behaviour (`inf`, no
+/// raise). Calling those keeps one implementation rather than two that have to
+/// be kept in agreement.
+///
+/// **Dtype for the two rounding modes preserves rather than promotes**, which is
+/// the visible difference from `None`: `int64 / int64` stays `int64` under
+/// `trunc`/`floor` and becomes `float32` under `None` (measured). The tensor
+/// form follows `torch.promote_types` exactly -- checked cell by cell over the
+/// seven storable numeric dtypes, 49 pairs, no disagreements. The scalar form
+/// follows the wrapped-number rule `remainder.Scalar` already implements: an int
+/// scalar never widens the tensor, a float scalar floats an integral one.
+///
+/// **The scalar is narrowed into the result dtype before the division**, and it
+/// is observable in exactly the way `remainder`'s is:
+/// `div(uint8(200), -3, rounding_mode="floor")` is **`0`**, because `-3` becomes
+/// `253` in `uint8`. Building the scalar as a 0-D tensor at the result storage
+/// reproduces that instead of restating it.
+///
+/// **Division by zero splits by category, and by mode.** An integral divisor of
+/// `0` raises `RuntimeError('ZeroDivisionError')` -- upstream's message is that
+/// bare string -- but *only* under `trunc`/`floor`; under `None` the same call
+/// promotes to float and answers `inf`/`nan` with no raise. A floating divisor
+/// never raises under any mode. All six combinations measured.
+///
+/// **`i64::MIN / -1` answers `i64::MIN`** under both rounding modes (measured),
+/// where the quotient overflows. `wrapping_div`/`wrapping_rem` are used for
+/// exactly that pair, as `remainder` uses `wrapping_rem` -- a Rust overflow
+/// panic here would cross the FFI boundary as a `PanicException`, which is not
+/// a refusal.
+///
+/// **Bool.** `div.Tensor_mode` on a bool pair raises upstream's own
+/// `"div_trunc_cpu" not implemented for 'Bool'` (or `div_floor_cpu`),
+/// reproduced verbatim. `div.Scalar_mode` on a bool tensor is refused here and
+/// upstream computes -- the same deliberate gap `remainder.Scalar` has, for the
+/// same reason: the rule is a fast-path ladder keyed on the scalar's *Python*
+/// type (`div(bool_t, 2, "floor")` is `int64`, `div(bool_t, 2.0, "floor")` is
+/// `float32`, `div(bool_t, True, "floor")` raises), and `scalar_arg` has erased
+/// `True` into `Scalar::Int(1)` before this kernel runs. Golden carries it as
+/// `c_error` so the gap is watched rather than filed away.
+fn div_mode(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    scalar_form: bool,
+) -> PyResult<Py<PyAny>> {
+    let mode = rounding_mode_arg(op, args, kwargs)?;
+    if mode == RoundMode::True {
+        // True division, which is `div.Tensor`/`div.Scalar` exactly.
+        return if scalar_form {
+            arith_scalar(py, args, kwargs, op, Arith::Div)
+        } else {
+            arith_tensor(py, args, kwargs, op, Arith::Div)
+        };
+    }
+    // Upstream names the kernel, not the op, in its `'Bool'` refusal.
+    let kernel = if mode == RoundMode::Trunc {
+        "div_trunc_cpu"
+    } else {
+        "div_floor_cpu"
+    };
+
+    let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+    let left = lhs.tensor()?;
+
+    let (tag, right_dims) = if scalar_form {
+        let other =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        if lhs.tag() == TorchDType::Bool {
+            return Err(not_implemented(format!(
+                "{op}: a torch.bool tensor with a numeric scalar promotes through a \
+                 fast-path ladder keyed on the scalar's Python type (int64 for an int, \
+                 float32 for a float, and upstream raises for a bool), which is not \
+                 implemented in torch._C shim"
+            )));
+        }
+        let mut tag = lhs.tag();
+        if !other.is_int() && !tag.is_floating_point() {
+            tag = default_float();
+        }
+        (tag, left.dims().to_vec())
+    } else {
+        let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+        if lhs.tag() == TorchDType::Bool || rhs.tag() == TorchDType::Bool {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "\"{kernel}\" not implemented for 'Bool'"
+            )));
+        }
+        let tag = promote_operands(op, &lhs, &rhs)?;
+        (tag, rhs.tensor()?.dims().to_vec())
+    };
+
+    let storage = PyDtype::new(tag).storage(op)?;
+    let shape = if scalar_form {
+        left.dims().to_vec()
+    } else {
+        broadcast_shape(op, left.dims(), &right_dims)?
+    };
+
+    let a = left
+        .fast_to(storage)
+        .and_then(|t| t.broadcast_as(shape.clone()))
+        .map_err(|e| candle_err(op, e))?;
+    let b = if scalar_form {
+        let scalar =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        // Narrowed to `storage` first: see the doc comment's `uint8` case.
+        let filled = if storage.is_int() {
+            Tensor::full(scalar.as_i64(), (), left.device())
+        } else {
+            Tensor::full(scalar.as_f64(), (), left.device())
+        };
+        filled
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    } else {
+        tensor_arg(op, args, kwargs, 1, "other")?
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    };
+
+    let values = match (read_flat(op, &a, tag)?, read_flat(op, &b, tag)?) {
+        (Flat::Float(x), Flat::Float(y)) => {
+            let narrow = float_narrower(tag);
+            let f = if mode == RoundMode::Trunc {
+                div_trunc_float
+            } else {
+                div_floor_float
+            };
+            Flat::Float(x.into_iter().zip(y).map(|(p, q)| f(p, q, narrow)).collect())
+        }
+        (Flat::Int(x), Flat::Int(y)) => {
+            let mut out = Vec::with_capacity(x.len());
+            for (p, q) in x.into_iter().zip(y) {
+                if q == 0 {
+                    // Upstream's message is this bare string, on an integral
+                    // dtype only -- floats fall in the arm above and answer
+                    // inf/nan without raising.
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err("ZeroDivisionError"));
+                }
+                // Wrapping for the `i64::MIN / -1` pair, whose quotient
+                // overflows; upstream answers `i64::MIN` there.
+                let quotient = p.wrapping_div(q);
+                out.push(if mode == RoundMode::Trunc {
+                    quotient
+                } else {
+                    let rem = p.wrapping_rem(q);
+                    if rem != 0 && (rem < 0) != (q < 0) {
+                        quotient.wrapping_sub(1)
+                    } else {
+                        quotient
+                    }
+                });
+            }
+            Flat::Int(out)
+        }
+        // Unreachable: both sides are read at the same `tag`, so they are the
+        // same `Flat` arm by construction. An `unreachable!()` here would be a
+        // panic across the FFI boundary.
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: operands read at different categories -- internal error"
+            )))
+        }
+    };
+    let out = write_flat(op, values, shape, left.device(), tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::norm.ScalarOpt_dim(Tensor self, Scalar? p, int[1] dim,
+///     bool keepdim=False) -> Tensor`
+///
+/// The kernel docs/KERNELS26.md §5.4 found behind `weight_norm`, and §8.3's
+/// correction to ARCH26.md: `weight_norm` costs **three** pieces, not two, and
+/// this is the one that was invisible to a traced sweep because
+/// `torch.norm_except_dim` is a composite and it is called at *construction*
+/// rather than in a forward.
+///
+/// **`p` is a general real exponent, not a flag.** Measured on 2.13.0 across
+/// the whole family rather than only the `p=2` that `norm_except_dim` passes:
+///
+/// ```text
+/// p = None    same as p = 2 (the Frobenius default)
+/// p = 0       the COUNT of non-zero elements, not a sum of anything
+/// p = +inf    max |x|
+/// p = -inf    min |x|
+/// p = 1       sum |x|
+/// otherwise   (sum |x|^p)^(1/p), including fractional and NEGATIVE p
+/// ```
+///
+/// The negative-`p` rows are the ones that catch a special-cased
+/// implementation: `norm([[0, 0], [1, 2]], p=-1, dim=1)` is `[0.0, 0.6666...]`
+/// — the zero row gives `|0|^-1 = inf`, a sum of `inf`, and `inf^(-1) = 0`. It
+/// falls straight out of the general formula and has to be special-cased *not*
+/// to happen.
+///
+/// **An empty `dim` list reduces every axis** (measured: `norm(x, 2, [])` on a
+/// 2x2 is a scalar), which is the opposite of the usual "no dims means no
+/// reduction" reading. A repeated dim raises upstream's
+/// `dim 0 appears multiple times in the list of dims`, reproduced.
+///
+/// **Integral and boolean input raise**, with upstream's own wording:
+/// `norm(): input dtype should be either floating point or complex. Got Long
+/// instead.` — the `scalar_type_name` spelling (`Long`, `Bool`), which is the
+/// third of the four namings docs/KERNELS26.md §5.2 tabulates.
+///
+/// Dtype is preserved, including `float16` and `bfloat16` (measured: a `f16`
+/// input gives a `f16` norm), so this does not promote the way a reduction
+/// that accumulated in `f32` would.
+fn norm_scalaropt_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.norm.ScalarOpt_dim";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "norm(): input dtype should be either floating point or complex. Got {} instead.",
+            scalar_type_name(tag)
+        )));
+    }
+    // `Scalar? p` -- absent and `None` are both the Frobenius default.
+    let p = scalar_arg(OP, args, kwargs, 1, "p")?
+        .map(|s| s.as_f64())
+        .unwrap_or(2.0);
+    let dims_raw = shape_arg(OP, args, kwargs, 2, "dim")?;
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+
+    let t = input.tensor()?;
+    let rank = t.rank();
+    // An empty list means "every axis", measured. `normalise_dim` gives the
+    // negative-index convention and upstream's out-of-range message.
+    let dims: Vec<usize> = if dims_raw.is_empty() {
+        (0..rank.max(1)).collect()
+    } else {
+        dims_raw
+            .iter()
+            .map(|&d| normalise_dim(OP, d, rank))
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    let mut seen = dims.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    if seen.len() != dims.len() {
+        // Upstream names the first repeat, not the count.
+        let mut counted: Vec<usize> = Vec::new();
+        for d in &dims {
+            if counted.contains(d) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "dim {d} appears multiple times in the list of dims"
+                )));
+            }
+            counted.push(*d);
+        }
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let x = t.fast_to(storage).map_err(|e| candle_err(OP, e))?;
+    let abs = x.abs().map_err(|e| candle_err(OP, e))?;
+    // Reduced one axis at a time with `keepdim`, then squeezed at the end if
+    // asked -- reducing several at once would need the axes renumbered after
+    // each collapse, which is exactly the kind of index bookkeeping that goes
+    // wrong silently on a non-square tensor.
+    let reduce_sum = |v: &Tensor| -> PyResult<Tensor> {
+        let mut acc = v.clone();
+        for &d in &dims {
+            acc = acc.sum_keepdim(d).map_err(|e| candle_err(OP, e))?;
+        }
+        Ok(acc)
+    };
+    let out = if p == 0.0 {
+        // The count of non-zero elements. `ne(0)` gives a mask; summing it in
+        // the value dtype is the count.
+        let mask = abs
+            .ne(0.0)
+            .and_then(|m| m.to_dtype(storage))
+            .map_err(|e| candle_err(OP, e))?;
+        reduce_sum(&mask)?
+    } else if p == f64::INFINITY {
+        let mut acc = abs.clone();
+        for &d in &dims {
+            acc = acc.max_keepdim(d).map_err(|e| candle_err(OP, e))?;
+        }
+        acc
+    } else if p == f64::NEG_INFINITY {
+        let mut acc = abs.clone();
+        for &d in &dims {
+            acc = acc.min_keepdim(d).map_err(|e| candle_err(OP, e))?;
+        }
+        acc
+    } else if p == 1.0 {
+        reduce_sum(&abs)?
+    } else if p == 2.0 {
+        // `sqrt` of the sum of squares rather than `powf(0.5)`: the same
+        // reason docs/SEQLEN.md §3 squares by multiplying, and it keeps the
+        // exactly-representable cases exact.
+        let sq = abs.sqr().map_err(|e| candle_err(OP, e))?;
+        reduce_sum(&sq)?.sqrt().map_err(|e| candle_err(OP, e))?
+    } else {
+        let powed = abs.powf(p).map_err(|e| candle_err(OP, e))?;
+        reduce_sum(&powed)?
+            .powf(1.0 / p)
+            .map_err(|e| candle_err(OP, e))?
+    };
+    let out = if keepdim {
+        out
+    } else {
+        // Squeeze from the highest axis down, so the earlier indices stay valid.
+        let mut squeezed = out;
+        let mut ordered = dims.clone();
+        ordered.sort_unstable();
+        for &d in ordered.iter().rev() {
+            squeezed = squeezed.squeeze(d).map_err(|e| candle_err(OP, e))?;
+        }
+        squeezed
+    };
+    finish(py, out, tag)
+}
+
+/// `aten::_weight_norm_interface(Tensor v, Tensor g, int dim=0)
+///     -> (Tensor, Tensor)`
+///
+/// The second of `weight_norm`'s three pieces, and the one ARCH26.md §6 did
+/// find -- it fires in the *forward*, where `norm.ScalarOpt_dim` above only
+/// fires at construction.
+///
+/// ```text
+/// norms = norm_except_dim(v, 2, dim)        keep `dim`, reduce every other axis
+/// out   = v * (g / norms)
+/// ```
+///
+/// Both asserted against upstream rather than taken from the formula:
+/// `norms` equals `torch.norm_except_dim(v, 2, dim)` and `out` equals
+/// `v * (g / norms)`, on real tensors.
+///
+/// **`dim` must be `0` or `v.dim() - 1`.** Upstream does not raise a friendly
+/// error for anything else -- it trips an `INTERNAL ASSERT FAILED
+/// (dim == 0 || dim == v.dim() - 1)`. Both live callers sit inside that: `vits`
+/// takes the default `dim=0`, `sew_d` passes `dim=2` on a 3-D `Conv1d` weight,
+/// which is `v.dim() - 1`. A middle dim is refused here by name rather than
+/// reproducing an internal assertion.
+///
+/// **The norms come back `float32` for a `float16`/`bfloat16` input** while the
+/// output keeps the input's dtype -- measured, and not a rule that follows from
+/// anything else in this file, so it is read off rather than derived. `float32`
+/// and `float64` inputs give norms of their own dtype.
+///
+/// A `v`/`g` dtype mismatch raises upstream (`expected scalar type Float but
+/// found Double`) rather than promoting, and integral input raises
+/// `"weight_norm_kernel" not implemented for 'Long'`. Both reproduced.
+///
+/// A zero row is not special-cased: upstream answers `nan` for it (the norm is
+/// `0` and the division is `g / 0`), and so does this.
+fn weight_norm_interface_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._weight_norm_interface.default";
+    let v = tensor_arg(OP, args, kwargs, 0, "v")?;
+    let g = tensor_arg(OP, args, kwargs, 1, "g")?;
+    let dim = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0);
+
+    let tag = v.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"weight_norm_kernel\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    if g.tag() != tag {
+        // Upstream's wording, which names the C++ type rather than the torch
+        // dtype -- the `c10_name` column of §5.2's table, capitalised.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected scalar type {} but found {}",
+            scalar_type_name(tag),
+            scalar_type_name(g.tag())
+        )));
+    }
+
+    let vt = v.tensor()?;
+    let rank = vt.rank();
+    let axis = normalise_dim(OP, dim, rank)?;
+    if rank > 0 && axis != 0 && axis != rank - 1 {
+        return Err(not_implemented(format!(
+            "{OP}: dim must be 0 or v.dim() - 1, got {dim} for a {rank}-D v -- \
+             upstream trips an internal assertion here rather than raising, and \
+             both measured callers (vits at dim=0, sew_d at dim=v.dim()-1) sit \
+             inside the supported range"
+        )));
+    }
+
+    // **The whole computation runs in `float32` for a reduced-float input**,
+    // and that is not a choice made here -- it is *why* upstream's `norms` come
+    // back `float32` while `out` keeps the input's dtype.
+    //
+    // Computing the norm in `float16` and merely casting the result up is a
+    // different number, and the golden cases measured it as one: for a
+    // `float16` `(2,3)` v, upstream's norm is `2.4494898319244385` -- the
+    // `float32` value of `sqrt(6)` -- where narrow-then-widen gives
+    // `2.4492188`. So `norm_tag` is the dtype the arithmetic *happens* in, and
+    // the `float32` result dtype is a consequence rather than a separate rule.
+    let norm_tag = match tag {
+        TorchDType::Float16 | TorchDType::BFloat16 => TorchDType::Float32,
+        other => other,
+    };
+    let compute = PyDtype::new(norm_tag).storage(OP)?;
+    let x = vt.fast_to(compute).map_err(|e| candle_err(OP, e))?;
+    // `norm_except_dim(v, 2, dim)`: keep `axis`, reduce every other axis,
+    // keepdim so the result broadcasts back against `v`.
+    let mut norms = x.sqr().map_err(|e| candle_err(OP, e))?;
+    for d in 0..rank {
+        if d != axis {
+            norms = norms.sum_keepdim(d).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    let norms = norms.sqrt().map_err(|e| candle_err(OP, e))?;
+    let gt = g.tensor()?.fast_to(compute).map_err(|e| candle_err(OP, e))?;
+    // `out` is computed in the widened dtype too and narrowed once, at the end.
+    let out_storage = PyDtype::new(tag).storage(OP)?;
+    let out = gt
+        .broadcast_div(&norms)
+        .and_then(|scale| x.broadcast_mul(&scale))
+        .and_then(|t| t.to_dtype(out_storage))
+        .map_err(|e| candle_err(OP, e))?;
+
+    // Promoted element by element: `promote` at the dispatcher's exit does not
+    // look inside a tuple, the same reason `native_layer_norm` promotes its own.
+    let pair = [
+        crate::tensor::promote(py, finish(py, out, tag)?)?,
+        crate::tensor::promote(py, finish(py, norms, norm_tag)?)?,
+    ];
+    Ok(PyTuple::new(py, pair)?.into_any().unbind())
+}
+
 /// `aten::repeat(Tensor self, SymInt[] repeats) -> Tensor`
 ///
 /// **Tiling, not broadcasting.** `expand` above produces a view whose strides
@@ -9734,15 +10377,10 @@ fn convolution_default(
     let output_padding = shape_arg(OP, args, kwargs, 7, "output_padding")?;
     let groups = required(OP, args, kwargs, 8, "groups")?.extract::<i64>()?;
 
-    if transposed {
+    if !transposed && output_padding.iter().any(|&v| v != 0) {
         return Err(not_implemented(format!(
-            "{OP}: transposed convolution not implemented in torch._C shim"
-        )));
-    }
-    if output_padding.iter().any(|&v| v != 0) {
-        return Err(not_implemented(format!(
-            "{OP}: a non-zero output_padding is not implemented in torch._C shim \
-             (only meaningful for transposed convolution, which is also not implemented)"
+            "{OP}: a non-zero output_padding is only meaningful for a transposed \
+             convolution, and is not implemented for a forward one in torch._C shim"
         )));
     }
     // 1-D (3-D input) and 2-D (4-D input). `spatial` is how many trailing
@@ -9786,6 +10424,11 @@ fn convolution_default(
     let stride = expand("stride", stride)?;
     let padding = expand("padding", padding)?;
     let dilation = expand("dilation", dilation)?;
+    let output_padding = if transposed {
+        expand("output_padding", output_padding)?
+    } else {
+        output_padding
+    };
     if stride.iter().any(|&v| v <= 0)
         || padding.iter().any(|&v| v < 0)
         || dilation.iter().any(|&v| v <= 0)
@@ -9805,13 +10448,64 @@ fn convolution_default(
     // ARCH26.md §3.2 stopped on, is `nn.Conv2d(3, hidden, kernel_size=16,
     // stride=16)` -- square kernel, square stride, no padding.
     if spatial == 2 {
-        for (name, v) in [("stride", &stride), ("padding", &padding), ("dilation", &dilation)] {
+        let mut axed: Vec<(&str, &Vec<isize>)> =
+            vec![("stride", &stride), ("padding", &padding), ("dilation", &dilation)];
+        if transposed {
+            axed.push(("output_padding", &output_padding));
+        }
+        for (name, v) in axed {
             if v[0] != v[1] {
                 return Err(not_implemented(format!(
                     "{OP}: an asymmetric {name} {v:?} is not implemented in torch._C shim \
                      -- candle's conv2d takes one value per argument, not one per axis"
                 )));
             }
+        }
+    }
+    // --- transposed convolution: what is implemented, and what is refused ---
+    //
+    // `zoedepth`'s `ZoeDepthUpsample` is `nn.ConvTranspose2d(channels, channels,
+    // kernel_size=factor, stride=factor, padding=0)` -- 2-D, groups=1, square
+    // everything. That is what this implements; the rest is refused by name.
+    //
+    // **candle's `conv_transpose2d` has no `groups` parameter** (its
+    // `conv_transpose1d` does, and its `ParamsConvTranspose2D` simply has no
+    // field for it), so a grouped transposed convolution cannot be handed to it
+    // and is refused rather than silently computed as `groups=1` -- which would
+    // produce a tensor of the wrong *shape* here, but only because `c_out` is
+    // read off the weight; a decomposition into per-group calls is possible and
+    // is left for a round that has a caller for it.
+    if transposed {
+        if spatial != 2 {
+            return Err(not_implemented(format!(
+                "{OP}: only 2-D transposed convolution (4-D input) is implemented in \
+                 torch._C shim, got {spatial}-D"
+            )));
+        }
+        if groups != 1 {
+            return Err(not_implemented(format!(
+                "{OP}: a grouped transposed convolution (groups={groups}) is not \
+                 implemented in torch._C shim -- candle's conv_transpose2d takes no \
+                 groups argument"
+            )));
+        }
+        // Upstream's own precondition, measured: `output_padding=1` is accepted
+        // with `stride=2, dilation=1` and with `stride=1, dilation=2`, and
+        // refused with `stride=1, dilation=1`. So the bound is
+        // `max(stride, dilation)`, not `stride`. Message reproduced verbatim.
+        for i in 0..spatial {
+            if output_padding[i] >= stride[i].max(dilation[i]) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "output padding must be smaller than either stride or dilation, \
+                     but got output_padding_height: {} output_padding_width: {}",
+                    output_padding[0], output_padding[1]
+                )));
+            }
+        }
+        if output_padding.iter().any(|&v| v < 0) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: output_padding must be non-negative"
+            )));
         }
     }
     if groups <= 0 {
@@ -9831,7 +10525,55 @@ fn convolution_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let x = input.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
     let w = weight.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
-    let raw = if spatial == 1 {
+    let raw = if transposed {
+        // **The weight layout is `(in_channels, out_channels/groups, kH, kW)`,
+        // not `(out, in, kH, kW)`** -- the opposite of the forward convolution
+        // just above, and the single most dangerous line in this kernel.
+        //
+        // Established from upstream's behaviour rather than from the docs, three
+        // independent ways:
+        //
+        //   1. shape. `conv_transpose2d(x(2,3,5,7), w(3,5,2,4))` gives
+        //      `(2, 5, 6, 10)` -- `out_channels` is `w.shape[1]`. Handing it the
+        //      transposed `w(5,3,2,4)` raises `expected input[2,3,5,7] to have
+        //      5 channels, but got 3 channels`.
+        //   2. `nn.ConvTranspose2d(3, 5, kernel_size=(2,4)).weight.shape` is
+        //      `[3, 5, 2, 4]`.
+        //   3. a from-scratch scatter-add implementation of the definition
+        //      (transposed convolution = the gradient of a convolution with
+        //      respect to its input) agrees with upstream on four
+        //      configurations including `groups=2`.
+        //
+        // **The measurement had to be built on a non-square, unequal-channel
+        // case, because `zoedepth`'s own call cannot show any of this**: it is
+        // `nn.ConvTranspose2d(channels, channels, kernel_size=factor,
+        // stride=factor)` -- equal in/out channels and a square kernel, so a
+        // transposed weight has exactly the same shape and produces a plausible
+        // tensor instead of an error. Measured on `(1,2,3,3)` input with a
+        // `(2,2,3,3)` weight: swapping the first two axes changes the sum from
+        // 61317 to 54756 with no shape change, and **flipping the kernel
+        // spatially leaves the sum at 61317 while changing every element** --
+        // so even a checksum does not separate those two. The golden cases
+        // compare element by element and carry both wrong layouts as live
+        // shapes.
+        //
+        // candle's `conv_transpose2d` reads its kernel as `(c_in_k, c_out, k_h,
+        // k_w)` and bails if `c_in_k` disagrees with the input's channels, so it
+        // is the same convention and the weight is passed through unpermuted.
+        //
+        // Its argument ORDER is not `conv2d`'s: `(kernel, padding,
+        // output_padding, stride, dilation)` against `conv2d`'s `(kernel,
+        // padding, stride, dilation, groups)`. `output_padding` sits where
+        // `stride` sits in the forward call, which is another way to get a
+        // plausible tensor of the wrong shape.
+        x.conv_transpose2d(
+            &w,
+            padding[0] as usize,
+            output_padding[0] as usize,
+            stride[0] as usize,
+            dilation[0] as usize,
+        )
+    } else if spatial == 1 {
         x.conv1d(
             &w,
             padding[0] as usize,
@@ -9873,9 +10615,9 @@ fn convolution_default(
     finish(py, out, tag)
 }
 
-/// `aten::zeros_like`/`aten::empty_like(Tensor self, *, ScalarType? dtype=None,
-///     Layout? layout=None, Device? device=None, bool? pin_memory=None,
-///     MemoryFormat? memory_format=None) -> Tensor`
+/// `aten::zeros_like`/`aten::empty_like`/`aten::ones_like(Tensor self, *,
+///     ScalarType? dtype=None, Layout? layout=None, Device? device=None,
+///     bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor`
 ///
 /// `mamba`'s selective-scan state is seeded with `zeros_like(...)`, and
 /// `mixtral`'s grouped-MoE routing (`transformers`'
@@ -9885,6 +10627,12 @@ fn convolution_default(
 /// `empty.memory_format` above, "empty" answers zeros here: the shim is
 /// deterministic where upstream is not, and both measured call sites read
 /// every element back before using it.
+///
+/// **`ones_like` joins them as the same function with a different fill.** It
+/// is the wall `vits` AND `sam3_video` both landed on once `weight_norm` and
+/// `outer` were behind them -- two architectures on one one-line kernel. Unlike
+/// its two siblings its value is *defined*, so it is the only one of the three
+/// whose golden case can diff real values rather than dtype and shape alone.
 ///
 /// Structured like `new_ones_default`: the reference tensor supplies the
 /// defaults (shape always, dtype/device unless overridden) a bare factory
@@ -9910,7 +10658,12 @@ fn zeros_or_empty_like(
     }
     let device = label.resolve()?;
     let storage = PyDtype::new(tag).storage(op)?;
-    let out = Tensor::zeros(shape, storage, &device).map_err(|e| candle_err(op, e))?;
+    let out = if op == "aten.ones_like.default" {
+        Tensor::ones(shape, storage, &device)
+    } else {
+        Tensor::zeros(shape, storage, &device)
+    }
+    .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
 

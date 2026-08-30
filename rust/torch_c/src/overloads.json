@@ -389,6 +389,11 @@
     "aten::ones(SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
 
+  "ones_like": [
+    "aten::ones_like.out(Tensor self, *, MemoryFormat? memory_format=None, Tensor(a!) out) -> Tensor(a!)",
+    "aten::ones_like(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None, MemoryFormat? memory_format=None) -> Tensor"
+  ],
+
   "pow": [
     "aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)",
@@ -472,6 +477,10 @@
   "cumsum": [
     "aten::cumsum.out(Tensor self, int dim, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+
+  "detach": [
+    "aten::detach(Tensor(a) self) -> Tensor(a)"
   ],
 
   "histc": [

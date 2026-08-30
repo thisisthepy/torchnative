@@ -2642,6 +2642,866 @@ def remainder_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.norm.ScalarOpt_dim -----------------------------------------------
+#
+# The third piece of `weight_norm`, and the one docs/KERNELS26.md §8.3 records
+# as invisible to ARCH26.md's method: `torch.norm_except_dim` is a composite (so
+# the op name never appears in the source) and it is called at CONSTRUCTION,
+# while the trace that found `_weight_norm_interface` ran on a forward.
+#
+# **`p` is a general real exponent and five of its values are different
+# functions.** Measured on 2.13.0:
+#
+#     p = None   ->  same as 2
+#     p = 0      ->  the COUNT of non-zero elements
+#     p = +inf   ->  max |x|
+#     p = -inf   ->  min |x|
+#     p = 1      ->  sum |x|
+#     otherwise  ->  (sum |x|^p)^(1/p), fractional and NEGATIVE p included
+#
+# `norm_except_dim` only ever passes 2, so a case set built from the caller
+# would exercise one of those six. The negative-`p` rows are the ones that
+# catch a special-cased implementation: `norm([[0,0],[1,2]], p=-1, dim=1)` is
+# `[0.0, 0.666...]`, because `|0|^-1` is `inf`, the sum is `inf`, and
+# `inf^(-1)` is `0` -- it has to be special-cased *not* to happen.
+
+_NORM_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_NORM_PS = [None, 2, 1, 0, 3, 0.5, -1, -2, float("inf"), float("-inf")]
+
+
+def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.norm.ScalarOpt_dim"
+    cases: list[Case] = []
+
+    # A non-square 2-D tensor with mixed signs and a zero, so |x| matters, the
+    # axes are not interchangeable, and p=0 has something to count.
+    flat = [3.0, -4.0, 0.0, 1.0, -1.0, 2.0]
+    for dtype_name in _NORM_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (2, 3), dtype_name)
+        for p in _NORM_PS:
+            for dim in ([0], [1], [-1], [0, 1], []):
+                for keepdim in (False, True):
+                    cases.append(
+                        Case(
+                            name=f"norm({dtype_name}, p={p!r}, dim={dim}, keepdim={keepdim})",
+                            op=op,
+                            run_torch=lambda a_t=a_t, p=p, dim=dim, k=keepdim: torch_call(
+                                a_t, p, list(dim), k
+                            ),
+                            run_c=lambda a_c=a_c, p=p, dim=dim, k=keepdim: c_module._aten_dispatch(
+                                op, a_c, p, list(dim), k
+                            ),
+                            note="an empty dim list reduces EVERY axis, which is "
+                            "the opposite of the usual reading",
+                        )
+                    )
+    # 3-D, so `norm_except_dim`'s real shape (a Conv1d weight) is covered and a
+    # middle axis exists to get wrong.
+    flat3 = [float(v) * 0.5 - 3.0 for v in range(2 * 3 * 4)]
+    for dim in ([0], [1], [2], [0, 2], [1, 2]):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat3, (2, 3, 4), "float64")
+        cases.append(
+            Case(
+                name=f"norm(float64, 3-D (2,3,4), p=2, dim={dim}, keepdim=True)",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, 2, list(dim), True),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(
+                    op, a_c, 2, list(dim), True
+                ),
+                note="the multi-axis reduction `norm_except_dim` is written on",
+            )
+        )
+    # A zero row against negative and infinite p -- the corners that fall out of
+    # the general formula and would be special-cased away by mistake.
+    zeros = [0.0, 0.0, 1.0, 2.0]
+    z_t, z_c = pair_from_flat(torch_module, c_module, zeros, (2, 2), "float64")
+    for p in (-1, -2, float("inf"), float("-inf"), 0):
+        cases.append(
+            Case(
+                name=f"norm(float64, a zero row, p={p!r}, dim=[1])",
+                op=op,
+                run_torch=lambda p=p: torch_call(z_t, p, [1], False),
+                run_c=lambda p=p: c_module._aten_dispatch(op, z_c, p, [1], False),
+                note="p=-1 over a zero row is 0.0, not inf: |0|^-1 is inf, the "
+                "sum is inf, and inf^(-1) is 0",
+            )
+        )
+    # An empty tensor reduces to 0.0, not to an error.
+    e_t, e_c = pair_from_flat(torch_module, c_module, [], (2, 0), "float32")
+    cases.append(
+        Case(
+            name="norm(float32, (2,0) empty, p=2, dim=[1])",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 2, [1], False),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 2, [1], False),
+            note="an empty reduction is 0.0",
+        )
+    )
+    # Integral and boolean input raise on both sides, with upstream's wording.
+    for dtype_name in ("int64", "int32", "bool"):
+        i_t, i_c = pair_from_flat(
+            torch_module, c_module, [1, 0, 1, 1], (2, 2), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"norm({dtype_name}, p=2, dim=[1]) [both refuse]",
+                op=op,
+                run_torch=lambda i_t=i_t: torch_call(i_t, 2, [1], False),
+                run_c=lambda i_c=i_c: c_module._aten_dispatch(op, i_c, 2, [1], False),
+                expect="both_error",
+                note="upstream: 'norm(): input dtype should be either floating "
+                "point or complex. Got Long instead.'",
+            )
+        )
+    # A repeated dim raises on both sides.
+    r_t, r_c = pair_from_flat(torch_module, c_module, flat, (2, 3), "float32")
+    cases.append(
+        Case(
+            name="norm(float32, dim=[0, 0]) [repeated dim, both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(r_t, 2, [0, 0], False),
+            run_c=lambda: c_module._aten_dispatch(op, r_c, 2, [0, 0], False),
+            expect="both_error",
+            note="upstream: 'dim 0 appears multiple times in the list of dims'",
+        )
+    )
+    return cases
+
+
+# --- aten._weight_norm_interface.default ------------------------------------
+#
+#     norms = norm_except_dim(v, 2, dim)     keep `dim`, reduce every other axis
+#     out   = v * (g / norms)
+#
+# Both halves asserted against upstream rather than taken from the formula.
+#
+# **`dim` must be 0 or `v.dim() - 1`** -- upstream trips an `INTERNAL ASSERT
+# FAILED` for anything else rather than raising a real error, so a middle dim is
+# refused here by name and carried as `c_error`.
+#
+# **The norms come back float32 for a float16/bfloat16 input** while the output
+# keeps the input dtype. That does not follow from anything else in this file
+# and is read off upstream, so the reduced-float rows are the ones that catch it.
+
+
+def _weight_norm_pair_check(t_res, c_res) -> tuple[bool, str]:
+    """`(out, norms)` -- two float tensors, both compared within tolerance.
+
+    `_pair_result_check` above cannot be reused: that one is for
+    `(values, indices)` and requires its second member to match *exactly*,
+    which is right for integer positions and wrong for a norm. Written as the
+    full dtype/shape/value check on both members rather than as a check of
+    `out` alone, because `norms` carries the one dtype rule this op has that
+    nothing else in the file does (float32 for a reduced-float input).
+    """
+    try:
+        t_parts = (t_res[0], t_res[1])
+        c_parts = (c_res[0], c_res[1])
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (out, norms) result on both sides: {e!r}"
+    for label, t_part, c_part in zip(("out", "norms"), t_parts, c_parts):
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        tol = dt.tolerance_for(t_dtype)
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            # A zero row gives NaN on both sides; that agreement is the result.
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (NaN on one side only)"
+            if not math.isclose(xf, yf, rel_tol=tol.rtol, abs_tol=tol.atol):
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+    return True, (
+        f"(out, norms) agree: out dtype={dt.dtype_name(t_parts[0].dtype)} "
+        f"shape={tuple(int(x) for x in t_parts[0].shape)}, "
+        f"norms dtype={dt.dtype_name(t_parts[1].dtype)} "
+        f"shape={tuple(int(x) for x in t_parts[1].shape)}"
+    )
+
+
+def weight_norm_interface_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._weight_norm_interface.default"
+    cases: list[Case] = []
+
+    # 2-D, dim=0: `vits`'s shape (the default). Non-square and mixed sign.
+    v_flat = [3.0, -4.0, 0.0, 1.0, -1.0, 2.0]
+    for dtype_name in _NORM_DTYPES:
+        v_t, v_c = pair_from_flat(torch_module, c_module, v_flat, (2, 3), dtype_name)
+        g0_t, g0_c = pair_from_flat(torch_module, c_module, [2.0, -3.0], (2, 1), dtype_name)
+        cases.append(
+            Case(
+                name=f"_weight_norm_interface({dtype_name}, v=(2,3), dim=0)",
+                op=op,
+                run_torch=lambda v_t=v_t, g_t=g0_t: torch_call(v_t, g_t, 0),
+                run_c=lambda v_c=v_c, g_c=g0_c: c_module._aten_dispatch(op, v_c, g_c, 0),
+                value_check=_weight_norm_pair_check,
+                note="norms widen to float32 for float16/bfloat16 while out "
+                "keeps the input dtype -- measured, not derived",
+            )
+        )
+        # dim = v.dim()-1: `sew_d`'s form.
+        g1_t, g1_c = pair_from_flat(
+            torch_module, c_module, [1.0, 2.0, -0.5], (1, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"_weight_norm_interface({dtype_name}, v=(2,3), dim=1 = v.dim()-1)",
+                op=op,
+                run_torch=lambda v_t=v_t, g_t=g1_t: torch_call(v_t, g_t, 1),
+                run_c=lambda v_c=v_c, g_c=g1_c: c_module._aten_dispatch(op, v_c, g_c, 1),
+                value_check=_weight_norm_pair_check,
+                note="the other end of the supported range",
+            )
+        )
+    # 3-D: a Conv1d weight, which is what both real callers actually pass.
+    v3 = [float(x) * 0.3 - 2.0 for x in range(4 * 3 * 5)]
+    v3_t, v3_c = pair_from_flat(torch_module, c_module, v3, (4, 3, 5), "float64")
+    g30_t, g30_c = pair_from_flat(
+        torch_module, c_module, [1.0, -2.0, 0.5, 3.0], (4, 1, 1), "float64"
+    )
+    cases.append(
+        Case(
+            name="_weight_norm_interface(float64, v=(4,3,5) Conv1d weight, dim=0) [vits]",
+            op=op,
+            run_torch=lambda: torch_call(v3_t, g30_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, v3_c, g30_c, 0),
+            value_check=_weight_norm_pair_check,
+            note="vits: weight_norm(nn.Conv1d(...), name='weight') -- default dim=0",
+        )
+    )
+    g32_t, g32_c = pair_from_flat(
+        torch_module, c_module, [1.0, -1.0, 2.0, 0.5, -0.25], (1, 1, 5), "float64"
+    )
+    cases.append(
+        Case(
+            name="_weight_norm_interface(float64, v=(4,3,5) Conv1d weight, dim=2) [sew_d]",
+            op=op,
+            run_torch=lambda: torch_call(v3_t, g32_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, v3_c, g32_c, 2),
+            value_check=_weight_norm_pair_check,
+            note="sew_d: weight_norm(self.conv, name='weight', dim=2) on a 3-D "
+            "weight, which is v.dim()-1",
+        )
+    )
+    # A zero row: the norm is 0 and the division is g/0, so upstream answers
+    # NaN. Not special-cased on either side.
+    vz_t, vz_c = pair_from_flat(
+        torch_module, c_module, [0.0, 0.0, 1.0, 2.0], (2, 2), "float64"
+    )
+    gz_t, gz_c = pair_from_flat(torch_module, c_module, [2.0, 3.0], (2, 1), "float64")
+    cases.append(
+        Case(
+            name="_weight_norm_interface(float64, a zero row, dim=0) [NaN, not a raise]",
+            op=op,
+            run_torch=lambda: torch_call(vz_t, gz_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, vz_c, gz_c, 0),
+            value_check=_weight_norm_pair_check,
+            note="norm 0 and g/0 -> NaN on both sides; nothing is guarded",
+        )
+    )
+    # Integral input: upstream refuses by kernel name.
+    vi_t, vi_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int64")
+    gi_t, gi_c = pair_from_flat(torch_module, c_module, [1, 2], (2, 1), "int64")
+    cases.append(
+        Case(
+            name="_weight_norm_interface(int64) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(vi_t, gi_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, vi_c, gi_c, 0),
+            expect="both_error",
+            note="upstream: '\"weight_norm_kernel\" not implemented for \\'Long\\''",
+        )
+    )
+    # A v/g dtype mismatch raises rather than promoting.
+    vm_t, vm_c = pair_from_flat(torch_module, c_module, v_flat, (2, 3), "float32")
+    gm_t, gm_c = pair_from_flat(torch_module, c_module, [2.0, -3.0], (2, 1), "float64")
+    cases.append(
+        Case(
+            name="_weight_norm_interface(v float32, g float64) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(vm_t, gm_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, vm_c, gm_c, 0),
+            expect="both_error",
+            note="upstream: 'expected scalar type Float but found Double' -- it "
+            "does not promote",
+        )
+    )
+    # A middle dim: upstream trips an INTERNAL ASSERT, this refuses by name.
+    gmid_t, gmid_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0], (1, 3, 1), "float64"
+    )
+    cases.append(
+        Case(
+            name="_weight_norm_interface(v=(4,3,5), dim=1) [a middle dim]",
+            op=op,
+            run_torch=lambda: torch_call(v3_t, gmid_t, 1),
+            run_c=lambda: c_module._aten_dispatch(op, v3_c, gmid_c, 1),
+            expect="both_error",
+            note="upstream trips 'dim == 0 || dim == v.dim() - 1 INTERNAL ASSERT "
+            "FAILED' rather than raising a real error; this refuses by name",
+        )
+    )
+    return cases
+
+
+# --- aten.div.Tensor_mode / aten.div.Scalar_mode ---------------------------
+#
+# `sam3_video`'s second wall, two lines after `remainder`'s (docs/ARCH26.md §5):
+# `Sam3ViTRotaryEmbedding.__init__` builds the y axis of its rotary position
+# grid with `torch.div(flattened_indices, end_x, rounding_mode="floor")`.
+#
+# **`rounding_mode` selects between three different functions**, and the case
+# set has to be able to tell all three apart. Measured on upstream 2.13.0:
+#
+#         a    b   None      trunc   floor
+#         7    3    2.333       2       2
+#         7   -3   -2.333      -2      -3    <-- trunc/floor DISAGREE
+#        -7    3   -2.333      -2      -3    <-- trunc/floor DISAGREE
+#        -7   -3    2.333       2       2
+#        -6    3   -2.0        -2      -2    <-- opposite signs, EXACT: agree
+#     dtype    ->  float32   int64   int64
+#
+# `trunc` and `floor` differ **exactly when the operands' signs differ AND the
+# division is inexact** -- established rather than asserted, over 210 integer
+# pairs: they disagree on 64, that set contains no same-sign pair and no
+# exact-division pair, and it is precisely the 64 opposite-sign inexact pairs.
+# So two different case sets would each pass both implementations: one built
+# from positive operands, and one built from opposite signs that divide exactly
+# (`-6 / 3`). `_DIV_SIGNS` below carries all three kinds.
+#
+# **The float corners are where `floor(a / b)` -- the plausible implementation
+# -- dies.** All measured:
+#
+#   * `inf / 3.0` is **nan**, not inf. `fmod(inf, 3.0)` is NaN and upstream's
+#     algorithm propagates it.
+#   * `5.0 / -inf` is **-1.0**, not -0.0, and `-5.0 / inf` is **-1.0** -- the
+#     sign correction firing on a finite quotient of zero.
+#   * `5.0 / 0.0` is **inf**, which is a *different* answer from `inf / 3.0`
+#     even though both are non-finite: upstream returns the raw IEEE quotient
+#     when `b == 0` and runs the algorithm otherwise.
+#   * `-0.0 / 3.0` keeps its sign bit, which `==` cannot see.
+#
+# **Reduced-precision arithmetic is the trap that tolerance hides.** Upstream
+# computes in the tensor's own dtype, not in f64. Computing in f64 and narrowing
+# once is off by 1-2 ULP at large magnitudes -- and at those magnitudes a 1-ULP
+# float32 error is ~8e-8 relative, comfortably *inside* this harness's float32
+# rtol of 1e-5. The `_DIV_PRECISION` cases below therefore use
+# `_exact_value_check`; under the default pipeline they would pass either way
+# and prove nothing.
+#
+# **One measured upstream inconsistency, carried as `expect="diverge"`.** For
+# float16/bfloat16 only, upstream's answer depends on the tensor's LENGTH: a
+# one-element tensor computes in wider precision than a two-element one
+# (measured at n = 1, 2, 4, 7, 8, 16, 17, 32, 64, 100 -- every n >= 2 agrees
+# with every other, and only n == 1 differs, so it is a one-element fast path
+# and not a vectorised-body/scalar-tail split). This shim computes in the
+# tensor's own dtype, which is upstream's n >= 2 answer and therefore the answer
+# every real tensor gets; the n == 1 cases record the disagreement so that it
+# fails loudly if upstream ever unifies the two paths.
+
+_DIV_MODE_FLOAT = ["float64", "float32", "float16", "bfloat16"]
+_DIV_MODE_INT = ["int64", "int32", "int16", "uint8"]
+
+# Same-sign, opposite-sign-inexact (where trunc and floor disagree), and
+# opposite-sign-exact (where they agree, and so cannot tell them apart).
+_DIV_SIGNS = [
+    (7, 3), (7, -3), (-7, 3), (-7, -3),      # inexact, all four quadrants
+    (6, 3), (6, -3), (-6, 3), (-6, -3),      # EXACT, all four quadrants
+    (1, 3), (-1, 3), (1, -3), (-1, -3),      # |a| < |b|, quotient rounds to 0/-1
+    (0, 3), (0, -3),                          # zero dividend
+    (5, 2), (-5, 2), (5, -2), (-5, -2),
+]
+
+# (a, b) pairs where computing in f64 and narrowing gives a DIFFERENT answer
+# from computing in the dtype itself. Found by search, then each one confirmed
+# against upstream. Without these the f64 shortcut passes the whole suite.
+_DIV_PRECISION: dict[str, list[tuple[float, float]]] = {
+    "float32": [
+        (8703144.0, -0.331771582365036),
+        (13229698.0, -0.5165976285934448),
+        (13088387.0, 0.9100134968757629),
+        (9657791.0, 0.7925834059715271),
+        (13277388.0, 2.04852032661438),
+    ],
+    "float16": [
+        (-1121.0, -1.1806640625),
+        (1050.0, -0.69873046875),
+        (-1191.0, -0.26953125),
+        (1706.0, -0.65185546875),
+        (1582.0, 1.6044921875),
+    ],
+    "bfloat16": [
+        (187.0, 0.83984375),
+        (183.0, 0.51171875),
+        (-163.0, 0.80078125),
+        (190.0, 0.68359375),
+        (212.0, 1.078125),
+    ],
+}
+
+# (dtype, mode) -> an (a, b) pair whose answer upstream changes between a
+# one-element tensor and a two-element one. Measured on both sides for each of
+# the four; the divergence is mode-dependent, so a table keyed only on dtype
+# produced a case that could not fail.
+#
+#   float16  floor  (-1121.0, -1.1806640625)  n=1: 949    n>=2: 948
+#   float16  trunc  ( 1050.0, -0.69873046875) n=1: -1502  n>=2: -1503
+#   bfloat16 floor  (  187.0,  0.83984375)    n=1: 222    n>=2: 221
+#   bfloat16 trunc  (  190.0,  0.68359375)    n=1: 276    n>=2: 278
+_DIV_N1_DIVERGENT: dict[tuple[str, str], tuple[float, float]] = {
+    ("float16", "floor"): (-1121.0, -1.1806640625),
+    ("float16", "trunc"): (1050.0, -0.69873046875),
+    ("bfloat16", "floor"): (187.0, 0.83984375),
+    ("bfloat16", "trunc"): (190.0, 0.68359375),
+}
+
+# The float corners, as (dividend, divisor, why).
+_DIV_FLOAT_CORNERS = [
+    (float("inf"), 3.0, "inf / finite is NaN, not inf -- fmod(inf, b) is NaN"),
+    (float("-inf"), 3.0, "-inf / finite is NaN"),
+    (float("nan"), 3.0, "NaN dividend stays NaN"),
+    (5.0, float("inf"), "+inf divisor -> +0.0"),
+    (5.0, float("-inf"), "-inf divisor -> -1.0 under floor, from the correction"),
+    (-5.0, float("inf"), "negative dividend, +inf divisor -> -1.0 under floor"),
+    (0.5, 3.0, "|a| < |b|, positive -> +0.0"),
+    (-0.5, 3.0, "|a| < |b|, negative -> -1.0 under floor, -0.0 under trunc"),
+    (5.0, 0.0, "float division by zero -> inf, NO raise (b == 0 early return)"),
+    (-5.0, 0.0, "float division by zero -> -inf"),
+    (0.0, 0.0, "0/0 -> NaN"),
+]
+
+
+def _div_mode_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.div.Scalar_mode"
+    cases: list[Case] = []
+
+    for mode in ("trunc", "floor"):
+        for dtype_name in _DIV_MODE_INT:
+            for a, b in _DIV_SIGNS:
+                if dtype_name == "uint8" and a < 0:
+                    continue
+                a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+                cases.append(
+                    Case(
+                        name=f"div({a} as {dtype_name}, {b}, rounding_mode={mode!r})",
+                        op=op,
+                        run_torch=lambda a_t=a_t, b=b, m=mode: torch_call(a_t, b, rounding_mode=m),
+                        run_c=lambda a_c=a_c, b=b, m=mode: c_module._aten_dispatch(
+                            op, a_c, b, rounding_mode=m
+                        ),
+                        note="trunc and floor differ iff the signs differ and "
+                        "the division is inexact; the dtype is PRESERVED, not "
+                        "promoted to float as rounding_mode=None would",
+                    )
+                )
+            # Integral division by zero raises -- but only under a rounding
+            # mode. The same call with rounding_mode=None answers inf.
+            a_t, a_c = pair_from_flat(torch_module, c_module, [5], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"div({dtype_name}, 0, rounding_mode={mode!r}) [raises]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, 0, rounding_mode=m),
+                    run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, 0, rounding_mode=m
+                    ),
+                    expect="both_error",
+                    note="RuntimeError('ZeroDivisionError'); rounding_mode=None "
+                    "answers inf for the same input",
+                )
+            )
+            # A float scalar floats an integral tensor (wrapped-number rule).
+            a_t, a_c = pair_from_flat(torch_module, c_module, [7], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"div({dtype_name}, 2.0, rounding_mode={mode!r}) [float scalar floats]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, 2.0, rounding_mode=m),
+                    run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, 2.0, rounding_mode=m
+                    ),
+                    note="an int scalar would leave the dtype alone",
+                )
+            )
+
+        for dtype_name in _DIV_MODE_FLOAT:
+            for a, b in _DIV_SIGNS:
+                a_t, a_c = pair_from_flat(
+                    torch_module, c_module, [float(a)], (1,), dtype_name
+                )
+                cases.append(
+                    Case(
+                        name=f"div({a}.0 as {dtype_name}, {b}.0, rounding_mode={mode!r})",
+                        op=op,
+                        run_torch=lambda a_t=a_t, b=b, m=mode: torch_call(
+                            a_t, float(b), rounding_mode=m
+                        ),
+                        run_c=lambda a_c=a_c, b=b, m=mode: c_module._aten_dispatch(
+                            op, a_c, float(b), rounding_mode=m
+                        ),
+                        note="floating dtype is preserved under both rounding modes",
+                    )
+                )
+            for a, b, why in _DIV_FLOAT_CORNERS:
+                a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+                cases.append(
+                    Case(
+                        name=f"div({a!r} as {dtype_name}, {b!r}, rounding_mode={mode!r}) [{why}]",
+                        op=op,
+                        run_torch=lambda a_t=a_t, b=b, m=mode: torch_call(
+                            a_t, b, rounding_mode=m
+                        ),
+                        run_c=lambda a_c=a_c, b=b, m=mode: c_module._aten_dispatch(
+                            op, a_c, b, rounding_mode=m
+                        ),
+                        note=why,
+                    )
+                )
+            # The signed zero, on its sign bit.
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [-0.0, 0.0, -0.0, 0.0], (2, 2), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"div(-0.0/+0.0 as {dtype_name}, 3.0, rounding_mode={mode!r}) "
+                    "[signed zero survives]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, 3.0, rounding_mode=m),
+                    run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, 3.0, rounding_mode=m
+                    ),
+                    value_check=_signed_zero_check,
+                    expect="match",
+                    note="upstream's copysign(0, a/b) branch; `-0.0 == 0.0` so "
+                    "this needs the sign bit, not the value",
+                )
+            )
+
+    # `uint8(200) / -3` is 0, because the scalar narrows to 253 in uint8 BEFORE
+    # the division. The analogue of `remainder(uint8(200), -3) == 200`.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [200], (1,), "uint8")
+    for mode in ("trunc", "floor"):
+        cases.append(
+            Case(
+                name=f"div(uint8(200), -3, rounding_mode={mode!r}) [scalar narrows first]",
+                op=op,
+                run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, -3, rounding_mode=m),
+                run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
+                    op, a_c, -3, rounding_mode=m
+                ),
+                note="-3 becomes 253 in uint8, so the answer is 0, not -66",
+            )
+        )
+
+    # `i64::MIN / -1` overflows the quotient; upstream answers i64::MIN.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [-(2**63)], (1,), "int64")
+    for mode in ("trunc", "floor"):
+        cases.append(
+            Case(
+                name=f"div(int64 min, -1, rounding_mode={mode!r}) [the overflow pair]",
+                op=op,
+                run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, -1, rounding_mode=m),
+                run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(
+                    op, a_c, -1, rounding_mode=m
+                ),
+                note="`i64::MIN / -1` panics in Rust; upstream answers i64::MIN",
+            )
+        )
+
+    # rounding_mode=None is true division: it PROMOTES where the other two
+    # preserve, which is the row that tells the three modes apart by dtype.
+    for dtype_name in ("int64", "int32", "float32"):
+        a_t, a_c = pair_from_flat(torch_module, c_module, [7, -7], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"div({dtype_name}, 2, rounding_mode=None) [true division]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 2, rounding_mode=None),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 2, rounding_mode=None),
+                note="int64 becomes float32 here and stays int64 under "
+                "trunc/floor -- the dtype is how the modes are told apart",
+            )
+        )
+    # ... and division by zero does NOT raise under None, where it does raise
+    # under the other two. Same op, same operands, opposite kind of answer.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [5, -5, 0], (3,), "int64")
+    cases.append(
+        Case(
+            name="div(int64, 0, rounding_mode=None) [no raise, unlike trunc/floor]",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, 0, rounding_mode=None),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0, rounding_mode=None),
+            note="answers [inf, -inf, nan] as float32; trunc/floor raise",
+        )
+    )
+
+    # An unrecognised rounding_mode is a RuntimeError on both sides.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [7], (1,), "int64")
+    for bad in ("ceil", "", "Floor"):
+        cases.append(
+            Case(
+                name=f"div(int64, 3, rounding_mode={bad!r}) [rejected by name]",
+                op=op,
+                run_torch=lambda a_t=a_t, s=bad: torch_call(a_t, 3, rounding_mode=s),
+                run_c=lambda a_c=a_c, s=bad: c_module._aten_dispatch(
+                    op, a_c, 3, rounding_mode=s
+                ),
+                expect="both_error",
+                note="upstream: \"div expected rounding_mode to be one of None, "
+                "'trunc', or 'floor'\" -- matched exactly and case-sensitively",
+            )
+        )
+
+    # A documented capability gap, identical in shape to `remainder.Scalar`'s:
+    # upstream computes for a bool tensor with a numeric scalar and this shim
+    # refuses, because the rule keys on the scalar's Python type.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    for scalar in (2, 2.0):
+        for mode in ("trunc", "floor"):
+            cases.append(
+                Case(
+                    name=f"div(bool, {scalar!r}, rounding_mode={mode!r}) "
+                    "[documented gap: upstream computes]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, s=scalar, m=mode: torch_call(
+                        a_t, s, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, s=scalar, m=mode: c_module._aten_dispatch(
+                        op, a_c, s, rounding_mode=m
+                    ),
+                    expect="c_error",
+                    note="upstream gives int64 for an int scalar and float32 for "
+                    "a float one, and raises for a bool one; `scalar_arg` has "
+                    "erased the Python type before the kernel runs -- the same "
+                    "gap `remainder.Scalar` carries",
+                )
+            )
+
+    return cases
+
+
+def _div_mode_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.div.Tensor_mode"
+    cases: list[Case] = []
+
+    for mode in ("trunc", "floor"):
+        # All the sign quadrants at once, per dtype, as a real tensor pair.
+        for dtype_name in _DIV_MODE_FLOAT + _DIV_MODE_INT:
+            signs = [
+                (a, b) for a, b in _DIV_SIGNS
+                if not (dtype_name == "uint8" and (a < 0 or b < 0))
+            ]
+            conv = float if dtype_name in _DIV_MODE_FLOAT else int
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [conv(a) for a, _ in signs], (len(signs),), dtype_name
+            )
+            b_t, b_c = pair_from_flat(
+                torch_module, c_module, [conv(b) for _, b in signs], (len(signs),), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"div.Tensor_mode({dtype_name}, rounding_mode={mode!r}) "
+                    "[every sign quadrant, exact and inexact]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(
+                        a_t, b_t, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, b_c, rounding_mode=m
+                    ),
+                    note="includes the opposite-sign EXACT pairs, on which "
+                    "trunc and floor agree and so cannot be told apart",
+                )
+            )
+
+        # The float corners as one tensor per dtype.
+        for dtype_name in _DIV_MODE_FLOAT:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [a for a, _, _ in _DIV_FLOAT_CORNERS],
+                (len(_DIV_FLOAT_CORNERS),), dtype_name,
+            )
+            b_t, b_c = pair_from_flat(
+                torch_module, c_module, [b for _, b, _ in _DIV_FLOAT_CORNERS],
+                (len(_DIV_FLOAT_CORNERS),), dtype_name,
+            )
+            cases.append(
+                Case(
+                    name=f"div.Tensor_mode({dtype_name}, rounding_mode={mode!r}) "
+                    "[inf/nan/zero corners]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(
+                        a_t, b_t, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, b_c, rounding_mode=m
+                    ),
+                    value_check=_signed_zero_check,
+                    note="`inf / 3.0` is NaN while `5.0 / 0.0` is inf -- the "
+                    "b == 0 early return is what makes those differ",
+                )
+            )
+
+        # THE PRECISION CASES. `_exact_value_check`, not the default pipeline:
+        # a 1-ULP float32 error at these magnitudes is ~8e-8 relative, well
+        # inside this harness's 1e-5 float32 rtol, so under the default
+        # comparator these cases could not fail.
+        for dtype_name, pairs in _DIV_PRECISION.items():
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [a for a, _ in pairs], (len(pairs),), dtype_name
+            )
+            b_t, b_c = pair_from_flat(
+                torch_module, c_module, [b for _, b in pairs], (len(pairs),), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"div.Tensor_mode({dtype_name}, rounding_mode={mode!r}) "
+                    "[computed in the tensor's own dtype, not f64]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(
+                        a_t, b_t, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, b_c, rounding_mode=m
+                    ),
+                    value_check=_exact_value_check,
+                    note="every pair here is one where computing in f64 and "
+                    "narrowing once gives a different answer; the default "
+                    "float32 tolerance would accept both",
+                )
+            )
+
+        # Broadcasting, in both directions.
+        a_t, a_c = pair_from_flat(torch_module, c_module, [7, -7, 6], (1, 3), "int64")
+        b_t, b_c = pair_from_flat(torch_module, c_module, [3, -3], (2, 1), "int64")
+        cases.append(
+            Case(
+                name=f"div.Tensor_mode((1,3) against (2,1), rounding_mode={mode!r}) [broadcast]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(a_t, b_t, rounding_mode=m),
+                run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                    op, a_c, b_c, rounding_mode=m
+                ),
+                note="every sign combination appears in the (2,3) result",
+            )
+        )
+
+        # Promotion follows torch.promote_types exactly (49 cells checked).
+        for a_dt, b_dt in [
+            ("int64", "int32"), ("int32", "float32"), ("float32", "float64"),
+            ("float16", "float32"), ("float16", "bfloat16"), ("uint8", "int16"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [7], (1,), a_dt)
+            b_t, b_c = pair_from_flat(torch_module, c_module, [3], (1,), b_dt)
+            cases.append(
+                Case(
+                    name=f"div.Tensor_mode({a_dt} against {b_dt}, rounding_mode={mode!r}) "
+                    "[promotion]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(
+                        a_t, b_t, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, b_c, rounding_mode=m
+                    ),
+                    note="preserves the promoted integral dtype rather than "
+                    "floating it the way rounding_mode=None does",
+                )
+            )
+
+        # Bool on both sides: upstream refuses too, naming the kernel.
+        a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+        b_t, b_c = pair_from_flat(torch_module, c_module, [True, True], (2,), "bool")
+        cases.append(
+            Case(
+                name=f"div.Tensor_mode(bool, bool, rounding_mode={mode!r}) [upstream refuses too]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(a_t, b_t, rounding_mode=m),
+                run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                    op, a_c, b_c, rounding_mode=m
+                ),
+                expect="both_error",
+                note='upstream: \'"div_trunc_cpu"/"div_floor_cpu" not '
+                "implemented for 'Bool'\"",
+            )
+        )
+
+        # One zero divisor anywhere in an integral tensor raises.
+        a_t, a_c = pair_from_flat(torch_module, c_module, [5, 6], (2,), "int64")
+        b_t, b_c = pair_from_flat(torch_module, c_module, [3, 0], (2,), "int64")
+        cases.append(
+            Case(
+                name=f"div.Tensor_mode(int64, [3, 0], rounding_mode={mode!r}) [one zero raises]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(a_t, b_t, rounding_mode=m),
+                run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                    op, a_c, b_c, rounding_mode=m
+                ),
+                expect="both_error",
+                note="RuntimeError('ZeroDivisionError'), not an inf in one lane",
+            )
+        )
+
+        # Upstream's own length dependence, for the reduced floats only. This
+        # shim answers upstream's n >= 2 value in both cases; at n == 1 upstream
+        # computes in wider precision and the two disagree. Recorded so it fails
+        # if upstream ever makes its two paths agree.
+        for dtype_name in ("float16", "bfloat16"):
+            # Keyed on the MODE as well as the dtype: a pair that diverges at
+            # n == 1 under `floor` need not diverge under `trunc`, and picking
+            # one per dtype gave a case that could not fail. Each of these four
+            # was measured on both sides of n == 1.
+            a, b = _DIV_N1_DIVERGENT[(dtype_name, mode)]
+            a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, [b], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"div.Tensor_mode({dtype_name} n=1, rounding_mode={mode!r}) "
+                    "[upstream's one-element path uses wider precision]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, m=mode: torch_call(
+                        a_t, b_t, rounding_mode=m
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, m=mode: c_module._aten_dispatch(
+                        op, a_c, b_c, rounding_mode=m
+                    ),
+                    expect="diverge",
+                    note="upstream answers one value for a 1-element tensor and "
+                    "another for the same operands in a 2-element tensor "
+                    "(measured at n = 1, 2, 4, 7, 8, 16, 17, 32, 64, 100: only "
+                    "n == 1 differs). This shim computes in the tensor's own "
+                    "dtype, which is upstream's n >= 2 answer",
+                )
+            )
+
+    # rounding_mode=None on the tensor form: true division, promoting.
+    for dtype_name in ("int64", "float32"):
+        a_t, a_c = pair_from_flat(torch_module, c_module, [7, -7, 6], (3,), dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [3, 3, -3], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"div.Tensor_mode({dtype_name}, rounding_mode=None) [true division]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t, rounding_mode=None),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(
+                    op, a_c, b_c, rounding_mode=None
+                ),
+                note="identical to aten.div.Tensor, which is what it delegates to",
+            )
+        )
+
+    return cases
+
+
 # --- aten.repeat.default ---------------------------------------------------
 #
 # The kernel docs/ARCH26.md §6/§8 found recurring across four of the six
@@ -10720,6 +11580,216 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
             ),
         )
     )
+
+    # --- transposed 2-D convolution, docs/KERNELS26.md §10 -------------------
+    #
+    # **The weight layout is `(in_channels, out_channels/groups, kH, kW)` --
+    # the opposite of the forward convolution's `(out, in/groups, kH, kW)` --
+    # and getting it backwards produces a plausible tensor rather than an
+    # error.** That is the whole reason this block exists and why it is built
+    # the way it is.
+    #
+    # `zoedepth`'s own call cannot show it. `ZoeDepthUpsample` is
+    # `nn.ConvTranspose2d(channels, channels, kernel_size=factor,
+    # stride=factor, padding=0)`: equal in/out channels and a square kernel, so
+    # swapping the first two weight axes gives a tensor of exactly the same
+    # shape. Measured on a `(1,2,3,3)` input with a `(2,2,3,3)` weight:
+    #
+    #     correct                     sum 61317   [162, 351, 569, 413, 224, ...]
+    #     first two axes swapped      sum 54756   [ 81, 180, 299, 224, 125, ...]
+    #     kernel flipped spatially    sum 61317   [234, 493, 775, 535, 276, ...]
+    #
+    # The spatial flip **keeps the sum identical** and changes every element, so
+    # a checksum-shaped test passes it. Both wrong layouts are carried below as
+    # live cases, compared element by element.
+    #
+    # The layout itself was established on a case that *can* show it -- unequal
+    # channels and a non-square kernel -- three independent ways: the accepted
+    # shape (`x(2,3,5,7) @ w(3,5,2,4) -> (2,5,6,10)`, so `out_channels` is
+    # `w.shape[1]`), `nn.ConvTranspose2d(3, 5, (2,4)).weight.shape == [3,5,2,4]`,
+    # and a from-scratch scatter-add implementation of the definition.
+
+    def tmake(dtype_name, in_flat, in_shape, w_flat, w_shape, bias_flat,
+              stride, padding, dilation, output_padding, groups, note,
+              expect="match"):
+        x_t, x_c = pair_from_flat(torch_module, c_module, in_flat, in_shape, dtype_name)
+        w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+        if bias_flat is None:
+            b_t, b_c = None, None
+        else:
+            # (out_channels,) -- and for a TRANSPOSED weight that is
+            # `w_shape[1] * groups`, not `w_shape[0]`. Writing `w_shape[0]`
+            # here (the forward convolution's rule, and what the `make` helper
+            # above does) is the same layout mistake in the bias.
+            b_t, b_c = pair_from_flat(
+                torch_module, c_module, bias_flat, (w_shape[1] * groups,), dtype_name
+            )
+        return Case(
+            name=f"convolution transposed({dtype_name}, in={in_shape}, w={w_shape}, "
+                 f"stride={stride}, pad={padding}, dil={dilation}, "
+                 f"outpad={output_padding}, groups={groups}) [{note}]",
+            op=op,
+            run_torch=lambda: torch_call(
+                x_t, w_t, b_t, list(stride), list(padding), list(dilation),
+                True, list(output_padding), groups,
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x_c, w_c, b_c, list(stride), list(padding), list(dilation),
+                True, list(output_padding), groups,
+            ),
+            expect=expect,
+            note=note,
+        )
+
+    # 1. The case that PINS the layout: in=3, out=5, kernel 2x4. Every one of
+    #    those four numbers is different, so a weight read in any other order
+    #    is a different shape.
+    x_asym = [float(v) * 0.37 - 5.0 for v in range(2 * 3 * 5 * 7)]
+    w_asym = [float(v) * 0.11 - 1.0 for v in range(3 * 5 * 2 * 4)]
+    for dtype_name in ("float64", "float32"):
+        cases.append(
+            tmake(
+                dtype_name, x_asym, (2, 3, 5, 7), w_asym, (3, 5, 2, 4),
+                [0.1, -0.2, 0.3, -0.4, 0.5], (1,), (0,), (1,), (0,), 1,
+                "in=3 out=5 kernel 2x4 -- no two axes interchangeable",
+            )
+        )
+    # 2. The DANGEROUS case: equal channels, square kernel. Same shape under
+    #    both wrong layouts, so only the values separate them.
+    x_sq = [float(v) for v in range(1 * 2 * 3 * 3)]
+    w_sq = [float(v) for v in range(2 * 2 * 3 * 3)]
+    cases.append(
+        tmake(
+            "float64", x_sq, (1, 2, 3, 3), w_sq, (2, 2, 3, 3), None,
+            (1,), (0,), (1,), (0,), 1,
+            "equal channels, square kernel -- a swapped or flipped weight has "
+            "the SAME shape here, and a flipped one has the same sum too",
+        )
+    )
+    # 2b. The same operands with the weight actually transposed on the way in,
+    #     so the harness compares the two arrangements rather than trusting a
+    #     comment that says they differ. Upstream and the shim must BOTH answer
+    #     the swapped-weight result for a swapped weight -- if this case ever
+    #     matches case 2's values, the kernel is ignoring the axis order.
+    w_sq_swapped = []
+    for i in range(2):
+        for o in range(2):
+            for a in range(3):
+                for b in range(3):
+                    # w_sq is (2,2,3,3) in C order; take [o][i][a][b]
+                    w_sq_swapped.append(w_sq[((o * 2 + i) * 3 + a) * 3 + b])
+    cases.append(
+        tmake(
+            "float64", x_sq, (1, 2, 3, 3), w_sq_swapped, (2, 2, 3, 3), None,
+            (1,), (0,), (1,), (0,), 1,
+            "the same weight with its first two axes exchanged -- must give a "
+            "DIFFERENT answer from the case above, on both sides",
+        )
+    )
+    # 3. zoedepth's own shape: ConvTranspose2d(c, c, kernel_size=f, stride=f).
+    for factor in (2, 3):
+        c_ch = 2
+        xf = [float(v) * 0.25 - 1.0 for v in range(1 * c_ch * 4 * 4)]
+        wf = [float(v) * 0.1 - 0.5 for v in range(c_ch * c_ch * factor * factor)]
+        cases.append(
+            tmake(
+                "float32", xf, (1, c_ch, 4, 4), wf, (c_ch, c_ch, factor, factor),
+                [0.25, -0.5], (factor,), (0,), (1,), (0,), 1,
+                f"zoedepth's ZoeDepthUpsample, factor={factor}",
+            )
+        )
+    # 4. Each geometric argument varied ALONE and to a distinct value, so that
+    #    passing them to candle in the wrong order -- its signature is
+    #    `(kernel, padding, output_padding, stride, dilation)`, which is not
+    #    `conv2d`'s `(kernel, padding, stride, dilation, groups)` -- changes the
+    #    output shape and fails here.
+    x4 = [float(v) * 0.19 - 3.0 for v in range(1 * 2 * 4 * 4)]
+    w4 = [float(v) * 0.07 - 0.9 for v in range(2 * 3 * 3 * 3)]
+    for stride, padding, dilation, outpad, note in [
+        ((2,), (0,), (1,), (0,), "stride alone"),
+        ((1,), (2,), (1,), (0,), "padding alone"),
+        ((1,), (0,), (3,), (0,), "dilation alone"),
+        ((3,), (0,), (1,), (2,), "output_padding alone (needs stride > it)"),
+        ((3,), (1,), (2,), (2,), "all four at once, all different"),
+        ((1,), (0,), (2,), (1,), "output_padding bounded by DILATION, not stride"),
+    ]:
+        cases.append(
+            tmake(
+                "float64", x4, (1, 2, 4, 4), w4, (2, 3, 3, 3),
+                [0.1, -0.1, 0.2], stride, padding, dilation, outpad, 1, note,
+            )
+        )
+    # 5. Non-square kernel with the geometry varied too -- the height/width axes
+    #    must not be interchangeable anywhere in the wrapper.
+    x5 = [float(v) * 0.13 - 2.0 for v in range(1 * 2 * 3 * 5)]
+    w5 = [float(v) * 0.09 - 0.4 for v in range(2 * 3 * 2 * 4)]
+    cases.append(
+        tmake(
+            "float64", x5, (1, 2, 3, 5), w5, (2, 3, 2, 4), None,
+            (2,), (1,), (1,), (1,), 1,
+            "non-square input AND non-square kernel, strided and padded",
+        )
+    )
+    # 6. Refusals. Each computes upstream and is refused here by name.
+    cases.append(
+        tmake(
+            "float32", [float(v) for v in range(1 * 4 * 4 * 4)], (1, 4, 4, 4),
+            [float(v) for v in range(4 * 2 * 3 * 3)], (4, 2, 3, 3), None,
+            (1,), (0,), (1,), (0,), 2,
+            "grouped transposed convolution -- candle's conv_transpose2d takes "
+            "no groups argument",
+            expect="c_error",
+        )
+    )
+    for stride, padding, dilation, outpad, note in [
+        ((2, 1), (0, 0), (1, 1), (0, 0), "asymmetric stride"),
+        ((1, 1), (1, 0), (1, 1), (0, 0), "asymmetric padding"),
+        ((1, 1), (0, 0), (2, 1), (0, 0), "asymmetric dilation"),
+        ((2, 2), (0, 0), (1, 1), (1, 0), "asymmetric output_padding"),
+    ]:
+        cases.append(
+            tmake(
+                "float32", x4, (1, 2, 4, 4), w4, (2, 3, 3, 3), None,
+                stride, padding, dilation, outpad, 1,
+                note + " -- candle's conv_transpose2d takes one value per "
+                "argument, not one per axis",
+                expect="c_error",
+            )
+        )
+    # 1-D transposed (3-D input): candle HAS conv_transpose1d, with groups even,
+    # but nothing measured reaches it, so it is refused rather than added as
+    # unreached surface.
+    cases.append(
+        Case(
+            name="convolution transposed(3-D input) [c_error -- 1-D transposed not implemented]",
+            op=op,
+            run_torch=lambda: torch_call(x_t, w_t, None, [1], [0], [1], True, [0], 1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x_c, w_c, None, [1], [0], [1], True, [0], 1
+            ),
+            expect="c_error",
+            note="candle has conv_transpose1d and it is not wired -- no measured "
+            "caller, so it refuses by name rather than adding unreached surface",
+        )
+    )
+    # 7. output_padding >= max(stride, dilation) raises on BOTH sides, with
+    #    upstream's exact wording. The bound is max(stride, dilation) and not
+    #    stride -- measured: outpad=1 is accepted with stride=1, dilation=2 and
+    #    refused with stride=1, dilation=1.
+    for stride, dilation, outpad, note in [
+        ((1,), (1,), (1,), "outpad 1 with stride 1, dilation 1"),
+        ((2,), (1,), (2,), "outpad 2 with stride 2"),
+        ((1,), (2,), (2,), "outpad 2 with dilation 2"),
+    ]:
+        cases.append(
+            tmake(
+                "float32", x4, (1, 2, 4, 4), w4, (2, 3, 3, 3), None,
+                stride, (0,), dilation, outpad, 1,
+                note + " -- 'output padding must be smaller than either stride "
+                "or dilation'",
+                expect="both_error",
+            )
+        )
     return cases
 
 
@@ -10748,6 +11818,67 @@ def zeros_like_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
                 run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
                 note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    return cases
+
+
+def ones_like_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.ones_like.default` -- the wall `vits` AND `sam3_video` both reached.
+
+    The same function as `zeros_like`/`empty_like` with a different fill, but
+    **the only one of the three whose values can actually be diffed**: `zeros`
+    and `empty` share `_dtype_shape_only_check` because upstream's `empty` bytes
+    are undefined, while `ones` is defined to be ones. So these cases run the
+    default pipeline, and a fill that answered zeros -- which is what reusing
+    the sibling branch by accident would do -- fails on the values rather than
+    passing on the dtype.
+    """
+    op = "aten.ones_like.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8", "bool"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"ones_like(dtype={dtype_name}, shape=(2,3)) [dtype/shape from self]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="values are DEFINED here, unlike zeros_like's sibling "
+                "empty_like -- so this diffs them",
+            )
+        )
+    # An explicit dtype override beats the reference tensor's dtype.
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"ones_like(self_dtype=float32, dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
+                note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    # Shapes that a fill written against a flat buffer could get wrong.
+    for shape in ((0,), (1,), (3, 1), (2, 3, 4)):
+        n = 1
+        for d in shape:
+            n *= d
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1.0] * n, shape, "float32"
+        )
+        cases.append(
+            Case(
+                name=f"ones_like(float32, shape={shape})",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="including the empty shape, where a fill has nothing to do",
             )
         )
     return cases
@@ -14465,6 +15596,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.repeat.default": repeat_cases,
     "aten.remainder.Scalar": remainder_scalar_cases,
     "aten.remainder.Tensor": remainder_tensor_cases,
+    "aten.div.Scalar_mode": _div_mode_scalar_cases,
+    "aten.div.Tensor_mode": _div_mode_tensor_cases,
+    "aten.norm.ScalarOpt_dim": norm_scalaropt_dim_cases,
+    "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
     # members (docs/C_SURFACE.md §4) -- see the longer module note above.
@@ -14568,6 +15703,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.softplus.default": softplus_cases,
     "aten.convolution.default": convolution_cases,
     "aten.zeros_like.default": zeros_like_cases,
+    "aten.ones_like.default": ones_like_cases,
     "aten.empty_like.default": empty_like_cases,
     "aten.ge.Scalar": ge_scalar_cases,
     "aten.ge.Tensor": ge_tensor_cases,
