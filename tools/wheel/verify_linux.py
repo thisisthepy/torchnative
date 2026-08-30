@@ -280,6 +280,39 @@ def self_test() -> int:
                    py_bound and all(lib is None for lib in py_bound),
                    f"expected all None, got {sorted(set(py_bound))}"))
 
+    # 6. A dynamic ELF with no readable `SHT_DYNSYM` section is
+    #    `binfmt.elf_symbols` failing to read the file, not the file needing
+    #    nothing. Before that was enforced, zeroing one section's `sh_type`
+    #    from `SHT_DYNSYM` to `SHT_NULL` in an untouched `_dbm.*.so` left
+    #    `elf_info` still reporting a normal 64-bit x86-64 `dyn` ELF while
+    #    `elf_symbols` answered `{"defined": set(), "undefined": []}` --
+    #    which `resolve()` above prints as "0 undefined (0 exported)" and
+    #    "0 unresolved": a clean PASS on a file whose symbol table was never
+    #    actually read.
+    import struct
+    from binfmt import SHT_DYNSYM, _EHDR64_SHENTSIZE, _EHDR64_SHOFF, _elf_sections
+    corrupted = bytearray(dbm.read_bytes())
+    endian, _sections, _cstr = _elf_sections(bytes(corrupted))
+    shoff, = struct.unpack_from(endian + "Q", bytes(corrupted), _EHDR64_SHOFF)
+    shentsize, shnum, _shstrndx = struct.unpack_from(
+        endian + "HHH", bytes(corrupted), _EHDR64_SHENTSIZE)
+    patched = 0
+    for i in range(shnum):
+        off = shoff + i * shentsize
+        _name, stype = struct.unpack_from(endian + "II", bytes(corrupted), off)
+        if stype == SHT_DYNSYM:
+            struct.pack_into(endian + "I", corrupted, off + 4, 0)
+            patched += 1
+    still_dyn = elf_info(bytes(corrupted))
+    broken_result = elf_symbols(bytes(corrupted))
+    checks.append((
+        "a dynamic ELF with no readable SHT_DYNSYM answers None, not "
+        "'0 undefined, 0 exported'",
+        bool(patched) and still_dyn is not None and still_dyn["type"] == "dyn"
+        and broken_result is None,
+        f"patched {patched} section(s); elf_info={still_dyn}; "
+        f"elf_symbols={broken_result!r}"))
+
     print()
     bad = 0
     for label, ok, detail in checks:

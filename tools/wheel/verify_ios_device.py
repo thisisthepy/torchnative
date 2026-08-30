@@ -499,15 +499,27 @@ def find_sibling(device: Path) -> tuple[Path | None, str]:
     return matches[0], ""
 
 
-def ladder(findings: Findings, compared: bool) -> None:
-    symbols_ok = not any("not exported by" in p or "dynamically looked up" in p
-                         for p in findings.problems)
+def ladder(link_findings: Findings, compare_findings: Findings,
+          compared: bool) -> list[tuple[str, bool, str]]:
+    """Print the ladder and return it as `(label, done, note)`.
+
+    Each row is judged from the `Findings` that its own check populated --
+    `link_findings` from `check_not_loadable_here`/`check_link_closure`,
+    `compare_findings` from `check_same_but_the_binary` (or the sibling being
+    unavailable). A blind spot or a problem in one has no way to reach the
+    other's row: on 2026-08-30 the "symbols resolved" row read `[NO]` off a
+    blind spot in the *sibling comparison*, with 0/222 symbols actually
+    unresolved, because both checks were writing into one shared `Findings`
+    and this used its `blind` list unfiltered. Two separate `Findings`
+    objects -- one per rung -- make that impossible rather than merely fixed:
+    there is no shared list left to leak through.
+    """
     rows = [
         ("built", True,
          "device Mach-O, tag an installer matches -- verify_cross.py"),
-        ("symbols resolved", symbols_ok and not findings.blind,
+        ("symbols resolved", link_findings.ok(),
          "every undefined symbol exported by the library it is bound to"),
-        ("same tree as the simulator wheel", compared and not findings.problems,
+        ("same tree as the simulator wheel", compared and compare_findings.ok(),
          "everything but the extension is byte-identical"),
         ("installed", False, "needs a device: no iOS filesystem here"),
         ("imported", False,
@@ -523,6 +535,7 @@ def ladder(findings: Findings, compared: bool) -> None:
           "  in a real app bundle, code signing, `import torch` completing, "
           "any kernel computing,\n"
           "  and every performance number. See docs/IOS.md §10.")
+    return rows
 
 
 # ------------------------------------------------------------------ self-test
@@ -534,8 +547,10 @@ def self_test(device: Path, sibling: Path | None) -> int:
     looks nowhere, so each fault is aimed at one judgement, and the two kinds
     of answer -- a finding about the wheel, and the check being unable to
     look -- are asserted to come back as themselves rather than as each
-    other. The last two cases are `find_sibling` itself, against a scratch
-    multi-version directory shaped exactly like the real `dist/`.
+    other. Cases 6 and 7 are `find_sibling` itself, against a scratch
+    multi-version directory shaped exactly like the real `dist/`. Case 8 is
+    `ladder()` itself: that a blind spot in one rung's check cannot flip
+    another rung's verdict.
     """
     sdk, error = sdk_root("iphoneos")
     if sdk is None:
@@ -650,6 +665,39 @@ def self_test(device: Path, sibling: Path | None) -> int:
             "matched", ok,
             f"got {got.name if got else got!r}, error={err!r}"[:200]))
 
+        # 8. `ladder()` itself: the exact 2026-08-30 shape. `check_link_closure`
+        #    on our own real extension finds nothing wrong (0/222 unresolved --
+        #    same as case 1's provider being consulted for real, just clean
+        #    this time), and a *separate* phase (the sibling comparison) is
+        #    blind. Before this file kept one `Findings` per rung, the ladder
+        #    read "symbols resolved" off the whole shared `findings.blind`, so
+        #    a blind spot that had nothing to do with symbols dragged that row
+        #    to `[NO]` anyway -- confirmed live against a real device wheel
+        #    with no simulator sibling beside it: 0 unresolved, row still NO.
+        #    Two independent `Findings` make that impossible: there is no
+        #    shared list left for one rung's blind spot to leak through into
+        #    another's.
+        clean_link = Findings()
+        check_link_closure("torch/_C.abi3.so", extension,
+                           DEVICE_PYTHON / "Python.framework" / "Python", sdk,
+                           clean_link, quiet=True)
+        blind_compare = Findings()
+        blind_compare.blind.append(
+            "no simulator wheel to compare against -- stands in for the "
+            "sibling being absent or version-mismatched")
+        rows = ladder(clean_link, blind_compare, compared=False)
+        row = dict((label, done) for label, done, _ in rows)
+        ok = (not clean_link.problems and not clean_link.blind
+             and row["symbols resolved"] is True
+             and row["same tree as the simulator wheel"] is False)
+        results.append((
+            "a blind sibling comparison does not downgrade 'symbols resolved' "
+            "(the ladder is judged per rung, not off one shared findings list)",
+            "yes/NO", ok,
+            f"link findings clean={not clean_link.problems and not clean_link.blind}, "
+            f"'symbols resolved'={row.get('symbols resolved')!r}, "
+            f"'same tree...'={row.get('same tree as the simulator wheel')!r}"))
+
     print(f"SELF-TEST against {device.name}")
     caught = 0
     for label, want, ok, text in results:
@@ -706,7 +754,13 @@ def main() -> None:
     if sdk is None:
         sys.exit(f"cannot locate the {args.sdk} SDK: {error}")
 
-    findings = Findings()
+    # Two `Findings`, kept apart the same way `problems` and `blind` are kept
+    # apart within each: one per rung of the ladder, so a blind spot or a
+    # problem in one phase has no shared list through which to reach the
+    # other phase's verdict. `findings` below is only for the final combined
+    # report (FAIL / CANNOT JUDGE) and the exit code, which do want both.
+    link_findings = Findings()
+    compare_findings = Findings()
     print(f"{args.wheel.name}")
     print(f"  framework  {args.framework}")
     print(f"  sdk        {sdk}")
@@ -716,15 +770,16 @@ def main() -> None:
         members = [n for n in zf.namelist() if n in PLATFORM_MEMBERS]
         if not members:
             sys.exit(f"{args.wheel.name} carries none of {PLATFORM_MEMBERS}")
-        check_not_loadable_here(members[0], zf.read(members[0]), findings)
+        check_not_loadable_here(members[0], zf.read(members[0]), link_findings)
 
         print("\n+ every undefined symbol, against the library it is bound to")
         for name in members:
-            check_link_closure(name, zf.read(name), args.framework, sdk, findings)
+            check_link_closure(name, zf.read(name), args.framework, sdk,
+                               link_findings)
 
     print("\n+ the rest of the archive, against the simulator wheel")
     if sibling is None or not sibling.exists():
-        findings.blind.append(
+        compare_findings.blind.append(
             (sibling_error or
              "no simulator wheel to compare against -- build one with "
              "`build.py --target ios-arm64-sim` or pass --against")
@@ -733,9 +788,14 @@ def main() -> None:
         print(f"  (none -- {sibling_error or 'not found'})")
     else:
         print(f"  {sibling.name}")
-        check_same_but_the_binary(args.wheel, sibling, findings)
+        check_same_but_the_binary(args.wheel, sibling, compare_findings)
 
-    ladder(findings, compared=sibling is not None and sibling.exists())
+    ladder(link_findings, compare_findings,
+          compared=sibling is not None and sibling.exists())
+
+    findings = Findings()
+    findings.problems = link_findings.problems + compare_findings.problems
+    findings.blind = link_findings.blind + compare_findings.blind
 
     sys.stdout.flush()
     if findings.problems:

@@ -766,12 +766,43 @@ def self_test(wheel: Path, reference: Path | None) -> int:
                 print(f"  caught      {label}")
             broken.unlink()
 
+    # `_default_reference`'s own version-scoping, exercised directly rather
+    # than through a tampered wheel -- the counterpart of `find_sibling`'s
+    # cases 6/7 in verify_ios_device.py. `dist/` holds several released
+    # versions side by side by design; an unscoped `sorted(glob(...))[-1]`
+    # (what this function replaced) picks whichever sorts last regardless of
+    # which version `wheel` is. That shape of bug, in `find_sibling`, compared
+    # a 0.0.4a0 wheel against a 0.0.2a0 sibling on 2026-08-30 and reported
+    # PASS -- and here it is worse than harmless: every one of the ~120
+    # `{name}-{version}.data/...` paths differs by construction between any
+    # two versions, so a version-mismatched reference guarantees "are missing
+    # here" in the report whether or not a real drop happened, which is
+    # exactly the phrase the "part of the vendored tree dropped" fault mode
+    # above checks for -- an unscoped picker would make that fault mode catch
+    # nothing, silently, by being permanently pre-satisfied.
+    with tempfile.TemporaryDirectory() as tmp:
+        multiversion = Path(tmp)
+        for v in ("0.0.2a0", "0.0.3a0", "0.0.4a0"):
+            (multiversion / f"{name}-{v}-cp313-abi3-macosx_11_0_arm64.whl").touch()
+        old = multiversion / f"{name}-0.0.2a0-cp313-abi3-{plat}.whl"
+        old.touch()
+        want = multiversion / f"{name}-0.0.2a0-cp313-abi3-macosx_11_0_arm64.whl"
+        picked = _default_reference(old)
+        ref_ok = picked == want
+    print(f"  {'caught      ' if ref_ok else 'NOT CAUGHT  '}"
+          "_default_reference picks the SAME-VERSION macosx wheel beside a "
+          "wheel, not whichever version sorts last")
+    if not ref_ok:
+        print(f"      wanted {want}, got {picked}")
+    caught += ref_ok
+    total = len(faults) + 1
+
     print()
-    if caught != len(faults):
-        print(f"SELF-TEST: FAIL -- {len(faults) - caught} of {len(faults)} fault "
+    if caught != total:
+        print(f"SELF-TEST: FAIL -- {total - caught} of {total} fault "
               "modes were not reported for the right reason", file=sys.stderr)
         return 1
-    print(f"SELF-TEST: PASS -- {caught}/{len(faults)} fault modes rejected")
+    print(f"SELF-TEST: PASS -- {caught}/{total} fault modes rejected")
     return 0
 
 
@@ -802,6 +833,37 @@ def _impossible(plat: str) -> str:
     return re.sub(r"^ios_\d+_\d+", "ios_11_0", plat)
 
 
+def _default_reference(wheel: Path) -> Path | None:
+    """The `{name}-{version}-*macosx*.whl` beside `wheel`, if there is one.
+
+    Version-scoped on purpose. `tools/wheel/verify_ios_device.py`'s
+    `find_sibling` had the unscoped form of this picker --
+    `sorted(glob(...))[0]` over every version in the directory -- and on
+    2026-08-30 it compared a 0.0.4a0 device wheel against a 0.0.2a0 simulator
+    wheel and reported PASS. It was harmless there only because the vendored
+    tree had not changed between those two releases, which is luck, not a
+    check. This repository's `dist/` holds several versions side by side by
+    design (0.0.2a0 through 0.0.4a0 as of 2026-08-31), so an unscoped picker
+    here is not a hypothetical: `sorted(glob("*macosx*.whl"))[-1]` -- what
+    this function replaces below at the `--self-test` call site -- silently
+    picked the newest macosx wheel in the directory regardless of which
+    version `wheel` is, and every one of the ~120 `{name}-{version}.data/...`
+    paths differs by construction between any two versions. That is enough
+    spurious "missing"/"gained" noise on its own to make the self-test's
+    "part of the vendored tree dropped" fault mode pass whether or not the
+    deliberate drop it exists to catch actually happened -- the phrase it
+    looks for, "are missing here", is already in the report before the tamper
+    runs. Shared by both the `--self-test` default and the production default
+    below so there is one picker, not two that can drift apart.
+    """
+    parts = wheel.stem.split("-")
+    if len(parts) < 5:
+        return None
+    name, version = parts[0], parts[1]
+    candidates = sorted(wheel.parent.glob(f"{name}-{version}-*macosx*.whl"))
+    return candidates[-1] if candidates else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -809,7 +871,8 @@ def main() -> None:
     ap.add_argument("--reference", type=Path, default=None,
                     help="a wheel whose file list this one must match, to catch "
                          "a cross wheel that quietly lost part of the tree "
-                         "(default: the newest macosx wheel beside it)")
+                         "(default: the newest macosx wheel of the SAME name "
+                         "and version beside it)")
     ap.add_argument("--self-test", action="store_true",
                     help="damage this wheel nine ways and check that each is "
                          "reported, with the right reason")
@@ -821,8 +884,7 @@ def main() -> None:
     if args.self_test:
         reference = args.reference
         if reference is None:
-            found = sorted(args.wheel.parent.glob("*macosx*.whl"))
-            reference = found[-1] if found else None
+            reference = _default_reference(args.wheel)
         sys.exit(self_test(args.wheel, reference))
 
     parts = args.wheel.stem.split("-")
@@ -929,9 +991,7 @@ def main() -> None:
         #    means the tree behind it changed between builds.
         reference = args.reference
         if reference is None:
-            candidates = sorted(args.wheel.parent.glob(
-                f"{name}-{version}-*macosx*.whl"))
-            reference = candidates[-1] if candidates else None
+            reference = _default_reference(args.wheel)
         if reference is None:
             problems.append(
                 "no reference wheel to compare the file list against; build the "

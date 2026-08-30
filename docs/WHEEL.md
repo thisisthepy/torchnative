@@ -731,10 +731,19 @@ torch/_C.abi3.so   222 undefined
 앱에서는 `@executable_path/Frameworks` 로 해석됩니다), **코드 서명**, **`import torch` 완주**,
 **계산과 성능**입니다. 전부 실기가 있어야 합니다.
 
-도구는 다섯 가지로 스스로를 망가뜨려 보고 각각이 **올바른 종류의 답**으로 깨지는지 확인합니다
-(`--self-test`, 5/5). 특히 **"휠에 대한 발견"(`FAIL:`)과 "검사가 못 봄"(`CANNOT JUDGE:`)을
+도구는 여덟 가지로 스스로를 망가뜨려 보고 각각이 **올바른 종류의 답**으로 깨지는지 확인합니다
+(`--self-test`, 8/8). 특히 **"휠에 대한 발견"(`FAIL:`)과 "검사가 못 봄"(`CANNOT JUDGE:`)을
 섞지 않습니다** — 프레임워크를 엉뚱한 Mach-O 로 바꾸면 118 개 미해결로 `FAIL`, 프레임워크를
 아예 치우면 `CANNOT JUDGE` 입니다.
+
+**그 구분이 사다리의 각 칸에도 따로 적용됩니다 (2026-08-31 정정).** 사다리를 찍는 `ladder()`
+는 한동안 "symbols resolved" 칸을 `symbols_ok and not findings.blind` 로 계산했는데, 여기
+`findings.blind` 는 심볼 검사와 형제 비교(시뮬레이터 휠과의 파일 비교) 가 **함께 쓰는 목록**
+이었습니다. 그래서 형제 비교 쪽이 눈멀면(예: 짝지을 시뮬레이터 휠이 없으면) 심볼과 아무 상관
+없는 그 눈멂이 "symbols resolved" 칸을 `[NO]` 로 끌어내렸습니다. 실기 휠로 재현: 222 개 심볼이
+전부 자기 라이브러리에서 풀려도(0 unresolved), 형제 비교만 눈멀게 하면 그 칸이 여전히 `[NO]`
+였습니다. 지금은 심볼 검사와 형제 비교가 각자의 `Findings` 를 씁니다 — 사다리의 각 칸이 자기
+자신의 증거로만 판정되고, 다른 칸의 눈멂이 새어 들어올 공유 목록 자체가 없습니다.
 
 또 하나 미결로 남는 것: iOS 앱은 App Store 규칙상 바이너리 모듈을 `.framework` 로 담아야 하고,
 PEP 730 휠 안의 `.so` 를 프레임워크로 바꾸는 것은 **앱 패키징 도구의 일**입니다(briefcase 가
@@ -743,28 +752,46 @@ PEP 730 휠 안의 `.so` 를 프레임워크로 바꾸는 것은 **앱 패키징
 
 ### 7.5 검증이 실제로 실패하는지 확인했다
 
-"실패할 수 없는 검증은 검증이 아니다". `verify_cross.py --self-test` 는 좋은 휠을 아홉 가지로
+"실패할 수 없는 검증은 검증이 아니다". `verify_cross.py --self-test` 는 좋은 휠을 여러 가지로
 망가뜨린 뒤, 각각이 **올바른 이유로** 거절되는지 봅니다. 종료 코드만 보지 않고 보고 문구를
-맞춰 보는 이유는, 파일 목록 비교가 나머지 여덟 개를 전부 흡수해 버리기 때문입니다.
+맞춰 보는 이유는, 파일 목록 비교가 나머지를 전부 흡수해 버리기 때문입니다.
 
 ```
-SELF-TEST against torchnative-0.0.1a0-cp313-abi3-android_21_arm64_v8a.whl
+SELF-TEST against torchnative-0.0.4a0-cp313-abi3-android_21_arm64_v8a.whl
   caught      extension built for the wrong platform
   caught      global-deps library missing
   caught      global-deps library under the host's name
-  caught      wall-4 marker missing
   caught      a member edited without updating RECORD
   caught      part of the vendored tree dropped
+  caught      extension missing
   caught      WHEEL Tag: out of step with the filename
+  caught      wall-4 marker missing
   caught      platform tag no installer would generate
   caught      abi tag downgraded from abi3
+  caught      _default_reference picks the SAME-VERSION macosx wheel beside a
+              wheel, not whichever version sorts last
 
-SELF-TEST: PASS -- 9/9 fault modes rejected
+SELF-TEST: PASS -- 11/11 fault modes rejected
 ```
 
-세 크로스 휠 전부에서 9/9 입니다. 손상은 헤더 필드를 직접 고쳐 만들므로 — ELF 의 `e_machine`,
-Mach-O 의 `LC_BUILD_VERSION.platform` — **디스크에 다른 아티팩트가 있든 없든 아홉 개가 매번 다
-돕니다.** 건너뛴 항목이 통과처럼 보이는 일이 없습니다.
+**공통 고장 모드는 아홉이지만, 세 크로스 휠이 같은 개수는 아닙니다** — manylinux 는 §2.6 함정을
+잡는 태그-바닥 케이스가 하나 더 있어 12/12, Windows 는 global-deps 관련 두 케이스 대신 "이
+플랫폼은 아무것도 로드하지 않는데 있는" 한 케이스만 있어 9/9 입니다. 손상은 헤더 필드를 직접
+고쳐 만들므로 — ELF 의 `e_machine`, Mach-O 의 `LC_BUILD_VERSION.platform` — **디스크에 다른
+아티팩트가 있든 없든 그 개수가 매번 다 돕니다.** 건너뛴 항목이 통과처럼 보이는 일이 없습니다.
+
+**`--self-test` 자신의 기준 휠 고르개도 버전으로 짝짓습니다 (2026-08-31 정정).** `--reference`
+없이 `--self-test` 를 돌리면 비교 대상 macosx 휠을 고르는데, 한동안 이 기본값이 `find_sibling`
+의 원래 결함과 같은 모양이었습니다 — `sorted(glob("*macosx*.whl"))[-1]`, 버전 구분 없이
+정렬상 마지막 것. 운영 경로의 기본값(§7.4 의 `find_sibling` 바로 아래, 이 파일 내
+`_default_reference`)은 이미 `{name}-{version}-*macosx*.whl` 로 버전을 넣어 골랐지만
+`--self-test` 쪽만 그 필터가 빠져 있었습니다. `dist/` 에 0.0.2a0 부터 0.0.4a0 까지 나란히
+있는 지금, 이것은 가정이 아니라 실측입니다: 0.0.2a0 안드로이드 휠을 셀프테스트하면서
+`--reference` 를 생략하면 0.0.4a0 macosx 휠이 골렸고, 두 버전의 `{name}-{version}.data/...`
+경로가 구성상 항상 다르므로 그 자체로 "missing here" 문구가 나와 — "part of the vendored tree
+dropped" 케이스가 **실제로 드롭이 있었는지와 무관하게** 통과했습니다. 지금은 `--self-test` 도
+운영 경로와 같은 `_default_reference` 를 쓰고, 그 자체를 시험하는 케이스(위 목록의 마지막 줄)
+가 추가되었습니다.
 
 기기 쪽 음성 대조는 §7.3.1 의 세 번째 줄입니다.
 
@@ -1147,4 +1174,88 @@ $PY  tools/wheel/verify_ios_device.py --self-test dist/*iphoneos*  ->  EXIT=0,  
 산출물을 만들지 않았습니다. **`build.py --target android-arm64-v8a` 를 실제로 돌려 확인한
 결과**는 신선도 검사가 아니라 그 앞 단계인 **기존의 "산출물이 없다" 거절**입니다 (EXIT=1).
 §11.3 의 2 번이 말하는 대칭이 그것입니다 — 없음과 낡음이 같은 자리에서 같은 문서를 가리킵니다.
+
+---
+
+## 15. 검증 도구 자체를 감사한 회차 (2026-08-31) — 실패할 수 없는 검사를 찾는다
+
+하루 안에 `tools/wheel/` 에서 결함 셋이 같은 모양으로 나왔습니다: 전부 "무언가를 잡으려던
+검사인데 잡지 못했다" 는 뜻이었습니다 — `verify()` 는 MISSING 만 알아서 `.DS_Store` 가 여섯
+휠에 실렸고, `preflight()` 는 살아있는 소스 트리만 봐서 낡은 setuptools 빌드 캐시를 못 봤고,
+`find_sibling()` 은 `sorted(glob(...))[0]` 이라 0.0.4a0 실기 휠을 0.0.2a0 시뮬레이터 휠과
+비교하고도 PASS 를 냈습니다. 앞의 둘은 그 자리에서 고쳐졌고, 세 번째는 **보고만 되고 고쳐지지
+않은 채** 이 회차의 출발점이었습니다: `verify_ios_device.py` 의 `ladder()` 가 "symbols
+resolved" 칸을 `symbols_ok and not findings.blind` 로 계산하는데, 이 `findings.blind` 가 심볼
+검사와 형제 비교가 **함께 쓰는 목록**이라 형제 비교 쪽의 눈멂이(심볼과 무관해도) 그 칸을
+`[NO]` 로 끌어내렸습니다. §7.4 에 재현과 정정을 적어 두었습니다.
+
+**결함 수정**
+
+- `tools/wheel/verify_ios_device.py` `ladder()` — 심볼 검사와 형제 비교가 각자의 `Findings`
+  를 쓰도록 분리. 사다리의 각 칸이 자기 증거로만 판정되고, 다른 칸의 눈멂이 새어 들어올 공유
+  목록이 없어졌습니다 (§7.4)
+- `tools/wheel/verify_cross.py` `--self-test` 의 기준 휠 고르개 — `sorted(glob("*macosx*.whl"))
+  [-1]` (버전 구분 없음) 을 운영 경로와 같은 `_default_reference`(`{name}-{version}-
+  *macosx*.whl`) 로 교체. `dist/` 에 여러 버전이 나란히 있는 지금 실측으로 재현: 버전이 안
+  맞는 기준 휠을 골랐을 때, 두 버전의 `.data/...` 경로 차이만으로 "part of the vendored tree
+  dropped" 케이스가 실제 드롭 여부와 무관하게 통과했습니다 (§7.5)
+- `tools/wheel/binfmt.py` `elf_symbols()` — 읽을 수 있는 섹션 헤더 안에 `SHT_DYNSYM` 이 아예
+  없으면 `None` (읽기 실패) 을 답하도록 정정. 전에는 `{"defined": set(), "undefined": []}` 를
+  답해서, 동적 공유 객체의 섹션 헤더 하나만 손상돼도(다른 모든 것은 멀쩡해도) `verify_linux.py`
+  가 "0 undefined, 0 unresolved" 로 깨끗하게 통과했습니다. 실제 `libtorch_global_deps.so` 의
+  섹션 하나의 `sh_type` 을 `SHT_DYNSYM` 에서 `SHT_NULL` 로 바꿔 재현
+- `tools/wheel/build.py` `LinuxTarget._check_policy()` — `elf_dynamic(artefact) or
+  {"needed": []}` 가 "읽을 수 없음" 과 "링크한 게 없음" 을 같은 답으로 접었습니다. 두 메서드
+  아래 `_glibc_floor()` 는 이미 그 둘을 구분하는데(주석이 그 이유까지 적어 두었습니다)
+  `_check_policy()` 만 빠져 있었습니다. `platform_tag()` 가 같은 바이트로 `_glibc_floor()` 를
+  바로 뒤에 부르는 덕에 오늘까지는 가려져 있었을 뿐 — 그 호출 순서가 바뀌거나 `_check_policy`
+  가 다른 데서도 불리면 그 즉시 드러났을 결함입니다
+- `tools/wheel/build.py` `upstream_dist_info()` — 벤더링 트리에 `torch-*.dist-info` 가 없으면
+  `print()` 만 하고 빈 dict 를 반환했습니다. 그 dict 가 `extra` 로 들어가고, `verify()` 의
+  "누락"/"안 부른 것" 두 검사 모두 `expected`(패키지 트리 걷기) 와 `extra` 로만 판단하므로 —
+  둘 다 이 파일을 애초에 이름 붙인 적이 없어 그 부재를 볼 방법이 없었습니다. 지금은 거절합니다
+
+**테스트 추가** (기존 스위트에 케이스만 더한 것 / 새 스위트를 만든 것을 나눕니다)
+
+- `verify_ios_device.py --self-test` 7/7 → 8/8 — `ladder()` 자체를 시험하는 케이스. 심볼 검사가
+  깨끗해도(0/222 미해결) 형제 비교가 눈멀면 "symbols resolved" 칸은 여전히 `yes` 여야 함을 확인
+- `verify_cross.py --self-test` — 안드로이드/실기 10/10 → 11/11, manylinux 11/11 → 12/12,
+  Windows 8/8 → 9/9. `_default_reference` 가 버전으로 짝짓는지를 직접 시험하는 케이스
+- `verify_linux.py --self-test` 5/5 → 6/6 — `SHT_DYNSYM` 이 없는 ELF 가 `None` 을 답하는지
+  직접 시험하는 케이스
+- `build.py --self-test` — LINUX 스위트 10/10 → 11/11 (`_check_policy` 케이스), VERIFY 스위트
+  3/3 → 4/4 (**"누락" 방향이 이 스위트에 한 번도 없었습니다** — 세 케이스 다 `expected` 의
+  모든 파일을 항상 포함해서 만들었으므로, `verify()` 의 "누락" 검사가 통째로 회귀해도 3/3 은
+  그대로 PASS 였을 것입니다: 규칙 문자열 하나를 지운 채로 실제로 돌려서 확인), UPSTREAM-DIST-
+  INFO 새 스위트 2/2 (`upstream_dist_info` 전용)
+
+**문서 정정**
+
+- §7.4 의 "5/5" 를 8/8 로, §7.5 의 "9/9"(세 크로스 휠 공통) 를 실측(안드로이드/실기 11/11,
+  manylinux 12/12, Windows 9/9) 으로 정정. §11.4/§12 의 8/8 은 신선도 스위트 것으로 그대로
+  둡니다 — 이번 회차가 건드리지 않았습니다
+
+**감사했지만 결함이 아니라고 판정한 것** (기준과 함께)
+
+- `verify_windows.py --self-test` 의 `for candidate in sorted(REPO.glob("dist/*win_amd64.whl")):`
+  (break 없이 마지막 것이 남음) — `_default_reference` 와 같은 모양이지만, 세 버전
+  (0.0.2a0/0.0.3a0/0.0.4a0) 의 `torch/_C.pyd` PE import 테이블을 직접 비교해 확인: 셋 다
+  `python3.dll` 119 개 · `python313.dll` 0 개 · DLL 11 개로 **완전히 같습니다** — abi3 안정
+  ABI 표면이라 어느 버전을 고르든 이 self-test 의 판정이 달라지지 않습니다. 구조는 손봐야 할
+  냄새지만 오판을 만들지는 않습니다
+- `verify_android.py` · `verify_ios_sim.py` — `--self-test` 자체가 없고(실기/시뮬레이터가
+  있어야 함), `adb shell` 의 종료 코드를 신뢰하지 않는다는 것도 주석에 명시돼 있어(마커 줄로만
+  판정) 같은 모양의 결함을 찾지 못했습니다
+- `verify_cross.py` 의 `AndroidExpectation`/`LinuxExpectation`/`WindowsExpectation.interpreters`
+  — `sorted(glob(...))` 로 여러 인터프리터를 모을 수 있지만 `check_suffix_is_searched()` 가
+  **전부**를 순회해 확인하므로(`[0]`/`[-1]` 로 하나만 고르지 않음) 여러 개 중 하나만 보는 결함이
+  아닙니다
+
+**손대지 않은 것**
+
+- `rust/torch_c/` · `tools/golden/` — 한 줄도 (다른 에이전트 담당)
+- `dist/` — PyPI 에 올라간 0.0.4a0 휠들에 손대지 않았습니다. 검증은 전부 `/tmp` 사본과 실제
+  배포된 `torchnative` 저장소의 `dist/` (읽기 전용) 로 했습니다 — `twine check dist/*0.0.4a0*`
+  와 sha256 로 그대로임을 확인했습니다
+- 업로드 · 커밋 · 빌드 (휠을 새로 만들지 않았습니다 — 감사 대상은 도구지 산출물이 아닙니다)
 호스트 두 줄은 그 앞에서 통과했습니다.

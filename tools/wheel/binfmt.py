@@ -351,12 +351,32 @@ def elf_symbols(data: bytes) -> dict | None:
     unbound.
 
     Returns `None` when the bytes are not a readable 64-bit ELF with section
-    headers -- the same "could not run" answer `elf_dynamic` gives.
+    headers -- the same "could not run" answer `elf_dynamic` gives. Unlike
+    `elf_dynamic`, a *readable* ELF with no `SHT_DYNSYM` section also answers
+    `None` rather than the empty `{"defined": set(), "undefined": []}`: a
+    `DT_DYNAMIC`-less ELF is a legitimate thing (a static executable), so
+    `elf_dynamic` reporting empty fields for one is a finding. A `.dynsym`-less
+    *dynamic* shared object is not a legitimate thing -- `ld.so` could not
+    resolve a single symbol in or out of it -- so its absence here means the
+    section table this read could not be trusted, not that the image needs
+    nothing. Confirmed live: zeroing one section's `sh_type` from `SHT_DYNSYM`
+    to `SHT_NULL` in an otherwise-untouched `libtorch_global_deps.so` --
+    `elf_info` still reports it as a normal 64-bit x86-64 `dyn` ELF -- used to
+    make this return `{"defined": 0 symbols, "undefined": 0 symbols}`, which
+    `verify_linux.py`'s `resolve()` reports as "0 undefined (0 exported)" and
+    "0 unresolved": a clean PASS on a file whose symbol table was never read.
     """
     parsed = _elf_sections(data)
     if parsed is None:
         return None
     endian, sections, cstr = parsed
+
+    dynsym_sections = [s for s in sections if s["type"] == SHT_DYNSYM]
+    if not dynsym_sections:
+        # See the docstring: for a dynamic shared object this is not "it
+        # defines and needs nothing", it is this read having failed to find
+        # the one section the whole answer depends on.
+        return None
 
     dynamic = elf_dynamic(data) or {"version_index": {}}
     by_index = dynamic["version_index"]
@@ -371,8 +391,8 @@ def elf_symbols(data: bytes) -> dict | None:
 
     defined: set[str] = set()
     undefined: list[tuple[str, str | None, str | None, bool]] = []
-    for section in sections:
-        if section["type"] != SHT_DYNSYM or section["entsize"] != 24:
+    for section in dynsym_sections:
+        if section["entsize"] != 24:
             continue
         if section["link"] >= len(sections):
             continue

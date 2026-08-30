@@ -1062,7 +1062,26 @@ class LinuxTarget(Target):
         return floor
 
     def _check_policy(self, artefact: bytes) -> list[str]:
-        info = elf_dynamic(artefact) or {"needed": []}
+        info = elf_dynamic(artefact)
+        if info is None:
+            # The same distinction `_glibc_floor` two methods above makes, and
+            # for the same reason: `elf_dynamic` returning `None` means the
+            # section headers this reads DT_NEEDED from could not be found,
+            # not that the image links nothing. Folding that into
+            # `{"needed": []}` would make an unreadable artefact read as
+            # policy-compliant -- `outside` empty, nothing refused -- which is
+            # backwards: the check found nothing to say because it could not
+            # look, not because there was nothing wrong. `platform_tag` below
+            # happens to call `_glibc_floor` on the same bytes right after,
+            # which does make this distinction and would catch the same
+            # unreadable artefact -- but that is this method being right by
+            # a caller's coincidence, not by its own contract, and any other
+            # caller would not get that protection for free.
+            _fail(
+                f"{self.artefact} could not be read as a 64-bit ELF with "
+                "section headers, so its DT_NEEDED libraries -- which the "
+                "manylinux external-library policy (PEP 599) is checked "
+                "against -- are unavailable")
         needed = list(info["needed"])
         outside = sorted(set(needed) - self.POLICY_LIBRARIES)
         if outside:
@@ -1580,10 +1599,24 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
     """
     found = sorted(SRC.glob("torch-*.dist-info"))
     if not found:
-        print("  ! no upstream torch-*.dist-info in the vendored tree --")
-        print("    importlib.metadata.version('torch') will raise, and")
-        print("    transformers' is_torch_available() will answer False")
-        return {}
+        # Refused, not merely noted: `verify()`'s missing/unexpected checks
+        # cannot catch this on their own. `expected` is a walk of *package*
+        # directories (`tree_files(SRC / pkg)` in `main()`) and this
+        # directory sits at `SRC`'s top level, so `expected` never names any
+        # of its files; `extra` is exactly what this function returns, so an
+        # empty `{}` here means `extra` never names them either. A wheel
+        # missing this directory would therefore build and `verify()` clean
+        # -- `importlib.metadata.version('torch')` would raise on it and
+        # `transformers.is_torch_available()` would answer False, with
+        # nothing above having refused to ship that.
+        _fail(
+            f"no torch-*.dist-info under {SRC}\n"
+            "  vendor_torch.sh writes this as part of vendoring; without it "
+            "the wheel would\n  ship without upstream's own dist-info -- "
+            "importlib.metadata.version('torch') raises\n  and "
+            "transformers' is_torch_available() answers False, silently, "
+            "for anyone\n  who installs it. Re-run bash vendor/vendor_torch.sh."
+        )
     root = found[0]
     prefix = f"torchnative-{version}.data/purelib/{root.name}"
     out: dict[str, bytes] = {}
@@ -1972,6 +2005,22 @@ def self_test_linux() -> int:
         f"got: {said[:200]!r}",
     ))
 
+    # 5b. `_check_policy` makes the same distinction on the same kind of
+    #    input. Before this was enforced, unreadable bytes fed to
+    #    `_check_policy` came back `needed == []` -- policy-compliant,
+    #    silently -- because `elf_dynamic(artefact) or {"needed": []}`
+    #    could not tell "no libraries" from "could not read the libraries".
+    #    `platform_tag` happens to call `_glibc_floor` right after on the
+    #    same bytes and that call refuses, so this was masked in the only
+    #    call site that exists today -- exercised directly here so it is not
+    #    left depending on that call order.
+    said = refusal(target._check_policy, b"\xcf\xfa\xed\xfe" + b"\0" * 60)
+    checks.append((
+        "_check_policy on unreadable bytes refuses, not 'needed == []'",
+        "could not be read" in said,
+        f"got: {said[:200]!r}",
+    ))
+
     # 6. `check_image` keeps the wrong machine out. An aarch64 ELF is the one
     #    that would otherwise sail through -- it is an ELF, it is 64-bit, and it
     #    is a shared object.
@@ -2082,11 +2131,13 @@ def self_test_verify() -> int:
             dist_info = "torchnative-9.9.9.dist-info"
             wheel = tmpdir / "torchnative-9.9.9-cp313-abi3-macosx_11_0_arm64.whl"
 
-            def make_wheel(junk: str | None) -> None:
+            def make_wheel(junk: str | None, drop: str | None = None) -> None:
                 if wheel.exists():
                     wheel.unlink()
                 with zipfile.ZipFile(wheel, "w") as zf:
                     for name in sorted(expected):
+                        if name == drop:
+                            continue
                         zf.writestr(name, b"content")
                     for name, data in extra.items():
                         zf.writestr(name, data)
@@ -2096,8 +2147,8 @@ def self_test_verify() -> int:
                     if junk:
                         zf.writestr(junk, b"whatever a stale cache left behind")
 
-            def refusal(junk: str | None) -> str:
-                make_wheel(junk)
+            def refusal(junk: str | None, drop: str | None = None) -> str:
+                make_wheel(junk, drop)
                 try:
                     verify(wheel, set(expected), None, extra, dist_info)
                 except SystemExit as exc:
@@ -2105,21 +2156,32 @@ def self_test_verify() -> int:
                 return ""
 
             cases = [
-                ("a clean wheel", None, ""),
+                ("a clean wheel", None, None, ""),
                 ("a .DS_Store the source tree never had (2026-08-30's incident)",
-                 "torch/.DS_Store", "torch/.DS_Store"),
+                 "torch/.DS_Store", None, "torch/.DS_Store"),
                 ("a stray extension from a previous target",
-                 "torch/_C.cpython-311-darwin.so", "torch/_C.cpython-311-darwin.so"),
+                 "torch/_C.cpython-311-darwin.so", None,
+                 "torch/_C.cpython-311-darwin.so"),
+                # `verify`'s ORIGINAL job, before the unexpected-member check
+                # above existed: a wheel merely smaller than the source tree.
+                # `self_test_verify` had no case for this direction at all --
+                # every prior wheel here always carried every name in
+                # `expected`, so a regression that broke or disabled the
+                # `missing` check (verify()'s lines just above the
+                # unexpected-member one) would have passed 3/3 unnoticed.
+                ("a package file the source tree has but the wheel does not",
+                 None, "torch/lib/thing.py", "torch/lib/thing.py"),
             ]
-            for label, junk, must_contain in cases:
-                said = refusal(junk)
-                ok = (said == "") if junk is None else (must_contain in said)
+            for label, junk, drop, must_contain in cases:
+                said = refusal(junk, drop)
+                ok = (said == "") if junk is None and drop is None \
+                    else (must_contain in said)
                 bad += not ok
                 print(f"  {'ok    ' if ok else 'WRONG '}{label}"
                       + (f" -- refused: {said.splitlines()[0]}" if said else ""))
                 if not ok:
                     print(f"          expected "
-                          f"{'a clean PASS' if junk is None else 'refused, naming ' + repr(must_contain)}"
+                          f"{'a clean PASS' if junk is None and drop is None else 'refused, naming ' + repr(must_contain)}"
                           f"; got {said or '(passed)'}")
     finally:
         SRC = original_src
@@ -2202,6 +2264,78 @@ def self_test_preflight_cache() -> int:
     return bad
 
 
+def self_test_upstream_dist_info() -> int:
+    """Break `upstream_dist_info`'s refusal when the vendored tree lacks it.
+
+    `SRC` is swapped for the duration, same as `self_test_verify` and
+    `self_test_preflight_cache` do for their own module globals, restored in
+    `finally`.
+
+    Before this was enforced, a missing `torch-*.dist-info` produced only a
+    `print()` and an empty `dict`, which `main()` folds straight into both
+    `extra` (what actually goes in the wheel) and, through `extra`, what
+    `verify()` is told to expect -- so nothing downstream ever learned the
+    directory was supposed to exist. Case 1 is that absence, refused instead.
+    Case 2 is the ordinary path: a real `torch-<v>.dist-info` still comes back
+    relocated correctly, so the refusal is not bought by breaking the case
+    that has always worked.
+    """
+    import tempfile
+
+    global SRC
+    original_src = SRC
+    bad = 0
+
+    def refusal() -> str:
+        try:
+            upstream_dist_info("9.9.9")
+        except SystemExit as exc:
+            return str(exc)
+        return ""
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+
+            # 1. No torch-*.dist-info at all -- must refuse, not print-and-empty.
+            SRC = tmpdir / "no-dist-info"
+            SRC.mkdir()
+            said = refusal()
+            ok = "no torch-*.dist-info" in said
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}"
+                  "no torch-*.dist-info in the vendored tree -- refused, not "
+                  "silently empty")
+            if not ok:
+                print(f"          got: {said[:300]!r}")
+
+            # 2. A real one is still read and relocated correctly -- the
+            #    refusal above must not have cost this the normal path.
+            SRC = tmpdir / "with-dist-info"
+            info_dir = SRC / "torch-9.9.9.dist-info"
+            info_dir.mkdir(parents=True)
+            (info_dir / "METADATA").write_text("Metadata-Version: 2.1\n")
+            (info_dir / "RECORD").write_text("should not be copied\n")
+            out = upstream_dist_info("9.9.9")
+            want_key = "torchnative-9.9.9.data/purelib/torch-9.9.9.dist-info/METADATA"
+            ok = (out.get(want_key) == b"Metadata-Version: 2.1\n"
+                 and not any(k.endswith("/RECORD") for k in out))
+            bad += not ok
+            print(f"  {'ok    ' if ok else 'WRONG '}"
+                  "a real torch-*.dist-info is relocated under .data/purelib/, "
+                  "RECORD excluded")
+            if not ok:
+                print(f"          got keys: {sorted(out)}")
+    finally:
+        SRC = original_src
+
+    if bad:
+        print(f"UPSTREAM-DIST-INFO SELF-TEST: FAIL -- {bad}/2 wrong")
+    else:
+        print("UPSTREAM-DIST-INFO SELF-TEST: PASS -- 2/2 cases")
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
@@ -2224,6 +2358,8 @@ def main() -> None:
             failed.append("verify()'s unexpected-member check")
         if self_test_preflight_cache():
             failed.append("preflight's stale-build-cache refusal")
+        if self_test_upstream_dist_info():
+            failed.append("upstream_dist_info's missing-tree refusal")
         if failed:
             sys.exit("SELF-TEST: FAIL -- " + ", ".join(failed))
         return
