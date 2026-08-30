@@ -150,6 +150,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>119</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>2811 / 2811</b> — values, shapes, dtypes</td></tr>
+<tr><td>Smoke tests</td><td><b>211</b></td></tr>
 <tr><td>Signature and schema tables</td><td><b>4203</b> entries checked against upstream</td></tr>
 <tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
@@ -162,15 +163,11 @@ Complete: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT 
 Persimmon · Cohere · StableLM · OLMo · Phi · BERT · Falcon · BLOOM · GPT-BigCode
 
 `uniform_` and `normal_` are **bit-identical** to upstream, and `multinomial` consumes the same
-generator stream — a seeded run reproduces exactly.
+generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_like` forms and
+`torch.normal` are composed from those, and agree with upstream value for value under a seed.
 
 **Not working yet**
 
-- **`torch.randn` and `torch.rand` refuse**, which is worth saying first because it is the line
-  most people type first. The randomness underneath them is present and correct — `torch.empty(2,
-  3).normal_()` and `.uniform_()` both work, are bit-identical to upstream, and reproduce under a
-  seed; `torch.randint` works. What is missing is only the factory spelling, absent from the
-  overload table. Until it is wired, `torch.empty(shape).normal_()` is the exact equivalent.
 - Mixtral is the one incomplete architecture — `_grouped_mm`, an offset-based grouped GEMM
   with no equivalent here yet.
 - `torch.compile` does not work; it stops inside Dynamo. Eager execution is the supported path.
