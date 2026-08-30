@@ -17,7 +17,8 @@
 use candle_core::{Device, Tensor};
 use pyo3::prelude::*;
 use pyo3::PyErr;
-use pyo3::types::{PyDict, PyList, PyModule, PyTuple};
+use pyo3::intern;
+use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::device::PyDevice;
@@ -210,10 +211,92 @@ pub fn all_implemented() -> Vec<&'static str> {
 // gives the default float") call it rather than reading a copy, which is the
 // whole of what makes the setter load-bearing rather than decorative.
 
+/// What Python calls. A thin wrapper whose only job is to split `op` off the
+/// front of the argument tuple and hand the rest to `aten_dispatch`, which is
+/// still the one door and still where everything happens.
+///
+/// **The signature is exactly `(*args, **kwargs)` and takes no `py`, and both
+/// halves of that are load-bearing.** Anything else makes pyo3 take its
+/// general argument-extraction path: it iterates every keyword, `to_str()`s
+/// each key, compares it against the named parameters, and `set_item`s the
+/// survivors into a **freshly allocated `PyDict`** that is item-for-item the
+/// dict it was just handed (`DictVarkeywords::handle_varkeyword`,
+/// pyo3-0.29.2). That was the single largest shim-side leaf in the profile --
+/// 410 of 6031 samples, above every kernel.
+///
+/// The escape is `pyo3-macros-backend/src/params.rs::is_forwarded_args`,
+/// which forwards the caller's tuple and dict untouched:
+///
+/// ```ignore
+/// matches!(signature.arguments.as_slice(),
+///          [FnArg::VarArgs(..), FnArg::KwArgs(..),])
+/// ```
+///
+/// **`Python<'_>` is an `FnArg::Py` and therefore an element of that slice**,
+/// so a `py` parameter fails the match exactly as a named `op` does. That is
+/// not obvious and it is not documented; it cost a build and a profile to
+/// find, which is why it is written down here. `py` is recovered from
+/// `args.py()` instead -- the tuple is a live Python object, so it can hand
+/// back the token for free.
+///
+/// Nothing about the door changes for Python. `op` is still the first
+/// positional argument, still required, and an unimplemented operator is
+/// still refused *by name*; the two `TypeError`s pyo3 used to raise for a
+/// missing or non-string `op` are raised here instead, in the same words.
+///
+/// It is a wrapper rather than a rewrite of `aten_dispatch` because
+/// `capture.rs` replays a recorded graph by calling `aten_dispatch` from Rust,
+/// where the op is already a `String` and there is no tuple to split.
+#[pyfunction]
+#[pyo3(name = "_aten_dispatch", signature = (*args, **kwargs))]
+pub fn aten_dispatch_entry(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    // Not a parameter, for the reason in the doc comment above. `Python` is a
+    // zero-sized proof that the GIL is held, and `args` -- a live object we
+    // were handed while it is held -- can reproduce it without a C call.
+    let py = args.py();
+    // BORROWED, not owned. `PyTuple_GetItem` returns a borrowed reference and
+    // pyo3's `Borrowed` models exactly that -- no incref is taken here and
+    // none is released. Holding it for the rest of the call is sound because
+    // `args` is the caller's own argument tuple, which CPython keeps alive
+    // across the call, and the borrow's lifetime is tied to `args` by the type
+    // system rather than by this comment.
+    //
+    // That is what makes the `&str` below safe: it points into the
+    // interpreter's UTF-8 buffer for that string object and must not outlive
+    // it, and tying it to `args` makes that automatic rather than a rule
+    // someone has to remember.
+    let op_obj = args.get_borrowed_item(0).map_err(|_| {
+        // pyo3's own wording for the same mistake, kept verbatim so that
+        // anything matching on it keeps matching.
+        pyo3::exceptions::PyTypeError::new_err(
+            "_aten_dispatch() missing 1 required positional argument: 'op'",
+        )
+    })?;
+    let op: &str = op_obj.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "argument 'op': '{}' object cannot be converted to 'PyString'",
+            op_obj
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))
+    })?;
+    // OWNED. `PyTuple_GetSlice` returns a new reference; this `Bound` owns it
+    // and drops it at the end of the call. This is the identical slice pyo3's
+    // `TupleVarargs` handler used to build on the way in, so it is not a new
+    // cost -- and for the shape `bootstrap.py` actually emits (every argument
+    // bound by keyword, so `args` is just `(op,)`) the slice is empty and
+    // CPython hands back the interned empty tuple without allocating.
+    let rest = args.get_slice(1, args.len());
+    aten_dispatch(py, op, &rest, kwargs)
+}
+
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
-#[pyfunction]
-#[pyo3(name = "_aten_dispatch", signature = (op, *args, **kwargs))]
 pub fn aten_dispatch(
     py: Python<'_>,
     op: &str,
@@ -8919,6 +9002,114 @@ fn finish(py: Python<'_>, tensor: Tensor, tag: TorchDType) -> PyResult<Py<PyAny>
     Ok(wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
+/// Every argument name this file reads a keyword by, as an interned Python
+/// string that is built once per process instead of once per argument per
+/// call.
+///
+/// **This is a lookup table, not a source of truth.** A name that is missing
+/// falls through to `None` and the caller builds the string the old way, so
+/// the table can never make a call answer differently -- only more slowly.
+/// That is why it is safe to write it by hand and safe to leave it
+/// incomplete; adding an argument to a kernel without adding it here costs
+/// that kernel some nanoseconds and nothing else.
+///
+/// Why it is worth having: `bootstrap.py` binds every argument by keyword, so
+/// `optional` reaches the dict on essentially every read, and pyo3's
+/// `get_item(&str)` has to **allocate a fresh `PyString` and hash it from
+/// scratch** each time (a new string has no cached hash). In the profile that
+/// was `unicode_decode_utf8` 146 + `pysiphash` 139 of 6043 samples, plus the
+/// allocate/free traffic underneath it -- `dim_arg` -> `PyString::new` ->
+/// `unicode_dealloc` -> `_PyObject_Free` was a visible chain into CPython's
+/// thread-local allocator. An interned string is allocated once, carries its
+/// hash, and matches on pointer identity inside the dict probe.
+///
+/// The names were extracted mechanically from the helper call sites rather
+/// than typed out, so a name here cannot disagree with the name the kernel
+/// asks for. docs/DISPATCH.md §4.
+fn interned_name<'py>(py: Python<'py>, name: &str) -> Option<&'py Bound<'py, PyString>> {
+    // BORROWED, and borrowed from a process-lifetime cache. `intern!` stores
+    // the object in a `PyOnceLock` that is never cleared, so the reference is
+    // valid for as long as the interpreter is; nothing here increfs it and
+    // nothing may decref it.
+    Some(match name {
+        "self" => intern!(py, "self"),
+        "other" => intern!(py, "other"),
+        "dim" => intern!(py, "dim"),
+        "dtype" => intern!(py, "dtype"),
+        "size" => intern!(py, "size"),
+        "value" => intern!(py, "value"),
+        "keepdim" => intern!(py, "keepdim"),
+        "exponent" => intern!(py, "exponent"),
+        "alpha" => intern!(py, "alpha"),
+        "weight" => intern!(py, "weight"),
+        "src" => intern!(py, "src"),
+        "mat2" => intern!(py, "mat2"),
+        "indices" => intern!(py, "indices"),
+        "index" => intern!(py, "index"),
+        "generator" => intern!(py, "generator"),
+        "beta" => intern!(py, "beta"),
+        "tensors" => intern!(py, "tensors"),
+        "step" => intern!(py, "step"),
+        "start" => intern!(py, "start"),
+        "s" => intern!(py, "s"),
+        "min" => intern!(py, "min"),
+        "max" => intern!(py, "max"),
+        "mask" => intern!(py, "mask"),
+        "input" => intern!(py, "input"),
+        "end" => intern!(py, "end"),
+        "condition" => intern!(py, "condition"),
+        "bias" => intern!(py, "bias"),
+        "dim0" => intern!(py, "dim0"),
+        "dim1" => intern!(py, "dim1"),
+        "dims" => intern!(py, "dims"),
+        "device" => intern!(py, "device"),
+        "layout" => intern!(py, "layout"),
+        "memory_format" => intern!(py, "memory_format"),
+        "fill_value" => intern!(py, "fill_value"),
+        "normalized_shape" => intern!(py, "normalized_shape"),
+        "eps" => intern!(py, "eps"),
+        "half_to_float" => intern!(py, "half_to_float"),
+        "accumulate" => intern!(py, "accumulate"),
+        "attn_mask" => intern!(py, "attn_mask"),
+        "batch1" => intern!(py, "batch1"),
+        "batch2" => intern!(py, "batch2"),
+        "bins" => intern!(py, "bins"),
+        "descending" => intern!(py, "descending"),
+        "dilation" => intern!(py, "dilation"),
+        "dropout_p" => intern!(py, "dropout_p"),
+        "elements" => intern!(py, "elements"),
+        "from" => intern!(py, "from"),
+        "groups" => intern!(py, "groups"),
+        "high" => intern!(py, "high"),
+        "invert" => intern!(py, "invert"),
+        "is_causal" => intern!(py, "is_causal"),
+        "k" => intern!(py, "k"),
+        "key" => intern!(py, "key"),
+        "largest" => intern!(py, "largest"),
+        "low" => intern!(py, "low"),
+        "mat1" => intern!(py, "mat1"),
+        "mean" => intern!(py, "mean"),
+        "num_samples" => intern!(py, "num_samples"),
+        "output_padding" => intern!(py, "output_padding"),
+        "padding" => intern!(py, "padding"),
+        "query" => intern!(py, "query"),
+        "replacement" => intern!(py, "replacement"),
+        "scale" => intern!(py, "scale"),
+        "sorted" => intern!(py, "sorted"),
+        "sparse_grad" => intern!(py, "sparse_grad"),
+        "split_size" => intern!(py, "split_size"),
+        "split_sizes" => intern!(py, "split_sizes"),
+        "std" => intern!(py, "std"),
+        "stride" => intern!(py, "stride"),
+        "test_elements" => intern!(py, "test_elements"),
+        "threshold" => intern!(py, "threshold"),
+        "to" => intern!(py, "to"),
+        "transposed" => intern!(py, "transposed"),
+        "values" => intern!(py, "values"),
+        _ => return None,
+    })
+}
+
 fn optional<'py>(
     args: &Bound<'py, PyTuple>,
     kwargs: Option<&Bound<'py, PyDict>>,
@@ -8929,7 +9120,14 @@ fn optional<'py>(
         return Ok(Some(args.get_item(index)?));
     }
     match kwargs {
-        Some(kwargs) => kwargs.get_item(name),
+        // OWNED either way: `get_item` is `PyDict_GetItemRef`, which returns a
+        // *new* reference, and the `Bound` the caller receives owns it. The
+        // key is borrowed in the interned arm and temporary in the fallback
+        // arm, and neither is affected by what happens to the value.
+        Some(kwargs) => match interned_name(kwargs.py(), name) {
+            Some(key) => kwargs.get_item(key),
+            None => kwargs.get_item(name),
+        },
         None => Ok(None),
     }
 }
@@ -9254,7 +9452,7 @@ fn same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<Torc
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(aten_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(aten_dispatch_entry, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented, m)?)?;
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
