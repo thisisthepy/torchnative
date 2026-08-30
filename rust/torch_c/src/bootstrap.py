@@ -4429,6 +4429,8 @@ def _install_composites(module, varfns, dispatch) -> None:
     the one door, naming the kernel an inference-only shim does not need yet.
     """
 
+    tensorbase = module.TensorBase
+
     def dropout(input, p, train):
         if p == 0 or not train or input.numel() == 0:
             return input
@@ -4520,6 +4522,226 @@ def _install_composites(module, varfns, dispatch) -> None:
     isfinite.__name__ = isfinite.__qualname__ = "isfinite"
     isfinite.__module__ = "torch._C"
     setattr(varfns, "isfinite", isfinite)
+
+    # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
+    #
+    # docs/RANDOM.md. There is no `aten::randn`/`aten::rand` kernel in
+    # `aten.rs` -- only `aten.empty.memory_format` and
+    # `aten.uniform_.default`/`aten.normal_.default` -- so these cannot be
+    # `overloads.json` entries (a schema entry would name a kernel this shim
+    # does not have, the same complaint the table's own README makes about
+    # `layer_norm`). Real torch's *own* C++ body for these factories is the
+    # same composition: measured against torch 2.13.0, seeded
+    # `torch.randn(4, 4)` is bit-identical to seeded
+    # `torch.empty(4, 4).normal_(0., 1.)`, and the same holds for
+    # `rand`/`uniform_`, `rand_like`/`randn_like`, and every one of
+    # `torch.normal`'s four overloads against `mean + std * randn(shape)`
+    # (`shape` being the broadcast of `mean`'s and `std`'s shapes when both
+    # are tensors) -- so composing here, in Python, reproduces upstream's
+    # generator stream exactly rather than approximating it.
+    #
+    # `out=` is refused by name on all of them rather than silently ignored:
+    # upstream *resizes* the given tensor to the requested shape
+    # (`torch.randn(4, 4, out=torch.empty(2, 2))` returns a 4x4 tensor), and
+    # there is neither `aten::empty.out` nor a generic `resize_` in `aten.rs`
+    # to do that with. `dtype`/`layout`/`device`/`pin_memory`/`generator`/
+    # `requires_grad` are not reimplemented here either -- they are forwarded
+    # to the already-installed, already-validated `varfns.empty`/
+    # `varfns.empty_like` and `TensorBase.uniform_`/`normal_`, which refuse
+    # exactly what those refuse (an integer `dtype`, a foreign `generator`,
+    # `requires_grad=True`) for exactly the reasons documented at their own
+    # definitions.
+
+    def _factory_size(args):
+        # `torch.randn(4, 4)` and `torch.randn((4, 4))` both have to reach
+        # `empty` with the same `[4, 4]` list -- upstream accepts a size
+        # given either as varargs or as one sequence argument.
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            return list(args[0])
+        return list(args)
+
+    def _refuse_out(name, out):
+        if out is not None:
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch.{name}(out=...) -- "
+                f"upstream resizes the out tensor to the requested shape, "
+                f"which needs a kernel this shim does not have (no "
+                f"aten::empty.out, no generic resize_); construct into a "
+                f"fresh tensor instead"
+            )
+
+    def _empty_kwargs(dtype, layout, device, pin_memory, requires_grad):
+        # `dtype`/`layout`/`device` are forwarded only when given, so an
+        # omitted one reaches `aten.rs` as "absent" (the schema default,
+        # `None`) rather than as an explicit value -- `empty.memory_format`'s
+        # `reject_unsupported([(2, "layout"), (4, "pin_memory"), ...])` refuses
+        # an explicit `layout`/`pin_memory` *by position*, regardless of the
+        # value, so a caller-omitted `pin_memory=False` forwarded verbatim
+        # would be refused for asking for something nobody asked for. Passing
+        # it only when truthy keeps the two cases apart: silently getting an
+        # ordinary (unpinned) tensor when the caller said nothing, and
+        # honestly refusing when the caller said `pin_memory=True`.
+        kwargs = {"requires_grad": requires_grad}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        if layout is not None:
+            kwargs["layout"] = layout
+        if device is not None:
+            kwargs["device"] = device
+        if pin_memory:
+            kwargs["pin_memory"] = pin_memory
+        return kwargs
+
+    def _empty_like_kwargs(dtype, layout, device, memory_format, requires_grad):
+        kwargs = {"requires_grad": requires_grad}
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        if layout is not None:
+            kwargs["layout"] = layout
+        if device is not None:
+            kwargs["device"] = device
+        if memory_format is not None:
+            kwargs["memory_format"] = memory_format
+        return kwargs
+
+    def randn(*args, generator=None, out=None, dtype=None, layout=None,
+               device=None, requires_grad=False, pin_memory=False):
+        _refuse_out("randn", out)
+        t = varfns.empty(
+            _factory_size(args),
+            **_empty_kwargs(dtype, layout, device, pin_memory, requires_grad),
+        )
+        if generator is not None:
+            return t.normal_(0.0, 1.0, generator=generator)
+        return t.normal_(0.0, 1.0)
+
+    def rand(*args, generator=None, out=None, dtype=None, layout=None,
+             device=None, requires_grad=False, pin_memory=False):
+        _refuse_out("rand", out)
+        t = varfns.empty(
+            _factory_size(args),
+            **_empty_kwargs(dtype, layout, device, pin_memory, requires_grad),
+        )
+        if generator is not None:
+            return t.uniform_(0.0, 1.0, generator=generator)
+        return t.uniform_(0.0, 1.0)
+
+    def rand_like(input, *, generator=None, dtype=None, layout=None,
+                  device=None, requires_grad=False, memory_format=None):
+        t = varfns.empty_like(
+            input,
+            **_empty_like_kwargs(dtype, layout, device, memory_format, requires_grad),
+        )
+        if generator is not None:
+            return t.uniform_(0.0, 1.0, generator=generator)
+        return t.uniform_(0.0, 1.0)
+
+    def randn_like(input, *, generator=None, dtype=None, layout=None,
+                   device=None, requires_grad=False, memory_format=None):
+        t = varfns.empty_like(
+            input,
+            **_empty_like_kwargs(dtype, layout, device, memory_format, requires_grad),
+        )
+        if generator is not None:
+            return t.normal_(0.0, 1.0, generator=generator)
+        return t.normal_(0.0, 1.0)
+
+    def _broadcast_shape(a, b):
+        # Plain shape arithmetic, no aten call -- needed *before* the
+        # standard-normal draw below can be sized, since `mean`/`std` are not
+        # necessarily the same shape (`torch.normal(mean.shape=(3,1),
+        # std.shape=(1,4))` draws at `(3, 4)`, measured against torch 2.13.0).
+        a, b = list(a), list(b)
+        n = max(len(a), len(b))
+        out = []
+        for i in range(1, n + 1):
+            da = a[-i] if i <= len(a) else 1
+            db = b[-i] if i <= len(b) else 1
+            if da == db or da == 1 or db == 1:
+                out.append(max(da, db))
+            else:
+                raise RuntimeError(
+                    f"The size of tensor a ({da}) must match the size of "
+                    f"tensor b ({db}) at non-singleton dimension {n - i}"
+                )
+        return list(reversed(out))
+
+    def normal(mean=0.0, std=1.0, size=None, *, generator=None, out=None,
+               dtype=None, layout=None, device=None, pin_memory=None):
+        if out is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.normal(out=...) -- "
+                "upstream resizes the out tensor to the requested shape, "
+                "which needs a kernel this shim does not have (no "
+                "aten::normal.*_out, no generic resize_); construct into a "
+                "fresh tensor instead"
+            )
+        mean_is_tensor = isinstance(mean, tensorbase)
+        std_is_tensor = isinstance(std, tensorbase)
+        gen_kwargs = {"generator": generator} if generator is not None else {}
+
+        if size is not None:
+            # The `float_float` overload -- the one shaped exactly like
+            # `randn`/`rand` above, plain numbers plus an explicit size.
+            if mean_is_tensor or std_is_tensor:
+                raise TypeError(
+                    "torch.normal(): size= is only valid when both mean and "
+                    "std are plain numbers, not Tensors"
+                )
+            t = varfns.empty(
+                list(size),
+                **_empty_kwargs(dtype, layout, device, pin_memory, False),
+            )
+            return t.normal_(float(mean), float(std), **gen_kwargs)
+
+        if dtype is not None or layout is not None or device is not None \
+                or pin_memory is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.normal(dtype=/"
+                "layout=/device=/pin_memory=...) without size= -- upstream's "
+                "own arg parser only accepts these together with size= (the "
+                "float_float overload); with a Tensor mean or std the "
+                "result's dtype/device/layout come from that tensor instead"
+            )
+        if not mean_is_tensor and not std_is_tensor:
+            raise TypeError(
+                "torch.normal(): missing required argument 'size' (mean and "
+                "std are both plain numbers)"
+            )
+
+        if mean_is_tensor and std_is_tensor:
+            shape = _broadcast_shape(list(mean.shape), list(std.shape))
+            draw_dtype = mean.dtype
+        elif mean_is_tensor:
+            shape = list(mean.shape)
+            draw_dtype = mean.dtype
+        else:
+            shape = list(std.shape)
+            draw_dtype = std.dtype
+
+        # Upstream's own composition, transcribed (measured bit-identical
+        # against torch 2.13.0 for all three tensor-carrying overloads,
+        # including the broadcasting case): draw standard normal at the
+        # output shape, then affine-transform it by `std` and `mean`.
+        n = varfns.empty(shape, dtype=draw_dtype)
+        n = n.normal_(0.0, 1.0, **gen_kwargs)
+        if mean_is_tensor and std_is_tensor:
+            scaled = dispatch("aten.mul.Tensor", std, n)
+            return dispatch("aten.add.Tensor", mean, scaled)
+        if mean_is_tensor:  # std is a plain float
+            scaled = dispatch("aten.mul.Scalar", n, std)
+            return dispatch("aten.add.Tensor", mean, scaled)
+        # mean is a plain float, std is a Tensor
+        scaled = dispatch("aten.mul.Tensor", std, n)
+        return dispatch("aten.add.Scalar", scaled, mean)
+
+    for fn, name in (
+        (randn, "randn"), (rand, "rand"), (rand_like, "rand_like"),
+        (randn_like, "randn_like"), (normal, "normal"),
+    ):
+        fn.__name__ = fn.__qualname__ = name
+        fn.__module__ = "torch._C"
+        setattr(varfns, name, fn)
 
 
 def _install_behaviour(module, dispatch, transcribed) -> None:

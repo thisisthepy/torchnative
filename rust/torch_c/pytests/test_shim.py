@@ -1127,6 +1127,145 @@ def test_rng_ops_refuse_integer_tensors():
             raise AssertionError("an integer tensor was filled")
 
 
+# --- torch.randn / torch.rand and their siblings (docs/RANDOM.md) ----------
+#
+# `randn`/`rand` are not `overloads.json` entries: there is no `aten::randn`
+# or `aten::rand` kernel in `aten.rs`, only `aten.empty.memory_format` +
+# `aten.uniform_.default`/`aten.normal_.default`. Real torch's own C++ body
+# for these factories is the same composition (measured: seeded
+# `torch.randn(4, 4)` is bit-identical to seeded
+# `torch.empty(4, 4).normal_(0., 1.)`, and the same holds for `rand`/
+# `uniform_`), so these are Python-level compositions in `_install_composites`
+# -- the same shape as `dropout`/`layer_norm`/`isfinite` above -- rather than
+# a table entry that would name a kernel `aten.rs` does not have.
+
+
+def test_randn_and_rand_are_wired_rather_than_refused():
+    # The defect this section exists for: both used to raise
+    # "torch._C shim: ... overload resolution has no table entry".
+    x = _C._VariableFunctions.randn(4, 4)
+    assert x.shape == (4, 4)
+    assert x.dtype == _C.get_default_dtype()
+    y = _C._VariableFunctions.rand(2, 2)
+    assert y.shape == (2, 2)
+    assert y.dtype == _C.get_default_dtype()
+    assert all(0.0 <= v < 1.0 for row in y.tolist() for v in row)
+
+
+def test_randn_accepts_a_size_tuple_or_list_as_well_as_varargs():
+    # Upstream accepts both `torch.randn(4, 4)` and `torch.randn((4, 4))` --
+    # and they have to draw identically, not just produce the same shape.
+    _C._shim_manual_seed(0)
+    a = _C._VariableFunctions.randn(4, 4)
+    _C._shim_manual_seed(0)
+    b = _C._VariableFunctions.randn((4, 4))
+    assert a.tolist() == b.tolist()
+    _C._shim_manual_seed(0)
+    c = _C._VariableFunctions.randn([4, 4])
+    assert a.tolist() == c.tolist()
+    _C._shim_manual_seed(0)
+    d = _C._VariableFunctions.randn(4)
+    assert d.shape == (4,)
+
+
+def test_rand_like_and_randn_like_take_shape_and_dtype_from_the_input():
+    base = _C._VariableFunctions.empty([3, 2])
+    r = _C._VariableFunctions.rand_like(base)
+    assert r.shape == (3, 2)
+    assert r.dtype == base.dtype
+    n = _C._VariableFunctions.randn_like(base)
+    assert n.shape == (3, 2)
+    assert n.dtype == base.dtype
+
+
+def test_randn_refuses_an_integer_dtype_by_naming_it():
+    # The composite falls through to `normal_`, which already refuses integer
+    # tensors by name (`test_rng_ops_refuse_integer_tensors` above). This
+    # checks the composite does not swallow that refusal or convert it into a
+    # silently-wrong result.
+    try:
+        _C._VariableFunctions.randn(2, 2, dtype=_C.int64)
+    except NotImplementedError as e:
+        assert "int64" in str(e)
+    else:
+        raise AssertionError("torch.randn(dtype=torch.int64) must be refused")
+
+
+def test_randn_refuses_requires_grad_true_by_name():
+    try:
+        _C._VariableFunctions.randn(2, 2, requires_grad=True)
+    except NotImplementedError as e:
+        assert "requires_grad" in str(e)
+    else:
+        raise AssertionError("torch.randn(requires_grad=True) must be refused")
+
+
+def test_randn_and_rand_refuse_out_by_name_rather_than_silently_ignoring_it():
+    # Upstream resizes `out` to the requested shape --
+    # `torch.randn(4, 4, out=torch.empty(2, 2))` returns a 4x4 tensor -- which
+    # needs a resize kernel this shim does not have (no `aten::empty.out`, no
+    # generic `resize_`). Refusing by name is the honest answer; computing
+    # into the wrong shape, or silently ignoring `out` and returning a tensor
+    # the caller's `out` variable does not point to, would both be worse.
+    dest = _C._VariableFunctions.empty([2, 2])
+    for call in (
+        lambda: _C._VariableFunctions.randn(2, 2, out=dest),
+        lambda: _C._VariableFunctions.rand(2, 2, out=dest),
+    ):
+        try:
+            call()
+        except NotImplementedError as e:
+            assert "out" in str(e)
+        else:
+            raise AssertionError("torch.randn(out=...) must be refused")
+
+
+def test_randn_generator_kwarg_reaches_the_same_stream_as_manual_seed():
+    _C._shim_manual_seed(5)
+    a = _C._VariableFunctions.randn(3)
+    _C._shim_manual_seed(5)
+    b = _C._VariableFunctions.randn(3, generator=_C.default_generator)
+    assert a.tolist() == b.tolist()
+    other = _C.Generator()
+    try:
+        _C._VariableFunctions.randn(3, generator=other)
+    except NotImplementedError as e:
+        assert "torch.default_generator" in str(e)
+    else:
+        raise AssertionError("a foreign generator was accepted")
+
+
+def test_normal_size_overload_matches_manual_composition():
+    _C._shim_manual_seed(0)
+    a = _C._VariableFunctions.normal(0.0, 1.0, size=[2, 2])
+    _C._shim_manual_seed(0)
+    b = _C._VariableFunctions.empty([2, 2])
+    b.normal_(0.0, 1.0)
+    assert a.tolist() == b.tolist()
+
+
+def test_normal_accepts_tensor_mean_and_or_std():
+    mean_t = _t([1.0, 2.0, 3.0], [3])
+    std_t = _t([1.0, 1.0, 1.0], [3])
+    a = _C._VariableFunctions.normal(mean_t, 1.0)
+    assert a.shape == (3,)
+    b = _C._VariableFunctions.normal(0.5, std_t)
+    assert b.shape == (3,)
+    c = _C._VariableFunctions.normal(mean_t, std_t)
+    assert c.shape == (3,)
+
+
+def test_normal_requires_size_when_both_mean_and_std_are_plain_numbers():
+    try:
+        _C._VariableFunctions.normal(0.0, 1.0)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(
+            "torch.normal(float, float) with no size must be refused"
+        )
+
+
 def test_grad_mode_state_round_trips():
     # 84 calls during `from_config` (docs/FROM_CONFIG.md §2.2). The flag is
     # real; what it would govern is not.
@@ -1587,6 +1726,106 @@ def test_multinomial_matches_upstream_through_a_second_draw():
             c2 = _C._aten_dispatch("aten.multinomial.default", c_probs, n_sample, replacement)
             assert t1.tolist() == c1.tolist(), (n_cat, n_sample, replacement, seed, "draw1")
             assert t2.tolist() == c2.tolist(), (n_cat, n_sample, replacement, seed, "draw2")
+
+
+def test_randn_matches_upstreams_stream_bit_for_bit():
+    # `torch.randn` composes `empty` + `normal_` in bootstrap.py; this checks
+    # the composition draws the same number of words in the same order as
+    # upstream's own `aten::randn.default` kernel does, not just that the
+    # distribution looks right.
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    for seed in (0, 1, 1234):
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.randn(4, 4)
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.randn(4, 4)
+        assert got.tolist() == want.tolist(), seed
+        # Two draws with no reseed in between, to catch a composition that
+        # consumes a different word count than upstream's fused kernel would.
+        want2 = _upstream_torch.randn(3)
+        got2 = _C._VariableFunctions.randn(3)
+        assert got2.tolist() == want2.tolist(), (seed, "second draw")
+
+
+def test_rand_matches_upstreams_stream_bit_for_bit():
+    if _upstream_torch is None:
+        return
+    for seed in (0, 1, 1234):
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.rand(2, 3)
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.rand(2, 3)
+        assert got.tolist() == want.tolist(), seed
+
+
+def test_rand_like_and_randn_like_match_upstreams_stream_bit_for_bit():
+    if _upstream_torch is None:
+        return
+    flat = [float(i) for i in range(6)]
+    for seed in (0, 7):
+        t_base = _upstream_torch.tensor(flat).reshape(2, 3)
+        c_base = _C._tensor_from_flat(flat, [2, 3], dtype=_C.float32)
+        _upstream_torch.manual_seed(seed)
+        want_r = _upstream_torch.rand_like(t_base)
+        _C._shim_manual_seed(seed)
+        got_r = _C._VariableFunctions.rand_like(c_base)
+        assert got_r.tolist() == want_r.tolist(), (seed, "rand_like")
+        _upstream_torch.manual_seed(seed)
+        want_n = _upstream_torch.randn_like(t_base)
+        _C._shim_manual_seed(seed)
+        got_n = _C._VariableFunctions.randn_like(c_base)
+        assert got_n.tolist() == want_n.tolist(), (seed, "randn_like")
+
+
+def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
+    if _upstream_torch is None:
+        return
+    for seed in (0, 7):
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.normal(0.0, 1.0, size=(2, 2))
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.normal(0.0, 1.0, size=[2, 2])
+        assert got.tolist() == want.tolist(), (seed, "float_float")
+
+        mean_flat = [1.0, 2.0, 3.0, 4.0]
+        t_mean = _upstream_torch.tensor(mean_flat).reshape(2, 2)
+        c_mean = _C._tensor_from_flat(mean_flat, [2, 2], dtype=_C.float32)
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.normal(t_mean, 2.0)
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.normal(c_mean, 2.0)
+        assert got.tolist() == want.tolist(), (seed, "Tensor_float")
+
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.normal(0.5, t_mean)  # positive values -> a valid std
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.normal(0.5, c_mean)
+        assert got.tolist() == want.tolist(), (seed, "float_Tensor")
+
+        std_flat = [1.0, 1.0, 1.0, 1.0]
+        t_std = _upstream_torch.tensor(std_flat).reshape(2, 2)
+        c_std = _C._tensor_from_flat(std_flat, [2, 2], dtype=_C.float32)
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.normal(t_mean, t_std)
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.normal(c_mean, c_std)
+        assert got.tolist() == want.tolist(), (seed, "Tensor_Tensor")
+
+        # Broadcasting mean and std against each other, not just matching
+        # shapes -- the standard-normal draw has to be sized at the
+        # *broadcast* shape, not either operand's own shape (measured against
+        # upstream 2.13.0; see docs/RANDOM.md).
+        bflat_mean, bflat_std = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]
+        t_bmean = _upstream_torch.tensor(bflat_mean).reshape(3, 1)
+        t_bstd = _upstream_torch.tensor(bflat_std).reshape(1, 4)
+        c_bmean = _C._tensor_from_flat(bflat_mean, [3, 1], dtype=_C.float32)
+        c_bstd = _C._tensor_from_flat(bflat_std, [1, 4], dtype=_C.float32)
+        _upstream_torch.manual_seed(seed)
+        want = _upstream_torch.normal(t_bmean, t_bstd)
+        _C._shim_manual_seed(seed)
+        got = _C._VariableFunctions.normal(c_bmean, c_bstd)
+        assert got.tolist() == want.tolist(), (seed, "Tensor_Tensor broadcast")
 
 
 # --- checkpoint round trip: torch.load / safetensors read what upstream
