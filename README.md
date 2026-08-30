@@ -148,17 +148,17 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>139</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>4290 / 4290</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>261</b></td></tr>
+<tr><td>ATen operators</td><td><b>143</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>4709 / 4709</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>268</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
-<tr><td>Signature and schema tables</td><td><b>4353</b> entries checked against upstream</td></tr>
-<tr><td>Architectures — operator coverage</td><td><b>20 of 26</b> reach zero missing operators in the traced sweep</td></tr>
-<tr><td>Architectures — <b>actually forward</b></td><td><b>20 of 26</b>. The original twenty all forward and match upstream; six more were added once the <code>torch.jit.script</code> wall came down and <b>none of them forwards yet</b> — <code>sqrt</code>, 2-D <code>convolution</code>, <code>remainder</code> and <code>set_</code> are what stop them (<a href="docs/ARCH26.md">ARCH26.md</a>)</td></tr>
+<tr><td>Signature and schema tables</td><td><b>4376</b> entries checked against upstream</td></tr>
+<tr><td>Architectures — operator coverage</td><td><b>22 of 26</b> reach zero missing operators in the traced sweep</td></tr>
+<tr><td>Architectures — <b>actually forward</b></td><td><b>22 of 26</b>. Both DeBERTas joined, agreeing with upstream to 1.6e-07 on bit-identical weights. The four left stop on <code>conv_transpose2d</code>, <code>norm</code>, <code>div</code>'s mode overloads and the legacy tensor constructor (<a href="docs/KERNELS26.md">KERNELS26.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
-<tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.58x at 512, 2.09x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>). Four fifths of what is left at long sequences is not kernel speed — it is that attention here materialises the score matrix where upstream fuses it, which upstream's own kernels would also pay</td></tr>
+<tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>). Four fifths of what is left at long sequences is not kernel speed — it is that attention here materialises the score matrix where upstream fuses it, which upstream's own kernels would also pay</td></tr>
 </table>
 
 **All twenty forward**: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT ·
