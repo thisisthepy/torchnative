@@ -3143,6 +3143,73 @@ fn powi(base: i64, exponent: i64) -> i64 {
     base.wrapping_pow(exponent.min(u32::MAX as i64) as u32)
 }
 
+/// `x ** 2` without leaving the tensor, and without libm.
+///
+/// `pow_from_pairs` is the general path and it is *very* general: it widens
+/// every element to `f64`, copies the vector twice, calls libm `pow` once per
+/// element, and narrows back. That is six passes over the data plus a
+/// transcendental call that vectorises into nothing.
+///
+/// It is also, on a real model, almost the only `pow` that runs. `LlamaRMSNorm`
+/// -- and every RMSNorm transformers ships -- computes
+/// `hidden_states.pow(2).mean(-1, keepdim=True)`, which for SmolLM2-135M is 61
+/// calls per forward on a contiguous `[1, S, 576]` `float32` tensor.
+/// `docs/SEQLEN.md` §2 measures that one op at **90-173x upstream** and shows
+/// that it accounts for the entire *linear-in-S* term of the model-level gap.
+/// Upstream is fast for exactly this reason: ATen's `pow_tensor_scalar`
+/// special-cases small integral exponents into multiplication.
+///
+/// ## Why the answer cannot move
+///
+/// Not a tolerance argument -- an exactness one, for `f32`:
+///
+/// * `f32 -> f64` is exact, so the old path's input is the same number.
+/// * A `f32` significand is 24 bits, so `b * b` needs at most 48 and `f64` has
+///   53. **The exact square is representable**, so a correctly-rounded libm
+///   `pow(b, 2.0)` returns it with no rounding at all.
+/// * `fast_to(F32)` then rounds that exact square to `f32` -- one rounding,
+///   from the exact product. IEEE-754 `f32` multiplication is *defined* as the
+///   correctly-rounded exact product. Same rounding of the same value.
+///
+/// There is no double-rounding step to worry about because the intermediate was
+/// exact, and no range to worry about either: the smallest `f32` subnormal
+/// squared is ~2e-90, comfortably normal in `f64`, and anything that overflows
+/// `f32` gives `inf` on both paths.
+///
+/// `f64` is included on the weaker ground that `b * b` and `pow(b, 2.0)` are
+/// both required to be the correctly-rounded product; §3.2's test checks that
+/// claim against this platform's libm rather than trusting it.
+///
+/// **`f16` and `bf16` are deliberately excluded.** For those the `f64`
+/// intermediate is still exact but candle's reduced-precision multiply is not
+/// obviously a single correctly-rounded step, and `docs/DTYPE_PERF.md` owns the
+/// `bfloat16` checksum. Leaving them on the old path means that checksum cannot
+/// move as a consequence of this change -- it is not merely expected to hold,
+/// it is untouched.
+fn pow_square_fast_path(
+    op: &str,
+    t: &Tensor,
+    exponent: Scalar,
+    tag: TorchDType,
+) -> PyResult<Option<Tensor>> {
+    if exponent.as_f64() != 2.0 {
+        return Ok(None);
+    }
+    // `f32`/`f64` only -- see the doc comment.
+    if !matches!(
+        t.dtype(),
+        candle_core::DType::F32 | candle_core::DType::F64
+    ) {
+        return Ok(None);
+    }
+    // No promotion in flight: the generic path would have narrowed to the tag's
+    // storage at the end, and a multiply cannot do that. Bail if they differ.
+    if PyDtype::new(tag).storage(op)? != t.dtype() {
+        return Ok(None);
+    }
+    t.mul(t).map(Some).map_err(|err| candle_err(op, err))
+}
+
 fn pow_from_pairs(
     py: Python<'_>,
     op: &str,
@@ -3216,6 +3283,12 @@ fn pow_tensor_scalar(
         .ok_or_else(|| missing(OP, "exponent"))?;
     let tag = pow_result_tag(OP, base.tag(), !exponent.is_int())?;
     let shape = base.tensor()?.dims().to_vec();
+    // `x ** 2` is the RMSNorm case and it is the whole linear term of the
+    // model-level gap (docs/SEQLEN.md §2). Bit-identical -- see the fast path's
+    // doc comment for why that is exactness rather than tolerance.
+    if let Some(t) = pow_square_fast_path(OP, base.tensor()?, exponent, tag)? {
+        return finish(py, t, tag);
+    }
     let bases = side_from_tensor(OP, base.tensor()?, tag)?;
     let exponents = side_from_scalar(&exponent, tag);
     pow_from_pairs(
@@ -11073,5 +11146,128 @@ mod widen_tests {
             mine.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             theirs.flatten_all().unwrap().to_vec1::<f32>().unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod pow_square_tests {
+    use candle_core::{DType, Device, Tensor};
+
+    /// The old path, transcribed: widen to `f64`, libm `pow`, narrow back.
+    /// `pow_from_pairs` does exactly this plus two vector copies, and the
+    /// copies cannot change a value.
+    fn old_path_f32(src: &[f32]) -> Vec<f32> {
+        let dev = Device::Cpu;
+        let widened: Vec<f64> = Tensor::from_slice(src, src.len(), &dev)
+            .unwrap()
+            .to_dtype(DType::F64)
+            .unwrap()
+            .to_vec1::<f64>()
+            .unwrap();
+        let powed: Vec<f64> = widened.iter().map(|b| b.powf(2.0)).collect();
+        Tensor::from_vec(powed, src.len(), &dev)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// Squaring by multiplication is **bit-identical** to the libm round-trip
+    /// it replaces, across the whole `f32` range.
+    ///
+    /// This is the equality `pow_square_fast_path` rests on. It can fail: if
+    /// this platform's libm returned anything other than the correctly-rounded
+    /// square for exponent 2, or if the exact-square argument in that function's
+    /// doc comment were wrong at the extremes, the vectors would differ. The
+    /// inputs are chosen to press exactly there -- subnormals (which square to
+    /// zero), values whose square overflows `f32` (which must give `inf` on both
+    /// sides), negatives, signed zeros, and a sweep of ordinary values that need
+    /// real rounding.
+    #[test]
+    fn squaring_matches_the_libm_round_trip_bit_for_bit() {
+        let mut src: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::MIN_POSITIVE,          // smallest normal
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),          // smallest subnormal -- squares to 0
+            f32::from_bits(0x007f_ffff), // largest subnormal
+            f32::MAX,                   // squares to inf
+            -f32::MAX,
+            f32::MIN,
+            1e-30,
+            1e30,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ];
+        // Ordinary values that need rounding: /7.0 is not representable.
+        src.extend((0..4096).map(|i| (i as f32 - 2048.0) / 7.0));
+        // A geometric sweep across the exponent range.
+        src.extend((0..200).map(|i| 2.0f32.powi(i - 100) * 1.234_567_9));
+
+        let dev = Device::Cpu;
+        let fast = Tensor::from_slice(&src, src.len(), &dev)
+            .unwrap()
+            .mul(&Tensor::from_slice(&src, src.len(), &dev).unwrap())
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let slow = old_path_f32(&src);
+
+        assert_eq!(fast.len(), slow.len());
+        for (i, (a, b)) in fast.iter().zip(slow.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "input {} ({:e}) squared: fast {:e} vs libm round-trip {:e}",
+                i,
+                src[i],
+                a,
+                b
+            );
+        }
+    }
+
+    /// The same claim for `f64`, which rests on libm rather than on
+    /// representability -- so it is the one that could actually surprise us.
+    #[test]
+    fn squaring_matches_libm_for_f64_too() {
+        let mut src: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::MAX,
+            -f64::MAX,
+            f64::INFINITY,
+        ];
+        src.extend((0..4096).map(|i| (i as f64 - 2048.0) / 7.0));
+        src.extend((0..600).map(|i| 2.0f64.powi(i - 300) * 1.234_567_891_234));
+
+        for (i, &b) in src.iter().enumerate() {
+            assert_eq!(
+                (b * b).to_bits(),
+                b.powf(2.0).to_bits(),
+                "f64 input {} ({:e}): b*b {:e} vs powf {:e}",
+                i,
+                b,
+                b * b,
+                b.powf(2.0)
+            );
+        }
+    }
+
+    /// A **`NaN`** input squares to a `NaN` on both paths. Bit equality is the
+    /// wrong assertion here -- `NaN` payloads are not contractual -- so this
+    /// asserts the property upstream actually guarantees.
+    #[test]
+    fn nan_squares_to_nan() {
+        assert!((f32::NAN * f32::NAN).is_nan());
+        assert!((f64::from(f32::NAN)).powf(2.0).is_nan());
     }
 }
