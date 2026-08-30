@@ -9118,6 +9118,99 @@ def ge_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.ge.Tensor ----------------------------------------------------------
+#
+# The last of the six comparisons to get its Tensor overload. `le.Tensor`,
+# `lt.Tensor` and `gt.Tensor` all had a kernel and `ge` had only `.Scalar`, so
+# `x >= tensor` resolved through `methods.json` (docs/GROUPED_MM.md §6.4 put
+# both schema strings there) and then refused inside `_aten_dispatch`. The
+# cases mirror `gt.Tensor`'s exactly, because the two are the same kernel
+# under a different `Cmp` -- a divergence between them would be a real one.
+
+
+def ge_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.ge.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for sc in _CMP_SCENARIOS:
+            cases.append(
+                _binary_tensor_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    sc["a_flat"], sc["a_shape"], sc["b_flat"], sc["b_shape"], sc["note"],
+                )
+            )
+    cases.append(
+        Case(
+            name="ge(int64, x >= x is True) [equality boundary -- the half that separates ge from gt]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0],
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1],
+                _pair(torch_module, c_module, [1, 2, 3], (3,), "int64")[1],
+            ),
+            note="every element compared against itself -- non-strict >=, so all True. "
+                 "gt.Tensor's matching case is all False, which is what pins Cmp::Ge to "
+                 "this key rather than Cmp::Gt",
+        )
+    )
+    cases.append(
+        Case(
+            name="ge(float32, nan >= nan and 3.0 >= nan) [every comparison against NaN is false]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [float("nan"), 3.0, 2.0], (3,), "float32")[0],
+                _pair(torch_module, c_module, [float("nan"), 2.0, float("nan")], (3,), "float32")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [float("nan"), 3.0, 2.0], (3,), "float32")[1],
+                _pair(torch_module, c_module, [float("nan"), 2.0, float("nan")], (3,), "float32")[1],
+            ),
+            note="NaN on either side (or both) makes that element False even though >= is "
+                 "the reflexive comparison",
+        )
+    )
+    cases.append(
+        Case(
+            name="ge(bool, [T,F,T] >= [F,F,T]) [bool compares as 0/1]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1, 0, 1], (3,), "bool")[0],
+                _pair(torch_module, c_module, [0, 0, 1], (3,), "bool")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [1, 0, 1], (3,), "bool")[1],
+                _pair(torch_module, c_module, [0, 0, 1], (3,), "bool")[1],
+            ),
+            note="True >= False, False >= False and True >= True are all True (measured)",
+        )
+    )
+    cases.append(
+        Case(
+            name="ge(int64, causal mask idiom) [arange(S)[:,None] >= arange(S)[None]]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 4, 1), "int64")[0],
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 1, 4), "int64")[0],
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 4, 1), "int64")[1],
+                _pair(torch_module, c_module, [0, 1, 2, 3], (1, 1, 1, 4), "int64")[1],
+            ),
+            note="the same lower-triangular mask le.Tensor's case builds, written the other "
+                 "way round -- the broadcast that four architectures use",
+        )
+    )
+    cases.extend(_ge_tensor_member_cases(torch_module, c_module))
+    return cases
+
+
 def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.floor_divide.default"
     cases: list[Case] = []
@@ -9632,6 +9725,320 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
             note="measured: index [0,0,0] with values [1,2,3] leaves self[0] == 3",
         )
     )
+
+    # --- the bool mask (docs/VIEWS.md §2) ---------------------------------
+    #
+    # A mask is a different operation from an integer index, not a cast: it
+    # selects the positions where it is true. This was a `c_error` case for as
+    # long as the kernel delegated to `scatter`, which refused the dtype
+    # ("Expected dtype int32 or int64 for index, got bool"). It computes now,
+    # so it is a real case and the values are diffed.
+    for mask_dtype in ["bool", "uint8"]:
+        m_self_t, m_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+        m_mask_t, m_mask_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0], (4,), mask_dtype)
+        m_val_t, m_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+        cases.append(
+            Case(
+                name=f"index_put_(1-D {mask_dtype} mask, values one per true position)",
+                op=op,
+                run_torch=lambda a=m_self_t, m=m_mask_t, v=m_val_t: torch_call(a, [m], v, False),
+                run_c=lambda a=m_self_c, m=m_mask_c, v=m_val_c: c_module._aten_dispatch(op, a, [m], v, False),
+                note="upstream treats uint8 as a deprecated spelling of bool and gathers the "
+                     "TRUE positions, not the positions the values name -- the same rule "
+                     "index.Tensor's doc comment records",
+            )
+        )
+    # A 0-d value against a mask: every true position gets the same number.
+    m2_self_t, m2_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    m2_mask_t, m2_mask_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+    m2_val_t, m2_val_c = pair_from_flat(torch_module, c_module, [5.0], (), "float32")
+    cases.append(
+        Case(
+            name="index_put_(1-D bool mask, 0-d values broadcast)",
+            op=op,
+            run_torch=lambda: torch_call(m2_self_t, [m2_mask_t], m2_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, m2_self_c, [m2_mask_c], m2_val_c, False),
+            note="x[mask] = 5.0 -- the shape __setitem__ produces for a number",
+        )
+    )
+    # A mask covering BOTH axes of a matrix writes n scalars; a mask covering
+    # only the first writes whole rows. Two different results from the same
+    # receiver, which is what says the mask's rank is being read.
+    m3_self_t, m3_self_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    m3_mask_t, m3_mask_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0, 1, 0], (2, 3), "bool")
+    m3_val_t, m3_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(2-D bool mask over a 2-D self) [the mask consumes both axes]",
+            op=op,
+            run_torch=lambda: torch_call(m3_self_t, [m3_mask_t], m3_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, m3_self_c, [m3_mask_c], m3_val_c, False),
+            note="three true positions, three values, one each -- measured [[1,0,2],[0,3,0]]",
+        )
+    )
+    m4_self_t, m4_self_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    m4_mask_t, m4_mask_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    m4_val_t, m4_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(1-D bool mask over a 2-D self) [the mask consumes one axis, so a row]",
+            op=op,
+            run_torch=lambda: torch_call(m4_self_t, [m4_mask_t], m4_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, m4_self_c, [m4_mask_c], m4_val_c, False),
+            note="one true position selecting a whole row -- measured [[1,2,3],[0,0,0]]. "
+                 "Same mask values as the 2-D case above and a different answer, which is "
+                 "what pins the rank read rather than the contents",
+        )
+    )
+    # An all-false mask writes nothing. Upstream returns self unchanged rather
+    # than refusing on the zero-length value.
+    m5_self_t, m5_self_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    m5_mask_t, m5_mask_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (4,), "bool")
+    m5_val_t, m5_val_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(all-false mask, empty values) [writes nothing, returns self]",
+            op=op,
+            run_torch=lambda: torch_call(m5_self_t, [m5_mask_t], m5_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, m5_self_c, [m5_mask_c], m5_val_c, False),
+            note="measured: no write and no refusal. The receiver is non-zero so a kernel "
+                 "that zeroed it, or one that refused, both fail here",
+        )
+    )
+    # A mask whose shape does not line up: upstream raises, naming the
+    # mismatching axis twice. `mask_to_indices` owns that message already.
+    m6_self_t, m6_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    m6_mask_t, m6_mask_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    m6_val_t, m6_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(mask shorter than the axis it covers) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(m6_self_t, [m6_mask_t], m6_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, m6_self_c, [m6_mask_c], m6_val_c, False),
+            expect="both_error",
+            note="torch: IndexError('The shape of the mask [3] at index 0 does not match the "
+                 "shape of the indexed tensor [4] at index 0'), reproduced verbatim",
+        )
+    )
+
+    # --- self of rank above 1 (docs/VIEWS.md §3) ---------------------------
+    #
+    # `x[idx] = v` on a matrix, which is the common case and which the
+    # scatter-based kernel refused outright ("only a 1-D self/index/values").
+    # The indexing result here is (2,2): two selected rows of width two, and
+    # `values` broadcasts onto it right-aligned.
+    for label, v_flat, v_shape, note in [
+        ("0-d", [5.0], (), "x[idx] = 5 -- one number into every selected element"),
+        ("(2,2)", [1.0, 2.0, 3.0, 4.0], (2, 2), "one value per written element, no broadcast"),
+        ("(2,)", [1.0, 2.0], (2,), "right-aligned: the row is reused for both selected rows"),
+        ("(2,1)", [1.0, 2.0], (2, 1), "the OTHER broadcast of the same two numbers -- (2,) "
+                                      "fills across and (2,1) fills down, so a kernel that "
+                                      "aligned left would swap these two answers"),
+    ]:
+        r_self_t, r_self_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (3, 2), "float32")
+        r_idx_t, r_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+        r_val_t, r_val_c = pair_from_flat(torch_module, c_module, v_flat, v_shape, "float32")
+        cases.append(
+            Case(
+                name=f"index_put_(self (3,2), index (2,), values {label})",
+                op=op,
+                run_torch=lambda a=r_self_t, i=r_idx_t, v=r_val_t: torch_call(a, [i], v, False),
+                run_c=lambda a=r_self_c, i=r_idx_c, v=r_val_c: c_module._aten_dispatch(op, a, [i], v, False),
+                note=note,
+            )
+        )
+    # ...and the value that does not fit, which upstream names precisely.
+    r2_self_t, r2_self_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (3, 2), "float32")
+    r2_idx_t, r2_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    r2_val_t, r2_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(values that do not broadcast onto the indexing result) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(r2_self_t, [r2_idx_t], r2_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, r2_self_c, [r2_idx_c], r2_val_c, False),
+            expect="both_error",
+            note="torch: RuntimeError('shape mismatch: value tensor of shape [3] cannot be "
+                 "broadcast to indexing result of shape [2, 2]'), reproduced verbatim",
+        )
+    )
+    # An index tensor at a later axis: the `[None, t]` list `x[:, t] = v`
+    # produces. The indexing result is (2,2) again but for a different reason,
+    # and a kernel that ignored the leading `None` would write down the first
+    # column instead of across.
+    n_self_t, n_self_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    n_idx_t, n_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    n_val_t, n_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="index_put_(self (2,3), indices [None, index]) [the index sits at axis 1]",
+            op=op,
+            run_torch=lambda: torch_call(n_self_t, [None, n_idx_t], n_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, n_self_c, [None, n_idx_c], n_val_c, False),
+            note="measured [[1,0,2],[3,0,4]] -- columns 0 and 2 of both rows, in row-major "
+                 "order over the (2,2) result",
+        )
+    )
+    # An index tensor that is not 1-D. Its shape is spliced into the result
+    # whole, so a (2,2) index over a (4,2) self gives a (2,2,2) result.
+    s_self_t, s_self_c = pair_from_flat(torch_module, c_module, [0.0] * 8, (4, 2), "float32")
+    s_idx_t, s_idx_c = pair_from_flat(torch_module, c_module, [0, 1, 2, 3], (2, 2), "int64")
+    s_val_t, s_val_c = pair_from_flat(
+        torch_module, c_module, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], (2, 2, 2), "float32"
+    )
+    cases.append(
+        Case(
+            name="index_put_(2-D index over a 2-D self) [the index shape is spliced in whole]",
+            op=op,
+            run_torch=lambda: torch_call(s_self_t, [s_idx_t], s_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, s_self_c, [s_idx_c], s_val_c, False),
+            note="indexing result (2,2,2); the values arrive already the right shape, so "
+                 "this pins the row-major ORDER of the walk and nothing else",
+        )
+    )
+
+    # --- negative and out-of-range indices ---------------------------------
+    #
+    # torch wraps a negative index here. The scatter-based kernel could not:
+    # `scatter` has no negative-index rule and refused these as out of bounds.
+    g_self_t, g_self_c = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
+    g_idx_t, g_idx_c = pair_from_flat(torch_module, c_module, [-1, -2], (2,), "int64")
+    g_val_t, g_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(negative indices wrap) [-1 is the last position]",
+            op=op,
+            run_torch=lambda: torch_call(g_self_t, [g_idx_t], g_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, g_self_c, [g_idx_c], g_val_c, False),
+            note="measured [0,0,0,2,1] -- the two are in the reverse of the order they "
+                 "appear, so a kernel that clamped instead of wrapping fails here",
+        )
+    )
+    for label, bad in [("above the extent", 9), ("below the extent", -9)]:
+        b_self_t, b_self_c = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
+        b_idx_t, b_idx_c = pair_from_flat(torch_module, c_module, [bad], (1,), "int64")
+        b_val_t, b_val_c = pair_from_flat(torch_module, c_module, [1.0], (1,), "float32")
+        cases.append(
+            Case(
+                name=f"index_put_(index {label}) [both refuse]",
+                op=op,
+                run_torch=lambda a=b_self_t, i=b_idx_t, v=b_val_t: torch_call(a, [i], v, False),
+                run_c=lambda a=b_self_c, i=b_idx_c, v=b_val_c: c_module._aten_dispatch(op, a, [i], v, False),
+                expect="both_error",
+                note=f"torch: IndexError('index {bad} is out of bounds for dimension 0 with "
+                     "size 5'), reproduced verbatim -- and note -9 is refused rather than "
+                     "wrapped twice",
+            )
+        )
+    # An empty index writes nothing rather than refusing on the empty value.
+    e_self_t, e_self_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    e_idx_t, e_idx_c = pair_from_flat(torch_module, c_module, [], (0,), "int64")
+    e_val_t, e_val_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(empty index) [writes nothing, returns self]",
+            op=op,
+            run_torch=lambda: torch_call(e_self_t, [e_idx_t], e_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, e_self_c, [e_idx_c], e_val_c, False),
+            note="measured: no write and no refusal, with the receiver left non-zero",
+        )
+    )
+
+    # --- dtypes ------------------------------------------------------------
+    #
+    # Upstream does NOT promote here; it names both sides and refuses.
+    d_self_t, d_self_c = pair_from_flat(torch_module, c_module, [0.0] * 3, (3,), "float32")
+    d_idx_t, d_idx_c = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    d_val_t, d_val_c = pair_from_flat(torch_module, c_module, [1], (1,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(float32 self, int64 values) [both refuse -- no promotion]",
+            op=op,
+            run_torch=lambda: torch_call(d_self_t, [d_idx_t], d_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, d_self_c, [d_idx_c], d_val_c, False),
+            expect="both_error",
+            note="torch: RuntimeError('Index put requires the source and destination dtypes "
+                 "match, got Float for the destination and Long for the source.')",
+        )
+    )
+    # An int32 index is accepted, as it is for `scatter` and `index.Tensor`.
+    i32_self_t, i32_self_c = pair_from_flat(torch_module, c_module, [0.0] * 3, (3,), "float32")
+    i32_idx_t, i32_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int32")
+    i32_val_t, i32_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(int32 index) [accepted, like scatter's]",
+            op=op,
+            run_torch=lambda: torch_call(i32_self_t, [i32_idx_t], i32_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, i32_self_c, [i32_idx_c], i32_val_c, False),
+            note="measured: int32 is not refused here, unlike a float index",
+        )
+    )
+    # A bool receiver, which is the one dtype whose storage tag can be lost on
+    # the way back out of the kernel (BOOL.md §6.3).
+    bl_self_t, bl_self_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (4,), "bool")
+    bl_idx_t, bl_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    bl_val_t, bl_val_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "bool")
+    cases.append(
+        Case(
+            name="index_put_(bool self and bool values) [the tag survives the write]",
+            op=op,
+            run_torch=lambda: torch_call(bl_self_t, [bl_idx_t], bl_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, bl_self_c, [bl_idx_c], bl_val_c, False),
+            note="the comparator checks dtype as well as values, so a result that came back "
+                 "as uint8 fails here rather than reading as 0/1 and passing",
+        )
+    )
+    # A float index, which upstream refuses by naming the four it accepts.
+    f_self_t, f_self_c = pair_from_flat(torch_module, c_module, [0.0] * 3, (3,), "float32")
+    f_idx_t, f_idx_c = pair_from_flat(torch_module, c_module, [0.0], (1,), "float32")
+    f_val_t, f_val_c = pair_from_flat(torch_module, c_module, [1.0], (1,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(float index) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(f_self_t, [f_idx_t], f_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, f_self_c, [f_idx_c], f_val_c, False),
+            expect="both_error",
+            note="torch: IndexError('tensors used as indices must be long, int, byte or "
+                 "bool tensors'), reproduced verbatim",
+        )
+    )
+
+    # --- the mutation itself -----------------------------------------------
+    #
+    # `index_put_` RETURNS `self`, so every case above reads the return value
+    # and could not tell a write-through from a freshly built tensor handed
+    # back. These two throw the return value away and read the binding that
+    # was passed in. A kernel that computed the right answer and forgot to
+    # `replace_with` passes everything above and fails here.
+    for label, dtype_name, flat, shape, idx_flat, idx_shape, val_flat, val_shape in [
+        ("1-D", "float32", [0.0] * 5, (5,), [0, 2, 4], (3,), [7.0, 8.0, 9.0], (3,)),
+        ("2-D", "float32", [0.0] * 6, (3, 2), [0, 2], (2,), [5.0], ()),
+    ]:
+        a_self_t, a_self_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        a_idx_t, a_idx_c = pair_from_flat(torch_module, c_module, idx_flat, idx_shape, "int64")
+        a_val_t, a_val_c = pair_from_flat(torch_module, c_module, val_flat, val_shape, dtype_name)
+
+        def _through_torch(a=a_self_t, i=a_idx_t, v=a_val_t):
+            torch_call(a, [i], v, False)
+            return a
+
+        def _through_c(a=a_self_c, i=a_idx_c, v=a_val_c):
+            c_module._aten_dispatch(op, a, [i], v, False)
+            return a
+
+        cases.append(
+            Case(
+                name=f"index_put_({label} self, read back through the ORIGINAL binding)",
+                op=op,
+                run_torch=_through_torch,
+                run_c=_through_c,
+                note="the return value is discarded; this is the only case shape that can "
+                     "fail when the write lands in a copy",
+            )
+        )
 
     # Refused: accumulate=True is not measured/implemented.
     self3_t, self3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
@@ -10653,6 +11060,61 @@ def _ge_member_cases(torch_module, c_module) -> list[Case]:
     return cases
 
 
+def _ge_tensor_member_cases(torch_module, c_module) -> list[Case]:
+    """`x >= tensor`, the spelling that resolved and then refused.
+
+    `_ge_member_cases` above goes through `ge.Scalar` because its right-hand
+    side is a Python number. These go through `ge.Tensor`, which is the half
+    that had no kernel: `methods.json` listed both schema strings, so the
+    member bound, and `_aten_dispatch` then raised `NotImplementedError` on
+    the key. Deleting the `aten.ge.Tensor` arm in `aten.rs` fails these and
+    the door-level cases above; deleting the `methods.json` entry fails only
+    these."""
+    op = "aten.ge.Tensor"
+    cases: list[Case] = []
+    for spelling, call in (
+        ("x.__ge__(y)", lambda m, a, b: a.__ge__(b)),
+        ("x.ge(y)", lambda m, a, b: a.ge(b)),
+        ("x >= y", lambda m, a, b: a >= b),
+    ):
+        for dtype_name in ["float32", "int64", "int32"]:
+            a = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+            b = pair_from_flat(torch_module, c_module, [1, 5, 3, 0], (2, 2), dtype_name)
+            cases.append(
+                _member_case(
+                    torch_module, c_module, op,
+                    f"member {spelling} (dtype={dtype_name})", dtype_name, [a, b], call,
+                    note="mixed equal/greater/less in one call, so >= is separated from "
+                         "both > and ==, through the member rather than the dispatch key",
+                )
+            )
+    # 0-d right-hand side: a tensor, so still `ge.Tensor` and not `ge.Scalar`.
+    a = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int64")
+    b = pair_from_flat(torch_module, c_module, [3], (), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x >= 0-d tensor (dtype=int64) [broadcast, and still the Tensor overload]",
+            "int64", [a, b], lambda m, x, y: x >= y,
+            note="a 0-d tensor on the right picks ge.Tensor, not ge.Scalar -- the two "
+                 "overloads are told apart by the argument's type, not by its rank",
+        )
+    )
+    # NaN through the member, matching the door-level case above.
+    a = pair_from_flat(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")
+    b = pair_from_flat(torch_module, c_module, [float("nan"), 1.0], (2,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x >= y with NaN on both sides (dtype=float32)", "float32", [a, b],
+            lambda m, x, y: x >= y,
+            note="nan >= nan is False even though the two sides hold the same bits; "
+                 "1.0 >= 1.0 in the same call is True, so this is not a blanket False",
+        )
+    )
+    return cases
+
+
 def _div__member_cases(torch_module, c_module) -> list[Case]:
     op = "aten.div_.Tensor"
     cases: list[Case] = []
@@ -10891,23 +11353,168 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     )
     # A bool mask index. Upstream routes it through the same `index_put_`
     # (measured: `x[boolmask] = 1.0` dispatches `aten.index_put_.default`),
-    # and this shim resolves the *name* correctly and then refuses inside the
-    # kernel: `rust/torch_c/src/aten.rs`'s `index_put_` is written on top of
-    # `scatter`, which wants an int32/int64 index. **That is a missing kernel
-    # capability, not a missing name** -- the subscript path above works for
-    # integer indices -- so it is recorded as `c_error` rather than left
-    # uncased. Promote to "match" when the kernel grows a mask path.
+    # and this shim always resolved the *name* correctly and then refused
+    # inside the kernel, which was written on top of `scatter` and so wanted
+    # an int32/int64 index. **That was a missing kernel capability, not a
+    # missing name**, and it was carried here as a `c_error` case until
+    # docs/VIEWS.md §2 closed it. It is a real case now: a mask is a
+    # different operation from an integer index, and the values are diffed.
     pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
     mask = pair_from_flat(torch_module, c_module, [True, False, True, False], (4,), "bool")
     values = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
     cases.append(
         _member_case(
             torch_module, c_module, op,
-            "member x[boolmask] = values (dtype=float32) [c_error -- kernel gap]",
+            "member x[boolmask] = values (dtype=float32)",
             "float32", [pair, mask, values],
-            assigned(lambda a, mk, v: a.__setitem__(mk, v)), expect="c_error",
-            note="torch computes [1,0,2,0]; the shim's index_put_ is built on scatter, "
-                 "which raises \"Expected dtype int32 or int64 for index, got bool\"",
+            assigned(lambda a, mk, v: a.__setitem__(mk, v)),
+            note="measured [1,0,2,0] -- one value per TRUE position, in order, which is "
+                 "not what reading the mask as an integer index would give",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    mask = pair_from_flat(torch_module, c_module, [True, False, True, False], (4,), "bool")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[boolmask] = 1.0 (dtype=float32) [a number against a mask]", "float32",
+            [pair, mask], assigned(lambda a, mk: a.__setitem__(mk, 1.0)),
+            note="the number is lifted to a 0-d tensor of the RECEIVER's dtype and "
+                 "broadcast over the true positions -- both halves were gaps",
+        )
+    )
+    # A 2-D mask over a 2-D receiver, which is `x[x > 0] = v` in the shape a
+    # model writes it.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    mask = pair_from_flat(
+        torch_module, c_module, [True, False, True, False, True, False], (2, 3), "bool"
+    )
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[bool 2-D mask] = 1.0 (dtype=float32)", "float32", [pair, mask],
+            assigned(lambda a, mk: a.__setitem__(mk, 1.0)),
+            note="measured [[1,0,1],[0,1,0]] -- the mask covers both axes, so each true "
+                 "position is one element and not one row",
+        )
+    )
+
+    # --- a receiver of rank above 1 (docs/VIEWS.md §3) ---------------------
+    #
+    # `x[idx] = v` on a matrix: the common shape, and the one the kernel
+    # refused outright while it was built on `scatter`.
+    for dtype_name in ["float32", "int64"]:
+        zeros = [0] * 6
+        pair = pair_from_flat(torch_module, c_module, zeros, (3, 2), dtype_name)
+        idx = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+        values = pair_from_flat(
+            torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name
+        )
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"member x[idx] = values on a (3,2) receiver (dtype={dtype_name})", dtype_name,
+                [pair, idx, values], assigned(lambda a, i, v: a.__setitem__(i, v)),
+                note="two whole rows replaced -- the indexing result is (2,2) and the "
+                     "values arrive already that shape",
+            )
+        )
+    # `x[t] = 5`, which is gap 3's headline: a Python number lifted to a 0-d
+    # tensor and broadcast across every selected element. Two dtypes, because
+    # the lift now follows the RECEIVER's dtype and an int on a float
+    # receiver is exactly the pair that used to diverge.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 6, (3, 2), "float32")
+    idx = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[idx] = 5 on a (3,2) float32 receiver [an int number on a float tensor]",
+            "float32", [pair, idx], assigned(lambda a, i: a.__setitem__(i, 5)),
+            note="upstream lifts 5 to float32 because the RECEIVER is float32, not to "
+                 "int64 because the number is an int -- and index_put_ refuses a dtype "
+                 "mismatch, so getting the lift wrong refuses a write upstream performs",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [0] * 4, (4,), "int64")
+    idx = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[idx] = 5.0 on a 1-D int64 receiver [a float number on an int tensor]",
+            "int64", [pair, idx], assigned(lambda a, i: a.__setitem__(i, 5.0)),
+            note="the mirror of the case above: the lift is int64 and the number truncates",
+        )
+    )
+    # `x[:, t] = v` -- the `[None, t]` index list, through the subscript that
+    # produces it.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    idx = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[:, idx] = 5.0 on a (2,3) receiver [indices [None, t]]", "float32",
+            [pair, idx], assigned(lambda a, i: a.__setitem__((slice(None), i), 5.0)),
+            note="measured [[5,0,5],[5,0,5]] -- columns, not rows, so a kernel that "
+                 "ignored the leading None writes the wrong axis",
+        )
+    )
+    # Negative indices through the subscript.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
+    idx = pair_from_flat(torch_module, c_module, [-1, -2], (2,), "int64")
+    values = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[negative idx] = values (dtype=float32)", "float32",
+            [pair, idx, values], assigned(lambda a, i, v: a.__setitem__(i, v)),
+            note="measured [0,0,0,2,1]",
+        )
+    )
+    # A bool receiver with an integer number on the right. This is the pair
+    # that tells the two lift rules apart at the *kernel* level rather than
+    # only in the lift: `2` inferred from the Python type is int64, and
+    # `index_put_` refuses a dtype mismatch, so the old rule turns a write
+    # upstream performs into a refusal. Measured: `x[t] = 2` on a bool
+    # receiver gives [True, False, False].
+    pair = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "bool")
+    idx = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[idx] = 2 on a bool receiver [the number lifts to bool, not int64]",
+            "bool", [pair, idx], assigned(lambda a, i: a.__setitem__(i, 2)),
+            note="2 is truthy, so the lifted 0-d bool is True; inferring int64 from the "
+                 "Python type instead refuses here, which is a divergence from upstream "
+                 "in the refusing direction rather than the computing one",
+        )
+    )
+    # `x[:] = ...` on an int64 and a bool receiver. These go to `fill_.Tensor`
+    # and not `index_put_`, so they cover the OTHER caller of `_lift`.
+    #
+    # **Neither of them discriminates between the two lift rules**, and that
+    # is worth stating rather than implying: `fill_` takes its dtype from the
+    # receiver on both sides, so an int64 value against a bool receiver still
+    # comes out as the right bools. They are here because the fill_ path is
+    # part of `__setitem__`'s measured behaviour, not because they guard the
+    # lift. The `index_put_` case above is what guards the lift.
+    pair = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.fill_.Tensor",
+            "member x[:] = 3.0 on an int64 receiver [fill_, and the value truncates]", "int64",
+            [pair], assigned(lambda a: a.__setitem__(slice(None), 3.0)),
+            note="upstream lifts to int64 because the receiver is int64; the result is "
+                 "[3,3,3] and stays int64, which the dtype half of the comparator checks",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "bool")
+    cases.append(
+        _member_case(
+            torch_module, c_module, "aten.fill_.Tensor",
+            "member x[:] = 2 on a bool receiver [2 is truthy, so True]", "bool",
+            [pair], assigned(lambda a: a.__setitem__(slice(None), 2)),
+            note="measured [True,True,True] -- a receiver whose dtype cannot hold the "
+                 "number, filled with what the number means rather than with its bits",
         )
     )
     # `x[:] = tensor` narrows nothing, so upstream reaches `copy_` rather than
@@ -11071,6 +11678,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.zeros_like.default": zeros_like_cases,
     "aten.empty_like.default": empty_like_cases,
     "aten.ge.Scalar": ge_scalar_cases,
+    "aten.ge.Tensor": ge_tensor_cases,
     "aten.floor_divide.default": floor_divide_cases,
     "aten.floor_divide.Scalar": floor_divide_scalar_cases,
     "aten.histc.default": histc_cases,
