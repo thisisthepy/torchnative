@@ -170,7 +170,14 @@ generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_l
 
 - Mixtral is the one incomplete architecture — `_grouped_mm`, an offset-based grouped GEMM
   with no equivalent here yet.
-- `torch.compile` does not work; it stops inside Dynamo. Eager execution is the supported path.
+- `torch.compile` does not work, and the reason is structural rather than a missing piece.
+  Dynamo's frame-evaluation hook needs CPython internals — all six C files under
+  `torch/csrc/dynamo` define `Py_BUILD_CORE`, and `set_eval_frame` reaches
+  `_PyInterpreterState_SetEvalFrameFunc` on a `_PyInterpreterFrame` — which cannot coexist with
+  the limited API in one extension. **`torch.compile` and abi3 are mutually exclusive**, and abi3
+  is what lets one binary per platform serve 3.13 and every later CPython. Eager is the supported
+  path, and graph capture through the single door — already bit-exact against eager — is the
+  route being pursued instead ([`docs/DYNAMO.md`](docs/DYNAMO.md)).
 - CPU only. No GPU or NPU backend.
 - The Android run is an emulator, not a phone. No number here describes real silicon.
 - Apple is much faster than Android at `f32` matmul, and that is the hardware. Accelerate
