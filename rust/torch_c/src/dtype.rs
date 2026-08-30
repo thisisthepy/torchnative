@@ -688,7 +688,7 @@ pub fn get_default_dtype(py: Python<'_>) -> PyResult<Py<PyAny>> {
 static INTERNED: std::sync::OnceLock<Vec<(TorchDType, Py<PyAny>)>> =
     std::sync::OnceLock::new();
 
-fn interned(py: Python<'_>, tag: TorchDType) -> PyResult<Py<PyAny>> {
+pub(crate) fn interned(py: Python<'_>, tag: TorchDType) -> PyResult<Py<PyAny>> {
     INTERNED
         .get()
         .and_then(|made| made.iter().find(|(d, _)| *d == tag))

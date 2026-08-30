@@ -781,3 +781,354 @@ the floor at 2%; item 1 is ~4% of a `view` and the rest are smaller.
   `bind2_ab.sh` + `bind2_micro.py` + `bind2_report.py` (§8.4), and the
   `*.jsonl` per-round records. They are not committed; `differential.py` is the
   one worth promoting into the repository if this area is touched again.
+
+---
+
+## 9. Round 4 — `Tensor.dtype` was never interned, and it was a correctness bug
+
+The brief named this as one lead to check first, "a correctness question
+wearing a performance hat." It is a correctness question, the answer is a
+real bug, and the bug already had a name in this repository before this round
+started -- `docs/DECOMP.md` §7.2 recorded its symptom and said "not yet
+narrowed down which op it's from." It is this.
+
+### 9.1 The identity check, confirmed
+
+`tensor.rs:614`:
+
+```rust
+#[getter]
+fn dtype(&self) -> PyDtype {
+    PyDtype::new(self.tag)
+}
+```
+
+A fresh Rust struct -- and therefore a fresh Python object -- on every read.
+`PyDtype::__eq__` compares the tag, so `t.dtype == torch.float32` was never
+wrong. `t.dtype is torch.float32` was `False` unconditionally, for every
+tensor, of every dtype, every time:
+
+```
+>>> t = torch.zeros(3, dtype=torch.float32)
+>>> t.dtype is torch.float32
+False
+>>> t.dtype == torch.float32
+True
+>>> t.dtype is t.dtype
+False
+```
+
+Round 1's "attribute reads are comparable to upstream" table (§1) measured
+`.shape` and `.dim()`. It never measured `.dtype`, which is the one of the
+three with a singleton-identity contract upstream actually relies on --
+`torch.float32` is a module-level constant precisely so code can compare
+dtypes by `is` (`dtype.rs`'s own `register()` interns exactly one Python
+object per dtype and the module-level names all point at it -- `torch.float32
+is torch.float32` was always `True`; it is `Tensor.dtype`'s *return value*
+that was never one of those objects).
+
+### 9.2 This is not a hypothetical hazard -- it produces a wrong dtype today
+
+The vendored tree checks dtype by identity in reachable code.
+`_meta_registrations.py` gates several quantised-linear registrations
+(`torch._weight_int8pack_mm` and neighbours) on `w.dtype is torch.uint8` /
+`b.dtype is torch.int8` / `w.dtype is torch.int32`; against the native getter
+those are `False` unconditionally, so the guard takes the "wrong dtype"
+branch regardless of the tensor's actual dtype. SmolLM2-135M float32 does not
+reach that code, so it was not caught by the model-checksum check §8.3 relies
+on.
+
+Something SmolLM2's own capture/decompose path *does* reach was already
+failing, silently, and already had a name: `docs/DECOMP.md` §7.2, "**아직**"
+(not yet):
+
+```
+                       input                    decomposed dtype
+upstream  baddbmm(f32, f32, f32)                 float32
+here      baddbmm(f32, f32, f32)                 float64
+```
+
+recorded as "a divergence in the scalar promotion rule... not yet narrowed
+down which op it's from." It is this op. `torch/_prims_common/__init__.py`'s
+`get_higher_dtype` (used by `elementwise_dtypes`, which every
+`@pw_cast_for_opmath`-decorated decomposition calls, `baddbmm` among them):
+
+```python
+    a, b = _extract_dtype(a), _extract_dtype(b)
+
+    if a is b:
+        return a
+    ...
+    ordered_datatypes = (
+        (torch.bool,),
+        (torch.uint8, torch.int8),
+        ...
+        (torch.float32,),
+        (torch.float64,),
+        ...
+    )
+    for idx, dtypes in enumerate(ordered_datatypes):
+        if a in dtypes and b in dtypes:
+            return ordered_datatypes[idx + 1][0]
+```
+
+`if a is b: return a` is upstream's fast path for "these are literally the
+same dtype," and it is load-bearing, not an optimisation: the table below it
+is grouped for dtypes that are *different but equal-ranked*
+(`torch.uint8`/`torch.int8`, `torch.float16`/`torch.bfloat16`) and its rule
+for two same-group members is "promote to the next group" -- correct when `a`
+and `b` are genuinely different dtypes sharing a rank, wrong when they are the
+same dtype read twice. Two `float32` tensors reach `get_higher_dtype(t1.dtype,
+t2.dtype)`; against the native getter `a is b` is always `False`, so both fall
+into the table, both are found in `(torch.float32,)`, and the function returns
+`ordered_datatypes[idx + 1][0]` -- `torch.float64`. That is the exact
+divergence DECOMP.md §7.2 recorded, reproduced directly:
+
+```
+>>> from torch._decomp.decompositions import baddbmm
+>>> c, a, b = torch.ones(2,3,5), torch.ones(2,3,4), torch.ones(2,4,5)
+>>> baddbmm(c, a, b).dtype     # pre-fix artefact
+torch.float64
+>>> baddbmm(c, a, b).dtype     # post-fix artefact, same inputs
+torch.float32
+```
+
+Confirmed against both artefacts directly (§9.4's `old`/`new` builds, md5s
+distinct), not inferred: rebuilding with `_install_tensor_dtype_identity`
+reverted reproduces `float64`; rebuilding with it in place reproduces
+`float32`, matching upstream's `f32,f32,f32 -> f32`. **This was not a
+performance lead that happened to also matter for correctness -- it was
+already a filed, unexplained correctness bug, and the performance-shaped
+question the brief asked is what found its cause.**
+
+### 9.3 The fix -- in `bootstrap.py`, without touching `tensor.rs`
+
+`tensor.rs` is not this round's territory, so the fix is a Python-level
+override of `TensorBase.dtype`, installed from `_install_tensor_methods`
+(new function `_install_tensor_dtype_identity`, called before
+`_install_tensor_conversions`). It works because `torch._C._get_all_dtypes()`
+already carries the fact needed: it enumerates the dtypes by *name*
+(`str(d)`), and `getattr(module, name)` for each name is the interned
+singleton `dtype.rs::register` put on the module -- the same object
+`torch.float32` names, *not* what `_get_all_dtypes()` itself returns
+(`get_all_dtypes()` is `PyDtype::new` over the table too, so building the
+intern table from its return value directly would reproduce the exact bug
+this exists to fix -- tried first, and it does: see the inline comment in
+`_install_tensor_dtype_identity`). `PyDtype.__eq__`/`__hash__` are defined on
+the tag, so a dict keyed on a freshly-read (uninterned) dtype and valued on
+the module attribute resolves any `PyDtype` to its singleton by tag equality:
+
+```python
+def _install_tensor_dtype_identity(module, tensorbase) -> None:
+    raw_dtype = tensorbase.dtype
+    intern_table = {}
+    for raw in module._get_all_dtypes():
+        name = str(raw)[len("torch."):]
+        intern_table[raw] = getattr(module, name)
+
+    def dtype(self):
+        raw = raw_dtype.__get__(self)
+        return intern_table.get(raw, raw)
+
+    setattr(tensorbase, "dtype", property(dtype))
+```
+
+Verified for every one of the ten dtypes this build can actually store
+(`float32`, `float64`, `float16`, `bfloat16`, `uint8`, `uint32`, `int16`,
+`int32`, `int64`, `bool` -- `PyDtype::storage()` in `dtype.rs`):
+
+```
+float32 is: True eq: True   float64 is: True eq: True
+float16 is: True eq: True   bfloat16 is: True eq: True
+uint8 is: True eq: True     uint32 is: True eq: True
+int16 is: True eq: True     int32 is: True eq: True
+int64 is: True eq: True     bool is: True eq: True
+```
+
+`_to_copy`'s `!=` (not `is not`) is kept: `self.dtype` is now interned, but a
+caller-supplied `dtype` value is not guaranteed to be one, because
+`PyDtype.to_real()`/`.to_complex()` (`dtype.rs`) build a fresh, uninterned
+`PyDtype` unconditionally. `!=` is correct either way; the comment at that
+call site is updated to say why `is not` is still not used.
+
+**The clean fix is one line in `tensor.rs`**, changing the getter to call
+`dtype::interned(py, self.tag)` (already `pub(crate)`, already what
+`get_default_dtype` uses) instead of `PyDtype::new`. That needs no dict, no
+extra Python frame, and no per-read allocation -- strictly better than what
+is installed here, and it is not written because `tensor.rs` is outside
+`bootstrap.py` + `docs/BIND.md`. Recorded so whoever next touches `tensor.rs`
+does not have to re-derive it.
+
+### 9.4 What it costs -- measured, and it is not the story
+
+Cost of `t.dtype` itself, minimum of 5 blocks of 20 000 after 200 warmups on
+a `(1, 6, 9, 64)` float32 tensor, artefacts alternating old/new every round in
+fresh subprocesses (md5s distinct: `old` f4d91c5..., `new` 6f8860e...), 4
+rounds, load 3.26-3.29:
+
+| | old | new | ratio |
+|---|---|---|---|
+| round 1 | 0.0696 | 0.1518 | 2.18x |
+| round 2 | 0.0697 | 0.1530 | 2.19x |
+| round 3 | 0.0727 | 0.1518 | 2.09x |
+| round 4 | 0.0701 | 0.1530 | 2.18x |
+
+µs/call. The bands do not overlap: the dict lookup plus the extra Python
+frame roughly **doubles** the cost of a single `.dtype` read, from ~0.07 µs to
+~0.15 µs -- the honest price of the fix in §9.3, and the reason the clean
+version belongs in `tensor.rs` instead.
+
+**It does not matter at the model level, because `.dtype` is read rarely.**
+Counted directly (a counting wrapper installed over the already-fixed
+property, one SmolLM2-135M float32 prefill, after 2 warmup passes so import-
+time reads do not inflate it):
+
+```
+dtype reads per prefill: 220
+```
+
+against ~9275 `_aten_dispatch` calls (§9.5's profile). At +0.082 µs per read,
+220 reads is **+0.018 ms per prefill**, against a ~37-38 ms baseline (§5,
+§DISPATCH.md §5.2) -- **about 0.05%**, an order of magnitude below what this
+machine's round-to-round spread on prefill can resolve (§5 could not resolve
+2-6%). This is reported as a did-not-regress number, the same status BIND.md
+and DISPATCH.md give their own unresolved prefill readings, not as a measured
+loss.
+
+### 9.5 The one thing this changes, and it is not touched
+
+`baddbmm`'s decomposition no longer wrongly promotes to `float64` (§9.2), so
+the smoke test written *against* that documented bug now disagrees with it:
+
+```
+FAIL test_decompose_refuses_by_name_what_it_cannot_lower: AssertionError
+```
+
+`rust/torch_c/pytests/test_shim.py`'s
+`test_decompose_refuses_by_name_what_it_cannot_lower` asserts, as its third
+of three refusal cases, that lowering `aten.baddbmm.default` produces a
+result the capture *disagrees* with (`"aten.baddbmm.default" in
+r["refuse_disagrees"]`, `"torch.float64"` and `"torch.float32"` both in the
+message) -- i.e. it pins DECOMP.md §7.2's bug as expected behaviour. With this
+fix, the decomposition agrees with the recording (both `float32`), so
+`_lower_node` no longer raises, `r["refuse_disagrees"]` reads `"ACCEPTED"`,
+and the assertion fails. Confirmed directly: calling `_decomp_road_fixture()`
+after the fix returns `refuse_disagrees: "ACCEPTED"` where it used to return
+the `DecompositionRefused` message the test checks the wording of.
+
+**This is not touched.** `rust/torch_c/pytests/test_shim.py` and
+`docs/DECOMP.md` are outside this round's territory (`bootstrap.py` +
+`docs/BIND.md`), and the assertion encodes a bug this round's fix genuinely
+removes -- updating it is a real, small change (the test's case 3 needs a
+different op that still disagrees, or the assertion needs to become "now
+lowers cleanly," matching how `test_decompose_lowers_sum_default_now_that_
+the_kernel_agrees` was written the last time a case in this test stopped
+reproducing its bug) but it is a decision about what that test should now
+assert, not a decision this round's territory covers. **This is why the
+acceptance bar's "smoke exactly 211" does not hold as of this fix**: it reads
+210 ok / 1 failed, and the one failure is this. Golden (2843/2843), the
+self-test (PASS), and schemas (4203/4203) are unaffected and still hold
+exactly, all re-verified against the rebuilt artefact after the earlier false
+alarm in §9.6 was found and corrected.
+
+`docs/DECOMP.md` §7.2 can also be updated to close out "아직" (not yet) --
+§9.2 above is the missing "which op it's from" -- but that file is likewise
+outside this round's territory.
+
+### 9.6 A measurement-hygiene miss, caught before it was reported as real
+
+The first pass at golden/schemas after this fix read 2784/2843 and a hard
+crash in `verify_schemas.py` (`NotImplementedError:
+torch._C._jit_get_all_schemas`). That looked like a second, worse regression.
+It was not: the same two commands against the **unmodified baseline artefact**
+produced the identical 2784/2843 and the identical crash. The cause was this
+session's own environment -- `PYTHONPATH`/`TORCH_USE_RTLD_GLOBAL` had been
+left set (needed for the direct `.dtype` micro-benchmarks) when invoking
+`tools/golden/compare.py` and `verify_schemas.py`, which the brief's own
+VERIFY block does not set for those two commands. Unset, both baseline and
+fixed builds read exactly 2843/2843 and 4203/4203. Recorded per the brief's
+own instruction to suspect the harness before the code when a baseline
+disagrees with the number in the brief -- this is the twelfth instance of that
+class in this file's and DISPATCH.md's combined history, not the first.
+
+A second near-miss in the same pass: the first "final" golden/schemas run
+after popping a `git stash` (used to compare old vs. new source) was not
+preceded by a rebuild, so it silently re-tested the *previous* artefact.
+Caught by `strings _C.abi3.so | grep -c _install_tensor_dtype_identity`
+reading `0` where the patched build reads `3` -- the same class of trap
+DISPATCH.md §7.1 and this file's §8.7 both name (`bootstrap.py` is
+`include_str!`'d in at Rust build time, so a source-only diff proves nothing
+about which artefact is loaded).
+
+### 9.7 The profile, as it stands after three prior rounds
+
+Counted the same way §8.1 was -- `cProfile` over 5 SmolLM2-135M float32
+forward passes, after 2 warmups, on the artefact with this round's fix
+applied:
+
+```
+137081 function calls (132631 primitive calls) in 0.221 seconds
+
+ncalls   tottime  function
+  9275    0.170    {built-in method torch._C._aten_dispatch}
+  5940    0.010    bootstrap.py:2190(resolve)
+   615    0.003    bootstrap.py:3437(__getitem__)
+ 33775    0.003    {built-in method builtins.isinstance}
+  5020    0.003    bootstrap.py:3064(method)
+  1540    0.001    bootstrap.py:2150(_bind_keywords)
+   625    0.001    bootstrap.py:3207(to)
+```
+
+`resolve` is now **4.5% of total tottime** (0.010 / 0.221), down from the
+53-63 % of an *individual operator call* §8.1 measured before round 3's
+fold -- consistent with that fold, not a new finding. `_aten_dispatch` itself
+is 77%, and DISPATCH.md already closed the removable third of that
+(the keyword convention); the rest is kernel work upstream pays for too. Two
+things follow from this profile, both against the brief's instruction not to
+assume `resolve` is still the top item:
+
+1. **`resolve`/`_bind`/`method`/`fn` are not where the round-5 win is.** Three
+   rounds have already measured and either landed or explicitly declined
+   every change to this path that showed a measurable effect (§3, §8) or
+   priced the remaining ones below this machine's noise floor (§8.6: item 1
+   ~0.07 µs, items 2-3 smaller still, against a control that reads 1.00x to
+   within ~1-2%). Re-attempting them without a new idea would reproduce §8.5's
+   "measured 5-7% slower" or §3.4's "measured within noise, reverted" outcome
+   -- exactly the dead ends the brief named.
+2. **Nothing else in `bootstrap.py` stands out.** `__getitem__` (615 calls,
+   0.003 s), `to` (625 calls, 0.001 s) and `_bind_keywords` (1540 calls,
+   0.001 s) are each under 1.5% of total tottime on this model; none has the
+   call-count-times-per-call-cost shape that made `resolve` worth three
+   rounds. The dominant remaining cost is `_aten_dispatch` itself, which is
+   forbidden territory this round (`aten.rs`) and is mostly real kernel work
+   rather than convention overhead (DISPATCH.md §1.1's decomposition already
+   separated the two).
+
+No change is proposed from this profile. It is reported because the brief
+asked for it "as found," and because "nothing left to fold" is itself the
+answer to "is `resolve` still the top item" after three rounds -- it explains
+why this round's finding is a correctness fix rather than a fourth `resolve`
+optimisation.
+
+### 9.8 Summary
+
+- **`.dtype` question: correctness, not performance.** `Tensor.dtype` returned
+  a fresh, uninterned object on every read; `is torch.<dtype>` was `False`
+  unconditionally. Fixed in `bootstrap.py` (§9.3); the clean fix is a one-line
+  change in `tensor.rs`, described but not written (out of territory).
+- **It was not latent.** It was the unexplained cause of a bug already on
+  record, `docs/DECOMP.md` §7.2's `baddbmm` float32→float64 promotion,
+  traced to `get_higher_dtype`'s `if a is b: return a` fast path in
+  `torch/_prims_common/__init__.py:1360` failing open into a table lookup
+  that promotes same-rank dtypes to the next rank.
+- **The fix costs ~0.018 ms per SmolLM2-135M prefill** (220 `.dtype` reads ×
+  ~0.082 µs added each), against a ~37-38 ms baseline -- not measurable
+  against this machine's noise floor, reported as did-not-regress.
+- **One smoke test now fails**, `test_decompose_refuses_by_name_what_it_cannot
+  _lower`, because it pinned the bug this fix removes as expected behaviour.
+  Not fixed here -- out of territory (`rust/torch_c/pytests/test_shim.py`).
+  Golden (2843/2843), the self-test (PASS) and schemas (4203/4203) all hold
+  exactly, unaffected.
+- **The profile shows nothing else to fold in `bootstrap.py`.** `resolve` is
+  now 4.5% of prefill tottime; the dominant cost is `_aten_dispatch` itself,
+  outside this round's territory.
