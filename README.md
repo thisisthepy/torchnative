@@ -148,11 +148,11 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>119</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>2843 / 2843</b> — values, shapes, dtypes, positional <i>and</i> keyword</td></tr>
-<tr><td>Smoke tests</td><td><b>211</b></td></tr>
-<tr><td>Signature and schema tables</td><td><b>4203</b> entries checked against upstream</td></tr>
-<tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
+<tr><td>ATen operators</td><td><b>121</b>, each compared against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>2971 / 2971</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>223</b></td></tr>
+<tr><td>Signature and schema tables</td><td><b>4231</b> entries checked against upstream</td></tr>
+<tr><td>Architectures complete</td><td><b>20 of 20</b> measured. Mixtral was the last: it runs unpatched, agreeing with upstream on every argmax and every generated token, logits within one float32 ulp (<a href="docs/GROUPED_MM.md">GROUPED_MM.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
@@ -160,7 +160,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 </table>
 
 Complete: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT · StarCoder2 ·
-Persimmon · Cohere · StableLM · OLMo · Phi · BERT · Falcon · BLOOM · GPT-BigCode
+Persimmon · Cohere · StableLM · OLMo · Phi · BERT · Falcon · BLOOM · GPT-BigCode · Mixtral
 
 `uniform_` and `normal_` are **bit-identical** to upstream, and `multinomial` consumes the same
 generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_like` forms and
@@ -168,8 +168,6 @@ generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_l
 
 **Not working yet**
 
-- Mixtral is the one incomplete architecture — `_grouped_mm`, an offset-based grouped GEMM
-  with no equivalent here yet.
 - `torch.compile` does not work, and the reason is structural rather than a missing piece.
   Dynamo's frame-evaluation hook needs CPython internals — all six C files under
   `torch/csrc/dynamo` define `Py_BUILD_CORE`, and `set_eval_frame` reaches
