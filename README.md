@@ -157,7 +157,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
-<tr><td>Speed vs upstream</td><td>desktop CPU: <b>within a few percent</b> on SmolLM2-135M <code>float32</code> prefill, from 14% behind. The kernels were already ahead; the gap was argument binding (<a href="docs/BIND.md">BIND.md</a>)</td></tr>
+<tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.16x at 128, 1.97x at 512</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>)</td></tr>
 </table>
 
 **Forwards on this shim** (19): Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT ·
