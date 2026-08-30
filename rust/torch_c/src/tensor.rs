@@ -903,6 +903,40 @@ pub fn promote(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<PyAny>> {
     Ok(value)
 }
 
+/// The name `set_`'s dtype-mismatch message uses -- **a fourth spelling of the
+/// same set**, distinct from `TorchDType::name()` (`int64`), `aten.rs`'s
+/// `c10_name` (`int64_t`) and its `scalar_type_name` (`Long`).
+///
+/// It is the plain C++ type name rather than a c10 alias, so it is not
+/// derivable from any of the other three, and every row was read off a real
+/// `RuntimeError` from torch 2.13.0 by provoking the mismatch across all ten
+/// storable dtypes:
+///
+/// ```text
+/// int64 -> "long long"        NOT "int64_t"
+/// int16 -> "short"            NOT "int16_t"
+/// int8  -> "signed char"      uint8 -> "unsigned char"
+/// ```
+///
+/// The four floating rows happen to agree with `c10_name`; the integral ones
+/// do not, which is why this is its own table and not a call into that one.
+fn set_type_name(dtype: TorchDType) -> &'static str {
+    use TorchDType::*;
+    match dtype {
+        Float64 => "double",
+        Float32 => "float",
+        Float16 => "c10::Half",
+        BFloat16 => "c10::BFloat16",
+        Int64 => "long long",
+        Int32 => "int",
+        Int16 => "short",
+        Int8 => "signed char",
+        UInt8 => "unsigned char",
+        Bool => "bool",
+        other => other.name(),
+    }
+}
+
 #[pymethods]
 impl PyTensorBase {
     /// `TensorBase(other)` -- the constructor `promote` calls.
@@ -913,20 +947,116 @@ impl PyTensorBase {
     /// `_make_subclass` a three-line Python function in `bootstrap.py` rather
     /// than another piece of native machinery.
     ///
-    /// It takes a tensor and nothing else. Upstream's `torch.Tensor(2, 3)`
-    /// (the legacy uninitialised-storage constructor) is a different function
-    /// wearing the same name, is not used anywhere on the inference path, and
-    /// is refused by name rather than guessed at.
+    /// **It now takes two forms, and the split is by argument type.**
+    ///
+    /// ```text
+    /// TensorBase(existing)          re-wrap, sharing the candle tensor
+    /// TensorBase()                  a (0,) tensor of the default float
+    /// TensorBase(2), TensorBase(2, 3), ...   uninitialised storage of that shape
+    /// ```
+    ///
+    /// The second form is upstream's legacy `torch.Tensor(2, 3)` constructor,
+    /// which this refused by name until docs/KERNELS26.md §4. **The decision
+    /// recorded there is that reproducing it is right**, on three grounds, and
+    /// the grounds matter more than the conclusion:
+    ///
+    ///   1. **It is not a new computation path.** A `TorchDispatchMode` trace
+    ///      of `torch.Tensor(3)` on 2.13.0 fires exactly one op --
+    ///      `aten.empty.memory_format` -- which this shim already implements
+    ///      and already golden-compares. So this is a *constructor spelling*
+    ///      over an existing kernel, structurally the same as ARCH26.md §3.1's
+    ///      `torch.conv2d` over `aten.convolution.default`, and not the kind of
+    ///      invention `sqrt`-as-`pow(x, 0.5)` would have been.
+    ///   2. **The forms are distinguishable at the type level**, which is
+    ///      exactly what the old refusal already did -- it extracted a
+    ///      `TensorBase` and refused everything else. Nothing here has to guess.
+    ///   3. **It costs a family of architectures, not one.**
+    ///      `nn.Parameter(torch.Tensor(config.hidden_size).uniform_())` is the
+    ///      `masked_spec_embed` idiom, and it is created *unconditionally* in
+    ///      `__init__` whether or not `apply_spec_augment` is set -- so no toy
+    ///      config avoids it. `sew_d` is the architecture ARCH26.md §4 found it
+    ///      in; `wav2vec2`, `sew`, `hubert`, `unispeech` and `wavlm` share the
+    ///      line.
+    ///
+    /// **The bytes are zeros, and upstream's are uninitialised.** That is a
+    /// real divergence and it is the same one `aten.empty.memory_format`
+    /// already has (its golden case is `_dtype_shape_only_check`, whose whole
+    /// docstring is "there is no correct value to diff"). Reading a
+    /// `torch.Tensor(n)` before writing it is undefined upstream, so this is a
+    /// narrowing of undefined behaviour rather than a disagreement about a
+    /// defined one -- and the real caller writes it immediately, with
+    /// `.uniform_()`.
+    ///
+    /// **The sequence form stays refused.** `torch.Tensor([3, 4])` builds from
+    /// data (a `(2,)` tensor of `3.0, 4.0`, *not* a `(3, 4)` empty one), which
+    /// is a third function again, is not what any measured caller reaches, and
+    /// would need `_tensor_new_from_data` -- a module-level function this type
+    /// has no handle to. It refuses by name, and the message says which form it
+    /// is refusing rather than being generic.
+    ///
+    /// PyO3's generated `tp_new` allocates with the *subtype* it was called
+    /// with, so `Tensor(base)` produces a `Tensor` and `Parameter(base)` a
+    /// `Parameter`, each sharing the candle tensor. That is what makes
+    /// `_make_subclass` a three-line Python function in `bootstrap.py` rather
+    /// than another piece of native machinery, and it is unaffected by the
+    /// second form.
     #[new]
-    fn py_new(data: &Bound<'_, PyAny>) -> PyResult<Self> {
-        data.extract::<Self>().map_err(|_| {
-            not_implemented(format!(
-                "torch._C shim: TensorBase(...) takes an existing tensor to re-wrap; \
-                 upstream's legacy `torch.Tensor({})` storage constructor is not \
-                 implemented",
-                data.get_type().name().map(|n| n.to_string()).unwrap_or_default()
-            ))
-        })
+    #[pyo3(signature = (*args))]
+    fn py_new(args: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        // `TensorBase(existing)` first: it is the form every caller inside
+        // this shim uses, and checking it first keeps that path a single
+        // `extract`.
+        if args.len() == 1 {
+            if let Ok(existing) = args.get_item(0)?.extract::<Self>() {
+                return Ok(existing);
+            }
+        }
+
+        // Every remaining argument must be an integer, or this is the
+        // sequence form (or something else again) and is refused by name.
+        let mut dims: Vec<usize> = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            let item = args.get_item(i)?;
+            // `bool` subclasses `int` in Python; upstream's own parser takes
+            // `torch.Tensor(True)` as a size of 1, and so does this, because
+            // `extract::<i64>` accepts it. Not worth a special case in either
+            // direction -- it is the same number.
+            let Ok(extent) = item.extract::<i64>() else {
+                return Err(not_implemented(format!(
+                    "torch._C shim: TensorBase(...) takes either an existing tensor to \
+                     re-wrap or a sequence of integer sizes (upstream's legacy \
+                     `torch.Tensor(2, 3)` storage constructor); building from data, \
+                     `torch.Tensor({})`, is a third form and is not implemented",
+                    item.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+                )));
+            };
+            if extent < 0 {
+                // Upstream's wording, measured: `torch.Tensor(-1)` raises
+                // `Trying to create tensor with negative dimension -1: [-1]`.
+                let shown: Vec<i64> = (0..args.len())
+                    .map(|j| args.get_item(j).and_then(|v| v.extract::<i64>()).unwrap_or(0))
+                    .collect();
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Trying to create tensor with negative dimension {extent}: {shown:?}"
+                )));
+            }
+            dims.push(extent as usize);
+        }
+
+        // `TensorBase()` is `(0,)`, not `()` -- measured. The zero-argument
+        // form is the one-dimensional empty tensor, not a scalar.
+        if dims.is_empty() {
+            dims.push(0);
+        }
+
+        // The default float, read at call time, so this moves with
+        // `set_default_dtype` the way upstream's does (measured:
+        // `set_default_dtype(torch.float64)` makes `torch.Tensor(3)` float64).
+        let tag = crate::dtype::default_float();
+        let storage = PyDtype::new(tag).storage("TensorBase")?;
+        let inner = Tensor::zeros(dims, storage, &candle_core::Device::Cpu)
+            .map_err(|e| candle_err("TensorBase", e))?;
+        Self::new(inner)
     }
 
     /// torch returns `torch.Size`, itself a C-defined tuple subclass. The shim
@@ -1240,15 +1370,94 @@ impl PyTensorBase {
     ///    holds the same numbers with contiguous stride. That is visible to
     ///    anything that reads `.stride()`, and it is why `set_` cannot be used
     ///    to build an aliasing view on purpose.
-    #[pyo3(signature = (source, storage_offset = 0, size = None, stride = None))]
+    /// ---
+    ///
+    /// **`aten.set_.source_Tensor` and the no-argument form now work too**
+    /// (docs/KERNELS26.md §5), and unlike the storage form above they *do*
+    /// alias, which is upstream's behaviour rather than a divergence.
+    ///
+    /// ```text
+    /// a.set_(b)   a adopts b's storage, shape and stride, and returns `a`.
+    ///             The two share afterwards: writing into `b` is visible in `a`.
+    /// a.set_()    a becomes an empty (0,) tensor of its own dtype.
+    /// ```
+    ///
+    /// This is the wall `vits` and `sew_d` both stopped on (ARCH26.md §2),
+    /// reached through `torch.nn.utils.parametrizations.weight_norm`:
+    /// `register_parametrization` calls `ParametrizationList.__init__`, which
+    /// calls `_maybe_set(original, new)`, which is `dest.set_(src)` for two
+    /// tensors.
+    ///
+    /// **The tensor form aliases and the storage form copies, in the same
+    /// method, and that asymmetry is not an inconsistency.** The storage form
+    /// has to copy because candle owns its memory and a `Storage` is bytes
+    /// this shim holds separately; the tensor form does not, because
+    /// `Repr::Dense` *is* a candle tensor and a candle clone is an `Arc`
+    /// clone of the same storage. So the tensor form gets upstream's semantics
+    /// for free, and `test_which_ops_share_storage_with_their_input_and_which_do_not`
+    /// is where that is pinned rather than assumed.
+    ///
+    /// **The dtype must match, and upstream's refusal is reproduced**:
+    /// `torch.zeros(2).set_(torch.arange(3))` raises
+    /// `Could not set tensor of type long long to a tensor of type float`.
+    /// Silently adopting the source's dtype would make `set_` a `to()` with no
+    /// conversion, and the parametrize machinery would then be swapping a
+    /// float parameter for an integer one without complaint.
+    #[pyo3(signature = (source = None, storage_offset = 0, size = None, stride = None))]
     fn set_<'py>(
         slf: &Bound<'py, Self>,
-        source: &Bound<'py, PyAny>,
+        source: Option<&Bound<'py, PyAny>>,
         storage_offset: usize,
         size: Option<Vec<usize>>,
         stride: Option<Vec<i64>>,
     ) -> PyResult<Bound<'py, Self>> {
         const OP: &str = "TensorBase.set_";
+
+        // `a.set_()` -- `aten.set_.default`. Upstream empties the tensor in
+        // place, keeping its dtype: `torch.arange(4.).set_()` is `(0,)` with
+        // `numel() == 0`, measured.
+        let Some(source) = source else {
+            let tag = slf.borrow().tag;
+            let storage = PyDtype::new(tag).storage(OP)?;
+            let empty = Tensor::zeros(vec![0usize], storage, &candle_core::Device::Cpu)
+                .map_err(|e| candle_err(OP, e))?;
+            let replacement = Self { tag, ..Self::new(empty)? };
+            slf.borrow_mut().replace_with(replacement);
+            return Ok(slf.clone());
+        };
+
+        // `a.set_(b)` -- `aten.set_.source_Tensor`. Checked before the
+        // storage extraction, not after, because a `Parameter` extracts as a
+        // `TensorBase` and would otherwise fall into the storage arm's error
+        // message -- which is exactly the message ARCH26.md §2 recorded.
+        if let Ok(other) = source.extract::<PyTensorBase>() {
+            if storage_offset != 0 || size.is_some() || stride.is_some() {
+                return Err(not_implemented(format!(
+                    "{OP}(tensor, storage_offset, size, stride) is \
+                     aten.set_.source_Tensor_storage_offset, a distinct overload that \
+                     re-lays-out the source rather than adopting it, and is not \
+                     implemented in this shim"
+                )));
+            }
+            let tag = slf.borrow().tag;
+            if other.tag != tag {
+                // Upstream's wording, with its C++ type names, measured on
+                // 2.13.0. No shim prefix: this is torch semantics being
+                // reproduced, the same convention `overflow()` follows.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Could not set tensor of type {} to a tensor of type {}",
+                    set_type_name(other.tag),
+                    set_type_name(tag),
+                )));
+            }
+            // `replace_with` rather than `write_into`: `set_` re-points the
+            // tensor at another one's storage, it does not copy values into
+            // the storage this tensor already had. `Repr::Dense` holds a
+            // candle tensor whose clone shares its `Arc`, so the two alias
+            // afterwards exactly as upstream's do.
+            slf.borrow_mut().replace_with(other);
+            return Ok(slf.clone());
+        }
 
         let storage: PyRef<'_, crate::storage::PyStorageBase> =
             source.extract().map_err(|_| {
@@ -1258,9 +1467,7 @@ impl PyTensorBase {
                     .map(|n| n.to_string())
                     .unwrap_or_else(|_| "?".to_string());
                 not_implemented(format!(
-                    "{OP}: expected a torch.UntypedStorage, got {got} -- the \
-                     no-argument and tensor-argument spellings of set_ are not \
-                     implemented in this shim"
+                    "{OP}: expected a torch.UntypedStorage or a tensor, got {got}"
                 ))
             })?;
 
@@ -2007,10 +2214,320 @@ pub(crate) fn scale_and_causal_mask(source: &Tensor, scale: f64) -> candle_core:
     source.apply_op1_no_bwd(&ScaleCausal { scale })
 }
 
+// ---------------------------------------------------------------------------
+// The transposed copy, blocked.
+//
+// docs/SEQLEN.md §8.12 named this as the one clean kernel win left in SDPA:
+// `k.transpose(2, 3).contiguous()` moves 2.4 MB at ~3.7 GB/s, against
+// upstream's 0.134 ms for the same bytes -- 1.15 ms of a 13.64 ms per-call
+// gap at `S=1024`, which is 8% of the SDPA gap and 7% of the model gap.
+//
+// The reason it is slow is candle's `copy_strided_src`, which walks a
+// transposed layout **one element at a time**: for each output element it
+// recomputes a multi-dimensional index and reads a source address `head_dim`
+// floats away from the last one. Every read is a cache miss once the source is
+// bigger than L2.
+//
+// **This is the only entry in §8.12's table that is bit-identical by
+// construction**, and that is why it is the one taken. There is no arithmetic
+// here at all -- every output element is a *copy* of exactly one input element,
+// so there is no summation order to reassociate and no rounding to move. The
+// only thing a blocked traversal changes is the order in which the same
+// assignments happen.
+//
+// Contrast with the trap recorded beside it in §8.5: simply *dropping* the
+// `contiguous` is 5% faster and **moves the S=6 digest**, because it lets
+// Accelerate take a transposed GEMM with a different accumulation order. That
+// was tried and rejected. This makes the copy faster; it does not remove it.
+// ---------------------------------------------------------------------------
+
+/// Cache block, in elements per side.
+///
+/// 32x32 `f32` is 4 KB read plus 4 KB written, so both blocks are live in L1
+/// together with room to spare on every target this builds for. The value is
+/// not tuned per machine: the win is going from "one cache line per element"
+/// to "one cache line per 16 elements", and any block that fits in L1 gets
+/// essentially all of it.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// Is this layout "the last two dimensions of a contiguous tensor, swapped"?
+///
+/// Returns `(batches, src_rows, src_cols, offset)` when it is: the source is
+/// `batches` consecutive `src_rows x src_cols` row-major matrices starting at
+/// `offset`, and the output is each of them transposed.
+///
+/// Written as a recogniser rather than assumed, because the caller is one line
+/// in `sdpa_flash_cpu` and the guarantee has to hold for whatever that line is
+/// handed. Anything it does not recognise falls back to candle's own
+/// `contiguous`, so a layout this does not understand is slow rather than
+/// wrong.
+fn transposed_plan(layout: &Layout) -> Option<(usize, usize, usize, usize)> {
+    let dims = layout.dims();
+    let strides = layout.stride();
+    if dims.len() < 2 {
+        return None;
+    }
+    let last = dims.len() - 1;
+    // The swapped pair: the second-to-last dimension is the one packed in
+    // storage, and the last one steps by the packed extent.
+    if strides[last - 1] != 1 || strides[last] != dims[last - 1] {
+        return None;
+    }
+    // Everything above the pair must be contiguous over the pair's area, or
+    // the batches are not consecutive and the offset arithmetic below is
+    // wrong.
+    let area = dims[last] * dims[last - 1];
+    let mut expected = area;
+    for i in (0..last - 1).rev() {
+        if strides[i] != expected {
+            return None;
+        }
+        expected *= dims[i];
+    }
+    let batches: usize = dims[..last - 1].iter().product();
+    // src is `dims[last] x dims[last-1]` row-major; the output transposes it.
+    Some((batches, dims[last], dims[last - 1], layout.start_offset()))
+}
+
+/// One batch: `dst[r * rows + c] = src[c * cols + r]`, in cache blocks.
+///
+/// `rows` and `cols` name the **source** matrix, which is `rows x cols`
+/// row-major; the destination is `cols x rows`.
+#[inline]
+fn transpose_block<T: Copy>(src: &[T], dst: &mut [T], rows: usize, cols: usize) {
+    for c0 in (0..rows).step_by(TRANSPOSE_BLOCK) {
+        let c_end = (c0 + TRANSPOSE_BLOCK).min(rows);
+        for r0 in (0..cols).step_by(TRANSPOSE_BLOCK) {
+            let r_end = (r0 + TRANSPOSE_BLOCK).min(cols);
+            for c in c0..c_end {
+                let row = &src[c * cols..c * cols + cols];
+                for r in r0..r_end {
+                    dst[r * rows + c] = row[r];
+                }
+            }
+        }
+    }
+}
+
+/// The `CustomOp1` that carries `transpose_block` across candle's storage
+/// boundary, for every dtype `CpuStorage` has an owned `Vec` of.
+struct TransposedCopy;
+
+impl candle_core::CustomOp1 for TransposedCopy {
+    fn name(&self) -> &'static str {
+        "torch._C shim: transposed copy"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &CpuStorage,
+        layout: &Layout,
+    ) -> candle_core::Result<(CpuStorage, candle_core::Shape)> {
+        // Re-checked here and not only at the entry point: this is the
+        // function that indexes raw storage, so it is the one that must not
+        // trust a caller.
+        let Some((batches, rows, cols, offset)) = transposed_plan(layout) else {
+            return Err(candle_core::Error::Msg(
+                "torch._C shim: transposed copy on a layout that is not a \
+                 last-two-swapped view -- tensor.rs::transposed_contiguous is \
+                 supposed to have routed this to candle's own contiguous"
+                    .to_string(),
+            ));
+        };
+        let area = rows * cols;
+        macro_rules! run {
+            ($arm:ident, $values:expr) => {{
+                let src = $values;
+                if offset + batches * area > src.len() {
+                    return Err(candle_core::Error::Msg(
+                        "torch._C shim: transposed copy would read past the storage"
+                            .to_string(),
+                    ));
+                }
+                let mut out = vec![Default::default(); batches * area];
+                for b in 0..batches {
+                    transpose_block(
+                        &src[offset + b * area..offset + (b + 1) * area],
+                        &mut out[b * area..(b + 1) * area],
+                        rows,
+                        cols,
+                    );
+                }
+                CpuStorage::$arm(out)
+            }};
+        }
+        let out = match storage {
+            CpuStorage::U8(v) => run!(U8, v),
+            CpuStorage::U32(v) => run!(U32, v),
+            CpuStorage::I16(v) => run!(I16, v),
+            CpuStorage::I32(v) => run!(I32, v),
+            CpuStorage::I64(v) => run!(I64, v),
+            CpuStorage::BF16(v) => run!(BF16, v),
+            CpuStorage::F16(v) => run!(F16, v),
+            CpuStorage::F32(v) => run!(F32, v),
+            CpuStorage::F64(v) => run!(F64, v),
+            // candle's sub-byte float types, which this shim has no
+            // `TorchDType` for -- unreachable from any tensor it can build.
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "torch._C shim: transposed copy has no kernel for this candle dtype"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok((out, candle_core::Shape::from(layout.dims().to_vec())))
+    }
+}
+
+/// `t.contiguous()`, but blocked when `t` is a transposed view.
+///
+/// **Drop-in for `Tensor::contiguous`, and identical to it element for
+/// element.** The two fast exits are the safety property: an already-contiguous
+/// tensor goes to candle (which clones the handle, not the buffer), and any
+/// layout `transposed_plan` does not recognise goes to candle as well. So the
+/// worst case of a layout this does not understand is candle's own speed, never
+/// a wrong answer.
+pub(crate) fn transposed_contiguous(t: &Tensor) -> candle_core::Result<Tensor> {
+    if t.layout().is_contiguous() {
+        return t.contiguous();
+    }
+    match transposed_plan(t.layout()) {
+        Some(_) => t.apply_op1_no_bwd(&TransposedCopy),
+        None => t.contiguous(),
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod transpose_tests {
+    use super::*;
+
+    fn cpu() -> candle_core::Device {
+        candle_core::Device::Cpu
+    }
+
+    fn bits(t: &Tensor) -> Vec<u32> {
+        t.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    /// **The claim this kernel makes is bit-for-bit identity with the spelling
+    /// it replaces**, and it is checked against exactly that spelling --
+    /// candle's own `contiguous()` -- rather than against a recomputation.
+    ///
+    /// Sizes straddle the 32-element block in every direction on both axes, so
+    /// a remainder bug on either edge, a block that overruns and a transposed
+    /// index each have a shape that shows them. `(512, 64)` is the real
+    /// SDPA shape at `S=512`.
+    #[test]
+    fn a_blocked_transpose_is_bit_identical_to_candles_contiguous() {
+        for (b, h, s, d) in [
+            (1usize, 1usize, 1usize, 1usize),
+            (1, 1, 3, 5),
+            (1, 1, 32, 32),
+            (1, 1, 33, 31),
+            (1, 1, 31, 33),
+            (1, 1, 64, 96),
+            (2, 3, 7, 4),
+            (1, 9, 512, 64),
+            (2, 2, 129, 65),
+        ] {
+            let n = b * h * s * d;
+            let data: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let base = Tensor::from_vec(data, (b, h, s, d), &cpu()).unwrap();
+            let view = base.transpose(2, 3).unwrap();
+            assert!(!view.is_contiguous() || s == 1 || d == 1);
+            let want = view.contiguous().unwrap();
+            let got = transposed_contiguous(&view).unwrap();
+            assert_eq!(got.dims(), want.dims(), "shape at {b}x{h}x{s}x{d}");
+            assert_eq!(bits(&got), bits(&want), "values at {b}x{h}x{s}x{d}");
+        }
+    }
+
+    /// Rank 2 and rank 3, so the batch loop is exercised at zero and one
+    /// leading dimension as well as at two.
+    #[test]
+    fn every_rank_from_two_upwards_agrees_with_candle() {
+        for dims in [vec![5usize, 7], vec![4, 33, 31], vec![2, 3, 8, 9], vec![2, 2, 2, 5, 6]] {
+            let n: usize = dims.iter().product();
+            let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let base = Tensor::from_vec(data, dims.clone(), &cpu()).unwrap();
+            let last = dims.len() - 1;
+            let view = base.transpose(last - 1, last).unwrap();
+            assert_eq!(
+                bits(&transposed_contiguous(&view).unwrap()),
+                bits(&view.contiguous().unwrap()),
+                "rank {} dims {dims:?}",
+                dims.len()
+            );
+        }
+    }
+
+    /// Negative zero, the infinities and NaN survive the copy with their exact
+    /// bit patterns. A copy has no excuse to change any of them, and `==`
+    /// cannot see the first or the last -- so this compares `to_bits()`.
+    #[test]
+    fn the_special_values_survive_bit_for_bit() {
+        let data = vec![
+            -0.0f32,
+            0.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MIN_POSITIVE / 3.0, // subnormal
+            1.5,
+        ];
+        let base = Tensor::from_vec(data, (2, 4), &cpu()).unwrap();
+        let view = base.transpose(0, 1).unwrap();
+        assert_eq!(
+            bits(&transposed_contiguous(&view).unwrap()),
+            bits(&view.contiguous().unwrap())
+        );
+    }
+
+    /// A layout the recogniser does not understand must fall through to
+    /// candle rather than being read in storage order -- the failure mode that
+    /// would be silent, since it produces a tensor of the right shape.
+    #[test]
+    fn an_unrecognised_layout_falls_through_to_candle() {
+        let base = Tensor::from_vec(
+            (0..24).map(|i| i as f32).collect::<Vec<_>>(),
+            (2, 3, 4),
+            &cpu(),
+        )
+        .unwrap();
+        // Swapping the *first* two dimensions is not the pattern.
+        let view = base.transpose(0, 1).unwrap();
+        assert!(transposed_plan(view.layout()).is_none());
+        assert_eq!(
+            bits(&transposed_contiguous(&view).unwrap()),
+            bits(&view.contiguous().unwrap())
+        );
+        // A slice of a transposed view: the pair is right but the batches are
+        // no longer consecutive.
+        let sliced = base.transpose(1, 2).unwrap().narrow(0, 0, 1).unwrap();
+        let _ = transposed_plan(sliced.layout());
+        assert_eq!(
+            bits(&transposed_contiguous(&sliced).unwrap()),
+            bits(&sliced.contiguous().unwrap())
+        );
+        // An already-contiguous tensor is returned by candle's own path.
+        assert_eq!(
+            bits(&transposed_contiguous(&base).unwrap()),
+            bits(&base.contiguous().unwrap())
+        );
+    }
 }
 
 #[cfg(test)]

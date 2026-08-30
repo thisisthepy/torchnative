@@ -3325,6 +3325,27 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     setattr(tensorbase, "to", to)
     setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
 
+    # `Tensor.expand_as` -- `zoedepth`'s wall once 2-D convolution existed
+    # (docs/KERNELS26.md §7). A *name* gap, not a kernel gap: measured on
+    # upstream 2.13.0, `aten::expand_as` is `CompositeImplicitAutograd`
+    # (`_dispatch_has_kernel_for_dispatch_key` is True) and a
+    # `TorchDispatchMode` trace of `x.expand_as(y)` fires exactly one op --
+    # `aten.expand.default(x, y.shape)` -- which this shim already implements
+    # and already golden-compares. So this is `torch.conv2d`'s shape of fix
+    # (ARCH26.md §7), not a new computation path.
+    #
+    # It goes through `.expand` rather than calling `dispatch` directly so that
+    # it inherits `expand`'s own `-1` handling and rank rules, and so that it
+    # stays a **view**: `x.expand_as(y)` shares storage with `x` upstream
+    # (measured: `data_ptr()` equal), and `expand.default` is in this shim's
+    # aliasing table for the same reason.
+    def expand_as(self, other):
+        return self.expand(list(other.shape))
+
+    expand_as.__name__ = "expand_as"
+    expand_as.__qualname__ = "TensorBase.expand_as"
+    setattr(tensorbase, "expand_as", expand_as)
+
     # `Tensor.new_tensor` -- docs/ARCH26.md, `zoedepth`'s wall (through
     # `Dinov2`'s `_init_weights`, `transformers/initialization.py`'s
     # `trunc_normal_`, `torch/nn/init.py`'s `_no_grad_trunc_normal_`, which

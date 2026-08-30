@@ -368,6 +368,20 @@
   "rsqrt": [
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
+  "sqrt": [
+    "aten::sqrt(Tensor self) -> Tensor"
+  ],
+  "repeat": [
+    "aten::repeat(Tensor self, SymInt[] repeats) -> Tensor"
+  ],
+  "remainder": [
+    "aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__mod__": [
+    "aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
   "log": [
     "aten::log(Tensor self) -> Tensor"
   ],

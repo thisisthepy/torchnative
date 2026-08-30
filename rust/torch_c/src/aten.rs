@@ -142,6 +142,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.reciprocal.default",
     "aten.relu.default",
     "aten.relu_.default",
+    "aten.remainder.Scalar",
+    "aten.remainder.Tensor",
+    "aten.repeat.default",
     "aten.rsqrt.default",
     "aten.rsub.Scalar",
     "aten.scalar_tensor.default",
@@ -154,6 +157,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sort.default",
     "aten.split.Tensor",
     "aten.split_with_sizes.default",
+    "aten.sqrt.default",
     "aten.squeeze.dim",
     "aten.stack.default",
     "aten.sub.Tensor",
@@ -870,7 +874,8 @@ fn meta_dispatch(
         | "aten.exp.default"
         | "aten.log.default"
         | "aten.expm1.default"
-        | "aten.rsqrt.default" => {
+        | "aten.rsqrt.default"
+        | "aten.sqrt.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             meta_result(py, input.dims().to_vec(), unary_float_tag(input.tag()))
         }
@@ -1231,7 +1236,19 @@ fn aten_dispatch_inner(
         "aten.pow.Tensor_Tensor" => pow_tensor_tensor(py, args, kwargs),
         "aten.randint.default" => randint(py, args, kwargs, false),
         "aten.randint.low" => randint(py, args, kwargs, true),
+        "aten.remainder.Scalar" => {
+            remainder_op(py, args, kwargs, "aten.remainder.Scalar", true)
+        }
+        "aten.remainder.Tensor" => {
+            remainder_op(py, args, kwargs, "aten.remainder.Tensor", false)
+        }
+        "aten.repeat.default" => repeat_default(py, args, kwargs),
         "aten.rsqrt.default" => rsqrt_default(py, args, kwargs),
+        // `sqrt` sits with the `unary_float` family rather than beside
+        // `rsqrt`'s own kernel: it is one candle call, and sharing the family
+        // is what makes `float16` in / `float16` out true for both without
+        // restating the rule. docs/KERNELS26.md §1.
+        "aten.sqrt.default" => unary_float(py, args, kwargs, "aten.sqrt.default", Unary::Sqrt),
         "aten.rsub.Scalar" => rsub_scalar(py, args, kwargs),
 
         // -- what upstream's `repr(tensor)` dispatches (docs/E2E_REAL.md) ----
@@ -3106,7 +3123,23 @@ fn sdpa_flash_cpu(
             // at S=512, and **changes the answer at S=6**: the prefill digest
             // moved, measured. A different GEMM blocking is a different
             // summation order. docs/SEQLEN.md §8.5.
-            .and_then(|kt| kt.contiguous())
+            //
+            // What changed (docs/KERNELS26.md §7) is *how* the copy is made,
+            // not whether it is made. candle's `copy_strided_src` walks a
+            // transposed layout one element at a time, recomputing a
+            // multi-dimensional index per element and reading `head_dim`
+            // floats away from the previous one -- 2.4 MB at ~3.7 GB/s,
+            // against upstream's 0.134 ms for the same bytes.
+            // `transposed_contiguous` is the same copy in 32x32 cache blocks.
+            //
+            // **It is bit-identical by construction, not by tolerance**: every
+            // output element is a copy of exactly one input element, so there
+            // is no summation order to reassociate and no rounding to move.
+            // The only thing that changed is the order in which the same
+            // assignments happen. That is the whole difference between this
+            // and the rejected change above, and it is why the prefill digests
+            // hold at every length docs/SEQLEN.md §1.3 pins.
+            .and_then(|kt| crate::tensor::transposed_contiguous(&kt))
             .and_then(|kt| q.matmul(&kt))
             .map_err(|e| candle_err(OP, e))?;
 
@@ -4993,9 +5026,10 @@ enum Unary {
     Tanh,
     Exp,
     Log,
+    Sqrt,
 }
 
-/// `cos`, `sin`, `reciprocal`, `tanh`, `exp`, `log` -- torch's unary float promotion, the
+/// `cos`, `sin`, `reciprocal`, `tanh`, `exp`, `log`, `sqrt` -- torch's unary float promotion, the
 /// same rule `rsqrt` above already implements: a floating input keeps its own
 /// dtype (`float16` in, `float16` out, *not* widened), and an integral or
 /// boolean input becomes the default float.
@@ -5024,6 +5058,30 @@ enum Unary {
 /// to special-case the domain -- but it does have to be *checked*, because
 /// "raises on a negative input" is the plausible wrong guess and `mamba`'s
 /// `A = arange(1, state_size+1)` never leaves the positive half to reveal it.
+///
+/// **`sqrt` joined last, for `deberta`/`deberta_v2` (docs/KERNELS26.md §1).**
+/// The asymmetry -- `rsqrt` present since RMSNorm, `sqrt` absent -- stopped
+/// two architectures before any weight multiplied: `DebertaLayerNorm` computes
+/// `(h - mean) / torch.sqrt(var + eps)` by hand instead of calling
+/// `nn.LayerNorm`, and `deberta_v2`'s `scaled_size_sqrt` computes an attention
+/// temperature through `torch.sqrt` unconditionally, relative-position or not.
+///
+/// It is candle's own `Tensor::sqrt` rather than a `pow(x, 0.5)` composite,
+/// and the difference is measurable rather than stylistic. Three properties,
+/// measured against upstream 2.13.0, all of them IEEE's:
+///
+/// ```text
+/// sqrt(-0.0)  ->  -0.0     bit pattern 0x80000000 -- the sign of zero survives
+/// sqrt(-inf)  ->   NaN     not -inf
+/// sqrt(+inf)  ->  +inf
+/// ```
+///
+/// candle's `Tensor::pow` is `exp(exponent * log(base))` (see `pow_result_tag`
+/// below, which exists for exactly this reason) and answers NaN for `+inf`.
+/// `powf(0.5)` would get the values right but adds a second rounding on the
+/// reduced-float dtypes. The promotion was re-measured rather than inherited
+/// from `rsqrt`: `int64`/`int32`/`int16`/`uint8`/`bool` all give `float32`,
+/// and each float dtype keeps its own width.
 /// The dtype half of the `unary_float` family, on its own so the meta kernels
 /// can call it instead of restating it.
 ///
@@ -5060,6 +5118,7 @@ fn unary_float(
             Unary::Tanh => t.tanh(),
             Unary::Exp => t.exp(),
             Unary::Log => t.log(),
+            Unary::Sqrt => t.sqrt(),
         })
         .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
@@ -6959,6 +7018,317 @@ fn expand_target(op: &str, dims: &[usize], requested: &[isize]) -> PyResult<Vec<
     Ok(target)
 }
 
+/// `remainder`'s correction, on one float pair.
+///
+/// **`remainder` follows the sign of the divisor; `fmod` follows the sign of
+/// the dividend.** Rust's `%` on floats is `fmod`, so this is `fmod` plus
+/// upstream's own correction, transcribed rather than reinvented:
+///
+/// ```text
+/// mod = fmod(a, b);
+/// if (mod != 0) && ((b < 0) != (mod < 0)) { mod += b }
+/// ```
+///
+/// Three things fall out of that guard rather than being special-cased, and
+/// each was checked against upstream instead of reasoned about:
+///
+///   * **`remainder(-0.0, 3.0)` is `-0.0`.** `fmod(-0.0, 3.0)` is `-0.0`, and
+///     `-0.0 != 0.0` is *false*, so the correction does not fire and the
+///     negative zero survives. Python's own `-0.0 % 3.0` is `+0.0`, so
+///     "spell it as Python's `%`" is wrong here -- and wrong invisibly, since
+///     `-0.0 == 0.0`.
+///   * **NaN propagates.** `NaN != 0.0` is true, but `NaN < 0.0` is false, so
+///     for a positive divisor the guard's two sides agree and NaN is returned
+///     unchanged; for a negative one it fires and `NaN + b` is still NaN.
+///   * **infinite divisors.** `remainder(5.0, -inf)` is `-inf` and
+///     `remainder(-5.0, inf)` is `inf`, both measured, and both are just the
+///     correction firing on a finite `fmod`.
+fn remainder_f64(a: f64, b: f64) -> f64 {
+    let m = a % b;
+    if m != 0.0 && ((b < 0.0) != (m < 0.0)) {
+        m + b
+    } else {
+        m
+    }
+}
+
+/// The same correction on integers, with upstream's two divergences from C.
+///
+/// `wrapping_rem` rather than `%`: `i64::MIN % -1` **panics** in Rust (the
+/// quotient overflows) where upstream answers `0`, measured. A panic here
+/// crosses the FFI boundary as a `PanicException`, which is not a refusal.
+///
+/// A zero divisor raises rather than producing NaN -- that is the integral
+/// path's split from the float one, and upstream's message is the bare string
+/// `ZeroDivisionError` inside a `RuntimeError`.
+fn remainder_i64(a: i64, b: i64) -> PyResult<i64> {
+    if b == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("ZeroDivisionError"));
+    }
+    let r = a.wrapping_rem(b);
+    Ok(if r != 0 && ((r < 0) != (b < 0)) {
+        r.wrapping_add(b)
+    } else {
+        r
+    })
+}
+
+/// `aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor` and
+/// `aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor`.
+///
+/// `sam3_video`'s wall (docs/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
+/// computes `x_positions = (flattened_indices % end_x) * scale`, so
+/// `TensorBase.__mod__` and therefore `remainder.Scalar` -- during
+/// *construction*, which is why ARCH26.md's forward-only operator trace never
+/// saw it.
+///
+/// **Dtype.** The `Tensor` overload is `torch.promote_types` exactly; that was
+/// checked cell by cell over the eight storable numeric dtypes rather than
+/// assumed from `mul`, and there were no disagreements. The `Scalar` overload
+/// is the wrapped-number rule: an int scalar never widens a tensor of any
+/// category, a float scalar floats an integral one.
+///
+/// **Bool is refused on both.** For the `Tensor` overload that is *upstream's*
+/// refusal, reproduced with its own wording (`"remainder_cpu" not implemented
+/// for 'Bool'`). For the `Scalar` overload it is this shim's: upstream
+/// computes there (`remainder(bool_t, 2)` is `int64`, `remainder(bool_t, 2.0)`
+/// is `float32`, `remainder(bool_t, True)` raises) and this refuses, exactly
+/// as `arith_tag` already refuses `bool_tensor * 2` and for the same reason --
+/// the rule is a fast-path ladder keyed on the *Python type* of the scalar,
+/// and `scalar_arg` has already erased `True` into `Scalar::Int(1)` by the
+/// time this is reached. Two golden cases carry it as `expect="c_error"` so
+/// the gap is watched rather than filed away.
+///
+/// **The scalar is narrowed into the result dtype before the arithmetic**, not
+/// used as an `i64`, because that is what upstream does and it is observable:
+/// `remainder(uint8(200), -3)` is `200`, because `-3` becomes `253` in
+/// `uint8` and `200 % 253` is `200`. Building it as a 0-d tensor at `storage`
+/// reproduces the narrowing rather than restating it.
+///
+/// Computed elementwise in `f64`/`i64` rather than through candle, which has
+/// no `remainder`. `read_flat`/`write_flat` are the same route `expm1` and
+/// `pow` take, for the same reason: no kernel exists and the callers are not
+/// hot loops.
+fn remainder_op(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    scalar_form: bool,
+) -> PyResult<Py<PyAny>> {
+    let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+    let left = lhs.tensor()?;
+
+    let (tag, right_dims) = if scalar_form {
+        let other =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        if lhs.tag() == TorchDType::Bool {
+            return Err(not_implemented(format!(
+                "{op}: a torch.bool tensor with a numeric scalar promotes through a \
+                 fast-path ladder keyed on the scalar's Python type (int64 for an int, \
+                 float32 for a float, and upstream raises for a bool), which is not \
+                 implemented in torch._C shim"
+            )));
+        }
+        let mut tag = lhs.tag();
+        if !other.is_int() && !tag.is_floating_point() {
+            tag = default_float();
+        }
+        (tag, left.dims().to_vec())
+    } else {
+        let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+        if lhs.tag() == TorchDType::Bool || rhs.tag() == TorchDType::Bool {
+            // Upstream's own refusal, verbatim, with no shim prefix -- the
+            // convention `overflow()` follows, because a caller matching on
+            // the message should not have to know which side produced it.
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "\"remainder_cpu\" not implemented for 'Bool'",
+            ));
+        }
+        let tag = promote_operands(op, &lhs, &rhs)?;
+        (tag, rhs.tensor()?.dims().to_vec())
+    };
+
+    let storage = PyDtype::new(tag).storage(op)?;
+    let shape = if scalar_form {
+        left.dims().to_vec()
+    } else {
+        broadcast_shape(op, left.dims(), &right_dims)?
+    };
+
+    let a = left
+        .fast_to(storage)
+        .and_then(|t| t.broadcast_as(shape.clone()))
+        .map_err(|e| candle_err(op, e))?;
+    let b = if scalar_form {
+        let scalar =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        // Narrowed to `storage` first: see the doc comment's `uint8` case.
+        let filled = if storage.is_int() {
+            Tensor::full(scalar.as_i64(), (), left.device())
+        } else {
+            Tensor::full(scalar.as_f64(), (), left.device())
+        };
+        filled
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    } else {
+        tensor_arg(op, args, kwargs, 1, "other")?
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    };
+
+    let values = match (read_flat(op, &a, tag)?, read_flat(op, &b, tag)?) {
+        (Flat::Float(x), Flat::Float(y)) => {
+            Flat::Float(x.into_iter().zip(y).map(|(p, q)| remainder_f64(p, q)).collect())
+        }
+        (Flat::Int(x), Flat::Int(y)) => {
+            let mut out = Vec::with_capacity(x.len());
+            for (p, q) in x.into_iter().zip(y) {
+                out.push(remainder_i64(p, q)?);
+            }
+            Flat::Int(out)
+        }
+        // Unreachable: both sides are read at the same `tag`, so they are the
+        // same `Flat` arm by construction. An `unreachable!()` here would be a
+        // panic across the FFI boundary.
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: operands read at different categories -- internal error"
+            )))
+        }
+    };
+    let out = write_flat(op, values, shape, left.device(), tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::repeat(Tensor self, SymInt[] repeats) -> Tensor`
+///
+/// **Tiling, not broadcasting.** `expand` above produces a view whose strides
+/// are zero; `repeat` materialises a copy, and `[1,2,3].repeat(2, 3)` is
+/// `(2, 9)` -- the *last* repeat multiplies the existing dimension and the
+/// earlier ones are new leading dimensions. docs/ARCH26.md §8 found this op
+/// missing across four of the six architectures (`deberta`, `deberta_v2`,
+/// `sew_d`, `sam3_video`), and it is the wall both DeBERTas landed on the
+/// moment `sqrt` existed.
+///
+/// candle has a `Tensor::repeat` and it is **not** called here, for two
+/// measured reasons. Its whole loop is
+///
+/// ```ignore
+/// for (idx, &repeat) in repeats.iter().enumerate() {
+///     if repeat > 1 { inp = Tensor::cat(&vec![&inp; repeat], idx)? }
+/// }
+/// ```
+///
+/// so:
+///
+///   * **a repeat of `0` is skipped**, which makes it a no-op rather than an
+///     empty dimension. Upstream's `[1,2,3].repeat(0)` is `(0,)` and candle's
+///     would be `(3,)` -- a wrong *shape*, silently.
+///   * **`repeats.len() < rank` is not refused.** candle takes the
+///     `self.clone()` branch and then concatenates along axes that no longer
+///     line up. Upstream raises, and the raise is the correct answer.
+///
+/// A third difference is subtler and is the one the aliasing table catches:
+/// when every repeat is `1` candle returns `self.clone()`, and a candle clone
+/// is an `Arc` clone. `x.repeat(1, 1)` would then *share storage with `x`*,
+/// so `x.repeat(1,1).fill_(0)` would zero `x`. Upstream's `repeat` always
+/// materialises. That is the `_to_copy` defect docs/VIEWS.md §6 records,
+/// wearing a new hat: correct values, corrupted input, and every golden case
+/// green because they all read the result.
+///
+/// So the tiling is written out here: resolve the shape first (which is where
+/// both refusals live and where `0` is honoured), then build it with
+/// `Tensor::cat`, then guarantee a copy.
+///
+/// Both refusals carry upstream's wording, measured on 2.13.0:
+///
+/// ```text
+/// m.repeat([2])      Number of dimensions of repeat dims can not be smaller
+///                    than number of dimensions of tensor
+/// m.repeat([2, -1])  Trying to create tensor with negative dimension -2: [4, -2]
+/// ```
+///
+/// The second reports the *product* (`2 * -1` for a size-2 axis) and the whole
+/// computed output shape, not the offending repeat -- transcribed rather than
+/// paraphrased, since the number in the message is not the number the caller
+/// passed.
+fn repeat_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.repeat.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let repeats = shape_arg(OP, args, kwargs, 1, "repeats")?;
+    let source = input.tensor()?;
+    let dims = source.dims().to_vec();
+
+    if repeats.len() < dims.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Number of dimensions of repeat dims can not be smaller than number of \
+             dimensions of tensor",
+        ));
+    }
+
+    // The output shape, and both refusals with it. `offset` is how many
+    // leading dimensions the result gains; below it the repeat *is* the
+    // extent, at and above it the repeat multiplies the input's extent.
+    let offset = repeats.len() - dims.len();
+    let target: Vec<isize> = repeats
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| if i < offset { r } else { r * dims[i - offset] as isize })
+        .collect();
+    if let Some(&bad) = target.iter().find(|&&v| v < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Trying to create tensor with negative dimension {bad}: {target:?}"
+        )));
+    }
+
+    // Raise the rank first, so every subsequent axis index is the output's.
+    // `reshape` on a non-contiguous input copies, which is fine and is not
+    // what guarantees the copy below -- an already-rank-matched input skips
+    // this entirely.
+    let mut out = if offset > 0 {
+        let mut raised = vec![1usize; offset];
+        raised.extend_from_slice(&dims);
+        source.reshape(raised).map_err(|e| candle_err(OP, e))?
+    } else {
+        source.clone()
+    };
+
+    for (axis, &r) in repeats.iter().enumerate() {
+        let r = r as usize;
+        if r == 1 {
+            continue;
+        }
+        if r == 0 {
+            // `Tensor::cat` of nothing is an error, so an empty axis is built
+            // rather than concatenated. Everything after this point tiles an
+            // empty tensor, which stays empty -- but the *other* axes still
+            // have to come out the right size, so the loop is not short-cut.
+            let mut zeroed = out.dims().to_vec();
+            zeroed[axis] = 0;
+            out = Tensor::zeros(zeroed, out.dtype(), out.device())
+                .map_err(|e| candle_err(OP, e))?;
+            continue;
+        }
+        let copies = vec![&out; r];
+        out = Tensor::cat(&copies, axis).map_err(|e| candle_err(OP, e))?;
+    }
+
+    // Upstream's `repeat` always materialises. If nothing above concatenated
+    // -- every repeat was 1 -- `out` is still an `Arc` clone of the input's
+    // storage, and returning it would make `x.repeat(1,1).fill_(0)` zero `x`.
+    let out = out.copy().map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
 fn expand_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -7304,7 +7674,18 @@ fn contiguous_default(
     const OP: &str = "aten.contiguous.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     reject_memory_format(OP, args, kwargs, 1)?;
-    let out = input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?;
+    // `transposed_contiguous`, not `contiguous`: it is a drop-in that blocks
+    // the copy when the input is a last-two-swapped view and defers to candle
+    // for everything else, including the already-contiguous case (where candle
+    // clones the handle rather than the buffer, which is what makes
+    // `contiguous.default` an aliasing op in the table of docs/VIEWS.md §6 --
+    // that has to keep holding, and does, because the fast exit is the first
+    // thing it checks).
+    //
+    // Bit-identical by construction: every output element is a copy of one
+    // input element. docs/KERNELS26.md §7.
+    let out = crate::tensor::transposed_contiguous(input.tensor()?)
+        .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
 
@@ -9364,23 +9745,74 @@ fn convolution_default(
              (only meaningful for transposed convolution, which is also not implemented)"
         )));
     }
+    // 1-D (3-D input) and 2-D (4-D input). `spatial` is how many trailing
+    // dimensions are convolved, and it is what every argument below is
+    // length-checked against.
+    //
+    // **2-D was ARCH26.md §3.2's wall and it turned out to be the small piece,
+    // not the large one** (docs/KERNELS26.md §7): candle already carries
+    // `Tensor::conv2d` with the same `(padding, stride, dilation, groups)`
+    // signature `conv1d` has, so this is the same thin wrapper twice rather
+    // than a second kernel. What it is *not* is a general 2-D convolution --
+    // see the symmetry refusal below.
     let rank = input.tensor()?.rank();
-    if rank != 3 {
-        return Err(not_implemented(format!(
-            "{OP}: only 1-D convolution (3-D input, (batch, channels, length)) is \
-             implemented in torch._C shim, got {rank}-D"
-        )));
-    }
-    if stride.len() != 1 || padding.len() != 1 || dilation.len() != 1 {
-        return Err(not_implemented(format!(
-            "{OP}: only a single-element stride/padding/dilation (1-D convolution) is \
-             implemented in torch._C shim"
-        )));
-    }
-    if stride[0] <= 0 || padding[0] < 0 || dilation[0] <= 0 {
+    let spatial = match rank {
+        3 => 1usize,
+        4 => 2usize,
+        _ => {
+            return Err(not_implemented(format!(
+                "{OP}: only 1-D convolution (3-D input, (batch, channels, length)) and \
+                 2-D convolution (4-D input, (batch, channels, height, width)) are \
+                 implemented in torch._C shim, got {rank}-D"
+            )))
+        }
+    };
+    // **A single value broadcasts to every convolved axis**, which is torch's
+    // own `expand_param_if_needed`, measured: `convolution(4-D, ..., padding=[2],
+    // ...)` pads both axes by 2 and gives `(1, 3, 7, 7)`. Anything that is
+    // neither 1 nor `spatial` long raises, with upstream's wording -- a
+    // 2-element stride on a 3-D input is refused upstream too, so this is not
+    // a shim restriction.
+    let expand = |name: &str, v: Vec<isize>| -> PyResult<Vec<isize>> {
+        match v.len() {
+            1 => Ok(vec![v[0]; spatial]),
+            n if n == spatial => Ok(v),
+            _ => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "expected {name} to be a single integer value or a list of {spatial} \
+                 values to match the convolution dimensions, but got {name}={v:?}"
+            ))),
+        }
+    };
+    let stride = expand("stride", stride)?;
+    let padding = expand("padding", padding)?;
+    let dilation = expand("dilation", dilation)?;
+    if stride.iter().any(|&v| v <= 0)
+        || padding.iter().any(|&v| v < 0)
+        || dilation.iter().any(|&v| v <= 0)
+    {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{OP}: stride and dilation must be positive, padding must be non-negative"
         )));
+    }
+    // **candle's `conv2d` takes scalars, so it is symmetric only.** torch
+    // allows `(stride_h, stride_w)` to differ, and an asymmetric call reaching
+    // a symmetric kernel would silently convolve with the wrong geometry --
+    // the output shape would even be wrong, but only in one axis, which is the
+    // kind of thing a single square test case does not show. So it is refused
+    // by name, and the message says which axis pair disagreed.
+    //
+    // Nothing measured needs it: `Dinov2`'s patch embedding, which is what
+    // ARCH26.md §3.2 stopped on, is `nn.Conv2d(3, hidden, kernel_size=16,
+    // stride=16)` -- square kernel, square stride, no padding.
+    if spatial == 2 {
+        for (name, v) in [("stride", &stride), ("padding", &padding), ("dilation", &dilation)] {
+            if v[0] != v[1] {
+                return Err(not_implemented(format!(
+                    "{OP}: an asymmetric {name} {v:?} is not implemented in torch._C shim \
+                     -- candle's conv2d takes one value per argument, not one per axis"
+                )));
+            }
+        }
     }
     if groups <= 0 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -9399,15 +9831,24 @@ fn convolution_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let x = input.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
     let w = weight.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
-    let raw = x
-        .conv1d(
+    let raw = if spatial == 1 {
+        x.conv1d(
             &w,
             padding[0] as usize,
             stride[0] as usize,
             dilation[0] as usize,
             groups as usize,
         )
-        .map_err(|e| candle_err(OP, e))?;
+    } else {
+        x.conv2d(
+            &w,
+            padding[0] as usize,
+            stride[0] as usize,
+            dilation[0] as usize,
+            groups as usize,
+        )
+    }
+    .map_err(|e| candle_err(OP, e))?;
     let out = match bias {
         Some(b) => {
             if b.tag() != tag {
@@ -9416,10 +9857,14 @@ fn convolution_default(
                 )));
             }
             let c_out = raw.dim(1).map_err(|e| candle_err(OP, e))?;
+            // One trailing `1` per convolved axis, so the bias broadcasts
+            // along the channel dimension in either rank.
+            let mut b_shape = vec![1usize, c_out];
+            b_shape.extend(std::iter::repeat(1usize).take(spatial));
             let b_reshaped = b
                 .tensor()?
                 .fast_to(storage)
-                .and_then(|t| t.reshape((1, c_out, 1)))
+                .and_then(|t| t.reshape(b_shape))
                 .map_err(|e| candle_err(OP, e))?;
             raw.broadcast_add(&b_reshaped).map_err(|e| candle_err(OP, e))?
         }

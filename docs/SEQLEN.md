@@ -1363,7 +1363,9 @@ So the answer to "what would it take" is: **a second SDPA path with its own
 numerics contract, selected explicitly**, exactly as `flash::reference_enabled`
 already selects one. Not a change to this one.
 
-**The 2.60 ms/call that *is* kernel quality**, ordered, at `S=1024`:
+**The 2.60 ms/call that *is* kernel quality**, ordered, at `S=1024`
+(the second row was taken in docs/KERNELS26.md §7 and is now ~0.09 ms rather
+than 1.288, so the excess on it is ~+0.03 rather than +1.15):
 
 | item | ours | upstream's | excess |
 |---|---:|---:|---:|
@@ -1384,6 +1386,18 @@ already selects one. Not a change to this one.
   construction. It is the one clean kernel win left, and it is worth about
   1.15 ms of 13.64 — **8% of the SDPA gap, 7% of the model gap at `S=1024`**.
   Not taken here; sized, and left named.
+
+  > **TAKEN, in docs/KERNELS26.md §7.** `tensor.rs::transposed_contiguous` is
+  > the same copy in 32x32 cache blocks, wired into this call site and into
+  > `aten.contiguous.default`. Measured: the copy is **5.25x faster at
+  > `S=512`** (0.2123 → 0.0404 ms, 1.85 → 9.73 GB/s) and **4.84x at `S=1024`**
+  > (0.4232 → 0.0875 ms), which is 1.29x and 1.50x of upstream rather than
+  > 6.8x and 7.3x. Per SDPA call that is **−0.50 ms at `S=512` (−10.8%)** and
+  > **−1.01 ms at `S=1024` (−5.8%)** — the sizing above said 1.15 ms and was
+  > right. Model level: `S=512` **1.589x → 1.527x**, `S=1024` **2.089x →
+  > 2.019x**; `bf16` −2.9% and −2.7%. **All ten prefill digests unchanged**
+  > (`f32` and `bf16`, at every length §1.3 records), with a new-vs-new control
+  > reading 0.995–1.019 and a sabotage that moves every one of them.
 - The last row is the change this round made, and it is now **faster than
   upstream's three separate ops** for the same work.
 

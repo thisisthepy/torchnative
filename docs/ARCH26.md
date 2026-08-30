@@ -132,6 +132,14 @@ does not exist yet. **The real answer to "do the numbers drift" is: cannot be me
 `aten.sqrt.default` lands.** That is the finding to carry forward, not the standalone check above,
 which is corroborating evidence at best.
 
+> **MEASURED, in docs/KERNELS26.md §2.4.** `sqrt` and `repeat` landed and both
+> architectures forward. Same toy config, `torch.manual_seed(0)`, a 6-token
+> forward, upstream against the shim, with the full `state_dict` diffed as well
+> as the output: **all 37 (`deberta`) and 45 (`deberta_v2`) weight tensors are
+> bit-identical**, and the outputs agree to a maximum relative difference of
+> **1.61e-07** and **1.21e-07** — float32 epsilon is 1.19e-07. **There is no
+> TorchScript-versus-eager drift in either architecture.**
+
 ### 1.5 Summary
 
 | | deberta | deberta_v2 |
@@ -438,8 +446,14 @@ Not written — `aten.rs` is forbidden territory this round.
 | `TensorBase.__new__` / legacy `torch.Tensor(int)` | `sew_d` (§4) | hardcoded refusal in `tensor.rs::py_new`; the class that could grow a Python-level override (`torch.Tensor`) is in the vendored tree, also forbidden |
 | `aten.remainder.Scalar`, `aten.remainder.Tensor` | `sam3_video` (§5) | `TorchDispatchMode` trace of `x % 3` / `x % torch.tensor(3)` upstream; grepped absent from `aten.rs`/`overloads.json`/`methods.json` |
 | `aten._weight_norm_interface.default` | `vits`, `sew_d` (§6) | absent from `_aten_implemented()`; a second, independent weight-norm gap from `set_.source_Tensor` above — this one is needed at forward time, not registration time |
+| `aten.norm.ScalarOpt_dim` | `vits`, `sew_d` — **added by docs/KERNELS26.md §5.4** | **This table missed it, and §6's own blind spot is why.** `torch.norm_except_dim` is a *composite* (so no op name appears in the source) and it is called from `register_parametrization` at **construction** time, while the trace that produced the §6 table ran on a forward. So `weight_norm` costs **three** kernels here, not two — and `ParametrizationList.__init__` swallows the `NotImplementedError` with its own `except NotImplementedError: pass`, so the failure surfaces 200 frames away as a `TypeError` naming no kernel at all |
 | `aten.repeat.default` | `deberta`, `deberta_v2`, `sew_d`, `sam3_video` (§6) | absent from `_aten_implemented()`, recurs across four of the six |
 | `aten.zeros.default`, `aten.clamp_min.default`, `aten.flip.default`, `aten.leaky_relu.default`, `aten.ones_like.default`, `aten.randn_like.default`, `aten.sigmoid.default`, `aten.add.Scalar`, `aten.upsample_bilinear2d.default`, `aten.avg_pool2d.default`, `aten.erf.default`, `aten.masked_fill.Tensor`, `aten.native_group_norm.default`, `aten.sign.default`, `aten.all.default`, `aten.div.Tensor_mode`, `aten.log2.default` | one or more of the six (§6 table) | absent from `_aten_implemented()`, each confirmed by the operator-coverage trace in §6 rather than assumed |
+
+**Six of these were taken in docs/KERNELS26.md** — `sqrt`, `repeat`,
+`remainder.{Scalar,Tensor}`, `set_.source_Tensor`, the legacy `TensorBase(int)`
+constructor and `convolution.default`'s 2-D case — taking the sweep from 20/26
+to **22/26** (`deberta` and `deberta_v2` forward). The rest of this table stands.
 
 **None of these are attempted here, including the ones that look like a one-line composite
 (`aten.sqrt.default` over `pow(x, 0.5)` was considered and rejected in §1.2 — the same reasoning
@@ -484,10 +498,10 @@ TOTAL 20/20
 
 **26** (the 20 in ARCH20.md + `deberta`, `deberta_v2`, `vits`, `zoedepth`, `sew_d`, `sam3_video`).
 
-| | of 20 (ARCH20.md) | of 26 (this document) |
-|---|---|---|
-| operator coverage (zero missing, traced on upstream) | 20/20 | **20/26** |
-| actually forwards through the shim | 20/20 | **20/26** — none of the six new architectures forward yet |
+| | of 20 (ARCH20.md) | of 26 (this document) | after docs/KERNELS26.md |
+|---|---|---|---|
+| operator coverage (zero missing, traced on upstream) | 20/20 | **20/26** | 20/26 |
+| actually forwards through the shim | 20/20 | **20/26** — none of the six new architectures forward yet | **22/26** — `deberta` and `deberta_v2` forward |
 
 Both numbers move together here only because all six new architectures happen to fail both
 measures; §6 above is the reminder that they are not the same measurement and do not have to agree

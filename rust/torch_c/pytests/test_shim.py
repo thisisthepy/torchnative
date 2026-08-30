@@ -1043,6 +1043,14 @@ def test_which_ops_share_storage_with_their_input_and_which_do_not():
         "aten.masked_fill.Scalar": lambda x: d(
             "aten.masked_fill.Scalar", x,
             _C._tensor_from_flat([1, 0, 1, 0, 1, 0], [2, 3], dtype=_C.bool), 9.0),
+        # `repeat` materialises, always -- and the all-ones row is the one
+        # that matters. candle's `Tensor::repeat` skips every repeat that is
+        # not `> 1`, so `repeat([1, 1])` returns `self.clone()`, and a candle
+        # clone is an `Arc` clone. That is the `_to_copy` defect this table's
+        # docstring describes, in a new op: correct values, corrupted input.
+        "aten.repeat.default (tiling)": lambda x: d("aten.repeat.default", x, [2, 3]),
+        "aten.repeat.default (all ones)": lambda x: d("aten.repeat.default", x, [1, 1]),
+        "aten.repeat.default (rank raised)": lambda x: d("aten.repeat.default", x, [1, 1, 1]),
     }
 
     for name, build in sorted(shares.items()):
@@ -7330,7 +7338,24 @@ def test_core_ops_and_op_tags_agree():
     # `min.dim` is core while `max.dim` -- the same overload of the mirror op,
     # implemented by the same function -- is not. There is no rule to derive
     # that from; it is upstream's table and it has to be read.
-    assert r["tag_core_count"] == 84, r["tag_core_count"]
+    #
+    # 85 with docs/KERNELS26.md's `sqrt`, read off
+    # `torch.ops.aten.sqrt.default.tags` -- `['core', 'pointwise',
+    # 'pt2_compliant_tag']` -- and not inferred from `rsqrt`, which happens to
+    # carry the same three. This number moves once per core-tagged kernel that
+    # round adds; the kernels it adds that are NOT core upstream (checked, one
+    # at a time, on each op's own `.tags`) do not appear here.
+    #
+    # 86 with `repeat`, whose tags are `['core', 'pt2_compliant_tag']` -- core
+    # but *not* `pointwise`, which is the check that these are being read off
+    # each op rather than copied from the last one added.
+    #
+    # 88 with `remainder.Scalar` and `remainder.Tensor`, **both** of which are
+    # `['core', 'pointwise', 'pt2_compliant_tag']`. +2 rather than +1 because
+    # this counts overloads, not ops -- and two overloads of one op do not have
+    # to agree (`min.dim` is core while `max.dim` is not, above), so both were
+    # read rather than one inferred from the other.
+    assert r["tag_core_count"] == 88, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -8584,7 +8609,28 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # 221 with `_safe_softmax`, which is `overloads.json`-only: upstream has
     # `torch._safe_softmax` and no `Tensor._safe_softmax`, so it adds one
     # identity rather than two.
-    assert len(keys) == 221, len(keys)
+    #
+    # 223 with docs/KERNELS26.md's `sqrt`. **+2, not +3**, for the same reason
+    # `amax`/`tril`/`triu` were +3 rather than +6: `sqrt` went into both
+    # tables, and `overloads.json`'s `aten::sqrt|default` and
+    # `methods.json`'s are one identity. The second is `aten::sqrt|out`, which
+    # `overloads.json` carries with no kernel behind it so that
+    # `torch.sqrt(x, out=y)` refuses by the right name -- exactly as
+    # `rsqrt.out` already did.
+    #
+    # 224 with `repeat`. **+1**: it is `methods.json`-only, because upstream
+    # has no `torch.repeat` at all (`hasattr(torch, "repeat")` is False on
+    # 2.13.0 -- there is `Tensor.repeat` and the unrelated
+    # `torch.repeat_interleave`), and `aten::repeat` has no `.out` variant
+    # this shim carries.
+    #
+    # 228 with `remainder`. **+4**: `overloads.json` carries all four of
+    # `Scalar_out`, `Tensor_out`, `Tensor` and `Scalar` (the two `.out` forms
+    # with no kernel, so `torch.remainder(x, y, out=z)` refuses by the right
+    # name), and `methods.json`'s `remainder` and `__mod__` add none -- both
+    # name the same `Tensor`/`Scalar` pair, and `__mod__` is a second spelling
+    # exactly as `__iadd__` is of `add_`.
+    assert len(keys) == 228, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -11415,6 +11461,705 @@ def test_tril_and_triu_zero_by_selecting_not_by_multiplying():
                 assert str(e).startswith(name), str(e)
             else:
                 raise AssertionError(f"{op} accepted a rank-{len(shape)} input")
+
+
+# --- docs/KERNELS26.md: the kernels that stopped six architectures ----------
+#
+# Same split as the `_SPELL_ROAD_SCRIPT` section above, and for the same
+# reason: `tools/golden/compare.py` reaches a kernel by its *dispatch key*, so
+# it is structurally blind to a kernel that exists and has no `torch.<name>`
+# or `tensor.<name>` route into it. Every kernel this round adds gets both --
+# the raw key here (fast, in-process, against the bare artefact) and the two
+# Python spellings in `_KERNELS26_ROAD_SCRIPT` (a real `import torch` through
+# the vendored tree).
+#
+# Expected values are computed in plain Python (`math.sqrt`, `%`) rather than
+# by importing upstream torch, so this file still runs on an interpreter with
+# no torch installed, matching the module docstring.
+
+
+def test_sqrt_is_a_leaf_kernel_with_ieee_domain_and_sign():
+    """`aten.sqrt.default` -- the kernel that stopped `deberta` and
+    `deberta_v2` (docs/ARCH26.md §1), both of which reach `torch.sqrt` before
+    any weight multiplies.
+
+    Three things are asserted that a `pow(x, 0.5)` composite would get wrong,
+    and they are the reason this is a kernel rather than a `bootstrap.py`
+    one-liner:
+
+      * `sqrt(-0.0)` is `-0.0`. IEEE-754 keeps the sign of zero. Checked on
+        the sign bit via `math.copysign`, because `-0.0 == 0.0` is true and no
+        value comparison can see it.
+      * `sqrt(-inf)` is NaN, and `sqrt(+inf)` is `+inf`. candle's own
+        `Tensor::pow` is `exp(e * log(b))`, which answers NaN for the second
+        of those.
+      * the dtype rule is `unary_float`'s -- a float keeps its own width
+        (`float16` in, `float16` out, not widened) and anything else becomes
+        the default float.
+    """
+    d = _C._aten_dispatch
+
+    got = d("aten.sqrt.default", _t([1.0, 4.0, 9.0, 16.0], [2, 2])).tolist()
+    assert got == [[1.0, 2.0], [3.0, 4.0]], got
+    got = d("aten.sqrt.default", _t([2.0, 3.0], [2])).tolist()
+    for g, src in zip(got, (2.0, 3.0)):
+        assert abs(g - math.sqrt(src)) < 1e-6, (got, src)
+
+    # The domain, all four corners.
+    domain = d(
+        "aten.sqrt.default",
+        _t([-1.0, float("inf"), float("-inf"), float("nan")], [4]),
+    ).tolist()
+    assert math.isnan(domain[0]), domain
+    assert domain[1] == float("inf"), domain
+    assert math.isnan(domain[2]), domain  # -inf -> NaN, NOT -inf
+    assert math.isnan(domain[3]), domain
+
+    # The signed zero, on its sign bit.
+    for src, want_negative in ((-0.0, True), (0.0, False)):
+        z = d("aten.sqrt.default", _t([src], [1])).tolist()[0]
+        assert z == 0.0, (src, z)
+        assert (math.copysign(1.0, z) < 0) is want_negative, (src, z)
+
+    # The dtype rule, both halves.
+    for dtype in (_C.float32, _C.float64, _C.float16, _C.bfloat16):
+        out = d("aten.sqrt.default", _t([4.0], [1], dtype))
+        assert out.dtype == dtype, (dtype, out.dtype)
+    for dtype in (_C.int64, _C.int32, _C.int16, _C.uint8, _C.bool):
+        out = d("aten.sqrt.default", _t([1], [1], dtype))
+        assert out.dtype == _C.float32, (dtype, out.dtype)
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert d("aten.sqrt.default", _t([4], [1], _C.int64)).dtype == _C.float64
+        assert d("aten.sqrt.default", _t([4.0], [1], _C.float32)).dtype == _C.float32
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+    # 0-d and empty both answer rather than refusing.
+    assert d("aten.sqrt.default", _t([9.0], [])).item() == 3.0
+    assert list(d("aten.sqrt.default", _t([], [0])).shape) == [0]
+
+    # meta agrees with the dense kernel about shape and dtype.
+    meta = _C.device("meta")
+    for dtype, want in ((_C.float16, _C.float16), (_C.int64, _C.float32)):
+        out = d(
+            "aten.sqrt.default",
+            d("aten.empty.memory_format", [2, 3], dtype, device=meta),
+        )
+        assert out.is_meta is True, dtype
+        assert tuple(out.shape) == (2, 3), (dtype, tuple(out.shape))
+        assert out.dtype == want, (dtype, out.dtype)
+
+
+def test_sqrt_is_reachable_by_name_not_only_by_dispatch_key():
+    """The half of the surface `tools/golden/compare.py` cannot see.
+
+    `deberta`'s wall was `torch.sqrt(...)` -- the *spelling* -- and a kernel
+    with no `overloads.json` entry would leave that wall exactly where it was
+    while every golden case passed. Both tables are asserted here; the
+    end-to-end route through a real `import torch` is in
+    `test_kernels26_road_through_the_vendored_tree`.
+    """
+    assert _C._shim_overloads["sqrt"] == [
+        "aten.sqrt.out",
+        "aten.sqrt.default",
+    ], _C._shim_overloads.get("sqrt")
+    assert _C._shim_methods["sqrt"] == ["aten.sqrt.default"], _C._shim_methods.get("sqrt")
+    # `repeat` is a member and NOT a free function: measured on upstream
+    # 2.13.0, `hasattr(torch, "repeat")` is False -- there is only
+    # `Tensor.repeat` and the unrelated `torch.repeat_interleave`. Adding a
+    # `torch.repeat` here would invent a name upstream does not have, so the
+    # absence is asserted rather than left to chance.
+    assert _C._shim_methods["repeat"] == ["aten.repeat.default"], _C._shim_methods.get("repeat")
+    assert "repeat" not in _C._shim_overloads, "upstream has no torch.repeat"
+    # `remainder` is both a free function and a member, and `__mod__` is a
+    # third spelling of the same two keys. The order matters: the resolver
+    # picks `.Tensor` when handed a tensor and `.Scalar` otherwise, so a table
+    # that listed only one of them would silently answer the wrong overload
+    # for half the calls `x % y` can make.
+    for name in ("remainder", "__mod__"):
+        assert _C._shim_methods[name] == [
+            "aten.remainder.Tensor",
+            "aten.remainder.Scalar",
+        ], (name, _C._shim_methods.get(name))
+    assert _C._shim_overloads["remainder"] == [
+        "aten.remainder.Scalar_out",
+        "aten.remainder.Tensor_out",
+        "aten.remainder.Tensor",
+        "aten.remainder.Scalar",
+    ], _C._shim_overloads.get("remainder")
+    # `__rmod__` is deliberately absent: `3 % x` is `aten.remainder.Scalar_Tensor`,
+    # a distinct overload with its own promotion rule, and it is not implemented
+    # here. Asserted so that adding `__rmod__` without the kernel -- which would
+    # make `3 % x` refuse by a name that resolves to nothing -- fails here.
+    assert "__rmod__" not in _C._shim_methods
+    # `.out` is in the table with no kernel behind it, exactly as `rsqrt.out`
+    # is, so that `torch.sqrt(x, out=y)` refuses *by the right name* instead of
+    # falling through to "no table entry for this op".
+    try:
+        _C._aten_dispatch("aten.sqrt.out", _t([1.0], [1]), out=_t([0.0], [1]))
+    except NotImplementedError as e:
+        assert "aten.sqrt.out" in str(e), str(e)
+    else:
+        raise AssertionError("aten.sqrt.out has no kernel and must say so")
+
+
+def test_repeat_tiles_rather_than_broadcasts():
+    """`aten.repeat.default` -- the kernel `sqrt` uncovered, and the one
+    docs/ARCH26.md §8 found recurring across four of the six architectures.
+
+    `repeat` is tiling and `expand` is broadcasting; the assertions here are
+    the places the two are confusable, plus the two places candle's own
+    `Tensor::repeat` disagrees with upstream:
+
+      * a repeat of **0** must produce an empty dimension. candle's loop is
+        `if repeat > 1 { cat }`, so it treats 0 as 1 and returns the input.
+      * `len(repeats) < rank` must **refuse**. candle silently uses the
+        tensor as-is and then concatenates along the wrong axes.
+    """
+    d = _C._aten_dispatch
+
+    # 1-D, same rank.
+    assert d("aten.repeat.default", _t([1.0, 2.0, 3.0], [3]), [2]).tolist() == [
+        1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+    # 1-D raised to 2-D: the LAST repeat multiplies the existing dimension.
+    out = d("aten.repeat.default", _t([1.0, 2.0, 3.0], [3]), [2, 3])
+    assert list(out.shape) == [2, 9], list(out.shape)
+    assert out.tolist() == [[1.0, 2.0, 3.0] * 3] * 2, out.tolist()
+    # 2-D, same rank -- rows tile down, columns tile across.
+    out = d("aten.repeat.default", _t([1.0, 2.0, 3.0, 4.0], [2, 2]), [2, 3])
+    assert out.tolist() == [
+        [1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
+        [3.0, 4.0, 3.0, 4.0, 3.0, 4.0],
+    ] * 2, out.tolist()
+    # 0-D.
+    assert d("aten.repeat.default", _t([5.0], []), [3]).tolist() == [5.0, 5.0, 5.0]
+    assert list(d("aten.repeat.default", _t([5.0], []), []).shape) == []
+
+    # A repeat of zero is an empty dimension, not a no-op.
+    assert list(d("aten.repeat.default", _t([1.0, 2.0, 3.0], [3]), [0]).shape) == [0]
+    assert list(d("aten.repeat.default", _t([1.0, 2.0, 3.0, 4.0], [2, 2]), [0, 2]).shape) == [0, 4]
+    assert list(d("aten.repeat.default", _t([1.0, 2.0, 3.0, 4.0], [2, 2]), [2, 0]).shape) == [4, 0]
+
+    # dtype passes through untouched, `bool` included -- `repeat` is data
+    # movement and does not promote.
+    for dtype in (_C.float32, _C.float64, _C.float16, _C.bfloat16,
+                  _C.int64, _C.int32, _C.int16, _C.uint8, _C.bool):
+        out = d("aten.repeat.default", _t([1, 0], [2], dtype), [2])
+        assert out.dtype == dtype, (dtype, out.dtype)
+        assert list(out.shape) == [4], (dtype, list(out.shape))
+
+    # A non-contiguous input is tiled by its logical order, not its storage.
+    strided = d("aten.t.default", d("aten.view.default", _t(
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [6]), [2, 3]))
+    assert strided.tolist() == [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]
+    assert d("aten.repeat.default", strided, [2, 1]).tolist() == [
+        [0.0, 3.0], [1.0, 4.0], [2.0, 5.0], [0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]
+
+    # Upstream's two refusals, with upstream's own wording.
+    try:
+        d("aten.repeat.default", _t([1.0, 2.0, 3.0, 4.0], [2, 2]), [2])
+    except RuntimeError as e:
+        assert "can not be smaller than number of dimensions" in str(e), str(e)
+    else:
+        raise AssertionError("fewer repeats than dimensions must refuse")
+    for repeats, want in (([-1, 2], "-2"), ([2, -1], "-2")):
+        try:
+            d("aten.repeat.default", _t([1.0, 2.0, 3.0, 4.0], [2, 2]), repeats)
+        except RuntimeError as e:
+            assert "negative dimension" in str(e), str(e)
+            assert want in str(e), (repeats, str(e))
+        else:
+            raise AssertionError(f"repeat({repeats}) must refuse")
+
+
+def test_remainder_follows_the_sign_of_the_divisor_not_the_dividend():
+    """`aten.remainder.{Scalar,Tensor}` -- `sam3_video`'s wall
+    (docs/ARCH26.md §5), reached through `TensorBase.__mod__` inside a ViT
+    rotary embedding's `__init__`.
+
+    **This is the op where `fmod` is the wrong answer.** `remainder` takes the
+    sign of the *divisor*; `fmod` (and C's `%`, and Rust's) takes the sign of
+    the *dividend*. The two agree in exactly half the sign quadrants, so a
+    case set with positive operands -- or with only one sign varying -- cannot
+    tell them apart. Both halves are asserted: where the conventions must
+    differ, and where they must agree.
+
+    Three corners beyond the sign rule, each measured on upstream 2.13.0:
+
+      * `remainder(-0.0, 3.0)` is `-0.0`, not `+0.0`. Python's own
+        `-0.0 % 3.0` **is** `+0.0`, so this is a case where "spell it the way
+        Python spells it" is wrong, and `-0.0 == 0.0` hides it.
+      * a float divisor of `0.0` gives NaN; an **integral** one raises
+        `RuntimeError('ZeroDivisionError')`. Same op, different category,
+        different kind of answer.
+      * `remainder(int64_min, -1)` is `0`. Rust's `%` panics on that pair.
+    """
+    d = _C._aten_dispatch
+
+    # The four sign quadrants, written out rather than derived, so a shared
+    # helper cannot make both sides wrong in the same way.
+    quadrants = {
+        (7, 3): 1, (7, -3): -2, (-7, 3): 2, (-7, -3): -1,
+        (5, 2): 1, (5, -2): -1, (-5, 2): 1, (-5, -2): -1,
+        (6, 3): 0, (6, -3): 0, (-6, 3): 0, (-6, -3): 0,
+    }
+    for (a, b), want in quadrants.items():
+        got = d("aten.remainder.Scalar", _t([float(a)], [1]), float(b)).tolist()[0]
+        assert got == float(want), (a, b, got, want)
+        got_i = d("aten.remainder.Scalar", _t([a], [1], _C.int64), b).tolist()[0]
+        assert got_i == want, (a, b, got_i, want)
+        got_t = d(
+            "aten.remainder.Tensor", _t([float(a)], [1]), _t([float(b)], [1])
+        ).tolist()[0]
+        assert got_t == float(want), (a, b, got_t, want)
+
+    # Opposite signs: `remainder` and `fmod` MUST disagree. `fmod` is computed
+    # here by `math.fmod`, not taken from the shim.
+    for a, b in ((7, -3), (-7, 3), (5, -2), (-5, 2)):
+        rem = d("aten.remainder.Scalar", _t([float(a)], [1]), float(b)).tolist()[0]
+        assert rem != math.fmod(a, b), (
+            f"remainder({a}, {b}) == fmod({a}, {b}) == {rem} -- the kernel is "
+            "following the sign of the dividend"
+        )
+        assert (rem < 0) == (b < 0), (a, b, rem)
+    # Same signs: they MUST agree. The other half of the same claim.
+    for a, b in ((7, 3), (-7, -3), (5, 2), (-5, -2)):
+        rem = d("aten.remainder.Scalar", _t([float(a)], [1]), float(b)).tolist()[0]
+        assert rem == math.fmod(a, b), (a, b, rem, math.fmod(a, b))
+
+    # The signed zero, on its sign bit.
+    z = d("aten.remainder.Scalar", _t([-0.0], [1]), 3.0).tolist()[0]
+    assert z == 0.0 and math.copysign(1.0, z) < 0, (
+        f"remainder(-0.0, 3.0) must be -0.0, got {z!r} with sign "
+        f"{math.copysign(1.0, z)} -- Python's own -0.0 % 3.0 is +0.0"
+    )
+    z = d("aten.remainder.Scalar", _t([0.0], [1]), 3.0).tolist()[0]
+    assert z == 0.0 and math.copysign(1.0, z) > 0, z
+
+    # Non-finite operands, both sides.
+    inf, nan = float("inf"), float("nan")
+    assert math.isnan(d("aten.remainder.Scalar", _t([inf], [1]), 3.0).tolist()[0])
+    assert math.isnan(d("aten.remainder.Scalar", _t([nan], [1]), 3.0).tolist()[0])
+    assert d("aten.remainder.Scalar", _t([5.0], [1]), inf).tolist()[0] == 5.0
+    assert d("aten.remainder.Scalar", _t([5.0], [1]), -inf).tolist()[0] == -inf
+    assert d("aten.remainder.Scalar", _t([-5.0], [1]), inf).tolist()[0] == inf
+
+    # Division by zero: NaN for floats, a raise for integers.
+    assert math.isnan(d("aten.remainder.Scalar", _t([5.0], [1]), 0.0).tolist()[0])
+    try:
+        d("aten.remainder.Scalar", _t([5], [1], _C.int64), 0)
+    except RuntimeError as e:
+        assert "ZeroDivisionError" in str(e), str(e)
+    else:
+        raise AssertionError("integral remainder by zero must raise")
+
+    # The overflow pair Rust's `%` panics on.
+    assert d("aten.remainder.Scalar", _t([-(2 ** 63)], [1], _C.int64), -1).tolist()[0] == 0
+
+    # A scalar is narrowed INTO the tensor's dtype before the arithmetic:
+    # `uint8(200) % -3` is `200`, because -3 becomes 253 and 200 % 253 is 200.
+    assert d("aten.remainder.Scalar", _t([200], [1], _C.uint8), -3).tolist()[0] == 200
+
+    # dtype: the wrapped-number rule on `Scalar`, `promote_types` on `Tensor`.
+    assert d("aten.remainder.Scalar", _t([5], [1], _C.int64), 3).dtype == _C.int64
+    assert d("aten.remainder.Scalar", _t([5], [1], _C.int64), 3.0).dtype == _C.float32
+    assert d("aten.remainder.Scalar", _t([5.0], [1], _C.float16), 3).dtype == _C.float16
+    assert d(
+        "aten.remainder.Tensor", _t([5], [1], _C.int32), _t([3.0], [1], _C.float32)
+    ).dtype == _C.float32
+
+    # Broadcasting -- the sign correction has to run after it, not before.
+    got = d("aten.remainder.Tensor", _t([7.0, 8.0], [2, 1]), _t([3.0, -3.0], [2])).tolist()
+    assert got == [[1.0, -2.0], [2.0, -1.0]], got
+
+    # Bool: upstream's own refusal on `Tensor`, this shim's on `Scalar`.
+    bt = _t([1, 0], [2], _C.bool)
+    try:
+        d("aten.remainder.Tensor", bt, bt)
+    except NotImplementedError as e:
+        assert "remainder_cpu" in str(e) and "Bool" in str(e), str(e)
+    else:
+        raise AssertionError("remainder of two bool tensors must refuse, as upstream does")
+    try:
+        d("aten.remainder.Scalar", bt, 2)
+    except NotImplementedError as e:
+        assert "fast-path ladder" in str(e), str(e)
+    else:
+        raise AssertionError("the bool-with-scalar gap must refuse, not invent a dtype")
+
+
+def test_the_legacy_tensor_size_constructor_allocates_and_the_data_form_refuses():
+    """`torch.Tensor(n)` -- `sew_d`'s wall (docs/ARCH26.md §4).
+
+    Three forms wear the same name upstream and this asserts all three,
+    because the whole risk in implementing one of them is answering a
+    *different* one by accident:
+
+        TensorBase(existing)   re-wrap, sharing the candle tensor
+        TensorBase(2, 3)       uninitialised storage of that shape
+        TensorBase([3, 4])     build from data -- a (2,) tensor, NOT a (3, 4)
+                               empty one. Still refused; asserted refused.
+
+    The third is the trap: `[3, 4]` looks like a size list and is not one.
+    A constructor that accepted it as a shape would silently produce a
+    `(3, 4)` tensor of zeros where upstream produces `tensor([3., 4.])`.
+    """
+    # The re-wrap form still shares, which is what `_make_subclass` depends on.
+    base = _t([1.0, 2.0, 3.0], [3])
+    rewrapped = _C.TensorBase(base)
+    _C._aten_dispatch("aten.fill_.Scalar", rewrapped, 9.0)
+    assert base.tolist() == [9.0, 9.0, 9.0], (
+        "TensorBase(existing) must re-wrap, not copy -- `_make_subclass` relies on it"
+    )
+
+    # The size form, one dimension and several.
+    assert list(_C.TensorBase(3).shape) == [3]
+    assert list(_C.TensorBase(3, 4).shape) == [3, 4]
+    assert list(_C.TensorBase(2, 3, 4).shape) == [2, 3, 4]
+    # Zero arguments is `(0,)`, not `()` -- measured on upstream.
+    assert list(_C.TensorBase().shape) == [0]
+    assert list(_C.TensorBase(0).shape) == [0]
+
+    # dtype is the default float, read at call time so it moves with the
+    # setter exactly as upstream's does.
+    assert _C.TensorBase(3).dtype == _C.float32
+    try:
+        _C._set_default_dtype(_C.float64)
+        assert _C.TensorBase(3).dtype == _C.float64
+    finally:
+        _C._set_default_dtype(_C.float32)
+
+    # A negative size refuses with upstream's wording.
+    try:
+        _C.TensorBase(-1)
+    except RuntimeError as e:
+        assert "negative dimension" in str(e), str(e)
+    else:
+        raise AssertionError("TensorBase(-1) must refuse")
+
+    # The data form is a DIFFERENT function and must not be answered as a
+    # shape. Refusing is the documented decision; answering `(3, 4)` would be
+    # the silent wrong answer.
+    try:
+        _C.TensorBase([3, 4])
+    except NotImplementedError as e:
+        assert "third form" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "TensorBase([3, 4]) is torch's build-from-data form (a (2,) tensor of "
+            "3.0 and 4.0), not a size list -- answering it as a shape would be worse "
+            "than refusing"
+        )
+
+    # `sew_d`'s line verbatim, which is the reason this exists at all.
+    spec_embed = _C.TensorBase(32)
+    _C._aten_dispatch("aten.uniform_.default", spec_embed, 0.0, 1.0)
+    assert list(spec_embed.shape) == [32]
+    assert all(0.0 <= v < 1.0 for v in spec_embed.tolist()), spec_embed.tolist()
+
+
+def test_set_from_a_tensor_aliases_where_set_from_a_storage_copies():
+    """`aten.set_.source_Tensor` -- the wall `vits` AND `sew_d` both stopped
+    on (docs/ARCH26.md §2), reached through
+    `torch.nn.utils.parametrizations.weight_norm`.
+
+    **The two forms of `set_` in this shim have opposite aliasing behaviour,
+    and that is not an inconsistency.** The storage form copies, because
+    candle owns its memory and a `Storage` is bytes held separately (see
+    `set_`'s own doc comment, and docs/CKPT.md §4). The tensor form aliases,
+    because `Repr::Dense` *is* a candle tensor and a candle clone is an `Arc`
+    clone of the same storage -- so it gets upstream's semantics for free.
+    Both directions are asserted here, next to each other, because "one of
+    these copies and the other does not" is the kind of claim that rots.
+    """
+    d = _C._aten_dispatch
+
+    # a.set_(b): a adopts b's shape, and the two share storage afterwards.
+    a = _t([0.0, 0.0, 0.0], [3])
+    b = _t([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [2, 3])
+    returned = a.set_(b)
+    assert returned is a, "set_ is in place and returns the receiver"
+    assert list(a.shape) == [2, 3], list(a.shape)
+    assert a.tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+    # The aliasing half: a write into the source is visible through the target.
+    d("aten.fill_.Scalar", b, 9.0)
+    assert a.tolist() == [[9.0, 9.0, 9.0], [9.0, 9.0, 9.0]], (
+        "set_(tensor) must alias, as upstream's does -- got a copy"
+    )
+
+    # A non-contiguous source keeps its layout rather than being flattened.
+    strided = d("aten.t.default", d("aten.view.default", _t(
+        [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [6]), [2, 3]))
+    target = _t([0.0], [1])
+    target.set_(strided)
+    assert list(target.shape) == [3, 2], list(target.shape)
+    assert target.tolist() == [[0.0, 3.0], [1.0, 4.0], [2.0, 5.0]]
+
+    # set_() with no arguments empties in place, keeping the dtype.
+    e = _t([1.0, 2.0, 3.0, 4.0], [4], _C.float64)
+    e.set_()
+    assert list(e.shape) == [0], list(e.shape)
+    assert e.dtype == _C.float64, e.dtype
+
+    # A dtype mismatch refuses, with upstream's own C++ type names -- which
+    # are a FOURTH spelling of the dtype set (`long long`, not `int64_t` and
+    # not `Long`), so this asserts the exact string rather than a substring.
+    try:
+        _t([0.0, 0.0], [2], _C.float32).set_(_t([1, 2, 3], [3], _C.int64))
+    except RuntimeError as err:
+        assert str(err) == (
+            "Could not set tensor of type long long to a tensor of type float"
+        ), str(err)
+    else:
+        raise AssertionError("set_ must refuse a dtype mismatch, as upstream does")
+
+    # The four-argument tensor form is a distinct overload
+    # (`source_Tensor_storage_offset`) and refuses by that name rather than
+    # silently ignoring the extra arguments.
+    try:
+        _t([0.0], [1]).set_(_t([1.0, 2.0], [2]), 0, [2], [1])
+    except NotImplementedError as err:
+        assert "source_Tensor_storage_offset" in str(err), str(err)
+    else:
+        raise AssertionError("the storage-offset tensor overload must refuse by name")
+
+    # The storage form is unchanged and still copies -- exercised through the
+    # vendored tree by `test_checkpoint_road_...`, whose `unfilled_refused`
+    # probe reaches this same method with an `UntypedStorage`. What is checked
+    # here is only that the tensor arm did not swallow it: a storage argument
+    # must still reach the storage path and refuse for the storage path's
+    # reason, not be mistaken for a tensor.
+    try:
+        _t([], [0]).set_(object(), 0, [4], [1])
+    except NotImplementedError as err:
+        assert "UntypedStorage or a tensor" in str(err), str(err)
+    else:
+        raise AssertionError("a non-tensor, non-storage source must refuse")
+
+
+# The end-to-end half: a real `import torch` through the vendored tree, calling
+# each new name the way a model does. Grows one block per kernel this round.
+
+_KERNELS26_ROAD_SCRIPT = r"""
+import json, math, sys
+import torch
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+# --- sqrt: free function, member, and the two DeBERTa expressions ----------
+sq = torch.tensor([1.0, 4.0, 9.0, 16.0])
+rec("sqrt_fn", lambda: torch.sqrt(sq).tolist())
+rec("sqrt_member", lambda: sq.sqrt().tolist())
+rec("sqrt_neg_is_nan", lambda: math.isnan(torch.sqrt(torch.tensor([-1.0])).item()))
+rec("sqrt_neg_zero_sign",
+    lambda: math.copysign(1.0, torch.sqrt(torch.tensor([-0.0])).item()))
+rec("sqrt_int_dtype", lambda: str(torch.sqrt(torch.tensor([4], dtype=torch.int64)).dtype))
+rec("sqrt_matches_raw",
+    lambda: torch.sqrt(sq).tolist()
+    == torch._C._aten_dispatch("aten.sqrt.default", sq).tolist())
+
+# `deberta_v2`'s `scaled_size_sqrt` verbatim: the attention temperature, a
+# 0-d tensor built from a Python int and a scale factor.
+rec("deberta_scaled_size_sqrt",
+    lambda: torch.sqrt(torch.tensor(64, dtype=torch.float) * 3).item())
+# `DebertaLayerNorm.forward` verbatim, on a toy row.
+def _deberta_layer_norm():
+    h = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    mean = h.mean(-1, keepdim=True)
+    variance = (h - mean).pow(2).mean(-1, keepdim=True)
+    return ((h - mean) / torch.sqrt(variance + 1e-7)).tolist()
+rec("deberta_layer_norm", _deberta_layer_norm)
+
+# --- repeat: member only (upstream has no `torch.repeat`), varargs and list --
+rp = torch.tensor([1.0, 2.0, 3.0])
+rec("repeat_member_varargs", lambda: rp.repeat(2, 3).tolist())
+rec("repeat_member_list", lambda: rp.repeat([2, 3]).tolist())
+rec("repeat_member_single", lambda: rp.repeat(2).tolist())
+rec("repeat_zero_shape", lambda: list(rp.repeat(0).shape))
+rec("repeat_no_free_function", lambda: hasattr(torch, "repeat"))
+rec("repeat_matches_raw",
+    lambda: rp.repeat(2, 3).tolist()
+    == torch._C._aten_dispatch("aten.repeat.default", rp, [2, 3]).tolist())
+# `repeat` must copy: writing into the result must not reach the source.
+def _repeat_is_a_copy():
+    src = torch.tensor([1.0, 2.0])
+    r = src.repeat(1)
+    r.fill_(0.0)
+    return src.tolist()
+rec("repeat_is_a_copy", _repeat_is_a_copy)
+# `build_relative_position`'s shape, the reason `deberta` needs this at all:
+# a (1, q, k) relative-position grid tiled to the batch.
+rec("deberta_relative_position_repeat",
+    lambda: list(torch.arange(6).reshape(1, 2, 3).repeat(4, 1, 1).shape))
+
+# --- convolution 2-D: through torch.conv2d and nn.Conv2d --------------------
+# `torch.conv2d` was already wired (ARCH26.md §7) over a kernel that refused
+# 4-D input, so this is the first time that spelling reaches anything.
+import torch.nn as nn
+def _conv2d_road():
+    x = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).reshape(2, 3, 8, 8) * 0.01
+    w = torch.arange(4 * 3 * 4 * 4, dtype=torch.float32).reshape(4, 3, 4, 4) * 0.02
+    b = torch.tensor([0.1, -0.2, 0.3, -0.4])
+    # Dinov2's patch embedding shape: 4x4 kernel, stride 4, no padding.
+    out = torch.conv2d(x, w, b, 2 if False else [4, 4], [0, 0], [1, 1], 1)
+    return [list(out.shape), round(float(out.sum()), 4)]
+rec("conv2d_patch_embed", _conv2d_road)
+def _conv2d_matches_raw():
+    x = torch.arange(1 * 2 * 5 * 5, dtype=torch.float32).reshape(1, 2, 5, 5)
+    w = torch.arange(3 * 2 * 3 * 3, dtype=torch.float32).reshape(3, 2, 3, 3)
+    a = torch.conv2d(x, w, None, [1, 1], [1, 1], [1, 1], 1)
+    b = torch._C._aten_dispatch("aten.convolution.default", x, w, None,
+                                [1, 1], [1, 1], [1, 1], False, [0, 0], 1)
+    return a.tolist() == b.tolist()
+rec("conv2d_matches_raw", _conv2d_matches_raw)
+def _nn_conv2d():
+    # The route a vision backbone actually takes: nn.Conv2d.forward, which is
+    # F.conv2d, which is torch.conv2d, which is aten.convolution.default.
+    m = nn.Conv2d(3, 4, kernel_size=4, stride=4, bias=True)
+    with torch.no_grad():
+        m.weight.fill_(0.01)
+        m.bias.fill_(0.5)
+        out = m(torch.ones(2, 3, 8, 8))
+    # each output element = 3*4*4 ones * 0.01 + 0.5
+    return [list(out.shape), round(float(out.reshape(-1)[0]), 6)]
+rec("nn_conv2d_forward", _nn_conv2d)
+def _conv2d_asymmetric_refused():
+    x = torch.ones(1, 2, 7, 7); w = torch.ones(2, 2, 3, 3)
+    try:
+        torch.conv2d(x, w, None, [2, 1], [0, 0], [1, 1], 1)
+        return "ACCEPTED"
+    except NotImplementedError as e:
+        return "refused" if "asymmetric" in str(e) else "refused:" + str(e)[:80]
+rec("conv2d_asymmetric_refused", _conv2d_asymmetric_refused)
+
+# --- remainder: free function, member, and the `%` operator -----------------
+rm = torch.tensor([7.0, -7.0, 7.0, -7.0])
+rd = torch.tensor([3.0, 3.0, -3.0, -3.0])
+rec("remainder_fn", lambda: torch.remainder(rm, rd).tolist())
+rec("remainder_member", lambda: rm.remainder(rd).tolist())
+rec("remainder_operator", lambda: (rm % rd).tolist())
+rec("remainder_operator_scalar", lambda: (rm % -3.0).tolist())
+rec("remainder_int_operator", lambda: (torch.tensor([7, -7]) % 3).tolist())
+# `fmod` has no kernel here (docs/KERNELS26.md §6 leaves it named), so the
+# comparison is against Python's own `math.fmod` -- the same C function
+# upstream's `fmod` kernel calls, and it keeps this file's promise of not
+# needing a second torch to compute an expectation.
+rec("remainder_vs_fmod",
+    lambda: [torch.remainder(rm, rd).tolist(),
+             [math.fmod(a, b) for a, b in zip(rm.tolist(), rd.tolist())]])
+rec("remainder_neg_zero_sign",
+    lambda: math.copysign(1.0, (torch.tensor([-0.0]) % 3.0).item()))
+rec("remainder_matches_raw",
+    lambda: (rm % rd).tolist()
+    == torch._C._aten_dispatch("aten.remainder.Tensor", rm, rd).tolist())
+# `Sam3ViTRotaryEmbedding.__init__` verbatim: a flattened index grid taken
+# modulo the row length, which is what `sam3_video` stopped on.
+def _sam3_rotary_positions():
+    end_x, end_y = 4, 3
+    flat = torch.arange(end_x * end_y)
+    # The `% end_x` half only. The `//`-shaped `y_positions` beside it in
+    # `modeling_sam3.py` needs `div.Tensor_mode`, which docs/KERNELS26.md §6
+    # records as still missing.
+    return (flat % end_x).tolist()
+rec("sam3_rotary_x_positions", _sam3_rotary_positions)
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _kernels26_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _KERNELS26_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"kernels26 road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_kernels26_road_through_the_vendored_tree():
+    """Every kernel docs/KERNELS26.md adds, reached as a model reaches it.
+
+    Not `_C._aten_dispatch("aten.sqrt.default", ...)` with the key typed by the
+    test author -- that is what the section above does, and it is exactly the
+    check that cannot fail on a missing `overloads.json` entry. This one goes
+    `torch.sqrt(x)` and `x.sqrt()` through a real `import torch`.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _kernels26_road_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-5):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, (int, float)), f"{key}: got {got!r}"
+        assert abs(got - expected) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    # --- sqrt ---------------------------------------------------------------
+    eq("sqrt_fn", [1.0, 2.0, 3.0, 4.0])
+    eq("sqrt_member", [1.0, 2.0, 3.0, 4.0])
+    eq("sqrt_neg_is_nan", True)
+    eq("sqrt_neg_zero_sign", -1.0)  # sqrt(-0.0) is -0.0, not +0.0
+    eq("sqrt_int_dtype", "torch.float32")
+    eq("sqrt_matches_raw", True)
+    close("deberta_scaled_size_sqrt", math.sqrt(64.0 * 3))
+    rows = out.get("deberta_layer_norm", "<missing>")
+    assert isinstance(rows, list) and len(rows) == 1, rows
+    mean = 2.5
+    var = sum((v - mean) ** 2 for v in (1.0, 2.0, 3.0, 4.0)) / 4
+    want = [(v - mean) / math.sqrt(var + 1e-7) for v in (1.0, 2.0, 3.0, 4.0)]
+    for got_v, want_v in zip(rows[0], want):
+        assert abs(got_v - want_v) < 1e-5, (rows[0], want)
+
+    # --- repeat -------------------------------------------------------------
+    eq("repeat_member_varargs", [[1.0, 2.0, 3.0] * 3] * 2)
+    eq("repeat_member_list", [[1.0, 2.0, 3.0] * 3] * 2)
+    eq("repeat_member_single", [1.0, 2.0, 3.0, 1.0, 2.0, 3.0])
+    eq("repeat_zero_shape", [0])
+    eq("repeat_no_free_function", False)  # upstream has no torch.repeat
+    eq("repeat_matches_raw", True)
+    eq("repeat_is_a_copy", [1.0, 2.0])
+    eq("deberta_relative_position_repeat", [4, 2, 3])
+
+    # --- remainder ----------------------------------------------------------
+    # (7, -7) against (3, -3): the four sign quadrants in one call.
+    eq("remainder_fn", [1.0, 2.0, -2.0, -1.0])
+    eq("remainder_member", [1.0, 2.0, -2.0, -1.0])
+    eq("remainder_operator", [1.0, 2.0, -2.0, -1.0])
+    eq("remainder_operator_scalar", [-2.0, -1.0, -2.0, -1.0])
+    eq("remainder_int_operator", [1, 2])
+    # The pair that separates the two conventions, side by side.
+    eq("remainder_vs_fmod", [[1.0, 2.0, -2.0, -1.0], [1.0, -1.0, 1.0, -1.0]])
+    eq("remainder_neg_zero_sign", -1.0)
+    eq("remainder_matches_raw", True)
+    eq("sam3_rotary_x_positions", [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3])
+
+    # --- convolution 2-D ----------------------------------------------------
+    shape, _total = out.get("conv2d_patch_embed", ["<missing>", None])
+    assert shape == [2, 4, 2, 2], out.get("conv2d_patch_embed")
+    eq("conv2d_matches_raw", True)
+    # 3*4*4 = 48 ones times 0.01, plus a bias of 0.5.
+    eq("nn_conv2d_forward", [[2, 4, 2, 2], round(48 * 0.01 + 0.5, 6)])
+    eq("conv2d_asymmetric_refused", "refused")
 
 
 def _main():

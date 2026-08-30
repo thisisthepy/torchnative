@@ -414,6 +414,18 @@
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
 
+  "sqrt": [
+    "aten::sqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::sqrt(Tensor self) -> Tensor"
+  ],
+
+  "remainder": [
+    "aten::remainder.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::remainder.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+
   "tanh": [
     "aten::tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::tanh(Tensor self) -> Tensor"

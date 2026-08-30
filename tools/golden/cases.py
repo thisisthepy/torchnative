@@ -2225,6 +2225,542 @@ def rsqrt_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.sqrt.default -----------------------------------------------------
+#
+# `rsqrt` was here from the beginning and `sqrt` was not, which is the
+# asymmetry docs/ARCH26.md §1 found blocking `deberta` and `deberta_v2`:
+# both compute an attention temperature or a hand-rolled layer norm through
+# `torch.sqrt` rather than through `nn.LayerNorm`.
+#
+# Two properties are checked here that `rsqrt`'s builder cannot check for it,
+# because `rsqrt` destroys both:
+#
+#   * **`sqrt(-0.0)` is `-0.0`, not `+0.0`.** IEEE-754 says the sign of zero
+#     survives the square root, and upstream agrees (measured on 2.13.0:
+#     the result's bit pattern is `0x80000000`). `rsqrt(-0.0)` is `-inf`, so
+#     the sign is visible there as a sign of infinity rather than of zero, and
+#     an implementation that returned `+0.0` here would pass every `rsqrt`
+#     case. Comparing by value alone would *also* miss it, because
+#     `-0.0 == 0.0`, so the check is a dedicated `value_check` on the sign bit.
+#   * **the integral rows.** `rsqrt`'s builder only runs the four float
+#     dtypes; `sqrt(int64)` is `float32` (torch's unary-float promotion) and
+#     that row is where a "keep the input dtype" implementation would fail.
+#
+# The domain rows (`-1.0 -> NaN`, `-inf -> NaN`) are the ones that separate a
+# real `sqrt` from `pow(x, 0.5)`: `pow` on a negative base is NaN too, but
+# `exp(0.5 * log(x))` -- candle's own `Tensor::pow` -- is NaN for a *different*
+# reason and gets `sqrt(inf)` wrong. Nothing here is composed out of `pow`; the
+# rows exist so that a future attempt to do so fails.
+
+_SQRT_FLOAT_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_SQRT_INT_DTYPES = ["int64", "int32", "int16", "uint8", "bool"]
+
+
+def _signed_zero_check(t_res, c_res) -> tuple[bool, str]:
+    """dtype, shape, every value -- and the *sign bit* of every zero.
+
+    `_exact_value_check` above is the model, and this is that check plus one
+    thing it cannot do: `-0.0 == 0.0` is true in Python, so an implementation
+    that answered `+0.0` where upstream answers `-0.0` passes a bit-exact
+    value comparison. `math.copysign` reads the bit that `==` throws away.
+
+    Written as the superset rather than as a sign-only check on purpose: a
+    comparator that looked at nothing but the sign bit would be blind to
+    dtype, shape and every non-zero value, and `--self-test` would say so.
+    """
+    t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+    if t_dtype != c_dtype:
+        return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_shape = tuple(int(x) for x in t_res.shape)
+    c_shape = tuple(int(x) for x in c_res.shape)
+    if t_shape != c_shape:
+        return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+    t_vals = _flatten_values(t_res.tolist())
+    c_vals = _flatten_values(c_res.tolist())
+    if len(t_vals) != len(c_vals):
+        return False, f"element count differs: torch={len(t_vals)} c={len(c_vals)}"
+    zeros = 0
+    for i, (t, c) in enumerate(zip(t_vals, c_vals)):
+        if t != c and not (t != t and c != c):  # NaN == NaN for this purpose
+            return False, f"value mismatch at index {i}: torch={t!r} c={c!r}"
+        if t == 0.0:
+            zeros += 1
+            t_neg = math.copysign(1.0, float(t)) < 0
+            c_neg = math.copysign(1.0, float(c)) < 0
+            if t_neg != c_neg:
+                return False, (
+                    f"sign of zero differs at index {i}: "
+                    f"torch={'-0.0' if t_neg else '+0.0'} "
+                    f"c={'-0.0' if c_neg else '+0.0'} -- `-0.0 == 0.0` is true, "
+                    "so a value comparison alone cannot see this"
+                )
+    return True, (
+        f"dtype={t_dtype} shape={t_shape}, all {len(t_vals)} values equal and "
+        f"{zeros} signed zero(s) carry the same sign bit"
+    )
+
+
+def sqrt_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sqrt.default"
+    cases: list[Case] = []
+
+    for dtype_name in _SQRT_FLOAT_DTYPES:
+        for flat, shape, note in [
+            ([1.0, 4.0, 9.0, 16.0], (2, 2), "perfect squares"),
+            ([2.0, 3.0, 0.5, 10.0], (2, 2), "irrational results"),
+            ([0.5, 2.0, 100.0, 0.01], (2, 2), "assorted magnitudes"),
+            ([0.0], (1,), "+0.0 -> +0.0"),
+            ([-1.0, -4.0], (2,), "negative -> NaN"),
+            ([float("inf")], (1,), "+inf -> +inf"),
+            ([float("-inf")], (1,), "-inf -> NaN, not -inf"),
+            ([float("nan")], (1,), "NaN -> NaN"),
+            ([2.0], (), "0-d"),
+            ([], (0,), "empty"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"sqrt(dtype={dtype_name}, shape={shape}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                    note=note,
+                )
+            )
+
+        # The signed zero, checked on its sign bit rather than its value.
+        # Four elements rather than one so that the harness's `permute` and
+        # `constant` fault modes can be built against this comparator too --
+        # a one-element case leaves both of them "not applicable" and the
+        # comparator is then only ever proved against `value`/`shape`/`dtype`.
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [-0.0, 4.0, 0.0, 9.0], (2, 2), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"sqrt(dtype={dtype_name}) [-0.0 keeps its sign, +0.0 does too]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                value_check=_signed_zero_check,
+                note="IEEE-754: sqrt(-0.0) is -0.0. `-0.0 == 0.0`, so this "
+                "needs the sign bit, not the value.",
+            )
+        )
+
+    # Integral and boolean inputs promote to the default float -- the half of
+    # the rule `rsqrt`'s float-only builder never reaches.
+    for dtype_name in _SQRT_INT_DTYPES:
+        flat = [0, 1] if dtype_name == "bool" else [0, 1, 4, 9]
+        shape = (2,) if dtype_name == "bool" else (2, 2)
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(
+            Case(
+                name=f"sqrt(dtype={dtype_name}, shape={shape}) [integral -> default float]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="torch's unary-float promotion: not the input dtype",
+            )
+        )
+
+    return cases
+
+
+# --- aten.remainder.Scalar / aten.remainder.Tensor -------------------------
+#
+# `sam3_video`'s wall (docs/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
+# computes `x_positions = (flattened_indices % end_x) * scale`, which is
+# `TensorBase.__mod__` and therefore `aten.remainder.Scalar`.
+#
+# **`remainder` follows the sign of the DIVISOR and `fmod` follows the sign of
+# the dividend, and that is the classic way to get this wrong.** Every row of
+# `_REMAINDER_SIGNS` below is a `(dividend, divisor)` pair whose two operands
+# have signs that make the two conventions disagree, measured on upstream
+# 2.13.0:
+#
+#     remainder( 7,  3) =  1     fmod =  1      (agree)
+#     remainder( 7, -3) = -2     fmod =  1      <-- disagree
+#     remainder(-7,  3) =  2     fmod = -1      <-- disagree
+#     remainder(-7, -3) = -1     fmod = -1      (agree)
+#
+# An implementation written on `fmod` alone passes exactly half of these, and
+# a case set that only used positive operands would pass all of them.
+#
+# Three more corners, all measured rather than assumed:
+#
+#   * **`remainder(-0.0, 3.0)` is `-0.0`**, not `+0.0`. Upstream's own
+#     correction is `if (mod != 0) && ((b < 0) != (mod < 0)) mod += b`, and
+#     `-0.0 != 0` is false, so the negative zero survives. Python's own
+#     `-0.0 % 3.0` is `+0.0` -- so "just use Python's `%` semantics" is wrong
+#     here, in a way `==` cannot see.
+#   * **division by zero splits by category**: a float divisor of `0.0` gives
+#     NaN, an integral one **raises** `RuntimeError('ZeroDivisionError')`.
+#   * **infinities**: `remainder(5.0, -inf)` is `-inf` and
+#     `remainder(-5.0, inf)` is `inf`, which fall straight out of the
+#     correction above and are the rows that catch an implementation that
+#     special-cases non-finite divisors.
+
+_REMAINDER_DTYPES_FLOAT = ["float64", "float32", "float16", "bfloat16"]
+_REMAINDER_DTYPES_INT = ["int64", "int32", "int16", "uint8"]
+
+# The four sign quadrants, on both sides, in both directions.
+_REMAINDER_SIGNS = [
+    (7, 3), (7, -3), (-7, 3), (-7, -3),
+    (0, 3), (0, -3),
+    (5, 2), (-5, 2), (5, -2), (-5, -2),
+    (1, 3), (-1, 3), (1, -3), (-1, -3),
+    (6, 3), (-6, 3), (6, -3), (-6, -3),   # exact division in every quadrant
+]
+
+
+def remainder_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.remainder.Scalar"
+    cases: list[Case] = []
+
+    for dtype_name in _REMAINDER_DTYPES_FLOAT:
+        for a, b in _REMAINDER_SIGNS:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [float(a)], (1,), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"remainder({a}.0 as {dtype_name}, {b}.0) [sign of the divisor]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, float(b)),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, float(b)),
+                    note="fmod would answer the sign of the dividend",
+                )
+            )
+        # The signed zero, on its sign bit -- see `_signed_zero_check`.
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [-0.0, 0.0, -0.0, 0.0], (2, 2), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"remainder(-0.0/+0.0 as {dtype_name}, 3.0) [signed zero survives]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 3.0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 3.0),
+                value_check=_signed_zero_check,
+                note="upstream's correction is guarded by `mod != 0`, and "
+                "`-0.0 != 0` is false -- Python's own `-0.0 % 3.0` is +0.0",
+            )
+        )
+        # Non-finite operands, both sides.
+        for a, b, note in [
+            (float("inf"), 3.0, "inf dividend -> NaN"),
+            (float("-inf"), 3.0, "-inf dividend -> NaN"),
+            (float("nan"), 3.0, "NaN dividend -> NaN"),
+            (5.0, float("inf"), "+inf divisor -> the dividend, unchanged"),
+            (5.0, float("-inf"), "-inf divisor -> -inf, from the sign correction"),
+            (-5.0, float("inf"), "+inf divisor, negative dividend -> +inf"),
+            (5.0, 0.0, "float division by zero -> NaN, no raise"),
+            (-5.0, 0.0, "float division by zero -> NaN, no raise"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"remainder({a!r} as {dtype_name}, {b!r}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, b),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, b),
+                    note=note,
+                )
+            )
+
+    for dtype_name in _REMAINDER_DTYPES_INT:
+        for a, b in _REMAINDER_SIGNS:
+            if dtype_name == "uint8" and a < 0:
+                continue  # the dividend would wrap; the divisor still varies
+            a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"remainder({a} as {dtype_name}, {b}) [integral, sign of the divisor]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, b),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, b),
+                    note="C's `%` truncates toward zero; torch's does not",
+                )
+            )
+        # Integral division by zero RAISES, where the float path answers NaN.
+        a_t, a_c = pair_from_flat(torch_module, c_module, [5], (1,), dtype_name)
+        cases.append(
+            Case(
+                name=f"remainder({dtype_name}, 0) [integral division by zero raises]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                expect="both_error",
+                note="upstream: RuntimeError('ZeroDivisionError') -- the float "
+                "path answers NaN for the same input category",
+            )
+        )
+        # An integral tensor with a FLOAT scalar floats the result.
+        a_t, a_c = pair_from_flat(torch_module, c_module, [5], (1,), dtype_name)
+        cases.append(
+            Case(
+                name=f"remainder({dtype_name}, 2.5) [float scalar floats the result]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 2.5),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 2.5),
+                note="torch's wrapped-number rule: an int scalar would not",
+            )
+        )
+
+    # `int64` min against `-1` -- the one pair where C's `%` is undefined and
+    # Rust's panics. Upstream answers 0.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [-(2**63)], (1,), "int64")
+    cases.append(
+        Case(
+            name="remainder(int64 min, -1) [the overflow pair]",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, -1),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -1),
+            note="`i64::MIN % -1` panics in Rust; upstream answers 0",
+        )
+    )
+
+    # A documented capability gap: upstream computes for a bool tensor with a
+    # numeric scalar (int64 for an int, float32 for a float) and this shim
+    # refuses, the same way `arith_tag` refuses `bool_tensor * 2`.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    for scalar in (2, 2.0):
+        cases.append(
+            Case(
+                name=f"remainder(bool, {scalar!r}) [documented gap: upstream computes]",
+                op=op,
+                run_torch=lambda a_t=a_t, s=scalar: torch_call(a_t, s),
+                run_c=lambda a_c=a_c, s=scalar: c_module._aten_dispatch(op, a_c, s),
+                expect="c_error",
+                note="upstream gives int64 for an int scalar and float32 for a "
+                "float one; this shim refuses bool operands here exactly as "
+                "`arith_tag` already refuses `bool_tensor * 2`",
+            )
+        )
+
+    return cases
+
+
+def remainder_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.remainder.Tensor"
+    cases: list[Case] = []
+
+    for dtype_name in _REMAINDER_DTYPES_FLOAT + _REMAINDER_DTYPES_INT:
+        is_float = dtype_name in _REMAINDER_DTYPES_FLOAT
+        lhs = [a for a, _ in _REMAINDER_SIGNS]
+        rhs = [b for _, b in _REMAINDER_SIGNS]
+        if dtype_name == "uint8":
+            lhs = [abs(v) for v in lhs]
+            rhs = [abs(v) if v != 0 else 1 for v in rhs]
+        if is_float:
+            lhs = [float(v) for v in lhs]
+            rhs = [float(v) for v in rhs]
+        shape = (len(lhs),)
+        a_t, a_c = pair_from_flat(torch_module, c_module, lhs, shape, dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, rhs, shape, dtype_name)
+        cases.append(
+            Case(
+                name=f"remainder.Tensor(dtype={dtype_name}) [all four sign quadrants]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="elementwise, every quadrant in one call",
+            )
+        )
+
+    # Broadcasting, in both directions.
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [7.0, 8.0], (2, 1), "float32"
+    )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [3.0, -3.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="remainder.Tensor((2,1) against (2,)) [broadcast]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            note="the sign correction has to be applied after broadcasting",
+        )
+    )
+    cases.append(
+        Case(
+            name="remainder.Tensor((2,) against (2,1)) [broadcast, reversed]",
+            op=op,
+            run_torch=lambda a_t=b_t, b_t=a_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=b_c, b_c=a_c: c_module._aten_dispatch(op, a_c, b_c),
+        )
+    )
+
+    # Mixed dtypes -- `remainder.Tensor` follows `torch.promote_types` exactly
+    # (verified cell by cell over the eight storable numeric dtypes).
+    for a_dt, b_dt in [
+        ("int64", "int32"), ("int32", "float32"), ("float32", "float64"),
+        ("float16", "float32"), ("float16", "bfloat16"), ("uint8", "int16"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [7], (1,), a_dt)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [3], (1,), b_dt)
+        cases.append(
+            Case(
+                name=f"remainder.Tensor({a_dt} against {b_dt}) [promotion]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="agrees with torch.promote_types in every measured cell",
+            )
+        )
+
+    # Bool on both sides: upstream refuses too, with
+    # `"remainder_cpu" not implemented for 'Bool'`.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [True, True], (2,), "bool")
+    cases.append(
+        Case(
+            name="remainder.Tensor(bool, bool) [upstream refuses too]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note='upstream: NotImplementedError \'"remainder_cpu" not implemented for \'Bool\'\'',
+        )
+    )
+
+    # Integral division by zero, elementwise: one zero anywhere raises.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [5, 6], (2,), "int64")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [3, 0], (2,), "int64")
+    cases.append(
+        Case(
+            name="remainder.Tensor(int64, [3, 0]) [one zero divisor raises]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note="RuntimeError('ZeroDivisionError'), not a NaN in one lane",
+        )
+    )
+
+    return cases
+
+
+# --- aten.repeat.default ---------------------------------------------------
+#
+# The kernel docs/ARCH26.md §6/§8 found recurring across four of the six
+# architectures (`deberta`, `deberta_v2`, `sew_d`, `sam3_video`), and the wall
+# both DeBERTas landed on the moment `sqrt` was implemented.
+#
+# `repeat` is *tiling*, not broadcasting, and the difference is what this
+# builder is for. `expand` produces a view whose strides are zero; `repeat`
+# materialises a copy. The cases below cover the three places an
+# implementation goes wrong:
+#
+#   * **`len(repeats) > rank`** -- the tensor gains leading dimensions.
+#     `[1,2,3].repeat(2, 3)` is `(2, 9)`, not `(2, 3, 3)`: the *last* repeat
+#     multiplies the existing dimension and the earlier ones are new.
+#   * **a repeat of 0** -- upstream produces a genuinely empty dimension
+#     (`[1,2,3].repeat(0)` is `(0,)`). An implementation that loops
+#     `for r in repeats { if r > 1 { concat } }` -- which is candle's own
+#     `Tensor::repeat` -- silently treats 0 as 1 and returns the input.
+#   * **a non-contiguous input** -- `repeat` reads in logical order, so a
+#     transposed input must be tiled by its logical layout and not by its
+#     storage.
+#
+# dtype is passed through unchanged for every dtype including `bool`, which is
+# measured rather than assumed: `repeat` is a data movement and does not
+# promote.
+
+_REPEAT_DTYPES = [
+    "float64", "float32", "float16", "bfloat16",
+    "int64", "int32", "int16", "uint8", "bool",
+]
+
+# (input flat, input shape, repeats, note)
+_REPEAT_SHAPES: list[tuple[list, tuple, list, str]] = [
+    ([1, 2, 3], (3,), [2], "1-D, same rank"),
+    ([1, 2, 3], (3,), [1], "1-D, repeat of 1 -- must still be a copy"),
+    ([1, 2, 3], (3,), [2, 3], "1-D -> 2-D: the LAST repeat multiplies, the first is new"),
+    ([1, 2, 3], (3,), [2, 3, 4], "1-D -> 3-D"),
+    ([1, 2, 3, 4], (2, 2), [2, 3], "2-D, same rank"),
+    ([1, 2, 3, 4], (2, 2), [1, 1], "2-D, all ones -- must still be a copy"),
+    ([1, 2, 3, 4], (2, 2), [2, 1, 3], "2-D -> 3-D"),
+    ([1, 2, 3, 4, 5, 6], (2, 3), [3, 2], "2-D, non-square"),
+    ([5], (), [3], "0-D -> 1-D"),
+    ([5], (), [2, 2], "0-D -> 2-D"),
+    ([5], (), [], "0-D with an empty repeat list stays 0-D"),
+    ([1, 2, 3], (3,), [0], "repeat of 0 -> an empty dimension, NOT a no-op"),
+    ([1, 2, 3, 4], (2, 2), [0, 2], "repeat of 0 on the leading axis"),
+    ([1, 2, 3, 4], (2, 2), [2, 0], "repeat of 0 on the trailing axis"),
+    ([], (0, 3), [2, 2], "an already-empty input"),
+]
+
+
+def repeat_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.repeat.default"
+    cases: list[Case] = []
+
+    for dtype_name in _REPEAT_DTYPES:
+        for flat, shape, repeats, note in _REPEAT_SHAPES:
+            src = [bool(v) for v in flat] if dtype_name == "bool" else flat
+            a_t, a_c = pair_from_flat(torch_module, c_module, src, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"repeat(dtype={dtype_name}, shape={shape}, repeats={repeats}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, r=repeats: torch_call(a_t, r),
+                    run_c=lambda a_c=a_c, r=repeats: c_module._aten_dispatch(op, a_c, r),
+                    note=note,
+                )
+            )
+
+    # A transposed input: `repeat` must tile the logical layout, not the
+    # storage. `arange(6).reshape(2, 3).t()` is `(3, 2)` with strides `(1, 3)`.
+    base_t = torch_module.arange(6, dtype=torch_module.float32).reshape(2, 3).t()
+    base_c = c_module._aten_dispatch(
+        "aten.t.default",
+        c_module._aten_dispatch(
+            "aten.view.default",
+            c_module._tensor_from_flat([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], [6], c_module.float32),
+            [2, 3],
+        ),
+    )
+    for repeats in ([2, 1], [1, 2], [2, 3], [2, 1, 1]):
+        cases.append(
+            Case(
+                name=f"repeat(non-contiguous (3,2) transpose, repeats={repeats})",
+                op=op,
+                run_torch=lambda t=base_t, r=repeats: torch_call(t, r),
+                run_c=lambda c=base_c, r=repeats: c_module._aten_dispatch(op, c, r),
+                note="strides (1, 3) -- tiled by logical order, not by storage",
+            )
+        )
+
+    # Refusals, both upstream's, both with upstream's own wording.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="repeat(rank 2, repeats=[2]) [fewer repeats than dimensions]",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, [2]),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2]),
+            expect="both_error",
+            note="upstream: 'Number of dimensions of repeat dims can not be smaller "
+            "than number of dimensions of tensor'",
+        )
+    )
+    for repeats in ([-1, 2], [2, -1]):
+        cases.append(
+            Case(
+                name=f"repeat(rank 2, repeats={repeats}) [negative repeat]",
+                op=op,
+                run_torch=lambda a_t=a_t, r=repeats: torch_call(a_t, r),
+                run_c=lambda a_c=a_c, r=repeats: c_module._aten_dispatch(op, a_c, r),
+                expect="both_error",
+                note="upstream: 'Trying to create tensor with negative dimension'",
+            )
+        )
+
+    return cases
+
+
 # --- aten.lift_fresh.default (backs `torch.tensor(...)` construction) --------
 #
 # `torch.tensor([...])` -- the 13th name docs/C_SURFACE.md traced -- does
@@ -10013,12 +10549,12 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="a non-zero output_padding is not implemented in torch._C shim",
         )
     )
-    # A 2-D input: both sides refuse (measured on real torch: "Expected
+    # A rank-2 input: both sides refuse (measured on real torch: "Expected
     # 3-dimensional input for 3-dimensional weight").
     x2d_t, x2d_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), "float32")
     cases.append(
         Case(
-            name="convolution(2-D input) [both_error -- neither side does 2-D here]",
+            name="convolution(rank-2 input) [both_error -- a rank-2 input has no batch axis]",
             op=op,
             run_torch=lambda: torch_call(x2d_t, w_t, None, [1], [3], [1], False, [0], 3),
             run_c=lambda: c_module._aten_dispatch(op, x2d_c, w_c, None, [1], [3], [1], False, [0], 3),
@@ -10043,6 +10579,133 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
         [1.0, -1.0, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5, -1.0, 1.0, 0.0, 2.0],
         (3, 1, 4), "float32",
     )
+    # --- 2-D convolution (4-D input), docs/KERNELS26.md §7 -----------------
+    #
+    # `Dinov2`'s patch embedding is the caller ARCH26.md §3.2 stopped on, and
+    # its shape is the first row: a square kernel with a matching stride and no
+    # padding. The rest widen it in the ways a wrapper over a scalar-argument
+    # kernel could get wrong -- padding, dilation, groups, and a NON-square
+    # input, which is the one that catches an implementation that swapped the
+    # height and width axes (a square input cannot).
+    def make2d(dtype_name, in_shape, w_shape, with_bias, stride, padding, dilation,
+               groups, note, expect="match"):
+        n_in = 1
+        for d in in_shape:
+            n_in *= d
+        n_w = 1
+        for d in w_shape:
+            n_w *= d
+        in_flat = [((i * 37 % 23) - 11) * 0.25 for i in range(n_in)]
+        w_flat = [((i * 17 % 13) - 6) * 0.5 for i in range(n_w)]
+        x_t, x_c = pair_from_flat(torch_module, c_module, in_flat, in_shape, dtype_name)
+        w_t, w_c = pair_from_flat(torch_module, c_module, w_flat, w_shape, dtype_name)
+        if with_bias:
+            b_flat = [((i % 5) - 2) * 0.1 for i in range(w_shape[0])]
+            b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, (w_shape[0],), dtype_name)
+        else:
+            b_t, b_c = None, None
+        return Case(
+            name=f"convolution 2-D(dtype={dtype_name}, in={in_shape}, w={w_shape}, "
+                 f"stride={stride}, pad={padding}, dil={dilation}, groups={groups}) [{note}]",
+            op=op,
+            run_torch=lambda: torch_call(
+                x_t, w_t, b_t, list(stride), list(padding), list(dilation), False, [0, 0], groups
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x_c, w_c, b_c, list(stride), list(padding), list(dilation), False, [0, 0], groups
+            ),
+            expect=expect,
+            note=note,
+        )
+
+    for dtype_name in ["float64", "float32"]:
+        for in_shape, w_shape, with_bias, stride, padding, dilation, groups, note in [
+            # Dinov2's patch embedding, scaled down: (batch, 3, 8, 8) through a
+            # 4x4 kernel with stride 4.
+            ((2, 3, 8, 8), (4, 3, 4, 4), True, (4, 4), (0, 0), (1, 1), 1,
+             "Dinov2 patch embedding shape (square kernel, matching stride, no padding)"),
+            ((1, 2, 5, 5), (3, 2, 3, 3), True, (1, 1), (1, 1), (1, 1), 1,
+             "the ordinary 3x3-with-padding case"),
+            ((1, 2, 5, 5), (3, 2, 3, 3), False, (1, 1), (0, 0), (1, 1), 1, "no bias"),
+            ((1, 2, 6, 6), (2, 2, 3, 3), True, (2, 2), (1, 1), (1, 1), 1, "stride 2"),
+            ((1, 2, 7, 7), (2, 2, 3, 3), True, (1, 1), (2, 2), (2, 2), 1, "dilation 2"),
+            ((1, 4, 5, 5), (4, 1, 3, 3), True, (1, 1), (1, 1), (1, 1), 4, "depthwise (groups=channels)"),
+            ((1, 4, 5, 5), (4, 2, 3, 3), True, (1, 1), (1, 1), (1, 1), 2, "grouped, groups=2"),
+            # NON-square: the row a square-only case set cannot fail on.
+            ((1, 2, 4, 7), (3, 2, 3, 3), True, (1, 1), (1, 1), (1, 1), 1,
+             "non-square input -- catches a swapped height/width axis"),
+            ((1, 1, 6, 3), (2, 1, 3, 2), True, (1, 1), (0, 0), (1, 1), 1,
+             "non-square input AND non-square kernel"),
+            ((1, 2, 1, 1), (2, 2, 1, 1), True, (1, 1), (0, 0), (1, 1), 1, "1x1 kernel on a 1x1 input"),
+        ]:
+            cases.append(make2d(dtype_name, in_shape, w_shape, with_bias, stride,
+                                padding, dilation, groups, note))
+
+    # The documented gap: candle's `conv2d` takes one scalar per argument, so
+    # an ASYMMETRIC stride/padding/dilation is refused. torch computes all
+    # three. Carried as `c_error` so the harness watches the gap -- and so that
+    # implementing it later flips these to failures rather than being silent.
+    for stride, padding, dilation, which in [
+        ((2, 1), (0, 0), (1, 1), "stride"),
+        ((1, 1), (2, 0), (1, 1), "padding"),
+        ((1, 1), (0, 0), (2, 1), "dilation"),
+    ]:
+        cases.append(
+            make2d("float32", (1, 2, 7, 7), (2, 2, 3, 3), True, stride, padding,
+                   dilation, 1, f"asymmetric {which} -- c_error, torch computes",
+                   expect="c_error")
+        )
+
+    # **A single value broadcasts to both axes**, which is torch's own
+    # `expand_param_if_needed` -- measured, and initially got wrong here: this
+    # kernel first refused a 1-element list on a 4-D input, and that case
+    # failed as `both_error` because torch computes `(1, 3, 3, 3)` for it. Kept
+    # as a live case in both spellings.
+    x4_t, x4_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(1 * 2 * 5 * 5)], (1, 2, 5, 5), "float32")
+    w4_t, w4_c = pair_from_flat(
+        torch_module, c_module, [float(i % 7) for i in range(3 * 2 * 3 * 3)], (3, 2, 3, 3), "float32")
+    for pad, note in (([0], "no padding"), ([2], "padding 2 on both axes")):
+        cases.append(
+            Case(
+                name=f"convolution 2-D(4-D input, 1-element stride/padding/dilation) [{note}]",
+                op=op,
+                run_torch=lambda p=pad: torch_call(x4_t, w4_t, None, [1], p, [1], False, [0], 1),
+                run_c=lambda p=pad: c_module._aten_dispatch(
+                    op, x4_c, w4_c, None, [1], p, [1], False, [0], 1),
+                note="a single value expands to every convolved axis",
+            )
+        )
+    # ...and a length that is neither 1 nor the convolution's rank raises, on
+    # both sides, with upstream's own wording.
+    cases.append(
+        Case(
+            name="convolution 2-D(4-D input, 3-element stride) [both_error]",
+            op=op,
+            run_torch=lambda: torch_call(x4_t, w4_t, None, [1, 1, 1], [0], [1], False, [0], 1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x4_c, w4_c, None, [1, 1, 1], [0], [1], False, [0], 1),
+            expect="both_error",
+            note="torch: 'expected stride to be a single integer value or a list of 2 values'",
+        )
+    )
+    x3b_t, x3b_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(30)], (1, 2, 15), "float32")
+    w3b_t, w3b_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(12)], (2, 2, 3), "float32")
+    cases.append(
+        Case(
+            name="convolution 1-D(3-D input, 2-element stride) [both_error]",
+            op=op,
+            run_torch=lambda: torch_call(x3b_t, w3b_t, None, [1, 1], [0], [1], False, [0], 1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, x3b_c, w3b_c, None, [1, 1], [0], [1], False, [0], 1),
+            expect="both_error",
+            note="a 2-element stride on a 1-D convolution is refused upstream too -- "
+                 "this is not a shim restriction",
+        )
+    )
+
     cases.append(
         Case(
             name="convolution(every argument by keyword)",
@@ -13798,6 +14461,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.pow.Scalar": pow_scalar_cases,
     "aten.randint.low": randint_low_cases,
     "aten.rsqrt.default": rsqrt_cases,
+    "aten.sqrt.default": sqrt_cases,
+    "aten.repeat.default": repeat_cases,
+    "aten.remainder.Scalar": remainder_scalar_cases,
+    "aten.remainder.Tensor": remainder_tensor_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
     # members (docs/C_SURFACE.md §4) -- see the longer module note above.
