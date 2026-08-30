@@ -9959,6 +9959,200 @@ def test_spelling_road_through_the_vendored_tree():
     eq("bitwise_and_matches_raw", True)
 
 
+# --- torch.jit.script defaults to unavailable, upstream's own way ----------
+#
+# docs/TORCHSCRIPT.md is the investigation. Short version: there is no
+# TorchScript frontend here, `bootstrap.py` now sets `PYTORCH_JIT=0` by
+# `os.environ.setdefault` before `torch.jit._state` is first imported, and
+# upstream's own `torch/jit/_script.py` (`if not _enabled: return obj`,
+# unmodified in the vendored tree) is what turns `torch.jit.script` and
+# `torch.jit.script_method` into identity in that mode.
+#
+# These three tests go through the *Python-facing* path (call
+# `torch.jit.script`, read back what it returns / whether an import raises),
+# not `_C._aten_dispatch` or a dispatch-key table -- the brief's own warning
+# that "golden compares by dispatch key and is structurally blind to a
+# missing spelling" applies to this fix exactly as much as to a kernel: a
+# passing dispatch-key case would prove nothing about whether the decorator
+# a real model file uses actually degrades.
+#
+# All three run in a subprocess with the vendored (shim-backed) `torch` on
+# `PYTHONPATH`, the same shape every other *-road test in this file uses,
+# because there is no way to have both the vendored `torch` and this
+# process's own `_C`-only import coexist as one `torch` module.
+
+_JIT_DEFAULT_SCRIPT = r"""
+import json, sys
+import torch
+out = {}
+out["env_pytorch_jit"] = __import__("os").environ.get("PYTORCH_JIT")
+import torch.jit._state as st
+out["jit_enabled"] = bool(st._enabled)
+
+def f(x):
+    return x + 1
+
+scripted = torch.jit.script(f)
+out["script_is_identity"] = scripted is f
+out["script_result"] = scripted(3)
+
+class M(torch.nn.Module):
+    def forward(self, x):
+        return x + 1
+
+    __constants__ = []
+
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    stub = torch.jit.script_method(M.forward)
+out["script_method_is_identity"] = stub is M.forward
+
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _jit_default_fixture():
+    env = dict(os.environ)
+    env.pop("PYTORCH_JIT", None)  # the point of this test is the *default*
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _JIT_DEFAULT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"jit-default subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_torch_jit_script_defaults_to_returning_the_original_function():
+    if not _ckpt_shim_available():
+        return
+    r = _jit_default_fixture()
+    assert r["env_pytorch_jit"] == "0", r["env_pytorch_jit"]
+    assert r["jit_enabled"] is False, r
+    assert r["script_is_identity"] is True, r
+    assert r["script_result"] == 4, r
+    assert r["script_method_is_identity"] is True, r
+
+
+_GPT_BIGCODE_IMPORT_SCRIPT = r"""
+import json, sys, traceback
+import torch
+out = {}
+try:
+    from transformers import AutoConfig, AutoModelForCausalLM
+    cfg = AutoConfig.for_model(
+        "gpt_bigcode", hidden_size=32, num_hidden_layers=1,
+        num_attention_heads=4, num_key_value_heads=2, vocab_size=100,
+        max_position_embeddings=64, intermediate_size=64,
+    )
+    from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
+        GPTBigCodeForCausalLM,
+    )
+except BaseException:
+    out["import_result"] = "FAILED: " + traceback.format_exc(limit=6)
+else:
+    out["import_result"] = "OK"
+    out["class_name"] = GPTBigCodeForCausalLM.__name__
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _gpt_bigcode_import_fixture():
+    env = dict(os.environ)
+    env.pop("PYTORCH_JIT", None)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _GPT_BIGCODE_IMPORT_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gpt-bigcode-import subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_gpt_bigcode_imports_now_that_scripting_defaults_to_unavailable():
+    """The module-scope `@torch.jit.script` at
+    `modeling_gpt_bigcode.py:54` used to raise `NotImplementedError:
+    SourceRangeFactory.make_range` at import time (docs/TORCHSCRIPT.md).
+    With scripting off by default, it degrades to a plain function and the
+    module imports. This does not mean the architecture forwards -- it
+    still needs `aten.tril` (docs/TORCHSCRIPT.md §6), which is not this
+    file's territory -- only that the TorchScript wall specifically is gone.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    r = _gpt_bigcode_import_fixture()
+    assert r["import_result"] == "OK", r["import_result"]
+    assert r["class_name"] == "GPTBigCodeForCausalLM", r
+
+
+_JIT_EXPLICIT_ENABLE_SCRIPT = r"""
+import json, sys, traceback
+import torch
+out = {}
+try:
+    @torch.jit.script
+    def f(x: int) -> int:
+        return x + 1
+except BaseException as e:
+    out["result"] = "REFUSED: " + type(e).__name__ + ": " + str(e)[:200]
+else:
+    out["result"] = "SCRIPTED"
+json.dump(out, sys.stdout)
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _jit_explicit_enable_fixture():
+    env = dict(os.environ)
+    env["PYTORCH_JIT"] = "1"  # explicit override must NOT be clobbered
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _JIT_EXPLICIT_ENABLE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"jit-explicit-enable subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_an_explicit_pytorch_jit_1_is_not_clobbered_by_the_default():
+    """`os.environ.setdefault` in `bootstrap.py` must not override a caller
+    who explicitly asked for real scripting -- they still get the honest
+    refusal (naming `SourceRangeFactory.make_range`, not a silent identity),
+    which is the other half of the correctness bar this fix has to clear."""
+    if not _ckpt_shim_available():
+        return
+    r = _jit_explicit_enable_fixture()
+    assert r["result"].startswith("REFUSED:"), r
+    assert "make_range" in r["result"], r
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

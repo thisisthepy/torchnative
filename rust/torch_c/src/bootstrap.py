@@ -67,6 +67,36 @@ import sys
 import types
 
 # ---------------------------------------------------------------------------
+# Deliberate default: scripting reports itself unavailable
+# ---------------------------------------------------------------------------
+#
+# There is no TorchScript frontend here (docs/TORCHSCRIPT.md has the size of
+# what is missing -- upstream's `torch/csrc/jit/` is ~213k lines of C++, and
+# the first symbol the frontend needs, `SourceRangeFactory.make_range`, is
+# where this shim has always stopped, naming itself). That is not going to
+# change from inside `bootstrap.py`.
+#
+# Upstream already has an off switch for exactly this: `PYTORCH_JIT=0` (read
+# once by `torch/jit/_state.py:EnabledProxy.__init__`, unmodified in the
+# vendored tree). With it set, `torch.jit.script(obj)` and
+# `torch.jit.script_method(fn)` both take their own `if not _enabled: return
+# obj` branch and hand back the original Python function, unscripted --
+# upstream's own documented fallback, not a behaviour invented here. A
+# `@torch.jit.script` at module scope (`transformers/models/gpt_bigcode/
+# modeling_gpt_bigcode.py:54`, and five other modeling files -- see
+# docs/TORCHSCRIPT.md §5) then imports as a plain function instead of running
+# a compiler frontend that is not built.
+#
+# `setdefault`, not an unconditional set: a caller who explicitly asks for
+# `PYTORCH_JIT=1` still gets the real (and here, `NotImplementedError`-naming)
+# path -- this only changes the answer nobody supplied. Must run before
+# `torch.jit._state` is first imported, which happens during `import torch`
+# itself (`torch/__init__.py` imports `torch.jit` after `from torch._C import
+# *`); `_C`'s own import is what runs this file, so the ordering holds without
+# needing a hook anywhere else.
+os.environ.setdefault("PYTORCH_JIT", "0")
+
+# ---------------------------------------------------------------------------
 # Deliberate omissions
 # ---------------------------------------------------------------------------
 #
