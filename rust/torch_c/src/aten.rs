@@ -1430,6 +1430,52 @@ fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
     opmath_in(storage)
 }
 
+/// Widen a GEMM operand to the accumulation dtype **without flattening the
+/// layout it arrived in**.
+///
+/// `FastDType::fast_to` takes the NEON conversion path only when the tensor is
+/// contiguous and hands everything else to candle's per-element `to_dtype`
+/// (`reduced.rs`). That gate reads as conservative, and it is the opposite:
+/// **every weight in a real forward pass arrives here non-contiguous.**
+/// `bootstrap.py::linear` hands the kernel `t(weight)`, a free transpose
+/// *view*, so the fast conversion `docs/DTYPE.md` added never once fired on
+/// the operand that dominates. It was measured on contiguous tensors, which is
+/// the layout a model never produces.
+///
+/// The fallback costs twice, not once:
+///
+///   * candle's `to_dtype` is the scalar per-element loop, and
+///   * it **materialises a contiguous result**, which throws away the
+///     transpose that `gemm_with_layout_fallback` exists to preserve -- so the
+///     widened operand also loses its `CblasTrans` and is re-gathered. On
+///     SmolLM2-135M's `lm_head` that is 113 MB rewritten per call.
+///
+/// Measured at the decoding shape (`[1,576] @ [576,49152]`, `bfloat16`):
+/// **69.60 ms** through the fallback, against 3.10 ms for our own `float32`
+/// and 1.03 ms for upstream. docs/DTYPE_PERF.md §4.
+///
+/// **Why this cannot move a value.** Conversion is elementwise, so it commutes
+/// with a transpose: transposing is a relabelling of *which* element sits
+/// where and changes no element, and `fast_to` applies the same function to
+/// each. So widening the contiguous base and transposing the result is the
+/// same tensor -- bit for bit, not merely within tolerance -- as widening the
+/// transposed view. Any layout not recognised here stays on the old path.
+fn widen_gemm_operand(t: &Tensor, acc: candle_core::DType) -> candle_core::Result<Tensor> {
+    if t.dtype() == acc || t.layout().is_contiguous() || t.rank() < 2 {
+        return t.fast_to(acc);
+    }
+    // The one layout worth recognising is a plain transpose of a contiguous
+    // tensor, which is exactly what `linear` produces. `t()` swaps the last
+    // two dims, so if the result of that swap is contiguous, the input was
+    // that transpose and nothing else.
+    if let Ok(base) = t.t() {
+        if base.layout().is_contiguous() {
+            return base.fast_to(acc)?.t();
+        }
+    }
+    t.fast_to(acc)
+}
+
 /// Is this candle error "I cannot consume that layout" rather than anything
 /// else?
 ///
@@ -1659,10 +1705,11 @@ fn mm_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
-    let out = lhs
-        .tensor()?
-        .fast_to(acc)
-        .and_then(|l| rhs_inner.fast_to(acc).and_then(|r| l.matmul(&r)))
+    let out = widen_gemm_operand(lhs.tensor()?, acc)
+        .and_then(|l| {
+            widen_gemm_operand(rhs_inner, acc)
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
+        })
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
@@ -1720,12 +1767,9 @@ fn bmm_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
-    let out = lhs
-        .tensor()?
-        .fast_to(acc)
+    let out = widen_gemm_operand(lhs.tensor()?, acc)
         .and_then(|l| {
-            rhs_inner
-                .fast_to(acc)
+            widen_gemm_operand(rhs_inner, acc)
                 .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
         })
         .and_then(|p| p.fast_to(storage))
@@ -2274,12 +2318,9 @@ fn addmm_default(
     let mut acc: Option<Tensor> = None;
     if !alpha_zero {
         let mat2_inner = mat2.tensor()?;
-        let product = mat1
-            .tensor()?
-            .to_dtype(acc_dtype)
+        let product = widen_gemm_operand(mat1.tensor()?, acc_dtype)
             .and_then(|l| {
-                mat2_inner
-                    .to_dtype(acc_dtype)
+                widen_gemm_operand(mat2_inner, acc_dtype)
                     .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
             })
             .map_err(|e| candle_err(OP, e))?;
@@ -2448,12 +2489,9 @@ fn baddbmm_default(
     // The `?` on each `tensor()` is the meta change: a meta tensor has no bytes
     // to read, and the type says so rather than each kernel remembering to.
     let batch2_inner = batch2.tensor()?;
-    let product = batch1
-        .tensor()?
-        .to_dtype(acc_dtype)
+    let product = widen_gemm_operand(batch1.tensor()?, acc_dtype)
         .and_then(|l| {
-            batch2_inner
-                .to_dtype(acc_dtype)
+            widen_gemm_operand(batch2_inner, acc_dtype)
                 .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
         })
         .map_err(|e| candle_err(OP, e))?;
@@ -4201,10 +4239,10 @@ fn matmul_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
-    let out = lhs
-        .tensor()?
-        .fast_to(acc)
-        .and_then(|l| rhs_inner.fast_to(acc).and_then(|r| batched_matmul(&l, &r)))
+    let out = widen_gemm_operand(lhs.tensor()?, acc)
+        .and_then(|l| {
+            widen_gemm_operand(rhs_inner, acc).and_then(|r| batched_matmul(&l, &r))
+        })
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
@@ -10950,4 +10988,90 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(aten_implemented_awaiting_golden, m)?)?;
     m.add_function(wrap_pyfunction!(aten_all_implemented, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod widen_tests {
+    use super::widen_gemm_operand;
+    use candle_core::{DType, Device, Tensor};
+
+    /// Widening a **transposed** operand is bit-for-bit what candle's own
+    /// `to_dtype` produces on that same view.
+    ///
+    /// This is the equality the fast path rests on, and it is the one a wrong
+    /// transpose would break: taking `t()` of the base and forgetting to put it
+    /// back would still return a tensor of the right *shape* whenever the
+    /// operand is square, so a square-only check could not fail. The shapes
+    /// here are deliberately non-square, and the values deliberately need real
+    /// rounding (`/7.0` is not representable in either reduced format).
+    #[test]
+    fn widening_a_transposed_operand_matches_candle_bit_for_bit() {
+        let dev = Device::Cpu;
+        let (rows, cols) = (37usize, 91usize); // non-square, not a multiple of 8
+        let src: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 - 900.0) / 7.0)
+            .collect();
+        let base = Tensor::from_slice(&src, (rows, cols), &dev).unwrap();
+
+        for reduced in [DType::F16, DType::BF16] {
+            let stored = base.to_dtype(reduced).unwrap();
+            let view = stored.t().unwrap(); // what `linear` hands the kernel
+            assert!(
+                !view.layout().is_contiguous(),
+                "the case under test must be non-contiguous"
+            );
+
+            let mine = widen_gemm_operand(&view, DType::F32).unwrap();
+            let theirs = view.to_dtype(DType::F32).unwrap();
+
+            assert_eq!(mine.dims(), theirs.dims());
+            assert_eq!(
+                mine.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                theirs.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                "{reduced:?} transposed widening disagrees with candle"
+            );
+        }
+    }
+
+    /// The layout survives. If the widened operand came back contiguous the
+    /// values would still be right and the whole point would be gone -- the
+    /// GEMM would lose `CblasTrans` and re-gather the weight, which is the
+    /// 69.60 ms that docs/DTYPE_PERF.md §4 measured.
+    #[test]
+    fn widening_a_transposed_operand_keeps_it_a_transposed_view() {
+        let dev = Device::Cpu;
+        let base = Tensor::from_slice(
+            &(0..(8 * 5)).map(|i| i as f32).collect::<Vec<_>>(),
+            (8usize, 5usize),
+            &dev,
+        )
+        .unwrap();
+        let view = base.to_dtype(DType::BF16).unwrap().t().unwrap();
+        let widened = widen_gemm_operand(&view, DType::F32).unwrap();
+        assert_eq!(widened.dtype(), DType::F32);
+        assert!(
+            !widened.layout().is_contiguous(),
+            "the transpose was flattened -- the operand lost its CblasTrans"
+        );
+    }
+
+    /// A layout that is neither contiguous nor a plain transpose still gets the
+    /// right values. It falls through to candle, and that arm has to stay
+    /// correct rather than merely unreached.
+    #[test]
+    fn an_unrecognised_layout_still_widens_correctly() {
+        let dev = Device::Cpu;
+        let src: Vec<f32> = (0..60).map(|i| i as f32 / 3.0).collect();
+        let base = Tensor::from_slice(&src, (10usize, 6usize), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        let strided = base.narrow(0, 2, 5).unwrap().narrow(1, 1, 4).unwrap();
+        let mine = widen_gemm_operand(&strided, DType::F32).unwrap();
+        let theirs = strided.to_dtype(DType::F32).unwrap();
+        assert_eq!(
+            mine.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            theirs.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
 }
