@@ -381,15 +381,23 @@ s = slice.Tensor(y, 0, 1, 3, 1); copy_(s, v)   ->  y unchanged
 ```
 
 Running upstream's sequence would therefore report success and write nothing, which is the
-silent-divergence direction DESIGN.md §5 exists to keep out. So it refuses by name and says what
-is missing: **mutable views**. `test_setitem_refuses_the_basic_index_write_rather_than_dropping_it`
-asserts the probe above rather than the refusal alone, so if views ever become mutable the test
-goes red and points at the branch to delete.
+silent-divergence direction DESIGN.md §5 exists to keep out. So it refused by name and said what
+was missing: **mutable views**.
 
-**`aten.index_put_.default` refuses a bool-mask index**, where upstream accepts one: the kernel is
-written on top of `scatter`, which wants an int32/int64 index
-(`Expected dtype int32 or int64 for index, got bool`). A second kernel gap, recorded as a
-`c_error` golden case rather than left uncased.
+> **Fixed since.** Views are mutable now — `write_into` scatters into the positions the
+> destination's own `Layout` addresses, so an in-place write reaches the base instead of rebinding
+> the wrapper ([`docs/VIEWS.md`](VIEWS.md) §6). The test that pinned the refusal is now
+> `test_setitem_writes_the_basic_index_through_to_the_base` and asserts the write. What still
+> refuses is a `step != 1` slice, for a different reason: candle's `Tensor::from_storage` builds
+> only contiguous layouts, so there is nothing to construct a stepped view with.
+
+**`aten.index_put_.default` refused a bool-mask index**, where upstream accepts one: the kernel
+was written on top of `scatter`, which wants an int32/int64 index
+(`Expected dtype int32 or int64 for index, got bool`).
+
+> **Fixed since.** The kernel does its own address arithmetic and masks lower through
+> `mask_to_indices`. The same change lifted the rank-1 restriction; 33 behaviours were probed
+> against upstream and all 33 match, error text included.
 
 **`aten.index_put_.default` also refuses anything but 1-D self/index/values**, which is why
 `x[t] = 5` (a Python number, lifted to a 0-d tensor the way upstream lifts it) refuses and

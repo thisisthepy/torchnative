@@ -149,9 +149,9 @@ loads on 3.13, 3.14 and later without a rebuild.
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>122</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>3037 / 3037</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>225</b></td></tr>
-<tr><td>Signature and schema tables</td><td><b>4233</b> entries checked against upstream</td></tr>
+<tr><td>Golden comparison cases</td><td><b>3075 / 3075</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>229</b></td></tr>
+<tr><td>Signature and schema tables</td><td><b>4234</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>20 of 20</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>actually forward</b></td><td><b>13 of 20</b> on this shim, against 20 of 20 on upstream. The two numbers are different claims and the gap is real — see below</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
