@@ -166,6 +166,11 @@ generator stream — a seeded run reproduces exactly.
 
 **Not working yet**
 
+- **`torch.randn` and `torch.rand` refuse**, which is worth saying first because it is the line
+  most people type first. The randomness underneath them is present and correct — `torch.empty(2,
+  3).normal_()` and `.uniform_()` both work, are bit-identical to upstream, and reproduce under a
+  seed; `torch.randint` works. What is missing is only the factory spelling, absent from the
+  overload table. Until it is wired, `torch.empty(shape).normal_()` is the exact equivalent.
 - Mixtral is the one incomplete architecture — `_grouped_mm`, an offset-based grouped GEMM
   with no equivalent here yet.
 - `torch.compile` does not work; it stops inside Dynamo. Eager execution is the supported path.
@@ -205,7 +210,7 @@ only exists on a platform. Every ✅ has a run behind it.
 | installs | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
 | `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
 | computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 |
-| **on PyPI `0.0.2a0`** | ✅ | ✅ | ✅ | — | — | — |
+| **on PyPI `0.0.3a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ | ✅ *Node* |
 
 The last row is why the columns differ. iOS, Linux and Windows have no runtime on this machine —
@@ -343,7 +348,10 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 pip install torchnative
 ```
 
-`0.0.2a0` ships three platform wheels, all `cp313-abi3` — one binary per platform, loadable by
+Every published version is a pre-release, so if your resolver is configured to skip those, ask for
+one by name: `pip install --pre torchnative`.
+
+`0.0.3a0` ships five platform wheels, all `cp313-abi3` — one binary per platform, loadable by
 CPython 3.13 and every later release. Each carries the `_C` extension and the vendored upstream
 tree, so `import torch` resolves to *this* build.
 
@@ -354,6 +362,18 @@ tree, so `import torch` resolves to *this* build.
 | `macosx_11_0_arm64` | ✅ | ✅ | ✅ | ✅ |
 | `android_21_arm64_v8a` | ✅ | ✅ | ✅ | ✅ |
 | `ios_12_0_arm64_iphoneos` | ✅ | — | — | — |
+| `manylinux_2_17_x86_64` | ✅ | — | — | — |
+| `win_amd64` | ✅ | — | — | — |
+
+The iOS simulator wheel is built but deliberately not published: it loads only under a simulator,
+so on PyPI it would be a trap for anyone whose resolver reached it.
+
+Linux and Windows are in the same position as iOS and for the same reason — this machine has no
+Linux or Windows runtime and no container tooling, so verification stops at the artefact. Every
+import in the Linux wheel resolves, and every import in the Windows one is attributed to a
+naming DLL, which is the stronger of the two checks because PE records a DLL per import where ELF
+records only versioned ones ([`docs/LINUX.md`](docs/LINUX.md),
+[`docs/WINDOWS.md`](docs/WINDOWS.md)).
 
 macOS is checked in a clean virtualenv and Android on a device, unpacked into its CPython's
 `site-packages` — in both, `torch.__file__` lands inside the install, `aten.mm` returns the right
@@ -372,7 +392,7 @@ answer and an `nn.Linear` forward runs ([`docs/WHEEL.md`](docs/WHEEL.md) §7).
 > [!NOTE]
 > `0.0.1a0` is still on PyPI and does **not** work — it is `py3-none-any` and carries the
 > `torchnative` skeleton alone, no `_C` and no `torch`, so it installs cleanly and then fails to
-> import. Ask for `0.0.2a0` or later.
+> import. Ask for `0.0.3a0` or later.
 >
 > There is no source distribution. Building needs a Rust toolchain and a vendoring step that
 > `pip` cannot drive, so an sdist would install and then fail; the recipe is below instead.
