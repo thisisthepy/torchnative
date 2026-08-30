@@ -149,7 +149,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>119</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>2811 / 2811</b> — values, shapes, dtypes</td></tr>
+<tr><td>Golden comparison cases</td><td><b>2843 / 2843</b> — values, shapes, dtypes, positional <i>and</i> keyword</td></tr>
 <tr><td>Smoke tests</td><td><b>211</b></td></tr>
 <tr><td>Signature and schema tables</td><td><b>4203</b> entries checked against upstream</td></tr>
 <tr><td>Architectures complete</td><td><b>19 of 20</b> measured — Mixtral needs <code>_grouped_mm</code> alone</td></tr>
