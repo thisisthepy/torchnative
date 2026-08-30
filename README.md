@@ -150,7 +150,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>133</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>3302 / 3302</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>242</b></td></tr>
+<tr><td>Smoke tests</td><td><b>245</b></td></tr>
 <tr><td>Signature and schema tables</td><td><b>4331</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>20 of 20</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>actually forward</b></td><td><b>19 of 20</b> on this shim, against 20 of 20 on upstream. Only GPT-BigCode is left, on the TorchScript frontend</td></tr>
@@ -164,9 +164,9 @@ loads on 3.13, 3.14 and later without a rebuild.
 MPT · StarCoder2 · StableLM · OLMo · Phi · Mixtral · BERT · BLOOM · Cohere · Falcon · Mamba ·
 Persimmon
 
-**Does not forward** (1): GPT-BigCode, which calls `torch.jit.script` at module scope and so
-needs the TorchScript frontend — a large un-attempted piece, not the abi3 wall
-([`docs/DYNAMO.md`](docs/DYNAMO.md) §12)
+**Does not forward** (1): GPT-BigCode. Its `torch.jit.script` wall is gone — the shim takes
+upstream's own `PYTORCH_JIT=0` path, under which `torch.jit.script(f) is f` — and it now stops one
+step later on `torch.tril`, a single missing kernel ([`docs/TORCHSCRIPT.md`](docs/TORCHSCRIPT.md))
 
 The two rows measure different things, and conflating them is a mistake this README made. The
 coverage sweep traces a forward pass **on upstream torch** and asks whether every operator it
