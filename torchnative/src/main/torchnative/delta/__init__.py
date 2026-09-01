@@ -35,13 +35,22 @@ carrying a label:
 ======================================================  ========================
 can this delta be discarded, and at what cost           :meth:`Delta.revert`,
                                                         :attr:`Delta.nbytes`
-does it survive a process restart                       :meth:`Delta.persist`
+does it survive a process restart                       :meth:`Delta.persist`,
+                                                        :meth:`Delta.load`
 can it leave the device                                 :meth:`Delta.publish`
 ======================================================  ========================
 
-Two of the three refuse today. They refuse with a check the reader can run,
-not with a claim about the world, because a refusal that names a fact goes
-stale the day the fact changes and this repository has paid for that six times.
+**Two answers now, and one refusal.** ``persist``/``load`` write and read a
+delta as safetensors and the round trip is bit-identical; ``publish`` still
+refuses, because sending needs a second rank and there is no backend here that
+admits one. It refuses with a check the reader can run rather than with a claim
+about the world, because a refusal that names a fact goes stale the day the
+fact changes and this repository has paid for that six times.
+
+``persist`` deliberately does **not** go through ``torch.save``.
+docs/BACKWARD.md §14 measures what that would need and why it is the wrong
+instrument: its blocker is a storage object that aliases its tensor, which this
+stack does not have and cannot honestly fake.
 """
 
 from __future__ import annotations
@@ -203,21 +212,134 @@ class Delta:
         self.value = None
         return self
 
-    # -- the two destinations that do not exist yet ------------------------
+    # -- persistence -------------------------------------------------------
+    #
+    # `torch.save` is **not** what this uses, and that is a finding rather than
+    # a convenience. docs/BACKWARD.md §14 sizes it: two real items and five
+    # one-liners, and the substantial one -- `Tensor.untyped_storage()` -- is a
+    # semantic problem and not a kernel. Upstream a storage *aliases* its
+    # tensor; here a storage is a byte buffer that `set_` copies out of
+    # (`storage.rs`'s module docstring), so `untyped_storage()` on this stack
+    # would hand back a copy that silently does not write through.
+    # `torch.save` would not notice, because it only reads -- and every other
+    # caller would.
+    #
+    # What a delta on the wire actually needs is "tensor -> little-endian
+    # bytes" and a container, and safetensors is a container that is a JSON
+    # header and a concatenated blob: no pickle, no zip, no storage object. The
+    # reading side already works on this stack (docs/CKPT.md §1), so a delta
+    # written here is read back by the same library upstream reads it with.
 
-    def persist(self, path):
-        """Write this delta somewhere it survives the process. Refuses today.
+    #: safetensors dtype names. Only the dtypes a delta can hold -- a covered
+    #: parameter is floating point by construction, because `wrt_set` in
+    #: tape.rs drops non-floating constants from the gradient path.
+    _ST_NAME = {"torch.float32": "F32", "torch.float64": "F64",
+                "torch.float16": "F16", "torch.bfloat16": "BF16"}
+    #: struct codes for the dtypes that have one. The reduced-precision two do
+    #: not and are written through their bit pattern below.
+    _ST_PACK = {"F32": "f", "F64": "d"}
 
-        The refusal names a check rather than a state of the world, because a
-        refusal that names a fact goes stale silently.
+    @staticmethod
+    def _flat(values):
+        out = []
+
+        def walk(v):
+            if isinstance(v, list):
+                for item in v:
+                    walk(item)
+            else:
+                out.append(v)
+
+        walk(values)
+        return out
+
+    @classmethod
+    def _bytes(cls, tensor):
+        """One tensor as little-endian bytes.
+
+        Through ``tolist()``, which is the only way out of this shim that is
+        public -- ``numpy``, ``data_ptr`` and ``untyped_storage`` all refuse --
+        and is what docs/SEQLEN.md's logits sha256 has always used. It is a
+        conversion rather than a memcpy, and that is stated rather than hidden:
+        it costs a Python float per element, so this is a road for a *delta*
+        (137 KiB on a Tent-adapted SmolLM2, docs/ADAPT.md §5.2) and not for a
+        checkpoint.
         """
-        raise NotImplementedError(
-            "torchnative.delta: a delta cannot outlive this process yet -- "
-            "writing one needs a tensor serialiser.\n"
-            "Check: torch.save({'w': next(iter(delta.value.values()))}, path). "
-            "If that returns instead of raising, serialisation has landed and "
-            "this refusal is stale; write the bytes and delete it."
-        )
+        import struct
+
+        key = str(tensor.dtype)
+        name = cls._ST_NAME.get(key)
+        if name is None:
+            raise NotImplementedError(
+                "torchnative.delta: no safetensors dtype for %s; a delta holds "
+                "floating parameters and this is not one of %s"
+                % (key, sorted(cls._ST_NAME))
+            )
+        flat = cls._flat(tensor.tolist())
+        code = cls._ST_PACK.get(name)
+        if code is not None:
+            return name, struct.pack("<%d%s" % (len(flat), code), *flat)
+        # `float16`/`bfloat16`: the value came out of a tensor that already
+        # holds it at that precision, so `tolist()` is exact and the only
+        # question left is the bit layout. `bfloat16` is the top 16 bits of the
+        # `float32` pattern; `float16` has a struct code of its own.
+        if name == "BF16":
+            return name, b"".join(struct.pack("<f", v)[2:] for v in flat)
+        return name, struct.pack("<%de" % len(flat), *flat)
+
+    def persist(self, path, what="value"):
+        """Write this delta where it survives the process, and return the path.
+
+        ``what`` selects ``"value"`` -- the offset, which is what a send would
+        carry -- or ``"base"``, which is what a revert would need. The format
+        is safetensors, for the reason the comment above gives; :meth:`load`
+        reads it back and docs/BACKWARD.md §14.4 measures that round trip as
+        bit-identical on a real adapted checkpoint.
+        """
+        import json
+        import struct
+
+        if what not in ("value", "base"):
+            raise ValueError(
+                "torchnative.delta: persist(what=%r) -- 'value' (the offset) "
+                "or 'base' (what a revert needs)" % (what,)
+            )
+        table = getattr(self, what)
+        if table is None:
+            raise ValueError(
+                "torchnative.delta: this delta has no offset to write; call "
+                "record(model) first, or persist(what='base').\n"
+                "Check: delta.value is None."
+            )
+        header, blob, offset = {}, bytearray(), 0
+        for name in sorted(table):
+            dtype, raw = self._bytes(table[name])
+            header[name] = {"dtype": dtype,
+                            "shape": list(table[name].shape),
+                            "data_offsets": [offset, offset + len(raw)]}
+            blob += raw
+            offset += len(raw)
+        # safetensors wants the header padded to an 8-byte boundary.
+        encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        encoded += b" " * ((8 - len(encoded) % 8) % 8)
+        with open(path, "wb") as handle:
+            handle.write(struct.pack("<Q", len(encoded)))
+            handle.write(encoded)
+            handle.write(bytes(blob))
+        return path
+
+    @staticmethod
+    def load(path):
+        """``{name: tensor}`` from a file :meth:`persist` wrote.
+
+        Deliberately **not** a ``Delta``: what comes off the wire is a table of
+        tensors, and which model it belongs on -- and whether it is a base or
+        an offset -- is the caller's knowledge and not the file's. Federated
+        aggregation wants the table, not a reconstructed object.
+        """
+        from safetensors.torch import load_file
+
+        return load_file(path, device="cpu")
 
     def publish(self, group=None):
         """Send this delta to an aggregator. Refuses today.

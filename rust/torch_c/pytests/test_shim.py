@@ -14370,6 +14370,25 @@ def _tape_case_bodies():
         [2, 3], lambda x: s(d("aten.constant_pad_nd.default", x, [1, 2], 0.0)))
     cases["aten.cat.default"] = shape_case(
         [2, 3], lambda x: s(d("aten.cat.default", [x, d("aten.mul.Scalar", x, 2.0)], 1)))
+    # `split` of a 7-long axis by 3 gives chunks of 3, 3 and **1** -- the short
+    # last chunk, deliberately, because equal chunks let a rule that recovered
+    # the widths from the first one pass. All three are used, which is GPT-2's
+    # shape (a fused qkv projection unpacked three ways); the zero a rule has to
+    # supply for an *unused* chunk is what `_split_partial` below covers, and
+    # that one cannot be a case here because a case checks one gradient.
+    def _split(x):
+        # Split along dim **1**, not dim 0. A case that splits along 0 cannot
+        # tell the split axis from the `cat` axis, because the rule's `cat`
+        # would then be right for the wrong reason -- a fault that always
+        # concatenated along 0 passed until this was moved off it.
+        a, b, c = d("aten.split.Tensor", x, 3, 1)
+        # Scaled differently and reassembled in the wrong order on purpose:
+        # `cat(split(x))` is the identity, and its gradient is the identity's
+        # too, so a rule that ignored the chunk widths entirely would pass it.
+        return s(d("aten.cat.default", [d("aten.mul.Scalar", c, 3.0),
+                                        d("aten.mul.Scalar", b, 2.0), a], 1))
+
+    cases["aten.split.Tensor"] = shape_case([2, 7], _split)
 
     # -- elementwise -------------------------------------------------------
     other = _tape_f64(_tape_ramp(6, 0.5, 2.5), [2, 3])
@@ -14417,6 +14436,21 @@ def _tape_case_bodies():
         [2, 3], lambda x: d("aten.exp.default", d("aten.mean.default", x)))
     cases["aten.mean.dim"] = shape_case(
         [2, 3], lambda x: s(d("aten.mean.dim", x, [-1], True)))
+
+    # -- normalisation -----------------------------------------------------
+    # `weight` and `bias` are built **from the input**, so all three of the
+    # rule's gradients reach the one gradient this case checks. With constant
+    # affine parameters the case would exercise `grad_input` alone and
+    # `grad_weight`/`grad_bias` could be anything at all -- which is
+    # docs/BACKWARD.md §7's T8 (an attention case whose input was the query
+    # alone never entered the grouped-query fold) in a second place. The two are
+    # built by *different* functions of x so that swapping them is visible.
+    def _layer_norm(x):
+        w = d("aten.mean.dim", x, [0, 1], False)
+        b = d("aten.mean.dim", d("aten.sin.default", x), [0, 1], False)
+        return s(d("aten.native_layer_norm.default", x, [4], w, b, 1e-5)[0])
+
+    cases["aten.native_layer_norm.default"] = shape_case([2, 3, 4], _layer_norm)
 
     # -- matmul ------------------------------------------------------------
     rhs = _tape_f64(_tape_ramp(12, 0.2, 1.2), [3, 4])
@@ -14517,6 +14551,128 @@ def _tape_flat(t):
 
     walk(t.tolist())
     return flat
+
+
+def test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached():
+    """A chunk nothing differentiated still occupies its width in the input.
+
+    The gradient case above cannot check this and says so: it uses all three
+    chunks, which is also GPT-2's shape, so **the model that needs the rule is
+    the model that cannot exercise its zero**. Here only the middle chunk is
+    used, so the other two have to arrive as zeros of the right width -- a rule
+    that dropped them would return a `[2, 3]` gradient for a `[2, 7]` input,
+    and one that padded them wrongly would put the live rows in the wrong
+    columns.
+    """
+    d = _C._aten_dispatch
+    x = _tape_f64(_tape_ramp(14), [2, 7])
+    _C._capture_begin([x])
+    try:
+        chunks = d("aten.split.Tensor", x, 3, 1)
+        out = _tape_scalarise(chunks[1])
+        trace = _C._capture_end(out)
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    g = trace.backward([x])["inputs"][0]
+    assert list(g.shape) == [2, 7], list(g.shape)
+    got = [row for row in g.tolist()]
+    # Columns 3..5 are the middle chunk and are the only ones with a gradient.
+    for row in got:
+        assert row[0] == row[1] == row[2] == 0.0, row
+        assert row[6] == 0.0, row
+        assert all(v > 0.0 for v in row[3:6]), row
+    # And the live columns are exp(x) there, which is what pins that they are
+    # the *middle* chunk's and not some other three.
+    import math
+    for r, row in enumerate(x.tolist()):
+        for c in range(3, 6):
+            assert abs(got[r][c] - math.exp(row[c])) < 1e-9, (r, c, got[r][c])
+
+
+def test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row():
+    """`padding_idx` is a gradient-only semantic, so no oracle in this file
+    can check it.
+
+    Finite differences cannot: the *forward* reads the padding row like any
+    other, so perturbing it changes the output and the oracle would report a
+    gradient the correct rule deliberately does not produce. That is why the
+    embedding gradient case carries no `padding_idx` and why two faults --
+    dropping the zeroing, and applying its mask against the wrong axis -- went
+    uncaught until this test existed.
+
+    What can be checked without an oracle is the structural claim: the padding
+    row is exactly zero, every other used row is not, and the used rows are
+    unchanged by the presence of `padding_idx`. docs/BACKWARD.md §13.1 checks
+    the same thing against upstream on a real table.
+    """
+    d = _C._aten_dispatch
+    table = _tape_f64(_tape_ramp(12), [3, 4])
+    ids = _tape_i64([2, 1, 2, 0], [2, 2])
+
+    def run(padding):
+        _C._capture_begin([table])
+        try:
+            args = [table, ids] + ([padding] if padding is not None else [])
+            out = _tape_scalarise(d("aten.embedding.default", *args))
+            trace = _C._capture_end(out)
+        except BaseException:
+            try:
+                _C._capture_abandon()
+            except RuntimeError:
+                pass
+            raise
+        return trace.backward([table])["inputs"][0].tolist()
+
+    plain = run(None)
+    padded = run(1)
+    assert all(any(v != 0.0 for v in row) for row in plain), plain
+    # Row 1 is the padding row: it is used by the ids and gets nothing.
+    assert padded[1] == [0.0, 0.0, 0.0, 0.0], padded[1]
+    # Rows 0 and 2 are untouched by the padding, and row 2 is the repeated one
+    # so it still carries two contributions.
+    assert padded[0] == plain[0], (padded[0], plain[0])
+    assert padded[2] == plain[2], (padded[2], plain[2])
+    assert any(v != 0.0 for v in padded[0]), padded[0]
+    assert any(v != 0.0 for v in padded[2]), padded[2]
+
+
+def test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for():
+    """`grad_input` narrows back to the input's dtype.
+
+    `native_layer_norm` is the one op here where mixed precision is *supported*
+    rather than an error -- `aten.rs` measured `float32` parameters in front of
+    a `bfloat16` input giving `float32` statistics and a `bfloat16` output. The
+    rule reads those statistics, so without a narrowing step it would hand back
+    a `float32` gradient for a `bfloat16` input: a widening no forward asked
+    for, and one the `float64` finite-difference oracle cannot see because
+    everything there is already one dtype.
+    """
+    d = _C._aten_dispatch
+    x = _C._tensor_from_flat(_tape_ramp(24), [2, 3, 4], _C.bfloat16)
+    w = _C._tensor_from_flat(_tape_ramp(4, 0.5, 1.5), [4], _C.float32)
+    b = _C._tensor_from_flat(_tape_ramp(4, -0.5, 0.5), [4], _C.float32)
+    _C._capture_begin([x])
+    try:
+        out = d("aten.native_layer_norm.default", x, [4], w, b, 1e-5)
+        trace = _C._capture_end(_tape_scalarise(out[0]))
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    # The forward's own promise first, so a failure here is not read as the
+    # rule's: the statistics follow the parameters, the output the input.
+    assert out[0].dtype == _C.bfloat16, out[0].dtype
+    assert out[1].dtype == _C.float32, out[1].dtype
+    assert out[2].dtype == _C.float32, out[2].dtype
+    g = trace.backward([x])["inputs"][0]
+    assert g.dtype == _C.bfloat16, ("grad_input widened to %s" % g.dtype)
+    assert list(g.shape) == [2, 3, 4], list(g.shape)
 
 
 def test_the_tape_has_a_gradient_case_for_every_rule_it_claims():
@@ -14703,10 +14859,11 @@ def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
 #
 # The model is built from a deterministic generator on both sides rather than
 # from an RNG, for the reason `_ckpt_det` gives: what is compared must not
-# depend on which implementation's RNG ran. It is a *RMSNorm* model on purpose;
-# docs/ADAPT.md §8 records that an `nn.LayerNorm` one cannot take a step here
-# at all, and `test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule`
-# is where that is pinned.
+# depend on which implementation's RNG ran. It is a *RMSNorm* model because
+# that is the one compared against upstream here; the `nn.LayerNorm` variant of
+# the same model is built beside it by `build_ln` and adapts too, which is what
+# `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
+# docs/ADAPT.md §8 recorded the round in which it could not.
 
 _ADAPT_MODEL_SRC = r'''
 V, H, LR, STEPS = 24, 12, 4.0, 10
@@ -14758,7 +14915,7 @@ def entropy_of(logits):
 '''
 
 _ADAPT_ROAD_SCRIPT = (
-    "import json, sys, traceback\n"
+    "import json, os, sys, traceback\n"
     "import torch\n"
     "import torch.nn as nn\n"
     + _ADAPT_MODEL_SRC
@@ -14840,32 +14997,113 @@ except Exception as e:
 else:
     out["selects_nothing"] = "ACCEPTED"
 
-# --- what the tape cannot carry ------------------------------------------
+# --- an nn.LayerNorm model, which the tape now carries --------------------
 class LNLM(TinyLM):
     def __init__(self):
         super().__init__()
         self.norm1 = nn.LayerNorm(H)
         self.norm2 = nn.LayerNorm(H)
-wl = adapt.wrap(LNLM().eval(), method=adapt.Tent(), lr=LR).online()
-out["layernorm_selected"] = list(wl.online_parameters)
-try:
-    wl.step(ids)
-except NotImplementedError as e:
-    out["layernorm"] = str(e)
-except Exception as e:
-    out["layernorm"] = "%s: %s" % (type(e).__name__, str(e))
-else:
-    out["layernorm"] = "ACCEPTED"
 
-# --- the two destinations a delta cannot reach ---------------------------
+def build_ln():
+    """The same deterministic weights `build()` uses, with `nn.LayerNorm` in
+    place of the RMSNorm -- so the only difference between this model and the
+    supported one is the op the gradient has to pass through."""
+    m = LNLM()
+    with torch.no_grad():
+        m.embed.weight.copy_(torch.tensor(_adet(V * H, 3)).reshape(V, H))
+        m.fc.weight.copy_(torch.tensor(_adet(H * H, 5)).reshape(H, H))
+        m.fc.bias.copy_(torch.tensor(_adet(H, 7)))
+        m.head.weight.copy_(torch.tensor(_adet(V * H, 11)).reshape(V, H))
+        m.norm1.weight.copy_(torch.tensor([1.0 + v for v in _adet(H, 13)]))
+        m.norm2.weight.copy_(torch.tensor([1.0 + v for v in _adet(H, 17)]))
+        m.norm1.bias.copy_(torch.tensor(_adet(H, 19)))
+        m.norm2.bias.copy_(torch.tensor(_adet(H, 23)))
+    return m.eval()
+
+ml = build_ln()
+wl = adapt.wrap(ml, method=adapt.Tent(), lr=LR).online()
+out["layernorm_selected"] = list(wl.online_parameters)
+out["layernorm_base"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
+try:
+    out["layernorm_history"] = [wl.step(ids)[1] for _ in range(STEPS)]
+except Exception as e:
+    out["layernorm_history"] = "%s: %s" % (type(e).__name__, str(e))
+out["layernorm_adapted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
+wl.revert()
+out["layernorm_reverted"] = {n: ml.state_dict()[n].tolist() for n in out["layernorm_selected"]}
+# The wrong sign on the same model: if the fall above is the gradient's
+# direction rather than any perturbation of a LayerNorm's affine parameters,
+# negating the objective has to take it back up.
+wla = adapt.wrap(build_ln(), method=AntiTent(), lr=LR).online()
+out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
+
+# --- a rule that really is missing, so the refusal keeps being exercised ---
+# The point of this arm is the *reason*, not the refusal: it asserts that the
+# message names an op and that the op it names is genuinely absent from
+# `_tape_rules()`. When `abs` gains a rule this fails on its own premise and
+# says so, rather than going quietly stale -- which is what the previous
+# version of this block did the day `native_layer_norm` landed.
+NO_RULE_OP = "aten.abs.default"
+out["no_rule_op"] = NO_RULE_OP
+out["no_rule_op_is_unruled"] = NO_RULE_OP not in torch._C._tape_rules()
+
+class AbsTent(adapt.Tent):
+    def objective(self, outputs):
+        return super().objective(outputs.abs())
+
+wn = adapt.wrap(build_ln(), method=AbsTent(), lr=LR).online()
+try:
+    wn.step(ids)
+except NotImplementedError as e:
+    out["no_rule"] = str(e)
+except Exception as e:
+    out["no_rule"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["no_rule"] = "ACCEPTED"
+
+# --- persist: written, and read back -------------------------------------
+# The delta that is written is a *recorded* one from the Tent run above, not a
+# zero delta: a round trip that only ever carries zeros cannot tell a working
+# writer from one that writes the right number of zero bytes.
+mp = build()
+wp = adapt.wrap(mp, method=adapt.Tent(), lr=LR).online()
+for _ in range(3):
+    wp.step(ids)
+import tempfile
+_fd, _path = tempfile.mkstemp(suffix=".safetensors")
+os.close(_fd)
+try:
+    wp.adapted.persist(_path)
+    back = Delta.load(_path)
+    out["persist_size"] = os.path.getsize(_path)
+    out["persist_keys"] = sorted(back)
+    out["persist_written"] = {n: wp.adapted.value[n].tolist() for n in sorted(back)}
+    out["persist_read"] = {n: back[n].tolist() for n in sorted(back)}
+    out["persist_shapes"] = {n: list(back[n].shape) for n in sorted(back)}
+    out["persist_dtypes"] = {n: str(back[n].dtype) for n in sorted(back)}
+    out["persist"] = "OK"
+except Exception as e:
+    out["persist"] = "%s: %s" % (type(e).__name__, str(e))
+finally:
+    os.unlink(_path)
+
+# A delta with no recorded offset has nothing to write, and says so rather
+# than writing an empty file.
+try:
+    Delta.over(build(), ["norm1.weight"]).persist("/tmp/nowhere-delta")
+except Exception as e:
+    out["persist_unrecorded"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["persist_unrecorded"] = "ACCEPTED"
+
+# --- the destination a delta still cannot reach --------------------------
 d = Delta.over(build(), ["norm1.weight"])
-for name in ("persist", "publish"):
-    try:
-        getattr(d, name)(*(("/tmp/nowhere",) if name == "persist" else ()))
-    except NotImplementedError as e:
-        out[name] = str(e)
-    else:
-        out[name] = "ACCEPTED"
+try:
+    d.publish()
+except NotImplementedError as e:
+    out["publish"] = str(e)
+else:
+    out["publish"] = "ACCEPTED"
 
 # --- stage declarations ---------------------------------------------------
 class Stage0(adapt.Method):
@@ -15086,35 +15324,75 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
         assert r["rearm_reverted"][n] == r["rearm_base"][n], n
 
 
-def test_a_delta_names_a_check_for_the_destinations_it_cannot_reach():
-    """The other two of docs/DESIGN.md §3's three lifetime questions.
+def test_a_delta_is_written_and_read_back_bit_for_bit():
+    """docs/DESIGN.md §3's second lifetime question, answered by doing it.
 
-    Both refuse, and what is pinned is the *shape* of the refusal: it names a
-    line the reader can run, so that the day serialisation or a second rank
-    lands, the refusal is discovered by someone running the check rather than
-    by nobody. A refusal naming a fact has gone stale six times here.
+    `Delta.persist` writes safetensors rather than going through `torch.save`,
+    and docs/BACKWARD.md §14 is why: `torch.save`'s blocker is a storage object
+    that aliases its tensor, which this stack does not have.
+
+    What is asserted is **equality of the values**, not that a file appeared.
+    A writer that emitted the right number of zero bytes would produce a file
+    of exactly the right size with the right keys, shapes and dtypes -- so the
+    delta written is a *recorded* one from three real Tent steps, and every
+    element has to come back.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert "Check: torch.save(" in r["persist"], r["persist"]
-    assert "cannot outlive this process" in r["persist"], r["persist"]
+    assert r["persist"] == "OK", r["persist"]
+    assert r["persist_keys"] == ["norm1.weight", "norm2.weight"], r["persist_keys"]
+    assert r["persist_written"] == r["persist_read"], (
+        r["persist_written"], r["persist_read"])
+    # ... and the values are not all zero, or the line above proves nothing.
+    flat = [v for name in r["persist_read"] for v in r["persist_read"][name]]
+    assert any(v != 0.0 for v in flat), flat
+    assert all(d == "torch.float32" for d in r["persist_dtypes"].values()), r["persist_dtypes"]
+    assert r["persist_shapes"] == {"norm1.weight": [12], "norm2.weight": [12]}, \
+        r["persist_shapes"]
+    # 2 x 12 float32 = 96 bytes of payload, plus an 8-byte length and a header.
+    assert r["persist_size"] > 96, r["persist_size"]
+
+    assert r["persist_unrecorded"].startswith("ValueError:"), r["persist_unrecorded"]
+    assert "record(model) first" in r["persist_unrecorded"], r["persist_unrecorded"]
+
+
+def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
+    """The third of docs/DESIGN.md §3's lifetime questions, which still refuses.
+
+    What is pinned is the *shape* of the refusal: it names a line the reader
+    can run, so that the day a second rank lands the refusal is discovered by
+    someone running the check rather than by nobody. A refusal naming a fact
+    has gone stale six times here -- and the `persist` half of this test was
+    the seventh, caught by the test above replacing it rather than by anyone
+    re-reading the message.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
     assert "Check: torch.distributed.init_process_group(" in r["publish"], r["publish"]
     assert "world_size=2" in r["publish"], r["publish"]
+    assert "cannot leave this device" in r["publish"], r["publish"]
 
 
-def test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule():
-    """What the tape cannot carry, pinned so it cannot be forgotten.
+def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
+    """`aten.native_layer_norm.default` has a derivative rule, so the whole
+    `nn.LayerNorm` family adapts.
 
-    `aten.native_layer_norm.default` has no derivative rule (docs/BACKWARD.md
-    §8 -- it is not on SmolLM2's path, because RMSNorm decomposes into
-    mean.dim / rsqrt / mul). So Tent works on every RMSNorm architecture and on
-    no `nn.LayerNorm` one, which is most of the older encoders.
+    This test used to assert the refusal. docs/BACKWARD.md §8 predicted the day
+    it would invert and said the fix was to delete it; deleting it would have
+    been wrong, because what is worth pinning is not "Tent refuses" but **that
+    a LayerNorm model's entropy actually falls** -- a layer-norm backward with
+    the right shape for all three gradients and the wrong values passes any
+    test that only checks a step ran.
 
-    It is refused **before** the backward, by `trace.differentiable()`, and
-    with the whole list rather than whichever missing rule the walk reached
-    first. This test inverts the day a rule lands: it will fail, and the fix is
-    to delete it and move the architecture into the supported list.
+    So three things are asserted, and the middle one is what a plausible-but-
+    wrong `grad_input` fails: the entropy falls monotonically, negating the
+    objective takes it back **up** from the identical starting value on the
+    identical weights, and the base is restored bit for bit. The control is
+    what says the fall is the gradient's *direction* rather than any
+    perturbation of an affine parameter -- docs/ADAPT.md §4.1, applied to the
+    architecture the rule opened.
     """
     if not _ckpt_shim_available():
         return
@@ -15122,10 +15400,48 @@ def test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule():
     assert r["layernorm_selected"] == ["norm1.weight", "norm1.bias",
                                        "norm2.weight", "norm2.bias"], \
         r["layernorm_selected"]
-    got = r["layernorm"]
+    history = r["layernorm_history"]
+    assert isinstance(history, list), history
+    assert len(history) == 10, history
+    assert all(b < a for a, b in zip(history, history[1:])), history
+    assert history[-1] < history[0] - 1e-4, history
+
+    anti = r["layernorm_anti_history"]
+    assert all(b > a for a, b in zip(anti, anti[1:])), anti
+    assert anti[-1] > anti[0] + 1e-4, anti
+    assert abs(anti[0] - history[0]) < 1e-9, (anti[0], history[0])
+
+    moved = [n for n in r["layernorm_selected"]
+             if r["layernorm_adapted"][n] != r["layernorm_base"][n]]
+    assert len(moved) == 4, moved
+    assert r["layernorm_reverted"] == r["layernorm_base"]
+
+
+def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
+    """The refusal machinery, tested through its **reason** rather than through
+    the fact that it fires.
+
+    A refusal message in this repository has gone stale six times, and the way
+    it goes stale is that the thing being refused stops being refused while the
+    test still passes on the word "refused" -- which is exactly what the
+    previous version of the test above would have done had it been written one
+    assertion weaker. So this asserts that the op the message names is
+    genuinely absent from `_tape_rules()`. The day `abs` gains a rule,
+    `no_rule_op_is_unruled` goes False and this fails on its own premise and
+    says which line to change, instead of quietly checking nothing.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["no_rule_op_is_unruled"], (
+        "%s has a derivative rule now, so this fixture no longer exercises a "
+        "missing one; pick another op" % r["no_rule_op"])
+    got = r["no_rule"]
     assert got.startswith("torchnative.adapt:"), got
-    assert "aten.native_layer_norm.default" in got, got
+    assert r["no_rule_op"] in got, got
     assert "_tape_rules()" in got, got
+    # And the op that used to stop this model must not be what stops it now.
+    assert "aten.native_layer_norm.default" not in got, got
 
 
 def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():

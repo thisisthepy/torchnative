@@ -393,6 +393,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.mm.default",
     "aten.mul.Scalar",
     "aten.mul.Tensor",
+    "aten.native_layer_norm.default",
     "aten.neg.default",
     "aten.nll_loss_forward.default",
     "aten.permute.default",
@@ -406,6 +407,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.silu.default",
     "aten.sin.default",
     "aten.slice.Tensor",
+    "aten.split.Tensor",
     "aten.sqrt.default",
     "aten.squeeze.dim",
     "aten.sub.Scalar",
@@ -1015,31 +1017,68 @@ fn derivative<'py>(
             Ok((ops, vec![Some(gi)]))
         }
 
+        // ------------------------------------------------------ normalisation
+        "aten.native_layer_norm.default" => {
+            layer_norm_backward(py, node, env, gouts, outs)
+        }
+
         // --------------------------------------------------------------- loss
         "aten.nll_loss_forward.default" => {
             nll_loss_backward(py, node, env, gouts, outs)
         }
 
+        // ------------------------------------------------------------- split
+        //
+        // The one op here whose forward answers with a **list**, so `gouts` has
+        // one slot per chunk rather than per tuple position. The derivative is
+        // the concatenation of the chunk gradients along the split axis, and
+        // the part that is not optional is the *zero*: a chunk no gradient
+        // reached still occupies its width in the input, so it has to be
+        // present in the `cat` at full size. GPT-2 splits a fused qkv
+        // projection three ways and then uses all three, so the model that
+        // needs this rule is exactly the model that cannot exercise that zero.
+        "aten.split.Tensor" => {
+            let ops = bind(py, node, env, &["self", "split_size", "dim"])?;
+            let input = required(op, &ops, 0, "self")?;
+            let rank = input.shape()?.len();
+            let axis = normalise_dim(opt_i64(&ops, 2, 0)?, rank) as i64;
+            if outs.is_empty() {
+                return Err(crate::err::not_implemented(
+                    "torch._C tape: split's gradient needs the chunks the forward produced \
+                     and this node recorded none",
+                ));
+            }
+            let mut pieces = Vec::with_capacity(outs.len());
+            for (slot, chunk) in outs.iter().enumerate() {
+                pieces.push(match gouts.get(slot).and_then(|g| g.clone()) {
+                    Some(g) => g,
+                    None => zeros_like(py, chunk)?,
+                });
+            }
+            let list = PyList::new(py, pieces)?.into_any();
+            let gi = call(py, "aten.cat.default", vec![list, axis.into_bound_py_any(py)?])?;
+            Ok((ops, vec![Some(gi)]))
+        }
+
         // ---------------------------------------------------------- embedding
         //
         // Upstream calls this `embedding_dense_backward` and it is one of the
-        // five ops docs/AUTOGRAD.md §5.1 listed as missing. The obvious
-        // spelling is a scatter-add into a zero buffer, i.e.
-        // `index_put_(accumulate=True)` -- and **that is refused by this shim**
-        // (docs/VIEWS.md's table), so the rule is written the other way: a
-        // one-hot matrix, and the *matmul* does the summing that duplicated
-        // ids need. Two consequences, both stated rather than discovered
-        // later:
+        // five ops docs/AUTOGRAD.md §5.1 listed as missing. It is a scatter-add
+        // into a zero buffer -- `index_put_(accumulate=True)`, which
+        // docs/VIEWS.md §7 landed.
         //
-        //   * it is correct for repeated tokens without an accumulating
-        //     scatter, because a column of the one-hot names exactly one row;
-        //   * it costs a `[vocab, tokens]` intermediate. At SmolLM2's 49152
-        //     rows and 8 tokens that is 1.5 MB; at 1024 tokens it is 200 MB.
-        //     Adding `accumulate=True` to `index_put_` -- one line in
-        //     `index_put_inplace`'s write loop -- would remove that, and is
-        //     the right fix. It is left because the refusal it would make
-        //     stale lives in a document this round was told not to edit, and a
-        //     stale refusal is the failure this repository has had five times.
+        // **It was a one-hot matrix and a matmul until that flag existed**, and
+        // the switch is not only about the `[vocab, tokens]` intermediate the
+        // one-hot cost (1.5 MB at SmolLM2's 8 tokens, 200 MB at 1024). The two
+        // compositions are not the same function at reduced precision:
+        // upstream's kernel is `*dst += *src` in the receiver's dtype, so the
+        // running sum is rounded at every step, while a matmul accumulates in
+        // `float32` (docs/ARCH.md's GEMM accumulate-dtype rule) and rounds
+        // once. docs/VIEWS.md §7.4 measured both against upstream and this one
+        // is the one that agrees; §4.5 of docs/BACKWARD.md measures the
+        // difference on the real table. At `float32` they are identical, so the
+        // switch cannot move a `float32` gradient -- which is the check that
+        // says nothing else came with it.
         "aten.embedding.default" => {
             let ops = bind(
                 py,
@@ -1058,34 +1097,41 @@ fn derivative<'py>(
             }
             let (rows, width) = (wshape[0], wshape[1]);
             let count: usize = dims(&indices)?.iter().product();
-            let flat_rows = reshape(py, indices.clone(), &[1, count])?;
-            let flat_grad = reshape(py, g()?, &[count, width])?;
-            let dtype = weight.value.getattr("dtype")?;
-            let size = ints(py, &[rows as i64, count as i64])?;
-            let table = call_kw(py, "aten.zeros.default", vec![size], vec![("dtype", dtype.clone())])?;
-            let ones_size = ints(py, &[1, count as i64])?;
-            let mut hot = call_kw(py, "aten.ones.default", vec![ones_size], vec![("dtype", dtype)])?;
+            let flat_rows = reshape(py, indices.clone(), &[count])?;
+            let mut flat_grad = reshape(py, g()?, &[count, width])?;
             let padding = match ops.get(2).and_then(|s| s.as_ref()) {
                 Some(operand) if !operand.value.is_none() => operand.value.extract::<i64>().ok(),
                 _ => None,
             };
             if let Some(row) = padding {
-                // A padding row gets no gradient. Zeroing the *column* of the
-                // one-hot rather than the row of the result keeps it to one
-                // pass and costs nothing when there is no padding index.
+                // A padding row gets no gradient. The one-hot spelling zeroed a
+                // *column of the one-hot*; with no one-hot to zero, the same
+                // two ops are applied to the contributions instead -- every
+                // token whose id is the padding one contributes nothing, which
+                // is the same statement one step later. The mask is `[count, 1]`
+                // and broadcasts across the width.
                 let kept = call(
                     py,
                     "aten.ne.Scalar",
                     vec![flat_rows.clone(), row.into_bound_py_any(py)?],
                 )?;
-                hot = call(py, "aten.where.ScalarOther", vec![kept, hot, scalar(py, 0.0)?])?;
+                let mask = reshape(py, kept, &[count, 1])?;
+                flat_grad = call(
+                    py,
+                    "aten.where.ScalarOther",
+                    vec![mask, flat_grad, scalar(py, 0.0)?],
+                )?;
             }
-            let one_hot = call(
+            let dtype = weight.value.getattr("dtype")?;
+            let size = ints(py, &[rows as i64, width as i64])?;
+            let table = call_kw(py, "aten.zeros.default", vec![size], vec![("dtype", dtype)])?;
+            let index_list = PyList::new(py, [flat_rows])?.into_any();
+            let gi = call(
                 py,
-                "aten.scatter.src",
-                vec![table, 0i64.into_bound_py_any(py)?, flat_rows, hot],
+                "aten.index_put_.default",
+                vec![table, index_list, flat_grad, true.into_bound_py_any(py)?],
             )?;
-            Ok((ops, vec![Some(matmul(py, one_hot, flat_grad)?), None]))
+            Ok((ops, vec![Some(gi), None]))
         }
 
         // ---------------------------------------------------------------- sdpa
@@ -1186,6 +1232,149 @@ fn nll_loss_backward<'py>(
         vec![buffer, 1i64.into_bound_py_any(py)?, index, source],
     )?;
     Ok((ops, vec![Some(gi), None]))
+}
+
+/// `g` in `like`'s dtype, and `g` itself when they already agree.
+///
+/// Only mixed precision makes this do anything, and `native_layer_norm` is
+/// where mixed precision is *supported* rather than an error: `aten.rs`
+/// measured that `float32` parameters in front of a `bfloat16` input give
+/// `float32` statistics while the output stays `bfloat16`. A rule that read
+/// those statistics without narrowing again would hand back a `float32`
+/// gradient for a `bfloat16` input, which is a widening no forward asked for.
+fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj<'py>> {
+    let want = like.getattr("dtype")?;
+    if g.getattr("dtype")?.eq(&want)? {
+        return Ok(g);
+    }
+    call_kw(py, "aten._to_copy.default", vec![g], vec![("dtype", want)])
+}
+
+/// `native_layer_norm` -> gradients for input, weight and bias.
+///
+/// Three gradients, and only one of them is difficult. With `N` the number of
+/// elements the statistics were taken over, `y = (x - mean) * rstd` and
+/// `gh = g * weight`:
+///
+/// ```text
+///   grad_bias   = sum over the outer axes of  g
+///   grad_weight = sum over the outer axes of  g * y
+///   grad_input  = rstd * ( gh - mean(gh) - y * mean(gh * y) )
+/// ```
+///
+/// The two reductions are `reduce_to` under another name and would be right by
+/// accident. **`grad_input`'s last two terms are the ones a plausible
+/// implementation omits**: they are the correction for the fact that `mean` and
+/// `rstd` are themselves functions of every element of the row, so a rule that
+/// stops at `rstd * gh` -- which has the right shape, the right dtype and the
+/// right order of magnitude -- is wrong everywhere and looks right. `docs/BACKWARD.md`
+/// §7's T3 is the same shape of omission one layer down.
+///
+/// **`mean` and `rstd` are read off the forward's second and third results**
+/// rather than recomputed. That is what those results are *for* -- the same
+/// reading `docs/LOSS.md` §3.1 made of `nll_loss_forward`'s `total_weight`, and
+/// it is the reading that matters under mixed precision, where `aten.rs`
+/// measured the statistics following the *parameter* dtype and not the input's.
+/// Recomputing them would silently substitute the input's precision there.
+fn layer_norm_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+    outs: &[Obj<'py>],
+) -> PyResult<Rule<'py>> {
+    const OP: &str = "aten.native_layer_norm.default";
+    let ops = bind(py, node, env, &["input", "normalized_shape", "weight", "bias", "eps"])?;
+    for (slot, name) in [(1usize, "mean"), (2usize, "rstd")] {
+        if gouts.len() > slot && gouts[slot].is_some() {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: a gradient reached native_layer_norm's {name}, which this op \
+                 returns so that a backward need not recompute it; nothing here \
+                 differentiates a saved statistic"
+            )));
+        }
+    }
+    let g = gouts
+        .first()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| missing(OP, "grad"))?;
+
+    let input = required(OP, &ops, 0, "input")?;
+    let xshape = input.shape()?;
+    let rank = xshape.len();
+    let normalized = i64_list(&ops, 1, "normalized_shape", OP)?;
+    let k = normalized.len();
+    if k == 0 || k > rank {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: native_layer_norm's gradient was given normalized_shape \
+             {normalized:?} against a rank-{rank} input"
+        )));
+    }
+    if outs.len() < 3 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: native_layer_norm's gradient reads the mean and rstd this op \
+             returns, and this node recorded {} result(s)",
+            outs.len()
+        )));
+    }
+    let outer = rank - k;
+    let inner: Vec<i64> = (outer..rank).map(|d| d as i64).collect();
+    let want: Vec<usize> = xshape[outer..].to_vec();
+    let count = want.iter().product::<usize>() as f64;
+
+    // The op's own second and third results, kept at the input's rank with the
+    // normalised axes replaced by 1 -- so they broadcast against `x` with no
+    // reshaping, which is the shape `aten.rs` measured and the reason they are
+    // usable here at all.
+    let mean = outs[1].clone();
+    let rstd = outs[2].clone();
+    // The interior is computed in the **statistics'** dtype, which under mixed
+    // precision is the parameters' rather than the input's. Upstream's backward
+    // does the same, and without it this rule would not merely lose precision --
+    // it would refuse: `x - mean` with a `bfloat16` x against a `float32` mean
+    // is a promotion this shim declines by name. Each result is narrowed back
+    // on the way out, to the dtype of the thing it is a gradient *for*.
+    let xa = cast_like(py, input.value.clone(), &mean)?;
+    let ga = cast_like(py, g.clone(), &mean)?;
+    let y = mul(py, sub(py, xa, mean.clone())?, rstd.clone())?;
+
+    let weight = ops
+        .get(2)
+        .and_then(|slot| slot.as_ref())
+        .filter(|operand| !operand.value.is_none());
+    let bias = ops
+        .get(3)
+        .and_then(|slot| slot.as_ref())
+        .filter(|operand| !operand.value.is_none());
+
+    let gh = match weight {
+        Some(w) => mul(py, ga.clone(), cast_like(py, w.value.clone(), &mean)?)?,
+        None => ga.clone(),
+    };
+    let per = |py: Python<'py>, t: Obj<'py>| -> PyResult<Obj<'py>> {
+        let summed = sum_dims(py, t, &inner, true)?;
+        call(py, "aten.div.Scalar", vec![summed, scalar(py, count)?])
+    };
+    let mean_gh = per(py, gh.clone())?;
+    let mean_ghy = per(py, mul(py, gh.clone(), y.clone())?)?;
+    let centred = sub(py, sub(py, gh, mean_gh)?, mul(py, y.clone(), mean_ghy)?)?;
+    let gi = cast_like(py, mul(py, centred, rstd)?, &input.value)?;
+
+    let gw = match weight {
+        None => None,
+        Some(w) => {
+            let summed = reduce_to(py, mul(py, ga.clone(), y)?, &want)?;
+            Some(cast_like(py, summed, &w.value)?)
+        }
+    };
+    let gb = match bias {
+        None => None,
+        Some(b) => {
+            let summed = reduce_to(py, ga, &want)?;
+            Some(cast_like(py, summed, &b.value)?)
+        }
+    };
+    Ok((ops, vec![Some(gi), None, gw, gb, None]))
 }
 
 /// `_scaled_dot_product_flash_attention_for_cpu` -> gradients for q, k and v.
