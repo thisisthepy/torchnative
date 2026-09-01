@@ -352,6 +352,11 @@
     "aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
     "aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
   ],
+  "all": [
+    "aten::all(Tensor self) -> Tensor",
+    "aten::all.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
+    "aten::all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
+  ],
   "cumsum": [
     "aten::cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
   ],
@@ -371,6 +376,15 @@
   "sqrt": [
     "aten::sqrt(Tensor self) -> Tensor"
   ],
+  "sigmoid": [
+    "aten::sigmoid(Tensor self) -> Tensor"
+  ],
+  "sign": [
+    "aten::sign(Tensor self) -> Tensor"
+  ],
+  "flip": [
+    "aten::flip(Tensor self, int[] dims) -> Tensor"
+  ],
   "repeat": [
     "aten::repeat(Tensor self, SymInt[] repeats) -> Tensor"
   ],
@@ -387,6 +401,12 @@
   ],
   "exp": [
     "aten::exp(Tensor self) -> Tensor"
+  ],
+  "erf": [
+    "aten::erf(Tensor self) -> Tensor"
+  ],
+  "log2": [
+    "aten::log2(Tensor self) -> Tensor"
   ],
   "expm1": [
     "aten::expm1(Tensor self) -> Tensor"
@@ -509,6 +529,10 @@
   "clamp": [
     "aten::clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor",
     "aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+  "clamp_min": [
+    "aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor",
+    "aten::clamp_min(Tensor self, Scalar min) -> Tensor"
   ],
 
   "add_": [

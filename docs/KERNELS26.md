@@ -1810,3 +1810,1492 @@ f32   S=6 b9fc5553ee1bf6a2   S=32 331668f36da02f21   S=128 00159a9dbd308eda
       S=512 07c2797dabc4552e   S=1024 eda1e173727bb7f5
 bf16  S=128 7ff8e9334449b147
 ```
+
+---
+
+# Round three: closing the last four
+
+Same method as the two rounds above — **the sweep is re-run after every
+kernel**, never batched, and each section records the count and, when the count
+does not move, which wall replaced the one that was removed. Written
+incrementally.
+
+The starting point, re-measured on this worktree before any edit and identical
+to §14.1's:
+
+```
+pytests/run.sh                268 ok, 0 FAIL                        exit 0
+tools/golden/compare.py       5634/5634, ops=148, pending=1         exit 0
+compare.py --self-test        15 comparators x 11 fault modes       exit 0
+verify_schemas.py             4392/4392                             exit 0
+sweep26 (shim)                22/26                                 exit 0
+```
+
+with the four walls §14 predicted, each confirmed by running it:
+
+| architecture | wall at the start of this round |
+|---|---|
+| `vits` | `torch.clamp_min(...)` — no overload table entry |
+| `sew_d` | `torch.group_norm(...)` — no overload table entry |
+| `zoedepth` | `torch._C._nn.upsample_bilinear2d` |
+| `sam3_video` | `TensorBase.all` |
+
+### A harness note, because it cost two runs
+
+`run.sh` refused twice with `cmp exited 137`, and it was **not** the memory
+pressure its own message suggests. The kill was deterministic and one-sided:
+`cmp` on the *staged* copy under `$TMPDIR/torch-c-stage/` was SIGKILLed against
+any second file including itself, while the vendored copy compared against
+itself fine and `sha256` said all three copies (cargo's, the stage's, the
+vendored one's) were the same bytes. Deleting the stage directory and letting
+`run.sh` recreate it fixed it permanently. So the guard is right that 137 is
+not a staleness report — but "re-run when quieter" is not the only remedy, and
+`rm -rf "$TMPDIR/torch-c-stage"` is the one that worked here.
+
+## 15. `aten.clamp_min.default` — `vits`
+
+`modeling_vits.py:1352` keeps the predicted waveform at least one frame long:
+
+```python
+predicted_lengths = torch.clamp_min(torch.sum(duration, [1, 2]), 1).long()
+```
+
+measured `clamp_min.default(float32(1,), 1)`.
+
+### 15.1 It is `clamp(min=)`, and that was checked rather than assumed
+
+The cheap move is to write `clamp_min` as a floor and move on. The risk
+KERNELS26.md keeps hitting is the opposite one — a rule that *looks* shared and
+is not — so all ten rows of `clamp`'s dtype ladder were re-measured against
+`clamp_min` on 2.13.0 before anything was reused:
+
+```
+                       clamp_min(t, b)     clamp(t, min=b)
+int32,   0             int32               int32
+int32,   2.0           float32             float32
+uint8,   2             uint8               uint8
+uint8,   2.0           float32             float32
+float16, 2.0           float16             float16
+bool,    0             int64               int64
+bool,    0.0           float32             float32
+bool,    False         RAISES              RAISES
+f32 [nan,1,-1], 0.0    [nan,1,0]           [nan,1,0]
+int64,   -1            int64               int64
+```
+
+Identical on every row, so the kernel calls `clamp_result_tag` and
+`clamp_values` rather than restating a table the golden cases had to correct
+once (§ the `clamp`/`clamp_` split: the out-of-place form promotes where the
+in-place one refuses).
+
+**One thing is not shared, and it is the row a delegating implementation would
+get wrong invisibly.** The `bool`-bound refusal names the kernel upstream
+failed to find, and that name differs:
+
+```
+torch.clamp_min(bool_t, False)   "clamp_min_scalar_cpu" not implemented for 'Bool'
+torch.clamp(bool_t, False)       "clamp_scalar_cpu"     not implemented for 'Bool'
+```
+
+The golden case for that row is `both_error`, which by design does not compare
+messages — so a `clamp_min` written as a straight call through to `clamp` would
+be **green in golden and wrong in the string a user reads**. That is what
+`test_clamp_min_names_its_own_kernel_in_the_bool_refusal` in `test_shim.py` is
+for; `clamp_result_tag` derives the name from `op` so a third caller cannot
+forget to say which it is.
+
+`min` is required here where `clamp`'s is optional, which removes `clamp`'s
+"both bounds absent is an error, not a no-op" branch entirely — no spelling
+reaches it, because `None` cannot bind `Scalar min`.
+
+### 15.2 The plausible wrong implementations, and the cases that separate them
+
+| wrong implementation | what it gets right | the case that kills it |
+|---|---|---|
+| "a floor is `maximum`, so promote like a binary op" | every same-dtype row | `clamp_min(float16, 2.0)` → binary promotion says `float32`, upstream says `float16` |
+| "clamp both ends" (copy-paste from `clamp`) | everything with no large elements | `[1,5,10,-3]` floored at 2 → the `10` must survive |
+| "a floor is a relu with an offset" | every non-negative floor | `clamp_min(int64 [1,5,-3,-9], -1)` → `[1,5,-1,-1]`, a relu gives `[1,5,0,0]` |
+| `where(x > min, x, min)` | every finite input | `[nan,1,-1]` floored at 0 → upstream keeps the `nan`; that spelling returns `0` |
+
+### 15.3 The deliberate gap
+
+`clamp_min.Tensor` (a tensor floor) is **not** implemented. It is `maximum`
+with broadcasting and binary promotion, and this shim has no
+`aten.maximum.default` to delegate to, so it is a broadcast kernel and not a
+one-line alias. Both tables list it so `torch.clamp_min(x, some_tensor)`
+refuses by the name of the overload it needed —
+
+```
+NotImplementedError: aten op not implemented in torch._C shim: aten.clamp_min.Tensor
+```
+
+— exactly the shape `clamp.Tensor` already had beside it. A `c_error` golden
+case watches it, so the day it gains a kernel this fails and gets promoted
+rather than quietly starting to compute something unchecked.
+
+`out=` is refused by the resolver on both spellings (`no matching overload ...
+for (Tensor, int, out=Tensor)`), so no `.out` schema is listed — same as
+`clamp`.
+
+### 15.4 A defect in the harness, found by the first golden run
+
+Three of the new spelling cases failed with
+`c raised AttributeError("module '_C' has no attribute 'clamp_min'")`. The
+free-function spelling lives on `_C._VariableFunctions`, not on `_C` — `torch`
+hoists it, `_C` does not. The existing `_log_member_cases` already worked
+around that inline; this round extracted it as `_free(module, name)`.
+
+**It is worth naming because of the direction the mistake points.** The
+`match` cases failed loudly, which is the harness working. But the `c_error`
+case for `clamp_min.Tensor` **passed** — an `AttributeError` is an error, so
+"c refused" was satisfied by a typo rather than by the overload under test.
+A `c_error` case reached through a name that does not exist cannot fail, which
+is §0's "a validation that cannot fail is not a validation" in a new place.
+
+### 15.5 Counts
+
+| gate | before §15 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 268 | **269** (+1) |
+| `compare.py` | 5634/5634, ops=148 | **5656/5656, ops=149** (+22 cases, +1 op) |
+| `verify_schemas.py` | 4392/4392 | **4399/4399** (+7) |
+| schema identities | 230 | **232** (+2) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+The identity count is **+2, not +4**: `clamp_min` went into both tables with
+the same two schemas in the same change, so `torch.clamp_min` and
+`Tensor.clamp_min` are one identity per overload — the `amax`/`tril` shape
+again. Getting +4 would have meant the two tables had transcribed it
+differently.
+
+### 15.6 The sweep
+
+**22/26. `vits` moved one wall**, from `torch.clamp_min` to `torch.flip`:
+
+```
+vits         FAIL  torch.flip(...) -- overload resolution has no table entry for this op
+```
+
+which is the next entry on §14's own list. Note that §14 recorded
+`aten.flip.default` as *missing*, while this round's brief described it as
+existing with only a `TensorBase.flip` spelling absent. **§14 is the correct
+one** — `_aten_implemented()` has no `aten.flip.default`, so `flip` is a kernel
+and not a name.
+
+## 16. `aten.all.{default,dim,dims}` — `sam3_video`, and two rules `any` had wrong
+
+`masking_utils.py:330` asks `padding_mask.all()` before it will skip building a
+bidirectional mask. §14 called this "one-line, reduction family". It is one
+line **in the reduction**, and the family it was going to be copied from had
+two defects that a flipped comparison would have inherited.
+
+### 16.1 What "flip `max` to `min`" would have got wrong
+
+`any` reduces the 0/1 mask with `max`; `all` reduces it with `min`. That is the
+whole computation. The two things that are *not* symmetric:
+
+**Empty input.** `torch.tensor([]).any()` is `False`; `torch.tensor([]).all()`
+is `True`. `any_default` had a hardcoded early return of zero for
+`elem_count() == 0` — correct for `any`, and the exact wrong answer for `all`
+had it been shared verbatim. Now `BoolReduce::identity()` names it, one value
+per op, in the one place both read.
+
+Over a *dimension* it is worse than a wrong value, because candle refuses the
+reduction outright:
+
+```
+before:  torch.zeros(0,3).any(0)   RuntimeError: candle: empty tensor for reduce
+upstream:                          [False, False, False]
+         torch.zeros(0,3).all(0)   [True, True, True]     three trues out of nothing
+         torch.zeros(0,3).all(1)   []                     the surviving axis is 0-long
+```
+
+One shape, two dims, two different answers — which is why the kernel computes
+the reduced shape and fills it with the identity, rather than short-circuiting
+on "the input has no elements". A short-circuit gets `dim=0` right and `dim=1`
+wrong.
+
+**Result dtype.** The result is `torch.bool` for every input dtype **except
+`uint8`, where it is `uint8`**. This is not symmetry-guessing: upstream's own
+`torch.all` docstring states it ("matches the behaviour of NumPy in returning
+output of dtype `bool` for all supported dtypes except `uint8`"), and it is
+measured on both ops and all three forms.
+
+**`any` had this wrong** — it returned `torch.bool` unconditionally, and its
+golden cases probe only `int64`, which is exactly the dtype that cannot tell
+the rule from "always bool". So the defect was invisible and had been for as
+long as `any` existed. Fixed here, with `all`, rather than after it: writing
+`all` from `any`'s shape would have copied it into a second op, and then two
+ops would have agreed with each other and not with upstream — which is the
+failure mode §0 calls "two case sets that both pass two different
+implementations", arrived at from the other direction.
+
+### 16.2 The plausible wrong implementations
+
+| wrong implementation | what it gets right | what separates it |
+|---|---|---|
+| `any` with `max`→`min` and nothing else | every non-empty case | `[]` → `True` upstream, `False` from a shared early return |
+| "the result is always `bool`" | six of the seven dtypes | `uint8` in, `uint8` out — on all three forms |
+| "every element is **positive**" | every case built from 0/1 mask data, which is what a mask is | `[-1,-2,-3,-4].all()` is `True` |
+| "NaN is not true" | every finite input | `[nan, 1.].all()` is `True` — `nan != 0` |
+| short-circuit on `elem_count() == 0` | `zeros(0,3).all(0)` | `zeros(0,3).all(1)` is `[]`, not `[True,True,True]` |
+
+The dtype and the empty rules are stated **once** and fed to *both* ops
+(`_bool_reduce_dtype_cases`, `_bool_reduce_empty_cases`,
+`_bool_reduce_dim_cases` in `cases.py`). That is deliberate: a rule written
+once and applied to the pair is what stops them drifting apart a second time.
+
+### 16.3 Counts
+
+| gate | before §16 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 269 | **270** (+1) |
+| `compare.py` | 5656/5656, ops=149 | **5784/5784, ops=152** (+128 cases, +3 ops) |
+| `verify_schemas.py` | 4399/4399 | **4415/4415** (+16) |
+| schema identities | 232 | **238** (+6) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+**+3 ops, not +1**: `all.dim` and `all.dims` are separate overloads with
+separate kernels and separate builders, and `all.dims` is *not* parked in
+`IMPLEMENTED_AWAITING_GOLDEN` the way `any.dims` is — parking it would have
+left the one form whose `dim=None` means "every axis" (rather than "argument
+missing") uncompared.
+
+**+6 identities**: `any`'s exact inventory one op over — three kernels and
+three `.out` siblings carried with no kernel so `torch.all(x, out=y)` refuses
+by the right name. 128 of the new cases are the shared dtype/empty/dim
+builders, and roughly half of them land on `any`, which is where the
+regression coverage for the dtype fix lives.
+
+### 16.4 The sweep
+
+**22/26. `sam3_video` moved one wall**, from `TensorBase.all` to
+`TensorBase.sigmoid` — the first entry on §14's "also still missing" list.
+`vits`, `sew_d` and `zoedepth` are unchanged on `torch.flip`,
+`torch.group_norm` and `upsample_bilinear2d`.
+
+## 17. `aten.sigmoid.default` — `sam3_video`, and a tolerance that could not see the fault
+
+`sam3_video`'s next wall after `all` was `TensorBase.sigmoid`. §14 filed
+`sigmoid` under "one-line members of families that already exist". It is a
+one-line member of **two** families and they disagree about it.
+
+### 17.1 Two families, and which half each one supplies
+
+```
+dtype rule       unary_float's   int/bool in -> default float out     (silu REFUSES)
+precision rule   silu's          f16/bf16 computed in f32, narrowed once
+```
+
+`silu` has no integral CPU kernel upstream and raises on one; `sigmoid`
+promotes (measured: `int64`, `int32`, `uint8` and `bool` all give `float32`).
+So it cannot be a copy of `silu`. And the `unary_float` family evaluates in the
+input's own dtype, which is right for `tanh`/`exp`/`cos` and **wrong here**. So
+it cannot be another `Unary` variant either. It is its own function because the
+two rules it needs come from different places.
+
+The precision half is measured, not reasoned from `silu`'s comment. Over 20 000
+`randn * 8` inputs, against upstream's own answer:
+
+```
+              computed in f32, narrowed once     computed in the reduced dtype
+float16       0 / 20000 differ                   6983 / 20000 differ
+bfloat16      0 / 20000 differ                   5466 / 20000 differ
+```
+
+### 17.2 The tolerance could not see it, and the harness said so
+
+Every one of those 6983 disagreements is **1 ULP**, which at `float16` is about
+5e-4 relative — and golden's `float16` tolerance absorbs it completely. So the
+wrong implementation here is not merely plausible, it is *green*: writing
+`sigmoid` as a `Unary` variant passes every ordinary case at every dtype.
+
+That is §0's third trap ("a tolerance that cannot see the fault") arriving in
+this round, and it needed the same answer the f32 precision cases needed:
+compare something the tolerance does not soften. `_bitwise_equal_check`
+compares the results **bit for bit** at `float16` and `bfloat16`.
+
+**The comparator then caught a defect in itself.** Its first draft compared
+only the nested value lists, and `compare.py --self-test` reported it accepting
+an injected *shape* fault and an injected *dtype* fault:
+
+```
+PROBLEM: _bitwise_equal_check + shape: the comparator accepted a wrong answer
+PROBLEM: _bitwise_equal_check + dtype: the comparator accepted a wrong answer
+```
+
+A `value_check` **replaces** the default pipeline rather than extending it, so
+a comparator that only looks at values is blind to everything else. It is now a
+superset — dtype, then shape, then bit-exact values — and catches 7 of 11
+injected fault modes, the same as `_signed_zero_check`, which is the model it
+should have been written from.
+
+### 17.3 What f32 and f64 do, and why they are not bit-compared
+
+They are **not** bit-identical, and the residual is not this kernel's:
+
+```
+aten.exp.default vs upstream, 80 points in [-5, 5]:   12/80 differ at f32,  16/80 at f64
+aten.sigmoid.default vs upstream, the same 80 points:  the SAME indices
+```
+
+Upstream computing `1/(1+exp(-x))` with its own `exp` reproduces
+`torch.sigmoid` exactly at both widths (0/20000 differ), so the formula is
+right; what differs is candle's `exp` against upstream's vectorised one, ~1 ULP.
+Demanding bit-equality at `f32` would be demanding it of `exp`, which no other
+case in this repository does. Recorded rather than hidden — and the index
+agreement is what makes "inherited" a measurement rather than an excuse.
+
+Widening `f32` to `f64` and narrowing makes it **worse** (20 of 80 differ), so
+`f32` is computed in `f32`. That is the opposite of the reduced-dtype rule
+above, which is why both were measured rather than one inferred from the other.
+
+### 17.4 Counts
+
+| gate | before §17 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 270 | **270** |
+| `compare.py` | 5784/5784, ops=152 | **5830/5830, ops=153** (+46 cases, +1 op) |
+| `compare.py --self-test` | 15 comparators | **16 comparators** x 11 fault modes |
+| `verify_schemas.py` | 4415/4415 | **4421/4421** (+6) |
+| schema identities | 238 | **240** (+2) |
+| core-tagged ops | 90 | **91** (+1) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+The core-tagged count is **+1 across five kernels landed so far this round**,
+and the four that do not appear are the check that the tags are read one at a
+time rather than assumed:
+
+```
+sigmoid.default    ['core', 'pointwise', 'pt2_compliant_tag']   <- counted
+clamp_min.default  ['pointwise', 'pt2_compliant_tag']
+all.default        ['pt2_compliant_tag', 'reduction']
+all.dim            ['pt2_compliant_tag', 'reduction']
+all.dims           ['pt2_compliant_tag', 'reduction']
+```
+
+`clamp_min` is not core while `clamp` is, and none of the three `all` overloads
+is core while `amax` is. Neither is derivable; both were read.
+
+### 17.5 The sweep
+
+**22/26. `sam3_video` moved one wall**, and to a wall of a kind this round had
+not seen:
+
+```
+sam3_video   FAIL  aten.div.Tensor: dtype promotion not implemented in torch._C shim: float32 vs int64
+```
+
+That is not a missing name or a missing kernel — `aten.div.Tensor` has had a
+kernel since the beginning. It is `same_dtype` refusing a **mixed-dtype
+operand pair**, which docs/BIND.md §9 records as a deliberate divergence.
+`vits`, `sew_d` and `zoedepth` are unchanged.
+
+## 18. `aten.flip.default` — `vits`
+
+`modeling_vits.py:595` reverses the channel order of the residual coupling
+layer's input on every flow step: `torch.flip(inputs, [1])`.
+
+**Correction to this round's brief.** It described `aten.flip.default` as
+already existing with only a `TensorBase.flip` spelling missing. §14 of this
+same document said the opposite, and §14 is right — `_aten_implemented()` had
+no `flip` at all, and the sweep's own error was "overload resolution has no
+table entry". Both the kernel and both spellings land here.
+
+### 18.1 What it is, and the one thing it is not
+
+**It copies.** `torch.flip(x, [0]).data_ptr() != x.data_ptr()`, measured. That
+is a piece of luck rather than a design choice: a reversed axis is a negative
+stride, which is exactly what candle's `Layout` cannot express, so an op that
+*had* to alias would have joined `slice.Tensor` and `view.dtype` as a
+docs/VIEWS.md §6.4 divergence. It does not, so this is complete rather than
+recorded.
+
+Four rules, all measured on `x = arange(6).reshape(2, 3)`:
+
+```
+flip(x, [1])      [[2,1,0],[5,4,3]]    reverses WITHIN each row
+flip(x, [0])      [[3,4,5],[0,1,2]]    reverses the row ORDER
+flip(x, [-1])     [[2,1,0],[5,4,3]]    a negative dim is the LAST axis
+flip(x, [])       [[0,1,2],[3,4,5]]    an empty dim list is a COPY, not an error
+flip(x, [0, 0])   RAISES               "dim 0 appears multiple times in the list of dims"
+```
+
+**The duplicate refusal is the one a delegating implementation loses.**
+Flipping one axis twice is the identity, so a kernel that just loops over
+`dims` returns *the input* where upstream raises — a correctly-shaped,
+correctly-typed, entirely plausible tensor. And the check has to run **after**
+normalisation, because `[1, -1]` is the same axis twice on a rank-2; a check
+written against the raw list sees two different numbers. Both spellings are
+cased.
+
+Nothing in the case set is square, on purpose: `flip([0])` and `flip([1])` on a
+2×2 of distinct values differ in their values but not in their shape, and an
+axis mix-up is much easier to see on `(2, 3)` and `(2, 3, 4)`.
+
+### 18.2 The defect only the spelling cases could find
+
+The first build passed every dispatch-key case and failed all six spelling
+cases with:
+
+```
+c raised TypeError("aten.flip.default: missing required argument 'dims'")
+but torch computed a value
+```
+
+Every reduction in `aten.rs` calls its axis argument **`dim`**; `aten::flip`
+calls its **`dims`**, and `reduce_dims` had the name hardcoded. The resolver
+binds by the *schema's* name, so `torch.flip(x, [1])` and `x.flip(1)` both
+arrived with a keyword the kernel was not looking for — while
+`_aten_dispatch(op, t, [1])` passes the list **positionally** and finds it
+either way.
+
+So the kernel was simultaneously green on 60 dispatch-key cases and unusable
+from every spelling a caller has. This is §13.3's finding from the other side:
+there, golden was blind to a name; here, golden's dispatch path was blind to an
+*argument* name, and only the member/free-function cases could see it.
+`reduce_dims_named` now takes the keyword, and `reduce_dims` is a two-line
+wrapper that supplies `"dim"`.
+
+### 18.3 Counts
+
+| gate | before §18 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 270 | **271** (+1) |
+| `compare.py` | 5830/5830, ops=153 | **5892/5892, ops=154** (+62 cases, +1 op) |
+| `verify_schemas.py` | 4421/4421 | **4427/4427** (+6) |
+| schema identities | 240 | **242** (+2) |
+| core-tagged ops | 91 | **92** (+1) |
+| decomposition registry | 1007 | **1008** (+1) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+The registry moving is the `zeros_like.out`/`ones_like.out` mechanism for the
+fourth time, and **which** entry moved it is the check: the yaml declares
+`clamp_min.out`, `sigmoid.out`, `all.out`, `all.dims_out` and `all.all_out`
+itself — every other `.out` schema this round added — and does **not** declare
+`flip.out`. So `flip.out` becomes the eighth table-only entry and the other
+five move nothing. Grepped in the file rather than inferred from the count
+having moved by one.
+
+### 18.4 The sweep
+
+**22/26. `vits` moved one wall**, off the missing-name class entirely:
+
+```
+vits   FAIL  TypeError: 'IntTensor' object is not subscriptable
+    modeling_vits.py:363   fused_add_tanh_sigmoid_multiply(..., num_channels_tensor[0])
+```
+
+`TensorBase.__getitem__` refusing an integer index on a rank-1 tensor. Not a
+kernel and not an overload entry — a `bootstrap.py` surface gap. `sew_d`,
+`zoedepth` and `sam3_video` are unchanged.
+
+## 19. `aten.native_group_norm.default` — `sew_d`
+
+The first of the brief's two real kernels. `nn.GroupNorm.forward` →
+`F.group_norm` → `torch.group_norm`, which is `CompositeImplicitAutograd`;
+measured with a `TorchDispatchMode` logger on 2.13.0, all three of
+`torch.group_norm(...)`, `F.group_norm(...)` and an `nn.GroupNorm` forward emit
+
+```
+aten.native_group_norm.default
+```
+
+and nothing else. So `torch.group_norm` is installed as a composite in
+`bootstrap.py` beside `layer_norm`, not as an `overloads.json` entry — the
+table would name `aten.group_norm.default`, a key upstream's own dispatcher
+never answers to.
+
+### 19.1 Three results, and only the first is read
+
+`torch.group_norm` returns `result[0]`. **The `mean` and `rstd` beside it can
+be the wrong shape, the wrong dtype, or a different function entirely and every
+model in the sweep still forwards.** That is the brief's warning about this
+kernel and it is exactly right, so each of the three was measured separately:
+
+| result | what it is | the wrong answer with the same shape |
+|---|---|---|
+| `out` | `(x - mean) * rstd` reshaped, then per-channel `weight`/`bias` | applying the affine along the *statistics* view |
+| `mean` | `(N, group)` — per (sample, group) | `(N, C)` per channel; keepdim-shaped like `native_layer_norm`'s |
+| `rstd` | `1/sqrt(var + eps)`, **biased** variance | `sqrt(var+eps)`; `1/(sqrt(var)+eps)`; the unbiased variance |
+
+### 19.2 The two views, and why `C=6, group=3`
+
+The statistics are taken over `(C/group) * HxW` elements per row — the tensor
+read as `(N*group, C/group*HxW)`. The affine parameters are per **channel**,
+shape `(C,)`, applied to the normalised tensor reshaped back to `(N, C, HxW)`.
+
+Those are different views, and folding them into one is the plausible error.
+**It is invisible in the two configurations a hand-written test picks first:**
+
+```
+group == C    InstanceNorm       C/group == 1, so a "group" IS a channel
+group == 1    LayerNorm over CHW  one group, so the group view IS the whole tensor
+```
+
+Both coincide. Every value case here uses `C=6, group=3` (`C/group == 2`) so
+that they do not, and `group=1`/`group=6` are present as the *control* — a
+kernel that passes only those is the one being guarded against. The
+`test_shim.py` case zeroes `weight[0]` and asserts that exactly channel 0's row
+vanishes, which no shape or dtype check can substitute for.
+
+### 19.3 What pins `eps`, and what cannot
+
+A **constant** group has variance zero, so:
+
+```
+rstd = 1/sqrt(0 + eps)      316.2278    <- upstream, measured at eps=1e-5
+       1/(sqrt(0) + eps)    100000      <- eps added to the std instead
+       sqrt(0 + eps)        0.00316     <- rstd is not a reciprocal
+```
+
+Three different numbers of the same shape and dtype. But the constant case
+**cannot** pin the divisor: an unbiased variance over a constant group is also
+zero, so it gives `316.2278` too. And a random case cannot pin the `eps`
+placement, because `eps` is negligible against a real variance. So both are
+here, plus a third at `eps=0.5` on real data where the placement is visible
+without being degenerate. No one of the three does the job of the other two.
+
+### 19.4 The dtype rule, and the refusals
+
+`mean`/`rstd` follow the **parameter** dtype, not the input's — a `float16`
+input with `float32` parameters gives `float32` statistics and a `float16`
+output. That combination is *supported*, not an error, and it is the row where
+a kernel that tagged the statistics with the input dtype passes everything
+else. `float32` input with `float16` or `float64` parameters raises. All
+measured; the rule is `native_layer_norm`'s, and it was re-measured here rather
+than assumed from the neighbour.
+
+Upstream's refusals, transcribed with their own wording: the integral/bool
+`"GroupNormKernelImpl"`, the divisibility message, the `X.numel() == N*C*HxW`
+message, the weight-length message, and `Expected num groups to be greater than
+0`. The divisibility check runs **before** the count check — measured, because
+a wrong `C` that happens to be indivisible reports the first message and not
+the second.
+
+A **negative `eps` is not refused**: it gives NaN where `var + eps < 0` and a
+finite answer elsewhere, and this follows rather than guarding, as
+`native_layer_norm` does.
+
+**Not implemented: `HxW == 0`.** Upstream answers `mean=0` with `rstd=nan` —
+one half of the pair reporting an empty reduction and the other not. That is
+the same internally-inconsistent corner `native_layer_norm` refuses for a
+zero-extent `normalized_shape`, refused here for the same reason and watched by
+a `c_error` case. `N == 0` **is** implemented: every result is simply empty and
+there is nothing inconsistent to reproduce.
+
+### 19.5 Counts
+
+| gate | before §19 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 271 | **272** (+1) |
+| `compare.py` | 5892/5892, ops=154 | **5941/5941, ops=155** (+49 cases, +1 op) |
+| `verify_schemas.py` | 4427/4427 | **4430/4430** (+3) |
+| schema identities | 242 | **242** (unchanged) |
+| core-tagged ops | 92 | **93** (+1) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+**The identity count does not move, and that is the check.** `native_group_norm`
+went into neither `overloads.json` nor `methods.json` — it is reached through a
+`bootstrap.py` composite and through `_aten_dispatch`, neither of which is a
+schema table. `verify_schemas` still gains 3, because it counts every table
+entry it can re-derive and `torch.group_norm` is a name it now knows about.
+An identity count of 244 here would have meant the composite had been written
+as an overload entry by mistake.
+
+### 19.6 The sweep
+
+**22/26. `sew_d` moved one wall**, from `torch.group_norm` to
+`torch.avg_pool1d` — `aten.avg_pool2d.default`'s 1-D sibling, and §8.2's list
+had `avg_pool2d` on it as "a real kernel with its own measurement round".
+`vits`, `zoedepth` and `sam3_video` are unchanged.
+
+## 20. `aten.upsample_bilinear2d.default` — `zoedepth`
+
+The second of the brief's two real kernels, and the one where the wrong answer
+is **a plausible image**.
+
+`F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=...)` →
+`torch._C._nn.upsample_bilinear2d`, whose four-argument signature is the
+**`.vec`** schema. `.vec` is `CompositeImplicitAutograd`; measured with a
+`TorchDispatchMode` logger on 2.13.0, a `(1,1,2,3)` input emits exactly one
+record —
+
+```
+aten.upsample_bilinear2d.default((1,1,2,3), [4, 6], False, 2.0, 2.0)
+```
+
+— a *concrete* output size with the scale factors passed through beside it. So
+`.vec` is a `bootstrap.py` composite in `_install_nn` and this is the leaf.
+
+### 20.1 The two grids, and where they agree
+
+```
+align_corners=true    scale = (in-1)/(out-1)   [0 if out == 1]
+                      src   = scale * d
+align_corners=false   scale = 1/scale_arg  if given and > 0, else in/out
+                      src   = max(scale * (d + 0.5) - 0.5, 0)
+```
+
+Both values are used in the wild — `zoedepth`'s own config carries an
+`align_corners` flag — and they are different functions, not a tolerance apart.
+On `arange(6).reshape(1,1,2,3)` → `(4,6)` they disagree on **20 of 24
+elements**:
+
+```
+align_corners=false   0.00 0.25 0.75 1.25 1.75 2.00 | 0.75 1.00 ...
+align_corners=true    0.00 0.40 0.80 1.20 1.60 2.00 | 1.00 1.40 ...
+```
+
+**They agree at the four corners.** That is what the flag means, and it is
+exactly why a case set assembled from corners cannot separate them — nor can a
+symmetric input, nor a square one. Every case here uses a non-symmetric ramp on
+a non-square `(1,1,2,3)`, and every geometry is run through *both* values of
+the flag.
+
+The `+0.5 … −0.5` is the **half-pixel** convention the brief names, and
+dropping it is the classic error: `scale * d` under `align_corners=false`
+produces a slightly-shifted image rather than an error, and it is the
+`align_corners=true` formula, so an implementation that used one convention for
+both flag values still answers something for every input.
+
+### 20.2 Three things inside the grid, each measured on its own
+
+  * **`scales_h`/`scales_w` are honoured and are not `in/out`.** `1/scale` and
+    `in/out` coincide whenever `out == in * scale` exactly, which is *every*
+    case a `scale_factor=2` test produces. With `in=3, out=4, scales_w=1.5`
+    they are `0.667` against `0.75`, and upstream answers
+    `[0, 0.5, 1.1667, 1.8333]` rather than `[0, 0.625, 1.375, 2]`.
+  * **a non-positive scale is ignored**, falling back to `in/out` — measured
+    with `0.0` and `-1.0`, both giving the no-scale answer. A kernel that
+    divided by them gives `inf` or a mirrored grid.
+  * **`align_corners=true` ignores the scales entirely** — measured with
+    `scales_w=9.0`, which changes nothing.
+
+And the short circuit: **when `out == in` on an axis the axis is copied**, with
+no grid at all. Not "the grid happens to be the identity" — measured, `out ==
+in` with `scales_w=0.5` still copies, where the grid would have resampled.
+
+### 20.3 Precision, and the direction that is not obvious
+
+`opmath_t` is `f32` for `float16`/`bfloat16`/`float32` and `f64` for
+`float64`. Both halves measured, and they point opposite ways:
+
+```
+float16 computed in f32 and narrowed once    0 of 143 differ from upstream
+float16 computed in f64 and narrowed once    2 of 143 differ
+float32 computed in f64 and narrowed once  241 of 286 differ
+```
+
+So this is **not** "compute as wide as possible". `float32` has to be computed
+in `float32`, which is why the kernel casts through `f32` explicitly rather
+than staying in the `f64` that `read_flat` hands over — the shape of bug the
+brief's `_weight_norm_interface` note describes, met from the other side.
+
+### 20.4 The `uint8` gap, and how it was decided
+
+Upstream **computes** `uint8`, and not by rounding a bilinear result. Over 60
+random shapes (5584 elements), `round-half-away-from-zero` applied to the
+`float32` answer disagrees with upstream's `uint8` answer on **355** of them —
+94% right, which is exactly the kind of number that passes a small case set.
+Upstream runs a separate fixed-point kernel there. Refused by name, with a
+`c_error` case watching it, rather than shipping the 94% rule.
+
+The other refusals are upstream's, in upstream's own measured order:
+`output_size` length, then input rank, then "sizes greater than 0", then the
+non-empty check, then the dtype. `N == 0` is accepted (the non-empty check
+looks at the product of the dims *after* the batch) and `C == 0` is not.
+
+### 20.5 What the `.vec` cases caught
+
+The composite was written with "an explicit `output_size` wins over
+`scale_factors`". Upstream raises:
+
+```
+RuntimeError: Must specify exactly one of output_size and scale_factors
+```
+
+Two golden cases failed as `SILENT DIVERGENCE: torch raised ... but c computed
+a value`, which is the harness reporting the composite computing where upstream
+refuses. **No dispatch key exists for `.vec` at all**, so nothing but a
+spelling case could have seen it — the third time this round (after §15.4 and
+§18.2) that the door and not the kernel was the defect.
+
+### 20.6 Counts
+
+| gate | before §20 | after |
+|---|---:|---:|
+| `pytests/run.sh` | 272 | **272** |
+| `compare.py` | 5941/5941, ops=155 | **6033/6033, ops=156** (+92 cases, +1 op) |
+| `verify_schemas.py` | 4430/4430 | **4433/4433** (+3) |
+| schema identities | 242 | **242** (unchanged) |
+| core-tagged ops | 93 | **93** (unchanged) |
+| sweep26 (shim) | 22/26 | **22/26** |
+
+Two counts that do **not** move, both checked rather than noticed:
+`upsample_bilinear2d.default`'s tags are `['pt2_compliant_tag']` — it is *not*
+core, unlike `native_group_norm` beside it — and the identity count is
+unchanged because, like `native_group_norm`, this op is reached through a
+`bootstrap.py` composite and `_aten_dispatch` and appears in neither schema
+table.
+
+### 20.7 The sweep
+
+**22/26. `zoedepth` moved one wall**, and off the kernel class entirely:
+
+```
+zoedepth   FAIL  torch.relu_(...) -- overload resolution has no table entry for this op
+```
+
+`aten.relu_.default` has had a kernel since docs/KERNELS.md; only the free
+function's name is missing. `vits`, `sew_d` and `sam3_video` are unchanged.
+
+## 21. `torch.relu_` and `torch.concat` — two doors, and **zoedepth crosses**
+
+Neither is a kernel. Both are §13.1's finding again: *the wall behind a kernel
+turned out to be a name.*
+
+| wall | what it cost | sweep after |
+|---|---|---|
+| `torch.relu_(...)` — no `overloads.json` entry | one table entry. `aten.relu_.default` has had a kernel since docs/KERNELS.md and `x.relu_()` worked the whole time | 22/26 → `torch.concat` |
+| `torch.concat(...)` — no entry | a `bootstrap.py` composite. `aten::concat` is `CompositeImplicitAutograd`; a `TorchDispatchMode` trace fires `aten.cat.default` and nothing else | **23/26** |
+
+`relu_` adds **no** schema identity (`methods.json` already named
+`aten::relu_`, so `overloads.json` gives the same schema a second door) and
+`concat` adds none either, being a composite. `verify_schemas` moves by 1 for
+`relu_` and 0 for `concat`, which is the check that the second went in as a
+composite and not as a table entry.
+
+There is deliberately no `Tensor.concat`: upstream has none
+(`hasattr(torch.Tensor, "concat")` is False on 2.13.0), and adding one would
+invent a surface.
+
+### 21.1 `zoedepth` — 23/26
+
+```
+llama gpt2 qwen2 mistral gemma gpt_neox opt mpt starcoder2 stablelm olmo phi
+mixtral bert bloom cohere falcon gpt_bigcode mamba persimmon
+deberta deberta_v2 zoedepth                                   TOTAL 23/26
+```
+
+### 21.2 …and whether it *agrees*
+
+A forward that runs is not a forward that agrees, so the toy model was run on
+both sides under one seed and diffed. **The weights are diffed too** — "the
+initialisers agree under the same seed" is itself a claim, and a forward that
+matches on a model that does not is not evidence about kernels.
+
+```
+architecture      zoedepth
+inputs            identical
+weights           129 tensors, 196221 elements, 0 differing, max |diff| = 0
+shape             [2, 32, 32]  (2048 elements)
+sum               1419.565185546875 vs 1419.565185546875     bit-identical
+max |diff|        2.98023e-07
+```
+
+**The final tensor's argmax is not evidence here, and saying so is part of the
+result.** `predicted_depth` on this toy config has **2 distinct values across
+2048 elements** — a span of `1.19e-07`, which is smaller than the disagreement
+between the two runs. An argmax over that is decided by float noise on both
+sides, so reporting it as a match or a mismatch would be reporting the tie.
+(The comparison script prints the margin to the runner-up beside every argmax
+for exactly this reason.)
+
+So the evidence is the **115 module outputs**, captured with forward hooks on
+both sides:
+
+```
+module outputs    115 compared
+  worst |diff| / max|value|   1.87e-06   (neck.fusion_stage...residual_layer2.convolution2)
+  worst |diff|                1.25e-06   (backbone.encoder.layer.1.norm1, max|v| = 1.73)
+  deepest rich tensor         metric_head.conditional_log_binomial.mlp.0
+                              163840 elements, 163690 distinct
+  its argmax                  77220 vs 77220   MATCH   (max |diff| 1.11e-15)
+```
+
+`1.87e-06` relative is about 16 ULP at `float32`, accumulated through a
+two-layer backbone, a four-stage fusion neck and the metric head. The
+argmax **that does have signal** — over a 163840-element tensor with 163690
+distinct values — matches exactly.
+
+One trap avoided in reading those numbers: the *per-element* worst relative
+error over the module outputs is `0.48`, and it is meaningless. It occurs on
+`metric_head.attractors.0.conv1`, whose largest element is `3.2e-10`; the
+absolute difference there is `3.3e-16`. Scaling to the tensor's own magnitude
+rather than to each element is what makes the number readable, and the script
+does that.
+
+### 21.3 Where the other three stand
+
+`sew_d` and `sam3_video` did not move (`torch.avg_pool1d`, `div.Tensor`'s mixed
+dtypes); `vits` did not either (`'IntTensor' object is not subscriptable`).
+
+## 22. `erf`, `sign`, `avg_pool2d` — and **sew_d crosses**
+
+Three kernels, each swept on its own, in the order sew_d asked for them.
+
+Before writing any of them, the remaining work was **measured rather than
+walked**: the toy model was run on upstream under a `TorchDispatchMode` logger
+and the set of ops it fires diffed against `_aten_all_implemented()`. That is
+ARCH26.md §6's method, and it turns "walk one wall at a time and find out" into
+a list:
+
+```
+vits    50 ops fired, 2 not implemented   leaky_relu.default   randn_like.default
+sew_d   47 ops fired, 3 not implemented   avg_pool2d.default   erf.default   sign.default
+```
+
+It names kernels and not spellings, so it is a lower bound — but a lower bound
+that costs one run per architecture rather than one build per wall.
+
+### 22.1 `aten.erf.default`
+
+`sew_d` inherits DeBERTa's GELU, which spells the error function out
+(`x * 0.5 * (1 + erf(x / sqrt(2)))`) rather than calling `aten.gelu`, so the op
+fires on its own — twice per forward on a `(1, 19, 37)`.
+
+A plain member of the `unary_float` family, and that was measured rather than
+assumed: `int64`, `int32`, `uint8` and `bool` all give `float32`, and each float
+dtype keeps its own. `silu` — the other activation-shaped op in this file —
+*refuses* an integral input, so which of the two rules applies is not derivable
+from "it is an activation".
+
+**One golden case had to have its data changed to be able to run at all.**
+`erf(-0.0)` is `-0.0`, which `==` cannot see, so it needs `_signed_zero_check`
+— an **exact** comparator. But candle's `erf` is `libm::erf` and lands 1.2e-07
+from upstream's own kernel at `x = 1` (`gelu_default` already records the same
+divergence at 4.47e-08), so an exact comparator on ordinary values fails on the
+*erf* rather than on the sign bit — which is what the first run did. The case
+now uses only `±0.0` and `±inf`, whose erf is exact on both sides (`-0.0`,
+`+0.0`, `-1.0`, `+1.0`), so it isolates the one property the tolerant
+comparator cannot see and nothing else.
+
+### 22.2 `aten.sign.default`
+
+`modeling_sew_d.py:160` — `torch.sign(relative_pos)` on the
+disentangled-attention bucket table, once per forward on a `(19, 19)`.
+
+**Its dtype rule is the opposite of `erf`'s, in the same section.** `sign` keeps
+the input dtype on *every* dtype including `bool` (`sign(bool)` is `bool`);
+`erf` promotes every integral input to `float32`. Both were measured; neither
+follows from the other, and they landed together precisely so that could be
+said.
+
+Three values fix the definition, and each is where `x > 0 ? 1 : -1` — the
+plausible two-way spelling — is wrong:
+
+```
+sign(0.0)    0.0    there is a zero in the range
+sign(nan)    0.0    NaN is neither > 0 nor < 0
+sign(-0.0)  +0.0    POSITIVE zero -- checked with copysign, not with ==
+```
+
+candle's `Sign` is `f32::from(v > 0.) - f32::from(v < 0.)` on floats and
+`min(1, v)` on the unsigned types, which gives all three, so this delegates.
+
+### 22.3 `aten.avg_pool2d.default`
+
+`nn.AvgPool1d(kernel_size=2, stride=2)` in sew_d's encoder →
+`torch.avg_pool1d` → **`aten.avg_pool2d.default`**, because `aten::avg_pool1d`
+is `CompositeImplicitAutograd`: measured, `torch.avg_pool1d(x, 3, 2)` fires
+`unsqueeze(-2)`, `avg_pool2d([1,3],[1,2])`, `squeeze(-2)` and nothing else. So
+the 1-D name is a `bootstrap.py` composite and the 2-D op is the leaf. The
+degenerate axis is **H**, not W.
+
+**The two boundaries that are not the same boundary.** Upstream computes, per
+output cell:
+
+```
+start = out*stride - pad
+end   = min(start + kernel, extent + pad)        <- clipped to the PADDED extent
+count = (h_end - h_start) * (w_end - w_start)    <- taken HERE
+start = max(start, 0);  end = min(end, extent)   <- now clipped to the REAL extent
+divisor = divisor_override, else count if count_include_pad else the clipped area
+```
+
+The order between those two clips *is* `count_include_pad`. Measured on
+`arange(20).reshape(1,1,4,5)` with `kernel=2, stride=2, padding=1`, the cell at
+`(0,1)` sums `1+2 = 3` and divides by **4** with `count_include_pad=True`
+(`0.75`) and by **2** without (`1.5`). Same sum, same window, two answers — and
+`True` is the default, so an implementation that divided by what it summed is
+wrong on the *default* path.
+
+Other rules, each measured:
+
+  * **`stride=[]` means the kernel size, not 1.** A `stride=None` case sits
+    beside the explicit one so the two must agree.
+  * **`ceil_mode` has a drop rule.** `ceil` can produce a last window starting
+    at or past the end of the padded input, and upstream drops it. Cased on a
+    `1x5` where ceil gives 3 columns and floor gives 2.
+  * **`int64` computes and every other integral dtype does not.** `int32`,
+    `int16`, `int8`, `uint8` and `bool` all raise `"avg_pool2d" not implemented
+    for '<Type>'`. Measured one dtype at a time — "integral is supported" would
+    have been the wrong summary.
+  * **the integral divide truncates toward zero.** `11/4` is `2`, `-11/4` is
+    `-2`, not `-3`.
+
+Precision, and it goes both ways again:
+
+```
+float16/bfloat16 accumulated in f32 and narrowed once   max relative 0.0 vs upstream
+float32          accumulated in f64 and narrowed once   max relative 1.43e-05  -- WORSE
+```
+
+`1.43e-05` is past this repository's `float32` golden tolerance, so `f32`
+accumulates in `f32`. This is the second op this round (`sigmoid`,
+`upsample_bilinear2d`, and now this) where "compute as wide as possible" is the
+wrong rule.
+
+A measurement error worth recording, because it nearly set the accumulate type
+the other way: the first `float16` comparison narrowed **upstream's `float32`
+result on the original `float32` data** rather than on the `float16` values,
+and reported 90 of 216 differing. Comparing like with like — `f16` values
+widened to `f32`, pooled, narrowed — gives 0.
+
+### 22.4 The sweep, and **sew_d — 24/26**
+
+```
+after erf          23/26   sew_d still on torch.avg_pool1d
+after sign         23/26   sew_d still on torch.avg_pool1d
+after avg_pool2d   24/26   sew_d PASSES
+```
+
+The count moved on the third of the three, and the first two moved no wall at
+all — `erf` and `sign` fire *later* in the same forward than `avg_pool1d` does,
+so the sweep's first-wall report could not see them being fixed. Only the
+upstream op scan in §22 above could, which is the argument for having run it.
+
+### 22.5 …and whether `sew_d` agrees
+
+```
+architecture      sew_d
+inputs            identical
+shape             [1, 39, 32]  (1248 elements, 1217 distinct)
+argmax            91 vs 91      MATCH   (margin to runner-up 0.00525)
+argmin            1056 vs 1056  MATCH
+sum               5.7529401779174805 vs 5.7529377937316895
+max |diff|        8.9407e-08          (output span 0.312, so 2.9e-07 of it)
+module outputs    60 compared, worst |diff|/max|v| = 5.88e-07
+  deepest rich tensor  encoder.pos_conv_embed.conv.parametrizations.weight
+                       8192 elements, 8192 distinct
+  its argmax           7554 vs 7554   MATCH   (max |diff| 2.24e-08)
+```
+
+Unlike `zoedepth`, this output has signal — 1217 distinct values out of 1248 —
+so the argmax is real evidence and its margin to the runner-up (`0.00525`) is
+five orders of magnitude larger than the disagreement (`8.9e-08`).
+
+**The weights do not agree bit for bit, and that is a known divergence rather
+than a surprise.** 11 of 27610 elements differ, all of them in one tensor:
+
+```
+encoder.pos_conv_embed.conv.parametrizations.weight.original0
+n=16, 11 differing, max |diff| 2.98e-07, max |value| 0.8327
+```
+
+That is `g`, the weight-norm *magnitude*, computed at **construction** by
+`aten.norm.ScalarOpt_dim` — §11's kernel, whose reduction order differs from
+upstream's by float32 rounding. So the two models are not bit-identical before
+the forward starts, and the 8.9e-08 the forward then shows is on top of a
+2.98e-07 difference in one parameter. Saying "the forward agrees" without
+saying that would be claiming more than was measured.
+
+## 23. `log2`, `leaky_relu`, `div`'s promotion, `einsum` — and **sam3_video crosses**
+
+The same upstream op scan §22 used, re-run for the two architectures still
+standing, is what set this order:
+
+```
+vits         50 ops fired, 2 not implemented   leaky_relu.default   randn_like.default
+sam3_video   69 ops fired, 3 not implemented   log2.default   rand.default   randn.default
+```
+
+### 23.1 `aten.log2.default`
+
+`expm1`'s shape exactly: **the dtype rule is `unary_float`'s and the
+computation is not.** `int64`, `uint8` and `bool` all give `float32` and each
+float dtype keeps its own, so the promotion is shared. But candle has no
+`log2`, and `t.log()? / ln(2)` is a different function at the last bit —
+measured at `float64` it disagrees with `torch.log2` on 2 of 7 probe points,
+because upstream calls `std::log2` where that divides two separately-rounded
+values. `f64::log2` reproduces upstream on every `float64` probe, and
+`float16`/`bfloat16` are bit-identical through `f32` over 2000 random points.
+
+The powers of two are the cases that show it: `log2(8.0)` must be exactly `3.0`.
+
+### 23.2 `aten.leaky_relu.default`
+
+**`silu`'s side of the dtype split, not `relu`'s.** `relu` has an integral CPU
+kernel upstream and `leaky_relu` does not — `int64`, `uint8` and `bool` all
+raise `"leaky_relu_cpu" not implemented`. Two ops that differ by one
+multiplication and do not share a dtype rule.
+
+The plausible wrong implementation is `max(x, slope * x)`, and it agrees with
+`x < 0 ? slope*x : x` for **every slope in [0, 1]**, which is every slope anyone
+writes. It differs at a *negative* slope: `leaky_relu(-1, -0.5)` is `0.5`
+upstream and `-1` from the max spelling. `negative_slope` is a `Scalar` with no
+sign constraint and upstream computes it, so that case is here — along with
+`x < 0` versus `x <= 0`, which differ only in the sign of the zero and need
+`_signed_zero_check` to see.
+
+It is a `torch._C._nn` composite, not a table entry: `F.leaky_relu` *is* that
+binding, and upstream has neither `torch.leaky_relu` nor `Tensor.leaky_relu`
+(`hasattr` is False for both), so a table entry would invent a surface.
+
+### 23.3 `div.Tensor` promotes its operands
+
+`sam3_video` stopped on
+
+```
+aten.div.Tensor: dtype promotion not implemented in torch._C shim: float32 vs int64
+```
+
+which is neither a missing kernel nor a missing name — it is `same_dtype`
+refusing a mixed pair. `mul` has promoted since docs/OPS4.md; `div` now does
+too, through the same condition.
+
+**`add` and `sub` still refuse, and that is asserted rather than left
+implicit.** Upstream promotes all four; the split here is a record of which
+callers have been measured, not a principle (docs/BIND.md §9), and nothing in
+the sweep reaches `add`/`sub` with a mixed pair. Two `c_error` golden cases
+watch them.
+
+The **whole 10×10 promotion grid** is re-run for `div` rather than only the one
+cell, because `div`'s result rule is not `mul`'s: true division floats an
+integral pair, so `int64 / int64` is `float32` where `int64 * int64` is
+`int64`. A promotion rule copied from `mul` and a *result* rule copied from
+`mul` are two different mistakes and only the full grid separates the second.
+The same pair of assertions went into the meta test for the same reason.
+
+One cell disagrees and it is pre-existing: **`bool / bool`**. Upstream gives
+`float32`; `arith_tag` refuses `bool` arithmetic outright (BOOL.md §2.2), and
+`mul`'s own grid never sees it because `bool * bool` stays `bool` and *is*
+logical-and. Watched as `c_error`.
+
+### 23.4 `torch.einsum`
+
+`modeling_sam3.py:2113` — `torch.einsum("bqc,bchw->bqhw", mask_embeddings,
+instance_embeds)`, once per forward.
+
+`aten::einsum` is `CompositeImplicitAutograd`, and this reproduces its
+decomposition rather than inventing one. Measured, `einsum("bqc,bkc->bqk", ...)`
+fires `unsqueeze`, `permute`, `view`, **`bmm`**, `view`, `permute`, `view` —
+every one already here, and `aten.einsum.default` never fires. The part that
+matters numerically is that the contraction really is a **`bmm`**, so the
+accumulation order is upstream's rather than a hand-rolled sum's.
+
+The algorithm, per contraction:
+
+```
+batch    labels in BOTH inputs and still needed afterwards
+summed   labels in BOTH inputs and not needed afterwards
+free_a   labels in a only        free_b   labels in b only
+
+a -> (batch, free_a, summed) -> (B, M, K)
+b -> (batch, summed, free_b) -> (B, K, N)     bmm -> (B, M, N) -> permuted to the output
+```
+
+A label appearing in one operand only and not in the output is summed out of
+that operand *first*, before the pairing.
+
+Ten equations are cased, chosen so that a decomposition handling the common
+shape and nothing else fails somewhere — including the implicit-output form
+(`ij,jk`, whose output is alphabetical: `ik`, not `ki`), a fully-contracted
+`i,i->` where both M and N are empty products, and `abc,abd->acd`, where `b` is
+contracted while `a` is a batch, which is the case that separates the two.
+
+Refused by name, with `c_error` cases: an **ellipsis** (a variable number of
+batch axes, needing its own rank arithmetic) and a label **repeated inside one
+operand** (`ii->i` is a diagonal, not a contraction, and there is no
+`aten.diagonal` kernel here).
+
+It takes **both** calling conventions, because upstream has both:
+`torch/functional.py:362` unpacks "the old interface of passing the operands as
+one list argument" and line 372 then calls `_VF.einsum(equation, operands)` —
+with a list. Writing only the list form failed every golden spelling case,
+which is how that was found.
+
+### 23.5 The sweep
+
+```
+after log2         24/26   sam3_video moved to torch.einsum
+after leaky_relu   24/26   (landed together with log2; vits' wall is earlier)
+after div promote  24/26   sam3_video moved to torch.einsum
+after einsum       25/26   sam3_video PASSES
+```
+
+`rand` and `randn` — on the op scan's list for `sam3_video` — were **not
+needed**: they fire on a branch the detector forward does not take. Written
+down because the scan is a lower bound in one direction and an over-estimate in
+the other, and this is the second direction.
+
+```
+llama gpt2 qwen2 mistral gemma gpt_neox opt mpt starcoder2 stablelm olmo phi
+mixtral bert bloom cohere falcon gpt_bigcode mamba persimmon
+deberta deberta_v2 zoedepth sew_d sam3_video               TOTAL 25/26
+```
+
+### 23.6 …and whether `sam3_video` agrees
+
+```
+architecture      sam3_video
+inputs            identical
+weights           258 tensors, 266290 elements, 0 differing, max |diff| = 0
+shape             [1, 5]  (5 distinct values)
+argmax            0 vs 0  MATCH   (margin to runner-up 0.00189)
+argmin            4 vs 4  MATCH
+sum               0.025955114513635635 vs 0.025955114513635635   bit-identical
+max |diff|        5.58794e-09          (1.26e-07 of the output span)
+module outputs    164 compared, worst |diff|/max|v| = 1.20e-06
+  deepest rich tensor  detr_encoder.layers.0.mlp.activation_fn
+                       65536 elements, 29653 distinct
+  its argmax           40003 vs 40003   MATCH   (max |diff| 2.53e-07)
+```
+
+**The first attempt at this comparison failed, and the reason is worth
+recording because it is a live gap.** The sweep's toy script draws
+`input_ids = torch.randint(0, 1000, (1, 16))`, and the shim's `randint` does
+**not** reproduce upstream's sequence — its own golden case says so ("random
+draw, sequence unchecked"). So the two runs were different forwards:
+
+```
+pixel_values (torch.rand)      150528 of 150528 identical
+input_ids    (torch.randint)       16 of 16 DIFFERING
+pred_logits                    max |diff| 0.0175 -- 40% of the output span
+argmin                         4 vs 2   DIFFER
+```
+
+`torch.rand` matching bit for bit is the control that says the RNG *position*
+is not the problem — it is `randint`'s draw. The comparison now uses a fixed
+token list so that it measures the kernels rather than the RNG; the `randint`
+gap is untouched and is the same one its golden case already records.
+
+## 24. The four gaps behind `vits` — and **26 of 26**
+
+`vits`' tail was not kernels. Three of the four are surface, and the fourth is
+a refusal §10.3 wrote down as "no measured caller".
+
+### 24.1 `torch.IntTensor` and its nine siblings
+
+`modeling_vits.py:349` builds `torch.IntTensor([self.hidden_size])` and then
+subscripts it. The ten legacy per-dtype classes were `_ShimMeta` placeholders,
+so the model stopped on `'IntTensor' object is not subscriptable` — a
+`TypeError` from a type that was never a tensor class at all.
+
+**They must stay real types.** A factory function does not work, and the
+failure is not subtle: these names appear in *annotations*, which Python
+evaluates at import time.
+`transformers/modeling_flash_attention_utils.py:602` is
+`max_seqlen_q: int | torch.IntTensor | None = None`, and `int | <function>` is
+a `TypeError` that stops `import transformers` dead — measured while probing.
+So each is a class whose `__new__` returns a `TensorBase`, which is also what
+upstream does: `type(torch.IntTensor([1]))` is `torch.Tensor`.
+
+All three of the legacy constructor's forms, and the ambiguity is why §12.1
+ground 3 exists:
+
+```
+IntTensor(2, 3)      a SIZE -> a (2, 3) tensor of int32
+IntTensor([2, 3])    DATA   -> a (2,) tensor holding 2 and 3
+IntTensor(existing)  a re-wrap, cast to the class's dtype
+```
+
+`[2, 3]` looks exactly like a size list. The data branch is therefore decided
+**by type and never by shape**.
+
+**This is §12.1's own condition being met, not overturned.** That section kept
+`torch.Tensor([3, 4])` refused on the ground that "nothing in the
+26-architecture sweep reaches it, and the two forms are used by different
+code". `vits` now reaches the *typed* data form, so the typed classes are
+implemented and `torch.Tensor([...])` — which still has no caller in the sweep
+— still refuses. The inconsistency is deliberate and is the rule the repository
+already states: surface follows a measured caller.
+
+`CharTensor` refuses from one layer down (candle has no `int8` storage) and
+names the *dtype*. `ShortTensor` computes — `int16` is storable here, checked
+rather than assumed from `int8` being absent.
+
+### 24.2 A `numpy` scalar has to bind where a Python number would
+
+`modeling_vits.py:1379` is
+`predicted_lengths * np.prod(self.config.upsample_rates)`, and `np.prod([4,4])`
+is an `np.int64` — not a Python `int` and not a subclass of one. The resolver's
+`Scalar` predicate tested `isinstance(value, (bool, int, float, complex))`, so
+nothing bound; Python fell back to `np.int64.__rmul__`, which asked the tensor
+for `__array__`, which landed on `TensorBase.numpy` — a raising stub.
+
+Upstream takes it (measured: `torch.tensor([1,2]) * np.int64(16)` fires
+`aten.mul.Tensor` and keeps `int64`). The fix is `numbers.Number` in the
+predicate and `__index__`/`__float__` in the kernel's scalar reader — **the
+protocol, not a numpy import**, because `_C` is built before numpy would be
+importable.
+
+**`__index__` is tried before `__float__` and that ordering is load-bearing.**
+`np.int64` has both. Taking the float would make it a `Scalar::Float`, which
+`arith_tag`'s wrapped-number rule turns into a `float32` result from an `int64`
+tensor — a wrong dtype, silently. Sabotage S21 is exactly that swap.
+
+### 24.3 1-D transposed convolution
+
+§10.3 refused it, in these words: *"candle supports it fully, groups included,
+but nothing measured reaches it, and this round does not add unreached
+surface."* `vits`' HiFi-GAN decoder reaches it —
+`nn.ConvTranspose1d(channels, channels // 2, kernel, stride=rate,
+padding=(kernel - rate) // 2)`, once per upsample rate.
+
+The refusal is lifted for 1-D and **stands for grouped 2-D**, and the asymmetry
+is candle's rather than upstream's: `conv_transpose1d` takes a `groups`
+argument and `ParamsConvTranspose2D` has no field for one. So the 1-D path
+honours `groups` and the 2-D path still refuses a grouped call by name.
+
+Two `c_error` golden cases flipped on their own when this landed —
+
+```
+gap appears CLOSED: both sides now succeed, promote this case to expect=match
+```
+
+— which is what `c_error` is for, and they are now `match` cases diffing values.
+`torch.conv_transpose1d` joins its 2-D sibling in `bootstrap.py`, with the
+same argument order that is **not** `conv1d`'s (`groups` before `dilation`) and
+with `_as_list`'s width at **1**: passing 2 would hand
+`aten.convolution.default` a two-element `stride` for a rank-3 input, which is
+where a copy-paste of the 2-D body goes wrong. Sabotage S18.
+
+### 24.4 The sweep — 26 of 26
+
+```
+llama gpt2 qwen2 mistral gemma gpt_neox opt mpt starcoder2 stablelm olmo phi
+mixtral bert bloom cohere falcon gpt_bigcode mamba persimmon
+deberta deberta_v2 vits zoedepth sew_d sam3_video          TOTAL 26/26
+```
+
+Upstream is 26/26 on the same script, re-run at the end.
+
+### 24.5 …and whether `vits` agrees
+
+**`vits`' forward is stochastic, and this is the one architecture where the
+draw cannot be made to agree.** `modeling_vits.py:1373` is
+
+```python
+prior_latents = prior_means + torch.randn_like(prior_means) * torch.exp(prior_log_variances) * self.noise_scale
+```
+
+and `prior_means` is **not contiguous** there — measured, on both sides.
+Upstream's `normal_` CPU kernel branches on exactly that: `size >= 16 &&
+self.is_contiguous()` takes the vectorised `normal_fill`, anything else takes
+the scalar Box–Muller path. Upstream's `empty_like` preserves the input's
+layout, so upstream takes the **scalar** path for this 256-element draw; the
+shim's tensors are always materialised (docs/VIEWS.md §6.4), so its
+`empty_like` is contiguous and it takes the **vectorised** one.
+
+Both are torch's own streams, from the same state. That was established rather
+than assumed:
+
+```
+normal_ at n = 6, 15, 16, 17, 256           identical on both sides
+normal_ after a prefix draw of 1, 3, 4, 5, 16  identical on both sides
+the RNG state at the call site               identical (probe draw agrees)
+randn_like(zeros(1,32,8)) from a fresh seed  identical
+the draw inside the forward                  DIFFERENT
+is_contiguous(prior_means)                   False, on both sides
+```
+
+So the difference is the **path selection**, and the shim cannot see the
+property it selects on. This is a consequence of a structural divergence
+already recorded, not a new one, and it is not fixable without non-contiguous
+tensors.
+
+The comparison therefore replaces `randn_like` **on both sides** with the same
+contiguous draw — same seed, same distribution, same count, no layout-dependent
+branch — so that what is left is the kernels:
+
+```
+architecture      vits
+inputs            identical
+shape             [1, 128]  (63 distinct values)
+argmin            31 vs 31  MATCH
+argmax            22 vs 26  DIFFER -- and it is a 47-WAY TIE
+sum               46.05282974243164 vs 46.052818298339844
+max |diff|        5.51343e-06        (output span 2, so 2.8e-06 of it)
+module outputs    64 compared, worst |diff|/max|v| = 5.51e-06
+  deepest rich tensor  flow.flows.0.wavenet.in_layers.0.parametrizations.weight
+                       6144 elements, 6143 distinct
+  its argmax           1734 vs 1734   MATCH   (max |diff| 1.49e-08)
+```
+
+**The argmax differing is a tie, and the count is the evidence**: the waveform
+is clipped, and `1.0` occurs **47 times** and `-1.0` **18 times**. The margin to
+the runner-up is exactly `0`, which the comparison script prints beside every
+argmax for this reason. The argmax that does have signal — over a
+6144-element tensor with 6143 distinct values — matches exactly.
+
+**The weights are not bit-identical, in the same place `sew_d`'s were not.**
+147 of 72955 elements differ, every one of them in a
+`*.parametrizations.weight.original0` — the weight-norm magnitude `g` computed
+at construction by `aten.norm.ScalarOpt_dim` (§11), max `|diff|` `1.19e-07`
+across six tensors. No other weight differs at all.
+
+### 24.6 The three architectures' numeric agreement, side by side
+
+| | `zoedepth` | `sew_d` | `sam3_video` | `vits` |
+|---|---|---|---|---|
+| weights differing | 0 / 196221 | 11 / 27610 | 0 / 266290 | 147 / 72955 |
+| …and where | — | `weight.original0` | — | `weight.original0` |
+| output max \|diff\| | 2.98e-07 | 8.94e-08 | 5.59e-09 | 5.51e-06 |
+| output sum | bit-identical | 5.7529402 vs 5.7529378 | bit-identical | 46.052830 vs 46.052818 |
+| argmax | tie (2 distinct / 2048) | **MATCH**, margin 0.00525 | **MATCH**, margin 0.00189 | tie (47-way) |
+| argmin | tie | **MATCH** | **MATCH** | **MATCH** |
+| module outputs | 115, worst 1.87e-06 | 60, worst 5.88e-07 | 164, worst 1.20e-06 | 64, worst 5.51e-06 |
+| deepest rich argmax | **MATCH** (163840 el.) | **MATCH** (8192 el.) | **MATCH** (65536 el.) | **MATCH** (6144 el.) |
+
+Two of the four have a degenerate final tensor — `zoedepth`'s toy depth map has
+**2 distinct values across 2048 elements** and `vits`' waveform is clipped to
+±1 — so their final argmax is a tie and is reported as one rather than as a
+match or a mismatch. For both, the argmax over the deepest tensor that *does*
+have signal matches exactly.
+
+## 25. Sabotage
+
+Twenty-one faults, each the **plausible wrong implementation** the
+corresponding section claims its cases separate. One at a time: patch, rebuild,
+`compare.py`, `run.sh`, revert. Baseline is 6374/6374 golden and `run.sh` exit 0.
+
+Every row was re-run against **that** baseline. The first pass ran against
+6372, before §25.2's two `log2` cases existed; only the two totals moved (by
+exactly 2, and only for the two faults whose case sets are disjoint from
+`log2`), and no `failed` count changed. Re-running rather than adding 2 to the
+totals is the difference between a measurement and an inference.
+
+| # | fault | golden | `run.sh` | what it proves |
+|---|---|---|---|---|
+| S1 | `clamp_min` shares `clamp`'s bool-refusal wording | **6374/6374, 0 failed** | 1 FAIL | §15.1 exactly: the golden case is `both_error` and does not compare messages, so only `test_shim.py` can see it |
+| S2 | `all` shares `any`'s empty identity (`0`) | 6366/6374, **8 failed** | 1 FAIL | the `all` over nothing is `True`; 8 cases, all of them empty inputs |
+| S3 | `all`/`any` always return `bool` | 6347/6374, **27 failed** | 1 FAIL | the `uint8` rule, across **both** ops — which is why it was fixed in `any` too |
+| S4 | `sigmoid` computed in the reduced dtype | 6372/6374, **2 failed** | 0 FAIL | exactly the two `BIT-EXACT` `f16`/`bf16` cases. Every other case at every dtype passes — §17.2's claim, demonstrated |
+| S5 | `flip` accepts a repeated dim | 6372/6374, **2 failed** | 1 FAIL | the two `both_error` cases, `[0,0]` and `[1,-1]` |
+| S6 | `flip` reads the keyword `dim` | 6368/6374, **6 failed** | 1 FAIL | exactly the six *spelling* cases; all 60 dispatch-key cases pass, because they pass the list positionally |
+| S7 | `group_norm` applies the affine along the statistics view | 6351/6374, **23 failed** | 1 FAIL | the `C=6, group=3` shape is what sees it |
+| S8 | `group_norm` `rstd` is `sqrt(var+eps)` | 6337/6374, **37 failed** | 1 FAIL | the result nothing reads, caught by cases written for it |
+| S9 | bilinear drops the half-pixel offset | 6343/6374, **31 failed** | 0 FAIL | every `align_corners=False` case on non-symmetric data |
+| S10 | bilinear ignores `scales_h`/`scales_w` | 6371/6374, **3 failed** | 0 FAIL | only the three cases whose geometry makes `1/scale` differ from `in/out` — the other 90 pass |
+| S11 | `avg_pool2d` ignores `count_include_pad` | 6369/6374, **5 failed** | 0 FAIL | only the padded cases; every unpadded one is unaffected, which is right |
+| S12 | `log2` is `log(x)/ln(2)` | 6372/6374, **2 failed** | 0 FAIL | **see below — this one initially missed** |
+| S13 | `leaky_relu` is `max(x, slope*x)` | 6370/6374, **4 failed** | 0 FAIL | the four negative-slope cases, one per float dtype. Every slope in `[0,1]` passes |
+| S14 | `sign` is `x > 0 ? 1 : -1` | 6350/6374, **24 failed** | 0 FAIL | zero, NaN and the dtype rule together |
+| S15 | `div` stops promoting | 6293/6374, **81 failed** | 0 FAIL | the 10×10 grid, minus the cells that were already same-dtype |
+| S16a | `einsum` treats every shared label as a batch axis | **6374/6374, 0 failed** | 0 FAIL | **correct — see below** |
+| S16b | `einsum` aligns the right operand as `(batch, free_b, summed)` | 6369/6374, **5 failed** | 0 FAIL | the contraction axes transposed; five of the ten equations can see it |
+| S17 | `IntTensor([32])` reads the sequence as a **shape** | **6374/6374, 0 failed** | 1 FAIL | **golden is structurally blind — see below** |
+| S18 | `conv_transpose1d` pads its lists to width 2 | 6372/6374, **2 failed** | 0 FAIL | the two spelling cases; the dispatch-key cases pass their lists already-sized |
+| S19 | `avg_pool1d` puts the degenerate axis on W | 6369/6374, **5 failed** | 0 FAIL | the six composite cases, minus `k=1` which is the identity either way |
+| S20 | the `Scalar` predicate stops accepting a numpy scalar | **6374/6374, 0 failed** | 1 FAIL | same blindness as S17 — no dispatch key names a resolver predicate |
+| S21 | the scalar reader takes `__float__` before `__index__` | **6374/6374, 0 failed** | 1 FAIL | an `int64` tensor times an `np.int64` comes out `float32`; only the shim test sees it |
+
+### 25.1 The three faults that do **not** fail golden, and why each is right
+
+**S1, S20, S21 — golden compares by dispatch key.** A refusal *message*, a
+resolver predicate and a scalar reader's ordering are not values of an op, so
+no case can compare them. All three fail `run.sh`, which is where the
+assertions about them live. This is §13.3's finding for the fourth, fifth and
+sixth time this round.
+
+**S16a is not a wrong implementation.** Folding a contracted label into the
+batch group makes the `bmm` an outer product with `K = 1` and leaves the
+summation to the `sum_over` at the end — a different *decomposition* of the
+same function, and slower, but the same answer to the last bit. Reporting it as
+an uncaught fault would be reporting a case set for failing to detect
+correctness. S16b is the same region of the code done *wrongly* (the
+contraction axes transposed), and five cases catch it.
+
+**S17 is a real gap in the case set, and it was closed.** The legacy
+constructors have no aten op — `torch.IntTensor([32])` produces a `lift_fresh`
+and nothing that names the class — so `compare.py` has no key to hang a case
+on, and reading the sequence as a shape left all 6374 green. A `test_shim.py`
+test was written *because of this run*, and S17 now fails `run.sh`. The same is
+true of S20.
+
+### 25.2 The fault that missed, and what it changed
+
+**S12 initially passed every one of the 6374 cases.** `log2` written as
+`log(x) / ln(2)` differs from `std::log2` by **1 ULP**, and the harness's
+`float64` tolerance absorbs 1 ULP completely — while the powers of two that
+made up most of the case set are exact under *both* spellings.
+
+That is §0's third trap ("a tolerance that cannot see the fault") for the second
+time this round, and it was caught by the sabotage run rather than by reasoning.
+The fix is the one `sigmoid` needed: measure where the two actually differ
+(`3, 9, 10, 12, 100` in `float64` and `0.3` in `float32`, on 2.13.0) and compare
+those **exactly**, through `_bitwise_equal_check`. S12 now fails 2 cases.
+
+**A case set that cannot fail is not a case set**, and the only way this was
+going to be found was by breaking the kernel on purpose.
+
+## 26. Final gates
+
+```
+PYTHON=$PY sh rust/torch_c/pytests/run.sh   274 ok, 0 FAIL                    exit 0   (was 268)
+$PY tools/golden/compare.py                 6374/6374, ops=161, pending 1     exit 0   (was 5634/5634, ops=148)
+$PY tools/golden/compare.py --self-test     16 comparators x 11 fault modes    exit 0   (was 15)
+$PY rust/torch_c/pytests/verify_schemas.py  4458/4458                          exit 0   (was 4392/4392)
+( cd rust/torch_c && cargo test --release ) 28 passed                          exit 0
+sweep26 (shim)                              26/26                              exit 0   (was 22/26)
+sweep26 (upstream)                          26/26                              exit 0
+```
+
+Other counted invariants, each re-derived rather than carried:
+
+```
+schema identities         230 -> 248        every one accounted for in test_shim.py
+core-tagged ops            92 -> 98         read off each op's own .tags, one at a time
+decomposition registry   1007 -> 1008       flip.out, the fourth time by that mechanism
+registry_default          461 -> 461        unchanged, which is the check it was a .out
+```
+
+Prefill digests on the final artefact, **all six unchanged** from
+docs/SEQLEN.md §1.3 and §8.8:
+
+```
+f32   S=6 b9fc5553ee1bf6a2   S=32 331668f36da02f21   S=128 00159a9dbd308eda
+      S=512 07c2797dabc4552e   S=1024 eda1e173727bb7f5
+bf16  S=128 7ff8e9334449b147
+```
+
+### 26.1 What is left
+
+Nothing on §8.2's "genuinely still missing" list blocks an architecture any
+more. What remains from it, untouched and with no caller in the sweep:
+
+```
+aten.fmod.{Tensor,Scalar}              aten.remainder.Scalar_Tensor (and __rmod__)
+aten.set_.source_Tensor_storage_offset aten.rand.default   aten.randn.default
+```
+
+`rand`/`randn` are on `sam3_video`'s op scan and were **not** needed — they fire
+on a branch the detector forward does not take (§23.5). They are reachable
+today through the `bootstrap.py` composites over `empty` + `uniform_`/`normal_`;
+what is missing is only the aten key.
+
+Gaps found *this* round, each refused by name with a `c_error` case watching it:
+
+```
+aten.clamp_min.Tensor              maximum with broadcasting; no aten.maximum here (§15.3)
+aten.native_group_norm HxW == 0    upstream's mean=0 with rstd=nan (§19.4)
+aten.upsample_bilinear2d uint8     a separate fixed-point kernel; 355/5584 differ (§20.4)
+einsum with an ellipsis            variable batch rank
+einsum with a repeated label       a diagonal; no aten.diagonal here
+grouped 2-D transposed convolution candle's ParamsConvTranspose2D has no groups (§24.3)
+div.Tensor on bool/bool            BOOL.md §2.2 (§23.3)
+add.Tensor / sub.Tensor mixed      only mul and div promote (§23.3)
+torch.Tensor([3, 4])               still no caller in the sweep (§12.1, §24.1)
+```
+
+And two divergences that are **not** gaps in a kernel:
+
+- **`randint` does not reproduce upstream's sequence** (its own golden case
+  says so). It made the first `sam3_video` and `vits` comparisons different
+  forwards; both now use fixed token lists (§23.6, §24.5).
+- **`randn_like` on a non-contiguous input takes a different `normal_` path**,
+  because the shim has no non-contiguous tensors to preserve
+  (docs/VIEWS.md §6.4). `vits` is the only architecture where this reaches the
+  output (§24.5).

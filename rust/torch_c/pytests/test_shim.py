@@ -3834,14 +3834,31 @@ def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kern
                 assert tuple(out.shape) == shape, (op, dtype, lhs, rhs, tuple(out.shape))
                 assert out.dtype == want, (op, dtype, lhs, rhs, out.dtype)
 
-    # `mul.Tensor` is the one member that promotes a mixed pair, and the three
-    # others refuse it. Both halves, so that a meta kernel which promoted
-    # everything and one which refused everything both fail.
-    out = d("aten.mul.Tensor", _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
-    assert out.dtype == _C.float32, out.dtype
-    out = d("aten.mul.Tensor", _meta_empty([2], _C.float16), _meta_empty([2], _C.bfloat16))
-    assert out.dtype == _C.float32, ("float16 x bfloat16 escapes upwards", out.dtype)
-    for op in ("aten.add.Tensor", "aten.sub.Tensor", "aten.div.Tensor"):
+    # `mul.Tensor` and -- since docs/KERNELS26.md §23 -- `div.Tensor` promote a
+    # mixed pair; `add` and `sub` still refuse it. Both halves, so that a meta
+    # kernel which promoted everything and one which refused everything both
+    # fail.
+    #
+    # `div` moved because `sam3_video` divides a `float32` grid by an `int64`
+    # stride. The split between the four is not a principle -- upstream
+    # promotes all four -- it is a record of which callers have been measured,
+    # and `add`/`sub` have none in the 26-architecture sweep.
+    #
+    # The two `div` assertions below are not the same assertion twice:
+    # `float32 / int64` checks the *operand* promotion (mul's rule) and
+    # `int64 / int64` checks the *result* rule, which is NOT mul's -- true
+    # division floats an integral pair. A meta kernel that copied `mul`
+    # wholesale passes the first and fails the second.
+    for op in ("aten.mul.Tensor", "aten.div.Tensor"):
+        out = d(op, _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+        assert out.dtype == _C.float32, (op, out.dtype)
+        out = d(op, _meta_empty([2], _C.float16), _meta_empty([2], _C.bfloat16))
+        assert out.dtype == _C.float32, (op, "f16 x bf16 escapes upwards", out.dtype)
+    assert d("aten.div.Tensor", _meta_empty([2], _C.int64),
+             _meta_empty([2], _C.int32)).dtype == _C.float32
+    assert d("aten.mul.Tensor", _meta_empty([2], _C.int64),
+             _meta_empty([2], _C.int32)).dtype == _C.int64
+    for op in ("aten.add.Tensor", "aten.sub.Tensor"):
         try:
             d(op, _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
         except NotImplementedError as e:
@@ -7284,7 +7301,20 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `detach` went into `overloads.json` in the same change and moved NOTHING
     # here: `aten::detach` has no `.out` variant, so there is no undeclared
     # overload for a packet to reach.
-    assert r["registry"] == 1007, r["registry"]
+    #
+    # 1008 with `flip` (docs/KERNELS26.md §18), for the fourth time by the same
+    # mechanism: `overloads.json` carries `aten::flip.out`, and grepping the
+    # yaml confirms it declares `flip` and not `flip.out`, so
+    # `register_decomposition(aten.flip)` has a schema to resolve and reaches
+    # one more overload. `registry_default` is again unchanged, because the new
+    # one is `.out`.
+    #
+    # `clamp_min`, `sigmoid` and the three `all` overloads moved NOTHING here,
+    # and it is worth saying why rather than only that they did not: the yaml
+    # declares `clamp_min.out`, `sigmoid.out`, `all.out`, `all.dims_out` and
+    # `all.all_out` itself (checked in the file), so those packets could
+    # already resolve every overload this shim lists for them.
+    assert r["registry"] == 1008, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -7376,7 +7406,50 @@ def test_core_ops_and_op_tags_agree():
     # own `.tags` rather than copied from `div.Tensor` beside them, which
     # happens to carry the same three. +2 for the same reason `remainder` was
     # +2: this counts overloads.
-    assert r["tag_core_count"] == 90, r["tag_core_count"]
+    # 91 with `sigmoid.default` (docs/KERNELS26.md §17), which is
+    # `['core', 'pointwise', 'pt2_compliant_tag']`. **+1 across five new
+    # kernels**, and the four that do not appear are the check that these are
+    # read one at a time rather than assumed from the round:
+    #
+    #     sigmoid.default   ['core', 'pointwise', 'pt2_compliant_tag']   <- counted
+    #     clamp_min.default ['pointwise', 'pt2_compliant_tag']
+    #     all.default       ['pt2_compliant_tag', 'reduction']
+    #     all.dim           ['pt2_compliant_tag', 'reduction']
+    #     all.dims          ['pt2_compliant_tag', 'reduction']
+    #
+    # `clamp_min` not being core while `clamp` (counted at 82) is, and none of
+    # the three `all` overloads being core while `amax` (counted at 83) is, are
+    # both upstream's table rather than anything derivable.
+    #
+    # 92 with `flip.default`, which is `['core', 'pt2_compliant_tag']` -- core
+    # but not `pointwise`, the same shape `repeat` had at 86. Read off its own
+    # `.tags` and not inferred from `sigmoid` beside it, which carries a
+    # different set.
+    #
+    # 93 with `native_group_norm.default` (docs/KERNELS26.md §19),
+    # `['core', 'pt2_compliant_tag']` -- the same pair `native_layer_norm`
+    # beside it carries, read off its own `.tags` anyway. It adds one and not
+    # two: `aten::group_norm` is `CompositeImplicitAutograd` and is installed
+    # in `bootstrap.py` rather than being an implemented op, so it is not in
+    # `_aten_implemented()` and cannot be counted here.
+    #
+    # 94 with `erf.default` (docs/KERNELS26.md §22),
+    # `['core', 'pointwise', 'pt2_compliant_tag']`. `upsample_bilinear2d`,
+    # landed in §20 between these two numbers, moved NOTHING here: its tags
+    # are `['pt2_compliant_tag']` only. Both read off their own `.tags`.
+    #
+    # 95 with `sign.default`, `['core', 'pointwise', 'pt2_compliant_tag']` --
+    # the same three `erf` carries, read off `sign`'s own `.tags` anyway,
+    # since the two have opposite *dtype* rules and agreeing on tags is not
+    # something to infer from that.
+    #
+    # 96 with `avg_pool2d.default`, `['core', 'pt2_compliant_tag']` -- core
+    # but not `pointwise`, unlike `erf` and `sign` beside it, which is the
+    # check that these are read one at a time.
+    #
+    # 98 with `log2.default` and `leaky_relu.default`, both
+    # `['core', 'pointwise', 'pt2_compliant_tag']`. +2, one per overload.
+    assert r["tag_core_count"] == 98, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -8661,7 +8734,60 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # identity, exactly as `__mod__`/`remainder` and `__iadd__`/`add_` are.
     # Getting +3 here would mean the two tables had transcribed `detach`
     # differently.
-    assert len(keys) == 230, len(keys)
+    #
+    # 232 with `clamp_min` (docs/KERNELS26.md §15). **+2, not +4**: it went
+    # into both tables in the same change, with the same two schemas
+    # (`clamp_min|default` and `clamp_min|Tensor`), so `torch.clamp_min` and
+    # `Tensor.clamp_min` are one identity per overload -- the `amax`/`tril`
+    # shape again. Only one of the two has a kernel; `clamp_min.Tensor` is
+    # listed so the tensor-floor spelling refuses by the name of the overload
+    # it needed, exactly as `clamp.Tensor` does beside it.
+    #
+    # 238 with `all` (docs/KERNELS26.md §16). **+6**, which is `any`'s exact
+    # inventory one op over: three kernels (`all`, `all.dims`, `all.dim`) and
+    # three `.out` siblings (`all_out`, `dims_out`, `out`) carried with no
+    # kernel so that `torch.all(x, out=y)` refuses by the right name. Both
+    # tables list the three non-`out` schemas, and they are one identity each
+    # -- the `amax`/`clamp_min` shape again.
+    #
+    # 240 with `sigmoid` (docs/KERNELS26.md §17). **+2**: `aten::sigmoid` and
+    # `aten::sigmoid.out`, the second carried in `overloads.json` with no
+    # kernel so that `torch.sigmoid(x, out=y)` refuses by the right name --
+    # `sqrt`'s shape exactly. `methods.json`'s `sigmoid` adds none; it names
+    # the same default schema.
+    #
+    # 242 with `flip` (docs/KERNELS26.md §18). **+2**: `aten::flip` and
+    # `aten::flip.out`. The second is the **eighth** table-only entry -- the
+    # yaml declares `flip` and not `flip.out` -- which is why `from_tables`
+    # below grows by one and the decomposition registry moves by one, the
+    # `zeros_like.out`/`ones_like.out` mechanism for the fourth time.
+    # `methods.json`'s `flip` adds no identity; it names the same default
+    # schema `torch.flip` does.
+    #
+    # 244 with `erf` (docs/KERNELS26.md §22). **+2**: `aten::erf` and
+    # `aten::erf.out`, the second with no kernel so `torch.erf(x, out=y)`
+    # refuses by the right name -- `sqrt`/`sigmoid`'s shape. `methods.json`'s
+    # `erf` adds none.
+    #
+    # `relu_` (§21) added **none** and it is worth saying which side that came
+    # from: `methods.json` already named `aten::relu_`, so putting it in
+    # `overloads.json` gives one schema a second door, exactly as `detach` did
+    # at 230. `torch.concat` added none either -- it is a `bootstrap.py`
+    # composite over `aten.cat`, in neither table. Nor did
+    # `native_group_norm` (§19) or `upsample_bilinear2d` (§20), for the same
+    # reason: both are reached through composites and `_aten_dispatch`.
+    #
+    # 246 with `sign`. **+2**, the same shape `erf` had: `aten::sign` and
+    # `aten::sign.out`, the second with no kernel so the `out=` spelling
+    # refuses by the right name.
+    #
+    # 248 with `log2`. **+2** -- `aten::log2` and `aten::log2.out` -- and
+    # `leaky_relu`, landed in the same change, adds **none**: it is a
+    # `torch._C._nn` composite, and upstream has neither `torch.leaky_relu`
+    # nor `Tensor.leaky_relu` (`hasattr` is False for both on 2.13.0), so it
+    # is in neither table. Getting +4 here would have meant `leaky_relu` had
+    # been given a table entry that invents a surface upstream does not have.
+    assert len(keys) == 248, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -8676,11 +8802,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # shape as `zeros_like.out` beside it -- which is why it, and not
     # `ones_like` itself, is what moved the decomposition registry by one.
     # `detach` adds nothing here: it is declared in the yaml.
+    #
+    # `flip.out` is the eighth, and the check that it is this mechanism rather
+    # than a transcription slip is that the yaml declares `clamp_min.out`,
+    # `sigmoid.out`, `all.out`, `all.dims_out` and `all.all_out` -- every other
+    # `.out` schema this round added -- so those five are answered by the file
+    # and only `flip.out` is not.
     assert from_tables == [
         ("aten::div", "Scalar_mode_out"),
         ("aten::div", "Scalar_out"),
         ("aten::embedding", "out"),
         ("aten::empty_like", "out"),
+        ("aten::flip", "out"),
         ("aten::floor_divide", "Scalar_out"),
         ("aten::ones_like", "out"),
         ("aten::zeros_like", "out"),
@@ -10585,6 +10718,358 @@ def test_clamp_out_of_place_promotes_where_clamp_underscore_refuses():
     receiver = _arch20_tensor([1.0, 5.0, 10.0])
     receiver.clamp(max=2.0)
     assert receiver.tolist() == [1.0, 5.0, 10.0]
+
+
+def test_legacy_typed_tensor_constructors_read_a_sequence_as_data():
+    """`torch.IntTensor` and its nine siblings (docs/KERNELS26.md §24).
+
+    `vits` needs them: `modeling_vits.py:349` builds
+    `torch.IntTensor([self.hidden_size])` and then subscripts it. Until §24
+    they were `_ShimMeta` placeholders and the model stopped on
+    `'IntTensor' object is not subscriptable`.
+
+    **Golden cannot see any of this.** There is no aten op for a legacy
+    constructor -- `torch.IntTensor([32])` produces a `lift_fresh` and nothing
+    that names the class -- so `compare.py` has no dispatch key to hang a case
+    on, and the sabotage run confirmed it: making the data form read its
+    sequence as a *shape* left all 6374 golden cases green (docs/KERNELS26.md
+    §25, fault S17). This test is the only thing that fails on it.
+
+    The ambiguity is the whole point. `[2, 3]` looks exactly like a size list:
+
+        IntTensor(2, 3)     a SIZE -> (2, 3) of int32
+        IntTensor([2, 3])   DATA   -> (2,) holding 2 and 3
+
+    An implementation that took the sequence as a shape answers `(2, 3)` zeros
+    where upstream answers two numbers, and nothing downstream raises.
+    """
+    made = _C.IntTensor([32])
+    assert tuple(made.shape) == (1,), tuple(made.shape)
+    assert made.dtype == _C.int32, made.dtype
+    assert made.tolist() == [32]
+    # ...and it is subscriptable, which is what vits does with it.
+    assert made[0].tolist() == 32
+
+    # Data, not a shape -- the two forms side by side.
+    assert _C.IntTensor([2, 3]).tolist() == [2, 3]
+    assert tuple(_C.IntTensor(2, 3).shape) == (2, 3)
+
+    # One class per dtype, and the dtype is the class's, not the data's.
+    for name, dtype, data in (
+        ("ByteTensor", _C.uint8, [1, 2]),
+        ("IntTensor", _C.int32, [1, 2]),
+        ("LongTensor", _C.int64, [1, 2]),
+        ("BoolTensor", _C.bool, [True, False]),
+        ("HalfTensor", _C.float16, [1.5, 2.5]),
+        ("BFloat16Tensor", _C.bfloat16, [1.5, 2.5]),
+        ("FloatTensor", _C.float32, [1.5, 2.5]),
+        ("DoubleTensor", _C.float64, [1.5, 2.5]),
+    ):
+        built = getattr(_C, name)(data)
+        assert built.dtype == dtype, (name, built.dtype)
+        assert tuple(built.shape) == (2,), (name, tuple(built.shape))
+
+    # The re-wrap form casts to the class's dtype, as upstream's does.
+    assert _C.IntTensor(_arch20_tensor([1.0, 2.0])).dtype == _C.int32
+
+    # They have to be real TYPES, not factory functions: these names appear in
+    # annotations, which Python evaluates at import time.
+    # `transformers/modeling_flash_attention_utils.py:602` is
+    # `max_seqlen_q: int | torch.IntTensor | None = None`, and `int | <function>`
+    # is a TypeError that stops `import transformers` dead -- measured.
+    assert isinstance(_C.IntTensor, type), type(_C.IntTensor)
+    assert (int | _C.IntTensor | None) is not None
+
+    # `int8` has no candle storage, so `CharTensor` refuses from one layer down
+    # and names the *dtype* rather than the class -- a better message than a
+    # missing name would be. `ShortTensor` computes: `int16` IS storable here,
+    # which was checked one dtype at a time rather than assumed from `int8`
+    # being absent.
+    assert _C.ShortTensor([1, 2]).dtype == _C.int16
+    try:
+        _C.CharTensor([1, 2])
+    except NotImplementedError as e:
+        assert "not storable" in str(e), str(e)
+    else:
+        raise AssertionError("int8 has no candle storage; CharTensor must refuse")
+
+    assert _C._shim_legacy_tensor_types == sorted([
+        "BFloat16Tensor", "BoolTensor", "ByteTensor", "CharTensor",
+        "DoubleTensor", "FloatTensor", "HalfTensor", "IntTensor",
+        "LongTensor", "ShortTensor",
+    ])
+
+
+def test_a_numpy_scalar_binds_where_a_python_number_would():
+    """`vits`' last wall but one (docs/KERNELS26.md §24).
+
+    `modeling_vits.py:1379` is
+    `predicted_lengths * np.prod(self.config.upsample_rates)`, and
+    `np.prod([4, 4])` is an `np.int64` -- not a Python `int`, and not a
+    subclass of one. The overload resolver's `Scalar` predicate tested
+    `isinstance(value, (bool, int, float, complex))`, so nothing bound, Python
+    fell back to `np.int64.__rmul__`, and that asked the tensor for
+    `__array__` -- landing on `TensorBase.numpy`, which is a raising stub.
+
+    Upstream takes it (measured: `torch.tensor([1,2]) * np.int64(16)` fires
+    `aten.mul.Tensor` and keeps `int64`), so the fix is `numbers.Number` in the
+    predicate and `__index__`/`__float__` in the kernel's scalar reader -- the
+    protocol, not a numpy import, because `_C` is built before numpy would be
+    importable.
+
+    **`__index__` is tried before `__float__` and that ordering is
+    load-bearing**: `np.int64` has both, and taking the float would make it a
+    `Scalar::Float`, which `arith_tag`'s wrapped-number rule turns into a
+    `float32` result from an `int64` tensor.
+    """
+    import numpy as np
+
+    ints = _arch20_tensor([1, 2], dtype=_C.int64)
+    scaled = ints * np.prod([4, 4])
+    assert scaled.dtype == _C.int64, scaled.dtype
+    assert scaled.tolist() == [16, 32]
+
+    # A numpy *float* beside an integer tensor floats it, exactly as a Python
+    # float would.
+    floated = ints * np.float64(2.5)
+    assert floated.dtype == _C.float32, floated.dtype
+    assert floated.tolist() == [2.5, 5.0]
+
+    # Through the kernel door as well as through the member.
+    direct = _C._aten_dispatch("aten.mul.Scalar", ints, np.int64(3))
+    assert direct.dtype == _C.int64 and direct.tolist() == [3, 6]
+
+
+def test_group_norm_statistics_are_per_sample_group_and_rstd_is_a_reciprocal():
+    """`sew_d`'s wall (docs/KERNELS26.md §19), and the two results nothing reads.
+
+    `torch.group_norm` returns `result[0]`. The `mean` and `rstd` beside it are
+    what backward would need and there is no backward here, so a wrong shape, a
+    wrong dtype or an entirely wrong *definition* for either leaves every
+    forward in the sweep green. They are pinned here rather than only against
+    upstream, because the constants below say what the definition **is**:
+
+      * `mean`/`rstd` are `(N, group)` -- per (sample, group). Not per channel,
+        and not keepdim-shaped the way `native_layer_norm`'s are.
+      * on a constant group the variance is zero, so `rstd = 1/sqrt(eps)`.
+        At `eps=1e-5` that is `316.2278`, and the plausible alternatives are
+        all a different number of the same shape and dtype:
+        `1/(sqrt(0)+eps)` is `100000` and `sqrt(0+eps)` is `0.00316`. An
+        *unbiased* variance is still `0` here, so it gives `316.2278` too --
+        which is why a non-constant case is needed as well and is in
+        `tools/golden/cases.py`. Neither case alone pins both halves.
+
+    And the view that is not the affine view: with `C=6, group=3` the
+    statistics run over `(C/group)*HxW` elements while `weight` is over `C`.
+    A kernel that used one reshape for both passes `group=1` and `group=C`,
+    which are the two a hand-written test picks first.
+    """
+    x = _C._tensor_from_flat([3.0] * 12, [1, 6, 2], dtype=_C.float32)
+    out, mean, rstd = _C._aten_dispatch(
+        "aten.native_group_norm.default", x, None, None, 1, 6, 2, 3, 1e-5)
+    assert tuple(mean.shape) == (1, 3), tuple(mean.shape)
+    assert tuple(rstd.shape) == (1, 3), tuple(rstd.shape)
+    assert mean.tolist() == [[3.0, 3.0, 3.0]], mean.tolist()
+    for value in rstd.tolist()[0]:
+        assert abs(value - 316.22775) < 1e-2, value
+    # A constant input normalises to zero, whatever eps is.
+    assert all(abs(v) < 1e-3 for v in _e2e_flatten(out.tolist())), out.tolist()
+
+    # The two views, separated. `weight` is per channel: with a zero weight on
+    # channel 0 only, exactly the first channel's row must vanish -- a kernel
+    # that applied the weight along the *statistics* view would zero something
+    # else.
+    ramp = [float(i) for i in range(12)]
+    x = _C._tensor_from_flat(ramp, [1, 6, 2], dtype=_C.float32)
+    w = _C._tensor_from_flat([0.0, 1.0, 1.0, 1.0, 1.0, 1.0], [6], dtype=_C.float32)
+    out, _, _ = _C._aten_dispatch(
+        "aten.native_group_norm.default", x, w, None, 1, 6, 2, 3, 1e-5)
+    rows = out.tolist()[0]
+    assert rows[0] == [0.0, 0.0], rows[0]
+    assert any(v != 0.0 for v in rows[1]), rows[1]
+
+    # The composite derives N/C/HxW, and the trailing axes multiply.
+    x4 = _C._tensor_from_flat(ramp, [1, 6, 1, 2], dtype=_C.float32)
+    via_composite = _C._VariableFunctions.group_norm(x4, 3, None, None, 1e-5, True)
+    assert tuple(via_composite.shape) == (1, 6, 1, 2), tuple(via_composite.shape)
+    direct, _, _ = _C._aten_dispatch(
+        "aten.native_group_norm.default", x4, None, None, 1, 6, 2, 3, 1e-5)
+    assert _e2e_flatten(via_composite.tolist()) == _e2e_flatten(direct.tolist())
+
+    # Rank 1 is the composite's own refusal, before any kernel runs.
+    try:
+        _C._VariableFunctions.group_norm(
+            _C._tensor_from_flat([1.0, 2.0], [2], dtype=_C.float32), 1)
+    except RuntimeError as e:
+        assert "at least 2 dimensions" in str(e), str(e)
+    else:
+        raise AssertionError("group_norm must refuse a rank-1 input")
+
+    # C not divisible by group, and a group of zero.
+    for group, fragment in ((4, "divisible by num_groups"), (0, "greater than 0")):
+        try:
+            _C._aten_dispatch(
+                "aten.native_group_norm.default", x, None, None, 1, 6, 2, group, 1e-5)
+        except RuntimeError as e:
+            assert fragment in str(e), str(e)
+        else:
+            raise AssertionError(f"group={group} must refuse")
+
+
+def test_flip_copies_refuses_a_repeated_dim_and_reads_its_own_keyword():
+    """`vits`' wall after `clamp_min` (docs/KERNELS26.md §18).
+
+    Three things golden's dispatch-key cases cannot see, all of them here:
+
+    **It copies.** Upstream's `flip` is not a view (`data_ptr` differs), which
+    matters because a negative-stride view is precisely what candle's `Layout`
+    cannot express -- so an op that had to alias would have been another
+    docs/VIEWS.md §6.4 divergence. It does not, so writing into the result must
+    leave the base alone.
+
+    **A repeated dim is refused.** Flipping one axis twice is the identity, so
+    a kernel that just loops over `dims` returns the *input* where upstream
+    raises -- a correctly-shaped, correctly-typed, entirely plausible tensor.
+    The check has to run after normalisation, because `[1, -1]` is the same
+    axis twice on a rank-2.
+
+    **The keyword is `dims`, not `dim`.** Every reduction in this file spells
+    it `dim` and `aten::flip` spells it `dims`; the resolver binds by the
+    schema's name, so reaching for the wrong one refuses with "missing required
+    argument" on `torch.flip(x, [1])` while `_aten_dispatch(op, t, [1])` --
+    which passes it positionally -- keeps working. That asymmetry is why the
+    spelling is asserted here and not only through a dispatch key.
+    """
+    base = _C._aten_dispatch("aten.arange.default", 6)
+    grid = _C._aten_dispatch("aten.view.default", base, [2, 3])
+
+    assert _C._VariableFunctions.flip(grid, [0]).tolist() == [[3, 4, 5], [0, 1, 2]]
+    assert _C._VariableFunctions.flip(grid, [1]).tolist() == [[2, 1, 0], [5, 4, 3]]
+    # A negative dim is the LAST axis, which is the one a naive normalisation
+    # turns into the first.
+    assert grid.flip([-1]).tolist() == [[2, 1, 0], [5, 4, 3]]
+    assert grid.flip(1).tolist() == [[2, 1, 0], [5, 4, 3]]
+    # An empty dim list is a copy, not an error.
+    assert grid.flip([]).tolist() == [[0, 1, 2], [3, 4, 5]]
+
+    # A copy, not a view: writing into the result must not reach the base.
+    flipped = grid.flip([1])
+    flipped.fill_(9)
+    assert grid.tolist() == [[0, 1, 2], [3, 4, 5]], grid.tolist()
+
+    for dims in ([0, 0], [1, -1]):
+        try:
+            _C._VariableFunctions.flip(grid, dims)
+        except RuntimeError as e:
+            assert "appears multiple times" in str(e), str(e)
+        else:
+            raise AssertionError(
+                f"flip({dims}) must refuse; flipping one axis twice is the identity "
+                "and returning the input unchanged is a plausible wrong answer")
+
+
+def test_all_and_any_disagree_on_empty_and_agree_on_uint8():
+    """`sam3_video`'s wall (docs/KERNELS26.md §16), and the two rules that
+    separate a real `all` from `any` with the comparison flipped.
+
+    **Empty.** `any` over nothing is False and `all` over nothing is True.
+    A kernel that shared one early return between the two is right for one op
+    and wrong for the other on exactly this input, which no forward reaches --
+    so nothing but a case like this can see it.
+
+    **uint8.** The result is `torch.bool` for every dtype except `uint8`,
+    where it is `uint8` (upstream's own `torch.all` docstring says so).
+    `any` had this wrong -- it returned `torch.bool` unconditionally -- and its
+    golden cases probe only `int64`, so no case could see it either. Fixed with
+    `all` rather than after it, because writing `all` from `any`'s shape would
+    have copied the defect into a second op.
+    """
+    empty = _C._aten_dispatch("aten.zeros.default", [0])
+    assert _C._VariableFunctions.all(empty).tolist() is True
+    assert _C._VariableFunctions.any(empty).tolist() is False
+
+    for dtype, expected in ((_C.uint8, _C.uint8), (_C.int64, _C.bool),
+                            (_C.bool, _C.bool), (_C.float32, _C.bool)):
+        probe = _C._tensor_from_flat([1, 0], [2], dtype=dtype)
+        assert probe.all().dtype == expected, (dtype, probe.all().dtype)
+        assert probe.any().dtype == expected, (dtype, probe.any().dtype)
+        assert probe.all(0).dtype == expected, (dtype, probe.all(0).dtype)
+
+    # Reducing over a zero-length axis is the identity once per surviving
+    # element; reducing over the axis that is not zero-length leaves an empty
+    # result. One shape, two dims, two different answers -- which is why the
+    # kernel computes the reduced shape rather than short-circuiting on
+    # "the input has no elements". candle refuses the reduction outright
+    # ("empty tensor for reduce"), so before this both raised.
+    wide = _C._aten_dispatch("aten.zeros.default", [0, 3])
+    assert wide.all(0).tolist() == [True, True, True]
+    assert wide.all(1).tolist() == []
+    assert wide.any(0).tolist() == [False, False, False]
+
+    # NaN is nonzero and therefore true, and a negative number is too -- `all`
+    # is "every element is nonzero", not "every element is positive".
+    assert _C._tensor_from_flat(
+        [float("nan"), 1.0], [2], dtype=_C.float32).all().tolist() is True
+    assert _arch20_tensor([-1, -2], dtype=_C.int64).all().tolist() is True
+
+    # sam3_video's exact call: a bool mask, through the member.
+    mask = _arch20_tensor([1, 1, 1], dtype=_C.bool)
+    assert mask.all().tolist() is True
+    assert _arch20_tensor([1, 0, 1], dtype=_C.bool).all().tolist() is False
+
+
+def test_clamp_min_names_its_own_kernel_in_the_bool_refusal():
+    """`vits`' wall (docs/KERNELS26.md §15), and the one thing `clamp_min` does
+    NOT share with `clamp`.
+
+    Every dtype row of the two ops agrees -- that is why the kernel calls
+    `clamp_result_tag` rather than restating it -- but a *boolean* bound
+    against a `bool` tensor refuses with the name of the kernel upstream failed
+    to find, and that name differs. Measured on 2.13.0:
+
+        torch.clamp_min(bool_t, False)  "clamp_min_scalar_cpu" not implemented
+        torch.clamp(bool_t, False)      "clamp_scalar_cpu" not implemented
+
+    A `clamp_min` written as a call through to `clamp` passes every golden case
+    (they are `both_error`, so the wording is not compared) and fails this.
+    """
+    mask = _arch20_tensor([1, 0, 1], dtype=_C.bool)
+    try:
+        _C._VariableFunctions.clamp_min(mask, False)
+    except NotImplementedError as e:
+        assert "clamp_min_scalar_cpu" in str(e), str(e)
+    else:
+        raise AssertionError("clamp_min must refuse a bool bound on a bool tensor")
+    try:
+        _C._VariableFunctions.clamp(mask, False)
+    except NotImplementedError as e:
+        assert "clamp_scalar_cpu" in str(e), str(e)
+        assert "clamp_min" not in str(e), str(e)
+    else:
+        raise AssertionError("clamp must refuse a bool bound on a bool tensor")
+
+    # It is a floor, not a two-sided clamp: the largest element survives.
+    out = _C._VariableFunctions.clamp_min(_arch20_tensor([1.0, 5.0, 10.0, -3.0]), 2)
+    assert out.tolist() == [2.0, 5.0, 10.0, 2.0], out.tolist()
+    # ...and a negative floor is not a relu.
+    ints = _arch20_tensor([1, 5, -3, -9], dtype=_C.int64)
+    assert ints.clamp_min(-1).tolist() == [1, 5, -1, -1]
+
+    # vits' whole line, through the free function it actually spells.
+    duration = _C._tensor_from_flat([0.25, 3.75], [2], dtype=_C.float32)
+    floored = _C._VariableFunctions.clamp_min(duration, 1)
+    assert floored.dtype == _C.float32, floored.dtype
+    assert floored.tolist() == [1.0, 3.75]
+    assert floored.long().tolist() == [1, 3]
+
+    # The Tensor overload is listed with no kernel, so it refuses by the name
+    # of the overload it needed rather than by "no matching signature".
+    try:
+        _C._VariableFunctions.clamp_min(duration, duration)
+    except NotImplementedError as e:
+        assert "clamp_min.Tensor" in str(e), str(e)
+    else:
+        raise AssertionError("clamp_min.Tensor has no kernel and must refuse")
 
 
 def test_expm1_is_not_exp_minus_one():

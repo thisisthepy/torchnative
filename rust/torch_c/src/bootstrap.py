@@ -61,6 +61,11 @@ import importlib.util
 import inspect
 import json
 import math
+# `numbers` for the ABCs a `numpy` scalar registers with -- see the `Scalar`
+# predicate in `_TypeChecker`. Importing numpy itself here is not an option:
+# the shim has no numpy dependency and `_C` is imported before it would be
+# available.
+import numbers as _numbers
 import os
 import re
 import sys
@@ -1830,6 +1835,17 @@ class _TypeChecker:
             def scalar(value):
                 if isinstance(value, (bool, int, float, complex)):
                     return True
+                # A number that is not one of Python's own. `numpy` scalars
+                # register with the `numbers` ABCs, so this reaches them
+                # without importing numpy -- and `vits` needs it:
+                # `modeling_vits.py:1379` multiplies a tensor by
+                # `np.prod(self.config.upsample_rates)`, an `np.int64`.
+                # Upstream binds it (measured: the call fires
+                # `aten.mul.Tensor` and keeps `int64`); refusing it here makes
+                # Python fall back to `np.int64.__rmul__`, which asks the
+                # tensor for `__array__` and stops on `TensorBase.numpy`.
+                if isinstance(value, _numbers.Number) and not isinstance(value, tensor):
+                    return True
                 return isinstance(value, tensor) and value.dim() == 0
 
             return scalar
@@ -1946,6 +1962,10 @@ class _TypeChecker:
             return isinstance(value, self._tensor)
         if base == "Scalar":
             if isinstance(value, (bool, int, float, complex)):
+                return True
+            # See `_base_predicate`'s `scalar` above: `numbers.Number` is what
+            # reaches a `numpy` scalar without importing numpy.
+            if isinstance(value, _numbers.Number) and not isinstance(value, self._tensor):
                 return True
             return isinstance(value, self._tensor) and value.dim() == 0
         if base in ("int", "SymInt"):
@@ -2754,6 +2774,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
                 name, (), {"__module__": "torch._C", "__init__": _permissive_init}))
         else:
             setattr(module, name, _Unimplemented(f"torch._C.{name}"))
+
+    _install_legacy_tensor_types(module, dispatch)
 
     # The overload tables, re-keyed by aten `(qualname, overload)` so that
     # `_get_schema` can answer from them. They are already parsed -- one
@@ -4272,6 +4294,97 @@ def _tensor_factory(module, dispatch):
     return tensor
 
 
+# The legacy per-dtype tensor classes -- `torch.IntTensor` and its nine
+# siblings. `vits` is what needs them (docs/KERNELS26.md §24):
+# `modeling_vits.py:349` builds `torch.IntTensor([self.hidden_size])` and then
+# subscripts it, and until now they were `_ShimMeta` placeholders, so the model
+# stopped on `'IntTensor' object is not subscriptable` -- a TypeError from a
+# type that was never a tensor class at all.
+#
+# **They must stay real types**, not factory functions, for the reason the
+# placeholder loop above gives: these names turn up in *annotations*, which
+# Python evaluates at import time. `transformers/modeling_flash_attention_
+# utils.py:602` is `max_seqlen_q: int | torch.IntTensor | None = None`, and
+# `int | <function>` is a TypeError -- measured, it stops `import transformers`
+# dead. So each is a class whose `__new__` returns a `TensorBase`, which is
+# also what upstream does: `type(torch.IntTensor([1]))` is `torch.Tensor`, not
+# `torch.IntTensor`.
+#
+# All three of the legacy constructor's forms, and the ambiguity is the whole
+# reason this is worth writing carefully (docs/KERNELS26.md §12.1 ground 3):
+#
+#     IntTensor(2, 3)      a SIZE -> a (2, 3) tensor of int32
+#     IntTensor([2, 3])    DATA   -> a (2,) tensor holding 2 and 3
+#     IntTensor(existing)  a re-wrap, cast to the class's dtype
+#
+# `[2, 3]` looks exactly like a size list and is not one. An implementation
+# that took a sequence as a shape answers `(2, 3)` zeros where upstream answers
+# two numbers, and nothing downstream raises -- so the data branch is checked
+# first and by type, never by shape.
+_LEGACY_TENSOR_DTYPES = {
+    "ByteTensor": "uint8",
+    "CharTensor": "int8",
+    "ShortTensor": "int16",
+    "IntTensor": "int32",
+    "LongTensor": "int64",
+    "BoolTensor": "bool",
+    "HalfTensor": "float16",
+    "BFloat16Tensor": "bfloat16",
+    "FloatTensor": "float32",
+    "DoubleTensor": "float64",
+}
+
+
+def _install_legacy_tensor_types(module, dispatch) -> None:
+    base = module.TensorBase
+
+    def make(name, dtype_name):
+        dtype = getattr(module, dtype_name)
+
+        def __new__(cls, *args):
+            # The re-wrap form first, as `TensorBase.__new__` does, so the
+            # single-tensor path stays one check.
+            if len(args) == 1 and isinstance(args[0], base):
+                return dispatch("aten._to_copy.default", args[0], dtype=dtype)
+            # DATA, decided by type and never by shape: a sequence is values.
+            # Through `_VariableFunctions.tensor`, which is where
+            # `_tensor_factory` installs it -- `torch.tensor` is hoisted from
+            # there by `torch/__init__.py`, and `_C` itself has no `tensor`.
+            if len(args) == 1 and isinstance(args[0], (list, tuple)):
+                return module._VariableFunctions.tensor(args[0], dtype=dtype)
+            # ...and everything else is the size form, which `TensorBase`
+            # already implements (including upstream's negative-dimension
+            # wording and the `()` -> `(0,)` rule). It builds at the default
+            # float, so the cast is what makes it this class's dtype -- and
+            # the values are zeros where upstream's are uninitialised, which
+            # is docs/KERNELS26.md §12.2's recorded property of the size form
+            # and not a new one.
+            return dispatch("aten._to_copy.default", base(*args), dtype=dtype)
+
+        return _ShimMeta(name, (), {
+            "__module__": "torch",
+            "__new__": __new__,
+            "__doc__": f"torch._C shim: the legacy {name} constructor "
+                       f"({dtype_name}). Returns a TensorBase, as upstream "
+                       f"returns a torch.Tensor.",
+        })
+
+    installed = []
+    for name, dtype_name in _LEGACY_TENSOR_DTYPES.items():
+        if not hasattr(module, dtype_name):
+            continue
+        setattr(module, name, make(name, dtype_name))
+        installed.append(name)
+    # Readable for the same reason `_shim_nn_implemented` is: which of these
+    # ten do something should be answerable by asking rather than by trying.
+    # All ten are installed. `CharTensor` then refuses from one layer down --
+    # candle has no `int8` storage, so the refusal comes from
+    # `_tensor_from_flat` naming the *dtype*, which is a better message than a
+    # missing name would be. `ShortTensor` computes: `int16` is storable here,
+    # checked rather than assumed from `int8` being absent.
+    module._shim_legacy_tensor_types = sorted(installed)
+
+
 def _install_namespace_types(module, namespace) -> None:
     """`torch.strided`, `torch.contiguous_format`, `torch.per_tensor_affine`.
 
@@ -5154,6 +5267,80 @@ def _install_nn(module, dispatch) -> None:
         """
         return dispatch("aten.softplus.default", input, beta, threshold)
 
+    def upsample_bilinear2d(input, output_size, align_corners, scale_factors=None):
+        """`torch._C._nn.upsample_bilinear2d` -- `zoedepth`'s wall.
+
+        `torch/nn/functional.py:5248` (`F.interpolate`, `mode="bilinear"`)
+        calls this with exactly this four-argument shape, which is the
+        **`.vec`** schema: `output_size` may be `None`, and `scale_factors` is
+        a list rather than the leaf's two separate `float?` arguments.
+
+        `.vec` is `CompositeImplicitAutograd`. Measured with a
+        `TorchDispatchMode` logger on 2.13.0, `F.interpolate(x,
+        scale_factor=2, mode="bilinear")` on a `(1,1,2,3)` input emits exactly
+        one record:
+
+            aten.upsample_bilinear2d.default((1,1,2,3), [4, 6], False, 2.0, 2.0)
+
+        -- a *concrete* output size, with the scale factors passed through
+        beside it. So `.vec` belongs here, not in a table, for the reason
+        `layer_norm` and `group_norm` give.
+
+        **The scale factors are forwarded, not just used to size the output**,
+        and that is the part a shortcut loses. `1/scale` and `in/out` coincide
+        whenever `out == in * scale` exactly -- which is every case a
+        `scale_factor=2` test produces -- and diverge as soon as the product is
+        not integral. Dropping them here would make `scale_factor=1.5` sample a
+        different grid, silently, with the right output shape.
+
+        Upstream's `compute_output_size`: **exactly one** of `output_size` and
+        `scale_factors` may be given -- not "output_size wins", which is what
+        this was written as first and what a golden case caught. Upstream
+        raises `Must specify exactly one of output_size and scale_factors`, and
+        so does this. When it is `scale_factors`, each output extent is
+        `floor(input.size(i+2) * factor)`.
+        """
+        sizes = list(input.shape)
+        if output_size is not None and scale_factors is not None:
+            raise RuntimeError(
+                "Must specify exactly one of output_size and scale_factors"
+            )
+        if output_size is not None:
+            osize = [int(v) for v in output_size]
+            scale_h = scale_w = None
+        else:
+            if scale_factors is None:
+                raise RuntimeError(
+                    "Must specify exactly one of output_size and scale_factors"
+                )
+            factors = list(scale_factors)
+            osize = [int(sizes[i + 2] * factors[i]) for i in range(len(factors))]
+            scale_h = float(factors[0]) if len(factors) > 0 else None
+            scale_w = float(factors[1]) if len(factors) > 1 else None
+        return dispatch(
+            "aten.upsample_bilinear2d.default", input, osize, align_corners,
+            scale_h, scale_w,
+        )
+
+    def leaky_relu(input, negative_slope=0.01):
+        """`torch._C._nn.leaky_relu` -- `vits`' wall after the `IntTensor`
+        constructor.
+
+        `torch/nn/functional.py:1969` is `torch._C._nn.leaky_relu(input,
+        negative_slope)`, so `F.leaky_relu` *is* this binding rather than a
+        wrapper around it -- the same relationship `gelu` has, and the reason
+        it is a `_nn` name rather than an `overloads.json` entry. There is no
+        `torch.leaky_relu` and no `Tensor.leaky_relu` upstream
+        (`hasattr` is False for both on 2.13.0), so adding either would invent
+        a surface.
+
+        The in-place sibling `leaky_relu_` is deliberately absent: `F.leaky_relu`
+        reaches it only when called with `inplace=True`, `vits` does not, and
+        `aten.leaky_relu_.default` has no kernel here -- so the name stays a
+        raising stub that says which op it needed.
+        """
+        return dispatch("aten.leaky_relu.default", input, negative_slope)
+
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
@@ -5161,6 +5348,8 @@ def _install_nn(module, dispatch) -> None:
         (scaled_dot_product_attention, "scaled_dot_product_attention"),
         (pad, "pad"),
         (softplus, "softplus"),
+        (upsample_bilinear2d, "upsample_bilinear2d"),
+        (leaky_relu, "leaky_relu"),
     ):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C._nn"
@@ -5169,8 +5358,9 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "gelu", "linear", "pad", "scaled_dot_product_attention", "silu",
-        "softplus",
+        "gelu", "leaky_relu", "linear", "pad",
+        "scaled_dot_product_attention", "silu", "softplus",
+        "upsample_bilinear2d",
     ]
 
 
@@ -5269,6 +5459,63 @@ def _install_composites(module, varfns, dispatch) -> None:
     layer_norm.__module__ = "torch._C"
     setattr(varfns, "layer_norm", layer_norm)
 
+    def group_norm(input, num_groups, weight=None, bias=None, eps=1e-5,
+                    cudnn_enabled=True):
+        """`torch.group_norm` / `F.group_norm` / `nn.GroupNorm`'s forward.
+
+        `sew_d`'s wall (docs/KERNELS26.md §19), and `layer_norm`'s shape
+        exactly: `aten::group_norm` is `CompositeImplicitAutograd`, so a
+        `TorchDispatchMode` logger on torch 2.13.0 sees all three of
+        `torch.group_norm(...)`, `F.group_norm(...)` and an `nn.GroupNorm`
+        forward emit `aten.native_group_norm.default` and nothing else --
+        `aten.group_norm.default` never fires. So this is a composite here and
+        not an `overloads.json` entry, for the reason `layer_norm`'s note above
+        gives: the table would name a key upstream's own dispatcher never
+        answers to.
+
+        **The three arguments `native_group_norm` needs and this signature does
+        not carry are derived here**, which is most of the body:
+
+            N    = input.shape[0]
+            C    = input.shape[1]
+            HxW  = the product of everything after that
+
+        `N * C * HxW == input.numel()` by construction, so the element-count
+        check the kernel makes cannot fire through this door -- it is there for
+        a caller that spells the leaf op directly, which upstream's schema
+        allows too.
+
+        Rank is checked here rather than in the kernel because it is *this*
+        function's rule: upstream's `F.group_norm` raises "Expected at least 2
+        dimensions" before calling anything, and a rank-1 input would otherwise
+        reach the leaf with `HxW = 1` and normalise something.
+
+        `cudnn_enabled` is accepted and ignored, exactly as `layer_norm`'s
+        `cudnn_enable` is: `native_group_norm`'s CPU kernel does not consult
+        it. The mean and rstd the leaf also returns are what backward would
+        need; there is no backward here, so they are computed and discarded --
+        which is precisely why they need their own cases in
+        `tools/golden/cases.py` rather than being covered by a forward.
+        """
+        shape = list(input.shape)
+        if len(shape) < 2:
+            raise RuntimeError(
+                "Expected at least 2 dimensions for input tensor but received "
+                f"{len(shape)}"
+            )
+        hxw = 1
+        for extent in shape[2:]:
+            hxw *= extent
+        result = dispatch(
+            "aten.native_group_norm.default", input, weight, bias,
+            shape[0], shape[1], hxw, num_groups, eps,
+        )
+        return result[0]
+
+    group_norm.__name__ = group_norm.__qualname__ = "group_norm"
+    group_norm.__module__ = "torch._C"
+    setattr(varfns, "group_norm", group_norm)
+
     def isfinite(input):
         """`torch.isfinite` -- the third `CompositeImplicitAutograd` here.
 
@@ -5356,6 +5603,247 @@ def _install_composites(module, varfns, dispatch) -> None:
     square.__name__ = square.__qualname__ = "square"
     square.__module__ = "torch._C"
     setattr(varfns, "square", square)
+
+    def concat(tensors, dim=0, *, out=None):
+        """`torch.concat` -- `zoedepth`'s wall after `relu_`, and an alias.
+
+        `aten::concat` is `CompositeImplicitAutograd` and its body is
+        `at::cat(tensors, dim)`. Measured with a `TorchDispatchMode` logger on
+        torch 2.13.0: `torch.concat([a, b], dim=0)` and `torch.concat([a, b],
+        1)` each fire exactly `aten.cat.default` and nothing else --
+        `aten.concat.default` never fires. So this is a composite for the
+        reason `square`'s note above gives, rather than an `overloads.json`
+        entry that would name a key upstream's dispatcher never answers to.
+
+        There is deliberately no `Tensor.concat` beside it: upstream has none
+        either (`hasattr(torch.Tensor, "concat")` is False on 2.13.0), so
+        adding one would invent a surface.
+
+        `out=` is refused by name rather than forwarded, as every other `out=`
+        in this file is: the route would be `aten::cat.out`, which this shim
+        has no kernel for.
+        """
+        if out is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.concat(..., out=...) "
+                "-- would need aten.cat.out, which has no kernel here"
+            )
+        return dispatch("aten.cat.default", list(tensors), dim)
+
+    concat.__name__ = concat.__qualname__ = "concat"
+    concat.__module__ = "torch._C"
+    setattr(varfns, "concat", concat)
+
+    def avg_pool1d(input, kernel_size, stride=None, padding=0, ceil_mode=False,
+                   count_include_pad=True):
+        """`torch.avg_pool1d` -- `sew_d`'s wall after `sign`.
+
+        `nn.AvgPool1d.forward` -> `F.avg_pool1d` -> here. `aten::avg_pool1d` is
+        `CompositeImplicitAutograd`; measured with a `TorchDispatchMode` logger
+        on torch 2.13.0, `torch.avg_pool1d(x, 3, 2)` fires exactly
+
+            aten.unsqueeze.default(-2)
+            aten.avg_pool2d.default([1, 3], [1, 2])
+            aten.squeeze.dim(-2)
+
+        and `aten.avg_pool1d.default` never fires. So this is a composite for
+        the reason `layer_norm`'s note above gives, and the **height** axis is
+        the degenerate one -- `[1, k]`, not `[k, 1]`. Getting that round the
+        wrong way pools along a length-1 axis, which is the identity, and then
+        the *output shape* is wrong rather than the values, so it fails loudly
+        rather than quietly. It is transcribed from the trace regardless.
+
+        `stride=None` means "the kernel size", which is upstream's `int[1]
+        stride=[]` default written in Python. It is not 1, and the difference
+        is the whole output length.
+        """
+        length = [kernel_size] if isinstance(kernel_size, int) else list(kernel_size)
+        if stride is None or (not isinstance(stride, int) and not list(stride)):
+            step = length
+        else:
+            step = [stride] if isinstance(stride, int) else list(stride)
+        pad = [padding] if isinstance(padding, int) else list(padding)
+        widened = dispatch("aten.unsqueeze.default", input, -2)
+        pooled = dispatch(
+            "aten.avg_pool2d.default", widened, [1, length[0]], [1, step[0]],
+            [0, pad[0]], ceil_mode, count_include_pad,
+        )
+        return dispatch("aten.squeeze.dim", pooled, -2)
+
+    avg_pool1d.__name__ = avg_pool1d.__qualname__ = "avg_pool1d"
+    avg_pool1d.__module__ = "torch._C"
+    setattr(varfns, "avg_pool1d", avg_pool1d)
+
+    def einsum(equation, *operands, path=None):
+        """`torch._C._VariableFunctions.einsum` -- `sam3_video`'s wall after
+        `div`'s promotion.
+
+        `modeling_sam3.py:2113` is `torch.einsum("bqc,bchw->bqhw",
+        mask_embeddings, instance_embeds)`, once per forward, and
+        `torch/functional.py:372` sends it here as `_VF.einsum(equation,
+        operands)` -- a list, not varargs.
+
+        **`aten::einsum` is `CompositeImplicitAutograd`, and this reproduces
+        its decomposition rather than inventing one.** Measured with a
+        `TorchDispatchMode` logger on 2.13.0, `einsum("bqc,bkc->bqk", ...)`
+        fires exactly `unsqueeze`, `permute`, `view`, **`bmm`**, `view`,
+        `permute`, `view` -- every one of which this shim already has, and
+        `aten.einsum.default` never fires. So this is a composite for the
+        reason `layer_norm`'s note above gives, and -- the part that matters
+        numerically -- **the contraction really is a `bmm`**, so the
+        accumulation order is upstream's rather than a hand-rolled sum's.
+
+        The algorithm, for one contraction of two operands:
+
+            batch      labels in BOTH inputs and in the output
+            summed     labels in BOTH inputs and NOT in the output
+            free_a     labels in a only (and in the output)
+            free_b     labels in b only (and in the output)
+
+            a -> (batch, free_a, summed) -> (B, M, K)
+            b -> (batch, summed, free_b) -> (B, K, N)
+            bmm                             (B, M, N)
+            -> batch + free_a + free_b   -> permuted to the output order
+
+        A label that appears in one operand only and *not* in the output is
+        summed out of that operand first, before the pairing -- otherwise it
+        would have to become a spurious free axis.
+
+        More than two operands fold left, which is what `torch/functional.py`
+        does too when `opt_einsum` is unavailable.
+
+        **Refused by name, not approximated:**
+
+          * an ellipsis (`...`) -- it stands for a variable number of batch
+            axes and needs its own rank arithmetic;
+          * a label repeated *within* one operand (`ii->i`) -- that is a
+            diagonal, not a contraction, and there is no `diagonal` kernel
+            here;
+          * the sublist form (`einsum(a, [0, 1], b, [1, 2])`), which is a
+            different overload;
+          * a non-`None` `path`, which only `opt_einsum` supplies.
+
+        The implicit-output form (no `->`) IS supported, with upstream's rule:
+        the output is every label appearing exactly once across all operands,
+        in alphabetical order.
+        """
+        if path is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.einsum(..., path=...) "
+                "-- only opt_einsum supplies a path and it is not wired here"
+            )
+        # Both calling conventions, because upstream has both:
+        # `torch/functional.py:362` unpacks "the old interface of passing the
+        # operands as one list argument", and line 372 then calls
+        # `_VF.einsum(equation, operands)` -- with a list. So this name is
+        # reached with a list from the vendored tree and with varargs from a
+        # caller who writes `torch.einsum("ij,jk->ik", a, b)` directly.
+        if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+            operands = tuple(operands[0])
+        tensors = list(operands)
+        if not tensors:
+            raise RuntimeError("einsum(): must provide at least one operand")
+        if "..." in equation or "." in equation:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.einsum with an ellipsis "
+                f"({equation!r}) -- the ellipsis stands for a variable number of "
+                "batch axes and needs its own rank arithmetic"
+            )
+        text = equation.replace(" ", "")
+        if "->" in text:
+            lhs_text, out_labels = text.split("->", 1)
+        else:
+            lhs_text, out_labels = text, None
+        terms = lhs_text.split(",")
+        if len(terms) != len(tensors):
+            raise RuntimeError(
+                f"einsum(): the equation has {len(terms)} operand(s) but "
+                f"{len(tensors)} were given"
+            )
+        for term in terms:
+            if len(set(term)) != len(term):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: torch.einsum with a label "
+                    f"repeated inside one operand ({term!r}) -- that is a diagonal, "
+                    "not a contraction, and aten.diagonal has no kernel here"
+                )
+        for term, tensor in zip(terms, tensors):
+            if len(term) != len(tensor.shape):
+                raise RuntimeError(
+                    f"einsum(): the subscript {term!r} has {len(term)} label(s) "
+                    f"but the operand has {len(tensor.shape)} dimension(s)"
+                )
+        if out_labels is None:
+            counts = {}
+            for term in terms:
+                for label in term:
+                    counts[label] = counts.get(label, 0) + 1
+            out_labels = "".join(sorted(l for l, n in counts.items() if n == 1))
+
+        def sum_over(term, tensor, keep):
+            """Drop the axes of `tensor` whose label is not in `keep`."""
+            drop = [i for i, label in enumerate(term) if label not in keep]
+            if not drop:
+                return term, tensor
+            reduced = dispatch("aten.sum.dim_IntList", tensor, drop, False)
+            return "".join(l for l in term if l in keep), reduced
+
+        def align(term, tensor, order):
+            """Permute `tensor` so its labels come out in `order`."""
+            perm = [term.index(label) for label in order]
+            if perm == list(range(len(perm))):
+                return tensor
+            return dispatch("aten.permute.default", tensor, perm)
+
+        term, acc = terms[0], tensors[0]
+        for index in range(1, len(terms)):
+            other_term, other = terms[index], tensors[index]
+            # Labels still needed after this contraction: the output's, plus
+            # everything the operands still to come will pair against.
+            later = set(out_labels)
+            for rest in terms[index + 1:]:
+                later |= set(rest)
+            term, acc = sum_over(term, acc, set(other_term) | later)
+            other_term, other = sum_over(other_term, other, set(term) | later)
+
+            shared = [l for l in term if l in other_term]
+            batch = [l for l in shared if l in later]
+            summed = [l for l in shared if l not in later]
+            free_a = [l for l in term if l not in other_term]
+            free_b = [l for l in other_term if l not in term]
+
+            left = align(term, acc, batch + free_a + summed)
+            right = align(other_term, other, batch + summed + free_b)
+            sizes = {}
+            for label, extent in zip(batch + free_a + summed, left.shape):
+                sizes[label] = int(extent)
+            for label, extent in zip(batch + summed + free_b, right.shape):
+                sizes[label] = int(extent)
+
+            def product(labels):
+                total = 1
+                for label in labels:
+                    total *= sizes[label]
+                return total
+
+            b_size, m_size = product(batch), product(free_a)
+            k_size, n_size = product(summed), product(free_b)
+            left = dispatch("aten.reshape.default", left, [b_size, m_size, k_size])
+            right = dispatch("aten.reshape.default", right, [b_size, k_size, n_size])
+            product_out = dispatch("aten.bmm.default", left, right)
+            term = "".join(batch + free_a + free_b)
+            acc = dispatch(
+                "aten.reshape.default", product_out, [sizes[l] for l in term] or [1])
+            if not term:
+                acc = dispatch("aten.reshape.default", acc, [])
+
+        # A single operand, or a leftover label to reduce after the last pair.
+        term, acc = sum_over(term, acc, set(out_labels))
+        return align(term, acc, list(out_labels))
+
+    einsum.__name__ = einsum.__qualname__ = "einsum"
+    einsum.__module__ = "torch._C"
+    setattr(varfns, "einsum", einsum)
 
     def repeat_interleave(input, repeats, dim=None, *, output_size=None):
         """`torch.repeat_interleave` -- `cohere`'s wall, also a composite.
@@ -5740,6 +6228,58 @@ def _install_composites(module, varfns, dispatch) -> None:
     conv_transpose2d.__name__ = conv_transpose2d.__qualname__ = "conv_transpose2d"
     conv_transpose2d.__module__ = "torch._C"
     setattr(varfns, "conv_transpose2d", conv_transpose2d)
+
+    def conv_transpose1d(
+        input, weight, bias=None, stride=1, padding=0, output_padding=0,
+        groups=1, dilation=1,
+    ):
+        """`torch.conv_transpose1d` -- `vits`' last wall (docs/KERNELS26.md §24).
+
+        `modeling_vits.py`'s HiFi-GAN decoder is
+        `nn.ConvTranspose1d(channels, channels // 2, kernel, stride=rate,
+        padding=(kernel - rate) // 2)`, once per entry in `upsample_rates`,
+        reached through `F.conv_transpose1d` -- which **is**
+        `torch.conv_transpose1d` (asserted, not assumed, exactly as
+        `conv_transpose2d` above asserts its own).
+
+        Same shape as its 2-D sibling in every respect, including the argument
+        order that is not `conv1d`'s: **`groups` comes before `dilation`**.
+        The one difference is downstream rather than here -- `aten.rs` can
+        honour `groups` for the 1-D transposed case and not for the 2-D one,
+        because candle's `conv_transpose1d` takes a `groups` argument and its
+        `ParamsConvTranspose2D` has no field for one.
+
+        The `_as_list` width is 1, not 2. Passing 2 would hand
+        `aten.convolution.default` a two-element `stride` for a rank-3 input,
+        which is where a copy-paste of the 2-D body goes wrong.
+        """
+        def _as_list(value, n=1):
+            if isinstance(value, (list, tuple)):
+                return list(value)
+            return [value] * n
+
+        if isinstance(padding, str):
+            raise ValueError(
+                "conv_transpose1d: padding must be an int or a 1-tuple, got "
+                f"{padding!r} -- 'same'/'valid' are conv1d's forms and upstream's "
+                "transposed signature does not accept them"
+            )
+        return dispatch(
+            "aten.convolution.default",
+            input,
+            weight,
+            bias,
+            _as_list(stride),
+            _as_list(padding),
+            _as_list(dilation),
+            True,
+            _as_list(output_padding),
+            groups,
+        )
+
+    conv_transpose1d.__name__ = conv_transpose1d.__qualname__ = "conv_transpose1d"
+    conv_transpose1d.__module__ = "torch._C"
+    setattr(varfns, "conv_transpose1d", conv_transpose1d)
 
     def norm_except_dim(v, pow=2, dim=0):
         """`torch.norm_except_dim` -- the piece of `weight_norm` that a traced
