@@ -1998,6 +1998,185 @@ def test_rng_ops_refuse_integer_tensors():
             raise AssertionError("an integer tensor was filled")
 
 
+# --- bernoulli_ and the dropout composite over it (docs/TRAIN.md) ----------
+#
+# Training mode. Every architecture sweep in this repository called `.eval()`
+# until docs/TRAIN.md, and in `.eval()` `torch.dropout` short-circuits before
+# the dispatcher -- so this whole family was unreachable and unmeasured while
+# the project's stated purpose (README §2/§3: federated learning, test-time
+# adaptation) is training.
+
+
+def test_bernoulli_draws_in_double_for_every_dtype():
+    # THE trap. `uniform_` follows `opmath_type<scalar_t>`, so a float16
+    # tensor draws one 32-bit word per element there. `bernoulli_` does not:
+    # `bernoulli_distribution<double>` holds a `uniform_real_distribution<
+    # double>`, which takes `generator->random64()` whatever `scalar_t` is.
+    # A shim that copied `uniform_`'s rule would agree on float64 and
+    # desynchronise the stream at half the rate everywhere else -- while
+    # producing a perfectly plausible-looking mask.
+    def reference(n, p):
+        _C._shim_manual_seed(99)
+        u = _t([0.0] * n, [n], _C.float64)
+        u.uniform_(0.0, 1.0)
+        return [1.0 if v < p else 0.0 for v in u.tolist()]
+
+    for dtype in (_C.float64, _C.float32, _C.float16, _C.bfloat16,
+                  _C.int64, _C.int32, _C.int16, _C.uint8, _C.bool):
+        _C._shim_manual_seed(99)
+        t = _t([0] * 12, [12], dtype)
+        assert t.bernoulli_(0.5) is t
+        got = [float(v) for v in t.tolist()]
+        assert got == reference(12, 0.5), (dtype, got)
+
+
+def test_bernoulli_still_draws_when_p_is_zero_or_one():
+    # Upstream has no short-circuit: the comparison is per element, inside the
+    # kernel. So `p == 0` and `p == 1` are exact AND cost `numel` draws. A
+    # shim that returned early would produce the identical tensor and leave
+    # the generator behind -- invisible in the result, wrong in everything
+    # after it.
+    def after(p):
+        _C._shim_manual_seed(5)
+        t = _t([0.0] * 9, [9])
+        t.bernoulli_(p)
+        nxt = _t([0.0] * 3, [3], _C.float64)
+        nxt.uniform_(0.0, 1.0)
+        return t.tolist(), nxt.tolist()
+
+    zeros, after_zero = after(0.0)
+    ones, after_one = after(1.0)
+    _, after_half = after(0.5)
+    assert zeros == [0.0] * 9
+    assert ones == [1.0] * 9
+    # Same number of draws consumed by all three, so the tail agrees.
+    assert after_zero == after_one == after_half
+    # ...and it is genuinely 9 draws, not 0.
+    _C._shim_manual_seed(5)
+    skipped = _t([0.0] * 3, [3], _C.float64)
+    skipped.uniform_(0.0, 1.0)
+    assert skipped.tolist() != after_zero
+
+
+def test_bernoulli_refuses_p_outside_the_unit_interval_including_nan():
+    x = _t([0.0] * 4, [4])
+    for p in (-0.1, 1.5, float("nan")):
+        try:
+            x.bernoulli_(p)
+        except RuntimeError as e:
+            assert "bernoulli_ expects p to be in [0, 1]" in str(e), e
+        else:
+            raise AssertionError(f"p={p!r} was accepted")
+
+
+def test_bernoulli_refuses_the_dtypes_upstream_refuses():
+    # `AT_DISPATCH_ALL_TYPES_AND3(Bool, BFloat16, Half)` -- narrower than what
+    # candle can store, so uint32 has to be refused deliberately rather than
+    # served by accident.
+    x = _t([0, 1, 2], [3], _C.uint32)
+    try:
+        x.bernoulli_(0.5)
+    except NotImplementedError as e:
+        assert "bernoulli_scalar_cpu_" in str(e) and "UInt32" in str(e), e
+    else:
+        raise AssertionError("uint32 was filled")
+
+
+def test_dropout_decomposes_rather_than_naming_a_kernel():
+    # `aten::dropout` is CompositeImplicitAutograd: a TorchDispatchMode logger
+    # over a training `nn.Dropout` on torch 2.13.0 reports empty_like,
+    # bernoulli_.float, div_.Scalar, mul.Tensor -- and never
+    # `aten.dropout.default`. So there is no such kernel to implement, and
+    # this asserts the absence as well as the presence.
+    assert "aten.dropout.default" not in _C._aten_all_implemented()
+    assert "aten.bernoulli_.float" in _C._aten_implemented()
+    assert "aten.div_.Scalar" in _C._aten_implemented()
+    dropout = _C._VariableFunctions.dropout
+    _C._shim_manual_seed(0)
+    x = _t([1.0] * 8, [8])
+    y = dropout(x, 0.3, True)
+    # Upstream, measured: torch.manual_seed(0); torch.dropout(torch.ones(8),
+    # 0.3, True). The survivor is 1/0.7 rounded in float32.
+    assert y.tolist() == [
+        0.0, 0.0, 1.4285714626312256, 0.0,
+        1.4285714626312256, 0.0, 1.4285714626312256, 1.4285714626312256,
+    ], y.tolist()
+
+
+def test_dropout_identity_paths_return_the_same_object():
+    dropout = _C._VariableFunctions.dropout
+    x = _t([1.0, 2.0, 3.0], [3])
+    assert dropout(x, 0.0, True) is x
+    assert dropout(x, 0.5, False) is x
+    assert dropout(x, 0.0, False) is x
+    empty = _t([], [0])
+    assert dropout(empty, 0.5, True) is empty
+
+
+def test_dropout_p_one_is_a_multiply_by_zero_not_zeros_like():
+    # The case a `(y == 0).all()` test cannot tell apart. Upstream returns
+    # `input * zeros({})`, so -0.0 survives as -0.0 and +-inf becomes nan.
+    import math
+
+    dropout = _C._VariableFunctions.dropout
+    x = _t([1.0, -1.0, 0.0, -0.0, float("inf"), float("-inf")], [6])
+    y = dropout(x, 1.0, True).tolist()
+    assert math.copysign(1.0, y[0]) == 1.0 and y[0] == 0.0
+    assert math.copysign(1.0, y[1]) == -1.0 and y[1] == 0.0
+    assert math.copysign(1.0, y[2]) == 1.0
+    assert math.copysign(1.0, y[3]) == -1.0, "-0.0 * 0.0 is -0.0, not 0.0"
+    assert math.isnan(y[4]) and math.isnan(y[5]), "inf * 0 is nan, not 0"
+
+
+def test_dropout_scales_the_mask_in_the_masks_dtype():
+    # `noise.div_(1 - p)` happens in the tensor's dtype and only then
+    # multiplies. Scaling the input by a Python `1/(1-p)` instead agrees in
+    # float32 and differs in bfloat16, where 1/0.3 is 3.328125.
+    dropout = _C._VariableFunctions.dropout
+    for dtype, survivor in ((_C.float32, 3.3333332538604736),
+                            (_C.bfloat16, 3.328125),
+                            (_C.float16, 3.333984375)):
+        _C._shim_manual_seed(4)
+        x = _t([1.0] * 32, [32], dtype)
+        vals = {v for v in dropout(x, 0.7, True).tolist()}
+        assert vals <= {0.0, survivor}, (dtype, vals)
+        assert survivor in vals, (dtype, vals)
+
+
+def test_dropout_range_check_precedes_the_short_circuit():
+    # `TORCH_CHECK(p >= 0 && p <= 1, ...)` runs before
+    # `if (p == 0 || !train || numel == 0)`, so an eval-mode call with a
+    # nonsense p still raises. This shim used to return `input`.
+    dropout = _C._VariableFunctions.dropout
+    x = _t([1.0, 2.0], [2])
+    for p, train in ((1.5, False), (-0.1, False), (float("nan"), True)):
+        try:
+            dropout(x, p, train)
+        except RuntimeError as e:
+            assert "dropout probability has to be between 0 and 1" in str(e), e
+        else:
+            raise AssertionError(f"dropout(p={p!r}, train={train}) was accepted")
+
+
+def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
+    # `div_true_kernel`'s Half/BFloat16 branch reads the ORIGINAL scalar in
+    # float and multiplies by its reciprocal; it does not narrow the divisor
+    # to the tensor's dtype the way add/mul do. Only float16 can see it:
+    # upstream answers 3.333984375 = f16(1.0f/0.3f), while narrowing first
+    # gives 1/f16(0.3) = 3.33203125. bfloat16 rounds both to 3.328125, which
+    # is why this went unnoticed.
+    for dtype, expected in ((_C.float16, 3.333984375),
+                            (_C.bfloat16, 3.328125),
+                            (_C.float32, 3.3333332538604736)):
+        out_of_place = _C._aten_dispatch(
+            "aten.div.Scalar", _t([1.0], [1], dtype), 0.3
+        )
+        in_place = _t([1.0], [1], dtype)
+        in_place.div_(0.3)
+        assert out_of_place.tolist() == [expected], (dtype, out_of_place.tolist())
+        assert in_place.tolist() == [expected], (dtype, in_place.tolist())
+
+
 # --- torch.randn / torch.rand and their siblings (docs/RANDOM.md) ----------
 #
 # `randn`/`rand` are not `overloads.json` entries: there is no `aten::randn`
@@ -6436,6 +6615,213 @@ def _forward_road_fixture():
     return json.loads(proc.stdout)
 
 
+# --- the training sweep, as a standing check (docs/TRAIN.md §5) -------------
+#
+# `docs/ARCH20.md`'s twenty and `docs/KERNELS26.md`'s twenty-six are run from
+# a script outside the repo, and both call `.eval()`. Nothing in the suite
+# noticed that a whole mode was unexercised, and nothing would notice it
+# regressing. This is that sweep in miniature, on the four ARCH20
+# architectures that forwarded in `.eval()` and stopped in `.train()` -- built
+# from the sweep's own toy config, unchanged, and compared against upstream in
+# the shape `test_a_real_transformers_llama_forward_matches_upstream` set: the
+# same `transformers` in both interpreters, weights pushed in by one procedure
+# so neither side depends on the other's random stream, and the forward run
+# under a seed so the dropout masks are comparable rather than merely
+# plausible.
+#
+# THE THREE THINGS IT ASSERTS, and each catches a different regression:
+#
+#   * the forward completes            -- a missing kernel
+#   * `.train()` differs from `.eval()` -- dropout silently becoming a no-op,
+#     which every "it runs" check would pass
+#   * the logits match upstream's      -- the mask itself, draw for draw; a
+#     shim drawing from the wrong stream produces a different, equally
+#     plausible mask and lands nowhere near this bound
+
+_TRAIN_SWEEP_MODELS = ("gpt2", "opt", "bert", "gpt_bigcode")
+
+# The toy config is `/tmp/k26/sweep26.py`'s `run_causal`, transcribed, so this
+# check and the sweep are measuring the same models.
+_TRAIN_SWEEP_CFG = dict(
+    hidden_size=32, num_hidden_layers=1, num_attention_heads=4,
+    num_key_value_heads=2, vocab_size=100, max_position_embeddings=64,
+    intermediate_size=64,
+)
+_TRAIN_SWEEP_IDS = [3, 17, 42, 8]
+_TRAIN_SWEEP_SEED = 1234
+
+# Shared by both interpreters, as source text, for the reason `_LLAMA_FILL`
+# gives: the two sides must fill the weights by *the same procedure*.
+#
+# Non-floating entries are skipped rather than filled. `gpt2` registers a
+# boolean causal-mask buffer and `bert` an int64 `position_ids`; writing
+# pseudo-random floats over either would not be "the same weights on both
+# sides", it would be a broken model on both sides.
+_TRAIN_SWEEP_BODY = r'''
+def _flat(v):
+    if isinstance(v, list):
+        r = []
+        for e in v:
+            r.extend(_flat(e))
+        return r
+    return [v]
+
+
+def _fill_float_params(model, torch):
+    sd = model.state_dict()
+    new = {}
+    for i, key in enumerate(sorted(sd)):
+        ref = sd[key]
+        if not ref.is_floating_point():
+            continue
+        n = 1
+        for d in ref.shape:
+            n *= int(d)
+        state = (i + 1) * 7919
+        vals = []
+        for _ in range(n):
+            state = (state * 1103515245 + 12345) % 2147483648
+            vals.append(round(((state / 2147483648.0) * 2.0 - 1.0) * 0.2, 6))
+        t = torch.tensor(vals, dtype=torch.float32)
+        new[key] = t.reshape([int(d) for d in ref.shape]) if len(ref.shape) != 1 else t
+    model.load_state_dict(new, strict=False)
+    return model
+
+
+def _run(torch, models, cfg_kwargs, ids, seed):
+    from transformers import AutoConfig, AutoModelForCausalLM
+    out = {}
+    for mt in models:
+        cfg = AutoConfig.for_model(mt, **cfg_kwargs)
+        model = AutoModelForCausalLM.from_config(cfg)
+        _fill_float_params(model, torch)
+        tokens = torch.tensor([ids])
+        model.eval()
+        with torch.no_grad():
+            ev = model(tokens).logits
+        model.train()
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            tr = model(tokens).logits
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            again = model(tokens).logits
+        out[mt] = {
+            "shape": [int(d) for d in tr.shape],
+            "train": _flat(tr.tolist()),
+            "eval": _flat(ev.tolist()),
+            "reproducible": bool((tr == again).all().item()),
+        }
+    return out
+'''
+
+_TRAIN_SWEEP_SCRIPT = r"""
+import json, sys, traceback
+import torch
+
+BODY = __BODY__
+ns = {}
+exec(BODY, ns)
+try:
+    out = {"models": ns["_run"](torch, __MODELS__, __CFG__, __IDS__, __SEED__)}
+except BaseException:
+    out = {"error": traceback.format_exc(limit=6)}
+json.dump(out, sys.stdout)
+""".replace("__BODY__", repr(_TRAIN_SWEEP_BODY)) \
+   .replace("__MODELS__", repr(_TRAIN_SWEEP_MODELS)) \
+   .replace("__CFG__", repr(_TRAIN_SWEEP_CFG)) \
+   .replace("__IDS__", repr(_TRAIN_SWEEP_IDS)) \
+   .replace("__SEED__", repr(_TRAIN_SWEEP_SEED))
+
+
+@functools.lru_cache(maxsize=1)
+def _train_sweep_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _TRAIN_SWEEP_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"train-sweep subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+@functools.lru_cache(maxsize=1)
+def _upstream_train_sweep():
+    ns = {}
+    exec(_TRAIN_SWEEP_BODY, ns)
+    return ns["_run"](
+        _upstream_torch, _TRAIN_SWEEP_MODELS, _TRAIN_SWEEP_CFG,
+        _TRAIN_SWEEP_IDS, _TRAIN_SWEEP_SEED,
+    )
+
+
+# Measured, not chosen, and both ends of it were measured. Clean run over the
+# four architectures below, shim against upstream, largest absolute logit
+# difference:
+#
+#     gpt2 5.96e-08   opt 1.79e-07   bert 5.96e-08   gpt_bigcode 5.96e-08
+#
+# What the bound has to sit *below* is the distance a wrong dropout mask
+# produces, and that was measured too rather than assumed -- by re-running the
+# shim side with the seed changed to 999, which is exactly the shape of "a
+# plausible mask from the wrong stream":
+#
+#     gpt2 0.474      opt 0.458       bert 0.592       gpt_bigcode 0.444
+#
+# So 1e-5 is 56x above the worst clean run and 44000x below the cheapest wrong
+# answer. It is deliberately not a tight numeric-accuracy bound -- that job
+# belongs to the golden suite -- it is a "the mask is upstream's" bound, and
+# the two numbers above are what say it can tell those apart.
+_TRAIN_SWEEP_ATOL = 1e-5
+
+
+def test_train_mode_forwards_the_four_architectures_eval_mode_hid():
+    """docs/TRAIN.md's sweep, in the suite.
+
+    Before docs/TRAIN.md these four raised `aten.dropout.default` and then
+    `scaled_dot_product_attention(dropout_p != 0)`. Nothing in this file would
+    have noticed either, because every model check in it calls `.eval()`.
+    """
+    if not _ckpt_shim_available() or _upstream_transformers is None:
+        return
+    r = _train_sweep_fixture()
+    assert "error" not in r, r.get("error")
+    expected = _upstream_train_sweep()
+    for mt in _TRAIN_SWEEP_MODELS:
+        got = r["models"][mt]
+        want = expected[mt]
+        assert got["shape"] == want["shape"], (mt, got["shape"], want["shape"])
+        # A seeded training forward has to reproduce, or nothing below means
+        # anything.
+        assert got["reproducible"] is True, mt
+        assert want["reproducible"] is True, mt
+        # Dropout has to actually fire. This is the assertion that fails if
+        # `torch.dropout` regressed to the identity in training mode -- which
+        # is exactly what it was before this work, and which every "the
+        # forward completes" check passes.
+        assert max(abs(a - b) for a, b in zip(got["train"], got["eval"])) > 1e-3, (
+            f"{mt}: .train() and .eval() produced the same logits, so no "
+            "dropout was applied"
+        )
+        # ...and the mask is upstream's, draw for draw.
+        max_diff = max(abs(a - b) for a, b in zip(got["train"], want["train"]))
+        assert max_diff < _TRAIN_SWEEP_ATOL, (mt, max_diff)
+        # The eval path is unchanged by any of this, checked here rather than
+        # assumed: a training-mode kernel that moved an eval-mode result is a
+        # bug, and this is the cheapest place that would see it.
+        eval_diff = max(abs(a - b) for a, b in zip(got["eval"], want["eval"]))
+        assert eval_diff < _TRAIN_SWEEP_ATOL, (mt, eval_diff)
+
+
 def test_min_and_max_refuse_an_empty_reduction_the_same_way():
     """`min.default` is `max.default`'s mirror, including the refusal.
 
@@ -8483,8 +8869,14 @@ def _schema_road_fixture():
 _EXPECTED_MUTABLE = (
     "aten.add_.Scalar",
     "aten.add_.Tensor",
+    # docs/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
+    # training mode needed, and both are `Tensor(a!) self` -- so this list
+    # growing by exactly two is the check that the new schemas were parsed
+    # rather than placeholdered.
+    "aten.bernoulli_.float",
     "aten.clamp_.default",
     "aten.copy_.default",
+    "aten.div_.Scalar",
     "aten.div_.Tensor",
     "aten.exp_.default",
     "aten.fill_.Scalar",
@@ -8787,7 +9179,19 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # nor `Tensor.leaky_relu` (`hasattr` is False for both on 2.13.0), so it
     # is in neither table. Getting +4 here would have meant `leaky_relu` had
     # been given a table entry that invents a surface upstream does not have.
-    assert len(keys) == 248, len(keys)
+    #
+    # 250 with `bernoulli_` (docs/TRAIN.md). **+2**, and both come from
+    # `methods.json` alone: `aten::bernoulli_.Tensor` and
+    # `aten::bernoulli_.float`. There is no `overloads.json` half -- upstream
+    # has no `torch.bernoulli_`, only `Tensor.bernoulli_` (`hasattr(torch,
+    # "bernoulli_")` is False on 2.13.0) -- and only the `.float` overload has
+    # a kernel; the `.Tensor` one is listed so that a tensor-valued `p`
+    # refuses by the name of the overload it needed. `div_.Scalar` adds
+    # **none**: `methods.json`'s `div_` already declared all four of its
+    # overloads, and this round only gave one of them a kernel. Getting +3
+    # here would mean `dropout` had been given a table entry, which would
+    # invent a `CompositeImplicitAutograd` kernel upstream does not have.
+    assert len(keys) == 250, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -11782,32 +12186,53 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     names as present, it must be in `_aten_implemented()`; for every one it
     names as absent, it must not be. A refusal message that drifts out of
     agreement with the artefact fails here rather than sitting unread.
+
+    **THE DROPOUT REFUSAL IS GONE, AND THIS TEST IS WHAT CAUGHT IT.** Its
+    negative claim -- that `aten.bernoulli_.float` and `aten.div_.Scalar` had
+    no kernels -- went stale the moment docs/TRAIN.md landed them, for the
+    third time in this one function. The right answer was not a fourth
+    re-wording: with both kernels present the math backend was writable, so
+    `dropout_p != 0` now takes it (docs/TRAIN.md §4) and there is nothing left
+    to claim. The assertions below are inverted rather than deleted, so the
+    file still records which refusal this was.
     """
     if not _ckpt_shim_available():
         return
     r = _sdpa_refusal_fixture()
     implemented = set(_C._aten_implemented()) | set(_C._aten_all_implemented())
 
-    for label in ("dropout", "three_d"):
-        message = r[label]
-        assert message.startswith("NotImplementedError"), f"{label}: {message}"
-        assert "math backend" in message, f"{label}: {message}"
-        # Nothing in either message may say a kernel is missing when it is not.
-        assert "_safe_softmax.default; it has no kernel" not in message, message
-        assert "aten._safe_softmax.default, " not in message, message
+    # The refusal that is gone.
+    assert r["dropout"] == "ACCEPTED", r["dropout"]
+    assert r["dropout_shape"] == [1, 2, 3, 4], r["dropout_shape"]
+    # `dropout_p=1.0` drops every weight, so the math backend's output is
+    # exactly zero. A path that quietly ignored `dropout_p` and called the
+    # flash kernel anyway would return the ordinary attention output here.
+    assert r["dropout_p_one"] == 0.0, r["dropout_p_one"]
+    assert r["dropout_reproducible"] is True, "a seeded run must reproduce"
+    assert r["dropout_differs_from_eval"] is True, (
+        "dropout_p=0.5 must differ from dropout_p=0.0 -- otherwise the mask "
+        "is not being applied at all"
+    )
+    # Upstream's own check, kept: the math backend builds its own causal mask
+    # and will not take a second one.
+    assert "Explicit attn_mask should not be set when is_causal=True" in (
+        r["causal_and_mask"]
+    ), r["causal_and_mask"]
+    # ...and the two kernels whose absence that refusal used to claim.
+    for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
+        assert op in implemented, op
 
-    # The positive claims, checked against the artefact.
-    assert "aten._safe_softmax.default is " in r["dropout"], r["dropout"]
+    # The refusal that remains, checked the way both used to be.
+    message = r["three_d"]
+    assert message.startswith("NotImplementedError"), message
+    assert "math backend" in message, message
+    # Nothing in it may say a kernel is missing when it is not.
+    assert "_safe_softmax.default; it has no kernel" not in message, message
+    assert "aten._safe_softmax.default, " not in message, message
+    assert "_safe_softmax" in message, message
     assert "aten._safe_softmax.default" in implemented
-    assert "_safe_softmax" in r["three_d"], r["three_d"]
     for op in ("aten.mul.Scalar", "aten.expand.default", "aten.view.default", "aten.bmm.default"):
         assert op in implemented, f"{op} named as implemented by the 3-D refusal, but is not"
-    # ...and the negative ones.
-    for op in ("aten.bernoulli_.float", "aten.div_.Scalar"):
-        assert op not in implemented, (
-            f"{op} now has a kernel -- the dropout refusal names it as missing "
-            f"and has gone stale again"
-        )
 
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
@@ -11835,6 +12260,28 @@ try:
     out["dropout"] = "ACCEPTED"
 except NotImplementedError as e:
     out["dropout"] = "NotImplementedError: %s" % e
+# The math backend, now that `dropout_p != 0` takes it (docs/TRAIN.md §4).
+# `dropout_p=1.0` drops every attention weight, so the output is exactly zero
+# whatever the inputs are -- the one assertion about this path that needs no
+# reference values and still fails if the dropout step were skipped.
+v = torch.randn(1, 2, 3, 4)
+out["dropout_p_one"] = torch.nn.functional.scaled_dot_product_attention(
+    q, q, v, dropout_p=1.0).abs().sum().item()
+torch.manual_seed(3)
+first = torch.nn.functional.scaled_dot_product_attention(q, q, v, dropout_p=0.5)
+torch.manual_seed(3)
+again = torch.nn.functional.scaled_dot_product_attention(q, q, v, dropout_p=0.5)
+out["dropout_reproducible"] = bool((first == again).all().item())
+out["dropout_differs_from_eval"] = bool((
+    first != torch.nn.functional.scaled_dot_product_attention(
+        q, q, v, dropout_p=0.0)).any().item())
+out["dropout_shape"] = list(first.shape)
+try:
+    torch.nn.functional.scaled_dot_product_attention(
+        q, q, v, attn_mask=torch.zeros(1, 2, 3, 3), dropout_p=0.5, is_causal=True)
+    out["causal_and_mask"] = "ACCEPTED"
+except RuntimeError as e:
+    out["causal_and_mask"] = str(e)
 q3 = torch.randn(2, 3, 4)
 try:
     torch.nn.functional.scaled_dot_product_attention(q3, q3, q3)

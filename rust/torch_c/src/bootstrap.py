@@ -5102,6 +5102,97 @@ def _install_nn(module, dispatch) -> None:
     # it is a backward-pass residual and this shim has no backward.
     _FLASH = "aten._scaled_dot_product_flash_attention_for_cpu.default"
 
+    def _boolean_attn_mask(mask, dtype):
+        """`convert_boolean_attn_mask`, shared by the flash and math paths.
+
+        Argument order in the `where` is the half a plausible reading gets
+        backwards, so it was read off the *values*, not the shapes:
+        `where(tensor([[True, False]]), 0.0, -inf)` gives `[[0.0, -inf]]`. A
+        `True` in a boolean attention mask means *attend*, so it selects the
+        zero; the `-inf` is what a `False` selects.
+        """
+        neg_inf = dispatch("aten.scalar_tensor.default", float("-inf"), dtype=dtype)
+        zero = dispatch("aten.scalar_tensor.default", 0.0, dtype=dtype)
+        return dispatch("aten.where.self", mask, zero, neg_inf)
+
+    def _sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale,
+                   enable_gqa):
+        """`at::native::_scaled_dot_product_attention_math`, transcribed.
+
+        **Why this exists at all**: a non-zero `dropout_p` takes the whole call
+        off the fused kernel. `_scaled_dot_product_flash_attention_for_cpu`
+        does not implement dropout, so upstream falls back here -- which means
+        `gpt2`, `bert` and `gpt_bigcode` run ONE op in `.eval()` and twenty in
+        `.train()` (docs/TRAIN.md §3). Until this was written, attention
+        dropout was the wall behind `nn.Dropout` for all three.
+
+        The sequence is upstream's, measured with a `TorchDispatchMode` logger
+        on torch 2.13.0 and reproduced op for op and in order.
+
+        Two details are measured rather than reasoned:
+
+          * **The scale is applied as its square root, to BOTH operands.**
+            Upstream multiplies `query` by `sqrt(scale)` and `key.transpose(
+            -2, -1)` by `sqrt(scale)` rather than scaling the product once --
+            it is a numerical-stability choice, and it is *observable*: for
+            `E=8` with no explicit scale the factor is 0.5946035575013605,
+            which is `sqrt(1/sqrt(8))`, and a shim that multiplied the logits
+            by `1/sqrt(8)` afterwards would differ in the last bits of every
+            attention weight.
+          * **A negative explicit `scale` is not just passed through.**
+            Upstream takes `abs(scale)`, roots it, and negates the *query*
+            multiplier, so the sign survives exactly once instead of being
+            lost to the square root.
+        """
+        if is_causal and attn_mask is not None:
+            raise RuntimeError(
+                "_scaled_dot_product_attention: Explicit attn_mask should not "
+                "be set when is_causal=True"
+            )
+        if attn_mask is not None and attn_mask.dtype == module.bool:
+            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
+
+        raw_scale = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
+        factor = math.sqrt(abs(raw_scale))
+        q = dispatch(
+            "aten.mul.Scalar", query, -factor if raw_scale < 0.0 else factor
+        )
+
+        if is_causal:
+            L, S = query.shape[-2], key.shape[-2]
+            causal = dispatch("aten.ones.default", [L, S], dtype=module.bool)
+            causal = dispatch("aten.tril.default", causal)
+            attn_mask = _boolean_attn_mask(causal, query.dtype)
+
+        if enable_gqa:
+            # `repeat_interleave` along the head dim, spelled the way upstream
+            # spells it: unsqueeze, expand, contiguous clone, view. Not a
+            # `repeat`, which would interleave the wrong way round.
+            n_rep = query.shape[1] // key.shape[1]
+            if n_rep != 1:
+                def _repeat_heads(t):
+                    b, h, s, e = t.shape
+                    x = dispatch("aten.unsqueeze.default", t, 2)
+                    x = dispatch("aten.expand.default", x, [b, h, n_rep, s, e])
+                    x = dispatch("aten.clone.default", x)
+                    return dispatch("aten.view.default", x, [b, h * n_rep, s, e])
+
+                key, value = _repeat_heads(key), _repeat_heads(value)
+
+        k_t = dispatch("aten.transpose.int", key, -2, -1)
+        k_t = dispatch("aten.mul.Scalar", k_t, factor)
+        attn = dispatch("aten.matmul.default", q, k_t)
+        if attn_mask is not None:
+            attn = dispatch("aten.add.Tensor", attn, attn_mask)
+        # `_safe_softmax`, not `softmax`: a fully-masked row is all `-inf`, and
+        # the two disagree there by exactly the amount that matters (zeros
+        # versus nan). It is the reason this composite could not be
+        # approximated while that kernel was missing.
+        attn = dispatch("aten._safe_softmax.default", attn, -1)
+        if dropout_p > 0.0:
+            attn = module._VariableFunctions.dropout(attn, dropout_p, True)
+        return dispatch("aten.matmul.default", attn, value)
+
     def scaled_dot_product_attention(
         query,
         key,
@@ -5113,14 +5204,6 @@ def _install_nn(module, dispatch) -> None:
         scale=None,
         enable_gqa=False,
     ):
-        if dropout_p != 0.0:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: "
-                "scaled_dot_product_attention(dropout_p != 0) -- upstream drops to "
-                "the math backend here. Its aten._safe_softmax.default is "
-                "implemented; aten.bernoulli_.float and aten.div_.Scalar are not, "
-                "and the math-backend composite itself is not written"
-            )
         if query.dim() != 4:
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
@@ -5160,11 +5243,7 @@ def _install_nn(module, dispatch) -> None:
             # it selects the zero; the `-inf` is what a `False` selects. Both
             # fills carry the query's dtype, not the default float, which is
             # what keeps a float16 forward in float16.
-            neg_inf = dispatch(
-                "aten.scalar_tensor.default", float("-inf"), dtype=query.dtype
-            )
-            zero = dispatch("aten.scalar_tensor.default", 0.0, dtype=query.dtype)
-            attn_mask = dispatch("aten.where.self", attn_mask, zero, neg_inf)
+            attn_mask = _boolean_attn_mask(attn_mask, query.dtype)
         # Grouped-query attention. The repetition itself is NOT here -- it is
         # in the aten kernel, because that is where upstream does it: a
         # TorchDispatchMode over `enable_gqa=True` reports one op, with the
@@ -5200,6 +5279,18 @@ def _install_nn(module, dispatch) -> None:
             raise RuntimeError(
                 f"The size of tensor a ({q_heads}) must match the size of tensor b "
                 f"({kv_heads}) at non-singleton dimension 1"
+            )
+        # **The backend selection, and it is upstream's, not a convenience.**
+        # `_scaled_dot_product_flash_attention_for_cpu` refuses `dropout > 0`
+        # -- upstream's own kernel does, with "Currently do not support dropout
+        # > 0" -- so a non-zero `dropout_p` is not a slower road to the same
+        # answer, it is a *different* backend with a different op sequence
+        # (docs/TRAIN.md §4). Measured on 2.13.0: `dropout_p=0.0` fires exactly
+        # one op and `dropout_p=0.1` fires twenty.
+        if dropout_p != 0.0:
+            return _sdpa_math(
+                query, key, value, attn_mask, dropout_p, is_causal, scale,
+                enable_gqa,
             )
         return dispatch(
             _FLASH,
@@ -5407,21 +5498,66 @@ def _install_composites(module, varfns, dispatch) -> None:
     therefore needs no dropout kernel, and routing this name through the
     overload table would have invented a requirement upstream does not have.
 
-    `train=True` still resolves to `aten.dropout.default` and still raises from
-    the one door, naming the kernel an inference-only shim does not need yet.
+    `train=True` is the training half, and docs/TRAIN.md is where it was
+    measured. There is **no `aten.dropout.default` kernel to write**: with a
+    `TorchDispatchMode` logger on torch 2.13.0, a training-mode `nn.Dropout`
+    forward fires
+
+        empty_like.default, bernoulli_.float, div_.Scalar, mul.Tensor
+
+    and `aten.dropout.default` never appears -- it is
+    `CompositeImplicitAutograd`, the same shape as `aten::linear` and
+    `aten::layer_norm`, which `_install_nn` and `layer_norm` below answer by
+    decomposition for the same reason. It is also *not* `native_dropout`;
+    that is the functionalised spelling, and eager CPU never reaches it
+    (`is_fused_kernel_acceptable` wants CUDA/XPU/lazy).
+
+    So the body below is `at::native::_dropout_impl` transcribed, and three of
+    its details are measured rather than assumed (docs/TRAIN.md §1):
+
+      * the range check runs **before** the short-circuit, so
+        `torch.dropout(x, 1.5, False)` raises rather than returning `x`;
+      * the identity return is the identity *object* -- `torch.dropout(x, 0.,
+        False) is x` is True upstream;
+      * `p == 1` is `input * zeros({})`, **not** `zeros_like(input)`. Signed
+        zero survives it and `±inf` becomes `nan`, neither of which a
+        `zeros_like` gives, and no `(y == 0).all()` test can tell the two
+        apart.
     """
 
     tensorbase = module.TensorBase
 
-    def dropout(input, p, train):
+    def _dropout_impl(input, p, train, inplace):
+        # `TORCH_CHECK(p >= 0 && p <= 1, ...)`, spelled so that `nan` is
+        # refused rather than falling through both comparisons.
+        if not (p >= 0 and p <= 1):
+            raise RuntimeError(
+                f"dropout probability has to be between 0 and 1, but got {p}"
+            )
         if p == 0 or not train or input.numel() == 0:
             return input
-        return dispatch("aten.dropout.default", input, p, train)
+        mul = "aten.mul_.Tensor" if inplace else "aten.mul.Tensor"
+        if p == 1:
+            zero = dispatch(
+                "aten.zeros.default", [], dtype=input.dtype, device=input.device
+            )
+            return dispatch(mul, input, zero)
+        noise = dispatch("aten.empty_like.default", input)
+        # `1 - p` is the *keep* probability, and it is computed once and used
+        # twice: upstream draws with it and then divides by it, so any rounding
+        # in it cancels between the mask and the scale. Computing `1 - p` twice
+        # would be the same value here; computing the scale as `1 / (1 - p)`
+        # and multiplying would not be -- `div_` rounds in the tensor's dtype.
+        keep = 1 - p
+        dispatch("aten.bernoulli_.float", noise, keep)
+        dispatch("aten.div_.Scalar", noise, keep)
+        return dispatch(mul, input, noise)
+
+    def dropout(input, p, train):
+        return _dropout_impl(input, p, train, inplace=False)
 
     def dropout_(input, p, train):
-        if p == 0 or not train or input.numel() == 0:
-            return input
-        return dispatch("aten.dropout_.default", input, p, train)
+        return _dropout_impl(input, p, train, inplace=True)
 
     for fn, name in ((dropout, "dropout"), (dropout_, "dropout_")):
         fn.__name__ = fn.__qualname__ = name

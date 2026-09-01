@@ -63,6 +63,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.argmax.default",
     "aten.avg_pool2d.default",
     "aten.baddbmm.default",
+    "aten.bernoulli_.float",
     "aten.bitwise_and.Scalar",
     "aten.bitwise_and.Tensor",
     "aten.bitwise_not.default",
@@ -84,6 +85,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.div.Scalar_mode",
     "aten.div.Tensor",
     "aten.div.Tensor_mode",
+    "aten.div_.Scalar",
     "aten.div_.Tensor",
     "aten.embedding.default",
     "aten.empty.memory_format",
@@ -1474,6 +1476,18 @@ fn aten_dispatch_inner(
         "aten.clamp.default" => clamp_default(py, args, kwargs),
         "aten.clamp_min.default" => clamp_min_default(py, args, kwargs),
         "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
+        // `noise.div_(1 - p)`, the scale step of upstream's dropout
+        // decomposition (docs/TRAIN.md §1). The out-of-place `div.Scalar` and
+        // the in-place `sub_`/`mul_`/`add_` scalar forms were all here already;
+        // this one was the hole in the middle of them, and it is the same
+        // helper -- `div_.Scalar` differs from `mul_.Scalar` only in
+        // `arith_tag`'s true-division promotion, which is what makes
+        // `int_tensor.div_(2)` refuse with "result type Float can't be cast to
+        // the desired output type Long" rather than floor-dividing.
+        "aten.div_.Scalar" => {
+            arith_inplace_scalar(py, args, kwargs, "aten.div_.Scalar", Arith::Div)
+        }
+        "aten.bernoulli_.float" => bernoulli_inplace_float(py, args, kwargs),
         "aten.masked_fill_.Scalar" => masked_fill_inplace(py, args, kwargs, "aten.masked_fill_.Scalar"),
         "aten.index_put_.default" => index_put_inplace(py, args, kwargs),
 
@@ -4716,6 +4730,52 @@ fn arith_tensor(
     finish(py, out, tag)
 }
 
+/// Upstream's **reduced-float scalar fast path for true division**, which is
+/// not the same arithmetic as the rest of the `Scalar` family.
+///
+/// `div_true_kernel` (ATen/native/cpu/BinaryOpsKernel.cpp) branches when the
+/// second operand is a wrapped scalar and the common dtype is `Half` or
+/// `BFloat16`:
+///
+/// ```text
+/// opmath_t inv_b = opmath_t(1) / iter.original_scalar_value<opmath_t>(2);
+/// ... return static_cast<opmath_t>(a) * inv_b;
+/// ```
+///
+/// Two departures from what `arith_scalar`'s comment describes, and both are
+/// only visible in `float16`:
+///
+///   * the divisor is the **original** scalar widened to `float`, not the
+///     scalar narrowed to the tensor's dtype. `add`/`mul` do narrow it (that
+///     is docs/GENERATE.md §3.2's `x + 0.3` adding `0.30078125`); `div` does
+///     not, because `original_scalar_value` reads the `Scalar` rather than the
+///     promoted operand.
+///   * the division is turned into a **reciprocal and a multiply**, once, for
+///     the whole tensor.
+///
+/// Measured on 2.13.0, `float16` ones divided by `0.3`: upstream answers
+/// `3.333984375`, which is `f16(1.0f / 0.3f)`. Narrowing first gives
+/// `1 / f16(0.3) = 3.33203125`, one representable step below -- and that is
+/// what this shim answered until docs/TRAIN.md §4. **`bfloat16` cannot see the
+/// difference**: both roads round to `3.328125`, which is why the existing
+/// `div.Scalar` kernel passed every bfloat16 case it had and was wrong.
+///
+/// Returns `None` for anything but `float16`/`bfloat16`, where upstream has no
+/// such branch and plain `a / b` is what runs.
+fn div_scalar_reduced_float(
+    op: &str,
+    left: &Tensor,
+    scalar: f64,
+    storage: candle_core::DType,
+) -> PyResult<Option<Tensor>> {
+    if !matches!(storage, candle_core::DType::F16 | candle_core::DType::BF16) {
+        return Ok(None);
+    }
+    let inv = 1.0f32 / (scalar as f32);
+    let right = Tensor::full(inv, (), left.device()).map_err(|e| candle_err(op, e))?;
+    Ok(Some(apply_arith(op, Arith::Mul, left, &right)?))
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -4753,9 +4813,16 @@ fn arith_scalar(
             .and_then(|t| t.fast_to(acc))
     }
     .map_err(|e| candle_err(op, e))?;
-    let out = apply_arith(op, kind, &left, &right)?
-        .fast_to(storage)
-        .map_err(|e| candle_err(op, e))?;
+    let computed = match kind {
+        Arith::Div => div_scalar_reduced_float(op, &left, other.as_f64(), storage)?,
+        _ => None,
+    };
+    let out = match computed {
+        Some(t) => t,
+        None => apply_arith(op, kind, &left, &right)?,
+    }
+    .fast_to(storage)
+    .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
 
@@ -9803,9 +9870,21 @@ fn arith_inplace_scalar(
             .and_then(|t| t.fast_to(acc))
     }
     .map_err(|e| candle_err(op, e))?;
-    let out = apply_arith(op, kind, &lhs, &rhs)?
-        .fast_to(storage)
-        .map_err(|e| candle_err(op, e))?;
+    // `div_.Scalar` takes upstream's reduced-float reciprocal path, exactly as
+    // the out-of-place `div.Scalar` above does -- see
+    // `div_scalar_reduced_float`. The in-place and out-of-place forms have to
+    // agree, and a `float16` `x /= 0.3` disagreeing with `x = x / 0.3` by one
+    // representable step is the kind of difference nobody would look for.
+    let computed = match kind {
+        Arith::Div => div_scalar_reduced_float(op, &lhs, other.as_f64(), storage)?,
+        _ => None,
+    };
+    let out = match computed {
+        Some(t) => t,
+        None => apply_arith(op, kind, &lhs, &rhs)?,
+    }
+    .fast_to(storage)
+    .map_err(|e| candle_err(op, e))?;
     write_back(op, &receiver, tagged(out, tag)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
@@ -10251,6 +10330,112 @@ fn normal_inplace(
 
     write_back(OP, &receiver, PyTensorBase::new(filled)?)?;
     let _ = (py, target.tag);
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::bernoulli_.float(Tensor(a!) self, float p=0.5, *,
+///                         Generator? generator=None) -> Tensor(a!)`
+///
+/// The primitive under **training mode** (docs/TRAIN.md). Two callers, and
+/// they are not the same caller: `nn.Dropout`'s composite decomposes onto it
+/// (docs/TRAIN.md §1), and DeBERTa's `XDropout` reaches for it directly --
+/// `transformers/models/sew_d/modeling_sew_d.py:229` is
+/// `(1 - torch.empty_like(input).bernoulli_(1 - dropout)).to(torch.bool)`,
+/// because it needs the mask itself and not just the masked tensor.
+///
+/// **The accumulate type is `double` for every dtype, and that is the trap.**
+/// `uniform_` follows `opmath_type<scalar_t>`, so a `float16` tensor draws one
+/// *32-bit* word per element there (see `uniform_inplace` above). `bernoulli_`
+/// does not: its `bernoulli_distribution<double>` holds a
+/// `uniform_real_distribution<double>` whose `operator()` takes
+/// `generator->random64()` no matter what `scalar_t` is. Reading the dtype
+/// here instead would consume the stream at half the rate on the reduced
+/// dtypes and desynchronise every draw after it -- while producing values that
+/// look perfectly plausible. Measured on torch 2.13.0 for all eight accepted
+/// dtypes: `bernoulli_(p)` is elementwise `uniform_(0,1) < p` in `float64`,
+/// and leaves the generator in the same state as that `float64` fill.
+///
+/// **`p == 0` and `p == 1` still draw.** Measured: the `rand(2)` after a
+/// `bernoulli_(0.0)` over six elements matches the one after `bernoulli_(1.0)`
+/// and `bernoulli_(0.5)`, and none of them matches no draw at all. Upstream
+/// has no short-circuit -- the comparison is per element, inside the kernel --
+/// so a short-circuit here would be invisible in the values it returns and
+/// wrong in everything that comes after it.
+///
+/// The dtype set is `AT_DISPATCH_ALL_TYPES_AND3(Bool, BFloat16, Half)`, which
+/// is narrower than what this shim can store: `uint32` and `float8_e4m3fn`
+/// both refuse upstream with `"bernoulli_scalar_cpu_" not implemented for
+/// '...'`, so they refuse here with the same message rather than being served
+/// because candle happens to have the storage.
+fn bernoulli_inplace_float(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.bernoulli_.float";
+
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let p = float_arg(args, kwargs, 1, "p", 0.5)?;
+    generator_arg(OP, args, kwargs, 2, "generator")?;
+
+    // torch's own check, message included. Written as `!(0 <= p <= 1)` rather
+    // than `p < 0 || p > 1` so that `nan` is refused -- upstream's
+    // `TORCH_CHECK(0 <= p && p <= 1, ...)` refuses it and reports `p=nan`.
+    if !(p >= 0.0 && p <= 1.0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "bernoulli_ expects p to be in [0, 1], but got p={p}"
+        )));
+    }
+
+    let tag = receiver.borrow().tag();
+    match tag {
+        TorchDType::Float64
+        | TorchDType::Float32
+        | TorchDType::Float16
+        | TorchDType::BFloat16
+        | TorchDType::Int64
+        | TorchDType::Int32
+        | TorchDType::Int16
+        | TorchDType::Int8
+        | TorchDType::UInt8
+        | TorchDType::Bool => {}
+        other => {
+            return Err(not_implemented(format!(
+                "\"bernoulli_scalar_cpu_\" not implemented for '{}'",
+                other.cpp_name()
+            )))
+        }
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+
+    let (shape, device, numel) = {
+        let borrowed = receiver.borrow();
+        let tensor = borrowed.tensor()?;
+        (
+            tensor.shape().clone(),
+            tensor.device().clone(),
+            tensor.elem_count(),
+        )
+    };
+
+    let mut gen = crate::rng::default_generator();
+    let draws = crate::rng::uniform_fill_f64(&mut gen, numel, 0.0, 1.0);
+    drop(gen);
+
+    // `uniform(generator) < p`, in `double`, exactly as
+    // `bernoulli_distribution::operator()` writes it -- strictly less-than, so
+    // `p == 0` is all zeros (a draw is never negative) and `p == 1` is all ones
+    // (a draw is never 1.0, the range is half-open).
+    let values: Vec<f64> = draws
+        .into_iter()
+        .map(|u| if u < p { 1.0 } else { 0.0 })
+        .collect();
+    let filled = Tensor::from_vec(values, shape, &device)
+        .and_then(|t| t.to_dtype(storage))
+        .map_err(|e| candle_err(OP, e))?;
+
+    write_back(OP, &receiver, tagged(filled, tag)?)?;
+    let _ = py;
     Ok(receiver.into_any().unbind())
 }
 

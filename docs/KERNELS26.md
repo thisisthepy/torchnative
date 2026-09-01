@@ -3299,3 +3299,20 @@ And two divergences that are **not** gaps in a kernel:
   because the shim has no non-contiguous tensors to preserve
   (docs/VIEWS.md §6.4). `vits` is the only architecture where this reaches the
   output (§24.5).
+
+---
+
+## 26. What "26 of 26" is a number for
+
+**Every sweep in this document calls `.eval()`.** So does docs/ARCH20.md's twenty, and so does the
+`sweep26.py` §0 describes. That was never stated as a scope, because nobody noticed it was one.
+
+Run the same twenty-six in `.train()` and the shim was **18 of 26** at the moment this document
+closed at 26 of 26 — one missing kernel and one missing backend behind it — while README §2/§3 say
+the project exists for federated learning and test-time adaptation, which are training.
+
+**docs/TRAIN.md** is that axis: what `nn.Dropout` actually dispatches to (not
+`aten.dropout.default`, which is `CompositeImplicitAutograd` and never fires), why a seeded
+comparison against upstream *is* bit-exact here where `randint`'s is not, the SDPA math backend that
+attention dropout selects, and the standing check that keeps `.train()` from regressing unnoticed.
+Training mode is 26 of 26 there, and this document's 26 is unchanged.

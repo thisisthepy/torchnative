@@ -7083,6 +7083,537 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.bernoulli_.float, and the dropout composite over it (docs/TRAIN.md) --
+#
+# The whole of training mode rests on this one kernel. `nn.Dropout` decomposes
+# onto it (`empty_like`, `bernoulli_.float`, `div_.Scalar`, `mul.Tensor`) and
+# DeBERTa's `XDropout` calls it directly, so both spellings are here: the
+# dispatch key, and the `torch.dropout` composite that golden is structurally
+# blind to because it has no key of its own.
+#
+# THE QUESTION TO ASK OF A STOCHASTIC KERNEL is which wrong implementations
+# still pass. Four are cheap to write and all four are covered below:
+#
+#   * one that draws 32-bit words instead of 64-bit (i.e. copies `uniform_`'s
+#     `opmath_type<scalar_t>` rule). Right distribution, wrong stream --
+#     invisible to any statistical check, caught by the seeded bit comparison.
+#   * one that short-circuits `p == 0` / `p == 1` without drawing. Right
+#     values, wrong generator state -- invisible to any check that looks only
+#     at the returned tensor, caught by `[after]` below, which draws again and
+#     compares *that*.
+#   * one that answers `zeros_like` for `dropout(p=1)`. Right on every finite
+#     input, wrong on `-0.0` and on `±inf` -- caught by `_signed_zero_check`
+#     over a vector that contains both.
+#   * one that scales the *input* by `1/(1-p)` instead of scaling the mask in
+#     the mask's dtype. Identical in float32, off by ~0.005 in bfloat16 --
+#     caught by the bfloat16 survivor-value cases.
+
+_BERNOULLI_DTYPES = [
+    "float64", "float32", "float16", "bfloat16",
+    "int64", "int32", "int16", "uint8", "bool",
+]
+
+
+def _seeded_bernoulli(torch_module, c_module, torch_call, dtype_name, n, p, seed):
+    """Both sides seeded alike, then `bernoulli_(p)` over an `n`-element zero
+    tensor. Built with an integer fill rather than `0.0` so the same call
+    works for `bool` and the integral dtypes, which `bernoulli_` accepts and
+    `uniform_` does not."""
+
+    def run_torch():
+        torch_module.manual_seed(seed)
+        target = pair_from_flat(torch_module, c_module, [0] * n, (n,), dtype_name)[0]
+        return torch_call(target, p)
+
+    def run_c():
+        c_module._shim_manual_seed(seed)
+        target = pair_from_flat(torch_module, c_module, [0] * n, (n,), dtype_name)[1]
+        return c_module._aten_dispatch("aten.bernoulli_.float", target, p)
+
+    return run_torch, run_c
+
+
+def _seeded_stream_after(torch_module, c_module, before_torch, before_c, n=6):
+    """Run something, then draw `n` float64 uniforms and return **those**.
+
+    This is the only case shape that can see a kernel which produced the right
+    tensor from the wrong number of draws. `bernoulli_` consumes `numel`
+    64-bit words for every `p`, `p == 0` and `p == 1` included (measured,
+    docs/TRAIN.md §2); a shim that skipped the draw would return an identical
+    tensor and desynchronise everything after it.
+    """
+
+    def run_torch():
+        torch_module.manual_seed(7)
+        before_torch()
+        after = torch_module.empty(n, dtype=torch_module.float64)
+        return after.uniform_(0.0, 1.0)
+
+    def run_c():
+        c_module._shim_manual_seed(7)
+        before_c()
+        after = c_module._tensor_from_flat([0.0] * n, [n], dtype=c_module.float64)
+        return c_module._aten_dispatch("aten.uniform_.default", after, 0.0, 1.0)
+
+    return run_torch, run_c
+
+
+def bernoulli__float_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bernoulli_.float"
+    cases: list[Case] = []
+
+    # 1. The stream itself, bit for bit, across every dtype upstream accepts.
+    #    The dtype sweep is the point: `bernoulli_` draws in `double` for ALL
+    #    of them, unlike `uniform_`, so a shim that reused `uniform_`'s
+    #    accumulate-type rule agrees on float64 and diverges on the other
+    #    eight. Only comparing more than one dtype can see that.
+    for dtype_name in _BERNOULLI_DTYPES:
+        for p in (0.25, 0.5, 0.9):
+            for n in (6, 17):
+                for seed in (0, 42):
+                    run_torch, run_c = _seeded_bernoulli(
+                        torch_module, c_module, torch_call, dtype_name, n, p, seed
+                    )
+                    cases.append(
+                        Case(
+                            name=f"bernoulli_(dtype={dtype_name}, n={n}, p={p}, seed={seed})",
+                            op=op,
+                            run_torch=run_torch,
+                            run_c=run_c,
+                            value_check=_rng_stream_check(bitwise=True),
+                            note="upstream's bernoulli_distribution<double> takes "
+                                 "generator->random64() for every scalar_t -- bit-for-bit",
+                        )
+                    )
+
+    # A large draw, so the *fraction* is a real statement and not noise. It is
+    # kept alongside the bit comparison rather than instead of it: this is the
+    # check a reader believes on sight, and it is also the one a completely
+    # wrong stream would still pass.
+    for p in (0.1, 0.5, 0.9):
+        run_torch, run_c = _seeded_bernoulli(
+            torch_module, c_module, torch_call, "float32", 4000, p, 0
+        )
+        cases.append(
+            Case(
+                name=f"bernoulli_(float32, n=4000, p={p}) [survivor fraction ~= p]",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_rng_stream_check(bitwise=True),
+                note="4000 draws: the mean is p to within ~1.6% at 2 sigma, and the "
+                     "bit comparison says the two sides agree draw for draw",
+            )
+        )
+
+    # 2. The degenerate probabilities, which are exact and have no randomness.
+    for p, expect_note in ((0.0, "all zeros -- a draw is never negative"),
+                           (1.0, "all ones -- the range is half-open, a draw is never 1.0")):
+        for dtype_name in ("float32", "int64", "bool"):
+            run_torch, run_c = _seeded_bernoulli(
+                torch_module, c_module, torch_call, dtype_name, 8, p, 3
+            )
+            cases.append(
+                Case(
+                    name=f"bernoulli_(dtype={dtype_name}, p={p}) [{expect_note}]",
+                    op=op,
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    value_check=_rng_stream_check(bitwise=True),
+                    note=expect_note,
+                )
+            )
+
+    # 3. ...and that they still consume the stream. This is the case that
+    #    fails against the obvious short-circuit and nothing else does.
+    for p in (0.0, 1.0, 0.5):
+        def before_torch(p=p):
+            torch_module.empty(9, dtype=torch_module.float32).bernoulli_(p)
+
+        def before_c(p=p):
+            target = c_module._tensor_from_flat([0.0] * 9, [9], dtype=c_module.float32)
+            c_module._aten_dispatch(op, target, p)
+
+        run_torch, run_c = _seeded_stream_after(
+            torch_module, c_module, before_torch, before_c
+        )
+        cases.append(
+            Case(
+                name=f"bernoulli_(p={p}) then uniform_ [the draws AFTER it]",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_rng_stream_check(bitwise=True, bounds=(0.0, 1.0)),
+                note="the result is the following uniform_ fill, not the bernoulli_ "
+                     "itself: a p==0 or p==1 short-circuit returns the right tensor "
+                     "and leaves the generator 9 draws behind",
+            )
+        )
+
+    # 4. Refusals, both sides.
+    for p in (-0.1, 1.5, float("nan")):
+        t_t, t_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (4,), "float32")
+        cases.append(
+            Case(
+                name=f"bernoulli_(p={p!r}) [refused on both sides]",
+                op=op,
+                run_torch=lambda t_t=t_t, p=p: torch_call(t_t, p),
+                run_c=lambda t_c=t_c, p=p: c_module._aten_dispatch(op, t_c, p),
+                expect="both_error",
+                note="torch: 'bernoulli_ expects p to be in [0, 1], but got p=...'. "
+                     "nan is refused because the check is `0 <= p && p <= 1`, which "
+                     "nan fails on both halves -- `p < 0 || p > 1` would let it through",
+            )
+        )
+    u_t, u_c = pair_from_flat(torch_module, c_module, [0, 1, 2], (3,), "uint32")
+    cases.append(
+        Case(
+            name="bernoulli_(dtype=uint32) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(u_t, 0.5),
+            run_c=lambda: c_module._aten_dispatch(op, u_c, 0.5),
+            expect="both_error",
+            note="AT_DISPATCH_ALL_TYPES_AND3(Bool, BFloat16, Half) does not cover "
+                 "uint32; upstream: '\"bernoulli_scalar_cpu_\" not implemented for "
+                 "'UInt32''. candle can store it, which is exactly why this has to "
+                 "be refused deliberately rather than served by accident",
+        )
+    )
+
+    # 5. Empty tensor: no draws, no error, shape preserved.
+    run_torch, run_c = _seeded_bernoulli(torch_module, c_module, torch_call, "float32", 0, 0.5, 1)
+    cases.append(
+        Case(
+            name="bernoulli_(float32, numel=0)",
+            op=op,
+            run_torch=run_torch,
+            run_c=run_c,
+            value_check=_rng_stream_check(bitwise=True),
+            note="an empty fill draws nothing and returns an empty tensor",
+        )
+    )
+
+    # 6. The member spelling. `methods.json` is what makes `x.bernoulli_(p)`
+    #    resolve, and golden compares by dispatch key -- so deleting that entry
+    #    fails here and nowhere else. `sew_d` uses exactly this spelling.
+    def _member_bernoulli(seed, p, dtype_name, n):
+        def run_torch():
+            torch_module.manual_seed(seed)
+            t = pair_from_flat(torch_module, c_module, [0] * n, (n,), dtype_name)[0]
+            t.bernoulli_(p)
+            return t
+
+        def run_c():
+            c_module._shim_manual_seed(seed)
+            t = pair_from_flat(torch_module, c_module, [0] * n, (n,), dtype_name)[1]
+            t.bernoulli_(p)
+            return t
+
+        return run_torch, run_c
+
+    for dtype_name in ("float32", "bool"):
+        run_torch, run_c = _member_bernoulli(11, 0.6, dtype_name, 12)
+        cases.append(
+            Case(
+                name=f"spelling x.bernoulli_(0.6) (dtype={dtype_name})",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_rng_stream_check(bitwise=True),
+                note="sew_d: (1 - torch.empty_like(x).bernoulli_(1 - p)).to(torch.bool)",
+            )
+        )
+
+    # `p` by keyword, the other half of the binding (docs/DISPATCH.md §4.1).
+    def _kw_run_torch():
+        torch_module.manual_seed(0)
+        t = pair_from_flat(torch_module, c_module, [0] * 6, (6,), "float32")[0]
+        return torch_call(self=t, p=0.75)
+
+    def _kw_run_c():
+        c_module._shim_manual_seed(0)
+        t = pair_from_flat(torch_module, c_module, [0] * 6, (6,), "float32")[1]
+        return c_module._aten_dispatch(op, self=t, p=0.75)
+
+    cases.append(
+        Case(
+            name="bernoulli_(self=/p= by keyword)",
+            op=op,
+            run_torch=_kw_run_torch,
+            run_c=_kw_run_c,
+            value_check=_rng_stream_check(bitwise=True),
+        )
+    )
+
+    # 7. The composite. It has no dispatch key of its own -- `aten::dropout` is
+    #    CompositeImplicitAutograd and never reaches the dispatcher (measured,
+    #    docs/TRAIN.md §1) -- so it is compared here, through the two Python
+    #    spellings that exist, against upstream's `torch.dropout`.
+    cases.extend(_dropout_composite_cases(torch_module, c_module, op))
+    return cases
+
+
+_DROPOUT_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+
+def _dropout_composite_cases(torch_module, c_module, op) -> list[Case]:
+    """`torch.dropout` / `torch.dropout_`, seeded, against upstream's."""
+    cases: list[Case] = []
+
+    def seeded(spelling, dtype_name, flat, shape, p, train, seed, check, note):
+        def side(module, which):
+            def run():
+                if which == "torch":
+                    module.manual_seed(seed)
+                else:
+                    module._shim_manual_seed(seed)
+                t = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)[
+                    0 if which == "torch" else 1
+                ]
+                return _free(module, spelling)(t, p, train)
+
+            return run
+
+        return Case(
+            name=f"{spelling}(dtype={dtype_name}, p={p}, train={train}, seed={seed})",
+            op=op,
+            run_torch=side(torch_module, "torch"),
+            run_c=side(c_module, "c"),
+            value_check=check,
+            note=note,
+        )
+
+    # The random path, bit for bit, in every float dtype.
+    #
+    # **THE INPUT IS NOT ONES, AND THAT IS THE WHOLE POINT.** The first draft
+    # of these cases used `[1.0] * 24`, and a deliberate sabotage -- replacing
+    # `noise.div_(1-p); input * noise` with `(input * (1/(1-p))) * noise`, the
+    # single most plausible wrong shape for this composite -- passed every one
+    # of them, and passed the smoke tests and the training sweep too. On an
+    # all-ones input the two are identical by construction: both end up
+    # multiplying by the same rounded `1/(1-p)`. Measured on upstream over
+    # 4000 random values, they differ on ~10% of the survivors by one ULP in
+    # `float16` and `bfloat16`, and not at all in `float32`. So the values
+    # below span a real range and there are enough of them that the 10% is a
+    # certainty rather than a coin flip.
+    spread = [round(v * 3.0, 4) for v in _deterministic(240, 9)]
+    for dtype_name in _DROPOUT_DTYPES:
+        for p in (0.25, 0.7):
+            for spelling in ("dropout", "dropout_"):
+                cases.append(
+                    seeded(
+                        spelling, dtype_name, spread, (10, 24), p, True, 5,
+                        _bitwise_equal_check,
+                        "survivors are input x (1/(1-p) rounded in the MASK's "
+                        "dtype). A shim that scaled the INPUT by a Python "
+                        "1/(1-p) instead agrees in float32 and differs by 1 ULP "
+                        "on ~10% of the survivors in float16/bfloat16 -- "
+                        "measured, and it passes an all-ones input, which is "
+                        "what this case used to be",
+                    )
+                )
+
+    # The exact paths: no randomness at all, so these are the strongest
+    # statements here and they are also most of the real call sites.
+    for dtype_name in _DROPOUT_DTYPES:
+        for p, train, why in (
+            (0.0, True, "p == 0 in train mode is the identity"),
+            (0.5, False, "eval mode is the identity for any p"),
+            (0.0, False, "both short-circuits at once"),
+        ):
+            cases.append(
+                seeded(
+                    "dropout", dtype_name, [1.5, -2.5, 0.0, -0.0, 7.25, -1.0], (6,),
+                    p, train, 1, _signed_zero_check, why + " -- bit for bit, signed zero included",
+                )
+            )
+
+    # p == 1: `input * zeros({})`, and the three inputs that tell it apart from
+    # `zeros_like`. Any of `-0.0`, `inf`, `-inf` alone would do it; all three
+    # are here because a reader should not have to know which one is load
+    # bearing.
+    special = [1.0, -1.0, 0.0, -0.0, float("inf"), float("-inf")]
+    for spelling in ("dropout", "dropout_"):
+        cases.append(
+            seeded(
+                spelling, "float32", special, (6,), 1.0, True, 1, _signed_zero_check,
+                "p == 1 is a multiply by zero: -0.0 stays -0.0 and +-inf becomes nan. "
+                "zeros_like passes (y == 0).all() and fails this",
+            )
+        )
+        cases.append(
+            seeded(
+                spelling, "float64", special, (6,), 1.0, True, 1, _signed_zero_check,
+                "same, in float64",
+            )
+        )
+
+    # The identity return is the identity OBJECT upstream, not a copy.
+    for p, train in ((0.0, True), (0.5, False)):
+        def ident(module, which, p=p, train=train):
+            def run():
+                t = pair_from_flat(
+                    torch_module, c_module, [1.0, 2.0], (2,), "float32"
+                )[0 if which == "torch" else 1]
+                return _free(module, "dropout")(t, p, train) is t
+
+            return run
+
+        cases.append(
+            Case(
+                name=f"dropout(p={p}, train={train}) returns the SAME object",
+                op=op,
+                run_torch=ident(torch_module, "torch"),
+                run_c=ident(c_module, "c"),
+                value_check=_scalar_match_check,
+                note="upstream's `return input;` is the identity, not a clone -- "
+                     "measured; a `clone()` here would pass every value comparison",
+            )
+        )
+
+    # numel == 0 short-circuits before anything is drawn.
+    cases.append(
+        seeded("dropout", "float32", [], (0,), 0.5, True, 1, _bitwise_equal_check,
+               "an empty input short-circuits: upstream draws nothing")
+    )
+
+    # The range check runs BEFORE the short-circuit, so an eval-mode call with
+    # a nonsense p still raises. The shim used to return `input` here.
+    for p, train in ((1.5, False), (-0.1, False), (float("nan"), True), (1.5, True)):
+        t_t, t_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+        cases.append(
+            Case(
+                name=f"dropout(p={p!r}, train={train}) [refused on both sides]",
+                op=op,
+                run_torch=lambda t_t=t_t, p=p, train=train: _free(torch_module, "dropout")(t_t, p, train),
+                run_c=lambda t_c=t_c, p=p, train=train: _free(c_module, "dropout")(t_c, p, train),
+                expect="both_error",
+                note="torch: 'dropout probability has to be between 0 and 1, but got ...' "
+                     "-- TORCH_CHECK precedes `if (p == 0 || !train || numel == 0)`, so "
+                     "train=False does NOT excuse an out-of-range p",
+            )
+        )
+
+    # And that the composite leaves the generator where upstream leaves it:
+    # four draws' worth for a 4-element input, not zero and not eight.
+    for p, train in ((0.5, True), (0.0, True), (1.0, True), (0.5, False)):
+        def before_torch(p=p, train=train):
+            _free(torch_module, "dropout")(torch_module.ones(4), p, train)
+
+        def before_c(p=p, train=train):
+            t = c_module._tensor_from_flat([1.0] * 4, [4], dtype=c_module.float32)
+            _free(c_module, "dropout")(t, p, train)
+
+        run_torch, run_c = _seeded_stream_after(
+            torch_module, c_module, before_torch, before_c
+        )
+        cases.append(
+            Case(
+                name=f"dropout(p={p}, train={train}) then uniform_ [the draws AFTER it]",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_rng_stream_check(bitwise=True, bounds=(0.0, 1.0)),
+                note="p==0, p==1 and train=False each draw a DIFFERENT amount "
+                     "(0, 4 and 0 respectively); this is the only case that sees it",
+            )
+        )
+    return cases
+
+
+def div__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten::div_.Scalar` -- `noise.div_(1 - p)`, dropout's scale step.
+
+    The hole in the middle of a family that was otherwise complete:
+    `div.Scalar` out of place, and `add_`/`sub_`/`mul_` `.Scalar` in place,
+    were all already here. What makes this one not a copy of `mul_.Scalar` is
+    the promotion: true division always produces a float, so an integral
+    receiver refuses rather than flooring."""
+    op = "aten.div_.Scalar"
+    cases: list[Case] = []
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for scalar in (2.0, 0.3, -4.0):
+            dst_t, dst_c = pair_from_flat(
+                torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"div_(dtype={dtype_name}, other={scalar!r})",
+                    op=op,
+                    run_torch=lambda dst_t=dst_t, s=scalar: torch_call(dst_t, s),
+                    run_c=lambda dst_c=dst_c, s=scalar: c_module._aten_dispatch(op, dst_c, s),
+                    value_check=_bitwise_equal_check,
+                    note="0.3 is not representable in any of these dtypes, so the "
+                         "quotient depends on where the narrowing happens -- compared "
+                         "bit for bit because the dtype tolerance would absorb it",
+                )
+            )
+
+    # dropout's exact call: a 0/1 mask divided by the keep probability. The
+    # survivor value IS the thing dropout multiplies by.
+    for dtype_name in ["float32", "bfloat16", "float16"]:
+        dst_t, dst_c = pair_from_flat(
+            torch_module, c_module, [1.0, 0.0, 1.0, 1.0], (4,), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"div_(dtype={dtype_name}, mask / 0.3) [dropout's scale step]",
+                op=op,
+                run_torch=lambda dst_t=dst_t: torch_call(dst_t, 0.3),
+                run_c=lambda dst_c=dst_c: c_module._aten_dispatch(op, dst_c, 0.3),
+                value_check=_bitwise_equal_check,
+                note="bfloat16 answers 3.328125 and float16 answers 3.333984375; "
+                     "a shim that computed 1/(1-p) in float and multiplied would "
+                     "give 3.3333333 in both",
+            )
+        )
+
+    zero_t, zero_c = pair_from_flat(
+        torch_module, c_module, [1.0, -1.0, 0.0, float("nan")], (4,), "float32"
+    )
+    cases.append(
+        Case(
+            name="div_(float32, by 0.0) [inf/-inf/nan, not an error]",
+            op=op,
+            run_torch=lambda: torch_call(zero_t, 0.0),
+            run_c=lambda: c_module._aten_dispatch(op, zero_c, 0.0),
+            value_check=_signed_zero_check,
+            note="IEEE division, and 0.0/0.0 is nan -- the same answers div.Scalar gives",
+        )
+    )
+
+    for dtype_name, scalar in (("int64", 2), ("int32", 2), ("uint8", 2)):
+        e_t, e_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"div_(dtype={dtype_name}, other={scalar}) [refused on both sides]",
+                op=op,
+                run_torch=lambda e_t=e_t, s=scalar: torch_call(e_t, s),
+                run_c=lambda e_c=e_c, s=scalar: c_module._aten_dispatch(op, e_c, s),
+                expect="both_error",
+                note="true division promotes to float and cannot be written back into "
+                     "an integral receiver -- this is what separates div_ from mul_, "
+                     "which accepts an int scalar happily",
+            )
+        )
+
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.div_(2.0)", lambda m, a: a.div_(2.0)),
+        # `x /= 2.0` is deliberately NOT here, and the reason is measured
+        # rather than assumed: `_C.TensorBase` has `__idiv__` and no
+        # `__itruediv__`, so on the bare shim module `x /= 2.0` falls back to
+        # `x = x / 2.0` and rebinds a local, leaving the base untouched --
+        # while `torch.Tensor` (which `torch/_tensor.py:1115` patches) writes
+        # through. That is a difference between the two *modules*, not between
+        # the two kernels, and a case comparing them would have failed for a
+        # reason having nothing to do with `div_.Scalar`.
+        ("x.__idiv__(2.0)", lambda m, a: a.__idiv__(2.0)),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
 # --- the eight ops a greedy 2-layer Llama forward stopped on (docs/GAP.md §3) --
 #
 # These are not "more coverage". Before them `_aten_dispatch` refused eight
@@ -7613,9 +8144,166 @@ def _sdpa_pair_check(t_res, c_res) -> tuple[bool, str]:
 _SDPA_DTYPES = ["float64", "float32", "float16", "bfloat16"]
 
 
+def _sdpa_math_backend_cases(torch_module, c_module, op) -> list[Case]:
+    """`F.scaled_dot_product_attention(..., dropout_p > 0)` -- the OTHER backend.
+
+    A non-zero `dropout_p` takes the call off the fused kernel entirely:
+    `_scaled_dot_product_flash_attention_for_cpu` refuses dropout, so upstream
+    drops to `_scaled_dot_product_attention_math`, a twenty-op sequence
+    (docs/TRAIN.md §4). That backend has no dispatch key of its own -- it is
+    reached only through the Python function -- so golden is structurally blind
+    to it and the cases live under the key of the backend that does have a
+    name. `F.scaled_dot_product_attention` is one function; both of its roads
+    belong in one builder.
+
+    **THIS BUILDER EXISTS BECAUSE A SABOTAGE PASSED.** Moving the scale from
+    "sqrt applied to query AND to key-transposed" to "applied once, after the
+    matmul" changed nothing any test could see: the two are algebraically
+    equal and differ by about one ULP at ordinary magnitudes, and the training
+    sweep's 1e-5 bound is sized to separate dropout MASKS, not to see a
+    rounding reorder. The `float16` overflow case below is what sees it, and
+    it is the reason upstream splits the scale in the first place: with
+    `float16` inputs around 100 the raw `q @ k^T` overflows to `inf` and the
+    softmax answers `nan`, while pre-scaling both operands keeps it finite.
+    Upstream answers `[12.0, 13.0, 14.0]` there and the scale-once shape
+    answers `[nan, nan, nan]` -- measured, on upstream, both ways.
+    """
+    cases: list[Case] = []
+
+    def sdpa(module):
+        return module.nn.functional.scaled_dot_product_attention if hasattr(
+            module, "nn") else module._nn.scaled_dot_product_attention
+
+    def seeded(name, dtype_name, shapes, flats, kwargs, note, expect="match",
+               value_check=None, seed=17):
+        def side(module, which):
+            def run():
+                if which == "torch":
+                    module.manual_seed(seed)
+                else:
+                    module._shim_manual_seed(seed)
+                args = [
+                    pair_from_flat(torch_module, c_module, f, sh, dtype_name)[
+                        0 if which == "torch" else 1
+                    ]
+                    for f, sh in zip(flats, shapes)
+                ]
+                kw = dict(kwargs)
+                if "attn_mask" in kw:
+                    mf, ms, md = kw.pop("attn_mask")
+                    kw["attn_mask"] = pair_from_flat(
+                        torch_module, c_module, mf, ms, md
+                    )[0 if which == "torch" else 1]
+                return sdpa(module)(*args, **kw)
+
+            return run
+
+        return Case(
+            name=name,
+            op=op,
+            run_torch=side(torch_module, "torch"),
+            run_c=side(c_module, "c"),
+            expect=expect,
+            value_check=value_check,
+            note=note,
+        )
+
+    b, h, t, e = 1, 2, 6, 8
+    n = b * h * t * e
+    shape = (b, h, t, e)
+    q, k, v = _deterministic(n, 21), _deterministic(n, 22), _deterministic(n, 23)
+
+    # 1. The mask itself, seeded, in every dtype the flash path supports. A
+    #    shim drawing from the wrong stream lands ~0.4 away here, not 1e-7.
+    for dtype_name in _SDPA_DTYPES:
+        for kwargs, label in (
+            ({"dropout_p": 0.25}, "plain"),
+            ({"dropout_p": 0.25, "is_causal": True}, "is_causal"),
+            ({"dropout_p": 0.5, "scale": 0.1}, "explicit non-representable scale"),
+        ):
+            cases.append(
+                seeded(
+                    f"sdpa_math(dtype={dtype_name}, {kwargs}) [{label}]",
+                    dtype_name, [shape] * 3, [q, k, v], kwargs,
+                    "the math backend: matmul, mask, _safe_softmax, dropout, matmul",
+                )
+            )
+
+    # 2. An additive mask with a -inf column, and a boolean one. Both reach
+    #    the same `_safe_softmax`; the bool one goes through
+    #    `convert_boolean_attn_mask` first.
+    mask_shape = (1, 1, t, t)
+    add_mask = ([0.0, 0.0, float("-inf"), 0.0, 0.0, 0.0] * t)
+    bool_mask = ([1, 1, 0, 1, 1, 1] * t)
+    for dtype_name in ["float64", "float32"]:
+        cases.append(
+            seeded(
+                f"sdpa_math(dtype={dtype_name}, additive mask with a -inf column)",
+                dtype_name, [shape] * 3, [q, k, v],
+                {"dropout_p": 0.25, "attn_mask": (add_mask, mask_shape, dtype_name)},
+                "a masked-out column must not become nan -- _safe_softmax's job",
+            )
+        )
+        cases.append(
+            seeded(
+                f"sdpa_math(dtype={dtype_name}, boolean mask)",
+                dtype_name, [shape] * 3, [q, k, v],
+                {"dropout_p": 0.25, "attn_mask": (bool_mask, mask_shape, "bool")},
+                "True means attend: convert_boolean_attn_mask picks 0.0, not -inf",
+            )
+        )
+
+    # 3. THE CASE THE SABOTAGE ASKED FOR. float16 inputs at magnitude 100:
+    #    `q @ k^T` is 80000, past float16's 65504, so scaling after the matmul
+    #    overflows to inf and the softmax answers nan. Splitting the scale
+    #    across both operands -- which is what upstream does and why -- keeps
+    #    every intermediate finite.
+    big = [100.0] * n
+    vv = [round(float(i % 7) - 3.0, 4) for i in range(n)]
+    for dropout_p in (0.0, 0.25):
+        cases.append(
+            seeded(
+                f"sdpa_math(float16, |q|=|k|=100, dropout_p={dropout_p}) "
+                "[scale-once overflows to nan here]",
+                "float16", [shape] * 3, [big, big, vv], {"dropout_p": dropout_p},
+                "upstream splits the scale as sqrt over BOTH operands for exactly "
+                "this: q @ k^T alone is 80000, past float16's 65504",
+            )
+        )
+
+    # 4. `dropout_p == 1` drops every weight, so the output is exactly zero
+    #    whatever the inputs are -- no reference values needed, and a backend
+    #    that ignored `dropout_p` would return ordinary attention.
+    for dtype_name in ["float32", "bfloat16"]:
+        cases.append(
+            seeded(
+                f"sdpa_math(dtype={dtype_name}, dropout_p=1.0) [exactly zero]",
+                dtype_name, [shape] * 3, [q, k, v], {"dropout_p": 1.0},
+                "every attention weight is dropped, so the output is 0 -- the one "
+                "assertion about this path that needs no reference values",
+                value_check=_signed_zero_check,
+            )
+        )
+
+    # 5. Upstream's own refusal, which the math backend raises and the flash
+    #    path never reaches.
+    cases.append(
+        seeded(
+            "sdpa_math(is_causal AND an explicit mask) [refused on both sides]",
+            "float32", [shape] * 3, [q, k, v],
+            {"dropout_p": 0.25, "is_causal": True,
+             "attn_mask": (add_mask, mask_shape, "float32")},
+            "torch: '_scaled_dot_product_attention: Explicit attn_mask should not "
+            "be set when is_causal=True' -- the math backend builds its own",
+            expect="both_error",
+        )
+    )
+    return cases
+
+
 def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._scaled_dot_product_flash_attention_for_cpu.default"
-    cases: list[Case] = []
+    cases: list[Case] = _sdpa_math_backend_cases(torch_module, c_module, op)
 
     b, h, t, e = 1, 2, 3, 4
     n = b * h * t * e
@@ -18016,4 +18704,11 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.triu.default": triu_cases,
     "aten.min.dim": min_dim_cases,
     "aten.min.other": min_other_cases,
+    # docs/TRAIN.md: training mode. `bernoulli__float_cases` also carries the
+    # `torch.dropout` composite, which has no dispatch key of its own to be
+    # registered under -- `aten::dropout` is CompositeImplicitAutograd and
+    # never reaches the dispatcher, so golden is structurally blind to it and
+    # it has to ride on the kernel it decomposes onto.
+    "aten.bernoulli_.float": bernoulli__float_cases,
+    "aten.div_.Scalar": div__scalar_cases,
 }

@@ -519,6 +519,10 @@
   "normal_": [
     "aten::normal_(Tensor(a!) self, float mean=0., float std=1., *, Generator? generator=None) -> Tensor(a!)"
   ],
+  "bernoulli_": [
+    "aten::bernoulli_.Tensor(Tensor(a!) self, Tensor p, *, Generator? generator=None) -> Tensor(a!)",
+    "aten::bernoulli_.float(Tensor(a!) self, float p=0.5, *, Generator? generator=None) -> Tensor(a!)"
+  ],
   "zero_": [
     "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
   ],
