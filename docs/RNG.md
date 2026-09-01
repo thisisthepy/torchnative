@@ -16,6 +16,20 @@
 Apple Silicon / darwin 25.5.0). 이 문서는 `docs/RNG.md` 외의 어떤 파일도 만들거나 고치지
 않았습니다.
 
+> **Correction (문서 감사, 2026-09):** §5 의 권고가 그대로 채택되어 포팅됐습니다. `git log
+> -S'"aten.uniform_.default"' -- rust/torch_c/src/aten.rs` 가 찾는 `2d3663f` ("Feat: Port
+> torch's CPU generator, and give `_C._dynamo` the two names that do work") 의 커밋 메시지가
+> 이 문서를 그대로 요약합니다 — "candle's CPU backend refuses seeding outright: MT19937 with the
+> pre-decrement that twists before the first draw, uniform_real at 24 and 53 bits, and the
+> kernel shapes that decide which stream a draw comes from". `aten.uniform_.default` /
+> `aten.normal_.default` 둘 다 지금 `_aten_implemented()` 에 있습니다 — §5 권고 1·2 번이 실행된
+> 결과이자, `docs/TENSORBASE.md` §7 이 "RNG 에서 멈췄다"고 적은 벽이 사라진 이유이기도 합니다
+> (같은 커밋). §3.3 의 비트 단위 재현 주장, §6 의 미확인 목록(AVX2 경로 · `randint` 알고리즘 ·
+> bf16/fp16 정확 재현)은 재측정하지 않았습니다 — 이 감사는 "포팅했는가" 만 확인했고 "포팅이
+> 이 문서가 예측한 정확도로 재현하는가" 는 확인하지 못했습니다.
+> <!-- DOCWATCH: op-implemented aten.uniform_.default -->
+> <!-- DOCWATCH: op-implemented aten.normal_.default -->
+
 ---
 
 ## 1. torch 의 CPU RNG — 실체

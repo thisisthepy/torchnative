@@ -328,23 +328,35 @@ argmax 는 소수의 토큰에 몰립니다. 강한 판정은 샘플링 쪽과 �
 | `torch.ops.aten.split.Tensor` | **OK** | — |
 | `torch.ops.aten.tanh.default` | **OK** | — |
 | `nn.Linear(bias=True)` | **OK** | — (`_C._nn.linear` 가 §3 의 경로로 내려감) |
-| `torch.addmm(...)` | 실패 | `overloads.json` 에 `addmm` 없음 |
-| `torch.tanh(x)` | 실패 | `overloads.json` 에 `tanh` 없음 |
-| `x.tanh()` | 실패 | `methods.json` 에 `tanh` 없음 |
-| `torch.split(x, n, d)` / `x.split(n, d)` | 실패 | `overloads.json` 에 `split` 없음 |
-| `F.layer_norm(...)` | 실패 | **`_C._get_cudnn_enabled`** (NN_SURFACE §1 이 예고한 그 벽) |
-| `nn.LayerNorm(...)` | 실패 | **`TensorBase.zero_`** — 파라미터 초기화에서 먼저 죽음 |
-| `torch.layer_norm` / `torch.native_layer_norm` | 실패 | `overloads.json` 없음 |
+| `torch.addmm(...)` | ~~실패~~ **정정: OK** | ~~`overloads.json` 에 `addmm` 없음~~ 지금은 있음 |
+| `torch.tanh(x)` | ~~실패~~ **정정: OK** | ~~`overloads.json` 에 `tanh` 없음~~ 지금은 있음 |
+| `x.tanh()` | ~~실패~~ **정정: OK** | ~~`methods.json` 에 `tanh` 없음~~ 지금은 있음 |
+| `torch.split(x, n, d)` / `x.split(n, d)` | ~~실패~~ **정정: OK** | ~~`overloads.json` 에 `split` 없음~~ 지금은 있음 |
+| `F.layer_norm(...)` | ~~실패~~ **정정: OK** | ~~**`_C._get_cudnn_enabled`**~~ `bootstrap.py:7071` 이 답을 답함(위 §5 텍스트와 별개로 이미 구현돼 있었던 것으로 보임 — 실측만 갱신) |
+| `nn.LayerNorm(...)` | ~~실패~~ **정정: OK** | ~~**`TensorBase.zero_`**~~ `methods.json` 에 `zero_` 가 생겨 닫힘 — `docs/ARCH.md` 감사(이 라운드)가 같은 것을 발견 |
+| `torch.layer_norm` / `torch.native_layer_norm` | ~~실패~~ **정정: OK** | `torch.layer_norm` 은 `overloads.json` 항목이 아니라 `bootstrap.py:5863` 의 파이썬 컴포지트(`aten.native_layer_norm.default` 를 직접 호출)로 배선됨 |
 
-**이번 작업이 만든 새 빚이 아닙니다.** 같은 상태인 것이 이미 여럿 있습니다 — `F.softmax` /
-`x.softmax` (`TensorBase.softmax` 없음), `torch.multinomial`, `torch.topk`, `torch.sort`,
-`torch.cumsum`, `x.masked_fill` (`TensorBase.__gt__` 없음) 이 전부 커널은 있는데 철자가
-없는 상태로 실측됩니다. `docs/SAMPLING.md` 가 판정을 aten 레벨로 한 것도 같은 이유입니다.
+> **Correction (문서 감사, 2026-09):** 위 표의 "실패" 여섯 줄 전부 오늘은 성공합니다(실측
+> 재확인, `nn.LayerNorm(4)` 생성 포함). `overloads.json`/`methods.json` 이 이 문서를 쓴 뒤
+> 다른 라운드들에서 계속 채워진 결과로 보입니다 — `docs/SAMPLING.md`/`docs/DEVICE.md`/
+> `docs/ARCH.md` 감사(이 라운드)에서 이미 반복해서 발견한 것과 같은 패턴입니다.
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json addmm present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json tanh present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json split present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json tanh present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py layer_norm present -->
 
-**`nn.LayerNorm` 은 두 겹입니다.** `_get_cudnn_enabled` 를 답해 줘도 `TensorBase.zero_` 에서
-먼저 죽습니다(`reset_parameters` 가 `init.zeros_(self.bias)` 를 부름). NN_SURFACE §10 이
-"`_get_cudnn_enabled` 는 답하기 싼 설정 게터로 보인다"고 남긴 항목은 맞지만, **그것만으로는
-`nn.LayerNorm` 이 안 열립니다.**
+**이번 작업이 만든 새 빚이 아닙니다.** 같은 상태인 것이 이미 여럿 있었습니다(이 문서를 쓴
+시점 기준) — `F.softmax` / `x.softmax` (`TensorBase.softmax` 없음), `torch.multinomial`,
+`torch.topk`, `torch.sort`, `torch.cumsum`, `x.masked_fill` (`TensorBase.__gt__` 없음) 이 전부
+커널은 있는데 철자가 없는 상태로 실측됐습니다. `docs/SAMPLING.md` 가 판정을 aten 레벨로 한
+것도 같은 이유였습니다 — 다만 `docs/SAMPLING.md` 자신의 감사(이 라운드)가 이미 확인했듯
+`multinomial`/`topk`/`sort` 도 지금은 파이썬 철자로 닿습니다.
+
+**`nn.LayerNorm` 은 두 겹이었습니다.** `_get_cudnn_enabled` 를 답해 줘도 `TensorBase.zero_` 에서
+먼저 죽었습니다(`reset_parameters` 가 `init.zeros_(self.bias)` 를 부름). NN_SURFACE §10 이
+"`_get_cudnn_enabled` 는 답하기 싼 설정 게터로 보인다"고 남긴 항목은 맞았지만, 그것만으로는
+`nn.LayerNorm` 이 열리지 않았습니다 — 지금은 둘 다 닫혀 있습니다.
 
 ---
 

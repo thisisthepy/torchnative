@@ -10,6 +10,16 @@ DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 �
 
 이 문서는 그 상태를 실제로 만들고, 어디서 깨지는지를 순서대로 기록한 것입니다.
 
+> **Correction (문서 감사, 2026-09):** 이 문서는 genesis 단계의 벽 목록입니다 (`_C` 표면
+> 17 개 vs 상류 989 개, §0). 이 감사가 이미 확인한 나중 라운드들(`docs/OVERLOAD.md`,
+> `docs/TENSORBASE.md`, `docs/DISTRIBUTED.md`, `docs/COMPAT.md`, `docs/DESIGN.md` §11.1 감사
+> 등, round 1·2)이 이 문서가 이름 붙인 벽 다수를 이미 닫았습니다 — `AutoModelForCausalLM.
+> from_config`/`from_pretrained` 둘 다 오늘 성공하고(round 1 DESIGN.md 감사, round 2
+> DISTRIBUTED.md/CKPT2.md/GENERATE.md 감사), `import transformers` 도 통과합니다. 이 문서
+> 자체의 개별 항목(§1-§8)을 하나씩 다시 검증하지는 않았습니다 — "목표는 되게 하는 것이
+> 아니라 어디서 깨지는지 아는 것" 이라는 이 문서의 진단은 역사적 기록으로 여전히 유효하고,
+> 그 진단이 가리킨 벽들이 이후 라운드에서 닫혔다는 사실이 그 진단을 무효화하지 않습니다.
+
 **목표는 "되게 하는 것" 이 아니라 "어디서 깨지는지 아는 것" 입니다.** 그래서 아래의 어떤 항목도
 "해결했다" 고 적지 않았습니다.
 

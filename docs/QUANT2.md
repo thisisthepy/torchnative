@@ -451,13 +451,26 @@ lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
     **다음 사람에게:** 이것이 §7 표의 1 번이고, 이 저장소에서 가장 큰 단일 성능 항목으로
     보입니다. 양자화보다 큽니다.
 
+> **Correction (문서 감사, 2026-09):** 다음 사람이 왔습니다 — 바로 다음날입니다. `git log
+> -1 --format=%ci b032276`(이 문서를 만든 커밋)와 `git log -1 --format=%ci 2e00ec3` 를
+> 대조하면 `2e00ec3`("Perf: Fold instead of broadcasting, and stop copying the weight every
+> call")가 2026-08-29, 이 문서(`b032276`, 2026-08-28)의 바로 다음날 착지했고 `git merge-base
+> --is-ancestor b032276 2e00ec3` 로 순서가 확인됩니다. `docs/LINEAR.md`(아직 이 감사가 읽지
+> 않음, `docs/DESIGN.md` §11.1 감사가 round 1 에서 이미 지목함)가 그 회차의 기록으로 보입니다.
+> `gemm_with_layout_fallback`/`batched_matmul` 이 지금 `aten.rs` 의 기본 경로이고, `.contiguous()`
+> 는 candle 이 스트라이드 낀 피연산자를 거부할 때만 도는 폴백입니다(round 1 의 DESIGN.md 감사가
+> 이미 소스를 읽어 확인). §6.2/§6.3 의 "4.7~82배" 측정 자체는 **이 문서를 쓴 시점의 참인
+> 측정**으로 남지만, "고치지 않았다"/"다음 벽" 은 낡았습니다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_with_layout_fallback present -->
+
 ---
 
 ## 7. 다음 벽 — 이름으로
 
 | # | 벽 | 크기 | 무엇이 필요한가 |
 |---|---|---|---|
-| 1 | **밀집 `linear` 의 호출당 전치 복사** | 전치 뷰 대 연속 **4.7 ~ 82 배** (§6.2). 모델 수준으로는 시임이 상류보다 9 ~ 17 배 느린 것의 원인 | `linear` 이 전치본을 캐시하거나, `matmul` 이 전치 레이아웃을 BLAS 에 그대로 넘기거나(`cblas` 의 `CblasTrans`). **골든의 누적 순서가 바뀔 수 있으므로 결정이 필요합니다** |
+| 1 | ~~**밀집 `linear` 의 호출당 전치 복사**~~ **정정 (문서 감사, 2026-09): 다음날 고쳐짐, §6.4 정정 참고** | 전치 뷰 대 연속 **4.7 ~ 82 배** (§6.2). 모델 수준으로는 시임이 상류보다 9 ~ 17 배 느린 것의 원인 | `linear` 이 전치본을 캐시하거나, `matmul` 이 전치 레이아웃을 BLAS 에 그대로 넘기거나(`cblas` 의 `CblasTrans`). **골든의 누적 순서가 바뀔 수 있으므로 결정이 필요합니다** |
 | 2 | **Q4K 가 576 을 담지 못함** | `docs/QUANT.md` §5.2 의 기기 3.29 배가 SmolLM2 에 적용 불가 (§5.2) | 형식의 제약. 마지막 차원 패딩, 또는 블록 32 형식으로 만족 |
 | 3 | **`q4_0` 실모델 품질** | 상대 RMS 29.5%, 생성 붕괴 (§5.3) | 보정(importance matrix), 또는 층별 형식 선택(`lm_head`·`down_proj` 만 8 비트), 또는 Q4K(=2 번에 막힘) |
 | 4 | **활성화가 `bfloat16` 이면 못 씀** | `QMatMul::forward` 가 f32/f16 만 받음 | 넓히는 비용을 재고 나서 결정. 지금은 이름을 대고 거절 |

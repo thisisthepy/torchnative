@@ -344,10 +344,17 @@ NaN 을 돌려주는 케이스를 처음 넣었을 때 **양쪽이 NaN 으로 �
 
 ## 6. 못 한 것 · 모르는 것 — 명시
 
-- **`torch.<op>` 철자로는 아직 안 닿습니다.** 이 작업은 `overloads.json`·`methods.json`·
-  `bootstrap.py` 를 건드리지 않았습니다(소유자가 다릅니다). 여덟 개는 `_aten_dispatch` 와 골든
-  하네스에서만 닿고, `torch.multinomial(...)`·`torch.sort(...)` 같은 파이썬 철자는 표에 항목이
-  생겨야 해석됩니다. 스키마 대조가 127/127 로 그대로인 이유가 이것입니다.
+- ~~**`torch.<op>` 철자로는 아직 안 닿습니다.**~~ **정정 (문서 감사, 2026-09): 지금은 닿습니다.**
+  이 작업은 `overloads.json`·`methods.json`·`bootstrap.py` 를 건드리지 않았지만(소유자가
+  다름, 이 문서를 쓸 때는 사실), 다른 라운드(§0 표의 8 개가 landed 된 뒤)가 표 항목을
+  채운 것으로 보입니다 — 실측: `torch.multinomial(torch.tensor([0.1,0.2,0.7]), 1)`,
+  `torch.sort(...)`, `torch.topk(...)` 전부 오늘 성공합니다. `overloads.json` 에
+  `"multinomial"`/`"sort"`/`"topk"` 키가 있습니다. 스키마 대조 숫자(127/127)가 이 문서를 쓴
+  시점 이후 바뀌었는지는 확인하지 않았습니다 — 이 항목의 요점(파이썬 철자로 안 닿는다)만
+  재확인했습니다.
+  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json multinomial present -->
+  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json sort present -->
+  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json topk present -->
 - **`topk` 의 동점 순서 (§4.2).** 재현하지 않았고, 재현하지 않기로 한 근거를 적었습니다.
   로짓이 정확히 같은 값을 갖는 모델에서 `top_k` 의 컷이 갈릴 수 있는지는 **확인하지 않았습니다.**
 - **축소 dtype 의 비-마지막-축 `_softmax` (§4.3).** 차이는 재었고 원인은 추론입니다.

@@ -477,6 +477,17 @@ aten.relu.default            15   dtype 8 + max 판별 2 + 모양 4 + bool 거�
 - **여섯 op 의 파이썬 철자.** `overloads.json`/`methods.json`/`bootstrap.py` 는 범위 밖이라 한 줄도
   안 고쳤습니다. 여섯 다 `torch.ops.aten.*` 로는 도달하지만 `torch.where(...)` ·
   `torch.stack(...)` · `Tensor.permute(...)` · `torch.nn.functional.relu(...)` 로는 아직 못 갑니다.
+
+  > **Correction (문서 감사, 2026-09):** 넷 다 지금은 닿습니다. 실측: `torch.where(...)`,
+  > `torch.stack(...)`, `torch.ones(2,3).permute(1,0)`, `F.relu(...)` 전부 오늘 성공합니다.
+  > `overloads.json` 에 `where`/`stack`/`relu` 키가, `methods.json` 에 `permute` 키가
+  > 있습니다. `docs/GPT2.md`/`docs/SAMPLING.md`/`docs/DEVICE.md`/`docs/ARCH.md` 감사(이
+  > 라운드)에서 반복해서 발견한 것과 같은 패턴입니다 — 나머지 두 op 이름은 이 문단이 밝히지
+  > 않아 확인하지 못했습니다.
+  > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json where present -->
+  > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json stack present -->
+  > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json relu present -->
+  > <!-- DOCWATCH: json-key rust/torch_c/src/methods.json permute present -->
 - **`compare.py` 의 `KNOWN_GAP` 세 항목 제거**(§9.1) 와 **`test_shim.py` 의 relu 표본
   교체**(§9.2). 둘 다 파일 범위 밖이고, 둘 다 지금 빨간 상태입니다.
 - **§4·§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `pytests/test_shim.py` 가 범위 밖입니다.

@@ -33,6 +33,10 @@ torch.Tag.core in torch.ops.aten.<op>.<overload>.tags
 aten.lift_fresh.default
 aten.max.default
 ```
+<!-- DOCWATCH: op-implemented aten.lift_fresh.default -->
+<!-- DOCWATCH: op-implemented aten.max.default -->
+(둘 다 shim 은 이미 구현하고 있습니다 — 이 절이 말하는 "미분류"는 Core ATen/분해표 어느
+분류표에도 안 걸린다는 뜻이지, shim 에 커널이 없다는 뜻이 아닙니다.)
 
 **그러므로 "Core ATen 범위 밖의 op 은 없다" 는 초안의 결론은 틀렸습니다.** 14 개가 밖에 있고,
 그중 2 개는 분해 테이블도 다루지 않습니다. 둘 다 사소해 보이지만 — `lift_fresh` 는 텐서 생성

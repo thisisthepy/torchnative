@@ -546,9 +546,9 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 | 갈래 | 개수 | 항목 |
 |---|---:|---|
 | **이 호스트에 MPS 가 있고 우리 빌드에 가속기가 없다** | 6 | `ctor.int`, `_get_accelerator`, `avail.mps`, `avail.mps.built`, `avail.accel`, `avail.accel.count` — 결함이 아니라 빌드 차이 |
-| **컨텍스트 매니저 / 기본 장치 미구현** (§7.2) | 6 | `attr.enter`, `ctx.with_cpu`, `ctx.with_meta`, `default.set_cpu`, `default.set_meta`, `m.meta_ctx` |
+| ~~**컨텍스트 매니저 / 기본 장치 미구현** (§7.2)~~ **정정 (문서 감사, 2026-09): §7.2 자신이 이미 "구현됨" 이라고 적은 것과 어긋남** | 6 | `attr.enter`, `ctx.with_cpu`, `ctx.with_meta`, `default.set_cpu`, `default.set_meta`, `m.meta_ctx` — §7.2 정정 참고, `docs/META.md` §8 |
 | **CUDA 부재를 다른 예외로 말한다** | 5 | `t.to.cuda`, `t.cuda`, `t.zeros_cuda`, `m.to_cuda`, `mixed.cpu_plus_cuda`. 상류 `AssertionError: Torch not compiled with CUDA enabled` vs 우리 `NotImplementedError: device not available in torch._C shim: cuda` — 둘 다 "없다" 이고, 우리 쪽 메시지는 어느 층에서 없는지를 말합니다 |
-| **`meta` 미구현** (§7.1) | 3 | `t.to.meta`, `t.zeros_meta`, `mixed.cpu_plus_meta` (`ctx.with_meta`·`m.meta_ctx` 는 그 앞의 컨텍스트 매니저에서 먼저 걸립니다) |
+| ~~**`meta` 미구현** (§7.1)~~ **정정 (문서 감사, 2026-09): §7.1 자신이 이미 "구현됨" 이라고 적은 것과 어긋남** | 3 | `t.to.meta`, `t.zeros_meta`, `mixed.cpu_plus_meta` — §7.1 정정 참고, `docs/META.md`. 실측 재확인: `torch.zeros(2, device='meta')` 와 `with torch.device('meta'): torch.zeros(3)` 둘 다 오늘 성공 |
 | **`privateuse1` 이름 변경 미구현** (§7.3) | 3 | `reg.rename`, `reg.after_rename`, `reg.device_pu1` |
 | **장치와 무관한 커널 구멍** | 2 | `t.ones_like_dev` (오버로드 테이블에 `ones_like` 없음), `t.pin_memory` |
 | **예외 메시지 문면만 다름** | 1 | `ctor.none` — 타입과 앞부분은 같고 상류가 오버로드 목록을 덧붙입니다 |

@@ -501,6 +501,23 @@ float32  T=512     6.9630 ms     156.1144 ms    22.42배
 | 상류의 후보 | 왜 안 맞나 |
 |---|---|
 | `torch.backends.cuda.enable_flash_sdp` · `torch.nn.attention.sdpa_kernel(SDPBackend.MATH)` | 이것은 **어떤 aten op 을 부를지**를 고르는 것이지, 한 op 을 **무슨 산술로 계산할지**가 아닙니다. 상류의 `MATH` 는 `mul.Scalar`·`expand`·`bmm`·`_safe_softmax` 라는 **다른 op 열**이고, 이 시임은 그것을 `bootstrap.py` 에서 **이름을 대며 거부**합니다(`_safe_softmax` 에 커널이 없음). 이 이름을 빌리면 `enable_flash_sdp(False)` 가 상류에서는 op 열을 바꾸는 자리에서 우리는 덧셈 순서만 조용히 바꾸게 되고, 게다가 `flash_sdp_enabled()` 가 **어느 쪽도 서술하지 못합니다** — 상류의 기본값은 `True` 인데 우리 기본값은 candle 이어야 하기 때문입니다 |
+
+> **Correction (문서 감사, 2026-09):** 괄호 안의 근거("`_safe_softmax` 에 커널이 없음")는 이
+> 문서를 쓴 시점에도 이미 사실이 아니었습니다 — `aten._safe_softmax.default` 는 `9612146`
+> (이 문서의 커밋 `4cd3bde` 의 조상 커밋)부터 `IMPLEMENTED` 에 있었고 골든으로 대조돼 왔습니다.
+> `bootstrap.py` 자신의 주석이 이미 이것을 발견해 적어 두었습니다(2026-09, 이 감사보다 먼저):
+> "**The reason given here used to be `_safe_softmax` has no kernel, and that stopped being
+> true.** ... every kernel the math backend needs for the 3-D and non-4-D cases is present, and
+> what is missing is the *composite* — nobody has transcribed upstream's math-backend op
+> sequence." 지금은 그 composite(`_sdpa_math`)도 **작성되어 있습니다** —
+> `dropout_p > 0`(train 모드)과 `is_causal`/bool 마스크 경로를 포함해 `bootstrap.py` 에
+> 구현돼 있고, 남은 거부는 4-D 가 아닌 query 에 대해서만입니다(§0 표의 "이름을 대며 거부"는
+> 이제 이 더 좁은 경우만 가리킵니다). `torch.ops.aten._safe_softmax.default` 를 직접 호출하면
+> 성공합니다(실측). 이 표 전체의 결론("이 저장소 자신의 철자를 쓴다")은 바뀌지 않습니다 —
+> `enable_flash_sdp`/`sdpa_kernel(MATH)` 는 여전히 백엔드 **선택** 이름이지 op 산술 선택
+> 이름이 아니므로, 지금도 안 맞는 이유가 유효합니다. 낡은 것은 괄호 안의 근거 하나뿐입니다.
+> <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
 | `torch.backends.cpu.get_cpu_capability` / `ATEN_CPU_CAPABILITY` | 읽기 전용이고, 환경변수 쪽은 빌드 전체의 **ISA 등급**을 고르는 것이지 한 op 의 참조 구현을 고르는 것이 아닙니다 |
 | `torch.use_deterministic_algorithms` | 한 빌드의 **실행 간 재현성**에 관한 것이고, 여기서는 **두 경로 다 이미 그렇습니다.** 사용자는 이것을 문서에 적힌 목적으로 켜는데, 거기에 20배를 매달아 두면 함정이 됩니다 |
 

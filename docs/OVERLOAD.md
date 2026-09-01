@@ -31,6 +31,9 @@ torch.full((2,), True)                         ->  NotImplementedError (막혀 �
 
 `from_config` 는 여전히 실패합니다. **다만 막히는 이유가 op 이 아닙니다** — §8.
 
+> **Correction (문서 감사, 2026-09):** 아래 §8 의 정정과 같은 자리 — `from_config` 는 이제
+> 성공합니다. `2d3663f` 가 §8 이 지목한 바로 그 이름을 실제로 넣었습니다.
+
 ---
 
 ## 1. 무엇이 문제였나 — `torch.full` 은 aten op 이 아니다
@@ -214,6 +217,12 @@ torch.full(2, 3)   -> TypeError        (full 은 둘 — full([2], 3) 이 되지
 | 12 | `rsqrt` | `.default` | **구현** | 정수 입력 → float32, float16 입력 → float16 (양쪽 실측) |
 | 13 | `tensor` | (aten 오버로드가 아님) | **구현** | §6.7 |
 
+<!-- DOCWATCH: op-implemented aten.arange.default -->
+<!-- DOCWATCH: op-implemented aten.embedding.default -->
+<!-- DOCWATCH: op-implemented aten.is_floating_point.default -->
+<!-- DOCWATCH: op-implemented aten.isin.Tensor_Tensor -->
+<!-- DOCWATCH: op-implemented aten.pow.Tensor_Tensor -->
+<!-- DOCWATCH: op-implemented aten.randint.low -->
 곁가지로 `mm` · `add` 도 표에 넣었습니다 — 이미 커널이 있고, 표가 어떤 모양의 오버로드
 집합까지 다루는지 보여주는 대조군입니다 (`add.Scalar` 는 커널이 없어 이름을 댑니다).
 
@@ -388,6 +397,18 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 
 **그러므로 다음 임계 경로는 op 이 아니라 `_C._dynamo` 입니다.** 이 작업의 범위 밖이라 2 번에서
 멈추고 기록합니다.
+
+> **Correction (문서 감사, 2026-09):** 3 번은 더 이상 미구현이 아닙니다 — `RUN THE CHECK: 이 절이
+> "여기서 멈췄습니다" 라고 이름 댄 바로 그 심볼이 이제 존재합니다.** `git log -S"set_guard_error_hook"
+> -- rust/torch_c/src/bootstrap.py` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator,
+> and give _C._dynamo the two names that do work") 이고, 그 커밋 메시지가 이름 댄 "두 개" 중
+> 하나가 정확히 이 심볼입니다(다른 하나는 `set_eval_frame_isolate_recompiles_id`). 실측:
+> `hasattr(torch._C._dynamo.eval_frame, 'set_guard_error_hook')` → `True`; 더 결정적으로,
+> **§8 이 실패한다고 기록한 바로 그 호출이 이제 성공합니다** —
+> `AutoModelForCausalLM.from_config(LlamaConfig(...))` 를 이 문서가 쓴 것과 같은 작은 설정으로
+> 직접 호출해 `LlamaForCausalLM` 인스턴스를 얻었습니다(2026-09, 이 셰임에서). §0 표의
+> "`from_config` 는 여전히 실패합니다" 도 같은 이유로 낡았습니다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py set_guard_error_hook present -->
 
 ---
 

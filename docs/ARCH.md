@@ -510,6 +510,15 @@ addmm +14   큰 크기 3, bfloat16 승격 (c_error 2 -> match 13)
   `Tensor.gather()` · `Tensor.zero_()` 로는 아직 못 갑니다. **`zero_` 는 이것이 특히 아픕니다** —
   §0 이 보인 대로 `nn.LayerNorm` 의 생성자가 그 철자로 부르기 때문에, 커널만으로는
   GPT2.md 가 보고한 벽이 그대로입니다.
+
+  > **Correction (문서 감사, 2026-09):** 셋 중 둘이 닫혔습니다. `methods.json` 에 지금
+  > `"gather"`/`"zero_"` 키가 있고, 실측: `torch.tensor([1,2,3]).gather(0, torch.tensor([0]))`
+  > 와 `torch.tensor([1.0,2.0]).zero_()` 둘 다 오늘 성공합니다. **`nn.LayerNorm(4)` 생성도
+  > 오늘 성공합니다** — GPT2.md 가 보고한 벽이 실제로 닫혔다는 뜻입니다. `Tensor.gelu()` 는
+  > 여전히 안 닫혔습니다(`methods.json` 에 `"gelu"` 키 없음, `AttributeError` 로 실측 재확인 —
+  > `NotImplementedError` 조차 아니고 애초에 메서드로 시도되지 않습니다).
+  > <!-- DOCWATCH: json-key rust/torch_c/src/methods.json gather present -->
+  > <!-- DOCWATCH: json-key rust/torch_c/src/methods.json zero_ present -->
 - **§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `pytests/test_shim.py` 가 범위 밖입니다.
   `_E2EBackend` 옆에 Gemma·BERT 전사를 놓으면 그대로 테스트가 됩니다 — 다음 작업 항목.
 - 다음 4-op 묶음(`le.Tensor` · `scalar_tensor` · `where.self` · `permute`)은 안 건드렸습니다.

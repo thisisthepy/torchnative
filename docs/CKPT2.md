@@ -372,6 +372,19 @@ WEIGHTS worst difference: 0.0     at None
 
 ### 7.1 그 모델의 순전파는 아직 안 됩니다 — 다음 벽 둘
 
+> **Correction (문서 감사, 2026-09):** 둘 다 열렸습니다. `aten.where.ScalarOther` 는 지금
+> `_aten_implemented()` 에 있고, `enable_gqa=True` 는 `bootstrap.py::_sdpa_math` 가
+> (`docs/SDPA.md` 감사가 이 라운드에서 이미 지목한 그 composite) 헤드를 반복해 지원합니다
+> (`bootstrap.py:5312` 의 `if enable_gqa:` 분기). 실측 재확인, 2026-09:
+> `AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M")` 의 순전파가
+> **성공**하고(`logits.shape == (1, 2, 49152)`), `model.generate(ids, max_new_tokens=5)` 도
+> **성공**합니다(§8 항목 2 의 `_prepare_attention_mask_for_generation` 벽도 함께 닫힌 것으로
+> 보입니다 — 별도로 추적하지 않았지만 `generate()` 자체가 도는 것으로 그 벽이 더는 막지
+> 않음을 알 수 있습니다). `docs/DESIGN.md` §11.1 감사(round 1)가 이미 같은 모델로 이것을
+> 확인했었고, 이 문서 자체의 §7.1/§8 이 그 사실을 반영하지 못한 채 남아 있었습니다.
+> <!-- DOCWATCH: op-implemented aten.where.ScalarOther -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
+
 적재가 아니라 **커널** 문제입니다. 두 어텐션 구현이 각각 다른 벽을 냅니다.
 
 ```
@@ -403,8 +416,8 @@ SmolLM2-135M 은 `num_attention_heads=9`, `num_key_value_heads=3` 의 **그룹 �
 
 | # | 항목 | 상태 |
 |---|---|---|
-| 1 | **진짜 사전학습 모델의 순전파** | **미통과.** 커널 둘: `sdpa(enable_gqa=True)` 와 `aten.where.ScalarOther` (§7.1) |
-| 2 | `generate()` — **진짜 모델로** | **미통과.** `_prepare_attention_mask_for_generation` 에서 `aten.mul.Tensor: int64 vs bool` 승격이 없어 멈춥니다. 커널 문제이지 체크포인트 문제가 아닙니다 |
+| 1 | **진짜 사전학습 모델의 순전파** | ~~**미통과.** 커널 둘: `sdpa(enable_gqa=True)` 와 `aten.where.ScalarOther` (§7.1)~~ **정정 (문서 감사, 2026-09): 통과함** — §7.1 정정 참고 |
+| 2 | `generate()` — **진짜 모델로** | ~~**미통과.** `_prepare_attention_mask_for_generation` 에서 `aten.mul.Tensor: int64 vs bool` 승격이 없어 멈춥니다. 커널 문제이지 체크포인트 문제가 아닙니다~~ **정정 (문서 감사, 2026-09): 통과함** — 실측: `model.generate(ids, max_new_tokens=5)` 이 SmolLM2-135M 에서 성공 |
 | 3 | `from_file(shared=True)` | **거절.** §2.1. 재현 불가능한 것이지 미구현이 아닙니다 |
 | 4 | **메모리** — `from_file` 은 파일 전체를 미리 읽습니다 | **미측정.** mmap 의 게으른 상주를 잃었고, 135M 모델(269 MB)에서는 문제가 되지 않았습니다. 7B 급에서 이것이 실제 제약인지는 재지 않았습니다 |
 | 5 | `bf16` 을 `f32` 로 올려 계산하는 것 | **판정 안 함.** §6.1. 적재는 정확하고 계산이 상류보다 정밀합니다. 어느 쪽이 옳은지는 이 회차의 질문이 아니었습니다 |

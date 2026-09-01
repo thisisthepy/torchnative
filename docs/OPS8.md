@@ -234,12 +234,29 @@ NotImplementedError: not implemented in torch._C shim: torch._C._nn.scaled_dot_p
 `pad`, `_parse_to` — 전부 같은 문구로 거부합니다. `_C._nn` 표면 전체가 아직 비어 있는 것으로
 보입니다.
 
+> **Correction (문서 감사, 2026-09):** 배선이 갈렸습니다. `_C._nn.linear` 와
+> `_C._nn.scaled_dot_product_attention` (이 절이 위에서 예로 든 둘) 은 오늘 성공합니다.
+> `_C._nn.gelu`/`_C._nn.silu`/`_C._nn.pad` 도 오늘 성공합니다. 다만 `_C._nn.softmax` 와
+> `_C._nn.layer_norm` 은 **여전히 거부합니다** — `torch.layer_norm`/`F.layer_norm` 은 이제
+> 되지만(`docs/GPT2.md` 감사가 이 라운드에서 이미 확인) `bootstrap.py:5863` 의 별도 파이썬
+> 컴포지트를 경유하는 것이지 `_C._nn.layer_norm` 자체가 채워진 것이 아닙니다. **"`_C._nn`
+> 표면 전체가 비어 있다"는 더 이상 맞지 않지만, "완전히 채워졌다"도 아닙니다** — 이름마다
+> 다릅니다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py linear present -->
+
 ### 5-2. `torch.bmm(...)` 같은 파이썬 철자는 아직 해석되지 않습니다
 
 `torch.ops.aten.bmm.default(...)` 은 됩니다. `torch.bmm(...)` 은 `src/overloads.json` 에 항목이
 없어 오버로드 해석이 거부합니다. `TensorBase.t()`/`.neg()`/`.bmm()` 도 `src/methods.json` 기준으로
 같습니다. 두 표는 `verify_schemas.py` 가 검사하는 대상이고 이 작업의 범위 밖이라 건드리지
 않았습니다 — 그래서 §0 의 127/127 이 그대로입니다. 항목을 넣으면 그 숫자가 올라갑니다.
+
+> **Correction (문서 감사, 2026-09):** 항목이 들어갔습니다. 실측: `torch.bmm(...)`,
+> `t.t()`, `t.neg()`, `t.bmm(...)` 전부 오늘 성공합니다. `overloads.json`/`methods.json` 에
+> `bmm`/`t`/`neg` 키가 있습니다 (지금 스키마 총계는 §0 의 127/127 이 아닙니다 —
+> `docs/AUDIT.md` 의 이 라운드 기준선은 4475/4475).
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json bmm present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json bmm present -->
 
 ### 5-3. `torch.distributed` — 임포트 벽, aten 과 무관
 

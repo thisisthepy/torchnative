@@ -1,5 +1,10 @@
 # `_C.dylib` iOS 시뮬레이터 로드 검증
 
+> **Correction (문서 감사, 2026-09):** 이 문서도 `docs/DEVICE_LOAD.md`(안드로이드 쪽 자매
+> 문서, 이 감사가 이미 확인)와 같은 3-op 단계의 스냅샷입니다. `docs/IOS.md` 가 이 계보의
+> 후속 문서로 보이나(이 감사가 아직 읽지 않음), 이 문서 자체의 결론("로드 성공")은 여전히
+> 유효합니다 — 뒤집혔다는 근거는 없습니다.
+
 **결론: 로드 성공.** `import _C`, `_C._aten_implemented()`, `_C._aten_dispatch("aten.full.default",
 [2, 3], 1.5)` 모두 실제 iOS 시뮬레이터(iPhone 16 Pro, iOS 18.0) 프로세스 안에서 정상 동작했다.
 `docs/RUST_CROSSBUILD.md` §0.5 가 확인한 것은 **`aarch64-apple-ios`(실기기) 산출물의 링크**뿐이었고,

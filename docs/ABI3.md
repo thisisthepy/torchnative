@@ -6,6 +6,12 @@
 현재 상태: `rust/torch_c/Cargo.toml:13` 이 `features = ["extension-module"]` — **non-abi3(버전 고정)**
 이고, 이 상태로 세 타깃이 빌드됩니다.
 
+> **Correction (문서 감사, 2026-09):** 이 문서의 권고("abi3 를 켜라, floor 는 `abi3-py313`")가
+> 채택됐습니다. `rust/torch_c/Cargo.toml` 의 `pyo3` 의존성이 지금
+> `features = ["extension-module", "abi3-py313"]` 입니다(줄 번호는 이동했을 수 있음, 실측
+> 재확인 2026-09). "현재 상태" 줄은 이 문서를 쓴 시점의 상태로 남겨 두고 여기서 정정합니다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml abi3-py313 present -->
+
 ---
 
 ## 결론부터

@@ -313,12 +313,26 @@ onig_sys v69.9.3 → onig v6.5.3 → tokenizers v0.22.2 → candle-core v0.11.0
 (`torch.promote_types`) **추측이 아니라 이식**입니다. 다만 이식 범위(카테고리 승격, 스칼라 참여
 규칙, `_to_copy` 와의 관계)를 정해야 하고, 이것 없이는 두 번째 이항 op 부터 전부 같은 벽에 막힙니다.
 
+> **Correction (문서 감사, 2026-09):** 결정이 이 문서가 예상한 방향과 다르게 났습니다 —
+> 이식하지 않기로 **의도적으로** 정해졌습니다. `torch.ops.aten.add.Tensor(float32_t, float64_t)`
+> 는 오늘도 정확히 이 메시지로 거부합니다(실측, 2026-09). `docs/TENSORBASE.md` §2.3 이 그
+> 결정을 명시합니다: "승격은 여전히 하지 않는다 ... `DESIGN.md` §5 가 candle 의 주된 위험으로
+> 꼽은 '조용한 수치 드리프트' 를 만들지 않기 위한 기존 규칙." 즉 **미해결이 아니라 해결된
+> 결정**입니다 — "텐서끼리는 승격하지 않고 이름을 댄다, 파이썬 스칼라는 wrapped-number 규칙을
+> 재현한다"로 갈렸습니다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs same_dtype present -->
+
 ### 3. `torch.bool`
 
 candle 에 없습니다. CORE_ATEN §2 목록의 마스킹·비교 op 9 개가 전부 여기 걸립니다
 (`bitwise_*`, `any.*`, `eq.Scalar`, `ne.Tensor`, `lt.Scalar`, `masked_fill.Scalar`).
 `U8` 을 불리언으로 쓰되 **dtype 라벨만 `torch.bool` 로 다는** 층을 `_C` 안에 둘지, candle 을
 건드릴지 정해야 합니다. `full.default` 의 bool fill 도 여기 묶입니다.
+
+> **Correction (문서 감사, 2026-09):** 닫혔습니다 — `docs/BOOL.md` 가 바로 이 결정을 다룹니다.
+> `torch.bool` 이 지금 존재하고(`hasattr(torch, 'bool')` → `True`), `aten.eq.Scalar` 등의 결과가
+> `torch.bool` dtype 을 답합니다(실측). 이 문서가 물었던 "`U8` 라벨링이냐 candle 을 건드리냐"는
+> 전자로 정해진 것으로 보입니다 — 자세한 내용은 `docs/BOOL.md`.
 
 ### 4. `torch.ops.aten.<op>.<overload>` 진입로
 
@@ -328,10 +342,20 @@ candle 에 없습니다. CORE_ATEN §2 목록의 마스킹·비교 op 9 개가 �
 (`import transformers`)를 실제로 해 보기 전에는 어떤 모양이 요구되는지 확정할 수 없습니다.**
 그러므로 1 단계가 먼저입니다.
 
+> **Correction (문서 감사, 2026-09):** 닫혔습니다 — `docs/OVERLOAD.md` 가 `torch.<op>(...)`
+> 사용자 표면(오버로드 해석기, `PythonArgParser::raw_parse` 재현)을 열었고,
+> `docs/TENSORBASE.md` 가 `TensorBase` 메서드 쪽을 열었습니다(이 감사가 이미 두 문서를
+> 확인함, 위 참고).
+
 ### 5. `aten.view.default` 와 별칭 의미론
 
 §2 에서 미룬 항목. DESIGN.md §4 가 "스파이크 초기에 여기부터 확인해야 한다" 고 적은 바로 그것이고,
 KV 캐시 갱신(`add_`, `copy_`) 과 한 묶음입니다.
+
+> **Correction (문서 감사, 2026-09):** 닫혔습니다 — `docs/VIEWS.md` 가 정확히 이 항목을
+> 다룹니다(이 감사가 round 1 에서 이미 확인: in-place 쓰기가 뷰를 관통, `aten.ge.Tensor` 등).
+> 완전히는 아닙니다 — `docs/VIEWS.md` §6.4 가 `slice.Tensor` step>1 과 `view.dtype` 은 여전히
+> 구조적으로(candle 의 `pub(crate)` storage 경계) 못 고친다고 남겨 둡니다.
 
 ### 6. abi3
 

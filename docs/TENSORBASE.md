@@ -33,6 +33,9 @@ x.item()   ->  NotImplementedError: TensorBase.item
 | 세 타깃 빌드 | 0 | **0** |
 | `from_config` | `_C._dynamo` 에서 정지 | **`nn.Linear` 안의 `uniform_` 까지 전진** (§7) |
 
+> **Correction (문서 감사, 2026-09):** "`nn.Linear` 안의 `uniform_` 까지 전진"도 이제
+> 낡았습니다 — §7 정정 참고. `nn.Linear(4, 3)` 이 지금은 그냥 성공합니다.
+
 `__class__` 는 `C_SURFACE.md` §4 가 이미 "잡음" 이라고 표시한 상속 던더이므로 분모는 49 입니다.
 
 ---
@@ -362,7 +365,7 @@ detach()/뷰가 만든 별칭        y = x.detach()
 | 8 | **`cumsum` 의 누산기 폭** | §2.2. `f64` 대 torch 의 `float` |
 | 9 | **`__getitem__` 의 혼합·다중 인덱스** | §3. 거부한다. 상류의 합성/브로드캐스트 규칙 **미측정** |
 | 10 | **`bitwise_*` 가 원소별 i64 경유** | 정확하지만 느리다. candle 에 비트 커널이 없다. 마스크 결합용이라 감수 |
-| 11 | **`normal_` · `uniform_`** | **미구현.** §7 |
+| 11 | **`normal_` · `uniform_`** | ~~**미구현.** §7~~ **정정 (문서 감사, 2026-09): 이제 구현됨** — §7 정정 참고 |
 | 12 | **`_to_copy` 의 device 인자** | `cpu` 만. 다른 device 는 `device_arg` 가 이름을 댄다 |
 | 13 | **`import torch` 비용이 1.15 s → 0.35 s 로 줄었다** | OVERLOAD.md §10 의 1.15 s 와 **다른 조건에서 잰 것일 수 있습니다.** 이번 작업이 임포트를 빠르게 할 이유가 없으므로 이 숫자는 **개선의 근거로 쓰지 마십시오** — 미조사 |
 | 14 | **기기 (Android · iOS)** | 이번에도 링크만 |
@@ -409,6 +412,19 @@ PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
 ```
 
 **이 둘이 들어오는 순간 `nn.Linear` 가 만들어집니다.** 그 뒤의 벽은 아직 모릅니다.
+
+> **Correction (문서 감사, 2026-09):** 이 둘이 들어왔습니다. `git log -S'"aten.uniform_.default"'
+> -- rust/torch_c/src/aten.rs` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator, and
+> give `_C._dynamo` the two names that do work") — 커밋 메시지가 그대로 말하듯, candle CPU
+> 백엔드가 시딩을 거부해서 상류 CPU generator(MT19937)를 이식한 결과입니다.
+> `uniform_inplace`/`normal_inplace` 가 `aten.rs:10274`/`10350` 에 있고, 둘 다 현재
+> `_aten_implemented()` 목록에 있습니다. 실측: `torch.nn.Linear(4, 3)` 이 지금은 그냥
+> 성공합니다(§0 표의 "정지" 도 같이 낡았습니다). `docs/RNG.md` 가 이 이식을 자세히 다루는
+> 문서로 보입니다(같은 커밋).
+> <!-- DOCWATCH: op-implemented aten.uniform_.default -->
+> <!-- DOCWATCH: op-implemented aten.normal_.default -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs uniform_inplace present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs normal_inplace present -->
 
 ### 7.2 벽 2 — `_C` 는 `TensorBase` 가 아니라 `torch.Tensor` 를 돌려줘야 한다
 

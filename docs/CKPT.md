@@ -239,8 +239,10 @@ after (see storage.rs and docs/CKPT.md §4).
 | | 무엇이 필요한가 |
 |---|---|
 | `torch.load` legacy 포맷 | 진짜 별칭 스토리지. §4 |
-| `torch.load(mmap=True)` | `UntypedStorage.from_file` + 스토리지 슬라이싱 |
-| `safetensors` 기본 `mmap` 백엔드 | 같은 것 |
+| ~~`torch.load(mmap=True)`~~ **정정 (문서 감사, 2026-09): 닫힘** | `UntypedStorage.from_file` + 스토리지 슬라이싱 — `docs/CKPT2.md` 가 구현, 가중치가 비트 단위로 상류와 일치 |
+| ~~`safetensors` 기본 `mmap` 백엔드~~ **정정 (문서 감사, 2026-09): 닫힘** | 같은 것 — `docs/CKPT2.md` §7 이 SmolLM2-135M 273 텐서 전부 비트 일치를 확인 |
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs from_file present -->
 | `get_record_offset_no_read` | torch 의 레코드 정렬 산술 재현. **틀린 오프셋은 예외가 아니라 옆 텐서의 바이트**라 추측하지 않음 |
 | `int8` · `uint16` · `uint64` · complex 로 저장된 체크포인트 | candle 이 못 담음. dtype 이름을 대며 거부 |
 | 음수 stride | torch 가 만들지 않으므로 추측하지 않음 |
@@ -248,7 +250,11 @@ after (see storage.rs and docs/CKPT.md §4).
 
 ### 모르는 것
 
-- **실제 사전훈련 체크포인트로는 검증하지 못했습니다.** `import transformers` 가 아직
+- ~~**실제 사전훈련 체크포인트로는 검증하지 못했습니다.**~~ **정정 (문서 감사, 2026-09):
+  닫힘 — `docs/CKPT2.md` §7 자신이 이 정확한 문장을 인용하며 닫혔다고 적습니다** ("`docs/CKPT.md`
+  §6 '모르는 것' 의 첫 줄 ... 이 닫혔습니다"). `import transformers` 도 그 뒤 `docs/DISTRIBUTED.md`
+  가 열었습니다(이 감사가 round 2 에서 이미 확인).
+  `import transformers` 가 아직
   `torch.distributed` 에서 막히고(IMPORT_WALLS), 이 조사는 `torch.nn` 조립 + 수동 적재로
   판정했습니다. 여기서 쓴 것은 상류가 저장한 진짜 `.pt`/`.safetensors` 파일이지, 진짜 *모델* 은
   아닙니다. HF 체크포인트 특유의 것(공유 텐서 메타데이터, 샤딩된 `.index.json`, `_metadata`)은

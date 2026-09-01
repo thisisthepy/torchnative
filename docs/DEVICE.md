@@ -385,6 +385,13 @@ ModuleNotFoundError: No module named '_multiprocessing'
 
 ## 7. 양쪽에서 똑같이 실패하는 것 하나 — `_C` 의 갭이지 기기 문제가 아니다
 
+> **Correction (문서 감사, 2026-09):** 닫혔습니다. `torch.relu` 가 지금
+> `rust/torch_c/src/overloads.json` 에 있고(`grep -c '"relu"'` → 1), 실측:
+> `torch.relu(torch.tensor([-1.0, 2.0]))` → `tensor([0., 2.])`, 성공. 어느 라운드가 채웠는지는
+> 추적하지 않았습니다 — `docs/SAMPLING.md` 감사에서 방금 발견한 것과 같은 모양입니다(overloads
+> 테이블이 이 문서를 쓴 뒤 다른 라운드에서 계속 채워졌다).
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json relu present -->
+
 ```
 nn.ReLU()(x)  ->  F.relu(x)  ->  torch.relu(x)
 NotImplementedError: not implemented in torch._C shim: torch.relu(...)

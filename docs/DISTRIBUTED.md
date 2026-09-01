@@ -348,8 +348,10 @@ model(input_ids)
 
 | # | 항목 | 상태 |
 |---|---|---|
-| 1 | `AutoModelForCausalLM.from_config` 로 만든 모델의 **순전파** | **미통과.** §7 의 autocast 벽 |
-| 2 | `from_pretrained` / 실제 체크포인트 경로 | **미시도.** 1 번 뒤에 있습니다 |
+| 1 | `AutoModelForCausalLM.from_config` 로 만든 모델의 **순전파** | ~~**미통과.** §7 의 autocast 벽~~ **정정 (문서 감사, 2026-09): §7 자신의 correction 과 어긋남 — 통과함, `docs/E2E_REAL.md` §4.** 실측 재확인: `AutoModelForCausalLM.from_config(...)` 로 만든 `LlamaForCausalLM` 의 순전파가 오늘도 통과합니다 |
+| 2 | `from_pretrained` / 실제 체크포인트 경로 | ~~**미시도.** 1 번 뒤에 있습니다~~ **정정 (문서 감사, 2026-09): 됩니다** — `torch._C._set_default_dtype` 도 지금 존재합니다(실측), `docs/DESIGN.md` §11.1 감사(round 1)가 실제 Hub 체크포인트 적재까지 확인했습니다 |
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py is_autocast_enabled present -->
 | 3 | `world_size >= 2` | **구현하지 않음.** `ProcessGroupLocal` 이 이름을 대고 거절합니다. 전송 계층이 없습니다 |
 | 4 | `torchnative.nn.federated` (스택의 맨 위 칸) | **비어 있습니다.** 이번 작업은 그 아래 두 칸만 세웠습니다 |
 | 5 | 장치 추상의 가속기 칸 (Metal · Vulkan · NPU) | **없음.** `local` 백엔드는 `devices=["cpu"]` 로만 등록합니다 |

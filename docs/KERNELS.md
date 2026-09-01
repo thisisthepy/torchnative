@@ -1,8 +1,14 @@
 # 밀린 커널 항목 셋 — 하나 고침, 하나 신설, 하나 범위 밖으로 반려
 
 `docs/TAIL.md`가 쌓아 둔 미해결 목록(§6) 중 우선순위가 높은 순서로 셋을 받았다. **결론 먼저:**
-`baddbmm`의 `alpha=0` 발산은 고쳤고 골든의 `KNOWN DIVERGENCE`가 0건이 됐다. `relu_`는 새 커널로
-채웠다. `uint8` 음수 포화는 **고치지 못했다** — 버그의 실체를 확인했지만 고칠 자리가 이 작업의
+`baddbmm`의 `alpha=0` 발산은 고쳤고 골든의 `KNOWN DIVERGENCE`가 0건이 됐다.
+<!-- DOCWATCH: op-implemented aten.baddbmm.default -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs baddbmm_default present -->
+`relu_`는 새 커널로
+채웠다.
+<!-- DOCWATCH: op-implemented aten.relu_.default -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs relu_inplace present -->
+`uint8` 음수 포화는 **고치지 못했다** — 버그의 실체를 확인했지만 고칠 자리가 이 작업의
 파일 범위(`rust/torch_c/src/aten.rs`, `tools/golden/cases.py`, 이 문서) 밖인 `rust/torch_c/src/lib.rs`에
 있다. `topk` 동점 순서는 지시대로 손대지 않았다.
 
