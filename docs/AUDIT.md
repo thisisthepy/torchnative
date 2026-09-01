@@ -37,6 +37,25 @@ elsewhere: overloads.json 200/200, methods.json 168/168,
 native_functions.yaml re-printed 2584/2584, packet overload lists 118/118,
 OpOverload.tags 148/148, CompositeImplicitAutograd registrations 744/744.
 
+> **Correction (docs/DOCWATCH.md, 2026-09):** this baseline is itself an
+> instance of the exact mechanism this document's own conclusion names — a
+> later, unrelated commit moved the numbers and nobody came back to this
+> paragraph. `cb6780d`/`f596426` ("Feat/Docs: Twenty-six of twenty-six", the
+> KERNELS26 round) landed after this document's last commit (`23c7097`) and
+> moved every gate count here. Re-run today, same commands, same env
+> pattern: `run.sh` 274 "ok " lines (not 268), `compare.py` SUMMARY:
+> 6374/6374 cases passed, 0 failed, ops covered=161 (not 148), pending case
+> builders=1, `verify_schemas.py` SUMMARY: 4458/4458 (not 4392). This is
+> also `tools/docwatch/check_docs.py`'s acceptance baseline — see
+> docs/DOCWATCH.md — and the markers below check the corrected numbers, not
+> the ones above, so this correction does not itself go stale silently the
+> next time a kernel round lands:
+> <!-- DOCWATCH: count smoke_ok ge 274 -->
+> <!-- DOCWATCH: count golden_cases_total ge 6374 -->
+> <!-- DOCWATCH: count golden_ops_covered ge 161 -->
+> <!-- DOCWATCH: count golden_pending eq 1 -->
+> <!-- DOCWATCH: count schema_entries_matched ge 4458 -->
+
 Ad hoc one-off checks (op implemented / spelling exists / etc.) are recorded
 inline in each file's section below with the exact command used, so the
 check is re-runnable.

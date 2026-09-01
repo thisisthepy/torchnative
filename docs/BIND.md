@@ -972,6 +972,10 @@ does not have to re-derive it.
 > fixes, not 2.1x more expensive.** The correctness finding (§9.1-§9.2, §9.5) and
 > the live behaviour (`t.dtype is torch.float32` → `True`, `baddbmm` → `float32`)
 > are unaffected and reconfirmed live in this audit.
+>
+> Standing check (docs/DOCWATCH.md):
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs interned present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_tensor_dtype_identity absent -->
 
 ### 9.4 What it costs -- measured, and it is not the story
 

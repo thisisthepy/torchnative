@@ -597,6 +597,17 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 > `torch.nn.functional.<name>`/`torch._C._nn.<name>`, both of which this shim already answers via
 > `bootstrap.py`'s `_install_nn`. Adding a `torch.gelu` entry would invent a spelling upstream
 > itself does not have. See docs/SPELLINGS.md §7.1 for the per-name measurement.
+>
+> Standing check (docs/DOCWATCH.md), so this correction cannot itself go stale the same way the
+> paragraph above it did:
+> <!-- DOCWATCH: hasattr gelu false -->
+> <!-- DOCWATCH: hasattr silu false -->
+> <!-- DOCWATCH: hasattr softplus false -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json triu present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json gelu absent -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json silu absent -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json softplus absent -->
+> <!-- DOCWATCH: count golden_pending eq 1 -->
 
 ---
 

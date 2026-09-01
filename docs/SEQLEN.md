@@ -918,6 +918,12 @@ Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 > answer). `test_amax_has_no_python_spelling_yet_and_says_so_by_name` failed on the first run
 > after the entries went in, exactly as designed, and was replaced by
 > `test_amax_now_has_both_python_spellings_and_they_reach_the_kernel`.
+>
+> Standing check (docs/DOCWATCH.md):
+> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json amax present -->
+> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json amax present -->
+> <!-- DOCWATCH: op-implemented aten.amax.default -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
 
 ### 7.11 Counts
 
@@ -1405,6 +1411,9 @@ than 1.288, so the excess on it is ~+0.03 rather than +1.15):
   > 2.019x**; `bf16` −2.9% and −2.7%. **All ten prefill digests unchanged**
   > (`f32` and `bf16`, at every length §1.3 records), with a new-vs-new control
   > reading 0.995–1.019 and a sabotage that moves every one of them.
+  >
+  > Standing check (docs/DOCWATCH.md):
+  > <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs transposed_contiguous present -->
 - The last row is the change this round made, and it is now **faster than
   upstream's three separate ops** for the same work.
 

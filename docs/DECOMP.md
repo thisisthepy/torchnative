@@ -26,6 +26,19 @@
   > 현재 베이스라인은 `docs/AUDIT.md` 상단을 보라. 아래 §4-§9 의 표는 원문 그대로 두고
   > 여기 한 곳에 정정을 모았다 — 표마다 따로 정정하면 이 문서가 기록하려는 "그 회차에 무엇이
   > 열렸는가" 라는 서사 자체가 흐려지기 때문이다.
+  >
+  > > **재정정 (docs/DOCWATCH.md, 2026-09):** 바로 위 정정도 같은 이유로 다시 낡았다 —
+  > > `cb6780d`/`f596426` ("Twenty-six of twenty-six", KERNELS26 라운드)가 이 정정 이후에
+  > > 착지해 커널 수를 또 옮겼다. 오늘 `decomp_sweep.py` 재실행:
+  > > `_aten_all_implemented() = 170`, `core = 98`, `non-core = 72`, 캡처 거절 22 개(그대로),
+  > > **모집단 50**(45 아님), **LOWERED 12**(11 아님). 매 라운드 손으로 다시 여는 대신, 이
+  > > 숫자는 이제 `tools/docwatch/check_docs.py` 가 산다 — `ge` 로 걸어서 다음 성장이 정정
+  > > 자체를 또 낡게 만들지 않는다:
+  > > <!-- DOCWATCH: count decomp_implemented ge 170 -->
+  > > <!-- DOCWATCH: count decomp_population ge 50 -->
+  > > <!-- DOCWATCH: count decomp_lowered ge 12 -->
+  > > <!-- DOCWATCH: op-implemented aten.baddbmm.default -->
+  > > <!-- DOCWATCH: op-implemented aten.floor_divide.default -->
 - **무엇이 막고 있었는가.** 두 가지였고 둘 다 열렸습니다 — `_jit_get_operation` 이 모든 패킷의
   오버로드를 `["default"]` 로 답하던 것(§3.1)과 `_dispatch_get_registrations_for_dispatch_key`
   가 없던 것(§3.2). 세 번째는 이 작업이 찾은 것입니다: **패스가 규칙을 기록된 kwarg 이름으로

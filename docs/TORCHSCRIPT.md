@@ -17,6 +17,9 @@ import succeeding, which the brief for this round explicitly rules out.
 > and forwards without error. (A separate, previously-unnoted gap — `aten.dropout.default` — blocks
 > the *training*-mode forward, i.e. with the model not put in `.eval()` first; that is a new,
 > unaudited finding, not a claim this document ever made, and is left for whoever picks it up.)
+>
+> Standing check (docs/DOCWATCH.md):
+> <!-- DOCWATCH: op-implemented aten.tril.default -->
 
 ---
 

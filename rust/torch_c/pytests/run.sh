@@ -104,4 +104,15 @@ PYTHONPATH="$stage" "${PYTHON:-python3}" "$crate_dir/pytests/test_shim.py" || ex
 # tools/golden/loader.py otherwise falls back to a fixed cache path that may
 # hold an entirely different build.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
-    exec "${PYTHON:-python3}" "$repo_root/tools/golden/compare.py" --self-test
+    "${PYTHON:-python3}" "$repo_root/tools/golden/compare.py" --self-test || exit $?
+
+# The documentation checker, for the same reason the golden self-test is here:
+# a gate nobody pulls is not a gate. An audit found false claims spread across
+# six of eleven load-bearing documents, and every one arrived the same way --
+# a later commit closed a gap and nobody returned to the document that had
+# named it. The markers assert only what has a single ground truth (an op in
+# `_aten_implemented()`, a key in a table, a count read from a suite's own
+# summary line), so this cannot cry wolf on prose; docs/DOCWATCH.md says what
+# it structurally cannot see.
+TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
+    exec "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py"

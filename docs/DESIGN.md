@@ -857,6 +857,11 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 > 지연 임포트 모듈입니다. `torchnative/nn/federated/__init__.py` 도 `DistributedDataFederated`
 > 임포트가 사라지고 docstring 만 남아, `import torchnative.nn.federated` 가 예외 없이 성공합니다
 > (재확인). 어느 커밋이 고쳤는지는 추적하지 않았다 — 이 문서 감사의 범위는 현재 상태 확인까지다.
+>
+> Standing check (docs/DOCWATCH.md) — path is `torchnative/src/main/torchnative/...` in this
+> tree, not the bare `torchnative/...` §9 above writes (the vendored tree's own root):
+> <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py DistributedDataFederated absent -->
+> <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/api/__init__.py "*args, *kwargs" absent -->
 
 ---
 
@@ -1123,6 +1128,10 @@ F.linear, lm_head 모양 (49152 × 576, 가중치 113 MB)
 > `lhs.contiguous()?, rhs.contiguous()?` 가 candle 이 스트라이드 실패로 거절할 때만 도는
 > 폴백으로 바뀌어 있다(재확인). LINEAR.md §6 에 이후에도 남은 벽 다섯 개(bf16/f16 가중치가
 > 여전히 호출마다 넓혀짐 등)가 이름으로 적혀 있다.
+>
+> Standing check (docs/DOCWATCH.md):
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_with_layout_fallback present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
 
 **이 결함이 다른 수치를 오염시킵니다.** `docs/QUANT2.md` 의 "27 배" 는 대부분 양자화가 아니라
 이 복사를 피한 것입니다. 전치 복사가 없는 밀집 경로와 비교하면 양자화는 이 호스트에서

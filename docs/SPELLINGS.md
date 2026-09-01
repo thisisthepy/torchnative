@@ -573,6 +573,12 @@ op가 아니다).
 **이름 자체가 상류에 없다.** `docs/ARCH20.md` §9의 분류를 바로잡는다: 이 셋은 "real gap"이
 아니라 "공개 `torch.<name>`이 없는 게 맞다" 쪽에 있어야 했다.
 
+표준 점검(docs/DOCWATCH.md):
+<!-- DOCWATCH: hasattr gelu false -->
+<!-- DOCWATCH: hasattr silu false -->
+<!-- DOCWATCH: hasattr softplus false -->
+<!-- DOCWATCH: hasattr triu true -->
+
 ### 7.2 `clamp`, `max`, `min` — 오버로드 단위로 갈랐다
 
 `max`가 세 오버로드(전체-리덕션/두-텐서/축-리덕션)를 갖고 서로 바꿔 쓸 수 없다는 지시의 경고는
@@ -764,6 +770,13 @@ distinct pair **215 → 217**(+2, §7.6). SmolLM2-135M float32 prefill **비트�
 | `max.other` 의 NaN 비대칭 (두 번째 피연산자의 NaN 이 사라짐) | **고쳐짐.** §7.3 이 실패하는 채로 박아 둔 골든 케이스가 그대로 통과한다 |
 | `min.other` / `min.dim` 커널 부재 | **구현됨.** `max` 쪽과 같은 `extremum_other` / `extremum_dim` 한 함수 |
 | `clamp.Tensor` 커널 부재 | **그대로.** 손대지 않았다 |
+
+표준 점검(docs/DOCWATCH.md), 위 표의 세 항목:
+<!-- DOCWATCH: op-implemented aten.max.other -->
+<!-- DOCWATCH: op-implemented aten.min.other -->
+<!-- DOCWATCH: op-implemented aten.min.dim -->
+<!-- DOCWATCH: op-not-implemented aten.clamp.Tensor -->
+<!-- DOCWATCH: op-implemented aten.clamp.default -->
 
 §7.2 가 `min.other`/`min.dim` 를 커널 없이 두 표에 넣어 "정확한 이름으로 거부하게" 한 판단은
 의도한 대로 작동했다 — 다음 담당자가 `torch.min(x, dim=0)` 의 거부 메시지에서 정확히 그 두 키를

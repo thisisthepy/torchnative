@@ -415,6 +415,12 @@ Golden cases by key: `aten.ge.Tensor` 31 (new), `aten.index_put_.default` 11 -> 
 `aten.fill_.Tensor` 13 -> 15. Of the new cases, 21 go through a tensor **member** rather than
 through `_aten_dispatch`.
 
+Standing check (docs/DOCWATCH.md) on the "after" column's still-current, non-round-scoped facts —
+not the round's own gate counts above, which are a historical snapshot per the house style
+docs/AUDIT.md confirms elsewhere:
+<!-- DOCWATCH: op-implemented aten.ge.Tensor -->
+<!-- DOCWATCH: op-implemented aten.index_put_.default -->
+
 Sabotage totals, all measured by injecting the fault, rebuilding, and counting — never by reading
 a green run as proof:
 
