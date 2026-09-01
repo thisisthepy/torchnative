@@ -1136,3 +1136,335 @@ $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 
 The scratch harnesses for §12–§16 live under `/tmp/rules/` and are reproduced nowhere else; every
 number they produce is quoted above with the command that made it.
+
+---
+
+## 18. Two rules for `.train()`, and the oracle §15.1 said was missing
+
+`docs/ADAPT.md` §14 is what these open — `gpt2` and `bert` taking a Tent step **in `.train()`**, which
+is the ordinary case for test-time adaptation and was refused until now. 60 rules, not 58.
+
+### 18.1 The wall, asked rather than assumed
+
+The same check §12.1 used, on the same checkpoints, with `.train()` instead of `.eval()`:
+
+| | nodes | on a gradient path | missing rules |
+|---|---:|---:|---|
+| `gpt2` `.eval()` | 492 | 460 | — (§12 closed them) |
+| `gpt2` `.train()` | **661** | **568** | `aten.native_dropout.default` ×36, `aten._safe_softmax.default` ×12 |
+
+**Training mode is 169 more nodes and two more rules, and the second one is not about dropout at
+all.** `_safe_softmax` ×12 — one per layer — arrives because a non-zero `dropout_p` takes SDPA off
+the fused kernel and onto the math backend, which is a different op sequence (`docs/TRAIN.md` §4).
+So the two rules are one requirement: there is no way to have attention dropout without the softmax
+it sits behind, and a round that landed only `native_dropout` would have moved the wall by one op.
+
+Both ops already had kernels (`docs/TRAIN.md` §3 and §4 landed them). What was missing was only the
+derivative, which is why this round adds no ops: `ops=168` is unchanged.
+
+### 18.2 `native_dropout`: the mask is the point, and the scalar is not narrowed
+
+```text
+  grad_input = (g * mask) * scale        scale = !train ? 1 : (p == 1 ? 0 : 1/(1-p))
+```
+
+**The mask is read off the forward's second result, and here that is not an optimisation.** `mean`
+and `rstd` (§12.2) and `total_weight` (`docs/LOSS.md` §3.1) could all be recomputed at a price; a
+dropout mask cannot be recomputed at any price, because no function of the input says which elements
+were dropped. A rule that did not read it would have to draw again, and would then be the gradient of
+a different function than the forward computed. §19's **D2** is that fault.
+
+Three details are upstream's and two are invisible in `float32`:
+
+* **The association is `(g * mask) * scale`, not `g * (mask * scale)`.** Upstream has both, for two
+  callers: `native_dropout_backward` and `infinitely_differentiable_native_dropout_backward`, the
+  second taken only when `GradMode` is on (`create_graph=True`). Measured on 2.13.0 they are
+  *different numbers* at `bfloat16` and `float16` and identical at `float32`/`float64` — at
+  `p = 0.7`, `g = 7.0`: **23.375** against **23.328125**. A plain `loss.backward()` takes the first,
+  so this rule does. §19's **D3**.
+* **The scalar is not narrowed to the tensor's dtype**, because `mul.Scalar` follows upstream's
+  un-narrowed `original_scalar_value<opmath_t>` since `docs/SCALAR.md`. This is the **opposite** of
+  what the forward does — `native_dropout`'s own kernel narrows before it multiplies (`aten.rs`,
+  1280 combinations) — so the two halves of one op answer the question differently and neither is a
+  guess.
+* **Both guards on the scale are real.** Without the `p == 1` guard the reciprocal is `inf` and every
+  dropped element's gradient is `0 * inf = nan`; without the `train` guard an eval-mode dropout's
+  gradient is scaled by `1/(1-p)` against an unscaled forward. Neither is reachable from a case at an
+  ordinary `p`, and both were green until they had their own arms — §19's **D4** and **D5**.
+
+### 18.3 `_safe_softmax`: the safety is in the forward, and the backward inherits it
+
+The expression is `_softmax`'s, `(g − rowsum(g·p))·p`. It is a **separate arm** anyway, because the
+third argument is `dtype` and not `half_to_float`, and the vendored tree binds arguments by name
+before dispatching (`docs/CAPTURE.md` §2) — a rule reading `half_to_float` would find nothing there.
+
+**What upstream does on a fully-masked row is the finding, and it was checked rather than assumed.**
+On a row that is entirely `-inf`:
+
+```text
+  _softmax        forward  nan      backward  nan
+  _safe_softmax   forward  0        backward  0        (SafeSoftmaxBackward0)
+```
+
+and upstream's `0` is **not a special case in its backward**. It is `(g − 0)·0`: the forward already
+wrote zeros there, so the backward's arithmetic gives zero without knowing why. That is only true of
+a rule that *reads* `outs[0]`. This tape is explicitly allowed to recompute — it runs outside a
+capture region and `sdpa_backward` two functions away does exactly that — and a `_safe_softmax` rule
+that recomputed would exponentiate `-inf − (-inf)` and answer `nan` on precisely the rows the op
+exists for, while agreeing everywhere the `float64` oracle can look. §19's **V2**.
+
+**The case that catches it took two tries, and the first one is the more useful half.** Written with
+`masked_fill(x, mask, -inf)` the fault passed: `masked_fill`'s own rule is `masked_fill(g, mask, 0)`,
+so it *replaces the `nan` with zero* on exactly the entries the test reads. Written with
+`add.Tensor(x, bias)` and a `-inf` bias it fails — and the additive spelling is also the one the
+model uses, since `bootstrap.py`'s math backend is `attn = add.Tensor(attn, attn_mask)`. A test that
+checks a `nan` has to be built so the `nan` can get out.
+
+### 18.4 The gradient cases, and the seed that all fifty-nine now share
+
+| case | worst \|tape − fd\| / scale | bound |
+|---|---|---|
+| `aten.native_dropout.default` | **1.123e-10** | 1e-5 |
+| `aten._safe_softmax.default` | **3.822e-09** | 1e-5 |
+
+* **`native_dropout` is the first case here whose forward is stochastic**, and the tape's backward
+  **replays** the forward rather than keeping the capture's intermediates. So three different masks
+  were in play — the capture's, the replay's, and a fresh one per finite difference — and the
+  comparison would have failed for a correct rule. `_tape_gradient` and `_tape_central_differences`
+  now seed before **every** forward, for all fifty-nine cases, so the next random rule inherits it.
+  §18.5 is what that seeding is hiding, said out loud.
+* `p = 0.5` on twelve elements leaves **7 survivors and 5 casualties**, checked. A `p` near zero
+  gives an all-ones mask, and against an all-ones mask a rule that ignored the mask is exactly right.
+* **`_safe_softmax`'s case is rank 3 on `dim = 1`, not the trailing axis.** `_softmax`'s existing case
+  is on `-1`, so neither of them could tell the rule's `dim` from a hardcoded `-1`; this one can.
+  §19's **V1**.
+
+### 18.5 The tape replays, so a dropout gradient is a *second* draw — measured
+
+`trace.backward()` calls `PyCaptureTrace::run`. `native_dropout` consumes the generator and is
+deliberately **not** on `capture.rs`'s `RANDOM` list — it was added so that a `.train()` forward could
+be captured at all (`docs/CAPTURE.md` §9). The consequence: a `torchnative.adapt` step computes the
+gradient of the objective it reports **at a different sample of the noise**.
+
+It is not a small term. One Tent gradient on `gpt2` in `.train()`, 50 tensors / 38,400 elements,
+against upstream's `loss.backward()`:
+
+| | rel L2 median | worst | sign agreement |
+|---|---|---|---|
+| replay put back on the capture's draw | **9.593e-03** | 1.151e-01 | 0.997214 |
+| replay left to draw again | 8.731e-01 | 4.197e+00 | 0.685312 |
+| *(the same model in `.eval()`, as the control)* | 8.331e-03 | 1.731e-02 | 0.997786 |
+
+**Two orders of magnitude, and the derivative rule is not what it is about**: with the draw held the
+`.train()` gradient agrees with upstream as well as the `.eval()` one does, on a path with 169 more
+nodes and twenty ops of recomputed attention in it. `test_the_tape_replays_a_dropout_forward_and_
+therefore_redraws_its_mask` pins the property so it cannot go quiet.
+
+### 18.6 The oracle §15.1 asked for, and L5 is caught
+
+§15.1 named a hole rather than a property: **L5** — the layer-norm rule recomputing its statistics
+instead of reading the two the forward returns — is *exactly* a no-op at matched dtypes and moves 22
+of 24 `grad_input` elements at mixed precision, so no `float32` or `float64` case could ever catch
+it. It said what would close it: *"an oracle for mixed-precision values, and `pytests/test_shim.py`
+has none"*.
+
+It has one, and **not the two-interpreter shape §15.1 guessed at**: upstream `torch` is importable
+**in this process** — `_E2EBackend` has been comparing against it that way since `docs/E2E.md`, and
+§15.1 read §7.1's "no upstream in the process" as a fact about the file when it is a fact about the
+*tape section* of the file. The comparison costs no subprocess.
+
+`bfloat16` input, `float32` weight and bias, a **linear** objective so the gradient arriving at the op
+is `gout` exactly on both sides:
+
+| | elements | differing from upstream, bit for bit | worst \|d\| |
+|---|---:|---:|---|
+| `grad_input` | 24 | **0** | 0.0 |
+| `grad_input`, **with L5 applied** | 24 | **24** | 0.0029 |
+
+**L5 now fails, at 24 of 24.** The assertion is bit-for-bit rather than a tolerance and the reason
+bounds what it can see: the rule's last step narrows to the input's dtype, so any `float32`
+disagreement below `bfloat16`'s eight significand bits is rounded away first. It is a strong
+assertion for a weak reason, and a fault moving `grad_input` by less than half a `bfloat16` ulp is
+still invisible. L5 moves it by 6.25 in §15.1's units.
+
+### 18.7 The oracle immediately found a second thing, and it is upstream's
+
+`grad_weight` and `grad_bias` are **not** upstream's at mixed precision, and the shim's are the exact
+ones. One column of six `bfloat16` gradients, `sum(dY)`:
+
+```text
+  exact sum, float64              1.141357421875
+  this rule (float32 interior)    1.141357421875     equal at every digit
+  upstream, bfloat16 in / f32 params   1.13671875
+  upstream, float32 in / f32 params    1.141357421875     equal again
+  upstream, all bfloat16                1.140625          one rounding
+```
+
+`1.13671875` is **not on the `bfloat16` grid**, so it is not "the exact sum rounded once", and it is
+not the all-`bfloat16` kernel's answer either. It is a third accumulation taken only on the mixed
+path. It is a function of `dY` alone (checked against three different inputs), so it is arithmetic
+and not a leak from the input. A `bfloat16` `sum`, a sequential `bfloat16` accumulation and a
+pairwise one were all tried and none reproduces it.
+
+Relative to upstream the gap is **3.099e-03** on `grad_weight` and **1.797e-03** on `grad_bias`,
+against `bfloat16`'s eps of 7.8e-03. It is recorded and bounded rather than chased into upstream's
+kernel: `test_mixed_precision_layer_norm_dgamma_is_not_upstreams_and_the_gap_is_upstreams` asserts
+the gap stays under one eps **and stays non-zero**, so the day somebody makes the two agree the test
+says which measurement has to be retaken.
+
+**This is §13.2's story with the sides swapped**, and it is not being treated as settled by that:
+there the shim's `float32`-accumulating matmul was the more accurate composition and was *replaced*
+by upstream's rounding, on the reasoning that "arguably more accurate and not upstream's" is still
+not upstream. The same reasoning applies here and the same change is not made, for one reason and it
+is stated so it can be argued with: **§13.2's replacement was a composition swap that made the
+gradient bit-identical, and no spelling reproduces this one** — so the choice here is between a
+measured 3e-03 gap and an unmeasured guess at upstream's accumulation order. That is a real item,
+not a closed one, and it belongs to whoever owns `native_layer_norm` next.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
+<!-- DOCWATCH: op-implemented aten.native_dropout.default -->
+<!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
+
+---
+
+## 19. Sabotage: 13 faults, and this time L5 has something to fail on
+
+Each applied to the source, **rebuilt**, and run through the ten `_C`-level checks plus the four
+adaptation-road tests that go through the vendored tree.
+
+| # | fault | caught by |
+|---|---|---|
+| D1 | dropout: the scale is `1 - p` rather than `1 / (1 - p)` | ✅ fd (0.750) **and** upstream, 14 of 24 elements |
+| D2 | dropout: **the mask ignored** — `g * scale` | ✅ fd (0.048), upstream 10 of 24, and the replay test |
+| D3 | dropout: `g * (mask * scale)` — upstream's *other* spelling | ✅ **`bfloat16` only**, 1 of 24 elements |
+| D4 | dropout: the `p == 1` guard dropped | ✅ the whole gradient is `nan` |
+| D5 | dropout: `train=False` ignored, so the scale is still `1/(1-p)` | ✅ every element off by 2× |
+| V1 | safe softmax: the axis hardcoded to `-1` rather than read off `dim` | ✅ fd, worst 0.459 |
+| V2 | safe softmax: the softmax **recomputed** instead of read off the forward | ✅ `nan` on the fully-masked row |
+| V3 | safe softmax: the subtraction's operands swapped — a sign flip | ✅ fd (0.082) and the masked-row case |
+| L5 | layer norm: `mean`/`rstd` recomputed — §15.1's uncatchable one | ✅ **24 of 24 at mixed precision** |
+| T1 | `Tensor.type()` answers the dtype rather than the legacy name | ✅ |
+| T2 | `Tensor.type(dtype)` always copies, losing `x.type(x.dtype) is x` | ✅ |
+| T3 | a bad type name raises `TypeError` where upstream raises `ValueError` | ✅ |
+| T4 | a type *object* read by `__name__`, which drops the module `tp_name` carries | ✅ |
+
+**Thirteen of thirteen**, and three of them are worth the space:
+
+* **D3 is caught by one dtype and one element.** `float32` and `float64` cannot see it at all, which
+  is why the case runs at both — the `float32` arm is the control that says the disagreement is about
+  precision and not about the formula. This is `docs/TRAIN.md` §5's S4 met from the other side.
+* **D4 and D5 could not fail on the first run**, and neither was a defect in the rule: the case ran at
+  an ordinary `p` with `train=True`, so neither guard was on the road at all.
+  `test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two` is the two arms, and it is the
+  fifth time in this file that a guard added *because upstream has it* turned out to have no case.
+* **V2 passed against the first version of its own test** (§18.3), which is the failure this
+  repository keeps meeting: a test whose oracle is downstream of something that erases the symptom.
+
+`test_the_tape_has_a_gradient_case_for_every_rule_it_claims` keeps the rule table and the case table
+equal, so neither new rule could have landed without a case.
+
+---
+
+## 20. Gates
+
+| gate | §16 | now |
+|---|---|---|
+| `pytests/run.sh` | 317 ok, 0 FAIL | **325 ok, 0 FAIL** |
+| `run.sh` DOCWATCH | 190/190 | **210/210** |
+| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
+| `compare.py --self-test` | 20 comparators × 11 fault modes | **unchanged** |
+| `verify_schemas.py` | 4479/4479 | **4479/4479** |
+| sweep26 (`.eval()`) | 26/26 | **26/26** |
+| sweeptrain (`.train()`) | 26/26 | **26/26** |
+| tape rules | 58 | **60** |
+
+`ops=168` is unchanged **and that is the claim of this round**: `native_dropout` and `_safe_softmax`
+have had kernels since `docs/TRAIN.md`, so two whole architectures' worth of `.train()` adaptation
+was one derivative apiece and no new arithmetic.
+
+### 20.1 SmolLM2 did not move
+
+Neither op is on SmolLM2's path — its config has no dropout — so §13.3's numbers must be unchanged to
+every digit, and they are: median relative L2 `8.780e-05`, worst `3.031e-04` at
+`model.layers.24.input_layernorm.weight`, sign agreement `134513262/134515008 = 0.999987`. The
+`float64` finite-difference bounds for the other 58 rules are unchanged too, including under the new
+per-forward seeding, which is the check that the seeding is a no-op where nothing draws.
+
+### 20.2 The forward did not move
+
+`docs/SEQLEN.md` §1.3's prefill logits sha256, re-measured on the final artefact. All nine equal
+§16.1's.
+
+| S | f32 | | bf16 | |
+|---:|---|:--:|---|:--:|
+| 6 | `b9fc5553ee1bf6a2…` | ✅ | `8ef1550ea33c4f3d…` | ✅ |
+| 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
+| 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
+| 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
+| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+
+### 20.3 The eight new tests
+
+```
+test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask
+test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two
+test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask
+test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan
+test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit
+test_mixed_precision_layer_norm_dgamma_is_not_upstreams_and_the_gap_is_upstreams
+test_tent_in_training_mode_adapts_and_the_dropout_is_really_on
+test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class
+```
+
+Nothing was deleted. `test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for` stays beside the
+new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert its *values*, and
+§15.2's L6 is caught by the first and not by the second.
+
+<!-- DOCWATCH: count smoke_ok ge 325 -->
+<!-- DOCWATCH: count golden_ops_covered ge 168 -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
+
+---
+
+## 21. Every command in §18–§20
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-trainrules
+export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
+export HF_HOME=/Volumes/macMini/caches/hf-home
+bash vendor/install_shim.sh
+PY=/Volumes/macMini/caches/spike-venv/bin/python
+SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"
+
+# §18.1  the .train() sizing, before any rule was written
+$SHIM /tmp/trrules/wall_train.py gpt2
+
+# §18.2/§18.3  what upstream's two derivatives are, and what it does on a masked row
+$PY /tmp/trrules/nd_up.py   ;  $PY /tmp/trrules/ss_up.py  ;  $PY /tmp/trrules/ss_up2.py
+
+# §18.5  one Tent gradient on gpt2, with and without the replay reseeded
+$PY   /tmp/trrules/tr_up.py gpt2 1e-3 10
+$SHIM /tmp/trrules/grad1.py gpt2            # reseeded
+$SHIM /tmp/trrules/grad1.py gpt2 noreseed
+TRMODE=eval $PY   /tmp/trrules/tr_up.py gpt2 1e-3 10     # the .eval() control
+TRMODE=eval $SHIM /tmp/trrules/grad1.py gpt2
+
+# §18.7  what upstream's mixed-precision dgamma/dbeta actually are
+$PY /tmp/trrules/mp_gw.py ; $PY /tmp/trrules/mp_gw3.py ; $PY /tmp/trrules/mp_gw5.py
+
+# §19  sabotage: 13 faults, each rebuilt
+$PY /tmp/trrules/sab.py                  # or /tmp/trrules/sab.py L5 V2 for one
+
+# §20  gates
+PYTHON=$PY sh rust/torch_c/pytests/run.sh
+$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
+$PY rust/torch_c/pytests/verify_schemas.py
+$SHIM /tmp/k26/sweep26.py /tmp/trrules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/trrules/tr
+$SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
+$SHIM /tmp/tape/smol_shim2.py sdpa 8 sdpa8
+```

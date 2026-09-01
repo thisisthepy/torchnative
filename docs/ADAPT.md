@@ -909,3 +909,177 @@ one rather than filed beside §9's S12 as "correctly uncatchable".
 The two refusals §8.1 and §8.3 recorded are both gone, and **neither test that pinned them was
 deleted** — `docs/BACKWARD.md` §16.2 says what replaced them and why deleting would have been the
 weaker move.
+
+---
+
+## 14. `.train()` adapts, and `.eval()` was the exotic case all along
+
+§13 landed `gpt2` and `bert` adapting. Both were in **`.eval()`**, and that is the wrong default for
+what this project is for: a model being adapted at test time has whatever mode it was shipped in, and
+dropout being active is the ordinary case, not the exotic one. Asked for a Tent step on a `gpt2` in
+`.train()`, the API refused, verbatim:
+
+```
+torchnative.adapt: this model cannot take a stage-1 step -- 2 op(s) on the gradient path have
+no derivative rule: ['aten._safe_softmax.default', 'aten.native_dropout.default'].
+```
+
+**That refusal is the API working.** `trace.differentiable()` named both rules on the first step
+rather than failing downstream on whichever the walk reached first, which is what §1.2 built it for.
+`docs/BACKWARD.md` §18 is the two rules; this is the measurement they were for.
+
+### 14.1 The surface gap underneath, which the sweeps could not see
+
+`TensorBase.type` did not exist. `gpt2`'s **eager** attention is
+`attn_weights = attn_weights.type(value.dtype)` (`modeling_gpt2.py:66`), so
+`attn_implementation="eager"` stopped there — and the default is `sdpa`, which is why every sweep in
+this repository was green over it.
+
+Upstream's `THPVariable_type` is **three behaviours in one name**, and the one an implementer written
+for the caller above would have missed is the one with no argument. All measured on 2.13.0:
+
+```text
+  x.type()                       'torch.FloatTensor'   -- a STRING, not a dtype
+  x.type(torch.float64)          a cast, and `x.type(x.dtype) is x` is True
+  x.type('torch.DoubleTensor')   the same cast, by legacy NAME
+  x.type(torch.DoubleTensor)     the same cast, by legacy CLASS (tp_name)
+  x.type(3)                      TypeError: dtype must be a type, str, or dtype object
+  x.type('torch.Nonsense')       ValueError: invalid type: 'torch.Nonsense'
+```
+
+All six are reproduced, the cast goes through the same `_to_copy` `.to` uses so it inherits the
+identity rule, and the name table is `_LEGACY_TENSOR_DTYPES` — the same object
+`_install_legacy_tensor_types` builds `torch.FloatTensor` and its nine siblings from, rather than a
+copy. Those ten cover every dtype this build can *hold*; a legacy name upstream accepts and candle
+has no storage for (`torch.ComplexFloatTensor`) is a `NotImplementedError` naming it and **not** a
+`ValueError`, because the name is valid upstream and saying otherwise would be a lie about upstream.
+
+`docs/BACKWARD.md` §19's T1–T4 are the four faults.
+
+### 14.2 `gpt2` in `.train()`: entropy falls 35%, and upstream's curve is not monotone either
+
+Real weights, `float32`, `.train()`, `lr = 1e-3`, ten steps, the same sentence and probe §13.2 uses.
+Both sides seeded per step so the dropout masks are the same draw.
+
+| step | shim | upstream | \|d\| |
+|---:|---|---|---|
+| 0 | **5.13352013** | 5.13314295 | 3.77e-04 |
+| 1 | 4.26144505 | 4.26838875 | 6.94e-03 |
+| 2 | 4.45781279 | 4.47982454 | 2.20e-02 |
+| 3 | 4.51429939 | 4.55722046 | 4.29e-02 |
+| 4 | 4.57245064 | 4.61346865 | 4.10e-02 |
+| 5 | 3.95523739 | 3.98662090 | 3.14e-02 |
+| 6 | 3.61272287 | 3.62454319 | 1.18e-02 |
+| 7 | 3.53803992 | 3.58537865 | 4.73e-02 |
+| 8 | 3.33473682 | 3.34286022 | 8.12e-03 |
+| 9 | 3.68768358 | 3.72120118 | 3.35e-02 |
+| after the last step | **3.31516528** | 3.31154037 | 3.62e-03 |
+
+**A 35% fall, and the held-out probe falls with it: `4.85157681 → 2.97959280`, 39%**, against
+upstream's `4.85127687 → 3.05861807`. Ten steps in **2.9 s**. The wrong-sign control takes entropy
+**up**, as in §13.
+
+**Neither curve is monotone**, and §13's "monotone falling" assertion is therefore the wrong one to
+carry over. Each step draws a new mask, so the objective is a different sample every time — upstream
+goes 5.133, 4.268, 4.480, 4.557, 4.613, … on its own autograd. Step 0 agrees with upstream to
+**3.77e-04**, which is §13.2's `.eval()` agreement (3.56e-04) to the digit, so the *forward* is as
+right as it was.
+
+`bert-base-uncased` in `.train()`, `lr = 5e-2`, ten steps: `1.29040861 → 1.25937676`, with a
+minimum of `1.15213215` at step 8, against upstream's `1.29040861 → 1.25837564` and its own minimum
+of `1.16028905` at the same step. **Step 0 is bit-identical** (`|d| = 0.00e+00`), for §13.3's reason
+— a 4-column row has no cancellation to speak of — and the sample-path shape is upstream's too: the
+end of a ten-step run in `.train()` is one draw and not a trend, which is why §14.5's road test
+asserts the fall and the wrong sign's rise rather than monotonicity.
+
+### 14.3 The delta is *not* §13's, and the reason is the tape and not the rules
+
+| after ten steps, 50 tensors / 38,400 numbers | `gpt2` `.eval()` (§13.2) | `gpt2` `.train()` |
+|---|---|---|
+| adapted weights, rel L2 median | 4.236e-05 | 1.341e-03 |
+| adapted weights, sign agreement | 1.000000 | 0.998958 |
+| **the delta itself, rel L2 median** | 8.527e-03 | **3.823e-01** |
+| the delta, sign agreement | 0.997396 | 0.839948 |
+| `revert()` bit-identical | yes, 50/50 | yes, 50/50 |
+
+A delta that disagrees with upstream's by 38% is worth explaining rather than filing. **It is not the
+two new rules.** `trace.backward()` **replays** the forward, and `native_dropout` consumes the
+generator, so `adapt.step()` computes the gradient of the objective it reports *at a different sample
+of the noise*. One Tent gradient on the same model, against upstream's, with and without the replay
+put back on the capture's draw:
+
+| | rel L2 median | sign agreement |
+|---|---|---|
+| replay reseeded to the capture's draw | **9.593e-03** | 0.997214 |
+| replay left to draw again (what `step()` does today) | 8.731e-01 | 0.685312 |
+| the same model in `.eval()`, as the control | 8.331e-03 | 0.997786 |
+
+**Held on one draw, the `.train()` gradient agrees with upstream as well as the `.eval()` one does**
+— on a path with 169 more nodes and twenty ops of recomputed attention in it. The 38% is the redraw,
+and it is two orders of magnitude larger than everything else on the road.
+
+It is recorded here and **not fixed**, because the fix is a decision about what a capture is rather
+than a defect in a rule: either the trace saves its draws (which is a change to `capture.rs`'s
+single-assignment story, `docs/CAPTURE.md` §9) or `step()` reseeds the global generator around its
+own backward (which is a library silently reaching into a caller's RNG). Both are arguable and
+neither is this round's to take. What *is* here is the property pinned by a test
+(`test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`) and the number, so the
+next reader is choosing rather than discovering.
+
+*Descent is unaffected in the sense that matters — Tent's objective is an expectation over draws and
+both curves fall — but "the gradient of the number `step()` returned" is not what `step()` returns
+today, and those are different claims.*
+
+### 14.4 What §8's wall table looks like now
+
+| §8 | §13.5 | now |
+|---|---|---|
+| 8.1 `nn.LayerNorm` models | **adapts** (`.eval()`) | **adapts in `.train()` too** — §14.2 |
+| 8.2 `use_cache=False` | `torch.diff` has no overload entry | unchanged |
+| 8.3 a delta cannot be written down | closed | unchanged |
+| 8.4 `Tensor.backward()` | refuses | unchanged |
+| `BertForMaskedLM` cannot load | one meta kernel, `constant_pad_nd` | unchanged |
+| — | — | **new:** an adaptation step's gradient is a *second* dropout draw (§14.3) |
+
+### 14.5 Gates, and what §9's sabotage table gains
+
+| gate | §13.7 | now |
+|---|---|---|
+| `pytests/run.sh` | 317 ok | **325 ok, 0 FAIL** |
+| `run.sh` DOCWATCH | 190/190 | **210/210** |
+| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **unchanged** |
+| `compare.py --self-test` | 20 × 11 | **unchanged** |
+| `verify_schemas.py` | 4479/4479 | **4479/4479** |
+| sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
+| prefill sha256, f32 × 5 and bf16 × 4 | 9/9 | **9/9 unchanged** |
+| tape rules | 58 | **60** |
+
+§9's thirteen `torchnative/`-side faults are unchanged. The rules and the surface this round touched
+have thirteen of their own in `docs/BACKWARD.md` §19, **all thirteen caught** — including §13.7's
+open item, L5, which had no oracle then and has one now (`docs/BACKWARD.md` §18.6). The hole that
+section named is closed; the oracle that closed it immediately found a second one, in
+`grad_weight`/`grad_bias` at mixed precision, and that is named in §18.7 rather than fixed.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
+<!-- DOCWATCH: count smoke_ok ge 325 -->
+
+### 14.6 Every command in §14
+
+```sh
+# the .train() sizing, before any rule was written
+$SHIM /tmp/trrules/wall_train.py gpt2
+
+# upstream writes, the shim loads and compares -- .train()
+$PY   /tmp/trrules/tr_up.py   gpt2 1e-3 10  ;  $SHIM /tmp/trrules/tr_shim.py gpt2 1e-3 10
+$PY   /tmp/trrules/tr_up.py   bert 5e-2 10  ;  $SHIM /tmp/trrules/tr_shim.py bert 5e-2 10
+$SHIM /tmp/trrules/tr_shim.py gpt2 1e-3 10 anti          # the wrong-sign control
+
+# §14.3  one gradient, with and without the replay reseeded, and the .eval() control
+$SHIM /tmp/trrules/grad1.py gpt2  ;  $SHIM /tmp/trrules/grad1.py gpt2 noreseed
+TRMODE=eval $PY /tmp/trrules/tr_up.py gpt2 1e-3 10 ; TRMODE=eval $SHIM /tmp/trrules/grad1.py gpt2
+
+# §14.1  Tensor.type, all three forms and both failure shapes
+$PY /tmp/trrules/type_up.py ; $PY /tmp/trrules/type_up2.py ; $SHIM /tmp/trrules/type_shim.py
+```

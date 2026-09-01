@@ -3467,6 +3467,131 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     setattr(tensorbase, "to", to)
     setattr(tensorbase, "type_as", lambda self, other: _to_copy(self, dtype=other.dtype))
 
+    # `Tensor.type` -- **three behaviours in one name**, and the one nobody
+    # expects is the one with no argument.
+    #
+    # `THPVariable_type` in `torch/csrc/autograd/python_variable_methods.cpp`
+    # branches on what it was handed, and all three were measured on 2.13.0
+    # rather than read:
+    #
+    #     x.type()                    'torch.FloatTensor'   -- a *string*
+    #     x.type(torch.float64)       a cast, `.to(dtype)`
+    #     x.type('torch.DoubleTensor')the same cast, by legacy NAME
+    #     x.type(torch.DoubleTensor)  the same again, by legacy CLASS
+    #
+    # A shim that implemented only the cast would answer a tensor where a
+    # caller asked for a name, and `if t.type() == 'torch.cuda.FloatTensor'`
+    # is a real idiom -- so the no-argument form is not an afterthought.
+    #
+    # GPT-2's **eager** attention is what asked: `eager_attention_forward` in
+    # `transformers/models/gpt2/modeling_gpt2.py:66` is
+    # `attn_weights = attn_weights.type(value.dtype)`, the dtype form, and the
+    # whole path stopped there. (`attn_implementation="sdpa"` is the default
+    # and does not reach it, which is why this survived every sweep.)
+    #
+    # Two details are upstream's and are kept:
+    #
+    #   * **the cast is `.to`, so it keeps `.to`'s identity rule** --
+    #     `x.type(torch.float32) is x` is `True` upstream for a float32 `x`,
+    #     measured, and `_to_copy` above already answers that way. That is why
+    #     this routes through `_to_copy` rather than dispatching directly.
+    #   * **a bad argument and a bad name raise different exceptions**:
+    #     `x.type(3)` is a `TypeError("dtype must be a type, str, or dtype
+    #     object")` and `x.type('torch.Nonsense')` is a
+    #     `ValueError("invalid type: 'torch.Nonsense'")`. Both measured.
+    #
+    # The name table is `_LEGACY_TENSOR_DTYPES`, the same one
+    # `_install_legacy_tensor_types` builds `torch.FloatTensor` and its nine
+    # siblings from. Deliberately the same object and not a copy: a second
+    # list of dtype spellings is the failure docs/AUDIT.md found six times.
+    # It covers every dtype this build can *hold* -- `uint16`, `complex64` and
+    # the rest have no candle storage, so no tensor can carry them and no
+    # `x.type()` can be asked about them.
+    def _legacy_type_name(dtype):
+        for legacy, dtype_name in _LEGACY_TENSOR_DTYPES.items():
+            if getattr(module, dtype_name, None) == dtype:
+                return "torch." + legacy
+        raise NotImplementedError(
+            "not implemented in torch._C shim: TensorBase.type() has no legacy "
+            f"tensor-type name for {dtype} -- the ten this build can hold are "
+            + ", ".join("torch." + n for n in sorted(_LEGACY_TENSOR_DTYPES))
+        )
+
+    def _dtype_from_legacy_name(name):
+        """Upstream's `torch::utils::options_from_string`, narrowed to what
+        this build can express."""
+        parts = name.split(".")
+        if len(parts) < 2 or parts[0] != "torch":
+            raise ValueError(f"invalid type: '{name}'")
+        stem = parts[-1]
+        if len(parts) == 3:
+            # `torch.cuda.FloatTensor` and friends. Upstream reads the middle
+            # segment as a device and fails on the backend rather than on the
+            # name; routing it through `module.device` keeps that decision in
+            # the one place that knows which backends are linked, the same
+            # reasoning `cuda()` above is written from.
+            if parts[1] == "sparse":
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: "
+                    f"TensorBase.type('{name}') asks for the sparse layout, and "
+                    "this build has only `torch.strided`"
+                )
+            device = module.device(parts[1])
+        elif len(parts) == 2:
+            device = None
+        else:
+            raise ValueError(f"invalid type: '{name}'")
+        if stem == "Tensor":
+            return module.get_default_dtype(), device
+        if stem not in _LEGACY_TENSOR_DTYPES:
+            if stem.endswith("Tensor"):
+                # A name upstream may well accept that this build has no dtype
+                # for. Saying "invalid" would be a lie about upstream; saying
+                # "not implemented here" is the truth about this shim.
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: "
+                    f"TensorBase.type('{name}') -- the ten legacy tensor types "
+                    "this build can hold are "
+                    + ", ".join("torch." + n for n in sorted(_LEGACY_TENSOR_DTYPES))
+                )
+            raise ValueError(f"invalid type: '{name}'")
+        return getattr(module, _LEGACY_TENSOR_DTYPES[stem]), device
+
+    def type_(self, dtype=None, non_blocking=False, **kwargs):
+        # `non_blocking` is accepted and ignored for `to`'s reason: there is no
+        # async copy engine here. `memory_format` likewise -- upstream accepts
+        # it keyword-only and this shim is contiguous-only.
+        kwargs.pop("memory_format", None)
+        kwargs.pop("async", None)
+        if kwargs:
+            raise TypeError(
+                "TensorBase.type(): unexpected keyword argument(s) "
+                f"{sorted(kwargs)} in torch._C shim"
+            )
+        if dtype is None:
+            return _legacy_type_name(self.dtype)
+        if isinstance(dtype, module.dtype):
+            return _to_copy(self, dtype=dtype)
+        if isinstance(dtype, str):
+            name = dtype
+        elif isinstance(dtype, type):
+            # Upstream reads the type object's `tp_name`, which for its own
+            # C-defined `torch.DoubleTensor` is `'torch.DoubleTensor'` and for
+            # a builtin like `int` is a bare `'int'`. `__module__` reproduces
+            # that split: the legacy classes here carry `__module__ = "torch"`
+            # (`_install_legacy_tensor_types`), builtins carry `"builtins"`.
+            where = getattr(dtype, "__module__", None)
+            name = dtype.__name__ if where in (None, "builtins") else (
+                f"{where}.{dtype.__name__}")
+        else:
+            raise TypeError("dtype must be a type, str, or dtype object")
+        want, device = _dtype_from_legacy_name(name)
+        return _to_copy(self, dtype=want, device=device)
+
+    type_.__name__ = "type"
+    type_.__qualname__ = "TensorBase.type"
+    setattr(tensorbase, "type", type_)
+
     # `Tensor.expand_as` -- `zoedepth`'s wall once 2-D convolution existed
     # (docs/KERNELS26.md §7). A *name* gap, not a kernel gap: measured on
     # upstream 2.13.0, `aten::expand_as` is `CompositeImplicitAutograd`

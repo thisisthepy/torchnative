@@ -448,10 +448,78 @@ than deleted, so the file still records which refusal came down and why.
 * **Autograd.** This whole document is `.train()` inside `torch.no_grad()`, which isolates the mode
   axis. A real federated-learning or test-time-adaptation step needs a backward, and this shim has
   none. That is the next wall and it is much larger than this one.
+
+  > **Closed, in two rounds.** `docs/BACKWARD.md` built the backward — a reverse walk over a captured
+  > region rather than a `VariableType` — and its §18 landed the two derivative rules a `.train()`
+  > forward needs on top of the kernels below. `gpt2` and `bert` take a real Tent step in `.train()`
+  > against upstream's own autograd (`docs/ADAPT.md` §14). §9 is what that changed about *this*
+  > document, including one thing in it that stopped being true.
 * **`bernoulli_.Tensor`.** Declared in `methods.json`, no kernel. Nothing in the 26 asks for it.
 * **`native_dropout`.** The functionalised spelling, which `torch.compile` and the meta/fake path
   use. Eager CPU never reaches it, so it is absent rather than wrong.
+
+  > **Landed since, and eager CPU still never reaches it — a *capture* does.** §9.1.
 * **`bernoulli_` on a non-contiguous receiver** writes in logical order where upstream writes in
   physical order (§2). It follows `uniform_`/`normal_`, which have the same property; no caller in
   the 26 can reach it, because `empty_like` is always contiguous.
 * **`mul.Scalar`'s reduced-float scalar** (§5), reported and left.
+
+  > **Fixed since, in `docs/SCALAR.md`** — the note under §5 says so, and the fix is what makes
+  > §9.1's dropout *gradient* bit-identical to upstream at `bfloat16`.
+
+## 9. The backward, and the one claim above that stopped being true
+
+### 9.1 `native_dropout` is here, and §8's third bullet was right about the wrong thing
+
+The bullet said eager CPU never reaches `native_dropout`, so its absence was not a defect. **Both
+halves survived; the conclusion did not.** Eager CPU still never reaches it — `is_fused_kernel_
+acceptable` still wants CUDA/XPU/lazy — but a *capture* does, and for the reason §1 gives about the
+composite: `_dropout_impl` decomposes onto `bernoulli_` and `div_`, both of which write in place, and
+capture refuses mutation so that a trace stays single-assignment. So `.train()` was uncapturable for
+the four architectures §7 names, and `native_dropout` — upstream's own functionalised spelling, one
+node, and it hands back the mask — is what fixed it. `bootstrap.py` takes that route **only inside a
+capture region**, which is following upstream's own rewrite rather than routing around it.
+
+It is not bit-identical to the eager branch and is not claimed to be: `_dropout_impl` divides the
+*mask* by `1 - p` and `native_dropout` multiplies the *output* by a `1/(1-p)` narrowed to the
+tensor's dtype. The masks agree draw for draw; the survivors can differ by an ulp at `bfloat16` and
+`float16`. That is upstream's difference reproduced, not this shim's.
+
+### 9.2 §2's answer is what makes the gradient checkable
+
+§2 asked whether a seeded comparison against upstream can be bit-exact and answered yes, because
+`bernoulli_` draws in `float64` for **every** dtype. That paid off somewhere it was not written for.
+A dropout *backward* is stochastic, which is exactly where a test that cannot fail hides — the
+comfortable version is a distributional check that no wrong implementation fails. §2's answer means
+the gradient is comparable against upstream **draw for draw** instead:
+
+| | elements | differing from upstream, bit for bit |
+|---|---:|---:|
+| `float32`, `p = 0.5` | 24 | **0** |
+| `bfloat16`, `p = 0.7` | 24 | **0** |
+
+and the mask is asserted equal on both sides *first*, because if the two had drawn different masks
+the comparison below it would have been meaningless.
+
+`bfloat16` at `p = 0.7` is not decoration: upstream has two spellings of this derivative and they are
+different numbers there. §5's S4 was "the shim cannot tell `x * (1/(1-p)) * mask` from
+`dropout(x)` because `mul.Scalar` narrowed and upstream's did not"; `docs/SCALAR.md` fixed that, and
+the same fix is what makes `(g * mask) * scale` reach upstream's answer here rather than
+`g * (mask * scale)`'s. **The forward's S4 and the backward's are the same defect met from both
+sides, and only the second one is bit-exact today because the first was fixed in between.**
+
+### 9.3 The sweep did not move, and this time that is the whole point
+
+| gate | §6 | now |
+|---|---|---|
+| sweeptrain (`.train()`) | 26/26 | **26/26** |
+| sweep26 (`.eval()`) | 26/26 | **26/26** |
+| prefill sha256, f32 × 5 and bf16 × 4 | 9/9 | **9/9 unchanged** |
+| `tools/golden/compare.py` ops covered | 163 | 168, **unchanged by this round** |
+
+A round that gave two architectures a `.train()` backward and moved **no** forward number is the
+claim: the kernels were all here already (§3, §4), and what was missing was two derivatives.
+
+<!-- DOCWATCH: op-implemented aten.native_dropout.default -->
+<!-- DOCWATCH: op-implemented aten.bernoulli_.float -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->

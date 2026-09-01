@@ -11854,6 +11854,93 @@ def test_legacy_typed_tensor_constructors_read_a_sequence_as_data():
     ])
 
 
+def test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class():
+    """`Tensor.type` is **three** behaviours wearing one name, and the one
+    that is easy to miss is the one with no argument.
+
+    GPT-2's *eager* attention is what asked -- `eager_attention_forward`,
+    `modeling_gpt2.py:66`, `attn_weights = attn_weights.type(value.dtype)` --
+    and that is the dtype form, so an implementation written for the caller
+    that needed it would have been a cast and nothing else. Upstream's
+    `THPVariable_type` branches on what it was handed:
+
+        x.type()                     'torch.FloatTensor'  -- a STRING
+        x.type(torch.float64)        a cast
+        x.type('torch.DoubleTensor') a cast, by legacy name
+        x.type(torch.DoubleTensor)   a cast, by legacy class
+
+    All four measured on 2.13.0, along with the two failure shapes, which are
+    *different exceptions*: a non-name is a `TypeError` and a name that is not
+    a tensor type is a `ValueError`.
+
+    The name table is `_LEGACY_TENSOR_DTYPES`, shared with the constructors
+    above rather than copied -- so `torch.CharTensor` naming `int8` is one
+    fact, not two that can drift.
+    """
+    x = _arch20_tensor([1.5, -2.5])
+    # 1. no argument: the legacy type NAME, for every dtype this build holds.
+    assert x.type() == "torch.FloatTensor", x.type()
+    assert x.type(None) == "torch.FloatTensor", x.type(None)
+    for method, want in (("double", "torch.DoubleTensor"),
+                         ("half", "torch.HalfTensor"),
+                         ("bfloat16", "torch.BFloat16Tensor"),
+                         ("long", "torch.LongTensor"),
+                         ("int", "torch.IntTensor"),
+                         ("short", "torch.ShortTensor"),
+                         ("byte", "torch.ByteTensor"),
+                         ("bool", "torch.BoolTensor")):
+        assert getattr(x, method)().type() == want, (method, getattr(x, method)().type())
+
+    # 2. a dtype: a cast, and it inherits `.to`'s identity rule --
+    # `x.type(<its own dtype>) is x` is True upstream, measured.
+    assert x.type(_C.float64).dtype == _C.float64
+    assert x.type(_C.float64).tolist() == [1.5, -2.5]
+    assert x.type(_C.int64).tolist() == [1, -2]
+    assert x.type(_C.float32) is x
+    assert x.type(_C.float64) is not x
+
+    # 3. a string, and 4. a class. Both go through the same legacy name.
+    assert x.type("torch.DoubleTensor").dtype == _C.float64
+    assert x.type("torch.LongTensor").tolist() == [1, -2]
+    assert x.type("torch.FloatTensor") is x
+    assert x.type(_C.DoubleTensor).dtype == _C.float64
+    # `torch.Tensor` means the default dtype, not "leave it alone".
+    assert x.double().type("torch.Tensor").dtype == _C.get_default_dtype()
+
+    # The two failure shapes, which upstream distinguishes.
+    try:
+        x.type(3)
+    except TypeError as e:
+        assert "dtype must be a type, str, or dtype object" in str(e), str(e)
+    else:
+        raise AssertionError("x.type(3) must be a TypeError, as upstream's is")
+    for bad in ("torch.Nonsense", "float32", "FloatTensor", "torch.FloatStorage"):
+        try:
+            x.type(bad)
+        except ValueError as e:
+            assert str(e) == "invalid type: '%s'" % bad, (bad, str(e))
+        else:
+            raise AssertionError("x.type(%r) must be a ValueError" % bad)
+    # A builtin type reaches the same ValueError because upstream reads
+    # `tp_name`, which for `int` is a bare `'int'` and not `'builtins.int'`.
+    try:
+        x.type(int)
+    except ValueError as e:
+        assert str(e) == "invalid type: 'int'", str(e)
+    else:
+        raise AssertionError("x.type(int) must be a ValueError")
+
+    # A legacy name upstream accepts and this build has no dtype for is a
+    # refusal that says so, NOT `invalid type` -- the name is perfectly valid
+    # upstream and claiming otherwise would be a lie about upstream.
+    try:
+        x.type("torch.ComplexFloatTensor")
+    except NotImplementedError as e:
+        assert "ComplexFloatTensor" in str(e), str(e)
+    else:
+        raise AssertionError("complex has no candle storage; this must refuse")
+
+
 def test_a_numpy_scalar_binds_where_a_python_number_would():
     """`vits`' last wall but one (docs/KERNELS26.md §24).
 
@@ -14506,14 +14593,58 @@ def _tape_case_bodies():
     cases["aten._scaled_dot_product_flash_attention_for_cpu.default"] = shape_case(
         [1, 2, 2, 4], _sdpa)
 
+    # -- dropout -----------------------------------------------------------
+    # `native_dropout` is the one case here whose forward is **stochastic**,
+    # and `_tape_gradient`/`_tape_central_differences` seed every forward so
+    # that the capture, the tape's replay and the finite differences all see
+    # the same mask (see `_TAPE_SEED`). Given that mask the function is an
+    # ordinary piecewise-linear one and the oracle applies unchanged.
+    #
+    # `p = 0.5` on twelve elements, checked below to leave both survivors and
+    # casualties: a `p` near 0 gives an all-ones mask, and against an all-ones
+    # mask a rule that ignored the mask entirely is exactly right. The scale is
+    # `2.0` there, so a rule that dropped the scale is caught by the same case.
+    def _dropout(x):
+        out, _mask = d("aten.native_dropout.default", x, 0.5, True)
+        return s(out)
+
+    cases["aten.native_dropout.default"] = shape_case([3, 4], _dropout)
+
+    # -- safe softmax ------------------------------------------------------
+    # Rank 3 with `dim = 1`, not the trailing axis: a case on the last axis
+    # cannot tell the rule's `dim` from a hardcoded `-1`, and `_softmax`'s case
+    # above is on `-1`, so this is the axis half neither of them would have.
+    # The fully-masked row -- the whole reason this op is not `_softmax` -- has
+    # no finite-difference oracle (perturbing `-inf` is not a thing) and is
+    # `test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan`.
+    cases["aten._safe_softmax.default"] = shape_case(
+        [2, 3, 4], lambda x: s(d("aten._safe_softmax.default", x, 1)))
+
     # -- the one rule that is "no gradient" --------------------------------
     cases["aten.detach.default"] = shape_case([2, 3], lambda x: s(d("aten.detach.default", x)))
     return cases
 
 
+# Every forward below is seeded, and one op is the reason.
+#
+# `native_dropout` consumes the generator, and **the tape's backward replays
+# the forward** (`PyCaptureTrace::run`) rather than keeping the capture's
+# intermediates. So without a seed the replay draws a *different* mask than the
+# capture did, the rule reads that one, and the finite differences -- a third
+# set of draws again -- would compare three unrelated functions and the
+# comparison would fail for a correct rule. Seeding to the same value before
+# every forward makes all three the same function, which is the only shape in
+# which a stochastic kernel's derivative can be checked at all.
+#
+# It is a no-op for the other fifty-eight cases, and it is applied to all of
+# them rather than to one so the next random rule inherits it.
+_TAPE_SEED = 20260901
+
+
 def _tape_gradient(case):
     values, shape, fn = case
     x = _tape_f64(values, shape)
+    _C._shim_manual_seed(_TAPE_SEED)
     _C._capture_begin([x])
     try:
         out = fn(x)
@@ -14524,6 +14655,7 @@ def _tape_gradient(case):
         except RuntimeError:
             pass
         raise
+    _C._shim_manual_seed(_TAPE_SEED)
     return trace, trace.backward([x])["inputs"][0]
 
 
@@ -14534,8 +14666,11 @@ def _tape_central_differences(case, h=1e-6):
         up, down = list(values), list(values)
         up[i] += h
         down[i] -= h
-        out.append((fn(_tape_f64(up, shape)).tolist()
-                    - fn(_tape_f64(down, shape)).tolist()) / (2 * h))
+        _C._shim_manual_seed(_TAPE_SEED)
+        high = fn(_tape_f64(up, shape)).tolist()
+        _C._shim_manual_seed(_TAPE_SEED)
+        low = fn(_tape_f64(down, shape)).tolist()
+        out.append((high - low) / (2 * h))
     return out
 
 
@@ -14673,6 +14808,421 @@ def test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for():
     g = trace.backward([x])["inputs"][0]
     assert g.dtype == _C.bfloat16, ("grad_input widened to %s" % g.dtype)
     assert list(g.shape) == [2, 3, 4], list(g.shape)
+
+
+def _dropout_grad_pair(dtype_name, p, seed, train=True):
+    """One `native_dropout` backward, through the tape and through upstream's
+    autograd, on the **same draw**. Returns
+    `(shim_mask, shim_grad, upstream_mask, upstream_grad, gout)`."""
+    U = _upstream_torch
+    d = _C._aten_dispatch
+    xv = _tape_ramp(24, -2.5, 3.5)
+    gv = _tape_ramp(24, -1.25, 1.75)
+    dt = getattr(_C, dtype_name)
+
+    x = _C._tensor_from_flat(xv, [4, 6], dt)
+    gout = _C._tensor_from_flat(gv, [4, 6], dt)
+    _C._shim_manual_seed(seed)
+    _C._capture_begin([x])
+    try:
+        out, mask = d("aten.native_dropout.default", x, p, train)
+        trace = _C._capture_end(
+            d("aten.sum.default", d("aten.mul.Tensor", out, gout)))
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    shim_mask = _tape_flat(mask)
+    # The replay draws again, so it is put back on the capture's seed. That is
+    # `_TAPE_SEED`'s reason restated at model scale, and it is the difference
+    # between comparing one function with itself and comparing two.
+    _C._shim_manual_seed(seed)
+    shim_grad = trace.backward([x])["inputs"][0]
+
+    udt = getattr(U, dtype_name)
+    xu = U.tensor(xv, dtype=udt).reshape(4, 6).requires_grad_(True)
+    gu = U.tensor(gv, dtype=udt).reshape(4, 6)
+    U.manual_seed(seed)
+    ou, um = U.ops.aten.native_dropout(xu, p, train)
+    (ou * gu).sum().backward()
+    return shim_mask, shim_grad, _tape_flat(um), xu.grad, _tape_flat(gout)
+
+
+def test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask():
+    """A stochastic backward is where a test that cannot fail hides, so this
+    one is not statistical.
+
+    `native_dropout` returns its mask precisely so a backward can reuse it, and
+    docs/TRAIN.md §2 measured why that makes a seeded comparison available at
+    all: `bernoulli_` draws in `float64` for *every* dtype, so the shim's
+    stream and upstream's agree element for element. The mask is therefore
+    checked first -- if the two sides drew different masks the gradient
+    comparison below would be meaningless, and a "within tolerance" version of
+    this test would have quietly become a distributional one.
+
+    `bfloat16` at `p = 0.7` is not decoration. Upstream has **two** spellings
+    of this derivative and they are different numbers at reduced precision:
+
+    ```text
+      native_dropout_backward                        (g * mask) * scale
+      infinitely_differentiable_..._backward         g * (mask * scale)
+      p=0.7, bfloat16, g=7.0    ->  23.375  versus  23.328125
+    ```
+
+    A plain `loss.backward()` takes the first (`GradMode` is off unless
+    `create_graph=True`), so the rule does, and only a reduced-precision case
+    can tell. `float32` runs beside it as the control that says the disagreement
+    is about precision and not about the formula.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    for dtype_name, p in (("float32", 0.5), ("bfloat16", 0.7)):
+        sm, sg, um, ug, _ = _dropout_grad_pair(dtype_name, p, 20260901)
+        assert sm == um, (dtype_name, "the two sides drew different masks", sm, um)
+        # Both survivors and casualties, or a rule that ignored the mask
+        # entirely would be right by construction.
+        assert 0 < sum(1 for v in sm if v) < len(sm), (dtype_name, sm)
+        got, want = _tape_flat(sg), _mp_flat(ug)
+        assert sg.dtype == getattr(_C, dtype_name), sg.dtype
+        differing = [i for i, (a, b) in enumerate(zip(got, want)) if a != b]
+        assert not differing, (
+            "%s: %d of %d gradient elements differ from upstream: %s"
+            % (dtype_name, len(differing), len(got),
+               [(i, got[i], want[i]) for i in differing[:6]]))
+        # A dropped element's gradient is zero and a survivor's is not, which
+        # is what says the mask reached the answer at all.
+        for i, kept in enumerate(sm):
+            if kept:
+                assert got[i] != 0.0, (dtype_name, i)
+            else:
+                assert got[i] == 0.0, (dtype_name, i, got[i])
+
+
+def test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two():
+    """`p == 1` and `train=False` are the two arms of the scale, and neither is
+    reachable from a case at an ordinary `p`.
+
+    The scale upstream differentiates with is
+    `!train ? 1 : (p == 1 ? 0.0 : 1 / (1 - p))`, and both guards were added
+    without a case that needed them -- which is the shape of a claim nobody has
+    checked. Dropping them individually and re-running the whole tape suite
+    left it green, so they get their own arms:
+
+      * **`p == 1`** without the guard is `1 / 0 = inf`, and the mask is all
+        `False` there, so every element becomes `0 * inf = nan` -- a gradient
+        that is not merely wrong but poisons every parameter downstream of it.
+        docs/TRAIN.md §5's S3 is the same edge in the forward and was caught on
+        the sign of a zero; here it is caught on a `nan`.
+      * **`train=False`** without the guard scales an *unscaled* forward by
+        `1 / (1 - p)`, so the gradient is off by a constant factor that
+        nothing about its shape, dtype or sign gives away. The mask is all
+        `True` there, so the correct answer is the incoming gradient exactly.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    sm, sg, um, ug, _ = _dropout_grad_pair("float32", 1.0, 20260901)
+    assert not any(sm), sm
+    assert sm == um, (sm, um)
+    got, want = _tape_flat(sg), _mp_flat(ug)
+    assert all(v == v for v in got), ("p=1 produced a nan gradient: %s" % (got,))
+    assert got == [0.0] * 24, got
+    assert got == want, (got, want)
+
+    sm, sg, um, ug, gout = _dropout_grad_pair("float32", 0.5, 20260901, train=False)
+    assert all(sm), sm
+    assert sm == um, (sm, um)
+    got, want = _tape_flat(sg), _mp_flat(ug)
+    assert got == want, (got, want)
+    # `train=False` is an identity, so the gradient is the incoming one and a
+    # `1 / (1 - p)` here would double every element.
+    assert got == gout, (got, gout)
+
+
+def test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask():
+    """A property of the tape that only a random op can show, pinned because
+    it is invisible everywhere else and it is not free.
+
+    `trace.backward()` **replays** the forward (`PyCaptureTrace::run`) rather
+    than keeping the capture's intermediates, and `native_dropout` consumes the
+    generator. So the mask the rule reads is a *second* draw, and the gradient
+    a `torchnative.adapt` step takes is the gradient of the objective it
+    reports **at a different sample of the noise**. Two backwards of one trace
+    disagree; two backwards with the generator put back agree exactly.
+
+    That is measurable on a real model: one Tent gradient on `gpt2` in
+    `.train()` against upstream's is a relative L2 median of **9.593e-03** with
+    the replay reseeded and **8.731e-01** without (docs/ADAPT.md §14.3), so
+    this is the larger term by two orders of magnitude and it is not the
+    derivative rule.
+
+    `capture.rs`'s `RANDOM` list exists to keep exactly this out of a trace,
+    and `native_dropout` is deliberately not on it -- it was added *so that* a
+    `.train()` forward could be captured at all, which is what makes this a
+    property to record rather than a rule to enforce.
+    """
+    d = _C._aten_dispatch
+    x = _tape_f64(_tape_ramp(24, -2.5, 3.5), [4, 6])
+    _C._shim_manual_seed(4321)
+    _C._capture_begin([x])
+    try:
+        out, _mask = d("aten.native_dropout.default", x, 0.5, True)
+        trace = _C._capture_end(_tape_scalarise(out))
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    first = _tape_flat(trace.backward([x])["inputs"][0])
+    free = _tape_flat(trace.backward([x])["inputs"][0])
+    assert first != free, (
+        "two replays of a dropout trace produced the same mask; either the "
+        "generator stopped advancing or this op stopped drawing")
+    _C._shim_manual_seed(4321)
+    again = _tape_flat(trace.backward([x])["inputs"][0])
+    _C._shim_manual_seed(4321)
+    repeat = _tape_flat(trace.backward([x])["inputs"][0])
+    assert again == repeat, (again, repeat)
+    # ...and the reseeded replay is the capture's own draw, not a third one:
+    # every element the capture kept is non-zero here and every one it dropped
+    # is exactly zero.
+    for kept, v in zip(_tape_flat(_mask), again):
+        assert (v != 0.0) == bool(kept), (kept, v)
+
+
+def test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan():
+    """The "safe" in `_safe_softmax`, from the backward side -- and it is a
+    real shape, not a curiosity: a row of a causal mask plus padding can
+    exclude every key.
+
+    No finite-difference case can look at it. The row is `-inf` and perturbing
+    an infinity is not a thing, so the gradient case for this rule is an
+    ordinary one and this is the structural claim beside it -- the same split
+    `test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row` makes
+    for `padding_idx`.
+
+    **Upstream's answer is `0`, and it is not a special case in its backward.**
+    Measured on 2.13.0 (`SafeSoftmaxBackward0`): the rule is softmax's own
+    `(g - rowsum(g*p)) * p`, and `p` is *already* zero on that row because the
+    forward made it so, so the zero is arithmetic. That is only true of a rule
+    that reads the saved output. The tape's backward runs outside a capture
+    region and may recompute -- `sdpa_backward` next door does exactly that --
+    and a `_safe_softmax` rule that recomputed a softmax of the recorded input
+    would exponentiate `-inf - (-inf)` and answer `nan` on precisely the rows
+    this op exists for, while agreeing everywhere the float64 oracle looks.
+
+    **The `-inf` arrives by `add.Tensor`, not by `masked_fill`, and that is
+    the whole reason this test can fail.** Both spellings reach a fully-masked
+    row; only one lets its gradient out. `masked_fill`'s own rule is
+    `masked_fill(g, mask, 0)`, so a `nan` produced above it is *replaced by
+    zero* on exactly the entries this test looks at -- the recompute fault was
+    run against a `masked_fill` version of this case and it passed. The
+    `add.Tensor` spelling passes the gradient through unchanged, and it is also
+    what the model does: `bootstrap.py`'s SDPA math backend is
+    `attn = add.Tensor(attn, attn_mask)` with a `-inf` mask, which is how
+    `gpt2` reaches this op at all.
+
+    The plain `_softmax` contrast is asserted too, because "the gradient is
+    finite" only means something if the unsafe spelling's is not.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    U = _upstream_torch
+    d = _C._aten_dispatch
+    inf = float("inf")
+    base = _tape_ramp(12, -1.0, 1.5)
+    gv = _tape_ramp(12, -1.25, 1.75)
+    # Row 0 ordinary, row 1 partially masked, row 2 **entirely** masked --
+    # the additive mask `transformers` builds, 0 where a key is kept.
+    bias = [0.0, 0.0, 0.0, 0.0,
+            0.0, -inf, 0.0, -inf,
+            -inf, -inf, -inf, -inf]
+    biast = _tape_f64(bias, [3, 4])
+    x = _tape_f64(base, [3, 4])
+    gout = _tape_f64(gv, [3, 4])
+
+    _C._capture_begin([x])
+    try:
+        scores = d("aten.add.Tensor", x, biast)
+        probs = d("aten._safe_softmax.default", scores, -1)
+        trace = _C._capture_end(
+            d("aten.sum.default", d("aten.mul.Tensor", probs, gout)))
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    assert _tape_flat(probs)[8:] == [0.0, 0.0, 0.0, 0.0], _tape_flat(probs)
+    g = _tape_flat(trace.backward([x])["inputs"][0])
+    assert all(v == v for v in g), ("a nan reached the gradient: %s" % (g,))
+    assert g[8:] == [0.0, 0.0, 0.0, 0.0], g[8:]
+    assert any(v != 0.0 for v in g[:4]), g[:4]
+
+    xu = U.tensor(base, dtype=U.float64).reshape(3, 4).requires_grad_(True)
+    bu = U.tensor(bias, dtype=U.float64).reshape(3, 4)
+    gu = U.tensor(gv, dtype=U.float64).reshape(3, 4)
+    (U.ops.aten._safe_softmax(xu + bu, -1) * gu).sum().backward()
+    want = _mp_flat(xu.grad)
+    worst = max(abs(a - b) for a, b in zip(g, want))
+    assert worst < 1e-12, (worst, g, want)
+
+    # ...and the unsafe spelling really does answer `nan` there, on both sides,
+    # so the assertion above is about `_safe_softmax` and not about the row.
+    unsafe = _tape_flat(d("aten._softmax.default",
+                          d("aten.add.Tensor", x, biast), -1, False))
+    assert all(v != v for v in unsafe[8:]), unsafe[8:]
+    uu = U.ops.aten._softmax(xu.detach() + bu, -1, False)
+    assert all(v != v for v in _mp_flat(uu)[8:]), _mp_flat(uu)
+
+
+# --- the mixed-precision oracle this file did not have ----------------------
+#
+# docs/BACKWARD.md §15.1 named a hole rather than a property: **L5** -- the
+# layer-norm rule recomputing its statistics instead of reading the two the
+# forward returns -- is *exactly* a no-op at matched dtypes (0 of 32 elements
+# differ, bit for bit) and moves 22 of 24 `grad_input` elements at mixed
+# precision. So no `float32` or `float64` case can ever catch it, and the
+# `float64` finite-difference oracle §5 is built on is structurally blind to
+# it. §15.1 said what would close it: "an oracle for mixed-precision *values*",
+# and `pytests/test_shim.py` had none.
+#
+# It has one. Not the two-interpreter shape §15.1 guessed at, either: upstream
+# `torch` is importable **in this process** (see `_E2EBackend` above, and
+# docs/E2E.md for why that is not the two-process split it looks like), so the
+# comparison is direct and costs no subprocess.
+
+
+def _mp_flat(t):
+    return _tape_flat(t if not hasattr(t, "detach") else t.detach())
+
+
+def _mp_layer_norm_gradients():
+    """The same mixed-precision layer norm through the tape and through
+    upstream's autograd. Returns `(shim, upstream)`, three gradients each."""
+    U = _upstream_torch
+    d = _C._aten_dispatch
+    xv = _tape_ramp(24, -1.5, 2.5)
+    wv = _tape_ramp(4, 0.5, 1.5)
+    bv = _tape_ramp(4, -0.5, 0.5)
+    gv = _tape_ramp(24, -1.25, 1.75)
+    eps = 1e-5
+
+    # The objective is **linear** in the layer norm's output, so the gradient
+    # arriving at the op is `gout` exactly on both sides and nothing upstream
+    # of the rule can contribute a difference. `_tape_scalarise`'s `sum(exp())`
+    # would put a `bfloat16` exponential between the two and hide the thing
+    # being measured behind it.
+    x = _C._tensor_from_flat(xv, [2, 3, 4], _C.bfloat16)
+    w = _C._tensor_from_flat(wv, [4], _C.float32)
+    b = _C._tensor_from_flat(bv, [4], _C.float32)
+    gout = _C._tensor_from_flat(gv, [2, 3, 4], _C.bfloat16)
+    _C._capture_begin([x])
+    try:
+        out = d("aten.native_layer_norm.default", x, [4], w, b, eps)
+        trace = _C._capture_end(
+            d("aten.sum.default", d("aten.mul.Tensor", out[0], gout)))
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    slots = {id(v): i for i, v in enumerate(trace.constant_values)}
+    sw, sb = slots[id(w)], slots[id(b)]
+    got = trace.backward([x], wrt_constants=[sw, sb])
+    shim = (got["inputs"][0], got["constants"][sw], got["constants"][sb])
+
+    xu = U.tensor(xv, dtype=U.bfloat16).reshape(2, 3, 4).requires_grad_(True)
+    wu = U.tensor(wv, dtype=U.float32).requires_grad_(True)
+    bu = U.tensor(bv, dtype=U.float32).requires_grad_(True)
+    gu = U.tensor(gv, dtype=U.bfloat16).reshape(2, 3, 4)
+    ou = U.ops.aten.native_layer_norm(xu, [4], wu, bu, eps)
+    (ou[0] * gu).sum().backward()
+    return shim, (xu.grad, wu.grad, bu.grad)
+
+
+def test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit():
+    """The case docs/BACKWARD.md §15.1's L5 has something to fail on.
+
+    `bfloat16` input, `float32` weight and bias -- the one shape in which
+    `native_layer_norm`'s statistics are at a *different* precision from its
+    input, which is the whole of what L5 is about. Reading them off the forward
+    and recomputing them are the same computation at every dtype except this
+    one.
+
+    `grad_input` is compared **bit for bit** rather than to a tolerance, and
+    that is measured rather than hoped for: the rule's last step narrows to the
+    input's dtype, so any `float32` disagreement below `bfloat16`'s eight
+    significand bits is rounded away before the comparison. It is a strong
+    assertion for a weak reason, and the reason is worth stating because it
+    also bounds what this case can see: a fault that moves `grad_input` by less
+    than half a `bfloat16` ulp is still invisible here. L5 moves it by 6.25.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    (gx, _, _), (ux, _, _) = _mp_layer_norm_gradients()
+    got, want = _mp_flat(gx), _mp_flat(ux)
+    assert gx.dtype == _C.bfloat16, gx.dtype
+    assert len(got) == len(want) == 24, (len(got), len(want))
+    differing = [i for i, (a, b) in enumerate(zip(got, want)) if a != b]
+    assert not differing, (
+        "%d of 24 grad_input elements differ from upstream at bfloat16/float32: "
+        "%s" % (len(differing), [(i, got[i], want[i]) for i in differing[:6]]))
+    # ...and the case has something to be right about: a gradient of all zeros
+    # would pass the line above against any rule at all.
+    assert max(abs(v) for v in got) > 1e-3, got
+
+
+def test_mixed_precision_layer_norm_dgamma_is_not_upstreams_and_the_gap_is_upstreams():
+    """The second thing the oracle above found, and it is not a fault here.
+
+    `grad_weight` and `grad_bias` are reductions -- `sum(g*y)` and `sum(g)` --
+    and this rule computes them in the *statistics'* dtype, which under mixed
+    precision is `float32`. **Upstream's kernel does not, and it does not
+    produce the exact sum either.** Measured on 2.13.0, one column of six
+    `bfloat16` gradients:
+
+    ```text
+      exact sum, float64        1.141357421875
+      this rule, float32        1.141357421875     (equal at every digit)
+      upstream, bfloat16 input  1.13671875
+      upstream, float32 input   1.141357421875     (equal again)
+    ```
+
+    and `1.13671875` is not on the `bfloat16` grid, so it is not "the exact sum
+    rounded once" -- it is a different accumulation, taken only on the mixed
+    path, and it is a function of `dY` alone (checked against three different
+    inputs). The all-`bfloat16` kernel gives `1.140625`, which *is* one
+    rounding, so the mixed path is not the reduced path either.
+
+    So the gap is bounded and recorded rather than chased into upstream's
+    kernel, and this test pins the bound in both directions: it must stay small
+    enough that this is a rounding-scale disagreement and **not** zero, because
+    a zero would mean somebody had made the two agree and the fact above had
+    stopped being true. That is the same shape as the `_softmax` rule's
+    reduced-precision gap (both accumulate where upstream uses `opmath`), and
+    it is `docs/BACKWARD.md` §13.2's story with the sides swapped: there the
+    shim was the more accurate one and was changed to upstream's rounding
+    because "arguably more accurate and not upstream's" is still not upstream.
+    """
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    (_, gw, gb), (_, uw, ub) = _mp_layer_norm_gradients()
+    for name, s, u in (("grad_weight", gw, uw), ("grad_bias", gb, ub)):
+        got, want = _mp_flat(s), _mp_flat(u)
+        scale = max(max(abs(v) for v in want), 1.0)
+        worst = max(abs(a - b) for a, b in zip(got, want)) / scale
+        # Clean: 3.099e-03 for grad_weight, 1.797e-03 for grad_bias. The bound
+        # is `bfloat16`'s eps (7.8e-03), because that is the size of the effect
+        # being allowed for; anything larger is not a rounding disagreement.
+        assert worst < 7.8125e-03, (name, worst, got, want)
+        assert worst > 0.0, (
+            "%s now agrees with upstream at bfloat16/float32. That is a change "
+            "in one of the two, and the docstring above says which measurement "
+            "would have to be re-taken." % name)
 
 
 def test_the_tape_has_a_gradient_case_for_every_rule_it_claims():
@@ -15036,6 +15586,99 @@ out["layernorm_reverted"] = {n: ml.state_dict()[n].tolist() for n in out["layern
 # negating the objective has to take it back up.
 wla = adapt.wrap(build_ln(), method=AntiTent(), lr=LR).online()
 out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
+
+# --- .train(), which is what test-time adaptation actually meets ----------
+# Two rules make this reachable and both are in the model below: `nn.Dropout`
+# reaches `aten.native_dropout.default` (bootstrap's dropout composite takes
+# the functionalised route inside a capture region, docs/TRAIN.md), and an
+# SDPA call with `dropout_p > 0` drops to the math backend, which is where
+# `aten._safe_softmax.default` lives.
+TRAIN_SEED = 20260901
+
+class TrainLM(LNLM):
+    def __init__(self):
+        super().__init__()
+        self.drop = nn.Dropout(0.5)
+    def forward(self, input_ids):
+        h = self.embed(input_ids)
+        h = self.norm1(h)
+        q = h.reshape(1, 1, h.shape[1], H)
+        # Gated on `self.training`, which is what `transformers` does --
+        # `dropout_p=self.attention_dropout if self.training else 0.0` -- and
+        # it is what makes the `.eval()` control below able to fail.
+        a = torch.nn.functional.scaled_dot_product_attention(
+            q, q, q, dropout_p=0.25 if self.training else 0.0, is_causal=True)
+        h = a.reshape(h.shape) + h
+        h = torch.relu(self.fc(h))
+        h = self.drop(h)
+        h = self.norm2(h)
+        return self.head(h)
+
+def build_train():
+    m = build_ln()
+    d = TrainLM()
+    d.load_state_dict(m.state_dict(), strict=False)
+    return d
+
+mt = build_train().train()
+out["train_mode"] = mt.training
+# The dropout is really on, which is the assertion every "it ran" check
+# passes: two forwards of the same input differ in .train() and agree in
+# .eval(). Without this a Dropout that had silently become the identity would
+# make every number below look right.
+with torch.no_grad():
+    torch.manual_seed(TRAIN_SEED)
+    a1 = mt(ids).reshape(-1).tolist()
+    torch.manual_seed(TRAIN_SEED + 1)
+    a2 = mt(ids).reshape(-1).tolist()
+    mt.eval()
+    e1 = mt(ids).reshape(-1).tolist()
+    e2 = mt(ids).reshape(-1).tolist()
+    mt.train()
+out["train_two_draws_differ"] = max(abs(p - q) for p, q in zip(a1, a2))
+out["eval_two_draws_agree"] = max(abs(p - q) for p, q in zip(e1, e2))
+
+wt = adapt.wrap(mt, method=adapt.Tent(), lr=LR).online()
+out["train_selected"] = list(wt.online_parameters)
+try:
+    hist = []
+    for i in range(STEPS):
+        torch.manual_seed(TRAIN_SEED + i)
+        hist.append(wt.step(ids)[1])
+    out["train_history"] = hist
+    with torch.no_grad():
+        torch.manual_seed(TRAIN_SEED + STEPS)
+        out["train_final"] = float(entropy_of(mt(ids)).item())
+except Exception as e:
+    out["train_history"] = "%s: %s" % (type(e).__name__, str(e))
+    out["train_final"] = None
+wt.revert()
+
+wta = adapt.wrap(build_train().train(), method=AntiTent(), lr=LR).online()
+anti = []
+for i in range(STEPS):
+    torch.manual_seed(TRAIN_SEED + i)
+    anti.append(-wta.step(ids)[1])
+out["train_anti_history"] = anti
+
+# What the trace actually contains, so the test asserts the two rules were on
+# the path rather than trusting that a step which ran must have used them.
+mr = build_train().train()
+torch.manual_seed(TRAIN_SEED)
+torch._C._capture_begin([ids])
+try:
+    tr = torch._C._capture_end(entropy_of(mr(ids)))
+except BaseException:
+    if torch._C._capture_active():
+        torch._C._capture_abandon()
+    raise
+_slots = {id(v): i for i, v in enumerate(tr.constant_values)}
+_names = [n for n, _ in mr.named_parameters() if n in out["train_selected"]]
+_params = dict(mr.named_parameters())
+_wrt = sorted(_slots[id(_params[n])] for n in _names if id(_params[n]) in _slots)
+_rep = tr.differentiable(wrt_constants=_wrt)
+out["train_covered"] = sorted(_rep["covered"])
+out["train_missing"] = sorted(_rep["missing"])
 
 # --- a rule that really is missing, so the refusal keeps being exercised ---
 # The point of this arm is the *reason*, not the refusal: it asserts that the
@@ -15415,6 +16058,56 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
              if r["layernorm_adapted"][n] != r["layernorm_base"][n]]
     assert len(moved) == 4, moved
     assert r["layernorm_reverted"] == r["layernorm_base"]
+
+
+def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
+    """Adaptation was `.eval()`-only, and **`.eval()` is the exotic case**: a
+    model being adapted at test time has whatever mode it was shipped in, and
+    dropout being active is the ordinary one.
+
+    Two rules make this reachable and the trace is asserted to contain both,
+    rather than inferred from a step that completed:
+    `aten.native_dropout.default` (an `nn.Dropout`, through the functionalised
+    route capture takes) and `aten._safe_softmax.default` (an SDPA call with
+    `dropout_p > 0`, which drops to the math backend on CPU -- docs/TRAIN.md
+    §4).
+
+    **The dropout is checked to be on.** A `nn.Dropout` that had silently
+    become the identity -- which is exactly what `.eval()` makes it -- passes
+    every "the step ran" and "entropy fell" assertion below, and would make
+    this a second copy of the `.eval()` test wearing a different name. So two
+    forwards of the same input must *differ* in `.train()` and agree in
+    `.eval()`.
+
+    **The history is not asserted monotone, and that is upstream's shape too.**
+    Each step draws a new mask, so the objective is a different sample every
+    time; upstream's own Tent curve on `gpt2` in `.train()` goes
+    5.133, 4.268, 4.480, 4.557, ... and is not monotone either
+    (docs/ADAPT.md §14.2). What is asserted is the fall overall and the wrong
+    sign's rise from the identical starting value, which is the control that
+    says the movement is the gradient's direction.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["train_mode"] is True, r["train_mode"]
+    # The dropout is on: same input, two draws, different answers.
+    assert r["train_two_draws_differ"] > 1e-3, r["train_two_draws_differ"]
+    assert r["eval_two_draws_agree"] == 0.0, r["eval_two_draws_agree"]
+
+    assert r["train_missing"] == [], r["train_missing"]
+    for op in ("aten.native_dropout.default", "aten._safe_softmax.default"):
+        assert op in r["train_covered"], (op, r["train_covered"])
+
+    history = r["train_history"]
+    assert isinstance(history, list), history
+    assert len(history) == 10, history
+    assert history[-1] < history[0] - 1e-3, history
+    assert r["train_final"] < history[0] - 1e-3, (r["train_final"], history[0])
+
+    anti = r["train_anti_history"]
+    assert anti[-1] > anti[0] + 1e-3, anti
+    assert abs(anti[0] - history[0]) < 1e-9, (anti[0], history[0])
 
 
 def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():

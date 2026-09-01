@@ -363,6 +363,7 @@ fn i64_list(operands: &[Option<Operand<'_>>], index: usize, name: &str, op: &str
 /// second list of op names stays honest in this repository (docs/AUDIT.md).
 pub const RULE_OPS: &[&str] = &[
     "aten._log_softmax.default",
+    "aten._safe_softmax.default",
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
     "aten._to_copy.default",
@@ -393,6 +394,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.mm.default",
     "aten.mul.Scalar",
     "aten.mul.Tensor",
+    "aten.native_dropout.default",
     "aten.native_layer_norm.default",
     "aten.neg.default",
     "aten.nll_loss_forward.default",
@@ -1016,10 +1018,55 @@ fn derivative<'py>(
             let gi = mul(py, sub(py, g()?, weighted)?, outs[0].clone())?;
             Ok((ops, vec![Some(gi)]))
         }
+        // `_safe_softmax` -- softmax's own rule, and the whole of the "safe"
+        // part is that it is applied to the **saved output**.
+        //
+        // The third argument is `dtype`, not `half_to_float`, so this cannot
+        // share `_softmax`'s arm even though the expression is identical: the
+        // vendored tree binds arguments by *name* before dispatching
+        // (docs/CAPTURE.md §2), so a trace can hold `{'dtype': ...}` and a
+        // rule reading `half_to_float` would find nothing there.
+        //
+        // **A fully-masked row is where the two softmaxes differ, and it is a
+        // real shape** -- every key excluded by a causal mask plus padding.
+        // Measured on upstream 2.13.0, on a row that is entirely `-inf`:
+        //
+        // ```text
+        //   _softmax        forward nan   backward nan
+        //   _safe_softmax   forward 0     backward 0     (SafeSoftmaxBackward0)
+        // ```
+        //
+        // and upstream's `0` there is **not** a special case in the backward.
+        // `(g - rowsum(g*p)) * p` with `p = 0` is `0` by arithmetic, so the
+        // forward's zero is what makes the gradient finite. That is only true
+        // of a rule that *reads* `outs[0]`: one that recomputed a softmax of
+        // the recorded input -- which the tape is allowed to do, it runs
+        // outside a capture region -- would exponentiate `-inf - (-inf)` and
+        // answer `nan` on exactly the rows this op exists for, while agreeing
+        // everywhere a finite-difference case can look. §15's V2 is that
+        // fault and the test that catches it is a structural one.
+        "aten._safe_softmax.default" => {
+            let ops = bind(py, node, env, &["self", "dim", "dtype"])?;
+            let rank = dims(&outs[0])?.len();
+            let axis = normalise_dim(opt_i64(&ops, 1, -1)?, rank) as i64;
+            let weighted = sum_dims(py, mul(py, g()?, outs[0].clone())?, &[axis], true)?;
+            let gi = mul(py, sub(py, g()?, weighted)?, outs[0].clone())?;
+            // `dtype`, when given, upcasts the forward. Upstream differentiates
+            // in that dtype and narrows back to the input's -- measured: a
+            // `float32` self with `dtype=float64` gives a `float32` gradient
+            // equal to the `float64` rule rounded once.
+            let gi = cast_like(py, gi, &required(op, &ops, 0, "self")?.value)?;
+            Ok((ops, vec![Some(gi)]))
+        }
 
         // ------------------------------------------------------ normalisation
         "aten.native_layer_norm.default" => {
             layer_norm_backward(py, node, env, gouts, outs)
+        }
+
+        // ------------------------------------------------------------ dropout
+        "aten.native_dropout.default" => {
+            native_dropout_backward(py, node, env, gouts, outs)
         }
 
         // --------------------------------------------------------------- loss
@@ -1375,6 +1422,94 @@ fn layer_norm_backward<'py>(
         }
     };
     Ok((ops, vec![Some(gi), None, gw, gb, None]))
+}
+
+/// `native_dropout` -> the gradient of its first result.
+///
+/// ```text
+///   grad_input = (g * mask) * scale
+/// ```
+///
+/// **The mask is read off the forward's second result, and that is the whole
+/// reason the op returns one.** `docs/LOSS.md` §3.1's reading of
+/// `nll_loss_forward`'s `total_weight` met for the third time, and here it is
+/// not an optimisation: a dropout mask *cannot* be recomputed. There is no
+/// function of the input that says which elements were dropped, so a rule that
+/// did not read it would have to draw again -- a different mask, and therefore
+/// the gradient of a different function than the one the forward computed.
+/// **A forward-only test cannot see this**, which is why §15's D2 is the fault
+/// it is.
+///
+/// Three details are upstream's and two of them would be invisible in
+/// `float32`:
+///
+/// * **The scale is `1 / (1 - p)` and it is guarded exactly as the forward
+///   guards it** -- `1` when `train` is false or absent, `0` when `p == 1`
+///   (`derivatives.yaml`: `!train.has_value() || !train.value() ? 1 : (p == 1
+///   ? 0.0 : 1.0 / (1.0 - p))`). Without the `p == 1` guard the reciprocal is
+///   `inf` and every dropped element's gradient becomes `nan` rather than `0`.
+/// * **The association is `(g * mask) * scale` and not `g * (mask * scale)`.**
+///   Upstream has both spellings, for two different callers:
+///   `native_dropout_backward` is the first and
+///   `infinitely_differentiable_native_dropout_backward` (taken only when
+///   `GradMode` is on, i.e. `create_graph=True`) is the second. Measured on
+///   2.13.0 at `p = 0.7`, they are *different numbers* in `bfloat16` and
+///   `float16` and identical in `float32` and `float64`; a plain
+///   `loss.backward()` takes the first, so this rule does.
+/// * **The scalar is not narrowed to the tensor's dtype.** `docs/SCALAR.md`
+///   fixed `mul.Scalar` to follow upstream's un-narrowed
+///   `original_scalar_value<opmath_t>`, and this rule inherits that by
+///   spelling the multiply as `mul.Scalar`. A `bfloat16(1/0.3)` here would
+///   disagree with upstream on the survivors. Note this is the *opposite* of
+///   what the forward does -- `native_dropout`'s own kernel narrows before it
+///   multiplies (`aten.rs`, measured on 1280 combinations) -- so the two
+///   halves of one op answer the question differently and neither is a
+///   guess.
+///
+/// A gradient reaching the **mask** is refused by name rather than dropped:
+/// upstream's mask is `bool` and carries no `grad_fn`, so anything that got
+/// there is a bug in the walk.
+fn native_dropout_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+    outs: &[Obj<'py>],
+) -> PyResult<Rule<'py>> {
+    const OP: &str = "aten.native_dropout.default";
+    let ops = bind(py, node, env, &["input", "p", "train"])?;
+    if gouts.len() > 1 && gouts[1].is_some() {
+        return Err(crate::err::not_implemented(
+            "torch._C tape: a gradient reached native_dropout's mask, which is a bool \
+             record of which elements survived rather than a differentiable value",
+        ));
+    }
+    let g = gouts
+        .first()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| missing(OP, "grad"))?;
+    if outs.len() < 2 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: native_dropout's gradient reads the mask this op returns, and \
+             this node recorded {} result(s)",
+            outs.len()
+        )));
+    }
+    let p = opt_f64(&ops, 1, 0.5)?;
+    // `bool? train` -- absent and `None` both mean `true`, which is what
+    // `opt_bool`'s fallback says and what upstream's `!train.has_value() ||
+    // *train` says.
+    let train = opt_bool(&ops, 2, true)?;
+    let scale = if !train {
+        1.0
+    } else if p == 1.0 {
+        0.0
+    } else {
+        1.0 / (1.0 - p)
+    };
+    let masked = mul(py, g, outs[1].clone())?;
+    let gi = muls(py, masked, scale)?;
+    Ok((ops, vec![Some(gi), None, None]))
 }
 
 /// `_scaled_dot_product_flash_attention_for_cpu` -> gradients for q, k and v.
