@@ -340,7 +340,19 @@ float16,  same                     upstream [0.89990234375, 1.5, 2.099609375,  0
 ```
 
 `mul_kernel`'s reduced-float branch is `opmath_t b = iter.original_scalar_value<opmath_t>(2)` — the
-un-narrowed scalar, exactly as `div`'s is. **This is reported and not fixed**, deliberately:
+un-narrowed scalar, exactly as `div`'s is.
+
+> **Fixed since, in [`docs/SCALAR.md`](SCALAR.md).** It was done as its own round for the reason
+> given below, and the reason held: the prefill digests did **not** move, because a dispatch trace
+> over a real `bfloat16` forward shows every Python number it passes is an integer or exactly
+> representable, so `mul.Scalar` is never reached with a separating scalar. Where one does reach it
+> — SDPA's math backend — 36 of 128 elements were wrong before and 0 after. The prediction two
+> paragraphs down is discharged: the widened dropout cases do now catch S4, at 52/46/50/54
+> differing survivors in `float16`/`bfloat16` against upstream's identical counts.
+>
+> The family turned out to have no rule to infer: `hardshrink` narrows and `softshrink` widens.
+
+**This was reported and not fixed** at the time, deliberately:
 `mul.Scalar` is on the eval hot path (RMSNorm, RoPE, the attention scale), so changing it would move
 `bfloat16` numerics repository-wide including the prefill digest docs/SEQLEN.md records, and that
 document is outside this round. It is also already golden-covered and passing, so `mul_scalar_cases`
