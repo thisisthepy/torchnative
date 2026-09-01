@@ -16,6 +16,15 @@ README's Mixtral note implied, because under 4.x Mixtral's MoE block does not go
 outright** on the single missing `_is_autocast_available` predicate, which was hiding the real,
 smaller shape of the gap.
 
+> **Correction (re-verified live against the current build): the 4.x cost has since shrunk.**
+> Later rounds (out of this document's territory — `aten.rs` kernel work, plus `docs/TORCHSCRIPT.md`'s
+> `PYTORCH_JIT` default) closed `gpt2`'s and `mixtral`'s gaps named here. Re-running this document's
+> own 20-toy-config sweep against the current shim: **5.x is 20/20** (was 14/20 — `persimmon`,
+> `cohere`, `falcon`, `bloom`, `gpt_bigcode`, `mamba` all now construct and forward), and **4.x is
+> 16/20** (was 10/20 — only `opt`/`bert` (`aten.all.default`), `mixtral`'s MoE loop (`_nn.one_hot`'s
+> decomposition), and `mamba` (`TensorBase.roll`) still refuse). See the corrections at §4 and §5
+> below for the per-name detail.
+
 ---
 
 ## 0. Method
@@ -302,15 +311,36 @@ mamba       FAIL  torch.log(...) -- no overload table entry
 OK: 14 / 20
 ```
 
+> **Correction (re-verified live against the current build, transformers 5.15.1/spike-venv): all
+> six below now pass — 5.x is 20/20, not 14/20.** `torch.square`/`torch.repeat_interleave` now
+> resolve (as Python-level composites decomposing into already-implemented kernels — neither has
+> its own `aten.*` entry in `_aten_implemented()`, confirmed), `TensorBase.__getitem__` with a list
+> index now works, `aten.pow.Tensor_Tensor`'s dtype promotion (`float32` base, `int32` exponent)
+> now runs, `aten.log.default` is implemented, and GPT-BigCode's `torch.jit.script` import wall is
+> gone (`docs/TORCHSCRIPT.md`'s `PYTORCH_JIT=0` default; its own construct-time `tril` gap is also
+> closed, `docs/TRIL.md`). All six were re-run end to end
+> (`AutoModelForCausalLM.from_config(...).eval()` forward) against the current shim and none raised.
+
 Six architectures fail on **both** versions, identically — `persimmon`, `cohere`, `falcon`, `bloom`,
 `gpt_bigcode`, `mamba`. These are pre-existing shim gaps, not part of the 4.x story; they would need
 closing regardless of which `transformers` version this project targets, and closing them is out of
 this session's territory (all six are `aten.rs` kernel gaps or the forbidden indexing region, except
 `gpt_bigcode` — see §5.3).
 
+> This paragraph's premise is superseded too — none of the six still fail (correction above).
+
 **The honest 4.x-specific cost, with the fixes in this session applied, is 4 architectures**:
 `gpt2`, `opt`, `bert`, `mixtral` pass on 5.x and fail on 4.x. All four fail for the same underlying
 reason — 4.x's older attention-masking and MoE code calls different primitives than 5.x's:
+
+> **Correction (re-verified live): `gpt2` is no longer in this set — `aten.tril.default` was
+> implemented (`docs/TRIL.md`), and 4.x's `GPT2Attention.__init__` now succeeds. `mamba` has taken
+> its place**, still failing on 4.x specifically (`TensorBase.roll`, per §1's op-coverage row for
+> `mamba` — `clamp`/`constant_pad_nd` from that same row are now implemented, `roll` is not). The
+> count is still 4, but the membership changed: **`opt`, `bert`, `mixtral`, `mamba`** — re-run
+> end to end against the current shim on both venvs (`compat-tf4-venv` 4.57.6, `spike-venv` 5.15.1).
+> `gpt2`'s row below is kept for the record (it correctly explains what *used to* block it) rather
+> than deleted.
 
 | architecture | 5.x path | 4.x path |
 |---|---|---|
@@ -345,9 +375,27 @@ another agent this pass):
 | `aten.log.default` | `mamba` | no — fails on 5.x too |
 | `aten.clamp.default`, `aten.constant_pad_nd.default`, `aten.roll.default` | `mamba` (op-coverage, §1; not reached by the shim run before `log` already blocks it) | mixed — `zeros.default` is common to both, the rest only showed up in the 4.x trace |
 
+> **Correction (re-verified live against the current build): six of the ten rows above are stale.**
+> `aten.tril.default` (`docs/TRIL.md`), `aten.log.default`, `aten.clamp.default`, and
+> `aten.constant_pad_nd.default` are all now `in torch._C._aten_implemented()` and were confirmed by
+> calling them directly (`torch.tril`, `torch.log`, `torch.clamp`, `F.pad`). `aten.pow.Tensor_Tensor`
+> dtype promotion (`float32` base, `int32` exponent) also now completes — confirmed with the exact
+> shapes `bloom`'s `build_alibi_tensor` uses. `torch.square` and `torch.repeat_interleave` also now
+> run end to end, though **neither has grown its own `aten.*` table entry** — both resolve as
+> Python-level composites that decompose into kernels this shim already had, which is why they do
+> not appear in `_aten_implemented()` even though the call succeeds. Still genuinely missing,
+> confirmed absent from `_aten_implemented()`: `aten.all.default`, `aten.aminmax.default`,
+> `aten.index_add_.default`, `aten.nonzero.default`, `aten.scatter_.value`, `aten.zeros.default`,
+> `aten.roll.default`.
+
 `TensorBase.__getitem__` with a list index (`bert`, `falcon`) is a kernel-shaped gap too, but it
 sits in the `__setitem__`/`__getitem__` region explicitly out of bounds for this session (another
 agent is rewriting it now) — not classified further here, and not fixed.
+
+> **Correction (re-verified live against the current build): this is fixed.** `x[:, [-1, 0]]` on a
+> 2-D float tensor now returns the correct values through the shim — confirmed by calling it
+> directly, not inferred from an architecture passing. Neither `bert` nor `falcon` hits this gap
+> anymore (§4's correction above already covers both by name).
 
 **(c) blocked under abi3 the way `torch.compile` is** — one candidate, and it turns out **not** to
 belong here:
@@ -363,6 +411,17 @@ buildable-in-principle Python-level IR parser (`Ident`, `Def`, `Return`, `Tuple`
 node types and onward, per DYNAMO.md §12's own probe), not a small one, and not attempted this
 session. Reused DYNAMO.md's own evidence rather than re-deriving it, per instruction. This gap is
 identical on 4.x and 5.x — `gpt_bigcode` still carries the same decorator upstream.
+
+> **Correction (docs/TORCHSCRIPT.md; re-verified live): this import wall is gone on both versions.**
+> A later round made this shim default to upstream's own scripting-disabled mode
+> (`os.environ.setdefault("PYTORCH_JIT", "0")`, `docs/TORCHSCRIPT.md`), which is exactly the kind of
+> off-switch this section's own (c)-vs-(a) analysis was checking for and did not find at the time.
+> `from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeForCausalLM` now
+> succeeds, and (with `aten.tril.default` also since implemented, `docs/TRIL.md`) the model
+> constructs and forwards on both `transformers` 4.57.6 and 5.15.1. This does not overturn the
+> (a)-not-(c) classification argument itself — the reasoning for why `make_range` is buildable
+> rather than abi3-blocked was never wrong — it changes only whether GPT-BigCode still needs it,
+> which it no longer does.
 
 ---
 
@@ -393,6 +452,14 @@ Reasons, in order of weight:
 Net: the ecosystem's own default (`pip install transformers`) already points at 5.x, the newer
 version needs less from this shim, and the gap that remains is upstream's own kernel surface, not
 this shim's autocast surface — so 5.x is both the honest target and the cheaper one to keep honest.
+
+> **Correction (re-verified live against the current build): the counts in points 3 and 4 are
+> stale — 5.x is 20/20 (not 14/20) and 4.x is 16/20 (not 10/20), and `tril` is no longer part of
+> the remaining 4.x gap (§4's and §5(b)'s corrections above).** The recommendation itself (target
+> 5.x) is a judgment call this correction does not attempt to re-decide — points 1 and 2, about
+> what `pip install transformers` resolves to and where new releases land, do not depend on these
+> counts and are unaffected. Whoever revisits this recommendation should re-check the counts first,
+> since the gap this section describes as motivation has narrowed on both sides.
 
 ---
 

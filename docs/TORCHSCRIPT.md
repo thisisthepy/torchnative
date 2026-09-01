@@ -8,6 +8,16 @@ does not forward — it stops one step later, at a small, named, ordinary kernel
 stays 19/20, not 20/20. Reporting anything else would be reporting the count on the strength of an
 import succeeding, which the brief for this round explicitly rules out.
 
+> **Correction (docs/TRIL.md; re-verified live): `aten.tril.default` has since been implemented,
+> and the count is 20/20, not 19/20.** `docs/TRIL.md` §0 records the kernel landing (`tril.default`
+> added to `aten.rs`, wired in `overloads.json`/`methods.json`) — out of this document's territory,
+> as §6 below already anticipated. Confirmed directly against the current build:
+> `"aten.tril.default" in torch._C._aten_implemented()` is `True`, and
+> `AutoModelForCausalLM.from_config(AutoConfig.for_model("gpt_bigcode", ...)).eval()` constructs
+> and forwards without error. (A separate, previously-unnoted gap — `aten.dropout.default` — blocks
+> the *training*-mode forward, i.e. with the model not put in `.eval()` first; that is a new,
+> unaudited finding, not a claim this document ever made, and is left for whoever picks it up.)
+
 ---
 
 ## 1. Baseline — reproduced, unchanged from the brief
@@ -391,7 +401,10 @@ not verified further. The remaining matches are all under `torch/testing/_intern
   architectures.
 * A TorchScript frontend — §7, deliberately not built; sized instead.
 
-**Count:** still 19/20. GPT-BigCode moved from failing at *import* (a wall with no name a caller
-could act on beyond "the frontend doesn't exist") to failing at *construction* on one named,
-ordinary, appropriately-sized kernel gap. That is real progress and it is not twenty of twenty —
-this document does not claim the second number.
+**Count:** still 19/20 *as of this round*. GPT-BigCode moved from failing at *import* (a wall with
+no name a caller could act on beyond "the frontend doesn't exist") to failing at *construction* on
+one named, ordinary, appropriately-sized kernel gap. That is real progress and it is not twenty of
+twenty — this document does not claim the second number.
+
+> **Correction: it is now 20/20** — see the correction after the top verdict. `tril` landed in a
+> later round (`docs/TRIL.md`) and closed exactly the gap named above.

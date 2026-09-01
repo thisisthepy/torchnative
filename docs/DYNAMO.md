@@ -215,6 +215,14 @@ $ python3 -c "import json; d=json.load(open('rust/torch_c/src/surface.json'));
 **8개.** 실제 137개의 6%입니다. `_export/` 도 같은 구조(중첩 `.pyi` 1개)를 갖고 있어 같은 버그의
 영향을 받을 가능성이 있습니다(확인은 `_dynamo` 만 했습니다 — `_export` 는 이 작업 범위 밖).
 
+> **Correction (커밋 `70f288b` "Fix: Recurse into directory stubs, which the surface scanner
+> walked only one level deep" — 이 문서 바로 다음 커밋): 이 버그는 고쳐졌습니다.** `gen_surface.py`
+> 가 이제 디렉터리형 서브모듈을 재귀적으로 파싱하고, `surface.json` 의 `_dynamo` 항목은 지금
+> `submodules` 키 아래 `eval_frame`(35) · `guards`(34) · `compiled_autograd`(5) 를 온전히 담고
+> 있습니다(현재 트리에서 직접 읽어 확인). `_export/` 도 같은 커밋에서 함께 고쳐졌습니다
+> (`submodules.pt2_archive_constants` 로 재귀됨) — §5 가 "이 작업 범위 밖"으로 남겨둔 그 우려가
+> 맞았고, 그대로 고쳐졌습니다.
+
 **좋은 소식은 `.pyi` 데이터 자체는 이미 있다는 것입니다.** §3.1에서 접근된 52개 전부
 (`eval_frame.pyi` · `guards.pyi` 기준) 스텁에 **선언돼 있습니다** — 시그니처까지 포함해서.
 빠진 건 `gen_surface.py` 가 그 파일들을 찾아 읽는 로직이지, 원본 데이터가 아닙니다.
@@ -341,7 +349,7 @@ README 의 "Dynamo 안에서 멈춘다"는 한 줄을 대체하는 것이 목적
 | 막힌 지점 (`backend='eager'`, 실제 호출 시) | `torch._C._dynamo.eval_frame.set_eval_frame` — CPython 의 PEP 523 프레임 평가 후킹 |
 | 그 심볼이 요구하는 CPython 기능 | `_PyInterpreterState_SetEvalFrameFunc`, `_PyInterpreterFrame` — 전부 `Py_BUILD_CORE` 로 가드된 내부 헤더 (§15, 실측) |
 | Limited API 에서 닿는가 | **아니오 — 구조적으로 닿지 않습니다.** 근거는 상류 C 소스 (§15) |
-| 막힌 지점 (기본 백엔드 `inductor`, 호출 이전 `compile()` 시점) | `torch._C._export.pt2_archive_constants` 부재 → 때우면 `torch.jit.script_method` → TorchScript 프론트엔드(`_jit_tree_views`) 요구 — **다른 벽, eval-frame 과 무관** (§12) |
+| 막힌 지점 (기본 백엔드 `inductor`, 호출 이전 `compile()` 시점) | `torch._C._export.pt2_archive_constants` 부재 → 때우면 `torch.jit.script_method` → TorchScript 프론트엔드(`_jit_tree_views`) 요구 — **다른 벽, eval-frame 과 무관** (§12) — **이 행은 §12 끝의 correction 을 보라: `docs/TORCHSCRIPT.md` 이후 기본값에서는 재현되지 않는다** |
 | 부기를 전부 no-op 으로 때웠을 때 실제로 컴파일이 일어나는가 | **아니오 — 실측으로 확인.** 함수가 매 호출마다 파이썬 레벨에서 다시 실행되고 dynamo 카운터가 전부 0 (§13) |
 | 캡처(`_aten_dispatch` 단일 관문) 가 대신 주는 것 | 구간 기록 + Core ATen 분해, NPU 델리게이트가 필요로 하는 서브그래프 모양까지 (§16, 기존 CAPTURE.md/DECOMP.md) |
 
@@ -481,6 +489,24 @@ tree-view 노드 타입이 줄줄이 필요합니다. 이건 **막힌 심볼 하
 컴파일러가 아니라 바이트코드 인터프리터라 iOS 에서도 된다"고 정정해 둔 것과 이 벽은 같은
 서브시스템(TorchScript)이지만 **다른 질문**입니다 — 거기는 "TorchScript 아티팩트를 실행할 수
 있는가"(된다)이고 여기는 "TorchScript 로 컴파일할 수 있는가"(안 됨, 프론트엔드가 없음).
+
+> **Correction (문서 감사, 재측정): 이 절의 "Wall B" 는 이제 기본값에서 재현되지 않습니다.**
+> `docs/TORCHSCRIPT.md` (이 문서보다 나중, `02758e8`, 2026-08-31) 가
+> `os.environ.setdefault("PYTORCH_JIT", "0")` 를 `bootstrap.py` 에 추가해 상류의 스크립팅
+> 끄기 모드를 기본값으로 만들었습니다. 그 결과 `@torch.jit.script_method` 는
+> (`torch/jit/_script.py` 의 `if not _enabled: return fn`) 함수를 그대로 돌려주고,
+> `MkldnnLinear` 는 더 이상 여기서 `SourceRangeFactory.make_range` 를 부르지 않습니다.
+> 재측정 확인: `pt2_archive_constants` 만 스텁하고 `PYTORCH_JIT` 를 건드리지 않은 채
+> (오늘의 기본값) `torch.compile(f)()` 를 부르면 임포트가 이 벽을 그냥 통과해
+> `torch._C._dynamo.eval_frame.set_skip_guard_eval_unsafe` — §11/§13/§15 가 이미 abi3 밖으로
+> 판정한 것과 **같은 eval-frame 계열의 심볼** — 에서 막힙니다. `PYTORCH_JIT=1` 을 명시적으로
+> 강제하면 (이 절이 측정할 당시의 조건과 같음) 이 절이 적은 그대로 `make_range` 에서 막히는
+> 것도 재확인했습니다 — 즉 원래 측정 자체는 틀리지 않았고, 이 절이 전제한 환경(스크립팅 기본
+> 켜짐)이 나중 라운드에서 바뀌었습니다. "다른 벽, eval-frame 과 무관" 이라는 요약표(파트 B 상단)
+> 항목과 아래 §12 의 결론은 **오늘의 기본 경로에는 더 이상 적용되지 않습니다** — 기본 백엔드도
+> 결국 §15 가 abi3 밖으로 판정한 것과 같은 종류의 벽에 부딪힙니다. §18 의 권고("캡처가 먼저다")는
+> 영향받지 않습니다 — 도달하는 벽이 바뀌었을 뿐 그 벽이 abi3 로 못 넘는다는 결론은 §15 그대로
+> 성립합니다.
 
 ---
 
