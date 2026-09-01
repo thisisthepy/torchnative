@@ -1,5 +1,15 @@
 # A backward pass: what it needs, how big it is, and whether abi3 allows it
 
+> **§6.6's recommendation was taken and steps 3, 4 and 5 have landed —
+> [`docs/BACKWARD.md`](BACKWARD.md).** A tape over a captured trace runs a full SmolLM2-135M
+> backward and one SGD step; all 134,515,008 gradient elements were compared against upstream.
+> Four things below are now wrong or narrower than they read, and each is corrected in place:
+> §4/§5's kernel bill (a *rule* is not a kernel, so **zero** new kernels were needed — §5.1),
+> SDPA's backward as "the one genuinely new kernel" (it stopped nothing — BACKWARD.md §3.4),
+> §7's argument for a read-only `.grad` (its antecedent is gone — BACKWARD.md §10), and §8 item 1
+> ("that a tape-based backward is numerically correct" — it is, to a median relative L2 of
+> 8.5e-07 in `float64`).
+
 `docs/TRAIN.md` closes by naming this as "the next wall and much larger than this one". Training
 mode landed — all 26 architectures forward in `.train()` and agree with upstream draw for draw —
 but every one of those runs inside `torch.no_grad()`, which isolates the mode axis and leaves the
@@ -468,6 +478,15 @@ So the kernel bill for one federated step on SmolLM2-135M is:
 > **two spelling gaps, five ops with a Core ATen decomposition to fall back on, and one real
 > kernel to write (SDPA's backward).**
 
+> **The bill was paid at zero.** `docs/BACKWARD.md` §1.1: the tape's backward runs *outside* a
+> capture region, so a derivative may use ops capture would refuse, may mutate, and may recompute
+> instead of reading a saved value. Every entry above is therefore a composition rather than a
+> kernel, including the last one — `_scaled_dot_product_flash_attention_for_cpu_backward` is still
+> absent and stopped nothing (BACKWARD.md §3.4). `ops=166` is unchanged across that whole round,
+> which is the check that says so. Two of the eight rows are also simply out of date: `div.Scalar`
+> and `zeros.default` have had kernels since `docs/LOSS.md`, and are absent from
+> `_aten_implemented()` only because that list means "has a kernel **and** golden compares it".
+
 This is much smaller than §4's 24 and far smaller than the 687 in `derivatives.yaml`, and the
 reason is that a decoder-only transformer is a narrow slice of ATen. That is the same reason
 `docs/KERNELS26.md` could reach 26 architectures on 163 ops.
@@ -639,11 +658,15 @@ The order this implies:
    autograd involved; unblocks measuring a real training step at all.
 2. `aten.native_dropout` — the functional dropout spelling. Fixes capture in `.train()` for the
    four architectures it currently refuses, and closes `docs/TRAIN.md` §8's third item.
-3. The tape walker and a `grad` map, with derivative rules for the ~18 Core ATen ops one
-   transformer block actually uses (§6.2).
-4. `_scaled_dot_product_flash_attention_for_cpu_backward` — the one real kernel with no
-   decomposition on SmolLM2's path (§5.1).
-5. An optimiser step. This was measured rather than assumed, because the first draft of this list
+3. ~~The tape walker and a `grad` map~~ — **landed, docs/BACKWARD.md.** 56 rules, not 18: a
+   whole `labels=` forward of SmolLM2-135M reaches 20 distinct ops and the rest are the small
+   cases' coverage.
+4. ~~`_scaled_dot_product_flash_attention_for_cpu_backward`~~ — **not needed.** The kernel is
+   still absent; the tape recomputes the attention and differentiates the textbook formulation
+   (BACKWARD.md §3.4). Removing SDPA from the model entirely moves the gradient residual by 1%
+   (§4.4 there), so it was never the wall this list expected.
+5. ~~An optimiser step.~~ **Landed for SGD** — 272 of 272 parameters, weights moved, 99.9976% of
+   the step components pointing where upstream's point. Adam still needs the four items below. This was measured rather than assumed, because the first draft of this list
    guessed it and guessed wrong:
 
 ```
@@ -716,6 +739,12 @@ Two named gaps in that list, both small and both on the critical path:
   "honestly reports no gradient" to "has a slot that is always empty", which is the direction
   `_install_autograd_shape` explicitly argues against.
 
+  > **Closed, and the argument above is what decided when.** `docs/BACKWARD.md` §10: the tape
+  > writes gradients, so the slot is no longer always empty and the antecedent of that sentence is
+  > gone. What would be dishonest now is a `torch.optim` step that silently skipped every parameter
+  > because the slot it reads cannot be filled. Nothing fills it implicitly — `backward()` returns
+  > gradients and the caller assigns them.
+
 ---
 
 ## 8. What this document does not establish
@@ -725,7 +754,7 @@ reader could over-read what is above.
 
 | # | not established | why |
 |---|---|---|
-| 1 | **That a tape-based backward is numerically correct.** | Nothing was implemented. §6 argues the input exists and the walk is small; it does not demonstrate a gradient. The first real test of §6.6 step 3 is `(x*x).sum()` against upstream's `x.grad`, and it has not been run because there is nothing to run it against |
+| 1 | ~~**That a tape-based backward is numerically correct.**~~ | **Established — docs/BACKWARD.md.** An `nn.Linear`'s gradient is bit-identical to upstream; a whole SmolLM2-135M's 134,515,008 gradient elements agree at a median relative L2 of 8.8e-05 in `float32` and **8.5e-07 in `float64`**, which is what says the residual is the forward's arithmetic rather than the rules |
 | 2 | **Effort in time.** | §4 and §5 count formulas and kernels, which is what the brief asked for. Converting counts to weeks would be the estimate-without-measurement this repository refuses |
 | 3 | **Memory.** | Not measured at all, and on a phone it may dominate everything here. A backward keeps every intermediate activation alive; SmolLM2-135M at S=8 is tiny, and nothing was measured at a realistic sequence length. `docs/SEQLEN.md`'s quadratic term is a forward-only measurement |
 | 4 | **That the 4 kernels with no decomposition are hard.** | They were classified by dispatch registration, not read. `avg_pool2d_backward` is probably easy; SDPA's backward is probably not. Neither was opened |

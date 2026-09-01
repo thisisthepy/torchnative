@@ -112,6 +112,21 @@ pub struct PyTensorBase {
     /// it stores something nothing reads. Recorded in docs/CKPT.md §6 as
     /// papered over, not implemented.
     backward_hooks: Option<Py<PyAny>>,
+    /// The accumulated gradient, and **no longer inert**.
+    ///
+    /// `docs/AUTOGRAD.md` §7 argued for leaving this a read-only `None`, and
+    /// the argument was right at the time and is quoted here rather than
+    /// paraphrased: *"making `.grad` writable while nothing writes to it would
+    /// move the shim from 'honestly reports no gradient' to 'has a slot that is
+    /// always empty'"*. `docs/BACKWARD.md` is what changed the antecedent --
+    /// the tape writes here, so the slot is no longer always empty, and every
+    /// `torch.optim` step in this shim reads it.
+    ///
+    /// A `Py<PyAny>` rather than a `PyTensorBase` because that is what
+    /// `optimizer.zero_grad(set_to_none=True)` writes (`None`) and what a
+    /// `Parameter`'s gradient is (a `Tensor`, i.e. a *subclass* instance whose
+    /// Python identity a caller may hold on to).
+    grad: Option<Py<PyAny>>,
 }
 
 /// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
@@ -124,6 +139,12 @@ impl Clone for PyTensorBase {
             tag: self.tag,
             requires_grad: self.requires_grad,
             backward_hooks: self.backward_hooks.as_ref().map(|h| h.clone_ref(py)),
+            // Deliberately dropped, not cloned. A clone is a *new* tensor and
+            // a gradient belongs to the leaf it was accumulated into; carrying
+            // it across would make `p.clone().grad` report a gradient nothing
+            // ever computed for that object. Upstream does the same -- a
+            // non-leaf has no `.grad` at all.
+            grad: None,
         })
     }
 }
@@ -168,6 +189,7 @@ impl PyTensorBase {
             tag,
             requires_grad: false,
             backward_hooks: None,
+            grad: None,
         })
     }
 
@@ -185,6 +207,7 @@ impl PyTensorBase {
             tag,
             requires_grad: false,
             backward_hooks: None,
+            grad: None,
         }
     }
 
@@ -210,6 +233,7 @@ impl PyTensorBase {
             tag,
             requires_grad: false,
             backward_hooks: None,
+            grad: None,
         }
     }
 
@@ -240,6 +264,7 @@ impl PyTensorBase {
             tag: TorchDType::Bool,
             requires_grad: false,
             backward_hooks: None,
+            grad: None,
         })
     }
 
@@ -1313,6 +1338,22 @@ impl PyTensorBase {
     #[setter]
     fn set__backward_hooks(&mut self, value: Option<Py<PyAny>>) {
         self.backward_hooks = value;
+    }
+
+    /// The gradient slot. See the field comment for why there is one now.
+    ///
+    /// Spelled `_shim_grad` rather than `grad` because `bootstrap.py` owns the
+    /// `grad` property: `_install_autograd_shape` puts the type check and the
+    /// docstring there, beside `requires_grad_` and `is_leaf`, so the whole
+    /// autograd-shaped surface stays readable in one place.
+    #[getter]
+    fn _shim_grad(&self) -> Option<&Py<PyAny>> {
+        self.grad.as_ref()
+    }
+
+    #[setter]
+    fn set__shim_grad(&mut self, value: Option<Py<PyAny>>) {
+        self.grad = value;
     }
 
     /// `tensor.element_size()` -- bytes per element, from the torch dtype tag

@@ -4308,7 +4308,32 @@ def _install_autograd_shape(tensorbase) -> None:
     requires_grad_.__qualname__ = "TensorBase.requires_grad_"
     setattr(tensorbase, "requires_grad_", requires_grad_)
     setattr(tensorbase, "grad_fn", property(lambda self: None))
-    setattr(tensorbase, "grad", property(lambda self: None))
+
+    def _set_grad(self, value):
+        """`p.grad = ...`, which is a real slot now. docs/BACKWARD.md.
+
+        The docstring above says `grad` is always `None`, "which is the truth
+        -- no gradient was ever accumulated", and docs/AUTOGRAD.md §7 argued
+        explicitly for keeping it that way *while nothing writes to it*. The
+        tape writes to it, so that antecedent is gone: what would be dishonest
+        now is a `torch.optim` step that silently skipped every parameter
+        because the slot it reads cannot be filled.
+
+        Nothing fills it implicitly. `CaptureTrace.backward()` *returns*
+        gradients and the caller assigns them, the same shape
+        `torch.optim.sgd.sgd` already had (docs/LOSS.md §6.4) -- there is still
+        no `Tensor.backward()` behind this, and that stub still refuses.
+        `None` is accepted because it is what `zero_grad(set_to_none=True)`,
+        the default, writes.
+        """
+        if value is not None and not isinstance(value, tensorbase):
+            raise TypeError(
+                "torch._C shim: Tensor.grad can only be set to a TensorBase or "
+                f"None, got {type(value).__name__}"
+            )
+        self._shim_grad = value
+
+    setattr(tensorbase, "grad", property(lambda self: self._shim_grad, _set_grad))
     setattr(tensorbase, "is_leaf", property(lambda self: True))
     # The getter is `self` (docs/TENSORBASE.md records why it is not a detached
     # view). The *setter* is what `nn.Module._apply` needs -- see

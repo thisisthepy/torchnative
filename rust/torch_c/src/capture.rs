@@ -83,7 +83,7 @@ pub fn is_active() -> bool {
 /// appear as a tensor operand in a straight-line segment, which is what makes
 /// the segment straight.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Ref {
+pub(crate) enum Ref {
     Input(usize),
     Const(usize),
     Node { node: usize, output: usize },
@@ -98,7 +98,7 @@ enum Ref {
 /// These are scalars, dtype singletons and small integer lists -- immutable in
 /// practice, and the ones that are not are exactly the ones a trace must not
 /// be a function of.
-enum Arg {
+pub(crate) enum Arg {
     Value(Ref),
     Literal(Py<PyAny>),
     List(Vec<Arg>),
@@ -108,10 +108,10 @@ enum Arg {
 /// Shape, dtype and device -- everything a trace knows about a tensor, and
 /// everything a guard is allowed to check.
 #[derive(Clone, PartialEq, Eq)]
-struct TensorMeta {
-    shape: Vec<usize>,
-    dtype: TorchDType,
-    device: String,
+pub(crate) struct TensorMeta {
+    pub(crate) shape: Vec<usize>,
+    pub(crate) dtype: TorchDType,
+    pub(crate) device: String,
 }
 
 impl TensorMeta {
@@ -149,20 +149,20 @@ impl TensorMeta {
 /// never become an operand. See `refusal_for`: the only such ops that survive
 /// recording are the ones whose answer is a function of *metadata*, and
 /// metadata is what the guards pin.
-enum Slot {
+pub(crate) enum Slot {
     Tensor(TensorMeta),
     Other,
 }
 
-struct Node {
-    op: String,
-    args: Vec<Arg>,
-    kwargs: Vec<(String, Arg)>,
-    outputs: Vec<Slot>,
+pub(crate) struct Node {
+    pub(crate) op: String,
+    pub(crate) args: Vec<Arg>,
+    pub(crate) kwargs: Vec<(String, Arg)>,
+    pub(crate) outputs: Vec<Slot>,
     /// Whether the op returned a sequence. Replay has to index the result the
     /// same way the recorded program did, and "one tensor" and "a list of one
     /// tensor" are different returns.
-    sequence: bool,
+    pub(crate) sequence: bool,
 }
 
 struct Recorder {
@@ -490,15 +490,15 @@ pub fn capture_value(kind: &str, index: usize, output: usize) -> PyResult<PyCapt
 /// A recorded straight-line segment, and the conditions it is valid under.
 #[pyclass(name = "CaptureTrace", module = "torch._C", frozen)]
 pub struct PyCaptureTrace {
-    nodes: Vec<Node>,
-    inputs: Vec<TensorMeta>,
-    consts: Vec<TensorMeta>,
-    const_objects: Vec<Py<PyAny>>,
-    outputs: Vec<Ref>,
+    pub(crate) nodes: Vec<Node>,
+    pub(crate) inputs: Vec<TensorMeta>,
+    pub(crate) consts: Vec<TensorMeta>,
+    pub(crate) const_objects: Vec<Py<PyAny>>,
+    pub(crate) outputs: Vec<Ref>,
 }
 
 impl Arg {
-    fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn to_python<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         Ok(match self {
             Arg::Value(reference) => PyCaptureValue::of(*reference).into_bound_py_any(py)?,
             Arg::Literal(object) => object.bind(py).clone(),
@@ -515,7 +515,7 @@ impl Arg {
 
     /// The same argument with every `Ref` replaced by the live value replay has
     /// computed for it.
-    fn materialise<'py>(&self, py: Python<'py>, env: &Env) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn materialise<'py>(&self, py: Python<'py>, env: &Env) -> PyResult<Bound<'py, PyAny>> {
         Ok(match self {
             Arg::Value(reference) => env.get(py, *reference)?,
             Arg::Literal(object) => object.bind(py).clone(),
@@ -532,14 +532,14 @@ impl Arg {
 }
 
 /// Live values during a replay, indexed the way `Ref` indexes them.
-struct Env {
-    inputs: Vec<Py<PyAny>>,
-    consts: Vec<Py<PyAny>>,
-    nodes: Vec<Vec<Py<PyAny>>>,
+pub(crate) struct Env {
+    pub(crate) inputs: Vec<Py<PyAny>>,
+    pub(crate) consts: Vec<Py<PyAny>>,
+    pub(crate) nodes: Vec<Vec<Py<PyAny>>>,
 }
 
 impl Env {
-    fn get<'py>(&self, py: Python<'py>, reference: Ref) -> PyResult<Bound<'py, PyAny>> {
+    pub(crate) fn get<'py>(&self, py: Python<'py>, reference: Ref) -> PyResult<Bound<'py, PyAny>> {
         let missing = || {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "torch._C capture: replay reached a value that had not been produced yet",
@@ -677,6 +677,59 @@ impl PyCaptureTrace {
         py: Python<'py>,
         inputs: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyTuple>> {
+        let env = self.run(py, inputs)?;
+        let mut out = Vec::with_capacity(self.outputs.len());
+        for reference in &self.outputs {
+            out.push(env.get(py, *reference)?);
+        }
+        PyTuple::new(py, out)
+    }
+
+    /// Reverse-mode over this trace. docs/BACKWARD.md.
+    ///
+    /// The forward is replayed first, because a `CaptureTrace` keeps only the
+    /// *shape* of every intermediate and not the intermediate itself -- capture
+    /// drops its keepalives at `_capture_end` (docs/CAPTURE.md §6), and holding
+    /// every activation for the life of every trace would be the wrong default
+    /// for the traces that are never differentiated. The cost is one extra
+    /// forward per backward, and it is named here rather than hidden.
+    #[pyo3(signature = (inputs, grad_outputs = None, wrt_constants = None))]
+    fn backward<'py>(
+        &self,
+        py: Python<'py>,
+        inputs: &Bound<'py, PyAny>,
+        grad_outputs: Option<&Bound<'py, PyAny>>,
+        wrt_constants: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        crate::tape::backward(py, self, inputs, grad_outputs, wrt_constants)
+    }
+
+    /// Which ops a gradient would have to flow through in this trace, and
+    /// whether the tape has a rule for each.
+    ///
+    /// Exists so that "what stops this model" is answerable **without** running
+    /// a backward and reading the exception -- docs/BACKWARD.md's wall table is
+    /// generated from this, not hand-kept, because hand-kept op lists in this
+    /// repository have gone stale five times.
+    #[pyo3(signature = (wrt_constants = None))]
+    fn differentiable<'py>(
+        &self,
+        py: Python<'py>,
+        wrt_constants: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        crate::tape::differentiable(py, self, wrt_constants)
+    }
+}
+
+impl PyCaptureTrace {
+    /// Replay the record and keep **every** value it produced.
+    ///
+    /// `replay` is this plus a projection onto the declared outputs; the tape
+    /// is this plus a reverse walk. Extracting it means the two cannot drift
+    /// apart -- a backward that materialised its activations its own way would
+    /// be differentiating a different forward from the one `replay` proves
+    /// equal to eager.
+    pub(crate) fn run<'py>(&self, py: Python<'py>, inputs: &Bound<'py, PyAny>) -> PyResult<Env> {
         if is_active() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "torch._C capture: cannot replay a trace while recording -- the replay's \
@@ -752,15 +805,9 @@ impl PyCaptureTrace {
             env.nodes.push(slots.into_iter().map(|s| s.unbind()).collect());
         }
 
-        let mut out = Vec::with_capacity(self.outputs.len());
-        for reference in &self.outputs {
-            out.push(env.get(py, *reference)?);
-        }
-        PyTuple::new(py, out)
+        Ok(env)
     }
-}
 
-impl PyCaptureTrace {
     fn check_guard(&self, index: usize, seen: &TensorMeta) -> PyResult<()> {
         let want = &self.inputs[index];
         if want.shape != seen.shape {

@@ -41,6 +41,7 @@ mod quant;
 mod reduced;
 mod rng;
 mod storage;
+mod tape;
 mod tensor;
 
 use crate::device::PyDevice;
@@ -623,6 +624,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tensor::register(m)?;
     aten::register(m)?;
     capture::register(m)?;
+    tape::register(m)?;
     rng::register(m)?;
     storage::register(m)?;
     quant::register(m)?;

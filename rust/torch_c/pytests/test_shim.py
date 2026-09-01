@@ -348,12 +348,28 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     checked either, so docs/AUTOGRAD.md could have gone stale the same way
     docs/AUDIT.md found six of eleven documents had.
 
-    **This test is written to fail when autograd lands.** That is deliberate,
-    and it is the shape `test_the_two_stale_sdpa_refusals_no_longer_claim_a_
-    missing_kernel` already set: when the boundary moves, invert this test
-    rather than deleting it, and revisit docs/AUTOGRAD.md §1 in the same
-    commit. A silently-passing document is the failure mode being guarded
-    against here.
+    **This test was written to fail when autograd landed, and a backward has
+    landed without failing it.** That is not the test missing something. It is
+    that the boundary pinned here is a *different* boundary from the one
+    docs/BACKWARD.md moved, and keeping them apart is the point:
+
+      * `CaptureTrace.backward()` differentiates a **recorded region**. It
+        needs no flag on any tensor and builds nothing as ops run, because the
+        record already is the graph.
+      * `Tensor.backward()` differentiates **whatever produced this tensor**,
+        which needs a node per op and a flag that propagates through them.
+
+    Every line below is about the second one and every line of it still holds:
+    `requires_grad` is inert, `mul` does not propagate it, and both walls
+    refuse. The one thing that changed is `.grad`, which is a real slot now --
+    docs/AUTOGRAD.md §7 argued for leaving it read-only *while nothing wrote
+    to it*, and something does.
+    `test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none` is that
+    half; the assertion here is only that it still *starts* empty.
+
+    If the first boundary ever moves too, invert this rather than deleting it,
+    the way `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`
+    did.
     """
     x = _C._aten_dispatch("aten.full.default", [4], 2.0)
 
@@ -364,6 +380,8 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     # ... and the rest of the shape is the honest report of "no graph exists".
     assert x.is_leaf is True
     assert x.grad_fn is None
+    # `.grad` is settable now, but nothing sets it implicitly: a tensor that
+    # has been through no backward still reports None, and that is the claim.
     assert x.grad is None
 
     # 2. Nothing reads the flag. This is the load-bearing one: an op does not
@@ -14114,6 +14132,430 @@ def _main():
             print(f"ok   {name}")
     print(f"\ntarget={_C._shim_target()} implemented={_C._aten_implemented()}")
     return 1 if failures else 0
+
+
+# --- the tape: reverse mode over a captured trace (docs/BACKWARD.md) --------
+#
+# Every rule in `tape.rs`'s `RULE_OPS` is checked here against **central
+# differences in float64**, which is an oracle that shares no code with the
+# rule it checks. That matters more than usual for this file: a derivative rule
+# is a short expression over ops that already work, so a test that recomputed
+# the same expression would agree with a rule that had the operands the wrong
+# way round, the sign flipped, or the broadcast unreduced. Finite differences
+# know nothing about the expression.
+#
+# `float64` and `h = 1e-6` put the truncation error near 1e-13 and the
+# cancellation error near 2e-9 for the O(1) functions below, so `1e-5` is two
+# orders of margin. docs/BACKWARD.md §6 records where that oracle stops being
+# usable -- on a real model it disagrees with **upstream's own autograd** by a
+# factor of 600, which is what a check has to be able to say about itself.
+
+
+def _tape_f64(values, shape):
+    return _C._tensor_from_flat([float(v) for v in values], shape, _C.float64)
+
+
+def _tape_i64(values, shape):
+    return _C._tensor_from_flat([int(v) for v in values], shape, _C.int64)
+
+
+def _tape_ramp(n, lo=0.25, hi=1.75):
+    """`n` distinct positive values. Distinct so that a rule which returns the
+    right *shape* by rearranging the wrong elements is still caught, and
+    positive so `log`, `sqrt` and `rsqrt` share the same generator."""
+    return [lo + (hi - lo) * (i + 1) / (n + 1) for i in range(n)]
+
+
+def _tape_scalarise(t):
+    """A scalar to differentiate, built so that every input element has a
+    *different* gradient.
+
+    `sum(t)` alone would give a gradient of all ones through any shape op,
+    which is exactly the case a transposed, reversed or mis-sliced rule still
+    passes. `sum(exp(t))` does not.
+    """
+    d = _C._aten_dispatch
+    return d("aten.sum.default", d("aten.exp.default", t))
+
+
+def _tape_case_bodies():
+    """`op -> (input values, input shape, fn)`, one entry per rule in
+    `_C._tape_rules()`.
+
+    `fn` takes the trace's single input and returns a scalar. Everything else
+    it touches becomes a burned-in constant, which is what makes the weights of
+    a real model constants too (docs/CAPTURE.md §2)."""
+    d = _C._aten_dispatch
+    s = _tape_scalarise
+
+    def shape_case(shape, body):
+        n = 1
+        for extent in shape:
+            n *= extent
+        return (_tape_ramp(n), shape, body)
+
+    cases = {}
+
+    # -- shape and identity ------------------------------------------------
+    cases["aten.t.default"] = shape_case([2, 3], lambda x: s(d("aten.t.default", x)))
+    cases["aten.transpose.int"] = shape_case(
+        [2, 3, 4], lambda x: s(d("aten.transpose.int", x, 0, 2)))
+    cases["aten.permute.default"] = shape_case(
+        [2, 3, 4], lambda x: s(d("aten.permute.default", x, [2, 0, 1])))
+    cases["aten.view.default"] = shape_case(
+        [2, 6], lambda x: s(d("aten.view.default", x, [3, 4])))
+    cases["aten.reshape.default"] = shape_case(
+        [2, 6], lambda x: s(d("aten.reshape.default", x, [4, 3])))
+    cases["aten._unsafe_view.default"] = shape_case(
+        [2, 6], lambda x: s(d("aten._unsafe_view.default", x, [12])))
+    cases["aten.unsqueeze.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.unsqueeze.default", x, 1)))
+    cases["aten.squeeze.dim"] = shape_case(
+        [1, 6], lambda x: s(d("aten.squeeze.dim", x, 0)))
+    cases["aten.expand.default"] = shape_case(
+        [1, 3], lambda x: s(d("aten.expand.default", x, [4, 3])))
+    cases["aten.contiguous.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.contiguous.default", x)))
+    cases["aten.clone.default"] = shape_case([2, 3], lambda x: s(d("aten.clone.default", x)))
+    cases["aten.alias.default"] = shape_case([2, 3], lambda x: s(d("aten.alias.default", x)))
+    cases["aten.lift_fresh.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.lift_fresh.default", x)))
+    cases["aten._to_copy.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten._to_copy.default", x, dtype=_C.float64)))
+
+    # -- slicing and joining -----------------------------------------------
+    # Asymmetric on purpose: `slice(x, 0, 1, 3)` of a `[4, 3]` leaves one row
+    # of padding on each side, so a rule that swapped the two pads would still
+    # pass. Taking one row of four leaves 1 and 2.
+    cases["aten.slice.Tensor"] = shape_case(
+        [4, 3], lambda x: s(d("aten.slice.Tensor", x, 0, 1, 2, 1)))
+    cases["aten.select.int"] = shape_case(
+        [4, 3], lambda x: s(d("aten.select.int", x, 0, 2)))
+    cases["aten.constant_pad_nd.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.constant_pad_nd.default", x, [1, 2], 0.0)))
+    cases["aten.cat.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.cat.default", [x, d("aten.mul.Scalar", x, 2.0)], 1)))
+
+    # -- elementwise -------------------------------------------------------
+    other = _tape_f64(_tape_ramp(6, 0.5, 2.5), [2, 3])
+    row = _tape_f64(_tape_ramp(3, 0.5, 2.5), [3])
+    cases["aten.add.Tensor"] = shape_case([2, 3], lambda x: s(d("aten.add.Tensor", x, other)))
+    cases["aten.sub.Tensor"] = shape_case([2, 3], lambda x: s(d("aten.sub.Tensor", x, other)))
+    cases["aten.add.Scalar"] = shape_case([2, 3], lambda x: s(d("aten.add.Scalar", x, 0.75)))
+    cases["aten.sub.Scalar"] = shape_case([2, 3], lambda x: s(d("aten.sub.Scalar", x, 0.75)))
+    cases["aten.rsub.Scalar"] = shape_case([2, 3], lambda x: s(d("aten.rsub.Scalar", x, 3.0)))
+    cases["aten.neg.default"] = shape_case([2, 3], lambda x: s(d("aten.neg.default", x)))
+    # The broadcast case, deliberately: a `[3]` against a `[2, 3]` is the
+    # RMSNorm shape, and it is the one `reduce_to` exists for.
+    cases["aten.mul.Tensor"] = shape_case([2, 3], lambda x: s(d("aten.mul.Tensor", x, row)))
+    cases["aten.mul.Scalar"] = shape_case([2, 3], lambda x: s(d("aten.mul.Scalar", x, 1.5)))
+    cases["aten.div.Tensor"] = shape_case([2, 3], lambda x: s(d("aten.div.Tensor", x, other)))
+    cases["aten.div.Scalar"] = shape_case([2, 3], lambda x: s(d("aten.div.Scalar", x, 2.5)))
+    cases["aten.pow.Tensor_Scalar"] = shape_case(
+        [2, 3], lambda x: s(d("aten.pow.Tensor_Scalar", x, 3.0)))
+    cases["aten.exp.default"] = shape_case([2, 3], lambda x: s(d("aten.exp.default", x)))
+    cases["aten.log.default"] = shape_case([2, 3], lambda x: s(d("aten.log.default", x)))
+    cases["aten.sqrt.default"] = shape_case([2, 3], lambda x: s(d("aten.sqrt.default", x)))
+    cases["aten.rsqrt.default"] = shape_case([2, 3], lambda x: s(d("aten.rsqrt.default", x)))
+    cases["aten.sin.default"] = shape_case([2, 3], lambda x: s(d("aten.sin.default", x)))
+    cases["aten.cos.default"] = shape_case([2, 3], lambda x: s(d("aten.cos.default", x)))
+    cases["aten.tanh.default"] = shape_case([2, 3], lambda x: s(d("aten.tanh.default", x)))
+    cases["aten.sigmoid.default"] = shape_case([2, 3], lambda x: s(d("aten.sigmoid.default", x)))
+    cases["aten.silu.default"] = shape_case([2, 3], lambda x: s(d("aten.silu.default", x)))
+    cases["aten.gelu.default"] = shape_case([2, 3], lambda x: s(d("aten.gelu.default", x)))
+    # `relu` is not differentiable at 0 and finite differences say so loudly,
+    # so the ramp is kept clear of it -- and both sides of it are covered.
+    cases["aten.relu.default"] = (
+        [-1.5, -0.5, 0.5, 1.5, 2.5, 3.5], [2, 3], lambda x: s(d("aten.relu.default", x)))
+    mask = _C._tensor_from_flat([1, 0, 0, 1, 0, 1], [2, 3], _C.bool)
+    cases["aten.masked_fill.Scalar"] = shape_case(
+        [2, 3], lambda x: s(d("aten.masked_fill.Scalar", x, mask, 0.5)))
+    cases["aten.where.self"] = shape_case(
+        [2, 3], lambda x: s(d("aten.where.self", mask, x, d("aten.mul.Scalar", x, 3.0))))
+
+    # -- reductions --------------------------------------------------------
+    cases["aten.sum.default"] = shape_case(
+        [2, 3], lambda x: d("aten.exp.default", d("aten.sum.default", x)))
+    cases["aten.sum.dim_IntList"] = shape_case(
+        [2, 3], lambda x: s(d("aten.sum.dim_IntList", x, [1], False)))
+    cases["aten.mean.default"] = shape_case(
+        [2, 3], lambda x: d("aten.exp.default", d("aten.mean.default", x)))
+    cases["aten.mean.dim"] = shape_case(
+        [2, 3], lambda x: s(d("aten.mean.dim", x, [-1], True)))
+
+    # -- matmul ------------------------------------------------------------
+    rhs = _tape_f64(_tape_ramp(12, 0.2, 1.2), [3, 4])
+    bias = _tape_f64(_tape_ramp(4, 0.1, 0.5), [4])
+    batched = _tape_f64(_tape_ramp(24, 0.2, 1.2), [2, 3, 4])
+    cases["aten.mm.default"] = shape_case([2, 3], lambda x: s(d("aten.mm.default", x, rhs)))
+    cases["aten.matmul.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.matmul.default", x, rhs)))
+    cases["aten.bmm.default"] = shape_case(
+        [2, 2, 3], lambda x: s(d("aten.bmm.default", x, batched)))
+    cases["aten.addmm.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.addmm.default", bias, x, rhs)))
+
+    # -- softmax and loss --------------------------------------------------
+    cases["aten._softmax.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten._softmax.default", x, -1, False)))
+    # `sum(exp(log_softmax(x)))` is identically 1, so its gradient is zero for
+    # every input and every rule -- including a wrong one. Weighting first is
+    # what makes this case able to fail at all.
+    cases["aten._log_softmax.default"] = shape_case(
+        [2, 3], lambda x: s(d("aten.mul.Tensor",
+                              d("aten._log_softmax.default", x, -1, False), other)))
+    # One row ignored, deliberately. Without it `total_weight` equals the row
+    # count and the `reduction=Mean` divisor cannot be told from a count -- and
+    # the whole `ignore_index` branch is never entered. docs/LOSS.md §3.1 is
+    # the forward half of the same trap.
+    targets = _tape_i64([2, 0, -100, 3], [4])
+    cases["aten.nll_loss_forward.default"] = shape_case(
+        [4, 4],
+        lambda x: d("aten.nll_loss_forward.default",
+                    d("aten._log_softmax.default", x, 1, False), targets, None, 1, -100)[0])
+
+    # -- embedding ---------------------------------------------------------
+    # The *table* is the input here, so the gradient this checks is the one an
+    # `embedding_dense_backward` would produce -- including the repeated row,
+    # which is the case a non-accumulating scatter gets wrong.
+    ids = _tape_i64([2, 0, 2, 1], [2, 2])
+    cases["aten.embedding.default"] = shape_case(
+        [3, 4], lambda x: s(d("aten.embedding.default", x, ids)))
+
+    # -- attention ---------------------------------------------------------
+    # Grouped-query (2 query heads to 1 kv head) and causal, which is
+    # SmolLM2's shape in miniature. Both are things the rule has to undo
+    # rather than assume away.
+    # Key and value are built *from the input* rather than being constants:
+    # the grouped-query fold only shows up in key's and value's gradients, so a
+    # case where the input is the query alone passes with the fold removed.
+    def _sdpa(x):
+        kv = d("aten.mean.dim", x, [1], True)
+        return s(d("aten._scaled_dot_product_flash_attention_for_cpu.default",
+                   x, kv, d("aten.mul.Scalar", kv, 1.5), 0.0, True)[0])
+
+    cases["aten._scaled_dot_product_flash_attention_for_cpu.default"] = shape_case(
+        [1, 2, 2, 4], _sdpa)
+
+    # -- the one rule that is "no gradient" --------------------------------
+    cases["aten.detach.default"] = shape_case([2, 3], lambda x: s(d("aten.detach.default", x)))
+    return cases
+
+
+def _tape_gradient(case):
+    values, shape, fn = case
+    x = _tape_f64(values, shape)
+    _C._capture_begin([x])
+    try:
+        out = fn(x)
+        trace = _C._capture_end(out)
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    return trace, trace.backward([x])["inputs"][0]
+
+
+def _tape_central_differences(case, h=1e-6):
+    values, shape, fn = case
+    out = []
+    for i in range(len(values)):
+        up, down = list(values), list(values)
+        up[i] += h
+        down[i] -= h
+        out.append((fn(_tape_f64(up, shape)).tolist()
+                    - fn(_tape_f64(down, shape)).tolist()) / (2 * h))
+    return out
+
+
+def _tape_flat(t):
+    flat = []
+
+    def walk(v):
+        if isinstance(v, list):
+            for item in v:
+                walk(item)
+        else:
+            flat.append(v)
+
+    walk(t.tolist())
+    return flat
+
+
+def test_the_tape_has_a_gradient_case_for_every_rule_it_claims():
+    """`RULE_OPS` is a second list of op names, which is the shape of the
+    failure docs/AUDIT.md found six times -- a list nobody re-reads going
+    stale beside the code it describes.
+
+    So it is not read: `differentiable()` reports against it, and this asserts
+    that the case table below covers it exactly. Adding a rule without a
+    gradient case, or leaving a case for a rule that was removed, fails here.
+    """
+    claimed = set(_C._tape_rules())
+    covered = set(_tape_case_bodies())
+    assert claimed - covered == set(), (
+        "rules with no gradient case: %s" % sorted(claimed - covered))
+    assert covered - claimed == set(), (
+        "gradient cases for rules that do not exist: %s" % sorted(covered - claimed))
+    assert len(claimed) == len(_C._tape_rules()), "RULE_OPS has a duplicate"
+
+
+def test_every_tape_rule_agrees_with_central_differences_in_float64():
+    """The rules, against an oracle that shares no code with them.
+
+    Each case is a scalar function of one float64 input built out of the op
+    under test; the tape's gradient is compared with `(f(x+h) - f(x-h)) / 2h`,
+    element by element. A rule that has its operands the wrong way round, drops
+    a broadcast reduction, transposes the wrong pair of axes or loses a sign
+    disagrees here even though it would still return a gradient of exactly the
+    right shape -- which is the failure a test that only checked shapes, or one
+    that recomputed the rule's own expression, would pass.
+    """
+    for op, case in sorted(_tape_case_bodies().items()):
+        trace, gradient = _tape_gradient(case)
+        report = trace.differentiable()
+        assert op in report["covered"], (op, report)
+        assert not report["missing"], (op, report["missing"])
+
+        if op == "aten.detach.default":
+            # The one rule whose answer is "no gradient flows", so finite
+            # differences must *disagree*: the function really does change.
+            assert gradient is None, op
+            assert max(abs(v) for v in _tape_central_differences(case)) > 1e-3, op
+            continue
+
+        assert gradient is not None, op
+        got = _tape_flat(gradient)
+        want = _tape_central_differences(case)
+        assert len(got) == len(want), (op, len(got), len(want))
+        scale = max(max(abs(v) for v in want), 1.0)
+        worst = max(abs(a - b) for a, b in zip(got, want)) / scale
+        assert worst < 1e-5, (op, worst, got, want)
+        # A case whose gradient is all zeros would pass the line above without
+        # exercising anything.
+        assert max(abs(v) for v in got) > 1e-6, (op, "the case has no gradient")
+
+
+def test_the_tape_refuses_an_op_it_has_no_rule_for_by_name():
+    """docs/DESIGN.md §6, applied to a derivative: a tape that guessed would
+    produce a gradient exactly as plausible as a correct one.
+
+    `topk` is chosen because it is implemented, differentiable upstream, and
+    has no rule here -- so this checks the refusal rather than a missing
+    kernel. `differentiable()` names it *before* a backward is run, which is
+    the property docs/BACKWARD.md's wall table is generated from.
+    """
+    x = _tape_f64(_tape_ramp(6), [6])
+    _C._capture_begin([x])
+    values = _C._aten_dispatch("aten.topk.default", x, 3)[0]
+    trace = _C._capture_end(_C._aten_dispatch("aten.sum.default", values))
+
+    report = trace.differentiable()
+    assert report["missing"] == {"aten.topk.default": 1}, report
+    assert "aten.sum.default" in report["covered"], report
+
+    try:
+        trace.backward([x])
+    except NotImplementedError as e:
+        message = str(e)
+        assert "aten.topk.default" in message, message
+        assert "no derivative rule" in message, message
+    else:
+        raise AssertionError(
+            "the tape produced a gradient through an op it has no rule for; if "
+            "topk gained one, move this test to another op rather than deleting it")
+
+
+def test_a_gradient_reaches_a_burned_in_constant_and_only_the_ones_asked_for():
+    """The split that makes an optimiser step possible.
+
+    A model's weights are not trace *inputs* -- capture burns them in as
+    constants (docs/CAPTURE.md §2), which is the same split
+    `ExportedProgram.graph_signature` makes. So "the gradient of the loss with
+    respect to this parameter" is "the gradient at this constant", and
+    `wrt_constants` is how a caller says which ones it wants. An integer
+    constant is dropped whichever way it is named: token ids are constants too.
+    """
+    d = _C._aten_dispatch
+    weight = _tape_f64(_tape_ramp(9), [3, 3])
+    ids = _tape_i64([1, 0], [2])
+    x = _tape_f64(_tape_ramp(3, 1.0, 2.0), [3])
+    _C._capture_begin([x])
+    picked = d("aten.embedding.default", weight, ids)
+    scaled = d("aten.mul.Tensor", picked, x)
+    trace = _C._capture_end(d("aten.sum.default", scaled))
+
+    both = trace.backward([x])
+    assert len(both["constants"]) == 2
+    # Exactly one of the two constants is floating point, and it is the one
+    # that gets a gradient. The ids do not, and asking for them does not
+    # change that.
+    grads = [g for g in both["constants"] if g is not None]
+    assert len(grads) == 1, [None if g is None else g.shape for g in both["constants"]]
+    assert list(grads[0].shape) == [3, 3], list(grads[0].shape)
+    # Row 2 was never looked up, so its gradient is exactly zero; rows 0 and 1
+    # were, so theirs are not.
+    rows = grads[0].tolist()
+    assert rows[2] == [0.0, 0.0, 0.0], rows
+    assert rows[0] != [0.0, 0.0, 0.0] and rows[1] != [0.0, 0.0, 0.0], rows
+
+    # Naming no constants leaves the input's gradient and nothing else.
+    none = trace.backward([x], None, [])
+    assert all(g is None for g in none["constants"]), none["constants"]
+    assert none["inputs"][0] is not None
+
+
+def test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise():
+    """`backward()` with no `grad_outputs` means `d(output)/d(output) = 1`,
+    which is only a definition when the output is a scalar. Guessing for a
+    non-scalar would silently sum it, which is a different function."""
+    d = _C._aten_dispatch
+    x = _tape_f64(_tape_ramp(4), [4])
+    _C._capture_begin([x])
+    trace = _C._capture_end(d("aten.mul.Scalar", x, 3.0))
+    try:
+        trace.backward([x])
+    except RuntimeError as e:
+        assert "not a scalar" in str(e), str(e)
+    else:
+        raise AssertionError("a non-scalar output was seeded with a one")
+
+    # Given explicitly, it is the vector-Jacobian product it claims to be.
+    seed = _tape_f64([1.0, 2.0, 3.0, 4.0], [4])
+    got = trace.backward([x], [seed])["inputs"][0].tolist()
+    assert got == [3.0, 6.0, 9.0, 12.0], got
+
+
+def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
+    """docs/AUTOGRAD.md §7 argued for leaving `.grad` a read-only `None`
+    *while nothing writes to it*. The tape writes to it, so that antecedent is
+    gone -- and this pins what replaced it rather than leaving the argument in
+    a docstring.
+
+    What has **not** changed is everything else on that boundary:
+    `Tensor.backward()` still refuses, `requires_grad` is still inert, and no
+    op propagates it. `test_the_autograd_boundary_is_where_autograd_md_says_it
+    _is` is where that half lives.
+    """
+    x = _tape_f64([1.0, 2.0], [2])
+    assert x.grad is None
+    g = _tape_f64([0.5, 0.25], [2])
+    x.grad = g
+    assert x.grad is g
+    x.grad = None
+    assert x.grad is None
+    try:
+        x.grad = 1.0
+    except TypeError as e:
+        assert "TensorBase or None" in str(e), str(e)
+    else:
+        raise AssertionError("Tensor.grad accepted a float")
+    # A clone does not inherit a gradient: a gradient belongs to the leaf it
+    # was accumulated into, and upstream gives a non-leaf no `.grad` at all.
+    x.grad = g
+    assert _C._aten_dispatch("aten.clone.default", x).grad is None
 
 
 if __name__ == "__main__":
