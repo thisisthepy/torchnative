@@ -1547,3 +1547,1045 @@ Two further checks, since the sub-agent's three fixes arrived unverified:
   finding here. It was my harness: I had called `to_empty(device='cpu')` on the same module first,
   which materialises the parameters, so the later `.to('cpu')` had nothing to copy out of meta. On a
   fresh module both sides raise `NotImplementedError` with the identical message.
+
+---
+
+## Findings (round 3 — the last 24, plus LOSS.md and SCALAR.md's full read)
+
+Same method as rounds 1-2. Territory this round: `docs/*.md` except BACKWARD.md, ADAPT.md,
+TRAIN.md, CAPTURE.md (owned concurrently by another agent), plus `tools/docwatch/`. Forbidden:
+`rust/`, `tools/wheel/`, `tools/golden/`, `scripts/`, `torchnative/`.
+
+Baseline (worktree `/Volumes/macMini/worktrees/bw-doclast`, established before touching any file,
+same commands as rounds 1-2):
+
+```
+PYTHON=$PY sh rust/torch_c/pytests/run.sh          -> EXIT=0, 317 "ok " lines, DOCWATCH: PASS -- 190/190
+$PY tools/golden/compare.py                        -> EXIT=0, SUMMARY: 7685/7685 cases passed, 0 failed, ops covered=168, pending case builders=1
+$PY rust/torch_c/pytests/verify_schemas.py         -> EXIT=0, SUMMARY: 4479/4479 table entries matched upstream, 0 failed
+```
+
+Implemented-ops snapshot captured in `/tmp/doclast_implemented_ops.txt` (168 ops). All 190
+pre-existing markers (rounds 1-2) still PASS against this baseline before this round touched
+anything — no re-staleness in the marker set itself this time (unlike round 2's DOCWATCH.md
+finding against round 1's own baseline paragraph).
+
+The brief's priority pattern — a refusal naming a kernel as missing, now closed by unrelated later
+work — has fired 12 times across rounds 1-2 (ARCH20.md, META.md, DYNAMO.md, DESIGN.md x2,
+OVERLOAD.md, TENSORBASE.md, SDPA.md, QUANT2.md, DISTRIBUTED.md, DEVICE_ABS.md, SAMPLING.md,
+DEVICE.md, ARCH.md, GPT2.md, OPS4.md, OPS8.md — more than 12 counting multi-instance files).
+Checked first in every file below.
+
+### docs/FROM_CONFIG.md
+
+392 lines, a genesis-era pre-measurement document (§0: "우리 shim 은 아직 여기 도달하지 못했으므로,
+진짜 torch 로 계측했다") — instruments what `AutoModelForCausalLM.from_config` needs before any of
+it was implemented. Exactly the shape this round was told to expect: a 3-op snapshot
+(`aten.add.Tensor`/`aten.full.default`/`aten.mm.default`) that 65+ rounds since built on top of.
+
+- **Claim (§2.1, §5 table, §6):** 14 ops the `from_config` path calls (`normal_`, `empty.
+  memory_format`, `uniform_`, `ones`, `fill_.Scalar`, `arange.start_step`, `div.Tensor`, `pow.
+  Scalar`, `reciprocal`, `mul.Tensor`, `detach`, `lift_fresh`, `copy_`, `clone`) are "14 개 중 0 개"
+  implemented; RNG (`torch.Generator`/`manual_seed`/candle-vs-torch value match) is unconfirmed;
+  the recommended next verification step (re-run the same script against our own shim) was not yet
+  done. **Status: FALSE today — all 14 ops implemented, RNG ported, and the next-step re-run now
+  succeeds.** **How checked:** grepped all 14 op spellings against the current 168-op
+  `_aten_implemented()` snapshot — all present. Live-ran the exact scenario this document's own §6
+  names as the next step: `AutoModelForCausalLM.from_config(cfg)` with the identical llama config
+  against our own shim (not real torch) — succeeds, and the parameter count matches this document's
+  own real-torch measurement exactly (95,040). `rust/torch_c/src/rng.rs` has a ported MT19937 engine
+  and `torch.manual_seed` remap, closing §4.3's "미확인" on RNG algorithm match (cross-referencing
+  round 2's RNG.md/TENSORBASE.md findings, same landing commit `2d3663f`).
+  **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote after the opening
+  paragraph, before the original method/measurement text, per house style (leave the historical
+  measurement visible, mark when it stopped being current). Marked `op-implemented` for 4
+  representative ops (not all 14 — a `count`-style "N of 14" claim isn't one of the six primitives,
+  and marking all 14 individually would be redundant with existing OVERLOAD.md/TENSORBASE.md/
+  SAMPLING.md markers for several of the same ops) and `symbol-in-file` for the RNG port.
+- §1 (the dual-instrumentation methodology, the `Generator` immutable-type workaround), §3
+  (`GenerationMixin`'s two real requirements: `no_grad` decorator protocol, `torch.*Tensor`
+  annotations evaluated at class-body time), §4.1-4.2 (double-init via `kaiming_uniform_` then
+  `normal_`, `transformers.initialization`'s capture layer): mechanism descriptions and
+  measurement methodology, not counts that drift — not re-verified, no reason to suspect.
+- **Fixed: one (all 14 "not implemented" op claims plus the RNG-value-match unknown, same severity
+  class as round 2's OVERLOAD.md/TENSORBASE.md findings — this is the earliest-written of the three
+  documents making this exact claim, so its staleness is also the most complete: 14/14, not a
+  partial set).**
+
+### docs/TRIL.md
+
+586 lines, the round that landed `tril`/`triu`, fixed a NaN-dropping bug in `max.dim`/`max.other`/
+`argmax` (found for the fourth time, repaired in one shared function), and closed the twentieth
+architecture (GPT-BigCode). Unusually rigorous already — an 11-fault sabotage table with one fault
+that could not fail, reported as such rather than hidden — house style already fully applied. Two
+"not done here" items in §6.5's "what this round did not verify" checked directly, since that
+section is exactly the "next step" shape this round prioritises.
+
+- **Claim (§6.5, "The SDPA math backend"):** "§2.3 corrected the refusals' reason and did not build
+  the composite. Its kernels are all present; nobody has transcribed the sequence." **Status: FALSE
+  today — built by a later, unrelated commit.** `git merge-base --is-ancestor 3b7d981 1938ad1`
+  confirms this document's own commit (`3b7d981`) predates `1938ad1` ("Feat: Open training mode,
+  which every sweep in this repository had assumed away"), which added `_sdpa_math` to
+  `bootstrap.py`. **How checked:** `_sdpa_math` exists at `bootstrap.py:5288`; live-called the exact
+  scenario the surrounding code names as routing to it (`dropout_p != 0.0` falls off the flash
+  path) — `F.scaled_dot_product_attention(q, k, v, dropout_p=0.1, is_causal=True)` succeeds today.
+  Round 2's SDPA.md/CKPT2.md/GENERATE.md audits already independently confirmed the same function
+  from its `enable_gqa` branch — this is the same landing, found here from the "was it ever built"
+  angle rather than the "does GQA work" angle.
+  **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote after the
+  §6.5 bullet, pointing to the landing commit and the live re-verification, without rewriting the
+  original "not attempted" framing (correct when written). Marked `symbol-in-file`.
+- **Claim (§2.4, §3.4, §6.5):** `aten.amin.default`/`aten.argmin.default` have no kernel — a
+  direction-specific `CustomOp1` that would need to be written, not a sign flip on `amax`.
+  **Status: confirmed still true.** How checked: both absent from the current 168-op
+  `_aten_implemented()` list. Marked `op-not-implemented` for both.
+- §0-§1 (the tril/triu kernel, the sign-convention table, the NaN-vs-multiply zeroing bug), §2.1-2.2
+  (`amax`/`softmax` spelling fixes), §3 (the shared `nan_along_dim` mechanism, the `-inf` boundary
+  case), §4 (the NaN-position test methodology), §5 (the 11-fault sabotage table), §6.1-6.4 (gate
+  counts, the smoke-test update table, the SmolLM2 hash-unchanged verification): round-scoped
+  landing narrative and mechanism description, not re-verified — no reason to suspect any, and §6.1's
+  gate counts are superseded by this round's own baseline header rather than individually stale.
+- **Fixed: one** — the SDPA-math-backend "not built" claim, same shape as round 2's SDPA.md/
+  CKPT2.md/GENERATE.md findings (a document naming an unbuilt composite that a later, unrelated
+  training-mode round then built) — the fourth document in this audit's overall run to make this
+  same claim about the same composite, and the last one still open before this round.
+
+### docs/REGISTRATIONS.md
+
+340 lines, a genesis-era measurement document (measured against real upstream torch, because "the
+shim doesn't even reach `from_config` yet") sizing the 1549 no-op `torch.library` registrations the
+vendored tree makes at import time, and judging none of them worth fixing right now — but naming
+two things that *are* worth fixing first: `_log_api_usage_once` (blocking `from_config` itself) and
+`_dispatch_get_registrations_for_dispatch_key` (blocking `core_aten_decompositions()`). Both are
+exactly the "refusal names something as missing" shape this round prioritises, and both are the
+document's own explicit "cannot be deferred" list (§5).
+
+- **Claim (§0 table, §5 item 2):** `from_config` doesn't even reach the model-construction stage —
+  it now fails even earlier than previously recorded, at `nn.Module.__init__` calling
+  `torch._C._log_api_usage_once`, which doesn't exist. **Status: FALSE today.** **How checked:**
+  `hasattr(torch._C, '_log_api_usage_once')` → `True` (`bootstrap.py:4777`); independently
+  reconfirmed by this same round's `docs/FROM_CONFIG.md` audit, which ran `from_config` on our own
+  shim end to end and it succeeded.
+- **Claim (§0 table, §4's last row, §5's "미룰 수 없는 것" item 2):** `core_aten_decompositions()`
+  crashes with `NotImplementedError: torch._C._dispatch_get_registrations_for_dispatch_key`; the
+  shim's `decomposition_table` is 592 entries (vs. real torch's 1097) because of a hardcoded
+  `_jit_get_operation` `overload_names=["default"]` that collapses every op packet to one overload.
+  **Status: FALSE today, both halves.** **How checked:** `hasattr(torch._C,
+  '_dispatch_get_registrations_for_dispatch_key')` → `True` (`bootstrap.py:1443`);
+  `core_aten_decompositions()` no longer crashes, returns 417 entries live (real torch, re-verified
+  unchanged today: 940 — a real remaining gap, not a crash); `decomposition_table` is 1008 today
+  (real torch, re-verified unchanged: 1097). The `overload_names` fix is `docs/DECOMP.md` §3 (round
+  2 of this audit) — its own code comment at `bootstrap.py:1223` cites this exact document by name
+  ("the reason it exists is docs/DECOMP.md §3"), so the fix already knew what it was closing; this
+  is the first time this audit round has found a document's own future fix already cross-linked in
+  the source it's auditing, not just in a sibling document.
+  **Not fixed:** "973" (§0's DESIGN.md-attributed number) is still not reproduced by any measurement
+  in this document or elsewhere — left as an open, unresolved discrepancy, not claimed fixed.
+  **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote after §0's table
+  and a shorter inline correction after §5 item 2, cross-referencing `docs/DECOMP.md` and
+  `docs/FROM_CONFIG.md` rather than re-deriving. Marked `symbol-in-file` for both closed functions.
+- §1-§3 (the 1549-registration taxonomy, the eager-forward "0 dispatched" measurement against real
+  torch, the `_dispatch_has_kernel=True` cost measurement and its 251-item TorchScript-residue
+  finding): round-scoped measurement methodology, not re-verified — these are facts about upstream
+  torch's own registration behavior (pinned to torch 2.13.0, same reasoning as CORE_ATEN.md/
+  QUANT.md above) or about a design decision's cost, not counts that drift with this repo's own
+  kernel growth.
+- §7's unknowns table (the "973" origin, `Autograd`-key registrations under backward, `torch.
+  compile` usage ratio, the impl-count mismatch between shim/real-torch counting layers,
+  `fallback()` at runtime, quantization/distributed/oneDNN dependence): explicit "미확인" admissions,
+  not re-checked — none contradicted by anything found while checking §0/§4/§5.
+- **Fixed: one finding, two symbols, propagating to two spots in the same file** — same severity
+  class as round 2's OVERLOAD.md/TENSORBASE.md findings: a refusal this document treats as the
+  active blocker for reaching `from_config` at all, closed by unrelated later work, with the fix
+  already cross-linked from the fixing commit's own code comment.
+
+### docs/SCHEMA.md
+
+367 lines, the round that gives `_schema` real text (reading the vendored `native_functions.yaml`
+directly rather than a hand-transcribed table) and fixes `is_mutable`, found wrong in both
+directions across two rounds (always-true, then — this round's own finding — always-false). Already
+unusually rigorous about its own claims: §9 is an explicit fault-injection table proving each of its
+five schema-printing rules can actually fail, and §4/§8.1 both explain their own numeric drift
+(97→117 implemented ops between when `docs/DISTRIBUTED.md` §8.1 first found the bug and when this
+document fixed it) rather than leaving it silent.
+
+- **Claim (§12, last bullet):** "`docs/DISTRIBUTED.md` §8.1 은 아직 '미해결'로 적혀 있습니다 ...
+  그 파일은 이 작업의 소유 범위 밖이라 건드리지 않았습니다" (DISTRIBUTED.md §8.1 is still marked
+  unresolved; out of this work's scope, left untouched). **Status: FALSE, and self-contradicted by
+  this document's own landing commit** — not an instance of the usual "later unrelated commit"
+  mechanism this round keeps finding, but a same-commit inconsistency. **How checked:** `git show
+  --stat e26e54b` (this document's own single landing commit, "Feat: Give the schema table real
+  text, so is_mutable can be wrong") shows `docs/DISTRIBUTED.md | 22 +-` in the same diff — the
+  commit that wrote this claim also rewrote `DISTRIBUTED.md` §8.1 with a "해결됐습니다
+  (2026-08-28)." correction block pointing at this exact document. Read literally, "건드리지 않았다"
+  (left untouched) is false about the very commit containing the sentence.
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote noting the
+  self-contradiction and that `DISTRIBUTED.md` §8.1 today does carry the resolution note, without
+  guessing at what the original sentence meant to say (probably "I, the document's author, didn't
+  hand-edit it" vs. "the coordinating session that landed this commit did"). Marked `symbol-in-file`
+  against the Korean resolution text itself, a first for this audit's marker set (confirms
+  `symbol-in-file`'s literal-substring fallback path handles non-ASCII).
+- §6's "2606 answerable / 1148 still placeholder" split (out of upstream's 3754 aten schemas): not
+  independently re-derived — this is arithmetic over a pinned-upstream-version fact (the vendored
+  `native_functions.yaml`'s 2584 declared entries + 18 hand-transcribed + 4 table-only, against
+  upstream torch 2.13.0's registry), the same kind of fact CORE_ATEN.md's `torch.Tag.core`
+  count and QUANT.md's `candle-core` `DType` enum are (pinned to a version, not to this repo's own
+  `_aten_implemented()` growth) — not the drifting category this round's baseline-count growth
+  affects. Spot-checked the *mechanism* instead: `torch._C._shim_placeholder_schemas()` is a
+  per-process query accumulator (§6's own text: "그중 물어진 것은 ... 들어갑니다"), not a static
+  total, so a quick live probe returning 223 is not comparable to the document's 1148 (measured
+  under a much larger workload: import + transformers + FSDP + decomp pass) — reproducing that
+  workload exactly was judged not worth the time given the number is upstream-pinned, not
+  kernel-count-dependent.
+- §0/§4's "117개 구현 중 12개가 mutable" headline count: round-scoped (implemented-op count was 117
+  when written, is 168 today) — house style, not re-annotated, consistent with how §4 itself already
+  explains the 97→117 drift between DISTRIBUTED.md's original finding and this document's fix.
+- §1-§3, §5, §7-§9 (the four-layer schema resolution order and why it's load-bearing, the five
+  upstream-printer rules and their measured counts, the two abandoned designs in §8, the
+  fault-injection table): mechanism descriptions and this round's own measurements, not re-verified
+  — no reason to suspect any, and §9's self-proving fault table already does much of what this audit
+  checks for.
+- **Fixed: one** — smaller in scope than most findings this round (an internal same-commit
+  inconsistency rather than a later-drift staleness), but a new variant of the "correction doesn't
+  propagate" mechanism round 2 found in DISTRIBUTED.md/DEVICE_ABS.md: here the propagation *did*
+  happen (to the other file), just not back to the sentence describing whether it would.
+
+### docs/IMPORT_TORCH.md
+
+600 lines, the round that got a strict-mode `import torch` to exit 0 for the first time (45 walls,
+§8). Already carries a pre-existing correction at the bottom pointing at `docs/REGISTRATIONS.md`
+(landed later, not by this audit) fixing this document's own wrong "973" figure and its causal
+story about `_dispatch_has_kernel` — house style already applied once. §11's "남은 벽과 미확인"
+(remaining walls / unknowns) table is exactly this round's target shape, checked item by item.
+
+- **Claim (§0 table, §11 item 3):** `from_config` still fails, now blocked in transformers'
+  `GenerationMixin` lazy import rather than inside `import torch` itself. **Status: FALSE today** —
+  same finding as this round's `docs/REGISTRATIONS.md`/`docs/FROM_CONFIG.md` audits, both of which
+  independently confirmed `from_config` now succeeds end to end (the blocking wall,
+  `torch._C._log_api_usage_once`, now exists). **Fixed:** yes — added a `> **정정 (문서 감사,
+  2026-09): ...**` blockquote after §0's table, cross-referencing both sibling findings from this
+  same round rather than re-deriving. Marked `symbol-in-file`.
+- **Claim (§11 item 12):** BOOL.md §6.2's table lands the bool tag and single-constructor
+  invariant, but `bitwise_*`/`any`/`masked_fill` kernels are still unimplemented. **Status: FALSE
+  today, all of them.** **How checked:** `aten.bitwise_and.Tensor`/`.Scalar`,
+  `aten.bitwise_or.Tensor`/`.Scalar`, `aten.bitwise_not.default`, `aten.any.default`/`.dim`,
+  `aten.masked_fill.Scalar`/`masked_fill_.Scalar` are all in the current 168-op
+  `_aten_implemented()` list; live-called `x & y`, `t.any()`, `x.masked_fill(mask, 0.0)` — all
+  compute today. **Fixed:** yes — inline correction in the table cell. Marked `op-implemented` for
+  3 representative ops.
+- **Claim (§11 item 10):** `float8_e4m3fn` tensor creation hangs, cause not investigated. **Status:
+  no longer reproduces.** **How checked:** `torch.full((3,), 1.0, dtype=torch.float8_e4m3fn)` under
+  a 5-second `SIGALRM` guard returns normally today. **Not** claiming to know what fixed it — the
+  original cause was never identified, so neither is the fix; only the symptom's absence is
+  reported. **Fixed:** inline correction noting the symptom no longer reproduces, cause still
+  untraced.
+- **Claim (§11 item 11):** the dtype promotion table is still unimplemented, `add.Tensor` refuses by
+  name. **Status: confirmed still true, and — cross-referencing round 2's TORCH_C.md/TENSORBASE.md
+  findings — now known to be *deliberate*, not a placeholder gap.** Inline note added pointing to
+  both, no strikethrough (the claim itself still holds).
+- §1-§9 (the bootstrap-surface architecture, the 45-wall table, the schema parser and its
+  bracket-matching bug fix, the dtype/bool tag design, the two golden-harness bugs found and fixed):
+  mechanism descriptions and this round's own landing measurements, not re-verified — no reason to
+  suspect any, and §9.1's `_dispatch_library`/1549-registration design decision is independently
+  reconfirmed unchanged by this round's own REGISTRATIONS.md audit (still a deliberate no-op, not a
+  gap).
+- §11 items 1, 2, 4-9, 13-14 (the 15 missing sub-byte dtypes, `_TensorMeta` always-true isinstance,
+  the `torch.library` no-op design, op-name-lookup never failing, device import, `TORCH_USE_RTLD_
+  GLOBAL`, `ios-sim`, re-vendoring surface drift, registration-usage ratio): explicit "미확인"/
+  design-decision admissions, not individually re-verified — item 5 (op lookup never fails) was
+  spot-checked live (`hasattr(torch.ops.aten, 'nonsense_op_xyz')` → `True` still) and remains a real
+  gap, consistent with the document's own claim.
+- **Fixed: three (from_config, bool-op kernels, float8_e4m3fn hang) — the bool-op finding is the
+  largest in scope this round after FROM_CONFIG.md's 14-op batch: nine op spellings across three
+  base names, all closed by the same generator-port-era kernel work rounds 2-3 keep finding.**
+
+### docs/IMPORT_WALLS.md
+
+341 lines, a genesis-era exploratory document (`import transformers` against a *stub* torch, no
+kernel work yet) — the earliest-written document read this round, and already the most heavily
+self-correcting one found in either round: four numbered rounds (1차-5차), each with its own
+`> **정정.**` blockquote catching the previous round's own mistake (a `grep -q MODEL_OK` false
+positive in round 2, a mis-diagnosed `@auto_docstring` wall in round 2's "범주 6" that
+`docs/AUTODOC.md` overturned). Checked whether its own remaining "아직 답하지 않은 것" (not yet
+answered) list has since been answered by a sibling document — the same "correction found in a
+different document's own text, not yet linked back" shape found in round 2's TORCH_C.md/CAPTURE.md.
+
+- **Claim (§ "관문 너머" table row 5, § "아직 답하지 않은 것" bullet 1):** category 5
+  (`@torch.no_grad()`'s decorator-and-context-manager dual protocol) is unconfirmed, exploration
+  stopped there. **Status: FALSE — answered by a sibling document that names this one directly.**
+  **How checked:** `docs/FROM_CONFIG.md` §3.3 (audited earlier this round) opens by quoting this
+  exact sentence — "IMPORT_WALLS.md 1차의 category 5... '미확인 — 여기서 멈췄다' 고 적어 둔
+  항목인데, 여기서 정확한 요구 시점과 프로토콜을 확인했습니다" — and gives the answer (class-body
+  evaluation time, dual `__call__`/context-manager protocol). `from_config` succeeds on our own
+  shim today (independently reconfirmed this round). **Fixed:** yes — inline correction in the
+  table cell and the bullet, pointing at `docs/FROM_CONFIG.md` §3.3 by name.
+- **Claim (§ "아직 답하지 않은 것" bullet 2):** whether the 15 discovered submodules can be satisfied
+  by empty stubs, or need real implementations, is undetermined future work. **Status: not answered
+  — the question became moot instead**, which is itself worth recording as distinct from "answered."
+  **How checked:** `docs/DESIGN.md` §11 (still current) made the final call this document's own §4/
+  §5 rounds fed into: "A(candle 위 `torch._C`)로 갑니다" — and option A carries the *entire* real
+  vendored Python tree, not stubs. So the stub-sufficiency question is not resolved either way; the
+  premise it was asked under (a stub torch) was abandoned. **Fixed:** yes — a correction noting the
+  distinction (moot, not answered) rather than claiming a false "yes/no."
+- **Claim (§ "아직 답하지 않은 것" bullet 3):** this experiment stops at model construction
+  (`from_config`); forward pass, `generate()`, `online()` are unexplored beyond it. **Status: since
+  closed by later rounds**, not by this document. **How checked:** round 2's `docs/CKPT2.md`/
+  `docs/GENERATE.md` audits already confirmed forward pass and `generate()` work today against a
+  real Hub checkpoint (SmolLM2-135M). **Fixed:** yes — inline correction pointing at both.
+- §"가장 큰 발견"-§"관문은 하나다" (torch is not a hard dependency, the `is_torch_available()`
+  gate), §1차-§3차 (the 15-submodule discovery, the 1084-module vendoring-size measurement, the
+  14-of-1084 modules actually executed at inference), §4차 (the import-time operator-registration
+  coupling that makes selective pruning expensive, feeding directly into `docs/DESIGN.md`'s A/B
+  decision): mechanism descriptions and measurements against real upstream torch/transformers, not
+  re-verified — pinned to torch 2.13.0/transformers 5.15.1, same reasoning as CORE_ATEN.md/QUANT.md
+  above, not the drifting category this round's kernel-count growth affects.
+- **Fixed: three, all "a later sibling document already answered this open item" findings** — no
+  DOCWATCH markers added (these are cross-document narrative claims and "did a scenario end up
+  working" claims, both explicitly named in `docs/DOCWATCH.md`'s "what this cannot see" list as
+  structurally outside the six primitives) — this is the fourth document this round where a
+  self-aware, heavily-corrected genesis document's own remaining gaps turn out to already be
+  answered elsewhere, unlinked.
+
+### docs/AUTODOC.md
+
+244 lines, a focused investigation overturning `docs/IMPORT_WALLS.md`'s own "범주 6" conclusion (the
+`@auto_docstring` wall IMPORT_WALLS.md judged unpassable by any stub, restated with its own
+`> **정정.**` there). This document is unusually careful about the limit of what it verified — its
+own closing table names exactly one thing still open: "벤더링 트리 + 우리 `_C` 조합에서는 아직
+확인되지 않았습니다" (not yet confirmed in the combination of the vendored tree + our own `_C`,
+only against a generic stub and real upstream torch separately). That is exactly the "next step"
+shape this round prioritises, and it is now checkable because `import torch` succeeds on our shim.
+
+- **Claim (§7's closing paragraph, the summary table's last row):** whether this wall reappears once
+  the vendored-tree-plus-our-`_C` combination actually reaches class definition is the one variable
+  this document did not check. **Status: now checked, and confirmed no wall.** **How checked:** `from
+  transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM` against our own shim
+  succeeds directly, and `__doc__` length matches this document's own real-upstream-torch
+  measurement byte for byte (`LlamaModel` 883, `LlamaForCausalLM` 850) — the same cross-check this
+  document itself used in §4 to prove its generic stub was behaviourally identical to real torch, now
+  run a third way (our shim) with the same result.
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after §7's paragraph and
+  an inline correction in the summary table's last row, rather than rewriting the original honest
+  "not yet confirmed" framing (which was correct when written — `import torch` did not pass on our
+  shim yet at the time).
+- §1-§3 (reading `auto_docstring.py`'s actual code path, the `copy_func`/`types.FunctionType`
+  census, the 87-call live trace proving none originate from the `@auto_docstring` frame), §4 (the
+  generic-stub reproduction, byte-identical `__doc__` across five model classes), §5 (the honest
+  "unconfirmed" account of what the original IMPORT_WALLS.md 2차 probe's `TypeError` actually was,
+  with its own script lost and not reconstructable): all already carefully hedged by evidence
+  strength in this document's own text — not re-verified, no reason to suspect any of them, and §5's
+  own "미확인" stays exactly that (a gap that cannot be closed without a script that no longer
+  exists, not a stale claim).
+- **Fixed: one** — the single item this document's own account flagged as the one thing it did not
+  check, now checkable and closed. Smaller in stakes than most findings this round (the document's
+  own judgment already said "no reason to expect a new wall here"), but it is the cleanest
+  before/after pair found this round: the same exact measurement (`__doc__` byte length across five
+  classes), run a third time, agreeing with both prior runs.
+
+### docs/C_SURFACE.md
+
+414 lines, a pure measurement document against real upstream torch/transformers 2.13.0/5.15.1 (an
+access-vs-call census of `torch._C`'s 989-name surface, `TensorBase`'s 694 members, and
+`_VariableFunctions`' 609 hoisted names) that informs implementation priority — it does not itself
+claim anything about our own shim being broken or missing a kernel, so the "refusal names something
+as missing" pattern this round prioritises does not really apply here. All headline counts (979/989
+accessed by `import torch` alone, 50/694 `TensorBase` members actually called, 13/609
+`_VariableFunctions` actually called, the dynamo-rule-table-scan false signal at 607/609) are pinned
+to real upstream torch/transformers behavior on one fixed toy-Llama scenario, not to this repo's own
+`_aten_implemented()` growth — the same non-drifting category as `docs/CORE_ATEN.md`/`docs/QUANT.md`
+above.
+
+- **Claim (§8 item 7, the document's own explicitly named open question):** whether the need-set
+  measured against real torch still holds once our own shim actually substitutes for it is
+  unconfirmed — the shim might take a different branch (e.g. an `hasattr`-gated subsystem) and need
+  a different name set. **Status: not fully re-measurable without repeating this document's own
+  elaborate tracing harness (out of scope for a documentation pass), but the top-level scenario this
+  question is really asking about — does our shim get through the same from_config + forward +
+  generate path at all — is independently confirmed working** by this round's `docs/FROM_CONFIG.md`
+  and round 2's `docs/CKPT2.md`/`docs/GENERATE.md` audits. Not claiming the exact 50/13-name sets
+  match; only that the scenario they were measured against no longer fails on our shim, which is the
+  premise the open question worried might not hold. Left as reported, not marked false — the
+  document's own hedging here is already correct and this round found no reason to overturn it, only
+  to note the surrounding scenario now passes.
+- §0-§6 (the tracing methodology — the `__getattribute__`-vs-`module_getattro` bug caught while
+  building the harness itself, the `TensorBase`/`_VariableFunctions` immutable-type workarounds, the
+  dynamo-rule-table contamination finding), §7 (priority tiers derived from the measurement): not
+  re-verified — all are measurements against real upstream software fixed to a pinned version, not
+  claims about this repo's own tree that could have drifted.
+- **Fixed: none — no false claims found.** This is the fifth document this round (after
+  CORE_ATEN.md/QUANT.md in round 2's pattern) where the content is investigation/measurement against
+  pinned upstream software rather than a claim about this repo's own kernel coverage, and the
+  "refusal names a kernel as missing" pattern the brief prioritises structurally does not apply.
+
+### docs/NN_SURFACE.md
+
+282 lines, the round that measured `_C._nn`'s real call footprint (3 of 96 names actually called by
+a Llama forward pass) and wired the Python spellings a model path actually needs. §1's four-row
+"what really blocks it" table and §9's eight-row "wired but no kernel yet" table are both exactly
+this round's target shape — the highest hit-rate file found this round.
+
+- **Claim (§9's table, 8 rows):** `Tensor.le`/`x <= y`, `torch.where`, `torch.where` against a bool
+  mask, `nn.Linear(bias=True)`, `F.softmax` (eager attention), and sdpa's math backend are all wired
+  but blocked on missing kernels (`aten.le.*`, `aten.where.self`, `aten.scalar_tensor.default`,
+  `aten.addmm.default`, `aten._softmax.default`, `aten._safe_softmax.default`); `aten.dropout.
+  default` likewise. **Status: FALSE for 7 of 8 rows today — only `dropout` is still accurate.**
+  **How checked:** all seven op spellings are in the current 168-op `_aten_implemented()` list;
+  live-verified `x <= y`, `torch.where(cond, a, b)`, `nn.Linear(3, 4, bias=True)(x)`,
+  `F.softmax(x, dim=0)` all compute today. `aten.dropout.default` remains absent — live-verified
+  `torch.ops.aten.dropout.default(x, 0.5, True)` still refuses by name, exactly as this document's
+  own §5 predicted (a deliberate low-priority gap, not a forgotten one — inference doesn't need it).
+  `aten._safe_softmax.default` is the same kernel round 2's SDPA.md and this round's TRIL.md already
+  found landed. **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after the
+  table, naming which row is the one exception rather than a blanket strikethrough (same "graded,
+  not all-or-nothing" shape round 2's OPS8.md `_C._nn` finding needed). Marked `op-implemented` for
+  4 representative ops and `op-not-implemented` for `dropout`.
+- **Claim (§1's table, rows 3-4):** `F.softmax` and `F.layer_norm` are blocked by
+  `_C._get_cudnn_enabled` (a config getter, cheap to answer, but out of scope because not on the
+  Llama path). **Status: FALSE today — both compute.** **How checked:**
+  `hasattr(torch._C, '_get_cudnn_enabled')` → `True`, and it returns `True`; live-called
+  `F.layer_norm(x, (4,))` and `F.pad(x, (1,1))` — both succeed today. `F.layer_norm`'s closure is
+  the identical finding round 2's `docs/GPT2.md` audit already made (a separate Python composite at
+  `bootstrap.py:5863` that bypasses `_C._nn` entirely, not `_C._nn.layer_norm` itself being filled
+  in) — cross-confirmed rather than duplicated. **Fixed:** yes — inline correction after §1's table.
+- §2-§4 (the `_C._nn` 70-vs-96 census methodology, the `torch.*`/`Tensor.*` python-spelling wiring
+  table, the `__rsub__` routing-through-`_VariableFunctions` mechanism), §5-§6 (the `linear`/
+  `dropout` composite-not-kernel decision and its branch-on-`_aten_all_implemented()` self-retiring
+  design, the sdpa backend-selection table), §7-§8 (the upstream-vs-shim numeric agreement table,
+  greedy-token match, schema-count growth): round-scoped landing measurements and mechanism
+  descriptions, not re-verified — no reason to suspect any, and §5's addmm branch is confirmed live
+  to have actually self-retired (addmm is implemented, matching the design's own stated intent).
+- §10's unknowns (the remaining 93 `_C._nn` names untested on other architectures, the 96-vs-70
+  surface gap, `_get_cudnn_enabled`/`_get_deterministic_algorithms` unverified beyond "looks cheap",
+  `enable_gqa`'s exact broadcast rule, bias-path numerical drift at scale, device import): explicit
+  "확인하지 않음" admissions, not re-checked — none contradicted by anything found while checking §1/
+  §9.
+- **Fixed: two findings, eleven op/config spellings total** — the largest single-document hit rate
+  this round (7 of 8 table rows in §9 alone), all tracing to the same generator/kernel-growth era
+  rounds 2-3 keep finding across FROM_CONFIG.md, IMPORT_TORCH.md, and here.
+
+### docs/LINEAR.md
+
+371 lines, the round that found and fixed `linear`'s per-call weight copy — already cited by name
+in round 1's `docs/DESIGN.md` audit and round 2's `docs/QUANT2.md` audit (both confirmed the fix
+landed as `2e00ec3`), but this document itself, the source of that fix, had never been read by this
+audit until now. §7's "판단이 필요한 것" (judgment needed) section frames the whole change as
+**uncommitted**, pending a coordinating-session decision between four options — exactly the
+"decision not yet shown to the user" shape `CLAUDE.md` §5.7 warns about, so worth checking whether
+that framing is still accurate.
+
+- **Claim (§7's opening paragraph):** "비트가 바뀌므로 여기서 임의로 고르지 않았습니다 ...
+  작업 트리에 변경만 있고 커밋하지 않았습니다" (the change sits uncommitted in the working tree,
+  pending a decision among 4 options). **Status: FALSE, and self-contradicted by this document's own
+  landing commit** — the same same-commit-inconsistency shape found in this round's `docs/SCHEMA.md`
+  audit, not the usual "later unrelated commit" mechanism. **How checked:** `git show --stat
+  2e00ec3` (this document's own single commit, "Perf: Fold instead of broadcasting, and stop copying
+  the weight every call") shows `docs/LINEAR.md | 370 +++...` and `rust/torch_c/src/aten.rs | 131
+  +++...` in the same diff — the commit that contains the sentence "커밋하지 않았습니다" is itself
+  the commit landing the change. Option **①** (A+B, unconditional, no opt-in) is what actually
+  shipped: `gemm_with_layout_fallback`/`batched_matmul` are the default path in `aten.rs` today
+  (independently reconfirmed live and by two prior audit rounds — `docs/DESIGN.md` in round 1,
+  `docs/QUANT2.md` in round 2, both citing this exact commit).
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after the paragraph,
+  naming which option was chosen and cross-referencing the two prior rounds that already found the
+  same commit from the other side, without rewriting §7's table (an accurate snapshot of the
+  decision *as posed*, just not of how it resolved). Marked `symbol-in-file`.
+- **Claim (§6 item 2):** the golden harness doesn't compare `aten.matmul.default` at all — it sits
+  in `IMPLEMENTED_AWAITING_GOLDEN`, so "golden 2760/2760 passes" cannot be cited as evidence for this
+  change, and the document's own §4 probe exists specifically to fill that gap. **Status: FALSE
+  today — closed.** **How checked:** `aten.matmul.default` is in the current 168-op
+  `_aten_implemented()` list, not the awaiting-golden set; this round's own baseline
+  (`golden_pending=1`) names only `aten.reshape.default` as still pending, not `matmul`. **Fixed:**
+  yes — inline correction in the table cell.
+- §0-§5 (the bit-comparison methodology and its 507-case four-way probe, the two-copy diagnosis —
+  `aten.rs`'s unconditional `.contiguous()` plus candle's own `broadcast_matmul` copy one level
+  down, the fold-not-broadcast fix and why it's not an approximation, the speed measurements against
+  upstream): round-scoped measurement, not re-verified — these are the document's own landing
+  numbers, already independently spot-checked for direction (not magnitude) by round 1/2's citations
+  of the same commit.
+- §6's other four items (bf16/f16 weight materialised per call — still open per the document's own
+  account and not contradicted by anything found elsewhere this round; left-2D/right-N-D matmul
+  folding; `addmm`'s bias-broadcast copy, named but judged too small to matter; no device
+  measurement): not independently re-verified given time budget — no reason to suspect any of them,
+  and item 1 in particular is consistent with round 1's `docs/DTYPE_PERF.md` finding that the fused-
+  gemv decode gap is also still open (same general "widening cost" family, different op).
+- **Fixed: two** — the self-contradiction is the more consequential of the two (it directly answers
+  a question two prior audit rounds had to chase down externally, from the one document that could
+  have answered it directly), continuing this round's pattern (after SCHEMA.md) of a landing commit
+  containing text describing itself as not yet landed.
+
+### docs/BF16.md
+
+396 lines, the round that overturned `docs/GENERATE.md` §6.2's own root-cause diagnosis (measured
+"GEMM reassociation" and proved it wrong by disproof, then traced the real cause to `aten.add.
+Tensor` truncating instead of round-to-nearest-even for bf16) — an explicit, well-executed instance
+of the house style CLAUDE.md §5.5 asks for ("a check that cannot fail is not a check": the bug
+survived because golden's `add` cases were all ≤24 elements and the bug only lives in the ≥32-element
+vectorized path, plus a tolerance that passed 1-ulp errors). §6.3's "이번 회차가 넣지 않은 것" (not
+included this round) table is the target shape this round prioritises.
+
+- **Claim (§6.2, §6.3 row 1):** the sdpa path retains a bit-exactness gap GEMM reassociation cannot
+  explain, narrowed to `_scaled_dot_product_flash_attention_for_cpu`'s block-wise reassociation, and
+  left unresolved. **Status: FALSE today — closed the very next day, by a document that opens by
+  quoting this exact paragraph.** **How checked:** `docs/SDPA.md`'s own opening line: "`docs/
+  BF16.md` §6.2 가 미해결로 남긴 하나를 닫습니다" (closes the one thing BF16.md §6.2 left open),
+  quoting the identical sentence. `git log` confirms `docs/SDPA.md`'s real landing commit
+  (`4cd3bde`, 2026-08-28 21:52) is one day after `docs/BF16.md`'s (`fc89498`, 2026-08-28 15:07) —
+  not the round 2 audit commit that later also touched SDPA.md's file. The block-wise kernel was
+  reproduced bit-exact (`rust/torch_c/src/flash.rs`), but it is 20x slower at T=512, so it ships
+  **behind an opt-in switch, off by default** — "not reproduced" is closed, "not the default path"
+  is the fact that remains. **Fixed:** yes — inline correction in §6.3's table row, naming the
+  sequel and what specifically changed (closed vs. still-true halves), rather than a blanket
+  strikethrough. Marked `symbol-in-file` for the switch's own function and, while checking the
+  table's other rows, `op-implemented` confirming `aten.bitwise_or.Tensor`'s existence (row 3 —
+  see below).
+- **Claim (§6.3 row 3):** `bitwise_or.Tensor` and similar dtype-promoting ops still refuse, no
+  caller in this repo's own code paths. **Status: confirmed still true, correctly scoped** — the op
+  itself is implemented today (`aten.bitwise_or.Tensor`/`aten.bitwise_and.Tensor` both in the
+  current 168-op list, closed by unrelated later work, same as this round's `docs/IMPORT_TORCH.md`
+  finding), but the *specific* claim this row makes — cross-dtype promotion refuses — still holds:
+  live-verified `torch.tensor([1,0,1], dtype=torch.int64) | torch.tensor([True,False,True])` still
+  raises `NotImplementedError: ... dtype promotion not implemented ... int64 vs bool` today. A good
+  example of why "is the op implemented" and "does this specific claim about it still hold" are
+  different questions — the op existing did not make this claim false.
+- §1-§2 (the disproof of GENERATE.md's GEMM-reassociation diagnosis, the truncation-vs-RNE root
+  cause and its "why no test caught it" analysis), §3 (the `opmath_in` fix and its `alpha` /
+  reduction-specific measured quirks), §4 (the bit-exact, no-tolerance test additions and their
+  fault-injection demonstrations), §5 (`aten.index.Tensor`'s multi-index-tensor rules, closing eager
+  `generate()`), §6.1 (upstream-vs-itself non-reproducibility as the judgment baseline): round-scoped
+  landing measurements and mechanism descriptions, already unusually rigorous about their own
+  evidence — not re-verified, no reason to suspect any.
+- §6.3's other rows (`float16`'s 1/20000 `alpha` residual, `use_cache=True` generation unmeasured,
+  Android/iOS unmeasured): not independently re-verified given time budget — no reason to suspect,
+  consistent with the pattern that this document's own hedging is already accurate.
+- **Fixed: one** — smaller in scope than most findings this round (a "closed the next day by the
+  direct sequel" cross-reference rather than a stale kernel claim), but notable for being the
+  fastest-superseded finding in either round of this audit: one calendar day between the claim and
+  its resolution, both landed before anyone came back to link them.
+
+### docs/DTYPE.md
+
+571 lines, a performance-and-design round (found the reduced-float widening cost was three separate
+layers, only one of them hardware; recommended a path to int8/quantization support). Already carries
+three of its own corrections to sibling documents (`docs/DEVICE_ABS.md` §5.1's stale `cargo test`
+crash claim, `docs/QUANT.md` §8's "7.8x compression" scoped to KleidiAI only, §3.5's dead-strip
+observation) — house style already applied outward. §6.4's recommendation ("candle `QTensor` as
+`Repr`'s third variant") is the one forward-looking claim worth checking, matching round 1's pattern
+for RNG.md → generator-port and round 2's pattern for CAPTURE.md → DECOMP.md.
+
+- **Claim (§6.4, the recommendation):** candle's `QTensor` should become `Repr`'s third variant, with
+  a specific landing order (verification axis first, then the enum variant + `dequantize` round
+  trip, then wiring `mm`/`linear`, then upstream 4-bit op names). Framed as a recommendation, not a
+  claim about current state. **Status: adopted, and in the recommended order.** **How checked:**
+  `git log` shows this document's own commit (`abc341d`, 18:23) landed about four hours before
+  `docs/QUANT2.md`'s (`b032276`, 22:08) — same day. `rust/torch_c/src/tensor.rs:82` has
+  `Repr::Quantized(Arc<QTensor>)` today, and round 2's `docs/QUANT2.md` audit already independently
+  confirmed the SmolLM2-135M q8_0/q4_0 20/20 token-match verification axis this document's step 1
+  called a prerequisite. §6.4 item 2's separate judgment — `torch.int8` itself correctly refuses by
+  name, not a defect — re-verified live and still holds: `torch.tensor([1,2,3], dtype=torch.int8)`
+  still raises `NotImplementedError: ... dtype not storable by the candle backend` today (the
+  `QTensor` path is a different mechanism from the raw `I8` `DType` this item is about).
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote before the
+  recommendation's own text, pointing to `docs/QUANT2.md` and noting which item held and which
+  didn't need to change, matching the "recommendation later adopted" pattern already used elsewhere
+  in this audit rather than rewriting the original recommendation. Marked `symbol-in-file`.
+- §0-§1 (the conclusion summary and its own "not to be read as" caveats — an explicitly
+  contamination-aware measurement session, load 1.6-11.7, relative comparisons only), §2 (the
+  four-layer cost breakdown: candle's element-wise `to_dtype`, the widen-entire-tensor-not-just-the-
+  accumulator bug, the zero-fill regression caught by re-measuring after adding a fix), §3-§4 (the
+  A/B numbers and the per-layer remaining-cost table, bf16's hardware ceiling on this CPU), §5 (the
+  exact-equality test suite and its own "verification lied once" self-correction — a `TORCH_C_
+  ARTEFACT` omission that silently compared against a stale cached build, caught and fixed the same
+  way `pytests/run.sh`'s own comment warns about): round-scoped measurement narrative, already
+  unusually self-aware about its own honesty, not re-verified — no reason to suspect any.
+- §7's unknowns (device measurement, `gemm-f16`'s runtime dispatch on `neon`-only targets, fused-
+  gemv at DRAM-bound model scale, further bf16-narrowing headroom, SmolLM2 model-level re-measurement
+  — explicitly argued unnecessary given the bit-equality proof, the QUANT.md §9.1 accelerate-f16
+  slowdown not reproducing at the candle layer, `torchao`'s API being unjudgeable without the
+  package installed, `QStorage`'s `Send`/`Sync` boundary only partially checked): explicit "미확인"
+  admissions in the house style this audit already validates elsewhere, not re-checked.
+- **Fixed: one** — a "recommendation adopted" finding rather than a false claim (the document never
+  asserted the `QTensor` path already existed), continuing this round's cluster of same-day or
+  next-day cross-document landings (after BF16.md→SDPA.md) that a plain per-file audit would not
+  surface without checking commit order.
+
+### docs/GROUPED_MM.md
+
+502 lines, the round that closed Mixtral (the one architecture of twenty stuck on a missing
+operator) — already unusually rigorous, with two pre-existing "Fixed since" blockquotes for the
+`__setitem__`/`index_put_` mutable-view findings, cross-referencing `docs/VIEWS.md` by name. This
+document went through three revisions the same day (`82ccc4b` 17:33, `36d3a2d` 18:08, `8c07af8`
+19:56); checking whether its *final* revision picked up everything that had landed by then turned up
+the fastest-arriving staleness found in either round of this audit — one that predates the document's
+own last commit by under an hour.
+
+- **Claim (§6.4):** "`aten.ge.Tensor` has no kernel" — `le.Tensor`/`lt.Tensor`/`gt.Tensor` all have
+  one, `ge.Tensor` alone resolves and then refuses. **Status: FALSE at the moment this document's own
+  final revision was committed, not just today.** **How checked:** `git log` shows `088e8f4` ("Feat:
+  Close three kernel gaps, and disprove the stated reason for the fourth" — its own commit message
+  opens with "ge.Tensor existed for le, lt and gt but not ge... One arm, 31 cases") landed at 18:58,
+  this document's own final revision (`8c07af8`, "retire two gap notes the work has closed") landed
+  at 19:56 the same day — 58 minutes later — and still shipped the "has no kernel" sentence
+  unqualified. `aten.ge.Tensor` is in the current 168-op `_aten_implemented()` list; live-verified
+  `x >= tensor` computes. Round 1's `docs/VIEWS.md` audit already independently found the same
+  kernel from a different document, unlinked from this one. **Fixed:** yes — added a `> **Fixed
+  since — and it was already fixed when this sentence was committed.**` blockquote, in the same
+  style as the document's own two pre-existing "Fixed since" notes a few paragraphs above, naming
+  the specific timing gap rather than treating it as ordinary later-drift. Marked `op-implemented`.
+- **Claim (§6.5, and §9's methodology note):** `torch.manual_seed` refuses via Dynamo's disable
+  wrapper (`torch._C._dynamo.eval_frame.set_eval_frame`), so Mixtral's weights had to be filled by a
+  shared LCG rather than real seeding. **Status: FALSE today** — closed by the same CPU-generator
+  port round 2's RNG.md/TENSORBASE.md audits found (`torch.manual_seed(42)` succeeds live today).
+  **Fixed:** yes — inline blockquote noting the closure, explicitly not re-running §9's comparison
+  with real seeding (out of scope for a documentation pass, and not needed to confirm the refusal
+  claim itself is stale).
+- §1-§2 (the schema and semantics read from the vendored tree and measured against real upstream
+  torch, the 16-byte stride refusal rule, the "rows nobody writes"/"offsets that go backwards"
+  behaviors), §3 (the group-walk implementation and why `slice_assign` was rejected), §4-§5
+  (reachability from Python, the operator-level and executed-model verification), §6.1-6.3 (the
+  `overloads.json` underscore-prefix predicate bug, `floor_divide.Scalar`, the three table-entry
+  additions), §7 (gate counts), §9 (the unpatched Mixtral run and its per-member call counts): not
+  independently re-verified beyond the two items above — this document's own sabotage-testing and
+  cross-referencing discipline (already correctly annotating two of its own claims as fixed by
+  `docs/VIEWS.md`) is exactly the house style this audit looks for, and no other claim contradicted
+  anything found elsewhere this round.
+- **Fixed: two** — the `ge.Tensor` finding is the sharpest example this audit has found of the "a
+  correction lands and the very next commit of the same document still doesn't pick it up" failure
+  mode: not a later, unrelated round, not even the next day — the fixing commit and the stale
+  sentence's committing revision are less than an hour apart, in the same session, on the same file
+  the fixing commit's own message explicitly discusses.
+
+### docs/SURFACE_HONESTY.md
+
+477 lines. Named directly in this round's brief as worth checking for self-drift, and it has
+drifted — genuinely and instructively. Two parts: §1 fixes `_Unimplemented` placeholders answering
+`bool()` truthily (a real, landed fix, re-verified below), and §2 is a **decision record**: whether
+to patch the vendored tree to bind `torch.distributed.Store`, and it concludes "no patches — build
+`torch.distributed` for real, starting from `world_size=1`," explicitly deferring `from_config`
+until that happens (§2.6: "그때까지 검증은 손으로 옮겨 적은 모델로 계속합니다").
+
+- **Claim (§0 summary table, §2.7):** "`from_config` 진행: 변화 없음. 같은 벽(`fake_pg.py:7`,
+  `torch.distributed` has no attribute `Store`)에서 멈춥니다." **Status: FALSE — closed the very
+  next morning, by the exact plan this document's own §2.6 laid out.** **How checked:** `git log`
+  shows this document's last commit (`eae2a42`) at 2026-08-24 22:38; `docs/DISTRIBUTED.md`'s landing
+  commit (`99fec1b`, "Feat: Stand up torch.distributed, and import transformers for the first time")
+  at 2026-08-25 06:52 — the next morning, executing precisely the plan §2.6 recorded ("go implement
+  `torch.distributed` for real, `world_size=1` first"). Live-verified today:
+  `hasattr(torch.distributed, 'Store')` → `True`; `AutoModelForCausalLM.from_config(cfg)` with the
+  identical llama config succeeds, parameter count 95,040 — matching this round's own
+  `docs/FROM_CONFIG.md` real-torch measurement exactly, the same cross-check used there.
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after §2.7's
+  reproduction transcript and a shorter inline note in §0's summary table, pointing at
+  `docs/DISTRIBUTED.md` and quoting this document's own "그때가 왔다" framing rather than rewriting
+  the decision record (which was a real, honest decision at the time, not a false claim about the
+  present). Marked `symbol-in-file` against `_install_distributed_c10d`.
+- **Self-assessment, since this document is explicitly about exactly this failure:** the drift found
+  here is not different in kind from what round 1-2 found elsewhere (a later, unrelated — or in this
+  case, directly consequential — commit closed a gap and nobody came back to update the document
+  that named it as open). What is different is the document's own subject matter: `SURFACE_HONESTY.
+  md` exists to catch a shim claiming something is true when it is not, and by the time this round
+  reached it, the document itself was doing the analogous thing about its own state — claiming
+  `from_config` still fails when the very decision it recorded had already been executed and had
+  succeeded. The irony is worth stating plainly, as the brief asked: **the document about honesty
+  had gone stale in the same shape it was written to detect**, though the mechanism (a later commit,
+  not an intentional lie) is the ordinary one this whole audit keeps finding, not a special case.
+- §1 (the `_Unimplemented`-truthy fix, the three-way split of upstream types behind the ten names the
+  coordinating session flagged, the four additional names the scan had missed, the single real call
+  site that mattered, and why both option (a) and (b) were applied together rather than either
+  alone): re-verified live where cheap — `torch.backends.cudnn.is_available()` returns `False`
+  today, matching §1.6's claimed post-fix state, no drift found. §1.7's explicitly-deferred items
+  (`_after_ADInplaceOrView_keyset` etc. — wrong type, both sides truthy, not this round's topic):
+  left as an open, correctly-labeled deferral, not re-chased.
+- §2.1-§2.6 (the reproduction, the upstream-reproduces-the-same-crash finding, the three rejected
+  branches and their measurements, the federated-learning namespace correction already present as a
+  self-correction within §2.6 item 1): mechanism and decision narrative, not re-verified beyond the
+  one outcome claim above — no reason to suspect the analysis itself, only the "still open" framing
+  of its consequence.
+- **Fixed: one, but it is the highest-symbolic-weight finding of this whole three-round audit** — the
+  document whose entire purpose is catching "the shim says X exists and it doesn't" was itself,
+  when read today, saying "this capability doesn't exist yet" about one that does, for the ordinary
+  reason (a later commit executed the very decision recorded here) this audit has now documented
+  well over a dozen times.
+
+### docs/PERF.md
+
+239 lines, a load-contaminated (4.24 average, explicitly disclosed) A/B performance round finding
+the model-level 7x gap against upstream was almost entirely one Cargo feature flag (`accelerate`,
+Apple-only) and closing it to 1.0x with zero golden regressions. Already correctly self-limits its
+own numbers to "same-session ratio only, not a regression baseline" (§0) — the house style already
+validated correct for this document class in rounds 1-2 (SEQLEN.md, DTYPE_PERF.md, SDPA.md,
+QUANT.md). One forward-pointing gap worth closing: §5's "Android still has no answer" is exactly the
+kind of "next step, not done here" claim this round prioritises.
+
+- **Claim (§5, "안드로이드의 행렬곱은 별도 과제로 남습니다"):** Android has no `accelerate`-equivalent
+  matmul solution; it is left as a separate, unstarted task. **Status: has a direct sequel.**
+  **How checked:** `docs/PERF_ANDROID.md` ("안드로이드 aarch64 행렬곱 — 무엇이 느리게 만들고
+  있었나") landed 2026-08-31, six days after this document (2026-08-25) — its title picks up exactly
+  where this section leaves off. **Fixed:** yes — added a forward-pointing correction after the
+  sentence, explicitly not comparing this document's numbers against PERF_ANDROID.md's (different
+  session, different hardware — an emulator — so a direct number-to-number comparison would itself
+  be the kind of contamination §0 warns against).
+- §0-§4 (the A/B methodology and its explicit limits, the model-level 7x-to-1x closure, the thread-
+  count control ruling out parallelism as the cause, the remaining 2.7x `_softmax` gap attributed to
+  scalar vs. vectorized `exp`), §6 (the unconfirmed-items table), §7 (the MLX GPU-vs-CPU comparison
+  and its crossover-point findings): round-scoped measurement narrative with its own honest
+  limitations already stated, not re-verified or re-measured — re-measuring performance is out of
+  scope for a documentation audit and risks exactly the contamination CLAUDE.md's own rule warns
+  against.
+- **Fixed: one** — a forward pointer rather than a correction to a false claim (the document never
+  claimed Android had a solution; it correctly named the gap as open, and it still is, just not
+  un-investigated any more).
+
+### docs/PERF_ANDROID.md
+
+643 lines — the direct, explicitly-named sequel to `docs/PERF.md` §5's open Android gap, and the
+most rigorous measurement document read in either round of this audit. Every comparison carries its
+own control group (two labels on the identical build, re-measured the same way), and every
+"transferred/did not transfer" verdict is qualified by which of two regimes it falls into
+(Python-dispatch-dominated vs. kernel/bandwidth-dominated) rather than asserted uniformly — this is
+exactly the "the f32 sequence-length curve and the bf16 ratio moved several times" pattern the brief
+warned about, and the document's own §10 table already does the reconciliation work a lazy read
+might mistake for contradiction: host numbers (from `docs/BIND.md`/`docs/DISPATCH.md`/`docs/SEQLEN.
+md`/`docs/DTYPE_PERF.md`) and device numbers for the *same* five optimizations are laid side by side
+and explicitly **not** treated as the same measurement re-run, with the document itself stating "이
+비교는 절대 규모가 전혀 다른 두 기계 위에서 잰 값이라 직접 대조할 근거가 약하다" (this comparison
+is between two machines of entirely different absolute scale, so a direct comparison has weak
+grounds) wherever that applies.
+
+- **Checked for staleness rather than found stale.** §5's `GEMM_THREADING_THRESHOLD = 4_000_000`
+  constant is confirmed unchanged in `rust/torch_c/src/lib.rs:601` today — the one mechanically
+  checkable fact this document commits to a specific number for (as opposed to a ratio). §6's fix
+  ("`parity` now builds the host side without `accelerate` for a gemm-vs-gemm comparison rather than
+  widening the tolerance list") is a design decision, not independently re-run (`scripts/` is
+  outside this round's territory).
+- **On the specific pattern named in the brief** ("f32 sequence-length curve and bf16 ratio moved
+  several times, say which document supersedes it"): this document is itself largely the
+  *reconciliation* document for that pattern, not a stale source of it — §10.2-§10.5 compare host
+  numbers from four earlier documents against freshly-measured device numbers for the *same*
+  optimizations, and each comparison explicitly states whether the two are on comparable footing
+  before drawing a "transferred" verdict. No numbers in *this* document contradict a later
+  document — nothing found this round supersedes any ratio here, and this document's own final
+  table (§10.6) is already the up-to-date reconciliation across five prior documents' numbers, not a
+  claim any of them has since moved past.
+- §0-§4 (the emulator-vs-real-hardware caveats, the GEMM-kernel-quality-is-identical finding across
+  host/device, the AMX-not-kernel-quality explanation for `docs/PERF.md`'s 7x, the compile-flag
+  hypothesis disproven both by source reading and by measurement, the threading-threshold diagnosis
+  and fix with a bit-identical sha256 proof that the fix changes nothing but which core does the
+  work): round-scoped measurement, internally self-verified (source claims cross-checked against
+  measured behavior throughout, e.g. §3.1's `nm`/`llvm-nm` evidence for the runtime-detection claim),
+  not re-verified beyond the one mechanical constant checked above.
+- §9's unconfirmed-items table (no real Android hardware — only the emulator throughout; big.LITTLE
+  scheduling unmeasurable on a homogeneous emulator; f16/bf16/int8 untestable because the emulator
+  doesn't advertise `asimdhp`/`asimddp`/`i8mm`; no aarch64-android upstream torch wheel to compare
+  against directly; whether 4M is the right threshold on real hardware): not independently
+  re-verified — these are hardware-access limitations stated as such, not falsifiable claims, and
+  nothing found elsewhere this round suggested real Android hardware measurement has since happened.
+- **Fixed: none — no false or stale claims found.** The document this round's brief specifically
+  flagged for the "measurements superseded" pattern turned out, on reading, to already be the
+  document doing that reconciliation work correctly for five prior documents' numbers; there was no
+  further staleness to find on top of it within this document's own text.
+
+### docs/SCALAR.md (full read — carried markers already, one of the two named in the brief)
+
+811 lines, the round that established the per-kernel reduced-float scalar rule (`mul`/`div` widen
+the Python number to `opmath_t`, `add`/`sub` narrow it — no principle survives contact with the
+table, it is genuinely per-kernel) and found four more ops wrong by it. Already the most heavily
+self-instrumented document in this repository's `docs/` tree — 13 pre-existing DOCWATCH markers
+(the most of any file audited across all three rounds), §8 is an entire section devoted to closing
+§5/§6's own "not fixed here" items with inverted markers so the closure "cannot silently come
+undone" (the document's own words), and §7/§8.4 run two separate sabotage rounds including three
+faults explicitly recorded as *unable* to fail, with the reason stated rather than hidden.
+
+- **All 13 pre-existing markers re-verified PASS against today's tree** — `mul.Scalar`, `mul_.
+  Scalar`, `floor_divide.Scalar`, `div.Scalar_mode`, `pow.Tensor_Scalar`, `pow.Scalar`, `add.
+  Scalar`, `sub.Scalar` all `op-implemented`; five `symbol-in-file` markers for the specific tests
+  and case builders that pin the rule. None had drifted — this is the only file found in either
+  round of this audit where a full marker set landed and, on re-check, needed nothing.
+- **Claim (§6, the one item left open after §8's closures):** `x *= 0.3` on a reduced-float tensor
+  still disagrees with upstream by one representable step, because upstream's Python `*=` resolves
+  to `mul_.Tensor` (which widens) while this shim's resolver reaches `mul_.Scalar` (which correctly
+  narrows, matching upstream's own `mul_.Scalar` — the mismatch is which *kernel* the same source
+  line reaches, not either kernel being wrong). Closing it needs the resolver's "numbers as tensors"
+  rule, described as living above `aten.rs`, out of this document's own scope. **Status: not
+  independently re-verified this round** — the fix would require the same op-resolution work this
+  round's own `docs/OVERLOAD.md`/`docs/TENSORBASE.md` findings traced to `bootstrap.py`'s overload
+  table, and nothing else found this round touched `mul_`'s specific resolution path; no evidence
+  either way was encountered, so left as reported rather than guessed at.
+- §1-§2 (establishing the per-kernel rule from a 420-value differential against two upstream-
+  arithmetic models, the `mul.Scalar` fix and its "cases that could not fail" analysis), §3 (the
+  three-op family sweep and `pow`'s `float32`-narrows-too finding, with its own explicit refusal to
+  add a `float32` case because the vectorisation tail makes the "correct" answer length-dependent
+  upstream), §4 (nine prefill digests unchanged, explained by tracing exactly which ops a real
+  SmolLM2 forward calls rather than asserted), §7-§8 (both sabotage rounds, the `softplus`/`norm`/
+  `add.Scalar`/`sub.Scalar` closures, the FMA-compilation residual sized and left rather than
+  half-fixed): already unusually rigorous and self-checking, not independently re-verified beyond
+  the marker re-run above — no reason to suspect any claim, and the document's own house style
+  already does most of what this audit checks for.
+- **Fixed: none needed — the highest-quality document found in either round of this audit**, both
+  in the sense that no claim had gone stale and in the sense that its own self-correcting apparatus
+  (13 markers, an entire section devoted to closing its own prior round's open items, sabotage that
+  records what could not fail rather than omitting it) is close to a template for what the other 73
+  files in this audit's scope would ideally look like.
+
+### docs/LOSS.md (full read — the second of the two files named in the brief as carrying markers)
+
+924 lines, the round that closed the loss/optimizer/dropout gap `docs/AUTOGRAD.md` left open —
+matches `docs/SCALAR.md`'s quality tier exactly: 18 pre-existing DOCWATCH markers, its own §8
+sabotage table (26 faults) records which ones could not fail and why rather than omitting them, and
+§5.4.1 is a mid-document self-correction adding a bounded-divergence case specifically so a number
+that used to live only in prose ("no case sees this because the widest case is 6 elements") gets a
+check that can fail if it moves.
+
+- **All 25 pre-existing markers re-verified PASS against today's tree** — `op-implemented` for
+  `_log_softmax`/`nll_loss_forward`/`native_dropout`; `op-not-implemented` for `lerp_.Scalar`/
+  `addcmul_.default`/`addcdiv_.default`/`is_complex.default` (Adam's fourth wall, §6.4) and
+  `nll_loss2d_forward`/`nll_loss_backward`/`native_dropout_backward`/`_log_softmax_backward_data`
+  (§9's explicit "not done" list); `hasattr` correctly distinguishing `nll_loss_forward` (upstream
+  has no such name — the shim's own name is deliberately invented, §3.4) from `native_dropout`
+  (upstream has it); `json-key`/`symbol-in-file` for the specific overload-table entries and Rust
+  functions. None had drifted.
+- §1's "gap is a name, not a kernel" finding (climbing the real call path rather than trusting a
+  `TorchDispatchMode` scan, since `CompositeImplicitAutograd` composites are invisible to dispatch-
+  level tracing) explicitly cites this exact failure shape recurring five times before it
+  (`docs/ARCH20.md`, `docs/GROUPED_MM.md` §6.1, `docs/TRIL.md` §2, `docs/SPELLINGS.md`) — consistent
+  with this round's own repeated finding of the same pattern (OVERLOAD.md, TENSORBASE.md, SAMPLING.md,
+  DEVICE.md, ARCH.md, GPT2.md, OPS4.md, OPS8.md, NN_SURFACE.md), a convergent observation from both
+  the document's own account and this three-round audit's independent tally.
+- §2-§4 (the `_log_softmax` dual-kernel summation-order fork and its constructed separating input,
+  `nll_loss_forward`'s eight-level cascade and its three load-bearing details, the real SmolLM2 loss
+  attribution isolating which kernel carries the residual), §5 (18 sabotage faults including three
+  that could not fail on the first attempt, with the case-list fix shown rather than just the
+  outcome), §6 (`zero_grad()`'s profiler-marker gate, `DisableTorchFunctionSubclass` correctly
+  distinguished from the torch-function mode stack), §7 (`native_dropout` vs. the eager `dropout`
+  composite, the two spellings agreeing bit-for-bit specifically because of scalar narrowing — a
+  direct instance of `docs/SCALAR.md`'s rule table applied and cross-referenced): already
+  extraordinarily rigorous and self-checking, not independently re-verified beyond the marker re-run
+  above — no reason to suspect any claim.
+- §9's "what this round did not do" table (`cross_entropy_loss`'s probability-target and label-
+  smoothing branches, `nll_loss_nd` for rank ≥3, Adam's remaining three kernels plus `torch.
+  is_complex`, `.grad`'s setter — explicitly deferred per `docs/AUTOGRAD.md` §7's still-standing
+  argument, the `profiler::` schema table, any backward pass): all four op-shaped items in this list
+  have `op-not-implemented` markers and all re-confirmed absent today — no drift.
+- **Fixed: none needed — the second-highest-quality document found in either round**, alongside
+  `docs/SCALAR.md`. Both were written in the same general era of this repository's documentation
+  practice (heavy DOCWATCH instrumentation, explicit "what this suite still cannot see" sections,
+  sabotage that records negative results) and both held up completely under re-verification —
+  suggesting the self-correction discipline this audit's overall conclusion recommends is not
+  hypothetical: it is already working exactly as intended in the files that adopted it most fully.
+
+### docs/CARGO_KT.md
+
+365 lines — an outlier in this audit's scope: a **design proposal for a sibling repository**
+(`/Volumes/macMini/thisisthepy/pypackpack`, a separate Kotlin build tool), not about this repo's own
+`_C` shim or op coverage at all. No code was implemented (the document says so explicitly, twice);
+every claim is either a citation of `pypackpack`'s current source (file:line) or an explicit
+"미확인" (unconfirmed). The "refusal names a kernel as missing" pattern this round prioritises does
+not apply — there is no aten op, `_aten_implemented()`, or golden harness in scope here.
+
+- **Claim (§0, §3-1):** `Cargo.kt`/`NDK.kt`/`XCode.kt` in `pypackpack` are 4-line placeholder files
+  (package declaration + one comment), and `Meson.kt` — the one implemented backend — does not
+  reference any of them despite `SPEC.md`'s "adapter pattern" documentation describing an intent
+  that isn't realized in code. **Status: confirmed still true today.** **How checked:** `wc -l` on
+  `pypackpack`'s `Cargo.kt` and `NDK.kt` — both still 4 lines; `git log -1` on `Cargo.kt` in that
+  repo shows its last change was `fda5f00`, 2025-06-07 — over a year before this document was
+  written, and unchanged since. This is a claim about a pinned, external repository's state rather
+  than something that drifts with this repo's own kernel growth — same non-drifting category as
+  `docs/CORE_ATEN.md`/`docs/QUANT.md`'s upstream-pinned facts, just pinned to a sibling repo instead
+  of upstream torch.
+- §1-§2 (the `BackendInterface` signature, `Meson.kt`'s three-stage lifecycle and process-execution
+  pattern, its testability-via-`open`-subclassing design), §3 (the `NDK.kt`/`XCode.kt` adapter
+  design options and the target-triple mismatches found in `Platforms.kt` — iOS's three naming
+  discrepancies and Android's API-level information loss through canonicalization), §4 (where the
+  `lib_C.so` → `_C.so` rename belongs in a three-stage `Cargo` backend), §5 (six items explicitly
+  scoped out, each with a stated reason), §6 (four explicitly unconfirmed items, e.g. the iOS
+  simulator rustc triples not locally re-verified because this machine has no `rustc`/`rustup`
+  installed): all design analysis and citations of `pypackpack`'s current source, not independently
+  re-verified beyond the one claim above — no reason to suspect any, and the document is already
+  unusually careful about marking what it did and did not verify (its own opening line: "실행해서
+  확인하지 못한 것은 '미확인'으로 표시했습니다").
+- **Fixed: none — no false or stale claims found.** The only substantive risk this round checked (a
+  design proposal describing a target repo as further behind than it now is) did not materialize —
+  `pypackpack` has not moved on this file since well before the proposal was written.
+
+### docs/RUST_CROSSBUILD.md
+
+296 lines, the investigation `docs/CARGO_KT.md`/`docs/ABI3.md` both cite by file:line throughout —
+already carrying two of its own visible corrections (the iOS/Android path mixup, the abi3
+recommendation reversed twice with the reasoning kept visible both times) matching this audit's
+house style before this round touched it.
+
+- **Claim (§1, the abi3 recommendation):** "조사 완료. 권고는 `abi3-py313` 을 켜는 것" (investigation
+  complete, recommendation is to enable `abi3-py313`) — a recommendation, not a claim it was already
+  adopted. **Status: adopted, confirmed live.** **How checked:** `rust/torch_c/Cargo.toml:23` has
+  `features = ["extension-module", "abi3-py313"]` today, with a comment citing "`abi3-py313` is
+  ABI3.md §7's recommendation" — the same landing round1's `docs/ABI3.md` audit already confirmed
+  independently. Not marked as a correction (the document never claimed adoption, only recommended
+  it — nothing to fix).
+- **Claim (§5, closing paragraph):** "`/Volumes/macMini` 는 349Gi 중 4.6Gi 여유" (4.6Gi free) —
+  **self-contradicted by this same document's own §0**, which opens with "여유 **164Gi** (이전
+  4.6Gi)" (164Gi free, up from a previous 4.6Gi) — i.e. §5 carries the pre-recovery number as if
+  current, directly beneath a section that already recorded the recovery. **Status: internally
+  inconsistent, and disk-free numbers are not something this audit re-pins** (they change
+  continuously — re-checked live today: 86Gi external, 12Gi internal, neither matching either
+  in-document figure). **Fixed:** yes — added a correction noting the stale figure sat right below
+  the updated one in the same document, without asserting a new number that would itself go stale
+  by the next session. No DOCWATCH marker fits (disk capacity is not one of the six primitives, and
+  a marker for a continuously-changing external fact would be exactly the "crying wolf" shape
+  `docs/DOCWATCH.md` warns against for global counts).
+- §0 (the toolchain inventory, the worktree `build/` cleanup recovering 159GB, the `CARGO_TARGET_
+  DIR` placement decision), §0.5 (the three-target build verification and the iOS linking
+  investigation — `pyo3-build-config` hardcoding a libpython link for iOS regardless of the
+  `extension-module` feature, the two-part fix combining `-F`/`-framework` with `PYO3_CONFIG_FILE`'s
+  `suppress_build_script_link_lines`, and the explicit warning that the committed `.cargo/config.
+  toml` path is machine-specific): the two Cargo.toml/config.toml facts spot-checked (abi3 feature,
+  the `-undefined dynamic_lookup` rustflag) both still match today's source. §1's other items
+  (`PYO3_CROSS*` env vars, the Android/iOS archive layout asymmetry), §2-§4 (cargo-ndk necessity,
+  iOS xcframework packaging notes, the `pypackpack` `Cargo.kt` requirements — superseded in detail by
+  `docs/CARGO_KT.md`'s own more thorough analysis, not re-derived here): not independently
+  re-verified — no reason to suspect any, and §1's open item (whether an abi3 module loads under a
+  3.14.7 interpreter) remains explicitly unconfirmed by the document's own account, consistent with
+  no 3.14 interpreter being available on this host either.
+- **Fixed: one** — an internal self-contradiction (stale figure directly below its own correction),
+  the same general shape as this round's `docs/SCHEMA.md`/`docs/LINEAR.md` findings, though about a
+  fact (disk space) that is expected to drift on its own rather than one this audit can re-pin.
+
+### docs/CANDLE_DEPS.md
+
+418 lines — an investigation into `candle-core`'s non-optional `tokenizers` dependency (44 unused
+crates, ~36% release-build CPU time), ending in a validated but deliberately **not landed** fix: a
+`[patch.crates-io]` block pointing at a machine-local absolute path, which the coordinating session
+(§9) explicitly declined to commit because it would break every other checkout's build. This is a
+"decision recorded, not code shipped" document, structurally similar to `docs/SURFACE_HONESTY.md`
+§2's decision record, so worth checking whether the decision has since been executed.
+
+- **Claim (§9, the standing decision):** the patch stays local until one of three conditions is
+  met — upstream PR #3490 merges, a public fork carries the patch, or candle is vendored into this
+  repo. Until then, "이 최적화를 켜지 않습니다" (this optimization stays off). **Status: confirmed
+  still the current state.** **How checked:** `rust/torch_c/Cargo.toml` has no `[patch.crates-io]`
+  block today; `rust/torch_c/Cargo.lock` still lists `tokenizers` (line 1231). Whether upstream PR
+  #3490 has since merged was not checked — `rust/`'s `Cargo.lock`/`Cargo.toml` are this round's
+  forbidden territory, and confirming a GitHub PR's status is outside a documentation-claim audit's
+  normal method (no live command in this repo answers it); reported as unconfirmed rather than
+  guessed at.
+- §0-§4 (why `tokenizers` is non-optional in candle-core 0.11.0's `Cargo.toml`, that `torch_c` never
+  calls the `TokenizerFromGguf` trait it exists for, the three removal options considered and why
+  forking-and-deleting was rejected in favor of the patch), §3 (the crate-count and build-time
+  measurements, cross-checked twice — once against a standalone probe crate, once against `rust/
+  torch_c`'s real `Cargo.lock`, both agreeing on −44 crates), §6 (explicit unknowns: the PR author's
+  self-reported test count, Windows MSVC-vs-GNU relevance, cross-compile measurement, stripped
+  binary size, burn's dependency tree): round-scoped investigation and measurement, not re-verified
+  — no reason to suspect any, and the crate-count claim is a `Cargo.lock` fact independently
+  re-confirmed above as part of checking §9.
+- **Fixed: none — no false or stale claims found.** The decision this document records has neither
+  been executed nor overtaken by events discoverable from within this repo; the standing "not
+  landed" state is exactly what's still on disk.
+
+### docs/HARNESS.md
+
+375 lines, the round that found `tools/golden/compare.py`'s own self-test (`--inject-fault`) had
+only ever exercised one comparator out of ten, covering 1377 of 1781 cases (77.3%) and leaving the
+other 404 (22.7%, nine comparators for multi-result ops) never proven able to fail. §6 found three
+genuine gaps in the untested comparators themselves (indices dtype/shape not compared in
+`_pair_result_check`+`dtype-last` and `_topk_multiset_check`+`shape-last`/`dtype-last`) and
+explicitly left them unfixed as out of this document's own file scope (`tools/golden/cases.py`).
+Worth checking whether a later round — this round's own territory excludes `tools/golden/` for
+edits, but not for reading — picked them up.
+
+- **Claim (§6, §4's table):** three comparator blind spots are real defects, not by-design gaps, and
+  are left unfixed, with the exact one-line fix given for each. **Status: FALSE today — all three
+  closed.** **How checked:** `tools/golden/cases.py` has `indices dtype mismatch`/`indices shape
+  mismatch` checks at two sites (lines 6287/6295 and 9575/9578), textually matching this section's
+  own proposed fix; `tools/golden/compare.py`'s `KNOWN_GAP` dict is empty today (`KNOWN_GAP: dict[
+  tuple[str, str], str] = {}`) — this section's own closing instruction ("고친 뒤에는 `KNOWN_GAP`
+  에서 해당 항목을 지워야 합니다... 안 지우면 `--self-test` 가... 실패합니다") was followed,
+  since `--self-test`'s design would fail loudly if a fix landed without the table update.
+  **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after §6's "고치지
+  않았습니다" sentence and a shorter inline note after §4's `GAP` legend line, without editing the
+  actual `tools/golden/` files this round is forbidden from touching (only observed that another,
+  earlier round already had). Marked `symbol-in-file` against the literal fix text.
+- §1-§3 (the coverage-gap discovery and its historical justification — the three original `value_
+  check` users were legitimately unfixable by the default pipeline when written, and became a real
+  gap only once `value_check` became the standard multi-result comparison mechanism), §3.2's own
+  self-correction (the `permute`/`permute-all` mode split, found because `--self-test` itself caught
+  a `BLIND_BY_DESIGN` entry actually getting caught — an in-document demonstration of exactly the
+  "a check that can't fail isn't a check" principle this whole audit round has been applying), §5
+  (the four legitimate `blind` entries and their reasoning), §7 (the tolerance-scheme measurement
+  and recommendation, explicitly not applied pending a future case addition — a "not done, and here
+  is exactly why not" deferral rather than an oversight), §8 (explicit unknowns, correctly hedged):
+  not independently re-verified beyond the one finding above — no reason to suspect any, and this
+  document's own §3.2 sidebar is itself evidence of the same self-correcting discipline this round
+  keeps finding in the higher-quality files.
+- **Fixed: one, but touching three comparator blind spots and a load-bearing invariant
+  (`KNOWN_GAP` must be empty for `--self-test` to mean what it claims)** — the same general shape as
+  this round's other findings (a "not fixed here" item closed by unrelated later work), but notable
+  for being a fix to the *verification apparatus itself* rather than to a kernel or Python spelling —
+  closing it matters more than most because every other file's DOCWATCH/golden-based finding in this
+  three-round audit implicitly depends on the harness being honest about what it can catch.
+
+### docs/VULKAN.md
+
+377 lines, a feasibility investigation (Android Vulkan compute via `ash`/`wgpu`, both proven bit-
+identical to CPU on an emulator, `ash` recommended) that explicitly declines to make one decision —
+whether Apple GPU support should come from candle's existing `metal` feature (favoring `ash` for
+Android alone) or from `wgpu` (one WGSL kernel covering all three targets) — and defers it as
+CLAUDE.md §5.7 territory (a cross-target kernel-ownership decision beyond this task's scope). §5.4's
+"아직 하지 않은 것" (not yet done) list is the checkable "next step" shape this round prioritises.
+
+- **Claim (§5.4):** no Vulkan dependency has been added to `rust/torch_c`; `"vulkan"` is only a
+  reserved device-string placeholder in `device.rs`; `rust/vk_probe` remains a separate, unmerged
+  workspace member. **Status: confirmed still true today.** **How checked:**
+  `rust/torch_c/Cargo.toml` has no `ash`/`wgpu`/vulkan dependency; `device.rs:69` still only lists
+  `"vulkan"` as a device-type string in a table, with no backing implementation; `rust/vk_probe/`
+  still exists as a sibling crate (`Cargo.toml`, `Cargo.lock`, `build.rs`, `shaders/`, `src/`) with
+  no reference from `rust/torch_c`.
+- **Claim (§5.3, the deferred decision):** whether Apple GPU support goes through candle's `metal`
+  feature (favoring `ash`) is still open, evidenced by `rust/torch_c/Cargo.toml` currently enabling
+  only `accelerate` on Apple targets, not `metal`. **Status: confirmed still true today** —
+  `Cargo.toml:107` still reads `features = ["accelerate"]` only; `metal` is absent. The decision
+  this document flagged as outside its own scope remains unmade.
+- §1-§2 (the bit-identical vecadd/matmul proof on both `ash` and `wgpu`, the tamper self-test that
+  demonstrated a real detection boundary at 1-2 ULP from FMA fusion, the host-vs-guest distinction
+  for feature bits — `MoltenVK` proving the emulator translates to the host GPU, and the correction
+  this document makes to `docs/DEVICE.md` §10's broader fp16/int8 claim, narrowing it to a host-only
+  fact), §3 (why pre-compiled SPIR-V kernels don't violate the "no model pre-conversion" premise),
+  §4 (the `ash`/`wgpu`/`vulkano`/ExecuTorch comparison, `candle` confirmed to have no Vulkan backend
+  at the pinned 0.11.0 tag), §6-§7 (device discipline followed, and an extensive explicit list of
+  what an emulator cannot answer — performance, real Adreno/Mali hardware, in-APK behavior, API 26,
+  multi-kernel synchronization, large-buffer memory pressure): not independently re-verified beyond
+  the two claims above — no reason to suspect any, and the document's own tamper self-test (§1) is
+  already the kind of "can this check actually fail" demonstration this audit looks for.
+- **Fixed: none — no false or stale claims found.** Both checkable "not yet done" claims (no Vulkan
+  dependency wired into `rust/torch_c`, the Apple-GPU-backend decision still unmade) remain
+  accurate; the decision this document explicitly declined to make on its own authority has not
+  been made by anyone else either.
+
+### docs/B_SPIKE.md
+
+534 lines, a timeboxed build spike against real upstream PyTorch (`main` at a pinned 2026-08-23
+commit) testing whether option B ("selective libtorch cross-build") could actually cross-compile for
+Android. It could (two builds completed, five blockers found and worked around, all upstream-side
+decay rather than this repo's own defect) — but the spike's most consequential finding is that the
+question itself was misframed: the mobile build path forces `BUILD_PYTHON=OFF`, so what it produces
+is never `torch._C`, and DESIGN.md §6's "cross-compilation is B's only unknown" is corrected in the
+document's own text (§4). This document's recommendation — favor A (candle+PyO3) — is exactly what
+round 1's `docs/DESIGN.md` audit already confirmed was adopted ("결론: A(candle 위 `torch._C`)로
+갑니다").
+
+- **Consistency check, not a staleness finding:** this document's recommendation and `docs/DESIGN.
+  md`'s recorded final decision agree (A was chosen), so there is no "recommendation later reversed"
+  or "still open" claim to correct here — unlike `docs/RNG.md`/`docs/DTYPE.md`'s "recommendation
+  adopted" pattern in earlier rounds, this document doesn't claim its own recommendation is still
+  pending; it just makes the case, and the case matches what happened.
+- §1-§3 (upstream PyTorch's mobile-build entry-point scripts confirmed deleted via GitHub API commit
+  lookups, the five build blockers and their upstream root causes — a stale eigen submodule
+  reference, an NDK Vulkan wrapper removal PyTorch's CMake didn't follow, a CUDA-only op breaking
+  static-dispatch codegen), §5 (iOS confirmed worse off than Android — the CMake toolchain file
+  itself deleted from upstream main), §6 (explicit unmeasured items: deployed-binary size,
+  on-device execution, `TRACING_BASED`/`model_tracer`, `BUILD_MOBILE_AUTOGRAD=ON`, whether the
+  `cpuinfo` WHOLE_ARCHIVE conflict is static-build-specific): all claims about a pinned external
+  repository's state at a specific commit, not about this repo's own kernel coverage — the
+  non-drifting category this round has repeatedly distinguished from `_aten_implemented()`-linked
+  claims (`docs/CORE_ATEN.md`/`docs/QUANT.md`/`docs/C_SURFACE.md`/`docs/CANDLE_DEPS.md` above). Not
+  re-verified — re-running this spike would mean re-cloning and rebuilding upstream PyTorch, well
+  outside a documentation-claim audit's scope, and nothing else found this round suggested the A/B
+  decision has been revisited.
+- **Fixed: none — no false or stale claims found.**

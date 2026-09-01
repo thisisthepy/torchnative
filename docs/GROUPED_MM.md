@@ -348,6 +348,14 @@ for no reason anyone could later reconstruct.
 missing table entry was a vague one. **This one is a missing kernel, not a missing name**, and it
 is the only comparison overload in that state.
 
+> **Fixed since — and it was already fixed when this sentence was committed.** `088e8f4` ("Feat:
+> Close three kernel gaps, and disprove the stated reason for the fourth") gave `ge.Tensor` a
+> kernel at 18:58, this document's own final revision (`8c07af8`) landed at 19:56 the same day, and
+> the sentence above still shipped saying "has no kernel." `x >= tensor` computes today
+> (`aten.ge.Tensor` is in the current 168-op `_aten_implemented()` list). Round 1 of this audit's
+> `docs/VIEWS.md` finding independently confirmed the same kernel from a different document.
+> <!-- DOCWATCH: op-implemented aten.ge.Tensor -->
+
 **`chunk` is not `extent // chunks`.** Upstream's composite
 (`at::native::chunk`, `aten/src/ATen/native/TensorShape.cpp`) rounds the split size *up* and then
 lets `split` return however many pieces that produces, so `chunks` is an upper bound rather than a
@@ -406,7 +414,15 @@ was written on top of `scatter`, which wants an int32/int64 index
 ### 6.5 Not a blocker, but on the path
 
 `torch.manual_seed` refuses (`torch._C._dynamo.eval_frame.set_eval_frame`), because
-`torch/_compile.py` routes it through Dynamo's disable wrapper. Nothing in a forward pass needs
+`torch/_compile.py` routes it through Dynamo's disable wrapper.
+
+> **Fixed since (문서 감사, 2026-09).** `torch.manual_seed(42)` succeeds today — the CPU generator
+> port (`docs/RNG.md`/`docs/TENSORBASE.md`, round 2 of this audit) closed this along with
+> `uniform_`/`normal_`. §9's "weights are filled by a shared LCG ... because `torch.manual_seed`
+> still refuses" is stale for the same reason, though re-running §9's comparison with real seeding
+> instead of the LCG workaround was not attempted here (out of scope for a documentation pass).
+
+Nothing in a forward pass needs
 it; it only means a seeded shim run cannot be set up the obvious way.
 
 ---

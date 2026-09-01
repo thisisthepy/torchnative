@@ -581,5 +581,18 @@ correction, so it keeps the exact bits it had.
 * **The SDPA math backend.** §2.3 corrected the refusals' *reason* and did not build the composite.
   Its kernels are all present; nobody has transcribed the sequence. That is the largest item this
   round names and leaves.
+  > **Correction (문서 감사, 2026-09):** built since — `_sdpa_math` exists in
+  > `rust/torch_c/src/bootstrap.py` (landed in `1938ad1`, "Feat: Open training mode, which every
+  > sweep in this repository had assumed away", which post-dates this document's own commit
+  > `3b7d981`; `git merge-base --is-ancestor 3b7d981 1938ad1` confirms the order). Live-verified:
+  > `F.scaled_dot_product_attention(q, k, v, dropout_p=0.1, is_causal=True)` — the exact scenario
+  > that falls off the flash path this document's own `bootstrap.py` comment names
+  > (`dropout_p != 0.0` routes to `_sdpa_math`) — succeeds today. Round 2's `docs/SDPA.md`/
+  > `docs/CKPT2.md`/`docs/GENERATE.md` audits already independently confirm the same function
+  > (its `enable_gqa` branch, specifically).
+  > <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
 * **`aten.amin.default`.** Named in §2.4, not written. It is a direction-specific `CustomOp1`, not
-  a sign flip.
+  a sign flip. **Status: confirmed still true** — `aten.amin.default` and `aten.argmin.default` are
+  both still absent from the current 168-op `_aten_implemented()` list.
+  <!-- DOCWATCH: op-not-implemented aten.amin.default -->
+  <!-- DOCWATCH: op-not-implemented aten.argmin.default -->

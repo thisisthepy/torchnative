@@ -230,6 +230,11 @@ VENDOR.md 의 벽 목록(`_load_global_deps` · `_initExtension` · `TensorBase`
 확인할 가치는 있습니다(§2 는 여기서 실물 torch 로 확인했지만 **벤더링된 트리 + 우리 `_C`** 조합
 에서는 아직 확인되지 않았습니다 — 이 문서가 다루지 않은 유일한 남은 변수입니다).
 
+> **정정 (문서 감사, 2026-09):** 확인됐다. `from transformers.models.llama.modeling_llama import
+> LlamaModel, LlamaForCausalLM` 이 오늘 벤더링된 트리 + 우리 `_C` 조합 위에서 직접 성공하고,
+> `__doc__` 길이가 이 문서가 실물 torch 로 잰 것과 정확히 같다 (`LlamaModel` 883, `LlamaForCausalLM`
+> 850). 판단은 실측으로 재확인됐다 — `@auto_docstring` 은 벤더링 경로에서도 새 벽이 아니다.
+
 ---
 
 ## 요약
@@ -240,4 +245,4 @@ VENDOR.md 의 벽 목록(`_load_global_deps` · `_initExtension` · `TensorBase`
 | `copy_func`/`types.FunctionType` 이 이 경로에서 불리는가 | **아니다** | grep 전수 + 87 회 호출 트레이스, 전부 무관한 9 개 지점 |
 | torch 의 무언가에 의존하는가 | **의존하지 않는 것으로 확인** — 제너릭 스텁으로 실물과 바이트 동일한 결과 | `/tmp/stub_env/run_stub2.py` vs `/tmp/stub_env/run_real.py` |
 | 2 차가 본 TypeError 의 정확한 원인 | **미확인** — 원본 스크립트 소실. 함수 아닌 객체가 `__code__` 를 문자열로 흉내냈을 가능성이 유력 | 메시지 재현(`types.FunctionType('x', {})`)과 소거법 |
-| 벤더링 경로(§2)에서 이 벽이 문제가 되는가 | **문제가 될 이유를 찾지 못함**. 다만 벤더링 트리 + 우리 `_C` 조합에서 `import torch` 를 실제로 넘긴 뒤 재확인은 안 함 | VENDOR.md 의 벽 목록에 부재 |
+| 벤더링 경로(§2)에서 이 벽이 문제가 되는가 | **문제가 될 이유를 찾지 못함**. 다만 벤더링 트리 + 우리 `_C` 조합에서 `import torch` 를 실제로 넘긴 뒤 재확인은 안 함. **정정 (문서 감사, 2026-09): 재확인됨, 문제 없음** — `LlamaModel`/`LlamaForCausalLM` 이 오늘 벤더링 트리 + 우리 `_C` 위에서 직접 임포트되고 `__doc__` 길이가 실물 torch 측정과 바이트 단위로 같다 | VENDOR.md 의 벽 목록에 부재 + §7 정정 |

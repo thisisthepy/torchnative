@@ -5,6 +5,22 @@
 계측한 기록입니다. **우리 shim 은 아직 여기 도달하지 못했으므로, 진짜 torch 2.13.0 +
 transformers 5.15.1 실물로 계측해서 목록을 만들었습니다.**
 
+> **Correction (문서 감사, 2026-09):** 이 문서는 사전 계측 시점(당시 `IMPLEMENTED` 3 개:
+> `aten.add.Tensor`/`aten.full.default`/`aten.mm.default`) 을 기록한 것이고, §2.1 이 요구한
+> 14 개 op 은 오늘 전부 구현되어 있다 (`grep`으로 14 개 전부 현재 168-op `_aten_implemented()`
+> 목록에 있음을 확인). §6 이 "다음 검증 단계"로 남긴 것 — 벤더링 트리 + 우리 `_C` 조합에서
+> 같은 스크립트를 다시 돌려 대조하는 것 — 도 실제로 일어났다: 우리 shim 위에서
+> `AutoModelForCausalLM.from_config(cfg)` (이 문서와 동일한 llama config) 을 직접 호출하면
+> 성공하고, 파라미터 수까지 이 문서가 실물 torch 로 잰 것과 정확히 같다(95,040개). §4.3 이
+> 미확인으로 남긴 "candle RNG 가 torch RNG 값과 같은가"도 `docs/RNG.md`/`docs/TENSORBASE.md`의
+> 포트로 답이 났다(`rust/torch_c/src/rng.rs`에 MT19937 엔진과 `torch.manual_seed` 리매핑이
+> 있다). 아래 §2.1/§5/§6 원문은 계측 당시 그대로 남긴다.
+> <!-- DOCWATCH: op-implemented aten.normal_.default -->
+> <!-- DOCWATCH: op-implemented aten.uniform_.default -->
+> <!-- DOCWATCH: op-implemented aten.empty.memory_format -->
+> <!-- DOCWATCH: op-implemented aten.arange.start_step -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/rng.rs manual_seed present -->
+
 환경: `/Volumes/macMini/caches/spike-venv/bin/python` (torch 2.13.0, transformers 5.15.1, 둘 다
 실물 설치). 대상 모델:
 

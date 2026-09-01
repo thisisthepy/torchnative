@@ -31,6 +31,12 @@ VENDOR.md 는 "목표는 되게 하는 것이 아니라 어디서 깨지는지 �
 `from_config` 는 여전히 실패합니다. 다만 **실패 지점이 `import torch` 밖으로 나갔습니다** — 이제
 transformers 쪽에서 멈춥니다 (§8 항목 3).
 
+> **정정 (문서 감사, 2026-09):** §11 항목 3 도 같이 본다 — `from_config` 는 오늘 shim 위에서
+> 직접 성공한다. `docs/REGISTRATIONS.md`/`docs/FROM_CONFIG.md` 감사(이 라운드)가 각각 독립적으로
+> 재확인했다: `torch._C._log_api_usage_once` 가 생겼고, 14개 초기화 op 이 전부 구현됐다. 아래
+> §0/§11 원문은 이 문서가 쓰인 시점 그대로 남긴다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _log_api_usage_once present -->
+
 ---
 
 ## 1. 구조 — `_C` 는 여전히 `.so` 하나다
@@ -519,11 +525,15 @@ import torch          1.15 s
 | 7 | **기기(Android · iOS)에서의 임포트** | 이번에도 링크만. 표면을 짓는 11.9 ms 와 45 KB 파이썬 소스 실행이 기기에서 어떤지 **미확인** |
 | 8 | `TORCH_USE_RTLD_GLOBAL` 의 기기 영향 | VENDOR.md §7 항목 4 그대로 |
 | 9 | `aarch64-apple-ios-sim` | 이번에도 빌드하지 않음 |
-| 10 | `float8_e4m3fn` 텐서 생성이 멈추는 현상 | 골든 하네스가 양쪽 독립적으로 관측한 그대로. **원인 미조사** |
-| 11 | dtype 승격표 | 여전히 미구현. `add.Tensor` 가 이름을 대고 거부 |
-| 12 | bool 연산 (BOOL.md §6.2 의 표) | 태그와 단일 생성자·불변식 검사는 들어갔지만, `bitwise_*`·`any`·`masked_fill` 커널은 **미구현** |
+| 10 | `float8_e4m3fn` 텐서 생성이 멈추는 현상 | 골든 하네스가 양쪽 독립적으로 관측한 그대로. **원인 미조사**. **정정 (문서 감사, 2026-09):** 오늘은 멈추지 않는다 — `torch.full((3,), 1.0, dtype=torch.float8_e4m3fn)` 가 5초 알람 안에서 정상 반환된다. 원인은 여전히 추적하지 않았다(무엇이 고쳤는지는 미확인), 증상만 재확인 |
+| 11 | dtype 승격표 | 여전히 미구현. `add.Tensor` 가 이름을 대고 거부. **확인 (문서 감사, 2026-09):** 오늘도 여전히 그렇다 — `docs/TORCH_C.md` 감사(라운드 2)가 같은 것을 확인했고, `docs/TENSORBASE.md` §2.3 이 이것을 **의도적** 결정으로 명명한다(자리표시자가 아니라) |
+| 12 | bool 연산 (BOOL.md §6.2 의 표) | 태그와 단일 생성자·불변식 검사는 들어갔지만, `bitwise_*`·`any`·`masked_fill` 커널은 **미구현**. **정정 (문서 감사, 2026-09):** 전부 닫혔다. `aten.bitwise_and.Tensor`/`aten.bitwise_and.Scalar`/`aten.bitwise_or.Tensor`/`aten.bitwise_or.Scalar`/`aten.bitwise_not.default`/`aten.any.default`/`aten.any.dim`/`aten.masked_fill.Scalar`/`aten.masked_fill_.Scalar` 가 전부 오늘 168-op `_aten_implemented()` 목록에 있다. 실측: `x & y`, `t.any()`, `x.masked_fill(mask, 0.0)` 전부 오늘 shim 위에서 계산된다 |
 | 13 | 재벤더링 시 표면이 얼마나 흔들리는지 | `surface.json` 은 2.13.0 에서 생성. 다른 판본에서 재생성했을 때의 차이 **미측정** |
 | 14 | `_shim_registrations` 1549 건 중 실제로 필요한 비율 | 미측정 |
+
+<!-- DOCWATCH: op-implemented aten.bitwise_and.Tensor -->
+<!-- DOCWATCH: op-implemented aten.any.default -->
+<!-- DOCWATCH: op-implemented aten.masked_fill.Scalar -->
 
 ---
 

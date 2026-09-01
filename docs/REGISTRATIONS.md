@@ -27,6 +27,21 @@ IMPORT_TORCH.md §9.1 이 "때우고 넘어간 것 중 가장 큰 것"으로 지
 | DESIGN §2 가 의존한다는 "973항목 분해 테이블" | **지금 재현되지 않는다.** `core_aten_decompositions()` 는 shim 에서 다른 이유로 크래시하고, 임포트 직후의 `decomposition_table` 은 592건으로, 973 과도 진짜 torch 의 1097 과도 다르다 |
 | 지금 고쳐야 하는가 | 아니오 — §5 참고. 이 1549건은 **eager 순전파에서는 진짜 torch 도 안 쓴다.** 지금 급한 것은 다른 벽(§5, `_log_api_usage_once`)이다 |
 
+> **Correction (문서 감사, 2026-09):** both "미룰 수 없는 것" items in §5 and the crash in §4's
+> last row are closed, and `from_config` no longer stops at `_log_api_usage_once`. **How checked:**
+> `hasattr(torch._C, '_log_api_usage_once')` and `hasattr(torch._C, '_dispatch_get_registrations_for_dispatch_key')`
+> are both `True` against today's shim; `core_aten_decompositions()` no longer crashes and returns
+> 417 entries (real torch: 940 — a real gap, but a count, not a crash);
+> `decomposition_table` is 1008 today (was 592 when this document measured it; real torch is
+> unchanged at 1097, confirmed live). `docs/DECOMP.md` §3 (round 2 of this audit) documents the
+> `_jit_get_operation`/`overload_names` fix directly, citing this document by name in its own code
+> comment (`bootstrap.py:1223`, "the reason it exists is docs/DECOMP.md §3"). `from_config`
+> succeeds end-to-end today (independently confirmed while auditing `docs/FROM_CONFIG.md`, this
+> round). "973" itself is still not reproduced or explained — that part of §0's row is unresolved,
+> not fixed, and is left as reported.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _log_api_usage_once present -->
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dispatch_get_registrations_for_dispatch_key present -->
+
 ---
 
 ## 1. 1549건의 분류
@@ -275,6 +290,9 @@ shim 에만 있고 진짜 torch 에는 없는 것:   210개  (전부 실재하�
    도달하기 전에 넘어야 할 벽이 이미 하나 더 있고, 그것은 `_dispatch_library` 와 무관합니다.**
    이 벽을 먼저 넘지 못하면 §2 의 "0건" 조차 shim 위에서는 검증할 수 없습니다(진짜 torch 로
    대신 잰 이유입니다).
+   > **정정 (문서 감사, 2026-09):** 닫혔다 — `torch._C._log_api_usage_once` 는 오늘 존재하고
+   > (`bootstrap.py:4777`), `from_config` 는 shim 위에서 직접 성공한다(§0 위 정정, 그리고
+   > `docs/FROM_CONFIG.md` 감사에서 독립적으로 재확인).
 3. **§3 이 보여주듯, `_dispatch_has_kernel=True` 홀로는 실제로 값싼 거짓말입니다** — 진짜
    torch 도 그 251개를 "무해한 잔재"로 취급하도록 설계돼 있습니다(`activate_meta()` 가 그것을
    걸러내려고 존재). 문제는 그 짝인 `_dispatch_has_kernel_for_dispatch_key` 를 나중에 따로

@@ -470,6 +470,16 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 
 ### 6.4 권고 — (b), 다만 순서가 있다
 
+> **정정 (문서 감사, 2026-09):** 권고가 채택됐다. `docs/QUANT2.md`(같은 날 22:08 착지, 이 문서의
+> 18:23 착지보다 약 4시간 뒤 — `git log` 로 순서 확인)가 `Repr::Quantized(Arc<QTensor>)` 를
+> `tensor.rs` 에 실제로 넣었다(오늘도 존재, 확인함). SmolLM2-135M q8_0/q4_0 로 20/20 토큰 일치를
+> 검증축으로 삼았다 — 아래 §6.4 순서표의 1번("양자화용 검증 축")과 2번("`Repr::Quantized` +
+> `dequantize` 왕복")이 실제로 그 순서로 닫혔다. `torch.int8` dtype 자체는 오늘도 여전히 이름을
+> 대고 거절한다(`torch.tensor([1,2,3], dtype=torch.int8)` → `NotImplementedError: ... dtype not
+> storable by the candle backend`) — §6.4 항목 2 의 "결함이 아니라 정확한 보고" 라는 판단은
+> 그대로 유효하다. 아래 원문은 권고 시점 그대로 남긴다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs Quantized present -->
+
 **추천: (b) candle `QTensor` 를 `Repr` 의 세 번째 변형으로.** 근거는 셋입니다.
 
 1. **(a) 는 지금 형태로는 아무것도 사지 못합니다.** 비-KleidiAI 팩 레이아웃은 압축이 0 이고

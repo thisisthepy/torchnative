@@ -62,7 +62,7 @@ version(...)` 으로 버전을 봅니다(메타데이터가 없으면 직접 imp
 | 2 | **어노테이션에 쓰이는 진짜 타입** | `generation/logits_process.py:142` 의 `eos_token_id: int \| list[int] \| torch.Tensor` — 어노테이션이 클래스 정의 시점에 평가되므로 `\|` 가 성립해야 함 | 예 (진짜 클래스면) |
 | 3 | **실제 서브모듈 파일** | `generation/utils.py:26` 의 `import torch.distributed as dist` — **모듈 수준 `__getattr__` 로는 만족되지 않음** | 예 (파일이 있으면) |
 | 4 | **상속 가능한 클래스** | `class _AllReduceBackward(torch.autograd.Function)` | 예 (진짜 클래스면) |
-| 5 | **데코레이터로 호출되는 것** | `continuous_batching/input_outputs.py:244` 의 `@torch.no_grad()` — 호출 결과가 다시 호출 가능해야 함 | 미확인 (여기서 멈춤) |
+| 5 | **데코레이터로 호출되는 것** | `continuous_batching/input_outputs.py:244` 의 `@torch.no_grad()` — 호출 결과가 다시 호출 가능해야 함 | 미확인 (여기서 멈춤). **정정 (문서 감사, 2026-09):** `docs/FROM_CONFIG.md` §3.3 이 이 범주를 이어받아 정확한 요구 시점(클래스 본문 실행 시점)과 이중 프로토콜(컨텍스트 매니저 + 데코레이터)을 확인했다 — 자기 문서 안에서 이 문서를 이름으로 지목한다 ("IMPORT_WALLS.md 1 차의 category 5"). `from_config` 는 오늘 shim 위에서 직접 성공한다(이 라운드에서 독립적으로 재확인) |
 
 범주 2 와 4 는 **속성마다 동적으로 진짜 클래스를 돌려주면** 한꺼번에 풀립니다. 범주 3 은 클래스로
 풀리지 않습니다 — 파이썬의 `import a.b` 는 실제 모듈을 찾으므로 파일이 있어야 합니다.
@@ -326,10 +326,20 @@ torch.cuda.graphs            torch.distributed.distributed_c10d
 ## 아직 답하지 않은 것
 
 - 범주 5(`@torch.no_grad()`) 너머는 미탐색입니다. 여기서 멈췄습니다.
+  > **정정 (문서 감사, 2026-09):** 위 §"관문 너머" 표의 인라인 정정을 참조 — `docs/FROM_CONFIG.md`
+  > §3.3 이 이 지점을 이어받아 답했다.
 - 위 서브모듈들이 **빈 스텁으로 충분한지** — 즉 transformers 가 그 안의 무엇을 실제로 호출하는지는
   다음 회차의 일입니다.
+  > **정정 (문서 감사, 2026-09):** 이 질문은 답해지지 않고 **무의미해졌다** — `docs/DESIGN.md`
+  > §11(살아 있고, 그 스스로 이 문서의 4·5 차를 근거로 인용한다)이 "A(candle 위 `torch._C`)로
+  > 간다"고 최종 결정했고, A 는 스텁이 아니라 **벤더링한 실물 파이썬 트리 전체**를 지고 간다.
+  > 그러므로 "빈 스텁으로 충분한가"는 이 프로젝트가 실제로 선택한 경로에서 다시 묻지 않는
+  > 질문이 되었다 — 답이 아니라 전제가 사라졌다.
 - 이 실험은 **모델 생성(`from_config`)** 까지만 봅니다. 순전파 · `generate` · `online()` 은 그
   너머입니다.
+  > **정정 (문서 감사, 2026-09):** 순전파와 `generate` 는 오늘 shim 위에서 실제로 동작한다
+  > (`docs/CKPT2.md`/`docs/GENERATE.md`, 라운드 2 감사 — SmolLM2-135M 실물 체크포인트로
+  > 재확인됨).
 
 ## 방법에 대한 메모
 

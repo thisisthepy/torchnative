@@ -17,7 +17,7 @@ worktree `/Volumes/macMini/worktrees/bw-surface`, 브랜치 `work/surface-honest
 | §1 이 실제로 바꾼 동작 | `torch.backends.cudnn.benchmark_limit` 이 자리표 쌍 → `None`. 상류와 일치 |
 | §2 `torch.distributed.Store` 재수출 | **결정됨 (§2.6).** 벤더 트리는 한 줄도 안 고칩니다 — `torch.distributed` 를 `world_size=1` 부터 실체로 구현하고, 그 부수 효과로 벽이 열립니다. 세 갈래 실측은 §2.6.1 에 남겨둡니다 |
 | §2 의 핵심 발견 | **상류 torch 자신도 같은 자리에서 같은 예외로 죽습니다.** 우리 결함이 아닙니다 (§2.2) |
-| `from_config` 진행 | **변화 없음.** 같은 벽(`fake_pg.py:7`)에서 멈춥니다 |
+| `from_config` 진행 | **변화 없음.** 같은 벽(`fake_pg.py:7`)에서 멈춥니다. **정정 (문서 감사, 2026-09): 닫혔다 — §2.7 정정 참조** |
 | 판정 기준 | 골든 1043/1043 covered=62 · 스키마 127/127 · 스모크 62/62 · strict probe torch·transformers · 3 타깃 — **전부 exit 0** |
 
 ---
@@ -417,6 +417,19 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 
 §1 은 이 벽보다 **앞쪽**(`import torch` 중 `torch/backends/cudnn`)을 고친 것이라 도달 거리를
 바꾸지 않습니다. 다음 벽이 무엇인지는 **모릅니다** — 위 §2.6 항목 3.
+
+> **정정 (문서 감사, 2026-09):** 이 벽은 이 문서의 바로 다음날 닫혔다. `docs/DISTRIBUTED.md`
+> (착지 커밋 `99fec1b`, "Feat: Stand up torch.distributed, and import transformers for the first
+> time", 2026-08-25 06:52 — 이 문서의 마지막 커밋 `eae2a42` 은 전날 22:38)가 §2.6 이 여기서
+> 결정한 바로 그 계획("`torch.distributed` 를 `world_size=1` 부터 실체로 구현")을 실행했다.
+> `torch.distributed.Store` 가 오늘 존재하고(`hasattr(torch.distributed, 'Store')` → `True`),
+> `from_config` 는 오늘 이 정확한 시나리오로 성공한다(실측, 파라미터 수 95,040개 —
+> `docs/FROM_CONFIG.md` 감사(이 라운드)가 실물 torch 로 잰 것과 정확히 같음). §2.6 이 스스로
+> "그때까지 검증은 손으로 옮겨 적은 모델로 계속합니다" 라고 적어 둔 "그때" 가 왔다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_distributed_c10d present -->
+
+이제 위 §0 요약표의 "`from_config` 진행: 변화 없음" 줄도 같은 이유로 낡았다 — 아래에서 다시
+쓰지 않고 이 정정을 가리킨다.
 
 ---
 

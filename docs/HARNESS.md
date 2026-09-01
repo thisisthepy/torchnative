@@ -171,7 +171,9 @@ _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | C
 
 - `CAUGHT` — 그 결함을 거부했다
 - `blind` — **의도된 무시**. 근거는 §5
-- `GAP` — **실제 결함**. 잡아야 하는데 못 잡는다. §6
+- `GAP` — **실제 결함**. 잡아야 하는데 못 잡는다. §6. **정정 (문서 감사, 2026-09): 위 표의 세
+  `GAP` 칸(`_pair_result_check`+`dtype-last`, `_topk_multiset_check`+`shape-last`/`dtype-last`)은
+  전부 닫혔다 — §6 의 정정 참조. `compare.py` 의 `KNOWN_GAP` 은 오늘 빈 딕셔너리다**
 - `n/a` — 그 결과 모양에 그 결함을 만들 수 없다 (단일 텐서에는 "마지막 멤버" 가 없다 등)
 
 **어떤 결함에도 안 걸린 비교기는 없습니다.** 열 개 전부 최소 두 개 이상의 주입을
@@ -212,6 +214,13 @@ _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | C
 
 세 결함 다 **`tools/golden/cases.py` 안에 있고, 이번 작업의 파일 범위 밖**입니다.
 고치지 않았습니다. 필요한 수정은 각각 한 줄입니다.
+
+> **정정 (문서 감사, 2026-09):** 전부 닫혔다 — `tools/golden/cases.py` 에 `indices dtype
+> mismatch`/`indices shape mismatch` 검사가 오늘 두 자리(6287·6295, 9575·9578행)에 있고, 그
+> 텍스트가 이 절이 제안한 한 줄과 그대로 일치한다. `tools/golden/compare.py` 의 `KNOWN_GAP` 은
+> 오늘 빈 딕셔너리다 — 아래 §6 의 요구대로 고친 뒤 지워졌다. `tools/golden/`/`rust/` 는 이
+> 라운드의 금지 영역이라 직접 고치지 않았지만, 이미 다른 작업이 고쳐 두었다.
+> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py "indices dtype mismatch" present -->
 
 ```python
 # _pair_result_check (cases.py:2108 근처, indices shape 비교 옆)

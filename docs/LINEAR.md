@@ -289,7 +289,7 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 | # | 벽 | 크기 | 무엇이 필요한가 |
 |---|---|---|---|
 | 1 | **`bfloat16`/`float16` 가중치가 호출마다 `float32` 로 실체화됨** | **이 회차가 없앤 것과 같은 종류의 복사이고, 아직 있습니다.** A+B 를 적용한 뒤에도 같은 모양에서: `lm_head` `(1,6,576)` `float32` **4.75 ms** 대 `bfloat16` **77.84 ms** (16.4×), `float16` 79.33 ms. `gate` 는 0.094 대 1.87 ms (19.9×) | `opmath_in` 의 넓히기는 상류가 하는 것이라 지울 수 없습니다(`docs/BF16.md`). 넓힌 가중치를 **캐시**하거나, 넓히기를 GEMM 안으로 밀어 넣어야 합니다. 수명이 걸린 설계 판단 |
-| 2 | **골든이 `aten.matmul.default` 를 안 봄** | `IMPLEMENTED_AWAITING_GOLDEN` 에 있음 (§4.3). 이 문서의 변경이 가장 크게 건드린 커널이 **골든 밖**이었습니다 | `tools/golden/cases.py` 에 케이스 빌더 하나 + `IMPLEMENTED` 로 한 줄 이동 |
+| 2 | **골든이 `aten.matmul.default` 를 안 봄** | `IMPLEMENTED_AWAITING_GOLDEN` 에 있음 (§4.3). 이 문서의 변경이 가장 크게 건드린 커널이 **골든 밖**이었습니다. **정정 (문서 감사, 2026-09): 닫혔다** — `aten.matmul.default` 가 오늘 168-op `_aten_implemented()` 목록에 있고(§6의 이 정정이 참조하는 라운드 3 기준선의 `pending case builders=1` 은 `aten.reshape.default` 하나뿐, `matmul` 아님), 골든이 오늘 이 op 을 비교한다 | `tools/golden/cases.py` 에 케이스 빌더 하나 + `IMPLEMENTED` 로 한 줄 이동 |
 | 3 | **왼쪽이 2-D, 오른쪽이 N-D 인 matmul** | 접기가 반대 방향은 안 함. `broadcast_matmul` 이 여전히 왼쪽을 실체화 | 상류의 `should_fold` 반대 갈래. 실측 사용례를 못 찾아 손대지 않았습니다 |
 | 4 | **`addmm` 의 bias 브로드캐스트 복사** | `bias.broadcast_as(target).contiguous()` — `lm_head` 에서 196 KB, 가중치 113 MB 대비 0.17% | 작아서 손대지 않았습니다. 이름만 적어둡니다 |
 | 5 | **기기 측정 없음** | 전부 호스트 M1 (Accelerate). 안드로이드는 `gemm` 백엔드라 §2 표의 오른쪽 열이 적용됨 | `gemm` 은 마지막 두 차원 스트라이드를 임의로 받으므로 **폴백이 더 적게 발동할 것**으로 보이지만, 재지 않았습니다 |
@@ -300,6 +300,16 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 
 **비트가 바뀌므로 여기서 임의로 고르지 않았습니다** (`CLAUDE.md` §5.7).
 작업 트리에 변경만 있고 **커밋하지 않았습니다.**
+
+> **정정 (문서 감사, 2026-09):** 이 문단은 이 문서 자신을 착지시킨 바로 그 커밋(`2e00ec3`,
+> "Perf: Fold instead of broadcasting, and stop copying the weight every call")과 자기모순이다 —
+> `git show --stat 2e00ec3` 로 확인하면 그 커밋이 `docs/LINEAR.md` 370줄 신설과 `rust/torch_c/
+> src/aten.rs` 131줄 변경을 **함께** 실었다. 즉 이 문단이 커밋에 들어가는 순간 "커밋하지 않았다"는
+> 이미 틀렸다. 골랐던 것은 **①** — A+B 를 그대로, 옵트인 없이, 기본값으로 착지 — 였다:
+> `gemm_with_layout_fallback`/`batched_matmul` 이 오늘 `aten.rs` 의 기본 경로다(라운드 1
+> `docs/DESIGN.md` 감사가 이미 확인). `docs/QUANT2.md` 감사(라운드 2)도 같은 커밋을 독립적으로
+> 확인했다. 아래 표 자체는 그 판단이 내려지기 직전 시점의 정확한 기록이라 그대로 둔다.
+> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
 
 | 선택지 | 무엇 | 대가 |
 |---|---|---|

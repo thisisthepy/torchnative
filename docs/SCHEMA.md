@@ -364,3 +364,10 @@ predicates answered without text:       84, 84/84 about ops upstream does not ha
   닫으려면 aten op 의 완전한 목록이 필요하고, 이 트리에는 없습니다.
 - **docs/DISTRIBUTED.md §8.1 은 아직 "미해결"로 적혀 있습니다.** 이 문서가 그 항목의 답이지만,
   그 파일은 이 작업의 소유 범위 밖이라 건드리지 않았습니다.
+  > **정정 (문서 감사, 2026-09):** 이 문장은 쓰인 순간부터 자기모순이었습니다 — `git show
+  > --stat`으로 확인하면, 이 문장이 들어 있는 바로 그 커밋(`e26e54b`, 이 문서 자체의 착지
+  > 커밋)이 `docs/DISTRIBUTED.md` 도 함께 22줄 바꿔 §8.1 에 "해결됐습니다 (2026-08-28)." 블록쿼트를
+  > 넣었습니다. "건드리지 않았다"는 "이 문서를 쓴 사람이 직접 고치지 않고 조율 세션이 착지시켰다"
+  > 는 뜻이었을 가능성이 높지만, 문면 그대로 읽으면 오늘도 여전히 틀립니다 — `docs/DISTRIBUTED.md`
+  > §8.1 은 지금 이 문서를 정확히 가리키는 "해결됐습니다" 블록을 담고 있습니다.
+  > <!-- DOCWATCH: symbol-in-file docs/DISTRIBUTED.md 해결됐습니다 present -->

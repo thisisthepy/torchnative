@@ -30,6 +30,12 @@ OPS8.md 는 벽을 이렇게 적었습니다.
 막는 것이 다른 곳에 있기 때문입니다. 반대로 `_get_cudnn_enabled` / `_get_deterministic_algorithms`
 는 설정값 게터라 답하기 싼데, **둘 다 Llama 경로에 없어서** 이번에 건드리지 않았습니다.
 
+> **정정 (문서 감사, 2026-09):** 둘 다 오늘은 막히지 않는다. `torch._C._get_cudnn_enabled` 가
+> 존재하고 `True` 를 답한다(오늘 shim 위에서 확인). 실측: `F.layer_norm(x, (4,))` 와
+> `F.pad(x, (1,1))` 둘 다 오늘 shim 위에서 성공한다 — `F.layer_norm` 은 `docs/GPT2.md` 감사(라운드
+> 2)가 이미 확인한 것과 같은 발견으로, `_C._nn` 을 거치지 않는 별도 파이썬 합성
+> (`bootstrap.py:5863`)이 답한다.
+
 ---
 
 ## 2. `_C._nn` 의 실제 범위 (재본 숫자)
@@ -259,6 +265,21 @@ shim: <정확한 키>` 로 거부하며, 필요한 것의 이름을 스스로 �
 | `aten._safe_softmax.default` | sdpa 의 math 백엔드 (3-D 입력, `dropout_p>0`) | 아니오 |
 | `aten.dropout.default` | `F.dropout(train=True, p>0)` | 아니오 (추론은 §5 로 답함) |
 | `aten.matmul.default` 의 1-D 피연산자 | `nn.Linear` 에 1-D 입력 | 아니오 |
+
+> **정정 (문서 감사, 2026-09):** 표의 여덟 줄 중 일곱은 오늘 커널이 생겼다 — `aten.le.Tensor`/
+> `aten.le.Scalar`/`aten.where.self`/`aten.scalar_tensor.default`/`aten.addmm.default`/
+> `aten._softmax.default`/`aten._safe_softmax.default` 가 전부 오늘 168-op `_aten_implemented()`
+> 목록에 있다. 실측: `x <= y`, `torch.where(cond, a, b)`, `nn.Linear(3, 4, bias=True)(x)`,
+> `F.softmax(x, dim=0)` 전부 오늘 shim 위에서 계산된다. **`aten.dropout.default` 만 여전히
+> 미구현** — 실측: `torch.ops.aten.dropout.default(x, 0.5, True)` 가 오늘도 이름을 대고 거부한다
+> (§5 가 이미 "때운 것이 아니다" 라고 적어 둔 그대로 — 추론 경로는 필요 없으므로 낮은 우선순위가
+> 맞다). `aten.matmul.default` 의 1-D 피연산자 거부는 별개 항목(커널은 있고 특정 입력만 거부)이라
+> 아래에서 재확인하지 않는다.
+> <!-- DOCWATCH: op-implemented aten.le.Tensor -->
+> <!-- DOCWATCH: op-implemented aten.where.self -->
+> <!-- DOCWATCH: op-implemented aten.addmm.default -->
+> <!-- DOCWATCH: op-implemented aten._softmax.default -->
+> <!-- DOCWATCH: op-not-implemented aten.dropout.default -->
 
 마지막 줄은 커널이 있는데 거부하는 경우입니다: `aten.matmul.default` 가
 `matmul with a 1-D operand (1D x 2D) is not implemented ... torch's vector rules were not
