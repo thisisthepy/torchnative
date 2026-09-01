@@ -626,7 +626,12 @@ nothing in this document's tests is entitled to claim it.
 adaptation API had needed a kernel, which would have been news.
 
 <!-- DOCWATCH: count smoke_ok ge 310 -->
-<!-- DOCWATCH: count golden_ops_covered eq 166 -->
+<!-- DOCWATCH: count golden_ops_covered ge 166 -->
+> The line above was `eq 166` and failed the moment an unrelated round added two ops. The
+> claim it is backing is *"this round added none"*, and a shared global count cannot express
+> that — only that it did not go **down**. A marker asserting equality on a number other work
+> legitimately moves fails on somebody else's commit, which is the crying-wolf failure
+> `docs/DOCWATCH.md` warns about, arriving in a marker rather than in the checker.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule present -->

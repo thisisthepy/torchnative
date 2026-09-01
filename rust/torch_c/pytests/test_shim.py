@@ -1572,7 +1572,11 @@ def test_index_put_takes_a_mask_a_matrix_and_a_number():
     empty[t([], [0], dtype=_C.int64)] = t([], [0])
     assert empty.tolist() == [1.0, 2.0, 3.0], empty.tolist()
 
-    # Still refused, and still by name: two index tensors, and accumulate.
+    # Still refused, and still by name: two index tensors. `accumulate=True`
+    # used to be asserted here alongside it and is now implemented -- see
+    # `test_index_put_accumulates_and_does_so_at_the_receivers_precision`
+    # and docs/VIEWS.md §7. This assertion firing is what caught the landing,
+    # which is what it was for.
     for label, call in (
         ("two index tensors", lambda: _C._aten_dispatch(
             "aten.index_put_.default",
@@ -1580,10 +1584,6 @@ def test_index_put_takes_a_mask_a_matrix_and_a_number():
             [t([0], [1], dtype=_C.int64), t([1], [1], dtype=_C.int64)],
             t([1.0], []),
             False,
-        )),
-        ("accumulate=True", lambda: _C._aten_dispatch(
-            "aten.index_put_.default",
-            t([0.0] * 3, [3]), [t([0], [1], dtype=_C.int64)], t([1.0], [1]), True,
         )),
     ):
         try:
@@ -1639,6 +1639,141 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
     # the receiver's own wrapper is being written.
     _C._aten_dispatch("aten.fill_.Scalar", alias, 5.0)
     assert z.tolist() == [5.0] * 4, z.tolist()
+
+
+def test_index_put_accumulates_and_does_so_at_the_receivers_precision():
+    """`accumulate=True`, which was refused by name until docs/VIEWS.md §7.
+
+    The golden suite diffs 17 accumulate cases against upstream. This pins
+    the three things a *regression* would most plausibly get wrong, by name
+    rather than only by value:
+
+      * that the flag is honoured at all -- a return to the refusal, or to
+        the write, fails the first block;
+      * that the addition runs at the receiver's dtype rather than at
+        `read_flat`'s `f64`. `bfloat16` is the separating dtype and the
+        separation is 0.0078, which is well inside `dtypes.py`'s 6e-2
+        `bfloat16` tolerance -- so this assertion, and golden's `_bit_exact`
+        cases, are the only things that can see it;
+      * that `torch.bool` accumulates as a logical or. `*dst += *src` on a
+        C++ `bool` promotes and converts back upstream, so the byte stays
+        0 or 1; adding in the `i64` walk would leave a 2 in a buffer the
+        whole tag depends on (docs/BOOL.md §6.3), and reading it *as bool*
+        cannot see that because 2 is truthy. It is read as int64 here.
+    """
+    def t(flat, shape, dtype=None):
+        kw = {} if dtype is None else {"dtype": dtype}
+        return _C._tensor_from_flat(list(flat), list(shape), **kw)
+
+    put = lambda *a, **k: _C._aten_dispatch("aten.index_put_.default", *a, **k)
+
+    # 1. It adds, onto what is already there, at repeated positions.
+    x = t([10, 20, 30], [3], dtype=_C.int64)
+    put(x, [t([0, 0, 2], [3], dtype=_C.int64)], t([1, 2, 3], [3], dtype=_C.int64), True)
+    assert x.tolist() == [13, 20, 33], x.tolist()
+    # ...and the same operands with the flag off still overwrite.
+    y = t([10, 20, 30], [3], dtype=_C.int64)
+    put(y, [t([0, 0, 2], [3], dtype=_C.int64)], t([1, 2, 3], [3], dtype=_C.int64), False)
+    assert y.tolist() == [2, 20, 3], y.tolist()
+
+    # 2. The accumulation dtype. Measured on torch 2.13.0: accumulating
+    #    bfloat16(1.0) + bfloat16(0.005) + bfloat16(0.005) gives 1.015625.
+    #    Accumulating the same two values in f64 and narrowing once gives
+    #    1.0078125, which is what `read_flat` would hand you.
+    b = t([0.0], [1], dtype=_C.bfloat16)
+    put(b, [t([0, 0, 0], [3], dtype=_C.int64)],
+        t([1.0, 0.005, 0.005], [3], dtype=_C.bfloat16), True)
+    assert b.tolist() == [1.015625], (
+        f"{b.tolist()} -- 1.0078125 means the walk accumulated in f64 and narrowed "
+        "once at the end; upstream accumulates in bfloat16"
+    )
+
+    # 3. bool is an or, not an add.
+    p = t([0, 0, 0], [3], dtype=_C.bool)
+    put(p, [t([0, 0, 0, 1], [4], dtype=_C.int64)],
+        t([1, 1, 1, 1], [4], dtype=_C.bool), True)
+    assert p.tolist() == [True, True, False]
+    as_int = _C._aten_dispatch("aten._to_copy.default", p, dtype=_C.int64)
+    assert as_int.tolist() == [1, 1, 0], (
+        f"{as_int.tolist()} -- a 3 here means the bool buffer holds a byte the "
+        "bool tag's invariant forbids (docs/BOOL.md §6.3)"
+    )
+
+
+def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
+    """docs/TAIL.md §2.2's finding, and the defect the audit found on top of it.
+
+    `arith_tag` refuses `torch.bool` for every arithmetic overload but
+    `mul.Tensor`, and every one of those refusals is correct. The *reason*
+    was not: the message said "torch.bool operands are logical, not
+    arithmetic, in torch (BOOL.md §2.2)", which is true of two of the twelve
+    (kind, overload, in-place) cells and false of the rest. `BOOL.md` §2.2
+    measured `x + x` for two bool tensors; a later round generalised that
+    into a blanket message.
+
+    Re-measured on torch 2.13.0:
+
+        .Tensor     add -> logical OR (bool)   sub -> refuses
+                    mul -> logical AND (bool)  div -> ARITHMETIC (float32)
+        .Scalar     add -> ARITHMETIC (int64)  sub -> refuses
+                    mul -> ARITHMETIC (int64)  div -> ARITHMETIC (float32)
+        in place    a scalar promotes the result and it cannot be cast back
+
+    This asserts the *reason each refusal gives*, not just that it refuses,
+    because a refusal that refuses for the wrong reason is what sent two
+    rounds of work at the wrong kernel. It is the sixth stale refusal this
+    repository has had; the instrument is the point.
+    """
+    def bool_t():
+        return _C._tensor_from_flat([1, 0, 1], [3], dtype=_C.bool)
+
+    def refusal(op, other):
+        try:
+            _C._aten_dispatch(op, bool_t(), other)
+        except NotImplementedError as error:
+            return str(error)
+        raise AssertionError(f"{op} must still refuse a torch.bool operand")
+
+    # 1. Subtraction: upstream refuses too, and NOT because bool `-` is
+    #    logical -- because it has no meaning. Naming it "logical" describes
+    #    neither side.
+    for op in ("aten.sub.Tensor", "aten.sub_.Tensor"):
+        assert "upstream refuses" in refusal(op, bool_t()), refusal(op, bool_t())
+    for op in ("aten.sub.Scalar", "aten.sub_.Scalar", "aten.rsub.Scalar"):
+        assert "upstream refuses" in refusal(op, 3), refusal(op, 3)
+
+    # 2. The `.Scalar` overloads, where upstream COMPUTES arithmetically.
+    #    This is the cell the old message got confidently wrong.
+    for op in ("aten.add.Scalar", "aten.mul.Scalar", "aten.div.Scalar"):
+        message = refusal(op, 3)
+        assert "ARITHMETICALLY" in message, message
+        assert "logical" not in message, (
+            f"{op}: upstream's .Scalar bool arithmetic IS arithmetic -- "
+            f"mul.Scalar(bool, 3) is tensor([3,0,3], int64) -- so a message that "
+            f"calls it logical is false: {message}"
+        )
+
+    # 3. `bool / bool` is the third cell the old text got wrong: it said
+    #    upstream refused `/`, and upstream computes [1.0, nan, 1.0] float32.
+    message = refusal("aten.div.Tensor", bool_t())
+    assert "ARITHMETICALLY" in message and "nan" in message, message
+
+    # 4. The two cells where "logical" is the truth: `+` between two bool
+    #    tensors is upstream's logical or, and the shim refuses because
+    #    candle would put a 2 in the byte.
+    message = refusal("aten.add_.Tensor", bool_t())
+    assert "logical OR" in message, message
+
+    # 5. In place with a scalar: upstream refuses, and for its own third
+    #    reason -- the promoted result cannot be cast back into the receiver.
+    for op in ("aten.add_.Scalar", "aten.mul_.Scalar"):
+        message = refusal(op, 3)
+        assert "in place" in message and "cast" in message, message
+
+    # 6. `mul.Tensor` is still the exception and still computes, because an
+    #    arithmetic product over {0,1} IS the logical and.
+    got = _C._aten_dispatch("aten.mul.Tensor", bool_t(), bool_t())
+    assert got.tolist() == [True, False, True] and got.dtype == _C.bool
 
 
 # --- the dtype tag (BOOL.md option B) ---------------------------------------

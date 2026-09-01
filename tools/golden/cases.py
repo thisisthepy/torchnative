@@ -2152,6 +2152,229 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.add.Scalar / aten.sub.Scalar (docs/SCALAR.md §6) -----------------
+#
+# The **narrowing** half of the scalar family. `mul.Scalar` and `div.Scalar`
+# read their operand at `opmath_t`; `add` and `sub` have no such branch, so
+# the operand arrives through the iterator's common dtype and really is
+# narrowed. docs/SCALAR.md §3 measured both halves and fixed the widening
+# one -- and then found that the narrowing one had **no golden coverage at
+# all**, because neither op was in `_aten_implemented()` and `CASE_BUILDERS`
+# had nowhere to hang a builder. Its sabotage fault F3 was caught by two
+# smoke tests and zero golden cases.
+#
+# Writing the builder found a defect, which is the argument for writing it:
+# **no case anywhere had ever passed either op a non-unit `alpha`**, and
+# `alpha` is narrowed to the tensor's dtype separately from `other`.
+
+
+def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[Case]:
+    cases: list[Case] = []
+    sign = 1.0 if kind == "add" else -1.0
+
+    # Ordinary values, all four floating dtypes.
+    for dtype_name in _MUL_DIV_FLOAT_DTYPES:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1.0, -2.0, 0.0, 3.5], (2, 2), dtype_name)
+        for scalar, note in [
+            (2.0, "plain scalar"),
+            (0.0, "the identity element"),
+            (-1.5, "negative scalar"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"{op}(dtype={dtype_name}, other={scalar}) [{note}]",
+                    op=op,
+                    run_torch=lambda a=a_t, s=scalar: torch_call(a, s),
+                    run_c=lambda a=a_c, s=scalar: c_module._aten_dispatch(op, a, s),
+                    note=note,
+                )
+            )
+
+    # The wrapped-number dtype rule, measured for these two rather than
+    # inherited from `mul.Scalar`'s builder: an integral tensor stays integral
+    # under an int scalar and promotes to the default float under a float one.
+    # `uint8` is here because it is the one that wraps rather than saturating.
+    for dtype_name, flat, scalar, note in [
+        ("int64", [1, 2, 3, 4], 5, "int tensor, int scalar -> int64"),
+        ("int64", [1, 2, 3, 4], 5.0, "int tensor, FLOAT scalar -> float32"),
+        ("int32", [1, 2, 3, 4], -3, "negative int scalar"),
+        ("int16", [10, 20, 30, 40], 2, "int16 with an int scalar"),
+        ("uint8", [250, 251, 252, 253], 9, "uint8 wraps mod 256 rather than saturating"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"{op}(dtype={dtype_name}, other={scalar!r}) [{note}]",
+                op=op,
+                run_torch=lambda a=a_t, s=scalar: torch_call(a, s),
+                run_c=lambda a=a_c, s=scalar: c_module._aten_dispatch(op, a, s),
+                note=note,
+            )
+        )
+
+    # **`torch.bool` — and the two ops do NOT agree, which is the whole point
+    # of casing them separately.** Measured on 2.13.0:
+    #
+    #   add.Scalar(bool_t, 3)   -> tensor([4,3,4], int64)   upstream COMPUTES
+    #   sub.Scalar(bool_t, 3)   -> RuntimeError "Subtraction, the `-` operator,
+    #                              with a bool tensor is not supported."
+    #
+    # so `add` is a `c_error` (the same over-refusal docs/TAIL.md §2.2 found
+    # for `mul.Scalar`) and `sub` is a `both_error`. The shim raises the same
+    # `arith_tag` refusal for both, which is why one message could not be
+    # right for both -- docs/TAIL.md §2.2 and the refusal wording it points at.
+    for scalar, scalar_note in [(3, "int scalar"), (2.5, "float scalar -> float32")]:
+        bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
+        cases.append(
+            Case(
+                name=f"{op}(dtype=bool, other={scalar!r}) [{scalar_note}]",
+                op=op,
+                run_torch=lambda a=bool_t, s=scalar: torch_call(a, s),
+                run_c=lambda a=bool_c, s=scalar: c_module._aten_dispatch(op, a, s),
+                expect="c_error" if kind == "add" else "both_error",
+                note=(
+                    "upstream reads True/False as 1/0 and computes arithmetically; the "
+                    "shim's blanket bool refusal in arith_tag over-refuses the .Scalar "
+                    "overload (docs/TAIL.md §2.2)"
+                    if kind == "add" else
+                    "upstream refuses too, and for its OWN reason -- 'Subtraction, the "
+                    "`-` operator, with a bool tensor is not supported' -- which is not "
+                    "the reason the shim's message gives"
+                ),
+            )
+        )
+
+    # The scalar rule itself, bit-exact. This is the coverage docs/SCALAR.md
+    # §6's second bullet said was missing: `narrow`, the opposite of
+    # `mul.Scalar`'s `widen`, and the controls show the separating cases are
+    # doing work.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(t, s),
+            lambda c, s: c_module._aten_dispatch(op, c, s),
+            rule="narrow",
+            why=f"{kind} has no original_scalar_value branch, so the operand arrives "
+                "through the iterator's common dtype",
+        )
+    )
+
+    # **`alpha`.** Nothing had ever passed one. Two separate findings live
+    # here and they are cased differently on purpose.
+    #
+    # 1. `alpha` is narrowed to the tensor's dtype *separately* from `other`,
+    #    and the product is narrowed again. Measured over 300 random
+    #    `(other, alpha)` pairs: `bf16(bf16(other) * bf16(alpha))` matches
+    #    upstream 300/300 where an `f64` product narrowed once matches
+    #    202/300. These cases are `_exact_value_check`, and before the fix
+    #    they failed: 53/150 rows at `bfloat16`, 56/150 at `float16`.
+    for dtype_name in _REDUCED_FLOAT_DTYPES:
+        for other, alpha in [(0.3, 0.3), (0.1, 1.3), (1.3, 0.7), (2.0, 0.5)]:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [0.0, 1.0, -2.0, 3.5, 0.25], (5,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op}(dtype={dtype_name}, other={other}, alpha={alpha}) "
+                         f"[alpha narrows separately]",
+                    op=op,
+                    run_torch=lambda a=a_t, o=other, al=alpha: torch_call(a, o, al),
+                    run_c=lambda a=a_c, o=other, al=alpha: c_module._aten_dispatch(
+                        op, a, o, al),
+                    value_check=_exact_value_check,
+                    note="measured: upstream is narrow(narrow(other) * narrow(alpha)), "
+                         "not narrow(other * alpha) -- bfloat16(0.0) + 0.3 with alpha=0.3 "
+                         "is 0x1.72p-4 and the f64 product gives 0x1.70p-4",
+                )
+            )
+
+    # 2. **A residual at `float32` and `float64` that is NOT closed**, stated
+    #    rather than absorbed. Upstream's `self + alpha * other` is compiled
+    #    to a fused multiply-add on this host: at `float64`, `fma(alpha,
+    #    other, self)` reproduces upstream on **1050/1050** elements over 150
+    #    random `(other, alpha)` pairs and the unfused `self + alpha*other`
+    #    on 862/1050. That is a property of how the wheel was compiled
+    #    (`-ffp-contract`), not of the operator, in the same class as the
+    #    Sleef-versus-libm gap `softplus_cases` and `pow_tensor_scalar_cases`
+    #    record. Closing it needs a per-element walk with `mul_add`, applied
+    #    at `float32`/`float64` only -- the reduced floats are exact WITHOUT
+    #    it, because their product is narrowed before the add -- so it is a
+    #    dtype-conditional rewrite rather than a line, and it is left.
+    #
+    #    Measured residual, shim against upstream, 150 random `(other, alpha)`
+    #    pairs over 7 values: `bfloat16` 0/150 rows, `float16` 0/150,
+    #    `float32` 120/150, `float64` 106/150. Worst **relative** error
+    #    5.5e-14 at `float64` and **3.2e-5** at `float32`.
+    #
+    #    **3.2e-5 is larger than `dtypes.py`'s `float32` rtol of 1e-5**, and
+    #    it is reached by cancellation: `7.0 + 2.4308… * 2.8817…` is
+    #    `-0.00489`, four decades below its operands, so a last-bit
+    #    disagreement in the product is a 3e-5 disagreement in the sum. The
+    #    same shape docs/LOSS.md §5.4 records for `_log_softmax`. A `float32`
+    #    case at those operands would fail, so there is not one; the
+    #    `float64` case below IS at them, where the same cancellation is
+    #    5.5e-14 and inside 1e-9.
+    #
+    #    **These cases pass, and they would pass against a kernel that did
+    #    not fuse.** They hold the *size* of the gap rather than its absence,
+    #    and they are deliberately not `_exact_value_check`.
+    for dtype_name, other, alpha, note in [
+        ("float64", 2.430806524345, 2.881715319161,
+         "the cancelling pair -- 7.0 + 2.43*2.88 is -0.00489, and the residual there is "
+         "5.5e-14 relative at float64. At float32 the same operands give 3.2e-5, past "
+         "golden's own rtol, which is why there is no float32 case at them"),
+        ("float64", 2.174704892141, -0.505837658118, "an ordinary pair"),
+        ("float32", 2.174704892141, -0.505837658118, "an ordinary pair"),
+    ]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [0.0, 1.0, -2.0, 3.5, 0.25, 7.0], (6,), dtype_name)
+        cases.append(
+            Case(
+                name=f"{op}(dtype={dtype_name}, other={other}, alpha={alpha}) "
+                     f"[KNOWN, watched: upstream fuses the multiply-add]",
+                op=op,
+                run_torch=lambda a=a_t, o=other, al=alpha: torch_call(a, o, al),
+                run_c=lambda a=a_c, o=other, al=alpha: c_module._aten_dispatch(op, a, o, al),
+                note="upstream's expression contracts to fmadd on this host (1050/1050 "
+                     "elements at float64 match fma, 862/1050 the unfused form). " + note,
+            )
+        )
+
+    # `alpha` on an integral tensor takes the integer path, where there is no
+    # narrowing question at all and the answer is exact.
+    ai_t, ai_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (4,), "int64")
+    cases.append(
+        Case(
+            name=f"{op}(dtype=int64, other=5, alpha=3)",
+            op=op,
+            run_torch=lambda: torch_call(ai_t, 5, 3),
+            run_c=lambda: c_module._aten_dispatch(op, ai_c, 5, 3),
+            note=f"the integer path: self {'+' if sign > 0 else '-'} 15, exactly",
+        )
+    )
+
+    # Keyword coverage -- `alpha` is positional in the Scalar schemas and
+    # keyword-only in the Tensor ones, and the binder is a different path.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1.0, -2.0, 0.0, 3.5], (4,), "float32")
+    cases.append(
+        Case(
+            name=f"{op}(self=/other=/alpha= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, other=2.0, alpha=3),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, other=2.0, alpha=3),
+        )
+    )
+    return cases
+
+
+def add_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _add_sub_scalar_cases(torch_module, c_module, torch_call, "aten.add.Scalar", "add")
+
+
+def sub_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _add_sub_scalar_cases(torch_module, c_module, torch_call, "aten.sub.Scalar", "sub")
+
+
 def pow_tensor_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.pow.Tensor_Tensor"
     cases: list[Case] = []
@@ -3208,6 +3431,50 @@ def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                             "the opposite of the usual reading",
                         )
                     )
+    # --- where the reduction accumulates (docs/SCALAR.md §5) ---------------
+    #
+    # **Every case above passed both the old kernel and the new one.** Their
+    # data is `[3, -4, 0, 1, -1, 2]` -- integers, exactly representable in
+    # all four dtypes, and every partial sum of their squares and absolute
+    # values is exact too. So the whole set is blind to *where* the
+    # accumulation happens, which is the thing docs/SCALAR.md §5 measured as
+    # wrong: upstream's `norm_kernel_cpu_impl<scalar_t, acc_t>` keeps the
+    # running `|x|^p` in `float` for `float16`/`bfloat16` and the old kernel
+    # kept it in the storage dtype at every step. Re-measured on a random
+    # 3x4 at ten `p` values and three `dim` lists: 29 of 120 rows disagreed
+    # (`bfloat16` and `float16` worst, `float32` 1/10 at `p=0.5`).
+    #
+    # These values are not representable, so every partial sum rounds, and
+    # they are compared with `_bit_exact`: the effect at `bfloat16` is
+    # smaller than `dtypes.py`'s 6e-2 for every input, which is the same
+    # hole `softplus_cases` and `_bit_exact`'s own docstring describe.
+    #
+    # Rows of three and columns of two, deliberately: upstream's `p = 2` arm
+    # sums **pairwise**, not serially, and at four or more elements that is
+    # visible at `float64` (measured: `sqrt((a²+b²)+(c²+d²))` is upstream's
+    # answer and the serial sum is one ULP away). See the note on the 3-D
+    # cases below, which is where that residual lives.
+    _acc_values = [0.7, -1.3, 2.9, -0.11, 1.7, -2.3]
+    for dtype_name in _NORM_DTYPES:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, _acc_values, (2, 3), dtype_name)
+        for p in _NORM_PS:
+            for dim in ([0], [1], [0, 1]):
+                cases.append(
+                    Case(
+                        name=f"norm({dtype_name}, p={p!r}, dim={dim}) "
+                             f"[accumulates at acc_t, bit for bit]",
+                        op=op,
+                        run_torch=lambda a=a_t, p=p, d=dim: torch_call(a, p, list(d), False),
+                        run_c=lambda a=a_c, p=p, d=dim: c_module._aten_dispatch(
+                            op, a, p, list(d), False),
+                        value_check=_bit_exact,
+                        note="upstream keeps the running |x|^p in `float` for the reduced "
+                             "dtypes and in scalar_t otherwise; a tolerance absorbs the "
+                             "difference at bfloat16 for every input",
+                    )
+                )
+
     # 3-D, so `norm_except_dim`'s real shape (a Conv1d weight) is covered and a
     # middle axis exists to get wrong.
     flat3 = [float(v) * 0.5 - 3.0 for v in range(2 * 3 * 4)]
@@ -3224,6 +3491,37 @@ def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="the multi-axis reduction `norm_except_dim` is written on",
             )
         )
+    # **The one residual, stated rather than absorbed.** Upstream's `p = 2`
+    # arm sums pairwise: on the row `[0.779296, 1.757861, -2.435259,
+    # -1.179592]` at `float64`, `sqrt((a²+b²) + (c²+d²))` is upstream's
+    # `0x1.a8e67779e8296p+1` and the serial `((a²+b²)+c²)+d²` is
+    # `0x1.a8e67779e8297p+1`. This kernel walks the input in order, so it
+    # answers the serial sum. It is one ULP, at `float64` `p = 2` only, and
+    # it is the *same* residual the previous kernel had -- 29 of 120
+    # disagreeing rows became 1, and this is the 1.
+    #
+    # Matching it means reproducing `binary_kernel_reduce_vec`'s lane count
+    # and unrolling, which is a property of how the wheel was compiled rather
+    # than of the operator (the same class as `softplus`'s Sleef tail and
+    # `add.Scalar`'s fused multiply-add). Not attempted.
+    #
+    # **This case passes**, at the ordinary `float64` tolerance of 1e-9, and
+    # it is here to hold the size of the gap: it turns red if the summation
+    # ever drifts further than one ULP.
+    p2_flat = [0.779296, 1.757861, -2.435259, -1.179592,
+               0.047048, 0.524309, -1.892038, 0.071452]
+    p2_t, p2_c = pair_from_flat(torch_module, c_module, p2_flat, (2, 4), "float64")
+    cases.append(
+        Case(
+            name="norm(float64, p=2, dim=[1], 4-wide) "
+                 "[KNOWN 1-ULP: upstream sums pairwise, this walks in order]",
+            op=op,
+            run_torch=lambda: torch_call(p2_t, 2, [1], False),
+            run_c=lambda: c_module._aten_dispatch(op, p2_c, 2, [1], False),
+            note="watched at the ordinary tolerance, not pinned bit-exactly: upstream's "
+                 "vectorised reducer forms (a²+b²)+(c²+d²) and this forms the serial sum",
+        )
+    )
     # A zero row against negative and infinite p -- the corners that fall out of
     # the general formula and would be special-cased away by mistake.
     zeros = [0.0, 0.0, 1.0, 2.0]
@@ -4306,7 +4604,15 @@ def _binary_scalar_case(torch_module, c_module, op, torch_call, dtype_name, a_fl
     )
 
 
-def _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note, kwargs=None) -> Case:
+def _unary_case(
+    torch_module, c_module, op, torch_call, dtype_name, flat, shape, note,
+    kwargs=None, value_check=None,
+) -> Case:
+    # `value_check` is here for the same reason `_bit_exact` exists: a unary
+    # kernel whose whole subject is *where* it computes (opmath versus the
+    # storage dtype) moves its answer by less than the per-dtype tolerance,
+    # so the default pipeline passes the wrong implementation for every
+    # input. `softplus` is the case that needed it.
     kwargs = kwargs or {}
     a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
     short = op.split(".", 2)[1]
@@ -4317,6 +4623,7 @@ def _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape,
         run_torch=lambda: torch_call(a_t, **kwargs),
         run_c=lambda: c_module._aten_dispatch(op, a_c, **kwargs),
         note=note,
+        value_check=value_check,
     )
 
 
@@ -13643,6 +13950,79 @@ def _bit_exact(t_res, c_res) -> tuple[bool, str]:
     return True, ""
 
 
+def _bounded_divergence(max_abs: float, max_rel: float):
+    """A comparator for a divergence that is **known, measured, and not
+    closeable** -- it asserts a ceiling on the disagreement rather than its
+    absence.
+
+    Two comparators already exist for the two ordinary answers: the default
+    pipeline ("these agree to within the dtype's tolerance") and `_bit_exact`
+    ("these agree exactly"). Neither can express the third answer this
+    repository keeps producing, which is *"these do not agree, here is by how
+    much, and the reason is a property of how upstream's wheel was compiled
+    rather than of the operator"* -- `_log_softmax` at vocabulary width
+    (docs/LOSS.md §5.4), `softplus`'s Sleef tail and `add.Scalar`'s fused
+    multiply-add (docs/SCALAR.md §8), `norm`'s pairwise `p=2` sum.
+
+    Until now those were written into a document and never measured again. A
+    number in a document does not fail when it moves. This one does.
+
+    **The bounds are a ceiling, not a target.** A shim that agreed exactly
+    passes; one that drifts past the recorded size does not. Set them to the
+    measured values with headroom, and quote the measurement at the call
+    site -- an unquoted bound is a tolerance, which is the thing this exists
+    to avoid.
+
+    dtype and shape are checked here for the reason `_bit_exact`'s docstring
+    gives: `compare.py` hands a `value_check` the whole job and runs none of
+    its own pipeline, so a values-only comparator is reported by `--self-test`
+    as accepting a wrong answer under the `shape` and `dtype` fault modes.
+    """
+    def check(t_res, c_res) -> tuple[bool, str]:
+        t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+        if t_dtype != c_dtype:
+            return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_res.shape)
+        c_shape = tuple(int(x) for x in c_res.shape)
+        if t_shape != c_shape:
+            return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+        t_flat, c_flat = _flatten_values(t_res.tolist()), _flatten_values(c_res.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"length differs: torch={len(t_flat)} c={len(c_flat)}"
+        worst_abs = worst_rel = 0.0
+        worst_at = -1
+        differing = 0
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"index {i}: torch={x!r} c={y!r} (NaN mismatch)"
+            if xf == yf:
+                continue
+            differing += 1
+            gap = abs(xf - yf)
+            rel = gap / abs(xf) if xf != 0.0 else float("inf")
+            if gap > worst_abs or rel > worst_rel:
+                worst_at = i
+            worst_abs = max(worst_abs, gap)
+            worst_rel = max(worst_rel, rel)
+        if worst_abs > max_abs or worst_rel > max_rel:
+            return False, (
+                f"the KNOWN divergence has GROWN: {differing}/{len(t_flat)} elements "
+                f"differ, worst |d|={worst_abs:.3e} (ceiling {max_abs:.3e}), worst "
+                f"relative={worst_rel:.3e} (ceiling {max_rel:.3e}), first at index "
+                f"{worst_at} (torch={t_flat[worst_at]!r} c={c_flat[worst_at]!r}). "
+                f"This case asserts a ceiling on a recorded divergence, not agreement "
+                f"-- see the note and the document it cites"
+            )
+        return True, (
+            f"within the recorded ceiling: {differing}/{len(t_flat)} differ, "
+            f"worst |d|={worst_abs:.3e}, worst relative={worst_rel:.3e}"
+        )
+    return check
+
+
 def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._log_softmax.default"
     cases: list[Case] = []
@@ -13860,6 +14240,53 @@ def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note=note,
             )
         )
+
+    # --- the divergence docs/LOSS.md §5.4 measured, now watched ------------
+    #
+    # §5.4 recorded that at a **real vocabulary width** the `float32`
+    # summation-order residual reaches 5.38e-04 relative on the SmolLM2
+    # logits, which is larger than `dtypes.py`'s `float32` rtol of 1e-5 --
+    # "and no case in this file sees it because the widest `float32` case is
+    # 6 elements". Every case above this line is still six elements or fewer.
+    #
+    # It is **not** fixed, and it is not the kind of thing that gets fixed:
+    # upstream's `map_reduce_all` accumulates in `Vectorized<float>` lanes --
+    # 4 on NEON, 8 on AVX2, 16 on AVX512 -- so a bit-exact `float32` target
+    # would be *this machine's* upstream. §5.4's argument stands unchanged.
+    #
+    # What was missing is that the number was written down and not measured
+    # again. This case measures it on every run and fails if it grows. The
+    # comparator asserts a *ceiling*, not agreement:
+    #
+    #     49152 columns, one row, deterministic LCG values in [-8, 8] with a
+    #     single 15.0 so the row's largest log-probability is -1.3305 and the
+    #     relative error is not divided by a large number
+    #
+    #     measured: all 49152 elements differ, worst |d| = 4.39e-05,
+    #               worst relative = 3.29e-05
+    #
+    # 3.29e-05 is three times `float32`'s rtol, which is the point: the
+    # default pipeline would call this a failure and it is not one. The
+    # bounds below are the measured values with roughly 2x headroom, so
+    # ordinary re-measurement noise does not move them and a real regression
+    # does.
+    wide_flat = _reduced_float_probe(49152, 20260901, 8.0)
+    wide_flat[17] = 15.0
+    wide_t, wide_c = pair_from_flat(
+        torch_module, c_module, wide_flat, (1, 49152), "float32")
+    cases.append(
+        Case(
+            name="_log_softmax(float32, [1, 49152] -- REAL VOCABULARY WIDTH) "
+                 "[KNOWN DIVERGENCE, watched: docs/LOSS.md §5.4]",
+            op=op,
+            run_torch=lambda t=wide_t: torch_call(t, -1, False),
+            run_c=lambda c=wide_c: c_module._aten_dispatch(op, c, -1, False),
+            value_check=_bounded_divergence(9e-05, 7e-05),
+            note="a serial sum of 49152 terms against upstream's 4-lane one. Not a "
+                 "failure and not agreement: the case holds the ceiling, so the number "
+                 "docs/LOSS.md §5.4 wrote down is re-measured on every run",
+        )
+    )
 
     return cases
 
@@ -15275,6 +15702,153 @@ def softplus_cases(torch_module, c_module, torch_call) -> list[Case]:
                 kwargs={"beta": beta, "threshold": threshold},
             )
         )
+
+    # --- the formula, and the accumulate-where (docs/SCALAR.md §5) ---------
+    #
+    # **Every case above this line passed both the old kernel and the new
+    # one**, which is the finding rather than an aside. The old kernel used
+    # the numerically-stable rewrite `max(y,0) + log(1 + exp(-|y|))` and
+    # computed it in the storage dtype; upstream is `log1p(exp(a*beta))/beta`
+    # in `opmath`. docs/SCALAR.md §5 measured the disagreement at every dtype
+    # including `float64` and this suite could not see any of it, for two
+    # separate reasons that the cases below fix separately:
+    #
+    #   * the inputs. `[-5, -1, 0, 1, 5]` is where the two formulas agree to
+    #     the last bit. The separating inputs are the ones where `log1p`
+    #     earns its name -- `exp(x)` near zero -- and where the split's
+    #     `max(y,0)` term forces a cancellation.
+    #   * the comparator. At `bfloat16` the effect is 0.0027 on a value of
+    #     0.048, and `dtypes.py` gives `bfloat16` `atol=6e-2`: a tolerance
+    #     absorbs it for **every** input. This is the second kind of hole
+    #     docs/LOSS.md §5.4 names, and `_bit_exact` is the instrument.
+    #
+    # The five values are chosen so that each of them separates something:
+    # `-3.0` is docs/SCALAR.md §5's own reported value; `-30.0` is where
+    # `log(1+tiny)` loses digits that `log1p` keeps; `±1e-9` sits either side
+    # of a cancellation in the `max(y,0)` term; `7.0` separates the two in
+    # `float64` and in nothing else.
+    _separating = [-3.0, -30.0, 1e-09, -1e-09, 7.0]
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                _separating, (5,),
+                "log1p(exp(y)) in opmath, bit for bit -- a tolerance absorbs the whole "
+                "effect at every dtype (docs/SCALAR.md §5)",
+                value_check=_bit_exact,
+            )
+        )
+
+    # **The `float32` case above must stay under 8 elements**, and that is
+    # upstream's constraint rather than this kernel's. `cpu_kernel_vec` runs a
+    # Sleef-vectorised body over full blocks and a scalar tail over the rest,
+    # and the two do not agree: `softplus(-3.0)` at `float32` is
+    # `0x1.8e070e0p-5` in a tensor of fewer than 8 elements and
+    # `0x1.8e07100p-5` in a longer one -- measured at n = 1, 2, 3, 4, 7, 8,
+    # 16, 17, 32, 64, 100, with the boundary at 8 and only that one input
+    # affected. This kernel is a scalar walk, so it answers the scalar path
+    # everywhere.
+    #
+    # The same five values at length 20, with the ORDINARY comparator, so the
+    # divergence is watched rather than only written down: it is one ULP
+    # (3.7e-9 absolute) and it fails nothing, but if it ever grows past
+    # `float32`'s 1e-5 this case turns red.
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float32",
+            _separating * 4, (20,),
+            "KNOWN DIVERGENCE, watched: at n >= 8 upstream vectorises and softplus(-3.0) "
+            "moves one ULP -- this case holds the size of that gap, not its absence",
+        )
+    )
+
+    # **The split is not the same function at the edges**, and this is the
+    # case that says so without a tolerance being involved at all: with a
+    # threshold large enough not to fire, upstream's `exp` overflows and the
+    # answer is `inf`. The stable split cannot overflow -- which is exactly
+    # why it was chosen and exactly why it disagreed -- and gave `800.0`.
+    for dtype_name in ["float64", "float32"]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [800.0, 1000.0], (2,),
+                "measured: inf, because exp(800) overflows before log1p sees it. The "
+                "stable rewrite returned x and no tolerance is involved in the difference",
+                kwargs={"beta": 1, "threshold": 1000000000.0},
+            )
+        )
+
+    # **`beta` is narrowed to the tensor's dtype before anything is computed
+    # with it** (`beta_.to<scalar_t>()`). Where that shows is not where you
+    # would look: at `bfloat16` and `float16` the final narrowing absorbs it
+    # completely and a 100-point search over (beta, x) found no separating
+    # pair, so there is no reduced-float case for it. At `float32` it is a
+    # real rounding -- and it is 9e-8 relative, inside the `float32`
+    # tolerance, so this case is `_bit_exact` and must stay under 8 elements
+    # for the reason above.
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float32",
+            [-3.440680608220717, 7.8368962387453, 1.0, -1.0], (4,),
+            "measured: 5.3583855628967285 for float(0.1) and 5.358386039733887 for the "
+            "double 0.1 -- the only place the beta narrowing is observable",
+            kwargs={"beta": 0.1},
+            value_check=_bit_exact,
+        )
+    )
+
+    # Non-finite input, which nothing above reached. None of these is
+    # special-cased in the kernel; they fall out of `log1p(exp(y))` and the
+    # `>` against the threshold, and all four were measured: `+inf` takes the
+    # threshold branch and returns itself, `-inf` gives `log1p(0) = 0`, `NaN`
+    # fails the `>` and propagates, `-0.0` gives `log(2)`.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [float("inf"), float("-inf"), float("nan"), 0.0, -0.0], (5,),
+                "inf -> inf (threshold branch), -inf -> 0, nan -> nan, -0.0 -> log(2)",
+                value_check=_bit_exact,
+            )
+        )
+
+    # `beta = 0` divides by zero rather than refusing, and a negative `beta`
+    # mirrors the function. Both measured; neither is guessed and neither is
+    # special-cased.
+    for beta, note in [
+        (0, "beta=0 gives inf everywhere -- upstream divides by it and does not refuse"),
+        (-1, "a negative beta mirrors the function: softplus(3, beta=-1) is -0.0485873…"),
+    ]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, "float64",
+                [-3.0, 0.0, 3.0], (3,), note,
+                kwargs={"beta": beta},
+                value_check=_bit_exact,
+            )
+        )
+    # A threshold below the data, so the linear branch is what most elements
+    # take, and one exactly ON it -- the comparison is `>`, so `y == threshold`
+    # still computes the formula (`softplus(20.0)` is `20.000000002061153`,
+    # not `20.0`).
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float64",
+            [-3.0, 0.0, 3.0], (3,), "a threshold below most of the data",
+            kwargs={"beta": 1, "threshold": -1},
+            value_check=_bit_exact,
+        )
+    )
+    cases.append(
+        _unary_case(
+            torch_module, c_module, op, torch_call, "float64",
+            [20.0], (1,),
+            "y == threshold takes the FORMULA, not the linear branch -- the comparison "
+            "is `>` and the answer is 20.000000002061153",
+            kwargs={"beta": 1, "threshold": 20},
+            value_check=_bit_exact,
+        )
+    )
 
     # Refused, not promoted -- unlike exp/tanh, measured `softplus_cpu`
     # raises `NotImplementedError` naming the dtype rather than widening an
@@ -17138,18 +17712,352 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Refused: accumulate=True is not measured/implemented.
+    # --- accumulate=True (docs/VIEWS.md §7) --------------------------------
+    #
+    # This was one `c_error` case ("torch computes, the shim refuses") for as
+    # long as the flag was refused. It is the scatter-add an embedding's
+    # backward wants, and docs/BACKWARD.md §4.5 named it while composing a
+    # one-hot instead at 200 MB for S=1024.
+    #
+    # The cases below are built so that each of the three things that are
+    # actually different about the accumulating arm fails at least one of
+    # them on its own:
+    #
+    #   * that it adds at all rather than overwriting  -- the repeated-index
+    #     pair, which is deliberately the SAME operands as the "last write
+    #     wins" case above so that a kernel ignoring the flag fails exactly
+    #     one of the two;
+    #   * that it adds onto what is already there rather than into a zeroed
+    #     buffer -- the non-zero receiver;
+    #   * that it adds at the RECEIVER's precision, not at `read_flat`'s f64
+    #     -- the three `_bit_exact` cases, which are the only ones a
+    #     tolerance would have absorbed. `bfloat16`'s tolerance in
+    #     `dtypes.py` is 6e-2 and the effect is 0.0078, so a tolerant
+    #     comparator here would pass a kernel that accumulated in f64 for
+    #     every input, not just easy ones.
+    #
+    # There is no member or `torch.`-level spelling to pair these with:
+    # `index_put_` is not in `methods.json` and `__setitem__` always passes
+    # `accumulate=False`, so `_aten_dispatch` is the only door. Recorded in
+    # docs/VIEWS.md §7 rather than worked around.
+
+    # (a) The same operands as "index_put_(repeated index) [last write wins]",
+    #     with the flag flipped: 1+2+3 = 6 instead of 3.
     self3_t, self3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
-    idx3_t, idx3_c = pair_from_flat(torch_module, c_module, [0, 1, 2], (3,), "int64")
+    idx3_t, idx3_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
     values3_t, values3_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
     cases.append(
         Case(
-            name="index_put_(accumulate=True) [c_error -- torch computes, shim refuses]",
+            name="index_put_(repeated index, accumulate=True) [the sum, not the last write]",
             op=op,
-            run_torch=lambda: torch_call(self3_t, [idx3_t], values3_t, True),
-            run_c=lambda: c_module._aten_dispatch(op, self3_c, [idx3_c], values3_c, True),
-            expect="c_error",
-            note="torch computes accumulate=True; the shim refuses it by name (not measured/needed)",
+            run_torch=lambda a=self3_t, i=idx3_t, v=values3_t: torch_call(a, [i], v, True),
+            run_c=lambda a=self3_c, i=idx3_c, v=values3_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="measured: index [0,0,0] with values [1,2,3] leaves self[0] == 6, where "
+                 "accumulate=False leaves 3 -- the pair that separates the two arms",
+        )
+    )
+
+    # (b) A receiver that is not zero, so a kernel that scattered into a fresh
+    #     zero buffer and handed that back fails here and nowhere else.
+    nz_self_t, nz_self_c = pair_from_flat(torch_module, c_module, [10, 20, 30], (3,), "int64")
+    nz_idx_t, nz_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    nz_val_t, nz_val_c = pair_from_flat(torch_module, c_module, [1, 2], (2,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(accumulate=True onto a NON-ZERO receiver)",
+            op=op,
+            run_torch=lambda a=nz_self_t, i=nz_idx_t, v=nz_val_t: torch_call(a, [i], v, True),
+            run_c=lambda a=nz_self_c, i=nz_idx_c, v=nz_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="[10,20,30] += [1,_,2] is [11,20,32]; a scatter into a zeroed buffer "
+                 "would give [1,0,2] and pass every all-zero case",
+        )
+    )
+
+    # (c) float32, repeated positions mixed with untouched ones.
+    #
+    # Every lambda in this block binds its operands as default arguments.
+    # The cases above this one do not, and that is a live trap rather than a
+    # style point: the first draft of this block reused the names `f_self_t`
+    # / `f_idx_t` / `f_val_t`, and because the *earlier* "index_put_(float
+    # index) [both refuse]" case reads those names at call time rather than
+    # at definition time, rebinding them here turned that case's operands
+    # into a legal int64 index and it stopped refusing. It failed loudly
+    # (`expected both sides to refuse`), which is the good outcome -- but a
+    # rebinding that kept the case *passing* while testing something else
+    # would not have.
+    facc_self_t, facc_self_c = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
+    facc_idx_t, facc_idx_c = pair_from_flat(torch_module, c_module, [0, 2, 2, 4], (4,), "int64")
+    facc_val_t, facc_val_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(float32, accumulate=True, one repeated position)",
+            op=op,
+            run_torch=lambda a=facc_self_t, i=facc_idx_t, v=facc_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=facc_self_c, i=facc_idx_c, v=facc_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="measured: zeros(5) at [0,2,2,4] with [1,2,3,4] is [1,0,5,0,4]",
+        )
+    )
+
+    # (d) **The accumulation dtype.** `read_flat` hands every floating dtype
+    #     over as f64, so `o[dest] + s[src]` computed there and narrowed once
+    #     at the end is the obvious spelling and it is wrong: upstream's
+    #     `*dst += *src` runs in `scalar_t`. Each row below is a value where
+    #     the two answers differ, measured on 2.13.0, and each is compared
+    #     with `_bit_exact` because the per-dtype tolerance is larger than
+    #     the whole effect.
+    for dtype_name, vals, upstream_answer, wide_answer in [
+        ("bfloat16", [1.0, 0.005, 0.005], 1.015625, 1.0078125),
+        ("float16", [1.0, 0.0004, 0.0004, 0.0004], 1.0, 1.0009765625),
+        ("float32", [1.0] + [1e-8] * 8, 1.0, 1.0000001192092896),
+    ]:
+        acc_self_t, acc_self_c = pair_from_flat(torch_module, c_module, [0.0], (1,), dtype_name)
+        acc_idx_t, acc_idx_c = pair_from_flat(
+            torch_module, c_module, [0] * len(vals), (len(vals),), "int64")
+        acc_val_t, acc_val_c = pair_from_flat(
+            torch_module, c_module, vals, (len(vals),), dtype_name)
+        cases.append(
+            Case(
+                name=f"index_put_(accumulate=True, {dtype_name}) "
+                     f"[accumulates in {dtype_name}, not in f64]",
+                op=op,
+                run_torch=lambda a=acc_self_t, i=acc_idx_t, v=acc_val_t: torch_call(
+                    a, [i], v, True),
+                run_c=lambda a=acc_self_c, i=acc_idx_c, v=acc_val_c: c_module._aten_dispatch(
+                    op, a, [i], v, True),
+                value_check=_bit_exact,
+                note=f"measured: upstream gives {upstream_answer!r}; accumulating in f64 "
+                     f"and narrowing once at the end gives {wide_answer!r}, which the "
+                     f"{dtype_name} tolerance would absorb -- hence _bit_exact",
+            )
+        )
+
+    # (e) **`torch.bool` accumulates as a logical or**, because upstream's
+    #     `*dst += *src` on a C++ `bool` integer-promotes and converts back.
+    #     Writing `o + s` would leave a 2 in a byte the whole `bool` tag
+    #     depends on being 0 or 1 (docs/BOOL.md §6.3) -- and reading the
+    #     result *as bool* cannot see that, because 2 is still truthy on both
+    #     sides. So the result is cast to int64 and the ints are compared;
+    #     that is the only shape here that fails an `o + s` kernel.
+    bacc_self_t, bacc_self_c = pair_from_flat(
+        torch_module, c_module, [0, 0, 0], (3,), "bool")
+    bacc_idx_t, bacc_idx_c = pair_from_flat(
+        torch_module, c_module, [0, 0, 0, 1], (4,), "int64")
+    bacc_val_t, bacc_val_c = pair_from_flat(
+        torch_module, c_module, [1, 1, 1, 1], (4,), "bool")
+    _int64_t = dt.torch_dtype(torch_module, "int64")
+    _int64_c = dt.c_dtype(c_module, "int64")
+
+    def _bool_acc_torch():
+        written = torch_call(bacc_self_t, [bacc_idx_t], bacc_val_t, True)
+        return torch_module.ops.aten._to_copy.default(written, dtype=_int64_t)
+
+    def _bool_acc_c():
+        written = c_module._aten_dispatch(op, bacc_self_c, [bacc_idx_c], bacc_val_c, True)
+        return c_module._aten_dispatch("aten._to_copy.default", written, dtype=_int64_c)
+
+    cases.append(
+        Case(
+            name="index_put_(bool self, accumulate=True) [or, not +; read back as int64]",
+            op=op,
+            run_torch=_bool_acc_torch,
+            run_c=_bool_acc_c,
+            note="measured: three True accumulated into position 0 of a bool tensor give "
+                 "True, and casting to int64 gives 1 -- not 3. Reading the bool result "
+                 "directly could not tell the two apart",
+        )
+    )
+
+    # (f) **Integer accumulation wraps at the storage width**, and the walk
+    #     runs in i64, so this is the case that says the narrowing back down
+    #     is upstream's. 200 + 100 + 100 is 144 in `uint8`, measured.
+    u8_self_t, u8_self_c = pair_from_flat(torch_module, c_module, [200, 200], (2,), "uint8")
+    u8_idx_t, u8_idx_c = pair_from_flat(torch_module, c_module, [0, 0], (2,), "int64")
+    u8_val_t, u8_val_c = pair_from_flat(torch_module, c_module, [100, 100], (2,), "uint8")
+    cases.append(
+        Case(
+            name="index_put_(uint8, accumulate=True) [the sum wraps at the storage width]",
+            op=op,
+            run_torch=lambda a=u8_self_t, i=u8_idx_t, v=u8_val_t: torch_call(a, [i], v, True),
+            run_c=lambda a=u8_self_c, i=u8_idx_c, v=u8_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="measured: uint8 200 + 100 + 100 is 144, and the second element is "
+                 "untouched at 200",
+        )
+    )
+
+    # (g) The mask lowering under accumulate -- the same `mask_to_indices`
+    #     path, adding onto values that are already there.
+    macc_self_t, macc_self_c = pair_from_flat(
+        torch_module, c_module, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (2, 3), "float32")
+    macc_mask_t, macc_mask_c = pair_from_flat(
+        torch_module, c_module, [1, 0, 1, 0, 1, 0], (2, 3), "bool")
+    macc_val_t, macc_val_c = pair_from_flat(
+        torch_module, c_module, [10.0, 20.0, 30.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(2-D bool mask, accumulate=True)",
+            op=op,
+            run_torch=lambda a=macc_self_t, m=macc_mask_t, v=macc_val_t: torch_call(
+                a, [m], v, True),
+            run_c=lambda a=macc_self_c, m=macc_mask_c, v=macc_val_c: c_module._aten_dispatch(
+                op, a, [m], v, True),
+            note="measured: [[0,1,2],[3,4,5]] with the true positions 0, 2, 4 getting "
+                 "+10, +20, +30 is [[10,1,22],[3,34,5]]",
+        )
+    )
+
+    # (h) `[None, index]` with a repeated column, so the accumulation happens
+    #     inside a group that is not at axis 0 and the leading axis is walked
+    #     as well.
+    nacc_self_t, nacc_self_c = pair_from_flat(
+        torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    nacc_idx_t, nacc_idx_c = pair_from_flat(torch_module, c_module, [0, 2, 0], (3,), "int64")
+    nacc_val_t, nacc_val_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="index_put_(indices [None, index] with a repeat, accumulate=True)",
+            op=op,
+            run_torch=lambda a=nacc_self_t, i=nacc_idx_t, v=nacc_val_t: torch_call(
+                a, [None, i], v, True),
+            run_c=lambda a=nacc_self_c, i=nacc_idx_c, v=nacc_val_c: c_module._aten_dispatch(
+                op, a, [None, i], v, True),
+            note="measured: zeros(2,3) at [None,[0,2,0]] with [[1,2,3],[4,5,6]] is "
+                 "[[4,0,2],[10,0,5]] -- column 0 gets both of its contributions",
+        )
+    )
+
+    # (i) Negative indices under accumulate: both name the last position, so
+    #     a kernel that dropped the wrap writes somewhere else entirely.
+    gacc_self_t, gacc_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    gacc_idx_t, gacc_idx_c = pair_from_flat(torch_module, c_module, [-1, -1], (2,), "int64")
+    gacc_val_t, gacc_val_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(negative indices, accumulate=True) [both name the last slot]",
+            op=op,
+            run_torch=lambda a=gacc_self_t, i=gacc_idx_t, v=gacc_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=gacc_self_c, i=gacc_idx_c, v=gacc_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="measured: zeros(4) at [-1,-1] with [1,2] is [0,0,0,3]",
+        )
+    )
+
+    # (j) A 0-d `values` broadcast under accumulate -- the same value added
+    #     once per named position, twice at the repeated one.
+    zacc_self_t, zacc_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    zacc_idx_t, zacc_idx_c = pair_from_flat(torch_module, c_module, [1, 1, 3], (3,), "int64")
+    zacc_val_t, zacc_val_c = pair_from_flat(torch_module, c_module, [2.0], (), "float32")
+    cases.append(
+        Case(
+            name="index_put_(0-d values broadcast, accumulate=True)",
+            op=op,
+            run_torch=lambda a=zacc_self_t, i=zacc_idx_t, v=zacc_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=zacc_self_c, i=zacc_idx_c, v=zacc_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="measured: zeros(4) at [1,1,3] with the 0-d 2.0 is [0,4,0,2]",
+        )
+    )
+
+    # (k) An empty index still writes nothing and still returns `self`.
+    eacc_self_t, eacc_self_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    eacc_idx_t, eacc_idx_c = pair_from_flat(torch_module, c_module, [], (0,), "int64")
+    eacc_val_t, eacc_val_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(empty index, accumulate=True) [writes nothing]",
+            op=op,
+            run_torch=lambda a=eacc_self_t, i=eacc_idx_t, v=eacc_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=eacc_self_c, i=eacc_idx_c, v=eacc_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            note="the early return has to leave the receiver alone, not zero it",
+        )
+    )
+
+    # (l) The two refusals are still refusals with the flag set -- the dtype
+    #     check and the broadcast check both run before any accumulation.
+    dacc_self_t, dacc_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
+    dacc_idx_t, dacc_idx_c = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    dacc_val_t, dacc_val_c = pair_from_flat(torch_module, c_module, [1], (1,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(dtype mismatch, accumulate=True) [both refuse]",
+            op=op,
+            run_torch=lambda a=dacc_self_t, i=dacc_idx_t, v=dacc_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=dacc_self_c, i=dacc_idx_c, v=dacc_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            expect="both_error",
+            note="accumulate does not enable promotion; the dtype check is the same one",
+        )
+    )
+    bacc2_self_t, bacc2_self_c = pair_from_flat(torch_module, c_module, [0.0] * 4, (2, 2), "float32")
+    bacc2_idx_t, bacc2_idx_c = pair_from_flat(torch_module, c_module, [0, 1], (2,), "int64")
+    bacc2_val_t, bacc2_val_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="index_put_(values that do not broadcast, accumulate=True) [both refuse]",
+            op=op,
+            run_torch=lambda a=bacc2_self_t, i=bacc2_idx_t, v=bacc2_val_t: torch_call(
+                a, [i], v, True),
+            run_c=lambda a=bacc2_self_c, i=bacc2_idx_c, v=bacc2_val_c: c_module._aten_dispatch(
+                op, a, [i], v, True),
+            expect="both_error",
+            note="the broadcast check runs before the walk on both arms",
+        )
+    )
+
+    # (m) The write-through question, asked of the accumulating arm: the
+    #     return value is discarded and the ORIGINAL binding is read.
+    wacc_self_t, wacc_self_c = pair_from_flat(torch_module, c_module, [1.0] * 5, (5,), "float32")
+    wacc_idx_t, wacc_idx_c = pair_from_flat(torch_module, c_module, [0, 2, 2], (3,), "int64")
+    wacc_val_t, wacc_val_c = pair_from_flat(
+        torch_module, c_module, [7.0, 8.0, 9.0], (3,), "float32")
+
+    def _acc_through_torch():
+        torch_call(wacc_self_t, [wacc_idx_t], wacc_val_t, True)
+        return wacc_self_t
+
+    def _acc_through_c():
+        c_module._aten_dispatch(op, wacc_self_c, [wacc_idx_c], wacc_val_c, True)
+        return wacc_self_c
+
+    cases.append(
+        Case(
+            name="index_put_(accumulate=True, read back through the ORIGINAL binding)",
+            op=op,
+            run_torch=_acc_through_torch,
+            run_c=_acc_through_c,
+            note="ones(5) at [0,2,2] with [7,8,9] is [8,1,18,1,1]; the return value is "
+                 "discarded, so this is the only accumulate case that fails when the "
+                 "write lands in a copy",
+        )
+    )
+
+    # (n) accumulate=True by keyword, since the flag is positional above.
+    kacc_self_t, kacc_self_c = pair_from_flat(torch_module, c_module, [0, 0, 0], (3,), "int64")
+    kacc_idx_t, kacc_idx_c = pair_from_flat(torch_module, c_module, [1, 1], (2,), "int64")
+    kacc_val_t, kacc_val_c = pair_from_flat(torch_module, c_module, [5, 6], (2,), "int64")
+    cases.append(
+        Case(
+            name="index_put_(accumulate=True by keyword)",
+            op=op,
+            run_torch=lambda a=kacc_self_t, i=kacc_idx_t, v=kacc_val_t: torch_call(
+                self=a, indices=[i], values=v, accumulate=True),
+            run_c=lambda a=kacc_self_c, i=kacc_idx_c, v=kacc_val_c: c_module._aten_dispatch(
+                op, self=a, indices=[i], values=v, accumulate=True),
+            note="the keyword path has its own binder; [0,0,0] at [1,1] with [5,6] is "
+                 "[0,11,0]",
         )
     )
 
@@ -19987,6 +20895,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.native_dropout.default": native_dropout_cases,
     "aten.add_.Tensor": add__tensor_cases,
     "aten.mul.Scalar": mul_scalar_cases,
+    # docs/SCALAR.md §6: the narrowing half of the family, promoted out of
+    # `IMPLEMENTED_AWAITING_GOLDEN` so that a builder could exist for it.
+    "aten.add.Scalar": add_scalar_cases,
+    "aten.sub.Scalar": sub_scalar_cases,
     # docs/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces
     # to, landed as its own kernel (was a measured gap, docs/SPELLINGS.md §6.6).
     "aten.relu_.default": relu__cases,

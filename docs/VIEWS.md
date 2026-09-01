@@ -762,3 +762,186 @@ asserts the whole 28-row aliasing table in both directions, now fail on it.
 The prefill check is the one that says this is not an optimisation with a tail: an aliasing change
 that altered a model result would be a bug, and the sha256 of all 245 760 float32 logits is
 unchanged.
+
+---
+
+## 7. `index_put_(accumulate=True)` — the refusal §2-§3 left, closed
+
+§2-§3's table ends with two rows where upstream computes and this shim refuses. This closes the
+second of them. It was left twice on purpose and both reasons were about *documents*, not about
+the code: §2-§3 had not measured the flag, and docs/BACKWARD.md §4.5 named it as "one line" while
+declining to write it because the refusal it would make stale lived in a file that round could not
+edit. Done as its own round, with its own measurement and its own sabotage pass, it is fine.
+
+### 7.1 It is one line, and two things about that line are not the obvious spelling
+
+The walk was already general — the mask lowering, the spliced result shape, the right-aligned
+broadcast, the negative-index wrap, the dtype check and the empty-write shortcut are all shared,
+and none of them changed. Only the assignment differs:
+
+```rust
+//  before                       after
+o[dest] = s[src];            o[dest] = if accumulate { narrow(o[dest] + s[src]) } else { s[src] };
+```
+
+**`narrow` is the part that is not obvious.** `read_flat` hands every floating dtype over as `f64`,
+so `o[dest] + s[src]` computed there and narrowed once by `write_flat` at the end is what you would
+write, and it is wrong: upstream's kernel is `*dst += *src` in C++'s `scalar_t`, so the running sum
+is rounded to the receiver's dtype at every step. Measured on 2.13.0, accumulating three
+`bfloat16` values into one slot:
+
+```
+index_put_(zeros(1, bf16), [[0,0,0]], [1.0, 0.005, 0.005], accumulate=True)
+  upstream                       1.015625
+  accumulated in f64, narrowed   1.0078125
+```
+
+`float_narrower` already exists for exactly this — it is `div_floor`/`div_trunc`'s, with its own
+doc comment making the same argument for the same reason — so the fix is to call it, not to write
+a second one. Separating values were found for `bfloat16`, `float16` and `float32`; `float64` has
+nothing to separate.
+
+**`torch.bool` is the second one.** `*dst += *src` on a C++ `bool` integer-promotes and converts
+back, so accumulating `True` onto `True` is `True` — a logical or. Writing `o + s` in the `i64`
+walk would leave a **2** in the byte, which is precisely what the `bool` tag's invariant
+(docs/BOOL.md §6.3: `boolean()` is the only constructor that may attach it, and the bytes are 0 or
+1) forbids. Measured: `zeros(4, bool)` accumulated at `[0, 0, 1]` with three `True` gives
+`[True, True, False, False]`.
+
+Integer dtypes wrap at the storage width, which the `i64` walk gets for free from `write_flat`'s
+cast: `uint8` `200 + 100 + 100` is **144** upstream and 144 here.
+
+### 7.2 What was measured, against 2.13.0, before anything was written
+
+| | upstream | here |
+|---|---|---|
+| repeated index | the sum (`zeros(5)` at `[0,2,2,4]` with `[1,2,3,4]` is `[1,0,5,0,4]`) | same |
+| a non-zero receiver | added onto, not replaced | same |
+| accumulation dtype | the receiver's (`bf16` 1.0+0.005+0.005 is `1.015625`) | same, via `float_narrower` |
+| `torch.bool` | logical or | same |
+| `uint8` overflow | wraps (`144`) | same |
+| bool / `uint8` mask | same `mask_to_indices` lowering, accumulating | same |
+| `[None, t]` with a repeated column | each contribution lands | same |
+| negative index | wraps, then accumulates | same |
+| 0-d `values` | broadcast, added once per named position | same |
+| empty index / all-false mask | writes nothing, returns `self` | same |
+| dtype mismatch | refuses, same message | same |
+| `values` that does not fit | refuses, same message | same |
+| two index tensors | computes | **still refused by name** — not measured, not guessed |
+
+The one remaining refusal is unchanged and deliberate.
+
+### 7.3 There is no member or `torch.`-level spelling to pair the cases with
+
+Every other kernel in this document was cased twice — once at the door (`_aten_dispatch`) and once
+through the Python name — because golden compares by dispatch key and is structurally blind to a
+missing name. **`accumulate` has no second door here, and that is a fact about the surface rather
+than a gap in the cases:**
+
+* `index_put_` is not in `methods.json`, so `tensor.index_put_(...)` does not resolve;
+* `__setitem__` in `bootstrap.py` builds the call itself and always passes `accumulate=False` —
+  there is no subscript syntax that means "add".
+
+That is upstream's shape too (`x[i] += v` is a `index`/`add`/`index_put_` triple upstream, not an
+accumulating put), so nothing is being routed around. Adding `index_put_` to `methods.json` would
+give the member a real spelling and cost two entries in `verify_schemas.py`; it is named here
+rather than done, because it is a surface change and this round is a correctness round.
+
+### 7.4 The embedding rule: measured, and the recommendation
+
+docs/BACKWARD.md §4.5 says the one-hot composition is used *because* this was refused, and asks
+whether the rule should switch. It should, and the memory is the smaller of the two reasons.
+
+Both compositions were run in this shim on the same inputs — the one-hot
+(`zeros[vocab,count]` → `scatter.src` → `mm`) exactly as `tape.rs` builds it, and the
+`index_put_(accumulate=True)` scatter-add:
+
+```
+float32, 11 rows x 4 wide, 23 tokens, random gradients
+    max |one-hot - index_put_|   0.0                      identical
+
+bfloat16, the separating case (three contributions into one row: 1.0, 0.005, 0.005)
+    upstream embedding_dense_backward   1.015625
+    index_put_(accumulate=True)         1.015625     <- upstream's answer
+    one-hot -> mm                       1.0078125    <- not upstream's answer
+```
+
+**At `float32` the two agree exactly, so switching cannot move a `float32` gradient.** At
+`bfloat16` they do not, and the accumulating scatter is the one that matches upstream: upstream's
+`embedding_dense_backward` accumulates in the storage dtype, and the one-hot's summing is done by
+a **matmul**, which accumulates in `float32` (the GEMM accumulation-dtype rule docs/ARCH.md
+landed). The one-hot is not merely more expensive at reduced precision — it is answering a
+different question.
+
+Two things a switch has to carry, both cheap and both already visible in the current rule:
+
+* **`padding_idx`.** The one-hot zeroes the *column* of the one-hot. An accumulating scatter has
+  to zero the corresponding rows of the flattened gradient instead — one `ne.Scalar` and one
+  `where`, the same two ops the rule already builds, applied to `flat_grad` rather than to `hot`.
+* **the zero buffer is `[vocab, width]`, not `[vocab, tokens]`** — which is the 200 MB.
+
+`tape.rs` is not this round's file and the change is not made here; this is the measurement the
+recommendation rests on. The comment in `tape.rs`'s `aten.embedding.default` arm ("**that is
+refused by this shim**") and docs/BACKWARD.md §4.5's costs table are both stale as of this
+section, and are left for the agent that owns them rather than edited across a boundary.
+
+### 7.5 Sabotage
+
+Each fault injected into the source, rebuilt, and counted. The accumulate cases are 17 of the
+`aten.index_put_.default` key's 61.
+
+| injected fault | golden failed | smoke failed |
+|---|---:|---:|
+| `accumulate` ignored — the walk always overwrites | **13** | 1 |
+| the sum accumulated in `f64` and narrowed once at the end | **3** | 1 |
+| `torch.bool` accumulates with `+` instead of `\|` | **1** | 1 |
+| the receiver is zeroed before accumulating | **4** | 1 |
+| the flag is inverted | **16** | 2 |
+
+The inverted flag is the row that says both arms are pinned: it fails the *non*-accumulate cases
+too, including one that goes through the member (`x[idx] = v` with a repeated index) and one that
+goes through a strided view.
+
+**What could not fail, and why that is right.**
+
+* The bool case does not fail on "accumulate ignored". Its receiver starts all-`False` and its
+  values are all `True`, so a write and an or give the same answer — it is aimed at the `+`-versus-
+  `|` fault and only at that one, and it is the only case that can see it. Reading the result *as
+  bool* cannot see it either, because 2 is truthy; the case casts to `int64` and compares the ints.
+* The `_bit_exact` cases are the only ones that can see the accumulation dtype. `dtypes.py` gives
+  `bfloat16` `atol=6e-2` and the effect is 0.0078, so a tolerant comparator would pass an
+  `f64`-accumulating kernel **for every input**, not merely for easy ones. This is the second kind
+  of hole docs/LOSS.md §5.4 named, and `_bit_exact` is the instrument that already existed for it.
+* The empty-index case does not fail on "the receiver is zeroed", because the zeroing was injected
+  after the `total == 0` early return — which is what that case exists to guard, and it is the only
+  case that guards it.
+* The two `both_error` cases (dtype mismatch, broadcast mismatch) fail on no fault above. They are
+  there to say that setting the flag does not enable promotion or relax the broadcast, i.e. they
+  pin checks that run *before* the walk; a fault in the walk cannot reach them.
+
+**One case pins behaviour this change did not write.** The `uint8` wrap is candle's `i64 -> u8`
+cast, not the `wrapping_add` in the walk — the `i64` accumulator cannot overflow on these values.
+It is cased because it is upstream's answer and nothing else in the suite asks for it, not because
+a plausible fault in this kernel would move it.
+
+### 7.6 Where §7 landed
+
+|  | before | after |
+|---|---|---|
+| `run.sh` | 302 ok | **303 ok** |
+| `compare.py` | 7447 / 7447, ops=166 | **7463 / 7463**, ops=166 |
+| `compare.py --self-test` | 19 × 11, 0 problems | unchanged |
+| `verify_schemas.py` | 4475 / 4475 | unchanged (no new key) |
+| `index_put_(accumulate=True)` | refuses (`c_error` case) | kernel, 17 cases against upstream |
+
+`aten.index_put_.default` goes from 45 cases to 61 — the `c_error` case that recorded the refusal
+is gone, replaced by the seventeen that record the behaviour.
+
+The prefill digests do not move, and they could not: `index_put_` is not on an inference forward at
+all, and the non-accumulating arm's assignment is byte-for-byte the statement it was. Re-measured
+anyway on the final artefact, at every length docs/SEQLEN.md §1.3 and docs/TRAIN.md §6 record —
+all nine unchanged (`f32` S=6/32/128/512/1024 and `bf16` S=6/32/128/512).
+
+The counts above are §7's own delta. Three more kernels landed in the same session, in
+docs/SCALAR.md §8, and its §8.7 has the round's totals: **304 ok, 7685/7685 over 168 ops,
+4479/4479 schemas**, both sweeps 26/26.

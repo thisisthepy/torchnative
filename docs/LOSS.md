@@ -470,6 +470,47 @@ entirely. That is the mechanism, and the 0-of-393216 at vocabulary width is the 
 The consequence for §4 is bounded and measured: it moves the SmolLM2 loss by 2.1e-05, i.e.
 1.6e-06 relative.
 
+#### 5.4.1 It is now watched, and the fix is still not attempted
+
+Everything above stands. The `float32` residual is **not** fixed and should not be — the argument
+in the paragraph above is the whole reason, and it has not weakened.
+
+What did change is the last clause of the second paragraph: *"no case in this file sees it because
+the widest `float32` case is 6 elements."* That was true, and it meant this number lived only in
+this document. **A number in a document does not fail when it moves.** There is now a case at real
+vocabulary width whose comparator asserts a *ceiling* on the disagreement rather than its absence:
+
+```
+_log_softmax(float32, [1, 49152] -- REAL VOCABULARY WIDTH)
+    49152 deterministic LCG values in [-8, 8], with one 15.0 so the row's largest
+    log-probability is -1.330504 and the relative error is not divided away
+
+    measured   all 49152 elements differ
+               worst |d| = 4.39e-05      ceiling 9e-05
+               worst rel = 3.29e-05      ceiling 7e-05
+```
+
+**3.29e-05 is three times `dtypes.py`'s `float32` rtol of 1e-5**, which is the point: under the
+default pipeline this case is a failure, and it is not one. The ceilings are the measured values
+with roughly 2× headroom, so re-measurement noise does not move them and a real regression does.
+
+The comparator is `_bounded_divergence(max_abs, max_rel)`, and it is new. Two comparators already
+existed for the two ordinary answers — the default pipeline ("agree within the dtype's tolerance")
+and `_bit_exact` ("agree exactly") — and neither can say the third thing this repository keeps
+having to say: *these do not agree, here is by how much, and the cause is a property of how
+upstream's wheel was compiled rather than of the operator.* `--self-test` puts it through all
+eleven fault modes and it catches the same seven the default pipeline does, so it is a ceiling and
+not a hole.
+
+Three other divergences of exactly this shape were measured in the same round and are recorded the
+same way, in `docs/SCALAR.md` §8: `softplus`'s Sleef-versus-scalar tail at `float32` (one ULP, at
+`n >= 8` only), `add.Scalar`/`sub.Scalar`'s fused multiply-add (worst 3.2e-05 relative at
+`float32`, by the same cancellation mechanism as this one), and `norm.ScalarOpt_dim`'s pairwise
+`p = 2` sum (one ULP at `float64`). The pattern is worth naming: **wherever upstream's answer
+depends on its vectoriser, the honest test is a ceiling, and the honest fix is usually none.**
+
+<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _bounded_divergence present -->
+
 ---
 
 ## 6. `zero_grad()`: a profiler marker, and it gates SGD too

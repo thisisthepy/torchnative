@@ -47,6 +47,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten.abs.default",
+    "aten.add.Scalar",
     "aten.add.Tensor",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
@@ -182,6 +183,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sqrt.default",
     "aten.squeeze.dim",
     "aten.stack.default",
+    "aten.sub.Scalar",
     "aten.sub.Tensor",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
@@ -232,15 +234,24 @@ pub const IMPLEMENTED: &[&str] = &[
 /// held it as a deliberately failing case until the kernel could be fixed.
 /// Promotion and fix landed together; a builder written against a parked op is
 /// not a formality.
+/// `aten.add.Scalar` and `aten.sub.Scalar` were the third and fourth, and
+/// they are the ones that say the parking list is not free. docs/SCALAR.md
+/// §6 recorded that the *narrowing* half of the scalar family had no golden
+/// coverage because of this list -- sabotage F3 was caught by two smoke tests
+/// and **zero** golden cases -- and writing the two builders on promotion
+/// found a live defect that nothing had ever been in a position to see:
+/// neither op had ever been passed a non-unit `alpha` by any case, and
+/// `alpha` is narrowed to the tensor's dtype *separately* from `other`
+/// upstream. `bfloat16` and `float16` went from 53/150 and 56/150 disagreeing
+/// rows to 0. Same shape as `aten.max.other` above: a builder written against
+/// a parked op is not a formality.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
-    "aten.add.Scalar",
     "aten.any.dims",
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
     "aten.randint.default",
     "aten.reshape.default",
-    "aten.sub.Scalar",
     "aten.zeros.default",
 ];
 
@@ -4516,10 +4527,34 @@ fn arith_tag(
     tensor: TorchDType,
     scalar_is_float: Option<bool>,
 ) -> PyResult<TorchDType> {
-    // `bool * bool` is a logical and in torch, not an arithmetic product
-    // (BOOL.md §2.2), and `bool + bool` is a logical or. candle would give 2
-    // where both are true -- still truthy, therefore silently wrong
-    // downstream. `add.Tensor` already refuses this; the rest follow.
+    // **`torch.bool` does four different things here and the refusal used to
+    // say it did one.** The whole matrix was re-measured on 2.13.0 (docs/TAIL.md
+    // §2.2 found the first row of it; the rest came out of the same probe):
+    //
+    // ```text
+    //                      add                sub        mul               div
+    //   .Tensor            LOGICAL OR, bool   refuses    LOGICAL AND, bool ARITHMETIC, float32
+    //   .Tensor in place   logical or, bool   refuses    logical and, bool refuses (cast back)
+    //   .Scalar            ARITHMETIC, int64  refuses    ARITHMETIC, int64 ARITHMETIC, float32
+    //   .Scalar in place   refuses (cast back) refuses   refuses           refuses
+    // ```
+    //
+    // The message this used to carry -- "torch.bool operands are logical, not
+    // arithmetic, in torch (BOOL.md §2.2)" -- is true of exactly two of those
+    // twelve cells. `docs/BOOL.md` §2.2's table measured `x + x` for two bool
+    // *tensors*, and a later round generalised that finding into a blanket
+    // refusal for every overload, message included. docs/AUDIT.md reported it
+    // as a live defect: for `.Scalar` upstream reads True/False as 1/0 and
+    // promotes exactly like any other integral tensor, which is arithmetic and
+    // not logical; and for `-` upstream refuses too, so calling it "logical"
+    // describes neither side. `bool / bool` was the third wrong cell -- this
+    // comment used to say "`-` and `/` are refused by upstream itself" and
+    // `div.Tensor(bool, bool)` computes `[1.0, nan, 1.0]` in `float32`.
+    //
+    // **The refusals themselves are unchanged and all of them are still
+    // right**; only the reason each one gives is. That distinction is the
+    // point: a refusal with a wrong reason sends the next reader to the wrong
+    // kernel, which is what happened here for two rounds.
     //
     // **`mul.Tensor` is the one exception, and it is an exception because the
     // two operations coincide rather than because it was convenient.** Under
@@ -4530,22 +4565,44 @@ fn arith_tag(
     // computes torch's answer exactly, values and dtype both
     // (`tensor([T,F]) * tensor([T,T])` is `tensor([True, False])`,
     // `torch.bool`, measured on 2.13.0). That is not true of `+`, which would
-    // give 2 and need clamping; `-` and `/` are refused by upstream itself.
+    // give 2 and need clamping.
     //
     // It is here because `torch.isfinite` needs it: upstream's own body is
     // `(self == self) * (self.abs() != inf)`, a multiply of two bool tensors,
     // and that is on the `print(tensor)` path (docs/E2E_REAL.md).
     //
-    // The **scalar** overload stays refused, and that is a real difference
-    // rather than caution: `bool_tensor * 2` promotes to `int64` upstream and
-    // `bool_tensor * 1.5` to `float32`, so the scalar form is not a logical
-    // and at all, and the promotion it needs is not implemented here.
     // `scalar_is_float.is_none()` is exactly "this is the Tensor overload".
     if tensor == TorchDType::Bool && !(kind == Arith::Mul && scalar_is_float.is_none()) {
-        return Err(not_implemented(format!(
-            "{op}: torch.bool operands are logical, not arithmetic, in torch \
-             (BOOL.md §2.2) and are not implemented in torch._C shim"
-        )));
+        // `aten.add_.Scalar` -> the name segment ends in `_`. The in-place
+        // forms differ from their out-of-place twins in exactly one way that
+        // matters here: the promoted result has nowhere to go.
+        let in_place = op.split('.').nth(1).is_some_and(|name| name.ends_with('_'));
+        let scalar_overload = scalar_is_float.is_some();
+        let detail = match (kind, scalar_overload, in_place) {
+            // Upstream refuses too, and not because bool `-` is logical --
+            // because it has no meaning at all. `rsub.Scalar` arrives here as
+            // `Arith::Sub` and upstream refuses it with the same words.
+            (Arith::Sub, _, _) => "upstream refuses a torch.bool subtraction as well \
+                 (\"Subtraction, the `-` operator, with a bool tensor is not supported\"), \
+                 so both sides refuse; it is not implemented in torch._C shim either",
+            // The promoted result cannot be written back into a bool buffer.
+            (_, true, true) => "upstream refuses a torch.bool receiver in place -- the \
+                 scalar promotes the result to int64 or float32 and \"result type Long \
+                 can't be cast to the desired output type Bool\" -- and it is not \
+                 implemented in torch._C shim",
+            // The two cells where "logical, not arithmetic" is actually true.
+            (Arith::Add | Arith::Mul, false, _) => "torch.bool `+` between two tensors is \
+                 a logical OR returning bool (measured: [T,F] + [T,T] is [True, True]); \
+                 candle would give 2, which is still truthy and so silently wrong \
+                 downstream (docs/BOOL.md §6.3). Not implemented in torch._C shim",
+            // Everything else: upstream COMPUTES, arithmetically, and the
+            // promotion is what is missing here.
+            _ => "upstream reads a torch.bool operand as 1/0 here and computes \
+                 ARITHMETICALLY, promoting like any other integral tensor (bool*3 is \
+                 int64 [3,0,3], bool/3 is float32, bool/bool is float32 [1.0, nan, 1.0]); \
+                 that promotion is not implemented in torch._C shim",
+        };
+        return Err(not_implemented(format!("{op}: {detail}")));
     }
     let mut tag = tensor;
     if scalar_is_float == Some(true) && !tag.is_floating_point() {
@@ -4865,7 +4922,25 @@ fn arith_scalar(
         // promotion makes a python float beside a `bfloat16` tensor a
         // `bfloat16` operand (docs/GENERATE.md §3.2), so `x + 0.3` adds
         // `0.30078125`. Building the scalar at `float` would add `0.3`.
-        Tensor::full(other.as_f64() * alpha, (), left.device())
+        //
+        // **`alpha` is narrowed too, and separately, and the product is
+        // narrowed again.** `other * alpha` in `f64` and one narrowing at the
+        // end is the obvious spelling and it disagrees: measured over 300
+        // random `(other, alpha)` pairs at `bfloat16`, `bf16(bf16(other) *
+        // bf16(alpha))` matches upstream 300/300 and the `f64` product 202/300
+        // (`float16`: 400/400 against 260/400). `bfloat16([0.0]) + 0.3` with
+        // `alpha=0.3` is `0x1.72p-4` upstream and was `0x1.70p-4` here. This
+        // could not have been seen before docs/SCALAR.md §6's second bullet
+        // was closed: `add.Scalar`/`sub.Scalar` were not in
+        // `_aten_implemented()`, so golden had no builder for them and no case
+        // had ever passed either op a non-unit `alpha`.
+        //
+        // `alpha = 1` is unaffected -- `narrow(1.0)` is `1.0` at every dtype
+        // and `narrow(narrow(o) * 1.0)` is `narrow(o)` -- which is why no
+        // prefill digest moves.
+        let narrow = float_narrower(tag);
+        let scaled = narrow(narrow(other.as_f64()) * narrow(alpha));
+        Tensor::full(scaled, (), left.device())
             .and_then(|t| t.fast_to(storage))
             .and_then(|t| t.fast_to(acc))
     }
@@ -8297,67 +8372,186 @@ fn norm_scalaropt_dim(
         }
     }
 
-    let storage = PyDtype::new(tag).storage(OP)?;
-    let x = t.fast_to(storage).map_err(|e| candle_err(OP, e))?;
-    let abs = x.abs().map_err(|e| candle_err(OP, e))?;
-    // Reduced one axis at a time with `keepdim`, then squeezed at the end if
-    // asked -- reducing several at once would need the axes renumbered after
-    // each collapse, which is exactly the kind of index bookkeeping that goes
-    // wrong silently on a non-square tensor.
-    let reduce_sum = |v: &Tensor| -> PyResult<Tensor> {
-        let mut acc = v.clone();
-        for &d in &dims {
-            acc = acc.sum_keepdim(d).map_err(|e| candle_err(OP, e))?;
-        }
-        Ok(acc)
+    // **The reduction is a walk, not a chain of candle reductions, and the
+    // reason is `acc_t`.** Upstream's `norm_kernel_tensor_iterator_impl`
+    // dispatches `norm_kernel_cpu_impl<scalar_t, acc_t>` with `acc_t = float`
+    // for `Half` and `BFloat16` and `acc_t = scalar_t` otherwise, so the
+    // running `|x|^p` sum is kept in `float` for the reduced dtypes and
+    // narrowed exactly once, at the end. Reducing with candle keeps every
+    // partial sum in the storage dtype.
+    //
+    // docs/SCALAR.md §5 recorded the resulting disagreement -- `bfloat16`
+    // 8/10, `float16` 8/10, `float32` 1/10, with `p=2` agreeing exactly
+    // everywhere -- and left it as an accumulate-where change with its own
+    // digest question. Re-measured before this rewrite over a 3x4 tensor at
+    // ten `p` values, three `dim` lists and four dtypes: **29 of 120 rows
+    // disagreed.**
+    //
+    // Each of upstream's six ops is transcribed rather than expressed through
+    // another one, because they are not the same arithmetic:
+    //
+    // ```text
+    //   p = 0      NormZeroOps    acc + (data == 0 ? 0 : 1)      project: acc
+    //   p = 1      NormOneOps     acc + |data|                   project: acc
+    //   p = 2      NormTwoOps     acc + data*data                project: sqrt(acc)
+    //   p = +inf   AbsMaxOps      max(acc, |data|)               project: acc
+    //   p = -inf   AbsMinOps      min(acc, |data|)               project: acc
+    //   otherwise  NormOps        acc + pow(|data|, p)           project: pow(acc, 1/p)
+    // ```
+    //
+    // `p = 2` squares rather than calling `pow(·, 2)`, and takes `sqrt`
+    // rather than `pow(·, 0.5)`; that is upstream's own split and it is what
+    // keeps the exactly-representable cases exact. The general arm uses
+    // `powf` at `acc_t`, not `pow` at `f64` then narrowed -- for the reduced
+    // dtypes the difference is invisible after narrowing and at `float32` it
+    // is not.
+    //
+    // The walk is row-major over the *input*, which is the order the
+    // partial sums are formed in, and that order is part of the answer:
+    // floating addition is not associative.
+    let shape = t.dims().to_vec();
+    let dims_set: Vec<bool> = (0..rank).map(|d| dims.contains(&d)).collect();
+    let device = t.device().clone();
+    let values = match read_flat(OP, t, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the dtype was checked above"),
     };
-    let out = if p == 0.0 {
-        // The count of non-zero elements. `ne(0)` gives a mask; summing it in
-        // the value dtype is the count.
-        let mask = abs
-            .ne(0.0)
-            .and_then(|m| m.to_dtype(storage))
-            .map_err(|e| candle_err(OP, e))?;
-        reduce_sum(&mask)?
+
+    let kept: Vec<usize> = shape
+        .iter()
+        .enumerate()
+        .map(|(d, &extent)| if dims_set[d] { 1 } else { extent })
+        .collect();
+    let out_strides = contiguous_strides(&kept);
+    let out_total: usize = kept.iter().product();
+
+    // `acc_t`, and then the storage dtype once at the end.
+    let wide = tag == TorchDType::Float64;
+    let acc_narrow = |v: f64| if wide { v } else { v as f32 as f64 };
+    let store_narrow = float_narrower(tag);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Norm {
+        Count,
+        Sum,
+        Squares,
+        Max,
+        Min,
+        Power,
+    }
+    let mode = if p == 0.0 {
+        Norm::Count
     } else if p == f64::INFINITY {
-        let mut acc = abs.clone();
-        for &d in &dims {
-            acc = acc.max_keepdim(d).map_err(|e| candle_err(OP, e))?;
-        }
-        acc
+        Norm::Max
     } else if p == f64::NEG_INFINITY {
-        let mut acc = abs.clone();
-        for &d in &dims {
-            acc = acc.min_keepdim(d).map_err(|e| candle_err(OP, e))?;
-        }
-        acc
+        Norm::Min
     } else if p == 1.0 {
-        reduce_sum(&abs)?
+        Norm::Sum
     } else if p == 2.0 {
-        // `sqrt` of the sum of squares rather than `powf(0.5)`: the same
-        // reason docs/SEQLEN.md §3 squares by multiplying, and it keeps the
-        // exactly-representable cases exact.
-        let sq = abs.sqr().map_err(|e| candle_err(OP, e))?;
-        reduce_sum(&sq)?.sqrt().map_err(|e| candle_err(OP, e))?
+        Norm::Squares
     } else {
-        let powed = abs.powf(p).map_err(|e| candle_err(OP, e))?;
-        reduce_sum(&powed)?
-            .powf(1.0 / p)
-            .map_err(|e| candle_err(OP, e))?
+        Norm::Power
     };
-    let out = if keepdim {
-        out
-    } else {
-        // Squeeze from the highest axis down, so the earlier indices stay valid.
-        let mut squeezed = out;
-        let mut ordered = dims.clone();
-        ordered.sort_unstable();
-        for &d in ordered.iter().rev() {
-            squeezed = squeezed.squeeze(d).map_err(|e| candle_err(OP, e))?;
+    let exponent = acc_narrow(p);
+
+    let mut acc: Vec<Option<f64>> = vec![None; out_total];
+    let mut coord = vec![0usize; rank];
+    let total: usize = shape.iter().product();
+    for src in 0..total {
+        let mut dst = 0usize;
+        for d in 0..rank {
+            if !dims_set[d] {
+                dst += coord[d] * out_strides[d];
+            }
         }
-        squeezed
+        let data = values[src];
+        let contrib = match mode {
+            // `data == 0`, not `|data| == 0`: the same answer, and it is
+            // upstream's spelling. NaN counts, because NaN != 0.
+            Norm::Count => f64::from(data != 0.0),
+            Norm::Sum | Norm::Max | Norm::Min => data.abs(),
+            Norm::Squares => {
+                let d = acc_narrow(data);
+                acc_narrow(d * d)
+            }
+            Norm::Power => {
+                let base = acc_narrow(data.abs());
+                if wide {
+                    base.powf(exponent)
+                } else {
+                    acc_narrow(f64::from((base as f32).powf(exponent as f32)))
+                }
+            }
+        };
+        acc[dst] = Some(match (acc[dst], mode) {
+            (None, _) => contrib,
+            (Some(a), Norm::Max) => {
+                if contrib > a {
+                    contrib
+                } else {
+                    a
+                }
+            }
+            (Some(a), Norm::Min) => {
+                if contrib < a {
+                    contrib
+                } else {
+                    a
+                }
+            }
+            (Some(a), _) => acc_narrow(a + contrib),
+        });
+        for d in (0..rank).rev() {
+            coord[d] += 1;
+            if coord[d] < shape[d] {
+                break;
+            }
+            coord[d] = 0;
+        }
+    }
+
+    let out_values: Vec<f64> = acc
+        .into_iter()
+        .map(|slot| {
+            // An empty reduction contributes nothing; upstream's identity for
+            // the summing arms is 0 and this reaches it the same way.
+            let a = slot.unwrap_or(0.0);
+            let projected = match mode {
+                Norm::Squares => {
+                    if wide {
+                        a.sqrt()
+                    } else {
+                        acc_narrow(f64::from((a as f32).sqrt()))
+                    }
+                }
+                Norm::Power => {
+                    // `acc_t(1) / acc_t(p)`, at `acc_t` -- not the `f64`
+                    // reciprocal narrowed afterwards.
+                    let inverse = acc_narrow(1.0 / exponent);
+                    if wide {
+                        a.powf(inverse)
+                    } else {
+                        acc_narrow(f64::from((a as f32).powf(inverse as f32)))
+                    }
+                }
+                _ => a,
+            };
+            store_narrow(projected)
+        })
+        .collect();
+
+    let out_dims: Vec<usize> = if keepdim {
+        kept
+    } else {
+        shape
+            .iter()
+            .enumerate()
+            .filter(|(d, _)| !dims_set[*d])
+            .map(|(_, &extent)| extent)
+            .collect()
     };
-    finish(py, out, tag)
+    let tensor = write_flat(OP, Flat::Float(out_values), out_dims, &device, tag)?;
+    finish(py, tensor, tag)
 }
 
 /// `aten::_weight_norm_interface(Tensor v, Tensor g, int dim=0)
@@ -11026,16 +11220,73 @@ fn split_with_sizes(
 /// `softplus_cpu` raises `NotImplementedError` naming the dtype rather than
 /// promoting the way `exp`/`tanh` do; softplus is refused, not widened.
 ///
-/// The formula is upstream's numerically-stable split, not the naive
-/// `log(1+exp(beta*x))/beta` a doc comment would suggest: writing `y =
-/// beta*x`, `log(1+exp(y)) == max(y,0) + log(1+exp(-|y|))`, which never
-/// overflows `exp` for large `y` and keeps `log`'s argument in `[1,2]` (never
-/// the near-`1.0` region where `log(1+tiny)` loses precision). Above
-/// `threshold`, upstream skips the formula entirely and returns `x` itself,
-/// not an evaluation of it -- measured `softplus(20.1) == 20.1` exactly,
-/// which the formula alone would not promise. Every measured call in `mamba`
-/// stays well inside the default `threshold=20`, so that branch is exercised
-/// by the golden cases, not by the model.
+/// **The formula is upstream's, transcribed, and the "numerically stable"
+/// rewrite this kernel used to carry was a divergence rather than an
+/// improvement.** Upstream's `softplus_kernel` is one line:
+///
+/// ```text
+/// (a * beta) > threshold ? a : std::log1p(std::exp(a * beta)) / beta
+/// ```
+///
+/// The previous version computed `max(y,0) + log(1 + exp(-|y|))` instead --
+/// mathematically the same function, and never equal to it in floating
+/// point. docs/SCALAR.md §5 recorded the resulting disagreement as open,
+/// with `softplus(-3)` at `float64` reading `0.048587351573742**06**`
+/// upstream and `…**196**` here. Two separate causes, both closed here:
+///
+///   * **`log1p`, not `log(1 + ·)`.** Checked against `math.log1p(math.exp(x))`
+///     on ten values in `float64`: upstream agrees with `log1p(exp(x))` on
+///     all ten and with the split on six.
+///   * **the split is not even the same function at the edges.** With a
+///     `threshold` large enough not to fire, upstream's `exp` overflows and
+///     the answer is `inf`: `softplus(800.0, 1, 1e9)` is `inf` upstream and
+///     was `800.0` here. The split cannot overflow, which is exactly why it
+///     was chosen and exactly why it disagrees.
+///
+/// **The arithmetic runs in `opmath`, not in the storage dtype.** Upstream's
+/// `scalar_t` is `c10::BFloat16`/`c10::Half` for the reduced floats, and
+/// every arithmetic operator on those promotes to `float` and back, so the
+/// whole expression is evaluated in `float32` and narrowed once at the end.
+/// This kernel used candle tensor ops, which stay in the storage dtype at
+/// every step -- `bfloat16 softplus(-3)` was `0.0458984375` here against
+/// upstream's `0.048583984375`, a 6% error that `dtypes.py`'s `bfloat16`
+/// tolerance of 6e-2 absorbs completely. That is why the cases for it use
+/// `_bit_exact`.
+///
+/// `beta` and `threshold` are narrowed to the tensor's dtype *first*
+/// (`beta_.to<scalar_t>()`). Where that is observable is not where you would
+/// look for it: at `bfloat16` and `float16` it is **not** observable at all,
+/// because the final narrowing back to 8 or 11 bits absorbs the difference —
+/// a 100-point search over `beta` and `x` found no separating pair. It is
+/// observable at **`float32`**, where the narrowing of `beta` is a real
+/// rounding and the result keeps 24 bits: `softplus(-3.440680608220717,
+/// beta=0.1)` is `5.3583855628967285` with `float(0.1)` and
+/// `5.358386039733887` with the `double` `0.1`. That gap is 9e-8 relative,
+/// inside `dtypes.py`'s `float32` tolerance, so its case is `_bit_exact` too.
+///
+/// **`float32` cannot be matched bit for bit and that is upstream's
+/// property, not this kernel's.** `cpu_kernel_vec` runs a Sleef-vectorised
+/// body and a scalar tail, and the two do not agree: `softplus(-3.0)` in
+/// `float32` is `0x1.8e070e0p-5` in a tensor of fewer than 8 elements and
+/// `0x1.8e07100p-5` in a longer one, measured at n = 1, 2, 3, 4, 7, 8, 16,
+/// 17, 32, 64, 100. That is one ULP and it is the same class docs/LOSS.md
+/// §5.4 records for `_log_softmax`. The `float32` cases therefore use the
+/// ordinary tolerance; `float64`, `float16` and `bfloat16` are all stable
+/// across length and are pinned bit-exactly.
+///
+/// Above `threshold`, upstream skips the formula entirely and returns `x`
+/// itself, not an evaluation of it -- measured `softplus(20.1) == 20.1`
+/// exactly, which the formula alone would not promise. The comparison is
+/// `>`, so `y == threshold` computes. Every measured call in `mamba` stays
+/// well inside the default `threshold=20`, so that branch is exercised by
+/// the golden cases, not by the model.
+///
+/// Nothing is special-cased for non-finite input; every one of them falls
+/// out of the expression, and all four were measured. `+inf` takes the
+/// threshold branch and returns itself; `-inf` gives `log1p(exp(-inf)) =
+/// log1p(0) = 0`; `NaN` fails the `>` and propagates through `exp`; `-0.0`
+/// gives `log(2)`. `beta = 0` gives `inf` (upstream's `/beta`), and a
+/// negative `beta` mirrors the function rather than refusing.
 fn softplus_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11057,30 +11308,50 @@ fn softplus_default(
         .unwrap_or(20.0);
 
     let tag = input.tag();
-    let x = input.tensor()?.clone();
-    let y = x.affine(beta, 0.0).map_err(|e| candle_err(OP, e))?;
-    let abs_y = y.abs().map_err(|e| candle_err(OP, e))?;
-    // max(y, 0) == (y + |y|) / 2 -- avoids needing a `maximum` against a
-    // freshly-built zero tensor.
-    let positive = y
-        .add(&abs_y)
-        .and_then(|t| t.affine(0.5, 0.0))
-        .map_err(|e| candle_err(OP, e))?;
-    let log_term = abs_y
-        .affine(-1.0, 0.0)
-        .and_then(|t| t.exp())
-        .and_then(|t| t.affine(1.0, 1.0))
-        .and_then(|t| t.log())
-        .map_err(|e| candle_err(OP, e))?;
-    let full_formula = positive
-        .add(&log_term)
-        .and_then(|t| t.affine(1.0 / beta, 0.0))
-        .map_err(|e| candle_err(OP, e))?;
-    let over_threshold = y.gt(threshold).map_err(|e| candle_err(OP, e))?;
-    let out = over_threshold
-        .where_cond(&x, &full_formula)
-        .map_err(|e| candle_err(OP, e))?;
-    finish(py, out, tag)
+    // `beta_.to<scalar_t>()` / `threshold_.to<scalar_t>()`, before anything
+    // is computed with them.
+    let narrow = float_narrower(tag);
+    let beta = narrow(beta);
+    let threshold = narrow(threshold);
+
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device().clone();
+    let values = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the dtype was checked above"),
+    };
+
+    // `opmath`: `double` for `double`, `float` for everything else this can
+    // hold. The walk carries `f64` because `read_flat` does; the `as f32`
+    // round trip is what makes the reduced-float arms compute where upstream
+    // computes.
+    let out: Vec<f64> = if tag == TorchDType::Float64 {
+        values
+            .iter()
+            .map(|&x| {
+                let y = x * beta;
+                if y > threshold {
+                    x
+                } else {
+                    y.exp().ln_1p() / beta
+                }
+            })
+            .collect()
+    } else {
+        let (beta, threshold) = (beta as f32, threshold as f32);
+        values
+            .iter()
+            .map(|&x| {
+                let x = x as f32;
+                let y = x * beta;
+                let value = if y > threshold { x } else { y.exp().ln_1p() / beta };
+                narrow(value as f64)
+            })
+            .collect()
+    };
+
+    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, tensor, tag)
 }
 
 /// `aten::convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[]
@@ -12147,11 +12418,11 @@ fn masked_fill_inplace(
 /// tensor -- measured `index_put_.default(int64(12,), [int64(12,)],
 /// int64(12,), accumulate=False (default, absent))`.
 ///
-/// **One non-`None` index tensor**, `accumulate=False`. Within that, `self`
+/// **One non-`None` index tensor**, either `accumulate`. Within that, `self`
 /// may have any rank, the index may have any shape, the index may be a
 /// boolean (or `uint8`) mask covering several axes, and `values` broadcasts
 /// against the result the way upstream broadcasts it. A second index tensor
-/// and `accumulate=True` are still refused by name.
+/// is still refused by name.
 ///
 /// The first version delegated to `scatter.src` along dimension 0, which is
 /// exactly right for the one call Mixtral makes and wrong for everything
@@ -12197,7 +12468,23 @@ fn masked_fill_inplace(
 ///   * **Repeated positions: last write wins**, in row-major order over the
 ///     result shape. Same rule the `scatter` version had, re-derived rather
 ///     than inherited.
+///   * **`accumulate=True` adds instead of overwriting**, so a repeated
+///     position gets the *sum* of its contributions rather than the last one
+///     (`zeros(5)` at `[0, 2, 2, 4]` with `[1, 2, 3, 4]` is
+///     `[1, 0, 5, 0, 4]`). Everything else -- the mask lowering, the
+///     broadcast, negative indices, the dtype check, the empty-write
+///     shortcut -- is the same code and the same rules; only the assignment
+///     in the walk differs. Two things about it are *not* the obvious
+///     spelling and were measured rather than assumed:
+///       * the addition runs at the receiver's precision, not at
+///         `read_flat`'s `f64` (see `float_narrower` at the walk); and
+///       * `torch.bool` accumulates as a logical or, because upstream's
+///         `*dst += *src` on a C++ `bool` promotes and converts back.
+///     This is what an embedding's backward wants -- a scatter-add into a
+///     zero buffer -- and docs/BACKWARD.md §4.5 records the one-hot
+///     composition it currently uses instead, at 200 MB for `S=1024`.
 ///
+
 /// The write goes back into the receiver through `write_back`, which puts it
 /// into the buffer the receiver already points at rather than swapping the
 /// wrapper -- so an alias or a view created before the call does see it, as
@@ -12220,11 +12507,6 @@ fn index_put_inplace(
     let items: Vec<Bound<'_, PyAny>> = raw_indices.extract()?;
     let values = tensor_arg(OP, args, kwargs, 2, "values")?;
     let accumulate = bool_arg(args, kwargs, 3, "accumulate")?.unwrap_or(false);
-    if accumulate {
-        return Err(not_implemented(format!(
-            "{OP}: accumulate=True is not implemented in torch._C shim"
-        )));
-    }
 
     let (tag, dims, device) = {
         let borrowed = receiver.borrow();
@@ -12384,6 +12666,23 @@ fn index_put_inplace(
     };
     let source = read_flat(OP, values.tensor()?, tag)?;
 
+    // `accumulate=True` adds where the default overwrites, and the addition
+    // happens **in the receiver's own dtype**, not in the `f64` `read_flat`
+    // hands over. Measured on 2.13.0: 64 accumulations of `bfloat16(0.01)`
+    // into one position give `0.65234375`, which is the `bfloat16` running
+    // sum; accumulating in `f64` and narrowing once at the end gives
+    // `0.640625`. Same argument as `float_narrower`'s own doc comment, and
+    // the same function is used for it.
+    let narrow = float_narrower(tag);
+    // `torch.bool` is the one dtype where `+` is not addition. Upstream's
+    // kernel is `*dst += *src` in C++'s `scalar_t`, so for `bool` the sum
+    // integer-promotes and converts back -- i.e. a logical or, measured:
+    // `zeros(4, bool)` accumulated at `[0, 0, 1]` with `[True, True, True]`
+    // is `[True, True, False, False]`, not a 2 anywhere. Writing `o + s`
+    // here would put a `2` in a `bool` buffer and break the invariant
+    // docs/BOOL.md §6.3 attaches to the tag.
+    let is_bool = tag == TorchDType::Bool;
+
     let mut coord = vec![0usize; result_rank];
     for _ in 0..total {
         let mut dest = 0usize;
@@ -12398,8 +12697,22 @@ fn index_put_inplace(
         }
         dest += offsets[group_flat];
         match (&source, &mut out) {
-            (Flat::Float(s), Flat::Float(o)) => o[dest] = s[src],
-            (Flat::Int(s), Flat::Int(o)) => o[dest] = s[src],
+            (Flat::Float(s), Flat::Float(o)) => {
+                o[dest] = if accumulate { narrow(o[dest] + s[src]) } else { s[src] }
+            }
+            (Flat::Int(s), Flat::Int(o)) => {
+                o[dest] = if !accumulate {
+                    s[src]
+                } else if is_bool {
+                    i64::from(o[dest] != 0 || s[src] != 0)
+                } else {
+                    // `uint8` overflow wraps upstream (`200 + 100 + 100` is
+                    // `144`, measured), and the narrowing to the storage
+                    // width happens in `write_flat`; `wrapping_add` keeps the
+                    // i64 accumulator from panicking on the way there.
+                    o[dest].wrapping_add(s[src])
+                }
+            }
             _ => unreachable!("self and values share a dtype, checked above"),
         }
         for d in (0..result_rank).rev() {

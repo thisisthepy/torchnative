@@ -288,3 +288,77 @@ TOTAL MISSING ACROSS ALL THREE: 0
 - **§5 로짓 대조** — 자동 라우터를 계속 다듬거나, `docs/ARCH.md` §5 가 Gemma/BERT 에 쓴 손-전사
   방식을 falcon/bloom/gpt_bigcode 에도 적용하는 것. 후자가 더 느리지만 이 저장소에서 이미 검증된
   방법이다.
+
+---
+
+## 7. §2.2 의 후속 — 거부의 *이유* 가 틀려 있었다
+
+§6 의 두 번째 항목(`arith_tag` 의 blanket bool 거부를 오버로드별로 나눌 것)에 대해, 그 사이에
+`docs/AUDIT.md` 가 **살아 있는 코드 결함**을 하나 더 찾아 보고만 하고 두었다. 이 절이 그것이다.
+
+§2.2 가 쓰인 뒤 어느 회차에서 거부 메시지가 바뀌어 있었다:
+
+```
+aten.mul.Scalar: torch.bool operands are logical, not arithmetic, in torch
+                 (BOOL.md §2.2) and are not implemented in torch._C shim
+```
+
+**그 문장 자체가 §2.2 의 측정과 모순된다.** `docs/BOOL.md` §2.2 의 표가 잰 것은 bool 텐서 둘의
+`x + x` 였는데, 그 결론이 모든 오버로드에 대한 blanket 메시지로 일반화되면서 `.Scalar` 에 대해
+**사실이 아닌 주장**을 하게 되었다. 이 저장소가 이번 세션에만 다섯 번 겪은 "낡은 거부" 의
+여섯 번째이고, 앞의 다섯이 각각 작업을 잘못된 곳으로 보냈다.
+
+### 7.1 실제로 참인 것 — 12칸 전부 재측정 (torch 2.13.0)
+
+|  | `add` | `sub` | `mul` | `div` |
+|---|---|---|---|---|
+| `.Tensor` | **논리합**, `bool` | **거부** | **논리곱**, `bool` | **산술**, `float32` (`[1.0, nan, 1.0]`) |
+| `.Tensor` in-place | 논리합, `bool` | 거부 | 논리곱, `bool` | 거부 (캐스트 불가) |
+| `.Scalar` | **산술**, `int64` (`[4,3,4]`) | **거부** | **산술**, `int64` | **산술**, `float32` |
+| `.Scalar` in-place | 거부 (캐스트 불가) | 거부 | 거부 | 거부 |
+
+`rsub.Scalar` 는 `Arith::Sub` 로 들어오고, 상류도 같은 문구로 거부한다.
+
+**"logical, not arithmetic" 이 참인 칸은 12칸 중 2칸뿐이다** (`.Tensor` 의 `add` 와 `mul`).
+그리고 같은 doc comment 가 적고 있던 *"`-` and `/` are refused by upstream itself"* 도 절반이
+틀렸다 — `div.Tensor(bool, bool)` 은 상류가 계산한다. 세 칸이 틀린 셈이다.
+
+세 종류의 거부 사유가 있고, 셋 다 서로 다르다:
+
+* **`sub` / `rsub`** — 상류도 거부한다. 이유는 "논리 연산이라서" 가 아니라 bool 뺄셈에 의미가
+  없어서이고, 상류는 그렇게 말한다(`"Subtraction, the `-` operator, with a bool tensor is not
+  supported"`). 즉 **양쪽 다 거부**이며 갭이 아니다.
+* **`.Tensor` 의 `add`** — 상류는 논리합을 계산해 `bool` 을 돌려준다. candle 은 2 를 만들고,
+  2 는 여전히 truthy 이므로 **조용히 틀린다** (docs/BOOL.md §6.3 의 불변식). 여기서만
+  "논리적이다" 가 참이다.
+* **`.Scalar` 전부와 `.Tensor` 의 `div`** — 상류는 **산술로 계산하고 승격한다.** 여기에 없는
+  것은 그 승격이지 논리 연산이 아니다.
+* **in-place + `.Scalar`** — 상류도 거부하지만 네 번째 이유다: 승격된 결과를 bool 수신자에
+  되쓸 수 없다 (`"result type Long can't be cast to the desired output type Bool"`).
+
+### 7.2 고친 것 — 동작이 아니라 메시지
+
+**거부 자체는 하나도 바뀌지 않았고, 전부 여전히 옳다.** 바뀐 것은 각 거부가 대는 이유뿐이다.
+`arith_tag` 는 이제 `(kind, .Scalar 인가, in-place 인가)` 로 네 갈래를 나눠 위 표의 사실을
+말한다. `mul.Tensor` 의 예외는 그대로다 — {0,1} 위의 산술 곱이 곧 논리곱이라는 §2.2 이후의
+논증은 재검증했고 여전히 성립한다.
+
+골든에서 이 칸들이 어떻게 분류되는지도 §8 에서 정리됐다: `add.Scalar(bool, ·)` 는 `c_error`
+(상류는 계산, 샤임은 거부), `sub.Scalar(bool, ·)` 는 `both_error` (양쪽 거부). **한 메시지가
+이 둘 모두에 맞을 수는 없었다**는 것이 이 결함의 요약이다.
+
+### 7.3 다시 낡지 않게 하는 장치
+
+낡은 거부가 여섯 번 반복된 이유는 **거부 사실은 테스트되고 거부 사유는 테스트되지 않기**
+때문이다. `test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason` 은 12칸의
+사유를 문자열로 단언한다 — `.Scalar` 메시지에 `"logical"` 이 다시 나타나면 실패하고,
+`div.Tensor` 메시지가 "상류도 거부한다" 로 돌아가도 실패한다.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason present -->
+<!-- DOCWATCH: op-implemented aten.add.Scalar -->
+<!-- DOCWATCH: op-implemented aten.sub.Scalar -->
+
+§6 의 2.2 항목은 **절반 닫혔다**: 오버로드별로 나뉜 것은 *메시지*이고, `.Scalar` 의 bool 산술을
+실제로 *계산*하는 것은 아직 없다. 그것은 승격 경로를 새로 만드는 일이고, `c_error` 케이스로
+pin 되어 있다. §6 이 함께 요구한 "`add.Tensor`(out-of-place) 도 bool 케이스가 없어서 확인이
+안 됐다" 는 확인은 위 표가 끝냈다 — 상류는 논리합을 계산하고, 샤임은 거부하며, 그것이 갭이다.

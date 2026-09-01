@@ -409,7 +409,7 @@ cannot be what causes it.
 
 | op | disagrees at | with an exactly-representable scalar? | what it looks like |
 |---|---|---|---|
-| `softplus` | every dtype **including `float64`**, with the *default* `beta=1, threshold=20` | yes, 7/7 | the `log1p(exp(x))` formula, computed in the storage dtype where upstream uses `opmath` — `bfloat16 softplus(-3)` is `0.048583984375` upstream and `0.0458984375` here |
+| `softplus` | every dtype **including `float64`**, with the *default* `beta=1, threshold=20` | yes, 7/7 | the `log1p(exp(x))` formula, computed in the storage dtype where upstream uses `opmath` — `bfloat16 softplus(-3)` is `0.048583984375` upstream and `0.0458984375` here. **Closed — §8.1** |
 | `norm.ScalarOpt_dim` | `bfloat16` 8/10, `float16` 8/10, `float32` 1/10 — but **`p=2` agrees exactly in all four dtypes** | yes, 4/7 | the accumulation of `|x|^p`, and `powf` for fractional `p`; the same class as docs/KERNELS26.md §9.3 |
 | `leaky_relu` | one case, and only on the **sign bit of a zero** with a negative slope | yes | `leaky_relu(0.0, -1.5)` — the scalar handling itself is correct |
 
@@ -419,6 +419,10 @@ correctness commit about scalars is exactly the thing docs/TRAIN.md §5 says not
 to do. They are recorded here rather than filed away; `softplus`'s is the larger
 of the two, since it is wrong at `float64` where nothing about reduced precision
 applies.
+
+> **§8 did that separate change.** `softplus` is closed (§8.1); `norm` is
+> re-measured and still open, with the size of it stated (§8.3). `leaky_relu`'s
+> signed zero was not touched.
 
 ---
 
@@ -430,13 +434,14 @@ applies.
   two are pinned as they are measured. Closing it means teaching the resolver
   upstream's "numbers as tensors" rule, which lives above `aten.rs`; the same
   gap `floor_divide.Scalar`'s doc comment already describes for a different op.
-* **The narrowing half of the family has no golden coverage.**
+* ~~**The narrowing half of the family has no golden coverage.**
   `aten.add.Scalar` and `aten.sub.Scalar` are implemented in `aten.rs` but are
   not in `_aten_implemented()`, so `CASE_BUILDERS` has nowhere to hang a builder
   and the only check on them is `test_add_and_sub_scalar_still_narrow_and_did_
   not_follow_mul`. Sabotage F3 is caught by two smoke tests and **zero golden
-  cases**.
-* **`softplus` and `norm`**, per §5.
+  cases**.~~ **Closed — §8.2**, and writing the builder found a defect.
+* **`softplus` and `norm`**, per §5. `softplus` closed — §8.1; `norm` still
+  open — §8.3.
 
 ---
 
@@ -527,9 +532,279 @@ dtype.
 > <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul present -->
 > <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_pow_narrows_its_scalar_where_mul_widens_it present -->
 >
-> §6's first bullet says `aten.add.Scalar` and `aten.sub.Scalar` are implemented
-> in `aten.rs` but absent from `_aten_implemented()`, which is why golden has no
-> builder for them. That is checkable both ways, and both halves are asserted so
-> the bullet cannot go stale in either direction:
-> <!-- DOCWATCH: op-not-implemented aten.add.Scalar -->
-> <!-- DOCWATCH: op-not-implemented aten.sub.Scalar -->
+> §6's second bullet said `aten.add.Scalar` and `aten.sub.Scalar` were
+> implemented in `aten.rs` but absent from `_aten_implemented()`, which is why
+> golden had no builder for them. **§8 closed it.** The markers are inverted
+> rather than deleted, so that the closure cannot silently come undone:
+> <!-- DOCWATCH: op-implemented aten.add.Scalar -->
+> <!-- DOCWATCH: op-implemented aten.sub.Scalar -->
+> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py _add_sub_scalar_cases present -->
+
+---
+
+## 8. §5 and §6, closed as their own round
+
+§5 and §6 both end with the same sentence in different words: *this is a change
+about where a kernel accumulates, it has its own digest question, and folding it
+into a scalar-rule commit would make a digest move look like a regression.* This
+section is that separate round. **All nine prefill digests are unchanged** (§8.5),
+which is the control the whole deferral was for.
+
+### 8.1 `softplus` — three defects, not one
+
+§5 called it "the `log1p(exp(x))` formula, computed in the storage dtype". The
+first half of that was generous: the kernel was not computing `log1p(exp(x))` at
+all.
+
+Upstream's `softplus_kernel` is one expression:
+
+```cpp
+(a * beta) > threshold ? a : std::log1p(std::exp(a * beta)) / beta
+```
+
+The kernel here computed `max(y,0) + log(1 + exp(-|y|))` in candle tensor ops.
+Three separate things are wrong with that, and each was measured on 2.13.0:
+
+| | what | evidence |
+|---|---|---|
+| 1 | **the rewrite is not the same function in floating point** | upstream agrees with `math.log1p(math.exp(x))` on 10 of 10 `float64` probes and with the split on 6 |
+| 2 | **and not the same function at all at the edges** | with a threshold that does not fire, upstream's `exp` overflows: `softplus(800.0, 1, 1e9)` is `inf` upstream and was `800.0` here. **No tolerance is involved in that difference** |
+| 3 | **it ran in the storage dtype where upstream runs in `opmath`** | `c10::BFloat16`'s operators promote to `float`, so the whole expression is `float32` and narrowed once. `bfloat16 softplus(-3)` was `0.0458984375` against upstream's `0.048583984375` — a 6% error |
+
+The kernel is now a scalar walk: `beta` and `threshold` narrowed to the
+tensor's dtype (`beta_.to<scalar_t>()`), then `log1p(exp(y))/beta` at `f64` for
+`float64` and at `f32` for everything else, then one narrowing.
+
+**Agreement after**: over 88 measured rows — four dtypes × main values, edge
+values (`±inf`, `NaN`, `±0.0`, `1e30`, `710`), and `beta`/`threshold` variants
+including `beta=0`, `beta=-1`, `threshold=1e9`, `threshold=-1` — **87 are
+bit-identical and one is not.**
+
+The one is `float32`, and it is **upstream's own irreproducibility**, not a
+defect here. `cpu_kernel_vec` runs a Sleef-vectorised body over full blocks and
+a scalar tail over the rest, and they disagree:
+
+```
+softplus(-3.0), float32:   n < 8   0x1.8e070e0p-5      (the scalar path)
+                           n >= 8  0x1.8e07100p-5      (Sleef)
+      measured at n = 1, 2, 3, 4, 7, 8, 16, 17, 32, 64, 100
+```
+
+This kernel is a scalar walk, so it answers the scalar path at every length. At
+`n < 8` it is bit-identical to upstream; at `n >= 8` it differs by one ULP on
+that one input and on nothing else. The same class docs/LOSS.md §5.4 records for
+`_log_softmax`, and the golden cases hold the size of it rather than its
+absence.
+
+`float64`, `float16` and `bfloat16` are stable across length and are pinned
+bit-exactly.
+
+**Cases**: 15 before, all of which passed both kernels; 16 more, for 31. The old ones
+could not fail for two reasons and the new ones fix both — their inputs
+(`[-5,-1,0,1,5]`) are where the two formulas agree to the last bit, and their
+comparator was the per-dtype tolerance, which at `bfloat16` is `6e-2` against an
+effect of 0.0027. Nine of the new cases use `_bit_exact`.
+
+### 8.2 `add.Scalar` / `sub.Scalar` — promoted, and the builder found a defect
+
+§6's second bullet: both ops had a kernel, neither was in `_aten_implemented()`,
+so `CASE_BUILDERS` had nowhere to hang a builder and sabotage F3 — *the
+narrowing half of the family widens instead* — was caught by two smoke tests and
+**zero** golden cases. Both are promoted, `IMPLEMENTED_AWAITING_GOLDEN` is down
+to seven entries, and there are now 84 cases across the two keys — 42 each. **F3
+fails 7 of them.**
+
+Writing the builder found something no case had been in a position to see:
+**nothing had ever passed either op a non-unit `alpha`.**
+
+`alpha` is narrowed to the tensor's dtype **separately from `other`**, and their
+product is narrowed again — it is not `narrow(other * alpha)`. Measured over 300
+random `(other, alpha)` pairs:
+
+| model | `bfloat16` | `float16` |
+|---|---:|---:|
+| `narrow(narrow(other) * narrow(alpha))` | **300/300** | **400/400** |
+| `narrow(other * alpha)` — what this shim did | 202/300 | 260/400 |
+
+`bfloat16([0.0]) + 0.3` with `alpha=0.3` is `0x1.72p-4` upstream and was
+`0x1.70p-4`. Fixed; the differential over 150 random pairs × 7 values goes:
+
+| | before | after |
+|---|---:|---:|
+| `bfloat16` | 53/150 rows | **0/150** |
+| `float16` | 56/150 rows | **0/150** |
+| `float32` | 132/150 (add) / 126/150 (sub) | 120/150 / 111/150 |
+| `float64` | 106/150 / 105/150 | unchanged |
+
+`alpha = 1` is unaffected at every dtype, which is why no digest moves:
+`narrow(1.0)` is `1.0` and `narrow(narrow(o) * 1.0)` is `narrow(o)`.
+
+**What the `float32`/`float64` residual is, and why it is left.** Upstream's
+`self + alpha * other` is compiled to a **fused multiply-add** on this host. At
+`float64`, `fma(alpha, other, self)` reproduces upstream on **1050/1050**
+elements over 150 random pairs; the unfused expression on 862/1050. That is a
+property of how the wheel was compiled (`-ffp-contract`), like §8.1's Sleef tail.
+
+Its size is worth stating precisely because one number is uncomfortable:
+
+| | worst ULP distance | worst **relative** error |
+|---|---:|---:|
+| `float64` | 310 | 5.5e-14 |
+| `float32` | 333 | **3.2e-05** |
+
+Both worst cases are the same cancellation: `7.0 + 2.430806… × 2.881715…` is
+`-0.00489`, four decades below its operands, so a last-bit disagreement in the
+product is a 3e-5 disagreement in the sum. **3.2e-05 is larger than
+`dtypes.py`'s `float32` rtol of 1e-5**, which is the same shape docs/LOSS.md
+§5.4 records — so there is deliberately no `float32` case at those operands, and
+the `float64` case *is* at them, where the same cancellation is inside 1e-9.
+
+Closing it needs a per-element walk using `mul_add`, applied at
+`float32`/`float64` **only** — the reduced floats are exact *without* it,
+because their product is narrowed before the add, so an unconditional FMA would
+break them. That is a dtype-conditional rewrite rather than a line, and it is
+left rather than half-done.
+
+### 8.3 `norm.ScalarOpt_dim` — 29 of 120 rows became 1
+
+§5 measured this as `bfloat16` 8/10, `float16` 8/10, `float32` 1/10, with `p=2`
+exact everywhere. Re-measured before the change over a random 3×4 at ten `p`
+values, three `dim` lists and four dtypes: **29 of 120 rows disagreed.**
+
+Upstream's `norm_kernel_tensor_iterator_impl` dispatches
+`norm_kernel_cpu_impl<scalar_t, acc_t>` with **`acc_t = float` for `Half` and
+`BFloat16`** and `acc_t = scalar_t` otherwise, so the running `|x|^p` is kept in
+`float` for the reduced dtypes and narrowed once. Reducing with candle keeps
+every partial sum in the storage dtype.
+
+The kernel is now a walk in `acc_t`, with each of upstream's six reduction ops
+transcribed rather than expressed through another:
+
+```text
+  p = 0      acc + (data == 0 ? 0 : 1)      project acc
+  p = 1      acc + |data|                   project acc
+  p = 2      acc + data*data                project sqrt(acc)
+  p = +inf   max(acc, |data|)               project acc
+  p = -inf   min(acc, |data|)               project acc
+  otherwise  acc + pow(|data|, p)           project pow(acc, 1/p)
+```
+
+**After: 1 of 120.** The residual is `float64`, `p = 2`, four-wide rows, one
+ULP — and it is **the same residual the previous kernel had**, neither
+introduced nor closed here. Upstream's `p = 2` arm sums **pairwise**: on
+`[0.779296, 1.757861, -2.435259, -1.179592]`, `sqrt((a²+b²)+(c²+d²))` is
+upstream's `0x1.a8e67779e8296p+1` and the serial sum is `…97p+1`. Matching it
+means reproducing `binary_kernel_reduce_vec`'s lane count and unrolling, which
+is again a compile-time property rather than an operator property. Not
+attempted; cased and watched.
+
+**Cases**: 120 new bit-exact ones across four dtypes × ten `p` × three `dim`
+lists, plus the watched `p=2` residual, for 536. The 415 existing cases could not
+see any of this — their data is `[3, -4, 0, 1, -1, 2]`, integers whose every partial sum
+of squares and absolute values is exact in all four dtypes.
+
+### 8.4 Sabotage — including three faults that cannot fail
+
+Each fault injected into `aten.rs`, rebuilt, and counted. Never read from a
+green run.
+
+| fault | golden | smoke |
+|---|---:|---:|
+| **S7** softplus: the whole previous kernel — split, `log(1+x)`, storage dtype | **9** | 0 |
+| S1 softplus: the stable split instead of `log1p(exp(y))` | 4 | 0 |
+| S2 softplus: `log(1 + x)` instead of `log1p(x)` | 5 | 0 |
+| S3 softplus: computed in `f64` for every dtype — *wider* than `opmath` | 2 | 0 |
+| S4 softplus: `beta`/`threshold` not narrowed to the tensor dtype first | **0** | 0 |
+| S5 softplus: every interior step narrowed to the storage dtype, `log1p` kept | **0** | 0 |
+| N1 norm: accumulate in the storage dtype — §5's recorded defect | **14** | 0 |
+| N2 norm: `pow` at `f64` instead of `powf` at `acc_t` | **0** | 0 |
+| N3 norm: `p = 2` via `powf(2)`/`powf(0.5)` instead of square/`sqrt` | **0** | 0 |
+| A1 add/sub: `narrow(other * alpha)` instead of narrowing each | 4 | 0 |
+| A2 add/sub: widen the scalar instead of narrowing — **this is F3** | **7** | 2 |
+| B1 bool: revert to the single blanket refusal message (§8.6) | 0 | 1 |
+
+**S7 is the one that matters**: it is the kernel this section replaced, and the
+new cases fail on it with exactly the reported numbers — `bfloat16` `0.0458984375`
+against upstream's `0.048583984375`. The case set would have caught the defect
+docs/SCALAR.md §5 had to find with a separate differential.
+
+**A2 is the discharge of §6's second bullet.** F3 previously failed two smoke
+tests and no golden case; it now fails seven, at `bfloat16` and `float16`, on
+both keys.
+
+**Three faults could not fail, and each is a real statement rather than a gap
+to fill.**
+
+* **S4 and S5 — the reduced floats hide interior precision.** Narrowing the
+  result to 8 or 11 mantissa bits absorbs almost any change in how the interior
+  steps round, provided the *formula* is right. S5 narrows every step of
+  `log1p(exp(y))/beta` to `bfloat16` and the answer does not move, because
+  `log1p` never forms the `1 + tiny` sum that the old kernel's rounding
+  destroyed. What separated the old kernel at `bfloat16` was the **formula**
+  (S1, S2, S7), not the precision on its own. S4 is a further step: narrowing
+  `beta` to `bfloat16` before use is genuinely a different computation
+  (`bf16(0.1)` is `0.10009765625`, `0.1f32` is `0.1`) and a 100-point search
+  over `(beta, x)` found **no separating pair at `bfloat16` or `float16`**. It
+  is observable at `float32` — and there the explicit narrowing is redundant
+  with the `as f32` in the walk, so removing the line changes nothing. The line
+  is kept because it is upstream's spelling, and it is recorded here that
+  nothing can fail on it.
+* **N2 and N3 — `powf` versus `pow`, and `pow(·,2)` versus squaring.** Both are
+  correct-rounding questions that the six chosen values do not separate:
+  `powf(x, 2)` is exact squaring and `powf(x, 0.5)` agrees with `sqrt` on them.
+  The arms are still written as upstream writes them, because a value that
+  *does* separate them exists in general even though these do not.
+
+The honest summary of both groups: **at `bfloat16` and `float16` this suite
+separates which function a kernel computes, and does not separate at what
+precision it computes the interior of that function.** The precision half is
+separated at `float32` and `float64`, where nothing absorbs it.
+
+### 8.5 The digests, which is what the deferral was for
+
+Re-measured on the final artefact, at every length docs/SEQLEN.md §1.3 and
+docs/TRAIN.md §6 record:
+
+| S | `float32` | | `bfloat16` | |
+|---:|---|:--:|---|:--:|
+| 6 | `b9fc5553ee1bf6a2…` | ✅ | `8ef1550ea33c4f3d…` | ✅ |
+| 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
+| 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
+| 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
+| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+
+**None moved, and the reason is checkable rather than lucky.** A
+`TorchDispatchMode` over this prefill (docs/SCALAR.md §4.2's log) shows the
+forward calls `add.Tensor`, `mul.Tensor`, `pow.Tensor_Scalar` and SDPA — it
+calls neither `softplus` (mamba's) nor `norm.ScalarOpt_dim` (`weight_norm`'s, at
+construction), and every `add` it makes has the default `alpha = 1`, which is
+exactly the value §8.2's fix leaves alone.
+
+### 8.6 The refusal message §5 did not look at
+
+While measuring `add.Scalar(bool, ·)` for §8.2's builder, the bool row came back
+`[4, 3, 4]` — upstream **computes** — and `sub.Scalar(bool, ·)` came back a
+refusal. One `arith_tag` message was serving both, and it said
+*"torch.bool operands are logical, not arithmetic, in torch"*, which is true of
+neither. docs/TAIL.md §7 has the twelve-cell re-measurement and the fix; the
+refusals are unchanged and only their stated reasons moved.
+
+### 8.7 Gates
+
+| gate | before this section | after |
+|---|---|---|
+| `pytests/run.sh` | 302 ok, DOCWATCH 159/159 | **304 ok, DOCWATCH 164/164** |
+| `tools/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168** |
+| `compare.py --self-test` | 19 × 11, 0 problems | unchanged |
+| `verify_schemas.py` | 4475/4475 | **4479/4479** |
+| sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
+| prefill digests | 9 recorded | **all 9 unchanged** |
+
+`ops` moves 166 → 168 because `add.Scalar` and `sub.Scalar` are now advertised;
+`verify_schemas` moves 4475 → 4479 for the same reason.
+
+The "after" column is the whole session's, not this section's alone: two other
+rounds landed against the same tree — `index_put_(accumulate=True)`
+(docs/VIEWS.md §7, +16 cases and +1 test) and the watched real-width
+`_log_softmax` divergence (docs/LOSS.md §5.4.1, +1 case and a new comparator).
+This section's own contribution is +237 cases and +1 test.
