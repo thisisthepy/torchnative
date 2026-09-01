@@ -182,3 +182,26 @@ Skimmed in full (445 lines), read §4 and §6 closely.
   still open is really a question for docs/BIND.md, which a separate agent in this session is
   auditing in parallel — not re-checked here to avoid duplicate work.
 
+
+---
+
+## Correction to this round's own record
+
+The commit that landed the first five files (`a1ff688`) says "two corrections landed". **Five
+documents were corrected, not two** — ARCH20.md and DISPATCH.md by the first agent, and META.md,
+SEQLEN.md and BIND.md by a sub-agent it had spawned, whose report arrived after the merge. The
+commit's own `--stat` shows all five.
+
+The mistake was in how I looked, not in what happened: I read `git status --short | head` and the
+listing was truncated. Piping a status through `head` is the same shape of error as reading an exit
+code through a pipe, which this repository already has a rule about.
+
+Two further checks, since the sub-agent's three fixes arrived unverified:
+
+- `torch.amax` and `Tensor.amax` both resolve and compute — SEQLEN.md §7.10's "they refuse by name"
+  was indeed stale.
+- META.md §12's `m.to('cpu')` claim holds. My first attempt to check it appeared to show the shim
+  computing where upstream raises, which would have been silent divergence and the worst class of
+  finding here. It was my harness: I had called `to_empty(device='cpu')` on the same module first,
+  which materialises the parameters, so the later `.to('cpu')` had nothing to copy out of meta. On a
+  fresh module both sides raise `NotImplementedError` with the identical message.
