@@ -582,6 +582,22 @@ twenty-five entries without twenty-five cases would raise a count without adding
 capability, which is the failure mode the last round of this repository was told to stop
 repeating. It is a well-defined next round: the list above is the whole of it.
 
+> **Correction (docs/SPELLINGS.md §5–§7): this "next round" already happened, and `gelu`/`silu`/
+> `softplus` were never in the gap it closed.** 22 of the 25 names above now have an
+> `overloads.json`/`methods.json` entry with a golden case (`rust/torch_c/src/overloads.json`'s
+> own comment: *"docs/ARCH20.md §9's 25-name inventory ... 22 got a `torch.<name>` entry here, 3
+> did not"*). `reshape` is the one exception still pending promotion in `aten.rs` itself
+> (`tools/golden/compare.py` reports it as the sole `PENDING` case builder, not yet in
+> `_aten_implemented()` — docs/SPELLINGS.md §7.3), not a missing table entry.
+>
+> The three left out — `gelu`, `silu`, `softplus` — were never "a real gap" by this section's own
+> definition, and listing them in the same bucket as `abs`/`clamp`/etc. is what made them look
+> like one: measured against torch 2.13.0, `hasattr(torch, "gelu")` is `False` (same for `silu`,
+> `softplus`), so there is no bare `torch.<name>` upstream to reach — only
+> `torch.nn.functional.<name>`/`torch._C._nn.<name>`, both of which this shim already answers via
+> `bootstrap.py`'s `_install_nn`. Adding a `torch.gelu` entry would invent a spelling upstream
+> itself does not have. See docs/SPELLINGS.md §7.1 for the per-name measurement.
+
 ---
 
 ## 10. `gpt_bigcode` — confirmed out of scope, and left

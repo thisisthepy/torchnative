@@ -1035,6 +1035,14 @@ alarm in §9.6 was found and corrected.
 §9.2 above is the missing "which op it's from" -- but that file is likewise
 outside this round's territory.
 
+> **Correction (문서 감사, 재확인):** `test_decompose_refuses_by_name_what_it_cannot_lower`
+> no longer fails. It was updated in a later round to drop `aten.baddbmm.default` from wall
+> 3's expected disagreements (a new test,
+> `test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton`, pins the fixed
+> behaviour instead), exactly along the lines this section anticipated. The "smoke exactly
+> 211" / "210 ok, 1 failed" state described above is this round's own landing number, not the
+> current one -- the full suite passes today (268 ok, 0 fail, confirmed via `run.sh`).
+
 ### 9.6 A measurement-hygiene miss, caught before it was reported as real
 
 The first pass at golden/schemas after this fix read 2784/2843 and a hard

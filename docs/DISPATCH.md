@@ -324,6 +324,17 @@ standing gap — a future change to argument *binding*, as opposed to argument
 *arithmetic*, can be green on 2811 cases and still be broken. The cheap fix
 would be a handful of case builders that pass their arguments by keyword.
 
+> **Update (docs/GOLDEN.md): the cheap fix above was taken, and the gap is
+> mostly closed, not standing.** docs/GOLDEN.md added 32 keyword-argument
+> cases; 61 of `interned_name()`'s 74 arms are now exercised by keyword by at
+> least one golden case, verified by re-running this same tamper (a different
+> arm, `"dim"`) and watching `compare.py` turn red. 13 arms remain uncovered
+> (docs/GOLDEN.md §4) — 12 because no implemented op reads them yet, one
+> (`generator`) left uncovered on purpose because no case can observe that
+> particular tamper. Read docs/GOLDEN.md before treating "the golden harness
+> is blind to this code path" as still true of the whole path — it is no
+> longer true of most of it.
+
 (Restored from a `cp` backup, not `git checkout`; the source md5 matched the
 pre-tamper file and all three gates returned to 197 / 2811 / 4203 afterwards.)
 

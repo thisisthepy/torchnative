@@ -820,6 +820,15 @@ llama3-rope from_pretrained + generate                            EXIT=0
 - **`m.to("cpu")` (meta 모듈을 CPU 로) 와 `m.to_empty(device=...)`.** 둘 다 `empty_like` 에
   걸리는데, 그것은 오버로드 테이블에 항목이 없습니다 — **meta 와 무관한 기존 구멍**이고
   `zeros_like`·`ones_like` 와 같은 갈래입니다(DEVICE_ABS §9 가 `ones_like` 로 이미 기록).
+
+  > **Correction (문서 감사, 재측정):** `empty_like` 는 이제 `overloads.json` 에 항목이
+  > 있습니다 — `zeros_like`·`ones_like` 도 마찬가지입니다. `m.to_empty(device="cpu")` 는
+  > 지금 실제로 동작합니다(재측정 확인). `m.to("cpu")` 는 여전히 거부되지만 이유가
+  > 다릅니다 — 오버로드 누락이 아니라 `NotImplementedError: Cannot copy out of meta
+  > tensor; no data! Please use torch.nn.Module.to_empty() instead ...`, 그리고 상류도
+  > **동일한 문면**으로 거부합니다(재측정 확인). 즉 이 갈래는 "구멍"이 아니라 상류와 일치하는
+  > 의도된 거부이고, 남은 것은 `m.to_empty` 가 아니라 `m.to("cpu")` 자체가 상류처럼
+  > 영구히 거부되어야 한다는 것뿐입니다.
 - **`torch.save(meta_tensor)`.** `PyTorchFileWriter.write_end_of_file` 에서 막힙니다 — 기존 구멍.
 - **`torch.device.__enter__` 를 독립 `_C` 에서 부르면 `ImportError`.** 벤더 트리가 없으면
   `torch.utils._device` 도 없습니다. 상류도 같은 자리에서 같은 이유로 실패합니다.

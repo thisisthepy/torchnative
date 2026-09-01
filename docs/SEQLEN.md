@@ -912,6 +912,13 @@ methods.json     "amax": same signature, receiver as self
 
 Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 
+> **TAKEN, in docs/TRIL.md §2.** Both entries landed in `src/overloads.json` and
+> `src/methods.json`; `torch.amax` and `Tensor.amax` now resolve and reach this kernel
+> (reverified directly: `torch.amax(t, dim=1)` and `t.amax(dim=1)` both return the kernel's
+> answer). `test_amax_has_no_python_spelling_yet_and_says_so_by_name` failed on the first run
+> after the entries went in, exactly as designed, and was replaced by
+> `test_amax_now_has_both_python_spellings_and_they_reach_the_kernel`.
+
 ### 7.11 Counts
 
 | gate | before | after |
