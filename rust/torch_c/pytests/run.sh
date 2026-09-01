@@ -12,7 +12,18 @@ set -eu
 crate_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 repo_root=$(CDPATH='' cd -- "$crate_dir/../.." && pwd)
 target_dir=${CARGO_TARGET_DIR:-$crate_dir/target}
-stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage}
+# Per-checkout, not per-machine. The default used to be a single
+# $TMPDIR/torch-c-stage shared by every worktree on the box, and this project
+# runs several concurrently: two suites overlapping would stage into the same
+# path and each would validate the other's artefact. It was caught by the
+# documentation checker reporting ops=168 while compare.py in the same tree
+# reported 166 -- a disagreement only possible if the two were reading
+# different binaries. That is the false-green shape, and a suite that can
+# silently check somebody else's build is worse than one that refuses.
+#
+# The hash is of the checkout path, so each worktree gets its own and reruns
+# in the same worktree still reuse theirs.
+stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage-$(printf '%s' "$repo_root" | cksum | cut -d' ' -f1)}
 
 # `cd` rather than `--manifest-path`: cargo discovers `.cargo/config.toml` from
 # the *working directory*, not from the manifest. Building this crate from
