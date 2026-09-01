@@ -14557,6 +14557,474 @@ def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
     x.grad = g
     assert _C._aten_dispatch("aten.clone.default", x).grad is None
 
+# --- test-time adaptation through the vendored tree (docs/ADAPT.md) --------
+#
+# `torchnative.adapt` is a Python layer over the capture/tape pair, so what it
+# has to be held down against is not `_C` but *upstream autograd*: the same
+# recipe, the same weights, `loss.backward()` instead of a reverse walk. That
+# needs both torches in the same test, so this uses the two-interpreter shape
+# the checkpoint, device, meta, capture and distributed roads above use -- the
+# subprocess gets the vendored tree, this process keeps upstream.
+#
+# The model is built from a deterministic generator on both sides rather than
+# from an RNG, for the reason `_ckpt_det` gives: what is compared must not
+# depend on which implementation's RNG ran. It is a *RMSNorm* model on purpose;
+# docs/ADAPT.md §8 records that an `nn.LayerNorm` one cannot take a step here
+# at all, and `test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule`
+# is where that is pinned.
+
+_ADAPT_MODEL_SRC = r'''
+V, H, LR, STEPS = 24, 12, 4.0, 10
+IDS = [[3, 7, 1, 19, 5]]
+
+def _adet(n, seed):
+    return [((seed * 1103515245 + i * 12345) % 2000 - 1000) / 4000.0 for i in range(n)]
+
+class RMSNorm(nn.Module):
+    """Shaped like a transformer's, so that the ops on the gradient path are
+    mean.dim / rsqrt / mul rather than aten.native_layer_norm.default."""
+    def __init__(self, d):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        v = x.pow(2).mean(-1, keepdim=True)
+        return self.weight * (x * torch.rsqrt(v + 1e-6))
+
+class TinyLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(V, H)
+        self.norm1 = RMSNorm(H)
+        self.fc = nn.Linear(H, H)
+        self.norm2 = RMSNorm(H)
+        self.head = nn.Linear(H, V, bias=False)
+    def forward(self, input_ids):
+        h = self.embed(input_ids)
+        h = self.norm1(h)
+        h = torch.relu(self.fc(h))
+        h = self.norm2(h)
+        return self.head(h)
+
+def build():
+    m = TinyLM()
+    with torch.no_grad():
+        m.embed.weight.copy_(torch.tensor(_adet(V * H, 3)).reshape(V, H))
+        m.fc.weight.copy_(torch.tensor(_adet(H * H, 5)).reshape(H, H))
+        m.fc.bias.copy_(torch.tensor(_adet(H, 7)))
+        m.head.weight.copy_(torch.tensor(_adet(V * H, 11)).reshape(V, H))
+        m.norm1.weight.copy_(torch.tensor([1.0 + v for v in _adet(H, 13)]))
+        m.norm2.weight.copy_(torch.tensor([1.0 + v for v in _adet(H, 17)]))
+    return m.eval()
+
+def entropy_of(logits):
+    p = torch.softmax(logits, dim=-1)
+    lp = torch.log_softmax(logits, dim=-1)
+    return -(p * lp).sum(-1).mean()
+'''
+
+_ADAPT_ROAD_SCRIPT = (
+    "import json, sys, traceback\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+from torchnative import adapt
+from torchnative.delta import Delta
+
+out = {}
+ids = torch.tensor(IDS)
+
+# --- the offline wrapper is the model it wraps ---------------------------
+m = build()
+w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
+out["offline_forward"] = w(ids).reshape(-1).tolist()
+out["unwrapped_forward"] = m(ids).reshape(-1).tolist()
+out["selected"] = adapt.Tent().select(m)
+
+# --- Tent ----------------------------------------------------------------
+w.online()
+out["base"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
+out["history"] = [w.step(ids)[1] for _ in range(STEPS)]
+out["final_entropy"] = float(entropy_of(m(ids)).item())
+out["adapted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
+out["delta_value"] = {n: w.adapted.value[n].tolist() for n in out["selected"]}
+out["nbytes"] = list(w.adapted.nbytes)
+out["covers"] = list(w.adapted.covers)
+
+# --- lifetime: applied, kept, reverted -----------------------------------
+w.revert()
+out["reverted"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
+out["all_after_revert"] = {n: p.tolist() for n, p in sorted(m.named_parameters())}
+w.adapted.apply(m)
+out["reapplied"] = {n: m.state_dict()[n].tolist() for n in out["selected"]}
+w.revert()
+
+# Arming twice must not re-snapshot the base. A second snapshot would make the
+# base whatever the first round of adaptation left behind, and then revert()
+# would restore an adapted model and report success.
+m2 = build()
+w2 = adapt.wrap(m2, method=adapt.Tent(), lr=LR)
+out["rearm_base"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
+w2.online(); w2.step(ids); w2.online(); w2.step(ids)
+out["rearm_adapted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
+w2.revert()
+out["rearm_reverted"] = {n: m2.state_dict()[n].tolist() for n in out["selected"]}
+
+# --- controls -------------------------------------------------------------
+class AntiTent(adapt.Tent):
+    def objective(self, outputs):
+        return -super().objective(outputs)
+
+class DetachedTent(adapt.Tent):
+    def objective(self, outputs):
+        return super().objective(outputs.detach())
+
+wa = adapt.wrap(build(), method=AntiTent(), lr=LR).online()
+out["anti_history"] = [-wa.step(ids)[1] for _ in range(STEPS)]
+
+w0 = adapt.wrap(build(), method=adapt.Tent(), lr=0.0).online()
+out["lr0_history"] = [w0.step(ids)[1] for _ in range(4)]
+out["lr0_delta_norm"] = w0.adapted.norm()
+
+wd = adapt.wrap(build(), method=DetachedTent(), lr=LR).online()
+try:
+    wd.step(ids)
+except Exception as e:
+    out["detached"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["detached"] = "ACCEPTED"
+
+# A method that selects nothing must refuse rather than run vacuously.
+class SelectsNothing(adapt.Tent):
+    def select(self, model):
+        return []
+try:
+    adapt.wrap(build(), method=SelectsNothing(), lr=LR).online()
+except Exception as e:
+    out["selects_nothing"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["selects_nothing"] = "ACCEPTED"
+
+# --- what the tape cannot carry ------------------------------------------
+class LNLM(TinyLM):
+    def __init__(self):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(H)
+        self.norm2 = nn.LayerNorm(H)
+wl = adapt.wrap(LNLM().eval(), method=adapt.Tent(), lr=LR).online()
+out["layernorm_selected"] = list(wl.online_parameters)
+try:
+    wl.step(ids)
+except NotImplementedError as e:
+    out["layernorm"] = str(e)
+except Exception as e:
+    out["layernorm"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["layernorm"] = "ACCEPTED"
+
+# --- the two destinations a delta cannot reach ---------------------------
+d = Delta.over(build(), ["norm1.weight"])
+for name in ("persist", "publish"):
+    try:
+        getattr(d, name)(*(("/tmp/nowhere",) if name == "persist" else ()))
+    except NotImplementedError as e:
+        out[name] = str(e)
+    else:
+        out[name] = "ACCEPTED"
+
+# --- stage declarations ---------------------------------------------------
+class Stage0(adapt.Method):
+    stage = adapt.STAGE_FORWARD_ONLY
+    def select(self, model): return ["norm1.weight"]
+    def objective(self, outputs): return outputs.sum()
+
+class Stage2(Stage0):
+    stage = adapt.STAGE_FULL_AUTOGRAD
+
+class NoStage(Stage0):
+    stage = None
+
+for name, cls in (("stage0", Stage0), ("stage2", Stage2), ("nostage", NoStage)):
+    try:
+        adapt.wrap(build(), method=cls(), lr=LR)
+    except Exception as e:
+        out[name] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[name] = "ACCEPTED"
+
+json.dump(out, sys.stdout)
+'''
+)
+
+
+@functools.cache
+def _adapt_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _ADAPT_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"adapt-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+@functools.cache
+def _adapt_upstream_tent():
+    """The same ten Tent steps, on upstream torch, with upstream's autograd.
+
+    This is the oracle. It shares the model source with the subprocess (the
+    same `_ADAPT_MODEL_SRC` string is executed on both sides) and shares no
+    implementation of the step: `loss.backward()` here, a reverse walk of a
+    captured region there.
+    """
+    torch = _upstream_torch
+    ns = {"torch": torch, "nn": torch.nn}
+    exec(_ADAPT_MODEL_SRC, ns)
+    m = ns["build"]()
+    ids = torch.tensor(ns["IDS"])
+    names = ["norm1.weight", "norm2.weight"]
+    params = dict(m.named_parameters())
+    for p in m.parameters():
+        p.requires_grad_(False)
+    for n in names:
+        params[n].requires_grad_(True)
+    base = {n: params[n].detach().clone().tolist() for n in names}
+    opt = torch.optim.SGD([params[n] for n in names], lr=ns["LR"])
+    history = []
+    for _ in range(ns["STEPS"]):
+        e = ns["entropy_of"](m(ids))
+        history.append(float(e.item()))
+        opt.zero_grad(set_to_none=True)
+        e.backward()
+        opt.step()
+    with torch.no_grad():
+        final = float(ns["entropy_of"](m(ids)).item())
+    return {
+        "base": base,
+        "history": history,
+        "final_entropy": final,
+        "adapted": {n: params[n].detach().clone().tolist() for n in names},
+    }
+
+
+def _adapt_flat(v):
+    if isinstance(v, list):
+        out = []
+        for e in v:
+            out.extend(_adapt_flat(e))
+        return out
+    return [v]
+
+
+def test_tent_reduces_prediction_entropy_and_upstream_agrees():
+    """The measurement docs/ADAPT.md §3 makes on SmolLM2, in miniature.
+
+    Three assertions, and the third is the one that could not be faked by an
+    implementation that merely ran:
+
+      * entropy falls at every step -- a loop that completed proves nothing,
+      * it falls by a lot, so a rounding-sized drift cannot pass,
+      * and the *weights* land where upstream's autograd puts them, which no
+        amount of descending the wrong thing would do.
+    """
+    if not _ckpt_shim_available():
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    r = _adapt_road_fixture()
+    up = _adapt_upstream_tent()
+
+    hist = r["history"]
+    assert len(hist) == 10, hist
+    assert all(b < a for a, b in zip(hist, hist[1:])), hist
+    assert r["final_entropy"] < hist[-1], (hist[-1], r["final_entropy"])
+    # A real drop, not a drift. Measured 29.5%; the bound is half that, and it
+    # is five orders of magnitude above the 4.8e-07 the comparison below
+    # tolerates -- a tolerance-sized change could not clear it.
+    assert hist[0] - r["final_entropy"] > 0.15 * hist[0], hist
+
+    # Measured max |d| over the eleven values: 4.8e-07, one float32 ULP at this
+    # magnitude. The bound is 20x that rather than something round.
+    for i, (u, s) in enumerate(zip(up["history"], hist)):
+        assert abs(u - s) < 1e-5, (i, u, s)
+    assert abs(up["final_entropy"] - r["final_entropy"]) < 1e-5, (
+        up["final_entropy"], r["final_entropy"])
+
+    assert r["selected"] == ["norm1.weight", "norm2.weight"], r["selected"]
+    for n in r["selected"]:
+        u = _adapt_flat(up["adapted"][n])
+        s = _adapt_flat(r["adapted"][n])
+        assert len(u) == len(s) and len(u) == 12, (n, len(u), len(s))
+        for i, (a, b) in enumerate(zip(u, s)):
+            assert abs(a - b) < 1e-5, (n, i, a, b)   # measured worst 6.0e-07
+        # and they moved by far more than that tolerance, so agreeing with
+        # upstream is not agreeing that nothing happened
+        moved = max(abs(a - b) for a, b in zip(s, _adapt_flat(r["base"][n])))
+        assert moved > 0.01, (n, moved)
+
+
+def test_the_wrong_sign_and_a_zero_step_do_not_reduce_entropy():
+    """The two controls that separate "it adapted" from "something moved".
+
+    Wrong sign is the direction control: the same code with the objective
+    negated must send entropy *up*, or the fall above was not the gradient's
+    doing. `lr=0` is the determinism control: identical to the last bit at
+    every step, so the fall is the update and not capture, replay or a cache
+    answering differently on the second call.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+
+    anti = r["anti_history"]
+    assert all(b > a for a, b in zip(anti, anti[1:])), anti
+    assert anti[-1] > anti[0], anti
+    assert anti[0] == r["history"][0], (anti[0], r["history"][0])
+
+    lr0 = r["lr0_history"]
+    assert len(set(lr0)) == 1, lr0
+    assert lr0[0] == r["history"][0], (lr0[0], r["history"][0])
+    assert r["lr0_delta_norm"] == 0.0, r["lr0_delta_norm"]
+
+
+def test_an_adaptation_step_that_cannot_move_anything_is_refused():
+    """The failure this API exists to make impossible.
+
+    A detached objective, and a method that selects nothing, both produce a
+    loop that runs to completion and changes nothing -- and both would pass any
+    test that only checked the step returned. They refuse, and the refusal
+    names a check rather than a fact.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["detached"].startswith("RuntimeError:"), r["detached"]
+    assert "gradient for none" in r["detached"], r["detached"]
+    assert "Check:" in r["detached"], r["detached"]
+    assert r["selects_nothing"].startswith("ValueError:"), r["selects_nothing"]
+    assert "Check:" in r["selects_nothing"], r["selects_nothing"]
+
+
+def test_a_delta_reverts_the_base_weights_bit_for_bit():
+    """docs/DESIGN.md §3's first lifetime question, answered as an equality.
+
+    Compared as exact lists rather than with a tolerance, because "reverted"
+    has to mean the bytes are back -- docs/ADAPT.md §5 measures what the
+    tolerant answer costs (2 elements of 35,136 on a real checkpoint), and a
+    tolerance here would accept exactly that.
+
+    The last assertion covers the **whole** model, not the covered parameters:
+    a delta that restored its own two tensors while something else had moved
+    would otherwise report success.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    for n in r["selected"]:
+        assert r["adapted"][n] != r["base"][n], n
+        assert r["reverted"][n] == r["base"][n], n
+    for n, after in r["all_after_revert"].items():
+        if n in r["base"]:
+            assert after == r["base"][n], n
+    # The kept delta goes back on and is the adapted model again, to within
+    # the float32 gap docs/ADAPT.md §5.1 measures. Not asserted as equality:
+    # base + (w - base) is not w, and pretending it is would be the fault.
+    for n in r["selected"]:
+        for a, b in zip(_adapt_flat(r["reapplied"][n]), _adapt_flat(r["adapted"][n])):
+            assert abs(a - b) < 1e-6, (n, a, b)
+    base_bytes, value_bytes = r["nbytes"]
+    assert base_bytes == value_bytes == 2 * 12 * 4, r["nbytes"]
+
+    # online() twice, stepping in between, still reverts to the *original*
+    # base. Without this the suite could not see a second snapshot: the delta
+    # would revert perfectly to the weights the first round left behind, and
+    # every other assertion here would still hold.
+    for n in r["selected"]:
+        assert r["rearm_adapted"][n] != r["rearm_base"][n], n
+        assert r["rearm_reverted"][n] == r["rearm_base"][n], n
+
+
+def test_a_delta_names_a_check_for_the_destinations_it_cannot_reach():
+    """The other two of docs/DESIGN.md §3's three lifetime questions.
+
+    Both refuse, and what is pinned is the *shape* of the refusal: it names a
+    line the reader can run, so that the day serialisation or a second rank
+    lands, the refusal is discovered by someone running the check rather than
+    by nobody. A refusal naming a fact has gone stale six times here.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert "Check: torch.save(" in r["persist"], r["persist"]
+    assert "cannot outlive this process" in r["persist"], r["persist"]
+    assert "Check: torch.distributed.init_process_group(" in r["publish"], r["publish"]
+    assert "world_size=2" in r["publish"], r["publish"]
+
+
+def test_tent_refuses_a_layer_norm_model_by_naming_the_missing_rule():
+    """What the tape cannot carry, pinned so it cannot be forgotten.
+
+    `aten.native_layer_norm.default` has no derivative rule (docs/BACKWARD.md
+    §8 -- it is not on SmolLM2's path, because RMSNorm decomposes into
+    mean.dim / rsqrt / mul). So Tent works on every RMSNorm architecture and on
+    no `nn.LayerNorm` one, which is most of the older encoders.
+
+    It is refused **before** the backward, by `trace.differentiable()`, and
+    with the whole list rather than whichever missing rule the walk reached
+    first. This test inverts the day a rule lands: it will fail, and the fix is
+    to delete it and move the architecture into the supported list.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["layernorm_selected"] == ["norm1.weight", "norm1.bias",
+                                       "norm2.weight", "norm2.bias"], \
+        r["layernorm_selected"]
+    got = r["layernorm"]
+    assert got.startswith("torchnative.adapt:"), got
+    assert "aten.native_layer_norm.default" in got, got
+    assert "_tape_rules()" in got, got
+
+
+def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
+    """docs/DESIGN.md §10: the stage is declared per method, not per directory.
+
+    All three arms are refusals at `wrap` time -- before a forward, before a
+    capture -- which is the property that lets a build without a backward turn
+    a stage-1 method away instead of exploding at the first step.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert "stage 0" in r["stage0"], r["stage0"]
+    assert r["stage0"].startswith("NotImplementedError:"), r["stage0"]
+    assert "stage 2" in r["stage2"], r["stage2"]
+    assert "Check: torch.ones(1, requires_grad=True)" in r["stage2"], r["stage2"]
+    assert r["nostage"].startswith("ValueError:"), r["nostage"]
+    assert "does not declare a stage" in r["nostage"], r["nostage"]
+
+
+def test_an_offline_wrapper_is_the_model_it_wraps():
+    """`adapt.wrap` must not move a plain forward, and `offline` is the default.
+
+    Asserted as exact equality on every logit. docs/ADAPT.md §7 does the same
+    thing at scale -- the SmolLM2 prefill sha256 at every length
+    docs/SEQLEN.md records, through the wrapper -- and this is the cheap
+    version that runs in the suite.
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _adapt_road_fixture()
+    assert r["offline_forward"] == r["unwrapped_forward"]
+    assert len(r["offline_forward"]) == 5 * 24, len(r["offline_forward"])
+
 
 if __name__ == "__main__":
     raise SystemExit(_main())

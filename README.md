@@ -118,6 +118,13 @@ engine.participate()          # local epochs, then contribute a delta
 sixteen value-producing collectives are byte-identical to upstream's `gloo`; what needs a second
 rank refuses by name rather than pretending. `torchnative.nn.federated` above it is still empty.
 
+What it is waiting on is three named things, and only two are about distribution: a second rank
+(`ProcessGroupLocal` refuses `world_size != 1`), a rendezvous (`TCPStore` refuses; `HashStore` is
+process-local), and **a delta on the wire** — `torch.save` refuses, so the local update cannot be
+written to bytes at all. That third one is shared with test-time adaptation, which is why
+`Delta.publish` in §3 is the seam this attaches to rather than a separate stack
+([`docs/ADAPT.md`](docs/ADAPT.md) §1).
+
 ### 3 · Test-time adaptation & training
 
 A model that ships to a device meets data the training set never had. TTA, TTT and the wider
@@ -127,13 +134,32 @@ weight delta over base weights, differing only in lifetime and destination.
 ```python
 from torchnative import adapt
 
-model = adapt.wrap(model, method=adapt.Tent())   # or TTT, memory-based, entropy-based
+model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
 model.online()                                   # adapt as it serves
+model.revert()                                   # the base weights are back, byte for byte
 ```
 
-**Today:** planned; the delta abstraction is specified in [`docs/DESIGN.md`](docs/DESIGN.md) §3.
-Lifetime is driven by system events — backgrounding, user switch, sync window — rather than by
-the domain boundaries a benchmark hands you.
+**Today:** **Tent runs on a real checkpoint.** On `SmolLM2-135M`, ten steps of entropy
+minimisation over the 61 normalisation weights take prediction entropy on unlabelled text from
+**4.1604 to 2.9828**, and a *held-out* sentence the loop never adapted on falls **3.7237 to
+2.9439** — so the model adapted rather than memorising one batch. The adapted weights agree with
+upstream's own autograd running the same step to a median relative **1.5e-06** with 100% sign
+agreement over 35,136 numbers. The controls are part of the claim: the same code with the
+objective's sign flipped sends entropy *up* to 7.4062, `lr=0` holds it identical to the last
+printed digit, and an objective on a detached tensor is refused by name rather than running
+vacuously ([`docs/ADAPT.md`](docs/ADAPT.md)).
+
+The delta abstraction of [`docs/DESIGN.md`](docs/DESIGN.md) §3 is what carries it:
+`torchnative.delta.Delta` owns the base, the offset, and the three lifetime questions, so
+`Tent` holds no state and is 40 lines. A revert restores the base **bit-identically** — all 272
+parameters, not only the 61 covered — and the base copy costs 137 KiB against the model's
+513 MiB. Lifetime is driven by system events rather than by the domain boundaries a benchmark
+hands you, and the two lifetimes that do not exist yet (surviving a restart, leaving the device)
+refuse with the check that would prove them stale.
+
+**What it does not cover:** any `nn.LayerNorm` model. `aten.native_layer_norm.default` has no
+derivative rule, so every RMSNorm architecture adapts and `gpt2`/`bert` are refused before the
+backward, by name.
 
 ---
 
@@ -177,6 +203,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. A real training step runs: loss, <b>backward</b>, and an SGD step that moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. It is a <b>tape over a captured region</b>, not <code>Tensor.backward()</code>, which still refuses (<a href="docs/BACKWARD.md">BACKWARD.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="docs/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
+<tr><td>Test-time adaptation</td><td><b>Tent runs on SmolLM2-135M.</b> Ten steps of entropy minimisation over the 61 normalisation weights: entropy <b>4.1604 → 2.9828</b> on unlabelled text, <b>3.7237 → 2.9439</b> on a held-out sentence never adapted on, adapted weights within a median relative <b>1.5e-06</b> of upstream's own autograd at 100% sign agreement. Reverting restores the base <b>bit-identically</b> across all 272 parameters, for a 137 KiB base copy against 513 MiB of model. The wrong sign sends entropy <i>up</i>, <code>lr=0</code> holds it to the last digit, and a detached objective is refused by name — because a loop that silently does nothing passes every test that only checks it completed. <code>nn.LayerNorm</code> models are refused: <code>aten.native_layer_norm.default</code> has no derivative rule (<a href="docs/ADAPT.md">ADAPT.md</a>)</td></tr>
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
 <tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>). Four fifths of what is left at long sequences is not kernel speed — it is that attention here materialises the score matrix where upstream fuses it, which upstream's own kernels would also pay</td></tr>
 </table>
