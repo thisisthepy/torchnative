@@ -335,6 +335,66 @@ def test_tensor_base_is_subclassable():
     assert issubclass(Tensor, _C.TensorBase)
 
 
+# --- autograd boundary (docs/AUTOGRAD.md §1) --------------------------------
+
+
+def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
+    """Pin the three facts docs/AUTOGRAD.md §1 measured, so they cannot drift.
+
+    There is no autograd behind this shim, and `_install_autograd_shape` in
+    bootstrap.py argues at length for carrying `requires_grad` as an *inert*
+    flag rather than stopping at it. That argument is only honest while the
+    flag really is inert and `backward()` really does refuse -- and nothing
+    checked either, so docs/AUTOGRAD.md could have gone stale the same way
+    docs/AUDIT.md found six of eleven documents had.
+
+    **This test is written to fail when autograd lands.** That is deliberate,
+    and it is the shape `test_the_two_stale_sdpa_refusals_no_longer_claim_a_
+    missing_kernel` already set: when the boundary moves, invert this test
+    rather than deleting it, and revisit docs/AUTOGRAD.md §1 in the same
+    commit. A silently-passing document is the failure mode being guarded
+    against here.
+    """
+    x = _C._aten_dispatch("aten.full.default", [4], 2.0)
+
+    # 1. The flag round-trips, both spellings, and `requires_grad_` chains.
+    x.requires_grad = True
+    assert x.requires_grad is True
+    assert _C._aten_dispatch("aten.full.default", [2], 1.0).requires_grad_(True).requires_grad
+    # ... and the rest of the shape is the honest report of "no graph exists".
+    assert x.is_leaf is True
+    assert x.grad_fn is None
+    assert x.grad is None
+
+    # 2. Nothing reads the flag. This is the load-bearing one: an op does not
+    #    propagate `requires_grad` to its output, so no graph is ever built --
+    #    which is why an engine alone would not be enough (AUTOGRAD.md §1.3).
+    y = _C._aten_dispatch("aten.mul.Tensor", x, x)
+    assert y.requires_grad is False, (
+        "an op propagated requires_grad -- graph construction has appeared; "
+        "see docs/AUTOGRAD.md §1.3 and §6 before extending this"
+    )
+    assert y.grad_fn is None
+
+    # 3. Both walls a `backward()` reaches refuse by name rather than
+    #    returning zeros. AUTOGRAD.md §1.2 walks the path that gets here:
+    #    Tensor.backward -> autograd.backward -> _engine_run_backward, which
+    #    touches the thread-local first and the engine second.
+    for label, call in (
+        ("_stash_obj_in_tls", lambda: _C._stash_obj_in_tls("context", None)),
+        ("run_backward", lambda: _C._ImperativeEngine().run_backward()),
+    ):
+        try:
+            call()
+        except NotImplementedError as e:
+            assert "not implemented in torch._C shim" in str(e), (label, str(e))
+        else:
+            raise AssertionError(
+                f"{label} no longer refuses -- if autograd landed, invert this "
+                f"test and update docs/AUTOGRAD.md §1 rather than deleting it"
+            )
+
+
 # --- discovery (DESIGN.md §6) ----------------------------------------------
 
 
