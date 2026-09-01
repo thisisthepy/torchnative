@@ -1643,6 +1643,82 @@ def _is_refused_op_name(name: str) -> bool:
     )
 
 
+class _RecordFunction:
+    """The handle `profiler::_record_function_enter_new` returns.
+
+    Upstream's is a `torch.ScriptObject` of TorchScript class
+    `__torch__.torch.classes.profiler._RecordFunction`, wrapping a C++
+    `at::RecordFunction` that the profiler's callbacks observe. **This build has
+    no profiler that could observe one** — see `_PROFILER_MARKERS` — so this is
+    an opaque token that carries the region's name and nothing else.
+
+    It carries the name rather than being a bare sentinel so that a caller
+    holding one can be debugged, and so `record_function.__exit__`'s
+    `if record is None: raise AssertionError` distinguishes "never entered"
+    from "entered".
+    """
+
+    __slots__ = ("name", "args")
+    __module__ = "torch.classes.profiler"
+
+    def __init__(self, name, args=None):
+        self.name = name
+        self.args = args
+
+    def __repr__(self):
+        return f"ScriptObject <__torch__.torch.classes.profiler._RecordFunction {self.name!r}>"
+
+
+# `torch.ops.<ns>.<op>.<overload>` entries that are answered in Python instead
+# of at the one door in `aten.rs`.
+#
+# **There are two of them and they are both profiler markers**, which is the
+# whole justification. `torch.optim` wraps every `step()` and every
+# `zero_grad()` in `with torch.autograd.profiler.record_function(...)`, so these
+# two names gate **every optimiser in `torch.optim`, SGD included** — and
+# neither is arithmetic. `docs/AUTOGRAD.md` §7 measured that:
+#
+#     optimiser.zero_grad()   FAIL  profiler._record_function_enter_new.default
+#
+# A no-op is the honest answer here and it is checkable rather than asserted:
+# nothing in this build can observe a record. Measured on this artefact —
+#
+#     torch.profiler.profile()          NotImplementedError: _supported_activities
+#     torch.autograd.profiler.profile() NotImplementedError: _ExperimentalConfig.trace_only
+#     torch.autograd._profiler_enabled()NotImplementedError: _profiler_enabled
+#
+# — so there is no profiler to start, no way to ask whether one is running, and
+# therefore no callback that a marker could reach. That is the difference
+# between this and a silent stub: a stub for `bernoulli_` would lose a draw
+# somebody wanted, and a marker with no listener loses nothing that exists.
+# The day a profiler lands here, these two are where it hooks in.
+#
+# They are answered above `_aten_dispatch` rather than inside it because they
+# are not kernels: they take a `str`, return an object with no storage, and
+# have no dtype, device or shape. Putting them in `aten.rs`'s table would make
+# `_aten_implemented()` — which means "has a kernel *and* golden compares it
+# against upstream" — list something golden cannot compare.
+def _record_function_enter_new(name, args=None):
+    return _RecordFunction(name, args)
+
+
+def _record_function_exit(record):
+    # Upstream returns `()`, i.e. None at the Python level. The handle is
+    # accepted and dropped; `record_function.__exit__` ignores the result.
+    return None
+
+
+_PROFILER_MARKERS = {
+    "profiler._record_function_enter_new.default": _record_function_enter_new,
+    # `record_function.__exit__` calls the `._RecordFunction` overload **by
+    # name**, not `.default` -- `.default` takes a `Tensor` handle and is the
+    # older spelling. Both are answered, because `torch.jit` scripting takes
+    # the other branch and reaches `.default`.
+    "profiler._record_function_exit._RecordFunction": _record_function_exit,
+    "profiler._record_function_exit.default": _record_function_exit,
+}
+
+
 def _op_callable(dispatch, qualname: str, overload: str):
     """The one door, wearing the shape `torch/_ops.py` expects.
 
@@ -1651,9 +1727,17 @@ def _op_callable(dispatch, qualname: str, overload: str):
     `_C._aten_implemented()` reports. Overload is part of the key on purpose
     (docs/TORCH_C.md §1): folding `add.Tensor` and `add.Scalar` together would
     make one implementation look like two.
+
+    `_PROFILER_MARKERS` is consulted first, and it is two entries. See the note
+    on that table for why those two do not belong behind the door.
     """
     namespace, _, name = qualname.partition("::")
     key = f"{namespace}.{name}.{overload or 'default'}"
+
+    marker = _PROFILER_MARKERS.get(key)
+    if marker is not None:
+        marker._shim_aten_key = key
+        return marker
 
     def op(*args, **kwargs):
         return dispatch(key, *args, **kwargs)
@@ -3075,6 +3159,42 @@ def _install_torch_function_modes(module) -> None:
         fn.__module__ = "torch._C"
         setattr(module, fn.__name__, fn)
 
+    # `DisableTorchFunctionSubclass`, the sixth, and a context manager rather
+    # than a function -- `surface.json` harvested it from the `.pyi` as
+    # `"function"`, so it became a raising stub, and
+    # `torch.autograd.profiler.record_function.__exit__` opens with
+    # `with torch._C.DisableTorchFunctionSubclass():` (docs/LOSS.md §6). So it
+    # sits on the road to `optimizer.zero_grad()` twice over: once for the
+    # marker and once for this.
+    #
+    # **A no-op is the correct body, not a stand-in**, and the line above says
+    # why: what it disables is subclass `__torch_function__` dispatch, and
+    # `_is_torch_function_enabled()` already returns `False` here because no
+    # type in the vendored tree overrides the protocol. Entering it turns off
+    # something already off. It is deliberately NOT wired to `_MODE_STACK`:
+    # that is the *mode* stack, which `DisableTorchFunction` (the other name)
+    # governs upstream, and clearing it here would silently drop a
+    # `with torch.device(...)` block that happened to span a `record_function`.
+    class _DisableTorchFunctionSubclass:
+        __module__ = "torch._C"
+        __qualname__ = "DisableTorchFunctionSubclass"
+        __slots__ = ()
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return None
+
+    _DisableTorchFunctionSubclass.__name__ = "DisableTorchFunctionSubclass"
+    module.DisableTorchFunctionSubclass = _DisableTorchFunctionSubclass
+
+    # Readable for the same reason as `_shim_overloads` and
+    # `_shim_registrations`: which `torch.ops` keys this build answers *above*
+    # the one door should be answerable by asking, not by reading bootstrap.py.
+    # There are two ops and three keys, and the list being short is the point.
+    module._shim_profiler_markers = sorted(_PROFILER_MARKERS)
+
 
 def _torch_level_function(name: str, dispatch, overloads):
     """A `torch.<name>` harvested from `_VariableFunctions`.
@@ -3512,7 +3632,22 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
 
 
 def _install_tensor_softmax(tensorbase, dispatch) -> None:
-    """`Tensor.softmax(dim, dtype=None)`.
+    """`Tensor.softmax(dim, dtype=None)` and `Tensor.log_softmax(dim, dtype=None)`.
+
+    The two are one function apart and are installed together so they cannot
+    drift on `dtype=` or on `half_to_float`. `log_softmax` is here for the
+    identical reason -- `aten::log_softmax.int` is `CompositeImplicitAutograd`
+    and never reaches a kernel, while `aten::_log_softmax` is the dispatched
+    leaf (docs/LOSS.md). Note that `torch._log_softmax`, the *private* free
+    spelling, is a genuine `overloads.json` entry, because it names the leaf;
+    `torch.log_softmax` is bound to this member instead. That asymmetry is
+    written out in `overloads.json`'s own `_README`.
+
+    `F.log_softmax(x, dim)` reaches `Tensor.log_softmax` -- measured: the
+    vendored `torch/nn/functional.py` spells it `input.log_softmax(dim)`, so
+    without this member `F.log_softmax` refuses at `TensorBase.log_softmax`
+    even with the kernel present. That is the shape of gap golden is
+    structurally blind to, since golden compares by dispatch key.
 
     `methods.json`'s `_README` explains why this is not a table entry: the
     parser-level key for `Tensor.softmax` is `aten::softmax.int`, which is
@@ -3544,6 +3679,16 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     softmax.__name__ = "softmax"
     softmax.__qualname__ = "TensorBase.softmax"
     setattr(tensorbase, "softmax", softmax)
+
+    def log_softmax(self, dim, dtype=None):
+        source = self
+        if dtype is not None and dtype != self.dtype:
+            source = dispatch("aten._to_copy.default", self, dtype=dtype)
+        return dispatch("aten._log_softmax.default", source, dim, False)
+
+    log_softmax.__name__ = "log_softmax"
+    log_softmax.__qualname__ = "TensorBase.log_softmax"
+    setattr(tensorbase, "log_softmax", log_softmax)
 
 
 def _install_tensor_chunk(tensorbase, dispatch) -> None:
@@ -5432,6 +5577,109 @@ def _install_nn(module, dispatch) -> None:
         """
         return dispatch("aten.leaky_relu.default", input, negative_slope)
 
+    # -- the cross-entropy composites (docs/LOSS.md) ---------------------
+    #
+    # Three names, all `CompositeImplicitAutograd`, and **none of them appears
+    # in a dispatch trace** -- which is why docs/AUTOGRAD.md §5.3's op scan
+    # named two missing kernels and the path needed six more names. A
+    # `TorchDispatchMode` sits below the composite layer, so it records the
+    # leaves a call lands on and never the names a caller uses to get there.
+    #
+    # `transformers` reaches a loss through the last of them:
+    # `ForCausalLMLoss` -> `fixed_cross_entropy` -> `F.cross_entropy` ->
+    # `torch._C._nn.cross_entropy_loss`.
+    #
+    # `nll_loss_forward` is deliberately NOT installed here: upstream has no
+    # `torch._C._nn.nll_loss_forward` (`hasattr` is False on 2.13.0), and
+    # inventing it would be a surface upstream does not have. The kernel behind
+    # it is reachable as `aten.nll_loss_forward.default`, which is where the
+    # golden cases compare it.
+
+    def nll_loss(self, target, weight=None, reduction=1, ignore_index=-100):
+        """`at::native::nll_loss` -- element 0 of the forward's pair.
+
+        The pair's *second* element, `total_weight`, is dropped here exactly as
+        upstream drops it. It is not dead: `nll_loss_backward` takes it as an
+        argument, which is why the kernel returns it and why the golden cases
+        check it (docs/LOSS.md §3.1).
+        """
+        return dispatch(
+            "aten.nll_loss_forward.default", self, target, weight, reduction, ignore_index
+        )[0]
+
+    def nll_loss_nd(self, target, weight=None, reduction=1, ignore_index=-100):
+        """`at::native::nll_loss_nd_symint`, transcribed.
+
+        Only the 1-D/2-D arm is written out. Upstream's 4-D arm and its
+        `dim == 3 or dim > 4` reshape both land on `nll_loss2d`, which this
+        shim has no kernel for; they refuse by that name rather than being
+        approximated, because `nll_loss2d` is a different reduction (it sums
+        over a spatial extent) and substituting `nll_loss` would be silently
+        wrong rather than slow.
+        """
+        if self.dim() < 1:
+            raise ValueError(f"Expected 1 or more dimensions (got {self.dim()})")
+        if self.dim() != 1 and self.shape[0] != target.shape[0]:
+            raise ValueError(
+                f"Expected input batch_size ({self.shape[0]}) to match "
+                f"target batch_size ({target.shape[0]})."
+            )
+        if self.dim() in (1, 2):
+            return nll_loss(self, target, weight, reduction, ignore_index)
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: torch._C._nn.nll_loss_nd(input.dim()="
+            f"{self.dim()}) -- upstream routes every rank but 1 and 2 through "
+            "aten.nll_loss2d_forward.default, which has no kernel here. That op "
+            "reduces over a spatial extent, so nll_loss is not a slower road to "
+            "the same answer"
+        )
+
+    def cross_entropy_loss(
+        self, target, weight=None, reduction=1, ignore_index=-100, label_smoothing=0.0
+    ):
+        """`at::native::cross_entropy_loss_symint`, whose third branch is the
+        one a causal-LM loss takes:
+
+            nll_loss_nd(log_softmax(self, class_dim, self.dtype), target, ...)
+
+        `class_dim` is `0` for a 1-D input and `1` otherwise -- so for the
+        `(N, V)` shape `ForCausalLMLoss` flattens to, the log-softmax is over
+        the vocabulary, which is dim 1 and also the trailing axis. That matters
+        more than it looks: it means a real cross-entropy takes `_log_softmax`'s
+        **last-dim** kernel, the narrowing one (docs/LOSS.md §2.1).
+
+        The `dtype` argument to `log_softmax` is `self.scalar_type()`, i.e. a
+        no-op cast. It is passed anyway, because that is upstream's call and
+        `Tensor.log_softmax` is measured to emit no `_to_copy` for a no-op
+        dtype -- so following upstream costs nothing here.
+
+        The other two branches refuse, by name and with what each would need:
+        upstream picks them on `self.sizes() == target.sizes()` (soft/probability
+        targets) and on `label_smoothing > 0`.
+        """
+        if tuple(self.shape) == tuple(target.shape):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch._C._nn.cross_entropy_loss("
+                "probability targets) -- input and target have the same shape, which "
+                "is how upstream selects cross_entropy_loss_prob_target. That branch "
+                "is a different formula (-(log_softmax(self) * target).sum()), not a "
+                "different spelling of this one"
+            )
+        if label_smoothing > 0.0:
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch._C._nn.cross_entropy_loss("
+                f"label_smoothing={label_smoothing}) -- upstream selects "
+                "cross_entropy_loss_label_smoothing, which blends a uniform term into "
+                "the target and is not expressible as nll_loss over a log_softmax. "
+                "label_smoothing=0.0, the default and what F.cross_entropy passes "
+                "unless asked otherwise, takes the branch this shim implements"
+            )
+        class_dim = 0 if self.dim() == 1 else 1
+        return nll_loss_nd(
+            module.TensorBase.log_softmax(self, class_dim, self.dtype),
+            target, weight, reduction, ignore_index,
+        )
+
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
@@ -5441,6 +5689,9 @@ def _install_nn(module, dispatch) -> None:
         (softplus, "softplus"),
         (upsample_bilinear2d, "upsample_bilinear2d"),
         (leaky_relu, "leaky_relu"),
+        (nll_loss, "nll_loss"),
+        (nll_loss_nd, "nll_loss_nd"),
+        (cross_entropy_loss, "cross_entropy_loss"),
     ):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C._nn"
@@ -5449,9 +5700,9 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "gelu", "leaky_relu", "linear", "pad",
-        "scaled_dot_product_attention", "silu", "softplus",
-        "upsample_bilinear2d",
+        "cross_entropy_loss", "gelu", "leaky_relu", "linear", "nll_loss",
+        "nll_loss_nd", "pad", "scaled_dot_product_attention", "silu",
+        "softplus", "upsample_bilinear2d",
     ]
 
 
@@ -5542,6 +5793,37 @@ def _install_composites(module, varfns, dispatch) -> None:
                 "aten.zeros.default", [], dtype=input.dtype, device=input.device
             )
             return dispatch(mul, input, zero)
+        if not inplace and module._capture_active():
+            # **The functionalised route, taken only while capture records.**
+            #
+            # `bernoulli_` and `div_` both write in place, and capture refuses
+            # mutation so that a trace stays single-assignment
+            # (docs/CAPTURE.md). So the eager decomposition below cannot be
+            # recorded at all, and `.train()` dropout was uncapturable --
+            # `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/TRAIN.md's own four
+            # (docs/AUTOGRAD.md §6.5 named it as one of two reasons to want
+            # this op). `aten.native_dropout.default` is upstream's own
+            # out-of-place spelling of the same thing, is one node rather than
+            # four, and hands back the mask a backward will need.
+            #
+            # **This is following upstream, not routing around it.**
+            # `native_dropout` is precisely what functionalisation rewrites
+            # eager dropout to; taking it inside a capture region is the same
+            # substitution upstream makes for the same reason. Outside one,
+            # eager keeps the eager path, because `is_fused_kernel_acceptable`
+            # wants CUDA/XPU/lazy and CPU eager never reaches `native_dropout`
+            # upstream either.
+            #
+            # **It is not bit-identical to the branch below, and it must not be
+            # claimed to be** (docs/LOSS.md §7): the two spellings put the
+            # scale in different places -- `_dropout_impl` divides the *mask*
+            # by `1 - p`, `native_dropout` multiplies the *output* by a
+            # `1/(1-p)` narrowed to the tensor's dtype. The masks agree draw
+            # for draw (both consume `numel` 64-bit draws through
+            # `bernoulli_`'s stream, measured across all four dtypes) and the
+            # survivors can differ by an ULP in `bfloat16`/`float16`. That is
+            # upstream's difference, reproduced, not this shim's.
+            return dispatch("aten.native_dropout.default", input, p, train)[0]
         noise = dispatch("aten.empty_like.default", input)
         # `1 - p` is the *keep* probability, and it is computed once and used
         # twice: upstream draws with it and then divides by it, so any rounding
@@ -5559,7 +5841,21 @@ def _install_composites(module, varfns, dispatch) -> None:
     def dropout_(input, p, train):
         return _dropout_impl(input, p, train, inplace=True)
 
-    for fn, name in ((dropout, "dropout"), (dropout_, "dropout_")):
+    def native_dropout(input, p, train):
+        """`torch.native_dropout` -- `hasattr(torch, 'native_dropout')` is True
+        on 2.13.0, so the name exists upstream and is spelled here.
+
+        Not an `overloads.json` entry even though `aten::native_dropout` is a
+        dispatched leaf: the free function takes exactly the leaf's arguments
+        and there is nothing to resolve, so a one-signature table entry would
+        add a parser round trip and no information. `torch._log_softmax` is in
+        the table because its *name* differs from the public one; this name
+        does not.
+        """
+        return dispatch("aten.native_dropout.default", input, p, train)
+
+    for fn, name in ((dropout, "dropout"), (dropout_, "dropout_"),
+                     (native_dropout, "native_dropout")):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C"
         setattr(varfns, name, fn)
@@ -6141,6 +6437,21 @@ def _install_composites(module, varfns, dispatch) -> None:
     softmax.__name__ = softmax.__qualname__ = "softmax"
     softmax.__module__ = "torch._C"
     setattr(varfns, "softmax", softmax)
+
+    # `torch.log_softmax`, the same shape as `softmax` directly above and for
+    # the same reason: `aten::log_softmax.int` is `CompositeImplicitAutograd`,
+    # so an `overloads.json` entry would validate against upstream's schema and
+    # still name a key no dispatcher ever sees. Bound to the member so the free
+    # spelling and `Tensor.log_softmax` are one function (docs/LOSS.md).
+    #
+    # `torch._log_softmax` -- one underscore away -- IS an `overloads.json`
+    # entry, because that name is the dispatched leaf.
+    def log_softmax(input, dim, dtype=None):
+        return module.TensorBase.log_softmax(input, dim, dtype)
+
+    log_softmax.__name__ = log_softmax.__qualname__ = "log_softmax"
+    log_softmax.__module__ = "torch._C"
+    setattr(varfns, "log_softmax", log_softmax)
 
     def conv1d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         """`torch.conv1d` -- `mamba`'s depthwise causal convolution.

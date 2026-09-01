@@ -246,7 +246,16 @@
     "`aten._safe_softmax.default` as a kernel that did not exist, long after",
     "it did -- the same stale-refusal defect the bool-mask note in that",
     "function already records against itself. A name that is never called",
-    "cannot correct the text that says it is missing."
+    "cannot correct the text that says it is missing.",
+    "",
+    "`_log_softmax` (docs/LOSS.md) is the `_safe_softmax` shape exactly, and",
+    "the pair with `softmax` above is the reason both notes are kept: the",
+    "*public* spelling `torch.log_softmax` has parser key",
+    "`aten::log_softmax.int`, which is `CompositeImplicitAutograd` and belongs",
+    "in `bootstrap.py` next to `softmax`; the *private* spelling",
+    "`torch._log_softmax` has parser key `aten::_log_softmax`, which is the",
+    "dispatched leaf and belongs here. Two names one underscore apart, and the",
+    "right answer for each is the opposite of the right answer for the other."
   ],
 
   "arange": [
@@ -268,6 +277,10 @@
 
   "_safe_softmax": [
     "aten::_safe_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor"
+  ],
+
+  "_log_softmax": [
+    "aten::_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor"
   ],
 
   "tril": [

@@ -39,6 +39,7 @@ use crate::tensor::PyTensorBase;
 pub const IMPLEMENTED: &[&str] = &[
     "aten._grouped_mm.default",
     "aten._local_scalar_dense.default",
+    "aten._log_softmax.default",
     "aten._safe_softmax.default",
     "aten._scaled_dot_product_flash_attention_for_cpu.default",
     "aten._softmax.default",
@@ -141,12 +142,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mul_.Tensor",
     "aten.multinomial.default",
     "aten.native_group_norm.default",
+    "aten.native_dropout.default",
     "aten.native_layer_norm.default",
     "aten.ne.Scalar",
     "aten.ne.Tensor",
     "aten.neg.default",
     "aten.neg_.default",
     "aten.new_ones.default",
+    "aten.nll_loss_forward.default",
     "aten.norm.ScalarOpt_dim",
     "aten.normal_.default",
     "aten.ones.default",
@@ -1437,6 +1440,13 @@ fn aten_dispatch_inner(
         "aten.sort.default" => sort_default(py, args, kwargs),
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
+
+        // -- the cross-entropy forward (docs/LOSS.md) ----------------------
+        "aten._log_softmax.default" => log_softmax_default(py, args, kwargs),
+        "aten.nll_loss_forward.default" => nll_loss_forward_default(py, args, kwargs),
+
+        // -- the out-of-place dropout capture can record (docs/LOSS.md §7) --
+        "aten.native_dropout.default" => native_dropout_default(py, args, kwargs),
 
         // -- falcon / bloom / gpt_bigcode (docs/TAIL.md) --------------------
         "aten._safe_softmax.default" => safe_softmax_default(py, args, kwargs),
@@ -13686,6 +13696,683 @@ fn safe_softmax_default(
     let device = tensor.device().clone();
     let result = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
     finish(py, result, tag)
+}
+
+/// `aten::_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor`
+///
+/// The first half of a cross-entropy forward, and the reason `docs/TRAIN.md`'s
+/// 26 of 26 are *lossless* forwards: without it there is no scalar to call
+/// `.backward()` on. `docs/LOSS.md` is the round that landed it.
+///
+/// It shares `_softmax`'s two refusals verbatim -- `half_to_float=True` is a
+/// CUDA-only fusion and raises on CPU for every dtype, and an integral input
+/// raises `NotImplementedError` naming the kernel -- but **it does not share
+/// the kernel name in that message**, and the difference is measurable:
+///
+/// ```text
+/// _log_softmax(int64 (4,),   dim 0)  "log_softmax_lastdim_kernel_impl" not implemented for 'Long'
+/// _log_softmax(int64 (2,3),  dim 1)  "log_softmax_lastdim_kernel_impl" ...
+/// _log_softmax(int64 (2,3),  dim 0)  "log_softmax_kernel_impl"         ...
+/// ```
+///
+/// upstream picks between two kernels on whether `dim` is the trailing axis,
+/// and each names itself. (`_softmax` above answers `softmax_lastdim_kernel_impl`
+/// for both, which is a pre-existing near-miss in *that* op, not this one.)
+///
+/// ## The split that is not guessable
+///
+/// That same fork decides the **arithmetic**, and the two halves do not agree
+/// on where the sum of exponentials is rounded. Measured against upstream on
+/// `bfloat16` and `float16`, over seven shape/dim combinations each -- the
+/// column is the number of elements that differ from upstream:
+///
+/// ```text
+///                                    sum kept in f32   sum narrowed to dtype
+///   bfloat16  (3,5,9) dim -1              26                    0
+///   bfloat16  (3,5,9) dim  1               0                   27
+///   float16   (2,3,4,5) dim -1            19                    0
+///   float16   (4,7) dim 0                  0                    8
+/// ```
+///
+/// It is exactly upstream's own source. `serial_vec_log_softmax_lastdim_range`
+/// (`ATen/native/cpu/LogSoftmaxKernelImpl.h`) accumulates the sum in `float`
+/// but **stores it into a `scalar_t[]` buffer**, takes the log of that narrowed
+/// value, and stores the log back into the same `scalar_t` buffer -- so on the
+/// last-dim path a `bfloat16` row loses the sum to 8 significand bits *twice*
+/// before it is subtracted. `serial_vec_logsoftmax_range`, the strided path,
+/// holds both in `float[]` and never narrows. For `float32` and `float64` the
+/// narrowing is the identity and the two paths coincide, which is why a
+/// float-only test cannot see any of this.
+///
+/// The separating case is small and is in `tools/golden/cases.py`:
+/// `bfloat16 [0, ln(0.002)]` sums to `1.00203`, which rounds to exactly `1.0`
+/// in `bfloat16`, so the last-dim path answers `log(1) = 0` and the strided
+/// path answers `log(1.00203) = 0.00198`. The first output element is `0.0`
+/// one way and `-0.00198` the other -- a **relative** difference of 1.0, which
+/// is the only reason golden can see it at all: one `bfloat16` ULP is 0.4%
+/// relative and this file's tolerance for that dtype is 6%.
+///
+/// ## Order of operations
+///
+/// `x - max - log(sum)`, left to right, never `x - (max + log(sum))`.
+/// Upstream's comment says why, citing pytorch#11752: with large logits and a
+/// small spread, forming `max + tmp_sum` first loses the difference the whole
+/// computation is about.
+fn log_softmax_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._log_softmax.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let half_to_float = bool_arg(args, kwargs, 2, "half_to_float")?
+        .ok_or_else(|| missing(OP, "half_to_float"))?;
+    if half_to_float {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "softmax with half to float conversion is not supported on CPU",
+        ));
+    }
+    let tag = input.tag();
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(OP, dim_raw, rank)?;
+    let dims = input.tensor()?.dims().to_vec();
+    // Upstream views a 0-dim input as `(1,)` before choosing, so its only axis
+    // is the trailing one.
+    let lastdim = dims.is_empty() || dim + 1 == rank;
+    if !tag.is_floating_point() {
+        return Err(not_implemented(format!(
+            "\"{}\" not implemented for '{}'",
+            if lastdim {
+                "log_softmax_lastdim_kernel_impl"
+            } else {
+                "log_softmax_kernel_impl"
+            },
+            scalar_type_name(tag)
+        )));
+    }
+
+    let (outer, n, inner) = if dims.is_empty() {
+        (1usize, 1usize, 1usize)
+    } else {
+        (
+            dims[..dim].iter().product::<usize>(),
+            dims[dim],
+            dims[dim + 1..].iter().product::<usize>(),
+        )
+    };
+
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let double_acc = storage == candle_core::DType::F64;
+    let narrow = if lastdim { Some(float_narrower(tag)) } else { None };
+    let out = log_softmax_body(&source, outer, n, inner, double_acc, narrow);
+
+    let device = input.tensor()?.device().clone();
+    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The reduction behind `_log_softmax.default`, over the same `(outer, n,
+/// inner)` view `softmax_body` uses.
+///
+/// `narrow`, when present, is the tensor dtype's rounding, applied to the sum
+/// and again to its logarithm -- upstream's last-dim path, which round-trips
+/// both through a `scalar_t` buffer. `None` is the strided path, which holds
+/// them in `float`. See `log_softmax_default`'s docs for the measurement that
+/// decided this; for `float32`/`float64` the two are the same function.
+fn log_softmax_body(
+    source: &[f64],
+    outer: usize,
+    n: usize,
+    inner: usize,
+    double_acc: bool,
+    narrow: Option<fn(f64) -> f64>,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; source.len()];
+
+    for o in 0..outer {
+        for i in 0..inner {
+            let at = |j: usize| o * n * inner + j * inner + i;
+            if double_acc {
+                let mut max = f64::NEG_INFINITY;
+                for j in 0..n {
+                    let v = source[at(j)];
+                    if !(v <= max) {
+                        max = v;
+                    }
+                }
+                let mut sum = 0.0f64;
+                for j in 0..n {
+                    sum += (source[at(j)] - max).exp();
+                }
+                // `float64`'s narrower is the identity, so this branch is the
+                // same either way; it is written out so the two paths read
+                // alike.
+                let logsum = match narrow {
+                    Some(f) => f(f(sum).ln()),
+                    None => sum.ln(),
+                };
+                for j in 0..n {
+                    out[at(j)] = source[at(j)] - max - logsum;
+                }
+            } else {
+                let mut max = f32::NEG_INFINITY;
+                for j in 0..n {
+                    let v = source[at(j)] as f32;
+                    if !(v <= max) {
+                        max = v;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for j in 0..n {
+                    sum += ((source[at(j)] as f32) - max).exp();
+                }
+                let logsum = match narrow {
+                    Some(f) => {
+                        let narrowed = f(sum as f64) as f32;
+                        f(narrowed.ln() as f64) as f32
+                    }
+                    None => sum.ln(),
+                };
+                for j in 0..n {
+                    out[at(j)] = (((source[at(j)] as f32) - max) - logsum) as f64;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `aten::nll_loss_forward(Tensor self, Tensor target, Tensor? weight,
+///     int reduction, SymInt ignore_index) -> (Tensor output, Tensor total_weight)`
+///
+/// The second half of a cross-entropy forward (docs/LOSS.md), and the op whose
+/// **second return value** is the reason a forward-only test is not enough:
+/// `total_weight` is what `nll_loss_backward` divides by, and every caller in
+/// `transformers` throws it away. Its rules are not derivable from the loss:
+///
+/// ```text
+/// reduction=none, 2-D input   total_weight = 0      <- always, even weighted
+/// reduction=none, 1-D input   total_weight = 1      (1-D takes the reduce path)
+/// reduction=mean/sum, no w    total_weight = batch_size - num_ignored
+/// reduction=mean/sum, w       total_weight = sum of the weights not ignored
+/// empty target                total_weight = 0
+/// ```
+///
+/// The first line is upstream writing `*total_weight_data = 0` at the top of
+/// `nll_loss_out_frame` and then returning before it is ever updated. A shim
+/// that computed the "obvious" total weight there would be wrong in a way no
+/// loss value can show.
+///
+/// ## The summation is a cascade, and transcribing it as a loop is wrong
+///
+/// Upstream accumulates into **eight partial sums** with a carry at every
+/// `2^4` elements, all in `scalar_t`. Measured against a plain left-to-right
+/// sum, upstream and naive disagree from `n=8` in `bfloat16` and from `n=300`
+/// in `float32`:
+///
+/// ```text
+///   n=300  bfloat16   upstream -225        naive -226        f64 -226.61255
+///   n=300  float32    upstream 373.92365   naive 373.92377   f64 373.92358
+///   n=4096 bfloat16   upstream -1528       naive -1384       f64 -1545.9946
+/// ```
+///
+/// Three details in it are load-bearing and each was found by a mismatch:
+///
+/// * **An ignored target `continue`s past the carry loop.** It does not just
+///   skip the addition -- the whole cascade advance is skipped for that `b`,
+///   so `ignore_index` changes *where* the carries land, not only what is
+///   summed. Running the carry anyway matched upstream on unweighted runs and
+///   drifted on `ignore_index=3` ones.
+/// * **`float32` and `float64` contract `sum -= data * weight` into an FMA;
+///   the reduced dtypes cannot.** `c10::BFloat16 operator*` returns a
+///   `BFloat16`, so the product is rounded before the subtraction and no
+///   contraction is possible; native `float`/`double` are contracted by the
+///   compiler. Using an FMA everywhere, or nowhere, both mismatch -- and in
+///   opposite dtypes, which is how the split was found.
+/// * **`total_weight` for the unweighted case is a *count*, not a sum**:
+///   `static_cast<scalar_t>(batch_size - num_ignored)`, so it never
+///   accumulates rounding and never goes through the cascade at all.
+///
+/// With all three, a transcription of `nll_loss_out_frame` matched upstream
+/// **1200 of 1200** combinations bit for bit: 25 batch sizes from 1 to 5000 x
+/// 4 dtypes x {sum, mean} x 3 `ignore_index` values x {weighted, unweighted}.
+///
+/// ## The checks, in upstream's order
+///
+/// `ignore_index` is tested **before** the bounds check, so a target equal to
+/// an out-of-range `ignore_index` is accepted -- measured:
+/// `nll_loss_forward(x, [0, 77], None, mean, 77)` succeeds where the same call
+/// with `ignore_index=-100` raises `IndexError: Target 77 is out of bounds.`
+///
+/// `reduction` is **not validated**: upstream accepts `3` and treats it as
+/// anything-but-Mean, i.e. a sum (measured). This reproduces that rather than
+/// adding a refusal upstream does not have.
+fn nll_loss_forward_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.nll_loss_forward.default";
+    const MEAN: i64 = 1;
+    const NONE: i64 = 0;
+
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let target = tensor_arg(OP, args, kwargs, 1, "target")?;
+    let weight = optional_tensor_arg(OP, args, kwargs, 2, "weight")?;
+    let reduction = int_arg(args, kwargs, 3, "reduction")?.ok_or_else(|| missing(OP, "reduction"))?;
+    let ignore_index =
+        int_arg(args, kwargs, 4, "ignore_index")?.ok_or_else(|| missing(OP, "ignore_index"))?;
+
+    let in_dims = input.tensor()?.dims().to_vec();
+    let tgt_dims = target.tensor()?.dims().to_vec();
+
+    // -- the meta function's checks, in its order ------------------------
+    if in_dims.is_empty() || in_dims.len() > 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "input tensor should be 1D or 2D",
+        ));
+    }
+    if tgt_dims.len() > 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "0D or 1D target tensor expected, multi-target not supported",
+        ));
+    }
+    if !matches!(target.tag(), TorchDType::Int64 | TorchDType::UInt8) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected target dtype to be Long or Byte, but got {}",
+            scalar_type_name(target.tag())
+        )));
+    }
+    if in_dims.len() == 1 && tgt_dims.len() == 1 && tgt_dims[0] != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "For 1D input, 1D target must have size 1, but got target size: {}",
+            tgt_dims[0]
+        )));
+    }
+    if in_dims.len() != 1 && (tgt_dims.is_empty() || in_dims[0] != tgt_dims[0]) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "size mismatch (got input: {:?}, target: {:?})",
+            in_dims, tgt_dims
+        )));
+    }
+    let n_classes = in_dims[in_dims.len() - 1];
+    if let Some(w) = &weight {
+        let wd = w.tensor()?.dims().to_vec();
+        if wd.len() != 1 || wd[0] != n_classes {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "weight tensor should be defined either for all {n_classes} classes or no \
+                 classes but got weight tensor of shape: {wd:?}"
+            )));
+        }
+    }
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(not_implemented(format!(
+            "\"nll_loss_out_frame\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    // `data_ptr<scalar_t>()` on the weight is what raises this upstream, so it
+    // is an exact dtype match rather than a promotion.
+    if let Some(w) = &weight {
+        if w.tag() != tag {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "expected scalar type {} but found {}",
+                scalar_type_name(tag),
+                scalar_type_name(w.tag())
+            )));
+        }
+    }
+
+    let device = input.tensor()?.device().clone();
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let targets = match read_flat(OP, target.tensor()?, target.tag())? {
+        Flat::Int(v) => v,
+        Flat::Float(_) => unreachable!("only Long and Byte reach here"),
+    };
+    let weights = match &weight {
+        Some(w) => match read_flat(OP, w.tensor()?, tag)? {
+            Flat::Float(v) => Some(v),
+            Flat::Int(_) => unreachable!("the weight shares the input's floating dtype"),
+        },
+        None => None,
+    };
+    let narrow = float_narrower(tag);
+    let bounds = |t: i64| -> PyResult<usize> {
+        if t < 0 || t as usize >= n_classes {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Target {t} is out of bounds."
+            )));
+        }
+        Ok(t as usize)
+    };
+
+    // -- reduction=None over a 2-D input: elementwise, and total_weight
+    //    stays at the zero it was initialised to.
+    if reduction == NONE && in_dims.len() == 2 {
+        let batch = in_dims[0];
+        let mut out = vec![0.0f64; batch];
+        for i in 0..batch {
+            let t = targets[i];
+            if t == ignore_index {
+                continue; // upstream writes an explicit 0 here
+            }
+            let c = bounds(t)?;
+            let w = weights.as_ref().map(|w| w[c]).unwrap_or(1.0);
+            out[i] = narrow(narrow(-source[i * n_classes + c]) * w);
+        }
+        let output = write_flat(OP, Flat::Float(out), vec![batch], &device, tag)?;
+        let total = write_flat(OP, Flat::Float(vec![0.0]), vec![], &device, tag)?;
+        let pair = [
+            crate::tensor::promote(py, finish(py, output, tag)?)?,
+            crate::tensor::promote(py, finish(py, total, tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
+    // -- the reduce path, which a 1-D input always takes ------------------
+    let scalar = |v: f64| -> PyResult<Tensor> {
+        write_flat(OP, Flat::Float(vec![v]), vec![], &device, tag)
+    };
+    if targets.is_empty() {
+        // Mean over nothing is NaN, by upstream's own choice (pytorch#64572).
+        let out = if reduction == MEAN { f64::NAN } else { 0.0 };
+        let pair = [
+            crate::tensor::promote(py, finish(py, scalar(out)?, tag)?)?,
+            crate::tensor::promote(py, finish(py, scalar(0.0)?, tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
+    let batch = if in_dims.len() == 1 { 1 } else { in_dims[0] };
+    let (loss, total_weight) = nll_cascade(
+        &source, &targets, weights.as_deref(), n_classes, batch, ignore_index, tag, narrow,
+        &bounds,
+    )?;
+    let out = if reduction == MEAN {
+        narrow(loss / total_weight)
+    } else {
+        loss
+    };
+    let pair = [
+        crate::tensor::promote(py, finish(py, scalar(out)?, tag)?)?,
+        crate::tensor::promote(py, finish(py, scalar(total_weight)?, tag)?)?,
+    ];
+    Ok(PyTuple::new(py, pair)?.into_any().unbind())
+}
+
+/// `nll_loss_out_frame`'s eight-level cascade sum, and the `total_weight` that
+/// comes out of the same loop. See `nll_loss_forward_default`'s docs for the
+/// three details that are not guessable and for the 1200-case agreement.
+#[allow(clippy::too_many_arguments)]
+fn nll_cascade(
+    source: &[f64],
+    targets: &[i64],
+    weights: Option<&[f64]>,
+    n_classes: usize,
+    batch: usize,
+    ignore_index: i64,
+    tag: TorchDType,
+    narrow: fn(f64) -> f64,
+    bounds: &dyn Fn(i64) -> PyResult<usize>,
+) -> PyResult<(f64, f64)> {
+    const LEVELS: usize = 8;
+    // `std::max(4, CeilLog2(batch_size) / 8)`. In practice 4 for every batch
+    // below 2^40; written out because it is upstream's and cost nothing.
+    let ceil_log2 = |x: usize| -> u32 {
+        if x <= 2 {
+            1
+        } else {
+            (x - 1).ilog2() + 1
+        }
+    };
+    let level_power = std::cmp::max(4u32, ceil_log2(batch) / LEVELS as u32);
+    let level_mask: u64 = (1u64 << level_power) - 1;
+
+    // The contraction split: native `float`/`double` fold `sum -= a * b` into
+    // one FMA, `c10::BFloat16`/`c10::Half` cannot because their `operator*`
+    // rounds. Measured -- using either everywhere mismatches, in opposite
+    // dtypes.
+    let fused = matches!(tag, TorchDType::Float32 | TorchDType::Float64);
+    let double = tag == TorchDType::Float64;
+
+    let mut wp = [0.0f64; LEVELS];
+    let mut lp = [0.0f64; LEVELS];
+    let mut num_ignored = 0usize;
+
+    for b in 0..batch {
+        let t = targets[b];
+        if t == ignore_index {
+            num_ignored += 1;
+            continue; // and past the carry loop, which is the point
+        }
+        let c = bounds(t)?;
+        let data = source[b * n_classes + c];
+        match weights {
+            Some(w) => {
+                let wv = w[c];
+                lp[0] = if fused {
+                    if double {
+                        (-data).mul_add(wv, lp[0])
+                    } else {
+                        ((-data as f32).mul_add(wv as f32, lp[0] as f32)) as f64
+                    }
+                } else {
+                    narrow(lp[0] - narrow(data * wv))
+                };
+                wp[0] = narrow(wp[0] + wv);
+            }
+            None => lp[0] = narrow(lp[0] - data),
+        }
+        for j in 0..LEVELS - 1 {
+            if (b as u64) & (level_mask << (j as u32 * level_power)) != 0 {
+                break;
+            }
+            wp[j + 1] = narrow(wp[j + 1] + wp[j]);
+            lp[j + 1] = narrow(lp[j + 1] + lp[j]);
+            wp[j] = 0.0;
+            lp[j] = 0.0;
+        }
+    }
+
+    let total_weight = match weights {
+        // A count, cast once -- not a sum, so it carries no rounding.
+        None => narrow((batch - num_ignored) as f64),
+        Some(_) => wp.iter().fold(0.0f64, |a, v| narrow(a + v)),
+    };
+    let loss = lp.iter().fold(0.0f64, |a, v| narrow(a + v));
+    Ok((loss, total_weight))
+}
+
+/// `aten::native_dropout(Tensor input, float p, bool? train) -> (Tensor, Tensor)`
+///
+/// The **out-of-place** dropout, and the reason it is here is not arithmetic:
+/// `capture` refuses mutation so that a trace stays single-assignment
+/// (docs/CAPTURE.md), and the eager composite `torch.dropout` decomposes onto
+/// `bernoulli_`, which writes in place. So a `.train()` forward with real
+/// dropout could not be captured at all — `gpt2`, `bert`, `opt` and
+/// `gpt_bigcode`, `docs/TRAIN.md`'s own four. This op is upstream's own answer
+/// to the same problem: it is the spelling functionalisation rewrites to, and
+/// it returns the mask rather than hiding it inside an in-place fill.
+///
+/// **It is one kernel and not a decomposition, and that is the requirement.**
+/// A `bootstrap.py` decomposition would emit its steps through the one door,
+/// capture would record each of them, and `bernoulli_` would be among them —
+/// which is the thing being fixed. One node in, one node out.
+///
+/// ## It is NOT the composite with the mutation removed
+///
+/// `at::native::native_dropout_cpu` and `_dropout_impl` differ in three
+/// measurable ways, and two of them would be invisible in `float32`:
+///
+/// ```text
+///                        _dropout_impl (torch.dropout)   native_dropout_cpu
+///   the mask's dtype     the input's                     bool
+///   where the scale goes on the MASK: noise.div_(1-p)    on the OUTPUT:
+///                        then input * noise              input.mul(mask).mul_(scale)
+///   p out of [0,1]       TORCH_CHECK naming p            no check of its own
+/// ```
+///
+/// The second is the same distinction `docs/TRAIN.md` §5's S4 fault is about,
+/// with the sides swapped — and it is a real difference in `bfloat16`/`float16`,
+/// where `x * (1/(1-p))` and `x / (1-p)` disagree by an ULP on some survivors.
+/// Following upstream means each spelling keeps its own answer.
+///
+/// The third is measured rather than read: `native_dropout(x, 1.5, True)`
+/// raises **`bernoulli_ expects p to be in [0, 1], but got p=-0.5`** — the
+/// message names `1 - p`, not `p`, because the only check on the road is
+/// `bernoulli_`'s and it sees the survival probability. `torch.dropout(x, 1.5,
+/// True)` raises `dropout probability has to be between 0 and 1, but got 1.5`.
+/// A shared range check would answer the wrong one for whichever caller it was
+/// not written for.
+///
+/// ## Two edges upstream chose and one of them looks like a bug
+///
+/// * **`numel == 0` returns the input itself and a mask of the INPUT's dtype**,
+///   not `bool`: `return std::make_tuple(input, at::empty_like(input,
+///   input.options()))`, taken before the branch that would have made it bool.
+///   Measured — `native_dropout(torch.zeros(0,3), 0.5, True)[1].dtype` is
+///   `torch.float32`. Reproduced rather than tidied; a caller that switches on
+///   the mask's dtype sees what upstream shows it.
+/// * **`train=False` copies.** `output = input.clone()`, so the result is not
+///   the same object — unlike `_dropout_impl`, whose `p == 0 || !train` branch
+///   returns `input` itself (docs/TRAIN.md §1 pins that identity). Two dropout
+///   spellings, opposite answers to `out is x`.
+///
+/// `train=None` means `True`: upstream tests `!train.has_value() || *train`.
+fn native_dropout_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.native_dropout.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let p = float_arg(args, kwargs, 1, "p", 0.5)?;
+    // `bool? train` -- absent and `None` both mean "not given", which upstream
+    // treats as `true`.
+    let train = bool_arg(args, kwargs, 2, "train")?.unwrap_or(true);
+
+    let tag = input.tag();
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device().clone();
+    let numel: usize = dims.iter().product();
+
+    // The zero-element early return, before anything decides the mask is bool.
+    //
+    // `return std::make_tuple(input, at::empty_like(input, input.options()))`
+    // -- the input **itself**, so `out is input` is `True` upstream (measured),
+    // and a mask carrying the *input's* dtype rather than `bool` because this
+    // return is taken above the branch that would have made it bool. Both are
+    // reproduced rather than tidied; a caller switching on the mask's dtype
+    // should see what upstream shows it.
+    if numel == 0 {
+        let mask = write_flat(OP, Flat::Float(Vec::new()), dims.clone(), &device, tag)?;
+        let same = required(OP, args, kwargs, 0, "input")?;
+        let pair = [
+            crate::tensor::promote(py, same.unbind())?,
+            crate::tensor::promote(py, finish(py, mask, tag)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
+    if !train {
+        let mask = Tensor::from_vec(vec![1u8; numel], dims.clone(), &device)
+            .map_err(|e| candle_err(OP, e))?;
+        let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
+        let pair = [
+            crate::tensor::promote(py, finish(py, out, tag)?)?,
+            crate::tensor::promote(py, finish(py, mask, TorchDType::Bool)?)?,
+        ];
+        return Ok(PyTuple::new(py, pair)?.into_any().unbind());
+    }
+
+    let p1m = 1.0 - p;
+    // Upstream's own comment: guard the reciprocal so `p == 1` gives 0 rather
+    // than `inf`, which would turn every masked-out element into NaN.
+    let scale = if p1m == 0.0 { 0.0 } else { 1.0 / p1m };
+
+    // `mask.bernoulli_(p1m)`, and the range check that fires is `bernoulli_`'s,
+    // reporting `p1m`. Same message text as `bernoulli_inplace_float`, which is
+    // the function upstream actually reaches.
+    if !(p1m >= 0.0 && p1m <= 1.0) {
+        // `{}` on an `f64` NaN prints `NaN` in Rust and `nan` in C++'s
+        // `operator<<`, and this message is compared as text.
+        let shown = if p1m.is_nan() { "nan".to_string() } else { p1m.to_string() };
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "bernoulli_ expects p to be in [0, 1], but got p={shown}"
+        )));
+    }
+    if !tag.is_floating_point() {
+        // `output = input.mul(mask).mul_(scale)` is what raises: the scalar is
+        // `double`, and an integral receiver cannot take it in place.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type Float can't be cast to the desired output type {}",
+            scalar_type_name(tag)
+        )));
+    }
+
+    // One `random64()` per element, in `double`, exactly as `bernoulli_` does
+    // for every dtype -- the asymmetry with `uniform_` that
+    // `bernoulli_inplace_float`'s docs record. The mask is `bool`, but the
+    // draws are not `bool`-shaped: they are the same stream a `float32` mask
+    // would consume, which is why a seeded `native_dropout` and a seeded
+    // `torch.dropout` produce the same mask (measured, all four dtypes).
+    let mut gen = crate::rng::default_generator();
+    let draws = crate::rng::uniform_fill_f64(&mut gen, numel, 0.0, 1.0);
+    drop(gen);
+
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
+    };
+    let narrow = float_narrower(tag);
+    // **The scale is narrowed to the input's dtype before it multiplies**, and
+    // that is measured rather than read off `native_dropout_cpu`'s
+    // `output.mul_(scale)`. A standalone `x.mul_(1/0.3)` on a `bfloat16` tensor
+    // does NOT narrow -- `mul_kernel`'s reduced-float branch takes
+    // `original_scalar_value<opmath_t>`, which is `float` (docs/TRAIN.md §5,
+    // docs/SCALAR.md) -- and the two answers differ:
+    //
+    //     bfloat16, x = -9.875, p = 0.7
+    //       x.mul(mask).mul_(scale)  step by step from Python  ->  -33.0
+    //       native_dropout(x, 0.7, True) on the same survivor  ->  -32.75
+    //       bfloat16(scale) = 3.328125, and -9.875 * 3.328125  ->  -32.75
+    //
+    // The narrowed route reproduces upstream on **1280 of 1280** combinations
+    // (4 dtypes x 5 values of p x 64 elements); the un-narrowed one misses 41
+    // of 377 in the harness. This is the same family docs/SCALAR.md closed by
+    // recording that it *has no rule to infer* -- `hardshrink` narrows and
+    // `softshrink` widens -- so it is measured per op, and this op narrows.
+    let scale = narrow(scale);
+    let mut mask = vec![0u8; numel];
+    let mut out = vec![0.0f64; numel];
+    for i in 0..numel {
+        let keep = draws[i] < p1m;
+        mask[i] = keep as u8;
+        // `input.mul(mask)` promotes the bool to the input's dtype, so a
+        // survivor is `x * 1` and a casualty is `x * 0` -- which keeps a signed
+        // zero signed and turns an infinity into NaN, both measured. Then
+        // `.mul_(scale)`, on the OUTPUT and not on the mask.
+        let masked = narrow(source[i] * if keep { 1.0 } else { 0.0 });
+        out[i] = narrow(masked * scale);
+    }
+
+    let out_t = write_flat(OP, Flat::Float(out), dims.clone(), &device, tag)?;
+    let mask_t = Tensor::from_vec(mask, dims, &device).map_err(|e| candle_err(OP, e))?;
+    let pair = [
+        crate::tensor::promote(py, finish(py, out_t, tag)?)?,
+        crate::tensor::promote(py, finish(py, mask_t, TorchDType::Bool)?)?,
+    ];
+    Ok(PyTuple::new(py, pair)?.into_any().unbind())
 }
 
 /// Row-major strides for a contiguous shape, as element counts.

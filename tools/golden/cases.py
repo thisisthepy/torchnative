@@ -13240,6 +13240,1128 @@ def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.native_dropout.default -----------------------------------------
+#
+# The out-of-place dropout (docs/LOSS.md §7). It exists here because `capture`
+# refuses mutation, so the eager composite's `bernoulli_` made a `.train()`
+# forward unrecordable -- not because anything needed a faster dropout.
+#
+# **It is not the composite with the mutation removed**, and the case list is
+# built around the three places it differs. Two are invisible in `float32`:
+#
+#   * the mask is `bool`, not the input's dtype;
+#   * the scale goes on the OUTPUT (`input.mul(mask).mul_(scale)`), not on the
+#     mask (`noise.div_(1-p)`), and it is **narrowed to the input's dtype
+#     first** -- which a standalone `Tensor.mul_(python_float)` does not do;
+#   * `p` outside [0,1] raises `bernoulli_`'s message naming `1 - p`, where
+#     `torch.dropout` raises its own naming `p`.
+#
+# The second was found by measurement and not by reading the source. Stepping
+# `output.mul_(scale)` from Python gives a different answer than the kernel
+# does, and only in the reduced dtypes:
+#
+#     bfloat16, x = -9.875, p = 0.7, a survivor
+#       x.mul(mask).mul_(scale)     -> -33.0
+#       native_dropout(...)         -> -32.75      = -9.875 * bfloat16(scale)
+#
+# `_ND_SURVIVOR` below is that value, carried as a case so the rule is pinned
+# rather than remembered. The un-narrowed reading misses 41 of 377 in the
+# development harness and **0 of 377 in float32 alone**.
+
+_ND_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+# -9.875 is exactly representable in every dtype here, and 0.7 makes
+# `1/(1-p)` = 3.3333... a value whose bfloat16 and float32 roundings differ in
+# the first place that matters. Measured, not chosen for looks.
+_ND_SURVIVOR = -9.875
+
+
+def _nd_pair_check(t_res, c_res) -> tuple[bool, str]:
+    """`(output, mask)`, both exact.
+
+    Exact rather than tolerant for the same reason `_bit_exact` is: the subject
+    is *where the rounding happens*, so a tolerance is the one thing that
+    cannot be allowed to absorb it. Measured, this kernel agrees with upstream
+    bit for bit on all 377 combinations in the development harness, so
+    exactness is a bound it meets.
+    """
+    try:
+        parts = list(zip(("output", "mask"), (t_res[0], t_res[1]), (c_res[0], c_res[1])))
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (output, mask) result on both sides: {e!r}"
+    for label, t_part, c_part in parts:
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, (
+                f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+                + ("  -- the mask is bool on the normal path and the INPUT's dtype "
+                   "on the numel==0 path; upstream takes that return before the "
+                   "branch that would have made it bool" if label == "mask" else "")
+            )
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            if isinstance(x, bool) or isinstance(y, bool):
+                if x != y:
+                    return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+                continue
+            xf, yf = float(x), float(y)
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (NaN on one side only)"
+            if xf != yf:
+                return False, (
+                    f"{label}[{i}] mismatch: torch={x!r} c={y!r} -- exact agreement "
+                    f"is required here; the scale's rounding is the subject "
+                    f"(docs/LOSS.md §7)"
+                )
+    return True, "output and mask both matched exactly"
+
+
+def native_dropout_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.native_dropout.default"
+    cases: list[Case] = []
+    SEED = 1234
+
+    def seeded(flat, shape, dtype_name, p, train):
+        def run_torch():
+            torch_module.manual_seed(SEED)
+            t = _pair(torch_module, c_module, flat, shape, dtype_name)[0]
+            return torch_call(t, p, train)
+
+        def run_c():
+            c_module._shim_manual_seed(SEED)
+            c = _pair(torch_module, c_module, flat, shape, dtype_name)[1]
+            return c_module._aten_dispatch(op, c, p, train)
+
+        return run_torch, run_c
+
+    vals24 = [round((((i * 7919 + 13) % 2000) / 100.0 - 10.0), 6) for i in range(24)]
+    for dtype_name in _ND_DTYPES:
+        for shape in [(4, 6), (24,), (2, 3, 4)]:
+            for p in [0.0, 0.25, 0.5, 0.7, 1.0]:
+                for train in [True, False, None]:
+                    run_torch, run_c = seeded(vals24, shape, dtype_name, p, train)
+                    cases.append(
+                        Case(
+                            name=(f"native_dropout(dtype={dtype_name}, shape={shape}, "
+                                  f"p={p}, train={train})"),
+                            op=op,
+                            run_torch=run_torch,
+                            run_c=run_c,
+                            value_check=_nd_pair_check,
+                            note=("train=None means True upstream -- "
+                                  "`!train.has_value() || *train`"
+                                  if train is None else ""),
+                        )
+                    )
+
+    # The survivor whose scale rounding separates the two readings. One element,
+    # forced to survive by p=0.0... which also makes scale 1. So instead: a
+    # 24-element run at p=0.7 where at least one survivor is -9.875, and the
+    # *whole* tensor is that value, so every survivor is the separating one.
+    for dtype_name in _ND_DTYPES:
+        for p in [0.7, 0.3, 0.9]:
+            run_torch, run_c = seeded([_ND_SURVIVOR] * 24, (24,), dtype_name, p, True)
+            cases.append(
+                Case(
+                    name=(f"native_dropout(dtype={dtype_name}, p={p}, every element "
+                          f"{_ND_SURVIVOR}) [the scale-rounding separator]"),
+                    op=op,
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    value_check=_nd_pair_check,
+                    note="the scale is narrowed to the input's dtype before it "
+                         "multiplies; a standalone Tensor.mul_(float) does not narrow, "
+                         "and in bfloat16 the two answers are -32.75 and -33.0",
+                )
+            )
+
+    # The stream afterwards, which is where a short-circuit hides. `p=0` and
+    # `p=1` still draw `numel` times upstream, exactly as `bernoulli_` does --
+    # and the returned tensor is right either way, so only the *following* draw
+    # can tell.
+    for p in [0.0, 1.0, 0.5]:
+        for train in [True, False]:
+            def before_torch(p=p, train=train):
+                torch_module.ops.aten.native_dropout.default(
+                    torch_module.zeros(9), p, train)
+
+            def before_c(p=p, train=train):
+                c_module._aten_dispatch(
+                    op, c_module._tensor_from_flat([0.0] * 9, [9],
+                                                   dtype=c_module.float32), p, train)
+
+            run_torch, run_c = _seeded_stream_after(
+                torch_module, c_module, before_torch, before_c)
+            cases.append(
+                Case(
+                    name=f"native_dropout(p={p}, train={train}) then uniform_ "
+                         f"[the draws AFTER it]",
+                    op=op,
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    value_check=_rng_stream_check(bitwise=True, bounds=(0.0, 1.0)),
+                    note="train=False draws NOTHING (it takes the ones_like/clone "
+                         "branch) and train=True draws numel times even at p=0 and "
+                         "p=1. Every case that looks at the returned tensor passes "
+                         "both a short-circuit and a spurious draw",
+                )
+            )
+
+    edges = [
+        ([1.0, -1.0, 0.0, -0.0, float("inf"), float("-inf")], (6,), 1.0, True,
+         "p=1: the scale is guarded to 0, so masked-out elements keep their sign "
+         "and +-inf becomes NaN -- a zeros_like would give a plain 0.0"),
+        ([1.0, -1.0, 0.0, -0.0, float("inf"), float("-inf")], (6,), 0.0, True,
+         "p=0: every element survives and the scale is exactly 1"),
+        ([1.0, float("nan"), 2.0], (3,), 0.5, True, "NaN passes through a survivor"),
+        ([], (0,), 0.5, True,
+         "numel 0: upstream returns the INPUT ITSELF and a mask of the input's "
+         "dtype -- not bool, because that return is taken above the branch that "
+         "would have made it bool"),
+        ([], (0, 3), 0.5, False, "the same early return, train=False"),
+    ]
+    for flat, shape, p, train, note in edges:
+        run_torch, run_c = seeded(flat, shape, "float32", p, train)
+        cases.append(
+            Case(
+                name=f"native_dropout(float32, shape={shape}, p={p}, train={train}) "
+                     f"[{note[:40]}]",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_nd_pair_check,
+                note=note,
+            )
+        )
+
+    # Refusals. `p` outside [0,1] raises **bernoulli_'s** message, and it names
+    # `1 - p`: native_dropout has no range check of its own, unlike
+    # torch.dropout, which has one and names `p`.
+    for p in [1.5, -0.5, float("nan")]:
+        t_t, t_c = _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+        cases.append(
+            Case(
+                name=f"native_dropout(p={p!r}) [refused on both sides]",
+                op=op,
+                run_torch=lambda t_t=t_t, p=p: torch_call(t_t, p, True),
+                run_c=lambda t_c=t_c, p=p: c_module._aten_dispatch(op, t_c, p, True),
+                expect="both_error",
+                note="torch: 'bernoulli_ expects p to be in [0, 1], but got p=<1-p>'. "
+                     "The message names the SURVIVAL probability, because the only "
+                     "check on the road is bernoulli_'s",
+            )
+        )
+    # ...and train=False takes the branch with no bernoulli_ in it, so the same
+    # out-of-range p is ACCEPTED. Measured; it is the sharpest evidence that the
+    # check belongs to bernoulli_ and not to native_dropout.
+    for p in [1.5, -0.5]:
+        run_torch, run_c = seeded([1.0, 2.0, 3.0], (3,), "float32", p, False)
+        cases.append(
+            Case(
+                name=f"native_dropout(p={p!r}, train=False) [ACCEPTED on both sides]",
+                op=op,
+                run_torch=run_torch,
+                run_c=run_c,
+                value_check=_nd_pair_check,
+                note="train=False never reaches bernoulli_, so there is nothing to "
+                     "refuse an out-of-range p -- a range check written into "
+                     "native_dropout itself would reject a call upstream accepts",
+            )
+        )
+    for dtype_name, why in [
+        ("int64", "RuntimeError: result type Float can't be cast to the desired "
+                  "output type Long -- it is `mul_(scale)` that raises, not a "
+                  "dtype guard at the top"),
+        ("bool", "the same, for Bool"),
+    ]:
+        t_t, t_c = _pair(torch_module, c_module, [1, 0, 1], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"native_dropout(dtype={dtype_name}) [refused on both sides]",
+                op=op,
+                run_torch=lambda t_t=t_t: torch_call(t_t, 0.5, True),
+                run_c=lambda t_c=t_c: c_module._aten_dispatch(op, t_c, 0.5, True),
+                expect="both_error",
+                note=why,
+            )
+        )
+
+    # --- object identity, which a value comparison cannot see --------------
+    #
+    # `native_dropout` returns the input **itself** when `numel == 0` and a
+    # **copy** otherwise -- including on the `train=False` branch, where
+    # `torch.dropout` returns the input itself. Two dropout spellings, opposite
+    # answers to `out is x`, and neither shows up in any element.
+    #
+    # Expressed as a 1-element tensor holding the boolean, because that is the
+    # only shape this harness compares.
+    for shape, p, train, expect in [
+        ((3,), 0.5, False, "a copy -- output = input.clone()"),
+        ((3,), 0.0, True, "a copy: p==0 has no short-circuit here, unlike torch.dropout"),
+        ((0, 3), 0.5, True, "the SAME object -- the numel==0 early return"),
+        ((0, 3), 0.5, False, "the same object, on the train=False path too"),
+    ]:
+        n = 1
+        for s in shape:
+            n *= s
+
+        def rt(shape=shape, n=n, p=p, train=train):
+            t = _pair(torch_module, c_module, [1.0] * n, shape, "float32")[0]
+            return torch_module.tensor([float(torch_call(t, p, train)[0] is t)])
+
+        def rc(shape=shape, n=n, p=p, train=train):
+            c = _pair(torch_module, c_module, [1.0] * n, shape, "float32")[1]
+            same = c_module._aten_dispatch(op, c, p, train)[0] is c
+            return c_module._tensor_from_flat([float(same)], [1],
+                                              dtype=c_module.float32)
+
+        cases.append(
+            Case(
+                name=f"native_dropout(shape={shape}, p={p}, train={train}) "
+                     f"[is the output the input object? -- {expect}]",
+                op=op,
+                run_torch=rt,
+                run_c=rc,
+                note="identity, not values: `output = input.clone()` on the train "
+                     "branch and `return input` on the numel==0 one. No element "
+                     "differs either way",
+            )
+        )
+
+    # The spellings.
+    for label, fn_t, fn_c in [
+        ("torch.native_dropout(x, p, train)",
+         lambda t: torch_module.native_dropout(t, 0.5, True),
+         lambda c: c_module._VariableFunctions.native_dropout(c, 0.5, True)),
+    ]:
+        def rt(fn_t=fn_t):
+            torch_module.manual_seed(SEED)
+            return fn_t(_pair(torch_module, c_module, vals24, (24,), "float32")[0])
+
+        def rc(fn_c=fn_c):
+            c_module._shim_manual_seed(SEED)
+            return fn_c(_pair(torch_module, c_module, vals24, (24,), "float32")[1])
+
+        cases.append(
+            Case(
+                name=f"native_dropout via {label}",
+                op=op,
+                run_torch=rt,
+                run_c=rc,
+                value_check=_nd_pair_check,
+                note="hasattr(torch, 'native_dropout') is True on 2.13.0, so the free "
+                     "name exists upstream and golden -- which compares by dispatch "
+                     "key -- would not have noticed it missing",
+            )
+        )
+    return cases
+
+
+# --- aten._log_softmax.default -------------------------------------------
+#
+# The first half of a cross-entropy forward (docs/LOSS.md). It looks like
+# `softmax_cases` above and one thing in it is not like `_softmax` at all:
+#
+#   **upstream has TWO log-softmax kernels and they do different arithmetic.**
+#   `serial_vec_log_softmax_lastdim_range` (chosen when `dim` is the trailing
+#   axis) round-trips the sum of exponentials, and then its logarithm, through
+#   a `scalar_t` buffer; `serial_vec_logsoftmax_range` (every other `dim`)
+#   holds both in `float`. On `bfloat16` that is two roundings to 8 significand
+#   bits that the strided path does not do.
+#
+# For `float32` and `float64` the narrowing is the identity, so **a
+# float-only case list cannot see the split at all** -- which is why the
+# dtype x dim grid below runs all four dtypes against both paths rather than
+# spot-checking one.
+#
+# It still would not be enough. One `bfloat16` ULP is ~0.4% relative and
+# `dtypes.py` allows 6%, so an ordinary input that differs by a ULP passes
+# whichever way the kernel is written. `_LOG_SOFTMAX_SEPARATOR` below is the
+# input that does not: `[0, ln(0.002)]` sums to 1.00203, which is inside half a
+# `bfloat16` ULP of exactly 1.0, so the last-dim path takes `log(1) = 0` and
+# the strided path takes `log(1.00203) = 0.00198`. The first output element is
+# `0.0` one way and `-0.00198` the other, a *relative* difference of 1.0.
+# Measured, not chosen: the same input in `float16` differs by 4.6e-05, which
+# `float16`'s 5e-3 atol absorbs, so `float16` is carried as documentation of
+# the near miss rather than as a separator.
+
+_LOG_SOFTMAX_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+# ln(0.002), to float32 precision. Written out rather than computed so the
+# two sides cannot disagree about `math.log`.
+_LOG_SOFTMAX_SEPARATOR = -6.214608098422191
+
+
+def _bit_exact(t_res, c_res) -> tuple[bool, str]:
+    """Equality with no tolerance at all, for the cases whose whole subject is
+    a rounding rule.
+
+    **The default pipeline cannot do this job, and that was measured rather
+    than assumed.** `dtypes.py` gives `bfloat16` `atol=6e-2`, and the
+    narrowing this separates moves a value by at most one ULP or 0.002,
+    whichever is larger -- so `math.isclose` absorbs it for *every* input, not
+    just the easy ones. The bound is structural: the sum's `bfloat16` rounding
+    is at most 2^-9 relative, so `log(sum)` moves by at most 0.00195 absolute
+    no matter how the input is chosen, and reaching an absolute 6e-2 would
+    need `log(sum) > 16`, i.e. a reduction over e^16 elements.
+
+    **Dtype and shape are checked here, not by the caller.** `compare.py`
+    hands a `value_check` the whole job and skips its own pipeline entirely, so
+    the first draft of this function -- values only -- was reported by
+    `--self-test` as accepting a wrong answer under both the `shape` and the
+    `dtype` fault modes. That is the self-test doing exactly what it is for.
+    """
+    t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+    if t_dtype != c_dtype:
+        return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_shape = tuple(int(x) for x in t_res.shape)
+    c_shape = tuple(int(x) for x in c_res.shape)
+    if t_shape != c_shape:
+        return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+    t_flat, c_flat = _flatten_values(t_res.tolist()), _flatten_values(c_res.tolist())
+    if len(t_flat) != len(c_flat):
+        return False, f"length differs: torch={len(t_flat)} c={len(c_flat)}"
+    for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+        xf, yf = float(x), float(y)
+        if math.isnan(xf) or math.isnan(yf):
+            if math.isnan(xf) and math.isnan(yf):
+                continue
+            return False, f"index {i}: torch={x!r} c={y!r} (NaN mismatch)"
+        if xf != yf:
+            return False, (
+                f"index {i}: torch={x!r} c={y!r} -- these must agree BIT FOR BIT; "
+                f"a tolerance here would absorb the whole effect (see _bit_exact)"
+            )
+    return True, ""
+
+
+def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._log_softmax.default"
+    cases: list[Case] = []
+
+    # Values spread wide enough that the row max is not the first element and
+    # the exponentials do not all collapse to one term.
+    six = [1.0, 2.0, 3.0, 0.0, -1.5, 0.5]
+    scenarios = [
+        (six, (2, 3), -1, "last dim -- the narrowing path"),
+        (six, (2, 3), 0, "first dim -- the float path"),
+        (six, (6,), 0, "1-D: dim 0 is the trailing axis, so the narrowing path"),
+        (six, (3, 2, 1), 1, "inner extent 1 but dim is NOT the trailing axis -- "
+                            "still the strided kernel, which `inner == 1` would get wrong"),
+        ([3.0], (), -1, "0-d: upstream views it as (1,), so the answer is log(1) = 0"),
+    ]
+    for dtype_name in _LOG_SOFTMAX_DTYPES:
+        for flat, shape, dim, note in scenarios:
+            cases.append(
+                Case(
+                    name=f"_log_softmax(dtype={dtype_name}, shape={shape}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: torch_call(
+                        _pair(torch_module, c_module, flat, shape, dtype_name)[0], dim, False
+                    ),
+                    run_c=lambda flat=flat, shape=shape, dim=dim, dtype_name=dtype_name: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, flat, shape, dtype_name)[1], dim, False
+                    ),
+                    # The reduced dtypes agree with upstream bit for bit here
+                    # (measured, every shape/dim in this list), so they are held
+                    # to that. float32/float64 are not: this kernel sums
+                    # serially where upstream reduces over vector lanes, which
+                    # costs up to 9.5e-07 in float32 -- inside the tolerance,
+                    # and the reason no float32 case in this file can separate
+                    # a summation order.
+                    value_check=_bit_exact if dtype_name in ("float16", "bfloat16") else None,
+                    note=note,
+                )
+            )
+
+    # The separator, both ways round. `(1, 2)` at `dim=-1` takes the last-dim
+    # kernel; the same two numbers as `(2, 1)` at `dim=0` take the strided one.
+    # A shim that used one rule for both fails exactly one of each pair, in
+    # bfloat16, by 100% relative -- past any tolerance in dtypes.py.
+    for dtype_name in _LOG_SOFTMAX_DTYPES:
+        for shape, dim, which in [((1, 2), -1, "last-dim kernel: sum narrows, log(1.0) = 0"),
+                                  ((2, 1), 0, "strided kernel: sum stays float, log(1.00203)")]:
+            cases.append(
+                Case(
+                    name=f"_log_softmax(dtype={dtype_name}, shape={shape}, dim={dim}) "
+                         f"[the narrowing separator -- {which}]",
+                    op=op,
+                    run_torch=lambda shape=shape, dim=dim, dtype_name=dtype_name: torch_call(
+                        _pair(torch_module, c_module, [0.0, _LOG_SOFTMAX_SEPARATOR],
+                              shape, dtype_name)[0], dim, False
+                    ),
+                    run_c=lambda shape=shape, dim=dim, dtype_name=dtype_name: c_module._aten_dispatch(
+                        op, _pair(torch_module, c_module, [0.0, _LOG_SOFTMAX_SEPARATOR],
+                                  shape, dtype_name)[1], dim, False
+                    ),
+                    # **This must be exact, and that is the whole point.**
+                    # The first draft of these two cases used the default
+                    # tolerance and could not fail: applied to a shim that
+                    # never narrows, and to one that always narrows, golden
+                    # reported 0 failures both times. bfloat16's atol is 6e-2
+                    # and the effect is 0.002. See `_bit_exact`.
+                    value_check=_bit_exact,
+                    note="the only case in this list that can tell the two upstream "
+                         "log-softmax kernels apart",
+                )
+            )
+
+    edge = [
+        ([1.0, float("-inf"), 2.0], (3,), "one masked position",
+         "-inf survives as -inf: exp(-inf - max) is a clean 0, and the output is "
+         "-inf - log(sum), not a NaN"),
+        ([float("-inf"), float("-inf")], (2,), "a fully masked row",
+         "NaN on both sides -- `_log_softmax` has no `_safe_softmax` twin, so this "
+         "agreement is the whole contract"),
+        ([float("inf"), 1.0], (2,), "+inf",
+         "inf - inf is NaN and it poisons the row, on both sides"),
+        ([float("nan"), 1.0], (2,), "NaN input", "NaN out, both elements"),
+        ([1000.0, 1001.0, 999.0], (3,), "large logits",
+         "the max subtraction is the only thing between this and inf/inf"),
+        ([], (0,), "empty", "no lane to reduce"),
+        ([1.0, 2.0], (2, 0), "zero extent along dim -- wait, no elements at all",
+         "numel 0: upstream returns before the kernel runs"),
+    ]
+    for flat, shape, label, note in edge:
+        n = 1
+        for s in shape:
+            n *= s
+        cases.append(
+            Case(
+                name=f"_log_softmax(float32, {label})",
+                op=op,
+                run_torch=lambda flat=flat[:n], shape=shape: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], -1, False
+                ),
+                run_c=lambda flat=flat[:n], shape=shape: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], -1, False
+                ),
+                note=note,
+            )
+        )
+
+    # Both refusals, and -- unlike `_softmax` -- the integral one names a
+    # *different kernel* depending on which side of the last-dim fork the call
+    # falls. Two cases, not one, because a shim with a single hard-coded
+    # message passes the first and fails the second.
+    for shape, dim, kernel in [((4,), 0, "log_softmax_lastdim_kernel_impl"),
+                               ((2, 3), 1, "log_softmax_lastdim_kernel_impl"),
+                               ((2, 3), 0, "log_softmax_kernel_impl")]:
+        n = shape[0] * (shape[1] if len(shape) > 1 else 1)
+        cases.append(
+            Case(
+                name=f"_log_softmax(int64 shape={shape} dim={dim} rejected on both sides)",
+                op=op,
+                run_torch=lambda shape=shape, dim=dim, n=n: torch_call(
+                    _pair(torch_module, c_module, list(range(n)), shape, "int64")[0], dim, False
+                ),
+                run_c=lambda shape=shape, dim=dim, n=n: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, list(range(n)), shape, "int64")[1], dim, False
+                ),
+                expect="both_error",
+                note=f'torch: NotImplementedError, "{kernel}" not implemented for \'Long\'',
+            )
+        )
+
+    for dtype_name, why in [
+        ("float32", "torch: 'softmax with half to float conversion is not supported on CPU'"),
+        ("float16", "the same refusal, for the dtype whose name the flag comes from"),
+    ]:
+        cases.append(
+            Case(
+                name=f"_log_softmax(dtype={dtype_name}, half_to_float=True rejected on both sides)",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name: torch_call(
+                    _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), dtype_name)[0], -1, True
+                ),
+                run_c=lambda dtype_name=dtype_name: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), dtype_name)[1], -1, True
+                ),
+                expect="both_error",
+                note=why,
+            )
+        )
+    cases.append(
+        Case(
+            name="_log_softmax(dim out of range rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")[0], 5, False
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")[1], 5, False
+            ),
+            expect="both_error",
+            note="IndexError on both sides",
+        )
+    )
+
+    kw_t, kw_c = _pair(torch_module, c_module, six, (2, 3), "float32")
+    cases.append(
+        Case(
+            name="_log_softmax(self=/dim=/half_to_float= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, dim=-1, half_to_float=False),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, dim=-1, half_to_float=False),
+        )
+    )
+
+    # --- the spellings ---------------------------------------------------
+    #
+    # Everything above compares by dispatch key, and a dispatch key is exactly
+    # what a *caller* does not have. `F.log_softmax(x, dim)` is
+    # `input.log_softmax(dim)` in the vendored `torch/nn/functional.py`, so with
+    # the kernel present and the member absent it still refuses -- which is how
+    # this landed the first time. These cases go through the names instead.
+    def _spellings():
+        t, c = _pair(torch_module, c_module, six, (2, 3), "float32")
+        return t, c
+
+    spellings = [
+        ("torch.log_softmax(x, dim)",
+         lambda t: torch_module.log_softmax(t, -1),
+         lambda c: c_module._VariableFunctions.log_softmax(c, -1),
+         "the free public spelling -- a Python-level composite, NOT an "
+         "overloads.json entry, because aten::log_softmax.int is "
+         "CompositeImplicitAutograd"),
+        ("Tensor.log_softmax(dim)",
+         lambda t: t.log_softmax(-1),
+         lambda c: c.log_softmax(-1),
+         "the member F.log_softmax actually calls"),
+        ("torch._log_softmax(x, dim, False)",
+         lambda t: torch_module._log_softmax(t, -1, False),
+         lambda c: c_module._VariableFunctions._log_softmax(c, -1, False),
+         "the private free spelling -- this one IS an overloads.json entry, "
+         "because aten::_log_softmax is the dispatched leaf"),
+        ("torch.log_softmax(x, dim, dtype=float64)",
+         lambda t: torch_module.log_softmax(t, -1, dt.torch_dtype(torch_module, "float64")),
+         lambda c: c_module._VariableFunctions.log_softmax(c, -1, dt.c_dtype(c_module, "float64")),
+         "dtype= casts first, then calls the kernel -- so the result is float64"),
+        ("Tensor.log_softmax(dim, dtype=x.dtype)",
+         lambda t: t.log_softmax(-1, dt.torch_dtype(torch_module, "float32")),
+         lambda c: c.log_softmax(-1, dt.c_dtype(c_module, "float32")),
+         "a no-op dtype emits no conversion call on either side"),
+    ]
+    for label, fn_t, fn_c, note in spellings:
+        cases.append(
+            Case(
+                name=f"_log_softmax via {label}",
+                op=op,
+                run_torch=lambda fn_t=fn_t: fn_t(_spellings()[0]),
+                run_c=lambda fn_c=fn_c: fn_c(_spellings()[1]),
+                note=note,
+            )
+        )
+
+    return cases
+
+
+# --- aten.nll_loss_forward.default ---------------------------------------
+#
+# The second half of a cross-entropy forward (docs/LOSS.md §3). Two things
+# about it need saying before the case list.
+#
+# **It returns TWO tensors and every caller throws the second away.**
+# `total_weight` is what `nll_loss_backward` divides by, so it is not
+# decoration -- and a forward-only test cannot see it, which is the exact shape
+# of bug this repository keeps finding. `_nll_pair_check` below therefore
+# checks both members with equal weight, and the grid deliberately includes the
+# combination where `total_weight` is *not* what the loss suggests:
+#
+#     reduction=none, 2-D input   ->  total_weight = 0, always, even weighted
+#
+# because upstream writes `*total_weight_data = 0` at the top of
+# `nll_loss_out_frame` and then returns before it is ever updated.
+#
+# **The sum is a cascade, so the batch size is part of the input.** Upstream
+# accumulates into 8 partial sums with a carry every 16 elements, all in
+# `scalar_t`, and an ignored target `continue`s past the carry -- so
+# `ignore_index` changes *where* the carries land. A plain left-to-right sum
+# disagrees from n=8 in `bfloat16` and from n=300 in `float32`. The grid runs
+# 10 batch sizes chosen around the carry boundaries (16, 17, 64, 65) for that
+# reason, not for coverage's sake.
+
+_NLL_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_NLL_CLASSES = 7
+# Reduction constants, as `torch.nn._reduction` spells them.
+_NLL_NONE, _NLL_MEAN, _NLL_SUM = 0, 1, 2
+
+
+def _nll_pair_check(t_res, c_res) -> tuple[bool, str]:
+    """`(output, total_weight)`, both checked.
+
+    `total_weight` is the member a forward-only comparison cannot see, so it
+    gets the same dtype/shape/value treatment as the loss rather than being
+    glanced at. NaN is a *result* here and not a failure: mean over an entirely
+    ignored batch is `0/0`, deliberately (upstream's own choice,
+    pytorch#64572), and the two sides agreeing on it is what is checked.
+    """
+    try:
+        parts = list(zip(("output", "total_weight"), (t_res[0], t_res[1]), (c_res[0], c_res[1])))
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (output, total_weight) result on both sides: {e!r}"
+    for label, t_part, c_part in parts:
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (NaN on one side only)"
+            # **Exact, not close.** The cascade is the subject: a naive sum
+            # differs from upstream by well under `float32`'s 1e-5 for a small
+            # batch, so a tolerance here would let the wrong summation through
+            # for every batch size below a few hundred. Measured: this kernel
+            # agrees with upstream bit for bit on 1200 of 1200 combinations
+            # (25 batch sizes x 4 dtypes x 2 reductions x 3 ignore_index x
+            # weighted/not), so exactness is a bound it actually meets.
+            if xf != yf:
+                return False, (
+                    f"{label}[{i}] mismatch: torch={x!r} c={y!r} -- these must agree BIT "
+                    f"FOR BIT; the cascade summation is what this case is about and a "
+                    f"tolerance would absorb it (docs/LOSS.md §3.2)"
+                )
+    return True, "output and total_weight both matched exactly"
+
+
+def nll_loss_forward_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.nll_loss_forward.default"
+    cases: list[Case] = []
+    C = _NLL_CLASSES
+
+    def logits(n, dtype_name):
+        # Deterministic, spread over a range wide enough that the cascade's
+        # carry order is visible, and not a progression that sums the same in
+        # any order.
+        flat = [(((i * 7919 + 13) % 2000) / 100.0 - 10.0) for i in range(n * C)]
+        return _pair(torch_module, c_module, flat, (n, C), dtype_name)
+
+    def targets(n, mod=C):
+        flat = [(i * 13 + 5) % mod for i in range(n)]
+        return _pair(torch_module, c_module, flat, (n,), "int64")
+
+    def weights(dtype_name):
+        return _pair(torch_module, c_module,
+                     [round(0.1 + 0.37 * i, 6) for i in range(C)], (C,), dtype_name)
+
+    # Batch sizes around the cascade's carry boundaries: level_step is 16, so
+    # 16/17 and 64/65 are where a wrong carry rule first shows.
+    for dtype_name in _NLL_DTYPES:
+        for n in [1, 2, 3, 8, 16, 17, 64, 65, 300]:
+            for reduction, rn in [(_NLL_NONE, "none"), (_NLL_MEAN, "mean"), (_NLL_SUM, "sum")]:
+                for use_w in (False, True):
+                    for ignore in (-100, 3):
+                        note = (
+                            "total_weight is 0 here whatever the loss says"
+                            if reduction == _NLL_NONE
+                            else "an ignored target skips the cascade carry, not just the add"
+                            if ignore == 3 else ""
+                        )
+                        cases.append(
+                            Case(
+                                name=(f"nll_loss_forward(dtype={dtype_name}, n={n}, "
+                                      f"reduction={rn}, weight={use_w}, ignore_index={ignore})"),
+                                op=op,
+                                run_torch=lambda n=n, dtype_name=dtype_name, use_w=use_w,
+                                                 reduction=reduction, ignore=ignore: torch_call(
+                                    logits(n, dtype_name)[0], targets(n)[0],
+                                    weights(dtype_name)[0] if use_w else None,
+                                    reduction, ignore,
+                                ),
+                                run_c=lambda n=n, dtype_name=dtype_name, use_w=use_w,
+                                             reduction=reduction, ignore=ignore: c_module._aten_dispatch(
+                                    op, logits(n, dtype_name)[1], targets(n)[1],
+                                    weights(dtype_name)[1] if use_w else None,
+                                    reduction, ignore,
+                                ),
+                                value_check=_nll_pair_check,
+                                note=note,
+                            )
+                        )
+
+    # --- total_weight is a CAST OF A COUNT, not a sum ----------------------
+    #
+    # Upstream's unweighted branch is `static_cast<scalar_t>(batch_size -
+    # num_ignored)`: the count is formed in `int64` and rounded **once**.
+    # Accumulating `1.0` through the same cascade the loss uses is the obvious
+    # alternative and it agrees for every batch size in the grid above -- which
+    # is how it got through the first sabotage pass with 0 failures.
+    #
+    # It stops agreeing where a `bfloat16` partial sum saturates: at 256 the
+    # ULP is 2, so `256 + 1` is `256` and the cascade stops counting, while the
+    # single cast still rounds 258 to 258 exactly. Measured, not guessed --
+    # searched over n in [250,270] u [500,530] u {1000,1023,1024,1025,2049,
+    # 4097,300,301,320,384,385}, and 300 (the largest batch in the grid above)
+    # is NOT one of the ten that separate:
+    #
+    #     n=258 bfloat16   cast 258   cascade-of-ones 256
+    #     n=515 bfloat16   cast 516   cascade-of-ones 512
+    #
+    # `float16` never separates in that range: its 11-bit significand counts
+    # exactly past 2048, well beyond any batch worth putting in a case list.
+    for n, reduction, rn in [(258, _NLL_MEAN, "mean"), (258, _NLL_SUM, "sum")]:
+        cases.append(
+            Case(
+                name=(f"nll_loss_forward(bfloat16, n={n}, reduction={rn}) "
+                      f"[total_weight is one cast of a count, not a cascade of ones]"),
+                op=op,
+                run_torch=lambda n=n, reduction=reduction: torch_call(
+                    logits(n, "bfloat16")[0], targets(n)[0], None, reduction, -100),
+                run_c=lambda n=n, reduction=reduction: c_module._aten_dispatch(
+                    op, logits(n, "bfloat16")[1], targets(n)[1], None, reduction, -100),
+                value_check=_nll_pair_check,
+                note="at n=258 a bfloat16 partial sum has saturated (256 + 1 == 256) so "
+                     "summing ones answers 256; the cast answers 258. mean divides by it, "
+                     "so this case sees the difference in the loss as well",
+            )
+        )
+
+    # --- a 1-D input takes the reduce path whatever `reduction` says -------
+    one_d = [-1.0, -2.0, -3.0]
+    for dtype_name in _NLL_DTYPES:
+        for reduction, rn in [(_NLL_NONE, "none"), (_NLL_MEAN, "mean"), (_NLL_SUM, "sum")]:
+            for tgt_flat, tgt_shape, ignore, label in [
+                ([2], (), -100, "0-d target"),
+                ([2], (1,), -100, "1-d target of size 1 -- the only 1-d size allowed"),
+                ([2], (), 2, "the single target ignored: mean is 0/0"),
+            ]:
+                cases.append(
+                    Case(
+                        name=(f"nll_loss_forward(1-D input, dtype={dtype_name}, "
+                              f"reduction={rn}, {label})"),
+                        op=op,
+                        run_torch=lambda dtype_name=dtype_name, reduction=reduction,
+                                         tgt_flat=tgt_flat, tgt_shape=tgt_shape,
+                                         ignore=ignore: torch_call(
+                            _pair(torch_module, c_module, one_d, (3,), dtype_name)[0],
+                            _pair(torch_module, c_module, tgt_flat, tgt_shape, "int64")[0],
+                            None, reduction, ignore,
+                        ),
+                        run_c=lambda dtype_name=dtype_name, reduction=reduction,
+                                     tgt_flat=tgt_flat, tgt_shape=tgt_shape,
+                                     ignore=ignore: c_module._aten_dispatch(
+                            op,
+                            _pair(torch_module, c_module, one_d, (3,), dtype_name)[1],
+                            _pair(torch_module, c_module, tgt_flat, tgt_shape, "int64")[1],
+                            None, reduction, ignore,
+                        ),
+                        value_check=_nll_pair_check,
+                        note="reduction=none produces a SCALAR for a 1-D input, and "
+                             "total_weight is 1 rather than the 0 a 2-D none gives",
+                    )
+                )
+
+    # --- the edges, each one a rule that is not derivable ------------------
+    two = [-1.0, -2.0, -3.0, -0.5, -4.0, -0.25]
+    edges = [
+        ("every target ignored", [2, 2], (2,), None, 2,
+         "mean is 0/0 = NaN and sum is 0.0; total_weight is 0 for both"),
+        ("a target out of bounds but equal to ignore_index", [0, 77], (2,), None, 77,
+         "ignore_index is tested BEFORE the bounds check, so this is legal"),
+        ("all weights zero", [0, 2], (2,), [0.0] * _NLL_CLASSES, -100,
+         "total_weight is 0 from a sum rather than from a count, and mean is 0/0"),
+        ("uint8 target", None, None, None, -100, "Byte is the other accepted target dtype"),
+        ("reduction=3, which upstream does not validate", [0, 2], (2,), None, -100,
+         "anything but Mean is treated as a sum -- measured, not a guess"),
+    ]
+    for label, tgt, tgt_shape, w, ignore, note in edges:
+        if label.startswith("uint8"):
+            for reduction, rn in [(_NLL_NONE, "none"), (_NLL_MEAN, "mean"), (_NLL_SUM, "sum")]:
+                cases.append(
+                    Case(
+                        name=f"nll_loss_forward(float32, {label}, reduction={rn})",
+                        op=op,
+                        run_torch=lambda reduction=reduction: torch_call(
+                            _pair(torch_module, c_module, two, (2, 3), "float32")[0],
+                            _pair(torch_module, c_module, [0, 2], (2,), "uint8")[0],
+                            None, reduction, -100,
+                        ),
+                        run_c=lambda reduction=reduction: c_module._aten_dispatch(
+                            op,
+                            _pair(torch_module, c_module, two, (2, 3), "float32")[1],
+                            _pair(torch_module, c_module, [0, 2], (2,), "uint8")[1],
+                            None, reduction, -100,
+                        ),
+                        value_check=_nll_pair_check,
+                        note=note,
+                    )
+                )
+            continue
+        for reduction, rn in [(_NLL_NONE, "none"), (_NLL_MEAN, "mean"), (_NLL_SUM, "sum")]:
+            red = 3 if label.startswith("reduction=3") else reduction
+            if label.startswith("reduction=3") and reduction != _NLL_NONE:
+                continue
+            cases.append(
+                Case(
+                    name=f"nll_loss_forward(float32, {label}, reduction={red})",
+                    op=op,
+                    run_torch=lambda tgt=tgt, tgt_shape=tgt_shape, w=w, ignore=ignore,
+                                     red=red: torch_call(
+                        _pair(torch_module, c_module, two, (2, 3), "float32")[0],
+                        _pair(torch_module, c_module, tgt, tgt_shape, "int64")[0],
+                        _pair(torch_module, c_module, w, (3,), "float32")[0] if w else None,
+                        red, ignore,
+                    ),
+                    run_c=lambda tgt=tgt, tgt_shape=tgt_shape, w=w, ignore=ignore,
+                                 red=red: c_module._aten_dispatch(
+                        op,
+                        _pair(torch_module, c_module, two, (2, 3), "float32")[1],
+                        _pair(torch_module, c_module, tgt, tgt_shape, "int64")[1],
+                        _pair(torch_module, c_module, w, (3,), "float32")[1] if w else None,
+                        red, ignore,
+                    ),
+                    value_check=_nll_pair_check,
+                    note=note,
+                )
+            )
+
+    # The empty batch: mean over nothing is NaN by upstream's own decision
+    # (pytorch#64572), sum over nothing is 0, and reduction=none keeps the
+    # (0,) shape rather than collapsing to a scalar.
+    for reduction, rn in [(_NLL_NONE, "none"), (_NLL_MEAN, "mean"), (_NLL_SUM, "sum")]:
+        cases.append(
+            Case(
+                name=f"nll_loss_forward(float32, empty batch, reduction={rn})",
+                op=op,
+                run_torch=lambda reduction=reduction: torch_call(
+                    _pair(torch_module, c_module, [], (0, 3), "float32")[0],
+                    _pair(torch_module, c_module, [], (0,), "int64")[0],
+                    None, reduction, -100,
+                ),
+                run_c=lambda reduction=reduction: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, [], (0, 3), "float32")[1],
+                    _pair(torch_module, c_module, [], (0,), "int64")[1],
+                    None, reduction, -100,
+                ),
+                value_check=_nll_pair_check,
+                note="mean over an empty batch is NaN, not 0 -- upstream chose this "
+                     "deliberately and the comment in LossNLL.cpp cites the PR",
+            )
+        )
+
+    # --- the refusals, each one measured on upstream -----------------------
+    refusals = [
+        ("3-D input", (2, 3, 4), [0, 0], (2,), None, _NLL_MEAN, -100,
+         "RuntimeError: input tensor should be 1D or 2D"),
+        ("0-D input", (), [0], (), None, _NLL_MEAN, -100,
+         "the same message -- dim() must be > 0 as well as <= 2"),
+        ("2-D target", (2, 3), [0, 1, 0, 1], (2, 2), None, _NLL_MEAN, -100,
+         "RuntimeError: 0D or 1D target tensor expected, multi-target not supported"),
+        ("batch size mismatch", (2, 3), [0, 1, 2], (3,), None, _NLL_MEAN, -100,
+         "RuntimeError: size mismatch (got input: [2, 3], target: [3])"),
+        ("target out of bounds", (2, 3), [0, 5], (2,), None, _NLL_MEAN, -100,
+         "IndexError: Target 5 is out of bounds."),
+        ("negative target", (2, 3), [0, -1], (2,), None, _NLL_MEAN, -100,
+         "IndexError -- the bounds check is two-sided"),
+        ("target out of bounds, reduction=none", (2, 3), [0, 5], (2,), None, _NLL_NONE, -100,
+         "the elementwise path bounds-checks too, and that is a separate branch"),
+        ("weight of the wrong size", (2, 3), [0, 2], (2,), [1.0, 2.0], _NLL_MEAN, -100,
+         "RuntimeError naming the class count"),
+        ("2-D weight", (2, 3), [0, 2], (2,), [1.0, 2.0, 3.0], _NLL_MEAN, -100,
+         "a (1,3) weight is refused even though it has the right numel"),
+        ("1-D input with a 1-D target of size 2", (3,), [0, 1], (2,), None, _NLL_MEAN, -100,
+         "ValueError, not RuntimeError -- upstream uses TORCH_CHECK_VALUE here"),
+    ]
+    for label, in_shape, tgt, tgt_shape, w, reduction, ignore, why in refusals:
+        n = 1
+        for s in in_shape:
+            n *= s
+        w_shape = (1, 3) if label.startswith("2-D weight") else ((len(w),) if w else None)
+        cases.append(
+            Case(
+                name=f"nll_loss_forward({label} rejected on both sides)",
+                op=op,
+                run_torch=lambda in_shape=in_shape, n=n, tgt=tgt, tgt_shape=tgt_shape,
+                                 w=w, w_shape=w_shape, reduction=reduction,
+                                 ignore=ignore: torch_call(
+                    _pair(torch_module, c_module, [-1.0] * n, in_shape, "float32")[0],
+                    _pair(torch_module, c_module, tgt, tgt_shape, "int64")[0],
+                    _pair(torch_module, c_module, w, w_shape, "float32")[0] if w else None,
+                    reduction, ignore,
+                ),
+                run_c=lambda in_shape=in_shape, n=n, tgt=tgt, tgt_shape=tgt_shape,
+                             w=w, w_shape=w_shape, reduction=reduction,
+                             ignore=ignore: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, [-1.0] * n, in_shape, "float32")[1],
+                    _pair(torch_module, c_module, tgt, tgt_shape, "int64")[1],
+                    _pair(torch_module, c_module, w, w_shape, "float32")[1] if w else None,
+                    reduction, ignore,
+                ),
+                expect="both_error",
+                note=why,
+            )
+        )
+
+    for tgt_dtype, why in [
+        ("int32", "RuntimeError: expected target dtype to be Long or Byte, but got Int"),
+        ("float32", "a floating target is refused -- that is the prob-target API, "
+                    "which lives in cross_entropy_loss and not here"),
+    ]:
+        cases.append(
+            Case(
+                name=f"nll_loss_forward(target dtype {tgt_dtype} rejected on both sides)",
+                op=op,
+                run_torch=lambda tgt_dtype=tgt_dtype: torch_call(
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[0],
+                    _pair(torch_module, c_module, [0, 2], (2,), tgt_dtype)[0],
+                    None, _NLL_MEAN, -100,
+                ),
+                run_c=lambda tgt_dtype=tgt_dtype: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[1],
+                    _pair(torch_module, c_module, [0, 2], (2,), tgt_dtype)[1],
+                    None, _NLL_MEAN, -100,
+                ),
+                expect="both_error",
+                note=why,
+            )
+        )
+
+    cases.append(
+        Case(
+            name="nll_loss_forward(int64 input rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [0] * 6, (2, 3), "int64")[0],
+                _pair(torch_module, c_module, [0, 2], (2,), "int64")[0],
+                None, _NLL_MEAN, -100,
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                _pair(torch_module, c_module, [0] * 6, (2, 3), "int64")[1],
+                _pair(torch_module, c_module, [0, 2], (2,), "int64")[1],
+                None, _NLL_MEAN, -100,
+            ),
+            expect="both_error",
+            note='NotImplementedError: "nll_loss_out_frame" not implemented for \'Long\'',
+        )
+    )
+
+    # The weight's dtype must match the input's *exactly* -- it is
+    # `data_ptr<scalar_t>()` that raises, not a promotion rule. Both the
+    # reduce path and the elementwise path go through it.
+    for w_dtype, reduction, rn in [("float64", _NLL_MEAN, "mean"),
+                                   ("bfloat16", _NLL_MEAN, "mean"),
+                                   ("float64", _NLL_NONE, "none")]:
+        cases.append(
+            Case(
+                name=f"nll_loss_forward(float32 input, {w_dtype} weight, reduction={rn} "
+                     f"rejected on both sides)",
+                op=op,
+                run_torch=lambda w_dtype=w_dtype, reduction=reduction: torch_call(
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[0],
+                    _pair(torch_module, c_module, [0, 2], (2,), "int64")[0],
+                    _pair(torch_module, c_module, [1.0, 1.0, 1.0], (3,), w_dtype)[0],
+                    reduction, -100,
+                ),
+                run_c=lambda w_dtype=w_dtype, reduction=reduction: c_module._aten_dispatch(
+                    op,
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[1],
+                    _pair(torch_module, c_module, [0, 2], (2,), "int64")[1],
+                    _pair(torch_module, c_module, [1.0, 1.0, 1.0], (3,), w_dtype)[1],
+                    reduction, -100,
+                ),
+                expect="both_error",
+                note="RuntimeError: expected scalar type Float but found "
+                     + ("Double" if w_dtype == "float64" else "BFloat16"),
+            )
+        )
+
+    kw_t, kw_c = _pair(torch_module, c_module, two, (2, 3), "float32")
+    kwt_t, kwt_c = _pair(torch_module, c_module, [0, 2], (2,), "int64")
+    cases.append(
+        Case(
+            name="nll_loss_forward(every argument by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=kw_t, target=kwt_t, weight=None,
+                                         reduction=_NLL_MEAN, ignore_index=-100),
+            run_c=lambda: c_module._aten_dispatch(op, self=kw_c, target=kwt_c, weight=None,
+                                                  reduction=_NLL_MEAN, ignore_index=-100),
+            value_check=_nll_pair_check,
+        )
+    )
+
+    # --- the spellings -----------------------------------------------------
+    #
+    # `torch._C._nn.nll_loss_forward` is deliberately NOT among them: upstream
+    # has no such name (`hasattr` is False on 2.13.0), and the shim must not
+    # invent one. The three that do exist are all
+    # `CompositeImplicitAutograd`, so none of them appears in the dispatch
+    # trace that named this op -- which is the §1 finding, checked here.
+    F_t = torch_module.nn.functional
+    spellings = [
+        ("torch._C._nn.nll_loss",
+         lambda t, tt: torch_module._C._nn.nll_loss(t, tt, None, _NLL_MEAN, -100),
+         lambda c, ct: c_module._nn.nll_loss(c, ct, None, _NLL_MEAN, -100)),
+        ("torch._C._nn.nll_loss_nd",
+         lambda t, tt: torch_module._C._nn.nll_loss_nd(t, tt, None, _NLL_MEAN, -100),
+         lambda c, ct: c_module._nn.nll_loss_nd(c, ct, None, _NLL_MEAN, -100)),
+        ("torch._C._nn.cross_entropy_loss",
+         lambda t, tt: torch_module._C._nn.cross_entropy_loss(t, tt, None, _NLL_MEAN, -100, 0.0),
+         lambda c, ct: c_module._nn.cross_entropy_loss(c, ct, None, _NLL_MEAN, -100, 0.0)),
+        ("torch._C._nn.cross_entropy_loss(reduction=sum)",
+         lambda t, tt: torch_module._C._nn.cross_entropy_loss(t, tt, None, _NLL_SUM, -100, 0.0),
+         lambda c, ct: c_module._nn.cross_entropy_loss(c, ct, None, _NLL_SUM, -100, 0.0)),
+        ("torch._C._nn.cross_entropy_loss(reduction=none)",
+         lambda t, tt: torch_module._C._nn.cross_entropy_loss(t, tt, None, _NLL_NONE, -100, 0.0),
+         lambda c, ct: c_module._nn.cross_entropy_loss(c, ct, None, _NLL_NONE, -100, 0.0)),
+        ("torch._C._nn.cross_entropy_loss(ignore_index=2)",
+         lambda t, tt: torch_module._C._nn.cross_entropy_loss(t, tt, None, _NLL_MEAN, 2, 0.0),
+         lambda c, ct: c_module._nn.cross_entropy_loss(c, ct, None, _NLL_MEAN, 2, 0.0)),
+    ]
+    for label, fn_t, fn_c in spellings:
+        cases.append(
+            Case(
+                name=f"nll_loss_forward via {label}",
+                op=op,
+                run_torch=lambda fn_t=fn_t: fn_t(
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[0],
+                    _pair(torch_module, c_module, [0, 2], (2,), "int64")[0]),
+                run_c=lambda fn_c=fn_c: fn_c(
+                    _pair(torch_module, c_module, two, (2, 3), "float32")[1],
+                    _pair(torch_module, c_module, [0, 2], (2,), "int64")[1]),
+                note="a CompositeImplicitAutograd name -- invisible to the dispatch "
+                     "trace that found this op, and the reason the op scan under-counted",
+            )
+        )
+    # And a 1-D input through `nll_loss_nd`, which is the branch that routes to
+    # `nll_loss` rather than to `nll_loss2d`.
+    cases.append(
+        Case(
+            name="nll_loss_forward via torch._C._nn.nll_loss_nd(1-D input)",
+            op=op,
+            run_torch=lambda: torch_module._C._nn.nll_loss_nd(
+                _pair(torch_module, c_module, one_d, (3,), "float32")[0],
+                _pair(torch_module, c_module, [2], (), "int64")[0], None, _NLL_MEAN, -100),
+            run_c=lambda: c_module._nn.nll_loss_nd(
+                _pair(torch_module, c_module, one_d, (3,), "float32")[1],
+                _pair(torch_module, c_module, [2], (), "int64")[1], None, _NLL_MEAN, -100),
+        )
+    )
+    assert F_t is not None
+    return cases
+
+
 # --- aten._safe_softmax.default -----------------------------------------
 # torch's own decomposition (`torch/_decomp/decompositions.py::safe_softmax`):
 # `out = softmax(self, dim); masked = all(self == -inf, dim); where(masked, 0, out)`.
@@ -18859,6 +19981,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.baddbmm.default": baddbmm_cases,
     "aten.split_with_sizes.default": split_with_sizes_cases,
     "aten._safe_softmax.default": safe_softmax_cases,
+    # docs/LOSS.md -- the cross-entropy forward.
+    "aten._log_softmax.default": log_softmax_cases,
+    "aten.nll_loss_forward.default": nll_loss_forward_cases,
+    "aten.native_dropout.default": native_dropout_cases,
     "aten.add_.Tensor": add__tensor_cases,
     "aten.mul.Scalar": mul_scalar_cases,
     # docs/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces

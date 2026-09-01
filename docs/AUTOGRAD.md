@@ -531,8 +531,22 @@ logits. A training step needs the loss, and those two ops precede any backward. 
 neither needs autograd, so they are the smallest genuinely useful next commit in this direction
 and could land before any of §4 or §6 is decided.
 
-<!-- DOCWATCH: op-not-implemented aten._log_softmax.default -->
-<!-- DOCWATCH: op-not-implemented aten.nll_loss_forward.default -->
+> **Landed, in [`docs/LOSS.md`](LOSS.md) — and the count above was low, for a reason worth having.**
+> Both kernels are in and both agree with upstream. The sentence "those two ops" is where this
+> section was wrong: **a `TorchDispatchMode` sits below the composite layer**, so the scan that
+> produced it records the leaves a call lands on and never the names a caller uses to get there.
+> The real path needed the two kernels *and four more names* — `Tensor.log_softmax`,
+> `torch.log_softmax`, `torch._C._nn.nll_loss_nd` and `torch._C._nn.cross_entropy_loss` — every one
+> `CompositeImplicitAutograd` and therefore invisible to the measurement above. `F.cross_entropy`
+> is what `transformers` calls, and with both kernels present it still refused, on the last of them.
+>
+> "Cheap" was generous too. `_log_softmax` has **two** upstream CPU kernels that round the sum in
+> different places, and `nll_loss_forward` sums through an **eight-level cascade** whose carry an
+> ignored target skips. Neither falls out of transcribing the formula, and both are invisible in
+> `float32`. LOSS.md §2 and §3.
+
+<!-- DOCWATCH: op-implemented aten._log_softmax.default -->
+<!-- DOCWATCH: op-implemented aten.nll_loss_forward.default -->
 
 ---
 

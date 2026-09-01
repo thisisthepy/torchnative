@@ -395,6 +395,110 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
             )
 
 
+def test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one():
+    """docs/LOSS.md §6. Two profiler markers gate every `torch.optim`
+    optimiser, and neither is arithmetic.
+
+    `torch.optim` wraps `step()` and `zero_grad()` in
+    `with torch.autograd.profiler.record_function(...)`, so
+    `profiler._record_function_enter_new` and `_record_function_exit` are on
+    the road to **SGD's `zero_grad()`**, which needs no kernels at all
+    (docs/AUTOGRAD.md §7 measured the failure and named the marker).
+
+    **A no-op is only honest while nothing can observe a record**, so that is
+    the part this test pins rather than the return value. All three ways of
+    starting or querying a profiler in this build refuse; if one of them ever
+    stops refusing, a marker that quietly discards its region becomes a wrong
+    answer instead of a missing feature, and this test says so by name.
+    """
+    # 1. Exactly three keys are answered above the door, and no more. The list
+    #    being short is the claim: `_op_callable` consults it on every
+    #    `torch.ops.<ns>.<op>.<overload>`, so anything added here bypasses
+    #    `_aten_dispatch` and golden with it.
+    keys = _C._shim_profiler_markers
+    assert keys == [
+        "profiler._record_function_enter_new.default",
+        "profiler._record_function_exit._RecordFunction",
+        "profiler._record_function_exit.default",
+    ], keys
+
+    # ...and they answer through the route `torch/_ops.py` actually takes,
+    # `_get_operation_overload`, rather than only existing in the table.
+    def _op(name, overload):
+        got = _C._get_operation_overload(f"profiler::{name}", overload)
+        assert got is not None, (name, overload)
+        return got[0]
+
+    rec = _op("_record_function_enter_new", "default")("region", None)
+    assert rec is not None, (
+        "record_function.__exit__ raises AssertionError('Expected record to be set') "
+        "on a None handle, so every optimizer.step() would fail on the way out"
+    )
+    assert "_RecordFunction" in repr(rec), repr(rec)
+    # `record_function.__exit__` calls the `_RecordFunction` overload **by
+    # name**; `.default` is the older Tensor-handle spelling that TorchScript
+    # takes. Both have to accept the handle.
+    assert _op("_record_function_exit", "_RecordFunction")(rec) is None
+    assert _op("_record_function_exit", "default")(rec) is None
+
+    # 2. They are NOT in `_aten_implemented()`. That list means "has a kernel
+    #    and tools/golden/cases.py compares it against upstream", and golden
+    #    cannot compare a marker -- it has no dtype, shape or value.
+    implemented = set(_C._aten_implemented())
+    for key in keys:
+        assert key not in implemented, key
+
+    # 3. Nothing in this build can observe a record. This is the claim that
+    #    makes the no-op honest, and it is the one that can rot.
+    for label, call in (
+        ("_profiler_enabled", lambda: _C._autograd._profiler_enabled()),
+        ("_supported_activities", lambda: _C._autograd._supported_activities()),
+    ):
+        try:
+            call()
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError(
+                f"{label} no longer refuses -- this build may now have a profiler "
+                f"that could observe a record_function region, at which point the "
+                f"markers in bootstrap.py's _PROFILER_MARKERS are discarding data "
+                f"rather than discarding nothing. See docs/LOSS.md §6"
+            )
+
+    # 4. `DisableTorchFunctionSubclass` is the other name on that road, and a
+    #    no-op for a separate reason: it turns off subclass __torch_function__
+    #    dispatch, which `_is_torch_function_enabled()` already reports off.
+    assert _C._is_torch_function_enabled() is False
+    with _C.DisableTorchFunctionSubclass():
+        assert _C._is_torch_function_enabled() is False
+
+    # 5. ...and it must NOT touch the torch-function *mode* stack, which is a
+    #    different mechanism with a different name (`DisableTorchFunction`).
+    #    Clearing it here is the plausible wrong wiring, and it would silently
+    #    drop a `with torch.device(...)` block that happened to span a
+    #    `record_function` region -- i.e. every `optimizer.step()`.
+    class _Mode:
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            return func(*args, **(kwargs or {}))
+
+    before = _C._len_torch_function_stack()
+    _C._push_on_torch_function_stack(_Mode())
+    try:
+        assert _C._len_torch_function_stack() == before + 1
+        with _C.DisableTorchFunctionSubclass():
+            assert _C._len_torch_function_stack() == before + 1, (
+                "DisableTorchFunctionSubclass disturbed the torch-function MODE "
+                "stack. That is DisableTorchFunction's job upstream; doing it here "
+                "drops a `with torch.device(...)` block that spans a record_function "
+                "region, which is every optimizer.step()"
+            )
+        assert _C._len_torch_function_stack() == before + 1
+    finally:
+        _C._pop_torch_function_stack()
+    assert _C._len_torch_function_stack() == before
+
+
 # --- discovery (DESIGN.md §6) ----------------------------------------------
 
 
@@ -832,6 +936,14 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     kernel golden-compared since docs/SDPA.md. Two refusals in
     `scaled_dot_product_attention` meanwhile named it as a kernel that did not
     exist -- see `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`.
+
+    And a third: `_log_softmax` (docs/LOSS.md), the same shape again, arriving
+    with its own trap next door. `torch.log_softmax` -- one underscore fewer --
+    has parser key `aten::log_softmax.int`, which is
+    `CompositeImplicitAutograd` and must **not** be in `overloads.json`; it is
+    a `bootstrap.py` composite beside `softmax`. So the two spellings of one
+    function belong on opposite sides of this table, and this assertion is
+    where the private one is recorded as having been admitted on purpose.
     """
     fn = getattr(_C._VariableFunctions, "_grouped_mm")
     assert fn is not None
@@ -842,9 +954,14 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # than assumed harmless: `_README` is still excluded (it is a list of
     # prose, not schemas, and admitting it would fail to parse), and these
     # are the underscore-prefixed keys that reach a `torch.<name>` because of
-    # it. Both have kernels; neither would resolve under the old predicate.
+    # it. All three have kernels; none would resolve under the old predicate.
     admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
-    assert admitted == ["_grouped_mm", "_safe_softmax"], admitted
+    assert admitted == ["_grouped_mm", "_log_softmax", "_safe_softmax"], admitted
+    assert _C._shim_overloads["_log_softmax"] == ["aten._log_softmax.default"], (
+        _C._shim_overloads["_log_softmax"]
+    )
+    # The public spelling is deliberately absent from the same table.
+    assert "log_softmax" not in _C._shim_overloads, sorted(_C._shim_overloads)
     assert _C._shim_overloads["_safe_softmax"] == ["aten._safe_softmax.default"], (
         _C._shim_overloads["_safe_softmax"]
     )
@@ -1760,6 +1877,49 @@ def test_finfo_and_iinfo_report_torchs_numbers():
 
 def _t(values, shape, dtype=None):
     return _C._tensor_from_flat(values, shape, dtype)
+
+
+def test_log_softmax_names_the_kernel_its_dim_actually_selected():
+    """The one thing about `_log_softmax` that `tools/golden/compare.py`
+    cannot check, pinned here instead.
+
+    Upstream has two log-softmax CPU kernels and picks on whether `dim` is the
+    trailing axis. Each names *itself* in the `NotImplementedError` an integral
+    input raises, and the two names differ (docs/LOSS.md §2.3):
+
+        int64 (4,)   dim 0   ->  "log_softmax_lastdim_kernel_impl"
+        int64 (2,3)  dim 1   ->  "log_softmax_lastdim_kernel_impl"
+        int64 (2,3)  dim 0   ->  "log_softmax_kernel_impl"
+
+    Golden has `expect="both_error"` cases for all three and **they pass with a
+    single hard-coded message**, because `both_error` asserts that both sides
+    refuse and not that they refuse alike -- deliberately, since this shim
+    prefixes its own messages with the op key. Measured: a fault that replaces
+    the fork with the constant `"log_softmax_lastdim_kernel_impl"` produced 0
+    golden failures. So the message is checked here, where a string can be.
+
+    The names are also the shim's only evidence, at the refusal, of which
+    arithmetic the value path would have taken -- and those two arithmetics
+    differ on `bfloat16` (§2.1). A wrong name here means a wrong kernel there.
+    """
+    def refusal(shape, dim):
+        try:
+            _C._aten_dispatch("aten._log_softmax.default",
+                              _t([1] * (shape[0] * (shape[1] if len(shape) > 1 else 1)),
+                                 shape, _C.int64), dim, False)
+        except NotImplementedError as e:
+            return str(e)
+        raise AssertionError(f"expected a refusal for {shape} dim {dim}")
+
+    assert '"log_softmax_lastdim_kernel_impl" not implemented for \'Long\'' == refusal((4,), 0)
+    assert '"log_softmax_lastdim_kernel_impl" not implemented for \'Long\'' == refusal((2, 3), 1)
+    assert '"log_softmax_lastdim_kernel_impl" not implemented for \'Long\'' == refusal((2, 3), -1)
+    assert '"log_softmax_kernel_impl" not implemented for \'Long\'' == refusal((2, 3), 0)
+    # A trailing extent of 1 does NOT make dim 1 the trailing axis. `inner == 1`
+    # is the plausible way to write this fork and it is wrong; the value path
+    # has a golden case at the same shape for the same reason.
+    assert '"log_softmax_kernel_impl" not implemented for \'Long\'' == refusal((3, 2, 1), 1)
+    assert '"log_softmax_lastdim_kernel_impl" not implemented for \'Long\'' == refusal((3, 2, 1), 2)
 
 
 def test_tensor_methods_reach_the_one_door():
@@ -4975,6 +5135,89 @@ def test_capture_is_off_until_it_is_asked_for():
     assert _C._capture_active() is False
 
 
+def test_capture_takes_the_functional_dropout_and_only_inside_a_region():
+    """docs/LOSS.md §7. `.train()` dropout is recordable now, and the eager
+    path is unchanged outside a capture region.
+
+    Before this, `torch.dropout(x, 0.5, True)` decomposed onto `bernoulli_`,
+    which writes in place, and capture refuses mutation so a trace stays
+    single-assignment. So no `.train()` forward with real dropout could be
+    recorded at all -- `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/TRAIN.md's
+    own four, and docs/AUTOGRAD.md §6.5's second reason to want this op.
+
+    Three things are asserted and each catches a different regression:
+
+      * inside a region, the trace holds **one** `native_dropout` node and no
+        in-place op at all;
+      * outside one, the eager decomposition still runs -- substituting
+        `native_dropout` everywhere would change eager numerics, because the
+        two spellings put the scale in different places (§7);
+      * the short-circuit branches (`p == 0`, `train=False`) record *nothing*
+        either way, which is what makes an eval-mode forward capturable
+        without any of this.
+    """
+    x = _C._tensor_from_flat([1.0, -2.0, 3.0, -4.0], [4], dtype=_C.float32)
+
+    def capture(fn):
+        _C._capture_begin([x])
+        try:
+            out = fn()
+        except BaseException:
+            if _C._capture_active():
+                _C._capture_abandon()
+            raise
+        return _C._capture_end([out])
+
+    # 1. train=True, p != 0: one node, and it is the out-of-place one.
+    trace = capture(lambda: _C._VariableFunctions.dropout(x, 0.5, True))
+    ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
+    assert ops == ["aten.native_dropout.default"], ops
+    for op in ops:
+        assert not op.split(".")[1].endswith("_"), (
+            f"{op} mutates; capture refuses mutation and this is the region that "
+            f"used to be refused"
+        )
+
+    # 2. The short-circuits record nothing -- they return the input object.
+    for p, train in ((0.0, True), (0.5, False), (0.0, False)):
+        trace = capture(lambda p=p, train=train:
+                        _C._VariableFunctions.dropout(x, p, train))
+        assert len(trace.nodes) == 0, (p, train, len(trace.nodes))
+
+    # 3. **Capturing must not change the answer**, and that is not free.
+    #
+    #    The two spellings put the scale in different places -- `_dropout_impl`
+    #    divides the MASK by `1-p`, `native_dropout` multiplies the OUTPUT by
+    #    `1/(1-p)` -- and they agree bit for bit anyway, in every dtype,
+    #    because **both end up multiplying by a value narrowed to the input's
+    #    dtype**: the eager one stores its scale into a mask of that dtype, and
+    #    the functional one narrows the scalar (docs/LOSS.md §7). Measured
+    #    upstream: 0 of 25872 survivors differ, over 4 dtypes x 6 values of p.
+    #
+    #    That coincidence is what makes the substitution in `_dropout_impl`
+    #    safe, so it is the thing to pin. `bfloat16` at `p=0.7` is the case
+    #    that breaks if the scalar stops being narrowed: `-9.875 * 3.328125` is
+    #    `-32.75` and `-9.875 * float32(3.3333333)` rounds to `-33.0`.
+    assert _C._capture_active() is False
+    assert _C._VariableFunctions.dropout(x, 0.5, True) is not x
+    for dtype, p in ((_C.bfloat16, 0.7), (_C.float16, 0.7), (_C.float32, 0.3)):
+        flat = [-9.875, 3.25, -0.5, 7.125, -13.0, 2.0, -1.75, 21.5]
+        _C._shim_manual_seed(4321)
+        eager = _C._VariableFunctions.dropout(
+            _C._tensor_from_flat(flat, [8], dtype=dtype), p, True).tolist()
+        _C._shim_manual_seed(4321)
+        functional = _C._aten_dispatch(
+            "aten.native_dropout.default",
+            _C._tensor_from_flat(flat, [8], dtype=dtype), p, True)[0].tolist()
+        assert eager == functional, (
+            f"dtype={dtype} p={p}: the eager composite and native_dropout "
+            f"disagree, so entering a capture region changes the numbers.\n"
+            f"  eager      {eager}\n  native_dropout {functional}\n"
+            f"The usual cause is native_dropout's scale no longer being narrowed "
+            f"to the input's dtype before it multiplies -- see docs/LOSS.md §7"
+        )
+
+
 def test_capture_records_ops_in_order_with_input_and_output_metadata():
     d = _C._aten_dispatch
     a = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
@@ -8065,7 +8308,22 @@ def test_core_ops_and_op_tags_agree():
     #
     # 98 with `log2.default` and `leaky_relu.default`, both
     # `['core', 'pointwise', 'pt2_compliant_tag']`. +2, one per overload.
-    assert r["tag_core_count"] == 98, r["tag_core_count"]
+    #
+    # 99 with `_log_softmax.default` (docs/LOSS.md), whose tags are
+    # `['core', 'pt2_compliant_tag']` -- read off its own entry and not copied
+    # from `_softmax.default` beside it, which happens to carry the same pair.
+    # The other kernel that round landed, `nll_loss_forward.default`, is
+    # **`['pt2_compliant_tag']` only** and adds nothing here. Getting +2 would
+    # mean a loss kernel had been assumed core because the softmax next to it
+    # is; upstream's Core ATen set has no loss op in it.
+    #
+    # 100 with `native_dropout.default` (docs/LOSS.md §7), whose tags are
+    # `['core', 'nondeterministic_seeded', 'pt2_compliant_tag']`. The middle
+    # one is the interesting entry and it is read off this op rather than
+    # inherited: `bernoulli_.float` -- the primitive it draws through, already
+    # implemented -- is **not** in this count, because it is not core. Two ops
+    # in the same family, one core and one not, is upstream's table again.
+    assert r["tag_core_count"] == 100, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -9421,7 +9679,16 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # overloads, and this round only gave one of them a kernel. Getting +3
     # here would mean `dropout` had been given a table entry, which would
     # invent a `CompositeImplicitAutograd` kernel upstream does not have.
-    assert len(keys) == 250, len(keys)
+    #
+    # 251 with `_log_softmax` (docs/LOSS.md). **+1**, the `_safe_softmax`
+    # shape: `overloads.json`-only, because upstream has `torch._log_softmax`
+    # and no `Tensor._log_softmax`. Getting +2 would mean the *public*
+    # `log_softmax` had been given a table entry as well -- and it must not
+    # have one, because `aten::log_softmax.int` is `CompositeImplicitAutograd`
+    # and never reaches a kernel. Both spellings of that one function are
+    # installed, on opposite sides of this boundary; only the private one is
+    # counted here.
+    assert len(keys) == 251, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
