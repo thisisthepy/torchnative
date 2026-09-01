@@ -852,6 +852,12 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 
 둘 다 blank template 단계라 의도된 미완성일 수 있으나, 첫 실행 전에 걸립니다.
 
+> **Correction (문서 감사, 재측정 2026-09): 둘 다 고쳐졌습니다.** `torchnative/api/__init__.py` 는
+> 지금 `**kwargs` 문법 오류 없이 컴파일되고(`py_compile` 로 재확인), 실제로는 docstring 하나뿐인
+> 지연 임포트 모듈입니다. `torchnative/nn/federated/__init__.py` 도 `DistributedDataFederated`
+> 임포트가 사라지고 docstring 만 남아, `import torchnative.nn.federated` 가 예외 없이 성공합니다
+> (재확인). 어느 커밋이 고쳤는지는 추적하지 않았다 — 이 문서 감사의 범위는 현재 상태 확인까지다.
+
 ---
 
 ## 10. 저장소 구성과 빌드
@@ -1027,6 +1033,16 @@ B 로 한 번 통과시켜 필요한 것이 드러난 뒤에 옮기는 편이 �
 > **다만 순전파는 아직입니다.** 다음 벽은 분산이 아니라 `torch._C.is_autocast_enabled`
 > (`transformers/utils/generic.py:250`) 이고, 따라서 바로 아래 문단이 말하는
 > `from_pretrained` · 실제 체크포인트 경로는 **여전히 한 번도 실행되지 않았습니다.**
+>
+> > **Correction (문서 감사, 재측정 2026-09): 이 벽도 열렸고, `from_pretrained` 는 지금 실행됩니다.**
+> > `docs/COMPAT.md` 가 `torch._C._is_autocast_available`(및 관련 다섯 개)을 구현해 이 자리의
+> > autocast 벽을 닫았습니다. 재확인 완료 — 오늘의 빌드에서 `AutoModelForCausalLM.from_pretrained
+> > ("HuggingFaceTB/SmolLM2-135M")` 이 실제 Hub 체크포인트를 내려받아 로드하고, forward 와
+> > `generate()` 둘 다 성공합니다(직접 실행, 로짓 shape `(1, 3, 49152)`, `generate` 8 토큰 산출).
+> > `docs/META.md` §8.3/§7 도 같은 경로(`from_pretrained` + llama3 rope 초기화)를 상류와 로짓
+> > 1e-5 이내로 대조해 독립적으로 확인해 두었다. 아래 두 단락("1 단계가 완료되지 않았습니다" ·
+> > "`from_pretrained` 와 실제 체크포인트 경로는 아직 한 번도 실행되지 않았습니다")은 이 correction
+> > 이전 시점의 서술로 남겨 두었다 — 무엇이 막혀 있었고 무엇이 그것을 열었는지의 기록으로서다.
 
 **1 단계가 완료되지 않았습니다.** `import transformers` 가 아직 안 됩니다 —
 `torch.distributed.Store` 재수출이 끊겨서이고, 그 진단과 결정은 `docs/SURFACE_HONESTY.md` §2 에
@@ -1096,6 +1112,17 @@ F.linear, lm_head 모양 (49152 × 576, 가중치 113 MB)
 순서가 바뀔 수 있는데, 골든은 비트 비교입니다. 즉 이건 패치가 아니라 **"정확성과 속도 중
 무엇을 약속하는가" 의 결정**이고, `docs/SDPA.md` §12 가 sdpa 에서 내린 것과 같은 종류입니다.
 거기서는 옵트인으로 갈랐습니다.
+
+> **Correction (문서 감사, 재측정 2026-09): 지금은 고쳐져 있습니다.** `docs/LINEAR.md`
+> (2026-08-29) 가 이 결함을 정확히 진단하고("접기" + 레이아웃 폴백 두 가지), 비트가 상류
+> 쪽으로만 움직인다는 것(507 케이스 중 48 개 변경, 상류 이탈 0 · 상류 일치로 개선 35)을 재서
+> 두 갈래 선택지(그대로 착지 vs `docs/SDPA.md` 식 옵트인)를 제시했다. `git log -S` 로 확인:
+> 커밋 `2e00ec3` "Perf: Fold instead of broadcasting, and stop copying the weight every call"
+> 가 그 변경을 **옵트인이 아니라 기본값으로 착지**시켰다 — `rust/torch_c/src/aten.rs`
+> 의 `gemm_with_layout_fallback`/`batched_matmul` 가 지금 이 빌드에 있고,
+> `lhs.contiguous()?, rhs.contiguous()?` 가 candle 이 스트라이드 실패로 거절할 때만 도는
+> 폴백으로 바뀌어 있다(재확인). LINEAR.md §6 에 이후에도 남은 벽 다섯 개(bf16/f16 가중치가
+> 여전히 호출마다 넓혀짐 등)가 이름으로 적혀 있다.
 
 **이 결함이 다른 수치를 오염시킵니다.** `docs/QUANT2.md` 의 "27 배" 는 대부분 양자화가 아니라
 이 복사를 피한 것입니다. 전치 복사가 없는 밀집 경로와 비교하면 양자화는 이 호스트에서

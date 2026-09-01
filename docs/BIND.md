@@ -959,6 +959,20 @@ is installed here, and it is not written because `tensor.rs` is outside
 `bootstrap.py` + `docs/BIND.md`. Recorded so whoever next touches `tensor.rs`
 does not have to re-derive it.
 
+> **Correction (문서 감사):** it was written, in the same commit that landed this
+> section (`b8c3ea1`) -- the commit message says so directly ("The investigating
+> agent could not touch tensor.rs and wrote a Python-side property override
+> instead ... this replaces it"), and `tensor.rs`'s `dtype` getter is
+> `crate::dtype::interned(py, self.tag)` today, not `PyDtype::new`. The
+> `_install_tensor_dtype_identity` Python override this section describes does
+> not exist in `bootstrap.py` (re-verified, absent). So §9.4's cost table below
+> measures a code path that was never shipped -- the coordinating session
+> replaced it with the `tensor.rs` one-liner before merging, per the same commit
+> message: **0.042 µs against the original 0.070 µs, i.e. cheaper than the bug it
+> fixes, not 2.1x more expensive.** The correctness finding (§9.1-§9.2, §9.5) and
+> the live behaviour (`t.dtype is torch.float32` → `True`, `baddbmm` → `float32`)
+> are unaffected and reconfirmed live in this audit.
+
 ### 9.4 What it costs -- measured, and it is not the story
 
 Cost of `t.dtype` itself, minimum of 5 blocks of 20 000 after 200 warmups on
