@@ -146,6 +146,18 @@ Upstream's differ (`S=128`: `71e46824c0c40f15…`) and are expected to — accum
 order is not contractual across implementations. The contract here is that *ours*
 does not change.
 
+**Re-measured after docs/SCALAR.md, and all five still read as above.** That
+round changed `mul.Scalar`, `floor_divide.Scalar`, `div.Scalar_mode` and both
+`pow` overloads to read their scalar operand at the precision upstream reads it
+at, and `pow`'s half of that reaches `float32` — so these were re-run as the
+control rather than assumed. The `bfloat16` digests docs/TRAIN.md §6 records did
+not move either, which was **not** expected: a `TorchDispatchMode` over this
+prefill shows every Python number the forward passes is an integer or exactly
+representable (`pow(·, 2)`, `scale=0.125`, and `1e-05` on `add.Tensor`, which is
+the half of the family that still narrows), so no changed kernel can reach a
+separating value in this model. docs/SCALAR.md §4 has the log, and §4.2 the
+demonstration that the numerics do move where such a call exists.
+
 ---
 
 ## 2. Decomposition — the linear term is `pow`, entirely

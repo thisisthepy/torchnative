@@ -2221,7 +2221,10 @@ def test_dropout_range_check_precedes_the_short_circuit():
 def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
     # `div_true_kernel`'s Half/BFloat16 branch reads the ORIGINAL scalar in
     # float and multiplies by its reciprocal; it does not narrow the divisor
-    # to the tensor's dtype the way add/mul do. Only float16 can see it:
+    # to the tensor's dtype the way add/sub do. (It read "the way add/mul do"
+    # until docs/SCALAR.md, which is exactly the assumption that hid the same
+    # defect in `mul` for another round -- `mul` widens too.) Only float16
+    # can see it:
     # upstream answers 3.333984375 = f16(1.0f/0.3f), while narrowing first
     # gives 1/f16(0.3) = 3.33203125. bfloat16 rounds both to 3.328125, which
     # is why this went unnoticed.
@@ -2235,6 +2238,173 @@ def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
         in_place.div_(0.3)
         assert out_of_place.tolist() == [expected], (dtype, out_of_place.tolist())
         assert in_place.tolist() == [expected], (dtype, in_place.tolist())
+
+
+# --- the reduced-float scalar rule (docs/SCALAR.md) ------------------------
+#
+# `div.Scalar` above was the first member of a family to be found, and it was
+# found the way this one was: by noticing that two implementations which should
+# have been distinguishable were not. What these pin is that **which precision
+# a `Scalar` operand is read at is a property of the individual kernel**, not of
+# the `.Scalar` family, and the two halves sit one op apart:
+#
+#     mul, div, floor_divide, div.*_mode   read it at opmath_t (float)
+#     add, sub, rsub, pow, remainder, cmp  read it at scalar_t (the tensor's)
+#
+# Every expected value below is upstream torch 2.13.0's, measured. Every one of
+# them also *differs between the two rules* -- a scalar that is exactly
+# representable in the tensor's dtype (0.5, 2.0, -1.5) rounds the same either
+# way and asserts nothing, which is precisely how this got missed.
+
+
+def test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed():
+    # docs/SCALAR.md §2. `mul_kernel`'s reduced-float branch is
+    # `opmath_t b = iter.original_scalar_value<opmath_t>(2)`, so `bfloat16 * 0.3`
+    # multiplies by `0.3f`, not by `bf16(0.3) == 0.30078125`. This shim
+    # narrowed and answered one representable step high.
+    #
+    # Found because a sabotage fault failed to fail: with the narrowing in
+    # place, "scale dropout's input" and "scale dropout's mask" were
+    # bit-identical here where upstream separates them (docs/TRAIN.md §5, S4).
+    for dtype, want in (
+        (_C.bfloat16, [0.8984375, 1.5, 2.09375]),
+        (_C.float16, [0.89990234375, 1.5, 2.099609375]),
+    ):
+        got = _C._aten_dispatch("aten.mul.Scalar", _t([3.0, 5.0, 7.0], [3], dtype), 0.3)
+        assert got.tolist() == want, (dtype, got.tolist())
+    # float32 is where the rule is invisible: `opmath_type<float>` is `float`,
+    # so narrowing the scalar and widening it are the same computation. Pinned
+    # so that a change which also "fixes" float32 is caught here rather than in
+    # a moved prefill digest.
+    f32 = _C._aten_dispatch("aten.mul.Scalar", _t([3.0, 5.0, 7.0], [3], _C.float32), 0.3)
+    assert f32.tolist() == [0.9000000357627869, 1.5, 2.1000001430511475], f32.tolist()
+
+
+def test_mul__scalar_is_the_one_spelling_of_a_scalar_multiply_upstream_narrows():
+    # docs/SCALAR.md §2.2, and the reason `mul_` was NOT changed with `mul`.
+    # Measured over 4096 values x 4 scalars x 2 dtypes:
+    # `torch.ops.aten.mul_.Scalar` narrows where `mul.Scalar`, `div_.Scalar`,
+    # `x * 0.3` and `x *= 0.3` all widen. Upstream disagrees with itself here;
+    # this shim reproduces the key it is compared against, and the two forms
+    # therefore disagree with each other by one step.
+    x = _t([3.0, 5.0, 7.0], [3], _C.bfloat16)
+    _C._aten_dispatch("aten.mul_.Scalar", x, 0.3)
+    assert x.tolist() == [0.90234375, 1.5, 2.109375], x.tolist()
+    out = _C._aten_dispatch("aten.mul.Scalar", _t([3.0, 5.0, 7.0], [3], _C.bfloat16), 0.3)
+    assert out.tolist() == [0.8984375, 1.5, 2.09375], out.tolist()
+    assert out.tolist() != x.tolist(), "the asymmetry this test exists for is gone"
+
+
+def test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul():
+    # The half of the family that must NOT move. `add`/`sub` have no
+    # reduced-float scalar branch upstream, so the operand arrives through the
+    # iterator's common dtype and `bfloat16 + 0.3` really does add `0.30078125`
+    # (docs/GENERATE.md §3.2). A fix applied to "the .Scalar family" rather
+    # than to the measured half would break these.
+    #
+    # **The out-of-place keys are the ones `arith_scalar` owns**, and they are
+    # here because the in-place ones alone were not enough: sabotage F3 widened
+    # `add`/`sub` in `arith_scalar` and an earlier draft of this test did not
+    # notice, because `add_`/`sub_` go through a different function. Golden has
+    # no builder for either key -- neither `aten.add.Scalar` nor
+    # `aten.sub.Scalar` is in `_aten_implemented()`, so `CASE_BUILDERS` has
+    # nowhere to hang one -- which makes this the only check on the narrowing
+    # half of the family for the out-of-place path.
+    #
+    # **The operands separate the two rules**, measured rather than picked:
+    # `add` on `[1, 3, 5, 7]` gives the same bits either way (0.3 and
+    # 0.30078125 are less than half a bfloat16 ULP apart at those magnitudes),
+    # so the first draft could not fail. These eight separate 3/8 for `add` and
+    # 2/8 for `sub`/`rsub` in `bfloat16`, 1/8 each in `float16`.
+    flat = [-0.546875, -0.5, -0.9375, -7.96875, -0.421875, -1.1875, 0.0625, 0.1875]
+    x = _t(flat, [8], _C.bfloat16)
+    got = _C._aten_dispatch("aten.add.Scalar", x, 0.3)
+    assert got.tolist() == [-0.24609375, -0.19921875, -0.63671875, -7.65625,
+                            -0.12109375, -0.88671875, 0.36328125, 0.48828125], got.tolist()
+    got = _C._aten_dispatch("aten.sub.Scalar", x, 0.3)
+    assert got.tolist() == [-0.84765625, -0.80078125, -1.234375, -8.25,
+                            -0.72265625, -1.484375, -0.23828125, -0.11328125], got.tolist()
+    got = _C._aten_dispatch("aten.rsub.Scalar", x, 0.3)
+    assert got.tolist() == [0.84765625, 0.80078125, 1.234375, 8.25,
+                            0.72265625, 1.484375, 0.23828125, 0.11328125], got.tolist()
+    ip = _t(flat, [8], _C.bfloat16)
+    ip.add_(0.3)
+    assert ip.tolist() == [-0.24609375, -0.19921875, -0.63671875, -7.65625,
+                           -0.12109375, -0.88671875, 0.36328125, 0.48828125], ip.tolist()
+    ip = _t(flat, [8], _C.bfloat16)
+    ip.sub_(0.3)
+    assert ip.tolist() == [-0.84765625, -0.80078125, -1.234375, -8.25,
+                           -0.72265625, -1.484375, -0.23828125, -0.11328125], ip.tolist()
+
+
+def test_floor_division_by_a_reduced_float_scalar_is_off_by_a_whole_integer():
+    # docs/SCALAR.md §3.2. What is one ULP in `mul` is one *unit* here, because
+    # a floor turns a fractional error into an integer one. Both spellings are
+    # asserted because they were separately implemented and disagreed:
+    # `floor_divide.Scalar` computed `floor(a / b)` where `div.Scalar_mode` ran
+    # upstream's `div_floor_floating`.
+    #
+    # **The operands are not decorative.** `bf16(3) // 0.3` gives 9 under both
+    # rules -- upstream's fmod-based algorithm lands on 9 from the widened
+    # divisor and the narrowed divisor gets there by being too large -- so the
+    # first draft of this test could not fail, and sabotage F4 is what said so.
+    # These are pairs measured to separate: at `bfloat16` the divisor 0.3
+    # separates 4 of 8 values, at `float16` it separates none and 0.7 separates
+    # 3 of 8. The two dtypes need different scalars.
+    b = _t([40.0, 43.0, 61.0, -49.0], [4], _C.bfloat16)
+    assert _C._aten_dispatch("aten.floor_divide.Scalar", b, 0.3).tolist() == [
+        133.0, 143.0, 203.0, -164.0]
+    assert _C._aten_dispatch(
+        "aten.div.Scalar_mode", b, 0.3, rounding_mode="floor").tolist() == [
+        133.0, 143.0, 203.0, -164.0]
+    assert _C._aten_dispatch(
+        "aten.div.Scalar_mode", b, 0.3, rounding_mode="trunc").tolist() == [
+        133.0, 143.0, 203.0, -163.0]
+    f = _t([7.0, 14.0, -49.0], [3], _C.float16)
+    assert _C._aten_dispatch("aten.floor_divide.Scalar", f, 0.7).tolist() == [
+        10.0, 20.0, -71.0]
+    assert _C._aten_dispatch(
+        "aten.div.Scalar_mode", f, 0.7, rounding_mode="floor").tolist() == [
+        10.0, 20.0, -71.0]
+
+
+def test_floor_divide_runs_upstreams_algorithm_and_not_floor_of_the_quotient():
+    # The `float64` half of the same defect, which no reduced float can see and
+    # which the scalar rule has nothing to do with. `-3.0 / 0.3` in f64 is
+    # -10.000000000000002, so `floor(a / b)` answers -11 -- and so does
+    # upstream, via `fmod`. The two spellings now share one function, so this
+    # asserts they agree as well as what they agree on.
+    x = _t([-3.0, 3.0, -7.0, 7.0], [4], _C.float64)
+    fd = _C._aten_dispatch("aten.floor_divide.Scalar", x, 0.3)
+    dm = _C._aten_dispatch("aten.div.Scalar_mode", x, 0.3, rounding_mode="floor")
+    assert fd.tolist() == dm.tolist(), (fd.tolist(), dm.tolist())
+    assert fd.tolist() == [-11.0, 10.0, -24.0, 23.0], fd.tolist()
+
+
+def test_pow_narrows_its_scalar_where_mul_widens_it():
+    # docs/SCALAR.md §3.3, the other side of the split, and the reason the rule
+    # has to be established per kernel rather than argued from `mul`:
+    # `pow_tensor_scalar_kernel` converts the exponent to the dispatched
+    # `scalar_t`. This shim kept the parser's `f64` and was one step out.
+    got = _C._aten_dispatch("aten.pow.Tensor_Scalar", _t([3.0], [1], _C.float16), 0.3)
+    assert got.tolist() == [1.390625], got.tolist()
+    # `pow.Scalar`'s *base* narrows the same way.
+    base = _C._aten_dispatch("aten.pow.Scalar", 0.3, _t([3.0], [1], _C.bfloat16))
+    assert base.tolist() == [0.0272216796875], base.tolist()
+
+
+def test_the_scalar_rule_does_not_reach_ops_whose_scalar_is_only_stored():
+    # docs/SCALAR.md §1.1. `clamp`, `fill_`, `masked_fill` and
+    # `where.ScalarOther` cannot be got wrong this way: the scalar's only route
+    # to the output is to be stored, and storing narrows it whichever road it
+    # took. Asserted so that nobody "fixes" them, and with the two bfloat16
+    # neighbours of 0.3 as input -- the only values that could separate the
+    # rules if anything could.
+    x = _t([0.298828125, 0.30078125, 0.30859375], [3], _C.bfloat16)
+    got = _C._aten_dispatch("aten.clamp_min.default", x, 0.3)
+    assert got.tolist() == [0.30078125, 0.30078125, 0.30859375], got.tolist()
+    filled = _C._aten_dispatch("aten.fill_.Scalar", _t([0.0], [1], _C.bfloat16), 0.3)
+    assert filled.tolist() == [0.30078125], filled.tolist()
 
 
 # --- torch.randn / torch.rand and their siblings (docs/RANDOM.md) ----------

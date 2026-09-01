@@ -393,6 +393,98 @@ def _reduced_float_probe(n: int, seed: int, scale: float = 1.0) -> list[float]:
     return out
 
 
+# --- the reduced-float scalar rule (docs/SCALAR.md) ------------------------
+# When an op folds a Python number into a `float16`/`bfloat16` tensor, upstream
+# reads that number at one of two precisions, and **which one is a property of
+# the individual kernel, not of the op family**: `mul` reads it with
+# `original_scalar_value<opmath_t>(2)` (so `bf16 * 0.3` multiplies by `0.3f`),
+# `add` reads it through the iterator's common dtype (so `bf16 + 0.3` adds
+# `0.30078125`). Neither is derivable from the other and both were measured.
+#
+# **A case set can only see the difference if it is built to.** Two conditions,
+# and dropping either one makes every case pass under both rules:
+#
+#   * the **scalar** must not be representable in the tensor's dtype. `0.5`,
+#     `2.0` and `-1.5` round to themselves in `float16` and `bfloat16`, so
+#     narrowing them is the identity and the two implementations coincide. Every
+#     scalar `mul_scalar_cases` had was of exactly that kind, which is why an
+#     op that has been wrong for months passed every case it had.
+#   * the **tensor values** must be representable, so that the only rounding
+#     under test is the scalar's. Integers do that in both dtypes.
+#
+# The separating scalars below were picked by measuring, not by looking
+# irregular -- `0.1` separates 4 of these 8 values in `float16` and only 1 in
+# `bfloat16`, which is the same near-miss that let `div.Scalar` pass for months
+# (docs/TRAIN.md §4: `bfloat16` rounds both roads of `1/0.3` to `3.328125`).
+#
+#   0.3   5/8 in bfloat16, 3/8 in float16   the value docs/TRAIN.md §5 measured
+#   0.7   1/8 in bfloat16, 5/8 in float16   float16's separator, bfloat16's near miss
+#   1.3   5/8 in bfloat16, 4/8 in float16   >1, so the product crosses a binade
+#
+# and `0.5`/`2.0` are carried as controls: they pass under either rule, and a
+# run where *only* they pass is a run that has stopped testing anything.
+_SCALAR_RULE_VALUES = [3.0, 5.0, 7.0, 11.0, 13.0, 96.0, -3.0, -5.0]
+_SCALAR_RULE_SEPARATING = (0.3, 0.7, 1.3)
+_SCALAR_RULE_CONTROLS = (0.5, 2.0)
+
+
+def _scalar_rule_cases(
+    torch_module,
+    c_module,
+    op,
+    torch_of,
+    c_of,
+    *,
+    rule: str,
+    why: str,
+    dtypes=_REDUCED_FLOAT_DTYPES,
+    values=None,
+    shape=None,
+    separating=_SCALAR_RULE_SEPARATING,
+    controls=_SCALAR_RULE_CONTROLS,
+) -> list[Case]:
+    """Cases that separate "the scalar is narrowed into the tensor's dtype"
+    from "the scalar is widened to `opmath_type`", for one op.
+
+    `rule` is upstream's measured answer for this kernel -- `"widen"` or
+    `"narrow"` -- and goes in the case note so that a later reader can tell a
+    deliberate asymmetry from an oversight. `why` names the line of upstream
+    that decides it.
+
+    `_exact_value_check`, never the default pipeline: the whole difference is
+    one representable step, and `bfloat16`'s tolerance here is `6e-2`.
+    """
+    flat = list(values if values is not None else _SCALAR_RULE_VALUES)
+    dims = tuple(shape if shape is not None else (len(flat),))
+    cases: list[Case] = []
+    for dtype_name in dtypes:
+        for scalar in list(separating) + list(controls):
+            control = scalar in controls
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, dims, dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op}(dtype={dtype_name}, scalar={scalar!r}) "
+                         f"[scalar rule: {rule}{'; CONTROL' if control else ''}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, s=scalar: torch_of(a_t, s),
+                    run_c=lambda a_c=a_c, s=scalar: c_of(a_c, s),
+                    value_check=_exact_value_check,
+                    note=(
+                        f"upstream {rule}s the scalar here ({why}). "
+                        + (
+                            f"{scalar!r} IS representable in {dtype_name}, so this case "
+                            "passes under either rule -- it is the control that shows the "
+                            "others are doing work"
+                            if control
+                            else f"{scalar!r} is not representable in {dtype_name}, so the "
+                                 "two rules give different bits"
+                        )
+                    ),
+                )
+            )
+    return cases
+
+
 def _exact_value_check(t_res, c_res) -> tuple[bool, str]:
     """dtype, shape, and every value bit-for-bit -- no tolerance.
 
@@ -2029,6 +2121,34 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    # The scalar rule (docs/SCALAR.md §3.3), the *narrowing* half of it. Every
+    # exponent above is 2, 0, 0.5 or -1 -- all exactly representable, so this
+    # builder passed while the kernel used the parser's `f64` where upstream
+    # uses `scalar_t`. Bases are positive so that a fractional exponent has a
+    # real answer rather than nan; `float32` is included because this kernel has
+    # no `opmath` widening at all, so narrowing is observable there too.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(t, s),
+            lambda c, s: c_module._aten_dispatch(op, c, s),
+            rule="narrow",
+            why="pow_tensor_scalar_kernel converts the exponent to the "
+                "dispatched scalar_t, not to opmath_t",
+            # **`float32` is deliberately absent**, and not because the rule
+            # stops there -- it does not, `float32` narrows too. Upstream's
+            # `float32` `pow` answers *different bits for the same element
+            # depending on the tensor's length* (measured: `f32([...8 values])
+            # ** 0.3` disagrees with the same elements one at a time on 4 of 8;
+            # SLEEF's vectorised `powf` against libm's on the tail). A case here
+            # would be pinned to whichever road an 8-element tensor happens to
+            # take, which is the shape of a test that passes for the wrong
+            # reason. docs/SCALAR.md §3.3.
+            dtypes=["float16", "bfloat16"],
+            values=[3.0, 5.0, 7.0, 11.0, 13.0, 96.0, 2.0, 0.5],
+        )
+    )
+
     return cases
 
 
@@ -2165,6 +2285,26 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_torch=lambda: torch_call(2, e_t),
             run_c=lambda: c_module._aten_dispatch(op, 2, e_c),
             note="upstream [0, 8, 0, 1] -- the overload that refuses is Tensor_Scalar",
+        )
+    )
+
+    # The scalar rule, on the *base* rather than the exponent (docs/SCALAR.md
+    # §3.3). Same narrowing, same blind spot: every base above (2.0, 0.0, -1.0)
+    # is exactly representable. The tensor here is the exponent, so its values
+    # are small and exact and the scalar is what carries the rounding.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(s, t),
+            lambda c, s: c_module._aten_dispatch(op, s, c),
+            rule="narrow",
+            why="pow_scalar's base goes through the same scalar_t conversion "
+                "pow_tensor_scalar_kernel's exponent does",
+            # `float32` absent for `pow.Tensor_Scalar`'s reason -- the same
+            # length-dependence, seen here at exponent 0.5 of an 8-element
+            # tensor: 1.1401753425598145 in the vector, 1.140175461769104 alone.
+            dtypes=["float16", "bfloat16"],
+            values=[1.0, 2.0, 3.0, 0.0, -1.0, 4.0, 0.5, -2.0],
         )
     )
 
@@ -3632,6 +3772,35 @@ def _div_mode_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                 expect="both_error",
                 note="upstream: \"div expected rounding_mode to be one of None, "
                 "'trunc', or 'floor'\" -- matched exactly and case-sensitively",
+            )
+        )
+
+    # The reduced-float scalar rule, docs/SCALAR.md §3.2. `div_floor_kernel` and
+    # `div_trunc_kernel` carry the same `original_scalar_value<opmath_t>(2)`
+    # branch `div_true_kernel` does, so BOTH rounding modes widen -- and here a
+    # single narrowing step does not shift the answer by one ULP, it shifts it by
+    # a whole integer: bfloat16 `3 // 0.3` is 10 upstream and was 9 here.
+    for mode in ("floor", "trunc"):
+        cases.extend(
+            _scalar_rule_cases(
+                torch_module, c_module, op,
+                lambda t, s, m=mode: torch_call(t, s, rounding_mode=m),
+                lambda c, s, m=mode: c_module._aten_dispatch(op, c, s, rounding_mode=m),
+                rule="widen",
+                why=f"div_{mode}_kernel's reduced-float branch reads "
+                    "original_scalar_value<opmath_t>(2) and computes "
+                    f"div_{mode}_floating entirely in opmath",
+                # **`_SCALAR_RULE_VALUES` cannot see this op** and sabotage F4
+                # is what said so: at `[3, 5, 7, 11, 13, 96, -3, -5]` the two
+                # rules agree for every scalar but two of six (dtype, scalar)
+                # pairs, because upstream's fmod-based algorithm lands on the
+                # same integer from either divisor at small magnitudes. These
+                # values were measured to separate 4/8 at `bfloat16, 0.3`,
+                # 3/8 at `float16, 0.7` and 8/8 at `float16, 0.1` -- and the
+                # two dtypes need *different* scalars, which is why 0.1 is here
+                # and is not in the shared list.
+                values=[7.0, 14.0, 40.0, 43.0, 48.0, 61.0, 100.0, -49.0],
+                separating=(0.3, 0.7, 1.3, 0.1),
             )
         )
 
@@ -13349,6 +13518,20 @@ def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: bool*2.5 -> tensor([2.5,0.,2.5], dtype=float32); same gap, float scalar",
         )
     )
+    # The blind spot docs/TRAIN.md §5 predicted and docs/SCALAR.md fixed: every
+    # scalar above (2.0, 0.0, -1.5) is exactly representable in float16 and
+    # bfloat16, so this builder passed while the kernel narrowed a scalar
+    # upstream widens.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(t, s),
+            lambda c, s: c_module._aten_dispatch(op, c, s),
+            rule="widen",
+            why="mul_kernel's reduced-float branch reads "
+                "original_scalar_value<opmath_t>(2), the un-narrowed Scalar",
+        )
+    )
     return cases
 
 
@@ -14890,6 +15073,30 @@ def floor_divide_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, i_c, t_c),
             expect="both_error",
             note="aten::floor_divide.Scalar takes a Scalar; a Tensor there is aten.floor_divide.default",
+        )
+    )
+
+    # The reduced-float scalar rule (docs/SCALAR.md §3.2), and with it the
+    # `float64` gap that shares its cause: this builder's float coverage was
+    # `// 2.0` and `// 0.0`, both of which are exactly representable *and* land
+    # on an exact quotient, so `floor(a/b)` and upstream's fmod-based
+    # `div_floor_floating` agreed on every one of them. `-3.0 // 0.3` is `-11`
+    # upstream (the f64 quotient is -10.000000000000002) and was `-10` here.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(t, s),
+            lambda c, s: c_module._aten_dispatch(op, c, s),
+            rule="widen",
+            why="div_floor_kernel's reduced-float branch reads "
+                "original_scalar_value<opmath_t>(2); at float64 the same call "
+                "exposes that this key floored the quotient instead of running "
+                "upstream's div_floor_floating",
+            dtypes=["float64", "float32", "float16", "bfloat16"],
+            # `_div_mode_scalar_cases`' set, for its reason -- the shared
+            # values separate almost nothing under a floor. See there.
+            values=[7.0, 14.0, 40.0, 43.0, 48.0, 61.0, 100.0, -49.0],
+            separating=(0.3, 0.7, 1.3, 0.1),
         )
     )
     return cases
@@ -18312,6 +18519,23 @@ def mul__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.mul_.Scalar"
     cases = _inplace_scalar_cases(torch_module, c_module, torch_call, op, "mul_")
     cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    # **The one scalar multiply upstream narrows** -- docs/SCALAR.md §2.2.
+    # `mul.Scalar` widens, `div_.Scalar` widens, `x *= 0.3` widens, and
+    # `torch.ops.aten.mul_.Scalar` alone does not (checked over 4096 values x 4
+    # scalars x 2 dtypes, so it is not a vectorisation tail). Pinned rather than
+    # left implicit, because it reads exactly like an op that was missed.
+    cases.extend(
+        _scalar_rule_cases(
+            torch_module, c_module, op,
+            lambda t, s: torch_call(t.clone(), s),
+            lambda c, s: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.clone.default", c), s
+            ),
+            rule="narrow",
+            why="measured: this key, and only this key, disagrees with every "
+                "other spelling of a reduced-float scalar multiply",
+        )
+    )
     return cases
 
 

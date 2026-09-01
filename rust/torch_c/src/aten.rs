@@ -3893,9 +3893,33 @@ fn side_from_tensor(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<PowS
     }
 }
 
+/// The `Scalar` side of a `pow`, **narrowed into the result dtype first**.
+///
+/// `pow` is on the other side of the split docs/SCALAR.md draws: where
+/// `mul_kernel` and `div_*_kernel` read the operand with
+/// `original_scalar_value<opmath_t>`, `pow_tensor_scalar_kernel` converts it to
+/// the dispatched `scalar_t`, so the exponent really is rounded into the
+/// tensor's dtype before `std::pow` sees it. Measured on 2.13.0 over
+/// `[3, 5, 7, 11, 13, 96, 2, 0.5]` and five exponents, in every floating dtype:
+///
+/// ```text
+/// float16  [3] ** 0.3    upstream 1.3896484375   narrowing the exponent 1.3896484375
+///                                                keeping the f64        1.390625
+/// float32  [7] ** 0.3    upstream 1.7927899360   keeping the f64        1.7927900552
+/// ```
+///
+/// **`float32` narrows too**, which is the half that is easy to get wrong:
+/// `opmath_type<float>` is `float`, so there is no widening anywhere in this
+/// kernel and the `f64` the parser produced is never the value upstream uses.
+/// `float64` narrows to itself, so the same line is correct for all four.
+///
+/// The residual `float32`/`float64` disagreements that remain after this
+/// (1 of 7 exponents, ~1 ULP) are `powf` against libm, not the scalar rule --
+/// on the pair that separates them, `5.0 ** -1.5`, this shim's `f64` road is
+/// the *correctly rounded* `float32` answer and upstream's is one step below.
 fn side_from_scalar(value: &Scalar, tag: TorchDType) -> PowSide {
     if tag.is_floating_point() {
-        PowSide::Floats(vec![value.as_f64()])
+        PowSide::Floats(vec![float_narrower(tag)(value.as_f64())])
     } else {
         PowSide::Ints(vec![value.as_i64()])
     }
@@ -4798,11 +4822,34 @@ fn arith_scalar(
     // this reason. The key stays `mul.Scalar` here because that is what the
     // *parser* picked, and the parser is what this shim reproduces.
     //
-    // Built at `acc`, not at `storage`: narrowing the scalar first would round
-    // `0.3` to `bfloat16` and then round the result again, where torch rounds
-    // once. `opmath_in` has the measurement.
+    // **Where the scalar gets rounded is a property of the kernel, not of the
+    // `.Scalar` family**, and the two halves disagree. Both measured on 2.13.0
+    // over 420 values per dtype; docs/SCALAR.md has the table.
+    //
+    //   `mul`, `div`   read the operand at `opmath_t` --
+    //                  `original_scalar_value<opmath_t>(2)` in
+    //                  `mul_kernel`/`div_true_kernel` reads the `Scalar`
+    //                  itself, *before* the iterator's cast to the common
+    //                  dtype. `bfloat16([3]) * 0.3` is `0.8984375`, which is
+    //                  `bf16(3f * 0.3f)`.
+    //   `add`, `sub`   have no such branch, so the operand arrives through the
+    //                  iterator's common dtype and really is narrowed:
+    //                  `bfloat16 + 0.3` adds `0.30078125`
+    //                  (docs/GENERATE.md §3.2), and `alpha` narrows with it
+    //                  (`scale_by_alpha`).
+    //
+    // This shim narrowed for all four until docs/SCALAR.md, which made
+    // `bfloat16 * 0.3` answer `0.90234375` where upstream answers `0.8984375`.
+    // It was found by a sabotage fault that *failed to fail*: the narrowing
+    // made "scale the mask" and "scale the input" bit-identical here where
+    // upstream separates them (docs/TRAIN.md §5, S4).
+    let widen_scalar = matches!(kind, Arith::Mul | Arith::Div);
     let right = if storage.is_int() {
         Tensor::full(other.as_i64() * (alpha as i64), (), left.device()).and_then(|t| t.fast_to(acc))
+    } else if widen_scalar {
+        // Built at `acc` and never at `storage`: `fast_to(acc)` on an `f64`
+        // fill is exactly `opmath_t(scalar)`, the `float` upstream reads.
+        Tensor::full(other.as_f64() * alpha, (), left.device()).and_then(|t| t.fast_to(acc))
     } else {
         // Narrowed to `storage` and widened back, not built at `acc`: torch's
         // promotion makes a python float beside a `bfloat16` tensor a
@@ -8055,17 +8102,35 @@ fn div_mode(
         .fast_to(storage)
         .and_then(|t| t.broadcast_as(shape.clone()))
         .map_err(|e| candle_err(op, e))?;
+    // **A reduced-float scalar divisor takes upstream's `opmath_t` road**,
+    // exactly as `div.Scalar`'s reciprocal fast path does: `div_floor_kernel`
+    // and `div_trunc_kernel` carry the same
+    // `iter.is_scalar(2) && isReducedFloatingType(dtype)` branch that
+    // `div_true_kernel` does, read the divisor with
+    // `original_scalar_value<opmath_t>(2)`, and run the whole of
+    // `div_floor_floating` in `float` -- narrowing once on store rather than at
+    // every step. docs/SCALAR.md §3.2.
+    //
+    // Here the difference is not one representable step. A floor turns a
+    // fractional error into an integer one: `bfloat16(3) // 0.3` is **10**
+    // upstream and was **9** here, because `bf16(0.3)` is `0.30078125` and
+    // `3 / 0.30078125` is `9.97`.
+    let scalar_at_opmath = scalar_form
+        && matches!(storage, candle_core::DType::F16 | candle_core::DType::BF16);
     let b = if scalar_form {
         let scalar =
             scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
-        // Narrowed to `storage` first: see the doc comment's `uint8` case.
+        // Narrowed to `storage` first: see the doc comment's `uint8` case. The
+        // reduced-float branch above is the exception, and `float` is as narrow
+        // as the divisor ever gets there.
+        let target = if scalar_at_opmath { candle_core::DType::F32 } else { storage };
         let filled = if storage.is_int() {
             Tensor::full(scalar.as_i64(), (), left.device())
         } else {
             Tensor::full(scalar.as_f64(), (), left.device())
         };
         filled
-            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.fast_to(target))
             .and_then(|t| t.broadcast_as(shape.clone()))
             .map_err(|e| candle_err(op, e))?
     } else {
@@ -8076,9 +8141,18 @@ fn div_mode(
             .map_err(|e| candle_err(op, e))?
     };
 
+    // `read_flat`'s category (float vs int) is the tag's; the *value* is read
+    // at `f64` either way, so `b` built at `F32` above arrives un-narrowed.
     let values = match (read_flat(op, &a, tag)?, read_flat(op, &b, tag)?) {
         (Flat::Float(x), Flat::Float(y)) => {
-            let narrow = float_narrower(tag);
+            // The intermediates follow the divisor: `opmath` for the
+            // reduced-float scalar branch, the tensor's own dtype otherwise
+            // (docs/KERNELS26.md §9.3 measured that per-step narrowing).
+            let narrow = float_narrower(if scalar_at_opmath {
+                TorchDType::Float32
+            } else {
+                tag
+            });
             let f = if mode == RoundMode::Trunc {
                 div_trunc_float
             } else {
@@ -11461,6 +11535,11 @@ fn floor_divide_impl(
     }
     let raw_other = required(op, args, kwargs, 1, "other")?;
     let n = lhs.tensor()?.elem_count();
+    // Whether the divisor may keep `opmath` precision: only a real `Scalar`
+    // divisor on a reduced-float tensor reaches upstream's `is_scalar(2)`
+    // branch. A tensor divisor goes through the ordinary iterator, which casts
+    // it to the common dtype.
+    let mut scalar_at_opmath = false;
     let other_flat: Flat = if let Ok(other_tensor) = raw_other.extract::<PyTensorBase>() {
         if other_tensor.tag() != tag {
             return Err(not_implemented(format!(
@@ -11481,7 +11560,19 @@ fn floor_divide_impl(
     } else {
         let scalar = scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
         if tag.is_floating_point() {
-            Flat::Float(vec![scalar.as_f64()])
+            // **Narrowed to `opmath_t`, not to the tensor's dtype**:
+            // `floor_divide` is `div_floor_kernel`, so a reduced-float scalar
+            // divisor is read at `opmath_t` exactly as `div.Scalar_mode(floor)`
+            // reads it (docs/SCALAR.md §3.2). `f32` *is* `opmath_t` for both
+            // reduced floats; for `float32` and `float64` there is no
+            // reduced-float branch at all and the divisor narrows to the
+            // tensor's own dtype.
+            //
+            // **The `f64` the parser produced is never the right value**, in
+            // any dtype -- `float32 -3.0 // 0.3` differs between the two.
+            scalar_at_opmath = matches!(tag, TorchDType::Float16 | TorchDType::BFloat16);
+            let target = if scalar_at_opmath { TorchDType::Float32 } else { tag };
+            Flat::Float(vec![float_narrower(target)(scalar.as_f64())])
         } else {
             Flat::Int(vec![scalar.as_i64()])
         }
@@ -11490,8 +11581,26 @@ fn floor_divide_impl(
     let self_flat = read_flat(op, lhs.tensor()?, tag)?;
     let out_flat = match (self_flat, other_flat) {
         (Flat::Float(a), Flat::Float(b)) => {
+            // **`floor(a / b)` is not what upstream computes**, which
+            // `div_floor_float`'s own doc comment has said since it was
+            // written -- this key was calling the plausible version instead of
+            // the transcribed one, and the two disagree wherever the `f64`
+            // quotient lands just under an integer. `float64 -3.0 // 0.3` is
+            // `-11` upstream (the quotient is -10.000000000000002) and was
+            // `-10` here. Sharing the function is what stops the two spellings
+            // of floor division from drifting apart again.
+            let narrow = float_narrower(if scalar_at_opmath {
+                TorchDType::Float32
+            } else {
+                tag
+            });
             let get = |i: usize| if b.len() == 1 { b[0] } else { b[i] };
-            Flat::Float(a.iter().enumerate().map(|(i, &x)| (x / get(i)).floor()).collect())
+            Flat::Float(
+                a.iter()
+                    .enumerate()
+                    .map(|(i, &x)| div_floor_float(x, get(i), narrow))
+                    .collect(),
+            )
         }
         (Flat::Int(a), Flat::Int(b)) => {
             let get = |i: usize| if b.len() == 1 { b[0] } else { b[i] };

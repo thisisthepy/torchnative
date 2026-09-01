@@ -1165,6 +1165,12 @@ promotion (Scalar_mode)     the wrapped-number rule -- an int scalar never widen
                             a float scalar floats an integral tensor
 uint8(200) / -3   floor     0        -- the scalar narrows to 253 BEFORE dividing
 int8(100)  / -3   floor     -34      -- and to -3 here, because int8 is signed
+bf16(40)   / 0.3  floor     133      -- but a REDUCED-FLOAT scalar does NOT narrow:
+                                        div_floor_kernel reads it at opmath_t just
+                                        as div_true_kernel does, and narrowing
+                                        answers 132. Wrong here until
+                                        docs/SCALAR.md §3.2; a floor turns the
+                                        rounding step into a whole unit
 i64::MIN   / -1   both      i64::MIN -- wrapping_div, as remainder uses wrapping_rem
 integral divisor 0          RuntimeError('ZeroDivisionError'), trunc/floor only
 floating divisor 0          inf/-inf/nan, no raise, every mode
