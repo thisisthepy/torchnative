@@ -2822,6 +2822,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     # -- `_C._nn`, and the two composites that are not overload sets -------
     _install_nn(module, dispatch)
+    # Bound once here rather than looked up per call: it is read on the hot
+    # path in `_torch_level_function` and `_tensor_method`, and it is a Rust
+    # builtin that nothing replaces.
+    global _CAPTURE_ACTIVE
+    _CAPTURE_ACTIVE = module._capture_active
     _install_composites(module, varfns, dispatch)
 
     # -- the enum instances `_initExtension` writes into `torch` -----------
@@ -3196,6 +3201,104 @@ def _install_torch_function_modes(module) -> None:
     module._shim_profiler_markers = sorted(_PROFILER_MARKERS)
 
 
+
+def _compile_fast_path(fn, name, entry, dispatch, is_method):
+    skip = 1 if is_method else 0
+    lines = [
+        "def _fast(args):",
+        "    dispatch = getattr(_sys.modules.get('_C'), '_aten_dispatch', None) or getattr(_sys.modules.get('torch._C'), '_aten_dispatch', None)",
+        "    if dispatch is None: return NotImplemented",
+        "    n_args = len(args)",
+    ]
+    if is_method:
+        lines.append("    self = args[0]")
+        lines.append("    n_args -= 1")
+        
+
+    if not entry._armed:
+        checker = entry._checker_source()
+        for plan, _key in entry._candidates:
+            if not plan.armed:
+                plan.arm(checker)
+        entry._armed = True
+
+    import sys
+    g = {"_sys": sys, "NotImplemented": NotImplemented}
+    
+    for c_idx, (plan, key) in enumerate(entry._candidates):
+        required_kwarg_only = any(
+            not arg.has_default for arg in plan.arguments[plan.n_positional:]
+        )
+        if required_kwarg_only:
+            continue
+            
+        if plan.varargs_intlist:
+            lines.append(f"    # Candidate {c_idx} varargs_intlist")
+            lines.append(f"    if n_args > {skip}:")
+            target_idx = 1 if is_method else 0
+            lines.append(f"        if type(args[{target_idx}]) is int:")
+            if is_method:
+                lines.append(f"            return dispatch('{key}', self, args[1:])")
+            else:
+                lines.append(f"            return dispatch('{key}', args)")
+                
+        for L in range(plan.n_positional - skip, -1, -1):
+            can_match = True
+            for i in range(skip + L, plan.n_positional):
+                if not plan.positional[i].has_default:
+                    can_match = False
+                    break
+            if not can_match:
+                continue
+                
+            lines.append(f"    if n_args == {L}:")
+            conds = []
+            if is_method:
+                p_name = f"p_{c_idx}_0"
+                g[p_name] = plan.positional[0].predicate
+                conds.append(f"{p_name}(self)")
+            
+            for i in range(L):
+                p_name = f"p_{c_idx}_{skip + i}"
+                g[p_name] = plan.positional[skip + i].predicate
+                arg_idx = i + 1 if is_method else i
+                conds.append(f"{p_name}(args[{arg_idx}])")
+                
+            if conds:
+                lines.append(f"        if {' and '.join(conds)}:")
+                indent = "            "
+            else:
+                indent = "        "
+                
+            call_args = []
+            if is_method:
+                call_args.append("self")
+            for i in range(L):
+                arg_idx = i + 1 if is_method else i
+                if plan.positional[skip + i].sized_int_list:
+                    call_args.append(f"(args[{arg_idx}],) if type(args[{arg_idx}]) is int else args[{arg_idx}]")
+                else:
+                    call_args.append(f"args[{arg_idx}]")
+                    
+            call_str = ", ".join(call_args)
+            if call_str:
+                lines.append(f"{indent}return dispatch('{key}', {call_str})")
+            else:
+                lines.append(f"{indent}return dispatch('{key}')")
+                
+    lines.append("    return NotImplemented")
+    source = "\n".join(lines)
+    exec(source, g)
+    fn._fast = g["_fast"]
+    fn._compiled = True
+
+
+# Replaced with `module._capture_active` at install time (see `_install_*`).
+# Until then nothing has captured yet, so answering False is correct.
+def _CAPTURE_ACTIVE() -> bool:
+    return False
+
+
 def _torch_level_function(name: str, dispatch, overloads):
     """A `torch.<name>` harvested from `_VariableFunctions`.
 
@@ -3244,6 +3347,29 @@ def _torch_level_function(name: str, dispatch, overloads):
         def fn(*args, **kwargs):
             if _MODE_STACK:
                 return _through_torch_function_modes(fn, args, kwargs)
+            if not getattr(fn, "_compiled", False):
+                _compile_fast_path(fn, name, entry, dispatch, False)
+            # **The fast path is off while a capture records.** A recording
+            # made through it carries no argument names -- `dispatch` is
+            # called positionally, which is the whole saving -- so the same
+            # call would be recorded two different ways depending on whether
+            # the caller spelled its arguments out:
+            #
+            #     t.transpose(0, 1)            kwargs []
+            #     t.transpose(dim0=0, dim1=1)  kwargs ['dim0', 'dim1', 'self']
+            #
+            # A trace's contents must not depend on that. The decomposition
+            # pass reads operands by the schema's names (the third wall in
+            # `test_decompose_lowers_the_op_capture_md_named`), so the nameless
+            # shape reaches it as an empty map rather than as an error.
+            #
+            # `_capture_active()` is one call per op and this is the hot path,
+            # so it is guarded by `_fast` being reached at all -- and a capture
+            # is not open during decode, which is where the saving was measured.
+            if not kwargs and not _CAPTURE_ACTIVE():
+                res = fn._fast(args)
+                if res is not NotImplemented:
+                    return res
             # `_strip_python_only_kwargs({})` is `{}`, and `**kwargs` already
             # handed us a fresh dict, so the call is skippable when it would
             # have nothing to strip. Most calls are in that case.
@@ -3291,6 +3417,14 @@ def _tensor_method(name: str, dispatch, entry):
     is_dunder = name.startswith("__") and name.endswith("__")
 
     def method(self, *args, **kwargs):
+        if not getattr(method, "_compiled", False):
+            _compile_fast_path(method, name, entry, dispatch, True)
+        # See the `fn` branch above: a recording must not depend on whether the
+        # caller spelled its arguments out.
+        if not kwargs and not _CAPTURE_ACTIVE():
+            res = method._fast((self,) + args)
+            if res is not NotImplemented:
+                return res
         try:
             # See `_torch_function` above for why the empty case skips the call.
             key, bound = entry.resolve(

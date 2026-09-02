@@ -16170,5 +16170,96 @@ def test_an_offline_wrapper_is_the_model_it_wraps():
     assert len(r["offline_forward"]) == 5 * 24, len(r["offline_forward"])
 
 
+def test_a_capture_records_the_same_call_the_same_way_either_spelling():
+    """The positional fast path must not change what a trace contains.
+
+    `_torch_level_function` and `_tensor_method` take a fast path that skips
+    `entry.resolve`, and skipping it means `_aten_dispatch` is called with no
+    keyword arguments -- which is the whole saving. A recording made that way
+    carries no operand names, so before the guard the same call came back two
+    different ways depending on how the caller happened to spell it:
+
+        t.transpose(0, 1)             kwargs []
+        t.transpose(dim0=0, dim1=1)   kwargs ['dim0', 'dim1', 'self']
+
+    The decomposition pass reads operands by the schema's names -- the third
+    wall in `test_decompose_lowers_the_op_capture_md_named` -- so the nameless
+    shape reached it as an empty map rather than as an error. A wrong answer,
+    not a crash, and the golden harness cannot see it: the op results were
+    right, it was the recording that was short.
+
+    The two spellings are asserted to agree rather than asserting either one's
+    contents, so this keeps holding if the recorded names change for some other
+    reason. The last assertion pins the names as well, because two empty maps
+    also agree.
+    """
+    V = _C._VariableFunctions
+
+    def recorded(call):
+        # `try`/`finally`, because a capture left open by a failing assertion
+        # poisons every test after it -- `_capture_begin` refuses to nest, so
+        # one red test became thirty-six while this was being written.
+        t = _C._tensor_new_from_data([[1.0, 2.0], [3.0, 4.0]])
+        _C._capture_begin([t])
+        try:
+            trace = _C._capture_end(call(t))
+        finally:
+            if _C._capture_active():
+                _C._capture_end(t)
+        return [(n["op"], sorted((n.get("kwargs") or {}))) for n in trace.nodes]
+
+    pairs = [
+        (lambda t: t.transpose(0, 1), lambda t: t.transpose(dim0=0, dim1=1)),
+        (lambda t: t.mul(2.0), lambda t: t.mul(other=2.0)),
+        (lambda t: V.add(t, 2.0), lambda t: V.add(self=t, other=2.0)),
+    ]
+    for positional, keyword in pairs:
+        assert recorded(positional) == recorded(keyword), (
+            recorded(positional),
+            recorded(keyword),
+        )
+
+    ops = recorded(lambda t: t.transpose(0, 1))
+    assert ops == [("aten.transpose.int", ["dim0", "dim1", "self"])], ops
+
+
+def test_the_fast_path_falls_back_rather_than_binding_the_wrong_slot():
+    """Keyword arguments reach the slow path, not a positional guess.
+
+    The generated `_fast` answers `NotImplemented` when handed keywords and the
+    caller falls through to `entry.resolve`. This compares results rather than
+    checking which path ran, because that is the failure that would hurt: a
+    wrong-slot binding returns a tensor, it does not raise.
+    """
+    V = _C._VariableFunctions
+    t = _C._tensor_new_from_data([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]])
+
+    assert t.transpose(0, 1).tolist() == t.transpose(dim0=0, dim1=1).tolist()
+    assert t.mul(3.0).tolist() == t.mul(other=3.0).tolist()
+    assert V.add(t, 5.0).tolist() == V.add(self=t, other=5.0).tolist()
+    # Asymmetric on purpose. `add` and `mul` commute, so a fast path that put
+    # the operands in the wrong slots would pass every assertion above; `pow`
+    # has a Scalar-base overload as well, and the two disagree.
+    assert V.pow(t, 2.0).tolist() != V.pow(2.0, t).tolist()
+    assert V.pow(t, 2.0).tolist() == V.pow(self=t, exponent=2.0).tolist()
+
+    # An overload boundary, checked by result rather than by recorded key.
+    # `add.Tensor` and `add.Scalar` promote by different rules (docs/SCALAR.md),
+    # so selecting the wrong schema changes the dtype rather than raising --
+    # and the recorded key is not available to look at here, because the fast
+    # path is off while a capture is open (see the test above).
+    ones = _C._tensor_new_from_data([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+    assert V.add(t, ones).tolist() == V.add(self=t, other=ones).tolist()
+    assert str(V.add(t, 1.0).dtype) == "torch.float32", V.add(t, 1.0).dtype
+
+    # The sharper discriminator is not available. A float64 second operand
+    # would separate the two overloads by result dtype -- `add.Tensor` promotes
+    # to the wider operand where `add.Scalar` narrows to `self` -- but the shim
+    # refuses that pair outright: "aten.add.Tensor: dtype promotion not
+    # implemented in torch._C shim: float32 vs float64". So the overload is
+    # covered here by agreement between the spellings rather than by a value
+    # only one of them could produce.
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
