@@ -47,10 +47,15 @@ admits one. It refuses with a check the reader can run rather than with a claim
 about the world, because a refusal that names a fact goes stale the day the
 fact changes and this repository has paid for that six times.
 
-``persist`` deliberately does **not** go through ``torch.save``.
-docs/BACKWARD.md §14 measures what that would need and why it is the wrong
-instrument: its blocker is a storage object that aliases its tensor, which this
-stack does not have and cannot honestly fake.
+``persist`` deliberately does **not** go through ``torch.save``, and the
+reason is no longer the one BACKWARD.md §14 gave. That section said the blocker
+was a storage object aliasing its tensor, which this stack could not honestly
+fake; docs/SAVE.md §2 found the danger was real and the remedy wrong -- what has
+to refuse is the *write*, not the aliasing -- and ``torch.save`` now works.
+
+What remains is a choice of format rather than a wall: safetensors is a flat,
+mmap-able, pickle-free container, and a delta on the wire is exactly the payload
+where not executing arbitrary pickle on arrival is worth something.
 """
 
 from __future__ import annotations

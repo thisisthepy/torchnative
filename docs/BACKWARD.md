@@ -852,8 +852,8 @@ experiment `_ZipRecords`' docstring records for the reader.
 |---|---|---|
 | 1 | `torch._C._has_storage(t)` | a bool | one line |
 | 2 | `torch._C._get_tensor_metadata(t)` | a dict, empty here | one line |
-| 3 | `TensorBase.storage_offset()` | always 0 — storages here are copies, never windows | one line |
-| 4 | `TensorBase.stride()` | contiguous strides from the shape | a few lines |
+| 3 | `TensorBase.storage_offset()` | ~~always 0 — storages here are copies, never windows~~ **wrong, see below** | one line |
+| 4 | `TensorBase.stride()` | ~~contiguous strides from the shape~~ **wrong, see below** | a few lines |
 | 5 | `UntypedStorage._cdata` | an identity key, for storage de-duplication | one line |
 | 6 | **`TensorBase.untyped_storage()`** | the tensor's bytes as an `UntypedStorage` | **§14.3** |
 | 7 | **`PyTorchFileWriter`** | ctor + `write_record` + `write_end_of_file` | the container |
@@ -900,6 +900,18 @@ detect it.
 
 **So the honest sizing is not "seven items".** It is *five one-liners, one container, and one
 decision this round is not entitled to take* — and the decision is the whole of it.
+
+> **docs/SAVE.md took that decision, and this section is right about the danger and wrong about
+> the remedy.** A copy that silently swallows writes is exactly the lie described — but the thing
+> that has to refuse is the **write**, not the storage. All four write doors (`__setitem__`,
+> `copy_`, `resize_`, `_shim_fill`) now refuse and name the snapshot, and `torch.save` works:
+> upstream reads what it writes bit-for-bit, and storage sharing survives.
+>
+> Rows 3 and 4 of the table above were wrong for a related reason — both assume
+> `untyped_storage()` returns *the tensor's* bytes. Upstream's storage is the **whole buffer** and
+> the three numbers index into it, so a materialised view produces a file whose stride and offset
+> lie about their own payload. `_cdata` likewise had to be the buffer's identity and not the Python
+> object's, or de-duplication inverts. SAVE.md §2.
 
 ### 14.4 The right instrument, and it was taken
 

@@ -118,11 +118,15 @@ engine.participate()          # local epochs, then contribute a delta
 sixteen value-producing collectives are byte-identical to upstream's `gloo`; what needs a second
 rank refuses by name rather than pretending. `torchnative.nn.federated` above it is still empty.
 
-What it is waiting on is three named things, and only two are about distribution: a second rank
-(`ProcessGroupLocal` refuses `world_size != 1`), a rendezvous (`TCPStore` refuses; `HashStore` is
-process-local), and **a delta on the wire** — `torch.save` refuses, so the local update cannot be
-written to bytes at all. That third one is shared with test-time adaptation, which is why
-`Delta.publish` in §3 is the seam this attaches to rather than a separate stack
+What it was waiting on was three named things, and **the third is closed**: `torch.save` works,
+upstream reads what it writes bit-for-bit across eight dtypes, and storage sharing survives the
+round trip — `x`, `x.t()` and `x[1]` land in one record and come back sharing one storage
+([`docs/SAVE.md`](docs/SAVE.md)). A delta goes to bytes: `torch.save(delta.value)` is 1871 B.
+
+The two that remain are both about distribution: a second rank (`ProcessGroupLocal` refuses
+`world_size != 1` — it has no transport) and a rendezvous (`TCPStore` refuses; `HashStore` is
+process-local). `Delta.publish` now reaches the first of those rather than serialisation, which is
+why it is still the seam this attaches to rather than a separate stack
 ([`docs/ADAPT.md`](docs/ADAPT.md) §1).
 
 ### 3 · Test-time adaptation & training
@@ -195,7 +199,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>168</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>7685 / 7685</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>335</b></td></tr>
+<tr><td>Smoke tests</td><td><b>341</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>

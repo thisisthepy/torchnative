@@ -3153,8 +3153,276 @@ class _ZipRecords:
             return ""
 
 
+# The zip container's *extra field* header id torch pads local file headers
+# with. Measured off a 2.13.0 archive: every record's extra field is
+# `46 42 <len-4 LE> 5a 5a ...` -- id 0x4246, then that many `Z` bytes -- and
+# every payload consequently starts on a 64-byte boundary. It is the id
+# torch's miniz fork uses for exactly this, and it is written here so an
+# archive from this shim has the same shape as one from upstream rather than
+# merely the same contents.
+_ZIP_ALIGN_EXTRA_ID = 0x4246
+
+# What `zipfile` adds to a local file header when the entry needs zip64, and
+# the condition it adds it under (CPython 3.13 `ZipFile._open_to_write`:
+# `zip64 = force_zip64 or (zinfo.file_size * 1.05 > ZIP64_LIMIT)`, and
+# `ZipInfo.FileHeader(zip64)` then prepends a 20-byte extra field). It is
+# reproduced rather than ignored because the alignment arithmetic below has to
+# know the header's real length -- getting it wrong would not raise, it would
+# put every payload of a >2 GB checkpoint 20 bytes off the boundary the
+# `.storage_alignment` record claims.
+_ZIP64_EXTRA_LEN = 20
+_ZIP64_LIMIT = (1 << 31) - 1
+
+
+class _ZipWriter:
+    """`torch._C.PyTorchFileWriter` over CPython's `zipfile`.
+
+    The writing half of `_ZipRecords`, and it is here for the same reason that
+    one is (see the section comment above): the container is an ordinary zip
+    archive, nothing in it computes, and the standard library already has a
+    correct zip writer. What this class owns is the two things `zipfile` does
+    not know about -- torch's record *naming* and torch's payload *alignment*.
+
+    **`write_end_of_file` is the method the traceback names when a save
+    fails, and it is almost never the method at fault.**
+    `torch/serialization.py:1002` puts the whole of `_save` inside
+    `with _open_zipfile_writer(f) as z:`, and `__exit__` (:854) calls this
+    unconditionally. An exception from inside the block runs `__exit__`, which
+    raises its own, and the second one is what propagates -- so before this
+    class existed, *every* failure anywhere on the save path was reported as
+    `PyTorchFileWriter.write_end_of_file`. docs/SAVE.md §1.
+
+    The three records `_save` does not write are written here, matching where
+    upstream's C++ writer writes them:
+
+    | record | who | value |
+    |---|---|---|
+    | `version` | `writeEndOfFile()` | `3\\n`, upstream's, and the C++ *reader* validates it |
+    | `.data/serialization_id` | `writeEndOfFile()` | **not written** -- see `serialization_id` |
+    | everything else | `_save` | unchanged |
+    """
+
+    def __init__(self, name_or_buffer, compute_crc32=True, storage_alignment=64):
+        import os
+        import zipfile
+
+        self._own_stream = None
+        if isinstance(name_or_buffer, (str, bytes, os.PathLike)):
+            path = os.fsdecode(name_or_buffer)
+            self._own_stream = open(path, "wb")  # noqa: SIM115 -- closed in write_end_of_file
+            stream = self._own_stream
+            # Upstream names the archive after the file, extension stripped:
+            # `x.pt` -> `x/data.pkl`, `a.b.c.pt` -> `a.b.c/data.pkl`,
+            # `no_ext` -> `no_ext/data.pkl` (all measured on 2.13.0). Nothing
+            # reads the name back -- both readers derive the prefix from the
+            # first entry -- but a file that says `archive/` where upstream
+            # says `x/` is a gratuitous difference in a format other tools
+            # inspect.
+            self._archive = os.path.splitext(os.path.basename(path))[0]
+        else:
+            stream = name_or_buffer
+            self._archive = "archive"
+
+        self._align = max(1, int(storage_alignment))
+        # Accepted and not honoured *downward*: `zipfile` always computes the
+        # CRC, so `compute_crc32=False` gets a correct checksum where upstream
+        # would write zero. That is a superset -- no reader can distinguish a
+        # correct CRC from a required one -- and the alternative would be
+        # hand-writing the local headers to put a deliberate zero in them.
+        self._compute_crc32 = bool(compute_crc32)
+        self._zf = zipfile.ZipFile(stream, "w", zipfile.ZIP_STORED, allowZip64=True)
+        self._written = []
+        # `(payload offset, payload length)` per record written, in order. See
+        # `_next_header_offset` -- the alignment arithmetic needs it and
+        # `ZipInfo.__slots__` will not hold it.
+        self._layout = []
+        self._ended = False
+
+    def _bytes_of(self, name, data, size):
+        """The payload, from any of the three shapes `_save` passes."""
+        if isinstance(data, str):
+            payload = data.encode("utf-8")
+        elif isinstance(data, (bytes, bytearray, memoryview)):
+            payload = bytes(data)
+        else:
+            # A storage. `torch/serialization.py:1312` hands the object itself
+            # (upstream's writer reads through `data_ptr()`); here the bytes
+            # come out of the storage directly, which is also why `data_ptr()`
+            # is free to be an identity rather than a readable address --
+            # nothing on this path reads through it (storage.rs).
+            reader = getattr(data, "_shim_bytes", None)
+            if reader is None:
+                raise NotImplementedError(
+                    "torch._C shim: PyTorchFileWriter.write_record was handed a "
+                    f"{type(data).__name__} for record {name!r}. It writes str, "
+                    "bytes, and this shim's storages; upstream additionally "
+                    "accepts anything exposing a data pointer, which cannot be "
+                    "read from Python"
+                )
+            payload = bytes(reader())
+        if size is not None and len(payload) != size:
+            # Not a formality. `_save` computes `size` from `storage.nbytes()`
+            # and the reader trusts the *pickle's* number, so a disagreement
+            # here is a record whose payload does not match what will be asked
+            # of it -- which reads back as the neighbouring tensor's bytes
+            # rather than as an error (docs/CKPT.md §6).
+            raise RuntimeError(
+                f"torch._C shim: PyTorchFileWriter.write_record({name!r}) was "
+                f"told {size} bytes and given {len(payload)}"
+            )
+        return payload
+
+    def write_record(self, name, data, size=None, compress=False):
+        import struct
+        import zipfile
+
+        if compress:
+            raise NotImplementedError(
+                "torch._C shim: PyTorchFileWriter.write_record(compress=True) "
+                "-- torch writes checkpoints uncompressed and both readers "
+                "here assume ZIP_STORED"
+            )
+        payload = self._bytes_of(name, data, size)
+        full = f"{self._archive}/{name}"
+        # A fixed timestamp, where upstream writes the wall clock. It makes a
+        # save byte-reproducible: the same object saved twice gives the same
+        # file, which is what lets a federated delta be addressed by its hash
+        # (README, docs/DESIGN.md §10). 1980-01-01 is the zip epoch, the
+        # earliest value the format can carry.
+        info = zipfile.ZipInfo(full, date_time=(1980, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_STORED
+        info.external_attr = 0o600 << 16
+
+        # Pad the *local* header's extra field so the payload lands on the
+        # alignment `_save` advertised in the `.storage_alignment` record. A
+        # header is 30 bytes plus the name plus the extra, and the extra field
+        # itself has a 4-byte head -- so a padding of 1..3 is not expressible
+        # and has to become one whole alignment more.
+        zip64 = _ZIP64_EXTRA_LEN if len(payload) * 1.05 > _ZIP64_LIMIT else 0
+        fixed = 30 + len(full.encode("utf-8")) + zip64
+        pad = (-(self._next_header_offset() + fixed)) % self._align
+        if pad and pad < 4:
+            pad += self._align
+        if pad:
+            info.extra = struct.pack("<HH", _ZIP_ALIGN_EXTRA_ID, pad - 4) + b"Z" * (pad - 4)
+
+        self._zf.writestr(info, payload)
+
+        # Upstream's central directory carries no padding -- only the local
+        # header does (measured: `cd_extra=0`, `local_extra=18` and up). The
+        # entry is on disk by now, so clearing it here affects only what
+        # `close()` will put in the directory.
+        info.extra = b""
+
+        # Recorded, not recomputed: this is what the *next* record's alignment
+        # is measured from, and `ZipInfo` has `__slots__` so it cannot carry it.
+        payload_at = info.header_offset + fixed + pad
+        self._layout.append((payload_at, len(payload)))
+        if payload_at % self._align != 0:
+            # Not reachable for any input this file can construct, and checked
+            # anyway because the failure is silent: a `.storage_alignment`
+            # record that says 64 over payloads that are not aligned is a file
+            # that lies about itself, and no reader would complain.
+            raise RuntimeError(
+                "torch._C shim: PyTorchFileWriter could not align record "
+                f"{name!r} -- its payload starts at {payload_at}, which is not "
+                f"a multiple of {self._align}"
+            )
+        self._written.append(name)
+
+    def _next_header_offset(self):
+        """Where `zipfile` will put the next local file header.
+
+        Computed from the last record's own payload position and length rather
+        than read off `ZipFile.start_dir`, which is private. A stored entry on a
+        seekable stream is header + payload and nothing else -- no data
+        descriptor -- so the next header begins where the last payload ends.
+        """
+        if not self._layout:
+            return self._zf.fp.tell()
+        payload_at, payload_len = self._layout[-1]
+        return payload_at + payload_len
+
+    def write_record_metadata(self, name, numbytes):
+        """`torch.serialization.skip_data` -- a record's header with no bytes.
+
+        Refused rather than filled with zeros. The whole point of the context
+        manager is to write a checkpoint whose payloads are supplied later by
+        something else; a shim that quietly wrote `numbytes` zeros would produce
+        exactly the file docs/CKPT.md §4 spent a section on -- one that loads,
+        matches every key, and is all zeros.
+        """
+        raise NotImplementedError(
+            "torch._C shim: PyTorchFileWriter.write_record_metadata "
+            f"({name!r}, {numbytes} bytes) -- this is the "
+            "torch.serialization.skip_data path, which writes a record header "
+            "with no payload for a caller to fill in afterwards. It is refused "
+            "rather than zero-filled (docs/SAVE.md §6)"
+        )
+
+    def write_end_of_file(self):
+        """Close the archive. Idempotent -- `_opener.__exit__` calls it on the
+        way out of a `with` block that may already have failed."""
+        if self._ended:
+            return
+        self._ended = True
+        # Upstream's C++ `writeEndOfFile()` writes this, not `_save`, and its
+        # C++ *reader* validates the number on the way in
+        # (`kMinSupportedFileFormatVersion`). Measured: a 2.13.0 archive holds
+        # exactly `b"3\n"`.
+        if "version" not in self._written:
+            self.write_record("version", "3\n", 2)
+        self._zf.close()
+        if self._own_stream is not None:
+            self._own_stream.close()
+
+    def get_all_written_records(self):
+        return list(self._written)
+
+    def archive_name(self):
+        return self._archive
+
+    def serialization_id(self):
+        """**Not written, and this is the one place where writing something
+        would be worse than writing nothing.**
+
+        Upstream's `writeEndOfFile()` emits a `.data/serialization_id` record:
+        forty digits, two twenty-digit halves, a combined hash of the record
+        names and a combined CRC of their contents. The hash half is
+        `std::hash<std::string>`, which is implementation-defined -- there is
+        no portable way to compute the same number, so any id produced here
+        would differ from upstream's *for identical content*. Its only consumer
+        is a telemetry callback (`torch/serialization.py:2226`) that compares
+        ids to decide whether two checkpoints are the same file, and a
+        deterministic wrong answer to that question is worse than no answer:
+        absent, both readers report `""` (see `_ZipRecords.serialization_id`).
+        """
+        return ""
+
+    def __getattr__(self, name):
+        """The rest of upstream's writer surface, refusing by name.
+
+        This class replaces a synthesised `_C` type, and those answer an
+        unknown member through `_ShimMeta` rather than with an `AttributeError`
+        (rule 2 in this file's docstring: a missing member of a type is a hole,
+        not a switch). Keeping that here means a caller reaching for
+        `set_min_version` or `write_record_metadata`'s neighbours gets a work
+        item instead of a name error.
+
+        Dunders are excluded and get the ordinary `AttributeError`: a
+        `NotImplementedError` from a `__deepcopy__` or `__getstate__` probe
+        would turn a question into a failure.
+        """
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: PyTorchFileWriter.{name}"
+        )
+
+
 def _install_serialization(module) -> None:
     module.PyTorchFileReader = _ZipRecords
+    module.PyTorchFileWriter = _ZipWriter
 
     # `torch/_utils.py:290 _validate_loaded_sparse_tensors` runs at the end of
     # every `torch.load`, and asks this before it looks at what was loaded.
@@ -3163,6 +3431,27 @@ def _install_serialization(module) -> None:
     # answer here for a second reason: this shim has no sparse tensors, so the
     # list those checks would run over is always empty.
     module._check_sparse_tensor_invariants = lambda: False
+
+    def _get_tensor_metadata(tensor):
+        """`torch/_utils.py:get_tensor_metadata`, read once per tensor by
+        `_reduce_ex_internal` (`torch/_tensor.py:531`).
+
+        Upstream's answer for an ordinary tensor is `{}` (measured on 2.13.0),
+        and `_save` appends the metadata to the record only `if metadata:` --
+        so an empty dict means "this tensor has none", which is true of every
+        tensor this shim can make. It is not a stub standing in for something:
+        the metadata upstream can put here is set by
+        `torch._C._set_tensor_metadata`, which stays refused, so there is
+        nothing that could have put a key in it.
+        """
+        if not isinstance(tensor, module.TensorBase):
+            raise TypeError(
+                "torch._C shim: _get_tensor_metadata expected a tensor, got "
+                f"{type(tensor).__name__}"
+            )
+        return {}
+
+    module._get_tensor_metadata = _get_tensor_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -7726,6 +8015,15 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         tensor_cls = getattr(torch_module, "Tensor", None)
         if tensor_cls is not None:
             module._set_tensor_class(tensor_cls)
+        # The same registration, one type over, and needed for the same kind of
+        # `isinstance` check: `torch/storage.py:836` refuses a bare
+        # `torch._C.StorageBase` in `TypedStorage(wrap_storage=...)`, and every
+        # tensor of every `torch.save` goes through that constructor
+        # (`torch/_tensor.py:311`). `torch/__init__.py:1940` imports
+        # `UntypedStorage`, well before :2189 calls this.
+        storage_cls = getattr(torch_module, "UntypedStorage", None)
+        if storage_cls is not None:
+            module._set_storage_class(storage_cls)
         kinds = (module.dtype, module.layout, module.memory_format, module.qscheme)
         for name, value in list(vars(module).items()):
             # Filtered on the *type*, not on the leading underscore. Skipping

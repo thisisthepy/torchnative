@@ -366,6 +366,123 @@ impl PyTensorBase {
         self.tag
     }
 
+    /// Does this tensor have bytes behind it? `torch._C._has_storage`.
+    ///
+    /// Upstream this is `unsafeGetTensorImpl()->has_storage()`, and the one
+    /// thing it is false for on CPU is a meta tensor -- which is exactly the
+    /// distinction `Repr` was made for (docs/META.md §3). A quantised tensor
+    /// owns blocks and answers `true`, as upstream's quantised tensors do;
+    /// what it cannot do is hand those blocks over as a flat storage, and that
+    /// refusal belongs to `storage_snapshot`, one question later.
+    pub fn has_storage(&self) -> bool {
+        !matches!(self.inner, Repr::Meta { .. })
+    }
+
+    /// **The whole candle buffer this tensor's layout addresses**, as
+    /// little-endian bytes, with the identity of that buffer.
+    ///
+    /// Not `to_le_bytes`, and the difference is the entire point. That function
+    /// reads *the view* -- row-major, `numel` elements, offset and stride
+    /// resolved. This reads *the storage*, which is what upstream's
+    /// `untyped_storage()` is: `torch.save` records a tensor as
+    /// `(storage, storage_offset, size, stride)` and expects those three
+    /// numbers to index into the bytes it was handed. Handing over a
+    /// materialised view instead would produce a file whose stride and offset
+    /// were lies about its own payload -- readable, silently wrong, which is
+    /// the failure shape docs/CKPT.md §4 and §5 are both about.
+    ///
+    /// The second return value is the address of candle's `Storage` inside its
+    /// `Arc<RwLock<_>>`. Two tensors that share a buffer -- `x` and `x.t()`,
+    /// `x` and `x[1]` -- give the same number, and that is what lets a save
+    /// preserve storage sharing across a copy (`storage.rs::origin`). It is an
+    /// identity, never dereferenced, and it is only meaningful while the
+    /// tensor is alive -- which on the save path it is, since the object being
+    /// pickled holds it.
+    ///
+    /// Half-width floats are read here even though `to_le_bytes` refuses them.
+    /// That refusal's stated reason -- "this crate does not depend on `half`"
+    /// -- stopped being true when `reduced.rs` took the dependency (Cargo.toml
+    /// names `half = "2.7"`), and leaving it in place here would mean no
+    /// `bfloat16` weight could be saved. `to_le_bytes` itself is left alone: it
+    /// is `from_le_bytes`'s inverse for `aten.view.dtype`, and changing what
+    /// that op accepts is a separate decision with its own golden cases.
+    pub fn storage_snapshot(&self, op: &str) -> PyResult<(Vec<u8>, usize)> {
+        let tensor = self.tensor()?;
+        if !tensor.device().is_cpu() {
+            return Err(not_implemented(format!(
+                "{op}: reading a tensor's storage is implemented for the CPU \
+                 backend only in torch._C shim; this tensor is on {}",
+                self.device_label().__str__()
+            )));
+        }
+        let (guard, _layout) = tensor.storage_and_layout();
+        let storage: &candle_core::Storage = &guard;
+        // The identity, taken before the match so that it does not depend on
+        // which arm the storage is: the address of the `Storage` inside the
+        // `Arc<RwLock<Storage>>` every alias of this tensor shares.
+        let identity = storage as *const candle_core::Storage as usize;
+        let candle_core::Storage::Cpu(cpu) = storage else {
+            return Err(not_implemented(format!(
+                "{op}: torch._C shim can read the storage of a CPU tensor only"
+            )));
+        };
+        macro_rules! pour {
+            ($v:expr, $ty:ty) => {{
+                let v = $v;
+                let mut out = Vec::with_capacity(v.len() * std::mem::size_of::<$ty>());
+                for x in v.iter() {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                out
+            }};
+        }
+        macro_rules! pour_bits {
+            ($v:expr) => {{
+                let v = $v;
+                let mut out = Vec::with_capacity(v.len() * 2);
+                for x in v.iter() {
+                    out.extend_from_slice(&x.to_bits().to_le_bytes());
+                }
+                out
+            }};
+        }
+        let bytes = match cpu {
+            CpuStorage::U8(v) => v.clone(),
+            CpuStorage::U32(v) => pour!(v, u32),
+            CpuStorage::I16(v) => pour!(v, i16),
+            CpuStorage::I32(v) => pour!(v, i32),
+            CpuStorage::I64(v) => pour!(v, i64),
+            CpuStorage::BF16(v) => pour_bits!(v),
+            CpuStorage::F16(v) => pour_bits!(v),
+            CpuStorage::F32(v) => pour!(v, f32),
+            CpuStorage::F64(v) => pour!(v, f64),
+            _ => {
+                return Err(not_implemented(format!(
+                    "{op}: torch._C shim cannot read the raw bytes of a \
+                     torch.{} tensor's candle storage -- \
+                     tensor.rs::storage_snapshot names the storage kinds it \
+                     can read, and this is not one of them",
+                    self.tag.name()
+                )))
+            }
+        };
+        // The one thing that would make a saved file quietly wrong: a byte
+        // count that is not a whole number of the elements `storage_offset`
+        // and `stride` are counted in. Both are element counts against
+        // `tag.itemsize()`, so a disagreement between candle's element width
+        // and the torch tag's would produce a readable, misaligned file.
+        let width = self.tag.itemsize();
+        if width != 0 && bytes.len() % width != 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: torch._C shim internal error -- {} storage bytes is not \
+                 a whole number of torch.{} elements ({width} bytes each)",
+                bytes.len(),
+                self.tag.name()
+            )));
+        }
+        Ok((bytes, identity))
+    }
+
     /// **Rebinding, not writing.** The wrapper stops pointing at one candle
     /// tensor and starts pointing at another; the buffer it used to point at
     /// is untouched, so an alias taken before the call keeps the old values.
@@ -1391,6 +1508,109 @@ impl PyTensorBase {
                 q.dtype().block_size(),
             ))),
         }
+    }
+
+    /// `tensor.untyped_storage()` -- **a snapshot, where upstream lends.**
+    ///
+    /// `torch/_tensor.py:311 _typed_storage` calls this on every tensor of
+    /// every `torch.save`, and `torch/serialization.py`'s `persistent_id`
+    /// turns what comes back into one `data/N` record. It is the mirror of
+    /// `set_`, which is the *load* side's one non-aliasing point (see its
+    /// docstring): upstream hands out the storage a tensor is a view of, and
+    /// this hands out a copy of it, because candle owns its buffer and has no
+    /// way to lend it as a `StorageBase`.
+    ///
+    /// Copying is safe *here* in a way it is not on the load side, and the
+    /// asymmetry is worth naming since docs/CKPT.md §4 spent a section on the
+    /// other direction. Saving reads and never writes, so a snapshot taken
+    /// while the tensor is alive has exactly the bytes the tensor has. What a
+    /// copy cannot carry by itself is *identity* -- and identity is load
+    /// bearing here, because `torch.save` decides how many records to write by
+    /// comparing storages. That is what `storage.rs::origin` is for: the
+    /// snapshot is tagged with the address of the candle buffer it came from,
+    /// so `x` and `x.t()` still answer with one storage and the file still says
+    /// they were views of one buffer.
+    ///
+    /// **A meta or quantised tensor refuses**, from `tensor()` and from
+    /// `storage_snapshot` respectively: a meta tensor has no bytes at all
+    /// (docs/META.md §3, and `torch/_tensor.py:337` takes a different branch
+    /// for it before reaching here), and a quantised one has blocks that are
+    /// not a flat storage in any dtype torch could name in a record.
+    fn untyped_storage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
+        crate::storage::snapshot(py, bytes, origin)
+    }
+
+    /// `tensor.storage_offset()` -- the first element of this view inside its
+    /// storage, in elements.
+    ///
+    /// Real, not zero. `torch.save` writes it into the record and `torch.load`
+    /// feeds it back to `set_`, which walks it (`gather_strided`), so a
+    /// constant zero here would save `x[1]` as if it started at the front of
+    /// its buffer -- shape and dtype right, values from the wrong row, no
+    /// exception anywhere. docs/CKPT.md §5 measured that exact failure coming
+    /// the other way.
+    ///
+    /// A meta tensor refuses rather than answering `0`: `Repr::Meta` carries no
+    /// layout at all (docs/META.md §6 records the narrowing), so `0` would be
+    /// a guess that happens to be right for contiguous meta tensors and wrong
+    /// for the transposed ones upstream's meta does model.
+    fn storage_offset(&self) -> PyResult<usize> {
+        Ok(self.tensor()?.layout().start_offset())
+    }
+
+    /// `tensor.stride()` / `tensor.stride(dim)`, in elements.
+    ///
+    /// candle's `Layout` has carried a real stride since docs/VIEWS.md §6 made
+    /// narrowing alias, so this reports what the tensor actually is rather than
+    /// what a contiguous tensor of its shape would be. It is the fourth of the
+    /// four numbers a `torch.save` record is made of, and the same reasoning as
+    /// `storage_offset` applies: `w.t()` saved with a contiguous stride is a
+    /// file that reads back transposed, silently.
+    ///
+    /// Upstream returns a `torch.Size`; this returns a plain tuple, the same
+    /// narrowing `shape` already documents. `stride(dim)` returns one int, and
+    /// negative `dim` counts from the back, as upstream's does.
+    ///
+    /// **Meta refuses**, for the reason in `Repr::Meta`'s docstring: upstream's
+    /// meta tensor does carry stride and this build's does not model it, so
+    /// answering would invent one.
+    #[pyo3(signature = (dim = None))]
+    fn stride<'py>(&self, py: Python<'py>, dim: Option<isize>) -> PyResult<Bound<'py, PyAny>> {
+        let stride = self.tensor()?.layout().stride().to_vec();
+        let Some(dim) = dim else {
+            return Ok(PyTuple::new(py, &stride)?.into_any());
+        };
+        let rank = stride.len() as isize;
+        let at = if dim < 0 { dim + rank } else { dim };
+        if at < 0 || at >= rank {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Dimension out of range (expected to be in range of [{}, {}], but got {dim})",
+                -rank,
+                rank - 1
+            )));
+        }
+        stride[at as usize].into_bound_py_any(py)
+    }
+
+    /// `tensor.data_ptr()` -- the address of this view's first element.
+    ///
+    /// Storage address plus `storage_offset` in bytes, which is the relation
+    /// upstream has. The address is candle's, not a copy's, so two tensors that
+    /// share a buffer report addresses that differ by exactly their offsets --
+    /// the property `test_which_ops_share_storage_with_their_input_and_which_do_not`
+    /// exists to pin and which, before this, had to be measured indirectly.
+    ///
+    /// Never dereferenced from Python and never handed to a reader. Upstream's
+    /// own save path uses it only to tell storages apart
+    /// (`torch/serialization.py:1224`), and `torch/_tensor.py:462` compares it
+    /// against `0` to detect a storage-less subclass.
+    fn data_ptr(&self) -> PyResult<usize> {
+        let tensor = self.tensor()?;
+        let (guard, layout) = tensor.storage_and_layout();
+        let storage: &candle_core::Storage = &guard;
+        Ok(storage as *const candle_core::Storage as usize
+            + layout.start_offset() * self.tag.itemsize())
     }
 
     /// `tensor.set_(storage, storage_offset, size, stride)` -- **a copy, where
@@ -2474,9 +2694,39 @@ pub(crate) fn transposed_contiguous(t: &Tensor) -> candle_core::Result<Tensor> {
     }
 }
 
+/// `torch._C._has_storage(tensor)`.
+///
+/// A module-level function upstream too, not a tensor member. It is the first
+/// wall on the `torch.save` path -- `torch/_tensor.py:328`, inside
+/// `_reduce_ex_internal`, before anything else about the tensor is looked at
+/// (docs/SAVE.md §1.1) -- and `torch/_tensor.py:158` asks it again on the
+/// deepcopy path.
+///
+/// The argument is anything, because upstream's takes anything: it is asked
+/// about `FakeTensor`s and wrapper subclasses as well as ordinary ones. What is
+/// not a `TensorBase` at all gets a refusal naming what it was handed rather
+/// than a `False`, because "no storage" and "not a tensor" are different
+/// answers and only one of them is this function's to give.
+#[pyfunction]
+#[pyo3(name = "_has_storage")]
+pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    match value.extract::<PyRef<'_, PyTensorBase>>() {
+        Ok(t) => Ok(t.has_storage()),
+        Err(_) => Err(not_implemented(format!(
+            "torch._C._has_storage in torch._C shim: expected a tensor, got {}",
+            value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))),
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
+    m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     Ok(())
 }
 

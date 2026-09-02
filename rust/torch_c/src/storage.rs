@@ -82,6 +82,20 @@ pub struct PyStorageBase {
     off: usize,
     /// How many bytes of `buf` this storage is.
     len: usize,
+    /// **Identity, for a storage that is a snapshot of somebody else's bytes.**
+    /// Zero when this storage owns what it holds.
+    ///
+    /// `TensorBase.untyped_storage()` cannot lend candle's buffer out as a
+    /// `StorageBase` -- candle owns it -- so it copies (`snapshot` below, and
+    /// docs/SAVE.md §3). A copy alone would lose the one thing `torch.save`
+    /// reads a storage's address *for*: `torch/serialization.py:1235` keys the
+    /// record table on `storage._cdata`, so two tensors that are views of one
+    /// buffer must answer with one value or the file loses that they were
+    /// views. Two snapshots of the same candle storage carry the same value
+    /// here, so `data_ptr()` and `_cdata` answer "are these the same storage?"
+    /// -- which is the only question either path asks of them -- rather than
+    /// "where does this particular copy live?", which nothing asks.
+    origin: usize,
     /// Whether bytes were ever written in. See the module docstring -- this is
     /// the guard that makes the copy/alias difference loud instead of silent.
     /// Allocation does not set it; only delivering bytes does.
@@ -100,6 +114,88 @@ impl PyStorageBase {
     pub fn is_filled(&self) -> bool {
         self.filled
     }
+
+    /// The address this storage answers identity questions with. See `origin`.
+    fn base_address(&self) -> usize {
+        if self.origin != 0 {
+            self.origin
+        } else {
+            self.buf.as_ptr() as usize
+        }
+    }
+
+    /// The refusal every write door gives. Two messages, because the two cases
+    /// want different work done: a snapshot could only be made writable by
+    /// giving candle a lendable storage, and a plain one has simply never had
+    /// a caller.
+    fn snapshot_is_read_only(&self, op: &str) -> PyErr {
+        if self.origin != 0 {
+            not_implemented(format!(
+                "torch._C shim: {op} on a storage returned by \
+                 TensorBase.untyped_storage(). That storage is a *snapshot* of \
+                 the tensor's bytes, not a window onto them -- candle owns its \
+                 buffer and cannot lend it out -- so a write here would be \
+                 invisible to the tensor it came from. Refused rather than \
+                 accepted silently: write to the tensor instead \
+                 (docs/SAVE.md §3, storage.rs)"
+            ))
+        } else {
+            not_implemented(format!(
+                "torch._C shim: {op} -- this shim's storages are filled once, \
+                 by the reader that delivers their bytes, and are read-only \
+                 afterwards (storage.rs)"
+            ))
+        }
+    }
+}
+
+/// The Python class a storage should wear -- `torch.UntypedStorage`.
+///
+/// The same relationship, and the same reason, as `tensor::TENSOR_CLASS`:
+/// `torch/storage.py:836` refuses a bare `StorageBase` in
+/// `TypedStorage(wrap_storage=...)` with an `isinstance` check, and
+/// `torch/serialization.py`'s save path wraps every storage that way. Nothing
+/// registers it in the standalone `_C` that `tools/golden/loader.py` imports,
+/// and there `snapshot` hands back a bare `StorageBase` -- which is the honest
+/// answer when no `torch` package exists to name a subclass.
+static STORAGE_CLASS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+#[pyfunction]
+#[pyo3(name = "_set_storage_class")]
+pub fn set_storage_class(cls: Py<PyAny>) {
+    let _ = STORAGE_CLASS.set(cls);
+}
+
+/// A storage holding `bytes`, identified as a copy of the buffer at `origin`.
+///
+/// `TensorBase.untyped_storage()`'s other half. `filled` is set because bytes
+/// really did arrive -- the module docstring's invariant is "only something
+/// that actually delivered bytes may set this", and a snapshot delivers them.
+pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<PyAny>> {
+    let obj = match STORAGE_CLASS.get() {
+        Some(cls) => cls.bind(py).call1((0usize,))?,
+        None => Bound::new(
+            py,
+            PyStorageBase {
+                buf: Arc::new(Vec::new()),
+                off: 0,
+                len: 0,
+                origin: 0,
+                filled: false,
+                device: "cpu".to_string(),
+            },
+        )?
+        .into_any(),
+    };
+    {
+        let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
+        me.len = bytes.len();
+        me.off = 0;
+        me.buf = Arc::new(bytes);
+        me.origin = origin;
+        me.filled = true;
+    }
+    Ok(obj.unbind())
 }
 
 /// Build an instance of `cls` -- `torch.UntypedStorage`, normally -- holding a
@@ -126,6 +222,7 @@ fn view_of<'py>(
         // allocation is still an allocation. Inheriting rather than asserting
         // is what keeps `set_`'s guard meaningful one level down.
         me.filled = parent.filled;
+        me.origin = parent.origin;
         me.device = parent.device.clone();
     }
     Ok(obj)
@@ -157,6 +254,7 @@ impl PyStorageBase {
             buf: Arc::new(vec![0u8; size]),
             off: 0,
             len: size,
+            origin: 0,
             filled: false,
             device,
         })
@@ -171,6 +269,9 @@ impl PyStorageBase {
     /// be seen by the other; here it would not, and a fill that is invisible to
     /// half its aliases is the aliasing bug this module exists to make loud.
     fn _shim_fill(&mut self, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.origin != 0 {
+            return Err(self.snapshot_is_read_only("UntypedStorage._shim_fill"));
+        }
         let view = pyo3::buffer::PyBuffer::<u8>::get(data)?;
         let bytes = view.to_vec(data.py())?;
         if bytes.len() != self.len {
@@ -268,6 +369,7 @@ impl PyStorageBase {
             me.len = data.len();
             me.off = 0;
             me.buf = Arc::new(data);
+            me.origin = 0;
             // Bytes actually arrived, from the file the caller named. This is
             // the second thing in this module allowed to set `filled`, and it
             // qualifies for the same reason `_shim_fill` does.
@@ -321,6 +423,49 @@ impl PyStorageBase {
     #[getter]
     fn _shim_filled(&self) -> bool {
         self.filled
+    }
+
+    /// Whether this storage is a snapshot of a tensor's bytes. Readable for
+    /// the same reason `_shim_filled` is.
+    #[getter]
+    fn _shim_is_snapshot(&self) -> bool {
+        self.origin != 0
+    }
+
+    /// **The three write doors, all refusing, and this is what makes
+    /// `untyped_storage()` honest.**
+    ///
+    /// docs/BACKWARD.md §14.3 sized `untyped_storage()` and stopped, on the
+    /// grounds that a storage which is a copy would let a caller write through
+    /// it and have the write land nowhere -- *"a lie on the public surface to
+    /// satisfy the one caller that cannot detect it"*. That objection is right
+    /// about the danger and wrong about the remedy: what the danger needs is
+    /// not aliasing, it is a **refusal**. A storage that reads correctly and
+    /// says so when written to is a narrowing that names itself, which is the
+    /// same shape as `filled` on the load side; a `torch.save` that does not
+    /// exist is not.
+    ///
+    /// All three exist upstream and all three are a bare `raise
+    /// NotImplementedError` in the vendored `_StorageBase` (`torch/storage.py`
+    /// lines 62, 65 and 173) -- the anonymous refusal DESIGN.md §6 forbids and
+    /// which cannot be fixed where it lives. `UntypedStorage(torch._C.StorageBase,
+    /// _StorageBase)` puts these first in the MRO.
+    fn __setitem__(&self, _idx: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(self.snapshot_is_read_only("UntypedStorage.__setitem__"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn copy_(&self, _args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        Err(self.snapshot_is_read_only("UntypedStorage.copy_"))
+    }
+
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn resize_(
+        &self,
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
     fn nbytes(&self) -> usize {
@@ -377,8 +522,63 @@ impl PyStorageBase {
     /// A view's address is the parent's plus its offset, which is what makes
     /// two slices of one checkpoint distinguishable; that is the same relation
     /// upstream's mapping has, measured.
+    ///
+    /// For a *snapshot* -- what `TensorBase.untyped_storage()` returns -- it is
+    /// the address of the candle buffer the bytes were copied from, not of the
+    /// copy. See `origin`: the save path's two readers of this number
+    /// (`torch/serialization.py:1224`'s dtype-conflict table and, one line
+    /// later, `_cdata`'s record key) both ask it "same storage?", and a copy's
+    /// own address would answer "no" for two views of one buffer.
     fn data_ptr(&self) -> usize {
-        self.buf.as_ptr() as usize + self.off
+        self.base_address() + self.off
+    }
+
+    /// `storage._cdata`. Upstream this is the address of the `THPStorage`
+    /// object; `torch/serialization.py:1235` keys `id_map` on it, so it is what
+    /// decides how many `data/N` records a save writes, and
+    /// `torch/storage.py:239` uses it as a deepcopy memo key.
+    ///
+    /// Answered with the storage's identity rather than the Python object's,
+    /// which is the difference that makes storage sharing survive a save here:
+    /// `untyped_storage()` builds a *fresh* Python object on every call
+    /// (upstream caches one per storage), so object identity would make every
+    /// tensor look like it had a storage of its own.
+    #[getter]
+    fn _cdata(&self) -> usize {
+        self.base_address()
+    }
+
+    /// The legacy (non-zip) `torch.save` format's writer, and it stays refused.
+    ///
+    /// `torch.save(obj, f, _use_new_zipfile_serialization=False)` reaches
+    /// `_legacy_save`, which writes each storage with this. It is refused for
+    /// the same reason the legacy *reader* is (docs/CKPT.md §4): that format
+    /// puts `_rebuild_tensor`'s `set_` *before* the bytes arrive, and this
+    /// shim's `set_` copies rather than aliases, so a checkpoint written in it
+    /// would have to be read back through a path that produces zeros. Writing a
+    /// format this build cannot read is a worse trade than refusing it.
+    ///
+    /// The refusal is here rather than left to `_StorageBase._write_file` in
+    /// the vendored tree because that one is a bare `raise NotImplementedError`
+    /// with no message -- the anonymous refusal DESIGN.md §6 forbids -- and
+    /// `UntypedStorage(torch._C.StorageBase, _StorageBase)` puts this first in
+    /// the MRO, so naming it is possible from here and only from here.
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _write_file(
+        &self,
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        Err(not_implemented(
+            "torch._C shim: UntypedStorage._write_file -- this is the legacy \
+             (non-zip) torch.save container, reached by \
+             _use_new_zipfile_serialization=False. It is refused, not missing: \
+             the legacy format fills a storage *after* _rebuild_tensor has \
+             called set_, and this shim's set_ copies instead of aliasing, so \
+             anything written in that format reads back as zeros here \
+             (docs/CKPT.md §4, docs/SAVE.md §6). Save with the default zip \
+             container, which this build both writes and reads",
+        ))
     }
 
     #[getter]
@@ -406,10 +606,19 @@ impl PyStorageBase {
         false
     }
 
+    /// A storage is never pickled *as an object* by `torch.save`: the pickler
+    /// intercepts it through `persistent_id` and writes a `data/N` record
+    /// instead (`torch/serialization.py:1204`), so this is not on the save
+    /// path. It is what somebody reaches who pickles a storage directly, and
+    /// there is no honest reduction for one -- the bytes would have to be
+    /// inlined into the pickle, which is the thing the container format exists
+    /// to avoid.
     fn __getstate__(&self) -> PyResult<()> {
         Err(not_implemented(
-            "torch._C shim: UntypedStorage does not pickle -- this shim reads \
-             checkpoints, it does not write them",
+            "torch._C shim: UntypedStorage does not pickle on its own. \
+             torch.save does not need it to -- it writes storages as zip \
+             records through persistent_id (docs/SAVE.md) -- so this is \
+             reached only by pickling a storage directly",
         ))
     }
 
@@ -448,5 +657,6 @@ fn io_reason(e: &std::io::Error) -> String {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStorageBase>()?;
+    m.add_function(wrap_pyfunction!(set_storage_class, m)?)?;
     Ok(())
 }

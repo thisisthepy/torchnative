@@ -17013,5 +17013,426 @@ def test_the_quantizer_registers_a_name_and_changes_nothing_else():
     assert r["reregister_ok"] is True, "registering twice raised"
 
 
+# ---------------------------------------------------------------------------
+# `torch.save` -- docs/SAVE.md
+# ---------------------------------------------------------------------------
+#
+# The mirror of the `test_ckpt_*` block above, and it runs the same two
+# interpreters for the same reason (§8.2 of docs/CKPT.md): `torch.save` is
+# pure-Python torch, so making it use the shim means importing the vendored
+# tree *as* `torch`, which cannot share a process with the upstream `torch`
+# this file already holds.
+#
+# The direction is reversed, and that is what makes the acceptance test
+# possible without marshalling values between the two: upstream writes a
+# checkpoint here, the subprocess reads it with the shim and writes it back
+# out, and this process reads *that* with upstream and compares to the tensors
+# it started with. Nothing crosses the process boundary except files, so
+# "bit-for-bit" means `torch.equal` against the original objects rather than
+# against a JSON transcription of them.
+#
+# The one property that cannot be tested that way is storage sharing, because
+# the shim's loader copies (docs/CKPT.md §5), so sharing present in the input
+# file is gone by the time the subprocess re-saves. Sharing is therefore built
+# *inside* the subprocess -- `x`, `x.t()`, `x[1]` over one candle buffer -- and
+# checked in the file the shim wrote.
+
+_SAVE_SHIM_SCRIPT = r"""
+import io, json, os, sys, zipfile
+import torch
+import torch.nn as nn
+
+cfg = json.load(sys.stdin)
+d = cfg["dir"]
+result = {"shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def flat(t):
+    return t.reshape(-1).double().tolist()
+
+
+# 1. Read what upstream wrote (this half is docs/CKPT.md's, re-run here so the
+#    round trip below cannot be green on a file the shim never understood).
+src = torch.load(os.path.join(d, "upstream_in.pt"), weights_only=True)
+result["read_keys"] = sorted(src)
+
+# 2. Write it back out, both destinations `torch.save` has.
+torch.save(src, os.path.join(d, "shim_path.pt"))
+buf = io.BytesIO()
+torch.save(src, buf)
+with open(os.path.join(d, "shim_buf.pt"), "wb") as fh:
+    fh.write(buf.getvalue())
+
+# 3. A real module's state_dict, assembled and saved by the shim itself.
+class Tiny(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(8, 4)
+        self.lin = nn.Linear(4, 6, bias=True)
+        self.norm = nn.LayerNorm(6)
+
+m = Tiny()
+with torch.no_grad():
+    for i, (k, p) in enumerate(sorted(m.state_dict().items())):
+        vals = [((i + 1) * 1103515245 + j * 12345) % 2000 / 4000.0 - 0.25 for j in range(p.numel())]
+        m.state_dict()[k].copy_(torch.tensor(vals, dtype=torch.float32).reshape(p.shape))
+torch.save(m.state_dict(), os.path.join(d, "shim_sd.pt"))
+result["sd"] = {k: {"shape": list(v.shape), "dtype": str(v.dtype), "vals": flat(v)}
+                for k, v in m.state_dict().items()}
+
+# 4. Storage sharing, built here because a shim-loaded pair no longer shares
+#    (docs/CKPT.md §5) -- so this is the only place the property can exist.
+base = torch.tensor([float(i) for i in range(16)], dtype=torch.float32).reshape(4, 4)
+shared = {"base": base, "tr": base.t(), "row": base[1]}
+result["shared_one_storage_in_shim"] = (
+    base.untyped_storage()._cdata
+    == shared["tr"].untyped_storage()._cdata
+    == shared["row"].untyped_storage()._cdata
+)
+result["shared_meta"] = {
+    k: {"offset": v.storage_offset(), "stride": list(v.stride()), "vals": flat(v)}
+    for k, v in shared.items()
+}
+torch.save(shared, os.path.join(d, "shim_shared.pt"))
+names = zipfile.ZipFile(os.path.join(d, "shim_shared.pt")).namelist()
+result["shared_records"] = sorted(n.split("/", 1)[1] for n in names)
+
+# 5. A shim-only round trip: save then load, in this process.
+back = torch.load(os.path.join(d, "shim_path.pt"), weights_only=True)
+result["round_trip"] = {
+    k: {
+        "shape_ok": tuple(back[k].shape) == tuple(v.shape),
+        "dtype_ok": back[k].dtype == v.dtype,
+        "exact": flat(back[k]) == flat(v),
+    }
+    for k, v in src.items()
+}
+
+# 6. Two things the load side does with sharing, and they are different.
+#    `tied_a`/`tied_b` are one *object* under two keys, so pickle's memo brings
+#    them back as one object -- identity, not storage, and it survives.
+#    `transposed`/`slice_offset` are two objects over one buffer upstream, and
+#    the shim's loader copies (docs/CKPT.md §5), so that relationship does not
+#    survive. The second is why §4 above has to build its own sharing; pinned
+#    rather than assumed, because if it stopped being true the sharing test
+#    would be checking nothing.
+result["loaded_tied_is_one_object"] = back["tied_a"] is back["tied_b"]
+result["loaded_views_share_storage"] = (
+    back["transposed"].untyped_storage()._cdata
+    == back["slice_offset"].untyped_storage()._cdata
+)
+
+# 7. The refusals, each caught by name.
+refusals = {}
+
+
+def refuse(label, fn):
+    try:
+        fn()
+        refusals[label] = None
+    except NotImplementedError as e:
+        refusals[label] = str(e)
+
+
+refuse("legacy", lambda: torch.save(src, io.BytesIO(), _use_new_zipfile_serialization=False))
+
+
+def _skip_data():
+    with torch.serialization.skip_data():
+        torch.save(src, io.BytesIO())
+
+
+refuse("skip_data", _skip_data)
+snap = base.untyped_storage()
+refusals["is_snapshot"] = snap._shim_is_snapshot
+refuse("setitem", lambda: snap.__setitem__(0, 3))
+refuse("copy_", lambda: snap.copy_(snap))
+refuse("resize_", lambda: snap.resize_(8))
+refuse("shim_fill", lambda: snap._shim_fill(b"\x00" * snap.nbytes()))
+refuse("meta_storage", lambda: torch.zeros(2, device="meta").untyped_storage())
+refuse("storage_pickle", lambda: snap.__getstate__())
+result["refusals"] = refusals
+
+# 8. Two saves of the same object are byte-identical -- the fixed timestamp in
+#    `_ZipWriter.write_record`. A delta addressed by its hash needs it.
+one, two = io.BytesIO(), io.BytesIO()
+torch.save(src, one)
+torch.save(src, two)
+result["reproducible"] = one.getvalue() == two.getvalue()
+
+sys.stdout.write(json.dumps(result))
+"""
+
+
+@functools.lru_cache(maxsize=None)
+def _save_fixture():
+    """Upstream writes, the shim reads and re-writes, upstream reads back.
+
+    `lru_cache` for the reason `_ckpt_fixture` gives: one subprocess launch
+    serves every `test_save_*` below, and an exception is not cached, so each
+    caller re-runs and fails independently.
+    """
+    torch = _upstream_torch
+
+    tmpdir = tempfile.mkdtemp(prefix="save-harness-")
+    hard = {}
+    hard["w_f32"] = torch.tensor(_ckpt_det(24, 201), dtype=torch.float32).reshape(4, 6)
+    hard["w_f16"] = hard["w_f32"].half()
+    hard["w_bf16"] = hard["w_f32"].bfloat16()
+    hard["w_f64"] = torch.tensor(_ckpt_det(12, 204), dtype=torch.float64).reshape(3, 4)
+    hard["buf_i64"] = torch.arange(10, dtype=torch.int64)
+    hard["buf_i32"] = torch.arange(10, dtype=torch.int32)
+    hard["buf_u8"] = torch.arange(10, dtype=torch.int64).to(torch.uint8)
+    hard["buf_bool"] = torch.arange(10) % 3 == 0
+    hard["scalar"] = torch.tensor(1.25)
+    hard["empty"] = torch.zeros(0, dtype=torch.float32)
+    hard["rank3"] = torch.tensor(_ckpt_det(24, 205), dtype=torch.float32).reshape(2, 3, 4)
+    whole = torch.tensor(_ckpt_det(24, 206), dtype=torch.float32).reshape(4, 6)
+    hard["transposed"] = whole.t()
+    hard["slice_offset"] = whole.reshape(-1)[5:17]
+    tied = torch.tensor(_ckpt_det(20, 207), dtype=torch.float32).reshape(4, 5)
+    hard["tied_a"], hard["tied_b"] = tied, tied
+    torch.save(hard, os.path.join(tmpdir, "upstream_in.pt"))
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    env.pop("TORCH_C_ARTEFACT", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _SAVE_SHIM_SCRIPT],
+        input=json.dumps({"dir": tmpdir}),
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=_CKPT_REPO_ROOT,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"shim save subprocess failed ({proc.returncode}):\n{proc.stderr[-4000:]}"
+        )
+    report = json.loads(proc.stdout)
+    assert report["shim"] is True, "the subprocess imported upstream torch, not the shim"
+    return {"dir": tmpdir, "hard": hard, "report": report}
+
+
+def _save_available():
+    return _ckpt_shim_available()
+
+
+def test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit():
+    """**The acceptance test.** A file only this shim can read is not
+    `torch.save`.
+
+    Upstream torch 2.13.0, in *this* process, opens the two archives the shim
+    wrote in another one -- to a path and to an `io.BytesIO` -- and every
+    tensor has to come back equal to the object this process started with. The
+    comparison is `torch.equal`, not a tolerance: the whole path is a byte
+    copy, so anything other than exact equality is a defect and not a rounding.
+
+    The fourteen entries are the ones docs/CKPT.md §5 chose for the read side,
+    because the interesting *dtypes* are the same in both directions:
+    `bfloat16` (which `to_le_bytes` cannot read at all), `float16`, `float64`,
+    the integer buffers, a scalar, an empty tensor, and `bool`, whose storage
+    is candle `U8` and whose 0/1 invariant survives the trip.
+
+    **What this test cannot check is view fidelity, and that is measured, not
+    assumed.** `transposed` and `slice_offset` go in as views but the shim's
+    *loader* materialises them (docs/CKPT.md §5), so by the time they are
+    re-saved they are contiguous tensors at offset 0 and their values are all
+    that is left to compare. Sabotaging `storage_offset()` to `0` and
+    `stride()` to the contiguous stride leaves this test **green** -- only
+    `test_save_writes_one_record_for_tensors_that_share_a_storage`, whose views
+    are built inside the shim, goes red. Read the two together.
+    """
+    if not _save_available():
+        return
+    torch = _upstream_torch
+    fx = _save_fixture()
+    for fname in ("shim_path.pt", "shim_buf.pt"):
+        got = torch.load(os.path.join(fx["dir"], fname), weights_only=True)
+        assert sorted(got) == sorted(fx["hard"]), (fname, sorted(got))
+        for k, want in fx["hard"].items():
+            assert got[k].dtype == want.dtype, (fname, k, got[k].dtype, want.dtype)
+            assert got[k].shape == want.shape, (fname, k, got[k].shape, want.shape)
+            assert torch.equal(got[k], want), (fname, k)
+
+
+def test_save_writes_one_record_for_tensors_that_share_a_storage():
+    """Storage sharing survives, and it survives *through a copy*.
+
+    `torch/serialization.py:1235` keys its record table on `storage._cdata`, so
+    how many `data/N` records a save writes is decided by whether two tensors'
+    storages answer with the same number. This shim's `untyped_storage()`
+    cannot hand out candle's buffer, so it hands out a snapshot -- and a
+    snapshot that answered with its own address would give three tensors three
+    records, three copies of one buffer, and a file that no longer says they
+    were views of each other. `storage.rs::origin` is what stops that, and this
+    is the test that would catch it going away.
+
+    The sharing is built in the subprocess rather than loaded from the input
+    file, because the shim's *loader* copies (docs/CKPT.md §5) -- so two views
+    read out of a checkpoint no longer share, which the last assertions pin
+    rather than leave implied. They also separate that from the other thing
+    called weight tying: one tensor stored under two keys is one *object*, and
+    pickle's memo carries that through a save on both sides.
+    """
+    if not _save_available():
+        return
+    torch = _upstream_torch
+    fx = _save_fixture()
+    r = fx["report"]
+    assert r["shared_one_storage_in_shim"] is True, (
+        "three views of one candle buffer did not report one storage identity"
+    )
+    data_records = [n for n in r["shared_records"] if n.startswith("data/")]
+    assert data_records == ["data/0"], (
+        f"three views of one buffer wrote {data_records}, not a single record"
+    )
+
+    got = torch.load(os.path.join(fx["dir"], "shim_shared.pt"), weights_only=True)
+    ptrs = {k: v.untyped_storage().data_ptr() for k, v in got.items()}
+    assert len(set(ptrs.values())) == 1, ptrs
+    base = got["base"]
+    assert torch.equal(got["tr"], base.t()), got["tr"]
+    assert torch.equal(got["row"], base[1]), got["row"]
+    assert got["tr"].stride() == (1, 4), got["tr"].stride()
+    assert got["row"].storage_offset() == 4, got["row"].storage_offset()
+
+    assert r["loaded_views_share_storage"] is False, (
+        "two views loaded by the shim now share one storage -- if that is a "
+        "real change, the sharing above should be built from loaded tensors "
+        "instead, because this test's own fixture depends on it not being true"
+    )
+    assert r["loaded_tied_is_one_object"] is True, (
+        "one tensor saved under two keys came back as two objects -- pickle's "
+        "memo is what carries weight tying through a save, and it is a "
+        "different mechanism from the storage sharing above"
+    )
+
+
+def test_save_round_trips_inside_the_shim_and_reproduces_the_same_bytes():
+    """Save then load, in the shim alone, plus byte reproducibility.
+
+    Two properties that only the writing side can have. The round trip is the
+    weaker one -- a writer and a reader that agreed on the *wrong* layout would
+    pass it, which is why the acceptance test above compares against upstream
+    instead. It is here because it is the one that localises a failure: if this
+    is red and the upstream read is green, the reader moved.
+
+    Byte reproducibility is the fixed 1980-01-01 timestamp in
+    `_ZipWriter.write_record`, where upstream writes the wall clock. It is what
+    lets a federated delta be addressed by its hash (README §2), and it is a
+    property upstream's own `torch.save` does not have.
+    """
+    if not _save_available():
+        return
+    fx = _save_fixture()
+    for k, r in fx["report"]["round_trip"].items():
+        assert r["shape_ok"], k
+        assert r["dtype_ok"], k
+        assert r["exact"], f"{k} did not survive a shim save/load exactly"
+    assert fx["report"]["reproducible"] is True, (
+        "two saves of the same object gave different bytes"
+    )
+
+
+def test_save_writes_a_real_modules_state_dict():
+    """`torch.save(model.state_dict())`, which is what a caller actually
+    writes.
+
+    Different from the tensor dict above in one way that matters: the tensors
+    come out of `nn.Module`, so they are `Parameter`s detached by `state_dict`
+    rather than things this test built, and the keys are the module's. The
+    values are compared against what the subprocess reported for the same
+    tensors, since the module is assembled on that side -- so this checks the
+    file against the objects it was made from, one process over.
+    """
+    if not _save_available():
+        return
+    torch = _upstream_torch
+    fx = _save_fixture()
+    want = fx["report"]["sd"]
+    got = torch.load(os.path.join(fx["dir"], "shim_sd.pt"), weights_only=True)
+    assert sorted(got) == sorted(want), (sorted(got), sorted(want))
+    for k, v in got.items():
+        assert list(v.shape) == want[k]["shape"], (k, v.shape)
+        assert str(v.dtype) == want[k]["dtype"], (k, v.dtype)
+        assert v.reshape(-1).double().tolist() == want[k]["vals"], k
+
+
+def test_save_archive_matches_the_shape_upstream_writes():
+    """The container, not the contents.
+
+    Three things a reader other than `torch.load` depends on, all measured off
+    a 2.13.0 archive first (docs/SAVE.md §4):
+
+    * every record's payload starts on the 64-byte boundary the archive's own
+      `.storage_alignment` record claims -- torch pads the *local* file
+      header's extra field to get it, and CPython's `zipfile` does not;
+    * a `version` record exists, because upstream's C++ reader validates it
+      before it reads anything else;
+    * `.data/serialization_id` is **absent**, deliberately -- see
+      `_ZipWriter.serialization_id` for why writing one would be worse than
+      writing none.
+    """
+    if not _save_available():
+        return
+    import struct
+    import zipfile
+
+    fx = _save_fixture()
+    path = os.path.join(fx["dir"], "shim_path.pt")
+    raw = open(path, "rb").read()
+    zf = zipfile.ZipFile(path)
+    names = [n.split("/", 1)[1] for n in zf.namelist()]
+    assert "version" in names, names
+    assert zf.read(zf.namelist()[names.index("version")]) == b"3\n"
+    assert ".data/serialization_id" not in names, names
+    assert zf.read(f"shim_path/.storage_alignment") == b"64"
+
+    misaligned = []
+    for info in zf.infolist():
+        head = info.header_offset
+        name_len = struct.unpack("<H", raw[head + 26 : head + 28])[0]
+        extra_len = struct.unpack("<H", raw[head + 28 : head + 30])[0]
+        payload_at = head + 30 + name_len + extra_len
+        assert info.compress_type == zipfile.ZIP_STORED, info.filename
+        if payload_at % 64:
+            misaligned.append((info.filename, payload_at))
+    assert not misaligned, misaligned
+
+
+def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
+    """What is still refused, by name.
+
+    Two families, and they are refusals for different reasons.
+
+    *The legacy container* (`_use_new_zipfile_serialization=False`) and
+    *`skip_data`* are refused because writing them would produce a file that
+    reads back as zeros -- the failure docs/CKPT.md §4 spent a section on,
+    arriving from the writing side. The legacy format fills a storage after
+    `set_` has already copied out of it; `skip_data` writes a header with no
+    payload at all.
+
+    *The write doors on a snapshot* are the answer to docs/BACKWARD.md §14.3,
+    which sized `untyped_storage()` and stopped because a storage that is a
+    copy would let a write land nowhere silently. That is right about the
+    danger and wrong about the remedy: the danger needs the write to refuse,
+    not the storage to alias. All four doors refuse and name the snapshot.
+    """
+    if not _save_available():
+        return
+    r = _save_fixture()["report"]["refusals"]
+    assert r["is_snapshot"] is True, "untyped_storage() did not return a snapshot"
+    assert r["legacy"] and "_write_file" in r["legacy"], r["legacy"]
+    assert r["legacy"] and "legacy" in r["legacy"], r["legacy"]
+    assert r["skip_data"] and "write_record_metadata" in r["skip_data"], r["skip_data"]
+    for door in ("setitem", "copy_", "resize_", "shim_fill"):
+        assert r[door], f"{door} did not refuse a write into a snapshot"
+        assert "snapshot" in r[door], (door, r[door])
+    assert r["meta_storage"], "a meta tensor handed out a storage"
+    assert r["storage_pickle"], "a storage pickled itself"
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
