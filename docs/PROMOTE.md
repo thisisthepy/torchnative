@@ -475,3 +475,24 @@ each place. They are not made consistent with each other: a caller who writes
 `except NotImplementedError` around a bool pair would not catch a `RuntimeError`
 carrying the same words, so matching upstream matters more than matching
 ourselves. The first landed as `RuntimeError` and was corrected on review.
+
+### A shared `CARGO_TARGET_DIR` reported this round as broken when it was not
+
+The first verification of this work read **11 golden failures**, every one of
+them the *old* refusal message, which reads exactly like "the cases were added
+and the implementation was not". The implementation was there; the artefact
+under test was not built from it.
+
+`CARGO_TARGET_DIR` had been set to the shared `/Volumes/macMini/caches/cargo-target`,
+which the main checkout and every worktree write to. Rebuilding into a
+per-checkout directory and re-running gave **7763/7763** from the same source.
+
+Other rounds' documents already use per-round directories -- `cargo-target-adapt`
+(ADAPT.md), `cargo-target-autograd` (AUTOGRAD.md), `cargo-target-bind`
+(BIND.md) -- so the convention existed and the brief for this round contradicted
+it. Same shape as the `$TMPDIR/torch-c-stage` collision that made two concurrent
+worktrees validate each other's artefacts: **shared mutable build state across
+checkouts, and the failure presents as a wrong verdict rather than as an error.**
+
+The tell is that a failure message names behaviour the source no longer has.
+When that happens, rebuild into a fresh directory before believing the verdict.
