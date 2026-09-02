@@ -522,11 +522,19 @@ fn scan_for_device(
     }
     if let Ok(sequence) = value.cast::<PyList>() {
         for item in sequence.iter() {
-            visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item)?;
+            if !is_tensor {
+                // Not a tensor sequence
+                break;
+            }
         }
     } else if let Ok(sequence) = value.cast::<PyTuple>() {
         for item in sequence.iter() {
-            visit_for_device(op, first, &item)?;
+            let is_tensor = visit_for_device(op, first, &item)?;
+            if !is_tensor {
+                // Not a tensor sequence
+                break;
+            }
         }
     }
     Ok(())

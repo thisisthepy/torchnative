@@ -48,6 +48,14 @@ Component timing (inclusive):
 extension function that receives every aten op call. The SDPA kernel, at 4.1%,
 is not the bottleneck — `linear` (which is matmul) takes 13× more time.
 
+> **Correction (docs/DISPATCH2.md §1).** The sentence this document later drew
+> from that line — "what is left on the decode path is dispatch overhead, not
+> arithmetic" — misread cProfile. These are *inclusive* times and they overlap:
+> `linear` runs *inside* `_aten_dispatch`, so the 110 ms is part of the 142 ms
+> rather than beside it. Arithmetic still dominates. DISPATCH2.md §5 also shows
+> this whole profile used `use_cache=False`, which is not what `generate()`
+> does, and that with the cache on the shim is at **parity with upstream**.
+
 ### 0.3 Isolated kernel microbenchmark (SmolLM2-135M shapes)
 
 *(Measured on the **shim**)*
