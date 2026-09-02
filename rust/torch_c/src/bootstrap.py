@@ -9305,13 +9305,116 @@ def _install_distributed_c10d(module, spec) -> None:
             self.path = path
 
     class TCPStore(Store):
-        def __init__(self, *args, **kwargs):
-            refuse(
-                "TCPStore",
-                "no transport is built into this shim, and at world_size 1 "
-                "there is no peer to reach. Pass a HashStore, or pass "
-                "store=... to init_process_group",
-            )
+        # `host_name`, spelled the way upstream spells it. `rendezvous.py`
+        # builds this store with **keyword** arguments
+        # (`TCPStore(host_name=..., port=..., ...)`), so a parameter named
+        # `host` is unreachable through `init_process_group(init_method=
+        # "tcp://...")` -- which is the only door a user goes through.
+        # A test that constructs the store itself cannot see that.
+        def __init__(self, host_name, port, world_size, is_master, timeout=None, **kwargs):
+            host = host_name
+            if world_size == 1:
+                refuse(
+                    "TCPStore",
+                    "no transport is built into this shim, and at world_size 1 "
+                    "there is no peer to reach. Pass a HashStore, or pass "
+                    "store=... to init_process_group",
+                )
+            super().__init__()
+            import socket, threading, json, time
+            self.host = host
+            self.port = port
+            self.is_master = is_master
+            self.store = {}
+            self.cond = threading.Condition()
+            
+            if is_master:
+                self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+                self.server_thread.start()
+                
+            for _ in range(100):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.connect((self.host, self.port))
+                    s.close()
+                    break
+                except ConnectionRefusedError:
+                    time.sleep(0.01)
+
+        def _run_server(self):
+            import socket, threading, json
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.listen()
+            while True:
+                conn, addr = s.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+                
+        def _handle_client(self, conn):
+            import json
+            with conn:
+                while True:
+                    length_bytes = conn.recv(4)
+                    if not length_bytes: break
+                    length = int.from_bytes(length_bytes, 'big')
+                    data = b""
+                    while len(data) < length:
+                        packet = conn.recv(length - len(data))
+                        if not packet: break
+                        data += packet
+                    if not data: break
+                    req = json.loads(data.decode('utf-8'))
+                    
+                    with self.cond:
+                        cmd = req['cmd']
+                        if cmd == 'set':
+                            self.store[req['key']] = req['value']
+                            self.cond.notify_all()
+                            resp = {'status': 'ok'}
+                        elif cmd == 'get':
+                            key = req['key']
+                            while key not in self.store:
+                                self.cond.wait()
+                            resp = {'status': 'ok', 'value': self.store[key]}
+                        elif cmd == 'wait':
+                            keys = req['keys']
+                            for key in keys:
+                                while key not in self.store:
+                                    self.cond.wait()
+                            resp = {'status': 'ok'}
+                        else:
+                            resp = {'status': 'error', 'msg': 'unknown cmd'}
+                    
+                    resp_bytes = json.dumps(resp).encode('utf-8')
+                    conn.sendall(len(resp_bytes).to_bytes(4, 'big') + resp_bytes)
+                    
+        def _send_req(self, req):
+            import socket, json
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((self.host, self.port))
+            req_bytes = json.dumps(req).encode('utf-8')
+            s.sendall(len(req_bytes).to_bytes(4, 'big') + req_bytes)
+            
+            length_bytes = s.recv(4)
+            length = int.from_bytes(length_bytes, 'big')
+            data = b""
+            while len(data) < length:
+                data += s.recv(length - len(data))
+            s.close()
+            return json.loads(data.decode('utf-8'))
+            
+        def set(self, key, value):
+            if isinstance(value, bytes):
+                value = value.decode('latin1')
+            self._send_req({'cmd': 'set', 'key': key, 'value': value})
+            
+        def get(self, key):
+            resp = self._send_req({'cmd': 'get', 'key': key})
+            return resp['value'].encode('latin1')
+            
+        def wait(self, keys, timeout=None):
+            self._send_req({'cmd': 'wait', 'keys': keys})
 
     class PrefixStore(Store):
         """A real view onto another store, not a copy.
@@ -9773,23 +9876,65 @@ def _install_distributed_c10d(module, spec) -> None:
         one device holds one shard and aggregation happens a layer up.
         """
 
+    class ProcessGroupLocal(Backend):
+        """The collectives of a group whose only member is this process.
+
+        Named `Local` rather than after a transport because there is none: the
+        peer set is `{self}`. That is not a degenerate case to be tolerated --
+        it is the case federated learning starts from (DESIGN.md §11.1), where
+        one device holds one shard and aggregation happens a layer up.
+        """
+
         def __init__(self, rank=0, size=1, store=None):
-            if size != 1:
+            if size not in (1, 2):
                 raise NotImplementedError(
                     "torch._C._distributed_c10d.ProcessGroupLocal: world_size "
                     f"{size} needs a transport, and this build has none. Only "
-                    "world_size 1 is implemented"
+                    "world_size 1 and 2 are implemented"
                 )
-            if rank != 0:
+            if size == 1 and rank != 0:
                 raise ValueError(
                     "torch._C._distributed_c10d.ProcessGroupLocal: rank "
                     f"{rank} is not in a world of size 1"
                 )
+            if size == 2 and rank not in (0, 1):
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal: rank "
+                    f"{rank} is not in a world of size 2"
+                )
             super().__init__(rank, size)
             self._store = store
 
+            self._sock = None
+            if size == 2:
+                import socket, datetime
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Socket timeout to avoid hanging forever
+                self._sock.settimeout(30.0)
+                if rank == 0:
+                    self._sock.bind(("127.0.0.1", 0))
+                    self._sock.listen()
+                    port = self._sock.getsockname()[1]
+                    self._store.set("pg_local_port", str(port).encode('utf-8'))
+                    self._peer, _ = self._sock.accept()
+                else:
+                    self._store.wait(["pg_local_port"])
+                    port = int(self._store.get("pg_local_port").decode('utf-8'))
+                    self._sock.connect(("127.0.0.1", port))
+                    self._peer = self._sock
+
         def name(self):
             return "local"
+
+        def _recv_all(self, n):
+            data = b""
+            while len(data) < n:
+                packet = self._peer.recv(n - len(data))
+                if not packet:
+                    raise RuntimeError("connection closed")
+                data += packet
+            return data
 
         # -- reductions ----------------------------------------------------
         @staticmethod
@@ -9817,25 +9962,57 @@ def _install_distributed_c10d(module, spec) -> None:
                 )
 
         def allreduce(self, tensors, opts=None):
-            # Identity: one contribution reduced with itself is itself.
             self._check_reduce_op(opts, "allreduce")
+            if self._size == 1:
+                return Work(tensors)
+                
+            op = getattr(opts, "reduceOp", None)
+            kind = getattr(op, "op", op)
+            if kind is not getattr(_RedOpType, "SUM", None):
+                refuse(
+                    f"ProcessGroupLocal.allreduce with non-SUM op at world_size {self._size}",
+                    "Only SUM is implemented for world_size=2"
+                )
+
+            import json, struct
+            for t in tensors:
+                data = json.dumps(t.tolist()).encode('utf-8')
+                self._peer.sendall(struct.pack('!I', len(data)) + data)
+                
+                length_bytes = self._recv_all(4)
+                length = struct.unpack('!I', length_bytes)[0]
+                peer_data = self._recv_all(length)
+                peer_list = json.loads(peer_data.decode('utf-8'))
+                
+                import torch
+                peer_tensor = torch.tensor(peer_list, dtype=t.dtype, device=t.device)
+                t.add_(peer_tensor)
+                
             return Work(tensors)
 
         def allreduce_coalesced(self, tensors, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.allreduce_coalesced", "Only world_size 1 is implemented")
             self._check_reduce_op(opts, "allreduce_coalesced")
             return Work(tensors)
 
         def reduce(self, tensors, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.reduce", "Only world_size 1 is implemented")
             self._check_reduce_op(opts, "reduce")
             self._check_root(opts, "reduce")
             return Work(tensors)
 
         # -- movement ------------------------------------------------------
         def broadcast(self, tensors, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.broadcast", "Only world_size 1 is implemented")
             self._check_root(opts, "broadcast")
             return Work(tensors)
 
         def allgather(self, output_tensors, input_tensors, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.allgather", "Only world_size 1 is implemented")
             for outputs, source in zip(output_tensors, input_tensors):
                 if len(outputs) != 1:
                     raise ValueError(
@@ -9846,6 +10023,8 @@ def _install_distributed_c10d(module, spec) -> None:
             return Work([t for group in output_tensors for t in group])
 
         def _allgather_base(self, output, input, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal._allgather_base", "Only world_size 1 is implemented")
             output.copy_(input)
             return Work([output])
 
@@ -9853,24 +10032,34 @@ def _install_distributed_c10d(module, spec) -> None:
         # `distributed_c10d.py:4387` calls this one and `all_gather_into_tensor`
         # is the deprecated alias for it.
         def all_gather_single(self, output, input, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.all_gather_single", "Only world_size 1 is implemented")
             return self._allgather_base(output, input, opts)
 
         def all_gather_single_coalesced(self, outputs, inputs, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.all_gather_single_coalesced", "Only world_size 1 is implemented")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
             return Work(list(outputs))
 
         def allgather_into_tensor_coalesced(self, outputs, inputs, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.allgather_into_tensor_coalesced", "Only world_size 1 is implemented")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
             return Work(list(outputs))
 
         def allgather_coalesced(self, output_lists, input_list, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.allgather_coalesced", "Only world_size 1 is implemented")
             for outputs, source in zip(output_lists, input_list):
                 outputs[0].copy_(source)
             return Work(input_list)
 
         def gather(self, output_tensors, input_tensors, opts=None):
+            if self._size != 1:
+                refuse("ProcessGroupLocal.gather", "Only world_size 1 is implemented")
             self._check_root(opts, "gather")
             for outputs, source in zip(output_tensors, input_tensors):
                 outputs[0].copy_(source)

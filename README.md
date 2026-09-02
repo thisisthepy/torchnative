@@ -123,11 +123,13 @@ upstream reads what it writes bit-for-bit across eight dtypes, and storage shari
 round trip — `x`, `x.t()` and `x[1]` land in one record and come back sharing one storage
 ([`docs/SAVE.md`](docs/SAVE.md)). A delta goes to bytes: `torch.save(delta.value)` is 1871 B.
 
-The two that remain are both about distribution: a second rank (`ProcessGroupLocal` refuses
-`world_size != 1` — it has no transport) and a rendezvous (`TCPStore` refuses; `HashStore` is
-process-local). `Delta.publish` now reaches the first of those rather than serialisation, which is
-why it is still the seam this attaches to rather than a separate stack
-([`docs/ADAPT.md`](docs/ADAPT.md) §1).
+The other two have moved as well. **`world_size = 2` works over a real socket**: two independent
+OS processes rendezvous through `TCPStore` and `all_reduce(SUM)` gives what upstream's `gloo` gives
+for the same inputs, `[3.0, 6.0, 9.0]` against `[3.0, 6.0, 9.0]`, through the ordinary
+`init_process_group(backend="local", init_method="tcp://…")` and not a private door
+([`docs/TRANSPORT.md`](docs/TRANSPORT.md)). Everything past that — other collectives, other world
+sizes — refuses by name, and `torchnative.nn.federated` above it is still empty. `Delta.publish`
+remains the seam ([`docs/ADAPT.md`](docs/ADAPT.md) §1).
 
 ### 3 · Test-time adaptation & training
 

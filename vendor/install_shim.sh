@@ -33,6 +33,7 @@ else
     exit 1
 fi
 
+rm -f "$dest/torch/_C.abi3.so"
 cp "$artefact" "$dest/torch/_C.abi3.so"
 echo "installed $(basename "$artefact") -> $dest/torch/_C.abi3.so"
 
