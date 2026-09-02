@@ -1,0 +1,75 @@
+# Does the published wheel actually compute, on the platforms nobody here can run?
+#
+# The README's `computes` row is ⚠️ for Linux and Windows: the wheels are on
+# PyPI and their symbols resolve, but this project's only machine is an arm64
+# Mac with no Linux, no Windows and no container runtime, so nothing has ever
+# executed on either. A hosted runner is the missing machine.
+#
+# It installs from **PyPI**, not from this checkout. The question is what a user
+# gets, and a wheel built in the job would answer a different one.
+name: verify published wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "torchnative version to install from PyPI"
+        required: false
+        default: "0.0.9a0"
+  push:
+    paths:
+      - ".github/workflows/verify-published-wheel.yml"
+      - "tools/ci/verify_published.py"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: windows-latest
+            label: windows-amd64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.label }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.13 is the abi3 floor the wheels are tagged against. An older
+      # interpreter does not fail interestingly -- pip simply finds no
+      # candidate -- so pinning it here keeps a version skew from reading as
+      # "the wheel is broken".
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: What we are standing on
+        run: |
+          python -c "import platform,sys; print(platform.platform()); print(platform.machine()); print(sys.version)"
+
+      # No torch is installed on a fresh runner, which is what this needs:
+      # this distribution *provides* `torch`, and there is one per interpreter.
+      - name: Install the published wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torchnative==${{ inputs.version || '0.0.9a0' }}"
+
+      - name: Which wheel landed
+        run: python -m pip show torchnative
+
+      - name: Compute
+        run: python tools/ci/verify_published.py
+
+      # transformers last: if it drags in an upstream torch it would replace
+      # ours, and the script's first assertion catches that rather than the
+      # run quietly measuring somebody else's build.
+      - name: Install transformers
+        run: python -m pip install "transformers>=5,<6"
+
+      - name: Run a real model
+        run: python tools/ci/verify_published.py --model
