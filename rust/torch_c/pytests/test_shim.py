@@ -9816,6 +9816,19 @@ def _schema_road_fixture():
 #: `fill_.Scalar` -- which differ only by overload -- for free, hiding whether
 #: the overload was resolved at all.
 _EXPECTED_MUTABLE = (
+    # docs/INPLACE.md: fourteen of docs/SPELLINGS.md §9's fifteen in-place
+    # names that had no kernel. `report["ops"]` (the road script above) is
+    # keyed off `torch._C._aten_implemented()`, not off the tables, so the
+    # fifteenth -- `detach_`, refused by name in `aten.rs`
+    # (`detach_inplace_refusal`) rather than given a kernel -- is not here
+    # even though `aten::detach_`'s schema is just as `Tensor(a!) self` as
+    # the other fourteen: an op with no kernel is not in
+    # `_aten_implemented()`, so the road script never asks upstream's own
+    # `is_mutable` about it. Same reasoning keeps `clamp_min_.Tensor` out --
+    # its schema is mutable too, but it has no kernel either (only
+    # `clamp_min_.default` does), so it is invisible to this fixture the
+    # same way `clamp.Tensor`/`clamp_min.Tensor` already are.
+    "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
     # docs/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
@@ -9823,22 +9836,35 @@ _EXPECTED_MUTABLE = (
     # growing by exactly two is the check that the new schemas were parsed
     # rather than placeholdered.
     "aten.bernoulli_.float",
+    "aten.ceil_.default",
     "aten.clamp_.default",
+    "aten.clamp_min_.default",
     "aten.copy_.default",
+    "aten.cos_.default",
     "aten.div_.Scalar",
     "aten.div_.Tensor",
+    "aten.erf_.default",
     "aten.exp_.default",
+    "aten.expm1_.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
     "aten.index_put_.default",
+    "aten.log2_.default",
+    "aten.log_.default",
     "aten.masked_fill_.Scalar",
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
     "aten.neg_.default",
     "aten.normal_.default",
+    "aten.reciprocal_.default",
     "aten.relu_.default",
+    "aten.rsqrt_.default",
+    "aten.sigmoid_.default",
+    "aten.sin_.default",
+    "aten.sqrt_.default",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
+    "aten.tanh_.default",
     "aten.uniform_.default",
     "aten.zero_.default",
 )
@@ -10149,7 +10175,25 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # and never reaches a kernel. Both spellings of that one function are
     # installed, on opposite sides of this boundary; only the private one is
     # counted here.
-    assert len(keys) == 251, len(keys)
+    #
+    # 268 with docs/INPLACE.md: fourteen in-place ops that had a kernel for
+    # their out-of-place twin and no kernel of their own (`abs_`, `ceil_`,
+    # `cos_`, `erf_`, `expm1_`, `log2_`, `log_`, `reciprocal_`, `rsqrt_`,
+    # `sigmoid_`, `sin_`, `sqrt_`, `tanh_` -- one schema each, +13 -- and
+    # `clamp_min_`, whose `.Tensor`/default pair mirrors `clamp_min`'s own
+    # shape, +2), plus `detach_` (+1, refused by name in `aten.rs` rather
+    # than given a kernel -- see `detach_inplace_refusal` -- but still given
+    # a table entry on both sides so the refusal is reachable through
+    # `t.detach_()`/`torch.detach_(t)` and not just an `AttributeError`),
+    # plus `native_group_norm` (+1, `overloads.json`-only: upstream has
+    # `torch.native_group_norm` and no `Tensor.native_group_norm`, measured
+    # -- `hasattr(torch.Tensor, "native_group_norm")` is `False` on 2.13.0 --
+    # so it gets the `_log_softmax`/`_safe_softmax` shape rather than the
+    # `amax`/`clamp_min` one). 13 + 2 + 1 + 1 = 17, and every one of the
+    # fifteen in-place schemas is declared in the yaml (`from_tables` below
+    # is unchanged), because these are ordinary leaf ops upstream ships, not
+    # a torchgen-only `.out` variant.
+    assert len(keys) == 268, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -17771,16 +17815,67 @@ rec(
     lambda: torch.index_put_(p.clone(), (rep_idx,), rep_vals, accumulate=True).tolist(),
 )
 
-# --- the 16 kernel-less names: still refused, by the exact right key -----
-# One representative from each `aten.rs` arity/family this round did not
-# touch, through both doors where a door exists. Each assertion below reads
-# the *exact* dispatch key out of the refusal, not just "it raised" -- a
-# refusal that named the wrong key would be a resolver bug hiding behind a
-# refusal that happens to look right.
-refused("sqrt__fn", lambda: torch.sqrt_(e.clone()))
-refused("sqrt__member", lambda: e.clone().sqrt_())
-refused("abs__fn", lambda: torch.abs_(e.clone()))
-refused("tanh__fn", lambda: torch.tanh_(e.clone()))
+# --- docs/INPLACE.md: the fourteen in-place names that WERE kernel-less ---
+# and now have both a spelling and a kernel -- reached through both doors,
+# through the real vendored `torch`, and value-checked against upstream
+# 2.13.0 (transcribed, not derived from this shim). `t.<op>_() is t` is
+# checked too: an in-place op that rebound the wrapper instead of writing
+# through it would still pass a value-only comparison.
+_INPLACE_PROBES = (
+    ("cos_", 2.0, -0.4161468148231506),
+    ("sin_", 0.5, 0.479425549507141),
+    ("erf_", 1.0, 0.8427007929497148),
+    ("log_", 2.0, 0.6931471805599453),
+    ("reciprocal_", 2.0, 0.5),
+    ("tanh_", 1.0, 0.7615941559557649),
+    ("sqrt_", 4.0, 2.0),
+    ("rsqrt_", 4.0, 0.5),
+    ("expm1_", 1.0, 1.718281828459045),
+    ("log2_", 8.0, 3.0),
+    ("sigmoid_", 1.0, 0.7310585786300049),
+    ("abs_", -3.0, 3.0),
+    ("ceil_", 1.5, 2.0),
+)
+for name, x, expected in _INPLACE_PROBES:
+    def _fn(name=name, x=x):
+        t = torch.tensor([x])
+        r = getattr(torch, name)(t)
+        return [r.tolist()[0], r is t]
+    rec(f"{name}_fn", _fn)
+    def _member(name=name, x=x):
+        t = torch.tensor([x])
+        r = getattr(t, name)()
+        return [r.tolist()[0], r is t]
+    rec(f"{name}_member", _member)
+
+# `clamp_min_` takes a second argument, so it is not shaped like the twelve
+# above -- covered on its own, function and member doors both.
+cm = torch.tensor([-2.0, 3.0])
+rec("clamp_min__fn", lambda: (lambda t: [torch.clamp_min_(t, 0.0).tolist(), t is cm])(cm))
+cm2 = torch.tensor([-2.0, 3.0])
+rec("clamp_min__member", lambda: (lambda t: [t.clamp_min_(0.0).tolist(), t is cm2])(cm2))
+
+# `detach_` is the fifteenth name -- refused BY NAME rather than given a
+# kernel (`aten.rs::detach_inplace_refusal`; docs/INPLACE.md has the
+# reasoning). Both doors have a table entry (so the refusal names the op
+# rather than falling through to `AttributeError`), and both must still
+# refuse after this round -- a kernel silently appearing here would be the
+# exact silent-divergence risk the refusal exists to avoid.
+dt = torch.zeros(2)
+refused("detach__fn", lambda: torch.detach_(dt))
+refused("detach__member", lambda: dt.detach_())
+
+# `native_group_norm` -- the sixteenth item, of a different kind: the kernel
+# already existed, only the *function* spelling was missing (it is not a
+# `Tensor` method upstream, so no member spelling was added). The function
+# door must now work; the member door must still be `AttributeError`.
+def _native_group_norm_fn():
+    x = torch.ones(2, 6, 3)
+    w = torch.ones(6)
+    b = torch.zeros(6)
+    out_t, mean_t, rstd_t = torch.native_group_norm(x, w, b, 2, 6, 3, 3, 1e-5)
+    return [list(out_t.shape), list(mean_t.shape), list(rstd_t.shape)]
+rec("native_group_norm_fn", _native_group_norm_fn)
 rec("native_group_norm_member", lambda: base.native_group_norm)
 
 json.dump(out, sys.stdout)
@@ -17816,7 +17911,19 @@ def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_
     round made turns the matching assertion red by naming the entry it lost
     -- see the sabotage note in docs/SPELLINGS.md §9 for which one was
     actually tried.
-    """
+
+    Kept as one test rather than split, because docs/INPLACE.md's round
+    landed in the same file this one already exercises: §9 measured 15
+    in-place names with no kernel (`abs_ ceil_ clamp_min_ cos_ detach_ erf_
+    expm1_ log_ log2_ reciprocal_ rsqrt_ sigmoid_ sin_ sqrt_ tanh_`) and this
+    test used three of them (`sqrt_`/`abs_`/`tanh_`) as the "still refused"
+    regression pin -- so implementing fourteen of the fifteen turned that
+    pin red by construction, not by a defect. The pin now runs the other
+    way: fourteen value-checks against upstream (this round's actual work),
+    one refusal-by-name check for `detach_` (deliberately not implemented --
+    see `aten.rs::detach_inplace_refusal`), and a reachability check for
+    `native_group_norm`'s new function-only spelling (the sixteenth item,
+    a kernel that already existed with no door onto it)."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return  # vendor tree not installed -- see vendor/install_shim.sh
     out = _spellings_9_road_fixture()
@@ -17861,21 +17968,54 @@ def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_
     # receives 3+8=11, matching upstream (measured, not derived).
     eq("index_put__accumulate_fn", [11.0, 2.0, 11.0, 4.0])
 
-    # The 16 kernel-less names: still refused, by exact key -- this is the
-    # regression guard against this round's own additions drifting, and
-    # against a later round adding a kernel and forgetting the spelling.
-    got = out.get("sqrt__fn", "")
-    assert got.startswith("refused:") and "torch.sqrt_" in got, got
-    got = out.get("sqrt__member", "")
-    assert got.startswith("refused:") and "TensorBase.sqrt_" in got, got
-    got = out.get("abs__fn", "")
-    assert got.startswith("refused:") and "torch.abs_" in got, got
-    got = out.get("tanh__fn", "")
-    assert got.startswith("refused:") and "torch.tanh_" in got, got
-    # `native_group_norm` is not a `Tensor` method upstream either (measured
-    # `hasattr(torch.Tensor, "native_group_norm")` is False on torch 2.13.0),
-    # so there is no member to reach and this is an `AttributeError`, not the
-    # shim's own "no table entry" `NotImplementedError`.
+    # docs/INPLACE.md: the fourteen names that WERE kernel-less and now
+    # both reach a kernel and match upstream's value, through both doors --
+    # this is the regression guard against a later round quietly losing the
+    # spelling or the kernel. `is t` (not `== t`) is what a write-through
+    # regression would actually fail: a kernel that rebound the wrapper
+    # instead of writing through it still returns the "right" value.
+    for name, _x, expected in [
+        ("cos_", 2.0, -0.4161468148231506),
+        ("sin_", 0.5, 0.479425549507141),
+        ("erf_", 1.0, 0.8427007929497148),
+        ("log_", 2.0, 0.6931471805599453),
+        ("reciprocal_", 2.0, 0.5),
+        ("tanh_", 1.0, 0.7615941559557649),
+        ("sqrt_", 4.0, 2.0),
+        ("rsqrt_", 4.0, 0.5),
+        ("expm1_", 1.0, 1.718281828459045),
+        ("log2_", 8.0, 3.0),
+        ("sigmoid_", 1.0, 0.7310585786300049),
+        ("abs_", -3.0, 3.0),
+        ("ceil_", 1.5, 2.0),
+    ]:
+        for door in (f"{name}_fn", f"{name}_member"):
+            got = out.get(door, "<missing>")
+            assert isinstance(got, list) and len(got) == 2, f"{door}: got {got!r}"
+            value, is_self = got
+            assert abs(value - expected) < 1e-5, f"{door}: expected {expected}, got {value}"
+            assert is_self is True, f"{door}: did not return the receiver itself"
+
+    got = out.get("clamp_min__fn", "<missing>")
+    assert got == [[0.0, 3.0], True], got
+    got = out.get("clamp_min__member", "<missing>")
+    assert got == [[0.0, 3.0], True], got
+
+    # `detach_` -- the fifteenth name -- still refuses, by its own deliberate
+    # message (not a generic "no table entry"), through both doors.
+    got = out.get("detach__fn", "")
+    assert got.startswith("refused:") and "aten.detach_.default" in got, got
+    got = out.get("detach__member", "")
+    assert got.startswith("refused:") and "aten.detach_.default" in got, got
+
+    # `native_group_norm` -- the sixteenth item, a kernel that already
+    # existed with a new *function* spelling only. The function door works
+    # now (three tensors of the shapes `native_group_norm_default` computes);
+    # the member door is still `AttributeError`, because upstream itself has
+    # no `Tensor.native_group_norm` (measured,
+    # `hasattr(torch.Tensor, "native_group_norm")` is `False` on 2.13.0) --
+    # this is not the shim's own "no table entry" `NotImplementedError`.
+    eq("native_group_norm_fn", [[2, 6, 3], [2, 3], [2, 3]])
     got = out.get("native_group_norm_member", "")
     assert got.startswith("ERROR:AttributeError"), got
 

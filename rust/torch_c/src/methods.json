@@ -338,8 +338,14 @@
   "abs": [
     "aten::abs(Tensor self) -> Tensor"
   ],
+  "abs_": [
+    "aten::abs_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "ceil": [
     "aten::ceil(Tensor self) -> Tensor"
+  ],
+  "ceil_": [
+    "aten::ceil_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "unbind": [
     "aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]"
@@ -364,20 +370,38 @@
   "cos": [
     "aten::cos(Tensor self) -> Tensor"
   ],
+  "cos_": [
+    "aten::cos_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "sin": [
     "aten::sin(Tensor self) -> Tensor"
+  ],
+  "sin_": [
+    "aten::sin_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "reciprocal": [
     "aten::reciprocal(Tensor self) -> Tensor"
   ],
+  "reciprocal_": [
+    "aten::reciprocal_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "rsqrt": [
     "aten::rsqrt(Tensor self) -> Tensor"
+  ],
+  "rsqrt_": [
+    "aten::rsqrt_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "sqrt": [
     "aten::sqrt(Tensor self) -> Tensor"
   ],
+  "sqrt_": [
+    "aten::sqrt_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "sigmoid": [
     "aten::sigmoid(Tensor self) -> Tensor"
+  ],
+  "sigmoid_": [
+    "aten::sigmoid_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "sign": [
     "aten::sign(Tensor self) -> Tensor"
@@ -399,20 +423,35 @@
   "log": [
     "aten::log(Tensor self) -> Tensor"
   ],
+  "log_": [
+    "aten::log_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "exp": [
     "aten::exp(Tensor self) -> Tensor"
   ],
   "erf": [
     "aten::erf(Tensor self) -> Tensor"
   ],
+  "erf_": [
+    "aten::erf_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "log2": [
     "aten::log2(Tensor self) -> Tensor"
+  ],
+  "log2_": [
+    "aten::log2_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "expm1": [
     "aten::expm1(Tensor self) -> Tensor"
   ],
+  "expm1_": [
+    "aten::expm1_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "tanh": [
     "aten::tanh(Tensor self) -> Tensor"
+  ],
+  "tanh_": [
+    "aten::tanh_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "relu": [
     "aten::relu(Tensor self) -> Tensor"
@@ -502,6 +541,9 @@
   "detach": [
     "aten::detach(Tensor(a) self) -> Tensor(a)"
   ],
+  "detach_": [
+    "aten::detach_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "new_ones": [
     "aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
@@ -537,6 +579,10 @@
   "clamp_min": [
     "aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor",
     "aten::clamp_min(Tensor self, Scalar min) -> Tensor"
+  ],
+  "clamp_min_": [
+    "aten::clamp_min_.Tensor(Tensor(a!) self, Tensor min) -> Tensor(a!)",
+    "aten::clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)"
   ],
 
   "add_": [

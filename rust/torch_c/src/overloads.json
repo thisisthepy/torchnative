@@ -354,6 +354,9 @@
   "native_layer_norm": [
     "aten::native_layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight, Tensor? bias, float eps) -> (Tensor, Tensor, Tensor)"
   ],
+  "native_group_norm": [
+    "aten::native_group_norm(Tensor input, Tensor? weight, Tensor? bias, SymInt N, SymInt C, SymInt HxW, int group, float eps) -> (Tensor, Tensor, Tensor)"
+  ],
 
   "cat": [
     "aten::cat.out(Tensor[] tensors, int dim=0, *, Tensor(a!) out) -> Tensor(a!)",
@@ -443,15 +446,24 @@
     "aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
+  "rsqrt_": [
+    "aten::rsqrt_(Tensor(a!) self) -> Tensor(a!)"
+  ],
 
   "sqrt": [
     "aten::sqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::sqrt(Tensor self) -> Tensor"
   ],
+  "sqrt_": [
+    "aten::sqrt_(Tensor(a!) self) -> Tensor(a!)"
+  ],
 
   "sigmoid": [
     "aten::sigmoid.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::sigmoid(Tensor self) -> Tensor"
+  ],
+  "sigmoid_": [
+    "aten::sigmoid_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "sign": [
@@ -474,6 +486,9 @@
   "tanh": [
     "aten::tanh.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::tanh(Tensor self) -> Tensor"
+  ],
+  "tanh_": [
+    "aten::tanh_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "relu": [
@@ -525,6 +540,9 @@
 
   "detach": [
     "aten::detach(Tensor(a) self) -> Tensor(a)"
+  ],
+  "detach_": [
+    "aten::detach_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "histc": [
@@ -626,6 +644,10 @@
     "aten::ceil(Tensor self) -> Tensor"
   ],
 
+  "ceil_": [
+    "aten::ceil_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "masked_select": [
     "aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
@@ -655,6 +677,10 @@
     "aten::log(Tensor self) -> Tensor"
   ],
 
+  "log_": [
+    "aten::log_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "exp": [
     "aten::exp.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::exp(Tensor self) -> Tensor"
@@ -669,14 +695,26 @@
     "aten::erf(Tensor self) -> Tensor"
   ],
 
+  "erf_": [
+    "aten::erf_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "log2": [
     "aten::log2.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::log2(Tensor self) -> Tensor"
   ],
 
+  "log2_": [
+    "aten::log2_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "expm1": [
     "aten::expm1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::expm1(Tensor self) -> Tensor"
+  ],
+
+  "expm1_": [
+    "aten::expm1_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "stack": [
@@ -692,16 +730,32 @@
     "aten::abs(Tensor self) -> Tensor"
   ],
 
+  "abs_": [
+    "aten::abs_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "cos": [
     "aten::cos(Tensor self) -> Tensor"
+  ],
+
+  "cos_": [
+    "aten::cos_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "sin": [
     "aten::sin(Tensor self) -> Tensor"
   ],
 
+  "sin_": [
+    "aten::sin_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "reciprocal": [
     "aten::reciprocal(Tensor self) -> Tensor"
+  ],
+
+  "reciprocal_": [
+    "aten::reciprocal_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "clone": [
@@ -716,6 +770,11 @@
   "clamp_min": [
     "aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor",
     "aten::clamp_min(Tensor self, Scalar min) -> Tensor"
+  ],
+
+  "clamp_min_": [
+    "aten::clamp_min_.Tensor(Tensor(a!) self, Tensor min) -> Tensor(a!)",
+    "aten::clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)"
   ],
 
   "clamp_": [

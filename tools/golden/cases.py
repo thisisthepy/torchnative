@@ -19789,6 +19789,79 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
         lambda call, base: call(
             "aten.exp_.default", call("aten.select.int", base, 1, 0)))
 
+    # --- docs/SPELLINGS.md §9's fourteen-name gap, write-through evidence --
+    #
+    # Same shape as `exp_`/`neg_` above and here for the same reason: every
+    # one of these returns `self`, so a return-value case cannot tell a
+    # write-through kernel from one that computed into a fresh buffer and
+    # handed it back. Each reads the BASE through a strided `select.int`
+    # view. Positive-only inputs for the ops whose domain matters
+    # (`sqrt_`/`log_`/`log2_`/`reciprocal_`/`rsqrt_`); the signed grid for
+    # the rest.
+    add("aten.cos_.default",
+        "base after x[:,1].cos_() [reads the BASE]",
+        "cos_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.cos_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.sin_.default",
+        "base after x[:,1].sin_() [reads the BASE]",
+        "sin_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.sin_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.erf_.default",
+        "base after x[:,1].erf_() [reads the BASE]",
+        "erf_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.erf_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.tanh_.default",
+        "base after x[:,1].tanh_() [reads the BASE]",
+        "tanh_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.tanh_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.expm1_.default",
+        "base after x[:,1].expm1_() [reads the BASE]",
+        "expm1_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.expm1_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.sigmoid_.default",
+        "base after x[:,1].sigmoid_() [reads the BASE]",
+        "sigmoid_ through a strided view", signed, (3, 4), "float32",
+        lambda call, base: call("aten.sigmoid_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.sqrt_.default",
+        "base after x[:,1].sqrt_() [reads the BASE]",
+        "sqrt_ through a strided view", grid, (3, 4), "float32",
+        lambda call, base: call("aten.sqrt_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.rsqrt_.default",
+        "base after x[:,1].rsqrt_() [reads the BASE]",
+        "rsqrt_ through a strided view", grid, (3, 4), "float32",
+        lambda call, base: call("aten.rsqrt_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.log_.default",
+        "base after x[:,1].log_() [reads the BASE]",
+        "log_ through a strided view", grid, (3, 4), "float32",
+        lambda call, base: call("aten.log_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.log2_.default",
+        "base after x[:,1].log2_() [reads the BASE]",
+        "log2_ through a strided view", grid, (3, 4), "float32",
+        lambda call, base: call("aten.log2_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.reciprocal_.default",
+        "base after x[:,1].reciprocal_() [reads the BASE]",
+        "reciprocal_ through a strided view", grid, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.reciprocal_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.abs_.default",
+        "base after x[:,1].abs_() [reads the BASE]",
+        "abs_ through a strided view -- unlike the eleven above, an integral "
+        "receiver would compute here too, but this case is float32",
+        signed, (3, 4), "float32",
+        lambda call, base: call("aten.abs_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.ceil_.default",
+        "base after x[:,1].ceil_() [reads the BASE]",
+        "ceil_ through a strided view",
+        [v + 0.5 for v in signed], (3, 4), "float32",
+        lambda call, base: call("aten.ceil_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.clamp_min_.default",
+        "base after x[:,1].clamp_min_(0.0) [reads the BASE]",
+        "clamp_min_ through a strided view; the other three columns of the "
+        "base must come back untouched",
+        signed, (3, 4), "float32",
+        lambda call, base: call(
+            "aten.clamp_min_.default", call("aten.select.int", base, 1, 1), 0.0))
+
     # `masked_fill_` and `index_put_` need a mask/index operand, which
     # `_tensor_from_flat` will not build as bool directly -- same workaround
     # `masked_fill__scalar_cases` documents.
@@ -20852,6 +20925,391 @@ def exp__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def _promoting_unary_inplace_cases(
+    torch_module, c_module, torch_call, op, member_spelling, float_probes,
+) -> list[Case]:
+    """The shared shape for `cos_`/`sin_`/`erf_`/`log_`/`reciprocal_`/`tanh_`/
+    `sqrt_`/`rsqrt_`/`expm1_`/`log2_`/`sigmoid_` -- docs/SPELLINGS.md §9's
+    fifteen-name gap, minus `clamp_min_` (its own dtype refusal, not this
+    family's) and `abs_`/`ceil_` (which do not promote out of place either,
+    so they have nothing in common with this shape) and `detach_` (refused
+    by name, no kernel).
+
+    Every one of the eleven shares one rule: **in-place cannot promote**, so
+    every integral/boolean receiver refuses with upstream's own wording
+    rather than the out-of-place kernel's promotion to the default float.
+    `float_probes` supplies the op-specific values (`log_` needs positive
+    inputs, `reciprocal_` needs a domain that exercises `1/0`, etc.); this
+    function supplies the refusal rows, the write-through-a-view case, and
+    the `x.<op>_()` member spelling every one of them needs, so each op's own
+    function is only its values."""
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for flat, shape, note in float_probes:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op}(dtype={dtype_name}, shape={shape}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                    note=note,
+                )
+            )
+    for dtype_name in ["int64", "int32", "uint8", "bool"]:
+        flat = [0, 1] if dtype_name == "bool" else [1, 2, 3, 4]
+        shape = (2,) if dtype_name == "bool" else (2, 2)
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(
+            Case(
+                name=f"{op}(dtype={dtype_name}) [refused -- the out-of-place kernel "
+                     "promotes and in-place cannot]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note="result type Float can't be cast to the desired output type "
+                     "Long/Int/Byte/Bool",
+            )
+        )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        (member_spelling, lambda m, a, spelling=member_spelling: getattr(a, spelling[2:-2])()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def cos__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.cos_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.cos_()",
+        [
+            ([0.0, math.pi / 2, math.pi, -math.pi / 2], (4,), "quadrant points"),
+            ([1.0, -1.0, 10.0, -10.0], (2, 2), "assorted magnitudes"),
+            ([float("nan"), float("inf"), float("-inf")], (3,), "non-finite -> nan"),
+        ],
+    )
+
+
+def sin__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sin_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.sin_()",
+        [
+            ([0.0, math.pi / 2, math.pi, -math.pi / 2], (4,), "quadrant points"),
+            ([1.0, -1.0, 10.0, -10.0], (2, 2), "assorted magnitudes"),
+            ([float("nan"), float("inf"), float("-inf")], (3,), "non-finite -> nan"),
+        ],
+    )
+
+
+def erf__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.erf_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.erf_()",
+        [
+            ([-3.0, -1.0, 0.0, 1.0, 3.0], (5,), "assorted magnitudes, both signs"),
+            ([float("nan"), float("inf"), float("-inf")], (3,), "erf(+-inf) = +-1, nan stays nan"),
+        ],
+    )
+
+
+def log__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.log_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.log_()",
+        [
+            ([1.0, math.e, 10.0, 0.5], (4,), "assorted magnitudes"),
+            ([0.0], (1,), "log(0) -> -inf, not a refusal"),
+            ([-1.0], (1,), "log(negative) -> nan, not a refusal"),
+            ([float("inf")], (1,), "log(inf) -> inf"),
+        ],
+    )
+
+
+def reciprocal__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.reciprocal_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.reciprocal_()",
+        [
+            ([2.0, -2.0, 0.5, -0.5], (4,), "assorted magnitudes, both signs"),
+            ([0.0, -0.0], (2,), "1/0 -> +inf, 1/-0.0 -> -inf"),
+            ([float("inf"), float("-inf")], (2,), "1/inf -> 0, sign kept"),
+        ],
+    )
+
+
+def tanh__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.tanh_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.tanh_()",
+        [
+            ([0.0, 1.0, -1.0, 5.0, -5.0], (5,), "assorted magnitudes, both signs"),
+            ([float("nan"), float("inf"), float("-inf")], (3,), "saturating ends, nan stays nan"),
+        ],
+    )
+
+
+def sqrt__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sqrt_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.sqrt_()",
+        [
+            ([1.0, 4.0, 9.0, 16.0], (4,), "perfect squares"),
+            ([0.0, -0.0], (2,), "sqrt(+-0.0) keeps the sign"),
+            ([-1.0, -4.0], (2,), "negative -> NaN"),
+            ([float("inf")], (1,), "+inf -> +inf"),
+            ([float("-inf")], (1,), "-inf -> NaN, not -inf"),
+        ],
+    )
+
+
+def rsqrt__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.rsqrt_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.rsqrt_()",
+        [
+            ([1.0, 4.0, 9.0, 16.0], (4,), "perfect squares"),
+            ([0.5, 2.0, 100.0, 0.01], (4,), "assorted magnitudes"),
+            ([0.0], (1,), "zero -> +inf"),
+            ([-1.0, -4.0], (2,), "negative -> NaN"),
+        ],
+    )
+
+
+def expm1__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.expm1_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.expm1_()",
+        [
+            ([1e-8, -1e-8, 1e-4], (3,), "near zero -- the cancellation `expm1` exists to avoid"),
+            ([0.0, 1.0, -1.0, 5.0], (4,), "assorted magnitudes"),
+            ([float("nan"), float("inf"), float("-inf")], (3,), "non-finite"),
+        ],
+    )
+
+
+def log2__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.log2_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.log2_()",
+        [
+            ([1.0, 2.0, 4.0, 1024.0], (4,), "exact powers of two"),
+            ([0.0], (1,), "log2(0) -> -inf"),
+            ([-1.0], (1,), "log2(negative) -> nan"),
+            ([float("inf")], (1,), "log2(inf) -> inf"),
+        ],
+    )
+
+
+def sigmoid__cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sigmoid_.default"
+    return _promoting_unary_inplace_cases(
+        torch_module, c_module, torch_call, op, "x.sigmoid_()",
+        [
+            ([0.0, 1.0, -1.0, 8.0, -8.0], (5,), "assorted magnitudes, both signs"),
+            ([float("inf"), float("-inf"), float("nan")], (3,), "saturating ends, nan stays nan"),
+        ],
+    )
+
+
+def abs__cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`abs_` does **not** promote out of place (`int64.abs()` is `int64`),
+    so unlike the eleven ops above an integral receiver computes rather than
+    refuses -- only `bool` does, with upstream's own kernel name. The signed
+    integral rows exist to catch a plain `i64::abs`/`i32::abs`/`i16::abs`
+    rather than the `wrapping_abs` `abs_default` uses: `INT_MIN.abs()` panics
+    in a debug build and is `INT_MIN` again on real torch."""
+    op = "aten.abs_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [-3.0, 4.0, -0.0, 0.0, float("nan")], (5,), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"abs_(dtype={dtype_name}) [assorted signs, -0.0, nan]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            )
+        )
+    for dtype_name, minval in [("int64", -(2**63)), ("int32", -(2**31)), ("int16", -(2**15))]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [minval, -1, 0, 5], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"abs_(dtype={dtype_name}) [wrapping: {dtype_name}.min stays {dtype_name}.min]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="the most negative element of a signed type abs()es to itself upstream",
+            )
+        )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "uint8")
+    cases.append(
+        Case(
+            name="abs_(dtype=uint8) [identity -- no unsigned element is negative]",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+        )
+    )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="abs_(dtype=bool) [refused -- \"abs_cpu\" not implemented for 'Bool']",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+            expect="both_error",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.abs_()", lambda m, a: a.abs_()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def ceil__cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`ceil_` does not promote out of place either, and an integral receiver
+    is upstream's identity rather than a refusal -- re-measured here rather
+    than assumed from `ceil_default`. Only `bool` refuses, with a *different*
+    kernel name from `abs_`'s own ("ceil_vml_cpu", not "abs_cpu") because
+    upstream reaches a different kernel."""
+    op = "aten.ceil_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1.5, -1.5, -0.5, 0.5, 2.0, -2.0], (6,), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"ceil_(dtype={dtype_name}) [ceil(-0.5) keeps its sign as -0.0]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            )
+        )
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [float("nan"), float("inf"), float("-inf")], (3,), "float32"
+    )
+    cases.append(
+        Case(
+            name="ceil_(float32, [nan, inf, -inf])",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+        )
+    )
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1, -1, 2], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"ceil_(dtype={dtype_name}) [identity -- already integral]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            )
+        )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="ceil_(dtype=bool) [refused -- \"ceil_vml_cpu\" not implemented for 'Bool']",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+            expect="both_error",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.ceil_()", lambda m, a: a.ceil_()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def clamp_min__cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`clamp_min_` -- the in-place sibling of `clamp_min.default`
+    (`clamp_min_default`), landed for the same `vits` wall a round earlier
+    named only the out-of-place form for. **Its dtype rule is `clamp_`'s
+    shape, not `clamp_min`'s**: in-place cannot promote, so a float bound on
+    an integral receiver refuses (measured) where the out-of-place kernel
+    would compute in the default float. The bool row is its own kernel name
+    (`clamp_min_scalar_cpu`, not `clamp_scalar_cpu`), measured separately
+    from `clamp_`'s because the two diverge there."""
+    op = "aten.clamp_min_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [-2.0, -1.0, 0.0, 1.0, 2.0, float("nan")], (6,), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"clamp_min_(dtype={dtype_name}, min=0.0) [nan is kept, not clamped]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0.0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0.0),
+            )
+        )
+    for dtype_name, flat in [
+        ("int64", [-2, 0, 1, 5]),
+        ("int32", [-2, 0, 1, 5]),
+        # unsigned: no negative row -- `-2` would wrap at construction time,
+        # before `clamp_min_` ever runs, which is a fact about
+        # `pair_from_flat`'s tensor building and not about this kernel.
+        ("uint8", [0, 1, 2, 5]),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"clamp_min_(dtype={dtype_name}, min=1) [int bound keeps the dtype]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 1),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1),
+            )
+        )
+    for dtype_name in ["int32", "uint8"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"clamp_min_(dtype={dtype_name}, min=2.0) [refused -- a float bound "
+                     "would widen, and in-place cannot]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 2.0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 2.0),
+                expect="both_error",
+            )
+        )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="clamp_min_(dtype=bool, min=False) [refused -- \"clamp_min_scalar_cpu\" "
+                 "not implemented for 'Bool']",
+            op=op,
+            run_torch=lambda: torch_call(b_t, False),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, False),
+            expect="both_error",
+        )
+    )
+    b2_t, b2_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="clamp_min_(dtype=bool, min=0) [refused -- an int bound on bool still "
+                 "cannot cast]",
+            op=op,
+            run_torch=lambda: torch_call(b2_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, b2_c, 0),
+            expect="both_error",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.clamp_min_(0.0)", lambda m, a: a.clamp_min_(0.0)),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
 def _isub(a, b):
     a -= b
     return a
@@ -21149,4 +21607,25 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # it has to ride on the kernel it decomposes onto.
     "aten.bernoulli_.float": bernoulli__float_cases,
     "aten.div_.Scalar": div__scalar_cases,
+    # docs/SPELLINGS.md §9 / docs/INPLACE.md: fourteen in-place ops whose
+    # out-of-place twins already existed and whose in-place spelling had no
+    # kernel at all. `detach_` (the fifteenth name in that inventory) is
+    # deliberately refused by name rather than given a kernel -- see
+    # `detach_inplace_refusal` in aten.rs -- so it has no entry here; a
+    # refused-by-name op is not in `_aten_implemented()` and this harness's
+    # coverage rule only requires a builder for what is.
+    "aten.cos_.default": cos__cases,
+    "aten.sin_.default": sin__cases,
+    "aten.erf_.default": erf__cases,
+    "aten.log_.default": log__cases,
+    "aten.reciprocal_.default": reciprocal__cases,
+    "aten.tanh_.default": tanh__cases,
+    "aten.sqrt_.default": sqrt__cases,
+    "aten.rsqrt_.default": rsqrt__cases,
+    "aten.expm1_.default": expm1__cases,
+    "aten.log2_.default": log2__cases,
+    "aten.sigmoid_.default": sigmoid__cases,
+    "aten.abs_.default": abs__cases,
+    "aten.ceil_.default": ceil__cases,
+    "aten.clamp_min_.default": clamp_min__cases,
 }

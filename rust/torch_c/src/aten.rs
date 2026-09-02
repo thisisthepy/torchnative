@@ -47,6 +47,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten.abs.default",
+    "aten.abs_.default",
     "aten.add.Scalar",
     "aten.add.Tensor",
     "aten.add_.Scalar",
@@ -74,14 +75,17 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bmm.default",
     "aten.cat.default",
     "aten.ceil.default",
+    "aten.ceil_.default",
     "aten.clamp.default",
     "aten.clamp_.default",
     "aten.clamp_min.default",
+    "aten.clamp_min_.default",
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.convolution.default",
     "aten.copy_.default",
     "aten.cos.default",
+    "aten.cos_.default",
     "aten.cumsum.default",
     "aten.detach.default",
     "aten.div.Scalar_mode",
@@ -95,9 +99,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.eq.Scalar",
     "aten.eq.Tensor",
     "aten.erf.default",
+    "aten.erf_.default",
     "aten.exp.default",
     "aten.exp_.default",
     "aten.expm1.default",
+    "aten.expm1_.default",
     "aten.expand.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
@@ -122,6 +128,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.lift_fresh.default",
     "aten.log.default",
     "aten.log2.default",
+    "aten.log2_.default",
+    "aten.log_.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
@@ -161,26 +169,31 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.pow.Tensor_Tensor",
     "aten.randint.low",
     "aten.reciprocal.default",
+    "aten.reciprocal_.default",
     "aten.relu.default",
     "aten.relu_.default",
     "aten.remainder.Scalar",
     "aten.remainder.Tensor",
     "aten.repeat.default",
     "aten.rsqrt.default",
+    "aten.rsqrt_.default",
     "aten.rsub.Scalar",
     "aten.scalar_tensor.default",
     "aten.scatter.src",
     "aten.select.int",
     "aten.sigmoid.default",
+    "aten.sigmoid_.default",
     "aten.sign.default",
     "aten.silu.default",
     "aten.sin.default",
+    "aten.sin_.default",
     "aten.slice.Tensor",
     "aten.softplus.default",
     "aten.sort.default",
     "aten.split.Tensor",
     "aten.split_with_sizes.default",
     "aten.sqrt.default",
+    "aten.sqrt_.default",
     "aten.squeeze.dim",
     "aten.stack.default",
     "aten.sub.Scalar",
@@ -191,6 +204,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.sum.dim_IntList",
     "aten.t.default",
     "aten.tanh.default",
+    "aten.tanh_.default",
     "aten.topk.default",
     "aten.transpose.int",
     "aten.tril.default",
@@ -1550,6 +1564,35 @@ fn aten_dispatch_inner(
         }
         "aten.neg_.default" => neg_inplace(py, args, kwargs),
         "aten.exp_.default" => exp_inplace(py, args, kwargs),
+        "aten.cos_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.cos_.default", Unary::Cos)
+        }
+        "aten.sin_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.sin_.default", Unary::Sin)
+        }
+        "aten.erf_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.erf_.default", Unary::Erf)
+        }
+        "aten.log_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.log_.default", Unary::Log)
+        }
+        "aten.reciprocal_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.reciprocal_.default", Unary::Reciprocal)
+        }
+        "aten.tanh_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.tanh_.default", Unary::Tanh)
+        }
+        "aten.sqrt_.default" => {
+            unary_float_inplace(py, args, kwargs, "aten.sqrt_.default", Unary::Sqrt)
+        }
+        "aten.rsqrt_.default" => rsqrt_inplace(py, args, kwargs),
+        "aten.expm1_.default" => expm1_inplace(py, args, kwargs),
+        "aten.log2_.default" => log2_inplace(py, args, kwargs),
+        "aten.sigmoid_.default" => sigmoid_inplace(py, args, kwargs),
+        "aten.abs_.default" => abs_inplace(py, args, kwargs),
+        "aten.ceil_.default" => ceil_inplace(py, args, kwargs),
+        "aten.clamp_min_.default" => clamp_min_inplace(py, args, kwargs),
+        "aten.detach_.default" => detach_inplace_refusal(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -10461,6 +10504,480 @@ fn relu_inplace(
     write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;
     Ok(receiver.into_any().unbind())
+}
+
+/// The in-place sibling of `unary_float`'s family (`cos_`/`sin_`/`erf_`/
+/// `log_`/`reciprocal_`/`tanh_`/`sqrt_`), for `docs/SPELLINGS.md` §9's
+/// fifteen-name gap. `rsqrt_`/`expm1_`/`log2_`/`sigmoid_` are the same rule
+/// but not `Unary` variants (their out-of-place kernels do not go through
+/// `unary_float` either), so they get their own functions below rather than
+/// an `Unreachable` arm here.
+///
+/// **In-place cannot promote, and that is the whole dtype story.**
+/// `unary_float`'s out-of-place rule sends an integral or boolean input to
+/// the default float; an in-place receiver has nowhere to put a wider dtype
+/// than the one it already has, so every one of these refuses instead,
+/// measured against upstream 2.13.0 for all seven names this function
+/// serves plus the four that share the rule without sharing the function:
+///
+/// ```text
+/// int64/int32/int16/uint8/bool . sqrt_/cos_/sin_/erf_/log_/reciprocal_/
+///   tanh_/rsqrt_/expm1_/log2_/sigmoid_
+///     -> RuntimeError: result type Float can't be cast to the desired
+///        output type <Long/Int/Short/Byte/Bool>
+/// float16/bfloat16/float32/float64 -> computes, own dtype kept
+/// ```
+///
+/// `inplace_cast_check` is the same door `exp_inplace` already uses for the
+/// identical shape of refusal, so the wording is not re-derived here.
+fn unary_float_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    kind: Unary,
+) -> PyResult<Py<PyAny>> {
+    let receiver = tensor_receiver(op, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    inplace_cast_check(op, unary_float_tag(tag), tag)?;
+    let storage = PyDtype::new(tag).storage(op)?;
+    let out = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| match kind {
+                Unary::Cos => t.cos(),
+                Unary::Sin => t.sin(),
+                Unary::Reciprocal => t.recip(),
+                Unary::Tanh => t.tanh(),
+                Unary::Log => t.log(),
+                Unary::Sqrt => t.sqrt(),
+                Unary::Erf => t.erf(),
+                // `exp_` has had its own kernel (`exp_inplace`) since before
+                // this function existed, so nothing routes `Unary::Exp`
+                // here -- but the match has to be exhaustive.
+                Unary::Exp => {
+                    Err(candle_core::Error::Msg(format!(
+                        "{op}: torch._C shim internal error -- exp_ does not \
+                         route through unary_float_inplace (aten.rs)"
+                    )))
+                }
+            })
+        .map_err(|e| candle_err(op, e))?
+    };
+    write_back(op, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::rsqrt_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `rsqrt_default`'s value (`1/sqrt(x)`), written through the receiver.
+/// Not `unary_float_inplace` for the same reason `rsqrt_default` is not
+/// `unary_float`: it composes `sqrt`+`recip` itself rather than naming a
+/// `Unary` variant. The dtype rule is the family's, re-measured rather than
+/// assumed: `int64.rsqrt_()` raises "result type Float can't be cast to the
+/// desired output type Long", and every floating dtype keeps its own width.
+fn rsqrt_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.rsqrt_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    inplace_cast_check(OP, unary_float_tag(tag), tag)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let out = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| t.sqrt())
+            .and_then(|t| t.recip())
+            .map_err(|e| candle_err(OP, e))?
+    };
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::expm1_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `expm1_default`'s value (`exp(x) - 1`, through `f64::exp_m1` element by
+/// element rather than a subtraction that cancels near zero -- see that
+/// function's doc comment for the measurement), written through the
+/// receiver. The dtype rule is the family's: in-place cannot promote, so
+/// every non-floating receiver refuses (measured) rather than the
+/// out-of-place kernel's int/bool -> float32 promotion. Because the refusal
+/// runs first, `read_flat` is only ever called on an already-floating tag
+/// here, so it can never return `Flat::Int` -- the match still has to name
+/// that arm, and it does so as an internal error rather than a panic, the
+/// same shape `write_into`'s dtype checks use.
+fn expm1_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.expm1_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    inplace_cast_check(OP, unary_float_tag(tag), tag)?;
+    let source = receiver.borrow().tensor()?.clone();
+    let values = match read_flat(OP, &source, tag)? {
+        Flat::Float(v) => v.into_iter().map(f64::exp_m1).collect::<Vec<f64>>(),
+        Flat::Int(_) => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: torch._C shim internal error -- inplace_cast_check above \
+                 should have refused every non-floating receiver (aten.rs)"
+            )))
+        }
+    };
+    let out = write_flat(OP, Flat::Float(values), source.dims().to_vec(), source.device(), tag)?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::log2_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `log2_default`'s value (`f64::log2`, `f32` accumulation for the three
+/// narrow floats -- see that function's doc comment for why `t.log()? /
+/// ln(2)` is not bit-identical to upstream), written through the receiver.
+/// Dtype rule is the family's: refuses rather than promotes.
+fn log2_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.log2_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    inplace_cast_check(OP, unary_float_tag(tag), tag)?;
+    let acc32 = tag != TorchDType::Float64;
+    let source = receiver.borrow().tensor()?.clone();
+    let values = match read_flat(OP, &source, tag)? {
+        Flat::Float(v) => v
+            .into_iter()
+            .map(|x| if acc32 { (x as f32).log2() as f64 } else { x.log2() })
+            .collect::<Vec<f64>>(),
+        Flat::Int(_) => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: torch._C shim internal error -- inplace_cast_check above \
+                 should have refused every non-floating receiver (aten.rs)"
+            )))
+        }
+    };
+    let out = write_flat(OP, Flat::Float(values), source.dims().to_vec(), source.device(), tag)?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::sigmoid_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `sigmoid_default`'s value and precision rule (`1/(1+exp(-x))`, `float16`/
+/// `bfloat16` computed in `f32` and narrowed once -- see that function's doc
+/// comment for the measurement that pins it), written through the receiver.
+/// Dtype rule is the family's: refuses rather than promotes, so unlike the
+/// out-of-place kernel there is no `unary_float_tag` widening left to do by
+/// the time the value is computed -- `tag` and `storage` already are the
+/// accumulation dtype's source.
+fn sigmoid_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.sigmoid_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    inplace_cast_check(OP, unary_float_tag(tag), tag)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let out = {
+        let borrowed = receiver.borrow();
+        borrowed
+            .tensor()?
+            .fast_to(acc)
+            .and_then(|t| t.neg())
+            .and_then(|t| t.exp())
+            .and_then(|t| t + 1.0)
+            .and_then(|t| t.recip())
+            .and_then(|t| t.fast_to(storage))
+            .map_err(|e| candle_err(OP, e))?
+    };
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::abs_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `abs_default`'s value, written through the receiver. **Not** a member of
+/// the promoting family above: `abs` does not promote out of place either
+/// (`int64.abs()` is `int64`), so the in-place form has nothing to refuse on
+/// that account and the two dtype rules are the same, re-measured: every
+/// dtype computes except `bool`, which raises upstream's own kernel name
+/// ("abs_cpu" not implemented for 'Bool'). The integral path reuses
+/// `abs_default`'s `wrapping_abs` round trip through `i64` for the same
+/// reason that function gives -- candle's `abs` is a `unary_op!` whose
+/// integer arms are `todo!()` and would panic rather than raise.
+fn abs_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.abs_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"abs_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let out = if tag.is_floating_point() {
+        receiver.borrow().tensor()?.abs().map_err(|e| candle_err(OP, e))?
+    } else {
+        let source = receiver.borrow().tensor()?.clone();
+        let dims = source.dims().to_vec();
+        let values: Vec<i64> = source
+            .contiguous()
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_dtype(candle_core::DType::I64))
+            .and_then(|t| t.to_vec1::<i64>())
+            .map_err(|e| candle_err(OP, e))?;
+        let wrapped: Vec<i64> = values
+            .into_iter()
+            .map(|v| match storage {
+                candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
+                candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
+                _ => v.wrapping_abs(),
+            })
+            .collect();
+        Tensor::from_vec(wrapped, dims, source.device())
+            .and_then(|t| t.fast_to(storage))
+            .map_err(|e| candle_err(OP, e))?
+    };
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::ceil_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `ceil_default`'s value, written through the receiver. Like `abs_` above,
+/// **not** a member of the promoting family: `ceil` does not promote out of
+/// place (`torch.arange(3).ceil()` is still `int64`), so an integral
+/// receiver is the identity rather than a refusal -- re-measured, matching
+/// `ceil_default`'s doc comment. Only `bool` refuses, with upstream's own
+/// kernel name ("ceil_vml_cpu" not implemented for 'Bool'), a different
+/// string from `abs_`'s because upstream reaches a different kernel.
+fn ceil_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.ceil_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"ceil_vml_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    let out = if tag.is_floating_point() {
+        receiver.borrow().tensor()?.ceil().map_err(|e| candle_err(OP, e))?
+    } else {
+        // Already integral: upstream hands the tensor straight back, and
+        // writing the unchanged values through the receiver is the in-place
+        // shape of that no-op.
+        receiver.borrow().tensor()?.clone()
+    };
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The C++ scalar-type spelling `clamp_min_`'s (and `clamp_`'s) cast-refusal
+/// message names for the *destination* side, distinct from all three other
+/// dtype-name tables in this file (`TorchDType::name()`, `c10_name`,
+/// `scalar_type_name`) and not derivable from any of them -- each string was
+/// read off a real `RuntimeError` on torch 2.13.0:
+///
+/// ```text
+/// int32.clamp_min_(2.0)   "result type Float can't be cast to the desired output type int"
+/// int64.clamp_min_(2.0)   "... long long"
+/// int16.clamp_min_(2.0)   "... short"
+/// uint8.clamp_min_(2.0)   "... unsigned char"
+/// uint32.clamp_min_(2.0)  "... unsigned int"
+/// ```
+///
+/// Only the dtypes this shim can actually store need an entry (`dtype.rs`'s
+/// `storage()`); the rest fall back to `TorchDType::name()` rather than
+/// inventing a C++ spelling for a dtype no tensor here can carry.
+fn clamp_scalar_cpu_type_name(dtype: TorchDType) -> &'static str {
+    use TorchDType::*;
+    match dtype {
+        Int16 => "short",
+        Int32 => "int",
+        Int64 => "long long",
+        UInt8 => "unsigned char",
+        UInt32 => "unsigned int",
+        Bool => "bool",
+        other => other.name(),
+    }
+}
+
+/// The dtype refusal `clamp_min_` has, measured separately from `clamp_`'s
+/// `clamp_dtype_refusals` because the two diverge on exactly one row and
+/// sharing would reproduce the wrong one of them: a **boolean bound on a
+/// boolean receiver**. Measured on torch 2.13.0:
+///
+/// ```text
+/// clamp_min_(bool, 0)      "result type Long can't be cast to the desired output type bool"
+/// clamp_min_(bool, 0.0)    "result type Float can't be cast to the desired output type bool"
+/// clamp_min_(bool, False)  NotImplementedError: "clamp_min_scalar_cpu" not implemented for 'Bool'
+/// int32.clamp_min_(2.0)    "result type Float can't be cast to the desired output type int"
+/// uint8.clamp_min_(2)      OK, uint8 kept (an int bound never widens an int receiver)
+/// ```
+///
+/// The last row is `clamp_min_`'s half of "in-place cannot promote": unlike
+/// `clamp_min.default` (out of place), which promotes an integral receiver
+/// when the bound is a float, this refuses instead -- the same asymmetry
+/// `clamp_result_tag`'s doc comment already measured between `clamp` and
+/// `clamp_`.
+///
+/// `min` is read from the raw arguments as well as the parsed `Scalar`,
+/// for the reason `clamp_result_tag`'s own `bound_is_bool` reads them: `bool`
+/// subclasses `int` in Python and `Scalar` collapses the two, but upstream's
+/// kernel-name refusal fires only for an actual Python `bool`.
+fn clamp_min_inplace_refusal(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    tag: TorchDType,
+    min: Scalar,
+) -> PyResult<()> {
+    if tag == TorchDType::Bool {
+        let bound_is_bool = match optional(args, kwargs, 1, "min")? {
+            Some(value) if !value.is_none() => value.is_instance_of::<pyo3::types::PyBool>(),
+            _ => false,
+        };
+        if bound_is_bool {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "\"clamp_min_scalar_cpu\" not implemented for 'Bool'",
+            ));
+        }
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type {} can't be cast to the desired output type bool",
+            if min.is_int() { "Long" } else { "Float" }
+        )));
+    }
+    if !tag.is_floating_point() && !min.is_int() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "result type Float can't be cast to the desired output type {}",
+            clamp_scalar_cpu_type_name(tag)
+        )));
+    }
+    Ok(())
+}
+
+/// `aten::clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)`
+///
+/// `vits`'s wall had the out-of-place form (`clamp_min_default`, `x =
+/// torch.clamp_min(...)` reassigned); this is the in-place spelling
+/// (`x.clamp_min_(...)`/`torch.clamp_min_(x, ...)`), which had neither a
+/// kernel nor a table entry before docs/SPELLINGS.md §9 named it. The value
+/// is `clamp_values(..., min, None)`, shared with `clamp_min_default` and
+/// `clamp_inplace_default`; the dtype rule is `clamp_min_inplace_refusal`
+/// above, kept separate from `clamp_`'s own `clamp_dtype_refusals` because
+/// they diverge on the bool-bound-on-bool-receiver row.
+fn clamp_min_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.clamp_min_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let min = scalar_arg(OP, args, kwargs, 1, "min")?.ok_or_else(|| missing(OP, "min"))?;
+    let tag = receiver.borrow().tag();
+    clamp_min_inplace_refusal(args, kwargs, tag, min)?;
+    let source = receiver.borrow().tensor()?.clone();
+    let out = clamp_values(OP, &source, tag, Some(min), None)?;
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::detach_(Tensor(a!) self) -> Tensor(a!)` -- refused by name rather
+/// than approximated, and this is a judgement call recorded rather than an
+/// omission.
+///
+/// `detach_` is not arithmetic: it rewrites the receiver's autograd metadata
+/// (`requires_grad`/`is_leaf`/`grad_fn`), not its storage. Measured against
+/// upstream 2.13.0:
+///
+/// ```text
+/// leaf.detach_()          requires_grad -> False, is_leaf stays True,
+///                          grad_fn stays None, returns self (identity)
+/// non_leaf.detach_()      same triple, and non_leaf becomes indistinguishable
+///                          from a leaf that was never part of a graph
+/// view.detach_()          RuntimeError: Can't detach views in-place. Use
+///                          detach() instead. ...
+///                          -- true unconditionally, even for a view whose
+///                          requires_grad was already False (measured: a
+///                          view of a tensor that never required grad still
+///                          refuses)
+/// ```
+///
+/// Two of the three leaf-case fields are **already** upstream's answer for
+/// every `TensorBase` this shim has, independent of `detach_`:
+/// `is_leaf` is `property(lambda self: True)` and `grad_fn` is
+/// `property(lambda self: None)` (`bootstrap.py`, docs/BACKWARD2.md §1.4 W5/
+/// W6, neither landed). So the only field `detach_` could actually change
+/// here is `requires_grad`, and *that* would be a one-line `set_requires_grad`
+/// call -- except for the view refusal, which does not depend on
+/// `requires_grad` at all and fires before either flag is touched.
+///
+/// **This shim cannot tell a view from a non-view.** `PyTensorBase`
+/// (tensor.rs) carries shape, dtype and a candle `Tensor`; it has no
+/// `_base`/`is_view` slot recording which op produced it, so there is no
+/// field a kernel could read to decide which of the two upstream branches
+/// applies. Always taking the leaf branch (`requires_grad = false`, return
+/// self) would compute a value for every receiver, including the ones
+/// upstream refuses -- `y = x.view(-1); y.detach_()` would silently succeed
+/// here and raise upstream. That is the silent-divergence direction this
+/// file refuses everywhere else (`inplace_cast_check`'s doc comment, the
+/// `add_`/`sub_` narrowing fix, `write_into`'s own tag/shape checks), so it
+/// is refused here too rather than accepted for the sake of landing a
+/// sixteenth kernel. The out-of-place `detach()` this shim already
+/// implements is unaffected and is upstream's own suggested replacement.
+fn detach_inplace_refusal(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.detach_.default";
+    // Argument shape is checked before the deliberate refusal, the same
+    // order every other kernel in this file uses -- a caller who passed the
+    // wrong thing for `self` should see that error, not this one.
+    let _receiver = tensor_receiver(OP, args, kwargs)?;
+    let _ = py;
+    Err(not_implemented(
+        "aten.detach_.default: torch._C shim refuses this op by name rather than \
+         guessing at it (docs/INPLACE.md). Upstream sets requires_grad=False on a \
+         leaf receiver (is_leaf and grad_fn are already True/None for every tensor \
+         this shim has), but raises \"Can't detach views in-place. Use detach() \
+         instead.\" unconditionally for a view -- before touching either flag, and \
+         regardless of the view's requires_grad. This shim's TensorBase tracks no \
+         base/view relationship, so it cannot tell which case a given receiver is \
+         in; always taking the leaf branch would compute where upstream sometimes \
+         raises. Call the out-of-place detach() instead.",
+    ))
 }
 
 // ---------------------------------------------------------------------------
