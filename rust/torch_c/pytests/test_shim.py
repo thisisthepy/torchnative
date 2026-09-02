@@ -3567,6 +3567,313 @@ def test_rand_matches_upstreams_stream_bit_for_bit():
         assert got.tolist() == want.tolist(), seed
 
 
+# --- randint / randperm (docs/RANDINT.md) ----------------------------------
+#
+# These sat wrong for as long as they did because `randn` and `rand` above
+# were right. A seeded run agreed with upstream on floats and disagreed on
+# integers, with no error and no warning, and the only comparator `randint`
+# had asserted membership of `[low, high)` -- which the wrong generator
+# satisfied perfectly.
+
+_RANDINT_DTYPES_UP = ("int64", "int32", "int16", "uint8", "bool",
+                      "float32", "float64", "float16", "bfloat16")
+
+#: (low, high). The widths straddle 2^28 on purpose: that, not 2^32, is where
+#: upstream's public build switches from `random()` to `random64()`
+#: (docs/RANDINT.md §1.1 -- the 2^32 arm is `#ifdef FBCODE_CAFFE2`).
+_RANDINT_RANGES = (
+    (0, 2), (0, 10), (-5, 5), (3, 4), (0, 100), (0, 256), (0, 2048),
+    (0, 2**24), (0, 2**28 - 1), (0, 2**28), (0, 2**28 + 1),
+    (0, 2**31), (0, 2**32), (0, 2**32 + 1), (0, 2**40), (0, 2**53),
+    (-(2**30), 2**30), (-(2**27), 2**27), (7, 7 + 2**28),
+    (10**9, 10**9 + 7), (-100, -3),
+)
+
+
+def test_randint_matches_upstream_across_ranges_dtypes_and_lows():
+    """Bit-identical, or the same refusal, for every combination.
+
+    Both halves matter. When the range or the `low` cannot be held by the
+    dtype upstream refuses with a message naming the C++ type
+    (`to - 1 is out of bounds for short`), and a shim that computed a value
+    there would be wrong in the direction that is hardest to notice -- it
+    would look like more capability.
+    """
+    if _upstream_torch is None:
+        return
+    compared = refused = 0
+    for seed in (0, 7, 1234):
+        for name in _RANDINT_DTYPES_UP:
+            t_dt, c_dt = getattr(_upstream_torch, name), getattr(_C, name)
+            for low, high in _RANDINT_RANGES:
+                for n in (1, 6, 17):
+                    _upstream_torch.manual_seed(seed)
+                    try:
+                        want = _upstream_torch.randint(low, high, (n,), dtype=t_dt).tolist()
+                    except Exception as e:
+                        want = ("raised", type(e).__name__, str(e))
+                    _C._shim_manual_seed(seed)
+                    try:
+                        got = _C._VariableFunctions.randint(low, high, [n], dtype=c_dt).tolist()
+                    except Exception as e:
+                        got = ("raised", type(e).__name__, str(e))
+                    assert got == want, (seed, name, low, high, n, got, want)
+                    if isinstance(want, tuple):
+                        refused += 1
+                    else:
+                        compared += 1
+    # Both arms have to be non-trivially populated or this test could pass by
+    # comparing nothing: the refusals alone would not check a single value,
+    # and the values alone would not check a single message.
+    assert compared > 800, compared
+    assert refused > 100, refused
+
+
+def test_randint_leaves_the_stream_where_upstream_leaves_it():
+    """The check a values-only comparison structurally cannot make.
+
+    An implementation that gets the integers right by consuming the wrong
+    number of words passes the test above and fails this one. The pairs at
+    `2**28 - 1` and `2**28` are the ones that catch transcribing the
+    `FBCODE_CAFFE2` arm of the header: same distribution, different word
+    count, and therefore a different `randn` afterwards.
+    """
+    if _upstream_torch is None:
+        return
+    tails = {}
+    for low, high, n in [
+        (0, 100, 0), (0, 100, 1), (0, 100, 6), (0, 100, 17),
+        (0, 2**28 - 1, 6), (0, 2**28, 6), (0, 2**28, 3),
+        (7, 7 + 2**28, 5), (0, 2**40, 3), (-(2**30), 2**30, 4),
+    ]:
+        _upstream_torch.manual_seed(1234)
+        _upstream_torch.randint(low, high, (n,))
+        want = _upstream_torch.randn(4).tolist()
+        _C._shim_manual_seed(1234)
+        _C._VariableFunctions.randint(low, high, [n])
+        got = _C._VariableFunctions.randn(4).tolist()
+        assert got == want, (low, high, n, got, want)
+        tails[(low, high, n)] = tuple(want)
+    # An empty draw consumes nothing: its tail is the one an unseeded-then-
+    # immediately-drawn `randn` would give.
+    _upstream_torch.manual_seed(1234)
+    assert tails[(0, 100, 0)] == tuple(_upstream_torch.randn(4).tolist())
+    # Six narrow elements and three wide ones both cost six words, so they
+    # land on the same tail -- the equality that says the 2^28 threshold is
+    # being applied to the *width* rather than to the element count.
+    assert tails[(0, 100, 6)] == tails[(0, 2**40, 3)]
+    assert tails[(0, 2**28 - 1, 6)] == tails[(0, 100, 6)]
+    assert tails[(0, 2**28, 3)] == tails[(0, 100, 6)]
+    # ...and six wide elements do not.
+    assert tails[(0, 2**28, 6)] != tails[(0, 2**28 - 1, 6)]
+
+
+def test_randint_narrows_an_unrepresentable_float_bound_the_way_upstream_does():
+    """`update_from`/`update_to`, which move the bound *before* the width.
+
+    Upstream does not refuse `randint(0, 2**33, dtype=torch.float32)`; it
+    lowers `to` to the largest float32-representable value below it and draws
+    from the narrower range. Skipping that would change the modulus and could
+    change which side of the 2^28 threshold the call falls on, so it is
+    checked with a stream tail as well as with values.
+    """
+    if _upstream_torch is None:
+        return
+    for name, low, high in [
+        ("float32", 0, 2**33), ("float32", 0, 2**25),
+        ("float16", 0, 5000), ("bfloat16", 0, 1000), ("bfloat16", -1000, 1000),
+        ("float64", 0, 2**60),
+    ]:
+        t_dt, c_dt = getattr(_upstream_torch, name), getattr(_C, name)
+        _upstream_torch.manual_seed(1234)
+        want = _upstream_torch.randint(low, high, (5,), dtype=t_dt).tolist()
+        want_tail = _upstream_torch.randn(3).tolist()
+        _C._shim_manual_seed(1234)
+        got = _C._VariableFunctions.randint(low, high, [5], dtype=c_dt).tolist()
+        got_tail = _C._VariableFunctions.randn(3).tolist()
+        assert got == want, (name, low, high, got, want)
+        assert got_tail == want_tail, (name, low, high, "tail")
+
+
+def test_randint_refuses_a_reversed_range_by_upstreams_message():
+    for low, high in ((5, 5), (5, 4), (0, 0), (-1, -3)):
+        try:
+            _C._VariableFunctions.randint(low, high, [2])
+        except RuntimeError as e:
+            assert str(e) == (
+                "random_ expects 'from' to be less than 'to', "
+                f"but got from={low} >= to={high}"
+            ), str(e)
+        else:
+            raise AssertionError((low, high, "a reversed range must refuse"))
+
+
+def test_randint_checks_the_bounds_before_it_shortcuts_an_empty_result():
+    """Order, and it is observable.
+
+    `CHECK_EMPTY_AND_RETURN` sits *after* `check_from_to_in_range`, so asking
+    for zero elements is not a way past a bound the dtype cannot hold. A shim
+    that returned early on `numel == 0` would answer with an empty tensor
+    where upstream raises.
+    """
+    try:
+        _C._VariableFunctions.randint(0, 2**32, [0], dtype=_C.int32)
+    except RuntimeError as e:
+        assert str(e) == "to - 1 is out of bounds for int", str(e)
+    else:
+        raise AssertionError("an out-of-range bound must refuse even for an empty size")
+    # ...and a bound the dtype *can* hold still gives an empty tensor.
+    assert _C._VariableFunctions.randint(0, 100, [0]).tolist() == []
+
+
+def test_randperm_matches_upstream_including_the_word_count():
+    """Fisher-Yates over the same generator: `n - 1` words, never `n`.
+
+    `n=0` and `n=1` are the cases that pin that. A loop written `for i in
+    range(n)` produces a valid permutation and consumes one word too many,
+    which only the tail comparison sees.
+    """
+    if _upstream_torch is None:
+        return
+    for seed in (0, 7, 1234):
+        for n in (0, 1, 2, 6, 17, 20, 100, 1000, 29999, 30000, 30001):
+            _upstream_torch.manual_seed(seed)
+            want = _upstream_torch.randperm(n).tolist()
+            want_tail = _upstream_torch.randn(3).tolist()
+            _C._shim_manual_seed(seed)
+            got = _C._VariableFunctions.randperm(n).tolist()
+            got_tail = _C._VariableFunctions.randn(3).tolist()
+            assert got == want, (seed, n)
+            assert got_tail == want_tail, (seed, n, "stream position")
+
+
+def test_randperm_dtypes_match_upstream_including_the_bfloat16_defect():
+    """`bfloat16` is not in upstream's precision switch, and it shows.
+
+    `check_supported_max_int_with_precision` guards Half, Float and Double and
+    says nothing about BFloat16, so `randperm(300, dtype=torch.bfloat16)`
+    returns 279 distinct values out of 300 rather than refusing. This shim
+    reproduces that. Returning a real permutation there would read like the
+    better answer and would disagree with torch, which is the direction
+    docs/TORCH_C.md §1 refuses.
+    """
+    if _upstream_torch is None:
+        return
+    for name in ("int64", "int32", "int16", "uint8", "float32", "float64",
+                 "float16", "bfloat16", "bool"):
+        t_dt, c_dt = getattr(_upstream_torch, name), getattr(_C, name)
+        for n in (0, 1, 6, 20, 258, 300):
+            _upstream_torch.manual_seed(0)
+            try:
+                want = _upstream_torch.randperm(n, dtype=t_dt).tolist()
+            except Exception as e:
+                want = ("raised", type(e).__name__, str(e))
+            _C._shim_manual_seed(0)
+            try:
+                got = _C._VariableFunctions.randperm(n, dtype=c_dt).tolist()
+            except Exception as e:
+                got = ("raised", type(e).__name__, str(e))
+            assert got == want, (name, n, got, want)
+    # The defect itself, asserted rather than left implicit -- if upstream ever
+    # adds bfloat16 to that switch, this is what says so.
+    _upstream_torch.manual_seed(0)
+    assert len(set(_upstream_torch.randperm(300, dtype=_upstream_torch.bfloat16).tolist())) == 279
+    _C._shim_manual_seed(0)
+    assert len(set(_C._VariableFunctions.randperm(300, dtype=_C.bfloat16).tolist())) == 279
+
+
+def test_randperm_refuses_the_things_upstream_refuses():
+    if _upstream_torch is None:
+        return
+    for n, name in ((-1, "int64"), (2050, "float16"), (257, "uint8"),
+                    (32769, "int16"), (16777218, "float32")):
+        t_dt, c_dt = getattr(_upstream_torch, name), getattr(_C, name)
+        try:
+            _upstream_torch.randperm(n, dtype=t_dt)
+        except Exception as e:
+            want = (type(e).__name__, str(e))
+        else:
+            raise AssertionError((n, name, "upstream was expected to refuse"))
+        try:
+            _C._VariableFunctions.randperm(n, dtype=c_dt)
+        except Exception as e:
+            got = (type(e).__name__, str(e))
+        else:
+            raise AssertionError((n, name, "the shim computed a value upstream refuses"))
+        assert got == want, (n, name, got, want)
+
+
+def test_randint_and_randperm_interleave_with_the_float_draws():
+    """One seed, a chain of mixed draws, compared end to end.
+
+    Each op above is checked with its own tail; this checks that they compose
+    -- that nothing in the chain is right only when it starts from a fresh
+    seed.
+    """
+    if _upstream_torch is None:
+        return
+
+    def chain(mod, seed_fn, randint, randperm, rand, randn):
+        seed_fn(1234)
+        return [
+            randint(0, 10, 5),
+            randperm(7),
+            [round(v, 7) for v in rand(3)],
+            randint(-(2**35), 2**35, 2),
+            [round(v, 7) for v in randn(4)],
+            randperm(3),
+            randint(0, 2**28, 2),
+            [round(v, 7) for v in randn(2)],
+        ]
+
+    want = chain(
+        _upstream_torch, _upstream_torch.manual_seed,
+        lambda lo, hi, n: _upstream_torch.randint(lo, hi, (n,)).tolist(),
+        lambda n: _upstream_torch.randperm(n).tolist(),
+        lambda n: _upstream_torch.rand(n).tolist(),
+        lambda n: _upstream_torch.randn(n).tolist(),
+    )
+    got = chain(
+        _C, _C._shim_manual_seed,
+        lambda lo, hi, n: _C._VariableFunctions.randint(lo, hi, [n]).tolist(),
+        lambda n: _C._VariableFunctions.randperm(n).tolist(),
+        lambda n: _C._VariableFunctions.rand(n).tolist(),
+        lambda n: _C._VariableFunctions.randn(n).tolist(),
+    )
+    assert got == want, (got, want)
+
+
+def test_randint_high_only_overload_is_not_the_low_one_wearing_its_arguments():
+    """`torch.randint(10, (2,))` must reach `aten.randint.default`.
+
+    The two entries differ only in arity, and a resolver that sent this to
+    `.low` would read `10` as `low` and go looking for a `high`.
+
+    Checked by value against upstream rather than by asking which key
+    resolves: `_resolved_key` reads the name out of a `NotImplementedError`
+    and both overloads now have kernels, so there is no refusal left to read
+    it from. The value comparison is the stronger statement anyway -- the
+    failure being guarded against is one that still returns integers, and only
+    a range comparison sees it. The two `_aten_dispatch` calls below pin the
+    keys themselves: they hold `low` fixed at 0 and must then agree.
+    """
+    if _upstream_torch is None:
+        return
+    for seed in (0, 1234):
+        for high in (10, 2**28, 2**40):
+            _upstream_torch.manual_seed(seed)
+            want = _upstream_torch.randint(high, (6,)).tolist()
+            _C._shim_manual_seed(seed)
+            got = _C._VariableFunctions.randint(high, [6]).tolist()
+            assert got == want, (seed, high, got, want)
+            _C._shim_manual_seed(seed)
+            by_key = _C._aten_dispatch("aten.randint.default", high, [6]).tolist()
+            _C._shim_manual_seed(seed)
+            by_low = _C._aten_dispatch("aten.randint.low", 0, high, [6]).tolist()
+            assert by_key == want, (seed, high, "spelled call did not reach .default")
+            assert by_low == want, (seed, high, ".low with low=0 must agree with .default")
+
+
 def test_rand_like_and_randn_like_match_upstreams_stream_bit_for_bit():
     if _upstream_torch is None:
         return
@@ -8816,7 +9123,27 @@ def test_core_ops_and_op_tags_agree():
     # kernels this round landed, are also not core
     # (`['pt2_compliant_tag', 'reduction']` and `['pt2_compliant_tag']`) and
     # add nothing either.
-    assert r["tag_core_count"] == 102, r["tag_core_count"]
+    #
+    # 102 with docs/RANDINT.md's `randperm`. **+1 across two list changes**,
+    # and which one moved it is the check. `aten.randint.default` also changed
+    # lists in the same round -- promoted out of `IMPLEMENTED_AWAITING_GOLDEN`
+    # once it had a case builder -- and contributes nothing here, correctly:
+    # this counts `_aten_all_implemented()`, the *union*, so moving an op
+    # between the two halves cannot move it. `randperm.default` is genuinely
+    # new and genuinely core:
+    #
+    #     randperm.default    ['core', 'nondeterministic_seeded', 'pt2_compliant_tag']  <- counted
+    #     randperm.generator  ['nondeterministic_seeded', 'pt2_compliant_tag']
+    #     randint.default     ['nondeterministic_seeded', 'pt2_compliant_tag']
+    #     randint.low         ['nondeterministic_seeded', 'pt2_compliant_tag']
+    #
+    # Neither `randint` overload is core, which is worth having read rather
+    # than assumed: the two ops are siblings, share a generator and now share a
+    # document, and only one of them is in Core ATen.
+    #
+    # Both rounds landed together, so both increments apply: +1 for
+    # `squeeze.dims` and +1 for `randperm.default`.
+    assert r["tag_core_count"] == 103, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10280,7 +10607,22 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `overloads.json` before this round; only the dispatch arm for
     # `default` and `dims` was missing, which is a different table
     # (`_aten_implemented()`) from the one this test counts.
-    assert len(keys) == 275, len(keys)
+    #
+    # 275 with docs/RANDINT.md's `randperm`. **+4, and all four from one
+    # table**, which is the check that this is a genuinely new name rather
+    # than a second door onto an old one: upstream has no `Tensor.randperm`
+    # (`hasattr(torch.Tensor, "randperm")` is False on 2.13.0), so
+    # `methods.json` is untouched and `overloads.json`'s four schemas -- the
+    # default, `.generator`, `.out` and `.generator_out` -- are four distinct
+    # identities. Getting +2 would mean the `.out` pair had been left off; they
+    # are carried with no kernel behind them so that
+    # `torch.randperm(6, out=y)` refuses by the right name, exactly as
+    # `randint`'s four `.out` forms beside them already do. `randint` itself
+    # adds nothing this round: its kernel changed, its table entry did not.
+    #
+    # Both rounds landed together, so both increments apply: +1 for
+    # `squeeze.dims` and +1 for `randperm.default`.
+    assert len(keys) == 279, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

@@ -391,6 +391,16 @@ dtype·shape·범위만 보고 수열은 안 봅니다. 그 파일의 모듈 주
 알고리즘(`random_` → `uniform_int_from_to_distribution` 계열, 범위별 분기와 모듈로/거부 처리)은
 **이 조사에서 재현하지 않았습니다 — 미확인.**
 
+> **Correction (2026-09, `docs/RANDINT.md`):** 위 문단이 예고한 승격은 **일어나지 않았고, 그
+> 사이에 결함이 하나 숨었습니다.** `uniform_`/`normal_` 이 포팅될 때 `randint` 는 따라오지
+> 않아서 candle 의 시드 불가능한 생성기를 계속 썼고, `_range_check` 는 범위 소속만 보므로
+> 그것을 **잡을 수 없었습니다** — 잘못된 생성기도 `[low, high)` 는 완벽히 만족합니다. 결국
+> `docs/DEMAND3.md` 의 모델 스윕에서 토큰 id 가 양쪽에서 다르게 뽑히는 것으로 드러났습니다.
+> 지금은 포팅됐고(`rng.rs::randint_from_to_fill`), `_range_check` 는 사라졌으며,
+> `randint`/`randperm` 은 `_rng_stream_check` 로 **시드를 맞춘 원소 단위 비교**를 받습니다.
+> 아래 §6 이 "미확인" 으로 남긴 알고리즘은 `docs/RANDINT.md` §1~§4 가 실측했습니다 —
+> **원소당 한 번의 모듈로, 폭 2²⁸ 에서 32→64비트, 거부 샘플링 아님.**
+
 ### 4.3 요약표
 
 | | torch RNG 를 포팅하지 않으면 |
@@ -433,7 +443,8 @@ dtype·shape·범위만 보고 수열은 안 봅니다. 그 파일의 모듈 주
 | `aten.uniform_.default` | 모든 플랫폼 | `match` | **비트 단위** 가능 |
 | `aten.normal_.default` | aarch64 스칼라 경로 | `match` | **비트 단위** (§3.3 실측) |
 | `aten.normal_.default` | 그 외 (AVX2/VSX 포함) | `match` | float32 허용오차 — **미측정이라서지, 3 ulp 로 재서가 아닙니다** |
-| `aten.randint.low` | 모든 플랫폼 | 현행 `_range_check` 유지 | 알고리즘 재현이 **미확인**이므로 승격은 그 확인 이후 |
+| `aten.randint.low` | 모든 플랫폼 | ~~현행 `_range_check` 유지~~ → **`match`** | ~~알고리즘 재현이 **미확인**이므로 승격은 그 확인 이후~~ → `docs/RANDINT.md` 가 재현했고 **비트 단위**로 승격됐습니다. `_range_check` 는 삭제됐습니다 |
+| `aten.randint.default` / `aten.randperm.default` | 모든 플랫폼 | `match` | 같은 근거. `randperm` 은 같은 엔진의 Fisher–Yates라 함께 들어왔습니다 |
 
 `cases.py` 모듈 주석의 "두 RNG 는 시드로 맞출 수 없다"는 서술은 **candle 을 쓰는 동안은 맞고,
 포팅 후에는 틀립니다.** 포팅을 하면 그 주석과 `_range_check` 의 근거를 함께 갱신해야 합니다.
@@ -460,9 +471,14 @@ RNG 포팅은 그 대조를 가능하게 하려고 하는 것이 아니라, `fro
 
 - **`from_pretrained` 실물 확인.** §4.1(d) 는 `modeling_utils.py` 판독이고, 실제 사전학습
   체크포인트를 내려받아 초기화가 건너뛰어지는지 계측하지 않았습니다.
-- **torch `randint` 의 정수 균일 알고리즘.** `uniform_`/`normal_` 과 달리 재현하지 않았습니다.
-  범위 크기에 따른 분기(모듈로 / 거부 샘플링)와 `random64` 소비량 미확인.
+- ~~**torch `randint` 의 정수 균일 알고리즘.**~~ **닫혔습니다 — `docs/RANDINT.md`.** 거부
+  샘플링이 아니라 **모듈로**이고(`(val % range) + base`, 헤더가 스스로 "approx 5% skew" 라고
+  적습니다), 소비량은 원소당 정확히 한 번이며, 그 한 번이 32비트냐 64비트냐는 **폭 2²⁸**
+  에서 갈립니다 — dtype 은 관여하지 않습니다. 헤더의 첫 분기(`#ifdef FBCODE_CAFFE2`, 2³²
+  + dtype 목록)는 공개 휠이 컴파일하는 쪽이 아니므로 그대로 옮기면 틀립니다. 부동소수
+  dtype 은 `update_from`/`update_to` 로 경계가 먼저 이동합니다.
 - **`bernoulli_`(train 모드 dropout)의 스트림.** `eval` 에서 안 쓰이므로 조사 범위 밖으로 두었습니다.
+  (그 뒤 `aten.rs::bernoulli_inplace_float` 로 구현됐습니다 — 이 문서가 재측정한 것은 아닙니다.)
 - **bf16 / fp16 `normal_` 경로 A 의 완전 재현.** `DistributionTemplates.h:196-219` 의 스택 버퍼
   경로를 코드로 확인했으나, f32/f64 처럼 값까지 대조하지는 않았습니다. fp16 은 `n=16` 에서 f32 와
   근사하게 일치하고 `n=20` 에서 갈리는 것만 관측했습니다.

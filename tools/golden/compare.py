@@ -240,12 +240,12 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
 
     if case.value_check is not None:
         # Ops whose result isn't a plain value-comparable tensor (a Python
-        # bool from is_floating_point, uninitialized memory from empty,
-        # a random draw from randint whose *sequence* can't be matched
-        # across two independent RNG implementations even with the same
-        # seed) supply their own checker instead of the default
-        # dtype/shape/value pipeline below. See cases.py for what each one
-        # actually checks and why.
+        # bool from is_floating_point, uninitialized memory from empty), and
+        # ops that need a *stronger* check than the default pipeline can make
+        # (the RNG ops, whose comparator seeds both sides and demands
+        # bit-for-bit agreement rather than a tolerance), supply their own
+        # checker instead of the default dtype/shape/value pipeline below. See
+        # cases.py for what each one actually checks and why.
         ok, detail = case.value_check(t_res, c_res)
         if not ok:
             return Outcome(case, False, f"{prefix}{detail}")
@@ -361,9 +361,13 @@ BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
     ("_dtype_shape_only_check", "permute"): "same: uninitialized memory has no correct order",
     ("_dtype_shape_only_check", "permute-all"): "same: uninitialized memory has no correct order",
     ("_dtype_shape_only_check", "constant"): "same: uninitialized memory has no correct distribution",
-    ("_range_check", "permute"): "two independent RNGs cannot be seeded to agree, so the sequence is deliberately unchecked -- only membership of [lo, hi) is asserted",
-    ("_range_check", "permute-all"): "same: the sequence is deliberately unchecked",
-    ("_range_check", "constant"): "same: only membership of [lo, hi) is asserted, never the distribution. A shim returning a constant in range passes, and that limit is documented in cases.py",
+    # `_range_check` held three entries here (permute, permute-all, constant),
+    # all saying the same thing: the sequence a random op produces is
+    # deliberately unchecked, so reordering it or replacing it with a constant
+    # in range went uncaught. That comparator is gone -- cases.py records why
+    # -- and `randint`/`randperm` now run on `_rng_stream_check`, which catches
+    # all three. These are not entries that rotted; they are entries whose
+    # blindness was removed.
     ("_topk_multiset_check", "permute-all"): "upstream's own order under ties / sorted=False is a partition artefact, not a promise -- pinning it would pin an implementation detail. Note this is `permute-all` (values and indices moved together); plain `permute` breaks the value/index pairing and IS caught",
 }
 

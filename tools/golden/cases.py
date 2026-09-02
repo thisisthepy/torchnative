@@ -1135,20 +1135,23 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 # nothing and cannot fail the run. `run()` prints how many are waiting
 # under "PENDING", separately from the pass/fail count.
 #
-# Three of these ops don't produce a plain value-comparable tensor, so they
+# Two of these ops don't produce a plain value-comparable tensor, so they
 # use `Case.value_check` instead of relying on compare.py's default
 # dtype/shape/value pipeline:
 #   - `is_floating_point` returns a Python bool, not a 0-d Tensor.
 #   - `empty` returns uninitialized memory -- there is no "correct" value
 #     to diff, only dtype and shape are meaningful.
-#   - `randint` returns a random draw. Two independent RNG implementations
-#     (torch's CPU generator vs whatever rust/torch_c's backend uses)
-#     produce different sequences even given "the same" seed -- a seed only
-#     pins a *specific generator's* stream, it says nothing about another
-#     generator's algorithm. There is no seed value that makes their
-#     outputs equal, so this harness does not attempt to synchronize seeds
-#     and instead checks dtype, shape, and that every value falls inside
-#     the requested [low, high) range.
+#
+# `randint` was a third entry here, and the reason it gave -- "two independent
+# RNG implementations produce different sequences even given the same seed, so
+# this harness does not attempt to synchronize seeds" -- was true of candle and
+# has not been true since `rust/torch_c/src/rng.rs` ported torch's own
+# generator. The note outlived its reason, and while it did, `randint` really
+# was drawing from the wrong generator and nothing here could see it
+# (docs/RANDINT.md §8). Its cases are now seeded on both sides and compared
+# element by element, like `uniform_` and `normal_`. `empty` keeps its
+# exemption because *its* reason still holds: uninitialized memory has no
+# correct value, seed or no seed.
 
 
 def _dtype_shape_only_check(t_res, c_res) -> tuple[bool, str]:
@@ -1173,26 +1176,15 @@ def _flatten_values(x) -> list:
     return [x]
 
 
-def _range_check(lo, hi):
-    """dtype + shape must agree, and every value on both sides must land in
-    [lo, hi); the *sequence* is deliberately not compared -- see the module
-    note above on why two RNG implementations can't be seeded to match."""
-
-    def check(t_res, c_res) -> tuple[bool, str]:
-        t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
-        if t_dtype != c_dtype:
-            return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
-        t_shape = tuple(int(x) for x in t_res.shape)
-        c_shape = tuple(int(x) for x in c_res.shape)
-        if t_shape != c_shape:
-            return False, f"shape mismatch: torch={t_shape} c={c_shape}"
-        for label, res in (("torch", t_res), ("c", c_res)):
-            for v in _flatten_values(res.tolist()):
-                if not (lo <= v < hi):
-                    return False, f"{label} produced {v!r}, outside requested range [{lo}, {hi})"
-        return True, f"dtype={t_dtype} shape={t_shape}, all values within [{lo}, {hi}) (sequence unchecked -- see note above)"
-
-    return check
+# `_range_check` stood here. It asserted dtype, shape and membership of
+# `[lo, hi)` and deliberately not the sequence, and it was the only comparator
+# `randint` ever had. Its `bounds=` argument survives inside
+# `_rng_stream_check`, which makes the same membership assertion *and* compares
+# the draws -- so nothing it checked was dropped, only added to. It is gone
+# rather than kept unused because `compare.py --self-test` enumerates
+# comparators from the cases that use them: a comparator with no cases is
+# invisible to the self-test, and a dead one would sit here reading like a
+# promise the harness still makes.
 
 
 def _scalar_match_check(t_res, c_res) -> tuple[bool, str]:
@@ -2700,56 +2692,294 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- aten.randint.low -----------------------------------------------------------
+# --- aten.randint.low / aten.randint.default / aten.randperm.default -------
 #
-# See the module note above on random draws: dtype/shape/range are checked
-# via Case.value_check, the sequence itself is not.
+# These used to be the module note's third example of an op whose sequence
+# "cannot be matched across two independent RNG implementations even with the
+# same seed". That was true of candle, and it stopped being true the moment
+# `rust/torch_c/src/rng.rs` landed torch's own generator. Nothing noticed,
+# because a comparator that asserts only membership of `[lo, hi)` passes just
+# as happily on a generator that is right as on one that is wrong -- and this
+# one was wrong: `randint` was still drawing from candle while `randn` and
+# `rand` had moved, so a seeded run agreed with upstream on floats and
+# disagreed on integers, with no error and no warning (docs/RANDINT.md).
+#
+# So these are seeded on both sides and compared **element by element**, the
+# same promotion `uniform_`/`normal_` got, plus two things a values-only
+# comparison structurally cannot see:
+#
+#   * **the 2^28 width threshold.** One `randint` element costs one 32-bit
+#     word below that width and two at or above it (docs/RANDINT.md §1). The
+#     header that decides it has an `#ifdef FBCODE_CAFFE2` arm saying 2^32
+#     with a dtype list, which is not the arm the public wheel compiles -- so
+#     the pair at 2^28-1 and 2^28 below is the regression for transcribing the
+#     wrong one. Both arms give the same distribution and different values.
+#   * **the stream position afterwards.** `_randint_then_uniform_case` draws
+#     integers and returns the *floats that follow them*. An implementation
+#     that produces the right integers while consuming the wrong number of
+#     words passes every case above it and fails that one.
 
-_RANDINT_DTYPES = ["int64", "int32", "int16"]
+_RANDINT_DTYPES = ["int64", "int32", "int16", "uint8", "float32", "float64", "float16", "bfloat16"]
+
+#: The bounds a `randint` case may use for each dtype without changing what it
+#: is asking. For the integral dtypes this is the representable range, which
+#: upstream refuses outright past (`to - 1 is out of bounds for short`). For
+#: the floating ones it is `2^digits` -- past that upstream does not refuse, it
+#: silently *moves the bound* (docs/RANDINT.md §3.2), which is a real behaviour
+#: with its own cases below rather than something to fold into these.
+_RANDINT_DTYPE_LIMITS = {
+    "int64": (-(2**63), 2**63 - 1),
+    "int32": (-(2**31), 2**31 - 1),
+    "int16": (-(2**15), 2**15 - 1),
+    "uint8": (0, 255),
+    "float64": (-(2**53), 2**53),
+    "float32": (-(2**24), 2**24),
+    "float16": (-(2**11), 2**11),
+    "bfloat16": (-(2**8), 2**8),
+}
+
+
+def _randint_case(
+    torch_module, c_module, torch_call, op, name, seed, args, kwargs, dtype_name, bounds, note
+):
+    """Both generators seeded to the same value, then the same factory call.
+
+    The seeding lives inside the lambdas for the reason `_seeded_inplace`
+    gives: `compare.py` runs `run_torch` and `run_c` one after the other, and
+    each has to start from the beginning of the stream.
+    """
+    t_kwargs = dict(kwargs, dtype=dt.torch_dtype(torch_module, dtype_name))
+    c_kwargs = dict(kwargs, dtype=dt.c_dtype(c_module, dtype_name))
+
+    def run_torch():
+        torch_module.manual_seed(seed)
+        return torch_call(*args, **t_kwargs)
+
+    def run_c():
+        c_module._shim_manual_seed(seed)
+        return c_module._aten_dispatch(op, *args, **c_kwargs)
+
+    return Case(
+        name=name,
+        op=op,
+        run_torch=run_torch,
+        run_c=run_c,
+        value_check=_rng_stream_check(bitwise=True, bounds=bounds),
+        note=note,
+    )
+
+
+def _randint_then_uniform_case(torch_module, c_module, torch_call, op, name, seed, args, note):
+    """Draw integers, then return the *floats drawn after them*.
+
+    The one case shape that catches an integer draw which lands the right
+    values by consuming the wrong number of words. `uniform_` is separately
+    pinned bit-for-bit against upstream (docs/RNG.md §1.2), so a disagreement
+    here is the integer draw's displacement of the stream and nothing else.
+    """
+
+    def run_torch():
+        torch_module.manual_seed(seed)
+        torch_call(*args)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[0]
+        return target.uniform_()
+
+    def run_c():
+        c_module._shim_manual_seed(seed)
+        c_module._aten_dispatch(op, *args)
+        target = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")[1]
+        return c_module._aten_dispatch("aten.uniform_.default", target)
+
+    return Case(
+        name=name,
+        op=op,
+        run_torch=run_torch,
+        run_c=run_c,
+        value_check=_rng_stream_check(bitwise=True),
+        note=note,
+    )
+
+
+#: (low, high, size, note). The widths straddle 2^28 deliberately; see the
+#: section note above for why that boundary and not 2^32.
+_RANDINT_SCENARIOS = [
+    (0, 10, [5], "1D, small positive range"),
+    (-5, 5, [4], "range straddling zero"),
+    (0, 100, [2, 3], "2D shape"),
+    (0, 1, [3], "degenerate range -- only low itself is valid"),
+    (0, 2**28 - 1, [6], "one word per element: the last width below the 2^28 threshold"),
+    (0, 2**28, [6], "two words per element: the first width at or above it"),
+    (7, 7 + 2**28, [5], "the threshold is the *width*: low only offsets it"),
+    (-(2**27), 2**27, [5], "same width, straddling zero"),
+    (0, 2**40, [4], "well past 2^32, where the FBCODE arm would also use random64"),
+    (10**6, 10**6 + 3, [5], "narrow window at a large offset"),
+]
+
+#: Ranges a float dtype cannot hold exactly. Upstream does not refuse these --
+#: `update_from`/`update_to` move the endpoint to a representable one *before*
+#: the width is computed, so this changes the modulus and can change which side
+#: of the 2^28 threshold the call lands on (docs/RANDINT.md §3.2).
+_RANDINT_NARROWED = [
+    ("float32", 0, 2**33, [4], "digits=24: `to` drops to 2^33-512"),
+    ("float16", 0, 5000, [4], "digits=11: `to` drops to the previous multiple of 4"),
+    ("bfloat16", 0, 1000, [4], "digits=8: the coarsest of the four"),
+    ("bfloat16", -1000, 1000, [4], "both endpoints move"),
+]
 
 
 def randint_low_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.randint.low"
     cases: list[Case] = []
 
-    scenarios = [
-        dict(low=0, high=10, size=[5], note="1D, small positive range"),
-        dict(low=-5, high=5, size=[4], note="range straddling zero"),
-        dict(low=0, high=100, size=[2, 3], note="2D shape"),
-        dict(low=0, high=1, size=[3], note="degenerate range -- only low itself is valid"),
-    ]
-    for sc in scenarios:
-        low, high, size = sc["low"], sc["high"], sc["size"]
+    for low, high, size, note in _RANDINT_SCENARIOS:
         for dtype_name in _RANDINT_DTYPES:
-            t_dt = dt.torch_dtype(torch_module, dtype_name)
-            c_dt = dt.c_dtype(c_module, dtype_name)
+            dmin, dmax = _RANDINT_DTYPE_LIMITS[dtype_name]
+            if low < dmin or high - 1 > dmax:
+                continue
+            for seed in (0, 1234):
+                cases.append(
+                    _randint_case(
+                        torch_module, c_module, torch_call, op,
+                        f"randint(low={low}, high={high}, size={size}, "
+                        f"dtype={dtype_name}, seed={seed}) [{note}]",
+                        seed, (low, high, size), {}, dtype_name, (low, high), note,
+                    )
+                )
+
+    for dtype_name, low, high, size, note in _RANDINT_NARROWED:
+        for seed in (0, 1234):
             cases.append(
-                Case(
-                    name=f"randint(low={low}, high={high}, size={size}, dtype={dtype_name}) [{sc['note']}]",
-                    op=op,
-                    run_torch=lambda low=low, high=high, size=size, t_dt=t_dt: torch_call(low, high, size, dtype=t_dt),
-                    run_c=lambda low=low, high=high, size=size, c_dt=c_dt: c_module._aten_dispatch(
-                        op, low, high, size, dtype=c_dt
-                    ),
-                    value_check=_range_check(low, high),
-                    note=sc["note"] + " -- random draw, sequence unchecked (see module note above)",
+                _randint_case(
+                    torch_module, c_module, torch_call, op,
+                    f"randint(low={low}, high={high}, size={size}, "
+                    f"dtype={dtype_name}, seed={seed}) [bound narrowed -- {note}]",
+                    seed, (low, high, size), {}, dtype_name, (low, high),
+                    "upstream moves the endpoint rather than refusing: " + note,
                 )
             )
 
     # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
     # low/high/size/dtype all by keyword.
-    kw_t_dt = dt.torch_dtype(torch_module, "int64")
-    kw_c_dt = dt.c_dtype(c_module, "int64")
     cases.append(
-        Case(
-            name="randint(low=/high=/size=/dtype= all by keyword)",
-            op=op,
-            run_torch=lambda: torch_call(low=0, high=10, size=[5], dtype=kw_t_dt),
-            run_c=lambda: c_module._aten_dispatch(op, low=0, high=10, size=[5], dtype=kw_c_dt),
-            value_check=_range_check(0, 10),
+        _randint_case(
+            torch_module, c_module, torch_call, op,
+            "randint(low=/high=/size=/dtype= all by keyword)",
+            0, (), dict(low=0, high=10, size=[5]), "int64", (0, 10),
+            "every argument by keyword",
         )
     )
 
+    cases.append(
+        _randint_then_uniform_case(
+            torch_module, c_module, torch_call, op,
+            "randint(low=0, high=100, size=[0]) then uniform_ [empty consumes no words]",
+            0, (0, 100, [0]),
+            "an empty result returns before the kernel -- zero words consumed, "
+            "and the checks that precede it still run",
+        )
+    )
+    for low, high, size, note in _RANDINT_SCENARIOS:
+        cases.append(
+            _randint_then_uniform_case(
+                torch_module, c_module, torch_call, op,
+                f"randint(low={low}, high={high}, size={size}) then uniform_ "
+                f"[stream position -- {note}]",
+                1234, (low, high, size),
+                "the floats drawn after the integers: catches a right-valued, "
+                "wrong-width implementation",
+            )
+        )
+
+    return cases
+
+
+def randint_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten::randint(SymInt high, ...)` -- the same kernel with `low` at 0.
+
+    Its own builder rather than a flag on the one above, because the two are
+    separate table entries the resolver picks between by arity: a wiring
+    mistake that sent `torch.randint(10, (2,))` to `.low` would read `10` as
+    `low` and produce a different range entirely, which no case on `.low`
+    could see.
+    """
+    op = "aten.randint.default"
+    cases: list[Case] = []
+    for high, size, note in [
+        (10, [5], "1D, small range"),
+        (100, [2, 3], "2D shape"),
+        (2**28 - 1, [6], "one word per element"),
+        (2**28, [6], "two words per element"),
+        (2**40, [4], "well past 2^32"),
+    ]:
+        for dtype_name in ("int64", "int32"):
+            if high - 1 > _RANDINT_DTYPE_LIMITS[dtype_name][1]:
+                continue
+            for seed in (0, 1234):
+                cases.append(
+                    _randint_case(
+                        torch_module, c_module, torch_call, op,
+                        f"randint(high={high}, size={size}, dtype={dtype_name}, "
+                        f"seed={seed}) [{note}]",
+                        seed, (high, size), {}, dtype_name, (0, high), note,
+                    )
+                )
+    cases.append(
+        _randint_case(
+            torch_module, c_module, torch_call, op,
+            "randint(high=/size=/dtype= all by keyword)",
+            0, (), dict(high=10, size=[5]), "int64", (0, 10),
+            "every argument by keyword",
+        )
+    )
+    cases.append(
+        _randint_then_uniform_case(
+            torch_module, c_module, torch_call, op,
+            "randint(high=2**40, size=[4]) then uniform_ [stream position]",
+            1234, (2**40, [4]),
+            "eight words for four elements, then the floats that follow",
+        )
+    )
+    return cases
+
+
+def randperm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten::randperm(SymInt n, ...)`.
+
+    Here because it draws from the same engine, not because the surface wanted
+    widening: Fisher-Yates, one 32-bit word per swap and `n - 1` of them, with
+    no large-`n` alternative path (docs/RANDINT.md §4 reproduced n up to 50000
+    with the one loop). `n=0` and `n=1` are the cases that pin the count at
+    `max(n - 1, 0)` rather than `n`.
+    """
+    op = "aten.randperm.default"
+    cases: list[Case] = []
+    for n in (0, 1, 2, 6, 17, 20, 100, 257):
+        for dtype_name in ("int64", "int32", "float32"):
+            for seed in (0, 1234):
+                cases.append(
+                    _randint_case(
+                        torch_module, c_module, torch_call, op,
+                        f"randperm(n={n}, dtype={dtype_name}, seed={seed})",
+                        seed, (n,), {}, dtype_name, (0, n) if n else None,
+                        "Fisher-Yates over the same MT19937 `randint` draws from",
+                    )
+                )
+    cases.append(
+        _randint_case(
+            torch_module, c_module, torch_call, op,
+            "randperm(n=/dtype= all by keyword)",
+            0, (), dict(n=6), "int64", (0, 6), "every argument by keyword",
+        )
+    )
+    for n in (0, 1, 6, 20):
+        cases.append(
+            _randint_then_uniform_case(
+                torch_module, c_module, torch_call, op,
+                f"randperm(n={n}) then uniform_ [stream position: n-1 words, not n]",
+                1234, (n,),
+                "the floats drawn after the permutation",
+            )
+        )
     return cases
 
 
@@ -22448,6 +22678,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.pow.Tensor_Tensor": pow_tensor_tensor_cases,
     "aten.pow.Scalar": pow_scalar_cases,
     "aten.randint.low": randint_low_cases,
+    "aten.randint.default": randint_default_cases,
+    "aten.randperm.default": randperm_cases,
     "aten.rsqrt.default": rsqrt_cases,
     "aten.sqrt.default": sqrt_cases,
     # docs/KERNELS26.md §17 -- sam3_video.

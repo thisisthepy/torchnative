@@ -41,11 +41,14 @@ import traceback
 
 
 #: docs/CAPTURE.md §4. `is_mutating` (any op whose name ends in `_`) is derived
-#: rather than listed; these three are the ones named individually there.
+#: rather than listed; these are the ones named individually there. Mirrors
+#: `capture.rs`'s `RANDOM` -- an op missing here would be swept as if it were
+#: reproducible and would fail replay on every run.
 RANDOM = frozenset({
     "aten.multinomial.default",
     "aten.randint.default",
     "aten.randint.low",
+    "aten.randperm.default",
 })
 
 

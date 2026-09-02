@@ -265,6 +265,7 @@ const RANDOM: &[&str] = &[
     "aten.multinomial.default",
     "aten.randint.default",
     "aten.randint.low",
+    "aten.randperm.default",
 ];
 
 /// Ops that leave the tensor world entirely, taking a value the guards say

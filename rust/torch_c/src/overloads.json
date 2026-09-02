@@ -447,6 +447,13 @@
     "aten::randint(SymInt high, SymInt[] size, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
 
+  "randperm": [
+    "aten::randperm.generator_out(SymInt n, *, Generator? generator, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randperm.out(SymInt n, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::randperm.generator(SymInt n, *, Generator? generator, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::randperm(SymInt n, *, ScalarType? dtype=4, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+
   "rsqrt": [
     "aten::rsqrt.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::rsqrt(Tensor self) -> Tensor"

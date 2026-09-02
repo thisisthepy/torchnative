@@ -172,7 +172,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.pow.Scalar",
     "aten.pow.Tensor_Scalar",
     "aten.pow.Tensor_Tensor",
+    "aten.randint.default",
     "aten.randint.low",
+    "aten.randperm.default",
     "aten.reciprocal.default",
     "aten.reciprocal_.default",
     "aten.relu.default",
@@ -266,12 +268,20 @@ pub const IMPLEMENTED: &[&str] = &[
 /// upstream. `bfloat16` and `float16` went from 53/150 and 56/150 disagreeing
 /// rows to 0. Same shape as `aten.max.other` above: a builder written against
 /// a parked op is not a formality.
+///
+/// `aten.randint.default` was the fifth, and it is the one that says parking
+/// can hide a *wrong answer* and not merely an unmeasured one. It sat here
+/// while its sibling `aten.randint.low` was advertised against a comparator
+/// that checked membership of `[low, high)` and deliberately not the
+/// sequence -- so between the two of them, nothing in the harness was ever in
+/// a position to notice that both drew from a different generator entirely
+/// (docs/RANDINT.md §8). Promotion came with the fix, and the builder that
+/// replaced that comparator compares seeded values.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.any.dims",
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
-    "aten.randint.default",
     "aten.reshape.default",
     "aten.zeros.default",
 ];
@@ -1322,6 +1332,7 @@ fn aten_dispatch_inner(
         "aten.pow.Tensor_Tensor" => pow_tensor_tensor(py, args, kwargs),
         "aten.randint.default" => randint(py, args, kwargs, false),
         "aten.randint.low" => randint(py, args, kwargs, true),
+        "aten.randperm.default" => randperm(py, args, kwargs),
         "aten.remainder.Scalar" => {
             remainder_op(py, args, kwargs, "aten.remainder.Scalar", true)
         }
@@ -4755,17 +4766,121 @@ fn lift_fresh_default(
     Ok(input.into_pyobject(py)?.into_any().unbind())
 }
 
+/// The rounding behaviour `update_from`/`update_to` are written in terms of,
+/// for the dtypes `randint` can be asked for.
+///
+/// `float32`, `float64` and `bfloat16` all have a maximum past `int64_t`'s, so
+/// nothing this path can be handed overflows them; `float16` stops at 65504
+/// and the overflow is reachable and observable.
+fn randint_float_format(tag: TorchDType) -> Option<crate::rng::FloatFormat> {
+    use crate::rng::FloatFormat;
+    Some(match tag {
+        TorchDType::Float64 => FloatFormat { digits: 53, max_finite: u128::MAX },
+        TorchDType::Float32 => FloatFormat { digits: 24, max_finite: u128::MAX },
+        TorchDType::Float16 => FloatFormat { digits: 11, max_finite: 65504 },
+        TorchDType::BFloat16 => FloatFormat { digits: 8, max_finite: u128::MAX },
+        _ => return None,
+    })
+}
+
+/// What `check_from_to_in_range` compares against, and the name it prints.
+///
+/// The name is `caffe2::TypeMeta`'s C++ spelling, not torch's Python one --
+/// upstream's message is `to - 1 is out of bounds for int`, never `int32`.
+/// Measured dtype by dtype (docs/RANDINT.md §3.3); guessing `int32` here would
+/// produce a refusal that reads right and does not match.
+///
+/// `None` means the check cannot fire: every `int64_t` is representable, and
+/// float32/float64/bfloat16 all have a maximum past `int64_t`'s. Those three
+/// still lose precision, which is what `update_to` and the (unimplemented,
+/// §7) warning are for -- a lost bit is not an out-of-bounds bound.
+fn randint_representable(tag: TorchDType) -> Option<(&'static str, i64, i64)> {
+    Some(match tag {
+        TorchDType::Int32 => ("int", i32::MIN as i64, i32::MAX as i64),
+        TorchDType::Int16 => ("short", i16::MIN as i64, i16::MAX as i64),
+        TorchDType::Int8 => ("signed char", i8::MIN as i64, i8::MAX as i64),
+        TorchDType::UInt8 => ("unsigned char", 0, u8::MAX as i64),
+        TorchDType::UInt16 => ("unsigned short", 0, u16::MAX as i64),
+        TorchDType::UInt32 => ("unsigned int", 0, u32::MAX as i64),
+        TorchDType::Bool => ("bool", 0, 1),
+        TorchDType::Float16 => ("c10::Half", -65504, 65504),
+        _ => return None,
+    })
+}
+
+/// `at::native::templates::check_from_to_in_range`, message included.
+fn randint_check_in_range(from: i64, to_inclusive: i64, tag: TorchDType) -> PyResult<()> {
+    let Some((name, min, max)) = randint_representable(tag) else {
+        return Ok(());
+    };
+    // `from` first, then `to - 1`: upstream's two `CHECK_OUT_OF_BOUNDS` calls
+    // are in that order, and a call that violates both reports the first.
+    for (label, value) in [("from", from), ("to - 1", to_inclusive)] {
+        if value < min || value > max {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{label} is out of bounds for {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Turn the `int64_t` draws into the requested dtype the way the C++ cast does.
+///
+/// `static_cast<T>(static_cast<int64_t>(...))`, and for the reduced-precision
+/// floats that is *two* roundings, not one: `c10::Half` and `c10::BFloat16`
+/// are only constructible from `float`, so an `int64_t` becomes a `float`
+/// first and is narrowed again. Handing candle the `int64` tensor and asking
+/// for `bf16` would be a single rounding from a wider type, which differs from
+/// upstream on exactly the values where it matters.
+fn randint_narrow(
+    op: &str,
+    values: Vec<i64>,
+    shape: Vec<usize>,
+    storage: candle_core::DType,
+    device: &Device,
+) -> PyResult<Tensor> {
+    use candle_core::DType;
+    let built = match storage {
+        DType::F64 => {
+            Tensor::from_vec(values.into_iter().map(|v| v as f64).collect::<Vec<_>>(), shape, device)
+        }
+        DType::F32 | DType::F16 | DType::BF16 => {
+            let floats = values.into_iter().map(|v| v as f32).collect::<Vec<_>>();
+            Tensor::from_vec(floats, shape, device).and_then(|t| t.fast_to(storage))
+        }
+        _ => Tensor::from_vec(values, shape, device).and_then(|t| t.fast_to(storage)),
+    };
+    built.map_err(|e| candle_err(op, e))
+}
+
 /// `aten::randint.low(SymInt low, SymInt high, SymInt[] size, *,
 ///                    ScalarType? dtype=4, ...)` and `aten::randint(...)`.
 ///
 /// `dtype=4` in the schema is `ScalarType::Long`, so the default is int64
 /// rather than the default float every other factory here uses.
 ///
-/// **The generator is candle's, not torch's, so the *values* will not match a
-/// seeded torch run.** There is no seed plumbing in this shim, and inventing
-/// one that claims to reproduce torch's Philox stream would be a lie a test
-/// could not see through. What is reproduced is the range, the shape and the
-/// dtype.
+/// This used to draw from candle's unseedable generator and say so. It now
+/// draws from the ported one (`crate::rng`), so a seeded `randint` reproduces
+/// upstream bit for bit -- and, just as importantly, leaves the stream where
+/// upstream leaves it. docs/RANDINT.md is the measurement; three things in it
+/// are not guessable from the values alone:
+///
+///   * **One draw per element, never a retry.** `uniform_int_from_to` is a
+///     biased modulo (`val % range + base`) and the header says so. A
+///     rejection-sampling implementation would agree on the distribution,
+///     produce different values, and consume a data-dependent number of words.
+///   * **The width, alone, decides whether that draw is 32 or 64 bits**, at
+///     2^28 -- see `rng::RANDINT_WIDE_THRESHOLD` for why the dtype-shaped
+///     condition in the header is the wrong arm to copy.
+///   * **A float dtype moves the bounds before any of that** (`update_from` /
+///     `update_to`), which changes both the modulus and which side of the
+///     threshold the call falls on.
+///
+/// The checks below are in upstream's order, and the order is observable:
+/// the representable-range check runs *before* the empty-tensor shortcut, so
+/// `randint(0, 2**32, (0,), dtype=torch.int32)` raises rather than returning
+/// an empty tensor.
 fn randint(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -4799,7 +4914,23 @@ fn randint(
             "random_ expects 'from' to be less than 'to', but got from={low} >= to={high}"
         )));
     }
-    // After the bound check, before the allocation: upstream's meta kernel
+    let (from, to) = match randint_float_format(dtype) {
+        Some(format) => {
+            let from = crate::rng::update_from(low, format);
+            let to = crate::rng::update_to(high, format);
+            if to <= from {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "random_ expects 'from' casted to dtype to be less than 'to' casted to \
+                     dtype, but got from={from} >= to={to}"
+                )));
+            }
+            (from, to)
+        }
+        None => (low, high),
+    };
+    randint_check_in_range(from, to - 1, dtype)?;
+
+    // After the bound checks, before the allocation: upstream's meta kernel
     // raises for `high <= low` too, so the meta answer is not a way around a
     // check the real call makes.
     if label.is_meta() {
@@ -4807,16 +4938,115 @@ fn randint(
     }
     let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(op)?;
-    let span = (high - low) as f64;
-    let tensor = Tensor::rand(0f64, 1f64, size, &device)
-        .and_then(|t| t.affine(span, low as f64))
-        .and_then(|t| t.floor())
-        // `rand` is half-open in principle but the affine can land exactly on
-        // `high` after rounding; the clamp keeps the half-open contract that
-        // callers actually rely on.
-        .and_then(|t| t.clamp(low as f64, (high - 1) as f64))
-        .and_then(|t| t.fast_to(storage))
-        .map_err(|e| candle_err(op, e))?;
+    let numel: usize = size.iter().product();
+    // `CHECK_EMPTY_AND_RETURN` sits after the checks above and before the
+    // kernel, so an empty result draws nothing at all -- measured as zero
+    // words consumed, not as "too few to notice".
+    let values = if numel == 0 {
+        Vec::new()
+    } else {
+        let mut gen = crate::rng::default_generator();
+        crate::rng::randint_from_to_fill(&mut gen, numel, from, to)
+    };
+    let tensor = randint_narrow(op, values, size, storage, &device)?;
+    finish(py, tensor, dtype)
+}
+
+/// `aten::randperm(SymInt n, *, ScalarType? dtype=4, Layout? layout=None,
+///                 Device? device=None, bool? pin_memory=None) -> Tensor`
+///
+/// Here because it is the same machinery, not because the surface wanted
+/// widening: `randperm_cpu` is Fisher-Yates over the *same* MT19937, one
+/// 32-bit `random()` per swap, `n - 1` of them. docs/RANDINT.md §4 reproduced
+/// n up to 50000 with that one loop and found no large-`n` alternative path,
+/// which is what made adding it cheaper than refusing it by name.
+///
+/// Two guards that are not the RNG and are still part of matching upstream:
+///
+///   * `check_supported_max_int_with_precision` refuses when `n - 1` cannot be
+///     *exactly* held -- `n cannot be greater than 2049 for Half type.` -- but
+///     **only for Half, Float and Double**. `bfloat16` is not in that switch,
+///     so upstream happily returns a `randperm(300)` with 279 distinct values
+///     (measured). That is upstream's defect and this reproduces it rather
+///     than improving on it; a shim that quietly returned a real permutation
+///     there would disagree with torch and look like the better answer.
+///   * the integral dtypes get the check from the other direction, through
+///     `scalar_tensor`: `value cannot be converted to type int16_t without
+///     overflow`.
+fn randperm(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.randperm.default";
+    let n = int_arg(args, kwargs, 0, "n")?.ok_or_else(|| missing(OP, "n"))?;
+    let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(TorchDType::Int64);
+    reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
+    let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::cpu())?;
+
+    if n < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Trying to create tensor with negative dimension {n}: [{n}]"
+        )));
+    }
+    if dtype == TorchDType::Bool {
+        return Err(not_implemented(
+            "\"randperm\" not implemented for 'Bool'".to_string(),
+        ));
+    }
+    // `at::scalar_tensor(n > 0 ? n - 1 : n, options)`: the largest value the
+    // result has to hold is `n - 1`, and an integral dtype that cannot hold it
+    // refuses here rather than wrapping around.
+    if let Some((_, _, max)) = randint_representable(dtype) {
+        let largest = if n > 0 { n - 1 } else { n };
+        if !dtype.is_floating_point() && largest > max {
+            let c_name = match dtype {
+                TorchDType::Int32 => "int32_t",
+                TorchDType::Int16 => "int16_t",
+                TorchDType::Int8 => "int8_t",
+                TorchDType::UInt8 => "uint8_t",
+                TorchDType::UInt16 => "uint16_t",
+                TorchDType::UInt32 => "uint32_t",
+                other => other.name(),
+            };
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "value cannot be converted to type {c_name} without overflow"
+            )));
+        }
+    }
+    // The float switch, exactly as narrow as upstream's -- bfloat16 absent on
+    // purpose. The messages are upstream's verbatim, including the one that
+    // spells its bound out and the two that leave it as a power.
+    let precision_limit = match dtype {
+        TorchDType::Float16 => Some(((1i64 << 11) + 1, "n cannot be greater than 2049 for Half type.")),
+        TorchDType::Float32 => Some((
+            (1i64 << 24) + 1,
+            "n cannot be greater than 2^24+1 for Float type.",
+        )),
+        TorchDType::Float64 => Some((
+            (1i64 << 53) + 1,
+            "n cannot be greater than 2^53+1 for Double type.",
+        )),
+        _ => None,
+    };
+    if let Some((limit, message)) = precision_limit {
+        if n > limit {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(message));
+        }
+    }
+
+    if label.is_meta() {
+        return meta_result(py, vec![n as usize], dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(OP)?;
+    let values = if n == 0 {
+        Vec::new()
+    } else {
+        let mut gen = crate::rng::default_generator();
+        crate::rng::randperm_fill(&mut gen, n as usize)
+    };
+    let tensor = randint_narrow(OP, values, vec![n as usize], storage, &device)?;
     finish(py, tensor, dtype)
 }
 
