@@ -16366,14 +16366,30 @@ except Exception as e:
 else:
     out["persist_unrecorded"] = "ACCEPTED"
 
-# --- the destination a delta still cannot reach --------------------------
+# --- the destination, and the two reaches for it that still refuse --------
+# `publish` no longer refuses categorically (docs/FEDERATED.md §1): what it
+# refuses now is publishing *nothing*, and publishing with nobody to publish
+# to. The positive half is a two-process test -- it cannot be checked here,
+# and that is the point.
 d = Delta.over(build(), ["norm1.weight"])
 try:
     d.publish()
-except NotImplementedError as e:
-    out["publish"] = str(e)
+except Exception as e:
+    out["publish_unrecorded"] = "%s: %s" % (type(e).__name__, str(e))
 else:
-    out["publish"] = "ACCEPTED"
+    out["publish_unrecorded"] = "ACCEPTED"
+
+d2 = Delta.over(build(), ["norm1.weight"])
+m2 = build()
+with torch.no_grad():
+    m2.norm1.weight.add_(0.25)
+d2.record(m2)
+try:
+    d2.publish()
+except Exception as e:
+    out["publish_no_group"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["publish_no_group"] = "ACCEPTED"
 
 # --- stage declarations ---------------------------------------------------
 class Stage0(adapt.Method):
@@ -16628,21 +16644,43 @@ def test_a_delta_is_written_and_read_back_bit_for_bit():
 
 
 def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
-    """The third of docs/DESIGN.md §3's lifetime questions, which still refuses.
+    """The third of docs/DESIGN.md §3's lifetime questions -- which now runs.
 
-    What is pinned is the *shape* of the refusal: it names a line the reader
-    can run, so that the day a second rank lands the refusal is discovered by
-    someone running the check rather than by nobody. A refusal naming a fact
-    has gone stale six times here -- and the `persist` half of this test was
-    the seventh, caught by the test above replacing it rather than by anyone
-    re-reading the message.
+    **This test used to assert that `publish` refuses.** The refusal named a
+    check (`init_process_group(..., world_size=2)`), the check started
+    returning (docs/TRANSPORT.md), and `publish` was implemented on top of it
+    (docs/FEDERATED.md). That is the seventh time a refusal naming a fact went
+    stale here, and the first time the naming did its job: the message told the
+    reader what to run.
+
+    Inverted rather than deleted, on the precedent
+    `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` set.
+    What is worth pinning is not "publish refuses" but that **the two ways of
+    reaching the destination that are still wrong still refuse**, because both
+    would otherwise complete:
+
+    * an unrecorded delta is the zero offset -- publishing it contributes
+      nothing and is counted at full weight in the average anyway;
+    * with no process group there is nobody to publish to, and the message has
+      to carry the check that builds one rather than the exception four frames
+      down.
+
+    The positive half -- that the aggregate is the weighted average and not
+    something that merely returned -- cannot be asserted in one process at all,
+    and `test_fedavg_over_two_processes_equals_the_same_average_computed_
+    centrally` is where it lives.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
-    assert "Check: torch.distributed.init_process_group(" in r["publish"], r["publish"]
-    assert "world_size=2" in r["publish"], r["publish"]
-    assert "cannot leave this device" in r["publish"], r["publish"]
+    assert r["publish_unrecorded"].startswith("ValueError:"), r["publish_unrecorded"]
+    assert "nothing to publish" in r["publish_unrecorded"], r["publish_unrecorded"]
+    assert "record(model)" in r["publish_unrecorded"], r["publish_unrecorded"]
+
+    assert r["publish_no_group"].startswith("RuntimeError:"), r["publish_no_group"]
+    assert "Check: import torchnative.distributed" in r["publish_no_group"], \
+        r["publish_no_group"]
+    assert "world_size=2" in r["publish_no_group"], r["publish_no_group"]
 
 
 def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
@@ -18485,6 +18523,597 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
     ], out["meshgrid_three_shapes"]
     # A 0-d input counts as extent 1.
     assert out["meshgrid_scalar_shapes"] == [[1, 4], [1, 4]], out["meshgrid_scalar_shapes"]
+
+
+# ---------------------------------------------------------------------------
+# Federated averaging, across two operating-system processes
+# (docs/FEDERATED.md)
+#
+# **Nothing here may run in one process, and nothing here may run in two
+# threads.** `FedAvg` at `world_size = 1` is the identity function: it returns
+# the delta it was handed, so a test at that size passes whether the weights
+# are honoured, ignored, or never read at all. Two threads would share the
+# tensors and let a "collective" that only touched local memory pass as well.
+#
+# So the two ranks are two `subprocess.Popen`s that share nothing but a TCP
+# socket, and the acceptance check is not "the distributed path returned
+# something" but **the weighted average computed across the two ranks equals
+# the same weighted average computed centrally, from the two deltas those
+# ranks dumped**, element for element. The central side is computed in *this*
+# process, on upstream torch, from JSON -- so it shares no arithmetic with the
+# path under test beyond IEEE float32.
+#
+# The controls are what make that comparison mean something:
+#
+#   * the two local deltas must differ (the ranks trained on different data),
+#     or the average is trivially either of them;
+#   * the weighted average must differ from the *unweighted* one by more than
+#     float noise, or 3-and-7 is not being distinguished from 1-and-1 and an
+#     aggregator that dropped its weights would pass;
+#   * both ranks must end holding the same aggregate, or one of them is
+#     reporting its own delta back.
+#
+# Every subprocess reports whether it loaded the shim and the fixture refuses
+# if it did not -- two processes make "these numbers were upstream's" twice as
+# easy to arrive at.
+# ---------------------------------------------------------------------------
+
+_FED_WORKER_SRC = (
+    "import json, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="local"
+from torchnative import adapt
+from torchnative.delta import Delta
+from torchnative.nn import federated
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+
+# 3 and 7, not 1 and 1: a weighted average is only distinguishable from an
+# unweighted one when the weights differ, and only distinguishable from
+# "rank 0 wins" when neither is 0.
+WEIGHT = {0: 3.0, 1: 7.0}[rank]
+# Different local data per rank. Identical data would make the two deltas
+# identical and every average of them equal to either one.
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
+
+dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+out["rank"] = dist.get_rank()
+out["world"] = dist.get_world_size()
+out["backend"] = dist.get_backend()
+out["weight"] = WEIGHT
+
+# --- A. the low-level road: adapt -> Delta.publish -> FedAvg --------------
+m = build()
+w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
+w.online()
+ids = torch.tensor(LOCAL_IDS)
+out["history"] = [w.step(ids)[1] for _ in range(3)]
+d = w.adapted
+out["covers"] = list(d.covers)
+out["base"] = {n: t.tolist() for n, t in d.base.items()}
+out["local"] = {n: t.tolist() for n, t in d.value.items()}
+agg = d.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+out["aggregate"] = {n: t.tolist() for n, t in agg.items()}
+
+# The same two deltas, aggregated again with the weights switched off. Both
+# ranks hand over the value they just recorded, so this is the *distributed*
+# unweighted average of the same inputs -- the number the weighted one has to
+# differ from.
+out["unweighted"] = {
+    n: t.tolist() for n, t in federated.FedAvg(weighted=False).aggregate(
+        {n: torch.tensor(v) for n, v in out["local"].items()}, group=None).items()
+}
+
+# --- B. the Engine road, on a fresh model --------------------------------
+m2 = build()
+eng = federated.Engine(m2, method=adapt.Tent(), lr=LR,
+                       aggregator=federated.FedAvg())
+report = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+out["engine"] = {
+    "rank": report.rank, "world": report.world, "weight": report.weight,
+    "total_weight": report.total_weight, "share": report.share,
+    "steps": report.steps, "covers": list(report.covers),
+    "local_norm": report.local_norm, "aggregate_norm": report.aggregate_norm,
+    "repr": repr(report),
+}
+out["engine_params"] = {n: dict(m2.named_parameters())[n].tolist()
+                        for n in report.covers}
+try:
+    eng.participate([{"input_ids": ids}], weight=WEIGHT)
+except Exception as e:
+    out["engine_twice"] = "%s: %s" % (type(e).__name__, str(e))
+else:
+    out["engine_twice"] = "ACCEPTED"
+
+# --- C. refusals ---------------------------------------------------------
+probe = {"norm1.weight": torch.ones(4), "norm2.weight": torch.ones(4)}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+refuses("no_weight", lambda: federated.FedAvg().aggregate(probe, group=None))
+refuses("unweighted_given_weight",
+        lambda: federated.FedAvg(weighted=False).aggregate(probe, weight=5.0))
+refuses("zero_weight", lambda: federated.FedAvg().aggregate(probe, weight=0.0))
+refuses("integer_table",
+        lambda: federated.FedAvg().aggregate(
+            {"a": torch.ones(4, dtype=torch.int64)}, weight=1.0))
+refuses("empty_table", lambda: federated.FedAvg().aggregate({}, weight=1.0))
+refuses("engine_rounds",
+        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=3))
+refuses("engine_select",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 select=lambda m: []))
+refuses("engine_allow_missing",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 allow_missing=True))
+
+# The two collective refusals. Both ranks run the *same* collectives here --
+# `agree` reduces before it compares -- so the group stays in step even though
+# both raise, and a later collective in this script would still work.
+mismatched = {0: {"norm1.weight": torch.ones(4)},
+              1: {"norm2.weight": torch.ones(4)}}[rank]
+refuses("schema_mismatch",
+        lambda: federated.FedAvg().aggregate(mismatched, weight=1.0))
+
+dm = Delta.over(build(), ["norm1.weight"])
+if rank == 1:
+    dm.base["norm1.weight"] = dm.base["norm1.weight"] + 0.5
+dm.value = {"norm1.weight": torch.ones(12)}
+refuses("base_mismatch", lambda: dm.publish(group=None, weight=1.0))
+
+# 4,000,000 rather than 1,000,000: the bound moved above the old deadlock once
+# `ProcessGroupLocal.allreduce` stopped having both ranks send first, and a
+# fixture under the bound would have made this arm silently stop refusing.
+refuses("too_big_for_the_wire",
+        lambda: federated.FedAvg().aggregate({"big": torch.ones(4000000)},
+                                             weight=1.0))
+
+# The group survived every refusal above: if it had not, this would hang or
+# raise rather than reproduce the aggregate computed at the top.
+again = federated.FedAvg().aggregate(
+    {n: torch.tensor(v) for n, v in out["local"].items()},
+    weight=WEIGHT, group=None)
+out["again"] = {n: t.tolist() for n, t in again.items()}
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+_FED_WORLD_OF_ONE_SRC = (
+    "import json, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401
+from torchnative import adapt
+from torchnative.delta import Delta
+from torchnative.nn import federated
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+# Before there is any group at all.
+d = Delta.over(build(), ["norm1.weight"])
+d.value = {"norm1.weight": torch.ones(12)}
+refuses("no_group", lambda: d.publish())
+refuses("no_group_aggregate",
+        lambda: federated.FedAvg().aggregate({"a": torch.ones(4)}, weight=1.0))
+
+dist.init_process_group(backend="local", rank=0, world_size=1,
+                        store=dist.HashStore())
+out["world"] = dist.get_world_size()
+refuses("aggregate", lambda: federated.FedAvg().aggregate({"a": torch.ones(4)},
+                                                          weight=1.0))
+refuses("publish", lambda: d.publish(weight=1.0))
+refuses("agree", lambda: federated.agree(1))
+refuses("engine", lambda: federated.Engine(
+    build(), method=adapt.Tent(), lr=LR).participate(
+        [{"input_ids": torch.tensor(IDS)}], weight=1.0))
+
+json.dump(out, open(sys.argv[1], "w"))
+'''
+)
+
+
+@functools.cache
+def _fed_two_process_round():
+    """One federated round in two OS processes. Returns both ranks' reports.
+
+    The port is taken by binding to 0 and closing, so concurrent runs of this
+    suite in different worktrees do not collide on a fixed number -- the same
+    reasoning `run.sh` gives for staging per checkout.
+
+    Rank 0 is started first and the second is given a moment, because the
+    master half of `TCPStore` binds the listening socket in its constructor and
+    the client half retries for one second. Every process gets a timeout: a
+    rendezvous that never completes has to end the test, not the run.
+    """
+    import socket
+    import time
+
+    tmp = tempfile.mkdtemp(prefix="fed-round-")
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+
+    procs = []
+    for rank in (0, 1):
+        procs.append(subprocess.Popen(
+            [sys.executable, "-c", _FED_WORKER_SRC, str(rank), str(port),
+             os.path.join(tmp, "rank-%d.json" % rank)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        ))
+        time.sleep(0.3)
+
+    reports = []
+    for rank, proc in enumerate(procs):
+        try:
+            _, err = proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+            for other in procs:
+                other.kill()
+            raise RuntimeError(
+                "federated round: rank %d never finished. A two-process "
+                "collective that hangs is the failure this timeout exists for "
+                "-- the transport's own socket timeout is 30 s, so 600 s here "
+                "means the rendezvous, not the send.\n--- stderr ---\n%s"
+                % (rank, err[-4000:])
+            )
+        if proc.returncode != 0:
+            for other in procs:
+                other.kill()
+            raise RuntimeError(
+                "federated round: rank %d exited %d\n--- stderr ---\n%s"
+                % (rank, proc.returncode, err[-6000:])
+            )
+        with open(os.path.join(tmp, "rank-%d.json" % rank)) as handle:
+            reports.append(json.load(handle))
+    return reports
+
+
+@functools.cache
+def _fed_world_of_one():
+    """The refusals at `world_size = 1`, from one process. See the note above."""
+    dest = os.path.join(tempfile.mkdtemp(prefix="fed-one-"), "out.json")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _FED_WORLD_OF_ONE_SRC, dest],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"fed world-of-one subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    with open(dest) as handle:
+        return json.load(handle)
+
+
+def _fed_tensor(values):
+    """A float32 tensor from a rank's JSON, on *upstream* torch.
+
+    `tolist()` on a float32 tensor yields Python floats holding the exact
+    float32 value, `json` round-trips a float through `repr`, and building a
+    float32 tensor from those narrows back to the identical bits. So the
+    numbers compared below are the ranks' own, not approximations of them.
+    """
+    return _upstream_torch.tensor(values, dtype=_upstream_torch.float32)
+
+
+def test_fedavg_over_two_processes_equals_the_same_average_computed_centrally():
+    """The acceptance check, and the only one that can fail for the right reason.
+
+    Two operating-system processes, no shared memory, rendezvous over a real
+    TCP socket, each holding a delta produced by `adapt.wrap(model,
+    method=Tent())` on *different* local data and carrying a different weight
+    (3 and 7). What is asserted is that
+
+        aggregate_from_the_group  ==  (3*d0 + 7*d1) / 10
+
+    element for element, with the right-hand side computed here, in this
+    process, on upstream torch, from the two deltas the ranks dumped. Not that
+    the distributed path returned a tensor of the right shape; not that it ran.
+
+    Exact equality rather than a tolerance: every operation on both sides is a
+    correctly-rounded IEEE float32 multiply, add or divide over the same
+    inputs, so a difference of one ulp would be a real disagreement about the
+    arithmetic and not noise. `all_reduce` adds in the opposite order on the
+    two ranks and float addition is commutative, which is why both ranks land
+    on the same bits as each other as well.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    assert r0["shim"] is True and r1["shim"] is True, (r0["shim"], r1["shim"])
+    assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
+    assert r0["world"] == r1["world"] == 2, (r0["world"], r1["world"])
+    assert r0["backend"] == r1["backend"] == "local", r0["backend"]
+    assert r0["covers"] == r1["covers"] == ["norm1.weight", "norm2.weight"], \
+        (r0["covers"], r1["covers"])
+
+    # The premise: one base, two different deltas. Without the second half the
+    # average is trivially either operand.
+    assert r0["base"] == r1["base"], "the ranks did not start from one model"
+    assert r0["local"] != r1["local"], \
+        "the two ranks produced the same delta, so no average is distinguishable"
+
+    torch_up = _upstream_torch
+    w0, w1 = r0["weight"], r1["weight"]
+    assert (w0, w1) == (3.0, 7.0), (w0, w1)
+    total = torch_up.tensor(w0 + w1, dtype=torch_up.float32)
+
+    for name in r0["covers"]:
+        d0, d1 = _fed_tensor(r0["local"][name]), _fed_tensor(r1["local"][name])
+        central = (d0 * torch_up.tensor(w0, dtype=torch_up.float32)
+                   + d1 * torch_up.tensor(w1, dtype=torch_up.float32)) / total
+        got0 = _fed_tensor(r0["aggregate"][name])
+        got1 = _fed_tensor(r1["aggregate"][name])
+        assert torch_up.equal(got0, central), (
+            name, got0[:4].tolist(), central[:4].tolist())
+        assert torch_up.equal(got1, central), (
+            name, got1[:4].tolist(), central[:4].tolist())
+        # ... and it is neither operand, so "aggregation" did something.
+        assert not torch_up.equal(got0, d0), name
+        assert not torch_up.equal(got0, d1), name
+
+
+def test_fedavg_honours_its_weights_and_the_unweighted_average_is_different():
+    """The control for the test above: 3-and-7 is not 1-and-1.
+
+    Everything in `FedAvg` that could go wrong quietly goes wrong by producing
+    *some* average -- dropping the weights, using the peer's weight, reducing
+    before scaling. The acceptance test compares against the weighted average
+    and would catch all of those only if the weighted and unweighted answers
+    are actually different numbers, which is what this measures rather than
+    assumes.
+
+    The unweighted figure is produced by the distributed path too
+    (`FedAvg(weighted=False)` over the same two deltas), so this also pins that
+    the `weighted=False` road is a different computation and not a synonym.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    torch_up = _upstream_torch
+    gaps = []
+    for name in r0["covers"]:
+        d0, d1 = _fed_tensor(r0["local"][name]), _fed_tensor(r1["local"][name])
+        two = torch_up.tensor(2.0, dtype=torch_up.float32)
+        central_unweighted = (d0 + d1) / two
+        got = _fed_tensor(r0["unweighted"][name])
+        assert torch_up.equal(got, central_unweighted), (
+            name, got[:4].tolist(), central_unweighted[:4].tolist())
+        assert torch_up.equal(got, _fed_tensor(r1["unweighted"][name])), name
+        weighted = _fed_tensor(r0["aggregate"][name])
+        gaps.append(float((weighted - central_unweighted).abs().max()))
+    # Measured 0.0409 and 0.1649 on the two covered parameters. The bar is set
+    # far above float32 noise so that this reports "the weights are ignored"
+    # rather than "the last bit moved".
+    assert min(gaps) > 1e-3, gaps
+
+
+def test_the_engine_leaves_both_ranks_holding_the_same_averaged_model():
+    """README §2's road, and what a caller sees after one round.
+
+    `Engine.participate` runs the local epochs through `torchnative.adapt`,
+    publishes the delta, and installs `base + aggregate` -- so after the round
+    the two ranks hold *the same weights*, which is the property that makes it
+    federated learning rather than two devices training separately. The two
+    local norms differ (they trained on different data) and the two aggregate
+    norms do not.
+
+    It also crosses the two roads: the parameters the Engine left behind equal
+    `base + aggregate` computed on the low-level road in the same process, so
+    `Engine` is a use of `Delta.publish` rather than a second implementation
+    that could drift from it.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    torch_up = _upstream_torch
+    e0, e1 = r0["engine"], r1["engine"]
+    assert (e0["rank"], e1["rank"]) == (0, 1), (e0["rank"], e1["rank"])
+    assert e0["world"] == e1["world"] == 2, e0["world"]
+    assert e0["steps"] == e1["steps"] == 3, (e0["steps"], e1["steps"])
+    assert (e0["weight"], e1["weight"]) == (3.0, 7.0), (e0["weight"], e1["weight"])
+    assert e0["total_weight"] == e1["total_weight"] == 10.0, e0["total_weight"]
+    assert abs(e0["share"] - 0.3) < 1e-12 and abs(e1["share"] - 0.7) < 1e-12, \
+        (e0["share"], e1["share"])
+    assert e0["local_norm"] != e1["local_norm"], \
+        "the ranks contributed the same local update"
+    assert e0["aggregate_norm"] == e1["aggregate_norm"], \
+        (e0["aggregate_norm"], e1["aggregate_norm"])
+    assert "rank 0/2" in e0["repr"] and "weight 3 of 10" in e0["repr"], e0["repr"]
+
+    for rank_report in (r0, r1):
+        for name in rank_report["covers"]:
+            got = _fed_tensor(rank_report["engine_params"][name])
+            want = (_fed_tensor(rank_report["base"][name])
+                    + _fed_tensor(rank_report["aggregate"][name]))
+            assert torch_up.equal(got, want), (name, got[:4].tolist(),
+                                               want[:4].tolist())
+    # Both ranks hold the same model afterwards -- the point of the round.
+    assert r0["engine_params"] == r1["engine_params"], \
+        "the two ranks ended a round holding different weights"
+
+    assert r0["engine_twice"].startswith("RuntimeError:"), r0["engine_twice"]
+    assert "called twice" in r0["engine_twice"], r0["engine_twice"]
+
+
+def test_federated_refuses_a_world_of_one_by_name_at_every_door():
+    """The trap this whole section is arranged against, asserted as a refusal.
+
+    At `world_size = 1` a weighted average of one delta is that delta. Serving
+    it would make every other test here pass with an aggregator that did
+    nothing -- so all four doors (`FedAvg.aggregate`, `Delta.publish`,
+    `agree`, `Engine.participate`) refuse, and the message says *why* rather
+    than only *that*, because "world_size 1 unsupported" reads like an
+    oversight and this is a decision.
+
+    `Engine.participate` is asserted separately because it refuses **before**
+    the local epochs: refusing afterwards would leave the model adapted and the
+    round uncontributable, which is a worse place to stop than not starting.
+    """
+    if not _ckpt_shim_available():
+        return
+    out = _fed_world_of_one()
+    assert out["shim"] is True, out["shim"]
+    assert out["world"] == 1, out["world"]
+
+    for key in ("aggregate", "publish", "agree", "engine"):
+        msg = out[key]
+        assert msg.startswith("NotImplementedError:"), (key, msg)
+        assert "a world of one" in msg, (key, msg)
+        assert "identity function" in msg, (key, msg)
+        assert "Check: torch.distributed.get_world_size() == 2" in msg, (key, msg)
+    assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
+    assert "Delta.publish" in out["publish"], out["publish"]
+    assert "Engine.participate" in out["engine"], out["engine"]
+
+    # With no group at all the message names the call that builds one, rather
+    # than surfacing "Default process group has not been initialized".
+    for key in ("no_group", "no_group_aggregate"):
+        assert out[key].startswith("RuntimeError:"), (key, out[key])
+        assert "Check: import torchnative.distributed" in out[key], (key, out[key])
+        assert "world_size=2" in out[key], (key, out[key])
+
+
+def test_federated_refuses_the_shapes_that_would_average_incomparable_things():
+    """Two premises that fail silently, and the collective that checks them.
+
+    `all_reduce` sums element-wise whatever it is handed. Two ranks whose
+    deltas cover different parameters, or whose bases are different models,
+    both produce a number and no exception -- so both are checked with an
+    `int64` digest reduced over the same group, and both refusals name what
+    disagreed.
+
+    Both ranks reach the reduction before either compares, which is why the
+    group survives the refusal: the last assertion re-runs a full aggregation
+    afterwards and gets the same answer as the first one.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    for r in (r0, r1):
+        assert r["schema_mismatch"].startswith("ValueError:"), r["schema_mismatch"]
+        assert "which parameters this round covers" in r["schema_mismatch"], \
+            r["schema_mismatch"]
+        assert "would sum to" in r["schema_mismatch"], r["schema_mismatch"]
+
+        assert r["base_mismatch"].startswith("ValueError:"), r["base_mismatch"]
+        assert "the base these deltas are offsets from" in r["base_mismatch"], \
+            r["base_mismatch"]
+
+    # The group is still usable after both refusals, and still gives the
+    # aggregate the acceptance test pinned.
+    assert r0["again"] == r0["aggregate"], "the group did not survive a refusal"
+    assert r1["again"] == r1["aggregate"], "the group did not survive a refusal"
+
+
+def test_federated_refuses_the_round_shapes_it_does_not_implement():
+    """What was scoped out, refusing by name rather than approximated.
+
+    Each of these is a thing FedAvg implementations do and this one does not:
+    weighting implicitly, dropping a rank, selecting participants, looping
+    rounds. `docs/DESIGN.md` §6 is why they refuse instead: a refusal names the
+    next thing to build, and an aggregator that quietly averages unweighted or
+    quietly divides by however many ranks arrived reports success either way.
+
+    `too_big_for_the_wire` is the odd one: it is not a decision about
+    federation but a measured limit of the transport underneath, and the
+    message says so and gives both numbers, so the fix is looked for in
+    `ProcessGroupLocal.allreduce` where it belongs.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, _ = _fed_two_process_round()
+
+    assert r0["no_weight"].startswith("TypeError:"), r0["no_weight"]
+    assert "weight= is required" in r0["no_weight"], r0["no_weight"]
+    assert "FedAvg(weighted=False)" in r0["no_weight"], r0["no_weight"]
+
+    assert r0["unweighted_given_weight"].startswith("TypeError:"), \
+        r0["unweighted_given_weight"]
+    assert "accepted and ignored" in r0["unweighted_given_weight"], \
+        r0["unweighted_given_weight"]
+
+    assert r0["zero_weight"].startswith("ValueError:"), r0["zero_weight"]
+    assert r0["empty_table"].startswith("ValueError:"), r0["empty_table"]
+    assert r0["integer_table"].startswith("NotImplementedError:"), r0["integer_table"]
+
+    assert r0["engine_rounds"].startswith("NotImplementedError:"), r0["engine_rounds"]
+    assert "One round is implemented" in r0["engine_rounds"], r0["engine_rounds"]
+    assert "re-opening the delta per round" in r0["engine_rounds"], r0["engine_rounds"]
+
+    assert r0["engine_select"].startswith("NotImplementedError:"), r0["engine_select"]
+    assert "participant selection" in r0["engine_select"], r0["engine_select"]
+
+    assert r0["engine_allow_missing"].startswith("NotImplementedError:"), \
+        r0["engine_allow_missing"]
+    assert "dropout handling" in r0["engine_allow_missing"], r0["engine_allow_missing"]
+    assert "never produces a partial average" in r0["engine_allow_missing"], \
+        r0["engine_allow_missing"]
+
+    assert r0["too_big_for_the_wire"].startswith("NotImplementedError:"), \
+        r0["too_big_for_the_wire"]
+    assert "4000000 elements" in r0["too_big_for_the_wire"], \
+        r0["too_big_for_the_wire"]
+    # The refusal used to name a real deadlock -- both ranks called `sendall`
+    # before either received. That is fixed (`ProcessGroupLocal.allreduce`
+    # orders the exchange by rank; 3,000,000 floats complete in 0.60 s where
+    # 4 MB used to hang for 30 s), so the message must no longer present itself
+    # as a measured wall. A refusal that blames a defect somebody already fixed
+    # sends the next reader to the wrong file.
+    assert "not a measured wall" in r0["too_big_for_the_wire"], \
+        r0["too_big_for_the_wire"]
+    # And the bound has to sit *above* the size that used to fail, or the fix
+    # bought nothing. Both numbers are read out of the refusal itself rather
+    # than imported, so the message and the constant cannot drift apart: this
+    # goes red if someone lowers the bound back under the old wall, and also if
+    # the message stops carrying the numbers it points the reader at.
+    import re as _re
+    _msg = r0["too_big_for_the_wire"]
+    _bound = _re.search(r"The bound is (\d+)", _msg)
+    _dead = _re.search(r"(\d+) B did not", _msg)
+    assert _bound and _dead, _msg
+    assert int(_bound.group(1)) > int(_dead.group(1)), (_bound.group(1), _dead.group(1))
 
 
 if __name__ == "__main__":

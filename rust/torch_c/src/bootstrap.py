@@ -10113,15 +10113,6 @@ def _install_distributed_c10d(module, spec) -> None:
         one device holds one shard and aggregation happens a layer up.
         """
 
-    class ProcessGroupLocal(Backend):
-        """The collectives of a group whose only member is this process.
-
-        Named `Local` rather than after a transport because there is none: the
-        peer set is `{self}`. That is not a degenerate case to be tolerated --
-        it is the case federated learning starts from (DESIGN.md §11.1), where
-        one device holds one shard and aggregation happens a layer up.
-        """
-
         def __init__(self, rank=0, size=1, store=None):
             if size not in (1, 2):
                 raise NotImplementedError(
@@ -10214,13 +10205,32 @@ def _install_distributed_c10d(module, spec) -> None:
             import json, struct
             for t in tensors:
                 data = json.dumps(t.tolist()).encode('utf-8')
-                self._peer.sendall(struct.pack('!I', len(data)) + data)
-                
-                length_bytes = self._recv_all(4)
-                length = struct.unpack('!I', length_bytes)[0]
-                peer_data = self._recv_all(length)
+                frame = struct.pack('!I', len(data)) + data
+
+                # **Ordered by rank, because both sending first deadlocks.**
+                # `sendall` returns when the *kernel* has taken the bytes, not
+                # when the peer has read them, so it blocks once the payload
+                # exceeds the socket buffers. Both ranks sending before either
+                # receives means both block in `sendall` with nobody reading:
+                # 2.8 MB completed in 0.17 s and 4.05 MB hung for 30 s, and the
+                # wall was not even a constant -- 8.1 MB passed after a warm-up
+                # ramp had grown the buffers. A hang that depends on how much
+                # traffic came before it is the worst shape this could have.
+                #
+                # Even rank sends then receives, odd rank receives then sends.
+                # One side is always draining, so neither can fill the other's
+                # buffer with nobody home. Deterministic, and no thread.
+                if self._rank % 2 == 0:
+                    self._peer.sendall(frame)
+                    length = struct.unpack('!I', self._recv_all(4))[0]
+                    peer_data = self._recv_all(length)
+                else:
+                    length = struct.unpack('!I', self._recv_all(4))[0]
+                    peer_data = self._recv_all(length)
+                    self._peer.sendall(frame)
+
                 peer_list = json.loads(peer_data.decode('utf-8'))
-                
+
                 import torch
                 peer_tensor = torch.tensor(peer_list, dtype=t.dtype, device=t.device)
                 t.add_(peer_tensor)

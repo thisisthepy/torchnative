@@ -100,6 +100,14 @@ instrument for a delta regardless. `Delta.persist`/`Delta.load` write and read
 one as safetensors; `Delta.publish` still refuses, naming the check that would
 make *that* refusal stale (§2.2, §8.3).
 
+> **Correction (2026-09-02, `docs/FEDERATED.md`).** That refusal has now gone
+> stale exactly the way it was written to — someone ran the check it named.
+> `world_size = 2` landed (`docs/TRANSPORT.md`) and `Delta.publish` was
+> implemented on top of it: it sends the delta to the other rank and returns
+> the group's weighted average. What it still refuses is narrower and is about
+> the call rather than about the world — an unrecorded delta has nothing to
+> send, and an uninitialised process group has nobody to send to.
+
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py publish present -->
 
@@ -163,7 +171,7 @@ that integration, and it did not need names.** It needed three answers, and
 |---|---|---|
 | can this delta be discarded, and at what cost | `revert()`, `nbytes` | **yes**, and the cost is measured in §5 |
 | does it survive a process restart | `persist()`, `load()` | **yes** — §14, bit-identical over 35,136 numbers |
-| can it leave the device | `publish()` | **refuses** — no world larger than one |
+| can it leave the device | `publish()` | **yes** — a weighted `all_reduce` across two OS processes, checked against the same average computed centrally (`docs/FEDERATED.md` §2). *This row read "refuses — no world larger than one" until 2026-09-02* |
 
 *(The middle row said "refuses — no tensor serialiser" for one round.
 `docs/BACKWARD.md` §14 found that the wall it named was a masking exception and
@@ -618,7 +626,7 @@ nothing in this document's tests is entitled to claim it.
 
 | | why |
 |---|---|
-| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to |
+| `torchnative.nn.federated` | §1. It needed a second rank, a rendezvous and a serialiser. **The serialiser exists now** (§8.3); the other two still refuse, and `Delta.publish` is the seam it will attach to. *(2026-09-02: all three closed — `docs/SAVE.md`, `docs/TRANSPORT.md`, `docs/FEDERATED.md`. One round of `FedAvg` between two OS processes runs, and it attached at exactly that seam.)* |
 | a second adaptation method | The abstraction is built for one; §9.1's second bullet is honest that one method does not prove it |
 | `native_layer_norm`'s derivative rule | §8.1. It is one arm in `tape.rs`, which was out of scope this round |
 | momentum, Adam, a learning-rate schedule | `torch.optim.SGD` was enough for a curve, and `docs/LOSS.md` §6.4's four missing ops still gate Adam |

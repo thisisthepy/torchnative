@@ -40,12 +40,17 @@ does it survive a process restart                       :meth:`Delta.persist`,
 can it leave the device                                 :meth:`Delta.publish`
 ======================================================  ========================
 
-**Two answers now, and one refusal.** ``persist``/``load`` write and read a
-delta as safetensors and the round trip is bit-identical; ``publish`` still
-refuses, because sending needs a second rank and there is no backend here that
-admits one. It refuses with a check the reader can run rather than with a claim
-about the world, because a refusal that names a fact goes stale the day the
-fact changes and this repository has paid for that six times.
+**All three are answered now.** ``persist``/``load`` write and read a delta as
+safetensors and the round trip is bit-identical; ``publish`` sends it to the
+other ranks of a process group and returns the aggregate.
+
+``publish`` refused until 2026-09-02, and it refused with a check the reader
+could run rather than with a claim about the world -- ``init_process_group(
+backend='local', ..., world_size=2)``. That check started returning
+(docs/TRANSPORT.md) and this method was written on top of it (docs/FEDERATED.md).
+The two refusals that remain are narrower and are about *this* call rather than
+about the world: an unrecorded delta has nothing to send, and a process group
+that was never initialised has nobody to send to.
 
 ``persist`` deliberately does **not** go through ``torch.save``, and the
 reason is no longer the one BACKWARD.md §14 gave. That section said the blocker
@@ -346,20 +351,53 @@ class Delta:
 
         return load_file(path, device="cpu")
 
-    def publish(self, group=None):
-        """Send this delta to an aggregator. Refuses today.
+    def publish(self, group=None, weight=None, aggregator=None):
+        """Send this delta to the other ranks and return the aggregate.
 
         This is the federated destination -- DESIGN.md §3's second axis, the one
-        place where adaptation state leaves the device.
+        place where adaptation state leaves the device. It returns a
+        ``{name: tensor}`` table, not a ``Delta``, for the reason :meth:`load`
+        gives: what comes back off the wire is the *group's* offset, and which
+        model it belongs on is the caller's knowledge.
+
+        It refused until 2026-09-02, and what it was waiting for was a second
+        rank rather than a serialiser -- docs/SAVE.md §7 sized the three walls
+        and this was the last of them. docs/TRANSPORT.md opened it.
+
+        **What this checks before it sends.** FedAvg averages *offsets from a
+        common base*: ``sum(w_k (w_k^local - w_global)) / sum(w_k)`` only means
+        anything if every rank subtracted the same ``w_global``. Nothing
+        downstream notices if they did not -- ``all_reduce`` sums whatever it
+        is handed -- so the bases are compared here, by digest, over the same
+        collective the aggregation runs on. It costs one ``int64`` element.
+
+        Pass ``over_common_base=False``... there is no such argument, and that
+        is deliberate: an opt-out would exist to be used by the first caller
+        whose bases did not match.
         """
-        raise NotImplementedError(
-            "torchnative.delta: a delta cannot leave this device yet -- "
-            "aggregation needs a process group with more than one rank.\n"
-            "Check: torch.distributed.init_process_group(backend='local', "
-            "rank=0, world_size=2, store=torch.distributed.HashStore()). "
-            "If that returns instead of refusing, a world of two exists and "
-            "this refusal is stale (docs/DISTRIBUTED.md §5)."
+        if self.value is None:
+            raise ValueError(
+                "torchnative.delta: this delta has nothing to publish -- it is "
+                "the zero offset, so the round would contribute nothing and "
+                "still be counted at full weight in the average.\n"
+                "Check: delta.value is None. Call record(model) after the "
+                "local step."
+            )
+        from torchnative.nn import federated
+
+        if aggregator is None:
+            aggregator = federated.FedAvg()
+        # Named here rather than inherited from `agree` below, so that a world
+        # of one is reported against the call the caller made.
+        federated._require_two(group, "Delta.publish")
+        federated.agree(
+            federated.digest(self.base),
+            group,
+            "the base these deltas are offsets from (FedAvg averages offsets "
+            "from a common model, and averaging offsets from two different "
+            "models is arithmetic on incomparable quantities)",
         )
+        return aggregator.aggregate(self.value, weight=weight, group=group)
 
     def __repr__(self):
         base, val = self.nbytes

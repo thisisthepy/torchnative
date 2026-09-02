@@ -956,6 +956,13 @@ is exact" are different claims and only the first one is true.
 
 ### 14.6 What is still refused, and it is the right one
 
+> **Correction (2026-09-02, `docs/FEDERATED.md`).** It does not any more, and it stopped in the
+> way this section hoped: someone ran the check the refusal named. `world_size = 2` landed
+> (`docs/TRANSPORT.md`) and `Delta.publish` was implemented on it — it sends the delta to the
+> other rank and returns the group's weighted average, checked against the same average computed
+> centrally. All three of `docs/DESIGN.md` §3's lifetime questions now answer by doing the thing.
+> The paragraph below is left as the record of what was blocked and by what.
+
 `Delta.publish` still refuses. It needs a second rank, `ProcessGroupLocal` refuses `world_size != 1`,
 and there is no backend here that does not — `docs/ADAPT.md` §1's table, unchanged. That refusal
 names a check that can be run, and it is now the only one of `docs/DESIGN.md` §3's three lifetime

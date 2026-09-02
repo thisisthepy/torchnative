@@ -110,26 +110,46 @@ model, gather the updates, weighted all-reduce.
 ```python
 from torchnative.nn import federated
 
-engine = federated.Engine(model, rounds=..., aggregator=federated.FedAvg())
-engine.participate()          # local epochs, then contribute a delta
+engine = federated.Engine(model, method=adapt.Tent(), aggregator=federated.FedAvg())
+report = engine.participate(batches, weight=n_local_samples)   # local epochs, then a delta
 ```
 
-**Today:** the transport under it stands. `torch.distributed` works at `world_size = 1`, and its
-sixteen value-producing collectives are byte-identical to upstream's `gloo`; what needs a second
-rank refuses by name rather than pretending. `torchnative.nn.federated` above it is still empty.
+**Today:** **one round runs, between two operating-system processes that share no memory.** Each
+rank adapts locally with `adapt.wrap(model, method=Tent())`, contributes the delta that produces,
+and comes back holding the group's weighted average — and the acceptance check is not that the
+distributed path returned something. It is that
 
-What it was waiting on was three named things, and **the third is closed**: `torch.save` works,
-upstream reads what it writes bit-for-bit across eight dtypes, and storage sharing survives the
-round trip — `x`, `x.t()` and `x[1]` land in one record and come back sharing one storage
-([`docs/SAVE.md`](docs/SAVE.md)). A delta goes to bytes: `torch.save(delta.value)` is 1871 B.
+```
+aggregate_across_the_two_ranks  ==  (3·d0 + 7·d1) / 10
+```
 
-The other two have moved as well. **`world_size = 2` works over a real socket**: two independent
-OS processes rendezvous through `TCPStore` and `all_reduce(SUM)` gives what upstream's `gloo` gives
-for the same inputs, `[3.0, 6.0, 9.0]` against `[3.0, 6.0, 9.0]`, through the ordinary
-`init_process_group(backend="local", init_method="tcp://…")` and not a private door
-([`docs/TRANSPORT.md`](docs/TRANSPORT.md)). Everything past that — other collectives, other world
-sizes — refuses by name, and `torchnative.nn.federated` above it is still empty. `Delta.publish`
-remains the seam ([`docs/ADAPT.md`](docs/ADAPT.md) §1).
+element for element, with the right-hand side computed **centrally** in a third process on upstream
+torch from the two deltas the ranks dumped. `torch.equal`, not a tolerance: every operation on both
+sides is a correctly-rounded IEEE `float32` multiply, add or divide, so one ulp apart would be a
+real disagreement. Both ranks land on the same bits, and after the round they hold the same model
+([`docs/FEDERATED.md`](docs/FEDERATED.md)).
+
+**The trap was that `FedAvg` at `world_size = 1` is the identity function** — it returns the delta
+it was handed, so a test at that size passes whether the weights are honoured, ignored, or never
+read. So a world of one is *refused* at all four doors rather than served, two threads are not
+enough either, and the controls are part of the claim: the weighted average differs from the
+unweighted one by 0.041 and 0.165 on the two covered parameters, so an aggregator that dropped its
+weights fails. Five injected defects were counted, and the two that removed an agreement check made
+the mismatch **complete silently** — different parameter sets summed into a number with no
+exception.
+
+The three things it was waiting on are all closed: `torch.save` works and upstream reads what it
+writes bit-for-bit across eight dtypes ([`docs/SAVE.md`](docs/SAVE.md)); `world_size = 2` works over
+a real socket, through the ordinary `init_process_group(backend="local", init_method="tcp://…")` and
+not a private door ([`docs/TRANSPORT.md`](docs/TRANSPORT.md)); and `Delta.publish`, the seam, now
+sends.
+
+**What it does not cover, by name:** more than one round, participant selection, dropout handling,
+secure aggregation, and any aggregator that is not `FedAvg` — each refusing with what it would take
+rather than approximating. A rank that does not arrive makes the round raise; it never produces a
+partial average. And a delta above ~2 MB on the wire refuses, because the transport under it sends
+before it receives and deadlocks — a limit of `ProcessGroupLocal`, named there rather than worked
+around here.
 
 ### 3 · Test-time adaptation & training
 
@@ -200,8 +220,8 @@ loads on 3.13, 3.14 and later without a rebuild.
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>185</b>, each compared against upstream</td></tr>
-<tr><td>Golden comparison cases</td><td><b>7685 / 7685</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>348</b></td></tr>
+<tr><td>Golden comparison cases</td><td><b>8,126 / 8,126</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<tr><td>Smoke tests</td><td><b>354</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
