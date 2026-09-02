@@ -173,12 +173,17 @@ already use, or to `TensorBase`'s existing native size/re-wrap constructor.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sized_tensor present -->
 <!-- DOCWATCH: op-implemented aten.lift_fresh.default -->
 
-"No new kernel" is a checkable claim rather than an assertion: `ops covered` is **185**, the same
-number it was before this round. That is also why the golden harness cannot see any of this — it
-dispatches by op key, and no key changed — and why the coverage is six vendored-tree road tests
-instead (`test_ctor_*` in `pytests/test_shim.py`). docs/GOLDEN.md's blind spot, the same shape
-`as_tensor` and `meshgrid` had in docs/DEMAND1.md.
-<!-- DOCWATCH: count golden_ops_covered eq 185 -->
+This round added **no kernel**: `ops covered` was 185 before it and 185 after. That is also why the
+golden harness cannot see any of this — it dispatches by op key, and no key changed — and why the
+coverage is six vendored-tree road tests instead (`test_ctor_*` in `pytests/test_shim.py`).
+docs/GOLDEN.md's blind spot, the same shape `as_tensor` and `meshgrid` had in docs/DEMAND1.md.
+
+That claim was first written as `count golden_ops_covered eq 185`, which is the one thing a marker
+must not do: `ops covered` is a **shared global**, so an `eq` on it fails on somebody else's commit.
+It did, within the hour — docs/DEMAND2.md landed four kernels in a round running beside this one and
+took it to 189. "This round added no kernel" is a fact about a diff and cannot be expressed as an
+assertion about a global total; `ge` is the honest marker, and the sentence above carries the rest.
+<!-- DOCWATCH: count golden_ops_covered ge 185 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8126 -->
 <!-- DOCWATCH: count smoke_ok ge 354 -->
 

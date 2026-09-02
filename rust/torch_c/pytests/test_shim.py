@@ -8804,7 +8804,19 @@ def test_core_ops_and_op_tags_agree():
     # because Core ATen's batch-norm member is `_native_batch_norm_legit`, the
     # functionalised spelling that carries the alias annotations this one is
     # measured not to have (docs/DEMAND1.md §1.1).
-    assert r["tag_core_count"] == 101, r["tag_core_count"]
+    #
+    # 102 with `squeeze.dims` (docs/DEMAND.md §0.1 rank 2), whose tags are
+    # `['core', 'pt2_compliant_tag']` -- the same pair `squeeze.dim`, already
+    # counted here from before this round, carries. `squeeze.default`, landed
+    # in the same round, is **not** core (`['pt2_compliant_tag']` only) and
+    # adds nothing -- read off its own entry rather than assumed from its two
+    # siblings, which is the point: three overloads of the same op, one not
+    # core and two that are, and there is no way to get that from the name.
+    # `linalg_vector_norm.default` and `linspace.default`, the other two
+    # kernels this round landed, are also not core
+    # (`['pt2_compliant_tag', 'reduction']` and `['pt2_compliant_tag']`) and
+    # add nothing either.
+    assert r["tag_core_count"] == 102, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10255,7 +10267,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # the same boundary `layer_norm` and `group_norm` sit on.
     # Both landed in the same round pair: 251 + 17 (INPLACE.md) + 3
     # (DEMAND1.md) = 271.
-    assert len(keys) == 271, len(keys)
+    #
+    # 275 with docs/DEMAND.md §0.1 ranks 3 and 4: `linalg_vector_norm` and
+    # `linspace` each got a fresh `overloads.json` entry, `default` and
+    # `out`, both declared in the yaml (checked -- `aten::linspace.out` and
+    # `aten::linalg_vector_norm.out` are ordinary `- func:` lines, not a
+    # torchgen-only `.out` the way `full_like.out` above was), so
+    # `from_tables` below does not move. +4, not +2, because this counts
+    # `(qualname, overload)` pairs and each op contributes two. `squeeze`
+    # (rank 2 of the same re-ranking) contributes nothing here: its three
+    # overloads -- `default`, `dim`, `dims` -- were already in
+    # `overloads.json` before this round; only the dispatch arm for
+    # `default` and `dims` was missing, which is a different table
+    # (`_aten_implemented()`) from the one this test counts.
+    assert len(keys) == 275, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

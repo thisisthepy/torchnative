@@ -461,6 +461,9 @@ having no kernel of their own to assert.
 <!-- DOCWATCH: hasattr as_tensor true -->
 <!-- DOCWATCH: hasattr meshgrid true -->
 
-Still open, and measured in §5 above so the next round does not have to re-measure it:
+Measured in §5 above so the round that closed it did not have to re-measure it, and closed by
+that round — docs/DEMAND.md §0.2 rank 3, kernel shared with `norm.ScalarOpt_dim`. Asserted
+present now for the same reason the three markers above are: a regression (the kernel removed,
+or removed from `_aten_implemented()`) fails here too.
 
-<!-- DOCWATCH: op-not-implemented aten.linalg_vector_norm.default -->
+<!-- DOCWATCH: op-implemented aten.linalg_vector_norm.default -->

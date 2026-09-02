@@ -2715,6 +2715,22 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         setattr(module, name, sub)
         sys.modules[f"{prefix}.{name}"] = sub
 
+    # `torch._C._linalg.linalg_vector_norm` -- `torch/nn/functional.py:6100`'s
+    # `normalize` calls this spelling directly, not `torch.linalg_vector_norm`
+    # (which upstream does not expose either -- `torch.linalg.vector_norm` is
+    # the public name, a different, Python-level function). `_linalg` has no
+    # stub data (`EXTRA_SUBMODULES`, above), so the generic loop just ran left
+    # every name on it as the catch-all `_Unimplemented`. docs/DEMAND.md §0.1
+    # rank 3: this replaces the one name it asks for with a real resolving
+    # function, sharing the exact overload machinery `torch.<op>` uses --
+    # `overloads["linalg_vector_norm"]` is the same table
+    # `_torch_level_function` reads for the top-level names, just not
+    # harvested onto `torch.<name>` because upstream does not put it there
+    # either.
+    module._linalg.linalg_vector_norm = _torch_level_function(
+        "linalg_vector_norm", dispatch, overloads
+    )
+
     # -- `_monitor._WaitCounter` -- a block that can be entered -------------
     #
     # `torch/distributed/c10d_logger.py:96` wraps every public collective in

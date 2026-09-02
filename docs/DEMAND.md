@@ -29,13 +29,29 @@ the same code path).
 > the word this table used for it was wrong. It is recorded in §0.2 with the rest, and the
 > three below move up one.
 
+> **Re-ranked again 2026-09-02 (docs/DEMAND2.md).** Ranks 2, 3 and 4 of the list above are now
+> **closed** too — everything the first re-ranking left open except rank 1. §0.1 is, once again,
+> renumbered to what remains; §0.2 gets three more rows. Same reason as before for not editing
+> the closed ranks' own rows in place: the vote counts and "why this is the cheapest/closest"
+> reasoning are the measurement, not decoration.
+
 ### 0.1 What is still open, renumbered
 
 | rank | gap | models that hit it | kind |
 |---|---|---|---|
-| 1 | `aten.squeeze.default` | `mbart` (1) | **the GOLDEN.md blind-spot shape**, promoted from the honourable mentions because it is now the cheapest thing on the list: `squeeze` is *declared* in both `overloads.json` and `methods.json` with three overloads — `squeeze()`, `squeeze.dim`, `squeeze.dims` — but `aten.rs`'s dispatch `match` has an arm only for `squeeze.dim`. The no-arg overload looks present in the name tables and is not reachable. `mbart`'s `shift_tokens_right` is the caller. |
-| 2 | `aten.linalg_vector_norm.default` | `sentence_embed` (1) | **missing kernel**, promoted from the honourable mentions. A **distinct** leaf from the already-implemented `aten.norm.ScalarOpt_dim` (`_dispatch_has_kernel_for_dispatch_key` returns `False` for it too). `F.normalize` fires `linalg_vector_norm.default, clamp_min.default, expand.default, div.Tensor` and the other three are implemented, so this one kernel closes the model. **Measured in full in docs/DEMAND1.md §5** — the six-arm `ord` family (`0`, `±inf`, `1`, `2`, general, and negative), the empty-reduction split (`ord=2` gives `0.0`, `ord=±inf` raises), and the `dtype=` promotion. Its spelling is `torch._C._linalg.linalg_vector_norm`, not a `torch.<name>`. The kernel is close to `norm.ScalarOpt_dim`'s existing six-op walk and the two should share it rather than diverge. |
-| 3 | `torch.linspace` | `convnext` (1) | **missing kernel**, leaf upstream — `ConvNextModel.__init__`'s stochastic-depth rate schedule, so a construction-time wall rather than a forward one. The generic "N vision backbones with a `drop_path_rate` schedule" pattern. |
+**Nothing on this document's list is open.** Its rank 1 (the legacy
+`torch.Tensor(...)` constructor) closed in docs/CTOR.md, and ranks 2 to 4
+(`squeeze.default`, `linalg_vector_norm.default`, `linspace`) closed in
+docs/DEMAND2.md — two rounds that ran at the same time, each removing what it
+had closed, which is why this section merged to empty.
+
+That does **not** mean nothing is open. This file ranks the *first* sweep of
+eighteen architectures; re-running them after five closures moved seven models
+onto new walls, and that list lives in [`docs/DEMAND3.md`](DEMAND3.md). Read
+that one for what to build next — `max_pool2d`, `where.default` (the
+single-argument overload), `hardtanh`, `adaptive_avg_pool1d`, `one_hot` — and
+the `randint` divergence recorded at the end of it, which outranks all of them.
+
 
 ### 0.2 Closed, and by what
 
@@ -43,14 +59,22 @@ the same code path).
 |---|---|---|
 | 0.1-1 | legacy `torch.Tensor(...)` constructor | **docs/CTOR.md.** One function in `bootstrap.py`, installed on `torch.Tensor` at the existing `_initExtension` hook. **Not structural, and that is the finding**: this table said the only class that could carry a Python-level `__new__` is in the vendored tree, and concluded the gap was therefore unreachable. `torch.Tensor` *is* that vendored class — `class Tensor(torch._C.TensorBase)`, MRO `(Tensor, TensorBase, object)` — but it **inherits** `__new__` and is a settable heap type, so it can be given one without editing the file that declares it. Being vendored blocks *editing*, not *patching*, and `bootstrap.py` patches classes it does not own everywhere. The real obstacle was ordering (`_C` imports before `torch.Tensor` exists) and the hook for it already existed and already ran on this exact class. Shapes implemented: `Tensor()`, `Tensor(2, 3)`, `Tensor(torch.Size(...))`, `Tensor(existing)`, `Tensor(sequence)`, `Tensor(ndarray)`, `device=`; refusals transcribed from upstream by wording. `torch.Tensor(int)` was already native by `3c53d16`. **Two divergences recorded rather than closed** (CTOR.md §3.3): the ndarray path copies where upstream aliases (the same one §0.2's `as_tensor` row records), and the size form's bytes are zeros where upstream's are uninitialised. **`ops covered` is unchanged at 185** — no kernel; every form routes to `lift_fresh` or to the existing native size constructor, so the golden harness is structurally blind to it and six vendored-tree road tests are what cover it. `pegasus` and `sew_d` both construct and match upstream bit for bit. |
 | 1 | `torch.batch_norm` / `aten.native_batch_norm.default` | **docs/DEMAND1.md §1.** Kernel in `aten.rs` (`native_batch_norm_default`), spelling as a `bootstrap.py` composite beside `layer_norm`/`group_norm` — not an `overloads.json` entry, because `aten::batch_norm` is `CompositeImplicitAutograd` and never fires. The train/eval split, the in-place running-statistic update, the biased-for-output / **unbiased**-for-running-variance divergence, the `(0,)`-shaped `save_mean`/`save_invstd` in eval, and upstream's **fused** `x*alpha + beta` affine (which the golden harness caught, on the constant-input case) are all measured and golden-compared. `capture.rs` grew an argument-aware guard: this op mutates and its name does not say so. `nn.BatchNorm2d`, `1d` and `3d` all forward. |
-| 3 | `torch.full_like` / `aten.full_like.default` | **docs/DEMAND1.md §2.** Kernel reusing `full`'s own `filled_block` rather than a second fill; `overloads.json` entry. The rule that separates it from `full` — dtype from the *reference tensor*, not inferred from the fill value — is what the golden cases are built around. |
-| 4 | `torch.as_tensor` | **docs/DEMAND1.md §4.** A spelling, as predicted: a `bootstrap.py` composite branching between `lift_fresh` (new data) and `_to_copy` (a tensor needing a cast), with the identity case — `torch.as_tensor(t) is t` — returning the receiver. **One difference is recorded rather than closed**: upstream's ndarray path shares memory with the array and this one copies, because this shim's tensors do not wrap foreign buffers. |
-| 5 | `TensorBase.new_zeros` / `aten.new_zeros.default` | **docs/DEMAND1.md §3.** One function in `aten.rs` now serves `new_ones` and `new_zeros`; `methods.json` entry. |
+| 2 | `aten.squeeze.default` (and `aten.squeeze.dims`, found to have the identical hole while landing `.default`) | **docs/DEMAND2.md.** `squeeze` was *declared* in both `overloads.json` and `methods.json` with three overloads and `aten.rs`'s dispatch `match` had an arm only for `.dim`; `.default` and `.dims` are now both wired. `.default` removes every axis of size 1 (not just one); `.dims` removes each *named* axis that is size 1 and leaves the rest — a named axis that is not size 1 is a no-op, the same rule `.dim` carries, and an **empty `dim` list on `.dims` is a no-op**, not "every axis" the way `norm.ScalarOpt_dim`/`linalg_vector_norm`'s empty `dim` is. `.dims`' repeated-dim refusal (`dim 0 appears multiple times in the list of dims`) is checked **before** any size is looked at, measured: `squeeze(x, dim=(1,1))` refuses even though axis 1 is not size 1. `mbart`'s `shift_tokens_right` calls plain `squeeze()`; no measured model called `.dims`. |
+| 3 | `aten.linalg_vector_norm.default` | **docs/DEMAND2.md**, building on the full upstream measurement already recorded in docs/DEMAND1.md §5. A **distinct** leaf from `aten.norm.ScalarOpt_dim`, and the kernel **shares** that op's six-arm accumulate walk (`norm_pow_walk` in `aten.rs`) rather than re-deriving it, per docs/DEMAND1.md §7's stated reason not to diverge. What stays this op's own: the `dim=None`/`dim=[]` "every axis" rule (identical to `norm.ScalarOpt_dim`'s), the dtype-mismatch wording (`"linalg.vector_norm: Expected a floating point or complex tensor as input. Got {name}"`, no trailing "instead." the way `norm()`'s has), `dtype=` promotion with a narrowing refusal (`Half`/`BFloat16` cannot convert to each other despite being the same width), and the empty-reduction split — `ord=2` still answers `0.0`, but `ord=±inf` now **refuses**, with one message naming the empty axis (`"...on the dimension {d}because..."`, upstream's own missing space, transcribed) when `dim` was a non-empty list, and another (`"...on an empty tensor because..."`) when it was not. `F.normalize`'s four ops (`linalg_vector_norm.default, clamp_min.default, expand.default, div.Tensor`) all have kernels now; `sentence_embed` forwards and matches upstream end to end. |
+| 4 | `torch.linspace` | **docs/DEMAND2.md.** Leaf kernel, fetched and read from upstream's `RangeFactoriesKernel.cpp::linspace_kernel` rather than guessed. `steps=0` answers empty (not an error); `steps<0` refuses (`"number of steps must be non-negative"`); `steps=1` answers `[start]` without reading `end`. The default dtype is always the default float dtype, never `int64` the way `arange`'s all-integral rule would suggest, and an explicit integer dtype **truncates toward zero**. The endpoint is exact by construction — upstream fills forward from `start` and *backward* from `end`, split at `steps // 2`, and the `Float`/`Double` arms fold each half's multiply-add into one hardware FMA (this shim's own `f32`/`f64::mul_add`) to match the compiler's contraction of upstream's literal `a + b*c`; `Half`/`BFloat16` do not fuse and are narrowed after every individual operator call instead, matching `at::Half`/`at::BFloat16` arithmetic. `ConvNextModel.__init__`'s stochastic-depth rate schedule is the caller. |
+| 5 | `torch.full_like` / `aten.full_like.default` | **docs/DEMAND1.md §2.** Kernel reusing `full`'s own `filled_block` rather than a second fill; `overloads.json` entry. The rule that separates it from `full` — dtype from the *reference tensor*, not inferred from the fill value — is what the golden cases are built around. |
+| 6 | `torch.as_tensor` | **docs/DEMAND1.md §4.** A spelling, as predicted: a `bootstrap.py` composite branching between `lift_fresh` (new data) and `_to_copy` (a tensor needing a cast), with the identity case — `torch.as_tensor(t) is t` — returning the receiver. **One difference is recorded rather than closed**: upstream's ndarray path shares memory with the array and this one copies, because this shim's tensors do not wrap foreign buffers. |
+| 7 | `TensorBase.new_zeros` / `aten.new_zeros.default` | **docs/DEMAND1.md §3.** One function in `aten.rs` now serves `new_ones` and `new_zeros`; `methods.json` entry. |
 | HM | `torch.meshgrid` | **docs/DEMAND1.md §6.** A spelling, as predicted — a `bootstrap.py` composite over `view` + `expand`, both long implemented. `"xy"` is done by swapping the first two inputs and swapping the outputs back, which is what upstream's op trace shows and what a transpose-based implementation would have got wrong invisibly (the shapes and values agree; only the trace differs). |
 
-Closing those five moved `ops covered` from 168 to 171 (three kernels; `as_tensor` and `meshgrid`
-added none, being spellings over ops that were already there — which is exactly why they needed
-smoke coverage through the vendored tree instead, GOLDEN.md's blind spot).
+Closing the first five (native_batch_norm, full_like, as_tensor, new_zeros, meshgrid) moved
+`ops covered` from 168 to 171 (three kernels; `as_tensor` and `meshgrid` added none, being
+spellings over ops that were already there — which is exactly why they needed smoke coverage
+through the vendored tree instead, GOLDEN.md's blind spot). Closing ranks 2, 3 and 4 above moved
+it from 185 to 189: `squeeze.default`, `squeeze.dims`, `linalg_vector_norm.default` and
+`linspace.default` are each a real `_aten_implemented()` entry, one kernel apiece (`squeeze`'s
+two new overloads share their existing `.dim` kernel's candle call, `linalg_vector_norm` shares
+`norm.ScalarOpt_dim`'s walk) — four entries, four kernels, +4.
 
 **Honorable mentions still open, one vote each** (`linalg_vector_norm`, `squeeze.default` and
 `linspace` were promoted into §0.1 above and are no longer listed here). The original text of the
@@ -214,18 +238,28 @@ fails and has to be re-ranked rather than quietly describing a closed gap. That 
 failure mode this file exists to break: the last demand list went stale and the queue
 was fed by ad-hoc probes instead, one of which misclassified fifteen names.
 
-**It worked, on 2026-09-02.** Three of the five markers below failed on the round that
+**It worked, on 2026-09-02, twice.** Three of the five markers below failed on the round that
 implemented them, and failing is what forced §0 to be re-ranked instead of being left
 describing gaps that had closed. The three that closed are now asserted **present** — the
 same mechanism pointed the other way, so that a regression (a kernel removed, or removed
-from `_aten_implemented()`) fails here too. The two still open keep their original
-`op-not-implemented` markers and will fail the day they land, which is the point.
+from `_aten_implemented()`) fails here too.
+
+**It worked a second time the same day (docs/DEMAND2.md).** The two markers that were still
+open — `linalg_vector_norm.default` and `squeeze.default` — both failed the moment their
+kernels landed, exactly as designed, and are flipped below. `squeeze.dims` and
+`torch.linspace` never had markers of their own (the previous round did not add one for
+`linspace`, and `squeeze.dims` was not yet distinguished from `.default`); both get one now,
+so a regression in either fails here too rather than only in `_aten_implemented()`'s own count.
 
 Closed — asserted present now:
 
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
 <!-- DOCWATCH: op-implemented aten.full_like.default -->
 <!-- DOCWATCH: op-implemented aten.new_zeros.default -->
+<!-- DOCWATCH: op-implemented aten.linalg_vector_norm.default -->
+<!-- DOCWATCH: op-implemented aten.squeeze.default -->
+<!-- DOCWATCH: op-implemented aten.squeeze.dims -->
+<!-- DOCWATCH: op-implemented aten.linspace.default -->
 
 The two spellings that closed have no kernel of their own to assert, so they are pinned by
 name against upstream instead — the same check `hasattr gelu false` makes elsewhere, in the
@@ -234,10 +268,9 @@ other direction:
 <!-- DOCWATCH: hasattr as_tensor true -->
 <!-- DOCWATCH: hasattr meshgrid true -->
 
-Still open — asserted absent, and §0.1 is the queue:
-
-<!-- DOCWATCH: op-not-implemented aten.linalg_vector_norm.default -->
-<!-- DOCWATCH: op-not-implemented aten.squeeze.default -->
+Nothing is still open under this mechanism: rank 1 (§0.1) is a structural refusal inside
+PyO3's `#[new]` slot, not a missing aten kernel, so there is no `_aten_implemented()` name for
+a marker to watch yet.
 
 ### Found while closing rank 1, and not ranked because no model asked for it yet
 

@@ -127,6 +127,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.le.Tensor",
     "aten.leaky_relu.default",
     "aten.lift_fresh.default",
+    "aten.linalg_vector_norm.default",
+    "aten.linspace.default",
     "aten.log.default",
     "aten.log2.default",
     "aten.log2_.default",
@@ -197,7 +199,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.split_with_sizes.default",
     "aten.sqrt.default",
     "aten.sqrt_.default",
+    "aten.squeeze.default",
     "aten.squeeze.dim",
+    "aten.squeeze.dims",
     "aten.stack.default",
     "aten.sub.Scalar",
     "aten.sub.Tensor",
@@ -1362,6 +1366,7 @@ fn aten_dispatch_inner(
         "aten.div.Tensor" => arith_tensor(py, args, kwargs, "aten.div.Tensor", Arith::Div),
         "aten.div.Scalar" => arith_scalar(py, args, kwargs, "aten.div.Scalar", Arith::Div),
         "aten.norm.ScalarOpt_dim" => norm_scalaropt_dim(py, args, kwargs),
+        "aten.linalg_vector_norm.default" => linalg_vector_norm_default(py, args, kwargs),
         "aten._weight_norm_interface.default" => weight_norm_interface_default(py, args, kwargs),
         "aten.div.Tensor_mode" => div_mode(py, args, kwargs, "aten.div.Tensor_mode", false),
         "aten.div.Scalar_mode" => div_mode(py, args, kwargs, "aten.div.Scalar_mode", true),
@@ -1454,7 +1459,9 @@ fn aten_dispatch_inner(
         "aten.permute.default" => permute_default(py, args, kwargs),
         "aten.t.default" => t_default(py, args, kwargs),
         "aten.unsqueeze.default" => unsqueeze_default(py, args, kwargs),
+        "aten.squeeze.default" => squeeze_default(py, args, kwargs),
         "aten.squeeze.dim" => squeeze_dim(py, args, kwargs),
+        "aten.squeeze.dims" => squeeze_dims(py, args, kwargs),
         "aten.split.Tensor" => split_tensor(py, args, kwargs),
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
         "aten.clone.default" => clone_default(py, args, kwargs),
@@ -1509,6 +1516,7 @@ fn aten_dispatch_inner(
         "aten.log.default" => unary_float(py, args, kwargs, "aten.log.default", Unary::Log),
         "aten.log2.default" => log2_default(py, args, kwargs),
         "aten.leaky_relu.default" => leaky_relu_default(py, args, kwargs),
+        "aten.linspace.default" => linspace_default(py, args, kwargs),
         "aten.expm1.default" => expm1_default(py, args, kwargs),
         // `bert`'s wall: `F.pad` on a bias while the model is being built.
         "aten.constant_pad_nd.default" => constant_pad_nd(py, args, kwargs),
@@ -3640,6 +3648,185 @@ fn arange_length(
         (((fe - fs) / fd).ceil()).max(0.0) as i64
     };
     Ok(n as usize)
+}
+
+/// `aten::linspace(Scalar start, Scalar end, int steps, *, ScalarType?
+///     dtype=None, Layout? layout=None, Device? device=None, bool?
+///     pin_memory=None) -> Tensor`
+///
+/// docs/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
+/// rate schedule, a construction-time wall rather than a forward one. Leaf
+/// upstream (`RangeFactoriesKernel.cpp::linspace_kernel`, fetched and read
+/// rather than guessed, since three of its details are easy to get wrong by
+/// reasoning alone):
+///
+/// * **`steps=0` is not an error -- it answers the empty tensor.** `steps<0`
+///   is upstream's own `"number of steps must be non-negative"`. `steps=1`
+///   answers `[start]` (measured: `linspace(3, 999, 1) == [3.0]`, `end`
+///   never contributes).
+/// * **The default dtype is always the default float dtype**, never
+///   `int64` the way `arange`'s all-integral rule would suggest --
+///   `linspace(0, 10, 5)` is `float32` even though every argument is an
+///   `int`. `dtype=torch.int64` is accepted and **truncates toward zero,
+///   not rounds** (`linspace(0, 9, 5, dtype=int64) == [0, 2, 4, 6, 9]`, from
+///   the exact schedule `0, 2.25, 4.5, 6.75, 9`).
+/// * **The endpoint is exact by construction, not by luck.** Upstream fills
+///   the first half of the output forward from `start` (`start +
+///   step*i`) and the second half *backward* from `end` (`end -
+///   step*(steps-1-i)`), split at `steps/2`, specifically so `end` never
+///   accumulates floating error over `steps-1` additions. The `Float`/
+///   `Double` arms fold each half's multiply-add into one hardware fused
+///   op -- measured: a plain `start + step*i` in matching precision
+///   disagrees with upstream on the least-significant bit often enough
+///   that a golden case would catch it, and `f32`/`f64::mul_add` (this
+///   shim's own FMA) does not. `Half`/`BFloat16` do **not** get this
+///   treatment: `at::Half`/`at::BFloat16` arithmetic promotes to `f32` and
+///   narrows back on every single operator call rather than fusing, so
+///   those two use `float_narrower` after each individual step instead
+///   -- measured separately, the two conventions disagree at exactly the
+///   dtype boundary you would expect.
+fn linspace_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.linspace.default";
+    let start = scalar_arg(OP, args, kwargs, 0, "start")?.ok_or_else(|| missing(OP, "start"))?;
+    let end = scalar_arg(OP, args, kwargs, 1, "end")?.ok_or_else(|| missing(OP, "end"))?;
+    let steps = int_arg(args, kwargs, 2, "steps")?.ok_or_else(|| missing(OP, "steps"))?;
+    let dtype = dtype_arg(args, kwargs, 3, "dtype")?.unwrap_or_else(default_float);
+    reject_unsupported(OP, args, kwargs, &[(4, "layout"), (6, "pin_memory")])?;
+    let label = device_arg_or_label(args, kwargs, 5, "device", &PyDevice::cpu())?;
+
+    if steps < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "number of steps must be non-negative",
+        ));
+    }
+    if !linspace_has_cpu_kernel(dtype) {
+        return Err(not_implemented(format!(
+            "\"linspace_cpu\" not implemented for '{}'",
+            scalar_type_name(dtype)
+        )));
+    }
+    if label.is_meta() {
+        return meta_result(py, vec![steps as usize], dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(OP)?;
+    let n = steps as usize;
+
+    let tensor = if dtype.is_floating_point() {
+        let values = linspace_float_values(dtype, start.as_f64(), end.as_f64(), n);
+        Tensor::from_vec(values, n, &device)
+    } else {
+        let values = linspace_int_values(start.as_i64(), end.as_i64(), n);
+        Tensor::from_vec(values, n, &device)
+    }
+    .and_then(|t| t.fast_to(storage))
+    .map_err(|err| candle_err(OP, err))?;
+
+    finish(py, tensor, dtype)
+}
+
+/// Does torch have a `linspace_cpu` kernel for this dtype? Upstream's
+/// `AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16, ...)` leaves
+/// `Bool` and the wider unsigned integers this shim can store (`UInt16`,
+/// `UInt32`, `UInt64`) unregistered -- measured:
+/// `torch.linspace(0, 10, 5, dtype=torch.bool)` raises `"linspace_cpu" not
+/// implemented for 'Bool'`, the same wording reproduced here for the whole
+/// unregistered set.
+fn linspace_has_cpu_kernel(dtype: TorchDType) -> bool {
+    use TorchDType::*;
+    !matches!(dtype, Bool | UInt16 | UInt32 | UInt64 | Float8E4M3FN)
+}
+
+/// The `Float`/`Double`/`Half`/`BFloat16` arms of upstream's
+/// `linspace_kernel` -- see the doc comment on `linspace_default` for why
+/// the native two are `mul_add` and the reduced two are not. Returns widened
+/// `f64` throughout; every value produced is already exact at `dtype`'s own
+/// precision, so the final narrowing `linspace_default` does via `fast_to`
+/// is a lossless round-trip, not a second rounding.
+fn linspace_float_values(dtype: TorchDType, start: f64, end: f64, n: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![float_narrower(dtype)(start)];
+    }
+    let halfway = n / 2;
+    match dtype {
+        TorchDType::Float32 => {
+            let (s, e) = (start as f32, end as f32);
+            let step = (e - s) / (n as f32 - 1.0);
+            (0..n)
+                .map(|i| {
+                    if i < halfway {
+                        step.mul_add(i as f32, s) as f64
+                    } else {
+                        (-step).mul_add((n - i - 1) as f32, e) as f64
+                    }
+                })
+                .collect()
+        }
+        TorchDType::Float64 => {
+            let (s, e) = (start, end);
+            let step = (e - s) / (n as f64 - 1.0);
+            (0..n)
+                .map(|i| {
+                    if i < halfway {
+                        step.mul_add(i as f64, s)
+                    } else {
+                        (-step).mul_add((n - i - 1) as f64, e)
+                    }
+                })
+                .collect()
+        }
+        // `Half`/`BFloat16`: no fusion, narrowed after every single op --
+        // `at::Half`/`at::BFloat16`'s own arithmetic does the same.
+        other => {
+            let narrow = float_narrower(other);
+            let s = narrow(start);
+            let e = narrow(end);
+            let step = narrow(narrow(e - s) / narrow(n as f64 - 1.0));
+            (0..n)
+                .map(|i| {
+                    if i < halfway {
+                        narrow(s + narrow(step * i as f64))
+                    } else {
+                        narrow(e - narrow(step * (n - i - 1) as f64))
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// The integral arms: `step_t` is always `double` upstream regardless of the
+/// output's own width, and the per-element sum is truncated toward zero into
+/// the output type -- never rounded (measured: `linspace(0, 9, 5,
+/// dtype=int64)` includes `6`, not `7`, from the exact `6.75`). Kept in
+/// `i64` throughout and narrowed once by `linspace_default`'s `fast_to`,
+/// the same convention `arange`'s integral arm above uses.
+fn linspace_int_values(start: i64, end: i64, n: usize) -> Vec<i64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![start];
+    }
+    let halfway = n / 2;
+    let step = (end as f64 - start as f64) / (n as f64 - 1.0);
+    (0..n)
+        .map(|i| {
+            let v = if i < halfway {
+                step.mul_add(i as f64, start as f64)
+            } else {
+                (-step).mul_add((n - i - 1) as f64, end as f64)
+            };
+            v as i64
+        })
+        .collect()
 }
 
 /// `aten::ones(SymInt[] size, *, ScalarType? dtype=None, ...)` and
@@ -8636,22 +8823,60 @@ fn norm_scalaropt_dim(
             .map(|&d| normalise_dim(OP, d, rank))
             .collect::<PyResult<Vec<_>>>()?
     };
-    let mut seen = dims.clone();
-    seen.sort_unstable();
-    seen.dedup();
-    if seen.len() != dims.len() {
-        // Upstream names the first repeat, not the count.
-        let mut counted: Vec<usize> = Vec::new();
-        for d in &dims {
-            if counted.contains(d) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "dim {d} appears multiple times in the list of dims"
-                )));
-            }
-            counted.push(*d);
-        }
-    }
+    refuse_duplicate_dims(&dims)?;
+    let dims_set: Vec<bool> = (0..rank).map(|d| dims.contains(&d)).collect();
+    let tensor = norm_pow_walk(OP, t, tag, &dims_set, p, keepdim)?;
+    finish(py, tensor, tag)
+}
 
+/// Upstream's `dim {d} appears multiple times in the list of dims`, on
+/// **normalised** indices -- shared by `norm.ScalarOpt_dim`,
+/// `linalg_vector_norm.default` and `squeeze.dims`, all three of which raise
+/// this exact wording (measured on 2.13.0) for a repeated axis in a `dim`
+/// list, independent of whether the repeat is spelled the same way twice
+/// (`[0, 0]`) or as a positive/negative pair that normalises to the same axis
+/// (`[0, -4]`). Upstream's message does not name the calling op, so this
+/// takes none.
+fn refuse_duplicate_dims(dims: &[usize]) -> PyResult<()> {
+    let mut counted: Vec<usize> = Vec::new();
+    for d in dims {
+        if counted.contains(d) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "dim {d} appears multiple times in the list of dims"
+            )));
+        }
+        counted.push(*d);
+    }
+    Ok(())
+}
+
+/// The accumulate-in-`opmath` reduction walk `norm.ScalarOpt_dim` and
+/// `linalg_vector_norm.default` share (docs/DEMAND1.md §5, docs/DEMAND.md
+/// §0.1 rank 3): both compute the same six-arm `ord`/`p` family --
+///
+/// ```text
+///   p = 0      NormZeroOps    acc + (data == 0 ? 0 : 1)      project: acc
+///   p = 1      NormOneOps     acc + |data|                   project: acc
+///   p = 2      NormTwoOps     acc + data*data                project: sqrt(acc)
+///   p = +inf   AbsMaxOps      max(acc, |data|)               project: acc
+///   p = -inf   AbsMinOps      min(acc, |data|)               project: acc
+///   otherwise  NormOps        acc + pow(|data|, p)           project: pow(acc, 1/p)
+/// ```
+///
+/// `tag` is both the accumulate width (`float` for `Half`/`BFloat16`, the
+/// storage dtype otherwise -- upstream's `acc_t`) and the output storage
+/// dtype; a caller that promotes via `dtype=` passes the *target* dtype here,
+/// not the input's own. `dims_set` is already resolved and de-duplicated by
+/// the caller -- this function only runs the walk.
+fn norm_pow_walk(
+    op: &str,
+    t: &Tensor,
+    tag: TorchDType,
+    dims_set: &[bool],
+    p: f64,
+    keepdim: bool,
+) -> PyResult<Tensor> {
+    let rank = dims_set.len();
     // **The reduction is a walk, not a chain of candle reductions, and the
     // reason is `acc_t`.** Upstream's `norm_kernel_tensor_iterator_impl`
     // dispatches `norm_kernel_cpu_impl<scalar_t, acc_t>` with `acc_t = float`
@@ -8690,9 +8915,8 @@ fn norm_scalaropt_dim(
     // partial sums are formed in, and that order is part of the answer:
     // floating addition is not associative.
     let shape = t.dims().to_vec();
-    let dims_set: Vec<bool> = (0..rank).map(|d| dims.contains(&d)).collect();
     let device = t.device().clone();
-    let values = match read_flat(OP, t, tag)? {
+    let values = match read_flat(op, t, tag)? {
         Flat::Float(v) => v,
         Flat::Int(_) => unreachable!("the dtype was checked above"),
     };
@@ -8830,8 +9054,167 @@ fn norm_scalaropt_dim(
             .map(|(_, &extent)| extent)
             .collect()
     };
-    let tensor = write_flat(OP, Flat::Float(out_values), out_dims, &device, tag)?;
-    finish(py, tensor, tag)
+    write_flat(op, Flat::Float(out_values), out_dims, &device, tag)
+}
+
+/// `aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
+///     bool keepdim=False, *, ScalarType? dtype=None) -> Tensor`
+///
+/// docs/DEMAND.md §0.1 rank 3, measured in full in docs/DEMAND1.md §5. A
+/// **distinct leaf** from `aten.norm.ScalarOpt_dim` above -- upstream gives
+/// each its own dispatch registration -- but the same `ord`/`p` family, which
+/// is why this shares `norm_pow_walk` rather than re-deriving it.
+/// `F.normalize(v, p=2, dim=1)` fires this, `clamp_min.default`,
+/// `expand.default`, `div.Tensor` in that order; the other three were
+/// already implemented, so this one kernel closes `sentence_embed`.
+///
+/// Three ways it is not just `norm.ScalarOpt_dim` under a different name,
+/// each measured on 2.13.0:
+///
+/// * **`dim` is `int[1]?`, not `int[1]`.** Absent and an explicit `dim=[]`
+///   both mean "every axis", the same rule `norm.ScalarOpt_dim` applies when
+///   its always-present `dim` is `[]`.
+/// * **The dtype-mismatch wording is this op's own**: `"linalg.vector_norm:
+///   Expected a floating point or complex tensor as input. Got {name}"` --
+///   no trailing "instead." the way `norm()`'s does -- and it fires
+///   regardless of whether `dtype=` is also given (an `int64` input with
+///   `dtype=torch.float32` still refuses this way rather than promoting
+///   first).
+/// * **`dtype=` promotes before reducing**, and only *widening* is allowed
+///   (`refuse_narrowing_dtype` below).
+///
+/// **The empty-reduction split** (`ord=2` gives `0.0`, `ord=±inf` raises) is
+/// the one behaviour this op adds that the shared walk does not have on its
+/// own -- `norm.ScalarOpt_dim` was never measured against an empty tensor
+/// and is left as found, so the check lives here. Upstream's message has two
+/// shapes, chosen by whether `dim` was given as a *non-empty* list, not by
+/// whether the reduction happens to cover every axis:
+///
+/// ```text
+/// dim=None / dim=[]    , whole tensor empty -> "...on an empty tensor because..."
+/// dim=[..non-empty..]  , a named axis empty  -> "...on the dimension {raw}because..."
+/// ```
+///
+/// (`{raw}because`, no space -- upstream's own concatenation, transcribed
+/// rather than fixed.) The dimension **named is the first one in the
+/// *given* list order whose extent is 0, printed exactly as the caller
+/// spelled it** -- not normalised and not the smallest index: `dim=[2, 1]`
+/// on a `(2, 0, 0)` tensor names `2`; `dim=[-1, -2]` on the same shape names
+/// `-1`. An axis that is empty but not in the reduced set never raises --
+/// `linalg_vector_norm(zeros(0, 3), dim=[1])` answers the empty `(0,)`
+/// tensor with no error, because there are zero rows to compute over.
+fn linalg_vector_norm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.linalg_vector_norm.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let source_tag = input.tag();
+    if !source_tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "linalg.vector_norm: Expected a floating point or complex tensor as input. Got {}",
+            scalar_type_name(source_tag)
+        )));
+    }
+    let p = scalar_arg(OP, args, kwargs, 1, "ord")?
+        .map(|s| s.as_f64())
+        .unwrap_or(2.0);
+    // Raw, un-normalised: the empty-reduction error prints whatever the
+    // caller spelled, not the normalised axis (measured -- see the doc
+    // comment above).
+    let raw_dim: Option<Vec<isize>> = match optional(args, kwargs, 2, "dim")? {
+        Some(value) if !value.is_none() => Some(match value.extract::<Vec<isize>>() {
+            Ok(list) => list,
+            Err(_) => vec![value.extract::<isize>()?],
+        }),
+        _ => None,
+    };
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    let dtype = dtype_arg(args, kwargs, 4, "dtype")?;
+
+    let t = input.tensor()?;
+    let rank = t.rank();
+    let full_reduce = raw_dim.as_ref().map_or(true, |d| d.is_empty());
+    let dims: Vec<usize> = if full_reduce {
+        (0..rank).collect()
+    } else {
+        raw_dim
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|&d| normalise_dim(OP, d, rank))
+            .collect::<PyResult<Vec<_>>>()?
+    };
+    refuse_duplicate_dims(&dims)?;
+    let dims_set: Vec<bool> = (0..rank).map(|d| dims.contains(&d)).collect();
+
+    // The identity-less arms: `±inf` has no additive identity, so an empty
+    // reduction is refused rather than silently answering 0 the way the
+    // summing/counting arms do.
+    if p == f64::INFINITY || p == f64::NEG_INFINITY {
+        let ord_name = if p == f64::INFINITY { "inf" } else { "-inf" };
+        if full_reduce {
+            if t.elem_count() == 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "linalg.vector_norm cannot compute the {ord_name} norm on an empty \
+                     tensor because the operation does not have an identity"
+                )));
+            }
+        } else {
+            let shape = t.dims();
+            for &raw in raw_dim.as_ref().unwrap() {
+                let normalised = normalise_dim(OP, raw, rank)?;
+                let extent = if rank == 0 { 1 } else { shape[normalised] };
+                if extent == 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "linalg.vector_norm cannot compute the {ord_name} norm on the \
+                         dimension {raw}because this dimension is empty and the operation \
+                         does not have an identity"
+                    )));
+                }
+            }
+        }
+    }
+
+    let target_tag = match dtype {
+        Some(dtype) if dtype != source_tag => {
+            refuse_narrowing_dtype(source_tag, dtype)?;
+            dtype
+        }
+        _ => source_tag,
+    };
+
+    let tensor = norm_pow_walk(OP, t, target_tag, &dims_set, p, keepdim)?;
+    finish(py, tensor, target_tag)
+}
+
+/// Upstream's floating-point "no narrowing" rule for `linalg_vector_norm`'s
+/// `dtype=`, measured pairwise across the four floating dtypes this shim
+/// stores (`Half`, `BFloat16`, `Float`, `Double`) rather than assumed:
+/// `Half` and `BFloat16` are the same width and neither converts to the
+/// other without narrowing (both refuse); `Half`/`BFloat16` -> `Float` ->
+/// `Double` each widen and are allowed; every pairing that goes down that
+/// ladder, or sideways between `Half` and `BFloat16`, is refused with
+/// upstream's own wording.
+fn refuse_narrowing_dtype(source: TorchDType, target: TorchDType) -> PyResult<()> {
+    fn tier(tag: TorchDType) -> u8 {
+        match tag {
+            TorchDType::Float16 | TorchDType::BFloat16 => 1,
+            TorchDType::Float32 => 2,
+            TorchDType::Float64 => 3,
+            _ => 0,
+        }
+    }
+    if tier(target) > tier(source) {
+        return Ok(());
+    }
+    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "linalg.vector_norm: the dtype of the input ({}) should be convertible without \
+         narrowing to the specified dtype ({})",
+        scalar_type_name(source),
+        scalar_type_name(target)
+    )))
 }
 
 /// `aten::_weight_norm_interface(Tensor v, Tensor g, int dim=0)
@@ -11847,6 +12230,85 @@ fn squeeze_dim(
         .tensor()?
         .squeeze(dim)
         .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `aten::squeeze.default(Tensor(a) self) -> Tensor(a)`
+///
+/// docs/DEMAND.md §0.1 rank 2: `squeeze` is declared in both
+/// `overloads.json` and `methods.json` with three overloads --
+/// `squeeze()`, `.dim`, `.dims` -- but the dispatch `match` above only had
+/// an arm for `.dim`. The no-arg overload looked present in the name tables
+/// and was not reachable. `mbart`'s `shift_tokens_right` calls plain
+/// `squeeze()`.
+///
+/// Removes **every** axis of size 1, not just one -- measured:
+/// `squeeze(zeros(1,3,1,2)).shape == (3, 2)`. Squeezed from the last axis
+/// down so a removal never shifts the index of an axis not yet visited (the
+/// same convention `.dims` below uses). A 0-d tensor has nothing to remove
+/// and is returned unchanged.
+fn squeeze_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.squeeze.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let t = input.tensor()?;
+    let dims: Vec<usize> = t.dims().to_vec();
+    let mut out = t.clone();
+    for dim in (0..dims.len()).rev() {
+        if dims[dim] == 1 {
+            out = out.squeeze(dim).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    finish(py, out, input.tag())
+}
+
+/// `aten::squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)`
+///
+/// docs/DEMAND.md §0.1 rank 2 -- the other hole beside `squeeze.default`,
+/// same missing dispatch arm, checked while landing it.
+///
+/// Each named axis of size 1 is removed; a named axis whose size is not 1
+/// is a no-op, the same rule `.dim` carries for a single axis (measured:
+/// `squeeze(x, dim=(0,1))` on a `(1,3,1,2)` tensor, where axis 1 has size
+/// 3, removes only axis 0 and answers `(3,1,2)`). **An empty list is a
+/// no-op**, not "every axis" -- unlike `norm.ScalarOpt_dim` and
+/// `linalg_vector_norm` above, where an empty `dim` list means the
+/// opposite. A repeated axis -- even a positive/negative pair that
+/// normalises to the same one, `dim=(0,-4)` on a 4-d tensor -- raises
+/// upstream's own `dim {d} appears multiple times in the list of dims`,
+/// checked **before** any size is looked at (measured: `squeeze(x,
+/// dim=(1,1))` raises even though axis 1 is not size 1, and a 0-d tensor's
+/// `dim=(0,0)` raises too). A 0-d tensor otherwise accepts `dim=(0,)` or
+/// `dim=(-1,)` (torch treats a 0-d tensor as one-dimensional for indexing)
+/// and answers itself unchanged.
+fn squeeze_dims(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.squeeze.dims";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let raw = shape_arg(OP, args, kwargs, 1, "dim")?;
+    let dims: Vec<usize> = raw
+        .iter()
+        .map(|&d| normalise_dim(OP, d, rank))
+        .collect::<PyResult<Vec<_>>>()?;
+    refuse_duplicate_dims(&dims)?;
+    if rank == 0 {
+        return finish(py, input.tensor()?.clone(), input.tag());
+    }
+    let t = input.tensor()?;
+    let shape = t.dims();
+    let mut to_remove: Vec<usize> = dims.into_iter().filter(|&d| shape[d] == 1).collect();
+    to_remove.sort_unstable();
+    let mut out = t.clone();
+    for dim in to_remove.into_iter().rev() {
+        out = out.squeeze(dim).map_err(|e| candle_err(OP, e))?;
+    }
     finish(py, out, input.tag())
 }
 

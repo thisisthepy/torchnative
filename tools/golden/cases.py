@@ -1382,6 +1382,118 @@ def arange_start_step_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.linspace.default ----------------------------------------------------
+#
+# docs/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
+# rate schedule, a construction-time wall. Leaf upstream
+# (`RangeFactoriesKernel.cpp::linspace_kernel`, fetched and read). Three
+# things this suite exists to pin down, each measured rather than assumed:
+#
+#   * `steps=0` answers empty, not an error; `steps<0` refuses; `steps=1`
+#     answers `[start]` and never reads `end`.
+#   * the default dtype is always the default float dtype, never `int64` the
+#     way `arange`'s all-integral rule would suggest, and an explicit integer
+#     dtype **truncates toward zero**, not rounds.
+#   * the endpoint is exact: upstream fills forward from `start` and
+#     *backward* from `end`, split at `steps // 2`, specifically so `end`
+#     never drifts over `steps - 1` additions -- `value_check=_bit_exact`
+#     below is what a naive single-direction accumulation would fail.
+
+
+def linspace_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.linspace.default"
+    cases: list[Case] = []
+
+    for start, end, steps, note in [
+        (0, 10, 5, "the textbook case"),
+        (0, 10, 1, "steps=1 answers [start]; end is never read"),
+        (0, 10, 0, "steps=0 answers the empty tensor, not an error"),
+        (3, 999, 1, "steps=1 ignores end even when it is far away"),
+        (3, 3, 5, "start == end -> every element the same"),
+        (-9, 0, 5, "negative start"),
+        (0.1, 0.3, 7, "a step that is not exactly representable"),
+        (-100, 100, 257, "many steps, so the forward/backward split is exercised"),
+    ]:
+        cases.append(
+            Case(
+                name=f"linspace(start={start}, end={end}, steps={steps}) [{note}]",
+                op=op,
+                run_torch=lambda start=start, end=end, steps=steps: torch_call(start, end, steps),
+                run_c=lambda start=start, end=end, steps=steps: c_module._aten_dispatch(
+                    op, start, end, steps
+                ),
+                value_check=_bit_exact,
+                note=note,
+            )
+        )
+
+    cases.append(
+        Case(
+            name="linspace(start=0, end=10, steps=-1, rejected)",
+            op=op,
+            run_torch=lambda: torch_call(0, 10, -1),
+            run_c=lambda: c_module._aten_dispatch(op, 0, 10, -1),
+            expect="both_error",
+            note="upstream: 'number of steps must be non-negative'",
+        )
+    )
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        cases.append(
+            Case(
+                name=f"linspace(start=0.1, end=0.3, steps=7, dtype={dtype_name})",
+                op=op,
+                run_torch=lambda t_dt=t_dt: torch_call(0.1, 0.3, 7, dtype=t_dt),
+                run_c=lambda c_dt=c_dt: c_module._aten_dispatch(op, 0.1, 0.3, 7, dtype=c_dt),
+                value_check=_bit_exact,
+                note="Float/Double fold each half's multiply-add into one hardware FMA "
+                "(matching the compiler's contraction of upstream's literal "
+                "`a + b*c`); Half/BFloat16 do not fuse -- they narrow after every "
+                "single operator call, the same as at::Half/at::BFloat16 arithmetic",
+            )
+        )
+
+    for dtype_name in ["int64", "int32", "int16", "uint8"]:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        cases.append(
+            Case(
+                name=f"linspace(start=0, end=9, steps=5, dtype={dtype_name})",
+                op=op,
+                run_torch=lambda t_dt=t_dt: torch_call(0, 9, 5, dtype=t_dt),
+                run_c=lambda c_dt=c_dt: c_module._aten_dispatch(op, 0, 9, 5, dtype=c_dt),
+                note="the exact schedule is 0, 2.25, 4.5, 6.75, 9 -- truncated toward "
+                "zero to [0, 2, 4, 6, 9], not rounded to [0, 2, 5, 7, 9]",
+            )
+        )
+    cases.append(
+        Case(
+            name="linspace(start=-9, end=0, steps=5, dtype=int64) [negative values]",
+            op=op,
+            run_torch=lambda: torch_call(-9, 0, 5, dtype=dt.torch_dtype(torch_module, "int64")),
+            run_c=lambda: c_module._aten_dispatch(
+                op, -9, 0, 5, dtype=dt.c_dtype(c_module, "int64")
+            ),
+            note="truncation toward zero, not floor: -6.75 -> -6",
+        )
+    )
+    cases.append(
+        Case(
+            name="linspace(start=0, end=10, steps=5, dtype=bool) [both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(0, 10, 5, dtype=dt.torch_dtype(torch_module, "bool")),
+            run_c=lambda: c_module._aten_dispatch(
+                op, 0, 10, 5, dtype=dt.c_dtype(c_module, "bool")
+            ),
+            expect="both_error",
+            note="upstream: linspace_cpu not implemented for Bool",
+        )
+    )
+    return cases
+
+
 # --- aten.amax.default -------------------------------------------------------
 #
 # `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor` -- the
@@ -3628,6 +3740,320 @@ def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, r_c, 2, [0, 0], False),
             expect="both_error",
             note="upstream: 'dim 0 appears multiple times in the list of dims'",
+        )
+    )
+    return cases
+
+
+# --- aten.linalg_vector_norm.default -----------------------------------------
+#
+# docs/DEMAND.md §0.1 rank 3 -- `sentence_embed`'s `F.normalize`. A distinct
+# leaf from `aten.norm.ScalarOpt_dim` above (`_dispatch_has_kernel_for_dispatch_key`
+# is `False` for this key too, measured), spelled
+# `torch._C._linalg.linalg_vector_norm`, not `torch.<name>`. The kernel shares
+# `norm_pow_walk` with `norm.ScalarOpt_dim` (docs/DEMAND1.md §5, §7), so this
+# suite is deliberately smaller than that one's dtype-accumulation sweep --
+# the walk itself is already pinned there -- and concentrates on the four
+# ways this op is not just `norm.ScalarOpt_dim` under a different name:
+# `dim` is optional (`None` and `[]` both mean "every axis"), the
+# dtype-mismatch wording is its own, `dtype=` promotes (and refuses to
+# narrow), and an empty reduction is a **refusal** at `ord=+-inf` rather than
+# always answering `0.0`.
+
+_LVN_ORDS = [2, 1, 0, 3, 0.5, -1, -2, float("inf"), float("-inf")]
+
+
+def linalg_vector_norm_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.linalg_vector_norm.default"
+    cases: list[Case] = []
+
+    # The six-arm `ord` family, across `dim=None` (the real default -- no
+    # argument at all, not even an empty list) and a handful of explicit
+    # dims, keepdim both ways.
+    flat = [3.0, -4.0, 0.0, 1.0, -1.0, 2.0]
+    a_t, a_c = pair_from_flat(torch_module, c_module, flat, (2, 3), "float32")
+    for ordv in _LVN_ORDS:
+        for dim, keepdim in [
+            (None, False),
+            (None, True),
+            ([0], False),
+            ([1], True),
+            ([-1], False),
+            ([0, 1], False),
+            ([], False),
+        ]:
+            if dim is None:
+                run_torch = lambda ordv=ordv: torch_call(a_t, ordv)
+                run_c = lambda ordv=ordv: c_module._aten_dispatch(op, a_c, ordv)
+            else:
+                run_torch = lambda ordv=ordv, dim=dim, k=keepdim: torch_call(
+                    a_t, ordv, list(dim), k
+                )
+                run_c = lambda ordv=ordv, dim=dim, k=keepdim: c_module._aten_dispatch(
+                    op, a_c, ordv, list(dim), k
+                )
+            cases.append(
+                Case(
+                    name=f"linalg_vector_norm(float32, ord={ordv!r}, dim={dim}, "
+                    f"keepdim={keepdim})",
+                    op=op,
+                    run_torch=run_torch,
+                    run_c=run_c,
+                    note="dim=None (no argument) and dim=[] both reduce every axis",
+                )
+            )
+
+    # `dtype=` promotes before reducing, and only widening is allowed.
+    for src, dst in [
+        ("float32", "float64"),
+        ("float16", "float32"),
+        ("bfloat16", "float32"),
+    ]:
+        s_t, s_c = pair_from_flat(torch_module, c_module, flat, (2, 3), src)
+        dst_dtype_t = dt.torch_dtype(torch_module, dst)
+        dst_dtype_c = dt.c_dtype(c_module, dst)
+        cases.append(
+            Case(
+                name=f"linalg_vector_norm({src} -> dtype={dst}, ord=2, dim=[1])",
+                op=op,
+                run_torch=lambda s_t=s_t, d=dst_dtype_t: torch_call(
+                    s_t, 2, [1], False, dtype=d
+                ),
+                run_c=lambda s_c=s_c, d=dst_dtype_c: c_module._aten_dispatch(
+                    op, s_c, 2, [1], False, dtype=d
+                ),
+                note="dtype= promotes before reducing",
+            )
+        )
+    for src, dst in [
+        ("float64", "float32"),
+        ("float32", "bfloat16"),
+        ("float16", "bfloat16"),
+        ("bfloat16", "float16"),
+    ]:
+        n_t, n_c = pair_from_flat(torch_module, c_module, flat, (2, 3), src)
+        dst_dtype_t = dt.torch_dtype(torch_module, dst)
+        dst_dtype_c = dt.c_dtype(c_module, dst)
+        cases.append(
+            Case(
+                name=f"linalg_vector_norm({src} -> dtype={dst}) [narrowing, both refuse]",
+                op=op,
+                run_torch=lambda n_t=n_t, d=dst_dtype_t: torch_call(
+                    n_t, 2, [1], False, dtype=d
+                ),
+                run_c=lambda n_c=n_c, d=dst_dtype_c: c_module._aten_dispatch(
+                    op, n_c, 2, [1], False, dtype=d
+                ),
+                expect="both_error",
+                note="upstream: 'the dtype of the input (...) should be convertible "
+                "without narrowing to the specified dtype (...)' -- Half and "
+                "BFloat16 refuse each other despite being the same width",
+            )
+        )
+
+    # Integral and boolean input raise on both sides, with this op's OWN
+    # wording -- not norm()'s.
+    for dtype_name in ("int64", "bool"):
+        i_t, i_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 1], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"linalg_vector_norm({dtype_name}) [both refuse]",
+                op=op,
+                run_torch=lambda i_t=i_t: torch_call(i_t, 2),
+                run_c=lambda i_c=i_c: c_module._aten_dispatch(op, i_c, 2),
+                expect="both_error",
+                note="upstream: 'linalg.vector_norm: Expected a floating point or "
+                "complex tensor as input. Got Long' -- no 'instead.' the way "
+                "norm()'s wording has",
+            )
+        )
+
+    # A repeated dim raises on both sides, same wording as norm.ScalarOpt_dim.
+    r_t, r_c = pair_from_flat(torch_module, c_module, flat, (2, 3), "float32")
+    cases.append(
+        Case(
+            name="linalg_vector_norm(float32, dim=[0, -2]) [repeated dim, both refuse]",
+            op=op,
+            run_torch=lambda: torch_call(r_t, 2, [0, -2], False),
+            run_c=lambda: c_module._aten_dispatch(op, r_c, 2, [0, -2], False),
+            expect="both_error",
+            note="upstream: 'dim 0 appears multiple times in the list of dims' -- "
+            "0 and -2 normalise to the same axis on a rank-2 tensor",
+        )
+    )
+
+    # The empty-reduction split: ord=2 is 0.0, ord=+-inf refuses -- and
+    # refuses with upstream's OTHER message shape when dim is a non-empty
+    # list naming the empty axis.
+    e_t, e_c = pair_from_flat(torch_module, c_module, [], (2, 0), "float32")
+    cases.append(
+        Case(
+            name="linalg_vector_norm(float32, (2,0) empty, ord=2, dim=[1])",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 2, [1], False),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 2, [1], False),
+            note="an empty reduction under ord=2 is 0.0, the same identity norm() has",
+        )
+    )
+    for ordv in (float("inf"), float("-inf")):
+        cases.append(
+            Case(
+                name=f"linalg_vector_norm(float32, (2,0) empty, ord={ordv!r}, "
+                f"dim=[1]) [both refuse]",
+                op=op,
+                run_torch=lambda ordv=ordv: torch_call(e_t, ordv, [1], False),
+                run_c=lambda ordv=ordv: c_module._aten_dispatch(op, e_c, ordv, [1], False),
+                expect="both_error",
+                note="upstream: 'linalg.vector_norm cannot compute the ... norm on "
+                "the dimension 1because this dimension is empty and the operation "
+                "does not have an identity' -- a non-empty dim list names the axis",
+            )
+        )
+        cases.append(
+            Case(
+                name=f"linalg_vector_norm(float32, (2,0) empty, ord={ordv!r}, "
+                f"dim=None) [both refuse]",
+                op=op,
+                run_torch=lambda ordv=ordv: torch_call(e_t, ordv),
+                run_c=lambda ordv=ordv: c_module._aten_dispatch(op, e_c, ordv),
+                expect="both_error",
+                note="upstream: '...on an empty tensor because...' -- no dim number "
+                "when dim was never given (or given as [])",
+            )
+        )
+    return cases
+
+
+# --- aten.squeeze.default / aten.squeeze.dims --------------------------------
+#
+# docs/DEMAND.md §0.1 rank 2, the GOLDEN.md blind-spot shape: `squeeze` is
+# declared in both `overloads.json` and `methods.json` with three overloads
+# -- `squeeze()`, `.dim` (above), `.dims` -- but the dispatch `match` had an
+# arm only for `.dim`. Both the no-arg overload and the multi-dim list
+# overload looked present in the name tables and were not reachable.
+# `mbart`'s `shift_tokens_right` calls plain `squeeze()`; `.dims` had the
+# identical hole, found while landing `.default`, not called by any measured
+# model.
+
+
+def squeeze_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.squeeze.default"
+    cases: list[Case] = []
+    flat, shape = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (1, 3, 1, 2)
+    for shape_, flat_, note in [
+        (shape, flat, "two size-1 dims, both removed"),
+        ((3, 2), flat, "no size-1 dims -- unchanged"),
+        ((1, 1, 1), [7.0], "every dim size 1 -- fully squeezed to 0-d"),
+        ((), [5.0], "already 0-d -- unchanged"),
+    ]:
+        cases.append(
+            Case(
+                name=f"squeeze({shape_}) [{note}]",
+                op=op,
+                run_torch=lambda shape_=shape_, flat_=flat_: torch_call(
+                    _pair(torch_module, c_module, flat_, shape_, "float32")[0]
+                ),
+                run_c=lambda shape_=shape_, flat_=flat_: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat_, shape_, "float32")[1]
+                ),
+                note=note,
+            )
+        )
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        cases.append(
+            Case(
+                name=f"squeeze(dtype={dtype_name}, {shape})",
+                op=op,
+                run_torch=lambda dtype_name=dtype_name: torch_call(
+                    _pair(torch_module, c_module, flat, shape, dtype_name)[0]
+                ),
+                run_c=lambda dtype_name=dtype_name: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, dtype_name)[1]
+                ),
+                note="mbart's shift_tokens_right calls plain squeeze()",
+            )
+        )
+    return cases
+
+
+def squeeze_dims_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.squeeze.dims"
+    cases: list[Case] = []
+    flat, shape = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (1, 3, 1, 2)
+    for dims, note in [
+        ((0,), "one of the two size-1 dims"),
+        ((0, 2), "both size-1 dims removed"),
+        ((0, 1), "dim 1 has size 3 -- a partial no-op, only dim 0 removed"),
+        ((-4, -2), "the same two dims, addressed negatively"),
+        ((), "empty list -- a no-op, NOT every axis (unlike norm/linalg_vector_norm)"),
+    ]:
+        cases.append(
+            Case(
+                name=f"squeeze({shape}, dim={dims}) [{note}]",
+                op=op,
+                run_torch=lambda dims=dims: torch_call(
+                    _pair(torch_module, c_module, flat, shape, "float32")[0], list(dims)
+                ),
+                run_c=lambda dims=dims: c_module._aten_dispatch(
+                    op, _pair(torch_module, c_module, flat, shape, "float32")[1], list(dims)
+                ),
+                note=note,
+            )
+        )
+    cases.append(
+        Case(
+            name="squeeze(0-d, dim=(0,)) [torch accepts dim 0 and -1 on a 0-d tensor]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, [5.0], (), "float32")[0], [0]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, [5.0], (), "float32")[1], [0]
+            ),
+            note="nothing to remove, so the 0-d tensor comes back unchanged",
+        )
+    )
+    cases.append(
+        Case(
+            name="squeeze(dim out of range rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, flat, shape, "float32")[0], [0, 9]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, flat, shape, "float32")[1], [0, 9]
+            ),
+            expect="both_error",
+            note="IndexError on both sides",
+        )
+    )
+    cases.append(
+        Case(
+            name="squeeze(dim=(1, 1)) [repeated dim, both refuse -- checked BEFORE size]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, flat, shape, "float32")[0], [1, 1]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, flat, shape, "float32")[1], [1, 1]
+            ),
+            expect="both_error",
+            note="dim 1 has size 3, not 1 -- the duplicate is refused before that is ever "
+            "looked at, so this does NOT silently no-op",
+        )
+    )
+    cases.append(
+        Case(
+            name="squeeze(dim=(0, -4)) [repeated dim via a positive/negative pair]",
+            op=op,
+            run_torch=lambda: torch_call(
+                _pair(torch_module, c_module, flat, shape, "float32")[0], [0, -4]
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, _pair(torch_module, c_module, flat, shape, "float32")[1], [0, -4]
+            ),
+            expect="both_error",
+            note="0 and -4 normalise to the same axis on this rank-4 tensor",
         )
     )
     return cases
@@ -22010,6 +22436,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.arange.default": arange_default_cases,
     "aten.arange.start": arange_start_cases,
     "aten.arange.start_step": arange_start_step_cases,
+    "aten.linspace.default": linspace_default_cases,
     "aten.argmax.default": argmax_cases,
     "aten.cat.default": cat_cases,
     "aten.embedding.default": embedding_cases,
@@ -22033,6 +22460,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.div.Scalar_mode": _div_mode_scalar_cases,
     "aten.div.Tensor_mode": _div_mode_tensor_cases,
     "aten.norm.ScalarOpt_dim": norm_scalaropt_dim_cases,
+    "aten.linalg_vector_norm.default": linalg_vector_norm_default_cases,
     "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
@@ -22103,6 +22531,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.scatter.src": scatter_src_cases,
     "aten.sort.default": sort_cases,
     "aten.squeeze.dim": squeeze_dim_cases,
+    "aten.squeeze.default": squeeze_default_cases,
+    "aten.squeeze.dims": squeeze_dims_cases,
     "aten.topk.default": topk_cases,
     # The four docs/GPT2.md measured a 2-layer GPT-2 stopping on, after the
     # Llama-shaped work had already cleared everything else.
