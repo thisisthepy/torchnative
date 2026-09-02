@@ -5945,6 +5945,48 @@ def test_capture_refuses_in_place_ops():
         assert "in place" in got, (op, got)
 
 
+def test_capture_refuses_the_new_inplace_spellings_by_dispatch_key():
+    """docs/SPELLINGS.md §9's six real gaps, at the raw `_aten_dispatch` level.
+
+    `capture.rs`'s `is_mutating` keys off the op name ending in `_` (before
+    the last `.`), not off which Python door reached it (docs/CAPTURE.md), so
+    opening `torch.<name>`/`Tensor.<name>` doors onto these kernels needed no
+    `capture.rs` change. This is the raw-dispatch half of the measurement
+    that confirms that rather than assumes it -- `masked_fill.Scalar` is the
+    control: it is one of the same six names but does not mutate, so it must
+    NOT be refused, and a change to `is_mutating` broad enough to refuse
+    everything would still fail this half of the test.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.0, 2.0, 3.0, 4.0])
+    idx = _C._tensor_new_from_data([0])
+    vals = _C._tensor_new_from_data([9.0])
+    mask = _C._tensor_new_from_data([True, False, True, False])
+
+    for op, args in (
+        ("aten.exp_.default", (a,)),
+        ("aten.neg_.default", (a,)),
+        # `min`/`max` both `None` raises before the op ever mutates or gets
+        # near capture (measured -- `aten.rs`'s own "at least one of 'min'
+        # or 'max'" check), which would leave capture stuck active rather
+        # than poisoned if hit here. A real bound keeps this on the path
+        # `_capture_refusal` expects: mutate, then get poisoned at `record`.
+        ("aten.clamp_.default", (a, -2.0, 2.0)),
+        ("aten.fill_.Scalar", (a, 1.0)),
+        ("aten.index_put_.default", (a, [idx], vals, False)),
+    ):
+        got = _capture_refusal(lambda op=op, args=args: d(op, *args), [a])
+        assert op in got, (op, got)
+        assert "in place" in got, (op, got)
+
+    # Control: masked_fill.Scalar is out-of-place and must record cleanly.
+    _C._capture_begin([a])
+    out = d("aten.masked_fill.Scalar", a, mask, 5.0)
+    trace = _C._capture_end(out)
+    ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
+    assert ops == ["aten.masked_fill.Scalar"], ops
+
+
 def test_capture_refuses_ops_that_draw_random_numbers():
     """A replay that does not equal eager cannot be checked against eager.
 
@@ -17432,6 +17474,224 @@ def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
         assert "snapshot" in r[door], (door, r[door])
     assert r["meta_storage"], "a meta tensor handed out a storage"
     assert r["storage_pickle"], "a storage pickled itself"
+
+
+# --- docs/SPELLINGS.md §9: six real spelling gaps out of 18 alleged ---------
+#
+# The coordinating session's own probe flagged 18 names as "neither
+# `torch.<name>(...)` nor `tensor.<name>(...)` work". Measured against
+# `aten.rs`'s `IMPLEMENTED`/`IMPLEMENTED_AWAITING_GOLDEN` constants directly
+# (not through a second probe), 16 of those 18 have no kernel at all --
+# `abs_ ceil_ clamp_min_ cos_ detach_ erf_ expm1_ log2_ log_ reciprocal_
+# rsqrt_ sigmoid_ sin_ sqrt_ tanh_ native_group_norm` -- so filling a
+# spelling for them would resolve to a key `aten.rs` still refuses, moving
+# the error rather than closing it. `test_spellings_9_the_16_kernel_less_names_still_refuse_by_exact_key`
+# below is the guard that a later round adding a kernel without a spelling
+# still shows up as a refusal here, and that this round did not quietly grow
+# the 16 into 17 by mistake.
+#
+# The other two -- `masked_fill` and `index_put_` -- had kernels but were
+# measured with `methods.json` already carrying `masked_fill`/`clamp_`/
+# `exp_`/`fill_`/`neg_` (so `tensor.<name>(...)` already worked for five of
+# the six real gaps; only `torch.<name>(...)` was closed for those five).
+# `index_put_` had neither door, and its schema's `indices: Tensor?[]`
+# cannot be expressed by `overloads.json`/`methods.json` at all (§8.2's find
+# on the stale checkout, reconfirmed on this tree in the sections below), so
+# it is a `bootstrap.py` composite on both doors rather than a table entry.
+_SPELLINGS_9_ROAD_SCRIPT = r"""
+import json, math, sys
+import torch
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+def refused(key, thunk):
+    try:
+        thunk()
+    except NotImplementedError as e:
+        out[key] = f"refused:{e}"
+    else:
+        out[key] = "ACCEPTED"
+
+d = torch._C._aten_dispatch
+
+# --- masked_fill: function door was missing, method door already worked ---
+base = torch.tensor([1.0, 2.0, 3.0, 4.0])
+mask = torch.tensor([True, False, True, False])
+rec("masked_fill_fn_scalar", lambda: torch.masked_fill(base, mask, -9.0).tolist())
+rec("masked_fill_fn_scalar_base_unchanged", lambda: base.tolist())
+rec("masked_fill_fn_tensor", lambda: torch.masked_fill(base, mask, torch.tensor(2.5)).tolist())
+rec("masked_fill_member", lambda: base.masked_fill(mask, -9.0).tolist())
+rec(
+    "masked_fill_fn_matches_raw",
+    lambda: torch.masked_fill(base, mask, -9.0).tolist()
+    == d("aten.masked_fill.Scalar", base, mask, -9.0).tolist(),
+)
+
+# --- clamp_: function door was missing, method door already worked -------
+c = torch.tensor([-5.0, 0.0, 5.0, 10.0])
+rec("clamp__fn", lambda: torch.clamp_(c.clone(), min=-2.0, max=2.0).tolist())
+rec("clamp__member", lambda: c.clone().clamp_(min=-2.0, max=2.0).tolist())
+# The bare no-arg call resolves to `clamp_.Tensor`, which has no kernel
+# (`aten.clamp_.default` is the only one that does) -- still refused by that
+# exact key, unchanged by this round (docs/SPELLINGS.md §7.2/§8.1).
+refused("clamp__noargs_fn", lambda: torch.clamp_(c.clone()))
+
+# --- exp_: function door was missing, method door already fully worked ---
+e = torch.tensor([1.0, 2.0, -3.0, 4.0])
+rec("exp__fn", lambda: torch.exp_(e.clone()).tolist())
+rec("exp__member", lambda: e.clone().exp_().tolist())
+
+# --- fill_: function door was missing, method door already worked --------
+f = torch.tensor([1.0, 2.0, 3.0, 4.0])
+rec("fill__fn_scalar", lambda: torch.fill_(f.clone(), 7.0).tolist())
+rec("fill__fn_tensor", lambda: torch.fill_(f.clone(), torch.tensor(3.0)).tolist())
+rec("fill__member", lambda: f.clone().fill_(7.0).tolist())
+
+# --- neg_: function door was missing, method door already fully worked ---
+n = torch.tensor([1.0, -2.0, 3.0, -4.0])
+rec("neg__fn", lambda: torch.neg_(n.clone()).tolist())
+rec("neg__member", lambda: n.clone().neg_().tolist())
+
+# --- index_put_: neither door existed; both are bootstrap.py composites --
+p = torch.tensor([1.0, 2.0, 3.0, 4.0])
+idx = torch.tensor([0, 2])
+vals = torch.tensor([9.0, 8.0])
+def _index_put_fn():
+    t = p.clone()
+    r = torch.index_put_(t, (idx,), vals)
+    return [r.tolist(), r is t]
+rec("index_put__fn", _index_put_fn)
+def _index_put_member():
+    t = p.clone()
+    r = t.index_put_((idx,), vals)
+    return [r.tolist(), r is t]
+rec("index_put__member", _index_put_member)
+rec(
+    "index_put__fn_matches_raw",
+    lambda: torch.index_put_(p.clone(), (idx,), vals).tolist()
+    == d("aten.index_put_.default", p.clone(), [idx], vals, False).tolist(),
+)
+# accumulate=True, with a repeated position -- adds rather than overwrites.
+rep_idx = torch.tensor([0, 2, 0])
+rep_vals = torch.tensor([9.0, 8.0, 1.0])
+rec(
+    "index_put__accumulate_fn",
+    lambda: torch.index_put_(p.clone(), (rep_idx,), rep_vals, accumulate=True).tolist(),
+)
+
+# --- the 16 kernel-less names: still refused, by the exact right key -----
+# One representative from each `aten.rs` arity/family this round did not
+# touch, through both doors where a door exists. Each assertion below reads
+# the *exact* dispatch key out of the refusal, not just "it raised" -- a
+# refusal that named the wrong key would be a resolver bug hiding behind a
+# refusal that happens to look right.
+refused("sqrt__fn", lambda: torch.sqrt_(e.clone()))
+refused("sqrt__member", lambda: e.clone().sqrt_())
+refused("abs__fn", lambda: torch.abs_(e.clone()))
+refused("tanh__fn", lambda: torch.tanh_(e.clone()))
+rec("native_group_norm_member", lambda: base.native_group_norm)
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _spellings_9_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _SPELLINGS_9_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"spellings-9-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree():
+    """docs/SPELLINGS.md §9's six real gaps, each through a real `import torch`
+    against the shim -- `torch.<name>(...)` and, where a method exists,
+    `tensor.<name>(...)`, value-checked against upstream torch 2.13.0 (values
+    below are transcribed from that comparison, not derived from this shim).
+
+    Deleting any one of the six `overloads.json`/`bootstrap.py` changes this
+    round made turns the matching assertion red by naming the entry it lost
+    -- see the sabotage note in docs/SPELLINGS.md §9 for which one was
+    actually tried.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _spellings_9_road_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-5):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    # masked_fill -- out-of-place: the original must be untouched.
+    eq("masked_fill_fn_scalar", [-9.0, 2.0, -9.0, 4.0])
+    eq("masked_fill_fn_scalar_base_unchanged", [1.0, 2.0, 3.0, 4.0])
+    eq("masked_fill_fn_tensor", [2.5, 2.0, 2.5, 4.0])
+    eq("masked_fill_member", [-9.0, 2.0, -9.0, 4.0])
+    eq("masked_fill_fn_matches_raw", True)
+
+    eq("clamp__fn", [-2.0, 0.0, 2.0, 2.0])
+    eq("clamp__member", [-2.0, 0.0, 2.0, 2.0])
+    got = out.get("clamp__noargs_fn", "")
+    assert got.startswith("refused:") and "aten.clamp_.Tensor" in got, got
+
+    close("exp__fn", [math.exp(v) for v in (1.0, 2.0, -3.0, 4.0)])
+    close("exp__member", [math.exp(v) for v in (1.0, 2.0, -3.0, 4.0)])
+
+    eq("fill__fn_scalar", [7.0, 7.0, 7.0, 7.0])
+    eq("fill__fn_tensor", [3.0, 3.0, 3.0, 3.0])
+    eq("fill__member", [7.0, 7.0, 7.0, 7.0])
+
+    eq("neg__fn", [-1.0, 2.0, -3.0, 4.0])
+    eq("neg__member", [-1.0, 2.0, -3.0, 4.0])
+
+    # index_put_ -- in-place: the write lands in the receiver (`is`, not `==`).
+    eq("index_put__fn", [[9.0, 2.0, 8.0, 4.0], True])
+    eq("index_put__member", [[9.0, 2.0, 8.0, 4.0], True])
+    eq("index_put__fn_matches_raw", True)
+    # base [1,2,3,4], positions [0,2,0] get [9,8,1]: 0 receives 1+9+1=11, 2
+    # receives 3+8=11, matching upstream (measured, not derived).
+    eq("index_put__accumulate_fn", [11.0, 2.0, 11.0, 4.0])
+
+    # The 16 kernel-less names: still refused, by exact key -- this is the
+    # regression guard against this round's own additions drifting, and
+    # against a later round adding a kernel and forgetting the spelling.
+    got = out.get("sqrt__fn", "")
+    assert got.startswith("refused:") and "torch.sqrt_" in got, got
+    got = out.get("sqrt__member", "")
+    assert got.startswith("refused:") and "TensorBase.sqrt_" in got, got
+    got = out.get("abs__fn", "")
+    assert got.startswith("refused:") and "torch.abs_" in got, got
+    got = out.get("tanh__fn", "")
+    assert got.startswith("refused:") and "torch.tanh_" in got, got
+    # `native_group_norm` is not a `Tensor` method upstream either (measured
+    # `hasattr(torch.Tensor, "native_group_norm")` is False on torch 2.13.0),
+    # so there is no member to reach and this is an `AttributeError`, not the
+    # shim's own "no table entry" `NotImplementedError`.
+    got = out.get("native_group_norm_member", "")
+    assert got.startswith("ERROR:AttributeError"), got
 
 
 if __name__ == "__main__":

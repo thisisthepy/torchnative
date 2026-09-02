@@ -3871,6 +3871,7 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_indexing(module, tensorbase, dispatch)
     _install_tensor_softmax(tensorbase, dispatch)
     _install_tensor_chunk(tensorbase, dispatch)
+    _install_tensor_index_put_(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
 
 
@@ -4346,6 +4347,29 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     log_softmax.__name__ = "log_softmax"
     log_softmax.__qualname__ = "TensorBase.log_softmax"
     setattr(tensorbase, "log_softmax", log_softmax)
+
+
+def _install_tensor_index_put_(tensorbase, dispatch) -> None:
+    """`Tensor.index_put_(indices, values, accumulate=False)`.
+
+    Same wall as the `index_put_` composite in `_install_composites`:
+    `aten::index_put_`'s `indices: Tensor?[]` argument (a list of optional
+    Tensors, one per axis) is a type `_decompose_type` cannot represent --
+    see that function's docstring and the free-function `index_put_`'s note
+    above -- so this cannot be a `methods.json` entry either, for the same
+    install-time `_SCHEMA_BASE_TYPES` failure. The body is the method-door
+    twin of that composite: same dispatch, `self` bound instead of taken as
+    the first positional argument.
+    """
+
+    def index_put_(self, indices, values, accumulate=False):
+        return dispatch(
+            "aten.index_put_.default", self, list(indices), values, accumulate
+        )
+
+    index_put_.__name__ = "index_put_"
+    index_put_.__qualname__ = "TensorBase.index_put_"
+    setattr(tensorbase, "index_put_", index_put_)
 
 
 def _install_tensor_chunk(tensorbase, dispatch) -> None:
@@ -6803,6 +6827,50 @@ def _install_composites(module, varfns, dispatch) -> None:
     isfinite.__name__ = isfinite.__qualname__ = "isfinite"
     isfinite.__module__ = "torch._C"
     setattr(varfns, "isfinite", isfinite)
+
+    def index_put_(input, indices, values, accumulate=False):
+        """`torch.index_put_(input, indices, values, accumulate=False)`.
+
+        Not an `overloads.json` entry: `aten::index_put_`'s schema is
+
+            aten::index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)
+
+        and `indices: Tensor?[]` -- a list whose *elements* are optional
+        Tensors, one per axis, `None` meaning "take this whole axis" -- does
+        not round-trip through `_decompose_type`. That function's own
+        docstring says `?` binds outermost (`int[]?` is an *optional list*),
+        which is exactly the opposite shape: stripping the trailing `]`
+        first leaves `"Tensor?"` as the base type, and that fails the
+        `_SCHEMA_BASE_TYPES` membership check at install time -- measured:
+
+            RuntimeError: torch._C shim: overloads.json entry 'index_put_'
+            uses schema type 'Tensor?', which _TypeChecker does not handle:
+            aten::index_put_(...)
+
+        So this is not a missing table entry; it is a schema shape the type
+        checker has no notation for, and the table cannot express it at all.
+
+        This lands at the same door `layer_norm`/`isfinite` above use for a
+        `CompositeImplicitAutograd` mismatch, except the mismatch here is in
+        the type checker's vocabulary rather than in which dispatch key
+        fires. There is exactly one candidate schema
+        (`aten.index_put_.default`), so there is nothing to resolve -- the
+        call goes straight to `dispatch` with no argument validation of its
+        own, the same contract every other composite here keeps: validation
+        is `aten.rs`'s job, after the call.
+
+        `Tensor.index_put_` is the method-door twin, `_install_tensor_index_put_`
+        below -- the two are kept in separate functions rather than shared
+        because one binds `self` and the other does not, the same split
+        `_install_tensor_indexing`'s note draws for `__getitem__`.
+        """
+        return dispatch(
+            "aten.index_put_.default", input, list(indices), values, accumulate
+        )
+
+    index_put_.__name__ = index_put_.__qualname__ = "index_put_"
+    index_put_.__module__ = "torch._C"
+    setattr(varfns, "index_put_", index_put_)
 
     def square(input, *, out=None):
         """`torch.square` -- `persimmon`'s wall, and a composite, not an op.

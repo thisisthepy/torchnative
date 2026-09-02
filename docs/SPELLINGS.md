@@ -795,3 +795,193 @@ README 에도 같은 내용을 적었는데, 그 README 주석은 **커널이 �
 
 `torch.amax` / `Tensor.amax` 도 §7 의 인벤토리가 잡지 못한 부류였다 — 그 회차가 끝난 *뒤에*
 docs/SEQLEN.md §7 이 커널을 추가했기 때문이다. 인벤토리는 시점의 사진이지 불변식이 아니다.
+
+## 9. 일곱 번째 회차 — 18개 인벤토리 중 진짜 스펠링 결손은 6개, 이번에도
+
+조율 세션의 프로브가 `torch.<name>(...)`도 `tensor.<name>(...)`도 안 된다고 낸 18개 —
+
+    abs_ ceil_ clamp_min_ cos_ detach_ erf_ expm1_ index_put_ log2_ log_ masked_fill
+    native_group_norm reciprocal_ rsqrt_ sigmoid_ sin_ sqrt_ tanh_
+
+와 메서드로는 되는데 함수로는 안 되는 4개 — `clamp_ exp_ fill_ neg_`. 이 절이 검증하는 체크아웃은
+develop `e34f65d` (§8 이 돈 체크아웃보다 뒤) 이고, 지시 자체가 "직접 검증하고, 앞 회차의 측정을
+그대로 믿지 말라"고 명시했다. §8 과 결론의 모양은 같지만 — **같은 모양이라는 것 자체가 재확인의
+결과이지 재확인을 생략할 이유가 아니다.**
+
+### 9.0 검증 — `aten.rs`의 `IMPLEMENTED`/`IMPLEMENTED_AWAITING_GOLDEN`을 런타임에서 직접 읽었다
+
+`aten.rs` 원문을 grep 하는 대신 `_C._aten_implemented()`/`_aten_implemented_awaiting_golden()`를
+이 빌드에서 직접 호출해 22개 각각을 대조했다 (§8.0 은 원문 파싱, 이 절은 로드된 바이너리 — 다른
+경로로 같은 답을 재확인하는 것이 목적):
+
+    커널이 있는 것 (6개)    masked_fill(Scalar 는 IMPLEMENTED, Tensor 는 AWAITING_GOLDEN)
+                            index_put_(default)  clamp_(default 만, Tensor 는 커널 없음)
+                            exp_(default)  fill_(Scalar/Tensor 둘 다)  neg_(default)
+    커널이 없는 것 (15개)   abs_ ceil_ clamp_min_ cos_ detach_ erf_ expm1_ log2_ log_
+                            reciprocal_ rsqrt_ sigmoid_ sin_ sqrt_ tanh_
+
+**한 가지는 §8 과 달라졌다.** `native_group_norm`은 §8 이 돈 체크아웃에서 커널이 없었지만,
+이 체크아웃에서는 `aten.native_group_norm.default`가 `IMPLEMENTED`에 있다 — develop 이 그 사이에
+움직였다는 뜻이다(docs/SEQLEN.md §7 이 `amax` 에 대해 이미 남긴 것과 같은 모양의 시차). 다만
+상류 확인은 그대로다: `hasattr(torch, "native_group_norm")`은 `True`(함수), `hasattr(torch.Tensor,
+"native_group_norm")`은 `False`(메서드가 아니다) — 이번 실측으로 재확인. 그래서 커널이 생겼다고
+해서 메서드 스펠링을 지어서는 안 되고, 이 회차는 지시받은 "6개 실제 결손"에 `native_group_norm`이
+없으므로 **손대지 않았다** — 함수 스펠링을 주는 것조차 이 회차의 범위 밖으로 남겨 둔다. 조율
+세션에게 발견 사실로만 보고한다.
+
+즉 18개 중 **15개는 스펠링이 아니라 커널이 없는 것**이고, `index_put_`/`masked_fill`은 커널이
+있다. `methods.json`/`overloads.json` 현재 상태를 직접 읽어 대조:
+
+    masked_fill  methods.json 에 이미 있음(Tensor/Scalar), overloads.json 에는 없음
+    clamp_       methods.json 에 이미 있음(Tensor/bare), overloads.json 에는 없음
+    exp_         methods.json 에 이미 있음, overloads.json 에는 없음
+    fill_        methods.json 에 이미 있음(Tensor/Scalar), overloads.json 에는 없음
+    neg_         methods.json 에 이미 있음, overloads.json 에는 없음
+    index_put_   양쪽 다 없음
+
+**§8 과 정확히 같은 모양** — 여섯 이름 모두 메서드 문은 이미 있었고, 없던 것은 오직
+`torch.<name>(...)` 쪽 문뿐이었다(`index_put_`만 양쪽 다). 18개 목록에 `masked_fill`이
+"양쪽 다 안 된다"로 올라 있었던 것은 이번에도 프로브가 틀린 것이었다.
+
+### 9.1 추가한 것 — 5개는 표 항목, `index_put_`는 `bootstrap.py` 합성
+
+`overloads.json`에 다섯 개를 추가했다, `methods.json`의 기존 스키마 문자열을 그대로 전사(새로
+짓지 않음):
+
+    masked_fill  aten::masked_fill.Tensor / .Scalar
+    clamp_       aten::clamp_.Tensor(Tensor(a!) self, Tensor? min=None, Tensor? max=None) /
+                 clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None)
+    exp_         aten::exp_(Tensor(a!) self)
+    fill_        aten::fill_.Tensor / .Scalar
+    neg_         aten::neg_(Tensor(a!) self)
+
+`overloads.json` 항목 수: **96/96 → 101/101**(+5 키), 스키마 문자열 수 **220 → 228**(+8 =
+masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 항목, 180 스키마
+문자열 그대로**(변경 없음 — 다섯 개 다 이미 있었다). `pytests/verify_schemas.py`:
+`overloads.json 228/228 matched`, `methods.json 180/180 matched`, `SUMMARY 4487/4487 matched,
+0 failed`.
+
+상류 대조(torch 2.13.0, `spike-venv`, 벤더 트리를 이 셈의 `_C` 위에 얹어 실제
+`torch.<name>(...)`/`tensor.<name>(...)` 호출, 양쪽 다):
+
+    torch.masked_fill(x, mask, -9.0)        -> [-9,2,-9,4], x 는 안 바뀜 (out-of-place)
+    torch.masked_fill(x, mask, tensor(2.5)) -> [2.5,2,2.5,4]
+    torch.clamp_(c.clone(), min=-2, max=2)  -> [-2,0,2,2]  (self 반환)
+    torch.exp_(e.clone())                    -> [e^1,e^2,e^-3,e^4], float32 정밀도 내 일치
+    torch.fill_(f.clone(), 7.0)              -> [7]*4
+    torch.fill_(f.clone(), tensor(3.0))      -> [3]*4
+    torch.neg_(n.clone())                    -> 부호 반전, 정확히 일치
+
+전부 상류와 일치. `clamp_`의 무인자 호출(`torch.clamp_(c)`)은 여전히 `aten.clamp_.Tensor`로
+정확한 이름으로 거부된다(§7.2/§8.1 이 남긴 자리 그대로, 이번 회차가 새로 만든 간격이 아니다) —
+이번 회차의 회귀 테스트가 그 정확한 문자열을 확인한다.
+
+### 9.2 `index_put_`는 이번에도 테이블에 넣을 수 없었다 — `_TypeChecker`가 `Tensor?[]`를 모른다
+
+§8.2 의 결론이 이 체크아웃에서도 그대로 재현된다. 스키마는
+
+    aten::index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)
+
+이고 `indices`의 타입 `Tensor?[]`(축마다 하나씩, 텐서 아니면 전체 선택을 뜻하는 `None`)를
+`bootstrap.py`의 `_decompose_type`이 표현하지 못한다. 그 함수 자신의 docstring이 "`?`가 가장
+바깥에 붙는다"고 명시하는데, 이는 `int[]?`(옵셔널 리스트) 모양만 지원하고 `Tensor?[]`(옵셔널의
+리스트)는 반대 모양이라는 뜻이다. 문자열 끝의 `]`를 먼저 벗기면 남는 `"Tensor?"`가
+`_SCHEMA_BASE_TYPES` 멤버십 검사를 install 시점에 통과하지 못해 **`import _C` 자체가 죽는다** —
+이번 회차가 직접 재현해 확인:
+
+    RuntimeError: torch._C shim: overloads.json entry 'index_put_' uses schema type
+    'Tensor?', which _TypeChecker does not handle: aten::index_put_(...)
+
+그래서 `overloads.json`/`methods.json`에는 넣지 않고, `bootstrap.py`의 `_install_composites`
+(함수 문, `layer_norm`/`isfinite`와 같은 자리)와 새로 만든 `_install_tensor_index_put_`(메서드
+문, `_install_tensor_indexing`과 같은 자리)에 각각 얇은 합성을 심었다 — 둘 다
+`dispatch("aten.index_put_.default", ..., list(indices), values, accumulate)` 하나뿐이고, 자체
+타입 검증은 없다(다른 합성들과 같은 계약: 검증은 `aten.rs`의 일).
+
+두 문 다 실측 확인, 상류와 대조:
+
+    t.index_put_((idx,), vals)          -> [9,2,8,4], self 반환 (is 로 확인, True)
+    torch.index_put_(t, (idx,), vals)   -> 위와 값 일치, `_aten_dispatch` 직접 호출과도 일치
+    torch.index_put_(t, (rep_idx,), rep_vals, accumulate=True)
+        rep_idx=[0,2,0], rep_vals=[9,8,1], base=[1,2,3,4]
+        -> [11,2,11,4] (위치 0 은 1+9+1, 위치 2 는 3+8) -- 상류와 일치, 이번 회차가 새로
+           추가한 실측(§8 은 accumulate 케이스를 넣지 않았다)
+
+### 9.3 캡처 — 새 문으로 들어가도 이름으로 거부되는지, 두 층에서 다시 쟀다
+
+`docs/CAPTURE.md`의 규칙: `capture.rs`의 `is_mutating`은 op 이름이 `_`로 끝나는지(`aten.<op>.
+<overload>`의 `<op>` 부분)만 본다. 어느 Python 문으로 그 op 에 도달했는지는 관여하지 않으므로,
+이번 회차가 새 문을 다섯 개 열어도(`torch.masked_fill`/`clamp_`/`exp_`/`fill_`/`neg_`) 와
+`index_put_`의 두 문을 새로 만들어도 `capture.rs`는 한 줄도 고치지 않았다. 그래도 "새 문으로
+들어가도 실제로 그 규칙을 타는지"는 추측이 아니라 두 층에서 쟀다.
+
+**raw dispatch 층** (`test_capture_refuses_the_new_inplace_spellings_by_dispatch_key`,
+`_aten_dispatch` 직접 호출, `capture.rs` 무변경 확인용): `aten.exp_.default`/`aten.neg_.default`/
+`aten.clamp_.default`/`aten.fill_.Scalar`/`aten.index_put_.default` 다섯 다 정확한 키로 poison
+되고, `masked_fill.Scalar`(같은 여섯 이름 중 하나이지만 비변이)는 poison 되지 않고 트레이스에
+정상 기록된다는 것을 대조군으로 확인.
+
+**벤더 트리 Python 스펠링 층** (`_SPELLINGS_9_ROAD_SCRIPT`의 캡처 절, 진짜 `import torch`를 통해):
+
+    _capture_begin([x]); x.exp_(); _capture_end(None)
+      -> NotImplementedError: ... aten.exp_.default writes in place; capture refuses mutation
+    torch.fill_(x, 1.0) 안에서도 동일
+    x.index_put_((idx,), vals) 안에서도 동일
+    대조군 -- torch.masked_fill(x, mask, 5.0): 성공, poison 없음
+
+둘 다 §8.3 과 같은 결론이고, 이번 회차가 독립적으로 다시 잰 것이다.
+
+### 9.4 커버리지 — 실패할 수 있는 검증과 사보타지 결과
+
+추가한 6개 각각에 "이름을 빼면 실제로 빨개지는" 케이스를 뒀다:
+
+* `rust/torch_c/pytests/test_shim.py`의
+  `test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree` —
+  벤더 트리를 이 셈의 `_C` 위에 얹은 진짜 `import torch`로 `torch.<name>(...)`와
+  `tensor.<name>(...)` 양쪽, 6개 전부를 값 대조(수작업 계산 기대값, `math.exp` 등, 상류
+  torch 를 두 번째로 임포트하지 않고). `masked_fill`/`index_put_`는 `_aten_dispatch` 직접
+  호출과도 대조(`_matches_raw`). 15개 커널 없는 이름 중 대표 몇 개(`sqrt_`/`abs_`/`tanh_`)도
+  같은 스크립트에서 여전히 정확한 키로 거부되는지 확인 — 이 회차가 스펠링을 안 준 것이 실수가
+  아니라 측정이라는 것을 스스로 증명하는 절. `native_group_norm`은 `Tensor` 메서드가 아니라는
+  것도 `AttributeError`로 재확인.
+* `test_capture_refuses_the_new_inplace_spellings_by_dispatch_key` — §9.3 raw dispatch 층의
+  실측을 그대로 테스트로 박음.
+
+**사보타지**: `overloads.json`의 `neg_` 항목을 지우고(`cp`로 백업한 뒤) 다시 빌드 + 재설치 +
+`pytests/run.sh`를 돌리자
+
+    FAIL test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree:
+    AssertionError: neg__fn: expected [-1.0, 2.0, -3.0, 4.0], got
+    'ERROR:NotImplementedError:not implemented in torch._C shim: torch.neg_(...) -- overload
+    resolution has no table entry for this op ...'
+
+로 **빨갛게 이름을 대며** 실패했다. `cp` 백업에서 복원 후 재빌드·재설치·재실행하니 다시 초록
+(335 ok, DOCWATCH 248/248). 지운 것이 `neg_` 하나뿐인데도 실패 메시지가 정확히 `neg__fn`을
+지목했다 — 이 테스트가 여섯 항목을 뭉뚱그려 세지 않고 각각 실패할 수 있다는 뜻이다.
+
+### 9.5 게이트
+
+    pytests/run.sh              333 ok -> 335 ok (+2 = 새 subprocess road 테스트 1 +
+                                 raw dispatch capture 테스트 1), exit 0
+    DOCWATCH                    248/248 그대로
+    verify_schemas.py           overloads.json 220 -> 228 스키마 문자열(+8),
+                                 methods.json 180 그대로, SUMMARY 4487/4487, 0 failed
+    tools/golden/compare.py     7763/7763 cases passed, 0 failed, ops covered=168 그대로
+                                 (무회귀 -- 스펠링만 추가했고 `_aten_implemented()`가 답하는
+                                 커널 집합은 이번 회차가 바꾸지 않았다), pending case builders=1 그대로
+
+### 9.6 손대지 않은 것 / 이 회차 밖
+
+`aten.rs` — 15개 커널 없는 이름은 커널이 있어야 스펠링을 줄 수 있는데, 이 회차의 파일 범위가
+스펠링(`overloads.json`/`methods.json`/`bootstrap.py`)이지 커널이 아니다. `capture.rs`도
+무변경 — §9.3 이 실측으로 확인했듯 규칙이 이름 기반이라 새 문이 열려도 따로 손볼 것이 없었다.
+`masked_fill.Tensor`는 여전히 `IMPLEMENTED_AWAITING_GOLDEN`이라 골든 본 게이트(7763/7763)
+집계에는 안 잡힌다 — §8 과 같은 자리, 이번 회차가 새로 만든 상태가 아니다.
+
+**`native_group_norm`은 이번 회차가 발견했지만 손대지 않은 것으로 남긴다.** §8 이 돈
+체크아웃에서는 커널이 없었는데 이 체크아웃에서는 있다(§9.0) — 그런데 지시받은 "6개 실제
+결손"에는 들어 있지 않았고, 커널이 생겼다고 해서 함수 스펠링을 짓는 것은 이 절이 감사하는
+범위(6개) 밖의 새 작업 항목이다. **상류에 없는 메서드 스펠링은 짓지 않는다**는 원칙(§7.1,
+`gelu`/`silu`/`softplus`가 같은 이유로 빠졌던 것과 같은 자리)은 여기서도 지켰지만, *함수*
+스펠링(`torch.native_group_norm`)을 주는 판단 자체는 조율 세션에게 넘긴다 — 결정하고 실행하는
+대신 발견 사실만 보고한다.

@@ -80,6 +80,18 @@
     "why that op gets its own `split_with_sizes` key rather than being folded",
     "in here.",
     "",
+    "`index_put_` is deliberately NOT here either, for a different reason than",
+    "`linear`/`dropout`/`layer_norm` above: `aten::index_put_`'s `indices`",
+    "argument has type `Tensor?[]` (a list of optional Tensors, one per axis),",
+    "which `_decompose_type` cannot represent -- its docstring says `?` binds",
+    "outermost, so it handles `int[]?` (an optional list) but not `Tensor?[]`",
+    "(a list of optionals). Adding this entry makes `import _C` raise at",
+    "install time (`_SCHEMA_BASE_TYPES` has no 'Tensor?' member), not merely",
+    "resolve wrong -- measured. `torch.index_put_`/`Tensor.index_put_` are",
+    "both Python-level compositions in `bootstrap.py` (`_install_composites`,",
+    "`_install_tensor_index_put_`) that dispatch straight to",
+    "`aten.index_put_.default` with no table involved, docs/SPELLINGS.md §8.2.",
+    "",
     "docs/SPELLINGS.md §6 notes on `any`/`div`/`mean`/`sum`, measured with a",
     "`TorchDispatchMode` logger on torch 2.13.0 rather than reasoned about:",
     "",
@@ -578,6 +590,10 @@
     "aten::neg(Tensor self) -> Tensor"
   ],
 
+  "neg_": [
+    "aten::neg_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+
   "t": [
     "aten::t(Tensor(a) self) -> Tensor(a)"
   ],
@@ -600,6 +616,11 @@
     "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
+  "fill_": [
+    "aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)",
+    "aten::fill_.Scalar(Tensor(a!) self, Scalar value) -> Tensor(a!)"
+  ],
+
   "ceil": [
     "aten::ceil.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::ceil(Tensor self) -> Tensor"
@@ -608,6 +629,11 @@
   "masked_select": [
     "aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
+  ],
+
+  "masked_fill": [
+    "aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor",
+    "aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor"
   ],
 
   "transpose": [
@@ -632,6 +658,10 @@
   "exp": [
     "aten::exp.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::exp(Tensor self) -> Tensor"
+  ],
+
+  "exp_": [
+    "aten::exp_(Tensor(a!) self) -> Tensor(a!)"
   ],
 
   "erf": [
@@ -686,6 +716,11 @@
   "clamp_min": [
     "aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor",
     "aten::clamp_min(Tensor self, Scalar min) -> Tensor"
+  ],
+
+  "clamp_": [
+    "aten::clamp_.Tensor(Tensor(a!) self, Tensor? min=None, Tensor? max=None) -> Tensor(a!)",
+    "aten::clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)"
   ],
 
   "eq": [
