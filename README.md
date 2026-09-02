@@ -195,7 +195,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>168</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>7685 / 7685</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>328</b></td></tr>
+<tr><td>Smoke tests</td><td><b>329</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
@@ -333,7 +333,7 @@ rather than inferred from the host.
 | `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` in registers, accumulated, narrowed once — upstream's rule. Prefill is 1.19x `float32` here and **2.3x faster than upstream's own `bfloat16`**; decode still materialises the widened weight ([`docs/DTYPE_PERF.md`](docs/DTYPE_PERF.md)) |
 | `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | integer kernels |
 | `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | constructs, then hangs on most paths — excluded from the golden suite |
-| `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created |
+| `int8` `qint8` `quint8` | ❌ | ❌ | ❌ | ❌ | candle's `DType` has no `I8`: the tensor cannot be created. Adding it would buy the storage type and not the speed — candle has no int8 matmul either, and its quantisation is `QTensor`/`GgmlDType`, a **separate system** that `Tensor`/`DType` never sees, so teaching `aten.mm` a new element type does not reach the fast kernel. **int8 inference is here, as module replacement rather than as a dtype**: `quant.quantize_(model, format="q8_0")` gives 3.76x with 0.80% max relative error on a 512x512 `Linear` ([`docs/QUANT2.md`](docs/QUANT2.md)) |
 | the other 35 | ❌ | ❌ | ❌ | ❌ | complex, other float8, 4-bit — refuse by name |
 
 The last two rows are ❌ everywhere rather than 🔲, because the cause is in candle's type system

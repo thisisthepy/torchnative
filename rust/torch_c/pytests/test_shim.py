@@ -16378,5 +16378,88 @@ def test_the_fast_path_falls_back_rather_than_binding_the_wrong_slot():
     # only one of them could produce.
 
 
+_QUANT_NOOP_SCRIPT = """
+import json
+import torch
+import torch.nn as nn
+import torchnative.quant as q
+
+out = {}
+
+# Handed the module itself: `quantize_` walks `named_children` and rebinds with
+# `setattr`, so there is no parent to rebind and nothing happens.
+try:
+    q.quantize_(nn.Linear(64, 64, bias=False), format="q8_0")
+    out["bare"] = None
+except ValueError as exc:
+    out["bare"] = str(exc)
+
+# Nothing of the right type anywhere.
+try:
+    q.quantize_(nn.Sequential(nn.ReLU()), format="q8_0")
+    out["empty"] = None
+except ValueError as exc:
+    out["empty"] = str(exc)
+
+# The working shape, so the refusals above are not the only outcome.
+r = q.quantize_(nn.Sequential(nn.Linear(64, 64, bias=False)), format="q8_0")
+out["replaced"] = list(r.replaced)
+out["ratio"] = r.ratio
+
+print(json.dumps(out))
+"""
+
+
+def _quant_noop_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _QUANT_NOOP_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"quant-noop subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_quantise_refuses_the_call_that_would_have_done_nothing():
+    """`quantize_(model.lm_head)` used to succeed and quantise nothing.
+
+    It walks `named_children` and rebinds with `setattr`, so it can only
+    replace a module that has a parent -- Python offers no way to rebind the
+    caller's own reference. Handed a bare `nn.Linear`, it walked nothing and
+    returned a report whose `replaced` and `skipped` were both empty and whose
+    `ratio` was `nan`. That reads as success, and the shape of the mistake --
+    reaching for one layer instead of the model, which is a natural thing to
+    try -- is the case where the caller is least likely to inspect the report.
+
+    The two refusals say different things because the causes are different:
+    one is "there is a Linear here and I cannot rebind it", the other is
+    "there was nothing of that type at all".
+    """
+    if not _ckpt_shim_available():
+        return
+    r = _quant_noop_fixture()
+
+    assert r["bare"] is not None, "a bare nn.Linear was accepted and did nothing"
+    assert "cannot replace the module it was handed" in r["bare"], r["bare"]
+    assert "q8_0" in r["bare"], r["bare"]
+
+    assert r["empty"] is not None, "a model with no Linear was accepted"
+    assert "found no nn.Linear" in r["empty"], r["empty"]
+
+    # The refusals are not the only outcome -- the ordinary shape still works,
+    # so this cannot pass by `quantize_` having become unusable.
+    assert r["replaced"] == ["0"], r["replaced"]
+    assert 3.7 < r["ratio"] < 3.8, r["ratio"]
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

@@ -184,6 +184,35 @@ def quantize_(model, format="q8_0", predicate=None):
         report.replaced.append(full)
         report.dense_bytes += child.weight.numel() * 4
         report.quantized_bytes += torch._C._quantized_nbytes(replacement.qweight)
+
+    # **A no-op is an error, not an empty report.** This walks `named_children`
+    # and rebinds with `setattr`, so it can only replace a module that has a
+    # parent -- Python gives no way to rebind the caller's own reference. Hand
+    # it a bare `nn.Linear`, or one layer picked out of a model
+    # (`quantize_(model.lm_head)`, which is a natural thing to try), and it
+    # walks nothing, replaces nothing, and returns a report whose `replaced`
+    # and `skipped` are both empty and whose `ratio` is `nan`.
+    #
+    # That reads as success. The caller has to notice an empty list to find out
+    # otherwise, and the shape of the mistake -- reaching for one layer rather
+    # than the model -- is exactly the case where they are least likely to look.
+    #
+    # `skipped` being non-empty is a different thing and stays quiet: the
+    # predicate excluded them, or `from_linear` refused them by name, and both
+    # are answers rather than silence.
+    if not report.replaced and not report.skipped:
+        if isinstance(model, torch.nn.Linear):
+            raise ValueError(
+                "quantize_ cannot replace the module it was handed, only that "
+                "module's children -- rebinding the caller's own reference is "
+                "not something Python allows. Assign it instead: "
+                "`parent.name = QuantizedLinear.from_linear(parent.name, "
+                f'"{format}")`, or pass the model that contains this layer.'
+            )
+        raise ValueError(
+            "quantize_ found no nn.Linear to replace in "
+            f"{type(model).__name__}. Nothing was quantised."
+        )
     return report
 
 
