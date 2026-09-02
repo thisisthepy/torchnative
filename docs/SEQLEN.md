@@ -36,6 +36,19 @@ upstream never builds it. §8.12 has what closing that would cost, and the
 answer is a second SDPA path with its own numerics contract rather than a
 faster version of this one.
 
+> **docs/FLASH.md built that second path and it is slower, twice over.**
+>
+> "We materialise and upstream never does" is true, and it is the wrong way
+> round as a *performance* claim on CPU. The `[1, 9, S, S]` product is one BLAS
+> `gemm`; a blocked kernel gives that up. `flash.rs` — upstream's own blocked
+> kernel, reproduced exactly — is **20x slower at T=512**, which is why it ships
+> off by default. A second, independent tiled implementation written for
+> FLASH.md measured **0.38–0.56x**. Both avoid the allocation; neither is fast.
+>
+> So the floor named above stands, but the remedy implied here does not.
+> Upstream's 3.79 ms is a hand-written fused kernel with BLAS-quality inner
+> loops, not the absence of a materialised matrix. FLASH.md §1.2.
+
 ---
 
 ## 0. What these numbers may not be used for
