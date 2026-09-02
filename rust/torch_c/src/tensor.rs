@@ -99,6 +99,16 @@ pub struct PyTensorBase {
     /// stub so that code which really depends on the flag meaning something
     /// fails by name rather than silently getting nothing. Recorded as a
     /// papered-over item in docs/TENSORBASE.md, not as an implementation.
+    ///
+    /// Inert is not the same as unconstrained, and that distinction was missed
+    /// for as long as this comment has existed. `docs/BACKWARD2.md` §1.4
+    /// measured the one place where this shim was *more* permissive than
+    /// upstream rather than less: an integer tensor could be told to require
+    /// gradients here and cannot upstream. `set_requires_grad` states that rule
+    /// now, at the site upstream states it -- `tape.rs`'s `wrt_set` had been
+    /// carrying it alone, one layer down, where docs/BACKWARD.md §4.1 records
+    /// having to add it after the reverse walk asked for the derivative of a
+    /// token id.
     requires_grad: bool,
     /// **Inert**, for the same reason as `requires_grad`: there is no autograd
     /// here, so nothing ever fires a backward hook. It is a real slot rather
@@ -1644,9 +1654,35 @@ impl PyTensorBase {
         self.requires_grad
     }
 
+    /// `t.requires_grad = True`, and the one rule the flag has.
+    ///
+    /// The flag is inert (no graph is built from it), but "inert" says nothing
+    /// about which tensors may carry it, and upstream restricts that: only
+    /// floating-point and complex tensors may require gradients, because only
+    /// those have a derivative to accumulate. `docs/BACKWARD2.md` §1.4 measured
+    /// this shim accepting `torch.ones(2, dtype=torch.int64).requires_grad_(True)`
+    /// where upstream raises -- the single place in the whole autograd chain
+    /// where this shim was the permissive one.
+    ///
+    /// The message is upstream's, transcribed from torch 2.13.0 by running the
+    /// failing case, and upstream has **three** wordings for the same rule
+    /// depending on which door is used: this one is the attribute setter's.
+    /// `bootstrap.py`'s `requires_grad_` and the factory keyword carry theirs.
+    /// Reproducing all three is the same practice `_frombuffer` follows for its
+    /// `ValueError`s -- a caller who greps for upstream's text finds it.
+    ///
+    /// Only `True` is checked. Upstream lets `requires_grad = False` through on
+    /// any dtype, and `nn.Module._apply` writes exactly that over integer
+    /// buffers.
     #[setter]
-    fn set_requires_grad(&mut self, value: bool) {
+    fn set_requires_grad(&mut self, value: bool) -> PyResult<()> {
+        if value && !(self.tag.is_floating_point() || self.tag.is_complex()) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "only Tensors of floating point and complex dtype can require gradients",
+            ));
+        }
         self.requires_grad = value;
+        Ok(())
     }
 
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only

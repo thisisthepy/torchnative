@@ -342,12 +342,6 @@ fn _frombuffer(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "torch.frombuffer";
 
-    if requires_grad {
-        return Err(crate::err::not_implemented(format!(
-            "{OP}(requires_grad=True) -- there is no autograd behind this shim"
-        )));
-    }
-
     // The buffer protocol rather than a `bytes`/`bytearray` downcast: upstream
     // takes anything that implements it, and `safetensors` hands over a
     // `bytearray` while pickle frames arrive as `memoryview`. `PyBuffer` is
@@ -400,7 +394,29 @@ fn _frombuffer(
     // `torch.load` path -- both are checkpoint readers, and the two agreeing is
     // exactly what docs/CKPT.md §1 measures (worst difference: 0.0).
     let wrapped = crate::tensor::from_le_bytes(OP, slice, &[numel as usize], dtype.tag())?;
-    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
+    let out = crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())?;
+    carry_requires_grad(py, out, requires_grad)
+}
+
+/// `requires_grad=True` on a factory that builds its tensor in Rust.
+///
+/// The two here (`frombuffer`, `asarray`) used to refuse it, alongside the five
+/// Python-level doors `bootstrap.py::_strip_python_only_kwargs` covers. Those
+/// five now carry the flag (docs/BACKWARD2.md §4.1: the refusal protected a
+/// *spelling*, since `.requires_grad_(True)` reaches the same tensor), and
+/// leaving these two refusing would re-create the inconsistency one door over.
+///
+/// The dtype rule and its wording come from `TensorBase.set_requires_grad`, so
+/// there is exactly one statement of it on this path.
+fn carry_requires_grad(
+    py: Python<'_>,
+    out: Py<PyAny>,
+    requires_grad: bool,
+) -> PyResult<Py<PyAny>> {
+    if requires_grad {
+        out.bind(py).setattr("requires_grad", true)?;
+    }
+    Ok(out)
 }
 
 /// `torch.asarray(obj, *, dtype=None, device=None, copy=None, requires_grad=False)`,
@@ -441,11 +457,9 @@ fn _asarray(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "torch.asarray";
 
-    if requires_grad {
-        return Err(crate::err::not_implemented(format!(
-            "{OP}(requires_grad=True) -- there is no autograd behind this shim"
-        )));
-    }
+    // `requires_grad` is carried at the end -- see `carry_requires_grad`.
+    // `copy=False` still refuses, and the two are not the same case: the copy
+    // names an aliasing this shim's tensors cannot express.
     if copy == Some(false) {
         return Err(crate::err::not_implemented(format!(
             "{OP}(copy=False) -- upstream would alias the source's memory, and \
@@ -494,7 +508,8 @@ fn _asarray(
     // Same byte reader as `frombuffer` and `TensorBase.set_`; see the comment
     // at the end of `_frombuffer`.
     let wrapped = crate::tensor::from_le_bytes(OP, bytes, &[bytes.len() / itemsize], tag)?;
-    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
+    let out = crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())?;
+    carry_requires_grad(py, out, requires_grad)
 }
 
 /// The triple this artefact was built for. Three targets are cross-compiled and

@@ -370,13 +370,28 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     If the first boundary ever moves too, invert this rather than deleting it,
     the way `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`
     did.
+
+    **Wall 3 below has been inverted once already, and the wall it named was
+    not autograd.** docs/BACKWARD2.md §1.2 measured that `_stash_obj_in_tls` is
+    a thread-local key/value store that `torch/autograd/graph.py` uses so the
+    engine's *device threads* can see a `contextvars.Context` -- and that with
+    it refusing, `_engine_run_backward`'s `finally:` then raised
+    `_remove_obj_from_tls` **on top of the engine's own refusal**, so a user
+    never saw the engine at all. Implementing the store moved the refusal onto
+    `run_backward`, which is the wall this test is about. The assertion below is
+    correspondingly stronger: the store must round-trip *and* the engine must
+    still refuse *and* its refusal must name what does work.
     """
     x = _C._aten_dispatch("aten.full.default", [4], 2.0)
 
-    # 1. The flag round-trips, both spellings, and `requires_grad_` chains.
+    # 1. The flag round-trips, all three spellings, and `requires_grad_` chains.
+    #    The factory keyword is here since docs/BACKWARD2.md §4.1 -- it used to
+    #    refuse while `requires_grad_` did not, which drew one boundary in two
+    #    places for two spellings of one thing.
     x.requires_grad = True
     assert x.requires_grad is True
     assert _C._aten_dispatch("aten.full.default", [2], 1.0).requires_grad_(True).requires_grad
+    assert _C._VariableFunctions.ones(2, requires_grad=True).requires_grad is True
     # ... and the rest of the shape is the honest report of "no graph exists".
     assert x.is_leaf is True
     assert x.grad_fn is None
@@ -394,23 +409,80 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     )
     assert y.grad_fn is None
 
-    # 3. Both walls a `backward()` reaches refuse by name rather than
-    #    returning zeros. AUTOGRAD.md §1.2 walks the path that gets here:
+    # 3. The wall a `backward()` reaches refuses by name rather than returning
+    #    zeros. AUTOGRAD.md §1.2 walks the path that gets here:
     #    Tensor.backward -> autograd.backward -> _engine_run_backward, which
-    #    touches the thread-local first and the engine second.
-    for label, call in (
-        ("_stash_obj_in_tls", lambda: _C._stash_obj_in_tls("context", None)),
-        ("run_backward", lambda: _C._ImperativeEngine().run_backward()),
-    ):
-        try:
-            call()
-        except NotImplementedError as e:
-            assert "not implemented in torch._C shim" in str(e), (label, str(e))
-        else:
-            raise AssertionError(
-                f"{label} no longer refuses -- if autograd landed, invert this "
-                f"test and update docs/AUTOGRAD.md §1 rather than deleting it"
-            )
+    #    touches the thread-local first and the engine second. The thread-local
+    #    is no longer a wall (see the docstring), so this is now one wall and
+    #    it is the right one.
+    try:
+        _C._ImperativeEngine().run_backward()
+    except NotImplementedError as e:
+        assert "not implemented in torch._C shim" in str(e), str(e)
+        # A refusal that names only itself sends a reader nowhere.
+        # docs/DESIGN.md §6: name the alternative that works.
+        assert "CaptureTrace.backward()" in str(e), str(e)
+        assert "docs/BACKWARD2.md" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "run_backward no longer refuses -- if autograd landed, invert this "
+            "test and update docs/AUTOGRAD.md §1 and docs/BACKWARD2.md rather "
+            "than deleting it"
+        )
+    # ... and the thread-local store, which stood in front of it, is a store.
+    # It is asserted here rather than left to its own test because the *reason*
+    # it exists is that it was masking the assertion above.
+    assert _C._is_key_in_tls("context") is False
+    _C._stash_obj_in_tls("context", x)
+    assert _C._is_key_in_tls("context") is True
+    assert _C._get_obj_in_tls("context") is x
+    _C._remove_obj_from_tls("context")
+    assert _C._is_key_in_tls("context") is False
+    # Removing a key that is not there is what `_engine_run_backward`'s
+    # `finally:` does when the engine raised before stashing. It must not raise,
+    # or it would mask the engine's refusal -- which is exactly what it did.
+    _C._remove_obj_from_tls("context")
+
+
+def test_the_thread_local_store_is_thread_local_and_not_a_module_dict():
+    """The one property of `_stash_obj_in_tls` a single-threaded test cannot see.
+
+    docs/BACKWARD2.md §4.3: a module-level dict would pass every other
+    assertion in this file and be a *different* semantics -- and the reason the
+    key exists upstream at all is that the engine has more than one thread. So
+    the implementation is `threading.local()`, and this is what says so.
+
+    Both directions are checked. A worker must not see the main thread's key
+    (which a shared dict would fail), and the main thread must not see a
+    worker's (which a *global* per-process slot would fail even if reads were
+    somehow scoped).
+    """
+    import threading
+
+    _C._remove_obj_from_tls("bw2")
+    _C._stash_obj_in_tls("bw2", "main")
+    seen = []
+
+    def worker():
+        seen.append(("sees main's key", _C._is_key_in_tls("bw2")))
+        _C._stash_obj_in_tls("bw2", "worker")
+        seen.append(("sees its own", _C._get_obj_in_tls("bw2")))
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert seen == [("sees main's key", False), ("sees its own", "worker")], seen
+    # And the worker's write did not reach here, which is the other direction.
+    assert _C._get_obj_in_tls("bw2") == "main"
+    _C._remove_obj_from_tls("bw2")
+    # Absent key: upstream raises rather than answering `None`, and a `None`
+    # would be a value the caller could not distinguish from a stashed one.
+    try:
+        _C._get_obj_in_tls("bw2")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("_get_obj_in_tls answered for a key that is not there")
 
 
 def test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one():
@@ -645,16 +717,90 @@ def test_varargs_intlist_rule_matches_torchs_precondition():
     assert _vf("ones")(2).shape == (2,)
 
 
-def test_requires_grad_is_refused_not_ignored():
-    try:
-        _vf("ones")(2, requires_grad=True)
-    except NotImplementedError as e:
-        assert "autograd" in str(e)
-    else:
-        raise AssertionError("requires_grad=True must not be silently dropped")
+def test_requires_grad_is_carried_not_dropped_and_not_refused():
+    """The inversion of `test_requires_grad_is_refused_not_ignored`.
+
+    That test pinned a refusal, and docs/BACKWARD2.md §4.1 removed it -- for a
+    reason that is about the refusal's own argument rather than about autograd
+    arriving. The refusal's ground was "returning a tensor that quietly records
+    nothing would be worse than refusing", and
+
+        torch.ones(2, 2, requires_grad=True)      <- was refused
+        torch.ones(2, 2).requires_grad_(True)     <- succeeds, and always has
+
+    are the same object. So the refusal redirected a caller to a spelling that
+    hands over the identical tensor **with no warning at all**.
+
+    Inverted rather than deleted, the way
+    `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel` was.
+    What replaces it is stronger than what it asserted, because the property
+    that actually matters is not "does the keyword refuse" but **"do the two
+    spellings agree"** -- which nothing checked while one of them refused.
+    """
+    carried = _vf("ones")(2, requires_grad=True)
+    assert carried.requires_grad is True, "requires_grad=True was silently dropped"
+    # The two spellings must agree, which is the whole point. `is_leaf`,
+    # `grad_fn` and `grad` are in the tuple because a factory that took a
+    # *different* path to the flag could set it and miss those.
+    def shape_of(t):
+        return (t.requires_grad, t.is_leaf, t.grad_fn, t.grad, t.dtype, t.shape)
+
+    assert shape_of(carried) == shape_of(_vf("ones")(2).requires_grad_(True))
     # ... and the falsy spelling, which the vendored tree passes constantly,
-    # goes through.
-    assert _vf("ones")(2, requires_grad=False).shape == (2,)
+    # goes through and does *not* set the flag.
+    plain = _vf("ones")(2, requires_grad=False)
+    assert plain.shape == (2,)
+    assert plain.requires_grad is False
+
+
+def test_requires_grad_refuses_a_non_floating_tensor_at_all_three_doors():
+    """docs/BACKWARD2.md §1.4 and §4.2: the one place this shim was *more*
+    permissive than upstream in the whole autograd chain.
+
+    `torch.ones(2, dtype=torch.int64).requires_grad_(True)` succeeded here and
+    raises upstream, because only a tensor with a derivative to accumulate may
+    carry the flag. `tape.rs`'s `wrt_set` had been enforcing it alone, one layer
+    down, where docs/BACKWARD.md §4.1 records having to add it after the reverse
+    walk asked for the derivative of a token id.
+
+    Upstream has **three** wordings for the one rule, and all three are
+    transcribed at the door that produces them -- measured on 2.13.0 by running
+    each failing case. They are asserted with `in` on the exact text rather than
+    on a keyword, because the point of transcribing a message is that a caller
+    who greps for upstream's text finds it. Complex is accepted at every door
+    despite `requires_grad_`'s wording saying only "floating point"; that is
+    upstream's message being loose, and its behaviour is what is copied.
+    """
+    doors = (
+        # (label, call, upstream's exact message for this door)
+        ("factory keyword",
+         lambda dt: _vf("ones")(2, dtype=dt, requires_grad=True),
+         "Only Tensors of floating point and complex dtype can require gradients"),
+        ("requires_grad_",
+         lambda dt: _vf("ones")(2, dtype=dt).requires_grad_(True),
+         "only Tensors of floating point dtype can require gradients"),
+        ("attribute setter",
+         lambda dt: setattr(_vf("ones")(2, dtype=dt), "requires_grad", True),
+         "only Tensors of floating point and complex dtype can require gradients"),
+    )
+    for label, call, message in doors:
+        for dt in (_C.int64, _C.int32, _C.uint8, _C.bool):
+            try:
+                call(dt)
+            except RuntimeError as e:
+                assert str(e) == message, (label, dt, str(e))
+            else:
+                raise AssertionError(
+                    f"{label} let a {dt} tensor require gradients; upstream "
+                    f"raises {message!r} (docs/BACKWARD2.md §4.2)"
+                )
+        # ... and a floating dtype goes through every door.
+        call(_C.float32)
+        # `requires_grad = False` is *not* refused on an integer tensor at any
+        # door: upstream only objects to True, and `nn.Module._apply` writes
+        # False over integer buffers on every `.to()`.
+        assert _vf("ones")(2, dtype=_C.int64, requires_grad=False).requires_grad is False
+        assert _vf("ones")(2, dtype=_C.int64).requires_grad_(False).requires_grad is False
 
 
 def test_torch_tensor_builds_data_and_goes_through_lift_fresh():
@@ -2833,13 +2979,33 @@ def test_randn_refuses_an_integer_dtype_by_naming_it():
         raise AssertionError("torch.randn(dtype=torch.int64) must be refused")
 
 
-def test_randn_refuses_requires_grad_true_by_name():
+def test_randn_carries_requires_grad_through_its_composite():
+    """The inversion of `test_randn_refuses_requires_grad_true_by_name`, and it
+    checks something the refusal made unreachable.
+
+    `randn` is not a kernel here: it is `empty` followed by an in-place
+    `normal_`. So the flag is set on the tensor `empty` returns and has to
+    **survive the in-place fill** -- if `normal_` returned a fresh Python object
+    wrapping the same data, `torch.randn(requires_grad=True)` would silently
+    come back with the flag off. Nothing could check that while the whole path
+    refused. docs/BACKWARD2.md §4.1.
+    """
+    for name in ("randn", "rand"):
+        made = getattr(_C._VariableFunctions, name)(2, 2, requires_grad=True)
+        assert made.requires_grad is True, f"torch.{name} lost the flag over its in-place fill"
+        assert made.shape == (2, 2)
+        assert getattr(_C._VariableFunctions, name)(2, 2).requires_grad is False
+    # `*_like` takes the other composite path, through `empty_like`.
+    base = _C._VariableFunctions.ones(2, 2)
+    assert _C._VariableFunctions.randn_like(base, requires_grad=True).requires_grad is True
+    # An integer dtype is still refused, and by the *dtype* rule rather than by
+    # `normal_`'s -- the two refusals are different and both must survive.
     try:
-        _C._VariableFunctions.randn(2, 2, requires_grad=True)
-    except NotImplementedError as e:
-        assert "requires_grad" in str(e)
+        _C._VariableFunctions.randn(2, 2, dtype=_C.int64, requires_grad=True)
+    except RuntimeError as e:
+        assert "can require gradients" in str(e) or "int64" in str(e), str(e)
     else:
-        raise AssertionError("torch.randn(requires_grad=True) must be refused")
+        raise AssertionError("randn(dtype=int64, requires_grad=True) must be refused")
 
 
 def test_randn_and_rand_refuse_out_by_name_rather_than_silently_ignoring_it():

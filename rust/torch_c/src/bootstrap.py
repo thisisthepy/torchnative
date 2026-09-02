@@ -69,6 +69,11 @@ import numbers as _numbers
 import os
 import re
 import sys
+# `threading` for `_install_thread_local_store` only. Upstream's
+# `_stash_obj_in_tls` is a C++ thread-local, and a module-level dict would be a
+# *different* semantics that happens to agree in a single-threaded process --
+# docs/BACKWARD2.md §4.3.
+import threading
 import types
 
 # ---------------------------------------------------------------------------
@@ -2437,30 +2442,116 @@ def _describe_call(args, kwargs) -> str:
 
 
 # Python-level keyword arguments torch's factory functions accept that no aten
-# schema mentions. They are the autograd knob, and this shim has no autograd
-# (DESIGN.md §3 stage 0) -- so `requires_grad=False` is dropped and
-# `requires_grad=True` is refused by name rather than ignored, which would hand
-# back a tensor that silently does not record anything.
-def _strip_python_only_kwargs(name: str, kwargs: dict) -> dict:
+# schema mentions. `requires_grad` is the autograd knob, and this shim has no
+# autograd (DESIGN.md §3 stage 0) -- so the flag is *carried*, exactly as
+# `TensorBase.requires_grad_` has always carried it, and `backward()` is where
+# the absence is reported.
+#
+# **It used to be refused here, and docs/BACKWARD2.md §4.1 is why it is not.**
+# The refusal's stated ground was that "returning a tensor that quietly records
+# nothing would be worse than refusing", and that ground does not survive being
+# measured, for one reason:
+#
+#     torch.ones(2, 2, requires_grad=True)      <- refused
+#     torch.ones(2, 2).requires_grad_(True)     <- succeeds, and always has
+#
+# Both produce the same object. So the refusal protected nobody: it redirected
+# a caller to a spelling that hands over the identical tensor **with no warning
+# at all**, which is strictly worse than either accepting or refusing both. The
+# boundary has not moved -- `Tensor.backward()` still refuses, by name, and now
+# it is the *first* wall a `.backward()` reaches rather than the third.
+#
+# `torchnative.adapt`'s stage-2 refusal is the load-bearing consumer and it gets
+# more accurate, not less: its probe is
+# `torch.ones(1, requires_grad=True).sum().backward()`, which before this change
+# refused at the *factory* -- no evidence about autograd at all, since
+# `.requires_grad_(True)` walks past it -- and now refuses at `.backward()`,
+# which is the thing the sentence claims to test.
+def _strip_python_only_kwargs(name: str, kwargs: dict):
+    """Returns `(kwargs_for_the_schema, requires_grad)`.
+
+    The flag comes back rather than being applied here because this runs
+    *before* the dispatch that makes the tensor. `_apply_requires_grad` is the
+    other half, and both call sites use it.
+    """
     # Nothing to strip out of nothing, and the overwhelming majority of calls
     # arrive with no keyword arguments at all. A fresh dict rather than the
     # caller's, so the result is still something the caller may keep.
     if not kwargs:
-        return {}
+        return {}, False
     kwargs = dict(kwargs)
-    if kwargs.pop("requires_grad", False):
-        raise NotImplementedError(
-            f"not implemented in torch._C shim: torch.{name}(requires_grad=True) "
-            f"-- there is no autograd behind this shim, and returning a tensor "
-            f"that quietly records nothing would be worse than refusing"
-        )
+    requires_grad = bool(kwargs.pop("requires_grad", False))
     # An explicit `out=None` is how the vendored tree spells "no out tensor".
     # Left in place it would fail to bind the `.out` overload (`out` is not
     # optional there) *and* fail to bind the plain one (`out` is not an
     # argument of it), so the call would report no matching overload.
     if "out" in kwargs and kwargs["out"] is None:
         del kwargs["out"]
-    return kwargs
+    return kwargs, requires_grad
+
+
+# Upstream's factory wording, transcribed from torch 2.13.0 by running the
+# failing case. It is a *third* spelling of one rule -- `TensorBase.requires_grad
+# = True` says "only Tensors of ...", `requires_grad_(True)` says "only Tensors
+# of floating point dtype ...", and this one capitalises. docs/BACKWARD2.md §4.2
+# records all three, measured side by side; reproducing each at the door that
+# produces it is what lets a caller grep for the text upstream gave them.
+_FACTORY_REQUIRES_GRAD_REFUSAL = (
+    "Only Tensors of floating point and complex dtype can require gradients"
+)
+
+
+def _refuse_non_floating_requires_grad(tensor, mode, message):
+    """Upstream's one rule: only a float or complex tensor may require grad.
+
+    Stated at three doors because upstream states it at three doors with three
+    different wordings (docs/BACKWARD2.md §4.2). `mode` is checked because
+    upstream only objects to `True` -- `requires_grad = False` goes through on
+    an integer tensor, and `nn.Module._apply` writes exactly that over integer
+    buffers.
+
+    A tensor whose `dtype` cannot answer either question is let through rather
+    than refused: this is a rule about which tensors may carry a flag, not a
+    place to invent a second dtype taxonomy.
+    """
+    if not mode:
+        return
+    dtype = getattr(tensor, "dtype", None)
+    if dtype is None:
+        return
+    if getattr(dtype, "is_floating_point", False) or getattr(dtype, "is_complex", False):
+        return
+    raise RuntimeError(message)
+
+
+def _apply_requires_grad(result, message=_FACTORY_REQUIRES_GRAD_REFUSAL):
+    """Carry `requires_grad=True` onto whatever a factory just built.
+
+    A call given `requires_grad=True` may return something that is not a tensor
+    -- `_torch_level_function` wraps every op and not only factories, and an op
+    with a tuple result reaches here the same way. A non-tensor cannot carry the
+    flag, and that is a `TypeError` rather than a silent drop, because a
+    silently dropped `requires_grad` is precisely the thing the old refusal was
+    written to prevent and the one part of its argument that was right.
+    """
+    tensorbase = _C_TENSORBASE[0]
+    if tensorbase is None or not isinstance(result, tensorbase):
+        raise TypeError(
+            "torch._C shim: requires_grad=True was given to a call that did not "
+            f"return a tensor ({type(result).__name__}), so there is nothing to "
+            "carry the flag"
+        )
+    _refuse_non_floating_requires_grad(result, True, message)
+    result.requires_grad = True
+    return result
+
+
+# Filled in by `install()` once `module.TensorBase` is reachable. A module-level
+# list rather than a global rebound later, so `_apply_requires_grad` reads a
+# container that exists at definition time; if `install()` ever forgot to fill
+# it, every `requires_grad=True` would fail loudly on the first call rather than
+# dropping the flag.
+_C_TENSORBASE = [None]
 
 
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
@@ -2518,6 +2609,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         name: list(entry.keys) for name, entry in sorted(methods.items())
     }
 
+    # `_apply_requires_grad`'s type test. Set before any factory can run, which
+    # is why it is here and not beside the `TensorBase` member installation
+    # further down.
+    _C_TENSORBASE[0] = module.TensorBase
+
     # -- types ------------------------------------------------------------
     resolved = {}
     for name, spec in _order_types(surface["types"]):
@@ -2525,6 +2621,13 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
             continue
         resolved[name] = _build_type(name, spec, "torch._C", resolved)
         setattr(module, name, resolved[name])
+
+    # The two walls a `Tensor.backward()` reaches, in the order it reaches
+    # them. Both are synthesised above as table-less stubs, and both are
+    # replaced here -- one because it is not autograd at all, the other because
+    # it is, and should say so. docs/BACKWARD2.md §4.3.
+    _install_thread_local_store(module)
+    _install_engine_refusal(module)
 
     # `torch.Size` is a real tuple subclass upstream and the tree relies on it
     # being one (`isinstance(x.shape, tuple)`, unpacking, slicing).
@@ -3370,13 +3473,16 @@ def _torch_level_function(name: str, dispatch, overloads):
                 res = fn._fast(args)
                 if res is not NotImplemented:
                     return res
-            # `_strip_python_only_kwargs({})` is `{}`, and `**kwargs` already
-            # handed us a fresh dict, so the call is skippable when it would
-            # have nothing to strip. Most calls are in that case.
-            key, bound = entry.resolve(
-                args, _strip_python_only_kwargs(name, kwargs) if kwargs else kwargs
-            )
-            return dispatch(key, **bound)
+            # `_strip_python_only_kwargs({})` is `({}, False)`, and `**kwargs`
+            # already handed us a fresh dict, so the call is skippable when it
+            # would have nothing to strip. Most calls are in that case.
+            if kwargs:
+                stripped, requires_grad = _strip_python_only_kwargs(name, kwargs)
+            else:
+                stripped, requires_grad = kwargs, False
+            key, bound = entry.resolve(args, stripped)
+            out = dispatch(key, **bound)
+            return _apply_requires_grad(out) if requires_grad else out
 
     fn.__name__ = name
     fn.__qualname__ = name
@@ -3425,17 +3531,19 @@ def _tensor_method(name: str, dispatch, entry):
             res = method._fast((self,) + args)
             if res is not NotImplemented:
                 return res
+        if kwargs:
+            stripped, requires_grad = _strip_python_only_kwargs(name, kwargs)
+        else:
+            stripped, requires_grad = kwargs, False
         try:
             # See `_torch_function` above for why the empty case skips the call.
-            key, bound = entry.resolve(
-                (self,) + args,
-                _strip_python_only_kwargs(name, kwargs) if kwargs else kwargs,
-            )
+            key, bound = entry.resolve((self,) + args, stripped)
         except TypeError:
             if is_dunder:
                 return NotImplemented
             raise
-        return dispatch(key, **bound)
+        out = dispatch(key, **bound)
+        return _apply_requires_grad(out) if requires_grad else out
 
     method.__name__ = name
     method.__qualname__ = f"TensorBase.{name}"
@@ -3815,11 +3923,11 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     # `requires_grad`/`pin_memory` refusals, instead.
     def new_tensor(self, data, *, dtype=None, device=None, requires_grad=False,
                     pin_memory=False):
-        if requires_grad:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: TensorBase.new_tensor("
-                "requires_grad=True) -- there is no autograd behind this shim"
-            )
+        # `requires_grad` is carried rather than refused -- see
+        # `_strip_python_only_kwargs` for the whole argument. `pin_memory` still
+        # refuses, and the two are not the same case: a pinned allocation is a
+        # capability this shim does not have, while the flag is one it has had
+        # all along under a different spelling.
         if pin_memory:
             raise NotImplementedError(
                 "not implemented in torch._C shim: TensorBase.new_tensor("
@@ -3829,10 +3937,11 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         device = self.device if device is None else device
         if isinstance(device, str):
             device = module.device(device)
-        return dispatch(
+        out = dispatch(
             "aten.lift_fresh.default",
             module._tensor_new_from_data(data, dtype, device),
         )
+        return _apply_requires_grad(out) if requires_grad else out
 
     new_tensor.__name__ = "new_tensor"
     new_tensor.__qualname__ = "TensorBase.new_tensor"
@@ -4498,12 +4607,20 @@ def _install_autograd_shape(tensorbase) -> None:
 
     The flag is carried, and the boundary is drawn where it can be seen:
 
-      * `requires_grad` stores and reports what was set. Nothing reads it.
+      * `requires_grad` stores and reports what was set. Nothing reads it --
+        but only a floating-point or complex tensor may carry it, which is
+        upstream's rule and was missing here until docs/BACKWARD2.md §1.4
+        measured it. `TensorBase.set_requires_grad` in `tensor.rs` is where it
+        is stated; `_refuse_non_floating_requires_grad` below is the same rule
+        under `requires_grad_`'s own upstream wording.
       * `grad_fn` and `grad` are always `None`, which is the truth -- no graph
         node was ever created and no gradient was ever accumulated.
       * `backward()` stays a raising stub, so code that actually depends on
         the flag meaning something fails by name rather than silently getting
-        zeros.
+        zeros. That refusal is the *whole* of the boundary now: since
+        docs/BACKWARD2.md §4.1 the factory keyword carries the flag instead of
+        refusing it, because `requires_grad_` had always carried it and the two
+        spellings disagreeing protected nobody.
 
     `data` returns `self`, not a detached alias. Upstream's `.data` shares
     storage with the original, so `p.data.normal_()` writes through to `p`;
@@ -4560,6 +4677,17 @@ def _install_autograd_shape(tensorbase) -> None:
     tensorbase._make_subclass = staticmethod(_make_subclass)
 
     def requires_grad_(self, mode=True):
+        # Upstream's *third* wording of the one dtype rule, transcribed from
+        # 2.13.0 by running the failing case. `requires_grad_` says "floating
+        # point dtype" and nothing about complex -- and then accepts a
+        # `complex64` tensor anyway, which is upstream's message being loose
+        # rather than upstream's behaviour differing. The behaviour is the same
+        # rule `TensorBase.set_requires_grad` enforces; only the text differs,
+        # and the text is what a caller greps for. docs/BACKWARD2.md §4.2.
+        _refuse_non_floating_requires_grad(
+            self, bool(mode),
+            "only Tensors of floating point dtype can require gradients",
+        )
         self.requires_grad = bool(mode)
         return self
 
@@ -4676,6 +4804,116 @@ def _install_grad_mode(module, varfns) -> None:
     module._shim_grad_state = state
 
 
+def _install_thread_local_store(module) -> None:
+    """`_stash_obj_in_tls` and its three siblings -- thread plumbing, not autograd.
+
+    `torch/autograd/graph.py:989` `_engine_run_backward` stashes a
+    `contextvars.Context` under the key `"context"` so that the engine's
+    **device threads** can read the compiler config, and removes it in a
+    `finally:`. That is the whole observable contract at this layer, and a
+    thread-local key/value store is a complete implementation of it -- the same
+    judgement `_install_grad_mode` records for `no_grad()`'s flag, where what is
+    implemented is the flag and not what the flag would govern.
+
+    **The reason to implement it is that it was standing in front of the wall
+    that matters.** docs/BACKWARD2.md §1.2 measured what a user got before:
+
+        >>> torch.ones(2,2).requires_grad_(True).sum().backward()
+        NotImplementedError: not implemented in torch._C shim: torch._C._stash_obj_in_tls
+
+    which says nothing about autograd, because `_stash_obj_in_tls` is not
+    autograd. Worse, stubbing only that one does not reveal the engine either:
+    `_engine_run_backward`'s `finally:` calls `_remove_obj_from_tls`, which then
+    raises **while the engine's own refusal is unwinding** and replaces it.
+    docs/BACKWARD.md §14.1 met the same masking shape inside `torch.save` and
+    called a refusal a `finally:` overwrites "a refusal nobody can size".
+
+    `threading.local()` rather than a module dict, deliberately. A dict would
+    agree with upstream in every single-threaded test that could be written here
+    and be a different semantics -- and the *reason* the key exists at all is
+    that upstream has more than one thread.
+    """
+    store = threading.local()
+
+    def _slots():
+        # `threading.local` gives each thread a fresh, empty instance, so the
+        # map has to be created on first touch per thread rather than once.
+        try:
+            return store.slots
+        except AttributeError:
+            store.slots = {}
+            return store.slots
+
+    def _stash_obj_in_tls(key, value):
+        _slots()[key] = value
+
+    def _get_obj_in_tls(key):
+        # Upstream raises if the key is absent rather than returning None, and
+        # `torch/_dynamo` reads this key only under an `_is_key_in_tls` guard.
+        # A `KeyError` here is the honest report; a `None` would be a value.
+        return _slots()[key]
+
+    def _is_key_in_tls(key):
+        return key in _slots()
+
+    def _remove_obj_from_tls(key):
+        _slots().pop(key, None)
+
+    for name, fn in (
+        ("_stash_obj_in_tls", _stash_obj_in_tls),
+        ("_get_obj_in_tls", _get_obj_in_tls),
+        ("_is_key_in_tls", _is_key_in_tls),
+        ("_remove_obj_from_tls", _remove_obj_from_tls),
+    ):
+        fn.__name__ = name
+        fn.__qualname__ = f"torch._C.{name}"
+        setattr(module, name, fn)
+
+
+def _install_engine_refusal(module) -> None:
+    """`_ImperativeEngine.run_backward` -- the wall, saying which wall it is.
+
+    This is where both `Tensor.backward()` and `torch.autograd.grad()` land
+    (docs/BACKWARD2.md §1.3 measured that it is one wall and not two), and with
+    `_install_thread_local_store` in place it is now the **first** thing a
+    `.backward()` reaches rather than the third.
+
+    Synthesised from `surface.json` it would refuse with `_make_function`'s
+    generic text, which names the method and nothing else. A refusal that names
+    the alternative that works is docs/DESIGN.md §6's shape, and here there
+    genuinely is one: `CaptureTrace.backward()` differentiates a *captured
+    region* and moves all 272 of SmolLM2-135M's parameters where upstream moves
+    them (docs/BACKWARD.md §4).
+
+    The distinction the message has to carry is the one
+    `test_the_autograd_boundary_is_where_autograd_md_says_it_is` exists to keep:
+    a tape differentiates **a recorded region**, `Tensor.backward()`
+    differentiates **whatever produced this tensor**, and the second needs a
+    graph node per op and a `requires_grad` flag that propagates through them.
+    Neither exists, and docs/BACKWARD2.md §1 walks all ten walls between here
+    and one that does.
+    """
+    engine = getattr(module, "_ImperativeEngine", None)
+    if engine is None:
+        return
+
+    def run_backward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "not implemented in torch._C shim: _ImperativeEngine.run_backward "
+            "-- Tensor.backward() and torch.autograd.grad() differentiate "
+            "whatever produced a tensor, which needs a graph node per op and a "
+            "requires_grad flag that propagates through them; neither exists "
+            "here, and docs/BACKWARD2.md §1 walks every wall between them. "
+            "What does exist is CaptureTrace.backward(), which differentiates a "
+            "*captured region* -- torchnative.adapt is the surface over it, and "
+            "_C._tape_rules() lists the derivative rules it has"
+        )
+
+    run_backward.__name__ = "run_backward"
+    run_backward.__qualname__ = "_ImperativeEngine.run_backward"
+    engine.run_backward = run_backward
+
+
 def _tensor_factory(module, dispatch):
     """`torch.tensor(...)`, which has no overload set to resolve against.
 
@@ -4702,21 +4940,20 @@ def _tensor_factory(module, dispatch):
             kwargs = {"dtype": dtype, "device": device,
                       "requires_grad": requires_grad, "pin_memory": pin_memory}
             return _through_torch_function_modes(tensor, (data,), kwargs)
-        if requires_grad:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: torch.tensor(requires_grad=True) "
-                "-- there is no autograd behind this shim"
-            )
+        # `requires_grad` is carried, not refused -- `_strip_python_only_kwargs`
+        # carries the argument. `pin_memory` is a different case and still
+        # refuses: it names an allocation this shim cannot make.
         if pin_memory:
             raise NotImplementedError(
                 "not implemented in torch._C shim: torch.tensor(pin_memory=True)"
             )
         if isinstance(device, str):
             device = module.device(device)
-        return dispatch(
+        out = dispatch(
             "aten.lift_fresh.default",
             module._tensor_new_from_data(data, dtype, device),
         )
+        return _apply_requires_grad(out) if requires_grad else out
 
     tensor.__name__ = "tensor"
     tensor.__qualname__ = "tensor"
