@@ -8784,7 +8784,27 @@ def test_core_ops_and_op_tags_agree():
     # inherited: `bernoulli_.float` -- the primitive it draws through, already
     # implemented -- is **not** in this count, because it is not core. Two ops
     # in the same family, one core and one not, is upstream's table again.
-    assert r["tag_core_count"] == 100, r["tag_core_count"]
+    #
+    # 101 with `full_like.default` (docs/DEMAND1.md §2), whose tags are
+    # `['core', 'pt2_compliant_tag']` -- the same pair `full.default` already
+    # counted here carries, read off `full_like`'s own entry rather than
+    # inherited from it. **+1 across three new kernels**, and the two that do
+    # not appear are the check that these were read one at a time:
+    #
+    #     full_like.default          ['core', 'pt2_compliant_tag']    <- counted
+    #     new_zeros.default          ['pt2_compliant_tag']
+    #     native_batch_norm.default  ['pt2_compliant_tag']
+    #
+    # `new_zeros` would have been easy to assume core from the other side too:
+    # one function in `aten.rs` serves it and `new_ones`, and a shared kernel
+    # invites a shared assumption. `new_ones.default` is `['pt2_compliant_tag']`
+    # and so is `new_zeros`; the pair agrees, and it was read rather than
+    # inferred. `native_batch_norm` is the sharper one -- the most generic
+    # vision-CNN primitive there is, and upstream still does not tag it core,
+    # because Core ATen's batch-norm member is `_native_batch_norm_legit`, the
+    # functionalised spelling that carries the alias annotations this one is
+    # measured not to have (docs/DEMAND1.md §1.1).
+    assert r["tag_core_count"] == 101, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -8990,9 +9010,28 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
 
     # 2. A rule exists and running it reaches something the shim lacks. The
     #    refusal carries the underlying reason, so the gap is findable.
+    #
+    #    **The reason moved when `full_like` landed, and it moved inward.**
+    #    Until docs/DEMAND1.md this read `"torch.full_like" in ...`, because
+    #    `zeros_like`'s decomposition reached a name with no table entry at all
+    #    and got the overload-resolution refusal. `aten.full_like.default` has
+    #    a kernel now, so the decomposition gets one argument further and stops
+    #    on `pin_memory=False` -- which upstream *accepts* and every factory in
+    #    this shim refuses through the shared `reject_unsupported`
+    #    (`full`, `new_ones`, `zeros_like` and the rest all behave this way).
+    #    So wall 2 still has the same example and the refusal still names
+    #    `full_like`; what changed is that it now names the one argument that
+    #    is missing rather than the whole op. Asserted on both halves so this
+    #    cannot drift back to a vaguer message unnoticed.
+    #
+    #    Giving `full_like` alone a `pin_memory=False` fast path would have
+    #    made `zeros_like` lower and left wall 2 with no example -- and it
+    #    would have made one factory disagree with its siblings about an
+    #    argument none of them supports. The gap is real and stays named.
     assert r["refuse_unrunnable"] != "ACCEPTED"
     assert "aten.zeros_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
-    assert "torch.full_like" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "aten.full_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "pin_memory" in r["refuse_unrunnable"], r["refuse_unrunnable"]
 
     # 3. A rule exists, runs, and produces a result the recording disagrees
     #    with. **No op does this any more.** Every non-core op that reaches
@@ -10193,7 +10232,30 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # fifteen in-place schemas is declared in the yaml (`from_tables` below
     # is unchanged), because these are ordinary leaf ops upstream ships, not
     # a torchgen-only `.out` variant.
-    assert len(keys) == 268, len(keys)
+    #
+    # 254 with docs/DEMAND1.md's `full_like` and `new_zeros`. **+3, and the
+    # split is the check**: `full_like` is `overloads.json`-only and
+    # contributes two (`aten::full_like|default` and `aten::full_like|out`,
+    # the `.out` carried with no kernel behind it so that
+    # `torch.full_like(x, v, out=y)` refuses by the right name, exactly as
+    # `zeros_like.out` beside it does), while `new_zeros` is
+    # `methods.json`-only and contributes one -- upstream has
+    # `Tensor.new_zeros` and no `torch.new_zeros` (`hasattr(torch,
+    # "new_zeros")` is False on 2.13.0), checked the way `repeat`'s entry
+    # above was.
+    #
+    # Getting +4 would mean `new_zeros.out` had been listed as well; it is
+    # deliberately not, mirroring `new_ones` beside it, which has an `.out`
+    # overload upstream and does not carry it here either. Getting +1 would
+    # mean `native_batch_norm` had been given a table entry -- and it must not
+    # have one. The name a caller spells is `torch.batch_norm`, whose
+    # parser-level key is `aten::batch_norm`, which is
+    # `CompositeImplicitAutograd` and never reaches a kernel; the leaf this
+    # shim implements is reached through a `bootstrap.py` composite instead,
+    # the same boundary `layer_norm` and `group_norm` sit on.
+    # Both landed in the same round pair: 251 + 17 (INPLACE.md) + 3
+    # (DEMAND1.md) = 271.
+    assert len(keys) == 271, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -10214,6 +10276,15 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `sigmoid.out`, `all.out`, `all.dims_out` and `all.all_out` -- every other
     # `.out` schema this round added -- so those five are answered by the file
     # and only `flip.out` is not.
+    #
+    # `full_like.out` is the ninth (docs/DEMAND1.md §2), and it completes the
+    # `*_like.out` set: `zeros_like.out`, `ones_like.out`, `empty_like.out` and
+    # now `full_like.out` are all torchgen-generated and none of the four is
+    # declared in the yaml. The check that this is that mechanism and not a
+    # transcription slip is `new_zeros`, added in the same change: the yaml
+    # *does* declare `aten::new_zeros`, so it is answered by the file and does
+    # not appear here. Two table entries in one round, one generated and one
+    # declared, landing on opposite sides of this list is what the list is for.
     assert from_tables == [
         ("aten::div", "Scalar_mode_out"),
         ("aten::div", "Scalar_out"),
@@ -10221,6 +10292,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
         ("aten::empty_like", "out"),
         ("aten::flip", "out"),
         ("aten::floor_divide", "Scalar_out"),
+        ("aten::full_like", "out"),
         ("aten::ones_like", "out"),
         ("aten::zeros_like", "out"),
     ], from_tables
@@ -18018,6 +18090,401 @@ def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_
     eq("native_group_norm_fn", [[2, 6, 3], [2, 3], [2, 3]])
     got = out.get("native_group_norm_member", "")
     assert got.startswith("ERROR:AttributeError"), got
+
+
+# ---------------------------------------------------------------------------
+# docs/DEMAND1.md -- the top of the demand list, through the vendored tree
+#
+# The golden harness compares by *dispatch key*, so it is structurally unable
+# to see a missing spelling (docs/SPELLINGS.md's `stack`/`amax` lesson: a
+# kernel golden-compared for months behind a door that did not exist). Two of
+# this round's four items -- `as_tensor` and `meshgrid` -- are spellings with
+# no new kernel at all, so the harness cannot see them even in principle.
+# Hence the road-script pattern: a real `import torch` against the vendored
+# tree, exercising the names a model actually writes.
+#
+# Every value below is transcribed from upstream torch 2.13.0 run on the same
+# script, not read off this shim.
+_DEMAND1_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+torch.manual_seed(0)
+
+# --- rank 1: nn.BatchNorm2d, the call docs/DEMAND.md says refuses ---------
+# TRAINING. The output is checked, and so are the running statistics -- a
+# kernel that returns the right values and leaves running_mean untouched
+# passes any test that reads only the output.
+m = nn.BatchNorm2d(3)
+rec("bn_train_out", lambda: m(torch.ones(1, 3, 4, 4)).flatten()[:4].tolist())
+rec("bn_train_running_mean", lambda: m.running_mean.tolist())
+rec("bn_train_running_var", lambda: m.running_var.tolist())
+rec("bn_train_num_batches", lambda: m.num_batches_tracked.item())
+
+# EVAL. Nothing must move.
+x = torch.arange(24, dtype=torch.float32).reshape(1, 3, 2, 4) / 7.0
+me = nn.BatchNorm2d(3)
+me.running_mean.copy_(torch.tensor([0.25, 0.5, 0.75]))
+me.running_var.copy_(torch.tensor([1.5, 2.0, 0.5]))
+me.eval()
+rec("bn_eval_out", lambda: me(x).flatten()[:4].tolist())
+rec("bn_eval_running_mean", lambda: me.running_mean.tolist())
+rec("bn_eval_running_var", lambda: me.running_var.tolist())
+rec("bn_eval_num_batches", lambda: me.num_batches_tracked.item())
+
+rec("bn1d_shape", lambda: list(nn.BatchNorm1d(3)(torch.randn(4, 3)).shape))
+rec("bn3d_shape", lambda: list(nn.BatchNorm3d(3)(torch.randn(2, 3, 2, 2, 2)).shape))
+rec("bn_affine_false", lambda: nn.BatchNorm2d(3, affine=False)(x).flatten()[:3].tolist())
+
+# `track_running_stats=False` in eval: the module passes training=True so the
+# kernel never sees the eval-with-no-statistics combination upstream crashes on.
+def _no_stats():
+    mm = nn.BatchNorm2d(3, track_running_stats=False)
+    mm.eval()
+    return mm(x).flatten()[:3].tolist()
+rec("bn_no_stats_eval", _no_stats)
+
+# The composite's own refusals, upstream's wording, in the measured order.
+rec("bn_bad_weight", lambda: torch.batch_norm(
+    x, torch.ones(4), torch.zeros(3), torch.zeros(3), torch.ones(3),
+    True, 0.1, 1e-5, False))
+rec("bn_bad_both", lambda: torch.batch_norm(
+    x, torch.ones(4), torch.zeros(3), torch.zeros(5), torch.ones(3),
+    True, 0.1, 1e-5, False))
+rec("bn_eval_no_stats", lambda: torch.batch_norm(
+    x, None, None, None, None, False, 0.1, 1e-5, False))
+rec("bn_numel_zero", lambda: list(torch.batch_norm(
+    torch.zeros(0, 3, 2, 2), torch.ones(4), torch.zeros(3), torch.zeros(3),
+    torch.ones(3), True, 0.1, 1e-5, False).shape))
+rec("bn_verify_batch_size", lambda: F.batch_norm(
+    torch.ones(1, 3, 1, 1), None, None, None, None, True, 0.1, 1e-5))
+
+# --- rank 3: torch.full_like, T5's line ----------------------------------
+rp = torch.tensor([[0, 5, 20], [3, 1, 9]])
+rec("full_like_t5", lambda: torch.full_like(rp, 31).tolist())
+rec("full_like_t5_dtype", lambda: str(torch.full_like(rp, 31).dtype))
+rec("full_like_float_into_int", lambda: torch.full_like(rp, 7.5).flatten()[:2].tolist())
+rec("full_like_override", lambda: str(torch.full_like(rp, 3, dtype=torch.float32).dtype))
+
+# --- rank 5: Tensor.new_zeros, BART's shift_tokens_right ------------------
+ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+rec("new_zeros_bart", lambda: ids.new_zeros(ids.shape).tolist())
+rec("new_zeros_dtype", lambda: str(ids.new_zeros(ids.shape).dtype))
+rec("new_zeros_varargs", lambda: ids.new_zeros(2, 2).tolist())
+
+# --- rank 4: torch.as_tensor ---------------------------------------------
+rec("as_tensor_list", lambda: torch.as_tensor([1, 2, 3]).tolist())
+rec("as_tensor_list_dtype", lambda: str(torch.as_tensor([1, 2, 3]).dtype))
+rec("as_tensor_nested", lambda: torch.as_tensor([[1, 2], [3, 4]]).tolist())
+rec("as_tensor_cast", lambda: str(torch.as_tensor([1, 2, 3], dtype=torch.float32).dtype))
+t = torch.zeros(3)
+# The identity rows. `as_tensor` of a tensor that needs no conversion returns
+# THE SAME OBJECT -- this is the whole difference from `torch.tensor`, and a
+# copy would be right on values and wrong here.
+rec("as_tensor_identity", lambda: torch.as_tensor(t) is t)
+rec("as_tensor_identity_same_dtype", lambda: torch.as_tensor(t, dtype=torch.float32) is t)
+rec("as_tensor_recast_not_identity", lambda: torch.as_tensor(t, dtype=torch.float64) is t)
+rec("as_tensor_recast_dtype", lambda: str(torch.as_tensor(t, dtype=torch.float64).dtype))
+
+# --- honourable mention: torch.meshgrid, swin's construction --------------
+a, b = torch.arange(3), torch.arange(4)
+rec("meshgrid_ij", lambda: [g.tolist() for g in torch.meshgrid(a, b, indexing="ij")])
+rec("meshgrid_xy", lambda: [g.tolist() for g in torch.meshgrid(a, b, indexing="xy")])
+rec("meshgrid_default_shapes", lambda: [list(g.shape) for g in torch.meshgrid(a, b)])
+rec("meshgrid_list_shapes", lambda: [list(g.shape) for g in torch.meshgrid([a, b], indexing="ij")])
+rec("meshgrid_three_shapes",
+    lambda: [list(g.shape) for g in torch.meshgrid(a, b, torch.arange(2), indexing="ij")])
+rec("meshgrid_scalar_shapes",
+    lambda: [list(g.shape) for g in torch.meshgrid(torch.tensor(1), b, indexing="ij")])
+
+# --- capture: the op that mutates without saying so ----------------------
+# `capture.rs::is_mutating` reads torch's trailing-underscore convention.
+# `native_batch_norm` has no underscore and mutates anyway, so this is the
+# one place the name rule is not enough. Both directions are exercised: a
+# training-mode capture must be refused, an eval-mode one must succeed.
+#
+# `torch.batch_norm` and NOT `nn.BatchNorm2d`, deliberately: the module's
+# `num_batches_tracked += 1` is an `aten.add_.Scalar`, which the ordinary
+# name rule refuses first, so a module-level probe reports a refusal that
+# would arrive with or without this guard and proves nothing about it.
+def _capture(training, stats=True):
+    inp = torch.ones(1, 3, 4, 4)
+    w, b = torch.ones(3), torch.zeros(3)
+    rm = torch.zeros(3) if stats else None
+    rv = torch.ones(3) if stats else None
+    torch._C._capture_begin([inp])
+    try:
+        y = torch.batch_norm(inp, w, b, rm, rv, training, 0.1, 1e-5, False)
+    except Exception as e:
+        try:
+            torch._C._capture_end(None)
+        except Exception:
+            pass
+        return f"FORWARD-ERROR:{type(e).__name__}:{e}"
+    try:
+        trace = torch._C._capture_end([y])
+    except NotImplementedError as e:
+        return f"refused:{e}"
+    # Not just "it did not raise" -- name the ops that got recorded, so an
+    # EMPTY trace cannot pass for a captured one.
+    return "CAPTURED:" + ",".join(sorted({n["op"] for n in trace.nodes}))
+
+rec("capture_bn_training", lambda: _capture(True))
+rec("capture_bn_eval", lambda: _capture(False))
+# Training with no running statistics: nothing to mutate, so recordable.
+rec("capture_bn_training_no_stats", lambda: _capture(True, stats=False))
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _demand1_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _DEMAND1_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"demand1-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def _close(got, want, tol=1e-5):
+    assert isinstance(got, list), got
+    assert len(got) == len(want), (got, want)
+    for g, w in zip(got, want):
+        assert abs(float(g) - float(w)) <= tol, (got, want)
+
+
+def test_demand1_batch_norm_moves_the_running_statistics_in_training_and_not_in_eval():
+    """docs/DEMAND.md rank 1, through a real `nn.BatchNorm2d`.
+
+    `nn.BatchNorm2d(3)(torch.ones(1,3,4,4))` refused before this round; it is
+    the wall `resnet` and `mobilenet_v2` both stopped on, one layer past a stem
+    `conv2d` that already worked.
+
+    **The running statistics are asserted, not just the output.** That is the
+    point of this test rather than an extra: `native_batch_norm` writes
+    `running_mean`/`running_var` in place while declaring no alias on any
+    argument (measured, docs/DEMAND1.md §1.1), so a kernel that computes the
+    right output and never touches them passes anything that reads only the
+    return value. Both modes are checked, because the mutation is the half that
+    differs between them and "eval leaves them alone" is as much a claim as
+    "training moves them".
+
+    Values transcribed from upstream torch 2.13.0 run on the same script.
+
+    `running_var` after one training step on a constant input is the row that
+    pins the **unbiased** variance: the batch variance of a constant is 0
+    either way, so this one says only that `eps` does not leak into the update
+    (0.9*1 + 0.1*0 = 0.9). The unbiased-versus-biased distinction itself is
+    pinned by the golden harness's `momentum=1` case, where the old value drops
+    out and the two differ; here it would not.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _demand1_road_fixture()
+
+    # Training: a constant input normalises to 0, then bias (0) -- and the
+    # statistics move.
+    _close(out["bn_train_out"], [0.0, 0.0, 0.0, 0.0])
+    _close(out["bn_train_running_mean"], [0.1, 0.1, 0.1])
+    _close(out["bn_train_running_var"], [0.9, 0.9, 0.9])
+    assert out["bn_train_num_batches"] == 1, out["bn_train_num_batches"]
+
+    # Eval: the seeded statistics are used and NOT touched.
+    # `nn.BatchNorm2d(3)`'s default affine is weight=1, bias=0, so these are
+    # `(x - running_mean) / sqrt(running_var + eps)` with the statistics seeded
+    # above: `(0 - 0.25) / sqrt(1.5 + 1e-5)` is the first.
+    _close(
+        out["bn_eval_out"],
+        [-0.20412346720695496, -0.08748148381710052,
+         0.029160499572753906, 0.14580246806144714],
+    )
+    _close(out["bn_eval_running_mean"], [0.25, 0.5, 0.75])
+    _close(out["bn_eval_running_var"], [1.5, 2.0, 0.5])
+    assert out["bn_eval_num_batches"] == 0, out["bn_eval_num_batches"]
+
+    # Every rank the three module classes cover; `HxW` is derived, not assumed.
+    assert out["bn1d_shape"] == [4, 3], out["bn1d_shape"]
+    assert out["bn3d_shape"] == [2, 3, 2, 2, 2], out["bn3d_shape"]
+    # `affine=False` and `track_running_stats=False` reach the same normalised
+    # values by two different routes -- the first passes weight/bias as None,
+    # the second passes the statistics as None and flips `training` to True.
+    _close(
+        out["bn_affine_false"],
+        [-1.527453899383545, -1.091038465499878, -0.6546230316162109],
+    )
+    _close(
+        out["bn_no_stats_eval"],
+        [-1.527453899383545, -1.091038465499878, -0.6546230316162109],
+    )
+
+
+def test_demand1_batch_norm_composite_refuses_with_upstreams_wording_and_order():
+    """The four length checks belong to `torch.batch_norm`, not to the kernel.
+
+    Upstream's leaf does not check them -- it reads past the end of the buffer
+    (docs/DEMAND1.md §1.6) -- so these messages come from the composite in
+    `bootstrap.py`, transcribed from upstream's own. The **order** is asserted
+    as well as the wording: a call with a wrong `weight` and a wrong
+    `running_mean` must report the `running_mean` one, because `running_mean`
+    is checked first. Reversing the four checks would leave three of these
+    assertions passing.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _demand1_road_fixture()
+
+    assert out["bn_bad_weight"] == (
+        "ERROR:RuntimeError:weight should contain 3 elements not 4"
+    ), out["bn_bad_weight"]
+    # Both wrong -- running_mean is checked first, so weight's message must NOT
+    # be the one that comes back.
+    assert out["bn_bad_both"] == (
+        "ERROR:RuntimeError:running_mean should contain 3 elements not 5"
+    ), out["bn_bad_both"]
+    # Upstream SEGFAULTS at the leaf for this combination (exit 139, reproduced
+    # twice, docs/DEMAND1.md §1.6). The composite refuses first, upstream and
+    # here alike, which is why no golden case exists for it -- one would take
+    # the harness process down rather than fail.
+    assert out["bn_eval_no_stats"] == (
+        "ERROR:RuntimeError:running_mean must be defined in evaluation mode"
+    ), out["bn_eval_no_stats"]
+    # `numel == 0` short-circuits BEFORE the four checks: this call has a
+    # deliberately wrong `weight` and succeeds anyway.
+    assert out["bn_numel_zero"] == [0, 3, 2, 2], out["bn_numel_zero"]
+    # And `F.batch_norm`'s own `_verify_batch_size`, which is upstream's Python
+    # in the vendored tree and above all of this.
+    got = out["bn_verify_batch_size"]
+    assert got.startswith("ERROR:ValueError:Expected more than 1 value per channel"), got
+
+
+def test_demand1_capture_refuses_batch_norm_only_when_the_call_actually_mutates():
+    """The one op whose name does not carry torch's mutation convention.
+
+    `capture.rs::is_mutating` asks whether the op name ends in `_`. That is
+    right for every op that follows the convention, and `native_batch_norm`
+    does not: it writes `running_mean`/`running_var` and its schema declares no
+    alias on anything.
+
+    Both directions are asserted, and the second is the one that makes the
+    first worth having. Refusing the *name* would have been a one-liner and
+    would have made every BatchNorm CNN uncapturable -- eval mode is what an
+    inference graph is in, and eval mode is measured to touch nothing. So the
+    guard is per call, and the two `CAPTURED` rows are the control: if either
+    ever starts being refused, the guard has widened into the thing it was
+    written to avoid.
+
+    **The probe calls `torch.batch_norm`, not `nn.BatchNorm2d`, and that is
+    load-bearing.** Written the obvious way against the module first, this
+    test passed while proving nothing: the module's `num_batches_tracked += 1`
+    is an `aten.add_.Scalar`, the ordinary trailing-underscore rule refuses it
+    before `native_batch_norm` is ever recorded, and the refusal that came back
+    named `add_`. Deleting this guard entirely left that version green.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _demand1_road_fixture()
+
+    got = out["capture_bn_training"]
+    assert got.startswith("refused:"), got
+    assert "aten.native_batch_norm.default" in got, got
+    assert "running_mean/running_var in place" in got, got
+    assert "single-assignment" in got, got
+    # Not `add_` -- see the docstring. If this ever fires, the probe has
+    # stopped reaching the guard.
+    assert "add_" not in got, got
+
+    # The controls. Eval-mode batch norm mutates nothing, and neither does
+    # training mode with no running statistics to update. Both must record --
+    # and must record the op itself, so an EMPTY trace cannot pass for a
+    # captured one.
+    assert out["capture_bn_eval"] == "CAPTURED:aten.native_batch_norm.default", (
+        out["capture_bn_eval"]
+    )
+    assert out["capture_bn_training_no_stats"] == (
+        "CAPTURED:aten.native_batch_norm.default"
+    ), out["capture_bn_training_no_stats"]
+
+
+def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tree():
+    """`full_like`, `new_zeros`, `as_tensor` and `meshgrid`, as a model spells them.
+
+    Two of the four have no new kernel behind them at all -- `as_tensor` routes
+    to `lift_fresh`/`_to_copy` and `meshgrid` to `view`/`expand`, all four of
+    which have been implemented and golden-compared for rounds. The golden
+    harness dispatches by key and is therefore structurally unable to notice
+    that either name existed, which is exactly the `stack`/`amax` shape
+    docs/SPELLINGS.md records. This test is the only thing that can see them.
+
+    Values transcribed from upstream torch 2.13.0.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _demand1_road_fixture()
+
+    # rank 3 -- T5's `torch.full_like(relative_position_if_large, num_buckets - 1)`.
+    assert out["full_like_t5"] == [[31, 31, 31], [31, 31, 31]], out["full_like_t5"]
+    assert out["full_like_t5_dtype"] == "torch.int64", out["full_like_t5_dtype"]
+    # The row that separates `full_like` from `full`: the dtype comes from the
+    # reference tensor, so a float fill into an int64 reference truncates and
+    # stays int64. `torch.full([2,3], 7.5)` would be a float holding 7.5.
+    assert out["full_like_float_into_int"] == [7, 7], out["full_like_float_into_int"]
+    assert out["full_like_override"] == "torch.float32", out["full_like_override"]
+
+    # rank 5 -- BART's `input_ids.new_zeros(input_ids.shape)`.
+    assert out["new_zeros_bart"] == [[0, 0, 0], [0, 0, 0]], out["new_zeros_bart"]
+    assert out["new_zeros_dtype"] == "torch.int64", out["new_zeros_dtype"]
+    assert out["new_zeros_varargs"] == [[0, 0], [0, 0]], out["new_zeros_varargs"]
+
+    # rank 4 -- `torch.as_tensor`, and the identity rows are the whole point.
+    assert out["as_tensor_list"] == [1, 2, 3], out["as_tensor_list"]
+    assert out["as_tensor_list_dtype"] == "torch.int64", out["as_tensor_list_dtype"]
+    assert out["as_tensor_nested"] == [[1, 2], [3, 4]], out["as_tensor_nested"]
+    assert out["as_tensor_cast"] == "torch.float32", out["as_tensor_cast"]
+    assert out["as_tensor_identity"] is True, out["as_tensor_identity"]
+    assert out["as_tensor_identity_same_dtype"] is True, out["as_tensor_identity_same_dtype"]
+    # A real conversion is a new object, and the dtype changed.
+    assert out["as_tensor_recast_not_identity"] is False, out["as_tensor_recast_not_identity"]
+    assert out["as_tensor_recast_dtype"] == "torch.float64", out["as_tensor_recast_dtype"]
+
+    # honourable mention -- `torch.meshgrid`, `swin`'s relative-position index.
+    assert out["meshgrid_ij"] == [
+        [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2]],
+        [[0, 1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3]],
+    ], out["meshgrid_ij"]
+    # `"xy"` transposes the *shape* as well as the content -- (4,3), not (3,4).
+    # A composite that produced `"ij"` and ignored `indexing` gives (3,4) here.
+    assert out["meshgrid_xy"] == [
+        [[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]],
+        [[0, 0, 0], [1, 1, 1], [2, 2, 2], [3, 3, 3]],
+    ], out["meshgrid_xy"]
+    assert out["meshgrid_default_shapes"] == [[3, 4], [3, 4]], out["meshgrid_default_shapes"]
+    assert out["meshgrid_list_shapes"] == [[3, 4], [3, 4]], out["meshgrid_list_shapes"]
+    assert out["meshgrid_three_shapes"] == [
+        [3, 4, 2], [3, 4, 2], [3, 4, 2]
+    ], out["meshgrid_three_shapes"]
+    # A 0-d input counts as extent 1.
+    assert out["meshgrid_scalar_shapes"] == [[1, 4], [1, 4]], out["meshgrid_scalar_shapes"]
 
 
 if __name__ == "__main__":

@@ -204,6 +204,59 @@ fn is_mutating(op: &str) -> bool {
     op.rsplit_once('.').is_some_and(|(head, _)| head.ends_with('_'))
 }
 
+/// Ops that mutate an argument and whose **name does not say so**.
+///
+/// `is_mutating` above is torch's own convention, and it is right for every op
+/// that follows it -- which is why nothing here needed a list until now.
+/// `aten::native_batch_norm` breaks it: its schema declares no alias on any
+/// argument (measured on 2.13.0, every `alias_info` is `None`) and it writes
+/// `running_mean`/`running_var` in place anyway when `training=True`. Upstream
+/// knows -- `_native_batch_norm_legit` exists beside it carrying the
+/// `Tensor(a!)` annotations the functionaliser needs, which is the only reason
+/// the discrepancy is survivable there.
+///
+/// It would not have been survivable here. Without this, a training-mode
+/// BatchNorm would have been recorded as a pure node and replaying the trace
+/// would advance the running statistics a second time: the trace would not be
+/// single-assignment, which is the one property this module exists to keep.
+///
+/// **The judgement is per call, not per name**, and that is why it lives here
+/// rather than in a widened `is_mutating`. Measured (docs/DEMAND1.md §1.3):
+/// with `training=False` this op touches nothing -- the running statistics come
+/// back byte-identical and `save_mean`/`save_invstd` are empty. Eval is the
+/// mode a captured inference graph is in and the mode every BatchNorm CNN
+/// backbone runs in here, so refusing the name outright would have made all of
+/// them uncapturable to buy nothing. A call with no running statistics at all
+/// (`nn.BatchNorm2d(track_running_stats=False)`) has nothing to mutate in
+/// either mode and is likewise recordable.
+const MUTATES_WITHOUT_UNDERSCORE: &[&str] = &["aten.native_batch_norm.default"];
+
+/// Whether this *particular* call of a `MUTATES_WITHOUT_UNDERSCORE` op writes.
+///
+/// Reads the same argument positions the kernel does, positionally or by
+/// keyword, because `bootstrap.py`'s `batch_norm` composite passes them
+/// positionally and a direct `torch.ops.aten` call need not.
+fn mutates_this_call(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> bool {
+    if op != "aten.native_batch_norm.default" {
+        // The list has one member; a second one arriving without its own arm
+        // here should be refused outright rather than waved through.
+        return true;
+    }
+    let arg = |index: usize, name: &str| -> Option<Bound<'_, PyAny>> {
+        if let Ok(value) = args.get_item(index) {
+            return Some(value);
+        }
+        kwargs.and_then(|kw| kw.get_item(name).ok().flatten())
+    };
+    let training = arg(5, "training").is_some_and(|v| v.is_truthy().unwrap_or(true));
+    let has_stats = arg(3, "running_mean").is_some_and(|v| !v.is_none());
+    training && has_stats
+}
+
 /// Ops that consume the generator. Recorded traces are checked by replaying
 /// them and comparing against eager, and an op that legitimately differs on
 /// every call makes that check unable to fail -- which is worse than not
@@ -288,6 +341,20 @@ pub fn record(
         }
         if let Some(reason) = refusal_for(op) {
             rec.poison(reason);
+            return;
+        }
+        // The arg-aware half of the same question, for the one op whose name
+        // does not carry torch's mutation convention. See
+        // `MUTATES_WITHOUT_UNDERSCORE`.
+        if MUTATES_WITHOUT_UNDERSCORE.contains(&op) && mutates_this_call(op, args, kwargs) {
+            rec.poison(format!(
+                "{op} writes running_mean/running_var in place on this call \
+                 (training=True with running statistics supplied), even though its \
+                 schema declares no alias on any argument; capture refuses mutation so \
+                 that aliasing cannot be observed, which is what keeps a trace \
+                 single-assignment. The same op in eval mode touches nothing and IS \
+                 capturable"
+            ));
             return;
         }
 

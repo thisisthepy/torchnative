@@ -547,6 +547,9 @@
   "new_ones": [
     "aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
+  "new_zeros": [
+    "aten::new_zeros(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
 
   "fill_": [
     "aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)",

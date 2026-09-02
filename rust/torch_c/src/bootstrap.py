@@ -7958,6 +7958,243 @@ def _install_composites(module, varfns, dispatch) -> None:
         fn.__module__ = "torch._C"
         setattr(varfns, name, fn)
 
+    def batch_norm(input, weight, bias, running_mean, running_var, training,
+                    momentum, eps, cudnn_enabled):
+        """`torch.batch_norm` / `F.batch_norm` / every `nn.BatchNorm*d` forward.
+
+        docs/DEMAND.md's rank 1, and `layer_norm`/`group_norm`'s shape exactly:
+        `aten::batch_norm` is `CompositeImplicitAutograd`, so a
+        `TorchDispatchMode` logger on torch 2.13.0 sees `torch.batch_norm(...)`,
+        `F.batch_norm(...)` and an `nn.BatchNorm2d` forward all emit
+        `aten.native_batch_norm.default` (behind an `empty.memory_format` the
+        output allocation makes) and never `aten.batch_norm.default`. So this
+        is a composite and not an `overloads.json` entry, for the reason
+        `layer_norm`'s note above gives.
+
+        `cudnn_enabled` is accepted and ignored, as `layer_norm`'s
+        `cudnn_enable` and `group_norm`'s `cudnn_enabled` are: the CPU kernel
+        does not consult it.
+
+        **The four length checks are this function's, not the kernel's**, and
+        that is why they are here. Upstream's leaf does not check: measured
+        with three channels, a length-2 `weight` and a length-4 `weight` both
+        return, and both return bit-identical numbers to the correct length-3
+        call -- the short one having read a float past the end of its buffer
+        (docs/DEMAND1.md §1.6). Upstream's *composite* is what refuses, and
+        this is upstream's composite. The order below is measured, and it
+        shows: a call with a wrong `weight` **and** a wrong `running_mean`
+        reports the `running_mean` one.
+
+            num_features = input.size(1) if input.dim() >= 2 else 0
+              (rank 0 and rank 1 both report 0, measured -- both then fail the
+               running_mean check below with "should contain 0 elements")
+
+            1. running_mean  length, else "running_mean must be defined in evaluation mode"
+            2. running_var   length, else "running_var must be defined in evaluation mode"
+            3. weight        length
+            4. bias          length
+
+        **`input.numel() == 0` short-circuits before all four**, also measured
+        rather than assumed: `N=0` with a deliberately wrong `weight`
+        succeeds. Upstream's body for it is `out = input.clone()`, then
+        `out * weight[0]` and `out + bias[0]` if those are defined -- pinned by
+        `C=0`, which raises `IndexError: select(): index 0 out of range for
+        tensor of size [0] at dimension 0` from inside that `weight[0]`. The
+        running statistics are not touched on this path. Transcribed rather
+        than replaced by "return an empty tensor" because upstream's own
+        comment says why it clones: an empty tensor would break the gradient
+        chain, and the `weight[0]`/`bias[0]` keep the result attached to the
+        parameters.
+
+        `F.batch_norm`'s own two checks -- `_verify_batch_size` ("Expected more
+        than 1 value per channel when training") and the `eps` sign rules --
+        are above this, in the vendored tree, and are upstream's own Python.
+        Nothing is added for them here.
+        """
+        del cudnn_enabled
+        shape = list(input.shape)
+        num_features = shape[1] if len(shape) >= 2 else 0
+
+        numel = 1
+        for extent in shape:
+            numel *= extent
+        if numel == 0:
+            out = dispatch("aten.clone.default", input)
+            if weight is not None:
+                out = dispatch("aten.mul.Tensor", out, dispatch("aten.select.int", weight, 0, 0))
+            if bias is not None:
+                out = dispatch("aten.add.Tensor", out, dispatch("aten.select.int", bias, 0, 0))
+            return out
+
+        for name, value, needed_in_eval in (
+            ("running_mean", running_mean, True),
+            ("running_var", running_var, True),
+            ("weight", weight, False),
+            ("bias", bias, False),
+        ):
+            if value is None:
+                if needed_in_eval and not training:
+                    raise RuntimeError(f"{name} must be defined in evaluation mode")
+                continue
+            count = 1
+            for extent in value.shape:
+                count *= extent
+            if count != num_features:
+                raise RuntimeError(
+                    f"{name} should contain {num_features} elements not {count}"
+                )
+
+        result = dispatch(
+            "aten.native_batch_norm.default", input, weight, bias,
+            running_mean, running_var, training, momentum, eps,
+        )
+        return result[0]
+
+    batch_norm.__name__ = batch_norm.__qualname__ = "batch_norm"
+    batch_norm.__module__ = "torch._C"
+    setattr(varfns, "batch_norm", batch_norm)
+
+    def as_tensor(data, dtype=None, device=None):
+        """`torch.as_tensor` -- docs/DEMAND.md rank 4, a **spelling**, not a kernel.
+
+        `whisper`'s `.generate()` is the measured hit
+        (`generation_whisper.py:1608`, `_retrieve_init_tokens`), but
+        `transformers/generation/utils.py` calls it from several shared
+        helpers, so it is a wall a queue of already-running models is behind
+        rather than one model's.
+
+        Not an `overloads.json` entry, and the reason is `torch.tensor`'s
+        (`_tensor_factory`): `aten::as_tensor` exists as a schema, but the
+        Python binding is `THPVariable_as_tensor` -> `internal_new_from_data`,
+        and a `TorchDispatchMode` logger on 2.13.0 shows the real calls firing
+        something else entirely:
+
+            torch.as_tensor([1, 2, 3])              ->  aten.lift_fresh.default
+            torch.as_tensor(t, dtype=torch.float64) ->  aten._to_copy.default
+            torch.as_tensor(t)                      ->  NO record at all
+
+        Both of those primitives already have kernels and golden cases, so the
+        branch between them is the whole of the fix.
+
+        **The no-record row is the one worth writing down.** `torch.as_tensor(t)`
+        and `torch.as_tensor(t, dtype=t.dtype)` return the *same object* --
+        measured, `is` is True, not merely equal. That is the entire difference
+        between `as_tensor` and `tensor`, and returning a copy here would be
+        right on values and wrong on identity, which nothing downstream raises
+        about.
+
+        **What is NOT reproduced, said rather than papered over**:
+        `torch.as_tensor(ndarray)` upstream *shares memory* with the array
+        (measured -- mutating the array afterwards shows through the tensor).
+        This shim's tensors do not wrap foreign buffers, so an ndarray goes
+        through `lift_fresh` like a list does and is **copied**. Every measured
+        caller in `transformers` builds a fresh array or list and never touches
+        it again, so the difference has no observed consequence; it is still a
+        difference, and docs/DEMAND1.md §4 records it.
+        """
+        if _MODE_STACK:
+            return _through_torch_function_modes(
+                as_tensor, (data,), {"dtype": dtype, "device": device}
+            )
+        if isinstance(device, str):
+            device = module.device(device)
+        if isinstance(data, module.TensorBase):
+            # Already a tensor: "no conversion" is not a copy, it is identity.
+            if dtype is None or dtype == data.dtype:
+                return data
+            return dispatch("aten._to_copy.default", data, dtype=dtype)
+        return dispatch(
+            "aten.lift_fresh.default",
+            module._tensor_new_from_data(data, dtype, device),
+        )
+
+    as_tensor.__name__ = as_tensor.__qualname__ = "as_tensor"
+    as_tensor.__module__ = "torch._C"
+    setattr(varfns, "as_tensor", as_tensor)
+
+    def meshgrid(tensors, indexing=None):
+        """`torch._VF.meshgrid` -- `swin`'s wall, and a spelling over two ops
+        that have both been implemented for a long time.
+
+        `torch/functional.py:504` is `_VF.meshgrid(tensors, **kwargs)`, so this
+        is the name the vendored tree reaches. `aten::meshgrid` is
+        `CompositeImplicitAutograd`, and a `TorchDispatchMode` logger on 2.13.0
+        records, for two 1-D inputs and for **both** `indexing` values:
+
+            view.default, expand.default, view.default, expand.default
+
+        and nothing else. No transpose, no permute -- which is the measurement
+        that pins how `"xy"` is done, because the obvious implementation of
+        `"xy"` is a transpose of the `"ij"` result and a transpose would have
+        appeared in that trace.
+
+        `"xy"` is `"ij"` with the **first two inputs swapped and the first two
+        outputs swapped back**. Measured: `meshgrid(arange(3), arange(4),
+        indexing="xy")` gives two tensors of shape `(4, 3)`, which is what the
+        swap produces -- and also what a transpose would produce. The two agree
+        on shapes and on values; only the op trace tells them apart, so
+        following the trace rather than the shapes is what keeps this composite
+        honest about the ops a caller's capture will see.
+
+        A **0-d** input counts as extent 1, measured
+        (`meshgrid(tensor(1), arange(4))` gives two `(1, 4)`), which falls out
+        of the shape being empty rather than needing a case.
+
+        `indexing=None` means `"ij"`, with a `UserWarning` upstream that this
+        will become required. The warning is upstream's C++ and is not
+        reproduced; the default is.
+        """
+        if isinstance(tensors, module.TensorBase):
+            tensors = [tensors]
+        else:
+            tensors = list(tensors)
+            # `torch.meshgrid(a, b)` reaches `torch/functional.py` as a tuple
+            # of tensors and `torch.meshgrid([a, b])` as a one-element tuple
+            # holding the list; upstream unwraps the second form, so this does.
+            if len(tensors) == 1 and not isinstance(tensors[0], module.TensorBase):
+                tensors = list(tensors[0])
+        if indexing is None:
+            indexing = "ij"
+        if indexing not in ("ij", "xy"):
+            raise RuntimeError(
+                'torch.meshgrid: indexing must be one of "xy" or "ij", '
+                f"but received: {indexing}"
+            )
+
+        order = list(range(len(tensors)))
+        if indexing == "xy" and len(tensors) >= 2:
+            order[0], order[1] = order[1], order[0]
+        swapped = [tensors[i] for i in order]
+
+        sizes = []
+        for t in swapped:
+            shape = list(t.shape)
+            if len(shape) > 1:
+                raise RuntimeError(
+                    "torch.meshgrid: Expected 0D or 1D tensor in the tensor "
+                    f"list but got: {t}"
+                )
+            sizes.append(shape[0] if shape else 1)
+
+        grids = []
+        for axis, t in enumerate(swapped):
+            view_shape = [1] * len(swapped)
+            view_shape[axis] = sizes[axis]
+            grids.append(
+                dispatch(
+                    "aten.expand.default",
+                    dispatch("aten.view.default", t, view_shape),
+                    list(sizes),
+                )
+            )
+        if indexing == "xy" and len(grids) >= 2:
+            grids[0], grids[1] = grids[1], grids[0]
+        return tuple(grids)
+
+    meshgrid.__name__ = meshgrid.__qualname__ = "meshgrid"
+    meshgrid.__module__ = "torch._C"
+    setattr(varfns, "meshgrid", meshgrid)
+
 
 def _install_behaviour(module, dispatch, transcribed) -> None:
     """The names that have to *do* something for the import to finish.

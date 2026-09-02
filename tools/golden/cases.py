@@ -21390,7 +21390,618 @@ def relu__member_cases(torch_module, c_module) -> list[Case]:
     ], operands=1)
 
 
+# --- aten.full_like.default -------------------------------------------------
+#
+# docs/DEMAND.md rank 3, `t5`/`switch_transformers`. The kernel reuses
+# `full`'s own `filled_block`, so what these cases have to separate is not the
+# fill arithmetic (`full_cases` already pins that) but the ONE rule that
+# differs: `full` infers the dtype from the fill value, `full_like` takes it
+# from the reference tensor and ignores the fill value's Python type.
+#
+# The two rows that separate them are `full_like(int64_t, 7.5)` -- `int64`
+# holding `7`, where `full([2,3], 7.5)` is a float holding `7.5` -- and
+# `full_like(f32_t, True)`, `float32` holding `1.0` where `full` would give
+# `torch.bool`. An implementation that routed the fill through `full`'s
+# inference passes every other case here and fails those two.
+
+
+def full_like_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.full_like.default"
+    cases: list[Case] = []
+
+    # dtype comes from the reference tensor, across the whole default set.
+    for dtype_name in dt.DEFAULT_DTYPES:
+        for fill, note in [
+            (3, "integer fill"),
+            (0, "zero fill"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+            cases.append(
+                Case(
+                    name=f"full_like(self_dtype={dtype_name}, fill={fill!r}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, fill=fill: torch_call(a_t, fill),
+                    run_c=lambda a_c=a_c, fill=fill: c_module._aten_dispatch(op, a_c, fill),
+                    note="dtype is the reference tensor's, not inferred from the fill",
+                )
+            )
+
+    # The rows that separate `full_like` from `full`. Each is a fill whose
+    # Python type would have inferred a DIFFERENT dtype under `full`'s rule.
+    for dtype_name, fill, note in [
+        ("int64", 7.5, "float fill into an integral reference -- truncates toward zero, "
+                       "and stays int64 where `full` would give the default float"),
+        ("int64", -7.5, "negative float fill -- truncation is toward zero, not floor"),
+        ("int64", True, "bool fill into an integral reference -- 1, and int64, not torch.bool"),
+        ("float32", True, "bool fill into a float reference -- 1.0, not torch.bool"),
+        ("float32", 7, "int fill into a float reference -- 7.0, not int64"),
+        ("uint8", 3.9, "float fill into uint8"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"full_like(self_dtype={dtype_name}, fill={fill!r}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, fill=fill: torch_call(a_t, fill),
+                run_c=lambda a_c=a_c, fill=fill: c_module._aten_dispatch(op, a_c, fill),
+                note=note,
+            )
+        )
+
+    # An explicit `dtype=` still beats the reference tensor.
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"full_like(self_dtype=float32, fill=2, dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, 2, dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, 2, dtype=c_dt),
+                note="explicit dtype override beats the reference tensor's dtype",
+            )
+        )
+
+    # Shape comes from the reference tensor, degenerate shapes included.
+    for shape, flat, note in [
+        ((), [1], "0-d reference"),
+        ((0, 3), [], "empty reference -- an empty result, not a refusal"),
+        ((1, 2, 3), [1, 2, 3, 4, 5, 6], "rank 3"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"full_like(shape={shape}, fill=2.5) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 2.5),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 2.5),
+                note=note,
+            )
+        )
+
+    # `memory_format` is ACCEPTED here, unlike `zeros_like`/`ones_like`
+    # next door -- measured: upstream succeeds and returns a contiguous
+    # tensor, which is the only layout this shim has.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="full_like(memory_format=contiguous_format) [accepted and ignored, measured]",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1.0, memory_format=torch_module.contiguous_format),
+            run_c=lambda: c_module._aten_dispatch(
+                op, a_c, 1.0, memory_format=c_module.contiguous_format
+            ),
+            note="upstream accepts this and returns a contiguous tensor",
+        )
+    )
+
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="full_like(self=/fill_value=/dtype= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=kw_t, fill_value=3.0, dtype=dt.torch_dtype(torch_module, "float64")
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=kw_c, fill_value=3.0, dtype=dt.c_dtype(c_module, "float64")
+            ),
+            note="keyword-argument coverage, per docs/GOLDEN.md's interned_name() effort",
+        )
+    )
+
+    # The overflow refusal is `full`'s, and it fires through this door too.
+    ov_t, ov_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
+    cases.append(
+        Case(
+            name="full_like(int32 reference, fill=2**31) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(ov_t, 2**31),
+            run_c=lambda: c_module._aten_dispatch(op, ov_c, 2**31),
+            expect="both_error",
+            note="RuntimeError: value cannot be converted to type int without overflow -- "
+                 "the same checked_convert `full` uses, reached from the reference tensor's tag",
+        )
+    )
+    return cases
+
+
+# --- aten.new_zeros.default -------------------------------------------------
+#
+# docs/DEMAND.md rank 5, `bart`'s `shift_tokens_right`. The kernel is literally
+# `new_ones`'s, with `Tensor::zeros` for `Tensor::ones`, so these cases mirror
+# `new_ones_cases` above row for row -- if the two ever stop agreeing on how
+# the defaults come off the reference tensor, one of the two files is wrong and
+# this is where it shows.
+
+
+def new_zeros_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.new_zeros.default"
+    cases: list[Case] = []
+    for self_dtype in dt.DEFAULT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), self_dtype)
+        cases.append(
+            Case(
+                name=f"new_zeros(self_dtype={self_dtype}, shape=[2,3]) [dtype inherited from self]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, 3]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, 3]),
+                note="dtype inherited from the self tensor, not a default -- "
+                     "the half of `new_ones`'s rule that is easy to get wrong and "
+                     "invisible in a forward, since every value is 0 either way",
+            )
+        )
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"new_zeros(self_dtype=float32, shape=[2,2], dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, [2, 2], dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, [2, 2], dtype=c_dt),
+                note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    # Degenerate shapes. `[]` is a 0-d tensor holding one zero, not an empty
+    # one -- measured, and the pair with `[0]` is what separates them.
+    for size, note in [
+        ([], "0-d result: one element, not zero elements"),
+        ([0], "empty result"),
+        ([0, 3], "empty in the leading axis only"),
+        ([1, 1, 1], "rank 3, all singleton"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"new_zeros(size={size}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, size=size: torch_call(a_t, size),
+                run_c=lambda a_c=a_c, size=size: c_module._aten_dispatch(op, a_c, size),
+                note=note,
+            )
+        )
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="new_zeros(self=/size=/dtype= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=kw_t, size=[2, 2], dtype=dt.torch_dtype(torch_module, "int64")
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=kw_c, size=[2, 2], dtype=dt.c_dtype(c_module, "int64")
+            ),
+            note="keyword-argument coverage",
+        )
+    )
+    return cases
+
+
+# --- aten.native_batch_norm.default -----------------------------------------
+#
+# docs/DEMAND.md rank 1. The hardest op in this file to test honestly, for two
+# reasons that no other entry here has at once:
+#
+#   * **Two of its three results are read by nobody.** `torch.batch_norm`
+#     returns `result[0]`, so `save_mean` and `save_invstd` can be the wrong
+#     shape, the wrong dtype or a different definition and every model in the
+#     sweep still runs. In EVAL mode they are measured to be shape `(0,)` --
+#     handing back the running statistics there instead is the plausible error
+#     and is invisible to any forward.
+#   * **Its most important effect is not a result at all.** It writes
+#     `running_mean` and `running_var` in place while declaring no alias on any
+#     argument (docs/DEMAND1.md §1.1). A kernel that returns exactly the right
+#     `out` while leaving the running statistics untouched passes any test that
+#     reads only the output.
+#
+# So the thunks below return a FIVE-tuple -- the schema's three results, then
+# the two running-statistic tensors *after* the call -- and
+# `_batch_norm_result_check` diffs all five. That is the only arrangement that
+# can see the mutation, since the harness compares return values and these two
+# are not returned.
+#
+# One case that would be natural to write is deliberately absent:
+# `training=False` with both running statistics `None`. Upstream **segfaults**
+# there (exit 139, reproduced twice in isolation, docs/DEMAND1.md §1.6), so a
+# case for it would take the harness process down rather than fail. It is
+# unreachable through any real spelling -- `torch.batch_norm` raises
+# "running_mean must be defined in evaluation mode" first, and the shim raises
+# that same message -- and the smoke suite pins the shim's refusal by name
+# instead.
+
+_BN_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+# 24 values that are not a smooth ramp along any axis, so a reduction over the
+# wrong axes shows up as a wrong number rather than as the same number by
+# symmetry. Read as (2, 3, 2, 2): N=2, C=3, H=W=2.
+_BN_INPUT = [round(((i * 37) % 23) / 7.0 - 1.5, 6) for i in range(24)]
+_BN_WEIGHT = [1.0, 2.0, 0.5]
+_BN_BIAS = [0.1, -0.2, 0.3]
+_BN_MEAN = [0.25, 0.5, 0.75]
+_BN_VAR = [1.5, 2.0, 0.5]
+
+
+def _batch_norm_result_check(t_res, c_res) -> tuple[bool, str]:
+    """`(out, save_mean, save_invstd, running_mean, running_var)`.
+
+    The first three are the schema's; the last two are the *mutated arguments*,
+    appended by the thunks so that this comparator can see them at all. A
+    `None` in either of the last two positions means the case passed no running
+    statistics, and both sides must agree that there are none.
+    """
+    labels = ("out", "save_mean", "save_invstd", "running_mean", "running_var")
+    try:
+        t_parts = tuple(t_res[i] for i in range(5))
+        c_parts = tuple(c_res[i] for i in range(5))
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 5-element result on both sides: {e!r}"
+
+    for label, t_part, c_part in zip(labels, t_parts, c_parts):
+        if t_part is None or c_part is None:
+            if t_part is None and c_part is None:
+                continue
+            return False, f"{label}: present on one side only (torch={t_part!r} c={c_part!r})"
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        tol = dt.tolerance_for(t_dtype)
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            # A negative eps is not refused upstream -- it gives NaN, and the
+            # two sides agreeing on NaN is the result being checked.
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (NaN on one side only)"
+            if not math.isclose(xf, yf, rel_tol=tol.rtol, abs_tol=tol.atol):
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+    return True, (
+        "out/save_mean/save_invstd AND the two running statistics matched; "
+        f"save_* shapes {[tuple(int(v) for v in p.shape) for p in t_parts[1:3]]}"
+    )
+
+
+def _bn_case(
+    torch_module, c_module, torch_call, dtype_name, flat, shape,
+    weight=_BN_WEIGHT, bias=_BN_BIAS, stats=True, training=True,
+    momentum=0.1, eps=1e-5, param_dtype=None, expect="match", note="",
+) -> Case:
+    op = "aten.native_batch_norm.default"
+    param_dtype = param_dtype or dtype_name
+    x_t, x_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+    channels = shape[1] if len(shape) >= 2 else 0
+
+    def param(values):
+        if values is None:
+            return None, None
+        return pair_from_flat(
+            torch_module, c_module, values, (len(values),), param_dtype
+        )
+
+    w_t, w_c = param(weight)
+    b_t, b_c = param(bias)
+    # Fresh running statistics per case -- they are MUTATED, so sharing one
+    # pair across cases would carry one case's update into the next, exactly
+    # the trap the in-place module note above records for `fill_`/`copy_`.
+    rm_t, rm_c = param(_BN_MEAN[:channels] if stats else None)
+    rv_t, rv_c = param(_BN_VAR[:channels] if stats else None)
+
+    def run_torch():
+        res = torch_call(x_t, w_t, b_t, rm_t, rv_t, training, momentum, eps)
+        return (res[0], res[1], res[2], rm_t, rv_t)
+
+    def run_c():
+        res = c_module._aten_dispatch(
+            op, x_c, w_c, b_c, rm_c, rv_c, training, momentum, eps
+        )
+        return (res[0], res[1], res[2], rm_c, rv_c)
+
+    return Case(
+        name=(
+            f"native_batch_norm(dtype={dtype_name}, shape={shape}, "
+            f"training={training}, weight={weight is not None}, "
+            f"bias={bias is not None}, stats={stats}, momentum={momentum}, "
+            f"eps={eps}, param_dtype={param_dtype}) [{note}]"
+        ),
+        op=op,
+        run_torch=run_torch,
+        run_c=run_c,
+        expect=expect,
+        value_check=_batch_norm_result_check if expect == "match" else None,
+        note=note + " -- compares (out, save_mean, save_invstd) AND the two "
+                    "running statistics after the call, see _batch_norm_result_check",
+    )
+
+
+def native_batch_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.native_batch_norm.default"
+    cases: list[Case] = []
+
+    for dtype_name in _BN_DTYPES:
+        # The train/eval split, over the affine variants. In TRAINING the
+        # running statistics move and `save_*` are (C,); in EVAL nothing moves
+        # and `save_*` are (0,). Both halves are compared here.
+        for training in (True, False):
+            for weight, bias, note in [
+                (_BN_WEIGHT, _BN_BIAS, "affine -- nn.BatchNorm2d's default"),
+                (None, None, "affine=False"),
+                (_BN_WEIGHT, None, "weight only"),
+                (None, _BN_BIAS, "bias only"),
+            ]:
+                cases.append(
+                    _bn_case(
+                        torch_module, c_module, torch_call, dtype_name,
+                        _BN_INPUT, (2, 3, 2, 2), weight=weight, bias=bias,
+                        training=training,
+                        note=f"{note}, training={training}",
+                    )
+                )
+        # No running statistics at all -- `track_running_stats=False`. Legal in
+        # training (batch statistics, nothing to update) and the ONE case where
+        # `save_*` are populated with no mutation to check.
+        cases.append(
+            _bn_case(
+                torch_module, c_module, torch_call, dtype_name,
+                _BN_INPUT, (2, 3, 2, 2), stats=False, training=True,
+                note="running stats None in training -- batch statistics, no update",
+            )
+        )
+
+    # The ranks. `HxW` is derived from whatever follows the channel axis, and
+    # these are what catch a kernel that assumed rank 4. The exact save_mean
+    # values differ per rank over the same 24 numbers, so a rank-4-shaped
+    # reduction produces a wrong number rather than a wrong shape.
+    for shape, note in [
+        ((8, 3), "rank 2 (N, C) -- nn.BatchNorm1d on a flat batch"),
+        ((2, 3, 4), "rank 3 (N, C, L) -- nn.BatchNorm1d on a sequence"),
+        ((2, 3, 2, 1, 2), "rank 5 (N, C, D, H, W) -- nn.BatchNorm3d"),
+    ]:
+        for training in (True, False):
+            cases.append(
+                _bn_case(
+                    torch_module, c_module, torch_call, "float32",
+                    _BN_INPUT, shape, training=training, note=note,
+                )
+            )
+
+    # `momentum` at both ends. `momentum=1.0` is the case that pins the
+    # UNBIASED variance in the running-variance update: the old value drops out
+    # entirely, so `running_var` after is the new statistic exactly, and the
+    # biased variance (which `save_invstd` uses) is a different number.
+    # `momentum=0.0` is the control -- nothing moves.
+    for momentum, note in [
+        (1.0, "momentum=1 -- running_var after IS the unbiased variance, exactly; "
+              "the biased one save_invstd uses would be a different number here"),
+        (0.0, "momentum=0 -- the running statistics must not move at all"),
+        (0.5, "momentum=0.5 -- both terms contribute equally"),
+    ]:
+        cases.append(
+            _bn_case(
+                torch_module, c_module, torch_call, "float32",
+                _BN_INPUT, (2, 3, 2, 2), momentum=momentum, note=note,
+            )
+        )
+
+    # A CONSTANT input. This is the case that pins where `eps` goes, and it
+    # cannot be replaced by a varying one: the variance is 0, so
+    # `save_invstd = 1/sqrt(0+eps) = 316.2278` at eps=1e-5, while
+    # `1/(sqrt(0)+eps)` would be 100000 and `sqrt(0+eps)` would be 0.00316.
+    # All three have the same shape and dtype. Conversely a varying input
+    # cannot pin it, because eps is negligible against a real variance -- so
+    # both are needed and neither is redundant. It also pins that `eps` is NOT
+    # in the running-variance update: running_var after is 0.9*1.5 + 0.1*0.
+    cases.append(
+        _bn_case(
+            torch_module, c_module, torch_call, "float32",
+            [2.0] * 24, (2, 3, 2, 2),
+            note="constant input -- variance 0, so save_invstd is 1/sqrt(eps) and "
+                 "the running-variance update sees a zero unbiased variance",
+        )
+    )
+    for eps, note in [
+        (0.5, "a large eps, where its placement is visible against a real variance too"),
+        (0.0, "eps=0 -- no guard, and finite because the variance is not zero"),
+    ]:
+        cases.append(
+            _bn_case(
+                torch_module, c_module, torch_call, "float32",
+                _BN_INPUT, (2, 3, 2, 2), eps=eps, note=note,
+            )
+        )
+
+    # Mixed precision: a reduced-precision input with float32 parameters. The
+    # results split -- `out` stays reduced, `save_*` and the running statistics
+    # are float32 -- which is the rule `native_layer_norm`/`native_group_norm`
+    # have and which was re-measured here rather than assumed from them.
+    for dtype_name in ("float16", "bfloat16"):
+        for training in (True, False):
+            cases.append(
+                _bn_case(
+                    torch_module, c_module, torch_call, dtype_name,
+                    _BN_INPUT, (2, 3, 2, 2), param_dtype="float32",
+                    training=training,
+                    note="mixed precision -- out stays reduced, the statistics are float32",
+                )
+            )
+
+    # N=0 in EVAL. Legal upstream: the output is empty, `save_*` are (0,) and
+    # the running statistics do not move. (N=0 in TRAINING is refused on both
+    # sides -- below.)
+    cases.append(
+        _bn_case(
+            torch_module, c_module, torch_call, "float32",
+            [], (0, 3, 2, 2), training=False,
+            note="N=0 in eval -- empty output, empty save_*, statistics untouched",
+        )
+    )
+
+    # Keyword-argument coverage.
+    kx_t, kx_c = pair_from_flat(torch_module, c_module, _BN_INPUT, (2, 3, 2, 2), "float32")
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, _BN_WEIGHT, (3,), "float32")
+    kb_t, kb_c = pair_from_flat(torch_module, c_module, _BN_BIAS, (3,), "float32")
+    km_t, km_c = pair_from_flat(torch_module, c_module, _BN_MEAN, (3,), "float32")
+    kv_t, kv_c = pair_from_flat(torch_module, c_module, _BN_VAR, (3,), "float32")
+    cases.append(
+        Case(
+            name="native_batch_norm(every argument by keyword)",
+            op=op,
+            run_torch=lambda: (
+                lambda r: (r[0], r[1], r[2], km_t, kv_t)
+            )(torch_call(
+                input=kx_t, weight=kw_t, bias=kb_t, running_mean=km_t,
+                running_var=kv_t, training=True, momentum=0.1, eps=1e-5,
+            )),
+            run_c=lambda: (
+                lambda r: (r[0], r[1], r[2], km_c, kv_c)
+            )(c_module._aten_dispatch(
+                op, input=kx_c, weight=kw_c, bias=kb_c, running_mean=km_c,
+                running_var=kv_c, training=True, momentum=0.1, eps=1e-5,
+            )),
+            value_check=_batch_norm_result_check,
+            note="keyword-argument coverage, per docs/GOLDEN.md's interned_name() effort",
+        )
+    )
+
+    # --- refusals ---------------------------------------------------------
+    for dtype_name, wording in [("int64", "Long"), ("bool", "Bool")]:
+        cases.append(
+            _bn_case(
+                torch_module, c_module, torch_call, dtype_name,
+                [1, 0, 1, 0] * 6, (2, 3, 2, 2), param_dtype=dtype_name,
+                expect="both_error",
+                note=f'"batch_norm" not implemented for \'{wording}\'',
+            )
+        )
+    # N=0 in TRAINING: refused, unlike N=0 in eval above.
+    cases.append(
+        _bn_case(
+            torch_module, c_module, torch_call, "float32", [], (0, 3, 2, 2),
+            training=True, expect="both_error",
+            note="input tensor must have at least one element, but got input_sizes = [0, 3, 2, 2]",
+        )
+    )
+    # A rank-1 input never reaches a channel axis.
+    cases.append(
+        _bn_case(
+            torch_module, c_module, torch_call, "float32", [1.0, 2.0, 3.0], (3,),
+            weight=None, bias=None, stats=False, expect="both_error",
+            note="rank 1 -- Dimension out of range; there is no channel axis to reduce over",
+        )
+    )
+    # Exactly one running statistic supplied.
+    half_x_t, half_x_c = pair_from_flat(
+        torch_module, c_module, _BN_INPUT, (2, 3, 2, 2), "float32"
+    )
+    half_v_t, half_v_c = pair_from_flat(torch_module, c_module, _BN_VAR, (3,), "float32")
+    cases.append(
+        Case(
+            name="native_batch_norm(running_mean=None, running_var=given) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(half_x_t, None, None, None, half_v_t, True, 0.1, 1e-5),
+            run_c=lambda: c_module._aten_dispatch(
+                op, half_x_c, None, None, None, half_v_c, True, 0.1, 1e-5
+            ),
+            expect="both_error",
+            note="ValueError: running_mean and running_var must either both be None or "
+                 "neither be None",
+        )
+    )
+    # A parameter whose length is not C. Upstream does NOT refuse: measured, a
+    # length-2 weight against 3 channels returns bit-identical numbers to the
+    # correct length-3 call, having read a third float out of uninitialised
+    # heap (docs/DEMAND1.md §1.6). The shim refuses by name rather than
+    # reproducing whatever happened to be in memory, so this is `c_error` and
+    # says why.
+    bad_x_t, bad_x_c = pair_from_flat(
+        torch_module, c_module, _BN_INPUT, (2, 3, 2, 2), "float32"
+    )
+    bad_w_t, bad_w_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 0.5, 9.0], (4,), "float32"
+    )
+    bad_m_t, bad_m_c = pair_from_flat(torch_module, c_module, _BN_MEAN, (3,), "float32")
+    bad_v_t, bad_v_c = pair_from_flat(torch_module, c_module, _BN_VAR, (3,), "float32")
+    cases.append(
+        Case(
+            name="native_batch_norm(weight of length 4 against 3 channels) "
+                 "[upstream reads out of bounds; the shim refuses]",
+            op=op,
+            run_torch=lambda: torch_call(
+                bad_x_t, bad_w_t, None, bad_m_t, bad_v_t, True, 0.1, 1e-5
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, bad_x_c, bad_w_c, None, bad_m_c, bad_v_c, True, 0.1, 1e-5
+            ),
+            expect="c_error",
+            note="DELIBERATE. Upstream's leaf does not check the length and reads past the "
+                 "end of the buffer -- a length-2 weight against 3 channels returns "
+                 "bit-identical numbers to the correct call, having found the third float "
+                 "in uninitialised heap. `torch.batch_norm` (bootstrap.py) refuses it above "
+                 "this layer with upstream's own 'weight should contain 3 elements not 4', "
+                 "which is what every real caller meets; the shim's leaf refuses by name "
+                 "rather than reproducing heap contents",
+        )
+    )
+    # A float64 input with float32 parameters -- refused on both sides, and the
+    # message is NOT native_group_norm's.
+    mix_x_t, mix_x_c = pair_from_flat(
+        torch_module, c_module, _BN_INPUT, (2, 3, 2, 2), "float64"
+    )
+    mix_w_t, mix_w_c = pair_from_flat(torch_module, c_module, _BN_WEIGHT, (3,), "float32")
+    mix_m_t, mix_m_c = pair_from_flat(torch_module, c_module, _BN_MEAN, (3,), "float32")
+    mix_v_t, mix_v_c = pair_from_flat(torch_module, c_module, _BN_VAR, (3,), "float32")
+    cases.append(
+        Case(
+            name="native_batch_norm(float64 input, float32 parameters) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(
+                mix_x_t, mix_w_t, None, mix_m_t, mix_v_t, True, 0.1, 1e-5
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, mix_x_c, mix_w_c, None, mix_m_c, mix_v_c, True, 0.1, 1e-5
+            ),
+            expect="both_error",
+            note="RuntimeError: mixed dtype (CPU): all inputs must share same datatype. "
+                 "-- note this is NOT native_group_norm's wording ('expect parameter to "
+                 "have scalar type of Float'); the two were measured separately",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
+    "aten.full_like.default": full_like_cases,
+    "aten.new_zeros.default": new_zeros_cases,
+    "aten.native_batch_norm.default": native_batch_norm_cases,
     "aten._grouped_mm.default": grouped_mm_cases,
     "aten.full.default": full_cases,
     "aten.add.Tensor": add_cases,

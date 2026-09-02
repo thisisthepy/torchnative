@@ -18,15 +18,38 @@ Ranked by **how many distinct models hit each wall as their first blocker** in t
 broken by real-world reach (how many architecture *families*, not just the one model tried, use
 the same code path).
 
-| rank | gap | models that hit it (this round) | kind |
-|---|---|---|---|
-| 1 | `torch.batch_norm` / `aten.native_batch_norm.default` | `resnet`, `mobilenet_v2` (2) | **missing kernel** — leaf op upstream (`_dispatch_has_kernel_for_dispatch_key(..., "CompositeImplicitAutograd")` is `False`), absent from `aten.rs`/`overloads.json`/`methods.json` entirely, no spelling to wire even once a kernel exists. Blocks **every BatchNorm-based CNN backbone** (ResNet, MobileNetV2/V3, and by the same code shape EfficientNet, RegNet, DenseNet) — the single most generic vision-CNN primitive tried this round. Note 2-D `aten.convolution.default`, ARCH26's blocker for `zoedepth`, is **no longer the wall** — both CNNs got past their stem `conv2d` and stopped one layer later, at the norm. |
-| 2 | legacy `torch.Tensor(...)` constructor (`TensorBase.__new__`, `tensor.rs::py_new`) | `pegasus` (1 new; `sew_d` already recorded this family in ARCH26 §4) | **structural** — forbidden-file territory even outside this round's rules: the refusal fires inside PyO3's `#[new] fn py_new`, and the class that could grow a Python-level override (`torch.Tensor(TensorBase)`) is the vendored tree. Two *distinct* call shapes now confirmed blocked: `torch.Tensor(int)` (allocate-uninitialised, `sew_d`) and `torch.Tensor(ndarray)`/`torch.FloatTensor(ndarray)` (build-from-data, `pegasus`, in `PegasusSinusoidalPositionalEmbedding.create_weight`). Both trace to `aten.lift_fresh.default` upstream — **the same primitive `torch.tensor()`/`new_tensor()` already use** — so the missing piece is purely the constructor-slot dispatch, not new arithmetic. |
-| 3 | `torch.full_like` / `aten.full_like.default` | `t5`, `switch_transformers` (2) | **missing kernel** — leaf upstream, sibling `aten.full.default` already implemented and golden-compared. Both hits are the same line, `T5Attention._relative_position_bucket`'s `torch.full_like(relative_position_if_large, num_buckets - 1)` — shared code across the whole T5 family (`t5`, `mt5`, `long_t5`, `umt5`, `switch_transformers`, `t5gemma` all inherit or duplicate it), so this one kernel is worth more than 2 votes. |
-| 4 | `torch.as_tensor` (`.generate()` path) | `whisper` (1, but only after its **forward** already matched upstream — see §2) | **missing spelling**, cheapest class in this table. `torch.as_tensor(data)` and `torch.Tensor(ndarray)` (rank 2) both trace to `aten.lift_fresh.default`, and `torch.tensor()`/`Tensor.new_tensor()` already wire that primitive (ARCH26 §7). `generation_whisper.py`'s `_retrieve_init_tokens` is the hit here, but `transformers/generation/utils.py` calls `torch.as_tensor` in several shared helpers (`_prepare_attention_mask_for_generation`, stopping-criteria bookkeeping) that `t5`/`bart`/`mbart`/`pegasus`'s `.generate()` never reached this round because each stopped earlier for its own reason (ranks 2, 3, 5). This is a wall several already-run models are queued up behind, not just whisper's. |
-| 5 | `TensorBase.new_zeros` / `aten.new_zeros.default` | `bart` (1) | **missing kernel**, but same shape as an already-solved sibling: `aten.new_ones.default` is implemented (`aten.rs:9416`, `new_ones_default`) and `new_zeros` is not registered at all — not in `aten.rs`, not in `methods.json`. `BartForConditionalGeneration.forward`'s `shift_tokens_right` is generic code duplicated across the whole BART-derived family (`bart`, `marian`, `blenderbot`, `mvp`) — `mbart` and `pegasus` use *different* shift-right code and hit ranks 2/8 instead, which is itself informative: this family is not as uniform as it looks from one member. |
+> **Re-ranked 2026-09-02 (docs/DEMAND1.md).** Ranks 1, 3, 4 and 5 of the original list are
+> **closed**, along with one of the honourable mentions. §0.1 below is what remains, renumbered;
+> §0.2 records what closed and how. The original ranking is preserved in §0.2 rather than edited
+> in place, because "which wall did each model hit" is the measurement this file exists to carry
+> and rewriting it would lose the evidence.
 
-**Honorable mentions, one vote each, not in the top five but each closes a distinct model:**
+### 0.1 What is still open, renumbered
+
+| rank | gap | models that hit it | kind |
+|---|---|---|---|
+| 1 | legacy `torch.Tensor(...)` constructor (`TensorBase.__new__`, `tensor.rs::py_new`) | `pegasus` (1 new; `sew_d` already recorded this family in ARCH26 §4) | **structural** — was rank 2. The refusal fires inside PyO3's `#[new] fn py_new`, and the class that could grow a Python-level override (`torch.Tensor(TensorBase)`) is the vendored tree. Two *distinct* call shapes confirmed blocked: `torch.Tensor(int)` (allocate-uninitialised, `sew_d`) and `torch.Tensor(ndarray)`/`torch.FloatTensor(ndarray)` (build-from-data, `pegasus`, in `PegasusSinusoidalPositionalEmbedding.create_weight`). Both trace to `aten.lift_fresh.default` upstream — **the same primitive `torch.tensor()`/`new_tensor()`/`as_tensor()` already use** — so the missing piece is purely the constructor-slot dispatch, not new arithmetic. Now the top of the list by default rather than by vote count, which is worth saying plainly: it has one vote, and it is here because everything with more votes is closed. |
+| 2 | `aten.squeeze.default` | `mbart` (1) | **the GOLDEN.md blind-spot shape**, promoted from the honourable mentions because it is now the cheapest thing on the list: `squeeze` is *declared* in both `overloads.json` and `methods.json` with three overloads — `squeeze()`, `squeeze.dim`, `squeeze.dims` — but `aten.rs`'s dispatch `match` has an arm only for `squeeze.dim`. The no-arg overload looks present in the name tables and is not reachable. `mbart`'s `shift_tokens_right` is the caller. |
+| 3 | `aten.linalg_vector_norm.default` | `sentence_embed` (1) | **missing kernel**, promoted from the honourable mentions. A **distinct** leaf from the already-implemented `aten.norm.ScalarOpt_dim` (`_dispatch_has_kernel_for_dispatch_key` returns `False` for it too). `F.normalize` fires `linalg_vector_norm.default, clamp_min.default, expand.default, div.Tensor` and the other three are implemented, so this one kernel closes the model. **Measured in full in docs/DEMAND1.md §5** — the six-arm `ord` family (`0`, `±inf`, `1`, `2`, general, and negative), the empty-reduction split (`ord=2` gives `0.0`, `ord=±inf` raises), and the `dtype=` promotion. Its spelling is `torch._C._linalg.linalg_vector_norm`, not a `torch.<name>`. The kernel is close to `norm.ScalarOpt_dim`'s existing six-op walk and the two should share it rather than diverge. |
+| 4 | `torch.linspace` | `convnext` (1) | **missing kernel**, leaf upstream — `ConvNextModel.__init__`'s stochastic-depth rate schedule, so a construction-time wall rather than a forward one. The generic "N vision backbones with a `drop_path_rate` schedule" pattern. |
+
+### 0.2 Closed, and by what
+
+| was | gap | closed by |
+|---|---|---|
+| 1 | `torch.batch_norm` / `aten.native_batch_norm.default` | **docs/DEMAND1.md §1.** Kernel in `aten.rs` (`native_batch_norm_default`), spelling as a `bootstrap.py` composite beside `layer_norm`/`group_norm` — not an `overloads.json` entry, because `aten::batch_norm` is `CompositeImplicitAutograd` and never fires. The train/eval split, the in-place running-statistic update, the biased-for-output / **unbiased**-for-running-variance divergence, the `(0,)`-shaped `save_mean`/`save_invstd` in eval, and upstream's **fused** `x*alpha + beta` affine (which the golden harness caught, on the constant-input case) are all measured and golden-compared. `capture.rs` grew an argument-aware guard: this op mutates and its name does not say so. `nn.BatchNorm2d`, `1d` and `3d` all forward. |
+| 3 | `torch.full_like` / `aten.full_like.default` | **docs/DEMAND1.md §2.** Kernel reusing `full`'s own `filled_block` rather than a second fill; `overloads.json` entry. The rule that separates it from `full` — dtype from the *reference tensor*, not inferred from the fill value — is what the golden cases are built around. |
+| 4 | `torch.as_tensor` | **docs/DEMAND1.md §4.** A spelling, as predicted: a `bootstrap.py` composite branching between `lift_fresh` (new data) and `_to_copy` (a tensor needing a cast), with the identity case — `torch.as_tensor(t) is t` — returning the receiver. **One difference is recorded rather than closed**: upstream's ndarray path shares memory with the array and this one copies, because this shim's tensors do not wrap foreign buffers. |
+| 5 | `TensorBase.new_zeros` / `aten.new_zeros.default` | **docs/DEMAND1.md §3.** One function in `aten.rs` now serves `new_ones` and `new_zeros`; `methods.json` entry. |
+| HM | `torch.meshgrid` | **docs/DEMAND1.md §6.** A spelling, as predicted — a `bootstrap.py` composite over `view` + `expand`, both long implemented. `"xy"` is done by swapping the first two inputs and swapping the outputs back, which is what upstream's op trace shows and what a transpose-based implementation would have got wrong invisibly (the shapes and values agree; only the trace differs). |
+
+Closing those five moved `ops covered` from 168 to 171 (three kernels; `as_tensor` and `meshgrid`
+added none, being spellings over ops that were already there — which is exactly why they needed
+smoke coverage through the vendored tree instead, GOLDEN.md's blind spot).
+
+**Honorable mentions still open, one vote each** (`linalg_vector_norm`, `squeeze.default` and
+`linspace` were promoted into §0.1 above and are no longer listed here). The original text of the
+two that closed is kept in §0.2. For reference, the mentions as first written were:
 `aten.linalg_vector_norm.default` (`sentence_embed`'s `F.normalize`, missing kernel — a **distinct**
 leaf from the already-implemented `aten.norm.ScalarOpt_dim`, confirmed by
 `_dispatch_has_kernel_for_dispatch_key` returning `False` for it too); `torch.meshgrid` (`swin`'s
@@ -186,8 +209,38 @@ fails and has to be re-ranked rather than quietly describing a closed gap. That 
 failure mode this file exists to break: the last demand list went stale and the queue
 was fed by ad-hoc probes instead, one of which misclassified fifteen names.
 
-<!-- DOCWATCH: op-not-implemented aten.native_batch_norm.default -->
-<!-- DOCWATCH: op-not-implemented aten.full_like.default -->
-<!-- DOCWATCH: op-not-implemented aten.new_zeros.default -->
+**It worked, on 2026-09-02.** Three of the five markers below failed on the round that
+implemented them, and failing is what forced §0 to be re-ranked instead of being left
+describing gaps that had closed. The three that closed are now asserted **present** — the
+same mechanism pointed the other way, so that a regression (a kernel removed, or removed
+from `_aten_implemented()`) fails here too. The two still open keep their original
+`op-not-implemented` markers and will fail the day they land, which is the point.
+
+Closed — asserted present now:
+
+<!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
+<!-- DOCWATCH: op-implemented aten.full_like.default -->
+<!-- DOCWATCH: op-implemented aten.new_zeros.default -->
+
+The two spellings that closed have no kernel of their own to assert, so they are pinned by
+name against upstream instead — the same check `hasattr gelu false` makes elsewhere, in the
+other direction:
+
+<!-- DOCWATCH: hasattr as_tensor true -->
+<!-- DOCWATCH: hasattr meshgrid true -->
+
+Still open — asserted absent, and §0.1 is the queue:
+
 <!-- DOCWATCH: op-not-implemented aten.linalg_vector_norm.default -->
 <!-- DOCWATCH: op-not-implemented aten.squeeze.default -->
+
+### Found while closing rank 1, and not ranked because no model asked for it yet
+
+`Tensor.shape` returns a plain `tuple`, not `torch.Size`, for every tensor —
+pre-existing, not from any round in this pair. `torch.Size` is a tuple subclass,
+so indexing and unpacking are unaffected and nothing in the eighteen models
+noticed; what would notice is `isinstance(x.shape, torch.Size)` or a call to
+`Size.numel()`. Recorded here rather than ranked, because this file ranks by how
+many models want a thing and the answer today is none.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_autograd_shape present -->

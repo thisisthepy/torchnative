@@ -111,6 +111,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.floor_divide.default",
     "aten.floor_divide.Scalar",
     "aten.full.default",
+    "aten.full_like.default",
     "aten.gather.default",
     "aten.ge.Scalar",
     "aten.ge.Tensor",
@@ -150,6 +151,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
     "aten.multinomial.default",
+    "aten.native_batch_norm.default",
     "aten.native_group_norm.default",
     "aten.native_dropout.default",
     "aten.native_layer_norm.default",
@@ -158,6 +160,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.neg.default",
     "aten.neg_.default",
     "aten.new_ones.default",
+    "aten.new_zeros.default",
     "aten.nll_loss_forward.default",
     "aten.norm.ScalarOpt_dim",
     "aten.normal_.default",
@@ -1304,6 +1307,7 @@ fn aten_dispatch_inner(
         "aten.embedding.default" => embedding_default(py, args, kwargs),
         "aten.empty.memory_format" => empty_memory_format(py, args, kwargs),
         "aten.full.default" => full_default(py, args, kwargs),
+        "aten.full_like.default" => full_like_default(py, args, kwargs),
         "aten.is_floating_point.default" => is_floating_point_default(py, args, kwargs),
         "aten.isin.Tensor_Tensor" => isin_tensor_tensor(py, args, kwargs),
         "aten.lift_fresh.default" => lift_fresh_default(py, args, kwargs),
@@ -1347,6 +1351,7 @@ fn aten_dispatch_inner(
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
+        "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
         // -- the TensorBase surface (docs/TENSORBASE.md) -------------------
         "aten.add.Scalar" => arith_scalar(py, args, kwargs, "aten.add.Scalar", Arith::Add),
@@ -1456,6 +1461,7 @@ fn aten_dispatch_inner(
         "aten.detach.default" => detach_default(py, args, kwargs),
         "aten._to_copy.default" => to_copy_default(py, args, kwargs),
         "aten.new_ones.default" => new_ones_default(py, args, kwargs),
+        "aten.new_zeros.default" => new_zeros_default(py, args, kwargs),
         "aten.zeros.default" => zeros_or_ones(py, args, kwargs, "aten.zeros.default", false),
         "aten._local_scalar_dense.default" => local_scalar_dense(py, args, kwargs),
 
@@ -1744,6 +1750,98 @@ fn filled_block(
     }
     .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))
+}
+
+/// `aten::full_like(Tensor self, Scalar fill_value, *, ScalarType? dtype=None,
+///     Layout? layout=None, Device? device=None, bool? pin_memory=None,
+///     MemoryFormat? memory_format=None) -> Tensor`
+///
+/// `t5`'s wall, and `switch_transformers`' -- the *same line* in both, since
+/// `T5Attention._relative_position_bucket` is shared verbatim across the whole
+/// T5 family (`t5`, `mt5`, `long_t5`, `umt5`, `switch_transformers`,
+/// `t5gemma`). The call is
+/// `torch.full_like(relative_position_if_large, num_buckets - 1)` on an
+/// `int64` tensor with a Python `int` fill (docs/DEMAND.md rank 3).
+///
+/// A leaf upstream (`_dispatch_has_kernel_for_dispatch_key(...,
+/// "CompositeImplicitAutograd")` is `False`), and a `TorchDispatchMode` logger
+/// on 2.13.0 records exactly one key for the call above.
+///
+/// **The dtype rule is the opposite of `full`'s, which is the whole reason
+/// this is not a one-line alias for it.** `torch.full` *infers* from the fill
+/// value -- an `int` gives `int64`, a `float` gives the default float, a
+/// `bool` gives `torch.bool`. `full_like` takes the dtype from the **reference
+/// tensor** and ignores the fill value's Python type entirely. Measured on
+/// 2.13.0:
+///
+/// ```text
+/// full_like(int64_t, 7)      int64   [7, ...]      full_like(int64_t, 7.5)  int64   [7, ...]
+/// full_like(f32_t,   7)      float32 [7.0, ...]    full_like(f32_t,  True)  float32 [1.0, ...]
+/// full_like(int64_t, True)   int64   [1, ...]      full_like(bool_t, True)  bool    [True, ...]
+/// full_like(int64_t, 3, dtype=torch.float32)       float32 [3.0, ...]   <- override still wins
+/// ```
+///
+/// So `full_like(int64_t, 7.5)` is `7`, where `full([2,3], 7.5)` is `7.5` in
+/// the default float. Deriving one from the other by passing the fill through
+/// `full`'s inference would give the wrong dtype on the first row and the
+/// wrong *value* on the second.
+///
+/// **The fill itself is not reimplemented.** `filled_block` above is
+/// `full_default`'s fill half, already shared with `constant_pad_nd`, and it
+/// carries the two rules that would otherwise drift: truncation **toward
+/// zero** for a float value into an integral tag (hence `7.5 -> 7`, and
+/// `-7.5 -> -7`), and truthiness for the `bool` tag, which is what keeps that
+/// tag's 0/1 invariant holding by construction (BOOL.md §6.3). Two
+/// implementations of the same fill drift; this is the third caller of one.
+///
+/// The overflow refusal is `full`'s too, and it fires here: measured,
+/// `torch.full_like(int32_t, 2**31)` raises `RuntimeError: value cannot be
+/// converted to type int without overflow`. `checked_convert` runs before the
+/// meta branch for the reason `full_default`'s comment gives -- upstream's
+/// meta kernel makes the same check, and a claim that skipped the checks the
+/// real call makes would be worth less than no claim.
+///
+/// `memory_format` is **accepted and ignored** here rather than rejected,
+/// unlike `zeros_like`/`ones_like`/`empty_like` next door, and the difference
+/// is measured rather than chosen: `torch.full_like(x, 1.0,
+/// memory_format=torch.contiguous_format)` succeeds upstream and returns a
+/// contiguous tensor, which is the only layout this shim has. `layout` and
+/// `pin_memory` are likewise accepted at their measured defaults and refused
+/// otherwise, through `reject_unsupported`.
+fn full_like_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.full_like.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let fill = required(OP, args, kwargs, 1, "fill_value")?;
+    // The reference tensor's tag, NOT an inference from `fill`. An explicit
+    // `dtype=` still beats it, exactly as it does for `new_ones`.
+    let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(input.tag());
+    reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
+    let label = device_arg_or_label(args, kwargs, 4, "device", &input.device_label())?;
+    let shape = input.dims().to_vec();
+
+    let fill_is_bool = fill.is_instance_of::<pyo3::types::PyBool>();
+    let fill_is_int = fill.is_instance_of::<pyo3::types::PyInt>();
+    checked_convert(&fill, fill_is_int, tag, shape.iter().product())?;
+    if label.is_meta() {
+        return meta_result(py, shape, tag);
+    }
+    let device = label.resolve()?;
+
+    // `Scalar`, then `filled_block` -- the same two steps `constant_pad_nd`
+    // takes, so all three callers agree on what a `Scalar` becomes in a tag.
+    let value = if fill_is_bool {
+        Scalar::Int(i64::from(fill.extract::<bool>()?))
+    } else if fill_is_int {
+        Scalar::Int(fill.extract()?)
+    } else {
+        Scalar::Float(fill.extract()?)
+    };
+    let out = filled_block(OP, value, tag, &shape, &device)?;
+    finish(py, out, tag)
 }
 
 /// `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor`
@@ -9461,18 +9559,65 @@ fn new_ones_default(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.new_ones.default";
-    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let size: Vec<usize> = required(OP, args, kwargs, 1, "size")?.extract()?;
+    new_ones_or_zeros(py, args, kwargs, "aten.new_ones.default")
+}
+
+/// `aten::new_zeros(Tensor self, SymInt[] size, *, ScalarType? dtype=None,
+///     Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor`
+///
+/// `bart`'s wall (docs/DEMAND.md rank 5):
+/// `BartForConditionalGeneration.forward` -> `shift_tokens_right`, which
+/// allocates the shifted copy with `input_ids.new_zeros(input_ids.shape)`.
+/// Generic code duplicated across the whole BART-derived family (`bart`,
+/// `marian`, `blenderbot`, `mvp`) -- though not as uniform as it looks, since
+/// `mbart` and `pegasus` spell shift-right differently and hit other walls.
+///
+/// A leaf upstream, and **`new_ones`'s schema character for character** with a
+/// different fill: same argument list, same positions, same
+/// dtype-and-device-from-`self` defaulting. Measured on 2.13.0 and identical
+/// to `new_ones` in every one of them -- `x.new_zeros(())` is 0-d,
+/// `x.new_zeros(0)` is empty, a `bool` receiver gives `[False, False]`, an
+/// explicit `dtype=` beats the receiver's, `device="meta"` gives a meta
+/// tensor.
+///
+/// So it is the *same function*, switching only `Tensor::zeros` for
+/// `Tensor::ones` -- the arrangement `zeros_or_empty_like` already uses for
+/// its three `*_like` factories. Writing it out separately would mean two
+/// copies of the "defaults come from the reference tensor" rule, which is the
+/// half that is easy to get subtly wrong and impossible to see in a forward.
+fn new_zeros_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    new_ones_or_zeros(py, args, kwargs, "aten.new_zeros.default")
+}
+
+/// The body both `new_ones` and `new_zeros` are. `op` selects the fill and is
+/// also the name every refusal below carries, so a caller that spelled one of
+/// them is never told about the other.
+fn new_ones_or_zeros(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let size: Vec<usize> = required(op, args, kwargs, 1, "size")?.extract()?;
     let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(input.tag());
-    reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
+    reject_unsupported(op, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
     let label = device_arg_or_label(args, kwargs, 4, "device", &input.device_label())?;
     if label.is_meta() {
         return meta_result(py, size, tag);
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(tag).storage(OP)?;
-    let out = Tensor::ones(size, storage, &device).map_err(|e| candle_err(OP, e))?;
+    let storage = PyDtype::new(tag).storage(op)?;
+    let out = if op == "aten.new_ones.default" {
+        Tensor::ones(size, storage, &device)
+    } else {
+        Tensor::zeros(size, storage, &device)
+    }
+    .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
 
@@ -13881,6 +14026,440 @@ fn native_group_norm_default(
         crate::tensor::promote(py, finish(py, out, tag)?)?,
         crate::tensor::promote(py, finish(py, mean, stat_tag)?)?,
         crate::tensor::promote(py, finish(py, rstd, stat_tag)?)?,
+    ];
+    Ok(PyTuple::new(py, triple)?.into_any().unbind())
+}
+
+/// `optional_tensor_arg` for a slot the kernel is going to **write into**.
+///
+/// `optional_tensor_arg` extracts the wrapper by value, which is the right
+/// thing for every argument that is only read. `native_batch_norm`'s
+/// `running_mean`/`running_var` are not: they are mutated in place (see that
+/// kernel's doc comment), and a mutation applied to an extracted copy would be
+/// invisible to the caller. This keeps the `Bound`, the way `tensor_receiver`
+/// does for argument 0 of an `_`-suffixed op, but at an arbitrary index and
+/// admitting `None`.
+fn optional_tensor_receiver<'py>(
+    op: &str,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<Option<Bound<'py, PyTensorBase>>> {
+    match optional(args, kwargs, index, name)? {
+        Some(value) if !value.is_none() => Ok(Some(value.cast_into::<PyTensorBase>().map_err(
+            |_| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{op}: argument '{name}' must be a torch._C.TensorBase or None"
+                ))
+            },
+        )?)),
+        _ => Ok(None),
+    }
+}
+
+/// `aten::native_batch_norm(Tensor input, Tensor? weight, Tensor? bias,
+///     Tensor? running_mean, Tensor? running_var, bool training,
+///     float momentum, float eps) -> (Tensor, Tensor, Tensor)`
+///
+/// docs/DEMAND.md's **rank 1** -- `resnet` and `mobilenet_v2` both stop here,
+/// one layer past a stem `conv2d` that now succeeds, and the same code shape
+/// carries EfficientNet, RegNet and DenseNet. The most generic vision-CNN
+/// primitive there is. Full measurement round in docs/DEMAND1.md §1; the parts
+/// that decide the code are repeated here.
+///
+/// A leaf (`CompositeImplicitAutograd` is `False`); `aten::batch_norm` is the
+/// composite above it, and a `TorchDispatchMode` logger on 2.13.0 shows
+/// `torch.batch_norm`, `F.batch_norm` and an `nn.BatchNorm2d` forward all
+/// bottom out here with `aten.batch_norm.default` never firing. So the
+/// spelling is a `bootstrap.py` composite, exactly as `layer_norm` and
+/// `group_norm` are.
+///
+/// # The train/eval split is two different functions wearing one schema
+///
+/// ```text
+///                       training=True                    training=False
+/// statistics for out    the batch's, BIASED variance     running_mean / running_var
+/// save_mean             batch mean, shape (C,)           shape (0,)  -- EMPTY
+/// save_invstd           1/sqrt(biased_var+eps), (C,)     shape (0,)  -- EMPTY
+/// running_mean          WRITTEN IN PLACE                 untouched
+/// running_var           WRITTEN IN PLACE                 untouched
+/// ```
+///
+/// The empty `save_*` in eval mode is the detail no forward can see: a
+/// `nn.BatchNorm2d` in `.eval()` returns `result[0]` and nothing else, so
+/// handing back the running statistics there instead of two empty tensors
+/// leaves every model in the sweep green. Measured shape `(0,)`, dtype the
+/// parameter dtype.
+///
+/// # Biased for the output, UNBIASED for the running variance
+///
+/// The two halves disagree and both were pinned separately (DEMAND1.md §1.4):
+///
+/// ```text
+/// save_invstd = 1 / sqrt(var_biased + eps)                    <- divide by n
+/// running_var = (1-momentum)*running_var + momentum*var_unbiased   <- divide by n-1
+/// running_mean = (1-momentum)*running_mean + momentum*batch_mean
+/// ```
+///
+/// Pinned at `momentum=1.0`, where the old value drops out entirely and the
+/// update is the new statistic exactly: measured `running_var` after is
+/// `[0.12244898080825806, ...]`, which is the **unbiased** variance
+/// (`0.10714286` is the biased one). Using the biased variance for the update
+/// would give `1.3607143` where upstream gives `1.3622448444366455`, and no
+/// test that reads only `out` can tell those apart.
+///
+/// `eps` goes on the **variance**, before the reciprocal square root -- pinned
+/// by a constant channel, where `save_invstd` is `1/sqrt(1e-5) = 316.2278` and
+/// `1/(sqrt(0)+eps)` would be `100000`. `eps` does **not** enter the
+/// running-variance update.
+///
+/// # It mutates, and its schema does not say so
+///
+/// Measured: every argument's `alias_info` is `None`, so the schema promises
+/// this op writes nothing. It writes. That is upstream's own known wart --
+/// `_native_batch_norm_legit` exists beside it carrying the `Tensor(a!)`
+/// annotations the functionaliser needs -- and it matters here because
+/// `capture.rs` decides what mutates from **torch's name convention**, the
+/// trailing `_`. This op has none. `capture.rs` grew an argument-aware guard
+/// for it (see `MUTATES_WITHOUT_UNDERSCORE` there) that refuses a capture only
+/// when the call would actually mutate: `training=True` with statistics
+/// supplied. Eval-mode batch norm is genuinely pure, and it is the mode a
+/// captured inference graph is in, so refusing it by name would have made
+/// every BatchNorm CNN uncapturable to buy nothing.
+///
+/// # Axes, dtype and the refusals
+///
+/// The reduction is per **channel**: over dim 0 and every dim after 1. Checked
+/// with exact values at rank 2 (`(N,C)`), rank 3 (`(N,C,L)`) and rank 4 --
+/// `save_mean` for `arange(12).reshape(4,3)` is `[4.5, 5.5, 6.5]` and for
+/// `arange(12).reshape(2,3,2)` is `[3.5, 5.5, 7.5]`, which the same code path
+/// gets right only if `HxW` is derived rather than assumed to be rank-4.
+///
+/// Dtype, measured, and the same mixed-precision rule the other two norms have
+/// with a **different message**: parameters must agree with the input, except
+/// that a `float16`/`bfloat16` input may take `float32` parameters, and then
+/// `save_mean`/`save_invstd` and the running statistics are `float32` while
+/// `out` stays reduced. Anything else is `mixed dtype (CPU): all inputs must
+/// share same datatype.` -- note that this is *not* `native_group_norm`'s
+/// wording (`expect parameter to have scalar type of Float`), and the two were
+/// measured separately rather than shared.
+///
+/// ```text
+/// int64 / bool input          "batch_norm" not implemented for 'Long' / 'Bool'
+/// rank < 2                    Dimension out of range (...) -- via normalise_dim on dim 1
+/// exactly one of the stats    running_mean and running_var must either both be None or neither be None
+/// training and numel == 0     input tensor must have at least one element, but got input_sizes = [...]
+/// negative eps                NOT refused -- NaN, followed rather than guarded, as in the other two norms
+/// one element per channel     NOT refused at this level; save_invstd is 1/sqrt(eps).
+///                             `F.batch_norm`'s `_verify_batch_size` is what raises for a model,
+///                             one layer up, in the vendored tree
+/// ```
+///
+/// **Two places this kernel deliberately does not follow upstream**, both
+/// because upstream there is not a behaviour but an accident (DEMAND1.md §1.6):
+///
+///   * `training=False` with both statistics `None` **segfaults** upstream
+///     (exit 139, reproduced twice in isolation). Unreachable through any real
+///     spelling -- `torch.batch_norm` raises first, and
+///     `nn.BatchNorm2d(track_running_stats=False)` passes `training=True` in
+///     `.eval()` precisely so this cannot happen. Raised here with the message
+///     `torch.batch_norm` uses, because a crash is not an answer to reproduce.
+///   * a `weight`/`bias`/`running_*` whose length is not `C` **reads out of
+///     bounds** upstream. Measured with `C=3`: `weight` of length 2 and of
+///     length 4 both return, and both return bit-identical numbers to the
+///     correct length-3 call -- the short one having read a float past the end
+///     of its buffer and found `1.5` there. That is uninitialised heap, not a
+///     semantic. Refused here by name; `torch.batch_norm` refuses it above
+///     with upstream's own message, which is what every real caller meets.
+fn native_batch_norm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.native_batch_norm.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let weight = optional_tensor_arg(OP, args, kwargs, 1, "weight")?;
+    let bias = optional_tensor_arg(OP, args, kwargs, 2, "bias")?;
+    // Receivers, not extracted copies: these two are written in place.
+    let running_mean = optional_tensor_receiver(OP, args, kwargs, 3, "running_mean")?;
+    let running_var = optional_tensor_receiver(OP, args, kwargs, 4, "running_var")?;
+    let training = bool_arg(args, kwargs, 5, "training")?.ok_or_else(|| missing(OP, "training"))?;
+    let momentum = scalar_arg(OP, args, kwargs, 6, "momentum")?
+        .map(|s| s.as_f64())
+        .ok_or_else(|| missing(OP, "momentum"))?;
+    let eps = scalar_arg(OP, args, kwargs, 7, "eps")?
+        .map(|s| s.as_f64())
+        .ok_or_else(|| missing(OP, "eps"))?;
+
+    if running_mean.is_some() != running_var.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "running_mean and running_var must either both be None or neither be None",
+        ));
+    }
+
+    let dims = input.tensor()?.dims().to_vec();
+    // The channel axis. `normalise_dim` gives upstream's out-of-range message
+    // for a rank-1 or rank-0 input for free, which is measured to be what a
+    // direct `torch.ops.aten` call gets there.
+    let channel = normalise_dim(OP, 1, dims.len())?;
+    let c = dims[channel];
+    let n = dims[0];
+    let rest: usize = dims[2..].iter().product();
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"batch_norm\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    // The parameter dtype: every supplied parameter and running statistic must
+    // agree with the others, and then either match the input or be `float32`
+    // in front of a reduced-precision one.
+    let mixed_dtype = || {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "mixed dtype (CPU): all inputs must share same datatype.",
+        )
+    };
+    let mut param_tag: Option<TorchDType> = None;
+    let mut param_tags: Vec<TorchDType> = Vec::new();
+    if let Some(w) = &weight {
+        param_tags.push(w.tag());
+    }
+    if let Some(b) = &bias {
+        param_tags.push(b.tag());
+    }
+    if let Some(m) = &running_mean {
+        param_tags.push(m.borrow().tag());
+    }
+    if let Some(v) = &running_var {
+        param_tags.push(v.borrow().tag());
+    }
+    for candidate in param_tags {
+        match param_tag {
+            None => param_tag = Some(candidate),
+            Some(seen) if seen == candidate => {}
+            Some(_) => return Err(mixed_dtype()),
+        }
+    }
+    let mixed = match param_tag {
+        None => false,
+        Some(param) if param == tag => false,
+        Some(TorchDType::Float32)
+            if matches!(tag, TorchDType::Float16 | TorchDType::BFloat16) =>
+        {
+            true
+        }
+        Some(_) => return Err(mixed_dtype()),
+    };
+
+    // Length checks. Upstream reads out of bounds here (see the doc comment);
+    // `torch.batch_norm` refuses above with upstream's own wording, so nothing
+    // real arrives with a mismatch and this names the refusal rather than
+    // guessing at heap bytes.
+    for (label, extent) in [
+        ("weight", weight.as_ref().map(|t| t.tensor().map(|t| t.dims().to_vec()))),
+        ("bias", bias.as_ref().map(|t| t.tensor().map(|t| t.dims().to_vec()))),
+        (
+            "running_mean",
+            running_mean.as_ref().map(|t| t.borrow().tensor().map(|t| t.dims().to_vec())),
+        ),
+        (
+            "running_var",
+            running_var.as_ref().map(|t| t.borrow().tensor().map(|t| t.dims().to_vec())),
+        ),
+    ] {
+        if let Some(shape) = extent {
+            let shape = shape?;
+            if shape != [c] {
+                return Err(not_implemented(format!(
+                    "{OP}: {label} has shape {shape:?} where the input has {c} channel(s). \
+                     Upstream does not refuse this -- it reads past the end of the buffer \
+                     and returns whatever was there (measured: a length-2 weight against 3 \
+                     channels returns bit-identical numbers to the correct length-3 call, \
+                     having found the third float in uninitialised heap). \
+                     `torch.batch_norm` refuses it above this layer with upstream's own \
+                     message, which is what every real caller meets"
+                )));
+            }
+        }
+    }
+
+    let numel: usize = dims.iter().product();
+    if training && numel == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "input tensor must have at least one element, but got input_sizes = {dims:?}"
+        )));
+    }
+    if !training && running_mean.is_none() {
+        // Upstream segfaults here. `torch.batch_norm`'s own message, because a
+        // crash is not a behaviour to reproduce and this is the refusal every
+        // real caller would have met one layer up anyway.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "running_mean must be defined in evaluation mode",
+        ));
+    }
+
+    let stat_tag = if mixed { TorchDType::Float32 } else { tag };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let stat_storage = PyDtype::new(stat_tag).storage(OP)?;
+    // `opmath_type`: the reduced dtypes accumulate in `f32` and narrow once,
+    // the rule `native_group_norm` states next door.
+    let acc = match stat_storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let device = input.tensor()?.device().clone();
+
+    // `(N, C, rest)` -- `rest` derived, so rank 2, 3, 4 and 5 are one path.
+    let x3 = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.fast_to(acc))
+        .and_then(|t| t.reshape((n, c, rest)))
+        .map_err(|e| candle_err(OP, e))?;
+    let column = |t: &Tensor| t.reshape((1, c, 1)).map_err(|e| candle_err(OP, e));
+    let as_acc = |t: &PyTensorBase| {
+        t.tensor()?
+            .contiguous()
+            .and_then(|t| t.fast_to(acc))
+            .map_err(|e| candle_err(OP, e))
+    };
+
+    // `(mean, invstd)` as `(1, C, 1)` blocks, plus the flat `(C,)` statistics
+    // the first two results are. The training branch computes them; the eval
+    // branch reads them.
+    let (mean_block, invstd_block, saved) = if training {
+        let count = (n * rest) as f64;
+        let mean = x3
+            .sum_keepdim(0)
+            .and_then(|t| t.sum_keepdim(2))
+            .and_then(|t| t.affine(1.0 / count, 0.0))
+            .map_err(|e| candle_err(OP, e))?;
+        let centred = x3.broadcast_sub(&mean).map_err(|e| candle_err(OP, e))?;
+        // The BIASED variance -- divided by n. This is the one the output uses.
+        let var_biased = centred
+            .sqr()
+            .and_then(|t| t.sum_keepdim(0))
+            .and_then(|t| t.sum_keepdim(2))
+            .and_then(|t| t.affine(1.0 / count, 0.0))
+            .map_err(|e| candle_err(OP, e))?;
+        let invstd = var_biased
+            .affine(1.0, eps)
+            .and_then(|t| t.sqrt())
+            .and_then(|t| t.recip())
+            .map_err(|e| candle_err(OP, e))?;
+
+        // The running statistics, written in place. `running_var` takes the
+        // UNBIASED variance -- `biased * n/(n-1)` -- while `invstd` above kept
+        // the biased one. `eps` is not in this update.
+        if let (Some(rm), Some(rv)) = (&running_mean, &running_var) {
+            let flat_mean = mean.reshape(c).map_err(|e| candle_err(OP, e))?;
+            let var_unbiased = if count > 1.0 {
+                var_biased.affine(count / (count - 1.0), 0.0)
+            } else {
+                // n == 1: upstream's `n/(n-1)` is a division by zero and the
+                // result is not finite. Followed rather than guarded, the way
+                // a negative `eps` is -- `F.batch_norm`'s `_verify_batch_size`
+                // refuses this shape one layer up for every real caller.
+                var_biased.affine(f64::INFINITY, 0.0)
+            }
+            .and_then(|t| t.reshape(c))
+            .map_err(|e| candle_err(OP, e))?;
+            for (receiver, update) in [(rm, &flat_mean), (rv, &var_unbiased)] {
+                let old = as_acc(&receiver.borrow())?;
+                let new = old
+                    .affine(1.0 - momentum, 0.0)
+                    .and_then(|t| t.add(&update.affine(momentum, 0.0)?))
+                    .and_then(|t| t.fast_to(stat_storage))
+                    .map_err(|e| candle_err(OP, e))?;
+                write_back(OP, receiver, PyTensorBase::new(new)?)?;
+            }
+        }
+        let flat = |t: &Tensor| {
+            t.reshape(c)
+                .and_then(|t| t.fast_to(stat_storage))
+                .map_err(|e| candle_err(OP, e))
+        };
+        (mean.clone(), invstd.clone(), Some((flat(&mean)?, flat(&invstd)?)))
+    } else {
+        // Eval: the running statistics, unchanged, and two EMPTY results.
+        let rm = as_acc(&running_mean.as_ref().expect("checked above").borrow())?;
+        let rv = as_acc(&running_var.as_ref().expect("checked above").borrow())?;
+        let invstd = rv
+            .affine(1.0, eps)
+            .and_then(|t| t.sqrt())
+            .and_then(|t| t.recip())
+            .map_err(|e| candle_err(OP, e))?;
+        (column(&rm)?, column(&invstd)?, None)
+    };
+
+    // **Upstream's affine is fused, and the difference is measurable.** The
+    // obvious spelling -- `(x - mean) * invstd * weight + bias` -- is exact for
+    // a constant channel, giving `bias` back unchanged. Upstream does not do
+    // that. It precomputes
+    //
+    //     alpha = invstd * weight            (weight absent => 1)
+    //     beta  = bias - mean * alpha        (bias absent   => 0)
+    //     out   = x * alpha + beta
+    //
+    // and the two forms disagree wherever `mean * alpha` is large against the
+    // output, because that last line is a subtraction of two nearly equal
+    // numbers. Measured on a constant input of 2.0 with `eps=1e-5`, where
+    // `invstd = 316.2278`: upstream's `out` for `weight=1, bias=0.1` is
+    // **0.0999755859375**, not `0.1`. That is `0.1` rounded to a multiple of
+    // `2^-14`, which is exactly one `float32` ULP at magnitude 632 -- the
+    // magnitude of the two cancelling terms. The same arithmetic accounts for
+    // the other two channels of that measurement to the bit
+    // (`-0.1999969482421875` at `weight=2, bias=-0.2`, `0.29998779296875` at
+    // `weight=0.5, bias=0.3`).
+    //
+    // This was caught by the golden harness, not reasoned out in advance: the
+    // constant-input case exists to pin where `eps` goes, and it failed on the
+    // output instead. Everything with a real variance agrees to well inside
+    // tolerance under either form, so no other case could have found it.
+    let mut alpha = invstd_block;
+    if let Some(weight) = &weight {
+        alpha = alpha
+            .broadcast_mul(&column(&as_acc(weight)?)?)
+            .map_err(|e| candle_err(OP, e))?;
+    }
+    let mut beta = alpha
+        .mul(&mean_block)
+        .and_then(|t| t.neg())
+        .map_err(|e| candle_err(OP, e))?;
+    if let Some(bias) = &bias {
+        beta = beta
+            .broadcast_add(&column(&as_acc(bias)?)?)
+            .map_err(|e| candle_err(OP, e))?;
+    }
+    let out = x3
+        .broadcast_mul(&alpha)
+        .and_then(|t| t.broadcast_add(&beta))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let out = out
+        .fast_to(storage)
+        .and_then(|t| t.reshape(dims.as_slice()))
+        .map_err(|e| candle_err(OP, e))?;
+
+    let (save_mean, save_invstd) = match saved {
+        Some(pair) => pair,
+        None => {
+            let empty = || Tensor::zeros(0, stat_storage, &device).map_err(|e| candle_err(OP, e));
+            (empty()?, empty()?)
+        }
+    };
+
+    // Promoted element by element: `promote` at the dispatcher's exit does not
+    // look inside a tuple, the same reason the other two norms promote their
+    // own triple.
+    let triple = [
+        crate::tensor::promote(py, finish(py, out, tag)?)?,
+        crate::tensor::promote(py, finish(py, save_mean, stat_tag)?)?,
+        crate::tensor::promote(py, finish(py, save_invstd, stat_tag)?)?,
     ];
     Ok(PyTuple::new(py, triple)?.into_any().unbind())
 }
