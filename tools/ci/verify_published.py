@@ -135,10 +135,27 @@ def model(torch):
 
 
 def quantised(torch):
-    """Load-time quantisation, which is the on-device path this exists for."""
+    """Load-time quantisation, which is the on-device path this exists for.
+
+    Skipped, loudly and by name, when the installed release predates the
+    feature. This runs against **published** wheels, so a check written today
+    will outrun the version on PyPI until the next release -- and reporting that
+    as a platform failure would be a lie about the platform. The version is
+    printed so the skip cannot quietly become permanent.
+    """
+    import importlib.metadata as md
+
     from transformers import AutoModelForCausalLM
 
-    from torchnative.quant import TorchnativeConfig
+    try:
+        from torchnative.quant import TorchnativeConfig
+    except ImportError:
+        print(
+            f"SKIP  load-time quantisation -- torchnative "
+            f"{md.version('torchnative')} predates TorchnativeConfig. "
+            f"Not a platform result."
+        )
+        return
 
     m = AutoModelForCausalLM.from_pretrained(
         "HuggingFaceTB/SmolLM2-135M",

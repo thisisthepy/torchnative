@@ -280,24 +280,33 @@ only exists on a platform. Every ✅ has a run behind it.
 | symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
 | `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
 | installs | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ *mounted, no wheel* |
-| `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ |
-| computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
+| `import torch` | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
+| computes | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
 | **on PyPI `0.0.9a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ *but run elsewhere* | ✅ *Node* |
+| can be run *here* | ✅ | emulator | ❌ | CI | CI | ✅ *Node* |
 
-**Windows moved on a user's report, not on our own run**, and only as far as the report goes. Someone
-installed the published `0.0.5a0` wheel with `uv`, `import torch` succeeded, and `transformers`
-carried them 655 lines into `modeling_rope_utils.py` before hitting a missing **meta** kernel — since
-fixed. That proves install and import; it does **not** prove `computes`, because everything on that
-path ran on the meta device, which by construction computes nothing. So that row stays ⚠️.
+**Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
+machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
+**published** wheel from PyPI on `ubuntu-latest` and `windows-latest` at Python 3.13 and asks it to
+work. Both answered `RESULT: ALL PASS` — `mm`, `nn.Linear`, and the mixed-dtype promotion where the
+value and not just the label is at stake (`int64(2049) - float16(1.0)` is `2047.0`) — and then both
+ran SmolLM2-135M through real `transformers` and produced text **character-identical to macOS
+arm64**. Every expected value is hardcoded from an arm64 run of the same source, so a disagreement
+would have localised to the platform rather than to the check.
+
+Windows had moved once before on a user's report rather than our own run, and that report could not
+carry `computes`: they installed `0.0.5a0` with `uv`, `import torch` succeeded, and `transformers`
+carried them 655 lines into `modeling_rope_utils.py` before a missing **meta** kernel — since fixed
+— but everything on that path ran on the meta device, which by construction computes nothing.
 
 The same report settled something else the table has no row for. Their interpreter was **Python
 3.14** and the wheel is `cp313-abi3`. One binary per platform loading on 3.13 and every later
 CPython is the property five published wheels rest on, and until then it had only been argued.
 
-The last row is why the columns differ. iOS, Linux and Windows have no runtime on this machine —
-no device, and no `docker`, `colima`, `podman`, `lima` or `qemu` — so the deepest rung any of them
-can reach here is *symbols resolve*.
+The last row is why the columns differ. **iOS is now the only platform with no way to run**: no
+device here, and no `docker`, `colima`, `podman`, `lima` or `qemu` either — but Linux and Windows do
+not need one, because CI has both. iOS cannot be reached that way (a hosted macOS runner has a
+simulator, which is the rung already measured, not a device), so it stays at *symbols resolve*.
 
 WASM is the exception, and it has now been executed. A complete emsdk with `emcc` and a bundled
 Node 24 sits in this machine's cache — `command -v node` finds nothing only because it is not on
