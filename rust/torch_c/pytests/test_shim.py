@@ -725,9 +725,53 @@ def test_add_broadcasts_and_applies_alpha():
     ]
 
 
-def test_add_refuses_to_guess_a_promotion():
+def test_add_promotes_and_computes_in_the_promoted_dtype():
+    """`float32 + float64` is `float64`, computed there rather than relabelled.
+
+    This test used to assert the opposite -- that `add` refused the pair.
+    That invariant genuinely changed: docs/PROMOTE.md §3 measured the whole
+    9x9 grid against `torch.promote_types` and upstream promotes every cell,
+    so the refusal was the defect and not the contract.
+
+    The dtype alone is not enough to know the change is right, which is why
+    the value is asserted too. `float32(0.1) - float64(0.1)` is a nonzero
+    number **only if the subtraction happened in `float64`**; computing in
+    `float32` and casting the result up gives exactly 0.0 and still labels
+    itself `float64`. Upstream answers 1.4901161138336505e-09.
+    """
     a = _C._tensor_from_flat([1.0], [1], dtype=_C.float32)
     b = _C._tensor_from_flat([1.0], [1], dtype=_C.float64)
+    out = _C._aten_dispatch("aten.add.Tensor", a, b)
+    assert out.dtype == _C.float64, out.dtype
+    assert out.tolist() == [2.0]
+
+    # The discriminating case: where the arithmetic happened is observable.
+    lo = _C._tensor_from_flat([0.1], [1], dtype=_C.float32)
+    hi = _C._tensor_from_flat([0.1], [1], dtype=_C.float64)
+    diff = _C._aten_dispatch("aten.sub.Tensor", lo, hi)
+    assert diff.dtype == _C.float64, diff.dtype
+    assert diff.tolist() == [1.4901161138336505e-09], diff.tolist()
+
+    # And the operand is narrowed to the common dtype BEFORE the arithmetic,
+    # which is the other half of the same rule. `float16` cannot hold 2049;
+    # upstream narrows it to 2048 and answers 2047, where computing in the
+    # `float32` accumulator and narrowing once at the end answers 2048.
+    big = _C._tensor_from_flat([2049.0], [1], dtype=_C.int64)
+    one = _C._tensor_from_flat([1.0], [1], dtype=_C.float16)
+    narrowed = _C._aten_dispatch("aten.sub.Tensor", big, one)
+    assert narrowed.dtype == _C.float16, narrowed.dtype
+    assert narrowed.tolist() == [2047.0], narrowed.tolist()
+
+
+def test_a_pair_with_no_promotion_is_still_refused_by_name():
+    """`uint32` against a signed integer has no promotion, upstream included.
+
+    Upstream raises "Promotion for uint16, uint32, uint64 types is not
+    supported, attempted to promote UInt32 and Long", so refusing is
+    reproducing it rather than declining to implement it.
+    """
+    a = _C._tensor_from_flat([1.0], [1], dtype=_C.uint32)
+    b = _C._tensor_from_flat([1.0], [1], dtype=_C.int64)
     try:
         _C._aten_dispatch("aten.add.Tensor", a, b)
     except NotImplementedError as e:
@@ -737,9 +781,14 @@ def test_add_refuses_to_guess_a_promotion():
         # `torch.bool` from `torch.uint8` -- both are `u8` down there. A
         # message that cannot name the difference cannot report the bug the
         # whole distinction exists to catch.
-        assert "float32" in str(e) and "float64" in str(e)
+        assert "uint32" in str(e) and "int64" in str(e)
     else:
         raise AssertionError("dtype promotion must not be silently invented")
+
+    # Against a float it DOES promote, and that cell is answered -- so the
+    # refusal above is about the pair, not about `uint32` being unsupported.
+    f = _C._tensor_from_flat([1.0], [1], dtype=_C.float32)
+    assert _C._aten_dispatch("aten.add.Tensor", a, f).dtype == _C.float32
 
 
 def test_mm_matches_torch():
@@ -4508,13 +4557,27 @@ def test_meta_comparisons_answer_bool_whatever_went_in():
     else:
         raise AssertionError("meta gt.Tensor broadcast a pair that does not broadcast")
 
-    # And the dense kernel's dtype refusal is the meta kernel's. Upstream
-    # promotes here; this shim does not, on either device, and the meta path
-    # must not be the one that quietly starts (docs/E2E_REAL.md §6.1).
+    # And the meta kernel's dtype rule is the dense kernel's, in BOTH
+    # directions -- it must promote exactly the pairs the dense kernel
+    # promotes and refuse exactly the ones it refuses (docs/E2E_REAL.md §6.1).
+    #
+    # `float32 x int64` used to be the refusing example here. It promotes now
+    # (docs/PROMOTE.md §4), so it has become the *promoting* example and the
+    # refusal is checked against a pair that genuinely has no promotion.
+    assert d("aten.gt.Tensor", _meta_empty([2], _C.float32),
+             _meta_empty([2], _C.int64)).dtype == _C.bool
+    assert d("aten.gt.Tensor", _meta_empty([2], _C.float16),
+             _meta_empty([2], _C.bfloat16)).dtype == _C.bool
+
+    # `uint32` has no promotion against a signed integer *upstream* either
+    # ("Promotion for uint16, uint32, uint64 types is not supported"), so this
+    # refusal reproduces upstream rather than admitting a gap -- and it is the
+    # pair that keeps this assertion able to fail at all.
     try:
-        d("aten.gt.Tensor", _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+        d("aten.gt.Tensor", _meta_empty([2], _C.uint32), _meta_empty([2], _C.int64))
     except NotImplementedError as e:
         assert "promotion" in str(e), str(e)
+        assert "uint32" in str(e) and "int64" in str(e), str(e)
     else:
         raise AssertionError("meta gt.Tensor promoted where the dense kernel refuses")
 
@@ -4580,13 +4643,42 @@ def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kern
              _meta_empty([2], _C.int32)).dtype == _C.float32
     assert d("aten.mul.Tensor", _meta_empty([2], _C.int64),
              _meta_empty([2], _C.int32)).dtype == _C.int64
+    # `add` and `sub` promote too now -- all four members share one rule
+    # (docs/PROMOTE.md §4), where they used to be split two and two. The meta
+    # path must have moved with the dense one, so this asserts the promotion
+    # rather than the refusal it used to assert.
     for op in ("aten.add.Tensor", "aten.sub.Tensor"):
+        assert d(op, _meta_empty([2], _C.float32),
+                 _meta_empty([2], _C.int64)).dtype == _C.float32, op
+        assert d(op, _meta_empty([2], _C.float16),
+                 _meta_empty([2], _C.bfloat16)).dtype == _C.float32, op
+        assert d(op, _meta_empty([2], _C.int64),
+                 _meta_empty([2], _C.float16)).dtype == _C.float16, op
+        # An integral operand never widens a float: the cell that breaks the
+        # plausible-looking "take the wider one" shortcut.
+        assert d(op, _meta_empty([2], _C.int64),
+                 _meta_empty([2], _C.int32)).dtype == _C.int64, op
+
+    # The refusal that is left is the one upstream also has.
+    for op in ("aten.add.Tensor", "aten.sub.Tensor", "aten.mul.Tensor", "aten.div.Tensor"):
         try:
-            d(op, _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+            d(op, _meta_empty([2], _C.uint32), _meta_empty([2], _C.int64))
         except NotImplementedError as e:
             assert "promotion" in str(e), (op, str(e))
         else:
             raise AssertionError(f"meta {op} promoted where the dense kernel refuses")
+
+    # `sub` refuses a `bool` operand whatever it would promote to, because
+    # upstream does -- the check is on the operand, not on the promoted type,
+    # and the meta path has to make it in the same order (docs/PROMOTE.md §4).
+    try:
+        d("aten.sub.Tensor", _meta_empty([2], _C.bool), _meta_empty([2], _C.float32))
+    except NotImplementedError as e:
+        assert "Subtraction" in str(e), str(e)
+    else:
+        raise AssertionError("meta sub.Tensor promoted a bool operand away")
+    assert d("aten.add.Tensor", _meta_empty([2], _C.bool),
+             _meta_empty([2], _C.float32)).dtype == _C.float32
 
     # The `Scalar` overloads, including the two that were absent until the
     # `Tensor` ones landed. `int64 * 2` stays `int64`; `int64 * 2.0` floats.
@@ -4665,10 +4757,18 @@ def test_meta_where_broadcasts_three_operands_and_takes_dtype_from_the_values():
     else:
         raise AssertionError("meta where.self accepted a float condition")
 
-    # And the value operands must agree, as they must on the dense path.
+    # And the value operands promote, as they do on the dense path -- from the
+    # two value operands only, with the condition's dtype taking no part
+    # (docs/PROMOTE.md §4).
+    assert d("aten.where.self", _meta_empty([2], _C.bool),
+             _meta_empty([2], _C.float32), _meta_empty([2], _C.int64)).dtype == _C.float32
+    assert d("aten.where.self", _meta_empty([2], _C.bool),
+             _meta_empty([2], _C.float16), _meta_empty([2], _C.bfloat16)).dtype == _C.float32
+
+    # The pair upstream has no promotion for is still refused.
     try:
         d("aten.where.self", _meta_empty([2], _C.bool),
-          _meta_empty([2], _C.float32), _meta_empty([2], _C.int64))
+          _meta_empty([2], _C.uint32), _meta_empty([2], _C.int64))
     except NotImplementedError as e:
         assert "promotion" in str(e), str(e)
     else:
@@ -12349,10 +12449,22 @@ for name in ("eq", "ne", "lt", "le", "gt", "ge"):
     rec(f"{name}_fn", lambda name=name: getattr(torch, name)(x, y).tolist())
     rec(f"{name}_member", lambda name=name: getattr(x, name)(y).tolist())
 try:
-    torch.eq(torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([1.0, 3.0, 2.0]))
-    out["eq_mixed_dtype"] = "ACCEPTED"
+    _mixed = torch.eq(
+        torch.tensor([1, 2, 3], dtype=torch.int32), torch.tensor([1.0, 3.0, 2.0])
+    )
+    out["eq_mixed_dtype"] = _mixed.tolist()
 except NotImplementedError as e:
     out["eq_mixed_dtype"] = f"refused:{e}"
+# `uint32` against a signed integer has no promotion upstream either, so this
+# one must still be refused -- it is what keeps the assertion above able to
+# fail rather than passing on any answer at all.
+try:
+    torch.eq(
+        torch.tensor([1, 2, 3], dtype=torch.uint32), torch.tensor([1, 3, 2], dtype=torch.int64)
+    )
+    out["eq_unpromotable"] = "ACCEPTED"
+except NotImplementedError as e:
+    out["eq_unpromotable"] = f"refused:{e}"
 
 # --- max/min: whole-tensor, two-tensor (max only), dim-reduce (max only) --
 rec("max_whole_fn", lambda: torch.max(x).item())
@@ -12537,8 +12649,13 @@ def test_spelling_road_through_the_vendored_tree():
     eq("gt_member", [a > b for a, b in zip(x, y)])
     eq("ge_fn", [a >= b for a, b in zip(x, y)])
     eq("ge_member", [a >= b for a, b in zip(x, y)])
-    got = out.get("eq_mixed_dtype", "")
-    assert got.startswith("refused:"), got  # documented gap, not this round's to close
+    # `int32 == float32` used to be recorded here as a documented refusal.
+    # It promotes now (docs/PROMOTE.md §4): the `int32` operand is brought to
+    # `float32` and compared there, giving upstream's answer through the
+    # vendored `import torch` road rather than through `_aten_dispatch`.
+    eq("eq_mixed_dtype", [True, False, False])
+    got = out.get("eq_unpromotable", "")
+    assert got.startswith("refused:"), got
 
     eq("max_whole_fn", 4.0)
     eq("max_whole_member", 4.0)

@@ -195,7 +195,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>168</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>7685 / 7685</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>327</b></td></tr>
+<tr><td>Smoke tests</td><td><b>328</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
@@ -329,7 +329,7 @@ rather than inferred from the host.
 | dtype | macOS | Android | iOS | Linux · Windows · WASM | arithmetic path |
 |---|:--:|:--:|:--:|:--:|---|
 | `float32` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | **macOS: AMX** via Accelerate · **Android: NEON `gemm`**, 88% of core peak |
-| `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm` |
+| `float64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | `gemm`. **Mixes with the other float and integer dtypes**, on `add`, `sub`, the six comparisons, `max`/`min`, `bitwise_or`, `where`, `cat` and `stack` — result dtype *and* value bit-identical to upstream over a 9×9 grid, which is not the same thing: upstream casts each operand to the common dtype before the accumulator, so `int64(2049) - float16(1.0)` is `2047.0` and not `2048.0` ([`docs/PROMOTE.md`](docs/PROMOTE.md)). `mm`, `matmul`, `bmm`, `convolution` and SDPA still refuse a mixed pair, and so does upstream |
 | `bfloat16` · `float16` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | widened to `f32` in registers, accumulated, narrowed once — upstream's rule. Prefill is 1.19x `float32` here and **2.3x faster than upstream's own `bfloat16`**; decode still materialises the widened weight ([`docs/DTYPE_PERF.md`](docs/DTYPE_PERF.md)) |
 | `bool` `uint8` `uint32`<br>`int16` `int32` `int64` | ✅ | ✅ | ⚠️ | ⚠️ · ⚠️ · 🔲 | integer kernels |
 | `float8_e4m3fn` | ⚠️ | ⚠️ | ⚠️ | ⚠️ · ⚠️ · 🔲 | constructs, then hangs on most paths — excluded from the golden suite |

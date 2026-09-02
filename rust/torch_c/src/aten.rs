@@ -803,7 +803,11 @@ fn meta_dispatch(
         | "aten.gt.Tensor" => {
             let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
             let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-            same_dtype(op, &lhs, &rhs)?;
+            // Promotes, and the result is `bool` whatever it promotes to.
+            // The call is still made rather than skipped: it is what refuses
+            // the pairs that have no promotion at all, so meta cannot
+            // advertise a comparison the dense kernel declines to run.
+            promote_operands(op, &lhs, &rhs)?;
             let shape = broadcast_shape(op, lhs.dims(), rhs.dims())?;
             meta_result(py, shape, TorchDType::Bool)
         }
@@ -826,14 +830,16 @@ fn meta_dispatch(
             };
             let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
             let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-            // `mul` and `div` promote; `add` and `sub` do not. The dense
-            // kernel's split, read off the same condition so meta cannot
-            // advertise a pairing the dense kernel declines.
-            let operand = if kind == Arith::Mul || kind == Arith::Div {
-                promote_operands(op, &lhs, &rhs)?
-            } else {
-                same_dtype(op, &lhs, &rhs)?
-            };
+            // All four promote, and `sub` refuses a `bool` operand before it
+            // promotes. Both halves are `arith_tensor`'s, restated in the
+            // same order so meta cannot advertise a pairing the dense kernel
+            // declines -- nor decline one it would have answered.
+            if kind == Arith::Sub
+                && (lhs.tag() == TorchDType::Bool || rhs.tag() == TorchDType::Bool)
+            {
+                arith_tag(op, kind, TorchDType::Bool, None)?;
+            }
+            let operand = promote_operands(op, &lhs, &rhs)?;
             let tag = arith_tag(op, kind, operand, None)?;
             alpha_arg(op, args, kwargs)?;
             let shape = broadcast_shape(op, lhs.dims(), rhs.dims())?;
@@ -868,7 +874,8 @@ fn meta_dispatch(
             let lhs = tensor_arg(op, args, kwargs, 1, "self")?;
             let rhs = tensor_arg(op, args, kwargs, 2, "other")?;
             where_condition_check(&condition)?;
-            let tag = same_dtype(op, &lhs, &rhs)?;
+            // Promotes from the two value operands, as the dense kernel does.
+            let tag = promote_operands(op, &lhs, &rhs)?;
             let shape = broadcast_shape(op, condition.dims(), lhs.dims())?;
             let shape = broadcast_shape(op, &shape, rhs.dims())?;
             meta_result(py, shape, tag)
@@ -1853,11 +1860,19 @@ fn add_tensor(
         _ => 1.0,
     };
 
-    let tag = same_dtype(OP, &lhs, &rhs)?;
+    // Promotes, over the same lattice as every other elementwise binary op --
+    // docs/PROMOTE.md §3, where `add.Tensor`'s 9x9 grid was measured against
+    // `torch.promote_types` and agreed in every cell.
+    let tag = promote_operands(OP, &lhs, &rhs)?;
     // `bool + bool` is a logical or in torch, not an arithmetic sum
     // (BOOL.md §2.2). candle's `broadcast_add` would give 2 where both are
     // true, which is still truthy and therefore silently wrong downstream --
     // so this refuses rather than approximates.
+    //
+    // Only `bool + bool` reaches here now: a `bool` against anything else
+    // promotes to that other dtype and is ordinary arithmetic upstream
+    // (`bool + float32` is `float32` `[2.0]`, measured), which is what makes
+    // testing the *promoted* tag the right test rather than either operand's.
     if tag == TorchDType::Bool {
         return Err(not_implemented(format!(
             "{OP}: torch.bool addition is logical or, not arithmetic, and is              not implemented in torch._C shim"
@@ -1875,16 +1890,21 @@ fn add_tensor(
     // approximating -- and `alpha != 1` is left to the slow path because
     // `scale_by_alpha` is a rule of its own (§3.1 of docs/BF16.md) and folding
     // it in here would be a second place for that rule to live.
+    //
+    // Both operands reach the common dtype before either reaches `acc` --
+    // `operand_in`, which is where that ordering is justified.
+    let lhs_common = operand_in(OP, lhs.tensor()?, storage)?;
+    let rhs_common = operand_in(OP, rhs.tensor()?, storage)?;
     if alpha == 1.0 {
         if let Some(out) =
-            crate::reduced::fused_arith(Fused::Add, lhs.tensor()?, rhs.tensor()?, storage)
+            crate::reduced::fused_arith(Fused::Add, &lhs_common, &rhs_common, storage)
         {
             let out = out.map_err(|e| candle_err(OP, e))?;
             return Ok(PyTensorBase::new(out)?.into_pyobject(py)?.into_any().unbind());
         }
     }
-    let lhs = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
-    let rhs = rhs.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
+    let lhs = lhs_common.fast_to(acc).map_err(|e| candle_err(OP, e))?;
+    let rhs = rhs_common.fast_to(acc).map_err(|e| candle_err(OP, e))?;
     let rhs = scale_by_alpha(OP, &rhs, alpha, storage)?;
     let out = lhs
         .broadcast_add(&rhs)
@@ -2196,7 +2216,7 @@ fn mm_default(
             rhs.tensor()?.rank()
         )));
     }
-    let tag = same_dtype(OP, &lhs, &rhs)?;
+    let tag = require_same_dtype(OP, &lhs, &rhs)?;
 
     // Accumulate where torch accumulates -- see `gemm_accumulate_in`.
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -2246,7 +2266,7 @@ fn bmm_default(
             "batch2 must be a 3D tensor",
         ));
     }
-    let tag = same_dtype(OP, &lhs, &rhs)?;
+    let tag = require_same_dtype(OP, &lhs, &rhs)?;
 
     // torch checks batch2's leading pair against batch1's (batch, k) and says
     // so in exactly these words. Reproduced rather than paraphrased: the
@@ -3098,8 +3118,8 @@ fn sdpa_flash_cpu(
         _ => None,
     };
 
-    same_dtype(OP, &query, &key)?;
-    let tag = same_dtype(OP, &query, &value)?;
+    require_same_dtype(OP, &query, &key)?;
+    let tag = require_same_dtype(OP, &query, &value)?;
     if !tag.is_floating_point() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "scaled_dot_product_attention_flash_attention: Expected data type in \
@@ -3979,10 +3999,10 @@ fn side_from_scalar(value: &Scalar, tag: TorchDType) -> PowSide {
 ///     `IndexError`.
 ///
 /// It does still take part in **dtype**: upstream promotes, so
-/// `cat([int64 (0,), int32 (2,3)])` is `int64` rather than `int32`. This shim
-/// refuses mixed dtypes here as it did before -- promotion is a separate gap
-/// with its own refusal, and skipping the shape while silently dropping the
-/// dtype would have been a third behaviour belonging to neither.
+/// `cat([int64 (0,), int32 (2,3)])` is `int64` rather than `int32`. A skipped
+/// entry is skipped for its *shape* only -- `promote_list` runs over the
+/// whole list, before the partition, so a `(0,)` entry still contributes its
+/// dtype exactly as upstream's does.
 fn cat_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -3995,29 +4015,24 @@ fn cat_default(
             "torch.cat(): expected a non-empty list of Tensors",
         ));
     }
-    let tag = tensors[0].tag();
-    for other in &tensors[1..] {
-        if other.tag() != tag {
-            return Err(not_implemented(format!(
-                "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other.tag().name()
-            )));
-        }
-    }
+    let tag = promote_list(OP, &tensors)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
 
-    // The legacy-empty partition, before anything reads a rank.
-    let mut kept: Vec<&Tensor> = Vec::with_capacity(tensors.len());
+    // The legacy-empty partition, before anything reads a rank. Each kept
+    // entry is brought to the common dtype here -- `Tensor::cat` needs one
+    // dtype across the list, and this is the same narrowing upstream applies
+    // (`cat([int64([2049]), float16([1.])])` is `[2048., 1.]`, measured, not
+    // `[2049., 1.]`).
+    let mut kept: Vec<Tensor> = Vec::with_capacity(tensors.len());
     for t in &tensors {
         let inner = t.tensor()?;
         if inner.dims() != [0] {
-            kept.push(inner);
+            kept.push(operand_in(OP, inner, storage)?);
         }
     }
     if kept.is_empty() {
         // Every entry was `(0,)`. Upstream hands back a `(0,)` of the same
         // dtype without ever looking at `dim`.
-        let storage = PyDtype::new(tag).storage(OP)?;
         let out = Tensor::from_vec(Vec::<f64>::new(), 0usize, tensors[0].tensor()?.device())
             .and_then(|t| t.fast_to(storage))
             .map_err(|err| candle_err(OP, err))?;
@@ -4057,12 +4072,10 @@ fn cat_default(
 ///     with different wording.
 ///   * **upstream promotes dtypes here** -- `stack([bool, int64])` gives
 ///     `int64` and `stack([int64, float32])` gives `float32`, both measured.
-///     This shim refuses instead, the same way `cat_default` and `same_dtype`
-///     do and for the reason written at `same_dtype`. The four architectures
-///     this op was added for never mix (GPT-J stacks two `float32` halves of
-///     one tensor), so the refusal costs nothing measured; the golden cases
-///     record the promotion as `c_error` so it stays visible as a gap rather
-///     than being forgotten.
+///     This shim used to refuse; it now promotes through `promote_list`, the
+///     same fold `cat_default` uses, `stack`'s own 9x9 grid having been
+///     measured against `torch.promote_types` in docs/PROMOTE.md §3 rather
+///     than inherited from `cat`'s.
 ///
 /// Entries are made contiguous first. Upstream accepts a non-contiguous entry
 /// and answers a contiguous result (measured on a transposed input), and
@@ -4080,16 +4093,8 @@ fn stack_default(
             "stack expects a non-empty TensorList",
         ));
     }
-    let tag = tensors[0].tag();
-    for other in &tensors[1..] {
-        if other.tag() != tag {
-            return Err(not_implemented(format!(
-                "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other.tag().name()
-            )));
-        }
-    }
+    let tag = promote_list(OP, &tensors)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
     let first = tensors[0].tensor()?.dims().to_vec();
     for (index, other) in tensors.iter().enumerate().skip(1) {
         if other.tensor()?.dims() != first.as_slice() {
@@ -4117,9 +4122,16 @@ fn stack_default(
         )));
     }
 
+    // Brought to the common dtype and made contiguous, in that order:
+    // `Tensor::stack` needs one dtype across the list, and the narrowing is
+    // the one upstream applies to each operand rather than to the result.
     let contiguous: Vec<Tensor> = tensors
         .iter()
-        .map(|t| t.tensor()?.contiguous().map_err(|e| candle_err(OP, e)))
+        .map(|t| {
+            operand_in(OP, t.tensor()?, storage)?
+                .contiguous()
+                .map_err(|e| candle_err(OP, e))
+        })
         .collect::<PyResult<_>>()?;
     let tensor = Tensor::stack(&contiguous, dim as usize).map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, tag)
@@ -4764,6 +4776,43 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
 /// over the storable dtypes and agree with it in every cell, so the same
 /// table serves them; only `bitwise_and` has a measured caller and only
 /// `bitwise_and` is wired.
+/// The dtype a promoting *n*-ary op computes in: the lattice folded left over
+/// the list. `cat` and `stack` are the two.
+///
+/// **Folding left is upstream's own shape for this** and it is sound because
+/// `promote_types` is associative and commutative over the lattice, which is
+/// the property that makes the result independent of the list order. The one
+/// pair that could have broken it is the reduced-float tie -- `float16` with
+/// `bfloat16` escapes upwards to `float32` rather than picking a side -- and
+/// it was checked rather than assumed:
+///
+/// ```text
+/// cat([float16, bfloat16, float64])  ->  float64     upstream
+/// cat([float64, float16, bfloat16])  ->  float64     upstream
+/// cat([float16, bfloat16, float16])  ->  float32     upstream
+/// ```
+///
+/// The error names the accumulated dtype against the entry that could not
+/// join it, which is the pair that has no answer -- not the first two entries,
+/// which may well have promoted cleanly.
+fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
+    let mut tag = tensors[0].tag();
+    for other in &tensors[1..] {
+        let next = other.tag();
+        if next == tag {
+            continue;
+        }
+        tag = promote_types(tag, next).ok_or_else(|| {
+            not_implemented(format!(
+                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                tag.name(),
+                next.name()
+            ))
+        })?;
+    }
+    Ok(tag)
+}
+
 fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() == rhs.tag() {
         return Ok(lhs.tag());
@@ -4777,6 +4826,39 @@ fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResul
     })
 }
 
+/// An operand cast **to the common dtype**, which is the step that has to
+/// happen before any widening to an accumulator.
+///
+/// This is one line and it is the whole difference between promoting and
+/// *appearing* to promote. Upstream's `TensorIterator` converts every operand
+/// to `common_dtype` and the kernel then reads that value into `opmath_t`;
+/// the two conversions are not interchangeable with a single conversion
+/// straight to `opmath_t`, because the first one can lose bits that the
+/// second cannot restore.
+///
+/// Measured on 2.13.0:
+///
+/// ```text
+/// sub(int64([2049]), float16([1.0]))  ->  float16  2047.0     upstream
+/// ```
+///
+/// `promote_types(int64, float16)` is `float16`, and `float16` cannot hold
+/// 2049 -- it rounds to 2048. Upstream narrows the `int64` operand *first*,
+/// so it subtracts 2048 - 1 and answers 2047. Casting both operands straight
+/// to the `float32` accumulator subtracts 2049 - 1 = 2048 and narrows once at
+/// the end, answering **2048**. Both results are labelled `float16` and only
+/// one of them is upstream's, which is exactly the failure that is invisible
+/// from the outside: the dtype matches, the value does not.
+///
+/// The same trap is in the comparisons, where it is worse because the result
+/// dtype is `bool` either way and carries no trace of where the comparison
+/// happened. `eq(int64([16777217]), float32([16777216.0]))` is **True**
+/// upstream -- the `int64` narrows to `float32` and the two become the same
+/// number -- while comparing in a dtype wide enough to hold both gives False.
+fn operand_in(op: &str, tensor: &Tensor, common: candle_core::DType) -> PyResult<Tensor> {
+    tensor.fast_to(common).map_err(|e| candle_err(op, e))
+}
+
 fn arith_tensor(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -4786,21 +4868,24 @@ fn arith_tensor(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    // **`mul` and `div` promote their operands; `add` and `sub` still do
-    // not.** That split is not a principle, it is a record of which callers
-    // have been measured: `mul` was widened for docs/OPS4.md's, and `div` is
-    // widened here for `sam3_video`, whose SAM3 detector divides a `float32`
-    // grid by an `int64` stride and stopped on
-    // `aten.div.Tensor: dtype promotion not implemented ... float32 vs int64`.
-    // Upstream promotes all four; `add`/`sub` keep `same_dtype`'s refusal
-    // because nothing in the 26-architecture sweep reaches them mixed, and a
-    // refusal that names the gap is better than surface with no caller
-    // (docs/BIND.md §9).
-    let operand = if kind == Arith::Mul || kind == Arith::Div {
-        promote_operands(op, &lhs, &rhs)?
-    } else {
-        same_dtype(op, &lhs, &rhs)?
-    };
+    // **All four promote.** They did not always: `mul` was widened for
+    // docs/OPS4.md and `div` for `sam3_video`, one measured caller at a time,
+    // while `add` and `sub` kept `same_dtype`'s refusal. docs/PROMOTE.md §3
+    // closed the split by measuring the whole 9x9 grid for all four against
+    // `torch.promote_types` -- they agree in every cell, so there is one rule
+    // here and no reason for two of the four to decline it.
+    //
+    // **`sub` still refuses a `bool` operand, and that check has to run
+    // before the promotion rather than after it.** Upstream raises for
+    // `bool - float32` even though `promote_types(bool, float32)` is
+    // `float32`: the refusal is on the *operand*, not on the promoted type,
+    // so promoting first would answer where upstream raises. `arith_tag` is
+    // asked for the wording rather than it being repeated here, so the two
+    // spellings of the refusal cannot drift apart.
+    if kind == Arith::Sub && (lhs.tag() == TorchDType::Bool || rhs.tag() == TorchDType::Bool) {
+        arith_tag(op, kind, TorchDType::Bool, None)?;
+    }
+    let operand = promote_operands(op, &lhs, &rhs)?;
     let tag = arith_tag(op, kind, operand, None)?;
     let storage = PyDtype::new(tag).storage(op)?;
 
@@ -4809,19 +4894,26 @@ fn arith_tensor(
     // reason `add_tensor` does it there.
     let acc = opmath_in(storage);
     let alpha = alpha_arg(op, args, kwargs)?;
+    // **To the common dtype first, then to the accumulator** -- `operand_in`,
+    // which is where the reason is written. Straight to `acc` is a different
+    // answer whenever the common dtype is narrower than the operand.
+    let left_common = operand_in(op, lhs.tensor()?, storage)?;
+    let right_common = operand_in(op, rhs.tensor()?, storage)?;
     // One pass instead of three, when the operands allow it -- see
-    // `add_tensor`, which takes the same fast path for the same reason.
+    // `add_tensor`, which takes the same fast path for the same reason. It is
+    // handed the *narrowed* operands, so a promoting call reaches it too;
+    // `fused_arith` still declines anything that is not already `storage`.
     if alpha == 1.0 {
         if let Some(fused) = kind.fused() {
             if let Some(out) =
-                crate::reduced::fused_arith(fused, lhs.tensor()?, rhs.tensor()?, storage)
+                crate::reduced::fused_arith(fused, &left_common, &right_common, storage)
             {
                 return finish(py, out.map_err(|e| candle_err(op, e))?, tag);
             }
         }
     }
-    let left = lhs.tensor()?.fast_to(acc).map_err(|e| candle_err(op, e))?;
-    let right = rhs.tensor()?.fast_to(acc).map_err(|e| candle_err(op, e))?;
+    let left = left_common.fast_to(acc).map_err(|e| candle_err(op, e))?;
+    let right = right_common.fast_to(acc).map_err(|e| candle_err(op, e))?;
     let right = scale_by_alpha(op, &right, alpha, storage)?;
     let out = apply_arith(op, kind, &left, &right)?
         .fast_to(storage)
@@ -5023,7 +5115,7 @@ fn matmul_default(
     const OP: &str = "aten.matmul.default";
     let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
-    let tag = same_dtype(OP, &lhs, &rhs)?;
+    let tag = require_same_dtype(OP, &lhs, &rhs)?;
     if lhs.tensor()?.rank() < 2 || rhs.tensor()?.rank() < 2 {
         // torch's 1-D rules prepend/append a dimension and remove it again.
         // Not measured as used, and guessing them is what this shim refuses.
@@ -5097,10 +5189,29 @@ fn compare_tensor(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    let tag = same_dtype(op, &lhs, &rhs)?;
+    // Promotes. The result is `bool` for every pair (docs/PROMOTE.md §3), so
+    // the promoted tag is not the *answer's* dtype -- it is the dtype the
+    // comparison happens **in**, and that is a load-bearing distinction.
+    //
+    // `compare_common` then widens to `f64`/`i64` so candle has one kernel to
+    // run, which is safe only because both operands have already been brought
+    // to the common dtype. Widening straight from the originals compares two
+    // numbers that upstream never compares:
+    //
+    // ```text
+    // eq(int64([16777217]), float32([16777216.0]))  ->  True    upstream
+    // ```
+    //
+    // 16777217 is not representable in `float32`; upstream narrows the
+    // `int64` operand to the common dtype and the two become the same number.
+    // Comparing in `f64` -- which holds both exactly -- answers False. The
+    // result is `torch.bool` on both roads and nothing downstream can tell
+    // which one ran.
+    let tag = promote_operands(op, &lhs, &rhs)?;
+    let storage = PyDtype::new(tag).storage(op)?;
     let floating = tag.is_floating_point();
-    let left = compare_common(op, lhs.tensor()?, floating)?;
-    let right = compare_common(op, rhs.tensor()?, floating)?;
+    let left = compare_common(op, &operand_in(op, lhs.tensor()?, storage)?, floating)?;
+    let right = compare_common(op, &operand_in(op, rhs.tensor()?, storage)?, floating)?;
     // candle's comparisons yield U8 with 0/1, which is exactly the invariant
     // `boolean()` asserts (BOOL.md §6.3).
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
@@ -5150,15 +5261,13 @@ fn bitwise_binary(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    // `bitwise_and` promotes; `bitwise_or` does not, for the reason
-    // `promote_operands` gives -- one has a measured caller and the other
-    // does not. Both were measured to follow the SAME table, so when a
-    // caller for `or` turns up this is a one-word change.
-    let tag = if matches!(kind, Bitwise::And) {
-        promote_operands(op, &lhs, &rhs)?
-    } else {
-        same_dtype(op, &lhs, &rhs)?
-    };
+    // Both promote, over the same table. `bitwise_or` used to refuse -- not
+    // because its rule was unknown (the comment here already recorded that
+    // the two had been measured to follow the same table) but because only
+    // `and` had a measured caller. docs/PROMOTE.md re-measured `or`'s own 9x9
+    // grid rather than inheriting `and`'s, and it agrees with
+    // `torch.promote_types` in every cell, so the two share one line.
+    let tag = promote_operands(op, &lhs, &rhs)?;
     if tag.is_floating_point() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "\"bitwise_{}_cpu\" not implemented for '{}'",
@@ -6927,8 +7036,14 @@ fn extremum_other(
     };
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    let tag = same_dtype(op, &lhs, &rhs)?;
-    let (a, b) = (lhs.tensor()?, rhs.tensor()?);
+    // Promotes over the lattice (docs/PROMOTE.md §3). Both operands are
+    // brought to the common dtype before the comparison, for `operand_in`'s
+    // reason -- the elementwise maximum of a narrowed pair is not always the
+    // narrowing of the maximum.
+    let tag = promote_operands(op, &lhs, &rhs)?;
+    let storage = PyDtype::new(tag).storage(op)?;
+    let a = &operand_in(op, lhs.tensor()?, storage)?;
+    let b = &operand_in(op, rhs.tensor()?, storage)?;
     let out = match which {
         Extremum::Max => a.broadcast_maximum(b),
         Extremum::Min => a.broadcast_minimum(b),
@@ -7427,7 +7542,14 @@ fn where_self(
     let rhs = tensor_arg(OP, args, kwargs, 2, "other")?;
 
     where_condition_check(&condition)?;
-    let tag = same_dtype(OP, &lhs, &rhs)?;
+    // Promotes over the lattice (docs/PROMOTE.md §3), from the two *value*
+    // operands only -- the condition's dtype takes no part, exactly as the
+    // meta path below already documented for the same-dtype case.
+    //
+    // `where_select` casts both branches to the tag's storage itself, so the
+    // promoted tag is all it needs; there is no separate `operand_in` call
+    // here because that cast is the one `where_select` already performs.
+    let tag = promote_operands(OP, &lhs, &rhs)?;
     let out = where_select(OP, &condition, lhs.tensor()?, rhs.tensor()?, tag)?;
     finish(py, out, tag)
 }
@@ -11558,7 +11680,7 @@ fn convolution_default(
         )));
     }
 
-    let tag = same_dtype(OP, &input, &weight)?;
+    let tag = require_same_dtype(OP, &input, &weight)?;
     if !tag.is_floating_point() {
         return Err(not_implemented(format!(
             "{OP}: only floating-point convolution is implemented in torch._C shim, \
@@ -15840,9 +15962,47 @@ fn checked_convert(
     Ok(())
 }
 
-/// torch would promote here. The shim does not, and says so by name. Compares
-/// the *torch* dtype, so `bool` and `uint8` are not accidentally the same
-/// operand type just because candle stores both as `U8`.
+/// **Upstream requires these operands to have equal dtypes and raises
+/// otherwise**, so refusing here is reproducing upstream rather than
+/// admitting a gap.
+///
+/// This used to say "torch would promote here; the shim does not", and for
+/// five of its six callers that was simply false. docs/PROMOTE.md §1.3
+/// measured the full 9x9 grid for each and found the diagonal is the *only*
+/// non-raising cell: the matmul family and the two structured kernels do not
+/// consult `promote_types` at all.
+///
+/// ```text
+/// mm / matmul     expected m1 and m2 to have the same dtype, but got: float != double
+/// bmm / conv      expected scalar type Float but found Double
+/// sdpa flash      expected scalar type Float but found Double
+/// ```
+///
+/// The distinction matters because a refusal that calls itself unimplemented
+/// puts the op on the work queue DESIGN.md §6 is built on, and these five do
+/// not belong there -- implementing "promotion" for them would be a departure
+/// from upstream, not a convergence with it.
+///
+/// Compares the *torch* dtype, so `bool` and `uint8` are not accidentally the
+/// same operand type just because candle stores both as `U8`.
+fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
+    if lhs.tag() != rhs.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: expected both operands to have the same dtype, but got: {} != {} \
+             -- upstream requires equal dtypes here too and does not promote",
+            lhs.tag().name(),
+            rhs.tag().name()
+        )));
+    }
+    Ok(lhs.tag())
+}
+
+/// torch would promote here. The shim does not, and says so by name.
+///
+/// **One caller is left: `isin.Tensor_Tensor`.** Everything else that used to
+/// come through this either promotes now (docs/PROMOTE.md §4) or was moved to
+/// `require_same_dtype` above because upstream refuses it too. `isin` is a
+/// genuine remaining gap and is recorded as one in docs/PROMOTE.md §6.
 fn same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() != rhs.tag() {
         return Err(not_implemented(format!(

@@ -320,18 +320,26 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Known gap, explicitly called out in docs/TORCH_C.md §2: dtype
-    # promotion is refused rather than guessed.
-    af_t, af_c = pair_from_flat(torch_module, c_module, [1.0], [1], "float32")
-    bf_t, bf_c = pair_from_flat(torch_module, c_module, [1.0], [1], "float64")
+    # Was a known gap (docs/TORCH_C.md §2 called promotion deliberately
+    # unimplemented). docs/PROMOTE.md §4 closed it, so this diffs real values
+    # now rather than asserting a refusal.
+    #
+    # The operands are 0.1 and not 1.0 on purpose: `1.0 + 1.0` is 2.0 in
+    # either dtype, so it cannot tell "promoted to float64 and added there"
+    # from "added in float32 and relabelled float64". 0.1 has no exact binary
+    # form, so the float32 operand carries its own rounding into the float64
+    # sum and the answer is 0.20000000149011612 rather than 0.2.
+    af_t, af_c = pair_from_flat(torch_module, c_module, [0.1], [1], "float32")
+    bf_t, bf_c = pair_from_flat(torch_module, c_module, [0.1], [1], "float64")
     cases.append(
         Case(
-            name="add(dtype-mismatch float32 vs float64)",
+            name="add(promote float32 vs float64, and compute in float64)",
             op="aten.add.Tensor",
             run_torch=lambda: torch_call(af_t, bf_t),
             run_c=lambda: c_module._aten_dispatch("aten.add.Tensor", af_c, bf_c),
-            expect="c_error",
-            note="dtype promotion is deliberately unimplemented (docs/TORCH_C.md §2); torch promotes to float64, _C refuses rather than guess a promotion table.",
+            note="upstream promotes to float64 and adds there (docs/PROMOTE.md §4). "
+                 "0.1 is used because 1.0 cannot distinguish a float64 add from a "
+                 "float32 add relabelled float64.",
         )
     )
 
@@ -1703,6 +1711,51 @@ _CAT_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32", "u
 def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.cat.default"
     cases: list[Case] = []
+
+    # Promotion across the list (docs/PROMOTE.md §4). `cat` takes a
+    # TensorList, so it folds `promote_types` over every entry rather than
+    # joining a pair -- the three-entry case is what distinguishes a real
+    # fold from a look at the first two.
+    for a_dtype, b_dtype, why in _PROMOTION_PAIRS:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 1], (2, 2), a_dtype)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [1, 1, 0, 1], (2, 2), b_dtype)
+        cases.append(
+            Case(
+                name=f"cat(promote {a_dtype} x {b_dtype}, dim=0)",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call([a_t, b_t], 0),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, [a_c, b_c], 0),
+                note=f"{why} (docs/PROMOTE.md §3)",
+            )
+        )
+    tri = [
+        pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), d)
+        for d in ("float16", "bfloat16", "float64")
+    ]
+    cases.append(
+        Case(
+            name="cat(promote float16 x bfloat16 x float64 -- folded over all three)",
+            op=op,
+            run_torch=lambda: torch_call([t for t, _ in tri], 0),
+            run_c=lambda: c_module._aten_dispatch(op, [c for _, c in tri], 0),
+            note="f16 x bf16 escapes to f32, which f64 then wins outright; a fold that "
+                 "stopped after the first pair answers float32 (docs/PROMOTE.md §4)",
+        )
+    )
+    # A `(0,)` entry is skipped for its SHAPE but still contributes its DTYPE,
+    # which is the interaction between the legacy-empty rule and promotion.
+    e_t, e_c = pair_from_flat(torch_module, c_module, [], (0,), "float64")
+    n_t, n_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="cat(legacy-empty float64 (0,) + float32 (2,)) [skipped shape, live dtype]",
+            op=op,
+            run_torch=lambda: torch_call([e_t, n_t], 0),
+            run_c=lambda: c_module._aten_dispatch(op, [e_c, n_c], 0),
+            note="the (0,) entry takes no part in the shape but still promotes the "
+                 "result to float64 (docs/PROMOTE.md §4)",
+        )
+    )
 
     for dtype_name in _CAT_DTYPES:
         a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
@@ -4960,24 +5013,46 @@ def _div_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="the SAM3 detector divides a float32 grid by an int64 stride",
         )
     )
-    # ...and the two that still refuse, so the split is asserted rather than
-    # implied. `c_error`: upstream computes both, and the day either gains a
-    # promoting kernel this fails and gets promoted to `match`.
+    # ...and the two that used to refuse. The day either gained a promoting
+    # kernel this was to fail and be promoted to `match`; docs/PROMOTE.md §4
+    # is that day, so all four members now share one rule and one expectation.
     for other_op, torch_name in (("aten.add.Tensor", "add"), ("aten.sub.Tensor", "sub")):
         l_t, l_c = pair_from_flat(
             torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
         r_t, r_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int64")
         cases.append(
             Case(
-                name=f"{other_op}(float32, int64) [still refused -- only mul and div promote]",
+                name=f"{other_op}(float32, int64) [promotes, like mul and div]",
                 op=op,
                 run_torch=lambda l_t=l_t, r_t=r_t, n=torch_name: getattr(
                     torch_module.ops.aten, n).Tensor(l_t, r_t),
                 run_c=lambda l_c=l_c, r_c=r_c, o=other_op: c_module._aten_dispatch(
                     o, l_c, r_c),
-                expect="c_error",
-                note="docs/BIND.md §9: the split records which callers were measured, "
-                     "not a principle -- nothing in the sweep adds a mixed pair",
+                note="an integral operand never widens a float: float32 x int64 is "
+                     "float32, not float64 (docs/PROMOTE.md §3)",
+            )
+        )
+
+    # **The pair that says where the arithmetic happened.** `float16` cannot
+    # hold 2049; upstream narrows the int64 operand to the common dtype first
+    # and answers 2047, where casting straight to the float32 accumulator
+    # subtracts 2049 - 1 and narrows once at the end, answering 2048. Both
+    # are labelled float16 and only one is upstream's -- a dtype-only check
+    # passes on either. docs/PROMOTE.md §5.
+    for other_op, torch_name in (("aten.sub.Tensor", "sub"), ("aten.add.Tensor", "add")):
+        n_t, n_c = pair_from_flat(torch_module, c_module, [2049, 2049], (2,), "int64")
+        o_t, o_c = pair_from_flat(torch_module, c_module, [1.0, 1.0], (2,), "float16")
+        cases.append(
+            Case(
+                name=f"{other_op}(int64 2049, float16 1.0) [narrowed BEFORE the arithmetic]",
+                op=op,
+                run_torch=lambda n_t=n_t, o_t=o_t, n=torch_name: getattr(
+                    torch_module.ops.aten, n).Tensor(n_t, o_t),
+                run_c=lambda n_c=n_c, o_c=o_c, o=other_op: c_module._aten_dispatch(
+                    o, n_c, o_c),
+                note="the operand reaches the common dtype before the accumulator; "
+                     "computing in the accumulator first gives a different value under "
+                     "the same dtype label",
             )
         )
     return cases
@@ -5150,14 +5225,14 @@ def bitwise_or_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
         cases.append(
             Case(
-                name=f"bitwise_or.Tensor(promote {a_dtype} x {b_dtype} -- torch gives "
-                     f"{upstream}, the shim refuses)",
+                name=f"bitwise_or.Tensor(promote {a_dtype} x {b_dtype} -- both give "
+                     f"{upstream})",
                 op=op,
                 run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
                 run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
-                expect="c_error",
-                note="same table as bitwise_and, wired only for bitwise_and because only "
-                     "bitwise_and has a measured caller",
+                note="`or` was re-measured over its own 9x9 grid rather than inheriting "
+                     "`and`'s, and agrees with torch.promote_types in every cell "
+                     "(docs/PROMOTE.md §3), so the two now share one line",
             )
         )
     return cases
@@ -5203,9 +5278,78 @@ _CMP_SCENARIOS: list[dict] = [
 ]
 
 
+# --- shared: tensor-tensor dtype promotion -----------------------------------
+#
+# docs/PROMOTE.md §3 measured each op below over the full 9x9 dtype grid
+# against `torch.promote_types` and they agree in every cell, so one list of
+# pairs serves all of them. The pairs are not a sample: each is a cell that
+# some plausible-but-wrong rule gets wrong.
+_PROMOTION_PAIRS = [
+    ("float32", "float64", "the ordinary widening"),
+    ("int64", "float16", "an integral operand never widens a float"),
+    ("float16", "bfloat16", "two reduced floats promote OUT to float32"),
+    ("uint8", "int16", "unsigned meets signed, no escape needed"),
+    ("bool", "int64", "bool is the bottom of the lattice"),
+    ("int32", "int64", "same category, the wider one wins"),
+]
+
+
+def _promotion_cases(torch_module, c_module, op, torch_call,
+                     a_flat=(1, 0, 1, 1), b_flat=(1, 1, 0, 1), shape=(4,)):
+    """Mixed-dtype cases for a promoting binary op.
+
+    Values are 0/1 so that one list is legal in every dtype in the pairs
+    above, `bool` and `uint8` included. That deliberately does *not* exercise
+    the narrowing precision rule -- the cases that do are attached to the
+    individual ops, because they need values the shared list cannot hold.
+    """
+    cases: list[Case] = []
+    for a_dtype, b_dtype, why in _PROMOTION_PAIRS:
+        a_t, a_c = pair_from_flat(torch_module, c_module, list(a_flat), shape, a_dtype)
+        b_t, b_c = pair_from_flat(torch_module, c_module, list(b_flat), shape, b_dtype)
+        cases.append(
+            Case(
+                name=f"{op}(promote {a_dtype} x {b_dtype})",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note=f"{why} (docs/PROMOTE.md §3)",
+            )
+        )
+    return cases
+
+
+def _comparison_precision_cases(torch_module, c_module, op, torch_call):
+    """The comparison cases where the *dtype* of the answer proves nothing.
+
+    A comparison answers `bool` however it promotes, so nothing in the result
+    records which dtype the two operands were compared in. 16777217 has no
+    `float32` form; upstream narrows the `int64` operand to the common dtype
+    and the two operands become the *same number*, so `eq` is True and `lt`
+    is False. Comparing in a dtype wide enough to hold both -- which is what
+    this shim's kernel does internally -- answers the opposite unless the
+    operands are brought to the common dtype first. docs/PROMOTE.md §5.
+    """
+    a_t, a_c = pair_from_flat(torch_module, c_module, [16777217, 16777217], (2,), "int64")
+    b_t, b_c = pair_from_flat(
+        torch_module, c_module, [16777216.0, 16777218.0], (2,), "float32")
+    return [
+        Case(
+            name=f"{op}(int64 16777217 vs float32 16777216) [lossy narrow decides it]",
+            op=op,
+            run_torch=lambda: torch_call(a_t, b_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, b_c),
+            note="the int64 operand is narrowed to float32 BEFORE the comparison, so "
+                 "16777217 and 16777216 compare equal (docs/PROMOTE.md §5)",
+        )
+    ]
+
+
 def eq_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.eq.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
@@ -5233,6 +5377,8 @@ def eq_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 def lt_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.lt.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
@@ -5260,6 +5406,8 @@ def lt_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 def ne_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.ne.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
@@ -6473,6 +6621,7 @@ def min_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 def _extremum_other_cases(torch_module, c_module, torch_call, op, short) -> list[Case]:
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _REDUCE_DTYPES:
         for sc in _ELEMENTWISE_SCENARIOS:
             cases.append(
@@ -12352,10 +12501,11 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The gap: upstream promotes, this shim refuses. The full 9x9 table is in
-    # docs/OPS4.md §2; these are the four rows that would be got wrong by
-    # assuming "the wider one wins" (an integral branch never widens a floating
-    # one, and float16 with bfloat16 escapes to float32).
+    # Was the gap; `where_self` promotes now (docs/PROMOTE.md §4). The full
+    # 9x9 table is in docs/OPS4.md §2 and re-measured in docs/PROMOTE.md §3;
+    # these are the four rows that would be got wrong by assuming "the wider
+    # one wins" (an integral branch never widens a floating one, and float16
+    # with bfloat16 escapes to float32).
     for lhs_dtype, rhs_dtype, upstream, note in [
         ("float32", "float64", "float64", "the ordinary widening"),
         ("float16", "int64", "float16", "an INTEGRAL branch does not widen a floating one"),
@@ -12366,9 +12516,8 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
             _where_case(
                 torch_module, c_module, torch_call, mask4,
                 ([1, 2, 3, 4], (4,), lhs_dtype), ([9, 8, 7, 6], (4,), rhs_dtype),
-                expect="c_error",
-                note=f"upstream promotes to {upstream} ({note}); the shim refuses rather than "
-                     "guessing a promotion -- see same_dtype in rust/torch_c/src/aten.rs",
+                note=f"both promote to {upstream} ({note}); the condition's dtype takes "
+                     "no part -- see promote_operands in rust/torch_c/src/aten.rs",
             )
         )
 
@@ -12805,21 +12954,37 @@ def stack_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The gap: upstream promotes here as well.
+    # Was the gap; `promote_list` closed it (docs/PROMOTE.md §4). `stack`'s
+    # own 9x9 grid was measured rather than inherited from `cat`'s.
     for lhs_dtype, rhs_dtype, upstream in [
         ("float32", "float64", "float64"),
         ("int64", "float32", "float32"),
         ("bool", "int64", "int64"),
+        # Two reduced floats promote OUT rather than one winning -- the cell
+        # that a "widest entry wins" fold gets wrong.
+        ("float16", "bfloat16", "float32"),
     ]:
         cases.append(
             _stack_case(
                 torch_module, c_module, torch_call,
                 [([1, 2], (2,), lhs_dtype), ([3, 4], (2,), rhs_dtype)],
-                expect="c_error",
-                note=f"upstream promotes the entries to {upstream}; the shim refuses, the same "
-                     "way cat_default does",
+                note=f"upstream promotes the entries to {upstream}, and so does the shim, "
+                     "the same way cat_default does",
             )
         )
+
+    # Three entries, to pin that the fold is over the WHOLE list and not just
+    # the first pair. `float16` with `bfloat16` escapes to `float32`, which
+    # `float64` then wins outright; a fold that stopped after two entries, or
+    # one that only looked at entry 0, gets a different answer.
+    cases.append(
+        _stack_case(
+            torch_module, c_module, torch_call,
+            [([1], (1,), "float16"), ([2], (1,), "bfloat16"), ([3], (1,), "float64")],
+            note="promote_list folds left over every entry: f16 x bf16 -> f32, then "
+                 "f32 x f64 -> f64 (docs/PROMOTE.md §4)",
+        )
+    )
     return cases
 
 
@@ -12994,6 +13159,8 @@ def relu__cases(torch_module, c_module, torch_call) -> list[Case]:
 def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.le.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
@@ -16541,6 +16708,8 @@ def ge_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 def ge_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.ge.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
@@ -18190,6 +18359,8 @@ def ceil_cases(torch_module, c_module, torch_call) -> list[Case]:
 def gt_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.gt.Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
+    cases.extend(_comparison_precision_cases(torch_module, c_module, op, torch_call))
     for dtype_name in _CMP_DTYPES:
         for sc in _CMP_SCENARIOS:
             cases.append(
