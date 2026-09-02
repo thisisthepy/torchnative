@@ -311,6 +311,27 @@ this round's forbidden file, not a `bootstrap.py`-reachable name.
 `sew_d` gets no further: nothing behind this wall (including the `sqrt` wall it shares with
 `deberta_v2`, and whatever comes after that) has been reached or explored for this architecture.
 
+> **Closed, and one sentence above is wrong — corrected 2026-09-02, docs/CTOR.md.**
+> `sew_d` constructs (49 weights, `masked_spec_embed` `(32,)` float32). The size form was
+> implemented in `tensor.rs::py_new`; this section's "forbidden file" was forbidden to *that*
+> round's brief, not permanently. The data forms are in `bootstrap.py`.
+>
+> The wrong sentence is *"Both places that could plausibly grow a `__new__` override are
+> therefore forbidden territory"*, and with it the reasoning that `torch.Tensor` is unreachable
+> because `torch/_tensor.py` is vendored. **Measured: `torch.Tensor` inherits `__new__` from
+> `TensorBase`, defines none of its own, and is a settable heap type** — so it takes a `__new__`
+> by `setattr` without the vendored file being touched, which is what `bootstrap.py` now does at
+> the `_initExtension` hook. Being vendored blocks *editing*, not *patching*.
+>
+> The sentence after it — *"`bootstrap.py` has no hook into `TensorBase.__new__` the way it has
+> hooks into ordinary members"* — is **true**, and beside the point: the override does not go on
+> `TensorBase`, and docs/CTOR.md §1.1 measures why it must not. Putting it there makes the native
+> allocator permanently unreachable from Python and takes `Parameter` with it.
+>
+> Recorded here rather than edited in place, per this file's convention and docs/AUDIT.md's
+> finding: the recurring failure is a later commit closing a gap while the document that named
+> it goes on saying it is shut.
+
 ---
 
 ## 5. `sam3_video` — a different shape of architecture, and a missing arithmetic kernel

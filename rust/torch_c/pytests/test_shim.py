@@ -19116,5 +19116,475 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     assert int(_bound.group(1)) > int(_dead.group(1)), (_bound.group(1), _dead.group(1))
 
 
+_CTOR_ROAD_SCRIPT = r"""
+import json, sys
+import numpy as np
+import torch
+import torch.nn as nn
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+# --- the MRO claim docs/CTOR.md §1 turns on ------------------------------
+rec("is_tensorbase", lambda: torch.Tensor is torch._C.TensorBase)
+rec("mro", lambda: [f"{c.__module__}.{c.__name__}" for c in torch.Tensor.__mro__])
+rec("new_installed", lambda: "__new__" in vars(torch.Tensor))
+rec("flag", lambda: bool(getattr(torch._C, "_shim_tensor_constructor", False)))
+# `TensorBase` must NOT have been the one patched -- see docs/CTOR.md §1.1.
+# The contrast between these two is the whole assertion: the patched class
+# holds a Python object, the native one still holds the PyO3 slot wrapper.
+rec("tensorbase_new_kind",
+    lambda: type(vars(torch._C.TensorBase)["__new__"]).__name__)
+rec("tensor_new_kind", lambda: type(vars(torch.Tensor)["__new__"]).__name__)
+
+# --- the size forms -------------------------------------------------------
+rec("empty_shape", lambda: list(torch.Tensor().shape))
+rec("empty_dtype", lambda: str(torch.Tensor().dtype))
+rec("size_1d", lambda: list(torch.Tensor(5).shape))
+rec("size_2d", lambda: list(torch.Tensor(2, 3).shape))
+rec("size_zero", lambda: list(torch.Tensor(0).shape))
+rec("size_dtype", lambda: str(torch.Tensor(5).dtype))
+rec("size_type", lambda: type(torch.Tensor(5)).__name__)
+rec("size_negative", lambda: torch.Tensor(-1))
+# `torch.Size` is a SIZE, not data -- and it IS a tuple subclass, so this is
+# the row a `isinstance(x, (list, tuple))`-first implementation gets wrong.
+rec("size_object", lambda: list(torch.Tensor(torch.Size([2, 3])).shape))
+rec("size_object_empty", lambda: list(torch.Tensor(torch.Size([])).shape))
+rec("size_object_numel", lambda: torch.Tensor(torch.Size([2, 3])).numel())
+rec("device_kwarg", lambda: list(torch.Tensor(5, device="cpu").shape))
+
+# --- the data forms -------------------------------------------------------
+rec("data_list", lambda: torch.Tensor([1, 2, 3]).tolist())
+rec("data_list_dtype", lambda: str(torch.Tensor([1, 2, 3]).dtype))
+rec("data_tuple", lambda: torch.Tensor((1, 2, 3)).tolist())
+rec("data_nested", lambda: torch.Tensor([[1, 2], [3, 4]]).tolist())
+rec("data_empty", lambda: list(torch.Tensor([]).shape))
+rec("data_nested_empty", lambda: list(torch.Tensor([[]]).shape))
+rec("data_range", lambda: torch.Tensor(range(3)).tolist())
+rec("data_bools", lambda: torch.Tensor([True, False]).tolist())
+rec("data_type", lambda: type(torch.Tensor([1, 2])).__name__)
+
+# --- the ndarray forms, `pegasus`'s wall ---------------------------------
+rec("nd_f64", lambda: torch.Tensor(np.array([1.5, 2.5], dtype=np.float64)).tolist())
+rec("nd_f64_dtype",
+    lambda: str(torch.Tensor(np.array([1.5, 2.5], dtype=np.float64)).dtype))
+# The default-dtype rule: an int64 array does NOT stay int64 through this
+# constructor. That is the whole difference from `torch.tensor`, below.
+rec("nd_i64_dtype",
+    lambda: str(torch.Tensor(np.array([1, 2], dtype=np.int64)).dtype))
+rec("nd_i64_values",
+    lambda: torch.Tensor(np.array([1, 2], dtype=np.int64)).tolist())
+rec("nd_bool_dtype",
+    lambda: str(torch.Tensor(np.array([True, False])).dtype))
+rec("nd_2d",
+    lambda: torch.Tensor(np.array([[1., 2.], [3., 4.]], dtype=np.float32)).tolist())
+rec("nd_0d_shape", lambda: list(torch.Tensor(np.array(3.5)).shape))
+rec("nd_0d_value", lambda: torch.Tensor(np.array(3.5)).item())
+
+# --- the re-wrap form, the ONE case that does not land on the default -----
+rec("rewrap_dtype", lambda: str(torch.Tensor(torch.ones(3, dtype=torch.int64)).dtype))
+rec("rewrap_values", lambda: torch.Tensor(torch.ones(3, dtype=torch.int64)).tolist())
+rec("rewrap_type", lambda: type(torch.Tensor(torch.ones(3))).__name__)
+
+# --- refusals, by upstream's wording -------------------------------------
+def refusal(fn):
+    try:
+        fn()
+    except Exception as e:
+        return f"{type(e).__name__}:{e}"
+    return "NO-RAISE"
+
+rec("refuse_float", lambda: refusal(lambda: torch.Tensor(1.5)))
+rec("refuse_none", lambda: refusal(lambda: torch.Tensor(None)))
+rec("refuse_str", lambda: refusal(lambda: torch.Tensor("x")))
+rec("refuse_npscalar", lambda: refusal(lambda: torch.Tensor(np.float32(3.5))))
+rec("refuse_dtype_kwarg",
+    lambda: refusal(lambda: torch.Tensor(5, dtype=torch.float64)))
+rec("refuse_requires_grad",
+    lambda: refusal(lambda: torch.Tensor(5, requires_grad=True)))
+rec("refuse_two_lists", lambda: refusal(lambda: torch.Tensor([1, 2], [3, 4])))
+rec("refuse_two_tensors",
+    lambda: refusal(lambda: torch.Tensor(torch.ones(2), torch.ones(2))))
+rec("refuse_int_then_float", lambda: refusal(lambda: torch.Tensor(2, 3.0)))
+rec("refuse_complex_array",
+    lambda: refusal(lambda: torch.Tensor(np.array([1 + 2j]))))
+
+# --- the typed constructors ----------------------------------------------
+rec("float_nd",
+    lambda: torch.FloatTensor(np.array([1.5, 2.5], dtype=np.float64)).tolist())
+rec("float_nd_dtype",
+    lambda: str(torch.FloatTensor(np.array([1.5, 2.5], dtype=np.float64)).dtype))
+# Coerced, and TRUNCATING -- upstream's answer, not a rounded one.
+rec("long_nd", lambda: torch.LongTensor(np.array([1.7, 2.9])).tolist())
+rec("long_nd_dtype", lambda: str(torch.LongTensor(np.array([1.7, 2.9])).dtype))
+rec("double_nd_dtype",
+    lambda: str(torch.DoubleTensor(np.array([1, 2], dtype=np.float32)).dtype))
+rec("bool_nd", lambda: torch.BoolTensor(np.array([1, 0], dtype=np.int64)).tolist())
+# The `torch.Size` rule, which the typed classes had backwards.
+rec("float_size_obj", lambda: list(torch.FloatTensor(torch.Size([2, 3])).shape))
+rec("long_size_obj_dtype", lambda: str(torch.LongTensor(torch.Size([2, 3])).dtype))
+rec("float_list_still_data", lambda: torch.FloatTensor([2, 3]).tolist())
+
+# --- `pegasus`'s actual line ---------------------------------------------
+def pegasus_create_weight():
+    from transformers.models.pegasus.modeling_pegasus import (
+        PegasusSinusoidalPositionalEmbedding,
+    )
+    e = PegasusSinusoidalPositionalEmbedding(4, 4)
+    return [round(x, 6) for x in e.create_weight().flatten().tolist()]
+
+rec("pegasus_create_weight", pegasus_create_weight)
+
+# --- the ndarray family that shares the helper ---------------------------
+# These PRESERVE the array's dtype where the constructor above casts, which
+# is upstream's split and the reason `_array_like_data` returns a dtype.
+rec("tensor_nd_dtype",
+    lambda: str(torch.tensor(np.array([1.5, 2.5], dtype=np.float64)).dtype))
+rec("as_tensor_nd_dtype",
+    lambda: str(torch.as_tensor(np.array([1.5, 2.5], dtype=np.float64)).dtype))
+rec("as_tensor_nd_values",
+    lambda: torch.as_tensor(np.array([1.5, 2.5], dtype=np.float64)).tolist())
+rec("new_tensor_nd_dtype",
+    lambda: str(torch.ones(2).new_tensor(np.array([1.5, 2.5], dtype=np.float64)).dtype))
+
+# --- the recorded divergence: this COPIES where upstream aliases ---------
+def alias_probe():
+    arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    t = torch.Tensor(arr)
+    arr[0] = 99.0
+    return t.tolist()[0]
+
+rec("alias_probe", alias_probe)
+
+# --- what patching TensorBase instead would have broken ------------------
+rec("parameter_type", lambda: type(nn.Parameter(torch.ones(2))).__name__)
+rec("parameter_shape", lambda: list(nn.Parameter(torch.ones(2)).shape))
+rec("linear_nparams", lambda: len(list(nn.Linear(2, 2).parameters())))
+rec("make_subclass_type",
+    lambda: type(torch.Tensor._make_subclass(nn.Parameter, torch.ones(2))).__name__)
+rec("tensorbase_rewrap_type",
+    lambda: type(torch._C.TensorBase(torch.ones(2))).__name__)
+rec("empty_still_tensor", lambda: type(torch.empty(2)).__name__)
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _ctor_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _CTOR_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ctor-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_ctor_torch_tensor_is_a_vendored_python_subclass_not_tensorbase():
+    """docs/CTOR.md §1 -- the measurement that decides whether this gap was
+    "structural", and the only test here about the *shape* of the fix rather
+    than its behaviour.
+
+    docs/DEMAND.md §0.1 ranked this gap structural because the only class that
+    could carry a Python-level `__new__` lives in the vendored tree. It does --
+    and it *inherits* `__new__` rather than defining one, and it is a settable
+    heap type, so it can be given one from outside the file that declares it.
+    If `torch.Tensor` ever becomes `TensorBase` itself, or grows its own
+    `__new__` upstream, the installation in `bootstrap.py::_initExtension`
+    stops being correct and this is what says so.
+
+    The `*_new_kind` pair is the other half, and it is the one that keeps
+    `Parameter` alive. `TensorBase.__new__` must still be the native PyO3 slot
+    wrapper -- a `builtin_function_or_method`, which is also what upstream's
+    own `TensorBase` holds (measured on 2.13.0, both sides agree on this row) --
+    while `Tensor.__new__` is the Python `staticmethod` this round installs.
+    The two kinds differing is the assertion; if `TensorBase`'s ever becomes a
+    Python object too, the native allocator has been made unreachable and
+    `TensorBase(existing)` goes with it (docs/CTOR.md §1.1).
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    assert out["is_tensorbase"] is False, out["is_tensorbase"]
+    assert out["mro"] == [
+        "torch.Tensor", "torch._C.TensorBase", "builtins.object"
+    ], out["mro"]
+    assert out["new_installed"] is True, out["new_installed"]
+    assert out["flag"] is True, out["flag"]
+    assert out["tensorbase_new_kind"] == "builtin_function_or_method", (
+        out["tensorbase_new_kind"]
+    )
+    assert out["tensor_new_kind"] == "staticmethod", out["tensor_new_kind"]
+
+
+def test_ctor_the_legacy_constructor_accepts_upstreams_shapes():
+    """docs/DEMAND.md §0.1 rank 1 -- `torch.Tensor(...)`, every accepted form.
+
+    Values transcribed from upstream torch 2.13.0, run side by side
+    (docs/CTOR.md §2). The rows worth naming:
+
+    - **`torch.Size` is a size and a plain tuple is data**, and `torch.Size`
+      *is* a `tuple` subclass. A sequence-first implementation answers a `(2,)`
+      tensor holding 2 and 3 where upstream answers a `(2, 3)` empty one, and
+      nothing downstream raises. `size_object_numel` is the guard: 6 elements,
+      not 2.
+    - **`Tensor()` is `(0,)` and `Tensor(torch.Size([]))` is `()`.** Upstream
+      really does distinguish them, and the first version of `_sized_tensor`
+      collapsed both to a scalar -- caught by diffing the whole table, not by
+      any one case.
+    - **Data always lands on the default dtype**, so `Tensor(int64 ndarray)` is
+      `float32`. The one exception is the re-wrap form, which keeps the
+      source's dtype -- `rewrap_dtype` is that exception.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    # size forms
+    assert out["empty_shape"] == [0], out["empty_shape"]
+    assert out["empty_dtype"] == "torch.float32", out["empty_dtype"]
+    assert out["size_1d"] == [5], out["size_1d"]
+    assert out["size_2d"] == [2, 3], out["size_2d"]
+    assert out["size_zero"] == [0], out["size_zero"]
+    assert out["size_dtype"] == "torch.float32", out["size_dtype"]
+    assert out["size_type"] == "Tensor", out["size_type"]
+    assert str(out["size_negative"]).startswith(
+        "ERROR:RuntimeError:Trying to create tensor with negative dimension -1"
+    ), out["size_negative"]
+    assert out["size_object"] == [2, 3], out["size_object"]
+    assert out["size_object_numel"] == 6, out["size_object_numel"]
+    assert out["size_object_empty"] == [], out["size_object_empty"]
+    assert out["device_kwarg"] == [5], out["device_kwarg"]
+
+    # data forms
+    assert out["data_list"] == [1.0, 2.0, 3.0], out["data_list"]
+    assert out["data_list_dtype"] == "torch.float32", out["data_list_dtype"]
+    assert out["data_tuple"] == [1.0, 2.0, 3.0], out["data_tuple"]
+    assert out["data_nested"] == [[1.0, 2.0], [3.0, 4.0]], out["data_nested"]
+    assert out["data_empty"] == [0], out["data_empty"]
+    assert out["data_nested_empty"] == [1, 0], out["data_nested_empty"]
+    assert out["data_range"] == [0.0, 1.0, 2.0], out["data_range"]
+    assert out["data_bools"] == [1.0, 0.0], out["data_bools"]
+    assert out["data_type"] == "Tensor", out["data_type"]
+
+    # ndarray forms
+    assert out["nd_f64"] == [1.5, 2.5], out["nd_f64"]
+    assert out["nd_f64_dtype"] == "torch.float32", out["nd_f64_dtype"]
+    assert out["nd_i64_dtype"] == "torch.float32", out["nd_i64_dtype"]
+    assert out["nd_i64_values"] == [1.0, 2.0], out["nd_i64_values"]
+    assert out["nd_bool_dtype"] == "torch.float32", out["nd_bool_dtype"]
+    assert out["nd_2d"] == [[1.0, 2.0], [3.0, 4.0]], out["nd_2d"]
+    assert out["nd_0d_shape"] == [], out["nd_0d_shape"]
+    assert out["nd_0d_value"] == 3.5, out["nd_0d_value"]
+
+    # the re-wrap exception
+    assert out["rewrap_dtype"] == "torch.int64", out["rewrap_dtype"]
+    assert out["rewrap_values"] == [1, 1, 1], out["rewrap_values"]
+    assert out["rewrap_type"] == "Tensor", out["rewrap_type"]
+
+
+def test_ctor_refuses_the_rest_in_upstreams_own_wording():
+    """The forms upstream rejects, rejected here with upstream's messages.
+
+    Every one of these but the last is a `TypeError` upstream, not a
+    `NotImplementedError`: they are not shim limitations, they are calls
+    upstream does not accept either, and spelling them "not implemented in
+    torch._C shim" would claim a gap that does not exist. `refuse_dtype_kwarg`
+    is the one that most looks like a shim limitation and is not -- upstream's
+    legacy constructor takes `device` and no other keyword.
+
+    `refuse_complex_array` is the one genuine shim refusal, and it is a
+    `NotImplementedError` naming the dtype, because there is no `complex128`
+    storage here to build into.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    assert out["refuse_float"] == (
+        "TypeError:new(): data must be a sequence (got float)"
+    ), out["refuse_float"]
+    assert out["refuse_none"] == (
+        "TypeError:new(): data must be a sequence (got NoneType)"
+    ), out["refuse_none"]
+    assert out["refuse_str"] == (
+        "TypeError:new(): invalid data type 'str'"
+    ), out["refuse_str"]
+    assert out["refuse_npscalar"] == (
+        "TypeError:new(): data must be a sequence (got numpy.float32)"
+    ), out["refuse_npscalar"]
+
+    # The two keyword refusals, which upstream also makes.
+    assert out["refuse_dtype_kwarg"].startswith(
+        "TypeError:new() received an invalid combination of arguments - got "
+        "(int, dtype=torch.dtype)"
+    ), out["refuse_dtype_kwarg"]
+    assert out["refuse_requires_grad"].startswith(
+        "TypeError:new() received an invalid combination of arguments - got "
+        "(int, requires_grad=bool)"
+    ), out["refuse_requires_grad"]
+
+    # Upstream uses two DIFFERENT messages here and the split is on whether the
+    # first argument reads as a size -- see `_make_tensor_class_new`.
+    assert out["refuse_two_lists"].startswith(
+        "TypeError:new() received an invalid combination of arguments - got "
+        "(list, list)"
+    ), out["refuse_two_lists"]
+    assert out["refuse_two_tensors"].startswith(
+        "TypeError:new() received an invalid combination of arguments - got "
+        "(Tensor, Tensor)"
+    ), out["refuse_two_tensors"]
+    assert out["refuse_int_then_float"] == (
+        "TypeError:new(): argument 'size' failed to unpack the object at pos 2 "
+        "with error \"type must be tuple of ints,but got float\""
+    ), out["refuse_int_then_float"]
+
+    assert out["refuse_complex_array"].startswith("NotImplementedError:"), (
+        out["refuse_complex_array"]
+    )
+    assert "complex128" in out["refuse_complex_array"], out["refuse_complex_array"]
+
+
+def test_ctor_typed_classes_take_an_ndarray_and_read_torch_size_as_a_size():
+    """`torch.FloatTensor(ndarray)` -- `pegasus`'s wall, and the `torch.Size`
+    defect found next to it.
+
+    `PegasusSinusoidalPositionalEmbedding.create_weight` is
+    `torch.FloatTensor(np.sin(position_enc[:, 0::2]))`, so this is the exact
+    call docs/DEMAND.md §0.1 rank 1 names for that model. The dtype rule is
+    upstream's and is *not* the plain constructor's: the class's dtype wins
+    over both the array's and the default, and the coercion **truncates**
+    (`LongTensor(array([1.7, 2.9]))` is `[1, 2]`, measured).
+
+    The `torch.Size` rows are a defect found while measuring, not a new
+    feature: these classes checked `isinstance(x, (list, tuple))` before
+    anything else, and `torch.Size` is a `tuple` subclass, so
+    `FloatTensor(torch.Size([2, 3]))` answered a `(2,)` tensor holding 2 and 3
+    where upstream answers a `(2, 3)` one. `float_list_still_data` is the
+    control that the fix did not swing the other way -- a plain list is still
+    data.
+
+    `pegasus_create_weight` is the end-to-end row, transcribed from upstream:
+    a constructor that works and computes different numbers gives a model that
+    runs and disagrees, which docs/GOLDEN.md rates worse than one that refuses.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    assert out["float_nd"] == [1.5, 2.5], out["float_nd"]
+    assert out["float_nd_dtype"] == "torch.float32", out["float_nd_dtype"]
+    assert out["long_nd"] == [1, 2], out["long_nd"]
+    assert out["long_nd_dtype"] == "torch.int64", out["long_nd_dtype"]
+    assert out["double_nd_dtype"] == "torch.float64", out["double_nd_dtype"]
+    assert out["bool_nd"] == [True, False], out["bool_nd"]
+
+    assert out["float_size_obj"] == [2, 3], out["float_size_obj"]
+    assert out["long_size_obj_dtype"] == "torch.int64", out["long_size_obj_dtype"]
+    # The control: a plain list is still DATA, not a size.
+    assert out["float_list_still_data"] == [2.0, 3.0], out["float_list_still_data"]
+
+    # Upstream's own numbers for a (4, 4) Pegasus sinusoidal table.
+    _close(out["pegasus_create_weight"], [
+        0.0, 0.0, 1.0, 1.0,
+        0.841471, 0.009999833, 0.5403023, 0.99995,
+        0.9092974, 0.019998666, -0.4161468, 0.99980002,
+        0.14112, 0.0299955, -0.9899925, 0.99955004,
+    ], tol=1e-5)
+
+
+def test_ctor_the_ndarray_family_preserves_dtype_where_the_constructor_casts():
+    """`torch.tensor`/`as_tensor`/`new_tensor` on an ndarray -- and the
+    divergence that is recorded rather than closed.
+
+    All three of these **raised** before this round, on any ndarray:
+    `_tensor_new_from_data` walks nested sequences of Python scalars and
+    refused an `ndarray` by name. `as_tensor`'s own docstring said the ndarray
+    path worked and merely copied, which was the intended behaviour written
+    down as though it were the observed one. docs/CTOR.md §3.3 corrects it.
+
+    They are here rather than in a round of their own because they share
+    `_new_from_data` with the constructor, and because the **dtype split** is
+    only visible by testing both sides of it: these preserve the array's dtype
+    (`float64` in, `float64` out) and `torch.Tensor(ndarray)` casts to the
+    default. A helper that got that backwards would pass either test alone.
+
+    `alias_probe` asserts the **divergence**, not the agreement: upstream
+    shares the array's buffer when no cast is needed, so mutating the array
+    afterwards shows through and upstream answers `99.0`. This shim copies --
+    its tensors do not wrap foreign buffers -- so it answers `1.0`. Asserting
+    the copy is what stops the difference from moving silently in either
+    direction; it is the same divergence docs/DEMAND1.md §4 recorded for
+    `as_tensor`, and it is still open.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    assert out["tensor_nd_dtype"] == "torch.float64", out["tensor_nd_dtype"]
+    assert out["as_tensor_nd_dtype"] == "torch.float64", out["as_tensor_nd_dtype"]
+    assert out["as_tensor_nd_values"] == [1.5, 2.5], out["as_tensor_nd_values"]
+    # `new_tensor` defaults its dtype from the RECEIVER, not from the array --
+    # upstream's documented rule, and the reason this row differs from the two
+    # above on the same input.
+    assert out["new_tensor_nd_dtype"] == "torch.float32", out["new_tensor_nd_dtype"]
+
+    # The divergence. Upstream answers 99.0 here.
+    assert out["alias_probe"] == 1.0, (
+        f"expected the recorded COPY behaviour (1.0); got {out['alias_probe']}. "
+        "If this is now 99.0 the shim has grown foreign-buffer aliasing, which "
+        "would close docs/DEMAND1.md §4 and docs/CTOR.md §3.3 -- update both "
+        "rather than this assertion."
+    )
+
+
+def test_ctor_patching_tensor_did_not_break_what_patching_tensorbase_would():
+    """The controls for docs/CTOR.md §1.1, and the reason they are controls.
+
+    Putting `__new__` on `TensorBase` needs no late hook and is the obvious
+    implementation. It also makes the native PyO3 allocator permanently
+    unreachable from Python (CPython's `tp_new_wrapper` guard), which takes
+    `TensorBase(existing)` down -- and that is how `_make_subclass` builds a
+    `Parameter`, how `nn.Module.__setattr__` recognises one, and therefore
+    whether a model has parameters at all.
+
+    None of these rows mentions the constructor. That is deliberate: they are
+    what a wrong *placement* of a correct constructor would break, and they
+    would all still pass with the data forms unimplemented. Their value is
+    entirely in failing if the override ever migrates one class down.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return
+    out = _ctor_road_fixture()
+
+    assert out["parameter_type"] == "Parameter", out["parameter_type"]
+    assert out["parameter_shape"] == [2], out["parameter_shape"]
+    assert out["linear_nparams"] == 2, out["linear_nparams"]
+    assert out["make_subclass_type"] == "Parameter", out["make_subclass_type"]
+    # `TensorBase`, not `Tensor`: PyO3's `tp_new` allocates with the subtype it
+    # was *called* with, and this call names `TensorBase` explicitly. The row
+    # is here for reachability, not for the class -- if the native allocator
+    # ever stops being callable this raises instead of answering.
+    assert out["tensorbase_rewrap_type"] == "TensorBase", (
+        out["tensorbase_rewrap_type"]
+    )
+    assert out["empty_still_tensor"] == "Tensor", out["empty_still_tensor"]
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

@@ -4229,7 +4229,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
             device = module.device(device)
         out = dispatch(
             "aten.lift_fresh.default",
-            module._tensor_new_from_data(data, dtype, device),
+            _new_from_data(module, data, dtype, device),
         )
         return _apply_requires_grad(out) if requires_grad else out
 
@@ -5262,6 +5262,120 @@ def _install_engine_refusal(module) -> None:
     engine.run_backward = run_backward
 
 
+# numpy's dtype names, mapped to this shim's. Keyed on `arr.dtype.name`, which
+# is a plain `str`, so nothing here imports numpy -- the same constraint the
+# `_numbers` import at the top of this file is written around, and for the same
+# reason: `_C` is imported before numpy would be available, and the shim does
+# not depend on it.
+#
+# The names left out are left out deliberately. `complex64`/`complex128`,
+# `float128`, `uint16`/`uint32`/`uint64` and the datetime kinds have no candle
+# storage behind them; they refuse by *name* in `_array_like_data` below rather
+# than being mapped to something close, because a silent widening of `uint32`
+# to `int64` is the shape of wrongness docs/GOLDEN.md exists to stop.
+_NUMPY_DTYPE_TO_TORCH = {
+    "bool": "bool",
+    "uint8": "uint8",
+    "int8": "int8",
+    "int16": "int16",
+    "int32": "int32",
+    "int64": "int64",
+    "float16": "float16",
+    "float32": "float32",
+    "float64": "float64",
+}
+
+
+def _array_like_data(module, data):
+    """`(nested_list, dtype)` for a numpy array, or `None` for anything else.
+
+    Every construction path in this file bottoms out in
+    `module._tensor_new_from_data`, which walks *nested sequences of Python
+    bool/int/float* and refuses anything else by name. An `ndarray` is not one:
+    measured on this shim before this function existed, `torch.tensor(ndarray)`,
+    `torch.as_tensor(ndarray)`, `Tensor.new_tensor(ndarray)` **and**
+    `torch.FloatTensor(ndarray)` all raised
+
+        TypeError: torch._C shim: torch.tensor() takes nested sequences of
+        Python bool/int/float, and got ndarray
+
+    -- including `as_tensor`, whose own docstring claimed the ndarray path
+    worked and merely copied. It did not work at all. That claim is corrected
+    where it stands.
+
+    `.tolist()` is the bridge, and it is a **copy**, which is the recorded
+    divergence: upstream aliases the array's buffer when no cast is needed
+    (docs/DEMAND1.md §4, docs/CTOR.md §3.3), and this shim's tensors do not wrap
+    foreign buffers, so there is no aliasing answer to give.
+
+    Returning the numpy dtype alongside the values is what keeps
+    `torch.tensor(ndarray)` honest: upstream **preserves** the array's dtype
+    there (`torch.tensor(float64 array)` is `float64`), while nested-list
+    inference would answer the default float. The callers that want the default
+    instead -- the legacy `torch.Tensor(...)` constructor and its ten typed
+    siblings, which cast unconditionally -- pass their own `dtype` and ignore
+    this one.
+
+    **What is deliberately not array-like here**: a numpy *scalar*
+    (`np.float32(3.5)`) has `__array__` and `tolist` too, and upstream's legacy
+    constructor rejects it (`new(): data must be a sequence (got numpy.float32)`)
+    while `torch.tensor` accepts it. It is filtered out by `_numbers.Number` --
+    numpy scalars register with those ABCs and `ndarray` does not (measured) --
+    so it falls through to the *scalar* handling each caller already had, which
+    is the behaviour both of those callers want. A `TensorBase` is filtered for
+    the same reason in reverse: it has `__array__`, and every caller checks for
+    it first anyway.
+    """
+    if isinstance(data, (module.TensorBase, str, bytes, bytearray)):
+        return None
+    if isinstance(data, _numbers.Number):
+        return None
+    if not (hasattr(data, "__array__") and hasattr(data, "tolist")
+            and hasattr(data, "shape")):
+        return None
+    name = getattr(getattr(data, "dtype", None), "name", None)
+    mapped = _NUMPY_DTYPE_TO_TORCH.get(name)
+    if mapped is None:
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: building a tensor from an array "
+            f"of dtype {name!r} -- this shim reads an array through .tolist(), "
+            f"and only {sorted(_NUMPY_DTYPE_TO_TORCH)} have a storage behind "
+            f"them here. See bootstrap.py::_array_like_data"
+        )
+    return data.tolist(), getattr(module, mapped)
+
+
+def _new_from_data(module, data, dtype, device):
+    """`module._tensor_new_from_data`, with the array-like and iterator cases.
+
+    The one door every `lift_fresh` construction goes through, so that
+    `torch.tensor`, `torch.as_tensor`, `Tensor.new_tensor` and the legacy
+    `torch.Tensor(...)` constructor agree about what "data" means instead of
+    each growing its own answer.
+
+    Two conversions, both of which the Rust walker cannot do and neither of
+    which changes an already-working call:
+
+    - **array-likes**, per `_array_like_data` above.
+    - **arbitrary sequences**, because upstream's `torch.Tensor(range(3))` is a
+      `(3,)` tensor of `0., 1., 2.` (measured) and the walker takes only `list`
+      and `tuple`. `str`/`bytes` are excluded: they are sequences, and upstream
+      answers `TypeError: new(): invalid data type 'str'`, so letting them
+      through would turn a refusal into three tensors of character codes.
+    """
+    arrayed = _array_like_data(module, data)
+    if arrayed is not None:
+        values, array_dtype = arrayed
+        return module._tensor_new_from_data(
+            values, array_dtype if dtype is None else dtype, device
+        )
+    if (not isinstance(data, (list, tuple, str, bytes, bytearray, module.TensorBase))
+            and not isinstance(data, _numbers.Number)
+            and hasattr(data, "__iter__")):
+        data = list(data)
+    return module._tensor_new_from_data(data, dtype, device)
+
+
 def _tensor_factory(module, dispatch):
     """`torch.tensor(...)`, which has no overload set to resolve against.
 
@@ -5299,7 +5413,7 @@ def _tensor_factory(module, dispatch):
             device = module.device(device)
         out = dispatch(
             "aten.lift_fresh.default",
-            module._tensor_new_from_data(data, dtype, device),
+            _new_from_data(module, data, dtype, device),
         )
         return _apply_requires_grad(out) if requires_grad else out
 
@@ -5349,21 +5463,82 @@ _LEGACY_TENSOR_DTYPES = {
 }
 
 
+def _sized_tensor(module, base, sizes, device, empty_is_scalar=False):
+    """The legacy constructors' *size* form -- `Tensor(2, 3)` and its relatives.
+
+    `TensorBase(*sizes)` is the native one (`tensor.rs::py_new`) and stays the
+    path for the ordinary case, because it is the path that is already measured
+    and golden-compared, and routing it through a kernel would put aten records
+    into a trace that upstream's own trace does not have.
+
+    Two cases it cannot answer, both introduced by callers that reach this
+    function and did not reach `py_new` directly:
+
+    - **the empty size**, from `torch.Tensor(torch.Size([]))`, which upstream
+      answers with a **scalar** `()` tensor. `TensorBase()` is `(0,)` -- the
+      one-dimensional empty tensor, measured and deliberate -- so the two
+      genuinely differ, and which one is right depends on *how the caller
+      spelled it*: `torch.Tensor()` is `(0,)` and `torch.Tensor(torch.Size([]))`
+      is `()`, both measured upstream. That is what `empty_is_scalar`
+      distinguishes, and it is the only reason this function needs a flag. The
+      first version of it did not have one and silently turned `torch.Tensor()`
+      into a scalar -- caught by diffing the whole shape table against upstream
+      rather than by any single case.
+    - **a non-CPU device**, from `torch.Tensor(5, device=...)`. `py_new` takes
+      no keywords at all (its signature is `(*args)`), so this is the only
+      place the keyword upstream accepts can be honoured.
+
+    Both fall through to `empty`, which is a real kernel with a device argument
+    and the same "no correct value to diff" contract the size form has.
+    """
+    sizes = tuple(sizes)
+    on_cpu = device is None or getattr(device, "type", "cpu") == "cpu"
+    if on_cpu and (sizes or not empty_is_scalar):
+        return base(*sizes)
+    return module._VariableFunctions.empty(list(sizes), device=device)
+
+
 def _install_legacy_tensor_types(module, dispatch) -> None:
     base = module.TensorBase
 
     def make(name, dtype_name):
         dtype = getattr(module, dtype_name)
 
-        def __new__(cls, *args):
+        def __new__(cls, *args, **kwargs):
             # The re-wrap form first, as `TensorBase.__new__` does, so the
             # single-tensor path stays one check.
             if len(args) == 1 and isinstance(args[0], base):
                 return dispatch("aten._to_copy.default", args[0], dtype=dtype)
+            # `torch.Size` is a SIZE, and it has to be checked before the
+            # sequence branch below because it *is* a `tuple` subclass -- so
+            # the `isinstance(..., (list, tuple))` test catches it and answers
+            # data. Measured upstream: `FloatTensor(torch.Size([2, 3]))` is a
+            # `(2, 3)` float32 tensor and `LongTensor(torch.Size([2, 3]))` a
+            # `(2, 3)` int64 one, i.e. the same size rule `torch.Tensor` has
+            # (docs/CTOR.md §2.1). Before this check they answered a `(2,)`
+            # tensor holding 2 and 3 -- the exact confusion the comment above
+            # this function warns about, one type further out than it looked.
+            if len(args) == 1 and isinstance(args[0], module.Size):
+                return dispatch("aten._to_copy.default",
+                                _sized_tensor(module, base, tuple(args[0]),
+                                              kwargs.get("device"),
+                                              empty_is_scalar=True),
+                                dtype=dtype)
             # DATA, decided by type and never by shape: a sequence is values.
             # Through `_VariableFunctions.tensor`, which is where
             # `_tensor_factory` installs it -- `torch.tensor` is hoisted from
             # there by `torch/__init__.py`, and `_C` itself has no `tensor`.
+            #
+            # `_array_like_data` extends this to an `ndarray`, which is what
+            # `pegasus` reaches: `PegasusSinusoidalPositionalEmbedding.
+            # create_weight` is `torch.FloatTensor(numpy_array)`. Upstream
+            # **coerces** it to the class's dtype rather than preserving the
+            # array's (`LongTensor(array([1.7, 2.9]))` is `[1, 2]`, truncating
+            # -- measured), which is what passing `dtype=dtype` here does.
+            if len(args) == 1:
+                arrayed = _array_like_data(module, args[0])
+                if arrayed is not None:
+                    return module._VariableFunctions.tensor(arrayed[0], dtype=dtype)
             if len(args) == 1 and isinstance(args[0], (list, tuple)):
                 return module._VariableFunctions.tensor(args[0], dtype=dtype)
             # ...and everything else is the size form, which `TensorBase`
@@ -5373,7 +5548,9 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
             # the values are zeros where upstream's are uninitialised, which
             # is docs/KERNELS26.md §12.2's recorded property of the size form
             # and not a new one.
-            return dispatch("aten._to_copy.default", base(*args), dtype=dtype)
+            return dispatch("aten._to_copy.default",
+                            _sized_tensor(module, base, args, kwargs.get("device")),
+                            dtype=dtype)
 
         return _ShimMeta(name, (), {
             "__module__": "torch",
@@ -5397,6 +5574,207 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
     # missing name would be. `ShortTensor` computes: `int16` is storable here,
     # checked rather than assumed from `int8` being absent.
     module._shim_legacy_tensor_types = sorted(installed)
+    module._shim_tensor_new = _make_tensor_class_new(module, dispatch)
+
+
+def _make_tensor_class_new(module, dispatch):
+    """`torch.Tensor.__new__` -- docs/DEMAND.md §0.1 rank 1, and it is not
+    structural.
+
+    DEMAND.md called this gap structural on the ground that the refusal lives in
+    PyO3's `#[new] fn py_new` and the only class that could carry a Python-level
+    override, `torch.Tensor`, is in the vendored tree. Measured (docs/CTOR.md
+    §1), `torch.Tensor` is `class Tensor(torch._C.TensorBase)` at
+    `torch/_tensor.py:102`; its MRO is `(Tensor, TensorBase, object)`; it
+    defines **neither** `__new__` nor `__init__`, inheriting the first from
+    `TensorBase`; and it is a settable heap type. A class that inherits
+    `__new__` and accepts `setattr` can be given one from outside the file that
+    declares it. Being in the vendored tree makes a class unavailable to
+    *editing*, not to *patching*, and patching classes it does not own is most
+    of what this file does.
+
+    The real obstacle was ordering, and the hook for it already existed:
+    `_initExtension` installs this, at the moment its own comment already
+    names -- `torch/__init__.py:1931` imports `Tensor` and `:2189` calls
+    `_initExtension`, so the class exists and no tensor has been made yet.
+
+    **It goes on `Tensor`, not on `TensorBase`, and that is not a preference.**
+    Assigning a Python `__new__` replaces a type's `tp_new` with `slot_tp_new`,
+    after which the native constructor is reachable only through the saved
+    wrapper -- and CPython's `tp_new_wrapper` guard then refuses it:
+
+        TypeError: torch._C.TensorBase.__new__(Tensor) is not safe,
+                   use object.__new__()
+
+    measured, by doing exactly that. The guard walks up from the subtype past
+    every `slot_tp_new` and compares with the wrapper's own type's `tp_new`;
+    once `TensorBase`'s is itself `slot_tp_new` nothing matches and the native
+    allocator is permanently unreachable from Python -- taking
+    `TensorBase(existing)` with it, which is the re-wrap form every internal
+    caller uses and the one `_make_subclass` builds a `Parameter` out of.
+    Patching only `Tensor` leaves `TensorBase.tp_new` native, so the walk
+    succeeds (`Tensor` is a slot -> skip -> `TensorBase` matches) and
+    `base.__new__(cls, ...)` keeps working. Verified: after the patch,
+    `torch.Tensor(5)` is a `Tensor`, `nn.Parameter(...)` is a `Parameter`, and
+    `nn.Linear(2, 2)` still has two parameters.
+
+    The dispatch order below is upstream's parser, and each branch is a rule
+    that a plausible implementation gets wrong -- see docs/CTOR.md §2:
+
+        Tensor(existing)        re-wrap; keeps the SOURCE dtype, not the default
+        Tensor(torch.Size(...)) a SIZE -- and `torch.Size` is a `tuple` subclass,
+                                so this must precede the sequence branch
+        Tensor(), Tensor(2, 3)  a SIZE, native
+        Tensor([...]), (...),   DATA, always at the DEFAULT dtype, whatever the
+        Tensor(ndarray),        source dtype is -- which is the whole difference
+        Tensor(range(...))      between this and `torch.tensor`, which infers
+    """
+    base = module.TensorBase
+
+    def __new__(cls, *args, **kwargs):
+        device = kwargs.pop("device", None)
+        if kwargs:
+            # Upstream's own answer, in shape if not word for word: it reports
+            # the combination it got. `dtype=` and `requires_grad=` are the two
+            # that get tried, and upstream rejects **both** -- the legacy
+            # constructor takes `device` and nothing else (measured:
+            # `Tensor(5, dtype=torch.float64)` is a TypeError there too). So
+            # this is not a shim limitation and is not spelled as one.
+            got = ", ".join(
+                [_upstream_type_name(a) for a in args]
+                + [f"{k}={_upstream_type_name(v)}" for k, v in kwargs.items()])
+            raise TypeError(
+                f"new() received an invalid combination of arguments - got "
+                f"({got}), but expected one of:\n * (*, torch.device device)"
+                f"\n * (torch.Storage storage)\n * (Tensor other)"
+                f"\n * (tuple of ints size, *, torch.device device)"
+                f"\n * (object data, *, torch.device device)"
+            )
+        if isinstance(device, str):
+            device = module.device(device)
+
+        if len(args) == 1:
+            only = args[0]
+            # Re-wrap. Native, and it keeps the source dtype -- `Tensor(int64
+            # tensor)` is `int64` upstream, the one case where this constructor
+            # does not land on the default dtype.
+            if isinstance(only, base):
+                return base.__new__(cls, only)
+            # A SIZE, before the sequence branch, because `torch.Size` is a
+            # `tuple` subclass and the branch below would read it as data --
+            # answering a `(2,)` tensor holding 2 and 3 where upstream answers
+            # a `(2, 3)` empty one, with nothing downstream raising.
+            if isinstance(only, module.Size):
+                return base.__new__(
+                    cls, _sized_tensor(module, base, tuple(only), device,
+                                       empty_is_scalar=True))
+            if isinstance(only, bool) or isinstance(only, int):
+                return base.__new__(cls, _sized_tensor(module, base, (only,), device))
+            if isinstance(only, (str, bytes, bytearray)):
+                raise TypeError(
+                    f"new(): invalid data type '{type(only).__name__}'")
+            if isinstance(only, _numbers.Number) or only is None:
+                # `Tensor(1.5)`, `Tensor(None)`, `Tensor(np.float32(3.5))`.
+                # Upstream's wording, transcribed. A float is not a size (it
+                # cannot be one) and not a sequence, so it is neither form.
+                raise TypeError(
+                    f"new(): data must be a sequence (got "
+                    f"{_upstream_type_name(only)})")
+            # DATA. `dtype` is the default dtype and is passed explicitly:
+            # nested-list inference would answer `int64` for `Tensor([1, 2])`
+            # and the array's own dtype for `Tensor(int64 ndarray)`, and
+            # upstream answers the default float for both.
+            out = dispatch(
+                "aten.lift_fresh.default",
+                _new_from_data(module, only, module.get_default_dtype(), device),
+            )
+            return base.__new__(cls, out)
+
+        # Zero arguments, or several. Several must all be sizes: upstream has
+        # no multi-argument data form, so `Tensor([1, 2], [3, 4])` and
+        # `Tensor(t, t)` are both refusals there and are refusals here.
+        #
+        # **Which** refusal depends on the first argument, and upstream really
+        # does use two different messages -- measured:
+        #
+        #     Tensor([1,2], [3,4])  invalid combination of arguments - got (list, list)
+        #     Tensor(t, t)          invalid combination of arguments - got (Tensor, Tensor)
+        #     Tensor(2, 3.0)        argument 'size' failed to unpack ... at pos 2
+        #
+        # i.e. once the first argument reads as a size, the whole call is the
+        # size overload and a later bad element is an unpack failure *within*
+        # it; if the first argument does not, no overload matched at all. A
+        # caller catching one of these by text gets the one upstream gives.
+        if args and not isinstance(args[0], (int, bool)):
+            got = ", ".join(_upstream_type_name(a) for a in args)
+            raise TypeError(
+                f"new() received an invalid combination of arguments - got "
+                f"({got}), but expected one of:\n * (*, torch.device device)"
+                f"\n * (torch.Storage storage)\n * (Tensor other)"
+                f"\n * (tuple of ints size, *, torch.device device)"
+                f"\n * (object data, *, torch.device device)"
+            )
+        for i, arg in enumerate(args):
+            if isinstance(arg, (int, bool)):
+                continue
+            # Transcribed from upstream 2.13.0 including the missing space
+            # after the comma -- it is upstream's, and a caller matching on
+            # this text would be matching upstream's spelling of it.
+            raise TypeError(
+                f"new(): argument 'size' failed to unpack the object at "
+                f"pos {i + 1} with error \"type must be tuple of ints,but "
+                f"got {_upstream_type_name(arg)}\"")
+        return base.__new__(cls, _sized_tensor(module, base, args, device))
+
+    __new__.__name__ = "__new__"
+    __new__.__qualname__ = "Tensor.__new__"
+    # The same wall `_make_subclass` hit, and the same answer -- see its
+    # comment for the whole argument. `torch/_dynamo/decorators.py:1006`
+    # compares this function's signature against the polyfill
+    # `torch/_dynamo/polyfills/tensor.py:42::tensor_pynew` and raises
+    # `TypeError: Signature mismatch` unless one of the two is the wildcard
+    # `(*args, **kwargs)`. Upstream's `Tensor.__new__` is a C builtin, so
+    # `inspect.signature` raises `ValueError` on it and the comparison is
+    # skipped entirely; a Python function has a readable signature, so the
+    # comparison ran -- and `(cls, *args, **kwargs)` is not the wildcard,
+    # because `cls` is an ordinary positional parameter.
+    #
+    # Measured: without this line, `PegasusSinusoidalPositionalEmbedding`
+    # stops at `decorators.py:1011` before reaching any tensor at all, and
+    # every later model in the same process then fails differently
+    # (`Duplicate dispatch rule for ... _make_subclass`) because the first
+    # failure left the polyfill registration half-done. Withholding the
+    # signature is the same amount of information upstream gives.
+    __new__.__signature__ = inspect.signature(lambda *args, **kwargs: None)
+    __new__.__doc__ = (
+        "torch._C shim: the legacy torch.Tensor(...) constructor. Accepts the "
+        "re-wrap form Tensor(existing), the size forms Tensor(), Tensor(2, 3) "
+        "and Tensor(torch.Size(...)), and the data forms Tensor(sequence) and "
+        "Tensor(ndarray) -- the last two at the default dtype, as upstream "
+        "does. See docs/CTOR.md."
+    )
+    return staticmethod(__new__)
+
+
+def _upstream_type_name(value):
+    """Upstream names a rejected argument's type the way `repr` of its class
+    does, module-qualified for anything outside builtins: `float`, `NoneType`,
+    `numpy.float32`. Transcribed rather than guessed -- the numpy-scalar
+    spelling is the one that carries a module, and it is the one a caller
+    catching this message would be matching on.
+
+    A tensor is the exception and is bare `Tensor`, not `torch.Tensor`:
+    upstream's `Tensor(t, t)` reports `got (Tensor, Tensor)` (measured), and
+    the qualified spelling was what this function produced before the diff
+    against upstream caught it."""
+    cls = type(value)
+    for candidate in ("TensorBase", "Tensor"):
+        parent = getattr(sys.modules.get("torch._C"), candidate, None)
+        if isinstance(parent, type) and isinstance(value, parent):
+            return "Tensor"
+    if cls.__module__ in ("builtins", None):
+        return cls.__name__
+    return f"{cls.__module__}.{cls.__name__}"
 
 
 def _install_namespace_types(module, namespace) -> None:
@@ -8091,6 +8469,17 @@ def _install_composites(module, varfns, dispatch) -> None:
         caller in `transformers` builds a fresh array or list and never touches
         it again, so the difference has no observed consequence; it is still a
         difference, and docs/DEMAND1.md §4 records it.
+
+        **A correction to the paragraph above, made in docs/CTOR.md's round.**
+        Until that round the ndarray path here did not copy either -- it
+        *raised*, because `_tensor_new_from_data` walks nested sequences of
+        Python scalars and refuses an `ndarray` by name. "Copies rather than
+        aliases" was the intended divergence and was written down as though it
+        were the observed one; the observed one was a `TypeError`. It now really
+        does copy, through `_new_from_data`, and the dtype is the array's --
+        which is what upstream answers here (`as_tensor(float64 array)` is
+        `float64`), and is the difference between this path and the legacy
+        `torch.Tensor(ndarray)` constructor, which casts to the default dtype.
         """
         if _MODE_STACK:
             return _through_torch_function_modes(
@@ -8105,7 +8494,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             return dispatch("aten._to_copy.default", data, dtype=dtype)
         return dispatch(
             "aten.lift_fresh.default",
-            module._tensor_new_from_data(data, dtype, device),
+            _new_from_data(module, data, dtype, device),
         )
 
     as_tensor.__name__ = as_tensor.__qualname__ = "as_tensor"
@@ -8355,6 +8744,17 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         tensor_cls = getattr(torch_module, "Tensor", None)
         if tensor_cls is not None:
             module._set_tensor_class(tensor_cls)
+            # docs/DEMAND.md §0.1 rank 1, and the reason this hook is the one
+            # that closes it: `torch.Tensor` inherits `__new__` from
+            # `TensorBase` and defines none of its own (measured, docs/CTOR.md
+            # §1), so it can be given one here without editing the vendored
+            # file that declares it. The guard is on `__new__` being *inherited*
+            # rather than on the class being untouched -- if a future vendored
+            # tree grows its own `__new__`, that one is upstream's and wins.
+            new_fn = getattr(module, "_shim_tensor_new", None)
+            if new_fn is not None and "__new__" not in vars(tensor_cls):
+                tensor_cls.__new__ = new_fn
+                module._shim_tensor_constructor = True
         # The same registration, one type over, and needed for the same kind of
         # `isinstance` check: `torch/storage.py:836` refuses a bare
         # `torch._C.StorageBase` in `TypedStorage(wrap_storage=...)`, and every
