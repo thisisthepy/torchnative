@@ -282,7 +282,7 @@ only exists on a platform. Every ✅ has a run behind it.
 | installs | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ *mounted, no wheel* |
 | `import torch` | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ |
 | computes | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ |
-| **on PyPI `0.0.8a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| **on PyPI `0.0.9a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | can be run *here* | ✅ | emulator | ❌ | ❌ | ❌ *but run elsewhere* | ✅ *Node* |
 
 **Windows moved on a user's report, not on our own run**, and only as far as the report goes. Someone
@@ -437,7 +437,7 @@ pip install torchnative
 Every published version is a pre-release, so if your resolver is configured to skip those, ask for
 one by name: `pip install --pre torchnative`.
 
-`0.0.8a0` ships five platform wheels, all `cp313-abi3` — one binary per platform, loadable by
+`0.0.9a0` ships five platform wheels, all `cp313-abi3` — one binary per platform, loadable by
 CPython 3.13 and every later release. Each carries the `_C` extension and the vendored upstream
 tree, so `import torch` resolves to *this* build.
 
@@ -478,7 +478,7 @@ answer and an `nn.Linear` forward runs ([`docs/WHEEL.md`](docs/WHEEL.md) §7).
 > [!NOTE]
 > `0.0.1a0` is still on PyPI and does **not** work — it is `py3-none-any` and carries the
 > `torchnative` skeleton alone, no `_C` and no `torch`, so it installs cleanly and then fails to
-> import. Ask for `0.0.8a0` or later.
+> import. Ask for `0.0.9a0` or later.
 >
 > There is no source distribution. Building needs a Rust toolchain and a vendoring step that
 > `pip` cannot drive, so an sdist would install and then fail; the recipe is below instead.
