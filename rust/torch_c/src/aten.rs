@@ -4367,7 +4367,16 @@ fn isin_tensor_tensor(
     const OP: &str = "aten.isin.Tensor_Tensor";
     let elements = tensor_arg(OP, args, kwargs, 0, "elements")?;
     let test = tensor_arg(OP, args, kwargs, 1, "test_elements")?;
-    let tag = same_dtype(OP, &elements, &test)?;
+    
+    if elements.tag() == TorchDType::Bool || test.tag() == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: upstream refuses bool operands ({} vs {})",
+            elements.tag().name(),
+            test.tag().name()
+        )));
+    }
+    
+    let tag = promote_operands(OP, &elements, &test)?;
     let invert = bool_arg(args, kwargs, 3, "invert")?.unwrap_or(false);
 
     // Compared as f64 when either side is floating, as i64 otherwise. Equality
@@ -11938,27 +11947,26 @@ fn floor_divide_impl(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
-    let tag = lhs.tag();
-    if tag == TorchDType::Bool {
-        return Err(not_implemented(format!(
-            "{op}: torch.bool operands are not implemented in torch._C shim"
-        )));
-    }
     let raw_other = required(op, args, kwargs, 1, "other")?;
     let n = lhs.tensor()?.elem_count();
-    // Whether the divisor may keep `opmath` precision: only a real `Scalar`
-    // divisor on a reduced-float tensor reaches upstream's `is_scalar(2)`
-    // branch. A tensor divisor goes through the ordinary iterator, which casts
-    // it to the common dtype.
+    
     let mut scalar_at_opmath = false;
+    let tag;
+
     let other_flat: Flat = if let Ok(other_tensor) = raw_other.extract::<PyTensorBase>() {
-        if other_tensor.tag() != tag {
-            return Err(not_implemented(format!(
-                "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
-                tag.name(),
-                other_tensor.tag().name()
-            )));
+        if lhs.tag() == TorchDType::Bool && other_tensor.tag() == TorchDType::Bool {
+            // `NotImplementedError`, not `RuntimeError`: upstream raises the
+            // first one here, and a caller that writes `except
+            // NotImplementedError` around a bool pair would not catch a
+            // `RuntimeError` carrying the same words. `isin` a few thousand
+            // lines up refuses bool with `RuntimeError` because that is what
+            // upstream raises *there* -- the two differ, so they are spelled
+            // separately rather than made consistent with each other.
+            return Err(not_implemented(
+                "\"div_floor_cpu\" not implemented for 'Bool'".to_string()
+            ));
         }
+        tag = promote_operands(op, &lhs, &other_tensor)?;
         let flat = read_flat(op, other_tensor.tensor()?, tag)?;
         let count = other_tensor.tensor()?.elem_count();
         if count != n && count != 1 {
@@ -11969,18 +11977,20 @@ fn floor_divide_impl(
         }
         flat
     } else {
+        if lhs.tag() == TorchDType::Bool && raw_other.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "\"div_floor_cpu\" not implemented for 'Bool'"
+            ));
+        }
         let scalar = scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        
+        tag = if !scalar.is_int() {
+            if lhs.tag().is_floating_point() { lhs.tag() } else { TorchDType::Float32 }
+        } else {
+            if lhs.tag() == TorchDType::Bool { TorchDType::Int64 } else { lhs.tag() }
+        };
+
         if tag.is_floating_point() {
-            // **Narrowed to `opmath_t`, not to the tensor's dtype**:
-            // `floor_divide` is `div_floor_kernel`, so a reduced-float scalar
-            // divisor is read at `opmath_t` exactly as `div.Scalar_mode(floor)`
-            // reads it (docs/SCALAR.md §3.2). `f32` *is* `opmath_t` for both
-            // reduced floats; for `float32` and `float64` there is no
-            // reduced-float branch at all and the divisor narrows to the
-            // tensor's own dtype.
-            //
-            // **The `f64` the parser produced is never the right value**, in
-            // any dtype -- `float32 -3.0 // 0.3` differs between the two.
             scalar_at_opmath = matches!(tag, TorchDType::Float16 | TorchDType::BFloat16);
             let target = if scalar_at_opmath { TorchDType::Float32 } else { tag };
             Flat::Float(vec![float_narrower(target)(scalar.as_f64())])
@@ -15990,23 +16000,6 @@ fn require_same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyRes
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{op}: expected both operands to have the same dtype, but got: {} != {} \
              -- upstream requires equal dtypes here too and does not promote",
-            lhs.tag().name(),
-            rhs.tag().name()
-        )));
-    }
-    Ok(lhs.tag())
-}
-
-/// torch would promote here. The shim does not, and says so by name.
-///
-/// **One caller is left: `isin.Tensor_Tensor`.** Everything else that used to
-/// come through this either promotes now (docs/PROMOTE.md §4) or was moved to
-/// `require_same_dtype` above because upstream refuses it too. `isin` is a
-/// genuine remaining gap and is recorded as one in docs/PROMOTE.md §6.
-fn same_dtype(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
-    if lhs.tag() != rhs.tag() {
-        return Err(not_implemented(format!(
-            "{op}: dtype promotion not implemented in torch._C shim: {} vs {}",
             lhs.tag().name(),
             rhs.tag().name()
         )));

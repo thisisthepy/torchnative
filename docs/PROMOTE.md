@@ -432,3 +432,46 @@ shim answers / upstream raises  = 0
 
 All three remaining refusals are `bool x bool` -- same-dtype, so no promotion
 is involved; they are the docs/BOOL.md gaps described in §4.
+
+## 8. Closing the deliberate refusals (`floor_divide`, `isin`)
+
+Two ops deliberately refused mixed dtypes in the initial round due to upstream behavior interacting with their native type promotion rules.
+
+### `isin`
+
+`isin` promotes all inputs, but refuses any `bool` operand natively.
+
+Truth table (tested natively):
+- **bool / ***: Upstream raises `RuntimeError: "isin_Tensor_Tensor_out" not implemented for 'Bool'`
+- **uint8 / int16**: `bool` (result is always boolean mask)
+- **float32 / float64**: `bool`
+- **int64 / float16**: `bool`
+- **float16 / bfloat16**: `bool`
+- **int32 / int64**: `bool`
+
+The implementation intercepts `bool` operands directly in `isin_tensor_tensor` and raises the shim's `PyRuntimeError`, and otherwise delegates safely to the general `promote_operands` path.
+
+### `floor_divide`
+
+`floor_divide.default` (tensor-tensor) accepts mixed dtypes normally, but specifically refuses `bool` with itself. `floor_divide.Scalar` uses PyTorch's `result_type(tensor, scalar)` rules, which are different from standard binary op promotion:
+
+Truth table (tested natively):
+- **bool // bool**: Upstream raises `RuntimeError: "div_floor_cpu" not implemented for 'Bool'`
+- **bool // int**: `int64`
+- **bool // float**: `float32`
+- **uint8 // int16**: `int16`
+- **float32 // float64**: `float64`
+- **int64 // float16**: `float16`
+- **float16 // bfloat16**: `float32`
+- **int32 // int64**: `int64`
+
+The implementation handles the `bool // bool` tensor pair by throwing `PyRuntimeError` with upstream's exact message, and uses `promote_operands` for other tensor pairs. For `.Scalar`, it simulates upstream's scalar promotion rules directly inline.
+
+### The exception type is part of the answer
+
+`floor_divide` on a `bool` pair raises **`NotImplementedError`** and `isin` on a
+`bool` operand raises **`RuntimeError`**, because that is what upstream raises in
+each place. They are not made consistent with each other: a caller who writes
+`except NotImplementedError` around a bool pair would not catch a `RuntimeError`
+carrying the same words, so matching upstream matters more than matching
+ourselves. The first landed as `RuntimeError` and was corrected on review.

@@ -2021,6 +2021,7 @@ _ISIN_DTYPES = ["float64", "float32", "int64", "int32", "uint8"]
 def isin_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.isin.Tensor_Tensor"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(torch_module, c_module, op, torch_call))
 
     for dtype_name in _ISIN_DTYPES:
         elements_t, elements_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5], (5,), dtype_name)
@@ -16793,6 +16794,10 @@ def ge_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.floor_divide.default"
     cases: list[Case] = []
+    cases.extend(_promotion_cases(
+        torch_module, c_module, op, torch_call,
+        a_flat=(5, 5, 5, 5), b_flat=(2, 2, 2, 2)
+    ))
 
     # Tensor,Tensor -- mixed sign, re-measured against real torch: floors
     # toward -inf like Python's `//`, not toward zero like C's truncation.
