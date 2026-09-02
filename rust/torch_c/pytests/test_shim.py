@@ -16461,5 +16461,391 @@ def test_quantise_refuses_the_call_that_would_have_done_nothing():
     assert 3.7 < r["ratio"] < 3.8, r["ratio"]
 
 
+# --- from_pretrained(quantization_config=TorchnativeConfig(...)) -----------
+#
+# docs/HFQUANT.md. The point of the plugin is *when* the swap happens, not
+# that it happens: `quantize_` runs after `from_pretrained` returns, so peak
+# memory is the dense model whatever format you ask for. So the assertions
+# below come in two halves.
+#
+#   1. The claim itself, measured. Three subprocesses load the same 68 MB
+#      checkpoint -- dense, dense-then-`quantize_`, and through the plugin --
+#      and report `ru_maxrss`. A regression that turned the plugin back into a
+#      post-hoc swap would leave the third number sitting on the second.
+#      Separate processes because `ru_maxrss` is a high-water mark, so two
+#      loads in one process would both report the larger.
+#   2. That the earlier swap computes the same thing. The plugin's blobs are
+#      compared byte for byte against `quantize_`'s on the same weights, and
+#      the two models' logits bit for bit. This is the half that would catch a
+#      pre-load path that is cheap because it quantised the wrong tensor.
+#
+# The checkpoints are written by *this* process on upstream torch, for the
+# reason the `_CKPT_*` block above gives at length -- and for one more:
+# `save_pretrained` on the shim needs `TensorBase.untyped_storage`, which is
+# not implemented, so the shim cannot write its own fixture.
+import shutil as _hfquant_shutil
+
+_HFQUANT_SCRIPT = r"""
+import json, os, resource, sys
+import torch
+
+MODE, CKPT_BIG, CKPT_TIED = sys.argv[1], sys.argv[2], sys.argv[3]
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def peak_mb():
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return r / (1024.0 * 1024.0) if sys.platform == "darwin" else r / 1024.0
+
+
+if MODE == "inert":
+    # Registering a name is allowed; changing what an unrelated load does is
+    # not. Two facts, in order: importing `torchnative.quant` must not drag
+    # `transformers` in at all (it is not a hard dependency), and importing
+    # `transformers` afterwards must find its own tables untouched.
+    import torchnative.quant  # noqa: F401
+
+    out["transformers_imported_by_torchnative"] = "transformers" in sys.modules
+    from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING, AUTO_QUANTIZER_MAPPING
+
+    out["registered_before_ask"] = "torchnative" in AUTO_QUANTIZER_MAPPING
+    from torchnative.quant import TorchnativeConfig  # the ask
+
+    out["registered_after_ask"] = "torchnative" in AUTO_QUANTIZER_MAPPING
+    out["config_registered_after_ask"] = "torchnative" in AUTO_QUANTIZATION_CONFIG_MAPPING
+    out["config_class_is_ours"] = (
+        AUTO_QUANTIZATION_CONFIG_MAPPING.get("torchnative") is TorchnativeConfig
+    )
+    # Idempotent: `register_quantizer` raises on a duplicate name, and this
+    # module can be reached under more than one path.
+    from torchnative.quant import hf as _hf
+
+    _hf._register()
+    out["reregister_ok"] = True
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+from transformers import AutoModelForCausalLM
+import torchnative.quant as q
+from torchnative.quant import TorchnativeConfig
+
+
+def load(path, **kw):
+    return AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32, **kw)
+
+
+if MODE in ("dense", "posthoc", "plugin"):
+    if MODE == "dense":
+        m = load(CKPT_BIG)
+    elif MODE == "posthoc":
+        m = load(CKPT_BIG)
+        q.quantize_(m, format="q8_0", predicate=lambda n, mod: n != "lm_head")
+    else:
+        m = load(CKPT_BIG, quantization_config=TorchnativeConfig("q8_0"))
+        rep = m.torchnative_quantization
+        out["report"] = str(rep)
+        out["converted"] = len(rep.converted)
+        out["swapped_before_weights"] = rep.swapped_before_weights
+    out["peak_rss_MB"] = peak_mb()
+    d, qb = q.storage_bytes(m)
+    out["storage"] = [d, qb]
+    out["n_quantized"] = sum(1 for x in m.modules() if isinstance(x, q.QuantizedLinear))
+    out["n_linear"] = sum(1 for x in m.modules() if isinstance(x, torch.nn.Linear))
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+if MODE == "compare":
+    ids = torch.tensor([[3, 7, 1, 19]])
+    a = load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0"))
+    b = load(CKPT_TIED)
+    q.quantize_(b, format="q8_0", predicate=lambda n, mod: n != "lm_head")
+    an = dict(a.named_modules())
+    bn = dict(b.named_modules())
+    names = sorted(n for n, mod in an.items() if isinstance(mod, q.QuantizedLinear))
+    out["compared"] = len(names)
+    out["blob_identical"] = sum(
+        1
+        for n in names
+        if torch._C._quantized_blob(an[n].qweight) == torch._C._quantized_blob(bn[n].qweight)
+    )
+    out["posthoc_types_match"] = all(isinstance(bn[n], q.QuantizedLinear) for n in names)
+    with torch.no_grad():
+        la, lb = a(ids).logits, b(ids).logits
+    out["logits_bit_identical"] = bool((la == lb).all().item())
+    out["logits_max_abs"] = float(la.abs().max())
+    # The dense weight is gone from the loaded model: not a Parameter, not a
+    # buffer, not in `state_dict()` (QuantizedLinear's docstring).
+    out["dense_weight_keys_left"] = sorted(
+        k
+        for k in a.state_dict()
+        if k.rsplit(".", 1)[-1] == "weight"
+        and isinstance(an.get(k.rsplit(".", 1)[0]), q.QuantizedLinear)
+    )
+    del b
+    # A negative control for the bit comparison above: two *different* formats
+    # must not agree, or "bit identical" would be measuring nothing.
+    c = load(CKPT_TIED, quantization_config=TorchnativeConfig("q4_0"))
+    with torch.no_grad():
+        lc = c(ids).logits
+    out["q4_differs"] = not bool((la == lc).all().item())
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+if MODE == "refuse":
+    # A k-quant on a width no k-quant can hold: docs/QUANT2.md §5.2. The
+    # message has to carry the block size, because that is what tells the
+    # reader which formats are still open to them.
+    try:
+        load(CKPT_TIED, quantization_config=TorchnativeConfig("q4_k"))
+        out["q4_k"] = "ACCEPTED"
+    except ValueError as exc:
+        out["q4_k"] = str(exc)
+    # Asking for the tied head: there is no tensor for it in the checkpoint.
+    try:
+        load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0", modules_to_not_convert=[]))
+        out["tied"] = "ACCEPTED"
+    except ValueError as exc:
+        out["tied"] = str(exc)
+    try:
+        TorchnativeConfig("q9_9")
+        out["bad_format"] = "ACCEPTED"
+    except ValueError as exc:
+        out["bad_format"] = str(exc)
+    try:
+        TorchnativeConfig("q8_0", modules_to_not_convert="lm_head")
+        out["str_skip"] = "ACCEPTED"
+    except ValueError as exc:
+        out["str_skip"] = str(exc)
+    # An explicit list is honoured, and it replaces the default rather than
+    # adding to it.
+    m = load(
+        CKPT_TIED,
+        quantization_config=TorchnativeConfig(
+            "q8_0", modules_to_not_convert=["lm_head", "model.layers.0.mlp.gate_proj"]
+        ),
+    )
+    rep = m.torchnative_quantization
+    out["explicit_skips"] = sorted(rep.modules_to_not_convert)
+    out["explicit_default_flag"] = rep.default_skips
+    out["explicit_gate_type"] = type(m.model.layers[0].mlp.gate_proj).__name__
+    out["explicit_q_type"] = type(m.model.layers[0].self_attn.q_proj).__name__
+    out["explicit_converted"] = len(rep.converted)
+    del m
+    d = load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0"))
+    out["default_skips"] = sorted(d.torchnative_quantization.modules_to_not_convert)
+    out["default_default_flag"] = d.torchnative_quantization.default_skips
+    out["default_converted"] = len(d.torchnative_quantization.converted)
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+raise SystemExit("unknown mode " + MODE)
+"""
+
+# Big enough that `ru_maxrss` separates the two paths well clear of process
+# noise (68 MB of dense weight against 21 MB after replacement), small enough
+# that writing it and loading it three times costs about ten seconds.
+_HFQUANT_BIG_CFG = dict(
+    vocab_size=1024, hidden_size=512, intermediate_size=2048, num_hidden_layers=4,
+    num_attention_heads=8, num_key_value_heads=8, max_position_embeddings=64,
+    tie_word_embeddings=False,
+)
+# Tied, and 64 wide: `lm_head.weight` is not in the checkpoint at all, and
+# `64 % 256 != 0` closes every k-quant. Both refusals need a model shaped like
+# this -- and SmolLM2-135M is shaped like this too (576 wide, tied head).
+_HFQUANT_TIED_CFG = dict(
+    vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+    num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=32,
+    tie_word_embeddings=True,
+)
+
+
+@functools.cache
+def _hfquant_fixture():
+    """Write two checkpoints on upstream torch, then read them back on the shim."""
+    torch = _upstream_torch
+    from transformers.models.llama.configuration_llama import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
+    root = tempfile.mkdtemp(prefix="hfquant-")
+    try:
+        paths = {}
+        for name, cfg in (("big", _HFQUANT_BIG_CFG), ("tied", _HFQUANT_TIED_CFG)):
+            torch.manual_seed(0)
+            model = LlamaForCausalLM(LlamaConfig(dtype="float32", **cfg))
+            paths[name] = os.path.join(root, name)
+            model.save_pretrained(paths[name])
+            del model
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+        env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+        env["HF_HUB_OFFLINE"] = "1"  # the checkpoints are local; never reach out
+        results = {}
+        for mode in ("inert", "dense", "posthoc", "plugin", "compare", "refuse"):
+            proc = subprocess.run(
+                [sys.executable, "-c", _HFQUANT_SCRIPT, mode, paths["big"], paths["tied"]],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"hfquant subprocess ({mode}) exited {proc.returncode}\n"
+                    f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+                )
+            results[mode] = json.loads(proc.stdout.strip().splitlines()[-1])
+        results["dense_weight_bytes"] = results["dense"]["storage"][0]
+        return results
+    finally:
+        _hfquant_shutil.rmtree(root, ignore_errors=True)
+
+
+def _hfquant_available():
+    return _ckpt_shim_available() and _upstream_transformers is not None
+
+
+def test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land():
+    """The reason this plugin exists, stated as a memory measurement.
+
+    `quantize_` cannot help peak memory: it runs after `from_pretrained` has
+    returned, so the dense model is fully built before anything shrinks. That
+    is survivable at 135M and self-defeating at 7B, and on-device is the
+    premise of this repository (docs/DESIGN.md §1).
+    `_process_model_before_weight_loading` runs while the model is still a
+    meta-device skeleton, so the leaves are replaced first and each weight is
+    quantised as it comes off disk.
+
+    The assertion is a *difference between two processes*, not an absolute
+    number: absolutes here carry the interpreter, the vendored tree and the
+    mmap of the checkpoint, none of which this round changed. The margin is
+    40% of the dense weight bytes against a measured saving of about 78%, so
+    it has room for a noisier machine and none at all for a plugin that went
+    back to swapping after the load -- that scores zero.
+    """
+    if not _hfquant_available():
+        return
+    r = _hfquant_fixture()
+    dense_MB = r["dense_weight_bytes"] / (1024.0 * 1024.0)
+    plugin, posthoc, dense = (r[k]["peak_rss_MB"] for k in ("plugin", "posthoc", "dense"))
+
+    assert r["plugin"]["shim"] and r["posthoc"]["shim"], "measured upstream, not the shim"
+    saved = posthoc - plugin
+    assert saved > 0.40 * dense_MB, (
+        f"plugin peak {plugin:.1f} MB vs post-hoc {posthoc:.1f} MB: saved {saved:.1f} MB of "
+        f"{dense_MB:.1f} MB of dense weight. The pre-load swap is not saving memory."
+    )
+    # Below the *dense* load too, which is the stronger of the two: it says the
+    # dense model was never assembled, not merely that it was taken apart.
+    assert plugin < dense, (plugin, dense)
+
+    # Same destination as the post-hoc path, so the saving is not from doing less.
+    assert r["plugin"]["storage"] == r["posthoc"]["storage"], (
+        r["plugin"]["storage"],
+        r["posthoc"]["storage"],
+    )
+    assert r["plugin"]["n_quantized"] == r["posthoc"]["n_quantized"] == 28
+    assert r["plugin"]["n_linear"] == 1, "lm_head should be the only nn.Linear left"
+    # Recorded by the hook itself: every weight it replaced still had no
+    # storage. A post-hoc swap wearing this plugin's clothes fails here even on
+    # a machine too noisy for the numbers above.
+    assert r["plugin"]["swapped_before_weights"] is True, r["plugin"]["report"]
+
+
+def test_the_quantizer_plugin_and_quantize_produce_the_same_model():
+    """Earlier is only better if it is also the same.
+
+    A pre-load path that quantised a transposed or half-materialised tensor
+    would be cheap and wrong, and both of those are shapes this repository has
+    actually produced. So the comparison is exact on both sides of the layer:
+    the GGML blobs byte for byte (`_quantized_blob`, the same axis
+    docs/QUANT2.md §2.2 builds on), and the logits bit for bit.
+
+    `q4_differs` is the negative control. Bit equality between two things that
+    could not differ proves nothing, so the same comparison is run against a
+    model quantised to `q4_0` and required to *fail*.
+    """
+    if not _hfquant_available():
+        return
+    r = _hfquant_fixture()["compare"]
+    assert r["compared"] == 14, r["compared"]
+    assert r["blob_identical"] == r["compared"], r
+    assert r["posthoc_types_match"]
+    assert r["logits_bit_identical"], r["logits_max_abs"]
+    assert r["q4_differs"], "q4_0 gave the same logits as q8_0 -- the comparison is inert"
+    # The dense `weight` placeholder that made the checkpoint key match is
+    # gone: a quantised leaf has no `weight` in `state_dict()`, which is what
+    # keeps `model.to(...)` from calling dense kernels on a packed block.
+    assert r["dense_weight_keys_left"] == [], r["dense_weight_keys_left"]
+
+
+def test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work():
+    """A format that fits nothing, and a head that has no tensor to quantise.
+
+    Both refusals are the shape docs/QUANT2.md §5.2 and §5.4 describe, and
+    both fire on SmolLM2-135M, which is 576 wide and ties its head. The
+    difference from `quantize_` is deliberate and is about the channel:
+    `quantize_` returns a report that groups skips by reason, so a caller who
+    reads it sees the wall. `from_pretrained` returns a model and nothing
+    else, so the same "skip and log" would hand back something that looks
+    quantised and, for `q4_k` here, is entirely dense.
+    """
+    if not _hfquant_available():
+        return
+    r = _hfquant_fixture()["refuse"]
+
+    assert r["q4_k"] != "ACCEPTED", "a 256-block format was accepted on a 64-wide model"
+    assert "256 elements per block" in r["q4_k"], r["q4_k"]
+    assert "not a multiple of 256" in r["q4_k"], r["q4_k"]
+    assert "modules_to_not_convert" in r["q4_k"], r["q4_k"]
+
+    assert r["tied"] != "ACCEPTED", "a tied lm_head was accepted with no tensor to quantise"
+    assert "tied" in r["tied"] and "lm_head" in r["tied"], r["tied"]
+    assert "quantize_" in r["tied"], "the refusal should name the way round it"
+
+    assert r["bad_format"] != "ACCEPTED"
+    assert "unknown quantisation format" in r["bad_format"], r["bad_format"]
+    assert r["str_skip"] != "ACCEPTED", "a bare string was taken for a list of names"
+
+    # `lm_head` is not special-cased silently in either direction: the default
+    # is transformers' own convention and says which it used, and an explicit
+    # list replaces that rather than adding to it.
+    assert r["default_skips"] == ["lm_head", "model.embed_tokens"], r["default_skips"]
+    assert r["default_default_flag"] is True
+    assert r["default_converted"] == 14, r["default_converted"]
+
+    assert r["explicit_skips"] == ["lm_head", "model.layers.0.mlp.gate_proj"]
+    assert r["explicit_default_flag"] is False
+    assert r["explicit_gate_type"] == "Linear", r["explicit_gate_type"]
+    assert r["explicit_q_type"] == "QuantizedLinear", r["explicit_q_type"]
+    assert r["explicit_converted"] == 13, r["explicit_converted"]
+
+
+def test_the_quantizer_registers_a_name_and_changes_nothing_else():
+    """Importing `torchnative.quant` must cost nothing and decide nothing.
+
+    Two separate properties, and the second is the one worth guarding.
+    `transformers` is not a hard dependency, so `import torchnative.quant` has
+    to work without it -- which means it must not import it. And registration
+    has to be something asked for: the name appears only once
+    `TorchnativeConfig` is fetched, and even then it changes no default,
+    because `AutoHfQuantizer.from_config` dispatches on the config that was
+    passed and nothing dispatches to a name nobody named.
+    """
+    if not _hfquant_available():
+        return
+    r = _hfquant_fixture()["inert"]
+    assert r["transformers_imported_by_torchnative"] is False, (
+        "import torchnative.quant pulled in transformers; it is not a hard dependency"
+    )
+    assert r["registered_before_ask"] is False, (
+        "the name was in transformers' table before anyone asked for it"
+    )
+    assert r["registered_after_ask"] is True
+    assert r["config_registered_after_ask"] is True
+    assert r["config_class_is_ours"] is True
+    assert r["reregister_ok"] is True, "registering twice raised"
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

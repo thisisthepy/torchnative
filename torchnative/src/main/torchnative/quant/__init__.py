@@ -31,7 +31,39 @@ the block it belongs to and nothing else.
 
 import torch
 
-__all__ = ["QuantizedLinear", "quantize_", "storage_bytes", "FORMATS"]
+__all__ = [
+    "QuantizedLinear",
+    "quantize_",
+    "storage_bytes",
+    "FORMATS",
+    "TorchnativeConfig",
+    "TorchnativeHfQuantizer",
+]
+
+
+def __getattr__(name):
+    """`TorchnativeConfig` is fetched lazily, and that is what keeps this import cheap.
+
+    `torchnative.quant.hf` imports `transformers` and, on import, registers
+    the name `"torchnative"` in transformers' quantizer tables. Two rules make
+    that an attribute lookup rather than a top-level import:
+
+      * **`transformers` is not a hard dependency.** `import torchnative.quant`
+        has to keep working on a machine that has never installed it, because
+        `quantize_` does not need it. A top-level `from .hf import ...` would
+        make the whole module fail to import on that machine.
+      * **Registration must be something you ask for.** Registering a name is
+        inert -- nothing dispatches to `"torchnative"` unless a
+        `TorchnativeConfig` is handed to `from_pretrained` -- but it should
+        still not happen behind the back of someone who imported this module
+        for `quantize_` alone. `from torchnative.quant import TorchnativeConfig`
+        is the ask; PEP 562 routes it here.
+    """
+    if name in ("TorchnativeConfig", "TorchnativeHfQuantizer"):
+        from . import hf
+
+        return getattr(hf, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def FORMATS():
@@ -93,7 +125,59 @@ class QuantizedLinear(torch.nn.Module):
         qweight = torch._C._quantize(weight, fmt)
         return cls(in_features, out_features, qweight, mod.bias, fmt)
 
+    @classmethod
+    def pending_from_linear(cls, mod, fmt):
+        """The same swap as `from_linear`, made *before* the weight exists.
+
+        This is what lets the replacement happen ahead of the checkpoint
+        instead of after it. `from_pretrained` builds the model on the meta
+        device and only then streams weights in, so at replacement time
+        `mod.weight` is a shape and a dtype and no storage. This keeps that
+        meta `Parameter` registered under the name `weight` and leaves
+        `qweight` as `None` until `adopt` is called with the real tensor.
+
+        **The placeholder is not a design change to `QuantizedLinear`.** It
+        exists for exactly as long as loading does. transformers matches
+        checkpoint keys against `model.state_dict()`, so a module with no
+        `weight` entry makes `...q_proj.weight` an *unexpected key* -- the
+        tensor is then never read, never routed anywhere, and the layer is
+        silently left without a weight. `adopt` removes the placeholder again,
+        so a loaded model has the `state_dict` this class documents.
+        """
+        out_features, in_features = mod.weight.shape
+        self = cls(in_features, out_features, None, mod.bias, fmt)
+        # Reuse the very `Parameter` the loader will look at, rather than a
+        # new meta tensor of the same shape: the shape check in
+        # `set_param_for_module` reads `getattr(module, "weight").shape`, and
+        # anything that made the two disagree would be a bug this class
+        # invented for itself.
+        self.register_parameter("weight", mod.weight)
+        return self
+
+    def adopt(self, weight):
+        """Quantise `weight` into this layer and drop the loading placeholder.
+
+        Called once per layer, by the conversion op that transformers runs on
+        the tensor as it comes off disk. Quantising here rather than after the
+        load is the whole point of the pre-load swap: the dense tensor is the
+        op's only reference, so it is freed as soon as this returns and the
+        dense model never exists all at once.
+        """
+        if self.qweight is not None:
+            raise ValueError(
+                f"{type(self).__name__} already holds a quantised weight; "
+                "adopt() is for the loading placeholder and runs once."
+            )
+        self.qweight = torch._C._quantize(weight, self.format)
+        del self._parameters["weight"]
+
     def forward(self, x):
+        if self.qweight is None:
+            raise RuntimeError(
+                "QuantizedLinear was asked to run before its weight arrived. "
+                "This instance is still the loading placeholder built by "
+                "`pending_from_linear`; nothing called `adopt`."
+            )
         return torch._C._quantized_linear(x, self.qweight, self.bias)
 
     def extra_repr(self):
