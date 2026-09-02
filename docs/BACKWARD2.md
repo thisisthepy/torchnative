@@ -324,6 +324,13 @@ without W5 would put the shim in the state `_install_autograd_shape` was written
 plausible as a right one and the program keeps running"* — is the whole reason this round stops
 here rather than one wall further.
 
+**`docs/BACKWARD3.md` tested that stopping decision rather than inheriting it, and upheld it — with
+two corrections to the reasoning above.** The guard `torch.optim` actually keys on is **`is_leaf`,
+not `requires_grad`** (`torch/optim/optimizer.py:1153`), and this shim already walks past it today,
+so W4 does not *create* that divergence — it makes it plausible. And **W6 has no content that is not
+W5**: `is_leaf` is defined upstream as `grad_fn is None`, so the semantic row is two walls and a
+consequence, not three. BACKWARD3 §1–§4.
+
 ### 4.1 W1: the factory keyword now does what `requires_grad_` already did
 
 The refusal's stated ground is *"returning a tensor that quietly records nothing would be worse than
@@ -508,12 +515,25 @@ _C._tape_rules(): 60 rules
 
 **`on a gradient path` reads 1853 where `docs/BACKWARD.md` §4 says 1723, and that is not this
 round.** The same script on the **unmodified** tree — `git stash push` on the four changed files,
-rebuild, re-run, `git stash pop` — reports 1853 as well. So the 1723 is stale: it was measured at
-`develop` `a39d0b4` and something between there and `e34f65d` changed which nodes the walk
-considers reachable. It is recorded here rather than corrected in place because *which* commit
-moved it is a separate question, and `docs/DOCWATCH.md`'s whole thesis is that a number nobody can
-check goes stale — this one is prose inside a table, which is exactly the shape the marker system
-structurally cannot see.
+rebuild, re-run, `git stash pop` — reports 1853 as well.
+
+> **Corrected by `docs/BACKWARD3.md` §6: the 1723 was never stale, and no commit moved it.** The
+> two numbers are two different questions asked of the same trace. `differentiable()` with no
+> argument seeds the walk from *every floating constant* — all 333, including the 61 the trace burns
+> in that are not parameters — and gives **1853, distinct ops 26**. `differentiable(wrt_constants=`
+> *the 272 parameter slots*`)` gives **1723, distinct ops 20**, which is `docs/BACKWARD.md` §4's pair
+> exactly, both numbers. The script above called the first; §4's called the second.
+> `wrt_set`, `reachable`, `wanted` and `differentiable` are unchanged since `443220f`, the commit
+> §4 documents, and `nodes_on_a_gradient_path` is computed before `has_rule` is consulted, so the six
+> rules added since cannot have moved it.
+>
+> What this section got wrong is not the measurement but the comparison: a count of "nodes on a
+> gradient path" has no value until you say a gradient path **to what**, and `wrt_constants` is that
+> question rather than a filter on the answer — which is what `reachable()`'s own doc comment says.
+
+The paragraph is left standing rather than rewritten because `docs/DOCWATCH.md`'s thesis is that a
+number nobody can check goes stale, and this one is prose inside a table — exactly the shape the
+marker system structurally cannot see. It went stale in one round.
 
 ### 7.3 Two things measured and not claimed
 
@@ -537,4 +557,4 @@ structurally cannot see.
 | 3 | **That an eager recorder can reuse `derivative()` unchanged.** | §3 measures that it *does not depend on* `PyCaptureTrace`, which is necessary and not sufficient. Nobody has built a `Node` outside `capture::record` and fed it in |
 | 4 | **That W10 has no cheap answer.** | The two options in §1.5 are the two that were thought of. A third — recording a *copy* of any operand an in-place op is about to touch, i.e. paying memory instead of a version counter — is not obviously worse and was not costed |
 | 5 | **Anything about memory or about device.** | Desktop macOS, `float32`, one process. Inherited unchanged from `docs/BACKWARD.md` §8 |
-| 6 | **Which commit moved §7.2's 1853.** | Measured as pre-existing, not attributed |
+| 6 | ~~**Which commit moved §7.2's 1853.**~~ **Closed by `docs/BACKWARD3.md` §6: no commit moved it.** | 1723 and 1853 are the same walk seeded from the 272 parameters and from all 333 floating constants respectively. Both are current on this tree; §7.2's "stale" reading is corrected in place |

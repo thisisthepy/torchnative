@@ -15723,6 +15723,192 @@ def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
     x.grad = g
     assert _C._aten_dispatch("aten.clone.default", x).grad is None
 
+
+# --- the seed a backward would be handed (docs/BACKWARD3.md) ---------------
+#
+# Runs in a *fresh* interpreter with the vendored (shim-backed) `torch` on
+# PYTHONPATH, because everything measured here is upstream **Python** --
+# `torch/autograd/__init__.py`'s `_make_grads` and `torch/optim/optimizer.py`'s
+# `add_param_group` -- and neither exists against a bare `_C`. The same
+# fixture shape the checkpoint, device and meta tests use.
+_SEED_SCRIPT = r"""
+import json, sys
+import torch
+out = {"who": "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"}
+
+
+def attempt(fn):
+    try:
+        return {"ok": fn()}
+    except BaseException as e:
+        return {"exc": type(e).__name__, "msg": str(e).splitlines()[0]}
+
+
+from torch.autograd import _make_grads
+
+x = torch.ones(3, requires_grad=True)
+scalar, nonscalar = x.sum(), x * 2
+
+out["leaf"] = [x.requires_grad, x.grad_fn is None, x.is_leaf, x.grad is None]
+out["intermediate"] = [nonscalar.requires_grad, nonscalar.grad_fn is None, nonscalar.is_leaf]
+
+# 1/2. The seed, both shapes. `_make_grads` builds one only `if out.requires_grad`.
+out["scalar_seed"] = attempt(
+    lambda: [None if g is None else float(g) for g in _make_grads((scalar,), (None,),
+                                                                 is_grads_batched=False)])
+out["nonscalar_seed"] = attempt(
+    lambda: [None if g is None else g.shape[0] for g in _make_grads((nonscalar,), (None,),
+                                                                    is_grads_batched=False)])
+
+# 3. ... and what would consume it.
+out["backward"] = attempt(lambda: (scalar.backward(), "returned")[1])
+out["autograd_grad"] = attempt(lambda: (torch.autograd.grad(scalar, x), "returned")[1])
+
+# 4/5. The two halves of upstream's non-leaf guard, optimizer.py:1153.
+import torch.optim
+out["optim_nonleaf"] = attempt(
+    lambda: type(torch.optim.SGD([nonscalar], lr=0.1)).__name__)
+out["retains_grad"] = attempt(lambda: bool(nonscalar.retains_grad))
+out["requires_grad_on_nonleaf"] = attempt(
+    lambda: bool(nonscalar.requires_grad_(False).requires_grad))
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _seed_fixture(env_overrides):
+    # `None` *removes* the key rather than setting it empty: an empty
+    # PYTHONPATH is not "no PYTHONPATH" (CPython reads "" as the current
+    # directory), and the upstream arm has to be a plain interpreter or it
+    # would import the shim it is supposed to be the oracle for.
+    env = dict(os.environ)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    proc = subprocess.run(
+        [sys.executable, "-c", _SEED_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"seed subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
+    """docs/BACKWARD2.md §1.3's warning, pinned instead of left in prose.
+
+    That section states the single most dangerous fact in the refusal chain as
+    a block quote and asserts nothing about it:
+
+        An engine implemented at W3 alone would receive `roots=(y,)`,
+        `grads=(None,)` and `accumulate_grad=True`, and the obvious defensive
+        thing to do with a `None` seed is to substitute a one. For the scalar
+        case that is *the right answer by coincidence*. For any non-scalar
+        output it is silently wrong, and upstream would have raised.
+
+    The `None` arrives because `_make_grads` builds a seed only `if
+    out.requires_grad` and no op here propagates the flag (W4). So this test
+    holds down three things that have to stay true *together*, and it is their
+    conjunction that is the safety property:
+
+      1. the seed really is absent, in both shapes;
+      2. upstream's answer differs in both shapes, and differs *differently* --
+         a one for a scalar, a `RuntimeError` for anything else;
+      3. **nothing consumes either `None`**, because the engine refuses first.
+
+    Drop (3) and (1) becomes a loaded gun. That is why the engine's refusal is
+    asserted here as well as in
+    `test_the_autograd_boundary_is_where_autograd_md_says_it_is` -- there it is
+    the boundary, here it is the thing that makes the absent seed harmless.
+
+    It also pins the divergence docs/BACKWARD3.md §1.1 found while measuring
+    this, because it was written down nowhere: **`is_leaf` is always `True`
+    here, and it is the predicate `torch.optim` keys on.**
+    `torch/optim/optimizer.py:1153` refuses a non-leaf with `ValueError: can't
+    optimize a non-leaf Tensor`, and this shim accepts one. That is asserted as
+    a *divergence*, not as a behaviour anyone wants.
+
+    **When W5 lands (a real `grad_fn`), every assertion below flips.** Invert
+    them, do not delete them, and read docs/BACKWARD3.md §4.1 first -- the
+    claim it makes is that they all flip in the same commit, and this test is
+    where that claim gets checked.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    shim = _seed_fixture({"PYTHONPATH": _CKPT_VENDOR_DIR, "TORCH_USE_RTLD_GLOBAL": "1"})
+    assert shim["who"] == "shim", shim["who"]
+
+    # -- a leaf that requires gradients is described exactly as upstream does.
+    #    This is the control: the round that carried the flag (BACKWARD2 §4.1)
+    #    got this row right, and the rows below are only interesting because
+    #    this one agrees.
+    assert shim["leaf"] == [True, True, True, True], shim["leaf"]
+
+    # -- an intermediate is described as a *constant*, which is what it is here.
+    assert shim["intermediate"] == [False, True, True], shim["intermediate"]
+
+    # 1. The seed is absent in both shapes, and absent the same way.
+    assert shim["scalar_seed"] == {"ok": [None]}, shim["scalar_seed"]
+    assert shim["nonscalar_seed"] == {"ok": [None]}, shim["nonscalar_seed"]
+
+    # 3. Nothing consumes it: both doors into the engine refuse, by the engine's
+    #    own name rather than by a helper's. If this ever stops refusing while
+    #    the two rows above still read `[None]`, an engine is being handed a
+    #    missing seed -- which is the exact failure this test exists for.
+    for key in ("backward", "autograd_grad"):
+        got = shim[key]
+        assert got.get("exc") == "NotImplementedError", (key, got)
+        assert "_ImperativeEngine.run_backward" in got["msg"], (key, got)
+
+    # 4/5. The divergence, stated as one. `is_leaf` short-circuits upstream's
+    #      `param.is_leaf or param.retains_grad`, so `retains_grad` has never
+    #      been reached and is still unimplemented -- whatever gives `is_leaf` a
+    #      second answer has to give `retains_grad` a first one.
+    assert shim["optim_nonleaf"] == {"ok": "SGD"}, (
+        "torch.optim now refuses an intermediate -- if grad_fn became a node "
+        "(docs/BACKWARD2.md W5), invert this and the two rows below rather "
+        "than deleting them; see docs/BACKWARD3.md §4.1"
+    )
+    assert shim["retains_grad"].get("exc") == "NotImplementedError", shim["retains_grad"]
+    assert "retains_grad" in shim["retains_grad"]["msg"], shim["retains_grad"]
+    assert shim["requires_grad_on_nonleaf"] == {"ok": False}, shim["requires_grad_on_nonleaf"]
+
+    # 2. Upstream is the oracle for every row above, and is measured rather
+    #    than transcribed -- a hardcoded expectation is a claim about 2.13.0
+    #    that nothing re-checks (docs/AUDIT.md's repeated defect).
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    up = _seed_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
+    assert up["who"] == "upstream", up["who"]
+
+    assert up["leaf"] == shim["leaf"], (up["leaf"], shim["leaf"])
+    # requires_grad propagates there, grad_fn is a node, and it is not a leaf.
+    assert up["intermediate"] == [True, False, False], up["intermediate"]
+    # A one for a scalar ...
+    assert up["scalar_seed"] == {"ok": [1.0]}, up["scalar_seed"]
+    # ... and a refusal for anything else. These are *different* answers, which
+    # is why substituting a one for the `None` above would be wrong rather than
+    # merely unjustified.
+    assert up["nonscalar_seed"].get("exc") == "RuntimeError", up["nonscalar_seed"]
+    assert "scalar outputs" in up["nonscalar_seed"]["msg"], up["nonscalar_seed"]
+    # The engine runs there, so both doors return.
+    assert up["backward"] == {"ok": "returned"}, up["backward"]
+    assert up["autograd_grad"] == {"ok": "returned"}, up["autograd_grad"]
+    # And the guard this shim walks past.
+    assert up["optim_nonleaf"].get("exc") == "ValueError", up["optim_nonleaf"]
+    assert "non-leaf" in up["optim_nonleaf"]["msg"], up["optim_nonleaf"]
+    assert up["retains_grad"] == {"ok": False}, up["retains_grad"]
+    assert up["requires_grad_on_nonleaf"].get("exc") == "RuntimeError", (
+        up["requires_grad_on_nonleaf"])
+    assert "leaf variables" in up["requires_grad_on_nonleaf"]["msg"], (
+        up["requires_grad_on_nonleaf"])
+
+
 # --- test-time adaptation through the vendored tree (docs/ADAPT.md) --------
 #
 # `torchnative.adapt` is a Python layer over the capture/tape pair, so what it

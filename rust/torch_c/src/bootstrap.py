@@ -4911,7 +4911,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
 
 
 def _install_autograd_shape(tensorbase) -> None:
-    """`requires_grad`, `grad_fn`, `data` -- the papered-over part.
+    """`requires_grad`, `grad_fn`, `is_leaf`, `data` -- the papered-over part.
 
     **This is the one group here that is not an implementation.** There is no
     autograd behind this shim (DESIGN.md §3 stage 0), and `from_config` reaches
@@ -4928,6 +4928,37 @@ def _install_autograd_shape(tensorbase) -> None:
         under `requires_grad_`'s own upstream wording.
       * `grad_fn` and `grad` are always `None`, which is the truth -- no graph
         node was ever created and no gradient was ever accumulated.
+      * `is_leaf` is always `True`, and **this one is not the truth** -- it is
+        the one claim in this group that upstream would contradict, so it is
+        the one to know about before extending anything here.
+
+        Upstream does not store `is_leaf`; it *is* `grad_fn is None`, and it is
+        the predicate that separates "a tensor a user made" from "a tensor an
+        op made". `torch/optim/optimizer.py:1153` is the load-bearing reader --
+
+            if not self.defaults.get("differentiable", None) and not (
+                param.is_leaf or param.retains_grad
+            ):
+                raise ValueError("can't optimize a non-leaf Tensor")
+
+        -- so with `True` here, `torch.optim.SGD([x * 2])` is **accepted** and
+        upstream raises. Measured both ways, docs/BACKWARD3.md §1.1, along with
+        the two other guards that key on the same predicate
+        (`requires_grad_` and `setattr` on a non-leaf, which upstream refuses
+        with "you can only change requires_grad flags of leaf variables").
+
+        It is nevertheless the honest report *given* the rest of this group: no
+        op propagates `requires_grad` (docs/BACKWARD2.md §1, W4), so a tensor an
+        op made here really does behave as a constant -- no gradient reaches it,
+        nothing accumulates into it, and `backward()` refuses. `is_leaf` cannot
+        be made to say otherwise without `grad_fn` becoming a node; there is no
+        version of it that is a smaller change, which is docs/BACKWARD3.md §3
+        and the reason W4/W6/W7 did not land as a group.
+
+        Note also that `retains_grad` is *unimplemented* and is unreachable
+        only because Python short-circuits the `or` above. Whatever gives
+        `is_leaf` a second answer has to give `retains_grad` a first one, or
+        upstream's `ValueError` becomes a shim refusal naming the wrong thing.
       * `backward()` stays a raising stub, so code that actually depends on
         the flag meaning something fails by name rather than silently getting
         zeros. That refusal is the *whole* of the boundary now: since
@@ -5034,6 +5065,10 @@ def _install_autograd_shape(tensorbase) -> None:
         self._shim_grad = value
 
     setattr(tensorbase, "grad", property(lambda self: self._shim_grad, _set_grad))
+    # Always `True`. The one claim in this group upstream would contradict, and
+    # the docstring above says which upstream guard reads it and what that
+    # costs -- `test_the_backward_seed_is_absent_and_nothing_guesses_a_one`
+    # pins the consequence so it cannot go stale in prose.
     setattr(tensorbase, "is_leaf", property(lambda self: True))
     # The getter is `self` (docs/TENSORBASE.md records why it is not a detached
     # view). The *setter* is what `nn.Module._apply` needs -- see
