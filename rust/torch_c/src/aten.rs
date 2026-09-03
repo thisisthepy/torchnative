@@ -5725,7 +5725,10 @@ enum Cmp {
 /// tensors (measured, docs/OPS4.md §1). It is a separate key from `le.Scalar`
 /// -- different schema, different overload -- but the same kernel, exactly as
 /// `lt.Tensor`/`lt.Scalar` already are.
-fn compare_common(op: &str, tensor: &Tensor, floating: bool) -> PyResult<Tensor> {
+fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) -> PyResult<Tensor> {
+    if tag == TorchDType::Float8E4M3FN {
+        return Err(not_implemented(format!("{}: float8_e4m3fn", op)));
+    }
     tensor
         .to_dtype(if floating {
             candle_core::DType::F64
@@ -5777,8 +5780,8 @@ fn compare_tensor(
     let tag = promote_operands(op, &lhs, &rhs)?;
     let storage = PyDtype::new(tag).storage(op)?;
     let floating = tag.is_floating_point();
-    let left = compare_common(op, &operand_in(op, lhs.tensor()?, storage)?, floating)?;
-    let right = compare_common(op, &operand_in(op, rhs.tensor()?, storage)?, floating)?;
+    let left = compare_common(op, &operand_in(op, lhs.tensor()?, storage)?, floating, tag)?;
+    let right = compare_common(op, &operand_in(op, rhs.tensor()?, storage)?, floating, tag)?;
     // candle's comparisons yield U8 with 0/1, which is exactly the invariant
     // `boolean()` asserts (BOOL.md §6.3).
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
@@ -5795,7 +5798,7 @@ fn compare_scalar(
     let other =
         scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
     let floating = lhs.tag().is_floating_point() || !other.is_int();
-    let left = compare_common(op, lhs.tensor()?, floating)?;
+    let left = compare_common(op, lhs.tensor()?, floating, lhs.tag())?;
     let right = if floating {
         Tensor::full(other.as_f64(), (), left.device())
     } else {
@@ -10261,6 +10264,9 @@ fn local_scalar_dense(
             .to_vec1::<u8>()
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok((value != 0).into_bound_py_any(py)?.unbind());
+    }
+    if input.tag() == TorchDType::Float8E4M3FN {
+        return Err(not_implemented(format!("{}: float8_e4m3fn", OP)));
     }
     if input.tag().is_floating_point() {
         let value = flat

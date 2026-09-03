@@ -1946,6 +1946,9 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             .collect::<PyResult<Vec<_>>>();
     }
     if dtype.is_float() {
+        if tag == TorchDType::Float8E4M3FN {
+            return Err(not_implemented("tolist on float8_e4m3fn"));
+        }
         let values = flat
             .to_dtype(DType::F64)
             .and_then(|t| t.to_vec1::<f64>())
