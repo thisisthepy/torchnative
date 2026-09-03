@@ -9143,7 +9143,7 @@ def test_core_ops_and_op_tags_agree():
     #
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
-    assert r["tag_core_count"] == 103, r["tag_core_count"]
+    assert r["tag_core_count"] == 105, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10622,7 +10622,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     #
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
-    assert len(keys) == 279, len(keys)
+    assert len(keys) == 283, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

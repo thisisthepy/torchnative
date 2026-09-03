@@ -607,7 +607,7 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json gelu absent -->
 > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json silu absent -->
 > <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json softplus absent -->
-> <!-- DOCWATCH: count golden_pending eq 1 -->
+> <!-- DOCWATCH: count golden_pending eq 0 -->
 
 ---
 

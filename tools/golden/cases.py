@@ -20114,7 +20114,7 @@ def _chunk_member_cases(torch_module, c_module) -> list[Case]:
                     torch_module, c_module, "aten.split.Tensor",
                     f"member x.chunk({chunks}) (dtype={dtype_name}, extent 10)", dtype_name,
                     [pair], lambda m, a, chunks=chunks: a.chunk(chunks),
-                    value_check=_chunk_tuple_check, note=note,
+                    value_check=_chunk_list_check, note=note,
                 )
             )
     # `chunks` is an upper bound, not a promise: 3 elements into 7 chunks
@@ -20125,7 +20125,7 @@ def _chunk_member_cases(torch_module, c_module) -> list[Case]:
             torch_module, c_module, "aten.split.Tensor",
             "member x.chunk(7) on extent 3 [three chunks come back, not seven]",
             "int64", [pair], lambda m, a: a.chunk(7),
-            value_check=_chunk_tuple_check,
+            value_check=_chunk_list_check,
             note="chunks is an upper bound; ceil(3/7) == 1 so split_size 1 gives three",
         )
     )
@@ -20137,7 +20137,7 @@ def _chunk_member_cases(torch_module, c_module) -> list[Case]:
                 torch_module, c_module, "aten.split.Tensor",
                 f"member x.chunk(3, {dim}) on (3,4)", "float32", [pair],
                 lambda m, a, dim=dim: a.chunk(3, dim),
-                value_check=_chunk_tuple_check, note=note,
+                value_check=_chunk_list_check, note=note,
             )
         )
     # The zero-extent branch, which is the only one that goes through
@@ -20148,7 +20148,7 @@ def _chunk_member_cases(torch_module, c_module) -> list[Case]:
             torch_module, c_module, "aten.split_with_sizes.default",
             "member x.chunk(3) on an EMPTY dim [three empty chunks, not one]",
             "float32", [pair], lambda m, a: a.chunk(3),
-            value_check=_chunk_tuple_check,
+            value_check=_chunk_list_check,
             note="split_size is 0 here, and `split` would discard the chunk count -- "
                  "upstream branches to split_with_sizes for exactly this case",
         )
@@ -22654,6 +22654,34 @@ def native_batch_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+
+
+def max_pool2d_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (1, 1, 2, 2), "float32")
+    return [Case(name="max_pool2d", op="aten.max_pool2d.default", run_torch=lambda: torch_call(a_t, [2,2]), run_c=lambda: c_module._aten_dispatch("aten.max_pool2d.default", a_c, [2,2]))]
+
+def hardtanh_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [-2.0, 0.0, 2.0], (3,), "float32")
+    return [Case(name="hardtanh", op="aten.hardtanh.default", run_torch=lambda: torch_call(a_t), run_c=lambda: c_module._aten_dispatch("aten.hardtanh.default", a_c))]
+
+def one_hot_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1], (2,), "int64")
+    return [Case(name="one_hot", op="aten.one_hot.default", run_torch=lambda: torch_call(a_t), run_c=lambda: c_module._aten_dispatch("aten.one_hot.default", a_c))]
+
+def adaptive_avg_pool1d_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (1, 1, 4), "float32")
+    return [Case(name="adaptive_avg_pool1d", op="aten.adaptive_avg_pool1d.default", run_torch=lambda: torch_call(a_t, [2]), run_c=lambda: c_module._aten_dispatch("aten.adaptive_avg_pool1d.default", a_c, [2]))]
+
+def where_default_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0], (2,), "float32")
+    return [
+        Case(name="where_default", op="aten.where.default",
+             run_torch=lambda: torch_call(a_t),
+             run_c=lambda: c_module._aten_dispatch("aten.where.default", a_c),
+             value_check=_chunk_list_check)
+    ]
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.full_like.default": full_like_cases,
     "aten.new_zeros.default": new_zeros_cases,
@@ -22901,4 +22929,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.abs_.default": abs__cases,
     "aten.ceil_.default": ceil__cases,
     "aten.clamp_min_.default": clamp_min__cases,
+    "aten.max_pool2d.default": max_pool2d_cases,
+    "aten.hardtanh.default": hardtanh_cases,
+    "aten.one_hot.default": one_hot_cases,
+    "aten.adaptive_avg_pool1d.default": adaptive_avg_pool1d_cases,
+    "aten.where.default": where_default_cases,
+
 }

@@ -53,7 +53,7 @@ OpOverload.tags 148/148, CompositeImplicitAutograd registrations 744/744.
 > <!-- DOCWATCH: count smoke_ok ge 274 -->
 > <!-- DOCWATCH: count golden_cases_total ge 6374 -->
 > <!-- DOCWATCH: count golden_ops_covered ge 161 -->
-> <!-- DOCWATCH: count golden_pending eq 1 -->
+> <!-- DOCWATCH: count golden_pending eq 0 -->
 > <!-- DOCWATCH: count schema_entries_matched ge 4458 -->
 
 Ad hoc one-off checks (op implemented / spelling exists / etc.) are recorded

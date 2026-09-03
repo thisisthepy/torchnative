@@ -47,6 +47,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
     "aten.abs.default",
+    "aten.adaptive_avg_pool1d.default",
     "aten.abs_.default",
     "aten.add.Scalar",
     "aten.add.Tensor",
@@ -65,6 +66,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start_step",
     "aten.argmax.default",
     "aten.avg_pool2d.default",
+    "aten.max_pool2d.default",
     "aten.baddbmm.default",
     "aten.bernoulli_.float",
     "aten.bitwise_and.Scalar",
@@ -113,6 +115,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.full.default",
     "aten.full_like.default",
     "aten.gather.default",
+    "aten.hardtanh.default",
     "aten.ge.Scalar",
     "aten.ge.Tensor",
     "aten.gelu.default",
@@ -166,6 +169,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.nll_loss_forward.default",
     "aten.norm.ScalarOpt_dim",
     "aten.normal_.default",
+        "aten.reshape.default",
+    "aten.one_hot.default",
     "aten.ones.default",
     "aten.ones_like.default",
     "aten.permute.default",
@@ -225,6 +230,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.view.default",
     "aten.view.dtype",
     "aten.where.ScalarOther",
+    "aten.where.default",
     "aten.where.self",
     "aten.zero_.default",
     "aten.zeros_like.default",
@@ -282,7 +288,6 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
-    "aten.reshape.default",
     "aten.zeros.default",
 ];
 
@@ -1350,6 +1355,7 @@ fn aten_dispatch_inner(
 
         // -- what upstream's `repr(tensor)` dispatches (docs/E2E_REAL.md) ----
         "aten.abs.default" => abs_default(py, args, kwargs),
+        "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
         "aten.gt.Tensor" => compare_tensor(py, args, kwargs, "aten.gt.Tensor", Cmp::Gt),
         "aten.gt.Scalar" => compare_scalar(py, args, kwargs, "aten.gt.Scalar", Cmp::Gt),
@@ -1365,6 +1371,7 @@ fn aten_dispatch_inner(
         "aten.native_group_norm.default" => native_group_norm_default(py, args, kwargs),
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
+        "aten.max_pool2d.default" => max_pool2d_default(py, args, kwargs),
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
         "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
@@ -1451,6 +1458,7 @@ fn aten_dispatch_inner(
 
         "aten.masked_fill.Scalar" => masked_fill(py, args, kwargs, "aten.masked_fill.Scalar"),
         "aten.masked_fill.Tensor" => masked_fill(py, args, kwargs, "aten.masked_fill.Tensor"),
+        "aten.where.default" => where_default(py, args, kwargs),
         "aten.where.self" => where_self(py, args, kwargs),
         "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
 
@@ -1497,6 +1505,7 @@ fn aten_dispatch_inner(
         // -- what widening past the Llama/GPT-2 family asks for (docs/ARCH.md) --
         "aten.gelu.default" => gelu_default(py, args, kwargs),
         "aten.gather.default" => gather_default(py, args, kwargs),
+        "aten.hardtanh.default" => hardtanh_default(py, args, kwargs),
 
         // -- the eight `do_sample=True` stops on (docs/SAMPLING.md) ---------
         "aten._softmax.default" => softmax_default(py, args, kwargs),
@@ -1619,6 +1628,7 @@ fn aten_dispatch_inner(
         "aten.clamp_min_.default" => clamp_min_inplace(py, args, kwargs),
         "aten.detach_.default" => detach_inplace_refusal(py, args, kwargs),
 
+        "aten.one_hot.default" => one_hot_default(py, args, kwargs),
         other => Err(aten_not_implemented(other)),
     }
 }
@@ -18016,4 +18026,420 @@ mod pow_square_tests {
         assert!((f32::NAN * f32::NAN).is_nan());
         assert!((f64::from(f32::NAN)).powf(2.0).is_nan());
     }
+}
+
+fn max_pool2d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.max_pool2d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let kernel = shape_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let stride_raw = match optional(args, kwargs, 2, "stride")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 2, "stride")?,
+        _ => Vec::new(),
+    };
+    let padding = match optional(args, kwargs, 3, "padding")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 3, "padding")?,
+        _ => vec![0],
+    };
+    let dilation = match optional(args, kwargs, 4, "dilation")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 4, "dilation")?,
+        _ => vec![1],
+    };
+    let ceil_mode = bool_arg(args, kwargs, 5, "ceil_mode")?.unwrap_or(false);
+
+    let normalize = |name: &str, s: &[isize], default: &[isize]| -> PyResult<(i64, i64)> {
+        let v = if s.is_empty() { default } else { s };
+        if v.len() == 1 {
+            Ok((v[0] as i64, v[0] as i64))
+        } else if v.len() == 2 {
+            Ok((v[0] as i64, v[1] as i64))
+        } else {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "max_pool2d: {} must either be a single int, or a tuple of two ints",
+                name
+            )))
+        }
+    };
+
+    let (kh, kw) = normalize("kernel_size", &kernel, &[])?;
+    let (sh, sw) = normalize("stride", &stride_raw, &kernel)?;
+    let (ph, pw) = normalize("padding", &padding, &[])?;
+    let (dh, dw) = normalize("dilation", &dilation, &[])?;
+
+    if kh <= 0 || kw <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool2d: kernel_size must be greater than zero",
+        ));
+    }
+    if sh <= 0 || sw <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool2d: stride must be greater than zero",
+        ));
+    }
+    if dh <= 0 || dw <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool2d: dilation must be greater than zero",
+        ));
+    }
+
+    let t = input.tensor()?;
+    let tag = input.tag();
+    let dims = t.dims();
+    if dims.len() != 3 && dims.len() != 4 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool2d: non-empty 3D or 4D (batch mode) tensor expected for input",
+        ));
+    }
+
+    let split = dims.len() - 2;
+    let planes: usize = dims[..split].iter().product();
+    let ih = dims[split] as i64;
+    let iw = dims[split + 1] as i64;
+
+    let extent = |input_size: i64, k: i64, pad: i64, stride: i64, dilation: i64| -> i64 {
+        let numerator = input_size + 2 * pad - dilation * (k - 1) - 1;
+        let mut out = if ceil_mode {
+            numerator.div_euclid(stride) + if numerator.rem_euclid(stride) != 0 { 1 } else { 0 }
+        } else {
+            numerator.div_euclid(stride)
+        } + 1;
+        if ceil_mode && (out - 1) * stride >= input_size + pad {
+            out -= 1;
+        }
+        out
+    };
+    let oh = extent(ih, kh, ph, sh, dh);
+    let ow = extent(iw, kw, pw, sw, dw);
+    if oh <= 0 || ow <= 0 {
+        let c = if split == 1 { dims[0] } else { dims[1] };
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "max_pool2d: Given input size: ({}x{}x{}). Calculated output size: ({}x{}x{}). \
+             Output size is too small",
+            c, ih, iw, c, oh, ow
+        )));
+    }
+
+    let out_dims = if split == 1 {
+        vec![dims[0], oh as usize, ow as usize]
+    } else {
+        vec![dims[0], dims[1], oh as usize, ow as usize]
+    };
+    
+    let source = read_flat(OP, t, tag)?;
+    
+    let acc32 = match tag {
+        TorchDType::Float32 => true,
+        TorchDType::Float64 => false,
+        _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "\"max_pool2d\" not implemented for '{}'",
+            scalar_type_name(tag)
+        ))),
+    };
+
+    let mut out_f = vec![0.0f64; planes * (oh * ow) as usize];
+    for p in 0..planes {
+        let base = p * (ih * iw) as usize;
+        for y in 0..oh {
+            let h_start_raw = y * sh - ph;
+            let h_end_raw = (h_start_raw + dh * kh).min(ih + ph);
+            let h_start = h_start_raw.max(0);
+            let h_end = h_end_raw.min(ih);
+            for x in 0..ow {
+                let w_start_raw = x * sw - pw;
+                let w_end_raw = (w_start_raw + dw * kw).min(iw + pw);
+                let w_start = w_start_raw.max(0);
+                let w_end = w_end_raw.min(iw);
+                let at = p * (oh * ow) as usize + (y * ow + x) as usize;
+                
+                match &source {
+                    Flat::Float(values) => {
+                        if acc32 {
+                            let mut max_val = f32::NEG_INFINITY;
+                            for row_idx in 0..kh {
+                                let row = h_start_raw + row_idx * dh;
+                                if row >= 0 && row < ih {
+                                    let offset = base + (row * iw) as usize;
+                                    for col_idx in 0..kw {
+                                        let col = w_start_raw + col_idx * dw;
+                                        if col >= 0 && col < iw {
+                                            let val = values[offset + col as usize] as f32;
+                                            if val > max_val || max_val.is_nan() {
+                                                max_val = val;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            out_f[at] = max_val as f64;
+                        } else {
+                            let mut max_val = f64::NEG_INFINITY;
+                            for row_idx in 0..kh {
+                                let row = h_start_raw + row_idx * dh;
+                                if row >= 0 && row < ih {
+                                    let offset = base + (row * iw) as usize;
+                                    for col_idx in 0..kw {
+                                        let col = w_start_raw + col_idx * dw;
+                                        if col >= 0 && col < iw {
+                                            let val = values[offset + col as usize];
+                                            if val > max_val || max_val.is_nan() {
+                                                max_val = val;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            out_f[at] = max_val;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    let out_t = if acc32 {
+        let floats: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
+        Tensor::from_vec(floats, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+    } else {
+        Tensor::from_vec(out_f, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+    };
+    
+    let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+    Ok(py_t.into_any())
+}
+
+fn where_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.where.default";
+    let condition = tensor_arg(OP, args, kwargs, 0, "condition")?;
+    let t = condition.tensor()?;
+    
+    let zeros = t.zeros_like().map_err(|e| candle_err(OP, e))?;
+    let mask = t.ne(&zeros).map_err(|e| candle_err(OP, e))?;
+    let mask_u8 = mask.flatten_all().map_err(|e| candle_err(OP, e))?.to_vec1::<u8>().map_err(|e| candle_err(OP, e))?;
+
+    let shape = t.dims();
+    let num_dims = shape.len();
+
+    if num_dims == 0 {
+        let mut vals = Vec::new();
+        if mask_u8[0] != 0 {
+            vals.push(0i64);
+        }
+        let out_t = Tensor::from_vec(vals.clone(), vals.len(), t.device()).map_err(|e| candle_err(OP, e))?;
+        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+        let tuple = PyTuple::new(py, vec![out.into_any()])?;
+        return Ok(tuple.into_any().unbind());
+    }
+
+    let mut indices: Vec<Vec<i64>> = vec![Vec::new(); num_dims];
+    let mut strides = vec![0i64; num_dims];
+    let mut current_stride = 1i64;
+    for i in (0..num_dims).rev() {
+        strides[i] = current_stride;
+        current_stride *= shape[i] as i64;
+    }
+
+    for (flat_idx, &val) in mask_u8.iter().enumerate() {
+        if val != 0 {
+            let mut rem = flat_idx as i64;
+            for i in 0..num_dims {
+                indices[i].push(rem / strides[i]);
+                rem %= strides[i];
+            }
+        }
+    }
+
+    let mut out_tensors = Vec::with_capacity(num_dims);
+    let count = indices[0].len();
+    for i in 0..num_dims {
+        let out_t = Tensor::from_vec(indices[i].clone(), count, t.device()).map_err(|e| candle_err(OP, e))?;
+        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+        out_tensors.push(out.into_any());
+    }
+
+    let tuple = PyTuple::new(py, out_tensors)?;
+    Ok(tuple.into_any().unbind())
+}
+
+fn hardtanh_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.hardtanh.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let min = scalar_arg(OP, args, kwargs, 1, "min_val")?;
+    let max = scalar_arg(OP, args, kwargs, 2, "max_val")?;
+    
+    let min_val = min.unwrap_or(Scalar::Float(-1.0));
+    let max_val = max.unwrap_or(Scalar::Float(1.0));
+
+    let tag = clamp_result_tag(OP, args, kwargs, input.tag(), Some(min_val), Some(max_val))?;
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let source = input
+        .tensor()?
+        .fast_to(storage)
+        .map_err(|e| candle_err(OP, e))?;
+    let out = clamp_values(OP, &source, tag, Some(min_val), Some(max_val))?;
+    finish(py, out, tag)
+}
+
+fn one_hot_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.one_hot.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let num_classes_opt = int_arg(args, kwargs, 1, "num_classes")?;
+    let num_classes = num_classes_opt.unwrap_or(-1);
+    
+    let t = input.tensor()?;
+    if input.tag() != TorchDType::Int64 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "one_hot is only applicable to index tensor of type LongTensor.",
+        ));
+    }
+    
+    let mut actual_num_classes = num_classes as i64;
+    let flat = t.flatten_all().map_err(|e| candle_err(OP, e))?;
+    let data = flat.to_vec1::<i64>().map_err(|e| candle_err(OP, e))?;
+    
+    if actual_num_classes == -1 {
+        if data.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Can not infer total number of classes from empty tensor.",
+            ));
+        }
+        let max_val = *data.iter().max().unwrap();
+        actual_num_classes = max_val + 1;
+    }
+    
+    for &val in &data {
+        if val < 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Class values must be non-negative.",
+            ));
+        }
+        if val >= actual_num_classes {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Class values must be smaller than num_classes.",
+            ));
+        }
+    }
+    
+    let mut out_data = vec![0i64; data.len() * actual_num_classes as usize];
+    for (i, &val) in data.iter().enumerate() {
+        out_data[i * actual_num_classes as usize + val as usize] = 1;
+    }
+    
+    let mut out_dims = t.dims().to_vec();
+    out_dims.push(actual_num_classes as usize);
+    
+    let out_t = Tensor::from_vec(out_data, out_dims, t.device()).map_err(|e| candle_err(OP, e))?;
+    let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+    Ok(py_t.into_any())
+}
+
+fn adaptive_avg_pool1d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.adaptive_avg_pool1d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    
+    let t = input.tensor()?;
+    let tag = input.tag();
+    let dims = t.dims();
+    
+    if dims.len() != 2 && dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "adaptive_avg_pool1d: non-empty 2D or 3D (batch mode) tensor expected for input",
+        ));
+    }
+    
+    if output_size.len() != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "adaptive_avg_pool1d: output_size must be a single int or a tuple of one int",
+        ));
+    }
+    
+    let osize = output_size[0] as i64;
+    let isize = dims[dims.len() - 1] as i64;
+    
+    let split = dims.len() - 1;
+    let planes: usize = dims[..split].iter().product();
+    
+    let mut out_dims = dims.to_vec();
+    out_dims[split] = osize as usize;
+    
+    let source = read_flat(OP, t, tag)?;
+    
+    let acc32 = match tag {
+        TorchDType::Float32 => true,
+        TorchDType::Float64 => false,
+        _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "\"adaptive_avg_pool1d\" not implemented for '{}'",
+            scalar_type_name(tag)
+        ))),
+    };
+
+    let mut out_f = vec![0.0f64; planes * osize as usize];
+    
+    match &source {
+        Flat::Float(values) => {
+            if acc32 {
+                for p in 0..planes {
+                    let base = p * isize as usize;
+                    let out_base = p * osize as usize;
+                    for i in 0..osize {
+                        let start = (i * isize) / osize;
+                        let end = ((i + 1) * isize + osize - 1) / osize;
+                        let mut sum = 0.0f32;
+                        for j in start..end {
+                            sum += values[base + j as usize] as f32;
+                        }
+                        let count = end - start;
+                        out_f[out_base + i as usize] = (sum / count as f32) as f64;
+                    }
+                }
+            } else {
+                for p in 0..planes {
+                    let base = p * isize as usize;
+                    let out_base = p * osize as usize;
+                    for i in 0..osize {
+                        let start = (i * isize) / osize;
+                        let end = ((i + 1) * isize + osize - 1) / osize;
+                        let mut sum = 0.0f64;
+                        for j in start..end {
+                            sum += values[base + j as usize];
+                        }
+                        let count = end - start;
+                        out_f[out_base + i as usize] = sum / count as f64;
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    
+    let out_t = if acc32 {
+        let floats: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
+        Tensor::from_vec(floats, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+    } else {
+        Tensor::from_vec(out_f, out_dims, t.device()).map_err(|e| candle_err(OP, e))?
+    };
+    
+    let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+    Ok(py_t.into_any())
 }

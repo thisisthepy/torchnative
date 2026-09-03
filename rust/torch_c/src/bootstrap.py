@@ -6711,6 +6711,16 @@ def _install_nn(module, dispatch) -> None:
             scale=scale,
         )[0]
 
+
+    def hardtanh(input, min_val=-1.0, max_val=1.0):
+        return dispatch("aten.hardtanh.default", input, min_val, max_val)
+
+
+
+    def one_hot(tensor, num_classes=-1):
+        return dispatch("aten.one_hot.default", tensor, num_classes)
+
+
     def pad(input, pad, mode="constant", value=None):
         """`torch._C._nn.pad`, which `F.pad` calls after its own dispatch.
 
@@ -6952,6 +6962,8 @@ def _install_nn(module, dispatch) -> None:
         (softplus, "softplus"),
         (upsample_bilinear2d, "upsample_bilinear2d"),
         (leaky_relu, "leaky_relu"),
+        (hardtanh, "hardtanh"),
+        (one_hot, "one_hot"),
         (nll_loss, "nll_loss"),
         (nll_loss_nd, "nll_loss_nd"),
         (cross_entropy_loss, "cross_entropy_loss"),
@@ -6963,8 +6975,8 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "cross_entropy_loss", "gelu", "leaky_relu", "linear", "nll_loss",
-        "nll_loss_nd", "pad", "scaled_dot_product_attention", "silu",
+        "cross_entropy_loss", "gelu", "hardtanh", "leaky_relu", "linear", "nll_loss",
+        "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bilinear2d",
     ]
 
