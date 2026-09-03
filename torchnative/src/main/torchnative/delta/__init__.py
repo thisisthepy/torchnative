@@ -222,6 +222,29 @@ class Delta:
         self.value = None
         return self
 
+    def re_snapshot(self, model):
+        """Replace the base with a copy of the current live weights and zero the value.
+
+        After this call, ``delta()`` measures movement from the new base.  This
+        is what multi-round federated learning needs: after round *k* installs
+        the aggregate, round *k+1*'s delta must reflect only the new local
+        training, not cumulative movement from round 1.
+
+        Without this, ``online()`` puts the wrapper back into training mode but
+        does **not** take a new snapshot -- the base remains the one captured at
+        construction -- so every later round would re-send round 1's movement
+        and the model would diverge by compounding.
+
+        The optimiser state is **not** reset.  Momentum / variance from the
+        previous round carry into the next.  Whether that matters depends on the
+        optimiser and the task; it is named here rather than silently decided
+        either way (DESIGN.md §6).
+        """
+        params = dict(model.named_parameters())
+        self.base = {n: params[n].detach().clone() for n in self.base}
+        self.value = None
+        return self
+
     # -- persistence -------------------------------------------------------
     #
     # `torch.save` is **not** what this uses, and that is a finding rather than

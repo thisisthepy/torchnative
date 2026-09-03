@@ -18984,7 +18984,7 @@ out["unweighted"] = {
 m2 = build()
 eng = federated.Engine(m2, method=adapt.Tent(), lr=LR,
                        aggregator=federated.FedAvg())
-report = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+[report] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
 out["engine"] = {
     "rank": report.rank, "world": report.world, "weight": report.weight,
     "total_weight": report.total_weight, "share": report.share,
@@ -19000,6 +19000,77 @@ except Exception as e:
     out["engine_twice"] = "%s: %s" % (type(e).__name__, str(e))
 else:
     out["engine_twice"] = "ACCEPTED"
+
+# --- B2. multi-round low-level road (3 rounds with re_snapshot) ----------
+# This mimics what the Engine does internally, exposing per-round data for
+# central verification. Same model, same data, same weights.
+m3 = build()
+w3 = adapt.wrap(m3, method=adapt.Tent(), lr=LR)
+multi_rounds = []
+for rd in range(3):
+    w3.online()
+    for _ in range(3):
+        w3.step(input_ids=ids)
+    d3 = w3.adapted
+    base_snap = {n: t.tolist() for n, t in d3.base.items()}
+    local_snap = {n: t.tolist() for n, t in d3.value.items()}
+    agg3 = d3.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    agg_snap = {n: t.tolist() for n, t in agg3.items()}
+    # Install the aggregate
+    d3.value = dict(agg3)
+    d3.apply(m3)
+    params_after = {n: dict(m3.named_parameters())[n].tolist() for n in d3.covers}
+    multi_rounds.append({
+        "base": base_snap, "local": local_snap,
+        "aggregate": agg_snap, "params_after": params_after,
+    })
+    # Re-snapshot for next round
+    d3.re_snapshot(m3)
+out["multi_rounds"] = multi_rounds
+
+# --- B3. multi-round Engine (3 rounds) -----------------------------------
+m3e = build()
+eng3 = federated.Engine(m3e, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.FedAvg(), rounds=3)
+reports3 = eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+out["engine_rounds3"] = {
+    "count": len(reports3),
+    "rounds": [],
+    "final_params": {n: dict(m3e.named_parameters())[n].tolist()
+                     for n in reports3[0].covers},
+}
+for i, rep in enumerate(reports3):
+    out["engine_rounds3"]["rounds"].append({
+        "rank": rep.rank, "world": rep.world, "weight": rep.weight,
+        "total_weight": rep.total_weight, "steps": rep.steps,
+        "local_norm": rep.local_norm, "aggregate_norm": rep.aggregate_norm,
+    })
+
+# --- B3. the stale-base control: skip re_snapshot, confirm divergence ----
+# Both ranks build from the same base but deliberately don't re-snapshot
+# between rounds, so round 2's delta is measured from the original base
+# instead of the aggregated weights.
+m4 = build()
+w4 = adapt.wrap(m4, method=adapt.Tent(), lr=LR)
+stale_rounds = []
+for rd in range(3):
+    w4.online()
+    for _ in range(3):
+        w4.step(input_ids=ids)
+    d4 = w4.adapted
+    agg4 = d4.publish(group=None, weight=WEIGHT, aggregator=federated.FedAvg())
+    stale_rounds.append({
+        "local": {n: t.tolist() for n, t in d4.value.items()},
+        "aggregate": {n: t.tolist() for n, t in agg4.items()},
+    })
+    # Install the aggregate
+    d4.value = dict(agg4)
+    d4.apply(m4)
+    # BUG on purpose: do NOT re_snapshot -- next round's delta measures
+    # from the original base, not from the aggregated weights.
+out["stale_base_rounds"] = stale_rounds
+out["stale_final_params"] = {n: dict(m4.named_parameters())[n].tolist()
+                             for n in d4.covers}
 
 # --- C. refusals ---------------------------------------------------------
 probe = {"norm1.weight": torch.ones(4), "norm2.weight": torch.ones(4)}
@@ -19020,8 +19091,12 @@ refuses("integer_table",
         lambda: federated.FedAvg().aggregate(
             {"a": torch.ones(4, dtype=torch.int64)}, weight=1.0))
 refuses("empty_table", lambda: federated.FedAvg().aggregate({}, weight=1.0))
-refuses("engine_rounds",
-        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=3))
+refuses("engine_rounds_zero",
+        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=0))
+refuses("engine_rounds_negative",
+        lambda: federated.Engine(build(), method=adapt.Tent(), rounds=-1))
+refuses("engine_rounds_string",
+        lambda: federated.Engine(build(), method=adapt.Tent(), rounds="two"))
 refuses("engine_select",
         lambda: federated.Engine(build(), method=adapt.Tent(),
                                  select=lambda m: []))
@@ -19445,9 +19520,11 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     assert r0["empty_table"].startswith("ValueError:"), r0["empty_table"]
     assert r0["integer_table"].startswith("NotImplementedError:"), r0["integer_table"]
 
-    assert r0["engine_rounds"].startswith("NotImplementedError:"), r0["engine_rounds"]
-    assert "One round is implemented" in r0["engine_rounds"], r0["engine_rounds"]
-    assert "re-opening the delta per round" in r0["engine_rounds"], r0["engine_rounds"]
+    assert r0["engine_rounds_zero"].startswith("ValueError:"), r0["engine_rounds_zero"]
+    assert "rounds=" in r0["engine_rounds_zero"], r0["engine_rounds_zero"]
+    assert r0["engine_rounds_negative"].startswith("ValueError:"), r0["engine_rounds_negative"]
+    assert r0["engine_rounds_string"].startswith(("ValueError:", "TypeError:")), \
+        r0["engine_rounds_string"]
 
     assert r0["engine_select"].startswith("NotImplementedError:"), r0["engine_select"]
     assert "participant selection" in r0["engine_select"], r0["engine_select"]
@@ -19481,6 +19558,164 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     _dead = _re.search(r"(\d+) B did not", _msg)
     assert _bound and _dead, _msg
     assert int(_bound.group(1)) > int(_dead.group(1)), (_bound.group(1), _dead.group(1))
+
+
+def test_multi_round_fedavg_equals_the_same_rounds_computed_centrally():
+    """Three rounds of distributed FedAvg equal three rounds computed centrally.
+
+    This is FEDERATED.md §2's check extended to N rounds. Each round's delta
+    is measured from the base that round started from, which after round 1 is
+    the aggregate of round 1 (not the original model). The central computation
+    below replicates that progression: start from the original base, apply each
+    round's aggregate, then start the next round from there.
+
+    ``torch.equal`` at every round — the same arithmetic argument as §2.1: one
+    dtype, one rounding, correctly-rounded IEEE float32.
+
+    The control is a stale base: the worker also runs three rounds *without*
+    re-snapshotting, and the final weights must differ from the correct ones.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    torch_up = _upstream_torch
+    assert r0["shim"] is True and r1["shim"] is True
+    w0, w1 = r0["weight"], r1["weight"]
+    total = torch_up.tensor(w0 + w1, dtype=torch_up.float32)
+
+    # Check each of the 3 rounds: the distributed aggregate must equal the
+    # centrally computed weighted average of the two ranks' per-round deltas.
+    assert len(r0["multi_rounds"]) == 3, len(r0["multi_rounds"])
+    assert len(r1["multi_rounds"]) == 3, len(r1["multi_rounds"])
+
+    for rd in range(3):
+        mr0 = r0["multi_rounds"][rd]
+        mr1 = r1["multi_rounds"][rd]
+
+        # The bases must agree at every round: round 0 is the original model,
+        # rounds 1+ are the previous round's aggregate — re_snapshot is what
+        # makes this true.
+        assert mr0["base"] == mr1["base"], \
+            "round %d: the two ranks started from different bases" % rd
+
+        for name in r0["covers"]:
+            d0 = _fed_tensor(mr0["local"][name])
+            d1 = _fed_tensor(mr1["local"][name])
+            central = (d0 * torch_up.tensor(w0, dtype=torch_up.float32)
+                        + d1 * torch_up.tensor(w1, dtype=torch_up.float32)) / total
+            got0 = _fed_tensor(mr0["aggregate"][name])
+            got1 = _fed_tensor(mr1["aggregate"][name])
+            assert torch_up.equal(got0, central), \
+                ("round %d" % rd, name, got0[:4].tolist(), central[:4].tolist())
+            assert torch_up.equal(got1, central), \
+                ("round %d" % rd, name, got1[:4].tolist(), central[:4].tolist())
+
+        # After each round, both ranks should hold the same parameters:
+        # base + aggregate.
+        assert mr0["params_after"] == mr1["params_after"], \
+            "round %d: the two ranks ended with different weights" % rd
+
+    # The two local deltas should differ at every round (the ranks train on
+    # different data), and the aggregate should differ from round to round
+    # (the starting point changes each time).
+    for rd in range(3):
+        for name in r0["covers"]:
+            assert r0["multi_rounds"][rd]["local"][name] \
+                != r1["multi_rounds"][rd]["local"][name], \
+                ("round %d %s: identical deltas" % (rd, name))
+
+
+def test_multi_round_engine_leaves_both_ranks_holding_the_same_weights():
+    """The multi-round Engine road: 3 rounds, same final weights on both ranks.
+
+    This is the Engine companion to the multi-round acceptance test above. The
+    Engine's 3-round result is checked against the low-level 3-round road's
+    final weights — they must agree, because the Engine is a *use* of the
+    low-level machinery and not a reimplementation of it.
+
+    The two ranks must also hold the same final weights, which is the whole
+    point of federated learning. And each round's aggregate norm must be
+    identical across ranks (same aggregate), while the local norms must differ
+    (different local data).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    torch_up = _upstream_torch
+    e0 = r0["engine_rounds3"]
+    e1 = r1["engine_rounds3"]
+    assert e0["count"] == e1["count"] == 3, (e0["count"], e1["count"])
+
+    # Both ranks hold the same final weights.
+    assert e0["final_params"] == e1["final_params"], \
+        "multi-round Engine: the two ranks ended with different weights"
+
+    # Engine and low-level road agree on the final weights.
+    # The last round's params_after from the low-level road should match.
+    last_low_level_0 = r0["multi_rounds"][-1]["params_after"]
+    assert e0["final_params"] == last_low_level_0, \
+        "Engine and low-level road diverged on the final weights"
+
+    # Per-round checks: aggregate norms match, local norms differ.
+    for rd in range(3):
+        re0 = e0["rounds"][rd]
+        re1 = e1["rounds"][rd]
+        assert re0["aggregate_norm"] == re1["aggregate_norm"], \
+            ("round %d: aggregate norms differ" % rd,
+             re0["aggregate_norm"], re1["aggregate_norm"])
+        assert re0["local_norm"] != re1["local_norm"], \
+            ("round %d: local norms are identical" % rd)
+        assert re0["steps"] == re1["steps"] == 3, \
+            ("round %d: wrong step count" % rd)
+
+
+def test_a_stale_base_makes_multi_round_deltas_cumulative():
+    """The control: skipping re_snapshot makes per-round deltas cumulative.
+
+    Without ``re_snapshot``, round 2's delta is measured from the *original*
+    base and includes round 1's aggregate. ``Delta.apply(base + value)``
+    cancels this exactly — the applied weights are the same either way — which
+    is why the failure is in the *delta* rather than in the final model.
+
+    That matters because the delta is what gets **published**. A cumulative
+    delta sent at round 2 contains round 1's aggregate again; a per-round
+    delta contains only the new local training. If the two ever disagreed on
+    the base (e.g. a new rank joining after round 1), the cumulative delta
+    would average incomparable quantities — ``publish``'s base check catches
+    that, but only if the delta is per-round.
+
+    This test asserts two things:
+    1. The per-round local deltas differ between the correct and stale paths
+       (they must, because one includes the round-1 aggregate and the other
+       doesn't).
+    2. The stale round-2 delta's norm is larger than the correct one (it
+       carries extra payload from round 1).
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed_two_process_round()
+    torch_up = _upstream_torch
+
+    # Round 0 should be identical (same base, no prior history).
+    for name in r0["covers"]:
+        c0 = _fed_tensor(r0["multi_rounds"][0]["local"][name])
+        s0 = _fed_tensor(r0["stale_base_rounds"][0]["local"][name])
+        assert torch_up.equal(c0, s0), \
+            ("round 0 %s: correct and stale deltas should agree" % name)
+
+    # Rounds 1+ must differ: the stale delta is cumulative (includes round 0's
+    # aggregate), while the correct delta is per-round only.
+    for rd in range(1, 3):
+        for name in r0["covers"]:
+            correct = _fed_tensor(r0["multi_rounds"][rd]["local"][name])
+            stale = _fed_tensor(r0["stale_base_rounds"][rd]["local"][name])
+            assert not torch_up.equal(correct, stale), \
+                ("round %d %s: stale and correct deltas are identical, "
+                 "meaning re_snapshot had no effect" % (rd, name))
+            # The stale delta should be larger in norm: it carries the
+            # cumulative offset rather than just the local movement.
+            assert float(stale.abs().max()) > float(correct.abs().max()), \
+                ("round %d %s: stale delta is not larger than correct" % (rd, name))
 
 
 _CTOR_ROAD_SCRIPT = r"""

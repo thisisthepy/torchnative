@@ -423,11 +423,11 @@ class Round:
 
 
 class Engine:
-    """One federated round: adapt locally, contribute a delta, take the average.
+    """Federated averaging engine: N rounds of adapt, aggregate, re-snapshot.
 
         engine = federated.Engine(model, method=adapt.Tent(), lr=1e-3,
-                                  aggregator=federated.FedAvg())
-        report = engine.participate(batches, weight=len(local_dataset))
+                                  aggregator=federated.FedAvg(), rounds=3)
+        reports = engine.participate(batches, weight=len(local_dataset))
 
     The local half is ``torchnative.adapt`` unchanged -- ``wrap`` a method
     round the model, go ``online``, take a step per batch -- so the delta this
@@ -441,8 +441,18 @@ class Engine:
     arguments would have to invent either the batches or the sample count, and
     both change the result. The rest of the sketch stands.
 
-    **This is one round.** ``rounds`` exists so that asking for more is refused
-    with the reason rather than silently accepted -- see :meth:`__init__`.
+    **Rounds > 1.** Each round adapts locally, publishes the delta, and
+    installs ``base + aggregate`` into the model. Before the next round, the
+    delta's base is **re-snapshotted** to the current (aggregated) weights, so
+    that round *k+1*'s delta measures only the new local training, not
+    cumulative movement from round 1. Without this, ``online()`` leaves the
+    base at the value captured at construction, and every later round would
+    re-send round 1's offset -- the model diverges by compounding.
+
+    **Optimiser state.** The optimiser is **not** reset between rounds.
+    Momentum and variance from the previous round carry into the next.
+    Whether that matters depends on the optimiser and the task; it is named
+    here rather than silently decided (DESIGN.md §6).
     """
 
     def __init__(self, model, method=None, aggregator=None, rounds=1,
@@ -478,20 +488,10 @@ class Engine:
                 "partial average. What is missing is a *policy*, not a "
                 "mechanism to notice."
             )
-        if rounds != 1:
-            raise NotImplementedError(
-                "torchnative.nn.federated.Engine: rounds=%r. One round is "
-                "implemented.\n"
-                "Round two is not a loop around round one: the delta each rank "
-                "contributes has to be opened over the *aggregated* weights, "
-                "and Adapted.online() deliberately never re-snapshots its base "
-                "-- so every later round would measure from the original model "
-                "and contribute the accumulated offset again. The check that "
-                "would make a second round provable is already here "
-                "(Delta.publish verifies the ranks share a base); what is "
-                "missing is re-opening the delta per round, and a test that "
-                "the two ranks stay bit-identical across the boundary."
-                % (rounds,)
+        if not isinstance(rounds, int) or rounds < 1:
+            raise ValueError(
+                "torchnative.nn.federated.Engine: rounds=%r. Must be a "
+                "positive integer." % (rounds,)
             )
         from torchnative import adapt
 
@@ -509,22 +509,27 @@ class Engine:
             type(self.method).__name__, self.aggregator, self.rounds)
 
     def participate(self, batches, weight=None, epochs=1):
-        """Run the local epochs, contribute the delta, take the average.
+        """Run ``self.rounds`` federated rounds over the same local data.
+
+        Each round: adapt locally (``epochs`` passes over ``batches``),
+        publish the delta, install ``base + aggregate``, re-snapshot.  The
+        model ends holding the weights from the *last* round's aggregate.
 
         ``batches`` is an iterable of what the model is called with: a mapping
         goes as keyword arguments, a tuple as positional, anything else as one
-        positional argument. One adaptation step per batch, ``epochs`` passes.
+        positional argument. One adaptation step per batch per epoch.
 
-        Returns a :class:`Round`. The model is left holding
-        ``base + aggregate`` -- the *averaged* update, not this rank's -- which
-        is the point, and is also why the two ranks end bit-identical.
+        Returns a **list** of :class:`Round` objects, one per round.  For
+        backwards compatibility with code that expected a single ``Round``,
+        ``rounds=1`` still returns a list of length 1 -- callers that used
+        ``report = engine.participate(...)`` should use
+        ``[report] = engine.participate(...)`` or ``reports[-1]``.
         """
         if self._participated:
             raise RuntimeError(
-                "torchnative.nn.federated.Engine.participate: called twice, and "
-                "this engine is one round (see rounds= in __init__). A second "
-                "call would open no new delta and would contribute this rank's "
-                "first-round offset again"
+                "torchnative.nn.federated.Engine.participate: called twice. "
+                "A second call would open no new delta and would contribute "
+                "this rank's previous offset again"
             )
         batches = list(batches)
         if not batches:
@@ -552,34 +557,42 @@ class Engine:
                     if hasattr(self.aggregator, "resolve_weight")
                     else (1.0 if weight is None else float(weight)))
 
-        self.adapted.online()
-        steps = 0
-        for _ in range(epochs):
-            for batch in batches:
-                if isinstance(batch, dict):
-                    self.adapted.step(**batch)
-                elif isinstance(batch, tuple):
-                    self.adapted.step(*batch)
-                else:
-                    self.adapted.step(batch)
-                steps += 1
+        reports = []
+        for round_idx in range(self.rounds):
+            self.adapted.online()
+            steps = 0
+            for _ in range(epochs):
+                for batch in batches:
+                    if isinstance(batch, dict):
+                        self.adapted.step(**batch)
+                    elif isinstance(batch, tuple):
+                        self.adapted.step(*batch)
+                    else:
+                        self.adapted.step(batch)
+                    steps += 1
 
-        delta = self.adapted.adapted
-        local_norm = delta.norm()
-        table = delta.publish(group=self.group, weight=weight,
-                              aggregator=self.aggregator)
-        total = _total_weight(resolved, self.group)
+            delta = self.adapted.adapted
+            local_norm = delta.norm()
+            table = delta.publish(group=self.group, weight=weight,
+                                  aggregator=self.aggregator)
+            total = _total_weight(resolved, self.group)
 
-        # The model keeps the base it started the round from and takes the
-        # aggregate on top of it. `Delta.apply` is what writes `base + value`,
-        # so the averaged offset is installed through the existing path rather
-        # than through a second one that could disagree with it.
-        delta.value = dict(table)
-        delta.apply(self.model)
+            # Install the aggregate: base + aggregated_delta.
+            delta.value = dict(table)
+            delta.apply(self.model)
+
+            reports.append(Round(
+                rank=rank, world=world, weight=resolved, total_weight=total,
+                steps=steps, history=self.adapted.history, covers=delta.covers,
+                local_norm=local_norm, aggregate_norm=delta.norm(),
+            ))
+
+            # Re-snapshot: the next round's delta must be measured against the
+            # aggregated weights, not against the original base. Without this,
+            # round k+1 re-sends round 1's movement and the model diverges.
+            if round_idx < self.rounds - 1:
+                delta.re_snapshot(self.model)
+
         self._participated = True
+        return reports
 
-        return Round(
-            rank=rank, world=world, weight=resolved, total_weight=total,
-            steps=steps, history=self.adapted.history, covers=delta.covers,
-            local_norm=local_norm, aggregate_norm=delta.norm(),
-        )
