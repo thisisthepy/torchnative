@@ -115,6 +115,16 @@ _FULL_FILLS: dict[str, list[tuple[Any, str, str]]] = {
         (1e5, "match", ""),
         (-1e5, "match", ""),
     ],
+    # float8_e4m3fn: 4 exponent bits, 3 mantissa bits, no infinities. Max
+    # finite is 448.0 and every value here is exactly representable, so a
+    # rounding disagreement between the two sides shows up as a value
+    # difference rather than as tolerance slack. docs/FLOAT8B.md §5.
+    "float8_e4m3fn": [
+        (0.0, "match", ""),
+        (-1.0, "match", ""),
+        (2.0, "match", ""),
+        (448.0, "match", "max finite float8_e4m3fn"),
+    ],
     "int64": [
         (0, "match", ""),
         (-1234567890123, "match", ""),
@@ -8019,13 +8029,29 @@ def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
             if expect != "match":
                 continue
             a_t, a_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
+            # `float8_e4m3fn` is a known gap rather than a match: every
+            # in-place writer refuses this dtype because `tensor.rs`'s
+            # `flat_storage` cannot read F8E4M3 back out to write through it
+            # (docs/FLOAT8B.md §4.2). Upstream fills it. Recorded as
+            # `expect="c_error"` so the harness keeps saying so every run and
+            # **fails if the gap silently closes** -- which is what the
+            # vocabulary is for; it is not a way to stop looking.
+            f8_gap = dtype_name == "float8_e4m3fn"
             cases.append(
                 Case(
                     name=f"fill_(dtype={dtype_name}, value={fill!r})",
                     op=op,
                     run_torch=lambda a_t=a_t, fill=fill: torch_call(a_t, fill),
                     run_c=lambda a_c=a_c, fill=fill: c_module._aten_dispatch(op, a_c, fill),
-                    note=(note or "in-place fill") + " -- compares the mutated operand fill_ returns",
+                    expect="c_error" if f8_gap else "match",
+                    note=(
+                        "torch._C shim cannot write through a view of candle dtype "
+                        "F8E4M3 (tensor.rs::flat_storage); upstream fills it. "
+                        "docs/FLOAT8B.md §4.2"
+                        if f8_gap
+                        else (note or "in-place fill")
+                        + " -- compares the mutated operand fill_ returns"
+                    ),
                 )
             )
     cases.extend(
@@ -10801,7 +10827,18 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                     _pair(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)[1],
                     _pair(torch_module, c_module, [3], (), dtype_name)[1],
                 ),
-                note="in-place: compares the mutated operand fill_ returns",
+                # `float8_e4m3fn`: one of the ten ops upstream computes and this
+                # build cannot, because candle 0.11.0's `F8E4M3 -> f64`
+                # conversion does not terminate (docs/FLOAT8B.md §4.1). Refusing
+                # is the only safe answer here today; `expect="c_error"` records
+                # that and **fails if it silently starts computing**.
+                expect="c_error" if dtype_name == "float8_e4m3fn" else "match",
+                note=(
+                    "candle's F8E4M3 -> f64 conversion does not terminate, so "
+                    "the shim refuses; upstream fills it. docs/FLOAT8B.md §4.1"
+                    if dtype_name == "float8_e4m3fn"
+                    else "in-place: compares the mutated operand fill_ returns"
+                ),
             )
         )
     cases.append(
@@ -12678,7 +12715,17 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
-                note="in-place: compares the mutated operand zero_ returns",
+                # Same known gap as `fill_.Scalar`: no in-place writer can reach
+                # an F8E4M3 buffer, because `tensor.rs`'s `flat_storage` cannot
+                # read that dtype back out. docs/FLOAT8B.md §4.2.
+                expect="c_error" if dtype_name == "float8_e4m3fn" else "match",
+                note=(
+                    "torch._C shim cannot write through a view of candle dtype "
+                    "F8E4M3 (tensor.rs::flat_storage); upstream zeroes it. "
+                    "docs/FLOAT8B.md §4.2"
+                    if dtype_name == "float8_e4m3fn"
+                    else "in-place: compares the mutated operand zero_ returns"
+                ),
             )
         )
     cases.append(

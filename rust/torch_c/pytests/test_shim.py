@@ -20527,5 +20527,163 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
     )
 
 
+
+
+# --- `float8_e4m3fn` refuses exactly what upstream refuses (docs/FLOAT8B.md) --
+#
+# docs/FLOAT8.md closed three hangs and then recorded, from an eleven-op probe,
+# that seven ops answered where upstream declined. Enumerating all 197 ops found
+# 114 -- 48 computing, 27 hanging, 39 refusing in words of their own. What makes
+# that class dangerous is not the count: it is that **nothing can check an answer
+# upstream refuses to produce**. There is no oracle for it.
+#
+# These rows are the closure, and they are written against upstream's exact text
+# because the text is the contract. `docs/PROMOTE.md`'s last section is there
+# because a refusal once landed as `RuntimeError` carrying `NotImplementedError`'s
+# message, and a caller writing `except NotImplementedError` would have missed it,
+# so the exception *type* is asserted on every row too.
+
+# (op, kernel name upstream puts in the message). A sample of the 114, chosen so
+# that every distinct *shape* of upstream wording is represented: the shared
+# kernels (`add`/`sub`/`rsub` -> `add_stub`, `mean`/`sum` -> `sum_cpu`), the
+# near-miss pair (`relu` -> `clamp_min_scalar_cpu` vs `hardtanh` ->
+# `clamp_scalar_cpu`), a CamelCase one, an in-place one, and the seven
+# docs/FLOAT8.md named.
+_FLOAT8_TRANSCRIBED = [
+    ("aten.add.Tensor", "add_stub"),
+    ("aten.add.Scalar", "add_stub"),
+    ("aten.sub.Tensor", "add_stub"),
+    ("aten.rsub.Scalar", "add_stub"),
+    ("aten.div.Tensor", "div_cpu"),
+    ("aten.div.Scalar_mode", "div_cpu_reduced_float"),
+    ("aten.neg.default", "neg_cpu"),
+    ("aten.exp.default", "exp_vml_cpu"),
+    ("aten.sum.default", "sum_cpu"),
+    ("aten.mean.default", "sum_cpu"),
+    ("aten.relu.default", "clamp_min_scalar_cpu"),
+    ("aten.hardtanh.default", "clamp_scalar_cpu"),
+    ("aten.gelu.default", "GeluKernelImpl"),
+    ("aten.native_layer_norm.default", "LayerNormKernelImpl"),
+    ("aten.sigmoid.default", "sigmoid_cpu_reduced_float"),
+    ("aten.tril.default", "tril"),
+    ("aten.exp_.default", "exp_vml_cpu"),
+    ("aten.gt.Tensor", "gt_cpu"),
+    ("aten.sort.default", "sorting_kernel_method_name"),
+    ("aten.topk.default", "topk_cpu"),
+]
+
+
+def _f8(values=(1.0, 2.0), shape=(2,)):
+    return _C._tensor_from_flat(list(values), list(shape), _C.float8_e4m3fn)
+
+
+def _f8_refusal(op, *args, **kwargs):
+    try:
+        _C._aten_dispatch(op, *args, **kwargs)
+    except Exception as e:  # noqa: BLE001 - the type is the assertion
+        return type(e), str(e)
+    return None, "NO-RAISE"
+
+
+def test_float8_transcribes_upstreams_wording_per_op_not_a_house_string():
+    for op, kernel in _FLOAT8_TRANSCRIBED:
+        exc, message = _f8_refusal(op, _f8(), _f8())
+        want = "\"%s\" not implemented for 'Float8_e4m3fn'" % kernel
+        # Exception TYPE, not just text. See the module note above.
+        assert exc is NotImplementedError, (op, exc, message)
+        assert message == want, (op, message, want)
+    # The near-miss pair is the point of transcribing rather than unifying: two
+    # ops that look like one rule and are not.
+    assert dict(_FLOAT8_TRANSCRIBED)["aten.relu.default"] != \
+        dict(_FLOAT8_TRANSCRIBED)["aten.hardtanh.default"]
+
+
+def test_float8_refuses_every_op_on_the_table_and_the_table_is_not_a_sample():
+    """The whole table, not the sample above.
+
+    docs/FLOAT8.md's finding came from eleven ops and undercounted by an order of
+    magnitude. This row exists so that a *count* is asserted rather than a
+    handful: if the gate is removed, or an op is dropped from the table, the
+    number moves.
+    """
+    covered = 0
+    for op in _C._aten_implemented():
+        exc, message = _f8_refusal(op, _f8(), _f8())
+        if exc is NotImplementedError and message.endswith(
+            "not implemented for 'Float8_e4m3fn'"
+        ):
+            covered += 1
+    # `>=`, not `==`: this counts what the shim refuses through one calling
+    # shape, so a future op that joins the table only raises it.
+    assert covered >= 100, covered
+
+
+def test_float8_still_computes_everything_upstream_computes():
+    """The other direction, and the one that would make this round a net loss.
+
+    docs/BACKWARD2.md and docs/PROMOTE.md both closed a divergence and this
+    project has twice re-opened one in the opposite direction while doing it.
+    `mul`, `abs`, `clone` and `cat` are ops upstream ships for this dtype.
+    """
+    t = _f8()
+    got = _C._aten_dispatch("aten.mul.Tensor", t, t)
+    assert str(got.dtype) == "torch.float8_e4m3fn", got.dtype
+    # 1*1 and 2*2, both exactly representable in e4m3, so this is a value check
+    # and not just a dtype one. `.tolist()` is refused for this dtype
+    # (docs/FLOAT8.md), so it is read through the lossless widening to float32.
+    widened = _C._aten_dispatch("aten._to_copy.default", got, dtype=_C.float32)
+    assert widened.tolist() == [1.0, 4.0], widened.tolist()
+    for op in ("aten.abs.default", "aten.clone.default"):
+        out = _C._aten_dispatch(op, t)
+        assert str(out.dtype) == "torch.float8_e4m3fn", (op, out.dtype)
+    stacked = _C._aten_dispatch("aten.cat.default", [t, t])
+    assert list(stacked.shape) == [4], stacked.shape
+
+
+def test_float8_matmul_refuses_the_shape_upstream_refuses_and_only_that_shape():
+    """`aten.matmul.default` is the one refusal that is **not** op-level.
+
+    Upstream returns a float8 answer for 2-D x 2-D and falls through to `dot`
+    only for 1-D x 1-D. A gate keyed on the op would refuse a call upstream
+    answers, which is the mistake this whole document is about, pointed the
+    other way.
+    """
+    exc, message = _f8_refusal("aten.matmul.default", _f8(), _f8())
+    assert exc is NotImplementedError, (exc, message)
+    assert message == "\"dot\" not implemented for 'Float8_e4m3fn'", message
+
+    square = _f8([1.0, 2.0, 3.0, 4.0], [2, 2])
+    exc2, message2 = _f8_refusal("aten.matmul.default", square, square)
+    # Not the `dot` refusal: whatever this build does with a 2-D float8 matmul,
+    # it must not claim upstream refused it, because upstream computes it.
+    assert "\"dot\" not implemented" not in message2, message2
+
+
+def test_float8_gate_does_not_fire_on_a_mixed_dtype_call():
+    """Upstream refuses `add(float8, float32)` **before** looking up a kernel,
+    with a `RuntimeError` about promotion -- a different rule and a different
+    exception type (docs/FLOAT8B.md §2.1). Answering it with the kernel message
+    would be a new divergence in exception type."""
+    f32 = _C._tensor_from_flat([1.0, 2.0], [2], _C.float32)
+    exc, message = _f8_refusal("aten.add.Tensor", _f8(), f32)
+    assert "\"add_stub\" not implemented" not in message, message
+
+
+def test_float8_shim_only_refusals_do_not_borrow_upstreams_wording():
+    """The ten ops upstream computes and this build cannot (docs/FLOAT8B.md
+    §4.1). They refuse -- a hang is not an acceptable answer -- but claiming
+    `"pow" not implemented for 'Float8_e4m3fn'` for `aten.pow.Scalar` would be a
+    lie, because upstream implements it."""
+    for op, args in (
+        ("aten.all.default", (_f8(),)),
+        ("aten.any.default", (_f8(),)),
+        ("aten.pow.Tensor_Scalar", (_f8(), 2.0)),
+    ):
+        exc, message = _f8_refusal(op, *args)
+        assert exc is NotImplementedError, (op, exc, message)
+        assert "not implemented for 'Float8_e4m3fn'" not in message, (op, message)
+        assert op in message and "FLOAT8B" in message, (op, message)
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

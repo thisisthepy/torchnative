@@ -121,7 +121,7 @@ def _values_close(torch_nested, c_nested, atol: float, rtol: float) -> tuple[boo
 
 def _summarize(result) -> str:
     try:
-        return f"{result.tolist()!r} dtype={dt.dtype_name(result.dtype)} shape={tuple(result.shape)}"
+        return f"{_as_list(result)!r} dtype={dt.dtype_name(result.dtype)} shape={tuple(result.shape)}"
     except Exception:
         return repr(result)
 
@@ -135,6 +135,56 @@ def _run_one(case: Case, inject_fault: str | None) -> Outcome:
     outcome = _run_one_body(case, inject_fault, tag_box)
     outcome.fault_applied = bool(tag_box[0])
     return outcome
+
+
+def _as_list(result):
+    """`result.tolist()`, except for `float8_e4m3fn`, which is read through a
+    lossless widening to `float32` first.
+
+    This shim refuses `tolist` on `float8_e4m3fn` outright (docs/FLOAT8.md):
+    candle 0.11.0's `f8e4m3 -> f64` conversion does not terminate, so the
+    refusal is the only safe answer and it is not going away in this round.
+    Without this helper that refusal would make the dtype permanently
+    uncomparable *here* -- the harness would raise while reading a result both
+    sides had already produced correctly.
+
+    The widening is exact rather than a tolerance: `float8_e4m3fn` has 4
+    exponent and 3 mantissa bits and every finite value of it is representable
+    in `float32`, so `.to(float32).tolist()` and a working `.tolist()` would
+    return the same numbers. It reads the same value on both sides by the same
+    route, so it cannot hide a disagreement between them.
+    """
+    # `_FakeResult` (the fault injector's stand-in) already holds a plain list
+    # and has no `.to`; it is never a real float8 buffer, so it reads directly.
+    if dt.dtype_name(result.dtype) == "float8_e4m3fn" and hasattr(result, "to"):
+        return result.to(_float32_of(result)).tolist()
+    return result.tolist()
+
+
+# The two modules under comparison, registered by `run`/`self_test` so
+# `_float32_of` can find the `float32` constant that belongs to a given result.
+#
+# Not an import and not `type(result).__module__`: the shim is loaded from a
+# file path under the module name `_C` (see loader.py, which is deliberately
+# `sys.path`-independent) while pyo3 spells its classes `torch._C.TensorBase`,
+# so the class's own `__module__` names a module that is *not* the one holding
+# the dtype constants. And the two `float32` objects are deliberately not
+# interchangeable -- docs/TORCH_C.md §1 is about `_C` owning its own dtype type.
+_DTYPE_OWNERS: list = []
+
+
+def _float32_of(result):
+    """`float32` as spelled by whichever module owns `result` -- `torch` for the
+    torch side, `_C` for the shim side. Identified by dtype *type*, so a result
+    can never be widened with the other module's constant."""
+    for module in _DTYPE_OWNERS:
+        float32 = getattr(module, "float32", None)
+        if float32 is not None and type(float32) is type(result.dtype):
+            return float32
+    raise RuntimeError(
+        f"no registered module owns {type(result.dtype)!r}; _as_list cannot "
+        "widen this float8 result"
+    )
 
 
 def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> Outcome:
@@ -206,7 +256,7 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
                 f"{case.note}); got torch_ok={t_ok} c_ok={c_ok} "
                 f"(torch={t_exc!r}, c={c_exc!r})",
             )
-        if t_res.tolist() == c_res.tolist():
+        if _as_list(t_res) == _as_list(c_res):
             return Outcome(
                 case,
                 False,
@@ -216,7 +266,7 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         return Outcome(
             case,
             True,
-            f"known divergence still present: torch={t_res.tolist()!r} c={c_res.tolist()!r}",
+            f"known divergence still present: torch={_as_list(t_res)!r} c={_as_list(c_res)!r}",
         )
 
     # expect == "match"
@@ -258,7 +308,7 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
             case,
             False,
             f"{prefix}dtype mismatch: torch={t_dtype} c={c_dtype} "
-            f"(torch value={t_res.tolist()!r}, c value={c_res.tolist()!r})",
+            f"(torch value={_as_list(t_res)!r}, c value={_as_list(c_res)!r})",
         )
 
     t_shape = tuple(int(x) for x in t_res.shape)
@@ -267,12 +317,12 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
         return Outcome(case, False, f"{prefix}shape mismatch: torch={t_shape} c={c_shape}")
 
     tol = dt.tolerance_for(t_dtype)
-    ok, detail = _values_close(t_res.tolist(), c_res.tolist(), tol.atol, tol.rtol)
+    ok, detail = _values_close(_as_list(t_res), _as_list(c_res), tol.atol, tol.rtol)
     if not ok:
         return Outcome(
             case,
             False,
-            f"{prefix}value mismatch ({detail}); torch={t_res.tolist()!r} c={c_res.tolist()!r} dtype={t_dtype}",
+            f"{prefix}value mismatch ({detail}); torch={_as_list(t_res)!r} c={_as_list(c_res)!r} dtype={t_dtype}",
         )
     return Outcome(
         case, True, f"dtype={t_dtype} shape={t_shape}{_uncaught_suffix(case, fault_tag, inject_fault)}"
@@ -499,7 +549,7 @@ def _set_leaf(values, which: int, fn):
 def _corrupt_member(target, base_mode: str, last: bool):
     """Corrupt one tensor-like member. Returns None if this mode cannot be
     built for this member (e.g. `permute` on a single element)."""
-    values = target.tolist()
+    values = _as_list(target)
     shape = tuple(int(v) for v in target.shape)
     if base_mode == "value":
         new = _set_leaf(values, -1 if last else 0, _wrong)
@@ -551,7 +601,7 @@ def _corrupt(result, mode: str) -> tuple[Any, str]:
             )
         first, last_chunk = members[0], members[-1]
         f_shape = tuple(int(v) for v in first.shape)
-        l_flat = _flatten(last_chunk.tolist())
+        l_flat = _flatten(_as_list(last_chunk))
         if _numel(f_shape) <= len(l_flat):
             # Uniform split: there is nothing to pad, so this mode does not
             # apply to this case. Say so rather than pretend.
@@ -621,6 +671,8 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
         return 2
 
     import torch  # imported lazily so --help works even without torch installed
+
+    _DTYPE_OWNERS[:] = [torch, c_module]
 
     implemented = list(c_module._aten_implemented())
     print(f"target={c_module._shim_target()} implemented={implemented}")
@@ -805,6 +857,8 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
         return 2
 
     import torch
+
+    _DTYPE_OWNERS[:] = [torch, c_module]
 
     print(f"target={c_module._shim_target()}")
     groups = _group_cases_by_comparator(torch, c_module)

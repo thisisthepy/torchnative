@@ -395,6 +395,300 @@ pub fn aten_dispatch_entry(
     aten_dispatch(py, op, &rest, kwargs)
 }
 
+
+// ---------------------------------------------------------------------------
+// `float8_e4m3fn`: refusing exactly what upstream refuses (docs/FLOAT8B.md)
+// ---------------------------------------------------------------------------
+
+/// The 114 ops upstream 2.13.0 refuses for `float8_e4m3fn`, paired with the
+/// **kernel name upstream puts in the message**, transcribed per op.
+///
+/// docs/FLOAT8B.md §2: the wording is not unified because the difference carries
+/// information. `add`, `sub` and `rsub` all report `"add_stub"`; `mean` and `sum`
+/// both report `"sum_cpu"`; `relu` reports `"clamp_min_scalar_cpu"` while
+/// `hardtanh` reports `"clamp_scalar_cpu"`. Each pair says which kernel upstream
+/// would have dispatched to, and a house string would erase it. Same reasoning as
+/// docs/PROMOTE.md and docs/BACKWARD2.md, which both transcribed rather than
+/// unified.
+///
+/// Sorted by op: `float8_e4m3fn_kernel` binary-searches it, and a duplicate is
+/// visible on sight.
+static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
+    ("aten._log_softmax.default", "log_softmax_lastdim_kernel_impl"),
+    ("aten._safe_softmax.default", "softmax_lastdim_kernel_impl"),
+    ("aten._scaled_dot_product_flash_attention_for_cpu.default", "flash_attention"),
+    ("aten._softmax.default", "softmax_lastdim_kernel_impl"),
+    ("aten._weight_norm_interface.default", "weight_norm_kernel"),
+    ("aten.add.Scalar", "add_stub"),
+    ("aten.add.Tensor", "add_stub"),
+    ("aten.add_.Scalar", "add_stub"),
+    ("aten.add_.Tensor", "add_stub"),
+    ("aten.amax.default", "max_values_cpu"),
+    ("aten.argmax.default", "argmax_cpu"),
+    ("aten.avg_pool2d.default", "avg_pool2d"),
+    ("aten.baddbmm.default", "baddbmm"),
+    ("aten.bernoulli_.float", "bernoulli_scalar_cpu_"),
+    ("aten.bmm.default", "bmm"),
+    ("aten.ceil.default", "ceil_vml_cpu"),
+    ("aten.ceil_.default", "ceil_vml_cpu"),
+    ("aten.clamp.default", "clamp_scalar_cpu"),
+    ("aten.clamp_.default", "clamp_scalar_cpu"),
+    ("aten.clamp_min.default", "clamp_min_scalar_cpu"),
+    ("aten.clamp_min_.default", "clamp_min_scalar_cpu"),
+    ("aten.convolution.default", "slow_conv2d_cpu"),
+    ("aten.cos.default", "cos_vml_cpu"),
+    ("aten.cos_.default", "cos_vml_cpu"),
+    ("aten.cumsum.default", "cumsum_out_cpu"),
+    ("aten.div.Scalar_mode", "div_cpu_reduced_float"),
+    ("aten.div.Tensor", "div_cpu"),
+    ("aten.div.Tensor_mode", "div_cpu"),
+    ("aten.div_.Scalar", "div_cpu_reduced_float"),
+    ("aten.div_.Tensor", "div_cpu"),
+    ("aten.erf.default", "erf_vml_cpu"),
+    ("aten.erf_.default", "erf_vml_cpu"),
+    ("aten.exp.default", "exp_vml_cpu"),
+    ("aten.exp_.default", "exp_vml_cpu"),
+    ("aten.expm1.default", "expm1_vml_cpu"),
+    ("aten.expm1_.default", "expm1_vml_cpu"),
+    ("aten.flip.default", "flip_cpu"),
+    ("aten.floor_divide.Scalar", "div_floor_cpu_reduced_float"),
+    ("aten.floor_divide.default", "div_floor_cpu"),
+    ("aten.gather.default", "scatter_gather_tensor_cpu"),
+    ("aten.ge.Scalar", "ge_cpu"),
+    ("aten.ge.Tensor", "ge_cpu"),
+    ("aten.gelu.default", "GeluKernelImpl"),
+    ("aten.gt.Scalar", "gt_cpu"),
+    ("aten.gt.Tensor", "gt_cpu"),
+    ("aten.hardtanh.default", "clamp_scalar_cpu"),
+    ("aten.histc.default", "aminmax_cpu"),
+    ("aten.isin.Tensor_Tensor", "isin_default_cpu"),
+    ("aten.le.Scalar", "le_cpu"),
+    ("aten.le.Tensor", "le_cpu"),
+    ("aten.leaky_relu.default", "leaky_relu_cpu"),
+    ("aten.linalg_vector_norm.default", "norm_cpu"),
+    ("aten.log.default", "log_vml_cpu"),
+    ("aten.log2.default", "log2_vml_cpu"),
+    ("aten.log2_.default", "log2_vml_cpu"),
+    ("aten.log_.default", "log_vml_cpu"),
+    ("aten.lt.Scalar", "lt_cpu"),
+    ("aten.lt.Tensor", "lt_cpu"),
+    ("aten.masked_fill.Scalar", "masked_fill"),
+    ("aten.masked_fill_.Scalar", "masked_fill"),
+    ("aten.max.default", "max_all"),
+    ("aten.max.dim", "max_cpu"),
+    ("aten.max.other", "maximum_cpu"),
+    ("aten.max_pool2d.default", "max_pool2d"),
+    ("aten.mean.default", "sum_cpu"),
+    ("aten.mean.dim", "sum_cpu"),
+    ("aten.min.default", "min_all"),
+    ("aten.min.dim", "min_cpu"),
+    ("aten.min.other", "minimum_cpu"),
+    ("aten.mul.Scalar", "mul_cpu_reduced_float"),
+    ("aten.multinomial.default", "aminmax_cpu"),
+    ("aten.native_batch_norm.default", "batch_norm"),
+    ("aten.native_group_norm.default", "GroupNormKernelImpl"),
+    ("aten.native_layer_norm.default", "LayerNormKernelImpl"),
+    ("aten.neg.default", "neg_cpu"),
+    ("aten.neg_.default", "neg_cpu"),
+    ("aten.nll_loss_forward.default", "nll_loss_out_frame"),
+    ("aten.norm.ScalarOpt_dim", "norm_cpu"),
+    ("aten.normal_.default", "normal_kernel_cpu"),
+    ("aten.pow.Tensor_Tensor", "pow"),
+    ("aten.reciprocal.default", "reciprocal_cpu"),
+    ("aten.reciprocal_.default", "reciprocal_cpu"),
+    ("aten.relu.default", "clamp_min_scalar_cpu"),
+    ("aten.relu_.default", "clamp_min_scalar_cpu"),
+    ("aten.remainder.Scalar", "remainder_cpu"),
+    ("aten.remainder.Tensor", "remainder_cpu"),
+    ("aten.rsqrt.default", "rsqrt_cpu"),
+    ("aten.rsqrt_.default", "rsqrt_cpu"),
+    ("aten.rsub.Scalar", "add_stub"),
+    ("aten.scatter.src", "scatter_gather_tensor_cpu"),
+    ("aten.sigmoid.default", "sigmoid_cpu_reduced_float"),
+    ("aten.sigmoid_.default", "sigmoid_cpu_reduced_float"),
+    ("aten.sign.default", "sign_cpu"),
+    ("aten.silu.default", "silu_cpu"),
+    ("aten.sin.default", "sin_vml_cpu"),
+    ("aten.sin_.default", "sin_vml_cpu"),
+    ("aten.softplus.default", "softplus_cpu"),
+    ("aten.sort.default", "sorting_kernel_method_name"),
+    ("aten.sqrt.default", "sqrt_vml_cpu"),
+    ("aten.sqrt_.default", "sqrt_vml_cpu"),
+    ("aten.sub.Scalar", "add_stub"),
+    ("aten.sub.Tensor", "add_stub"),
+    ("aten.sub_.Scalar", "add_stub"),
+    ("aten.sub_.Tensor", "add_stub"),
+    ("aten.sum.default", "sum_cpu"),
+    ("aten.sum.dim_IntList", "sum_cpu"),
+    ("aten.tanh.default", "tanh_vml_cpu"),
+    ("aten.tanh_.default", "tanh_vml_cpu"),
+    ("aten.topk.default", "topk_cpu"),
+    ("aten.tril.default", "tril"),
+    ("aten.triu.default", "triu"),
+    ("aten.uniform_.default", "check_uniform_bounds"),
+    ("aten.upsample_bilinear2d.default", "upsample_bilinear2d_channels_last"),
+    ("aten.where.default", "nonzero_count_cpu"),
+];
+
+/// Upstream's exact refusal for `op`, or `None` if upstream computes it.
+fn float8_e4m3fn_kernel(op: &str) -> Option<&'static str> {
+    FLOAT8_E4M3FN_REFUSALS
+        .binary_search_by(|(name, _)| (*name).cmp(op))
+        .ok()
+        .map(|i| FLOAT8_E4M3FN_REFUSALS[i].1)
+}
+
+/// The ten ops upstream **computes** for this dtype and this build cannot
+/// (docs/FLOAT8B.md §4.1): candle 0.11.0's `WithDType for f8e4m3::to_f64`
+/// recurses into itself and release-mode LLVM turns that into `.L1: jmp .L1`,
+/// so they hang instead of answering.
+///
+/// They are refused in **this shim's** words, never upstream's. Reporting
+/// `"pow" not implemented for 'Float8_e4m3fn'` for `aten.pow.Scalar` would be a
+/// lie: upstream implements it.
+static FLOAT8_E4M3FN_SHIM_ONLY: &[&str] = &[
+    "aten.adaptive_avg_pool1d.default",
+    "aten.all.default",
+    "aten.all.dim",
+    "aten.all.dims",
+    "aten.any.default",
+    "aten.any.dim",
+    "aten.fill_.Tensor",
+    "aten.index_put_.default",
+    "aten.pow.Scalar",
+    "aten.pow.Tensor_Scalar",
+];
+
+fn float8_shim_only_refusal(op: &str) -> bool {
+    FLOAT8_E4M3FN_SHIM_ONLY.binary_search(&op).is_ok()
+}
+
+/// Whether the float8 gate applies to this call: at least one tensor operand is
+/// `float8_e4m3fn` and no tensor operand is a *different* floating-point dtype.
+///
+/// The second half is the whole subtlety (docs/FLOAT8B.md §2.1). Upstream refuses
+/// a mixed call like `add(float8, float32)` **before** it looks up a kernel, with
+/// a `RuntimeError` -- `Promotion for Float8 Types is not supported` -- and
+/// answering that with `NotImplementedError` would be a new divergence in
+/// exception *type*, which is the failure docs/PROMOTE.md's last section is about.
+///
+/// Integer and bool operands do not block the gate: `gather`'s int64 index and
+/// `masked_fill`'s bool mask do not promote, and upstream does report the kernel
+/// message for those calls (measured, docs/FLOAT8B.md §2.1).
+fn float8_only_floats(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let mut saw_f8 = false;
+    let mut saw_other_float = false;
+    fn visit(value: &Bound<'_, PyAny>, saw_f8: &mut bool, saw_other_float: &mut bool) -> bool {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return false;
+        };
+        let tag = tensor.borrow().tag();
+        if tag == TorchDType::Float8E4M3FN {
+            *saw_f8 = true;
+        } else if tag.is_floating_point() {
+            *saw_other_float = true;
+        }
+        true
+    }
+    fn scan(value: &Bound<'_, PyAny>, saw_f8: &mut bool, saw_other_float: &mut bool) {
+        if visit(value, saw_f8, saw_other_float) {
+            return;
+        }
+        // One level down, exactly as the device gate descends: `cat`/`stack`
+        // take `Tensor[]`, and `bootstrap.py` binds it by keyword.
+        if let Ok(sequence) = value.cast::<PyList>() {
+            for item in sequence.iter() {
+                if !visit(&item, saw_f8, saw_other_float) {
+                    break;
+                }
+            }
+        } else if let Ok(sequence) = value.cast::<PyTuple>() {
+            for item in sequence.iter() {
+                if !visit(&item, saw_f8, saw_other_float) {
+                    break;
+                }
+            }
+        }
+    }
+    for value in args.iter() {
+        scan(&value, &mut saw_f8, &mut saw_other_float);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            scan(&value, &mut saw_f8, &mut saw_other_float);
+        }
+    }
+    saw_f8 && !saw_other_float
+}
+
+/// Every tensor operand is 1-D. Only `aten.matmul.default` asks (see the gate).
+fn all_operands_are_1d(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let mut seen = false;
+    let mut all_1d = true;
+    let mut check = |value: &Bound<'_, PyAny>| {
+        if let Ok(tensor) = value.cast::<PyTensorBase>() {
+            seen = true;
+            if tensor.borrow().dims().len() != 1 {
+                all_1d = false;
+            }
+        }
+    };
+    for value in args.iter() {
+        check(&value);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            check(&value);
+        }
+    }
+    seen && all_1d
+}
+
+/// The gate itself, called once at the single door.
+///
+/// Table first, operands second: the two binary searches miss for every op on
+/// neither list, and the operand scan -- the only part that touches Python
+/// objects -- runs only after one of them hits. Nothing on the float32 path
+/// scans anything new.
+///
+/// At the door rather than in 114 kernels for the reason the device gate is
+/// there: a kernel can forget, and the 27 ops in docs/FLOAT8B.md table B never
+/// reach a kernel at all -- they disappear into candle's `F8E4M3 -> f64`
+/// tail-call loop first. Only the door runs before that.
+fn float8_e4m3fn_gate(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if let Some(kernel) = float8_e4m3fn_kernel(op) {
+        if float8_only_floats(args, kwargs) {
+            // Upstream's text, character for character, and upstream's exception
+            // type. A caller writing `except NotImplementedError` catches this
+            // exactly as it catches upstream's.
+            return Err(not_implemented(format!(
+                "\"{kernel}\" not implemented for 'Float8_e4m3fn'"
+            )));
+        }
+        return Ok(());
+    }
+    // `aten.matmul.default` is not on the table: upstream's refusal for it is
+    // **shape-dependent**, not op-level -- 2-D x 2-D returns a float8 result, and
+    // only the 1-D x 1-D form falls through to `dot` (docs/FLOAT8B.md §2.1). So
+    // it is gated on the shape upstream actually refuses, and left alone on the
+    // shape upstream answers.
+    if op == "aten.matmul.default" && float8_only_floats(args, kwargs) && all_operands_are_1d(args, kwargs) {
+        return Err(not_implemented("\"dot\" not implemented for 'Float8_e4m3fn'"));
+    }
+    if float8_shim_only_refusal(op) && float8_only_floats(args, kwargs) {
+        return Err(not_implemented(format!(
+            "{op}: float8_e4m3fn is not supported by this op in the torch._C shim \
+             (candle's F8E4M3 -> f64 conversion does not terminate); upstream \
+             computes this -- docs/FLOAT8B.md §4.1"
+        )));
+    }
+    Ok(())
+}
+
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
 pub fn aten_dispatch(
@@ -408,6 +702,10 @@ pub fn aten_dispatch(
     // paid for a scan twice at the hottest line in the crate; merged, meta
     // costs the dispatcher a discriminant test on a value the gate already had
     // in hand.
+    // docs/FLOAT8B.md: `float8_e4m3fn` refuses here exactly where upstream
+    // refuses, in upstream's own words. Before the device gate, because the
+    // hanging ops in table B never come back from the kernel to be refused.
+    float8_e4m3fn_gate(op, args, kwargs)?;
     let out = match check_devices_agree(op, args, kwargs)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
         _ => aten_dispatch_inner(py, op, args, kwargs)?,
@@ -5382,12 +5680,36 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
 /// The error names the accumulated dtype against the entry that could not
 /// join it, which is the pair that has no answer -- not the first two entries,
 /// which may well have promoted cleanly.
+/// Upstream refuses a float8 operand *before* it looks a kernel up, and says so
+/// in its own words: `RuntimeError: Promotion for Float8 Types is not
+/// supported, attempted to promote Float8_e4m3fn and Float`. That is a
+/// different exception type and a different sentence from the
+/// "dtype promotion not implemented" this shim raises for pairs it simply has
+/// no rule for, and the two must not be merged -- docs/PROMOTE.md's last
+/// section exists because a refusal once carried the right words under the
+/// wrong type, and `except NotImplementedError` did not catch it.
+fn float8_promotion_refusal(a: TorchDType, b: TorchDType) -> Option<PyErr> {
+    let f8 = |t: TorchDType| matches!(t, TorchDType::Float8E4M3FN);
+    if f8(a) || f8(b) {
+        let (first, second) = if f8(a) { (a, b) } else { (b, a) };
+        return Some(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Promotion for Float8 Types is not supported, attempted to promote {} and {}",
+            scalar_type_name(first),
+            scalar_type_name(second)
+        )));
+    }
+    None
+}
+
 fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
     let mut tag = tensors[0].tag();
     for other in &tensors[1..] {
         let next = other.tag();
         if next == tag {
             continue;
+        }
+        if let Some(err) = float8_promotion_refusal(tag, next) {
+            return Err(err);
         }
         tag = promote_types(tag, next).ok_or_else(|| {
             not_implemented(format!(
@@ -5403,6 +5725,9 @@ fn promote_list(op: &str, tensors: &[PyTensorBase]) -> PyResult<TorchDType> {
 fn promote_operands(op: &str, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<TorchDType> {
     if lhs.tag() == rhs.tag() {
         return Ok(lhs.tag());
+    }
+    if let Some(err) = float8_promotion_refusal(lhs.tag(), rhs.tag()) {
+        return Err(err);
     }
     promote_types(lhs.tag(), rhs.tag()).ok_or_else(|| {
         not_implemented(format!(

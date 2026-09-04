@@ -39,15 +39,22 @@ TOLERANCES: dict[str, Tolerance] = {
     "uint32": Tolerance(atol=0.0, rtol=0.0),
 }
 
-# Dtypes the harness exercises by default. `float8_e4m3fn` is deliberately
-# left out: constructing a float8_e4m3fn tensor was observed to hang
-# indefinitely on this host, on *both* sides independently --
-# `torch.tensor([...], dtype=torch.float8_e4m3fn)` alone (no `_C` involved)
-# and `_C._tensor_from_flat([...], dtype=_C.float8_e4m3fn)` alone (no torch
-# involved). That is an environment/toolchain issue worth someone's
-# attention, but it is orthogonal to numeric correctness and this harness
-# must not hang CI over it, so it is excluded here rather than silently
-# retried forever. See the final report for how this was narrowed down.
+# Dtypes the harness exercises by default.
+#
+# `float8_e4m3fn` was excluded from 2026-08-24 until docs/FLOAT8B.md, on the
+# stated ground that construction hung on both sides independently. **That
+# ground was wrong, and docs/FLOAT8.md had already disproved it**: construction
+# works on both sides and always did. The hang was in `to_dtype(F64)` --
+# candle 0.11.0's `WithDType for f8e4m3::to_f64` recursing into itself, which
+# release-mode LLVM collapses to `.L1: jmp .L1` -- and construction never calls
+# it. An exclusion reason nobody could check outlived the fact it named.
+#
+# It is included now because the two things that made it uncheckable are gone
+# (docs/FLOAT8B.md): 48 ops that computed answers upstream refuses to produce,
+# and 37 that hung. Every op now either matches upstream's value or matches
+# upstream's refusal, so `expect="match"` is a real question for this dtype --
+# a case where one side refuses and the other computes is a SILENT DIVERGENCE
+# failure, which is exactly the check that was missing.
 DEFAULT_DTYPES: tuple[str, ...] = (
     "float64",
     "float32",
@@ -58,17 +65,14 @@ DEFAULT_DTYPES: tuple[str, ...] = (
     "int16",
     "uint8",
     "uint32",
+    "float8_e4m3fn",
 )
 
-EXCLUDED_DTYPES: dict[str, str] = {
-    "float8_e4m3fn": (
-        "torch.tensor(..., dtype=torch.float8_e4m3fn) and "
-        "_C._tensor_from_flat(..., dtype=_C.float8_e4m3fn) both hang "
-        "indefinitely when probed independently on this host (observed "
-        "2026-08-24). Not exercised by this harness; needs investigation "
-        "in rust/torch_c, which is out of scope here."
-    ),
-}
+# Nothing is excluded. The key is kept -- with its shape and its consumer in
+# `compare.py` intact -- because an empty dict is the honest state and a deleted
+# mechanism is not: the next dtype that needs excluding should have to write a
+# reason here, and reasons here go stale (see the note above `DEFAULT_DTYPES`).
+EXCLUDED_DTYPES: dict[str, str] = {}
 
 
 def dtype_name(dtype_obj) -> str:
