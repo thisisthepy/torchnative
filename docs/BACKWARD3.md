@@ -29,6 +29,7 @@ upstream reading was taken with `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`.
 | So what is W4's whole observable effect? | It changes the shim's answer to *"will a gradient flow through this tensor?"* from **False**, which is true of this shim, to **True**, which is not. §4 |
 | What landed? | The measurement, one test that makes the trap in BACKWARD2 §1.3 loud, and the documentation of a divergence that was never written down. **No behaviour changed.** §5 |
 | Did the structural group get cheaper or harder? | **Cheaper by one item and better-ordered by one.** §7 |
+| Did W5 then land? | **Yes, in `docs/BACKWARD4.md`, and smaller than §7 budgeted.** A correct `grad_fn` *nullness* needs no tape — one `Option<Box<str>>` per tensor at the door — so W5, W6, `retains_grad` and both divergences in §1.1 landed together and W8/W9/W10 were not touched. The one correction it makes to this document is §1: **W4 is not separable from W5 either**, because upstream's `grad_fn is not None` holds exactly when the flag would have propagated |
 | The stale `1723`? | **It was never stale.** `1723` and `1853` are two different questions asked of the same trace, and both are current. §6 |
 
 ---

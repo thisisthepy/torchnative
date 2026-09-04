@@ -399,15 +399,42 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     # has been through no backward still reports None, and that is the claim.
     assert x.grad is None
 
-    # 2. Nothing reads the flag. This is the load-bearing one: an op does not
-    #    propagate `requires_grad` to its output, so no graph is ever built --
-    #    which is why an engine alone would not be enough (AUTOGRAD.md §1.3).
+    # 2. **Inverted by docs/BACKWARD4.md, not deleted.** This assertion used to
+    #    read `y.requires_grad is False` with a message saying "an op propagated
+    #    requires_grad -- graph construction has appeared". An op now does
+    #    propagate it, and graph construction has *not* appeared: the door
+    #    records which op produced a tensor and nothing else, so `grad_fn` is a
+    #    correct nullness rather than a node (docs/BACKWARD4.md §2).
+    #
+    #    So the claim the test makes has to become the sharper one -- the flag
+    #    propagates AND the boundary is still where it was -- because that pair
+    #    is what "a nullness, not a graph" means and neither half alone says it.
     y = _C._aten_dispatch("aten.mul.Tensor", x, x)
-    assert y.requires_grad is False, (
-        "an op propagated requires_grad -- graph construction has appeared; "
-        "see docs/AUTOGRAD.md §1.3 and §6 before extending this"
+    assert y.requires_grad is True, (
+        "an op stopped propagating requires_grad -- docs/BACKWARD4.md landed "
+        "that, and upstream's invariant `grad_fn is not None => requires_grad` "
+        "cannot hold without it"
     )
-    assert y.grad_fn is None
+    assert y.is_leaf is False
+    assert y.grad_fn is not None
+    assert type(y.grad_fn).__name__ == "MulBackward0", type(y.grad_fn).__name__
+    # And the graph is still absent, which is the half that would otherwise go
+    # unstated. Reaching past nullness refuses by name; it does not answer with
+    # an empty tuple that reads as "this node has no inputs".
+    for attribute in ("next_functions", "apply", "metadata", "_saved_self"):
+        try:
+            getattr(y.grad_fn, attribute)
+        except NotImplementedError as e:
+            assert "no next_functions" in str(e) or "grad_fn." in str(e), str(e)
+        else:
+            raise AssertionError(
+                f"grad_fn.{attribute} answered -- a graph has appeared; see "
+                "docs/BACKWARD4.md §1.3 and docs/BACKWARD2.md §2.1 before "
+                "extending this"
+            )
+    # A leaf is still a leaf, which is the control that keeps the two rows
+    # above from passing on a `grad_fn` that is simply always non-None.
+    assert x.is_leaf is True and x.grad_fn is None
 
     # 3. The wall a `backward()` reaches refuses by name rather than returning
     #    zeros. AUTOGRAD.md §1.2 walks the path that gets here:
@@ -16309,17 +16336,24 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     `test_the_autograd_boundary_is_where_autograd_md_says_it_is` -- there it is
     the boundary, here it is the thing that makes the absent seed harmless.
 
-    It also pins the divergence docs/BACKWARD3.md §1.1 found while measuring
-    this, because it was written down nowhere: **`is_leaf` is always `True`
-    here, and it is the predicate `torch.optim` keys on.**
-    `torch/optim/optimizer.py:1153` refuses a non-leaf with `ValueError: can't
-    optimize a non-leaf Tensor`, and this shim accepts one. That is asserted as
-    a *divergence*, not as a behaviour anyone wants.
+    **W5 landed (docs/BACKWARD4.md) and the assertions were inverted rather
+    than deleted, which is what the previous revision of this docstring asked
+    for.** The divergence it pinned -- `is_leaf` hardcoded `True`, so
+    `torch/optim/optimizer.py:1153` accepted an intermediate as a parameter --
+    is closed, and the row that pinned it now asserts upstream's `ValueError`.
 
-    **When W5 lands (a real `grad_fn`), every assertion below flips.** Invert
-    them, do not delete them, and read docs/BACKWARD3.md §4.1 first -- the
-    claim it makes is that they all flip in the same commit, and this test is
-    where that claim gets checked.
+    The safety property survived the inversion and got *stronger*, because
+    (1) changed sides without (3) moving. The seed is no longer absent: it is
+    `tensor(1.)` for a scalar and a `RuntimeError` for anything else, both
+    upstream's answers. So the conjunction now reads
+
+      1. the seed is **present and correct** in both shapes;
+      3. **nothing consumes it**, because the engine still refuses.
+
+    which is a harder pair to hold than the old one. An engine written above
+    this would no longer be handed a `None` to guess at -- it would be handed
+    the right seed and would still have no graph to walk, which is the wall
+    docs/BACKWARD2.md §2.1 puts at W8/W9/W10.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return  # vendor tree not installed -- see vendor/install_shim.sh
@@ -16332,12 +16366,20 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     #    this one agrees.
     assert shim["leaf"] == [True, True, True, True], shim["leaf"]
 
-    # -- an intermediate is described as a *constant*, which is what it is here.
-    assert shim["intermediate"] == [False, True, True], shim["intermediate"]
+    # -- an intermediate is described as an intermediate: the flag propagated,
+    #    `grad_fn` is not None, and it is not a leaf. Inverted from
+    #    `[False, True, True]` by docs/BACKWARD4.md; the three move together
+    #    because upstream's `is_leaf` *is* `grad_fn is None` and its
+    #    `grad_fn is not None` implies `requires_grad`.
+    assert shim["intermediate"] == [True, False, False], shim["intermediate"]
 
-    # 1. The seed is absent in both shapes, and absent the same way.
-    assert shim["scalar_seed"] == {"ok": [None]}, shim["scalar_seed"]
-    assert shim["nonscalar_seed"] == {"ok": [None]}, shim["nonscalar_seed"]
+    # 1. The seed is present and is upstream's, in both shapes. Inverted from
+    #    two `[None]`s. The `None` was the dangerous half of this test and it
+    #    is gone; what replaces it is the assertion that the *right* seed is
+    #    built and (3) still nothing consumes it.
+    assert shim["scalar_seed"] == {"ok": [1.0]}, shim["scalar_seed"]
+    assert shim["nonscalar_seed"].get("exc") == "RuntimeError", shim["nonscalar_seed"]
+    assert "scalar outputs" in shim["nonscalar_seed"]["msg"], shim["nonscalar_seed"]
 
     # 3. Nothing consumes it: both doors into the engine refuse, by the engine's
     #    own name rather than by a helper's. If this ever stops refusing while
@@ -16348,18 +16390,25 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
         assert got.get("exc") == "NotImplementedError", (key, got)
         assert "_ImperativeEngine.run_backward" in got["msg"], (key, got)
 
-    # 4/5. The divergence, stated as one. `is_leaf` short-circuits upstream's
-    #      `param.is_leaf or param.retains_grad`, so `retains_grad` has never
-    #      been reached and is still unimplemented -- whatever gives `is_leaf` a
-    #      second answer has to give `retains_grad` a first one.
-    assert shim["optim_nonleaf"] == {"ok": "SGD"}, (
-        "torch.optim now refuses an intermediate -- if grad_fn became a node "
-        "(docs/BACKWARD2.md W5), invert this and the two rows below rather "
-        "than deleting them; see docs/BACKWARD3.md §4.1"
+    # 4/5. The divergence, closed. Both halves of upstream's guard
+    #      `param.is_leaf or param.retains_grad` are answerable now: `is_leaf`
+    #      is derived instead of asserted, so the `or` no longer
+    #      short-circuits, and `retains_grad` -- which was
+    #      `NotImplementedError` only because nothing had ever reached it --
+    #      answers `False`. The message is upstream's own, checked against
+    #      upstream below rather than transcribed here.
+    assert shim["optim_nonleaf"].get("exc") == "ValueError", (
+        "torch.optim accepts an intermediate again -- docs/BACKWARD4.md §4.1 "
+        "closed this; invert rather than delete if the boundary moves back"
     )
-    assert shim["retains_grad"].get("exc") == "NotImplementedError", shim["retains_grad"]
-    assert "retains_grad" in shim["retains_grad"]["msg"], shim["retains_grad"]
-    assert shim["requires_grad_on_nonleaf"] == {"ok": False}, shim["requires_grad_on_nonleaf"]
+    assert "non-leaf" in shim["optim_nonleaf"]["msg"], shim["optim_nonleaf"]
+    assert shim["retains_grad"] == {"ok": False}, shim["retains_grad"]
+    assert shim["requires_grad_on_nonleaf"].get("exc") == "RuntimeError", (
+        shim["requires_grad_on_nonleaf"]
+    )
+    assert "leaf variables" in shim["requires_grad_on_nonleaf"]["msg"], (
+        shim["requires_grad_on_nonleaf"]
+    )
 
     # 2. Upstream is the oracle for every row above, and is measured rather
     #    than transcribed -- a hardcoded expectation is a claim about 2.13.0
@@ -16372,6 +16421,17 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     assert up["leaf"] == shim["leaf"], (up["leaf"], shim["leaf"])
     # requires_grad propagates there, grad_fn is a node, and it is not a leaf.
     assert up["intermediate"] == [True, False, False], up["intermediate"]
+    # ... and since docs/BACKWARD4.md the shim says the same thing, so this is
+    # an equality rather than two hardcoded triples that could drift apart.
+    assert shim["intermediate"] == up["intermediate"], (shim, up)
+    # The four rows W5 moved, each checked against the oracle rather than
+    # against a literal. `requires_grad_on_nonleaf` is deliberately compared on
+    # the exception *type and text*: upstream has three wordings of the
+    # requires_grad rule (docs/BACKWARD2.md §4.2) and this is the longest one.
+    assert shim["scalar_seed"] == up["scalar_seed"], (shim, up)
+    assert shim["optim_nonleaf"] == up["optim_nonleaf"], (shim, up)
+    assert shim["retains_grad"] == up["retains_grad"], (shim, up)
+    assert shim["requires_grad_on_nonleaf"] == up["requires_grad_on_nonleaf"], (shim, up)
     # A one for a scalar ...
     assert up["scalar_seed"] == {"ok": [1.0]}, up["scalar_seed"]
     # ... and a refusal for anything else. These are *different* answers, which
@@ -20186,6 +20246,285 @@ def test_ctor_patching_tensor_did_not_break_what_patching_tensorbase_would():
         out["tensorbase_rewrap_type"]
     )
     assert out["empty_still_tensor"] == "Tensor", out["empty_still_tensor"]
+
+
+# --- docs/BACKWARD4.md: W5, `grad_fn` as a nullness -------------------------
+
+_GRAD_FN_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {"who": "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"}
+
+x = torch.randn(4, 4).requires_grad_(True)
+w = torch.randn(4, 4).requires_grad_(True)
+v = torch.randn(4).requires_grad_(True)
+idx = torch.tensor([0, 1, 2])
+
+# Keyed by the *aten op*, not by the Python spelling. Upstream answers a
+# different node name for `mul.Scalar` than for `mul.Tensor`, so a table keyed
+# by "multiply" would have no answer to check.
+CASES = {
+    "aten.mul.Tensor": lambda: torch.ops.aten.mul.Tensor(x, w),
+    "aten.mul.Scalar": lambda: torch.ops.aten.mul.Scalar(x, 2.0),
+    "aten.add.Tensor": lambda: torch.ops.aten.add.Tensor(x, w),
+    "aten.sub.Tensor": lambda: torch.ops.aten.sub.Tensor(x, w),
+    "aten.div.Tensor": lambda: torch.ops.aten.div.Tensor(x, w),
+    "aten.mm.default": lambda: torch.ops.aten.mm.default(x, w),
+    "aten.sum.default": lambda: torch.ops.aten.sum.default(x),
+    "aten.mean.default": lambda: torch.ops.aten.mean.default(x),
+    "aten.neg.default": lambda: torch.ops.aten.neg.default(x),
+    "aten.exp.default": lambda: torch.ops.aten.exp.default(x),
+    "aten.tanh.default": lambda: torch.ops.aten.tanh.default(x),
+    "aten.sigmoid.default": lambda: torch.ops.aten.sigmoid.default(x),
+    "aten.relu.default": lambda: torch.ops.aten.relu.default(x),
+    "aten.silu.default": lambda: torch.ops.aten.silu.default(x),
+    "aten.gelu.default": lambda: torch.ops.aten.gelu.default(x),
+    "aten.t.default": lambda: torch.ops.aten.t.default(x),
+    "aten.view.default": lambda: torch.ops.aten.view.default(x, [16]),
+    "aten.permute.default": lambda: torch.ops.aten.permute.default(x, [1, 0]),
+    "aten.transpose.int": lambda: torch.ops.aten.transpose.int(x, 0, 1),
+    "aten.reshape.default": lambda: torch.ops.aten.reshape.default(x, [16]),
+    "aten.cat.default": lambda: torch.ops.aten.cat.default([x, w], 0),
+    "aten.slice.Tensor": lambda: torch.ops.aten.slice.Tensor(x, 0, 0, 2),
+    "aten.unsqueeze.default": lambda: torch.ops.aten.unsqueeze.default(x, 0),
+    "aten.squeeze.dim": lambda: torch.ops.aten.squeeze.dim(x.unsqueeze(0), 0),
+    "aten.embedding.default": lambda: torch.ops.aten.embedding.default(x, idx),
+    "aten.rsqrt.default": lambda: torch.ops.aten.rsqrt.default(torch.ops.aten.add.Scalar(torch.ops.aten.abs.default(x), 1.0)),
+    "aten.native_layer_norm.default": lambda: torch.ops.aten.native_layer_norm.default(x, [4], v, v, 1e-5)[0],
+    "aten._softmax.default": lambda: torch.ops.aten._softmax.default(x, -1, False),
+    "aten._log_softmax.default": lambda: torch.ops.aten._log_softmax.default(x, -1, False),
+    "aten.clone.default": lambda: torch.ops.aten.clone.default(x),
+    "aten.stack.default": lambda: torch.ops.aten.stack.default([x, w], 0),
+    "aten.abs.default": lambda: torch.ops.aten.abs.default(x),
+    "aten.max.default": lambda: torch.ops.aten.max.default(x),
+    "aten.amax.default": lambda: torch.ops.aten.amax.default(x, [0]),
+    "aten.select.int": lambda: torch.ops.aten.select.int(x, 0, 0),
+    "aten.constant_pad_nd.default": lambda: torch.ops.aten.constant_pad_nd.default(x, [1, 1], 0.0),
+    "aten.where.self": lambda: torch.ops.aten.where.self(torch.ops.aten.gt.Scalar(x, 0.0), x, w),
+    "aten.masked_fill.Scalar": lambda: torch.ops.aten.masked_fill.Scalar(x, torch.ops.aten.gt.Scalar(x, 0.0), 0.0),
+    # The two that must answer `None` on both sides: one asks for a leaf, one
+    # only reads a shape. Without them the table below would pass on a
+    # `grad_fn` that is simply never `None`.
+    "aten.detach.default": lambda: torch.ops.aten.detach.default(x),
+    "aten.ones_like.default": lambda: torch.ops.aten.ones_like.default(x),
+}
+
+names = {}
+for op, fn in CASES.items():
+    try:
+        got = fn()
+    except BaseException as e:
+        names[op] = "!" + type(e).__name__
+        continue
+    node = got.grad_fn
+    names[op] = None if node is None else type(node).__name__
+out["names"] = names
+
+# The grad-mode gate, both directions, and the two flags checked against each
+# other rather than assumed equal.
+out["grad_enabled_default"] = torch.is_grad_enabled()
+with torch.no_grad():
+    out["no_grad_flag"] = torch.is_grad_enabled()
+    z = torch.ops.aten.mul.Tensor(x, w)
+    out["no_grad_leaf"] = [z.requires_grad, z.grad_fn is None, z.is_leaf]
+out["restored_flag"] = torch.is_grad_enabled()
+y = torch.ops.aten.mul.Tensor(x, w)
+out["grad_leaf"] = [y.requires_grad, y.grad_fn is None, y.is_leaf]
+
+# An integer tensor cannot carry a gradient, so an op over one leaves a leaf
+# even when a floating operand next to it requires one.
+ints = torch.ones(4, dtype=torch.int64)
+out["int_out"] = [
+    torch.ops.aten.add.Tensor(ints, ints).is_leaf,
+    torch.ops.aten.gt.Scalar(x, 0.0).is_leaf,
+]
+
+# A parameter survives an optimizer step as a leaf. This is the W10 boundary
+# stated as a property rather than as prose: `step()` is `add_`, `add_` returns
+# its own receiver, and a receiver that became a non-leaf would be refused by
+# `add_param_group` on the next epoch.
+p = torch.nn.Parameter(torch.ones(3))
+opt = torch.optim.SGD([p], lr=0.1)
+p.grad = torch.ones(3)
+opt.step()
+out["param_after_step"] = [p.is_leaf, p.grad_fn is None, p.requires_grad,
+                           round(float(p.reshape(-1)[0]), 4)]
+out["readd_after_step"] = "ok"
+try:
+    torch.optim.SGD([p], lr=0.1)
+except BaseException as e:
+    out["readd_after_step"] = type(e).__name__ + ": " + str(e).splitlines()[0]
+
+# The same guard with grad mode ON, which is where it is actually load-bearing:
+# `optimizer.step()` runs under `no_grad` and so would pass even if the door
+# marked in-place outputs. This one does not. Upstream refuses the call
+# outright ("a leaf Variable that requires grad is being used in an in-place
+# operation"); this shim performs it, and the property asserted is that
+# performing it does not silently turn a parameter into a non-leaf.
+q = torch.nn.Parameter(torch.ones(3))
+out["inplace_on_leaf"] = "ok"
+try:
+    torch.ops.aten.mul_.Scalar(q, 2.0)
+except BaseException as e:
+    out["inplace_on_leaf"] = type(e).__name__ + ": " + str(e).splitlines()[0]
+out["leaf_after_inplace"] = [q.is_leaf, q.grad_fn is None, q.requires_grad]
+out["readd_after_inplace"] = "ok"
+try:
+    torch.optim.SGD([q], lr=0.1)
+except BaseException as e:
+    out["readd_after_inplace"] = type(e).__name__ + ": " + str(e).splitlines()[0]
+
+# ... and an in-place op on an *intermediate* does not un-mark it either.
+r = torch.ops.aten.mul.Tensor(x, w)
+try:
+    torch.ops.aten.add_.Scalar(r, 1.0)
+except BaseException:
+    pass
+out["nonleaf_after_inplace"] = [r.is_leaf, r.grad_fn is None]
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _grad_fn_fixture(env_overrides):
+    env = dict(os.environ)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    proc = subprocess.run(
+        [sys.executable, "-c", _GRAD_FN_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"grad_fn subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
+    """docs/BACKWARD4.md. The node's *name* is the one thing about it that is real.
+
+    `_GradFnNode` has no `next_functions`, no `apply` and no saved operands --
+    docs/BACKWARD4.md §1.3 measured that the only caller on any exercised path
+    which reaches past `grad_fn is None` is `torch/_tensor_str.py:646`, and what
+    it reads is `type(grad_fn).__name__`. So that name is a claim about upstream
+    and gets checked against upstream, per aten op, rather than transcribed into
+    a literal here.
+
+    `bootstrap.py` derives most of them with a rule (CamelCase the aten base
+    name, append `Backward0`) and keeps a measured exception table for the ones
+    the rule gets wrong -- the trailing digit is an overload index that is not
+    derivable, and upstream decomposes `reshape` and `linear` before recording.
+    **The rule and the table are checked the same way**, because a table entry
+    that has quietly become wrong and a rule that was never right fail
+    identically from a caller's point of view.
+
+    Two rows must answer `None` on both sides (`detach`, `ones_like`). Without
+    them every assertion here would pass against a `grad_fn` that is simply
+    never `None`, which is the fault docs/BACKWARD3.md §7.5's F3 caught from the
+    other direction.
+
+    The grad-mode rows are here rather than in their own test because they are
+    the same measurement: `no_grad()` has to gate the door's marking, and the
+    door reads a mirror of `_install_grad_mode`'s flag rather than the flag
+    itself. Two copies of one truth is exactly the shape that drifts, so the
+    test reads `torch.is_grad_enabled()` (the dict) and the leafness of an op's
+    output (the mirror) in the same breath and requires them to agree.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    shim = _grad_fn_fixture(
+        {"PYTHONPATH": _CKPT_VENDOR_DIR, "TORCH_USE_RTLD_GLOBAL": "1"}
+    )
+    assert shim["who"] == "shim", shim["who"]
+
+    # -- the gate, both directions, and the flag it is supposed to follow.
+    assert shim["grad_enabled_default"] is True
+    assert shim["no_grad_flag"] is False
+    assert shim["restored_flag"] is True
+    assert shim["no_grad_leaf"] == [False, True, True], shim["no_grad_leaf"]
+    assert shim["grad_leaf"] == [True, False, False], shim["grad_leaf"]
+
+    # -- only a floating or complex tensor can carry a gradient, so an op whose
+    #    output is integral or boolean leaves a leaf. Upstream's own rule.
+    assert shim["int_out"] == [True, True], shim["int_out"]
+
+    # -- and a parameter is still a parameter after a step. `add_` returns its
+    #    receiver, and the door refuses to change the leafness of a tensor that
+    #    already exists; if it stopped refusing, `p` would become a non-leaf and
+    #    the *next* `SGD([p])` would raise the ValueError this round added.
+    assert shim["param_after_step"] == [True, True, True, 0.9], (
+        shim["param_after_step"]
+    )
+    assert shim["readd_after_step"] == "ok", shim["readd_after_step"]
+
+    # -- and the same guard with grad mode ON, which is the arm that actually
+    #    exercises it. `optimizer.step()` runs under `no_grad`, so the row above
+    #    would pass even if the door marked in-place outputs; this row would
+    #    not. Removing the identity test in `mark_from_op` fails here and
+    #    nowhere else, which is why it is written out separately.
+    assert shim["inplace_on_leaf"] == "ok", shim["inplace_on_leaf"]
+    assert shim["leaf_after_inplace"] == [True, True, True], (
+        "an in-place op turned a parameter into a non-leaf -- see "
+        "mark_from_op's identity test and docs/BACKWARD4.md §4.2 (W10)"
+    )
+    assert shim["readd_after_inplace"] == "ok", shim["readd_after_inplace"]
+    assert shim["nonleaf_after_inplace"] == [False, False], (
+        shim["nonleaf_after_inplace"]
+    )
+
+    # -- the names, against the oracle.
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    up = _grad_fn_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
+    assert up["who"] == "upstream", up["who"]
+
+    # The controls first: if these two stopped being `None` upstream the table
+    # below would be checking the wrong thing.
+    assert up["names"]["aten.detach.default"] is None, up["names"]
+    assert up["names"]["aten.ones_like.default"] is None, up["names"]
+
+    # Every op in the table is one this shim implements, so a shim-side refusal
+    # is a regression rather than a gap and is named before the comparison --
+    # otherwise it would be reported as a name disagreement, which points at the
+    # wrong file.
+    refused = {op: got for op, got in shim["names"].items() if str(got).startswith("!")}
+    assert not refused, refused
+
+    disagree = {
+        op: (shim["names"][op], up["names"][op])
+        for op in up["names"]
+        if not str(up["names"][op]).startswith("!")
+        and shim["names"].get(op) != up["names"][op]
+    }
+    assert not disagree, (
+        "grad_fn class names disagree with upstream -- add the measured name to "
+        "_GRAD_FN_NAMES in bootstrap.py rather than widening the rule: "
+        f"{disagree}"
+    )
+    # And the table is not vacuous: at least one row exercised an entry the
+    # naive rule gets wrong.
+    assert up["names"]["aten.mul.Scalar"] == "MulBackward1", up["names"]
+    assert up["names"]["aten.reshape.default"] == "ViewBackward0", up["names"]
+    assert up["names"]["aten.max.default"] == "MaxBackward1", up["names"]
+
+    # The one row where this round deliberately does *not* follow upstream, and
+    # it is recorded here as a divergence rather than left to prose. Upstream
+    # refuses an in-place op on a leaf that requires grad; this shim performs it
+    # and keeps the leaf a leaf. Both answers protect `torch.optim`; upstream's
+    # protects it by refusing, and W10 (docs/BACKWARD2.md §1.5) is the version
+    # counter this shim would need to say the same thing.
+    assert up["inplace_on_leaf"].startswith("RuntimeError"), up["inplace_on_leaf"]
+    assert "in-place operation" in up["inplace_on_leaf"], up["inplace_on_leaf"]
+    assert shim["inplace_on_leaf"] == "ok", shim["inplace_on_leaf"]
+    assert up["leaf_after_inplace"] == shim["leaf_after_inplace"], (
+        up["leaf_after_inplace"], shim["leaf_after_inplace"]
+    )
 
 
 if __name__ == "__main__":

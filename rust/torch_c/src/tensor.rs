@@ -137,6 +137,30 @@ pub struct PyTensorBase {
     /// `Parameter`'s gradient is (a `Tensor`, i.e. a *subclass* instance whose
     /// Python identity a caller may hold on to).
     grad: Option<Py<PyAny>>,
+    /// **The one autograd fact this shim computes rather than asserts.**
+    ///
+    /// `Some(op)` means "this tensor was produced by `op`, under grad mode,
+    /// from an operand that required a gradient" -- which is exactly upstream's
+    /// condition for `grad_fn is not None`, and therefore for `is_leaf` being
+    /// `False`. `None` means leaf. docs/BACKWARD4.md §2 is why the two cannot
+    /// be separated: upstream does not store `is_leaf`, it *is*
+    /// `grad_fn is None`, so a truthful `is_leaf` and a truthful `grad_fn`
+    /// nullness are one field and not two.
+    ///
+    /// It holds the aten op name and nothing else. There is no node, no
+    /// `next_functions`, no saved operand and no `apply` -- `bootstrap.py`'s
+    /// `_grad_fn_node` builds an opaque object from this string on read, whose
+    /// only faithful attribute is its class name, because
+    /// `torch/_tensor_str.py:646` reads `type(grad_fn).__name__` and is the
+    /// only caller on an exercised path that reaches past nullness
+    /// (docs/BACKWARD4.md §1.3). `Tensor.backward()` still refuses at
+    /// `_ImperativeEngine.run_backward`; **this field is a description of what
+    /// happened, not a promise that it can be undone.**
+    from_op: Option<Box<str>>,
+    /// `t.retain_grad()` was called. Unreachable before this round, because
+    /// upstream's `param.is_leaf or param.retains_grad` short-circuited on an
+    /// `is_leaf` that was always `True` -- docs/BACKWARD3.md §1.2.
+    retains_grad: bool,
 }
 
 /// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
@@ -155,6 +179,14 @@ impl Clone for PyTensorBase {
             // ever computed for that object. Upstream does the same -- a
             // non-leaf has no `.grad` at all.
             grad: None,
+            // Dropped for the same reason, and it is upstream's answer too. A
+            // clone is a *new* tensor: if it came out of `aten.clone.default`
+            // the door marks it itself, and if it came out of
+            // `Tensor._make_subclass` -- which is how every `nn.Parameter` is
+            // born -- it is a leaf, exactly as `nn.Parameter(non_leaf)` is a
+            // leaf upstream.
+            from_op: None,
+            retains_grad: false,
         })
     }
 }
@@ -200,6 +232,8 @@ impl PyTensorBase {
             requires_grad: false,
             backward_hooks: None,
             grad: None,
+            from_op: None,
+            retains_grad: false,
         })
     }
 
@@ -218,6 +252,8 @@ impl PyTensorBase {
             requires_grad: false,
             backward_hooks: None,
             grad: None,
+            from_op: None,
+            retains_grad: false,
         }
     }
 
@@ -244,6 +280,8 @@ impl PyTensorBase {
             requires_grad: false,
             backward_hooks: None,
             grad: None,
+            from_op: None,
+            retains_grad: false,
         }
     }
 
@@ -275,6 +313,8 @@ impl PyTensorBase {
             requires_grad: false,
             backward_hooks: None,
             grad: None,
+            from_op: None,
+            retains_grad: false,
         })
     }
 
@@ -1868,10 +1908,18 @@ impl PyTensorBase {
         }
     }
 
-    /// See the field comment: stored, reported, read by nothing.
+    /// The stored flag, **or** the fact that an op produced this tensor from
+    /// something that had it.
+    ///
+    /// Upstream keeps one flag and derives nothing; here the leaf half is
+    /// stored (`requires_grad_`, the factory keyword, `nn.Parameter`) and the
+    /// non-leaf half is `from_op`, which the door sets. The disjunction is
+    /// upstream's invariant `grad_fn is not None => requires_grad` written as
+    /// code: a tensor cannot report a `grad_fn` and deny requiring a gradient.
+    /// docs/BACKWARD4.md §2.
     #[getter]
     fn requires_grad(&self) -> bool {
-        self.requires_grad
+        self.requires_grad || self.from_op.is_some()
     }
 
     /// `t.requires_grad = True`, and the one rule the flag has.
@@ -1896,6 +1944,16 @@ impl PyTensorBase {
     /// buffers.
     #[setter]
     fn set_requires_grad(&mut self, value: bool) -> PyResult<()> {
+        // Upstream's own refusal, transcribed from 2.13.0 by running the
+        // failing case, and it is the divergence docs/BACKWARD3.md §1.1 listed
+        // and could not close: the flag on a non-leaf is not a flag, it is a
+        // consequence of the graph, so changing it is meaningless rather than
+        // merely unsupported. Unreachable until `from_op` existed.
+        if self.from_op.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "you can only change requires_grad flags of leaf variables.",
+            ));
+        }
         if value && !(self.tag.is_floating_point() || self.tag.is_complex()) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "only Tensors of floating point and complex dtype can require gradients",
@@ -1903,6 +1961,35 @@ impl PyTensorBase {
         }
         self.requires_grad = value;
         Ok(())
+    }
+
+    /// The aten op that produced this tensor, or `None` for a leaf.
+    ///
+    /// `bootstrap.py` turns it into `grad_fn` and `is_leaf`; it is exposed as a
+    /// string rather than as those two properties because the naming table that
+    /// makes `type(grad_fn).__name__` agree with upstream is measured data
+    /// (docs/BACKWARD4.md §3.1) and belongs beside the measurement, in Python,
+    /// where the test that checks it against real torch can read it.
+    #[getter]
+    fn _shim_from_op(&self) -> Option<&str> {
+        self.from_op.as_deref()
+    }
+
+    /// Called by the door (`aten::mark_autograd`) and by nothing else.
+    fn _shim_set_from_op(&mut self, op: &str) {
+        self.from_op = Some(op.into());
+    }
+
+    /// `t.retains_grad`. `False` for every leaf, and for a non-leaf until
+    /// `retain_grad()` is called on it -- which is upstream's rule and, until
+    /// `from_op` existed, was a `NotImplementedError` nothing had ever reached.
+    #[getter]
+    fn _shim_retains_grad(&self) -> bool {
+        self.retains_grad
+    }
+
+    fn _shim_set_retains_grad(&mut self, value: bool) {
+        self.retains_grad = value;
     }
 
     /// Nested Python lists, as `torch.Tensor.tolist` gives. This is the only
@@ -2726,10 +2813,253 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// W5: `grad_fn` as a nullness. docs/BACKWARD4.md.
+// ---------------------------------------------------------------------------
+
+/// Grad mode, mirrored out of `bootstrap.py`'s `_install_grad_mode` dict.
+///
+/// The dict stays the source of truth for `torch.is_grad_enabled()` -- moving
+/// it here would put a Python-visible flag in two places. What is mirrored is
+/// only what the *door* needs, because the door runs once per op and a
+/// `PyDict_GetItem` plus a `PyObject_IsTrue` per op is a cost paid by every
+/// caller including the ones that never differentiate anything. A relaxed load
+/// of an `AtomicBool` is the same shape as `capture::is_active`, which
+/// docs/CAPTURE.md §7 already measured at the same door.
+///
+/// `Ordering::Relaxed` for the same reason capture uses it: there is nothing
+/// else for this flag to be ordered *against*. A thread that flips it and then
+/// dispatches does both under the GIL.
+static GRAD_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[pyfunction]
+#[pyo3(name = "_shim_set_grad_enabled_flag")]
+pub fn set_grad_enabled_flag(value: bool) {
+    GRAD_ENABLED.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Grad mode off for the duration of a scope, restored on drop.
+///
+/// Only the *door's* mirror is touched, not `bootstrap.py`'s `state["grad"]`:
+/// a caller who asks `torch.is_grad_enabled()` from inside a tape backward is
+/// asking about Python's grad mode, which nothing here changed. What is
+/// suppressed is graph *marking*, which is upstream's `AutoGradMode` and not
+/// upstream's `GradMode` python flag.
+pub struct NoGradGuard(bool);
+
+impl NoGradGuard {
+    pub fn enter() -> Self {
+        Self(GRAD_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for NoGradGuard {
+    fn drop(&mut self) {
+        GRAD_ENABLED.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[pyfunction]
+#[pyo3(name = "_shim_grad_enabled_flag")]
+pub fn grad_enabled_flag() -> bool {
+    GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Ops whose output is **not** a differentiable function of their tensor
+/// arguments, and which therefore leave a leaf behind even when handed a
+/// parameter.
+///
+/// Every entry was checked against upstream rather than reasoned about
+/// (docs/BACKWARD4.md §3.2): `torch.ops.aten.<op>(param, ...)` on torch 2.13.0
+/// reports `grad_fn is None` for all of them.
+///
+///   * `detach` is the definition of the boundary -- it is how a caller *asks*
+///     for a leaf, and marking its output would make `.detach()` a no-op.
+///   * the `*_like` family and `new_ones`/`new_zeros` read a tensor for its
+///     shape and dtype and nothing else; the values do not flow.
+///   * `lift_fresh` returns a fresh leaf by name.
+///   * `view.dtype` reinterprets bytes rather than computing.
+///   * `histc`, `multinomial` and `randperm` have no derivative upstream.
+///
+/// Nothing else in `_aten_implemented()`'s 197 needs an entry: the remaining
+/// non-differentiable ops (`argmax`, `sort`'s indices, comparisons, `one_hot`)
+/// return integer or boolean tensors and are excluded by the dtype test in
+/// `mark_from_op` instead, which is upstream's rule stated where upstream
+/// states it -- only floating and complex tensors can carry a gradient.
+const NOT_DIFFERENTIABLE: &[&str] = &[
+    "aten.detach.default",
+    "aten.empty_like.default",
+    "aten.full_like.default",
+    "aten.ones_like.default",
+    "aten.zeros_like.default",
+    "aten.new_ones.default",
+    "aten.new_zeros.default",
+    "aten.lift_fresh.default",
+    "aten.view.dtype",
+    "aten.histc.default",
+    "aten.multinomial.default",
+    "aten.randperm.default",
+];
+
+/// Walks a dispatcher argument, collecting every `TensorBase` it contains.
+///
+/// Flat rather than recursive-without-limit: aten arguments nest one level at
+/// most (`cat([a, b], 0)`, `where(c, a, b)`), and a bounded walk cannot be made
+/// to loop by a caller.
+fn collect_tensors<'py>(value: &Bound<'py, PyAny>, out: &mut Vec<Bound<'py, PyAny>>) {
+    if value.cast::<PyTensorBase>().is_ok() {
+        out.push(value.clone());
+        return;
+    }
+    if let Ok(seq) = value.cast::<PyList>() {
+        for item in seq.iter() {
+            if item.cast::<PyTensorBase>().is_ok() {
+                out.push(item);
+            }
+        }
+        return;
+    }
+    if let Ok(seq) = value.cast::<PyTuple>() {
+        for item in seq.iter() {
+            if item.cast::<PyTensorBase>().is_ok() {
+                out.push(item);
+            }
+        }
+    }
+}
+
+/// The first pass of `mark_from_op`: does any tensor operand require a
+/// gradient, or come from an op that did?
+///
+/// Deliberately allocation-free. It is on the hot path of every dispatch in the
+/// process, including the ones with no autograd anywhere near them, and
+/// `docs/BACKWARD3.md` §4's last row is the reason: a SmolLM2-135M forward at
+/// `S=8` is 1862 dispatches, and a `Vec` per dispatch to answer `false` 1862
+/// times would be a cost paid by callers who never intend to differentiate.
+fn any_operand_requires_grad(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> bool {
+    fn wants(value: &Bound<'_, PyAny>) -> bool {
+        if let Ok(cell) = value.cast::<PyTensorBase>() {
+            return match cell.try_borrow() {
+                Ok(t) => t.requires_grad || t.from_op.is_some(),
+                Err(_) => false,
+            };
+        }
+        false
+    }
+    fn wants_nested(value: &Bound<'_, PyAny>) -> bool {
+        if wants(value) {
+            return true;
+        }
+        if let Ok(seq) = value.cast::<PyList>() {
+            return seq.iter().any(|item| wants(&item));
+        }
+        if let Ok(seq) = value.cast::<PyTuple>() {
+            return seq.iter().any(|item| wants(&item));
+        }
+        false
+    }
+    if args.iter().any(|item| wants_nested(&item)) {
+        return true;
+    }
+    match kwargs {
+        Some(kwargs) => kwargs.iter().any(|(_, value)| wants_nested(&value)),
+        None => false,
+    }
+}
+
+/// The door's autograd half: decide whether the outputs of `op` are leaves.
+///
+/// This is **all** of W5. Upstream's condition for `grad_fn is not None` is
+/// "an op ran, under grad mode, on an operand that requires a gradient, and the
+/// result can carry one", and each clause below is one of those:
+///
+/// ```text
+/// grad mode is on                     GRAD_ENABLED
+/// the op is differentiable            NOT_DIFFERENTIABLE
+/// some operand requires a gradient    requires_grad || from_op.is_some()
+/// the result can carry one            floating or complex
+/// the result is a new tensor          not identical to any operand
+/// ```
+///
+/// The last clause is the one that is not upstream's, and it is the round's
+/// deliberate stopping point rather than an oversight. An in-place op returns
+/// its own receiver, so marking there would rewrite the leafness of a tensor
+/// that already exists -- which is `optimizer.step()`'s `add_` turning every
+/// parameter in the model into a non-leaf. Upstream can afford to mark it
+/// because upstream has version counters and a leaf-mutation refusal
+/// (docs/BACKWARD2.md §1.5, W10); here the honest answer is to leave leafness
+/// alone, and `docs/BACKWARD4.md` §4.2 records the divergence that follows:
+/// an activation mutated in place stays a leaf here and does not upstream.
+///
+/// Errors are not propagated: a marking failure must not turn a working
+/// dispatch into a raise. A tensor that could not be borrowed (because the
+/// caller is holding it mutably) simply stays a leaf, which is the answer the
+/// shim gave before this round for every tensor.
+pub fn mark_from_op(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
+    out: &Py<PyAny>,
+) {
+    if !GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if NOT_DIFFERENTIABLE.contains(&op) {
+        return;
+    }
+    // Two passes over the arguments, and the first one allocates nothing.
+    //
+    // The overwhelmingly common case in this shim is *no* tensor in the call
+    // requiring a gradient -- every inference forward, every golden case, every
+    // `torch.load`. That case has to leave the door as it found it, so the
+    // first pass answers "does anybody want this?" by borrowing one `bool` per
+    // tensor argument and returns before a `Vec` exists. Only a call that
+    // really is on a gradient path pays for the second pass, which is the one
+    // that needs the operand identities for the in-place test below.
+    if !any_operand_requires_grad(args, kwargs) {
+        return;
+    }
+    let mut inputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    for item in args.iter() {
+        collect_tensors(&item, &mut inputs);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            collect_tensors(&value, &mut inputs);
+        }
+    }
+    let mut outputs: Vec<Bound<'_, PyAny>> = Vec::new();
+    collect_tensors(out.bind(py), &mut outputs);
+    for output in outputs {
+        if inputs.iter().any(|input| input.is(&output)) {
+            continue;
+        }
+        let cell = match output.cast::<PyTensorBase>() {
+            Ok(cell) => cell,
+            Err(_) => continue,
+        };
+        if let Ok(mut borrowed) = cell.try_borrow_mut() {
+            if !(borrowed.tag.is_floating_point() || borrowed.tag.is_complex()) {
+                continue;
+            }
+            if borrowed.from_op.is_none() {
+                borrowed.from_op = Some(op.into());
+            }
+        }
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
+    m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
+    m.add_function(wrap_pyfunction!(grad_enabled_flag, m)?)?;
     Ok(())
 }
 

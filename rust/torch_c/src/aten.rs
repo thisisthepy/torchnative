@@ -425,6 +425,16 @@ pub fn aten_dispatch(
     // When capture is off -- which is always, unless something asked for it --
     // this is one relaxed atomic load and a branch that is not taken. That is
     // the entire cost added to the single door, measured in docs/CAPTURE.md §7.
+    // W5 (docs/BACKWARD4.md). Beside the capture hook rather than inside it,
+    // and for the same three reasons: the meta path has to be answered too, the
+    // identity that gets marked has to be the object *Python will hold* --
+    // `promote`'s result -- and there is exactly one place where "an op
+    // happened" is known.
+    //
+    // When nothing in the process requires a gradient this is one relaxed
+    // atomic load, one table scan of twelve strings, and a walk of the argument
+    // tuple that stops at the first tensor and finds a `false`.
+    crate::tensor::mark_from_op(py, op, args, kwargs, &out);
     if crate::capture::is_active() {
         crate::capture::record(py, op, args, kwargs, &out);
     }
@@ -13207,12 +13217,21 @@ fn zeros_or_empty_like(
 ) -> PyResult<Py<PyAny>> {
     let input = tensor_arg(op, args, kwargs, 0, "self")?;
     let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
-    reject_unsupported(
-        op,
-        args,
-        kwargs,
-        &[(2, "layout"), (4, "pin_memory"), (5, "memory_format")],
-    )?;
+    reject_unsupported(op, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
+    // `memory_format` was in the blanket-refusal list above and is now read the
+    // way `full_like` and `clone` next door already read it: the two formats
+    // that mean "leave the layout alone" are accepted, everything else still
+    // refuses with the format named.
+    //
+    // **This round is what made it reachable, and that is the reason for the
+    // change rather than tidiness.** `torch/autograd/__init__.py` `_make_grads`
+    // builds its seed with `torch.ones_like(out, memory_format=preserve_format)`
+    // and only reaches that line `if out.requires_grad` -- which was `False` for
+    // every intermediate until docs/BACKWARD4.md. With the flag propagating, a
+    // blanket refusal here would have **moved `Tensor.backward()`'s refusal**
+    // off `_ImperativeEngine.run_backward` and onto a memory-format argument, so
+    // the wall a user hits would have stopped naming the thing that is missing.
+    reject_memory_format(op, args, kwargs, 5)?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     let shape = input.tensor()?.dims().to_vec();
     if label.is_meta() {

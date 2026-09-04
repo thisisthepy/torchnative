@@ -769,6 +769,17 @@ impl PyCaptureTrace {
         grad_outputs: Option<&Bound<'py, PyAny>>,
         wrt_constants: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        // Under `no_grad`, and for upstream's own reason rather than a
+        // convenience. A backward runs *outside* the graph: upstream's engine
+        // executes with grad mode off unless `create_graph=True`, so the
+        // gradients it produces are leaves. Since docs/BACKWARD4.md the door
+        // marks non-leaves, and the tape's backward is a composition of
+        // ordinary `aten_dispatch` calls on tensors that require gradients --
+        // so without this the returned gradients would come back with a
+        // `grad_fn`, and `torch/optim/optimizer.py:1064` would then call
+        // `p.grad.detach_()`, which this shim refuses by name. A gradient is a
+        // value, not a node.
+        let _guard = crate::tensor::NoGradGuard::enter();
         crate::tape::backward(py, self, inputs, grad_outputs, wrt_constants)
     }
 

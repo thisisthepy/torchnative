@@ -17241,6 +17241,28 @@ def zeros_like_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="explicit dtype override beats the self tensor's dtype",
             )
         )
+    # `memory_format` -- accepted since docs/BACKWARD4.md, where it stopped
+    # being reachable-but-refused. `torch/autograd/__init__.py` `_make_grads`
+    # builds its seed with `ones_like(out, memory_format=preserve_format)` and
+    # only gets there `if out.requires_grad`, which was never true of an
+    # intermediate until that round. Both formats that mean "leave the layout
+    # alone" are accepted; `channels_last` still refuses, and `clone`'s case
+    # next door is the one that pins the refusal.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    for fmt in ("preserve_format", "contiguous_format"):
+        cases.append(
+            Case(
+                name=f"zeros_like(memory_format={fmt}) [accepted and ignored, measured]",
+                op=op,
+                run_torch=lambda a_t=a_t, fmt=fmt: torch_call(
+                    a_t, memory_format=getattr(torch_module, fmt)
+                ),
+                run_c=lambda a_c=a_c, fmt=fmt: c_module._aten_dispatch(
+                    op, a_c, memory_format=getattr(c_module, fmt)
+                ),
+                note="upstream accepts this and returns a contiguous tensor",
+            )
+        )
     return cases
 
 
@@ -17283,6 +17305,30 @@ def ones_like_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
                 run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
                 note="explicit dtype override beats the self tensor's dtype",
+            )
+        )
+    # `memory_format` -- accepted since docs/BACKWARD4.md, where it stopped
+    # being reachable-but-refused. `torch/autograd/__init__.py` `_make_grads`
+    # builds `Tensor.backward()`'s seed with
+    # `ones_like(out, memory_format=preserve_format)` and only reaches that line
+    # `if out.requires_grad`, which was never true of an intermediate until that
+    # round. A blanket refusal here would have moved `backward()`'s wall off
+    # `_ImperativeEngine.run_backward` and onto an argument. Both formats that
+    # mean "leave the layout alone" are accepted; `channels_last` still refuses,
+    # and `clone`'s `c_error` case is what pins that.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    for fmt in ("preserve_format", "contiguous_format"):
+        cases.append(
+            Case(
+                name=f"ones_like(memory_format={fmt}) [accepted and ignored, measured]",
+                op=op,
+                run_torch=lambda a_t=a_t, fmt=fmt: torch_call(
+                    a_t, memory_format=getattr(torch_module, fmt)
+                ),
+                run_c=lambda a_c=a_c, fmt=fmt: c_module._aten_dispatch(
+                    op, a_c, memory_format=getattr(c_module, fmt)
+                ),
+                note="upstream accepts this and returns a contiguous tensor",
             )
         )
     # Shapes that a fill written against a flat buffer could get wrong.

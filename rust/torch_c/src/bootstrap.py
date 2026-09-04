@@ -4926,6 +4926,145 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
     setattr(tensorbase, "__len__", __len__)
 
 
+# The class name upstream gives the node an op produces, where the naive rule
+# does not get it right.
+#
+# **Measured, not derived.** `docs/BACKWARD4.md` §3.1 ran 48 ops through real
+# torch 2.13.0 and read `type(y.grad_fn).__name__` off each; the naive rule
+# below -- CamelCase the aten base name and append `Backward0` -- agreed on 41
+# of them. These are the seven that disagreed, and each one disagrees for a
+# reason worth keeping visible:
+#
+#   mul.Scalar     MulBackward1     the trailing digit is an *overload* index,
+#   squeeze.dim    SqueezeBackward1  not always 0, and it is not derivable
+#   max.default    MaxBackward1      from the aten name at all
+#   reshape        ViewBackward0    upstream decomposes before it records
+#   linear         AddmmBackward0   likewise
+#   to.dtype       ToCopyBackward0  the recorded op is the copy, not the cast
+#   contiguous     (no node)        a no-op returns its own input; the door's
+#                                    identity test already handles this one
+#
+# A name outside this table falls back to the rule, and a fallback that is
+# wrong is a *smaller* divergence than the one it replaces: before this round
+# the shim printed no `grad_fn=` field at all for any intermediate. That is the
+# whole claim being made for the fallback, and
+# `test_grad_fn_names_agree_with_upstream` checks the table against real torch
+# so it cannot rot into a guess.
+_GRAD_FN_NAMES = {
+    "aten.mul.Scalar": "MulBackward1",
+    "aten.squeeze.dim": "SqueezeBackward1",
+    "aten.max.default": "MaxBackward1",
+    "aten.reshape.default": "ViewBackward0",
+    # Measured, not derived, and both were wrong in the first pass:
+    #   aten.matmul.default -> MmBackward0     upstream decomposes matmul
+    #     before autograd records, so there is no `MatmulBackward0` node
+    #     anywhere in upstream -- same class as `reshape` and `linear`
+    #     above, and it was simply missed.
+    #   aten.clamp.default  -> ClampBackward1  the trailing digit is an
+    #     overload index and this one is 1 for every clamp form measured
+    #     (both bounds, min only, and the `Tensor.clamp` spelling).
+    "aten.matmul.default": "MmBackward0",
+    "aten.clamp.default": "ClampBackward1",
+    "aten.linear.default": "AddmmBackward0",
+    "aten.to.dtype": "ToCopyBackward0",
+    "aten._to_copy.default": "ToCopyBackward0",
+    "aten._softmax.default": "SoftmaxBackward0",
+    "aten._log_softmax.default": "LogSoftmaxBackward0",
+    "aten._unsafe_view.default": "UnsafeViewBackward0",
+}
+
+_GRAD_FN_CLASSES = {}
+
+
+def _grad_fn_name(op: str) -> str:
+    """`aten.native_layer_norm.default` -> `NativeLayerNormBackward0`."""
+    known = _GRAD_FN_NAMES.get(op)
+    if known is not None:
+        return known
+    base = op.split(".")[1] if "." in op else op
+    parts = [p for p in base.strip("_").split("_") if p]
+    return "".join(p[:1].upper() + p[1:] for p in parts) + "Backward0"
+
+
+class _GradFnNode:
+    """What `grad_fn` returns for a non-leaf, and it is deliberately hollow.
+
+    `docs/BACKWARD4.md` §1.3 asked which caller is the first to reach past
+    nullness and answered it by counting: on a real `from_pretrained` +
+    `.train()` + forward, `grad_fn` is read 546 times and **every one of them is
+    a nullness or a truthiness test**. The 547th, and the only one that reaches
+    further on any path this shim runs, is `torch/_tensor_str.py:646`:
+
+        grad_fn_name = type(grad_fn).__name__
+
+    So the class *name* is the one attribute that has to be faithful, and it is
+    -- see `_GRAD_FN_NAMES`. Everything else upstream's node has
+    (`next_functions`, `name()`, `metadata`, `register_hook`, `_saved_*`, and
+    an `apply` that computes) is **absent rather than stubbed**, so a caller
+    that needs a graph gets an `AttributeError` naming exactly what it wanted
+    instead of an empty tuple that reads as "this node has no inputs".
+
+    That distinction is the whole boundary between this round and the
+    structural group. `next_functions = ()` would be a graph of one node with
+    no edges, which is a false statement about a real graph; no attribute at
+    all is a true statement about a shim that has none.
+    """
+
+    __slots__ = ("_shim_op",)
+
+    def __init__(self, op):
+        self._shim_op = op
+
+    def __repr__(self):
+        return f"<{type(self).__name__} object at {id(self):#x}>"
+
+    def __getattr__(self, name):
+        """Everything a real node has, refused by name.
+
+        A bare `AttributeError` would be the truth -- there is no attribute --
+        but it is the *shape* of truth a caller misreads. `getattr(node,
+        "next_functions", ())` and every `hasattr` guard in
+        `torch/nn/modules/module.py` would take it as "this node happens not to
+        have inputs" and carry on, which is the silent-wrong-answer failure
+        `docs/BACKWARD.md` §5.2 is about. So the refusal says what is absent and
+        that it is absent by construction.
+
+        Dunders are excluded and still raise `AttributeError`, because that is
+        the protocol: `copy`, `pickle` and `repr` all probe for optional
+        `__reduce__`/`__deepcopy__` hooks and read a raise as "not provided".
+        Turning those probes into `NotImplementedError` would break callers that
+        never asked about autograd at all.
+        """
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        raise NotImplementedError(
+            f"not implemented in torch._C shim: grad_fn.{name} -- "
+            f"{type(self).__name__} records that {self._shim_op} produced this "
+            "tensor and nothing else. There is no graph behind it: no "
+            "next_functions, no saved operands, no apply. "
+            "Tensor.backward() refuses at _ImperativeEngine.run_backward for "
+            "the same reason; see docs/BACKWARD4.md §1.3 and docs/BACKWARD2.md §2."
+        )
+
+
+def _grad_fn(self):
+    """`t.grad_fn` -- `None` for a leaf, an opaque node for anything else.
+
+    Built on read rather than at the door. The door stores one string
+    (`tensor.rs`'s `from_op`); allocating a Python object per op instead would
+    have put an allocation on the hot path for a value that a real
+    `.train()` forward reads **zero** times (docs/BACKWARD4.md §1.1).
+    """
+    op = self._shim_from_op
+    if op is None:
+        return None
+    cls = _GRAD_FN_CLASSES.get(op)
+    if cls is None:
+        cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
+        _GRAD_FN_CLASSES[op] = cls
+    return cls(op)
+
+
 def _install_autograd_shape(tensorbase) -> None:
     """`requires_grad`, `grad_fn`, `is_leaf`, `data` -- the papered-over part.
 
@@ -5037,6 +5176,18 @@ def _install_autograd_shape(tensorbase) -> None:
     tensorbase._make_subclass = staticmethod(_make_subclass)
 
     def requires_grad_(self, mode=True):
+        # Upstream refuses this on a non-leaf before it looks at the dtype, with
+        # a longer message than the attribute setter's -- both were transcribed
+        # from 2.13.0 by running the failing case, and the difference between
+        # them is upstream's, not this shim's. docs/BACKWARD3.md §1.1 listed
+        # this as a live divergence that `is_leaf` being hardcoded made
+        # unreachable; docs/BACKWARD4.md §4.1 is it closed.
+        if self._shim_from_op is not None:
+            raise RuntimeError(
+                "you can only change requires_grad flags of leaf variables. If "
+                "you want to use a computed variable in a subgraph that doesn't "
+                "require differentiation use var_no_grad = var.detach()."
+            )
         # Upstream's *third* wording of the one dtype rule, transcribed from
         # 2.13.0 by running the failing case. `requires_grad_` says "floating
         # point dtype" and nothing about complex -- and then accepts a
@@ -5054,7 +5205,7 @@ def _install_autograd_shape(tensorbase) -> None:
     requires_grad_.__name__ = "requires_grad_"
     requires_grad_.__qualname__ = "TensorBase.requires_grad_"
     setattr(tensorbase, "requires_grad_", requires_grad_)
-    setattr(tensorbase, "grad_fn", property(lambda self: None))
+    setattr(tensorbase, "grad_fn", property(_grad_fn))
 
     def _set_grad(self, value):
         """`p.grad = ...`, which is a real slot now. docs/BACKWARD.md.
@@ -5085,7 +5236,16 @@ def _install_autograd_shape(tensorbase) -> None:
     # the docstring above says which upstream guard reads it and what that
     # costs -- `test_the_backward_seed_is_absent_and_nothing_guesses_a_one`
     # pins the consequence so it cannot go stale in prose.
-    setattr(tensorbase, "is_leaf", property(lambda self: True))
+    # Derived, not asserted. Upstream does not store `is_leaf` -- it *is*
+    # `grad_fn is None`, which docs/BACKWARD3.md §3 is entirely about, and
+    # writing it as anything else here would re-create the divergence this
+    # round exists to close.
+    setattr(tensorbase, "is_leaf", property(lambda self: self._shim_from_op is None))
+    setattr(
+        tensorbase,
+        "retains_grad",
+        property(lambda self: bool(self._shim_retains_grad)),
+    )
     # The getter is `self` (docs/TENSORBASE.md records why it is not a detached
     # view). The *setter* is what `nn.Module._apply` needs -- see
     # `_shim_set_data` in tensor.rs for what it costs and what it agrees with.
@@ -5098,7 +5258,35 @@ def _install_autograd_shape(tensorbase) -> None:
         self._shim_set_data(value)
 
     setattr(tensorbase, "data", property(lambda self: self, _set_data))
-    setattr(tensorbase, "retain_grad", lambda self: None)
+    def retain_grad(self):
+        """`t.retain_grad()`, which was `lambda self: None` until this round.
+
+        Upstream's contract has two halves and this implements the half that is
+        true here. `retains_grad` starts reporting `True`, which is what
+        `torch/optim/optimizer.py:1153` reads -- and reading it is only
+        *possible* now that `is_leaf` stopped short-circuiting the `or`
+        (docs/BACKWARD3.md §1.2). What does not happen is the other half: no
+        gradient is ever populated into `.grad`, because `Tensor.backward()`
+        still refuses at `_ImperativeEngine.run_backward`. That is the same
+        boundary every other name in this installer draws, and it is drawn in
+        the same place.
+
+        On a leaf it is a no-op with no flag set, which is upstream's behaviour
+        too -- upstream returns early for a tensor that is already an
+        accumulating leaf, and `x.retain_grad(); x.retains_grad` is `False`
+        there as well (measured on 2.13.0, docs/BACKWARD4.md §3.3).
+        """
+        if not self.requires_grad:
+            raise RuntimeError(
+                "can't retain_grad on Tensor that has requires_grad=False"
+            )
+        if self._shim_from_op is not None:
+            self._shim_set_retains_grad(True)
+        return None
+
+    retain_grad.__name__ = "retain_grad"
+    retain_grad.__qualname__ = "TensorBase.retain_grad"
+    setattr(tensorbase, "retain_grad", retain_grad)
 
 
 def _install_grad_mode(module, varfns) -> None:
@@ -5138,7 +5326,15 @@ def _install_grad_mode(module, varfns) -> None:
         return state["grad"]
 
     def _set_grad_enabled(mode):
+        # Two writes, one source of truth. `state` stays the value
+        # `torch.is_grad_enabled()` reports; the mirror is what the *door* reads
+        # once per op, because W5 has to be gated by grad mode and a dict lookup
+        # per dispatch is not a cost this shim can add for callers who never
+        # differentiate. See `tensor.rs`'s `GRAD_ENABLED`, and
+        # `test_no_grad_gates_grad_fn` for the two being checked against each
+        # other rather than assumed equal.
         state["grad"] = bool(mode)
+        module._shim_set_grad_enabled_flag(bool(mode))
 
     def _is_multithreading_enabled():
         return state["multithreading"]
