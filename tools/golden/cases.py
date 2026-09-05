@@ -22775,7 +22775,59 @@ def where_default_cases(torch_module, c_module, torch_call):
     ]
 
 
+
+def adaptive_avg_pool2d_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [float(i) for i in range(16)], (1, 1, 4, 4), "float32")
+    return [
+        Case(name="adaptive_avg_pool2d", op="aten.adaptive_avg_pool2d.default", 
+             run_torch=lambda: torch_call(a_t, [2, 2]), 
+             run_c=lambda: c_module._aten_dispatch("aten.adaptive_avg_pool2d.default", a_c, [2, 2]))
+    ]
+
+def where_scalar_self_cases(torch_module, c_module, torch_call):
+    cond_t, cond_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+    other_t, other_c = pair_from_flat(torch_module, c_module, [2.0, 3.0, 4.0, 5.0], (4,), "float32")
+    return [
+        Case(name="where_scalar_self", op="aten.where.ScalarSelf", 
+             run_torch=lambda: torch_call(cond_t, 1.0, other_t), 
+             run_c=lambda: c_module._aten_dispatch("aten.where.ScalarSelf", cond_c, 1.0, other_c))
+    ]
+
+def greater_scalar_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 2.0], (2,), "float32")
+    return [
+        Case(name="greater_scalar", op="aten.greater.Scalar", 
+             run_torch=lambda: torch_call(a_t, 1.0), 
+             run_c=lambda: c_module._aten_dispatch("aten.greater.Scalar", a_c, 1.0))
+    ]
+
+def greater_tensor_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 2.0], (2,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1.0, 1.0], (2,), "float32")
+    return [
+        Case(name="greater_tensor", op="aten.greater.Tensor", 
+             run_torch=lambda: torch_call(a_t, b_t), 
+             run_c=lambda: c_module._aten_dispatch("aten.greater.Tensor", a_c, b_c))
+    ]
+
+def roll_default_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [float(i) for i in range(12)], (3, 4), "float32")
+    return [
+        Case(name="roll_1d", op="aten.roll.default", 
+             run_torch=lambda: torch_call(a_t, [1], []), 
+             run_c=lambda: c_module._aten_dispatch("aten.roll.default", a_c, [1], [])),
+        Case(name="roll_2d", op="aten.roll.default", 
+             run_torch=lambda: torch_call(a_t, [1, -1], [0, 1]), 
+             run_c=lambda: c_module._aten_dispatch("aten.roll.default", a_c, [1, -1], [0, 1]))
+    ]
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
+    "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
+    "aten.where.ScalarSelf": where_scalar_self_cases,
+    "aten.greater.Scalar": greater_scalar_cases,
+    "aten.greater.Tensor": greater_tensor_cases,
+    "aten.roll.default": roll_default_cases,
+
     "aten.full_like.default": full_like_cases,
     "aten.new_zeros.default": new_zeros_cases,
     "aten.native_batch_norm.default": native_batch_norm_cases,

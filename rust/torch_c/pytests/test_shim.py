@@ -10649,7 +10649,14 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     #
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
-    assert len(keys) == 283, len(keys)
+    # 287 with docs/DEMAND5.md's four: `adaptive_avg_pool2d` and `roll` bring
+    # `default` and `out` each, `greater` brings `Scalar` and `Tensor`, and
+    # `where.ScalarSelf` brings none -- it was already declared in
+    # `overloads.json` and only lacked a dispatch arm, which is a different
+    # table from the one this counts. That asymmetry is the check: +4 rather
+    # than +5 or +8 is what says `where.ScalarSelf` was the unbound-member
+    # shape and the other three were genuinely new names.
+    assert len(keys) == 287, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -13292,6 +13299,18 @@ rec("max_other_matches_raw", lambda: torch.max(x, y).tolist() == torch._C._aten_
 rec("reshape_matches_raw", lambda: torch.reshape(x, (2, 2)).tolist() == torch._C._aten_dispatch("aten.reshape.default", x, [2, 2]).tolist())
 rec("bitwise_and_matches_raw", lambda: torch.bitwise_and(bi, bj).tolist() == torch._C._aten_dispatch("aten.bitwise_and.Tensor", bi, bj).tolist())
 
+# docs/DEMAND5.md's two spellings. The kernels are golden-compared by dispatch
+# key; what nothing else exercises is that `torch.roll(...)` and
+# `torch.greater(...)` reach them at all -- the blind spot docs/GOLDEN.md names,
+# and the one that has now hidden a missing name four times.
+r6 = torch.arange(6.0)
+rec("roll_fn", lambda: torch.roll(r6, 2).tolist())
+rec("roll_method", lambda: r6.roll(2).tolist())
+rec("roll_dims", lambda: torch.roll(torch.arange(6.0).reshape(2, 3), 1, dims=0).tolist())
+rec("greater_fn", lambda: torch.greater(r6, 2).tolist())
+rec("greater_method", lambda: r6.greater(2).tolist())
+rec("greater_matches_gt", lambda: torch.greater(r6, 2).tolist() == torch.gt(r6, 2).tolist())
+
 json.dump(out, sys.stdout)
 """
 
@@ -13446,6 +13465,16 @@ def test_spelling_road_through_the_vendored_tree():
     eq("max_other_matches_raw", True)
     eq("reshape_matches_raw", True)
     eq("bitwise_and_matches_raw", True)
+
+    # docs/DEMAND5.md's two spellings, checked here rather than in golden: the
+    # harness compares by dispatch key and cannot see a name that is missing.
+    assert out["roll_fn"] == [4.0, 5.0, 0.0, 1.0, 2.0, 3.0], out["roll_fn"]
+    assert out["roll_method"] == out["roll_fn"], (out["roll_method"], out["roll_fn"])
+    assert out["roll_dims"] == [[3.0, 4.0, 5.0], [0.0, 1.0, 2.0]], out["roll_dims"]
+    assert out["greater_fn"] == [False, False, False, True, True, True], out["greater_fn"]
+    assert out["greater_method"] == out["greater_fn"], out["greater_method"]
+    # `greater` is upstream's alias for `gt`, so agreeing with it is the claim.
+    assert out["greater_matches_gt"] is True, out["greater_matches_gt"]
 
 
 # --- torch.jit.script defaults to unavailable, upstream's own way ----------

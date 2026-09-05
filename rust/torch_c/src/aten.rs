@@ -48,6 +48,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._weight_norm_interface.default",
     "aten.abs.default",
     "aten.adaptive_avg_pool1d.default",
+    "aten.adaptive_avg_pool2d.default",
+    "aten.greater.Scalar",
+    "aten.greater.Tensor",
+    "aten.roll.default",
+    "aten.where.ScalarSelf",
     "aten.abs_.default",
     "aten.add.Scalar",
     "aten.add.Tensor",
@@ -1232,6 +1237,23 @@ fn meta_dispatch(
         // gives about the factories: a meta tensor is a claim about what the
         // real call would have produced, and a claim that skipped the real
         // call's range check is not a claim.
+        "aten.where.ScalarSelf" => {
+            let condition = tensor_arg(op, args, kwargs, 0, "condition")?;
+            let raw = required(op, args, kwargs, 1, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 2, "other")?;
+            where_condition_check(&condition)?;
+            if raw.is_instance_of::<PyTensorBase>() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "aten::where() Expected a value of type 'number' for argument 'self'                      but instead found type Tensor",
+                ));
+            }
+            let scalar_is_bool = raw.is_instance_of::<pyo3::types::PyBool>();
+            let scalar_is_int = scalar_is_bool || raw.is_instance_of::<pyo3::types::PyInt>();
+            let tag = where_scalar_tag(rhs.tag(), scalar_is_bool, scalar_is_int);
+            checked_convert(&raw, scalar_is_int, tag, 1)?;
+            let shape = broadcast_shape(op, condition.dims(), rhs.dims())?;
+            meta_result(py, shape, tag)
+        }
         "aten.where.ScalarOther" => {
             let condition = tensor_arg(op, args, kwargs, 0, "condition")?;
             let lhs = tensor_arg(op, args, kwargs, 1, "self")?;
@@ -1664,6 +1686,11 @@ fn aten_dispatch_inner(
         // -- what upstream's `repr(tensor)` dispatches (docs/E2E_REAL.md) ----
         "aten.abs.default" => abs_default(py, args, kwargs),
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
+        "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
+        "aten.greater.Scalar" => compare_scalar(py, args, kwargs, "aten.greater.Scalar", Cmp::Gt),
+        "aten.adaptive_avg_pool2d.default" => adaptive_avg_pool2d_default(py, args, kwargs),
+        "aten.roll.default" => roll_default(py, args, kwargs),
+        "aten.where.ScalarSelf" => where_scalar_self(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
         "aten.gt.Tensor" => compare_tensor(py, args, kwargs, "aten.gt.Tensor", Cmp::Gt),
         "aten.gt.Scalar" => compare_scalar(py, args, kwargs, "aten.gt.Scalar", Cmp::Gt),
@@ -18786,4 +18813,233 @@ fn adaptive_avg_pool1d_default(
     
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
     Ok(py_t.into_any())
+}
+
+fn where_scalar_self(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.where.ScalarSelf";
+    let condition = tensor_arg(OP, args, kwargs, 0, "condition")?;
+    let raw = required(OP, args, kwargs, 1, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 2, "other")?;
+
+    where_condition_check(&condition)?;
+    if raw.is_instance_of::<PyTensorBase>() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "aten::where() Expected a value of type 'number' for argument 'self'              but instead found type Tensor",
+        ));
+    }
+
+    let scalar_is_bool = raw.is_instance_of::<pyo3::types::PyBool>();
+    let scalar_is_int = scalar_is_bool || raw.is_instance_of::<pyo3::types::PyInt>();
+    let value = scalar_arg(OP, args, kwargs, 1, "self")?.ok_or_else(|| missing(OP, "self"))?;
+
+    let tag = where_scalar_tag(rhs.tag(), scalar_is_bool, scalar_is_int);
+    checked_convert(&raw, scalar_is_int, tag, 1)?;
+
+    let device = rhs.tensor()?.device().clone();
+    let lhs = if tag == TorchDType::Bool {
+        Tensor::full(u8::from(value.as_f64() != 0.0), (), &device).map_err(|e| candle_err(OP, e))?
+    } else {
+        let storage = PyDtype::new(tag).storage(OP)?;
+        if storage.is_int() {
+            Tensor::full(value.as_i64(), (), &device)
+        } else {
+            Tensor::full(value.as_f64(), (), &device)
+        }
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?
+    };
+
+    let out = where_select(OP, &condition, &lhs, rhs.tensor()?, tag)?;
+    finish(py, out, tag)
+}
+
+fn roll_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.roll.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let shifts_raw = shape_arg(OP, args, kwargs, 1, "shifts")?;
+
+    let dims_raw = if let Some(v) = optional(args, kwargs, 2, "dims")? {
+        if v.is_none() {
+            vec![]
+        } else {
+            shape_arg(OP, args, kwargs, 2, "dims")?
+        }
+    } else {
+        vec![]
+    };
+
+    if !dims_raw.is_empty() && shifts_raw.len() != dims_raw.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            format!("shifts and dimensions must align. shifts: {}, dims:{}", shifts_raw.len(), dims_raw.len()),
+        ));
+    }
+
+    let t = input.tensor()?;
+    let tag = input.tag();
+    let mut current = t.clone();
+
+    if dims_raw.is_empty() {
+        if shifts_raw.len() != 1 { 
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("shifts and dimensions must align. shifts: {}, dims:0", shifts_raw.len())
+            )); 
+        }
+        let total_shift = shifts_raw[0];
+        let shape = current.dims().to_vec();
+        current = current.flatten_all().map_err(|e| candle_err(OP, e))?;
+        let len = current.dims()[0] as isize;
+        if len > 0 {
+            let mut s = total_shift % len;
+            if s < 0 {
+                s += len;
+            }
+            if s > 0 {
+                let split_idx = (len - s) as usize;
+                let front = current.narrow(0, split_idx, s as usize).map_err(|e| candle_err(OP, e))?;
+                let back = current.narrow(0, 0, split_idx).map_err(|e| candle_err(OP, e))?;
+                current = candle_core::Tensor::cat(&[&front, &back], 0).map_err(|e| candle_err(OP, e))?;
+            }
+        }
+        current = current.reshape(shape).map_err(|e| candle_err(OP, e))?;
+    } else {
+        let rank = current.rank();
+        for (shift, dim_raw) in shifts_raw.into_iter().zip(dims_raw.into_iter()) {
+            let dim = normalise_dim(OP, dim_raw, rank)?;
+            let len = current.dims()[dim] as isize;
+            if len > 0 {
+                let mut s = shift % len;
+                if s < 0 {
+                    s += len;
+                }
+                if s > 0 {
+                    let split_idx = (len - s) as usize;
+                    let front = current.narrow(dim, split_idx, s as usize).map_err(|e| candle_err(OP, e))?;
+                    let back = current.narrow(dim, 0, split_idx).map_err(|e| candle_err(OP, e))?;
+                    current = candle_core::Tensor::cat(&[&front, &back], dim).map_err(|e| candle_err(OP, e))?;
+                }
+            }
+        }
+    }
+
+    finish(py, current, tag)
+}
+
+fn adaptive_avg_pool2d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.adaptive_avg_pool2d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+
+    let t = input.tensor()?;
+    let tag = input.tag();
+    let dims = t.dims();
+
+    if dims.len() != 3 && dims.len() != 4 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "adaptive_avg_pool2d: expected 3D or 4D input",
+        ));
+    }
+
+    if output_size.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "adaptive_avg_pool2d: output_size must be 2",
+        ));
+    }
+
+    let osize_h = output_size[0] as i64;
+    let osize_w = output_size[1] as i64;
+    let isize_h = dims[dims.len() - 2] as i64;
+    let isize_w = dims[dims.len() - 1] as i64;
+
+    let split = dims.len() - 2;
+    let planes: usize = dims[..split].iter().product();
+
+    let mut out_dims = dims.to_vec();
+    out_dims[split] = osize_h as usize;
+    out_dims[split + 1] = osize_w as usize;
+
+    let source = read_flat(OP, t, tag)?;
+
+    let acc32 = match tag {
+        TorchDType::Float32 => true,
+        TorchDType::Float64 => false,
+        _ => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "\"adaptive_avg_pool2d\" not implemented for '{}'",
+            scalar_type_name(tag)
+        ))),
+    };
+
+    let mut out_f = vec![0.0f64; planes * (osize_h * osize_w) as usize];
+
+    match &source {
+        Flat::Float(values) => {
+            if acc32 {
+                for p in 0..planes {
+                    let base = p * (isize_h * isize_w) as usize;
+                    let out_base = p * (osize_h * osize_w) as usize;
+                    for ih in 0..osize_h {
+                        let start_h = (ih * isize_h) / osize_h;
+                        let end_h = ((ih + 1) * isize_h + osize_h - 1) / osize_h;
+                        for iw in 0..osize_w {
+                            let start_w = (iw * isize_w) / osize_w;
+                            let end_w = ((iw + 1) * isize_w + osize_w - 1) / osize_w;
+
+                            let mut sum = 0.0f32;
+                            for h in start_h..end_h {
+                                for w in start_w..end_w {
+                                    sum += values[base + (h * isize_w + w) as usize] as f32;
+                                }
+                            }
+                            let count = (end_h - start_h) * (end_w - start_w);
+                            out_f[out_base + (ih * osize_w + iw) as usize] = (sum / count as f32) as f64;
+                        }
+                    }
+                }
+            } else {
+                for p in 0..planes {
+                    let base = p * (isize_h * isize_w) as usize;
+                    let out_base = p * (osize_h * osize_w) as usize;
+                    for ih in 0..osize_h {
+                        let start_h = (ih * isize_h) / osize_h;
+                        let end_h = ((ih + 1) * isize_h + osize_h - 1) / osize_h;
+                        for iw in 0..osize_w {
+                            let start_w = (iw * isize_w) / osize_w;
+                            let end_w = ((iw + 1) * isize_w + osize_w - 1) / osize_w;
+
+                            let mut sum = 0.0f64;
+                            for h in start_h..end_h {
+                                for w in start_w..end_w {
+                                    sum += values[base + (h * isize_w + w) as usize];
+                                }
+                            }
+                            let count = (end_h - start_h) * (end_w - start_w);
+                            out_f[out_base + (ih * osize_w + iw) as usize] = sum / count as f64;
+                        }
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    let out_t = if acc32 {
+        let f32_vals: Vec<f32> = out_f.into_iter().map(|v| v as f32).collect();
+        Tensor::from_vec(f32_vals, out_dims.as_slice(), t.device())
+    } else {
+        Tensor::from_vec(out_f, out_dims.as_slice(), t.device())
+    }
+    .map_err(|e| candle_err(OP, e))?;
+
+    finish(py, out_t, tag)
 }

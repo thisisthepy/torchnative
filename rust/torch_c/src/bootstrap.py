@@ -6908,6 +6908,9 @@ def _install_nn(module, dispatch) -> None:
         )[0]
 
 
+    def adaptive_avg_pool2d(input, output_size):
+        return dispatch("aten.adaptive_avg_pool2d.default", input, output_size)
+
     def hardtanh(input, min_val=-1.0, max_val=1.0):
         return dispatch("aten.hardtanh.default", input, min_val, max_val)
 
@@ -7158,6 +7161,7 @@ def _install_nn(module, dispatch) -> None:
         (softplus, "softplus"),
         (upsample_bilinear2d, "upsample_bilinear2d"),
         (leaky_relu, "leaky_relu"),
+        (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
         (hardtanh, "hardtanh"),
         (one_hot, "one_hot"),
         (nll_loss, "nll_loss"),
@@ -7171,7 +7175,7 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "cross_entropy_loss", "gelu", "hardtanh", "leaky_relu", "linear", "nll_loss",
+        "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "hardtanh", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bilinear2d",
     ]

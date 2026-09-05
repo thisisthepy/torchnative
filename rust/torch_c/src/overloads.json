@@ -777,5 +777,15 @@
   ],
   "adaptive_avg_pool1d": [
     "aten::adaptive_avg_pool1d(Tensor self, int[1] output_size) -> Tensor"
+  ],
+  "adaptive_avg_pool2d": [
+    "aten::adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor"
+  ],
+  "greater": [
+    "aten::greater.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::greater.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "roll": [
+    "aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor"
   ]
 }
