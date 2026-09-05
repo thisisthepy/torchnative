@@ -34,13 +34,18 @@ jobs:
             label: linux-x86_64
           - os: windows-latest
             label: windows-amd64
-          # A hosted macOS runner has Xcode and simulators. It does **not** have a
-          # phone, so this closes the simulator rung and not the device one --
-          # `verify_ios_sim.py`'s own last line says so, and the simulator runs on
-          # the host kernel. What it buys is that this machine stops being the only
-          # witness: the check already runs on every release build here.
-          - os: macos-latest
-            label: ios-simulator-arm64
+          # **No iOS job, and Xcode is not the reason.** A hosted macOS runner has
+          # Xcode and simulators, so the obvious job looks like it should work --
+          # it was added, run, and failed in sixteen seconds with
+          #
+          #     no simulator CPython at
+          #     .../caches/target-python/arm64-iphonesimulator
+          #
+          # `verify_ios_sim.py` unpacks the wheel into an **iOS CPython**, and that
+          # is a 205 MB distribution sitting in one machine's cache since October
+          # 2024 with no recorded provenance anywhere in this repository. Putting
+          # the check in CI means first answering where that comes from, which is
+          # a question and not a configuration change. docs/IOS_CI.md.
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.label }}
 
@@ -61,42 +66,22 @@ jobs:
 
       # No torch is installed on a fresh runner, which is what this needs:
       # this distribution *provides* `torch`, and there is one per interpreter.
-      # The simulator wheel cannot be installed into the runner's own CPython --
-      # different Mach-O platform. It is downloaded and handed to the harness,
-      # which unpacks it into an iOS CPython inside a booted simulator.
-      - name: Download the simulator wheel
-        if: matrix.label == 'ios-simulator-arm64'
-        run: |
-          python -m pip download --no-deps --only-binary :all: \
-            --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
-            -d dist "torchnative==${{ inputs.version || '0.0.11a0' }}"
-          ls -la dist
-
-      - name: Verify it computes in a simulator
-        if: matrix.label == 'ios-simulator-arm64'
-        run: python tools/wheel/verify_ios_sim.py dist/torchnative-*-ios_*_iphonesimulator.whl
-
       - name: Install the published wheel
-        if: matrix.label != 'ios-simulator-arm64'
         run: |
           python -m pip install --upgrade pip
           python -m pip install "torchnative==${{ inputs.version || '0.0.9a0' }}"
 
       - name: Which wheel landed
-        if: matrix.label != 'ios-simulator-arm64'
         run: python -m pip show torchnative
 
       - name: Compute
-        if: matrix.label != 'ios-simulator-arm64'
         run: python tools/ci/verify_published.py
 
       # transformers last: if it drags in an upstream torch it would replace
       # ours, and the script's first assertion catches that rather than the
       # run quietly measuring somebody else's build.
       - name: Install transformers
-        if: matrix.label != 'ios-simulator-arm64'
         run: python -m pip install "transformers>=5,<6"
 
       - name: Run a real model
-        if: matrix.label != 'ios-simulator-arm64'
         run: python tools/ci/verify_published.py --model
