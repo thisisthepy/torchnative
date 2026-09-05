@@ -294,22 +294,22 @@ only exists on a platform. Every ✅ has a run behind it.
 
 ### Platforms
 
-| | macOS<br>arm64 | Android<br>arm64 | iOS<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
-|---|:--:|:--:|:--:|:--:|:--:|:--:|
-| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
-| rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ *Pyodide 3.14* |
-| candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| candle **computes** | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
-| extension builds | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
-| wheel builds | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
+| | macOS<br>arm64 | Android<br>arm64 | iOS sim<br>arm64 | iOS device<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
+| rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ *Pyodide 3.14* |
+| candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| candle **computes** | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
+| extension builds | ✅ | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
+| wheel builds | ✅ | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
 | symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
-| `dlopen` + `PyInit_` runs | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | ⚠️ | ⚠️ | ✅ *reported* | ✅ *mounted, no wheel* |
-| `import torch` | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
-| computes | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
-| **on PyPI `0.0.11a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| can be run *here* | ✅ | emulator | ❌ | CI | CI | ✅ *Node* |
+| `dlopen` + `PyInit_` runs | — | — | — | — | — | — | ✅ |
+| installs | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ *mounted, no wheel* |
+| `import torch` | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
+| computes | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
+| **on PyPI `0.0.11a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| can be run *here* | ✅ | emulator | simulator | ❌ | CI | CI | ✅ *Node* |
 
 **Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
 machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
@@ -329,10 +329,17 @@ The same report settled something else the table has no row for. Their interpret
 3.14** and the wheel is `cp313-abi3`. One binary per platform loading on 3.13 and every later
 CPython is the property five published wheels rest on, and until then it had only been argued.
 
-The last row is why the columns differ. **iOS is now the only platform with no way to run**: no
-device here, and no `docker`, `colima`, `podman`, `lima` or `qemu` either — but Linux and Windows do
-not need one, because CI has both. iOS cannot be reached that way (a hosted macOS runner has a
-simulator, which is the rung already measured, not a device), so it stays at *symbols resolve*.
+The last row is why the columns differ, and the iOS column had to become two. **The simulator
+computes**: `verify_ios_sim.py` boots one, unpacks the published wheel into an iOS CPython's
+`site-packages`, and gets `aten.mm`, `x + x` and an `nn.Linear` forward, with `platform.system()`
+answering `iOS`. That runs on every release build and in CI. It was previously reported as ⚠️
+along with the device, which understated it.
+
+**The device is the one platform with no way to run, and CI cannot close it.** A hosted macOS
+runner has a simulator, not an iPhone — the same rung, on somebody else's machine — and the
+simulator runs on the *host* kernel, which its own output says: `uname().version` is this Mac's.
+Same instruction set, different Mach-O platform, separate artefact. So the device column stays at
+*symbols resolve* until a physical device runs it.
 
 WASM is the exception, and it has now been executed. A complete emsdk with `emcc` and a bundled
 Node 24 sits in this machine's cache — `command -v node` finds nothing only because it is not on
@@ -486,11 +493,16 @@ tree, so `import torch` resolves to *this* build.
 | `manylinux_2_17_x86_64` | ✅ | — | — | — |
 | `win_amd64` | ✅ | — | — | — |
 
-The iOS simulator wheel is built but deliberately not published: it loads only under a simulator,
-so on PyPI it would be a trap for anyone whose resolver reached it.
+The iOS simulator wheel **is** published, and this sentence used to say the opposite — that it was
+"deliberately not published" because a resolver reaching it would be trapped. PyPI has carried it
+since `0.0.2a0`; the two iOS wheels differ by platform tag (`iphonesimulator` against `iphoneos`)
+and pip selects on that, so the trap does not exist. Corrected rather than left, because it is the
+kind of claim nobody re-reads.
 
-Linux and Windows are in the same position as iOS and for the same reason — this machine has no
-Linux or Windows runtime and no container tooling, so verification stops at the artefact. Every
+Linux and Windows were in that position and are not any more: CI installs the published wheel on
+`ubuntu-latest` and `windows-latest` and both compute, matching macOS arm64 character for character
+on a real SmolLM2 generation. What follows is the artefact-level check that used to be all there
+was, and it still runs — it catches a broken wheel before anything is uploaded. Every
 import in the Linux wheel resolves, and every import in the Windows one is attributed to a
 naming DLL, which is the stronger of the two checks because PE records a DLL per import where ELF
 records only versioned ones ([`docs/LINUX.md`](docs/LINUX.md),
