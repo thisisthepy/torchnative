@@ -272,7 +272,7 @@ decision about whether a *method* may span two stages, and that question is not
 this round's. The docstring is therefore left exactly as written. Listed in §5
 as the next thing this makes answerable.
 
-### 3.5 OPEN (small) — `torchnative.api.TorchNativeAPI.deploy` accepts a model and does nothing
+### 3.5 DEFERRED — `torchnative.api.TorchNativeAPI.deploy` accepts a model and does nothing
 
 `api/__init__.py:19` defines `TorchNativeAPI` with `__init__` and
 `deploy(self, model)`, both `pass`. A caller who writes
@@ -286,10 +286,29 @@ file as "docstring-only with imports deferred", which is not what it contains �
 that line was written about the `SyntaxError` that used to be on line 4 and did
 not look past it.
 
-**Not closed here** because both honest options change the public surface: make
-`deploy` refuse by name, or remove the class. Either is a withdrawal, and
-withdrawals in this repo are announced (`IntelNPUWithdrawn` is the pattern).
-Recorded for the user to choose.
+**Deferred by the user, 2026-09-13, and left exactly as it is.** Not refused,
+not withdrawn, not implemented.
+
+The framing above was wrong and is kept only so the correction is legible. This
+is not an orphan stub: `DESIGN.md` :961-973 puts it opposite pypackpack's
+`deploy/weight/TorchNativeAPI.kt`, the weight-distribution client, and :1037
+makes it the *only* channel for model weights -- `torch._C` and the fused
+kernels are barred from fast-track and can only be baked into the bundle, so
+weights are the one thing that updates through this path.
+
+That makes both "withdraw" options wrong. Removing the class deletes the seat
+the Kotlin counterpart is meant to take, and refusing by name declares
+impossible something that has merely not been built -- `IntelNPUWithdrawn` is
+the pattern for *tried and cannot*, not for *not yet*.
+
+It cannot be implemented yet either, for the reason `DESIGN.md` :1045 states
+under its own heading: **"Rust 배선은 아직 없다 -- 이것이 1 단계보다 앞선다."**
+The counterpart does not exist, so there is nothing for `deploy` to speak to
+and no wire format to agree on.
+
+**Reopen when:** pypackpack's `deploy/weight/TorchNativeAPI.kt` exists. That
+spec is the input; until it does, a `deploy` written here would be guessing at
+a protocol with one end.
 
 ---
 
@@ -374,8 +393,12 @@ README and understated the count.
   2026-09-12: §3.3 is closed.** `_has_mps` is `is_built()` (`cfg!(target_vendor = "apple")`)
   and `_mps_is_available` is `is_available()` via `torch._C._mps_probe()`. See
   `docs/numerics/DTYPEDEV.md` section 2.
-* **Whether `torchnative.api.TorchNativeAPI` should refuse or be withdrawn.**
-  §3.5. Both are public-surface changes. **Settled by:** the user choosing.
+* ~~**Whether `torchnative.api.TorchNativeAPI` should refuse or be withdrawn.**~~
+  **SETTLED 2026-09-13: neither.** The question was malformed -- it offered two
+  withdrawals for something that was never built rather than tried and failed.
+  `DESIGN.md` :973 makes this the device-side counterpart of pypackpack's
+  weight-distribution client, and :1045 records that the Rust wiring for it does
+  not exist yet. Deferred as-is; see §3.5 for the reopen condition.
 * **`torchnative/nn/__init__.py` is a zero-byte file.** `nn/federated` is
   reached through it and works, so it is functional as a namespace anchor, but
   every other subpackage in this tree carries a docstring saying what it is.
