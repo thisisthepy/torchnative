@@ -108,6 +108,17 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   prefers the CPU at batch 1 — and a decode step is batch 1 by
   definition. **This arm is a prefill story, not a decode story.**
 
+  **The table stands; the explanation attached to it does not, and
+  [`../graph/ANEDECODE.md`](../graph/ANEDECODE.md) supersedes this bullet.**
+  The reason is not that one token is too little work. `ios16.linear` at
+  batch 1 is CPU-preferred at *every* width out to 49152 and in a program
+  holding 64 of them, while the same arithmetic as a 1x1 `ios16.conv` over a
+  rank-4 `(1, C, 1, 1)` tensor crosses to the unit — so the **form** decides.
+  What size decides is a **per-program** threshold of about 4.7M weights,
+  which one leaf per program cannot reach. `lm_head` reports
+  `preferred: NeuralEngine` at batch 1 since that rewrite; the other four
+  still report CPU.
+
 - **float16 does not meet the agreement bar** that float32 meets.
   float32 is 2.7e-06 (linear) and 4.5e-06 (conv) against `verify`'s own
   2e-05; float16 is 1.5e-03 and 1.26e-03 under its own, weaker, named
@@ -119,6 +130,16 @@ than "it runs on the Neural Engine", and §3 says exactly how narrow.
   ANE-*preferred*, at every size tried. Swapping such a leaf buys a
   tensor round trip and does not reach the unit. `gather` is not in the
   supported column at all; `matmul` is, but attention is not a leaf.
+
+  **"At every size tried" was varying the wrong thing**, and
+  [`../graph/ANEDECODE.md`](../graph/ANEDECODE.md) §4 withdraws this
+  measurement. Those leaves were each measured as a *one-operation program*,
+  which holds no weights and so can never clear the per-program threshold
+  ANEDECODE.md §3 establishes — the rejection was decided by a number that
+  could only ever have come out that way. Inside a program that does clear it,
+  `silu`, `mul` and `add` are NeuralEngine-*preferred* like everything else.
+  Whether swapping them as leaves is worth it is unchanged: a per-leaf program
+  still cannot reach the threshold, so the conclusion survives its reasoning.
 
 - **Intel NPU and Qualcomm are unchanged.** A user reported
   `to(device.npu)` ending the process on a Windows Intel NPU laptop on

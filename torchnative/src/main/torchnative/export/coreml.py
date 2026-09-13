@@ -1269,6 +1269,13 @@ class _CoreMLLinear:
             self._bias_np = _np(self.bias) if self.bias is not None else None
         return self._weight_np, self._bias_np
 
+    #: The input shape a batch-1 program is given, as a function of
+    #: `in_features`. Rank 4, `(B, C, 1, S)`, which is Apple's
+    #: `ml-ane-transformers` layout and the shape `mb.conv` needs.
+    @staticmethod
+    def _rank4(in_features):
+        return (1, in_features, 1, 1)
+
     def _compile_for(self, batch: int, *, probe: bool = False):
         if batch in self._compiled:
             return self._compiled[batch]
@@ -1281,9 +1288,39 @@ class _CoreMLLinear:
         if bias is not None:
             kwargs["bias"] = bias
 
-        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, self.in_features))])
-        def program(x):
-            return mb.linear(x=x, **kwargs)
+        if batch == 1:
+            # docs/graph/ANEDECODE.md: a rank-2 `ios16.linear` at batch 1 is
+            # CPU-*preferred* at every output width measured, up to 49152, and
+            # stays CPU-preferred in a program holding 64 of them. The same
+            # arithmetic as a 1x1 `ios16.conv` over `(1, C, 1, 1)` is not --
+            # 576->49152 crosses to the Neural Engine. So the form is the
+            # variable and the size is not, which is why this is a rewrite and
+            # not a threshold.
+            #
+            # **Only at batch 1**, and that bound is measured too, in the
+            # opposite direction: `(1, 576, 1, S)` conv stays CPU-preferred out
+            # to S=128 while a rank-2 `linear` at batch 128 is
+            # NeuralEngine-preferred. Applying this above batch 1 would trade
+            # the prefill result docs/graph/NPU2.md §8.2 reports as working for
+            # nothing. `_compile_for` is keyed by batch, so the two forms never
+            # meet.
+            #
+            # It costs no accuracy: the dot products are identical and the
+            # 576->576 output is bit-for-bit what the linear form produced.
+            kwargs["weight"] = weight.reshape(
+                self.out_features, self.in_features, 1, 1)
+            spec = mb.TensorSpec(shape=self._rank4(self.in_features))
+
+            @mb.program(input_specs=[spec])
+            def program(x):
+                return mb.conv(x=x, strides=[1, 1], pad_type="custom",
+                               pad=[0, 0, 0, 0], dilations=[1, 1], groups=1,
+                               **kwargs)
+        else:
+            @mb.program(
+                input_specs=[mb.TensorSpec(shape=(batch, self.in_features))])
+            def program(x):
+                return mb.linear(x=x, **kwargs)
 
         units = self._units()
         model = ct.convert(
@@ -1321,8 +1358,13 @@ class _CoreMLLinear:
         for dim in shape[:-1]:
             batch *= dim
         model = self._compile_for(batch)
-        feed = _feed_buffer(self._feeds, batch, (batch, self.in_features))
-        feed[...] = _np(x.detach()).reshape(batch, self.in_features)
+        # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
+        # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
+        # never share a key, because `_compile_for` never emits both for one.
+        fed = (self._rank4(self.in_features) if batch == 1
+               else (batch, self.in_features))
+        feed = _feed_buffer(self._feeds, batch, fed)
+        feed[...] = _np(x.detach()).reshape(fed)
         produced = list(_predict(
             model,
             {model.get_spec().description.input[0].name: feed}).values())[0]

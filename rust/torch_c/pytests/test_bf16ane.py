@@ -206,6 +206,27 @@ try:
             "supported": sorted({d for r in rows for d in r["supported"]}),
             "ops": [r["op"] for r in rows],
         }
+    # -- 2a. the same question at a size that clears the program threshold -
+    #
+    # 576 -> 1536 holds 0.88M weights, an order of magnitude under the ~4.7M
+    # `docs/graph/ANEDECODE.md` §3 measures, so its batch-1 CPU verdict says
+    # nothing about bfloat16: a float16 leaf of that shape is CPU-preferred
+    # too. 576 -> 49152 holds 28.3M and is the one shape a per-leaf program
+    # carries on its own, so it is where "are bfloat16-sourced weights
+    # excluded from the conv path on the unit?" can actually be asked.
+    wh = torch.randn(49152, 576).to(torch.bfloat16)
+    bh = torch.randn(49152).to(torch.bfloat16)
+    head = C._CoreMLLinear(wh, bh, precision="float16",
+                           compute_units=ct.ComputeUnit.ALL)
+    head._compile_for(1, probe=True)
+    rows = C.computes(head._report["plans"][-1]["rows"])
+    out["bf16_head"] = {
+        "preferred": sorted({r["preferred"] for r in rows}),
+        "supported": sorted({d for r in rows for d in r["supported"]}),
+        "ops": [r["op"] for r in rows],
+    }
+    del wh, bh, head
+
     # It runs, from a bfloat16 input, and hands a bfloat16 tensor back.
     leaf = C._CoreMLLinear(w, b, precision="float16",
                            compute_units=ct.ComputeUnit.ALL)
@@ -843,15 +864,56 @@ def test_a_bfloat16_linear_reaches_the_unit_at_the_size_that_reaches_it():
     Same leaf, same shape, two batches: the unit is supported at both and
     preferred only at the larger one. If widening bfloat16 had changed the
     program CoreML sees, this is where it would show.
+
+    **The op name at batch 1 changed and the verdict did not.**
+    `docs/graph/ANEDECODE.md` rewrites a batch-1 leaf as a 1x1 `ios16.conv`
+    over rank-4 `(1, C, 1, 1)`, so `ops` here reads `ios16.conv` where it
+    used to read `ios16.linear`. That is asserted rather than relaxed,
+    because *which* form the leaf emits at batch 1 is now a decision this
+    repository makes and a silent return to `linear` would cost `lm_head`
+    the unit.
+
+    What did **not** change is `preferred`: CPU at batch 1, NeuralEngine at
+    128. It would have been easy to read that CPU as "the conv rewrite is a
+    regression for bfloat16", and it is not one -- 576 -> 1536 holds 0.88M
+    weights and the program threshold §3 measures is ~4.7M, so this shape is
+    CPU-preferred at batch 1 in *either* form and at float16 as well
+    (`test_anedecode.py::test_the_four_projection_shapes_are_still_cpu_at_batch_one`
+    asserts exactly that for the float16 leaf of this shape). The dtype the
+    weights arrived in is not what decides it, which is this test's premise
+    and is still true. `test_a_bfloat16_linear_is_not_excluded_from_the_conv_path`
+    is the positive control for that claim.
     """
     r = _fixture_or_skip()
     if r is None:
         return
     small, large = r["bf16_linear"]["1"], r["bf16_linear"]["128"]
-    assert small["ops"] == ["ios16.linear"], small
+    assert small["ops"] == ["ios16.conv"], small
     assert "NeuralEngine" in small["supported"], small
     assert small["preferred"] == ["CPU"], small
+    assert large["ops"] == ["ios16.linear"], large
     assert large["preferred"] == ["NeuralEngine"], large
+
+
+def test_a_bfloat16_linear_is_not_excluded_from_the_conv_path():
+    """The control that makes the CPU verdict above a size and not a dtype.
+
+    A bfloat16 `Linear` of 576 -> 49152, widened to float16 by this file's
+    own path, compiled at batch 1 through the conv rewrite: **NeuralEngine**.
+    So bfloat16-sourced weights reach the unit through `ios16.conv` at the
+    size where anything does, and the batch-1 CPU result one test above is
+    the ~4.7M program threshold rather than a bfloat16 exclusion.
+
+    Without this, "bfloat16 at batch 1 is CPU" and "bfloat16 cannot use the
+    conv path" are the same observation, and the first would have been read
+    as the second.
+    """
+    r = _fixture_or_skip()
+    if r is None:
+        return
+    head = r["bf16_head"]
+    assert head["ops"] == ["ios16.conv"], head
+    assert head["preferred"] == ["NeuralEngine"], head
 
 
 def test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not():
@@ -905,6 +967,24 @@ def test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears():
     This is asserted rather than reported so that a change which made batch 1
     reach the unit would go red and be looked at, instead of quietly
     improving a claim nobody re-measured.
+
+    **It went red, and this is the looking at it.** `docs/graph/ANEDECODE.md`
+    found that the attribution above -- "a 576-wide projection of one token is
+    not enough work" -- is wrong. Size is not what excludes a batch-1 leaf: a
+    rank-2 `ios16.linear` is CPU-preferred at batch 1 at *every* output width
+    out to 49152 and in a program holding 64 of them, so there is no amount of
+    work that buys it the unit. The *form* is what excludes it, and the same
+    arithmetic as a 1x1 `ios16.conv` over rank-4 `(1, C, 1, 1)` is not
+    excluded. With that rewrite in `_CoreMLLinear`, `lm_head` -- 28.3M weights,
+    the only shape in this model large enough to clear the ~4.7M-weight
+    *program* threshold on its own, since this project compiles one program
+    per leaf -- now reaches the NeuralEngine at batch 1.
+
+    So the title is no longer "none of its linears", and rather than delete
+    the test or soften it to something that cannot fail, it asserts the
+    partition: the four projections are still CPU at batch 1, `lm_head` is
+    NeuralEngine, and both halves go red if either moves. The intent is
+    unchanged -- an unre-measured improvement still cannot pass through here.
     """
     r = _smol_or_skip()
     if r is None:
@@ -912,8 +992,9 @@ def test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears():
     plans = r["smol_plans"]
     assert set(plans) == {"576->1536", "576->576", "576->192",
                           "1536->576", "576->49152"}, sorted(plans)
-    for shape, entry in sorted(plans.items()):
-        assert entry["1"] == ["CPU"], (shape, entry)
+    for shape in ("576->1536", "576->576", "576->192", "1536->576"):
+        assert plans[shape]["1"] == ["CPU"], (shape, plans[shape])
+    assert plans["576->49152"]["1"] == ["NeuralEngine"], plans["576->49152"]
     # And the same leaves at a prefill-shaped batch are not all CPU, so the
     # assertion above is about the size and not about the lowering.
     reached = [s for s, e in plans.items() if e["128"] == ["NeuralEngine"]]
@@ -944,9 +1025,15 @@ def test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token():
 
 
 def test_the_shape_that_never_reaches_the_unit_is_the_output_projection():
-    """576->49152 is CPU-preferred at batch 128 too -- the one shape in this
-    model for which prefill does not help either. Named because "most of it
-    reaches the unit at prefill" is true and "all of it does" is not."""
+    """576->49152 is CPU-preferred at batch 128 -- the one shape in this
+    model for which prefill does not help. Named because "most of it
+    reaches the unit at prefill" is true and "all of it does" is not.
+
+    The name says "never" and that is now only true of batch 128. At batch 1
+    this same shape is the *only* one that does reach the unit, through
+    `docs/graph/ANEDECODE.md`'s conv rewrite -- so the two batches have
+    swapped which of them is the exception, and the assertion here is
+    deliberately still about 128 alone."""
     r = _smol_or_skip()
     if r is None:
         return

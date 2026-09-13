@@ -26377,9 +26377,19 @@ print(json.dumps(out))
 #: is written at the end to a dup of the original. Nothing but the JSON can
 #: reach the parent's stdout, whoever writes it and from whatever language.
 #:
-#: A script that splices this in must `import io, os, sys` above it and print
-#: its JSON with `file=_stdout, flush=True`.
-_STDOUT_GUARD = r"""_stdout = os.fdopen(os.dup(1), "w")
+#: The guard carries its own `import io, os, sys`. It used to require the
+#: splicing script to have imported all three above it, which is a contract
+#: that is invisible until it is broken: `test_anedecode.py` imported `json`,
+#: `os` and `sys` but not `io`, and every one of its nine tests died *inside
+#: the guard* with `NameError: name 'io' is not defined` -- reported by
+#: `_npu_fixture` as `npu subprocess exited 1`, which names the symptom and
+#: not the cause. Re-importing three stdlib modules costs nothing and no
+#: script can get it wrong, so the requirement is gone rather than restated.
+#:
+#: A script that splices this in must print its JSON with
+#: `file=_stdout, flush=True`.
+_STDOUT_GUARD = r"""import io, os, sys
+_stdout = os.fdopen(os.dup(1), "w")
 _sink = os.open(os.devnull, os.O_WRONLY)
 os.dup2(_sink, 1)
 os.close(_sink)

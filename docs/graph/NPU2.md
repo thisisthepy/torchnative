@@ -693,6 +693,23 @@ mistaken for "the Neural Engine ran it". That is §1's failure, refused.
 **So the honest summary is: generation on this arm is a prefill story, not a
 decode story.** Nothing measured here reaches the unit one token at a time.
 
+> **Superseded in its explanation by [`ANEDECODE.md`](ANEDECODE.md); the table
+> above is reproduced there unchanged and was re-measured before anything was
+> altered.** The sentence to strike is "CoreML weighs dispatch cost against
+> work, and one token through a 576-wide projection is not enough work". It is
+> not a work threshold. A rank-2 `ios16.linear` at batch 1 is CPU-preferred at
+> every width out to 49152 *and* in a program holding 64 of them — 21M weights
+> — while the **same arithmetic** as a 1x1 `ios16.conv` over `(1, C, 1, 1)`
+> reaches the unit. The size that does matter is counted **per program, in
+> weights**, not in arithmetic: a 576→576 conv at S=128 does 42M MACs and stays
+> on the CPU, while sixteen of them at S=1 do 5.3M MACs and do not. This
+> project compiles one program per leaf, so the sentence above described a
+> property of the lowering as a property of the token.
+>
+> `lm_head` is the one shape that clears the threshold on its own, and it is
+> NeuralEngine-preferred at batch 1 since the conv rewrite. The other four are
+> not; ANEDECODE.md §7 says what they would need.
+
 ### 8.3 The first forward ended the process — and the first diagnosis was wrong
 
 This section replaces one that was published here and is **superseded**. What
