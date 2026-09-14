@@ -15755,17 +15755,12 @@ def test_kernels26_road_through_the_vendored_tree():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    import vulkan_coverage
+
+    # `run_tests` prints ok / FAIL exactly as the loop here used to, plus SKIP
+    # for a test that could not reach a Vulkan device (docs/devices/VULKAN5.md §2).
+    failures = vulkan_coverage.run_tests(
+        [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")])
     print(f"\ntarget={_C._shim_target()} implemented={_C._aten_implemented()}")
     return 1 if failures else 0
 
@@ -25898,18 +25893,24 @@ def _sip_stripped_the_loader_path():
 
 def _vulkan_or_skip(what):
     """A live `vulkan` device, or None having said why not."""
+    import vulkan_coverage
+
     probe = _C._vulkan_probe()
     if not probe["available"]:
         if _sip_stripped_the_loader_path():
-            print(f"   (skipped {what}: VK_DRIVER_FILES is set but "
-                  "DYLD_LIBRARY_PATH is not -- macOS SIP strips DYLD_* when "
-                  "exec'ing /bin/sh, so run.sh never received it. Pass it as "
-                  "TORCH_C_DYLD_LIBRARY_PATH instead, which run.sh re-exports "
-                  "(docs/devices/VULKAN3.md §6.1). The loader said: "
-                  f"{str(probe['error']).splitlines()[0]})")
-            return None
-        print(f"   (skipped {what}: no vulkan -- {str(probe['error']).splitlines()[0]})")
+            reason = (f"{what}: VK_DRIVER_FILES is set but "
+                      "DYLD_LIBRARY_PATH is not -- macOS SIP strips DYLD_* when "
+                      "exec'ing /bin/sh, so run.sh never received it. Pass it as "
+                      "TORCH_C_DYLD_LIBRARY_PATH instead, which run.sh re-exports "
+                      "(docs/devices/VULKAN3.md §6.1). The loader said: "
+                      f"{str(probe['error']).splitlines()[0]}")
+        else:
+            reason = f"{what}: no vulkan -- {str(probe['error']).splitlines()[0]}"
+        print(f"   (skipped {reason})")
+        # A skip is its own outcome, not an `ok` (docs/devices/VULKAN5.md §2).
+        vulkan_coverage.vulkan_skip(reason)
         return None
+    vulkan_coverage.vulkan_used(probe["device"])
     return _C.device("vulkan")
 
 
@@ -25923,7 +25924,9 @@ def test_vulkan_probe_answers_the_same_question_the_device_does():
     can happen without this disagreeing.
     """
     probe = _C._vulkan_probe()
-    assert set(probe) == {"available", "device", "type", "queue_family", "error"}, probe
+    assert set(probe) == {"available", "device", "type", "queue_family", "loader", "error"}, probe
+    # Which loader was opened is evidence, and absence of one is not a path.
+    assert (probe["loader"] is not None) == probe["available"], probe
     try:
         t = _C._aten_dispatch("aten.ones.default", [1], device=_C.device("vulkan"))
     except NotImplementedError as e:

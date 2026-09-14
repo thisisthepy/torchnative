@@ -13061,7 +13061,7 @@ fn resolve_shape(op: &str, requested: &[isize], numel: usize) -> PyResult<Vec<us
     Ok(out)
 }
 
-fn shape_arg(
+pub(crate) fn shape_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -23983,7 +23983,7 @@ fn multinomial_default(
 /// those rules read. Python `bool` lands in `Int` -- it subclasses `int` and
 /// torch treats it as an integral scalar in these positions.
 #[derive(Clone, Copy)]
-enum Scalar {
+pub(crate) enum Scalar {
     Int(i64),
     Float(f64),
 }
@@ -23993,7 +23993,7 @@ impl Scalar {
         matches!(self, Scalar::Int(_))
     }
 
-    fn as_f64(self) -> f64 {
+    pub(crate) fn as_f64(self) -> f64 {
         match self {
             Scalar::Int(v) => v as f64,
             Scalar::Float(v) => v,
@@ -24008,11 +24008,11 @@ impl Scalar {
     }
 }
 
-fn missing(op: &str, name: &str) -> PyErr {
+pub(crate) fn missing(op: &str, name: &str) -> PyErr {
     pyo3::exceptions::PyTypeError::new_err(format!("{op}: missing required argument '{name}'"))
 }
 
-fn scalar_arg(
+pub(crate) fn scalar_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -24108,7 +24108,7 @@ fn int_arg(
     }
 }
 
-fn dim_arg(
+pub(crate) fn dim_arg(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
@@ -24120,7 +24120,7 @@ fn dim_arg(
     }
 }
 
-fn bool_arg(
+pub(crate) fn bool_arg(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
@@ -24347,7 +24347,7 @@ pub(crate) fn tensor_arg(
 /// `tensor_arg` for a `Tensor?` slot. `None` and an absent argument are the
 /// same answer -- `native_layer_norm(x, [4], None, None, eps)` is how a
 /// `nn.LayerNorm(elementwise_affine=False)` arrives.
-fn optional_tensor_arg(
+pub(crate) fn optional_tensor_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,

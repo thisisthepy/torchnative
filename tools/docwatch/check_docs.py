@@ -166,10 +166,22 @@ class LiveFactsError(RuntimeError):
     tell" into one outcome is the bug, not a simplification."""
 
 
+class LiveFactsSkip(RuntimeError):
+    """Ground truth that only some machines can produce, and this one did not.
+
+    Reported SKIP, with the reason, rather than PASS or FAIL. The case it
+    exists for is Vulkan (docs/devices/VULKAN5.md §2): a claim that the Vulkan
+    kernels agree with upstream cannot be checked on a machine with no loader,
+    and the two wrong answers are both available -- PASS would repeat the
+    false green this marker was added to end, and FAIL would make every CI
+    machine without a GPU red for a claim nobody there could have tested."""
+
+
 class LiveFacts:
     def __init__(self, python_exe: str, env: dict[str, str]):
         self.python_exe = python_exe
         self.env = env
+        self._vulkan_cache: dict | None = None
         self._shim_cache: dict | None = None
         self._golden_cache: dict | None = None
         self._schema_cache: dict | None = None
@@ -302,6 +314,39 @@ class LiveFacts:
                 self._smoke_cache = ok_count
         return self._smoke_cache
 
+    # -- rust/torch_c/pytests/test_vulkan4.py `VULKAN:` tally -----------------
+    def vulkan(self) -> dict:
+        if self._vulkan_cache is None:
+            artefact = self.env.get("TORCH_C_ARTEFACT")
+            if not artefact or not os.path.isfile(artefact):
+                raise LiveFactsError(f"TORCH_C_ARTEFACT={artefact!r} is not a file; vulkan_tests_ok needs a built artefact")
+            pytests = REPO_ROOT / "rust" / "torch_c" / "pytests"
+            with tempfile.TemporaryDirectory(prefix="docwatch-vulkan-") as stage:
+                import shutil
+
+                shutil.copy(artefact, os.path.join(stage, "_C.abi3.so"))
+                env = dict(self.env)
+                env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests}"
+                proc = subprocess.run(
+                    [self.python_exe, str(pytests / "test_vulkan4.py")],
+                    capture_output=True, text=True, cwd=REPO_ROOT, env=env,
+                )
+            m = re.search(r"^VULKAN: ran=(\d+) ok=(\d+) failed=(\d+) skipped=(\d+) device=(.*)$",
+                          proc.stdout, re.MULTILINE)
+            if not m:
+                raise LiveFactsError(f"test_vulkan4.py exit={proc.returncode} printed no VULKAN: tally; stderr={proc.stderr[-400:]}")
+            ran, ok, failed, skipped = (int(g) for g in m.groups()[:4])
+            self._vulkan_cache = {"ran": ran, "ok": ok, "failed": failed, "skipped": skipped, "device": m.group(5)}
+        return self._vulkan_cache
+
+    def vulkan_tests_ok(self) -> int:
+        v = self.vulkan()
+        if v["ran"] == 0:
+            raise LiveFactsSkip(
+                f"no Vulkan test executed on this host ({v['skipped']} skipped) -- "
+                "the claim is unmeasured here, not confirmed")
+        return v["ok"]
+
     # -- rust/torch_c/pytests/decomp_sweep.py, vendored-tree import --------
     def decomp(self) -> dict:
         if self._decomp_cache is None:
@@ -398,6 +443,8 @@ class LiveFacts:
 
 COUNT_SOURCES = {
     "smoke_ok": lambda lf: lf.smoke_ok(),
+    # SKIP, never PASS, on a host where no Vulkan test ran (LiveFactsSkip).
+    "vulkan_tests_ok": lambda lf: lf.vulkan_tests_ok(),
     "golden_cases_passed": lambda lf: lf.golden()["golden_cases_passed"],
     "golden_cases_failed": lambda lf: lf.golden()["golden_cases_failed"],
     "golden_cases_total": lambda lf: lf.golden()["golden_cases_total"],
@@ -552,6 +599,8 @@ def evaluate(claims: list[Claim], live: LiveFacts | None) -> list[Result]:
 
         except LiveFactsError as e:
             results.append(Result(c, "ERROR", str(e)))
+        except LiveFactsSkip as e:
+            results.append(Result(c, "SKIP", str(e)))
     return results
 
 

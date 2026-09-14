@@ -53,6 +53,7 @@ import struct
 import subprocess
 import sys
 
+import vulkan_coverage
 from test_shim import _C
 
 
@@ -90,8 +91,12 @@ def _vulkan_or_skip(what):
     """
     probe = _C._vulkan_probe()
     if not probe["available"]:
-        print(f"   (skipped {what}: no vulkan loader here -- {probe['error']})")
+        reason = f"{what}: no vulkan loader here -- {probe['error']}"
+        # Recorded, so the runner prints `SKIP <test>: <reason>` and not ok
+        # (docs/devices/VULKAN5.md §2); that line carries the loader's words.
+        vulkan_coverage.vulkan_skip(reason)
         return None
+    vulkan_coverage.vulkan_used(probe["device"])
     return probe
 
 
@@ -146,6 +151,7 @@ def _upstream():
         import torch
     except Exception as e:  # noqa: BLE001
         print(f"   (skipped: no upstream torch here -- {type(e).__name__})")
+        vulkan_coverage.vulkan_skip(f"no upstream torch here -- {type(e).__name__}")
         return None
     # The oracle must not be the thing under test. If `torch` on this path is
     # the shim, every agreement number below would be the shim agreeing with
@@ -534,6 +540,10 @@ EXPECTED_DISPATCHES = {
     "aten.transpose.int": (1, 1),
     "aten.mm.default": (1, 2),
     "aten.addmm.default": (2, 3),
+    "aten.gelu.default": (1, 1),
+    "aten._softmax.default": (1, 1),
+    "aten.native_layer_norm.default": (1, 1),
+    "aten.bmm.default": (1, 2),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -571,6 +581,10 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
     b = _to_vulkan(_cpu([6.0, 5.0, 4.0, 3.0, 2.0, 1.0], [2, 3]))
     sq = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]))
     bias = _to_vulkan(_cpu([0.5, 1.5], [2]))
+    a3 = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [1, 2, 3]))
+    b3 = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [1, 3, 2]))
+    w3 = _to_vulkan(_cpu([0.5, 1.0, 2.0], [3]))
+    c3 = _to_vulkan(_cpu([0.1, 0.2, 0.3], [3]))
 
     taught = set(_C._vulkan_ops())
     assert taught == set(EXPECTED_DISPATCHES) | {"aten._to_copy.default"}, (
@@ -584,6 +598,12 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
             args = (bias, a, sq)
         elif op == "aten.transpose.int":
             args = (a, 0, 1)
+        elif op == "aten._softmax.default":
+            args = (a, -1, False)
+        elif op == "aten.native_layer_norm.default":
+            args = (a, [3], w3, c3, 1e-5)
+        elif op == "aten.bmm.default":
+            args = (a3, b3)
         elif op in ("aten.view.default", "aten._unsafe_view.default",
                     "aten.reshape.default"):
             args = (a, [6])
@@ -594,6 +614,9 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
         before = _counters()
         out = _C._aten_dispatch(op, *args)
         d = _delta(before, _counters())
+        if isinstance(out, tuple):  # native_layer_norm: (out, mean, invstd)
+            assert all(str(o.device) == "vulkan" for o in out), (op, out)
+            out = out[0]
         assert str(out.device) == "vulkan", (op, out.device)
         assert d["shader_dispatches"] == expected, (
             f"{op} ran {d['shader_dispatches']} compute shaders, expected "
@@ -695,7 +718,7 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
     try:
         import torch.nn as nn
     except Exception:  # noqa: BLE001
-        print("   (skipped the module forward: no torch.nn upstream)")
+        vulkan_coverage.vulkan_skip("the module forward: no torch.nn upstream")
         return
 
     i, h, o, batch = 12, 32, 6, 5
@@ -718,8 +741,12 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
     assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-3000:])
     got = json.loads(proc.stdout)
     if not got["probe"]["available"]:
-        print(f"   (skipped the module forward: the vendored-tree subprocess "
-              f"has no loader -- {got['probe']['error']})")
+        # This printed "(skipped ...)" and then `ok` -- measured, on a host
+        # where this process had a loader and the vendored `_C` was a build
+        # that did not search Homebrew's prefix (docs/devices/VULKAN5.md §2).
+        vulkan_coverage.vulkan_skip(
+            f"the module forward: the vendored-tree subprocess has no loader -- "
+            f"{got['probe']['error']}")
         return
 
     assert got["device"].startswith("vulkan"), got["device"]
@@ -778,12 +805,26 @@ def test_a_transformer_still_does_not_forward_and_the_wall_is_named():
     if _vulkan_or_skip("the named transformer wall") is None:
         return
     taught = set(_C._vulkan_ops())
-    walls = ("aten.native_layer_norm.default", "aten._softmax.default",
-             "aten.gelu.default", "aten.embedding.default", "aten.bmm.default")
+    # docs/devices/VULKAN5.md §4: four of the five walls are taught now. They
+    # are asserted taught, so dropping one fails here too.
+    fell = ("aten.native_layer_norm.default", "aten._softmax.default",
+            "aten.gelu.default", "aten.bmm.default")
+    assert all(op in taught for op in fell), sorted(set(fell) - taught)
+    # `embedding` is the first op of every transformer forward, and its index
+    # operand is int64 while this device stores float32 only -- so no
+    # transformer reaches even its second op. `expand` is on the same trace.
+    walls = ("aten.embedding.default", "aten.expand.default")
     still = [op for op in walls if op not in taught]
     assert still == list(walls), (
-        f"these are taught now and docs/devices/VULKAN4.md §5 needs updating: "
+        f"these are taught now and docs/devices/VULKAN5.md §4 needs updating: "
         f"{sorted(set(walls) - set(still))}")
+    idx = _C._tensor_from_flat([0, 1], [2], dtype=_C.int64)
+    try:
+        _to_vulkan(idx)
+    except NotImplementedError as e:
+        assert "int64" in str(e) and "float32" in str(e), str(e)
+    else:
+        raise AssertionError("an int64 index tensor reached the vulkan device")
 
 
 # ---------------------------------------------------------------------------
@@ -901,20 +942,320 @@ def test_every_shader_on_disk_is_reachable_from_the_dispatcher():
             f"vulkan.rs names {stem!r}")
 
 
-def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
+# ---------------------------------------------------------------------------
+# 8. Finding the loader (docs/devices/VULKAN5.md §1)
+# ---------------------------------------------------------------------------
+
+def test_a_loader_installed_where_this_build_searches_is_found():
+    """A loader on disk at a searched path must not produce "failed to load".
+
+    The defect this holds down: Homebrew's `vulkan-loader` puts
+    `libvulkan.dylib` in `/opt/homebrew/lib`, which is not on dyld's default
+    search path, so a bare `dlopen("libvulkan.dylib")` misses it and every
+    Vulkan test skipped on a machine that had a loader.
+
+    The places to check are listed **here**, not read back from the
+    extension. The first version of this test took them from
+    `_vulkan_loader_candidates()`, and deleting the Homebrew fallback left it
+    green: the path vanished from the list it was checked against at the same
+    moment (docs/devices/VULKAN5.md §5.1). On a machine with none of these on
+    disk there is nothing to assert, and it says so.
+    """
+    known = ["/opt/homebrew/lib/libvulkan.1.dylib", "/usr/local/lib/libvulkan.1.dylib"]
+    if os.environ.get("VULKAN_SDK"):
+        known.append(os.path.join(os.environ["VULKAN_SDK"], "lib", "libvulkan.1.dylib"))
+    candidates = _C._vulkan_loader_candidates()
+    assert candidates, "the extension names no place to look for a Vulkan loader"
+    probe = _C._vulkan_probe()
+    if probe["available"]:
+        assert probe["loader"] in candidates, (probe, candidates)
+        print(f"   loader {probe['loader']} -> {probe['device']} ({probe['type']})")
+    on_disk = [p for p in known if os.path.exists(p)] if sys.platform == "darwin" else []
+    if not on_disk:
+        print(f"   no known macOS loader location exists here; searched {candidates}")
+        return
+    missing = [p for p in on_disk if p not in candidates]
+    assert not missing, f"{missing} exist on disk but the extension never looks there: {candidates}"
+    assert not str(probe["error"] or "").startswith("failed to load the Vulkan loader"), (
+        f"{on_disk} exist on disk and are searched, yet the loader was not "
+        f"loaded: {probe['error']}")
+
+
+# ---------------------------------------------------------------------------
+# 9. The four transformer kernels -- values (docs/devices/VULKAN5.md §3)
+# ---------------------------------------------------------------------------
+
+def _rel(xs, truth):
+    scale = max(abs(v) for v in truth) or 1.0
+    return max(abs(x - y) for x, y in zip(xs, truth)) / scale
+
+
+def _elem_ratio(xs, want32, truth):
+    """Worst per-element distance from the float64 truth, as a multiple of
+    upstream float32's own distance on *that element* (floored at one ulp of
+    it). The tensor-scale metric above is AGREE's and is what is asserted;
+    this is printed so a small element that is far off in its own terms is
+    visible rather than averaged into a large scale. Measured in ulp it read
+    8388608 for shim and upstream alike wherever the truth underflows float32,
+    which said nothing about either -- hence the ratio."""
+    worst = 0.0
+    for x, u, t in zip(xs, want32, truth):
+        allowed = max(abs(u - t), abs(t) * FLOAT32_EPS, 1e-38)
+        worst = max(worst, abs(x - t) / allowed)
+    return worst
+
+
+def _assert_agreement(name, cases):
+    """`cases`: (label, shim, upstream float32, upstream float64) flat lists.
+
+    The tolerance is re-derived from *this* population's upstream float32 vs
+    float64 error (docs/numerics/AGREE.md §2), per op, never chosen.
+    """
+    rows, up_errs = [], []
+    for label, got, want32, truth in cases:
+        assert len(got) == len(want32) == len(truth), (label, len(got), len(want32), len(truth))
+        up = _rel(want32, truth)
+        rows.append((label, _rel(got, truth), up,
+                     sum(_bits(x) != _bits(y) for x, y in zip(got, want32)), len(got),
+                     _elem_ratio(got, want32, truth)))
+        up_errs.append(up)
+    tol, p90 = _derived_tolerance(up_errs)
+    worst = max(rows, key=lambda r: r[1])
+    print(f"   {name}: {len(rows)} cases, tolerance max(p90 {p90:.3e}, 8 ulp {8 * FLOAT32_EPS:.3e}) "
+          f"= {tol:.3e}; worst shim {worst[1]:.3e} at {worst[0]} (upstream's own {worst[2]:.3e}); "
+          f"{sum(r[3] for r in rows)}/{sum(r[4] for r in rows)} elements differ in bits from upstream f32; "
+          f"worst element {max(r[5] for r in rows):.2f}x upstream's own error on it")
+    for label, shim, up, *_ in rows:
+        assert shim <= tol, (
+            f"{label}: shim {shim:.3e} from the float64 truth exceeds the derived "
+            f"tolerance {tol:.3e} (upstream float32's own error {up:.3e})")
+
+
+def _up_flat(t):
+    return t.reshape(-1).tolist()
+
+
+GELU_SHAPES = ((4, 5), (7, 33), (2, 3, 64), (1025,))
+
+
+def test_gelu_agrees_with_upstream_at_a_derived_tolerance():
+    """Both `approximate` modes, on `3 * randn` so the tails are exercised."""
+    if _vulkan_or_skip("the gelu agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    import torch.nn.functional as F
+    for approximate in ("none", "tanh"):
+        cases = []
+        for i, shape in enumerate(GELU_SHAPES):
+            a = _rand(torch, *shape, seed=500 + i) * 3.0
+            out = _C._aten_dispatch("aten.gelu.default",
+                                    _to_vulkan(_cpu(_up_flat(a), shape)),
+                                    approximate=approximate)
+            assert list(out.shape) == list(shape), (out.shape, shape)
+            cases.append((f"gelu[{approximate}]{list(shape)}", _flat(_to_cpu(out)),
+                          _up_flat(F.gelu(a, approximate=approximate)),
+                          _up_flat(F.gelu(a.double(), approximate=approximate))))
+        _assert_agreement(f"gelu approximate={approximate}", cases)
+
+
+# (shape, dim, input scale) -- scale 8 makes rows peaky, which is where a
+# softmax that forgot to subtract the max overflows.
+SOFTMAX_CASES = (((4, 5), -1, 1.0), ((3, 7), 1, 4.0), ((2, 3, 64), 2, 1.0),
+                 ((2, 512), -1, 8.0), ((5, 1), -1, 1.0), ((3, 9), -1, 40.0))
+
+
+def test_softmax_agrees_with_upstream_at_a_derived_tolerance():
+    if _vulkan_or_skip("the softmax agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, (shape, dim, scale) in enumerate(SOFTMAX_CASES):
+        a = _rand(torch, *shape, seed=600 + i) * scale
+        out = _C._aten_dispatch("aten._softmax.default",
+                                _to_vulkan(_cpu(_up_flat(a), shape)), dim, False)
+        assert list(out.shape) == list(shape), (out.shape, shape)
+        cases.append((f"softmax{list(shape)} dim={dim} x{scale}", _flat(_to_cpu(out)),
+                      _up_flat(torch.ops.aten._softmax.default(a, dim, False)),
+                      _up_flat(torch.ops.aten._softmax.default(a.double(), dim, False))))
+    _assert_agreement("_softmax", cases)
+
+
+# (input shape, normalized_shape, which affine parameters are given)
+LAYER_NORM_CASES = (((4, 5), [5], "both"), ((2, 4, 3), [3], "both"),
+                    ((2, 4, 3), [4, 3], "both"), ((3, 64), [64], "weight"),
+                    ((3, 64), [64], "bias"), ((6, 17), [17], "none"),
+                    ((1, 512), [512], "both"))
+
+
+def test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance():
+    """All three outputs -- `out`, `mean`, `invstd` -- and their shapes.
+
+    Every affine combination, because the kernel this round inherited
+    silently dropped `bias` whenever `weight` was absent: `nn.LayerNorm` never
+    produces that, so nothing on a model trace would have caught it.
+    """
+    if _vulkan_or_skip("the native_layer_norm agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    per_output = {"out": [], "mean": [], "invstd": []}
+    for i, (shape, norm, affine) in enumerate(LAYER_NORM_CASES):
+        a = _rand(torch, *shape, seed=700 + i) * 2.0 + 0.5
+        w = _rand(torch, *norm, seed=800 + i) if affine in ("both", "weight") else None
+        b = _rand(torch, *norm, seed=900 + i) if affine in ("both", "bias") else None
+        vw = None if w is None else _to_vulkan(_cpu(_up_flat(w), norm))
+        vb = None if b is None else _to_vulkan(_cpu(_up_flat(b), norm))
+        got = _C._aten_dispatch("aten.native_layer_norm.default",
+                                _to_vulkan(_cpu(_up_flat(a), shape)), norm, vw, vb, 1e-5)
+        want32 = torch.ops.aten.native_layer_norm.default(a, norm, w, b, 1e-5)
+        want64 = torch.ops.aten.native_layer_norm.default(
+            a.double(), norm, None if w is None else w.double(),
+            None if b is None else b.double(), 1e-5)
+        for name, g, u32, u64 in zip(("out", "mean", "invstd"), got, want32, want64):
+            assert list(g.shape) == list(u32.shape), (
+                f"native_layer_norm{list(shape)} {norm} {affine}: {name} has shape "
+                f"{list(g.shape)}, upstream {list(u32.shape)}")
+            per_output[name].append((f"{name}{list(shape)} {norm} {affine}",
+                                     _flat(_to_cpu(g)), _up_flat(u32), _up_flat(u64)))
+    for name, cases in per_output.items():
+        _assert_agreement(f"native_layer_norm {name}", cases)
+
+
+BMM_SHAPES = ((2, 3, 4, 5), (4, 16, 8, 16), (3, 5, 257, 7), (2, 1, 512, 1))
+
+
+def test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be():
+    """Agreement at a derived tolerance, then the matmul proof per batch.
+
+    A tolerance cannot tell an accumulation-order residue from a kernel that
+    reads the wrong batch's element -- both are "small" on randn. So the GPU
+    answer is also compared **bit for bit** against the host model of the
+    matmul kernel applied to each batch slice separately: a batch-offset bug
+    would not survive that.
+    """
+    if _vulkan_or_skip("the bmm agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases, model_misses = [], []
+    for i, (bs, m, k, n) in enumerate(BMM_SHAPES):
+        a = _rand(torch, bs, m, k, seed=1000 + i)
+        b = _rand(torch, bs, k, n, seed=1100 + i)
+        af, bf = _up_flat(a), _up_flat(b)
+        out = _C._aten_dispatch("aten.bmm.default", _to_vulkan(_cpu(af, (bs, m, k))),
+                                _to_vulkan(_cpu(bf, (bs, k, n))))
+        assert list(out.shape) == [bs, m, n], out.shape
+        got = _flat(_to_cpu(out))
+        cases.append((f"bmm[{bs},{m},{k},{n}]", got, _up_flat(torch.bmm(a, b)),
+                      _up_flat(torch.bmm(a.double(), b.double()))))
+        model = []
+        for bi in range(bs):
+            model += _host_model_of_the_matmul_kernel(
+                af[bi * m * k:(bi + 1) * m * k], bf[bi * k * n:(bi + 1) * k * n], m, k, n)
+        misses = sum(_bits(x) != _bits(y) for x, y in zip(got, model))
+        model_misses.append((f"bmm[{bs},{m},{k},{n}]", misses, len(got)))
+    _assert_agreement("bmm", cases)
+    print(f"   bmm vs the host FMA model of the kernel: {model_misses}")
+    for label, misses, total in model_misses:
+        assert misses == 0, (
+            f"{label}: {misses} of {total} elements are not what per-batch "
+            f"sequential float32 accumulation gives -- a batch or index offset "
+            f"is wrong, or this driver contracts differently")
+
+
+# ---------------------------------------------------------------------------
+# 10. The four transformer kernels -- refusals
+# ---------------------------------------------------------------------------
+
+def test_the_transformer_kernels_refuse_what_they_do_not_implement_before_any_gpu_work():
+    """Each refusal names its reason, and happens before a shader is dispatched.
+
+    Three of these were not refusals in the kernels this round inherited:
+    `gelu(approximate="foo")` computed the exact gelu, a `normalized_shape`
+    that did not match the input normalised the wrong span (or panicked when
+    it was longer than the input's rank), and `weight=None, bias=b` dropped
+    `b`. Messages follow upstream's where upstream raises.
+    """
+    if _vulkan_or_skip("the transformer-kernel refusals") is None:
+        return
+    d = _C._aten_dispatch
+    x = _to_vulkan(_cpu([float(i) for i in range(12)], [3, 4]))
+    w5 = _to_vulkan(_cpu([1.0] * 5, [5]))
+    b234 = _to_vulkan(_cpu([1.0] * 24, [2, 3, 4]))
+    b254 = _to_vulkan(_cpu([1.0] * 40, [2, 5, 4]))
+    b334 = _to_vulkan(_cpu([1.0] * 36, [3, 4, 3]))
+    ln = "aten.native_layer_norm.default"
+    cases = (
+        ("gelu approximate", lambda: d("aten.gelu.default", x, approximate="foo"),
+         RuntimeError, "approximate"),
+        ("softmax over a non-last dim", lambda: d("aten._softmax.default", x, 0, False),
+         NotImplementedError, "last dimension"),
+        ("softmax dim out of range", lambda: d("aten._softmax.default", x, 2, False),
+         IndexError, "out of range"),
+        ("softmax half_to_float", lambda: d("aten._softmax.default", x, -1, True),
+         NotImplementedError, "half_to_float"),
+        ("layer_norm shape mismatch", lambda: d(ln, x, [5], None, None, 1e-5),
+         RuntimeError, "normalized_shape"),
+        ("layer_norm longer than input", lambda: d(ln, x, [2, 3, 4], None, None, 1e-5),
+         RuntimeError, "normalized_shape"),
+        ("layer_norm weight shape", lambda: d(ln, x, [4], w5, None, 1e-5),
+         RuntimeError, "weight"),
+        ("layer_norm bias shape", lambda: d(ln, x, [4], None, w5, 1e-5),
+         RuntimeError, "bias"),
+        ("bmm inner size", lambda: d("aten.bmm.default", b234, b254),
+         RuntimeError, "batch2"),
+        ("bmm batch size", lambda: d("aten.bmm.default", b234, b334),
+         RuntimeError, "batch2"),
+        ("bmm rank", lambda: d("aten.bmm.default", x, x), RuntimeError, "3D"),
+    )
+    for what, call, exc, needle in cases:
+        before = _counters()
         try:
-            fn()
+            call()
+        except exc as e:
+            assert needle in str(e), f"the {what} refusal does not say {needle!r}: {e}"
         except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
+            raise AssertionError(f"{what}: expected {exc.__name__}, got {type(e).__name__}: {e}")
         else:
-            print(f"ok   {name}")
+            raise AssertionError(f"{what} was computed instead of refused")
+        assert _delta(before, _counters())["shader_dispatches"] == 0, (
+            f"{what}: a shader ran before the refusal")
+
+
+def test_every_float_dtype_but_float32_refuses_on_the_way_to_the_device():
+    """"Per dtype", measured: float32 is the only dtype these kernels ever see.
+
+    float16, bfloat16 and float64 inputs cannot reach a Vulkan kernel at all,
+    because the upload refuses them by name, so there is no agreement number
+    for them to report and none is claimed.
+    """
+    if _vulkan_or_skip("the per-dtype refusal") is None:
+        return
+    for dtype in (_C.float16, _C.bfloat16, _C.float64):
+        src = _C._tensor_from_flat([1.0, 2.0], [2], dtype=dtype)
+        try:
+            _to_vulkan(src)
+        except NotImplementedError as e:
+            assert "float32 only" in str(e), (dtype, str(e))
+        else:
+            raise AssertionError(f"a {dtype} tensor reached the vulkan device")
+
+
+def _main():
+    # `run_tests` prints SKIP rather than ok for a test that had no Vulkan
+    # device, and a `VULKAN:` tally that run.sh adds up (docs/devices/VULKAN5.md §2).
+    failures = vulkan_coverage.run_tests(
+        [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")])
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+

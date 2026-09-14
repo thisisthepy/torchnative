@@ -14,6 +14,12 @@
 | 모듈 하나가 forward 하나 | **한다.** `nn.Sequential(Linear, ReLU, Linear)` 가 셰이더 7회, 호스트 되읽기 **0회**로 돈다 |
 | 트랜스포머는 | **돌지 않는다.** `layer_norm`·`_softmax`·`gelu`·`embedding`·`bmm` 이 전부 미구현이고 §2 의 추적에 전부 있다 |
 
+> **정정 (`docs/devices/VULKAN5.md`).** 이 표의 마지막 줄은 이제 반만 참입니다. `native_layer_norm`·`_softmax`·`gelu`·`bmm`
+> 넷은 구현되었고 **Apple M1 위의 두 드라이버(MoltenVK, kosmickrisp)에서 upstream 과 대조해 일치**를
+> 잰 상태입니다. `embedding` 은 여전히 미구현이고 트랜스포머의 첫 op 이므로, **Vulkan 에서 도는
+> 트랜스포머는 여전히 0 개**입니다. 또 §4.1 의 "33 케이스 비트 동일" 은 kosmickrisp 에서만 참이었고
+> MoltenVK 기본 설정에서는 `div` 가 어긋났습니다 — VULKAN5.md §3.1.
+
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs SHADER_DISPATCHES present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs maybe_upload present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_every_taught_op_ran_on_the_gpu_or_says_it_did_not present -->
@@ -386,6 +392,8 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
   `expand`(8회) 가 전부 미구현이고, BERT 는 그중 첫 번째에서 멈춥니다.
   `test_a_transformer_still_does_not_forward_and_the_wall_is_named` 이 다섯 개가 여전히
   거절되는 것을 단언하므로, 누군가 하나를 가르치면 **이 문장이 실패로 갱신을 요구**합니다.
+  — **정정:** 그 요구가 실제로 일어났습니다. 넷이 구현되었고 테스트는 이제 넷이 *가르쳐졌음*과
+  `embedding`·`expand` 가 여전히 거절됨을 단언합니다 (`docs/devices/VULKAN5.md` §4).
 - **네 개에서 여덟 개가 아니라 열여덟 개입니다. 그런데 열여덟 중 컴퓨트 셰이더를 도는 것은
   열한 개**이고, 나머지 일곱은 shape 조작이거나 복사입니다. §1 이 지적한 셈법의 함정을 이
   문서 자신에게도 적용하면 그렇게 됩니다. **"18 ops"보다 "11 kernels + 7 metadata ops"가 정확한
@@ -408,6 +416,12 @@ float64 진실로부터   upstream f32  2.282e-07      shim vulkan  2.136e-06   
 | `torch.tensor([...], device="vulkan")` | 다른 팩토리. `.to("vulkan")` 만 만들었다 |
 | `gelu` | upstream 의 기본 `gelu` 는 정확한 `erf` 이고 GLSL 내장이 아니다. tanh 근사로 바꾸면 값이 달라지는데, **그 차이는 정밀도가 아니라 다른 함수**다 |
 | 리덕션 (`sum`·`softmax`·`layer_norm`) | 행 단위 리덕션 커널이 없다. 이 라운드가 하지 않은 가장 큰 덩어리이고, 트랜스포머로 가는 길이다 |
+
+> **정정 (`docs/devices/VULKAN5.md` §3).** 위 표의 `bmm`·`gelu`·`softmax`·`layer_norm` 행은 더 이상 현재가 아닙니다.
+> `bmm` 은 3-D 배치 matmul 셰이더로, `_softmax` 는 마지막 차원 한정으로, `native_layer_norm` 은 행 단위
+> 셰이더로 구현되었습니다. `gelu` 는 이 표가 경고한 그대로 **정확한 `erf` 가 아니라 Abramowitz–Stegun
+> 7.1.26 근사**를 씁니다 — 텐서 단위 규칙(`docs/numerics/AGREE.md` §2)으로는 upstream 과 일치하지만, 작은 원소에서는
+> upstream 자신의 오차의 28 배까지 떨어집니다. 숨기지 않고 VULKAN5.md §3 에 숫자로 적었습니다.
 
 **전치가 실체화된다는 것은 upstream 과의 진짜 차이**이고 숨기지 않습니다. upstream 에서
 `x.t()` 는 메타데이터이고 여기서는 바이트를 옮깁니다. 결과 값은 같지만(§4.1 이 비트 동일로
