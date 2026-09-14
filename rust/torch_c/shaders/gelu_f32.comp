@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+float erf(float x) {
+    float sign_x = sign(x);
+    x = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * x);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x);
+    return sign_x * y;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float x = a[i];
+    if (pc.p1 == 1) {
+        // approximate="tanh"
+        c[i] = 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+    } else {
+        // approximate="none"
+        c[i] = 0.5 * x * (1.0 + erf(x * 0.7071067811865475));
+    }
+}

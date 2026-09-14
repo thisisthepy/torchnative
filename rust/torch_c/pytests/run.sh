@@ -286,11 +286,25 @@ if [ -n "${TORCHNATIVE_VULKAN_DYLD:-}" ]; then
     echo "vulkan: re-exporting DYLD_LIBRARY_PATH=$TORCHNATIVE_VULKAN_DYLD (SIP strips it through /bin/sh)"
 fi
 
+# Each suite's output is also kept, so the Vulkan tally below can be read from
+# it. docs/devices/VULKAN5.md §2 is why: on a machine with no Vulkan loader
+# every Vulkan test printed "(skipped ...)" and then `ok`, and this gate came
+# out 0 FAIL having executed none of them. Suites now print `SKIP` for those
+# and a `VULKAN:` tally line; `vulkan_coverage.py` adds the tallies up and says
+# UNVERIFIED when nothing ran. With TORCHNATIVE_REQUIRE_VULKAN=1 a skip fails
+# the gate -- the only form of this run that is evidence for a Vulkan kernel.
 suite_failed=0
+suite_logs="$stage/suite-logs"
+rm -rf "$suite_logs"
+mkdir -p "$suite_logs"
 for suite in "$crate_dir"/pytests/test_*.py; do
-    echo "--- $(basename "$suite") ---"
-    env $vk_env PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" || suite_failed=1
+    name=$(basename "$suite")
+    echo "--- $name ---"
+    env $vk_env PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" \
+        > "$suite_logs/$name.log" 2>&1 || suite_failed=1
+    cat "$suite_logs/$name.log"
 done
+"${PYTHON:-python3}" "$crate_dir/pytests/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
 [ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
@@ -327,6 +341,9 @@ TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
 # proof -- it went 1070 -> 1070 across the move, not down.
 # `test_docrefs.py` fails if this glob comes back, here or in check_docs.py.
 doc_files=$(find "$repo_root/docs" -name '*.md' | sort)
-TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
-    exec "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py" \
+# `$vk_env` too: the `vulkan_tests_ok` count re-runs test_vulkan4.py, and
+# without it a machine that selected its loader through TORCHNATIVE_VULKAN_DYLD
+# would report that marker SKIPPED while the suites above had run on the GPU.
+exec env $vk_env TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
+    "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py" \
         $doc_files "$repo_root/README.md"

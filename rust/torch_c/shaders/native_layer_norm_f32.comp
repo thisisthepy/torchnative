@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer W { float w[]; };
+layout(std430, set = 0, binding = 2) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer C { float c[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer M { float m[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer R { float r[]; };
+
+// n: number of rows
+// p1: row_length
+// p2: has_weight (1 or 0)
+// p3: eps (float bits)
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n) return;
+    
+    uint row_len = pc.p1;
+    uint offset = row * row_len;
+    
+    // compute mean
+    float sum = 0.0;
+    for (uint i = 0; i < row_len; i++) {
+        sum += a[offset + i];
+    }
+    float mean = sum / float(row_len);
+    
+    // compute variance
+    float var_sum = 0.0;
+    for (uint i = 0; i < row_len; i++) {
+        float diff = a[offset + i] - mean;
+        var_sum += diff * diff;
+    }
+    float var = var_sum / float(row_len);
+    float eps = uintBitsToFloat(pc.p3);
+    float rstd = 1.0 / sqrt(var + eps);
+    
+    m[row] = mean;
+    r[row] = rstd;
+    
+    // Two independent bits: `weight=None, bias=b` is legal upstream, and a
+    // single "has affine" flag dropped `b` silently (docs/devices/VULKAN5.md §3).
+    bool has_weight = (pc.p2 & 1u) != 0u;
+    bool has_bias = (pc.p2 & 2u) != 0u;
+
+    for (uint i = 0; i < row_len; i++) {
+        float val = (a[offset + i] - mean) * rstd;
+        if (has_weight) {
+            val = val * w[i];
+        }
+        if (has_bias) {
+            val = val + b[i];
+        }
+        c[offset + i] = val;
+    }
+}

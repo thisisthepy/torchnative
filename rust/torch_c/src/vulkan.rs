@@ -31,10 +31,12 @@
 //!
 //! ## Where the loader comes from
 //!
-//! Nothing is installed. `ash::Entry::load()` *dlopens* the loader rather than
-//! linking it, so this module compiles and the artefact loads on a machine with
-//! no Vulkan at all -- absence is a value that gets reported, not a link error.
-//! On this host the loader and ICDs already exist inside the Android emulator's
+//! The loader is *dlopened* rather than linked, so this module compiles and the
+//! artefact loads on a machine with no Vulkan at all -- absence is a value that
+//! gets reported, not a link error. `loader_candidates_for` lists where it is
+//! looked for; on macOS that includes the Homebrew prefixes, where
+//! `vulkan-loader` + `molten-vk` put it (docs/devices/VULKAN5.md §1).
+//! On this host the loader and ICDs also exist inside the Android emulator's
 //! bundle (`docs/devices/VULKAN2.md` §4), and pointing `DYLD_LIBRARY_PATH` and
 //! `VK_DRIVER_FILES` at `libkosmickrisp_icd.json` gives the real `Apple M1`
 //! GPU. **Those files are the Android SDK's private implementation detail and
@@ -74,6 +76,10 @@ spv!(MUL_F32_SPV, "mul_f32");
 spv!(DIV_F32_SPV, "div_f32");
 spv!(RELU_F32_SPV, "relu_f32");
 spv!(NEG_F32_SPV, "neg_f32");
+spv!(GELU_F32_SPV, "gelu_f32");
+spv!(SOFTMAX_LASTDIM_F32_SPV, "softmax_lastdim_f32");
+spv!(NATIVE_LAYER_NORM_F32_SPV, "native_layer_norm_f32");
+spv!(BMM_F32_SPV, "bmm_f32");
 spv!(COPY_F32_SPV, "copy_f32");
 spv!(TRANSPOSE2D_F32_SPV, "transpose2d_f32");
 spv!(MATMUL_F32_SPV, "matmul_f32");
@@ -153,6 +159,9 @@ pub struct VkContext {
     /// which driver it skipped and a passing one can say what it ran on.
     pub device_name: String,
     pub device_type: String,
+    /// Which of `loader_candidates()` was opened -- so a passing run can say
+    /// which loader (and so which ICD search) it measured.
+    pub loader: String,
     /// Vulkan requires *external* synchronisation on a queue and on a command
     /// pool -- the driver does no locking of its own. One mutex covers both,
     /// which is right while there is one queue: the critical section is the
@@ -205,10 +214,111 @@ fn require(op: &str) -> PyResult<&'static VkContext> {
     })
 }
 
+/// Where the Vulkan loader is looked for, in order (docs/devices/VULKAN5.md §1).
+///
+/// `ash::Entry::load()` tries one bare name, and on macOS that name is found
+/// only on dyld's search path. Homebrew installs `vulkan-loader` under its own
+/// prefix -- `/opt/homebrew/lib` on Apple Silicon, `/usr/local/lib` on Intel --
+/// and neither is on that path, so a Mac with a loader installed reported "no
+/// such file" and every Vulkan test skipped. Measured: `dlopen("libvulkan.dylib")`
+/// failed and `dlopen("/opt/homebrew/lib/libvulkan.dylib")` loaded.
+///
+/// The bare name stays **first**, so `DYLD_LIBRARY_PATH` still chooses (that
+/// is how the Android emulator's bundled loader is selected, docs/devices/VULKAN2.md
+/// §4). After it: `$VULKAN_SDK/lib` (the LunarG SDK's convention), then the two
+/// Homebrew prefixes. Each is a *fallback*, not an assumption -- a path that
+/// does not exist costs one failed `dlopen` and is named in the error. Linux
+/// keeps the soname lookup the dynamic linker already does well; no absolute
+/// path is guessed there.
+fn loader_candidates_for(vulkan_sdk: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    out.push("libvulkan.dylib".into());
+    #[cfg(target_os = "macos")]
+    {
+        out.push("libvulkan.1.dylib".into());
+        if let Some(sdk) = vulkan_sdk.filter(|s| !s.is_empty()) {
+            out.push(format!("{sdk}/lib/libvulkan.1.dylib"));
+        }
+        out.push("/opt/homebrew/lib/libvulkan.1.dylib".into());
+        out.push("/usr/local/lib/libvulkan.1.dylib".into());
+    }
+    #[cfg(windows)]
+    out.push("vulkan-1.dll".into());
+    #[cfg(any(target_os = "android", target_os = "fuchsia"))]
+    out.push("libvulkan.so".into());
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android", target_os = "fuchsia"))
+    ))]
+    {
+        out.push("libvulkan.so.1".into());
+        out.push("libvulkan.so".into());
+    }
+    let _ = vulkan_sdk;
+    out
+}
+
+pub fn loader_candidates() -> Vec<String> {
+    loader_candidates_for(std::env::var("VULKAN_SDK").ok().as_deref())
+}
+
+/// The first candidate that loads, and its name -- or every attempt's error.
+unsafe fn load_loader() -> Result<(ash::Entry, String), String> {
+    let mut tried = Vec::new();
+    for candidate in loader_candidates() {
+        match ash::Entry::load_from(&candidate) {
+            Ok(entry) => return Ok((entry, candidate)),
+            Err(e) => tried.push(format!("{candidate}: {e}")),
+        }
+    }
+    Err(format!("failed to load the Vulkan loader -- tried {}", tried.join(" | ")))
+}
+
+fn offers(props: &[vk::ExtensionProperties], name: &CStr) -> bool {
+    props.iter().any(|p| p.extension_name_as_c_str() == Ok(name))
+}
+
 unsafe fn init() -> Result<VkContext, String> {
-    let entry = ash::Entry::load().map_err(|e| format!("failed to load the Vulkan loader: {e}"))?;
+    let (entry, loader) = load_loader()?;
     let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-    let ci = vk::InstanceCreateInfo::default().application_info(&app);
+    // MoltenVK is a *portability* driver, and loaders from 1.3.216 on hide
+    // those unless the instance opts in -- the refusal docs/devices/VULKAN2.md §4.2
+    // recorded verbatim. Opted into only when the loader offers the extension,
+    // so a loader that predates it (Android's) sees the same request as before.
+    let offered = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+    let mut instance_exts = Vec::new();
+    let mut ci = vk::InstanceCreateInfo::default().application_info(&app);
+    if offers(&offered, ash::khr::portability_enumeration::NAME) {
+        instance_exts.push(ash::khr::portability_enumeration::NAME.as_ptr());
+        ci = ci.flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+    }
+    // MoltenVK compiles every shader with Metal's fast-math on by default, and
+    // fast-math licenses rewriting `a / b`: `div` came back 3 of 20 elements
+    // off upstream's bits on MoltenVK and bit-identical with
+    // `MVK_CONFIG_FAST_MATH_ENABLED=0` (docs/devices/VULKAN5.md §3.1). The
+    // exactly-rounded kernels here promise IEEE results, so this instance asks
+    // for them, through the extension MoltenVK documents for configuration
+    // (layer name "MoltenVK"; settings made here override its environment
+    // variables). A driver that does not offer the extension is not asked.
+    //
+    // The name is the environment variable's, prefix included: measured,
+    // `FAST_MATH_ENABLED` and `fastMathEnabled` were ignored exactly as a
+    // nonsense name was (1199 of 4149 `div` elements off upstream's bits for
+    // all three, 0 for this one).
+    let fast_math_off = 0i32.to_ne_bytes();
+    let mut settings = [vk::LayerSettingEXT::default()
+        .layer_name(c"MoltenVK")
+        .setting_name(c"MVK_CONFIG_FAST_MATH_ENABLED")
+        .ty(vk::LayerSettingTypeEXT::INT32)
+        .values(&fast_math_off)];
+    settings[0].value_count = 1;
+    let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
+    if offers(&offered, ash::ext::layer_settings::NAME) {
+        instance_exts.push(ash::ext::layer_settings::NAME.as_ptr());
+        ci = ci.push_next(&mut layer_settings);
+    }
+    ci = ci.enabled_extension_names(&instance_exts);
     let instance = entry
         .create_instance(&ci, None)
         .map_err(|e| format!("vkCreateInstance: {e}"))?;
@@ -254,7 +364,14 @@ unsafe fn init() -> Result<VkContext, String> {
     let qci = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(qfi)
         .queue_priorities(&prio)];
-    let dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+    // A device that advertises the portability subset must have it enabled
+    // (the extension's own spec text); MoltenVK's does.
+    let device_offered = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
+    let device_exts = [ash::khr::portability_subset::NAME.as_ptr()];
+    let mut dci = vk::DeviceCreateInfo::default().queue_create_infos(&qci);
+    if offers(&device_offered, ash::khr::portability_subset::NAME) {
+        dci = dci.enabled_extension_names(&device_exts);
+    }
     let device = instance
         .create_device(pd, &dci, None)
         .map_err(|e| format!("vkCreateDevice: {e}"))?;
@@ -277,6 +394,7 @@ unsafe fn init() -> Result<VkContext, String> {
         mem_props,
         device_name,
         device_type,
+        loader,
         submit: Mutex::new(pool),
         pipelines: Mutex::new(HashMap::new()),
     })
@@ -440,7 +558,7 @@ impl VkContext {
     /// Three storage-buffer bindings and a `uint` push constant is the whole
     /// interface every kernel here uses, so the layout is shared rather than
     /// described per kernel.
-    unsafe fn kernel(&self, name: &'static str, spv: &[u8]) -> Result<Kernel, String> {
+    unsafe fn kernel(&self, name: &'static str, spv: &[u8], num_bindings: u32) -> Result<Kernel, String> {
         let mut cache = self.pipelines.lock().map_err(|_| "pipeline cache poisoned")?;
         if let Some(k) = cache.get(name) {
             return Ok(*k);
@@ -460,7 +578,7 @@ impl VkContext {
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
             .map_err(|e| format!("vkCreateShaderModule({name}): {e}"))?;
 
-        let bindings: Vec<_> = (0..3u32)
+        let bindings: Vec<_> = (0..num_bindings)
             .map(|i| {
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
@@ -516,7 +634,9 @@ impl VkContext {
 
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3 * 64)];
+            // Per binding: `native_layer_norm` binds six, and a pool sized for
+            // three would run out at half its stated set count.
+            .descriptor_count(num_bindings * 64)];
         let dpool = self
             .device
             .create_descriptor_pool(
@@ -549,10 +669,10 @@ impl VkContext {
         &self,
         name: &'static str,
         spv: &[u8],
-        bufs: [&VkBuffer; 3],
+        bufs: &[&VkBuffer],
         push: [u32; 4],
     ) -> Result<(), String> {
-        let k = self.kernel(name, spv)?;
+        let k = self.kernel(name, spv, bufs.len() as u32)?;
         let pool = self.submit.lock().map_err(|_| "submit lock poisoned")?;
 
         let set_layouts = [k.dsl];
@@ -744,6 +864,10 @@ pub fn dispatch(
 
         // Unary elementwise.
         "aten.relu.default" => unary(py, op, args, kwargs, "relu_f32", RELU_F32_SPV),
+        "aten.gelu.default" => gelu_vulkan(py, op, args, kwargs),
+        "aten.native_layer_norm.default" => native_layer_norm_vulkan(py, op, args, kwargs),
+        "aten.bmm.default" => bmm_vulkan(py, op, args, kwargs),
+        "aten._softmax.default" => softmax_vulkan(py, op, args, kwargs),
         "aten.neg.default" => unary(py, op, args, kwargs, "neg_f32", NEG_F32_SPV),
 
         // `clone` allocates and copies on the device. `detach`/`alias` share
@@ -847,7 +971,7 @@ fn unary(
         // Binding 1 is the input again: the descriptor set layout is three
         // storage buffers for every kernel here and the shader declares the
         // slot it does not read (`shaders/*_f32.comp`).
-        ctx.dispatch_kernel(name, spv, [&a.buffer, &a.buffer, &out], [n as u32, 0, 0, 0])
+        ctx.dispatch_kernel(name, spv, &[&a.buffer, &a.buffer, &out], [n as u32, 0, 0, 0])
             .map_err(|e| vk_error(op, e))?;
         out
     };
@@ -878,7 +1002,7 @@ fn binary(
     let n = a.elem_count();
     let out = unsafe {
         let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
-        ctx.dispatch_kernel(name, spv, [&a.buffer, &b.buffer, &out], [n as u32, 0, 0, 0])
+        ctx.dispatch_kernel(name, spv, &[&a.buffer, &b.buffer, &out], [n as u32, 0, 0, 0])
             .map_err(|e| vk_error(op, e))?;
         out
     };
@@ -1076,8 +1200,7 @@ fn transpose2d(
         let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
         ctx.dispatch_kernel(
             "transpose2d_f32",
-            TRANSPOSE2D_F32_SPV,
-            [&a.buffer, &a.buffer, &out],
+            TRANSPOSE2D_F32_SPV, &[&a.buffer, &a.buffer, &out],
             [n as u32, rows as u32, cols as u32, 0],
         )
         .map_err(|e| vk_error(op, e))?;
@@ -1109,8 +1232,7 @@ fn matmul_into(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<(VkBuffer, usiz
         let out = ctx.alloc(count * 4).map_err(|e| vk_error(op, e))?;
         ctx.dispatch_kernel(
             "matmul_f32",
-            MATMUL_F32_SPV,
-            [&a.buffer, &b.buffer, &out],
+            MATMUL_F32_SPV, &[&a.buffer, &b.buffer, &out],
             [count as u32, m as u32, k as u32, n as u32],
         )
         .map_err(|e| vk_error(op, e))?;
@@ -1186,8 +1308,7 @@ fn addmm(
         let out = ctx.alloc(count * 4).map_err(|e| vk_error(op, e))?;
         ctx.dispatch_kernel(
             "bias_add_f32",
-            BIAS_ADD_F32_SPV,
-            [&product, &c.buffer, &out],
+            BIAS_ADD_F32_SPV, &[&product, &c.buffer, &out],
             [count as u32, n as u32, 0, 0],
         )
         .map_err(|e| vk_error(op, e))?;
@@ -1340,8 +1461,7 @@ fn add_tensor(
         let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
         ctx.dispatch_kernel(
             "add_f32",
-            ADD_F32_SPV,
-            [&a.buffer, &b.buffer, &out],
+            ADD_F32_SPV, &[&a.buffer, &b.buffer, &out],
             [n as u32, 0, 0, 0],
         )
         .map_err(|e| vk_error(op, e))?;
@@ -1381,6 +1501,7 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
             d.set_item("device", ctx.device_name.as_str())?;
             d.set_item("type", ctx.device_type.as_str())?;
             d.set_item("queue_family", ctx.qfi)?;
+            d.set_item("loader", ctx.loader.as_str())?;
             d.set_item("error", py.None())?;
         }
         Err(reason) => {
@@ -1388,6 +1509,7 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
             d.set_item("device", py.None())?;
             d.set_item("type", py.None())?;
             d.set_item("queue_family", py.None())?;
+            d.set_item("loader", py.None())?;
             d.set_item("error", reason)?;
         }
     }
@@ -1400,17 +1522,21 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pyo3(name = "_vulkan_ops")]
 fn vulkan_ops() -> Vec<&'static str> {
     vec![
+        "aten._softmax.default",
         "aten._to_copy.default",
         "aten._unsafe_view.default",
         "aten.add.Tensor",
         "aten.addmm.default",
         "aten.alias.default",
+        "aten.bmm.default",
         "aten.clone.default",
         "aten.contiguous.default",
         "aten.detach.default",
         "aten.div.Tensor",
+        "aten.gelu.default",
         "aten.mm.default",
         "aten.mul.Tensor",
+        "aten.native_layer_norm.default",
         "aten.neg.default",
         "aten.relu.default",
         "aten.reshape.default",
@@ -1447,5 +1573,289 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(vulkan_probe, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_ops, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(vulkan_loader_candidates, m)?)?;
     Ok(())
+}
+
+/// `_C._vulkan_loader_candidates()` -- where `init` looks, in the order it
+/// looks, so a test can check that a loader present at one of them is found
+/// without restating the list.
+#[pyfunction]
+#[pyo3(name = "_vulkan_loader_candidates")]
+fn vulkan_loader_candidates() -> Vec<String> {
+    loader_candidates()
+}
+
+// ---------------------------------------------------------------------------
+// The transformer kernels: gelu, _softmax, native_layer_norm, bmm
+// ---------------------------------------------------------------------------
+//
+// docs/devices/VULKAN5.md §3. Each refuses what it does not implement *before*
+// allocating or dispatching, with upstream's message where upstream raises.
+
+fn wrap_vk(py: Python<'_>, t: VkTensor, tag: TorchDType) -> PyResult<Py<PyAny>> {
+    crate::tensor::promote(py, PyTensorBase::vulkan(t, tag).into_pyobject(py)?.into_any().unbind())
+}
+
+fn gelu_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    if args.len() > 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "aten::gelu() takes 1 positional argument(s) but {} were given. \
+             Declaration: aten::gelu(Tensor self, *, str approximate=\"none\") -> Tensor",
+            args.len()
+        )));
+    }
+    let approximate: String = match kwargs.map(|kw| kw.get_item("approximate")).transpose()?.flatten() {
+        None => "none".to_string(),
+        Some(v) => v.extract().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "aten::gelu() expected a value of type 'str' for argument 'approximate'",
+            )
+        })?,
+    };
+    // Anything else used to compute the exact gelu silently.
+    let tanh = match approximate.as_str() {
+        "none" => 0,
+        "tanh" => 1,
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "approximate argument must be either none or tanh.",
+            ))
+        }
+    };
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let ctx = require(op)?;
+    let n = x.elem_count();
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel("gelu_f32", GELU_F32_SPV, &[&x.buffer, &x.buffer, &out], [n as u32, tanh, 0, 0])
+            .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(out), shape: x.shape }, input.tag())
+}
+
+fn softmax_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let dim_raw = crate::aten::dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| crate::aten::missing(op, "dim"))?;
+    let half_to_float = crate::aten::bool_arg(args, kwargs, 2, "half_to_float")?
+        .ok_or_else(|| crate::aten::missing(op, "half_to_float"))?;
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let rank = x.shape.len() as isize;
+    // A 0-d tensor accepts dim 0 and -1, as upstream's does.
+    let span = rank.max(1);
+    let dim = if dim_raw < 0 { dim_raw + span } else { dim_raw };
+    if dim < 0 || dim >= span {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {dim_raw})",
+            -span,
+            span - 1
+        )));
+    }
+    if rank > 0 && dim != rank - 1 {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device implements softmax over the last dimension only, \
+             got dim={dim_raw} of a {rank}-D tensor. Move it with .cpu() or permute first."
+        )));
+    }
+    if half_to_float {
+        return Err(not_implemented(format!(
+            "{op}: half_to_float=True is not implemented on the vulkan device, which \
+             stores float32 only"
+        )));
+    }
+    let ctx = require(op)?;
+    let n = x.elem_count();
+    let row_len = x.shape.last().copied().unwrap_or(1);
+    let rows = if row_len > 0 { n / row_len } else { 0 };
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "softmax_lastdim_f32",
+            SOFTMAX_LASTDIM_F32_SPV,
+            &[&x.buffer, &x.buffer, &out],
+            [rows as u32, row_len as u32, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(out), shape: x.shape }, input.tag())
+}
+
+/// `native_layer_norm(input, normalized_shape, weight?, bias?, eps)`.
+///
+/// Returns `(out, mean, invstd)` with `mean`/`invstd` shaped
+/// `input.shape[:axis] + [1] * len(normalized_shape)`, which is upstream's
+/// shape -- the inherited kernel returned `input.shape[:axis]`.
+fn native_layer_norm_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "input")?;
+    let requested = crate::aten::shape_arg(op, args, kwargs, 1, "normalized_shape")?;
+    let weight = crate::aten::optional_tensor_arg(op, args, kwargs, 2, "weight")?;
+    let bias = crate::aten::optional_tensor_arg(op, args, kwargs, 3, "bias")?;
+    let eps = crate::aten::scalar_arg(op, args, kwargs, 4, "eps")?
+        .map(|s| s.as_f64())
+        .ok_or_else(|| crate::aten::missing(op, "eps"))?;
+
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let dims = x.shape.clone();
+    let fmt = |v: &[usize]| format!("{v:?}").replace(' ', "");
+
+    if requested.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Expected normalized_shape to be at least 1-dimensional, i.e., containing at least one element, but got normalized_shape = []",
+        ));
+    }
+    // Negative entries cannot match a real size; map them to a value that
+    // fails the comparison below rather than wrapping.
+    let norm: Vec<usize> = requested.iter().map(|&d| usize::try_from(d).unwrap_or(usize::MAX)).collect();
+    // Previously unchecked: a mismatch normalised the wrong span, and a
+    // `normalized_shape` longer than the input underflowed a `usize`.
+    if norm.len() > dims.len() || dims[dims.len() - norm.len()..] != norm[..] {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given normalized_shape={}, expected input with shape [*, {}], but got input of size{}",
+            fmt(&norm),
+            fmt(&norm).trim_start_matches('[').trim_end_matches(']'),
+            fmt(&dims)
+        )));
+    }
+    let affine = |name: &str, t: &Option<PyTensorBase>| -> PyResult<Option<VkTensor>> {
+        let Some(t) = t else { return Ok(None) };
+        check_dtype(op, t.tag())?;
+        let v = t.vk_tensor(op)?.clone();
+        if v.shape != norm {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected {name} to be of same shape as normalized_shape, but got {name} of shape {} and normalized_shape = {}",
+                fmt(&v.shape),
+                fmt(&norm)
+            )));
+        }
+        Ok(Some(v))
+    };
+    let w = affine("weight", &weight)?;
+    let b = affine("bias", &bias)?;
+
+    let axis = dims.len() - norm.len();
+    let n = x.elem_count();
+    let row_len: usize = norm.iter().product();
+    let rows = if row_len > 0 { n / row_len } else { 0 };
+    let mut stat_shape = dims[..axis].to_vec();
+    stat_shape.extend(std::iter::repeat(1).take(norm.len()));
+
+    let ctx = require(op)?;
+    let (out, mean, invstd) = unsafe {
+        // Bound in the slot of an absent weight/bias; the shader does not read
+        // a slot whose bit is clear.
+        let dummy = ctx.alloc(4).map_err(|e| vk_error(op, e))?;
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        let mean = ctx.alloc(rows * 4).map_err(|e| vk_error(op, e))?;
+        let invstd = ctx.alloc(rows * 4).map_err(|e| vk_error(op, e))?;
+        let wbuf: &VkBuffer = w.as_ref().map(|t| &*t.buffer).unwrap_or(&dummy);
+        let bbuf: &VkBuffer = b.as_ref().map(|t| &*t.buffer).unwrap_or(&dummy);
+        let flags = u32::from(w.is_some()) | (u32::from(b.is_some()) << 1);
+        ctx.dispatch_kernel(
+            "native_layer_norm_f32",
+            NATIVE_LAYER_NORM_F32_SPV,
+            &[&x.buffer, wbuf, bbuf, &out, &mean, &invstd],
+            [rows as u32, row_len as u32, flags, (eps as f32).to_bits()],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        (out, mean, invstd)
+    };
+    let tag = input.tag();
+    let items = [
+        wrap_vk(py, VkTensor { buffer: Arc::new(out), shape: dims }, tag)?,
+        wrap_vk(py, VkTensor { buffer: Arc::new(mean), shape: stat_shape.clone() }, tag)?,
+        wrap_vk(py, VkTensor { buffer: Arc::new(invstd), shape: stat_shape }, tag)?,
+    ];
+    Ok(PyTuple::new(py, items)?.into_any().unbind())
+}
+
+fn bmm_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let lhs = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let rhs = crate::aten::tensor_arg(op, args, kwargs, 1, "mat2")?;
+    check_all_f32(op, &[&lhs, &rhs])?;
+    let a = lhs.vk_tensor(op)?.clone();
+    let b = rhs.vk_tensor(op)?.clone();
+    let runtime = |m: String| pyo3::exceptions::PyRuntimeError::new_err(m);
+    if a.shape.len() != 3 {
+        return Err(runtime("batch1 must be a 3D tensor".into()));
+    }
+    if b.shape.len() != 3 {
+        return Err(runtime("batch2 must be a 3D tensor".into()));
+    }
+    let (batch, m, k) = (a.shape[0], a.shape[1], a.shape[2]);
+    if b.shape[0] != batch || b.shape[1] != k {
+        return Err(runtime(format!(
+            "Expected size for first two dimensions of batch2 tensor to be: [{batch}, {k}] but got: [{}, {}].",
+            b.shape[0], b.shape[1]
+        )));
+    }
+    let n_dim = b.shape[2];
+    let ctx = require(op)?;
+    let n = batch * m * n_dim;
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "bmm_f32",
+            BMM_F32_SPV,
+            &[&a.buffer, &b.buffer, &out],
+            [n as u32, m as u32, k as u32, n_dim as u32],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(out), shape: vec![batch, m, n_dim] }, lhs.tag())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loader_candidates_for;
+
+    /// docs/devices/VULKAN5.md §1. The bare name stays first so that
+    /// `DYLD_LIBRARY_PATH` (and run.sh's `TORCHNATIVE_VULKAN_DYLD`) still
+    /// choose the loader; the absolute paths are fallbacks after it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_bare_name_wins_and_the_sdk_precedes_homebrew() {
+        let c = loader_candidates_for(Some("/sdk"));
+        assert_eq!(c[0], "libvulkan.dylib");
+        let at = |p: &str| c.iter().position(|x| x == p).unwrap_or_else(|| panic!("{p} not in {c:?}"));
+        assert!(at("/sdk/lib/libvulkan.1.dylib") < at("/opt/homebrew/lib/libvulkan.1.dylib"));
+        assert!(at("/opt/homebrew/lib/libvulkan.1.dylib") < at("/usr/local/lib/libvulkan.1.dylib"));
+        // An empty VULKAN_SDK is not the filesystem root.
+        assert!(!loader_candidates_for(Some("")).iter().any(|p| p.starts_with("/lib")));
+        assert!(!loader_candidates_for(None).iter().any(|p| p.contains("/sdk")));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn linux_looks_for_the_soname_first_and_has_no_macos_paths() {
+        let c = loader_candidates_for(Some("/sdk"));
+        assert_eq!(c[0], "libvulkan.so.1");
+        assert!(!c.iter().any(|p| p.contains("homebrew") || p.ends_with(".dylib")));
+    }
 }
