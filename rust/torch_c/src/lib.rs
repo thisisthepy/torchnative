@@ -102,8 +102,29 @@ fn _tensor_from_flat(
         .map(|d| d.storage("_tensor_from_flat"))
         .transpose()?
         .unwrap_or(candle_core::DType::F32);
-    let tensor = Tensor::from_vec(values, shape, &device)
+    // Built on the host, cast on the host, and moved last -- not built on the
+    // target device and cast there.
+    //
+    // The values arrive as `Vec<f64>`, so constructing on the device makes an
+    // `F64` buffer there and the `to_dtype` below becomes a *device* cast out
+    // of `F64`. candle's Metal backend implements almost none of that table:
+    // ten of the eleven storable dtypes died with `Metal contiguous to_dtype
+    // F64 <X> not implemented` (only `bool`, which leaves above, survived), so
+    // `torch._C._tensor_from_flat(..., device="mps")` could not build an
+    // operand of any arithmetic dtype at all. Measured before this order was
+    // changed; `test_dtmdev.py` holds it down by comparing the values that
+    // arrive against upstream's, per dtype.
+    //
+    // The host cast is also the cheaper one: what crosses to the device is the
+    // target dtype's bytes rather than float64's, so a float16 operand moves a
+    // quarter of what it used to.
+    //
+    // `float64` on Metal is still refused, and still by name -- the move
+    // succeeds and `PyTensorBase::new` below carries `metal_dtype_gate`, which
+    // is the one door every dense tensor passes through (device.rs).
+    let tensor = Tensor::from_vec(values, shape, &candle_core::Device::Cpu)
         .and_then(|t| t.to_dtype(target))
+        .and_then(|t| t.to_device(&device))
         .map_err(|e| candle_err("_tensor_from_flat", e))?;
     crate::tensor::promote(
         py,

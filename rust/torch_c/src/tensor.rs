@@ -2927,7 +2927,31 @@ impl PyTensorBase {
 /// integer type through `i64`, so a dtype candle can hold but this shim has not
 /// taught itself to read fails by name instead of returning garbage.
 fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Vec<Py<PyAny>>> {
-    let flat = tensor.flatten_all().map_err(|e| candle_err("tolist", e))?;
+    // To the host first, then read.
+    //
+    // Reading the tensor where it lies meant every widening below became a
+    // *device* cast, and candle's Metal backend has few of them: `tolist()` on
+    // an `mps` tensor raised `Metal contiguous to_dtype F32 F64 not
+    // implemented` for float32, float16, bfloat16, int32 and int16, while
+    // int64, uint8, uint32 and bool happened to work because those casts exist
+    // on Metal. So whether values could be read off the device depended on
+    // candle's kernel table rather than on anything this shim decided.
+    //
+    // **This is a host readback, and it is allowed to be one.** `tolist` is a
+    // host read by definition -- upstream's copies too, and `.cpu()` is the
+    // same question asked in another spelling. What must not acquire a quiet
+    // host hop is `read_flat` in aten.rs, which is what twenty-odd *kernels*
+    // use: docs/devices/MPS.md §2 measured thirteen ops returning correct
+    // values the GPU never computed once that gate was removed, and the only
+    // reason the float ones were loud is that `read_flat` widens through `f64`
+    // and Metal has no `F32 -> F64`. The two functions stay separate for that
+    // reason, and `flat_objects` has exactly one caller: `tolist` above.
+    // `test_dtmdev.test_fixing_tolist_did_not_open_the_host_readback_hole`
+    // fails if a kernel is ever routed through here to get a cheap readback.
+    let flat = tensor
+        .flatten_all()
+        .and_then(|t| t.to_device(&candle_core::Device::Cpu))
+        .map_err(|e| candle_err("tolist", e))?;
     let dtype = tensor.dtype();
     if tag == TorchDType::Bool {
         // torch's `tolist` on a bool tensor yields Python `bool`s, not 0/1

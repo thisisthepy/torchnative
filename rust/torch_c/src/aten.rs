@@ -1853,7 +1853,7 @@ fn meta_dispatch(
                 label if label.is_meta() => meta_result(py, size, tag),
                 label => {
                     let device = label.resolve()?;
-                    let storage = PyDtype::new(tag).storage(op)?;
+                    let storage = storage_for(op, tag, &device)?;
                     let out = Tensor::ones(size, storage, &device)
                         .map_err(|e| candle_err(op, e))?;
                     finish(py, out, tag)
@@ -1899,7 +1899,7 @@ fn meta_dispatch(
                 label if label.is_meta() => meta_result(py, shape, tag),
                 label => {
                     let device = label.resolve()?;
-                    let storage = PyDtype::new(tag).storage(op)?;
+                    let storage = storage_for(op, tag, &device)?;
                     let out =
                         Tensor::zeros(shape, storage, &device).map_err(|e| candle_err(op, e))?;
                     finish(py, out, tag)
@@ -4597,7 +4597,7 @@ fn full_default(
         return meta_result(py, size, dtype);
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(dtype).storage(OP)?;
+    let storage = storage_for(OP, dtype, &device)?;
 
     if dtype == TorchDType::Bool {
         // Normalised on the way in, which is what makes the tag's invariant
@@ -4644,7 +4644,7 @@ fn filled_block(
         return Tensor::full(u8::from(value.as_f64() != 0.0), shape, device)
             .map_err(|e| candle_err(op, e));
     }
-    let storage = PyDtype::new(tag).storage(op)?;
+    let storage = storage_for(op, tag, device)?;
     if storage.is_int() {
         Tensor::full(value.as_i64(), shape, device)
     } else {
@@ -7054,7 +7054,7 @@ fn arange(
         return meta_result(py, vec![n], dtype);
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(dtype).storage(op)?;
+    let storage = storage_for(op, dtype, &device)?;
 
     // torch has no `arange_cpu` kernel for these, and the golden harness
     // caught the shim computing an answer where torch refuses. Reproducing an
@@ -7354,7 +7354,7 @@ fn zeros_or_ones(
         return crate::vulkan::factory(py, op, size, dtype, if one { 1.0 } else { 0.0 });
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(dtype).storage(op)?;
+    let storage = storage_for(op, dtype, &device)?;
 
     let tensor = if one {
         Tensor::ones(size, storage, &device)
@@ -8340,7 +8340,7 @@ fn scalar_tensor_default(
         let tensor = Tensor::full(truthy, (), &device).map_err(|e| candle_err(OP, e))?;
         return finish(py, tensor, dtype);
     }
-    let storage = PyDtype::new(dtype).storage(OP)?;
+    let storage = storage_for(OP, dtype, &device)?;
     let tensor = if storage.is_int() {
         // Upstream truncates toward zero rather than rounding:
         // `scalar_tensor(-1.5, dtype=int64)` is `-1`, measured.
@@ -15567,7 +15567,7 @@ fn new_ones_or_zeros(
         return meta_result(py, size, tag);
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(tag).storage(op)?;
+    let storage = storage_for(op, tag, &device)?;
     // `new_zeros` and `new_empty` share the zero fill; only `new_ones` differs.
     // Selected on the one key that fills with ones rather than listing the two
     // that fill with zeros, so a third zero-filling factory added here cannot
@@ -18623,7 +18623,7 @@ fn zeros_or_empty_like(
         return meta_result(py, shape, tag);
     }
     let device = label.resolve()?;
-    let storage = PyDtype::new(tag).storage(op)?;
+    let storage = storage_for(op, tag, &device)?;
     let out = if op == "aten.ones_like.default" {
         Tensor::ones(shape, storage, &device)
     } else {
@@ -24162,6 +24162,41 @@ fn finish(py: Python<'_>, tensor: Tensor, tag: TorchDType) -> PyResult<Py<PyAny>
         PyTensorBase::new(tensor)?
     };
     Ok(wrapped.into_pyobject(py)?.into_any().unbind())
+}
+
+/// The candle storage dtype for `tag`, refused **by name** if `device` cannot
+/// hold it.
+///
+/// `PyDtype::storage` answers "can this crate store that dtype at all". It is
+/// handed no device, so it cannot answer "can *this* device", and the pairing
+/// matters for one cell today: `float64` on Metal, which MSL has no type for.
+/// `metal_dtype_gate` (device.rs) is the function that knows it.
+///
+/// **Why the factories need this when `PyTensorBase::new` already carries the
+/// same gate.** That gate sits on the constructor every dense tensor passes
+/// through, which is what makes it impossible to get round -- but a factory
+/// reaches *candle* first, and candle refuses in its own vocabulary before the
+/// constructor is ever called. Measured on this machine, before this helper
+/// existed: `torch.ones(2, dtype=torch.float64, device="mps")` answered
+/// `candle: unsupported const-set f64`, and `torch.arange(4, ...)` the same way
+/// answered `Metal contiguous to_dtype I64 F64 not implemented`. Eight roads
+/// spoke like that -- `ones`, `full`, `scalar_tensor`, `arange`, `ones_like`,
+/// `full_like`, `new_ones`, `new_full`. A caller can act on neither sentence:
+/// both name an internal symbol for a fact about Metal's API, which is the
+/// shape CLAUDE.md §6 rejects and which `test_intmps.py` already rejected for
+/// the integer dtypes (`name_mps_int_refusal`, device.rs).
+///
+/// So this is **not a second gate**. It is the same gate asked one step earlier
+/// on the paths that would otherwise never reach it -- nullifying
+/// `metal_dtype_gate` takes this and the constructor's copy out together, which
+/// is what keeps the guard testable rather than mutually shadowed (CLAUDE.md
+/// §5.5). `test_dtmdev.test_float64_refuses_by_name_on_every_road_onto_metal`
+/// is the test, and it walks 22 roads rather than the four that were broken,
+/// so a road that regresses in the other direction is red too.
+fn storage_for(op: &str, tag: TorchDType, device: &Device) -> PyResult<candle_core::DType> {
+    let storage = PyDtype::new(tag).storage(op)?;
+    crate::device::metal_dtype_gate(device, storage)?;
+    Ok(storage)
 }
 
 /// Every argument name this file reads a keyword by, as an interned Python

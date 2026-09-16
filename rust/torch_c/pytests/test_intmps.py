@@ -47,7 +47,7 @@ outcome docs/numerics/DTYPEDEV.md section 1 ranks above a quietly wrong one.
 
 Nullifications this file is meant to catch:
 
-* `name_metal_int_refusal` returning the error unchanged
+* `name_mps_int_refusal` returning the error unchanged
       -> test_int16_and_int32_on_metal_refuse_by_name_rather_than_by_shader_symbol
 * the refusal applied to `add` only, not the family
       -> test_the_named_refusal_covers_the_whole_family
