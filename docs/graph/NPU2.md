@@ -976,6 +976,14 @@ next person cannot check**, which is how it survived two red gates.
 
 ### 9.1 Why the plan was empty — established
 
+> **Superseded in part by §9.6 (2026-09-16).** The silence measured below is
+> real, but it is not a property of the artefact's bytes alone: it belongs
+> overwhelmingly to `ComputeUnit.ALL` — 75% silent there against 0.7% at
+> `CPU_AND_NE`, measured over 168 observations. The table in this section and the eliminations
+> under it were all taken at `ALL`, which is `compute_plan`'s default, so they
+> are measurements *within* that configuration rather than about CoreML in
+> general. Read §9.6 before building on this section.
+
 `compute_plan` returned **zero** rows for a single-`relu` and a single-`gelu`
 float16 program at `(256, 1024)`, while returning full rows for a `linear` at
 the same precision in the same process.
@@ -1070,10 +1078,14 @@ guarded against is a silent drop.
 §9.1 is exactly the situation where a one-shape measurement can be taken away
 by one artefact. The relu/gelu claim — supported on the unit, preferred
 elsewhere, which is the number that decided not to lower them — is now taken at
-`(256, 1024)`, `(255, 1024)`, `(128, 1024)` and `(256, 1023)`. The test grades
-every shape CoreML answered and **requires at least two to answer**, so it
-cannot go quietly vacuous the way `assert rows` did; the shape CoreML declined
-is present as a named `unknown` row rather than as an absence.
+`(256, 1024)`, `(255, 1024)`, `(128, 1024)` and `(256, 1023)`.
+
+It requires at least two to answer, and **as of §9.6 it asks at `CPU_AND_NE`
+rather than `ALL`.** The threshold was never the flake: it was the residue of
+asking the question in the configuration that answers 25% of the time, and
+§9.6.1 records the measurement that a stricter threshold is not available even
+at `CPU_AND_NE`. The shape CoreML declines is still present as a named
+`unknown` row rather than as an absence.
 
 ### 9.5 Split the way CLAUDE.md §5.3 asks
 
@@ -1082,13 +1094,109 @@ is present as a named `unknown` row rather than as an absence.
 | **defect fixed** | an empty or partly-unnamed `MLComputePlan` produced **no warning at all**, in both places that read one — the §1 silence, reached a different way |
 | **defect fixed** | `compute_plan` silently dropped every operation CoreML named no device for, so "no plan" and "no computing operations" were the same empty list |
 | **defect fixed** | an unknown plan was read as `_UNREACHABLE_PRECISION`, blaming the precision for a `supported` column CoreML never filled in |
-| **claim added** | the empty plan tracks the compiled artefact's **bytes**, not the program: a two-byte rename inside `.mlmodelc` restores it, and renaming back removes it again (§9.1) |
+| **claim amended** | the empty plan tracks the compiled artefact's **bytes**, not the program: a two-byte rename inside `.mlmodelc` restores it (§9.1) — but only within `ComputeUnit.ALL`, which §9.6 shows is the thing the silence actually belongs to |
 | **claim withdrawn** | that the failure had "cleared on its own" — it is deterministic, and it reproduces at `af47641` as well |
 | **hypothesis discarded** | that per-op usage needs a warm `e5bundlecache`; a never-compiled shape plans fully cold, and the silent one stays silent after a real `predict` (§9.2) |
 | **limitation named** | which cache holds the bad entry, and how one gets into that state, is **not** established; `e5bundlecache` was not deleted to find out |
 | **claim unchanged** | relu and gelu are supported on the unit and preferred elsewhere — re-measured at four shapes, not widened, not re-graded |
 | **test defect fixed** | the relu/gelu measurement rested on a single artefact and became `assert []` when that artefact went silent |
 | **tests added** | 8, in `rust/torch_c/pytests/test_emptyplan.py` |
+
+### 9.6 The silence belongs to `ComputeUnit.ALL` — measured, 2026-09-16
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was the
+flakiest thing on `develop`. Across four solitary gate runs it graded 4, then
+1, then 1, then 0 answered shapes — and the run that answered all four was
+taken as a clean baseline, which is how a different branch came to be suspected
+of a regression it had nothing to do with.
+
+§9.1 read that silence as belonging to the compiled artefact's bytes. It does
+not. It belongs to the **compute-unit configuration the plan is asked for**,
+and `compute_plan`'s default is `ComputeUnit.ALL`.
+
+Measured at the fixture's own four shapes, both ops, three fresh interpreters
+back to back, load average 1.5, nothing else on the machine — 24 rows, byte
+identical every time:
+
+| | `ComputeUnit.ALL` | `ComputeUnit.CPU_AND_NE` |
+|---|---|---|
+| relu, all four shapes | **no plan at all**, 4/4 | `supported=[CPU, NeuralEngine]`, `preferred=CPU`, 4/4 |
+| gelu `(256,1024)`, `(255,1024)` | `supported=[CPU, GPU, NeuralEngine]`, `preferred=CPU` | `supported=[CPU, NeuralEngine]`, `preferred=CPU` |
+| gelu `(128,1024)`, `(256,1023)` | **no plan at all** | `supported=[CPU, NeuralEngine]`, `preferred=CPU` |
+| **answered** | **2 of 8** | **8 of 8** |
+
+Widened to every observation taken this round — 3 probe runs, 12 solitary runs
+of `test_coremlops.py`, and 3 full gate runs:
+
+| | observations | silent | rate |
+|---|---|---|---|
+| `ComputeUnit.ALL` | 24 | 18 | **75%** |
+| `ComputeUnit.CPU_AND_NE` | 144 | 1 | **0.7%** |
+
+Two things follow, and the second matters more than the first.
+
+**It is whole-program, not per-operation.** Either every operation of the
+compiled program has a device usage or none of them does — including the
+`ios16.cast`s at the boundary, which is what §9.1 observed. There is no partial
+plan. That is consistent with `docs/graph/ANEDECODE.md`'s finding that the
+scheduling unit is the compiled program.
+
+**The answer at `ALL` is not stable, and that is the flake.** §9.1 records
+relu planning normally at `(255, 1024)`, `(128, 1024)` and `(256, 1023)`, and
+on 2026-09-16 relu plans at **none** of them at `ALL` — while `(909, 1024)` and
+`(64, 4096)` still do, and a `linear` at `(128, 1024)` still comes back
+`preferred=NeuralEngine`. Same machine, same coremltools, same artefacts, a
+different answer three days apart. A test cannot be founded on that.
+
+`CPU_AND_NE` is not a weaker question. It is the **stronger** one: with the GPU
+out of the arbitration, the CPU is CoreML's only alternative to the Neural
+Engine, and CoreML still picks the CPU. That is exactly the claim leaving relu
+and gelu unlowered has to rest on. It does not distort the positive result
+either — `linear` at `(128, 1024)` reads `preferred=NeuralEngine` at
+`CPU_AND_NE` just as it does at `ALL`.
+
+What is **not** established: why `ALL` declines for some programs and not
+others, nor what changed between 2026-09-13 and 2026-09-16 to move which ones.
+The fix does not need it — the question has a configuration that answers — but
+nothing here should be read as an account of CoreML's arbitration.
+
+The `unknown` row stays in `compute_plan`, and §9.3's warnings stay keyed on
+it. Making the absence visible was always the point, and the fixture still has
+an absence to tolerate about once in 144 observations — §9.6.1 is the
+measurement that says so, and the reason the test's threshold did not move.
+
+#### 9.6.1 `== 4` was tried, and the third gate run refused it
+
+The obvious strengthening — require all four shapes to answer, since
+`CPU_AND_NE` answered all eight every time in isolation — was written first and
+then **measured rather than assumed**. It passed 12 of 12 solitary runs of
+`test_coremlops.py` and full gate runs 1 and 2; **gate run 3 returned
+`unknown` for gelu at `(256, 1023)`** and the test went red.
+
+So CoreML's willingness to produce a per-operation plan is not a guarantee at
+*any* compute-unit setting. It is 75% silent at `ALL` and 0.7% silent at
+`CPU_AND_NE`, and the second number is small but is not zero. The threshold
+therefore stays at `>= 2`, with the reason recorded instead of inherited: at
+0.7% per observation, three of an op's four shapes going silent together is
+about `4 * 0.007**3` — roughly one run in a million — whereas the
+configuration this test used to run in failed outright most of the time. The
+four-shape sweep (§9.4) is the redundancy; `>= 2` is what makes the redundancy
+load-bearing. An op silent at *every* shape — which is exactly what `ALL` did
+to relu, 4 of 4 — still fails.
+
+This is written down because the number looks like the weak old rule and is
+not: nothing about the threshold was the flake. The compute-unit argument was.
+
+| | |
+|---|---|
+| **defect fixed** | the fixture asked `MLComputePlan` with `ComputeUnit.ALL`, which returns no plan for 6 of its 8 (op, shape) pairs and returns a *different* 6 on different days — the whole of the flake |
+| **test strengthened** | the payload names the compute units, so a silent revert to `ALL` fails here by name rather than as an intermittently empty plan |
+| **claim added** | the plan is whole-program: either every operation has a usage or none does, boundary casts included |
+| **claim amended** | §9.1's artefact-bytes account is scoped to `ALL` rather than withdrawn (§9.1, §9.5) |
+| **claim withdrawn** | that `CPU_AND_NE` answers 8 of 8 unconditionally — it is 143 of 144 (§9.6.1) |
+| **limitation named** | why `ALL` declines for a given program, and why `CPU_AND_NE` declines once in 144, is not established |
+| **threshold unchanged** | `answered >= 2`, now with the arithmetic behind it (§9.6.1) rather than as a residue |
+| **tests added** | 0 — this is the existing test moved off a configuration that answers on luck |
 
 ---
 

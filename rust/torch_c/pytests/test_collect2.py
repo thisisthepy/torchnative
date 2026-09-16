@@ -448,6 +448,35 @@ def _c2_free_port():
     return port
 
 
+def _c2_extract(path, head=1000, tail=3000):
+    """The head and the tail of a child's stream, with the middle named."""
+    try:
+        with open(path, "r", errors="replace") as handle:
+            text = handle.read()
+    except OSError as error:
+        return "<unreadable: %s>" % error
+    if not text:
+        return "<empty>"
+    if len(text) <= head + tail:
+        return text
+    return "%s\n... [%d characters elided] ...\n%s" % (
+        text[:head], len(text) - head - tail, text[-tail:])
+
+
+def _c2_states(procs, tmp):
+    """One line per rank: how it ended, or that it has not."""
+    lines = []
+    for rank, proc in enumerate(procs):
+        code = proc.poll()
+        state = "still running" if code is None else "exited %d" % code
+        lines.append(
+            "--- rank %d: %s ---\nstdout: %s\nstderr: %s"
+            % (rank, state,
+               _c2_extract(os.path.join(tmp, "rank-%d.out" % rank)),
+               _c2_extract(os.path.join(tmp, "rank-%d.err" % rank))))
+    return "\n".join(lines)
+
+
 def _c2_spawn(source, world, dtype, shim, what, timeout=600):
     """Run `source` as `world` processes. Returns their JSON, rank-ordered.
 
@@ -455,6 +484,29 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
     test that propagates an exception with a peer still blocked in `accept`
     leaves an orphan holding a port, and the next round to bind an ephemeral
     port near it inherits a machine that is quietly one process dirtier.
+
+    **The children's output goes to files, not to pipes, and `timeout` is a
+    deadline for the spawn rather than a budget per rank.** Both of those are
+    corrections, and `test_a_rank_that_prints_does_not_deadlock_the_harness_
+    that_reads_it` and its neighbour hold them:
+
+    * These processes are peers in one collective -- not one of them can
+      finish until all of them have. Waiting on them **in rank order** with
+      `communicate()` therefore reads exactly one pipe at a time, and a pipe
+      holds 64 KiB; a rank that writes more than that blocks in `write(2)`
+      with nobody reading, never reaches the collective, and hangs every peer
+      including the one the parent is waiting on. The parent then spends its
+      whole timeout and reports "rank 0 never finished". Measured at 1 MiB per
+      rank: 1 of 1 timeouts at world 3. Files have no such limit, so every
+      rank runs to completion and the parent reads afterwards.
+    * The rank a per-rank wait names on a timeout is whichever one the loop
+      reached first, which is rank 0 -- **not** the rank that wedged. A real
+      ten-minute hang of `aw-gloo32-3` was reported that way and could not be
+      diagnosed: rank 0 was blocked waiting for a peer, and the peer's output
+      was thrown away by the `finally` that killed it. A timeout now names
+      every rank's state and keeps what each one said.
+    * `timeout` passed to each `communicate()` in turn is `world * timeout`
+      for the spawn, so a wedged world-4 run took 40 minutes to say anything.
     """
     tmp = tempfile.mkdtemp(prefix="collect2-%s-" % what)
     port = _c2_free_port()
@@ -469,32 +521,45 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
         env.pop("PYTHONPATH", None)
 
     procs = []
+    streams = []
     try:
         for rank in range(world):
+            out = open(os.path.join(tmp, "rank-%d.out" % rank), "wb")
+            err = open(os.path.join(tmp, "rank-%d.err" % rank), "wb")
+            streams += [out, err]
             procs.append(subprocess.Popen(
                 [sys.executable, "-c", source, str(rank), str(port),
                  str(world), os.path.join(tmp, "rank-%d.json" % rank), dtype],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                env=env,
+                stdout=out, stderr=err, env=env,
             ))
             if rank == 0 and shim:
                 # Rank 0 binds the store before the others retry against it.
                 time.sleep(0.4)
 
-        reports = []
+        deadline = time.monotonic() + timeout
         for rank, proc in enumerate(procs):
             try:
-                _, err = proc.communicate(timeout=timeout)
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
+                for stream in streams:
+                    stream.flush()
                 raise RuntimeError(
-                    "collect2/%s: rank %d never finished within %ds at world "
+                    "collect2/%s: not every rank finished within %ds at world "
                     "%d. A collective that hangs is what this timeout exists "
-                    "for; it is not a performance bound."
-                    % (what, rank, timeout, world))
+                    "for; it is not a performance bound. Every rank's state "
+                    "and output follow -- the one that wedged is a rank still "
+                    "running, which is not necessarily rank 0.\n%s"
+                    % (what, timeout, world, _c2_states(procs, tmp)))
+        for stream in streams:
+            stream.flush()
+        reports = []
+        for rank, proc in enumerate(procs):
             if proc.returncode != 0:
                 raise RuntimeError(
-                    "collect2/%s: rank %d exited %d\n--- stderr ---\n%s"
-                    % (what, rank, proc.returncode, err[-6000:]))
+                    "collect2/%s: rank %d exited %d at world %d. Every rank's "
+                    "state and output follow.\n%s"
+                    % (what, rank, proc.returncode, world,
+                       _c2_states(procs, tmp)))
             with open(os.path.join(tmp, "rank-%d.json" % rank)) as handle:
                 reports.append(json.load(handle))
         return reports
@@ -502,7 +567,9 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
         for proc in procs:
             if proc.poll() is None:
                 proc.kill()
-                proc.communicate()
+                proc.wait()
+        for stream in streams:
+            stream.close()
 
 
 @functools.cache
@@ -1092,6 +1159,127 @@ def test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream():
                 assert meta["shim"] is False, meta
                 assert (meta["rank"], meta["world"]) == (rank, world), meta
                 assert meta["backend"] == "gloo", meta
+
+
+# ---------------------------------------------------------------------------
+# The harness itself, which is the thing every number above is read through
+# ---------------------------------------------------------------------------
+#
+# `_c2_spawn` runs `world` processes that are *peers in one collective*: none
+# of them can finish until all of them have. Everything below is about the two
+# ways a harness with that shape destroys the evidence it exists to collect.
+
+
+#: A rendezvous written in files rather than in a collective, so these two
+#: tests exercise `_c2_spawn`'s process handling and nothing else -- no torch,
+#: no gloo, no shim. `NOISE` bytes go to stderr *before* the rendezvous, which
+#: is what makes a parent that does not drain concurrently deadlock.
+_C2_HARNESS_PROBE = r"""
+import json, os, sys, time
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+here = os.path.dirname(dest)
+noise = int(os.environ.get("C2_PROBE_NOISE", "0"))
+if noise:
+    sys.stderr.write("rank%d:" % rank + "n" * noise + "\n")
+    sys.stderr.flush()
+wedged = os.environ.get("C2_PROBE_WEDGED_RANK")
+if wedged is not None and rank == int(wedged):
+    time.sleep(float(os.environ.get("C2_PROBE_WEDGE_SECONDS", "60")))
+open(os.path.join(here, "arrived-%d" % rank), "w").close()
+deadline = time.time() + 120
+while time.time() < deadline:
+    if all(os.path.exists(os.path.join(here, "arrived-%d" % peer))
+           for peer in range(world)):
+        break
+    time.sleep(0.02)
+json.dump({"rank": rank}, open(dest, "w"))
+"""
+
+
+def _c2_harness_probe(world, timeout, **env):
+    previous = {key: os.environ.get(key) for key in env}
+    os.environ.update({key: str(value) for key, value in env.items()})
+    try:
+        return _c2_spawn(_C2_HARNESS_PROBE, world, "float32", False,
+                         "harness-probe", timeout=timeout)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_a_rank_that_prints_does_not_deadlock_the_harness_that_reads_it():
+    """Peers must be drained together, because they must also run together.
+
+    `_c2_spawn` used to give every child `stdout=PIPE, stderr=PIPE` and then
+    `communicate()` them **one rank at a time, in rank order**. A pipe holds
+    64 KiB on this machine; past that the writer blocks in `write(2)` until
+    somebody reads. So while the parent sat in rank 0's `communicate()`, ranks
+    1..n-1 had nobody reading theirs -- and a peer blocked mid-`write` is a
+    peer that never reaches the collective, which is a rank 0 that never
+    finishes. The parent then reported, after its full timeout:
+
+        collect2/<what>: rank 0 never finished within 600s at world 3
+
+    Measured: with 1 MiB per rank on stderr and a rendezvous every rank must
+    reach, the old harness timed out 1 of 1 at world 3 with exactly that
+    message, and this test therefore fails without the fix rather than
+    describing it.
+
+    It matters most on the path that matters most. A rank that *raises* prints
+    a traceback, and upstream torch's distributed tracebacks are not small --
+    so the shape being removed here is one where a real failure in a child is
+    converted into a ten-minute silence in the parent.
+    """
+    reports = _c2_harness_probe(3, 120, C2_PROBE_NOISE=1 << 20)
+    assert [r["rank"] for r in reports] == [0, 1, 2], reports
+
+
+def test_a_timeout_names_the_rank_that_wedged_and_keeps_what_every_rank_said():
+    """"rank 0 never finished" was a fact about the loop, not about the run.
+
+    The parent waited rank by rank, so the rank it named on a timeout was
+    always the first one it happened to be waiting on -- rank 0 -- whichever
+    peer had actually wedged. Every other rank's output was then discarded by
+    the `finally` that kills them. One real occurrence of this, a ten-minute
+    hang of `aw-gloo32-3`, could not be diagnosed afterwards for exactly that
+    reason: the message named rank 0, rank 0 was merely blocked in a
+    collective waiting for somebody else, and the somebody else's stderr was
+    gone.
+
+    So a timeout now reports the state of **every** rank -- which ones exited
+    and with what, which are still running -- and the tail of each one's
+    output. That is not a fix for a hang; it is what makes the next hang
+    something a person can read. The test wedges rank 2 and requires the
+    report to say so, which is exactly what the old message could not do.
+
+    The second timeout defect is here too: `timeout` was passed to each
+    `communicate()` in turn, so a world-4 spawn could take four times the
+    timeout it was given before it said anything. It is a deadline for the
+    spawn now, and this test's own runtime is the proof -- it wedges one rank
+    for far longer than the deadline it allows.
+    """
+    started = time.time()
+    try:
+        _c2_harness_probe(3, 5, C2_PROBE_NOISE=4096,
+                          C2_PROBE_WEDGED_RANK=2, C2_PROBE_WEDGE_SECONDS=90)
+    except RuntimeError as error:
+        message = str(error)
+    else:
+        raise AssertionError("a wedged rank did not time out the spawn")
+    elapsed = time.time() - started
+    # A deadline for the spawn, not a budget per rank: three ranks, five
+    # seconds, not fifteen. Generous against a loaded machine, and still far
+    # under the 3x that the per-rank spelling would take.
+    assert elapsed < 30, elapsed
+    assert "rank 2" in message, message
+    assert "still running" in message, message
+    # The ranks that were merely waiting are on the report, with what they
+    # said, instead of being killed unread.
+    assert "rank0:" in message and "rank1:" in message, message
 
 
 def _main():

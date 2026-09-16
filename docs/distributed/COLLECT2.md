@@ -369,3 +369,85 @@ until the harness times out.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_all_to_all_single_refuses_uneven_splits_by_name present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_point_to_point_still_refuses_by_name_and_was_not_weakened present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
+
+---
+
+## 11. The harness could not report a hang it caused — measured, 2026-09-16
+
+A full gate run failed with
+
+```
+RuntimeError: collect2/aw-gloo32-3: rank 0 never finished within 600s at world 3.
+```
+
+and the adjacent run of the same commit passed. That message turned out to
+carry almost no information, for two separate reasons in `_c2_spawn`, and both
+are fixed here. **Neither is a fix for the hang itself** — see the limitation
+at the end.
+
+### 11.1 Waiting on peers one at a time deadlocks on 64 KiB
+
+`_c2_spawn` gave every child `stdout=PIPE, stderr=PIPE` and then
+`communicate()`d them **in rank order**. These children are peers in one
+collective: not one of them can finish until all of them have. So while the
+parent sat in rank 0's `communicate()`, nobody was reading ranks 1..n-1 — and a
+pipe holds 64 KiB on this machine. Past that the writer blocks in `write(2)`,
+never reaches the collective, and hangs every peer including the one the parent
+is waiting on. The parent then burned its whole timeout and blamed rank 0.
+
+Measured with 1 MiB per rank on stderr and a rendezvous every rank must reach:
+**1 of 1 timeouts at world 3, with exactly the message above.** After the fix,
+the same probe returns in 0.1 s. `test_a_rank_that_prints_does_not_deadlock_
+the_harness_that_reads_it` is that measurement.
+
+This is latent on the happy path and not on the path that matters. Measured on
+2026-09-16, every rank of `aw-gloo32-3`, `aw-gloo32-4`, `aw-shim3` and
+`aw-shim4` writes **0 bytes** to both streams when it succeeds — which is why
+the deadlock is not the cause of the observed hang, and is said here rather
+than claimed as one. But a rank that *raises* prints a traceback, and upstream
+torch's distributed tracebacks are not small: the shape removed here is one
+that converts a real failure in a child into a ten-minute silence in the
+parent. That is this repository's recurring defect — the fixture throwing away
+the evidence — wearing another face.
+
+Children now write to per-rank files, which have no such limit.
+
+### 11.2 The rank a per-rank wait names is the loop's, not the run's
+
+The parent waited rank by rank, so the rank it named on a timeout was always
+whichever one it reached first — **rank 0** — regardless of which peer wedged.
+Rank 0 in a wedged collective is merely blocked waiting for somebody else, and
+that somebody else's output was then discarded by the `finally` that kills the
+children. So `aw-gloo32-3`'s ten-minute hang was unanalysable the moment it was
+reported.
+
+A timeout now reports every rank's state — exited with what, or still running —
+and the head and tail of each one's stdout and stderr. The rank that wedged is
+a rank *still running*, and it is on the report by number.
+
+`timeout` was also passed to each `communicate()` in turn, making the real
+budget `world * timeout`: a wedged world-4 spawn took 40 minutes to say
+anything. It is a deadline for the spawn now.
+
+### 11.3 What was ruled out, and what is still open
+
+| hypothesis | measurement | verdict |
+|---|---|---|
+| the peers deadlock on the stdout/stderr pipe buffer | every rank writes 0 B on the passing path | **not the cause here**, though it is a real defect (§11.1) |
+| `_c2_free_port` hands the same port to two concurrent suites | 6000 draws from two concurrent processes: 0 within-process duplicates, 0 cross-process collisions | **discarded** |
+| the hang reproduces solitary | `test_asyncwork.py` run 20 times back to back, load average ~1.9 | **20 of 20 passed in ~24 s each; not reproduced** |
+
+**Not established: why `aw-gloo32-3` hung.** It was seen once, in a full gate
+run, alongside other suites; it has not been reproduced in 20 solitary runs of
+that suite nor in the gate runs since. What §11 buys is that the next
+occurrence arrives with every rank's state and output attached instead of a
+sentence naming the rank that was merely waiting first. Nothing here adds a
+retry, widens a timeout, or lets a hang pass.
+
+| | |
+|---|---|
+| **defect fixed** | `_c2_spawn` deadlocked on a rank that wrote more than 64 KiB, producing the same timeout message a genuine hang produces |
+| **defect fixed** | a timeout named rank 0 whichever rank wedged, and killed the other ranks' output unread |
+| **defect fixed** | `timeout` was a per-rank budget, so a spawn's real limit was `world x timeout` |
+| **tests added** | 2, in `rust/torch_c/pytests/test_collect2.py` |
+| **not fixed** | the `aw-gloo32-3` hang itself, which was not reproduced (§11.3) |

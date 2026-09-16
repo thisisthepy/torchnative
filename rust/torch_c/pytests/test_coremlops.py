@@ -201,13 +201,22 @@ try:
     # and not preferred" would silently become untested. It is asked at every
     # shape, each answer is kept as it came -- including `unknown`, which is
     # now a row rather than an absence -- and the test grades them.
+    # CPU_AND_NE, and not ALL. See the test's docstring and
+    # docs/graph/NPU2.md §9.6: with the GPU in the arbitration MLComputePlan
+    # returns no per-operation plan at all for 6 of these 8 (op, shape) pairs,
+    # which is the whole of what §9.1 recorded as an artefact-bytes mystery.
+    # With CPU_AND_NE all 8 answer, and the answer is the stronger one: even
+    # when the CPU is CoreML's only alternative to the Neural Engine, it still
+    # prefers the CPU.
+    _REJECTED_UNITS = "CPU_AND_NE"
+    out["rejected_plans_units"] = _REJECTED_UNITS
     for name, module in (("relu", torch.nn.ReLU()), ("gelu", torch.nn.GELU())):
         by_shape = {}
         for shape in ((256, 1024), (255, 1024), (128, 1024), (256, 1023)):
             model_, _names, _emitted = C.compile_model(
                 capture(module.eval(), torch.randn(*shape)), float32=False)
-            by_shape[str(list(shape))] = C.computes(
-                C.compute_plan(model_, compute_units=ct.ComputeUnit.ALL))
+            by_shape[str(list(shape))] = C.computes(C.compute_plan(
+                model_, compute_units=getattr(ct.ComputeUnit, _REJECTED_UNITS)))
         out.setdefault("rejected_plans", {})[name] = by_shape
     out["layer_norm_has_no_lowering"] = sorted(
         op for op in C.supported_ops() if "layer_norm" in op)
@@ -381,10 +390,52 @@ def test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission():
     What changed is that the shape CoreML declined is *visible* -- it is a row
     reading `preferred == "unknown"` -- instead of being an empty list that
     reads exactly like "no measurement was taken".
+
+    **Asked at `CPU_AND_NE`, and that -- not the threshold -- was the flake.**
+    §9.1 recorded the silence as a property of the compiled artefact's bytes,
+    which made it look unavoidable and left the test grading whatever
+    survived. It is not that: the silence belongs overwhelmingly to
+    `ComputeUnit.ALL`, which is `compute_plan`'s default and which this
+    fixture used to pass explicitly. Measured (docs/graph/NPU2.md §9.6):
+
+        ComputeUnit.ALL         18 of 24 (op, shape) observations return NO
+                                plan at all -- 75%, and *which* six of eight
+                                pairs are silent changes from day to day
+        ComputeUnit.CPU_AND_NE   1 of 144 observations silent -- 0.7% --
+                                across 3 probe runs, 12 suite runs and 3 full
+                                gate runs; every answer that came back said
+                                supported=[CPU, NeuralEngine], preferred=CPU
+
+    Asking with the GPU out of the arbitration is the **stronger** claim, not
+    the weaker one: even when CoreML's only alternative to the Neural Engine
+    is the CPU, it still picks the CPU. That is exactly what leaving relu and
+    gelu on the CPU has to rest on. It does not distort the positive result
+    either -- a `linear` at `(128, 1024)` still reads `preferred=NeuralEngine`
+    at `CPU_AND_NE`, measured.
+
+    **Why `>= 2` and not `== 4`, argued rather than assumed.** `== 4` was
+    tried here first, and it passed 12 of 12 solitary suite runs and 2 of 3
+    full gate runs -- the third went `unknown` for gelu at `(256, 1023)`. So
+    CoreML's willingness to answer is not a guarantee at any compute-unit
+    setting, and a rule that needs all four is a rule that fails on luck a few
+    times a year. That is the measured reason the threshold is below the
+    sweep, and it is not a tolerance widened to fit: at a 0.7% per-observation
+    silence rate, three of one op's four shapes going silent together is about
+    4 * 0.007**3, roughly one run in a million, while the configuration this
+    test used to run in failed outright most of the time. The sweep is the
+    redundancy (§9.4) and `>= 2` is what makes the redundancy load-bearing.
+
+    The `unknown` row stays, in `compute_plan` and here, and it is still never
+    an *absence*: a shape CoreML declined is a named row with an empty
+    `supported`, and an op that goes silent at every shape -- which is what
+    `ComputeUnit.ALL` did to relu, 4 of 4 -- still fails this test.
     """
     r = _fixture_or_skip()
     if r is None:
         return
+    # Named in the payload so that a silent revert to `ComputeUnit.ALL` fails
+    # here, by name, instead of coming back as an intermittently empty plan.
+    assert r["rejected_plans_units"] == "CPU_AND_NE", r["rejected_plans_units"]
     for name in ("relu", "gelu"):
         by_shape = r["rejected_plans"][name]
         assert len(by_shape) == 4, (name, sorted(by_shape))
