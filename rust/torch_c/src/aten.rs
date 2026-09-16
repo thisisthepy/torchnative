@@ -9064,6 +9064,7 @@ fn promotion_rank(dtype: TorchDType) -> Option<(u8, u8)> {
     use TorchDType::*;
     Some(match dtype {
         Bool => (0, 0),
+        Int8 => (1, 1),
         UInt8 => (1, 1),
         Int16 => (1, 2),
         Int32 => (1, 3),
@@ -9115,6 +9116,9 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
     for (a, b) in [(lhs, rhs), (rhs, lhs)] {
         if unsigned_wide(a) {
             return if b.is_floating_point() { Some(b) } else { None };
+        }
+        if a == TorchDType::Int8 && b == TorchDType::UInt8 {
+            return Some(TorchDType::Int16);
         }
     }
 
@@ -10796,6 +10800,7 @@ fn abs_default(
     let wrapped: Vec<i64> = values
         .into_iter()
         .map(|v| match storage {
+            candle_core::DType::I8 => (v as i8).wrapping_abs() as i64,
             candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
             candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
             // Unsigned storages cannot hold a negative, so this is the
@@ -16849,6 +16854,7 @@ fn abs_inplace(
         let wrapped: Vec<i64> = values
             .into_iter()
             .map(|v| match storage {
+                candle_core::DType::I8 => (v as i8).wrapping_abs() as i64,
                 candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
                 candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
                 _ => v.wrapping_abs(),

@@ -254,12 +254,12 @@ def test_the_weight_transport_round_trips_every_dtype_it_claims_to_carry():
         print("   (skipped: no vendored shim installed)")
         return
     unavailable = {d: r["unavailable"] for d, r in data.items() if "unavailable" in r}
-    # `int8` is not storable by the candle backend at all, so it cannot be
-    # transported and is not a transport defect. It is asserted as the ONLY such
-    # dtype, so the day another one joins it this says so rather than shrinking
-    # the check silently. No architecture in the sweep carried one: the
-    # `state_dict` round-tripped for 290 of 290.
-    assert set(unavailable) == {"torch.int8"}, unavailable
+    # Every dtype the sweep carries is transportable. `int8` was the one
+    # exception, asserted as the ONLY one, until the `candle-core` fork gave it
+    # storage (docs/numerics/INT8.md §1.2) -- and that assertion is what went red
+    # when it did. Pinned as empty so a dtype that stops being carried says so.
+    assert unavailable == {}, unavailable
+    assert "torch.int8" in data, sorted(data)
     for dtype, row in data.items():
         if "unavailable" in row:
             continue

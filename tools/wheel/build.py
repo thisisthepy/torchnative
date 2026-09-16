@@ -524,6 +524,36 @@ def _make_rules(text: str) -> list[tuple[str, list[str]]]:
     return rules
 
 
+def _source_roots() -> list[str]:
+    """Where this checkout's build legitimately reads source: the crate, and
+    every `[patch]` `path` in its `Cargo.toml` that resolves inside the
+    repository.
+
+    cargo's dep-info lists a path dependency's sources beside the crate's, and
+    the `candle-core` fork is one (`vendor/candle-core`, docs/numerics/INT8.md
+    §1.2). Reading those as "another checkout" refused every wheel build.
+    Declared roots rather than "anywhere under REPO", so an input from a stray
+    corner of the repository is still foreign; and inside REPO only, so a
+    `[patch]` pointing at one machine's absolute path -- how the fork first
+    landed -- is foreign too.
+    """
+    import tomllib
+
+    roots = [os.path.realpath(CRATE)]
+    try:
+        manifest = tomllib.loads((CRATE / "Cargo.toml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return roots
+    repo = os.path.realpath(REPO)
+    for registry in manifest.get("patch", {}).values():
+        for spec in registry.values():
+            if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                root = os.path.realpath(CRATE / spec["path"])
+                if root.startswith(repo + os.sep):
+                    roots.append(root)
+    return roots
+
+
 def artefact_verdict(artefact: Path) -> tuple[str, str]:
     """Was `artefact` built from the source that is on disk now?
 
@@ -566,15 +596,18 @@ def artefact_verdict(artefact: Path) -> tuple[str, str]:
             "nothing to compare it against")
 
     # Absolute paths from the machine that built it. If they are not inside this
-    # crate then the artefact came out of a different checkout, and comparing it
-    # against *this* tree's mtimes would answer a question nobody asked.
-    crate = os.path.realpath(CRATE)
-    foreign = [d for d in deps if not os.path.realpath(d).startswith(crate + os.sep)]
+    # checkout's source roots then the artefact came out of a different
+    # checkout, and comparing it against *this* tree's mtimes would answer a
+    # question nobody asked.
+    roots = _source_roots()
+    foreign = [d for d in deps
+               if not any(os.path.realpath(d).startswith(r + os.sep) for r in roots)]
     if foreign:
         return UNKNOWN, (
-            f"the build read {len(foreign)} input(s) from outside {CRATE}, e.g. "
-            f"{foreign[0]} -- this artefact was built from a different checkout, "
-            "so its age relative to this one says nothing")
+            f"the build read {len(foreign)} input(s) from outside {CRATE} and its "
+            f"in-repository [patch] sources, e.g. {foreign[0]} -- this artefact "
+            "was built from a different checkout, so its age relative to this one "
+            "says nothing")
 
     try:
         artefact_ns = artefact.stat().st_mtime_ns
@@ -2473,6 +2506,19 @@ def self_test() -> None:
             ("prerequisites from another checkout", UNKNOWN,
              "different checkout",
              "@ART@: /some/other/worktree/rust/torch_c/src/lib.rs", 0.0),
+            # The `candle-core` fork is a `[patch]` path inside this repository
+            # (docs/numerics/INT8.md §1.2), so cargo's dep-info lists its sources
+            # beside the crate's. Reading those as "another checkout" refused
+            # every wheel build the fork landed into.
+            ("a prerequisite from this checkout's [patch] source", FRESH,
+             "recorded inputs",
+             f"@ART@: {real[0]} {REPO / 'vendor' / 'candle-core' / 'src' / 'lib.rs'}",
+             0.0),
+            # ...and only those: the rule is the declared source roots, not
+            # "anywhere in the repository".
+            ("a prerequisite in this repository but no declared source root",
+             UNKNOWN, "different checkout",
+             f"@ART@: {real[0]} {REPO / 'tools' / 'wheel' / 'build.py'}", 0.0),
         ]
 
         print(f"SELF-TEST of the artefact freshness check ({len(checks)} cases)")

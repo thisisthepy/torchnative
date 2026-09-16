@@ -416,11 +416,11 @@ def _mps_or_skip(what):
 # and a different axis from this one.
 _STORABLE = (
     "float64", "float32", "float16", "bfloat16",
-    "int64", "int32", "int16", "uint8", "uint32", "bool",
+    "int64", "int32", "int16", "int8", "uint8", "uint32", "bool",
     "float8_e4m3fn",
 )
 _NOT_STORABLE = (
-    "int8", "uint16", "uint64",
+    "uint16", "uint64",
     "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu",
     "float4_e2m1fn_x2",
     "qint8", "quint8", "qint32",
@@ -576,15 +576,14 @@ def _reaches(device):
 
 
 def test_every_dtype_this_build_cannot_store_refuses_by_name():
-    """Grade: **refuses by name**. Eleven of the dtypes `torch` publishes have
+    """Grade: **refuses by name**. Ten of the dtypes `torch` publishes have
     no candle storage here, and the requirement for those is not that they work
     -- it is that asking says so, naming the dtype, rather than silently
     downcasting to one that does.
 
-    `int8` is the one on this list most likely to surprise: upstream computes
-    with it on both cpu and mps, and this build cannot hold it at all.
-    docs/numerics/INT8.md and INT8B.md are that ground; what is checked here is
-    only that the refusal names the dtype.
+    `int8` was on this list until the `candle-core` fork gave it `DType::I8`
+    (docs/numerics/INT8.md §1.2). This test is what caught the list going stale:
+    it failed with "int8 built a tensor on the cpu" on the branch that landed it.
     """
     for name in _NOT_STORABLE:
         dt = getattr(_C, name, None)
@@ -713,6 +712,28 @@ _CPU_REACHES = {
     "float8_e4m3fn|matmul",
     "float8_e4m3fn|mul",
     "float8_e4m3fn|to_f32",
+    # Added 2026-09-15 with the candle fork (docs/numerics/INT8.md §1.2): the
+    # same eighteen `int16` and `uint8` reach, each graded against upstream by
+    # test_the_dtype_device_matrix_agrees_with_upstream. None on `mps` -- the
+    # fork is CPU-only and candle's Metal backend refuses `I8` by name.
+    "int8|abs",
+    "int8|add",
+    "int8|argmax",
+    "int8|clone",
+    "int8|cumsum",
+    "int8|div",
+    "int8|eq",
+    "int8|exp",
+    "int8|index0",
+    "int8|max",
+    "int8|mul",
+    "int8|neg",
+    "int8|pow2",
+    "int8|sqrt",
+    "int8|sub",
+    "int8|sum",
+    "int8|to_f32",
+    "int8|transpose_contig",
     "int16|abs",
     "int16|add",
     "int16|argmax",

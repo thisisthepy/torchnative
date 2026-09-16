@@ -69,7 +69,12 @@ and cannot satisfy either of those, so the change is still a refactor of
 candle's core numeric trait across three backends rather than one more enum
 arm. **No `[patch]` was added and none should be.**
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml '[patch' absent -->
+> **2026-09-15.** A `[patch]` now exists — for `I8`, one enum arm, not for complex
+> (`docs/numerics/INT8.md` §1.2) — and this marker, which read `Cargo.toml '[patch' absent`,
+> went red with it. The claim here is about a complex fork, so the marker now pins that the
+> fork carries none.
+
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/dtype.rs Complex absent -->
 
 ### 1.2 A pair, not interleaving — and the shape site that proves it
 

@@ -212,6 +212,7 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 | `int64` | 18 | 15 | 21 | 21 |
 | `int32` | 18 | **2** | 21 | 21 |
 | `int16` | 18 | **2** | 21 | 21 |
+| `int8` | 18 | **0** | 21 | 21 |
 | `uint8` | 18 | 15 | 21 | 21 |
 | `uint32` | 17 | 14 | **13** | **8** |
 | `bool` | 12 | 10 | 16 | 16 |
@@ -219,7 +220,10 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 
 **Grade: `agrees`, for every cell in the "reaches" columns.** Of the 288
 (dtype, device, operator) cells where both this build and upstream produce a
-value, **all 288 match** within one float32 ULP applied relatively. The twelve
+value, **all 288 match** within one float32 ULP applied relatively. (288 predates
+the `int8` row, added 2026-09-15; its 18 cpu cells are graded by the same test,
+which now covers 306, and `int8`'s wrap-around edges — which this matrix's
+values 1..4 never reach — by `test_int8.py`.) The twelve
 cells that differ in their last bits are all `exp` and `softmax` — a rounding
 direction, not an operator — and all sit inside the tolerances
 `tools/golden/dtypes.py` already sets for those dtypes.
@@ -247,13 +251,19 @@ Two rows are worth reading carefully:
 
 ### 3.2 Dtypes this build cannot store at all
 
-Eleven of the dtypes `torch` publishes have no candle storage here. **Grade:
+Ten of the dtypes `torch` publishes have no candle storage here. **Grade:
 refuses by name** — `_build` on each raises naming the dtype, and that is
-asserted for all eleven:
+asserted for all ten.
+
+`int8` was the eleventh until 2026-09-15, when the `candle-core` fork gave it
+storage ([`INT8.md`](INT8.md) §1.2); it moved to §3.1's table. Its row here had
+said upstream reaches 22 of 23 on both devices; re-measured with this file's own
+`_cell`, upstream reaches **21** on each (`mean` and `softmax` refuse `int8`).
+The test that lists this table failed on the branch that landed the fork —
+`int8 built a tensor on the cpu` — which is how the stale entry was found.
 
 | dtype | upstream cpu | upstream mps | note |
 |---|---|---|---|
-| `int8` | works (22/23) | works (22/23) | the one on this list most likely to surprise. [`INT8.md`](INT8.md) / [`INT8B.md`](INT8B.md) are that ground |
 | `uint16`, `uint64` | partial | partial | upstream also refuses most arithmetic on these |
 | `float8_e5m2`, `float8_e4m3fnuz`, `float8_e5m2fnuz`, `float8_e8m0fnu` | partial | partial | [`FLOAT8.md`](FLOAT8.md), [`FLOAT8B.md`](FLOAT8B.md), [`FLOAT8C.md`](FLOAT8C.md) — only `float8_e4m3fn` has candle storage |
 | `float4_e2m1fn_x2` | refuses | refuses | both sides refuse |

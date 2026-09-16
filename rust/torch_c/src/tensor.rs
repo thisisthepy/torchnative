@@ -867,6 +867,7 @@ impl PyTensorBase {
         let bytes = match cpu {
             CpuStorage::U8(v) => v.clone(),
             CpuStorage::U32(v) => pour!(v, u32),
+            CpuStorage::I8(v) => pour!(v, i8),
             CpuStorage::I16(v) => pour!(v, i16),
             CpuStorage::I32(v) => pour!(v, i32),
             CpuStorage::I64(v) => pour!(v, i64),
@@ -1169,6 +1170,7 @@ fn flat_storage(op: &str, source: &Tensor) -> PyResult<CpuStorage> {
     Ok(match flat.dtype() {
         DType::U8 => pour!(U8, u8),
         DType::U32 => pour!(U32, u32),
+        DType::I8 => pour!(I8, i8),
         DType::I16 => pour!(I16, i16),
         DType::I32 => pour!(I32, i32),
         DType::I64 => pour!(I64, i64),
@@ -1218,6 +1220,7 @@ impl InplaceOp1 for WriteThrough {
         match (storage, &self.payload) {
             (CpuStorage::U8(d), CpuStorage::U8(s)) => scatter!(d, s),
             (CpuStorage::U32(d), CpuStorage::U32(s)) => scatter!(d, s),
+            (CpuStorage::I8(d), CpuStorage::I8(s)) => scatter!(d, s),
             (CpuStorage::I16(d), CpuStorage::I16(s)) => scatter!(d, s),
             (CpuStorage::I32(d), CpuStorage::I32(s)) => scatter!(d, s),
             (CpuStorage::I64(d), CpuStorage::I64(s)) => scatter!(d, s),
@@ -1401,6 +1404,7 @@ pub fn to_le_bytes(op: &str, tensor: &Tensor) -> PyResult<Vec<u8>> {
     Ok(match flat.dtype() {
         DType::U8 => flat.to_vec1::<u8>().map_err(|e| candle_err(op, e))?,
         DType::U32 => pour!(u32),
+        DType::I8 => pour!(i8),
         DType::I16 => pour!(i16),
         DType::I32 => pour!(i32),
         DType::I64 => pour!(i64),
@@ -3117,6 +3121,7 @@ max_scalar_int!(u32);
 max_scalar_int!(i16);
 max_scalar_int!(i32);
 max_scalar_int!(i64);
+max_scalar_int!(i8);
 
 /// How many independent accumulators the row reduction carries.
 ///
@@ -3333,6 +3338,7 @@ impl candle_core::CustomOp1 for AMax {
         let out = match storage {
             CpuStorage::U8(v) => reduce!(U8, v),
             CpuStorage::U32(v) => reduce!(U32, v),
+            CpuStorage::I8(v) => reduce!(I8, v),
             CpuStorage::I16(v) => reduce!(I16, v),
             CpuStorage::I32(v) => reduce!(I32, v),
             CpuStorage::I64(v) => reduce!(I64, v),
@@ -3688,6 +3694,7 @@ impl candle_core::CustomOp1 for TransposedCopy {
         let out = match storage {
             CpuStorage::U8(v) => run!(U8, v),
             CpuStorage::U32(v) => run!(U32, v),
+            CpuStorage::I8(v) => run!(I8, v),
             CpuStorage::I16(v) => run!(I16, v),
             CpuStorage::I32(v) => run!(I32, v),
             CpuStorage::I64(v) => run!(I64, v),

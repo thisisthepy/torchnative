@@ -13209,18 +13209,9 @@ def test_legacy_typed_tensor_constructors_read_a_sequence_as_data():
     assert isinstance(_C.IntTensor, type), type(_C.IntTensor)
     assert (int | _C.IntTensor | None) is not None
 
-    # `int8` has no candle storage, so `CharTensor` refuses from one layer down
-    # and names the *dtype* rather than the class -- a better message than a
-    # missing name would be. `ShortTensor` computes: `int16` IS storable here,
-    # which was checked one dtype at a time rather than assumed from `int8`
-    # being absent.
+    # `int8` is now storable, so `CharTensor` constructs an int8 tensor.
     assert _C.ShortTensor([1, 2]).dtype == _C.int16
-    try:
-        _C.CharTensor([1, 2])
-    except NotImplementedError as e:
-        assert "not storable" in str(e), str(e)
-    else:
-        raise AssertionError("int8 has no candle storage; CharTensor must refuse")
+    assert _C.CharTensor([1, 2]).dtype == _C.int8
 
     assert _C._shim_legacy_tensor_types == sorted([
         "BFloat16Tensor", "BoolTensor", "ByteTensor", "CharTensor",

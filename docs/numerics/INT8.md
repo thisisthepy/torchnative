@@ -42,16 +42,88 @@ fetched 2026-09-06 (`main` at `ddf1b879dc3a`, committed 2026-09-04) declares
 and `grep -w I8` over that file returns **nothing**. So the cheap answer — bump the
 pin — does not exist. Whatever this costs, it costs a fork.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml '[patch' absent -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml '[patch.crates-io]' present -->
 
-### 1.2 What `/Volumes/macMini/caches/candle-vendor/candle-0.11.0-patched` was for
+### 1.2 The fork, and where it lives
 
-`docs/numerics/FLOAT8C.md` recorded that this crate's `Cargo.toml` has **no `[patch]` section**
-and that the vendored tree is therefore not in the shipped build. That is still true
-(`grep -rn '^\[patch' --include=Cargo.toml .` returns nothing; `Cargo.lock` resolves
-`candle-core 0.11.0` from `registry+https://github.com/rust-lang/crates.io-index`).
+`docs/numerics/FLOAT8C.md` recorded that this crate's `Cargo.toml` has **no `[patch]` section**.
+**That is no longer true.** This crate forks `candle-core` 0.11.0 to add `DType::I8`. Upstream
+has no `I8` as of `ddf1b879dc3a`, so the fork is the only road; it can be dropped the day
+upstream `candle-core` gains `I8` and the pin moves to that release.
 
-What that document did not say is **what the patch was**. Diffed against the crates.io
+**Where it lives (2026-09-15).** The fork was first landed as
+`candle-core = { path = "/Volumes/macMini/caches/candle-vendor/..." }` — an absolute path on one
+machine, outside the repository. cargo treats a missing `[patch]` path as an error, so every
+other checkout, CI and the wheel builds failed at resolution. It is now:
+
+| | |
+|---|---|
+| `rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-core = { path = "../../vendor/candle-core" }` |
+| `vendor/candle-core/` | **committed.** The published crate plus the patch, 113 files, 1.9 MB |
+| `vendor/int8-candle-0.11.0-cpu.patch` | the only place the fork is edited |
+| `vendor/vendor_candle.sh` | regenerates the tree; `--check` rebuilds it in a temp dir and diffs |
+
+The base is the **published** `candle-core-0.11.0.crate`, pinned by sha256
+`5ecb2450…6706` — the checksum crates.io's index records, i.e. the one develop's `Cargo.lock`
+carried. Its `.cargo_vcs_info.json` names candle commit `31f35b1`, the commit
+`docs/design/CANDLE_DEPS.md` §8 cloned. Published rather than cloned because `cargo package`
+normalises `Cargo.toml`: the crate stands alone, where the repository's `candle-core` inherits
+from a 24 MB workspace. That size was CANDLE_DEPS.md §9's reason not to vendor; the published
+crate is 1.9 MB.
+
+**Committed, not gitignored, deliberately.** `[patch]` is resolved before any build script runs,
+so a per-machine tree would need the vendoring step in front of every cargo invocation — two
+`vendor/*.sh`, `run.sh`, a dozen cross builds across two CI workflows, `cargo ndk`, the device
+scripts — and the first one missed would reproduce this defect. Committed, a fresh clone builds
+with plain `cargo build`. The cost is a copy that could drift from its two inputs, and
+`rust/torch_c/pytests/test_int8.py` runs `--check` in the gate, including a test that a
+drifted copy and a wrong crate are **refused**.
+
+**The patch carried in `vendor/` was not the fork that was built.** Applied to the published
+crate it failed one hunk of `dtype.rs` (the hand-built tree held a `dtype.rs.rej`), and it had no
+`metal_backend/mod.rs` hunks at all — the four `UnsupportedDTypeForOp` refusals that keep an
+`mps` user from a silent fallback existed only in the machine-local tree. The patch was
+regenerated from that tree: 12 files, all under `src/`. On `mps` an `int8` tensor refuses with
+`candle: unsupported dtype I8 for op to_dtype` — the candle spelling, not `int8`.
+
+**Portability, tested rather than asserted.** A copy of the checkout's tracked and untracked
+files at a different path, with a fresh `CARGO_HOME` and target directory, under
+`sandbox-exec` denying reads of the old absolute path, the original worktree and
+`~/.cargo/registry`:
+
+    pre-fix Cargo.toml + Cargo.lock    cargo build --release          exit 101
+        failed to read `/Volumes/macMini/caches/candle-vendor/.../candle-core/Cargo.toml`
+    vendor_candle.sh --check           (no cache: fetched static.crates.io, sha256 verified)  exit 0
+    fixed Cargo.toml + Cargo.lock      cargo build --release --locked exit 0
+        Compiling candle-core v0.11.0 (<copy>/vendor/candle-core); 200 crates downloaded,
+        no candle-core crate among them
+
+and `test_int8.py` passed 10/10 against the artefact that sandboxed build produced. Not
+tested: a non-macOS host, and the CUDA backend, which the patch does not touch and which
+nothing here can compile (§5 item 4 still stands for CUDA).
+
+**The wheel build refused the fork, and so would it have refused the absolute path.**
+`tools/wheel/build.py`'s freshness check reads cargo's dep-info and treated any input outside
+`rust/torch_c` as "built from a different checkout" — and a path dependency's sources are in
+that dep-info. The gate's `test_toolguard_wheel_staging.py` went red on it
+(`the build read 52 input(s) from outside .../rust/torch_c, e.g. .../vendor/candle-core/src/accelerate.rs`).
+The rule is now the crate plus each `[patch]` `path` that resolves **inside the repository**:
+an input elsewhere in the repository, or a `[patch]` at an outside absolute path, is still
+foreign. `build.py --self-test` carries both as cases, and the fork case was run red before
+the rule changed.
+
+**The tokenizer gate is not carried.** The machine-local tree was also the one CANDLE_DEPS.md §8
+made to drop `tokenizers` from the graph — the diff below. That is a separate decision §9
+declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that
+`candle-core` has no registry `source`.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml '"../../vendor/candle-core"' present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml 'candle-vendor' absent -->
+<!-- DOCWATCH: symbol-in-file vendor/vendor_candle.sh 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_committed_fork_is_the_pinned_crate_plus_the_patch present -->
+
+What follows is the history of that machine-local tree. `docs/numerics/FLOAT8C.md` did not say
+**what its patch was**. Diffed against the crates.io
 package, the vendored `candle-core` differs in exactly two files, and only one of them
 is source:
 
@@ -333,7 +405,13 @@ ends here rather than in a diff.
    at a named door, but a divergence to be decided on rather than assumed.
 4. **CUDA and Metal were not touched** and 33 `I16` sites there are unexamined.
 
-What is landed instead is the evidence: `docs/int8-candle-0.11.0-cpu.patch` is the
+> **Superseded 2026-09-15.** The fork has landed (§1.2), and item 1's objection is answered
+> by committing the published crate under `vendor/candle-core` rather than by an absolute
+> path. The patch named in the next paragraph moved to `vendor/`, and the copy that was
+> carried **did not apply** — it has been regenerated from the tree that was actually built.
+> Items 3 and 4 are unchanged.
+
+What is landed instead is the evidence: `vendor/int8-candle-0.11.0-cpu.patch` is the
 exact +252-line diff that compiles under `--no-default-features` and
 `--features accelerate`, keeps candle's own suite at 0 failed, and passes the
 functional probe in §2.4. Applying it is a `[patch.crates-io]` entry and the seven
@@ -350,5 +428,15 @@ lines of §3 away from `torch.tensor([1], dtype=torch.int8)` working.
   **not** compare values — that is the golden suite's job and it cannot run on a
   dtype that does not construct.
 - **`int8` overflow behaviour.** §2.4 exercised no overflow, and upstream's wrapping
-  semantics for `int8` were not compared against candle's.
+  semantics for `int8` were not compared against candle's. **Closed 2026-09-15** by
+  `rust/torch_c/pytests/test_int8.py`, exact against upstream in the same interpreter:
+  ordinary arithmetic, the wrap-around edges (`127 + 1`, `-(-128)`, `abs(-128)`, scalar
+  forms, and `sum` widening to `int64`), casts into `int8` from six dtypes and out of it to
+  eight, and `int8 × uint8 → int16` in both orders. Each was broken on purpose and went red:
+  saturating `i8` arithmetic in the fork (edges), a clamping `int64 → int8` cast (casts in),
+  and the `Int8`/`UInt8` rule removed from `promote_types` (promotion). Grade **agrees** for
+  those cases only; the 135 of §4.3 are still unjudged.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_int8_wraps_at_the_edges_exactly_where_upstream_wraps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_int8_with_uint8_promotes_to_int16_in_both_orders present -->
 - **The 34 of §4.5**, and **CUDA/Metal**.

@@ -129,7 +129,13 @@ more force here than it did for `I8`: this dependency is pinned and reaches
 Android, iOS, wasm and every wheel target, and a fork of a core trait is not
 something to carry for four architectures in the tail.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml '[patch' absent -->
+> **2026-09-15.** This marker used to read `Cargo.toml '[patch' absent`, and went red when
+> the `I8` fork landed a `[patch.crates-io]` (`docs/numerics/INT8.md` §1.2). That fork is not
+> this one: it adds an enum arm, which is exactly the "touched nothing structural" case above.
+> The claim this section makes is that there is **no complex fork**, so that is what is pinned.
+
+<!-- DOCWATCH: symbol-in-file vendor/int8-candle-0.11.0-cpu.patch Complex absent -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/dtype.rs Complex absent -->
 
 ---
 
