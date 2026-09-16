@@ -1243,7 +1243,7 @@ def test_the_htp_stub_names_are_derived_from_the_architecture_not_listed():
     refusal = result["refuse_stub_for_none"]
     assert refusal and "not an HTP architecture number" in refusal, refusal
     assert "invent" in refusal, refusal
-    assert result["soc_properties"][0] == "ro.soc.model", result["soc_properties"]
+    assert result["soc_properties"][0] == "ro.soc.manufacturer", result["soc_properties"]
 
 
 def test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset():

@@ -49,6 +49,7 @@ __all__ = [
     "SOC_KNOWN",
     "SOC_NOT_IN_TABLE",
     "SOC_TABLE_UNAVAILABLE",
+    "SOC_EXYNOS_UNIMPLEMENTED",
     "serial",
     "adb_available",
     "adb",
@@ -73,12 +74,10 @@ class QnnDeviceRefused(RuntimeError):
 #: instruction this round was given; `nnapi_device` owns `bw_device` next to it.
 DEVICE_DIR = "/data/local/tmp/bw_qnn"
 
-#: Read in order; the first that answers wins. `ro.soc.model` is the one
-#: Android documents for this and the one ExecuTorch's own issue reports quote
-#: (`ro.soc.model=CQ8750S` in pytorch/executorch#16465), but it is OEM
-#: populated and absent on older images, so `ro.board.platform` is the
-#: fallback that has been there since long before it.
-SOC_PROPERTIES = ("ro.soc.model", "ro.board.platform", "ro.hardware")
+#: Read in order; the first that answers wins. `ro.soc.manufacturer` and
+#: `ro.soc.model` are the ones Android documents for CDD Section 3.2.2 compliance,
+#: while `ro.board.platform` and `ro.hardware` are legacy fallbacks.
+SOC_PROPERTIES = ("ro.soc.manufacturer", "ro.soc.model", "ro.board.platform", "ro.hardware")
 
 #: The Qualcomm runtime libraries an HTP-delegated `.pte` needs beside it.
 #: `libQnnHtp.so` is the backend, `libQnnSystem.so` its shared system layer,
@@ -133,11 +132,21 @@ def device_abi():
     return getprop("ro.product.cpu.abi")
 
 
-#: `device_soc`'s third element. Three outcomes, and conflating any two of
+#: `device_soc`'s third element. Four outcomes, and conflating any two of
 #: them produces a report that is worse than no report.
 SOC_KNOWN = "known"                       # in ExecuTorch's QcomChipset
 SOC_NOT_IN_TABLE = "not-in-table"         # the device answered; the table does not have it
 SOC_TABLE_UNAVAILABLE = "table-unavailable"   # this *host* cannot consult the table
+SOC_EXYNOS_UNIMPLEMENTED = "exynos-unimplemented"  # Samsung Exynos SoC detected
+
+
+def _is_exynos(prop: str, raw: str) -> bool:
+    r = raw.lower()
+    if prop == "ro.soc.manufacturer" and r in ("samsung", "exynos"):
+        return True
+    if "exynos" in r or r.startswith("s5e") or r.startswith("universal"):
+        return True
+    return False
 
 
 def device_soc():
@@ -168,6 +177,9 @@ def device_soc():
         raw = getprop(prop)
         if not raw:
             continue
+        if _is_exynos(prop, raw):
+            model = getprop("ro.soc.model") or raw
+            return prop, raw, SOC_EXYNOS_UNIMPLEMENTED, "Samsung Exynos", model, None
         try:
             member, soc_model, htp_arch = qnn.resolve_soc(raw)
         except qnn.QnnRefused as exc:
@@ -349,6 +361,14 @@ def device_report():
             soc_model=soc_model,
             htp_arch=htp_arch,
         )
+        if status == SOC_EXYNOS_UNIMPLEMENTED:
+            report["is_exynos"] = True
+            report["htp_reachable"] = False
+            report["htp_unreachable_reason"] = (
+                f"Samsung Exynos SoC detected ({soc_model or raw}), but Exynos NPU support is unimplemented in torchnative. "
+                f"Use torchnative.device.cpu or torchnative.device.vulkan for execution on this device."
+            )
+            return report
         report["htp_libraries"] = (
             HTP_RUNTIME_LIBRARIES + htp_stub_for(htp_arch)
             if htp_arch

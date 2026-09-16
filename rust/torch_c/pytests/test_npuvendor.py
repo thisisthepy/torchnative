@@ -368,6 +368,91 @@ def test_the_openvino_candidate_is_not_offered_as_an_amd_path():
     print("ok   npuvendor: openvino is only ever paired with the Intel NPU, and AMD routes nowhere")
 
 
+def test_android_exynos_soc_refuses_by_name_with_unimplemented_and_fallbacks():
+    """An Android Samsung Exynos SoC must produce an Exynos-named refusal.
+
+    It must name the detected Exynos SoC, state that Exynos NPU support is
+    unimplemented (not "unsupportable"), and name the working execution paths
+    on device (cpu and vulkan), rather than pointing at Qualcomm Hexagon NPU.
+    """
+    _shim()
+    from torchnative.export import qnn_device
+
+    saved_report = qnn_device.device_report
+    try:
+        qnn_device.device_report = lambda *a, **k: {
+            "reachable": True,
+            "serial": "emulator-5554",
+            "soc_property": "ro.soc.manufacturer",
+            "soc_raw": "Samsung",
+            "soc_model": "Exynos 2400",
+            "is_exynos": True,
+            "soc_status": "exynos-unimplemented",
+            "htp_arch": None,
+            "htp_reachable": False,
+        }
+        old_host = D.host
+        D.host = lambda: "android"
+        try:
+            D.npu.resolve()
+        except D.NpuUnresolved as exc:
+            err = str(exc)
+        else:
+            raise AssertionError("Exynos SoC resolved on Android without raising NpuUnresolved")
+        finally:
+            D.host = old_host
+    finally:
+        qnn_device.device_report = saved_report
+
+    assert "Exynos" in err or "Samsung" in err, f"refusal must name Exynos/Samsung: {err}"
+    assert "unimplemented" in err.lower(), f"refusal must state unimplemented: {err}"
+    assert "cpu" in err.lower(), f"refusal must name CPU path: {err}"
+    assert "vulkan" in err.lower(), f"refusal must name Vulkan path: {err}"
+    assert "Qualcomm Hexagon NPU" not in err, f"Exynos refusal must not claim Hexagon NPU: {err}"
+    print("ok   npuvendor: Samsung Exynos on Android is refused by name with unimplemented status and CPU/Vulkan fallback guidance")
+
+
+def test_android_unrecognised_soc_reports_raw_properties_in_generic_refusal():
+    """An unrecognised Android SoC must report the raw read properties.
+    
+    If an Exynos SoC misses our detection heuristics (or if it's a MediaTek), 
+    the generic refusal must include the read SoC properties so the failure is 
+    truthful and actionable rather than just saying 'no Hexagon NPU'.
+    """
+    _shim()
+    from torchnative.export import qnn_device
+
+    saved_report = qnn_device.device_report
+    try:
+        qnn_device.device_report = lambda *a, **k: {
+            "reachable": True,
+            "serial": "emulator-5554",
+            "soc_property": "ro.soc.manufacturer",
+            "soc_raw": "MediaTek",
+            "soc_model": "MT6893",
+            "is_exynos": False,
+            "soc_status": qnn_device.SOC_NOT_IN_TABLE,
+            "htp_arch": None,
+            "htp_reachable": False,
+        }
+        old_host = D.host
+        D.host = lambda: "android"
+        try:
+            D.npu.resolve()
+        except D.NpuUnresolved as exc:
+            err = str(exc)
+        else:
+            raise AssertionError("Unrecognised SoC resolved on Android without raising NpuUnresolved")
+        finally:
+            D.host = old_host
+    finally:
+        qnn_device.device_report = saved_report
+
+    assert "no supported npu vendor matched" in err.lower(), f"refusal must mention no supported NPU vendor matched: {err}"
+    assert "mediatek" in err.lower(), f"refusal must contain the raw SoC value: {err}"
+    print("ok   npuvendor: Unrecognised Android SoC generic refusal reports raw property values")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(list(globals().items())):
