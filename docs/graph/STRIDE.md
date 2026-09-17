@@ -167,6 +167,12 @@ cannot re-lay a tensor.
 
 ## 5. `torch.export`: where the forty stop now
 
+> **Both walls named below are closed — `docs/graph/VARMEAN.md`.** `var_mean`
+> went from 11 of the forty to 0 and `torch._C._select_conv_backend` from 5 to
+> 0. The bar did not move: still **0 of 10**. Nine of the ten now stop at one
+> new wall (a `return_types_native_layer_norm` that `proxy_tensor.py`'s
+> `extract_val` cannot rebuild) and the tenth at §6's dispatcher question.
+
 `export_sweep.py --limit 40`, shim side, before this round and after, with
 upstream's own run beside it:
 

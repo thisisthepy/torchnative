@@ -28811,6 +28811,84 @@ def _bare_cases_body(op, label, torch_module, c_module, torch_call) -> list[Case
     return cases
 
 
+def _var_mean_pair_check(t_res, c_res) -> tuple[bool, str]:
+    """`var_mean` returns `(variance, mean)` -- BOTH halves are results.
+
+    `_pair_result_check` above is for `(values, indices)`, where the second
+    half is integral and must match exactly. Here both halves are floating
+    and both get the dtype's tolerance. A comparator that checked only the
+    variance would accept a kernel that handed back the wrong tensor as its
+    second element entirely, which is the failure this op is most exposed to:
+    the mean is already computed on the way to the variance, so returning
+    something plausible-looking is one wrong variable away.
+    """
+    try:
+        t_parts = (t_res[0], t_res[1])
+        c_parts = (c_res[0], c_res[1])
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 2-element (var, mean) result on both sides: {e!r}"
+
+    for label, t_part, c_part in zip(("var", "mean"), t_parts, c_parts):
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        tol = dt.tolerance_for(t_dtype)
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        if len(t_flat) != len(c_flat):
+            return False, f"{label} length differs: torch={len(t_flat)} c={len(c_flat)}"
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            # `nan` and `inf` are both RESULTS here, not failures: the
+            # denominator is clamped at zero, so an overshooting correction
+            # gives `inf` where `m2 > 0` and `nan` where `m2 == 0`. The five
+            # rows are in `_var_cases`' table and in `aten.rs::var_reduce`.
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (NaN one side)"
+            if math.isinf(xf) or math.isinf(yf):
+                if xf == yf:
+                    continue
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r} (inf one side)"
+            if not math.isclose(xf, yf, rel_tol=tol.rtol, abs_tol=tol.atol):
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+    return True, (
+        "var and mean both matched; shapes "
+        f"{[tuple(int(v) for v in p.shape) for p in t_parts]}"
+    )
+
+
+def _paired(builder):
+    """The same cases, compared as a `(var, mean)` pair.
+
+    `var_mean` shares `var`'s tables exactly -- it shares `var_reduce_values`
+    in the kernel -- so the cases are reused rather than retyped, and only the
+    comparator changes. Reusing them is what makes the five clamped-denominator
+    rows and the `correction=None` default apply to the pair too; a fresh
+    table would have had to remember them.
+    """
+
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases = builder(torch_module, c_module, torch_call)
+        for case in cases:
+            if case.expect == "match":
+                case.value_check = _var_mean_pair_check
+        return cases
+
+    return build
+
+
+var_mean_default_cases = _paired(_bare_cases("aten.var_mean.default", "var_mean"))
+var_mean_dim_cases = _paired(_var_cases("aten.var_mean.dim", _var_dim_spelling))
+var_mean_correction_cases = _paired(
+    _var_cases("aten.var_mean.correction", _var_correction_spelling))
+
+
 # The two overloads that take a `dim`, driven by one table. `var.default` has
 # its own builder above because it takes no `dim` at all, so most of the table
 # is unrepresentable for it and a shared driver would be mostly `continue`.
@@ -30387,6 +30465,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
     "aten.kaiser_window.beta": kaiser_window_beta_cases,
     "aten.diag.default": diag_cases,
+    "aten.var_mean.default": var_mean_default_cases,
+    "aten.var_mean.dim": var_mean_dim_cases,
+    "aten.var_mean.correction": var_mean_correction_cases,
     "aten.var.default": var_default_cases,
     "aten.var.dim": var_dim_cases,
     "aten.var.correction": var_correction_cases,

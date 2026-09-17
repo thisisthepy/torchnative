@@ -333,6 +333,11 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.var.default",
     "aten.var.dim",
     "aten.var.correction",
+    // docs/graph/VARMEAN.md -- the pair `torch.export` stops at, on six of
+    // the ten architectures upstream itself can export.
+    "aten.var_mean.default",
+    "aten.var_mean.dim",
+    "aten.var_mean.correction",
     "aten.kaiser_window.default",
     "aten.kaiser_window.periodic",
     "aten.kaiser_window.beta",
@@ -2110,6 +2115,12 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.cumsum.default"
         | "aten.any.default"
         | "aten.norm.ScalarOpt_dim"
+        // Measured across five input layouts, including a permuted
+        // channels-last one: both halves come back contiguous whatever the
+        // input's layout (`test_var_mean_on_meta_answers_upstreams_shape_dtype_and_stride`).
+        | "aten.var_mean.default"
+        | "aten.var_mean.dim"
+        | "aten.var_mean.correction"
         | "aten.embedding.default"
         | "aten.gather.default"
         | "aten.native_layer_norm.default"
@@ -4594,6 +4605,58 @@ fn meta_table(
             refuse_duplicate_dims(&dims)?;
             meta_result(py, reduced_dims(&dims_in, &dims, keepdim), tag)
         }
+        // `aten::var_mean` -- docs/graph/VARMEAN.md. A PAIR, so both halves
+        // are built and both are promoted: the dispatcher's exit promotes a
+        // top-level tensor and does not look into a tuple
+        // (docs/graph/STRIDE.md §8).
+        //
+        // `AlwaysContiguous` (`meta_stride_rule`), measured rather than
+        // assumed: upstream answers a fresh contiguous pair for a
+        // transposed, permuted, sliced and channels-last input alike.
+        //
+        // The dtype refusal is the DENSE kernel's, called rather than
+        // restated -- docs/devices/META.md §7.1's convention. Upstream
+        // disagrees with itself here, as it does on `_weight_norm_interface`
+        // below: its CPU kernel says "var_mean only support floating point
+        // and complex dtypes" and its META kernel says "mean(): could not
+        // infer output dtype...", because the meta arm is the `_refs`
+        // decomposition and the refusal comes from the `mean` inside it.
+        // This shim has one door, so it follows dense;
+        // `test_var_mean_on_meta_refuses_with_the_dense_kernels_wording`
+        // names the divergence rather than leaving it unstated.
+        "aten.var_mean.default" | "aten.var_mean.dim" | "aten.var_mean.correction" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            var_mean_dtype_check(op, &input)?;
+            let rank = input.dims().len();
+            let (dims_arg, keepdim) = if op == "aten.var_mean.default" {
+                (None, false)
+            } else {
+                // `keepdim` is index 3 in both remaining overloads --
+                // positional in `.dim`, kwarg-only in `.correction` -- which
+                // is the same numbering `var_dim`/`var_correction` use.
+                let named = optional_shape(op, args, kwargs, 1, "dim")?;
+                (named, bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false))
+            };
+            // `dim=None` and `dim=[]` both mean "every axis" -- `var_reduce`'s
+            // rule, re-measured for `var` rather than inherited, and the pair
+            // shares it because it shares that function.
+            let reduce: Vec<usize> = match &dims_arg {
+                None => (0..rank).collect(),
+                Some(list) if list.is_empty() => (0..rank).collect(),
+                Some(list) => list
+                    .iter()
+                    .map(|&d| normalise_dim(op, d, rank))
+                    .collect::<PyResult<Vec<_>>>()?,
+            };
+            refuse_duplicate_dims(&reduce)?;
+            let shape = reduced_dims(input.dims(), &reduce, keepdim);
+            let tag = input.tag();
+            let pair = [
+                crate::tensor::promote(py, meta_result(py, shape.clone(), tag)?)?,
+                crate::tensor::promote(py, meta_result(py, shape, tag)?)?,
+            ];
+            Ok(PyTuple::new(py, pair)?.into_any().unbind())
+        }
         "aten._weight_norm_interface.default" => {
             let v = tensor_arg(op, args, kwargs, 0, "v")?;
             let g = tensor_arg(op, args, kwargs, 1, "g")?;
@@ -5143,6 +5206,9 @@ fn aten_dispatch_inner(
         "aten.std.correction" => std_correction(py, args, kwargs),
         "aten.var.dim" => var_dim(py, args, kwargs),
         "aten.var.correction" => var_correction(py, args, kwargs),
+        "aten.var_mean.default" => var_mean_default(py, args, kwargs),
+        "aten.var_mean.dim" => var_mean_dim(py, args, kwargs),
+        "aten.var_mean.correction" => var_mean_correction(py, args, kwargs),
         "aten.kaiser_window.default"
         | "aten.kaiser_window.periodic"
         | "aten.kaiser_window.beta" => kaiser_window_default(py, args, kwargs, op),
@@ -29768,9 +29834,36 @@ fn var_reduce(
     root: bool,
 ) -> PyResult<Py<PyAny>> {
     let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let Reduced { out, means: _, out_dims } =
+        var_reduce_values(op, input, source, dims_arg, correction, keepdim, root)?;
+    let tensor = write_flat(op, Flat::Float(out), out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The lanes `var_reduce` and `var_mean_reduce` share.
+///
+/// `means` is a **result**, not an intermediate: `var_mean` returns it as the
+/// second half of its pair, and it is the same `f64` accumulator the variance
+/// was computed from. Computing the mean a second time through `mean.dim`
+/// would narrow twice and is not what upstream's fused kernel does.
+struct Reduced {
+    out: Vec<f64>,
+    means: Vec<f64>,
+    out_dims: Vec<usize>,
+}
+
+fn var_reduce_values(
+    op: &str,
+    input: &PyTensorBase,
+    source: Vec<f64>,
+    dims_arg: Option<Vec<isize>>,
+    correction: f64,
+    keepdim: bool,
+    root: bool,
+) -> PyResult<Reduced> {
     let dims = input.tensor()?.dims().to_vec();
     let rank = dims.len();
-    let device = input.tensor()?.device().clone();
 
     // `dim=None` and `dim=[]` both mean "every axis", which is upstream's
     // rule for the reduction family and was re-measured for `var` rather
@@ -29873,8 +29966,7 @@ fn var_reduce(
             }
         })
         .collect();
-    let tensor = write_flat(op, Flat::Float(out), out_dims, &device, tag)?;
-    finish(py, tensor, tag)
+    Ok(Reduced { out, means, out_dims })
 }
 
 /// The dtype refusal `var` and `std` share, so that each of the six dispatch
@@ -30035,6 +30127,149 @@ fn std_correction(
         Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
     };
     var_reduce(py, OP, &input, source, dims, correction, keepdim, true)
+}
+
+/// `aten::var_mean(Tensor self, bool unbiased=True) -> (Tensor, Tensor)` and
+/// its two siblings -- the pair `torch.export` stops at.
+///
+/// **This is a real op addition, not a table entry.** `docs/graph/STRIDE.md`
+/// §5 measured that of the forty `transformers` architectures the sweep
+/// covers, only ten are ones upstream torch can export at all, and six of
+/// those ten stop here. The other four stop at
+/// `torch._C._select_conv_backend`.
+///
+/// It returns a **pair**, and the second half is a result rather than a
+/// by-product: `torch/_refs/__init__.py:3343` (`native_layer_norm`) and
+/// `torch/_decomp/decompositions.py:2095` (`_batch_norm_no_update`) both use
+/// the mean directly. So both halves are compared against upstream
+/// element-wise in `pytests/test_varmean.py`, and the mean comes out of the
+/// same `f64` accumulator the variance was computed from -- recomputing it
+/// through `mean.dim` would narrow twice, which upstream's fused kernel does
+/// not do.
+///
+/// `correction` is `var`'s trap, identically: **`correction=None` means 1**,
+/// not 0. At n=2 the two conventions differ by a factor of two, which is
+/// where `pytests/test_varmean.py` pins it.
+///
+/// The three dispatch targets each spell out their own `read_flat`, for the
+/// reason `var_std_dtype_check` records above: the MPS readback list is
+/// derived by scanning each dispatch target's body and following named
+/// helpers one level, so a readback hidden inside `var_mean_reduce` would be
+/// invisible to that scan.
+fn var_mean_dtype_check(op: &str, input: &PyTensorBase) -> PyResult<()> {
+    // Upstream's wording for this family is NOT `var`'s -- measured on
+    // 2.13.0, `var` says "std and var only support floating point and complex
+    // dtypes" and `var_mean` says "var_mean only support floating point and
+    // complex dtypes". Transcribed rather than shared, same reasoning as
+    // `FLOAT8_E4M3FN_REFUSALS`.
+    let _ = op;
+    if !input.tag().is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "var_mean only support floating point and complex dtypes",
+        ));
+    }
+    Ok(())
+}
+
+/// The pair `var_mean` returns, built from one pass of `var_reduce_values`.
+fn var_mean_reduce(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    source: Vec<f64>,
+    dims_arg: Option<Vec<isize>>,
+    correction: f64,
+    keepdim: bool,
+) -> PyResult<Py<PyAny>> {
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let Reduced { out, means, out_dims } =
+        var_reduce_values(op, input, source, dims_arg, correction, keepdim, false)?;
+    let variance = write_flat(op, Flat::Float(out), out_dims.clone(), &device, tag)?;
+    let mean = write_flat(op, Flat::Float(means), out_dims, &device, tag)?;
+    // Promoted: the pair leaves inside a tuple, and the dispatcher's exit
+    // promotes a top-level tensor without looking into one
+    // (docs/graph/STRIDE.md §8).
+    let pair = [
+        crate::tensor::promote(py, finish(py, variance, tag)?)?,
+        crate::tensor::promote(py, finish(py, mean, tag)?)?,
+    ];
+    Ok(PyTuple::new(py, pair)?.into_any().unbind())
+}
+
+/// `aten::var_mean(Tensor self, bool unbiased=True) -> (Tensor, Tensor)`
+fn var_mean_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var_mean.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let unbiased = bool_arg(args, kwargs, 1, "unbiased")?.unwrap_or(true);
+    var_mean_dtype_check(OP, &input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_mean_reduce(py, OP, &input, source, None, if unbiased { 1.0 } else { 0.0 }, false)
+}
+
+/// `aten::var_mean.dim(Tensor self, int[1]? dim, bool unbiased=True,
+///     bool keepdim=False) -> (Tensor, Tensor)`
+///
+/// The spelling the vendored tree's own `_refs.native_layer_norm` uses
+/// (`torch.var_mean(a_acc, dim=norm_dims, unbiased=False, keepdim=True)`).
+fn var_mean_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var_mean.dim";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let unbiased = bool_arg(args, kwargs, 2, "unbiased")?.unwrap_or(true);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_mean_dtype_check(OP, &input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_mean_reduce(py, OP, &input, source, dims, if unbiased { 1.0 } else { 0.0 }, keepdim)
+}
+
+/// `aten::var_mean.correction(Tensor self, int[1]? dim=None, *,
+///     Scalar? correction=None, bool keepdim=False) -> (Tensor, Tensor)`
+///
+/// The only overload upstream's `PythonArgParser` ever reaches -- every
+/// spelling of `torch.var_mean` lands here on upstream, including the
+/// deprecated `unbiased` forms, which it translates. This shim's resolver
+/// takes the first schema in `overloads.json` that binds and therefore
+/// reaches all three, exactly as `torch.var` already does
+/// (docs/graph/EXPORT5.md §9). The values are the same either way; the
+/// disagreement is pinned by
+/// `test_var_mean_resolves_the_overload_var_resolves_and_that_is_not_upstreams`
+/// so that a silent change to it reddens something.
+///
+/// The spelling `_decomp.decompositions._batch_norm_no_update` uses
+/// (`correction=0, keepdim=True`).
+fn var_mean_correction(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var_mean.correction";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let correction = scalar_arg(OP, args, kwargs, 2, "correction")?
+        .map(|s| s.as_f64())
+        .unwrap_or(1.0);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_mean_dtype_check(OP, &input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_mean_reduce(py, OP, &input, source, dims, correction, keepdim)
 }
 
 /// `shape_arg` for an `int[1]?` -- present, absent, or explicitly `None`, and

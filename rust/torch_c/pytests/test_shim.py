@@ -11212,7 +11212,17 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # no `methods.json` row to double with. Getting +4 would mean a method
     # spelling had been added for a door this round does not open; getting +1
     # would mean one of the two schemas was dropped.
-    assert len(keys) == 368, len(keys)
+    #
+    # 371 with docs/graph/VARMEAN.md's `var_mean`. **+3, one per overload**, and
+    # the three are `overloads.json`-only: upstream has `torch.var_mean` and no
+    # `Tensor.var_mean` (measured on 2.13.0), exactly as `empty_strided` above,
+    # so there is no `methods.json` row to double with. Getting +6 would mean a
+    # method spelling had been invented for a door upstream does not have;
+    # getting fewer than +3 would mean one of the three overloads had been
+    # dropped from the table. All three ARE declared in the yaml, so
+    # `from_tables` below is unchanged -- which is the check that they are
+    # answered by the file rather than by the oracle itself.
+    assert len(keys) == 371, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -27956,8 +27966,21 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
         return
     vit = models["vit"]
     assert vit["outside_raw"] == 11, vit["outside_raw"]
-    assert vit["union"]["outside_lowered"] == 11, vit["union"]
-    assert vit["union"]["outside_refolded"] == 10, vit["union"]
+    # 11 -> 12 and 10 -> 11 with docs/graph/VARMEAN.md's `var_mean`, and the
+    # +1 is **named** rather than absorbed into the number: `_refs`'
+    # `native_layer_norm` decomposition calls `torch.var_mean`, which refused
+    # at overload resolution until this round and now terminates at
+    # `aten.var_mean.dim`. So one more op sits outside NNAPI, and it is that
+    # one. Asserting the name as well as the count is the difference between
+    # recording a consequence and re-baselining a number: if some *other* op
+    # moved outside, the count would still be 12 and this would still fail.
+    assert "aten.var_mean.dim" in vit["union"]["outside_refolded_names"], vit["union"]
+    assert vit["union"]["outside_lowered"] == 12, vit["union"]
+    assert vit["union"]["outside_refolded"] == 11, vit["union"]
+    # What the refold itself does is unchanged: it still takes exactly one op
+    # off the outside, and the prims it folds are the same ones.
+    assert (vit["union"]["outside_lowered"]
+            - vit["union"]["outside_refolded"]) == 1, vit["union"]
     assert "prims.erf.default" in vit["union"]["refolded"], vit["union"]["refolded"]
     assert "prims.transpose.default" in vit["union"]["refolded"], vit["union"]
 

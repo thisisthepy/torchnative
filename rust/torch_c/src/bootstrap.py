@@ -8225,6 +8225,156 @@ def _install_dispatcher_kernel_predicates(module) -> None:
     module._shim_has_computed_kernel_keys = answerable
 
 
+def _install_conv_backend_query(module) -> None:
+    """`torch._C._select_conv_backend` and `_conv_determine_backend_memory_format`.
+
+    **A backend-selection QUERY, not a computation.** Its only consumer in the
+    vendored tree is `_subclasses/fake_impls.py:1811`, which asks it which
+    kernel a convolution would dispatch to and then asks
+    `_conv_determine_backend_memory_format` what memory format that kernel's
+    output would have -- the answer is used for exactly one thing, a
+    `t.to(memory_format=mem_fmt)` on the result. Nothing convolves.
+
+    So the honest answer is a statement about *this shim's* convolution, and
+    upstream supplies the vocabulary for it. `_ConvBackend.Overrideable` is
+    upstream's own name for "a backend outside this enumeration handles this",
+    and upstream returns exactly that whenever it cannot see a device it knows
+    -- `_meta_registrations.py:2793` says so in a comment, and it is measured
+    rather than taken on that comment's word: upstream answers `Overrideable`
+    for a meta-tensor convolution in all six shapes the probe builds (2d, 3d,
+    1d, depthwise, transposed, dilated).
+
+    This shim has ONE convolution path and it is none of the twenty-two
+    upstream enumerates -- no cudnn, no mkldnn, no nnpack, no xnnpack, no
+    Winograd. Naming any of them would be a claim about which kernel runs.
+    `Overrideable` is the true one.
+
+    It is also the *safe* one, and that is a measurement too, not a
+    convenience. On a CPU tensor upstream answers `channels_last` for
+    `Slow2d` and a channels-last input, and `contiguous_format` for
+    `Overrideable` on the same input. That second answer is what this shim's
+    convolution actually produces: `docs/graph/STRIDE.md` §3.1 measured its
+    meta arm contiguous even for a channels-last input, and §9 records that
+    the dense side cannot hold a caller-chosen stride at all. Answering
+    `Slow2d` would have been a plausible-looking lie that made the exported
+    graph record a layout this build never produces.
+
+    `_ConvBackend`'s member names and values cannot come from the vendored
+    tree -- `torch/_C/__init__.pyi` declares `class ConvBackend(Enum): ...`
+    with **zero members**, which is why the generated `torch._C.ConvBackend`
+    is an empty enum. They are transcribed from upstream 2.13.0, exactly as
+    `overloads.json` is, and
+    `pytests/test_convbackend.py::test_the_conv_backend_enum_is_upstreams_names_and_values`
+    re-derives them from a live upstream rather than trusting this list.
+    `MpsTranspose,` carries a trailing comma in upstream's own enum
+    definition; it is transcribed as found rather than tidied, because the
+    name is the thing being reproduced.
+    """
+    import enum
+
+    # The FUNCTIONAL api, not a class body, for one reason: `MpsTranspose,`
+    # is not an identifier and cannot be written as an assignment target.
+    _ConvBackend = enum.Enum("_ConvBackend", module="torch._C",
+                             qualname="_ConvBackend", names=[
+        ("CudaDepthwise2d", 0),
+        ("CudaDepthwise3d", 1),
+        ("Cudnn", 2),
+        ("CudnnTranspose", 3),
+        ("Empty", 4),
+        ("Miopen", 5),
+        ("MiopenDepthwise", 6),
+        ("MiopenTranspose", 7),
+        ("Mkldnn", 8),
+        ("MkldnnEmpty", 10),
+        ("NnpackSpatial", 11),
+        ("Overrideable", 12),
+        ("Slow2d", 13),
+        ("Slow3d", 14),
+        ("SlowDilated2d", 15),
+        ("SlowDilated3d", 16),
+        ("SlowTranspose2d", 17),
+        ("SlowTranspose3d", 18),
+        ("Winograd3x3Depthwise", 19),
+        ("Xnnpack2d", 20),
+        ("Mps", 21),
+        ("MpsTranspose,", 22),
+    ])
+
+    # Upstream's `repr` is `<_ConvBackend.Overrideable: 12>` and its `str` is
+    # `_ConvBackend.Overrideable`; Python 3.11 changed `enum.Enum.__str__`, so
+    # both are stated rather than inherited.
+    _ConvBackend.__str__ = lambda self: f"_ConvBackend.{self.name}"
+    _ConvBackend.__repr__ = lambda self: f"<_ConvBackend.{self.name}: {self.value}>"
+    _ConvBackend.__module__ = "torch._C"
+    _ConvBackend.__qualname__ = "_ConvBackend"
+
+    module._ConvBackend = _ConvBackend
+    # **`torch._C.ConvBackend` is deliberately NOT pointed at this class.**
+    # `torch/_C/__init__.pyi` spells the annotation `ConvBackend` and
+    # `surface.json` harvested that name into an empty enum, so aliasing the
+    # two looks like tidying. It is not: `torch/__init__.py:1091` walks every
+    # PUBLIC name in `dir(_C)` and rewrites `__obj.__module__` to `"torch"`,
+    # so the alias silently moved this class's `__module__` off `torch._C`,
+    # which is where upstream's is. Upstream has no runtime `ConvBackend` at
+    # all -- only the underscored name -- so the empty enum is a stub
+    # artefact and is left exactly as it was.
+
+    def _select_conv_backend(*args, **kwargs):
+        # Every argument is accepted and none is consulted, and that is the
+        # claim rather than laziness: the answer does not depend on the
+        # convolution's shape because this build has one convolution path.
+        # Upstream's own answer for a device it does not enumerate is the
+        # same constant (measured across six shapes on meta tensors).
+        if len(args) < 2 and not {"input", "weight"} <= set(kwargs):
+            raise TypeError(
+                "torch._C._select_conv_backend(): expected at least an input "
+                "and a weight"
+            )
+        return _ConvBackend.Overrideable
+
+    _select_conv_backend.__name__ = "_select_conv_backend"
+    _select_conv_backend.__qualname__ = "torch._C._select_conv_backend"
+    module._select_conv_backend = _select_conv_backend
+
+    def _conv_determine_backend_memory_format(input, weight, backend):
+        """`torch.contiguous_format`, for every backend and every layout.
+
+        Not a shortcut, and the first draft got this wrong in the opposite
+        direction -- it refused every native backend by name, on the strength
+        of a CPU measurement where `Slow2d` answers `channels_last` for a
+        channels-last input. Re-measured on the device this is actually asked
+        about, that refusal was a DIVERGENCE and not a narrowing: on a **meta**
+        tensor upstream answers `torch.contiguous_format` for `Slow2d`,
+        `Empty` and `Overrideable` alike, contiguous input and channels-last
+        input alike, because it has no device to consult
+        (`_meta_registrations.py:2793` says exactly this).
+
+        So the constant is upstream's own answer everywhere this shim is
+        asked, and it is also true of this shim's convolution on the dense
+        side: `docs/graph/STRIDE.md` §3.1 measured the meta arm contiguous even
+        for a channels-last input, and §9 records that the dense side cannot
+        hold a caller-chosen stride at all.
+
+        The one place upstream disagrees is a DENSE channels-last input with a
+        native backend, where it answers `channels_last`. That pair is not
+        reachable through this shim's own `_select_conv_backend`, which never
+        names a native backend; it is recorded rather than refused, and
+        `test_convbackend.py::test_the_one_place_this_constant_differs_from_upstream_is_recorded`
+        is that record.
+        """
+        return module.contiguous_format
+
+    _conv_determine_backend_memory_format.__name__ = (
+        "_conv_determine_backend_memory_format"
+    )
+    _conv_determine_backend_memory_format.__qualname__ = (
+        "torch._C._conv_determine_backend_memory_format"
+    )
+    module._conv_determine_backend_memory_format = (
+        _conv_determine_backend_memory_format
+    )
+
+
 def _install_arg_parser_predicates(module) -> None:
     """`torch._C._should_allow_numbers_as_tensors` -- a fixed table, not a policy.
 
@@ -11704,6 +11854,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     _install_dispatch_keys(module)
     _install_arg_parser_predicates(module)
     _install_dispatcher_kernel_predicates(module)
+    _install_conv_backend_query(module)
     _install_dispatch_suppression(module)
     _install_fx_node_base(module)
     # Seeded with the schemas that exist only in C++ upstream, or only in

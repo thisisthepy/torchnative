@@ -700,7 +700,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 90] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -787,11 +787,17 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.var.correction",
     "aten.var.default",
     "aten.var.dim",
+    // `var_mean` reads back for the same reason its `var` siblings do: it
+    // shares `var_reduce_values`, whose two-pass mean has to see each lane
+    // twice. docs/graph/VARMEAN.md §1.1.
+    "aten.var_mean.correction",
+    "aten.var_mean.default",
+    "aten.var_mean.dim",
     "aten.where.default",
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the eighty-seven above.
+/// reason each is different in kind from the ninety above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
