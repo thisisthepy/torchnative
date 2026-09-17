@@ -132,7 +132,54 @@ fi
 cd -- "$crate_dir"
 cargo build --release
 
+# One gate per stage, and it says so rather than racing.
+#
+# `$stage` is per-checkout (above), which stops two *worktrees* from validating
+# each other's artefact -- but two runs in the SAME worktree still share it, and
+# on 2026-09-17 that produced the defect this project keeps finding, in the
+# instrument: the second run's `rm -rf "$suite_logs"` deleted the first run's
+# logs while it was still writing them. One run died on `cat: ... No such file
+# or directory` at 944 ok / 0 FAIL -- a number shaped like a partial pass --
+# and three others dropped test_bf16ane.py's whole section, 21 tests, from the
+# aggregate **and still exited 0** (1669 reported against 1690 in the logs).
+#
+# `mkdir` is the lock because it is atomic on every filesystem this runs on:
+# it either creates the directory or fails, with no window between the test and
+# the take. The holder's pid goes inside so the refusal can name it, and so a
+# lock left behind by a crashed run can be distinguished from a live one --
+# refusing is honest, but refusing forever because a run was killed is just a
+# wedged checkout. The trap releases it on any exit, including the `exec` at
+# the end of this script (which replaces this process and would otherwise
+# leave the lock held forever -- hence the explicit release before it).
+stage_lock="$stage/lock"
 mkdir -p "$stage"
+if ! mkdir "$stage_lock" 2>/dev/null; then
+    holder=$(cat "$stage_lock/pid" 2>/dev/null || echo "")
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        cat >&2 <<EOF
+run.sh: refusing to run -- another gate already holds this stage.
+
+Stage:  $stage
+Holder: pid $holder (still running)
+
+Two gates in one stage share \$stage/_C.abi3.so and the suite logs, and the
+second one destroys the first one's: that is how a run came out 944 ok / 0 FAIL
+mid-way, and how three others silently dropped a whole suite from the aggregate
+while exiting 0. Refusing is the honest outcome; racing is not.
+
+Fix: wait for pid $holder to finish, or run with a stage of your own:
+    TORCH_C_STAGE=\$TMPDIR/my-gate $0
+EOF
+        exit 1
+    fi
+    # Nobody is behind it. Take it over rather than wedging the checkout.
+    echo "run.sh: taking over a stale stage lock left by pid ${holder:-unknown}" >&2
+    rm -rf "$stage_lock"
+    mkdir "$stage_lock" || { echo "run.sh: cannot take $stage_lock" >&2; exit 1; }
+fi
+echo $$ > "$stage_lock/pid"
+trap 'rm -rf "$stage_lock"' EXIT INT TERM HUP
+
 rm -f "$stage/_C.so"
 if [ -f "$target_dir/release/lib_C.dylib" ]; then
     cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
@@ -293,17 +340,30 @@ fi
 # and a `VULKAN:` tally line; `vulkan_coverage.py` adds the tallies up and says
 # UNVERIFIED when nothing ran. With TORCHNATIVE_REQUIRE_VULKAN=1 a skip fails
 # the gate -- the only form of this run that is evidence for a Vulkan kernel.
+#
+# The loop itself now lives in `suite_ledger.py`, and the logs go in a
+# PID-suffixed directory rather than one shared `$stage/suite-logs` that the
+# next run began by deleting. The shell version could not notice what it lost:
+# `cat` was the only reader, a missing section was simply absent, and no count
+# was ever compared with anything. The ledger accounts for every `test_*.py`
+# file, re-reads each log from disk after the loop, and fails naming the suite
+# if what it printed and what is on disk disagree -- see its docstring, and
+# `test_gatelock.py` for the collision staged deliberately.
+#
+# Finished runs' directories are left behind on purpose (~390 KB each,
+# in $TMPDIR, which the OS purges). Reaping them would mean deleting a
+# directory this run does not own, which is the move that caused the
+# defect above; the storage is not worth reintroducing it.
 suite_failed=0
-suite_logs="$stage/suite-logs"
+suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
 mkdir -p "$suite_logs"
-for suite in "$crate_dir"/pytests/test_*.py; do
-    name=$(basename "$suite")
-    echo "--- $name ---"
-    env $vk_env PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" \
-        > "$suite_logs/$name.log" 2>&1 || suite_failed=1
-    cat "$suite_logs/$name.log"
-done
+"${PYTHON:-python3}" "$crate_dir/pytests/suite_ledger.py" \
+    --logs "$suite_logs" --pytests "$crate_dir/pytests" \
+    --python "${PYTHON:-python3}" \
+    --suite-env "PYTHONPATH=$stage:$crate_dir/pytests" \
+    ${vk_env:+--suite-env "$vk_env"} \
+    -- "$crate_dir"/pytests/test_*.py || suite_failed=1
 "${PYTHON:-python3}" "$crate_dir/pytests/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
 [ "$suite_failed" -eq 0 ] || exit 1
 
@@ -344,6 +404,10 @@ doc_files=$(find "$repo_root/docs" -name '*.md' | sort)
 # `$vk_env` too: the `vulkan_tests_ok` count re-runs test_vulkan4.py, and
 # without it a machine that selected its loader through TORCHNATIVE_VULKAN_DYLD
 # would report that marker SKIPPED while the suites above had run on the GPU.
+# `exec` replaces this process, so the EXIT trap never fires: release the lock
+# by hand here or every run would leave its stage locked for the next one.
+rm -rf "$stage_lock"
+trap - EXIT INT TERM HUP
 exec env $vk_env TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
     "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py" \
         $doc_files "$repo_root/README.md"

@@ -34,6 +34,8 @@ chances for the two sides to stop being given the same thing.
 
 import functools
 
+import gloo_loopback
+
 from test_collect2 import (
     C2_WORLDS,
     _c2_spawn,
@@ -282,7 +284,13 @@ with open(dest, "w") as handle:
 
 
 _AW_GLOO_SRC = (
-    "import json, os, sys, time\n"
+    # Before `import torch`: gloo builds its device from
+    # `gethostname()` unless GLOO_SOCKET_IFNAME says otherwise, and
+    # these ranks are all on this one machine. A gate run failed
+    # with `Unable to find address for: irackui-Macmini.local`
+    # because of it -- see gloo_loopback.py and test_gloopin.py.
+    gloo_loopback.child_pin_source()
+    + "import json, os, sys, time\n"
     "import torch\n"
     'assert not hasattr(torch._C, "_aten_implemented"), (\n'
     '    "this subprocess loaded the shim, not upstream torch -- the oracle '
