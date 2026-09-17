@@ -781,6 +781,239 @@ fn overriding_types<'py>(
     PyTuple::new(py, found)
 }
 
+/// `torch.Tensor` and its `__torch_dispatch__`, resolved once.
+///
+/// Two entries because the door below needs both on the *fast* path: the type
+/// to recognise a subclass with one C-level type check, and the base method to
+/// tell a subclass that overrides `__torch_dispatch__` from one that merely
+/// inherits it.
+static TENSOR_TYPE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+static TENSOR_BASE_DISPATCH: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// Fill the pair above without remembering a failure, `cached_module`'s reason:
+/// the first dispatch of the process can happen while `import torch` is still
+/// running, and caching that absence would disable subclass dispatch for the
+/// life of the interpreter.
+fn tensor_type(py: Python<'_>) -> Option<&'static Py<PyAny>> {
+    if let Some(found) = TENSOR_TYPE.get() {
+        return Some(found);
+    }
+    let tensor = py.import("torch").ok()?.getattr(intern!(py, "Tensor")).ok()?;
+    let base = tensor.getattr(intern!(py, "__torch_dispatch__")).ok()?;
+    let _ = TENSOR_BASE_DISPATCH.set(base.unbind());
+    let _ = TENSOR_TYPE.set(tensor.into_any().unbind());
+    TENSOR_TYPE.get()
+}
+
+/// The `Python` dispatch key, which upstream carries on the **tensor** and
+/// this shim carried nowhere.
+///
+/// `any_dispatch_mode_active` above is the whole of upstream's *mode* stack.
+/// It is not the whole of upstream's dispatcher. A tensor subclass that
+/// overrides `__torch_dispatch__` is dispatched to by virtue of being in the
+/// arguments, with no mode entered anywhere -- that is `DispatchKey::Python`
+/// set on the tensor's own key set, and it is why `torch/_tensor.py:457`
+/// computes a `types` tuple at all.
+///
+/// **Not carrying it is what `docs/graph/VARMEAN.md` §4 was looking at**, two
+/// levels above the cause. The chain, each link measured (docs/graph/STRUCTSEQ.md §2):
+///
+///   1. `FakeTensorMode.dispatch` pops every mode before running a
+///      `fake_impls` handler, so `_refs.native_layer_norm`'s body runs with an
+///      empty stack and `FakeTensor` arguments.
+///   2. Without this key, `a - b` on two `FakeTensor`s fell through to the
+///      dense path and returned a bare `meta` tensor.
+///   3. `_make_cache_entry` then raised `_BypassDispatchCache("non-FakeTensor
+///      output")` and wrote a *negative* cache entry.
+///   4. So `_output_from_cache_entry` -- whose last line is `return
+///      tuple(outputs)`, and which is the only reason upstream ever hands
+///      `extract_val` a plain `tuple` -- was never reached, and the
+///      `_out_wrapper` NamedTuple survived to `proxy_tensor.py:714`.
+///
+/// Returns the type to dispatch to, or `None` for the ordinary path. The
+/// ordinary path pays one `PyObject_TypeCheck` per argument and nothing else:
+/// a plain `Tensor` is recognised by pointer identity on its type and skipped
+/// before any attribute is touched, and a non-tensor fails the instance check
+/// in C.
+fn subclass_dispatch_target<'py>(
+    py: Python<'py>,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> Option<Bound<'py, PyAny>> {
+    let tensor = tensor_type(py)?.bind(py);
+    let base = TENSOR_BASE_DISPATCH.get().map(|b| b.bind(py));
+    let mut pick = |obj: Bound<'py, PyAny>| -> Option<Bound<'py, PyAny>> {
+        let ty = obj.get_type();
+        // The overwhelmingly common case, and it costs a pointer compare.
+        if ty.is(tensor) {
+            return None;
+        }
+        if !obj.is_instance(tensor).unwrap_or(false) {
+            return None;
+        }
+        let theirs = ty.getattr(intern!(py, "__torch_dispatch__")).ok()?;
+        if let Some(base) = base.as_ref() {
+            if theirs.is(base) {
+                return None;
+            }
+        }
+        Some(ty.into_any())
+    };
+    for arg in args.iter() {
+        if let Some(ty) = pick(arg) {
+            return Some(ty);
+        }
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            if let Some(ty) = pick(value) {
+                return Some(ty);
+            }
+        }
+    }
+    None
+}
+
+/// Re-box a mode's or subclass's answer into the shape the **schema** says.
+///
+/// **This is the wall `docs/graph/VARMEAN.md` §4 was looking at, and it is not
+/// a result type this shim chose.** Upstream's `OpOverload.__call__` does not
+/// hand back the object `__torch_dispatch__` returned: it converts that object
+/// to IValues per the schema and boxes the IValues back out. So a schema with
+/// three returns produces a plain `tuple` *whatever* the mode returned, and
+/// `torch/_prims_common/wrappers.py`'s `_out_wrapper` NamedTuple never escapes
+/// the dispatcher at all. Measured directly (docs/graph/STRUCTSEQ.md §3): a
+/// `TorchDispatchMode` that deliberately returns a `namedtuple` from
+/// `aten.native_layer_norm.default` is seen by its caller as
+///
+///     upstream:   tuple
+///     this shim:  NT          <- the object, passed straight through
+///
+/// which is why `proxy_tensor.py:714`'s `val.__class__([...])` -- a
+/// reconstruction that every plain `tuple` survives -- raised here and nowhere
+/// upstream. `torch.return_types.native_layer_norm` does not exist on either
+/// side; there is no structseq anywhere in this story.
+///
+/// The rule is upstream's own, and both halves of it were measured rather than
+/// reasoned from the first:
+///
+/// | schema | upstream re-boxes to |
+/// |---|---|
+/// | more than one return (`native_layer_norm`, `max.dim`, `var_mean`, `sort`, `topk`) | `tuple` |
+/// | one return of list type (`split.Tensor`, `unbind.int`) | `list` |
+/// | anything else | unchanged |
+///
+/// Doing this **here**, once, rather than teaching six ops to return a
+/// structseq, is the whole of this round's design decision. A per-op repair
+/// would have made `native_layer_norm` agree with upstream by a mechanism
+/// upstream does not use, and left `native_batch_norm` -- whose result class
+/// is the same `_out_wrapper` NamedTuple -- to raise the same `TypeError`
+/// under a different name.
+///
+/// The fast exit costs one pointer compare: a result that is *already* a plain
+/// `tuple` or a plain `list` is returned untouched without the schema being
+/// read at all, which is every op whose mode did not build a named result.
+fn reshape_to_schema<'py>(
+    py: Python<'py>,
+    func: &Bound<'py, PyAny>,
+    result: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ty = result.get_type();
+    let is_tuple_subclass = result.is_instance_of::<PyTuple>();
+    let is_list_subclass = result.is_instance_of::<pyo3::types::PyList>();
+    if !is_tuple_subclass && !is_list_subclass {
+        return Ok(result);
+    }
+    // Already exactly what the schema could ask for. `type(x) is tuple` and
+    // `type(x) is list` are pointer compares, and they take every ordinary op.
+    let exact_tuple = ty.is(&py.get_type::<PyTuple>());
+    let exact_list = ty.is(&py.get_type::<pyo3::types::PyList>());
+    if exact_tuple || exact_list {
+        return Ok(result);
+    }
+    // A named result. Ask the schema which box it belongs in. Any failure to
+    // read the schema leaves the value alone: that is the behaviour this door
+    // had before, so a schema this shim cannot parse degrades to the old
+    // answer rather than to an error.
+    let Ok(schema) = func.getattr(intern!(py, "_schema")) else {
+        return Ok(result);
+    };
+    let Ok(returns) = schema.getattr(intern!(py, "returns")) else {
+        return Ok(result);
+    };
+    let Ok(n) = returns.len() else {
+        return Ok(result);
+    };
+    if n > 1 {
+        return Ok(PyTuple::new(py, result.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any());
+    }
+    if n == 1 {
+        // `Tensor[]`, `Tensor?[]` -- upstream hands these back as a `list`.
+        // The type is read as text because that is the only spelling
+        // `torch._C.Argument` exposes through this shim's own surface.
+        let is_list_return = returns
+            .get_item(0)
+            .and_then(|r| r.getattr(intern!(py, "type")))
+            .and_then(|t| t.str())
+            .map(|t| t.to_string_lossy().ends_with("[]"))
+            .unwrap_or(false);
+        if is_list_return {
+            return Ok(pyo3::types::PyList::new(
+                py,
+                result.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+            )?
+            .into_any());
+        }
+    }
+    Ok(result)
+}
+
+/// Give the subclass the call.
+///
+/// No pop/restore pair, unlike `dispatch_through_mode`: there is no stack to
+/// pop. Re-entry is bounded by the subclass itself -- `FakeTensor`'s
+/// implementation ends `with fake_mode: return func(*args, **kwargs)`, so the
+/// call that comes back through this door finds a mode entered and takes
+/// `dispatch_through_mode` instead -- and by `no_dispatch()`, which
+/// `in_kernel_invocation_manager` holds while it runs the real meta kernel on
+/// the very `FakeTensor`s it is computing from. The caller checks that guard
+/// before getting here; without it this recurses until the stack blows, which
+/// is what `test_no_dispatch_still_suppresses_subclass_dispatch` pins.
+///
+/// `NotImplemented` is a real answer and not an error. Upstream's own comment
+/// at `fake_tensor.py:1047` is that a subclass returns it when it does not
+/// recognise another subclass in the arguments, and the dispatcher then keeps
+/// chaining. There is nothing further to chain to here, so the fall-through is
+/// the ordinary dense path -- which is exactly what this door did before the
+/// key existed.
+fn dispatch_through_subclass(
+    py: Python<'_>,
+    subclass: Bound<'_, PyAny>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    let func = op_overload(py, op)?;
+    let (seated_args, seated_kwargs) = seat_positionally(py, &func, args, kwargs)?;
+    let types = overriding_types(py, &seated_args, seated_kwargs.as_ref())?;
+    // An **empty dict**, never `None`. Upstream's signature defaults this
+    // parameter to `immutable_dict()`, and `FakeTensor.__torch_dispatch__`
+    // reaches `pytree.arg_tree_leaves(*args, **kwargs)` unconditionally --
+    // which raises `argument after ** must be a mapping, not NoneType` on a
+    // `None`. The mode path above can pass `None` because a *mode*'s
+    // implementation forwards it to `dispatch` without unpacking it; the
+    // subclass path cannot.
+    let seated_kwargs = seated_kwargs.unwrap_or_else(|| PyDict::new(py));
+    let result = subclass.call_method1(
+        intern!(py, "__torch_dispatch__"),
+        (&func, types, seated_args, seated_kwargs),
+    )?;
+    if result.is(&py.NotImplemented()) {
+        return Ok(None);
+    }
+    Ok(Some(reshape_to_schema(py, &func, result)?.unbind()))
+}
+
 /// Re-seat the call in upstream's shape: schema-positional arguments in
 /// `args`, `kwarg_only` arguments in `kwargs`.
 ///
@@ -1026,10 +1259,11 @@ fn dispatch_through_mode(
         let func = op_overload(py, op)?;
         let (args, kwargs) = seat_positionally(py, &func, args, kwargs)?;
         let types = overriding_types(py, &args, kwargs.as_ref())?;
-        active
+        let value = active
             .mode
-            .call_method1(intern!(py, "__torch_dispatch__"), (func, types, args, kwargs))
-            .map(|value| value.unbind())
+            .call_method1(intern!(py, "__torch_dispatch__"), (&func, types, args, kwargs))?;
+        // The schema, not the mode, decides the shape of the answer.
+        reshape_to_schema(py, &func, value).map(|value| value.unbind())
     })();
     let restored = match (&ops, active.infra_key.as_ref()) {
         (Some(ops), _) => {
@@ -1138,6 +1372,23 @@ pub fn aten_dispatch_entry(
     if any_dispatch_mode_active(py) {
         if let Some(active) = innermost_dispatch_mode(py)? {
             return dispatch_through_mode(py, active, op, &rest, kwargs);
+        }
+    }
+    // The `Python` dispatch key -- upstream carries it on the tensor, not on
+    // the stack, so it applies with no mode entered anywhere. This is the
+    // state a `fake_impls` handler and a `_refs` body actually run in, and
+    // reaching it is what makes a `FakeTensor` argument produce a
+    // `FakeTensor` rather than a bare `meta` tensor. docs/graph/STRUCTSEQ.md.
+    //
+    // `dispatch_suppressed` is checked *here* rather than inside
+    // `subclass_dispatch_target` so that the ordinary path -- no mode, no
+    // subclass -- still pays nothing: the Python call that reads the guard
+    // happens only once a subclass has actually been found.
+    if let Some(subclass) = subclass_dispatch_target(py, &rest, kwargs) {
+        if !dispatch_suppressed(py) {
+            if let Some(value) = dispatch_through_subclass(py, subclass, op, &rest, kwargs)? {
+                return Ok(value);
+            }
         }
     }
     aten_dispatch(py, op, &rest, kwargs)

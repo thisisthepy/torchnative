@@ -296,6 +296,21 @@ upstream run takes) and a branch above `fake_tensor.py:3049` that returns
 before the `op_implementations_checks` loop. **That is the next round's first
 task**, and it is one line of measurement away — not a redesign.
 
+> **Answered, and the answer moved the count: `docs/graph/STRUCTSEQ.md`.**
+> The cache *is* where upstream's plain `tuple` comes from, and it is still not
+> the mechanism. Two things below this were wrong. The `Python` dispatch key
+> was carried nowhere, so `fx - fx` on a `FakeTensor` with the mode popped
+> returned a bare `meta` tensor — which is what made `_make_cache_entry` bypass
+> and kept the cache's `tuple(outputs)` out of reach. And
+> `OpOverload.__call__` did not re-box a mode's answer through the schema,
+> which is the step that keeps the `_out_wrapper` NamedTuple from ever escaping
+> upstream's dispatcher on the *first*, uncached call.
+> **There is no structseq anywhere in this**: upstream has no
+> `torch.return_types.native_layer_norm`, and upstream's own `_dispatch_impl`
+> returns the same NamedTuple this shim did. With both repaired the bar moves
+> **0 of 10 → 7 of 10**, `aimv2_vision_model` included. §4.1's two rejected
+> explanations stand rejected and were not re-derived.
+
 Stated plainly so nobody re-derives it: **the shortest road from 0/10 is now
 this one result type, shared by nine of the ten. It is not a missing
 operator.** The tenth, `aimv2_vision_model`, stops at
