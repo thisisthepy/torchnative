@@ -4128,6 +4128,18 @@ pub mod complex_ops {
     /// and it is safe for the models measured only because all three of
     /// `llama4`'s call sites feed a freshly computed expression that is never
     /// written to again. docs/kernels/COMPLEX2.md §6.
+    
+    pub fn abs(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.abs.default";
+        let (re, im) = input.complex_parts(OP)?;
+        // hypot(re, im) = sqrt(re^2 + im^2)
+        let re_sq = re.sqr().map_err(|e| candle_err(OP, e))?;
+        let im_sq = im.sqr().map_err(|e| candle_err(OP, e))?;
+        let sum = re_sq.broadcast_add(&im_sq).map_err(|e| candle_err(OP, e))?;
+        let out = sum.sqrt().map_err(|e| candle_err(OP, e))?;
+        Ok(PyTensorBase::new(out)?.into_pyobject(py).map(|b| b.into_any().unbind())?)
+    }
+
     pub fn view_as_complex(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
         const OP: &str = "aten.view_as_complex.default";
         // Upstream's own message, verbatim, for the dtype it cannot take.

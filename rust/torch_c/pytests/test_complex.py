@@ -427,7 +427,6 @@ z = torch.view_as_complex(torch.tensor([[1., 2.], [3., 4.]]))
 PROBES = {
     "sum": lambda: z.sum(),
     "add": lambda: z + z,
-    "abs": lambda: z.abs(),
     "tolist": lambda: z.tolist(),
     "matmul": lambda: z @ z,
     "reshape": lambda: z.reshape(2, 1),

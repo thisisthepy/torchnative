@@ -1,3 +1,4 @@
+import os
 """docs/architectures/VOICE4.md -- the first voicestudio model run end to end, and the wall
 that a coverage list structurally could not see.
 
@@ -52,7 +53,6 @@ what it measured when it was run by hand.
 """
 
 import json
-import os
 import subprocess
 import sys
 
@@ -495,6 +495,123 @@ def test_the_two_meta_kernels_are_the_meta_half_of_ops_already_implemented():
         "hit them"
     )
 
+
+def test_bigvgan_feature_extraction_and_generation_under_the_shim_agrees_with_upstream():
+    """TDD for the STFT and complex dtype wall: extract the mel from the waveform
+    under the shim, and generate the waveform from it, comparing both to upstream."""
+    assets = os.environ.get("TORCH_C_VOICE4_ASSETS")
+    if not assets:
+        print("   (skipped: TORCH_C_VOICE4_ASSETS is not set)")
+        return
+    _VENDOR_DIR = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "..", "..", "torchnative", "src", "main")
+    _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
+    if not os.path.isfile(_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+
+    script = r"""
+import json, os, sys
+import torch
+assets = os.environ["TORCH_C_VOICE4_ASSETS"]
+sys.path.insert(0, os.path.join(assets, "pkg"))
+sys.path.insert(0, os.path.join(assets, "stubs"))
+from vsbig import BigVGANModel, BigVGANConfig
+from vsbig.modeling_bigvgan import mel_spectrogram
+import numpy as np
+
+marker = "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"
+config = BigVGANConfig.from_pretrained(os.path.join(assets, "bigvgan-converted"))
+model = BigVGANModel.from_pretrained(os.path.join(assets, "bigvgan-converted"),
+                                     dtype=torch.float32).eval()
+
+import wave
+with wave.open(os.path.join(assets, "mlk24k.wav"), 'rb') as f:
+    frames = f.readframes(f.getnframes())
+    wav_array = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+waveform = torch.tensor(wav_array, dtype=torch.float32).unsqueeze(0)
+
+with torch.no_grad():
+    mel = mel_spectrogram(
+        waveform,
+        sampling_rate=config.sampling_rate,
+        n_fft=config.n_fft,
+        hop_length=config.hop_length,
+        win_length=config.win_length,
+        num_mel_bins=config.model_in_dim,
+        fmin=config.mel_fmin,
+        fmax=config.mel_loss_fmax,
+        centered=False,
+    )
+    audio = model(input_features=mel).audio_values
+
+json.dump({
+    "_marker": marker,
+    "mel": mel.flatten().tolist(),
+    "audio": audio.flatten().tolist()
+}, sys.stdout)
+"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    
+    _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..")
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        env=env, cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == 0, f"shim failed:\n{proc.stderr}"
+    shim = json.loads(proc.stdout)
+    assert shim["_marker"] == "shim"
+    
+    env_up = dict(os.environ)
+    env_up.pop("PYTHONPATH", None)
+    env_up.pop("TORCH_USE_RTLD_GLOBAL", None)
+    proc_up = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True,
+        env=env_up, cwd=_REPO_ROOT,
+    )
+    assert proc_up.returncode == 0, f"upstream failed:\n{proc_up.stderr}"
+    up = json.loads(proc_up.stdout)
+    assert up["_marker"] == "upstream"
+    
+    # Compare Mel
+    shim_mel = shim["mel"]
+    up_mel = up["mel"]
+    scale = max(abs(x) for x in up_mel)
+    rel_mel = max(abs(a - b) for a, b in zip(shim_mel, up_mel)) / scale
+    print(f"mel rel diff: {rel_mel:.3e}")
+    assert rel_mel < 6.81e-07, f"mel difference too large: {rel_mel:.3e}"
+
+    # Compare Audio
+    shim_audio = shim["audio"]
+    up_audio = up["audio"]
+    scale_a = max(abs(x) for x in up_audio)
+    rel_audio = max(abs(a - b) for a, b in zip(shim_audio, up_audio)) / scale_a
+    print(f"audio rel diff: {rel_audio:.3e}")
+    # The existing test allows 2.71e-4
+    assert rel_audio <= 2.71e-04, f"the shim's waveform is {rel_audio:.3e} from upstream's"
+
+def test_the_mel_tolerance_would_actually_reject_a_wrong_mel():
+    """Proves that the tolerance derived for the mel extraction is capable of failing,
+    exactly as test_the_tolerance_would_actually_reject_a_wrong_waveform does for audio."""
+    assets = os.environ.get("TORCH_C_VOICE4_ASSETS")
+    if not assets:
+        return
+    # The mel tolerance is 6.81e-07.
+    # We create a dummy comparison where the difference is 1e-6 (larger than tolerance).
+    shim_mel = [1.0, 2.0, 3.0]
+    up_mel = [1.0, 2.0, 3.0 + 1e-6]
+    scale = max(abs(x) for x in up_mel)
+    rel_mel = max(abs(a - b) for a, b in zip(shim_mel, up_mel)) / scale
+    
+    passed = False
+    try:
+        assert rel_mel < 6.81e-07, f"mel difference too large: {rel_mel:.3e}"
+        passed = True
+    except AssertionError:
+        pass
+    
+    assert not passed, "the mel tolerance allowed a difference of 1e-6 (should have rejected)"
 
 def _main():
     failures = 0

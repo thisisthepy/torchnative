@@ -4011,6 +4011,10 @@ fn aten_dispatch_inner(
         "aten.rsub.Scalar" => rsub_scalar(py, args, kwargs),
 
         // -- what upstream's `repr(tensor)` dispatches (docs/models/E2E_REAL.md) ----
+        "aten.abs.default" if first_arg_is_complex(args, kwargs) => {
+            let input = tensor_arg("aten.abs.default", args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::abs(py, &input)
+        }
         "aten.abs.default" => abs_default(py, args, kwargs),
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
