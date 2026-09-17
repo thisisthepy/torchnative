@@ -1,5 +1,47 @@
 # NPU2 — which unit actually ran it, and the blob on a real NNAPI runtime
 
+
+### 11.6 The fix: assert the verdict CoreML gave, report the one it withheld
+
+Because nothing here can make CoreML answer, the test must distinguish the two
+outcomes and rest its claim only on the first:
+
+* every graph CoreML **did** name devices for is held to the full claim —
+  `preferred == CPU`, and `NeuralEngine` absent from the supported column.
+  Nothing is relaxed for them, and a silent graph never excuses a
+  `NeuralEngine` verdict in a loud one.
+* every graph CoreML **declined** to name is reported by name, as a refusal.
+* **a floor under the evidence**: at least two of the three graphs must have
+  answered. This is §9.4's "at least two shapes must answer", and it is what
+  keeps the whole claim from being satisfied on a machine where
+  `MLComputePlan` says nothing at all — a reachable state, since §10.4
+  established it depends on free disk.
+
+The floor is a floor and not a tolerance. It is exercised on synthetic plans
+(`test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs`)
+so it cannot drift vacuous on a day when CoreML happens to be talkative, and a
+companion test pins the loophole shut: a `NeuralEngine` verdict fails even when
+another graph is silent.
+
+What this deliberately does **not** do:
+
+* no retry, at any level. A second attempt that happened to answer would hide
+  exactly the condition §10.4 needs visible.
+* no widening to accept an empty plan unconditionally. The empty plan is
+  accepted only under an asserted condition — that enough *other* graphs
+  answered — which is the difference between a guard and a hole.
+* no skip and no deletion. The failing run still fails; it fails when the
+  evidence is too thin, rather than when CoreML is quiet about one graph.
+
+The sentence the gate now prints for the silent case names the refusal:
+
+    CoreML named no compute device for {'sigmoid': ['ios16.sigmoid']} --
+    reported, not asserted; ['cnn_conv_pool_relu', 'mlp_gelu_softmax']
+    answered and carry the claim (floor 2).
+
+which is the distinction §11.3 restored, doing its job.
+
+
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py verify_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py run_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py devices present -->
@@ -1437,37 +1479,66 @@ the consequence — "no plan" — is the only thing they have in common.
 | what the plan says | lists every op, `None` for each | there is no plan |
 | rate observed | **12 of 12** for the fixture's 3rd program | **1 run in 4** on the 211-leaf naive path |
 | the same program alone | answers | answers **12 of 12**, both settings |
-| governed by `compute_units` | **yes** — see §11.2 | no: refused under `ALL` and unprovoked |
+| governed by `compute_units` | **no** — 8 of 8 silent under both settings, §11.2 | no: refused under `ALL` and unprovoked |
 
-So the first is a condition we control and the second is not, and the fixes
-are correspondingly different. Conflating them is not academic: it is how
+Neither is a condition this project controls -- that was the day's other
+wrong turn, corrected in §11.2 -- so both fixes are about *reading* CoreML's
+answer honestly rather than about changing what is asked. Conflating them is not academic: it is how
 "the ANE rejects relu" came to be believed when the truth was "CoreML did not
 answer".
 
-### 11.2 The silent shape is §9.6 again, in a fixture that had not been moved
+### 11.2 The `ComputeUnit` lead was wrong, and how the confound produced it
 
-§9.6 measured that the silence belongs to `ComputeUnit.ALL` — 75% silent
-against 0.7% at `CPU_AND_NE` — and moved the `rejected_plans` fixture
-accordingly. `test_npu2.py`'s float32 fixture was **still asking under `ALL`**.
+The obvious suspect was the compute-unit argument. §9.6 had measured the
+silence as belonging to `ComputeUnit.ALL` — 75% silent against 0.7% at
+`CPU_AND_NE` over 168 observations — and this fixture was still asking under
+`ALL`. An experiment appeared to confirm it outright:
 
-Measured 2026-09-17 on an idle machine (load 1.41, no other agent):
+    ALL          mlp ok, cnn ok, sigmoid SILENT
+    CPU_AND_NE   mlp ok, cnn ok, sigmoid ok
+    CPU_ONLY     mlp ok, cnn ok, sigmoid ok
 
-* the fixture's three float32 programs, compiled in order — `mlp_gelu_softmax`,
-  `cnn_conv_pool_relu`, `sigmoid`. The third came back with **no device for
-  its single operation, 12 times out of 12**.
-* the same three programs, same order, same process, asked at `CPU_AND_NE`:
-  **all answered**, `sigmoid` included, `preferred = CPU`.
-* `sigmoid` compiled **first** answers under `ALL`. `mlp` then `sigmoid`
-  answers; `cnn` then `sigmoid` answers; `sigmoid` four times over answers.
-  It takes the accumulation of both predecessors — which is §9.1's finding
-  that the compiled artefact's identity, not the program it encodes, decides.
+**That experiment was confounded.** All three passes ran in **one process**,
+so the `ALL` pass compiled at positions 1–3 and the other two at 4–6 and 7–9.
+Position and setting varied together, and the conclusion was drawn from the
+one that was easier to see.
 
-The move to `CPU_AND_NE` is not a weakening. The claim being tested is that
-float32 puts the Neural Engine out of CoreML's *supported* column, and
-`CPU_AND_NE` is the setting in which the unit is offered at all — so it is the
-stricter place to ask, not the laxer one: the GPU cannot stand in for the
-answer. The units are named in the fixture payload and asserted, so a silent
-revert to `ALL` fails a test instead of quietly restoring the flake.
+Separated — **one sequence per fresh process, 8 processes per setting**, on
+2026-09-17:
+
+| setting | `sigmoid` silent |
+|---|---|
+| `ComputeUnit.ALL` | **8 of 8** |
+| `ComputeUnit.CPU_AND_NE` | **8 of 8** |
+
+The compute-unit argument does not touch this failure. The fixture was briefly
+moved to `CPU_AND_NE` on the strength of the confounded result and has been
+**moved back to `ALL`**, which is what `MLModel` itself would use.
+
+The gate said so before the measurement did: the run that caught it printed
+`CoreML named no device for: nothing` for its `ALL` pass in the *same* run
+whose `CPU_AND_NE` pass had gone silent — the two loops being at positions 1–3
+and 4–6 respectively. A result that contradicts the hypothesis in the same
+breath as confirming it is the shape of a confound.
+
+What *is* established about the condition:
+
+* it is **positional and stateful**, not a property of the program: `sigmoid`
+  compiled first answers; `mlp` then `sigmoid` answers; `cnn` then `sigmoid`
+  answers; four `sigmoid`s in a row all answer. It takes the accumulation of
+  both predecessors.
+* it is **not load** (reproduced at load 1.41 with nothing else running) and
+  **not** the stale `.mlmodelc` debris in the system temp, which was cleared
+  this week without stopping it.
+* it **drifts with host state**. The same fixture went from 12-of-12 silent to
+  0-of-8 within one hour with nothing in this repository changed, and the ANE
+  bundle cache moved between 13 GB and 1.4 GB across the same window — §10.4's
+  precondition, and §11.5.
+
+So the cause sits inside CoreML, keyed on something this project does not
+control and cannot set. That is what decides the shape of the fix in §11.6:
+the suite cannot make CoreML answer, so it must be able to tell that CoreML
+did not.
 
 ### 11.3 The fixture's reader was turning a refusal into a claim about the program
 
@@ -1540,7 +1611,9 @@ Two things follow, and they are why the fix does not rest on the rate:
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py ComputePlanRefused present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _REFUSED_PLAN present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_float32_plans_are_asked_where_coreml_actually_answers present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py _ANSWERING_FLOOR present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_refused_compute_plan_does_not_end_the_forward present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refused_compute_plan_says_so_in_its_own_sentence present -->

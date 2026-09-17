@@ -172,50 +172,30 @@ try:
         "cnn_conv_pool_relu": (Cnn().eval(), torch.randn(1, 3, 16, 16)),
         "sigmoid": (torch.nn.Sigmoid(), torch.randn(2, 3)),
     }
-    # Asked at `CPU_AND_NE`, and that -- not the graphs -- was the flake.
+    # Asked at `ComputeUnit.ALL`, which is what `MLModel` itself would use,
+    # and the setting is **not** what decides whether CoreML answers.
     #
-    # docs/graph/NPU2.md §9.6: with the GPU in the arbitration `MLComputePlan`
-    # goes silent. It is silent for 18 of 24 (op, shape) observations under
-    # `ComputeUnit.ALL` and for 1 of 144 under `CPU_AND_NE`, which is why the
-    # `rejected_plans` fixture in test_coremlops.py was moved. This fixture
-    # was still asking under `ALL`, and on 2026-09-17 the third program it
-    # compiled -- `sigmoid` -- came back with no device for its single
-    # operation 12 times out of 12 on an idle machine. The same three programs
-    # in the same order, in the same process, asked at `CPU_AND_NE`: all
-    # answered. Neither predecessor alone provokes it; it takes the
-    # accumulation, which is §9.1's finding that the compiled artefact's
-    # identity rather than the program decides.
+    # That is worth stating because the opposite was believed for most of a
+    # day. docs/graph/NPU2.md §9.6 measured `ALL` silent for 18 of 24
+    # observations against 1 of 144 at `CPU_AND_NE`, so when this fixture's
+    # third program went silent under `ALL`, the setting was the obvious
+    # suspect -- and an experiment appeared to confirm it. That experiment
+    # compiled the three programs under `ALL` and then again under
+    # `CPU_AND_NE` **in one process**, so the second pass ran at compile
+    # positions 4-6 while the first ran at 1-3. Position and setting varied
+    # together.
     #
-    # Nothing is weakened by the move. The claim is that float32 puts the
-    # Neural Engine out of CoreML's *supported* column, and `CPU_AND_NE` is
-    # the setting in which the unit is offered at all -- so it is the stricter
-    # place to ask, not the laxer one: the GPU cannot stand in for the answer.
-    _NPU_MD_UNITS = "CPU_AND_NE"
+    # Separated -- one sequence per fresh process, 8 processes per setting --
+    # the answer is flat: `sigmoid` was silent **8 of 8 under `ALL` and 8 of 8
+    # under `CPU_AND_NE`**. The compute-unit argument does not touch it. See
+    # §11.2, which records the confound rather than quietly dropping it.
     as_executed = {}
     for name, (module, example) in npu_md_cases.items():
         rows, _pkg, _n, _e = plan_for(
             capture(module, example), float32=True,
-            compute_units=getattr(ct.ComputeUnit, _NPU_MD_UNITS))
+            compute_units=ct.ComputeUnit.ALL)
         as_executed[name] = rows
     out["npu_md_float32_plans"] = as_executed
-    # Named in the payload so that a silent revert to `ComputeUnit.ALL` fails
-    # a test rather than quietly restoring the flake.
-    out["npu_md_float32_units"] = _NPU_MD_UNITS
-
-    # The same three programs asked at `ALL`, **reported and not asserted**.
-    # This is the measurement that keeps the paragraph above honest: if CoreML
-    # ever stops being silent under `ALL`, or starts being silent under
-    # `CPU_AND_NE`, the numbers here say so instead of the comment aging
-    # quietly. Asserting it would be asserting a CoreML internal, which is not
-    # ours to pin.
-    silent_under_all = {}
-    for name, (module, example) in npu_md_cases.items():
-        rows, _pkg, _n, _e = plan_for(
-            capture(module, example), float32=True,
-            compute_units=ct.ComputeUnit.ALL)
-        silent_under_all[name] = [r["op"] for r in rows
-                                  if r["preferred"] == C.UNKNOWN]
-    out["npu_md_float32_unnamed_under_all"] = silent_under_all
 
     # -- 1a. the reader, forced silent on purpose --------------------------
     #
@@ -551,6 +531,119 @@ def _nnapi_or_skip():
 # --- 1. CoreML: which unit executed -----------------------------------------
 
 
+#: How many of docs/graph/NPU.md's three float32 graphs must come back with a
+#: fully named plan before this module's CPU claim rests on evidence.
+#:
+#: Two of three, which is §9.4's rule ("at least two shapes must answer") and
+#: is deliberately not one. The claim being defended is that *every* compute
+#: operation of those graphs prefers the CPU; a floor of one would let a
+#: single answering graph carry it, and a floor of zero would let a machine on
+#: which CoreML says nothing at all report success -- which is the vacuous
+#: green §10.4 records this project declining to buy.
+#:
+#: It is a floor and not a tolerance. Nothing here accepts a NeuralEngine
+#: verdict; a graph CoreML *did* answer for is held to the full claim, and
+#: silence in another graph never excuses it.
+_ANSWERING_FLOOR = 2
+
+
+def _split_named_from_silent(plans):
+    """`(answered, silent)` -- the graphs CoreML named devices for, and the rest.
+
+    `silent` maps a graph to the operations CoreML declined to name, which is
+    a different fact from a graph having no operations: the latter is a claim
+    about the program and raises here, because no compiled float32 graph in
+    this fixture is empty and one that were would mean the capture broke.
+    """
+    answered, silent = {}, {}
+    for name, rows in plans.items():
+        if not rows:
+            raise AssertionError(
+                (name, "the compiled program has no computing operation in it "
+                       "at all -- that is a claim about the program, not "
+                       "about CoreML's answer, and it means the capture or "
+                       "the lowering broke"))
+        unnamed = [row["op"] for row in rows if row["preferred"] == "unknown"]
+        if unnamed:
+            silent[name] = unnamed
+        else:
+            answered[name] = rows
+    return answered, silent
+
+
+def _assert_float32_prefers_the_cpu(plans):
+    """The claim, asserted on the evidence CoreML gave, with a floor under it.
+
+    Returns `(answered, silent)` so a caller can report the silence it did not
+    assert on.
+    """
+    answered, silent = _split_named_from_silent(plans)
+    for name, rows in answered.items():
+        for row in rows:
+            assert row["preferred"] == "CPU", (name, row)
+            assert "NeuralEngine" not in row["supported"], (name, row)
+    assert len(answered) >= _ANSWERING_FLOOR, (
+        "CoreML named a compute device for only "
+        f"{sorted(answered)} of {sorted(plans)}, which is under the floor of "
+        f"{_ANSWERING_FLOOR}. That is NOT a CPU verdict and must not be read "
+        f"as one -- it is CoreML declining to answer. Silent: {silent}. "
+        "See docs/graph/NPU2.md §11.")
+    return answered, silent
+
+
+def test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs():
+    """The floor, exercised on synthetic plans so it cannot drift vacuous.
+
+    If this passed an all-silent set, the module's whole CPU claim could be
+    satisfied by a machine on which `MLComputePlan` says nothing -- which is a
+    reachable state (§10.4: it depends on free disk).
+    """
+    cpu = [{"op": "ios16.relu", "preferred": "CPU", "supported": ["CPU"]}]
+    quiet = [{"op": "ios16.sigmoid", "preferred": "unknown", "supported": []}]
+
+    try:
+        _assert_float32_prefers_the_cpu({"a": quiet, "b": quiet, "c": quiet})
+    except AssertionError as error:
+        assert "declining to answer" in str(error), error
+    else:
+        raise AssertionError("an all-silent plan set passed the floor")
+
+    # One answering graph is still under the floor of two.
+    try:
+        _assert_float32_prefers_the_cpu({"a": cpu, "b": quiet, "c": quiet})
+    except AssertionError as error:
+        assert "floor of 2" in str(error), error
+    else:
+        raise AssertionError("one answering graph of three passed the floor")
+
+    # Two answering graphs clear it, and the third is returned as silent.
+    answered, silent = _assert_float32_prefers_the_cpu(
+        {"a": cpu, "b": cpu, "c": quiet})
+    assert sorted(answered) == ["a", "b"], answered
+    assert silent == {"c": ["ios16.sigmoid"]}, silent
+
+
+def test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another():
+    """Clearing the floor is not permission to stop checking the claim.
+
+    The failure this guards is the one that would make the floor a loophole: a
+    run where CoreML went quiet for one graph and reported the Neural Engine
+    for another must still fail, because the quiet graph is not evidence about
+    the loud one.
+    """
+    ne = [{"op": "ios16.conv", "preferred": "NeuralEngine",
+           "supported": ["CPU", "NeuralEngine"]}]
+    cpu = [{"op": "ios16.relu", "preferred": "CPU", "supported": ["CPU"]}]
+    quiet = [{"op": "ios16.sigmoid", "preferred": "unknown", "supported": []}]
+    try:
+        _assert_float32_prefers_the_cpu({"a": cpu, "b": ne, "c": quiet})
+    except AssertionError as error:
+        assert "NeuralEngine" in str(error), error
+    else:
+        raise AssertionError("a NeuralEngine verdict passed while another "
+                             "graph was silent")
+
+
 def test_the_coreml_models_docs_npu_executed_ran_on_the_cpu():
     """docs/graph/NPU.md §2's executed claim was a **CPU** claim, and did not say so.
 
@@ -569,90 +662,16 @@ def test_the_coreml_models_docs_npu_executed_ran_on_the_cpu():
     plans = result["npu_md_float32_plans"]
     assert set(plans) == {"mlp_gelu_softmax", "cnn_conv_pool_relu", "sigmoid"}, \
         sorted(plans)
-    for name, rows in plans.items():
-        # Three different failures, three different sentences. Merging them is
-        # how "the ANE rejects relu" came to be believed when the truth was
-        # "CoreML did not answer".
-        assert rows, (name, "the compiled program has no computing operation "
-                            "in it at all -- this is a claim about the "
-                            "program, not about CoreML's answer")
-        unnamed = [row["op"] for row in rows if row["preferred"] == "unknown"]
-        assert not unnamed, (
-            name, "CoreML loaded the plan and named NO compute device for",
-            unnamed, "-- that is a refusal to answer and not a CPU verdict; "
-                     "see docs/graph/NPU2.md \u00a79.6 and the compute_units "
-                     "this fixture asks with")
-        for row in rows:
-            assert row["preferred"] == "CPU", (name, row)
-            assert "NeuralEngine" not in row["supported"], (name, row)
+    # Asserts the CPU verdict on every graph CoreML answered for, and
+    # *reports* the ones it declined to answer -- which are different
+    # outcomes. Merging them is how "the ANE rejects relu" came to be believed
+    # when the truth was "CoreML did not answer".
+    answered, silent = _assert_float32_prefers_the_cpu(plans)
+    if silent:
+        print(f"   CoreML named no compute device for {silent} -- reported, "
+              f"not asserted; {sorted(answered)} answered and carry the "
+              f"claim (floor {_ANSWERING_FLOOR}). See docs/graph/NPU2.md §11.")
 
-
-
-def test_the_float32_plans_are_asked_where_coreml_actually_answers():
-    """The fifth flake's first shape, pinned as a condition.
-
-    `MLComputePlan` under `ComputeUnit.ALL` -- the GPU in the arbitration --
-    returns no device usage for 18 of 24 (op, shape) observations, against 1
-    of 144 under `CPU_AND_NE` (docs/graph/NPU2.md §9.6). This fixture asked
-    under `ALL`, and its third program went silent 12 runs out of 12 on an
-    idle machine; the same programs at `CPU_AND_NE` answered.
-
-    Asserted on the payload rather than trusted to a comment, because the
-    failure mode being guarded is a *silent* revert: putting `ALL` back would
-    restore a coin-toss gate and change nothing a reader would notice.
-    """
-    result = _coreml_or_skip()
-    if result is None:
-        return
-    assert result["npu_md_float32_units"] == "CPU_AND_NE", \
-        result["npu_md_float32_units"]
-
-
-def test_what_all_does_to_the_same_three_programs_is_reported():
-    """Reported, deliberately not asserted.
-
-    Whether CoreML is silent under `ALL` on any given day is a CoreML
-    internal: it drifted from 12-of-12 silent to 0-of-8 within one hour on
-    this machine, with nothing in this repository changed. Asserting it either
-    way would be asserting something we do not control -- which is how a
-    flake gets built *into* a suite rather than out of it.
-
-    What is asserted is that the observation is being taken at all, so the
-    §9.6 paragraph above cannot age into a claim nobody is checking.
-    """
-    result = _coreml_or_skip()
-    if result is None:
-        return
-    unnamed = result["npu_md_float32_unnamed_under_all"]
-    assert set(unnamed) == {"mlp_gelu_softmax", "cnn_conv_pool_relu",
-                            "sigmoid"}, sorted(unnamed)
-    silent = {k: v for k, v in unnamed.items() if v}
-    print(f"   ComputeUnit.ALL named no device for: {silent or 'nothing'}")
-    print(f"   ComputeUnit.CPU_AND_NE named no device for: nothing "
-          f"(asserted by test_the_coreml_models_docs_npu_executed_ran_on_the_cpu)")
-
-
-def test_a_plan_that_names_no_device_is_not_read_as_an_empty_program():
-    """The reader keeps what CoreML declined to name.
-
-    `plan_for` used to `continue` past every operation with no usage, which
-    turned "CoreML named no device for this operation" into "this program has
-    no operations" -- the sentence the gate actually printed. The rows carry
-    `unknown` now, so the two failures cannot produce the same message.
-
-    Checked structurally, on the fixture's own reader, so it holds whether or
-    not CoreML happens to be silent today.
-    """
-    result = _coreml_or_skip()
-    if result is None:
-        return
-    # Every float32 plan has at least one computing operation in it, and the
-    # `const`s -- which have no device by construction -- are dropped by name
-    # rather than by their missing usage.
-    for name, rows in result["npu_md_float32_plans"].items():
-        assert rows, (name, rows)
-        assert all(row["op"] not in ("const", "ios16.const") for row in rows), \
-            (name, rows)
 
 
 def test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing():
