@@ -1408,3 +1408,140 @@ Two consequences worth carrying:
   must answer" would have turned a disk-full machine into a green line,
   permanently, on every host. The round that declined to weaken it and
   asked instead is the reason this was diagnosable at all.
+
+## 11. The fifth flake: a refusal read as an answer, in two shapes (2026-09-17)
+
+Four CoreML-adjacent flakes were diagnosed and fixed this week. This is the
+fifth, the one that made a gate run a coin toss, and it appeared in at least
+four separate branches' gates on the same day. It showed up as two sentences:
+
+    FAIL test_the_coreml_models_docs_npu_executed_ran_on_the_cpu:
+         AssertionError: ('sigmoid', 'no compute operations in the plan at all')
+
+    FAIL test_the_path_a_user_types_survives_its_own_first_forward:
+         RuntimeError: { NSLocalizedDescription =
+                         "Failed to construct compute plan, internal failure."; }
+
+Neither sentence is true. The first says the *program* has no operations; the
+second kills a forward that had already compiled. Both are CoreML declining to
+answer a **diagnostic** question, read as though it were an answer.
+
+### 11.1 They are two different conditions, measured apart
+
+Established by measurement rather than by their shared consequence, because
+the consequence — "no plan" — is the only thing they have in common.
+
+| | silence | refusal |
+|---|---|---|
+| what `load_from_path` does | returns a plan | **raises** |
+| what the plan says | lists every op, `None` for each | there is no plan |
+| rate observed | **12 of 12** for the fixture's 3rd program | **1 run in 4** on the 211-leaf naive path |
+| the same program alone | answers | answers **12 of 12**, both settings |
+| governed by `compute_units` | **yes** — see §11.2 | no: refused under `ALL` and unprovoked |
+
+So the first is a condition we control and the second is not, and the fixes
+are correspondingly different. Conflating them is not academic: it is how
+"the ANE rejects relu" came to be believed when the truth was "CoreML did not
+answer".
+
+### 11.2 The silent shape is §9.6 again, in a fixture that had not been moved
+
+§9.6 measured that the silence belongs to `ComputeUnit.ALL` — 75% silent
+against 0.7% at `CPU_AND_NE` — and moved the `rejected_plans` fixture
+accordingly. `test_npu2.py`'s float32 fixture was **still asking under `ALL`**.
+
+Measured 2026-09-17 on an idle machine (load 1.41, no other agent):
+
+* the fixture's three float32 programs, compiled in order — `mlp_gelu_softmax`,
+  `cnn_conv_pool_relu`, `sigmoid`. The third came back with **no device for
+  its single operation, 12 times out of 12**.
+* the same three programs, same order, same process, asked at `CPU_AND_NE`:
+  **all answered**, `sigmoid` included, `preferred = CPU`.
+* `sigmoid` compiled **first** answers under `ALL`. `mlp` then `sigmoid`
+  answers; `cnn` then `sigmoid` answers; `sigmoid` four times over answers.
+  It takes the accumulation of both predecessors — which is §9.1's finding
+  that the compiled artefact's identity, not the program it encodes, decides.
+
+The move to `CPU_AND_NE` is not a weakening. The claim being tested is that
+float32 puts the Neural Engine out of CoreML's *supported* column, and
+`CPU_AND_NE` is the setting in which the unit is offered at all — so it is the
+stricter place to ask, not the laxer one: the GPU cannot stand in for the
+answer. The units are named in the fixture payload and asserted, so a silent
+revert to `ALL` fails a test instead of quietly restoring the flake.
+
+### 11.3 The fixture's reader was turning a refusal into a claim about the program
+
+`plan_for` in `test_npu2.py` dropped every operation CoreML returned no usage
+for — the same `continue` that §9.3 removed from `compute_plan` and for the
+same reason, left behind in the test's private copy. With every operation
+unnamed, the plan became an **empty list**, and the assertion that fired was
+`rows` — printing *"no compute operations in the plan at all"*, a statement
+about the program, when the truth was that CoreML named no device.
+
+It reads `unknown` rows now, exactly as `compute_plan` does, and the assertion
+that fires names which of the three things went wrong. Pinned with an
+**injected** total silence rather than by waiting for CoreML to produce one,
+because whether CoreML is silent today drifts (§11.5) and a test that only
+bites on a bad day is not a test.
+
+### 11.4 The refusing shape was a diagnostic read destroying a computation
+
+`_compile_for` reads the compute plan on the **forward** path — that is how
+this library can say which unit ran a shape nobody knew until the call. When
+`load_from_path` raised, that `RuntimeError` came out of `model(x)`. The model
+had compiled and would have predicted correctly; the question "which unit"
+had failed, and it took the answer down with it.
+
+The fix is not a retry and not a swallow:
+
+* `compute_plan` raises `ComputePlanRefused` rather than a bare
+  `RuntimeError`, so a caller can catch **this** condition without also
+  catching every lowering failure CoreML can raise.
+* `_compile_for` keeps the compiled model, records the refusal on the report
+  as `torchnative_offload['refused']`, and says `_REFUSED_PLAN` — a sentence
+  distinct from `_UNKNOWN_PLAN`, naming no unit and no precision, because it
+  has evidence about neither.
+* **No plan record is appended.** An empty `plans` list is not the same claim
+  as a plan whose rows are all unknown.
+
+### 11.5 What the rate does *not* prove — and the host condition behind it
+
+Between 18:30 and 18:48 on the same machine the sigmoid silence went from
+**12 of 12 to 0 of 8 with nothing in this repository changed**, before the
+fix in §11.2 was applied. Anyone measuring only the after-rate would have
+credited the fix with a change that had already happened.
+
+The likely reason is §10.4's precondition, and it is **back**:
+
+    ~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache   13 GB
+    /                                                     12 GB free
+
+§10.4 established that when the ANE bundle cache cannot grow, CoreML stops
+answering `MLComputePlan` for programs it has not already cached — and that a
+failure to create a bundle is also the condition behind the fd-1 diagnostics
+of §10.1. A `load_from_path` that fails internally is the same family.
+
+This is **not** the stale-`.mlmodelc` debris in the system temp, which was
+cleared this week and did not stop the recurrence; that is a different
+directory. Clearing Apple's cache is outside what a round may do on its own,
+so it is recorded here and not acted on.
+
+Two things follow, and they are why the fix does not rest on the rate:
+
+* **The A/B is what proves §11.2, not the after-count.** At 18:30, under the
+  *same* host condition, `ALL` was silent 12 of 12 while `CPU_AND_NE`
+  answered. `CPU_AND_NE` is robust to a condition that `ALL` is not.
+* **A green `MLComputePlan` depends on free disk**, so the suite must be able
+  to say "CoreML refused" on a host that is short of it. That is what §11.3's
+  `unknown` rows and §11.4's `refused` record are for: on such a host the
+  gate now reports a refusal by name instead of either crashing or claiming
+  the CPU ran it.
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py ComputePlanRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _REFUSED_PLAN present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_refused present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_float32_plans_are_asked_where_coreml_actually_answers present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_refused_compute_plan_does_not_end_the_forward present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refused_compute_plan_says_so_in_its_own_sentence present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refusal_and_a_silence_do_not_share_one_sentence present -->

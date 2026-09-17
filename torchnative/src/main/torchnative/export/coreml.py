@@ -715,6 +715,24 @@ class CoreMLUnsupported(NotImplementedError):
     """Something is refused by name: a leaf, a precision, or an empty lowering."""
 
 
+class ComputePlanRefused(RuntimeError):
+    """CoreML declined to construct a compute plan at all.
+
+    Raised by `compute_plan` in place of the bare `RuntimeError` that
+    `MLComputePlan.load_from_path` throws, so that callers can catch **this**
+    condition without also catching every other RuntimeError CoreML can
+    produce -- a bare `except RuntimeError` around a plan read would swallow
+    real lowering failures and let a broken model through silently.
+
+    It is a distinct condition from a plan that loads and names no device for
+    its operations; that one comes back as `UNKNOWN` rows. Measured
+    2026-09-17: the 211-leaf naive path raised this on 1 run in 4, while the
+    same leaf compiled alone answered 12 of 12 under both `ComputeUnit.ALL`
+    and `CPU_AND_NE` -- so neither the program nor the compute-unit argument
+    is established as the cause, and nothing this library passes provoked it.
+    """
+
+
 #: The two spellings, and the whole set of them. A precision outside this is a
 #: refusal and not a fallback -- an argument accepted and dropped is how a mode
 #: goes silent, which is the failure docs/graph/NPU2.md is about.
@@ -832,9 +850,19 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
         package = os.path.join(directory, "m.mlpackage")
         model.save(package)
         compiled = os.path.join(directory, "m.mlmodelc")
-        plan = MLComputePlan.load_from_path(
-            ct_utils.compile_model(package, compiled),
-            compute_units=compute_units)
+        # Named rather than left as a bare RuntimeError. See
+        # `ComputePlanRefused`: this is CoreML declining to build the plan,
+        # which is a different fact from the plan coming back empty, and the
+        # callers that must survive it have to be able to catch *it* and not
+        # every RuntimeError a lowering can raise.
+        try:
+            plan = MLComputePlan.load_from_path(
+                ct_utils.compile_model(package, compiled),
+                compute_units=compute_units)
+        except ComputePlanRefused:
+            raise
+        except RuntimeError as error:
+            raise ComputePlanRefused(str(error)) from error
         function = plan.model_structure.program.functions["main"]
         rows = []
         for operation in function.block.operations:
@@ -1169,6 +1197,68 @@ _UNKNOWN_PLAN = (
 )
 
 
+#: Said once per model when CoreML declined to build a plan at all.
+#:
+#: Deliberately a *different* string from `_UNKNOWN_PLAN`, because the two are
+#: different conditions and they send a reader to different places. An unknown
+#: plan is CoreML answering "no device for any operation" -- docs/graph/NPU2.md
+#: §9.1's artefact-identity measurement. A refusal never gets as far as an
+#: artefact to identify: `MLComputePlan.load_from_path` raises
+#: `Failed to construct compute plan, internal failure.` before a plan exists.
+#:
+#: Measured 2026-09-17 on a quiet machine: the 211-leaf naive path raised this
+#: on 1 run in 4, while the same leaf compiled on its own answered 12 of 12
+#: under both `ALL` and `CPU_AND_NE`. So it is not a property of the program
+#: and not one of the compute-unit argument -- nothing here provoked it, and
+#: nothing here can be set to avoid it.
+#:
+#: What it does NOT say is the point. No unit, no precision: reading a refusal
+#: as "CPU" is how a CPU-bound model gets reported as an offloaded one, and
+#: blaming the precision would send the caller to change a setting that has
+#: nothing to do with it.
+_REFUSED_PLAN = (
+    "torchnative coreml: CoreML **refused** to construct a compute plan for "
+    "this program -- MLComputePlan.load_from_path raised {detail} -- so "
+    "**what ran is unknown**. This is a different failure from a plan that "
+    "comes back naming no device for its operations (see `_UNKNOWN_PLAN` and "
+    "docs/graph/NPU2.md \u00a79.1): there, CoreML answered and the answer was "
+    "empty; here it declined to answer at all, and no argument this library "
+    "passes provoked it. Do not read it as CPU and do not read it as "
+    "offloaded -- there is no evidence either way. The lowering succeeded and "
+    "the forward below this warning ran and returned a real answer; the plan "
+    "is a diagnostic read and only the question \"which unit\" is "
+    "unanswered. Refusals are recorded on the model as "
+    "`.torchnative_offload['refused']`."
+)
+
+
+def _say_refused(report, detail) -> None:
+    """Say that CoreML declined to build a plan. Once per model.
+
+    Once per model and not per shape for the reason `_say_unknown` is: a leaf
+    compiles per shape, the naive path has 211 of them, and the measured
+    failure raised while many were compiling. A sentence per leaf per shape is
+    a wall a caller filters out, and this is the sentence that stands between
+    "unknown" and a caller who believes the Neural Engine ran it.
+
+    Also **records** the refusal on the report, rather than only warning.
+    A warning can be suppressed; the record is what a test can assert on, and
+    telling "CoreML refused" apart from "the answer was CPU" is the whole
+    reason this function is separate from `_say_unknown`.
+    """
+    import warnings
+
+    report.setdefault("refused", []).append(str(detail))
+    if report.get("_refused_warned"):
+        return
+    report["_refused_warned"] = True
+    warnings.warn(
+        _REFUSED_PLAN.format(detail=detail),
+        UserWarning,
+        stacklevel=4,
+    )
+
+
 #: Said once per model, by whoever gets there first. Held as one string
 #: because `_compile_model` says it at `to()` time for a leaf it could probe
 #: and `_say_what_ran` says it at the first forward for one it could not, and
@@ -1332,7 +1422,23 @@ class _CoreMLLinear:
                                else ct.precision.FLOAT16),
             compute_units=units,
         )
-        rows = compute_plan(model, compute_units=units)
+        # A refused plan is a refused *diagnostic*. The model compiled and
+        # predicts; reading the plan is how this library answers "which unit",
+        # and CoreML declining to answer that is not a reason to destroy the
+        # caller's forward. It used to be: the RuntimeError came out of
+        # `model(x)` and ended the process's work. See `ComputePlanRefused`.
+        #
+        # Not swallowed, and not retried. There is no plan record appended --
+        # an empty `plans` list is not the same claim as a plan whose rows are
+        # all unknown -- the refusal is recorded on the report by name, and
+        # `_say_refused` says it. Nothing below reads a unit out of it,
+        # because there is nothing to read.
+        try:
+            rows = compute_plan(model, compute_units=units)
+        except ComputePlanRefused as error:
+            self._compiled[batch] = model
+            _say_refused(self._report, error)
+            return model
         self._report.setdefault("plans", []).append({
             "leaf": "linear", "batch": batch,
             "shape": [batch, self.in_features],
@@ -1507,7 +1613,23 @@ class _CoreMLConv2d:
                                else ct.precision.FLOAT16),
             compute_units=units,
         )
-        rows = compute_plan(model, compute_units=units)
+        # A refused plan is a refused *diagnostic*. The model compiled and
+        # predicts; reading the plan is how this library answers "which unit",
+        # and CoreML declining to answer that is not a reason to destroy the
+        # caller's forward. It used to be: the RuntimeError came out of
+        # `model(x)` and ended the process's work. See `ComputePlanRefused`.
+        #
+        # Not swallowed, and not retried. There is no plan record appended --
+        # an empty `plans` list is not the same claim as a plan whose rows are
+        # all unknown -- the refusal is recorded on the report by name, and
+        # `_say_refused` says it. Nothing below reads a unit out of it,
+        # because there is nothing to read.
+        try:
+            rows = compute_plan(model, compute_units=units)
+        except ComputePlanRefused as error:
+            self._compiled[shape] = model
+            _say_refused(self._report, error)
+            return model
         self._report.setdefault("plans", []).append({
             "leaf": "conv2d", "shape": list(shape),
             "probe": bool(probe), "rows": rows,

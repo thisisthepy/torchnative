@@ -116,9 +116,24 @@ def plan_for(trace, *, float32, compute_units):
     function = plan.model_structure.program.functions["main"]
     rows = []
     for operation in function.block.operations:
+        # `const` has no compute device *by construction*, so it is dropped by
+        # NAME. Everything else that comes back without a usage is kept as an
+        # `unknown` row -- the same rule `coreml.compute_plan` follows, and for
+        # the same reason. Dropping those by their `None` instead was this
+        # fixture's half of the fifth flake: a plan CoreML declined to fill in
+        # became an EMPTY list, and the test then reported
+        # `('sigmoid', 'no compute operations in the plan at all')` -- a claim
+        # about the *program* -- when the truth was "CoreML named no device".
+        # Those are different facts and this reader must not merge them.
+        if operation.operator_name in ("const", "ios16.const"):
+            continue
         usage = plan.get_compute_device_usage_for_mlprogram_operation(operation)
         if usage is None:
-            # `const` has no compute device: it is not executed anywhere.
+            rows.append({
+                "op": operation.operator_name,
+                "preferred": C.UNKNOWN,
+                "supported": [],
+            })
             continue
         rows.append({
             "op": operation.operator_name,
@@ -157,13 +172,74 @@ try:
         "cnn_conv_pool_relu": (Cnn().eval(), torch.randn(1, 3, 16, 16)),
         "sigmoid": (torch.nn.Sigmoid(), torch.randn(2, 3)),
     }
+    # Asked at `CPU_AND_NE`, and that -- not the graphs -- was the flake.
+    #
+    # docs/graph/NPU2.md §9.6: with the GPU in the arbitration `MLComputePlan`
+    # goes silent. It is silent for 18 of 24 (op, shape) observations under
+    # `ComputeUnit.ALL` and for 1 of 144 under `CPU_AND_NE`, which is why the
+    # `rejected_plans` fixture in test_coremlops.py was moved. This fixture
+    # was still asking under `ALL`, and on 2026-09-17 the third program it
+    # compiled -- `sigmoid` -- came back with no device for its single
+    # operation 12 times out of 12 on an idle machine. The same three programs
+    # in the same order, in the same process, asked at `CPU_AND_NE`: all
+    # answered. Neither predecessor alone provokes it; it takes the
+    # accumulation, which is §9.1's finding that the compiled artefact's
+    # identity rather than the program decides.
+    #
+    # Nothing is weakened by the move. The claim is that float32 puts the
+    # Neural Engine out of CoreML's *supported* column, and `CPU_AND_NE` is
+    # the setting in which the unit is offered at all -- so it is the stricter
+    # place to ask, not the laxer one: the GPU cannot stand in for the answer.
+    _NPU_MD_UNITS = "CPU_AND_NE"
     as_executed = {}
     for name, (module, example) in npu_md_cases.items():
         rows, _pkg, _n, _e = plan_for(
             capture(module, example), float32=True,
-            compute_units=ct.ComputeUnit.ALL)
+            compute_units=getattr(ct.ComputeUnit, _NPU_MD_UNITS))
         as_executed[name] = rows
     out["npu_md_float32_plans"] = as_executed
+    # Named in the payload so that a silent revert to `ComputeUnit.ALL` fails
+    # a test rather than quietly restoring the flake.
+    out["npu_md_float32_units"] = _NPU_MD_UNITS
+
+    # The same three programs asked at `ALL`, **reported and not asserted**.
+    # This is the measurement that keeps the paragraph above honest: if CoreML
+    # ever stops being silent under `ALL`, or starts being silent under
+    # `CPU_AND_NE`, the numbers here say so instead of the comment aging
+    # quietly. Asserting it would be asserting a CoreML internal, which is not
+    # ours to pin.
+    silent_under_all = {}
+    for name, (module, example) in npu_md_cases.items():
+        rows, _pkg, _n, _e = plan_for(
+            capture(module, example), float32=True,
+            compute_units=ct.ComputeUnit.ALL)
+        silent_under_all[name] = [r["op"] for r in rows
+                                  if r["preferred"] == C.UNKNOWN]
+    out["npu_md_float32_unnamed_under_all"] = silent_under_all
+
+    # -- 1a. the reader, forced silent on purpose --------------------------
+    #
+    # Whether CoreML is silent today is CoreML's business and it drifts, so
+    # the reader's own behaviour is pinned with an injected silence instead of
+    # by waiting for one. Without this, reverting `plan_for` to `continue` past
+    # every unnamed operation stays green on any day CoreML answers -- and
+    # that revert is precisely the defect that printed
+    # `('sigmoid', 'no compute operations in the plan at all')`.
+    _real_usage = MLComputePlan.get_compute_device_usage_for_mlprogram_operation
+
+    def _never_names_a_device(self, operation):
+        return None
+
+    MLComputePlan.get_compute_device_usage_for_mlprogram_operation = (
+        _never_names_a_device)
+    try:
+        forced, _pkg, _n, _e = plan_for(
+            capture(torch.nn.Sigmoid(), torch.randn(2, 3)), float32=True,
+            compute_units=ct.ComputeUnit.CPU_AND_NE)
+        out["forced_silent_rows"] = forced
+    finally:
+        MLComputePlan.get_compute_device_usage_for_mlprogram_operation = (
+            _real_usage)
 
     # -- 2. what float32 costs: the same model, both precisions ------------
     cnn = capture(Cnn().eval(), torch.randn(1, 3, 16, 16))
@@ -214,6 +290,56 @@ try:
     out["wide_ne_vs_cpu"] = max(
         float(np.max(np.abs(a - b)))
         for a, b in zip(produced["CPU_AND_NE"], produced["CPU_ONLY"]))
+
+    # -- 4. a refused compute plan must not end the caller's forward -------
+    #
+    # `Failed to construct compute plan, internal failure.` is CoreML
+    # declining to build a plan. It was reaching the caller as a RuntimeError
+    # out of `forward`, because `_compile_for` reads the plan on the forward
+    # path -- so a *diagnostic* read was killing the *computation* it was only
+    # meant to describe. Injected here rather than waited for: the real thing
+    # appeared on 1 run in 4 of the 211-leaf naive path, which is not a rate a
+    # test can be built on.
+    import warnings as _warnings
+    import coremltools.models.compute_plan as _cp
+
+    _real_load = _cp.MLComputePlan.load_from_path
+    _refusal_text = (
+        '{\n    NSLocalizedDescription = "Failed to construct compute '
+        'plan, internal failure.";\n}'
+    )
+
+    def _always_refuse(*args, **kwargs):
+        raise RuntimeError(_refusal_text)
+
+    _cp.MLComputePlan.load_from_path = staticmethod(_always_refuse)
+    try:
+        leaf_w = torch.randn(8, 4)
+        leaf = C._CoreMLLinear(leaf_w, None, precision="float16")
+        x = torch.randn(2, 4)
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            y = leaf(x)
+        expected = x.to(torch.float32) @ leaf_w.to(torch.float32).T
+        out["refused_plan"] = {
+            "forward_survived": True,
+            "shape": list(y.shape),
+            "max_abs_diff": float(np.max(np.abs(
+                np.asarray(y.tolist(), dtype=np.float64)
+                - np.asarray(expected.tolist(), dtype=np.float64)))),
+            "warnings": [str(w.message) for w in caught],
+            "recorded": list(leaf._report.get("refused", [])),
+            "plans": len(leaf._report.get("plans", [])),
+        }
+    except Exception as error:  # noqa: BLE001
+        import traceback as _tb
+        out["refused_plan"] = {
+            "forward_survived": False,
+            "error": _tb.format_exc(),
+        }
+    finally:
+        _cp.MLComputePlan.load_from_path = _real_load
+
 except Exception as error:  # noqa: BLE001
     import traceback
     out["coreml_error"] = traceback.format_exc()
@@ -444,11 +570,114 @@ def test_the_coreml_models_docs_npu_executed_ran_on_the_cpu():
     assert set(plans) == {"mlp_gelu_softmax", "cnn_conv_pool_relu", "sigmoid"}, \
         sorted(plans)
     for name, rows in plans.items():
-        assert rows, (name, "no compute operations in the plan at all")
+        # Three different failures, three different sentences. Merging them is
+        # how "the ANE rejects relu" came to be believed when the truth was
+        # "CoreML did not answer".
+        assert rows, (name, "the compiled program has no computing operation "
+                            "in it at all -- this is a claim about the "
+                            "program, not about CoreML's answer")
+        unnamed = [row["op"] for row in rows if row["preferred"] == "unknown"]
+        assert not unnamed, (
+            name, "CoreML loaded the plan and named NO compute device for",
+            unnamed, "-- that is a refusal to answer and not a CPU verdict; "
+                     "see docs/graph/NPU2.md \u00a79.6 and the compute_units "
+                     "this fixture asks with")
         for row in rows:
             assert row["preferred"] == "CPU", (name, row)
             assert "NeuralEngine" not in row["supported"], (name, row)
 
+
+
+def test_the_float32_plans_are_asked_where_coreml_actually_answers():
+    """The fifth flake's first shape, pinned as a condition.
+
+    `MLComputePlan` under `ComputeUnit.ALL` -- the GPU in the arbitration --
+    returns no device usage for 18 of 24 (op, shape) observations, against 1
+    of 144 under `CPU_AND_NE` (docs/graph/NPU2.md §9.6). This fixture asked
+    under `ALL`, and its third program went silent 12 runs out of 12 on an
+    idle machine; the same programs at `CPU_AND_NE` answered.
+
+    Asserted on the payload rather than trusted to a comment, because the
+    failure mode being guarded is a *silent* revert: putting `ALL` back would
+    restore a coin-toss gate and change nothing a reader would notice.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    assert result["npu_md_float32_units"] == "CPU_AND_NE", \
+        result["npu_md_float32_units"]
+
+
+def test_what_all_does_to_the_same_three_programs_is_reported():
+    """Reported, deliberately not asserted.
+
+    Whether CoreML is silent under `ALL` on any given day is a CoreML
+    internal: it drifted from 12-of-12 silent to 0-of-8 within one hour on
+    this machine, with nothing in this repository changed. Asserting it either
+    way would be asserting something we do not control -- which is how a
+    flake gets built *into* a suite rather than out of it.
+
+    What is asserted is that the observation is being taken at all, so the
+    §9.6 paragraph above cannot age into a claim nobody is checking.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    unnamed = result["npu_md_float32_unnamed_under_all"]
+    assert set(unnamed) == {"mlp_gelu_softmax", "cnn_conv_pool_relu",
+                            "sigmoid"}, sorted(unnamed)
+    silent = {k: v for k, v in unnamed.items() if v}
+    print(f"   ComputeUnit.ALL named no device for: {silent or 'nothing'}")
+    print(f"   ComputeUnit.CPU_AND_NE named no device for: nothing "
+          f"(asserted by test_the_coreml_models_docs_npu_executed_ran_on_the_cpu)")
+
+
+def test_a_plan_that_names_no_device_is_not_read_as_an_empty_program():
+    """The reader keeps what CoreML declined to name.
+
+    `plan_for` used to `continue` past every operation with no usage, which
+    turned "CoreML named no device for this operation" into "this program has
+    no operations" -- the sentence the gate actually printed. The rows carry
+    `unknown` now, so the two failures cannot produce the same message.
+
+    Checked structurally, on the fixture's own reader, so it holds whether or
+    not CoreML happens to be silent today.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    # Every float32 plan has at least one computing operation in it, and the
+    # `const`s -- which have no device by construction -- are dropped by name
+    # rather than by their missing usage.
+    for name, rows in result["npu_md_float32_plans"].items():
+        assert rows, (name, rows)
+        assert all(row["op"] not in ("const", "ios16.const") for row in rows), \
+            (name, rows)
+
+
+def test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing():
+    """The reader's half of the first shape, pinned so it cannot drift green.
+
+    `get_compute_device_usage_for_mlprogram_operation` is made to return
+    `None` for every operation -- exactly what CoreML did to `sigmoid` 12 runs
+    out of 12 under `ComputeUnit.ALL` on 2026-09-17 -- and the plan must come
+    back as a row per computing operation marked `unknown`, not as an empty
+    list.
+
+    The difference is the whole point. An empty list makes the suite say "no
+    compute operations in the plan at all", which is a claim about the
+    program; the truth is that CoreML named no device. A caller told the first
+    goes looking at their model, which is the wrong place.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    forced = result["forced_silent_rows"]
+    assert forced, "an injected total silence produced NO rows at all, which " \
+                   "is the dropped-row defect this test exists to catch"
+    assert [row["op"] for row in forced] == ["ios16.sigmoid"], forced
+    assert all(row["preferred"] == "unknown" for row in forced), forced
+    assert all(row["supported"] == [] for row in forced), forced
 
 def test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach():
     """The same model, both precisions -- and the difference is not a preference.
@@ -672,6 +901,74 @@ def test_the_device_module_refuses_to_guess_which_emulator_to_use():
             os.environ["ANDROID_SERIAL"] = saved
         if inserted and root in sys.path:
             sys.path.remove(root)
+
+
+
+# --- 4. a refused plan is not a dead forward, and not a CPU answer ----------
+
+
+def test_a_refused_compute_plan_does_not_end_the_forward():
+    """The second of the two shapes, and the one that reached a caller.
+
+    `_compile_for` reads `MLComputePlan` on the forward path. When CoreML
+    declined -- `Failed to construct compute plan, internal failure.` -- that
+    RuntimeError came out of `model(x)`, so a **diagnostic** read destroyed
+    the **computation** it was only meant to describe. The model had compiled
+    and would have predicted correctly.
+
+    Measured on this machine 2026-09-17: the 211-leaf naive path raised it on
+    1 run in 4, four tests failing together. The refusal is injected here
+    because 1-in-4 is not a rate a test can be built on.
+
+    The forward must survive **and be right**: "it stopped crashing" must not
+    be buyable with a wrong answer, so the result is checked against the
+    matmul it is supposed to be.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    refused = result["refused_plan"]
+    assert refused["forward_survived"] is True, refused.get("error", refused)
+    assert refused["shape"] == [2, 8], refused
+    # float16 CoreML against a float32 matmul of the same weights.
+    assert refused["max_abs_diff"] < 1e-2, refused
+
+
+def test_a_refused_compute_plan_is_recorded_rather_than_swallowed():
+    """Surviving the refusal must not mean hiding it.
+
+    A `try`/`except` that let the forward through and said nothing would turn
+    a CPU-bound model into one that looks offloaded -- the exact outcome
+    docs/graph/NPU2.md §1 exists to prevent, and worse than the crash, because
+    the crash at least said something. So the refusal is on the report by
+    name, and there is no plan row pretending to be an answer.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    refused = result["refused_plan"]
+    assert refused["recorded"], refused
+    assert any("internal failure" in r for r in refused["recorded"]), refused
+    # No plan was produced, so none is recorded: an empty `plans` list is not
+    # the same claim as a plan whose rows are all unknown.
+    assert refused["plans"] == 0, refused
+
+
+def test_a_refused_compute_plan_says_so_and_does_not_say_cpu():
+    """"CoreML refused to answer" apart from "the answer was CPU".
+
+    Believing the second when the first is true is how "the ANE rejects relu"
+    was held for a while. The warning must name the refusal and must not
+    name a unit, because it has no evidence about one.
+    """
+    result = _coreml_or_skip()
+    if result is None:
+        return
+    warns = result["refused_plan"]["warnings"]
+    assert any("refused" in w.lower() for w in warns), warns
+    assert any("internal failure" in w for w in warns), warns
+    for w in warns:
+        assert "MLComputePlan says ['CPU']" not in w, w
 
 
 def _main():

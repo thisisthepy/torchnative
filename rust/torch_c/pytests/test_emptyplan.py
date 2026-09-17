@@ -168,6 +168,110 @@ def test_unknown_rows_survive_the_boundary_cast_filter():
     assert kept == [_UNKNOWN], kept
 
 
+# -- a refusal is not a silence, and not an answer ---------------------------
+#
+# The two shapes this section separates were measured on 2026-09-17 in this
+# worktree, on a quiet machine (load 1.4-2.6, no other agent running):
+#
+#   silence  MLComputePlan loads, lists the operations, and returns `None` for
+#            every one of them. Under `ComputeUnit.ALL` the third float32
+#            program compiled in a process went silent 12 times out of 12;
+#            under `CPU_AND_NE` the same three programs in the same order
+#            answered. Neither predecessor alone triggers it -- it takes the
+#            accumulation -- which is docs/graph/NPU2.md 9.1's finding that
+#            the compiled artefact's identity, not the program it encodes,
+#            decides.
+#
+#   refusal  `MLComputePlan.load_from_path` raises outright:
+#            `Failed to construct compute plan, internal failure.` Seen on the
+#            211-leaf naive path 1 run in 4; the same leaf compiled alone
+#            answered 12 times out of 12 under both settings.
+#
+# They are different conditions with one consequence, and the consequence is
+# the trap: read either as "the answer was CPU" and a CPU-bound model is
+# reported as an offloaded one. That conflation is how "the ANE rejects relu"
+# came to be believed when the truth was "CoreML did not answer".
+
+
+def _refused(report=None, detail="internal failure"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        C._say_refused(report if report is not None else {}, detail)
+    return [str(w.message) for w in caught]
+
+
+def test_a_refused_compute_plan_says_so_in_its_own_sentence():
+    """`load_from_path` raising is not the same fact as an empty plan.
+
+    An empty plan is CoreML answering "no device for any operation"; a refusal
+    is CoreML declining to build the plan at all. The library has a sentence
+    for the first (`_UNKNOWN_PLAN`) and this asserts it has a *different* one
+    for the second, because sending a reader to 9.1's artefact-identity
+    measurement for an error that never got as far as an artefact is sending
+    them to the wrong place.
+    """
+    said = _refused()
+    assert len(said) == 1, said
+    assert "refused" in said[0].lower(), said[0]
+    assert "internal failure" in said[0], said[0]
+
+
+def test_a_refused_plan_is_never_reported_as_cpu_or_as_offloaded():
+    """The conflation this whole file exists to prevent, at the refusal.
+
+    "CoreML refused to answer" and "the answer was CPU" are different facts.
+    A sentence that says the model ran on the CPU, or that it reached the
+    unit, is making a claim about evidence that does not exist.
+    """
+    said = _refused()[0]
+    assert "ran on the CPU" not in said, said
+    assert "reached the Neural Engine" not in said, said
+    # It must say the question is unanswered, not answer it.
+    assert "unknown" in said.lower() or "not know" in said.lower(), said
+
+
+def test_a_refused_plan_does_not_claim_the_precision_is_at_fault():
+    """`_UNREACHABLE_PRECISION` blames a setting the caller can change.
+
+    Saying it for a refusal sends the caller to change `precision=` for an
+    error that has nothing to do with precision -- the same misdirection
+    `test_an_unknown_plan_is_not_blamed_on_the_precision` fixes one shape up.
+    """
+    said = _refused()[0]
+    assert "no compute_units setting can reach the unit" not in said, said
+    assert "precision=" not in said, said
+
+
+def test_the_refusal_sentence_is_said_once_per_model_and_not_per_shape():
+    """A leaf compiles per shape, and 211 of them refuse together.
+
+    The naive path's failure raised on `lm_head` while 210 other leaves were
+    compiling; one sentence per shape per leaf is a wall of text a caller
+    filters out, which is the same reason `_say_unknown` is once-per-model.
+    """
+    report = {}
+    first = _refused(report=report)
+    second = _refused(report=report)
+    assert len(first) == 1, first
+    assert second == [], second
+
+
+def test_a_refusal_and_a_silence_do_not_share_one_sentence():
+    """Told apart by the text, not only by the code path that produced them.
+
+    If both produced the same string a reader could not tell which happened,
+    and the two send them to different places: a silence to 9.1, a refusal to
+    a CoreML internal error that no setting of ours provoked.
+    """
+    refusal = _refused()[0]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        C._say_unknown({}, [], False)
+    silence = str(caught[0].message)
+    assert refusal != silence, refusal
+    assert "internal failure" not in silence, silence
+
+
 def _at_to(plans, precision="float16", report=None):
     report = report if report is not None else {}
     report["plans"] = plans
