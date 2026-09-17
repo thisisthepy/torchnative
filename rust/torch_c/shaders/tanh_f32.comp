@@ -1,0 +1,27 @@
+#version 450
+
+// `aten.tanh.default` for f32: out[i] = tanh(a[i]).
+//
+// The last op of BERT's pooler (`docs/devices/VULKAN7.md`). GLSL's built-in,
+// which on MoltenVK is Metal's `tanh`; MoltenVK's fast-math is off for this
+// instance (`vulkan.rs`), so the call is not rewritten. The result is not an
+// exactly-rounded operation on either side, so the test holds it to a
+// tolerance derived from upstream's own float32 error (docs/numerics/AGREE.md
+// §2), not to bit equality.
+//
+// NaN and the infinities: `tanh(±inf)` is ±1 by the GLSL definition and by
+// upstream's; NaN propagates on both.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    c[i] = tanh(a[i]);
+}

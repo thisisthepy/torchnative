@@ -26,8 +26,11 @@
 //! * **No fallback.** If the loader is absent, `ones(..., device="vulkan")`
 //!   raises with the loader's own error text. It never quietly returns a CPU
 //!   tensor.
-//! * **f32 only, contiguous only, same-shape only.** Every other case refuses
-//!   by name rather than being approximated.
+//! * **f32 compute, contiguous storage.** Arithmetic is float32 only; int64
+//!   indices are *stored* (as int32) and moved, never computed on. Every
+//!   tensor is a contiguous buffer, so a view materialises
+//!   (docs/devices/VULKAN7.md §2). Every other case refuses by name rather
+//!   than being approximated.
 //!
 //! ## Where the loader comes from
 //!
@@ -87,6 +90,10 @@ spv!(BIAS_ADD_F32_SPV, "bias_add_f32");
 spv!(EMBEDDING_I32_F32_SPV, "embedding_i32_f32");
 spv!(TRANSPOSE_BATCHED2D_F32_SPV, "transpose_batched2d_f32");
 spv!(SCALAR_F32_SPV, "scalar_f32");
+spv!(STRIDED_GATHER_U32_SPV, "strided_gather_u32");
+spv!(GATHER_U32_I32_SPV, "gather_u32_i32");
+spv!(TANH_F32_SPV, "tanh_f32");
+spv!(BROADCAST_BINARY_F32_SPV, "broadcast_binary_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -118,12 +125,8 @@ static SHADER_DISPATCHES: AtomicU64 = AtomicU64::new(0);
 static HOST_UPLOADS: AtomicU64 = AtomicU64::new(0);
 static HOST_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
 
-fn push_bytes(push: [u32; 4]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for (i, v) in push.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-    }
-    out
+fn push_bytes(push: &[u32]) -> Vec<u8> {
+    push.iter().flat_map(|v| v.to_ne_bytes()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +460,22 @@ pub struct VkBuffer {
     /// `VkBuffer` rather than on the `VkTensor` so that `view`, `reshape`,
     /// `detach` and `alias` -- which share the `Arc<VkBuffer>` and rebuild the
     /// `VkTensor` -- carry it without a line of code each.
-    index_range: OnceLock<(i64, i64)>,
+    ///
+    /// A view of an index tensor (`slice`, `select`, `expand`, `gather`) holds
+    /// a subset of its source's values, so it inherits the source's range as
+    /// a **bound that may be loose** -- the exact one would need a read-back
+    /// (docs/devices/VULKAN7.md §3). `IndexRange::exact` says which it is, so
+    /// a refusal on a loose bound can say that rather than claim a value.
+    index_range: OnceLock<IndexRange>,
+}
+
+/// The recorded `(lo, hi)` of an index buffer, and whether it is the buffer's
+/// own or one inherited from the tensor it was viewed out of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexRange {
+    pub lo: i64,
+    pub hi: i64,
+    pub exact: bool,
 }
 
 unsafe impl Send for VkBuffer {}
@@ -640,7 +658,13 @@ impl VkContext {
     /// Three storage-buffer bindings and a `uint` push constant is the whole
     /// interface every kernel here uses, so the layout is shared rather than
     /// described per kernel.
-    unsafe fn kernel(&self, name: &'static str, spv: &[u8], num_bindings: u32) -> Result<Kernel, String> {
+    unsafe fn kernel(
+        &self,
+        name: &'static str,
+        spv: &[u8],
+        num_bindings: u32,
+        push_words: u32,
+    ) -> Result<Kernel, String> {
         let mut cache = self.pipelines.lock().map_err(|_| "pipeline cache poisoned")?;
         if let Some(k) = cache.get(name) {
             return Ok(*k);
@@ -677,17 +701,23 @@ impl VkContext {
             )
             .map_err(|e| format!("vkCreateDescriptorSetLayout({name}): {e}"))?;
 
-        // Sixteen bytes, not four. Every kernel here declares
-        // `Push { uint n; uint p1; uint p2; uint p3; }` and most of them use
-        // only `n`; a shader that reads fewer bytes than the range declares is
-        // legal, which is why widening this did not require recompiling
+        // Sixteen bytes for every kernel that declares
+        // `Push { uint n; uint p1; uint p2; uint p3; }` -- most use only `n`;
+        // a shader that reads fewer bytes than the range declares is legal,
+        // which is why widening this did not require recompiling
         // `add_f32.spv` -- and `shaders/compile.sh` reproduced that file
         // byte-for-byte, which is the control that the toolchain here is the
         // one that produced the committed kernel (docs/devices/VULKAN4.md §3).
+        //
+        // Eighty for the two view kernels, which carry a shape and a stride of
+        // rank up to `VIEW_RANK_MAX` (docs/devices/VULKAN7.md §2) -- inside the
+        // 128 bytes every Vulkan device must accept, so this is not a
+        // capability that varies by GPU. The size is fixed per kernel name,
+        // and the cache is keyed by name, so one pipeline never sees two sizes.
         let pc = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(16)];
+            .size(push_words.max(4) * 4)];
         let set_layouts = [dsl];
         let layout = self
             .device
@@ -754,7 +784,20 @@ impl VkContext {
         bufs: &[&VkBuffer],
         push: [u32; 4],
     ) -> Result<(), String> {
-        let k = self.kernel(name, spv, bufs.len() as u32)?;
+        self.dispatch_kernel_words(name, spv, bufs, &push)
+    }
+
+    /// `dispatch_kernel` with a push-constant block of any length -- the view
+    /// kernels' is twenty words. `push[0]` is the output element count, as
+    /// for every kernel here.
+    unsafe fn dispatch_kernel_words(
+        &self,
+        name: &'static str,
+        spv: &[u8],
+        bufs: &[&VkBuffer],
+        push: &[u32],
+    ) -> Result<(), String> {
+        let k = self.kernel(name, spv, bufs.len() as u32, push.len() as u32)?;
         let pool = self.submit.lock().map_err(|_| "submit lock poisoned")?;
 
         let set_layouts = [k.dsl];
@@ -1024,6 +1067,15 @@ pub fn dispatch(
         "aten.embedding.default" => embedding_vulkan(py, op, args, kwargs),
         "aten._softmax.default" => softmax_vulkan(py, op, args, kwargs),
         "aten.neg.default" => unary(py, op, args, kwargs, "neg_f32", NEG_F32_SPV),
+        // BERT's pooler (docs/devices/VULKAN7.md).
+        "aten.tanh.default" => unary(py, op, args, kwargs, "tanh_f32", TANH_F32_SPV),
+        // The views of docs/devices/VULKAN7.md, materialised by one strided
+        // copy each -- float32 and index words alike -- and the gather BERT's
+        // embeddings run on their `token_type_ids` buffer.
+        "aten.slice.Tensor" => slice_vulkan(py, op, args, kwargs),
+        "aten.select.int" => select_vulkan(py, op, args, kwargs),
+        "aten.expand.default" => expand_vulkan(py, op, args, kwargs),
+        "aten.gather.default" => gather_vulkan(py, op, args, kwargs),
 
         // `clone` allocates and copies on the device. `detach`/`alias` share
         // the buffer, which is what the dense arm does too (a candle clone is
@@ -1047,13 +1099,16 @@ pub fn dispatch(
         }
 
         // Transpose *materialises* here, because a `VkTensor` has a shape and
-        // no strides. 2-D only; higher ranks refuse by name (docs/devices/VULKAN4.md §6).
+        // no strides. Any pair, up to rank `VIEW_RANK_MAX` (docs/devices/VULKAN7.md).
         "aten.t.default" => t_default(py, op, args, kwargs),
         "aten.transpose.int" => transpose_int(py, op, args, kwargs),
 
         // The matmuls -- the ops the measured trace says a forward pass
         // actually spends itself on (docs/devices/VULKAN4.md §2).
         "aten.mm.default" => mm(py, op, args, kwargs),
+        // Kept whole by the shim (docs/devices/VULKAN4.md §2.1), so it is its
+        // own arm rather than upstream's expand + bmm + view.
+        "aten.matmul.default" => matmul_vulkan(py, op, args, kwargs),
         "aten.addmm.default" => addmm(py, op, args, kwargs),
 
         other => Err(not_implemented(format!(
@@ -1133,8 +1188,9 @@ fn unary(
     wrap(py, out, a.shape.clone(), input.tag())
 }
 
-/// Two inputs of equal shape, one output. `alpha` is accepted only when it is
-/// 1, for the ops that have one.
+/// Two inputs, one output. Equal shapes take the op's own elementwise kernel;
+/// unequal ones broadcast through `broadcast_binary`. `alpha` is accepted only
+/// when it is 1, for the ops that have one.
 fn binary(
     py: Python<'_>,
     op: &str,
@@ -1152,7 +1208,9 @@ fn binary(
     check_all_f32(op, &[&lhs, &rhs])?;
     let a = lhs.vk_tensor(op)?.clone();
     let b = rhs.vk_tensor(op)?.clone();
-    same_shape(op, &a, &b)?;
+    if a.shape != b.shape {
+        return broadcast_binary(py, op, &lhs, &a, &b);
+    }
     let ctx = require(op)?;
     let n = a.elem_count();
     let out = unsafe {
@@ -1162,21 +1220,6 @@ fn binary(
         out
     };
     wrap(py, out, a.shape.clone(), lhs.tag())
-}
-
-/// Broadcasting is refused rather than emulated, by name and with both shapes
-/// in the message. `docs/devices/VULKAN3.md` is explicit that reaching for the CPU
-/// implementation half a metre away is exactly the silent fallback this device
-/// exists to make impossible.
-fn same_shape(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<()> {
-    if a.shape != b.shape {
-        return Err(not_implemented(format!(
-            "{op}: the vulkan kernels are elementwise over equal shapes and do \
-             not broadcast {:?} with {:?} (docs/devices/VULKAN4.md §6).",
-            a.shape, b.shape
-        )));
-    }
-    Ok(())
 }
 
 fn reject_alpha(
@@ -1301,14 +1344,21 @@ fn t_default(
     }
 }
 
-/// `aten.transpose.int`. 2-D only on this device -- see `transpose2d`.
+/// `aten.transpose.int`. Any pair, up to rank `VIEW_RANK_MAX`; 2-D and the
+/// last two axes of a float 3-D tensor keep their own kernels.
 fn transpose_int(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    let (input, a) = self_vk(op, args, kwargs)?;
+    // `check_storage_dtype`, not `self_vk`'s `check_dtype`: a transpose moves
+    // words and computes on none, so an int64 index tensor is as welcome as a
+    // float one (docs/devices/VULKAN7.md). The two older kernels below are
+    // float-only shaders, so an index tensor always takes the strided one.
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let store = check_storage_dtype(op, input.tag())?;
+    let a = input.vk_tensor(op)?.clone();
     let rank = a.shape.len();
     let dim = |i: usize, name: &str| -> PyResult<isize> {
         let v = crate::aten::optional(args, kwargs, i, name)?
@@ -1339,21 +1389,16 @@ fn transpose_int(
     // op past the wall this round came to remove (docs/devices/VULKAN6.md §3).
     // Every other pair and every higher rank still refuses by name: a general
     // permutation needs strides a `VkTensor` does not have.
-    if rank == 3 && d0.min(d1) == 1 && d0.max(d1) == 2 {
+    if store == VkStore::F32 && rank == 3 && d0.min(d1) == 1 && d0.max(d1) == 2 {
         return transpose_batched2d(py, op, &input, &a);
     }
-    if rank != 2 {
-        return Err(not_implemented(format!(
-            "{op}: the vulkan device transposes 2-D tensors, and the last two \
-             dimensions of a 3-D one; it was asked for dims ({d0}, {d1}) of a \
-             {rank}-D tensor {:?}. A `VkTensor` carries a shape and no strides, \
-             so a transpose here has to move bytes, and the kernels that move \
-             them are those two. Anything else refuses rather than being \
-             permuted by some other route (docs/devices/VULKAN4.md §6).",
-            a.shape
-        )));
+    if store == VkStore::F32 && rank == 2 {
+        return transpose2d(py, op, &input, &a);
     }
-    transpose2d(py, op, &input, &a)
+    // Every other pair and rank, up to the stated bound: BERT's attention
+    // transposes (batch, head, seq, dim) tensors, which is the 4-D wall
+    // docs/devices/VULKAN6.md §3.1 named. Above the bound this refuses by name.
+    transpose_strided(py, op, &input, &a, d0, d1)
 }
 
 /// The materialising 2-D transpose. Pure data movement, so the result is
@@ -1456,8 +1501,8 @@ fn matmul_into(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<(VkBuffer, usiz
     if a.shape.len() != 2 || b.shape.len() != 2 {
         return Err(not_implemented(format!(
             "{op}: the vulkan matmul kernel is 2-D and was given {:?} and {:?}. \
-             Batched matmul (`aten.bmm.default`) is not taught this device \
-             (docs/devices/VULKAN4.md §6).",
+             Batched and broadcast products go through `aten.bmm.default` / \
+             `aten.matmul.default` (docs/devices/VULKAN7.md).",
             a.shape, b.shape
         )));
     }
@@ -1667,7 +1712,7 @@ pub fn maybe_upload(
                 ctx.upload_i32(&buf, &words).map_err(|e| vk_error(op, e))?;
                 buf
             };
-            let _ = buf.index_range.set((lo, hi));
+            let _ = buf.index_range.set(IndexRange { lo, hi, exact: true });
             buf
         }
     };
@@ -1711,12 +1756,14 @@ fn to_copy(
     }
 }
 
-/// `aten.add.Tensor` -- the one elementwise op, f32, same shape, alpha == 1.
+/// `aten.add.Tensor` -- f32, alpha == 1.
 ///
-/// Every narrowing refuses by name instead of being emulated: a broadcast, a
-/// scalar `other` and an `alpha` all have perfectly good CPU implementations
-/// half a metre away and reaching for one of them here is exactly the silent
-/// fallback this device exists to make impossible.
+/// Unequal shapes broadcast on the device, in one dispatch
+/// (`broadcast_binary`, docs/devices/VULKAN7.md §3.2). Every other narrowing
+/// refuses by name instead of being emulated: a scalar `other` and an `alpha`
+/// both have perfectly good CPU implementations half a metre away and reaching
+/// for one of them here is exactly the silent fallback this device exists to
+/// make impossible.
 fn add_tensor(
     py: Python<'_>,
     op: &str,
@@ -1737,11 +1784,7 @@ fn add_tensor(
     let a = lhs.vk_tensor(op)?.clone();
     let b = rhs.vk_tensor(op)?.clone();
     if a.shape != b.shape {
-        return Err(not_implemented(format!(
-            "{op}: the vulkan kernel adds equal shapes elementwise and does not \
-             broadcast {:?} with {:?} (docs/devices/VULKAN3.md).",
-            a.shape, b.shape
-        )));
+        return broadcast_binary(py, op, &lhs, &a, &b);
     }
     let ctx = require(op)?;
     let n = a.elem_count();
@@ -1835,7 +1878,10 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.div.Scalar",
         "aten.div.Tensor",
         "aten.embedding.default",
+        "aten.expand.default",
+        "aten.gather.default",
         "aten.gelu.default",
+        "aten.matmul.default",
         "aten.mm.default",
         "aten.mul.Scalar",
         "aten.mul.Tensor",
@@ -1843,8 +1889,11 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.neg.default",
         "aten.relu.default",
         "aten.reshape.default",
+        "aten.select.int",
+        "aten.slice.Tensor",
         "aten.sub.Tensor",
         "aten.t.default",
+        "aten.tanh.default",
         "aten.transpose.int",
         "aten.view.default",
     ]
@@ -2212,22 +2261,13 @@ fn embedding_vulkan(
     // The range the upload recorded. `None` can only mean a buffer that was
     // not filled by the int64 upload path, which nothing in this module can
     // produce -- so it refuses rather than guessing a range.
-    let Some(&(lo, hi)) = idx.buffer.index_range.get() else {
-        return Err(not_implemented(format!(
-            "{op}: this index tensor carries no recorded range, so its values \
-             cannot be checked against the table without reading the device \
-             back. Copy the indices to the vulkan device with .to(\"vulkan\") \
-             (docs/devices/VULKAN6.md §2)."
-        )));
-    };
     let count = idx.elem_count();
-    if count > 0 && (lo < 0 || hi >= rows as i64) {
-        // Upstream's wording for an index outside the table.
-        let bad = if lo < 0 { lo } else { hi };
-        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+    // Upstream's wording for an index outside the table.
+    check_index_range(op, &idx, rows, count, |bad| {
+        pyo3::exceptions::PyIndexError::new_err(format!(
             "index out of range in self: {bad} is not in [0, {rows})"
-        )));
-    }
+        ))
+    })?;
 
     let mut shape = idx.shape.clone();
     shape.push(dim);
@@ -2247,4 +2287,616 @@ fn embedding_vulkan(
         out
     };
     wrap(py, out, shape, weight.tag())
+}
+
+// ---------------------------------------------------------------------------
+// The pretrained-BERT wall: slice, select, expand, any-rank transpose, gather,
+// tanh (docs/devices/VULKAN7.md)
+// ---------------------------------------------------------------------------
+//
+// `docs/devices/VULKAN6.md` §3.1 measured what stopped a pretrained BERT after
+// a single-head block ran: `expand` 10, `slice` 1, `gather` 1, `select` 1,
+// `tanh` 1, and `transpose.int` on 4-D tensors. Four of those six are *views*
+// upstream, and a `VkTensor` has a shape and no strides -- so here they
+// materialise, all through one kernel that takes the view's `(shape, stride,
+// base)` and copies. That keeps the property every other op here has (each
+// tensor is a contiguous buffer, so nothing downstream needs to learn strides)
+// at the price of one dispatch per view, which is stated in the per-op
+// dispatch table rather than hidden.
+
+/// The highest rank a view kernel carries in its push constants.
+///
+/// A stated bound, like `VULKAN_INDEX_MAX`, and for the same reason: the push
+/// block is eighty bytes (inside the 128 every device must accept), so the
+/// rank a view can have is a property of this library, not of the GPU. BERT
+/// needs 4; a rank above 8 refuses by name before any GPU work.
+pub const VIEW_RANK_MAX: usize = 8;
+
+/// A count or offset a shader indexes with, or a refusal naming it.
+///
+/// The shaders index with `uint`, so anything above `u32::MAX` would wrap into
+/// a different, plausible element. Checked *before* allocating, so the
+/// refusal costs nothing -- `expand` in particular can ask for an output far
+/// larger than its input, which upstream answers as a free view and this
+/// device would have to materialise.
+fn shader_u32(op: &str, what: &str, value: usize) -> PyResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        not_implemented(format!(
+            "{op}: the {what} is {value}, which does not fit the 32-bit index \
+             every vulkan shader in this build uses (bound {}). A view is \
+             materialised on this device, so its size is a real allocation \
+             and a real index, not a free stride (docs/devices/VULKAN7.md §2).",
+            u32::MAX
+        ))
+    })
+}
+
+fn check_view_rank(op: &str, rank: usize) -> PyResult<()> {
+    if rank > VIEW_RANK_MAX {
+        return Err(not_implemented(format!(
+            "{op}: a rank-{rank} view is above the rank {VIEW_RANK_MAX} the vulkan \
+             view kernels carry in their push constants. The bound is this \
+             build's, the same on every device, and a higher rank refuses \
+             rather than being reshaped by some other route \
+             (docs/devices/VULKAN7.md §2)."
+        )));
+    }
+    Ok(())
+}
+
+fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1];
+    }
+    strides
+}
+
+/// The source's element count, the storage class, and the dtype check that
+/// every view kernel shares: float32 and the int64-as-int32 index words are
+/// both accepted, because the kernel copies words and computes on neither.
+fn view_source(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(PyTensorBase, VkTensor, VkStore)> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let store = check_storage_dtype(op, input.tag())?;
+    let a = input.vk_tensor(op)?.clone();
+    Ok((input, a, store))
+}
+
+/// What the output of a view says about its index values: its source's range,
+/// marked inherited. A float tensor has none.
+fn inherit_range(store: VkStore, from: &VkBuffer, to: &VkBuffer) {
+    if store == VkStore::I64AsI32 {
+        if let Some(r) = from.index_range.get() {
+            let _ = to.index_range.set(IndexRange { exact: false, ..*r });
+        }
+    }
+}
+
+/// Materialise `out[i] = src[base + sum coord_d * stride_d]` over `shape`.
+///
+/// Returns the input's own buffer, with no dispatch, when the view is the
+/// identity -- the output would be a byte-for-byte copy of a buffer nothing on
+/// this device ever writes to again, and upstream's answer there is a view of
+/// the same storage too.
+fn materialise_view(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    a: &VkTensor,
+    store: VkStore,
+    shape: Vec<usize>,
+    stride: Vec<usize>,
+    base: usize,
+) -> PyResult<Py<PyAny>> {
+    check_view_rank(op, shape.len())?;
+    let n: usize = shape.iter().product();
+    let identity = base == 0 && shape == a.shape && stride == contiguous_strides(&a.shape);
+    if identity {
+        let out = PyTensorBase::vulkan(
+            VkTensor { buffer: a.buffer.clone(), shape },
+            input.tag(),
+        );
+        return crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind());
+    }
+    let n32 = shader_u32(op, "output element count", n)?;
+    let mut push = vec![n32, shape.len() as u32, 0, 0];
+    if n > 0 {
+        // The largest source offset this view can form, checked against the
+        // source rather than trusted: a stride derivation that was wrong by
+        // one axis would otherwise read past the buffer in a shader that
+        // cannot raise.
+        let last = base
+            + shape
+                .iter()
+                .zip(&stride)
+                .map(|(&e, &s)| (e - 1) * s)
+                .sum::<usize>();
+        if last >= a.elem_count() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: vulkan: internal view error -- offset {last} is outside a \
+                 source of {} elements (shape {:?}, stride {:?}, base {base})",
+                a.elem_count(),
+                shape,
+                stride
+            )));
+        }
+        push[2] = shader_u32(op, "source offset", base)?;
+        shader_u32(op, "source offset", last)?;
+    }
+    let mut dims = [0u32; VIEW_RANK_MAX];
+    let mut strides = [0u32; VIEW_RANK_MAX];
+    for d in 0..shape.len() {
+        dims[d] = shape[d] as u32;
+        strides[d] = if n > 0 { shader_u32(op, "stride", stride[d])? } else { 0 };
+    }
+    push.extend_from_slice(&dims);
+    push.extend_from_slice(&strides);
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel_words(
+                "strided_gather_u32",
+                STRIDED_GATHER_U32_SPV,
+                &[&a.buffer, &a.buffer, &out],
+                &push,
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    inherit_range(store, &a.buffer, &out);
+    wrap(py, out, shape, input.tag())
+}
+
+/// `aten::slice.Tensor(self, dim=0, start=None, end=None, step=1)`.
+///
+/// Upstream clamps rather than raising; the arithmetic is the dense kernel's
+/// (`aten.rs::slice_tensor`) and the meta kernel's, transcribed.
+fn slice_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a, store) = view_source(op, args, kwargs)?;
+    let rank = a.shape.len();
+    let dim = crate::aten::normalise_dim(
+        op,
+        crate::aten::dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0),
+        rank,
+    )?;
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(
+            "slice() cannot be applied to a 0-dim tensor.",
+        ));
+    }
+    let extent = a.shape[dim] as i64;
+    let step = crate::aten::int_arg(args, kwargs, 4, "step")?.unwrap_or(1);
+    if step <= 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "step must be greater than zero, got {step}"
+        )));
+    }
+    let clamp = |value: i64| -> i64 {
+        let shifted = if value < 0 { value + extent } else { value };
+        shifted.clamp(0, extent)
+    };
+    let start = clamp(crate::aten::int_arg(args, kwargs, 2, "start")?.unwrap_or(0));
+    let end = match crate::aten::int_arg(args, kwargs, 3, "end")? {
+        Some(value) if value >= extent => extent,
+        Some(value) => clamp(value),
+        None => extent,
+    };
+    let length = ((end - start).max(0) as usize).div_ceil(step as usize);
+    let mut shape = a.shape.clone();
+    let mut stride = contiguous_strides(&a.shape);
+    let base = start as usize * stride[dim];
+    shape[dim] = length;
+    stride[dim] *= step as usize;
+    materialise_view(py, op, &input, &a, store, shape, stride, base)
+}
+
+/// `aten::select.int(self, dim, index)` -- BERT's pooler takes `[:, 0]`.
+fn select_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a, store) = view_source(op, args, kwargs)?;
+    let rank = a.shape.len();
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(
+            "invalid index of a 0-dim tensor",
+        ));
+    }
+    let dim = crate::aten::normalise_dim(
+        op,
+        crate::aten::dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0),
+        rank,
+    )?;
+    let index = crate::aten::normalise_index(
+        op,
+        crate::aten::int_arg(args, kwargs, 2, "index")?
+            .ok_or_else(|| crate::aten::missing(op, "index"))? as isize,
+        a.shape[dim],
+    )?;
+    let mut shape = a.shape.clone();
+    let mut stride = contiguous_strides(&a.shape);
+    let base = index * stride[dim];
+    shape.remove(dim);
+    stride.remove(dim);
+    materialise_view(py, op, &input, &a, store, shape, stride, base)
+}
+
+/// `aten::expand(self, size, *, implicit=False)` -- a grown axis reads the
+/// same source element along its whole length (stride 0).
+fn expand_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a, store) = view_source(op, args, kwargs)?;
+    let requested = crate::aten::shape_arg(op, args, kwargs, 1, "size")?;
+    let target = crate::aten::expand_target(op, &a.shape, &requested)?;
+    crate::aten::check_expand_extents(&a.shape, &target, &requested)?;
+    check_view_rank(op, target.len())?;
+    let lead = target.len() - a.shape.len();
+    let source = contiguous_strides(&a.shape);
+    let stride: Vec<usize> = (0..target.len())
+        .map(|d| {
+            if d < lead || a.shape[d - lead] != target[d] {
+                0
+            } else {
+                source[d - lead]
+            }
+        })
+        .collect();
+    materialise_view(py, op, &input, &a, store, target, stride, 0)
+}
+
+/// `aten.transpose.int` for any pair of a tensor of rank up to
+/// `VIEW_RANK_MAX`: the two strides swap.
+fn transpose_strided(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    a: &VkTensor,
+    d0: usize,
+    d1: usize,
+) -> PyResult<Py<PyAny>> {
+    let store = check_storage_dtype(op, input.tag())?;
+    let mut shape = a.shape.clone();
+    let mut stride = contiguous_strides(&a.shape);
+    shape.swap(d0, d1);
+    stride.swap(d0, d1);
+    materialise_view(py, op, input, a, store, shape, stride, 0)
+}
+
+/// Refuse an index whose recorded range falls outside `[0, extent)`.
+///
+/// `exact_refusal` is upstream's error for the op, given the offending value;
+/// when the range was **inherited** (the index tensor is a view of another)
+/// the refusal says so and gives the bound, rather than claiming a value it
+/// cannot have read.
+fn check_index_range(
+    op: &str,
+    idx: &VkTensor,
+    extent: usize,
+    count: usize,
+    exact_refusal: impl Fn(i64) -> PyErr,
+) -> PyResult<()> {
+    // `None` can only mean a buffer that no int64 upload or view filled,
+    // which nothing in this module produces -- so it refuses rather than
+    // guessing a range.
+    let Some(range) = idx.buffer.index_range.get() else {
+        return Err(not_implemented(format!(
+            "{op}: this index tensor carries no recorded range, so its values \
+             cannot be checked against the table without reading the device \
+             back. Copy the indices to the vulkan device with .to(\"vulkan\") \
+             (docs/devices/VULKAN6.md §2)."
+        )));
+    };
+    if count == 0 || (range.lo >= 0 && range.hi < extent as i64) {
+        return Ok(());
+    }
+    let bad = if range.lo < 0 { range.lo } else { range.hi };
+    if range.exact {
+        return Err(exact_refusal(bad));
+    }
+    Err(pyo3::exceptions::PyIndexError::new_err(format!(
+        "{op}: this index tensor is a view of another, and the only bound on its \
+         values this device holds without reading it back is the one inherited \
+         from that source: [{}, {}]. {bad} is not in [0, {extent}), so the \
+         indices cannot be shown to be in range and are not gathered. Its own \
+         values may all be in range; upload them directly with .to(\"vulkan\") \
+         to record their exact range (docs/devices/VULKAN7.md §3).",
+        range.lo, range.hi
+    )))
+}
+
+/// `aten::gather(self, dim, index, *, sparse_grad=False)`.
+///
+/// `sparse_grad` is an autograd hint, like `embedding`'s trailing flags, and
+/// the test asks upstream for the same answer with it set. The shape checks
+/// are the dense kernel's (`aten.rs::gather_default`), in upstream's words.
+fn gather_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let dim_raw = crate::aten::dim_arg(args, kwargs, 1, "dim")?
+        .ok_or_else(|| crate::aten::missing(op, "dim"))?;
+    let index = crate::aten::tensor_arg(op, args, kwargs, 2, "index")?;
+    let _sparse_grad = crate::aten::bool_arg(args, kwargs, 3, "sparse_grad")?;
+    let store = check_storage_dtype(op, input.tag())?;
+    if index.tag() != TorchDType::Int64 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "gather(): Expected dtype int32/int64 for index -- and the vulkan \
+             device holds int64 indices only (stored as int32, \
+             docs/devices/VULKAN6.md §1), not {}",
+            index.tag().name()
+        )));
+    }
+    let a = input.vk_tensor(op)?.clone();
+    let idx = index.vk_tensor(op)?.clone();
+    // `ensure_nonempty_dim`: a 0-d tensor counts as one axis of extent 1.
+    let self_dims = if a.shape.is_empty() { vec![1] } else { a.shape.clone() };
+    let idx_dims = if idx.shape.is_empty() { vec![1] } else { idx.shape.clone() };
+    if idx_dims.len() != self_dims.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as input tensor",
+        ));
+    }
+    let dim = crate::aten::normalise_dim(op, dim_raw, a.shape.len())?;
+    for d in 0..self_dims.len() {
+        if d != dim && idx_dims[d] > self_dims[d] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Size does not match at dimension {d} expected index {idx_dims:?} \
+                 to be no larger than self {self_dims:?} apart from dimension {dim}"
+            )));
+        }
+    }
+    check_view_rank(op, self_dims.len())?;
+    let n = idx.elem_count();
+    let extent = self_dims[dim];
+    check_index_range(op, &idx, extent, n, |bad| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index {bad} is out of bounds for dimension {dim} with size {extent}"
+        ))
+    })?;
+    let n32 = shader_u32(op, "output element count", n)?;
+    shader_u32(op, "source element count", a.elem_count())?;
+    let mut push = vec![n32, self_dims.len() as u32, dim as u32, 0];
+    let mut dims = [0u32; VIEW_RANK_MAX];
+    let mut strides = [0u32; VIEW_RANK_MAX];
+    for (d, (&e, s)) in idx_dims.iter().zip(contiguous_strides(&self_dims)).enumerate() {
+        dims[d] = e as u32;
+        strides[d] = s as u32;
+    }
+    push.extend_from_slice(&dims);
+    push.extend_from_slice(&strides);
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel_words(
+                "gather_u32_i32",
+                GATHER_U32_I32_SPV,
+                &[&a.buffer, &idx.buffer, &out],
+                &push,
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    inherit_range(store, &a.buffer, &out);
+    wrap(py, out, idx.shape.clone(), input.tag())
+}
+
+/// The strides of `shape` right-aligned into `out`, 0 where it broadcasts.
+fn broadcast_strides(shape: &[usize], out: &[usize]) -> Vec<usize> {
+    let lead = out.len() - shape.len();
+    let own = contiguous_strides(shape);
+    (0..out.len())
+        .map(|d| {
+            if d < lead || (shape[d - lead] == 1 && out[d] != 1) {
+                0
+            } else {
+                own[d - lead]
+            }
+        })
+        .collect()
+}
+
+/// `add`/`sub`/`mul`/`div` `.Tensor` over unequal, broadcastable shapes, in
+/// one dispatch (docs/devices/VULKAN7.md §3.2).
+///
+/// What upstream refuses -- a pair of extents that are neither equal nor 1 --
+/// refuses here in upstream's words (`aten.rs::broadcast_shape`), before any
+/// GPU work.
+fn broadcast_binary(
+    py: Python<'_>,
+    op: &str,
+    lhs: &PyTensorBase,
+    a: &VkTensor,
+    b: &VkTensor,
+) -> PyResult<Py<PyAny>> {
+    let which = match op {
+        "aten.add.Tensor" => 0u32,
+        "aten.sub.Tensor" => 1,
+        "aten.mul.Tensor" => 2,
+        "aten.div.Tensor" => 3,
+        other => {
+            return Err(not_implemented(format!(
+                "{other}: the vulkan broadcast kernel implements add, sub, mul and div"
+            )))
+        }
+    };
+    let shape = crate::aten::broadcast_shape(op, &a.shape, &b.shape)?;
+    check_view_rank(op, shape.len())?;
+    let n = shape.iter().product::<usize>();
+    let n32 = shader_u32(op, "output element count", n)?;
+    shader_u32(op, "operand element count", a.elem_count().max(b.elem_count()))?;
+    let sa = broadcast_strides(&a.shape, &shape);
+    let sb = broadcast_strides(&b.shape, &shape);
+    let mut push = vec![n32, shape.len() as u32, which, 0];
+    let mut dims = [0u32; VIEW_RANK_MAX];
+    let mut stride_a = [0u32; VIEW_RANK_MAX];
+    let mut stride_b = [0u32; VIEW_RANK_MAX];
+    for d in 0..shape.len() {
+        dims[d] = shape[d] as u32;
+        stride_a[d] = sa[d] as u32;
+        stride_b[d] = sb[d] as u32;
+    }
+    push.extend_from_slice(&dims);
+    push.extend_from_slice(&stride_a);
+    push.extend_from_slice(&stride_b);
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel_words(
+                "broadcast_binary_f32",
+                BROADCAST_BINARY_F32_SPV,
+                &[&a.buffer, &b.buffer, &out],
+                &push,
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    wrap(py, out, shape, lhs.tag())
+}
+
+/// A batch of matrices, broadcast to `batch` leading dimensions and made
+/// contiguous: the operand itself when nothing needs to move, otherwise one
+/// strided copy.
+fn broadcast_batch(
+    op: &str,
+    t: &VkTensor,
+    batch: &[usize],
+) -> PyResult<(Arc<VkBuffer>, bool)> {
+    let r = t.shape.len();
+    let mut want = batch.to_vec();
+    want.extend_from_slice(&t.shape[r - 2..]);
+    if want == t.shape {
+        return Ok((t.buffer.clone(), false));
+    }
+    check_view_rank(op, want.len())?;
+    let stride = broadcast_strides(&t.shape, &want);
+    let n = want.iter().product::<usize>();
+    let n32 = shader_u32(op, "broadcast operand element count", n)?;
+    let mut push = vec![n32, want.len() as u32, 0, 0];
+    let mut dims = [0u32; VIEW_RANK_MAX];
+    let mut strides = [0u32; VIEW_RANK_MAX];
+    for d in 0..want.len() {
+        dims[d] = want[d] as u32;
+        strides[d] = stride[d] as u32;
+    }
+    push.extend_from_slice(&dims);
+    push.extend_from_slice(&strides);
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel_words(
+                "strided_gather_u32",
+                STRIDED_GATHER_U32_SPV,
+                &[&t.buffer, &t.buffer, &out],
+                &push,
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    Ok((Arc::new(out), true))
+}
+
+/// `aten::matmul(self, other)` with upstream's rank rules: a 1-D operand is a
+/// row (left) or column (right) that is removed from the result, and batch
+/// dimensions broadcast. The product itself is the `bmm` kernel over the
+/// flattened batch -- every tensor here is contiguous, so the flattening moves
+/// no bytes -- and a broadcast batch is materialised first, one strided copy
+/// per operand that needs it.
+fn matmul_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let lhs = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let rhs = crate::aten::tensor_arg(op, args, kwargs, 1, "other")?;
+    check_all_f32(op, &[&lhs, &rhs])?;
+    let a0 = lhs.vk_tensor(op)?.clone();
+    let b0 = rhs.vk_tensor(op)?.clone();
+    let runtime = |m: String| pyo3::exceptions::PyRuntimeError::new_err(m);
+    let (ra, rb) = (a0.shape.len(), b0.shape.len());
+    if ra == 0 || rb == 0 {
+        return Err(runtime(format!(
+            "both arguments to matmul need to be at least 1D, but they are {ra}D and {rb}D"
+        )));
+    }
+    // Promote a vector to a matrix, remembering to drop the axis afterwards.
+    let a = VkTensor {
+        buffer: a0.buffer.clone(),
+        shape: if ra == 1 { vec![1, a0.shape[0]] } else { a0.shape.clone() },
+    };
+    let b = VkTensor {
+        buffer: b0.buffer.clone(),
+        shape: if rb == 1 { vec![b0.shape[0], 1] } else { b0.shape.clone() },
+    };
+    let (m, k) = (a.shape[a.shape.len() - 2], a.shape[a.shape.len() - 1]);
+    let (k2, n) = (b.shape[b.shape.len() - 2], b.shape[b.shape.len() - 1]);
+    if k != k2 {
+        return Err(runtime(if ra <= 2 && rb <= 2 {
+            format!("mat1 and mat2 shapes cannot be multiplied ({m}x{k} and {k2}x{n})")
+        } else {
+            format!(
+                "Expected size for first two dimensions of batch2 tensor to be: \
+                 [*, {k}] but got: [*, {k2}]."
+            )
+        }));
+    }
+    let batch_a = &a.shape[..a.shape.len() - 2];
+    let batch_b = &b.shape[..b.shape.len() - 2];
+    let batch = crate::aten::broadcast_shape(op, batch_a, batch_b)
+        .map_err(|e| runtime(e.to_string().trim_start_matches(&format!("{op}: ")).to_string()))?;
+    check_view_rank(op, batch.len() + 2)?;
+    let flat: usize = batch.iter().product();
+    let count = flat * m * n;
+    let count32 = shader_u32(op, "output element count", count)?;
+    shader_u32(op, "operand element count", (flat * m * k).max(flat * k * n))?;
+    let (abuf, _) = broadcast_batch(op, &a, &batch)?;
+    let (bbuf, _) = broadcast_batch(op, &b, &batch)?;
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(count.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if count > 0 {
+            ctx.dispatch_kernel(
+                "bmm_f32",
+                BMM_F32_SPV,
+                &[&abuf, &bbuf, &out],
+                [count32, m as u32, k as u32, n as u32],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    let mut shape = batch;
+    if ra > 1 {
+        shape.push(m);
+    }
+    if rb > 1 {
+        shape.push(n);
+    }
+    wrap(py, out, shape, lhs.tag())
 }

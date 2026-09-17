@@ -1,0 +1,56 @@
+#version 450
+
+// Materialise a view: `slice`, `select`, `expand` and a `transpose` of any
+// pair, on a tensor of rank up to 8 -- `docs/devices/VULKAN7.md`.
+//
+// out[i] = src[base + sum_d coord_d(i) * stride[d]]
+//
+// where coord(i) is the row-major multi-index of `i` in the *output* shape and
+// `stride` is the view's stride into the (always contiguous) source buffer.
+// Every view op on this device is that formula with a different `(shape,
+// stride, base)`, which `vulkan.rs` derives the way upstream's own view
+// functions derive theirs: `slice` moves `base` and multiplies one stride,
+// `select` moves `base` and drops an axis, `expand` sets a grown axis's stride
+// to 0, and `transpose` swaps two entries.
+//
+// **The words are `uint`, not `float`, on purpose.** No arithmetic touches the
+// payload -- it is copied -- so one kernel serves both storage classes this
+// device has: a float32 and an int32 index word are the same four bytes to it,
+// and neither is reinterpreted on the way (a float copy is allowed to
+// canonicalise a NaN payload; a `uint` copy is not). That is what lets BERT's
+// int64 `position_ids` be sliced on the device, and it is why the result is
+// bit-identical to upstream by construction.
+//
+// No bounds check here, for the reason `embedding_i32_f32.comp` gives: a
+// shader cannot raise. `vulkan.rs` checks that every offset this can form fits
+// the source, and that every count fits a `uint`, before dispatching.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { uint a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { uint unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { uint c[]; };
+
+// 80 bytes -- inside the 128 every Vulkan device must accept for push
+// constants (maxPushConstantsSize's required minimum).
+layout(push_constant, std430) uniform Push {
+    uint n;          // output elements
+    uint rank;       // 0..=8
+    uint base;       // offset of output element 0 in the source
+    uint unused;
+    uint shape[8];   // output shape, row-major
+    uint stride[8];  // source stride per output axis (0 for an expanded one)
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint rem = i;
+    uint src = pc.base;
+    for (int d = int(pc.rank) - 1; d >= 0; --d) {
+        uint e = pc.shape[d];
+        src += (rem % e) * pc.stride[d];
+        rem /= e;
+    }
+    c[i] = a[src];
+}

@@ -2996,23 +2996,7 @@ fn meta_table(
             let requested = shape_arg(op, args, kwargs, 1, "size")?;
             let dims = input.dims().to_vec();
             let target = expand_target(op, &dims, &requested)?;
-            let offset = target.len() - dims.len();
-            for (i, &want) in target.iter().enumerate().skip(offset) {
-                let have = dims[i - offset];
-                if have != want && have != 1 {
-                    // `requested` and not `target`: upstream prints the sizes
-                    // as they were *asked for*, `-1` sentinels included --
-                    // `expand(zeros(2,1,3), [2,4,3,-1])` reports
-                    // `Target sizes: [2, 4, 3, -1]`, measured. Printing the
-                    // resolved list instead would name a size the caller
-                    // never wrote.
-                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "The expanded size of the tensor ({want}) must match the existing \
-                         size ({have}) at non-singleton dimension {i}.  Target sizes: \
-                         {requested:?}.  Tensor sizes: {dims:?}"
-                    )));
-                }
-            }
+            check_expand_extents(&dims, &target, &requested)?;
             // A view: grown axes get stride 0 (`layout::expand_stride`).
             let (shape, stride, offset) = meta_layout_of(op, &input)?;
             let strides = crate::layout::expand_stride(&shape, &stride, &target);
@@ -11978,10 +11962,16 @@ fn masked_select_default(
 /// either side. The refusal reproduces upstream's wording, which names both
 /// extents and the axis -- a bare "shapes do not match" would make a broadcast
 /// mistake much harder to place.
-fn broadcast_shape(op: &str, lhs: &[usize], rhs: &[usize]) -> PyResult<Vec<usize>> {
+///
+/// **Right to left**, as upstream's `infer_size` walks: when more than one
+/// axis disagrees, upstream names the *last* one -- `[2, 3] + [3, 2]` reports
+/// "a (3) ... b (2) at non-singleton dimension 1". This walked left to right
+/// and named dimension 0 instead, which docs/devices/VULKAN7.md found by
+/// comparing the whole message with upstream's rather than a substring.
+pub(crate) fn broadcast_shape(op: &str, lhs: &[usize], rhs: &[usize]) -> PyResult<Vec<usize>> {
     let rank = lhs.len().max(rhs.len());
     let mut out = vec![0usize; rank];
-    for i in 0..rank {
+    for i in (0..rank).rev() {
         let a = if i < rank - lhs.len() {
             1
         } else {
@@ -14138,7 +14128,37 @@ pub(crate) fn shape_arg(
 /// `broadcast_as`, and the meta path, which has no candle handle to hand to
 /// `broadcast_as`, does it itself with upstream's wording. That split is
 /// recorded in docs/devices/META.md §7.2 rather than hidden.
-fn expand_target(op: &str, dims: &[usize], requested: &[isize]) -> PyResult<Vec<usize>> {
+/// `expand`'s extent rule, for the two kernels that have no `broadcast_as` to
+/// get it from: meta (no candle handle) and vulkan (no candle tensor at all).
+///
+/// A zero extent is *not* singleton for this rule -- `expand(zeros(0, 3), [2,
+/// 3])` raises upstream, naming dimension 0 -- which is the case a `!= 1`
+/// written as `<= 1` would silently accept.
+pub(crate) fn check_expand_extents(
+    dims: &[usize],
+    target: &[usize],
+    requested: &[isize],
+) -> PyResult<()> {
+    let offset = target.len() - dims.len();
+    for (i, &want) in target.iter().enumerate().skip(offset) {
+        let have = dims[i - offset];
+        if have != want && have != 1 {
+            // `requested` and not `target`: upstream prints the sizes as they
+            // were *asked for*, `-1` sentinels included --
+            // `expand(zeros(2,1,3), [2,4,3,-1])` reports
+            // `Target sizes: [2, 4, 3, -1]`, measured. Printing the resolved
+            // list instead would name a size the caller never wrote.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "The expanded size of the tensor ({want}) must match the existing \
+                 size ({have}) at non-singleton dimension {i}.  Target sizes: \
+                 {requested:?}.  Tensor sizes: {dims:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn expand_target(op: &str, dims: &[usize], requested: &[isize]) -> PyResult<Vec<usize>> {
     if requested.len() < dims.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expand(torch._C.TensorBase{dims:?}, size={requested:?}): the number of \
@@ -16665,7 +16685,7 @@ fn local_scalar_dense(
 }
 
 /// torch's negative-index convention for a single position along `dim`.
-fn normalise_index(op: &str, index: isize, extent: usize) -> PyResult<usize> {
+pub(crate) fn normalise_index(op: &str, index: isize, extent: usize) -> PyResult<usize> {
     let signed = extent as isize;
     let resolved = if index < 0 { index + signed } else { index };
     if resolved < 0 || resolved >= signed {
@@ -25144,7 +25164,7 @@ pub(crate) fn dtype_arg(
     }
 }
 
-fn int_arg(
+pub(crate) fn int_arg(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
@@ -25181,7 +25201,7 @@ pub(crate) fn bool_arg(
 }
 
 /// torch's negative-dimension convention, with torch's error message shape.
-fn normalise_dim(op: &str, dim: isize, rank: usize) -> PyResult<usize> {
+pub(crate) fn normalise_dim(op: &str, dim: isize, rank: usize) -> PyResult<usize> {
     // torch treats a zero-dim tensor as one-dimensional for indexing purposes.
     let extent = rank.max(1) as isize;
     let index = if dim < 0 { dim + extent } else { dim };

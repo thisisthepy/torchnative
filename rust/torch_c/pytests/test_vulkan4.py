@@ -557,6 +557,19 @@ EXPECTED_DISPATCHES = {
     "aten.embedding.default": (1, 2),
     "aten.mul.Scalar": (1, 1),
     "aten.div.Scalar": (1, 1),
+    # docs/devices/VULKAN7.md -- the pretrained-BERT wall. The three view ops
+    # materialise through one strided-gather shader each (a `VkTensor` has no
+    # strides), `gather` is its own shader, and `tanh` is one elementwise pass.
+    # The arguments below are chosen so none of them is an identity view,
+    # which is the one case these dispatch nothing for.
+    "aten.slice.Tensor": (1, 1),
+    "aten.select.int": (1, 1),
+    "aten.expand.default": (1, 1),
+    "aten.gather.default": (1, 2),
+    "aten.tanh.default": (1, 1),
+    # The shim keeps `matmul` whole (docs/devices/VULKAN4.md §2.1); with equal
+    # batch dimensions it is one batched-product pass.
+    "aten.matmul.default": (1, 2),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -605,7 +618,7 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
         f"missing from this table: {sorted(taught - set(EXPECTED_DISPATCHES) - {'aten._to_copy.default'})}")
 
     for op, (expected, arity) in sorted(EXPECTED_DISPATCHES.items()):
-        if op == "aten.mm.default":
+        if op in ("aten.mm.default", "aten.matmul.default"):
             args = (a, sq)
         elif op == "aten.addmm.default":
             args = (bias, a, sq)
@@ -621,6 +634,14 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
             args = (a, _to_vulkan(_i64([0, 1], [2])))
         elif op in ("aten.mul.Scalar", "aten.div.Scalar"):
             args = (a, 2.0)
+        elif op == "aten.slice.Tensor":
+            args = (a, 1, 1, 3)
+        elif op == "aten.select.int":
+            args = (a, 0, 1)
+        elif op == "aten.expand.default":
+            args = (a, [4, 2, 3])
+        elif op == "aten.gather.default":
+            args = (a, 1, _to_vulkan(_i64([2, 0, 1, 1], [2, 2])))
         elif op in ("aten.view.default", "aten._unsafe_view.default",
                     "aten.reshape.default"):
             args = (a, [6])
@@ -811,52 +832,44 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
 
 
 def test_the_transformer_wall_moved_and_the_new_one_is_named():
-    """The wall was `embedding`. It is not any more, and this says what is.
+    """The wall was `embedding`, then five ops and a 4-D transpose. Both are gone.
 
-    `docs/devices/VULKAN5.md` §4 said no transformer reached its *second* op,
-    because `embedding` is the first and its index operand is int64 on a device
-    that stored float32 only. That is closed (docs/devices/VULKAN6.md), and a
-    transformer block really does forward -- see
-    `test_a_transformer_block_forwards_on_the_gpu_and_agrees_with_upstream`.
+    `docs/devices/VULKAN5.md` §4 said no transformer reached its *second* op;
+    `docs/devices/VULKAN6.md` §3 closed that and named what stopped a
+    *pretrained* BERT next: `expand`, `slice`, `gather`, `select`, `tanh`, and
+    `transpose.int` on 4-D (batch, head, seq, dim) tensors.
+    `docs/devices/VULKAN7.md` teaches all six, and
+    `test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream` is
+    the evidence that the list was the whole wall rather than its first
+    layer.
 
-    What stops a *pretrained* BERT is now further in, and this test pins it so
-    the sentence in the docs cannot go stale in either direction: the ops below
-    are on the measured trace of a shrunk BERT forward (VULKAN6.md §3, 18 op
-    kinds), are not taught, and refuse by name. A round that teaches one fails
-    here and gets to update the sentence.
+    This pins the list in both directions: every op VULKAN6 named is taught,
+    and a 4-D transpose -- which VULKAN6 asserted *refused* -- now runs one
+    shader. A round that drops any of them fails here.
     """
     if _vulkan_or_skip("the named transformer wall") is None:
         return
     taught = set(_C._vulkan_ops())
-    # Taught now -- dropping any of them fails here too.
     landed = ("aten.native_layer_norm.default", "aten._softmax.default",
               "aten.gelu.default", "aten.bmm.default",
-              "aten.embedding.default", "aten.div.Scalar")
+              "aten.embedding.default", "aten.div.Scalar",
+              # docs/devices/VULKAN6.md §3.1's wall, in its order.
+              "aten.expand.default", "aten.slice.Tensor", "aten.gather.default",
+              "aten.select.int", "aten.tanh.default",
+              # ...and the one VULKAN6.md's trace could not see: the shim keeps
+              # matmul whole (docs/devices/VULKAN7.md §3.2).
+              "aten.matmul.default")
     assert all(op in taught for op in landed), sorted(set(landed) - taught)
 
-    # Still missing, in the order the BERT trace of docs/devices/VULKAN6.md §3
-    # counts them: expand 10, slice 1, gather 1, select 1, tanh 1.
-    walls = ("aten.expand.default", "aten.slice.Tensor", "aten.gather.default",
-             "aten.select.int", "aten.tanh.default")
-    still = [op for op in walls if op not in taught]
-    assert still == list(walls), (
-        f"these are taught now and docs/devices/VULKAN6.md §3 needs updating: "
-        f"{sorted(set(walls) - set(still))}")
+    a4 = _to_vulkan(_cpu([float(i) for i in range(16)], [2, 2, 2, 2]))
+    before = _counters()
+    out = _C._aten_dispatch("aten.transpose.int", a4, 1, 2)
+    d = _delta(before, _counters())
+    assert list(out.shape) == [2, 2, 2, 2], out.shape
+    assert d["shader_dispatches"] == 1 and d["host_downloads"] == 0, d
 
-    # And the rank the transpose still refuses. BERT's ten `transpose.int`
-    # calls are on 4-D tensors (batch, head, seq, dim); this round taught the
-    # 3-D case only, which is what a single-head block needs.
-    a4 = _to_vulkan(_cpu([1.0] * 16, [2, 2, 2, 2]))
-    try:
-        _C._aten_dispatch("aten.transpose.int", a4, 1, 2)
-    except NotImplementedError as e:
-        assert "4-D" in str(e), str(e)
-    else:
-        raise AssertionError("a 4-D transpose was permuted instead of refused")
-
-    # `embedding`'s wall was int64 *storage*, and it is the one thing here that
-    # moved rather than being taught: an index tensor now lands, and what it
-    # cannot hold refuses with the bound named (docs/devices/VULKAN6.md §1).
+    # `embedding`'s wall was int64 *storage*; an index tensor still lands, and
+    # what it cannot hold still refuses with the bound named (VULKAN6.md §1).
     idx = _to_vulkan(_i64([0, 1], [2]))
     assert str(idx.device) == "vulkan" and str(idx.dtype) == "torch.int64", (
         idx.device, idx.dtype)
@@ -880,15 +893,16 @@ def test_every_narrowing_refuses_by_name_rather_than_being_emulated():
     a23 = _to_vulkan(_cpu([1.0] * 6, [2, 3]))
     a32 = _to_vulkan(_cpu([1.0] * 6, [3, 2]))
     a3d = _to_vulkan(_cpu([1.0] * 8, [2, 2, 2]))
+    a9d = _to_vulkan(_cpu([1.0] * 2, [2] + [1] * 8))
     bias = _to_vulkan(_cpu([1.0, 1.0], [2]))
 
     cases = (
-        ("broadcast", lambda: _C._aten_dispatch("aten.add.Tensor", a23, a32),
-         "broadcast"),
+        ("non-broadcastable", lambda: _C._aten_dispatch("aten.add.Tensor", a23, a32),
+         "must match the size"),
         ("alpha", lambda: _C._aten_dispatch("aten.add.Tensor", a23, a23, 2.0),
          "alpha"),
-        ("3-D transpose",
-         lambda: _C._aten_dispatch("aten.transpose.int", a3d, 0, 1), "2-D"),
+        ("rank-9 transpose",
+         lambda: _C._aten_dispatch("aten.transpose.int", a9d, 0, 1), "rank"),
         ("batched matmul",
          lambda: _C._aten_dispatch("aten.mm.default", a3d, a3d), "2-D"),
         ("addmm beta",
@@ -1559,7 +1573,7 @@ def test_embedding_refuses_the_operands_it_does_not_implement():
         assert d["shader_dispatches"] == 0, (what, d)
 
 
-def test_the_batched_transpose_is_bit_identical_and_every_other_permutation_refuses():
+def test_the_batched_transpose_is_bit_identical_and_a_rank_above_the_bound_refuses():
     """`k.transpose(1, 2)` -- the op between an attention block's two `bmm`s.
 
     Measured, not chosen: with `embedding` taught and this not, a transformer
@@ -1597,18 +1611,19 @@ def test_the_batched_transpose_is_bit_identical_and_every_other_permutation_refu
         neg = _C._aten_dispatch("aten.transpose.int", xv, -1, -2)
         assert [_bits(v) for v in _flat(_to_cpu(neg))] == [_bits(v) for v in want]
 
-    a3 = _to_vulkan(_cpu([1.0] * 8, [2, 2, 2]))
-    a4 = _to_vulkan(_cpu([1.0] * 16, [2, 2, 2, 2]))
-    for what, args in (("3-D (0,1)", (a3, 0, 1)), ("3-D (0,2)", (a3, 0, 2)),
-                       ("4-D (1,2)", (a4, 1, 2))):
-        before = _counters()
-        try:
-            _C._aten_dispatch("aten.transpose.int", *args)
-        except NotImplementedError as e:
-            assert "refuse" in str(e) or "was asked for" in str(e), str(e)
-        else:
-            raise AssertionError(f"{what} was permuted instead of refused")
-        assert _delta(before, _counters())["shader_dispatches"] == 0, what
+    # docs/devices/VULKAN7.md: every other pair and rank up to the stated
+    # bound is taught now (through the strided gather, one shader each), so
+    # what is left to refuse is a rank above that bound -- by name, before any
+    # GPU work.
+    a9 = _to_vulkan(_cpu([1.0] * 2, [2] + [1] * 8))
+    before = _counters()
+    try:
+        _C._aten_dispatch("aten.transpose.int", a9, 0, 8)
+    except NotImplementedError as e:
+        assert "rank" in str(e) and "8" in str(e), str(e)
+    else:
+        raise AssertionError("a rank-9 transpose was permuted instead of refused")
+    assert _delta(before, _counters())["shader_dispatches"] == 0
 
 
 def test_the_scalar_ops_are_bit_identical_and_the_divide_stayed_a_divide():
@@ -1832,6 +1847,705 @@ def test_a_transformer_block_forwards_on_the_gpu_and_agrees_with_upstream():
           f"({vk_err / up_err:.2f}x), vulkan-vs-cpu {backends / ulp:.2f} ulp, "
           f"{counters['shader_dispatches']} shaders, "
           f"{counters['host_downloads']} readbacks")
+
+
+# ---------------------------------------------------------------------------
+# 11. The pretrained-BERT wall (docs/devices/VULKAN7.md)
+# ---------------------------------------------------------------------------
+
+def _vk_like(torch, x):
+    """An upstream tensor's values, on the shim's vulkan device, same dtype."""
+    shape = list(x.shape)
+    flat = x.reshape(-1).tolist()
+    if x.dtype == torch.int64:
+        return _to_vulkan(_i64(flat, shape))
+    assert x.dtype == torch.float32, x.dtype
+    return _to_vulkan(_cpu(flat, shape))
+
+
+def _bit_mismatches(got, want):
+    """Positions where the shim's answer is not upstream's, bit for bit.
+
+    Floats are compared by their bit pattern, integers by value; a float
+    compared with `==` would call -0.0 and 0.0 the same, and NaN different
+    from itself.
+    """
+    got = _flat(got)
+    want = want.reshape(-1).tolist()
+    assert len(got) == len(want), (len(got), len(want))
+    if want and isinstance(want[0], float):
+        return [i for i, (a, b) in enumerate(zip(got, want)) if _bits(a) != _bits(b)]
+    return [i for i, (a, b) in enumerate(zip(got, want)) if int(a) != int(b)]
+
+
+# (label, input shape, dtype, op, args, expected shader count)
+#
+# Every case asks upstream's own `torch.ops.aten.<op>` the same question, so
+# the clamping of `slice`, the `-1` of `expand` and the negative dims and
+# indices are upstream's answers rather than this file's reading of them.
+# Zero shaders is claimed for exactly two shapes of case: an identity view
+# (the output *is* the input, and the buffer is shared -- safe because no op
+# on this device writes in place) and an empty result.
+VIEW_CASES = (
+    ("slice bert position_ids", [1, 512], "i64", "slice.Tensor", (1, 0, 7), 1),
+    ("slice f32 [2,512] 0:7", [2, 512], "f32", "slice.Tensor", (1, 0, 7), 1),
+    ("slice step 2 neg", [4, 5, 6], "f32", "slice.Tensor", (-1, 1, -1, 2), 1),
+    ("slice clamps", [4, 5], "f32", "slice.Tensor", (0, -10, 100, 3), 1),
+    ("slice inner dim", [3, 4, 5], "f32", "slice.Tensor", (1, 1, 3), 1),
+    ("slice empty", [3, 4], "f32", "slice.Tensor", (1, 3, 1), 0),
+    ("slice identity", [2, 3, 4, 5], "f32", "slice.Tensor", (2, 0, 2 ** 63 - 1), 0),
+    ("select pooler", [2, 7, 8], "f32", "select.int", (1, 0), 1),
+    ("select neg", [5, 3], "f32", "select.int", (0, -1), 1),
+    ("select to 0-d", [4], "f32", "select.int", (0, 2), 1),
+    ("select i64", [3, 4], "i64", "select.int", (1, 3), 1),
+    ("expand bert token_type", [1, 512], "i64", "expand.default", ([2, -1],), 1),
+    ("expand lead dims", [3, 1], "f32", "expand.default", ([2, 3, 4],), 1),
+    ("expand middle", [2, 1, 4], "f32", "expand.default", ([2, 3, 4],), 1),
+    ("expand 0-d", [], "f32", "expand.default", ([3, 2],), 1),
+    ("expand identity", [2, 3], "f32", "expand.default", ([2, -1],), 0),
+    ("transpose 4-D (1,2)", [2, 4, 7, 16], "f32", "transpose.int", (1, 2), 1),
+    ("transpose 4-D (2,3)", [2, 4, 7, 16], "f32", "transpose.int", (2, 3), 1),
+    ("transpose 4-D (-1,-2)", [2, 4, 7, 5], "f32", "transpose.int", (-1, -2), 1),
+    ("transpose 4-D (0,3)", [2, 3, 4, 5], "f32", "transpose.int", (0, 3), 1),
+    ("transpose 5-D (1,3)", [2, 3, 4, 5, 6], "f32", "transpose.int", (1, 3), 1),
+    ("transpose 3-D (0,2)", [3, 4, 5], "f32", "transpose.int", (0, 2), 1),
+    ("transpose 3-D (0,1)", [3, 4, 5], "f32", "transpose.int", (0, 1), 1),
+    ("transpose i64 4-D", [2, 3, 2, 2], "i64", "transpose.int", (1, 3), 1),
+)
+
+
+def test_the_view_ops_are_bit_identical_to_upstream_and_ran_on_the_gpu():
+    """`slice`, `select`, `expand` and any-rank `transpose`, against upstream.
+
+    No tolerance: these move bytes and do no arithmetic, so the only right
+    answer is upstream's bits. Both storage classes are covered -- the shader
+    reads and writes `uint` words, so a float32 and an int32 index word travel
+    the same way -- and the int64 cases are exactly the two BERT runs on its
+    `position_ids` and `token_type_ids` buffers.
+
+    The device half is the counter delta, per case. A host twin of any of these
+    would produce the same bits (VULKAN6.md §6 D5 is that exact experiment for
+    `embedding`); it would not produce `shader_dispatches == 1` with
+    `host_downloads == 0`.
+
+    **Why the values are random and distinct.** A copy that read the wrong
+    source position -- a stride off by one axis -- is invisible on a tensor of
+    ones. `discriminating` counts the cases whose output would change under
+    the most likely such bug (reading the input front to back, i.e. ignoring
+    the view), and refuses to pass if that count is zero.
+    """
+    if _vulkan_or_skip("the view-op sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    discriminating = 0
+    for n, (label, shape, kind, op, args, shaders) in enumerate(VIEW_CASES):
+        g = torch.Generator().manual_seed(7000 + n)
+        if kind == "i64":
+            count = 1
+            for e in shape:
+                count *= e
+            x = torch.randperm(max(count, 1), generator=g)[:count].reshape(shape)
+        else:
+            x = torch.randn(shape, generator=g, dtype=torch.float32)
+        name, overload = op.split(".")
+        want = getattr(getattr(torch.ops.aten, name), overload)(x, *args).contiguous()
+        xv = _vk_like(torch, x)
+        before = _counters()
+        out = _C._aten_dispatch(f"aten.{op}", xv, *args)
+        d = _delta(before, _counters())
+        assert str(out.device) == "vulkan", (label, out.device)
+        assert list(out.shape) == list(want.shape), (label, out.shape, want.shape)
+        assert str(out.dtype) == str(want.dtype), (label, out.dtype, want.dtype)
+        assert d["shader_dispatches"] == shaders, (
+            f"{label}: {d['shader_dispatches']} shaders, expected {shaders}: {d}")
+        assert d["host_downloads"] == 0 and d["host_uploads"] == 0, (label, d)
+        off = _bit_mismatches(_to_cpu(out), want)
+        assert not off, (
+            f"{label}: {len(off)} of {want.numel()} elements differ from "
+            f"upstream's bits, first at {off[:5]}")
+        # An `expand` output is larger than its input, so a front-to-back copy
+        # would run off the end -- which the bit check above catches too.
+        if want.numel() > x.numel():
+            discriminating += 1
+        else:
+            front = x.reshape(-1)[:want.numel()].reshape(want.shape)
+            discriminating += int(want.numel() > 1 and not torch.equal(front, want))
+    assert discriminating >= 15, (
+        f"only {discriminating} cases distinguish a view from a front-to-back "
+        f"copy of its input; the sweep cannot catch a stride error")
+    print(f"   {len(VIEW_CASES)} view cases bit-identical to upstream; "
+          f"{discriminating} of them would catch a copy that ignored the view")
+
+
+# (label, self shape, dtype, dim, index shape)
+GATHER_CASES = (
+    ("bert token_type", [2, 512], "i64", 1, [2, 7]),
+    ("f32 dim1 narrower", [3, 5], "f32", 1, [3, 4]),
+    ("f32 dim1 smaller rows", [3, 5], "f32", 1, [2, 9]),
+    ("f32 3-D dim0", [4, 3, 2], "f32", 0, [2, 3, 2]),
+    ("f32 3-D dim -1", [4, 3, 2], "f32", -1, [4, 1, 2]),
+    ("f32 4-D dim2", [2, 3, 5, 4], "f32", 2, [2, 2, 6, 3]),
+    ("i64 1-D repeats", [6], "i64", 0, [10]),
+)
+
+
+def test_gather_is_bit_identical_to_upstream_and_ran_on_the_gpu():
+    """`torch.gather` on the device, both storage classes, against upstream.
+
+    BERT's embeddings call it on the int64 `token_type_ids` buffer, indexed by
+    the int64 `position_ids` -- so this op both reads an index buffer and, for
+    that case, *produces* one. The produced one is checked by value here, and
+    by use (it feeds `embedding`) in the BERT forward.
+    """
+    if _vulkan_or_skip("the gather sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for n, (label, shape, kind, dim, ishape) in enumerate(GATHER_CASES):
+        g = torch.Generator().manual_seed(8100 + n)
+        if kind == "i64":
+            x = torch.randint(-50, 50, shape, generator=g, dtype=torch.int64)
+        else:
+            x = torch.randn(*shape, generator=g, dtype=torch.float32)
+        idx = torch.randint(0, shape[dim], ishape, generator=g, dtype=torch.int64)
+        for sparse_grad in (False, True):
+            want = torch.gather(x, dim, idx, sparse_grad=sparse_grad)
+            xv, iv = _vk_like(torch, x), _vk_like(torch, idx)
+            before = _counters()
+            out = _C._aten_dispatch("aten.gather.default", xv, dim, iv,
+                                    sparse_grad=sparse_grad)
+            d = _delta(before, _counters())
+            assert list(out.shape) == ishape and str(out.dtype) == str(want.dtype), (
+                label, out.shape, out.dtype)
+            assert d["shader_dispatches"] == 1, (label, d)
+            assert d["host_downloads"] == 0 and d["host_uploads"] == 0, (label, d)
+            off = _bit_mismatches(_to_cpu(out), want)
+            assert not off, (
+                f"gather {label} sparse_grad={sparse_grad}: {len(off)} of "
+                f"{want.numel()} elements differ from upstream, first at {off[:5]}")
+
+
+def test_gather_refuses_what_upstream_refuses_before_any_gpu_work():
+    """Out-of-range and malformed indices, with zero shaders.
+
+    A shader cannot raise, so an out-of-range gather index is checked on the
+    host against the range recorded at upload -- the same trade VULKAN6.md §2
+    made for `embedding`, applied to a second reader of the index buffer.
+    Each case asks upstream first, so "refuses" means "refuses where upstream
+    refuses", and the message is upstream's.
+    """
+    if _vulkan_or_skip("the gather refusals") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    x = torch.arange(15, dtype=torch.float32).reshape(3, 5)
+    cases = (
+        ("index == size", x, 1, torch.tensor([[0, 5]]), "out of bounds"),
+        ("negative index", x, 1, torch.tensor([[-1, 0]]), "out of bounds"),
+        ("rank mismatch", x, 1, torch.tensor([0, 1]), "same number of dimensions"),
+        ("index too wide", x, 1, torch.zeros(4, 2, dtype=torch.int64), "Size does not match"),
+        ("dim out of range", x, 2, torch.zeros(1, 1, dtype=torch.int64), "Dimension out of range"),
+    )
+    for what, src, dim, idx, needle in cases:
+        try:
+            torch.gather(src, dim, idx)
+        except (RuntimeError, IndexError):
+            pass
+        else:
+            raise AssertionError(f"upstream accepted the case {what!r}; the sweep is wrong")
+        xv, iv = _vk_like(torch, src), _vk_like(torch, idx)
+        before = _counters()
+        try:
+            _C._aten_dispatch("aten.gather.default", xv, dim, iv)
+        except (RuntimeError, IndexError) as e:
+            assert needle in str(e), (what, needle, str(e))
+        else:
+            raise AssertionError(f"gather {what} was computed instead of refused")
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 0 and d["host_downloads"] == 0, (what, d)
+
+    # A float index is refused by dtype, naming it.
+    fv = _to_vulkan(_cpu([0.0, 1.0], [1, 2]))
+    try:
+        _C._aten_dispatch("aten.gather.default", _vk_like(torch, x), 1, fv)
+    except (RuntimeError, NotImplementedError) as e:
+        assert "int" in str(e), str(e)
+    else:
+        raise AssertionError("a float gather index was accepted")
+
+
+def test_an_index_range_is_inherited_through_views_and_a_loose_one_refuses_by_name():
+    """What a slice of an index tensor knows about its values.
+
+    The range check costs no read-back because the upload recorded `(min,
+    max)` (VULKAN6.md §2). A slice, select, expand or gather of that tensor
+    holds a *subset* of its values, so the parent's range is still a true
+    bound -- but possibly a loose one, and the exact one cannot be had without
+    reading the device back.
+
+    So two things are asserted. Where the inherited bound fits the table, the
+    gather runs and is bit-identical (BERT's `position_ids[:, :7]`, whose
+    parent range 0..511 fits a 512-row table, is this case). Where it does
+    not, the refusal says the bound was **inherited** and gives it, with zero
+    shaders -- rather than gathering an unchecked index, and rather than
+    pretending the sliced values themselves were out of range.
+    """
+    if _vulkan_or_skip("the inherited index range") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    table = torch.randn(8, 3, generator=torch.Generator().manual_seed(9), dtype=torch.float32)
+    parent = torch.arange(50, dtype=torch.int64)
+    child = parent[2:6]
+    want = torch.nn.functional.embedding(child, table)  # upstream answers
+
+    pv = _vk_like(torch, parent)
+    cv = _C._aten_dispatch("aten.slice.Tensor", pv, 0, 2, 6)
+    tv = _vk_like(torch, table)
+    before = _counters()
+    try:
+        _C._aten_dispatch("aten.embedding.default", tv, cv)
+    except IndexError as e:
+        message = str(e)
+    else:
+        raise AssertionError("an index with an unchecked, inherited range was gathered")
+    d = _delta(before, _counters())
+    assert d == {"shader_dispatches": 0, "host_uploads": 0, "host_downloads": 0}, d
+    assert "inherited" in message and "49" in message and "8" in message, message
+
+    # The same slice, against a table the inherited bound fits: it runs.
+    wide = torch.randn(50, 3, generator=torch.Generator().manual_seed(10), dtype=torch.float32)
+    out = _C._aten_dispatch("aten.embedding.default", _vk_like(torch, wide), cv)
+    assert not _bit_mismatches(_to_cpu(out), torch.nn.functional.embedding(child, wide))
+    assert want.shape == (4, 3)
+
+    # The same holds through select, expand and gather: each output's bound
+    # is its source's.
+    sel = _C._aten_dispatch("aten.select.int", pv, 0, 3)
+    exp = _C._aten_dispatch("aten.expand.default", _C._aten_dispatch(
+        "aten.view.default", pv, [1, 50]), [2, 50])
+    gat = _C._aten_dispatch("aten.gather.default", exp, 1,
+                            _vk_like(torch, torch.tensor([[1, 2], [3, 4]])))
+    for what, t in (("select", sel), ("expand", exp), ("gather", gat)):
+        try:
+            _C._aten_dispatch("aten.embedding.default", tv, t)
+        except IndexError as e:
+            assert "inherited" in str(e) and "49" in str(e), (what, str(e))
+        else:
+            raise AssertionError(f"{what}: the inherited bound was dropped")
+
+
+def test_the_view_ops_refuse_what_they_cannot_express_before_any_gpu_work():
+    """Upstream's refusals in upstream's words, and this device's own by name.
+
+    The last case is this device's, not upstream's: an output whose element
+    count does not fit the shaders' 32-bit invocation index. Upstream's
+    `expand` answers it (a view costs nothing), and this device would have to
+    materialise it, so it refuses with the value and the bound *before*
+    allocating -- the same shape of decision as VULKAN6.md §1's index ceiling.
+    """
+    if _vulkan_or_skip("the view-op refusals") is None:
+        return
+    x = _to_vulkan(_cpu([float(i) for i in range(6)], [2, 3]))
+    s = _to_vulkan(_cpu([1.0], []))
+    i64 = _to_vulkan(_i64([0, 1], [2]))
+    d = _C._aten_dispatch
+    cases = (
+        ("slice step 0", lambda: d("aten.slice.Tensor", x, 1, 0, 3, 0), "step must be greater than zero"),
+        ("slice dim", lambda: d("aten.slice.Tensor", x, 2, 0, 3), "Dimension out of range"),
+        ("select 0-d", lambda: d("aten.select.int", s, 0, 0), "0-dim"),
+        ("select index", lambda: d("aten.select.int", x, 1, 3), "out of"),
+        ("expand extent", lambda: d("aten.expand.default", x, [2, 4]), "must match the existing size"),
+        ("expand fewer", lambda: d("aten.expand.default", x, [3]), "must be greater or equal"),
+        ("expand -1 lead", lambda: d("aten.expand.default", x, [-1, 2, 3]), "leading, non-existing"),
+        ("expand past u32", lambda: d("aten.expand.default", s, [2 ** 32 + 1]), "4294967297"),
+        ("tanh int64", lambda: d("aten.tanh.default", i64), "float32"),
+        ("rank 9 expand", lambda: d("aten.expand.default", s, [1] * 9), "rank"),
+    )
+    for what, call, needle in cases:
+        before = _counters()
+        try:
+            call()
+        except (RuntimeError, IndexError, ValueError, NotImplementedError) as e:
+            assert needle in str(e), (what, needle, str(e))
+        else:
+            raise AssertionError(f"{what} was computed instead of refused")
+        delta = _delta(before, _counters())
+        assert delta["shader_dispatches"] == 0 and delta["host_downloads"] == 0, (what, delta)
+
+
+# (label, lhs shape, rhs shape)
+BROADCAST_CASES = (
+    ("bert position add", [2, 7, 16], [1, 7, 16]),
+    ("bias row", [3, 5], [5]),
+    ("column vs row", [4, 1], [1, 6]),
+    ("scalar tensor", [2, 3], []),
+    ("lead dims both", [2, 1, 3, 1], [5, 1, 4]),
+    ("mask shape", [2, 4, 7, 7], [2, 1, 1, 7]),
+    ("lhs is the small one", [1, 3], [4, 3]),
+)
+
+
+def test_broadcasting_arithmetic_is_bit_identical_to_upstream_and_one_shader():
+    """`a + b` with unequal, broadcastable shapes -- a wall VULKAN6.md did not list.
+
+    A pretrained BERT with a batch of two adds `position_embeddings` of shape
+    `[1, S, H]` to embeddings of shape `[2, S, H]`. VULKAN6.md §3.1's trace ran
+    one sequence, where that add is between equal shapes, and it counted op
+    *names* -- `add.Tensor` was taught, so it was not a wall there. It is here
+    (docs/devices/VULKAN7.md §3.2).
+
+    One IEEE operation per element, so bit equality, for all four operators.
+    One shader per call: the broadcast is strides in the kernel's push
+    constants, not a materialised `expand` first.
+    """
+    if _vulkan_or_skip("the broadcasting arithmetic") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    ops = (("aten.add.Tensor", torch.add), ("aten.sub.Tensor", torch.sub),
+           ("aten.mul.Tensor", torch.mul), ("aten.div.Tensor", torch.div))
+    for n, (label, sa, sb) in enumerate(BROADCAST_CASES):
+        g = torch.Generator().manual_seed(9300 + n)
+        a = torch.randn(sa, generator=g, dtype=torch.float32)
+        b = torch.randn(sb, generator=g, dtype=torch.float32) + 0.25
+        av, bv = _vk_like(torch, a), _vk_like(torch, b)
+        for op, fn in ops:
+            for x, y, xv, yv, order in ((a, b, av, bv, "a.b"), (b, a, bv, av, "b.a")):
+                want = fn(x, y)
+                before = _counters()
+                out = _C._aten_dispatch(op, xv, yv)
+                d = _delta(before, _counters())
+                assert list(out.shape) == list(want.shape), (label, op, out.shape, want.shape)
+                assert d["shader_dispatches"] == 1, (label, op, order, d)
+                assert d["host_downloads"] == 0 and d["host_uploads"] == 0, (label, op, d)
+                off = _bit_mismatches(_to_cpu(out), want)
+                assert not off, (
+                    f"{op} {label} ({order}): {len(off)} of {want.numel()} "
+                    f"elements differ from upstream's bits, first at {off[:5]}")
+
+    # What upstream refuses, this refuses, with upstream's wording and no GPU work.
+    x = _to_vulkan(_cpu([1.0] * 6, [2, 3]))
+    y = _to_vulkan(_cpu([1.0] * 6, [3, 2]))
+    try:
+        torch.add(torch.ones(2, 3), torch.ones(3, 2))
+    except RuntimeError as e:
+        upstream = str(e)
+    else:
+        raise AssertionError("upstream broadcast [2,3] with [3,2]")
+    # The helper that words this refusal is shared with the meta kernels
+    # (`aten.rs::broadcast_shape`), and it walked left to right: for more than
+    # one disagreeing axis it named a different one from upstream. Held here
+    # on meta, where the same helper answers.
+    meta = _C.device("meta")
+    for sa, sb in (((2, 3), (3, 2)), ((5, 2, 3), (4, 1, 3)), ((4, 2), (3,))):
+        try:
+            torch.add(torch.ones(sa), torch.ones(sb))
+        except RuntimeError as e:
+            want = str(e)
+        else:
+            raise AssertionError((sa, sb))
+        xm = _C._aten_dispatch("aten.empty.memory_format", list(sa), device=meta)
+        ym = _C._aten_dispatch("aten.empty.memory_format", list(sb), device=meta)
+        try:
+            _C._aten_dispatch("aten.add.Tensor", xm, ym)
+        except RuntimeError as e:
+            assert want in str(e), (sa, sb, str(e), want)
+        else:
+            raise AssertionError(f"meta add {sa} {sb} was answered")
+    before = _counters()
+    try:
+        _C._aten_dispatch("aten.add.Tensor", x, y)
+    except RuntimeError as e:
+        # The shim prefixes the op name, as its dense kernels do.
+        assert upstream in str(e), (str(e), upstream)
+    else:
+        raise AssertionError("[2,3] + [3,2] was computed")
+    assert _delta(before, _counters())["shader_dispatches"] == 0
+
+
+# (label, lhs shape, rhs shape, shaders): one `bmm` pass, plus one strided
+# copy for each operand whose batch dimensions must be materialised.
+MATMUL_CASES = (
+    ("bert q.kT", [2, 4, 7, 16], [2, 4, 16, 7], 1),
+    ("bert attn.v", [2, 4, 7, 7], [2, 4, 7, 16], 1),
+    ("2-D", [5, 3], [3, 4], 1),
+    ("3-D", [3, 5, 2], [3, 2, 6], 1),
+    ("broadcast lhs batch", [1, 4, 5, 3], [2, 4, 3, 2], 2),
+    ("broadcast rhs 2-D", [2, 3, 5, 3], [3, 4], 2),
+    ("vector rhs", [2, 5, 3], [3], 2),
+    ("vector lhs", [3], [3, 4], 1),
+    ("vector vector", [6], [6], 1),
+)
+
+
+def test_matmul_agrees_with_upstream_and_ran_as_one_batched_product():
+    """`torch.matmul` on the device -- the other wall VULKAN6.md did not list.
+
+    The shim keeps `aten.matmul.default` as one op (docs/devices/VULKAN4.md
+    §2.1); upstream decomposes it into `expand` + `bmm` + `_unsafe_view`, and
+    VULKAN6.md's wall came from upstream's trace, where `matmul` never appears.
+    BERT's eager attention calls it twice per layer.
+
+    Values within the tolerance derived from upstream's own float32 error
+    (docs/numerics/AGREE.md §2) -- a sum of products is not exactly rounded,
+    so bit equality is not the bar. The shader count says the product ran once
+    over the flattened batch, and that a broadcast batch cost exactly one
+    extra strided copy per operand that needed it.
+    """
+    if _vulkan_or_skip("the matmul sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for n, (label, sa, sb, shaders) in enumerate(MATMUL_CASES):
+        a = _rand(torch, *sa, seed=9500 + n)
+        b = _rand(torch, *sb, seed=9600 + n)
+        av, bv = _vk_like(torch, a), _vk_like(torch, b)
+        before = _counters()
+        out = _C._aten_dispatch("aten.matmul.default", av, bv)
+        d = _delta(before, _counters())
+        want = torch.matmul(a, b)
+        assert list(out.shape) == list(want.shape), (label, out.shape, want.shape)
+        assert str(out.device) == "vulkan", (label, out.device)
+        assert d["shader_dispatches"] == shaders, (label, d)
+        assert d["host_downloads"] == 0 and d["host_uploads"] == 0, (label, d)
+        cases.append((f"matmul {label}", _flat(_to_cpu(out)), _up_flat(want),
+                      _up_flat(torch.matmul(a.double(), b.double()))))
+    _assert_agreement("matmul", cases)
+
+    for label, sa, sb in (("inner mismatch", [2, 3], [4, 5]),
+                          ("batch mismatch", [2, 3, 4], [3, 4, 5]),
+                          ("0-d", [], [3])):
+        a, b = torch.ones(sa), torch.ones(sb)
+        try:
+            torch.matmul(a, b)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"upstream accepted {label}")
+        av, bv = _vk_like(torch, a), _vk_like(torch, b)
+        before = _counters()
+        try:
+            _C._aten_dispatch("aten.matmul.default", av, bv)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"matmul {label} was computed instead of refused")
+        assert _delta(before, _counters())["shader_dispatches"] == 0, label
+
+
+TANH_SHAPES = ((4, 5), (7, 33), (2, 3, 64), (1025,), (2, 768))
+
+
+def test_tanh_agrees_with_upstream_at_a_derived_tolerance():
+    """BERT's pooler ends in `tanh`. Values over a wide range, tails included."""
+    if _vulkan_or_skip("the tanh agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, shape in enumerate(TANH_SHAPES):
+        a = _rand(torch, *shape, seed=900 + i) * (0.5 + 3.0 * i)
+        av = _to_vulkan(_cpu(_up_flat(a), shape))
+        before = _counters()
+        out = _C._aten_dispatch("aten.tanh.default", av)
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 1, (shape, d)
+        assert d["host_downloads"] == 0 and d["host_uploads"] == 0, (shape, d)
+        assert list(out.shape) == list(shape), (out.shape, shape)
+        cases.append((f"tanh{list(shape)}", _flat(_to_cpu(out)),
+                      _up_flat(torch.tanh(a)), _up_flat(torch.tanh(a.double()))))
+    _assert_agreement("tanh", cases)
+
+
+_BERT_SHIM_SCRIPT = r"""
+import json, sys
+import torch
+
+assert hasattr(torch._C, "_aten_implemented"), "this subprocess got upstream torch"
+
+cfg = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+from transformers import AutoModel
+
+m = AutoModel.from_pretrained(cfg["path"], attn_implementation="eager").eval()
+ids = torch.as_tensor(cfg["ids"], dtype=torch.int64).reshape(cfg["sids"])
+with torch.no_grad():
+    r = m(input_ids=ids)
+out["cpu"] = r.last_hidden_state.reshape(-1).tolist()
+out["cpu_pooled"] = r.pooler_output.reshape(-1).tolist()
+m.to("vulkan")
+out["param_devices"] = sorted({str(p.device) for p in m.parameters()} |
+                              {str(b.device) for b in m.buffers()})
+v = ids.to("vulkan")
+before = torch._C._vulkan_counters()
+with torch.no_grad():
+    r = m(input_ids=v)
+after = torch._C._vulkan_counters()
+out["counters"] = {k: after[k] - before[k] for k in after}
+out["device"] = [str(r.last_hidden_state.device), str(r.pooler_output.device)]
+out["vulkan"] = r.last_hidden_state.cpu().reshape(-1).tolist()
+out["vulkan_pooled"] = r.pooler_output.cpu().reshape(-1).tolist()
+out["layers"] = m.config.num_hidden_layers
+json.dump(out, sys.stdout)
+"""
+
+
+def _pretrained_bert_dir():
+    """A local `bert-base-uncased` with weights, or None.
+
+    Looked for, never downloaded: the gate must not reach the network. The
+    candidates are the two Hugging Face caches this machine uses; a snapshot
+    without `model.safetensors` (the default cache here holds only a config)
+    does not count.
+    """
+    import glob
+    roots = []
+    if os.environ.get("TORCHNATIVE_BERT_DIR"):
+        roots.append(os.environ["TORCHNATIVE_BERT_DIR"])
+    for home in (os.environ.get("HF_HOME"), "/Volumes/macMini/caches/hf-home",
+                 os.path.expanduser("~/.cache/huggingface")):
+        if home:
+            for repo in ("models--google-bert--bert-base-uncased",
+                         "models--bert-base-uncased"):
+                roots.extend(sorted(glob.glob(os.path.join(home, "hub", repo, "snapshots", "*"))))
+    for root in roots:
+        if (os.path.exists(os.path.join(root, "model.safetensors"))
+                and os.path.exists(os.path.join(root, "config.json"))):
+            return root
+    return None
+
+
+def test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream():
+    """**The deliverable of docs/devices/VULKAN7.md.**
+
+    Real `transformers`, real `AutoModel.from_pretrained("bert-base-uncased")`,
+    moved to the Vulkan device with `m.to("vulkan")`, forwarded on real token
+    ids -- and compared against the same checkpoint in upstream torch.
+
+    `docs/architectures/VOICE4.md` records the failure this exists to avoid:
+    seven rounds that closed operators one at a time and never ran a model.
+    VULKAN6.md stopped at "a single-head block runs"; the claim here is the
+    pretrained, twelve-layer, twelve-head model.
+
+    Three kinds of assertion, kept apart:
+
+      * **value** -- `last_hidden_state` and `pooler_output` each within
+        docs/numerics/AGREE.md §2's rule: no further from upstream's float64
+        answer than 4x upstream float32's own distance from it;
+      * **device** -- every parameter and buffer reports `vulkan`, and so do
+        both outputs;
+      * **work** -- the forward ran exactly the number of compute shaders the
+        architecture implies (derived below from the model code, not copied
+        from a run) and **read nothing back**. A forward that computed any
+        part on the host would still pass the value check.
+    """
+    if _vulkan_or_skip("the pretrained BERT forward") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    path = _pretrained_bert_dir()
+    if path is None:
+        vulkan_coverage.vulkan_skip(
+            "the pretrained BERT forward: no local bert-base-uncased with "
+            "model.safetensors (set TORCHNATIVE_BERT_DIR); nothing is downloaded")
+        return
+    from transformers import AutoModel, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(path)
+    # Two sentences of different length, so the batch is not a copy of one
+    # row -- padded, and forwarded without a mask on both sides alike.
+    enc = tok(["the quick brown fox jumps over the lazy dog",
+               "vulkan runs a pretrained transformer"],
+              return_tensors="pt", padding=True)
+    ids = enc["input_ids"]
+    B, S = ids.shape
+
+    cfg = {"path": path, "ids": ids.reshape(-1).tolist(), "sids": [B, S]}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    env["HF_HUB_OFFLINE"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _BERT_SHIM_SCRIPT],
+                          input=json.dumps(cfg), capture_output=True,
+                          text=True, env=env, timeout=1200)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    got = json.loads(proc.stdout)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            f"the pretrained BERT forward: the vendored-tree subprocess has "
+            f"no loader -- {got['probe']['error']}")
+        return
+
+    assert got["param_devices"] == ["vulkan"], got["param_devices"]
+    assert got["device"] == ["vulkan", "vulkan"], got["device"]
+
+    up = AutoModel.from_pretrained(path, attn_implementation="eager").eval()
+    with torch.no_grad():
+        r32 = up(input_ids=ids)
+        r64 = up.double()(input_ids=ids)
+
+    for what, key, want32, truth in (
+            ("last_hidden_state", "vulkan", r32.last_hidden_state, r64.last_hidden_state),
+            ("pooler_output", "vulkan_pooled", r32.pooler_output, r64.pooler_output)):
+        want32 = want32.reshape(-1).tolist()
+        truth = truth.reshape(-1).tolist()
+        cpu_key = "cpu" if key == "vulkan" else "cpu_pooled"
+        assert len(got[key]) == len(truth), (what, len(got[key]), len(truth))
+        up_err = max(abs(a - b) for a, b in zip(want32, truth))
+        vk_err = max(abs(a - b) for a, b in zip(got[key], truth))
+        cpu_err = max(abs(a - b) for a, b in zip(got[cpu_key], truth))
+        print(f"   bert {what}: upstream f32 err {up_err:.3e}, shim cpu "
+              f"{cpu_err:.3e}, shim vulkan {vk_err:.3e} ({vk_err / up_err:.2f}x)")
+        assert vk_err <= 4 * up_err, (
+            f"bert {what} on vulkan is {vk_err:.3e} from upstream's float64 "
+            f"answer against upstream float32's own {up_err:.3e}; "
+            f"docs/numerics/AGREE.md's rule allows 4x")
+
+    # Derived from `transformers/models/bert/modeling_bert.py` with
+    # `attn_implementation="eager"`, `input_ids` only, B = 2 (so `expand` is
+    # not an identity), and the dispatch table above:
+    #
+    #   embeddings  9  slice(position_ids) + expand(token_type_ids) + gather
+    #                  + 3 embedding + 2 add + layer_norm
+    #   per layer  32  3 x Linear(q,k,v) [t + matmul + bias = 3]  9
+    #                  3 x transpose(1, 2) after view                3
+    #                  transpose(k, 2, 3)                            1
+    #                  matmul -> bmm, * scaling, softmax, matmul     4
+    #                  transpose(1, 2) of the context                1
+    #                  attention output: Linear + add + layer_norm  5
+    #                  intermediate: Linear + gelu                   4
+    #                  output: Linear + add + layer_norm             5
+    #   pooler      5  [:, 0] = identity slice (0) + select (1)
+    #                  + Linear on 2-D (t + matmul + bias = 3) + tanh
+    expected = 9 + 32 * got["layers"] + 5
+    counters = got["counters"]
+    print(f"   bert on vulkan: {got['layers']} layers, B={B} S={S}, "
+          f"{counters['shader_dispatches']} shaders, "
+          f"{counters['host_downloads']} readbacks, "
+          f"{counters['host_uploads']} uploads during the forward")
+    assert counters["host_downloads"] == 0, (
+        f"the BERT forward read {counters['host_downloads']} buffer(s) back to "
+        f"the host -- part of it computed on the CPU: {counters}")
+    assert counters["host_uploads"] == 0, (
+        f"the BERT forward uploaded {counters['host_uploads']} buffer(s) -- "
+        f"something was built on the host mid-forward: {counters}")
+    assert counters["shader_dispatches"] == expected, (
+        f"the BERT forward ran {counters['shader_dispatches']} compute shaders, "
+        f"expected {expected} = 9 + 32 x {got['layers']} + 5: {counters}")
 
 
 def _main():

@@ -12,7 +12,7 @@ int64 인데 `vulkan.rs` 의 `check_dtype` 은 float32 만 받았기 때문입�
 | `embedding` 은 구현됐나 | 예. `_vulkan_ops()` 에 있고 `embedding_i32_f32` 셰이더가 돈다 |
 | `embedding` 은 **일치**하는가 | **예 — 허용치가 아니라 비트 단위.** gather 는 산술이 없다 (§4) |
 | 트랜스포머가 Vulkan 에서 도는가 | **예 — 블록 하나가 29 개 셰이더로, 읽어오기 0 회.** upstream 과 §5 |
-| 사전학습 BERT 가 도는가 | **아니다.** 벽이 `embedding` 에서 `expand`·`slice`·`gather`·`select`·`tanh`·4-D `transpose` 로 옮겨갔다 (§3) |
+| 사전학습 BERT 가 도는가 | **아니다.** 벽이 `embedding` 에서 `expand`·`slice`·`gather`·`select`·`tanh`·4-D `transpose` 로 옮겨갔다 (§3). **이후 `docs/devices/VULKAN7.md` 에서 닫혔고 `bert-base-uncased` 가 장치 위에서 돈다 — 단 이 목록은 전부가 아니었다** |
 | 장치에 int64 저장이 생겼나 | **아니다.** int64 텐서는 int32 로 **범위를 명시해 좁혀** 저장하고, 넘는 값은 이름을 대며 거절한다 (§1) |
 | 이 기계는 `shaderInt64` 가 있나 | **있다.** 그래서 이 선택은 능력 보고가 아니라 설계 결정이다 (§1.2) |
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
@@ -159,6 +159,12 @@ upstream 에서 다시 추적했습니다 — 117 dispatch / 18 종. 이번 회�
 
 **즉 이 회차가 주장하는 것은 "멀티헤드 트랜스포머가 돈다" 가 아니라 "단일헤드 블록이 돈다" 입니다.**
 
+> **후속 (2026-09-18):** 위 목록은 **전부가 아니었습니다.** 여섯을 모두 가르친 뒤 실제 `bert-base-uncased` 는
+> 브로드캐스팅 `aten.add.Tensor`(`[2, S, H] + [1, S, H]`)와 `aten.matmul.default` 에서 차례로 멈췄습니다 — 이
+> 추적은 op **이름**을 셌고(`add` 는 이미 "가르친" 이름이었습니다), **upstream** 에서 했기 때문에 셰임이
+> 분해하지 않는 `matmul` 이 보이지 않았습니다. 이 8 개를 닫고 사전학습 BERT 가 장치 위에서 돕니다.
+> `docs/devices/VULKAN7.md` §3.2, §5.
+
 ---
 
 ## 4. `embedding` — 값
@@ -269,7 +275,8 @@ vulkan vs 셰임 cpu 2.70 float32 ulp
 
 ## 7. 하지 않은 것
 
-- **멀티헤드 / 사전학습 BERT.** §3.1 의 다섯 op 과 4-D 전치가 남아 있습니다.
+- **멀티헤드 / 사전학습 BERT.** §3.1 의 다섯 op 과 4-D 전치가 남아 있습니다. *(후속: `docs/devices/VULKAN7.md`
+  에서 닫혔고, 목록에 없던 두 op 까지 닫아 `bert-base-uncased` 가 돕니다.)*
 - **성능.** 아무것도 재지 않았습니다. 한 커널당 한 번의 `vkQueueSubmit` + fence 대기는 그대로입니다.
 - **정수 산술.** 저장만 생겼고 계산은 없습니다 (§1.3).
 - **float16 / bfloat16 / float64** — `docs/devices/VULKAN5.md` 그대로, 장치에 올라가는 순간 거절합니다.

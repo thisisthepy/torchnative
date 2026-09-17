@@ -26057,6 +26057,9 @@ def test_an_op_vulkan_was_not_taught_refuses_and_names_the_op():
         ("aten.mul.Tensor", (a, a)),
         ("aten.sub.Tensor", (a, a)),
         ("aten.matmul.default", (a, d("aten.ones.default", [3, 2], device=vulkan))),
+        # docs/devices/VULKAN7.md taught the three above; these are not.
+        ("aten.exp.default", (a,)),
+        ("aten.cumsum.default", (a, 0)),
     ]
     untaught = [(op, args) for op, args in candidates if op not in taught]
     assert untaught, ("every candidate is now taught -- pick a new one", taught)
