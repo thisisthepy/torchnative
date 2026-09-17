@@ -2281,7 +2281,19 @@ def test_parsed_schema_really_reads_the_schema():
         "aten::full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None) -> Tensor"
     )
     assert [a.kwarg_only for a in kwonly.arguments] == [False, False, True]
-    assert kwonly.arguments[2].default_value == "None"
+    # `default_value` is the VALUE, `default_source` is the schema's text, and
+    # `has_default_value()` is neither -- it says whether a default was
+    # DECLARED. This used to read `default_value == "None"`, which was the
+    # shim's own spelling rather than upstream's: upstream answers Python
+    # `None` here, and `torch/_subclasses/fake_impls.py` hands whatever it gets
+    # straight back to the op. All three are asserted because the old coupling
+    # (`has_default_value` was `default_value is not None`) made it impossible
+    # for any of them to be right at the same time.
+    assert kwonly.arguments[2].default_value is None
+    assert kwonly.arguments[2].default_source == "None"
+    assert kwonly.arguments[2].has_default_value()
+    assert not kwonly.arguments[0].has_default_value()
+    assert kwonly.arguments[0].default_source is None
 
 
 def test_finfo_and_iinfo_report_torchs_numbers():
@@ -5721,10 +5733,16 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # the two edits merged cleanly as text and produced a stale list. This
     # test caught it at the merge, which is the whole reason it names ops
     # instead of counting them.
+    #
+    # `squeeze.dims` left the same way in docs/graph/EXPORT6.md §2: it was the
+    # last member of the `squeeze` family still refusing, and it is reached by
+    # `torch.export` once EXPORT5 §10's walls are down. It has moved to the
+    # answering half below. `new_empty` and `new_zeros` and `prims.split_dim`
+    # were never on this list -- they had no meta arm and no entry here -- and
+    # they are added to the answering half for the same round.
     for op, args in (
         ("aten.stack.default", ([a, b], 0)),
         ("aten.unbind.int", (a, 0)),
-        ("aten.squeeze.dims", (a, [0])),
         ("aten.narrow.default", (a, 0, 0, 1)),
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
@@ -5766,6 +5784,12 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.transpose.int", (a, 0, 1)),
         ("aten.permute.default", (a, [1, 0])),
         ("aten.unsqueeze.default", (a, 0)),
+        # docs/graph/EXPORT6.md §2 -- reached only once EXPORT5 §10's walls
+        # came down.
+        ("aten.squeeze.dims", (a, [0])),
+        ("aten.new_empty.default", (a, [2, 2])),
+        ("aten.new_zeros.default", (a, [2, 2])),
+        ("prims.split_dim.default", (a, 1, 3)),
         ("aten.squeeze.dim", (a, 0)),
         ("aten.squeeze.default", (a,)),
         ("aten.slice.Tensor", (a, 0, 0, 1)),
@@ -8877,9 +8901,18 @@ out["refuse_no_rule"] = refusal(
     torch.ones(3, 4), lambda t: d("aten.reshape.default", t, [4, 3])
 )
 # A rule exists, and running it hits something the shim does not have.
-# `aten.t.default` used to stand here too and now lowers; `aten.zeros_like`
-# is blocked one layer down, on `torch.full_like` having no overload entry.
+# `aten.t.default` used to stand here, then `aten.zeros_like.default` --
+# which was blocked on `pin_memory=False` being refused by every factory.
+# `torch.export` passes that argument explicitly on every factory it traces,
+# so it is accepted now and `zeros_like` lowers (docs/graph/EXPORT6.md §3).
+# `aten.empty_like.default` is the honest replacement: its decomposition
+# reaches `torch.empty_permuted`, which has no overload table entry at all.
+# `zeros_like` is kept beside it as the case that MOVED, so the wall having
+# an example and this particular op no longer being it stay separate facts.
 out["refuse_unrunnable"] = refusal(
+    torch.ones(4, 8), lambda t: d("aten.empty_like.default", t)
+)
+out["lowers_now_zeros_like"] = refusal(
     torch.ones(4, 8), lambda t: d("aten.zeros_like.default", t)
 )
 # Wall 3 -- "a rule exists, runs, and produces a result the recording
@@ -9703,27 +9736,29 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     # 2. A rule exists and running it reaches something the shim lacks. The
     #    refusal carries the underlying reason, so the gap is findable.
     #
-    #    **The reason moved when `full_like` landed, and it moved inward.**
-    #    Until docs/architectures/DEMAND1.md this read `"torch.full_like" in ...`, because
-    #    `zeros_like`'s decomposition reached a name with no table entry at all
-    #    and got the overload-resolution refusal. `aten.full_like.default` has
-    #    a kernel now, so the decomposition gets one argument further and stops
-    #    on `pin_memory=False` -- which upstream *accepts* and every factory in
-    #    this shim refuses through the shared `reject_unsupported`
-    #    (`full`, `new_ones`, `zeros_like` and the rest all behave this way).
-    #    So wall 2 still has the same example and the refusal still names
-    #    `full_like`; what changed is that it now names the one argument that
-    #    is missing rather than the whole op. Asserted on both halves so this
-    #    cannot drift back to a vaguer message unnoticed.
+    #    **The example moved again, and the reason it moved is a gap closing.**
+    #    This used to be `aten.zeros_like.default`, stopped on `pin_memory=False`
+    #    -- an argument upstream accepts and every factory here refused through
+    #    the shared `reject_unsupported`. The note that stood here argued the
+    #    gap was real and should stay named. `torch.export` settled it the other
+    #    way: it passes `layout` and `pin_memory` explicitly on every factory it
+    #    traces, so refusing `pin_memory=False` refused a request for nothing,
+    #    on ten of the forty architectures (docs/graph/EXPORT6.md §3). It is
+    #    accepted now -- `pin_memory=True` still refuses -- and `zeros_like`
+    #    lowers, which is asserted below as its own case rather than being left
+    #    as an absence.
     #
-    #    Giving `full_like` alone a `pin_memory=False` fast path would have
-    #    made `zeros_like` lower and left wall 2 with no example -- and it
-    #    would have made one factory disagree with its siblings about an
-    #    argument none of them supports. The gap is real and stays named.
+    #    `aten.empty_like.default` is the replacement, and it is a wall of the
+    #    same kind rather than a substitute chosen to keep a test alive: its
+    #    decomposition reaches `torch.empty_permuted`, which has no entry in
+    #    `overloads.json` at all, so nothing resolves it.
     assert r["refuse_unrunnable"] != "ACCEPTED"
-    assert "aten.zeros_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
-    assert "aten.full_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
-    assert "pin_memory" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "aten.empty_like.default" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    assert "empty_permuted" in r["refuse_unrunnable"], r["refuse_unrunnable"]
+    #    The op that moved OFF this wall, asserted positively. Without this the
+    #    close would be invisible: wall 2 would simply have a different name in
+    #    it and nothing would record that `zeros_like` now lowers.
+    assert r["lowers_now_zeros_like"] == "ACCEPTED", r["lowers_now_zeros_like"]
 
     # 3. A rule exists, runs, and produces a result the recording disagrees
     #    with. **No op does this any more.** Every non-core op that reaches

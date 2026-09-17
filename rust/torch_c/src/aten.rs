@@ -776,6 +776,205 @@ fn overriding_types<'py>(
     PyTuple::new(py, found)
 }
 
+/// Re-seat the call in upstream's shape: schema-positional arguments in
+/// `args`, `kwarg_only` arguments in `kwargs`.
+///
+/// `bootstrap.py` binds every argument by *keyword* whenever the fast path is
+/// not taken -- `dispatch(key, **bound)` -- so `args` arrives as `()` and the
+/// whole call is in `kwargs`. Eager dispatch does not care, because
+/// `aten_dispatch` looks arguments up by name either way. A
+/// `TorchDispatchMode` does care, and `docs/graph/EXPORT5.md` §10's wall 1 was
+/// standing in front of the proof:
+///
+///     torch/_subclasses/fake_tensor.py:2970   r = func.decompose(*args, **kwargs)
+///     TypeError: OpOverload.decompose() got multiple values for argument 'self'
+///
+/// `OpOverload.decompose` is `def decompose(self, *args, **kwargs)`, and the
+/// first argument of most aten schemas is *named* `self`. Passed positionally
+/// it is an operand; passed as a keyword it collides with the bound receiver.
+/// Thirteen of the fourteen architectures freed by `annotation_str` stopped
+/// here, one line further on.
+///
+/// Only the mode path is re-seated. Eager dispatch keeps the keyword shape it
+/// has always had, so this cannot change any number a mode-less run produces;
+/// the cost is paid only when someone has entered a mode, where it is noise
+/// beside the Python call that follows.
+///
+/// **It gives up rather than guessing.** If the op has no schema, if a
+/// positional argument is missing with no default to fill it, or if an
+/// argument's name is not in the schema at all, the original `(args, kwargs)`
+/// are returned untouched. A half-seated call would be the failure this whole
+/// area keeps producing: something that looks converted and is wrong for one
+/// op in thirty.
+fn seat_positionally<'py>(
+    py: Python<'py>,
+    func: &Bound<'py, PyAny>,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<(Bound<'py, PyTuple>, Option<Bound<'py, PyDict>>)> {
+    let original = || -> PyResult<(Bound<'py, PyTuple>, Option<Bound<'py, PyDict>>)> {
+        Ok((args.clone(), kwargs.map(|k| k.clone())))
+    };
+    let Some(kwargs) = kwargs else { return original() };
+    if kwargs.is_empty() {
+        return original();
+    }
+    let Ok(schema) = func.getattr(intern!(py, "_schema")) else {
+        return original();
+    };
+    let Ok(arguments) = schema.getattr(intern!(py, "arguments")) else {
+        return original();
+    };
+    let n = arguments.len()?;
+
+    // The schema-positional names, in order, from where `args` already stops.
+    // A schema cannot declare a positional argument after a `kwarg_only` one,
+    // so the first `kwarg_only` ends the run.
+    let already = args.len();
+    let mut names: Vec<Bound<'py, PyAny>> = Vec::new();
+    for i in already..n {
+        let argument = arguments.get_item(i)?;
+        if argument.getattr(intern!(py, "kwarg_only"))?.is_truthy()? {
+            break;
+        }
+        names.push(argument);
+    }
+    // `names` may be empty -- the caller already passed every positional
+    // argument positionally, which is what the fast path in `bootstrap.py`
+    // does. There is still the keyword pruning below to do, so this falls
+    // through rather than returning.
+    //
+    // Trailing positionals the caller did not supply are simply not passed --
+    // upstream's own boxed call omits them too, and `OpOverload.__call__`
+    // fills them from the schema. A *gap* is different: an absent argument
+    // with a supplied one after it must be filled from its default, or the
+    // ones after it would shift left and land on the wrong parameter.
+    let mut values: Vec<Option<Bound<'py, PyAny>>> = Vec::with_capacity(names.len());
+    for argument in &names {
+        let name = argument.getattr(intern!(py, "name"))?;
+        values.push(kwargs.get_item(&name)?);
+    }
+    let last = values.iter().rposition(|v| v.is_some());
+
+    let mut positional: Vec<Bound<'py, PyAny>> = args.iter().collect();
+    let mut moved = 0usize;
+    if let Some(last) = last {
+        for (i, slot) in values.iter().enumerate().take(last + 1) {
+            match slot {
+                Some(value) => positional.push(value.clone()),
+                None => {
+                    let argument = &names[i];
+                    if !argument
+                        .call_method0(intern!(py, "has_default_value"))?
+                        .is_truthy()?
+                    {
+                        // A hole with nothing to fill it. Hand the call back
+                        // exactly as it came rather than shifting the rest.
+                        return original();
+                    }
+                    positional.push(argument.getattr(intern!(py, "default_value"))?);
+                }
+            }
+        }
+        moved = last + 1;
+    }
+
+    let rest = PyDict::new(py);
+    let consumed: Vec<Bound<'py, PyAny>> = names
+        .iter()
+        .take(moved)
+        .map(|a| a.getattr(intern!(py, "name")))
+        .collect::<PyResult<_>>()?;
+    // The kwarg-only remainder, minus anything that is simply its own default.
+    //
+    // Upstream drops those (`parseIValuesToPyArgsKwargs` omits an argument
+    // whose IValue equals the schema default), and the difference is not
+    // cosmetic: `torch/_subclasses/fake_tensor.py:2624` reads
+    //
+    //     "device" in kwargs and kwargs["device"].type != "cpu"
+    //
+    // with no `is None` between them, so a `device=None` that upstream would
+    // never have put there is an `AttributeError` on `NoneType`. Twelve
+    // architectures stopped exactly there.
+    //
+    // This shim's own binder already drops schema-defaults on the way in
+    // (`_is_schema_default`); what reaches here undropped came through
+    // `OpOverload.__call__`, which forwards its caller's keywords verbatim.
+    let by_name: std::collections::HashMap<String, Bound<'py, PyAny>> = arguments
+        .try_iter()?
+        .filter_map(|a| a.ok())
+        .filter_map(|a| {
+            a.getattr(intern!(py, "name"))
+                .ok()
+                .and_then(|n| n.extract::<String>().ok())
+                .map(|n| (n, a))
+        })
+        .collect();
+    for (key, value) in kwargs.iter() {
+        let mut taken = false;
+        for name in &consumed {
+            if key.eq(name)? {
+                taken = true;
+                break;
+            }
+        }
+        if taken {
+            continue;
+        }
+        if let Ok(name) = key.extract::<String>() {
+            if let Some(argument) = by_name.get(&name) {
+                if is_schema_default(py, argument, &value)? {
+                    continue;
+                }
+            }
+        }
+        rest.set_item(key, value)?;
+    }
+    Ok((PyTuple::new(py, positional)?, Some(rest)))
+}
+
+/// Is this value the one the schema would have used anyway?
+///
+/// Restricted to `None`, `bool`, `int`, `float` and `str` on purpose, which is
+/// the same restriction `bootstrap.py::_is_schema_default` states: `==`
+/// against a tensor goes through a synthesised `__eq__` that raises, and
+/// against a list it would allocate. Anything outside those types is kept,
+/// which is the safe direction -- an argument that is passed on when upstream
+/// would have dropped it is visible; one that is dropped when upstream would
+/// have passed it is not.
+fn is_schema_default(
+    py: Python<'_>,
+    argument: &Bound<'_, PyAny>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if !argument
+        .call_method0(intern!(py, "has_default_value"))?
+        .is_truthy()?
+    {
+        return Ok(false);
+    }
+    let default = argument.getattr(intern!(py, "default_value"))?;
+    if value.is_none() {
+        return Ok(default.is_none());
+    }
+    let comparable = value.is_instance_of::<pyo3::types::PyBool>()
+        || value.is_instance_of::<pyo3::types::PyInt>()
+        || value.is_instance_of::<pyo3::types::PyFloat>()
+        || value.is_instance_of::<PyString>();
+    if !comparable {
+        return Ok(false);
+    }
+    // `bool` and `int` compare equal in Python (`True == 1`), and a schema
+    // whose default is `1` should not swallow a `True`. Same guard
+    // `_is_schema_default` uses.
+    if value.is_instance_of::<pyo3::types::PyBool>()
+        != default.is_instance_of::<pyo3::types::PyBool>()
+    {
+        return Ok(false);
+    }
+    value.eq(&default)
+}
+
 /// Give the mode the call, upstream's way: **pop it for the duration**.
 ///
 /// Every `__torch_dispatch__` implementation worth the name ends by calling
@@ -820,7 +1019,8 @@ fn dispatch_through_mode(
     }
     let result = (|| -> PyResult<Py<PyAny>> {
         let func = op_overload(py, op)?;
-        let types = overriding_types(py, args, kwargs)?;
+        let (args, kwargs) = seat_positionally(py, &func, args, kwargs)?;
+        let types = overriding_types(py, &args, kwargs.as_ref())?;
         active
             .mode
             .call_method1(intern!(py, "__torch_dispatch__"), (func, types, args, kwargs))
@@ -1843,9 +2043,23 @@ fn meta_dispatch(
         "aten._local_scalar_dense.default" => Err(pyo3::exceptions::PyRuntimeError::new_err(
             "Tensor.item() cannot be called on meta tensors",
         )),
-        // `new_ones` takes its shape from the argument and its device from the
-        // input tensor, so on a meta input it is a meta factory.
-        "aten.new_ones.default" => {
+        // `new_ones` and its two siblings take their shape from the argument
+        // and their device from the input tensor, so on a meta input they are
+        // meta factories.
+        //
+        // `new_empty` is here because `torch/_meta_registrations.py:8997` --
+        // upstream's meta kernel for `embedding` -- is literally
+        // `weight.new_empty(out_shape, dtype=out_dtype)`. Every architecture
+        // with an embedding table reaches it, which in the `docs/graph/EXPORT5.md`
+        // §10 sweep is thirteen of the fourteen wall-1 architectures. `new_ones`
+        // was here and its siblings were not, which is why only `new_ones`'s
+        // callers had ever asked.
+        //
+        // Off meta they differ only in what they write: `new_empty` answers
+        // zeros, for the reason the `empty_like` arm below states at length --
+        // this shim's "empty" is zeros everywhere, deliberately, rather than
+        // uninitialised bytes.
+        "aten.new_ones.default" | "aten.new_zeros.default" | "aten.new_empty.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let size: Vec<usize> = required(op, args, kwargs, 1, "size")?.extract()?;
             let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(input.tag());
@@ -1854,8 +2068,12 @@ fn meta_dispatch(
                 label => {
                     let device = label.resolve()?;
                     let storage = storage_for(op, tag, &device)?;
-                    let out = Tensor::ones(size, storage, &device)
-                        .map_err(|e| candle_err(op, e))?;
+                    let out = if op == "aten.new_ones.default" {
+                        Tensor::ones(size, storage, &device)
+                    } else {
+                        Tensor::zeros(size, storage, &device)
+                    }
+                    .map_err(|e| candle_err(op, e))?;
                     finish(py, out, tag)
                 }
             }
@@ -2737,6 +2955,83 @@ fn meta_dispatch(
                 dims.remove(dim);
             }
             meta_result(py, dims, input.tag())
+        }
+        // `aten::squeeze.dims` -- the named axes, and only the ones whose
+        // extent is 1. An axis of any other extent is a **no-op, not an
+        // error**, which is `squeeze_dims`'s own rule restated here; a meta
+        // kernel that removed it anyway would advertise a rank the dense
+        // kernel does not produce.
+        //
+        // Reached only after `docs/graph/EXPORT5.md` §10's walls came down:
+        // nothing got far enough into a trace to ask for it before.
+        "aten.squeeze.dims" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let dims = input.dims().to_vec();
+            let rank = dims.len();
+            let raw = shape_arg(op, args, kwargs, 1, "dim")?;
+            let mut named: Vec<usize> = raw
+                .iter()
+                .map(|&d| normalise_dim(op, d, rank))
+                .collect::<PyResult<Vec<_>>>()?;
+            refuse_duplicate_dims(&named)?;
+            named.sort_unstable();
+            let mut out = dims.clone();
+            for dim in named.into_iter().rev() {
+                if out.get(dim) == Some(&1) {
+                    out.remove(dim);
+                }
+            }
+            meta_result(py, out, input.tag())
+        }
+        // `prims::split_dim(a, dim, outer_length)` -- one axis becomes two.
+        //
+        // Every refusal is `prims_split_dim`'s, restated with the same
+        // messages rather than simplified: upstream's `validate_idx` allows
+        // `dim == 0` on a 0-d tensor, a negative `outer_length` is a
+        // `torch._check`, a zero one is a genuine `ZeroDivisionError`, and a
+        // remainder is a `ValueError` naming both lengths. A meta kernel that
+        // accepted what the dense one refuses would let a trace record a shape
+        // that cannot be computed.
+        "prims.split_dim.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "a")?;
+            let dim = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?;
+            let outer_length = dim_arg(args, kwargs, 2, "outer_length")?
+                .ok_or_else(|| missing(op, "outer_length"))?;
+            let dims = input.dims().to_vec();
+            let rank = dims.len();
+            if !((dim >= 0 && dim < rank as isize) || dim == 0) {
+                return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                    "idx {dim} is out of bounds for rank {rank}"
+                )));
+            }
+            if outer_length < 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Expected cond to be True, but got False.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)",
+                ));
+            }
+            if outer_length == 0 {
+                return Err(pyo3::exceptions::PyZeroDivisionError::new_err(
+                    "integer division or modulo by zero",
+                ));
+            }
+            let length = *dims.get(dim as usize).unwrap_or(&1) as isize;
+            if length % outer_length != 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Attempting to split dimension of length {length}, but outer length of \
+                     {outer_length} divides it with a remainder!"
+                )));
+            }
+            let inner_length = length / outer_length;
+            let mut shape: Vec<usize> = Vec::with_capacity(rank + 1);
+            for (index, &extent) in dims.iter().enumerate() {
+                if index == dim as usize {
+                    shape.push(outer_length as usize);
+                    shape.push(inner_length as usize);
+                } else {
+                    shape.push(extent);
+                }
+            }
+            meta_result(py, shape, input.tag())
         }
         // `aten::squeeze.default` -- every axis of size 1 removed.
         "aten.squeeze.default" => {
@@ -15045,8 +15340,7 @@ fn reject_layout(
         // answers `strided` from `_shim_name`, and a *real* `torch.strided`
         // (which the golden harness hands to both sides) has no `_shim_name` and
         // falls back to its `str()`, `torch.strided`.
-        let name = memory_format_name(&value);
-        if !value.is_none() && name != "strided" && name != "torch.strided" {
+        if !value.is_none() && !is_strided_layout(&value) {
             return Err(not_implemented(format!(
                 "{op}: argument 'layout' not implemented in torch._C shim (got {value})"
             )));
@@ -24448,14 +24742,64 @@ fn reject_unsupported(
 ) -> PyResult<()> {
     for (index, name) in fields {
         if let Some(value) = optional(args, kwargs, *index, name)? {
-            if !value.is_none() {
-                return Err(not_implemented(format!(
-                    "{op}: argument '{name}' not implemented in torch._C shim (got {value})"
-                )));
+            if value.is_none() {
+                continue;
             }
+            // `layout=torch.strided` names the ONLY layout this shim has, so
+            // refusing it turns away a request for exactly what is about to be
+            // handed back. `reject_layout` below already made that argument
+            // for three hand-picked ops; `torch.export` is what made it
+            // general -- `torch/_export/non_strict_utils.py:1205` passes the
+            // layout explicitly on every factory it traces, and ten of
+            // `docs/graph/EXPORT5.md` §10's architectures stopped here.
+            //
+            // Every OTHER layout still refuses, by name. That half is not
+            // decoration: a dropped `layout=torch.sparse_coo` is a wrong
+            // answer with no trace, and `test_export6.py` asserts the refusal
+            // beside the acceptance for that reason.
+            if *name == "layout" && is_strided_layout(&value) {
+                continue;
+            }
+            // `pin_memory=False` asks for nothing. It is the same request as
+            // `pin_memory=None` -- do not pin -- and refusing one while
+            // accepting the other refuses a no-op. `torch.export` spells every
+            // factory argument out, so this is the wall immediately behind the
+            // layout one, on the same ten architectures.
+            //
+            // `pin_memory=True` is a DIFFERENT request, this shim has no
+            // pinned allocator, and it still refuses by name. Accepting it
+            // would hand back ordinary memory while claiming it was pinned.
+            if *name == "pin_memory" && matches!(value.is_truthy(), Ok(false)) {
+                continue;
+            }
+            return Err(not_implemented(format!(
+                "{op}: argument '{name}' not implemented in torch._C shim (got {value})"
+            )));
         }
     }
     Ok(())
+}
+
+/// Is this label `torch.strided`?
+///
+/// Both spellings are accepted because both arrive, for the reason
+/// `reject_layout` states: the shim's own label answers `strided` from
+/// `_shim_name`, and a real upstream `torch.strided` has no `_shim_name` and
+/// falls back to its `str()`, `torch.strided`.
+fn is_strided_layout(value: &Bound<'_, PyAny>) -> bool {
+    // A `_shim_name` of `strided` -- the shim's own label object -- or a real
+    // upstream `torch.strided`, whose `str()` is `torch.strided`.
+    //
+    // A bare Python string `"strided"` is deliberately NOT accepted, even
+    // though `memory_format_name` would render it identically. It is not a
+    // layout; upstream refuses it; and `test_shim.py`'s
+    // `test_full_rejects_arguments_it_does_not_honour` passes exactly that
+    // string, which is why the two cases have to be told apart here rather
+    // than by whatever `str()` happens to produce.
+    if let Ok(name) = value.getattr("_shim_name").and_then(|v| v.extract::<String>()) {
+        return name == "strided";
+    }
+    value.str().map(|s| s.to_string()).unwrap_or_default() == "torch.strided"
 }
 
 // ---------------------------------------------------------------------------

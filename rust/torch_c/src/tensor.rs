@@ -2638,6 +2638,77 @@ impl PyTensorBase {
         let itemsize = tag.itemsize();
         let numel: usize = size.iter().product();
 
+        // **Meta tensor, meta storage: this is metadata and nothing else.**
+        //
+        // `torch/_subclasses/meta_utils.py:2124` -- the branch whose own
+        // comment says "you're in crazy town" -- builds a meta storage with
+        // `meta_storage()` and `set_`s it onto a meta tensor to give that
+        // tensor a layout `clone()` could not preserve. No bytes exist on
+        // either side, so the `filled` check below is asking a question that
+        // cannot have a yes: nothing ever writes bytes into a meta storage,
+        // deliberately (`storage::meta`). `docs/graph/EXPORT5.md` §10 counted
+        // it as 11 of the 26 architectures that stop at export, and named this
+        // exact narrowing -- allow when BOTH are meta, refuse otherwise.
+        //
+        // The `filled` invariant is not lifted. A dense receiver, or a dense
+        // storage, still falls through to the refusal below, which is
+        // `docs/models/CKPT.md` §4's silent zeros and the reason the invariant
+        // exists. `test_export6.py` asserts that half beside this one, because
+        // a test for the narrowing alone would pass against a shim that had
+        // simply deleted the check.
+        if storage.is_meta_storage() && slf.borrow().is_meta_repr() {
+            if storage_offset != 0 {
+                return Err(not_implemented(format!(
+                    "{OP}(meta storage, storage_offset={storage_offset}, ...): \
+                     `Repr::Meta` carries a shape and a storage identity and no \
+                     offset, so a non-zero offset would be accepted and then \
+                     silently forgotten. Refused by name rather than dropped."
+                )));
+            }
+            let requested = stride.unwrap_or_else(|| contiguous_stride(&size));
+            if requested.len() != size.len() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{OP}: size {size:?} has {} dimensions but stride {requested:?} has {}",
+                    size.len(),
+                    requested.len()
+                )));
+            }
+            // Only a contiguous layout can be adopted, because `Repr::Meta` has
+            // no stride field -- deliberately, see its own comment, and
+            // `docs/graph/EXPORT4.md` §6.5 rests an invariant on it. Accepting a
+            // non-contiguous stride here would make `stride()` answer the
+            // contiguous one for a tensor that is not, which is a wrong answer
+            // with no trace. This is the same layout-model question as
+            // `docs/graph/EXPORT5.md` §10's third wall (`aten.t`/`aten.slice` on
+            // meta) and it is refused here for that reason, by name.
+            //
+            // Axes of extent 0 or 1 are skipped: their stride is unobservable
+            // and upstream does not normalise it, so demanding a particular
+            // value there would refuse layouts that are contiguous.
+            let canonical = contiguous_stride(&size);
+            let mismatch = size
+                .iter()
+                .zip(requested.iter())
+                .zip(canonical.iter())
+                .find(|((extent, got), want)| **extent > 1 && got != want);
+            if let Some(((_, _), _)) = mismatch {
+                return Err(not_implemented(format!(
+                    "{OP}(meta storage, size={size:?}, stride={requested:?}): this \
+                     shim's meta tensors carry no stride, so only a contiguous \
+                     layout can be adopted -- the contiguous stride for that \
+                     size is {canonical:?}. Refused rather than answered, \
+                     because accepting it would leave a tensor that reports a \
+                     layout it does not have. See docs/graph/EXPORT6.md \
+                     \u{a7}6 -- the stride question, unchanged."
+                )));
+            }
+            let storage_id = storage.identity();
+            drop(storage);
+            let replacement = Self::meta_with_storage_id(size, tag, storage_id);
+            slf.borrow_mut().replace_with(replacement);
+            return Ok(slf.clone());
+        }
+
         if numel > 0 && !storage.is_filled() {
             return Err(not_implemented(format!(
                 "{OP}: the storage has never been filled. This shim's set_ copies \

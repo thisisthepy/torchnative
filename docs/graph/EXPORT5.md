@@ -607,6 +607,16 @@ arithmetic — which is precisely why it needs a test rather than a tolerance.
 
 ## 10. The real sweep, and the three walls that remain
 
+> **Superseded for the three walls, not for the sweep.** `docs/graph/EXPORT6.md`
+> reproduced every figure in this section exactly -- 26/10/4 and 14/11/1 -- and
+> then closed walls 1 and 2 and the six further walls that were queued behind
+> them. The sweep is still 0/40 under the replay-and-agree bar; where the 26 stop
+> is completely different. **Read EXPORT6 §1.2 for the current numbers**; the
+> walls named below are historical from that point on, except the third
+> (`aten.t`/`aten.slice`, the missing stride on `Repr::Meta`), which is unchanged
+> and is now reached by five architectures instead of one (EXPORT6 §6).
+
+
 `export_sweep.py`, 40 `transformers` architectures, both sides, after the
 hand-off:
 

@@ -135,6 +135,28 @@ impl PyStorageBase {
         self.device == "meta"
     }
 
+    /// `is_meta`, for `tensor.rs`.
+    ///
+    /// `TensorBase.set_` has to tell a meta storage from a dense one, because
+    /// the two mean different things: a meta storage is a size and an identity
+    /// with no bytes, so adopting it is metadata and nothing else, while an
+    /// unfilled DENSE storage is the silent-zeros failure `docs/models/CKPT.md`
+    /// §4 records. Same method, opposite verdicts, and this is what separates
+    /// them.
+    pub fn is_meta_storage(&self) -> bool {
+        self.is_meta()
+    }
+
+    /// The storage identity token, for `tensor.rs`.
+    ///
+    /// For a meta storage this is `Repr::Meta`'s own `storage_id`, put here by
+    /// `meta()` above. Handing it back on `set_` is what keeps
+    /// `meta_utils.py`'s aliasing memo true: the tensor that adopts the storage
+    /// must answer the same `_cdata` as the storage it adopted.
+    pub fn identity(&self) -> usize {
+        self.origin
+    }
+
     /// The refusal a meta storage gives to anything that wants its bytes.
     ///
     /// Separate from `snapshot_is_read_only` because it is a different fact

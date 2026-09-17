@@ -316,6 +316,34 @@ class _ShimMeta(type):
         setattr(cls, name, value)
         return value
 
+    def __instancecheck__(cls, instance):
+        """`isinstance(arg.type, torch.TensorType)`, the other half of `get()`.
+
+        Five places in the vendored tree ask this of a *schema* type rather
+        than comparing against the singleton -- `torch/library.py:100,164,178`,
+        `torch/distributed/tensor/_sharding_prop.py:119`,
+        `torch/_higher_order_ops/out_dtype.py:58` -- and a `_SchemaType` is not
+        an instance of the synthesised stub class, so every one of them read
+        `False`.
+
+        The alias annotation is stripped before comparing, because it is not
+        part of the type: upstream's `Tensor(a!)` argument is a `TensorType`
+        with an `AliasInfo` beside it, which is exactly how this shim stores it
+        too. `Tensor?` and `Tensor[]` are NOT `TensorType` on either side --
+        upstream wraps them in `OptionalType`/`ListType` -- so the decomposition
+        refuses them by checking the two flags.
+
+        Everything that is not a `_SchemaType` falls through to the ordinary
+        rule, so this cannot change what any other synthesised class means.
+        """
+        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
+        if spelling is not None and type(instance) is _SchemaType:
+            base, is_list, optional, _ = _decompose_type(str(instance))
+            if is_list or optional:
+                return False
+            return base == spelling
+        return type.__instancecheck__(cls, instance)
+
 
 # Types whose metatype must be exactly `type`. `torch/autograd/variable.py:14`
 # is `class Variable(_C._LegacyVariableBase, metaclass=VariableMeta)` where
@@ -492,9 +520,28 @@ def _build_type(name, spec, module_name, resolved):
 
 
 def _singleton_getter():
+    """`_C.<X>Type.get()`, the TorchScript type singletons.
+
+    For the twelve scalar types `_SchemaType` knows a spelling for, `get()`
+    hands back **the interned `_SchemaType`** rather than an instance of the
+    stub class. That is what makes
+
+        schema.returns[0].type is torch._C.TensorType.get()
+
+    -- `torch/_subclasses/fake_impls.py:159`, the tensor-constructor test --
+    answerable at all. Before this it was `False` for every op in the file.
+
+    Everything else keeps the old behaviour: one stub instance per class,
+    created on demand. `torch/_higher_order_ops/schema.py:56` builds a dict of
+    these at import and the tree uses them as keys, so `get()` must be stable
+    whichever branch it takes.
+    """
     cache: dict = {}
 
     def get(cls):
+        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
+        if spelling is not None:
+            return _SchemaType(spelling)
         if cls not in cache:
             cache[cls] = cls()
         return cache[cls]
@@ -535,17 +582,66 @@ def _order_types(types_spec):
 class _SchemaType:
     """A type inside a schema, kept as its source spelling.
 
-    Not comparable to the TorchScript type singletons (`_C.TensorType.get()`
-    and friends): `torch/_library/utils.py:163` decides "is this a tensor
-    argument" by comparing against those objects, and answering `True` from a
-    string match would be claiming a correspondence the shim has not built.
-    Answering `False` makes the callers take their conservative branch, which
-    is the safe direction.
+    **It IS the TorchScript type singleton now**, and that is a change from
+    what this docstring used to say. The old text declined the correspondence
+    -- "answering `True` from a string match would be claiming a correspondence
+    the shim has not built" -- and was right to while the correspondence did
+    not exist. It exists now: instances are interned per spelling (`__new__`),
+    `_C.TensorType.get()` returns the interned `Tensor`, and `_ShimMeta`'s
+    `__instancecheck__` reads the same table. So `type is TensorType.get()` and
+    `isinstance(type, TensorType)` are answered by identity and by a decomposed
+    spelling respectively, not simulated.
+
+    The conservative `False` was not free. `torch/_subclasses/fake_impls.py:159`
+    uses that identity to decide "is this op a tensor constructor", and a
+    blanket `False` meant no factory op ever reached upstream's constructor
+    handler -- which is `docs/graph/EXPORT5.md` §10's `Could not find common
+    device` wall, on ten architectures.
+
+    What is still declined: a parametrised type lattice. `isSubtypeOf` answers
+    only equality-on-spelling plus `Any`, and `containedTypes` unwraps one
+    layer; anything wider would be inventing rules.
     """
 
     __slots__ = ("_spelling",)
 
+    #: spelling -> the one instance for it. See `__new__`.
+    _INTERNED: dict = {}
+
+    def __new__(cls, spelling: str):
+        """One object per spelling, for the whole process.
+
+        Interning is not a memory optimisation; it is what makes **identity**
+        answerable. `torch/_subclasses/fake_impls.py:159` decides whether an op
+        is a tensor constructor with
+
+            schema.returns[0].type is torch._C.TensorType.get()
+
+        and `is` cannot be satisfied by a type that mints a fresh object per
+        schema. With the table interned, `TensorType.get()` can hand back the
+        `Tensor` entry and every schema that spells `Tensor` gets that same
+        object. `docs/graph/EXPORT5.md` §10's `Could not find common device for
+        aten.arange.start_step` was this: no op was ever a constructor, so
+        `arange` reached the generic path, which looks for a device among
+        arguments that `arange` does not have.
+
+        Safe because a `_SchemaType` is immutable -- `__slots__`, one field,
+        written once here -- so two callers sharing one cannot disturb each
+        other. Unbounded, like `_decompose_type`'s memo and for the same
+        reason: the tables hold a few hundred distinct spellings.
+        """
+        interned = cls._INTERNED.get(spelling)
+        if interned is not None:
+            return interned
+        self = super().__new__(cls)
+        self._spelling = spelling
+        cls._INTERNED[spelling] = self
+        return self
+
     def __init__(self, spelling: str) -> None:
+        # `__new__` has already set it, on the first construction and on every
+        # later one. Assigning again is harmless and keeps the field's owner
+        # visible in one place.
         self._spelling = spelling
 
     def __str__(self) -> str:
@@ -633,6 +729,81 @@ class _SchemaType:
             return [_SchemaType(base)]
         return []
 
+    #: Schema base spelling -> the spelling upstream's `annotation_str` uses.
+    #:
+    #: Not invented and not a reading: it is the exact map read off upstream
+    #: torch 2.13.0 by parsing all 2584 `- func:` entries of the vendored
+    #: `native_functions.yaml` on both sides and pairing argument by argument.
+    #: `test_export6.py` re-derives it that way on every run, so a wrong entry
+    #: here is a failure and not a drift.
+    #:
+    #: The lossy rows are upstream's, not a simplification made here.
+    #: `ScalarType`, `Layout`, `MemoryFormat` and `DeviceIndex` all annotate as
+    #: plain `int`, and `SymInt`/`SymBool` as `int`/`bool` -- because
+    #: `torch/fx/operator_schemas.py:71` `_type_eval_globals` has no name for
+    #: any of them, so any more faithful spelling would `eval` to `NameError`
+    #: and stop `torch.export` exactly as the missing attribute did.
+    _ANNOTATION_BASES = {
+        "Tensor": "Tensor",
+        "Scalar": "number",
+        "number": "number",
+        "int": "int",
+        "SymInt": "int",
+        "DeviceIndex": "int",
+        "Layout": "int",
+        "MemoryFormat": "int",
+        "ScalarType": "int",
+        "bool": "bool",
+        "SymBool": "bool",
+        "float": "float",
+        "SymFloat": "float",
+        "complex": "complex",
+        "str": "str",
+        "Device": "Device",
+        "Generator": "Generator",
+        "Storage": "Storage",
+        "Stream": "Stream",
+        "QScheme": "QScheme",
+        "None": "NoneType",
+    }
+
+    @property
+    def annotation_str(self) -> str:
+        """The Python annotation for this type, as `eval`'d by `torch.fx`.
+
+        `torch/fx/operator_schemas.py:95` is the caller that matters:
+
+            return eval(ts_type.annotation_str, _type_eval_globals)
+
+        and `torch/export`'s normalisation reaches it for every argument of
+        every op it traces. Its absence was `docs/graph/EXPORT5.md` §10's
+        largest wall -- 14 of the 26 architectures that stopped at export.
+
+        Deliberately *not* `__str__`. Upstream's `JitType.__str__` and its
+        `annotation_str` happen to coincide, but this shim's `__str__` is the
+        schema spelling (`Tensor?`, `int[]`), which `_decompose_type` and every
+        binding path reads. Two different jobs, and merging them would have
+        `_bind` start seeing `Optional[Tensor]` where it expects `Tensor?`.
+
+        Recursive rather than table-driven on the whole spelling, because `?`
+        and `[]` nest in both orders: `int[]?` is `Optional[List[int]]` and
+        `Tensor?[]` is `List[Optional[Tensor]]`, and a flat table would have to
+        enumerate the cross product.
+
+        An unrecognised base passes through unchanged, which is upstream's own
+        fallback (`AnyEnumType`, `t`, `__torch__.X` all annotate as their own
+        name). It is not a guess in the dangerous direction: a base this shim
+        has never seen produces a `NameError` inside `eval` -- loud, named, and
+        at the call site -- rather than a plausible wrong type.
+        """
+        base, is_list, optional, _ = _decompose_type(self._spelling)
+        if is_list:
+            inner = _SchemaType(base).annotation_str
+            rendered = f"List[{inner}]"
+        else:
+            rendered = self._ANNOTATION_BASES.get(base, base)
+        return f"Optional[{rendered}]" if optional else rendered
+
 
 #: `(op spelling, predicate)` for every question answered from a schema with no
 #: text behind it. Read through `_C._shim_unanswered_predicates()`; see
@@ -649,22 +820,138 @@ class _AliasInfo:
         self.after_set = set(symbols)
 
 
-class _Argument:
-    __slots__ = ("name", "type", "kwarg_only", "default_value", "alias_info", "N")
+#: Sentinel for "the default has not been evaluated yet". `None` cannot be it:
+#: `None` is the single most common default in the file (1112 arguments), so a
+#: `None` cache would re-evaluate every one of them on every read.
+_UNEVALUATED = object()
 
-    def __init__(self, name, typ, kwarg_only, default_value, alias_info, N=None):
+
+class _Argument:
+    __slots__ = (
+        "name", "type", "kwarg_only", "default_source", "alias_info", "N",
+        "_default_cache",
+    )
+
+    def __init__(self, name, typ, kwarg_only, default_source, alias_info, N=None):
         self.name = name
         self.type = typ
         self.kwarg_only = kwarg_only
-        self.default_value = default_value
+        #: The default exactly as the schema spells it -- `"None"`, `"0"`,
+        #: `"[-2,-1]"`, `"Mean"` -- or `None` when there is no default at all.
+        #: This is what the binder reads (`_ArgPlan.default_source`), because
+        #: "is this argument equal to its own default" is decided on the text.
+        self.default_source = default_source
         self.alias_info = alias_info
         self.N = N
+        self._default_cache = _UNEVALUATED
 
     def has_default_value(self):
-        return self.default_value is not None
+        """Whether the schema declares a default, independent of its value.
+
+        Deliberately not `self.default_value is not None`, which is what it
+        used to be. That coupling is why `default_value` had to stay a string:
+        1112 of this file's arguments default to `None`, and under the old test
+        every one of them would have answered "no default". Upstream draws the
+        distinction and so does this -- `Tensor? bias=None` HAS a default, and
+        that default IS `None`.
+        """
+        return self.default_source is not None
+
+    @property
+    def default_value(self):
+        """The default as a Python VALUE, which is upstream's contract.
+
+        This used to answer the schema's source text, and it was never wrong
+        for the only caller it had: this shim's own binder re-parses that text.
+        The first reader from outside the shim got a string. It is
+        `torch/_subclasses/fake_impls.py:218`, and it does not inspect what it
+        got -- `normalize_function(..., normalize_to_only_use_kwargs=True)`
+        fills every unsupplied argument from here and hands the lot straight
+        back to the op:
+
+            r = func(*args, **{..., 'layout': 'None', 'device': 'None'})
+
+        so `torch.device('None')` is what raised, one frame further in, naming
+        a device type it had never heard of. That is the `docs/graph/COMPILE.md`
+        shape exactly: the failure surfaced nowhere near the wrong answer.
+
+        Evaluated lazily and cached. Schema parsing is per-op and on the import
+        path; almost no caller reads a default at all, and the ones that do
+        read all of them.
+        """
+        if self._default_cache is _UNEVALUATED:
+            self._default_cache = _default_python_value(
+                str(self.type), self.default_source
+            )
+        return self._default_cache
 
     def __repr__(self):
         return f"{self.type} {self.name}"
+
+
+def _default_python_value(type_spelling: str, source):
+    """`("int[2]", "0")` -> `[0, 0]`. The schema's default text as a value.
+
+    Every rule here is upstream's own, read off `torch._C.parse_schema` over
+    all 2584 `- func:` entries of the vendored `native_functions.yaml` and
+    compared argument by argument -- `test_export6.py` re-derives the whole
+    comparison on every run, so a rule that is merely plausible fails.
+
+    The four that are not obvious:
+
+    * **The sized-list broadcast.** `int[2] padding=0` defaults to `[0, 0]`,
+      not to `0`. It is the same rule the schema *printer* above already
+      encodes in the other direction (`_print_schema_default`'s rule 4), and
+      it has to be here too or `conv2d`'s stride would arrive as a scalar.
+    * **The element type decides int vs float.** `float alpha=1` is `1.0`
+      while `Scalar alpha=1` is `1`, because the second is an int IValue.
+      Deciding on the literal alone would get twelve arguments wrong.
+    * **Three defaults are enumerators**, `Mean` / `long` /
+      `contiguous_format`, and upstream answers their integer.
+      `_SCHEMA_ENUM_DEFAULTS` is the same table the printer uses.
+    * **An unparseable literal is returned as text** rather than guessed at.
+      Nothing in 2.13.0's file reaches that, and if something ever does, a
+      caller sees the schema's own spelling instead of a wrong number.
+    """
+    if source is None:
+        return None
+    text = source.strip()
+    if text == "None":
+        return None
+    if text == "True":
+        return True
+    if text == "False":
+        return False
+    base, is_list, _optional, size = _decompose_type(type_spelling)
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        return [_default_scalar(base, part.strip()) for part in _split_top_level(inner)]
+    value = _default_scalar(base, text)
+    if is_list:
+        return [value] * (size or 1)
+    return value
+
+
+def _default_scalar(base: str, literal: str):
+    if literal in _SCHEMA_ENUM_DEFAULTS:
+        return int(_SCHEMA_ENUM_DEFAULTS[literal])
+    if len(literal) >= 2 and literal[0] in "\"'" and literal[-1] == literal[0]:
+        return _unquote_schema_string(literal)
+    if base in ("float", "SymFloat"):
+        try:
+            return float(literal)
+        except ValueError:
+            return literal
+    try:
+        return int(literal)
+    except ValueError:
+        pass
+    try:
+        return float(literal)
+    except ValueError:
+        return literal
 
 
 def _split_top_level(text: str) -> list:
@@ -2234,9 +2521,10 @@ class _ArgPlan:
         # The list twin of `scalar_int`: a `SymInt[]`/`int[]` position whose
         # elements may each need `_symint_from_tensor`'s unpack.
         self.int_list = bool(is_list and base in ("int", "SymInt"))
-        # `_Argument.has_default_value()` is exactly this test.
-        self.default_source = argument.default_value
-        self.has_default = argument.default_value is not None
+        # `_Argument.has_default_value()` is exactly this test. The SOURCE
+        # text, not the value: `_is_schema_default` compares on the spelling.
+        self.default_source = argument.default_source
+        self.has_default = argument.default_source is not None
         self.predicate = None
 
 
