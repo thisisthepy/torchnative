@@ -1979,7 +1979,372 @@ fn visit_for_device(
 /// definition has none of. Meta support is a property of ops already on the
 /// list, so op coverage stays 96 and the evidence lives in
 /// `pytests/test_shim.py` instead. docs/devices/META.md §7.
+///
+/// **Every call goes through `meta_stride_rule` first** (docs/graph/STRIDE.md
+/// §3): a meta tensor stores its stride now, so each arm below is also a claim
+/// about the *layout* of what it returns, and an arm that has not been shown
+/// to make that claim correctly is not allowed to make it at all.
 fn meta_dispatch(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let inputs = meta_operands(args, kwargs);
+    match meta_stride_rule(op) {
+        MetaStrideRule::OwnLayout | MetaStrideRule::AlwaysContiguous => {
+            meta_table(py, op, args, kwargs)
+        }
+        MetaStrideRule::Elementwise => {
+            let out = meta_table(py, op, args, kwargs)?;
+            relay_elementwise(py, op, out, args, kwargs, &inputs, false)
+        }
+        MetaStrideRule::PreserveFormat => {
+            let out = meta_table(py, op, args, kwargs)?;
+            relay_elementwise(py, op, out, args, kwargs, &inputs, true)
+        }
+        MetaStrideRule::Unverified => {
+            if let Some((shape, stride)) = inputs
+                .iter()
+                .find(|(shape, stride)| *stride != crate::layout::contiguous(shape))
+            {
+                return Err(not_implemented(format!(
+                    "torch._C shim: the meta kernel for {op} has not been shown to \
+                     produce upstream's output stride, and one of its inputs is not \
+                     laid out contiguously (shape {shape:?}, stride {stride:?}). \
+                     Refused rather than answered with a contiguous stride upstream \
+                     may not give -- upstream's own answer for this op depends on \
+                     the input's layout. docs/graph/STRIDE.md \u{a7}3"
+                )));
+            }
+            meta_table(py, op, args, kwargs)
+        }
+    }
+}
+
+/// What a meta arm's output layout is, per op. docs/graph/STRIDE.md §3.
+///
+/// A meta kernel's result is a claim about shape, dtype **and stride**, and a
+/// wrong stride is believed downstream (the prims view metas build
+/// `as_strided` calls out of it). So every op is in exactly one of these, and
+/// the lists are checked against upstream by `pytests/test_metastride.py`
+/// rather than by reading.
+enum MetaStrideRule {
+    /// The arm computes the layout itself: the views (which share their
+    /// input's storage), the in-place initialisers (which return their
+    /// receiver), the ops whose result is not a tensor, and `cat`, whose
+    /// result follows the inputs' common memory format.
+    OwnLayout,
+    /// Upstream answers a fresh contiguous tensor whatever the input's
+    /// layout, which is what `meta_result` builds. Measured, not assumed:
+    /// `sort`, `index.Tensor`, the CPU flash-attention kernel and
+    /// `_weight_norm_interface` looked like members and are not.
+    AlwaysContiguous,
+    /// The output follows the operands' layout
+    /// (`layout::elementwise_stride`); the arm builds it contiguous and
+    /// `relay_elementwise` re-lays it.
+    Elementwise,
+    /// A copy that keeps a dense input's layout exactly and otherwise falls
+    /// back to `Elementwise` (`layout::preserve_format_stride`). Separate
+    /// because the two answer differently on an empty tensor, measured.
+    PreserveFormat,
+    /// Not shown for every layout: answers only when every meta input is
+    /// laid out contiguously. That the arm's answer is upstream's *there* is
+    /// itself a per-op measurement, not a consequence of contiguity --
+    /// `_scaled_dot_product_flash_attention_for_cpu` gives a transposed
+    /// `logsumexp` for contiguous inputs -- and
+    /// `test_metastride.py::test_gated_meta_kernels_agree_with_upstream_on_contiguous_inputs`
+    /// is that measurement for every op this arm catches.
+    Unverified,
+}
+
+fn meta_stride_rule(op: &str) -> MetaStrideRule {
+    match op {
+        "aten.as_strided.default"
+        | "aten.t.default"
+        | "aten.transpose.int"
+        | "aten.permute.default"
+        | "aten.slice.Tensor"
+        | "aten.select.int"
+        | "aten.expand.default"
+        | "aten.squeeze.default"
+        | "aten.squeeze.dim"
+        | "aten.squeeze.dims"
+        | "aten.unsqueeze.default"
+        | "aten.split.Tensor"
+        | "aten.split_with_sizes.default"
+        | "aten.view.default"
+        | "aten.reshape.default"
+        | "aten.detach.default"
+        | "aten.alias.default"
+        | "aten.lift_fresh.default"
+        | "aten.contiguous.default"
+        | "prims.view_of.default"
+        | "prims.split_dim.default"
+        | "prims.collapse_view.default"
+        | "aten.cat.default"
+        | "aten._scaled_dot_product_flash_attention_for_cpu.default"
+        | "aten.uniform_.default"
+        | "aten.normal_.default"
+        | "aten.zero_.default"
+        | "aten.fill_.Scalar"
+        | "aten.copy_.default"
+        | "aten.is_floating_point.default"
+        | "aten._local_scalar_dense.default"
+        | "aten.masked_select.default"
+        | "aten._unique2.default"
+        | "aten.repeat_interleave.Tensor" => MetaStrideRule::OwnLayout,
+        "aten.mm.default"
+        | "aten.bmm.default"
+        | "aten.addmm.default"
+        | "aten.matmul.default"
+        | "aten.sum.default"
+        | "aten.sum.dim_IntList"
+        | "aten.mean.default"
+        | "aten.mean.dim"
+        | "aten.amax.default"
+        | "aten.argmax.default"
+        | "aten.max.dim"
+        | "aten.min.dim"
+        | "aten.topk.default"
+        | "aten.cumsum.default"
+        | "aten.any.default"
+        | "aten.norm.ScalarOpt_dim"
+        | "aten.embedding.default"
+        | "aten.gather.default"
+        | "aten.native_layer_norm.default"
+        | "aten.convolution.default"
+        | "aten.repeat.default"
+        | "aten.new_zeros.default"
+        | "aten.new_empty.default"
+        | "aten.new_ones.default"
+        | "aten.tril.default"
+        | "aten.triu.default" => MetaStrideRule::AlwaysContiguous,
+        "aten.sin.default"
+        | "aten.cos.default"
+        | "aten.erf.default"
+        | "aten.exp.default"
+        | "aten.expm1.default"
+        | "aten.log.default"
+        | "aten.log2.default"
+        | "aten.rsqrt.default"
+        | "aten.sinc.default"
+        | "aten.sqrt.default"
+        | "aten.tanh.default"
+        | "aten.neg.default"
+        | "aten.reciprocal.default"
+        | "aten.relu.default"
+        | "aten.gelu.default"
+        | "aten.silu.default"
+        | "aten.bitwise_not.default"
+        | "aten.clamp.default"
+        | "aten.clip.default"
+        | "aten.clamp_min.default"
+        | "aten.pow.Tensor_Scalar"
+        | "aten.pow.Tensor_Tensor"
+        | "aten.add.Tensor"
+        | "aten.sub.Tensor"
+        | "aten.mul.Tensor"
+        | "aten.div.Tensor"
+        | "aten.add.Scalar"
+        | "aten.sub.Scalar"
+        | "aten.mul.Scalar"
+        | "aten.div.Scalar"
+        | "aten.rsub.Scalar"
+        | "aten.eq.Scalar"
+        | "aten.ne.Scalar"
+        | "aten.ge.Scalar"
+        | "aten.gt.Scalar"
+        | "aten.le.Scalar"
+        | "aten.lt.Scalar"
+        | "aten.eq.Tensor"
+        | "aten.ne.Tensor"
+        | "aten.ge.Tensor"
+        | "aten.gt.Tensor"
+        | "aten.le.Tensor"
+        | "aten.lt.Tensor"
+        | "aten.where.self"
+        | "aten.where.ScalarOther"
+        | "aten.where.ScalarSelf"
+        | "prims.sin.default"
+        | "prims.cos.default"
+        | "prims.erf.default"
+        | "prims.neg.default"
+        | "prims.reciprocal.default"
+        | "prims.rsqrt.default"
+        | "prims.sqrt.default"
+        | "prims.tanh.default"
+        | "aten.empty_like.default"
+        | "aten.zeros_like.default" => MetaStrideRule::Elementwise,
+        "aten.clone.default" | "prims.clone.default" | "aten._to_copy.default" => {
+            MetaStrideRule::PreserveFormat
+        }
+        _ => MetaStrideRule::Unverified,
+    }
+}
+
+/// The meta tensors among an op's arguments, as `(shape, stride)`, in
+/// argument order -- including those inside a list argument (`cat`).
+fn meta_operands(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> Vec<(Vec<usize>, Vec<usize>)> {
+    fn visit(value: &Bound<'_, PyAny>, out: &mut Vec<(Vec<usize>, Vec<usize>)>, depth: u8) {
+        if let Ok(tensor) = value.cast::<PyTensorBase>() {
+            if let Some((shape, stride, _)) = tensor.borrow().meta_layout() {
+                out.push((shape.to_vec(), stride.to_vec()));
+            }
+        } else if depth == 0 {
+            if let Ok(items) = value.cast::<PyList>() {
+                for item in items.iter() {
+                    visit(&item, out, 1);
+                }
+            } else if let Ok(items) = value.cast::<PyTuple>() {
+                for item in items.iter() {
+                    visit(&item, out, 1);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for value in args.iter() {
+        visit(&value, &mut out, 0);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            visit(&value, &mut out, 0);
+        }
+    }
+    out
+}
+
+/// Give an elementwise arm's output the layout upstream gives it.
+///
+/// The operands are expanded to the output's shape first, because upstream's
+/// rule runs on the broadcast operands (`_refs` broadcasts before
+/// `_elementwise_meta`). An output that *is* one of the arguments keeps its
+/// own layout -- it is not fresh, and re-laying it would move a tensor the
+/// caller also holds.
+fn relay_elementwise(
+    py: Python<'_>,
+    op: &str,
+    out: Py<PyAny>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    inputs: &[(Vec<usize>, Vec<usize>)],
+    preserve: bool,
+) -> PyResult<Py<PyAny>> {
+    let bound = out.bind(py);
+    let returned_an_argument = args.iter().any(|a| a.is(bound))
+        || kwargs.is_some_and(|k| k.values().iter().any(|a| a.is(bound)));
+    if returned_an_argument || inputs.is_empty() {
+        return Ok(out);
+    }
+    let Ok(tensor) = bound.cast::<PyTensorBase>() else {
+        return Err(not_implemented(format!(
+            "torch._C shim: {op} on meta returned something that is not a tensor, \
+             so its layout cannot be given (docs/graph/STRIDE.md \u{a7}3)"
+        )));
+    };
+    // An explicit `memory_format=` decides instead of the input: the meta
+    // arms ignored it, and `clone(x, memory_format=contiguous_format)` of a
+    // transposed `x` is contiguous upstream. Only the two formats with a
+    // known answer are served; the channels-last ones refuse by name.
+    match kwargs.and_then(|k| k.get_item("memory_format").ok().flatten()) {
+        Some(mf) if !mf.is_none() => {
+            let label = mf
+                .getattr("_shim_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| mf.str().map(|s| s.to_string()).unwrap_or_default());
+            match label.rsplit('.').next().unwrap_or(&label) {
+                "preserve_format" => {}
+                // `meta_result` built it contiguous already.
+                "contiguous_format" => return Ok(out),
+                other => {
+                    return Err(not_implemented(format!(
+                        "torch._C shim: {op} on meta with memory_format={other}: only \
+                         preserve_format and contiguous_format are laid out here \
+                         (docs/graph/STRIDE.md \u{a7}3)"
+                    )))
+                }
+            }
+        }
+        _ => {}
+    }
+    let shape = tensor.borrow().dims().to_vec();
+    let canonical_inputs = inputs
+        .iter()
+        .all(|(s, st)| *st == crate::layout::contiguous(s));
+    if !tensor.borrow().is_meta_repr() {
+        // `zeros_like(meta, device="cpu")`: upstream lays the dense result out
+        // like the input, and a dense tensor here cannot be given a layout.
+        if canonical_inputs {
+            return Ok(out);
+        }
+        return Err(not_implemented(format!(
+            "torch._C shim: {op} of a non-contiguous meta tensor onto a dense device \
+             would have upstream's input-following stride, and a dense tensor here \
+             cannot be built with a caller-chosen stride (docs/graph/STRIDE.md \u{a7}3)"
+        )));
+    }
+    let mut operands = Vec::with_capacity(inputs.len());
+    for (s, st) in inputs {
+        let broadcastable = s.len() <= shape.len()
+            && s.iter()
+                .zip(&shape[shape.len() - s.len()..])
+                .all(|(&have, &want)| have == want || have == 1);
+        if !broadcastable {
+            return Err(not_implemented(format!(
+                "torch._C shim: {op} on meta: operand of shape {s:?} does not broadcast \
+                 to the output shape {shape:?}, so the elementwise layout rule does not \
+                 apply (docs/graph/STRIDE.md \u{a7}3)"
+            )));
+        }
+        operands.push(crate::layout::expand_stride(s, st, &shape));
+    }
+    let stride = match (preserve, operands.as_slice()) {
+        (true, [only]) => crate::layout::preserve_format_stride(&shape, only),
+        (true, _) => {
+            return Err(not_implemented(format!(
+                "torch._C shim: {op} on meta has {} tensor operands; a preserve_format \
+                 copy has exactly one (docs/graph/STRIDE.md \u{a7}3)",
+                operands.len()
+            )))
+        }
+        (false, _) => crate::layout::elementwise_stride(&shape, &operands),
+    };
+    if stride != tensor.borrow().layout_stride()? {
+        tensor.borrow_mut().relay_fresh_meta(stride)?;
+    }
+    Ok(out)
+}
+
+/// A meta view of `input`: its storage, the layout given.
+fn meta_view_result(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    shape: Vec<usize>,
+    stride: Vec<usize>,
+    storage_offset: usize,
+) -> PyResult<Py<PyAny>> {
+    let view = input.meta_view(shape, stride, storage_offset).ok_or_else(|| {
+        not_implemented(format!("torch._C shim: {op}'s meta view arm was handed a non-meta tensor"))
+    })?;
+    Ok(view.into_pyobject(py)?.into_any().unbind())
+}
+
+/// `(shape, stride, storage_offset)` of a meta kernel's input, owned.
+fn meta_layout_of(op: &str, input: &PyTensorBase) -> PyResult<(Vec<usize>, Vec<usize>, usize)> {
+    input
+        .meta_layout()
+        .map(|(shape, stride, offset)| (shape.to_vec(), stride.to_vec(), offset))
+        .ok_or_else(|| {
+            not_implemented(format!("torch._C shim: {op}'s meta arm was handed a non-meta tensor"))
+        })
+}
+
+fn meta_table(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
@@ -1993,14 +2358,82 @@ fn meta_dispatch(
         // storage, which meta has none of. This shim's dense `detach`/`alias`
         // already copy rather than alias (docs/kernels/OPS4.md §8), so meta is not
         // losing an aliasing property it otherwise had.
-        "aten.detach.default" | "aten.alias.default" | "aten.clone.default"
-        | "aten.contiguous.default" | "aten.lift_fresh.default"
-        // `prims.clone` is the same pass-through. `prims.view_of` is too, but
-        // its argument is named `a`, so it is a line of its own below rather
-        // than a name added to this list.
+        //
+        // **`detach`/`alias`/`lift_fresh` are views on meta** and keep their
+        // input's layout and storage, as upstream's do (measured: a meta
+        // `t().detach()` reports `(1, 4)` and the base's `_cdata`). `clone`
+        // and `contiguous` are copies: a fresh storage, laid out by
+        // `meta_stride_rule` (elementwise for `clone`, contiguous for
+        // `contiguous`).
+        "aten.detach.default" | "aten.alias.default" | "aten.lift_fresh.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            meta_view_result(py, op, &input, shape, stride, offset)
+        }
+        // `aten::contiguous` is `self` when `self` is already contiguous --
+        // the same object, offset and storage included (measured: a meta
+        // `x[1:3].contiguous()` keeps offset 4). Otherwise a fresh contiguous
+        // copy.
+        "aten.contiguous.default" => {
+            let receiver = tensor_receiver(op, args, kwargs)?;
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let (shape, stride, _) = meta_layout_of(op, &input)?;
+            if crate::layout::is_contiguous(&shape, &stride) {
+                return Ok(receiver.into_any().unbind());
+            }
+            meta_result(py, shape, input.tag())
+        }
+        "aten.clone.default"
+        // `prims.clone` is the same pass-through. `prims.view_of` is a view,
+        // and its argument is named `a`, so it is a line of its own below.
         | "prims.clone.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             meta_result(py, input.dims().to_vec(), input.tag())
+        }
+        // `aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride,
+        // SymInt? storage_offset=None)` -- docs/graph/EXPORT6.md §6's op, and
+        // the one every prims view meta is written in terms of
+        // (`torch/_prims/__init__.py`: `a.as_strided(new_shape, new_strides,
+        // a.storage_offset())`).
+        //
+        // The layout is **stored as given**; nothing is derived from the
+        // shape. Upstream's checks, in upstream's order and words, measured on
+        // a meta tensor on 2.13.0. Upstream's *aten* meta does **not**
+        // bounds-check against the storage (a 12-element base accepts a
+        // 16-element layout); the prims meta does, in Python, against
+        // `untyped_storage()` -- which is why the storage size is a field.
+        // The default offset is the input's own, not zero.
+        "aten.as_strided.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let size = shape_arg(op, args, kwargs, 1, "size")?;
+            let stride = shape_arg(op, args, kwargs, 2, "stride")?;
+            let requested_offset = int_arg(args, kwargs, 3, "storage_offset")?;
+            if size.len() != stride.len() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "mismatch in length of strides and shape",
+                ));
+            }
+            if stride.iter().any(|&s| s < 0) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "as_strided: Negative strides are not supported at the moment, \
+                     got strides: {stride:?}"
+                )));
+            }
+            if size.iter().any(|&s| s < 0) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "numel: integer multiplication overflow",
+                ));
+            }
+            let (_, _, own_offset) = meta_layout_of(op, &input)?;
+            let offset = requested_offset.unwrap_or(own_offset as i64);
+            if offset < 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Tensor: invalid storage offset {offset}"
+                )));
+            }
+            let shape = size.iter().map(|&v| v as usize).collect();
+            let stride = stride.iter().map(|&v| v as usize).collect();
+            meta_view_result(py, op, &input, shape, stride, offset as usize)
         }
         // **In-place initialisers: no-ops that return the receiver.** These are
         // not a convenience -- `nn.Linear.reset_parameters` runs
@@ -2385,7 +2818,8 @@ fn meta_dispatch(
         // the dense kernel refuses to compute.
         "prims.view_of.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "a")?;
-            meta_result(py, input.dims().to_vec(), input.tag())
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            meta_view_result(py, op, &input, shape, stride, offset)
         }
         "aten.neg.default" | "prims.neg.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -2491,14 +2925,18 @@ fn meta_dispatch(
                 ));
             }
             let dim = normalise_dim(op, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), dims.len())?;
-            normalise_index(
+            let index = normalise_index(
                 op,
                 int_arg(args, kwargs, 2, "index")?.ok_or_else(|| missing(op, "index"))? as isize,
                 dims[dim],
             )?;
-            let mut shape = dims;
+            // A view: the removed axis moves the offset by `index` steps of
+            // its stride, and the axis's stride goes with it.
+            let (mut shape, mut stride, offset) = meta_layout_of(op, &input)?;
+            let offset = offset + index * stride[dim];
             shape.remove(dim);
-            meta_result(py, shape, input.tag())
+            stride.remove(dim);
+            meta_view_result(py, op, &input, shape, stride, offset)
         }
         // `aten::tril` / `aten::triu` -- shape and dtype both unchanged; the
         // whole op is *which values are zeroed*, and a meta tensor has none.
@@ -2564,7 +3002,10 @@ fn meta_dispatch(
                     )));
                 }
             }
-            meta_result(py, target, input.tag())
+            // A view: grown axes get stride 0 (`layout::expand_stride`).
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            let strides = crate::layout::expand_stride(&shape, &stride, &target);
+            meta_view_result(py, op, &input, target, strides, offset)
         }
         // `aten::div.Scalar` and `aten::mul.Scalar` -- shape is the input's,
         // dtype is `arith_tag`'s.
@@ -2691,20 +3132,21 @@ fn meta_dispatch(
                     "shape '{requested:?}' is invalid for input of size {numel}"
                 )));
             }
-            // **The storage identity is inherited, not freshly minted.**
-            // `view` is the one meta kernel here that is a view, and upstream's
-            // view shares its input's storage -- `_cdata` is equal on both
-            // sides, measured on 2.13.0. A fresh id would make
-            // `meta_utils.py`'s `storage_memo` see a tensor and its own view as
-            // two unrelated storages, which is precisely the aliasing the memo
-            // exists to preserve. tensor.rs::`Repr::Meta`.
-            let storage_id = input
-                .meta_storage_id()
-                .expect("a meta kernel's input is a meta tensor");
-            Ok(PyTensorBase::meta_with_storage_id(dims, input.tag(), storage_id)
-                .into_pyobject(py)?
-                .into_any()
-                .unbind())
+            // **The storage identity is inherited, not freshly minted**, and
+            // now so is the layout: upstream's `view` shares its input's
+            // storage (`_cdata` equal, measured on 2.13.0), and is *legal*
+            // only where `computeStride` finds a stride for the new shape. A
+            // meta tensor could not be non-contiguous before docs/graph/STRIDE.md,
+            // so this refusal could not fire; it can now, in upstream's words.
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            let Some(strides) = crate::layout::view_stride(&shape, &stride, &dims) else {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "view size is not compatible with input tensor's size and stride \
+                     (at least one dimension spans across two contiguous subspaces). \
+                     Use .reshape(...) instead.",
+                ));
+            };
+            meta_view_result(py, op, &input, dims, strides, offset)
         }
         // ---------------------------------------------------------------
         // METAFAM.md: the two families VOICE4.md §4 opened one member of
@@ -2834,11 +3276,13 @@ fn meta_dispatch(
         // refused. META.md §7.4's note that `reshape` "may copy, so
         // answering it from view's rule promises a view where upstream
         // might return a copy" is a promise about *aliasing*, and a meta
-        // tensor carries no storage to alias in the first place -- this
-        // shim's meta tensors do not track strides at all (§7.2's note on
-        // `expand`), so "view" and "copy" are indistinguishable outputs
-        // here: same shape, same dtype, no data either way. Shape and dtype
-        // are the whole of what a meta kernel can promise.
+        // tensor carries no storage to alias in the first place.
+        //
+        // **That reasoning expired with docs/graph/STRIDE.md**: a meta tensor
+        // carries a layout and a storage identity now, so view and copy are
+        // distinguishable, and this arm picks between them by upstream's rule
+        // -- a view where `layout::view_stride` finds one, otherwise a fresh
+        // contiguous copy.
         "aten.reshape.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let numel: usize = input.dims().iter().product();
@@ -2850,7 +3294,11 @@ fn meta_dispatch(
                     "shape '{requested:?}' is invalid for input of size {numel}"
                 )));
             }
-            meta_result(py, dims, input.tag())
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            match crate::layout::view_stride(&shape, &stride, &dims) {
+                Some(strides) => meta_view_result(py, op, &input, dims, strides, offset),
+                None => meta_result(py, dims, input.tag()),
+            }
         }
         // `aten::t.default` -- `t_default`'s own rule: 0-D/1-D unchanged,
         // 2-D swaps, 3-D+ refuses.
@@ -2862,11 +3310,12 @@ fn meta_dispatch(
                     "t() expects a tensor with <= 2 dimensions, but self is {rank}D"
                 )));
             }
-            let mut dims = input.dims().to_vec();
+            let (mut dims, mut stride, offset) = meta_layout_of(op, &input)?;
             if rank == 2 {
                 dims.swap(0, 1);
+                stride.swap(0, 1);
             }
-            meta_result(py, dims, input.tag())
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // `aten::transpose.int` -- `transpose_int`'s own rule: swap the two
         // named axes, both normalised against the input's rank.
@@ -2883,9 +3332,10 @@ fn meta_dispatch(
                 dim_arg(args, kwargs, 2, "dim1")?.ok_or_else(|| missing(op, "dim1"))?,
                 rank,
             )?;
-            let mut dims = input.dims().to_vec();
+            let (mut dims, mut stride, offset) = meta_layout_of(op, &input)?;
             dims.swap(dim0, dim1);
-            meta_result(py, dims, input.tag())
+            stride.swap(dim0, dim1);
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // `aten::permute.default` -- `permute_default`'s own refusals
         // (wrong length, duplicate axis) and reordering.
@@ -2901,9 +3351,9 @@ fn meta_dispatch(
                     requested.len()
                 )));
             }
-            let extents = input.dims().to_vec();
+            let (extents, strides, offset) = meta_layout_of(op, &input)?;
             if rank == 0 {
-                meta_result(py, extents, input.tag())
+                meta_view_result(py, op, &input, extents, strides, offset)
             } else {
                 let mut order = Vec::with_capacity(rank);
                 for &value in &requested {
@@ -2916,7 +3366,8 @@ fn meta_dispatch(
                     order.push(dim);
                 }
                 let dims = order.iter().map(|&d| extents[d]).collect();
-                meta_result(py, dims, input.tag())
+                let stride = order.iter().map(|&d| strides[d]).collect();
+                meta_view_result(py, op, &input, dims, stride, offset)
             }
         }
         // `aten::unsqueeze.default` -- `unsqueeze_default`'s own range,
@@ -2936,9 +3387,11 @@ fn meta_dispatch(
                     extent - 1
                 )));
             }
-            let mut dims = input.dims().to_vec();
+            let (mut dims, mut stride, offset) = meta_layout_of(op, &input)?;
+            let new_stride = crate::layout::unsqueeze_stride(&dims, &stride, dim as usize);
             dims.insert(dim as usize, 1);
-            meta_result(py, dims, input.tag())
+            stride.insert(dim as usize, new_stride);
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // `aten::squeeze.dim` -- a non-1 axis is a no-op, not a refusal
         // (`squeeze_dim`'s own comment).
@@ -2950,11 +3403,12 @@ fn meta_dispatch(
                 dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?,
                 rank,
             )?;
-            let mut dims = input.dims().to_vec();
+            let (mut dims, mut stride, offset) = meta_layout_of(op, &input)?;
             if rank > 0 && dims[dim] == 1 {
                 dims.remove(dim);
+                stride.remove(dim);
             }
-            meta_result(py, dims, input.tag())
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // `aten::squeeze.dims` -- the named axes, and only the ones whose
         // extent is 1. An axis of any other extent is a **no-op, not an
@@ -2975,13 +3429,15 @@ fn meta_dispatch(
                 .collect::<PyResult<Vec<_>>>()?;
             refuse_duplicate_dims(&named)?;
             named.sort_unstable();
-            let mut out = dims.clone();
+            let (mut out, mut stride, offset) = meta_layout_of(op, &input)?;
+            debug_assert_eq!(out, dims);
             for dim in named.into_iter().rev() {
                 if out.get(dim) == Some(&1) {
                     out.remove(dim);
+                    stride.remove(dim);
                 }
             }
-            meta_result(py, out, input.tag())
+            meta_view_result(py, op, &input, out, stride, offset)
         }
         // `prims::split_dim(a, dim, outer_length)` -- one axis becomes two.
         //
@@ -2992,6 +3448,42 @@ fn meta_dispatch(
         // remainder is a `ValueError` naming both lengths. A meta kernel that
         // accepted what the dense one refuses would let a trace record a shape
         // that cannot be computed.
+        // `prims::collapse_view(a, start, end)` -- axes `start..=end` merged,
+        // as a view, or upstream's refusal when they do not nest. EXPORT6
+        // §1.2's sixth wall: `_reshape_view_helper` reaches it through
+        // `flatten`. `_collapse_view_helper` is `layout::collapse_view`.
+        "prims.collapse_view.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "a")?;
+            let start = dim_arg(args, kwargs, 1, "start")?.ok_or_else(|| missing(op, "start"))?;
+            let end = dim_arg(args, kwargs, 2, "end")?.ok_or_else(|| missing(op, "end"))?;
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            let rank = shape.len().max(1);
+            for idx in [start, end] {
+                if idx < 0 {
+                    return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                        "idx {idx} is out of bounds for rank {rank}"
+                    )));
+                }
+            }
+            match crate::layout::collapse_view(&shape, &stride, start as usize, end as usize) {
+                Ok((shape, stride)) => meta_view_result(py, op, &input, shape, stride, offset),
+                Err(crate::layout::CollapseError::OutOfBounds { idx, rank }) => {
+                    Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                        "idx {idx} is out of bounds for rank {rank}"
+                    )))
+                }
+                Err(crate::layout::CollapseError::Backwards { start, end }) => {
+                    Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Attempting to collapse but end, {end}, is less than start, {start}!"
+                    )))
+                }
+                Err(crate::layout::CollapseError::NoSuchView) => {
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "Attempting to view a collapsed tensor, but no such view exists!",
+                    ))
+                }
+            }
+        }
         "prims.split_dim.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "a")?;
             let dim = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?;
@@ -3022,22 +3514,37 @@ fn meta_dispatch(
                 )));
             }
             let inner_length = length / outer_length;
+            // `_split_dim_meta`'s layout: the outer axis steps over whole inner
+            // runs, the inner axis keeps the split axis's stride.
+            let (_, strides, offset) = meta_layout_of(op, &input)?;
             let mut shape: Vec<usize> = Vec::with_capacity(rank + 1);
+            let mut stride: Vec<usize> = Vec::with_capacity(rank + 1);
             for (index, &extent) in dims.iter().enumerate() {
                 if index == dim as usize {
                     shape.push(outer_length as usize);
                     shape.push(inner_length as usize);
+                    stride.push(strides[index] * inner_length as usize);
+                    stride.push(strides[index]);
                 } else {
                     shape.push(extent);
+                    stride.push(strides[index]);
                 }
             }
-            meta_result(py, shape, input.tag())
+            if rank == 0 {
+                // `dim == 0` on a 0-d tensor is allowed above and splits a
+                // length-1 axis that has no stride to inherit.
+                shape = vec![outer_length as usize, inner_length as usize];
+                stride = vec![inner_length as usize, 1];
+            }
+            meta_view_result(py, op, &input, shape, stride, offset)
         }
         // `aten::squeeze.default` -- every axis of size 1 removed.
         "aten.squeeze.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
-            let dims: Vec<usize> = input.dims().iter().copied().filter(|&e| e != 1).collect();
-            meta_result(py, dims, input.tag())
+            let (shape, stride, offset) = meta_layout_of(op, &input)?;
+            let (dims, stride): (Vec<usize>, Vec<usize>) =
+                shape.iter().zip(&stride).filter(|(&e, _)| e != 1).map(|(&e, &s)| (e, s)).unzip();
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // `aten::slice.Tensor` -- `slice_tensor`'s own clamping arithmetic,
         // shape-only: the narrowed extent along `dim`, everything else
@@ -3064,9 +3571,13 @@ fn meta_dispatch(
                 None => extent,
             };
             let length = ((end - start).max(0) as usize + step as usize - 1) / step as usize;
-            let mut dims = input.dims().to_vec();
+            // A view: the offset moves `start` steps along `dim`, and the
+            // axis's stride is multiplied by `step`.
+            let (mut dims, mut stride, offset) = meta_layout_of(op, &input)?;
+            let offset = offset + start as usize * stride[dim];
             dims[dim] = length;
-            meta_result(py, dims, input.tag())
+            stride[dim] *= step as usize;
+            meta_view_result(py, op, &input, dims, stride, offset)
         }
         // ---------------------------------------------------------------
         // Contraction/indexing family and the multi-output reductions.
@@ -3540,9 +4051,13 @@ fn meta_dispatch(
                 .chain(std::iter::repeat(1).take(k))
                 .collect();
             let triple = [
-                meta_result(py, dims, tag)?,
-                meta_result(py, stat_dims.clone(), stat_tag)?,
-                meta_result(py, stat_dims, stat_tag)?,
+                // Promoted: the triple leaves inside a tuple, which the
+                // dispatcher's exit does not look into, and each half was a
+                // bare `TensorBase` until docs/graph/STRIDE.md's probe recorded
+                // the result's type.
+                crate::tensor::promote(py, meta_result(py, dims, tag)?)?,
+                crate::tensor::promote(py, meta_result(py, stat_dims.clone(), stat_tag)?)?,
+                crate::tensor::promote(py, meta_result(py, stat_dims, stat_tag)?)?,
             ];
             Ok(PyTuple::new(py, triple)?.into_any().unbind())
         }
@@ -3607,6 +4122,25 @@ fn meta_dispatch(
                 total += dims[dim];
             }
             shape[dim] = total;
+            // The layout is the inputs' common suggested memory format
+            // (`cat`'s `compute_output_memory_format`): channels-last only if
+            // every counted input's stride ordering suggests it, contiguous on
+            // any disagreement. Measured: two NHWC-permuted inputs give an
+            // NHWC-strided result on meta, which `meta_result` alone missed.
+            // Every input votes, *including* the skipped 1-D empty ones: a
+            // `zeros(0)` in the list makes the result contiguous, measured.
+            let all_channels_last = tensors.iter().all(|t| {
+                t.meta_layout()
+                    .is_some_and(|(s, st, _)| crate::layout::strides_like_channels_last(s, st))
+            });
+            if all_channels_last {
+                if let Some(stride) = crate::layout::channels_last(&shape) {
+                    return Ok(PyTensorBase::meta_fresh(shape, stride, tag)
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind());
+                }
+            }
             meta_result(py, shape, tag)
         }
         // `aten::split.Tensor` and `aten::split_with_sizes` -- one arm,
@@ -3664,10 +4198,16 @@ fn meta_dispatch(
                 sizes.iter().map(|&v| v as usize).collect()
             };
             let mut chunks: Vec<Py<PyAny>> = Vec::with_capacity(lengths.len());
+            // Views, each one `narrow`: offset by the lengths before it.
+            let (base_shape, stride, base_offset) = meta_layout_of(op, &input)?;
+            let mut start = 0usize;
             for length in lengths {
-                let mut shape = input.dims().to_vec();
+                let mut shape = base_shape.clone();
                 shape[dim] = length;
-                chunks.push(crate::tensor::promote(py, meta_result(py, shape, input.tag())?)?);
+                let offset = base_offset + start * stride[dim];
+                start += length;
+                let view = meta_view_result(py, op, &input, shape, stride.clone(), offset)?;
+                chunks.push(crate::tensor::promote(py, view)?);
             }
             Ok(PyTuple::new(py, chunks)?.into_any().unbind())
         }
@@ -3784,9 +4324,36 @@ fn meta_dispatch(
                      same head size",
                 ));
             }
+            // The layouts are upstream's meta registration's, which is two
+            // lines (`_meta_registrations.py`, measured to agree):
+            //
+            //     attention = torch.empty_like(query)
+            //     logsumexp = torch.empty((B, T, H)).transpose(1, 2)
+            //
+            // so `logsumexp` is transposed **even for a contiguous query** --
+            // `(15, 1, 3)` for `(2, 3, 5)`. Both used to be answered
+            // contiguously, and that was a wrong stride on the path the
+            // stride gate lets through (docs/graph/STRIDE.md §3.2).
+            //
+            // Both halves are promoted here, for `max.dim`'s reason: the pair
+            // leaves inside a tuple, and the dispatcher's exit does not look
+            // into one. Unpromoted, `F.scaled_dot_product_attention` on meta
+            // returned a bare `TensorBase`.
+            let (_, q_stride, _) = meta_layout_of(op, &query)?;
+            let attention_stride = crate::layout::elementwise_stride(&q, &[q_stride]);
+            let attention = PyTensorBase::meta_fresh(q.clone(), attention_stride, query.tag());
+            let base = PyTensorBase::meta(vec![q[0], q[2], q[1]], TorchDType::Float32);
+            let base_stride = base.layout_stride()?;
+            let logsumexp = base
+                .meta_view(
+                    vec![q[0], q[1], q[2]],
+                    vec![base_stride[0], base_stride[2], base_stride[1]],
+                    0,
+                )
+                .expect("a fresh meta tensor is a meta tensor");
             let pair = [
-                meta_result(py, q.clone(), query.tag())?,
-                meta_result(py, vec![q[0], q[1], q[2]], TorchDType::Float32)?,
+                crate::tensor::promote(py, attention.into_pyobject(py)?.into_any().unbind())?,
+                crate::tensor::promote(py, logsumexp.into_pyobject(py)?.into_any().unbind())?,
             ];
             Ok(PyTuple::new(py, pair)?.into_any().unbind())
         }
@@ -4069,9 +4636,10 @@ fn meta_dispatch(
                 TorchDType::Float16 | TorchDType::BFloat16 => TorchDType::Float32,
                 other => other,
             };
+            // Promoted for the same reason as the attention pair above.
             let pair = [
-                meta_result(py, dims_in, tag)?,
-                meta_result(py, norms_shape, norm_tag)?,
+                crate::tensor::promote(py, meta_result(py, dims_in, tag)?)?,
+                crate::tensor::promote(py, meta_result(py, norms_shape, norm_tag)?)?,
             ];
             Ok(PyTuple::new(py, pair)?.into_any().unbind())
         }
@@ -7877,13 +8445,11 @@ fn ones_default(
 /// before it reaches anything interesting. docs/graph/EXPORT.md §3.1 named it as the
 /// wall past the census, and docs/graph/EXPORT4.md §4 is what it turned out to be.
 ///
-/// **It serves the contiguous case and refuses every other stride by name.**
-/// That split is forced, not chosen, and both halves of it are in the type:
+/// **On meta it builds any layout; on a dense device it serves the contiguous
+/// case and refuses every other stride by name.** The meta half used to refuse
+/// too, because `Repr::Meta` stored no stride; it does now
+/// (docs/graph/STRIDE.md), so that half of the argument below is history.
 ///
-/// * `Repr::Meta { shape }` (tensor.rs) stores a shape and no stride. That is a
-///   deliberate narrowing recorded in docs/devices/META.md §6 -- upstream's meta *does*
-///   carry stride -- and it means a meta tensor here cannot remember a stride it
-///   was asked for.
 /// * A dense tensor cannot carry an arbitrary caller-supplied stride either.
 ///   `Tensor::from_storage` always allocates contiguous strides, and the
 ///   constructor that would pair a custom `candle_core::Layout` with a storage
@@ -7892,7 +8458,7 @@ fn ones_default(
 ///   contiguous storage -- and that trick is unavailable here, because
 ///   `empty_strided` has no base to gather from.
 ///
-/// So a non-contiguous request has no representation on either path, and the
+/// So a non-contiguous request has no dense representation, and the
 /// choice is between refusing it and returning a contiguous tensor while
 /// claiming it is strided. The second is the failure this repository keeps
 /// meeting: the caller asked for a layout, got a different one silently, and
@@ -7959,6 +8525,18 @@ fn empty_strided_default(
 
     let dims: Vec<usize> = size.iter().map(|&s| s as usize).collect();
 
+    // **A meta tensor stores the stride it is asked for** (docs/graph/STRIDE.md),
+    // so the meta half has no representability question left: any
+    // non-negative layout is built as given, with the storage size upstream
+    // gives it (`layout::storage_nbytes`). Only the dense half still refuses.
+    if label.is_meta() {
+        let strides = stride.iter().map(|&s| s as usize).collect();
+        return Ok(PyTensorBase::meta_fresh(dims, strides, dtype)
+            .into_pyobject(py)?
+            .into_any()
+            .unbind());
+    }
+
     // The contiguous stride for this shape, right to left. A zero- or
     // one-extent axis makes its own stride unobservable -- no two distinct
     // index tuples differ in it -- so those axes are not allowed to decide the
@@ -7982,15 +8560,11 @@ fn empty_strided_default(
             "{OP}: a non-contiguous stride is not representable in this shim -- \
              asked for size={size:?} stride={stride:?}, and the only stride this \
              shim can build for that size is the contiguous {contiguous:?}. \
-             A meta tensor here stores a shape and no stride (docs/devices/META.md §6), \
-             and a dense tensor cannot be given a caller-supplied stride at all, \
-             so returning a contiguous tensor would silently answer a different \
-             layout than the one requested. docs/graph/EXPORT4.md §4"
+             A dense tensor cannot be given a caller-supplied stride at all \
+             (a meta one can, docs/graph/STRIDE.md), so returning a contiguous \
+             tensor would silently answer a different layout than the one \
+             requested. docs/graph/EXPORT4.md §4"
         )));
-    }
-
-    if label.is_meta() {
-        return meta_result(py, dims, dtype);
     }
     let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(OP)?;

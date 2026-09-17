@@ -556,24 +556,43 @@ def test_the_warn_deprecated_sibling_warns_and_still_answers():
                for _, m in r["warn_messages"]), r["warn_messages"]
 
 
-def test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable():
-    """The invariant the answer rests on, asserted rather than assumed.
+_META_STRIDE_PROBE = r"""
+import json
+import torch
 
-    `Repr::Meta` stores no stride. `stride()` is answerable anyway *only*
-    because every meta tensor here is contiguous, and a contiguous tensor's
-    stride is a function of its shape. The day a non-contiguous meta tensor
-    becomes constructible, this fails -- which is the day the derived answer
-    would start lying.
+m = torch.zeros(2, 3, 4, device="meta")
+t = torch.zeros(3, 4, device="meta").t()
+s = torch.zeros(5, 4, device="meta")[1:, ::2]
+print(json.dumps({
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
+    "fresh": [m.is_contiguous(), list(m.stride()), m.stride(0), m.stride(-1), m.storage_offset()],
+    "scalar": list(torch.zeros((), device="meta").stride()),
+    "transposed": [t.is_contiguous(), list(t.stride()), t.stride(0), t.storage_offset()],
+    "sliced": [s.is_contiguous(), list(s.stride()), s.storage_offset()],
+}))
+"""
+
+
+def test_a_meta_tensor_reports_the_stride_it_stores_not_one_derived_from_its_shape():
+    """docs/graph/EXPORT4.md §6.5, rewritten by docs/graph/STRIDE.md.
+
+    §6.5 answered a meta `stride()` with the contiguous stride of its shape,
+    resting on "every meta tensor is contiguous", and this test used to assert
+    that invariant -- on a freshly constructed tensor only.  The invariant was
+    already false: the meta `t()` arm answered `(3, 1)` for a tensor upstream
+    reports as `(1, 4)`.  `Repr::Meta` now stores the stride, so the test asks
+    the question that invariant was standing in for: does a *non-contiguous*
+    meta tensor report upstream's stride and offset?  A shim that derived the
+    stride from the shape fails on `transposed` and `sliced`.
     """
     if not _available():
         return
-    r = _shim()
-    assert _ok(r["meta_contiguous"], "meta is_contiguous") is True
-    assert _ok(r["meta_stride"], "meta stride") == [12, 4, 1]
-    assert _ok(r["meta_stride_dim"], "meta stride(0)") == 12
-    assert _ok(r["meta_stride_neg_dim"], "meta stride(-1)") == 1
-    assert _ok(r["meta_storage_offset"], "meta storage_offset") == 0
-    assert _ok(r["meta_scalar_stride"], "0-d meta stride") == []
+    shim = _run(_META_STRIDE_PROBE, shim=True)
+    up = _run(_META_STRIDE_PROBE, shim=False)
+    assert shim["is_shim"] and not up["is_shim"]
+    for key in ("fresh", "scalar", "transposed", "sliced"):
+        assert shim[key] == up[key], f"{key}: shim {shim[key]} upstream {up[key]}"
+    assert up["transposed"][0] is False, "the probe must include a non-contiguous meta tensor"
 
 
 def test_meta_stride_keeps_the_dim_range_check_and_leaves_dense_alone():

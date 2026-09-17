@@ -160,6 +160,10 @@ META.md §7.4's note (added when VOICE4.md closed `view` but not `reshape`) read
 됩니다" -- reshape may copy, so answering it from view's rule promises a view where upstream
 might return a copy.
 
+> **Superseded by `docs/graph/STRIDE.md`:** a meta tensor carries a layout and a storage
+> identity now, so view and copy are distinguishable, and `reshape`'s meta arm picks
+> between them by upstream's `computeStride` rule.
+
 That is a claim about ALIASING. A meta tensor in this shim carries no storage and no strides
 at all (META.md §7.2's own note on `expand`: "이 셰임의 meta expand는 모양만 맞고 스트라이드
 의미는 없습니다"), so "the result aliases the input" and "the result is a fresh copy" are

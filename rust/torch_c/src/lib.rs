@@ -37,6 +37,7 @@ mod dtype;
 mod err;
 mod flash;
 mod info;
+mod layout;
 mod quant;
 mod reduced;
 mod rng;

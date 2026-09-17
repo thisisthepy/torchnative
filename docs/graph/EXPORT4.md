@@ -162,6 +162,8 @@ by the storage model, and both halves of the force are in the types:
 
 * `Repr::Meta { shape }` stores a shape and **no stride**. `docs/devices/META.md` §6
   records that as a deliberate narrowing — upstream's meta *does* carry stride.
+  *(No longer true: `docs/graph/STRIDE.md` §2 — a meta tensor stores its
+  stride, and meta `empty_strided` builds any non-negative one.)*
 * A dense tensor cannot be given an arbitrary caller-supplied stride either.
   `Tensor::from_storage` always allocates contiguous strides and the constructor
   that would pair a custom `candle_core::Layout` with a storage is not public.
@@ -359,6 +361,13 @@ one-way, like upstream's: an un-setter would let a fake tensor be laundered into
 one whose `data_ptr()` answers.
 
 ### 6.5 A meta tensor's `stride()` — derived, not invented
+
+> **Superseded by `docs/graph/STRIDE.md`.** The invariant below was already
+> false: the meta `t()` arm answered `(3, 1)` for a tensor upstream reports as
+> `(1, 4)`, and the test named here asked a freshly constructed tensor only.
+> `Repr::Meta` now stores the stride; the test was rewritten as
+> `test_a_meta_tensor_reports_the_stride_it_stores_not_one_derived_from_its_shape`
+> and compares a transposed and a sliced meta tensor with upstream.
 
 `meta_utils.py:2066` calls `r.stride()` on the meta tensor it just built. The
 refusal it got was `Cannot copy out of meta tensor; no data!` — a message about

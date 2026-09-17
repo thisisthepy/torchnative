@@ -41,13 +41,24 @@ use crate::err::{candle_err, not_implemented};
 #[derive(Clone)]
 pub enum Repr {
     Dense(Tensor),
-    /// `meta`: shape and dtype, no storage.
+    /// `meta`: a layout and a dtype, no bytes.
     ///
-    /// Stride is deliberately absent. `TensorBase` has no `.stride()` in this
-    /// shim (dense tensors do not report one either), so modelling strides here
-    /// would give meta a surface the dense side does not have. Recorded in
-    /// docs/devices/META.md §6 as a narrowing, since upstream's meta *does* carry
-    /// stride (`torch.zeros(2,3,device="meta").t().stride()` is `(1, 3)`).
+    /// **The layout is stored, not derived** -- `stride`, `storage_offset` and
+    /// the size of the storage it addresses, `storage_nbytes`. It used to be a
+    /// shape alone, on the argument that every meta tensor was contiguous and
+    /// its stride therefore a function of its shape (docs/graph/EXPORT4.md
+    /// §6.5). That argument was already false when this changed: the meta
+    /// `t`/`permute`/`slice`/`expand` arms existed and answered a contiguous
+    /// stride for tensors upstream reports as non-contiguous
+    /// (docs/graph/STRIDE.md §1). A meta kernel now states the layout it
+    /// produces, and one that has not been shown to know it refuses a
+    /// non-contiguous input by name (`aten.rs::meta_stride_rule`).
+    ///
+    /// `storage_nbytes` is carried rather than recomputed because a view does
+    /// not know its base's extent: `x[1:].untyped_storage().nbytes()` is the
+    /// base's, and the prims `as_strided` meta bounds-checks against it. It is
+    /// a cell shared with every view and every storage handle, because
+    /// upstream's `set_` grows the one storage they all address.
     ///
     /// The device label is not stored either, and that is measured rather than
     /// assumed: upstream normalises every meta index away --
@@ -64,10 +75,16 @@ pub enum Repr {
     /// *does* carry is a distinct `_cdata` per storage which two views of one
     /// base share, and that is what this token is. It is drawn from a
     /// process-wide counter at construction and **propagated by the one meta
-    /// kernel that is a view** (`aten.view.default`), so `x` and `x.view(-1)`
-    /// answer with one storage here as they do upstream, and two separately
-    /// constructed meta tensors do not. docs/graph/EXPORT5.md §2.
-    Meta { shape: Vec<usize>, storage_id: usize },
+    /// kernel that is a view** (every view arm, through `meta_view`), so `x`
+    /// and `x.t()` answer with one storage here as they do upstream, and two
+    /// separately constructed meta tensors do not. docs/graph/EXPORT5.md §2.
+    Meta {
+        shape: Vec<usize>,
+        stride: Vec<usize>,
+        storage_offset: usize,
+        storage_nbytes: Arc<std::sync::atomic::AtomicUsize>,
+        storage_id: usize,
+    },
     /// A GGML block-quantised weight.
     ///
     /// **The reason this is a third arm and not a `Tensor` wearing a label is
@@ -457,19 +474,91 @@ impl PyTensorBase {
     /// CPU counterpart is not, which is also true upstream on a build without a
     /// kernel for a dtype. docs/devices/META.md §6.
     pub fn meta(shape: Vec<usize>, tag: TorchDType) -> Self {
-        Self::meta_with_storage_id(shape, tag, next_meta_storage_id())
+        let stride = crate::layout::contiguous(&shape);
+        Self::meta_fresh(shape, stride, tag)
     }
 
-    /// A meta tensor sharing an existing meta storage identity.
+    /// A meta tensor with a fresh storage laid out as `stride` asks.
     ///
-    /// The view half of `meta`. Upstream's `view` shares storage, so its meta
-    /// counterpart must answer the same `_cdata` as its input; allocating a
-    /// fresh id there would make `meta_utils.py`'s `storage_memo` treat a
-    /// tensor and its own view as two unrelated storages, which is the
-    /// aliasing information the memo exists to preserve.
-    pub fn meta_with_storage_id(shape: Vec<usize>, tag: TorchDType, storage_id: usize) -> Self {
+    /// The storage is sized the way `empty_strided` sizes it upstream
+    /// (`layout::storage_nbytes`), which is smaller than `numel * itemsize`
+    /// for an overlapping layout and larger for none.
+    pub fn meta_fresh(shape: Vec<usize>, stride: Vec<usize>, tag: TorchDType) -> Self {
+        let nbytes = crate::layout::storage_nbytes(&shape, &stride, 0, tag.itemsize());
+        let cell = Arc::new(std::sync::atomic::AtomicUsize::new(nbytes));
+        Self::meta_strided(shape, stride, 0, cell, next_meta_storage_id(), tag)
+    }
+
+    /// A view of this meta tensor: the same storage, a new layout.
+    ///
+    /// Upstream's views share storage, so their meta counterparts must answer
+    /// the same `_cdata` as their input; allocating a fresh id there would make
+    /// `meta_utils.py`'s `storage_memo` treat a tensor and its own view as two
+    /// unrelated storages, which is the aliasing information the memo exists
+    /// to preserve. `None` if this is not a meta tensor.
+    pub fn meta_view(&self, shape: Vec<usize>, stride: Vec<usize>, storage_offset: usize) -> Option<Self> {
+        match &self.inner {
+            Repr::Meta { storage_nbytes, storage_id, .. } => Some(Self::meta_strided(
+                shape,
+                stride,
+                storage_offset,
+                Arc::clone(storage_nbytes),
+                *storage_id,
+                self.tag,
+            )),
+            _ => None,
+        }
+    }
+
+    /// The meta layout: `(shape, stride, storage_offset)`, or `None` for
+    /// every other representation.
+    pub fn meta_layout(&self) -> Option<(&[usize], &[usize], usize)> {
+        match &self.inner {
+            Repr::Meta { shape, stride, storage_offset, .. } => Some((shape, stride, *storage_offset)),
+            _ => None,
+        }
+    }
+
+    /// Re-lay a meta tensor that **owns a fresh storage** as `stride`.
+    ///
+    /// For the layout-following kernels (`aten.rs::meta_dispatch`), which
+    /// build their output contiguous and are then told the layout upstream
+    /// gives it. Refuses if the tensor is a view -- re-laying a view would
+    /// move it inside a storage someone else also addresses -- or if the new
+    /// layout does not address exactly the storage it has.
+    pub fn relay_fresh_meta(&mut self, stride: Vec<usize>) -> PyResult<()> {
+        let tag = self.tag;
+        match &mut self.inner {
+            Repr::Meta { shape, stride: have, storage_offset: 0, storage_nbytes, .. }
+                if stride.len() == shape.len()
+                    && Arc::strong_count(storage_nbytes) == 1
+                    && crate::layout::storage_nbytes(shape, have, 0, tag.itemsize())
+                        == storage_nbytes.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::layout::storage_nbytes(shape, &stride, 0, tag.itemsize())
+                        == storage_nbytes.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                *have = stride;
+                Ok(())
+            }
+            _ => Err(not_implemented(
+                "torch._C shim: relay_fresh_meta was handed a tensor that is not a \
+                 freshly allocated meta tensor, or a layout that does not address \
+                 its storage exactly (docs/graph/STRIDE.md)",
+            )),
+        }
+    }
+
+    pub fn meta_strided(
+        shape: Vec<usize>,
+        stride: Vec<usize>,
+        storage_offset: usize,
+        storage_nbytes: Arc<std::sync::atomic::AtomicUsize>,
+        storage_id: usize,
+        tag: TorchDType,
+    ) -> Self {
+        debug_assert_eq!(shape.len(), stride.len());
         Self {
-            inner: Repr::Meta { shape, storage_id },
+            inner: Repr::Meta { shape, stride, storage_offset, storage_nbytes, storage_id },
             tag,
             requires_grad: false,
             backward_hooks: None,
@@ -2331,9 +2420,12 @@ impl PyTensorBase {
         // and every byte door on it refuses by name rather than answering over
         // an empty buffer. docs/graph/EXPORT5.md §2 is the table of which of
         // upstream's expectations that meets and which it refuses.
-        if let Some(storage_id) = self.meta_storage_id() {
-            let nbytes = self.numel() * self.tag.itemsize();
-            return crate::storage::meta(py, nbytes, storage_id);
+        //
+        // The size is the storage's, carried on `Repr::Meta`, not this view's
+        // `numel * itemsize`: `x[1:].untyped_storage().nbytes()` is the base's
+        // upstream, and the prims `as_strided` meta bounds-checks against it.
+        if let Repr::Meta { storage_nbytes, storage_id, .. } = &self.inner {
+            return crate::storage::meta(py, Arc::clone(storage_nbytes), *storage_id);
         }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
         crate::storage::snapshot(py, bytes, origin)
@@ -2349,17 +2441,11 @@ impl PyTensorBase {
     /// exception anywhere. docs/models/CKPT.md §5 measured that exact failure coming
     /// the other way.
     ///
-    /// A meta tensor refuses rather than answering `0`: `Repr::Meta` carries no
-    /// layout at all (docs/devices/META.md §6 records the narrowing), so `0` would be
-    /// a guess that happens to be right for contiguous meta tensors and wrong
-    /// for the transposed ones upstream's meta does model.
+    /// A meta tensor answers the offset it stores (docs/graph/STRIDE.md): a
+    /// meta `x[1:]` is offset into its base's storage exactly as a dense one is.
     fn storage_offset(&self) -> PyResult<usize> {
-        // A meta tensor has no storage, so it cannot be offset into one, and 0
-        // is the only representable answer rather than a chosen one. Upstream
-        // answers 0 here too for a freshly built meta tensor. See `stride`
-        // below for why meta is answered rather than refused at all.
-        if let Repr::Meta { .. } = self.inner {
-            return Ok(0);
+        if let Repr::Meta { storage_offset, .. } = self.inner {
+            return Ok(storage_offset);
         }
         Ok(self.tensor()?.layout().start_offset())
     }
@@ -2377,56 +2463,17 @@ impl PyTensorBase {
     /// narrowing `shape` already documents. `stride(dim)` returns one int, and
     /// negative `dim` counts from the back, as upstream's does.
     ///
-    /// **Meta refuses**, for the reason in `Repr::Meta`'s docstring: upstream's
-    /// meta tensor does carry stride and this build's does not model it, so
-    /// answering would invent one.
+    /// **A meta tensor answers the stride it stores.** It used to answer the
+    /// contiguous stride of its shape, on the argument that every meta tensor
+    /// was contiguous (docs/graph/EXPORT4.md §6.5); that argument was already
+    /// false for `t()`, and docs/graph/STRIDE.md is the change that made the
+    /// stride a field instead.
     #[pyo3(signature = (dim = None))]
     fn stride<'py>(&self, py: Python<'py>, dim: Option<isize>) -> PyResult<Bound<'py, PyAny>> {
-        // **A meta tensor answers its contiguous stride, and that is derived,
-        // not guessed.**
-        //
-        // `Repr::Meta` stores a shape and no stride (docs/devices/META.md §6 records
-        // the narrowing), so the obvious reading is that `stride()` cannot be
-        // answered and must refuse -- which is what it did, via `tensor()?`,
-        // and the refusal was `Cannot copy out of meta tensor; no data!`. That
-        // message is about *bytes*, and a stride is not bytes; it was the wrong
-        // refusal for the question, and it stopped `torch.export` at
-        // `meta_utils.py:2066`.
-        //
-        // The answer is available because of a fact the type already asserts:
-        // `is_contiguous()` returns `true` for every `Repr::Meta`, since no
-        // kernel in this tree can produce a non-contiguous one, and
-        // `aten.empty_strided.default` refuses by name rather than build one.
-        // A contiguous tensor's stride is a function of its shape alone. So
-        // this is the same value the dense path would compute, arrived at
-        // without a storage to read it off.
-        //
-        // The invariant this rests on is checked, not assumed:
-        // `test_export4.py::test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable`
-        // fails if a meta tensor ever becomes non-contiguous, which is exactly
-        // the day this answer would start lying.
-        if let Repr::Meta { shape, .. } = &self.inner {
-            let mut contiguous = vec![0i64; shape.len()];
-            let mut acc: i64 = 1;
-            for i in (0..shape.len()).rev() {
-                contiguous[i] = acc;
-                acc *= shape[i] as i64;
-            }
-            let Some(dim) = dim else {
-                return Ok(PyTuple::new(py, &contiguous)?.into_any());
-            };
-            let rank = contiguous.len() as isize;
-            let at = if dim < 0 { dim + rank } else { dim };
-            if at < 0 || at >= rank {
-                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                    "Dimension out of range (expected to be in range of [{}, {}], but got {dim})",
-                    -rank,
-                    rank - 1
-                )));
-            }
-            return contiguous[at as usize].into_bound_py_any(py);
-        }
-        let stride = self.tensor()?.layout().stride().to_vec();
+        let stride: Vec<usize> = match &self.inner {
+            Repr::Meta { stride, .. } => stride.clone(),
+            _ => self.tensor()?.layout().stride().to_vec(),
+        };
         let Some(dim) = dim else {
             return Ok(PyTuple::new(py, &stride)?.into_any());
         };
@@ -2675,14 +2722,6 @@ impl PyTensorBase {
         // a test for the narrowing alone would pass against a shim that had
         // simply deleted the check.
         if storage.is_meta_storage() && slf.borrow().is_meta_repr() {
-            if storage_offset != 0 {
-                return Err(not_implemented(format!(
-                    "{OP}(meta storage, storage_offset={storage_offset}, ...): \
-                     `Repr::Meta` carries a shape and a storage identity and no \
-                     offset, so a non-zero offset would be accepted and then \
-                     silently forgotten. Refused by name rather than dropped."
-                )));
-            }
             let requested = stride.unwrap_or_else(|| contiguous_stride(&size));
             if requested.len() != size.len() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2691,38 +2730,38 @@ impl PyTensorBase {
                     requested.len()
                 )));
             }
-            // Only a contiguous layout can be adopted, because `Repr::Meta` has
-            // no stride field -- deliberately, see its own comment, and
-            // `docs/graph/EXPORT4.md` §6.5 rests an invariant on it. Accepting a
-            // non-contiguous stride here would make `stride()` answer the
-            // contiguous one for a tensor that is not, which is a wrong answer
-            // with no trace. This is the same layout-model question as
-            // `docs/graph/EXPORT5.md` §10's third wall (`aten.t`/`aten.slice` on
-            // meta) and it is refused here for that reason, by name.
+            // The layout is adopted as given: `Repr::Meta` stores a stride and
+            // an offset now (docs/graph/STRIDE.md), which is what
+            // docs/graph/EXPORT6.md §2.5's two refusals were waiting for.
             //
-            // Axes of extent 0 or 1 are skipped: their stride is unobservable
-            // and upstream does not normalise it, so demanding a particular
-            // value there would refuse layouts that are contiguous.
-            let canonical = contiguous_stride(&size);
-            let mismatch = size
-                .iter()
-                .zip(requested.iter())
-                .zip(canonical.iter())
-                .find(|((extent, got), want)| **extent > 1 && got != want);
-            if let Some(((_, _), _)) = mismatch {
+            // A negative stride is still refused, as the dense path below
+            // refuses it. Upstream accepts one here and reports a different
+            // stride back (`(-1, 3)` is read back as `(6, 3)`, measured on
+            // 2.13.0), which is not a layout this shim can claim to reproduce.
+            if requested.iter().any(|s| *s < 0) {
                 return Err(not_implemented(format!(
-                    "{OP}(meta storage, size={size:?}, stride={requested:?}): this \
-                     shim's meta tensors carry no stride, so only a contiguous \
-                     layout can be adopted -- the contiguous stride for that \
-                     size is {canonical:?}. Refused rather than answered, \
-                     because accepting it would leave a tensor that reports a \
-                     layout it does not have. See docs/graph/EXPORT6.md \
-                     \u{a7}6 -- the stride question, unchanged."
+                    "{OP}(meta storage, size={size:?}, stride={requested:?}): \
+                     negative stride. Refused rather than guessed at -- \
+                     upstream reads it back as a different stride."
                 )));
             }
+            let stride: Vec<usize> = requested.iter().map(|&s| s as usize).collect();
+            let need = crate::layout::storage_nbytes(&size, &stride, storage_offset, itemsize);
+            let Some(cell) = storage.meta_len_cell() else {
+                return Err(not_implemented(format!(
+                    "{OP}: a meta storage handle without a size cell (storage.rs)"
+                )));
+            };
+            // Upstream *grows* the meta storage in place when the layout
+            // addresses past its end (measured: a 40-byte storage reads back as
+            // 56 after `set_` of a 14-element layout, through every handle and
+            // every view). The size is one cell shared by all of them, so
+            // growing it here is growing it everywhere, as upstream's is.
+            cell.fetch_max(need, std::sync::atomic::Ordering::Relaxed);
             let storage_id = storage.identity();
             drop(storage);
-            let replacement = Self::meta_with_storage_id(size, tag, storage_id);
+            let replacement =
+                Self::meta_strided(size, stride, storage_offset, cell, storage_id, tag);
             slf.borrow_mut().replace_with(replacement);
             return Ok(slf.clone());
         }
@@ -2820,13 +2859,10 @@ impl PyTensorBase {
 
     /// `tensor.is_contiguous()`.
     ///
-    /// A meta tensor answers `True` unconditionally, and that is a narrowing
-    /// rather than an answer: upstream tracks stride on meta and
-    /// `torch.zeros(2,3,device="meta").t().is_contiguous()` is `False`. Here
-    /// `Repr::Meta` carries no stride (see its comment) and no meta kernel can
-    /// produce a transposed one, so every meta tensor this shim can make *is*
-    /// contiguous. It stops being true the day a meta `t`/`permute` kernel
-    /// lands, and that kernel is the thing that has to add the stride field.
+    /// A meta tensor answers from the stride it stores. It used to answer
+    /// `True` unconditionally, on the claim that no meta kernel could produce a
+    /// transposed tensor -- a claim the meta `t`/`permute` arms had already
+    /// falsified (docs/graph/STRIDE.md §1).
     /// **`memory_format` is keyword-only and is answered, not ignored.**
     ///
     /// `fake_tensor.py:1295`'s `extract_tensor_metadata` calls
@@ -2840,18 +2876,16 @@ impl PyTensorBase {
     /// |---|---|---|
     /// | `contiguous_format` | the ordinary answer | the ordinary answer |
     /// | `preserve_format` | the ordinary answer (measured: `False` on a permuted tensor, not an unconditional `True`) | the ordinary answer |
-    /// | `channels_last` / `channels_last_3d` | `True` only for a tensor actually in that layout | **`False`, as a fact** |
+    /// | `channels_last` / `channels_last_3d` | `True` only for a tensor actually in that layout | read off the stride |
     ///
-    /// The last row is a fact rather than a stand-in, in the same sense as
-    /// `is_mkldnn` (docs/graph/EXPORT.md §2.3): **there is no channels-last
-    /// representation in this build at all.** candle carries a `Layout` and no
-    /// memory-format tag, no kernel here accepts `memory_format=channels_last`,
-    /// and `grep channels_last rust/torch_c/src/*.rs` finds only upsample
-    /// *error message* strings. A tensor cannot be in a layout the build cannot
-    /// construct, so `False` is true of every tensor this shim can make -- and
-    /// `test_export5.py` asserts that non-constructibility rather than trusting
-    /// this paragraph, because the day a channels-last kernel lands is the day
-    /// this answer starts lying.
+    /// The last row used to be a constant `False`, on the argument that the
+    /// build could not construct a channels-last tensor. It could: a plain
+    /// `permute(0, 3, 1, 2)` of an NHWC tensor *is* channels-last, with no
+    /// memory-format tag anywhere, and upstream says so. The claim was checked
+    /// only through `.to(memory_format=channels_last)`, which is one door of
+    /// several. Channels-last contiguity is a predicate on `(shape, stride)`
+    /// (`compute_channels_last_contiguous_2d`), so it is computed, on every
+    /// arm, from the stride that arm has (docs/graph/STRIDE.md §4).
     ///
     /// An unrecognised memory format **refuses by name** rather than falling
     /// through to the ordinary answer: silently treating an unknown label as
@@ -2866,7 +2900,12 @@ impl PyTensorBase {
             let label = label.rsplit('.').next().unwrap_or(&label).to_string();
             match label.as_str() {
                 "contiguous_format" | "preserve_format" => {}
-                "channels_last" | "channels_last_3d" => return Ok(false),
+                "channels_last" => {
+                    return Ok(crate::layout::is_channels_last(self.dims(), &self.layout_stride()?, 4))
+                }
+                "channels_last_3d" => {
+                    return Ok(crate::layout::is_channels_last(self.dims(), &self.layout_stride()?, 5))
+                }
                 other => {
                     return Err(not_implemented(format!(
                         "TensorBase.is_contiguous(memory_format={other}): this shim knows \
@@ -2881,16 +2920,31 @@ impl PyTensorBase {
         Ok(self.is_contiguous_inner())
     }
 
+    /// The stride this tensor has, whichever arm it is on. The two arms with
+    /// no strided view (see `is_contiguous_inner`) answer the contiguous
+    /// stride, which is the only layout they can be in.
+    pub fn layout_stride(&self) -> PyResult<Vec<usize>> {
+        Ok(match &self.inner {
+            Repr::Dense(tensor) => tensor.layout().stride().to_vec(),
+            Repr::Meta { stride, .. } => stride.clone(),
+            Repr::Complex { re, .. } => re.layout().stride().to_vec(),
+            Repr::Quantized(_) | Repr::Vulkan(_) => crate::layout::contiguous(self.dims()),
+        })
+    }
+
     fn is_contiguous_inner(&self) -> bool {
         match &self.inner {
-            Repr::Dense(tensor) => tensor.is_contiguous(),
-            Repr::Meta { .. } => true,
+            // Upstream's rule, not candle's: candle has no "fewer than two
+            // elements" clause, so a dense `zeros(0, 4, 5, 3).permute(0, 3, 1, 2)`
+            // answered `False` where upstream answers `True` (measured,
+            // docs/graph/STRIDE.md §4).
+            Repr::Dense(tensor) => crate::layout::is_contiguous(tensor.dims(), tensor.layout().stride()),
+            Repr::Meta { shape, stride, .. } => crate::layout::is_contiguous(shape, stride),
             // A `QTensor` has no `Layout` and therefore no stride at all: its
             // blocks are laid out in one flat, row-major run, and candle
             // offers no way to build a strided view of one. So every quantised
-            // tensor this shim can make is contiguous for the same reason
-            // `Meta` is -- there is no operation that could produce a
-            // non-contiguous one.
+            // tensor this shim can make is contiguous -- there is no operation
+            // that could produce a non-contiguous one.
             Repr::Quantized(_) => true,
             // Every Vulkan tensor this build can make is a flat row-major
             // buffer: there is no view, transpose or slice kernel on this

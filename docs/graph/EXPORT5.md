@@ -214,6 +214,13 @@ Upstream's semantics, measured — including the signature, which is keyword-onl
 The `False` is a fact in the same sense as `is_mkldnn` (`docs/graph/EXPORT.md` §2.3):
 there is no channels-last representation in this build at all.
 
+> **Superseded by `docs/graph/STRIDE.md` §4.** The premise "no tensor in this
+> build can be channels-last" was false by a second door: `permute(0, 3, 1, 2)`
+> of an NHWC tensor is channels-last on both sides, and the shim answered
+> `False` for it. Channels-last contiguity is now read off the stride, and the
+> test below was replaced by
+> `test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it`.
+
 ### 3.1 The defect: `to(memory_format=channels_last)` was dropping the request
 
 **A `False` that rests on an invariant is only as good as the invariant, so the

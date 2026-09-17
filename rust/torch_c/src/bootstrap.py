@@ -11924,9 +11924,10 @@ _AUTOCAST_DEVICE_TYPES = (
 def _refuse_unrepresentable_memory_format(op, kwargs):
     """Pop `memory_format`, and **refuse the two this build cannot produce.**
 
-    `contiguous_format` and `preserve_format` are accepted and dropped, which is
-    honest: every tensor this shim can build is contiguous, so both of them ask
-    for what the result already is.
+    `contiguous_format` and `preserve_format` are accepted and dropped. That
+    matches upstream, measured: `x.t().to(memory_format=contiguous_format)`
+    returns `x.t()` itself on both sides, because `to` with nothing else to
+    change is a no-op.
 
     `channels_last` and `channels_last_3d` were being dropped in the same
     breath, and that was a silent wrong answer on the public surface --
@@ -11935,12 +11936,14 @@ def _refuse_unrepresentable_memory_format(op, kwargs):
     every later `is_contiguous(memory_format=channels_last)` disagreed with what
     it had asked for.
 
-    It was found by `test_export5.py::test_channels_last_is_false_as_a_fact_
-    because_the_build_cannot_make_one`, which is a test written to check the
-    *premise* of an answer rather than the answer -- the premise being "no
-    tensor in this build can be in that layout" (docs/graph/EXPORT5.md §3). The
-    premise was false by way of this door, and nothing else in the suite could
-    have noticed, because dropping an argument raises nothing.
+    It was found by a test written to check the *premise* of an answer rather
+    than the answer -- the premise being "no tensor in this build can be in
+    that layout" (docs/graph/EXPORT5.md §3). The premise was false by way of
+    this door, and nothing else in the suite could have noticed, because
+    dropping an argument raises nothing. It was also false by way of
+    `permute`, which that test did not try (docs/graph/STRIDE.md §4); the test
+    that replaced it is
+    `test_export5.py::test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it`.
 
     candle carries a `Layout` and no memory-format tag, and no kernel here reads
     one, so there is no representation to return. Refusing is the only answer

@@ -807,6 +807,9 @@ llama3-rope from_pretrained + generate                            EXIT=0
 - **모드 스택이 프로세스 전역입니다** (상류는 스레드 로컬) — §8.4.
 - **`Tensor` 메서드는 모드를 상의하지 않습니다** — §8.4. 장치 컨텍스트에 대해서는 차이가
   없지만 다른 종류의 모드에 대해서는 있습니다.
+- > **정정 (`docs/graph/STRIDE.md`):** 이제 meta 는 스트라이드·storage offset·storage
+  > 크기를 저장하고, 뷰·원소별 커널은 상류가 주는 레이아웃을 답합니다. 아래 항목은
+  > 당시의 기록입니다.
 - **meta 는 스트라이드를 들지 않습니다.** `is_contiguous()` 가 meta 에 대해 무조건 `True` 를
   답하고, 상류는 `t()` 한 meta 에 대해 `False` 입니다. meta `t`/`permute` 커널이 오는 날
   그 커널이 `PyTensorBase` 에 그 필드를 먼저 추가해야 합니다 (§7.4).

@@ -137,6 +137,19 @@ for name, module, inputs64 in CASES:
     cases[name] = rec
 out["cases"] = cases
 
+# Channels-last contiguity is a predicate on the stride, on both sides. A plain
+# permute of an NHWC tensor *is* channels-last -- docs/graph/STRIDE.md §4 found
+# the shim answering False for it.
+_nhwc = torch.ones(2, 4, 5, 3).permute(0, 3, 1, 2)
+out["channels_last_both"] = {
+    "nchw": torch.ones(2, 3, 4, 5).is_contiguous(memory_format=torch.channels_last),
+    "nhwc_permuted": [
+        _nhwc.is_contiguous(memory_format=torch.channels_last),
+        _nhwc.is_contiguous(),
+        list(_nhwc.stride()),
+    ],
+}
+
 if out["is_shim"]:
     # ---- the meta storage handle, docs/graph/EXPORT5.md §2 -----------------------
     t = torch.empty((3, 4), dtype=torch.float32, device="meta")
@@ -194,9 +207,9 @@ if out["is_shim"]:
     }
     out["is_contiguous_positional"] = attempt(
         lambda: torch.ones(3).is_contiguous(torch.contiguous_format))
-    # Can this build make a channels-last tensor at all? The `False` above is a
-    # fact only while it cannot. docs/graph/EXPORT5.md §3.
-    out["channels_last_constructible"] = attempt(
+    # `.to(memory_format=channels_last)` is still refused here by name (the
+    # dense side cannot re-lay a tensor); upstream answers it.
+    out["channels_last_by_to"] = attempt(
         lambda: torch.ones(2, 3, 4, 5).to(memory_format=torch.channels_last))
 
     # ---- the setters that refuse rather than lie to their own getters ------
@@ -601,9 +614,11 @@ def test_every_door_that_would_need_bytes_refuses_on_a_meta_storage():
     Those are different claims and the second one has to refuse.
 
     `resize_` is in the list and is a **divergence**: upstream's meta storage
-    really does resize (measured).  It refuses here because `len` is derived
-    from the meta tensor's shape and dtype, so a resize would leave the storage
-    and the tensor disagreeing about a number the tensor owns.
+    really does resize (measured).  It refused here because the size was
+    derived from the meta tensor's shape and dtype.  Since docs/graph/STRIDE.md
+    §2 the size is a cell the tensors share, so that reason is gone; the
+    refusal stays, by name, until a round measures what upstream does to the
+    tensors when their storage shrinks.
     """
     if not _available():
         return
@@ -615,7 +630,7 @@ def test_every_door_that_would_need_bytes_refuses_on_a_meta_storage():
     assert "meta" in doors["getitem"]["message"], doors["getitem"]
     for name in ("setitem", "copy_", "bytes"):
         assert "no bytes at all" in doors[name]["message"], (name, doors[name])
-    assert "not independently settable" in doors["resize_"]["message"], doors["resize_"]
+    assert "refuses it by name" in doors["resize_"]["message"], doors["resize_"]
 
 
 def test_the_dense_storage_path_is_untouched_by_the_meta_handle():
@@ -654,25 +669,30 @@ def test_is_contiguous_reads_memory_format_and_only_as_a_keyword():
     assert pos["status"] == "raise", pos
 
 
-def test_channels_last_is_false_as_a_fact_because_the_build_cannot_make_one():
-    """The invariant under the answer, asserted rather than argued.
+def test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it():
+    """The premise of the old answer was false, and this is what replaced it.
 
-    `is_contiguous(memory_format=channels_last)` answers `False` here for every
-    tensor, and that is only *true* while no tensor in this build can be in that
-    layout.  So the test checks the premise: constructing a channels-last tensor
-    must fail.  The day it succeeds, this test fails -- and that is the day the
-    `False` above starts lying, which is exactly `docs/graph/EXPORT4.md` §6.5's shape
-    of argument for the meta `stride()`.
+    `is_contiguous(memory_format=channels_last)` used to answer `False` for
+    every tensor, and this test checked the premise -- "no tensor in this build
+    can be in that layout" -- by trying `.to(memory_format=channels_last)`.
+    That is one door of several: `permute(0, 3, 1, 2)` of an NHWC tensor is
+    channels-last with no memory-format request anywhere, and the shim answered
+    `False` for it (docs/graph/STRIDE.md §4).  The answer is now computed from
+    the stride and compared with upstream's on both a plain NCHW tensor and
+    the permuted one.  `.to(memory_format=channels_last)` still refuses by
+    name, and that half is asserted too -- the dense side cannot re-lay a
+    tensor, so the refusal is what stops it answering with the wrong layout.
     """
     if not _available():
         return
-    assert _shim()["is_contiguous"]["channels_last"] is False
-    made = _shim()["channels_last_constructible"]
-    assert made["status"] == "raise", (
-        "this build constructed a channels-last tensor, so answering False to "
-        "is_contiguous(memory_format=channels_last) is no longer a fact about "
-        "the build -- it is now a wrong answer (docs/graph/EXPORT5.md §3)"
-    )
+    shim, up = _shim(), _upstream()
+    assert shim["channels_last_both"] == up["channels_last_both"], (
+        shim["channels_last_both"], up["channels_last_both"])
+    assert up["channels_last_both"]["nhwc_permuted"][0] is True, (
+        "the probe must build a channels-last tensor")
+    assert shim["is_contiguous"]["channels_last"] is False
+    made = shim["channels_last_by_to"]
+    assert made["status"] == "raise", made
 
 
 # ---------------------------------------------------------------------------

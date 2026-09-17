@@ -266,17 +266,29 @@ was genuinely built.
   `aten.var.*` does. It returns a pair, so it is a real op addition with golden
   cases, not a table entry.
 * **`torch._C._select_conv_backend`** — 5. A `_C` surface, not a kernel.
-* **`aten.as_strided.default` on meta** — 5. §6.
+* **`aten.as_strided.default` on meta** — 5. §6. **Closed by
+  `docs/graph/STRIDE.md`**, as is `prims.collapse_view` below; all six are
+  architectures upstream itself does not export.
 * **`aten.lift_fresh_copy.default`** — 3. No kernel at all, dense or meta. It is
   `clone` semantics, but adding it changes op coverage and wants golden cases.
 * **`prims.collapse_view.default` on meta** — 1.
 * **`FakeTensorDeviceMismatchError`** — 2, unanalysed.
+  > **Analysed in `docs/graph/STRIDE.md` §6:** the shim's door consults
+  > dispatch modes but not a tensor subclass's own `__torch_dispatch__`, so
+  > fake mode's mode-less `view` implementation gets plain meta tensors back.
 * **The `.Scalar`/`.Tensor` overload disagreement** — `docs/graph/EXPORT5.md` §9,
   untouched.
 
 ---
 
 ## 6. The stride question is unchanged, and is now the third-largest wall
+
+> **Superseded by `docs/graph/STRIDE.md`.** `Repr::Meta` stores a stride,
+> offset and storage size; `as_strided` and `collapse_view` have meta kernels;
+> §2.5's two `set_` refusals are lifted. One premise below was already false
+> when this was written: the meta `t`/`slice` arms existed and answered a
+> contiguous stride, so the lie this section warns against was live
+> (STRIDE.md §1).
 
 EXPORT5 §10's third wall was `aten.t` / `aten.slice` on a meta tensor, because
 `Repr::Meta` has no stride field and `docs/graph/EXPORT4.md` §6.5 rests an

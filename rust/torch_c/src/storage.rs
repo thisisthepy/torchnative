@@ -104,16 +104,38 @@ pub struct PyStorageBase {
     /// than answered with a CPU buffer.
     ///
     /// A **meta** storage is the one kind here that has a size and no bytes:
-    /// `buf` is empty, `len` is what the tensor's bytes *would* occupy, and
+    /// `buf` is empty, `meta_len` is what the storage *would* occupy, and
     /// `filled` is false and stays false. It exists because
     /// `torch/_subclasses/meta_utils.py:2071` asks a meta tensor for its
     /// storage in order to key an aliasing memo, and a size-and-identity
     /// handle is exactly what that question wants -- see docs/graph/EXPORT5.md §2 for
     /// which of upstream's expectations it meets and which it refuses by name.
     device: String,
+    /// **A meta storage's size, shared** with every meta tensor that addresses
+    /// it and every other handle to it (docs/graph/STRIDE.md §2). `None` for a
+    /// storage with bytes, whose size is `len`.
+    ///
+    /// Shared because upstream's is: all of these are one `StorageImpl`, and
+    /// `set_` past its end *grows* it (measured), after which every view and
+    /// every handle reports the new size. A plain `usize` per handle would
+    /// have to either refuse the growth or let the objects disagree.
+    meta_len: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl PyStorageBase {
+    /// This storage's size in bytes, now: the shared cell for a meta storage.
+    fn size_bytes(&self) -> usize {
+        match &self.meta_len {
+            Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.len,
+        }
+    }
+
+    /// The shared size cell of a meta storage, for `set_` to adopt and grow.
+    pub fn meta_len_cell(&self) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.meta_len.clone()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.buf[self.off..self.off + self.len]
     }
@@ -157,6 +179,7 @@ impl PyStorageBase {
         self.origin
     }
 
+
     /// The refusal a meta storage gives to anything that wants its bytes.
     ///
     /// Separate from `snapshot_is_read_only` because it is a different fact
@@ -171,7 +194,7 @@ impl PyStorageBase {
              which is what meta_utils.py's aliasing memo asks of it; it is not a \
              buffer of zeros standing in for one. Refused rather than answered \
              (docs/graph/EXPORT5.md §2, storage.rs)",
-            self.len
+            self.size_bytes()
         ))
     }
 
@@ -234,6 +257,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
                 origin: 0,
                 filled: false,
                 device: "cpu".to_string(),
+                meta_len: None,
             },
         )?
         .into_any(),
@@ -261,7 +285,11 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
 /// delivered bytes may set it, nothing ever delivers bytes here, and `set_`
 /// refuses on an unfilled storage. So a meta storage cannot be laundered into
 /// a real tensor's bytes by the one path that would produce silent zeros.
-pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyAny>> {
+pub fn meta(
+    py: Python<'_>,
+    nbytes: Arc<std::sync::atomic::AtomicUsize>,
+    storage_id: usize,
+) -> PyResult<Py<PyAny>> {
     let obj = match STORAGE_CLASS.get() {
         Some(cls) => cls.bind(py).call1((0usize,))?,
         None => Bound::new(
@@ -273,6 +301,7 @@ pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyA
                 origin: 0,
                 filled: false,
                 device: "cpu".to_string(),
+                meta_len: None,
             },
         )?
         .into_any(),
@@ -281,7 +310,8 @@ pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyA
         let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
         me.buf = Arc::new(Vec::new());
         me.off = 0;
-        me.len = nbytes;
+        me.len = 0;
+        me.meta_len = Some(nbytes);
         me.origin = storage_id;
         me.filled = false;
         me.device = "meta".to_string();
@@ -315,6 +345,8 @@ fn view_of<'py>(
         me.filled = parent.filled;
         me.origin = parent.origin;
         me.device = parent.device.clone();
+        // A byte range of a storage is not the storage: its size is `len`.
+        me.meta_len = None;
     }
     Ok(obj)
 }
@@ -348,6 +380,7 @@ impl PyStorageBase {
             origin: 0,
             filled: false,
             device,
+            meta_len: None,
         })
     }
 
@@ -656,34 +689,33 @@ impl PyStorageBase {
     ) -> PyResult<()> {
         // Upstream's meta storage *does* resize (measured: 2.13.0 resizes a
         // meta storage to 8 bytes and reports it). This one refuses, and that
-        // is a divergence rather than a gap: `len` here is derived from the
-        // meta tensor's shape and dtype at the moment the handle was made, so
-        // a resize would leave the storage and the tensor disagreeing about a
-        // number the tensor is the authority on. docs/graph/EXPORT5.md §2 lists it
-        // among the expectations this handle refuses by name.
+        // is a divergence rather than a gap. docs/graph/EXPORT5.md §2 lists it
+        // among the expectations this handle refuses by name. The size is a
+        // cell shared with the tensors now (docs/graph/STRIDE.md §2), so the
+        // refusal is no longer forced -- `set_` grows it -- but lifting it is
+        // a change of its own, with its own measurement of what upstream does
+        // to the tensors when the storage shrinks.
         if self.is_meta() {
             return Err(not_implemented(format!(
                 "torch._C shim: UntypedStorage.resize_ on a storage of a meta \
-                 tensor. Upstream resizes one; this handle's size ({} bytes) is \
-                 derived from the meta tensor's shape and dtype and is not \
-                 independently settable, so resizing would leave the storage and \
-                 the tensor disagreeing (docs/graph/EXPORT5.md §2)",
-                self.len
+                 tensor. Upstream resizes one; this shim refuses it by name \
+                 (this storage is {} bytes; docs/graph/EXPORT5.md §2)",
+                self.size_bytes()
             )));
         }
         Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
     fn nbytes(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     fn size(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     fn __len__(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     /// `UntypedStorage.filename` reads this (`torch/storage.py:484`). Upstream
@@ -851,7 +883,7 @@ impl PyStorageBase {
     fn __repr__(&self) -> String {
         format!(
             "<torch._C.StorageBase {} bytes on {}{}{}>",
-            self.len,
+            self.size_bytes(),
             self.device,
             if self.off == 0 {
                 String::new()

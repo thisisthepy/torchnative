@@ -402,6 +402,10 @@ SDPA logsumexp, shape (2, 4, 8)
     this shim  (32, 8, 1)                        <- contiguous
 ```
 
+> **Closed by `docs/graph/STRIDE.md`:** meta tensors store their stride, `split` chunks
+> and the attention `logsumexp` are laid out as upstream lays them, and both are compared
+> with upstream in `test_metastride.py`.
+
 META.md §12 records that this shim's meta tensors carry no stride field and that `expand`
 was the first case where "everything meta makes is contiguous" stopped being self-evident.
 **These are the second and third, and the first where the divergence is not confined to an
