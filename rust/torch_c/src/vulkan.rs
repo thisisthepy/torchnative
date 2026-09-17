@@ -84,6 +84,9 @@ spv!(COPY_F32_SPV, "copy_f32");
 spv!(TRANSPOSE2D_F32_SPV, "transpose2d_f32");
 spv!(MATMUL_F32_SPV, "matmul_f32");
 spv!(BIAS_ADD_F32_SPV, "bias_add_f32");
+spv!(EMBEDDING_I32_F32_SPV, "embedding_i32_f32");
+spv!(TRANSPOSE_BATCHED2D_F32_SPV, "transpose_batched2d_f32");
+spv!(SCALAR_F32_SPV, "scalar_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -155,6 +158,20 @@ pub struct VkContext {
     queue: vk::Queue,
     qfi: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// What the driver says about integers, **measured rather than assumed**.
+    ///
+    /// Asked because `docs/devices/VULKAN6.md` §1 had to decide how an index
+    /// buffer is stored, and **the measurement contradicted the guess**: this
+    /// MoltenVK/Apple M1 reports `shaderInt64 = true`. Native int64 indices are
+    /// therefore possible *here* -- and are still not what this device does,
+    /// because taking them would make the supported index range a property of
+    /// the GPU rather than of the library (§1.2). Reported to Python so that
+    /// argument can be checked against the device instead of trusted.
+    pub shader_int64: bool,
+    pub shader_int16: bool,
+    pub shader_float64: bool,
+    pub khr_8bit_storage: bool,
+    pub khr_16bit_storage: bool,
     /// For the report `_vulkan_probe()` gives Python, so a skipped test can say
     /// which driver it skipped and a passing one can say what it ran on.
     pub device_name: String,
@@ -377,6 +394,12 @@ unsafe fn init() -> Result<VkContext, String> {
         .map_err(|e| format!("vkCreateDevice: {e}"))?;
     let queue = device.get_device_queue(qfi, 0);
     let mem_props = instance.get_physical_device_memory_properties(pd);
+    // Asked once, here, and reported: `docs/devices/VULKAN6.md` §1 chose int32
+    // index storage *because* of what these say on this machine, and a machine
+    // where they say something else can see that in `_vulkan_probe()`.
+    let features = instance.get_physical_device_features(pd);
+    let khr_8bit_storage = offers(&device_offered, ash::khr::_8bit_storage::NAME);
+    let khr_16bit_storage = offers(&device_offered, ash::khr::_16bit_storage::NAME);
 
     let cp_ci = vk::CommandPoolCreateInfo::default()
         .queue_family_index(qfi)
@@ -392,6 +415,11 @@ unsafe fn init() -> Result<VkContext, String> {
         queue,
         qfi,
         mem_props,
+        shader_int64: features.shader_int64 != 0,
+        shader_int16: features.shader_int16 != 0,
+        shader_float64: features.shader_float64 != 0,
+        khr_8bit_storage,
+        khr_16bit_storage,
         device_name,
         device_type,
         loader,
@@ -417,6 +445,19 @@ pub struct VkBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     bytes: usize,
+    /// `(min, max)` of the int64 values this buffer was filled with, recorded
+    /// at upload -- the only moment an integer tensor can come into existence
+    /// on this device (no kernel here produces one).
+    ///
+    /// **This is what lets `embedding` check its indices against the table
+    /// without reading the device back.** The alternative -- download the
+    /// index buffer and look -- would be a host round trip per call, which in
+    /// a decode loop is one per token; `docs/devices/VULKAN6.md` §2 states
+    /// that cost and why this side of the trade was taken. It lives on the
+    /// `VkBuffer` rather than on the `VkTensor` so that `view`, `reshape`,
+    /// `detach` and `alias` -- which share the `Arc<VkBuffer>` and rebuild the
+    /// `VkTensor` -- carry it without a line of code each.
+    index_range: OnceLock<(i64, i64)>,
 }
 
 unsafe impl Send for VkBuffer {}
@@ -515,6 +556,7 @@ impl VkContext {
             buffer,
             memory,
             bytes: req.size as usize,
+            index_range: OnceLock::new(),
         })
     }
 
@@ -533,6 +575,46 @@ impl VkContext {
         self.device.unmap_memory(buf.memory);
         HOST_UPLOADS.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Host to device, int32 words. The index half of `docs/devices/VULKAN6.md` §1.
+    ///
+    /// Separate from `upload` rather than generic over the word type, because
+    /// the two are not interchangeable at the call site: this one is reached
+    /// only after every value has been checked to fit in an int32, and that
+    /// check is what makes the narrowing a stated bound instead of a truncation.
+    unsafe fn upload_i32(&self, buf: &VkBuffer, data: &[i32]) -> Result<(), String> {
+        let p = self
+            .device
+            .map_memory(
+                buf.memory,
+                0,
+                buf.bytes as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+            .map_err(|e| format!("vkMapMemory: {e}"))? as *mut i32;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+        self.device.unmap_memory(buf.memory);
+        HOST_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Device to host, int32 words, widened back to the int64 torch asked for.
+    unsafe fn download_i32(&self, buf: &VkBuffer, n: usize) -> Result<Vec<i64>, String> {
+        let p = self
+            .device
+            .map_memory(
+                buf.memory,
+                0,
+                buf.bytes as vk::DeviceSize,
+                vk::MemoryMapFlags::empty(),
+            )
+            .map_err(|e| format!("vkMapMemory: {e}"))? as *const i32;
+        let mut words = vec![0i32; n];
+        std::ptr::copy_nonoverlapping(p, words.as_mut_ptr(), n);
+        self.device.unmap_memory(buf.memory);
+        HOST_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+        Ok(words.into_iter().map(i64::from).collect())
     }
 
     /// Device to host. The download half -- what `.cpu()` runs.
@@ -810,6 +892,57 @@ pub fn factory(
     crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
+/// The largest index this device can hold, and the reason it is not 2^63.
+///
+/// **This is a bound, not a truncation, and not a capability report.**
+/// `docs/devices/VULKAN6.md` §1: 64-bit integers in a compute shader need the
+/// device's `shaderInt64`, which is optional in Vulkan and absent on a great
+/// many mobile GPUs. This machine was measured rather than assumed and it
+/// *has* it (`_vulkan_probe()["shader_int64"] == True` on MoltenVK 1.4.2 /
+/// Apple M1) -- and the index buffer is int32 anyway, because an index range
+/// that depended on the GPU would mean the same model refusing on one device
+/// and not another, which is a worse failure than a stated ceiling. So the
+/// ceiling is stated once, here, for every device, and any value above it
+/// **refuses by name** on the way in rather than wrapping into a plausible
+/// wrong row. A vocabulary is nowhere near it: 2^31-1 is about 43000 times
+/// GPT-2's 50257.
+pub const VULKAN_INDEX_MAX: i64 = i32::MAX as i64;
+
+/// How a dtype is stored on this device, or a refusal saying it is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VkStore {
+    /// One float32 word per element -- every kernel in `shaders/` but one.
+    F32,
+    /// One int32 word per element, widened back to int64 on the way out.
+    ///
+    /// Reached only by `aten._to_copy.default` from the host and read only by
+    /// the `embedding` kernel's index binding: **there is no arithmetic on
+    /// integers on this device**, so this storage class cannot be used to
+    /// smuggle an unimplemented integer op through a float shader.
+    I64AsI32,
+}
+
+/// Which storage class a dtype gets, or a refusal.
+///
+/// The split from `check_dtype` is the design change of this round and it is
+/// deliberately narrow: *storing* an int64 index tensor is now possible,
+/// *computing* on one is exactly as impossible as before, because every op but
+/// `embedding` still calls `check_dtype` and `check_dtype` still admits float32
+/// only. `docs/devices/VULKAN6.md` §1.
+pub fn check_storage_dtype(op: &str, tag: TorchDType) -> PyResult<VkStore> {
+    match tag {
+        TorchDType::Float32 => Ok(VkStore::F32),
+        TorchDType::Int64 => Ok(VkStore::I64AsI32),
+        _ => Err(not_implemented(format!(
+            "{op}: the vulkan device in this build stores float32, and int64 \
+             indices as int32 (docs/devices/VULKAN6.md §1) -- not {}. The \
+             shader is f32 and there is no conversion path that would not be a \
+             silent one (docs/devices/VULKAN3.md).",
+            tag.name()
+        ))),
+    }
+}
+
 /// f32 is the only dtype with a kernel, and every other one refuses here rather
 /// than being silently widened or narrowed.
 fn check_dtype(op: &str, tag: TorchDType) -> PyResult<()> {
@@ -829,12 +962,26 @@ fn vk_error(op: &str, message: String) -> PyErr {
 }
 
 /// Bring a Vulkan tensor's bytes back to the CPU as a candle tensor.
-pub fn to_cpu(op: &str, vk_tensor: &VkTensor) -> PyResult<candle_core::Tensor> {
+///
+/// `tag` decides how the words are read, and it has to: an index buffer holds
+/// int32 words that mean int64 values, and reading them as f32 would return
+/// denormal nonsense that looks like an answer.
+pub fn to_cpu(op: &str, vk_tensor: &VkTensor, tag: TorchDType) -> PyResult<candle_core::Tensor> {
     let ctx = require(op)?;
     let n = vk_tensor.elem_count();
-    let host = unsafe { ctx.download(&vk_tensor.buffer, n) }.map_err(|e| vk_error(op, e))?;
-    candle_core::Tensor::from_vec(host, vk_tensor.shape.clone(), &candle_core::Device::Cpu)
-        .map_err(|e| crate::err::candle_err(op, e))
+    match check_storage_dtype(op, tag)? {
+        VkStore::F32 => {
+            let host = unsafe { ctx.download(&vk_tensor.buffer, n) }.map_err(|e| vk_error(op, e))?;
+            candle_core::Tensor::from_vec(host, vk_tensor.shape.clone(), &candle_core::Device::Cpu)
+                .map_err(|e| crate::err::candle_err(op, e))
+        }
+        VkStore::I64AsI32 => {
+            let host =
+                unsafe { ctx.download_i32(&vk_tensor.buffer, n) }.map_err(|e| vk_error(op, e))?;
+            candle_core::Tensor::from_vec(host, vk_tensor.shape.clone(), &candle_core::Device::Cpu)
+                .map_err(|e| crate::err::candle_err(op, e))
+        }
+    }
 }
 
 /// The `vulkan` half of the dispatcher, and the *only* way an op computes on a
@@ -861,12 +1008,20 @@ pub fn dispatch(
         "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
         "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
         "aten.div.Tensor" => binary(py, op, args, kwargs, "div_f32", DIV_F32_SPV, false),
+        // Tensor-by-number. On the measured trace this is attention's
+        // `scores / sqrt(d)` (docs/devices/VULKAN6.md §3); the scalar rides in
+        // the push constants rather than in a buffer.
+        "aten.mul.Scalar" => scalar_op(py, op, args, kwargs, 0),
+        "aten.div.Scalar" => scalar_op(py, op, args, kwargs, 1),
 
         // Unary elementwise.
         "aten.relu.default" => unary(py, op, args, kwargs, "relu_f32", RELU_F32_SPV),
         "aten.gelu.default" => gelu_vulkan(py, op, args, kwargs),
         "aten.native_layer_norm.default" => native_layer_norm_vulkan(py, op, args, kwargs),
         "aten.bmm.default" => bmm_vulkan(py, op, args, kwargs),
+        // The first op of every transformer forward, and the only one here
+        // that reads an integer buffer (docs/devices/VULKAN6.md).
+        "aten.embedding.default" => embedding_vulkan(py, op, args, kwargs),
         "aten._softmax.default" => softmax_vulkan(py, op, args, kwargs),
         "aten.neg.default" => unary(py, op, args, kwargs, "neg_f32", NEG_F32_SPV),
 
@@ -1046,7 +1201,13 @@ fn reshape(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
-    let (input, a) = self_vk(op, args, kwargs)?;
+    // `check_storage_dtype`, not `check_dtype`: a reshape moves no bytes and
+    // runs no shader, so it is the one op here that is honest about an int64
+    // index tensor -- and it has to be, because a transformer reshapes its
+    // `input_ids` before the embedding sees them.
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    check_storage_dtype(op, input.tag())?;
+    let a = input.vk_tensor(op)?.clone();
     // `aten.view` and `aten._unsafe_view` spell the argument `size`;
     // `aten.reshape` spells it `shape`. Both are accepted rather than one
     // being assumed -- the first draft assumed `size` and `t.reshape(-1)`
@@ -1172,13 +1333,23 @@ fn transpose_int(
         let out = PyTensorBase::vulkan(a, input.tag());
         return crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind());
     }
+    // The last two dimensions of a 3-D tensor: `k.transpose(1, 2)` between an
+    // attention block's two `bmm`s. **Measured, not guessed** -- with
+    // `embedding` taught and this not, a transformer forward stopped here, one
+    // op past the wall this round came to remove (docs/devices/VULKAN6.md §3).
+    // Every other pair and every higher rank still refuses by name: a general
+    // permutation needs strides a `VkTensor` does not have.
+    if rank == 3 && d0.min(d1) == 1 && d0.max(d1) == 2 {
+        return transpose_batched2d(py, op, &input, &a);
+    }
     if rank != 2 {
         return Err(not_implemented(format!(
-            "{op}: the vulkan device transposes 2-D tensors and was asked for a \
-             {rank}-D one {:?}. A `VkTensor` carries a shape and no strides, so a \
-             transpose here has to move bytes, and the kernel that moves them is \
-             a 2-D one. Higher ranks refuse rather than being permuted by some \
-             other route (docs/devices/VULKAN4.md §6).",
+            "{op}: the vulkan device transposes 2-D tensors, and the last two \
+             dimensions of a 3-D one; it was asked for dims ({d0}, {d1}) of a \
+             {rank}-D tensor {:?}. A `VkTensor` carries a shape and no strides, \
+             so a transpose here has to move bytes, and the kernels that move \
+             them are those two. Anything else refuses rather than being \
+             permuted by some other route (docs/devices/VULKAN4.md §6).",
             a.shape
         )));
     }
@@ -1187,6 +1358,77 @@ fn transpose_int(
 
 /// The materialising 2-D transpose. Pure data movement, so the result is
 /// bit-identical to the CPU answer by construction.
+
+/// The last two dimensions of a 3-D tensor, materialised per batch.
+///
+/// Shares `transpose2d`'s reasoning and its proof: no arithmetic happens, so
+/// the result is bit-identical to the CPU answer rather than close to it.
+/// `aten.mul.Scalar` / `aten.div.Scalar` -- one tensor, one number.
+///
+/// `which` is 0 for multiply and 1 for divide, and the divide stays a divide
+/// (see `shaders/scalar_f32.comp`). The scalar is required to be a real number
+/// that survives the trip to float32 exactly as upstream's own `Scalar` does;
+/// a non-finite or complex one refuses rather than being coerced.
+fn scalar_op(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    which: u32,
+) -> PyResult<Py<PyAny>> {
+    let (input, a) = self_vk(op, args, kwargs)?;
+    let other = crate::aten::optional(args, kwargs, 1, "other")?
+        .ok_or_else(|| not_implemented(format!("{op}: vulkan: missing argument 'other'")))?;
+    let value: f64 = other.extract().map_err(|_| {
+        not_implemented(format!(
+            "{op}: the vulkan device's scalar kernel takes a number, not {}.              A 0-d tensor goes through the .Tensor overload.",
+            other.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+    let ctx = require(op)?;
+    let n = a.elem_count();
+    let bits = (value as f32).to_bits();
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel(
+                "scalar_f32",
+                SCALAR_F32_SPV,
+                &[&a.buffer, &a.buffer, &out],
+                [n as u32, bits, which, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    wrap(py, out, a.shape.clone(), input.tag())
+}
+
+fn transpose_batched2d(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    a: &VkTensor,
+) -> PyResult<Py<PyAny>> {
+    let (batch, rows, cols) = (a.shape[0], a.shape[1], a.shape[2]);
+    let ctx = require(op)?;
+    let n = batch * rows * cols;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel(
+                "transpose_batched2d_f32",
+                TRANSPOSE_BATCHED2D_F32_SPV,
+                &[&a.buffer, &a.buffer, &out],
+                [n as u32, rows as u32, cols as u32, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    wrap(py, out, vec![batch, cols, rows], input.tag())
+}
+
 fn transpose2d(
     py: Python<'_>,
     op: &str,
@@ -1362,7 +1604,7 @@ pub fn maybe_upload(
             tag.name()
         )));
     }
-    check_dtype(op, tag)?;
+    let store = check_storage_dtype(op, tag)?;
     if current.kind != "cpu" {
         return Err(not_implemented(format!(
             "{op}: the vulkan device accepts a copy from the cpu, not from {} \
@@ -1375,13 +1617,59 @@ pub fn maybe_upload(
     let flat = host
         .flatten_all()
         .and_then(|t| t.contiguous())
-        .and_then(|t| t.to_vec1::<f32>())
         .map_err(|e| crate::err::candle_err(op, e))?;
     let ctx = require(op)?;
-    let buffer = unsafe {
-        let buf = ctx.alloc(flat.len() * 4).map_err(|e| vk_error(op, e))?;
-        ctx.upload(&buf, &flat).map_err(|e| vk_error(op, e))?;
-        buf
+    let buffer = match store {
+        VkStore::F32 => {
+            let words = flat.to_vec1::<f32>().map_err(|e| crate::err::candle_err(op, e))?;
+            unsafe {
+                let buf = ctx.alloc(words.len() * 4).map_err(|e| vk_error(op, e))?;
+                ctx.upload(&buf, &words).map_err(|e| vk_error(op, e))?;
+                buf
+            }
+        }
+        VkStore::I64AsI32 => {
+            let values = flat.to_vec1::<i64>().map_err(|e| crate::err::candle_err(op, e))?;
+            // **The narrowing, refused by name rather than performed.** One
+            // pass over values that are being copied anyway: the offending
+            // element is reported with its position and the bound, so the
+            // message says which value and against what -- and the same pass
+            // records the range `embedding` will check against, so the range
+            // check later costs no host round trip.
+            let mut lo = 0i64;
+            let mut hi = 0i64;
+            let mut words = Vec::with_capacity(values.len());
+            for (i, &v) in values.iter().enumerate() {
+                if !(-VULKAN_INDEX_MAX - 1..=VULKAN_INDEX_MAX).contains(&v) {
+                    return Err(not_implemented(format!(
+                        "{op}: int64 element {i} is {v}, which does not fit the \
+                         int32 index storage every vulkan device in this build \
+                         uses (bound {}..={}). 64-bit integers in a shader need \
+                         the optional shaderInt64 feature, so the ceiling is the \
+                         same everywhere rather than a property of this GPU -- \
+                         and a value above it is refused here rather than \
+                         truncated into a different, plausible index \
+                         (docs/devices/VULKAN6.md §1).",
+                        -VULKAN_INDEX_MAX - 1,
+                        VULKAN_INDEX_MAX
+                    )));
+                }
+                if i == 0 || v < lo {
+                    lo = v;
+                }
+                if i == 0 || v > hi {
+                    hi = v;
+                }
+                words.push(v as i32);
+            }
+            let buf = unsafe {
+                let buf = ctx.alloc(words.len().max(1) * 4).map_err(|e| vk_error(op, e))?;
+                ctx.upload_i32(&buf, &words).map_err(|e| vk_error(op, e))?;
+                buf
+            };
+            let _ = buf.index_range.set((lo, hi));
+            buf
+        }
     };
     Ok(Some(wrap(py, buffer, shape, tag)?))
 }
@@ -1408,7 +1696,7 @@ fn to_copy(
     let vk_tensor = input.vk_tensor(op)?.clone();
     match label.kind.as_str() {
         "cpu" => {
-            let host = to_cpu(op, &vk_tensor)?;
+            let host = to_cpu(op, &vk_tensor, input.tag())?;
             let out = PyTensorBase::new(host)?;
             crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind())
         }
@@ -1502,6 +1790,12 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
             d.set_item("type", ctx.device_type.as_str())?;
             d.set_item("queue_family", ctx.qfi)?;
             d.set_item("loader", ctx.loader.as_str())?;
+            d.set_item("shader_int64", ctx.shader_int64)?;
+            d.set_item("shader_int16", ctx.shader_int16)?;
+            d.set_item("shader_float64", ctx.shader_float64)?;
+            d.set_item("khr_8bit_storage", ctx.khr_8bit_storage)?;
+            d.set_item("khr_16bit_storage", ctx.khr_16bit_storage)?;
+            d.set_item("index_max", VULKAN_INDEX_MAX)?;
             d.set_item("error", py.None())?;
         }
         Err(reason) => {
@@ -1510,6 +1804,12 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
             d.set_item("type", py.None())?;
             d.set_item("queue_family", py.None())?;
             d.set_item("loader", py.None())?;
+            d.set_item("shader_int64", py.None())?;
+            d.set_item("shader_int16", py.None())?;
+            d.set_item("shader_float64", py.None())?;
+            d.set_item("khr_8bit_storage", py.None())?;
+            d.set_item("khr_16bit_storage", py.None())?;
+            d.set_item("index_max", VULKAN_INDEX_MAX)?;
             d.set_item("error", reason)?;
         }
     }
@@ -1532,9 +1832,12 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.clone.default",
         "aten.contiguous.default",
         "aten.detach.default",
+        "aten.div.Scalar",
         "aten.div.Tensor",
+        "aten.embedding.default",
         "aten.gelu.default",
         "aten.mm.default",
+        "aten.mul.Scalar",
         "aten.mul.Tensor",
         "aten.native_layer_norm.default",
         "aten.neg.default",
@@ -1858,4 +2161,90 @@ mod tests {
         assert_eq!(c[0], "libvulkan.so.1");
         assert!(!c.iter().any(|p| p.contains("homebrew") || p.ends_with(".dylib")));
     }
+}
+
+
+/// `aten.embedding.default` -- the gather that starts every transformer.
+///
+/// `embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False,
+/// sparse=False)`. The two trailing flags are **autograd hints**: upstream's
+/// forward reads neither (they change how the backward accumulates), and there
+/// is no backward on this device, so they are accepted and the forward is
+/// asserted equal to upstream's with them set. `padding_idx` is likewise a
+/// backward-only argument in `aten::embedding`; the row is still gathered.
+/// That is a claim about upstream's kernel, and
+/// `test_embedding_ignores_the_autograd_only_arguments_exactly_as_upstream_does`
+/// checks it against upstream rather than against this comment.
+///
+/// **The index range is checked before anything is dispatched**, against the
+/// `(min, max)` recorded when the indices were uploaded -- so an out-of-range
+/// index is upstream's `IndexError` with zero shader dispatches, and the check
+/// costs no read-back. `docs/devices/VULKAN6.md` §2.
+fn embedding_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let weight = crate::aten::tensor_arg(op, args, kwargs, 0, "weight")?;
+    let indices = crate::aten::tensor_arg(op, args, kwargs, 1, "indices")?;
+    // The table is float32 like every other tensor with a kernel here...
+    check_dtype(op, weight.tag())?;
+    // ...and the indices are the one integer tensor this device holds.
+    if indices.tag() != TorchDType::Int64 {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan embedding kernel indexes with int64 (stored as \
+             int32, docs/devices/VULKAN6.md §1), not {}. Upstream's \
+             aten::embedding requires Long indices too.",
+            indices.tag().name()
+        )));
+    }
+    let w = weight.vk_tensor(op)?.clone();
+    let idx = indices.vk_tensor(op)?.clone();
+    if w.shape.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "'weight' must be 2-D, got {}-D",
+            w.shape.len()
+        )));
+    }
+    let (rows, dim) = (w.shape[0], w.shape[1]);
+
+    // The range the upload recorded. `None` can only mean a buffer that was
+    // not filled by the int64 upload path, which nothing in this module can
+    // produce -- so it refuses rather than guessing a range.
+    let Some(&(lo, hi)) = idx.buffer.index_range.get() else {
+        return Err(not_implemented(format!(
+            "{op}: this index tensor carries no recorded range, so its values \
+             cannot be checked against the table without reading the device \
+             back. Copy the indices to the vulkan device with .to(\"vulkan\") \
+             (docs/devices/VULKAN6.md §2)."
+        )));
+    };
+    let count = idx.elem_count();
+    if count > 0 && (lo < 0 || hi >= rows as i64) {
+        // Upstream's wording for an index outside the table.
+        let bad = if lo < 0 { lo } else { hi };
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index out of range in self: {bad} is not in [0, {rows})"
+        )));
+    }
+
+    let mut shape = idx.shape.clone();
+    shape.push(dim);
+    let n = count * dim;
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel(
+                "embedding_i32_f32",
+                EMBEDDING_I32_F32_SPV,
+                &[&w.buffer, &idx.buffer, &out],
+                [n as u32, dim as u32, 0, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    wrap(py, out, shape, weight.tag())
 }

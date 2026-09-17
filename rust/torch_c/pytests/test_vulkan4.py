@@ -117,6 +117,12 @@ def _cpu(values, shape):
                                 dtype=_C.float32)
 
 
+def _i64(values, shape):
+    """An int64 CPU tensor -- the dtype an index operand actually has."""
+    return _C._tensor_from_flat([float(v) for v in values], list(shape),
+                                dtype=_C.int64)
+
+
 def _to_vulkan(t):
     return _C._aten_dispatch("aten._to_copy.default", t,
                              device=_C.device("vulkan"))
@@ -544,6 +550,13 @@ EXPECTED_DISPATCHES = {
     "aten._softmax.default": (1, 1),
     "aten.native_layer_norm.default": (1, 1),
     "aten.bmm.default": (1, 2),
+    # docs/devices/VULKAN6.md. `embedding` is one gather; the two `.Scalar`
+    # ops are one elementwise pass each with the number in the push constants,
+    # so neither uploads a staging buffer -- which the `host_uploads == 0`
+    # assertion below is what actually proves.
+    "aten.embedding.default": (1, 2),
+    "aten.mul.Scalar": (1, 1),
+    "aten.div.Scalar": (1, 1),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -604,6 +617,10 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
             args = (a, [3], w3, c3, 1e-5)
         elif op == "aten.bmm.default":
             args = (a3, b3)
+        elif op == "aten.embedding.default":
+            args = (a, _to_vulkan(_i64([0, 1], [2])))
+        elif op in ("aten.mul.Scalar", "aten.div.Scalar"):
+            args = (a, 2.0)
         elif op in ("aten.view.default", "aten._unsafe_view.default",
                     "aten.reshape.default"):
             args = (a, [6])
@@ -793,38 +810,56 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
           f"{counters['host_downloads']} readbacks")
 
 
-def test_a_transformer_still_does_not_forward_and_the_wall_is_named():
-    """The other half of the honest answer.
+def test_the_transformer_wall_moved_and_the_new_one_is_named():
+    """The wall was `embedding`. It is not any more, and this says what is.
 
-    docs/devices/VULKAN4.md §2 measured what a BERT forward dispatches. Five of those
-    ops are not taught this device, and this asserts they still refuse -- so
-    that "an MLP forwards, a transformer does not" cannot quietly become
-    stale in either direction. If a later round teaches one, this test says so
-    by failing, and whoever teaches it gets to update the sentence.
+    `docs/devices/VULKAN5.md` §4 said no transformer reached its *second* op,
+    because `embedding` is the first and its index operand is int64 on a device
+    that stored float32 only. That is closed (docs/devices/VULKAN6.md), and a
+    transformer block really does forward -- see
+    `test_a_transformer_block_forwards_on_the_gpu_and_agrees_with_upstream`.
+
+    What stops a *pretrained* BERT is now further in, and this test pins it so
+    the sentence in the docs cannot go stale in either direction: the ops below
+    are on the measured trace of a shrunk BERT forward (VULKAN6.md §3, 18 op
+    kinds), are not taught, and refuse by name. A round that teaches one fails
+    here and gets to update the sentence.
     """
     if _vulkan_or_skip("the named transformer wall") is None:
         return
     taught = set(_C._vulkan_ops())
-    # docs/devices/VULKAN5.md §4: four of the five walls are taught now. They
-    # are asserted taught, so dropping one fails here too.
-    fell = ("aten.native_layer_norm.default", "aten._softmax.default",
-            "aten.gelu.default", "aten.bmm.default")
-    assert all(op in taught for op in fell), sorted(set(fell) - taught)
-    # `embedding` is the first op of every transformer forward, and its index
-    # operand is int64 while this device stores float32 only -- so no
-    # transformer reaches even its second op. `expand` is on the same trace.
-    walls = ("aten.embedding.default", "aten.expand.default")
+    # Taught now -- dropping any of them fails here too.
+    landed = ("aten.native_layer_norm.default", "aten._softmax.default",
+              "aten.gelu.default", "aten.bmm.default",
+              "aten.embedding.default", "aten.div.Scalar")
+    assert all(op in taught for op in landed), sorted(set(landed) - taught)
+
+    # Still missing, in the order the BERT trace of docs/devices/VULKAN6.md §3
+    # counts them: expand 10, slice 1, gather 1, select 1, tanh 1.
+    walls = ("aten.expand.default", "aten.slice.Tensor", "aten.gather.default",
+             "aten.select.int", "aten.tanh.default")
     still = [op for op in walls if op not in taught]
     assert still == list(walls), (
-        f"these are taught now and docs/devices/VULKAN5.md §4 needs updating: "
+        f"these are taught now and docs/devices/VULKAN6.md §3 needs updating: "
         f"{sorted(set(walls) - set(still))}")
-    idx = _C._tensor_from_flat([0, 1], [2], dtype=_C.int64)
+
+    # And the rank the transpose still refuses. BERT's ten `transpose.int`
+    # calls are on 4-D tensors (batch, head, seq, dim); this round taught the
+    # 3-D case only, which is what a single-head block needs.
+    a4 = _to_vulkan(_cpu([1.0] * 16, [2, 2, 2, 2]))
     try:
-        _to_vulkan(idx)
+        _C._aten_dispatch("aten.transpose.int", a4, 1, 2)
     except NotImplementedError as e:
-        assert "int64" in str(e) and "float32" in str(e), str(e)
+        assert "4-D" in str(e), str(e)
     else:
-        raise AssertionError("an int64 index tensor reached the vulkan device")
+        raise AssertionError("a 4-D transpose was permuted instead of refused")
+
+    # `embedding`'s wall was int64 *storage*, and it is the one thing here that
+    # moved rather than being taught: an index tensor now lands, and what it
+    # cannot hold refuses with the bound named (docs/devices/VULKAN6.md §1).
+    idx = _to_vulkan(_i64([0, 1], [2]))
+    assert str(idx.device) == "vulkan" and str(idx.dtype) == "torch.int64", (
+        idx.device, idx.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1242,9 +1277,561 @@ def test_every_float_dtype_but_float32_refuses_on_the_way_to_the_device():
         try:
             _to_vulkan(src)
         except NotImplementedError as e:
-            assert "float32 only" in str(e), (dtype, str(e))
+            # The sentence grew when int64 index storage landed
+            # (docs/devices/VULKAN6.md §1): it now says what *is* stored as
+            # well as what is not, so the check is that both halves are
+            # there and that the dtype is named.
+            msg = str(e)
+            assert "stores float32" in msg and "int64 indices as int32" in msg, (dtype, msg)
+            assert f"not {str(dtype).replace('torch.', '')}" in msg, (dtype, msg)
         else:
             raise AssertionError(f"a {dtype} tensor reached the vulkan device")
+
+
+# ---------------------------------------------------------------------------
+# 10. Integer index storage, `embedding`, and the ops a block needs
+#     (docs/devices/VULKAN6.md)
+# ---------------------------------------------------------------------------
+
+def test_the_device_reports_its_integer_capabilities_and_the_index_bound_is_not_one_of_them():
+    """The measurement the design rests on, and the refusal to depend on it.
+
+    `docs/devices/VULKAN6.md` §1 had to decide how an index buffer is stored,
+    and the honest input was what *this* driver reports rather than the usual
+    claim that Vulkan compute has no 64-bit integers. Measured here: MoltenVK
+    1.4.2 on an Apple M1 reports `shaderInt64 = True`.
+
+    The index storage is int32 anyway, and that is the part this test holds
+    down: `index_max` is the same number whatever the device says, so the range
+    of indices a model may use is a property of this library and not of the GPU
+    it happens to be running on. On a machine whose `shaderInt64` is True --
+    this one -- the bound is *provably* not a capability report, because a
+    value the device could represent natively is still refused.
+    """
+    probe = _vulkan_or_skip("the integer-capability report")
+    if probe is None:
+        return
+    for key in ("shader_int64", "shader_int16", "shader_float64",
+                "khr_8bit_storage", "khr_16bit_storage"):
+        assert key in probe, f"_vulkan_probe() does not report {key}: {sorted(probe)}"
+        assert isinstance(probe[key], bool), (key, probe[key])
+    assert probe["index_max"] == 2 ** 31 - 1, probe["index_max"]
+
+    print(f"   {probe['device']} via {probe['loader']}: "
+          f"shaderInt64={probe['shader_int64']} shaderInt16={probe['shader_int16']} "
+          f"shaderFloat64={probe['shader_float64']} "
+          f"8bit={probe['khr_8bit_storage']} 16bit={probe['khr_16bit_storage']}")
+
+    if not probe["shader_int64"]:
+        print("   (this device has no shaderInt64, so the bound could not be "
+              "distinguished from a capability report here)")
+        return
+    too_big = _i64([2 ** 31], [1])
+    try:
+        _to_vulkan(too_big)
+    except NotImplementedError as e:
+        assert "int32" in str(e) and "2147483647" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "2**31 reached the device: the index bound is following the "
+            "driver's shaderInt64 instead of being this library's own")
+
+
+def test_int64_indices_round_trip_through_the_device_unchanged():
+    """The storage class, end to end -- and a reshape of it on the way.
+
+    Values at both ends of the bound, because a narrowing that is wrong at the
+    edges is right in the middle. `view` is in the middle of the trip because a
+    transformer reshapes its `input_ids` before the embedding sees them, and
+    `view` is the one op here that had to learn about a non-float dtype.
+    """
+    if _vulkan_or_skip("the int64 round trip") is None:
+        return
+    values = [0, 1, 2, 7, 2 ** 31 - 1, -(2 ** 31), -1, 12345]
+    src = _i64(values, [2, 4])
+    dev = _to_vulkan(src)
+    assert str(dev.device) == "vulkan", dev.device
+    assert str(dev.dtype) == "torch.int64", dev.dtype
+    viewed = _C._aten_dispatch("aten.view.default", dev, [8])
+    back = _to_cpu(viewed)
+    assert str(back.dtype) == "torch.int64", back.dtype
+    got = [int(v) for v in _flat(back)]
+    assert got == values, (got, values)
+
+
+def test_an_int64_value_beyond_the_bound_refuses_by_name_and_uploads_nothing():
+    """The narrowing is a refusal, not a truncation.
+
+    `2**31` truncated to int32 is `-2147483648`, which as an index is a
+    perfectly plausible wrong row rather than an error -- which is why this
+    refuses instead. The message has to carry the value, its position and the
+    bound, because "does not fit" alone leaves the caller hunting for which
+    element.
+
+    The second assertion is the one that makes it a refusal rather than a late
+    error: no buffer was uploaded, so nothing of this tensor exists on the
+    device.
+    """
+    if _vulkan_or_skip("the out-of-bound index refusal") is None:
+        return
+    for values, offender, position in ((([1, 2 ** 31]), 2 ** 31, 1),
+                                       (([-(2 ** 31) - 1, 3]), -(2 ** 31) - 1, 0)):
+        src = _i64(values, [2])
+        before = _counters()
+        try:
+            _to_vulkan(src)
+        except NotImplementedError as e:
+            msg = str(e)
+            assert str(offender) in msg, (offender, msg)
+            assert f"element {position}" in msg, (position, msg)
+            assert "2147483647" in msg, msg
+        else:
+            raise AssertionError(f"{offender} was narrowed instead of refused")
+        d = _delta(before, _counters())
+        assert d["host_uploads"] == 0 and d["shader_dispatches"] == 0, (values, d)
+
+
+def _embedding_cases():
+    return (
+        # (vocab, dim, index shape, indices)
+        (8, 4, [3], [0, 7, 3]),
+        (8, 4, [2, 3], [0, 1, 2, 3, 4, 5]),
+        (50257, 2, [4], [0, 1, 50256, 42]),
+        (5, 1, [1], [4]),
+        (6, 3, [2, 2], [5, 5, 0, 0]),
+    )
+
+
+def test_embedding_is_bit_identical_to_upstream_and_ran_on_the_gpu():
+    """The kernel, held to bit equality rather than a tolerance.
+
+    A gather does no arithmetic: every output element is a float32 copied from
+    the table, so "agrees with upstream" here means *the same bits*, and a
+    tolerance would be a place for a defect to hide. docs/numerics/AGREE.md §2's
+    derivation produces zero for an op like this, the way it does for `view`
+    and `t`.
+
+    The second half is the device assertion: one compute shader ran and nothing
+    was read back, so the gather happened on the GPU. Both halves are needed --
+    a host implementation would get the bits exactly right.
+    """
+    if _vulkan_or_skip("the embedding agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    checked = 0
+    for vocab, dim, shape, indices in _embedding_cases():
+        g = torch.Generator().manual_seed(vocab * 131 + dim)
+        w = torch.randn(vocab, dim, generator=g, dtype=torch.float32)
+        ids = torch.as_tensor(indices, dtype=torch.int64).reshape(shape)
+        want = torch.ops.aten.embedding.default(w, ids)
+
+        wv = _to_vulkan(_cpu(w.reshape(-1).tolist(), [vocab, dim]))
+        iv = _to_vulkan(_i64(indices, shape))
+        before = _counters()
+        out = _C._aten_dispatch("aten.embedding.default", wv, iv)
+        d = _delta(before, _counters())
+        assert str(out.device) == "vulkan", out.device
+        assert list(out.shape) == list(want.shape), (out.shape, want.shape)
+        assert d["shader_dispatches"] == 1, (vocab, dim, shape, d)
+        assert d["host_downloads"] == 0, (
+            f"embedding read {d['host_downloads']} buffer(s) back -- it is "
+            f"gathering on the CPU under a vulkan label")
+
+        got = _flat(_to_cpu(out))
+        exp = want.reshape(-1).tolist()
+        assert len(got) == len(exp), (len(got), len(exp))
+        off = [i for i, (x, y) in enumerate(zip(got, exp)) if _bits(x) != _bits(y)]
+        assert not off, (
+            f"embedding[{vocab},{dim}]{shape}: {len(off)} of {len(exp)} "
+            f"elements differ from upstream's bits, first at {off[:5]}")
+        checked += len(exp)
+    print(f"   embedding: {checked} elements bit-identical to upstream over "
+          f"{len(_embedding_cases())} cases")
+
+
+def test_embedding_refuses_an_out_of_range_index_before_any_gpu_work():
+    """Upstream raises `IndexError` here, and so does this -- with no dispatch.
+
+    The row is checked against the table on the host, from the range recorded
+    when the indices were uploaded, so it costs no read-back (the shader could
+    not raise anyway; it could only clamp or read garbage, and both of those
+    are the silent wrong answer this device exists to prevent).
+
+    Upstream is asked the same question rather than its behaviour being
+    asserted from memory.
+    """
+    if _vulkan_or_skip("the embedding range refusal") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    vocab, dim = 5, 3
+    w = torch.zeros(vocab, dim, dtype=torch.float32)
+    wv = _to_vulkan(_cpu([0.0] * (vocab * dim), [vocab, dim]))
+    for bad in (vocab, vocab + 100, -1):
+        try:
+            torch.ops.aten.embedding.default(w, torch.as_tensor([bad]))
+        except IndexError:
+            pass
+        else:
+            raise AssertionError(
+                f"upstream accepted index {bad} into a {vocab}-row table; this "
+                f"test's premise is wrong")
+        iv = _to_vulkan(_i64([0, bad], [2]))
+        before = _counters()
+        try:
+            _C._aten_dispatch("aten.embedding.default", wv, iv)
+        except IndexError as e:
+            assert str(bad) in str(e) and f"[0, {vocab})" in str(e), str(e)
+        else:
+            raise AssertionError(f"index {bad} was gathered instead of refused")
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 0, (
+            f"the out-of-range refusal ran {d['shader_dispatches']} compute "
+            f"shader(s) before refusing: {d}")
+        assert d["host_downloads"] == 0, (
+            f"the range check read {d['host_downloads']} buffer(s) back; it is "
+            f"meant to use the range recorded at upload: {d}")
+
+
+def test_embedding_ignores_the_autograd_only_arguments_exactly_as_upstream_does():
+    """`padding_idx`, `scale_grad_by_freq` and `sparse` change no forward value.
+
+    That is the reason this kernel accepts them instead of refusing by name,
+    and it is a claim about *upstream's* kernel -- so it is checked against
+    upstream on the same inputs rather than asserted from the signature. If a
+    future torch made `padding_idx` zero the row in the forward, this fails
+    and the acceptance has to become a refusal.
+    """
+    if _vulkan_or_skip("the embedding autograd-argument check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    vocab, dim = 6, 3
+    g = torch.Generator().manual_seed(7)
+    w = torch.randn(vocab, dim, generator=g, dtype=torch.float32)
+    indices = [0, 5, 2, 0]
+    ids = torch.as_tensor(indices, dtype=torch.int64)
+    wv = _to_vulkan(_cpu(w.reshape(-1).tolist(), [vocab, dim]))
+    plain = torch.ops.aten.embedding.default(w, ids).reshape(-1).tolist()
+    for padding_idx, scale, sparse in ((0, False, False), (-1, True, False),
+                                       (2, False, True), (0, True, True)):
+        want = torch.ops.aten.embedding.default(
+            w, ids, padding_idx, scale, sparse).reshape(-1).tolist()
+        assert [_bits(x) for x in want] == [_bits(x) for x in plain], (
+            f"upstream's forward DOES read (padding_idx={padding_idx}, "
+            f"scale_grad_by_freq={scale}, sparse={sparse}) -- the vulkan "
+            f"kernel must stop accepting them and refuse by name instead")
+        iv = _to_vulkan(_i64(indices, [len(indices)]))
+        out = _C._aten_dispatch("aten.embedding.default", wv, iv,
+                                padding_idx, scale, sparse)
+        got = _flat(_to_cpu(out))
+        assert [_bits(x) for x in got] == [_bits(x) for x in want], (
+            padding_idx, scale, sparse)
+
+
+def test_embedding_refuses_the_operands_it_does_not_implement():
+    """Each refusal names what was wrong, before any GPU work."""
+    if _vulkan_or_skip("the embedding operand refusals") is None:
+        return
+    w2 = _to_vulkan(_cpu([1.0] * 6, [3, 2]))
+    w3 = _to_vulkan(_cpu([1.0] * 8, [2, 2, 2]))
+    idx = _to_vulkan(_i64([0, 1], [2]))
+    floaty = _to_vulkan(_cpu([0.0, 1.0], [2]))
+    cases = (
+        ("a 3-D table", lambda: _C._aten_dispatch("aten.embedding.default", w3, idx),
+         "2-D"),
+        ("float indices", lambda: _C._aten_dispatch("aten.embedding.default", w2, floaty),
+         "int64"),
+    )
+    for what, call, needle in cases:
+        before = _counters()
+        try:
+            call()
+        except (NotImplementedError, RuntimeError) as e:
+            assert needle in str(e), (what, needle, str(e))
+        else:
+            raise AssertionError(f"{what} was computed instead of refused")
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 0, (what, d)
+
+
+def test_the_batched_transpose_is_bit_identical_and_every_other_permutation_refuses():
+    """`k.transpose(1, 2)` -- the op between an attention block's two `bmm`s.
+
+    Measured, not chosen: with `embedding` taught and this not, a transformer
+    block's forward stopped here (docs/devices/VULKAN6.md §3). Pure data
+    movement, so bit equality rather than a tolerance -- the same standard
+    `t` and the 2-D transpose are held to.
+
+    The refusals matter as much as the kernel: a general permutation needs
+    strides a `VkTensor` does not have, so every other dimension pair and every
+    higher rank still refuses by name rather than being routed through
+    something that happens to be nearby.
+    """
+    if _vulkan_or_skip("the batched transpose") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for batch, rows, cols in ((2, 3, 4), (1, 5, 1), (3, 2, 2), (2, 1, 7)):
+        g = torch.Generator().manual_seed(batch * 977 + rows * 31 + cols)
+        x = torch.randn(batch, rows, cols, generator=g, dtype=torch.float32)
+        want = x.transpose(1, 2).contiguous().reshape(-1).tolist()
+        xv = _to_vulkan(_cpu(x.reshape(-1).tolist(), [batch, rows, cols]))
+        before = _counters()
+        out = _C._aten_dispatch("aten.transpose.int", xv, 1, 2)
+        d = _delta(before, _counters())
+        assert list(out.shape) == [batch, cols, rows], out.shape
+        assert d["shader_dispatches"] == 1, (batch, rows, cols, d)
+        assert d["host_downloads"] == 0, d
+        got = _flat(_to_cpu(out))
+        off = [i for i, (a, b) in enumerate(zip(got, want)) if _bits(a) != _bits(b)]
+        assert not off, (
+            f"transpose[{batch},{rows},{cols}](1,2): {len(off)} of {len(want)} "
+            f"elements differ from upstream's bits, first at {off[:5]}")
+        # Negative dims name the same pair and must take the same path.
+        neg = _C._aten_dispatch("aten.transpose.int", xv, -1, -2)
+        assert [_bits(v) for v in _flat(_to_cpu(neg))] == [_bits(v) for v in want]
+
+    a3 = _to_vulkan(_cpu([1.0] * 8, [2, 2, 2]))
+    a4 = _to_vulkan(_cpu([1.0] * 16, [2, 2, 2, 2]))
+    for what, args in (("3-D (0,1)", (a3, 0, 1)), ("3-D (0,2)", (a3, 0, 2)),
+                       ("4-D (1,2)", (a4, 1, 2))):
+        before = _counters()
+        try:
+            _C._aten_dispatch("aten.transpose.int", *args)
+        except NotImplementedError as e:
+            assert "refuse" in str(e) or "was asked for" in str(e), str(e)
+        else:
+            raise AssertionError(f"{what} was permuted instead of refused")
+        assert _delta(before, _counters())["shader_dispatches"] == 0, what
+
+
+def test_the_scalar_ops_are_bit_identical_and_the_divide_stayed_a_divide():
+    """`x / sqrt(d)` is on the trace, and it must not become `x * (1/sqrt(d))`.
+
+    The reciprocal rewrite is the same class of transformation MoltenVK's
+    fast-math was turned off for (docs/devices/VULKAN5.md §3.1): it is within
+    any tolerance anyone would pick and it is not what upstream computes. So
+    the assertion is bit equality against upstream -- and the test first checks
+    that the case can *tell the difference*, by counting how many elements the
+    reciprocal form would get wrong. A case where that count is zero would
+    prove nothing, and this refuses to be such a case.
+    """
+    if _vulkan_or_skip("the scalar ops") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    g = torch.Generator().manual_seed(4242)
+    x = torch.randn(64, generator=g, dtype=torch.float32)
+    xv = _to_vulkan(_cpu(x.tolist(), [64]))
+    discriminating = 0
+    for scalar in (2.0, 3.0, 32.0 ** 0.5, 0.1, -7.5):
+        s32 = torch.as_tensor(scalar, dtype=torch.float32)
+        for op, want in (("aten.mul.Scalar", x * s32), ("aten.div.Scalar", x / s32)):
+            before = _counters()
+            out = _C._aten_dispatch(op, xv, scalar)
+            d = _delta(before, _counters())
+            assert d["shader_dispatches"] == 1, (op, scalar, d)
+            assert d["host_downloads"] == 0, (op, scalar, d)
+            got = _flat(_to_cpu(out))
+            exp = want.tolist()
+            off = [i for i, (a, b) in enumerate(zip(got, exp)) if _bits(a) != _bits(b)]
+            assert not off, (
+                f"{op} by {scalar}: {len(off)} of {len(exp)} elements differ "
+                f"from upstream's bits, first at {off[:5]}")
+            if op == "aten.div.Scalar":
+                recip = (x * (torch.as_tensor(1.0, dtype=torch.float32) / s32)).tolist()
+                differ = sum(1 for a, b in zip(recip, exp) if _bits(a) != _bits(b))
+                discriminating += differ
+    assert discriminating > 0, (
+        "no scalar in this sweep distinguishes `a / s` from `a * (1/s)`, so "
+        "the bit-equality assertion above could not have caught the rewrite")
+    print(f"   scalar ops bit-identical; the reciprocal rewrite would have "
+          f"moved {discriminating} element(s) across this sweep")
+
+
+_BLOCK_SHIM_SCRIPT = r"""
+import json, math, sys
+import torch, torch.nn as nn
+
+assert hasattr(torch._C, "_aten_implemented"), "this subprocess got upstream torch"
+
+cfg = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+V, D, F = cfg["V"], cfg["D"], cfg["F"]
+
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = nn.Embedding(V, D)
+        self.ln1 = nn.LayerNorm(D)
+        self.ln2 = nn.LayerNorm(D)
+        self.q = nn.Linear(D, D); self.k = nn.Linear(D, D)
+        self.v = nn.Linear(D, D); self.o = nn.Linear(D, D)
+        self.f1 = nn.Linear(D, F); self.f2 = nn.Linear(F, D)
+
+    def forward(self, ids):
+        x = self.emb(ids)
+        h = self.ln1(x)
+        q, k, v = self.q(h), self.k(h), self.v(h)
+        scores = torch.bmm(q, k.transpose(1, 2)) / math.sqrt(D)
+        y = torch.bmm(torch.softmax(scores, dim=-1), v)
+        x = x + self.o(y)
+        h = self.ln2(x)
+        return x + self.f2(torch.nn.functional.gelu(self.f1(h)))
+
+
+m = Block()
+m.load_state_dict({k: torch.as_tensor(v, dtype=torch.float32)
+                   for k, v in cfg["sd"].items()})
+m.eval()
+ids = torch.as_tensor(cfg["ids"], dtype=torch.int64).reshape(cfg["sids"])
+with torch.no_grad():
+    out["cpu"] = m(ids).reshape(-1).tolist()
+m.to("vulkan")
+before = torch._C._vulkan_counters()
+with torch.no_grad():
+    r = m(ids.to("vulkan"))
+after = torch._C._vulkan_counters()
+out["device"] = str(r.device)
+out["counters"] = {k: after[k] - before[k] for k in after}
+out["vulkan"] = r.cpu().reshape(-1).tolist()
+json.dump(out, sys.stdout)
+"""
+
+
+def test_a_transformer_block_forwards_on_the_gpu_and_agrees_with_upstream():
+    """**The deliverable of docs/devices/VULKAN6.md, and the reason it exists.**
+
+    `docs/architectures/VOICE4.md` records seven rounds that closed operators
+    one at a time and never ran a model; `docs/devices/VULKAN5.md` closed four
+    transformer kernels and could not run a transformer either, because
+    `embedding` is the first op. So the claim being made here is not that a
+    kernel agrees -- it is that a *transformer block* forwards, on the device,
+    end to end:
+
+        embedding -> layer_norm -> q,k,v -> transpose -> bmm -> /sqrt(d)
+                  -> softmax -> bmm -> out proj -> residual
+                  -> layer_norm -> fc -> gelu -> fc -> residual
+
+    Three assertions, and only the first is about the answer:
+
+      1. it agrees with upstream inside docs/numerics/AGREE.md §2's rule (no
+         worse than 4x upstream's own distance from the float64 truth), and
+         with the shim's own cpu answer to a couple of float32 ulp;
+      2. the result is a vulkan tensor;
+      3. **every compute shader in it ran on the GPU and nothing was read
+         back.** A forward that fell back to the host would still get the
+         numbers right and would fail here.
+
+    It is a single-head block, and that is stated rather than implied: BERT's
+    ten `transpose.int` calls are 4-D (batch, head, seq, dim) and refuse, along
+    with `expand`, `slice`, `gather`, `select` and `tanh` -- see
+    `test_the_transformer_wall_moved_and_the_new_one_is_named`.
+    """
+    if _vulkan_or_skip("the transformer block forward") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    try:
+        import torch.nn as nn
+    except Exception:  # noqa: BLE001
+        vulkan_coverage.vulkan_skip("the transformer block forward: no torch.nn upstream")
+        return
+
+    V, D, F, B, S = 32, 16, 32, 2, 6
+    g = torch.Generator().manual_seed(2026)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = nn.Embedding(V, D)
+            self.ln1 = nn.LayerNorm(D)
+            self.ln2 = nn.LayerNorm(D)
+            self.q = nn.Linear(D, D); self.k = nn.Linear(D, D)
+            self.v = nn.Linear(D, D); self.o = nn.Linear(D, D)
+            self.f1 = nn.Linear(D, F); self.f2 = nn.Linear(F, D)
+
+        def forward(self, ids):
+            x = self.emb(ids)
+            h = self.ln1(x)
+            q, k, v = self.q(h), self.k(h), self.v(h)
+            scores = torch.bmm(q, k.transpose(1, 2)) / (D ** 0.5)
+            y = torch.bmm(torch.softmax(scores, dim=-1), v)
+            x = x + self.o(y)
+            h = self.ln2(x)
+            return x + self.f2(torch.nn.functional.gelu(self.f1(h)))
+
+    model = Block().eval()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.randn(p.shape, generator=g, dtype=torch.float32) * 0.5)
+    ids = torch.randint(0, V, (B, S), generator=g, dtype=torch.int64)
+
+    cfg = {"V": V, "D": D, "F": F, "ids": ids.reshape(-1).tolist(),
+           "sids": [B, S],
+           "sd": {k: v.tolist() for k, v in model.state_dict().items()}}
+    env = dict(os.environ)
+    env["PYTHONPATH"] = VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _BLOCK_SHIM_SCRIPT],
+                          input=json.dumps(cfg), capture_output=True,
+                          text=True, env=env, timeout=600)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    got = json.loads(proc.stdout)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            f"the transformer block forward: the vendored-tree subprocess has "
+            f"no loader -- {got['probe']['error']}")
+        return
+    assert got["device"].startswith("vulkan"), got["device"]
+
+    with torch.no_grad():
+        f32 = model(ids).reshape(-1).tolist()
+        wide = Block().eval()
+        wide.load_state_dict(model.state_dict())
+        truth = wide.double()(ids).reshape(-1).tolist()
+
+    scale = max(abs(v) for v in truth)
+    up_err = max(abs(a - b) for a, b in zip(f32, truth))
+    vk_err = max(abs(a - b) for a, b in zip(got["vulkan"], truth))
+    cpu_err = max(abs(a - b) for a, b in zip(got["cpu"], truth))
+    backends = max(abs(a - b) for a, b in zip(got["vulkan"], got["cpu"]))
+    ulp = scale * FLOAT32_EPS
+
+    assert vk_err <= 4 * up_err, (
+        f"the vulkan block is {vk_err:.3e} from the float64 truth against "
+        f"upstream's own {up_err:.3e}; docs/numerics/AGREE.md's rule allows 4x")
+    assert cpu_err <= 4 * up_err, (cpu_err, up_err)
+    assert backends <= 8 * ulp, (
+        f"vulkan and the shim's own cpu differ by {backends:.3e}, more than "
+        f"eight float32 ulp ({8 * ulp:.3e}) at this magnitude")
+
+    counters = got["counters"]
+    # 1 embedding + 2 layer_norm + 6 Linear x (t + matmul + bias)
+    # + 1 transpose + 2 bmm + 1 div + 1 softmax + 1 gelu + 2 residual add = 29.
+    assert counters["shader_dispatches"] == 29, (
+        f"the block forward ran {counters['shader_dispatches']} compute "
+        f"shaders, expected 29: {counters}")
+    assert counters["host_downloads"] == 0, (
+        f"the block forward read {counters['host_downloads']} buffer(s) back "
+        f"to the host -- part of it computed on the CPU: {counters}")
+    print(f"   transformer block on vulkan: upstream f32 err {up_err:.3e}, "
+          f"shim cpu {cpu_err:.3e}, shim vulkan {vk_err:.3e} "
+          f"({vk_err / up_err:.2f}x), vulkan-vs-cpu {backends / ulp:.2f} ulp, "
+          f"{counters['shader_dispatches']} shaders, "
+          f"{counters['host_downloads']} readbacks")
 
 
 def _main():

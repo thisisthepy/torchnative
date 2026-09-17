@@ -14,7 +14,7 @@
 | 네 커널은 **일치함**(AGREES)인가 | **예 — float32, 연산자 단위, Apple M1, 두 드라이버(MoltenVK 1.4.2 · kosmickrisp).** `docs/numerics/AGREE.md` §2 의 유도 허용치 안 (§3) |
 | 그 판정은 어떤 기계에서든 참인가 | **아니다.** 로더가 없는 기계에서는 **재지 않은 것**이고, 이제 게이트가 그렇게 말한다 (§2) |
 | float16 / bfloat16 / float64 는 | **숫자가 없다.** 장치에 올라가는 순간 이름을 대며 거절한다. 일치 주장도 없다 |
-| 트랜스포머가 Vulkan 에서 도는가 | **0 개.** `embedding` 이 첫 op 이고 미구현이다 (§4) |
+| 트랜스포머가 Vulkan 에서 도는가 | **0 개.** `embedding` 이 첫 op 이고 미구현이다 (§4). **이후 `docs/devices/VULKAN6.md` 에서 닫혔고, 블록 하나가 장치 위에서 돈다** |
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 19 -->
@@ -220,6 +220,10 @@ NOPE_CONTROL (대조군)             1199 / 4149
 ---
 
 ## 4. 남은 벽 — Vulkan 에서 도는 트랜스포머는 0 개
+
+> **이 절은 이 회차의 기록이며, 이후 `docs/devices/VULKAN6.md` 가 여기를 닫았습니다** — int64
+> 인덱스는 int32 로 범위를 명시해 저장되고, `embedding` 과 3-D `transpose`·`div.Scalar` 가 생겨 단일헤드
+> 트랜스포머 블록이 장치 위에서 forward 합니다. 아래는 그때의 상태입니다.
 
 `aten.embedding.default` 는 여전히 `_vulkan_ops()` 에 없습니다. 이유는 구조적입니다: **`vulkan.rs` 는 장치
 텐서를 float32 로만 저장**하고, 인덱스 텐서는 int64 입니다. int64 텐서를 올리면 이름을 대며 거절됩니다

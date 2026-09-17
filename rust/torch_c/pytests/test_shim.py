@@ -25915,7 +25915,19 @@ def test_vulkan_probe_answers_the_same_question_the_device_does():
     can happen without this disagreeing.
     """
     probe = _C._vulkan_probe()
-    assert set(probe) == {"available", "device", "type", "queue_family", "loader", "error"}, probe
+    # The set is exact in both directions, so a key that stops being reported
+    # fails here as loudly as one that appears unannounced. The five capability
+    # keys and `index_max` arrived with the int64 index storage of
+    # docs/devices/VULKAN6.md §1 -- that section's argument is *about* these
+    # values, so a build that stopped reporting them would leave the argument
+    # uncheckable.
+    assert set(probe) == {"available", "device", "type", "queue_family", "loader",
+                          "shader_int64", "shader_int16", "shader_float64",
+                          "khr_8bit_storage", "khr_16bit_storage", "index_max",
+                          "error"}, probe
+    # The ceiling is this library's and not the driver's, so it is reported
+    # whether or not there is a device (docs/devices/VULKAN6.md §1.2).
+    assert probe["index_max"] == 2 ** 31 - 1, probe
     # Which loader was opened is evidence, and absence of one is not a path.
     assert (probe["loader"] is not None) == probe["available"], probe
     try:
