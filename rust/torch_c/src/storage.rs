@@ -556,12 +556,96 @@ impl PyStorageBase {
         Err(self.snapshot_is_read_only("UntypedStorage.__setitem__"))
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn copy_(&self, _args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        if self.is_meta() {
-            return Err(self.meta_has_no_bytes("UntypedStorage.copy_"));
+    /// `UntypedStorage.copy_(source, non_blocking=False)` -- **the fill door,
+    /// not a write door.** docs/architectures/VOICE5.md §5.
+    ///
+    /// This refused unconditionally, and that refusal was reached by the
+    /// ordinary user path: `copy.deepcopy(tensor)` is
+    /// `Tensor.__deepcopy__` -> `UntypedStorage.clone()` ->
+    /// `type(self)(self.nbytes(), device=self.device).copy_(self)`, and
+    /// `transformers.ProcessorMixin.__repr__` deep-copies every attribute it
+    /// holds -- which for `HiggsAudioV2Processor` includes an entire audio
+    /// tokenizer model. So `AutoProcessor.from_pretrained` stopped here,
+    /// before a single operator ran.
+    ///
+    /// The rule this module enforces is **filled once, by the reader that
+    /// delivers the bytes**, and a storage allocated one line earlier by
+    /// `clone()` has not been filled. Filling it is that rule, not an
+    /// exception to it, so exactly that case is accepted and every other
+    /// keeps the refusal it had:
+    ///
+    /// ```text
+    /// destination is meta            refused -- it has no bytes at all
+    /// destination is a SNAPSHOT      refused -- a write would be invisible
+    ///                                to the tensor it was taken from
+    /// destination already filled     refused -- filled once
+    /// destination shares its buffer  refused -- the fill would be visible to
+    ///                                some holders of the alias and not others
+    /// source is not a storage        refused -- nothing to read bytes from
+    /// sizes differ                   refused, with upstream's own wording
+    /// fresh, unshared, unfilled      FILLED, and `filled` is set
+    /// ```
+    ///
+    /// Returns the destination, which is what upstream's `copy_` returns and
+    /// what `storage.py`'s `clone()` relies on (`return type(self)(...)
+    /// .copy_(self)` answers `None` otherwise).
+    #[pyo3(signature = (source = None, non_blocking = false))]
+    fn copy_(
+        slf: &Bound<'_, Self>,
+        source: Option<&Bound<'_, PyAny>>,
+        non_blocking: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = non_blocking;
+        {
+            let me = slf.borrow();
+            if me.is_meta() {
+                return Err(me.meta_has_no_bytes("UntypedStorage.copy_"));
+            }
+            if me.origin != 0 || me.filled {
+                return Err(me.snapshot_is_read_only("UntypedStorage.copy_"));
+            }
         }
-        Err(self.snapshot_is_read_only("UntypedStorage.copy_"))
+        let Some(source) = source else {
+            return Err(slf.borrow().snapshot_is_read_only("UntypedStorage.copy_"));
+        };
+        let Ok(src) = source.cast::<Self>() else {
+            return Err(not_implemented(format!(
+                "torch._C shim: UntypedStorage.copy_(source) where source is a {} -- \
+                 the only source this shim can read bytes from is another \
+                 UntypedStorage (storage.rs)",
+                source.get_type().name()?
+            )));
+        };
+        let bytes = {
+            let src = src.borrow();
+            if src.is_meta() {
+                return Err(src.meta_has_no_bytes("UntypedStorage.copy_(source=...)"));
+            }
+            src.bytes().to_vec()
+        };
+        let mut me = slf.borrow_mut();
+        if bytes.len() != me.len {
+            // Upstream's own wording for a size-mismatched storage copy.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "size mismatch, source has {} bytes and destination has {}",
+                bytes.len(),
+                me.len
+            )));
+        }
+        let off = me.off;
+        let len = me.len;
+        let Some(buf) = Arc::get_mut(&mut me.buf) else {
+            return Err(not_implemented(
+                "torch._C shim: UntypedStorage.copy_ into a storage whose bytes \
+                 are shared with a view -- this shim's views alias, so the fill \
+                 would be visible to some holders and not others. Fill the \
+                 storage before slicing it (see storage.rs)",
+            ));
+        };
+        buf[off..off + len].copy_from_slice(&bytes);
+        me.filled = true;
+        drop(me);
+        Ok(slf.clone().into_any().unbind())
     }
 
     #[pyo3(signature = (*_args, **_kwargs))]

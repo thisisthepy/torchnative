@@ -3972,6 +3972,110 @@ fn meta_dispatch(
             meta_result(py, shape, input.tag())
         }
         // ---------------------------------------------------------------
+        // `weight_norm`'s two ops on meta -- docs/architectures/VOICE5.md §4.
+        //
+        // `torch.nn.utils.parametrizations.weight_norm` is how the Higgs audio
+        // tokenizer's decoder convolutions are built, and `from_pretrained`
+        // builds under `accelerate.init_empty_weights`, i.e. on `meta`. Both
+        // ops below were already in `_aten_implemented()` with dense kernels
+        // and golden cases -- VOICE4.md §4.1's finding, in a new place.
+        //
+        // The failure they produce is worth naming because it does not name
+        // them: `ParametrizationList.__init__` runs `right_inverse` inside
+        // `except NotImplementedError: pass`, so "no meta kernel for
+        // aten.norm.ScalarOpt_dim" is SWALLOWED, the list concludes
+        // `is_tensor = True` from the un-inverted tensor, and the user is
+        // handed `TypeError: _WeightNorm.forward() missing 1 required
+        // positional argument: 'weight_v'` from somewhere else entirely.
+        //
+        // Both follow META.md §7.1's convention: the rule is the DENSE
+        // kernel's, called rather than restated, so a meta answer cannot
+        // promise a shape or dtype the dense path would refuse to produce.
+        // Where upstream's own meta kernel contradicts upstream's own dense
+        // kernel -- and on `_weight_norm_interface` it does, in four measured
+        // places -- this follows dense. VOICE5.md §4.3 tabulates all four.
+        "aten.norm.ScalarOpt_dim" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = input.tag();
+            // `norm_scalaropt_dim`'s own refusal, verbatim: a meta kernel must
+            // not accept a dtype the dense kernel rejects.
+            if !tag.is_floating_point() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "norm(): input dtype should be either floating point or complex. Got {} instead.",
+                    scalar_type_name(tag)
+                )));
+            }
+            // `p` decides the VALUES and nothing else -- every `p` in the
+            // family (0, 1, 2, +-inf, fractional, negative) reduces the same
+            // axes -- so it is read and discarded here rather than ignored
+            // silently.
+            let _p = scalar_arg(op, args, kwargs, 1, "p")?;
+            let dims_raw = shape_arg(op, args, kwargs, 2, "dim")?;
+            let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+            let dims_in = input.dims().to_vec();
+            let rank = dims_in.len();
+            // An EMPTY `dim` list means every axis, which is the opposite of
+            // the usual reading and is the dense kernel's rule, measured.
+            let dims: Vec<usize> = if dims_raw.is_empty() {
+                (0..rank.max(1)).collect()
+            } else {
+                dims_raw
+                    .iter()
+                    .map(|&d| normalise_dim(op, d, rank))
+                    .collect::<PyResult<Vec<_>>>()?
+            };
+            refuse_duplicate_dims(&dims)?;
+            meta_result(py, reduced_dims(&dims_in, &dims, keepdim), tag)
+        }
+        "aten._weight_norm_interface.default" => {
+            let v = tensor_arg(op, args, kwargs, 0, "v")?;
+            let g = tensor_arg(op, args, kwargs, 1, "g")?;
+            let dim = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0);
+            let tag = v.tag();
+            if !tag.is_floating_point() {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "\"weight_norm_kernel\" not implemented for '{}'",
+                    scalar_type_name(tag)
+                )));
+            }
+            if g.tag() != tag {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "expected scalar type {} but found {}",
+                    scalar_type_name(tag),
+                    scalar_type_name(g.tag())
+                )));
+            }
+            let dims_in = v.dims().to_vec();
+            let rank = dims_in.len();
+            let axis = normalise_dim(op, dim, rank)?;
+            if rank > 0 && axis != 0 && axis != rank - 1 {
+                return Err(not_implemented(format!(
+                    "{op}: dim must be 0 or v.dim() - 1, got {dim} for a {rank}-D v -- \
+                     upstream trips an internal assertion here rather than raising, and \
+                     both measured callers (vits at dim=0, sew_d at dim=v.dim()-1) sit \
+                     inside the supported range"
+                )));
+            }
+            // `norms` keeps `axis` and reduces every OTHER axis, keepdim, so it
+            // broadcasts back against `v` -- exactly the loop the dense kernel
+            // runs (`for d in 0..rank { if d != axis { sum_keepdim(d) } }`),
+            // which for a rank-1 `v` reduces nothing and leaves `[n]`.
+            let others: Vec<usize> = (0..rank).filter(|d| *d != axis).collect();
+            let norms_shape = reduced_dims(&dims_in, &others, true);
+            // The norm is computed in `float32` for a reduced-float input --
+            // the dense kernel's `norm_tag`, and the reason upstream's dense
+            // `norms` come back `float32` while `out` keeps `v`'s dtype.
+            let norm_tag = match tag {
+                TorchDType::Float16 | TorchDType::BFloat16 => TorchDType::Float32,
+                other => other,
+            };
+            let pair = [
+                meta_result(py, dims_in, tag)?,
+                meta_result(py, norms_shape, norm_tag)?,
+            ];
+            Ok(PyTuple::new(py, pair)?.into_any().unbind())
+        }
+        // ---------------------------------------------------------------
         // Refused BY NAME, with the reason -- not left to the fallthrough.
         //
         // The generic message below says the op "would have to infer its

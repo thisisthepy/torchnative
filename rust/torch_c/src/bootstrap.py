@@ -10801,6 +10801,26 @@ def _install_composites(module, varfns, dispatch) -> None:
                 )
             dims = [d for d in range(rank) if d != axis]
             keepdim = True
+        if not dims:
+            # **A rank-1 `v` exempts its only axis, so there is nothing left to
+            # reduce -- and an EMPTY `dim` list does not say that.** It says
+            # "every axis" to `aten.norm.ScalarOpt_dim` (the opposite reading,
+            # measured, and the one its own kernel documents), so this branch
+            # used to answer `[1]` where upstream answers `[4]`: the whole
+            # tensor's norm instead of an element-wise magnitude.
+            #
+            # Upstream's C++ never has the ambiguity because it does not pass a
+            # dim list at all -- it is `v.view(v.size(0), -1).norm(pow, 1)`,
+            # which for a rank-1 `v` reduces a trailing axis of extent ONE.
+            # That construction is reproduced here rather than special-cased to
+            # `abs`, because the reduction of a single element is `|x|` only
+            # for some `pow` (`pow=0` counts non-zeros instead).
+            #
+            # Found by docs/architectures/VOICE5.md §4.4 while giving `norm.ScalarOpt_dim`
+            # a meta kernel: the meta answer was right and the DENSE answer it
+            # was being compared against was wrong.
+            widened = dispatch("aten.unsqueeze.default", v, rank)
+            return dispatch("aten.norm.ScalarOpt_dim", widened, pow, [rank], False)
         return dispatch("aten.norm.ScalarOpt_dim", v, pow, dims, keepdim)
 
     norm_except_dim.__name__ = norm_except_dim.__qualname__ = "norm_except_dim"

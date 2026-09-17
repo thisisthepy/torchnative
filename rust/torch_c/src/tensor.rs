@@ -2614,6 +2614,24 @@ impl PyTensorBase {
             return Ok(slf.clone());
         }
 
+        // **A `TypedStorage` is unwrapped rather than refused.** `set_` is
+        // reached from `Tensor.__deepcopy__` (`torch/_tensor.py:234`), which
+        // passes `new_storage` -- a `TypedStorage`, because that is what
+        // `self._typed_storage()._deepcopy(memo)` returns. Upstream's `set_`
+        // accepts both spellings; refusing the typed one made
+        // `copy.deepcopy(tensor)` fail with a message about a class the caller
+        // never named. The dtype the `TypedStorage` carries is NOT adopted --
+        // `tag` below is still this tensor's own, so the size/itemsize checks
+        // that follow are unchanged. docs/architectures/VOICE5.md §5.
+        let source: Bound<'py, PyAny> = if source.is_instance_of::<crate::storage::PyStorageBase>()
+        {
+            source.clone()
+        } else if let Ok(inner) = source.getattr("_untyped_storage") {
+            inner
+        } else {
+            source.clone()
+        };
+        let source = &source;
         let storage: PyRef<'_, crate::storage::PyStorageBase> =
             source.extract().map_err(|_| {
                 let got = source
