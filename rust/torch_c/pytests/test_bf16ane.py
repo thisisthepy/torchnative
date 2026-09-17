@@ -254,28 +254,103 @@ try:
     def _bundles():
         return {n for n in os.listdir(_native) if n.endswith(".mlmodelc")}
 
+    # That directory is shared by every process of this user, so a snapshot
+    # difference counts other processes' live models as ours. Instead, every
+    # compiled bundle *this* process writes is recorded where it is written,
+    # and other coremltools processes are looked for while the window is open.
+    # See the test's docstring for the measurement behind this.
+    import coremltools.libcoremlpython as _L
+    import coremltools.models.model as _ct_model
+    import coremltools.models.utils as _ct_utils
+
+    _loads, _plan_native, _plan_dest = [], [], []
+    _Proxy = _L._MLModelProxy
+    _real_native_compile = _Proxy.compileModel
+    _real_compile_model = _ct_utils.compile_model
+
+    class _RecordingProxy(_Proxy):
+        # What `MLModel` constructs; its bundle is the `tmpXXXXXXXX` one.
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            _loads.append(self.get_compiled_model_path())
+
+    def _recording_native_compile(path):
+        produced = _real_native_compile(path)
+        _plan_native.append(produced)
+        return produced
+
+    def _recording_compile_model(*args, **kwargs):
+        produced = _real_compile_model(*args, **kwargs)
+        _plan_dest.append(produced)
+        return produced
+
+    _pids = set()
+    _saw_self = []
+
+    def _sample_coreml_processes():
+        # Every process of this user with a `libcoremlpython` mapped, which is
+        # every process that can write a `tmpXXXXXXXX.mlmodelc` from Python.
+        got = _sp.run(["/usr/sbin/lsof", "-nP", "-u", str(os.getuid()),
+                       "-a", "-d", "txt", "-Fpn"],
+                      capture_output=True, text=True).stdout
+        pid = None
+        for line in got.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:])
+            elif line.startswith("n") and "libcoremlpython" in line:
+                if pid == os.getpid():
+                    _saw_self.append(True)
+                else:
+                    _pids.add(pid)
+
     probe = C._CoreMLLinear(w, b, precision="float16",
                             compute_units=ct.ComputeUnit.ALL)
     before = _bundles()
-    with warnings.catch_warnings(record=True):
-        warnings.simplefilter("always")
-        for batch in (11, 13, 17):
-            probe._compile_for(batch, probe=True)
+    _ct_model._MLModelProxy = _RecordingProxy
+    _Proxy.compileModel = staticmethod(_recording_native_compile)
+    _ct_utils.compile_model = _recording_compile_model
+    try:
+        _sample_coreml_processes()
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            for batch in (11, 13, 17):
+                probe._compile_for(batch, probe=True)
+                _sample_coreml_processes()
+    finally:
+        _ct_model._MLModelProxy = _Proxy
+        _Proxy.compileModel = staticmethod(_real_native_compile)
+        _ct_utils.compile_model = _real_compile_model
     # While the models are alive, `ct.convert`'s own `tmpXXXXXXXX.mlmodelc`
     # is legitimately on disk -- it belongs to the `MLModel`. What matters is
     # what is left **after** they are released, so the probe is dropped first
     # and the difference taken then.
-    during = sorted(_bundles() - before)
+    during = _bundles() - before
+    loads_present = sum(os.path.isdir(p) for p in _loads)
     del probe
     import gc as _gc
     _gc.collect()
     _gc.collect()
-    survived = sorted(_bundles() - before)
+    survived = _bundles() - before
+    _sample_coreml_processes()
+
+    recorded = {os.path.basename(p.rstrip("/"))
+                for p in _loads + _plan_native + _plan_dest}
     out["bundles"] = {
         "compiles": 3,
-        "during": len(during),
-        "survived": len(survived),
-        "sample": survived[:3],
+        "loads": [os.path.basename(p.rstrip("/")) for p in _loads],
+        "loads_in_native_temp": bool(_loads) and all(
+            os.path.dirname(p.rstrip("/")) == _native.rstrip("/")
+            for p in _loads),
+        "loads_present_during": loads_present,
+        "loads_survived": [p for p in _loads if os.path.exists(p)],
+        "plan_native": _plan_native,
+        "plan_destinations": _plan_dest,
+        "plan_survived": [p for p in _plan_native + _plan_dest
+                          if os.path.exists(p)],
+        "unattributed_during": sorted(during - recorded),
+        "unattributed_survived": sorted(survived - recorded),
+        "foreign_pids": sorted(_pids),
+        "detector_saw_self": bool(_saw_self),
     }
 
     # -- 3. the agreement grades, through coreml.verify and no other ------
@@ -758,20 +833,101 @@ def test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp():
     +650 MB**. So this was the whole of what this repository was leaking.
 
     The count is of `NSTemporaryDirectory()`, which is **not** `$TMPDIR` --
-    CoreML's native side ignores the variable. A non-zero here means either
-    the fix regressed or another CoreML process was running concurrently;
-    `run.sh` runs suites serially, so the first is the one to look at.
+    CoreML's native side ignores the variable.
+
+    **That directory belongs to the user, not to this process, and that made
+    the old form of this test unsound.** It took a snapshot before the three
+    compiles and after the release and called the difference "survived". Every
+    Python process of this account that loads an `MLModel` writes its
+    `tmpXXXXXXXX.mlmodelc` into the same place, and `run.sh` running suites
+    serially says nothing about other worktrees' gates or other agents. The
+    difference therefore counted *their* live models too. That was the whole
+    of this test's intermittency, measured: a passing run shows `during: 3`,
+    the failing gate showed `during: 6, survived: 3`, and with one neighbour
+    process that converts and holds three models the old assertion failed
+    **6 runs in 10**. Every survivor was `tmp*`, eight of ten carried the
+    neighbour's own `get_compiled_model_path()` names, the other two belonged to
+    another agent's process on the machine, and all of them were gone once
+    their owners dropped them. No object of ours outlived its scope: with the
+    neighbour running, the probe's three bundles were removed on `del` every
+    time.
+
+    So the fixture now **attributes** instead of subtracting. It records every
+    compiled bundle this process's CoreML entry points write during the window
+    -- each `MLModel` load's `get_compiled_model_path()`, each
+    `_MLModelProxy.compileModel` output and each `compile_model` destination.
+    What that makes true:
+
+    * **What this process wrote must be gone, with no exception.** Both
+      defects this file exists for land here: the `m_<UUID>` bundle from an
+      undestined `compile_model`, and an `MLModel` kept alive past its scope.
+    * **A survivor nobody recorded is tolerated only when another process that
+      has `libcoremlpython` mapped was observed during the window.** That is
+      the one condition under which a stranger's bundle can be here. With no
+      such process, an unrecorded survivor means a writer this fixture does not
+      know about, and it fails. The detector is `lsof`, and it must see **this**
+      process, so a broken detector fails the test rather than excusing
+      everything (see the next test).
+
+    What this cannot see (CLAUDE.md §5.4): a CoreML user with no
+    `libcoremlpython` (Swift, `coremlcompiler`) writing here during the window,
+    and a foreign Python process that loads, compiles and **crashes** between
+    two detector samples. The first would show up as an unexcused survivor, a
+    red that names the bundle. The second is a stranger's leak that we would
+    report as ours.
     """
     r = _fixture_or_skip()
     if r is None:
         return
     bundles = r["bundles"]
     assert bundles["compiles"] == 3, bundles
-    # While the models are alive their own bundles are legitimately on disk;
-    # asserting that too would forbid CoreML from having a compiled model.
-    assert bundles["during"] >= 3, bundles
-    # Nothing survives the models.
-    assert bundles["survived"] == 0, bundles
+    assert "error" not in bundles, bundles
+    # What this process wrote: nothing of it survives the models.
+    assert bundles["loads_survived"] == [], bundles
+    assert bundles["plan_survived"] == [], bundles
+    # What nobody here wrote: only while someone else was compiling.
+    if bundles["unattributed_survived"]:
+        assert bundles["foreign_pids"], (
+            "a compiled bundle this process did not record survived, and no "
+            "other process with libcoremlpython mapped was running: ", bundles)
+        print(f"   (tolerated {len(bundles['unattributed_survived'])} "
+              f"unattributed survivor(s): coremltools processes "
+              f"{bundles['foreign_pids']} were running during the window)")
+
+
+def test_every_bundle_this_process_compiles_is_attributed_to_it():
+    """The measurement that makes the previous test's excuse safe.
+
+    Tolerating strangers' bundles is only honest if attribution cannot quietly
+    miss this process's own. So each part is checked separately:
+
+    * three probe compiles give **three** `MLModel` bundles, each in the native
+      temp directory, each on disk while its model is alive. That both
+      confirms the recorder saw them and confirms the directory is the right
+      one to look in;
+    * `compute_plan` compiled **three** times, and the recorder saw every
+      native output and every destination;
+    * the `lsof` detector reports **this** process, since it has
+      `libcoremlpython` mapped. A detector that cannot see us cannot see anyone,
+      and would turn the tolerance into a blanket excuse;
+    * with no other coremltools process observed, **every** bundle added
+      during the window is one we recorded. That is the check that found
+      `m_<UUID>` in the first place, and it still stands whenever the machine
+      lets it.
+    """
+    r = _fixture_or_skip()
+    if r is None:
+        return
+    bundles = r["bundles"]
+    assert "error" not in bundles, bundles
+    assert len(bundles["loads"]) == 3, bundles
+    assert bundles["loads_in_native_temp"] is True, bundles
+    assert bundles["loads_present_during"] == 3, bundles
+    assert len(bundles["plan_native"]) == 3, bundles
+    assert len(bundles["plan_destinations"]) == 3, bundles
+    assert bundles["detector_saw_self"] is True, bundles
+    if not bundles["foreign_pids"]:
+        assert bundles["unattributed_during"] == [], bundles
 
 
 def test_float16_is_in_the_map_too_and_is_not_a_second_refusal():

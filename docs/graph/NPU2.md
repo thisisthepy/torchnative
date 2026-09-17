@@ -957,6 +957,76 @@ is recorded so the next person does not have to re-derive it.
 | **limitation named** | the `m_<UUID>` bundle had no owner at any level; `NSTemporaryDirectory()` ignores `$TMPDIR`; `e5bundlecache` is Apple's (§8.4) |
 | **tests added** | 19, in `rust/torch_c/pytests/test_bf16ane.py`; nine nullifications, each red on the tests it targets |
 
+### 8.6 The bundle count was counting other processes' models (2026-09-17)
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_every_bundle_this_process_compiles_is_attributed_to_it present -->
+
+§8.4's guard took a snapshot of `NSTemporaryDirectory()` before three probe
+compiles and another after releasing them, and asserted that the difference
+was empty. It failed intermittently on `develop`: survivor counts of 3, 1, 0
+and 0 over four runs of one binary, including runs on an otherwise quiet
+machine. The survivors were always `tmp*`, never `m_*`.
+
+**It was not a lifetime defect in our code.** That directory is per *user*,
+not per process, and every Python process that loads an `MLModel` writes its
+`tmpXXXXXXXX.mlmodelc` there. A passing run shows `during: 3`, one bundle per
+compile. The failing gate run showed `during: 6, survived: 3`: three bundles
+that were not ours appeared inside the window and were still alive at the
+second snapshot. Measured:
+
+| | runs | old assertion red | new tests red |
+|---|---|---|---|
+| fixture alone, machine quiet | 2 | 0 | — |
+| beside a neighbour process that converts and holds 3 models | 10 | **6** | — |
+| same, after the change | 20 | 20 (computed from the same runs) | **0** |
+
+In the attribution run, 8 of 10 survivors carried the neighbour's own
+`get_compiled_model_path()` names. The other 2 belonged to another agent's
+`export_sweep.py`, which was running on the machine at the time. All were gone
+once their owners released them. With the neighbour running, the probe's own
+three bundles were removed on `del` every time. Real contamination also
+happened without a neighbour of ours: one ordinary run during this round came
+back `during: 6, survived: 3`.
+
+**The fix is to the measurement, not to a number.** The fixture now records
+every compiled bundle this process writes during the window:
+
+* each `MLModel` load's path, through a recording `_MLModelProxy` subclass;
+* each `_MLModelProxy.compileModel` output;
+* each `compile_model` destination.
+
+It also samples `lsof` for processes that have `libcoremlpython` mapped. Then:
+
+* **Anything this process wrote must be gone after release, unconditionally.**
+* **An unrecorded survivor is tolerated only if another such process was
+  observed**, and the test prints that it tolerated it.
+* **The detector must see this process**, so a broken detector cannot turn
+  the tolerance into a blanket excuse.
+* **With no stranger observed, every addition must be recorded.** That is the
+  generic check that found `m_<UUID>`, kept wherever the machine allows it.
+
+Nullified, each on the real fixture:
+
+* `compile_model(package)` with no destination makes the first test red, with
+  three `m_*` in `plan_survived`.
+* An `MLModel` retained in `_RETAINED_FEEDS` makes the first test red, through
+  `loads_survived`.
+* A recorder blind to loads makes the second test red.
+* An `lsof` filter that matches nothing makes both tests red.
+* An unknown `tmp*.mlmodelc` written inside a stranger-free window makes both
+  tests red. Removing the stranger condition leaves the first test green, so
+  that condition is the thing that bites there.
+
+**Blind spots.** This cannot see a CoreML writer without `libcoremlpython`, or
+a foreign process that loads, compiles and crashes entirely between two
+`lsof` samples.
+
+| | |
+|---|---|
+| **test defect fixed** | the survivor count was a directory difference over a directory shared with every CoreML process of the user |
+| **defects fixed in product code** | 0; no object outlived its scope |
+| **tests added** | 1 (`test_every_bundle_this_process_compiles_is_attributed_to_it`); 1 rewritten; five nullifications plus one control |
+
 ## 9. An empty compute plan is not silence — and the plan itself is not a property of the program
 
 `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was
