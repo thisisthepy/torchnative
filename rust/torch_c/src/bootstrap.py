@@ -1207,8 +1207,19 @@ def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
         spelling, name = chunk, ""
 
     alias_info = None
-    if "(" in spelling and spelling.endswith(")"):
-        inner = spelling[spelling.index("(") + 1 : -1]
+    if "(" in spelling and ")" in spelling:
+        # The annotation directly follows the base type and is the *first*
+        # parenthesised group, which matters because a list or optional suffix
+        # can come after it: `Tensor(a!)[]`, `Tensor(a!)?`, `Tensor(a)[]`.
+        #
+        # This used to require `spelling.endswith(")")`, which is true for
+        # `Tensor(a!)` and false for `Tensor(a!)[]` -- so a **mutable list of
+        # tensors got no `alias_info` at all** and every consumer read it as
+        # non-mutating. Found by the exhaustive `_SchemaInfo` comparison in
+        # `test_liftfresh.py` rather than predicted: upstream answers
+        # `is_write=True` for `_amp_foreach_non_finite_check_and_unscale_`'s
+        # `Tensor(a!)[] self` and this answered False.
+        inner = spelling[spelling.index("(") + 1 : spelling.index(")")]
         # `Tensor(a!)` mutates; `Tensor(a)` only aliases.
         alias_info = _AliasInfo("!" in inner, inner.replace("!", "").split("|"))
     return _Argument(name.strip(), _SchemaType(spelling.strip()), kwarg_only, default,
@@ -3327,6 +3338,106 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     module.Size = Size
     resolved["Size"] = Size
+
+    # `torch._C._SchemaInfo` -- the third wall of `docs/graph/LIFTFRESH.md`,
+    # and a derivation rather than new information.
+    #
+    # Fake mode's constant bookkeeping reaches it immediately after the storage
+    # map: `invalidate_written_to_constants` -> `get_schema_info(func)` ->
+    # `schema_info.is_mutable()`, so that an op which *writes* to a traced
+    # constant can invalidate every alias of that constant. It was a generated
+    # placeholder and every call raised.
+    #
+    # The answer is already in the schema this shim parses: an argument is
+    # mutated exactly when it carries a write alias annotation -- `Tensor(a!)`
+    # -- which is `argument.alias_info.is_write`, and that field already agrees
+    # with upstream's for every schema (measured before this was written, and
+    # `test_liftfresh.py` keeps it measured over all 2584 `- func:` entries of
+    # `native_functions.yaml`). So this is written in Python over the parsed
+    # schema rather than in Rust over the text: there is nothing to re-parse.
+    #
+    # Only the three members the export path uses are implemented. The rest of
+    # upstream's `_SchemaInfo` -- the alias/containment analysis it exposes for
+    # `torch.jit` -- stays absent rather than guessed at, so reaching for one
+    # raises `AttributeError` here instead of quietly answering.
+    class _SchemaInfo:
+        __module__ = "torch._C"
+        __qualname__ = "_SchemaInfo"
+
+        __slots__ = ("_schema", "_writes")
+
+        #: The ops whose mutability is **not** in their alias annotations.
+        #:
+        #: Found by the 2584-schema comparison in `test_liftfresh.py`, not
+        #: predicted: the derivation above is right for every aten schema
+        #: except these, where upstream's `SchemaInfo` hardcodes that
+        #: `running_mean`/`running_var` are written. They are the batch-norm
+        #: family, whose mutation is *conditional on the `training` argument*
+        #: and therefore cannot be spelled in a static alias annotation;
+        #: upstream answers the conservative `True` and so does this.
+        #:
+        #: Exactly 14 (op, argument) pairs over 7 **overload-qualified** names,
+        #: which is the complete disagreement set -- the test asserts every
+        #: other schema agrees, so this table cannot silently grow stale in
+        #: either direction.
+        #:
+        #: The key includes the overload, and that is not tidiness: upstream's
+        #: table contains `native_batch_norm.out` but **not**
+        #: `cudnn_batch_norm.out`, whose `running_mean`/`running_var` it
+        #: reports as not mutable even though `cudnn_batch_norm` without the
+        #: overload are. Keying on the base name made this shim answer `True`
+        #: for `cudnn_batch_norm.out` and the sweep caught it. There is no rule
+        #: behind that asymmetry to infer -- it is upstream's hand-maintained
+        #: list, so it is copied as measured rather than reasoned about.
+        _TRAINING_DEPENDENT_WRITES = {
+            "aten::batch_norm": ("running_mean", "running_var"),
+            "aten::_batch_norm_impl_index": ("running_mean", "running_var"),
+            "aten::cudnn_batch_norm": ("running_mean", "running_var"),
+            "aten::instance_norm": ("running_mean", "running_var"),
+            "aten::miopen_batch_norm": ("running_mean", "running_var"),
+            "aten::native_batch_norm": ("running_mean", "running_var"),
+            "aten::native_batch_norm.out": ("running_mean", "running_var"),
+        }
+
+        def __init__(self, schema):
+            self._schema = schema
+            # Name -> is_write, for the arguments that carry an alias set at
+            # all. Built once: `invalidate_written_to_constants` asks
+            # `is_mutable()` for every dispatch and then `is_mutable(name)` for
+            # every argument of the mutating ones.
+            self._writes = {
+                argument.name: bool(
+                    argument.alias_info is not None and argument.alias_info.is_write
+                )
+                for argument in schema.arguments
+            }
+            key = schema.name
+            if getattr(schema, "overload_name", ""):
+                key = f"{key}.{schema.overload_name}"
+            for name in self._TRAINING_DEPENDENT_WRITES.get(key, ()):
+                if name in self._writes:
+                    self._writes[name] = True
+
+        def is_mutable(self, name=None):
+            """`is_mutable()` -- does this op write to any argument.
+
+            `is_mutable(name)` -- does it write to *that* argument. Upstream
+            answers `False` for a name that is not an argument at all rather
+            than raising, so this does too (measured); `has_argument` is the
+            question that distinguishes the two cases.
+            """
+            if name is None:
+                return any(self._writes.values())
+            return self._writes.get(name, False)
+
+        def has_argument(self, name):
+            return name in self._writes
+
+        def __repr__(self):
+            return f"<torch._C._SchemaInfo for {self._schema}>"
+
+    module._SchemaInfo = _SchemaInfo
+    resolved["_SchemaInfo"] = _SchemaInfo
 
     # `TensorBase.shape` (and `size()` with no `dim`, which goes through it)
     # answers with this class from here on. Registered rather than imported,
@@ -11693,6 +11804,21 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         storage_cls = getattr(torch_module, "UntypedStorage", None)
         if storage_cls is not None:
             module._set_storage_class(storage_cls)
+        # `torch.Storage` -- the legacy alias upstream's `_initExtension` also
+        # sets, and it is `FloatStorage` there, not `UntypedStorage` (measured
+        # on 2.13.0: `torch.Storage is torch.FloatStorage` is True and
+        # `is torch.UntypedStorage` is False). So it is set from the same
+        # class here rather than from the one the name suggests.
+        #
+        # It is on the `torch.export` path, not decoration:
+        # `torch/multiprocessing/reductions.py:33` reads
+        # `torch.Storage._free_weak_ref` in `StorageWeakRef.__init__`, which
+        # fake mode's constant propagation reaches for every traced constant
+        # (`docs/graph/LIFTFRESH.md` §3). `FloatStorage` inherits it from
+        # `TypedStorage`, which delegates to `UntypedStorage._free_weak_ref`.
+        float_storage_cls = getattr(torch_module, "FloatStorage", None)
+        if float_storage_cls is not None and not hasattr(torch_module, "Storage"):
+            torch_module.Storage = float_storage_cls
         kinds = (module.dtype, module.layout, module.memory_format, module.qscheme)
         for name, value in list(vars(module).items()):
             # Filtered on the *type*, not on the leading underscore. Skipping

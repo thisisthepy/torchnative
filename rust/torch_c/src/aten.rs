@@ -164,6 +164,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.leaky_relu.default",
     "aten.logical_and.default",
     "aten.lift_fresh.default",
+    "aten.lift_fresh_copy.default",
     "aten.linalg_qr.default",
     "aten.linalg_vector_norm.default",
     "aten.linspace.default",
@@ -2381,6 +2382,13 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten.new_empty.default"
         | "aten.new_ones.default"
         | "aten.tril.default"
+        // `aten.lift_fresh_copy` is a **contiguous** copy, which is exactly
+        // where it parts company with `aten.clone.default` (`PreserveFormat`
+        // above): measured on a transposed `(4, 3)` input of stride `(1, 4)`,
+        // upstream answers stride `(3, 1)` for `lift_fresh_copy` and `(1, 4)`
+        // for `clone`.  `test_liftfresh.py` asserts that *difference*, so a
+        // kernel that spelled one as the other cannot pass.
+        | "aten.lift_fresh_copy.default"
         | "aten.triu.default" => MetaStrideRule::AlwaysContiguous,
         "aten.sin.default"
         | "aten.cos.default"
@@ -2631,6 +2639,16 @@ fn meta_table(
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let (shape, stride, offset) = meta_layout_of(op, &input)?;
             meta_view_result(py, op, &input, shape, stride, offset)
+        }
+        // `aten::lift_fresh_copy(Tensor self) -> Tensor` is the one member of
+        // the `lift_fresh` family that is **not** a view: functionalisation
+        // rewrites `lift_fresh` into it precisely so the traced constant stops
+        // aliasing anything.  So it is a sibling of the line above only in
+        // name -- a fresh contiguous buffer, which is what `meta_result`
+        // builds and what `meta_stride_rule` classifies it as.
+        "aten.lift_fresh_copy.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            meta_result(py, input.dims().to_vec(), input.tag())
         }
         // `aten::contiguous` is `self` when `self` is already contiguous --
         // the same object, offset and storage included (measured: a meta
@@ -5146,6 +5164,7 @@ fn aten_dispatch_inner(
         | "aten.clone.default"
         | "aten.contiguous.default"
         | "aten.lift_fresh.default"
+        | "aten.lift_fresh_copy.default"
             if first_arg_is_complex(args, kwargs) =>
         {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -5249,6 +5268,7 @@ fn aten_dispatch_inner(
         "aten.is_floating_point.default" => is_floating_point_default(py, args, kwargs),
         "aten.isin.Tensor_Tensor" => isin_tensor_tensor(py, args, kwargs),
         "aten.lift_fresh.default" => lift_fresh_default(py, args, kwargs),
+        "aten.lift_fresh_copy.default" => lift_fresh_copy_default(py, args, kwargs),
         "aten.mm.default" => mm_default(py, args, kwargs),
         "aten.ones.default" => ones_default(py, args, kwargs),
         "aten.eye.default" => eye_factory(py, args, kwargs, "aten.eye.default", false),
@@ -9871,6 +9891,40 @@ fn lift_fresh_default(
     const OP: &str = "aten.lift_fresh.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     Ok(input.into_pyobject(py)?.into_any().unbind())
+}
+
+/// `aten::lift_fresh_copy(Tensor self) -> Tensor`
+///
+/// The op `torch.export` actually puts in the graph: functionalisation
+/// rewrites every `lift_fresh` into this one, so `lift_fresh` never survives
+/// into an exported graph and this does (measured on both sides,
+/// `test_liftfresh.py::test_export_emits_lift_fresh_copy_and_not_lift_fresh`).
+///
+/// Two properties separate it from its neighbours and each has a test:
+///
+/// * it is a **copy, not an alias** -- upstream's result does not share
+///   storage with its input, which is the whole point of the rewrite;
+/// * it is a **contiguous** copy, where `aten.clone.default` preserves the
+///   input's layout.  Measured on a transposed `(4, 3)` input of stride
+///   `(1, 4)`: `lift_fresh_copy` answers `(3, 1)`, `clone` answers `(1, 4)`.
+///
+/// So it is `contiguous`'s layout with `clone`'s unconditional allocation, and
+/// it is neither of those two kernels reused: `contiguous_blocked` hands back
+/// the same storage when the input is already contiguous, and this must not.
+fn lift_fresh_copy_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.lift_fresh_copy.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    // `contiguous_blocked` first so a non-contiguous input is laid out the way
+    // upstream lays it out, then `copy` so the result never shares storage --
+    // `contiguous_blocked` returns the input's own handle when it is already
+    // contiguous, and that would make this an alias.
+    let laid_out = contiguous_blocked(input.tensor()?).map_err(|e| candle_err(OP, e))?;
+    let out = laid_out.copy().map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
 }
 
 /// The rounding behaviour `update_from`/`update_to` are written in terms of,

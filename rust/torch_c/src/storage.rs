@@ -803,6 +803,80 @@ impl PyStorageBase {
         self.base_address()
     }
 
+    /// `storage._weak_ref()` -- the storage identity `StorageWeakRef` keys on.
+    ///
+    /// Reached from `torch.export` through fake mode's constant propagation:
+    /// `_dispatch_impl` -> `from_real_tensor(make_constant=True)` ->
+    /// `add_constant_storage_mapping` -> `StorageWeakRef(...)`.  It was the
+    /// wall standing directly behind `aten.lift_fresh_copy.default`
+    /// (`docs/graph/LIFTFRESH.md`), inherited from `_StorageBase` in the
+    /// vendored tree, whose body is upstream's own bare
+    /// `raise NotImplementedError` -- upstream overrides it on the C
+    /// `UntypedStorage` and this shim did not.
+    ///
+    /// **What the caller needs here is an identity, not a weak reference.**
+    /// `StorageWeakRef.__hash__` and `__eq__` read `cdata` and nothing else,
+    /// and `fake_tensor.py` never calls `_expired` -- it tracks liveness with
+    /// Python `weakref.ref` on the *tensors*.  So this answers `_cdata`, which
+    /// is already this shim's storage identity and already has the relation
+    /// upstream's has: shared between a storage and its views, distinct across
+    /// storages.
+    ///
+    /// Nothing is retained, which is why `_expired` below refuses rather than
+    /// guessing and `_free_weak_ref` has nothing to release.
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _weak_ref(
+        &self,
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> usize {
+        self.base_address()
+    }
+
+    /// `torch.Storage._free_weak_ref(cdata)` -- a no-op, because `_weak_ref`
+    /// retained nothing to free.
+    ///
+    /// It has to exist and it has to not raise: `StorageWeakRef.__del__` calls
+    /// it, and an exception raised in `__del__` is only *ignored* by the
+    /// interpreter, never surfaced -- it would print during interpreter
+    /// shutdown and change nothing else, which is the worst of both.
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _free_weak_ref(_args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) {}
+
+    /// `torch.Storage._expired(cdata)` -- refused, deliberately.
+    ///
+    /// `_weak_ref` hands back an identity and retains nothing, so this shim
+    /// genuinely does not know whether that storage is still alive.  Answering
+    /// `False` ("still alive") is the cheap way to make this return something
+    /// and it is a claim that is wrong exactly when it is load-bearing.
+    ///
+    /// Nothing on the `torch.export` path reaches it, so refusing costs
+    /// nothing today and keeps the limitation visible;
+    /// `test_liftfresh.py::test_expired_still_refuses_rather_than_guessing`
+    /// holds the refusal in place so that answering it later requires a
+    /// liveness mechanism rather than a constant.
+    ///
+    /// Named here rather than left to `_StorageBase._expired`'s bare
+    /// `raise NotImplementedError` for `_write_file`'s reason above: an
+    /// anonymous refusal is the one DESIGN.md §6 forbids, and this shim's
+    /// class is first in the MRO.
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _expired(
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "UntypedStorage._expired is not implemented in torch._C shim: \
+             `_weak_ref()` answers a storage identity and retains nothing, so \
+             there is no liveness to report. Answering `False` here would be a \
+             guess. Nothing on the torch.export path calls this -- \
+             torch/_subclasses/fake_tensor.py tracks liveness with weakref.ref \
+             on the tensors and uses StorageWeakRef only as a dict key.",
+        ))
+    }
+
     /// The legacy (non-zip) `torch.save` format's writer, and it stays refused.
     ///
     /// `torch.save(obj, f, _use_new_zipfile_serialization=False)` reaches

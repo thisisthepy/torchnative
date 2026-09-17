@@ -5656,6 +5656,39 @@ def lift_fresh_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.lift_fresh_copy.default (what export puts in the graph) -----------
+#
+# `aten::lift_fresh_copy(Tensor self) -> Tensor` is the op functionalisation
+# rewrites `lift_fresh` into, and the one that actually appears in an
+# `ExportedProgram` -- `lift_fresh` never survives into one
+# (`rust/torch_c/pytests/test_liftfresh.py`, measured on both sides).
+#
+# It is a **copy**, not the alias `lift_fresh` returns, and it lays its output
+# out **contiguously**, which is where it parts company with
+# `aten.clone.default`.  Values and dtype are all a golden comparison can see
+# here, so the layout half is held down by `test_liftfresh.py` instead; what
+# these cases hold down is that the values and dtype survive the copy exactly,
+# across the same dtypes and shapes `lift_fresh` is exercised over.
+def lift_fresh_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.lift_fresh_copy.default"
+    cases: list[Case] = []
+
+    for dtype_name in _LIFT_FRESH_DTYPES:
+        for flat, shape in [([0], ()), ([1, 2, 3], (3,)), ([1, 2, 3, 4], (2, 2))]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"lift_fresh_copy(dtype={dtype_name}, shape={shape}) [copy]",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                    note="the op torch.export puts in the graph -- a contiguous copy",
+                )
+            )
+
+    return cases
+
+
 # --- pre-seeded case builders for the ops backing TensorBase's 50 --------
 # actually-used members (docs/design/C_SURFACE.md §4)
 #
@@ -30540,6 +30573,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.linalg_vector_norm.default": linalg_vector_norm_default_cases,
     "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
+    "aten.lift_fresh_copy.default": lift_fresh_copy_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
     # members (docs/design/C_SURFACE.md §4) -- see the longer module note above.
     "aten.sub.Tensor": sub_cases,
