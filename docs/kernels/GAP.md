@@ -1,5 +1,12 @@
 # 60개 구현 vs 실사용 op — 갭 측정
 
+> **Superseded by current codebase (`rust/torch_c/src/aten.rs`).** The counts in this document reflect
+> an early snapshot (60 implemented ops, 8 missing for greedy Llama). Current `aten.rs` contains
+> 304 ops in `IMPLEMENTED` (plus 15 in `IMPLEMENTED_AWAITING_GOLDEN`, total 319 ops), and all 8 operators
+> listed in §3 as missing for greedy Llama (`_scaled_dot_product_flash_attention_for_cpu.default`,
+> `_unsafe_view.default`, `alias.default`, `bmm.default`, `neg.default`, `rsub.Scalar`, `silu.default`,
+> `t.default`) have since been implemented. Refer to `rust/torch_c/src/aten.rs` as the source of truth.
+
 `fac5702` 로 `_aten_implemented()` 가 60개가 됐습니다. `docs/design/CORE_ATEN.md` §2 가 예전에 잰
 "소형 Llama 가 부르는 op" 48개와 정확히 대조하고, `do_sample=True` 경로와 다른 아키텍처(GPT-2)로
 같은 방법을 반복 적용한 결과입니다.

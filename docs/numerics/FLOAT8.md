@@ -1,5 +1,9 @@
 # `float8_e4m3fn` Investigation
 
+> **Superseded by `docs/numerics/FLOAT8C.md`.** The hangs (on `.tolist()`, `.item()`, and comparisons)
+> and refusals documented here and in `FLOAT8B.md` (tables D and E: 10 hangs, 13 refusals) are all closed
+> without requiring a `candle-core` fork by routing conversions through `f32` (`F8E4M3 -> F32 -> F64`).
+
 ## Path-by-path Table
 
 | Operation | Shim | Upstream (2.13.0) |

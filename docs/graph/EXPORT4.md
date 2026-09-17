@@ -1,5 +1,10 @@
 # `torch.export` — six walls closed, and the one that is a design question
 
+> **Superseded by `docs/graph/EXPORT5.md` (2026-09-07).** All four export claims in §3 (returns an
+> `ExportedProgram`, contains operators, replays to same numbers, agrees bit-identically with upstream)
+> are now **yes on small hand-written modules** (4 of 4). However, export does NOT work generally:
+> real-architecture export is still **0 of 40** (EXPORT5 §8 and §10). Refer to `EXPORT5.md` for current status.
+
 `docs/graph/EXPORT.md` §6 gave an ordering and a prediction: steps 1 and 2 first (the
 dispatcher consults the mode stack; `_NodeBase` builds), and then the wall would
 be `aten.empty_strided`. Both steps had landed when this round started. **The

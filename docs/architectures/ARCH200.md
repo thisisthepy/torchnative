@@ -1,14 +1,9 @@
 # ARCH200 — the sweep taken again: 270 of 297 forward, 16 operators missing
 
-> **Re-swept in `docs/architectures/ARCH300.md`.** Operator work landed between this round and that one —
-> `_vmap_increment_nesting`, `index_copy_`, `lstm`, `upsample_linear1d`, `conv1d`, `diag`,
-> `logsumexp`, `std`, `fft_fftn`, `avg_pool2d`, `im2col`, `einsum`, and the `embedding` backend
-> refusal on `cpmant`, among others. The headline below (270/297, 16 operators) no longer describes
-> the current tree: ARCH300 measures **290/297 (98%), 7 blocked**. This document is left in place
-> as the record of what was true at `2498122` — the comparison ARCH300 exists to make depends on
-> this baseline staying unedited.
-> `docs/numerics/AGREE2.md` (2026-09-12) then measures **297/297 forwarding**, so ARCH300's
-> 290/297 is itself superseded.
+> **Superseded by `docs/numerics/AGREE2.md` (2026-09-12).** Current tree measures **297/297 (100%) forwarding** and 288 of 290 judgeable agree numerically.
+> Earlier round: `ARCH300.md` (290/297, 7 blocked).
+> Operator work landed between this round and ARCH300 — `_vmap_increment_nesting`, `index_copy_`, `lstm`, `upsample_linear1d`, `conv1d`, `diag`, `logsumexp`, `std`, `fft_fftn`, `avg_pool2d`, `im2col`, `einsum`, and the `embedding` backend refusal on `cpmant`, among others.
+> The headline below (270/297, 16 operators) no longer describes the current tree. This document is left in place as the record of what was true at `2498122` — the comparison ARCH300 exists to make depends on this baseline staying unedited.
 
 Worktree `work/sweep2` on develop `2498122` (vendored tree assembled fresh). torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). No Rust, `bootstrap.py`, or `aten.rs`

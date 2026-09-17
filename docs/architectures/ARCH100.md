@@ -1,14 +1,10 @@
 # ARCH100 — every `transformers` architecture, swept: 215 of 297 forward, 31 operators missing
 
-> **Re-swept in `docs/architectures/ARCH200.md`.** Two batches of operator work landed between this round and
-> that one — `__setitem__`, the scatter family, `index_select`, `glu`, `linalg_qr`,
-> `linalg_norm`, complex tensors, reflect/replicate padding, rank-5 `matmul`, `eye`, `erfinv`,
-> `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and more. The headline below (215/297,
-> 31 operators) no longer describes the current tree: ARCH200 measures **270/297 (91%), 16
-> operators**. This document is left in place as the record of what was true at `6d016f0` — the
-> comparison ARCH200 exists to make depends on this baseline staying unedited.
-> ARCH300 then measured 290/297, and `docs/numerics/AGREE2.md` (2026-09-12) measures
-> **297/297 forwarding**. A reader arriving at the 82 below is three rounds behind.
+> **Superseded by `docs/numerics/AGREE2.md` (2026-09-12).** Current tree measures **297/297 (100%) forwarding** and 288 of 290 judgeable agree numerically.
+> Earlier rounds: `ARCH200.md` (270/297, 16 missing ops) and `ARCH300.md` (290/297, 7 blocked).
+> Two batches of operator work landed between this round and ARCH200 — `__setitem__`, the scatter family, `index_select`, `glu`, `linalg_qr`, `linalg_norm`, complex tensors, reflect/replicate padding, rank-5 `matmul`, `eye`, `erfinv`, `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and more.
+> This document is left in place as the record of what was true at `6d016f0` — the comparison ARCH200 exists to make depends on this baseline staying unedited.
+> A reader arriving at the 82 below is three rounds behind.
 
 Worktree `work/arch` on develop `6d016f0`. torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`), `transformers` 5.15.1.

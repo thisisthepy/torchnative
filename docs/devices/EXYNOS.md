@@ -18,7 +18,21 @@ On Android hosts, `torchnative` previously had a single NPU candidate: Qualcomm 
 ### Key Findings
 
 1. **Vendor SDK Isolation (`DOCUMENTED`)**: Samsung Exynos NPUs are accessed natively via Samsung's proprietary **Exynos Neural Network (ENN) SDK** (`libenn_public_api.so`, `libenn_engine.so`) and Samsung Neural SDK. These APIs are proprietary, gated under partner developer agreements, and not distributed as open-source headers or libraries in the Android NDK or AOSP.
-2. **ExecuTorch Delegate Absence (`DOCUMENTED`)**: ExecuTorch provides open-source backends for Qualcomm QNN (`libQnnHtp.so`), Apple CoreML, and Arm Ethos-U, but has **no public open-source ExecuTorch delegate for Samsung Exynos ENN**.
+2. **ExecuTorch HAS a Samsung backend (`DEMONSTRATED`, corrected 2026-09-17)**:
+   `pytorch/executorch` carries `backends/samsung`, alongside `qualcomm`, `mediatek`,
+   `openvino`, `apple`, `arm` and `vulkan`. It targets **Exynos 2500 (E9955)** and
+   **Exynos 2600 (E9965)**, and supports **quantised i8/u8/i16/u16 and FP16** inference.
+   It builds against Samsung's **Exynos AI LiteCore** SDK, via `EXYNOS_AI_LITECORE_ROOT`,
+   plus the Android NDK.
+
+   > **This entry previously asserted the opposite**, at `DOCUMENTED` grade: *"no public
+   > open-source ExecuTorch delegate for Samsung Exynos ENN"*. That was false when written
+   > and the evidence grade made it worse, because a grade is a claim that someone checked.
+   > Nobody had. The error mattered: this document's conclusion, and the commit that landed
+   > it, argued that the delegate road was closed for Exynos and open for every other vendor.
+   > **The same road QNN uses exists here.** What is actually gated is the SDK, and even that
+   > is a developer-portal registration rather than the NDA partner agreement item 1 describes
+   > — those are different barriers and this document had conflated them.
 3. **NNAPI Deprecation (`DOCUMENTED`)**: Google Android Neural Networks API (NNAPI, `libneuralnetworks.so`), which previously bridged vendor HALs including Samsung's `nnapi.exynos.so`, was officially **deprecated in Android 13 (API level 33)**. Google explicitly advises against using NNAPI for new applications, directing developers to vendor-specific delegates or cross-platform Vulkan compute shaders.
 4. **Resolution Strategy in `torchnative` (`DEMONSTRATED`)**: Rather than failing with a misleading Qualcomm QNN error message, `torchnative` probes Android SoC properties (`ro.soc.manufacturer`, `ro.soc.model`, `ro.board.platform`, `ro.hardware`). When a Samsung Exynos SoC is detected, `torchnative.device.npu.resolve()` raises `ExynosNpuUnimplemented` — naming the detected Exynos SoC, explicitly stating that Exynos NPU support is `unimplemented` in `torchnative`, and providing actionable guidance toward supported execution paths (`torchnative.device.cpu` and `torchnative.device.vulkan`).
 
@@ -75,7 +89,7 @@ flowchart TD
 
 ---
 
-## 3. PyTorch & ExecuTorch Delegate Status (`DOCUMENTED`)
+## 3. PyTorch & ExecuTorch Delegate Status (`DEMONSTRATED`, corrected 2026-09-17)
 
 PyTorch's edge execution ecosystem centers on **ExecuTorch** (`pytorch/executorch`), which utilizes modular delegate backends to offload subgraphs to hardware accelerators.
 
@@ -87,9 +101,23 @@ PyTorch's edge execution ecosystem centers on **ExecuTorch** (`pytorch/executorc
 | **Apple Neural Engine** | Fully Supported (`coreml`) | CoreML framework / `MLComputeDevice` | macOS, iOS |
 | **Arm Ethos-U NPU** | Fully Supported (`ethos_u`) | Arm Vela compiler / TFLu | Embedded / Bare metal |
 | **Intel NPU** | Supported via OpenVINO (`openvino`) | `openvino_intel_npu_plugin.dll` / `.so` | Windows, Linux |
-| **Samsung Exynos NPU** | **Unimplemented / No Delegate** | None (Proprietary `libenn_*.so` not integrated) | Android |
+| **Samsung Exynos NPU** | **Supported** (`backends/samsung`) | Exynos AI LiteCore (`EXYNOS_AI_LITECORE_ROOT`) | Android |
 
-Because ExecuTorch lacks an ENN delegate, PyTorch models cannot be lowered or compiled into an Exynos-native NPU artifact (`.pte` or ENN binary) within the open-source PyTorch toolchain today.
+**Corrected 2026-09-17.** This section previously ended: *"Because ExecuTorch lacks an
+ENN delegate, PyTorch models cannot be lowered or compiled into an Exynos-native NPU
+artifact within the open-source PyTorch toolchain today."* That is false. `backends/samsung`
+exists and does exactly that, for Exynos 2500 (E9955) and 2600 (E9965), at quantised
+i8/u8/i16/u16 and FP16.
+
+So the delegate road is open for Exynos on the same terms as for Qualcomm. What separates
+them is the SDK: QNN's runtime libraries ship in a downloadable SDK, while Exynos AI
+LiteCore requires registration on Samsung's developer portal. That is a real obstacle for
+CI and for a contributor without an account, and it is the honest reason this project has
+not built against it — **not** an absence of a delegate.
+
+What remains unverified here is everything downstream of that: nothing in this repository
+has been built against LiteCore, and no Exynos device has run anything. The refusal in
+`torchnative.device` stands until it has.
 
 ---
 

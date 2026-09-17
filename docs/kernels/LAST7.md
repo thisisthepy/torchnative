@@ -1,5 +1,11 @@
 # LAST7 — four of the last seven, and only two of them were kernels
 
+> **Superseded by `docs/numerics/AGREE2.md` and `docs/kernels/REPEAT.md`.** All four architectures analyzed here
+> (`univnet`, `nystromformer`, `vilt`, and `fastspeech2_conformer`) now forward. `repeat_interleave.Tensor`
+> (with tensor `repeats`) was landed in `docs/kernels/REPEAT.md` (`aten.rs` line 239, dispatch line 4004)
+> across all four required files, `Tensor.unfold` landed (`aten.rs` line 282), and `fastspeech2_conformer`
+> now forwards and only diverges numerically (288/290 agree per AGREE2.md).
+
 Worktree `work/last7` on develop `b33e2ee`. Territory: `rust/torch_c/src/aten.rs`,
 `overloads.json`, `methods.json`, `tools/golden/cases.py`,
 `rust/torch_c/pytests/test_last7.py`, plus the three inversions §7 lists.
