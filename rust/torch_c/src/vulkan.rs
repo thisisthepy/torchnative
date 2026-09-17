@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use pyo3::types::{PyDict, PyModule, PyTuple};
 
 use crate::device::PyDevice;
@@ -81,6 +82,8 @@ spv!(RELU_F32_SPV, "relu_f32");
 spv!(NEG_F32_SPV, "neg_f32");
 spv!(GELU_F32_SPV, "gelu_f32");
 spv!(SOFTMAX_LASTDIM_F32_SPV, "softmax_lastdim_f32");
+    spv!(ALL_BOOL_I32_SPV, "all_bool_i32");
+    spv!(SAFE_SOFTMAX_LASTDIM_F32_SPV, "safe_softmax_lastdim_f32");
 spv!(NATIVE_LAYER_NORM_F32_SPV, "native_layer_norm_f32");
 spv!(BMM_F32_SPV, "bmm_f32");
 spv!(COPY_F32_SPV, "copy_f32");
@@ -911,6 +914,51 @@ impl VkContext {
 /// the bytes really do end up in a `VkBuffer` and really do come back out of
 /// one through `.cpu()`. A `fill` shader would move the loop to the GPU and
 /// prove nothing more about the wiring; `docs/devices/VULKAN2.md` §5.3 says the same.
+
+pub fn arange_factory(
+    py: Python<'_>,
+    op: &str,
+    start: f64,
+    step: f64,
+    n: usize,
+    tag: TorchDType,
+) -> PyResult<Py<PyAny>> {
+    let ctx = require(op)?;
+    check_dtype(op, tag)?;
+    let buffer = unsafe {
+        let buf = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        if tag == TorchDType::Int64 || tag == TorchDType::Int32 {
+            let mut data = Vec::with_capacity(n);
+            let s = start as i64;
+            let d = step as i64;
+            let mut lo = s;
+            let mut hi = s;
+            for i in 0..n {
+                let v = s + (i as i64) * d;
+                if i == 0 || v < lo { lo = v; }
+                if i == 0 || v > hi { hi = v; }
+                data.push(v as i32);
+            }
+            ctx.upload_i32(&buf, &data).map_err(|e| vk_error(op, e))?;
+            let _ = buf.index_range.set(IndexRange { lo, hi, exact: true });
+        } else {
+            let mut data = Vec::with_capacity(n);
+            let s = start as f32;
+            let d = step as f32;
+            for i in 0..n {
+                data.push(s + (i as f32) * d);
+            }
+            ctx.upload(&buf, &data).map_err(|e| vk_error(op, e))?;
+        }
+        buf
+    };
+    let vk_tensor = VkTensor {
+        buffer: Arc::new(buffer),
+        shape: vec![n],
+    };
+    wrap_vk(py, vk_tensor, tag)
+}
+
 pub fn factory(
     py: Python<'_>,
     op: &str,
@@ -963,6 +1011,7 @@ pub enum VkStore {
     /// integers on this device**, so this storage class cannot be used to
     /// smuggle an unimplemented integer op through a float shader.
     I64AsI32,
+    BoolAsI32,
 }
 
 /// Which storage class a dtype gets, or a refusal.
@@ -976,6 +1025,7 @@ pub fn check_storage_dtype(op: &str, tag: TorchDType) -> PyResult<VkStore> {
     match tag {
         TorchDType::Float32 => Ok(VkStore::F32),
         TorchDType::Int64 => Ok(VkStore::I64AsI32),
+        TorchDType::Bool => Ok(VkStore::BoolAsI32),
         _ => Err(not_implemented(format!(
             "{op}: the vulkan device in this build stores float32, and int64 \
              indices as int32 (docs/devices/VULKAN6.md §1) -- not {}. The \
@@ -1024,6 +1074,13 @@ pub fn to_cpu(op: &str, vk_tensor: &VkTensor, tag: TorchDType) -> PyResult<candl
             candle_core::Tensor::from_vec(host, vk_tensor.shape.clone(), &candle_core::Device::Cpu)
                 .map_err(|e| crate::err::candle_err(op, e))
         }
+        VkStore::BoolAsI32 => {
+            let host =
+                unsafe { ctx.download_i32(&vk_tensor.buffer, n) }.map_err(|e| vk_error(op, e))?;
+            let host_u8: Vec<u8> = host.into_iter().map(|v| if v != 0 { 1 } else { 0 }).collect();
+            candle_core::Tensor::from_vec(host_u8, vk_tensor.shape.clone(), &candle_core::Device::Cpu)
+                .map_err(|e| crate::err::candle_err(op, e))
+        }
     }
 }
 
@@ -1048,6 +1105,8 @@ pub fn dispatch(
         // per element, so each of these is compared bit-for-bit against the
         // CPU kernel rather than within a tolerance (docs/devices/VULKAN4.md §4).
         "aten.add.Tensor" => add_tensor(py, op, args, kwargs),
+        "aten.all.default" => all_vulkan(py, op, args, kwargs),
+        "aten._local_scalar_dense.default" => local_scalar_dense_vulkan(py, op, args, kwargs),
         "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
         "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
         "aten.div.Tensor" => binary(py, op, args, kwargs, "div_f32", DIV_F32_SPV, false),
@@ -1065,7 +1124,9 @@ pub fn dispatch(
         // The first op of every transformer forward, and the only one here
         // that reads an integer buffer (docs/devices/VULKAN6.md).
         "aten.embedding.default" => embedding_vulkan(py, op, args, kwargs),
+        "aten._scaled_dot_product_flash_attention_for_cpu.default" => sdpa_vulkan(py, op, args, kwargs),
         "aten._softmax.default" => softmax_vulkan(py, op, args, kwargs),
+        "aten._safe_softmax.default" => safe_softmax_vulkan(py, op, args, kwargs),
         "aten.neg.default" => unary(py, op, args, kwargs, "neg_f32", NEG_F32_SPV),
         // BERT's pooler (docs/devices/VULKAN7.md).
         "aten.tanh.default" => unary(py, op, args, kwargs, "tanh_f32", TANH_F32_SPV),
@@ -1641,13 +1702,17 @@ pub fn maybe_upload(
     // about which narrowing was hit.
     let tag = crate::aten::dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     if tag != input.tag() {
-        return Err(not_implemented(format!(
-            "{op}: the vulkan device cannot change dtype on the way in ({} to \
-             {}) -- there is no conversion shader. Cast on the cpu first \
-             (docs/devices/VULKAN4.md §6).",
-            input.tag().name(),
-            tag.name()
-        )));
+        let allow = (tag == TorchDType::Bool && input.tag() == TorchDType::Int64) ||
+                    (tag == TorchDType::Int64 && input.tag() == TorchDType::Bool);
+        if !allow {
+            return Err(not_implemented(format!(
+                "{op}: the vulkan device cannot change dtype on the way in ({} to \
+                 {}) -- there is no conversion shader. Cast on the cpu first \
+                 (docs/devices/VULKAN4.md §6).",
+                input.tag().name(),
+                tag.name()
+            )));
+        }
     }
     let store = check_storage_dtype(op, tag)?;
     if current.kind != "cpu" {
@@ -1670,6 +1735,15 @@ pub fn maybe_upload(
             unsafe {
                 let buf = ctx.alloc(words.len() * 4).map_err(|e| vk_error(op, e))?;
                 ctx.upload(&buf, &words).map_err(|e| vk_error(op, e))?;
+                buf
+            }
+        }
+        VkStore::BoolAsI32 => {
+            let values = flat.to_dtype(candle_core::DType::U8).map_err(|e| crate::err::candle_err(op, e))?.to_vec1::<u8>().map_err(|e| crate::err::candle_err(op, e))?;
+            let words: Vec<i32> = values.into_iter().map(|v| if v != 0 { 1 } else { 0 }).collect();
+            unsafe {
+                let buf = ctx.alloc(words.len() * 4).map_err(|e| vk_error(op, e))?;
+                ctx.upload_i32(&buf, &words).map_err(|e| vk_error(op, e))?;
                 buf
             }
         }
@@ -1730,13 +1804,17 @@ fn to_copy(
     let tag = crate::aten::dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
     let label = crate::aten::device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
     if tag != input.tag() {
-        return Err(not_implemented(format!(
-            "{op}: the vulkan device cannot change dtype ({} to {}) -- there is \
-             no conversion shader. Bring the tensor to the cpu first \
-             (docs/devices/VULKAN3.md).",
-            input.tag().name(),
-            tag.name()
-        )));
+        let allow = (tag == TorchDType::Bool && input.tag() == TorchDType::Int64) ||
+                    (tag == TorchDType::Int64 && input.tag() == TorchDType::Bool);
+        if !allow {
+            return Err(not_implemented(format!(
+                "{op}: the vulkan device cannot change dtype ({} to {}) -- there is \
+                 no conversion shader. Bring the tensor to the cpu first \
+                 (docs/devices/VULKAN3.md).",
+                input.tag().name(),
+                tag.name()
+            )));
+        }
     }
     let vk_tensor = input.vk_tensor(op)?.clone();
     match label.kind.as_str() {
@@ -1865,12 +1943,16 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
 #[pyo3(name = "_vulkan_ops")]
 fn vulkan_ops() -> Vec<&'static str> {
     vec![
+        "aten._local_scalar_dense.default",
+        "aten._safe_softmax.default",
+        "aten._scaled_dot_product_flash_attention_for_cpu.default",
         "aten._softmax.default",
         "aten._to_copy.default",
         "aten._unsafe_view.default",
         "aten.add.Tensor",
         "aten.addmm.default",
         "aten.alias.default",
+        "aten.all.default",
         "aten.bmm.default",
         "aten.clone.default",
         "aten.contiguous.default",
@@ -2900,3 +2982,246 @@ fn matmul_vulkan(
     }
     wrap(py, out, shape, lhs.tag())
 }
+
+fn safe_softmax_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let dim_raw = crate::aten::dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| crate::aten::missing(op, "dim"))?;
+    let dtype = crate::aten::dtype_arg(args, kwargs, 2, "dtype")?;
+    let tag = dtype.unwrap_or(input.tag());
+    if tag != input.tag() {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device cannot cast to dtype {} -- cast first.",
+            tag.name()
+        )));
+    }
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let rank = x.shape.len() as isize;
+    let span = rank.max(1);
+    let dim = if dim_raw < 0 { dim_raw + span } else { dim_raw };
+    if dim < 0 || dim >= span {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {dim_raw})",
+            -span,
+            span - 1
+        )));
+    }
+    if rank > 0 && dim != rank - 1 {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device implements safe_softmax over the last dimension only,              got dim={dim_raw} of a {rank}-D tensor. Move it with .cpu() or permute first."
+        )));
+    }
+    let ctx = require(op)?;
+    let n = x.elem_count();
+    let row_len = x.shape.last().copied().unwrap_or(1);
+    let rows = if row_len > 0 { n / row_len } else { 0 };
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "safe_softmax_lastdim_f32",
+            SAFE_SOFTMAX_LASTDIM_F32_SPV,
+            &[&x.buffer, &x.buffer, &out],
+            [rows as u32, row_len as u32, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap(py, out, x.shape, input.tag())
+}
+
+fn all_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    if input.tag() != TorchDType::Bool {
+        return Err(not_implemented(format!("{op} on vulkan is implemented only for bool tensors")));
+    }
+    let x = input.vk_tensor(op)?.clone();
+    let n = x.elem_count();
+    let ctx = require(op)?;
+    let out = unsafe {
+        let out = ctx.alloc(4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "all_bool_i32",
+            ALL_BOOL_I32_SPV,
+            &[&x.buffer, &out],
+            [n as u32, 0, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(out), shape: vec![] }, TorchDType::Bool)
+}
+
+fn local_scalar_dense_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let x = input.vk_tensor(op)?.clone();
+    if x.elem_count() != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{op}: expected a tensor with exactly one element, got {} elements",
+            x.elem_count()
+        )));
+    }
+    // We must return a Python scalar!
+    let ctx = require(op)?;
+    match input.tag() {
+        TorchDType::Bool => {
+            let host = unsafe { ctx.download_i32(&x.buffer, 1) }.map_err(|e| vk_error(op, e))?;
+            Ok((host[0] != 0).into_bound_py_any(py)?.unbind())
+        }
+        TorchDType::Float32 => {
+            let host = unsafe { ctx.download(&x.buffer, 1) }.map_err(|e| vk_error(op, e))?;
+            Ok((host[0] as f64).into_bound_py_any(py)?.unbind())
+        }
+        TorchDType::Int64 => {
+            let host = unsafe { ctx.download_i32(&x.buffer, 1) }.map_err(|e| vk_error(op, e))?;
+            Ok((host[0] as i64).into_bound_py_any(py)?.unbind())
+        }
+        _ => Err(not_implemented(format!("{op} for dtype {} is not implemented", input.tag().name()))),
+    }
+}
+
+
+/// One step of the math path, dispatched as an aten op.
+///
+/// **Not a Python-API call.** `crate::aten::aten_dispatch` is the same
+/// function `_aten_dispatch` reaches, so every operand stays a
+/// `torch._C.TensorBase` and nothing here depends on the caller having
+/// arrived through `torch.Tensor`.
+fn sdpa_step(
+    py: Python<'_>,
+    op: &str,
+    args: Vec<Py<PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let tuple = PyTuple::new(py, args)?;
+    crate::aten::aten_dispatch(py, op, &tuple, None)
+}
+
+fn sdpa_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    // The math path of `scaled_dot_product_attention`, composed from ops that
+    // are already taught on this device:
+    //
+    //   transpose.int -> matmul (q @ kT) -> mul.Scalar (scale)
+    //                 -> add.Tensor (mask, if any) -> _softmax -> matmul (@ v)
+    //
+    // This is the fallback for a device with no fused flash kernel, which is
+    // every device this module has.
+    //
+    // **Each step is dispatched, not called through the Python API.** This
+    // handler sits on the device dispatch table, so it is reached with
+    // whatever the dispatcher is holding -- bare `torch._C.TensorBase`
+    // objects. It used to be inline Python ending in `torch.softmax(...)`,
+    // and `torch.softmax` is a Python-level entry point that accepts only the
+    // `torch.Tensor` subclass:
+    //
+    //     TypeError: softmax(): argument 'input' (position 1) must be Tensor,
+    //                not torch._C.TensorBase
+    //
+    // A model forward never saw that, because a model's operands came in
+    // through `torch.Tensor`; calling the op directly, which is what the
+    // dispatcher does, failed every time. A dispatch handler that re-enters
+    // the API above it only works for callers who came in that way, so the
+    // handler dispatches `aten._softmax.default` instead and the asymmetry is
+    // gone. `test_sdpa_is_reachable_from_the_dispatcher_and_agrees` in
+    // test_vulkan4.py is the test that fails if it comes back.
+    //
+    // The argument indices are the schema's, and they are *not* the ones the
+    // inline Python used: `(query, key, value, dropout_p=0.0, is_causal=false,
+    // attn_mask=None, scale=None)`. The old body read `args[3]` as the mask,
+    // which is `dropout_p` -- so a positional call meant one thing here and
+    // another in `sdpa_flash_cpu`, which parses these same indices.
+    let query = crate::aten::tensor_arg(op, args, kwargs, 0, "query")?;
+    let _key = crate::aten::tensor_arg(op, args, kwargs, 1, "key")?;
+    let _value = crate::aten::tensor_arg(op, args, kwargs, 2, "value")?;
+    let dropout_p = match crate::aten::optional(args, kwargs, 3, "dropout_p")? {
+        Some(value) if !value.is_none() => value.extract::<f64>()?,
+        _ => 0.0,
+    };
+    let is_causal = crate::aten::bool_arg(args, kwargs, 4, "is_causal")?.unwrap_or(false);
+    let attn_mask = crate::aten::optional_tensor_arg(op, args, kwargs, 5, "attn_mask")?;
+    let scale = match crate::aten::optional(args, kwargs, 6, "scale")? {
+        Some(value) if !value.is_none() => Some(value.extract::<f64>()?),
+        _ => None,
+    };
+
+    // Upstream's CPU kernel refuses both of these by name rather than
+    // returning an answer computed as if they had not been given, and a
+    // device that quietly ignored them would be wrong in the one direction
+    // nobody checks. The wording is upstream's, kept as `sdpa_flash_cpu`
+    // keeps it.
+    if dropout_p > 0.0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "scaled_dot_product_attention_flash_attention: Currently do not support dropout > 0",
+        ));
+    }
+    if is_causal {
+        return Err(not_implemented(format!(
+            "{op} on vulkan is implemented only for is_causal=False"
+        )));
+    }
+
+    // `1/sqrt(E)` over the last dimension, read off the device tensor's own
+    // shape -- there is no host readback here, a shape is metadata.
+    let scale = match scale {
+        Some(value) => value,
+        None => {
+            let shape = &query.vk_tensor(op)?.shape;
+            let last = *shape.last().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: query must have at least one dimension"
+                ))
+            })?;
+            1.0 / (last as f64).sqrt()
+        }
+    };
+
+    // The operands are passed on as the objects they arrived as, so this
+    // composes ops without ever constructing a Python-level tensor.
+    let q = crate::aten::required(op, args, kwargs, 0, "query")?.unbind();
+    let k = crate::aten::required(op, args, kwargs, 1, "key")?.unbind();
+    let v = crate::aten::required(op, args, kwargs, 2, "value")?.unbind();
+
+    let kt = sdpa_step(py, "aten.transpose.int", vec![
+        k,
+        (-2i64).into_bound_py_any(py)?.unbind(),
+        (-1i64).into_bound_py_any(py)?.unbind(),
+    ])?;
+    let scores = sdpa_step(py, "aten.matmul.default", vec![q, kt])?;
+    let mut scores = sdpa_step(py, "aten.mul.Scalar", vec![
+        scores,
+        scale.into_bound_py_any(py)?.unbind(),
+    ])?;
+    if attn_mask.is_some() {
+        let mask = crate::aten::required(op, args, kwargs, 5, "attn_mask")?.unbind();
+        scores = sdpa_step(py, "aten.add.Tensor", vec![scores, mask])?;
+    }
+    let attn = sdpa_step(py, "aten._softmax.default", vec![
+        scores,
+        (-1i64).into_bound_py_any(py)?.unbind(),
+        false.into_bound_py_any(py)?.unbind(),
+    ])?;
+    let out = sdpa_step(py, "aten.matmul.default", vec![attn, v])?;
+
+    let none = py.None();
+    let tup = pyo3::types::PyTuple::new(py, [out.into_bound(py), none.into_bound(py)])?;
+    Ok(tup.into_any().unbind())
+}
+

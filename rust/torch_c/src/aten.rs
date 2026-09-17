@@ -8345,6 +8345,10 @@ fn arange(
         let n = arange_length(op, &start, &end, &step, integral)?;
         return meta_result(py, vec![n], dtype);
     }
+    if label.kind == "vulkan" {
+        let n = arange_length(op, &start, &end, &step, integral)?;
+        return crate::vulkan::arange_factory(py, op, start.as_f64(), step.as_f64(), n, dtype);
+    }
     let device = label.resolve()?;
     let storage = storage_for(op, dtype, &device)?;
 
@@ -25702,7 +25706,7 @@ pub(crate) fn optional<'py>(
     }
 }
 
-fn required<'py>(
+pub(crate) fn required<'py>(
     op: &str,
     args: &Bound<'py, PyTuple>,
     kwargs: Option<&Bound<'py, PyDict>>,

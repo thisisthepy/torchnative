@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: number of rows
+// p1: row_length
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n) return;
+    
+    uint row_len = pc.p1;
+    uint offset = row * row_len;
+    
+    // find max
+    float m = a[offset];
+    for (uint i = 1; i < row_len; i++) {
+        m = max(m, a[offset + i]);
+    }
+    
+    // _safe_softmax: if every element is -inf, the row is dead.
+    // exp(-inf - (-inf)) = NaN on many GPUs, so we detect it here and
+    // write zeros instead — the only place _safe_softmax differs from
+    // _softmax (docs/devices/VULKAN7.md).
+    if (isinf(m) && m < 0.0) {
+        for (uint i = 0; i < row_len; i++) {
+            c[offset + i] = 0.0;
+        }
+        return;
+    }
+    
+    // compute sum exp
+    float sum = 0.0;
+    for (uint i = 0; i < row_len; i++) {
+        sum += exp(a[offset + i] - m);
+    }
+    
+    // write out
+    for (uint i = 0; i < row_len; i++) {
+        c[offset + i] = exp(a[offset + i] - m) / sum;
+    }
+}
