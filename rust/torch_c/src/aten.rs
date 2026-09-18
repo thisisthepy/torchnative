@@ -2350,7 +2350,13 @@ fn meta_stride_rule(op: &str) -> MetaStrideRule {
         | "aten._local_scalar_dense.default"
         | "aten.masked_select.default"
         | "aten._unique2.default"
-        | "aten.repeat_interleave.Tensor" => MetaStrideRule::OwnLayout,
+        | "aten.repeat_interleave.Tensor"
+        // Two branches with two different layout rules, so it can be neither
+        // `AlwaysContiguous` nor `PreserveFormat`: an all-non-positive pad
+        // narrows and clones (preserve_format), anything else fills a fresh
+        // buffer in the input's `suggest_memory_format`. Measured on both
+        // sides, docs/graph/CANINE.md §2.
+        | "aten.constant_pad_nd.default" => MetaStrideRule::OwnLayout,
         "aten.mm.default"
         | "aten.bmm.default"
         | "aten.addmm.default"
@@ -3365,6 +3371,117 @@ fn meta_table(
         // only consults `numel` when it has a wildcard to fill. On a meta
         // tensor there is no candle call afterwards to catch it, so a
         // mismatched `view` would silently answer the wrong shape.
+        // `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0)`
+        // on a **meta** input -- `canine`'s wall, and the whole of it.
+        //
+        // The dense kernel has been here since docs/architectures/ARCH20.md §2; the meta
+        // half was missing, so `MetaStrideRule::Unverified`'s gate refused the
+        // op on `canine`'s non-contiguous `(1, 64, 8)` stride `(512, 1, 64)`
+        // and `meta_table` would have refused it even contiguous. That is
+        // docs/graph/EXPORT6.md §5's shape again: already in
+        // `_aten_implemented()`, merely lacking a meta kernel. It is **not**
+        // docs/graph/STRIDE.md §3's representation limit -- nothing here asks a
+        // dense tensor to carry a caller-chosen stride.
+        //
+        // The layout is upstream's `_constant_pad_nd_meta`, measured rather
+        // than read, and it has two branches that answer *differently on the
+        // same input* (docs/graph/CANINE.md §2):
+        //
+        // ```text
+        // (3, 4) stride (1, 3), pad [ 1,  1]  ->  (3, 6) stride (6, 1)
+        // (3, 4) stride (1, 3), pad [-1, -1]  ->  (3, 2) stride (1, 3)
+        // ```
+        //
+        // **The branch test is `p <= 0`, not `p < 0`.** The meta registration
+        // and the `_refs` decomposition genuinely differ there, and the meta
+        // registration is what this table mirrors: an all-zero pad takes the
+        // narrow-and-clone branch, so `constant_pad_nd(t, [0, 0])` of a
+        // transposed `t` keeps `(1, 3)` rather than contiguating. Measured.
+        //
+        // Branch one is `narrow`s followed by `clone()`: a narrow changes the
+        // extent and never the stride, so the result is `preserve_format` over
+        // the *narrowed* shape and the *input's* stride.
+        //
+        // Branch two is `empty(new_shape, memory_format=suggest_memory_format(
+        // input))`, i.e. contiguous for every layout except a
+        // channels-last-*strided* one -- including upstream's two ambiguity
+        // fallbacks, which `layout::strides_like_channels_last` already has.
+        "aten.constant_pad_nd.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let pad: Vec<i64> = required(op, args, kwargs, 1, "pad")?.extract()?;
+            let (shape, stride, _) = meta_layout_of(op, &input)?;
+            let tag = input.tag();
+            if pad.len() % 2 != 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Length of pad must be even but instead it equals {}",
+                    pad.len()
+                )));
+            }
+            let rank = shape.len();
+            let l_pad = pad.len() / 2;
+            if l_pad > rank {
+                // The dense arm's message, which is upstream's verbatim --
+                // missing spaces included, docs/models/CKPT2.md §4.
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Length of pad should be no more than twice the number of \
+                     dimensions of the input. Pad length is {}while the input has \
+                     {rank}dimensions.",
+                    pad.len()
+                )));
+            }
+            let l_diff = rank - l_pad;
+            if pad.iter().all(|&p| p <= 0) {
+                let mut narrowed = shape.clone();
+                for i in l_diff..rank {
+                    let pad_idx = 2 * (rank - i - 1);
+                    for amount in [pad[pad_idx], pad[pad_idx + 1]] {
+                        if amount >= 0 {
+                            continue;
+                        }
+                        let kept = narrowed[i] as i64 + amount;
+                        if kept < 0 {
+                            // Upstream's `narrow` raises this, and the dense
+                            // arm reproduces it for the same inputs.
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                "narrow(): length must be non-negative.",
+                            ));
+                        }
+                        narrowed[i] = kept as usize;
+                    }
+                }
+                let out = crate::layout::preserve_format_stride(&narrowed, &stride);
+                return Ok(PyTensorBase::meta_fresh(narrowed, out, tag)
+                    .into_pyobject(py)?
+                    .into_any()
+                    .unbind());
+            }
+            let mut new_shape = shape[..l_diff].to_vec();
+            for i in 0..l_pad {
+                let pad_idx = pad.len() - ((i + 1) * 2);
+                let new_dim = shape[l_diff + i] as i64 + pad[pad_idx] + pad[pad_idx + 1];
+                if new_dim < 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "The input size {}, plus negative padding {} and {} resulted in \
+                         a negative output size, which is invalid. Check dimension {} of \
+                         your input.",
+                        shape[l_diff + i],
+                        pad[pad_idx],
+                        pad[pad_idx + 1],
+                        l_diff + i
+                    )));
+                }
+                new_shape.push(new_dim as usize);
+            }
+            if crate::layout::strides_like_channels_last(&shape, &stride) {
+                if let Some(out) = crate::layout::channels_last(&new_shape) {
+                    return Ok(PyTensorBase::meta_fresh(new_shape, out, tag)
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind());
+                }
+            }
+            meta_result(py, new_shape, tag)
+        }
         // `aten::zeros_like` on a meta input -- **delegated, not reimplemented.**
         //
         // The dense kernel already does every part of this correctly: it reads

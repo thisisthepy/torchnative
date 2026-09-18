@@ -5734,6 +5734,10 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # test caught it at the merge, which is the whole reason it names ops
     # instead of counting them.
     #
+    # `constant_pad_nd` has now left that list too, and the gate is what
+    # caught it: docs/graph/CANINE.md gave it a meta kernel and this test went
+    # red on the next run, naming the op. It is in the answering half below.
+    #
     # `squeeze.dims` left the same way in docs/graph/EXPORT6.md §2: it was the
     # last member of the `squeeze` family still refusing, and it is reached by
     # `torch.export` once EXPORT5 §10's walls are down. It has moved to the
@@ -5746,7 +5750,6 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.narrow.default", (a, 0, 0, 1)),
         ("aten.flip.default", (a, [0])),
         ("aten._softmax.default", (a, -1, False)),
-        ("aten.constant_pad_nd.default", (a, [1, 1])),
         ("aten.abs.default", (a,)),
         ("aten.ceil.default", (a,)),
         ("aten.floor_divide.default", (a, b)),
@@ -5797,6 +5800,14 @@ def test_ops_without_a_meta_kernel_name_themselves():
         # branch parallel to METAEMB's, which is why the refusing list above
         # still named it after the merge.
         ("aten.zeros_like.default", (a,)),
+        # docs/graph/CANINE.md -- `canine`'s wall, and the last of METAEMB §6's
+        # confirmed-refusing list to be reached by `torch.export`. It was the
+        # recurring shape once more: already in `_aten_implemented()` with a
+        # dense kernel since docs/architectures/ARCH20.md §2, and merely lacking
+        # a meta one. The boundary moved again rather than this test being
+        # weakened -- `stack`, `unbind`, `narrow`, `flip`, `_softmax` and the
+        # three elementwise stragglers are still above.
+        ("aten.constant_pad_nd.default", (a, [1, 1])),
         # docs/kernels/METAEMB.md -- the measured wall and what stood behind it.
         ("aten.embedding.default", (w, idx)),
         ("aten.gather.default", (a, 1, gidx)),

@@ -326,6 +326,15 @@ numbers moved.
   a dense device. `docs/graph/STRIDE.md` §3 already analysed it: a dense tensor
   here cannot be built with a caller-chosen stride. It is a representation
   change, not an operator, and it is the whole of the distance from 9 to 10.
+
+  **Superseded -- `docs/graph/CANINE.md` §1.** Re-measured at the head of the
+  next round, `canine` stops one wall *earlier*, at
+  `aten.constant_pad_nd.default` on a non-contiguous meta tensor: an operator
+  already in `_aten_implemented()` that merely lacked a meta kernel, with no
+  representation question in it. Closing that took the count to **10 of 10**.
+  `STRIDE.md` §3's dense stride limit is still real and still unmoved; it was
+  simply not what `canine` was standing behind, and no architecture in the
+  forty reaches it now.
 * **A non-contiguous `FakeTensor` reaches `TensorBase._base`**, which this shim
   does not implement -- for **every** copy-shaped operator, `clone` and
   `contiguous` identically to `lift_fresh_copy`. Not this operator's gap, and
