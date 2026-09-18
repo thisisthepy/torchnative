@@ -4161,6 +4161,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_dynamo_bool(module, _put)
     _install_inference_mode(module, _put)
     _install_raii_guards(module, _put)
+    _install_torchaudio(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
     # -- which is how most of the `torch` namespace comes into being
@@ -8867,6 +8868,16 @@ def _install_nn(module, dispatch) -> None:
     # below, `gelu(x, "tanh")` would bind fine at this level and silently
     # reach the tanh branch where upstream raises -- caught by testing the
     # positional form directly, not reasoned out in advance.
+    def elu(input, alpha=1.0, inplace=False):
+        """`torch._C._nn.elu` -- Higgs' encode path wall.
+        Decomposed to `where` and `expm1` to avoid a kernel gap."""
+        if inplace:
+            raise NotImplementedError("elu inplace")
+        import torch
+        pos = input > 0.0
+        neg_val = torch.expm1(input) * alpha
+        return torch.where(pos, input, neg_val)
+
     def gelu(input, *, approximate="none"):
         return dispatch("aten.gelu.default", input, approximate=approximate)
 
@@ -9799,6 +9810,7 @@ def _install_nn(module, dispatch) -> None:
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
+        (elu, "elu"),
         (gelu, "gelu"),
         (scaled_dot_product_attention, "scaled_dot_product_attention"),
         (pad, "pad"),
@@ -16912,3 +16924,68 @@ def _install_default_generator(module) -> None:
     # shape for a per-instance value -- and nothing reads it on this path.
 
     module.default_generator = generator
+
+
+def _install_torchaudio(module):
+    import sys
+    import importlib.util
+
+    if "torchaudio" in sys.modules:
+        return
+
+    try:
+        if importlib.util.find_spec("torchaudio") is not None:
+            return
+    except Exception:
+        pass
+
+    import warnings
+    warnings.warn("torchaudio is not installed; installing Higgs shim for torchaudio.functional.resample", RuntimeWarning)
+
+    import math
+
+    class TorchaudioFunctional:
+        @staticmethod
+        def resample(waveform, orig_freq, new_freq, lowpass_filter_width=6, rolloff=0.99, resampling_method="sinc_interp_hann", beta=None):
+            if orig_freq == new_freq: return waveform
+            gcd = math.gcd(int(orig_freq), int(new_freq))
+            orig_freq = int(orig_freq) // gcd
+            new_freq = int(new_freq) // gcd
+            base_freq = min(orig_freq, new_freq) * rolloff
+            width = math.ceil(lowpass_filter_width * orig_freq / base_freq)
+            idx_dtype = waveform.dtype if waveform.dtype.is_floating_point else module.float64
+            idx = (module._VariableFunctions.arange(-width, width + orig_freq, dtype=idx_dtype)[None, None] / orig_freq)
+            t = (module._VariableFunctions.arange(0, -new_freq, -1, dtype=waveform.dtype)[:, None, None] / new_freq + idx)
+            t *= base_freq
+            t = t.clamp(-lowpass_filter_width, lowpass_filter_width)
+            if resampling_method == "sinc_interp_hann":
+                window = module._VariableFunctions.cos(t * math.pi / lowpass_filter_width / 2) ** 2
+            else:
+                if beta is None: beta = 14.769656459379492
+                beta_tensor = module._VariableFunctions.tensor(float(beta), dtype=waveform.dtype)
+                window = module._VariableFunctions.i0(beta_tensor * module._VariableFunctions.sqrt(1 - (t / lowpass_filter_width) ** 2)) / module._VariableFunctions.i0(beta_tensor)
+            t *= math.pi
+            scale = base_freq / orig_freq
+            kernels = module._VariableFunctions.where(t == 0, module._VariableFunctions.tensor(1.0, dtype=waveform.dtype), module._VariableFunctions.sin(t) / t)
+            kernels *= window * scale
+            if not waveform.dtype.is_floating_point: kernels = kernels.to(dtype=module.float32)
+            shape = waveform.size()
+            waveform = waveform.view(-1, shape[-1])
+            num_wavs, length = waveform.shape
+            waveform = module._VariableFunctions.pad(waveform, (width, width + orig_freq))
+            resampled = module._aten_dispatch("aten.conv1d.default", waveform[:, None], kernels, None, [orig_freq], [0], [1], 1)
+            resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
+            target_length = module._VariableFunctions.ceil(module._VariableFunctions.tensor(new_freq * length / orig_freq)).to(dtype=module.int64)
+            resampled = resampled[..., :target_length]
+            return resampled.view(shape[:-1] + resampled.shape[-1:])
+
+    class Torchaudio:
+        functional = TorchaudioFunctional()
+
+    import importlib.machinery
+    torchaudio = Torchaudio()
+    torchaudio.__spec__ = importlib.machinery.ModuleSpec("torchaudio", None)
+    torchaudio.__path__ = []
+    sys.modules["torchaudio"] = torchaudio
+    sys.modules["torchaudio.functional"] = torchaudio.functional
+
