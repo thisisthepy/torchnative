@@ -285,6 +285,18 @@ recorded because each looks right and would have been published as the cause:
   needs a registry of which ops this shim has a meta arm for. That is a real
   gap, and it is now measured; it is simply not this wall.
 
+  > **Measured on its own terms, and left alone: `docs/graph/METAKEY.md`.**
+  > The 2083/408 reproduces exactly, and a third answer nobody had named turns
+  > up beside them — upstream **raises** for 300 names rather than answering.
+  > Two things above this need correcting. The gap a caller can see is **148**,
+  > not 1375: `OpOverload.has_kernel_for_dispatch_key` ORs in `py_kernels`, and
+  > `activate_meta()` has already covered 1227 of the 1375. And **"a registry of
+  > which ops this shim has a meta arm for" is the wrong registry** — 28 of the
+  > 114 ops with a meta arm here are ops upstream answers `False` for, because
+  > it reaches them through `CompositeExplicitAutograd`. The one caller is
+  > `resolve_key`, it is not reached on this shim, and 15 of the 17 names it
+  > asks about during a `BertModel` export are `prims::`.
+
 ### 4.2 What is left to localise
 
 Upstream's full fake dispatch produces a plain `tuple` for
