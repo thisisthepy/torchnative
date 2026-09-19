@@ -182,6 +182,17 @@ Read across, that is the whole remaining shape:
   it is a claim about the **shape of the remaining work**, not a claim that the
   shim does it.
 
+> **Corrected by the round that did it: the real number is 1440, not 3301.**
+> `docs/graph/BFALLBACK.md` implemented both names and measured that this
+> shim's own registry holds **zero** backend fallbacks, so the honest predicate
+> answers `False` everywhere. Stage 4's 3301 was measured with *upstream's*
+> 37-key set patched in and was an upper bound, never a target: the 1861
+> difference is `resolve_key` handing back the dispatch key itself on the
+> promise of a fallback that does not exist here. **What stage 4 got right is
+> the part that mattered** — the chain does terminate. The 3453 that stage 3
+> loses to a gap now raise `could not find kernel` instead, and no
+> `resolve_key` result on the aten surface dies on an unimplemented name.
+
 Stage 0 and stage 1 agreeing to the unit is a second, weaker check on the
 table: the shim's own 14 entries and upstream's live 16 produce the same 4893
 outcomes.
@@ -241,12 +252,19 @@ implementation with itself.
 * **Did not implement `_dispatch_is_alias_key`.** It is the next name, it is the
   first one that moves the resolved count, and it is six names wide — but it is
   a different function and this round's bar is agreement on this one. §3 says
-  what it buys: 94 of 4893.
+  what it buys: 94 of 4893. **Done: `docs/graph/BFALLBACK.md` §1**, and it
+  needed no table — the six alias keys are exactly the six
+  `_ALIAS_EXPANSION` entries.
 * **Did not implement `_dispatch_has_backend_fallback`.** It is where the mass
   is (1440 → 3301) and it is the one that must not be copied from upstream: its
   `True` set is upstream's registered fallbacks, and 37 of them are not this
   shim's. Copying it would be the claim-a-kernel direction that
-  `docs/graph/METAKEY.md` §3 rejected for the Meta predicate.
+  `docs/graph/METAKEY.md` §3 rejected for the Meta predicate. **Done:
+  `docs/graph/BFALLBACK.md` §2, and it was not copied** — this shim's own
+  registry holds zero fallbacks, so the predicate answers `False`
+  everywhere, the resolved count lands at **1440** rather than 3301, and
+  the 32 spellable keys where upstream answers `True` are named as
+  capability gaps.
 * **Did not assert that the resolved count stays at 1346.** That would be a
   test against progress (`docs/graph/METAKEY.md` §5). The guarantee is
   one-directional — no result that resolved before may stop resolving — and the

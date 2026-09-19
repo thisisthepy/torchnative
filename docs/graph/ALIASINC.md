@@ -200,6 +200,13 @@ named next blocker, not an unblocked feature. The next round that wants
 > (1346 → 1440) and is six names wide; `_dispatch_has_backend_fallback` is
 > where the mass is (1440 → 3301) and is the one that must **not** be copied
 > from upstream, because its `True` set is upstream's registered fallbacks.
+>
+> **Both are now done, and the terminal number is 1440, not 3301:**
+> `docs/graph/BFALLBACK.md`. This shim's own registry holds zero backend
+> fallbacks, so the honest predicate answers `False` everywhere; 3301 was
+> measured with upstream's 37-key set patched in and was an upper bound. The
+> chain does terminate — the other 3453 raise upstream's own `could not find
+> kernel` rather than dying on a gap.
 
 ---
 

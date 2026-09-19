@@ -1960,6 +1960,26 @@ _AUTOGRAD_BACKEND_KEYSET = {
 }
 
 
+#: `_dispatch_has_backend_fallback(k)` -- the dispatch keys this shim has a
+#: fallback kernel at, meaning a kernel that catches *every* operator sent to
+#: that key. **It is empty, and that is the answer rather than a placeholder.**
+#:
+#: Upstream's own set has 37 keys and must not be copied: `resolve_key` hands
+#: back the key itself when this says `True`, so borrowing upstream's set would
+#: promise a fallback for 1861 more `(op, key)` pairs than this shim can serve
+#: -- the same claim `_DISPATCH_REGISTRATIONS` refuses above, at a different
+#: scale. `docs/graph/BFALLBACK.md` has the measurement and names the 32
+#: spellable capability gaps that answering `False` leaves open.
+#:
+#: This is deliberately *not* fed by `_dispatch_library(...).fallback(...)`.
+#: Those registrations are recorded into `_shim_registrations` and dropped, so
+#: marking their key effective would claim a kernel that can never run. When a
+#: round wires Python fallbacks through to `_aten_dispatch`, this is the set it
+#: adds to, and `rust/torch_c/pytests/test_bfallback.py` reddens until both
+#: sides move together.
+_SHIM_BACKEND_FALLBACKS: frozenset = frozenset()
+
+
 _FILE_DECLARED_DISPATCH_KEYS = (
     "CompositeImplicitAutograd",
     "CompositeImplicitAutogradNestedTensor",
@@ -8994,6 +9014,104 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_get_backend_keyset_from_autograd = (
         _dispatch_get_backend_keyset_from_autograd
     )
+
+    def _dispatch_is_alias_key(k):
+        """`torch._C._dispatch_is_alias_key` -- `c10::isAliasDispatchKey`.
+
+        The only caller in the vendored tree is
+        `OperatorBase.has_kernel_for_any_dispatch_key` (`torch/_ops.py:113`),
+        which skips alias keys when asking whether an op has a kernel in a
+        keyset -- an alias key in `py_kernels` describes how an op is put
+        together, not which backend runs it, so it must not count as a backend
+        kernel.
+
+        **This adds no table.** The alias keys are exactly the keys that expand
+        beyond themselves under `_dispatch_is_included_in_alias`, so the answer
+        is membership in `_ALIAS_EXPANSION`, which already exists and is
+        already held to upstream over all 15129 askable pairs. Adding a second
+        six-name list beside it would give this file two places to rot
+        independently. That identity is not assumed:
+        `test_the_alias_keys_are_exactly_the_keys_that_expand_beyond_themselves`
+        re-derives both sets from a live upstream every run and reddens if they
+        ever come apart.
+
+        Two things that look like edge cases and are not. `ADInplaceOrView`
+        reads like an alias key and upstream answers `False` for it
+        (`docs/graph/ALIASINC.md` §1.1 measured that). And upstream's
+        `DispatchKeySet.has()` answers `True` for all six alias keys on *any*
+        keyset including the empty one (`docs/graph/BKEYSET.md` §2.1) -- that
+        is a property of the bit-set representation, not a membership, and
+        nothing here imitates it.
+
+        This is the first name in this chain that moves the resolved count:
+        1346 -> 1440 of 4893 `resolve_key` results over the aten surface, 87
+        landing on `CompositeImplicitAutograd` and 7 on `Autograd`.
+        """
+        return getattr(k, "name", k) in _ALIAS_EXPANSION
+
+    module._dispatch_is_alias_key = _dispatch_is_alias_key
+
+    def _dispatch_has_backend_fallback(k):
+        """`torch._C._dispatch_has_backend_fallback` -- `Dispatcher::hasBackendFallbackForDispatchKey`.
+
+        **This one is not a lookup, and copying upstream's answer would be the
+        single largest false claim in this file.**
+
+        `resolve_key` (`torch/_ops.py:257`) consults this last: if the answer
+        is `True` it hands back the dispatch key *itself*, on the promise that
+        "the dispatch key will implicitly route to backend fallback". Upstream
+        can promise that because its C++ build registers catch-every-operator
+        fallback kernels at 37 keys -- `ADInplaceOrView`, the autograd and
+        autocast keys, `Functionalize`, `Python`, `BackendSelect`, `Meta`,
+        `MPS`, the functorch keys and the rest.
+
+        **This shim has registered none, and that is derived rather than
+        assumed.** The only door a registration can arrive through here is
+        `_C._dispatch_library(...)`, whose `fallback` lands in
+        `_shim_registrations`; after a full `import torch` there are zero of
+        them. `_SHIM_BACKEND_FALLBACKS` below is the set of keys a fallback is
+        actually *effective* at, and nothing populates it -- because a Python
+        fallback that arrives through that door is recorded and then dropped
+        (`_install_library`'s docstring), so `_aten_dispatch` would never run
+        it. Answering `True` for a recorded-and-dropped fallback would claim a
+        kernel just as much as copying upstream's 37 would, so the two sets are
+        kept apart and `test_a_python_registered_fallback_is_recorded_but_is_not_effective`
+        pins the asymmetry.
+
+        What that honesty costs, measured rather than estimated:
+
+            resolved, before                        1346
+            + `_dispatch_is_alias_key`              1440
+            + this, answered honestly               1440   unchanged
+            + upstream's 37-key set patched in      3301   1861 claimed kernels
+
+        `docs/graph/BKEYSET.md` §3 projected 3301 for this step; **1440 is the
+        real number** and the 3301 was an upper bound measured with upstream's
+        set patched in, never a target. The 1861 difference is the size of the
+        claim this declines to make -- the same shape `_dispatch_registrations`
+        refuses by name, where answering from upstream's file "would claim 1500
+        kernels this shim does not have".
+
+        **What it does buy is that the chain terminates.** The other 3453 stop
+        dying on an unimplemented name and start raising upstream's own `could
+        not find kernel` -- an honest refusal that names itself. No
+        `resolve_key` result on the aten surface dies on a gap in this shim any
+        more.
+
+        The 32 spellable keys where upstream answers `True` and this answers
+        `False` are real missing capabilities, and they are listed by
+        `test_the_capability_gaps_this_honest_answer_names` rather than
+        described here, so the list is re-derived from both live sides instead
+        of rotting in a comment.
+        """
+        return getattr(k, "name", k) in _SHIM_BACKEND_FALLBACKS
+
+    module._dispatch_has_backend_fallback = _dispatch_has_backend_fallback
+
+    # Countable rather than implicit, in the shape `_shim_registrations` and
+    # `_shim_unknown_tags` already use: the size of this set is the size of
+    # what `resolve_key`'s last branch can honestly promise, and it is 0.
+    module._shim_backend_fallbacks = lambda: sorted(_SHIM_BACKEND_FALLBACKS)
 
     # A `DispatchKeySet` *value*, not a function.
     # `torch/_subclasses/functional_tensor.py:146` does
