@@ -1128,13 +1128,6 @@ impl PyTensorBase {
                 dest.dtype().as_str()
             )));
         }
-        if !dest.device().is_cpu() {
-            return Err(not_implemented(format!(
-                "{op}: writing through a view is implemented for the CPU backend \
-                 only in torch._C shim; this tensor is on {}",
-                self.device_label().__str__()
-            )));
-        }
         // **The `as_strided` write barrier.** docs/kernels/STRIDED.md §2.
         //
         // This is the single write door -- `aten.rs::write_back` is the only
@@ -1184,6 +1177,20 @@ impl PyTensorBase {
             ));
         }
 
+        // **The device fork, and it is the last thing decided.** Everything
+        // above -- the dtype and shape contract, the `as_strided` barrier, the
+        // `Overlap` table -- is a property of the layout and of upstream's
+        // answer, not of where the bytes live, so a device receiver has to
+        // pass all of it on the same terms a CPU one does. Only the *mechanism*
+        // of the write differs, and that is what forks here.
+        //
+        // docs/devices/matrix.md §7.7. Before it, this branch was a blanket
+        // refusal naming the backend, and it was the single gate under all 33
+        // in-place operators on Metal.
+        if !dest.device().is_cpu() {
+            return write_on_device(op, dest, src, self.device_label().__str__());
+        }
+
         // Read first, and let every lock go before the write starts. See the
         // aliasing note above -- this line is the reason `x[0:2] = x[1:3]`
         // is correct rather than half-overwritten.
@@ -1191,6 +1198,103 @@ impl PyTensorBase {
         dest.inplace_op1(&WriteThrough { payload })
             .map_err(|e| candle_err(op, e))
     }
+}
+
+/// Write `source`'s values into the storage positions `dest`'s layout
+/// addresses, **without moving either tensor's bytes to the host.**
+///
+/// The device half of the single write door. `write_into` has already checked
+/// everything that is a property of the layout rather than of the backend, so
+/// this function decides one thing: can the run of storage this view addresses
+/// be written by a door candle already publishes?
+///
+/// **Why the host path cannot serve a device receiver.** `WriteThrough`
+/// implements `InplaceOp1::cpu_fwd` only, and walks the destination's layout
+/// over a `&mut CpuStorage` *slice*. There is no slice behind a Metal buffer.
+/// Worse, `flat_storage` reaches the replacement through `to_vec1`, so even a
+/// `metal_fwd` built on the same shape would pull the freshly computed values
+/// back to the host and push them out again -- a CPU round trip under an `mps`
+/// label, which is what docs/devices/MPS.md §2 exists to refuse. So this
+/// function must reach the device or refuse, and it must never fall through.
+///
+/// **Contiguous only, and that is the whole of the restriction.** A
+/// contiguous view addresses **one unbroken run** of `numel` elements starting
+/// at `layout.start_offset()`, and candle publishes a door for exactly that
+/// run: `Tensor::slice_set`, which reaches `BackendStorage::copy2d`, which on
+/// Metal with `src_s == d2 == dst_s` is a **blit on the device's own command
+/// queue** and on CUDA is a device-to-device copy. That covers the receiver a
+/// person actually writes to -- a whole tensor, or a `detach()`, `view()`,
+/// `reshape()`, `unsqueeze()` or leading-axis `slice`/`select` of one.
+///
+/// A *strided* view (`x[:, 0:2]`, a transpose, an `expand`) needs a scatter
+/// over a discontiguous set of positions, and candle exposes no public
+/// device-side scatter-by-layout: `copy2d` handles one stride pair, not a rank-
+/// n odometer, and `InplaceOp1::metal_fwd` hands back a `MetalStorage` whose
+/// element count is private and against which we would have to write a Metal
+/// kernel of our own. **Refusing is the answer, and the refusal names the
+/// layout** -- naming the *backend*, as the old sentence did, is what sent 112
+/// cells of docs/devices/matrix.md to the wrong diagnosis (§7.2).
+///
+/// **Nothing here changes `vendor/candle-core`.** Every call below is on the
+/// published API of the pinned crate; the fork's contract is "two inputs and
+/// nothing else" (docs/numerics/INT8.md §1.2) and it is untouched.
+fn write_on_device(
+    op: &str,
+    dest: &Tensor,
+    source: &Tensor,
+    label: String,
+) -> PyResult<()> {
+    // An empty view addresses no storage at all. `slice_set` would compute a
+    // zero-length blit, but `to_index` on a rank-0 shape raises first, and a
+    // refusal for `x[0:0].zero_()` would be wrong rather than conservative.
+    if dest.elem_count() == 0 {
+        return Ok(());
+    }
+    if !dest.is_contiguous() {
+        return Err(not_implemented(format!(
+            "{op}: writing through a non-contiguous view is implemented for the \
+             CPU backend only in torch._C shim; this tensor is on {label} with \
+             dims {:?} and strides {:?}. A *contiguous* receiver does write on \
+             the device -- a whole tensor, or a view(), reshape(), detach(), \
+             unsqueeze() or leading-axis slice of one. This layout addresses a \
+             broken run, and candle 0.11.0 publishes no device scatter for one \
+             (`copy2d` takes a single stride pair). .contiguous() the receiver, \
+             or write the base. docs/devices/matrix.md §7.7",
+            dest.dims(),
+            dest.layout().stride()
+        )));
+    }
+
+    // **Break storage sharing before handing the pair to candle.**
+    // `slice_set` refuses a source that shares the destination's storage, and
+    // its guard is `same_storage` -- coarser than element overlap, so it also
+    // refuses the disjoint-rows case (`x[0:2].copy_(x[2:4])`) that upstream
+    // writes happily. `contiguous()` returns a shallow clone when the source
+    // already is one, so it does not break the sharing on its own; `copy()`
+    // does, on the device, and only when the sharing is real.
+    //
+    // This is the device analogue of the host path's "read first": there, the
+    // source is poured into an owned `CpuStorage` before the write lock is
+    // taken. Here it becomes a fresh device buffer. Same reason, same
+    // guarantee -- the write never reads a position it has already written.
+    let mut src = source.contiguous().map_err(|e| candle_err(op, e))?;
+    if crate::storage::storage_identity(&src) == crate::storage::storage_identity(dest) {
+        src = src.copy().map_err(|e| candle_err(op, e))?;
+    }
+
+    // `slice_set` indexes a dimension, so a rank-0 receiver has none to name.
+    // Reshaping a contiguous tensor keeps its storage *and* its start offset,
+    // so the reshaped handle writes into exactly the same element.
+    let (dest, src) = if dest.rank() == 0 {
+        (
+            dest.reshape((1,)).map_err(|e| candle_err(op, e))?,
+            src.reshape((1,)).map_err(|e| candle_err(op, e))?,
+        )
+    } else {
+        (dest.clone(), src)
+    };
+
+    dest.slice_set(&src, 0, 0).map_err(|e| candle_err(op, e))
 }
 
 /// Whether an in-place op may write into a destination that addresses the

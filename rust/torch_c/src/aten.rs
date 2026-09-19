@@ -20530,6 +20530,40 @@ fn clamp_dtype_refusals(
 }
 
 /// `min(max(x, min_val), max_val)`, the value half of both clamp spellings.
+///
+/// **NaN is restored off the CPU, and that is a divergence in candle's
+/// backends rather than a choice made here** (docs/devices/matrix.md §7.9).
+/// Upstream's clamp propagates NaN: `torch.tensor([nan]).clamp_min_(0.)` is
+/// `nan`. candle's CPU `maximum`/`minimum` do the same. Its **Metal** kernels
+/// are MSL `max`/`min`, which return the *non-NaN* operand, so the same
+/// expression came back `0.0` on an `mps` tensor -- a silently wrong number,
+/// which is the one direction CLAUDE.md §4 does not permit.
+///
+/// It was found by re-measuring the (dtype x device) matrix after the in-place
+/// write door opened on Metal, and it is **older than that door**: `clamp` and
+/// `clamp_min` (out of place) have been wrong on `mps` since `mps` landed, and
+/// the matrix graded them AGREES throughout because its cell is one shape from
+/// `tools/golden/cases.py` and that shape has no NaN in it (§5's "one shape per
+/// op", demonstrated rather than warned about). The in-place pair was *refused*
+/// by the write door until now, so lifting that gate without this would have
+/// turned a refusal into a wrong answer.
+///
+/// **The restore is device-resident**: `ne` is an elementwise compare and
+/// `where_cond` a select, both candle kernels on whatever device the tensor is
+/// on, so nothing comes back to the host and the op stays off
+/// `MPS_HOST_READBACK_OPS`.
+///
+/// **Only off the CPU**, because the CPU is already right and `clamp` is on a
+/// hot path -- `mamba`'s discretisation clamps `dt` twice per step
+/// (docs/architectures/ARCH20.md §4) -- so the CPU keeps its two-kernel shape
+/// rather than paying a compare and a select for a correction it does not need.
+/// The condition is `!is_cpu()` and not `is_metal()`: CUDA's kernels are the
+/// same `fmax`/`fmin` shape and this machine has no CUDA to measure on, so the
+/// correction is applied wherever it cannot be ruled out.
+///
+/// Integral tags never take this branch: there is no integral NaN, `ne` on an
+/// integer tensor is a needless kernel, and `tag.is_floating_point()` is the
+/// same predicate the bounds above already switch on.
 fn clamp_values(
     op: &str,
     source: &Tensor,
@@ -20553,6 +20587,12 @@ fn clamp_values(
             out.minimum(bound.as_i64())
         }
         .map_err(|e| candle_err(op, e))?;
+    }
+    if tag.is_floating_point() && !source.device().is_cpu() {
+        out = source
+            .ne(source)
+            .and_then(|isnan| isnan.where_cond(source, &out))
+            .map_err(|e| candle_err(op, e))?;
     }
     Ok(out)
 }

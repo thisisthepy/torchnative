@@ -28,11 +28,16 @@ integer arms (`op.rs`'s `bin_op!`, unlike `unary_op!`, whose integer arms are
 `todo!()`, which is why the negation is a subtraction from zero and not
 `Tensor::neg`).
 
-**`abs_` is a different cell and stays REFUSES on mps.** Its kernel lost the
-readback too, so it left the list -- but `write_back` refuses an in-place
-write to a non-CPU tensor, which is a separate gate this round does not lift.
-What changed for `abs_` is that its refusal now names the reason that is
-actually true. The cell is published as REFUSES, not as anything better.
+**`abs_` was a different cell and stayed REFUSES on mps until 2026-09-20.**
+Its kernel lost the readback too, so it left the list -- but `write_back`
+refused an in-place write to a non-CPU tensor, which was a separate gate.
+`docs/devices/matrix.md` §7.7 lifted that gate for a contiguous receiver
+(`tensor.rs::write_on_device`, candle's `slice_set` onto a Metal blit), so
+`abs_` now AGREES on all four `mps` dtypes Metal allows and the test below is
+an agreement test rather than a refusal test. That change is recorded here
+rather than silently made: this file landed green on 2026-09-19, and a test
+that starts asserting the opposite of what it asserted needs the reason
+written down beside it.
 
 **What this file proves, and at which grade.**
 
@@ -63,9 +68,9 @@ Nullifications this file is meant to catch, each verified by making the break:
       -> test_abs_wraps_at_the_signed_minimum_exactly_as_upstream_does
 * `aten.abs.default` going back on `MPS_HOST_READBACK_OPS`
       -> test_abs_on_mps_does_not_come_back_through_the_readback_gate
-* `abs_` on `mps` starting to succeed without `write_back` having learned to
-  write on a device, or being refused by the readback gate again
-      -> test_abs_inplace_agrees_on_cpu_and_refuses_on_mps_for_the_right_reason
+* `abs_` on `mps` regressing to a refusal, or coming back through the
+  readback gate
+      -> test_abs_inplace_agrees_with_upstream_on_cpu_and_on_mps
 * a `to_vec1` reappearing in the kernel while the name stays off the list
       -> test_shim.py's derivation scan, which is why this file does not
          restate it
@@ -275,25 +280,24 @@ def test_abs_on_mps_does_not_come_back_through_the_readback_gate():
         "exempt. An exemption here would be the MPSATTN.md §3.1 defeat.")
 
 
-def test_abs_inplace_agrees_on_cpu_and_refuses_on_mps_for_the_right_reason():
-    """`abs_` is `abs`'s value through the receiver -- and is still refused on
-    Metal, by a **different** gate, which is the thing worth pinning.
+def test_abs_inplace_agrees_with_upstream_on_cpu_and_on_mps():
+    """`abs_` is `abs`'s value through the receiver, now on both devices.
 
-    `abs_`'s kernel lost its host readback at the same time `abs`'s did, so it
-    left `MPS_HOST_READBACK_OPS` too. It still does not run on `mps`, because
-    `write_back` refuses an in-place write to a non-CPU tensor
-    ("writing through a view is implemented for the CPU backend only"). That
-    is a real and separate limitation -- it is the same refusal `zero_`,
-    `ceil_` and the rest of the in-place family give (docs/devices/matrix.md
-    §7) -- and this round does not lift it.
+    **This test changed shape on 2026-09-19 and the previous version said to.**
+    It used to assert that `abs_` *refuses* on `mps`, and it did: `abs_`'s
+    kernel had lost its host readback along with `abs`'s, but the write itself
+    stopped at `write_back`'s "writing through a view is implemented for the
+    CPU backend only". Its docstring said that if the op ever started
+    succeeding, this should become an agreement test provided the success was
+    a device write and not a silent host round trip. It is -- see
+    `test_mpsinplace.py`, which lifts that gate for a contiguous receiver by
+    routing the write through candle's `slice_set` and pins the no-readback
+    property structurally (docs/devices/matrix.md §7.7).
 
-    **Why this is an improvement even though the cell is still REFUSES.** The
-    sentence changed from one that was no longer true ("this kernel reads the
-    tensor back to host memory") to the one that is. A refusal naming the
-    wrong reason sends the reader to the wrong fix, and CLAUDE.md §6 is about
-    exactly that. This test goes red if the readback sentence comes back, and
-    red if the op silently starts succeeding on `mps` without anybody having
-    taught `write_back` to write on a device.
+    So this is now grade *agrees* on both devices, with the oracle in a
+    separate subprocess, and it keeps the two negative claims that were worth
+    keeping: the receiver must come back on `mps`, and the readback sentence
+    must not reappear.
     """
     wanted = sorted(set(_CPU_DTYPES) | set(_MPS_DTYPES))
     oracle = _oracle(_ORACLE_ABS,
@@ -311,28 +315,33 @@ def test_abs_inplace_agrees_on_cpu_and_refuses_on_mps_for_the_right_reason():
             why = _close(got, ref["values"], tol.atol, tol.rtol)
             assert why is None, "aten.abs_ %s_cpu (%s): %s" % (name, who, why)
 
-    mps = _mps_or_skip("abs_'s refusal on mps")
+    mps = _mps_or_skip("abs_ agreement on mps")
     if mps is None:
         return
     for name in _MPS_DTYPES:
         t = _C._tensor_from_flat(list(_values_for(name)), list(_SHAPE),
                                  dt_utils.c_dtype(_C, name), mps)
         try:
-            _C._aten_dispatch("aten.abs_.default", t)
+            r = _C._aten_dispatch("aten.abs_.default", t)
         except NotImplementedError as e:
             msg = str(e).splitlines()[0]
-        else:
+            assert "reads the tensor back to host memory" not in msg, (
+                "aten.abs_ %s_mps is refused by the host-readback gate again: "
+                "%r" % (name, msg))
             raise AssertionError(
-                "aten.abs_ %s_mps succeeded. If `write_back` learned to write "
-                "on a device, that is good news and this test should become an "
-                "agreement test -- but check that it is that, and not a silent "
-                "host round trip." % name)
-        assert "writing through a view" in msg, (
-            "aten.abs_ %s_mps refuses, but not for the write-back reason: %r"
-            % (name, msg))
-        assert "reads the tensor back to host memory" not in msg, (
-            "aten.abs_ %s_mps is refused by the host-readback gate again: %r"
-            % (name, msg))
+                "aten.abs_ %s_mps refuses again: %r. The device write door in "
+                "tensor.rs::write_on_device is what makes it work; if that was "
+                "removed, this is the regression." % (name, msg))
+        ref = oracle[name]
+        tol = dt_utils.tolerance_for(ref["dtype"])
+        assert r is t, (
+            "aten.abs_ %s_mps returned a different object from the receiver"
+            % name)
+        assert str(t.device).startswith("mps"), (
+            "aten.abs_ %s_mps left the receiver on %s" % (name, t.device))
+        got = [float(v) for v in t.cpu().to(_C.float64).flatten().tolist()]
+        why = _close(got, ref["values"], tol.atol, tol.rtol)
+        assert why is None, "aten.abs_ %s_mps (receiver): %s" % (name, why)
 
 
 def _main():
