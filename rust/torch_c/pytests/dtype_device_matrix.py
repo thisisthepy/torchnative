@@ -80,7 +80,19 @@ _NAMED = ("not implemented in torch._C shim", "not implemented for the",
 _SYMBOLS = ("const-set", "contiguous to_dtype", "Error while loading function",
             "mlx matmul", "candle:")
 _REFUSALish = ("not implemented", "unsupported", "not supported",
-               "cannot be converted", "no kernel", "doesn't support")
+               "cannot be converted", "no kernel", "doesn't support",
+               # `write_back`'s refusal for the whole in-place family on a
+               # non-CPU tensor ("writing through a view is implemented for
+               # the CPU backend only in torch._C shim; this tensor is on
+               # mps:0"). It says "is implemented for" and not "is not
+               # implemented", so the fragments above missed it and 112 cells
+               # across 33 in-place operators were published as BREAKS -- a
+               # verdict docs/devices/matrix.md §1 defines as "never read as a
+               # refusal". They are refusals, and named ones: they say the
+               # device, the reason and the family. Fixing this moves the
+               # cells in the *pessimistic* direction only; nothing becomes
+               # AGREES.
+               "implemented for the cpu backend only")
 
 
 def _cell_worker(ops, out_path):

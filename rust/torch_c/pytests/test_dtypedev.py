@@ -833,6 +833,15 @@ _CPU_REACHES = {
 # almost none for I16/I32. docs/numerics/DTYPEDEV.md section 4 lists what
 # closing that would take.
 _MPS_REACHES = {
+    # `*|abs` joined this set on 2026-09-19: `aten.abs.default`'s integral
+    # path stopped being a `to_vec1::<i64>()` loop and became
+    # `integral_abs_on_device` -- `maximum(x, 0 - x)` in candle -- so the
+    # operator left `MPS_HOST_READBACK_OPS` and its floating path, which was
+    # already one candle op, stopped being refused on the integral half's
+    # account. docs/devices/matrix.md §7.3. `test_the_dtype_device_matrix_
+    # agrees_with_upstream` grades these six by value; reaching is not the
+    # claim.
+    "bfloat16|abs",
     "bfloat16|add",
     "bfloat16|clone",
     "bfloat16|div",
@@ -858,6 +867,7 @@ _MPS_REACHES = {
     "bool|sum",
     "bool|to_f32",
     "bool|transpose_contig",
+    "float16|abs",
     "float16|add",
     "float16|clone",
     "float16|div",
@@ -873,6 +883,7 @@ _MPS_REACHES = {
     "float16|sum",
     "float16|to_f32",
     "float16|transpose_contig",
+    "float32|abs",
     "float32|add",
     "float32|clone",
     "float32|div",
@@ -895,6 +906,7 @@ _MPS_REACHES = {
     "int16|index0",
     "int32|clone",
     "int32|index0",
+    "int64|abs",
     "int64|add",
     "int64|clone",
     "int64|cumsum",
@@ -910,6 +922,7 @@ _MPS_REACHES = {
     "int64|sum",
     "int64|to_f32",
     "int64|transpose_contig",
+    "uint32|abs",
     "uint32|add",
     "uint32|clone",
     "uint32|cumsum",
@@ -924,6 +937,7 @@ _MPS_REACHES = {
     "uint32|sum",
     "uint32|to_f32",
     "uint32|transpose_contig",
+    "uint8|abs",
     "uint8|add",
     "uint8|clone",
     "uint8|cumsum",
