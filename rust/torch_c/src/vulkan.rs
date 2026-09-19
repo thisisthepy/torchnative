@@ -99,6 +99,7 @@ spv!(TANH_F32_SPV, "tanh_f32");
 spv!(BROADCAST_BINARY_F32_SPV, "broadcast_binary_f32");
 spv!(LOGSUMEXP_LASTDIM_F32_SPV, "logsumexp_lastdim_f32");
 spv!(SUM_DIMS_F32_SPV, "sum_dims_f32");
+spv!(FILL_F32_SPV, "fill_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -1109,6 +1110,14 @@ pub fn dispatch(
         "aten.add.Tensor" => add_tensor(py, op, args, kwargs),
         "aten.all.default" => all_vulkan(py, op, args, kwargs),
         "aten.sum.dim_IntList" | "aten.sum.default" => sum_vulkan(py, op, args, kwargs),
+        // `mean` is the same reduction with a divisor -- one dispatch, not a
+        // sum followed by a divide (docs/devices/VULKAN10.md §2).
+        "aten.mean.dim" | "aten.mean.default" => sum_vulkan(py, op, args, kwargs),
+        // The gradient seed. A *shader*, unlike `torch.ones(device="vulkan")`
+        // next door, so that a backward pass costs zero host uploads and the
+        // counter stays usable as evidence (docs/devices/VULKAN10.md §3).
+        "aten.ones_like.default" => like_fill(py, op, args, kwargs, 1.0),
+        "aten.zeros_like.default" => like_fill(py, op, args, kwargs, 0.0),
         "aten._local_scalar_dense.default" => local_scalar_dense_vulkan(py, op, args, kwargs),
         "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
         "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
@@ -1967,11 +1976,14 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.gather.default",
         "aten.gelu.default",
         "aten.matmul.default",
+        "aten.mean.default",
+        "aten.mean.dim",
         "aten.mm.default",
         "aten.mul.Scalar",
         "aten.mul.Tensor",
         "aten.native_layer_norm.default",
         "aten.neg.default",
+        "aten.ones_like.default",
         "aten.relu.default",
         "aten.reshape.default",
         "aten.select.int",
@@ -1983,6 +1995,7 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.tanh.default",
         "aten.transpose.int",
         "aten.view.default",
+        "aten.zeros_like.default",
     ]
 }
 
@@ -3325,7 +3338,10 @@ fn sum_vulkan(
     let rank = x.shape.len();
     check_view_rank(op, rank)?;
 
-    let all_dims = op == "aten.sum.default";
+    // `sum.default` and `mean.default` take no `dim`; the `.dim`/`.dim_IntList`
+    // overloads do, which moves every later argument along by two.
+    let all_dims = op == "aten.sum.default" || op == "aten.mean.default";
+    let is_mean = op == "aten.mean.default" || op == "aten.mean.dim";
     let dtype_at = if all_dims { 1 } else { 3 };
     // `dtype=` would mean a conversion, and on this device the only storage a
     // float sum can land in is float32. Widening `check_dtype` to make an
@@ -3412,7 +3428,7 @@ fn sum_vulkan(
     };
 
     shader_u32(op, "output element count", n_out)?;
-    let mut push: Vec<u32> = vec![n_out as u32, n_kept, n_red, 0];
+    let mut push: Vec<u32> = vec![n_out as u32, n_kept, n_red, u32::from(is_mean)];
     push.extend_from_slice(&shape_words);
     push.extend_from_slice(&stride_words);
 
@@ -3429,6 +3445,89 @@ fn sum_vulkan(
         buffer
     };
     wrap_vk(py, VkTensor { buffer: Arc::new(buffer), shape: result_shape }, input.tag())
+}
+
+/// `aten.ones_like.default` and `aten.zeros_like.default` -- a constant fill
+/// of the input's shape, **by a compute shader**.
+///
+/// `factory` above builds `torch.ones(2, 2, device="vulkan")` on the host and
+/// uploads it, and argues there that a fill kernel would prove nothing more.
+/// That argument holds for a constructor and fails for this op, because this
+/// is the one `torch/autograd/__init__.py` `_make_grads` calls to seed every
+/// `loss.backward()`. Uploading here would put a host transfer inside every
+/// training step, and `host_uploads == 0` is the only witness this device has
+/// that a step was not silently served by the CPU -- `docs/devices/VULKAN9.md`
+/// §6 N2 recorded a host twin whose *values were entirely correct* and which
+/// only the counters caught. So the seed runs on the device.
+///
+/// `dtype=` to anything but float32 refuses by name rather than quietly
+/// handing back a float32, which is `check_dtype`'s standing policy
+/// (`docs/devices/VULKAN6.md` §1).
+fn like_fill(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    value: f32,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    check_dtype(op, input.tag())?;
+    if let Some(tag) = crate::aten::dtype_arg(args, kwargs, 1, "dtype")? {
+        if tag != TorchDType::Float32 {
+            return Err(not_implemented(format!(
+                "{op}: dtype={} is not available on the vulkan device, which \
+                 stores float32 only. There is no integer arithmetic on this \
+                 backend (docs/devices/VULKAN6.md §1) and handing back a \
+                 float32 under an int64 request would be the silent \
+                 conversion that policy forbids.",
+                tag.name()
+            )));
+        }
+    }
+    // `_make_grads` passes `memory_format=torch.preserve_format`. Refusing it
+    // would move the wall off the op that is missing and onto an argument,
+    // which is the mistake `zeros_or_empty_like` in `aten.rs` records having
+    // made once already; the two formats that mean "leave the layout alone"
+    // are accepted and everything else still refuses with the format named.
+    crate::aten::reject_memory_format(op, args, kwargs, 5)?;
+    // **`device=` is read, not ignored.** `aten_dispatch` routes here on the
+    // *tensor arguments'* device, so `zeros_like(vk, device="cpu")` arrives
+    // here even though upstream answers it with a real CPU tensor -- and
+    // `aten.rs`'s `zeros_or_empty_like` names that non-meta half as the
+    // interesting one. Answering it with a `VkTensor` would be a wrong
+    // answer wearing the right shape, which is worse than a refusal, so it
+    // refuses with the device named.
+    let label = crate::aten::device_arg_or_label(args, kwargs, 3, "device",
+                                                 &input.device_label())?;
+    if label.kind != "vulkan" {
+        return Err(not_implemented(format!(
+            "{op}: device={} on a vulkan input is not available here. This \
+             kernel fills a VkBuffer on the device; producing a {} tensor \
+             would mean a readback, and this backend refuses rather than \
+             crossing that boundary behind the caller's back \
+             (docs/devices/VULKAN4.md). Move the input with .cpu() first.",
+            label.kind, label.kind
+        )));
+    }
+    let x = input.vk_tensor(op)?.clone();
+    let shape = x.shape.clone();
+    let n: usize = shape.iter().product();
+    let ctx = require(op)?;
+    let bits = value.to_bits();
+    let out = unsafe {
+        let out = ctx.alloc(n.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        if n > 0 {
+            ctx.dispatch_kernel(
+                "fill_f32",
+                FILL_F32_SPV,
+                &[&x.buffer, &x.buffer, &out],
+                [n as u32, bits, 0, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+        out
+    };
+    wrap(py, out, shape, input.tag())
 }
 
 fn all_dims_named(reduced: &[usize], rank: usize) -> bool {

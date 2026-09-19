@@ -1,7 +1,8 @@
 #version 450
 
-// `aten.sum.dim_IntList` and `aten.sum.default` -- a sum over an arbitrary set
-// of axes of a tensor of rank up to 8, one *output* element per invocation.
+// `aten.sum.dim_IntList`, `aten.sum.default`, `aten.mean.dim` and
+// `aten.mean.default` -- a reduction over an arbitrary set of axes of a
+// tensor of rank up to 8, one *output* element per invocation.
 //
 //     out[i] = sum_j src[base(i) + offset(j)]
 //
@@ -27,6 +28,13 @@
 // of each addition forward, which makes this *better* than upstream rather
 // than merely as good, and that is the only honest way to get inside a
 // tolerance derived from upstream's own error without widening it.
+//
+// **`mean` is this kernel with a divisor, not a second pass.** `do_mean`
+// divides the compensated total by the number of terms, once, inside the same
+// invocation. It is deliberately not `sum` followed by `mul.Scalar` by the
+// reciprocal: the reciprocal is a rounding upstream does not do, the same
+// rewrite MoltenVK's fast-math was turned off for (docs/devices/VULKAN5.md
+// §3.1). It is also not a second dispatch, which a counter test pins.
 
 layout(local_size_x = 64) in;
 
@@ -39,7 +47,7 @@ layout(push_constant, std430) uniform Push {
     uint n;          // output elements
     uint n_kept;     // axes that survive, first in the arrays below
     uint n_red;      // axes summed away, immediately after them
-    uint unused;
+    uint do_mean;   // 1 = divide the total by the number of terms (`mean`)
     uint shape[8];   // extent of each axis, kept axes then reduced axes
     uint stride[8];  // source stride of each axis, same order
 } pc;
@@ -87,5 +95,6 @@ void main() {
         sum = t;
     }
 
-    c[i] = sum + comp;
+    float acc = sum + comp;
+    c[i] = (pc.do_mean == 1u) ? (acc / float(total)) : acc;
 }

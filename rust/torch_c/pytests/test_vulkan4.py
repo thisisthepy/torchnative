@@ -588,6 +588,19 @@ EXPECTED_DISPATCHES = {
     # materialising a permuted copy and reducing the last axis.
     "aten.sum.dim_IntList": (1, 1),
     "aten.sum.default": (1, 1),
+    # docs/devices/VULKAN10.md §2 -- `mean` is that same kernel with a
+    # divisor, so it is **one** dispatch and not a sum followed by a divide.
+    # Two would still be on the GPU and would still be the wrong kernel, which
+    # is why the number here is the claim rather than ">= 1".
+    "aten.mean.dim": (1, 1),
+    "aten.mean.default": (1, 1),
+    # docs/devices/VULKAN10.md §3 -- the gradient seed, and a shader rather
+    # than the host-built upload `torch.ones(device="vulkan")` still is. The
+    # 1 here is the difference: an uploading seed would read 0 dispatches and
+    # 1 upload, and the `host_uploads == 0` assertion below is what makes a
+    # whole training step's counters mean anything.
+    "aten.ones_like.default": (1, 1),
+    "aten.zeros_like.default": (1, 1),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -3474,12 +3487,21 @@ _BACKWARD_STILL_MISSING = (
     "aten.masked_fill.Scalar",
 )
 
-# And the wall a *loss*-shaped backward hits, one step before the rule: with
-# `grad_outputs` supplied explicitly the rule runs, but `o.sum().backward()`
-# has to seed the gradient first. `aten.sum.default` is no longer that wall
-# (this round taught it); `aten.ones_like.default` is. Probed below, not
-# inferred.
-_LOSS_BACKWARD_WALL = "aten.ones_like.default"
+# `o.sum().backward()` and `o.mean().backward()` were the walls
+# docs/devices/VULKAN9.md §5 measured -- `aten.ones_like.default` and
+# `aten.mean.default`. Both are taught now and both loss shapes run, so this
+# file's claim about them is the opposite of the one it replaces and is
+# asserted as `"ok"` below rather than as a refusal.
+#
+# The wall that replaces them is a *second* backward into a `.grad` that
+# already exists: `AccumulateGrad`'s in-place add. It is named from the probe,
+# and the reason it is not implemented is the same shape as the `is_causal`
+# four -- **no op on this device writes in place.** `detach`/`alias` share the
+# `VkBuffer` (vulkan.rs `dispatch` says so in as many words), so an `add_`
+# would write through an alias that other tensors are reading, and it would do
+# it *silently*. Teaching it needs a sharing analysis this device does not
+# have, not a kernel. docs/devices/VULKAN10.md §6.
+_SECOND_ACCUMULATION_WALL = "aten.add_.Tensor"
 
 
 def _backward_probe(shape, payload):
@@ -3613,11 +3635,12 @@ def test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason()
     test pins both halves: the ops are still absent, **and** the reason they
     are unreachable is still true.
 
-    It also pins the one wall a loss-shaped backward still hits.
-    `o.sum().backward()` needs a gradient seed before the rule is reached;
-    docs/devices/VULKAN8.md §4 listed `aten.sum.default` and
-    `aten.ones_like.default` together for that, and only the first of them is
-    taught now. The wall is named from a live probe below, not from this list.
+    It also pins where a loss-shaped backward now gets to. Both walls
+    docs/devices/VULKAN9.md §5 measured -- `o.sum().backward()` at
+    `aten.ones_like.default` and `o.mean().backward()` at
+    `aten.mean.default` -- are gone, so those two are asserted to **run**, and
+    the wall that replaced them (a second accumulation into an existing
+    `.grad`) is named from the same live probe rather than from this list.
     """
     if _vulkan_or_skip("the remaining sdpa-backward walls") is None:
         return
@@ -3658,17 +3681,30 @@ def test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason()
         f"{walls['is_causal_forward']}")
     assert "is_causal=False" in walls["is_causal_forward"], walls["is_causal_forward"]
 
-    assert walls["loss_backward"].startswith("NotImplementedError"), (
-        f"`o.sum().backward()` now works on this device: {walls['loss_backward']}")
-    # The refusal message *lists every taught op*, so a substring search would
-    # match `aten.sum.default` in the list and call it the wall. The op that
-    # actually stopped is the one the message opens with, before
-    # `: not implemented`, and that is what is read here.
-    named = walls["loss_backward"].split(": ", 1)[1].split(":", 1)[0].strip()
-    assert named == _LOSS_BACKWARD_WALL, (
-        f"the loss-shaped backward stopped at {named!r}, not at the op this "
-        f"test names ({_LOSS_BACKWARD_WALL!r}): {walls['loss_backward'][:200]}")
-    print(f"   next wall for `o.sum().backward()`: {named}")
+    # Both loss shapes docs/devices/VULKAN9.md §5 measured as walls now run.
+    assert walls["loss_backward"] == "ok", (
+        f"`o.sum().backward()` stopped again: {walls['loss_backward'][:300]}")
+    assert walls["mean_backward"] == "ok", (
+        f"`o.mean().backward()` stopped again: {walls['mean_backward'][:300]}")
+
+    # And what replaced them. The refusal message *lists every taught op*, so
+    # a substring search would match `aten.add.Tensor` in the list and call it
+    # the wall. The op that actually stopped is the one the message opens
+    # with, before `: not implemented`, and that is what is read here.
+    assert walls["second_accumulation"].startswith("NotImplementedError"), (
+        f"a second backward into an existing `.grad` now works on this "
+        f"device: {walls['second_accumulation']}. That means an in-place "
+        f"write landed here, and vulkan.rs `dispatch` states that no op on "
+        f"this device writes in place because `detach`/`alias` share the "
+        f"buffer -- so this test must be rewritten against whatever made it "
+        f"sound, not deleted")
+    named = walls["second_accumulation"].split(": ", 1)[1].split(":", 1)[0].strip()
+    assert named == _SECOND_ACCUMULATION_WALL, (
+        f"the second accumulation stopped at {named!r}, not at the op this "
+        f"test names ({_SECOND_ACCUMULATION_WALL!r}): "
+        f"{walls['second_accumulation'][:200]}")
+    print(f"   `o.sum().backward()` and `o.mean().backward()`: ok; "
+          f"next wall (second accumulation): {named}")
 
 
 _REMAINING_WALLS_PROBE = r"""
@@ -3698,6 +3734,23 @@ except Exception as e:
 
 q, k, v = trio()
 try:
+    o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    o.mean().backward()
+    out["mean_backward"] = "ok"
+except Exception as e:
+    out["mean_backward"] = f"{type(e).__name__}: {e}"
+
+# A second backward into a `.grad` that already exists -- the in-place add.
+w = torch.ones(2, 2, device="vulkan").requires_grad_(True)
+try:
+    for _ in range(2):
+        (w * w).sum().backward()
+    out["second_accumulation"] = "ok"
+except Exception as e:
+    out["second_accumulation"] = f"{type(e).__name__}: {e}"
+
+q, k, v = trio()
+try:
     torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     out["is_causal_forward"] = "ok"
 except Exception as e:
@@ -3705,6 +3758,603 @@ except Exception as e:
 
 json.dump(out, sys.stdout)
 """
+
+
+# ---------------------------------------------------------------------------
+# From "a kernel's gradient agrees" to "a person can train on this device"
+# -- docs/devices/VULKAN10.md
+#
+# docs/devices/VULKAN9.md §5 left the gap named by a live probe rather than
+# inferred: the sdpa gradient rule runs when `grad_outputs` is handed to it,
+# but a *loss*-shaped backward has to seed the gradient first and stops at
+# `aten.ones_like.default`, and a mean-shaped one stops at `aten.mean.default`.
+# Those two are gradient seeding and loss reduction, which is the whole of
+# what stands between a proven kernel and an optimisation step.
+# ---------------------------------------------------------------------------
+
+_ONES_LIKE = "aten.ones_like.default"
+_ZEROS_LIKE = "aten.zeros_like.default"
+_MEAN_DIM = "aten.mean.dim"
+_MEAN_ALL = "aten.mean.default"
+
+LIKE_SHAPES = ((), (1,), (4, 5), (2, 3, 4), (1, 2, 3, 4), (129,))
+
+
+def test_ones_like_and_zeros_like_are_filled_by_a_shader_not_by_an_upload():
+    """The gradient seed -- and it is a *kernel*, deliberately.
+
+    `torch.ones(..., device="vulkan")` on this device builds the fill on the
+    host and uploads it (`vulkan.rs` `factory`), and that was the honest
+    minimum for a constructor called once at the edge of a program. It is not
+    the honest minimum **inside a backward pass**: `torch/autograd/__init__.py`
+    `_make_grads` calls `torch.ones_like(out, memory_format=preserve_format)`
+    to seed every `loss.backward()`, so an uploading `ones_like` would put a
+    host round trip in the middle of every training step and make
+    `host_uploads == 0` unavailable as evidence that the step stayed on the
+    device. So this is a shader, and this test asserts exactly that: one
+    dispatch, **zero uploads**, zero downloads.
+
+    The values are constants, so they are held to bit equality rather than to
+    a tolerance -- there is no rounding for a tolerance to be about.
+    """
+    if _vulkan_or_skip("the ones_like/zeros_like fill") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for i, shape in enumerate(LIKE_SHAPES):
+        n = 1
+        for d in shape:
+            n *= d
+        a = _rand(torch, *shape, seed=4100 + i) if shape else _rand(torch, 1, seed=4100)
+        src = _to_vulkan(_cpu(_up_flat(a)[:n] if shape else [1.5], shape))
+        for op, want in ((_ONES_LIKE, 1.0), (_ZEROS_LIKE, 0.0)):
+            before = _counters()
+            out = _C._aten_dispatch(op, src)
+            d = _delta(before, _counters())
+            assert list(out.shape) == list(shape), (op, out.shape, shape)
+            assert str(out.device) == "vulkan", out.device
+            assert d["shader_dispatches"] == 1, (
+                f"{op}{list(shape)} ran {d['shader_dispatches']} compute "
+                f"shaders, expected exactly 1: {d}")
+            assert d["host_uploads"] == 0, (
+                f"{op}{list(shape)} uploaded {d['host_uploads']} buffer(s); "
+                f"the fill happens on the device or `host_uploads == 0` stops "
+                f"being readable as evidence about a training step: {d}")
+            assert d["host_downloads"] == 0, d
+            got = _flat(_to_cpu(out))
+            assert got == [want] * n, (op, shape, got[:8])
+    # And the `memory_format=preserve_format` that `_make_grads` actually
+    # passes is accepted rather than refused -- a refusal there would move the
+    # wall off the op that is missing and onto an argument.
+    out = _C._aten_dispatch(_ONES_LIKE, _to_vulkan(_cpu([1.0, 2.0], (2,))),
+                            memory_format=_C.preserve_format)
+    assert _flat(_to_cpu(out)) == [1.0, 1.0], _flat(_to_cpu(out))
+
+
+def test_ones_like_refuses_a_dtype_this_device_cannot_hold():
+    """Not a silent float32 in an int64's clothing.
+
+    `check_dtype` admits float32 and nothing else on this backend
+    (docs/devices/VULKAN6.md §1). `ones_like(x, dtype=torch.int64)` is a real
+    request upstream answers, and answering it here by ignoring the dtype
+    would be exactly the silent conversion that policy exists to forbid.
+    """
+    if _vulkan_or_skip("the ones_like dtype refusal") is None:
+        return
+    for op in (_ONES_LIKE, _ZEROS_LIKE):
+        try:
+            _C._aten_dispatch(op, _to_vulkan(_cpu([1.0, 2.0], (2,))), dtype=_C.int64)
+        except NotImplementedError as e:
+            assert "int64" in str(e), str(e)
+            assert "float32" in str(e), str(e)
+        else:
+            raise AssertionError(f"{op}(dtype=int64) did not refuse on the vulkan device")
+
+
+
+def test_ones_like_refuses_a_device_it_would_have_to_leave_to_honour():
+    """The subtler refusal, and the one no counter would have caught.
+
+    `aten_dispatch` picks this backend from the *tensor arguments*, so
+    `zeros_like(vk, device="cpu")` reaches the vulkan kernel -- while upstream
+    answers that call with a real CPU tensor, and `aten.rs`'s
+    `zeros_or_empty_like` calls that non-meta half "the interesting half" in
+    as many words. Ignoring the argument gives back a `VkTensor`: a wrong
+    answer in the right shape, with the right values in it, on a device that
+    ran the right number of shaders. Neither the agreement sweep nor the
+    dispatch counters can see that, which is why it is asserted here.
+    """
+    if _vulkan_or_skip("the ones_like/zeros_like device refusal") is None:
+        return
+    for op in (_ONES_LIKE, _ZEROS_LIKE):
+        for kind in ("cpu", "meta"):
+            try:
+                out = _C._aten_dispatch(op, _to_vulkan(_cpu([1.0, 2.0], (2,))),
+                                        device=_C.device(kind))
+            except NotImplementedError as e:
+                assert kind in str(e), str(e)
+            else:
+                raise AssertionError(
+                    f"{op}(device={kind!r}) on a vulkan input returned a "
+                    f"{out.device} tensor instead of refusing; upstream "
+                    f"answers that call with a {kind} tensor")
+
+
+# (shape, dim, keepdim) -- the same sweep shape as SUM_CASES, because `mean`
+# is the same kernel with a divisor and the interesting cases are the same:
+# a leading axis, two non-adjacent axes, an empty list, `dim=None`, and a
+# 512-long axis where the division's rounding has somewhere to show.
+MEAN_CASES = SUM_CASES
+
+
+def _mean_upstream(torch, a, dim, keepdim):
+    return torch.ops.aten.mean.dim(a, dim, keepdim)
+
+
+def test_mean_over_dims_agrees_with_upstream_at_a_derived_tolerance():
+    """`aten.mean.dim` -- the loss reduction, element-wise against upstream.
+
+    It is `sum_dims_f32` with a divisor, not a second kernel and not a
+    `sum` followed by a `mul.Scalar` by the reciprocal: the reciprocal is a
+    rounding upstream does not do, which is the same rewrite
+    docs/devices/VULKAN5.md §3.1 turned MoltenVK's fast-math off for. The
+    division happens once, in the shader, on the compensated total.
+
+    The tolerance is re-derived by `_assert_agreement` from this population's
+    own upstream float32-vs-float64 error;
+    `test_a_wrong_mean_reduction_is_rejected_by_this_tolerance` proves it bites.
+    """
+    if _vulkan_or_skip("the mean.dim agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, (shape, dim, keepdim) in enumerate(MEAN_CASES):
+        a = _rand(torch, *shape, seed=4200 + i)
+        out = _C._aten_dispatch(_MEAN_DIM, _to_vulkan(_cpu(_up_flat(a), shape)),
+                                dim, keepdim)
+        want32 = _mean_upstream(torch, a, dim, keepdim)
+        truth = _mean_upstream(torch, a.double(), dim, keepdim)
+        assert list(out.shape) == list(want32.shape), (
+            f"mean{list(shape)} dim={dim} keepdim={keepdim}: shape "
+            f"{list(out.shape)}, upstream {list(want32.shape)}")
+        assert str(out.device) == "vulkan", out.device
+        cases.append((f"mean{list(shape)} dim={dim} keepdim={keepdim}",
+                      _flat(_to_cpu(out)), _up_flat(want32), _up_flat(truth)))
+    _assert_agreement("mean.dim", cases)
+
+
+def test_mean_default_agrees_with_upstream_at_a_derived_tolerance():
+    """`aten.mean.default` -- the whole-tensor form a scalar loss is."""
+    if _vulkan_or_skip("the mean.default agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, shape in enumerate(((2, 3, 4), (1025,), (4, 5), (2, 512))):
+        a = _rand(torch, *shape, seed=4300 + i)
+        out = _C._aten_dispatch(_MEAN_ALL, _to_vulkan(_cpu(_up_flat(a), shape)))
+        want32 = torch.ops.aten.mean.default(a)
+        truth = torch.ops.aten.mean.default(a.double())
+        assert list(out.shape) == list(want32.shape), (out.shape, want32.shape)
+        assert str(out.device) == "vulkan", out.device
+        cases.append((f"mean_all{list(shape)}", _flat(_to_cpu(out)),
+                      [want32.item()], [truth.item()]))
+    _assert_agreement("mean.default", cases)
+
+
+def test_a_wrong_mean_reduction_is_rejected_by_this_tolerance():
+    """The teeth check, and the wrong answers are the ones this kernel
+    could actually have been: dividing by the *kept* extent instead of the
+    reduced one (an off-by-one-axis in the divisor, which a `sum` test could
+    never see), and forgetting to divide at all.
+    """
+    if _vulkan_or_skip("the mean tolerance teeth check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    a = _rand(torch, 6, 7, seed=4401)
+    want32 = torch.ops.aten.mean.dim(a, [-1], False)
+    truth = torch.ops.aten.mean.dim(a.double(), [-1], False)
+
+    _assert_agreement("mean teeth (control: the correct value)",
+                      [("control", _up_flat(want32), _up_flat(want32), _up_flat(truth))])
+
+    wrong_divisor = torch.ops.aten.sum.dim_IntList(a, [-1], False) / 6.0
+    undivided = torch.ops.aten.sum.dim_IntList(a, [-1], False)
+
+    margins = []
+    for name, wrong in (("the kept extent as the divisor", wrong_divisor),
+                        ("no division at all", undivided)):
+        got = _up_flat(wrong.float())
+        try:
+            _assert_agreement(f"mean teeth ({name})",
+                              [(name, got, _up_flat(want32), _up_flat(truth))])
+        except AssertionError:
+            margins.append((name, _elem_ratio(got, _up_flat(want32), _up_flat(truth))))
+        else:
+            raise AssertionError(
+                f"the derived tolerance accepted a mean computed with {name}; "
+                f"it is too wide to be evidence of anything")
+    for name, ratio in margins:
+        print(f"   mean teeth: {name} rejected at {ratio:,.0f}x upstream's own error")
+        assert ratio > 1e3, (name, ratio)
+
+
+def test_the_mean_reduction_ran_on_the_gpu_in_exactly_one_dispatch():
+    """One dispatch, not two -- `sum` then `div` would also be on the GPU and
+    would also be the wrong kernel, and only a counter can tell them apart.
+    """
+    if _vulkan_or_skip("the mean dispatch-counter check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for i, (shape, dim, keepdim) in enumerate(MEAN_CASES):
+        a = _rand(torch, *shape, seed=4500 + i)
+        on_device = _to_vulkan(_cpu(_up_flat(a), shape))
+        before = _counters()
+        out = _C._aten_dispatch(_MEAN_DIM, on_device, dim, keepdim)
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 1, (
+            f"mean{list(shape)} dim={dim} ran {d['shader_dispatches']} compute "
+            f"shaders, expected exactly 1: {d}")
+        assert d["host_downloads"] == 0, d
+        assert d["host_uploads"] == 0, d
+        assert str(out.device) == "vulkan", out.device
+
+    on_device = _to_vulkan(_cpu(_up_flat(_rand(torch, 3, 4, seed=4600)), (3, 4)))
+    before = _counters()
+    _C._aten_dispatch(_MEAN_ALL, on_device)
+    d = _delta(before, _counters())
+    assert d["shader_dispatches"] == 1, d
+    assert d["host_downloads"] == 0, d
+    assert d["host_uploads"] == 0, d
+
+
+# ---------------------------------------------------------------------------
+# A training step -- forward, loss, backward, parameter update
+# ---------------------------------------------------------------------------
+
+# A 4->3 linear layer, mean-squared error, one SGD step. Small on purpose: the
+# claim is that a step *completes on the device and agrees*, and a bigger
+# tensor would only make the float32 reduction error larger without making the
+# claim stronger. The update is written functionally (`w - lr * w.grad`)
+# rather than in place, because **no op on this device writes in place** --
+# `detach`/`alias` share the buffer (vulkan.rs `dispatch`), so an in-place
+# update would be unsound here rather than merely unimplemented.
+_TRAIN_STEP_PROBE = r"""
+import json, sys
+import torch
+
+req = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+lr = req["lr"]
+
+
+def dev(flat, shape):
+    return torch.tensor(flat, dtype=torch.float32).reshape(shape).to("vulkan")
+
+
+x = dev(req["x"], req["x_shape"])
+y = dev(req["y"], req["y_shape"])
+w = dev(req["w"], req["w_shape"]).requires_grad_(True)
+
+# The counters bracket the whole step: forward, loss, backward, update. The
+# readback below is this probe's own way of getting the answer out to the
+# process that owns the oracle and is deliberately outside the bracket.
+before = torch._C._vulkan_counters()
+try:
+    pred = x @ w
+    diff = pred - y
+    loss = (diff * diff).mean()
+    loss.backward()
+    with torch.no_grad():
+        updated = w - lr * w.grad
+    out["step"] = "ok"
+except Exception as e:
+    out["step"] = f"{type(e).__name__}: {e}"
+    updated = None
+    loss = None
+after = torch._C._vulkan_counters()
+out["counters"] = {k: after[k] - before[k] for k in after}
+if updated is not None:
+    out["devices"] = {"updated": str(updated.device), "grad": str(w.grad.device),
+                      "loss": str(loss.device)}
+    out["updated"] = updated.cpu().reshape(-1).tolist()
+    out["grad"] = w.grad.cpu().reshape(-1).tolist()
+    out["loss"] = float(loss.cpu().reshape(-1).tolist()[0]) if loss.dim() == 0 or loss.numel() == 1 else None
+    out["w_before"] = w.detach().cpu().reshape(-1).tolist()
+json.dump(out, sys.stdout)
+"""
+
+_TRAIN_N, _TRAIN_IN, _TRAIN_OUT = 8, 4, 3
+_TRAIN_LR = 0.1
+
+
+def _train_payload(torch):
+    x = _rand(torch, _TRAIN_N, _TRAIN_IN, seed=4700)
+    y = _rand(torch, _TRAIN_N, _TRAIN_OUT, seed=4701)
+    w = _rand(torch, _TRAIN_IN, _TRAIN_OUT, seed=4702)
+    return {
+        "lr": _TRAIN_LR,
+        "x": _up_flat(x), "x_shape": [_TRAIN_N, _TRAIN_IN],
+        "y": _up_flat(y), "y_shape": [_TRAIN_N, _TRAIN_OUT],
+        "w": _up_flat(w), "w_shape": [_TRAIN_IN, _TRAIN_OUT],
+    }
+
+
+def _train_probe(payload):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _TRAIN_STEP_PROBE],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=900)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    return json.loads(proc.stdout)
+
+
+def _upstream_step(torch, payload):
+    """The same step upstream, on the CPU, from the *same numbers*."""
+    def t(key, shape_key):
+        return torch.tensor(payload[key], dtype=torch.float32).reshape(payload[shape_key])
+
+    x = t("x", "x_shape")
+    y = t("y", "y_shape")
+    w = t("w", "w_shape").requires_grad_(True)
+    pred = x @ w
+    diff = pred - y
+    loss = (diff * diff).mean()
+    loss.backward()
+    with torch.no_grad():
+        updated = w - payload["lr"] * w.grad
+    return loss, w.grad, updated
+
+
+def test_a_training_step_runs_end_to_end_on_the_vulkan_device_and_agrees_with_upstream():
+    """**A parameter update, on the device, with the weights actually moving.**
+
+    docs/devices/VULKAN9.md proved one kernel's gradient. This proves a *step*:
+    forward (`matmul`), loss (`sub`, `mul`, `mean`), backward (seeded by
+    `ones_like`, through the `mean` and `mul` and `matmul` rules of tape.rs),
+    and an SGD update. The measurement is in a separate interpreter running the
+    vendored shim, fed the *same flat numbers* the oracle here differentiates,
+    so neither side depends on the two RNGs agreeing.
+
+    Three things are asserted and they are not the same claim:
+
+      * the updated weights agree element-wise with the same step run upstream
+        on the CPU, at a tolerance `_assert_agreement` re-derives;
+      * the weights **changed** -- a gradient of exactly zero would satisfy
+        agreement while proving nothing about the backward;
+      * the gradient and the loss agree too, so a step that landed on the
+        right weights by cancelling two errors is not read as a pass.
+    """
+    if _vulkan_or_skip("the vulkan training step") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    payload = _train_payload(torch)
+    got = _train_probe(payload)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            "the vulkan training step: the vendored-tree subprocess has no loader")
+        return
+    assert got["step"] == "ok", (
+        f"a training step did not complete on the vulkan device: {got['step']}\n"
+        f"counters at the refusal: {got['counters']}")
+    assert got["devices"]["updated"] == "vulkan", got["devices"]
+    assert got["devices"]["grad"] == "vulkan", got["devices"]
+    assert got["devices"]["loss"] == "vulkan", got["devices"]
+
+    loss32, grad32, updated32 = _upstream_step(torch, payload)
+    loss64, grad64, updated64 = _upstream_step(torch, payload)
+
+    # The weights moved. Without this, a backward that produced zeros would
+    # agree with an upstream step that also produced zeros -- and it does not:
+    # the biggest coordinate moves by the margin printed below.
+    moved = max(abs(a - b) for a, b in zip(got["updated"], got["w_before"]))
+    assert moved > 1e-3, (
+        f"the parameters did not move: worst coordinate changed by {moved:.3e}. "
+        f"An unchanged weight satisfies agreement and proves nothing.")
+    print(f"   training step: worst parameter moved {moved:.3e} at lr={_TRAIN_LR}")
+
+    _assert_agreement("training step (loss, grad, updated weights)", [
+        ("loss", [got["loss"]], [loss32.item()],
+         [float(loss64.double().item())]),
+        ("grad_w", got["grad"], _up_flat(grad32), _up_flat(grad64.double())),
+        ("updated w", got["updated"], _up_flat(updated32),
+         _up_flat(updated64.double())),
+    ])
+
+
+def test_the_training_step_never_left_the_gpu():
+    """The claim values cannot make (docs/devices/VULKAN9.md §4).
+
+    A step that downloaded the weights, ran the whole thing in candle on the
+    host and uploaded the answer would pass the agreement test above *exactly*
+    and would report `.device == "vulkan"` for every tensor in it. The only
+    witness that separates the two is the counter pair, so this asserts
+    **zero uploads and zero downloads** across forward, loss, backward and
+    update -- the gradient seed included, which is why `ones_like` is a shader
+    and not an upload.
+    """
+    if _vulkan_or_skip("the vulkan training step counters") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    got = _train_probe(_train_payload(torch))
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            "the vulkan training step counters: the vendored-tree subprocess "
+            "has no loader")
+        return
+    assert got["step"] == "ok", got["step"]
+    d = got["counters"]
+    assert d["host_downloads"] == 0, (
+        f"the training step read {d['host_downloads']} buffer(s) back to the "
+        f"host mid-step; it runs on the device or it does not run: {d}")
+    assert d["host_uploads"] == 0, (
+        f"the training step uploaded {d['host_uploads']} buffer(s) mid-step; "
+        f"every input was already on the device before the bracket: {d}")
+    # A floor, not an exact count: the exact number is `tape.rs`'s to choose
+    # and pinning it would break this test on a refactor that changes nothing
+    # observable. What must not move is the pair of zeros above, and a
+    # *collapse* -- the shape a host fallback has -- trips this.
+    assert d["shader_dispatches"] >= 10, (
+        f"the whole step ran only {d['shader_dispatches']} compute shaders; a "
+        f"forward, a loss, a backward and an update cannot be that few on a "
+        f"device with no fusion: {d}")
+    print(f"   training step on vulkan: {d['shader_dispatches']} compute shaders, "
+          f"{d['host_uploads']} uploads, {d['host_downloads']} downloads")
+
+
+# ---------------------------------------------------------------------------
+# Three steps, not one -- the loss has to actually come down
+# ---------------------------------------------------------------------------
+
+# One step proves the wiring. It does not prove the *sign*: a gradient with
+# the wrong sign, or one scaled by a constant, would agree with an upstream
+# step computed the same wrong way only if upstream were wrong too -- but it
+# would sail through a test that only asks "did the weights move". So this
+# runs three steps and requires the loss to fall monotonically, which is a
+# property of the arithmetic rather than of the comparison.
+_TRAIN_LOOP_PROBE = r"""
+import json, sys
+import torch
+
+req = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+
+def dev(flat, shape):
+    return torch.tensor(flat, dtype=torch.float32).reshape(shape).to("vulkan")
+
+
+x = dev(req["x"], req["x_shape"])
+y = dev(req["y"], req["y_shape"])
+w = dev(req["w"], req["w_shape"]).requires_grad_(True)
+
+before = torch._C._vulkan_counters()
+losses = []
+try:
+    for _ in range(req["steps"]):
+        diff = x @ w - y
+        loss = (diff * diff).mean()
+        loss.backward()
+        losses.append(loss)
+        # A fresh leaf each step rather than an in-place update: **no op on
+        # this device writes in place** (vulkan.rs `dispatch` -- `detach` and
+        # `alias` share the buffer), so `w -= lr * w.grad` would be unsound
+        # here rather than merely unimplemented, and a fresh leaf also gives
+        # `AccumulateGrad` an empty `.grad` to store into.
+        with torch.no_grad():
+            w = (w - req["lr"] * w.grad).requires_grad_(True)
+    out["loop"] = "ok"
+except Exception as e:
+    out["loop"] = f"{type(e).__name__}: {e}"
+after = torch._C._vulkan_counters()
+out["counters"] = {k: after[k] - before[k] for k in after}
+out["losses"] = [float(t.cpu().reshape(-1).tolist()[0]) for t in losses]
+out["w_final"] = w.detach().cpu().reshape(-1).tolist()
+json.dump(out, sys.stdout)
+"""
+
+_TRAIN_STEPS = 3
+
+
+def _upstream_loop(torch, payload):
+    def t(key, shape_key):
+        return torch.tensor(payload[key], dtype=torch.float32).reshape(payload[shape_key])
+
+    x = t("x", "x_shape")
+    y = t("y", "y_shape")
+    w = t("w", "w_shape").requires_grad_(True)
+    losses = []
+    for _ in range(payload["steps"]):
+        diff = x @ w - y
+        loss = (diff * diff).mean()
+        loss.backward()
+        losses.append(loss.item())
+        with torch.no_grad():
+            w = (w - payload["lr"] * w.grad).requires_grad_(True)
+    return losses, w.detach()
+
+
+def test_three_training_steps_drive_the_loss_down_and_track_upstream():
+    """**Training, not one step of it.** docs/devices/VULKAN10.md §5.
+
+    Three SGD steps on the device, and two claims a single step cannot make:
+
+      * the loss falls at every step. A gradient with the wrong sign or a
+        mis-scaled reduction still "moves the weights", and still agrees with
+        an upstream step if the comparison is the only check. A falling loss
+        is a property of the arithmetic itself.
+      * the whole loop stays on the device -- zero uploads and zero downloads
+        across all three steps, so nothing is re-seeded from the host between
+        them.
+
+    The loss sequence and the final weights are then compared element-wise
+    with the same loop run upstream on the CPU from the same numbers, which is
+    where error would show if it were accumulating.
+    """
+    if _vulkan_or_skip("the vulkan training loop") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    payload = dict(_train_payload(torch), steps=_TRAIN_STEPS)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _TRAIN_LOOP_PROBE],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=900)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    got = json.loads(proc.stdout)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            "the vulkan training loop: the vendored-tree subprocess has no loader")
+        return
+    assert got["loop"] == "ok", (
+        f"the training loop stopped: {got['loop']}\ncounters: {got['counters']}")
+    assert len(got["losses"]) == _TRAIN_STEPS, got["losses"]
+
+    falls = all(b < a for a, b in zip(got["losses"], got["losses"][1:]))
+    assert falls, (
+        f"the loss did not fall monotonically over {_TRAIN_STEPS} steps: "
+        f"{got['losses']}. A step that moves the weights in the wrong "
+        f"direction still moves them.")
+    print(f"   training loop on vulkan: losses "
+          f"{' -> '.join(f'{v:.6f}' for v in got['losses'])}, "
+          f"{got['counters']['shader_dispatches']} compute shaders, "
+          f"{got['counters']['host_uploads']} uploads, "
+          f"{got['counters']['host_downloads']} downloads")
+
+    d = got["counters"]
+    assert d["host_uploads"] == 0 and d["host_downloads"] == 0, (
+        f"the training loop crossed the host boundary {d['host_uploads']} up / "
+        f"{d['host_downloads']} down; every input was on the device before "
+        f"the bracket and the loop never needs to leave it: {d}")
+
+    losses32, w32 = _upstream_loop(torch, payload)
+    losses64, w64 = _upstream_loop(torch, payload)
+    _assert_agreement("training loop (losses, final weights)", [
+        ("losses", got["losses"], losses32, [float(v) for v in losses64]),
+        ("final w", got["w_final"], _up_flat(w32), _up_flat(w64.double())),
+    ])
 
 
 # ---------------------------------------------------------------------------

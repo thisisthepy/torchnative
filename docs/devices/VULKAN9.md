@@ -17,7 +17,7 @@
 | **backward 가 이제 되는가** | **예.** dq·dk·dv 전부. 최악 **1.441e-07** (upstream 자신 1.417e-07) (§4) |
 | 호스트로 떨어지지 않았음은 무엇이 보증하나 | 디스패치 카운터. backward 는 셰이더 **17 회**, 업로드 0, 읽어오기 **0** (§4) |
 | 그 카운터에 이빨이 있나 | **예.** 호스트 쌍둥이로 바꾸면 **값은 전부 맞고 카운터만 빨개진다** (§6 N2) |
-| 다음 벽은 | **`aten.ones_like.default`** — `o.sum().backward()` 의 gradient 시드. 실측 (§5) |
+| 다음 벽은 | **`aten.ones_like.default`** — `o.sum().backward()` 의 gradient 시드. 실측 (§5). **`docs/devices/VULKAN10.md` 가 그것과 `mean` 을 치웠고, 훈련 한 스텝이 이제 이 장치에서 돕니다** |
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 52 -->
@@ -215,8 +215,10 @@ N3 을 처음 돌렸을 때 일치 스윕 둘만 빨갛고 **backward 테스트�
 
 - **`aten.ones_like.default` · `aten.zeros_like.default`.** §5 의 다음 벽. 이것을 가르치면
   `o.sum().backward()` 가 끝까지 돌지만, 이 회차는 `sdpa_backward` 의 벽 하나를 끝까지
-  증명하는 데 썼습니다.
+  증명하는 데 썼습니다. **(`docs/devices/VULKAN10.md` 가 구현했습니다 — 시드는 업로드가
+  아니라 셰이더입니다.)**
 - **`aten.mean.default` · `aten.mean.dim`.** 같은 커널에 나눗셈 하나지만 §5 의 세 번째 줄입니다.
+  **(`docs/devices/VULKAN10.md` 가 구현했습니다 — 같은 커널, divisor 하나, 디스패치 1 회.)**
 - **`is_causal` 분기의 네 op.** §5.1 — 실행시킬 수 없으므로 증명할 수 없습니다.
 - **`dim=None` + `keepdim=True`.** 이 장치는 `aten.rs` 의 dense 커널과 **같게** 랭크 0 으로
   접습니다(`sum_all`). upstream 의 `torch.sum(x, dim=None, keepdim=True)` 는 전부 1 인 shape 을

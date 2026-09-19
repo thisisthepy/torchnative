@@ -7229,6 +7229,16 @@ def _install_engine(module) -> None:
         makes this exactly one copy in both cases rather than two in one.
         """
         dense = gradient.contiguous()
+        if dense.device.type == "vulkan":
+            # **A device with no strides at all** (docs/devices/VULKAN4.md §6):
+            # a `VkTensor` is a shape and a contiguous buffer, so `contiguous()`
+            # here shares the input's `VkBuffer` rather than materialising, and
+            # `data_ptr()` has no host address to answer with -- it refuses,
+            # which is what stopped the first training step on this device
+            # (docs/devices/VULKAN10.md §4). The test above therefore cannot be
+            # asked; the answer it would give is always "same storage", so the
+            # clone is unconditional and is a real on-device copy.
+            return dense.clone()
         if dense.data_ptr() == gradient.data_ptr():
             dense = dense.clone()
         return dense
