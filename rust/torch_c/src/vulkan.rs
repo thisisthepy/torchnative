@@ -98,6 +98,7 @@ spv!(GATHER_U32_I32_SPV, "gather_u32_i32");
 spv!(TANH_F32_SPV, "tanh_f32");
 spv!(BROADCAST_BINARY_F32_SPV, "broadcast_binary_f32");
 spv!(LOGSUMEXP_LASTDIM_F32_SPV, "logsumexp_lastdim_f32");
+spv!(SUM_DIMS_F32_SPV, "sum_dims_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -1107,6 +1108,7 @@ pub fn dispatch(
         // CPU kernel rather than within a tolerance (docs/devices/VULKAN4.md §4).
         "aten.add.Tensor" => add_tensor(py, op, args, kwargs),
         "aten.all.default" => all_vulkan(py, op, args, kwargs),
+        "aten.sum.dim_IntList" | "aten.sum.default" => sum_vulkan(py, op, args, kwargs),
         "aten._local_scalar_dense.default" => local_scalar_dense_vulkan(py, op, args, kwargs),
         "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
         "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
@@ -1975,6 +1977,8 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.select.int",
         "aten.slice.Tensor",
         "aten.sub.Tensor",
+        "aten.sum.default",
+        "aten.sum.dim_IntList",
         "aten.t.default",
         "aten.tanh.default",
         "aten.transpose.int",
@@ -3286,5 +3290,148 @@ fn logsumexp_lastdim(
         buffer
     };
     wrap_vk(py, VkTensor { buffer: Arc::new(buffer), shape: out_shape }, input.tag())
+}
+
+/// `aten.sum.dim_IntList` and `aten.sum.default` -- a sum over an arbitrary
+/// set of axes, in one dispatch.
+///
+/// **The interesting constraint is that this device has no strides.** A
+/// `VkTensor` is a shape and a contiguous buffer (`docs/devices/VULKAN4.md`
+/// §6), so the usual CPU move -- permute the reduced axes to the end and call
+/// a last-axis kernel -- is not available without materialising a transposed
+/// copy first, which would be a second allocation and a second dispatch for
+/// every reduction. Instead the *source stride of every axis* is derived here
+/// from the input shape (`stride[d] = prod(shape[d+1..])`, which is exactly
+/// what "contiguous" means) and handed to the shader, which walks the kept
+/// index space and the reduced index space separately. An arbitrary `dim`
+/// list is then one kernel launch whatever the axes are, and the two
+/// non-adjacent axes in the test sweep exercise precisely that.
+///
+/// The axes are handed over already split -- kept axes first, in output order,
+/// then the reduced ones -- so the shader does no set membership at runtime.
+///
+/// `aten.sum.default` is the same call with every axis reduced and rank-0
+/// output; it is not a separate kernel, and `test_sum_default_agrees_...`
+/// measures it separately anyway rather than taking that on trust.
+fn sum_vulkan(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let rank = x.shape.len();
+    check_view_rank(op, rank)?;
+
+    let all_dims = op == "aten.sum.default";
+    let dtype_at = if all_dims { 1 } else { 3 };
+    // `dtype=` would mean a conversion, and on this device the only storage a
+    // float sum can land in is float32. Widening `check_dtype` to make an
+    // integer accumulator pass is the move docs/devices/VULKAN6.md §1 exists
+    // to forbid, so this refuses by name instead.
+    if let Some(tag) = crate::aten::dtype_arg(args, kwargs, dtype_at, "dtype")? {
+        if tag != TorchDType::Float32 {
+            return Err(not_implemented(format!(
+                "{op}: dtype={} is not available on the vulkan device, which \
+                 accumulates and stores float32 only. There is no integer \
+                 arithmetic on this backend (docs/devices/VULKAN6.md §1) and \
+                 widening that policy to make a reduction pass would be the \
+                 silent conversion the policy forbids.",
+                tag.name()
+            )));
+        }
+    }
+    // torch: `dim=None` reduces everything to a scalar, an *empty* list also
+    // reduces everything (it is not "reduce nothing"), and any other list
+    // names the axes. This mirrors `sum_or_mean` in `aten.rs` deliberately --
+    // the two kernels answering the same schema differently is the shape of
+    // defect a device backend is most likely to introduce.
+    let named = if all_dims {
+        None
+    } else {
+        crate::aten::reduce_dims(op, args, kwargs, 1, rank)?
+    };
+    let keepdim = if all_dims {
+        false
+    } else {
+        crate::aten::bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false)
+    };
+    let collapse_all = named.is_none();
+    let reduced: Vec<usize> = match named {
+        Some(d) if !d.is_empty() => {
+            let mut d = d;
+            d.sort_unstable();
+            d.dedup();
+            d
+        }
+        _ => (0..rank).collect(),
+    };
+
+    let mut stride = vec![0usize; rank];
+    let mut acc = 1usize;
+    for d in (0..rank).rev() {
+        stride[d] = acc;
+        acc *= x.shape[d];
+    }
+
+    let mut shape_words: Vec<u32> = Vec::with_capacity(VIEW_RANK_MAX);
+    let mut stride_words: Vec<u32> = Vec::with_capacity(VIEW_RANK_MAX);
+    let mut out_shape: Vec<usize> = Vec::new();
+    let mut n_out = 1usize;
+    for d in 0..rank {
+        if reduced.contains(&d) {
+            continue;
+        }
+        shape_words.push(shader_u32(op, "axis extent", x.shape[d])?);
+        stride_words.push(shader_u32(op, "axis stride", stride[d])?);
+        out_shape.push(x.shape[d]);
+        n_out *= x.shape[d];
+    }
+    let n_kept = shape_words.len() as u32;
+    for &d in &reduced {
+        shape_words.push(shader_u32(op, "axis extent", x.shape[d])?);
+        stride_words.push(shader_u32(op, "axis stride", stride[d])?);
+    }
+    let n_red = shape_words.len() as u32 - n_kept;
+    shape_words.resize(VIEW_RANK_MAX, 0);
+    stride_words.resize(VIEW_RANK_MAX, 0);
+
+    // `dim=None` collapses to rank 0 whatever `keepdim` said, which is what
+    // the dense kernel here does (`sum_all`). A named list with keepdim=True
+    // keeps a 1 in each reduced position.
+    let result_shape: Vec<usize> = if collapse_all && all_dims_named(&reduced, rank) {
+        Vec::new()
+    } else if keepdim {
+        (0..rank)
+            .map(|d| if reduced.contains(&d) { 1 } else { x.shape[d] })
+            .collect()
+    } else {
+        out_shape
+    };
+
+    shader_u32(op, "output element count", n_out)?;
+    let mut push: Vec<u32> = vec![n_out as u32, n_kept, n_red, 0];
+    push.extend_from_slice(&shape_words);
+    push.extend_from_slice(&stride_words);
+
+    let ctx = require(op)?;
+    let buffer = unsafe {
+        let buffer = ctx.alloc(n_out.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel_words(
+            "sum_dims_f32",
+            SUM_DIMS_F32_SPV,
+            &[&x.buffer, &x.buffer, &buffer],
+            &push,
+        )
+        .map_err(|e| vk_error(op, e))?;
+        buffer
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(buffer), shape: result_shape }, input.tag())
+}
+
+fn all_dims_named(reduced: &[usize], rank: usize) -> bool {
+    reduced.len() == rank
 }
 

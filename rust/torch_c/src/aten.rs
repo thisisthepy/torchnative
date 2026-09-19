@@ -12916,7 +12916,7 @@ enum Reduce {
 
 /// The dims a reduction runs over, normalised, plus whether the whole tensor
 /// is being reduced.
-fn reduce_dims(
+pub(crate) fn reduce_dims(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
