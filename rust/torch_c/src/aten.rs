@@ -12203,6 +12203,46 @@ fn neg_default(
     finish(py, out, tag)
 }
 
+/// `|x|` for an **integral** candle tensor, computed where the tensor lies.
+///
+/// `maximum(x, 0 - x)`. The negation is a *binary* subtraction from zero
+/// rather than `Tensor::neg`, because candle's `unary_op!` macro (`op.rs`)
+/// fills every integer arm with `todo!()` -- `neg` on an `i64` tensor panics
+/// rather than raising. `bin_op!` is the opposite: `Sub` and `Maximum` have
+/// real arms for `u8`/`u32`/`i8`/`i16`/`i32`/`i64` and Metal kernels for the
+/// widths this build allows on Metal, so the whole computation stays on the
+/// device.
+///
+/// **Why this shape and not a host loop.** The loop it replaces went out
+/// through `to_vec1::<i64>()`, which is a `_MPS_READBACK_MARKERS` marker, so
+/// the derivation scan in `test_shim.py` put `aten.abs.default` and
+/// `aten.abs_.default` on `MPS_HOST_READBACK_OPS` and the gate refused `abs`
+/// on Metal for *every* dtype -- including the three floating ones, whose
+/// path was already a single candle op and never touched the host.
+/// `x.abs()` on an `mps` tensor is three lines a user types, and it raised.
+///
+/// **Wrapping is preserved exactly.** The loop spelled `wrapping_abs`, and
+/// so does this: `0i8 - (-128)` wraps to `-128` and `maximum(-128, -128)` is
+/// `-128`, which is what upstream returns for `torch.tensor([-128],
+/// dtype=torch.int8).abs()`. Rust's release profile and Metal's integer ALU
+/// both wrap, so the two devices agree.
+///
+/// **Unsigned storages are the identity and must be.** `0u8 - 5` wraps to
+/// `251`, so `maximum` would pick the wrapped value and `abs` on a `uint8`
+/// tensor would corrupt every nonzero element. No unsigned element is
+/// negative, so handing the tensor back is both correct and free.
+fn integral_abs_on_device(op: &str, input: &Tensor) -> PyResult<Tensor> {
+    match input.dtype() {
+        candle_core::DType::U8 | candle_core::DType::U32 => Ok(input.clone()),
+        _ => {
+            let zero = input.zeros_like().map_err(|e| candle_err(op, e))?;
+            let negated = zero.broadcast_sub(input).map_err(|e| candle_err(op, e))?;
+            input.maximum(&negated).map_err(|e| candle_err(op, e))
+        }
+    }
+}
+
+
 /// `aten::abs(Tensor self) -> Tensor`
 ///
 /// The float path is candle's `abs`, which is IEEE `fabs`: `abs(-0.0)` is
@@ -12212,14 +12252,19 @@ fn neg_default(
 /// **The integral path is `wrapping_abs`, not `abs`.** Upstream's answer for
 /// the most negative element of a signed type is that element again:
 /// `abs(int64 min)` is `int64 min`, measured. Rust's `i64::abs` panics on that
-/// input in a debug build, so the round trip uses `wrapping_abs`, the same
-/// shape `neg_default` above uses `wrapping_neg` for the same reason. The
-/// width matters: an `int32` tensor wraps at `i32::MIN`, not at `i64::MIN`, so
-/// the wrap is applied in the *storage* width before widening back.
+/// input in a debug build, so the wrap is the one the storage width gives:
+/// an `int32` tensor wraps at `i32::MIN`, not at `i64::MIN`, and the
+/// subtraction happens in the storage dtype so that is what it does.
+/// `test_absmps.py::test_abs_wraps_at_the_signed_minimum_exactly_as_upstream_does`
+/// pins all three widths against upstream.
 ///
-/// It goes through `i64` rather than candle for the same reason `neg` does --
-/// candle's `abs` is a `unary_op!` whose integer arms are `todo!()`, which
-/// panics and takes the interpreter down instead of raising.
+/// The integral path is `integral_abs_on_device` above -- `maximum(x, 0 - x)`
+/// in candle, on whatever device the tensor lies on. It used to be a host
+/// loop over `to_vec1::<i64>()`, which is why `aten.abs.default` was on
+/// `MPS_HOST_READBACK_OPS` and refused on Metal for every dtype including the
+/// floating ones this branch never sent to the host at all. candle's *unary*
+/// `abs` is still unusable here -- `unary_op!`'s integer arms are `todo!()`
+/// and panic -- which is why the negation is a binary subtraction.
 ///
 /// `uint8`/`uint32` are the identity, which is a fact rather than a special
 /// case: no unsigned element is negative. `bool` is refused with upstream's
@@ -12242,28 +12287,8 @@ fn abs_default(
         let out = input.tensor()?.abs().map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
     }
-    let dims = input.tensor()?.dims().to_vec();
-    let values: Vec<i64> = input
-        .tensor()?
-        .contiguous()
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_dtype(candle_core::DType::I64))
-        .and_then(|t| t.to_vec1::<i64>())
-        .map_err(|e| candle_err(OP, e))?;
-    let wrapped: Vec<i64> = values
-        .into_iter()
-        .map(|v| match storage {
-            candle_core::DType::I8 => (v as i8).wrapping_abs() as i64,
-            candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
-            candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
-            // Unsigned storages cannot hold a negative, so this is the
-            // identity; `i64` is the only remaining signed width.
-            _ => v.wrapping_abs(),
-        })
-        .collect();
-    let out = Tensor::from_vec(wrapped, dims, input.tensor()?.device())
-        .and_then(|t| t.fast_to(storage))
-        .map_err(|e| candle_err(OP, e))?;
+    let _ = storage;
+    let out = integral_abs_on_device(OP, input.tensor()?)?;
     finish(py, out, tag)
 }
 
@@ -18331,26 +18356,9 @@ fn abs_inplace(
     let out = if tag.is_floating_point() {
         receiver.borrow().tensor()?.abs().map_err(|e| candle_err(OP, e))?
     } else {
+        let _ = storage;
         let source = receiver.borrow().tensor()?.clone();
-        let dims = source.dims().to_vec();
-        let values: Vec<i64> = source
-            .contiguous()
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_dtype(candle_core::DType::I64))
-            .and_then(|t| t.to_vec1::<i64>())
-            .map_err(|e| candle_err(OP, e))?;
-        let wrapped: Vec<i64> = values
-            .into_iter()
-            .map(|v| match storage {
-                candle_core::DType::I8 => (v as i8).wrapping_abs() as i64,
-                candle_core::DType::I16 => (v as i16).wrapping_abs() as i64,
-                candle_core::DType::I32 => (v as i32).wrapping_abs() as i64,
-                _ => v.wrapping_abs(),
-            })
-            .collect();
-        Tensor::from_vec(wrapped, dims, source.device())
-            .and_then(|t| t.fast_to(storage))
-            .map_err(|e| candle_err(OP, e))?
+        integral_abs_on_device(OP, &source)?
     };
     write_back(OP, &receiver, PyTensorBase::new(out)?)?;
     let _ = py;

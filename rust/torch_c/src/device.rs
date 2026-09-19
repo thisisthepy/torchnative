@@ -700,15 +700,20 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 90] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 88] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._unique2.default",
-    "aten.abs.default",
-    "aten.abs_.default",
+    // `aten.abs.default` and `aten.abs_.default` were here until their
+    // integral path stopped being a `to_vec1::<i64>()` loop and became
+    // `integral_abs_on_device` -- `maximum(x, 0 - x)` in candle, on the
+    // device. Removing a name from this list without removing the readback
+    // is the defeat docs/devices/MPSATTN.md §3.1 records; the derivation
+    // scan in test_shim.py re-derives the whole list from `aten.rs` on every
+    // gate run, so it would put them straight back.
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
