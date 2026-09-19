@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 from test_shim import _C, _CKPT_VENDOR_DIR, _CKPT_VENDOR_SHIM
+import _skip
 
 
 # The programs. Each prints one JSON object and must print `who` so that a
@@ -347,8 +348,8 @@ def _both():
 def _agree(name):
     pair = _both()
     if pair is None:
-        print(f"   (skipped {name}: no vendored tree or no upstream torch)")
-        return None
+        _skip.skip(f"   (skipped {name}: no vendored tree or no upstream torch)")
+        return
     shim, upstream = pair
     assert name in upstream, f"{name} is not in the upstream probe's output"
     assert shim[name] == upstream[name], (
@@ -637,17 +638,9 @@ def test_reduce_is_absent_by_name_rather_than_by_omission():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_scatter")
     return 1 if failures else 0
 
 

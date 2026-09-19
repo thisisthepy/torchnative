@@ -55,6 +55,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 try:
     import torch as _upstream_torch
@@ -197,7 +198,7 @@ def test_mps_probe_answers_built_and_available_separately():
     an actual `resolve()`.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s -- run vendor/vendor_torch.sh "
+        _skip.skip("   (skipped: no vendored tree at %s -- run vendor/vendor_torch.sh "
               "then vendor/install_shim.sh)" % _VENDOR_SHIM)
         return
     r = _backends()
@@ -223,7 +224,7 @@ def test_mps_is_built_is_the_artefacts_own_answer():
     putting the constant back cannot make this pass.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
+        _skip.skip("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
         return
     r = _backends()
     assert r["is_built"] == r["has_mps"], r
@@ -245,7 +246,7 @@ def test_mps_is_available_is_a_probe_and_not_a_constant():
     say that instead. Either direction of disagreement fails here.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
+        _skip.skip("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
         return
     r = _backends()
     assert r["mps_is_available_is_callable"], r
@@ -268,11 +269,11 @@ def test_the_shim_really_computes_on_metal_when_it_says_it_can():
     both.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
+        _skip.skip("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
         return
     r = _backends()
     if not r["is_available"]:
-        print("   (skipped: no mps device on this machine -- %s)" % r["really_error"])
+        _skip.skip("   (skipped: no mps device on this machine -- %s)" % r["really_error"])
         return
     assert r["matmul_device"].startswith("mps"), r["matmul_device"]
 
@@ -290,7 +291,7 @@ def test_manual_seed_survives_has_mps_being_true():
     implemented in torch._C shim: torch._C._mps_get_default_generator`.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
+        _skip.skip("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
         return
     r = _backends()
     assert r["manual_seed"] is None, (
@@ -341,11 +342,11 @@ def test_float64_refuses_by_name_on_every_road_onto_metal():
     implemented`.
     """
     if not _vendor_available():
-        print("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
+        _skip.skip("   (skipped: no vendored tree at %s)" % _VENDOR_SHIM)
         return
     r = _backends()
     if not r["is_available"]:
-        print("   (skipped: no mps device on this machine -- %s)" % r["really_error"])
+        _skip.skip("   (skipped: no mps device on this machine -- %s)" % r["really_error"])
         return
     for road in ("cast_then_move", "move_then_cast", "factory"):
         got = r["f64"][road]
@@ -399,9 +400,9 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except (NotImplementedError, RuntimeError) as e:
-        print("   (skipped %s: no mps device on this machine -- %s)"
+        _skip.skip("   (skipped %s: no mps device on this machine -- %s)"
               % (what, str(e).splitlines()[0]))
-        return None
+        return
     return _C.device("mps")
 
 
@@ -517,7 +518,7 @@ def test_the_dtype_device_matrix_agrees_with_upstream():
     refusal is loud.
     """
     if _upstream_torch is None:
-        print("   (skipped: no upstream torch in this interpreter -- "
+        _skip.skip("   (skipped: no upstream torch in this interpreter -- "
               "the oracle half of this test cannot run)")
         return
     mps = _mps_or_skip("the mps half of the matrix")
@@ -975,17 +976,9 @@ def _diff(device, got, want):
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_dtypedev")
     return 1 if failures else 0
 
 

@@ -62,6 +62,7 @@ import os
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from test_shim import _C
+import _skip
 
 try:
     import torch as _upstream_torch
@@ -86,9 +87,9 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except (NotImplementedError, RuntimeError) as e:
-        print("   (skipped %s: no mps device on this machine -- %s)"
+        _skip.skip("   (skipped %s: no mps device on this machine -- %s)"
               % (what, str(e).splitlines()[0]))
-        return None
+        return
     return _C.device("mps")
 
 
@@ -172,7 +173,7 @@ def test_the_ring_operators_survive_a_promotion_round_trip():
     `iinfo.min` again, at both widths.
     """
     if _upstream_torch is None:
-        print("   (skipped: no upstream torch in this interpreter -- the "
+        _skip.skip("   (skipped: no upstream torch in this interpreter -- the "
               "oracle half of this test cannot run)")
         return
     for name in _DTYPES:
@@ -229,7 +230,7 @@ def test_the_integer_reductions_return_int64_and_so_are_never_narrowed():
     give, and upstream returns exactly that.
     """
     if _upstream_torch is None:
-        print("   (skipped: no upstream torch in this interpreter -- the "
+        _skip.skip("   (skipped: no upstream torch in this interpreter -- the "
               "oracle half of this test cannot run)")
         return
     for name in _DTYPES:
@@ -403,7 +404,7 @@ def test_the_int64_road_named_in_the_refusal_actually_works():
     if _mps_or_skip("the int64 remedy") is None:
         return
     if _upstream_torch is None:
-        print("   (skipped: no upstream torch in this interpreter)")
+        _skip.skip("   (skipped: no upstream torch in this interpreter)")
         return
     probes = [1, 2, 3, 4]
     for name in _DTYPES:
@@ -457,17 +458,9 @@ def test_the_escape_hatch_off_a_sealed_int_metal_tensor_stays_open():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_intmps")
     return 1 if failures else 0
 
 

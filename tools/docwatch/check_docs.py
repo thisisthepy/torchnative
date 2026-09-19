@@ -188,6 +188,7 @@ class LiveFacts:
         self._smoke_cache: int | None = None
         self._decomp_cache: dict | None = None
         self._agree_cache: dict | None = None
+        self._skipvis_cache: int | None = None
         self._requested_attrs: set[str] = set()
 
     def preload_attrs(self, attrs: set[str]) -> None:
@@ -440,11 +441,50 @@ class LiveFacts:
             }
         return self._agree_cache
 
+    # -- silent-skip visibility (rust/torch_c/pytests/_skip.py) ------------
+    #
+    # A test whose fixture is missing used to print "   (skipped: ...)" and
+    # `return`, which suite_ledger.py's `^SKIP\s` tally cannot see -- the
+    # skip landed in neither the ok nor the SKIP column. `_skip.py` and the
+    # per-suite runners now report it as a real `SKIP <suite>: <name> --
+    # <reason>` line. `test_skipvis.py` (a `test_*.py`, so `suite_ledger.py`
+    # globs it into every gate like any other suite) already checks this by
+    # a static AST scan of the suite sources. This count is the other half:
+    # a LIVE run of one real suite, counted from its actual stdout, so a
+    # regression that a static scan cannot see -- e.g. the registration call
+    # present in the source but never reached, or reached and silently
+    # raising -- still shows up as a DOCWATCH FAIL.
+    #
+    # `test_intelnpu.py` is the source: it needs no vendored `_C` build (only
+    # the pure-Python `torchnative` package), skips several tests on macOS
+    # for lack of an Intel NPU / OpenVINO runtime, and does so unconditionally
+    # regardless of host -- so `ge 1` holds everywhere this doc is checked
+    # from, without needing TORCH_C_ARTEFACT.
+    def skip_lines_visible(self) -> int:
+        if self._skipvis_cache is None:
+            env = dict(self.env)
+            env["PYTHONPATH"] = str(REPO_ROOT / "torchnative" / "src" / "main")
+            proc = subprocess.run(
+                [self.python_exe, str(REPO_ROOT / "rust" / "torch_c" / "pytests" / "test_intelnpu.py")],
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+                env=env,
+            )
+            if proc.returncode not in (0, 1):
+                raise LiveFactsError(
+                    f"test_intelnpu.py exit={proc.returncode}, stderr={proc.stderr[-800:]}"
+                )
+            self._skipvis_cache = sum(
+                1 for line in proc.stdout.splitlines() if line.startswith("SKIP "))
+        return self._skipvis_cache
+
 
 COUNT_SOURCES = {
     "smoke_ok": lambda lf: lf.smoke_ok(),
     # SKIP, never PASS, on a host where no Vulkan test ran (LiveFactsSkip).
     "vulkan_tests_ok": lambda lf: lf.vulkan_tests_ok(),
+    "skip_lines_visible": lambda lf: lf.skip_lines_visible(),
     "golden_cases_passed": lambda lf: lf.golden()["golden_cases_passed"],
     "golden_cases_failed": lambda lf: lf.golden()["golden_cases_failed"],
     "golden_cases_total": lambda lf: lf.golden()["golden_cases_total"],

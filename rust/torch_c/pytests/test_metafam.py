@@ -32,6 +32,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
@@ -223,8 +224,8 @@ _KNOWN_META_VS_CPU_DIVERGENCE = {"amax_dim_on_zero_extent"}
 def _compare(prefix, min_cases):
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return 0
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     upstream = _run("upstream")
     keys = sorted(
         k for k in upstream
@@ -366,24 +367,11 @@ def test_the_new_meta_kernels_are_the_meta_half_of_ops_already_implemented():
 
 
 if __name__ == "__main__":
-    import traceback
-
-    failures = 0
     tests = [
         (name, fn)
         for name, fn in sorted(globals().items())
         if name.startswith("test_") and callable(fn)
     ]
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"ok   {name}")
-        except AssertionError as e:
-            failures += 1
-            print(f"FAIL {name}: {e}")
-        except Exception:
-            failures += 1
-            print(f"FAIL {name}:")
-            traceback.print_exc()
-    print(f"\n{len(tests) - failures} ok / {failures} fail")
+    failures = _skip.run_tests(tests, suite="test_metafam")
+    print(f"\n{len(tests) - failures} ok/skip / {failures} fail")
     sys.exit(1 if failures else 0)

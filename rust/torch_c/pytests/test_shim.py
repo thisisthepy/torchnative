@@ -19,6 +19,7 @@ import pathlib
 import re
 
 import _C
+import vulkan_coverage
 
 
 # --- identity ---------------------------------------------------------------
@@ -6771,7 +6772,7 @@ def test_capture_road_through_the_vendored_tree():
     `ReLU` do, and the ops that come out are the record.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _capture_road_fixture()
 
@@ -9068,7 +9069,7 @@ def test_decompose_reads_core_aten_out_of_the_vendored_tree():
     here rather than a quietly shorter list.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _decomp_road_fixture()
     assert r["n_core"] == 193, r["n_core"]
@@ -10721,7 +10722,7 @@ def test_every_implemented_op_has_schema_text():
     shortfall to be tolerated silently.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     _, report = _schema_road_fixture()
     assert report["source"].endswith("native_functions.yaml"), report["source"]
@@ -23439,7 +23440,7 @@ def test_nnapi_target_set_is_read_from_the_vendored_serializer():
     progress. What must not change is which side of the line these sit on.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
     assert r["is_shim"] is True, r["is_shim"]
@@ -23466,7 +23467,7 @@ def test_coreml_operator_set_refuses_instead_of_inventing_one():
     source so the next reader goes to it rather than to a list here.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
     assert r["coreml"] != "ANSWERED", r["coreml"]
@@ -23505,7 +23506,7 @@ def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
     not seen, which is the only claim a delegate can rely on.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
 
@@ -23553,7 +23554,7 @@ def test_the_core_table_cannot_lower_gelu_and_the_full_table_can():
     number, so it is pinned rather than only written down.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
     assert r["gelu_in_core_table"] is False, r["gelu_in_core_table"]
@@ -23573,7 +23574,7 @@ def test_more_ops_lower_toward_nnapi_and_each_keeps_its_values():
     numbers in docs/graph/DECOMP.md §12 count it honestly as the latter.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
     # `_refs.t` calls `prims.transpose`, so with that kernel present the rule
@@ -23599,7 +23600,7 @@ def test_lowering_a_whole_module_graph_preserves_what_it_computes():
     graph against the module on inputs it never saw is what catches that.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
     whole = r["whole_module"]
@@ -23645,7 +23646,7 @@ def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
     and names what it could not reach.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     import re
 
@@ -24040,7 +24041,7 @@ def test_the_thirteen_prims_ops_are_callable_by_their_own_key():
     use. `reach.ops_namespace_spelled` reads this file for exactly that.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _prims_road_fixture()
     assert r["is_shim"] is True, r["is_shim"]
@@ -24144,7 +24145,7 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
     Every expected value below was run on upstream 2.13.0 separately.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _rwkv_road_fixture()
     assert r["is_shim"] is True, r["is_shim"]
@@ -25396,8 +25397,8 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except NotImplementedError as e:
-        print(f"   (skipped {what}: no mps device -- {str(e).splitlines()[0]})")
-        return None
+        vulkan_coverage.vulkan_skip(f"   (skipped {what}: no mps device -- {str(e).splitlines()[0]})")
+        return
     return _C.device("mps")
 
 
@@ -25695,7 +25696,7 @@ def test_the_mps_readback_list_is_what_the_kernels_actually_do():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped mps readback derivation: rust/torch_c/src/aten.rs "
+        vulkan_coverage.vulkan_skip("   (skipped mps readback derivation: rust/torch_c/src/aten.rs "
               "is not beside this file -- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -25746,7 +25747,7 @@ def test_every_host_readback_in_aten_is_classified():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped mps readback classification: aten.rs is not beside "
+        vulkan_coverage.vulkan_skip("   (skipped mps readback classification: aten.rs is not beside "
               "this file -- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -26127,7 +26128,7 @@ def test_the_checked_in_spirv_is_not_stale():
     """
     shaders = pathlib.Path(__file__).resolve().parent.parent / "shaders"
     if not shaders.is_dir():
-        print("   (skipped spirv staleness: no shaders/ directory)")
+        vulkan_coverage.vulkan_skip("   (skipped spirv staleness: no shaders/ directory)")
         return
     sources = sorted(shaders.glob("*.comp"))
     assert sources, f"no .comp under {shaders}"
@@ -26535,7 +26536,7 @@ def test_upstreams_nnapi_serialiser_needs_a_jit_graph_this_build_cannot_make():
     of being inherited.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     assert r["is_shim"] is True, r["is_shim"]
@@ -26556,7 +26557,7 @@ def test_the_serialisers_graph_surface_is_three_methods_and_stays_three():
     façade would then be silently incomplete.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     assert r["graph_methods"] == ["inputs", "nodes", "return_node"], r["graph_methods"]
@@ -26576,7 +26577,7 @@ def test_a_conv_relu_graph_serialises_to_a_blob_that_decodes():
     check would not see.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     conv = r["conv_relu"]
@@ -26608,7 +26609,7 @@ def test_serialised_shapes_agree_with_what_capture_recorded():
     checker (CLAUDE.md §5.5).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     assert r["conv_relu"]["shapes"]["mismatches"] == [], r["conv_relu"]["shapes"]
@@ -26647,7 +26648,7 @@ def test_constant_folding_is_what_makes_a_linear_layer_serialisable():
     that serialises, runs, and returns the same answer for every input.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     mlp = r["mlp"]
@@ -26670,7 +26671,7 @@ def test_an_op_with_no_calling_convention_is_refused_by_name():
     failure `decompose.py` already refuses one layer up.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     assert r["unmapped"] != "ACCEPTED", r["unmapped"]
@@ -26687,7 +26688,7 @@ def test_the_blob_decoder_rejects_blobs_that_do_not_decode():
     refused with a message that names what did not line up.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     assert r["corrupt_header"] != "ACCEPTED", r["corrupt_header"]
@@ -26706,7 +26707,7 @@ def test_what_serialises_is_smaller_than_what_nnapi_nominally_accepts():
     name" and "a captured overload of it can be handed to that adder".
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_serialiser_fixture()
     supported = set(r["supported_base_names"])
@@ -26729,11 +26730,11 @@ def test_coremltools_registry_is_read_rather_than_transcribed():
     `ADDER_MAP`.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_coreml_fixture()
     if r["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
+        vulkan_coverage.vulkan_skip("   (skipped: coremltools not installed for this interpreter)")
         return
     assert r["registry_size"] > 300, r["registry_size"]
     for op in ("relu", "conv2d", "gelu", "softmax", "matmul", "layer_norm"):
@@ -26757,11 +26758,11 @@ def test_coreml_models_are_compiled_and_actually_run():
     on an NPU, and nothing there claims a CoreML model was merely inspected.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_coreml_fixture()
     if r["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
+        vulkan_coverage.vulkan_skip("   (skipped: coremltools not installed for this interpreter)")
         return
     executed = r["executed"]
     assert set(executed) == {
@@ -26795,11 +26796,11 @@ def test_coremls_default_precision_is_float16_and_that_changes_the_claim():
     the claim being made.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_coreml_fixture()
     if r["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
+        vulkan_coverage.vulkan_skip("   (skipped: coremltools not installed for this interpreter)")
         return
     half = r["float16_default"]["max_abs_diff"]
     full = r["float32_same_model"]["max_abs_diff"]
@@ -26819,11 +26820,11 @@ def test_an_op_with_no_mil_lowering_is_refused_by_name():
     §12.6 mistake from the other side.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _npu_coreml_fixture()
     if r["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
+        vulkan_coverage.vulkan_skip("   (skipped: coremltools not installed for this interpreter)")
         return
     assert r["unmapped"] != "ACCEPTED", r["unmapped"]
     assert "aten.log.default" in r["unmapped"], r["unmapped"]
@@ -27464,7 +27465,7 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
     §3 met the same wall from the other side).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _training_loop_fixture(
         {"PYTHONPATH": _CKPT_VENDOR_DIR, "TORCH_USE_RTLD_GLOBAL": "1"}
@@ -27874,7 +27875,7 @@ def test_the_refold_goes_prims_to_aten_because_the_other_direction_is_partial():
     inherited.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     assert r["is_shim"] is True, r["is_shim"]
@@ -27900,7 +27901,7 @@ def test_every_refold_table_entry_computes_the_same_value_as_the_prim():
     bit for bit -- a re-spelling has no tolerance to spend.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     per_op = r["per_op"]
@@ -27937,7 +27938,7 @@ def test_a_prim_with_no_aten_spelling_is_refused_by_name():
     it, so a caller measuring the gap sees the prim still there.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     assert r["expand_control"] != "ACCEPTED", (
@@ -27971,12 +27972,12 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     improved would report the pass as more than it is (CLAUDE.md §5.3).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     models = r["models"]
     if "vit" not in models:
-        print("   (skipped: transformers unavailable)")
+        vulkan_coverage.vulkan_skip("   (skipped: transformers unavailable)")
         return
     vit = models["vit"]
     assert vit["outside_raw"] == 11, vit["outside_raw"]
@@ -28016,7 +28017,7 @@ def test_the_refold_is_a_respelling_and_replays_bit_for_bit():
     computes something close.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     checked = 0
@@ -28051,7 +28052,7 @@ def test_the_batch_norm_affine_this_fold_uses_is_upstreams():
     arithmetic is no longer being checked by anything.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     affine = r["affine"]
@@ -28087,7 +28088,7 @@ def test_the_batch_norm_fold_refuses_where_the_algebra_does_not_hold():
     a graph that decodes, serialises and computes something else.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     refusals = r["refusals"]
@@ -28114,11 +28115,11 @@ def test_folding_batch_norm_into_conv_takes_mobilenet_to_one_op_outside():
     matching most pairs would still "improve" the graph.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     if "mobilenet_v2" not in r["models"]:
-        print("   (skipped: transformers unavailable)")
+        vulkan_coverage.vulkan_skip("   (skipped: transformers unavailable)")
         return
     mobile = r["models"]["mobilenet_v2"]
     assert mobile["outside_raw_supported"] == [
@@ -28154,7 +28155,7 @@ def test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set():
     one still decodes, and the shape check would not see it.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _refold_fixture()
     whole = r["whole"]

@@ -29,6 +29,7 @@ pass and is worse than a failure.
 import os
 
 from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
+import _skip
 
 
 # ---------------------------------------------------------------------------
@@ -485,12 +486,12 @@ def _nnapi_fixture():
 def _coreml_or_skip():
     """The CoreML fixture, or `None` with the reason printed by name."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     result = _coreml_fixture()
     if result["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
-        return None
+        _skip.skip("   (skipped: coremltools not installed for this interpreter)")
+        return
     if "coreml_error" in result:
         raise AssertionError(
             "the CoreML compute-plan fixture raised; this is a failure and "
@@ -509,17 +510,17 @@ def _nnapi_or_skip():
     docs/devices/VULKAN3.md §6.1's whole lesson.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     result = _nnapi_fixture()
     if not result["adb"]:
-        print("   (skipped: no adb on PATH, or ANDROID_SERIAL is unset -- "
+        _skip.skip("   (skipped: no adb on PATH, or ANDROID_SERIAL is unset -- "
               "this module will not guess which shared emulator to use)")
-        return None
+        return
     if result["ndk_clang"] is None:
-        print("   (skipped: no Android NDK clang for arm64, so nnapi_runner.c "
+        _skip.skip("   (skipped: no Android NDK clang for arm64, so nnapi_runner.c "
               "cannot be built)")
-        return None
+        return
     if "nnapi_error" in result:
         raise AssertionError(
             "the NNAPI device fixture raised; this is a failure and not a "
@@ -855,7 +856,7 @@ def test_a_driver_that_does_not_claim_the_operations_refuses_by_name():
     if result is None:
         return
     if "quant_driver" not in result:
-        print("   (skipped: this image ships no quantised-only sample driver)")
+        _skip.skip("   (skipped: this image ships no quantised-only sample driver)")
         return
     assert result["quant_driver"] != "ACCEPTED", result["quant_driver"]
     assert "supports 0/8" in result["quant_driver"], result["quant_driver"]
@@ -896,7 +897,7 @@ def test_the_device_module_refuses_to_guess_which_emulator_to_use():
             os.path.dirname(os.path.abspath(__file__))))),
         "torchnative", "src", "main")
     if not os.path.isdir(os.path.join(root, "torchnative", "export")):
-        print(f"   (skipped: no vendored torchnative tree under {root})")
+        _skip.skip(f"   (skipped: no vendored torchnative tree under {root})")
         return
     inserted = root not in sys.path
     if inserted:
@@ -991,17 +992,9 @@ def test_a_refused_compute_plan_says_so_and_does_not_say_cpu():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_npu2")
     return 1 if failures else 0
 
 

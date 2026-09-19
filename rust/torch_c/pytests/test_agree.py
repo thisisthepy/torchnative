@@ -37,6 +37,7 @@ import subprocess
 import sys
 
 import agree_sweep as A
+import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _PYTESTS = os.path.dirname(os.path.abspath(__file__))
@@ -227,7 +228,7 @@ def test_the_calibration_batch_rows_differ_on_both_float_and_integer_inputs():
     """
     data = _shim_json(["--self-test-calibration"])
     if data is None:
-        print("   (skipped: no vendored shim installed)")
+        _skip.skip("   (skipped: no vendored shim installed)")
         return
     assert data["float_rows_distinct"] is True, data
     assert data["int_rows_distinct"] is True, data
@@ -251,7 +252,7 @@ def test_the_weight_transport_round_trips_every_dtype_it_claims_to_carry():
     different models and every number afterwards is about the transport."""
     data = _shim_json(["--self-test-transport"])
     if data is None:
-        print("   (skipped: no vendored shim installed)")
+        _skip.skip("   (skipped: no vendored shim installed)")
         return
     unavailable = {d: r["unavailable"] for d, r in data.items() if "unavailable" in r}
     # Every dtype the sweep carries is transportable. `int8` was the one
@@ -277,7 +278,7 @@ def test_the_shim_reproduces_upstreams_seeded_random_numbers():
     comparison of two different initialisations."""
     data = _shim_json(["--rng-check"])
     if data is None:
-        print("   (skipped: no vendored shim installed)")
+        _skip.skip("   (skipped: no vendored shim installed)")
         return
     for name, want in _UPSTREAM_SEED0.items():
         got = data[name]
@@ -324,17 +325,9 @@ def test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_agree")
     return 1 if failures else 0
 
 

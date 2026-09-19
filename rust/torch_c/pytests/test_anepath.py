@@ -31,6 +31,7 @@ Skips say by name what is missing, for docs/devices/VULKAN3.md §6.1's reason.
 import os
 
 from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
+import _skip
 
 
 _ANEPATH_SCRIPT = r"""
@@ -210,18 +211,18 @@ _CACHE = {}
 def _fixture_or_skip():
     """The fixture, or `None` with the reason printed by name."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     if "f" not in _CACHE:
         _CACHE["f"] = _npu_fixture(_ANEPATH_SCRIPT)
     result = _CACHE["f"]
     if result["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
-        return None
+        _skip.skip("   (skipped: coremltools not installed for this interpreter)")
+        return
     if result.get("resolution", {}).get("backend") != "coreml":
-        print("   (skipped: this host's npu does not resolve to the coreml "
+        _skip.skip("   (skipped: this host's npu does not resolve to the coreml "
               "backend)")
-        return None
+        return
     if "anepath_error" in result:
         raise AssertionError(
             "the CoreML lowering fixture raised; this is a failure and not a "
@@ -372,17 +373,9 @@ def test_a_partial_offload_warns_and_a_complete_one_does_not():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_anepath")
     return 1 if failures else 0
 
 

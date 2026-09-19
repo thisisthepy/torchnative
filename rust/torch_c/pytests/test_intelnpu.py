@@ -66,6 +66,7 @@ from torchnative.export.intelnpu import (  # noqa: E402
     unpack_f16,
     verdict_execution_devices,
 )
+import _skip
 
 _OV_ENV = "TORCHNATIVE_OPENVINO_C"
 
@@ -683,8 +684,8 @@ def _openvino_run():
 def _openvino_or_skip(what):
     payload, reason = _openvino_run()
     if payload is None:
-        print(f"   (skipped {what}: {reason})")
-        return None
+        _skip.skip(f"   (skipped {what}: {reason})")
+        return
     assert payload["is_shim"], (
         "the subprocess did not load torchnative's shim -- torch._C has no "
         "_aten_implemented(), so this measurement is against some other torch"
@@ -839,7 +840,7 @@ def test_the_shim_has_no_numpy_bridge_which_is_why_this_packs_bytes():
 def test_probe_on_real_hardware():
     """The only test that can prove NPU execution. Skips loudly everywhere else."""
     if sys.platform != "win32" and not sys.platform.startswith("linux"):
-        print(
+        _skip.skip(
             f"   (skipped: sys.platform is {sys.platform!r}; the OpenVINO NPU plugin "
             f"ships for Windows and Linux on x86-64 only, so there is no Intel NPU "
             f"to reach from here -- this is not a missing install)"
@@ -850,14 +851,14 @@ def test_probe_on_real_hardware():
     try:
         ov = OpenVINO()
     except IntelNPUUnavailable as exc:
-        print(f"   (skipped: OpenVINO C runtime not loadable -- {exc})")
+        _skip.skip(f"   (skipped: OpenVINO C runtime not loadable -- {exc})")
         return
     try:
         devices = ov.devices()
     finally:
         ov.close()
     if "NPU" not in devices:
-        print(
+        _skip.skip(
             f"   (skipped: OpenVINO loaded and reports devices {list(devices)!r}, which "
             f"does not include 'NPU'; no Intel NPU driver / NPU plugin on this machine)"
         )
@@ -1138,9 +1139,18 @@ if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if not name.startswith("test_") or not callable(fn):
             continue
+        _skip._state["current"] = name
         try:
             fn()
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+        else:
+            # The test itself prints its own "ok   ..." line on success; a
+            # test that instead called `_skip.skip(reason)` and returned
+            # printed nothing, so report the skip here (docs: this file's
+            # skip helper had no ledger-visible line before this).
+            if name in _skip._state["skipped"]:
+                print(f"SKIP test_intelnpu: {name} -- {_skip._state['skipped'][name]}")
+        _skip._state["current"] = None
     raise SystemExit(1 if failures else 0)

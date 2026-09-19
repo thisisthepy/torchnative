@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import _skip
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 PYPROJECT = REPO / "pyproject.toml"
@@ -219,7 +220,7 @@ def test_the_abi3_wheel_loads_on_later_cpythons():
     """
     artefact = REPO / "torchnative/src/main/torch/_C.abi3.so"
     if not artefact.exists():
-        print("   (skipped: no built _C.abi3.so; run vendor/install_shim.sh)")
+        _skip.skip("   (skipped: no built _C.abi3.so; run vendor/install_shim.sh)")
         return
 
     floor = (3, 13)
@@ -229,7 +230,7 @@ def test_the_abi3_wheel_loads_on_later_cpythons():
         if exe:
             later.append((minor, exe))
     if not later:
-        print(
+        _skip.skip(
             f"   (skipped: no CPython newer than 3.{floor[1]} on PATH, so the "
             "abi3 floor could not be exercised above itself)"
         )
@@ -299,17 +300,9 @@ def test_every_suite_prints_its_passes_in_the_one_format():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_release")
     return 1 if failures else 0
 
 

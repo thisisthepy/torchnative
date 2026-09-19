@@ -54,6 +54,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "src", "main")
@@ -308,7 +309,7 @@ def test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strid
     """
     text = _aten_source()
     if text is None:
-        print("   (skipped: aten.rs is not beside this file)")
+        _skip.skip("   (skipped: aten.rs is not beside this file)")
         return
     calls = re.findall(r"\.write_into\s*\(", text)
     assert len(calls) == 1, (
@@ -336,7 +337,7 @@ def test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed():
     """
     path = os.path.join(_REPO_ROOT, "tools", "golden", "reach_allow.json")
     if not os.path.isfile(path):
-        print("   (skipped: reach_allow.json is not in this tree)")
+        _skip.skip("   (skipped: reach_allow.json is not in this tree)")
         return
     table = json.load(open(path, encoding="utf-8"))
     blob = json.dumps(table)
@@ -787,7 +788,7 @@ def test_the_only_new_arithmetic_this_round_is_ties_to_even():
     """
     text = _aten_source()
     if text is None:
-        print("   (skipped: aten.rs is not beside this file)")
+        _skip.skip("   (skipped: aten.rs is not beside this file)")
         return
     # Each pair of keys reaches ONE function, which is what "a binding, not a
     # kernel" means here.
@@ -834,7 +835,7 @@ def test_none_of_this_rounds_kernels_reads_a_tensor_back_to_the_host():
     """
     text = _aten_source()
     if text is None:
-        print("   (skipped: aten.rs is not beside this file)")
+        _skip.skip("   (skipped: aten.rs is not beside this file)")
         return
     markers = ("read_flat(", ".to_vec1", ".to_vec2", ".to_vec3", ".to_scalar",
                "nan_along_dim(", "narrow_through(", "local_scalar_dense(")
@@ -885,7 +886,7 @@ def test_the_new_spellings_are_reachable_from_python_not_only_by_dispatch_key():
     vendored tree.
     """
     if not os.path.isfile(_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     script = r"""
 import json, sys
@@ -958,17 +959,9 @@ def test_the_round_decimals_overload_resolves_before_the_bare_one():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_tail4")
     return 1 if failures else 0
 
 

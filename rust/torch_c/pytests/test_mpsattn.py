@@ -39,6 +39,7 @@ import sys
 
 from test_shim import _C, _MPS_READBACK_MARKERS, _MPS_READBACK_HELPERS
 from test_shim import _aten_rs_functions, _aten_dispatch_targets
+import _skip
 
 
 # The two ops that left `MPS_HOST_READBACK_OPS` this round, by being rewritten
@@ -59,9 +60,9 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except NotImplementedError as e:
-        print(f"   (skipped {what}: no mps device on this machine -- "
+        _skip.skip(f"   (skipped {what}: no mps device on this machine -- "
               f"{str(e).splitlines()[0]})")
-        return None
+        return
     return _C.device("mps")
 
 
@@ -104,7 +105,7 @@ def test_the_softmax_ops_left_the_refusal_list_by_being_rewritten():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped mpsattn source claim: rust/torch_c/src/aten.rs is "
+        _skip.skip("   (skipped mpsattn source claim: rust/torch_c/src/aten.rs is "
               "not beside this file -- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -142,7 +143,7 @@ def test_the_shared_softmax_reduction_is_candle_ops_and_not_a_scalar_loop():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped mpsattn helper claim: aten.rs is not beside this "
+        _skip.skip("   (skipped mpsattn helper claim: aten.rs is not beside this "
               "file -- installed rather than in-tree)")
         return
     bodies, _ = parsed
@@ -195,7 +196,7 @@ def test_the_metal_matmul_refusal_is_recognised_as_a_striding_refusal():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped mpsattn matmul arm claim: aten.rs is not beside "
+        _skip.skip("   (skipped mpsattn matmul arm claim: aten.rs is not beside "
               "this file -- installed rather than in-tree)")
         return
     bodies, _ = parsed
@@ -418,9 +419,9 @@ def _upstream_bert():
         import torch as upstream
         from transformers import BertConfig, BertModel
     except Exception as e:  # noqa: BLE001
-        print(f"   (skipped the BERT-on-mps agreement: no upstream torch or "
+        _skip.skip(f"   (skipped the BERT-on-mps agreement: no upstream torch or "
               f"transformers here -- {type(e).__name__})")
-        return None
+        return
     upstream.manual_seed(0)
     model = BertModel(BertConfig(attn_implementation="eager", **_BERT_CFG)).eval()
     ids = upstream.tensor(_BERT_IDS)
@@ -475,7 +476,7 @@ def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
         return
     weights, up32, up64 = produced
     if not os.path.isfile(_VENDOR_SHIM):
-        print("   (skipped the BERT-on-mps agreement: no vendored shim at "
+        _skip.skip("   (skipped the BERT-on-mps agreement: no vendored shim at "
               f"{_VENDOR_SHIM} -- run vendor/install_shim.sh)")
         return
     env = dict(os.environ, PYTHONPATH=_VENDOR_DIR, TORCH_USE_RTLD_GLOBAL="1")
@@ -486,7 +487,7 @@ def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
     if proc.returncode != 0:
         tail = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else ""
         if "not implemented for the mps device" in tail or "no mps" in tail:
-            print(f"   (skipped the BERT-on-mps agreement: {tail})")
+            _skip.skip(f"   (skipped the BERT-on-mps agreement: {tail})")
             return
         raise AssertionError(
             "the shim-side BERT forward failed:\n" + proc.stderr[-3000:])
@@ -526,17 +527,9 @@ def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_mpsattn")
     return 1 if failures else 0
 
 

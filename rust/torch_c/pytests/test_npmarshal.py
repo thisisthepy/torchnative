@@ -29,6 +29,7 @@ Non-vacuity nullifications performed and recorded in docstrings.
 import os
 import sys
 import tracemalloc
+import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
@@ -204,7 +205,7 @@ def test_compute_plan_cleans_up_its_tempdir():
     try:
         import coremltools  # noqa: F401
     except ImportError:
-        print("   (skipped: coremltools not installed)")
+        _skip.skip("   (skipped: coremltools not installed)")
         return
 
     C = _coreml()
@@ -243,17 +244,9 @@ def test_compute_plan_cleans_up_its_tempdir():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_npmarshal")
     return 1 if failures else 0
 
 

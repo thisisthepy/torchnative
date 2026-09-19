@@ -36,6 +36,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "src", "main")
@@ -579,7 +580,7 @@ def test_as_strided_landed_and_stft_still_does_not_use_it():
     )
     path = os.path.join(_REPO_ROOT, "rust", "torch_c", "src", "aten.rs")
     if not os.path.isfile(path):
-        print("   (skipped: aten.rs is not beside this file)")
+        _skip.skip("   (skipped: aten.rs is not beside this file)")
         return
     text = open(path, encoding="utf-8").read()
     start = text.index("fn stft_kernel(") if "fn stft_kernel(" in text else None
@@ -601,17 +602,9 @@ def test_as_strided_landed_and_stft_still_does_not_use_it():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_fft")
     return 1 if failures else 0
 
 

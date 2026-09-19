@@ -75,6 +75,7 @@ import os
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from test_shim import _C
+import _skip
 
 try:
     import torch as _upstream_torch
@@ -136,17 +137,17 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except (NotImplementedError, RuntimeError) as e:
-        print("   (skipped %s: no mps device on this machine -- %s)"
+        _skip.skip("   (skipped %s: no mps device on this machine -- %s)"
               % (what, str(e).splitlines()[0]))
-        return None
+        return
     return _C.device("mps")
 
 
 def _upstream_or_skip(what):
     if _upstream_torch is None:
-        print("   (skipped %s: no upstream torch in this interpreter -- the "
+        _skip.skip("   (skipped %s: no upstream torch in this interpreter -- the "
               "oracle half of this test cannot run)" % what)
-        return None
+        return
     return _upstream_torch
 
 
@@ -515,17 +516,9 @@ def test_fixing_tolist_did_not_open_the_host_readback_hole():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_dtmdev")
     return 1 if failures else 0
 
 

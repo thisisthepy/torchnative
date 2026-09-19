@@ -52,6 +52,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
@@ -248,8 +249,8 @@ def _run(side):
 def _compare(prefix, min_cases):
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return 0
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     upstream = _run("upstream")
     keys = sorted(k for k in upstream if k.startswith(prefix) and not k.startswith("div_"))
     assert keys, f"the probe recorded no {prefix}* cases"
@@ -299,7 +300,7 @@ def test_the_weight_norm_wall_reports_itself_and_not_a_typeerror():
     exist; `weight_norm` on a meta module has to actually ANSWER."""
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     upstream = _run("upstream")
     got = shim["weight_norm_on_a_meta_module"]
@@ -326,7 +327,7 @@ def test_where_upstreams_meta_and_dense_kernels_disagree_the_shim_follows_dense(
     """
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     upstream = _run("upstream")
 
@@ -386,7 +387,7 @@ def test_deepcopy_of_a_tensor_answers_what_upstream_answers():
     actually being broken."""
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     upstream = _run("upstream")
     for key in ("deepcopy_a_tensor", "deepcopy_a_module", "deepcopy_values_match"):
@@ -399,7 +400,7 @@ def test_a_deep_copy_is_independent_of_its_original():
     visible through the original -- on both sides, the same answer."""
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     upstream = _run("upstream")
     got = shim["deepcopy_is_independent"]
@@ -415,7 +416,7 @@ def test_the_read_only_storage_refusal_survives_the_deepcopy_fix():
     while making a fresh, unfilled storage fillable."""
     shim = _run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     assert shim["snapshot_storage_still_refuses_copy_"] == {"error": "NotImplementedError"}, (
         shim["snapshot_storage_still_refuses_copy_"]
@@ -690,26 +691,13 @@ assert sys.modules['torchaudio'] is FakeTorchaudio, 'Guard failed: shim overwrot
 
 if __name__ == "__main__":
 
-    import traceback
-
-    failures = 0
     tests = [
         (name, fn)
         for name, fn in sorted(globals().items())
         if name.startswith("test_") and callable(fn)
     ]
-    for name, fn in tests:
-        try:
-            fn()
-            print(f"ok   {name}")
-        except AssertionError as e:
-            failures += 1
-            print(f"FAIL {name}: {e}")
-        except Exception:
-            failures += 1
-            print(f"FAIL {name}:")
-            traceback.print_exc()
-    print(f"\n{len(tests) - failures} ok / {failures} fail")
+    failures = _skip.run_tests(tests, suite="test_higgs")
+    print(f"\n{len(tests) - failures} ok/skip / {failures} fail")
     sys.exit(1 if failures else 0)
 
 

@@ -33,6 +33,7 @@ import re
 
 from test_shim import _C, _MPS_READBACK_MARKERS, _MPS_READBACK_HELPERS
 from test_shim import _aten_rs_functions, _aten_dispatch_targets
+import _skip
 
 
 # The three that left the refusal list by being rewritten, plus `prims.neg`,
@@ -56,9 +57,9 @@ def _mps_or_skip(what):
     try:
         _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
     except NotImplementedError as e:
-        print(f"   (skipped {what}: no mps device on this machine -- "
+        _skip.skip(f"   (skipped {what}: no mps device on this machine -- "
               f"{str(e).splitlines()[0]})")
-        return None
+        return
     return _C.device("mps")
 
 
@@ -104,7 +105,7 @@ def test_the_ops_that_left_the_refusal_list_no_longer_read_back():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        print("   (skipped: rust/torch_c/src/aten.rs is not beside this file "
+        _skip.skip("   (skipped: rust/torch_c/src/aten.rs is not beside this file "
               "-- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -381,17 +382,9 @@ def test_a_transformer_block_forwards_on_mps_and_agrees_with_cpu():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_mpsfwd")
     return 1 if failures else 0
 
 

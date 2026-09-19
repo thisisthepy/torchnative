@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import _skip
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
@@ -102,11 +103,11 @@ def _minimal_linux_elf() -> bytes:
 
 def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
     if not VENDORED_TORCH.is_dir() or not HOST_SHIM.exists():
-        print("   (skipped: no vendored torch tree / host shim -- run "
+        _skip.skip("   (skipped: no vendored torch tree / host shim -- run "
               "vendor/vendor_torch.sh && vendor/install_shim.sh first)")
         return
     if shutil.which("zig") or os.environ.get("TARGET_CC"):
-        print("   (skipped: a real cross toolchain is on PATH/env -- this "
+        _skip.skip("   (skipped: a real cross toolchain is on PATH/env -- this "
               "case needs global_deps_stub to fail)")
         return
 
@@ -128,7 +129,7 @@ def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
         # gate that goes red after a wheel build is a gate people stop reading.
         # Refusing to overwrite a real artefact is still right; announcing it as
         # a defect is not.
-        print(f"   (skipped: {rel_dir} already exists -- refusing to fake an "
+        _skip.skip(f"   (skipped: {rel_dir} already exists -- refusing to fake an "
               "artefact over a real cross build. Remove it to run this case.)")
         return
 
@@ -194,17 +195,9 @@ def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_toolguard_wheel_staging")
     return 1 if failures else 0
 
 

@@ -35,6 +35,7 @@ import subprocess
 import sys
 
 from test_shim import _C, _upstream_torch, _CKPT_VENDOR_DIR, _CKPT_VENDOR_SHIM
+import _skip
 
 
 def _run(script, env_overrides):
@@ -187,7 +188,7 @@ def test_convolution_gradients_agree_with_upstream_across_stride_padding_dilatio
     backward is not losing anything the forward has not already lost.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_CONV_SCRIPT)
     assert shim["who"] == "shim", shim["who"]
@@ -226,7 +227,7 @@ def test_the_weight_gradient_needs_stride_and_dilation_exchanged():
     dilation` this fails rather than silently stopping checking.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_CONV_SCRIPT)
     # `2d_stride2_pad2_dil2` and `1d_stride3_pad2_dil2` are the two, by name.
@@ -301,7 +302,7 @@ def test_average_pooling_gradients_agree_with_upstream_where_the_window_tiles():
     grew arithmetic it does not need.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_POOL_SCRIPT)
     assert shim["who"] == "shim", shim["who"]
@@ -324,7 +325,7 @@ def test_the_pooling_windows_that_do_not_tile_are_refused_by_name():
     gap rather than an invalid program.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_POOL_SCRIPT)
     for name, phrase in (("avg_overlapping", "tiles"),
@@ -357,7 +358,7 @@ def test_max_pool2d_backward_is_still_refused_by_name():
     finding go stale -- so it is not the way in.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     implemented = set(_C._aten_implemented())
     assert "aten.max_pool2d.default" in implemented
@@ -382,7 +383,7 @@ def test_a_transposed_convolution_is_refused_by_name_rather_than_differentiated(
     refusal nobody executes is a comment.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     script = r"""
 import json, sys
@@ -530,7 +531,7 @@ def test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream():
     different orders differ at that scale.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_VISION_SCRIPT)
     assert shim["who"] == "shim", shim["who"]
@@ -573,7 +574,7 @@ def test_the_training_loop_actually_accumulates_into_dot_grad():
     is the same number added to itself.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_VISION_SCRIPT)
     seen = 0
@@ -687,7 +688,7 @@ def test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream():
     the final parameters, against upstream running the identical program.
     """
     if not _available():
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
     shim = _shim(_TRANSFORMER_SCRIPT)
     assert shim["who"] == "shim", shim["who"]
@@ -728,17 +729,9 @@ def test_the_three_rules_this_round_added_are_in_the_tape_s_own_list():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_train")
     return 1 if failures else 0
 
 

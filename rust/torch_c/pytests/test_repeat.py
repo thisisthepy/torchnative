@@ -27,6 +27,7 @@ import json
 import os
 
 from test_shim import _C
+import _skip
 
 
 def _flat(t):
@@ -110,7 +111,7 @@ def test_tensor_where_is_not_a_methods_json_row_and_the_table_still_has_none():
         os.path.dirname(os.path.abspath(__file__)), "..", "src", "methods.json"
     )
     if not os.path.exists(path):
-        print("   (skipped the methods.json half: the tree is not beside this "
+        _skip.skip("   (skipped the methods.json half: the tree is not beside this "
               "file -- installed rather than in-tree)")
         return
     with open(path, encoding="utf-8") as handle:
@@ -536,17 +537,9 @@ def test_the_int_list_symint_rule_refuses_exactly_what_upstream_refuses():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_repeat")
     return 1 if failures else 0
 
 

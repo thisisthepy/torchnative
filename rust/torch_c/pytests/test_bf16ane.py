@@ -72,6 +72,7 @@ import os
 import struct
 
 from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
+import _skip
 
 
 #: The motivating checkpoint, read from the Hugging Face cache and never
@@ -629,21 +630,21 @@ _CACHE = {}
 def _fixture_or_skip():
     """The fixture, or `None` with the reason printed by name."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     if not _checkpoint_path():
-        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
-        return None
+        _skip.skip(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        return
     if "f" not in _CACHE:
         _CACHE["f"] = _npu_fixture(_BF16_SCRIPT)
     result = _CACHE["f"]
     if result["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
-        return None
+        _skip.skip("   (skipped: coremltools not installed for this interpreter)")
+        return
     if result.get("resolution", {}).get("backend") != "coreml":
-        print("   (skipped: this host's npu does not resolve to the coreml "
+        _skip.skip("   (skipped: this host's npu does not resolve to the coreml "
               "backend)")
-        return None
+        return
     if "bf16_error" in result:
         raise AssertionError(
             "the bfloat16 fixture raised; this is a failure and not a "
@@ -655,21 +656,21 @@ def _fixture_or_skip():
 def _smol_or_skip():
     """The real-model fixture, in its own interpreter, or `None` by name."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     if not _checkpoint_path():
-        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
-        return None
+        _skip.skip(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        return
     if "s" not in _CACHE:
         _CACHE["s"] = _npu_fixture(_SMOL_SCRIPT)
     result = _CACHE["s"]
     if result["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
-        return None
+        _skip.skip("   (skipped: coremltools not installed for this interpreter)")
+        return
     if result.get("resolution", {}).get("backend") != "coreml":
-        print("   (skipped: this host's npu does not resolve to the coreml "
+        _skip.skip("   (skipped: this host's npu does not resolve to the coreml "
               "backend)")
-        return None
+        return
     if "smol_error" in result:
         raise AssertionError(
             "the SmolLM2 fixture raised; this is a failure and not a "
@@ -686,21 +687,21 @@ def _naive_or_skip():
     error at all.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return None
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     if not _checkpoint_path():
-        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
-        return None
+        _skip.skip(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        return
     if "n" not in _CACHE:
         _CACHE["n"] = _npu_fixture(_NAIVE_SCRIPT)
     result = _CACHE["n"]
     if result["coremltools"] is None:
-        print("   (skipped: coremltools not installed for this interpreter)")
-        return None
+        _skip.skip("   (skipped: coremltools not installed for this interpreter)")
+        return
     if result.get("resolution", {}).get("backend") != "coreml":
-        print("   (skipped: this host's npu does not resolve to the coreml "
+        _skip.skip("   (skipped: this host's npu does not resolve to the coreml "
               "backend)")
-        return None
+        return
     if "naive_error" in result:
         raise AssertionError(
             "the naive-path fixture raised; this is a failure and not a "
@@ -752,7 +753,7 @@ def test_the_motivating_checkpoint_really_is_bfloat16_end_to_end():
     """
     path = _checkpoint_path()
     if path is None:
-        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        _skip.skip(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
         return
     dtypes = {dtype for _, dtype, _ in _checkpoint_tensors()}
     assert dtypes == {"BF16"}, dtypes
@@ -776,7 +777,7 @@ def test_no_smollm2_weight_leaves_float16s_range_so_the_cast_loses_no_value():
 
     path = _checkpoint_path()
     if path is None:
-        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        _skip.skip(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
         return
 
     F16_MAX = 65504.0
@@ -1311,17 +1312,9 @@ def test_the_fixture_guard_stops_a_write_that_bypasses_sys_stdout():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_bf16ane")
     return 1 if failures else 0
 
 

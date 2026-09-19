@@ -54,6 +54,7 @@ from torchnative.export.qnn_plan import (  # noqa: E402
     QnnPlanUnavailable,
     plan_lowering,
 )
+import _skip
 
 
 def _real_torch():
@@ -376,7 +377,7 @@ def test_missing_qnn_ops_module_is_refused_by_name_not_a_bare_import_error():
     """
     torch = _real_torch()
     if torch is None:
-        print("   (skipped: torch.nn not importable)")
+        _skip.skip("   (skipped: torch.nn not importable)")
         return
     model = torch.nn.Sequential()
     model.add_module("a", torch.nn.Linear(4, 4))
@@ -468,12 +469,12 @@ def test_the_real_qnn_ops_table_drives_the_real_plan():
     """
     torch = _real_torch()
     if torch is None:
-        print("   (skipped: torch.nn not importable)")
+        _skip.skip("   (skipped: torch.nn not importable)")
         return
     try:
         from torchnative.export import qnn_ops  # noqa: F401
     except ImportError:
-        print("   (skipped: torchnative.export.qnn_ops is not present)")
+        _skip.skip("   (skipped: torchnative.export.qnn_ops is not present)")
         return
 
     model = torch.nn.Sequential(
@@ -519,9 +520,14 @@ if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if not name.startswith("test_") or not callable(fn):
             continue
+        _skip._state["current"] = name
         try:
             fn()
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+        else:
+            if name in _skip._state["skipped"]:
+                print(f"SKIP test_qnn_plan: {name} -- {_skip._state['skipped'][name]}")
+        _skip._state["current"] = None
     raise SystemExit(1 if failures else 0)

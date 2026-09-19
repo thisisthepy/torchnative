@@ -42,6 +42,7 @@ and watching it go red:
 
 import os
 import sys
+import _skip
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _VENDOR_DIR = os.path.join(_ROOT, "torchnative", "src", "main")
@@ -119,7 +120,7 @@ def test_a_named_soc_with_no_compute_dsp_does_not_resolve():
     """The load-bearing one. This exact report used to return a resolution."""
     D = _device_ns()
     if D is None:
-        print("   (skipped: no vendored torchnative tree)")
+        _skip.skip("   (skipped: no vendored torchnative tree)")
         return
     try:
         res = _resolve_with(D, _TAB_S9_REPORT)
@@ -140,7 +141,7 @@ def test_the_audio_dsp_is_not_accepted_as_the_compute_dsp():
     """`adsprpc` must not be in the set that licenses the claim."""
     Q = _qnn_device()
     if Q is None:
-        print("   (skipped: no vendored torchnative tree)")
+        _skip.skip("   (skipped: no vendored torchnative tree)")
         return
     for node in Q.CDSP_FASTRPC_NODES:
         assert "adsprpc" not in node, (
@@ -165,7 +166,7 @@ def test_htp_reachability_is_read_from_the_device_not_declared():
     """`htp_reachable` must come from a probe, and must be able to say no."""
     Q = _qnn_device()
     if Q is None:
-        print("   (skipped: no vendored torchnative tree)")
+        _skip.skip("   (skipped: no vendored torchnative tree)")
         return
     saved = Q.cdsp_fastrpc_nodes
     try:
@@ -185,7 +186,7 @@ def test_a_reachable_compute_dsp_still_resolves():
     """The fix must refuse the unproven case without refusing every case."""
     D = _device_ns()
     if D is None:
-        print("   (skipped: no vendored torchnative tree)")
+        _skip.skip("   (skipped: no vendored torchnative tree)")
         return
     report = dict(
         _TAB_S9_REPORT,
@@ -204,9 +205,14 @@ if __name__ == "__main__":
     for name, fn in sorted(list(globals().items())):
         if not name.startswith("test_") or not callable(fn):
             continue
+        _skip._state["current"] = name
         try:
             fn()
         except Exception as exc:  # noqa: BLE001
             failures += 1
             print(f"FAIL {name}: {type(exc).__name__}: {exc}")
+        else:
+            if name in _skip._state["skipped"]:
+                print(f"SKIP test_qnnprobe: {name} -- {_skip._state['skipped'][name]}")
+        _skip._state["current"] = None
     raise SystemExit(1 if failures else 0)

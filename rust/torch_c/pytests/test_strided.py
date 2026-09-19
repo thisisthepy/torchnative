@@ -43,6 +43,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "src", "main")
@@ -478,7 +479,7 @@ def test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total():
     aten = _source(_ATEN_RS)
     tensor = _source(_TENSOR_RS)
     if aten is None or tensor is None:
-        print("   (skipped: the crate sources are not beside this file)")
+        _skip.skip("   (skipped: the crate sources are not beside this file)")
         return
     calls = re.findall(r"\.write_into\s*\(", aten)
     assert len(calls) == 1, (
@@ -517,7 +518,7 @@ def test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_m
     tensor = _source(_TENSOR_RS)
     storage = _source(_STORAGE_RS)
     if tensor is None or storage is None:
-        print("   (skipped: the crate sources are not beside this file)")
+        _skip.skip("   (skipped: the crate sources are not beside this file)")
         return
     door = tensor[tensor.index("pub fn write_into("):]
     assert "crate::storage::write_is_barred(&dest)" in door, (
@@ -553,7 +554,7 @@ def test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier():
     aten = _source(_ATEN_RS)
     tensor = _source(_TENSOR_RS)
     if aten is None or tensor is None:
-        print("   (skipped: the crate sources are not beside this file)")
+        _skip.skip("   (skipped: the crate sources are not beside this file)")
         return
     calls = re.findall(r"bar_writes_as_strided_view\s*\(", aten)
     assert len(calls) == 2, calls
@@ -586,7 +587,7 @@ def test_the_read_only_narrowing_is_declared_in_the_golden_harness():
     """
     path = os.path.join(_REPO_ROOT, "tools", "golden", "cases.py")
     if not os.path.isfile(path):
-        print("   (skipped: cases.py is not in this tree)")
+        _skip.skip("   (skipped: cases.py is not in this tree)")
         return
     text = open(path, encoding="utf-8").read()
     assert "def as_strided_cases(" in text
@@ -613,17 +614,9 @@ def test_the_read_only_narrowing_is_declared_in_the_golden_harness():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_strided")
     return 1 if failures else 0
 
 

@@ -57,6 +57,7 @@ import subprocess
 import sys
 
 from test_shim import _C
+import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
@@ -282,10 +283,10 @@ def test_bigvgan_replays_under_the_shim_and_agrees_with_upstream():
     passing quietly. docs/architectures/VOICE4.md §5 records the run."""
     assets = os.environ.get("TORCH_C_VOICE4_ASSETS")
     if not assets:
-        print("   (skipped: TORCH_C_VOICE4_ASSETS is not set -- see docs/architectures/VOICE4.md §5)")
+        _skip.skip("   (skipped: TORCH_C_VOICE4_ASSETS is not set -- see docs/architectures/VOICE4.md §5)")
         return
     if not os.path.isfile(_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
 
     manifest = _manifest()
@@ -427,8 +428,8 @@ def _meta_run(side):
 def _meta_compare(prefix):
     shim = _meta_run("shim")
     if shim is None:
-        print("   (skipped: vendored tree has no _C.abi3.so)")
-        return 0
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
+        return
     upstream = _meta_run("upstream")
     keys = sorted(k for k in upstream if k.startswith(prefix))
     assert keys, f"the probe recorded no {prefix}* cases"
@@ -501,12 +502,12 @@ def test_bigvgan_feature_extraction_and_generation_under_the_shim_agrees_with_up
     under the shim, and generate the waveform from it, comparing both to upstream."""
     assets = os.environ.get("TORCH_C_VOICE4_ASSETS")
     if not assets:
-        print("   (skipped: TORCH_C_VOICE4_ASSETS is not set)")
+        _skip.skip("   (skipped: TORCH_C_VOICE4_ASSETS is not set)")
         return
     _VENDOR_DIR = os.path.join(os.path.abspath(os.path.dirname(__file__)), "..", "..", "..", "torchnative", "src", "main")
     _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
     if not os.path.isfile(_VENDOR_SHIM):
-        print("   (skipped: vendored tree has no _C.abi3.so)")
+        _skip.skip("   (skipped: vendored tree has no _C.abi3.so)")
         return
 
     script = r"""
@@ -614,17 +615,9 @@ def test_the_mel_tolerance_would_actually_reject_a_wrong_mel():
     assert not passed, "the mel tolerance allowed a difference of 1e-6 (should have rejected)"
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skip.run_tests(items, suite="test_voice4")
     return 1 if failures else 0
 
 

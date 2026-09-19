@@ -57,6 +57,7 @@ if _SRC_MAIN not in sys.path:
     sys.path.append(_SRC_MAIN)
 
 from test_shim import _CKPT_VENDOR_DIR, _CKPT_VENDOR_SHIM
+import _skip as _skipreg
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +711,7 @@ def _qnn_et_fixture():
 
 
 def _skip(reason):
-    print(f"   (skipped: {reason})")
+    _skipreg.skip(reason)
 
 
 def _vendor_ready():
@@ -1457,17 +1458,9 @@ def test_an_unknown_npu_name_is_still_a_plain_attribute_error():
 
 
 def _main():
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if not name.startswith("test_"):
-            continue
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            failures += 1
-            print(f"FAIL {name}: {type(e).__name__}: {e}")
-        else:
-            print(f"ok   {name}")
+    items = [(name, fn) for name, fn in sorted(globals().items())
+              if name.startswith("test_")]
+    failures = _skipreg.run_tests(items, suite="test_qnn")
     return 1 if failures else 0
 
 
