@@ -243,6 +243,12 @@ try:
                 model_, compute_units=getattr(ct.ComputeUnit, _REJECTED_UNITS_2)))
         out.setdefault("rejected_plans", {})[name] = by_shape
         out.setdefault("rejected_plans_all", {})[name] = by_shape_2
+    # Wall-clock of the measurement, so a gate log can be lined up against
+    # docs/graph/NPU2.md §9.8's cadence sampling. Which cells are silent
+    # re-assigns on a timescale nobody has pinned down; without a timestamp a
+    # log says what was measured but not when.
+    import time as _time
+    out["rejected_plans_measured_at"] = _time.strftime("%Y-%m-%dT%H:%M:%S")
     out["layer_norm_has_no_lowering"] = sorted(
         op for op in C.supported_ops() if "layer_norm" in op)
 
@@ -473,6 +479,44 @@ def test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission():
     # here, by name, instead of coming back as an intermittently empty plan.
     assert r["rejected_plans_units"] == "CPU_AND_NE", r["rejected_plans_units"]
     assert r["rejected_plans_units_2"] == "ALL", r["rejected_plans_units_2"]
+
+    # -- the measurement, printed, so that a PASS is evidence ---------------
+    #
+    # This test used to print nothing on success, so its whole contribution to
+    # a gate log was the one line `ok   test_the_rejected...`. Eight of eight
+    # rows answering and exactly two answering looked identical afterwards --
+    # and when a pass and a failure 15 minutes apart needed comparing, the
+    # passing run had kept nothing to compare (docs/graph/NPU2.md §9.8).
+    #
+    # Printed BEFORE the assertions, so a red run carries the rows too, and
+    # indented, because `suite_ledger.py` counts lines matching `^ok\s`,
+    # `^FAIL\s` and `^SKIP\s` and a row starting in column 0 could be miscounted.
+    #
+    # Nothing here asserts; it changes what the log remembers, not what the
+    # test requires.
+    _ABBREV = {"CPU": "C", "GPU": "G", "NeuralEngine": "N"}
+    print(f"  PLAN measured_at={r.get('rejected_plans_measured_at')}")
+    for name in ("relu", "gelu"):
+        for units, table in (("CPU_AND_NE", r["rejected_plans"][name]),
+                             ("ALL", r["rejected_plans_all"][name])):
+            cells = []
+            answered_here = 0
+            for shape in sorted(table):
+                row = table[shape][0] if len(table[shape]) == 1 else None
+                compact = shape.replace(" ", "")
+                if row is None:
+                    cells.append(f"{compact}=<{len(table[shape])} rows>")
+                elif row["preferred"] == "unknown":
+                    cells.append(f"{compact}=SILENT")
+                else:
+                    answered_here += 1
+                    sup = "".join(_ABBREV.get(d, d) for d in row["supported"])
+                    cells.append(
+                        f"{compact}={_ABBREV.get(row['preferred'], row['preferred'])}"
+                        f":{sup}")
+            print(f"  PLAN {name:4s} {units:10s} answered={answered_here}/4  "
+                  + " ".join(cells))
+
     for name in ("relu", "gelu"):
         by_shape = r["rejected_plans"][name]
         by_shape_all = r["rejected_plans_all"][name]

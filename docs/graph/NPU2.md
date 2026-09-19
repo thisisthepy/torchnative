@@ -1320,6 +1320,16 @@ not: nothing about the threshold was the flake. The compute-unit argument was.
 
 ### 9.7 The two columns swapped, and the silence was never a rate — measured, 2026-09-19
 
+> **Corrected AND partly withdrawn by §9.8 (same day).** Two things below did
+> not survive. (1) "re-assigns between days" — it re-assigns in **minutes**,
+> triggered by the onset of CoreML/ANE activity, not by elapsed time: 0 flips
+> in 30.8 idle minutes, 6 flips all falling inside gate runs. (2) **The union
+> guarantee this section's fix rests on is false.** §9.7 assumes the two
+> compute-unit settings are not silent on the same cell at once; gate run 4 on
+> 2026-09-19 had relu silent at both settings on three of four shapes and went
+> red. The widening below is still an improvement and the threshold is still
+> right, but it is **not** the guarantee §9.7 claims it is. See §9.8 Finding 2.
+
 **§9.6 above is superseded. Its numbers are left in place on purpose**, the way
 §9.6 left §9.1's in place: the argument in §9.6 is still the right argument and
 the measurement behind it was honestly taken, but the column it chose is no
@@ -1473,9 +1483,199 @@ which is the check that the new rows are graded rather than merely counted.
 | **tests added** | 0. Existing test strengthened: up to 8 graded rows per op instead of 4, and two payload keys whose absence fails it |
 | **defect fixed** | the fixture interrogated a single compute-unit setting whose willingness to answer is not stable across days — deterministically red on develop as of today |
 
+### 9.8 The assignment moves on activity, not on elapsed time — and §9.7's guarantee is false. Measured, 2026-09-19
 
+Two findings, and the second one **falsifies the fix §9.7 landed**. They are
+kept together because the same hour of sampling produced both.
 
----
+§9.7 said the silent cells "re-assign between days". They re-assign in
+**minutes**, the trigger is activity rather than the clock, and — the part that
+matters — the two compute-unit settings **do** go silent on the same cell at
+the same time, which is precisely what §9.7 assumed they would not.
+
+The prompt was a timestamp, not a measurement: two full gate runs on `f81086b`
+about 15 minutes apart, nothing rebuilt between them, run 1 green and run 2 red.
+
+#### Method
+
+One sample every 60 s, each in a **fresh subprocess**, reading all 16 cells of
+the grid (2 ops x 4 shapes x 2 settings) from freshly compiled artefacts.
+**87 samples over 91.7 minutes = 1392 cell-observations**, interleaved with
+four full gate runs on an otherwise idle machine.
+
+#### Finding 1 — the trigger is activity onset, not elapsed time
+
+| phase | span | duration | flips |
+|---|---|---|---|
+| quiet — nothing but the sampler | 14:30 – 15:01 | 30.8 min | **0** |
+| **gate run 1** | 15:01:23 – 15:16:30 | 15.1 min | **3 + 1** |
+| idle gap | 15:16:30 – 15:17:00 | 0.5 min | 0 |
+| **gate run 2** | 15:17:00 – 15:32:06 | 15.1 min | **0** |
+| idle gap | 15:32:06 – 15:33:36 | 1.5 min | 0 |
+| **gate run 3** | 15:33:36 – 15:49:02 | 15.4 min | **1** |
+| idle gap | 15:49:02 – 15:49:14 | 0.2 min | 0 |
+| **gate run 4** | 15:49:14 – 16:01:40 | 12.4 min | **1** |
+
+All six flips in the hour and a half fell **inside a gate run**. None fell in
+the 30.8 quiet minutes, and none in any idle gap. Measured from the start of
+the gate that contained them, the flips land at **+53 s, +3 m 01 s, +4 m 05 s**
+(run 1), **+41 s** (run 3) and **+4 m 16 s** (run 4) — early in the run, not
+spread through it. Run 2 moved nothing at all, so heavy CoreML work is not
+sufficient either; **not every provocation flips something.**
+
+```
+15:02:16  [GATE1]  relu [256,1023] @ ALL          answer -> SILENT
+15:02:16  [GATE1]  relu [256,1024] @ ALL          answer -> SILENT
+15:04:24  [GATE1]  gelu [256,1024] @ ALL          answer -> SILENT
+15:05:28  [GATE1]  relu [256,1024] @ CPU_AND_NE   SILENT -> answer
+15:34:17  [GATE3]  relu [128,1024] @ ALL          answer -> SILENT
+15:53:30  [GATE4]  relu [256,1024] @ CPU_AND_NE   answer -> SILENT
+```
+
+**The drift has a direction.** Five of the six flips are `answer -> SILENT`,
+and the total silent count rose monotonically apart from one transient dip:
+**4 -> 6 -> 7 -> 6 -> 7 -> 8 of 16** across the four runs. Waiting does not
+restore it; over this hour, work only ever cost answers.
+
+**It is global state, not per-process.** The sampler is a different process
+from the gate's fixture, and at 15:06 the two agreed cell for cell — the gate
+printed `relu[256,1024]@CPU_AND_NE = C:CN` and `@ALL = SILENT` at 15:06:07,
+which is exactly what the 15:06:32 sample independently recorded.
+
+**Mechanism still not established.** Activity-onset is the measured *trigger*.
+What it acts on was not instrumented; ANE power or scheduler state is the
+obvious candidate and there is no evidence for it here, so it is not claimed.
+
+#### Finding 2 — §9.7's union guarantee is falsified, and the test is still flaky
+
+§9.7 rests on "at least one of `ALL` / `CPU_AND_NE` answers", and asserts
+`answered >= 2` over the union. **That does not hold.** The four gate runs,
+read off the new `PLAN` lines, show the relu union decaying monotonically:
+
+| | gate 1 (15:06) | gate 2 (15:21) | gate 3 (15:38) | gate 4 (15:54) |
+|---|---|---|---|---|
+| relu `CPU_AND_NE` | 2/4 | 2/4 | 2/4 | 1/4 |
+| relu `ALL` | 2/4 | 2/4 | 1/4 | 1/4 |
+| **relu union** | **3/4** | **3/4** | **2/4** | **1/4** |
+| gelu union | 4/4 | 4/4 | 4/4 | 4/4 |
+
+**Gate run 4 failed**, `1798 ok, 1 FAIL, suites 97/97`, on
+`answered >= 2` with the relu union at 1 of 4: `[256,1024]`, `[128,1024]` and
+`[256,1023]` were silent **at both settings simultaneously**. That is the
+event §9.7 claimed had not been observed, and it is now observed.
+
+So §9.7's widening **reduced** the flakiness without removing it — gate 3 would
+have been red under the pre-§9.7 single-setting test at 2/4 and passed at 2/4
+on the union, which is real; but the union is not a guarantee, it is a second
+sample of a quantity whose silences are **correlated across settings**, and
+§9.7's independence assumption between settings was the same mistake §9.6.1
+made between shapes. Two rounds have now assumed independence in this quantity
+and been wrong both times.
+
+What this does **not** license is lowering the threshold. `answered >= 1` would
+make the test pass by requiring almost nothing, and an op silent at every shape
+and both settings — which is one more flip away — would still fail it. The
+honest position is that **the test is correct and the measurement is sometimes
+unavailable**, and that the gap is unresolved. Options not taken here, recorded
+so the next round does not re-derive them:
+
+- **Re-ask on silence.** `preferred: unknown` is a refusal to answer, not a
+  verdict (§9.3), so recompiling and re-querying a refused cell is re-asking a
+  question rather than retrying until a result is liked. It would need a bound
+  and a named failure when the bound is hit.
+- **More shapes.** The drift touched 4 of 8 relu cells in 90 minutes; a wider
+  sweep buys headroom but not a guarantee, since the drift is directional.
+- **Skip with a named reason when the measurement is unavailable.** Rejected
+  without being tried: this repo already has 24 silent skips and a `skip ...`
+  line that the ledger counts as `ok`, and adding a 25th to make a red test
+  green is the worst of the options.
+
+#### 9.8.1 A pass now leaves evidence
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` printed
+**nothing on success**. Its whole contribution to a gate log was one line,
+`ok   test_the_rejected...`, so 8 of 8 rows answering and exactly 2 answering
+were indistinguishable afterwards — and when the green run and the red run 15
+minutes apart needed comparing, the green one had kept nothing to compare.
+
+It now prints the measured rows, **before** the assertions so a red run carries
+them too, indented so `suite_ledger.py`'s `^ok\s` / `^FAIL\s` / `^SKIP\s`
+matchers cannot miscount them, with the fixture's wall-clock so a log can be
+lined up against a cadence sample:
+
+```
+  PLAN measured_at=2026-09-19T15:06:07
+  PLAN relu CPU_AND_NE answered=2/4  [128,1024]=SILENT [255,1024]=C:CN [256,1023]=SILENT [256,1024]=C:CN
+  PLAN relu ALL        answered=2/4  [128,1024]=C:CGN [255,1024]=C:CGN [256,1023]=SILENT [256,1024]=SILENT
+  PLAN gelu CPU_AND_NE answered=4/4  [128,1024]=C:CN [255,1024]=C:CN [256,1023]=C:CN [256,1024]=C:CN
+  PLAN gelu ALL        answered=2/4  [128,1024]=C:CGN [255,1024]=SILENT [256,1023]=C:CGN [256,1024]=SILENT
+```
+
+`C`/`G`/`N` abbreviate `CPU`/`GPU`/`NeuralEngine`; the form is
+`preferred:supported`. **Nothing here asserts** — it changes what the log
+remembers, not what the test requires, and §9.7's five gutting checks were
+re-run against it unchanged and all five still go red.
+
+**It paid for itself within the hour.** Finding 2's decay table is read
+entirely off these lines; without them gate 4 would have been one more
+`FAIL ... flaky` with no way to see that the union had been eroding across the
+three green runs before it. The 15:06:07 stamp is also what let the gate's own
+measurement be matched against the independent sampler, which is the evidence
+that the state is global rather than per-process.
+
+#### 9.8.2 It is not only this test — `test_anedecode.py` fails from the same drift
+
+Gate run 5 (16:09) passed `test_coremlops.py` — the relu union had recovered to
+exactly 2 of 4 — and failed **`test_anedecode.py`** instead:
+
+```
+FAIL test_a_flexible_input_dimension_does_not_change_the_decision:
+     RuntimeError: npu subprocess exited 1
+     ... raise ComputePlanRefused(str(error)) from error
+```
+
+Same phenomenon, different suite: `MLComputePlan` refused to answer, and that
+suite surfaces the refusal as `ComputePlanRefused` rather than as an `unknown`
+row. So the drift measured in §9.8 is **not scoped to the test §9.7 fixed** —
+it destabilises the ANE-dependent part of the gate generally, and any suite
+that asks `MLComputePlan` a question is exposed to it.
+
+This also means the gate is **not reliably green on this machine at present**,
+for a reason outside the repository. Across **six** full runs of the same tree
+on 2026-09-19, nothing rebuilt between them:
+
+| run | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| result | ok | ok | ok | **FAIL** | **FAIL** | ok |
+| failing suite | — | — | — | `test_coremlops` | `test_anedecode` | — |
+| relu union | 3/4 | 3/4 | 2/4 | **1/4** | 2/4 | 3/4 |
+
+**2 red in 6, and the two reds were different suites.** A round that reads a
+single green run here as a clean baseline will be wrong about a third of the
+time — which is exactly how §9.6's flake came to be mis-attributed to an
+innocent branch. The relu union row also shows the drift is not monotone over
+a longer window: it fell 3 -> 1 across runs 1-4 and recovered to 3 by run 6,
+without the machine being idle for any of it.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_measured_at present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _ABBREV present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/suite_ledger.py tally present -->
+
+| | |
+|---|---|
+| **claim withdrawn** | §9.7's "at least one of `ALL` / `CPU_AND_NE` answers". Gate run 4 had relu silent at both settings on three of four shapes and went red |
+| **claim corrected** | §9.7's "re-assigns between days" — it re-assigns in minutes, on activity onset |
+| **claim added** | all 6 flips in 1392 cell-observations fell inside a gate run; 0 in 30.8 idle minutes and 0 in every idle gap; flips land within ~4 min of a run's start |
+| **claim added** | the drift is directional — 5 of 6 flips were `answer -> SILENT`, total silent 4 -> 8 of 16 over four runs |
+| **claim added** | the state is global, not per-process — independent sampler and gate fixture agreed cell-for-cell at the same minute |
+| **claim added** | heavy CoreML work is not sufficient to flip anything — gate run 2 moved nothing |
+| **limitation named** | what the activity acts on is not instrumented; no mechanism is claimed |
+| **limitation named** | **the test remains flaky.** §9.7 reduced the failure rate and did not remove it; three candidate fixes are recorded above, none implemented |
+| **test strengthened** | a passing run records which shapes answered at which setting, with a timestamp |
+| **threshold unchanged** | `answered >= 2`. Not lowered to make gate 4 pass — that is the one move ruled out |
+| **tests added** | 0 |
+| **defect fixed** | a green run of this test destroyed the only record of the quantity it measured |
+
 
 ## 10. Two failures in one file, and only one of them was the fixture's
 
