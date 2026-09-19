@@ -16482,7 +16482,7 @@ fn memory_format_name(value: &Bound<'_, PyAny>) -> String {
         .unwrap_or_else(|_| value.str().map(|s| s.to_string()).unwrap_or_default())
 }
 
-fn reject_memory_format(
+pub(crate) fn reject_memory_format(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,

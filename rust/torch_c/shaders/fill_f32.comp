@@ -1,0 +1,35 @@
+#version 450
+
+// `aten.ones_like.default` and `aten.zeros_like.default` -- a constant fill,
+// on the GPU: out[i] = s.
+//
+// **Why this is a shader when `torch.ones(..., device="vulkan")` is not.**
+// `vulkan.rs` `factory` builds the fill on the host and uploads it, and says
+// there that a fill shader "would prove nothing more about the wiring". That
+// is true of a *constructor at the edge of a program* and false of the one
+// `torch/autograd/__init__.py` `_make_grads` calls to seed every
+// `loss.backward()`. An uploading `ones_like` would put a host transfer in
+// the middle of every training step, and `host_uploads == 0` is the only
+// evidence this device has that a step did not silently run on the CPU
+// (docs/devices/VULKAN9.md §6 N2 -- a host twin produced entirely correct
+// values and only the counters caught it). So the seed is a kernel, and the
+// counter stays readable.
+//
+// The value arrives as its float32 *bit pattern* in the push constants, the
+// way `scalar_f32.comp` takes its scalar: `uintBitsToFloat` is an exact
+// reinterpretation, so no staging buffer and no rounding.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float unused_a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: elements, p1: the fill value's float32 bits
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    c[i] = uintBitsToFloat(pc.p1);
+}
