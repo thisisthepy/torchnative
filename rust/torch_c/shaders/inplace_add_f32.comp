@@ -1,0 +1,45 @@
+#version 450
+
+// `aten.add_.Tensor` for f32, **written into the receiver's own buffer**:
+//     a[i] = a[i] + s * b[i]
+//
+// The first shader on this device that writes where it also reads, and the
+// only reason that is sound here is the ownership check in `vulkan.rs`
+// (`require_exclusive`): the dispatch happens only when the receiver's
+// `Arc<VkBuffer>` has exactly one live reference, so no other tensor can
+// observe these bytes. See docs/devices/VULKAN11.md §2.
+//
+// Binding 0 is read *and* written. `b` may legitimately be the same buffer --
+// `x.add_(x)` is one tensor passed twice -- and that is safe without any
+// decoration because invocation `i` touches index `i` only: it reads a[i] and
+// b[i] and writes a[i], all in program order within the one invocation, and
+// never reads an index another invocation writes.
+//
+// `s` is `alpha`, and it is here rather than rejected because
+// `torch.optim.SGD` spells its whole update `p.add_(d_p, alpha=-lr)` -- an
+// `add_` without alpha would not carry the optimizer this shader exists for.
+// It arrives as a float32 *bit pattern* in the push constants the way
+// `scalar_f32.comp` takes its scalar, so there is no staging buffer and no
+// rounding on the way in.
+//
+// `a[i] + s * b[i]`, two separately rounded IEEE operations, and deliberately
+// not `fma(s, b[i], a[i])`: the shim's own CPU arm (`arith_inplace_tensor` in
+// aten.rs) scales by alpha and then adds, so a fused multiply-add here would
+// compute a different function from the CPU spelling of the same op. Both are
+// within the derived tolerance against upstream; agreeing with this repo's
+// other answer for `add_` is the tie-breaker.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0)          buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer B { float b[]; };
+
+// n: elements, p1: alpha's float32 bits
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float s = uintBitsToFloat(pc.p1);
+    a[i] = a[i] + s * b[i];
+}
