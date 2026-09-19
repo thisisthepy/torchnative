@@ -58,13 +58,14 @@ see below.
   separates a real write from a `replace_with`, and it is behavioural, not
   structural.
 * *placement* -- **weaker than a counter, and this file says so rather than
-  grading around it.** This build has no Metal dispatch counter: `device.rs`
-  has `_cuda_counters()` and `_vulkan_counters()` and nothing of the kind for
-  Metal, and candle's `MetalDevice` exposes no countable kernel launch
-  (docs/devices/matrix.md §7.5). Three separate rounds on 2026-09-19 planted a
-  host-computed twin, found the values entirely correct and the agreement test
-  green, and **only a dispatch counter caught the fallback**. That instrument
-  does not exist here. So the placement evidence is (a) the device branch
+  grading around it.** Three separate rounds planted a host-computed twin,
+  found the values entirely correct and the agreement test green, and **only a
+  dispatch counter caught the fallback** -- all three on Vulkan, which is the
+  correction CLAUDE.md §2 records against the inflated citation of that number.
+  A Metal counter now exists (`_C._metal_counters()`,
+  docs/devices/matrix.md §7.11) and **this file does not use it**: no test
+  below asserts a counter delta for the in-place family, so these cells remain
+  where §7.5 put them. So the placement evidence is (a) the device branch
   returns before `flat_storage` is ever reached, re-derived from `tensor.rs`
   by the scan below on every gate run, and (b) the receiver comes back on
   `mps` with a device-resident result. Neither can distinguish a write done by

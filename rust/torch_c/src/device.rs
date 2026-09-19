@@ -1698,6 +1698,68 @@ mod cuda_tests {
     }
 }
 
+
+/// `_C._metal_counters()` -- **the runtime answer to "did the GPU do it?" on
+/// Metal**, which until now this build could not ask.
+///
+/// docs/devices/matrix.md §7.5 named the absence and its cost: a kernel swapped
+/// for a host-computed twin keeps every value correct, keeps its `.device`
+/// label, and keeps its agreement test green. Three rounds performed exactly
+/// that substitution and **only a dispatch counter caught it** -- all three on
+/// Vulkan, because Vulkan was the only backend with one (CLAUDE.md §2). So
+/// every `mps` placement claim in this repository rested on source-derived
+/// evidence that docs/devices/MPSATTN.md §3.1 records as defeatable by moving
+/// a `read_flat` one call deeper.
+///
+/// The six numbers come from `candle_core::metal_backend::counters`, which is
+/// part of the vendored fork (`vendor/int8-candle-0.11.0-cpu.patch`) because
+/// there is nowhere else they can come from: the doors are inside candle's
+/// Metal backend, and anything counted on this side of the boundary would be
+/// counting this crate's *intent* rather than the GPU's work. Their exact
+/// meanings are documented beside the statics; the short form:
+///
+/// * `compute_encoders` -- kernel launches, at the one door candle opens them
+///   through. **A lower bound on GPU dispatches, not a count of
+///   `dispatch_threads`**: those are encoded in `candle-metal-kernels`, which
+///   this vendoring does not cover. A host-computed twin cannot raise it.
+/// * `blit_encoders` -- device copies, including the one `to_cpu` makes.
+/// * `host_uploads` / `host_downloads` (+ `_bytes`) -- crossings of the host
+///   boundary, at candle's only two doors for them.
+///
+/// **This function perturbs nothing.** It opens no device -- a build with no
+/// Metal device reports six zeros, which is the truthful answer -- and
+/// allocates nothing. On a non-Apple build `built` is `false` and every
+/// counter is `None` rather than `0`, because a zero there would read as "the
+/// GPU ran no kernels" when the truth is "there is no Metal in this artefact".
+#[pyfunction]
+#[pyo3(name = "_metal_counters")]
+fn metal_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    const NAMES: [&str; 6] = [
+        "compute_encoders",
+        "blit_encoders",
+        "host_uploads",
+        "host_upload_bytes",
+        "host_downloads",
+        "host_download_bytes",
+    ];
+    let d = PyDict::new(py);
+    d.set_item("built", cfg!(target_vendor = "apple"))?;
+    #[cfg(target_vendor = "apple")]
+    {
+        let snap = candle_core::metal_backend::counters::snapshot();
+        for (name, value) in NAMES.iter().zip(snap.iter()) {
+            d.set_item(*name, *value)?;
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        for name in NAMES.iter() {
+            d.set_item(*name, py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
@@ -1710,6 +1772,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_probe, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
     m.add_function(wrap_pyfunction!(mps_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
     Ok(())
 }
 

@@ -21,6 +21,84 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 mod device;
 pub use device::{DeviceId, MetalDevice};
 
+/// **Metal dispatch counters** -- the countable thing `MetalDevice` did not have.
+///
+/// Added by this fork, and by this fork because there is nowhere else to put
+/// it: every door below is inside `candle-core`'s Metal backend, and a counter
+/// outside the crate can only describe the *caller's* intent, which is exactly
+/// the evidence that three Vulkan rounds showed to be defeatable. A kernel
+/// swapped for a host-computed twin keeps every value correct, keeps the
+/// `.device` label, and keeps passing its agreement test; what it cannot keep
+/// is a compute encoder it never opened.
+///
+/// What each number is, stated narrowly so it is not over-read:
+///
+/// * `compute_encoders` -- successful `MetalDevice::command_encoder()` calls.
+///   Every kernel launch this crate performs goes through that one door and
+///   hands the guard straight to a `candle_metal_kernels::call_*`, which
+///   encodes at least one `dispatch_thread*`. It is therefore a lower bound on
+///   GPU dispatches and an exact count of *this crate's* GPU op invocations.
+///   It is **not** a count of `dispatch_threads` calls: those happen in
+///   `candle-metal-kernels`, a crate this vendoring does not cover.
+/// * `blit_encoders` -- successful `MetalDevice::blit_command_encoder()` calls
+///   (device-to-device copies, and the copy `to_cpu` makes before reading).
+/// * `host_uploads` / `host_upload_bytes` -- host-to-device copies, counted
+///   inside `MetalDevice::new_buffer_with_data`, which is the only door
+///   `storage_from_cpu_storage`, `storage_from_slice` and `BufferBuilder`'s
+///   `with_data` all pass through.
+/// * `host_downloads` / `host_download_bytes` -- device-to-host reads, counted
+///   inside `MetalStorage::to_cpu`, the only place this backend maps device
+///   bytes into a `Vec`.
+///
+/// Process-wide and `Relaxed`, for the same reason the Vulkan counters are:
+/// they are read before and after an operation on one thread, so the only
+/// ordering that matters is the program order of that thread.
+pub mod counters {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static COMPUTE_ENCODERS: AtomicU64 = AtomicU64::new(0);
+    pub static BLIT_ENCODERS: AtomicU64 = AtomicU64::new(0);
+    pub static HOST_UPLOADS: AtomicU64 = AtomicU64::new(0);
+    pub static HOST_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static HOST_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+    pub static HOST_DOWNLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    /// `[compute_encoders, blit_encoders, host_uploads, host_upload_bytes,
+    /// host_downloads, host_download_bytes]`, read in that fixed order.
+    ///
+    /// An array rather than a struct so a caller outside this crate can name
+    /// the six numbers without this fork having to publish a type whose shape
+    /// it would then owe compatibility to.
+    pub fn snapshot() -> [u64; 6] {
+        [
+            COMPUTE_ENCODERS.load(Ordering::Relaxed),
+            BLIT_ENCODERS.load(Ordering::Relaxed),
+            HOST_UPLOADS.load(Ordering::Relaxed),
+            HOST_UPLOAD_BYTES.load(Ordering::Relaxed),
+            HOST_DOWNLOADS.load(Ordering::Relaxed),
+            HOST_DOWNLOAD_BYTES.load(Ordering::Relaxed),
+        ]
+    }
+
+    pub(crate) fn note_compute_encoder() {
+        COMPUTE_ENCODERS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_blit_encoder() {
+        BLIT_ENCODERS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_host_upload(bytes: usize) {
+        HOST_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        HOST_UPLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_host_download(bytes: usize) {
+        HOST_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
+        HOST_DOWNLOAD_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
@@ -2017,6 +2095,8 @@ impl MetalStorage {
             blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);
         }
         self.device.flush_and_wait_current()?;
+        // The one place this backend maps device bytes into host memory.
+        counters::note_host_download(size);
         Ok(read_to_vec(&buffer, self.count))
     }
 }

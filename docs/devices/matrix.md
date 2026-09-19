@@ -875,8 +875,14 @@ and the readback sentence must not.
 
 ### 7.5 What this round could not prove, and the one thing that would fix it
 
-**There is no Metal dispatch counter in this build.** `device.rs` has
-`_cuda_counters()` and `_vulkan_counters()`; Metal has neither, and candle's
+> **Closed on 2026-09-20 by §7.11.** `_C._metal_counters()` exists, the fork
+> carries the counters, and §7.12 records the substitution experiment this
+> section says could not be run. The paragraph below is left as it was written
+> because §7.11 is only readable against it; read it as history, not as the
+> current state.
+
+**There was no Metal dispatch counter in this build.** `device.rs` has
+`_cuda_counters()` and `_vulkan_counters()`; Metal had neither, and candle's
 `MetalDevice` exposes no countable kernel launch — `capture()` writes a
 `.gputrace` and nothing smaller. So the placement evidence for §7.3's four
 cells is (a) the kernel performs no host readback *by construction*, re-derived
@@ -1107,3 +1113,137 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
 <!-- DOCWATCH: op-implemented aten.clamp_min_.default -->
+
+---
+
+### 7.11 The Metal dispatch counter — §7.5's missing instrument, built
+
+§7.5 said a Metal counter "is **the** piece of infrastructure that would raise
+every `mps` cell in this document above the present ceiling, and it is not
+built here." It is built now. `_C._metal_counters()` returns six numbers and a
+`built` flag, in the shape `_cuda_counters()` and `_vulkan_counters()` already
+use:
+
+| key | door it is counted at | what it means |
+|---|---|---|
+| `compute_encoders` | `MetalDevice::command_encoder()` | kernel launches |
+| `blit_encoders` | `MetalDevice::blit_command_encoder()` | device copies |
+| `host_uploads`, `host_upload_bytes` | `MetalDevice::new_buffer_with_data()` | host → device |
+| `host_downloads`, `host_download_bytes` | `MetalStorage::to_cpu()` | device → host |
+
+**The counters are in `vendor/candle-core`, and they had to be.** §7.5 named
+that as the reason not to build it inside a round about something else; this
+round was given the fork. They cannot live on this side of the FFI boundary:
+a counter in `aten.rs` counts what this crate *intended*, and a host-computed
+twin intends exactly what the real kernel intends. Only candle can say whether
+a compute encoder was opened. Every edit went into
+`vendor/int8-candle-0.11.0-cpu.patch` and the tree was regenerated from it, so
+`sh vendor/vendor_candle.sh --check` still passes byte for byte.
+
+**What `compute_encoders` is, stated narrowly enough that it cannot be
+over-quoted.** It is a successful `command_encoder()` call, which candle hands
+straight to a `candle_metal_kernels::call_*` that encodes at least one
+`dispatch_thread*`. So it is a **lower bound on GPU dispatches** and an exact
+count of candle's GPU op invocations — *not* a count of `dispatch_threads`,
+which happen in `candle-metal-kernels`, a crate this vendoring does not cover.
+Quoting it as "N kernels ran" would be the same kind of inflation-by-citation
+CLAUDE.md §2 records for the "four rounds"/"five rounds" count.
+
+Measured, one `aten.abs.default` on an `mps` `float32` `[2, 3]`:
+
+    build the operand   uploads 1 (+24 bytes), compute 0
+    abs                 compute 1, downloads 0
+    .cpu()              blits   1, downloads 1 (+24 bytes)
+
+**Which `mps` claims this upgrades.** §7.3's four `abs` cells
+(`float32`/`float16`/`bfloat16`/`int64`) move from structural evidence — "no
+host readback by construction", re-derived from source — to **counted**
+evidence: `test_metalcount.py` asserts `compute_encoders >= 1` and
+`host_downloads == 0` across the dispatch itself, on all four dtypes, beside
+an agreement check against a subprocess oracle.
+
+**Which it does not reach.** Every other `mps` cell in §6's table is still at
+the old standard, because the counter is an instrument and not a sweep: no
+test in this round asserts a counter delta for `softmax_on_device`, for the
+§7.7 in-place family, or for any of the 43 operators §7.8 measured. Those
+remain where §7.5 put them until someone writes the assertion. The instrument
+now exists; the work of pointing it at each cell does not.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs metal_counters present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_abs_on_mps_opens_a_metal_kernel_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_a_cpu_op_moves_no_metal_counter present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_a_readback_costs_exactly_the_tensors_bytes present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_metal_counters_answers_with_all_six_names present -->
+<!-- DOCWATCH: op-implemented aten.abs.default -->
+
+### 7.12 The experiment that could not be run on Metal, run
+
+CLAUDE.md §2 records three rounds that replaced a device kernel with a
+host-computed twin — `7dff9f0`, `35e002f`, `22d9158` — and notes that all three
+are Vulkan, because Vulkan was the only backend with a counter. This is the
+Metal one.
+
+**The subject.** `integral_abs_on_device` (the integral path of
+`aten.abs.default`, `maximum(x, 0 - x)`), the kernel §7.3 moved onto Metal and
+whose four cells §7.11 upgrades. **Two twins were planted**, both computing
+`wrapping_abs` on the host from `to_vec1::<i64>()` and rebuilding the tensor on
+the same device, and both returning values identical to upstream's:
+
+| twin | where the readback lives | `test_shim.py` classification scan | `test_absmps.py` (4 tests) | `test_metalcount.py` |
+|---|---|---|---|---|
+| M1 | inside `integral_abs_on_device`, in `aten.rs` | **RED** — named the function | 4 of 4 green | **RED** |
+| M2 | one file deeper, `tensor.rs::twin_abs_i64` | **green — 480 ok, 0 FAIL** | 4 of 4 green | **RED** |
+
+M2 is the result that matters, and it is the one the Vulkan rounds predicted.
+The entire existing gate — every value test, the wrap-at-`INT_MIN` test, the
+readback-gate table test, and the source scan whose whole purpose is to catch
+this — stayed green while `abs` on `int64`/`mps` was computed on the CPU. The
+counter said:
+
+    compute_encoders 0   blit_encoders 1   host_downloads 1 (+48 bytes)
+
+**M1 is a finding in the other direction and is reported as one.** The scan is
+not as blind as §7.5 implied: it catches a readback added directly to a
+function in `aten.rs`, by name, which is exactly what it claims to do. Its
+blind spot is narrower than "one call deeper" — it is *one file over*, because
+`_aten_rs_functions()` parses `aten.rs` and only `aten.rs`. That is worth
+knowing precisely rather than approximately.
+
+**No kernel already claiming device residency was found to be falling back.**
+The four `abs` cells were tested with the counter before any mutant was
+planted and all four opened a compute encoder and downloaded nothing. The
+substitution above is a mutant this round introduced and removed, not a defect
+it discovered.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs integral_abs_on_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs twin_abs_i64 absent -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
+
+### 7.13 `DType::I8` on Metal — declined, with the reason measured
+
+284 matrix cells fail at stage `operands`: `_tensor_from_flat` cannot build an
+`int8` tensor on `mps` at all, because the fork's `DType::I8` is CPU-only
+(docs/numerics/INT8.md §1.2) and `storage_from_cpu_storage` refuses
+`CpuStorage::I8`. Lifting that refusal was considered this round and **is not
+done**, for a reason that is a fact about a crate rather than a preference:
+
+`candle_metal_kernels::DType` has exactly six variants — `BF16 F16 F32 I64 U32
+U8` — and the MSL sources instantiate every kernel for those six and no others
+(`binary.metal`'s `init_binary` macro). `I8` is not among them. So the reach
+of a change confined to `candle-core` is precisely this: the *buffer* could be
+built, and every kernel would then refuse for want of a shader symbol. That
+converts 284 `operands` failures into 284 kernel-stage refusals and moves **no
+cell to AGREES** — a tensor that exists and can do nothing, which is a worse
+answer than the refusal it replaces, not a better one.
+
+This is the same wall `int16`/`int32` hit, and `device.rs`'s
+`_shim_mps_unsupported_int_dtypes` is the decision already taken for it
+(docs/numerics/DTYPEDEV.md §4.2). Making `int8` reach a Metal kernel means
+adding shader instantiations to `candle-metal-kernels`, a **second** crate to
+vendor. This round's approval was to patch this fork, so that decision is left
+where it belongs: with the user, stated rather than taken.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs shim_mps_unsupported_int_dtypes present -->
