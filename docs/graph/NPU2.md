@@ -1216,6 +1216,14 @@ at `CPU_AND_NE`. The shape CoreML declines is still present as a named
 
 ### 9.6 The silence belongs to `ComputeUnit.ALL` — measured, 2026-09-16
 
+> **Superseded by §9.7 (2026-09-19).** The numbers below are kept visible
+> rather than edited away, as §9.6 kept §9.1's. Two of them did not survive:
+> the columns of the table below have since **swapped** — `CPU_AND_NE` is now
+> the silent one and `ALL` answers — and the "0.7% per observation" is not a
+> rate at all. Measured over 800 observations in fresh subprocesses, the
+> silence is deterministic per (op, shape, setting) within a day and
+> re-assigns between days, so §9.6.1's `4 * 0.007**3` was never valid.
+
 `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was the
 flakiest thing on `develop`. Across four solitary gate runs it graded 4, then
 1, then 1, then 0 answered shapes — and the run that answered all four was
@@ -1309,6 +1317,163 @@ not: nothing about the threshold was the flake. The compute-unit argument was.
 | **limitation named** | why `ALL` declines for a given program, and why `CPU_AND_NE` declines once in 144, is not established |
 | **threshold unchanged** | `answered >= 2`, now with the arithmetic behind it (§9.6.1) rather than as a residue |
 | **tests added** | 0 — this is the existing test moved off a configuration that answers on luck |
+
+### 9.7 The two columns swapped, and the silence was never a rate — measured, 2026-09-19
+
+**§9.6 above is superseded. Its numbers are left in place on purpose**, the way
+§9.6 left §9.1's in place: the argument in §9.6 is still the right argument and
+the measurement behind it was honestly taken, but the column it chose is no
+longer the answering one, and the "0.7%" it reported is not a quantity that
+exists.
+
+#### What was asked
+
+A full gate run failed `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission`
+with relu silent at three of its four shapes at `CPU_AND_NE`. On §9.6's rate
+that is `4 * 0.007**3` — about one run in a million. The back-to-back gate run
+before it had passed. So either the machine hit one in a million, or the rate
+moved.
+
+#### The rate moved, and it is not a rate
+
+Every observation below is in a **separate, fresh subprocess** — 100 of them,
+800 observations, on a quiet machine with nothing else running.
+
+| | observations | silent | rate | 95% CI (Wilson) |
+|---|---|---|---|---|
+| §9.6, 2026-09-16, `CPU_AND_NE` | 144 | 1 | 0.69% | [0.12%, 3.83%] |
+| **today, `CPU_AND_NE`, same 8 pairs** | **800** | **300** | **37.5%** | **[34.2%, 40.9%]** |
+
+The intervals do not overlap and are not close. But the aggregate rate is the
+less important half, because **the silence is not distributed at random across
+observations at all.** Broken out per (op, shape), every cell is at 0 or at 1:
+
+| (op, shape) at `CPU_AND_NE` | silent / runs | rate | 95% CI |
+|---|---|---|---|
+| relu `(256, 1024)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(128, 1024)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(256, 1023)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(255, 1024)` | 0 / 100 | 0% | [0%, 3.7%] |
+| gelu, all four shapes | 0 / 400 | 0% | [0%, 0.95%] |
+
+Not one cell flipped in 800 observations. **"A 0.7% per-observation silence
+rate" was a description of a quantity that does not behave like a rate**: it is
+deterministic given (op, shape, compute-unit setting) within a day, and it
+re-assigns itself between days. §9.6's single silent observation in 144 was
+that re-assignment beginning, not a coin landing badly, and the arithmetic
+§9.6.1 built on it — `4 * 0.007**3` — was never valid, including on the day it
+was written.
+
+#### The columns swapped
+
+Asking the **same compiled artefact** at all three settings, in one process:
+
+| relu artefact | `ALL` | `CPU_AND_NE` | `CPU_ONLY` |
+|---|---|---|---|
+| `(256, 1024)` | answers, `preferred=CPU`, `supported=[CPU, GPU, NeuralEngine]` | **no plan at all** | answers |
+| `(255, 1024)` | answers | answers, `supported=[CPU, NeuralEngine]` | answers |
+
+This is §9.6's table with the columns exchanged. §9.6 chose `CPU_AND_NE`
+*because* it answered 8 of 8 while `ALL` answered 2 of 8; today `ALL` answers 8
+of 8 and `CPU_AND_NE` answers 5 of 8. §9.6 already recorded the same
+re-assignment happening once before, between 09-13 and 09-16, and named it as
+not established. It has now happened twice. **Neither setting is the reliable
+one; what is reliable is that at least one of them answers.**
+
+The whole-program claim from §9.6 survives unchanged and is re-measured here:
+at `(256, 1024)` at `CPU_AND_NE` the boundary `ios16.cast`s are silent too, all
+three operations or none.
+
+#### The suspect was wrong, measured rather than argued
+
+The round's hypothesis was `ad9c5cc` ("group decoder layers into one compiled
+program"), which landed the same day and added `test_anetracer.py` — heavier
+CoreML/ANE work, in the same gate run, alphabetically ahead of
+`test_coremlops.py`. Two independent results refute it.
+
+**It is not in the code.** `ad9c5cc` touches `export/coreml.py` with +324 lines
+and **0 deletions**, all of them new `_group_decoder_layers` /
+`_build_decoder_subgraph_program` definitions. It does not modify
+`compile_model`, `compute_plan` or `computes`, which are the entire path this
+measurement runs through. Those three functions are byte-identical to what
+§9.6 measured.
+
+**It is not in the run order either.** 30 trials per arm, each observation in
+its own fresh subprocess, **order counterbalanced** — odd trials ran arm A
+first, even trials ran arm B first, so position-in-sequence and arm do not vary
+together:
+
+| arm | observations | silent | rate | 95% CI |
+|---|---|---|---|---|
+| A — probe alone | 240 | 90 | 37.5% | [31.6%, 43.8%] |
+| B — `test_anetracer.py`'s full fixture in a subprocess immediately before | 240 | 90 | 37.5% | [31.6%, 43.8%] |
+
+Difference **0.00 pp**, 95% CI [−8.7 pp, +8.7 pp]. Per cell it is stronger than
+that interval suggests: all 480 cell-observations agreed, 30/30 or 0/30, with
+zero flips in either arm. **No detectable effect, and an effect large enough to
+matter would have had to flip cells that did not move at all.**
+
+The counterbalancing is there because this project has published a
+position-versus-setting confound before — an A/B for `compute_units` run with
+both settings inside one process — and retracted it.
+
+#### Mechanism: not established
+
+What changed between 2026-09-16 and 2026-09-19 to swap the columns is **not
+known**, and nothing here should be read as an account of it. What is ruled out
+is `ad9c5cc` (both by diff and by the A/B above) and any change to this
+repository's CoreML export path, which is unmodified. coremltools is 9.0 on
+both dates. The remaining candidates — the OS's CoreML/ANE segmenter and
+whatever state it keeps — were not instrumented, and saying "the rate moved and
+the cause is unknown" is the honest stopping point rather than naming a
+mechanism inferred from timing.
+
+#### What the test does now, and why it is not a weakening
+
+The threshold **stays at `answered >= 2`**. It was not touched. What changed is
+that the fixture asks the **same compiled artefact at both `CPU_AND_NE` and
+`ALL`**, and a shape counts as measured if either setting answered for it.
+
+This is strictly more evidence per shape, not less:
+
+- **Every row either setting returns is graded.** Previously four rows per op
+  were checked for `NeuralEngine in supported` and `preferred != NeuralEngine`;
+  now up to eight are. An op that became NeuralEngine-preferred reddens the
+  test from whichever setting saw it.
+- **Only the bookkeeping reads the union** — "was this shape measured at all".
+- **An op silent at both settings at every shape still fails**, which is what
+  `ALL` did to relu on 2026-09-16 and what `CPU_AND_NE` does to three of four
+  shapes today.
+
+It is §9.4's redundancy-across-shapes applied to the second axis the last three
+days proved was also unreliable. Verified by gutting: the test goes red when
+relu is silenced at both settings, when relu is made NeuralEngine-preferred at
+`ALL`, when `NeuralEngine` is dropped from `supported` at `ALL`, when only one
+of four shapes answers anywhere, and when the second setting's payload key is
+removed. Two of those five fire specifically from the newly-added `ALL` rows,
+which is the check that the new rows are graded rather than merely counted.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_all present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_units_2 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _REJECTED_UNITS_2 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py computes present -->
+
+| | |
+|---|---|
+| **claim withdrawn** | that the `CPU_AND_NE` silence is a 0.7% per-observation rate (§9.6). It is not a rate: it is deterministic per (op, shape, setting) within a day — 800 observations, zero cell flips — and re-assigns between days |
+| **claim withdrawn** | §9.6.1's `4 * 0.007**3` "one run in a million". The arithmetic assumed independence across shapes that the data never had |
+| **claim amended** | §9.6's "the silence belongs to `ComputeUnit.ALL`" is scoped to 2026-09-16 rather than withdrawn. The finding that it belongs to a *setting* is right; which setting is not stable |
+| **claim added** | at least one of `ALL` / `CPU_AND_NE` answers for every (op, shape) measured on both dates — the property the test now rests on |
+| **claim confirmed** | the plan is whole-program, boundary `ios16.cast`s included (§9.6), re-measured today at `(256, 1024)` |
+| **hypothesis refuted** | that `ad9c5cc` / `test_anetracer.py` caused it — by diff (+324/−0, export path untouched) and by a counterbalanced A/B, 240 observations per arm, 0.00 pp difference |
+| **limitation named** | what changed between 09-16 and 09-19 is not established, and no mechanism is claimed |
+| **threshold unchanged** | `answered >= 2`. Not weakened — the settings axis was widened, and every returned row is graded |
+| **tests added** | 0. Existing test strengthened: up to 8 graded rows per op instead of 4, and two payload keys whose absence fails it |
+| **defect fixed** | the fixture interrogated a single compute-unit setting whose willingness to answer is not stable across days — deterministically red on develop as of today |
+
+
 
 ---
 

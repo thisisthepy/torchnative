@@ -208,16 +208,41 @@ try:
     # With CPU_AND_NE all 8 answer, and the answer is the stronger one: even
     # when the CPU is CoreML's only alternative to the Neural Engine, it still
     # prefers the CPU.
+    #
+    # **Asked at BOTH settings now, because which one goes silent moves from
+    # day to day.** docs/graph/NPU2.md §9.7: on 2026-09-19 the two columns of
+    # §9.6's table swapped. `CPU_AND_NE` -- the setting §9.6 chose precisely
+    # because it answered 8 of 8 -- returns no plan for relu at three of these
+    # four shapes, in 100 of 100 fresh subprocesses, while `ALL` (the setting
+    # §9.6 abandoned) answers all four. Neither setting is reliably the
+    # answering one, and §9.6 already recorded the same re-assignment once
+    # before, between 09-13 and 09-16, without an account of it.
+    #
+    # So §9.4's redundancy across shapes is built across settings too. This is
+    # strictly MORE evidence per shape, not less: every row either setting
+    # returns is graded, so an op that became NeuralEngine-preferred reddens
+    # this from whichever setting saw it. Only the bookkeeping of "was this
+    # shape measured at all" reads the union.
     _REJECTED_UNITS = "CPU_AND_NE"
+    _REJECTED_UNITS_2 = "ALL"
     out["rejected_plans_units"] = _REJECTED_UNITS
+    out["rejected_plans_units_2"] = _REJECTED_UNITS_2
     for name, module in (("relu", torch.nn.ReLU()), ("gelu", torch.nn.GELU())):
         by_shape = {}
+        by_shape_2 = {}
         for shape in ((256, 1024), (255, 1024), (128, 1024), (256, 1023)):
             model_, _names, _emitted = C.compile_model(
                 capture(module.eval(), torch.randn(*shape)), float32=False)
-            by_shape[str(list(shape))] = C.computes(C.compute_plan(
+            key = str(list(shape))
+            # The SAME compiled artefact, asked twice. Recompiling between the
+            # two questions would make the answers incomparable, which is the
+            # confound §9.1 spent three days inside.
+            by_shape[key] = C.computes(C.compute_plan(
                 model_, compute_units=getattr(ct.ComputeUnit, _REJECTED_UNITS)))
+            by_shape_2[key] = C.computes(C.compute_plan(
+                model_, compute_units=getattr(ct.ComputeUnit, _REJECTED_UNITS_2)))
         out.setdefault("rejected_plans", {})[name] = by_shape
+        out.setdefault("rejected_plans_all", {})[name] = by_shape_2
     out["layer_norm_has_no_lowering"] = sorted(
         op for op in C.supported_ops() if "layer_norm" in op)
 
@@ -391,6 +416,17 @@ def test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission():
     reading `preferred == "unknown"` -- instead of being an empty list that
     reads exactly like "no measurement was taken".
 
+    **Asked at BOTH `CPU_AND_NE` and `ALL`, because which setting answers is
+    not stable (docs/graph/NPU2.md §9.7, which supersedes §9.6 below).** On
+    2026-09-19 the two columns of §9.6's table swapped: `CPU_AND_NE` went
+    silent for relu at three of the four shapes in **100 of 100** fresh
+    subprocesses -- deterministic, not a 0.7% flake -- while `ALL` answered
+    all four. The per-shape redundancy §9.4 built is therefore built across
+    settings as well, and every row either setting returns is graded, so this
+    is more evidence per shape rather than a weakened rule. The paragraphs
+    below record what was believed on 2026-09-16 and are kept for the
+    argument, not for their numbers.
+
     **Asked at `CPU_AND_NE`, and that -- not the threshold -- was the flake.**
     §9.1 recorded the silence as a property of the compiled artefact's bytes,
     which made it look unavoidable and left the test grading whatever
@@ -436,22 +472,40 @@ def test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission():
     # Named in the payload so that a silent revert to `ComputeUnit.ALL` fails
     # here, by name, instead of coming back as an intermittently empty plan.
     assert r["rejected_plans_units"] == "CPU_AND_NE", r["rejected_plans_units"]
+    assert r["rejected_plans_units_2"] == "ALL", r["rejected_plans_units_2"]
     for name in ("relu", "gelu"):
         by_shape = r["rejected_plans"][name]
+        by_shape_all = r["rejected_plans_all"][name]
         assert len(by_shape) == 4, (name, sorted(by_shape))
+        # Both settings must have been asked at the same four shapes, or the
+        # union below would be counting a shape one of them never saw.
+        assert sorted(by_shape) == sorted(by_shape_all), (
+            name, sorted(by_shape), sorted(by_shape_all))
         answered = 0
-        for shape, rows in sorted(by_shape.items()):
-            # Never absent. One row per computing operation, whatever CoreML
-            # was willing to say about it.
-            assert len(rows) == 1, (name, shape, rows)
-            row = rows[0]
-            if row["preferred"] == "unknown":
-                assert row["supported"] == [], (name, shape, row)
-                continue
-            answered += 1
-            assert "NeuralEngine" in row["supported"], (name, shape, row)
-            assert row["preferred"] != "NeuralEngine", (name, shape, row)
-        assert answered >= 2, (name, by_shape)
+        for shape in sorted(by_shape):
+            shape_answered = False
+            for units, rows in (("CPU_AND_NE", by_shape[shape]),
+                                ("ALL", by_shape_all[shape])):
+                # Never absent. One row per computing operation, whatever
+                # CoreML was willing to say about it.
+                assert len(rows) == 1, (name, shape, units, rows)
+                row = rows[0]
+                if row["preferred"] == "unknown":
+                    assert row["supported"] == [], (name, shape, units, row)
+                    continue
+                # Graded at EVERY setting that answered, not just the first.
+                # This is where the claim is actually made, and widening to
+                # two settings widened this too.
+                assert "NeuralEngine" in row["supported"], (
+                    name, shape, units, row)
+                assert row["preferred"] != "NeuralEngine", (
+                    name, shape, units, row)
+                shape_answered = True
+            if shape_answered:
+                answered += 1
+        # A shape counts as measured if EITHER setting answered for it. An op
+        # that goes silent at both settings at every shape still fails here.
+        assert answered >= 2, (name, by_shape, by_shape_all)
     assert r["layer_norm_has_no_lowering"] == [], r["layer_norm_has_no_lowering"]
 
 
