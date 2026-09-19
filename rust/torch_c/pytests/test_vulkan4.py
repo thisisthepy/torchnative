@@ -553,10 +553,12 @@ EXPECTED_DISPATCHES = {
     "aten._local_scalar_dense.default": (0, 1),
     # docs/devices/VULKAN7.md -- the math path, composed from taught ops
     # rather than fused: transpose, matmul (q @ kT), mul.Scalar (the scale),
-    # _softmax, matmul (@ v). Five, and with an `attn_mask` it would be six.
-    # This entry said 0 while the handler raised before reaching a kernel, so
-    # the number was never observed; it is measured now.
-    "aten._scaled_dot_product_flash_attention_for_cpu.default": (5, 7),
+    # _softmax, matmul (@ v), and -- since docs/devices/VULKAN8.md -- one more
+    # reduction for the `logsumexp` this op's second result is. **Six**, and
+    # with an `attn_mask` seven. This entry said 0 while the handler raised
+    # before reaching a kernel, so the number was never observed; it was
+    # measured at 5 and the logsumexp is the sixth.
+    "aten._scaled_dot_product_flash_attention_for_cpu.default": (6, 7),
     "aten.native_layer_norm.default": (1, 1),
     "aten.bmm.default": (1, 2),
     # docs/devices/VULKAN6.md. `embedding` is one gather; the two `.Scalar`
@@ -697,17 +699,17 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
         else:
             if isinstance(out, tuple):
                 # native_layer_norm: (out, mean, invstd) -- all three tensors.
-                # sdpa: (output, logsumexp), and the second is `None` on this
-                # device. The math path does not compute a logsumexp; only the
-                # fused kernel has one to return, and `sdpa` in bootstrap.py
-                # takes `[0]`. It is `None` rather than a zero tensor so that
-                # a backward that needed it fails loudly instead of
-                # differentiating through a fabricated one.
+                # sdpa: (output, logsumexp), and the second **used to be
+                # `None`** on this device. It is a real device tensor now
+                # (docs/devices/VULKAN8.md); this arm says so rather than
+                # tolerating either answer, so a regression that took the
+                # logsumexp away again fails here and not only in the sweep.
                 if op == _SDPA:
-                    assert out[1] is None, (
-                        f"{op} returned a logsumexp; the vulkan math path does "
-                        f"not compute one, so either it now does and this test "
-                        f"must say so, or something is being fabricated")
+                    assert out[1] is not None, (
+                        f"{op} returned None for its logsumexp; this device "
+                        f"computes one (docs/devices/VULKAN8.md) and a `None` "
+                        f"here means the handler stopped")
+                    assert str(out[1].device) == "vulkan", out[1].device
                 assert all(str(o.device) == "vulkan"
                            for o in out if o is not None), (op, out)
                 out = out[0]
@@ -2727,19 +2729,52 @@ def test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream():
         f"expected {expected} = 9 + 32 x {got['layers']} + 5: {counters}")
 
 
-def _main():
-    # `run_tests` prints SKIP rather than ok for a test that had no Vulkan
-    # device, and a `VULKAN:` tally that run.sh adds up (docs/devices/VULKAN5.md §2).
-    failures = vulkan_coverage.run_tests(
-        [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_")])
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())
 
 
 
+
+# ---------------------------------------------------------------------------
+# BERT under the DEFAULT `sdpa` with a real `attention_mask` -- what actually
+# happens, which is not what the round that wrote this claimed.
+#
+# The commit that added this file's previous version of the test below
+# (`716d16e`, "BERT on Vulkan takes an attention_mask") states:
+#
+#     `bert-base-uncased` forwards on the Vulkan device under the **default
+#     `sdpa`** and with a **real padded `attention_mask`** ... 410 compute
+#     shaders, one host upload and zero downloads, agreeing with CPU at about
+#     8.6e-06.
+#
+# **That test had never executed.** It was defined *below* this file's
+# `raise SystemExit(_main())`, so the module exited before Python reached the
+# `def`; the runner collected 40 test functions out of a file containing 41 and
+# nothing compared the two numbers. Moving the runner to the bottom of the file
+# (see the block at the end) made it run for the first time, and it fails.
+#
+# It fails for a reason that is not a regression and not this round's doing.
+# Its mechanism was to monkeypatch `BertModel.get_extended_attention_mask` so
+# the additive mask is built on the host and uploaded once. In transformers
+# 5.15.1 -- the version this repository pins -- BERT does not call that method.
+# `BertModel.forward` calls `_create_attention_masks` ->
+# `create_bidirectional_mask` -> `masking_utils.sdpa_mask`, and the first thing
+# `sdpa_mask` does is `torch.arange(batch_size, device=device)` with `device`
+# being the model's. This backend has no integer arithmetic on purpose
+# (docs/devices/VULKAN6.md §1), so `aten.arange.default` refuses by name, and
+# the patched method is never reached to prevent it.
+#
+# So the claim "BERT forwards on Vulkan under the default sdpa with a real
+# attention_mask" is **unverified**, and the numbers in it (410 shaders, one
+# upload, 8.6e-06) were never produced by anything in this tree. The test below
+# now pins what is measured instead: the refusal, by name, with nothing read
+# back, and the patched method's call count at zero so the *reason* is pinned
+# too and not just the symptom. It fails the moment either changes.
+#
+# What it would take is written down and not done here: either integer
+# `arange`/`add`/`where` on this device (a widening of `check_dtype`, which
+# VULKAN6 decided against and this round does not reopen), or an interception
+# at `masking_utils.sdpa_mask` rather than at the method transformers 5.15.1 no
+# longer calls. The second is a day's work and belongs to a mask round.
+# ---------------------------------------------------------------------------
 
 _BERT_SHIM_SCRIPT_MASK = r"""
 import json, sys
@@ -2759,53 +2794,71 @@ m = AutoModel.from_pretrained(cfg["path"], attn_implementation="sdpa").eval()
 ids = torch.as_tensor(cfg["ids"], dtype=torch.int64).reshape(cfg["sids"])
 mask = torch.as_tensor(cfg["mask"], dtype=torch.int64).reshape(cfg["sids"])
 
-# Transformers uploads the int64 mask because input_ids is on device, then processes it.
-# To compute it on the host instead, we intercept the mask creation.
-import transformers.modeling_utils as mu
+# The interception the previous round relied on, with a counter on it. The
+# counter is the point: it says whether transformers still routes through here.
 orig_get_extended = type(m).get_extended_attention_mask
+calls = {"n": 0}
+
 
 def host_mask(self, attention_mask, input_shape, device=None, dtype=None):
+    calls["n"] += 1
     attention_mask = attention_mask.cpu() if attention_mask is not None else None
     res = orig_get_extended(self, attention_mask, input_shape, device="cpu", dtype=dtype)
-    import sys
-    print(f"HOST_MASK RETURN: {'None' if res is None else res.shape}", file=sys.stderr)
     return res.to("vulkan") if res is not None else None
+
 
 type(m).get_extended_attention_mask = host_mask
 
-with torch.no_grad():
-    r = m(input_ids=ids, attention_mask=mask)
-out["cpu"] = r.last_hidden_state.reshape(-1).tolist()
-out["cpu_pooled"] = r.pooler_output.reshape(-1).tolist()
 m.to("vulkan")
 out["param_devices"] = sorted({str(p.device) for p in m.parameters()} |
                               {str(b.device) for b in m.buffers()})
 v_ids = ids.to("vulkan")
 before = torch._C._vulkan_counters()
-with torch.no_grad():
-    r = m(input_ids=v_ids, attention_mask=mask)
+try:
+    with torch.no_grad():
+        r = m(input_ids=v_ids, attention_mask=mask)
+    out["result"] = "ok"
+    out["device"] = [str(r.last_hidden_state.device), str(r.pooler_output.device)]
+except Exception as e:
+    out["result"] = f"{type(e).__name__}: {e}"
 after = torch._C._vulkan_counters()
-out["counters"] = {k: after[k] - before[k] for k in after}
-out["device"] = [str(r.last_hidden_state.device), str(r.pooler_output.device)]
-out["vulkan"] = r.last_hidden_state.cpu().reshape(-1).tolist()
-out["vulkan_pooled"] = r.pooler_output.cpu().reshape(-1).tolist()
+out["counters"] = {key: after[key] - before[key] for key in after}
+out["host_mask_calls"] = calls["n"]
 out["layers"] = m.config.num_hidden_layers
 json.dump(out, sys.stdout)
 """
 
-def test_the_pretrained_bert_sdpa_mask_forward_builds_mask_on_host_and_agrees_with_upstream():
+
+def test_the_pretrained_bert_sdpa_mask_forward_refuses_at_arange_and_the_host_mask_hook_is_never_called():
+    """The measured state of VULKAN7's last open claim.
+
+    Renamed from `..._builds_mask_on_host_and_agrees_with_upstream`, which is
+    what it was called while it was never run. See the block above for the
+    whole story; the short version is that the mask is *not* built on the host,
+    because the method that would have built it there is not on transformers
+    5.15.1's path for BERT.
+
+    Two assertions, and the second is the one that makes this evidence rather
+    than a symptom:
+
+      * the forward refuses, by name, at `aten.arange.default`, having read
+        nothing back to the host -- so this is a refusal and not a fallback;
+      * `get_extended_attention_mask` was called **zero** times, which is why.
+        Without this, someone reading the failure would reasonably conclude the
+        host-mask path was reached and broken.
+    """
     if _vulkan_or_skip("the pretrained BERT sdpa mask forward") is None:
-        return
-    torch = _upstream()
-    if torch is None:
         return
     path = _pretrained_bert_dir()
     if path is None:
         vulkan_coverage.vulkan_skip(
-            "the pretrained BERT forward: no local bert-base-uncased with "
+            "the pretrained BERT sdpa mask forward: no local bert-base-uncased with "
             "model.safetensors (set TORCHNATIVE_BERT_DIR); nothing is downloaded")
         return
-    from transformers import AutoModel, AutoTokenizer
+    torch = _upstream()
+    if torch is None:
+        return
+    from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(path)
     enc = tok(["the quick brown fox jumps over the lazy dog",
@@ -2814,10 +2867,16 @@ def test_the_pretrained_bert_sdpa_mask_forward_builds_mask_on_host_and_agrees_wi
     ids = enc["input_ids"]
     mask = enc["attention_mask"]
     B, S = ids.shape
+    # The two sentences are different lengths on purpose: with equal lengths
+    # there is no padding and the masked path is not exercised at all. A round
+    # in this repository once made a test pass by equalising them.
+    assert int(mask.sum()) < B * S, "the fixture stopped being padded"
 
-    cfg = {"path": path, "ids": ids.reshape(-1).tolist(), "mask": mask.reshape(-1).tolist(), "sids": [B, S]}
+    cfg = {"path": path, "ids": ids.reshape(-1).tolist(),
+           "mask": mask.reshape(-1).tolist(), "sids": [B, S]}
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{os.path.abspath('torchnative/src/main')}:{VENDOR_DIR}"
+    env["PYTHONPATH"] = (f"{os.environ.get('PYTHONPATH', '')}:"
+                         f"{os.path.abspath('torchnative/src/main')}:{VENDOR_DIR}")
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     env["HF_HUB_OFFLINE"] = "1"
     proc = subprocess.run([sys.executable, "-c", _BERT_SHIM_SCRIPT_MASK],
@@ -2832,39 +2891,473 @@ def test_the_pretrained_bert_sdpa_mask_forward_builds_mask_on_host_and_agrees_wi
         return
 
     assert got["param_devices"] == ["vulkan"], got["param_devices"]
-    assert got["device"] == ["vulkan", "vulkan"], got["device"]
+    assert got["result"] != "ok", (
+        "the default-sdpa BERT forward with an attention_mask succeeded on "
+        "vulkan. That is what VULKAN7's round claimed and this test says is "
+        "not true here -- if it is true now, restore the agreement assertions "
+        "and the 410-shader count rather than deleting this one")
+    assert got["result"].startswith("NotImplementedError"), got["result"]
+    assert "aten.arange.default" in got["result"], (
+        f"the forward stopped somewhere other than the op this test names: "
+        f"{got['result']}")
+    assert got["host_mask_calls"] == 0, (
+        f"get_extended_attention_mask was called {got['host_mask_calls']} "
+        f"time(s); if transformers routes through it again, the host-mask "
+        f"design is reachable and this test is describing the wrong wall")
+    # The state at the moment of refusal, pinned exactly rather than as an
+    # inequality. It is **not** zero readbacks: the embedding prologue runs
+    # first and something in it reads one buffer back before the mask is
+    # reached. That is recorded here as a measurement, not blessed -- an
+    # unexplained readback on a forward is the exact shape docs/devices/VULKAN6.md
+    # says values cannot police, and nothing in this round audited it. It is
+    # named in docs/devices/VULKAN8.md §5 as open.
+    assert got["counters"] == {"shader_dispatches": 10, "host_uploads": 1,
+                               "host_downloads": 1}, got["counters"]
+    print(f"   bert default-sdpa + attention_mask: refused at aten.arange.default "
+          f"after {got['counters']['shader_dispatches']} shaders, "
+          f"{got['counters']['host_downloads']} readback(s), "
+          f"get_extended_attention_mask calls=0")
 
-    up = AutoModel.from_pretrained(path, attn_implementation="sdpa").eval()
-    with torch.no_grad():
-        r32 = up(input_ids=ids, attention_mask=mask)
-        r64 = up.double()(input_ids=ids, attention_mask=mask)
 
-    for what, key, want32, truth in (
-            ("last_hidden_state", "vulkan", r32.last_hidden_state, r64.last_hidden_state),
-            ("pooler_output", "vulkan_pooled", r32.pooler_output, r64.pooler_output)):
-        want32 = want32.reshape(-1).tolist()
-        truth = truth.reshape(-1).tolist()
-        cpu_key = "cpu" if key == "vulkan" else "cpu_pooled"
-        assert len(got[key]) == len(truth), (what, len(got[key]), len(truth))
-        up_err = max(abs(a - b) for a, b in zip(want32, truth))
-        vk_err = max(abs(a - b) for a, b in zip(got[key], truth))
-        cpu_err = max(abs(a - b) for a, b in zip(got[cpu_key], truth))
-        print(f"   bert sdpa mask {what}: upstream f32 err {up_err:.3e}, shim cpu "
-              f"{cpu_err:.3e}, shim vulkan {vk_err:.3e} ({vk_err / up_err:.2f}x)")
-        assert vk_err <= 4 * up_err, (
-            f"bert {what} on vulkan is {vk_err:.3e} from upstream's float64 "
-            f"answer against upstream float32's own {up_err:.3e}; "
-            f"docs/numerics/AGREE.md's rule allows 4x")
+# ---------------------------------------------------------------------------
+# The logsumexp slot -- docs/devices/VULKAN8.md
+#
+# `_scaled_dot_product_flash_attention_for_cpu` returns `(output, logsumexp)`
+# and this device returned `None` in the second slot. What upstream actually
+# puts there was **measured**, not read off the name:
+#
+#   * shape   `query.shape[:-1]`, i.e. `(B, H, T)` -- one value per query row.
+#   * dtype   `float32` for a `float32` query (and float32 even for a float16
+#             one, which `test_metaemb.py` already pins on the meta device).
+#   * value   the natural log-sum-exp of the **masked, scaled** scores over the
+#             key axis -- the same rows the softmax above it normalises. Checked
+#             against `torch.logsumexp(scores.double(), dim=-1)`: 2.28e-07 worst
+#             over a randn population, i.e. float32's own rounding.
+#   * layout  upstream's is **not contiguous** -- stride `(15, 1, 3)` for shape
+#             `(2, 3, 5)`, because upstream allocates `(B, T, H)` and hands back
+#             a `transpose(1, 2)` of it. A `VkTensor` has a shape and no strides
+#             at all (docs/devices/VULKAN4.md §6), so this device cannot
+#             reproduce that and does not claim to: the values agree element for
+#             element, the strides are this device's own. Said here rather than
+#             left for someone to discover.
+#
+# `_scaled_dot_product_flash_attention_for_cpu` takes `attn_mask` and `scale`
+# keyword-only, so the upstream oracle below passes them that way.
+# ---------------------------------------------------------------------------
 
-    expected = 9 + 32 * got["layers"] + 5 + got["layers"] * 4
-    # With sdpa + mask, we might have additional nodes (e.g. attention mask ops)
-    # Actually let's just observe the shaders and assert > 0, because it might vary.
-    # But the strict requirement says "assert the shader dispatched" and "read nothing back".
-    counters = got["counters"]
-    assert counters["host_downloads"] == 1, (
-        f"the BERT sdpa mask forward read {counters['host_downloads']} buffer(s) back to "
-        f"the host, expected 1 to fetch the int64 mask for host processing: {counters}")
-    assert counters["host_uploads"] == 1, (
-        f"the BERT sdpa mask forward uploaded {counters['host_uploads']} buffer(s), "
-        f"expected 1 to upload the extended float32 mask: {counters}")
-    assert counters["shader_dispatches"] > 0
+# (B, H, T, E, S_kv, has_mask) -- rank 4, which is the only rank upstream's op
+# accepts, so the oracle can be upstream's own kernel rather than a formula.
+SDPA_LSE_CASES = (
+    (1, 1, 2, 4, 2, False),
+    (2, 3, 5, 4, 7, False),
+    (2, 3, 5, 4, 7, True),
+    (1, 2, 3, 16, 3, True),
+    (2, 1, 8, 8, 8, False),
+)
+
+
+def _lse_inputs(torch, i, b, h, t, e, s, has_mask):
+    q = _rand(torch, b, h, t, e, seed=1900 + i)
+    k = _rand(torch, b, h, s, e, seed=1930 + i)
+    v = _rand(torch, b, h, s, e, seed=1960 + i)
+    mask = None
+    if has_mask:
+        # A padded batch's mask: the last two keys are padding for every row.
+        mask = torch.zeros(b, 1, 1, s, dtype=torch.float32)
+        mask[:, :, :, s - 2:] = -1e9
+    return q, k, v, mask
+
+
+def _lse_truth(torch, q, k, v, mask, dtype):
+    """The written-out logsumexp at `dtype`, so the tolerance can be derived."""
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(q.size(-1)))
+    if mask is not None:
+        scores = scores + mask.to(dtype)
+    return torch.logsumexp(scores, dim=-1)
+
+
+def test_the_sdpa_logsumexp_is_no_longer_none_and_has_upstreams_shape_and_dtype():
+    """The slot itself, before any question of its value.
+
+    `None` here is what this device returned before, and the backward that
+    would consume it could not even ask for a shape.
+    """
+    if _vulkan_or_skip("the sdpa logsumexp shape and dtype") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for i, case in enumerate(SDPA_LSE_CASES):
+        b, h, t, e, s, has_mask = case
+        q, k, v, mask = _lse_inputs(torch, i, *case)
+        kwargs = {}
+        if mask is not None:
+            kwargs["attn_mask"] = _to_vulkan(_cpu(_up_flat(mask), [b, 1, 1, s]))
+        got = _C._aten_dispatch(
+            _SDPA,
+            _to_vulkan(_cpu(_up_flat(q), [b, h, t, e])),
+            _to_vulkan(_cpu(_up_flat(k), [b, h, s, e])),
+            _to_vulkan(_cpu(_up_flat(v), [b, h, s, e])),
+            **kwargs)
+        assert isinstance(got, tuple) and len(got) == 2, got
+        lse = got[1]
+        assert lse is not None, (
+            f"the logsumexp slot is still None for {case}; a backward through "
+            f"this op cannot even ask it for a shape")
+        # Upstream's own answer, for the shape and dtype rather than a
+        # transcription of them.
+        up = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default(
+            q, k, v, 0.0, False, attn_mask=mask)[1]
+        assert list(lse.shape) == list(up.shape), (case, lse.shape, up.shape)
+        assert str(lse.dtype) == str(up.dtype), (case, lse.dtype, up.dtype)
+        assert str(lse.device) == "vulkan", lse.device
+
+
+def test_the_sdpa_logsumexp_agrees_with_upstream_at_a_derived_tolerance():
+    """Element-wise against **upstream's own kernel**, not a formula beside it.
+
+    The tolerance comes from `_assert_agreement`, which re-derives it from this
+    population's upstream float32-vs-float64 error (docs/numerics/AGREE.md §2).
+    It is not a number chosen here and there is nothing in this file to widen:
+    `test_a_wrong_logsumexp_is_rejected_by_this_tolerance` proves the derived
+    number is tight enough to reject a wrong answer.
+    """
+    if _vulkan_or_skip("the sdpa logsumexp agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, case in enumerate(SDPA_LSE_CASES):
+        b, h, t, e, s, has_mask = case
+        q, k, v, mask = _lse_inputs(torch, i, *case)
+        kwargs = {}
+        if mask is not None:
+            kwargs["attn_mask"] = _to_vulkan(_cpu(_up_flat(mask), [b, 1, 1, s]))
+        lse = _C._aten_dispatch(
+            _SDPA,
+            _to_vulkan(_cpu(_up_flat(q), [b, h, t, e])),
+            _to_vulkan(_cpu(_up_flat(k), [b, h, s, e])),
+            _to_vulkan(_cpu(_up_flat(v), [b, h, s, e])),
+            **kwargs)[1]
+        want32 = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default(
+            q, k, v, 0.0, False, attn_mask=mask)[1]
+        truth = _lse_truth(torch, q, k, v, mask, torch.float64)
+        cases.append((f"lse{list(case)}", _flat(_to_cpu(lse)),
+                      _up_flat(want32.contiguous()), _up_flat(truth)))
+    _assert_agreement("sdpa logsumexp", cases)
+
+
+def test_a_wrong_logsumexp_is_rejected_by_this_tolerance():
+    """The derived tolerance has teeth -- checked, not asserted.
+
+    docs/architectures/VOICE4.md §6 records a tolerance widened 100x that left every
+    test green. The guard against that shape of failure is not a smaller
+    number, it is this: feed `_assert_agreement` a *wrong* answer and require
+    it to raise. The wrong answers below are the ones a plausible defect
+    produces -- `log(sum(exp(x)))` without the max shift is right, so it is not
+    here; `sum(exp(x))` without the log, and the logsumexp of the *unscaled*
+    scores, are the two this kernel could actually have been.
+    """
+    if _vulkan_or_skip("the logsumexp tolerance teeth check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    b, h, t, e, s, has_mask = SDPA_LSE_CASES[1]
+    q, k, v, mask = _lse_inputs(torch, 1, *SDPA_LSE_CASES[1])
+    want32 = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default(
+        q, k, v, 0.0, False, attn_mask=mask)[1]
+    truth = _lse_truth(torch, q, k, v, mask, torch.float64)
+    unscaled = torch.logsumexp(
+        (q.double() @ k.double().transpose(-2, -1)), dim=-1)
+    nolog = torch.exp(
+        (q.double() @ k.double().transpose(-2, -1)) / math.sqrt(e)).sum(-1)
+
+    # The right answer passes.
+    _assert_agreement("lse teeth (control: the correct value)",
+                      [("control", _up_flat(want32.contiguous()), _up_flat(want32.contiguous()),
+                        _up_flat(truth))])
+
+    for name, wrong in (("unscaled scores", unscaled), ("no log", nolog)):
+        try:
+            _assert_agreement(f"lse teeth ({name})",
+                              [(name, _up_flat(wrong.float()),
+                                _up_flat(want32.contiguous()), _up_flat(truth))])
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(
+                f"the derived tolerance accepted a logsumexp computed from {name}; "
+                f"it is too wide to be evidence of anything")
+
+
+def test_the_logsumexp_ran_on_the_gpu_and_cost_exactly_one_more_shader():
+    """docs/devices/VULKAN6.md's rule: values cannot police a host fallback.
+
+    Making `embedding` gather on the host produced bit-perfect numbers on a
+    tensor whose `.device` said `vulkan`, and only the counters caught it. So
+    the logsumexp is held to the counters too: the whole call reads **nothing**
+    back, and it costs exactly one dispatch more than the same call did without
+    a logsumexp. The step count is derived from the handler's chain, not copied
+    from a run:
+
+        transpose(k) 1 + matmul 1 + mul.Scalar 1 [+ add(mask) 1]
+                     + _softmax 1 + matmul 1 + logsumexp 1
+    """
+    if _vulkan_or_skip("the logsumexp dispatch-counter check") is None:
+        return
+    for case in (SDPA_LSE_CASES[1], SDPA_LSE_CASES[2]):
+        b, h, t, e, s, has_mask = case
+        torch = _upstream()
+        if torch is None:
+            return
+        q, k, v, mask = _lse_inputs(torch, 1, *case)
+        args = [_to_vulkan(_cpu(_up_flat(q), [b, h, t, e])),
+                _to_vulkan(_cpu(_up_flat(k), [b, h, s, e])),
+                _to_vulkan(_cpu(_up_flat(v), [b, h, s, e]))]
+        kwargs = {}
+        if mask is not None:
+            kwargs["attn_mask"] = _to_vulkan(_cpu(_up_flat(mask), [b, 1, 1, s]))
+        before = _counters()
+        out, lse = _C._aten_dispatch(_SDPA, *args, **kwargs)
+        d = _delta(before, _counters())
+        expected = 6 + (1 if has_mask else 0)
+        assert d["shader_dispatches"] == expected, (
+            f"sdpa{list(case)} ran {d['shader_dispatches']} compute shaders, "
+            f"expected {expected} (transpose, matmul, scale, "
+            f"{'mask, ' if has_mask else ''}softmax, matmul, logsumexp): {d}")
+        assert d["host_downloads"] == 0, (
+            f"sdpa{list(case)} read {d['host_downloads']} buffer(s) back to the "
+            f"host; the logsumexp is computed on the device or not at all: {d}")
+        assert d["host_uploads"] == 0, d
+        assert str(lse.device) == "vulkan", lse.device
+
+
+def test_a_fully_masked_row_reports_upstreams_logsumexp_convention():
+    """`0.0`, which is the flash kernel's answer and **not** `torch.logsumexp`'s.
+
+    Measured, both ways:
+
+        _scaled_dot_product_flash_attention_for_cpu, row masked to -inf
+            -> logsumexp 0.0,  output all zeros
+        torch.logsumexp([-inf, -inf, -inf], dim=-1)
+            -> -inf
+
+    The op being implemented here is the first one, so the kernel branches on
+    an all-`-inf` row rather than letting `exp(-inf - -inf)` become NaN. A
+    kernel without that branch returns NaN, which is neither answer.
+
+    **Not fixed here, and it is next door:** the *output* for such a row is NaN
+    on this device, because `sdpa_vulkan` runs `aten._softmax.default` and that
+    shader has the same unguarded shift. `aten._safe_softmax.default` is the op
+    that handles it and this device has it. Changing which softmax the handler
+    runs changes the arithmetic of every sdpa forward on this device, so it is
+    not folded into a logsumexp round; it is recorded in
+    docs/devices/VULKAN8.md §5 as the next thing.
+    """
+    if _vulkan_or_skip("the fully-masked logsumexp row") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    b, h, t, e, s = 1, 1, 2, 4, 3
+    q = _rand(torch, b, h, t, e, seed=2401)
+    k = _rand(torch, b, h, s, e, seed=2402)
+    v = _rand(torch, b, h, s, e, seed=2403)
+    mask = torch.zeros(b, 1, t, s, dtype=torch.float32)
+    mask[0, 0, 0, :] = float("-inf")
+
+    want = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default(
+        q, k, v, 0.0, False, attn_mask=mask)[1]
+    assert _up_flat(want.contiguous())[0] == 0.0, (
+        f"upstream's convention changed: {_up_flat(want.contiguous())}")
+
+    lse = _C._aten_dispatch(
+        _SDPA,
+        _to_vulkan(_cpu(_up_flat(q), [b, h, t, e])),
+        _to_vulkan(_cpu(_up_flat(k), [b, h, s, e])),
+        _to_vulkan(_cpu(_up_flat(v), [b, h, s, e])),
+        attn_mask=_to_vulkan(_cpu(_up_flat(mask), [b, 1, t, s])))[1]
+    got = _flat(_to_cpu(lse))
+    assert got[0] == 0.0, (
+        f"a fully masked row reported logsumexp {got[0]!r}; upstream's flash "
+        f"kernel reports 0.0 for it and NaN is neither answer")
+    assert abs(got[1] - _up_flat(want.contiguous())[1]) < 1e-5, (got, _up_flat(want.contiguous()))
+
+
+# ---------------------------------------------------------------------------
+# Does a backward work now? No. docs/devices/VULKAN8.md §4
+# ---------------------------------------------------------------------------
+
+_SDPA_BACKWARD_PROBE = r"""
+import json, sys
+import torch
+
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+B, H, T, E = 1, 2, 3, 4
+q = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
+k = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
+v = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
+o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+out["forward_device"] = str(o.device)
+before = torch._C._vulkan_counters()
+try:
+    torch.autograd.grad(o, [q, k, v],
+                        grad_outputs=torch.ones(B, H, T, E).to("vulkan"))
+    out["backward"] = "ok"
+except Exception as e:
+    out["backward"] = f"{type(e).__name__}: {e}"
+after = torch._C._vulkan_counters()
+out["counters"] = {key: after[key] - before[key] for key in after}
+out["rules"] = sorted(torch._C._tape_rules())
+json.dump(out, sys.stdout)
+"""
+
+# Named in `sdpa_backward` (tape.rs) or on the way to reaching it, and absent
+# from `vulkan_ops()`. Checked against the device's own list below rather than
+# trusted, so this comment cannot drift away from the build.
+_BACKWARD_STILL_MISSING = (
+    # the gradient rule's own `rowsum(dP * P)` -- the first thing that stops
+    "aten.sum.dim_IntList",
+    # `is_causal=True`'s branch of the rule (the vulkan forward refuses
+    # is_causal outright, so this is only reachable if that is lifted)
+    "aten.ones.default",
+    "aten.tril.default",
+    "aten.eq.Scalar",
+    "aten.masked_fill.Scalar",
+    # and what a *loss* needs, before any of the above is reached
+    "aten.sum.default",
+    "aten.ones_like.default",
+    "aten.zeros_like.default",
+)
+
+
+def test_a_backward_through_the_vulkan_sdpa_still_does_not_work_and_names_what_is_missing():
+    """**The logsumexp was not what was blocking it, and this says so.**
+
+    The round that left the slot at `None` recorded it as "a backward through
+    it would fail", and it is easy to read that as "filling the slot makes
+    backward work". It does not, and the reason is in `sdpa_backward`
+    (tape.rs): that rule **does not consume a logsumexp at all**. It recomputes
+    the probabilities from the saved q, k and v and differentiates the textbook
+    formulation -- a correctness-for-memory trade the rule's own comment
+    explains. The only thing it does with the logsumexp slot is *refuse* a
+    gradient that arrives at it.
+
+    So the logsumexp is now correct and backward is still refused, at
+    `aten.sum.dim_IntList` -- the `rowsum(dP * P)` in the middle of the rule.
+    This test pins that, by name, with the counters showing the refusal cost no
+    GPU work. It is written to **fail the day the list changes**: when someone
+    teaches `sum.dim_IntList` the refusal moves and this test must be rewritten
+    rather than quietly continuing to claim a wall that is gone.
+
+    Measured, not asserted from the source: the probe below runs the vendored
+    shim in a separate interpreter and reports whatever it gets.
+    """
+    if _vulkan_or_skip("the sdpa backward probe") is None:
+        return
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _SDPA_BACKWARD_PROBE],
+                          capture_output=True, text=True, env=env, timeout=600)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    got = json.loads(proc.stdout)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            f"the sdpa backward probe: the vendored-tree subprocess has no "
+            f"loader -- {got['probe']['error']}")
+        return
+
+    assert got["forward_device"] == "vulkan", got["forward_device"]
+    # The rule exists -- so this is not "no rule", it is "the rule's ops".
+    assert "aten._scaled_dot_product_flash_attention_for_cpu.default" in got["rules"]
+
+    assert got["backward"] != "ok", (
+        "a backward through the vulkan sdpa succeeded. That is the thing this "
+        "test says does not happen -- rewrite it, and check the gradients "
+        "against upstream before claiming it")
+    assert got["backward"].startswith("NotImplementedError"), got["backward"]
+    assert "aten.sum.dim_IntList" in got["backward"], (
+        f"the backward stopped somewhere other than the op this test names: "
+        f"{got['backward']}")
+    assert got["counters"]["host_downloads"] == 0, (
+        f"the refused backward read {got['counters']['host_downloads']} "
+        f"buffer(s) back; a refusal computes nothing: {got['counters']}")
+
+    # And the rest of the list, from the device's own refusal message rather
+    # than from this file.
+    try:
+        _C._aten_dispatch("aten.this_op_does_not_exist.default",
+                          _to_vulkan(_cpu([0.0], [1])))
+    except NotImplementedError as e:
+        taught = set(x.strip() for x in
+                     str(e).split("by name -- ")[1].split(" -- and")[0].split(","))
+    else:
+        raise AssertionError("an unknown op did not refuse")
+    still_missing = [op for op in _BACKWARD_STILL_MISSING if op not in taught]
+    assert still_missing == list(_BACKWARD_STILL_MISSING), (
+        f"some of the ops this test names as missing are now taught "
+        f"({sorted(set(_BACKWARD_STILL_MISSING) - set(still_missing))}); the "
+        f"list is stale and the backward story has moved")
+    print(f"   backward through vulkan sdpa: refused -- {got['backward'].splitlines()[0][:120]}")
+    print(f"   still missing for it: {', '.join(_BACKWARD_STILL_MISSING)}")
+
+
+# ---------------------------------------------------------------------------
+# The runner -- and why it is the LAST thing in this file
+#
+# `_main` collects `test_*` out of `globals()`, so it can only see what has
+# already been defined when it runs. This block used to sit in the middle of
+# the file, above `_BERT_SHIM_SCRIPT_MASK` and
+# `test_the_pretrained_bert_sdpa_mask_forward_builds_mask_on_host_and_agrees_with_upstream`
+# -- and a module executes top to bottom, so `raise SystemExit(_main())` fired
+# before that test was ever defined. **It had never run.** The tally said
+# `ran=40` with 41 test functions in the file, and nothing compared the two
+# numbers; the suite was green because the test did not exist yet at the moment
+# the runner looked.
+#
+# That is the "verification that cannot fail" shape of CLAUDE.md §5.5, in its
+# purest form: not a weak assertion, an *unreached* one. The guard against it
+# coming back is `test_every_test_in_this_file_is_actually_collected` above,
+# which counts `def test_` in the source and requires the collected list to
+# match -- so a test added below a future stray `__main__` block fails here
+# instead of disappearing.
+# ---------------------------------------------------------------------------
+
+def _collectable():
+    return [(name, fn) for name, fn in sorted(globals().items())
+            if name.startswith("test_")]
+
+
+def test_every_test_in_this_file_is_actually_collected():
+    """A test defined after the runner is a test that never runs.
+
+    No Vulkan device needed -- this one is about this file, not the GPU, so it
+    does not skip and cannot be hidden by a machine without a loader.
+    """
+    import re
+    src = open(os.path.abspath(__file__)).read()
+    in_source = sorted(set(re.findall(r"^def (test_\w+)", src, re.M)))
+    collected = sorted(name for name, _ in _collectable())
+    missing = [n for n in in_source if n not in collected]
+    assert not missing, (
+        f"{len(missing)} test(s) are defined in this file but were not collected "
+        f"by the runner: {missing}. A `raise SystemExit(_main())` above them is "
+        f"how that happens, and it silently happened once already.")
+
+
+def _main():
+    # `run_tests` prints SKIP rather than ok for a test that had no Vulkan
+    # device, and a `VULKAN:` tally that run.sh adds up (docs/devices/VULKAN5.md §2).
+    failures = vulkan_coverage.run_tests(_collectable())
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

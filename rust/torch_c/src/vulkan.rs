@@ -97,6 +97,7 @@ spv!(STRIDED_GATHER_U32_SPV, "strided_gather_u32");
 spv!(GATHER_U32_I32_SPV, "gather_u32_i32");
 spv!(TANH_F32_SPV, "tanh_f32");
 spv!(BROADCAST_BINARY_F32_SPV, "broadcast_binary_f32");
+spv!(LOGSUMEXP_LASTDIM_F32_SPV, "logsumexp_lastdim_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -3213,6 +3214,10 @@ fn sdpa_vulkan(
         let mask = crate::aten::required(op, args, kwargs, 5, "attn_mask")?.unbind();
         scores = sdpa_step(py, "aten.add.Tensor", vec![scores, mask])?;
     }
+    // Held before `_softmax` consumes it: these are the rows the logsumexp
+    // below reduces, and they must be the *same* rows -- masked and scaled --
+    // that the softmax normalises, not the raw product.
+    let scores_t = scores.bind(py).extract::<PyTensorBase>()?;
     let attn = sdpa_step(py, "aten._softmax.default", vec![
         scores,
         (-1i64).into_bound_py_any(py)?.unbind(),
@@ -3220,8 +3225,66 @@ fn sdpa_vulkan(
     ])?;
     let out = sdpa_step(py, "aten.matmul.default", vec![attn, v])?;
 
-    let none = py.None();
-    let tup = pyo3::types::PyTuple::new(py, [out.into_bound(py), none.into_bound(py)])?;
+    // The second slot. What goes in it was measured off upstream rather than
+    // read off the name (docs/devices/VULKAN8.md §1): the natural log-sum-exp
+    // of these same masked, scaled scores over the key axis, shaped
+    // `scores.shape[:-1]`, `float32`.
+    //
+    // **It needs its own reduction, and this is the evidence.** The maximum and
+    // the sum of exponentials it wants are both computed one line above, inside
+    // `softmax_lastdim_f32` -- but they live in that shader's registers and die
+    // there. Getting them out means `aten._softmax.default` returning two
+    // tensors, and `_softmax` is a one-output op that four other call sites on
+    // this device share. So the choice was between changing a shared op's
+    // contract and one more dispatch over a tensor already resident on the
+    // device, and this takes the dispatch. It is a second *pass*, not a second
+    // *forward*: no matmul is repeated and nothing is read back.
+    let lse = logsumexp_lastdim(py, op, &scores_t)?;
+
+    let tup = pyo3::types::PyTuple::new(py, [out.into_bound(py), lse.into_bound(py)])?;
     Ok(tup.into_any().unbind())
+}
+
+/// `logsumexp` over the last dimension of a resident f32 tensor.
+///
+/// Not on the dispatch table: this is the reduction `sdpa_vulkan` needs for its
+/// second result, and `aten.logsumexp.default` has a `dim` list, a `keepdim`
+/// and an integer-widening rule (`aten.rs`) that none of this exercises. Adding
+/// the op to `vulkan_ops()` would claim all of that. It says what it does
+/// instead, and the op list stays a list of things that are wholly implemented.
+fn logsumexp_lastdim(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+) -> PyResult<Py<PyAny>> {
+    check_dtype(op, input.tag())?;
+    let x = input.vk_tensor(op)?.clone();
+    let row_len = *x.shape.last().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: the scores must have at least one dimension to reduce"
+        ))
+    })?;
+    let out_shape: Vec<usize> = x.shape[..x.shape.len() - 1].to_vec();
+    let rows: usize = out_shape.iter().product();
+    // The same `u32` bound every other kernel on this device checks before it
+    // allocates: the shader indexes with `uint`, so a row count or an element
+    // count past `u32::MAX` would wrap to another plausible row rather than
+    // fail (docs/devices/VULKAN7.md §2.2).
+    shader_u32(op, "element count", x.elem_count())?;
+    shader_u32(op, "row count", rows)?;
+    shader_u32(op, "row length", row_len)?;
+    let ctx = require(op)?;
+    let buffer = unsafe {
+        let buffer = ctx.alloc(rows.max(1) * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "logsumexp_lastdim_f32",
+            LOGSUMEXP_LASTDIM_F32_SPV,
+            &[&x.buffer, &x.buffer, &buffer],
+            [rows as u32, row_len as u32, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        buffer
+    };
+    wrap_vk(py, VkTensor { buffer: Arc::new(buffer), shape: out_shape }, input.tag())
 }
 
