@@ -292,13 +292,21 @@ def test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs():
     bodies, text = parsed
     ops = shim_helpers._aten_dispatch_targets(text)
     allowed = set(_C._shim_mps_readback_but_allowed())
+    # The cross-file half, and it is imported rather than re-implemented for
+    # the reason this test exists at all. When `aten.view.dtype` joined the
+    # list on 2026-09-19, this copy of the derivation still scanned `aten.rs`
+    # alone and reported the op as **stale** -- i.e. a second hand-written
+    # derivation had come to differ from the first, which is precisely the
+    # divergence the docstring above says a second list would cause. The fix
+    # is to share the predicate, not to copy the new clause.
+    cross_file = shim_helpers._cross_file_readback_helpers()
     derived = set()
     for op, fn in ops.items():
         body = bodies.get(fn, "")
         reads = bool(shim_helpers._MPS_READBACK_MARKERS.search(body)) or any(
             re.search(r"\b" + helper + r"\s*\(", body)
             for helper in shim_helpers._MPS_READBACK_HELPERS
-        )
+        ) or shim_helpers._reaches_cross_file_readback(body, cross_file)
         if reads and op not in allowed:
             derived.add(op)
     assert derived == set(cuda), (

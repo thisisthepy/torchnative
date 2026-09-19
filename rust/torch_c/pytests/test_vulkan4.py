@@ -601,6 +601,16 @@ EXPECTED_DISPATCHES = {
     # whole training step's counters mean anything.
     "aten.ones_like.default": (1, 1),
     "aten.zeros_like.default": (1, 1),
+    # docs/devices/VULKAN11.md -- the in-place four. One dispatch each, into
+    # the receiver's own buffer, and the entry is 1 rather than ">= 1" for the
+    # same reason `mean`'s is: a copy-on-write answer would also be on the GPU
+    # and would also be one dispatch, so the number is not what separates them
+    # (the buffer identity test does) -- but a *readback, host add, upload*
+    # would read 0 dispatches here, and that is what this entry pins.
+    "aten.add_.Tensor": (1, 2),
+    "aten.mul_.Scalar": (1, 1),
+    "aten.fill_.Scalar": (1, 1),
+    "aten.zero_.default": (1, 1),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -679,6 +689,20 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
             args = (a, _to_vulkan(_i64([0, 1], [2])))
         elif op in ("aten.mul.Scalar", "aten.div.Scalar"):
             args = (a, 2.0)
+        # The in-place four get a *fresh* receiver each, and not the shared
+        # `a` this loop hands to everything else. Two reasons, both found by
+        # running it the other way: an in-place op would overwrite the operand
+        # every later iteration reads, and -- because `out` from the previous
+        # iteration is still alive -- `zero_` would arrive one line after
+        # `aten.view.default` had made an alias of `a`, and would correctly
+        # refuse. Neither has anything to do with the dispatch count this loop
+        # is measuring.
+        elif op == "aten.add_.Tensor":
+            args = (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])), b)
+        elif op in ("aten.mul_.Scalar", "aten.fill_.Scalar"):
+            args = (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])), 2.0)
+        elif op == "aten.zero_.default":
+            args = (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3])),)
         elif op == "aten.slice.Tensor":
             args = (a, 1, 1, 3)
         elif op == "aten.select.int":
@@ -3493,14 +3517,15 @@ _BACKWARD_STILL_MISSING = (
 # file's claim about them is the opposite of the one it replaces and is
 # asserted as `"ok"` below rather than as a refusal.
 #
-# The wall that replaces them is a *second* backward into a `.grad` that
-# already exists: `AccumulateGrad`'s in-place add. It is named from the probe,
-# and the reason it is not implemented is the same shape as the `is_causal`
-# four -- **no op on this device writes in place.** `detach`/`alias` share the
-# `VkBuffer` (vulkan.rs `dispatch` says so in as many words), so an `add_`
-# would write through an alias that other tensors are reading, and it would do
-# it *silently*. Teaching it needs a sharing analysis this device does not
-# have, not a kernel. docs/devices/VULKAN10.md §6.
+# The wall that replaced them -- a *second* backward into a `.grad` that
+# already exists, i.e. `AccumulateGrad`'s `aten.add_.Tensor` -- is gone too,
+# as of docs/devices/VULKAN11.md. It did not fall to a kernel: it fell to the
+# device being given an ownership analysis, because `detach`/`alias`/`view`/
+# `contiguous`/`reshape` share the `VkBuffer` and an in-place write through a
+# shared one is *unsound*, not merely unimplemented. `require_exclusive` in
+# vulkan.rs decides that question now, exactly, and refuses by name when the
+# answer is "shared". The constant is kept, spelling what that op is, because
+# the probe below still reads the op's name out of a refusal when one comes.
 _SECOND_ACCUMULATION_WALL = "aten.add_.Tensor"
 
 
@@ -3687,24 +3712,41 @@ def test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason()
     assert walls["mean_backward"] == "ok", (
         f"`o.mean().backward()` stopped again: {walls['mean_backward'][:300]}")
 
-    # And what replaced them. The refusal message *lists every taught op*, so
-    # a substring search would match `aten.add.Tensor` in the list and call it
-    # the wall. The op that actually stopped is the one the message opens
-    # with, before `: not implemented`, and that is what is read here.
-    assert walls["second_accumulation"].startswith("NotImplementedError"), (
-        f"a second backward into an existing `.grad` now works on this "
-        f"device: {walls['second_accumulation']}. That means an in-place "
-        f"write landed here, and vulkan.rs `dispatch` states that no op on "
-        f"this device writes in place because `detach`/`alias` share the "
-        f"buffer -- so this test must be rewritten against whatever made it "
-        f"sound, not deleted")
-    named = walls["second_accumulation"].split(": ", 1)[1].split(":", 1)[0].strip()
-    assert named == _SECOND_ACCUMULATION_WALL, (
-        f"the second accumulation stopped at {named!r}, not at the op this "
-        f"test names ({_SECOND_ACCUMULATION_WALL!r}): "
-        f"{walls['second_accumulation'][:200]}")
-    print(f"   `o.sum().backward()` and `o.mean().backward()`: ok; "
-          f"next wall (second accumulation): {named}")
+    # The wall docs/devices/VULKAN10.md §7 measured -- a second backward into
+    # an existing `.grad`, i.e. `AccumulateGrad`'s `aten.add_.Tensor` -- is
+    # gone as of docs/devices/VULKAN11.md, and it is asserted to **run** here
+    # rather than deleted. It did not go by acquiring a kernel: it went by the
+    # device acquiring an ownership analysis, so if this ever regresses the
+    # thing to look at is `require_exclusive`, not a shader.
+    assert walls["second_accumulation"] == "ok", (
+        f"a second accumulation into an existing `.grad` stopped again: "
+        f"{walls['second_accumulation'][:400]}")
+
+    # And what is still refused. These are measured in the same probe rather
+    # than listed from `vulkan.rs`, and they are NOT all the same kind of
+    # absence -- which is the point of naming them separately:
+    #   * `copy_`, `sub_`, `div_`, `empty_like` are unwritten kernels. The
+    #     ownership analysis would serve them unchanged; nothing measured has
+    #     needed them, and an unexercised kernel is unproven code with a green
+    #     tick (docs/devices/VULKAN9.md §5.1).
+    #   * `foreach` SGD is a different wall entirely: it stops in
+    #     `torch._C._group_tensors_by_device_and_dtype`, before any vulkan op,
+    #     so it was never behind the aliasing question and is not unblocked by
+    #     having answered it.
+    for name in ("copy_", "sub_", "div_", "empty_like"):
+        assert walls[name].startswith("NotImplementedError"), (
+            f"`{name}` now runs on this device. It is named here as an "
+            f"unwritten kernel; if it was written, it needs its own agreement "
+            f"and counter evidence and this list must shrink deliberately: "
+            f"{walls[name][:200]}")
+    assert walls["sgd_foreach"].startswith("NotImplementedError"), walls["sgd_foreach"][:300]
+    assert "_group_tensors_by_device_and_dtype" in walls["sgd_foreach"], (
+        f"`foreach` SGD no longer stops where this test says it does; the "
+        f"claim that it is not an aliasing wall must be re-measured: "
+        f"{walls['sgd_foreach'][:300]}")
+    print(f"   `o.sum().backward()`, `o.mean().backward()` and a second "
+          f"accumulation: ok; still refused: copy_, sub_, div_, empty_like, "
+          f"and foreach SGD at _group_tensors_by_device_and_dtype")
 
 
 _REMAINING_WALLS_PROBE = r"""
@@ -3755,6 +3797,33 @@ try:
     out["is_causal_forward"] = "ok"
 except Exception as e:
     out["is_causal_forward"] = f"{type(e).__name__}: {e}"
+
+# What the in-place four did NOT reach, measured rather than reasoned about.
+# `foreach` is the interesting one: it is `torch.optim`'s default fast path on
+# devices that support it and it stops *before* any vulkan op, in
+# `torch._C._group_tensors_by_device_and_dtype`, so it is not behind the
+# aliasing question at all.
+x = torch.ones(2, 2, device="vulkan")
+y = torch.ones(2, 2, device="vulkan")
+for name, fn in (
+    ("copy_", lambda: x.copy_(y)),
+    ("empty_like", lambda: torch.empty_like(x)),
+    ("sub_", lambda: x.sub_(y)),
+    ("div_", lambda: x.div_(2.0)),
+):
+    try:
+        fn()
+        out[name] = "ok"
+    except Exception as e:
+        out[name] = f"{type(e).__name__}: {e}"
+
+try:
+    p = torch.nn.Parameter(torch.ones(2, 2, device="vulkan"))
+    (p * p).sum().backward()
+    torch.optim.SGD([p], lr=0.1, foreach=True).step()
+    out["sgd_foreach"] = "ok"
+except Exception as e:
+    out["sgd_foreach"] = f"{type(e).__name__}: {e}"
 
 json.dump(out, sys.stdout)
 """
@@ -4024,9 +4093,12 @@ def test_the_mean_reduction_ran_on_the_gpu_in_exactly_one_dispatch():
 # claim is that a step *completes on the device and agrees*, and a bigger
 # tensor would only make the float32 reduction error larger without making the
 # claim stronger. The update is written functionally (`w - lr * w.grad`)
-# rather than in place, because **no op on this device writes in place** --
-# `detach`/`alias` share the buffer (vulkan.rs `dispatch`), so an in-place
-# update would be unsound here rather than merely unimplemented.
+# rather than in place, and it is **kept** that way now that in-place works
+# (docs/devices/VULKAN11.md): this test is the evidence that the functional
+# spelling still carries a whole step, which is what the round below would
+# have to fall back on if the ownership analysis were ever withdrawn. The
+# in-place spelling of the same step is
+# `test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream`.
 _TRAIN_STEP_PROBE = r"""
 import json, sys
 import torch
@@ -4355,6 +4427,504 @@ def test_three_training_steps_drive_the_loss_down_and_track_upstream():
         ("losses", got["losses"], losses32, [float(v) for v in losses64]),
         ("final w", got["w_final"], _up_flat(w32), _up_flat(w64.double())),
     ])
+
+
+# ---------------------------------------------------------------------------
+# In place -- and the ownership analysis that makes it decidable
+#
+# docs/devices/VULKAN11.md. Up to VULKAN10 this device had no in-place op at
+# all, and the stated reason was not "no kernel" but "no aliasing analysis":
+# `detach`/`alias`/`contiguous`/`view`/`reshape` all hand back a tensor over
+# the *same* `VkBuffer`, so a write through one of them would be seen by the
+# others and would be seen silently.
+#
+# The analysis exists now, and it is exact rather than approximate: a
+# `VkTensor` is a shape plus an `Arc<VkBuffer>`, and no descriptor this module
+# writes binds anything but `offset 0, VK_WHOLE_SIZE`, so two tensors overlap
+# **iff** they hold clones of one `Arc`. `Arc::strong_count == 1` is therefore
+# a proof of exclusivity, not a guess, and `_vulkan_storage()` reports it.
+#
+# The tests below are in three kinds and the kinds are kept apart:
+#   * the analysis answers correctly about sharing (built, not asserted from
+#     source);
+#   * where it says "exclusive", the in-place op runs, agrees with upstream,
+#     and the counters say the GPU did it;
+#   * where it says "shared", the op **refuses by name before any dispatch**
+#     and the alias is provably untouched.
+# ---------------------------------------------------------------------------
+
+def _storage(t):
+    return _C._vulkan_storage(t)
+
+
+def test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis():
+    """**The aliasing question, answered by construction rather than by rule.**
+
+    Every way this device has of producing a second tensor over one buffer is
+    exercised here, and each is required to *say so*. This is the test that
+    would have to fail first if `Arc::strong_count` stopped being an exact
+    account of sharing -- every claim below it rests on that.
+    """
+    if _vulkan_or_skip("the vulkan storage/aliasing report") is None:
+        return
+    x = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2]))
+    fresh = _storage(x)
+    assert fresh["shares"] == 1 and fresh["exclusive"] is True, fresh
+
+    # Every sharing op on this device, by name. `contiguous` is in the list
+    # because this device has no strides: it cannot make a copy to escape a
+    # layout it does not have, so it shares (vulkan.rs `dispatch`).
+    for name, make in (
+        ("detach", lambda t: _C._aten_dispatch("aten.detach.default", t)),
+        ("alias", lambda t: _C._aten_dispatch("aten.alias.default", t)),
+        ("contiguous", lambda t: _C._aten_dispatch("aten.contiguous.default", t)),
+        ("view", lambda t: _C._aten_dispatch("aten.view.default", t, [4])),
+        ("reshape", lambda t: _C._aten_dispatch("aten.reshape.default", t, [4])),
+    ):
+        y = make(x)
+        sx, sy = _storage(x), _storage(y)
+        assert sx["id"] == sy["id"], (name, sx, sy)
+        assert sx["shares"] >= 2 and not sx["exclusive"], (name, sx)
+        assert sy["shares"] >= 2 and not sy["exclusive"], (name, sy)
+        del y
+        back = _storage(x)
+        assert back["exclusive"] is True, (
+            f"{name}: dropping the alias did not restore exclusivity: {back}. "
+            f"A count that only goes up would refuse every in-place op after "
+            f"the first view ever taken of a buffer")
+
+    # `clone` is the one that does *not* share -- it allocates and copies on
+    # the device, which is what makes a copy-on-write answer available at all.
+    c = _C._aten_dispatch("aten.clone.default", x)
+    assert _storage(c)["id"] != _storage(x)["id"], (_storage(c), _storage(x))
+    assert _storage(x)["exclusive"] and _storage(c)["exclusive"]
+    print(f"   sharing is Arc-exact: detach/alias/contiguous/view/reshape share, "
+          f"clone does not; a dropped alias restores exclusivity")
+
+
+def test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device():
+    """A report that answered for a CPU tensor would be answering about
+    something with no `VkBuffer` at all, and every in-place decision below
+    reads it."""
+    if _vulkan_or_skip("the vulkan storage report's refusal") is None:
+        return
+    try:
+        _C._vulkan_storage(_cpu([1.0], [1]))
+    except NotImplementedError as e:
+        assert "vulkan" in str(e), str(e)
+    else:
+        raise AssertionError("_vulkan_storage answered for a CPU tensor")
+
+
+# The four in-place ops this round taught, each as (op, builder, upstream fn).
+# They are exactly what `torch.optim.SGD` and `zero_grad(set_to_none=False)`
+# call -- not a survey of the in-place surface, which is the reason
+# `copy_`/`div_`/`sub_` are still absent below.
+_INPLACE_SHAPES = ((4,), (2, 3), (3, 5, 7), (1,))
+
+
+def test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance():
+    """Element-wise against upstream's own in-place kernels, in a subprocess.
+
+    `alpha` is swept deliberately: `torch.optim.SGD` spells its update
+    `p.add_(d_p, alpha=-lr)`, so an `add_` that ignored `alpha` would pass a
+    plain-`add_` sweep and then move every weight the wrong distance.
+    """
+    if _vulkan_or_skip("the in-place agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    payload = _inplace_payload(torch)
+    got = _inplace_probe(payload)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip("the in-place agreement sweep: no loader in the subprocess")
+        return
+    assert got.get("error") is None, got.get("error")
+    cases = []
+    for case in payload["cases"]:
+        label = f"{case['op']} {case['shape']} alpha={case.get('alpha')}"
+        want32 = _up_flat(_inplace_upstream(torch, case, torch.float32))
+        want64 = _up_flat(_inplace_upstream(torch, case, torch.float64))
+        cases.append((label, got["results"][label], want32, [float(v) for v in want64]))
+    _assert_agreement("in-place add_/mul_/fill_/zero_", cases)
+
+
+def test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader():
+    """**In place means in place.** Three separate claims, and none of them
+    implies the others:
+
+      * the *buffer* is the same one afterwards (a copy-on-write answer would
+        be correct in value and would fail here);
+      * the Python object handed back is the receiver itself, as upstream's
+        in-place ops return;
+      * exactly one shader ran and nothing crossed the host boundary -- the
+        only evidence that separates this from a readback, a host add and an
+        upload, which docs/devices/VULKAN10.md §6 N3 showed passes every value
+        check there is.
+    """
+    if _vulkan_or_skip("the in-place buffer identity and counters") is None:
+        return
+    for op, build in (
+        ("aten.add_.Tensor",
+         lambda: ("aten.add_.Tensor",
+                  (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2])),
+                   _to_vulkan(_cpu([10.0, 20.0, 30.0, 40.0], [2, 2]))),
+                  {}, [11.0, 22.0, 33.0, 44.0])),
+        ("aten.mul_.Scalar",
+         lambda: ("aten.mul_.Scalar",
+                  (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2])), 3.0),
+                  {}, [3.0, 6.0, 9.0, 12.0])),
+        ("aten.fill_.Scalar",
+         lambda: ("aten.fill_.Scalar",
+                  (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2])), 7.5),
+                  {}, [7.5] * 4)),
+        ("aten.zero_.default",
+         lambda: ("aten.zero_.default",
+                  (_to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2])),),
+                  {}, [0.0] * 4)),
+    ):
+        name, call_args, call_kwargs, want = build()
+        receiver = call_args[0]
+        before_id = _storage(receiver)["id"]
+        before = _counters()
+        out = _C._aten_dispatch(name, *call_args, **call_kwargs)
+        d = _delta(before, _counters())
+        assert d == {"shader_dispatches": 1, "host_uploads": 0, "host_downloads": 0}, (op, d)
+        assert _storage(receiver)["id"] == before_id, (
+            f"{op} did not write into the buffer it was given -- the receiver's "
+            f"buffer changed identity, which is a copy-on-write answer wearing "
+            f"an in-place name")
+        assert _storage(out)["id"] == before_id, (op, "the result is a different buffer")
+        assert _flat(_to_cpu(receiver)) == want, (op, _flat(_to_cpu(receiver)))
+        assert _flat(_to_cpu(out)) == want, (op, "the returned handle disagrees with the receiver")
+    print("   add_/mul_/fill_/zero_: same buffer, one shader each, 0 uploads, 0 downloads")
+
+
+def test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact():
+    """**The unsoundness, built rather than argued about.**
+
+    `y = x.detach()` puts two tensors over one buffer. `x.add_(z)` would then
+    change `y` without `y` being mentioned -- and on this device it would do
+    it with no way for `y` to find out, because there is no version counter.
+    So the write refuses, and this test requires three things of that refusal:
+    it names the op, it happens **before any dispatch**, and `y` still holds
+    the numbers it held.
+
+    The last one is what makes this a corruption test and not a message test:
+    a kernel that dispatched and *then* raised would fail here and pass a
+    test that only read the exception.
+    """
+    if _vulkan_or_skip("the in-place refusal on a shared buffer") is None:
+        return
+    for name, alias_of in (
+        ("detach", lambda t: _C._aten_dispatch("aten.detach.default", t)),
+        ("view", lambda t: _C._aten_dispatch("aten.view.default", t, [4])),
+        ("contiguous", lambda t: _C._aten_dispatch("aten.contiguous.default", t)),
+    ):
+        x = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2]))
+        y = alias_of(x)
+        y_before = _flat(_to_cpu(y))
+        z = _to_vulkan(_cpu([10.0, 20.0, 30.0, 40.0], [2, 2]))
+        for op, call in (
+            ("aten.add_.Tensor", lambda: _C._aten_dispatch("aten.add_.Tensor", x, z)),
+            ("aten.mul_.Scalar", lambda: _C._aten_dispatch("aten.mul_.Scalar", x, 3.0)),
+            ("aten.zero_.default", lambda: _C._aten_dispatch("aten.zero_.default", x)),
+            ("aten.fill_.Scalar", lambda: _C._aten_dispatch("aten.fill_.Scalar", x, 9.0)),
+        ):
+            before = _counters()
+            try:
+                call()
+            except NotImplementedError as e:
+                msg = str(e)
+            else:
+                raise AssertionError(
+                    f"{op} wrote through a buffer shared with a {name} alias. "
+                    f"That write is invisible to the alias and this device has "
+                    f"no version counter to make it visible")
+            assert msg.split(":", 1)[0].strip() == op, msg[:300]
+            assert "shares" in msg or "shared" in msg, msg[:300]
+            d = _delta(before, _counters())
+            assert d == {"shader_dispatches": 0, "host_uploads": 0, "host_downloads": 0}, (
+                f"{op} refused a shared buffer but had already dispatched: {d}")
+            assert _flat(_to_cpu(x)) == [1.0, 2.0, 3.0, 4.0], (op, name, "x moved")
+            assert _flat(_to_cpu(y)) == y_before, (op, name, "the alias moved")
+
+        # And the same write is allowed the moment the alias is gone. Without
+        # this half the refusal could be unconditional and the test would not
+        # know -- which is how "refuses in the shared case" degenerates into
+        # "refuses".
+        del y
+        _C._aten_dispatch("aten.add_.Tensor", x, z)
+        assert _flat(_to_cpu(x)) == [11.0, 22.0, 33.0, 44.0], _flat(_to_cpu(x))
+    print("   add_/mul_/zero_/fill_ refuse a detach/view/contiguous alias "
+          "before dispatching, and run once it is dropped")
+
+
+def test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu():
+    """The narrowings, by name: a broadcasting `add_` and a non-f32 receiver.
+
+    A broadcast `add_` is not unimplementable here -- `broadcast_binary` exists
+    out of place -- but it is not written, and an op that quietly fell back to
+    the CPU for it would make every counter above unreadable.
+    """
+    if _vulkan_or_skip("the in-place narrowings") is None:
+        return
+    a = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], [2, 2]))
+    b = _to_vulkan(_cpu([1.0, 2.0], [1, 2]))
+    before = _counters()
+    try:
+        _C._aten_dispatch("aten.add_.Tensor", a, b)
+    except NotImplementedError as e:
+        assert "aten.add_.Tensor" in str(e), str(e)
+    else:
+        raise AssertionError("a broadcasting add_ did not refuse")
+    assert _delta(before, _counters())["shader_dispatches"] == 0
+    i = _to_vulkan(_i64([1, 2, 3, 4], [2, 2]))
+    try:
+        _C._aten_dispatch("aten.zero_.default", i)
+    except NotImplementedError as e:
+        assert "float32" in str(e), str(e)
+    else:
+        raise AssertionError("zero_ on an int64 vulkan tensor did not refuse")
+
+
+# ---------------------------------------------------------------------------
+# What the analysis was for: `torch.optim.SGD`
+# ---------------------------------------------------------------------------
+
+_SGD_PROBE = r"""
+import json, sys
+import torch
+
+req = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+
+def dev(flat, shape):
+    return torch.tensor(flat, dtype=torch.float32).reshape(shape).to("vulkan")
+
+
+results, counters, errors = {}, {}, {}
+for case in req["cases"]:
+    try:
+        x = dev(req["x"], req["x_shape"])
+        y = dev(req["y"], req["y_shape"])
+        w = torch.nn.Parameter(dev(req["w"], req["w_shape"]))
+        opt = torch.optim.SGD([w], lr=req["lr"], momentum=case["momentum"],
+                              foreach=False)
+        # The loss tensors are KEPT, not read back, inside the bracket: a
+        # `.cpu()` per step would make `host_downloads` count this probe's own
+        # reporting and the counter would stop being evidence about the step.
+        kept = []
+        before = torch._C._vulkan_counters()
+        for _ in range(case["steps"]):
+            opt.zero_grad(set_to_none=case["set_to_none"])
+            diff = (x @ w) - y
+            loss = (diff * diff).mean()
+            loss.backward()
+            kept.append(loss)
+            opt.step()
+        after = torch._C._vulkan_counters()
+        counters[case["name"]] = {k: after[k] - before[k] for k in after}
+        device = str(w.device)
+        results[case["name"]] = {
+            "losses": [float(t.detach().cpu().reshape(-1).tolist()[0]) for t in kept],
+            "w": w.detach().cpu().reshape(-1).tolist(),
+            "device": device}
+    except Exception as e:  # noqa: BLE001
+        errors[case["name"]] = f"{type(e).__name__}: {e}"
+out["results"] = results
+out["counters"] = counters
+out["errors"] = errors
+json.dump(out, sys.stdout)
+"""
+
+_SGD_CASES = (
+    {"name": "plain", "momentum": 0.0, "steps": 1, "set_to_none": True},
+    {"name": "three steps", "momentum": 0.0, "steps": 3, "set_to_none": True},
+    {"name": "momentum", "momentum": 0.9, "steps": 3, "set_to_none": True},
+    {"name": "zero_grad(set_to_none=False)", "momentum": 0.0, "steps": 3,
+     "set_to_none": False},
+)
+
+
+def _sgd_upstream(torch, payload, case, dtype):
+    def t(key, shape_key):
+        return torch.tensor(payload[key], dtype=dtype).reshape(payload[shape_key])
+
+    x, y = t("x", "x_shape"), t("y", "y_shape")
+    w = torch.nn.Parameter(t("w", "w_shape"))
+    opt = torch.optim.SGD([w], lr=payload["lr"], momentum=case["momentum"], foreach=False)
+    losses = []
+    for _ in range(case["steps"]):
+        opt.zero_grad(set_to_none=case["set_to_none"])
+        diff = (x @ w) - y
+        loss = (diff * diff).mean()
+        loss.backward()
+        losses.append(float(loss.detach().reshape(-1).tolist()[0]))
+        opt.step()
+    return losses, w.detach().reshape(-1).tolist()
+
+
+def _sgd_probe(payload):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _SGD_PROBE],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=900)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    return json.loads(proc.stdout)
+
+
+def _sgd_payload(torch):
+    p = _train_payload(torch)
+    p["cases"] = [dict(c) for c in _SGD_CASES]
+    return p
+
+
+def test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream():
+    """**The question this round exists to answer** -- not "does `add_` have a
+    kernel" but "can a person use `torch.optim.SGD` here".
+
+    `torch.optim.SGD` is upstream's own file, running unmodified: it reaches
+    `param.add_(d_p, alpha=-lr)` and, with momentum, `buf.mul_(m).add_(d_p)`.
+    Nothing here re-implements the optimizer; the only thing that changed is
+    that those three calls are now decidable on this device.
+
+    `zero_grad(set_to_none=False)` is included because it is the other half of
+    the wall: it calls `p.grad.zero_()`, and the second backward then
+    accumulates into that existing `.grad` with `add_`.
+    """
+    if _vulkan_or_skip("torch.optim.SGD on the vulkan device") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    payload = _sgd_payload(torch)
+    got = _sgd_probe(payload)
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip("torch.optim.SGD: no loader in the subprocess")
+        return
+    assert not got["errors"], got["errors"]
+
+    cases = []
+    for case in _SGD_CASES:
+        name = case["name"]
+        assert got["results"][name]["device"] == "vulkan", got["results"][name]
+        l32, w32 = _sgd_upstream(torch, payload, case, torch.float32)
+        l64, w64 = _sgd_upstream(torch, payload, case, torch.float64)
+        cases.append((f"SGD {name}: losses", got["results"][name]["losses"],
+                      l32, [float(v) for v in l64]))
+        cases.append((f"SGD {name}: weights", got["results"][name]["w"],
+                      w32, [float(v) for v in w64]))
+        # The step is a step: the weights moved, and the loss fell. Neither
+        # follows from agreement -- an all-zero gradient agrees with an
+        # all-zero gradient (docs/devices/VULKAN10.md §5).
+        moved = max(abs(a - b) for a, b in zip(got["results"][name]["w"], payload["w"]))
+        assert moved > 1e-3, (name, f"SGD moved no weight: {moved:.3e}")
+        if case["steps"] > 1:
+            losses = got["results"][name]["losses"]
+            assert losses[-1] < losses[0], (name, losses)
+        c = got["counters"][name]
+        assert c["host_uploads"] == 0 and c["host_downloads"] == 0, (
+            f"SGD {name} crossed the host boundary: {c}. A step that reads the "
+            f"weights back, updates them on the CPU and uploads them agrees "
+            f"with upstream perfectly (docs/devices/VULKAN10.md §6 N3); these "
+            f"two zeros are what separates it from this one")
+        assert c["shader_dispatches"] > 0, (name, c)
+    _assert_agreement("torch.optim.SGD (losses, weights)", cases)
+    for case in _SGD_CASES:
+        print(f"   SGD {case['name']}: losses "
+              f"{[round(v, 6) for v in got['results'][case['name']]['losses']]}, "
+              f"{got['counters'][case['name']]}")
+
+
+_INPLACE_PROBE = r"""
+import json, sys
+import torch
+
+req = json.load(sys.stdin)
+out = {"probe": torch._C._vulkan_probe()}
+if not out["probe"]["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+
+def dev(flat, shape):
+    return torch.tensor(flat, dtype=torch.float32).reshape(shape).to("vulkan")
+
+
+results = {}
+try:
+    for case in req["cases"]:
+        label = "%s %s alpha=%s" % (case["op"], case["shape"], case.get("alpha"))
+        a = dev(case["a"], case["shape"])
+        if case["op"] == "add_":
+            b = dev(case["b"], case["shape"])
+            a.add_(b, alpha=case["alpha"])
+        elif case["op"] == "mul_":
+            a.mul_(case["scalar"])
+        elif case["op"] == "fill_":
+            a.fill_(case["scalar"])
+        elif case["op"] == "zero_":
+            a.zero_()
+        results[label] = a.cpu().reshape(-1).tolist()
+    out["error"] = None
+except Exception as e:  # noqa: BLE001
+    out["error"] = "%s: %s" % (type(e).__name__, e)
+out["results"] = results
+json.dump(out, sys.stdout)
+"""
+
+
+def _inplace_payload(torch):
+    cases = []
+    seed = 5100
+    for shape in _INPLACE_SHAPES:
+        n = 1
+        for d in shape:
+            n *= d
+        a = _up_flat(_rand(torch, *shape, seed=seed))
+        b = _up_flat(_rand(torch, *shape, seed=seed + 1))
+        seed += 2
+        for alpha in (1.0, -0.1, 2.5):
+            cases.append({"op": "add_", "shape": list(shape), "a": a, "b": b,
+                          "alpha": alpha})
+        cases.append({"op": "mul_", "shape": list(shape), "a": a, "b": b,
+                      "scalar": 0.9, "alpha": None})
+        cases.append({"op": "fill_", "shape": list(shape), "a": a, "b": b,
+                      "scalar": -2.25, "alpha": None})
+        cases.append({"op": "zero_", "shape": list(shape), "a": a, "b": b,
+                      "scalar": 0.0, "alpha": None})
+    return {"cases": cases}
+
+
+def _inplace_upstream(torch, case, dtype):
+    a = torch.tensor(case["a"], dtype=dtype).reshape(case["shape"])
+    if case["op"] == "add_":
+        a.add_(torch.tensor(case["b"], dtype=dtype).reshape(case["shape"]),
+               alpha=case["alpha"])
+    elif case["op"] == "mul_":
+        a.mul_(case["scalar"])
+    elif case["op"] == "fill_":
+        a.fill_(case["scalar"])
+    elif case["op"] == "zero_":
+        a.zero_()
+    return a
+
+
+def _inplace_probe(payload):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _INPLACE_PROBE],
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=900)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    return json.loads(proc.stdout)
 
 
 # ---------------------------------------------------------------------------

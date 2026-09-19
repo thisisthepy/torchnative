@@ -100,6 +100,8 @@ spv!(BROADCAST_BINARY_F32_SPV, "broadcast_binary_f32");
 spv!(LOGSUMEXP_LASTDIM_F32_SPV, "logsumexp_lastdim_f32");
 spv!(SUM_DIMS_F32_SPV, "sum_dims_f32");
 spv!(FILL_F32_SPV, "fill_f32");
+spv!(INPLACE_ADD_F32_SPV, "inplace_add_f32");
+spv!(INPLACE_SCALAR_F32_SPV, "inplace_scalar_f32");
 
 // ---------------------------------------------------------------------------
 // The instrument: how "it ran on the GPU" stops being an inference
@@ -1152,9 +1154,34 @@ pub fn dispatch(
 
         // `clone` allocates and copies on the device. `detach`/`alias` share
         // the buffer, which is what the dense arm does too (a candle clone is
-        // an `Arc` clone) and is safe here for a stronger reason: no op on
-        // this device writes in place.
+        // an `Arc` clone). Until docs/devices/VULKAN11.md that sharing was
+        // safe for a blunt reason -- no op on this device wrote in place.
+        // Four now do, and what keeps this safe is that the sharing is
+        // *decidable*: the `Arc` every one of these clones is the thing
+        // `require_exclusive` counts, so an in-place write to a buffer one of
+        // these handed out refuses by name instead of going through.
         "aten.clone.default" => unary(py, op, args, kwargs, "copy_f32", COPY_F32_SPV),
+
+        // **The in-place ops, and the one thing that makes them decidable.**
+        //
+        // Up to docs/devices/VULKAN10.md nothing here wrote in place, and the
+        // reason given was not "no kernel" -- it was that `detach`/`alias`/
+        // `contiguous`/`view`/`reshape` hand back a tensor over the *same*
+        // `VkBuffer`, so a write through one would be seen by the others and
+        // would be seen silently. That is still true. What is new is that the
+        // sharing is now *decided* rather than assumed: `require_exclusive`
+        // proves the receiver's buffer has exactly one live reference before
+        // any dispatch, and refuses by name when it does not
+        // (docs/devices/VULKAN11.md §2).
+        //
+        // These four and no others, because these four are what
+        // `torch.optim.SGD` and `zero_grad(set_to_none=False)` actually call.
+        // An in-place op nobody exercises is unproven code with a green tick,
+        // which is the reason the `is_causal` four are still absent.
+        "aten.add_.Tensor" => add_inplace(py, op, args, kwargs),
+        "aten.mul_.Scalar" => scalar_inplace(py, op, args, kwargs, 0),
+        "aten.fill_.Scalar" => scalar_inplace(py, op, args, kwargs, 1),
+        "aten.zero_.default" => scalar_inplace(py, op, args, kwargs, 1),
         "aten.detach.default" | "aten.alias.default" | "aten.contiguous.default" => {
             let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
             let vk_tensor = input.vk_tensor(op)?.clone();
@@ -1308,6 +1335,200 @@ fn reject_alpha(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// In place -- and the ownership analysis that makes it decidable
+// ---------------------------------------------------------------------------
+//
+// docs/devices/VULKAN11.md §2. The problem this device had was never the
+// kernel. A `VkTensor` is a shape plus an `Arc<VkBuffer>`, and `detach`,
+// `alias`, `contiguous`, `view` and `reshape` all hand back a second tensor
+// over the *same* `Arc` -- deliberately, because this device has no strides
+// and so has nothing else for those ops to be. A write through one of them
+// would be seen by every other, with no version counter to make it visible.
+//
+// What makes the decision possible is that the sharing here is not an
+// approximation of an aliasing relation -- it *is* the relation. No
+// descriptor this module writes binds anything but `offset 0,
+// VK_WHOLE_SIZE`, so there are no partial overlaps to reason about: two
+// tensors touch the same bytes **iff** their `Arc`s are clones of one
+// another. `Arc::strong_count == 1` is therefore a proof of exclusivity.
+//
+// The GIL is what makes reading the count safely conclusive: every route to a
+// new alias on this device goes through `dispatch`, and `dispatch` runs under
+// the GIL, which this thread holds from the check through the submit. No
+// other thread can create an alias in between.
+//
+// Two answers were rejected before this one:
+//
+//   * **copy-on-write** -- write to a fresh buffer when shared. Sound in
+//     isolation and *wrong* as a torch op: `y = x.detach(); x.add_(z)` must
+//     leave `y` changed, and a copy-on-write `add_` leaves it unchanged while
+//     reporting success. That is a wrong answer where this is a refusal.
+//   * **a permanent refusal by name** -- honest, and it was the standing
+//     answer until this round, but it does not carry `torch.optim`: SGD's
+//     update *is* `p.add_(d_p, alpha=-lr)`, so refusing it refuses the
+//     optimizer, and there is no functional spelling of `torch.optim.SGD`
+//     that does not reach the same line of upstream's own file.
+
+/// The receiver of an in-place op, **without cloning it.**
+///
+/// `crate::aten::tensor_arg` extracts a `PyTensorBase` by value, which clones
+/// the wrapper and therefore the `Arc` -- and the count is the whole analysis
+/// here, so a helper that inflates it by one would make every exclusively
+/// owned tensor look shared with a phantom of the dispatcher's own making.
+fn vk_arg<'py>(
+    op: &str,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<Bound<'py, PyTensorBase>> {
+    crate::aten::required(op, args, kwargs, index, name)?
+        .cast_into::<PyTensorBase>()
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "{op}: argument '{name}' must be a torch._C.TensorBase"
+            ))
+        })
+}
+
+/// **The refusal.** No in-place write is submitted unless this returns `Ok`.
+fn require_exclusive(op: &str, t: &VkTensor) -> PyResult<()> {
+    let shares = Arc::strong_count(&t.buffer);
+    if shares == 1 {
+        return Ok(());
+    }
+    Err(not_implemented(format!(
+        "{op}: this tensor's VkBuffer is shared -- `_C._vulkan_storage()` \
+         reports shares={shares}, so {} other tensor(s) are built on exactly \
+         these bytes. Writing in place would change all of them without \
+         naming any of them, and this device has no version counter with \
+         which they could find out. `detach`, `alias`, `contiguous`, `view` \
+         and `reshape` all share here, because a VkTensor has no strides and \
+         so has nothing else to be (docs/devices/VULKAN11.md §2). Drop the \
+         alias, or use the out-of-place spelling -- `a = a + b` rather than \
+         `a += b` -- which allocates and is always sound.",
+        shares - 1
+    )))
+}
+
+/// `aten.add_.Tensor`: `a += alpha * b`, into `a`'s own buffer.
+fn add_inplace(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let receiver = vk_arg(op, args, kwargs, 0, "self")?;
+    let other = vk_arg(op, args, kwargs, 1, "other")?;
+    // `alpha` is *read*, not rejected: `torch.optim.SGD` spells its entire
+    // update `p.add_(d_p, alpha=-lr)`, so an `add_` that refused alpha would
+    // refuse the optimizer this arm exists for. The out-of-place
+    // `aten.add.Tensor` still refuses it (`reject_alpha`) because nothing
+    // measured has needed it there.
+    let alpha: f64 = match crate::aten::optional(args, kwargs, 2, "alpha")? {
+        Some(v) if !v.is_none() => v.extract().map_err(|_| {
+            not_implemented(format!(
+                "{op}: the vulkan kernel's alpha must be a number, not {}.",
+                v.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?,
+        _ => 1.0,
+    };
+
+    let a_base = receiver.borrow();
+    // A shared borrow twice over, which `x.add_(x)` needs -- one tensor
+    // handed in as both operands is legal and is not an aliasing problem:
+    // invocation `i` reads a[i] and b[i] and writes a[i], so nothing reads an
+    // index another invocation wrote.
+    let b_base = other.borrow();
+    check_dtype(op, a_base.tag())?;
+    check_dtype(op, b_base.tag())?;
+    let a = a_base.vk_tensor(op)?;
+    let b = b_base.vk_tensor(op)?;
+    if a.shape != b.shape {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan in-place add has no broadcast -- self {:?} and \
+             other {:?}. The out-of-place `aten.add.Tensor` broadcasts \
+             (docs/devices/VULKAN7.md); writing that shape into a fixed \
+             destination is a different kernel and nothing measured has \
+             needed it, so it refuses here rather than reaching for the CPU.",
+            a.shape, b.shape
+        )));
+    }
+    require_exclusive(op, a)?;
+    let n = a.elem_count();
+    if n > 0 {
+        let ctx = require(op)?;
+        unsafe {
+            ctx.dispatch_kernel(
+                "inplace_add_f32",
+                INPLACE_ADD_F32_SPV,
+                &[&a.buffer, &b.buffer],
+                [n as u32, (alpha as f32).to_bits(), 0, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+    }
+    drop(b_base);
+    drop(a_base);
+    // The receiver itself, which is what an in-place op returns. Not a new
+    // wrapper over the same buffer: that would be a second `Arc` and the next
+    // in-place op on this tensor would refuse until it was collected.
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten.mul_.Scalar` (`which == 0`), `aten.fill_.Scalar` and
+/// `aten.zero_.default` (`which == 1`), into the receiver's own buffer.
+fn scalar_inplace(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    which: u32,
+) -> PyResult<Py<PyAny>> {
+    let receiver = vk_arg(op, args, kwargs, 0, "self")?;
+    // `zero_` takes no value; `mul_`/`fill_` take one at index 1 under two
+    // different names, which is why the name is looked up under both rather
+    // than guessed from the op.
+    let value: f64 = if op == "aten.zero_.default" {
+        0.0
+    } else {
+        let name = if op == "aten.fill_.Scalar" { "value" } else { "other" };
+        let v = crate::aten::optional(args, kwargs, 1, name)?
+            .ok_or_else(|| not_implemented(format!("{op}: vulkan: missing argument '{name}'")))?;
+        v.extract().map_err(|_| {
+            not_implemented(format!(
+                "{op}: the vulkan device's scalar kernel takes a number, not \
+                 {}. A 0-d tensor goes through the .Tensor overload.",
+                v.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+            ))
+        })?
+    };
+
+    let base = receiver.borrow();
+    check_dtype(op, base.tag())?;
+    let a = base.vk_tensor(op)?;
+    require_exclusive(op, a)?;
+    let n = a.elem_count();
+    if n > 0 {
+        let ctx = require(op)?;
+        unsafe {
+            ctx.dispatch_kernel(
+                "inplace_scalar_f32",
+                INPLACE_SCALAR_F32_SPV,
+                &[&a.buffer],
+                [n as u32, (value as f32).to_bits(), which, 0],
+            )
+            .map_err(|e| vk_error(op, e))?;
+        }
+    }
+    drop(base);
+    let _ = py;
+    Ok(receiver.into_any().unbind())
 }
 
 /// `view` / `_unsafe_view` / `reshape`: a new shape over the same buffer.
@@ -1962,6 +2183,7 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten._to_copy.default",
         "aten._unsafe_view.default",
         "aten.add.Tensor",
+        "aten.add_.Tensor",
         "aten.addmm.default",
         "aten.alias.default",
         "aten.all.default",
@@ -1973,6 +2195,7 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.div.Tensor",
         "aten.embedding.default",
         "aten.expand.default",
+        "aten.fill_.Scalar",
         "aten.gather.default",
         "aten.gelu.default",
         "aten.matmul.default",
@@ -1981,6 +2204,7 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.mm.default",
         "aten.mul.Scalar",
         "aten.mul.Tensor",
+        "aten.mul_.Scalar",
         "aten.native_layer_norm.default",
         "aten.neg.default",
         "aten.ones_like.default",
@@ -1995,6 +2219,7 @@ fn vulkan_ops() -> Vec<&'static str> {
         "aten.tanh.default",
         "aten.transpose.int",
         "aten.view.default",
+        "aten.zero_.default",
         "aten.zeros_like.default",
     ]
 }
@@ -2021,8 +2246,48 @@ fn vulkan_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+/// `_C._vulkan_storage(t)` -- **this device's entire aliasing analysis, exposed.**
+///
+/// A `VkTensor` is a `shape` and an `Arc<VkBuffer>`, and a buffer is never
+/// sub-viewed: every descriptor this module writes binds `offset 0,
+/// VK_WHOLE_SIZE`. So two tensors overlap in memory **if and only if** they
+/// hold `Arc` clones of the same `VkBuffer`, and `Arc::strong_count` is not a
+/// heuristic for that -- it is the exact count of live references.
+///
+/// That is what makes an in-place kernel decidable here (docs/devices/VULKAN11.md §2).
+/// `shares == 1` proves no other tensor can observe a write to these bytes;
+/// anything else and the write would be seen through an alias, so the
+/// in-place ops refuse by name rather than doing it silently.
+///
+/// Reported rather than kept private because a test cannot otherwise *build*
+/// the shared case it needs to prove the refusal fires: `detach`, `alias`,
+/// `contiguous`, `view` and `reshape` all share, and nothing else on this
+/// device tells you so.
+#[pyfunction]
+#[pyo3(name = "_vulkan_storage")]
+fn vulkan_storage(py: Python<'_>, t: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    // `borrow`, deliberately not `extract`: `extract::<PyTensorBase>()` clones
+    // the wrapper and therefore the `Arc`, and would report every tensor as
+    // shared with a phantom that is this function's own argument.
+    let base = t.cast::<PyTensorBase>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "_vulkan_storage: expected a torch._C.TensorBase".to_string(),
+        )
+    })?;
+    let base = base.borrow();
+    let v = base.vk_tensor("_vulkan_storage")?;
+    let shares = Arc::strong_count(&v.buffer);
+    let d = PyDict::new(py);
+    d.set_item("id", Arc::as_ptr(&v.buffer) as usize)?;
+    d.set_item("shares", shares)?;
+    d.set_item("exclusive", shares == 1)?;
+    d.set_item("shape", v.shape.clone())?;
+    Ok(d.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(vulkan_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(vulkan_storage, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_ops, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_counters, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_loader_candidates, m)?)?;

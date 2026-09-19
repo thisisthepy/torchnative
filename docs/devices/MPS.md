@@ -146,6 +146,22 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 * 두 테스트 모두 **Metal 이 없는 기계에서도 돕니다.** 소스에 대한 주장이기 때문이고, 그 아래
   커널을 바꿀 가능성이 가장 큰 것이 바로 게이트를 실행해 볼 수 없는 러너들이기 때문입니다.
 
+**그 한계에는 두 번째 면이 있었고, 2026-09-19 에 그것으로 op 하나가 새어나간 것이 확인됐습니다.**
+스캔이 따라가는 여섯 헬퍼는 **전부 `aten.rs` 안에 정의된 것**이고, 분류 테스트도 `aten.rs`
+하나만 읽습니다. 그래서 **다른 모듈에 있는 되읽기**는 두 테스트 어느 쪽에도 보이지 않았습니다.
+`aten.view.dtype` 의 커널은 `crate::tensor::to_le_bytes`(dtype 별 `to_vec1`)와
+`crate::tensor::from_le_bytes`(`let device = candle_core::Device::Cpu;`)를 부릅니다 — 즉
+`mps` 입력에 **cpu 텐서**를 돌려주고 있었고, 값이 맞았기 때문에 조용했습니다
+(docs/devices/matrix.md §4.1).
+
+이제 유도가 파일을 건너갑니다. `_cross_file_readback_helpers` 가 `src/` 의 `aten.rs` 를 제외한
+모든 `*.rs` 에서 되읽기 표식을 가진 함수를 뽑고, 커널은 **정규화된 경로**
+(`crate::tensor::to_le_bytes(`)로 대조합니다 — 이름만으로 맞추면 정수의 고유 메서드인
+`to_le_bytes` 때문에 멀쩡한 커널 여러 개가 목록에 오릅니다.
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _cross_file_readback_helpers present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _reaches_cross_file_readback present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
+
 ### 3.2 왜 "안전한 op 의 허용 목록" 이 아닌가
 
 허용 목록은 위험 집합을 알 수 없을 때의 보수적 선택이고, **여기서는 알 수 있습니다**(§1.1).

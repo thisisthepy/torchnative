@@ -269,6 +269,12 @@ o.mean().backward()                   -> ok
 is_causal=True (forward)              -> NotImplementedError: ... only for is_causal=False
 ```
 
+> **`docs/devices/VULKAN11.md` 가 이 벽을 치웠습니다.** 아래 진단(불건전하다)은 옳았고,
+> 그 뒤의 전제 — *"이 장치에 없는 공유 분석이 필요하다"* — 가 틀렸습니다. 분석은 이미
+> 표현되어 있었습니다(`Arc<VkBuffer>` 의 strong count, 부분 겹침이 없으므로 정확함).
+> 지금은 배타적 소유가 증명될 때만 in-place 로 쓰고, 공유일 때는 이름을 대며 거절합니다.
+> **`torch.optim.SGD` 가 이 장치에서 돕니다.**
+
 `aten.add_.Tensor` 는 `AccumulateGrad` 가 두 번째 backward 부터 쓰는 in-place 덧셈입니다.
 **커널이 없어서가 아니라 이 장치에서 건전하지 않아서 쓰지 않았습니다** — `detach`/`alias` 가
 `VkBuffer` 를 공유하므로, in-place 쓰기는 다른 텐서가 읽고 있는 별칭을 통해 쓰게 되고 그것을
@@ -294,6 +300,11 @@ VULKAN9 §5.1 의 이유 그대로 여전히 구현하지 않았습니다 — fo
   그것을 실행시키는 테스트가 없으므로 쓰지 않았습니다.
 - **`torch.optim` 의 옵티마이저.** `foreach` SGD 는 `p.grad.add_` 와 `p.add_` 를 쓰므로
   §7 의 벽 뒤에 있습니다. 이 회차의 스텝은 손으로 쓴 SGD 입니다.
+  > **정정 (`docs/devices/VULKAN11.md` §7).** 두 가지가 틀렸습니다. (1) 기본 경로
+  > `torch.optim.SGD` 는 이제 **돕니다** — momentum 과 `zero_grad(set_to_none=False)` 포함,
+  > 업로드 0 · 읽어오기 0. (2) `foreach` 는 §7 의 벽 뒤에 있지 **않았습니다**: vulkan op 에
+  > 닿기도 전에 `torch._C._group_tensors_by_device_and_dtype` 에서 멈추며, 이것은 별칭 문제와
+  > 무관하고 따라서 별칭 문제를 답해도 풀리지 않습니다.
 - **`torch.nn.Module` · `Linear`.** 파라미터가 `torch.nn.Parameter` 이고 `.to("vulkan")` 이
   거기서 무엇을 하는지 재지 않았습니다. 스텝은 맨 텐서로 썼습니다.
 - **성능.** 아무것도 재지 않았습니다. `fill_f32` 과 `mean` 은 출력 원소당 invocation 하나이므로
