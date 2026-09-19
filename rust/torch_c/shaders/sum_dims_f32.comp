@@ -1,0 +1,91 @@
+#version 450
+
+// `aten.sum.dim_IntList` and `aten.sum.default` -- a sum over an arbitrary set
+// of axes of a tensor of rank up to 8, one *output* element per invocation.
+//
+//     out[i] = sum_j src[base(i) + offset(j)]
+//
+// where `base(i)` is the source offset of output element `i` and `offset(j)`
+// ranges over the reduced axes' extents.
+//
+// **This device has no strides** (docs/devices/VULKAN4.md §6): a `VkTensor` is
+// shape plus a buffer, always contiguous row-major. So the host derives the
+// source stride of every axis from the input shape and hands them in here, and
+// the reduction never needs a permute or a materialised view first. The axes
+// arrive already split and reordered by `vulkan.rs`: entries `0 .. n_kept` are
+// the axes that survive, in output order, and `n_kept .. n_kept + n_red` are
+// the ones summed away. That split is the whole reason an arbitrary `dim` list
+// costs one dispatch rather than one per axis.
+//
+// **Compensated (Kahan-Babuska-Neumaier), not a plain running sum.** This was
+// measured, not chosen: a plain `acc += x` over a 512-long axis came out at
+// 1.139e-06 against the float64 truth where the derived tolerance was
+// 9.537e-07 -- worse than upstream's own float32 error on the same data,
+// because upstream's CPU reduction is a cascade over vector lanes and one
+// invocation here has no tree to be. Striping over eight lanes was tried
+// first and is not enough. The compensation term carries the rounding error
+// of each addition forward, which makes this *better* than upstream rather
+// than merely as good, and that is the only honest way to get inside a
+// tolerance derived from upstream's own error without widening it.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// 80 bytes -- inside the 128 every Vulkan device must accept.
+layout(push_constant, std430) uniform Push {
+    uint n;          // output elements
+    uint n_kept;     // axes that survive, first in the arrays below
+    uint n_red;      // axes summed away, immediately after them
+    uint unused;
+    uint shape[8];   // extent of each axis, kept axes then reduced axes
+    uint stride[8];  // source stride of each axis, same order
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    uint rem = i;
+    uint base = 0u;
+    for (int d = int(pc.n_kept) - 1; d >= 0; --d) {
+        uint e = pc.shape[d];
+        base += (rem % e) * pc.stride[d];
+        rem /= e;
+    }
+
+    uint total = 1u;
+    for (uint d = 0u; d < pc.n_red; ++d) {
+        total *= pc.shape[pc.n_kept + d];
+    }
+
+    float sum = 0.0;
+    float comp = 0.0;   // the rounding error the running sum has dropped
+
+    for (uint j = 0u; j < total; ++j) {
+        uint r = j;
+        uint off = base;
+        for (int d = int(pc.n_red) - 1; d >= 0; --d) {
+            uint e = pc.shape[pc.n_kept + uint(d)];
+            off += (r % e) * pc.stride[pc.n_kept + uint(d)];
+            r /= e;
+        }
+        float x = a[off];
+        float t = sum + x;
+        // Neumaier's branch: whichever of the two is larger in magnitude is
+        // the one whose low bits survived, so the compensation is read off
+        // the other. Kahan's unbranched form loses the case where a single
+        // term dwarfs the running sum, which is exactly what a row of
+        // attention probabilities looks like.
+        if (abs(sum) >= abs(x)) {
+            comp += (sum - t) + x;
+        } else {
+            comp += (x - t) + sum;
+        }
+        sum = t;
+    }
+
+    c[i] = sum + comp;
+}

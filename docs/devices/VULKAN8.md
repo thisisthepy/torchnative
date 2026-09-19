@@ -17,7 +17,7 @@
 | upstream 과 일치하는가 | **예.** 유도 허용치 9.537e-07 에 대해 최악 **9.702e-08** — upstream 자신의 오차의 **1.00 배** (§3) |
 | 그 허용치에 이빨이 있는가 | **예.** 틀린 값 두 개를 넣어 거절되는 것을 확인했다 (§3.1) |
 | 두 번째 패스가 꼭 필요했나 | **예. 근거는 §2** — 최댓값과 지수합은 softmax 셰이더 안에 이미 있지만 레지스터에서 죽는다 |
-| **backward 가 이제 되는가** | **아니오.** `aten.sum.dim_IntList` 에서 이름을 대며 멈춘다 (§4). `logsumexp` 는 막던 것이 아니었다 |
+| **backward 가 이제 되는가** | 이 회차에는 **아니오** — `aten.sum.dim_IntList` 에서 멈췄다 (§4). `logsumexp` 는 막던 것이 아니었다. **그 벽은 `docs/devices/VULKAN9.md` 가 치웠고, backward 는 이제 돈다** |
 | 호스트로 떨어지지 않았음은 무엇이 보증하나 | 디스패치 카운터. 호스트 쌍둥이로 바꾸면 **값은 전부 맞고 카운터만 빨개진다** (§6 N4) |
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
@@ -27,7 +27,7 @@
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_wrong_logsumexp_is_rejected_by_this_tolerance present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_logsumexp_ran_on_the_gpu_and_cost_exactly_one_more_shader present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_fully_masked_row_reports_upstreams_logsumexp_convention present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_still_does_not_work_and_names_what_is_missing present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_every_test_in_this_file_is_actually_collected present -->
 
 ---
@@ -173,8 +173,14 @@ dq = scale * dS k                         dk  = scale * dS^T q
 `transpose.int`, `reshape`, `expand`)는 **전부 있습니다.** 즉 남은 것은 **리덕션 하나 계열**입니다.
 
 `test_a_backward_through_the_vulkan_sdpa_still_does_not_work_and_names_what_is_missing` 이 이 상태를
-이름으로 고정하고, **목록이 바뀌는 날 빨개지도록** 쓰여 있습니다 — 누가 `sum.dim_IntList` 를
+이름으로 고정하고, **목록이 바뀌는 날 빨개지도록** 쓰여 있었습니다 — 누가 `sum.dim_IntList` 를
 가르치면 그 테스트가 실패하고, 없어진 벽을 계속 주장할 수 없습니다.
+
+**그리고 실제로 그렇게 됐습니다.** 다음 회차가 `sum.dim_IntList` 를 가르치자 그 테스트가
+"a backward through the vulkan sdpa succeeded" 로 빨개졌고, 그 자리에
+`test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream` 이 들어갔습니다.
+**위 표의 그 줄과 §7 의 첫 항목은 이 문서가 낸 회차의 상태이며 더 이상 현재 상태가 아닙니다** —
+현재 상태는 `docs/devices/VULKAN9.md` 입니다.
 
 ---
 
@@ -256,6 +262,7 @@ masking_utils.py:507  sdpa_mask:  batch_arange = torch.arange(batch_size, device
 ## 7. 하지 않은 것
 
 - **backward.** §4. `aten.sum.dim_IntList` 가 첫 벽이고, 목록은 §4 의 표입니다.
+  **(이 회차에서는. `docs/devices/VULKAN9.md` 가 그 리덕션을 구현했고 backward 는 이제 돕니다.)**
 - **`sdpa` 가 `_safe_softmax` 를 쓰도록 바꾸는 것.** §3.2. 모든 sdpa forward 의 산술이 바뀝니다.
 - **`sdpa` + `attention_mask` 로 BERT 를 실제로 돌리는 것.** §5. `masking_utils.sdpa_mask` 에서
   가로채거나 정수 산술을 가르쳐야 하고, 후자는 `check_dtype` 의 정책을 넓히는 일이라

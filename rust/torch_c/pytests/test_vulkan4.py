@@ -581,6 +581,13 @@ EXPECTED_DISPATCHES = {
     # The shim keeps `matmul` whole (docs/devices/VULKAN4.md §2.1); with equal
     # batch dimensions it is one batched-product pass.
     "aten.matmul.default": (1, 2),
+    # docs/devices/VULKAN9.md -- the reduction the sdpa backward stops on.
+    # One dispatch whatever the axes are: the kernel takes the source stride
+    # of every axis (this device has no strides, so they are derived from the
+    # shape) and walks the kept and reduced index spaces itself, rather than
+    # materialising a permuted copy and reducing the last axis.
+    "aten.sum.dim_IntList": (1, 1),
+    "aten.sum.default": (1, 1),
     "aten.detach.default": (0, 1),
     "aten.alias.default": (0, 1),
     "aten.contiguous.default": (0, 1),
@@ -665,6 +672,8 @@ def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
             args = (a, 0, 1)
         elif op == "aten.expand.default":
             args = (a, [4, 2, 3])
+        elif op == "aten.sum.dim_IntList":
+            args = (a, [1], False)
         elif op == "aten.gather.default":
             args = (a, 1, _to_vulkan(_i64([2, 0, 1, 1], [2, 2])))
         elif op in ("aten.view.default", "aten._unsafe_view.default",
@@ -3188,110 +3197,430 @@ def test_a_fully_masked_row_reports_upstreams_logsumexp_convention():
 
 
 # ---------------------------------------------------------------------------
-# Does a backward work now? No. docs/devices/VULKAN8.md §4
+# The reduction the sdpa backward stops on -- docs/devices/VULKAN9.md
+# ---------------------------------------------------------------------------
+
+_SUM_DIMS = "aten.sum.dim_IntList"
+_SUM_ALL = "aten.sum.default"
+
+# (shape, dim, keepdim). The first entry is the shape of the rule's own
+# `rowsum(dP * P)` (tape.rs `sdpa_backward`): last axis, keepdim=True. The
+# rest widen it away from that one special case -- a leading axis, two
+# non-adjacent axes at once, an empty list (which torch reads as "every
+# axis", not "no axis"), `dim=None`, and a 512-long axis where a reduction
+# that rounds after every term drifts away from upstream's.
+SUM_CASES = (
+    ((4, 5), [-1], True),
+    ((4, 5), [0], False),
+    ((2, 3, 4), [0, 2], False),
+    ((2, 3, 4), [1], True),
+    ((2, 3, 4, 5), [1, 3], True),
+    ((129,), [0], False),
+    ((2, 512), [-1], False),
+    ((3, 7), [], False),
+    ((6,), None, False),
+    ((1, 2, 3, 4), [-1], True),
+)
+
+
+def _sum_upstream(torch, a, dim, keepdim):
+    if dim is None:
+        return torch.ops.aten.sum.dim_IntList(a, None, keepdim)
+    return torch.ops.aten.sum.dim_IntList(a, dim, keepdim)
+
+
+def _sum_on_vulkan(shape, dim, keepdim, values):
+    return _C._aten_dispatch(_SUM_DIMS, _to_vulkan(_cpu(values, shape)), dim, keepdim)
+
+
+def test_sum_over_dims_agrees_with_upstream_at_a_derived_tolerance():
+    """`aten.sum.dim_IntList` element-wise against upstream's own kernel.
+
+    **This device has no strides** (docs/devices/VULKAN4.md §6), so there is no
+    permute-then-reduce-the-last-axis route available: a `VkTensor` is a shape
+    and a contiguous buffer. The kernel therefore takes the *source stride of
+    every axis*, derived on the host from the input shape, splits the axes into
+    kept and reduced, and walks both index spaces itself. That is why an
+    arbitrary `dim` list -- including the two non-adjacent axes in the sweep --
+    is one dispatch and not one per axis.
+
+    The tolerance is re-derived by `_assert_agreement` from this population's
+    own upstream float32-vs-float64 error. Nothing here widens it, and
+    `test_a_wrong_sum_reduction_is_rejected_by_this_tolerance` proves it has
+    teeth.
+    """
+    if _vulkan_or_skip("the sum.dim_IntList agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, (shape, dim, keepdim) in enumerate(SUM_CASES):
+        a = _rand(torch, *shape, seed=2700 + i)
+        out = _sum_on_vulkan(shape, dim, keepdim, _up_flat(a))
+        want32 = _sum_upstream(torch, a, dim, keepdim)
+        truth = _sum_upstream(torch, a.double(), dim, keepdim)
+        assert list(out.shape) == list(want32.shape), (
+            f"sum{list(shape)} dim={dim} keepdim={keepdim}: shape "
+            f"{list(out.shape)}, upstream {list(want32.shape)}")
+        assert str(out.device) == "vulkan", out.device
+        cases.append((f"sum{list(shape)} dim={dim} keepdim={keepdim}",
+                      _flat(_to_cpu(out)), _up_flat(want32), _up_flat(truth)))
+    _assert_agreement("sum.dim_IntList", cases)
+
+
+def test_sum_default_agrees_with_upstream_at_a_derived_tolerance():
+    """`aten.sum.default` -- the whole-tensor form, which a *loss* needs.
+
+    It is the same kernel with no kept axes, which is the point: `sum.default`
+    is not a second reduction, it is `sum.dim_IntList` over every axis with the
+    output collapsed to rank 0. Held to upstream separately anyway, because
+    "it is the same kernel" is an argument and this is a measurement.
+    """
+    if _vulkan_or_skip("the sum.default agreement sweep") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    cases = []
+    for i, shape in enumerate(((2, 3, 4), (1025,), (4, 5), (2, 512))):
+        a = _rand(torch, *shape, seed=2800 + i)
+        out = _C._aten_dispatch(_SUM_ALL, _to_vulkan(_cpu(_up_flat(a), shape)))
+        want32 = torch.ops.aten.sum.default(a)
+        truth = torch.ops.aten.sum.default(a.double())
+        assert list(out.shape) == list(want32.shape), (out.shape, want32.shape)
+        assert str(out.device) == "vulkan", out.device
+        cases.append((f"sum_all{list(shape)}", _flat(_to_cpu(out)),
+                      [want32.item()], [truth.item()]))
+    _assert_agreement("sum.default", cases)
+
+
+def test_a_wrong_sum_reduction_is_rejected_by_this_tolerance():
+    """The derived tolerance has teeth -- two wrong reductions, and the margin.
+
+    The wrong answers are the two this kernel could actually have been, and
+    both are *plausible*: reducing the wrong axis (the kept/reduced split
+    inverted) and dropping the last term of each row (a `<` that should have
+    been `<=`). Neither is a scaled or shifted version of the right answer, so
+    a tolerance that accepts either is not measuring anything.
+    """
+    if _vulkan_or_skip("the sum tolerance teeth check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    a = _rand(torch, 6, 7, seed=2901)
+    want32 = torch.ops.aten.sum.dim_IntList(a, [-1], False)
+    truth = torch.ops.aten.sum.dim_IntList(a.double(), [-1], False)
+
+    _assert_agreement("sum teeth (control: the correct value)",
+                      [("control", _up_flat(want32), _up_flat(want32), _up_flat(truth))])
+
+    # The wrong axis: same shape here only because 6 != 7 would change it, so
+    # a square-ish slice of the transpose is taken to keep the lengths equal
+    # and force the comparison to be about *values*.
+    wrong_axis = torch.ops.aten.sum.dim_IntList(a, [0], False)[:6]
+    dropped = a[:, :-1].sum(-1)
+
+    margins = []
+    for name, wrong in (("the wrong axis", wrong_axis),
+                        ("a dropped last term", dropped)):
+        got = _up_flat(wrong.float())
+        try:
+            _assert_agreement(f"sum teeth ({name})",
+                              [(name, got, _up_flat(want32), _up_flat(truth))])
+        except AssertionError:
+            margins.append((name, _elem_ratio(got, _up_flat(want32), _up_flat(truth))))
+        else:
+            raise AssertionError(
+                f"the derived tolerance accepted a sum computed with {name}; "
+                f"it is too wide to be evidence of anything")
+    for name, ratio in margins:
+        print(f"   sum teeth: {name} rejected at {ratio:,.0f}x upstream's own error")
+        assert ratio > 1e3, (name, ratio)
+
+
+def test_the_sum_reduction_ran_on_the_gpu_in_exactly_one_dispatch():
+    """docs/devices/VULKAN6.md's rule: values cannot police a host fallback.
+
+    A sum done on the host would produce bit-identical numbers on a tensor
+    whose `.device` says `vulkan` -- that exact substitution was made for
+    `embedding` and only the counters caught it. So every case in the sweep is
+    required to cost **one** dispatch and **zero** host downloads. One, not
+    "at least one": a reduction that walked the axes with a dispatch each
+    would still be on the GPU and would still be the wrong kernel.
+    """
+    if _vulkan_or_skip("the sum dispatch-counter check") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    for i, (shape, dim, keepdim) in enumerate(SUM_CASES):
+        a = _rand(torch, *shape, seed=3000 + i)
+        on_device = _to_vulkan(_cpu(_up_flat(a), shape))
+        before = _counters()
+        out = _C._aten_dispatch(_SUM_DIMS, on_device, dim, keepdim)
+        d = _delta(before, _counters())
+        assert d["shader_dispatches"] == 1, (
+            f"sum{list(shape)} dim={dim} ran {d['shader_dispatches']} compute "
+            f"shaders, expected exactly 1: {d}")
+        assert d["host_downloads"] == 0, (
+            f"sum{list(shape)} dim={dim} read {d['host_downloads']} buffer(s) "
+            f"back; the reduction happens on the device or not at all: {d}")
+        assert d["host_uploads"] == 0, d
+        assert str(out.device) == "vulkan", out.device
+
+    on_device = _to_vulkan(_cpu(_up_flat(_rand(torch, 3, 4, seed=3100)), (3, 4)))
+    before = _counters()
+    _C._aten_dispatch(_SUM_ALL, on_device)
+    d = _delta(before, _counters())
+    assert d["shader_dispatches"] == 1, d
+    assert d["host_downloads"] == 0, d
+
+
+def test_sum_refuses_what_this_device_does_not_do_rather_than_reaching_for_the_cpu():
+    """The narrowings refuse **naming themselves**, they do not fall back.
+
+    Two of them, and both are this backend's standing policy rather than this
+    round's choice: `dtype=` to anything but float32 is the `check_dtype`
+    policy of docs/devices/VULKAN6.md §1 (there is no integer arithmetic here,
+    and widening it to make a sum pass is the move that policy exists to
+    forbid), and rank above 8 is the push-constant bound every indexed kernel
+    on this device already has.
+    """
+    if _vulkan_or_skip("the sum refusals") is None:
+        return
+    x = _to_vulkan(_cpu([1.0, 2.0, 3.0, 4.0], (2, 2)))
+    try:
+        _C._aten_dispatch(_SUM_DIMS, x, [0], False, dtype=_C.int64)
+    except NotImplementedError as e:
+        assert "int64" in str(e), str(e)
+        assert "float32" in str(e), str(e)
+    else:
+        raise AssertionError("sum(dtype=int64) did not refuse on the vulkan device")
+
+    deep = _to_vulkan(_cpu([1.0] * 512, (2,) * 9))
+    try:
+        _C._aten_dispatch(_SUM_DIMS, deep, [0], False)
+    except NotImplementedError as e:
+        assert "9" in str(e) and "8" in str(e), str(e)
+    else:
+        raise AssertionError("a rank-9 sum did not refuse on the vulkan device")
+
+    # And an out-of-range axis is an IndexError with torch's wording, not a
+    # silent clamp to a plausible neighbouring axis.
+    try:
+        _C._aten_dispatch(_SUM_DIMS, x, [5], False)
+    except IndexError as e:
+        assert "Dimension out of range" in str(e), str(e)
+    else:
+        raise AssertionError("sum over axis 5 of a 2-D tensor did not refuse")
+
+
+# ---------------------------------------------------------------------------
+# Does a backward work now? **Yes.** docs/devices/VULKAN9.md §4
 # ---------------------------------------------------------------------------
 
 _SDPA_BACKWARD_PROBE = r"""
 import json, sys
 import torch
 
+req = json.load(sys.stdin)
 out = {"probe": torch._C._vulkan_probe()}
 if not out["probe"]["available"]:
     json.dump(out, sys.stdout); raise SystemExit
+shape = req["shape"]
 
-B, H, T, E = 1, 2, 3, 4
-q = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
-k = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
-v = torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
+
+def dev(flat):
+    return torch.tensor(flat, dtype=torch.float32).reshape(shape).to("vulkan")
+
+
+q = dev(req["q"]).requires_grad_(True)
+k = dev(req["k"]).requires_grad_(True)
+v = dev(req["v"]).requires_grad_(True)
+g = dev(req["g"])
 o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 out["forward_device"] = str(o.device)
+# The counters bracket the backward ONLY. The readback below is this probe's
+# own way of getting the numbers out to the process that owns the oracle, and
+# folding it into the measurement would make `host_downloads` unreadable as
+# evidence about the gradient rule.
 before = torch._C._vulkan_counters()
 try:
-    torch.autograd.grad(o, [q, k, v],
-                        grad_outputs=torch.ones(B, H, T, E).to("vulkan"))
+    grads = torch.autograd.grad(o, [q, k, v], grad_outputs=g)
     out["backward"] = "ok"
 except Exception as e:
     out["backward"] = f"{type(e).__name__}: {e}"
+    grads = None
 after = torch._C._vulkan_counters()
 out["counters"] = {key: after[key] - before[key] for key in after}
+if grads is not None:
+    out["grad_devices"] = [str(t.device) for t in grads]
+    out["grads"] = [t.cpu().reshape(-1).tolist() for t in grads]
 out["rules"] = sorted(torch._C._tape_rules())
 json.dump(out, sys.stdout)
 """
 
-# Named in `sdpa_backward` (tape.rs) or on the way to reaching it, and absent
-# from `vulkan_ops()`. Checked against the device's own list below rather than
-# trusted, so this comment cannot drift away from the build.
+
+# What the sdpa gradient rule still cannot reach on this device, probed rather
+# than read off `tape.rs`. All four are behind `is_causal=True`, and the
+# **vulkan forward refuses `is_causal` outright**, so a kernel for any of them
+# would be unexercisable -- which is why this round did not write one.
 _BACKWARD_STILL_MISSING = (
-    # the gradient rule's own `rowsum(dP * P)` -- the first thing that stops
-    "aten.sum.dim_IntList",
-    # `is_causal=True`'s branch of the rule (the vulkan forward refuses
-    # is_causal outright, so this is only reachable if that is lifted)
     "aten.ones.default",
     "aten.tril.default",
     "aten.eq.Scalar",
     "aten.masked_fill.Scalar",
-    # and what a *loss* needs, before any of the above is reached
-    "aten.sum.default",
-    "aten.ones_like.default",
-    "aten.zeros_like.default",
 )
 
+# And the wall a *loss*-shaped backward hits, one step before the rule: with
+# `grad_outputs` supplied explicitly the rule runs, but `o.sum().backward()`
+# has to seed the gradient first. `aten.sum.default` is no longer that wall
+# (this round taught it); `aten.ones_like.default` is. Probed below, not
+# inferred.
+_LOSS_BACKWARD_WALL = "aten.ones_like.default"
 
-def test_a_backward_through_the_vulkan_sdpa_still_does_not_work_and_names_what_is_missing():
-    """**The logsumexp was not what was blocking it, and this says so.**
 
-    The round that left the slot at `None` recorded it as "a backward through
-    it would fail", and it is easy to read that as "filling the slot makes
-    backward work". It does not, and the reason is in `sdpa_backward`
-    (tape.rs): that rule **does not consume a logsumexp at all**. It recomputes
-    the probabilities from the saved q, k and v and differentiates the textbook
-    formulation -- a correctness-for-memory trade the rule's own comment
-    explains. The only thing it does with the logsumexp slot is *refuse* a
-    gradient that arrives at it.
-
-    So the logsumexp is now correct and backward is still refused, at
-    `aten.sum.dim_IntList` -- the `rowsum(dP * P)` in the middle of the rule.
-    This test pins that, by name, with the counters showing the refusal cost no
-    GPU work. It is written to **fail the day the list changes**: when someone
-    teaches `sum.dim_IntList` the refusal moves and this test must be rewritten
-    rather than quietly continuing to claim a wall that is gone.
-
-    Measured, not asserted from the source: the probe below runs the vendored
-    shim in a separate interpreter and reports whatever it gets.
-    """
-    if _vulkan_or_skip("the sdpa backward probe") is None:
-        return
+def _backward_probe(shape, payload):
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     proc = subprocess.run([sys.executable, "-c", _SDPA_BACKWARD_PROBE],
-                          capture_output=True, text=True, env=env, timeout=600)
+                          input=json.dumps(payload), capture_output=True,
+                          text=True, env=env, timeout=600)
     assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
-    got = json.loads(proc.stdout)
+    return json.loads(proc.stdout)
+
+
+_BW_SHAPE = (1, 2, 3, 4)
+
+
+def _backward_payload(torch):
+    n = 1
+    for d in _BW_SHAPE:
+        n *= d
+    tensors = {}
+    for i, name in enumerate("qkvg"):
+        tensors[name] = _up_flat(_rand(torch, *_BW_SHAPE, seed=3300 + i))
+    return {"shape": list(_BW_SHAPE), **tensors}
+
+
+def test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream():
+    """**It runs.** docs/devices/VULKAN8.md §4 said it did not, and named why.
+
+    That document's wall was `aten.sum.dim_IntList` -- the `rowsum(dP * P)` in
+    the middle of `sdpa_backward` (tape.rs). This round taught the device that
+    reduction and the wall is gone, so the claim this test makes is the
+    opposite of the one it replaces, and it is held to a higher bar than
+    "no exception": the three gradients are compared **element-wise against
+    upstream's own autograd**, at the tolerance `_assert_agreement` re-derives
+    from upstream's own float32-vs-float64 error on this same input.
+
+    The measurement is in a separate interpreter running the vendored shim
+    (the oracle lives in *this* one and the two cannot both be `torch`), and
+    the inputs cross as flat lists so both sides differentiate the same
+    numbers rather than two draws that happen to share a seed.
+    """
+    if _vulkan_or_skip("the sdpa backward agreement") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    import torch.nn.functional as F
+    payload = _backward_payload(torch)
+    got = _backward_probe(_BW_SHAPE, payload)
     if not got["probe"]["available"]:
         vulkan_coverage.vulkan_skip(
-            f"the sdpa backward probe: the vendored-tree subprocess has no "
+            f"the sdpa backward agreement: the vendored-tree subprocess has no "
             f"loader -- {got['probe']['error']}")
         return
 
     assert got["forward_device"] == "vulkan", got["forward_device"]
-    # The rule exists -- so this is not "no rule", it is "the rule's ops".
     assert "aten._scaled_dot_product_flash_attention_for_cpu.default" in got["rules"]
+    assert got["backward"] == "ok", (
+        f"the backward through the vulkan sdpa did not run: {got['backward']}")
+    assert got["grad_devices"] == ["vulkan"] * 3, got["grad_devices"]
 
-    assert got["backward"] != "ok", (
-        "a backward through the vulkan sdpa succeeded. That is the thing this "
-        "test says does not happen -- rewrite it, and check the gradients "
-        "against upstream before claiming it")
-    assert got["backward"].startswith("NotImplementedError"), got["backward"]
-    assert "aten.sum.dim_IntList" in got["backward"], (
-        f"the backward stopped somewhere other than the op this test names: "
-        f"{got['backward']}")
-    assert got["counters"]["host_downloads"] == 0, (
-        f"the refused backward read {got['counters']['host_downloads']} "
-        f"buffer(s) back; a refusal computes nothing: {got['counters']}")
+    def upstream(dtype):
+        q, k, v = (torch.tensor(payload[n], dtype=dtype).reshape(_BW_SHAPE)
+                   .requires_grad_(True) for n in "qkv")
+        g = torch.tensor(payload["g"], dtype=dtype).reshape(_BW_SHAPE)
+        o = F.scaled_dot_product_attention(q, k, v)
+        return [_up_flat(t) for t in torch.autograd.grad(o, [q, k, v], grad_outputs=g)]
 
-    # And the rest of the list, from the device's own refusal message rather
-    # than from this file.
+    want32, truth = upstream(torch.float32), upstream(torch.float64)
+    _assert_agreement("sdpa backward (dq, dk, dv)", [
+        (f"grad_{name}", got["grads"][i], want32[i], truth[i])
+        for i, name in enumerate("qkv")])
+
+
+def test_the_vulkan_sdpa_backward_never_left_the_gpu():
+    """The counters, which are the only thing that can say this.
+
+    docs/devices/VULKAN6.md's rule, and it bites hardest here: a backward that
+    quietly downloaded the saved q/k/v, differentiated on the host and uploaded
+    three answers would produce gradients that pass the agreement test above
+    **exactly**, on tensors whose `.device` says `vulkan`. Values cannot tell
+    the two apart. `host_downloads` can, and it is zero -- so every one of the
+    rule's matmuls, transposes, softmaxes and the new `sum.dim_IntList`
+    executed as a compute shader.
+
+    The dispatch count is asserted as a lower bound with a named floor rather
+    than an exact number: the rule's op sequence is `tape.rs`'s to choose and
+    pinning it here would make this test fail on a refactor that changed
+    nothing observable. What must not move is the **zero**.
+    """
+    if _vulkan_or_skip("the sdpa backward counters") is None:
+        return
+    torch = _upstream()
+    if torch is None:
+        return
+    got = _backward_probe(_BW_SHAPE, _backward_payload(torch))
+    if not got["probe"]["available"]:
+        vulkan_coverage.vulkan_skip(
+            f"the sdpa backward counters: the vendored-tree subprocess has no "
+            f"loader -- {got['probe']['error']}")
+        return
+    assert got["backward"] == "ok", got["backward"]
+    d = got["counters"]
+    assert d["host_downloads"] == 0, (
+        f"the backward read {d['host_downloads']} buffer(s) back to the host; "
+        f"a rule that computed on the CPU would have to, and its gradients "
+        f"would still agree with upstream: {d}")
+    assert d["host_uploads"] == 0, (
+        f"the backward uploaded {d['host_uploads']} buffer(s); every operand "
+        f"it needs was already on the device: {d}")
+    # The formula is dv = P^T dout, dP = dout v^T, dS = P * (dP - rowsum(dP*P)),
+    # dq = scale * dS k, dk = scale * dS^T q, plus the forward recomputation of
+    # P. That cannot be fewer than ten kernel launches on a device with no
+    # fusion; the floor is deliberately well under what it measures so that
+    # only a *collapse* -- the shape a host fallback has -- trips it.
+    assert d["shader_dispatches"] >= 10, (
+        f"the backward ran only {d['shader_dispatches']} compute shaders; the "
+        f"gradient rule cannot be that few kernels on this device: {d}")
+    print(f"   sdpa backward on vulkan: {d['shader_dispatches']} compute shaders, "
+          f"{d['host_uploads']} uploads, {d['host_downloads']} downloads")
+
+
+def test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason():
+    """The honest remainder -- and why no kernel was written for it.
+
+    Four ops in `sdpa_backward` belong to the `is_causal=True` branch. This
+    device's **forward** refuses `is_causal` by name, so that branch cannot be
+    entered at all, and a `tril` kernel written now could not be exercised by
+    any test -- it would be unproven code with a green tick beside it. So this
+    test pins both halves: the ops are still absent, **and** the reason they
+    are unreachable is still true.
+
+    It also pins the one wall a loss-shaped backward still hits.
+    `o.sum().backward()` needs a gradient seed before the rule is reached;
+    docs/devices/VULKAN8.md §4 listed `aten.sum.default` and
+    `aten.ones_like.default` together for that, and only the first of them is
+    taught now. The wall is named from a live probe below, not from this list.
+    """
+    if _vulkan_or_skip("the remaining sdpa-backward walls") is None:
+        return
     try:
         _C._aten_dispatch("aten.this_op_does_not_exist.default",
                           _to_vulkan(_cpu([0.0], [1])))
@@ -3300,13 +3629,82 @@ def test_a_backward_through_the_vulkan_sdpa_still_does_not_work_and_names_what_i
                      str(e).split("by name -- ")[1].split(" -- and")[0].split(","))
     else:
         raise AssertionError("an unknown op did not refuse")
-    still_missing = [op for op in _BACKWARD_STILL_MISSING if op not in taught]
-    assert still_missing == list(_BACKWARD_STILL_MISSING), (
-        f"some of the ops this test names as missing are now taught "
-        f"({sorted(set(_BACKWARD_STILL_MISSING) - set(still_missing))}); the "
-        f"list is stale and the backward story has moved")
-    print(f"   backward through vulkan sdpa: refused -- {got['backward'].splitlines()[0][:120]}")
-    print(f"   still missing for it: {', '.join(_BACKWARD_STILL_MISSING)}")
+
+    assert "aten.sum.dim_IntList" in taught, (
+        "this file claims the sdpa backward runs because sum.dim_IntList was "
+        "taught; it is not in the device's own list")
+    still = [op for op in _BACKWARD_STILL_MISSING if op not in taught]
+    assert still == list(_BACKWARD_STILL_MISSING), (
+        f"some of the ops this test names as unreachable are now taught "
+        f"({sorted(set(_BACKWARD_STILL_MISSING) - set(still))}); if the "
+        f"is_causal forward was lifted too, this test must be rewritten")
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = f"{os.environ.get('PYTHONPATH', '')}:{VENDOR_DIR}"
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", _REMAINING_WALLS_PROBE],
+                          capture_output=True, text=True, env=env, timeout=600)
+    assert proc.returncode == 0, (proc.stdout[-2000:], proc.stderr[-4000:])
+    walls = json.loads(proc.stdout)
+    if not walls.get("available", True):
+        vulkan_coverage.vulkan_skip(
+            "the remaining sdpa-backward walls: the vendored-tree subprocess "
+            "has no loader")
+        return
+
+    assert walls["is_causal_forward"].startswith("NotImplementedError"), (
+        f"the vulkan sdpa forward no longer refuses is_causal; the four ops "
+        f"above are now reachable and must be implemented or re-justified: "
+        f"{walls['is_causal_forward']}")
+    assert "is_causal=False" in walls["is_causal_forward"], walls["is_causal_forward"]
+
+    assert walls["loss_backward"].startswith("NotImplementedError"), (
+        f"`o.sum().backward()` now works on this device: {walls['loss_backward']}")
+    # The refusal message *lists every taught op*, so a substring search would
+    # match `aten.sum.default` in the list and call it the wall. The op that
+    # actually stopped is the one the message opens with, before
+    # `: not implemented`, and that is what is read here.
+    named = walls["loss_backward"].split(": ", 1)[1].split(":", 1)[0].strip()
+    assert named == _LOSS_BACKWARD_WALL, (
+        f"the loss-shaped backward stopped at {named!r}, not at the op this "
+        f"test names ({_LOSS_BACKWARD_WALL!r}): {walls['loss_backward'][:200]}")
+    print(f"   next wall for `o.sum().backward()`: {named}")
+
+
+_REMAINING_WALLS_PROBE = r"""
+import json, sys
+import torch
+
+probe = torch._C._vulkan_probe()
+out = {"available": probe["available"]}
+if not probe["available"]:
+    json.dump(out, sys.stdout); raise SystemExit
+
+B, H, T, E = 1, 2, 3, 4
+
+
+def trio():
+    return [torch.randn(B, H, T, E).to("vulkan").requires_grad_(True)
+            for _ in range(3)]
+
+
+q, k, v = trio()
+try:
+    o = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+    o.sum().backward()
+    out["loss_backward"] = "ok"
+except Exception as e:
+    out["loss_backward"] = f"{type(e).__name__}: {e}"
+
+q, k, v = trio()
+try:
+    torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    out["is_causal_forward"] = "ok"
+except Exception as e:
+    out["is_causal_forward"] = f"{type(e).__name__}: {e}"
+
+json.dump(out, sys.stdout)
+"""
 
 
 # ---------------------------------------------------------------------------
