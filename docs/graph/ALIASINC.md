@@ -189,6 +189,18 @@ named next blocker, not an unblocked feature. The next round that wants
 `resolve_key` to actually work on this shim should start at
 `_dispatch_get_backend_keyset_from_autograd`.
 
+> **Done, and it moved no downstream number either: `docs/graph/BKEYSET.md`.**
+> The 3547 do not resolve when that name answers; they split, 2719 onto
+> `_dispatch_is_alias_key` and 828 onto `_dispatch_has_backend_fallback`. What
+> that round added instead is the map this section could not draw: **the
+> remaining chain is exactly three names and it terminates.** With all of them
+> answered from a live upstream, 3301 of the 4893 resolve and the other 1592
+> raise upstream's own `could not find kernel` — none dies on an unimplemented
+> name. `_dispatch_is_alias_key` is the first one that moves the resolved count
+> (1346 → 1440) and is six names wide; `_dispatch_has_backend_fallback` is
+> where the mass is (1440 → 3301) and is the one that must **not** be copied
+> from upstream, because its `True` set is upstream's registered fallbacks.
+
 ---
 
 ## 5. What a wrong default breaks — the guess was wrong, and the build said so

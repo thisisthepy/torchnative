@@ -1841,6 +1841,125 @@ _ALIAS_EXPANSION = {
 }
 
 
+#: `_dispatch_get_backend_keyset_from_autograd(k)` -- `c10::getBackendKeySetFromAutograd`,
+#: the backend keys an autograd key was entered from. Measured against a live
+#: upstream over all 145 `DispatchKey`s by *enum membership*, never inferred
+#: from the names and never read out of a keyset's `repr`:
+#: `rust/torch_c/pytests/test_bkeyset.py`.
+#:
+#: **Only 16 of upstream's 145 keys answer a non-empty set**, and two of those
+#: 16 are keys the vendored enum does not have (`AutogradMAIA` and
+#: `EndOfAutogradFunctionalityBackends`, the latter being `AutogradMeta`'s
+#: value under a second name). So this is 14 entries, and everything else --
+#: every backend key, every autocast key, and `Autograd` itself -- answers the
+#: empty set.
+#:
+#: **The obvious rule is wrong for four keys.** "Strip `Autograd`, return that
+#: backend" would invent memberships for `AutogradHIP`, `AutogradVE`,
+#: `AutogradMTIA` and `AutogradFunctionality`, all of which exist upstream and
+#: all of which answer **empty** -- upstream's `getBackendKeySetFromAutograd`
+#: is a `switch` with explicit cases and those are not among them. That is why
+#: this is a measured table and not a derivation;
+#: `test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong` is what
+#: keeps the exception from being quietly "fixed" into the derivation.
+#:
+#: **This is a list, and lists rot.** The same three-way guard
+#: `_ALIAS_EXPANSION` has applies here and for the same reason: the tests
+#: re-derive every number from a live upstream on each run and assert the
+#: agreement element-wise, the *shape* (exactly these 16 keys answer non-empty,
+#: so a new autograd backend reddens rather than being answered empty), and the
+#: 123/17/22 name partition this agreement is valid over (so a vendor bump
+#: cannot shrink what the comparison covers and still look green).
+#:
+#: Members upstream reports that this enum cannot spell are dropped, and named
+#: in the comment above each entry. They are the `StartOf*`/`EndOf*` sentinels
+#: -- which are other keys' values under a second name, not extra keys -- plus
+#: the `MAIA` backends. That direction is safe: a name this enum cannot spell
+#: cannot be passed in or asked about. The reverse, the 17 names the stub has
+#: and upstream's runtime enum does not, answer the **empty** set, which is the
+#: direction that never claims a backend.
+#:
+#: What answering this bought, measured rather than assumed: **nothing yet.**
+#: Of 4893 `resolve_key` results over the aten surface, the 3547 that died on
+#: this name now split onto `_dispatch_is_alias_key` (2719) and
+#: `_dispatch_has_backend_fallback` (828), and **zero newly resolve**. The
+#: chain does terminate, though, and it is exactly those two names plus the
+#: `_dispatch_autogradother_backends` value: `docs/graph/BKEYSET.md` 3.
+_AUTOGRAD_BACKEND_KEYSET = {
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradCPU": (
+        "CPU", "Dense",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradCUDA": (
+        "CUDA", "Dense",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradHPU": (
+        "Dense", "HPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradIPU": (
+        "Dense", "IPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradLazy": (
+        "Dense", "Lazy",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradMPS": (
+        "Dense", "MPS",
+    ),
+    # upstream: 4 keys; 2 not in the vendored enum (EndOfDenseBackends, StartOfDenseBackends)
+    "AutogradMeta": (
+        "Dense", "Meta",
+    ),
+    # upstream: 19 keys; 3 not in the vendored enum (EndOfNestedTensorBackends, NestedTensorMAIA, StartOfNestedTensorBackends)
+    "AutogradNestedTensor": (
+        "NestedTensor", "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP",
+        "NestedTensorHPU", "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS",
+        "NestedTensorMTIA", "NestedTensorMeta", "NestedTensorPrivateUse1",
+        "NestedTensorPrivateUse2", "NestedTensorPrivateUse3", "NestedTensorVE",
+        "NestedTensorXLA", "NestedTensorXPU",
+    ),
+    # upstream: 57 keys; 10 not in the vendored enum (EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "AutogradOther": (
+        "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP", "QuantizedHPU",
+        "QuantizedIPU", "QuantizedLazy", "QuantizedMPS", "QuantizedMTIA",
+        "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU",
+        "Sparse", "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU",
+        "SparseCsrCUDA", "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU",
+        "SparseCsrLazy", "SparseCsrMPS", "SparseCsrMTIA", "SparseCsrMeta",
+        "SparseCsrPrivateUse1", "SparseCsrPrivateUse2", "SparseCsrPrivateUse3",
+        "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP", "SparseHPU",
+        "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse1": (
+        "Dense", "PrivateUse1",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse2": (
+        "Dense", "PrivateUse2",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse3": (
+        "Dense", "PrivateUse3",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradXLA": (
+        "Dense", "XLA",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradXPU": (
+        "Dense", "XPU",
+    ),
+}
+
+
 _FILE_DECLARED_DISPATCH_KEYS = (
     "CompositeImplicitAutograd",
     "CompositeImplicitAutogradNestedTensor",
@@ -8836,6 +8955,45 @@ def _install_dispatch_keys(module) -> None:
         return k_name == alias_name or k_name in _ALIAS_EXPANSION.get(alias_name, ())
 
     module._dispatch_is_included_in_alias = _dispatch_is_included_in_alias
+
+    def _dispatch_get_backend_keyset_from_autograd(k):
+        """`torch._C._dispatch_get_backend_keyset_from_autograd` -- `c10::getBackendKeySetFromAutograd`.
+
+        The only caller in the vendored tree is `resolve_key`
+        (`torch/_ops.py:240`), which feeds the result straight into
+        `op.has_kernel_for_any_dispatch_key(...)` to decide whether a backend
+        kernel exists before it will hand back a composite one. Before this
+        existed the name was a synthesised `_Unimplemented` and `resolve_key`
+        raised `NotImplementedError` for **3547 of 4893** results over the aten
+        surface -- the exact population `docs/graph/ALIASINC.md` 4 handed on.
+
+        Upstream has no edge cases here: every key answers, `Undefined`
+        included, and 129 of the 145 answer the empty set. `Autograd` itself is
+        one of the 129.
+
+        **Implementing this unblocks nothing, and that is measured.** The 3547
+        do not resolve; they split onto `_dispatch_is_alias_key` (2719) and
+        `_dispatch_has_backend_fallback` (828). `docs/graph/BKEYSET.md` 3 has
+        the staged map, including the part worth more than this function: with
+        those two answered plus the `_dispatch_autogradother_backends` value,
+        **no result dies on an unimplemented name at all** -- 3301 resolve and
+        1592 raise upstream's own `could not find kernel`. The chain
+        terminates, and it is three more names.
+
+        So this table is justified by element-wise agreement with upstream over
+        all 123 askable keys, **not** by anything observable here today. That
+        is the same footing `_dispatch_is_included_in_alias` stands on, and for
+        the same reason: at `resolve_key` the observable behaviour cannot yet
+        tell a correct table from a constant.
+        """
+        names = _AUTOGRAD_BACKEND_KEYSET.get(getattr(k, "name", k), ())
+        return DispatchKeySet._of(
+            getattr(DispatchKey, n) for n in names if hasattr(DispatchKey, n)
+        )
+
+    module._dispatch_get_backend_keyset_from_autograd = (
+        _dispatch_get_backend_keyset_from_autograd
+    )
 
     # A `DispatchKeySet` *value*, not a function.
     # `torch/_subclasses/functional_tensor.py:146` does
