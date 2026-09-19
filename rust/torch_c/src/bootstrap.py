@@ -1720,6 +1720,127 @@ _DISPATCH_REGISTRATIONS: dict = {}
 #: -- the file lists what upstream's C++ build registers, and answering with
 #: that here would claim 1500 kernels this shim does not have. Those are
 #: refused by name; see `_dispatch_registrations`.
+#: `_dispatch_is_included_in_alias(k, alias)` -- which concrete keys each alias
+#: key expands to. Measured against a live upstream over the full 145x145
+#: `DispatchKey` cross product, not inferred from the names:
+#: `rust/torch_c/pytests/test_aliasinc.py`.
+#:
+#: **Only six of upstream's 145 keys expand beyond themselves**; every other
+#: key includes itself and nothing else, which is why this is six entries and
+#: not a 145-row table. `ADInplaceOrView` reads like an alias and is not one.
+#:
+#: Upstream's whole rule is then
+#:
+#:     k != Undefined and (k == alias or k in _ALIAS_EXPANSION.get(alias, ()))
+#:
+#: which reproduces 20869 of the 20881 pairs upstream answers. The 12 misses
+#: are six symmetric pairs of *enum-value aliases* -- `EndOfDenseBackends` is
+#: the same number as `Meta` -- and none of those six names exists in the
+#: vendored `DispatchKey`, so the rule is exact on everything askable here.
+#:
+#: **This is a list, and lists rot.** What keeps it from rotting silently is
+#: that the tests re-derive all of it from a live upstream every run and assert
+#: three separate things: the full cross product agrees, *exactly* these six
+#: aliases expand (so a new upstream alias reddens rather than being answered
+#: `False`), and the 123/17/22 name partition between this enum and upstream's
+#: is unchanged (so a vendor bump cannot shrink what the first test compares
+#: and still look green).
+#:
+#: Names upstream has and the vendored stub does not are dropped, and are
+#: recorded in the comment above each entry. That direction is safe: a key this
+#: enum cannot spell cannot be passed in. The reverse -- the 17 the stub has
+#: and upstream's runtime enum does not (`Vulkan`, `MKLDNN`, `Named`,
+#: `Tracer`, ...) -- answer `False` for every alias, because upstream cannot be
+#: asked about them and guessing would be claiming a kernel.
+_ALIAS_EXPANSION = {
+    # upstream: 27 keys; 3 not in the vendored enum (AutogradMAIA, EndOfAutogradFunctionalityBackends, StartOfAutogradFunctionalityBackends)
+    "Autograd": (
+        "Autograd", "AutogradCPU", "AutogradCUDA", "AutogradFunctionality", "AutogradHIP",
+        "AutogradHPU", "AutogradIPU", "AutogradLazy", "AutogradMPS", "AutogradMTIA",
+        "AutogradMeta", "AutogradNestedTensor", "AutogradOther", "AutogradPrivateUse1",
+        "AutogradPrivateUse2", "AutogradPrivateUse3", "AutogradVE", "AutogradXLA",
+        "AutogradXPU", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "FuncTorchBatchedDecomposition",
+    ),
+    # upstream: 82 keys; 12 not in the vendored enum (EndOfDenseBackends, EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfDenseBackends, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "CompositeExplicitAutograd": (
+        "Autograd", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "Lazy", "MAIA", "MPS", "MTIA", "Meta", "PrivateUse1",
+        "PrivateUse2", "PrivateUse3", "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP",
+        "QuantizedHPU", "QuantizedIPU", "QuantizedLazy", "QuantizedMPS", "QuantizedMTIA",
+        "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU", "Sparse",
+        "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrLazy", "SparseCsrMPS",
+        "SparseCsrMTIA", "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP",
+        "SparseHPU", "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU", "VE", "XLA", "XPU",
+    ),
+    # upstream: 57 keys; 9 not in the vendored enum (EndOfDenseBackends, EndOfQuantizedBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, StartOfDenseBackends, StartOfQuantizedBackends, StartOfSparseCsrBackends)
+    "CompositeExplicitAutogradNonFunctional": (
+        "Autograd", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "MAIA", "MPS", "MTIA", "Meta", "PrivateUse1", "PrivateUse2",
+        "PrivateUse3", "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP", "QuantizedHPU",
+        "QuantizedIPU", "QuantizedMPS", "QuantizedMTIA", "QuantizedMeta",
+        "QuantizedPrivateUse1", "QuantizedPrivateUse2", "QuantizedPrivateUse3",
+        "QuantizedVE", "QuantizedXPU", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrMPS", "SparseCsrMTIA",
+        "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXPU", "VE", "XPU",
+    ),
+    # upstream: 122 keys; 18 not in the vendored enum (AutogradMAIA, EndOfAutogradFunctionalityBackends, EndOfDenseBackends, EndOfNestedTensorBackends, EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, NestedTensorMAIA, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfAutogradFunctionalityBackends, StartOfDenseBackends, StartOfNestedTensorBackends, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "CompositeImplicitAutograd": (
+        "Autograd", "AutogradCPU", "AutogradCUDA", "AutogradFunctionality", "AutogradHIP",
+        "AutogradHPU", "AutogradIPU", "AutogradLazy", "AutogradMPS", "AutogradMTIA",
+        "AutogradMeta", "AutogradNestedTensor", "AutogradOther", "AutogradPrivateUse1",
+        "AutogradPrivateUse2", "AutogradPrivateUse3", "AutogradVE", "AutogradXLA",
+        "AutogradXPU", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "Lazy", "MAIA", "MPS", "MTIA", "Meta", "NestedTensor",
+        "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP", "NestedTensorHPU",
+        "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS", "NestedTensorMTIA",
+        "NestedTensorMeta", "NestedTensorPrivateUse1", "NestedTensorPrivateUse2",
+        "NestedTensorPrivateUse3", "NestedTensorVE", "NestedTensorXLA", "NestedTensorXPU",
+        "PrivateUse1", "PrivateUse2", "PrivateUse3", "QuantizedCPU", "QuantizedCUDA",
+        "QuantizedHIP", "QuantizedHPU", "QuantizedIPU", "QuantizedLazy", "QuantizedMPS",
+        "QuantizedMTIA", "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU", "Sparse",
+        "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrLazy", "SparseCsrMPS",
+        "SparseCsrMTIA", "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP",
+        "SparseHPU", "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU", "VE", "XLA", "XPU",
+    ),
+    # upstream: 26 keys; 3 not in the vendored enum (EndOfNestedTensorBackends, NestedTensorMAIA, StartOfNestedTensorBackends)
+    "CompositeImplicitAutogradNestedTensor": (
+        "Autograd", "AutogradNestedTensor", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "FuncTorchBatchedDecomposition",
+        "NestedTensor", "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP",
+        "NestedTensorHPU", "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS",
+        "NestedTensorMTIA", "NestedTensorMeta", "NestedTensorPrivateUse1",
+        "NestedTensorPrivateUse2", "NestedTensorPrivateUse3", "NestedTensorVE",
+        "NestedTensorXLA", "NestedTensorXPU",
+    ),
+    # upstream: 7 keys; 0 not in the vendored enum (none)
+    "FuncTorchBatchedDecomposition": (
+        "Autograd", "CompositeExplicitAutograd", "CompositeExplicitAutogradNonFunctional",
+        "CompositeImplicitAutograd", "CompositeImplicitAutogradNestedTensor",
+        "FuncTorchBatched", "FuncTorchBatchedDecomposition",
+    ),
+}
+
+
 _FILE_DECLARED_DISPATCH_KEYS = (
     "CompositeImplicitAutograd",
     "CompositeImplicitAutogradNestedTensor",
@@ -8655,6 +8776,66 @@ def _install_dispatch_keys(module) -> None:
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
     # `core_aten_decompositions()` stopped at.
     module._dispatch_get_registrations_for_dispatch_key = _dispatch_registrations
+
+    def _dispatch_is_included_in_alias(k, alias):
+        """`torch._C._dispatch_is_included_in_alias` -- `c10::isIncludedInAlias`.
+
+        The only caller in the vendored tree is `resolve_key`
+        (`torch/_ops.py:218-254`), which asks about six `cand` aliases while
+        computing an op's dispatch table entry. Before this existed the name
+        was a synthesised `_Unimplemented` and `resolve_key` **raised**
+        `NotImplementedError` the moment branch 1 missed -- see
+        `docs/graph/METAKEY.md` 2.2, which measured that and named closing it
+        as a precondition for its own question mattering.
+
+        Upstream's two edge rules are asymmetric and both are kept:
+
+        * `k == Undefined` returns `False`. Upstream tests this first, so it
+          returns rather than tripping the assert below.
+        * `alias == Undefined` **raises**, because `runtimeDispatchKeySetHas`
+          asserts `t != DispatchKey::Undefined`
+          (`c10/core/DispatchKeySet.cpp:9`). Answering `False` here instead
+          would be tidier and would hide a caller bug upstream makes loud, so
+          it raises.
+
+        `docs/graph/METAKEY.md` 4 is the reason a default here was measured
+        rather than chosen: a blanket `True` on the *Meta* predicate did not
+        merely disagree with upstream, it stopped `import torch`, because
+        `torch/library.py:493` consults that one before allowing a meta
+        registration. **That does not repeat here, and the measurement said so
+        against the guess.** Both blanket answers were built and run
+        (`docs/graph/ALIASINC.md` 5): `import torch` survives both, and over
+        the whole aten surface -- 4893 `resolve_key(op, key)` results across
+        `Meta`, `CPU` and `AutogradCPU` -- **0 differ** from this real table.
+
+        The reason is that branch 1 (`py_kernels`) answers 1346 of the 4893,
+        and the remaining 3547 reach
+        `_dispatch_get_backend_keyset_from_autograd` -- the *next*
+        unimplemented name, and one that sits above branches 2.3-2.5 -- before
+        any answer here can matter. Branches 2.1 and 2.2 do come first, but
+        nothing in this tree registers a `py_kernel` at
+        `CompositeExplicitAutograd[NonFunctional]`, so they never fire.
+
+        So this table is justified by agreement with upstream over all 15129
+        askable pairs, **not** by anything observable here today. What closing
+        it bought is exactly that those 3547 now fail one gap later, naming the
+        real blocker instead of this one.
+        """
+        k_name = getattr(k, "name", k)
+        alias_name = getattr(alias, "name", alias)
+        if alias_name == "Undefined":
+            if k_name == "Undefined":
+                # Upstream's `k != Undefined` short-circuits before the assert.
+                return False
+            raise RuntimeError(
+                "t != DispatchKey::Undefined INTERNAL ASSERT FAILED: "
+                "_dispatch_is_included_in_alias was asked about the Undefined alias"
+            )
+        if k_name == "Undefined":
+            return False
+        return k_name == alias_name or k_name in _ALIAS_EXPANSION.get(alias_name, ())
+
+    module._dispatch_is_included_in_alias = _dispatch_is_included_in_alias
 
     # A `DispatchKeySet` *value*, not a function.
     # `torch/_subclasses/functional_tensor.py:146` does

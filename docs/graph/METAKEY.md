@@ -223,6 +223,22 @@ regression; the tree stops loading.
 * **Did not implement `_dispatch_is_included_in_alias`**, which is what
   `resolve_key` actually dies on here (§2.2). It is a different gap and it is
   the one that would have to close first for the Meta answer to matter.
+
+  > **Closed, and it did not make the Meta answer matter:
+  > `docs/graph/ALIASINC.md`.** The predicate now agrees with upstream on all
+  > 15129 askable `(key, alias)` pairs — upstream expands only **six** of its
+  > 145 keys beyond themselves, and `ADInplaceOrView` is not one of them. Two
+  > things above need qualifying. **§2.2's `resolve_key` measurement moved but
+  > did not improve**: of 4893 `resolve_key` results over the aten surface,
+  > the 3547 that died on this predicate now die on
+  > `_dispatch_get_backend_keyset_from_autograd` instead, and **zero** newly
+  > resolve. And **§4's nullification does not generalise** — both blanket
+  > answers were built here, `import torch` survives both, and neither is
+  > distinguishable from the correct table at `resolve_key` (0 of 4893
+  > differ), because branch 1 answers 1346 and nothing in this tree registers
+  > a `py_kernel` at `CompositeExplicitAutograd`, so branches 2.1–2.2 never
+  > fire. The bar had to be upstream agreement precisely because the
+  > observable behaviour cannot tell a correct implementation from a constant.
 * **Did not assert that the shim keeps making zero `Meta` queries.** A test
   that reddens when the shim starts reaching `_get_dispatch` would be a test
   against progress. The count is printed, not asserted.
