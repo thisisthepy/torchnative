@@ -39,6 +39,7 @@ carrying the verdicts across.
 > | Cells the 2026-09-16 table graded too **pessimistically** | **108** — a named refusal classified BREAKS. §7.2 |
 > | Cells moved REFUSES → AGREES this round | **4** — `aten.abs.default` on `mps`, all four dtypes Metal allows. §7.3 |
 > | Metal dispatch counter | **still none.** This is the ceiling on every `mps` cell's placement claim. §7.5 |
+> | `aten.view.dtype`'s silent CPU fallback | **closed 2026-09-19**, by refusal. The `mps`/`cuda` cells are REFUSES and name the reason; the derivation that missed it for two rounds now reaches across files. §4.1 |
 
 
 ---
@@ -210,24 +211,76 @@ an unnoticed nullification is worth more than a feature):
 
 ## 4. What the matrix found
 
-### 4.1 `aten.view.dtype` answers on the CPU under an `mps` label
+### 4.1 `aten.view.dtype` answers on the CPU under an `mps` label — closed 2026-09-19
 
-The one silent fallback in this sweep, and it is a real one:
+The one silent fallback in this sweep, and it was a real one:
 
 ```
-input.device=mps:0  ->  aten.view.dtype  ->  result.device=cpu     (shim)
+input.device=mps:0  ->  aten.view.dtype  ->  result.device=cpu     (shim, before)
 input.device=mps:0  ->  Tensor.view      ->  result.device=mps:0   (upstream)
 ```
 
 Measured on all four dtype pairs tried (`float32->int32`, `int64->float64`,
-`int32->float32`, `bool->uint8`). The result is correct and the device is wrong,
-which is the quiet form of the failure docs/graph/NPU2.md is about — and because
-the *output* is a cpu tensor, everything downstream of it silently leaves the
-device too. It is recorded BREAKS in the table below.
+`int32->float32`, `bool->uint8`). The result was correct and the device was
+wrong, which is the quiet form of the failure docs/graph/NPU2.md is about — and
+because the *output* was a cpu tensor, everything downstream of it silently left
+the device too. It was recorded BREAKS in the table below.
 
-**It is not fixed here.** It is outside the three changes this round was asked
-to port, and a correct fix is a kernel change with its own test. It is reported
-rather than quietly carried.
+**It is closed now, by refusal rather than by a kernel.** The verdict on the
+`mps` and `cuda` columns is REFUSES, naming the op, the device and the reason.
+
+#### Why it stayed open, and what that says about the derivation
+
+`device.rs::MPS_HOST_READBACK_OPS` is exactly the gate for this shape and it did
+not fire. The kernel is two lines:
+
+```rust
+let bytes = crate::tensor::to_le_bytes(OP, input.tensor()?)?;
+let wrapped = crate::tensor::from_le_bytes(OP, &bytes, &dims, want)?;
+```
+
+`to_le_bytes` is a `to_vec1` per dtype — a host readback — and `from_le_bytes`
+opens with `let device = candle_core::Device::Cpu;`. **Both live in `tensor.rs`,
+and the derivation scanned `aten.rs` only.** The six helper names it followed
+were all defined in the same file as the kernels, so a readback one module away
+was invisible to the per-op derivation *and* to the classification test that was
+built to cover what the per-op scan misses. That is the cross-file form of the
+defeat docs/devices/MPSATTN.md §3.1 records, and it had to be fixed before the
+operator could be seen at all.
+
+`test_shim.py::_cross_file_readback_helpers` now derives, from every `*.rs` in
+`src/` other than `aten.rs`, the set of functions whose bodies hold a readback
+marker, and the per-op derivation matches kernels against them **by qualified
+path** (`crate::tensor::to_le_bytes(`), not by bare name — `to_le_bytes` is also
+an inherent method on every Rust integer, and a bare-name match would have
+marked a dozen clean kernels.
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _cross_file_readback_helpers present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _reaches_cross_file_readback present -->
+
+#### Why a refusal and not a device kernel
+
+`view.dtype` reinterprets bytes. candle 0.11.0 exposes no bit-reinterpretation
+of a `Tensor` on any backend, and its Metal storage is not reachable at a level
+where a buffer could be re-tagged; a device-resident version is a Metal shader
+plus a candle-fork API, not a kernel edit. And one of the four pairs cannot be
+done on Metal at any effort: `int64 -> float64` asks for a double. §3.1 closed
+twenty-two roads onto the device for `float64`; **this operator was the
+twenty-third, and it was open.**
+
+#### What the evidence is, per device
+
+| device | evidence | measured here |
+|---|---|---|
+| `mps` | structural + the artefact's own table. Refused before the kernel runs; the name is re-derived from `aten.rs` + `tensor.rs` every gate run | yes — four dtype pairs, `test_viewdtype.py` |
+| `cuda` | the same list (`CUDA_HOST_READBACK_OPS` is an alias), so the one-line addition closes it, and `_cuda_counters()` reports the refusal | **no — there is no CUDA device on this machine.** Structural only |
+| `vulkan` | never silent: that backend is an allowlist and `aten.view.dtype` is not on it | asserted from the allowlist, not from a run |
+| `cpu` | unaffected, and pinned at grade *agrees* against a subprocess oracle | yes — four pairs, exact equality |
+
+There is still **no Metal dispatch counter** in this build (§7.5), so the `mps`
+row above is the ceiling this document keeps naming, not a counter reading.
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_viewdtype.py test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
+<!-- DOCWATCH: op-implemented aten.view.dtype -->
 
 ### 4.2 Four cells whose values disagree with upstream
 
@@ -243,6 +296,63 @@ exactly this. The remaining four are candidates worth a round of their own:
 | `aten.bitwise_xor.Scalar` `bool_cpu` | `11.0` | `1.0` |
 | `aten.col2im.default` `bool_cpu` | `1.0` | `2.0` |
 | `aten.view.dtype` `int8_cpu` | `-122.0` | `127.0` |
+
+### 4.3a The 474 symbol refusals are **five causes, and one of them is 60%**
+
+Scoped 2026-09-19, and the answer changes what the number means. The 474 were
+read as "the largest piece of work this matrix names"; clustered by the message
+they actually carry, they are not 474 kernels and they are not one problem
+either.
+
+**Provenance, stated because the number is quoted.** Derived from
+`/tmp/matrix_pub.json` — the 2026-09-19 round's own sweep output on develop
+`b4f89f3`, re-read rather than re-run, so this costs the machine nothing and
+adds no measurement of its own. The total reproduces exactly: **474**. It is
+the state *before* this round's `view.dtype` change, which moves 4 cells out of
+BREAKS and into a named refusal and does not touch any of the five below.
+
+| # | cause | cells | ops | stage | where |
+|---|---|---|---|---|---|
+| **A** | **`_tensor_from_flat` cannot build the operand** — `candle: unsupported dtype I8 for op to_dtype` | **284** | 284 | `operands` | `int8_mps`, all of it |
+| **B** | Metal has no cast between the two dtypes — `Metal contiguous to_dtype A B not implemented` | **137** | 45 | `op` | `mps` |
+| **C** | candle's matmul lacks the dtype — `unsupported dtype .. for op matmul`, `mlx matmul doesn't support ..` | **27** | 6 | `op` | 19 `cpu`, 8 `mps` |
+| **D** | candle cannot set a const of the dtype — `unsupported const-set ..` | **25** | 9 | `op` | `mps` |
+| **F** | one cell: `aten.sign.default` `bool_mps`, `Metal contiguous unary usign U8 not implemented` | **1** | 1 | `op` | `mps` |
+
+**A is not an operator refusal at all.** Its stage is `operands`: the sweep
+could not *construct* the int8 tensor on Metal, so the cell never reached the
+kernel. It is one gate — the candle fork's `DType::I8` is CPU-only
+(docs/numerics/INT8.md §1.2) — wearing 284 different operator names, exactly
+the shape the in-place family turned out to have (33 operators behind one
+`write_back`). **60% of the headline number is one thing, and it says nothing
+about the 284 operators it is filed under.** Until int8 lands on Metal the
+honest verdict for those cells is a named refusal or `n/a`, not a candle symbol
+attributed to the op.
+
+**B is mostly `float64` again.** Of the 137, **117 name `F64` on one side of the
+cast** (`F16->F64` 32, `BF16->F64` 32, `F32->F64` 31, `F64->*` 16, `U8->F64` 3,
+`I64->F64` 2). §3.1 refuses `float64` on Metal by name on all twenty-two roads
+*onto* the device — these are casts reached **inside** a kernel, after the
+operands were already placed, which is a road `metal_dtype_gate` does not stand
+on. The remaining 20 are `I64->I32` (10) and `I64->I8` (10), the same
+CPU-only-integer story as A. So B is two causes, not 45 operators, and the
+larger one is a gate placement question rather than a kernel.
+
+**C is the family §4.3 originally named** — `mm`, `bmm`, `matmul`, `addmm`,
+`baddbmm`, `convolution` — and it is the smallest real one: **6 operators.**
+**D is the factories**, 9 of them. **F is one cell.**
+
+    Work actually named here: 1 int8-on-Metal gate (A, and half of B's tail),
+    1 float64-cast gate placement (B, 117 cells), 6 matmul ops (C),
+    9 factories (D), 1 cell (F).
+
+**What this clustering cannot see.** It groups by the *text* of the message, so
+two different causes that happen to raise the same candle sentence are merged,
+and one cause whose wording differs between call sites is split. It also
+inherits every limit §5 states about the sweep — one shape per operator, and a
+cell that refuses for the first reason it meets hides any second reason behind
+it. Cause A hides the most: 284 operators have never been asked the question at
+all on that cell.
 
 ### 4.3 470 refusals still hand back a candle symbol
 

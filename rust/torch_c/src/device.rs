@@ -700,7 +700,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 88] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -798,6 +798,26 @@ pub const MPS_HOST_READBACK_OPS: [&str; 88] = [
     "aten.var_mean.correction",
     "aten.var_mean.default",
     "aten.var_mean.dim",
+    // `aten.view.dtype` is the one silent CPU fallback `docs/devices/matrix.md`
+    // §4.1 found, and it stayed open longer than the others because it was
+    // invisible to the derivation: its kernel holds no marker of its own and
+    // calls no in-file helper. It calls `crate::tensor::to_le_bytes`, a
+    // `to_vec1` per dtype, and then `crate::tensor::from_le_bytes`, which
+    // opens `let device = candle_core::Device::Cpu;`. So an `mps` input came
+    // back as a **cpu** tensor with correct values, and everything downstream
+    // of it left the device too.
+    //
+    // It is refused rather than moved onto the device because a byte
+    // reinterpretation is not expressible through candle 0.11.0 on any
+    // backend, and one of the pairs measured -- `int64 -> float64` -- asks
+    // Metal for a double, which it does not have. This op was the twenty-third
+    // road onto the device for `float64`; §3.1 closed the other twenty-two.
+    //
+    // The name is on this list *and* derivable: the scan in `test_shim.py`
+    // now follows helper calls across modules by qualified path, so removing
+    // the `to_le_bytes` is the only way to take the name off -- which is the
+    // order docs/devices/MPSATTN.md §3.1 insists on.
+    "aten.view.dtype",
     "aten.where.default",
 ];
 

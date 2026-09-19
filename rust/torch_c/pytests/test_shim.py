@@ -25620,15 +25620,14 @@ _MPS_READBACK_EXEMPT = {
 }
 
 
-def _aten_rs_functions():
-    """`aten.rs` split into `{function name: body}`, or None if it is not here.
+def _rs_functions(path):
+    """A Rust file split into `{function name: body}`, or None if absent.
 
-    Reads the source rather than the artefact on purpose: the claim being
-    checked is about what the kernels *do*, and only the source says that. It
-    is the one test in this file that needs the tree, so it skips by name where
-    the tree is absent (an installed wheel), rather than failing there.
+    Factored out of `_aten_rs_functions` when the derivation had to stop being
+    single-file: `aten.rs` is not the only module that can hold a readback,
+    and the one that did (`tensor.rs::to_le_bytes`) was invisible to every
+    check here for exactly that reason. See `_cross_file_readback_helpers`.
     """
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "aten.rs")
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as handle:
@@ -25658,6 +25657,75 @@ def _aten_rs_functions():
         bodies.setdefault(match.group(1), "")
         bodies[match.group(1)] += "\n" + text[start:cursor + 1]
     return bodies, text
+
+
+def _src_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+
+
+def _aten_rs_functions():
+    """`aten.rs` split into `{function name: body}`, or None if it is not here.
+
+    Reads the source rather than the artefact on purpose: the claim being
+    checked is about what the kernels *do*, and only the source says that. It
+    is the one test in this file that needs the tree, so it skips by name where
+    the tree is absent (an installed wheel), rather than failing there.
+    """
+    return _rs_functions(os.path.join(_src_dir(), "aten.rs"))
+
+
+def _cross_file_readback_helpers():
+    """`{(module, function)}` outside `aten.rs` whose body reads to the host.
+
+    **The hole this closes, and how it was found.** `_MPS_READBACK_HELPERS`
+    above is six names, and all six are defined in `aten.rs` -- so the per-op
+    derivation could only ever see a readback that lived in the same file as
+    the kernel. `aten.rs::view_dtype` calls `crate::tensor::to_le_bytes`,
+    which is a `to_vec1` per dtype, and `crate::tensor::from_le_bytes`, which
+    opens with `let device = candle_core::Device::Cpu;`. One file away, and
+    therefore invisible to both derivation tests **and** to the classification
+    test, which also reads `aten.rs` only. `aten.view.dtype` answered an
+    `mps` dispatch from the host and returned a cpu tensor for as long as that
+    was true (docs/devices/matrix.md §4.1).
+
+    This is derived, not listed. Every `*.rs` in `src/` other than `aten.rs`
+    is split into functions and any function whose body holds one of the same
+    three markers is a cross-file readback helper. A kernel that starts
+    calling one shows up in the per-op derivation below and fails the suite
+    until it is refused or classified.
+
+    Matching at the **call site** is by qualified path (`tensor::to_le_bytes(`
+    or `crate::tensor::to_le_bytes(`) rather than by bare name, and that is
+    load-bearing rather than tidy: `to_le_bytes` is also an inherent method on
+    every Rust integer, so a bare-name match would mark a dozen kernels that
+    merely encode a scalar. The qualified form cannot be reached by accident.
+
+    Returns an empty set rather than None when the tree is absent, so a
+    caller that has already skipped on `_aten_rs_functions` is not asked twice.
+    """
+    src = _src_dir()
+    if not os.path.isdir(src):
+        return set()
+    found = set()
+    for name in sorted(os.listdir(src)):
+        if not name.endswith(".rs") or name == "aten.rs":
+            continue
+        parsed = _rs_functions(os.path.join(src, name))
+        if parsed is None:
+            continue
+        bodies, _ = parsed
+        for fn, body in bodies.items():
+            if _MPS_READBACK_MARKERS.search(body):
+                found.add((name[:-3], fn))
+    return found
+
+
+def _reaches_cross_file_readback(body, helpers):
+    """Does this kernel body call one of `helpers` by qualified path?"""
+    for module, fn in helpers:
+        if re.search(r"(?:crate::)?" + module + r"\s*::\s*" + fn + r"\s*\(", body):
+            return True
+    return False
 
 
 def _aten_dispatch_targets(text):
@@ -25704,13 +25772,17 @@ def test_the_mps_readback_list_is_what_the_kernels_actually_do():
     assert len(ops) > 200, len(ops)
 
     allowed = set(_C._shim_mps_readback_but_allowed())
+    # The cross-file half. Six in-file helper names could not see
+    # `crate::tensor::to_le_bytes`, and `aten.view.dtype` sat in that blind
+    # spot answering `mps` dispatches from the host.
+    cross_file = _cross_file_readback_helpers()
     derived = set()
     for op, fn in ops.items():
         body = bodies.get(fn, "")
         reads = bool(_MPS_READBACK_MARKERS.search(body)) or any(
             re.search(r"\b" + helper + r"\s*\(", body)
             for helper in _MPS_READBACK_HELPERS
-        )
+        ) or _reaches_cross_file_readback(body, cross_file)
         if reads and op not in allowed:
             derived.add(op)
 
