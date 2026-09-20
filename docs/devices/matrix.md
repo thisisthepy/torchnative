@@ -1247,3 +1247,227 @@ vendor. This round's approval was to patch this fork, so that decision is left
 where it belongs: with the user, stated rather than taken.
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs shim_mps_unsupported_int_dtypes present -->
+
+### 7.14 The counter pointed at the rest of the table — and twelve cells are computed on the host
+
+§7.11 built `_C._metal_counters()` and said, in its own words, that it had not
+pointed it anywhere except `abs`:
+
+> no test in this round asserts a counter delta for `softmax_on_device`, for
+> the §7.7 in-place family, or for any of the 43 operators §7.8 measured.
+
+This round points it. **The finding first, because it is a claim this
+repository published and it is wrong.**
+
+#### The finding
+
+**Twelve `mps` cells across eight operators are published `AGREES` in §6's
+table and are computed on the CPU.** The operand is downloaded to host memory,
+a scalar loop runs there, and the answer is uploaded back to the device it came
+from — so every value is correct, every agreement test is green, and
+`.device` still reads `mps`. That is precisely the failure §7.12 had to plant
+deliberately in order to observe. It was already here.
+
+| operator | cells | measured delta on `mps` | how it reaches the host |
+|---|---|---|---|
+| `aten.sort.default` | `int64`, `bool` | `compute 0–2, downloads 1 (48 B)` | `order_along` |
+| `aten.argsort.default` | `int64`, `bool` | `compute 0–1, downloads 1 (48 B)` | `argsort_core` |
+| `aten.argsort.stable` | `int64`, `bool` | `compute 0–1, downloads 1 (48 B)` | `argsort_core` |
+| `aten.topk.default` | `int64` | `compute 0, downloads 1 (48 B)` | `order_along` |
+| `aten.floor_divide.default` | `int64` | `compute 0, downloads 2 (64 B)` | `floor_divide_impl` |
+| `aten.floor_divide.Scalar` | `int64`, `bool` | `compute 0–1, downloads 1 (56 B)` | `floor_divide_impl` |
+| `aten.scatter_.src` | `int64` | `compute 0, blit 4, downloads 3 (80 B)` | `scatter_inplace` → `scatter_src` → `read_flat` |
+| `aten.scatter_.value` | `int64` | `compute 0, blit 3, downloads 2 (96 B)` | `scatter_inplace` → `scatter_value` → `read_flat` |
+
+The last two rows are §7.7's and §7.8's. §7.8 classified `scatter_.value` and
+`scatter_.src` as "blocked by `f64` on Metal", which is true of their **float**
+columns and is why the diagnosis read as complete; their `int64` column is not
+blocked, reaches, and computes on the host. So **two of the 109 cells §7.7
+moved `REFUSES → AGREES` were moved onto the host, not onto the device.** The
+other 107 were not: they are counted below and they are clean.
+
+**Why the gate that exists to refuse this did not refuse it.**
+`MPS_HOST_READBACK_OPS` refuses `aten.sort.default`'s *kind* of kernel by
+name, and none of these eight is on it, because nothing put them there.
+`test_shim.py`'s derivation re-derives the list from `aten.rs` on every gate
+run — it is the check §7.3 leans on and §7.12 praised — and it follows
+**exactly six helper names** plus a derived set of *cross-file* helpers. Each
+of these eight kernels reaches `read_flat` through a seventh in-file helper
+(`order_along`, `argsort_core`, `floor_divide_impl`) or through another
+operator's kernel function (`scatter_inplace` calls `scatter_src`). §7.12
+described the scan's blind spot as "**one file over**". That was too narrow and
+this corrects it: the blind spot is **one un-named hop**, in the same file.
+Twelve production cells sit in it.
+
+**It is not fixed here, and that is a decision rather than an omission.** The
+fix is two changes that have to land together — deepen the derivation, then add
+the eight names to `MPS_HOST_READBACK_OPS` — and its effect is to remove
+`sort`, `argsort`, `topk`, `floor_divide` and in-place `scatter` from `mps` for
+the integral dtypes, turning twelve published `AGREES` into `REFUSES`. That is
+a capability decision, CLAUDE.md §5.7 leaves it with the user, and an audit is
+not the round to take it in. `test_metalplace.py` pins all three halves of the
+finding instead — the download happens, the op is not refused, the scan does
+not derive it — so that fixing any one of them turns the suite red and forces
+this section and §6's table to move with it.
+
+#### The claims that are now counted, and the bracket they were counted in
+
+The bracket is the same for every number below, and it is stated because
+counters from different brackets read like regressions side by side (CLAUDE.md
+§2): operands are built **before** the first snapshot, the counters are read
+immediately before and immediately after the single `_aten_dispatch` under
+test, and results are read back **after** the second snapshot. Nothing else
+runs between the two reads.
+
+| claim | cells counted | result |
+|---|---|---|
+| `softmax_on_device` (MPSATTN.md §3.1) | 6 — `_softmax` and `_safe_softmax` × `float32`/`float16`/`bfloat16` | `compute_encoders` **5**, `host_downloads` **0** |
+| §7.7's in-place family | 52 — the 14 operators × their dtypes | `host_downloads` **0**, `host_upload_bytes` ≤ 8, `compute_encoders ≥ 1` for the 12 that compute |
+| §7.8's 43 in-place operators | every (operator, dtype) pair that reaches | `host_downloads` **0** for all but `scatter_.src`/`scatter_.value` |
+| §7.3's four `abs` cells (control) | 4 | already counted by §7.11; unchanged |
+
+Each of these is asserted beside element-wise agreement against an oracle
+computed in a **separate subprocess** at `tools/golden/dtypes.py`'s derived
+tolerance, except the 43-operator sweep, which is **placement only and says
+so** — its values are graded by `test_mpsinplace.py` and by §6's table, and
+duplicating an oracle for 43 operators would have made the file about
+agreement instead of about where the work happened (CLAUDE.md §4).
+
+#### What the counter cannot reach, stated rather than approximated
+
+* `compute_encoders` is a **lower bound on GPU dispatches** — a successful
+  `command_encoder()`, handed to a `candle_metal_kernels::call_*` that encodes
+  at least one `dispatch_thread*`. It is not a `dispatch_threads` count; those
+  live in `candle-metal-kernels`, which this vendoring does not cover.
+* `blit_encoders` moves for a device-to-device copy **and** for a readback,
+  because a readback blits first. The two are not separated, so
+  `blit_encoders > 0` is never used here as evidence of device residency.
+  `host_downloads == 0` is.
+* **199 `mps` `AGREES` cells move no counter at all** and correctly so: they
+  are views, layout changes and dtype-identity cases (`view`, `permute`,
+  `slice`, `t_`, `clone`, `_to_copy` within a dtype, `round`/`ceil`/`floor` on
+  an integer). For these `compute_encoders ≥ 1` is unavailable and demanding it
+  would be widening the claim to make it countable. What *is* available is that
+  `host_uploads` and `host_downloads` are both zero, which a host-computed twin
+  cannot achieve — it has to move the bytes both ways.
+* **Two operators are correctly blit-only** and are asserted as such rather
+  than excused: `zero_` (a device `const_set` plus a copy) and `copy_` (the copy
+  alone) have `compute_encoders == 0` by construction. The assertion for them
+  is `blit_encoders ≥ 1` with both byte counters at zero.
+* **`uniform_` downloads 24 bytes and is exempt, not clean.** It is one of the
+  two names in `MPS_READBACK_BUT_ALLOWED`: its readback is of a *constant* it
+  built itself (`narrow_roundtrip_f32`), not of an input. The counter cannot
+  tell those apart — it counts bytes leaving the device, and the reason they
+  are leaving is not in the count. The same is true of
+  `_local_scalar_dense` (`.item()`), whose readback is what the caller asked
+  for. **Both are the class of claim this instrument cannot settle**, and both
+  remain settled by reading the kernel.
+* **A cell passing is not an operator being right** (§7.9's `clamp`). The
+  counter says where the work happened, never whether the shape exercised the
+  operator. Of the cells counted above, the ones whose single shape cannot
+  distinguish a correct kernel from a wrong one are named in
+  `test_metalplace.py`'s docstrings rather than counted as proof.
+
+#### Nullification
+
+Three mutants, each built through `vendor/install_shim.sh` so it reached the
+**vendored** tree, and each removed afterwards
+(`sh vendor/vendor_candle.sh --check` passes byte for byte).
+
+Each was built and measured **alone**, so the attribution below is measured
+rather than inferred.
+
+| mutant | what it broke | `test_metalplace` | `test_metalcount` |
+|---|---|---|---|
+| M-A: `note_compute_encoder` gutted in the fork | the compute counter | softmax RED, in-place family RED | `abs` RED |
+| M-B: `note_host_download` gutted in the fork | the download counter | §7.14 pin RED, 43-operator sweep RED | readback calibration RED |
+| M-C: a host-computed softmax twin in `tensor.rs`, one file over from `aten.rs` | `softmax_on_device`'s placement | softmax RED (`compute 0, blit 1, uploads 1 (24 B), downloads 1 (24 B)`) | green — it is about `abs` |
+
+M-C also left **`test_mpsattn.py` — the suite whose entire subject is
+`softmax_on_device` — green, 0 FAIL**, while softmax on `mps` computed on the
+CPU.
+
+**One honest weakness, found by running M-A and M-B separately.** The
+`host_downloads == 0` half of the softmax and in-place tests **survives M-B**:
+a download counter that can never move satisfies `== 0` trivially. What stops
+that is `test_metalcount.py::test_a_readback_costs_exactly_the_tensors_bytes`,
+which asserts a `.cpu()` costs exactly the tensor's bytes and does go RED under
+M-B. So the zero in this file is only meaningful because that calibration runs
+in the same gate — it is not self-supporting, and it is written down here
+rather than left to be discovered by the next round.
+
+M-C is the result worth keeping. It repeats §7.12's M2 on a different kernel
+and gets the same answer: the suite built for that kernel cannot tell that the
+kernel stopped running on the device. One test elsewhere did fail under M-C —
+`test_shim.py`'s central-difference tape check — but on **values**, because the
+twin accumulated in `f32` rather than the op's accumulation dtype. That is the
+twin being imperfect, not the gate detecting a fallback, and it is recorded
+that way rather than counted as a catch.
+
+**Which of the new tests survive which mutant.**
+`test_the_readback_derivation_scan_does_not_reach_these_kernels` survives all
+three, correctly — it is a claim about source, and no counter mutant can touch
+it. Every other test in the file dies to at least one: softmax and the in-place
+family to M-A (and softmax also to M-C), the §7.14 pin and the 43-operator
+sweep to M-B.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_softmax_on_mps_opens_metal_kernels_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_in_place_family_on_mps_computes_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_readback_derivation_scan_does_not_reach_these_kernels present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs softmax_on_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs twin_softmax absent -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+
+### 7.15 `candle_metal_kernels::DType` — the instantiation is macro-driven, and that is the shape of the `I8` decision
+
+§7.13 declined `DType::I8` on Metal and left the second-crate decision with the
+user. The one fact that decision needs, read rather than implemented:
+
+**Adding `I8` to `candle-metal-kernels` is adding instantiation lines to
+existing macros. It is not writing a Metal shader per operator.** Every kernel
+family in `src/metal_src/*.metal` is a C++ template instantiated through an
+`init_kernel` macro, and the six-dtype list is a hand-written list of macro
+*invocations* — one line per dtype — inside a per-family macro:
+
+```c
+#define init_binary(bop)                             \
+    init_binary_k(bop, bop, f32,  float,    float)   \
+    init_binary_k(bop, bop, f16,  half,     half)    \
+    init_binary_k(bop, bop, bf16, bfloat,   bfloat)  \
+    init_binary_k(bop, bop, u8,   uint8_t,  uint8_t) \
+    init_binary_k(bop, bop, u32,  uint32_t, uint32_t)\
+    init_binary_k(bop, bop, i64,  int64_t,  int64_t)
+```
+
+One added line there lights up **all six arithmetic binaries and all six
+comparison binaries at once**, each in its nine layout variants
+(`_strided`, `_lstrided`, `_scalar`, `_cs`, `_sc`, …), because `init_binary_k`
+fans those out. `cast.metal` is the same shape: `init_cast_all` is a six-line
+macro and one more line plus one more top-level `init_cast_all(i8, int8_t);`
+produces every cast pair to and from `i8`.
+
+The families that are **not** macro-fanned over dtype are hand-enumerated at
+the top level, one line per (index dtype, value dtype) pair:
+`INDEX_OP` ×16, `INDEX_ADD_OP` ×18, `GATHER_OP` ×16, `SCATTER_OP` ×10,
+`SCATTER_ADD_OP` ×10, `WHERE_OP` ×18, `ARGSORT` ×6. Adding `i8` as a *value*
+type there is one line per index dtype per family, not a new shader.
+
+So the count is roughly **30 added lines and zero new shader bodies** for the
+elementwise, cast, indexing, ternary and sort families. Two things are outside
+that:
+
+* `init_unary_float` covers `f32`/`f16`/`bf16` only, and the integer unary
+  instantiations are a hand-written three (`copy` for `u8`, `u32`, `i64`).
+  **candle has no integer `sin`/`exp`/`sqrt` on Metal and adding `I8` does not
+  change that** — nor should it, since upstream refuses those on integers too.
+* `quantized.metal`, `mlx_gemm.metal`, `gemv.metal` and
+  `scaled_dot_product_attention.metal` are float-only and untouched by this.
+
+The Rust half is the ordinary enum widening: `DType` gains a variant,
+`size_in_bytes` gains an arm, and every kernel-name suffix table gains `"i8"`.
+
+**Nothing was implemented and nothing was vendored for this section.** It is a
+reading of `candle-metal-kernels-0.11.0` as published, recorded so that §7.13's
+open decision is made against a measured shape rather than a guessed one.
