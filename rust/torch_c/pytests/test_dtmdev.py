@@ -311,21 +311,29 @@ def test_float64_refuses_by_name_on_every_road_onto_metal():
 # F8E4M3`, which candle's Metal backend does not implement at all -- so it
 # could not be built on the device by any amount of trying. Cast on the host,
 # it moves as eight-bit bytes and arrives exactly.
+#
+# `int8` joined on 2026-09-20. It had been in `_REFUSED_ON_MPS` below because
+# the `candle-core` fork's `DType::I8` was CPU-only; `candle-metal-kernels` is
+# now vendored as a second fork and the buffer builds
+# (docs/devices/matrix.md §7.17). It is graded here by value, like the rest --
+# moving it was not the point, comparing it against upstream is.
 _LANDS_ON_MPS = (
     "float32", "float16", "bfloat16", "float8_e4m3fn",
-    "int64", "int32", "int16", "uint8", "uint32",
+    "int64", "int32", "int16", "int8", "uint8", "uint32",
     "bool",
 )
 # Refuses, and the fragment its message has to contain to count as naming what
 # it refused. Both are real refusals; neither may become a wrong value.
 #
 # `float64` is a property of Metal's API (no `double`) and refuses with
-# upstream's own sentence. `int8` is a property of *this build*: the
-# candle-core fork that gave the CPU `DType::I8` (docs/numerics/INT8.md §1.2)
-# is CPU-only, and Metal names the dtype it cannot take.
+# upstream's own sentence. It is now the only entry: `int8` used to be here
+# too, because the `candle-core` fork's `DType::I8` was CPU-only, and it left
+# on 2026-09-20 when a second fork of `candle-metal-kernels` gave it shader
+# symbols (docs/numerics/INT8.md §1.2a). A one-entry mapping is kept as a
+# mapping rather than collapsed to a constant: the next dtype to refuse here
+# should be an added line and not a rewrite.
 _REFUSED_ON_MPS = {
     "float64": _F64_REFUSAL,
-    "int8": "I8",
 }
 
 

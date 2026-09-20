@@ -212,7 +212,7 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 | `int64` | 18 | 15 | 21 | 21 |
 | `int32` | 18 | **2** | 21 | 21 |
 | `int16` | 18 | **2** | 21 | 21 |
-| `int8` | 18 | **0** | 21 | 21 |
+| `int8` | 18 | 16 | 21 | 21 |
 | `uint8` | 18 | 15 | 21 | 21 |
 | `uint32` | 17 | 14 | **13** | **8** |
 | `bool` | 12 | 10 | 16 | 16 |
@@ -248,6 +248,14 @@ Two rows are worth reading carefully:
   answer to agree with.
 * **`float64` on `mps` is `0` on both sides now.** It was `3` on this side
   before this round. §4.1.
+* **`int8` on `mps` moved from `0` to `16` on 2026-09-20**, when
+  `candle-metal-kernels` was vendored as a second fork and `DType::I8` gained
+  its shader symbols ([`INT8.md`](INT8.md) §1.2a,
+  [`docs/devices/matrix.md`](../devices/matrix.md) §7.17). Sixteen, not
+  eighteen: `max` and `argmax` need an `I8` reduce kernel candle does not have.
+  The sixteen are in `_MPS_REACHES` and are graded by value against upstream
+  by `test_the_dtype_device_matrix_agrees_with_upstream`, which is what makes
+  `16` a claim about numbers rather than about dispatches.
 
 ### 3.2 Dtypes this build cannot store at all
 
@@ -360,7 +368,11 @@ aten.matmul.default: candle: Metal error mlx matmul doesn't support I32
 `candle-metal-kernels` ships `badd_i64`/`badd_u32` and not `badd_i16`/`badd_i32`,
 and the `to_dtype` matrix has no `I16→I64` or `I32→I64` arm. Closing it means
 either writing Metal shaders into `candle-metal-kernels` (upstream patch, of the
-shape `vendor/int8-candle-0.11.0-cpu.patch` already is for another gap), or a
+shape `vendor/int8-candle-0.11.0-cpu.patch` already is for another gap; and
+`vendor/int8-candle-metal-kernels-0.11.0.patch` is now that shape for the
+Metal half, so the road below is walked rather than hypothetical --
+see [`docs/devices/matrix.md`](../devices/matrix.md) §7.17 for what it cost),
+or a
 promotion rule in this crate that widens `int16`/`int32` to `int64` before
 dispatch on Metal and narrows after. **The second is cheaper and is the one that
 needs the argument written first**, because a silent widen-compute-narrow is
@@ -430,7 +442,7 @@ against upstream 2.13.0.
 | road | verdict |
 |---|---|
 | 1. promotion with a proven wrap identity | **identity proven; road impassable.** The widening cast is itself a missing Metal kernel (above). Doing it via the host is the failure mode this document's §1 ranks worst. |
-| 2. real Metal kernels for `i16`/`i32` | **fork only — there is no extension point.** `candle_metal_kernels::DType` (`lib.rs`) has exactly six variants, `F32 F16 BF16 I64 U32 U8`; `binary.metal`'s `init_binary` macro instantiates over the same six; the shaders are `include_str!`'d compile-time constants and `Kernels::load_library` takes a closed `Source` enum. Adding `I16`/`I32` means patching `candle-metal-kernels` **and** `candle-core`'s Metal dispatch — a shader patch in the shape of `vendor/int8-candle-0.11.0-cpu.patch`, but larger, and not something this round could grade across the matrix. Left for a round that owns it. |
+| 2. real Metal kernels for `i16`/`i32` | **fork only — there is no extension point, and that fork has since been made for `I8`** (2026-09-20, [`docs/devices/matrix.md`](../devices/matrix.md) §7.17: 51 lines, zero new shader bodies, `I16`/`I32` would be the same shape). `candle_metal_kernels::DType` (`lib.rs`) has exactly six variants, `F32 F16 BF16 I64 U32 U8`; `binary.metal`'s `init_binary` macro instantiates over the same six; the shaders are `include_str!`'d compile-time constants and `Kernels::load_library` takes a closed `Source` enum. Adding `I16`/`I32` means patching `candle-metal-kernels` **and** `candle-core`'s Metal dispatch — a shader patch in the shape of `vendor/int8-candle-0.11.0-cpu.patch`, but larger, and not something this round could grade across the matrix. Left for a round that owns it. |
 | 3. **refuse by name, close nothing** | **taken.** |
 
 **What was delivered instead, and it is a deliverable on its own.** The refusal
@@ -452,7 +464,7 @@ now:
 ```
 aten.add.Tensor: not implemented for int16 tensors on the mps device. candle's
 Metal backend in this build instantiates its kernels for float32, float16,
-bfloat16, uint8, uint32 and int64 only, so an int16 tensor on mps is storage no
+bfloat16, uint8, uint32, int64 and int8 only, so an int16 tensor on mps is storage no
 Metal kernel can read -- not arithmetic, not reductions, and not even a cast off
 it. Move it with .cpu() to compute on the host with the dtype kept, or cast with
 .to(torch.int64) before .to("mps") to keep the computation on the GPU with the

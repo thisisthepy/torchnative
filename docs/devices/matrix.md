@@ -369,6 +369,12 @@ cell that refuses for the first reason it meets hides any second reason behind
 it. Cause A hides the most: 284 operators have never been asked the question at
 all on that cell.
 
+**Asked, 2026-09-20 (§7.17): cause A is closed and it was worth 137, not 284.**
+Once the operand builds, 0 of the 284 still fail at stage `operands` and
+**137 reach AGREES**. The gap is not shaders: 99 of the 284 do not have
+`int8_cpu` at AGREES either, so they were never in the prize — which is the
+error this very paragraph warns about, committed by the paragraph above it.
+
 ### 4.3 470 refusals still hand back a candle symbol
 
 1201 of 1671 refusals name themselves. The other 470 quote an internal candle
@@ -1224,6 +1230,12 @@ it discovered.
 
 ### 7.13 `DType::I8` on Metal — declined, with the reason measured
 
+> **Superseded by §7.17 (2026-09-20), which does not correct it.** The second
+> crate was approved and vendored; everything this section says about a
+> `candle-core`-only change remains true and is why the second crate was
+> needed. The one number below that did **not** survive is "284": the ceiling
+> was 185, because 99 of the 284 do not agree on the CPU either.
+
 284 matrix cells fail at stage `operands`: `_tensor_from_flat` cannot build an
 `int8` tensor on `mps` at all, because the fork's `DType::I8` is CPU-only
 (docs/numerics/INT8.md §1.2) and `storage_from_cpu_storage` refuses
@@ -1238,6 +1250,9 @@ built, and every kernel would then refuse for want of a shader symbol. That
 converts 284 `operands` failures into 284 kernel-stage refusals and moves **no
 cell to AGREES** — a tensor that exists and can do nothing, which is a worse
 answer than the refusal it replaces, not a better one.
+
+**Taken, 2026-09-20.** See §7.17 for what the second crate cost (51 lines,
+zero new shader bodies) and what it moved (137 cells).
 
 This is the same wall `int16`/`int32` hit, and `device.rs`'s
 `_shim_mps_unsupported_int_dtypes` is the decision already taken for it
@@ -1670,3 +1685,152 @@ shape is `[2, 3]`.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs order_along present -->
 <!-- DOCWATCH: op-implemented aten.sort.default -->
 <!-- DOCWATCH: op-implemented aten.topk.default -->
+
+### 7.17 `DType::I8` on Metal — vendored, and 137 of the 284 cells now agree
+
+§7.13 declined this and left the decision with the user; §7.15 read the
+instantiation so the decision could be made against a measured shape. This
+section is the round that made it. **§7.13 is not corrected below — it was
+right about what a `candle-core`-only change would buy.** What changed is that
+the second crate was approved, so the other half could be built.
+
+#### The survey was re-checked first, because it is why this was approved
+
+§7.15 was read-only and this round depended on it, so it was verified against
+`candle-metal-kernels-0.11.0` as published — the crate whose sha256
+`242e83c6…3d3e` is the `checksum` `rust/torch_c/Cargo.lock` already carried,
+i.e. cargo's own pin and not one chosen here.
+
+| §7.15 said | measured |
+|---|---|
+| `candle_metal_kernels::DType` has six variants | **holds** — `BF16 F16 F32 I64 U32 U8`, `src/lib.rs` |
+| `init_binary` / `init_boolean_binary` are per-dtype macro invocation lists | **holds** |
+| `init_cast_all` is one macro plus one top-level call | **holds** |
+| `INDEX_OP` ×16, `INDEX_ADD_OP` ×18, `GATHER_OP` ×16, `SCATTER_OP` ×10, `SCATTER_ADD_OP` ×10, `WHERE_OP` ×18, `ARGSORT` ×6 | **holds, all seven counts exactly** |
+| `init_unary_float` is float-only; integer unary is `copy` only | **holds** — so no `int8` `sin`/`exp`/`sqrt`, as upstream also refuses |
+| `quantized`/`mlx_gemm`/`gemv`/`sdpa` are float-only | **holds** |
+| "roughly 30 added lines and zero new shader bodies" | **zero new shader bodies holds.** The line count was low: **43 MSL lines** (40 instantiations + 3 comment), because each macro exists twice behind `#if defined(__HAVE_BFLOAT__)` and both copies need the line |
+
+Three things the survey did not name, found only by compiling:
+
+* **`impl EncoderParam for i8`** (`src/utils.rs`). Without it `const_set` does
+  not typecheck, so `zero_`, `fill_` and every factory stay refused.
+* `copy2d::I8` and `sort.rs`'s two `DType` match tables, which are Rust
+  name/size tables rather than MSL.
+* `mlx_sort.metal`'s block-sort instantiations, which are a third list beside
+  `sort.metal`'s `ARGSORT`.
+
+Total: **51 added lines across 12 files**, none of them a shader body. The
+survey's *shape* was right and its *size* was 40% low; it was right about the
+thing the decision turned on.
+
+#### The result, in the three grades, and the 284 is not the number
+
+    builds     both crates compile; the MSL library loads on the device.
+    reaches    0 of the 284 cells still fail at stage `operands`.
+    AGREES     137.
+
+**147 do not agree, and 99 of them never could.** §4.3a counted 284 cells at
+stage `operands` and read that as the size of the prize. It is not: a cell can
+only reach AGREES on `mps` if `int8` agrees on the **CPU** too, and 99 of the
+284 have `int8_cpu` at BREAKS, REFUSES or REACHES. The real ceiling was
+**185**, and 137 of those 185 were taken. This is the same error §4.3a itself
+warned about one paragraph later — a number that names operators it has never
+asked the question of — repeated by the document that raised it.
+
+The 48 of the ceiling that remain, and the 99 that were never in it, cluster
+into four causes and **none of them is an `int8` shader**:
+
+| cause | cells | what it is |
+|---|---|---|
+| **A** | 98 | the `mps` host-readback gate (§7.16 and MPSATTN.md §3.1), which refuses these operators on **every** dtype. `int8` changed nothing here and was never going to |
+| **B** | 38 | **upstream itself refuses `int8`** — `"round_cpu" not implemented for 'Char'`, `mean(): input must be floating point`, `masked_fill only supports boolean masks`, `where expected condition to be a boolean tensor`. There is no oracle, so there is nothing to agree with |
+| **C** | 10 | candle has no `I8` kernel for that specific op: `mlx matmul doesn't support I8` (`mm`, `bmm`, `matmul`, `addmm`, `baddbmm`), `reduce op Max I8`, `unary usign I8`, and three `I8 <-> F64` casts which §3.1 refuses on Metal by name anyway |
+| **D** | 1 | `convolution`, refused by this shim as floating-point only |
+
+**C is the only one a further `candle-metal-kernels` change would move**, and
+it is 10 cells across 7 operators — the smallest of the four, which is the
+opposite of what §4.3a's headline implied.
+
+#### What was vendored, and on what terms
+
+`vendor/candle-metal-kernels/`, committed, on **exactly** the terms
+`vendor/candle-core/` is on: the sha256-pinned published crate plus
+`vendor/int8-candle-metal-kernels-0.11.0.patch`, regenerated by
+`sh vendor/vendor_candle.sh` and verified byte for byte by `--check` in the
+gate. `vendor_candle.sh` was extended to loop over both crates rather than
+gaining a sibling script, and `test_int8.py` now runs the same four vendoring
+tests against each: patch path relative and pointing at the tree `--check`
+verifies, lock resolving from the fork and not the registry, a drifted tree
+refused, a wrong crate refused. **`--check` reporting one tree instead of two
+is itself a failure**, asserted, because that is how a second crate silently
+stops being covered.
+
+The existing patch is still named `int8-…-cpu.patch` although it now carries
+Metal counters and Metal `I8`. Renaming it reaches `vendor_candle.sh`,
+docs/numerics/INT8.md §1.2 and `test_int8.py`; it is **left alone**, and the
+script says so where a reader meets it.
+
+#### Nullification
+
+Five mutants, each built through `vendor/install_shim.sh` so it reached the
+**vendored** tree, run alone, and removed afterwards. `--check` was re-run
+after the last one and both trees are byte for byte their patches again.
+
+| mutant | what it breaks | result |
+|---|---|---|
+| M-1: `init_binary_k(bop, bop, i8, int8_t, int8_t)` deleted from both `init_binary` branches | the arithmetic binaries | RED — `Error while loading function: badd_i8` |
+| M-2: the top-level `init_cast_all(i8, int8_t);` deleted | every cast *off* `i8` | RED in two tests — `cast_i8_f32`, and `cast_i8_i64` inside the comparisons |
+| M-3: the three `WHERE_OP(int8_t, …)` lines deleted | the ternary family | RED — `where_u8_i8 was not found in the library` |
+| M-4: `CpuStorage::I8` returned to the refusing arm in `candle-core` | §4.3a cause A, restored | RED in four tests — `unsupported dtype I8 for op to_dtype`, the exact pre-change message |
+| M-5: **a host twin** — `to_dtype` for `I8` downloads, converts on the CPU and uploads | nothing a value can see | RED **only on the counters** — `read 2 tensor(s) back to the host (16 bytes)`. Every element was still correct and `.device` still said `mps` |
+
+**M-5 is the one that matters**, and it is the experiment CLAUDE.md §2 records
+as never having been run on Metal. It has now been: a host-computed twin of
+the `int8` cast produced **correct values under an `mps` label**, and the
+agreement assertions did not notice. `host_downloads == 0` did.
+
+**Which tests survive which mutants.**
+`test_the_inputs_actually_wrap` survives all five — it is a property of the
+input data and touches no device, which is what it is for.
+`test_int8_builds_on_mps_and_makes_the_round_trip` survives M-1, M-2, M-3 and
+M-5 and dies only to M-4; it makes no counter claim, correctly, because a
+buffer build legitimately uploads.
+`test_int8_casts_agree_with_upstream_on_mps` is the only one that dies to both
+M-2 and M-5.
+
+#### What this round did not do, stated rather than left to be inferred
+
+* **No `int8` reduction, matmul or `sign` on Metal** (cause C, 10 cells). Each
+  is a real instantiation question and none was attempted.
+* **`maximum` and `minimum` are not in `test_i8mps.py`**, and not for a dtype
+  reason: they are on `_shim_mps_host_readback_ops()` for every dtype, so
+  including them would fail this file for something it is not about.
+* **The sweep is one shape per operator** (§5), so a cell graded AGREES here
+  is graded at that shape. `test_i8mps.py` exercises inputs the sweep's cell
+  does not contain — both `int8` endpoints in **both** operands, and inputs
+  where `add`, `sub` and `mul` each wrap at least twice — because §7.9's
+  `clamp` and §7.16's N-3 both passed a green suite on a cell that lacked the
+  value that mattered.
+* **Only the `int8_mps` column was re-swept**, for the 284 operators. The other
+  fifteen columns moved too between `b4f89f3` and this round, but those moves
+  are §7.16's refusals and other develop traffic, not this change, and are not
+  attributed to it here.
+
+<!-- DOCWATCH: symbol-in-file vendor/vendor_candle.sh candle-metal-kernels present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml candle-metal-kernels present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/lib.rs I8 present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/binary.metal "init_binary_k(bop, bop, i8, int8_t, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i8, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/ternary.metal where_u8_i8 present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs cast_i8_f32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_builds_on_mps_and_makes_the_round_trip present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_binary_operators_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_casts_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_where_agrees_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_the_inputs_actually_wrap present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry present -->

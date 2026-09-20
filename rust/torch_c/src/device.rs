@@ -1887,12 +1887,21 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // docs/numerics/DTYPEDEV.md §4.2 is the argument; this comment says only what a
 // reader of this file needs.
 //
-// **The fact.** `candle-metal-kernels` 0.11.0 instantiates every one of its
-// kernels for six element types and no others -- `binary.metal`'s `init_binary`
-// macro expands to `f32 f16 bf16 u8 u32 i64`, and `candle_metal_kernels::DType`
-// (`lib.rs`) has exactly those six variants. `I16` and `I32` are not among
-// them, which is a fact about candle's Metal backend and not about Metal: MSL
-// has `short` and `int` and would compile the shaders fine.
+// **The fact.** `candle-metal-kernels` 0.11.0 **as published** instantiates
+// every one of its kernels for six element types and no others --
+// `binary.metal`'s `init_binary` macro expands to `f32 f16 bf16 u8 u32 i64`,
+// and `candle_metal_kernels::DType` (`lib.rs`) has exactly those six variants.
+// `I16` and `I32` are not among them, which is a fact about candle's Metal
+// backend and not about Metal: MSL has `short` and `int` and would compile the
+// shaders fine.
+//
+// **This build vendors a seventh** (2026-09-20, docs/devices/matrix.md §7.17):
+// `vendor/candle-metal-kernels` adds `i8` to those same macros. So the "six"
+// above is the *upstream* count and `MPS_SUPPORTED_DTYPE_NAMES` below is the
+// *build* count, and they differ by `int8`. It also demonstrates the price of
+// closing this gap: 51 lines and no new shader body. `I16`/`I32` are the same
+// shape of change and are still not done -- this comment explains a refusal,
+// not an impossibility.
 //
 // **What that makes an int16/int32 tensor on Metal.** Not "a tensor missing
 // some operators" -- a *sealed buffer*. Measured on this machine, every cast
@@ -1945,9 +1954,18 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// can hand the same answer to a test and the artefact is what gets checked.
 pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 2] = [DType::I16, DType::I32];
 
-/// The six candle instantiates, named in the refusal so the reader learns the
-/// rule and not just this one case.
-const MPS_SUPPORTED_DTYPE_NAMES: &str = "float32, float16, bfloat16, uint8, uint32 and int64";
+/// The dtypes candle instantiates *in this build*, named in the refusal so the
+/// reader learns the rule and not just this one case.
+///
+/// It was six until 2026-09-20 -- the six `candle-metal-kernels` publishes.
+/// `int8` is the seventh and is **this repository's**, from the second
+/// vendored fork (docs/devices/matrix.md §7.17). It has to be listed: a
+/// refusal that tells an `int16` user to widen, while naming a supported set
+/// that omits a dtype this build does in fact support, sends them past the
+/// cheapest answer. That the list is a build property and not candle's is why
+/// this constant exists rather than a literal at the call site.
+const MPS_SUPPORTED_DTYPE_NAMES: &str =
+    "float32, float16, bfloat16, uint8, uint32, int64 and int8";
 
 pub fn is_mps_unsupported_int(dtype: DType) -> bool {
     MPS_UNSUPPORTED_INT_DTYPES.contains(&dtype)

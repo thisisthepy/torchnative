@@ -1,0 +1,314 @@
+diff --git a/src/kernels/macros.rs b/src/kernels/macros.rs
+index 9cff967..93e1f05 100644
+--- a/src/kernels/macros.rs
++++ b/src/kernels/macros.rs
+@@ -10,6 +10,7 @@ macro_rules! ops{
+             pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16"));
+             pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16"));
+             pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64"));
++            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8"));
+             pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32"));
+             pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8"));
+         }
+@@ -20,6 +21,7 @@ macro_rules! ops{
+                 pub const HALF: Kernel = Kernel("copy_f16");
+                 pub const BFLOAT: Kernel = Kernel("copy_bf16");
+                 pub const I64: Kernel = Kernel("copy_i64");
++                pub const I8: Kernel = Kernel("copy_i8");
+                 pub const U32: Kernel = Kernel("copy_u32");
+                 pub const U8: Kernel = Kernel("copy_u8");
+             }
+@@ -34,6 +36,7 @@ macro_rules! ops{
+             pub const HALF: Kernel = Kernel(concat!(stringify!($name), "_f16_strided"));
+             pub const BFLOAT: Kernel = Kernel(concat!(stringify!($name), "_bf16_strided"));
+             pub const I64: Kernel = Kernel(concat!(stringify!($name), "_i64_strided"));
++            pub const I8: Kernel = Kernel(concat!(stringify!($name), "_i8_strided"));
+             pub const U32: Kernel = Kernel(concat!(stringify!($name), "_u32_strided"));
+             pub const U8: Kernel = Kernel(concat!(stringify!($name), "_u8_strided"));
+         }
+@@ -44,6 +47,7 @@ macro_rules! ops{
+                 pub const HALF: Kernel = Kernel("copy_f16_strided");
+                 pub const BFLOAT: Kernel = Kernel("copy_bf16_strided");
+                 pub const I64: Kernel = Kernel("copy_i64_strided");
++                pub const I8: Kernel = Kernel("copy_i8_strided");
+                 pub const U32: Kernel = Kernel("copy_u32_strided");
+                 pub const U8: Kernel = Kernel("copy_u8_strided");
+             }
+diff --git a/src/kernels/sort.rs b/src/kernels/sort.rs
+index 750d373..d7f7718 100644
+--- a/src/kernels/sort.rs
++++ b/src/kernels/sort.rs
+@@ -48,6 +48,7 @@ fn mlx_dtype_str(dtype: DType) -> &'static str {
+         DType::U8 => "uint8",
+         DType::U32 => "uint32",
+         DType::I64 => "int64",
++        DType::I8 => "int8",
+         DType::F16 => "float16",
+         DType::BF16 => "bfloat16",
+         DType::F32 => "float32",
+@@ -214,6 +215,7 @@ fn multi_block_sort(
+         DType::U8 => crate::copy2d::U8,
+         DType::U32 => crate::copy2d::U32,
+         DType::I64 => crate::copy2d::I64,
++        DType::I8 => crate::copy2d::I8,
+         DType::BF16 => crate::copy2d::BFLOAT,
+         DType::F16 => crate::copy2d::HALF,
+         DType::F32 => crate::copy2d::FLOAT,
+diff --git a/src/kernels/unary.rs b/src/kernels/unary.rs
+index 4ccadc2..e7aff9b 100644
+--- a/src/kernels/unary.rs
++++ b/src/kernels/unary.rs
+@@ -146,6 +146,7 @@ pub mod copy2d {
+     pub const HALF: Kernel = Kernel("copy2d_f16");
+     pub const BFLOAT: Kernel = Kernel("copy2d_bf16");
+     pub const I64: Kernel = Kernel("copy2d_i64");
++    pub const I8: Kernel = Kernel("copy2d_i8");
+     pub const I32: Kernel = Kernel("copy2d_i32");
+     pub const I16: Kernel = Kernel("copy2d_i16");
+     pub const U32: Kernel = Kernel("copy2d_u32");
+diff --git a/src/lib.rs b/src/lib.rs
+index c75cdb7..74de219 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -31,6 +31,7 @@ pub enum DType {
+     F16,
+     F32,
+     I64,
++    I8,
+     U32,
+     U8,
+ }
+@@ -39,6 +40,7 @@ impl DType {
+     fn size_in_bytes(&self) -> usize {
+         match self {
+             Self::U8 => 1,
++            Self::I8 => 1,
+             Self::U32 => 4,
+             Self::I64 => 8,
+             Self::BF16 => 2,
+diff --git a/src/metal_src/binary.metal b/src/metal_src/binary.metal
+index 1399eb1..c62419d 100644
+--- a/src/metal_src/binary.metal
++++ b/src/metal_src/binary.metal
+@@ -137,14 +137,16 @@ template <
+     init_binary_k(bop, bop, bf16, bfloat, bfloat)   \
+     init_binary_k(bop, bop, u8, uint8_t, uint8_t)   \
+     init_binary_k(bop, bop, u32, uint32_t, uint32_t)\
+-    init_binary_k(bop, bop, i64, int64_t, int64_t)
++    init_binary_k(bop, bop, i64, int64_t, int64_t)\
++    init_binary_k(bop, bop, i8, int8_t, int8_t)
+ #else
+ #define init_binary(bop)                                                       \
+     init_binary_k(bop, bop, f32, float, float)      \
+     init_binary_k(bop, bop, f16, half, half)        \
+     init_binary_k(bop, bop, u8, uint8_t, uint8_t)   \
+     init_binary_k(bop, bop, u32, uint32_t, uint32_t)\
+-    init_binary_k(bop, bop, i64, int64_t, int64_t)
++    init_binary_k(bop, bop, i64, int64_t, int64_t)\
++    init_binary_k(bop, bop, i8, int8_t, int8_t)
+ #endif
+ 
+ #if defined(__HAVE_BFLOAT__)
+@@ -154,14 +156,16 @@ template <
+     init_binary_k(op_name, binary_op, bf16, bfloat, bool)   \
+     init_binary_k(op_name, binary_op, u8, uint8_t, bool)    \
+     init_binary_k(op_name, binary_op, u32, uint32_t, bool)  \
+-    init_binary_k(op_name, binary_op, i64, int64_t, bool)
++    init_binary_k(op_name, binary_op, i64, int64_t, bool)   \
++    init_binary_k(op_name, binary_op, i8, int8_t, bool)
+ #else
+ #define init_boolean_binary(op_name, binary_op)             \
+     init_binary_k(op_name, binary_op, f32, float, bool)     \
+     init_binary_k(op_name, binary_op, f16, half, bool)      \
+     init_binary_k(op_name, binary_op, u8, uint8_t, bool)    \
+     init_binary_k(op_name, binary_op, u32, uint32_t, bool)  \
+-    init_binary_k(op_name, binary_op, i64, int64_t, bool)
++    init_binary_k(op_name, binary_op, i64, int64_t, bool)   \
++    init_binary_k(op_name, binary_op, i8, int8_t, bool)
+ #endif
+ 
+ // Define binary ops
+diff --git a/src/metal_src/cast.metal b/src/metal_src/cast.metal
+index 0cb6c25..aeb2b8c 100644
+--- a/src/metal_src/cast.metal
++++ b/src/metal_src/cast.metal
+@@ -83,14 +83,16 @@ template <typename T, typename U, typename IR = T>
+     init_cast(tname, t, bf16, bfloat)   \
+     init_cast(tname, t, i64, int64_t)   \
+     init_cast(tname, t, u32, uint32_t)  \
+-    init_cast(tname, t, u8, uint8_t)
++    init_cast(tname, t, u8, uint8_t)  \
++    init_cast(tname, t, i8, int8_t)
+ #else
+ #define init_cast_all(tname, t)         \
+     init_cast(tname, t, f32, float)     \
+     init_cast(tname, t, f16, half)      \
+     init_cast(tname, t, i64, int64_t)   \
+     init_cast(tname, t, u32, uint32_t)  \
+-    init_cast(tname, t, u8, uint8_t)
++    init_cast(tname, t, u8, uint8_t)  \
++    init_cast(tname, t, i8, int8_t)
+ #endif
+ 
+ 
+@@ -102,3 +104,4 @@ init_cast_all(bf16, bfloat);
+ init_cast_all(i64, int64_t);
+ init_cast_all(u32, uint32_t);
+ init_cast_all(u8, uint8_t);
++init_cast_all(i8, int8_t);
+diff --git a/src/metal_src/indexing.metal b/src/metal_src/indexing.metal
+index c0e16e7..cc003d5 100644
+--- a/src/metal_src/indexing.metal
++++ b/src/metal_src/indexing.metal
+@@ -284,6 +284,13 @@ INDEX_OP(is_u8_f16, uint8_t, half)
+ INDEX_OP(is_u8_bf16, uint8_t, bfloat)
+ #endif
+ 
++// int8 as the *value* type, one line per index dtype. `int8` is never an
++// index dtype: torch's index tensors are int64 (or bool/uint8 masks), and a
++// 7-bit positive range could not address anything worth indexing.
++INDEX_OP(is_i64_i8, int64_t, int8_t)
++INDEX_OP(is_u32_i8, uint32_t, int8_t)
++INDEX_OP(is_u8_i8, uint8_t, int8_t)
++
+ GATHER_OP(gather_u8_f32, uint8_t, float)
+ GATHER_OP(gather_u8_f16, uint8_t, half)
+ GATHER_OP(gather_i64_f32, int64_t, float)
+@@ -302,6 +309,9 @@ GATHER_OP(gather_u32_u32, uint, uint)
+ GATHER_OP(gather_u32_i64, uint, int64_t)
+ GATHER_OP(gather_i64_u32, int64_t, uint)
+ GATHER_OP(gather_i64_i64, int64_t, int64_t)
++GATHER_OP(gather_i64_i8, int64_t, int8_t)
++GATHER_OP(gather_u32_i8, uint, int8_t)
++GATHER_OP(gather_u8_i8, uint8_t, int8_t)
+ 
+ SCATTER_ADD_OP(sa_u32_f32, uint32_t, float)
+ SCATTER_ADD_OP(sa_u8_f32, uint8_t, float)
+@@ -315,6 +325,9 @@ SCATTER_ADD_OP(sa_u32_bf16, uint32_t, bfloat)
+ SCATTER_ADD_OP(sa_u8_bf16, uint8_t, bfloat)
+ SCATTER_ADD_OP(sa_i64_bf16, int64_t, bfloat)
+ #endif
++SCATTER_ADD_OP(sa_u32_i8, uint32_t, int8_t)
++SCATTER_ADD_OP(sa_u8_i8, uint8_t, int8_t)
++SCATTER_ADD_OP(sa_i64_i8, int64_t, int8_t)
+ 
+ SCATTER_OP(s_u32_f32, uint32_t, float)
+ SCATTER_OP(s_u8_f32, uint8_t, float)
+@@ -328,6 +341,9 @@ SCATTER_OP(s_u32_bf16, uint32_t, bfloat)
+ SCATTER_OP(s_u8_bf16, uint8_t, bfloat)
+ SCATTER_OP(s_i64_bf16, int64_t, bfloat)
+ #endif
++SCATTER_OP(s_u32_i8, uint32_t, int8_t)
++SCATTER_OP(s_u8_i8, uint8_t, int8_t)
++SCATTER_OP(s_i64_i8, int64_t, int8_t)
+ 
+ // i64
+ INDEX_ADD_OP(ia_i64_f16, int64_t, half)
+@@ -335,6 +351,7 @@ INDEX_ADD_OP(ia_i64_f32, int64_t, float)
+ INDEX_ADD_OP(ia_i64_i64, int64_t, int64_t)
+ INDEX_ADD_OP(ia_i64_u32, int64_t, uint32_t)
+ INDEX_ADD_OP(ia_i64_u8, int64_t, uint8_t)
++INDEX_ADD_OP(ia_i64_i8, int64_t, int8_t)
+ #if defined(__HAVE_BFLOAT__)
+ INDEX_ADD_OP(ia_i64_bf16, int64_t, bfloat)
+ #endif
+@@ -345,6 +362,7 @@ INDEX_ADD_OP(ia_u32_f32, uint32_t, float)
+ INDEX_ADD_OP(ia_u32_i64, uint32_t, int64_t)
+ INDEX_ADD_OP(ia_u32_u32, uint32_t, uint32_t)
+ INDEX_ADD_OP(ia_u32_u8, uint32_t, uint8_t)
++INDEX_ADD_OP(ia_u32_i8, uint32_t, int8_t)
+ #if defined(__HAVE_BFLOAT__)
+ INDEX_ADD_OP(ia_u32_bf16, uint32_t, bfloat)
+ #endif
+@@ -355,6 +373,7 @@ INDEX_ADD_OP(ia_u8_f32, uint8_t, float)
+ INDEX_ADD_OP(ia_u8_i64, uint8_t, int64_t)
+ INDEX_ADD_OP(ia_u8_u32, uint8_t, uint32_t)
+ INDEX_ADD_OP(ia_u8_u8, uint8_t, uint8_t)
++INDEX_ADD_OP(ia_u8_i8, uint8_t, int8_t)
+ #if defined(__HAVE_BFLOAT__)
+ INDEX_ADD_OP(ia_u8_bf16, uint8_t, bfloat)
+ #endif
+diff --git a/src/metal_src/mlx_sort.metal b/src/metal_src/mlx_sort.metal
+index 3194754..bc0178d 100644
+--- a/src/metal_src/mlx_sort.metal
++++ b/src/metal_src/mlx_sort.metal
+@@ -831,6 +831,7 @@ instantiate_block_sort_bn(bfloat16, bfloat16_t)
+   instantiate_block_sort_tn(itname, itype, 256)
+ 
+ instantiate_block_sort_long(int64, int64_t)
++instantiate_block_sort_bn(int8, int8_t)
+ 
+ #define instantiate_multi_block_sort(                                      \
+     vtname, vtype, itname, itype, arg_sort, bn, tn)                        \
+@@ -853,4 +854,5 @@ instantiate_multi_block_sort_base(bfloat16, bfloat16_t)
+ #define instantiate_multi_block_sort_long(vtname, vtype) \
+   instantiate_multi_block_sort(vtname, vtype, uint32, uint32_t, true, 256, 8)
+ 
+-instantiate_multi_block_sort_long(int64, int64_t) // clang-format on
++instantiate_multi_block_sort_long(int64, int64_t)
++instantiate_multi_block_sort_base(int8, int8_t) // clang-format on
+diff --git a/src/metal_src/sort.metal b/src/metal_src/sort.metal
+index d71ab82..78a195f 100644
+--- a/src/metal_src/sort.metal
++++ b/src/metal_src/sort.metal
+@@ -91,6 +91,7 @@ ARGSORT(uint32_t, u32)
+ 
+ #if __METAL_VERSION__ >= 220
+ ARGSORT(int64_t, i64)
++ARGSORT(int8_t, i8)
+ #endif
+ #if defined(__HAVE_BFLOAT__)
+ ARGSORT(bfloat, bf16)
+diff --git a/src/metal_src/ternary.metal b/src/metal_src/ternary.metal
+index b78cb4a..3fdabed 100644
+--- a/src/metal_src/ternary.metal
++++ b/src/metal_src/ternary.metal
+@@ -99,11 +99,13 @@ WHERE_OP(half, uint32_t, where_u32_f16)
+ WHERE_OP(float, uint32_t, where_u32_f32)
+ WHERE_OP(uint8_t, uint32_t, where_u32_u8)
+ WHERE_OP(uint32_t, uint32_t, where_u32_u32)
++WHERE_OP(int8_t, uint32_t, where_u32_i8)
+ 
+ WHERE_OP(half, uint8_t, where_u8_f16)
+ WHERE_OP(float, uint8_t, where_u8_f32)
+ WHERE_OP(uint8_t, uint8_t, where_u8_u8)
+ WHERE_OP(uint32_t, uint8_t, where_u8_u32)
++WHERE_OP(int8_t, uint8_t, where_u8_i8)
+ 
+ #if __METAL_VERSION__ >= 220
+ WHERE_OP(int64_t, uint8_t, where_u8_i64)
+@@ -114,6 +116,7 @@ WHERE_OP(float, int64_t, where_i64_f32)
+ WHERE_OP(uint8_t, int64_t, where_i64_u8)
+ WHERE_OP(uint32_t, int64_t, where_i64_u32)
+ WHERE_OP(int64_t, int64_t, where_i64_i64)
++WHERE_OP(int8_t, int64_t, where_i64_i8)
+ #if defined(__HAVE_BFLOAT__)
+ WHERE_OP(bfloat, int64_t, where_i64_bf16)
+ #endif
+diff --git a/src/metal_src/unary.metal b/src/metal_src/unary.metal
+index 11e7a9a..77cdb15 100644
+--- a/src/metal_src/unary.metal
++++ b/src/metal_src/unary.metal
+@@ -274,6 +274,10 @@ init_const_set(u32, uint32_t);
+ init_unary(copy, uid, i64, int64_t);
+ init_copy2d(i64, int64_t);
+ init_const_set(i64, int64_t);
++
++init_unary(copy, uid, i8, int8_t);
++init_copy2d(i8, int8_t);
++init_const_set(i8, int8_t);
+ #endif
+ 
+ init_copy2d(i32, int32_t);
+diff --git a/src/utils.rs b/src/utils.rs
+index b4cd96c..396f4a2 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -111,6 +111,7 @@ macro_rules! primitive {
+ }
+ primitive!(bool);
+ primitive!(usize);
++primitive!(i8);
+ primitive!(i32);
+ primitive!(i64);
+ primitive!(u8);
