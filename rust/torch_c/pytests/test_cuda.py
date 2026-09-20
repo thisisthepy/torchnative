@@ -289,26 +289,20 @@ def test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs():
               "file -- installed rather than in-tree. The equality above still "
               "held.)")
         return
-    bodies, text = parsed
-    ops = shim_helpers._aten_dispatch_targets(text)
+    _, text = parsed
     allowed = set(_C._shim_mps_readback_but_allowed())
-    # The cross-file half, and it is imported rather than re-implemented for
-    # the reason this test exists at all. When `aten.view.dtype` joined the
-    # list on 2026-09-19, this copy of the derivation still scanned `aten.rs`
-    # alone and reported the op as **stale** -- i.e. a second hand-written
-    # derivation had come to differ from the first, which is precisely the
-    # divergence the docstring above says a second list would cause. The fix
-    # is to share the predicate, not to copy the new clause.
-    cross_file = shim_helpers._cross_file_readback_helpers()
-    derived = set()
-    for op, fn in ops.items():
-        body = bodies.get(fn, "")
-        reads = bool(shim_helpers._MPS_READBACK_MARKERS.search(body)) or any(
-            re.search(r"\b" + helper + r"\s*\(", body)
-            for helper in shim_helpers._MPS_READBACK_HELPERS
-        ) or shim_helpers._reaches_cross_file_readback(body, cross_file)
-        if reads and op not in allowed:
-            derived.add(op)
+    # The predicate is imported rather than re-implemented, and that is the
+    # whole point of this test rather than a tidiness. When `aten.view.dtype`
+    # joined the list on 2026-09-19, this copy of the derivation still scanned
+    # `aten.rs` alone and reported the op as **stale** -- a second hand-written
+    # derivation had come to differ from the first, which is exactly the
+    # divergence the docstring above says a second list would cause. It
+    # happened a second time on 2026-09-20, when the derivation stopped
+    # following six helper names and started following the call graph
+    # (docs/devices/matrix.md §7.16): a copy here would have gone red with
+    # ten ops it could not see. Share the predicate, do not copy the clause.
+    witness = shim_helpers._ops_that_reach_the_host()
+    derived = {op for op in witness if op not in allowed}
     assert derived == set(cuda), (
         "the cuda refusal list is not what the kernels do: missing "
         + repr(sorted(derived - set(cuda))) + " stale "

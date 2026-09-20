@@ -700,7 +700,30 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
+/// **Ten of these were added on 2026-09-20 and none of them is a new defect**
+/// (docs/devices/matrix.md §7.16). They are kernels that have always read
+/// their operand to the host, and were invisible to the derivation because it
+/// followed six helper *names* one hop. Each reaches `read_flat` through an
+/// un-named hop in the same file, or through another operator's kernel; the
+/// hop chain is written beside each entry below, and
+/// `test_shim.py::_ops_that_reach_the_host` now follows the call graph
+/// instead of a name list, so the chain is re-derived on every gate run
+/// rather than trusted.
+///
+/// **What refusing them cost, named rather than glossed.** Twelve cells
+/// published AGREES in §6's `mps` columns are withdrawn and all twelve are
+/// integral. The float columns of those operators were **already** not
+/// running on mps -- `sort` on `float32`/`mps` raises `Metal contiguous
+/// to_dtype F32 F64 not implemented` from inside candle, measured, because
+/// `read_flat` widens to `f64` and Metal has no double. The two `norm` ops
+/// withdraw nothing: every one of their mps cells was already REFUSES or
+/// BREAKS.
+///
+/// The alternative considered and rejected was an "allowed but host-assisted"
+/// third category. It would create a state `_metal_counters()` cannot tell
+/// from a real fallback -- the instrument §7.14 was built on -- and
+/// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
+pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -719,6 +742,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.adaptive_avg_pool2d.default",
     "aten.allclose.default",
     "aten.argmax.default",
+    // §7.16: argsort_default -> argsort_core -> order_along -> read_flat
+    "aten.argsort.default",
+    // §7.16: argsort_stable -> argsort_core -> order_along -> read_flat
+    "aten.argsort.stable",
     "aten.avg_pool2d.default",
     "aten.bitwise_and.Scalar",
     "aten.bitwise_and.Tensor",
@@ -737,6 +764,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.erfinv.default",
     "aten.expm1.default",
     "aten.expm1_.default",
+    // §7.16: floor_divide_scalar -> floor_divide_impl -> read_flat
+    "aten.floor_divide.Scalar",
+    // §7.16: floor_divide_default -> floor_divide_impl -> read_flat
+    "aten.floor_divide.default",
     "aten.fmod.Scalar",
     "aten.fmod.Tensor",
     "aten.gather.default",
@@ -749,6 +780,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.index_put_.default",
     "aten.isin.Tensor_Tensor",
     "aten.linalg_qr.default",
+    // §7.16: linalg_vector_norm_default -> norm_pow_walk -> read_flat
+    "aten.linalg_vector_norm.default",
     "aten.log2.default",
     "aten.log2_.default",
     "aten.lstm.input",
@@ -767,6 +800,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.native_dropout.default",
     "aten.nll_loss_forward.default",
     "aten.nonzero.default",
+    // §7.16: norm_scalaropt_dim -> norm_pow_walk -> read_flat
+    "aten.norm.ScalarOpt_dim",
     "aten.one_hot.default",
     "aten.pow.Scalar",
     "aten.pow.Tensor_Tensor",
@@ -777,13 +812,21 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
     "aten.repeat_interleave.Tensor",
     "aten.scatter.src",
     "aten.scatter.value",
+    // §7.16: scatter_inplace -> scatter_src -> read_flat
+    "aten.scatter_.src",
+    // §7.16: scatter_inplace -> scatter_src -> read_flat
+    "aten.scatter_.value",
     "aten.scatter_reduce.two",
     "aten.softplus.default",
+    // §7.16: sort_default -> order_along -> read_flat
+    "aten.sort.default",
     "aten.std.correction",
     "aten.std.default",
     "aten.std.dim",
     "aten.stft.center",
     "aten.stft.default",
+    // §7.16: topk_default -> order_along -> read_flat
+    "aten.topk.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
     "aten.upsample_linear1d.default",
@@ -822,7 +865,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 89] = [
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the ninety above.
+/// reason each is different in kind from the ninety-nine above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
@@ -856,6 +899,53 @@ pub const MPS_READBACK_BUT_ALLOWED: [&str; 2] = [
     "aten._local_scalar_dense.default",
     "aten.uniform_.default",
 ];
+
+/// What a refused op still does, per op, so the refusal is a direction rather
+/// than a wall.
+///
+/// **This is measured, not asserted.** Each entry names the dtypes whose
+/// **CPU** column agrees with upstream element-wise, and
+/// `test_mpsrefuse.py` re-measures every one of them against an oracle
+/// computed in a separate subprocess -- so a note that drifts away from what
+/// the build does turns the gate red rather than misdirecting a user.
+///
+/// It covers the ten names the deepened derivation added
+/// (docs/devices/matrix.md §7.16) and no others. The other eighty-nine
+/// predate the note mechanism and carry the generic wording; extending the
+/// table is a measurement each time, which is why it was not done in bulk.
+///
+/// The second field is deliberately *not* "and the float column works on
+/// mps". For all ten it does not: `read_flat` widens to `f64` and Metal has
+/// no double, so `sort` on `float32`/`mps` raises from inside candle. Writing
+/// the comforting sentence would have been the §7.9 `clamp` mistake in prose.
+pub const MPS_HOST_READBACK_NOTES: [(&str, &str); 10] = [
+    ("aten.argsort.default", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.argsort.stable", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.floor_divide.Scalar", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.floor_divide.default", "float32, float16, bfloat16, float64, int64, int32, int8"),
+    ("aten.linalg_vector_norm.default", "float32, float16, bfloat16, float64"),
+    ("aten.norm.ScalarOpt_dim", "float32, float16, bfloat16, float64"),
+    ("aten.scatter_.src", "int64, int32"),
+    ("aten.scatter_.value", "int64, int32"),
+    ("aten.sort.default", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.topk.default", "float32, float16, bfloat16, float64, int64, int32, int8"),
+];
+
+/// The note for an op, or `None` when it has none.
+pub fn host_readback_note(op: &str) -> Option<&'static str> {
+    MPS_HOST_READBACK_NOTES
+        .iter()
+        .find(|(name, _)| *name == op)
+        .map(|(_, note)| *note)
+}
+
+/// The table, readable from Python for the same reason the list is: a test
+/// has to check the *artefact*, not the constant beside it.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_host_readback_notes")]
+fn shim_mps_host_readback_notes() -> Vec<(&'static str, &'static str)> {
+    MPS_HOST_READBACK_NOTES.to_vec()
+}
 
 /// Is this candle handle a Metal one?
 ///
@@ -912,12 +1002,24 @@ fn host_readback_gate(
     if !MPS_HOST_READBACK_OPS.contains(&op) {
         return Ok(());
     }
+    // The note, when there is one, is what turns a refusal into a direction.
+    // A user who hits `sort` on `int64`/`mps` should leave this message
+    // knowing where the op *does* agree with upstream, not only that it did
+    // not work here.
+    let note = match host_readback_note(op) {
+        Some(dtypes) => format!(
+            " On the CPU this op agrees with upstream element-wise for {dtypes}; \
+             no dtype of it computes on {device}, so .cpu() is the whole answer \
+             rather than a dtype change."
+        ),
+        None => String::new(),
+    };
     Err(not_implemented(format!(
         "{op}: not implemented for the {device} device. This kernel reads the tensor \
          back to host memory and computes there, so it would return a correct \
          value that the GPU did not compute, under {article} {device} label -- the shim \
          refuses that rather than doing it silently. Move the tensor with \
-         .cpu() to ask for the CPU on purpose. {} of the ops this build \
+         .cpu() to ask for the CPU on purpose.{note} {} of the ops this build \
          implements are refused on {device} for this reason; \
          torch._C.{lister}() lists them ({doc}).",
         MPS_HOST_READBACK_OPS.len(),
@@ -1764,6 +1866,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_host_readback_notes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_unsupported_int_dtypes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_host_readback_ops, m)?)?;

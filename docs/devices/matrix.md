@@ -456,8 +456,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.arange.start | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.arange.start_step | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.argmax.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.argsort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
-| aten.argsort.stable | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
+| aten.argsort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.argsort.stable | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.as_strided.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
 | aten.avg_pool2d.default | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.baddbmm.default | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
@@ -521,8 +521,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.flip.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
 | aten.floor.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | REFUSES |
 | aten.floor_.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | REFUSES |
-| aten.floor_divide.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
-| aten.floor_divide.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
+| aten.floor_divide.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.floor_divide.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.fmod.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.fmod.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.full.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -560,7 +560,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.lift_fresh.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.lift_fresh_copy.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.linalg_qr.default | AGREES | REFUSES | REFUSES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.linalg_vector_norm.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
+| aten.linalg_vector_norm.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.linspace.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.log.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.log2.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
@@ -610,7 +610,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.new_zeros.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.nll_loss_forward.default | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.nonzero.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.norm.ScalarOpt_dim | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
+| aten.norm.ScalarOpt_dim | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.normal_.default | REACHES | REACHES | REACHES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.one_hot.default | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.ones.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | BREAKS | BREAKS | AGREES |
@@ -651,8 +651,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.scalar_tensor.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.scatter.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.scatter.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.scatter_.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
-| aten.scatter_.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
+| aten.scatter_.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.scatter_.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.scatter_reduce.two | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.select.int | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.sigmoid.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -664,7 +664,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.sinc.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.slice.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.softplus.default | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.sort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
+| aten.sort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.split.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.split_with_sizes.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.sqrt.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -688,7 +688,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.t_.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.tanh.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.tanh_.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | AGREES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
-| aten.topk.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REACHES |
+| aten.topk.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.transpose.int | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.tril.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.triu.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -1299,16 +1299,20 @@ described the scan's blind spot as "**one file over**". That was too narrow and
 this corrects it: the blind spot is **one un-named hop**, in the same file.
 Twelve production cells sit in it.
 
-**It is not fixed here, and that is a decision rather than an omission.** The
-fix is two changes that have to land together — deepen the derivation, then add
-the eight names to `MPS_HOST_READBACK_OPS` — and its effect is to remove
-`sort`, `argsort`, `topk`, `floor_divide` and in-place `scatter` from `mps` for
-the integral dtypes, turning twelve published `AGREES` into `REFUSES`. That is
-a capability decision, CLAUDE.md §5.7 leaves it with the user, and an audit is
-not the round to take it in. `test_metalplace.py` pins all three halves of the
-finding instead — the download happens, the op is not refused, the scan does
-not derive it — so that fixing any one of them turns the suite red and forces
-this section and §6's table to move with it.
+**It was not fixed in the round that found it, and that was a decision rather
+than an omission** — a capability decision, which CLAUDE.md §5.7 leaves with
+the user, and an audit is not the round to take it in. `test_metalplace.py`
+pinned all three halves instead — the download happens, the op is not refused,
+the scan does not derive it — so that fixing any one of them would turn the
+suite red and force this section and §6's table to move with it.
+
+**§7.16 is that fix**, taken on the user's decision, and all three pins moved
+together as designed. The eight are refused by name, two more turned up in the
+same blind spot once the derivation was deepened, and the assertions in
+`test_metalplace.py` now run in the opposite direction. The table above and
+the counter deltas in it are kept as the **record of the measurement that
+found them**, not as a description of the current build: `sort` on
+`int64`/`mps` raises now and moves no counter at all.
 
 #### The claims that are now counted, and the bracket they were counted in
 
@@ -1415,7 +1419,7 @@ sweep to M-B.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_in_place_family_on_mps_computes_on_the_device present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_readback_derivation_scan_does_not_reach_these_kernels present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs softmax_on_device present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs twin_softmax absent -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
@@ -1471,3 +1475,198 @@ The Rust half is the ordinary enum widening: `DType` gains a variant,
 **Nothing was implemented and nothing was vendored for this section.** It is a
 reading of `candle-metal-kernels-0.11.0` as published, recorded so that §7.13's
 open decision is made against a measured shape rather than a guessed one.
+
+### 7.16 The twelve cells are withdrawn, and the derivation that missed them now follows calls
+
+§7.14 found twelve published `AGREES` cells computed on the host and left the
+capability decision with the user. The decision was taken: **refuse them.**
+
+#### Why refusal, and not a third category
+
+The values were never wrong. What was false is the **placement** — and on a
+device whose whole point is avoiding host round trips, an invisible sync point
+inside a `generate` loop is a performance cliff nobody can see. The obvious
+alternative was an "allowed but host-assisted" grade, and it was rejected for a
+reason that is about the instrument rather than about taste:
+`MPS_HOST_READBACK_OPS` already answers exactly this question for every other
+operator that reaches the host, and a third category would create a state
+`_C._metal_counters()` cannot distinguish from a real defect. That counter is
+the only instrument that has ever caught a host-computed twin (§7.12, and three
+Vulkan rounds before it). `MPS_READBACK_BUT_ALLOWED` is deliberately two names
+for the same reason.
+
+#### What it costs, named rather than glossed
+
+**All twelve withdrawn cells are integral dtypes.** The float columns of these
+operators were *already* not running on `mps`, and that is measured rather than
+assumed: `sort` on `float32`/`mps` raises
+
+    aten.sort.default: candle: Metal contiguous to_dtype F32 F64 not implemented
+
+from inside candle, because `read_flat` widens to `f64` and Metal has no
+double. So the refusal takes the integral columns and **re-labels** the float
+ones; it does not remove a working float path.
+
+| operator | withdrawn (`AGREES` → `REFUSES`) | re-labelled |
+|---|---|---|
+| `aten.sort.default` | `int64`, `bool` | 6 already-`REFUSES` cells |
+| `aten.argsort.default` | `int64`, `bool` | 6 |
+| `aten.argsort.stable` | `int64`, `bool` | 6 |
+| `aten.topk.default` | `int64` | 6, plus `bool` `REACHES` → `REFUSES` |
+| `aten.floor_divide.default` | `int64` | 7 |
+| `aten.floor_divide.Scalar` | `int64`, `bool` | 6 |
+| `aten.scatter_.src` | `int64` | 3 `BREAKS` + `bool` `BREAKS` + 3 `REFUSES` |
+| `aten.scatter_.value` | `int64` | the same shape |
+| `aten.linalg_vector_norm.default` | — | 3 `BREAKS` → `REFUSES`, 5 already `REFUSES` |
+| `aten.norm.ScalarOpt_dim` | — | the same shape |
+
+**27 cells in §6's table change; 12 of them are a capability withdrawal and
+15 are a re-labelling.** Counting them together would have made the
+withdrawal look twice its size, and counting only the withdrawal would have
+hidden that the document now says `REFUSES` where it said `BREAKS`.
+
+**Every refusal names what still works.** `device.rs::MPS_HOST_READBACK_NOTES`
+carries, per operator, the dtypes whose **CPU** column agrees with upstream,
+and the gate appends it:
+
+    aten.sort.default: not implemented for the mps device. This kernel reads
+    the tensor back to host memory and computes there, [...] Move the tensor
+    with .cpu() to ask for the CPU on purpose. On the CPU this op agrees with
+    upstream element-wise for float32, float16, bfloat16, float64, int64,
+    int32, int8, bool; no dtype of it computes on mps, so .cpu() is the whole
+    answer rather than a dtype change.
+
+The note does **not** say "the float column works on mps", because it does
+not. Writing the comforting sentence would have been §7.9's `clamp` in prose —
+a claim published because it sounded right, never re-run. Instead every dtype
+in every note is re-measured against an oracle in a **separate subprocess** by
+`test_mpsrefuse.py::test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu`,
+at `tools/golden/dtypes.py`'s derived tolerance.
+
+#### The half that matters: the derivation, not the list
+
+Adding names to a list fixes twelve cells once. What stops the class recurring
+is the derivation, and its blind spot had by then been mis-stated twice:
+
+| said | where | correct? |
+|---|---|---|
+| "one call deeper" | §7.5 | no |
+| "one *file* over" | §7.12 | no — §7.12's M2 happened to be one file over |
+| "an un-named hop **in the same file**" | §7.14 | yes, and twelve production cells were in it |
+
+`test_shim.py`'s derivation no longer matches names at all. It builds the call
+graph of **every `src/*.rs`**, seeds it with the functions whose own bodies
+hold a readback marker (`.to_vec[0-3]`, `.to_scalar`, `.to_cpu(`), and closes
+it transitively by reverse BFS. A dispatched operator is derived if any path
+from its kernel reaches a readback, and the derivation returns the **witness
+path**, so a failure prints how the kernel gets to the host rather than only
+that it does.
+
+    sort_default, topk_default        -> order_along        -> read_flat
+    argsort_default, argsort_stable   -> argsort_core       -> order_along -> read_flat
+    floor_divide_{default,scalar}     -> floor_divide_impl  -> read_flat
+    scatter_inplace                   -> scatter_src        -> read_flat
+    linalg_vector_norm_default,
+    norm_scalaropt_dim                -> norm_pow_walk      -> read_flat
+
+**It found ten, not eight.** `aten.linalg_vector_norm.default` and
+`aten.norm.ScalarOpt_dim` share `norm_pow_walk`, whose accumulate-in-`acc_t`
+reduction opens with an unconditional `read_flat` (§7.14 never looked at them
+because no counter was pointed there). They were **not** on the list of eight
+this round was given, which is the only interesting thing about them: the
+derivation produced two names nobody had handed it. Their cost is zero
+capability — every `mps` cell of both was already `REFUSES` or `BREAKS`.
+
+**The independence is proved mechanically, not by reading.** A derivation that
+works because somebody added the answer to a list is the same defect wearing a
+fix, so `test_mpsrefuse.py::test_the_derivation_finds_the_ten_without_being_told_their_names`
+stubs `_C._shim_mps_host_readback_ops()` to the empty list, re-runs the
+derivation, and asserts the result is unchanged and still contains all ten,
+each through a path of **more than one hop** ending at a function that really
+holds a marker.
+
+**The false-positive direction is guarded at the call site.** A previous round
+found that matching `to_le_bytes` by bare name flags a dozen clean kernels,
+because it is an inherent method on every Rust integer. Calls are matched as
+`name(` **not preceded by `.` or `:`** for a function defined in the same
+module, and as `(crate::)?module::name(` across modules; a method call is
+neither. `test_a_readback_behind_two_un_named_hops_is_still_derived` asserts
+both directions on **synthetic** sources rather than on the real tree, so it
+cannot be satisfied by an accident of what `aten.rs` contains today.
+
+`_MPS_READBACK_EXEMPT` names are **barriers** in the graph rather than nodes:
+`scalar_arg` reads a zero-dim tensor *argument*, `scale_by_alpha` and
+`narrow_roundtrip_f32` read constants they built themselves. A kernel calling
+one has moved no dispatched tensor, and deriving through it would have put
+clean ops on the list.
+
+`test_cuda.py` stopped keeping its own copy of the predicate and imports
+`_ops_that_reach_the_host`. Its docstring already recorded that a copy had
+diverged once (`aten.view.dtype`, 2026-09-19); it would have diverged a second
+time here, by ten names.
+
+#### Nullification
+
+Both mutants were built through `vendor/install_shim.sh` so they reached the
+**vendored** tree, run alone, and removed afterwards.
+
+| mutant | what it breaks | result |
+|---|---|---|
+| N-1: `_callees` returns `set()` — the transitive hop blinded, one-hop matching only | the derivation | `test_shim.py` derivation RED, `test_metalplace` RED, `test_mpsrefuse` RED — all ten stop being derived, i.e. straight back to §7.14 |
+| N-2: `aten.sort.default` removed from `MPS_HOST_READBACK_OPS`, readback left in place | the refusal, not the readback — the MPSATTN.md §3.1 defeat | `test_shim.py` derivation RED (`missing: ['aten.sort.default']`), `test_mpsrefuse` RED, `test_metalplace` RED |
+| N-3: a refusal note widened to advertise a dtype that does not work | the note, the only part of this a user reads | RED — but see below |
+
+**N-3 is the one worth reading, because its first form survived.** Adding
+`int8` to `scatter_.src`'s note left the whole suite green. So did adding
+`float32` — and §6 grades `scatter_.src`'s `float32_cpu` cell **BREAKS**. The
+subprocess oracle was not lying: at the one shape that test uses, `[2, 3]`
+with an `int64` index, the shim and upstream really do agree. §6's BREAKS
+comes from a different probe. **One shape cannot speak for a column**, which
+is §7.9's `clamp` in miniature and was rediscovered here rather than
+remembered.
+
+The fix is not a bigger oracle. It is that every dtype a note advertises is
+now also required to be graded `AGREES` in §6's CPU column for that operator,
+so the note has the whole matrix sweep behind it instead of one tensor. With
+that assertion in place both forms of N-3 go RED, and it was confirmed by
+running them separately — `linalg_vector_norm` at `int64` (which upstream
+itself refuses) and `scatter_.src` at `float32` (which §6 grades BREAKS).
+
+**Which tests survive which mutant, including the ones that survive both.**
+`test_a_readback_behind_two_un_named_hops_is_still_derived` dies to N-1 and
+survives N-2, correctly: it is a claim about the derivation, and N-2 does not
+touch it. `test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses` reads
+the document and the build's note table, and no counter, so it survives
+**both** N-1 and N-2 — it is a consistency check between written things and
+is labelled as one rather than counted as proof of placement. It is the only
+test that catches N-3. `test_no_newly_refused_op_answers_any_mps_dtype`
+survives N-1 (the list is still right) and dies to N-2.
+
+**One weakness carried forward rather than rediscovered.** §7.14 recorded that
+`host_downloads == 0` survives gutting the download counter, because a counter
+that never moves satisfies `== 0`. `test_eight_operators_answer_an_mps_dispatch_from_the_host`
+now asserts exactly that zero, so it inherits the weakness: its `== 0` half is
+meaningful only because `test_metalcount.py::test_a_readback_costs_exactly_the_tensors_bytes`
+runs in the same gate. Its other two halves — the refusal fires, and it is the
+readback gate's wording — do not depend on any counter.
+
+**A cell passing is not an operator being right** (§7.9's `clamp`). None of the
+above says these operators are correct on the CPU at every shape; it says the
+dtypes each note advertises agree with upstream at the shape measured, and the
+shape is `[2, 3]`.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_NOTES present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs host_readback_note present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _ops_that_reach_the_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _host_reaching_functions present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _callees present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_ten_newly_refused_ops_are_refused_and_the_message_says_what_works present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_no_newly_refused_op_answers_any_mps_dtype present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_derivation_finds_the_ten_without_being_told_their_names present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_a_readback_behind_two_un_named_hops_is_still_derived present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs norm_pow_walk present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs order_along present -->
+<!-- DOCWATCH: op-implemented aten.sort.default -->
+<!-- DOCWATCH: op-implemented aten.topk.default -->

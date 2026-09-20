@@ -25525,14 +25525,26 @@ def test_an_op_mps_cannot_run_refuses_and_names_the_op():
     a = d("aten._to_copy.default", _f32([3, 1, 2], [3]), device=mps)
 
     # An op this shim implements, that candle's Metal backend cannot run.
+    #
+    # **This used to be `aten.sort.default` and cannot be any more.** `sort`
+    # joined `MPS_HOST_READBACK_OPS` (docs/devices/matrix.md §7.16), so the
+    # shim's own gate now refuses it at the door with a `NotImplementedError`
+    # and candle is never reached -- which would make this test assert the
+    # wrong refusal. `cumsum` is the replacement and it is the same shape:
+    # implemented here, dispatched through to candle, and bounced by Metal's
+    # missing `F32 -> F64` because the kernel accumulates in double.
     try:
-        d("aten.sort.default", a)
+        d("aten.cumsum.default", a, 0)
     except RuntimeError as e:
         message = str(e)
-        assert "aten.sort.default" in message, message
+        assert "aten.cumsum.default" in message, message
         assert "Metal" in message, message
     else:
-        raise AssertionError("aten.sort.default must not silently run elsewhere")
+        raise AssertionError("aten.cumsum.default must not silently run elsewhere")
+    # And it really is candle refusing, not this crate's readback gate wearing
+    # a different exception -- without this the substitution above could be
+    # satisfied by any op that happens to raise.
+    assert "aten.cumsum.default" not in set(_C._shim_mps_host_readback_ops())
 
     # An op nothing implements, for the control: same shape of refusal, so the
     # one above is not merely the generic path in disguise.
@@ -25588,10 +25600,15 @@ def test_mps_is_refused_by_name_where_it_is_not_compiled_in():
 
 _MPS_READBACK_MARKERS = re.compile(r"\.to_vec[0-3]|\.to_scalar|\.to_cpu\(")
 
-# The six helpers that move a dispatched tensor's bytes to the host. An op that
-# calls one of these computes on the CPU even though its own body is clean --
-# `aten._softmax.default` is the one worth naming, since a model on `mps` goes
-# through it on every attention block.
+# Six helpers that move a dispatched tensor's bytes to the host.
+#
+# **This is no longer what the derivation follows** -- it follows the call
+# graph (`_ops_that_reach_the_host`), because a fixed set of names could only
+# ever see the hops somebody had already thought of, and twelve published
+# cells were sitting in the ones nobody had. It is kept because
+# `test_mpsattn.py` and `test_mpsfwd.py` use it as a *named* spot-check on the
+# four kernels they moved onto the device: a readback reappearing in one of
+# those by any of these six names is worth a message that says which name.
 _MPS_READBACK_HELPERS = (
     "read_flat",
     "side_from_tensor",
@@ -25631,7 +25648,17 @@ def _rs_functions(path):
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as handle:
-        text = handle.read()
+        return _rs_functions_from_text(handle.read())
+
+
+def _rs_functions_from_text(text):
+    """The same split, from a string rather than a path.
+
+    Factored out so the derivation can be exercised on *synthetic* sources
+    (`test_mpsrefuse.py`). A blind-spot test that can only run against the
+    real `aten.rs` is satisfied by whatever that file happens to contain
+    today, which is the accident the blind spot kept hiding in.
+    """
     # Line comments are stripped first. This file is unusually comment-heavy
     # and several comments quote `to_vec1` while explaining why a kernel does
     # *not* call it -- counting those would put clean ops on the list.
@@ -25728,6 +25755,142 @@ def _reaches_cross_file_readback(body, helpers):
     return False
 
 
+# --- the derivation, deepened: follow calls, do not match a fixed set of names -----
+#
+# **Why this is not six names any more.** `_MPS_READBACK_HELPERS` above is the
+# set the derivation used to follow, one hop, by name. Twelve production cells
+# sat in what that could not see, and the blind spot has now been mis-stated
+# twice: §7.5 of docs/devices/matrix.md called it "one call deeper" and §7.12
+# corrected it to "one *file* over". Both were too narrow. `sort`, `argsort`,
+# `topk` and `floor_divide` reach `read_flat` through an in-file helper that is
+# simply not one of the six (`order_along`, `argsort_core`,
+# `floor_divide_impl`), and `scatter_.src`/`scatter_.value` reach it through
+# another operator's kernel function. **Same file, un-named hop.**
+#
+# So the derivation below does not match names at all. It builds the call graph
+# of every `src/*.rs`, seeds it with the functions whose own bodies hold a
+# readback marker, and closes it transitively. A kernel is derived if *any*
+# path from it reaches a readback. Adding a helper no longer requires adding
+# its name anywhere, which is the property the six-name version lacked.
+#
+# Two directions of error are guarded, and the false-positive one is the older
+# lesson: matching `to_le_bytes` by bare name flags a dozen clean kernels,
+# because it is an inherent method on every Rust integer. Calls are therefore
+# matched as `name(` **not preceded by `.` or `:`** for a function defined in
+# the same module, and as `(crate::)?module::name(` across modules. A method
+# call cannot be mistaken for either.
+
+_CALL_IN_MODULE = re.compile(r"(?<![.:\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CALL_QUALIFIED = re.compile(
+    r"(?:crate\s*::\s*)?([a-z_][a-z0-9_]*)\s*::\s*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+
+_RS_MODULES_CACHE = {}
+
+
+def _all_rs_modules():
+    """`{module: ({function: body}, text)}` for every `*.rs` in `src/`.
+
+    `None` when the tree is not beside this file (an installed wheel), which
+    is the same condition `_aten_rs_functions` skips on.
+    """
+    src = _src_dir()
+    if not os.path.isdir(src):
+        return None
+    key = os.path.abspath(src)
+    if key not in _RS_MODULES_CACHE:
+        mods = {}
+        for name in sorted(os.listdir(src)):
+            if not name.endswith(".rs"):
+                continue
+            parsed = _rs_functions(os.path.join(src, name))
+            if parsed is not None:
+                mods[name[:-3]] = parsed
+        _RS_MODULES_CACHE[key] = mods
+    return _RS_MODULES_CACHE[key]
+
+
+def _callees(mods, module, body):
+    """`{(module, function)}` this body calls, by definition site.
+
+    Only names that are *defined* somewhere in `src/` count, so the regex's
+    generosity costs nothing: `format!(`-adjacent noise and candle's own
+    methods have no definition here and drop out.
+
+    `_MPS_READBACK_EXEMPT` names are barriers rather than nodes. They hold a
+    marker for a reason that is written down beside them (a constant the
+    function built itself, a zero-dim scalar argument, a `#[cfg(test)]`
+    proof), so a kernel calling one has not moved a dispatched tensor to the
+    host and must not be derived through it.
+    """
+    out = set()
+    own = mods[module][0]
+    for name in _CALL_IN_MODULE.findall(body):
+        if name in own and name not in _MPS_READBACK_EXEMPT:
+            out.add((module, name))
+    for other, name in _CALL_QUALIFIED.findall(body):
+        if other in mods and other != module and name in mods[other][0] \
+                and name not in _MPS_READBACK_EXEMPT:
+            out.add((other, name))
+    return out
+
+
+def _host_reaching_functions():
+    """`{(module, function): [hop, ...]}` -- every function that reaches a readback.
+
+    The value is a shortest witness path from the function to the body that
+    actually holds the marker, so a failure can print *how* a kernel reaches
+    the host instead of only that it does. A derivation nobody can read the
+    output of gets silenced rather than fixed.
+    """
+    mods = _all_rs_modules()
+    if mods is None:
+        return None
+    graph, direct = {}, set()
+    for module, (bodies, _) in mods.items():
+        for fn, body in bodies.items():
+            node = (module, fn)
+            graph[node] = _callees(mods, module, body)
+            if fn not in _MPS_READBACK_EXEMPT and _MPS_READBACK_MARKERS.search(body):
+                direct.add(node)
+    # Reverse edges once, then a multi-source BFS outward from the functions
+    # that hold a marker. Linear in the graph rather than a fixed-point sweep
+    # over it, which matters: `aten.rs` alone is 33k lines.
+    callers = {}
+    for node, callees in graph.items():
+        for callee in callees:
+            callers.setdefault(callee, set()).add(node)
+    paths = {node: [node] for node in direct}
+    frontier = list(direct)
+    while frontier:
+        nxt = []
+        for node in frontier:
+            for caller in callers.get(node, ()):
+                if caller not in paths and caller[1] not in _MPS_READBACK_EXEMPT:
+                    paths[caller] = [caller] + paths[node]
+                    nxt.append(caller)
+        frontier = nxt
+    return paths
+
+
+def _ops_that_reach_the_host():
+    """`{op key: witness path}` for every dispatched op that reaches a readback.
+
+    This is the derivation the refusal list is compared against. `None` when
+    the tree is absent.
+    """
+    parsed = _aten_rs_functions()
+    reaching = _host_reaching_functions()
+    if parsed is None or reaching is None:
+        return None
+    _, text = parsed
+    derived = {}
+    for op, fn in _aten_dispatch_targets(text).items():
+        path = reaching.get(("aten", fn))
+        if path is not None:
+            derived[op] = path
+    return derived
+
 def _aten_dispatch_targets(text):
     """`{op key: kernel function}` read off `aten_dispatch_inner`'s match."""
     start = text.find("fn aten_dispatch_inner")
@@ -25772,26 +25935,29 @@ def test_the_mps_readback_list_is_what_the_kernels_actually_do():
     assert len(ops) > 200, len(ops)
 
     allowed = set(_C._shim_mps_readback_but_allowed())
-    # The cross-file half. Six in-file helper names could not see
-    # `crate::tensor::to_le_bytes`, and `aten.view.dtype` sat in that blind
-    # spot answering `mps` dispatches from the host.
-    cross_file = _cross_file_readback_helpers()
-    derived = set()
-    for op, fn in ops.items():
-        body = bodies.get(fn, "")
-        reads = bool(_MPS_READBACK_MARKERS.search(body)) or any(
-            re.search(r"\b" + helper + r"\s*\(", body)
-            for helper in _MPS_READBACK_HELPERS
-        ) or _reaches_cross_file_readback(body, cross_file)
-        if reads and op not in allowed:
-            derived.add(op)
+    # **The derivation follows calls, transitively, across every `src/*.rs`.**
+    # It used to follow six helper names one hop inside `aten.rs` plus a
+    # derived set of cross-file helpers, and twelve production cells sat in
+    # what that could not see -- an un-named hop in the *same* file
+    # (`order_along`, `argsort_core`, `floor_divide_impl`) or another
+    # operator's kernel (`scatter_inplace` -> `scatter_src`). See
+    # `_ops_that_reach_the_host` and docs/devices/matrix.md §7.16.
+    witness = _ops_that_reach_the_host()
+    assert witness is not None
+    derived = {op for op in witness if op not in allowed}
 
     declared = set(_C._shim_mps_host_readback_ops())
     missing = sorted(derived - declared)
     stale = sorted(declared - derived)
     assert not missing, (
         "these ops read an mps tensor back to the host and are NOT refused -- "
-        "add them to MPS_HOST_READBACK_OPS in device.rs: " + repr(missing)
+        "add them to MPS_HOST_READBACK_OPS in device.rs: "
+        + repr(missing)
+        + "\nthe hop chain for each, so the fix is not a guess:\n  "
+        + "\n  ".join(
+            "%s: %s" % (op, " -> ".join("%s::%s" % h for h in witness[op]))
+            for op in missing
+        )
     )
     assert not stale, (
         "these ops are refused on mps but no longer read back -- remove them "

@@ -77,20 +77,29 @@ _ALL_DTYPES = ("float32", "float16", "bfloat16", "int64")
 
 
 # ---------------------------------------------------------------------------
-# §7.14's finding, as data.
+# §7.14's finding, as data -- and §7.16's fix, which is why the assertions
+# below run in the opposite direction from the round that wrote them.
 #
-# Eight operators answer an `mps` dispatch by moving the operand to the host,
-# computing there and uploading the answer. Twelve of their cells are
-# published AGREES in §6's table. None of them is in
-# `MPS_HOST_READBACK_OPS`, because the derivation scan in `test_shim.py`
-# follows exactly six helper names and each of these kernels reaches the host
-# through a seventh (`order_along`, `argsort_core`, `floor_divide_impl`) or
-# through another *operator's* kernel function (`scatter_inplace` calls
-# `scatter_src`/`scatter_value`, which call `read_flat`).
+# Eight operators answered an `mps` dispatch by moving the operand to the
+# host, computing there and uploading the answer. Twelve of their cells were
+# published AGREES in §6's table. None of them was in
+# `MPS_HOST_READBACK_OPS`, because the derivation followed exactly six helper
+# names and each reached the host through a seventh (`order_along`,
+# `argsort_core`, `floor_divide_impl`) or through another *operator's* kernel
+# function (`scatter_inplace` calls `scatter_src`/`scatter_value`).
 #
-# Kept as data, and asserted in both directions: the set may not grow without
-# a visible edit here, and an operator that stops reading back fails too --
-# because that is a claim in `matrix.md` that has to change with it.
+# **All eight are now refused** (§7.16), together with two more the deepened
+# derivation found on its own (`linalg_vector_norm.default`,
+# `norm.ScalarOpt_dim`, through `norm_pow_walk`). So what this file pins is no
+# longer "they read back and nothing stops them" but "they are refused, and
+# the refusal is why the counter no longer sees the download". The set is
+# still data, still grown only by a visible edit, and still asserted in both
+# directions -- a name silently leaving the refusal list while its readback
+# stays is the docs/devices/MPSATTN.md §3.1 defeat and fails here.
+#
+# `test_mpsrefuse.py` owns the refusal itself and the note it carries. This
+# file keeps the counter half: with the gate in place there is no dispatch to
+# count, so the assertion is that the dispatch does not happen.
 # ---------------------------------------------------------------------------
 _HOST_COMPUTED_ON_MPS = {
     "aten.argsort.default": ("int64", "bool"),
@@ -103,9 +112,13 @@ _HOST_COMPUTED_ON_MPS = {
     "aten.topk.default": ("int64",),
 }
 
-# `.item()` is the one readback that *is* what the caller asked for, and
-# `uniform_` reads back a constant it built itself. Both are named exemptions
-# in `device.rs::MPS_READBACK_BUT_ALLOWED` and neither is a defect.
+# The two the deepened derivation added that §7.14 had not named. They are
+# kept separate from the eight on purpose: the eight were found by a counter
+# on a running device, these two by following calls in the source, and
+# conflating the two kinds of evidence is how a number gets quoted into
+# something it never measured (CLAUDE.md §2).
+_DERIVED_AS_WELL = ("aten.linalg_vector_norm.default", "aten.norm.ScalarOpt_dim")
+
 _EXEMPT = ("aten._local_scalar_dense.default", "aten.uniform_.default")
 
 
@@ -424,12 +437,15 @@ def test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back():
     operators here would make this file about agreement instead of about where
     the work happened. Stated rather than blurred, per CLAUDE.md §4.
 
-    Every operator that reaches must have `host_downloads == 0`, with two
-    named exceptions that are the finding of §7.14 and not an allowance:
-    `scatter_.src` and `scatter_.value` do read back, are **not** in
-    `MPS_HOST_READBACK_OPS`, and their `int64_mps` cells are published AGREES.
-    They are asserted to still do it, so that fixing them turns this test red
-    and forces §7.14 and §6's table to move with the fix.
+    Every operator that reaches must have `host_downloads == 0`, and there is
+    **no longer an exception**. `scatter_.src` and `scatter_.value` were the
+    two §7.14 named -- they read back, were not refused, and their
+    `int64_mps` cells were published AGREES. §7.16 refuses them, so the
+    assertion flipped: they must not reach at all, and they must be stopped
+    by the host-readback gate specifically rather than by some earlier error
+    that happens to raise first. A gate deleted and a gate that stopped
+    firing produce different failures here, which is the point of checking
+    the wording as well as the refusal.
     """
     mps = _mps_or_skip("the 43-operator placement sweep")
     if mps is None:
@@ -449,7 +465,7 @@ def test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back():
             try:
                 _C._aten_dispatch(op, t, *args, **kwargs)
             except (NotImplementedError, RuntimeError, TypeError) as e:
-                refused.append("%s %s: %s" % (op, dtype, str(e).splitlines()[0][:90]))
+                refused.append("%s %s: %s" % (op, dtype, str(e).splitlines()[0][:240]))
                 continue
             d = _delta(before, _counters())
             reached.append((op, dtype))
@@ -468,13 +484,22 @@ def test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back():
         + "\n  ".join("%s %s: %r" % x for x in unexpected))
 
     still_broken = {op for op, _, _ in downloaded if op in _HOST_COMPUTED_ON_MPS}
-    expected = {op for op in _HOST_COMPUTED_ON_MPS if op.split(".")[1].endswith("_")}
-    assert still_broken == expected, (
-        "docs/devices/matrix.md §7.14 says these in-place operators answer an "
-        "mps dispatch from the host: %s. The counter now says %s. If they were "
-        "fixed, §7.14 and §6's table have to change with them; if a new one "
-        "appeared, that is a regression."
-        % (sorted(expected), sorted(still_broken)))
+    assert not still_broken, (
+        "%s reached on mps and downloaded. §7.16 refuses them by name, so "
+        "reaching at all means the gate stopped firing -- the readback is "
+        "still in the kernel." % sorted(still_broken))
+
+    # The other half of the same claim, and the one that fails if the gate
+    # were deleted rather than merely stopped firing: the two in-place
+    # operators §7.14 named must be *refused*, by the readback gate and not by
+    # some other error that happens to be raised first.
+    held = [line for line in refused
+            if line.startswith(("aten.scatter_.src ", "aten.scatter_.value "))
+            and "reads the tensor back to host memory" in line]
+    assert len(held) >= 2, (
+        "scatter_.src/.value are meant to be held by the host-readback gate "
+        "on mps (§7.16). What the sweep saw instead:\n  "
+        + "\n  ".join(line for line in refused if "scatter_" in line))
 
 
 # ---------------------------------------------------------------------------
@@ -492,36 +517,33 @@ _PROBES = {
 
 
 def test_eight_operators_answer_an_mps_dispatch_from_the_host():
-    """§7.14's finding, pinned by the instrument that found it.
+    """§7.14's finding, now pinned from the other side: the door is shut.
 
-    Twelve cells published AGREES in §6's `mps` columns are computed on the
-    CPU: the operand is downloaded, a scalar loop runs on the host, and the
-    answer is uploaded again. The values are right -- that is the failure mode
-    §7.12 planted deliberately and could only catch with a counter -- and the
-    `.device` label is right, because the answer is rebuilt on the device it
-    came from.
+    Twelve cells published AGREES in §6's `mps` columns were computed on the
+    CPU -- the operand downloaded, a scalar loop run on the host, the answer
+    uploaded back. The values were right, which is why every agreement test
+    stayed green, and `.device` still read `mps`. That is precisely the
+    failure §7.12 had to plant deliberately in order to observe, and it was
+    already here.
 
-    **Why the source scan did not catch them.** `test_shim.py`'s derivation
-    follows six helper names inside `aten.rs` plus a derived set of cross-file
-    helpers. §7.12 described its blind spot as "one file over". That was too
-    narrow: these six operators reach `read_flat` through an *in-file* helper
-    that is not one of the six (`order_along`, `argsort_core`,
-    `floor_divide_impl`), and `scatter_.src`/`scatter_.value` reach it through
-    another operator's kernel function. Both are in the same file as the
-    kernel. The scan is one hop deep by name, not one file deep.
+    **§7.16 refuses all eight**, so the assertion this test used to make --
+    "the counter sees a download" -- is now unreachable: there is no dispatch
+    to count. What replaces it is the thing that must stay true for the fix to
+    mean anything, and it is asserted in three parts so that undoing any one
+    of them reddens:
 
-    This test asserts all three halves of the finding, so that fixing any of
-    them turns it red:
+      1. every one of the eight is in `MPS_HOST_READBACK_OPS`;
+      2. dispatching it on `mps` raises, with the *readback gate's* wording --
+         not some other error raised earlier, which would make the gate
+         removable without this failing;
+      3. the counters do not move. A gate that refused after downloading
+         would satisfy (2) and still have paid the round trip.
 
-      1. the counter sees a host download for each operator on `mps`;
-      2. none of them is in `MPS_HOST_READBACK_OPS`, so nothing refuses them;
-      3. the derivation scan does not derive them either, so the gate that
-         exists to catch exactly this is not catching it.
-
-    It is a *pin*, not an allowance. The fix is a decision about capability --
-    refusing them removes `sort`, `topk`, `argsort` and `floor_divide` from
-    `mps` for the integral dtypes -- and CLAUDE.md §5.7 leaves that with the
-    user rather than taking it inside an audit.
+    (3) is the one that survives having the refusal list gutted and is stated
+    plainly as the weak half: `host_downloads == 0` is satisfied by a counter
+    that can never move, which is what M-B proved. It is meaningful only
+    because `test_metalcount.py::
+    test_a_readback_costs_exactly_the_tensors_bytes` runs in the same gate.
     """
     mps = _mps_or_skip("the host-computed mps operators")
     if mps is None:
@@ -534,9 +556,12 @@ def test_eight_operators_answer_an_mps_dispatch_from_the_host():
 
     seen = {}
     for op, dtypes in sorted(_HOST_COMPUTED_ON_MPS.items()):
-        assert op not in refused_by_name, (
-            "%s is now refused on mps by name. That is the fix §7.14 leaves to "
-            "the user -- update §7.14 and §6's table, then remove it here." % op)
+        assert op in refused_by_name, (
+            "%s is not refused on mps by name any more. Its kernel still "
+            "reaches `read_flat` through an un-named hop, so taking the name "
+            "off the list without removing the readback is the "
+            "docs/devices/MPSATTN.md §3.1 defeat -- the op would go straight "
+            "back to answering an mps dispatch from the host." % op)
         dtype = dtypes[0]
         if op in _PROBES:
             args, kwargs = _PROBES[op](T, dtype)
@@ -544,65 +569,85 @@ def test_eight_operators_answer_an_mps_dispatch_from_the_host():
             args, kwargs = _inplace_args(op, dtype, mps)
         t = T(_VALUES, dtype)
         before = _counters()
-        _C._aten_dispatch(op, t, *args, **kwargs)
+        try:
+            _C._aten_dispatch(op, t, *args, **kwargs)
+        except NotImplementedError as e:
+            assert "reads the tensor back to host memory" in str(e), (
+                "%s was refused on mps, but not by the host-readback gate: %s"
+                % (op, str(e).splitlines()[0]))
+        else:
+            raise AssertionError(
+                "%s %s answered on mps. §7.16 refuses it because it computes "
+                "on the host; §6's table publishes REFUSES for every one of "
+                "its mps cells." % (op, dtype))
         d = _delta(before, _counters())
         seen[op] = d
-        assert d["host_downloads"] >= 1 and d["host_download_bytes"] > 0, (
-            "%s %s on mps no longer reads back (%r). If it was moved onto the "
-            "device that is good news and §7.14 plus §6's table have to say "
-            "so -- this assertion is the thing that makes you update them."
-            % (op, dtype, d))
+        assert d["host_downloads"] == 0 and d["host_download_bytes"] == 0, (
+            "%s %s was refused on mps but the operand had already been "
+            "downloaded (%r) -- the gate is firing after the round trip it "
+            "exists to prevent." % (op, dtype, d))
 
     assert len(seen) == len(_HOST_COMPUTED_ON_MPS) == 8, sorted(seen)
 
+    # And the two the *source* derivation added on its own are on the list
+    # too. They are asserted here rather than in the loop because no counter
+    # evidence was ever taken for them: the claim is "derived and refused",
+    # and saying so is what keeps the two kinds of evidence apart.
+    for op in _DERIVED_AS_WELL:
+        assert op in refused_by_name, (
+            "%s reaches read_flat through norm_pow_walk and is meant to be "
+            "refused on mps (§7.16)." % op)
 
-def test_the_readback_derivation_scan_does_not_reach_these_kernels():
-    """Half 3 of §7.14, and the reason it is a defect in the *instrument*.
+
+def test_the_readback_derivation_scan_reaches_these_kernels():
+    """Half 3 of §7.14, inverted by §7.16 -- the instrument was the defect.
 
     A counter finding that a kernel reads back is only half a finding; the
-    other half is that the gate built to refuse such kernels did not see it.
-    This re-runs `test_shim.py`'s own derivation -- the same functions, not a
-    restatement -- and asserts the eight operators are absent from the derived
-    set. They read back; the scan says they do not.
+    other half was that the gate built to refuse such kernels could not see
+    it. §7.14 pinned the blind spot so that closing it would redden. This is
+    that test after the fix, and it asserts the opposite: the derivation --
+    `test_shim.py`'s own, imported rather than restated -- **does** reach all
+    ten, and reaches each through a path of more than one hop, because a
+    one-hop path would mean the kernel changed rather than the scan.
 
-    When someone deepens the scan, this goes red, which is correct: the
-    derived set will then contain them and `test_shim.py` will demand they be
-    added to `MPS_HOST_READBACK_OPS`. The two tests fail together and get
-    fixed together.
+    Keeping the assertion here rather than deleting the test is deliberate.
+    The blind spot has been mis-stated twice (§7.5 "one call deeper", §7.12
+    "one file over") and both times the correction came from something
+    failing. A test that says "the scan reaches through N hops" is the thing
+    that fails if somebody re-flattens it.
     """
-    parsed = test_shim._aten_rs_functions()
-    if parsed is None:
-        _skip.skip("   (skipped the derivation blind spot: aten.rs is not "
-                   "beside this file -- installed rather than in-tree)")
+    witness = test_shim._ops_that_reach_the_host()
+    if witness is None:
+        _skip.skip("   (skipped the derivation depth check: rust/torch_c/src "
+                   "is not beside this file -- installed rather than in-tree)")
         return
-    bodies, text = parsed
-    ops = test_shim._aten_dispatch_targets(text)
-    cross_file = test_shim._cross_file_readback_helpers()
 
-    derived = set()
-    for op, fn in ops.items():
-        body = bodies.get(fn, "")
-        import re as _re
-        reads = bool(test_shim._MPS_READBACK_MARKERS.search(body)) or any(
-            _re.search(r"\b" + helper + r"\s*\(", body)
-            for helper in test_shim._MPS_READBACK_HELPERS
-        ) or test_shim._reaches_cross_file_readback(body, cross_file)
-        if reads:
-            derived.add(op)
+    expected = sorted(set(_HOST_COMPUTED_ON_MPS) | set(_DERIVED_AS_WELL))
+    missed = [op for op in expected if op not in witness]
+    assert not missed, (
+        "the derivation no longer reaches %r, which the counter measured "
+        "reading back. That is the §7.14 blind spot reopening: these kernels "
+        "reach `read_flat` through an in-file helper that is not one of the "
+        "six names (`order_along`, `argsort_core`, `floor_divide_impl`, "
+        "`norm_pow_walk`) or through another operator's kernel "
+        "(`scatter_inplace` -> `scatter_src`)." % (missed,))
 
-    caught = sorted(set(_HOST_COMPUTED_ON_MPS) & derived)
-    assert not caught, (
-        "the derivation scan now derives %r, which the counter has been "
-        "saying reads back all along. Good -- but test_shim.py will now "
-        "require them in MPS_HOST_READBACK_OPS, and docs/devices/matrix.md "
-        "§7.14 and §6's table describe them as unrefused. Update all three."
-        % (caught,))
+    shallow = {op: witness[op] for op in expected if len(witness[op]) < 3}
+    assert not shallow, (
+        "these are derived in fewer than two hops: %r. Either the kernel was "
+        "rewritten -- in which case §7.16's account of *why* the scan missed "
+        "them is now wrong and has to be corrected -- or the derivation is "
+        "matching something other than a call." % shallow)
 
-    # And the scan is not simply empty: it still derives the kernels it was
-    # built for. Without this the assertion above passes on a gutted scan.
-    assert "aten.expm1.default" in derived and len(derived) > 40, (
-        "the derivation scan derived %d ops -- it has stopped working, which "
-        "makes the assertion above meaningless" % len(derived))
+    # And the derivation is not simply everything: without this, an
+    # `_ops_that_reach_the_host` that returned every dispatched op would
+    # satisfy every assertion above.
+    _, text = test_shim._aten_rs_functions()
+    total = len(test_shim._aten_dispatch_targets(text))
+    assert "aten.expm1.default" in witness and 40 < len(witness) < total * 0.6, (
+        "the derivation reached %d of %d dispatched ops -- it has stopped "
+        "discriminating, which makes the assertions above meaningless"
+        % (len(witness), total))
 
 
 def _main():
