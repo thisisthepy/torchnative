@@ -361,6 +361,12 @@ larger one is a gate placement question rather than a kernel.
     1 float64-cast gate placement (B, 117 cells), 6 matmul ops (C),
     9 factories (D), 1 cell (F).
 
+**C and D were re-derived on 2026-09-20 and neither line above survived it.**
+See §4.3b. The counts reproduce exactly — 27/6 and 25/9, both stage `op` — but
+"6 matmul ops" and "9 factories" are both wrong about what the work *is*, in
+the same way cause A was: the clustering is by message text, and a single
+underlying door wearing several operator names reads as several doors.
+
 **What this clustering cannot see.** It groups by the *text* of the message, so
 two different causes that happen to raise the same candle sentence are merged,
 and one cause whose wording differs between call sites is split. It also
@@ -368,6 +374,133 @@ inherits every limit §5 states about the sweep — one shape per operator, and 
 cell that refuses for the first reason it meets hides any second reason behind
 it. Cause A hides the most: 284 operators have never been asked the question at
 all on that cell.
+
+### 4.3b C and D re-derived: 52 cells, and neither is what it was filed as
+
+Scoped 2026-09-20 from the same `/tmp/matrix_pub.json` §4.3a used, re-read
+rather than re-run. **The arithmetic reproduces exactly**: C is 27 cells over
+6 operator names, D is 25 over 9, and every one of the 52 is stage `op` — so,
+unlike cause A, these really did reach a kernel. What does not survive is the
+description.
+
+#### D is one helper that nine operators never adopted
+
+Every one of the 25 cells says `unsupported const-set f64` — and **the cell's
+own dtype is `float32`, `float16` or `bfloat16` in all 25.** The shim was
+asking Metal to materialise a *double* it had no reason to want. That is not
+"candle cannot const-set the dtype"; candle const-sets all three of those
+dtypes perfectly well.
+
+The door was already open in this repository. `aten.rs::host_const` builds the
+constant on the host and moves it, landed for `mul.Scalar` inside a rotary
+embedding (docs/devices/MPSFWD.md §2), and its docstring already carries the
+whole argument. Nine operators simply still called `Tensor::full(v, shape,
+device)`. `host_full` is `host_const` with a shape, and adopting it closes all
+25 cells — **no kernel, and nothing in `vendor/candle-core` touched.**
+
+The trap in the obvious cheaper fix is recorded because it is invisible on
+`float32`, which is the dtype anyone would test it on: narrowing the `f64` to
+`f32` and letting the device const-set *that* rounds twice for a `float16`
+destination. `f16(f32(0.031265258789971995))` is `0.03125` where
+`f16(0.031265258789971995)` is `0.031280517578125`.
+
+The same scan found **three more call sites of the identical shape** that the
+sweep never reached, because those cells refuse earlier for another reason:
+`amax`'s NaN seed, `nan_shaped_like`, and `round.decimals`' scale constant.
+They are fixed too, and a derivation in `test_constset.py` now refuses the
+*shape* of the defect in `aten.rs`, so a tenth is caught by arithmetic rather
+than by the next sweep.
+
+#### C is four different things, and only 15 cells are a missing kernel
+
+| what | cells | answer |
+|---|---:|---|
+| `bool`, any device | 6 | **upstream refuses it too** |
+| signed integer, `cpu` | 15 | a real kernel — exact |
+| `int64`, `mps` | 5 | refusal, by name |
+| `convolution` `bfloat16_cpu` | 1 | **not done**; see below |
+
+**The bool six were never a gap.** Measured against torch 2.13.0: `torch.mm`,
+`torch.matmul` and `torch.addmm` on `bool` raise `"addmm_impl_cpu_" not
+implemented for 'Bool'`, and `bmm`/`baddbmm` name themselves. `addmm` in this
+build already answered upstream's sentence; the other four answered `mlx
+matmul doesn't support U8`. The verdict does not change — it was REFUSES and
+stays REFUSES — and what changes is that the sentence is now upstream's, which
+is exactly the work §4.3 names.
+
+**The upcast route is a fudge here, and this was checked rather than assumed.**
+`gemm_accumulate_in` already widens `float8_e4m3fn` to `f32`, multiplies and
+narrows, and that is honest only because upstream's own answer was *measured*
+bit-identical to it over 700 cases. Integers are the other case:
+
+```text
+torch.mm(int8[[100, 100]], int8[[100], [100]])  ==  32
+```
+
+not `20000` (widening) and not `127` (saturating) — `20000 mod 256 == 32`.
+Upstream wraps in the storage width. **The cell §4.3a filed this under is a
+2x3x2 of small values where all three behaviours agree**, which is the `clamp`
+shape of mistake §1 warns about, so `test_gemmint.py` carries inputs that
+overflow every width *and* a test that fails if they ever stop overflowing.
+
+So the kernel accumulates in `i64` with wrapping arithmetic and truncates to
+the storage width at the end, which is the same number: reduction mod `2**n`
+is a ring homomorphism and `2**8`, `2**16` and `2**32` all divide `2**64`, so
+a sum of products — built from `+` and `*` and nothing else — has the same
+image either way, including when the `i64` evaluation itself overflows. That
+is `test_intmps.py`'s argument, reused for the one operator built from nothing
+but ring operations.
+
+**The `mps` five stay refused.** The kernel is a host computation, and running
+it for an `mps` operand would return a value the GPU did not compute under an
+`mps` label — the failure docs/graph/NPU2.md records. The refusal now names
+the operator, the dtype, the device, the reason and both roads out, and
+deliberately **does not quote candle's sentence**: this document clusters by
+message text, so carrying `mlx matmul` would keep counting the cell as the
+candle-symbol refusal it had just stopped being.
+
+**Not done: `aten.convolution.default` `bfloat16_cpu`, 1 cell.** Giving it
+`gemm_accumulate_in`'s widening is tempting and was not done, because the
+bit-identity argument does not carry over: widening a *cast* is elementwise
+and cannot move a value, whereas widening before im2col changes the
+**summation order** relative to upstream's kernel, and a reassociated float
+sum is a different number. That claim needs its own measurement against
+upstream, which this round did not make, so the cell is left refusing rather
+than answered on an argument nobody checked.
+
+#### Evidence, and its ceiling
+
+The 52 cells are graded **agrees** where they answer — element-wise against
+upstream in a separate subprocess, exactly (integers) or bit for bit
+(constants), with no tolerance anywhere in either file to widen. Eight mutants
+were built **through `vendor/install_shim.sh`**, so each reached the vendored
+tree and not only the stage, and each went RED in the test written for it:
+double-rounding the constant, filling on the device, saturating instead of
+wrapping, the `f64` upcast, removing the device gate, removing the bool gate,
+clamping the narrow, and a genuine host readback.
+
+**There is still no Metal dispatch counter in this build** (§7.5). The `mps`
+half of cause D is therefore supported by agreement with upstream and by a
+structural derivation over `aten.rs`, and by nothing that can observe where
+the fill happened — the same ceiling every `mps` row in this document names.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs host_full present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs exact_int_matmul present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_multiply present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_broadcast_multiply present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reject_bool_gemm present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reject_device_int_gemm present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs exact_int_gemm_dtype present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_every_float_factory_in_cause_d_answers_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_the_constant_is_rounded_once_and_not_twice present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_no_float_constant_is_still_materialised_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_the_cpu_answers_are_unchanged present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_upstream_integer_matmul_wraps_in_the_storage_width present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_integer_matmul_agrees_with_upstream_including_at_overflow present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_the_overflow_cases_really_do_overflow present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_bool_matmul_refuses_in_upstreams_own_words present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_the_mps_integer_refusal_names_the_op_the_dtype_and_the_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_the_mps_integer_refusal_is_not_served_by_a_readback present -->
 
 ### 4.3 470 refusals still hand back a candle symbol
 

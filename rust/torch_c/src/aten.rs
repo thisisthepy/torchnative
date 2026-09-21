@@ -6022,12 +6022,13 @@ fn full_default(
 
     let tensor = if storage.is_int() {
         let value: i64 = fill.extract()?;
-        Tensor::full(value, size, &device)
+        Tensor::full(value, size, &device).and_then(|t| t.fast_to(storage))
     } else {
+        // `host_full`, not `Tensor::full(.., &device)`: the second form asks
+        // Metal for an `f64` it does not have. Cause D, §4.3a.
         let value: f64 = fill.extract()?;
-        Tensor::full(value, size, &device)
+        host_full(value, &[storage], size, &device)
     }
-    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
 
     Ok(PyTensorBase::new(tensor)?.into_pyobject(py)?.into_any().unbind())
@@ -6055,11 +6056,12 @@ fn filled_block(
     }
     let storage = storage_for(op, tag, device)?;
     if storage.is_int() {
-        Tensor::full(value.as_i64(), shape, device)
+        Tensor::full(value.as_i64(), shape, device).and_then(|t| t.fast_to(storage))
     } else {
-        Tensor::full(value.as_f64(), shape, device)
+        // Cause D, and this one call site carries three of its operators:
+        // `full_like`, `new_full` and `constant_pad_nd` all fill through here.
+        host_full(value.as_f64(), &[storage], shape, device)
     }
-    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))
 }
 
@@ -6970,6 +6972,235 @@ fn gemm_with_layout_fallback(
     }
 }
 
+/// The `bool` GEMM refusal, in **upstream's own words**.
+///
+/// Upstream has no `bool` matmul on any of the five operators and declines by
+/// name; this build used to hand back `mlx matmul doesn't support U8`, a
+/// candle-internal type token that names neither the dtype nor the operator
+/// nor anything a reader can act on. Six cells of docs/devices/matrix.md
+/// §4.3a cause C are exactly this, and **none of them is a missing kernel** --
+/// the refusal was already the correct behaviour and only the sentence was
+/// wrong.
+///
+/// `impl_name` is upstream's and differs per operator, measured against torch
+/// 2.13.0 rather than inferred: `mm`, `matmul` and `addmm` all name the shared
+/// CPU implementation (`addmm_impl_cpu_`, because `mm` lowers to it), while
+/// `bmm` and `baddbmm` name themselves.
+fn reject_bool_gemm(impl_name: &str, tag: TorchDType) -> PyResult<()> {
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"{impl_name}\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    Ok(())
+}
+
+/// The integer element types `exact_int_matmul` below covers.
+///
+/// Signed and explicit rather than `is_int()`, because the two unsigned
+/// candle types that reach here are not claimed: `u8` is where this crate's
+/// `bool` lives and is refused above in upstream's words, and `u32` was never
+/// compared against upstream for a matmul at all.
+fn exact_int_gemm_dtype(dtype: candle_core::DType) -> bool {
+    matches!(
+        dtype,
+        candle_core::DType::I8
+            | candle_core::DType::I16
+            | candle_core::DType::I32
+            | candle_core::DType::I64
+    )
+}
+
+/// Integer GEMM **off the host**: refused by name rather than computed.
+///
+/// candle has no integer matmul kernel on any backend. Its Metal backend says
+/// so in mlx's words (`mlx matmul doesn't support I64`), which is five of the
+/// 27 cells of docs/devices/matrix.md §4.3a cause C.
+///
+/// `exact_int_matmul` *could* answer them -- it is a host computation and the
+/// buffer can always be read. That is precisely why it must not: it would
+/// hand back a value the GPU did not compute, under an `mps` label, which is
+/// the silent fallback docs/graph/NPU2.md records and
+/// `mps_host_readback_gate` exists to refuse. The refusal names the operator,
+/// the dtype, the device, the reason, and **both** roads out, because they
+/// are not interchangeable -- `.cpu()` keeps the exact integer answer and
+/// gives up the device, a float cast keeps the device and changes the dtype.
+fn reject_device_int_gemm(
+    op: &str,
+    tag: TorchDType,
+    storage: candle_core::DType,
+    device: &Device,
+) -> PyResult<()> {
+    if matches!(device, Device::Cpu) || !exact_int_gemm_dtype(storage) {
+        return Ok(());
+    }
+    let label = if crate::device::is_metal(device) { "mps" } else { "cuda" };
+    // `tag.name()` (`int64`), not `scalar_type_name(tag)` (`Long`): the
+    // reader of this sentence writes Python, and `Long` is a C++ spelling
+    // they never typed. Same choice `mps_int_dtype_refusal` makes.
+    let name = tag.name();
+    // **candle's own sentence is deliberately not quoted here.** It belongs in
+    // this function's doc comment, not in the message: docs/devices/matrix.md
+    // clusters refusals by message text, so a refusal carrying `mlx matmul`
+    // would keep being counted as the candle-symbol refusal it just stopped
+    // being (§4.3, §4.3a).
+    let _ = storage;
+    Err(not_implemented(format!(
+        "{op}: not implemented for {name} tensors on the {label} device. \
+         candle has no integer matmul kernel on any backend, and this shim \
+         computes integer matmul exactly on the host instead -- torch's \
+         integer matmul wraps in the storage width, so a widened float \
+         multiply would be a different answer rather than a slower one. \
+         Running that host kernel for a {label} tensor would return a value \
+         the GPU did not compute, under a {label} label, so it is refused \
+         rather than done silently. Move the tensor with .cpu() to get the \
+         exact {name} answer, or cast to a float dtype before \
+         .to(\"{label}\") to keep the multiply on the GPU \
+         (docs/devices/matrix.md §4.3a)."
+    )))
+}
+
+/// `lhs @ rhs` for integer operands, computed **exactly**, on the host.
+///
+/// **Why not a widening float multiply.** `gemm_accumulate_in` already widens
+/// `float8_e4m3fn` to `f32`, multiplies and narrows, and that is legitimate
+/// only because upstream's own answer was *measured* to be bit-identical to
+/// it over 700 cases. The same move on integers is not, and this was checked
+/// rather than assumed: upstream wraps in the storage width.
+///
+/// ```text
+/// torch.mm(int8[[100, 100]], int8[[100], [100]])  ==  32
+/// ```
+///
+/// not `20000` (widening) and not `127` (saturating). `20000 mod 256 == 32`.
+/// The cell docs/devices/matrix.md §4.3a filed this under is a 2x3x2 of small
+/// values where all three behaviours agree, which is the `clamp` shape of
+/// mistake §1 of that document warns about -- so `test_gemmint.py` carries
+/// inputs that overflow every width, and a test that fails if they ever stop
+/// overflowing.
+///
+/// **Why accumulating in `i64` and truncating at the end is the same number.**
+/// Reduction mod `2**n` is a ring homomorphism and `2**8`, `2**16` and
+/// `2**32` all divide `2**64`, so any expression built from `+` and `*` alone
+/// -- which a sum of products is -- has the same image whether it is
+/// evaluated at width `n` throughout or evaluated at width 64 and reduced
+/// once at the end, *including when the width-64 evaluation itself overflows*.
+/// This is `test_intmps.py`'s argument for `add`/`sub`/`mul`/`neg`, reused
+/// for the one operator built from nothing else.
+///
+/// The truncation is done here in Rust (`as i8`) rather than through
+/// `to_dtype`, so the kernel does not depend on candle's narrowing-cast
+/// semantics being the truncating one.
+fn exact_int_matmul(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
+    use candle_core::DType;
+    let dtype = lhs.dtype();
+    if !matches!(lhs.device(), Device::Cpu) {
+        // Unreachable through the five kernels, which all call
+        // `reject_device_int_gemm` first. Kept so that a sixth caller added
+        // later cannot turn this into a readback by forgetting the gate.
+        return Err(candle_core::Error::Msg(
+            "torch._C shim: the exact integer matmul is a host kernel and was \
+             reached with a non-host operand".to_string(),
+        ));
+    }
+    let (ld, rd) = (lhs.dims().to_vec(), rhs.dims().to_vec());
+    if ld.len() < 2 || rd.len() != ld.len() || ld[..ld.len() - 2] != rd[..rd.len() - 2] {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: the exact integer matmul takes two operands of \
+             equal rank >= 2 with equal batch extents, got {ld:?} and {rd:?}"
+        )));
+    }
+    let (m, k) = (ld[ld.len() - 2], ld[ld.len() - 1]);
+    let (k2, n) = (rd[rd.len() - 2], rd[rd.len() - 1]);
+    if k != k2 {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: the exact integer matmul got inner extents {k} \
+             and {k2}"
+        )));
+    }
+    let batch: usize = ld[..ld.len() - 2].iter().product();
+    let a = lhs.contiguous()?.flatten_all()?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+    let b = rhs.contiguous()?.flatten_all()?.to_dtype(DType::I64)?.to_vec1::<i64>()?;
+
+    let mut out = vec![0i64; batch * m * n];
+    for bi in 0..batch {
+        let (ao, bo, oo) = (bi * m * k, bi * k * n, bi * m * n);
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc: i64 = 0;
+                for x in 0..k {
+                    acc = acc.wrapping_add(a[ao + i * k + x].wrapping_mul(b[bo + x * n + j]));
+                }
+                out[oo + i * n + j] = acc;
+            }
+        }
+    }
+
+    let mut shape = ld[..ld.len() - 2].to_vec();
+    shape.push(m);
+    shape.push(n);
+    let cpu = Device::Cpu;
+    match dtype {
+        DType::I8 => Tensor::from_vec(
+            out.iter().map(|&v| v as i8).collect::<Vec<_>>(), shape, &cpu),
+        DType::I16 => Tensor::from_vec(
+            out.iter().map(|&v| v as i16).collect::<Vec<_>>(), shape, &cpu),
+        DType::I32 => Tensor::from_vec(
+            out.iter().map(|&v| v as i32).collect::<Vec<_>>(), shape, &cpu),
+        DType::I64 => Tensor::from_vec(out, shape, &cpu),
+        other => Err(candle_core::Error::Msg(format!(
+            "torch._C shim: the exact integer matmul was reached with {other:?}"
+        ))),
+    }
+}
+
+/// The multiply every GEMM kernel in this file goes through: candle's for the
+/// float dtypes it has kernels for, and this crate's exact one for the signed
+/// integers it does not.
+///
+/// A single function rather than a condition repeated at five call sites,
+/// because the thing that must not happen is one of the five keeping the old
+/// route and answering differently from the other four for the same operands.
+fn gemm_multiply(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
+    if exact_int_gemm_dtype(lhs.dtype()) {
+        return exact_int_matmul(lhs, rhs);
+    }
+    lhs.matmul(rhs)
+}
+
+/// `gemm_multiply`, for the broadcasting contract `matmul` has and `mm` does
+/// not. The broadcast is performed first and the exact kernel then sees two
+/// operands of equal rank and equal batch extents, which is all it accepts.
+fn gemm_broadcast_multiply(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
+    if !exact_int_gemm_dtype(lhs.dtype()) {
+        return lhs.broadcast_matmul(rhs);
+    }
+    let (ld, rd) = (lhs.dims(), rhs.dims());
+    if ld.len() != rd.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "torch._C shim: integer matmul with operands of rank {} and {} is \
+             not implemented -- torch's rank-equalising rules were not measured",
+            ld.len(), rd.len()
+        )));
+    }
+    let mut batch = Vec::with_capacity(ld.len() - 2);
+    for (&l, &r) in ld[..ld.len() - 2].iter().zip(rd[..rd.len() - 2].iter()) {
+        batch.push(l.max(r));
+    }
+    let expand = |t: &Tensor, tail: &[usize]| -> candle_core::Result<Tensor> {
+        let mut want = batch.clone();
+        want.extend_from_slice(tail);
+        if t.dims() == want.as_slice() {
+            return Ok(t.clone());
+        }
+        t.broadcast_as(want.as_slice())?.contiguous()
+    };
+    let l = expand(lhs, &ld[ld.len() - 2..])?;
+    let r = expand(rhs, &rd[rd.len() - 2..])?;
+    exact_int_matmul(&l, &r)
+}
+
 /// `matmul` over operands that may disagree in rank -- **folding the batch
 /// into the rows when the right operand has none**, which is what upstream
 /// does and is the difference between one GEMM and one copy of the weight.
@@ -7008,12 +7239,12 @@ fn batched_matmul(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
         let (lead, k) = dims.split_at(dims.len() - 1);
         let rows: usize = lead.iter().product();
         let folded = lhs.reshape((rows, k[0]))?;
-        let product = gemm_with_layout_fallback(&folded, rhs, |a, b| a.matmul(b))?;
+        let product = gemm_with_layout_fallback(&folded, rhs, gemm_multiply)?;
         let mut out_shape = lead.to_vec();
         out_shape.push(rhs.dims()[1]);
         return product.reshape(out_shape);
     }
-    let direct = gemm_with_layout_fallback(lhs, rhs, |a, b| a.broadcast_matmul(b));
+    let direct = gemm_with_layout_fallback(lhs, rhs, gemm_broadcast_multiply);
     match direct {
         Err(e) if is_matmul_striding_refusal(&e) => match fold_batch_axes_matmul(lhs, rhs) {
             Some(folded) => folded,
@@ -7260,15 +7491,19 @@ fn mm_default(
         )));
     }
     let tag = require_same_dtype(OP, &lhs, &rhs)?;
+    // `mm` lowers to `addmm_impl_cpu_` upstream and inherits its refusal by
+    // that name, measured rather than paraphrased (§4.3a cause C).
+    reject_bool_gemm("addmm_impl_cpu_", tag)?;
 
     // Accumulate where torch accumulates -- see `gemm_accumulate_in`.
     let storage = PyDtype::new(tag).storage(OP)?;
+    reject_device_int_gemm(OP, tag, storage, lhs.tensor()?.device())?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
     let out = widen_gemm_operand(lhs.tensor()?, acc)
         .and_then(|l| {
             widen_gemm_operand(rhs_inner, acc)
-                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, gemm_multiply))
         })
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
@@ -7324,13 +7559,17 @@ fn bmm_default(
         )));
     }
 
+    // `bmm` names itself upstream, where `mm` names `addmm_impl_cpu_`.
+    reject_bool_gemm("bmm", tag)?;
+
     let storage = PyDtype::new(tag).storage(OP)?;
+    reject_device_int_gemm(OP, tag, storage, lhs.tensor()?.device())?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
     let out = widen_gemm_operand(lhs.tensor()?, acc)
         .and_then(|l| {
             widen_gemm_operand(rhs_inner, acc)
-                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, gemm_multiply))
         })
         .and_then(|p| p.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
@@ -7858,6 +8097,7 @@ fn addmm_default(
     }
 
     let storage = PyDtype::new(tag).storage(OP)?;
+    reject_device_int_gemm(OP, tag, storage, mat1.tensor()?.device())?;
     let beta = scalar_arg(OP, args, kwargs, 3, "beta")?.unwrap_or(Scalar::Int(1));
     let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?.unwrap_or(Scalar::Int(1));
     // Zero is decided in the *result* dtype, which is why `beta=0.5` on an
@@ -7880,7 +8120,7 @@ fn addmm_default(
         let product = widen_gemm_operand(mat1.tensor()?, acc_dtype)
             .and_then(|l| {
                 widen_gemm_operand(mat2_inner, acc_dtype)
-                    .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
+                    .and_then(|r| gemm_with_layout_fallback(&l, &r, gemm_multiply))
             })
             .map_err(|e| candle_err(OP, e))?;
         acc = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
@@ -8026,6 +8266,7 @@ fn baddbmm_default(
     }
 
     let storage = PyDtype::new(tag).storage(OP)?;
+    reject_device_int_gemm(OP, tag, storage, batch1.tensor()?.device())?;
     let beta = scalar_arg(OP, args, kwargs, 3, "beta")?.unwrap_or(Scalar::Int(1));
     let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?.unwrap_or(Scalar::Int(1));
     // `alpha` has no quick return (see the kernel doc above) so only
@@ -8051,7 +8292,7 @@ fn baddbmm_default(
     let product = widen_gemm_operand(batch1.tensor()?, acc_dtype)
         .and_then(|l| {
             widen_gemm_operand(batch2_inner, acc_dtype)
-                .and_then(|r| gemm_with_layout_fallback(&l, &r, |a, b| a.matmul(b)))
+                .and_then(|r| gemm_with_layout_fallback(&l, &r, gemm_multiply))
         })
         .map_err(|e| candle_err(OP, e))?;
     let mut acc: Option<Tensor> = Some(addmm_scale(OP, &product, alpha, acc_dtype)?);
@@ -9763,11 +10004,10 @@ fn scalar_tensor_default(
     let tensor = if storage.is_int() {
         // Upstream truncates toward zero rather than rounding:
         // `scalar_tensor(-1.5, dtype=int64)` is `-1`, measured.
-        Tensor::full(value.as_i64(), (), &device)
+        Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
     } else {
-        Tensor::full(value.as_f64(), (), &device)
+        host_full(value.as_f64(), &[storage], (), &device)
     }
-    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, dtype)
 }
@@ -10963,6 +11203,55 @@ fn host_const<T: candle_core::WithDType>(
     }
 }
 
+/// `host_const`, for a constant that has a **shape**.
+///
+/// Same defect and the same fix, one layer out. `Tensor::full(v, shape,
+/// device)` asks the *device* to materialise the fill, and nine factories
+/// reached it holding an `f64` -- a dtype Metal does not have at all -- so
+/// `torch.full((2, 3), 1.5, dtype=torch.float32, device="mps")` died on
+/// `candle: unsupported const-set f64` even though its own dtype is one Metal
+/// supports perfectly well. That is cause D of docs/devices/matrix.md §4.3a:
+/// **25 cells, nine operator names, and one helper that was already here and
+/// simply had not been adopted.**
+///
+/// **The conversion happens once, on the host, before anything is
+/// broadcast.** The cheaper-looking repair is to narrow the `f64` to `f32`
+/// and let the device const-set that, since Metal does have `f32`. For a
+/// `float16` destination it rounds twice and lands on a different number:
+/// `f16(f32(0.031265258789971995))` is `0.03125` where
+/// `f16(0.031265258789971995)` is `0.031280517578125`. `test_constset.py`
+/// carries that witness, asked of upstream as well, precisely because the
+/// mistake is invisible on `float32`.
+///
+/// The `Cpu` arm is written as the same two calls the call sites made before
+/// this helper existed, so **the host answer is unchanged by construction**
+/// rather than by comparison -- and candle's own fill writes `n` copies of a
+/// scalar more cheaply than a broadcast and a strided copy would.
+///
+/// Like `host_const` this is not a host readback and must not be read as one:
+/// the only thing that travels is a constant this crate made up from a Python
+/// scalar, host -> device, the direction `.to(device)` already goes.
+fn host_full<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
+    value: T,
+    steps: &[candle_core::DType],
+    shape: S,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let shape = shape.into();
+    if matches!(device, Device::Cpu) {
+        let mut t = Tensor::full(value, shape, device)?;
+        for step in steps {
+            t = t.fast_to(*step)?;
+        }
+        return Ok(t);
+    }
+    let scalar = host_const(value, steps, device)?;
+    if shape.rank() == 0 {
+        return Ok(scalar);
+    }
+    scalar.broadcast_as(shape)?.contiguous()
+}
+
 fn arith_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11118,7 +11407,9 @@ fn matmul_default(
             rhs.tensor()?.rank()
         )));
     }
+    reject_bool_gemm("addmm_impl_cpu_", tag)?;
     let storage = PyDtype::new(tag).storage(OP)?;
+    reject_device_int_gemm(OP, tag, storage, lhs.tensor()?.device())?;
     let acc = gemm_accumulate_in(storage);
     let rhs_inner = rhs.tensor()?;
     let out = widen_gemm_operand(lhs.tensor()?, acc)
@@ -13463,7 +13754,7 @@ fn extremum_default(
             .map_err(|e| candle_err(op, e))?;
         if nan_count > 0 {
             let storage = PyDtype::new(tag).storage(op)?;
-            let out = Tensor::full(f64::NAN, (), flat.device())
+            let out = host_full(f64::NAN, &[], (), flat.device())
                 .and_then(|t| t.fast_to(storage))
                 .map_err(|e| candle_err(op, e))?;
             return finish(py, out, tag);
@@ -13639,7 +13930,7 @@ fn nan_along_dim(
 /// takes one Rust scalar type, and the tag decides the storage.
 fn nan_shaped_like(op: &str, like: &Tensor, tag: TorchDType) -> PyResult<Tensor> {
     let storage = PyDtype::new(tag).storage(op)?;
-    Tensor::full(f64::NAN, like.shape(), like.device())
+    host_full(f64::NAN, &[], like.shape(), like.device())
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))
 }
@@ -14232,10 +14523,10 @@ fn masked_fill(
         .map_err(|e| candle_err(op, e))?;
     let filled = if storage.is_int() {
         Tensor::full(value.as_i64(), shape.clone(), device)
+            .and_then(|t| t.fast_to(storage))
     } else {
-        Tensor::full(value.as_f64(), shape.clone(), device)
+        host_full(value.as_f64(), &[storage], shape.clone(), device)
     }
-    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(op, e))?;
     let source = input
         .tensor()?
@@ -14790,7 +15081,7 @@ fn remainder_op(
         let filled = if storage.is_int() {
             Tensor::full(scalar.as_i64(), (), left.device())
         } else {
-            Tensor::full(scalar.as_f64(), (), left.device())
+            host_full(scalar.as_f64(), &[], (), left.device())
         };
         filled
             .and_then(|t| t.fast_to(storage))
@@ -14921,7 +15212,7 @@ fn fmod_op(
         let filled = if storage.is_int() {
             Tensor::full(scalar.as_i64(), (), left.device())
         } else {
-            Tensor::full(scalar.as_f64(), (), left.device())
+            host_full(scalar.as_f64(), &[], (), left.device())
         };
         filled
             .and_then(|t| t.fast_to(storage))
@@ -15277,7 +15568,7 @@ fn div_mode(
         let filled = if storage.is_int() {
             Tensor::full(scalar.as_i64(), (), left.device())
         } else {
-            Tensor::full(scalar.as_f64(), (), left.device())
+            host_full(scalar.as_f64(), &[], (), left.device())
         };
         filled
             .and_then(|t| t.fast_to(target))
@@ -17636,11 +17927,10 @@ fn fill_inplace(
     } else {
         let storage = PyDtype::new(tag).storage(op)?;
         let filled = if storage.is_int() {
-            Tensor::full(value.as_i64(), shape, &device)
+            Tensor::full(value.as_i64(), shape, &device).and_then(|t| t.fast_to(storage))
         } else {
-            Tensor::full(value.as_f64(), shape, &device)
+            host_full(value.as_f64(), &[storage], shape, &device)
         }
-        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(op, e))?;
         PyTensorBase::new(filled)?
     };
@@ -27220,11 +27510,10 @@ fn where_scalar_scalar(
         } else {
             let storage = PyDtype::new(tag).storage(OP)?;
             if storage.is_int() {
-                Tensor::full(value.as_i64(), (), &device)
+                Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
             } else {
-                Tensor::full(value.as_f64(), (), &device)
+                host_full(value.as_f64(), &[storage], (), &device)
             }
-            .and_then(|t| t.fast_to(storage))
             .map_err(|e| candle_err(OP, e))
         }
     };
@@ -27784,11 +28073,10 @@ fn where_scalar_self(
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         if storage.is_int() {
-            Tensor::full(value.as_i64(), (), &device)
+            Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
         } else {
-            Tensor::full(value.as_f64(), (), &device)
+            host_full(value.as_f64(), &[storage], (), &device)
         }
-        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?
     };
 
@@ -32354,8 +32642,7 @@ fn round_common(
             let wide = source.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
             let negative = d < 0;
             let power = 10f64.powi(d.unsigned_abs().min(64) as i32);
-            let ten = Tensor::full(power, (), wide.device())
-                .and_then(|t| t.to_dtype(acc))
+            let ten = host_full(power, &[acc], (), wide.device())
                 .map_err(|e| candle_err(OP, e))?;
             let scaled = if negative {
                 wide.broadcast_div(&ten)
