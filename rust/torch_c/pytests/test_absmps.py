@@ -46,17 +46,20 @@ written down beside it.
   its path at all (`_oracle_abs` below). The tolerance is
   `tools/golden/dtypes.py`'s for the result dtype and is not widened here.
 * *placement* -- the honest statement is narrower than a CUDA or Vulkan cell's
-  and this file says so rather than overclaiming. This build has **no Metal
-  dispatch counter**: `device.rs` has `_cuda_counters()` and `_vulkan_counters()`
-  and nothing of the kind for Metal, and candle's `MetalDevice` exposes no
-  countable kernel launch. So the placement evidence here is (a) the kernel
+  and this file's own evidence is still the narrower kind: (a) the kernel
   performs no host readback *by construction*, which the derivation scan in
   `test_shim.py` re-derives from source on every gate run, and (b)
   `test_abs_on_mps_does_not_come_back_through_the_readback_gate`, which checks
   the artefact's own table rather than the source constant. Both are the
   standard `softmax_on_device` was landed at (docs/devices/MPSATTN.md §3.1).
-  A Metal counter is the piece of infrastructure that would raise every `mps`
-  cell in `matrix.md` above this ceiling, and it is not built here.
+
+  **The counter those two used to stand in for now exists** (2026-09-20):
+  `_C._metal_counters()`, docs/devices/matrix.md §7.11. It is not asserted
+  here -- `test_metalcount.py` is where the counted evidence for these four
+  cells lives, and duplicating it would make two files fail for one fault.
+  What is worth carrying across is §7.12's measurement: a host-computed twin
+  planted one file deeper left **all four tests in this file green**, so the
+  grade this file can reach on its own is *agrees*, not *ran on the GPU*.
 
 Nullifications this file is meant to catch, each verified by making the break:
 

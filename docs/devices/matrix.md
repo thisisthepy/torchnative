@@ -375,6 +375,12 @@ cell that refuses for the first reason it meets hides any second reason behind
 it. Cause A hides the most: 284 operators have never been asked the question at
 all on that cell.
 
+**Asked, 2026-09-20 (§7.17): cause A is closed and it was worth 137, not 284.**
+Once the operand builds, 0 of the 284 still fail at stage `operands` and
+**137 reach AGREES**. The gap is not shaders: 99 of the 284 do not have
+`int8_cpu` at AGREES either, so they were never in the prize — which is the
+error this very paragraph warns about, committed by the paragraph above it.
+
 ### 4.3b C and D re-derived: 52 cells, and neither is what it was filed as
 
 Scoped 2026-09-20 from the same `/tmp/matrix_pub.json` §4.3a used, re-read
@@ -589,8 +595,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.arange.start | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.arange.start_step | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.argmax.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.argsort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
-| aten.argsort.stable | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
+| aten.argsort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.argsort.stable | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.as_strided.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
 | aten.avg_pool2d.default | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.baddbmm.default | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
@@ -654,8 +660,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.flip.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
 | aten.floor.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | REFUSES |
 | aten.floor_.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | REFUSES |
-| aten.floor_divide.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
-| aten.floor_divide.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
+| aten.floor_divide.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.floor_divide.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.fmod.Scalar | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.fmod.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.full.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -693,7 +699,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.lift_fresh.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.lift_fresh_copy.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.linalg_qr.default | AGREES | REFUSES | REFUSES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.linalg_vector_norm.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
+| aten.linalg_vector_norm.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.linspace.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REFUSES |
 | aten.log.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.log2.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
@@ -743,7 +749,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.new_zeros.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.nll_loss_forward.default | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.nonzero.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.norm.ScalarOpt_dim | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
+| aten.norm.ScalarOpt_dim | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.normal_.default | REACHES | REACHES | REACHES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.one_hot.default | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | BREAKS | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.ones.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | BREAKS | BREAKS | AGREES |
@@ -784,8 +790,8 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.scalar_tensor.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.scatter.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.scatter.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.scatter_.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
-| aten.scatter_.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | BREAKS | REFUSES | AGREES | REFUSES | REFUSES | BREAKS |
+| aten.scatter_.src | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
+| aten.scatter_.value | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.scatter_reduce.two | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | BREAKS | BREAKS | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.select.int | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.sigmoid.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -797,7 +803,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.sinc.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.slice.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.softplus.default | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
-| aten.sort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
+| aten.sort.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.split.Tensor | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.split_with_sizes.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.sqrt.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -821,7 +827,7 @@ PYTHONPATH=<stage>:rust/torch_c/pytests python3 \
 | aten.t_.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.tanh.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.tanh_.default | AGREES | AGREES | AGREES | AGREES | BREAKS | BREAKS | BREAKS | BREAKS | AGREES | AGREES | AGREES | REFUSES | BREAKS | BREAKS | REFUSES | BREAKS |
-| aten.topk.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | AGREES | REFUSES | REFUSES | REACHES |
+| aten.topk.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REACHES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES | REFUSES |
 | aten.transpose.int | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | AGREES | REFUSES | AGREES |
 | aten.tril.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
 | aten.triu.default | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | AGREES | REFUSES | AGREES | REFUSES | REFUSES | AGREES |
@@ -1008,8 +1014,14 @@ and the readback sentence must not.
 
 ### 7.5 What this round could not prove, and the one thing that would fix it
 
-**There is no Metal dispatch counter in this build.** `device.rs` has
-`_cuda_counters()` and `_vulkan_counters()`; Metal has neither, and candle's
+> **Closed on 2026-09-20 by §7.11.** `_C._metal_counters()` exists, the fork
+> carries the counters, and §7.12 records the substitution experiment this
+> section says could not be run. The paragraph below is left as it was written
+> because §7.11 is only readable against it; read it as history, not as the
+> current state.
+
+**There was no Metal dispatch counter in this build.** `device.rs` has
+`_cuda_counters()` and `_vulkan_counters()`; Metal had neither, and candle's
 `MetalDevice` exposes no countable kernel launch — `capture()` writes a
 `.gputrace` and nothing smaller. So the placement evidence for §7.3's four
 cells is (a) the kernel performs no host readback *by construction*, re-derived
@@ -1240,3 +1252,718 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
 <!-- DOCWATCH: op-implemented aten.clamp_min_.default -->
+
+---
+
+### 7.11 The Metal dispatch counter — §7.5's missing instrument, built
+
+§7.5 said a Metal counter "is **the** piece of infrastructure that would raise
+every `mps` cell in this document above the present ceiling, and it is not
+built here." It is built now. `_C._metal_counters()` returns six numbers and a
+`built` flag, in the shape `_cuda_counters()` and `_vulkan_counters()` already
+use:
+
+| key | door it is counted at | what it means |
+|---|---|---|
+| `compute_encoders` | `MetalDevice::command_encoder()` | kernel launches |
+| `blit_encoders` | `MetalDevice::blit_command_encoder()` | device copies |
+| `host_uploads`, `host_upload_bytes` | `MetalDevice::new_buffer_with_data()` | host → device |
+| `host_downloads`, `host_download_bytes` | `MetalStorage::to_cpu()` | device → host |
+
+**The counters are in `vendor/candle-core`, and they had to be.** §7.5 named
+that as the reason not to build it inside a round about something else; this
+round was given the fork. They cannot live on this side of the FFI boundary:
+a counter in `aten.rs` counts what this crate *intended*, and a host-computed
+twin intends exactly what the real kernel intends. Only candle can say whether
+a compute encoder was opened. Every edit went into
+`vendor/int8-candle-0.11.0-cpu.patch` and the tree was regenerated from it, so
+`sh vendor/vendor_candle.sh --check` still passes byte for byte.
+
+**What `compute_encoders` is, stated narrowly enough that it cannot be
+over-quoted.** It is a successful `command_encoder()` call, which candle hands
+straight to a `candle_metal_kernels::call_*` that encodes at least one
+`dispatch_thread*`. So it is a **lower bound on GPU dispatches** and an exact
+count of candle's GPU op invocations — *not* a count of `dispatch_threads`,
+which happen in `candle-metal-kernels`, a crate this vendoring does not cover.
+Quoting it as "N kernels ran" would be the same kind of inflation-by-citation
+CLAUDE.md §2 records for the "four rounds"/"five rounds" count.
+
+Measured, one `aten.abs.default` on an `mps` `float32` `[2, 3]`:
+
+    build the operand   uploads 1 (+24 bytes), compute 0
+    abs                 compute 1, downloads 0
+    .cpu()              blits   1, downloads 1 (+24 bytes)
+
+**Which `mps` claims this upgrades.** §7.3's four `abs` cells
+(`float32`/`float16`/`bfloat16`/`int64`) move from structural evidence — "no
+host readback by construction", re-derived from source — to **counted**
+evidence: `test_metalcount.py` asserts `compute_encoders >= 1` and
+`host_downloads == 0` across the dispatch itself, on all four dtypes, beside
+an agreement check against a subprocess oracle.
+
+**Which it does not reach.** Every other `mps` cell in §6's table is still at
+the old standard, because the counter is an instrument and not a sweep: no
+test in this round asserts a counter delta for `softmax_on_device`, for the
+§7.7 in-place family, or for any of the 43 operators §7.8 measured. Those
+remain where §7.5 put them until someone writes the assertion. The instrument
+now exists; the work of pointing it at each cell does not.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs metal_counters present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_abs_on_mps_opens_a_metal_kernel_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_a_cpu_op_moves_no_metal_counter present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_a_readback_costs_exactly_the_tensors_bytes present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalcount.py test_metal_counters_answers_with_all_six_names present -->
+<!-- DOCWATCH: op-implemented aten.abs.default -->
+
+### 7.12 The experiment that could not be run on Metal, run
+
+CLAUDE.md §2 records three rounds that replaced a device kernel with a
+host-computed twin — `7dff9f0`, `35e002f`, `22d9158` — and notes that all three
+are Vulkan, because Vulkan was the only backend with a counter. This is the
+Metal one.
+
+**The subject.** `integral_abs_on_device` (the integral path of
+`aten.abs.default`, `maximum(x, 0 - x)`), the kernel §7.3 moved onto Metal and
+whose four cells §7.11 upgrades. **Two twins were planted**, both computing
+`wrapping_abs` on the host from `to_vec1::<i64>()` and rebuilding the tensor on
+the same device, and both returning values identical to upstream's:
+
+| twin | where the readback lives | `test_shim.py` classification scan | `test_absmps.py` (4 tests) | `test_metalcount.py` |
+|---|---|---|---|---|
+| M1 | inside `integral_abs_on_device`, in `aten.rs` | **RED** — named the function | 4 of 4 green | **RED** |
+| M2 | one file deeper, `tensor.rs::twin_abs_i64` | **green — 480 ok, 0 FAIL** | 4 of 4 green | **RED** |
+
+M2 is the result that matters, and it is the one the Vulkan rounds predicted.
+The entire existing gate — every value test, the wrap-at-`INT_MIN` test, the
+readback-gate table test, and the source scan whose whole purpose is to catch
+this — stayed green while `abs` on `int64`/`mps` was computed on the CPU. The
+counter said:
+
+    compute_encoders 0   blit_encoders 1   host_downloads 1 (+48 bytes)
+
+**M1 is a finding in the other direction and is reported as one.** The scan is
+not as blind as §7.5 implied: it catches a readback added directly to a
+function in `aten.rs`, by name, which is exactly what it claims to do. Its
+blind spot is narrower than "one call deeper" — it is *one file over*, because
+`_aten_rs_functions()` parses `aten.rs` and only `aten.rs`. That is worth
+knowing precisely rather than approximately.
+
+**No kernel already claiming device residency was found to be falling back.**
+The four `abs` cells were tested with the counter before any mutant was
+planted and all four opened a compute encoder and downloaded nothing. The
+substitution above is a mutant this round introduced and removed, not a defect
+it discovered.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs integral_abs_on_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs twin_abs_i64 absent -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
+
+### 7.13 `DType::I8` on Metal — declined, with the reason measured
+
+> **Superseded by §7.17 (2026-09-20), which does not correct it.** The second
+> crate was approved and vendored; everything this section says about a
+> `candle-core`-only change remains true and is why the second crate was
+> needed. The one number below that did **not** survive is "284": the ceiling
+> was 185, because 99 of the 284 do not agree on the CPU either.
+
+284 matrix cells fail at stage `operands`: `_tensor_from_flat` cannot build an
+`int8` tensor on `mps` at all, because the fork's `DType::I8` is CPU-only
+(docs/numerics/INT8.md §1.2) and `storage_from_cpu_storage` refuses
+`CpuStorage::I8`. Lifting that refusal was considered this round and **is not
+done**, for a reason that is a fact about a crate rather than a preference:
+
+`candle_metal_kernels::DType` has exactly six variants — `BF16 F16 F32 I64 U32
+U8` — and the MSL sources instantiate every kernel for those six and no others
+(`binary.metal`'s `init_binary` macro). `I8` is not among them. So the reach
+of a change confined to `candle-core` is precisely this: the *buffer* could be
+built, and every kernel would then refuse for want of a shader symbol. That
+converts 284 `operands` failures into 284 kernel-stage refusals and moves **no
+cell to AGREES** — a tensor that exists and can do nothing, which is a worse
+answer than the refusal it replaces, not a better one.
+
+**Taken, 2026-09-20.** See §7.17 for what the second crate cost (51 lines,
+zero new shader bodies) and what it moved (137 cells).
+
+This is the same wall `int16`/`int32` hit, and `device.rs`'s
+`_shim_mps_unsupported_int_dtypes` is the decision already taken for it
+(docs/numerics/DTYPEDEV.md §4.2). Making `int8` reach a Metal kernel means
+adding shader instantiations to `candle-metal-kernels`, a **second** crate to
+vendor. This round's approval was to patch this fork, so that decision is left
+where it belongs: with the user, stated rather than taken.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs shim_mps_unsupported_int_dtypes present -->
+
+### 7.14 The counter pointed at the rest of the table — and twelve cells are computed on the host
+
+§7.11 built `_C._metal_counters()` and said, in its own words, that it had not
+pointed it anywhere except `abs`:
+
+> no test in this round asserts a counter delta for `softmax_on_device`, for
+> the §7.7 in-place family, or for any of the 43 operators §7.8 measured.
+
+This round points it. **The finding first, because it is a claim this
+repository published and it is wrong.**
+
+#### The finding
+
+**Twelve `mps` cells across eight operators are published `AGREES` in §6's
+table and are computed on the CPU.** The operand is downloaded to host memory,
+a scalar loop runs there, and the answer is uploaded back to the device it came
+from — so every value is correct, every agreement test is green, and
+`.device` still reads `mps`. That is precisely the failure §7.12 had to plant
+deliberately in order to observe. It was already here.
+
+| operator | cells | measured delta on `mps` | how it reaches the host |
+|---|---|---|---|
+| `aten.sort.default` | `int64`, `bool` | `compute 0–2, downloads 1 (48 B)` | `order_along` |
+| `aten.argsort.default` | `int64`, `bool` | `compute 0–1, downloads 1 (48 B)` | `argsort_core` |
+| `aten.argsort.stable` | `int64`, `bool` | `compute 0–1, downloads 1 (48 B)` | `argsort_core` |
+| `aten.topk.default` | `int64` | `compute 0, downloads 1 (48 B)` | `order_along` |
+| `aten.floor_divide.default` | `int64` | `compute 0, downloads 2 (64 B)` | `floor_divide_impl` |
+| `aten.floor_divide.Scalar` | `int64`, `bool` | `compute 0–1, downloads 1 (56 B)` | `floor_divide_impl` |
+| `aten.scatter_.src` | `int64` | `compute 0, blit 4, downloads 3 (80 B)` | `scatter_inplace` → `scatter_src` → `read_flat` |
+| `aten.scatter_.value` | `int64` | `compute 0, blit 3, downloads 2 (96 B)` | `scatter_inplace` → `scatter_value` → `read_flat` |
+
+The last two rows are §7.7's and §7.8's. §7.8 classified `scatter_.value` and
+`scatter_.src` as "blocked by `f64` on Metal", which is true of their **float**
+columns and is why the diagnosis read as complete; their `int64` column is not
+blocked, reaches, and computes on the host. So **two of the 109 cells §7.7
+moved `REFUSES → AGREES` were moved onto the host, not onto the device.** The
+other 107 were not: they are counted below and they are clean.
+
+**Why the gate that exists to refuse this did not refuse it.**
+`MPS_HOST_READBACK_OPS` refuses `aten.sort.default`'s *kind* of kernel by
+name, and none of these eight is on it, because nothing put them there.
+`test_shim.py`'s derivation re-derives the list from `aten.rs` on every gate
+run — it is the check §7.3 leans on and §7.12 praised — and it follows
+**exactly six helper names** plus a derived set of *cross-file* helpers. Each
+of these eight kernels reaches `read_flat` through a seventh in-file helper
+(`order_along`, `argsort_core`, `floor_divide_impl`) or through another
+operator's kernel function (`scatter_inplace` calls `scatter_src`). §7.12
+described the scan's blind spot as "**one file over**". That was too narrow and
+this corrects it: the blind spot is **one un-named hop**, in the same file.
+Twelve production cells sit in it.
+
+**It was not fixed in the round that found it, and that was a decision rather
+than an omission** — a capability decision, which CLAUDE.md §5.7 leaves with
+the user, and an audit is not the round to take it in. `test_metalplace.py`
+pinned all three halves instead — the download happens, the op is not refused,
+the scan does not derive it — so that fixing any one of them would turn the
+suite red and force this section and §6's table to move with it.
+
+**§7.16 is that fix**, taken on the user's decision, and all three pins moved
+together as designed. The eight are refused by name, two more turned up in the
+same blind spot once the derivation was deepened, and the assertions in
+`test_metalplace.py` now run in the opposite direction. The table above and
+the counter deltas in it are kept as the **record of the measurement that
+found them**, not as a description of the current build: `sort` on
+`int64`/`mps` raises now and moves no counter at all.
+
+#### The claims that are now counted, and the bracket they were counted in
+
+The bracket is the same for every number below, and it is stated because
+counters from different brackets read like regressions side by side (CLAUDE.md
+§2): operands are built **before** the first snapshot, the counters are read
+immediately before and immediately after the single `_aten_dispatch` under
+test, and results are read back **after** the second snapshot. Nothing else
+runs between the two reads.
+
+| claim | cells counted | result |
+|---|---|---|
+| `softmax_on_device` (MPSATTN.md §3.1) | 6 — `_softmax` and `_safe_softmax` × `float32`/`float16`/`bfloat16` | `compute_encoders` **5**, `host_downloads` **0** |
+| §7.7's in-place family | 52 — the 14 operators × their dtypes | `host_downloads` **0**, `host_upload_bytes` ≤ 8, `compute_encoders ≥ 1` for the 12 that compute |
+| §7.8's 43 in-place operators | every (operator, dtype) pair that reaches | `host_downloads` **0** for all but `scatter_.src`/`scatter_.value` |
+| §7.3's four `abs` cells (control) | 4 | already counted by §7.11; unchanged |
+
+Each of these is asserted beside element-wise agreement against an oracle
+computed in a **separate subprocess** at `tools/golden/dtypes.py`'s derived
+tolerance, except the 43-operator sweep, which is **placement only and says
+so** — its values are graded by `test_mpsinplace.py` and by §6's table, and
+duplicating an oracle for 43 operators would have made the file about
+agreement instead of about where the work happened (CLAUDE.md §4).
+
+#### What the counter cannot reach, stated rather than approximated
+
+* `compute_encoders` is a **lower bound on GPU dispatches** — a successful
+  `command_encoder()`, handed to a `candle_metal_kernels::call_*` that encodes
+  at least one `dispatch_thread*`. It is not a `dispatch_threads` count; those
+  live in `candle-metal-kernels`, which this vendoring does not cover.
+* `blit_encoders` moves for a device-to-device copy **and** for a readback,
+  because a readback blits first. The two are not separated, so
+  `blit_encoders > 0` is never used here as evidence of device residency.
+  `host_downloads == 0` is.
+* **199 `mps` `AGREES` cells move no counter at all** and correctly so: they
+  are views, layout changes and dtype-identity cases (`view`, `permute`,
+  `slice`, `t_`, `clone`, `_to_copy` within a dtype, `round`/`ceil`/`floor` on
+  an integer). For these `compute_encoders ≥ 1` is unavailable and demanding it
+  would be widening the claim to make it countable. What *is* available is that
+  `host_uploads` and `host_downloads` are both zero, which a host-computed twin
+  cannot achieve — it has to move the bytes both ways.
+* **Two operators are correctly blit-only** and are asserted as such rather
+  than excused: `zero_` (a device `const_set` plus a copy) and `copy_` (the copy
+  alone) have `compute_encoders == 0` by construction. The assertion for them
+  is `blit_encoders ≥ 1` with both byte counters at zero.
+* **`uniform_` downloads 24 bytes and is exempt, not clean.** It is one of the
+  two names in `MPS_READBACK_BUT_ALLOWED`: its readback is of a *constant* it
+  built itself (`narrow_roundtrip_f32`), not of an input. The counter cannot
+  tell those apart — it counts bytes leaving the device, and the reason they
+  are leaving is not in the count. The same is true of
+  `_local_scalar_dense` (`.item()`), whose readback is what the caller asked
+  for. **Both are the class of claim this instrument cannot settle**, and both
+  remain settled by reading the kernel.
+* **A cell passing is not an operator being right** (§7.9's `clamp`). The
+  counter says where the work happened, never whether the shape exercised the
+  operator. Of the cells counted above, the ones whose single shape cannot
+  distinguish a correct kernel from a wrong one are named in
+  `test_metalplace.py`'s docstrings rather than counted as proof.
+
+#### Nullification
+
+Three mutants, each built through `vendor/install_shim.sh` so it reached the
+**vendored** tree, and each removed afterwards
+(`sh vendor/vendor_candle.sh --check` passes byte for byte).
+
+Each was built and measured **alone**, so the attribution below is measured
+rather than inferred.
+
+| mutant | what it broke | `test_metalplace` | `test_metalcount` |
+|---|---|---|---|
+| M-A: `note_compute_encoder` gutted in the fork | the compute counter | softmax RED, in-place family RED | `abs` RED |
+| M-B: `note_host_download` gutted in the fork | the download counter | §7.14 pin RED, 43-operator sweep RED | readback calibration RED |
+| M-C: a host-computed softmax twin in `tensor.rs`, one file over from `aten.rs` | `softmax_on_device`'s placement | softmax RED (`compute 0, blit 1, uploads 1 (24 B), downloads 1 (24 B)`) | green — it is about `abs` |
+
+M-C also left **`test_mpsattn.py` — the suite whose entire subject is
+`softmax_on_device` — green, 0 FAIL**, while softmax on `mps` computed on the
+CPU.
+
+**One honest weakness, found by running M-A and M-B separately.** The
+`host_downloads == 0` half of the softmax and in-place tests **survives M-B**:
+a download counter that can never move satisfies `== 0` trivially. What stops
+that is `test_metalcount.py::test_a_readback_costs_exactly_the_tensors_bytes`,
+which asserts a `.cpu()` costs exactly the tensor's bytes and does go RED under
+M-B. So the zero in this file is only meaningful because that calibration runs
+in the same gate — it is not self-supporting, and it is written down here
+rather than left to be discovered by the next round.
+
+M-C is the result worth keeping. It repeats §7.12's M2 on a different kernel
+and gets the same answer: the suite built for that kernel cannot tell that the
+kernel stopped running on the device. One test elsewhere did fail under M-C —
+`test_shim.py`'s central-difference tape check — but on **values**, because the
+twin accumulated in `f32` rather than the op's accumulation dtype. That is the
+twin being imperfect, not the gate detecting a fallback, and it is recorded
+that way rather than counted as a catch.
+
+**Which of the new tests survive which mutant.**
+`test_the_readback_derivation_scan_does_not_reach_these_kernels` survives all
+three, correctly — it is a claim about source, and no counter mutant can touch
+it. Every other test in the file dies to at least one: softmax and the in-place
+family to M-A (and softmax also to M-C), the §7.14 pin and the 43-operator
+sweep to M-B.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_softmax_on_mps_opens_metal_kernels_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_in_place_family_on_mps_computes_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs softmax_on_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs twin_softmax absent -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+
+### 7.15 `candle_metal_kernels::DType` — the instantiation is macro-driven, and that is the shape of the `I8` decision
+
+§7.13 declined `DType::I8` on Metal and left the second-crate decision with the
+user. The one fact that decision needs, read rather than implemented:
+
+**Adding `I8` to `candle-metal-kernels` is adding instantiation lines to
+existing macros. It is not writing a Metal shader per operator.** Every kernel
+family in `src/metal_src/*.metal` is a C++ template instantiated through an
+`init_kernel` macro, and the six-dtype list is a hand-written list of macro
+*invocations* — one line per dtype — inside a per-family macro:
+
+```c
+#define init_binary(bop)                             \
+    init_binary_k(bop, bop, f32,  float,    float)   \
+    init_binary_k(bop, bop, f16,  half,     half)    \
+    init_binary_k(bop, bop, bf16, bfloat,   bfloat)  \
+    init_binary_k(bop, bop, u8,   uint8_t,  uint8_t) \
+    init_binary_k(bop, bop, u32,  uint32_t, uint32_t)\
+    init_binary_k(bop, bop, i64,  int64_t,  int64_t)
+```
+
+One added line there lights up **all six arithmetic binaries and all six
+comparison binaries at once**, each in its nine layout variants
+(`_strided`, `_lstrided`, `_scalar`, `_cs`, `_sc`, …), because `init_binary_k`
+fans those out. `cast.metal` is the same shape: `init_cast_all` is a six-line
+macro and one more line plus one more top-level `init_cast_all(i8, int8_t);`
+produces every cast pair to and from `i8`.
+
+The families that are **not** macro-fanned over dtype are hand-enumerated at
+the top level, one line per (index dtype, value dtype) pair:
+`INDEX_OP` ×16, `INDEX_ADD_OP` ×18, `GATHER_OP` ×16, `SCATTER_OP` ×10,
+`SCATTER_ADD_OP` ×10, `WHERE_OP` ×18, `ARGSORT` ×6. Adding `i8` as a *value*
+type there is one line per index dtype per family, not a new shader.
+
+So the count is roughly **30 added lines and zero new shader bodies** for the
+elementwise, cast, indexing, ternary and sort families. Two things are outside
+that:
+
+* `init_unary_float` covers `f32`/`f16`/`bf16` only, and the integer unary
+  instantiations are a hand-written three (`copy` for `u8`, `u32`, `i64`).
+  **candle has no integer `sin`/`exp`/`sqrt` on Metal and adding `I8` does not
+  change that** — nor should it, since upstream refuses those on integers too.
+* `quantized.metal`, `mlx_gemm.metal`, `gemv.metal` and
+  `scaled_dot_product_attention.metal` are float-only and untouched by this.
+
+The Rust half is the ordinary enum widening: `DType` gains a variant,
+`size_in_bytes` gains an arm, and every kernel-name suffix table gains `"i8"`.
+
+**Nothing was implemented and nothing was vendored for this section.** It is a
+reading of `candle-metal-kernels-0.11.0` as published, recorded so that §7.13's
+open decision is made against a measured shape rather than a guessed one.
+
+### 7.16 The twelve cells are withdrawn, and the derivation that missed them now follows calls
+
+§7.14 found twelve published `AGREES` cells computed on the host and left the
+capability decision with the user. The decision was taken: **refuse them.**
+
+#### Why refusal, and not a third category
+
+The values were never wrong. What was false is the **placement** — and on a
+device whose whole point is avoiding host round trips, an invisible sync point
+inside a `generate` loop is a performance cliff nobody can see. The obvious
+alternative was an "allowed but host-assisted" grade, and it was rejected for a
+reason that is about the instrument rather than about taste:
+`MPS_HOST_READBACK_OPS` already answers exactly this question for every other
+operator that reaches the host, and a third category would create a state
+`_C._metal_counters()` cannot distinguish from a real defect. That counter is
+the only instrument that has ever caught a host-computed twin (§7.12, and three
+Vulkan rounds before it). `MPS_READBACK_BUT_ALLOWED` is deliberately two names
+for the same reason.
+
+#### What it costs, named rather than glossed
+
+**All twelve withdrawn cells are integral dtypes.** The float columns of these
+operators were *already* not running on `mps`, and that is measured rather than
+assumed: `sort` on `float32`/`mps` raises
+
+    aten.sort.default: candle: Metal contiguous to_dtype F32 F64 not implemented
+
+from inside candle, because `read_flat` widens to `f64` and Metal has no
+double. So the refusal takes the integral columns and **re-labels** the float
+ones; it does not remove a working float path.
+
+| operator | withdrawn (`AGREES` → `REFUSES`) | re-labelled |
+|---|---|---|
+| `aten.sort.default` | `int64`, `bool` | 6 already-`REFUSES` cells |
+| `aten.argsort.default` | `int64`, `bool` | 6 |
+| `aten.argsort.stable` | `int64`, `bool` | 6 |
+| `aten.topk.default` | `int64` | 6, plus `bool` `REACHES` → `REFUSES` |
+| `aten.floor_divide.default` | `int64` | 7 |
+| `aten.floor_divide.Scalar` | `int64`, `bool` | 6 |
+| `aten.scatter_.src` | `int64` | 3 `BREAKS` + `bool` `BREAKS` + 3 `REFUSES` |
+| `aten.scatter_.value` | `int64` | the same shape |
+| `aten.linalg_vector_norm.default` | — | 3 `BREAKS` → `REFUSES`, 5 already `REFUSES` |
+| `aten.norm.ScalarOpt_dim` | — | the same shape |
+
+**27 cells in §6's table change; 12 of them are a capability withdrawal and
+15 are a re-labelling.** Counting them together would have made the
+withdrawal look twice its size, and counting only the withdrawal would have
+hidden that the document now says `REFUSES` where it said `BREAKS`.
+
+**Every refusal names what still works.** `device.rs::MPS_HOST_READBACK_NOTES`
+carries, per operator, the dtypes whose **CPU** column agrees with upstream,
+and the gate appends it:
+
+    aten.sort.default: not implemented for the mps device. This kernel reads
+    the tensor back to host memory and computes there, [...] Move the tensor
+    with .cpu() to ask for the CPU on purpose. On the CPU this op agrees with
+    upstream element-wise for float32, float16, bfloat16, float64, int64,
+    int32, int8, bool; no dtype of it computes on mps, so .cpu() is the whole
+    answer rather than a dtype change.
+
+The note does **not** say "the float column works on mps", because it does
+not. Writing the comforting sentence would have been §7.9's `clamp` in prose —
+a claim published because it sounded right, never re-run. Instead every dtype
+in every note is re-measured against an oracle in a **separate subprocess** by
+`test_mpsrefuse.py::test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu`,
+at `tools/golden/dtypes.py`'s derived tolerance.
+
+#### The half that matters: the derivation, not the list
+
+Adding names to a list fixes twelve cells once. What stops the class recurring
+is the derivation, and its blind spot had by then been mis-stated twice:
+
+| said | where | correct? |
+|---|---|---|
+| "one call deeper" | §7.5 | no |
+| "one *file* over" | §7.12 | no — §7.12's M2 happened to be one file over |
+| "an un-named hop **in the same file**" | §7.14 | yes, and twelve production cells were in it |
+
+`test_shim.py`'s derivation no longer matches names at all. It builds the call
+graph of **every `src/*.rs`**, seeds it with the functions whose own bodies
+hold a readback marker (`.to_vec[0-3]`, `.to_scalar`, `.to_cpu(`), and closes
+it transitively by reverse BFS. A dispatched operator is derived if any path
+from its kernel reaches a readback, and the derivation returns the **witness
+path**, so a failure prints how the kernel gets to the host rather than only
+that it does.
+
+    sort_default, topk_default        -> order_along        -> read_flat
+    argsort_default, argsort_stable   -> argsort_core       -> order_along -> read_flat
+    floor_divide_{default,scalar}     -> floor_divide_impl  -> read_flat
+    scatter_inplace                   -> scatter_src        -> read_flat
+    linalg_vector_norm_default,
+    norm_scalaropt_dim                -> norm_pow_walk      -> read_flat
+
+**It found ten, not eight.** `aten.linalg_vector_norm.default` and
+`aten.norm.ScalarOpt_dim` share `norm_pow_walk`, whose accumulate-in-`acc_t`
+reduction opens with an unconditional `read_flat` (§7.14 never looked at them
+because no counter was pointed there). They were **not** on the list of eight
+this round was given, which is the only interesting thing about them: the
+derivation produced two names nobody had handed it. Their cost is zero
+capability — every `mps` cell of both was already `REFUSES` or `BREAKS`.
+
+**The independence is proved mechanically, not by reading.** A derivation that
+works because somebody added the answer to a list is the same defect wearing a
+fix, so `test_mpsrefuse.py::test_the_derivation_finds_the_ten_without_being_told_their_names`
+stubs `_C._shim_mps_host_readback_ops()` to the empty list, re-runs the
+derivation, and asserts the result is unchanged and still contains all ten,
+each through a path of **more than one hop** ending at a function that really
+holds a marker.
+
+**The false-positive direction is guarded at the call site.** A previous round
+found that matching `to_le_bytes` by bare name flags a dozen clean kernels,
+because it is an inherent method on every Rust integer. Calls are matched as
+`name(` **not preceded by `.` or `:`** for a function defined in the same
+module, and as `(crate::)?module::name(` across modules; a method call is
+neither. `test_a_readback_behind_two_un_named_hops_is_still_derived` asserts
+both directions on **synthetic** sources rather than on the real tree, so it
+cannot be satisfied by an accident of what `aten.rs` contains today.
+
+`_MPS_READBACK_EXEMPT` names are **barriers** in the graph rather than nodes:
+`scalar_arg` reads a zero-dim tensor *argument*, `scale_by_alpha` and
+`narrow_roundtrip_f32` read constants they built themselves. A kernel calling
+one has moved no dispatched tensor, and deriving through it would have put
+clean ops on the list.
+
+`test_cuda.py` stopped keeping its own copy of the predicate and imports
+`_ops_that_reach_the_host`. Its docstring already recorded that a copy had
+diverged once (`aten.view.dtype`, 2026-09-19); it would have diverged a second
+time here, by ten names.
+
+#### Nullification
+
+Both mutants were built through `vendor/install_shim.sh` so they reached the
+**vendored** tree, run alone, and removed afterwards.
+
+| mutant | what it breaks | result |
+|---|---|---|
+| N-1: `_callees` returns `set()` — the transitive hop blinded, one-hop matching only | the derivation | `test_shim.py` derivation RED, `test_metalplace` RED, `test_mpsrefuse` RED — all ten stop being derived, i.e. straight back to §7.14 |
+| N-2: `aten.sort.default` removed from `MPS_HOST_READBACK_OPS`, readback left in place | the refusal, not the readback — the MPSATTN.md §3.1 defeat | `test_shim.py` derivation RED (`missing: ['aten.sort.default']`), `test_mpsrefuse` RED, `test_metalplace` RED |
+| N-3: a refusal note widened to advertise a dtype that does not work | the note, the only part of this a user reads | RED — but see below |
+
+**N-3 is the one worth reading, because its first form survived.** Adding
+`int8` to `scatter_.src`'s note left the whole suite green. So did adding
+`float32` — and §6 grades `scatter_.src`'s `float32_cpu` cell **BREAKS**. The
+subprocess oracle was not lying: at the one shape that test uses, `[2, 3]`
+with an `int64` index, the shim and upstream really do agree. §6's BREAKS
+comes from a different probe. **One shape cannot speak for a column**, which
+is §7.9's `clamp` in miniature and was rediscovered here rather than
+remembered.
+
+The fix is not a bigger oracle. It is that every dtype a note advertises is
+now also required to be graded `AGREES` in §6's CPU column for that operator,
+so the note has the whole matrix sweep behind it instead of one tensor. With
+that assertion in place both forms of N-3 go RED, and it was confirmed by
+running them separately — `linalg_vector_norm` at `int64` (which upstream
+itself refuses) and `scatter_.src` at `float32` (which §6 grades BREAKS).
+
+**Which tests survive which mutant, including the ones that survive both.**
+`test_a_readback_behind_two_un_named_hops_is_still_derived` dies to N-1 and
+survives N-2, correctly: it is a claim about the derivation, and N-2 does not
+touch it. `test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses` reads
+the document and the build's note table, and no counter, so it survives
+**both** N-1 and N-2 — it is a consistency check between written things and
+is labelled as one rather than counted as proof of placement. It is the only
+test that catches N-3. `test_no_newly_refused_op_answers_any_mps_dtype`
+survives N-1 (the list is still right) and dies to N-2.
+
+**One weakness carried forward rather than rediscovered.** §7.14 recorded that
+`host_downloads == 0` survives gutting the download counter, because a counter
+that never moves satisfies `== 0`. `test_eight_operators_answer_an_mps_dispatch_from_the_host`
+now asserts exactly that zero, so it inherits the weakness: its `== 0` half is
+meaningful only because `test_metalcount.py::test_a_readback_costs_exactly_the_tensors_bytes`
+runs in the same gate. Its other two halves — the refusal fires, and it is the
+readback gate's wording — do not depend on any counter.
+
+**A cell passing is not an operator being right** (§7.9's `clamp`). None of the
+above says these operators are correct on the CPU at every shape; it says the
+dtypes each note advertises agree with upstream at the shape measured, and the
+shape is `[2, 3]`.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_NOTES present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs host_readback_note present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _ops_that_reach_the_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _host_reaching_functions present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _callees present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_ten_newly_refused_ops_are_refused_and_the_message_says_what_works present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_no_newly_refused_op_answers_any_mps_dtype present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_derivation_finds_the_ten_without_being_told_their_names present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_a_readback_behind_two_un_named_hops_is_still_derived present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsrefuse.py test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs norm_pow_walk present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs order_along present -->
+<!-- DOCWATCH: op-implemented aten.sort.default -->
+<!-- DOCWATCH: op-implemented aten.topk.default -->
+
+### 7.17 `DType::I8` on Metal — vendored, and 137 of the 284 cells now agree
+
+§7.13 declined this and left the decision with the user; §7.15 read the
+instantiation so the decision could be made against a measured shape. This
+section is the round that made it. **§7.13 is not corrected below — it was
+right about what a `candle-core`-only change would buy.** What changed is that
+the second crate was approved, so the other half could be built.
+
+#### The survey was re-checked first, because it is why this was approved
+
+§7.15 was read-only and this round depended on it, so it was verified against
+`candle-metal-kernels-0.11.0` as published — the crate whose sha256
+`242e83c6…3d3e` is the `checksum` `rust/torch_c/Cargo.lock` already carried,
+i.e. cargo's own pin and not one chosen here.
+
+| §7.15 said | measured |
+|---|---|
+| `candle_metal_kernels::DType` has six variants | **holds** — `BF16 F16 F32 I64 U32 U8`, `src/lib.rs` |
+| `init_binary` / `init_boolean_binary` are per-dtype macro invocation lists | **holds** |
+| `init_cast_all` is one macro plus one top-level call | **holds** |
+| `INDEX_OP` ×16, `INDEX_ADD_OP` ×18, `GATHER_OP` ×16, `SCATTER_OP` ×10, `SCATTER_ADD_OP` ×10, `WHERE_OP` ×18, `ARGSORT` ×6 | **holds, all seven counts exactly** |
+| `init_unary_float` is float-only; integer unary is `copy` only | **holds** — so no `int8` `sin`/`exp`/`sqrt`, as upstream also refuses |
+| `quantized`/`mlx_gemm`/`gemv`/`sdpa` are float-only | **holds** |
+| "roughly 30 added lines and zero new shader bodies" | **zero new shader bodies holds.** The line count was low: **43 MSL lines** (40 instantiations + 3 comment), because each macro exists twice behind `#if defined(__HAVE_BFLOAT__)` and both copies need the line |
+
+Three things the survey did not name, found only by compiling:
+
+* **`impl EncoderParam for i8`** (`src/utils.rs`). Without it `const_set` does
+  not typecheck, so `zero_`, `fill_` and every factory stay refused.
+* `copy2d::I8` and `sort.rs`'s two `DType` match tables, which are Rust
+  name/size tables rather than MSL.
+* `mlx_sort.metal`'s block-sort instantiations, which are a third list beside
+  `sort.metal`'s `ARGSORT`.
+
+Total: **51 added lines across 12 files**, none of them a shader body. The
+survey's *shape* was right and its *size* was 40% low; it was right about the
+thing the decision turned on.
+
+#### The result, in the three grades, and the 284 is not the number
+
+    builds     both crates compile; the MSL library loads on the device.
+    reaches    0 of the 284 cells still fail at stage `operands`.
+    AGREES     137.
+
+**147 do not agree, and 99 of them never could.** §4.3a counted 284 cells at
+stage `operands` and read that as the size of the prize. It is not: a cell can
+only reach AGREES on `mps` if `int8` agrees on the **CPU** too, and 99 of the
+284 have `int8_cpu` at BREAKS, REFUSES or REACHES. The real ceiling was
+**185**, and 137 of those 185 were taken. This is the same error §4.3a itself
+warned about one paragraph later — a number that names operators it has never
+asked the question of — repeated by the document that raised it.
+
+The 48 of the ceiling that remain, and the 99 that were never in it, cluster
+into four causes and **none of them is an `int8` shader**:
+
+| cause | cells | what it is |
+|---|---|---|
+| **A** | 98 | the `mps` host-readback gate (§7.16 and MPSATTN.md §3.1), which refuses these operators on **every** dtype. `int8` changed nothing here and was never going to |
+| **B** | 38 | **upstream itself refuses `int8`** — `"round_cpu" not implemented for 'Char'`, `mean(): input must be floating point`, `masked_fill only supports boolean masks`, `where expected condition to be a boolean tensor`. There is no oracle, so there is nothing to agree with |
+| **C** | 10 | candle has no `I8` kernel for that specific op: `mlx matmul doesn't support I8` (`mm`, `bmm`, `matmul`, `addmm`, `baddbmm`), `reduce op Max I8`, `unary usign I8`, and three `I8 <-> F64` casts which §3.1 refuses on Metal by name anyway |
+| **D** | 1 | `convolution`, refused by this shim as floating-point only |
+
+**C is the only one a further `candle-metal-kernels` change would move**, and
+it is 10 cells across 7 operators — the smallest of the four, which is the
+opposite of what §4.3a's headline implied.
+
+#### What was vendored, and on what terms
+
+`vendor/candle-metal-kernels/`, committed, on **exactly** the terms
+`vendor/candle-core/` is on: the sha256-pinned published crate plus
+`vendor/int8-candle-metal-kernels-0.11.0.patch`, regenerated by
+`sh vendor/vendor_candle.sh` and verified byte for byte by `--check` in the
+gate. `vendor_candle.sh` was extended to loop over both crates rather than
+gaining a sibling script, and `test_int8.py` now runs the same four vendoring
+tests against each: patch path relative and pointing at the tree `--check`
+verifies, lock resolving from the fork and not the registry, a drifted tree
+refused, a wrong crate refused. **`--check` reporting one tree instead of two
+is itself a failure**, asserted, because that is how a second crate silently
+stops being covered.
+
+The existing patch is still named `int8-…-cpu.patch` although it now carries
+Metal counters and Metal `I8`. Renaming it reaches `vendor_candle.sh`,
+docs/numerics/INT8.md §1.2 and `test_int8.py`; it is **left alone**, and the
+script says so where a reader meets it.
+
+#### Nullification
+
+Five mutants, each built through `vendor/install_shim.sh` so it reached the
+**vendored** tree, run alone, and removed afterwards. `--check` was re-run
+after the last one and both trees are byte for byte their patches again.
+
+| mutant | what it breaks | result |
+|---|---|---|
+| M-1: `init_binary_k(bop, bop, i8, int8_t, int8_t)` deleted from both `init_binary` branches | the arithmetic binaries | RED — `Error while loading function: badd_i8` |
+| M-2: the top-level `init_cast_all(i8, int8_t);` deleted | every cast *off* `i8` | RED in two tests — `cast_i8_f32`, and `cast_i8_i64` inside the comparisons |
+| M-3: the three `WHERE_OP(int8_t, …)` lines deleted | the ternary family | RED — `where_u8_i8 was not found in the library` |
+| M-4: `CpuStorage::I8` returned to the refusing arm in `candle-core` | §4.3a cause A, restored | RED in four tests — `unsupported dtype I8 for op to_dtype`, the exact pre-change message |
+| M-5: **a host twin** — `to_dtype` for `I8` downloads, converts on the CPU and uploads | nothing a value can see | RED **only on the counters** — `read 2 tensor(s) back to the host (16 bytes)`. Every element was still correct and `.device` still said `mps` |
+
+**M-5 is the one that matters**, and it is the experiment CLAUDE.md §2 records
+as never having been run on Metal. It has now been: a host-computed twin of
+the `int8` cast produced **correct values under an `mps` label**, and the
+agreement assertions did not notice. `host_downloads == 0` did.
+
+**Which tests survive which mutants.**
+`test_the_inputs_actually_wrap` survives all five — it is a property of the
+input data and touches no device, which is what it is for.
+`test_int8_builds_on_mps_and_makes_the_round_trip` survives M-1, M-2, M-3 and
+M-5 and dies only to M-4; it makes no counter claim, correctly, because a
+buffer build legitimately uploads.
+`test_int8_casts_agree_with_upstream_on_mps` is the only one that dies to both
+M-2 and M-5.
+
+#### What this round did not do, stated rather than left to be inferred
+
+* **No `int8` reduction, matmul or `sign` on Metal** (cause C, 10 cells). Each
+  is a real instantiation question and none was attempted.
+* **`maximum` and `minimum` are not in `test_i8mps.py`**, and not for a dtype
+  reason: they are on `_shim_mps_host_readback_ops()` for every dtype, so
+  including them would fail this file for something it is not about.
+* **The sweep is one shape per operator** (§5), so a cell graded AGREES here
+  is graded at that shape. `test_i8mps.py` exercises inputs the sweep's cell
+  does not contain — both `int8` endpoints in **both** operands, and inputs
+  where `add`, `sub` and `mul` each wrap at least twice — because §7.9's
+  `clamp` and §7.16's N-3 both passed a green suite on a cell that lacked the
+  value that mattered.
+* **Only the `int8_mps` column was re-swept**, for the 284 operators. The other
+  fifteen columns moved too between `b4f89f3` and this round, but those moves
+  are §7.16's refusals and other develop traffic, not this change, and are not
+  attributed to it here.
+
+<!-- DOCWATCH: symbol-in-file vendor/vendor_candle.sh candle-metal-kernels present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml candle-metal-kernels present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/lib.rs I8 present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/binary.metal "init_binary_k(bop, bop, i8, int8_t, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i8, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/ternary.metal where_u8_i8 present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
+<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs cast_i8_f32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_builds_on_mps_and_makes_the_round_trip present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_binary_operators_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_casts_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_int8_where_agrees_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_i8mps.py test_the_inputs_actually_wrap present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry present -->

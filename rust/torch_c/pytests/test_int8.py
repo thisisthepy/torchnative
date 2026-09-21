@@ -40,6 +40,7 @@ _CRATE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _REPO_ROOT = os.path.abspath(os.path.join(_CRATE_DIR, "..", ".."))
 _SCRIPT = os.path.join(_REPO_ROOT, "vendor", "vendor_candle.sh")
 _FORK = os.path.join(_REPO_ROOT, "vendor", "candle-core")
+_KERNELS_FORK = os.path.join(_REPO_ROOT, "vendor", "candle-metal-kernels")
 
 
 # --------------------------------------------------------------------------
@@ -104,6 +105,93 @@ def test_the_fork_check_refuses_a_tree_that_drifted_from_the_patch():
         proc = _run_script("--check", env_extra={"TORCHNATIVE_CANDLE_DIR": copy})
         assert proc.returncode != 0, proc.stdout
         assert "dtype.rs" in proc.stderr, proc.stderr
+    finally:
+        shutil.rmtree(tmp)
+
+
+# --------------------------------------------------------------------------
+# the SECOND fork -- `candle-metal-kernels`
+#
+# docs/devices/matrix.md §7.17. `DType::I8` on Metal is two halves that are
+# useless apart: `candle-core` can build the buffer, `candle-metal-kernels`
+# owns the shader symbol every kernel then looks up by name. The second crate
+# therefore gets the identical discipline -- its own sha256-pinned published
+# crate, its own patch file, and `--check` covering it -- rather than a
+# parallel mechanism beside it. These four tests are the four above, asked of
+# the second crate, and they are written out rather than parametrised so that
+# a failure names which crate drifted.
+# --------------------------------------------------------------------------
+
+
+def test_the_metal_kernels_patch_path_is_relative_and_is_the_tree_the_script_writes():
+    with open(os.path.join(_CRATE_DIR, "Cargo.toml"), "rb") as f:
+        manifest = tomllib.load(f)
+    path = manifest["patch"]["crates-io"]["candle-metal-kernels"]["path"]
+    assert not os.path.isabs(path), path
+    resolved = os.path.normpath(os.path.join(_CRATE_DIR, path))
+    assert resolved == _KERNELS_FORK, (resolved, _KERNELS_FORK)
+    with open(os.path.join(resolved, "Cargo.toml"), "rb") as f:
+        package = tomllib.load(f)["package"]
+    assert (package["name"], package["version"]) == ("candle-metal-kernels", "0.11.0"), package
+
+
+def test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry():
+    with open(os.path.join(_CRATE_DIR, "Cargo.lock"), "rb") as f:
+        lock = tomllib.load(f)
+    entries = [p for p in lock["package"] if p["name"] == "candle-metal-kernels"]
+    assert len(entries) == 1, entries
+    assert entries[0]["version"] == "0.11.0", entries[0]
+    assert "source" not in entries[0], (
+        "Cargo.lock resolves candle-metal-kernels from %s -- the fork is not in "
+        "the build, so every I8 shader this repository added is absent and the "
+        "int8 cells fall back to a refusal" % entries[0].get("source"))
+
+
+def test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch():
+    proc = _run_script("--check")
+    assert proc.returncode == 0, "exit %d\n%s\n%s" % (proc.returncode, proc.stdout, proc.stderr)
+    assert ("sha256 242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e verified"
+            in proc.stdout), proc.stdout
+    assert proc.stdout.count("byte for byte") == 2, (
+        "--check reported %d trees, not 2. Both forks have to be covered, or "
+        "one of them can drift silently.\n%s"
+        % (proc.stdout.count("byte for byte"), proc.stdout))
+
+
+def test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch():
+    """Without this the test above could be a script that exits 0."""
+    tmp = tempfile.mkdtemp(prefix="int8-mk-drift-")
+    try:
+        copy = os.path.join(tmp, "candle-metal-kernels")
+        shutil.copytree(_KERNELS_FORK, copy)
+        target = os.path.join(copy, "src", "metal_src", "binary.metal")
+        with open(target, "a", encoding="utf-8") as f:
+            f.write("\n// an edit made to the fork and not to the patch\n")
+        proc = _run_script("--check", env_extra={"TORCHNATIVE_CANDLE_KERNELS_DIR": copy})
+        assert proc.returncode != 0, proc.stdout
+        assert "binary.metal" in proc.stderr, proc.stderr
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one():
+    tmp = tempfile.mkdtemp(prefix="int8-mk-crate-")
+    try:
+        bogus = os.path.join(tmp, "candle-metal-kernels-0.11.0.crate")
+        with open(bogus, "wb") as f:
+            f.write(b"not the published crate")
+        target = os.path.join(tmp, "must-not-be-written")
+        # `candle-core` is verified first and would write the real tree, so it
+        # is pointed at a scratch directory: this test is about the second
+        # crate's refusal, not about rewriting the first.
+        proc = _run_script(env_extra={
+            "TORCHNATIVE_CANDLE_KERNELS_CRATE": bogus,
+            "TORCHNATIVE_CANDLE_KERNELS_DIR": target,
+            "TORCHNATIVE_CANDLE_DIR": os.path.join(tmp, "scratch-candle-core"),
+        })
+        assert proc.returncode != 0, proc.stdout
+        assert "wrong sha256" in proc.stderr, proc.stderr
+        assert not os.path.exists(target), "a refused crate still wrote a tree"
     finally:
         shutil.rmtree(tmp)
 

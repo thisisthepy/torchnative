@@ -922,6 +922,30 @@ _MPS_REACHES = {
     "int64|sum",
     "int64|to_f32",
     "int64|transpose_contig",
+    # `int8` joined this set on 2026-09-20, when `candle-metal-kernels` was
+    # vendored as a second fork and `DType::I8` gained its shader symbols
+    # (docs/devices/matrix.md §7.17). Sixteen cells, the same sixteen `int64`
+    # reaches -- `max` and `argmax` are absent because candle has no `I8`
+    # reduce kernel, and `matmul`/`mean`/`softmax` because mlx matmul and the
+    # float-only reductions do not take it. Reaching is not the claim:
+    # `test_the_dtype_device_matrix_agrees_with_upstream` grades these by
+    # value against upstream.
+    "int8|abs",
+    "int8|add",
+    "int8|clone",
+    "int8|cumsum",
+    "int8|div",
+    "int8|eq",
+    "int8|exp",
+    "int8|index0",
+    "int8|mul",
+    "int8|neg",
+    "int8|pow2",
+    "int8|sqrt",
+    "int8|sub",
+    "int8|sum",
+    "int8|to_f32",
+    "int8|transpose_contig",
     "uint32|abs",
     "uint32|add",
     "uint32|clone",

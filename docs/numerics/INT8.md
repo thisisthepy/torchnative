@@ -146,6 +146,42 @@ normalised package crates.io publishes.
 
 ---
 
+### 1.2a The second fork: `candle-metal-kernels` (2026-09-20)
+
+§1.2 describes one fork. There are now **two**, and they are two halves of one
+thing rather than one fork plus an extra.
+
+`candle-core`'s half can build an `int8` buffer on Metal. It cannot make any
+kernel run on it: `candle_metal_kernels::DType` has six variants and the MSL
+sources instantiate every kernel for those six only, so each one refuses for
+want of a shader symbol. docs/devices/matrix.md §7.13 measured that outcome
+exactly — 284 `operands` failures become 284 kernel-stage refusals and no cell
+moves to AGREES — which is why neither crate is vendored on its own.
+
+| | |
+|---|---|
+| `rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-metal-kernels = { path = "../../vendor/candle-metal-kernels" }` |
+| `vendor/candle-metal-kernels/` | **committed.** The published crate plus the patch, 984 KB |
+| `vendor/int8-candle-metal-kernels-0.11.0.patch` | the only place this fork is edited |
+| `vendor/vendor_candle.sh` | now loops over **both** crates; `--check` covers both |
+
+Pinned by sha256 `242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e`,
+which is the `checksum` `rust/torch_c/Cargo.lock` already recorded for the
+registry package — cargo's own pin, not one chosen here. The patch is **51
+added lines across 12 files and no new shader body**: `DType` gains a variant,
+`utils.rs` gains `impl EncoderParam for i8`, and the rest are instantiation
+lines inside macros that already fan out over dtype. docs/devices/matrix.md
+§7.17 is the measurement and §7.15 is the reading that sized it.
+
+**The patch file's name.** `int8-candle-0.11.0-cpu.patch` still says `cpu`
+although it has carried Metal counters for some time and now carries Metal
+`I8` as well. Renaming it reaches `vendor_candle.sh`, this section and
+`rust/torch_c/pytests/test_int8.py`; it is deliberately **left alone**, and
+`vendor_candle.sh`'s header says so where a reader meets it.
+
+<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
+<!-- DOCWATCH: symbol-in-file vendor/vendor_candle.sh int8-candle-metal-kernels present -->
+
 ## 2. Adding `I8` to `candle-core`: measured, not estimated
 
 Method: copy the crates.io package to a scratch directory this worktree alone uses

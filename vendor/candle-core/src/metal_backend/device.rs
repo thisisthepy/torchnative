@@ -156,6 +156,9 @@ impl MetalDevice {
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
         let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
+        // Counted after the encoder exists, so a failure to open one is not
+        // reported as a dispatch. See `super::counters`.
+        super::counters::note_compute_encoder();
         Ok(command_encoder)
     }
 
@@ -164,6 +167,7 @@ impl MetalDevice {
             .commands
             .blit_command_encoder()
             .map_err(MetalError::from)?;
+        super::counters::note_blit_encoder();
         Ok(command_encoder)
     }
 
@@ -263,6 +267,9 @@ impl MetalDevice {
         let new_buffer = Arc::new(new_buffer);
         self.residency_set.insert(&new_buffer);
         subbuffers.push(new_buffer.clone());
+        // The only host-to-device copy door in this backend: `with_data`,
+        // `storage_from_slice` and `storage_from_cpu_storage` all arrive here.
+        super::counters::note_host_upload(size);
         Ok(new_buffer)
     }
 
