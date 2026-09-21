@@ -219,3 +219,6 @@ tests/*
 !tests/*.py
 !tests/*.sh
 !tests/README.md
+
+# workspace caches (spike-venv, hf, gradle, konan, cargo targets)
+.caches/
