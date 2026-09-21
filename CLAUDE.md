@@ -313,7 +313,17 @@ gradient 를 아예 보지 않습니다.**
 
 ## 7. 병렬 실행과 기기
 
-**worktree 는 외장에** — `/Volumes/macMini/worktrees/<이름>`. 내부 SSD 는 여유가 없습니다.
+**worktree 는 이 저장소 안에** — `.worktrees/<이름>` (gitignore 됨). 저장소 자체가 외장
+(`/Volumes/macMini/thisisthepy/torchnative`)에 있으므로 내부 SSD 를 쓰지 않는다는 조건은
+그대로 만족하고, 저장소 밖에 흩어지지 않습니다.
+
+    git worktree add -b work/<이름> .worktrees/tn-<이름> develop
+
+**저장소 밖에 파일을 만들지 않는다.** 에이전트에게 줄 규칙, 스크립트, 산출물 전부 이
+저장소 안에 둡니다. 2026-09-22 에 조율 세션이 에이전트 규칙 파일을 `/tmp` 에 두었다가
+세션 재시작으로 **두 번** 잃었고, 그 다음에 `/Volumes/macMini/` 로 옮긴 것도 저장소
+밖이라 같은 잘못이었습니다. 지금 위치는 `tools/agent_rules.txt` 이고, 저장소 안 상대
+경로이므로 **모든 worktree 가 자동으로 갖습니다** — 절대 경로보다 나은 이유가 그것입니다.
 `build/` 와 `target/` 은 쌓이기만 하므로 주기적으로 지웁니다.
 
 **동시 실행 상한**: 빌드·테스트를 도는 에이전트 **3~4** (8 코어 · 16 GB). 읽기·분석만 하는
