@@ -211,3 +211,11 @@ cython_debug/
 
 # subagent worktrees live inside the repo
 .worktrees/
+
+# tests/ holds the VOICE4 (BigVGAN) fixtures. The scripts are tracked; the
+# assets are not -- model weights, the HF cache, vendored third-party source
+# and generated reference output are large and reproducible from the scripts.
+tests/*
+!tests/*.py
+!tests/*.sh
+!tests/README.md
