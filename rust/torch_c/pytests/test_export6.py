@@ -98,7 +98,7 @@ for line in open(path, encoding="utf-8"):
         rows.append({"error": "%%s: %%s" %% (type(exc).__name__, exc)})
 
 print(json.dumps({
-    "is_shim": "torchnative" in (torch.__file__ or ""),
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
     "names": names,
     "rows": rows,
 }))
@@ -168,7 +168,7 @@ import json
 import torch
 from torch.fx.operator_schemas import _torchscript_schema_to_signature
 
-out = {"is_shim": "torchnative" in (torch.__file__ or "")}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
 sigs = {}
 for spelling in [
     "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
@@ -235,7 +235,7 @@ with Record():
     torch.empty((2, 2), dtype=torch.float32)
 
 print(json.dumps({
-    "is_shim": "torchnative" in (torch.__file__ or ""),
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
     "records": records,
 }))
 """
@@ -330,7 +330,7 @@ _NEW_FACTORY_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 w = torch.empty(7, 5, device="meta", dtype=torch.float32)
 cases = {
     "new_empty": lambda: w.new_empty((3, 5)),
@@ -408,7 +408,7 @@ for line in open(path, encoding="utf-8"):
             vals.append([str(a.name), None, "ERR %%s" %% (exc,)])
     rows.append({"args": vals})
 print(json.dumps({
-    "is_shim": "torchnative" in (torch.__file__ or ""),
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
     "names": names,
     "rows": rows,
 }))
@@ -492,7 +492,7 @@ _LAYOUT_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 cases = {
     "arange": lambda: torch.arange(0, 6, 2, layout=torch.strided),
     "empty": lambda: torch.empty((2, 3), layout=torch.strided),
@@ -565,7 +565,7 @@ _PIN_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 cases = {
     "arange": lambda: torch.arange(0, 6, 2, pin_memory=False),
     "empty": lambda: torch.empty((2, 3), pin_memory=False),
@@ -630,7 +630,7 @@ import json
 import torch
 from torch._subclasses.fake_impls import _is_tensor_constructor, contains_tensor_types
 
-out = {"is_shim": "torchnative" in (torch.__file__ or "")}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
 
 ops = {
     "arange.start_step": torch.ops.aten.arange.start_step,
@@ -724,7 +724,7 @@ _SET_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, fn):
@@ -860,7 +860,7 @@ with Record():
     torch.ops.aten._to_copy.default(x, dtype=torch.float16)
 
 print(json.dumps({
-    "is_shim": "torchnative" in (torch.__file__ or ""),
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
     "records": records,
 }))
 """
@@ -915,7 +915,7 @@ _MORE_META_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, fn):

@@ -95,7 +95,7 @@ _DENSE_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, fn):
@@ -221,7 +221,7 @@ _META_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, fn):
@@ -308,7 +308,7 @@ import json
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, op):
@@ -379,7 +379,7 @@ import json
 import traceback
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "stage": "start"}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "stage": "start"}
 
 
 # A Python literal inside forward -- the construction that makes
@@ -515,7 +515,7 @@ import json
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 
 
 def record(name, fn):
@@ -628,7 +628,7 @@ _EXPIRED_PROBE = r"""
 import json
 import torch
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 s = torch.arange(4, dtype=torch.float32).untyped_storage()
 try:
     out["cases"]["expired"] = {"value": bool(torch.Storage._expired(s._weak_ref()))}
@@ -708,7 +708,7 @@ for line in open(path, encoding="utf-8"):
     except Exception as exc:
         rows.append([text.split("(", 1)[0], "RAISED", type(exc).__name__,
                      str(exc)[:80], None])
-print(json.dumps({"is_shim": "torchnative" in (torch.__file__ or ""),
+print(json.dumps({"is_shim": hasattr(torch._C, "_aten_implemented"),
                   "rows": rows}))
 """
 
