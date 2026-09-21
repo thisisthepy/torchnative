@@ -1,9 +1,17 @@
-import sys, time
+import os, sys, time
 import numpy as np
 import coremltools as ct
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol
-sys.path.insert(0, '/Volumes/macMini/worktrees/tn-anesubgraph/torchnative/src/main')
+# Derived from `__file__`, not typed. This line used to name an absolute
+# path inside a worktree that no longer exists, so the suite died at
+# import with `ModuleNotFoundError: No module named 'torchnative'` and
+# the gate counted the whole file as one red suite rather than as a
+# test result.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))),
+    'torchnative', 'src', 'main'))
 from torchnative.export import coreml as C
 
 def test_rope_can_be_implemented_in_coreml_without_strides():

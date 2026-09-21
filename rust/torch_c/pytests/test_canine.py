@@ -133,7 +133,7 @@ import torch
 LAYOUTS = %(layouts)s
 PADS = %(pads)s
 
-out = {"is_shim": "torchnative" in (torch.__file__ or ""), "cases": {}}
+out = {"is_shim": hasattr(torch._C, "_aten_implemented"), "cases": {}}
 op = torch.ops.aten.constant_pad_nd.default
 
 for name, shape, stride in LAYOUTS:

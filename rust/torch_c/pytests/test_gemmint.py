@@ -468,19 +468,42 @@ def test_the_mps_integer_refusal_is_not_served_by_a_readback():
     number the GPU did not compute, under an ``mps`` label, which
     docs/graph/NPU2.md is the record of this project getting wrong before.
 
-    **This evidence is structural and weaker than the agreement tests above**,
-    and says so: there is no Metal dispatch counter in this build
-    (docs/devices/matrix.md section 7.5), so nothing here can observe where a
-    computation happened. What it can observe is that no answer comes back at
-    all, which is the only outcome under which the question does not arise.
+    **There is a Metal dispatch counter in this build, and this test now uses
+    it.** The paragraph that stood here said there was not, citing
+    docs/devices/matrix.md section 7.5 -- but section 7.11 built one, and this
+    file was written against a tree that predated it: the round was scoped
+    before the int8 / ``candle-metal-kernels`` work landed, and inherited that
+    tree's ceiling along with its numbers. ``_C._metal_counters()`` is the
+    only instrument that can see a silent host fallback (CLAUDE.md section 2),
+    so the refusal is bracketed by it rather than argued for.
+
+    **Bracket**: counters read immediately before and immediately after a
+    single ``_aten_dispatch``, in this process, after an unmeasured dispatch
+    has warmed the device. A refusal must not move ``host_downloads`` at all
+    -- an answer served by a readback, or a readback begun and then discarded,
+    appears there and nowhere else.
     """
     if _mps_or_skip("the readback check") is None:
         return
+    counters = getattr(_C, "_metal_counters", None)
+    assert counters is not None, (
+        "_C._metal_counters() is gone. It is the only instrument that can "
+        "tell this refusal apart from a host readback wearing an mps label; "
+        "do not delete it, and do not weaken this test back into the "
+        "structural argument it used to be (docs/devices/matrix.md 7.11)")
     a = _tensor([1, 2, 3, 4], [2, 2], "int64").to("mps")
+    _C._aten_dispatch("aten.mul.Tensor", a, a)  # warm the device; not measured
     for op in ("mm", "matmul"):
+        before = counters()["host_downloads"]
         try:
             out = _C._aten_dispatch("aten.%s.default" % op, a, a)
         except (RuntimeError, NotImplementedError):
+            after = counters()["host_downloads"]
+            assert after == before, (
+                "aten.%s.default refused the int64 mps operand but moved "
+                "host_downloads %d -> %d on the way. A refusal that reads the "
+                "operand back to the host has already done the thing the "
+                "refusal exists to prevent." % (op, before, after))
             continue
         raise AssertionError(
             "aten.%s.default answered %r for an int64 mps operand. There is no "

@@ -18475,7 +18475,13 @@ if MODE == "dtype_int8":
             for f in traceback.extract_tb(exc.__traceback__)
         )
         out["bare_int8_raised_in_torchnative"] = any(
-            "torchnative" in (f.filename or "")
+            # A *path component*, and not under site-packages. The bare
+            # substring matched every frame once the workspace moved the
+            # spike-venv inside a repository directory literally named
+            # `torchnative`, which turned this provenance check -- and
+            # fifteen others like it -- into a constant True.
+            (f"{os.sep}torchnative{os.sep}" in (f.filename or "")
+             and "site-packages" not in (f.filename or ""))
             for f in traceback.extract_tb(exc.__traceback__)
         )
 
@@ -25622,6 +25628,14 @@ _MPS_READBACK_HELPERS = (
 # with the reason. Kept as data rather than as a filter in the scan so that the
 # scan cannot quietly grow an excuse: adding a name here is a visible edit.
 _MPS_READBACK_EXEMPT = {
+    "exact_int_matmul": "its first statement refuses a non-host operand by "
+                        "name, so the `to_vec1` below it can only ever read a "
+                        "tensor already on the CPU; the five gemm kernels "
+                        "additionally gate on `reject_device_int_gemm` before "
+                        "reaching it, and that refusal is what "
+                        "test_gemmint.py's "
+                        "`test_the_mps_integer_refusal_is_not_served_by_a_readback` "
+                        "holds down.",
     "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
                   "is what upstream does for the Scalar overloads too. The "
                   "data operand stays on the GPU.",

@@ -370,6 +370,22 @@ def test_the_named_refusal_covers_the_whole_family():
                 "refusal:\n  %s" % (name, op, got[op].splitlines()[0]))
 
 
+# The *device-keeping* road, per operator. It is not one road for every
+# operator and writing it as one was wrong: `int64` keeps the computation on
+# the GPU for the elementwise and reduction kernels, because candle
+# instantiates them for `i64` -- but **not for `matmul`**, which has no integer
+# kernel on any candle backend at any width (docs/devices/matrix.md
+# §4.3c: `int8`, `int32` and `int64` gemm on `mps` all refuse, by name). This
+# test asserted "int64" for every operator and went red the moment the matmul
+# refusal landed, which is the right outcome for the wrong reason: the message
+# was correct and the invariant was not. Recommending `int64` for `matmul`
+# would be recommending a road that dead-ends in another refusal -- exactly
+# what `test_the_int64_road_named_in_the_refusal_actually_works` exists to
+# stop.
+_DEVICE_ROAD = {op: "int64" for op in _OPS}
+_DEVICE_ROAD["matmul"] = "float"
+
+
 def test_the_refusal_says_what_to_do_instead():
     """A refusal that names the thing and not the way out is half a refusal.
 
@@ -387,10 +403,11 @@ def test_the_refusal_says_what_to_do_instead():
             assert ".cpu()" in msg, (
                 "%s on mps refused %s without offering the host road:\n  %s"
                 % (name, op, msg.splitlines()[0]))
-            assert "int64" in msg, (
-                "%s on mps refused %s without offering the int64 road, which "
-                "is the one that keeps the computation on the GPU:\n  %s"
-                % (name, op, msg.splitlines()[0]))
+            road = _DEVICE_ROAD[op]
+            assert road in msg, (
+                "%s on mps refused %s without offering the %s road, which is "
+                "the one that keeps the computation on the GPU:\n  %s"
+                % (name, op, road, msg.splitlines()[0]))
 
 
 def test_the_int64_road_named_in_the_refusal_actually_works():

@@ -126,7 +126,7 @@ _ALL_DTYPES = ("float32", "float16", "bfloat16", "int64")
 # (op, extra positional args, dtypes). The selection is by reachability, not by
 # coverage: these are the in-place calls a person writing three lines actually
 # makes. `fill_.Scalar` is deliberately absent and its own blocker is pinned by
-# `test_fill_on_mps_is_blocked_by_a_different_gate_than_this_one` below.
+# `test_fill_on_mps_agrees_with_upstream` below.
 _CASES = (
     ("aten.zero_.default", (), _ALL_DTYPES),
     ("aten.add_.Tensor", ("other",), _ALL_DTYPES),
@@ -461,39 +461,78 @@ def test_the_device_write_door_performs_no_host_readback():
         "receiver; a device tensor can now be scattered on the host")
 
 
-def test_fill_on_mps_is_blocked_by_a_different_gate_than_this_one():
-    """`fill_.Scalar` is still refused on `mps`, and not by `write_into`.
+def test_fill_on_mps_agrees_with_upstream():
+    """`fill_.Scalar` on `mps`, promoted from a recorded blocker to a grade.
 
-    Recorded rather than fixed, because it is a *separate* blocker and saying
-    "the in-place family works on Metal" while this one does not would be the
-    overclaim docs/devices/matrix.md §7 is about. `fill_inplace` builds its
-    replacement with `Tensor::full(value.as_f64(), ...)`, and candle's Metal
-    `const_set` has no `f64` arm, so the kernel raises **before** the write
-    door is reached at all: `candle: unsupported const-set f64`.
+    This test used to assert that `fill_` still **failed** on Metal, and said
+    what to do when it stopped: "make this an agreement test and move the cell
+    in docs/devices/matrix.md section 7.7". `host_full` (matrix.md section
+    4.3b, cause D) made it stop, and the commit that did so did not come back
+    here -- so the promotion is done now, and the cell in section 7.7 moves
+    with it.
 
-    This test goes red if `fill_` starts working (good news -- make it an
-    agreement test and update matrix.md §7.7) and red if it starts failing for
-    the write-back reason instead (which would mean the device door stopped
-    serving it, a regression).
+    The old blocker was `fill_inplace` building its replacement with
+    `Tensor::full(value.as_f64(), ...)`, which asked Metal's `const_set` for an
+    `f64` arm it does not have. The value is converted on the host now, once,
+    before anything crosses.
+
+    Graded **agrees**: element-wise against upstream in a separate subprocess,
+    on the three float dtypes. `int64` is not here because `fill_` on `mps` is
+    in this build's integer refusal, which matrix.md section 4.3c records by
+    name.
     """
-    mps = _mps_or_skip("fill_'s remaining blocker on mps")
+    mps = _mps_or_skip("fill_ on mps")
     if mps is None:
         return
-    t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE), _C.float32, mps)
-    try:
+    cases = {
+        "fill_/%s" % dt: {"op": "aten.fill_.Scalar", "args": [5.0],
+                          "dtype": dt, "values": list(_VALUES),
+                          "shape": list(_SHAPE), "other": list(_VALUES)}
+        for dt in _FLOAT_DTYPES
+    }
+    want = _oracle(_ORACLE, cases)
+    bad = []
+    for key, case in sorted(cases.items()):
+        expect = want[key]
+        assert "values" in expect, (key, expect)
+        t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE),
+                                 getattr(_C, case["dtype"]), mps)
         _C._aten_dispatch("aten.fill_.Scalar", t, 5.0)
+        assert str(t.device).startswith("mps"), (
+            "%s: the receiver left the mps device (%s), so this is not "
+            "measuring a Metal fill" % (key, t.device))
+        why = _close(_host(t), expect["values"], 0.0, 0.0)
+        if why:
+            bad.append("%s: %s" % (key, why))
+    assert not bad, ("fill_ on mps does not agree with upstream:\n  "
+                     + "\n  ".join(bad))
+
+
+def test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes():
+    """The half of `fill_` that did **not** move, asserted rather than dropped.
+
+    When a test that recorded a blocker becomes an agreement test, the easy
+    mistake is to let the cells that still refuse disappear with it. `int32`
+    on `mps` still refuses, and the requirement is that it refuses **by name**
+    -- naming the operator, the dtype and the device -- rather than quoting a
+    candle symbol.
+    """
+    mps = _mps_or_skip("fill_'s integer refusal on mps")
+    if mps is None:
+        return
+    t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE), _C.int32, mps)
+    try:
+        _C._aten_dispatch("aten.fill_.Scalar", t, 5)
     except (RuntimeError, NotImplementedError) as e:
         msg = str(e).splitlines()[0]
     else:
         raise AssertionError(
-            "aten.fill_.Scalar now works on mps. That is good news: make this "
-            "an agreement test and move the cell in docs/devices/matrix.md §7.7.")
-    assert "const-set" in msg, (
-        "fill_ on mps no longer fails in candle's const_set -- it fails with "
-        "%r. If that is the write-back sentence, the device write door has "
-        "regressed; if it is something else, this note is stale." % msg)
-    assert "writing through" not in msg, (
-        "fill_ on mps is refused by the write door again: %r" % msg)
+            "aten.fill_.Scalar now works on mps for int32. Good news: grade it "
+            "in test_fill_on_mps_agrees_with_upstream and update "
+            "docs/devices/matrix.md section 4.3c, which records it as refused.")
+    for token in ("aten.fill_.Scalar", "int32", "mps"):
+        assert token in msg, (
+            "the int32/mps fill_ refusal does not name %r: %r" % (token, msg))
 
 
 _ORACLE_SCRIPTS_NAN = r"""

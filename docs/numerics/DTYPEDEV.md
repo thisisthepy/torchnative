@@ -209,10 +209,10 @@ built from this tree. "upstream" is torch 2.13.0 in the same interpreter.
 | `float32` | 21 | 16 | 23 | 23 |
 | `float16` | 21 | 15 | 23 | 23 |
 | `bfloat16` | 21 | 15 | 23 | 23 |
-| `int64` | 18 | 15 | 21 | 21 |
-| `int32` | 18 | **2** | 21 | 21 |
-| `int16` | 18 | **2** | 21 | 21 |
-| `int8` | 18 | 16 | 21 | 21 |
+| `int64` | **19** | 15 | 21 | 21 |
+| `int32` | **19** | **2** | 21 | 21 |
+| `int16` | **19** | **2** | 21 | 21 |
+| `int8` | **19** | 16 | 21 | 21 |
 | `uint8` | 18 | 15 | 21 | 21 |
 | `uint32` | 17 | 14 | **13** | **8** |
 | `bool` | 12 | 10 | 16 | 16 |
@@ -227,6 +227,18 @@ values 1..4 never reach — by `test_int8.py`.) The twelve
 cells that differ in their last bits are all `exp` and `softmax` — a rounding
 direction, not an operator — and all sit inside the tolerances
 `tools/golden/dtypes.py` already sets for those dtypes.
+
+**The four signed-integer `cpu` rows moved 18 → 19 on 2026-09-22**, and the
+cell that arrived is `matmul` in each. `exact_int_matmul` (docs/devices/matrix.md
+§4.3b) gave `mm`/`bmm`/`matmul`/`addmm`/`baddbmm` a host kernel that wraps in the
+storage width, which is what upstream does. The commit that added it did not
+update this table or `_CPU_REACHES`, so `test_the_cpu_column_reaches_what_it_is_recorded_as_reaching`
+was red — correctly, since a cell that starts computing is one nothing has
+graded. It is graded now:
+`test_the_dtype_device_matrix_agrees_with_upstream` passes over the widened set,
+and `test_gemmint.py` grades the same kernel at inputs that overflow, which this
+matrix's values of 1..4 never reach. **`int16` is in this count and is not in
+§4.3b's fifteen**, whose sweep has no `int16` column.
 
 `_CPU_REACHES` and `_MPS_REACHES` in `test_dtypedev.py` freeze the *exact set*
 of cells that compute, rather than these counts. Both directions of change are

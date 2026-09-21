@@ -300,12 +300,18 @@ def test_no_float_constant_is_still_materialised_on_the_device():
     """Structural, derived from `aten.rs` rather than from a list kept by hand.
 
     The evidence here is **weaker than the agreement tests above and is meant
-    to be**: there is no Metal dispatch counter in this build
-    (docs/devices/matrix.md section 7.5), so nothing can observe where the fill
-    actually happened. What this can do is refuse the *shape* of the defect --
-    an `f64` handed to `Tensor::full` together with a device that is not
-    pinned to the host -- so that a tenth operator written tomorrow in the old
-    style is caught by arithmetic instead of by a sweep three weeks later.
+    to be**, but not for the reason first written here. That reason -- "there
+    is no Metal dispatch counter in this build" -- was false when this file
+    landed: docs/devices/matrix.md section 7.11 built one, and this file was
+    scoped against a tree that predated it. Where the fill happens *is*
+    observable, and `test_the_mps_fill_is_bracketed_by_the_metal_counters`
+    below observes it.
+
+    What this test adds on top of that is coverage of operators nobody has
+    written yet: it refuses the *shape* of the defect -- an `f64` handed to
+    `Tensor::full` together with a device that is not pinned to the host --
+    so that a tenth operator written tomorrow in the old style is caught by
+    arithmetic instead of by a sweep three weeks later.
 
     `&Device::Cpu` is excluded because that is `host_const`'s own body and the
     one place the pattern is correct by construction.
@@ -345,6 +351,298 @@ def test_host_full_exists_and_converts_before_it_broadcasts():
         "host_full broadcasts before it converts. Broadcasting an f64 and "
         "converting the block afterwards puts the f64 on the device, which is "
         "the defect this helper exists to remove")
+
+
+# Bytes one element of each dtype occupies. The upload assertion below is
+# built on these being the *storage* widths: an `f32` narrowing would upload 4
+# bytes for a `float16` destination and an unconverted `f64` would upload 8.
+_ITEMSIZE = {"float32": 4, "float16": 2, "bfloat16": 2}
+
+
+def test_the_mps_fill_is_bracketed_by_the_metal_counters():
+    """Where the fill happens, measured rather than argued.
+
+    `_C._metal_counters()` (docs/devices/matrix.md section 7.11) is the only
+    instrument in this project that can see a silent host fallback -- values
+    and `.device` labels cannot, and CLAUDE.md section 2 records three rounds
+    where nothing but a counter caught it. This file originally said no such
+    counter existed, which was true of the tree it was scoped against and is
+    not true of this one.
+
+    **Bracket**, stated because counters from different brackets read like
+    regressions side by side: each reading is taken immediately before and
+    immediately after **one** `_aten_dispatch` call, in this process, after an
+    unmeasured dispatch has warmed the device.
+
+    What the three deltas mean, and what each one would catch:
+
+        host_downloads   == 0  -- nothing was read back. A fill computed on
+                                  the host and returned under an `mps` label
+                                  is the failure docs/graph/NPU2.md records.
+        host_uploads     == 1  -- exactly one crossing. `host_const` converts
+                                  a single scalar and moves it; a host fill of
+                                  the whole block also uploads once, which is
+                                  why the byte count below is the load-bearing
+                                  assertion and not this one.
+        host_upload_bytes == itemsize -- **one element of the storage dtype**,
+                                  not `numel * itemsize` (a host-side fill of
+                                  the whole tensor) and not 8 (an `f64` that
+                                  was never converted). For `float16` this is
+                                  2, so the `f32` narrowing that
+                                  `test_the_constant_is_rounded_once_and_not_twice`
+                                  catches by value is caught here by width.
+        compute_encoders >= 1  -- the broadcast to `_SHAPE` ran on the device.
+
+    `scalar_tensor` is deliberately not in this loop: its result has one
+    element, so there is nothing to broadcast and `compute_encoders` is
+    legitimately 0. Asserting `> 0` for it would be asserting a bug.
+    """
+    device = _mps_or_skip("the metal counter bracket")
+    if device is None:
+        return
+    counters = getattr(_C, "_metal_counters", None)
+    assert counters is not None, (
+        "_C._metal_counters() is gone. It is the only instrument that can "
+        "observe where a fill happened; without it this file is back to the "
+        "structural argument it was written with (docs/devices/matrix.md 7.11)")
+    assert counters().get("built"), (
+        "the Metal counters report built=False, so no Metal device was ever "
+        "constructed -- the deltas below would all be 0 and this test would "
+        "pass while measuring nothing")
+
+    numel = _SHAPE[0] * _SHAPE[1]
+    _C._aten_dispatch("aten.full.default", _SHAPE, _VALUE,
+                      dtype=_C.float32, device=device)  # warm; not measured
+    bad = []
+    for dt in _DTYPES:
+        keys = ("host_downloads", "host_uploads", "host_upload_bytes",
+                "compute_encoders")
+        before = counters()
+        got = _C._aten_dispatch("aten.full.default", _SHAPE, _VALUE,
+                                dtype=getattr(_C, dt), device=device)
+        after = counters()
+        d = {k: after[k] - before[k] for k in keys}
+        if not str(got.device).startswith("mps"):
+            bad.append("full/%s answered on %s under an mps request"
+                       % (dt, got.device))
+        if d["host_downloads"] != 0:
+            bad.append("full/%s moved host_downloads by %d -- something was "
+                       "read back to the host, which is the silent fallback "
+                       "this bracket exists to see"
+                       % (dt, d["host_downloads"]))
+        if d["host_uploads"] != 1:
+            bad.append("full/%s crossed to the device %d times, expected "
+                       "exactly 1 (host_const moves one converted scalar)"
+                       % (dt, d["host_uploads"]))
+        if d["host_upload_bytes"] != _ITEMSIZE[dt]:
+            bad.append(
+                "full/%s uploaded %d bytes, expected %d -- one element of the "
+                "storage dtype. %d would mean the whole %d-element block was "
+                "filled on the host, and 8 would mean an unconverted f64 "
+                "crossed; for float16, 4 would mean the constant was narrowed "
+                "through f32 first, which is the double-rounding defect"
+                % (dt, d["host_upload_bytes"], _ITEMSIZE[dt],
+                   numel * _ITEMSIZE[dt], numel))
+        if d["compute_encoders"] < 1:
+            bad.append("full/%s ran %d compute shaders, expected at least 1 "
+                       "for the broadcast of the uploaded scalar to %r"
+                       % (dt, d["compute_encoders"], _SHAPE))
+    assert not bad, ("the mps fill is not where it is supposed to be:\n  "
+                     + "\n  ".join(bad))
+
+
+_NAN_ORACLE = r"""
+import json, sys
+import torch
+assert not hasattr(torch._C, "_aten_implemented"), (
+    "the oracle subprocess imported the shim, not upstream torch")
+req = json.loads(sys.argv[1])
+out = {}
+for key, case in req.items():
+    t = torch.tensor(case["source"], dtype=getattr(torch, case["dtype"]))
+    if case["case"] == "amax":
+        r = torch.amax(t, dim=0)
+    elif case["case"] == "amin":
+        r = torch.amin(t, dim=0)
+    elif case["case"] == "max_dim":
+        r = torch.max(t, dim=0).values
+    elif case["case"] == "min_dim":
+        r = torch.min(t, dim=0).values
+    else:
+        raise AssertionError("unknown case " + case["case"])
+    out[key] = {"values": [float(x) for x in
+                           r.to(torch.float64).flatten().tolist()],
+                "dtype": str(r.dtype).split(".")[-1]}
+print(json.dumps(out))
+"""
+
+# A NaN in the input is what reaches the seed. Without one, `nan_along_dim`
+# returns early and the `host_full(f64::NAN, ..)` line is never executed --
+# which is exactly why the 2026-09-20 sweep never saw these call sites.
+_NAN_SOURCE = [1.25, float("nan"), 0.5, 3.75]
+
+
+_NAN_OPS = {"amax": "aten.amax.default", "max_dim": "aten.max.dim",
+            "min_dim": "aten.min.dim"}
+
+
+def _ask_nan(case, dt, on_mps):
+    src = (_C._tensor_from_flat(_NAN_SOURCE, [len(_NAN_SOURCE)], _C.float64)
+           .to(getattr(_C, dt)))
+    if on_mps:
+        src = src.to("mps")
+    arg = [0] if case == "amax" else 0
+    out = _C._aten_dispatch(_NAN_OPS[case], src, arg)
+    return _host(out[0] if isinstance(out, tuple) else out)
+
+
+def _nan_oracle(cases):
+    req = {"%s/%s" % (c, dt): {"case": c, "dtype": dt, "source": _NAN_SOURCE}
+           for c in cases for dt in _DTYPES}
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("TORCH_C_ARTEFACT", None)
+    proc = subprocess.run(
+        [sys.executable, "-c", _NAN_ORACLE, json.dumps(req)],
+        capture_output=True, text=True, timeout=600, env=env)
+    assert proc.returncode == 0, ("upstream NaN oracle failed:\n"
+                                  + proc.stderr[-2000:])
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _same(a, b):
+    return (a != a and b != b) or a == b
+
+
+def test_the_nan_seed_call_sites_answer_where_they_are_reachable():
+    """The call sites section 4.3b found outside the sweep, actually run.
+
+    `max.default`/`min.default`'s all-NaN early return and `nan_shaped_like`
+    (used by `max.dim` and `min.dim`) build an `f64` NaN and move it, and the
+    same change that adopted `host_full` for the nine cause-D operators
+    adopted it here. Section 4.3b calls them "fixed too" and offers the
+    structural derivation as the evidence -- which is a claim about the source
+    text, not about what the machine does. **Nothing had ever executed them.**
+
+    They are unreachable through the matrix sweep by construction: it builds
+    one shape per operator and that shape has no NaN, so the seed is dead code
+    for it. That is precisely the blindness CLAUDE.md section 2 records for
+    `clamp`, whose cell had no NaN either and graded AGREES for months while
+    the operator was wrong.
+
+    Graded **agrees** on the `cpu`, element-wise against upstream in a
+    separate subprocess, NaN compared as NaN rather than by `==`, no
+    tolerance: a seeded NaN either is one or is not.
+
+    `amin` is not in this table because this build does not implement
+    `aten.amin.default` at all, which is asserted rather than assumed -- an
+    operator silently dropped from a table is how a gap stops being counted.
+    """
+    assert "aten.amin.default" not in _C._aten_implemented(), (
+        "this build now implements aten.amin.default. It has the same NaN "
+        "seed as the others and belongs in this table -- add it rather than "
+        "leaving this assertion to fail")
+    want = _nan_oracle(_NAN_OPS)
+    saw_a_nan = False
+    bad = []
+    for case in _NAN_OPS:
+        for dt in _DTYPES:
+            key = "%s/%s" % (case, dt)
+            expect = want[key]["values"]
+            saw_a_nan = saw_a_nan or any(v != v for v in expect)
+            try:
+                values = _ask_nan(case, dt, on_mps=False)
+            except Exception as e:  # noqa: BLE001 -- the refusal is the finding
+                bad.append("%s on cpu raised %s: %s"
+                           % (key, type(e).__name__, str(e).splitlines()[0]))
+                continue
+            if len(values) != len(expect) or not all(
+                    _same(a, b) for a, b in zip(values, expect)):
+                bad.append("%s on cpu gave %r, upstream gave %r"
+                           % (key, values, expect))
+    assert saw_a_nan, (
+        "not one upstream answer in this table is NaN, so the seed these call "
+        "sites exist for was never reached and this test proves nothing. Put "
+        "a NaN back into _NAN_SOURCE rather than deleting this check")
+    assert not bad, ("the NaN seed call sites do not agree:\n  "
+                     + "\n  ".join(bad))
+
+
+def test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect():
+    """What the `mps` half of those call sites actually does, measured.
+
+    Two different answers, and only one of them is acceptable:
+
+    * `max.dim` and `min.dim` **refuse by name** on `mps` -- they are in the
+      host-readback family, so `nan_shaped_like` is not reachable there at
+      all. The refusal is the right outcome and is asserted here so that a
+      later round which makes them answer has to come back to this test.
+
+    * `aten.amax.default` **answers, and answers wrongly.** With a NaN in the
+      input it returns the largest non-NaN element where upstream returns NaN.
+      This is not cause D and it is not this round's change: the cause is
+      `aten.rs::amax_keepdim_anywhere`, which routes a Metal tensor to
+      candle's `max_keepdim` -- the NaN-skipping fold that the docstring above
+      `nan_along_dim` calls "the third repair of one predicate and ... meant
+      to be the last". It is the fourth, it predates both this branch and the
+      int8 round (byte-identical in `7457147`'s `aten.rs`), and the same
+      helper is called from the softmax row-max, so the blast radius is wider
+      than `amax`.
+
+    **This test pins the defect rather than hiding it.** It asserts the wrong
+    answer is still the wrong answer, so the moment somebody repairs
+    `amax_keepdim_anywhere` this test goes RED and forces them here to replace
+    it with the agreement assertion. A defect nobody has written down is
+    rediscovered; a defect with a failing test is a decision. Deleting this
+    test without fixing the operator puts it back in the first category.
+    """
+    device = _mps_or_skip("the NaN seed on mps")
+    if device is None:
+        return
+    want = _nan_oracle(_NAN_OPS)
+    bad = []
+
+    for case in ("max_dim", "min_dim"):
+        for dt in _DTYPES:
+            try:
+                values = _ask_nan(case, dt, on_mps=True)
+            except (RuntimeError, NotImplementedError) as e:
+                msg = str(e)
+                for token in (_NAN_OPS[case], "mps"):
+                    if token not in msg:
+                        bad.append("%s/%s refuses on mps without naming %r: %s"
+                                   % (case, dt, token, msg.splitlines()[0]))
+                continue
+            bad.append(
+                "%s/%s now answers %r on mps. It is in the host-readback "
+                "family, so either it has started returning a value the GPU "
+                "did not compute, or the family changed and this test should "
+                "be comparing against upstream %r instead"
+                % (case, dt, values, want["%s/%s" % (case, dt)]["values"]))
+
+    for dt in _DTYPES:
+        expect = want["amax/%s" % dt]["values"]
+        assert any(v != v for v in expect), (
+            "upstream's amax/%s over %r is no longer NaN, so this pin is "
+            "measuring nothing" % (dt, _NAN_SOURCE))
+        values = _ask_nan("amax", dt, on_mps=True)
+        if all(_same(a, b) for a, b in zip(values, expect)):
+            bad.append(
+                "amax/%s on mps now agrees with upstream (%r). The recorded "
+                "defect in amax_keepdim_anywhere appears to be FIXED -- that "
+                "is good news: delete this loop and move amax into "
+                "test_the_nan_seed_call_sites_answer_where_they_are_reachable "
+                "on mps as well." % (dt, values))
+        elif values != [max(v for v in _NAN_SOURCE if v == v)]:
+            bad.append(
+                "amax/%s on mps gave %r, which is neither upstream's answer "
+                "%r nor the known NaN-skipping one %r. The defect has changed "
+                "shape and needs re-diagnosing rather than re-pinning"
+                % (dt, values, expect,
+                   [max(v for v in _NAN_SOURCE if v == v)]))
+
+    assert not bad, ("the mps NaN seed behaviour is not what is recorded:\n  "
+                     + "\n  ".join(bad))
 
 
 def _main():

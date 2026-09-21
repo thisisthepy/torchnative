@@ -615,7 +615,39 @@ def _reduced_float_reduce_cases(torch_module, c_module, op, torch_call) -> list[
 # either. The integral dtypes stay: that gap is real, and float32 cannot stand
 # in for an int64 product.
 _MM_MATCH_DTYPES = ["float32", "float64", "float16", "bfloat16"]
-_MM_C_ERROR_DTYPES = ["int64", "int32", "int16", "uint8"]
+# `uint8` alone, since 2026-09-22. `int64`/`int32`/`int16` were here too, and
+# they were right until `exact_int_matmul` (docs/devices/matrix.md §4.3b) gave
+# the five gemm operators a host kernel that wraps in the storage width the way
+# upstream does. Twenty cases in this file then went red with "gap appears
+# CLOSED: both sides now succeed" -- which is the `golden_cases_failed eq 0`
+# marker doing exactly what CLAUDE.md §2 put it there for, and the commit that
+# closed the gap not coming back here. `uint8` stays: the exact kernel covers
+# the signed widths only.
+_MM_C_ERROR_DTYPES = ["uint8"]
+_MM_EXACT_INT_DTYPES = ["int64", "int32", "int16"]
+_MM_INT_DTYPES = _MM_EXACT_INT_DTYPES + _MM_C_ERROR_DTYPES
+
+
+def _mm_int_expect(dtype_name):
+    """`match` where the exact host kernel answers, `c_error` where it does not.
+
+    Written as a function of the dtype rather than as two hand-kept lists, so
+    that moving a dtype between them changes every operator at once. The whole
+    point of the twenty cases above was that a gap closing for `mm` and not for
+    `bmm` should be visible, and that stays true: each operator still builds
+    its own case.
+    """
+    return "c_error" if dtype_name in _MM_C_ERROR_DTYPES else "match"
+
+
+def _mm_int_note(dtype_name, op_phrase):
+    if dtype_name in _MM_C_ERROR_DTYPES:
+        return (f"candle's matmul has no kernel for {dtype_name} and neither "
+                f"does this shim's exact integer kernel, which covers the "
+                f"signed widths only; torch's CPU {op_phrase} does.")
+    return (f"{dtype_name}: answered by exact_int_matmul on the host, wrapping "
+            f"in the storage width as torch's CPU {op_phrase} does "
+            "(docs/devices/matrix.md §4.3b)")
 
 
 def _mm_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, b_flat, b_shape, expect="match", note=""):
@@ -668,7 +700,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
     # Known gaps: candle's matmul kernel does not support these dtypes at
     # all (RuntimeError: "candle: unsupported dtype <X> for op matmul"),
     # while torch's CPU addmm does.
-    for dtype_name in _MM_C_ERROR_DTYPES:
+    for dtype_name in _MM_INT_DTYPES:
         a_flat = [1, 2, 3, 4] if dtype_name != "uint8" else [1, 2, 3, 4]
         b_flat = [1, 0, 0, 1]
         cases.append(
@@ -681,8 +713,8 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 (2, 2),
                 b_flat,
                 (2, 2),
-                expect="c_error",
-                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU addmm does. See docs/design/TORCH_C.md §2 for int64 specifically -- int32/int16/uint8/bfloat16 have the same gap, found while building this harness.",
+                expect=_mm_int_expect(dtype_name),
+                note=_mm_int_note(dtype_name, "addmm"),
             )
         )
 
@@ -794,7 +826,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
 # the default pipeline's `rtol=1e-5` -- so `_exact_value_check` is not
 # decoration here, it is the only comparator that can see it.
 _MATMUL_MATCH_DTYPES = _MM_MATCH_DTYPES
-_MATMUL_C_ERROR_DTYPES = _MM_C_ERROR_DTYPES
+_MATMUL_C_ERROR_DTYPES = _MM_INT_DTYPES
 
 
 def _matmul_case(torch_module, c_module, torch_call, dtype_name, a_flat, a_shape, b_flat, b_shape, expect="match", note="", value_check=None):
@@ -1048,9 +1080,9 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
     for dtype_name in _MATMUL_C_ERROR_DTYPES:
         cases.append(
             _matmul_case(torch_module, c_module, torch_call, dtype_name,
-                        [1, 2, 3, 4], (2, 2), [1, 0, 0, 1], (2, 2), expect="c_error",
-                        note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU matmul does. "
-                             "Same gap aten.mm.default already carries.")
+                        [1, 2, 3, 4], (2, 2), [1, 0, 0, 1], (2, 2),
+                        expect=_mm_int_expect(dtype_name),
+                        note=_mm_int_note(dtype_name, "matmul"))
         )
     cases.append(
         _matmul_case(torch_module, c_module, torch_call, "uint32",
@@ -9794,7 +9826,7 @@ def bmm_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # The same candle gap `mm_cases` records, re-checked through `bmm`: if it
     # ever closes for one op it should close for both, and these cases say so.
-    for dtype_name in _MM_C_ERROR_DTYPES:
+    for dtype_name in _MM_INT_DTYPES:
         at, ac = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
         bt, bc = pair_from_flat(torch_module, c_module, b_flat, b_shape, dtype_name)
         cases.append(
@@ -9803,11 +9835,11 @@ def bmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 op=op,
                 run_torch=lambda at=at, bt=bt: torch_call(at, bt),
                 run_c=lambda ac=ac, bc=bc: c_module._aten_dispatch(op, ac, bc),
-                expect="c_error",
+                expect=_mm_int_expect(dtype_name),
                 note=(
-                    f"candle's matmul has no kernel for {dtype_name}; torch's CPU baddbmm "
-                    "does. Same gap mm_cases records for mm -- tracked separately so "
-                    "closing it for one op cannot silently look like closing it for both."
+                    _mm_int_note(dtype_name, "baddbmm")
+                    + " Tracked separately from mm so that closing it for one "
+                      "op cannot silently look like closing it for both."
                 ),
             )
         )
@@ -12949,14 +12981,13 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # The inherited gap: candle's matmul has no kernel for these, exactly as
     # `aten.mm.default` already records (docs/design/TORCH_C.md §2).
-    for dtype_name in _MM_C_ERROR_DTYPES:
+    for dtype_name in _MM_INT_DTYPES:
         cases.append(
             _addmm_case(
                 torch_module, c_module, torch_call, dtype_name,
                 [1, 1, 1, 1], (2, 2), [1, 2, 3, 4], (2, 2), [1, 0, 0, 1], (2, 2),
-                expect="c_error",
-                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU addmm does. "
-                     "Same gap aten.mm.default already carries.",
+                expect=_mm_int_expect(dtype_name),
+                note=_mm_int_note(dtype_name, "addmm"),
             )
         )
         # ...but with alpha=0 there is no matmul to refuse, and both sides
@@ -16331,27 +16362,29 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
     int_b2 = ([1, 0, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1], (2, 3, 2))
     int_self = ([0] * 8, (2, 2, 2))
     for alpha, note in [
-        (1.9, "alpha=1.9 on int64 -- can't verify truncation, candle has no int64 matmul"),
-        (1, "alpha=1 on int64 -- same inherited gap"),
+        (1.9, "alpha=1.9 on int64 -- the truncation claim, now verifiable: "
+              "exact_int_matmul answers, so this is graded against upstream "
+              "rather than pinned as a gap"),
+        (1, "alpha=1 on int64 -- must be bit-for-bit what alpha=1.9 gives, "
+            "because the Scalar truncates toward zero before it multiplies"),
     ]:
         cases.append(
             _baddbmm_case(
                 torch_module, c_module, torch_call, "int64",
                 *int_self, *int_b1, *int_b2,
-                kwargs=dict(alpha=alpha), expect="c_error", note=note,
+                kwargs=dict(alpha=alpha), expect="match", note=note,
             )
         )
 
     # The inherited candle gap: no matmul kernel for the integral dtypes or
     # bfloat16 -- same split mm/addmm/bmm already carry.
-    for dtype_name in _MM_C_ERROR_DTYPES:
+    for dtype_name in _MM_INT_DTYPES:
         cases.append(
             _baddbmm_case(
                 torch_module, c_module, torch_call, dtype_name,
                 [0, 0, 0, 0], (1, 2, 2), [1, 2, 3, 4], (1, 2, 2), [1, 0, 0, 1], (1, 2, 2),
-                expect="c_error",
-                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU baddbmm does. "
-                     "Same gap aten.mm.default/aten.addmm.default already carry.",
+                expect=_mm_int_expect(dtype_name),
+                note=_mm_int_note(dtype_name, "baddbmm"),
             )
         )
         cases.append(
@@ -16359,7 +16392,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 torch_module, c_module, torch_call, dtype_name,
                 [0, 0, 0, 0], (1, 2, 2), [1, 2, 3, 4], (1, 2, 2), [1, 0, 0, 1], (1, 2, 2),
                 kwargs=dict(alpha=0),
-                expect="c_error",
+                expect=_mm_int_expect(dtype_name),
                 note=f"{dtype_name} with alpha=0 -- used to dodge the gap above (the kernel's old "
                      "alpha_zero quick return skipped the matmul unconditionally, matching torch by "
                      "accident); now that the multiply always runs (docs/kernels/TAIL.md §2.1 fix), this hits "

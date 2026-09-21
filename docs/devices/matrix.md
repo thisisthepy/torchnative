@@ -423,7 +423,7 @@ than by the next sweep.
 |---|---:|---|
 | `bool`, any device | 6 | **upstream refuses it too** |
 | signed integer, `cpu` | 15 | a real kernel — exact |
-| `int64`, `mps` | 5 | refusal, by name |
+| `int64`, `mps` | 5 | refusal, by name (**re-measured 2026-09-22: 15**, `int8`/`int32`/`int64` — see §4.3c) |
 | `convolution` `bfloat16_cpu` | 1 | **not done**; see below |
 
 **The bool six were never a gap.** Measured against torch 2.13.0: `torch.mm`,
@@ -457,7 +457,9 @@ image either way, including when the `i64` evaluation itself overflows. That
 is `test_intmps.py`'s argument, reused for the one operator built from nothing
 but ring operations.
 
-**The `mps` five stay refused.** The kernel is a host computation, and running
+**The `mps` five stay refused — and a re-run on this tree makes it ten.**
+(§4.3c: the `int8`/`mps` five sat behind cause A's `operands` stage when this
+was scoped, and became visible only once int8 reached Metal.) The kernel is a host computation, and running
 it for an `mps` operand would return a value the GPU did not compute under an
 `mps` label — the failure docs/graph/NPU2.md records. The refusal now names
 the operator, the dtype, the device, the reason and both roads out, and
@@ -485,10 +487,12 @@ double-rounding the constant, filling on the device, saturating instead of
 wrapping, the `f64` upcast, removing the device gate, removing the bool gate,
 clamping the narrow, and a genuine host readback.
 
-**There is still no Metal dispatch counter in this build** (§7.5). The `mps`
-half of cause D is therefore supported by agreement with upstream and by a
-structural derivation over `aten.rs`, and by nothing that can observe where
-the fill happened — the same ceiling every `mps` row in this document names.
+**Withdrawn, 2026-09-21: there is a Metal dispatch counter in this build.**
+This paragraph said there was not, citing §7.5 — but §7.11 built one, and the
+round that wrote this was scoped against a tree that predated it. The `mps`
+half of cause D is no longer resting on a structural derivation: it is
+bracketed by `_C._metal_counters()` in §4.3c, where the host-twin experiment
+CLAUDE.md §2 records as impossible on Metal has now been run on Metal.
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs host_full present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs exact_int_matmul present -->
@@ -507,6 +511,318 @@ the fill happened — the same ceiling every `mps` row in this document names.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_bool_matmul_refuses_in_upstreams_own_words present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_the_mps_integer_refusal_names_the_op_the_dtype_and_the_device present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_gemmint.py test_the_mps_integer_refusal_is_not_served_by_a_readback present -->
+
+### 4.3c §4.3b re-run rather than re-read — the work landed, three of its numbers did not
+
+§4.3a and §4.3b were both scoped **by re-reading `/tmp/matrix_pub.json`**, and
+they say so. This section is the first time those cells were **re-measured**,
+and the provenance matters more than usual: `882c45a`, the commit that
+implemented §4.3b, is **not a descendant of `7457147`** (the int8 /
+`candle-metal-kernels` round). Its sole parent is `c210f7c`; it reached this
+branch through a later merge. So §4.3b's numbers are **pre-int8 and
+pre-counter**, and every one of them was owed a re-run.
+
+**Method.** `dtype_device_matrix.py --worker` over the operators of causes C
+and D, run twice against two builds of this tree: `HEAD`, and a counterfactual
+build with `882c45a`'s `aten.rs` replaced by `7457147`'s — which is exactly
+"this tree minus the change under test", since the merge applied the WIP on
+top of that file. Same harness, same machine, same process shape, 37 minutes
+apart. Neither run re-reads a cached sweep.
+
+#### What moved: 39 AGREES and 25 relabelled, and the grades are not interchangeable
+
+| | cells | grade |
+|---|---:|---|
+| signed integer `mm`/`bmm`/`matmul`/`addmm`/`baddbmm` on `cpu` | **15** | REFUSES → **AGREES** |
+| cause D `full` and `scalar_tensor` on `mps` | 6 | REFUSES → **AGREES** |
+| cause D `constant_pad_nd`, `fill_`, `full_like`, `new_full`, `round.decimals`, `round_.decimals` on `mps` | 18 | REFUSES → **AGREES** |
+| `bool` gemm, both devices | **10** | REFUSES → REFUSES, sentence now upstream's |
+| `int8`/`int32`/`int64` gemm on `mps` | **15** | REFUSES → REFUSES, sentence now ours |
+| `aten.convolution.default` `bfloat16_cpu` | 1 | REFUSES, unchanged — declared not done, and it is |
+
+**39 cells reach AGREES and 25 are relabelled refusals.** They are different
+claims and this table does not add them up into one.
+
+**Corrected 2026-09-22, by re-running the sweep a third time rather than
+re-reading this section.** The paragraph above previously read "37 cells" in
+its heading and "21 cells reach AGREES and 16 are relabelled" in its body,
+while the table beside it summed to 39 and 16. **Neither prose figure was
+derivable from the table it introduced**, which is the §5.3 shape: a number
+that looks measured because a measured table is next to it. Two of the table's
+own rows were also short, and both for the same reason — a row was named after
+the dtypes the round had gone looking for rather than after the dtypes the
+sweep returned:
+
+* `bool` gemm is **10** cells, not 6: five operators × two devices, and every
+  one of the ten comes back in upstream's own words (`"addmm_impl_cpu_" not
+  implemented for 'Bool'`, `"bmm" not implemented for 'Bool'`, `"baddbmm" not
+  implemented for 'Bool'`). 6 cannot be reconstructed from any run of this
+  tree; the population it was drawn from was the cached `/tmp/matrix_pub.json`
+  that no longer exists.
+* the `mps` integer gemm refusal is **15**, not 10 and not 5. §4.3b said five
+  (`int64`), §4.3c raised it to ten (`int64` + `int8`) — and both missed
+  `int32`, whose five cells refuse with exactly the same sentence of ours.
+  **The count was corrected once and was still wrong**, because the correction
+  chased the dtype that had just been vendored instead of asking the sweep
+  which dtypes refused.
+
+Measured figures for the whole 224-cell sweep over these fourteen operators,
+from `dtype_device_matrix.py --tally`: **AGREES 150, REFUSES 61 (59 named, 2 by
+candle symbol), BREAKS 13, disagrees 0.** All thirteen BREAKS are
+`where.ScalarSelf`, the harness limitation named below.
+
+#### Two cause-D operators still carry a candle symbol on `int32`/`mps`
+
+The two unnamed refusals in that tally are `aten.full.default` and
+`aten.scalar_tensor.default` at `int32_mps`, both quoting
+`candle: Metal contiguous to_dtype I64 I32 not implemented`. They are the same
+defect as the `eye`/`linspace` cells named under "Still open" below — an
+integer constant built at `i64` and converted on the device — sitting inside
+cause D's own two headline operators, which `host_full` closed for the three
+float dtypes and not for this one. §4.3c did not name them. **Not fixed here:
+it is operator work, not verification, and it belongs with the `eye`/`linspace`
+round.**
+
+#### Three numbers in §4.3b do not survive the re-run
+
+**C's `mps` half is 10, not 5** — and a third run makes it 15; see the correction above.
+*(superseded)* **C's `mps` half is 10, not 5.** §4.3b names five `int64`/`mps` cells. On this
+tree the same change relabels **ten**: the five `int8`/`mps` cells were behind
+cause A's `operands` stage when §4.3b was scoped — the sweep could not build an
+int8 Metal operand at all, so those cells never reached the matmul to be
+counted in C. `7457147` moved them, and they landed in the same refusal. The
+implementation was already right; the count was written before it could be.
+
+**D's 25 is not reproducible, and the honest figures are 24 and 27.** On this
+tree the message `unsupported const-set f64` appears on **24** sweep-visible
+cells — eight operators × three dtypes — and all 24 now agree. The ninth
+cause-D operator, `where.ScalarSelf`, cannot be expressed by this harness at
+all (§5: it casts every tensor operand to the cell's dtype, including the
+`bool` condition, so upstream rejects the cell), which is why it is absent
+from the 24 and why `test_constset.py` measures it directly. Nine operators
+× three dtypes = **27**, which is what that file covers and what closed.
+**25 was a pre-int8 figure and no run of this tree produces it.** The claim
+§4.3b was making — one helper, nine operators, no kernel, nothing in
+`vendor/candle-core` touched — is confirmed; only its arithmetic is not.
+
+**`round.decimals` was never outside the sweep.** §4.3b lists three call sites
+"the sweep never reached": `amax`'s NaN seed, `nan_shaped_like`, and
+`round.decimals`' scale. The sweep reaches the third one directly — it is
+measured above moving REFUSES → AGREES. Two are genuinely outside it, both for
+the same reason: the sweep builds one shape per operator and that shape has no
+NaN, so the seed is dead code for it.
+
+#### The two call sites that really were outside the sweep, run
+
+Neither had ever been executed; §4.3b's evidence for them was a derivation over
+the source text. Run now, in `test_the_nan_seed_call_sites_answer_where_they_are_reachable`:
+
+* on the `cpu`, `max.default`, `max.dim` and `min.dim` **agree with upstream**
+  on a NaN input, so `host_full` did not disturb the seed.
+* on `mps`, `max.dim` and `min.dim` **refuse by name** — they are in the
+  host-readback family, so `nan_shaped_like` is not reachable there.
+* `amin` is not implemented by this build at all, which the test asserts
+  rather than assumes.
+
+#### A silently wrong answer found on the way, older than this branch
+
+**`aten.amax.default` on `mps` drops NaN.** Over `[1.25, nan, 0.5, 3.75]` it
+returns `3.75` where upstream returns `nan`; the `cpu` path returns `nan`
+correctly. The cause is `aten.rs::amax_keepdim_anywhere`, which sends a Metal
+tensor to candle's `max_keepdim` — the NaN-skipping fold that the docstring
+above `nan_along_dim` calls "the third repair of one predicate and ... meant
+to be the last". **It is the fourth.**
+
+It is **not** this round's change and **not** cause D: the function is
+byte-identical in `7457147`'s `aten.rs`, so it predates both this branch and
+the int8 round. It is left unfixed deliberately — it is a different operator
+family from the one this round was sent to verify, and the same helper is also
+called from the softmax row-max, so the blast radius wants its own round.
+`test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect` **pins** it:
+it asserts the wrong answer is still the wrong answer, and goes RED the moment
+somebody repairs the operator, which forces the agreement assertion back in.
+This is the `clamp` shape of §7.9 again, found the same way — by giving a cell
+an input its published shape never had.
+
+#### The bracket, and the host-twin experiment run on Metal
+
+`_C._metal_counters()` exists in this build (§7.11). **Bracket**: counters read
+immediately before and immediately after one `_aten_dispatch`, in-process,
+after an unmeasured dispatch has warmed the device.
+
+    aten.full.default, [2,3], on mps      compute  uploads  bytes  downloads
+      float32                                   1        1      4          0
+      float16                                   1        1      2          0
+      bfloat16                                  1        1      2          0
+    aten.scalar_tensor.default, on mps          0        1    4/2/2        0
+
+`compute_encoders > 0` and `host_downloads == 0`, as asked. The load-bearing
+number is **`host_upload_bytes`**: it is one element of the *storage* dtype,
+not `numel × itemsize` (a host-side fill of the whole block) and not 8 (an
+unconverted `f64`). `scalar_tensor`'s `compute_encoders` is legitimately 0 —
+a one-element result has nothing to broadcast — and the test excludes it by
+name rather than asserting a bug into existence.
+
+**CLAUDE.md §2 says this experiment cannot be run on Metal. It can now, and it
+was.** A mutant replacing `host_full`'s device path with a host-side fill of
+the whole block, built through `vendor/install_shim.sh` so it reached the
+vendored tree:
+
+| mutant | values | counters |
+|---|---|---|
+| M-B: whole block filled on the host, then uploaded | **all green** — `test_every_float_factory_in_cause_d_answers_on_mps` and the rounding witness both pass | **RED**: 24 bytes uploaded where 4 were expected, 0 compute shaders where ≥ 1 were expected |
+
+That is the host twin, on Metal, invisible to every value in the file and
+caught only by the counter — the same result CLAUDE.md §2 records three times
+on Vulkan and explicitly declines to claim cross-backend. It may now be
+claimed.
+
+#### Nullification
+
+| mutant | reached the vendored tree | result |
+|---|---|---|
+| M-A: narrow the constant through `f32` before the device sees it | yes | **RED** in `test_the_constant_is_rounded_once_and_not_twice` — `float16` gave `0.03125`, upstream `0.031280517578125`. **Every other test in the file stayed green**, which is the point: the trap is invisible on `float32` and invisible to a value of `1.5` |
+| M-B: fill the whole block on the host and upload it | yes | **RED** only in the counter bracket and the structural test; all six value tests green |
+| the whole of `882c45a` removed (`7457147`'s `aten.rs`, rebuilt) | yes | **7 of 11 RED** — the pre-implementation state, which is stronger evidence than a mutant and is what a TDD red looks like after the fact |
+
+**Which tests are toothless, stated plainly.** Four of the eleven stayed green
+against the pre-implementation build: `test_the_cpu_answers_are_unchanged`
+(a regression guard — green by design),
+`test_upstream_integer_matmul_wraps_in_the_storage_width` (measures upstream,
+not this build), `test_the_overflow_cases_really_do_overflow` (guards another
+test's inputs), and `test_the_mps_integer_refusal_is_not_served_by_a_readback`
+— which is the only uncomfortable one, because the pre-change build also
+refused, just in candle's words. It could not distinguish the two builds. It
+has been given the counter bracket so that it is at least an instrument
+against a future readback rather than an assertion that something raised.
+
+**Re-nullified 2026-09-22 on a freshly rebuilt tree, and the count was stale.**
+"Eleven" was the suite count of `882c45a`; this section then added three more
+tests (the counter bracket and the two NaN-seed tests) and did not re-run its
+own nullification, so four of the fourteen had never been broken on purpose.
+All three mutants below were built through `vendor/install_shim.sh`, so each
+reached the vendored `_C.abi3.so` rather than a stage:
+
+| mutant | result |
+|---|---|
+| M-A, re-run: `host_const` narrows through `f32` before the steps | **exactly one RED** — `test_the_constant_is_rounded_once_and_not_twice`, on `float16`/`mps`, `0.03125` against upstream's `0.031280517578125`. The other seven tests in the file stayed green, which is the claim: `float32` cannot see this |
+| M-B, re-run: `host_full` fills the whole block on the host and uploads it | **two RED** — the counter bracket (24 bytes where 4 were expected, 0 compute encoders where ≥ 1) and `test_host_full_exists_and_converts_before_it_broadcasts`. **All six value tests green.** The host twin, on Metal, seen only by the counter |
+| M-C, new: the exact integer matmul **saturates** instead of wrapping (`clamp` before the narrowing cast, `int8` and `int32`) | **RED in `test_integer_matmul_agrees_with_upstream_including_at_overflow` on all 20 case keys**, `int8` and `int32` alike |
+| the overflow inputs defanged to ±2 in `_random_case` | **RED in `test_the_overflow_cases_really_do_overflow`**, naming all three dtypes |
+
+M-C and the defang together close the question §4.3a's single 2×3×2 cell could
+not: the inputs really do overflow, and a saturating kernel — one of the three
+behaviours that cell cannot distinguish — is caught in every case. `int64` has
+no saturating mutant to write, because its arm returns the accumulator
+unnarrowed.
+
+#### The `mps` integer refusal is not one instantiation line away
+
+Asked because the vendored `candle-metal-kernels` crate now exists and could
+in principle have made the refusal premature. It has not:
+`kernels/mlx_gemm.rs` knows `GemmDType::{F32, F16, BF16}` and nothing else,
+`metal_src/mlx_gemm.metal` carries `instantiate_gemm_transpose_helper` lines
+for `f32`, `f16` and `bf16` only, and its `accum_type` is `typedef float`.
+An integer GEMM there is not a new instantiation line; it is a new accumulator
+type, because a `float` accumulator cannot hold the exact `int32`/`int64`
+products the CPU kernel is graded against. §7.13 and §7.15 reached the same
+place for `DType::I8` by a different road. **The refusal stands, on measured
+grounds rather than inherited ones.**
+
+#### The gate had never been run on this work, and it was red in six suites
+
+§4.3b and §4.3c were both written by rounds that ended before a gate. Run for
+the first time on 2026-09-22, the tree came back **suites 109/109, ok 1862,
+FAIL 21, SKIP 24** — not the FAIL 0 the branch was being reported at. Five
+suites were red **because of the work in this section**, and each failure was a
+neighbour the implementing commit did not come back to:
+
+| suite | what it said | why |
+|---|---|---|
+| `test_dtypedev` | `now computes and did not (4): int8\|matmul, int16\|matmul, int32\|matmul, int64\|matmul` | `_CPU_REACHES` and DTYPEDEV.md §3.1 freeze the exact set of cells that compute. `exact_int_matmul` widened it and neither was updated. Fixed: four rows go 18 → 19, and **`int16` is in that gain**, which §4.3b's fifteen does not contain — its sweep has no `int16` column |
+| `test_mpsinplace` | `aten.fill_.Scalar now works on mps. That is good news: make this an agreement test` | the pin §7.7 left behind did exactly what it was written to do. Promoted: `test_fill_on_mps_agrees_with_upstream` plus a second test holding the `int32` cell that still refuses |
+| `test_intmps` | `int16 on mps refused matmul without offering the int64 road` | **the message was right and the test was wrong.** `int64` matmul on `mps` refuses too, so recommending it would dead-end. The invariant "every refusal offers the `int64` road" was true only while the refusing operators were elementwise; it is now per-operator, and `matmul`'s device-keeping road is a float cast |
+| `test_shim` | `these functions in aten.rs read device bytes to the host and are neither a refused kernel, a known readback helper, nor an exemption with a reason: ['exact_int_matmul']` | the scan is a real instrument and it fired correctly. `exact_int_matmul` refuses a non-host operand at its first statement, so it is an exemption with a reason, and it is written down as one rather than filtered out |
+
+**And twenty golden cases, which the suites cannot see.** With the five suites
+green the gate was still red, in the one marker CLAUDE.md §2 says `ge` is
+useless for: `golden_cases_failed eq 0`, reading **20**. Every one of the twenty
+said the same thing — *"gap appears CLOSED: both sides now succeed, promote this
+case to expect=match and diff real values"*. They are `mm`, `bmm`, `matmul`,
+`addmm` and `baddbmm` at `int64`, `int32` and `int16`, recorded in
+`tools/golden/cases.py` as a candle gap since before this branch, plus the three
+`baddbmm` `alpha=0` cases and the two `alpha=1.9`/`alpha=1` truncation cases that
+were pinned as *unverifiable* precisely because the shim never reached the
+multiply. `exact_int_matmul` reaches it. All twenty are promoted to
+`expect="match"` — so their **values** are now diffed against upstream, which is
+a stronger claim than the refusal they replaced — and `_MM_C_ERROR_DTYPES`
+shrinks to `["uint8"]`, the one width the signed kernel does not cover. Golden:
+**11627/11627, 0 failed, ops=308, pending=0.** The `alpha=1.9` case is the one
+worth naming: it now *measures* the truncation its own comment said could not be
+verified, and it is bit-for-bit identical to `alpha=1`.
+
+The sixth was `test_ane_subgraph_components`, which died at import on an
+absolute `sys.path.insert` naming a worktree that no longer exists — unrelated
+to this work, and the reason it was invisible is worth keeping: **a suite that
+dies at import contributes 0 ok and 0 FAIL**, so it costs the ledger nothing
+and reads as present.
+
+#### Sixteen of the twenty-one failures were one character of path
+
+The rest were not this branch at all. Fifteen suites decide "did this probe get
+the shim or upstream?" with
+
+    "torchnative" in (torch.__file__ or "")
+
+and the workspace move that put the caches inside the repository made
+`/Volumes/macMini/caches` a symlink to
+`/Volumes/macMini/thisisthepy/torchnative/.caches`. **Upstream torch now lives
+under a directory literally named `torchnative`**, so that predicate is a
+constant `True` and every one of those suites failed with "the upstream-side
+probe got the shim". A sixteenth, `test_shim`'s HF-quantiser provenance check,
+asks the same question of traceback frames and answered the same way — it
+reported that transformers' own refusal came from torchnative.
+
+This is the CLAUDE.md §5.5 shape inverted: not a check that cannot fail, but a
+check that cannot pass, and both are the same defect — the instrument stopped
+depending on the thing it claims to measure. Replaced with
+`hasattr(torch._C, "_aten_implemented")`, which is what actually distinguishes
+the two builds, and with a path-component test that excludes `site-packages`
+for the traceback case.
+
+**Found twice, independently, within the same hour.** The coordinating session
+diagnosed it from the other side — it had made the workspace move — and landed
+the same replacement on `develop`, at the same nineteen call sites and with the
+same predicate. That is worth recording for a reason beyond bookkeeping: two
+rounds converged on `_aten_implemented` because it is the only thing in this
+directory that is a fact about **which torch was imported** rather than about
+where a file happens to sit. **A substring of a path is not that fact**, and
+this is the second time a workspace move has invalidated one: the first was the
+absolute `sys.path.insert` in `test_ane_subgraph_components` above. The fix in
+this worktree is redundant with develop's and should be dropped in favour of it
+at merge — kept here only so the gate numbers below were measured on a tree
+where the instrument worked.
+
+#### Still open, and named
+
+**`eye` and `linspace` build an `f64` on the device — cause D's defect wearing
+cause B's message.** Measured, unchanged by this round: `linspace` on `mps`
+refuses with `Metal contiguous to_dtype F64 F32 not implemented`, and
+`aten.rs` shows why — `Tensor::from_vec(values, n, &device)` puts a `Vec<f64>`
+straight onto Metal and converts afterwards. That is exactly the shape
+`host_full` exists to remove, one call shape further out, and
+`test_no_float_constant_is_still_materialised_on_the_device` does not catch it
+because it only inspects `Tensor::full`. Eight measured cells
+(`eye` and `linspace`, `float32`/`float16`/`bfloat16`/`int32` on `mps`) are
+behind it. **Not done here** — it is new operator work, not verification, and
+it is proposed rather than taken.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs amax_keepdim_anywhere present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
+<!-- DOCWATCH: op-implemented aten.amax.default -- the operator the mps NaN defect above is pinned on -->
+<!-- DOCWATCH: op-not-implemented aten.amin.default -- asserted by the NaN table rather than assumed -->
 
 ### 4.3 470 refusals still hand back a candle symbol
 
@@ -1163,6 +1479,21 @@ harder to judge. `test_mpsinplace.py::
 test_fill_on_mps_is_blocked_by_a_different_gate_than_this_one` pins it so it
 cannot be quietly reclassified.
 
+**Closed 2026-09-22, for the float dtypes.** §4.3b's `host_full` is exactly
+"the change to `aten.rs`'s constant construction" this paragraph declined to
+make, and it removed the `unsupported const-set f64` gate for `float32`,
+`float16` and `bfloat16`. The pin did its job — it went RED when `fill_` on
+`mps` started answering — but the commit that closed the gate did not come back
+to it, so it sat red. It has been promoted as it instructed:
+`test_fill_on_mps_agrees_with_upstream` grades the three float cells
+element-wise against upstream, and
+`test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes` keeps the `int32`
+cell, which still refuses, from vanishing with the old test. The eight names in
+the third row above are **not** all closed: the gate is closed where the
+constant is a float the destination dtype can hold, and `to_dtype through F64`
+(`eye`, `linspace`, `full`/`scalar_tensor` at `int32`) is untouched — see
+§4.3c.
+
 ### 7.9 A silently wrong answer, older than this round, found by re-measuring
 
 **`clamp` and `clamp_min` have dropped NaN on Metal since `mps` landed.**
@@ -1222,8 +1553,9 @@ without writing makes its receiver keep the unclamped values.
 
 The two that stay green under row one are the right two:
 `..._no_host_readback` is a claim about *source* and a mutant that removes the
-write does not add a readback, and `..._fill_..._different_gate` is about a
-blocker upstream of the write door that row one cannot reach.
+write does not add a readback, and `..._fill_...` (now
+`test_fill_on_mps_agrees_with_upstream`) is about a blocker upstream of the
+write door that row one cannot reach.
 
 **One test in this file has no mutant of its own, and that is reported rather
 than papered over.**
@@ -1247,7 +1579,8 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_fill_on_mps_is_blocked_by_a_different_gate_than_this_one present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes present -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
