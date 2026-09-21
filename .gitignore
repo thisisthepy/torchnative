@@ -208,3 +208,17 @@ cython_debug/
 # macOS Finder metadata. Three of these had been committed, and the sdist
 # carried them to PyPI.
 .DS_Store
+
+# subagent worktrees live inside the repo
+.worktrees/
+
+# tests/ holds the VOICE4 (BigVGAN) fixtures. The scripts are tracked; the
+# assets are not -- model weights, the HF cache, vendored third-party source
+# and generated reference output are large and reproducible from the scripts.
+tests/*
+!tests/*.py
+!tests/*.sh
+!tests/README.md
+
+# workspace caches (spike-venv, hf, gradle, konan, cargo targets)
+.caches/
