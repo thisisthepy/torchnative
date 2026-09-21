@@ -18474,14 +18474,14 @@ if MODE == "dtype_int8":
             "transformers" in (f.filename or "")
             for f in traceback.extract_tb(exc.__traceback__)
         )
+        # The torchnative *package* directory, not the substring "torchnative".
+        # The workspace venv now lives inside the repository, so every upstream
+        # file -- transformers included -- has "torchnative" in its path and a
+        # substring test calls every frame ours.
+        import torchnative as _tn, os as _os
+        _pkg = _os.path.dirname(_os.path.abspath(_tn.__file__))
         out["bare_int8_raised_in_torchnative"] = any(
-            # A *path component*, and not under site-packages. The bare
-            # substring matched every frame once the workspace moved the
-            # spike-venv inside a repository directory literally named
-            # `torchnative`, which turned this provenance check -- and
-            # fifteen others like it -- into a constant True.
-            (f"{os.sep}torchnative{os.sep}" in (f.filename or "")
-             and "site-packages" not in (f.filename or ""))
+            _os.path.abspath(f.filename or "").startswith(_pkg)
             for f in traceback.extract_tb(exc.__traceback__)
         )
 
