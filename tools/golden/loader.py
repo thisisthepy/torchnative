@@ -43,8 +43,8 @@ def _candidate_artefacts(explicit_path: str | None) -> list[str]:
     # environment variable -- but it says out loud which artefact it took, and
     # whether that artefact belongs to the tree it was invoked from.
     default = [
-        "/Volumes/macMini/caches/cargo-target/release/lib_C.dylib",
-        "/Volumes/macMini/caches/cargo-target/release/lib_C.so",
+        "/Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target/release/lib_C.dylib",
+        "/Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target/release/lib_C.so",
     ]
     here = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     for path in default:

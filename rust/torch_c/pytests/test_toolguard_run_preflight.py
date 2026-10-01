@@ -47,7 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RUN_SH = HERE / "run.sh"
 
-GOOD_PYTHON = "/Volumes/macMini/caches/spike-venv/bin/python"
+GOOD_PYTHON = "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python"
 
 
 def _fake_cargo_dir(tmp: Path, sentinel: Path) -> Path:

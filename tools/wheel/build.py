@@ -299,7 +299,7 @@ def _fix_install_name(data: bytes) -> bytes:
 
     cargo links a `cdylib` with `-install_name <CARGO_TARGET_DIR>/release/deps/
     lib_C.dylib`, so a wheel built here announces
-    `/Volumes/macMini/caches/cargo-target-wheel/...` to anyone who runs `otool
+    `/Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target-wheel/...` to anyone who runs `otool
     -L` on it. It is inert -- `dlopen()` of a module by path ignores
     `LC_ID_DYLIB`, which is why the extension imports anyway -- but a published
     artefact should not name a directory on the machine that built it.
@@ -400,7 +400,7 @@ def _retag(name: str, plat: str) -> str:
 # same class of lie as the `universal2` tag in §3.3 of docs/platform/WHEEL.md.
 
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
 
 # Where `cargo` put the cross artefacts. Cargo's own default is `<crate>/target`
 # and every build wiring in this repository overrides it, so read the same
@@ -415,7 +415,7 @@ CARGO_TARGET_DIR = Path(os.environ.get(
 #: the CPython inside Pyodide has never heard of it. Two roots because they are
 #: two kinds of thing -- see `PyEmscriptenTarget.sysconfig`.
 PYODIDE_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/caches/pyodide/pyodide"))
+    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/thisisthepy/torchnative/.caches/pyodide/pyodide"))
 
 CRATE = REPO / "rust" / "torch_c"
 

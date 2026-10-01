@@ -28,7 +28,7 @@ Not wired into `run.sh`, for the same reasons `arch_sweep.py` is not: it takes
 minutes, constructs hundreds of models, and produces a measurement rather than an
 invariant. Run it by hand, both sides, then compare:
 
-    PY=/Volumes/macMini/caches/spike-venv/bin/python
+    PY=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python
     root=$(git rev-parse --show-toplevel)
     cd $root/rust/torch_c/pytests
 

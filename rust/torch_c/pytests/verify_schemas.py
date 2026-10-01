@@ -22,7 +22,7 @@ artefact and `cargo build` needs no torch -- it is the same kind of tool as
 
 Usage
 -----
-    /Volumes/macMini/caches/spike-venv/bin/python rust/torch_c/pytests/verify_schemas.py
+    /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python rust/torch_c/pytests/verify_schemas.py
 
 Exit code is 0 iff every entry matched. Read the exit code; do not grep.
 """

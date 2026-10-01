@@ -55,7 +55,7 @@ REPO = pathlib.Path(__file__).resolve().parents[3]
 WHEEL_TOOLS = REPO / "tools" / "wheel"
 RELEASE_DOC = REPO / "docs" / "platform" / "RELEASE_0_1_0b3.md"
 WASM_HARNESS = WHEEL_TOOLS / "verify_wasm_browser.py"
-IOS_SCRATCH = pathlib.Path("/Volumes/macMini/caches/ios-wheel-check")
+IOS_SCRATCH = pathlib.Path("/Volumes/macMini/thisisthepy/torchnative/.caches/ios-wheel-check")
 
 SKIPPED = []
 

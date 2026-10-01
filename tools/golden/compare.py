@@ -15,13 +15,13 @@ comparing dtype, shape, and value.
 Usage
 -----
 Needs a Python environment with real upstream torch installed (this repo's
-scratch venv has it: /Volumes/macMini/caches/spike-venv, torch 2.13.0), and
+scratch venv has it: /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv, torch 2.13.0), and
 a built host artefact for `_C` (default host build location per
-docs/design/TORCH_C.md §7: /Volumes/macMini/caches/cargo-target/release/lib_C.dylib,
+docs/design/TORCH_C.md §7: /Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target/release/lib_C.dylib,
 or built fresh via `cd rust/torch_c && ./pytests/run.sh` first).
 
-    /Volumes/macMini/caches/spike-venv/bin/python tools/golden/compare.py
-    /Volumes/macMini/caches/spike-venv/bin/python tools/golden/compare.py \
+    /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tools/golden/compare.py
+    /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tools/golden/compare.py \
         --artefact /path/to/lib_C.dylib -v
 
 Exit code is 0 iff every case matched its expectation; non-zero (1)

@@ -2,7 +2,7 @@
 
 Pure tests only -- no ExecuTorch import, no device, no artefact. Everything
 this file checks is checkable from the module's own source and from the
-installed `executorch` wheel at `/Volumes/macMini/caches/qnn-venv` that the
+installed `executorch` wheel at `/Volumes/macMini/thisisthepy/torchnative/.caches/qnn-venv` that the
 table was built from. `docs/devices/QNNOPS.md` is the sourcing record;
 `docs/devices/QNN.md` is the (separate, artefact/device) round this table
 does not attempt to redo.
@@ -36,7 +36,7 @@ from torchnative.export.qnn_ops import (  # noqa: E402
 )
 
 _QNN_BUILDERS_DIR = (
-    "/Volumes/macMini/caches/qnn-venv/lib/python3.13/site-packages/"
+    "/Volumes/macMini/thisisthepy/torchnative/.caches/qnn-venv/lib/python3.13/site-packages/"
     "executorch/backends/qualcomm/builders"
 )
 
@@ -100,7 +100,7 @@ def test_supported_ops_matches_a_fresh_extraction_from_the_installed_wheel():
 def test_source_package_names_the_exact_installed_version():
     assert EXECUTORCH_VERSION in SOURCE_PACKAGE
     assert os.path.isdir(
-        "/Volumes/macMini/caches/qnn-venv/lib/python3.13/site-packages/"
+        "/Volumes/macMini/thisisthepy/torchnative/.caches/qnn-venv/lib/python3.13/site-packages/"
         f"executorch-{EXECUTORCH_VERSION}.dist-info"
     ) or not _qnn_builders_available(), (
         "SOURCE_PACKAGE claims a version whose dist-info is not on this machine"

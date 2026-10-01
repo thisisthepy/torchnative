@@ -14,7 +14,7 @@ Two things make the comparison fair, both inherited from PERF.md §0:
 
 Usage (one command, from the repo root)::
 
-    PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
+    PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python \
         python tools/bench/ab_upstream.py
 
     # or pick a suite / more rounds

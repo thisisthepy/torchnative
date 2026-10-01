@@ -63,7 +63,7 @@ NOT wired into `run.sh` and must not be: it needs both interpreters and takes a
 long time. Upstream runs FIRST -- it is the producer of weights, inputs and the
 float64 oracle; the shim side is a replay.
 
-    PY=/Volumes/macMini/caches/spike-venv/bin/python
+    PY=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python
     root=$(git rev-parse --show-toplevel)
     D=/tmp/agree
 

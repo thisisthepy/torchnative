@@ -7,7 +7,7 @@ to compare tensors -- their absence shows up in *somebody else's* code, not
 this shim's.
 
 Measured first, against real torch 2.13.0 in
-`/Volumes/macMini/caches/spike-venv` (`import torch as _upstream_torch`,
+`/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv` (`import torch as _upstream_torch`,
 guarded exactly the way `test_shim.py`'s own "against real upstream torch,
 live in the same process" section already does it -- `_C` here is the shim,
 loaded standalone and never as `torch._C`, so the two do not collide):

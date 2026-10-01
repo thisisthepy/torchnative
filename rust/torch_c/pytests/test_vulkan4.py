@@ -2642,7 +2642,7 @@ def _pretrained_bert_dir():
     roots = []
     if os.environ.get("TORCHNATIVE_BERT_DIR"):
         roots.append(os.environ["TORCHNATIVE_BERT_DIR"])
-    for home in (os.environ.get("HF_HOME"), "/Volumes/macMini/caches/hf-home",
+    for home in (os.environ.get("HF_HOME"), "/Volumes/macMini/thisisthepy/torchnative/.caches/hf-home",
                  os.path.expanduser("~/.cache/huggingface")):
         if home:
             for repo in ("models--google-bert--bert-base-uncased",

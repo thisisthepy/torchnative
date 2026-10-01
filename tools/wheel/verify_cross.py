@@ -80,7 +80,7 @@ REPO = Path(__file__).resolve().parents[2]
 import os  # noqa: E402
 
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
 
 
 def _interpreters_for(machine: str, pattern: str,
@@ -544,7 +544,7 @@ class WindowsExpectation(Expectation):
 # component exists only in Pyodide's `pyodide-lock.json`, and the CPython inside
 # it answers a different, plausible, wrong tag.
 PYODIDE_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/caches/pyodide/pyodide"))
+    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/thisisthepy/torchnative/.caches/pyodide/pyodide"))
 
 
 class PyEmscriptenExpectation(Expectation):

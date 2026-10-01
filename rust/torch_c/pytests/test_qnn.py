@@ -358,7 +358,7 @@ def _hf_home():
     """
     for root in (
         os.environ.get("HF_HOME"),
-        "/Volumes/macMini/caches/hf-home",
+        "/Volumes/macMini/thisisthepy/torchnative/.caches/hf-home",
         os.path.expanduser("~/.cache/huggingface"),
     ):
         if not root:

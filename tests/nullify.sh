@@ -12,4 +12,4 @@ TORCH_C_VENDOR_DIR=/Volumes/macMini/voice4-work/vendor \
 TORCH_C_VOICE4_ASSETS=/Volumes/macMini/voice4-work \
 HF_HOME=/Volumes/macMini/voice4-work/hf \
 PYTHONPATH="$STAGE:$W/rust/torch_c/pytests" \
-/Volumes/macMini/caches/spike-venv/bin/python rust/torch_c/pytests/test_voice4.py 2>&1 | grep -E "^(ok|FAIL)" || true
+/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python rust/torch_c/pytests/test_voice4.py 2>&1 | grep -E "^(ok|FAIL)" || true

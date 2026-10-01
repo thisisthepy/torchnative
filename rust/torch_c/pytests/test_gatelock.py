@@ -48,7 +48,7 @@ HERE = Path(__file__).resolve().parent
 LEDGER = HERE / "suite_ledger.py"
 RUN_SH = HERE / "run.sh"
 
-GOOD_PYTHON = "/Volumes/macMini/caches/spike-venv/bin/python"
+GOOD_PYTHON = "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python"
 
 
 # --------------------------------------------------------------------------

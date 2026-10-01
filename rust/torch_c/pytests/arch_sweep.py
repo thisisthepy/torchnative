@@ -19,7 +19,7 @@ It is NOT wired into `run.sh` and must not be: it needs no network but it takes
 minutes, constructs hundreds of models, and its result is a measurement rather
 than an invariant. Run it by hand, both sides, then compare:
 
-    PY=/Volumes/macMini/caches/spike-venv/bin/python
+    PY=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python
     root=$(git rev-parse --show-toplevel)
 
     PYTHONPATH=$root/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \

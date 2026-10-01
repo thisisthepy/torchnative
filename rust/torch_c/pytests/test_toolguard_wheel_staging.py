@@ -42,7 +42,7 @@ BUILD_PY = REPO_ROOT / "tools" / "wheel" / "build.py"
 VENDORED_TORCH = REPO_ROOT / "torchnative" / "src" / "main" / "torch"
 HOST_SHIM = VENDORED_TORCH / "_C.abi3.so"
 
-GOOD_PYTHON = "/Volumes/macMini/caches/spike-venv/bin/python"
+GOOD_PYTHON = "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python"
 
 
 def _minimal_linux_elf() -> bytes:

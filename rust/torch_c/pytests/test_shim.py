@@ -4043,7 +4043,7 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
 # --- checkpoint round trip: torch.load / safetensors read what upstream
 # wrote, and the `filled` guard refuses to fabricate zeros (docs/models/CKPT.md) ----
 #
-# docs/models/CKPT.md measured this by hand under /Volumes/macMini/caches/ckpt-probe/
+# docs/models/CKPT.md measured this by hand under /Volumes/macMini/thisisthepy/torchnative/.caches/ckpt-probe/
 # (not committed, evaporates with the worktree) and said so itself: "이 중
 # 아무것도 회귀로부터 보호되지 않는다." This section pins those measurements.
 #

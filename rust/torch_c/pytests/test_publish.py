@@ -38,7 +38,7 @@ DOC = REPO / "docs/platform/PUBLISH.md"
 # check_build fail before its stub `tools/wheel/build.py` -- which needs none
 # of the three -- ever ran. Falling back to `python3` when the known-good venv
 # is absent keeps this file runnable on a machine without it.
-_KNOWN_GOOD_PYTHON = "/Volumes/macMini/caches/spike-venv/bin/python"
+_KNOWN_GOOD_PYTHON = "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python"
 PUBLISH_TEST_PYTHON = (
     _KNOWN_GOOD_PYTHON if pathlib.Path(_KNOWN_GOOD_PYTHON).exists() else "python3"
 )

@@ -70,7 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from verify_android import unpack, stage_dependencies  # noqa: E402
 
-PYODIDE = Path(os.environ.get("PYODIDE_DIST", "/Volumes/macMini/caches/pyodide/pyodide"))
+PYODIDE = Path(os.environ.get("PYODIDE_DIST", "/Volumes/macMini/thisisthepy/torchnative/.caches/pyodide/pyodide"))
 PORT = int(os.environ.get("WASM_PROBE_PORT", "8731"))
 
 # Runs inside Pyodide. Mirrors verify_android.PROBE's shape; `_multiprocessing` is

@@ -112,7 +112,7 @@ torch.save(codes, a.out + "_out_codes.pt")
 def _call(side, stubs, d, name, tok_dtype):
     out = os.path.join(d, name)
     env = dict(os.environ)
-    env.setdefault("HF_HOME", "/Volumes/macMini/caches/hf")
+    env.setdefault("HF_HOME", "/Volumes/macMini/thisisthepy/torchnative/.caches/hf")
     if side == "shim":
         env["PYTHONPATH"] = _VENDOR_DIR + os.pathsep + stubs
         env["TORCH_USE_RTLD_GLOBAL"] = "1"

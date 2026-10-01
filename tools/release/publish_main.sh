@@ -344,7 +344,7 @@ pip wheel runs with --no-build-isolation (see run_pip_wheel's docstring), so
 nothing will install these for you. Nothing has been built yet.
 
 Fix: set PUBLISH_PYTHON to this repo's known-good interpreter and re-run:
-    PUBLISH_PYTHON=/Volumes/macMini/caches/spike-venv/bin/python $0
+    PUBLISH_PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python $0
 EOF
     exit 1
 fi

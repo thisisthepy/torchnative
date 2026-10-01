@@ -31,14 +31,14 @@ a place where the measurement is not of what it says:
     it RAISES, and the run records that none was called. It is reachable only
     from the tokenizer's ENCODE path (`torchaudio.functional.resample` on input
     audio), and this round decodes only. See §7 for what that costs.
-  * **`HF_HOME` is moved to the external disk** (`/Volumes/macMini/caches/hf`).
+  * **`HF_HOME` is moved to the external disk** (`/Volumes/macMini/thisisthepy/torchnative/.caches/hf`).
     The internal disk has 12 GB free and the checkpoint is 11.5 GB.
 
 Run it as:
 
-    PY=/Volumes/macMini/caches/spike-venv/bin/python
+    PY=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python
     root=$(git rev-parse --show-toplevel)
-    HF_HOME=/Volumes/macMini/caches/hf  $PY higgs_e2e.py --stage all --dir /tmp/higgs
+    HF_HOME=/Volumes/macMini/thisisthepy/torchnative/.caches/hf  $PY higgs_e2e.py --stage all --dir /tmp/higgs
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def _write_stub(d):
 
 def _env(side, stubs):
     env = dict(os.environ)
-    env.setdefault("HF_HOME", "/Volumes/macMini/caches/hf")
+    env.setdefault("HF_HOME", "/Volumes/macMini/thisisthepy/torchnative/.caches/hf")
     if side == "shim":
         env["PYTHONPATH"] = _VENDOR_DIR + os.pathsep + stubs
         env["TORCH_USE_RTLD_GLOBAL"] = "1"
