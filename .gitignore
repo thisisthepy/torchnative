@@ -222,3 +222,6 @@ tests/*
 
 # workspace caches (spike-venv, hf, gradle, konan, cargo targets)
 .caches/
+
+# ephemeral logs and scripts of the coordinating session
+.scratch/
