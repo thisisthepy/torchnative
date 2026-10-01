@@ -50,7 +50,7 @@ docs/                  179 개. 각 회차가 무엇을 측정했는지의 기�
 ## 2. 게이트
 
 ```sh
-PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
+PATH="$HOME/.cargo/bin:$PATH" PYTHON="$PWD/.caches/spike-venv/bin/python" \
     bash rust/torch_c/pytests/run.sh
 ```
 
@@ -153,6 +153,35 @@ bash rust/torch_c/pytests/run.sh > /tmp/gate.log 2>&1; echo "EXIT=$?"
 
 ## 3. 건드리면 안 되는 것
 
+### 3.0 이 저장소 밖에는 아무것도 만들지 않는다 — 예외 없음
+
+**파일, 디렉터리, 심볼릭 링크, 이름을 바꿔 남겨둔 것 — 무엇이든 이 저장소
+(`/Volumes/macMini/thisisthepy/torchnative`) 밖에 만들지 않습니다.** 사용자의 명시적
+지시입니다.
+
+빠져나갈 구멍으로 쓰인 것들이라 이름을 박아 둡니다. **전부 금지입니다:**
+
+- **심볼릭 링크.** "내용이 아니라 포인터일 뿐"이라는 이유로 저장소 밖에 링크를 만들지
+  마십시오. 2026-09-22 에 조율 세션이 `/Volumes/macMini/caches` 를 `.caches` 로 가는 링크로
+  만들었는데, 이유는 **문서 133 개를 고치지 않아도 된다는 자기 편의**였습니다. 사용자가
+  지우라고 했습니다.
+- **지우지 않고 이름만 바꿔 둔 것.** 같은 날 `caches.recreated` 를 "데몬이 쉴 때 지우겠다"며
+  저장소 밖에 남겼습니다. 지울 것은 지우고, 못 지우면 말하십시오.
+- **`/tmp` 와 하네스가 주는 스크래치 디렉터리.** 둘 다 저장소 밖입니다. 하네스가 스크래치를
+  쓰라고 해도 이 규정이 우선합니다. 임시 파일은 **`.scratch/`**(gitignore 됨)에 둡니다.
+  `/tmp` 에 둔 에이전트 규칙 파일은 세션 재시작으로 **두 번** 사라졌습니다.
+- **`/Volumes/macMini/` 최상위.** 이 경로 아래 저장소 아닌 곳은 전부 밖입니다.
+
+**저장소 밖을 *바꿔야만* 하는 경우**(예: 홈의 `~/.gradle` 링크가 저장소 안 데이터를
+가리키도록 되어 있는데 그 데이터가 움직였을 때)에는 **고치지 말고, 무엇을 왜 바꿔야 하는지
+말하고 기다립니다.** "안 고치면 다른 게 깨진다"는 이유로 혼자 바꾸지 마십시오 — 그것이 바로
+이 규정이 막으려는 판단입니다.
+
+검사는 간단합니다. 작업을 마치기 전에:
+
+    ls /Volumes/macMini/        # 저장소들과 원래 있던 것 외에 늘어난 것이 없어야 한다
+
+
 **`torchnative/src/main/torch/`** — upstream 의 vendored 트리입니다. gitignore 되어 있고
 `vendor/vendor_torch.sh` 가 생성하며 **조용히 지워집니다.** 손으로 고치지 마십시오.
 `__init__.py` 가 없으면 트리가 안 지어진 것입니다:
@@ -172,10 +201,10 @@ assert hasattr(torch._C, "_aten_implemented")   # shim 인가 upstream 인가
 **`rust/torch_c/src/bootstrap.py`** 는 빌드 타임에 `include_str!` 로 확장에 구워집니다.
 **고치고 리빌드하지 않으면 옛 바이너리를 다시 시험합니다.**
 
-**`/Volumes/macMini/caches/spike-venv`** 에 설치하지 마십시오 (transformers 5.15.1 로 고정).
-새 패키지가 필요하면 외장 SSD 에 별도 venv 를 만드십시오.
+**`.caches/spike-venv`** 에 설치하지 마십시오 (transformers 5.15.1 로 고정).
+새 패키지가 필요하면 **`.caches/` 안에** 별도 venv 를 만드십시오 (§3.0 — 저장소 밖은 안 됩니다).
 
-**`/Volumes/macMini/caches/emsdk`** 는 공유입니다. `EM_CACHE` 를 돌려쓰십시오.
+**`.caches/emsdk`** 는 공유입니다. `EM_CACHE` 를 돌려쓰십시오.
 
 ---
 

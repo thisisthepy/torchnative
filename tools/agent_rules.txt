@@ -1,8 +1,14 @@
 HARD RULES — violating any invalidates the round:
+- NEVER create anything outside this repository: no file, directory, symlink, or renamed
+  leftover. That includes /tmp and any scratch directory the harness offers you -- both are
+  outside. Put throwaway files in `.scratch/` (gitignored). If something outside the
+  repository genuinely has to change, do not change it: say what and why, and stop. This
+  is the user's explicit rule, and the coordinating session broke it twice in one day with
+  a symlink and a renamed directory.
 - Never run `git commit`, `git push`, `git merge`, or `git checkout -- <path>`. The coordinating session commits. To back up a file before editing, use `cp file file.bak`, and keep the backup outside the worktree.
 - Never run `git add -A`.
 - Never modify `torchnative/src/main/torch/` — upstream's vendored tree, gitignored, script-generated, silently wiped.
-- Never install anything into /Volumes/macMini/caches/spike-venv (transformers 5.15.1 pinned; do NOT install ml_dtypes). You may read it and run its python.
+- Never install anything into .caches/spike-venv (transformers 5.15.1 pinned; do NOT install ml_dtypes). You may read it and run its python.
 - Run long commands in the FOREGROUND. You are headless — there is no next turn, so backgrounding a command and waiting for a notification loses the work entirely.
 - Never read an exit code through a pipe. Redirect to a file, then check $? on its own line. Note `echo "EXIT=$?"` as the last command makes the script's own exit code 0 — read the EXIT= line from the file instead.
 - Never suppress stderr on a command whose success you will rely on. `2>/dev/null` once hid a failing `rm` and the coordinating session read the failure as success.
