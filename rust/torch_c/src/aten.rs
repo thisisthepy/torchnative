@@ -1790,6 +1790,28 @@ pub(crate) fn widen_f64(t: &Tensor) -> candle_core::Result<Tensor> {
     crate::reduced::to_dtype(t, candle_core::DType::F64)
 }
 
+/// `widen_f64` for a tensor that is on its way into host memory anyway.
+///
+/// Metal has no `F64`, so `to_dtype(F32 -> F64)` there is not a wrong answer
+/// but a missing symbol: `fill_.Tensor(float32(..), tensor(1.0))` died with
+/// `Metal contiguous to_dtype F32 F64 not implemented` inside `scalar_arg`,
+/// reading a **zero-dim tensor** whose one value the caller had already
+/// decided to read. Moving first and widening on the host answers the same
+/// question with the same bits and costs strictly less: the transfer is in the
+/// narrow dtype rather than the wide one.
+///
+/// Separate from `widen_f64` rather than folded into it, because most of that
+/// function's callers keep the widened tensor **on the device** and compute
+/// with it (`pow.Tensor_Scalar` is `widen_f64` plus candle's `powf`). Moving
+/// those to the host would be a silent fallback of exactly the kind
+/// docs/devices/MPS.md §1.1 refuses.
+pub(crate) fn widen_f64_host(t: &Tensor) -> candle_core::Result<Tensor> {
+    if matches!(t.device(), Device::Cpu) {
+        return widen_f64(t);
+    }
+    widen_f64(&t.to_device(&Device::Cpu)?)
+}
+
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
 /// land here once the Python layer is vendored.
 pub fn aten_dispatch(
@@ -6022,7 +6044,7 @@ fn full_default(
 
     let tensor = if storage.is_int() {
         let value: i64 = fill.extract()?;
-        Tensor::full(value, size, &device).and_then(|t| t.fast_to(storage))
+        host_full(value, &[storage], size, &device)
     } else {
         // `host_full`, not `Tensor::full(.., &device)`: the second form asks
         // Metal for an `f64` it does not have. Cause D, §4.3a.
@@ -6056,7 +6078,7 @@ fn filled_block(
     }
     let storage = storage_for(op, tag, device)?;
     if storage.is_int() {
-        Tensor::full(value.as_i64(), shape, device).and_then(|t| t.fast_to(storage))
+        host_full(value.as_i64(), &[storage], shape, device)
     } else {
         // Cause D, and this one call site carries three of its operators:
         // `full_like`, `new_full` and `constant_pad_nd` all fill through here.
@@ -10004,7 +10026,7 @@ fn scalar_tensor_default(
     let tensor = if storage.is_int() {
         // Upstream truncates toward zero rather than rounding:
         // `scalar_tensor(-1.5, dtype=int64)` is `-1`, measured.
-        Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
+        host_full(value.as_i64(), &[storage], (), &device)
     } else {
         host_full(value.as_f64(), &[storage], (), &device)
     }
@@ -11197,10 +11219,33 @@ fn host_const<T: candle_core::WithDType>(
         t = t.fast_to(*step)?;
     }
     if matches!(device, Device::Cpu) {
-        Ok(t)
-    } else {
-        t.to_device(device)
+        return Ok(t);
     }
+    // **The guard, and it is not optional.** Everything above happens on the
+    // host, where `F64` always works -- so without this line a caller that
+    // reached here with no narrowing step, or with `F64` as its last step,
+    // would get an `F64` buffer *allocated on Metal*: the capability claim
+    // made by construction that `metal_dtype_gate` exists to refuse
+    // (docs/devices/MPS.md §3.1). It would then die later in a message about a
+    // missing candle symbol -- `Metal contiguous to_dtype F64 F32 not
+    // implemented` -- which is the failure this helper exists to remove.
+    //
+    // Refusing here converts nothing. A caller that genuinely wants `float64`
+    // on `mps` is refused at `storage_for`, in upstream's own words; a caller
+    // whose narrowing step this crate chose is a bug in that call site, and
+    // this says so by name rather than silently downcasting it. Five call
+    // sites (`extremum_default`, `nan_shaped_like`, `remainder_op`, `fmod_op`,
+    // `div_mode`) passed no step and narrowed *after* the move, on the device;
+    // they pass their storage dtype now (docs/devices/matrix.md §7.18).
+    if t.dtype() == candle_core::DType::F64 && crate::device::is_metal(device) {
+        return Err(candle_core::Error::Msg(format!(
+            "host_const: refusing to place an f64 constant on {:?} -- Metal has \
+             no f64. The call site must narrow to the storage dtype first; if \
+             the caller asked for float64 on mps, storage_for refuses it.",
+            device.location()
+        )));
+    }
+    t.to_device(device)
 }
 
 /// `host_const`, for a constant that has a **shape**.
@@ -11250,6 +11295,29 @@ fn host_full<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
         return Ok(scalar);
     }
     scalar.broadcast_as(shape)?.contiguous()
+}
+
+/// A vector of host-computed values, narrowed **on the host** and then moved.
+///
+/// `Tensor::from_vec(values_f64, shape, &metal)` uploads an `F64` buffer and
+/// the `.to_dtype(storage)` behind it dies with `Metal contiguous to_dtype F64
+/// F32 not implemented`. The values are the host's either way -- these are RNG
+/// draws this crate just generated, not a readback of anything dispatched --
+/// so the narrowing belongs on the side that can do it, and doing it there
+/// also halves what crosses the boundary. `normal_` and `bernoulli_.float`
+/// are its two callers (docs/devices/matrix.md §7.18).
+fn host_vec<T: candle_core::WithDType, S: Into<candle_core::Shape>>(
+    values: Vec<T>,
+    shape: S,
+    storage: candle_core::DType,
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let t = Tensor::from_vec(values, shape, &Device::Cpu)?.to_dtype(storage)?;
+    if matches!(device, Device::Cpu) {
+        Ok(t)
+    } else {
+        t.to_device(device)
+    }
 }
 
 fn arith_scalar(
@@ -13754,8 +13822,7 @@ fn extremum_default(
             .map_err(|e| candle_err(op, e))?;
         if nan_count > 0 {
             let storage = PyDtype::new(tag).storage(op)?;
-            let out = host_full(f64::NAN, &[], (), flat.device())
-                .and_then(|t| t.fast_to(storage))
+            let out = host_full(f64::NAN, &[storage], (), flat.device())
                 .map_err(|e| candle_err(op, e))?;
             return finish(py, out, tag);
         }
@@ -13930,8 +13997,7 @@ fn nan_along_dim(
 /// takes one Rust scalar type, and the tag decides the storage.
 fn nan_shaped_like(op: &str, like: &Tensor, tag: TorchDType) -> PyResult<Tensor> {
     let storage = PyDtype::new(tag).storage(op)?;
-    host_full(f64::NAN, &[], like.shape(), like.device())
-        .and_then(|t| t.fast_to(storage))
+    host_full(f64::NAN, &[storage], like.shape(), like.device())
         .map_err(|e| candle_err(op, e))
 }
 
@@ -14522,8 +14588,7 @@ fn masked_fill(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(op, e))?;
     let filled = if storage.is_int() {
-        Tensor::full(value.as_i64(), shape.clone(), device)
-            .and_then(|t| t.fast_to(storage))
+        host_full(value.as_i64(), &[storage], shape.clone(), device)
     } else {
         host_full(value.as_f64(), &[storage], shape.clone(), device)
     }
@@ -15079,12 +15144,11 @@ fn remainder_op(
             scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
         // Narrowed to `storage` first: see the doc comment's `uint8` case.
         let filled = if storage.is_int() {
-            Tensor::full(scalar.as_i64(), (), left.device())
+            host_full(scalar.as_i64(), &[storage], (), left.device())
         } else {
-            host_full(scalar.as_f64(), &[], (), left.device())
+            host_full(scalar.as_f64(), &[storage], (), left.device())
         };
         filled
-            .and_then(|t| t.fast_to(storage))
             .and_then(|t| t.broadcast_as(shape.clone()))
             .map_err(|e| candle_err(op, e))?
     } else {
@@ -15210,12 +15274,11 @@ fn fmod_op(
         let scalar =
             scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
         let filled = if storage.is_int() {
-            Tensor::full(scalar.as_i64(), (), left.device())
+            host_full(scalar.as_i64(), &[storage], (), left.device())
         } else {
-            host_full(scalar.as_f64(), &[], (), left.device())
+            host_full(scalar.as_f64(), &[storage], (), left.device())
         };
         filled
-            .and_then(|t| t.fast_to(storage))
             .and_then(|t| t.broadcast_as(shape.clone()))
             .map_err(|e| candle_err(op, e))?
     } else {
@@ -15566,12 +15629,11 @@ fn div_mode(
         // as the divisor ever gets there.
         let target = if scalar_at_opmath { candle_core::DType::F32 } else { storage };
         let filled = if storage.is_int() {
-            Tensor::full(scalar.as_i64(), (), left.device())
+            host_full(scalar.as_i64(), &[target], (), left.device())
         } else {
-            host_full(scalar.as_f64(), &[], (), left.device())
+            host_full(scalar.as_f64(), &[target], (), left.device())
         };
         filled
-            .and_then(|t| t.fast_to(target))
             .and_then(|t| t.broadcast_as(shape.clone()))
             .map_err(|e| candle_err(op, e))?
     } else {
@@ -17899,7 +17961,6 @@ fn fill_inplace(
 ) -> PyResult<Py<PyAny>> {
     let receiver = tensor_receiver(op, args, kwargs)?;
     let raw = required(op, args, kwargs, 1, "value")?;
-    let value = scalar_arg(op, args, kwargs, 1, "value")?.ok_or_else(|| missing(op, "value"))?;
     let (tag, shape, device, numel) = {
         let borrowed = receiver.borrow();
         (
@@ -17919,6 +17980,62 @@ fn fill_inplace(
         checked_convert(&raw, raw.is_instance_of::<pyo3::types::PyInt>(), tag, numel)?;
     }
 
+    // `fill_.Tensor` whose value already lives on an accelerator: the fill
+    // is built **from that tensor, on that device**, and nothing is read
+    // back.
+    //
+    // The route through `scalar_arg` is the one upstream takes for its
+    // `Scalar` overloads, and it is right on the CPU -- but on `mps` it means
+    // downloading the value's one element to form a Rust `f64` and uploading a
+    // constant built from it. That is a host readback of a *dispatched*
+    // tensor, which docs/devices/MPS.md §1.1 refuses, and it is what
+    // `test_metalplace.py::test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back`
+    // caught the moment this key started reaching on Metal at all. There is
+    // nothing the host is needed for here: `to_dtype` then `broadcast_as` is
+    // the same value, computed where the value already is.
+    //
+    // Scoped to a non-CPU value on purpose. On the CPU there is no readback
+    // to avoid, and leaving that path exactly as it was keeps every
+    // `fill_.Tensor` result this crate has ever produced bit-identical.
+    if let Ok(src) = raw.extract::<PyTensorBase>() {
+        let value_tensor = src.tensor()?;
+        if !matches!(value_tensor.device(), Device::Cpu) {
+            if value_tensor.rank() != 0 {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "{op}: argument 'value' as a tensor must be zero-dim, got {}D",
+                    value_tensor.rank()
+                )));
+            }
+            let moved = if value_tensor.device().same_device(&device) {
+                value_tensor.clone()
+            } else {
+                value_tensor.to_device(&device).map_err(|e| candle_err(op, e))?
+            };
+            let replacement = if tag == TorchDType::Bool {
+                PyTensorBase::boolean(
+                    moved
+                        .ne(0.0f64)
+                        .and_then(|t| t.broadcast_as(shape))
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| candle_err(op, e))?,
+                )?
+            } else {
+                let storage = PyDtype::new(tag).storage(op)?;
+                PyTensorBase::new(
+                    moved
+                        .fast_to(storage)
+                        .and_then(|t| t.broadcast_as(shape))
+                        .and_then(|t| t.contiguous())
+                        .map_err(|e| candle_err(op, e))?,
+                )?
+            };
+            write_back(op, &receiver, replacement)?;
+            let _ = py;
+            return Ok(receiver.into_any().unbind());
+        }
+    }
+
+    let value = scalar_arg(op, args, kwargs, 1, "value")?.ok_or_else(|| missing(op, "value"))?;
     let replacement = if tag == TorchDType::Bool {
         let truthy = u8::from(value.as_f64() != 0.0);
         PyTensorBase::boolean(
@@ -17927,7 +18044,7 @@ fn fill_inplace(
     } else {
         let storage = PyDtype::new(tag).storage(op)?;
         let filled = if storage.is_int() {
-            Tensor::full(value.as_i64(), shape, &device).and_then(|t| t.fast_to(storage))
+            host_full(value.as_i64(), &[storage], shape, &device)
         } else {
             host_full(value.as_f64(), &[storage], shape, &device)
         }
@@ -19142,11 +19259,10 @@ fn normal_inplace(
     drop(gen);
 
     let filled = match (values_f64, values_f32) {
-        (Some(values), _) => Tensor::from_vec(values, target.shape, &target.device),
-        (_, Some(values)) => Tensor::from_vec(values, target.shape, &target.device),
+        (Some(values), _) => host_vec(values, target.shape, target.storage, &target.device),
+        (_, Some(values)) => host_vec(values, target.shape, target.storage, &target.device),
         _ => unreachable!("one of the two accumulate types is always produced"),
     }
-    .and_then(|t| t.to_dtype(target.storage))
     .map_err(|e| candle_err(OP, e))?;
 
     write_back(OP, &receiver, PyTensorBase::new(filled)?)?;
@@ -19251,8 +19367,7 @@ fn bernoulli_inplace_float(
         .into_iter()
         .map(|u| if u < p { 1.0 } else { 0.0 })
         .collect();
-    let filled = Tensor::from_vec(values, shape, &device)
-        .and_then(|t| t.to_dtype(storage))
+    let filled = host_vec(values, shape, storage, &device)
         .map_err(|e| candle_err(OP, e))?;
 
     write_back(OP, &receiver, tagged(filled, tag)?)?;
@@ -25875,7 +25990,7 @@ pub(crate) fn scalar_arg(
                 tensor.tensor()?.rank()
             )));
         }
-        let as_f64 = widen_f64(tensor.tensor()?)
+        let as_f64 = widen_f64_host(tensor.tensor()?)
             .and_then(|t| t.to_scalar::<f64>())
             .map_err(|err| candle_err(op, err))?;
         return Ok(Some(if tensor.tag().is_floating_point() {
@@ -27510,7 +27625,7 @@ fn where_scalar_scalar(
         } else {
             let storage = PyDtype::new(tag).storage(OP)?;
             if storage.is_int() {
-                Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
+                host_full(value.as_i64(), &[storage], (), &device)
             } else {
                 host_full(value.as_f64(), &[storage], (), &device)
             }
@@ -28073,7 +28188,7 @@ fn where_scalar_self(
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         if storage.is_int() {
-            Tensor::full(value.as_i64(), (), &device).and_then(|t| t.fast_to(storage))
+            host_full(value.as_i64(), &[storage], (), &device)
         } else {
             host_full(value.as_f64(), &[storage], (), &device)
         }
@@ -33671,4 +33786,81 @@ fn unfold_default(
     };
     wrapped.bar_writes_as_strided_view(barrier);
     Ok(wrapped.into_pyobject(py)?.into_any().unbind())
+}
+
+/// The half of the constant-gate fix that Python cannot reach.
+///
+/// `host_const` refuses to place an `f64` constant on Metal. Every
+/// caller-facing route to that situation is already refused earlier, by
+/// `storage_for`'s `metal_dtype_gate` in upstream's own words -- which is
+/// exactly why the Python suite cannot tell whether this refusal exists:
+/// `rust/torch_c/pytests/test_mpsconst.py` stayed green with the whole
+/// condition replaced by `if false`. A guard no test can kill is not a guard,
+/// so it is killed here instead, one level below the gate that hides it.
+///
+/// What it protects against is a *future call site*, not a user: everything
+/// `host_const` does happens on the host, where `F64` always works, so a new
+/// caller that forgets to pass a narrowing step would silently get an `F64`
+/// buffer allocated on Metal -- the capability claim made by construction that
+/// docs/devices/MPS.md §3.1 refuses, and the one that dies later in a message
+/// about a missing candle symbol.
+#[cfg(test)]
+mod host_const_tests {
+    use super::{host_const, host_full};
+    use candle_core::{DType, Device};
+
+    fn metal() -> Option<Device> {
+        Device::new_metal(0).ok()
+    }
+
+    #[test]
+    fn host_const_refuses_an_f64_constant_on_metal() {
+        let device = match metal() {
+            Some(device) => device,
+            // Not an Apple machine, or no Metal device. Nothing to assert;
+            // the CPU half below still runs.
+            None => return,
+        };
+        let err = host_const(1.5f64, &[], &device)
+            .expect_err("an f64 constant was placed on Metal, which has no f64");
+        let text = format!("{err}");
+        assert!(
+            text.contains("f64") && text.contains("host_const"),
+            "the refusal has to name itself and the dtype; got {text:?}"
+        );
+
+        // The same call with the narrowing step every real call site passes.
+        let ok = host_const(1.5f64, &[DType::F32], &device)
+            .expect("f32 is what Metal has; this must work");
+        assert_eq!(ok.dtype(), DType::F32);
+
+        // And the shaped sibling inherits it rather than routing round it.
+        host_full(1.5f64, &[], (2, 3), &device)
+            .expect_err("host_full must not be a way past host_const's guard");
+    }
+
+    #[test]
+    fn the_guard_is_metal_only() {
+        // `f64` on the CPU is an ordinary dtype and must stay one: a guard
+        // that fired here would break `float64` everywhere it legitimately
+        // works, which is most of this crate.
+        let t = host_const(1.5f64, &[], &Device::Cpu).expect("f64 on cpu is fine");
+        assert_eq!(t.dtype(), DType::F64);
+    }
+
+    /// One step, not two -- asserted where the Python suite asserts it, so
+    /// that a rewrite of `host_const` that reintroduces the intermediate is
+    /// caught by `cargo test` before the suite ever runs.
+    #[test]
+    fn the_narrowing_steps_are_applied_exactly_as_given() {
+        const X: f64 = 0.031265258789971995;
+        let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
+        let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
+        let read = |t: &candle_core::Tensor| {
+            t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
+        };
+        assert_eq!(read(&one), 0.031280517578125, "f16(x), one step");
+        assert_eq!(read(&two), 0.03125, "f16(f32(x)) -- the trap, for contrast");
+        assert_ne!(read(&one), read(&two));
+    }
 }

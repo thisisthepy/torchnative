@@ -350,16 +350,28 @@ cast** (`F16->F64` 32, `BF16->F64` 32, `F32->F64` 31, `F64->*` 16, `U8->F64` 3,
 *onto* the device — these are casts reached **inside** a kernel, after the
 operands were already placed, which is a road `metal_dtype_gate` does not stand
 on. The remaining 20 are `I64->I32` (10) and `I64->I8` (10), the same
-CPU-only-integer story as A. So B is two causes, not 45 operators, and the
-larger one is a gate placement question rather than a kernel.
+CPU-only-integer story as A. So B is two causes, not 45 operators.
+
+**Correction, 2026-09-22 (§7.18): the larger of B's two is neither a gate
+placement question nor 117 cells.** This paragraph read "117 name `F64` on one
+side of the cast" as 117 callers asking for `float64`, and concluded the gate
+was standing in the wrong place. Re-clustered by **the dtype the caller
+actually asked for** rather than by the text of the message, the 117 are
+`float32`/`float16`/`bfloat16` 108, `int64`/`bool` 8, **`float64` 1**. In 116
+of 117 nobody asked for `float64`: the `F64` is this crate's own, introduced
+by `read_flat` widening on its way to `to_vec1::<f64>`, and it appears in the
+message because candle names the dtypes of the cast it could not find. Moving
+a gate would not have touched a single one of them. §3.1's twenty-two roads
+are the right number of roads, and they are all still needed.
 
 **C is the family §4.3 originally named** — `mm`, `bmm`, `matmul`, `addmm`,
 `baddbmm`, `convolution` — and it is the smallest real one: **6 operators.**
 **D is the factories**, 9 of them. **F is one cell.**
 
     Work actually named here: 1 int8-on-Metal gate (A, and half of B's tail),
-    1 float64-cast gate placement (B, 117 cells), 6 matmul ops (C),
-    9 factories (D), 1 cell (F).
+    0 float64-cast gate placements (B -- retracted 2026-09-22; see the
+      correction above and Section 7.18), 6 matmul ops (C), 9 factories (D),
+    1 cell (F).
 
 **C and D were re-derived on 2026-09-20 and neither line above survived it.**
 See §4.3b. The counts reproduce exactly — 27/6 and 25/9, both stage `op` — but
@@ -582,6 +594,11 @@ cause D's own two headline operators, which `host_full` closed for the three
 float dtypes and not for this one. §4.3c did not name them. **Not fixed here:
 it is operator work, not verification, and it belongs with the `eye`/`linspace`
 round.**
+
+**Updated 2026-10-02 (§7.18).** `scalar_tensor` at `int32_mps` now agrees: its
+integer constant is narrowed on the host. `full` at `int32_mps` still breaks,
+but on `Metal copy_strided I32 not implemented` — the broadcast that fills the
+shape, not the narrowing.
 
 #### Three numbers in §4.3b do not survive the re-run
 
@@ -1494,6 +1511,12 @@ constant is a float the destination dtype can hold, and `to_dtype through F64`
 (`eye`, `linspace`, `full`/`scalar_tensor` at `int32`) is untouched — see
 §4.3c.
 
+**Updated 2026-10-02 (§7.18).** Of the eight names, `fill_.Tensor`,
+`bernoulli_.float` and `normal_.default` now agree on the three float dtypes,
+and `scalar_tensor` at `int32` agrees; `full` at `int32` still breaks, on a
+different candle symbol. `scatter_.value` and `scatter_.src` stay refused by
+the host-readback gate (§7.16), which was always in front of them.
+
 ### 7.9 A silently wrong answer, older than this round, found by re-measuring
 
 **`clamp` and `clamp_min` have dropped NaN on Metal since `mps` landed.**
@@ -2300,3 +2323,105 @@ M-2 and M-5.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_int8.py test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry present -->
+
+---
+
+### 7.18 The constant gate, the half §4.3b did not reach — carried from `work/cmlsilence`
+
+**Provenance, first.** Two rounds fixed the same defect in parallel. §4.3b
+(cause D) landed `host_full` and closed the **float** dtypes of nine factories.
+`work/cmlsilence`, on a base nine commits older, had independently routed the
+same call sites through a helper of its own (`host_filled`) and gone further.
+It was never committed; the integration round (`work/integA`, 2026-10-02)
+carried it onto develop's structure. **Develop's `host_full` was kept and the
+branch's `host_filled` dropped** — they are the same function, and `host_full`
+is the one the gate had already measured. What was carried is only what
+`host_full`'s round did not cover. The §4.3a correction about cause B above is
+that branch's measurement and was carried, not re-measured.
+
+**The shape, once more.** A kernel that needs a scalar operand wrote
+`Tensor::full(v, shape, device).and_then(|t| t.fast_to(storage))`, and the
+narrowing on the second half never ran on Metal, because the first half asked
+the device for a dtype it does not have. Measured on this machine, against the
+tree as develop left it, **three operators still died that way on every Metal
+float dtype**, behind the seven §4.3b closed:
+
+| operator | message on develop `78cf555` | after |
+|---|---|---|
+| `aten.fill_.Tensor` | `Metal contiguous to_dtype F32 F64 not implemented` | agrees, `float32`/`float16`/`bfloat16`/`int64` |
+| `aten.normal_.default` | `Metal contiguous to_dtype F64 F32 not implemented` | agrees: same draws as `cpu` under the same seed |
+| `aten.bernoulli_.float` | `Metal contiguous to_dtype F64 F32 not implemented` | agrees: same draws as `cpu` under the same seed |
+
+and one cell §4.3c named: `aten.scalar_tensor.default` at `int32_mps`
+(`Metal contiguous to_dtype I64 I32`) now agrees.
+
+**What was carried, by kind.**
+
+* `host_vec` — `normal_` and `bernoulli_.float` built their draws as
+  `Tensor::from_vec(values_f64, shape, &metal)` and narrowed on the device.
+  The draws are this crate's own RNG output, so narrowing them on the host is
+  not a fallback; it is the only place that conversion exists.
+* `widen_f64_host` in `scalar_arg` — a zero-dim **tensor** passed where a
+  `Scalar` is taken was widened to `f64` *before* it was moved to the host.
+  That is wider than the operator that exposed it: `mul.Scalar`, `add.Scalar`
+  and `masked_fill.Scalar` handed a zero-dim `mps` tensor died the same way, and
+  no sweep passes a tensor where a scalar is allowed.
+* `fill_inplace`'s device path — once `fill_.Tensor` reached on Metal,
+  forming the `Scalar` meant downloading the value tensor and uploading a
+  constant built from it, a host readback of a dispatched tensor that
+  `test_metalplace.py`'s in-place scan refuses. Where the value is already on
+  an accelerator the fill is built from it *there*. The CPU path is untouched.
+* **The integer arms** of `full`, `filled_block`, `scalar_tensor`,
+  `masked_fill`, `fill_`, `where.Scalar`, `where.ScalarSelf`, `remainder`,
+  `fmod` and `div`'s rounding modes go through `host_full` as their float arms
+  already did. `host_full`'s `Cpu` arm is the old two calls, so the host answer
+  is unchanged by construction.
+* **Five call sites passed `host_full` no narrowing step** and narrowed after
+  the move, on the device: `extremum_default`'s NaN seed, `nan_shaped_like`,
+  and the scalar operands of `remainder_op`, `fmod_op` and `div_mode`. They
+  pass their storage dtype now. On `mps` all five sit behind operators the
+  host-readback gate refuses (`max`, `max.dim`, `remainder.Scalar`,
+  `fmod.Scalar`, `floor_divide.Scalar`, `div.Scalar_mode` — measured), so this
+  changes no cell today; it is what lets the next item exist.
+* **`host_const` refuses an `f64` constant on Metal**, by name. Everything it
+  does happens on the host, where `F64` always works, so a call site with no
+  narrowing step got an `F64` buffer *allocated on Metal* — the capability
+  claim by construction that `metal_dtype_gate` refuses everywhere else. The
+  five sites above were exactly that, unreachable only by luck.
+
+**What did not move, named.** `full.default` at `int32_mps` still breaks, on a
+*different* candle symbol: the narrowed element now reaches the device, but
+filling a shape from it is a strided copy and candle's Metal backend has no
+`I32` one (`Metal copy_strided I32 not implemented`).
+`test_the_integer_arm_narrows_on_the_host_too` pins it and goes red when it
+falls. Every other `int32_mps` cell of these operators is refused by name at
+the door, as before. `eye` and `linspace` (§4.3c "Still open") are untouched.
+§6's table is **not** re-measured here; these cells are held by tests until the
+next sweep moves them.
+
+#### Nullification (integration round, each mutant built through `vendor/install_shim.sh`)
+
+| mutant | result |
+|---|---|
+| M-1: `host_const`'s `f64`-on-Metal refusal replaced by `if false &&` | **Python suites all GREEN**; `cargo test` RED (`42 passed; 1 failed`) — `mod host_const_tests` is the only thing that kills it, as the branch reported |
+| M-2: `host_vec` builds on the device and narrows there | RED — `test_the_rng_writers_...`: `normal_.default: Metal contiguous to_dtype F64 F32` |
+| M-3: `scalar_arg` back to `widen_f64` | RED — `test_a_zero_dim_device_tensor_...`: `mul.Scalar: Metal contiguous to_dtype F32 F64` |
+| M-4: `fill_inplace`'s device path disabled | RED in two files — `test_mpsconst`'s counter test (`read 4 byte(s) back`) and `test_metalplace`'s in-place readback scan |
+| M-5: `scalar_tensor`'s integer arm back to `Tensor::full(i64, .., device)` | RED — `test_the_integer_arm_...`: `Metal contiguous to_dtype I64 I32` |
+| M-6: `extremum_default`'s NaN seed back to `&[]` plus a device narrowing | **GREEN everywhere.** Not killable on this machine: the site is behind `max`, which `mps` refuses before it is reached. Recorded rather than papered over; M-1's guard is what would catch it if the refusal were ever lifted |
+
+**One correction to the branch's own ledger.** `test_mpsconst.py` labelled
+`aten.rs` 14791/14922 as exercised by its `mul.Scalar`/`div.Scalar` cases.
+Those lines are `remainder_op` and `fmod_op`; the cases reach `arith_scalar`.
+They are listed as unexercised now, with the measured refusal as the reason.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs host_vec present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs widen_f64_host present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs host_const_tests present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_constant_gate_agrees_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_the_constant_gate_operators_compute_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_the_rng_writers_narrow_on_the_host_and_draw_the_same_stream present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_float64_on_mps_is_still_refused_in_upstreams_words present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_the_sites_this_round_converted_are_accounted_for present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_a_zero_dim_device_tensor_can_stand_in_for_a_scalar present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsconst.py test_the_integer_arm_narrows_on_the_host_too present -->
