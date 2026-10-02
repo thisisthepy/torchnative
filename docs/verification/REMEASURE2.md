@@ -36,7 +36,7 @@ round would have to measure.
 | **Status · Accelerators** — "A transformer does not run on `mps` yet" | **FALSE** | As Metal above | Corrected |
 | **Status · NPU** — "nothing here has run on an NPU" | **FALSE** | Neural Engine execution test passes | Corrected; the NNAPI half is kept and sharpened |
 | **Status · `torch.distributed`** — "Everything else… refuses by name" | **FALSE** | As above | Corrected |
-| **Status · Test-time adaptation** — "`nn.LayerNorm` models are refused: `aten.native_layer_norm.default` has no derivative rule" | **FALSE** | Provoked: `nn.LayerNorm(8)` backward runs and produces a gradient. `test_train.py:703` already asserts the rule is present — the sentence had simply not been revisited | Corrected. **`docs/models/ADAPT.md` still carries the old sentence** and is left standing and marked (§3) |
+| **Status · Test-time adaptation** — "`nn.LayerNorm` models are refused: `aten.native_layer_norm.default` has no derivative rule" | **FALSE** | Provoked: `nn.LayerNorm(8)` backward runs and produces a gradient. `test_train.py:703` already asserts the rule is present — the sentence had simply not been revisited | Corrected. **`docs/models/ADAPT.md` had already corrected itself** — its §13 records the wall closed and `gpt2` and `bert` both adapting, with the old row struck through. The README had simply never picked that up, which is exactly the mechanism its own Roadmap warning describes: the `docs/` file is the measurement, the README is the summary, and the summary went stale |
 | **Status · ATen operators — 302** | **Checked, unchanged** | `len(torch._C._aten_implemented())` = **302**; DOCWATCH `golden_ops_covered ge 302` holds | Unchanged |
 | **Status · golden 11,420 / 11,420, `failed` 0, `pending` 0** | **Checked, unchanged** | Gate: `golden_cases_total = 11420`, `passed = 11420`, `failed = 0`, `pending = 0` | Unchanged |
 | **Status · 297 of 297 architectures forward** | **Not re-checked — left standing** | No fresh sweep was run (§3) | Unchanged, with its existing caveat that 297 rests on ARCH300's 290 plus seven individual re-runs |
@@ -93,10 +93,6 @@ Left in place and marked rather than deleted, per this round's rules:
   runner, an iPhone, an ARM64 Windows machine and a Pyodide run. None was reachable here.
 - **Android x86_64.** Cannot be checked on Apple Silicon at all — the emulator ships only
   `qemu/darwin-aarch64`. The refusal is by name and stays.
-- **`docs/models/ADAPT.md`'s LayerNorm sentence.** The README's copy is corrected; the `docs/`
-  file still carries "`nn.LayerNorm` models are refused". A `docs/` file is a record of what one
-  round measured, so it is **not** rewritten here — but a reader arriving at ADAPT.md alone will
-  still be told a false thing, and that is recorded rather than silently left.
 - **The complex dtype row.** Left standing: it is accurate about *storability* and misleading
   about *capability*. Correcting it properly means describing the `Repr::Complex` arm in a table
   organised by dtype, which is a restructure rather than a re-measurement.
@@ -160,8 +156,24 @@ Counted as CLAUDE.md §5.3 asks — by kind, not by test count.
   claim that something does not work tells them not to try it.
 - **Checked, unchanged:** 8 — Vulkan, CUDA, `torch.compile`, operator count, golden totals, `int8`
   unstorability, `max_pool2d` backward's refusal, and the closed device vocabulary.
-- **Left standing and marked:** 5 — the 297 sweep, the Platforms cells, Android x86_64, ADAPT.md's
-  LayerNorm sentence, and the complex dtype row.
+- **Left standing and marked:** 4 — the 297 sweep, the Platforms cells, Android x86_64, and the
+  complex dtype row.
 - **Corrected in the brief itself:** 1 — "NNAPI has never met an NPU" is **true** (§2).
-- **Documentation corrections:** 15 edits to `README.md`. **Feature changes: none.** Nothing in
+- **Documentation corrections:** 17 edits to `README.md`, including the Roadmap's own opening
+  sentence, which still called the device abstraction "the next milestone" while the table
+  directly beneath it marked that row **Done**. **Feature changes: none.** Nothing in
   this round implemented anything; the tree is unchanged apart from one new test file.
+
+---
+
+## 7. One correction to this document, made while writing it
+
+The first draft of §1 and §3 said `docs/models/ADAPT.md` still carried the false sentence about
+`nn.LayerNorm` being refused, and recorded that as a gap left standing. Checking it rather than
+assuming it showed the opposite: **ADAPT.md had already closed that wall in its §13**, struck the
+row through, and recorded `gpt2` and `bert` both adapting. Nothing was stale in `docs/` — only the
+README's summary of it.
+
+Recorded here rather than quietly fixed, because it is the same failure this whole round is about,
+committed by the round itself: a claim about what does *not* work, asserted from memory of another
+document instead of from reading it.

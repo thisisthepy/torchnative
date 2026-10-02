@@ -25648,6 +25648,11 @@ _MPS_READBACK_EXEMPT = {
     "squaring_matches_the_libm_round_trip_bit_for_bit": "a #[cfg(test)] proof.",
     "widening_a_transposed_operand_matches_candle_bit_for_bit":
         "a #[cfg(test)] proof.",
+    "the_narrowing_steps_are_applied_exactly_as_given":
+        "a #[cfg(test)] proof -- `host_const`'s narrowing steps, read back "
+        "from a constant the test itself built on the CPU. It is the Rust "
+        "half of the float16 double-rounding assertion in "
+        "test_mpsconst.py, and it touches no device (matrix.md 7.18).",
 }
 
 
