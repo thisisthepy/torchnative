@@ -189,6 +189,39 @@ def test_env_var_still_wins_over_package_discovery():
     raise AssertionError(f"load_openvino_c() with {LIBRARY_ENV} set unexpectedly loaded something")
 
 
+def test_explicit_path_wins_even_when_a_pip_openvino_is_actually_found():
+    """The two tests above pass on this Mac even if the precedence were wrong,
+    because there is no pip-installed `openvino` here for discovery to find --
+    `openvino_package_libs_dir()` returns `None` either way, so an unconditional
+    `if path:` and a bug that let discovery run first and win are
+    indistinguishable from this machine's vantage point. That gap is closed
+    here by monkeypatching `openvino_package_libs_dir` to return a fake but
+    real directory (mirroring the pip wheel layout), so discovery has
+    something concrete to find and could actually win if the precedence were
+    wrong. If `load_openvino_c` tried the discovered `libs_dir` candidates
+    before the explicit `path`, this would observe the discovered name in
+    `tried` ahead of (or instead of) the explicit one."""
+    bogus = "definitely-not-a-real-openvino-c-library-name-explicit"
+    with tempfile.TemporaryDirectory() as root:
+        libs_dir = _fake_openvino_libs_dir(root, ["libopenvino_c.so.9999"])
+        original = intelnpu.openvino_package_libs_dir
+        intelnpu.openvino_package_libs_dir = lambda *a, **k: libs_dir
+        try:
+            intelnpu.load_openvino_c(path=bogus)
+        except IntelNPUUnavailable as exc:
+            text = str(exc)
+            assert bogus in text, text
+            assert "9999" not in text, (
+                "explicit path lost to package discovery -- "
+                f"the discovered libs_dir candidate leaked into the refusal: {text}"
+            )
+            print("ok   intelnpu: an explicit path wins even when a pip openvino is discoverable")
+            return
+        finally:
+            intelnpu.openvino_package_libs_dir = original
+    raise AssertionError("load_openvino_c(path=bogus) unexpectedly loaded something")
+
+
 def test_library_candidates_refuses_darwin_by_name():
     """macOS has no Intel NPU. The refusal must say so, and say why, not just fail."""
     try:
