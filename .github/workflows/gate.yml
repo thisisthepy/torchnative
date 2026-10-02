@@ -175,7 +175,7 @@ jobs:
       # upstream torch. Asserted here rather than trusted from the step above.
       - name: the vendored torch is the shim, not upstream
         run: |
-          PYTHONPATH=torchnative/src/main python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
+          PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
           python -c 'import torch; assert not hasattr(torch._C, "_aten_implemented"); print("oracle:", torch.__version__, torch.__file__)'
 
       # The exit code is read from the command, not through a pipe (rule 8),
@@ -241,7 +241,7 @@ jobs:
 
       - name: the vendored torch is the shim, not upstream
         run: |
-          PYTHONPATH=torchnative/src/main python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
+          PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 python -c 'import torch; assert hasattr(torch._C, "_aten_implemented"), torch.__file__; print("shim:", torch.__file__)'
           python -c 'import torch; assert not hasattr(torch._C, "_aten_implemented"); print("oracle:", torch.__version__, torch.__file__)'
 
       # A measurement of the runner, not a check -- see the script's
