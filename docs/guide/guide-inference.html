@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inference · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Guide</span><span data-lang="ko">가이드</span></span>
+<h1><span data-lang="en">Inference with real <code>transformers</code></span><span data-lang="ko">진짜 <code>transformers</code> 로 추론하기</span></h1>
+<p class="lede" data-lang="en">Stream tokens, choose a dtype knowingly, and quantise at load time.</p><p class="lede" data-lang="ko">토큰을 스트리밍하고, dtype 을 알고 고르고, 로드 시점에 양자화합니다.</p>
+
+<h2><span data-lang="en">Streaming tokens</span><span data-lang="ko">토큰 스트리밍</span></h2>
+<pre><code><span class="k">from</span> threading <span class="k">import</span> Thread
+<span class="k">from</span> transformers <span class="k">import</span> TextIteratorStreamer
+
+streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+inputs   = tok("On-device inference is", return_tensors="pt")
+Thread(target=model.generate, kwargs=dict(**inputs, max_new_tokens=32, streamer=streamer)).start()
+
+<span class="k">for</span> piece <span class="k">in</span> streamer:
+    print(piece, end="", flush=True)</code></pre>
+<p data-lang="en"><code>generate</code> runs on a background thread while the main thread consumes the iterator. On an M-series desktop with SmolLM2-135M the first token arrived in 34 ms, then 47 tokens/s.</p><p data-lang="ko"><code>generate</code> 는 백그라운드 스레드에서 돌고 메인 스레드가 이터레이터를 소비합니다. M 시리즈 데스크톱에서 SmolLM2-135M 의 첫 토큰은 34 ms, 이후 초당 47 토큰이었습니다.</p>
+
+<h2><span data-lang="en">float32 or bfloat16</span><span data-lang="ko">float32 인가 bfloat16 인가</span></h2>
+<p data-lang="en">In <code>float32</code> the tokens match upstream's. Loaded in the checkpoint's native <code>bfloat16</code> — the default when you pass no <code>dtype</code> — they can diverge. That is not a defect: upstream disagrees with itself on one prompt in three under an equivalent change of accumulation order.</p><p data-lang="ko"><code>float32</code> 에서는 토큰이 upstream 과 같습니다. 체크포인트 고유의 <code>bfloat16</code> — <code>dtype</code> 을 주지 않을 때의 기본값 — 으로 읽으면 달라질 수 있습니다. 결함이 아닙니다: upstream 도 누적 순서를 동치로 바꾸면 세 프롬프트 중 하나에서 자기 자신과 어긋납니다.</p>
+
+<h2><span data-lang="en">Quantise while loading</span><span data-lang="ko">로드하면서 양자화</span></h2>
+<pre><code><span class="k">from</span> torchnative.quant <span class="k">import</span> TorchnativeConfig
+
+model = AutoModelForCausalLM.from_pretrained(
+    name, quantization_config=TorchnativeConfig("q8_0"))</code></pre>
+<p data-lang="en">Quantisation is module replacement, not a dtype: <code>nn.Linear</code> leaves are swapped for quantised ones before the weights land, so the dense model is never assembled. Formats: <code>q8_0</code> (lossless on integer operands), <code>q4_0</code>, and the k-quant <code>q4k</code>, which needs layer widths divisible by 256. <code>torchnative.quant.quantize_(model)</code> does the same to a model already loaded.</p><p data-lang="ko">양자화는 dtype 이 아니라 모듈 교체입니다: 가중치가 들어오기 전에 <code>nn.Linear</code> 잎을 양자화된 것으로 바꾸므로 밀집 모델이 조립되지 않습니다. 포맷은 <code>q8_0</code>(정수 연산자에 무손실), <code>q4_0</code>, 그리고 레이어 폭이 256 의 배수여야 하는 k-quant <code>q4k</code>. 이미 로드된 모델에는 <code>torchnative.quant.quantize_(model)</code> 가 같은 일을 합니다.</p>
+
+<h2><span data-lang="en">What refuses</span><span data-lang="ko">거부되는 것</span></h2>
+<p data-lang="en"><code>torch.compile</code> refuses by name, permanently: the stable ABI that lets one binary serve every CPython from 3.13 cannot coexist with the frame-evaluation hook it needs. Eager is the supported path.</p><p data-lang="ko"><code>torch.compile</code> 은 영구적으로 이름으로 거부됩니다: 한 바이너리가 3.13 이후 모든 CPython 에서 돌게 하는 안정 ABI 가, 그것이 필요로 하는 프레임 평가 훅과 공존할 수 없습니다. 지원 경로는 eager 입니다.</p>
+
+<div class="pager"><a href="concepts.html">← <span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

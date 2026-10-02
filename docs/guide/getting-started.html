@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting started · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Start</span><span data-lang="ko">시작</span></span>
+<h1><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></h1>
+<p class="lede" data-lang="en">Install a wheel, confirm that <code>torch</code> is this build, and generate text with a real Hugging Face model.</p><p class="lede" data-lang="ko">휠을 설치하고, <code>torch</code> 가 이 빌드인지 확인하고, 진짜 Hugging Face 모델로 텍스트를 생성합니다.</p>
+
+<h2><span data-lang="en">1 · Install</span><span data-lang="ko">1 · 설치</span></h2>
+<pre><code>pip install --pre torchnative</code></pre>
+<p data-lang="en">Every published version is a pre-release. Each platform wheel (<code>cp313-abi3</code>) carries the <code>_C</code> extension and upstream's Python tree, so <code>import torch</code> resolves to this build — it cannot share an interpreter with an installed PyTorch. Use a fresh virtual environment.</p><p data-lang="ko">공개된 버전은 모두 프리릴리스입니다. 각 플랫폼 휠(<code>cp313-abi3</code>)은 <code>_C</code> 확장과 upstream 파이썬 트리를 함께 싣고 있어 <code>import torch</code> 가 이 빌드로 해석됩니다 — 설치된 PyTorch 와 한 인터프리터를 공유할 수 없습니다. 새 가상환경을 쓰십시오.</p>
+<div class="note"><p data-lang="en">Avoid <code>0.0.1a0</code>: it is a <code>py3-none-any</code> skeleton with no <code>_C</code>, which installs and then fails to import.</p><p data-lang="ko"><code>0.0.1a0</code> 은 피하십시오: <code>_C</code> 가 없는 <code>py3-none-any</code> 껍데기라 설치는 되지만 import 에 실패합니다.</p></div>
+
+<h2><span data-lang="en">2 · Check which torch you have</span><span data-lang="ko">2 · 어떤 torch 인지 확인</span></h2>
+<pre><code><span class="k">import</span> torch
+<span class="k">assert</span> hasattr(torch._C, "_aten_implemented")   <span class="c"># the shim, not upstream</span>
+
+a = torch.ones(2, 3)
+print((a @ a.T).sum())                            <span class="c"># tensor(12.)</span></code></pre>
+<p data-lang="en">If the assertion fails, the interpreter found upstream torch first. Every probe in this project asserts the same thing.</p><p data-lang="ko">단언이 실패하면 인터프리터가 upstream torch 를 먼저 찾은 것입니다. 이 프로젝트의 모든 프로브가 같은 것을 단언합니다.</p>
+
+<h2><span data-lang="en">3 · Generate</span><span data-lang="ko">3 · 생성</span></h2>
+<pre><code><span class="k">import</span> torch
+<span class="k">from</span> transformers <span class="k">import</span> AutoModelForCausalLM, AutoTokenizer
+
+name  = "HuggingFaceTB/SmolLM2-135M"
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+tok   = AutoTokenizer.from_pretrained(name)
+
+ids = tok("On-device inference is", return_tensors="pt")
+out = model.generate(**ids, max_new_tokens=32)
+print(tok.decode(out[0], skip_special_tokens=True))</code></pre>
+<p data-lang="en">This is the real <code>transformers</code>: <code>from_pretrained</code> loads bit-identical weights, and in <code>float32</code> the tokens are the ones upstream emits.</p><p data-lang="ko">진짜 <code>transformers</code> 입니다: <code>from_pretrained</code> 는 비트 단위로 같은 가중치를 읽고, <code>float32</code> 에서는 upstream 과 같은 토큰이 나옵니다.</p>
+
+<h2><span data-lang="en">Build from source</span><span data-lang="ko">소스에서 빌드</span></h2>
+<p data-lang="en">Needs a Rust toolchain and CPython 3.13+.</p><p data-lang="ko">Rust 툴체인과 CPython 3.13+ 가 필요합니다.</p>
+<pre><code>bash vendor/vendor_torch.sh     <span class="c"># assemble the vendored torch tree</span>
+bash vendor/install_shim.sh     <span class="c"># build the extension and install it</span>
+python tools/wheel/build.py                            <span class="c"># -> dist/*.whl</span>
+python tools/wheel/verify.py dist/torchnative-*.whl    <span class="c"># clean venv, real import</span></code></pre>
+
+<div class="pager"><a href="index.html">← <span data-lang="en">Home</span><span data-lang="ko">홈</span></a><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

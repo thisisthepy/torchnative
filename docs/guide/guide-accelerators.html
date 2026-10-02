@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Accelerators · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Guide</span><span data-lang="ko">가이드</span></span>
+<h1><span data-lang="en">Accelerators and NPUs</span><span data-lang="ko">가속기와 NPU</span></h1>
+<p class="lede" data-lang="en">Eager devices dispatch op by op; an NPU takes a whole graph. torchnative keeps the two apart by type.</p><p class="lede" data-lang="ko">eager 장치는 op 하나씩 디스패치하고, NPU 는 그래프를 통째로 받습니다. torchnative 는 둘을 타입으로 구분합니다.</p>
+
+<h2><span data-lang="en">Ask what is available</span><span data-lang="ko">무엇이 가능한지 묻기</span></h2>
+<pre><code><span class="k">from</span> torchnative <span class="k">import</span> device
+
+device.mps      <span class="c"># eager: Metal through candle</span>
+device.vulkan   <span class="c"># eager: our own shaders</span>
+device.npu      <span class="c"># compiled target: resolves to this host's NPU, or refuses</span></code></pre>
+<p data-lang="en">Every availability answer names the probe that produced it. <code>npu</code> resolves per host — Apple Neural Engine, Intel NPU, Qualcomm Hexagon — and never resolves to the CPU. Because it is a compiled target, <code>torch.empty(2, 2, device=device.npu)</code> cannot be spelled.</p><p data-lang="ko">모든 가용성 답은 그것을 낸 프로브의 이름을 댑니다. <code>npu</code> 는 호스트마다 — Apple Neural Engine, Intel NPU, Qualcomm Hexagon — 달리 해석되고, CPU 로 해석되는 일은 없습니다. 컴파일 대상이므로 <code>torch.empty(2, 2, device=device.npu)</code> 는 쓸 수 없습니다.</p>
+
+<h2><span data-lang="en">Move a model, keep the model</span><span data-lang="ko">모델을 옮겨도 모델은 그대로</span></h2>
+<pre><code>model.to(device.npu)
+report = model.torchnative_offload   <span class="c"># what was lowered, and what stayed on the CPU</span></code></pre>
+<p data-lang="en"><code>.to()</code> lowers the eligible leaves in place and returns the same <code>nn.Module</code>, so <code>generate()</code> and <code>backward()</code> still work. A partial offload raises a <code>UserWarning</code> naming what stayed behind, and lowering nothing is a refusal, not a success.</p><p data-lang="ko"><code>.to()</code> 는 가능한 잎을 제자리에서 낮추고 같은 <code>nn.Module</code> 을 돌려주므로 <code>generate()</code> 와 <code>backward()</code> 가 그대로 됩니다. 일부만 옮겨지면 남은 것의 이름을 담은 <code>UserWarning</code> 이 뜨고, 아무것도 못 옮기면 성공이 아니라 거부입니다.</p>
+
+<h2><span data-lang="en">Where each back end stands</span><span data-lang="ko">백엔드별 현황</span></h2>
+<div class="table-wrap"><table>
+<thead><tr><th><span data-lang="en">Back end</span><span data-lang="ko">백엔드</span></th><th><span data-lang="en">State</span><span data-lang="ko">상태</span></th></tr></thead>
+<tbody>
+<tr><td translate="no">Metal (<code>mps</code>)</td><td><span class="chip ok" translate="no">agrees</span> <span data-lang="en">computes on the real GPU; ops that would read back to the host refuse by name</span><span data-lang="ko">실제 GPU 에서 계산; 호스트로 되읽는 op 은 이름으로 거부</span></td></tr>
+<tr><td translate="no">Vulkan</td><td><span class="chip ok" translate="no">agrees</span> <span data-lang="en">thirty-one ops in SPIR-V; a pretrained BERT forwards with no host readback</span><span data-lang="ko">SPIR-V 로 31 개 op; 사전학습 BERT 가 호스트 되읽기 없이 forward</span></td></tr>
+<tr><td translate="no">CoreML · ANE</td><td><span class="chip ok" translate="no">reaches</span> <span data-lang="en">a float16 graph runs on the Neural Engine</span><span data-lang="ko">float16 그래프가 Neural Engine 에서 실행</span></td></tr>
+<tr><td translate="no">Intel NPU · OpenVINO</td><td><span class="chip partial" translate="no">wired</span> <span data-lang="en">tested against a faked device; no Intel NPU has run it</span><span data-lang="ko">가짜 장치로만 시험; 실제 Intel NPU 에서 돈 적 없음</span></td></tr>
+<tr><td translate="no">QNN · NNAPI</td><td><span class="chip partial" translate="no">partial</span> <span data-lang="en">executes on CPU reference drivers; no NPU yet</span><span data-lang="ko">CPU 참조 드라이버에서 실행; NPU 는 아직</span></td></tr>
+<tr><td translate="no">CUDA</td><td><span class="chip planned" translate="no">builds?</span> <span data-lang="en">wired; never compiled or run</span><span data-lang="ko">배선만; 컴파일도 실행도 된 적 없음</span></td></tr>
+</tbody></table></div>
+
+<div class="pager"><a href="guide-adaptation.html">← <span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

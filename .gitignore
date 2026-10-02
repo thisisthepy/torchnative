@@ -225,3 +225,6 @@ tests/*
 
 # ephemeral logs and scripts of the coordinating session
 .scratch/
+
+# agent temporary files (AGENTS.md rule 2); delete when done
+.tmp/

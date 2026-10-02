@@ -30,6 +30,8 @@ records; they are the front door.
 | `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see CLAUDE.md §4. |
 | `api/` | The user-facing Python API this project offers in its own namespaces: `torchnative.device`, `torchnative.transformers`, and the argument forms and refusals they present. Distinct from `bindings/`, which is the `torch._C` surface we must reproduce; this folder is the surface we chose. |
 | `verification/` | The checkers themselves and the audits of this documentation: DOCWATCH, the golden harness, and what they structurally cannot see. |
+| `guide/` | The bilingual (en/ko) GitHub Pages site, deployed from `main` by `.github/workflows/pages.yml`. Static HTML/CSS/JS; `check_guide.py` is its test. |
+| `locale/` | Translations of the front page: `README_ko.md` is the Korean README. |
 
 This directory holds **documents only**. The three non-Markdown files that
 used to sit here have moved to where the thing they are is kept:
