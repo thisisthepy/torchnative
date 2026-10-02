@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contributing · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></span>
+<h1><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></h1>
+<p class="lede" data-lang="en">Intent, then spec, then a failing test, then code.</p><p class="lede" data-lang="ko">의도, 사양, 실패하는 테스트, 그다음에 코드.</p>
+
+<h2><span data-lang="en">The workflow</span><span data-lang="ko">작업 흐름</span></h2>
+<ol>
+<li><span data-lang="en">Search the issues; open one if nothing covers your change, stating what, why, and which tests must pass.</span><span data-lang="ko">이슈를 검색하고, 없으면 무엇을·왜·어떤 테스트가 통과해야 하는지 적어 엽니다.</span></li>
+<li><span data-lang="en">Work on a <code>work/&lt;topic&gt;</code> branch, push every commit, and open a pull request into <code>develop</code> that references the issue.</span><span data-lang="ko"><code>work/&lt;topic&gt;</code> 브랜치에서 작업하고 커밋마다 푸시한 뒤, 이슈를 가리키는 PR 을 <code>develop</code> 으로 엽니다.</span></li>
+<li><span data-lang="en">Merge through the pull request, then close the issue with a comment naming it — <code>Closes #N</code> only fires on merges into <code>main</code>.</span><span data-lang="ko">PR 로 병합한 뒤 그 PR 을 적어 이슈를 닫습니다 — <code>Closes #N</code> 은 <code>main</code> 으로의 병합에서만 동작합니다.</span></li>
+<li><span data-lang="en"><code>main</code> is generated from <code>develop</code> by CI and changes only through a pull request from <code>release</code>.</span><span data-lang="ko"><code>main</code> 은 CI 가 <code>develop</code> 에서 생성하며 <code>release</code> 에서 온 PR 로만 바뀝니다.</span></li>
+</ol>
+
+<h2><span data-lang="en">The standard</span><span data-lang="ko">기준</span></h2>
+<ul>
+<li><span data-lang="en">A test must be able to fail: break the implementation on purpose and watch it go red.</span><span data-lang="ko">테스트는 실패할 수 있어야 합니다: 구현을 일부러 깨고 빨개지는지 보십시오.</span></li>
+<li><span data-lang="en">State the grade of every claim — builds, reaches or agrees — and derive tolerances from upstream rather than choosing them.</span><span data-lang="ko">모든 주장의 등급 — 빌드됨·도달함·일치함 — 을 밝히고, 허용오차는 고르지 말고 upstream 에서 유도하십시오.</span></li>
+<li><span data-lang="en">An unsupported case refuses by name. Never invent a plausible answer, and never fall back silently.</span><span data-lang="ko">지원하지 않는 경우는 이름으로 거부합니다. 그럴듯한 답을 지어내거나 조용히 폴백하지 마십시오.</span></li>
+<li><span data-lang="en">Report features, fixes, tests, documentation and deletions separately; a test count is not progress.</span><span data-lang="ko">기능·수정·테스트·문서·삭제를 나눠 보고하십시오. 테스트 수는 진척이 아닙니다.</span></li>
+</ul>
+
+<h2><span data-lang="en">Run the checks</span><span data-lang="ko">검사 실행</span></h2>
+<pre><code>bash rust/torch_c/pytests/run.sh       <span class="c"># the gate: suites, golden self-test, DOCWATCH</span>
+python3 docs/guide/check_guide.py      <span class="c"># this site</span></code></pre>
+
+<div class="pager"><a href="status.html">← <span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a><span></span></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

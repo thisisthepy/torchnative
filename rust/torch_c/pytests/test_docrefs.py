@@ -74,6 +74,13 @@ KNOWN_MISSING = {
     ),
 }
 
+# Files whose `docs/...` strings are fixture paths in a throwaway repository they
+# build, not references into this tree. Named, like KNOWN_MISSING, so the list
+# only grows deliberately. `test-sync-release.sh` is shared verbatim across the
+# thisisthepy repositories and creates `docs/a.md`, `docs/sub/c.md`, ... under
+# `.tmp/` to test what `sync-release.sh` drops.
+FIXTURE_FILES = {"tools/release/test-sync-release.sh"}
+
 # Prefixes that mean the reference belongs to another project, not this one.
 FOREIGN_PREFIXES = ("pypackpack/", "torch-mlir/", "https://", "http://")
 
@@ -102,6 +109,8 @@ def test_no_docs_reference_in_the_tree_dangles():
     for path, text in _text_files():
         if path == pathlib.Path(__file__).resolve():
             continue  # this file quotes example paths while explaining itself
+        if str(path.relative_to(REPO)) in FIXTURE_FILES:
+            continue
         for m in DOCS_REF.finditer(text):
             prefix, folder, name = m.group("prefix"), m.group("folder"), m.group("name")
             # A URL or another project's checkout is not ours to resolve. Judge
@@ -160,8 +169,11 @@ def test_relative_markdown_links_inside_docs_resolve():
 def test_every_document_lives_in_a_subfolder():
     """The habit this sorting exists to break: a round drops its document at the
     top of `docs/` because there is no visible place for it. `docs/README.md` is
-    the index and is the one Markdown file allowed at this level."""
-    loose = sorted(p.name for p in DOCS.glob("*.md") if p.name != "README.md")
+    the index. `INTENT.md` and `SPEC.md` are the project's intent and behavioural
+    contract (AGENTS.md rule 5) and live here by the ecosystem-wide layout; they
+    are named, not pattern-matched, so a round document still cannot slip in."""
+    allowed = {"README.md", "INTENT.md", "SPEC.md"}
+    loose = sorted(p.name for p in DOCS.glob("*.md") if p.name not in allowed)
     assert not loose, (
         f"{len(loose)} document(s) at the top level of docs/: {', '.join(loose)}.\n"
         "Put each in the folder matching its subject -- docs/README.md lists them "

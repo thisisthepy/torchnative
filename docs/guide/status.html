@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Status &amp; FAQ · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></span>
+<h1><span data-lang="en">Status and FAQ</span><span data-lang="ko">현황과 FAQ</span></h1>
+<p class="lede" data-lang="en">Pre-alpha. What works has a run behind it; what does not says so by name.</p><p class="lede" data-lang="ko">프리알파입니다. 동작하는 것에는 실행 근거가 있고, 동작하지 않는 것은 이름으로 그렇다고 말합니다.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th><span data-lang="en">Area</span><span data-lang="ko">영역</span></th><th><span data-lang="en">State</span><span data-lang="ko">상태</span></th></tr></thead>
+<tbody>
+<tr><td><span data-lang="en">ATen operators</span><span data-lang="ko">ATen 연산자</span></td><td><span class="chip ok" translate="no">agrees</span> <span data-lang="en">302 operators; 11,420 of 11,420 golden cases</span><span data-lang="ko">302 개; 골든 케이스 11,420 / 11,420</span></td></tr>
+<tr><td><span data-lang="en">Architectures</span><span data-lang="ko">아키텍처</span></td><td><span class="chip ok" translate="no">agrees</span> <span data-lang="en">297 of 297 forward; 284 of 285 judgeable agree</span><span data-lang="ko">297 / 297 forward; 판정 가능한 285 중 284 일치</span></td></tr>
+<tr><td><span data-lang="en">Training</span><span data-lang="ko">학습</span></td><td><span class="chip partial" translate="no">partial</span> <span data-lang="en">backward and optimiser steps agree; double-backward and hooks refuse</span><span data-lang="ko">backward 와 옵티마이저 스텝 일치; double-backward·훅은 거부</span></td></tr>
+<tr><td><span data-lang="en">Adaptation</span><span data-lang="ko">적응</span></td><td><span class="chip ok" translate="no">agrees</span> <span data-lang="en">Tent and normalisation statistics; bit-identical revert</span><span data-lang="ko">Tent 와 정규화 통계; 비트 단위 되돌리기</span></td></tr>
+<tr><td><span data-lang="en">Federated</span><span data-lang="ko">연합</span></td><td><span class="chip partial" translate="no">partial</span> <span data-lang="en">FedAvg across processes; no secure aggregation or privacy</span><span data-lang="ko">프로세스 간 FedAvg; 보안 집계·프라이버시 없음</span></td></tr>
+<tr><td><span data-lang="en">Kernel bundles</span><span data-lang="ko">커널 번들</span></td><td><span class="chip planned" translate="no">planned</span> <span data-lang="en">the HF kernels contract, resolved at build time</span><span data-lang="ko">HF kernels 계약, 빌드 타임 해석</span></td></tr>
+<tr><td translate="no"><code>torch.compile</code></td><td><span class="chip no" translate="no">refused</span> <span data-lang="en">permanently, by name</span><span data-lang="ko">영구적으로, 이름으로</span></td></tr>
+</tbody></table></div>
+<p data-lang="en">Platforms: macOS arm64, Android arm64, iOS simulator, Linux and Windows x86-64 compute from published wheels. Windows arm64 and iOS devices have never executed a wheel; Android x86-64 refuses to build. The full matrix is on <a href='https://github.com/thisisthepy/torchnative#%EF%B8%8F-platform-support'>GitHub</a>.</p><p data-lang="ko">플랫폼: macOS arm64, Android arm64, iOS 시뮬레이터, Linux·Windows x86-64 는 공개 휠로 계산합니다. Windows arm64 와 iOS 기기는 휠을 실행한 적이 없고, Android x86-64 는 빌드를 거부합니다. 전체 표는 <a href='https://github.com/thisisthepy/torchnative#%EF%B8%8F-platform-support'>GitHub</a> 에 있습니다.</p>
+
+<h2><span data-lang="en">FAQ</span><span data-lang="ko">자주 묻는 질문</span></h2>
+<h3><span data-lang="en">Can I install it next to PyTorch?</span><span data-lang="ko">PyTorch 와 같이 설치할 수 있나요?</span></h3>
+<p data-lang="en">No. The wheel provides <code>torch</code> itself, so there is one <code>torch</code> per interpreter. Upstream PyTorch is only a test-time comparison baseline here.</p><p data-lang="ko">아니요. 휠이 <code>torch</code> 자체를 제공하므로 인터프리터마다 <code>torch</code> 는 하나입니다. 여기서 upstream PyTorch 는 테스트 때의 비교 기준일 뿐입니다.</p>
+<h3><span data-lang="en">Why not <code>torch.compile</code>?</span><span data-lang="ko">왜 <code>torch.compile</code> 이 안 되나요?</span></h3>
+<p data-lang="en">Dynamo's frame hook needs CPython internals that cannot coexist with the limited API, and the limited API is what lets one binary per platform serve 3.13 and every later CPython. <code>torch.export</code> is the direction instead.</p><p data-lang="ko">Dynamo 의 프레임 훅은 제한 API 와 공존할 수 없는 CPython 내부를 요구하는데, 그 제한 API 가 플랫폼당 바이너리 하나로 3.13 이후 모든 CPython 을 지원하게 합니다. 대신 <code>torch.export</code> 방향으로 갑니다.</p>
+<h3><span data-lang="en">Is it faster than PyTorch?</span><span data-lang="ko">PyTorch 보다 빠른가요?</span></h3>
+<p data-lang="en">Not the point, and the last numbers are stale. Long-sequence prefill was slower in float32 and faster in bfloat16; decode with a KV cache was about even. They will be re-measured on an idle machine before being quoted again.</p><p data-lang="ko">그것이 목적은 아니고, 마지막 숫자도 낡았습니다. 긴 시퀀스 prefill 은 float32 에서 느렸고 bfloat16 에서 빨랐으며, KV 캐시 디코드는 비슷했습니다. 다시 인용하기 전에 유휴 기계에서 재측정합니다.</p>
+<h3><span data-lang="en">Which Python?</span><span data-lang="ko">어떤 파이썬인가요?</span></h3>
+<p data-lang="en">CPython 3.13 or later. Wheels are <code>cp313-abi3</code>; Pyodide (WASM) is the exception, tied to one CPython.</p><p data-lang="ko">CPython 3.13 이상. 휠은 <code>cp313-abi3</code> 이고, Pyodide(WASM)만 예외로 한 CPython 에 묶입니다.</p>
+
+<div class="pager"><a href="ecosystem.html">← <span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

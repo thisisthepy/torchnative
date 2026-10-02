@@ -1,264 +1,201 @@
-# Packaging decisions
+# PROJECT.md — torchnative 프로젝트 주요 사항
 
-Why `pyproject.toml`, `setup.py` and the wheel layout are the way they are.
-
-Every entry below is a mistake this project actually made and corrected. They
-lived as comments inside `pyproject.toml` until that file was two thirds prose;
-they are here so the file can be read as configuration and the reasoning can be
-read as prose. **If you are about to change one of these fields, read its
-section first** — several of them have been changed to the "obvious" value
-before, and the section says what broke.
-
-Related: [`docs/design/DESIGN.md`](docs/design/DESIGN.md) for what this project
-is, [`docs/platform/WHEEL.md`](docs/platform/WHEEL.md) for how a wheel is built,
-[`docs/design/ABI3.md`](docs/design/ABI3.md) for the stable-ABI decision.
+현황 · 구조 · 빌드와 테스트 · 결정과 그 근거 · 열린 질문. 에이전트 규정은 `AGENTS.md`,
+의도는 `docs/INTENT.md`, 동작 계약은 `docs/SPEC.md`, 설계 근거는 `docs/design/DESIGN.md` 에 있습니다.
+이 파일은 `develop` 에만 있고 `main` 에는 실리지 않습니다.
 
 ---
 
-## `setup.py` exists, and deleting it breaks the wheel tag
+## 1. 한 줄 요약
 
-Everything declarative is in `pyproject.toml`. What is left in `setup.py` is the
-pair of facts that decide the **wheel tag**, neither of which has a
-`[tool.setuptools]` spelling:
+**PyTorch/`transformers` 생태계는 그대로 두고 `torch._C` 만 Rust 네이티브 확장으로 교체해,
+진짜 `torch` 와 `transformers` 가 기기(Android · iOS · 데스크톱)에서 돌게 합니다.** 재구현이
+아니며, 정확성의 기준은 upstream PyTorch 와의 원소 단위 일치입니다.
 
-1. **`has_ext_modules()` must answer `True`.** This distribution is not pure
-   Python — it carries `torch/_C.abi3.so` — but setuptools cannot see that,
-   because the extension is *pre-built* by `vendor/install_shim.sh` and arrives
-   as package data rather than as an `Extension()` setuptools compiled itself.
-   Left alone, `Distribution.is_pure()` answers `True` and the wheel goes out
-   tagged `py3-none-any`: installable on Android, on iOS, on any machine at all,
-   and functional on none of them, because the `.so` inside is Mach-O arm64.
-   **`0.0.1a0` on PyPI is that wheel**; every release from `0.0.2a0` is tagged
-   correctly, which is `setup.py` doing its job.
-2. **`py_limited_api = "cp313"`.** This is a `bdist_wheel` *command option*, not
-   project metadata, so it has to be passed through `options=`. It turns the tag
-   from `cp313-cp313-<plat>` into `cp313-abi3-<plat>`.
+## 2. 현황 (2026-10 기준, 상세는 `README.md` · `docs/platform/STATUS.md`)
 
-Both are load-bearing for the tag and nothing else. If the file were deleted the
-wheel would still build, and would be wrong in both directions.
+| 영역 | 상태 |
+|---|---|
+| ATen 연산자 | 302 개, 골든 케이스 11,420 / 11,420 일치 |
+| 아키텍처 | 297 / 297 forward(도달함), 판정 가능한 285 중 284 가 upstream 과 수치 일치 |
+| 학습 | `loss.backward()` · 옵티마이저 스텝이 upstream 과 일치. double-backward 등은 이름으로 거부 |
+| 적응 · 연합 | `Tent`(단계 1), 정규화 통계 재추정(단계 0), 다중 프로세스 FedAvg 동작 |
+| 가속기 | Metal · Vulkan 은 실제 GPU 에서 계산. CoreML 은 Neural Engine 실행 확인. Intel NPU 는 가짜 프로브로만 검증, CUDA 는 배선만 |
+| 배포 | 9 개 플랫폼 휠(`cp313-abi3`) 이 PyPI 에 있음(README 표 기준 `0.1.0b0`, `pyproject.toml` 은 `0.1.0b4`). Windows arm64 · iOS 기기는 실행된 적 없음 |
+| 미구현 | `torch.compile`(영구 거부), `torchnative.kernels` 번들 리졸버, `TorchNativeAPI` |
 
-`setup.py` as a *configuration* file is not deprecated. What is deprecated is
-invoking `python setup.py <command>` directly; this project uses PEP 517
-(`build-backend = "setuptools.build_meta"`), under which `setup.py` is read as
-configuration and nothing else.
+`docs/SPEC.md` 가 항목별 상태(implemented / partial / planned)와 근거 테스트를 기록합니다.
 
-**Hatchling was considered and rejected.** Neither fact is declarative there
-either: `pure_python` and `infer_tag` are *build data* that only a build hook
-can set, and there is no `py_limited_api` option at all — the ABI tag would have
-to be assembled by hand in a hook. That trades 56 lines (mostly comment) for a
-hook that owns tag computation, on the one surface that has already gone
-silently wrong across seven wheels. **maturin** does not fit for a different
-reason: it assumes it builds the Rust extension itself, and here `cargo` builds
-it separately and it is injected into a vendored upstream tree.
+## 3. 구조
 
----
-
-## `license` is upstream's expression, and cannot say which term is ours
-
-```toml
-license = "Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT"
+```
+rust/torch_c/            torch._C 확장 (Rust · pyo3 abi3-py313 · candle-core)
+  src/aten.rs            연산자 커널 — 모든 op 은 _aten_dispatch 한 문으로 들어온다
+  src/bootstrap.py       include_str! 로 확장에 구워지는 파이썬 부트스트랩
+  pytests/               게이트 스위트 (run.sh)
+torchnative/src/main/
+  torchnative/           파이썬 패키지: delta · adapt · nn/federated · device · transformers
+                         · export · quant · kernels · api · distributed
+  torch/                 upstream 벤더링 트리 (생성물, gitignore, 손대지 않음)
+vendor/                  벤더링(vendor_torch.sh)과 _C 설치(install_shim.sh)
+tools/                   golden · wheel · docwatch · ci · release · bench · scan · spike · colab
+docs/<folder>/           회차별 측정 기록. 색인은 docs/README.md
+docs/guide/              GitHub Pages 가이드 (영/한)
 ```
 
-That is torch 2.13.0's own `License-Expression`, **verbatim**. A platform wheel
-carries the upstream Python tree, so declaring our licence alone would describe
-a few thousand lines of this distribution and misdescribe two million.
+## 4. 빌드와 테스트
 
-**This field cannot express which term is ours.** Upstream's expression already
-contains Apache-2.0 *and* MIT, so ours is indistinguishable inside it, and
-changing our own licence does not change one character of this line. A comment
-that stood here for a long time claimed MIT was "ours" while the rest was
-upstream's — that was never true.
+```sh
+# 벤더 트리와 확장 (worktree 마다 먼저 — AGENTS.md §14.1)
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/vendor_torch.sh
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/install_shim.sh
 
-The upstream licence texts ride along: `tools/wheel/build.py` injects torch's
-`dist-info`, third-party notices included. This line is about the metadata being
-true, not about supplying attribution that was missing.
+# 게이트 (단독 실행, 파이프 금지 — AGENTS.md §13)
+PATH="$HOME/.cargo/bin:$PATH" PYTHON="$PWD/.caches/spike-venv/bin/python" \
+    bash rust/torch_c/pytests/run.sh > .scratch/gate.log 2>&1; echo "EXIT=$?"
 
----
+# 휠
+python tools/wheel/build.py && python tools/wheel/verify.py dist/torchnative-*.whl
 
-## `dependencies` — why `torch` is absent, and why upstream's deps are not
+# 가이드 사이트 검사
+python3 docs/guide/check_guide.py
 
-**`torch` is deliberately not listed.** This distribution *provides* `torch` —
-the upstream Python tree with `_C` replaced ([`docs/design/DESIGN.md`](docs/design/DESIGN.md) §2)
-— rather than consuming somebody else's, so requiring it would be a package
-declaring a dependency on itself.
+# 릴리스 브랜치 도구 검사
+bash tools/release/test-sync-release.sh
+```
 
-Two earlier attempts at that line were wrong in **opposite** directions:
+## 5. 브랜치와 릴리스
 
-- **Empty**, with a module-scope `from torch import nn`: installed cleanly and
-  then failed on import.
-- **Requiring `torch` unconditionally**: unresolvable on Android and iOS, where
-  upstream publishes no wheel at all — that is, on exactly the platforms this
-  project exists for.
+- 작업은 `work/<topic>` → PR → `develop` (AGENTS.md §4). `main` 은 `release` 에서 온 PR 로만 바뀝니다.
+- `release-sync.yml` 이 `develop` 푸시마다 `tools/release/sync-release.sh` 로 `release` 를 재생성하고
+  `release → main` PR 을 엽니다. `main-source-guard.yml` 이 다른 출처의 PR 을 막고,
+  `pages.yml` 이 `main` 푸시 때 `docs/guide/` 를 Pages 로 배포합니다.
+- PyPI 배포는 `v*` 태그로 `publish-pypi.yml` 이 수행합니다(Trusted Publishing, 토큰 없음).
+  **사용자 승인 없이 업로드하지 않습니다** (AGENTS.md §17.7).
 
-The mistake underneath both was reading upstream torch as a runtime dependency
-when it is a **comparison baseline**: the golden harness needs one installed to
-diff against, and nothing at runtime does. It follows that this cannot coexist
-with an installed PyTorch once the wheels carry the tree — not a defect to route
-around, but a consequence of there being one `torch` on an interpreter and this
-being a build of it.
+### 열린 문제 — `tools/release/publish_main.sh`
 
-**What *is* listed** is upstream torch's own pure-Python dependency set, copied
-from the `Requires-Dist` lines of the vendored `torch-2.13.0.dist-info`.
-Shipping the tree means inheriting them: `torch/__init__.py:35` imports
-`typing_extensions` before it reaches anything of ours, so an empty list is not
-a smaller promise — it is a wheel that installs and then raises
-`ModuleNotFoundError`, which is what the first platform wheel built here did.
+기존 스크립트는 `develop` 트리에서 경로를 빼 `main` 을 **로컬에서 직접** 만든 뒤(조율 세션이
+푸시) 휠 빌드로 검증합니다. 새 규칙("`main` 은 CI 가 만든 `release` 의 PR 로만")과 충돌합니다.
 
-**Upstream's CUDA and triton requirements are not copied.** They are all guarded
-`platform_system == "Linux"`, and this build has no CUDA path at all; carrying
-them would drag ~2 GB of nvidia wheels onto every Linux install, including the
-aarch64 boards that are the point of the exercise.
+| | `publish_main.sh` | `sync-release.sh` |
+|---|---|---|
+| `main` 을 바꾸는 방법 | 로컬 `update-ref` 후 수동 푸시 | CI 가 `release` 생성 → PR → 병합 |
+| 제외 대상 | `docs/` 전체, `CLAUDE.md`, `PROJECT.md`, `pytests/`, `tools/{docwatch,golden,spike,bench,scan,colab}` | 루트의 `README.md` 외 `*.md`, `docs/` 바로 아래 `*.md` 만 |
+| 검증 | 공개 트리에서 실제 휠 빌드 | 없음 |
+| `README` 링크 | `docs/` 링크를 `develop` 절대 URL 로 재작성 | 재작성 없음 (`docs/<sub>/` 가 남으므로 불필요) |
 
----
+제안: `publish_main.sh` 는 지우지 않고, ① `main` 을 움직이는 부분(`update-ref`)을 떼어
+"공개 트리가 휠을 빌드하는가" 검사만 남겨 `release-sync.yml` 의 한 단계(또는 `release → main` PR 의
+필수 체크)로 돌리고, ② PyPI 배포는 `main` 병합 뒤 태그로 걸어 `publish-pypi.yml` 이 받게 합니다.
+제외 목록을 `sync-release.sh` 에 맞출지(문서는 `main` 에 남김)는 사용자가 정할 일입니다.
+또한 이 스크립트는 `/Volumes/macMini/worktrees/` 와 `${TMPDIR:-/tmp}` 에 씁니다 — AGENTS.md §15.1 위반.
 
-## `classifiers`
+## 6. 패키징 결정 (`pyproject.toml` · `setup.py`)
 
-**`Development Status :: 2 - Pre-Alpha`** is on purpose. The Python surface is
-still a skeleton; the working part of this project is the `torch._C` replacement
-under `rust/torch_c`, built into the platform wheels
-([`docs/platform/WHEEL.md`](docs/platform/WHEEL.md)).
+`pyproject.toml` 의 주석이 "PROJECT.md" 를 가리키는 곳이 여기입니다. **아래 필드를 바꾸기 전에
+해당 항목을 읽으십시오** — 여러 번 "당연한" 값으로 바뀌었다가 깨졌습니다.
 
-**`Python :: 3.13` is the abi3 FLOOR, not a ceiling.** One `cp313-abi3` wheel
-installs on 3.13 and on every later CPython — that is what `setup.py`'s
-`py_limited_api` buys, and building a `cp314-abi3` wheel beside it would
-*narrow* support rather than widen it. 3.14 and 3.15 are advertised on a
-measurement, not on the argument: the `0.0.12a0` macOS arm64 wheel installs and
-computes on 3.14.7 and on 3.15.0rc1 — same wheel, `a @ b` sums to 134.0 on both.
-`test_release.py::test_the_abi3_wheel_loads_on_later_cpythons` keeps it honest
-by loading the built extension under every newer `python3.N` on PATH, and
-skipping *by name* when there is none.
+### 6.1 `setup.py` 는 휠 태그를 정한다 — 지우면 태그가 틀린다
 
-**`Operating System :: POSIX :: Linux` and `:: Microsoft :: Windows`** are
-declared because the wheels exist and pip will hand them to those users;
-shipping a `manylinux_2_17_x86_64` and a `win_amd64` wheel while withholding the
-classifier would be the more misleading option, since the platform tag already
-made the claim. What they have is CI execution against the *published* wheel,
-not local execution — the README's platform table is the precise record.
+선언적인 것은 전부 `pyproject.toml` 에 있고, `setup.py` 에는 `[tool.setuptools]` 로 쓸 수 없는
+두 사실만 남았습니다.
 
----
+1. **`has_ext_modules()` 가 `True` 여야 합니다.** `torch/_C.abi3.so` 는 `vendor/install_shim.sh` 가
+   미리 빌드해 패키지 데이터로 들어오므로 setuptools 는 확장을 못 봅니다. 그대로 두면
+   `py3-none-any` 휠이 나옵니다 — PyPI 의 **`0.0.1a0` 이 바로 그 휠**이고, `0.0.2a0` 부터는 올바릅니다.
+2. **`py_limited_api = "cp313"`** (`bdist_wheel` 명령 옵션). 태그를 `cp313-abi3-<plat>` 로 만듭니다.
 
-## `[project.optional-dependencies]` — the three backend extras install the same wheel, except npu
+`setup.py` 를 설정 파일로 쓰는 것은 폐기되지 않았습니다(PEP 517, `setuptools.build_meta`).
+Hatchling 은 둘 다 빌드 훅으로만 가능하고 `py_limited_api` 가 없어 기각했고, maturin 은 Rust 확장을
+스스로 빌드한다는 전제가 맞지 않습니다.
+
+### 6.2 `license` 는 upstream 의 표현식 그대로다
+
+`Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT`
+— torch 2.13.0 의 `License-Expression` 그대로입니다. 플랫폼 휠은 upstream 파이썬 트리를 싣기
+때문입니다. **이 필드로는 어느 항이 우리 것인지 표현할 수 없습니다**(우리 라이선스 Apache-2.0 은
+이미 포함). upstream 라이선스 원문은 `tools/wheel/build.py` 가 torch 의 `dist-info` 와 함께 넣습니다.
+
+### 6.3 `dependencies` — `torch` 는 없고, upstream 의 순수 파이썬 의존성은 있다
+
+이 배포판은 `torch` 를 **제공**하므로 `torch` 를 요구하면 자기 자신에 대한 의존이 됩니다. 과거의
+두 시도는 반대 방향으로 틀렸습니다 — 비워 두면 import 시 실패, `torch` 를 요구하면 upstream 휠이 없는
+Android · iOS 에서 해결 불가. upstream torch 는 런타임 의존성이 아니라 **비교 기준**입니다. 따라서
+설치된 PyTorch 와 공존할 수 없는 것은 결함이 아니라 귀결입니다.
+
+나열된 것은 벤더링한 `torch-2.13.0.dist-info` 의 `Requires-Dist` 에서 가져온 순수 파이썬 의존성입니다
+(`torch/__init__.py` 가 `typing_extensions` 를 먼저 import). **CUDA · triton 요구는 복사하지 않습니다** —
+모두 `platform_system == "Linux"` 조건이고 Linux 설치마다 ~2 GB 를 끌어옵니다.
+
+### 6.4 `classifiers`
+
+- **`Development Status :: 2 - Pre-Alpha`** 는 의도적입니다.
+- **`Python :: 3.13` 은 abi3 의 하한이지 상한이 아닙니다.** 3.14 · 3.15 는 측정으로 광고합니다 —
+  `0.0.12a0` macOS arm64 휠이 3.14.7 과 3.15.0rc1 에서 같은 결과(`a @ b` 합 134.0)를 냈고,
+  `test_release.py::test_the_abi3_wheel_loads_on_later_cpythons` 가 이를 지킵니다.
+- **Linux · Windows** 분류자는 휠이 존재하고 pip 가 건네주기 때문에 선언합니다. 근거는 공개된 휠에
+  대한 CI 실행이며, 정확한 기록은 README 의 플랫폼 표입니다.
+
+### 6.5 `[project.optional-dependencies]` — 세 백엔드 extra
 
 ```toml
 cpu = []
 gpu = []
-npu = [
-    "openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')",
-]
+npu = ["openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')"]
 ```
 
-**`cpu` and `gpu` are empty deliberately, not accidentally**, and the shape is
-forced by packaging rather than chosen
-([`docs/platform/WHEEL.md`](docs/platform/WHEEL.md) §13). A wheel filename
-carries no backend axis — pip selects on the python, abi and platform tags
-alone, and the `build tag` slot it does have is a tie-breaker it never selects
-on — so CPU, GPU and NPU builds cannot sit side by side under one platform
-tag. Upstream torch hits exactly this and answers it by leaving PyPI: its 24
-files for one version are 4 platforms × 6 pythons, and the CUDA builds live on
-a separate index.
+휠 파일명에는 백엔드 축이 없어(pip 는 python · abi · platform 태그로만 고름) CPU/GPU/NPU 빌드를 한
+플랫폼 태그 아래 나란히 둘 수 없습니다(`docs/platform/WHEEL.md` §13). 그래서 바이너리 하나가 셋을 다
+싣고 런타임에 고릅니다 — 가속기 경로는 링크가 아니라 **dlopen** 이라 가능합니다
+(`docs/devices/VULKAN.md`: `libvulkan` 이 `NEEDED` 에 없음). extra 는 휠 내용을 바꿀 수 없고 의존성만
+더하므로, `cpu`/`gpu` 는 비어 있고 이름만 선언해 둡니다.
 
-So one binary carries all three and chooses at runtime. That is possible because
-the accelerator paths are **dlopened rather than linked**:
-[`docs/devices/VULKAN.md`](docs/devices/VULKAN.md) measured `libvulkan` absent
-from `NEEDED`, so a device with no driver loses the GPU path and not
-`import torch`; NNAPI and CoreML compile at runtime with the same property.
+**`npu` 는 비어 있지 않습니다.** Intel NPU 경로(`torchnative/export/intelnpu.py`)는 OpenVINO C API 를
+`ctypes` 로 부르고, `pip install openvino` 가 런타임 전체를 파이썬 패키지 안에 싣습니다.
+`load_openvino_c` 가 자동으로 찾되 명시 경로와 `TORCHNATIVE_OPENVINO_C` 가 우선합니다. 마커는 Intel NPU 가
+없는 플랫폼(macOS, 비 x86-64)을 제외합니다.
 
-An extra cannot change what is in a wheel — only add dependencies. What belongs
-here is whatever a backend needs on the *Python* side at runtime. Nothing does
-for CPU or GPU, so those two stay empty; the names are declared so
-`torchnative[gpu]` resolves rather than errors, and so eventual contents have
-somewhere to land.
+- **`federated = []`** — 적응만 쓸 때 연합 스택을 끌어오지 않게 합니다(`docs/design/DESIGN.md` §10).
+- **`test = ["torch>=2.13,<2.14"]`** — 골든 하네스의 비교 기준. 한 릴리스의 `_C` 표면을 구현하므로
+  그 릴리스에 고정합니다. 플랫폼 휠과 충돌하는 것은 설계상 당연합니다.
 
-**`npu` is no longer empty.** The Intel NPU path
-(`torchnative/export/intelnpu.py`) reaches the device through OpenVINO's C
-API over `ctypes`, loaded from a shared library that has to come from
-somewhere — previously the user's own system-wide OpenVINO install, found by
-hand and put on `PATH` or named in `TORCHNATIVE_OPENVINO_C`. `pip install
-openvino` ships the *entire* runtime inside the Python package (`openvino_c`
-plus every plugin, including `openvino_intel_npu_plugin`), so it is exactly
-the kind of Python-side runtime dependency this section describes, not a
-wheel-shape workaround. `load_openvino_c` finds and loads it automatically
-once installed; an explicit path or `TORCHNATIVE_OPENVINO_C` still wins over
-it, so naming a library by hand is unaffected. The marker keeps it off
-platforms with no Intel NPU to reach — macOS and non-x86-64 hosts — matching
-the refusal `library_candidates` already makes by platform name.
+### 6.6 `[tool.setuptools]`
 
-**`federated = []`** exists so that using adaptation alone does not pull in the
-federated stack ([`docs/design/DESIGN.md`](docs/design/DESIGN.md) §10).
+- **`package-dir = { "" = "torchnative/src/main" }`** — 없으면 `src` 가 루트로 잡혀 `import main.torchnative`
+  가 되는 휠이 나왔습니다.
+- **`packages.find` 는 `torch` 를 포함합니다.** `src/main/torch` 는 남의 torch 에 붙이는 것이 아니라
+  우리가 조립한 트리입니다. 제외했던 것이 PyPI 의 `py3-none-any` 배포판을 만들었습니다. 트리는 git 에
+  없으므로 두 벤더 스크립트를 돌리기 전에는 찾을 것이 없고, `tools/wheel/build.py` 는 그 상태에서 빌드를
+  거부합니다.
+- **upstream 패키지는 셋입니다** — `functorch`, `torch`, `torchgen` (`top_level.txt`). `import torch` 가
+  `torch/utils/_python_dispatch.py:13` 에서 `torchgen` 에 닿습니다.
+- **`package-data` 는 재귀 catch-all** — 확장자별 목록은 파일을 조용히 빠뜨렸습니다(특히 `torchgen/packaged/`).
+- **`exclude-package-data`** — 바이트코드 캐시(빌드한 인터프리터의 매직 넘버에 묶임)와 **`.DS_Store`**
+  (실제로 휠에 들어갔고, iOS 검사가 두 휠을 멤버 단위로 비교하다 잡음).
+- **다른 배포판의 디렉터리에 쓰지 않습니다.** 위 `torch` 포함이 "남의 torch 에 이식"이 아니라는 구분이
+  `torchnative/_cachedir.py` · `test_ovcache.py` 가 인용하는 원칙입니다.
 
-**`test = ["torch>=2.13,<2.14"]`** is upstream PyTorch as the thing the golden
-harness diffs against — not a runtime dependency. Pinned to what is actually
-compared: this shim implements one release's `_C` surface, so a tree from
-another release expects different symbols from it. Installing it alongside the
-wheels that carry our own tree will conflict, which is why it is an extra.
+### 6.7 `[tool.ppp]`
 
----
+pypackpack 소스셋 레이아웃을 따릅니다. `src/main` 의 최상위 패키지를 스캔하므로 한 패키지가 `torch` 와
+`torchnative` 를 함께 제공할 수 있습니다(`docs/design/DESIGN.md` §10).
 
-## `[tool.setuptools]` — the source-set layout has to be spelled out
+## 7. 주요 결정 (요약)
 
-```toml
-package-dir = { "" = "torchnative/src/main" }
-```
+| 결정 | 근거 |
+|---|---|
+| `torch._C` 만 교체, 나머지는 벤더링 | `docs/design/DESIGN.md` §2, §5 (A 안 채택) |
+| 텐서 엔진은 candle | `docs/design/DESIGN.md` §4 |
+| abi3 고정, `torch.compile` 영구 거부 | `docs/design/ABI3.md`, `docs/graph/COMPILE.md` |
+| 가속기는 모듈 교체(앞단 고정 · 뒷단 교체) | `docs/graph/QUANT2.md` §3, AGENTS.md §20 |
+| 핵심 추상은 수명이 타입에 박힌 가중치 델타 | `docs/design/DESIGN.md` §3 |
+| `kernels` 는 계약 채용, 배포 역전(빌드 타임) | `docs/design/DESIGN.md` §8 |
 
-Without this, setuptools auto-discovery treats `src` as the root and ships
-`main/` and `test/` as importable packages — which it did, so a wheel built
-before this section answered `import main.torchnative` and not
-`import torchnative`.
+## 8. 열린 질문
 
-### `packages.find` includes `torch`, and that is the whole point
-
-`torch` **is** shipped from this distribution. An earlier revision excluded it on
-the grounds that writing into another distribution's package breaks its
-uninstall — true, but that describes a *graft onto somebody else's torch*, which
-is not what `src/main/torch` is. `vendor/vendor_torch.sh` assembles the whole
-upstream Python tree there and `vendor/install_shim.sh` puts our `_C` in the
-hole it leaves. **Excluding it is what produced the `py3-none-any` distribution
-on PyPI**, which installs and then cannot `import torch`.
-
-The tree is not in git (see `.gitignore`), so this has nothing to find until
-those two scripts have run. `tools/wheel/build.py` refuses to build in that
-state rather than quietly emitting the empty shell again.
-
-**Three upstream packages, not one.** `torch-<v>.dist-info/top_level.txt` names
-`functorch`, `torch` and `torchgen`, and `import torch` reaches the second of
-those (`torch/utils/_python_dispatch.py:13`) 2254 lines into
-`torch/__init__.py`. Shipping only `torch` looked fine for a long time because
-the `PYTHONPATH` workflow shadows site-packages for `torch` alone and let the
-other two resolve to the reference installation underneath.
-
-### `package-data` is a recursive catch-all on purpose
-
-Everything under the package roots that is not a `.py` module: the `_C`
-extension, upstream's `.pyi` stubs (note `torch/_C/` is a *directory* beside the
-`torch/_C.abi3.so` extension — importlib resolves the extension first, and
-upstream ships exactly this shape), `py.typed`, the inductor Jinja templates and
-linker script, the CMake config, and the `_dynamo/graph_break_registry.json`
-read at runtime.
-
-A per-extension list was tried first and **silently dropped files**, so this is a
-recursive catch-all with an exclusion list instead. `torchgen` in particular is
-mostly *not* Python: `torchgen/packaged/ATen/native/native_functions.yaml` and
-the rest of `packaged/` are data files a per-extension list would have to
-enumerate.
-
-### `exclude-package-data`
-
-Byte-code caches are build droppings — running the test suite in the source tree
-leaves ~400 of them under the vendored tree — and `.pyc` compiled by the
-*building* interpreter would pin the wheel to that interpreter's magic number,
-which is the one thing an abi3 wheel must not do.
-
-**`.DS_Store` is listed because one got into a wheel.** Finder writes it into any
-directory it displays, `.gitignore` cannot help (the vendored tree is not in
-git), and `build.py` skipped it only on the path that copies the tree, not on
-the one setuptools takes. The copy at `torchnative/src/main/.DS_Store` is the
-package root, so it landed at the archive root. It was caught by the iOS check
-comparing two wheels member by member: 2,566 shared, 1 differing.
-
----
-
-## `[tool.ppp]`
-
-Platform source sets follow the pypackpack layout: `src/main` is scanned for
-top-level Python packages, which is what lets one package provide both `torch`
-and `torchnative`. See [`docs/design/DESIGN.md`](docs/design/DESIGN.md) §10.
+1. `publish_main.sh` 를 새 릴리스 흐름에 어떻게 붙일지(§5), 그리고 `main` 에 `docs/<sub>/` 를 남길지.
+2. `docs/SPEC.md` 의 "Outside intent" 4 건 — WASM · Linux/Windows 휠, Vulkan 자작 백엔드, CUDA,
+   `torchnative.transformers` 미러가 의도 안에 있는지.
+3. 단계 0/1 을 **타입으로** 가르는 강제(DESIGN.md §2 의 첫째 강제 사항)는 아직 테스트가 없습니다.
+4. 임시 파일 위치: 공용 규정은 `.tmp/`, 이 저장소의 관행은 `.scratch/`. 하나로 정할지.
