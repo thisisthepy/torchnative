@@ -585,8 +585,13 @@ def test_dynamo_backend_refuses_permanently():
 def test_supported_ops_is_smaller_than_what_openvino_accepts_and_says_so():
     """The distinction coreml.py draws: what a target accepts vs what we can emit."""
     ops = supported_ops()
-    assert ops == frozenset({"MatMul", "Add"}), ops
-    assert SUPPORTED_MODULES == frozenset({"torch.nn.Linear"}), SUPPORTED_MODULES
+    # Swish and Multiply arrived with the fused gated MLP (GitHub issue #3,
+    # docs/devices/NPUFUSE.md); test_npufuse.py counts them in the emitted IR.
+    assert ops == frozenset({"MatMul", "Add", "Swish", "Multiply"}), ops
+    assert SUPPORTED_MODULES == frozenset({
+        "torch.nn.Linear",
+        "gated MLP: down_proj(silu(gate_proj(x)) * up_proj(x))",
+    }), SUPPORTED_MODULES
     print(f"ok   intelnpu: supported_ops() is {sorted(ops)} over {sorted(SUPPORTED_MODULES)}")
 
 
@@ -697,13 +702,21 @@ def _openvino_run():
     env = dict(os.environ)
     env["PYTHONPATH"] = _VENDOR_DIR
     env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
-    proc = subprocess.run(
-        [sys.executable, "-c", _SUBPROCESS.format(vendor=_VENDOR_DIR)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=900,
-    )
+    # The compile cache goes to a throwaway directory, as in test_npufuse.py:
+    # its default is the user's home cache (~/.cache/torchnative/openvino), and
+    # a test must not write outside the repository (AGENTS.md, the rule that
+    # was CLAUDE.md §3.0). These tests only began running on Apple arm64 once
+    # `ov_core_compile_model` got its argtypes, which is when the write showed up.
+    with tempfile.TemporaryDirectory(prefix="intelnpu-ovcache-") as cache:
+        env["TORCHNATIVE_CACHE_DIR"] = cache
+        env.pop("TORCHNATIVE_OPENVINO_CACHE_DIR", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", _SUBPROCESS.format(vendor=_VENDOR_DIR)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=900,
+        )
     if proc.returncode != 0:
         raise RuntimeError(
             f"openvino subprocess exited {proc.returncode}\n"

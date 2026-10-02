@@ -670,10 +670,21 @@ Stated plainly rather than left to be discovered.
    Every other leaf stays on the CPU and the report says so. The archived library lowers
    `Conv2d` too (`compiler.py:161-162`) and has fast paths for `LlamaMLP` /
    `LlamaAttention` (`compiler.py:176-191`); neither is here.
+   *Corrected 2026-10-02 (issue #3):* the gated MLP is now lowered as one graph
+   (`_NPUGatedMLP`, `mlp_ir`), with a behavioural matcher that refuses by name
+   whatever is not `down(silu(gate(x)) * up(x))`. Attention and `Conv2d` are still
+   not here. Measured on OpenVINO's CPU plugin, not on an NPU:
+   `docs/devices/NPUFUSE.md`.
 3. **Static shapes.** The batch dimension is baked into the compiled IR, so a
    differently-shaped input recompiles. For `generate()` that is a recompile per
    sequence length, which is a real performance problem and not a correctness one. The
    fix is dynamic dimensions in the IR, and it wants its own round.
+   *Corrected 2026-10-02 (issue #3):* that round happened. Every lowered module first
+   tries a `-1` row axis. On OpenVINO's CPU plugin, `generate()` over three prompt
+   lengths then compiles 0 models, counted by `intelnpu._compile_counters()`. A device
+   that refuses the axis falls back to the old per-length compile, named in the report
+   and warned at `to()`. Whether the **NPU** accepts it is open:
+   `docs/devices/NPUFUSE.md` §3 and §5.
 4. **The crossing is `tolist()` + `struct`, one element at a time.** §1.5 explains why
    it is not numpy, but the cost is real: this is fine for a test and far too slow for a
    7B model. The right fix is a bytes-level accessor on the shim, which is a `torch._C`
