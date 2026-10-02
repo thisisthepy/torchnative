@@ -35,6 +35,7 @@ __all__ = [
     "device",
     "distributed",
     "export",
+    "gguf",
     "kernels",
     "nn",
     "quant",
