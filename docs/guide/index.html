@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<section class="hero">
+<span class="eyebrow" translate="no">torchnative</span>
+<h1><span data-lang="en">The real PyTorch, on device. Only <em>torch._C</em> is ours.</span><span data-lang="ko">진짜 PyTorch 를 기기에서. 우리 것은 <em>torch._C</em> 하나뿐.</span></h1>
+<p class="lede" data-lang="en">Models are not ported, converted or re-expressed — they are imported. torchnative replaces PyTorch's compiled core with a native Rust extension, so the genuine <code>torch</code> and <code>transformers</code> packages run on a phone the way they run on a workstation.</p><p class="lede" data-lang="ko">모델을 포팅하거나 변환하거나 다시 쓰지 않습니다 — import 합니다. torchnative 는 PyTorch 의 컴파일된 핵심만 Rust 네이티브 확장으로 바꿔, 진짜 <code>torch</code> 와 <code>transformers</code> 가 워크스테이션에서처럼 휴대폰에서 돌게 합니다.</p>
+<div class="cta">
+<a class="btn primary" href="getting-started.html"><span data-lang="en">Get started</span><span data-lang="ko">시작하기</span></a>
+<a class="btn" href="concepts.html"><span data-lang="en">How it works</span><span data-lang="ko">동작 원리</span></a>
+<a class="btn" href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div>
+<pre class="install"><code>pip install --pre torchnative</code></pre>
+</section>
+
+<h2><span data-lang="en">The idea, in one picture</span><span data-lang="ko">한 장으로 보는 아이디어</span></h2>
+<p data-lang="en">Everything above the door is upstream source, unmodified. The door — and what sits behind it — is the whole of this project.</p><p data-lang="ko">문 위쪽은 전부 upstream 소스 그대로입니다. 그 문과 그 뒤에 있는 것이 이 프로젝트의 전부입니다.</p>
+<div class="stack" role="img" aria-label="Layer diagram">
+<div class="layer"><span class="name" translate="no">your code · transformers</span><span class="who"><span data-lang="en">upstream, unmodified</span><span data-lang="ko">upstream, 무수정</span></span></div>
+<div class="layer"><span class="name" translate="no">torch/*.py</span><span class="who"><span data-lang="en">upstream, vendored</span><span data-lang="ko">upstream, 벤더링</span></span></div>
+<div class="layer ours"><span class="name" translate="no">torch._C → _aten_dispatch</span><span class="who"><span data-lang="en">ours · the single door</span><span data-lang="ko">우리 것 · 단 하나의 문</span></span></div>
+<div class="layer ours"><span class="name" translate="no">kernels · Rust · candle</span><span class="who"><span data-lang="en">ours</span><span data-lang="ko">우리 것</span></span></div>
+<div class="door" aria-hidden="true"></div>
+<div class="layer below"><span class="name" translate="no">CPU · Metal · Vulkan · CoreML · OpenVINO · QNN</span><span class="who"><span data-lang="en">swapped per device</span><span data-lang="ko">기기마다 교체</span></span></div>
+</div>
+
+<h2><span data-lang="en">Philosophy</span><span data-lang="ko">철학</span></h2>
+<div class="grid">
+<div class="card"><span class="num">01</span><h3><span data-lang="en">Import, don't port</span><span data-lang="ko">포팅하지 말고 import 하라</span></h3><p data-lang="en">A façade that imitates transformers would make a real CPython on the device pointless. The goal is <code>import transformers</code> succeeding on the device.</p><p data-lang="ko">transformers 를 흉내내는 파사드는 기기 위의 진짜 CPython 을 무의미하게 만듭니다. 목표는 기기에서 <code>import transformers</code> 가 성공하는 것입니다.</p></div>
+<div class="card"><span class="num">02</span><h3><span data-lang="en">One door</span><span data-lang="ko">문은 하나</span></h3><p data-lang="en">Every operator passes <code>_aten_dispatch</code>. The surface is measurable, and graph capture has exactly one place to attach.</p><p data-lang="ko">모든 연산자는 <code>_aten_dispatch</code> 를 지납니다. 표면을 셀 수 있고, 그래프 캡처가 붙을 자리는 정확히 하나입니다.</p></div>
+<div class="card"><span class="num">03</span><h3><span data-lang="en">Refuse by name</span><span data-lang="ko">이름으로 거부한다</span></h3><p data-lang="en">What is not supported says so, with the reason. A silent CPU fallback is made unrepresentable, not merely avoided.</p><p data-lang="ko">지원하지 않는 것은 이유와 함께 그렇다고 말합니다. 조용한 CPU 폴백은 피하는 것이 아니라 표현할 수 없게 만듭니다.</p></div>
+<div class="card"><span class="num">04</span><h3><span data-lang="en">Measured, not claimed</span><span data-lang="ko">주장이 아니라 측정</span></h3><p data-lang="en">Correct means agreeing with upstream PyTorch, element by element, at a tolerance derived from upstream's own error.</p><p data-lang="ko">정확하다는 것은 upstream PyTorch 와 원소 단위로 일치한다는 뜻이고, 허용오차는 upstream 자신의 오차에서 유도합니다.</p></div>
+</div>
+
+<h2><span data-lang="en">Three grades of claim</span><span data-lang="ko">주장의 세 등급</span></h2>
+<div class="grades">
+<div><b translate="no">builds</b><span data-lang="en">compiles; symbols resolve. Not a claim about computing.</span><span data-lang="ko">컴파일되고 심볼이 해결된다. 계산에 대한 주장이 아니다.</span></div>
+<div><b translate="no">reaches</b><span data-lang="en">imports; the forward pass runs to the end.</span><span data-lang="ko">import 되고 forward 가 끝까지 간다.</span></div>
+<div><b translate="no">agrees</b><span data-lang="en">produces upstream's numbers. Only this supports “drop-in”.</span><span data-lang="ko">upstream 의 숫자를 낸다. “drop-in” 을 지탱하는 것은 이것뿐.</span></div>
+</div>
+
+<h2><span data-lang="en">What it is for</span><span data-lang="ko">무엇을 위한 것인가</span></h2>
+<p data-lang="en">An on-device AI library: test-time learning (adaptation and training) and federated learning on real models, with kernel optimisation across platforms on top. It is not a reimplementation of PyTorch, not an export pipeline, and not <code>torch.compile</code>.</p><p data-lang="ko">온디바이스 AI 라이브러리입니다: 진짜 모델 위의 테스트 타임 학습(적응·학습)과 연합학습, 그 위에 멀티플랫폼 커널 최적화. PyTorch 의 재구현도, export 파이프라인도, <code>torch.compile</code> 도 아닙니다.</p>
+
+<div class="pager"><span></span><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

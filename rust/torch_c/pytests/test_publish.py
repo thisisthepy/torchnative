@@ -154,12 +154,20 @@ def test_the_script_says_why_github_and_tools_ci_are_kept():
 #: "expected three, found four" and said nothing about whether the new one met
 #: the requirement below. Named instead, for the reason build.py's
 #: EXPECTED_TARGET_KEYS is named: a count cannot say which one moved.
-EXPECTED_WORKFLOWS = (
+MANUAL_WORKFLOWS = (
     "build-cuda-wheel.yml",
     "publish-pypi.yml",
     "qnn-lower.yml",
     "verify-published-wheel.yml",
 )
+# The release flow shared by every thisisthepy repository (tools/release/README.md):
+# event-driven, not manual, so they are exempt from the workflow_dispatch premise.
+AUTOMATION_WORKFLOWS = (
+    "main-source-guard.yml",
+    "pages.yml",
+    "release-sync.yml",
+)
+EXPECTED_WORKFLOWS = tuple(sorted(MANUAL_WORKFLOWS + AUTOMATION_WORKFLOWS))
 
 
 def test_every_workflow_is_still_workflow_dispatch():
@@ -176,6 +184,8 @@ def test_every_workflow_is_still_workflow_dispatch():
     assert names == EXPECTED_WORKFLOWS, (
         f"the workflow set is {list(names)}; expected {list(EXPECTED_WORKFLOWS)}")
     for wf in wfs:
+        if wf.name not in MANUAL_WORKFLOWS:
+            continue
         assert "workflow_dispatch" in wf.read_text(), (
             f"{wf.name} is no longer workflow_dispatch -- publish_main.sh keeps "
             f".github/ on main specifically so its Run workflow button exists."
