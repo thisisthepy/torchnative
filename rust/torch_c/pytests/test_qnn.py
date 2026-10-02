@@ -408,7 +408,10 @@ try:
 except qnn.QnnRefused as error:
     out["refuse_unknown_soc"] = str(error)
 
+import atexit
+import shutil
 work = tempfile.mkdtemp(prefix="bw-qnn-")
+atexit.register(shutil.rmtree, work, ignore_errors=True)
 
 
 class MLP(nn.Module):
@@ -687,7 +690,10 @@ def _qnn_et_fixture():
     interpreter = _qnn_interpreter()
     if interpreter is None:
         return None
+    import atexit
+    import shutil
     work = tempfile.mkdtemp(prefix="bw-qnn-stage-")
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
     env = dict(os.environ)
     env["PYTHONPATH"] = _torchnative_only_path(work)
     env.pop("TORCH_USE_RTLD_GLOBAL", None)

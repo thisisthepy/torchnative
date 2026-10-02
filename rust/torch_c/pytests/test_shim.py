@@ -4305,7 +4305,10 @@ def _ckpt_fixture():
         logits = m(ids_t)
     sd = m.state_dict()
 
+    import atexit
+    import shutil
     tmpdir = tempfile.mkdtemp(prefix="ckpt-harness-")
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
     torch.save(sd, os.path.join(tmpdir, "tiny.pt"))
     torch.save(sd, os.path.join(tmpdir, "tiny_legacy.pt"), _use_new_zipfile_serialization=False)
     from safetensors.torch import save_file
@@ -10092,7 +10095,10 @@ def _from_pretrained_fixture():
     from transformers import AutoModelForCausalLM
     from transformers.models.llama.configuration_llama import LlamaConfig
 
+    import atexit
+    import shutil
     root = tempfile.mkdtemp(prefix="from-pretrained-")
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
     st = os.path.join(root, "st")
     binned = os.path.join(root, "bin")
     payload = os.path.join(root, "payload.bin")
@@ -18985,7 +18991,10 @@ def _save_fixture():
     """
     torch = _upstream_torch
 
+    import atexit
+    import shutil
     tmpdir = tempfile.mkdtemp(prefix="save-harness-")
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
     hard = {}
     hard["w_f32"] = torch.tensor(_ckpt_det(24, 201), dtype=torch.float32).reshape(4, 6)
     hard["w_f16"] = hard["w_f32"].half()
@@ -20277,7 +20286,10 @@ def _fed_two_process_round():
     import socket
     import time
 
+    import atexit
+    import shutil
     tmp = tempfile.mkdtemp(prefix="fed-round-")
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -20327,7 +20339,11 @@ def _fed_two_process_round():
 @functools.cache
 def _fed_world_of_one():
     """The refusals at `world_size = 1`, from one process. See the note above."""
-    dest = os.path.join(tempfile.mkdtemp(prefix="fed-one-"), "out.json")
+    import atexit
+    import shutil
+    tmpdir = tempfile.mkdtemp(prefix="fed-one-")
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
+    dest = os.path.join(tmpdir, "out.json")
     env = dict(os.environ)
     env["PYTHONPATH"] = _CKPT_VENDOR_DIR
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
@@ -22252,7 +22268,10 @@ def _fed3_spawn(source, timeout=600, what="fed3"):
     import socket
     import time
 
+    import atexit
+    import shutil
     tmp = tempfile.mkdtemp(prefix="%s-" % what)
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -25000,7 +25019,10 @@ def _fed4_spawn(source, world=3, timeout=900, what="fed4"):
     import socket
     import time
 
+    import atexit
+    import shutil
     tmp = tempfile.mkdtemp(prefix="%s-" % what)
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -26663,7 +26685,10 @@ import os
 import tempfile
 
 model, names, _ = C.compile_model(capture(torch.nn.Sigmoid(), torch.randn(2, 3)))
+import atexit
+import shutil
 directory = tempfile.mkdtemp()
+atexit.register(shutil.rmtree, directory, ignore_errors=True)
 path = os.path.join(directory, "model.mlpackage")
 model.save(path)
 out["saved"] = {

@@ -109,7 +109,10 @@ def plan_for(trace, *, float32, compute_units):
     # the process with a C++ exception rather than raising, so the second
     # compile is not optional tidiness.
     model, names, emitted = C.compile_model(trace, float32=float32)
+    import atexit
+    import shutil
     directory = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
     package = os.path.join(directory, "m.mlpackage")
     model.save(package)
     compiled = ct_utils.compile_model(package)
