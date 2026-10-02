@@ -156,6 +156,9 @@ def test_the_script_says_why_github_and_tools_ci_are_kept():
 #: EXPECTED_TARGET_KEYS is named: a count cannot say which one moved.
 MANUAL_WORKFLOWS = (
     "build-cuda-wheel.yml",
+    # The gate on hosted runners (issue #24). Also triggered by pull requests
+    # to develop; workflow_dispatch so it can be run without opening one.
+    "gate.yml",
     "publish-pypi.yml",
     "qnn-lower.yml",
     "verify-published-wheel.yml",
