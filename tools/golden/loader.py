@@ -11,6 +11,7 @@ or the process's current directory.
 
 from __future__ import annotations
 
+import atexit
 import importlib.util
 import os
 import sys
@@ -81,7 +82,12 @@ def load_shim(explicit_path: str | None = None) -> ModuleType:
             "--artefact/TORCH_C_ARTEFACT explicitly."
         )
 
+    # Removed when the process exits, not before: the extension is dlopen'd
+    # from this directory and stays mapped for the life of the process. Left
+    # in place, every golden invocation (compare, self-test, DOCWATCH) leaked
+    # one full copy of the artefact into $TMPDIR -- see test_tmpleak.py.
     stage = tempfile.mkdtemp(prefix="golden-harness-")
+    atexit.register(shutil.rmtree, stage, ignore_errors=True)
     so_path = os.path.join(stage, "_C.so")
     shutil.copy(artefact, so_path)
 

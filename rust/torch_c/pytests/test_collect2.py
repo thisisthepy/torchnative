@@ -515,7 +515,10 @@ def _c2_spawn(source, world, dtype, shim, what, timeout=600):
     * `timeout` passed to each `communicate()` in turn is `world * timeout`
       for the spawn, so a wedged world-4 run took 40 minutes to say anything.
     """
+    import atexit
+    import shutil
     tmp = tempfile.mkdtemp(prefix="collect2-%s-" % what)
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
     port = _c2_free_port()
 
     env = dict(os.environ)
