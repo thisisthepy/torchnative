@@ -286,9 +286,7 @@ guarded only when someone runs `test_npufuse.py` with
   arm. That decision belongs after step 7's numbers, not before.
 * **Attention is still per-leaf.** The archived library also has a
   `LlamaAttention` fast path. This round fused only the MLP.
-* **The status page** that develop gained in PR #5 (`STATUS.md`, in the
-  platform folder) has the row "recompiling for the accelerator". It should
-  gain one sentence about the fused MLP and the dynamic axis when this branch
-  is brought up to develop. It is not linked here because this worktree's base
-  predates that file, and the doc-reference check would rightly call a link to
-  it dangling.
+* **The status page** — done after this branch was brought up to develop: the
+  "recompiling for the accelerator" row of
+  [`docs/platform/STATUS.md`](../platform/STATUS.md) now carries one sentence on
+  the fused MLP and the dynamic axis, at the grade measured here (CPU plugin).
