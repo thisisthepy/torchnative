@@ -34,7 +34,9 @@ no build-time OpenVINO SDK, and no threat to the abi3 single-wheel discipline.
 What it reaches the device *with* --- and this is now a **private** capability,
 not an API. `_compile_model(model, device="NPU")` walks a module tree and
 replaces every `torch.nn.Linear` with an `_NPULinear` whose forward runs on the
-device. It was public as `compile_model` and was withdrawn (see the bottom of
+device -- and, since GitHub issue #3, every gated MLP with one `_NPUGatedMLP`
+(one compiled graph instead of three leaves), each compiled with a dynamic row
+axis where the device allows it (docs/devices/NPUFUSE.md). It was public as `compile_model` and was withdrawn (see the bottom of
 this file); it is kept private because the measurements in this file rest on it. That is not an approximation of what the archived library does
 --- it is the same mechanism. `intel_npu_acceleration_library.compile`
 (`compiler.py:42-81`) does no tracing at all; it is `named_children()` +
@@ -94,6 +96,8 @@ __all__ = [
     "verdict_execution_devices",
     "minimal_ir",
     "linear_ir",
+    "mlp_ir",
+    "DYNAMIC_ROWS",
     "pack_f16",
     "unpack_f16",
     "f16_bytes",
@@ -253,6 +257,24 @@ CACHE_DIR_PROPERTY = "CACHE_DIR"
 #: Directories already announced as unusable, so the announcement is once per
 #: process per directory rather than once per compile.
 _CACHE_ANNOUNCED = set()
+
+#: How many compiled models this process has made, at two levels that do not
+#: share code. `ov_compile` is incremented inside `OpenVINO.compile_ir`, after
+#: `ov_core_compile_model` returns OK -- the runtime's own count. `lowered` is
+#: incremented by a lowered module (`_NPULinear`, `_NPUGatedMLP`) when it
+#: stores a compiled model it will run -- the lowering's count. A fake runtime
+#: moves only the second, which is why tests with a real runtime assert both.
+#:
+#: This is the instrument for GitHub issue #3's "generate() compiles once":
+#: values cannot show a recompile, because a recompiled model gives the same
+#: answer (AGENTS.md §16 -- counters, not values). Read with
+#: `_compile_counters()`, which returns a copy.
+_COUNTERS = {"ov_compile": 0, "lowered": 0}
+
+
+def _compile_counters() -> dict:
+    """A copy of `_COUNTERS`. Subtract two readings to bracket a region."""
+    return dict(_COUNTERS)
 
 
 def _reset_cache_announcements() -> None:
@@ -535,8 +557,39 @@ def _port(pid: int, dims, names: str = "") -> str:
     return f'<port id="{pid}" precision="FP16"{tag}>{body}</port>'
 
 
-def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = True) -> str:
+#: The row dimension's spelling when it is dynamic. OpenVINO's IR writes an
+#: unbounded dimension as `-1` in the Parameter's `shape` attribute and in every
+#: port that carries it; it is the same token `ov.save_model` emits for a
+#: dynamic input. docs/devices/NPUFUSE.md section 3.
+DYNAMIC_ROWS = -1
+
+
+def _row_dim(batch) -> int:
+    """`None` -> `DYNAMIC_ROWS`; a positive int -> itself; anything else refuses.
+
+    The row axis is every leading dimension of the activation flattened
+    (batch x sequence for a decoder), which is what `forward` feeds. A static
+    IR bakes one value of it in, and `generate()` sees a new value for every
+    prompt length -- the reason `None` exists (GitHub issue #3).
+    """
+    if batch is None:
+        return DYNAMIC_ROWS
+    if int(batch) < 1:
+        raise IntelNPUUnsupported(
+            f"torchnative intelnpu: a static row count of {int(batch)} is not a "
+            f"shape any input has. Pass a positive row count, or None for a "
+            f"dynamic row axis (`{DYNAMIC_ROWS}` in the IR)."
+        )
+    return int(batch)
+
+
+def linear_ir(in_features: int, out_features: int, batch: "int | None" = 1,
+              bias: bool = True) -> str:
     """OpenVINO IR v11 for `y = x @ W.T + b`, f16, weights in the companion blob.
+
+    `batch` is the row count (every leading dimension flattened). `None`
+    emits a dynamic row axis, `-1`, so one compiled model serves every row
+    count; see `_row_dim` and docs/devices/NPUFUSE.md section 3.
 
     This is `torch.nn.Linear` and nothing else, which is deliberate: it is the
     exact leaf `intel_npu_acceleration_library` replaces. `lower_linear`
@@ -584,7 +637,8 @@ def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = 
                 f"torchnative intelnpu: {label}={int(value)} is not a positive "
                 f"dimension, so there is no Linear to lower."
             )
-    in_features, out_features, batch = int(in_features), int(out_features), int(batch)
+    in_features, out_features = int(in_features), int(out_features)
+    batch = _row_dim(batch)
     weight_bytes = out_features * in_features * 2
 
     layers = [
@@ -634,6 +688,118 @@ def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = 
     )
     return (
         '<?xml version="1.0"?>\n<net name="torchnative_linear" version="11">\n'
+        "  <layers>\n    " + "\n    ".join(layers) + "\n  </layers>\n"
+        "  <edges>\n    " + "\n    ".join(edges) + "\n  </edges>\n</net>\n"
+    )
+
+
+def mlp_ir(hidden: int, intermediate: int, batch: "int | None" = 1) -> str:
+    """OpenVINO IR v11 for a gated MLP, `down(silu(gate(x)) * up(x))`, as ONE graph.
+
+    **A subtree, not a leaf.** `LlamaMLP.forward` (and Qwen's, Mistral's, ...)
+    is three `Linear`s and two elementwise ops. Lowered as leaves that is three
+    compiled models, three FFI crossings, and the SiLU and the multiply done on
+    the host between them. Lowered as this graph it is one compiled model, one
+    crossing, and the activation and the multiply happen on the device between
+    matmuls whose intermediates never leave it. `intel_npu_acceleration_library`
+    reached for the same shape once its leaf lowering worked (its `LlamaMLP`
+    fast path, `compiler.py:176-191`). docs/graph/QUANT2.md section 3 names the
+    ceiling this stays under: subtree replacement cannot see between modules,
+    so the residual add and the norms around this block stay on the CPU.
+
+    `Swish` (opset4) with one input is SiLU: its `beta` defaults to 1.0, and
+    `x * sigmoid(1.0 * x)` is `torch.nn.functional.silu`.
+
+    The blob is `gate`, then `up`, then `down`, each `[out, in]` and consumed
+    with `transpose_b="true"` -- `linear_ir`'s layout, for `linear_ir`'s reason.
+    No bias: a gated MLP with one is refused by `_gated_mlp_refusal` and its
+    Linears go down the leaf path instead.
+
+    `batch` is the row count; `None` is the dynamic row axis (`-1`).
+
+    Written from the archived `work/intelnpu2` branch's `mlp_ir` (tag
+    `archive/wip/bw-intelnpu2`), and **checked here against a real
+    OpenVINO** rather than inherited: docs/devices/NPUFUSE.md section 4.
+
+    Raises:
+        IntelNPUUnsupported: for a dimension above `MAX_DIM` or below 1, or a
+            non-positive static row count, by name.
+    """
+    for label, value in (("hidden", hidden), ("intermediate", intermediate)):
+        if int(value) > MAX_DIM:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {label}={int(value)} exceeds "
+                f"MAX_DIM={MAX_DIM}, so this gated MLP is not lowered as one "
+                f"graph. Refusing by name rather than handing the torch module "
+                f"back inside a model the caller believes is offloaded. MAX_DIM "
+                f"is itself unsourced -- docs/devices/NPUDIM.md."
+            )
+        if int(value) < 1:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {label}={int(value)} is not a positive "
+                f"dimension, so there is no gated MLP to lower."
+            )
+    hidden, intermediate = int(hidden), int(intermediate)
+    rows = _row_dim(batch)
+    proj_bytes = intermediate * hidden * 2  # gate, up and down are each this size
+
+    def const(lid, name, dims, offset):
+        return (
+            f'<layer id="{lid}" name="{name}" type="Const" version="opset1">'
+            f'<data element_type="f16" shape="{dims[0]}, {dims[1]}" '
+            f'offset="{offset}" size="{dims[0] * dims[1] * 2}"/>'
+            f"<output>{_port(0, dims)}</output></layer>"
+        )
+
+    def matmul(lid, name, a_dims, b_dims, out_dims):
+        return (
+            f'<layer id="{lid}" name="{name}" type="MatMul" version="opset1">'
+            f'<data transpose_a="false" transpose_b="true"/>'
+            f"<input>{_port(0, a_dims)}{_port(1, b_dims)}</input>"
+            f"<output>{_port(2, out_dims)}</output></layer>"
+        )
+
+    x_dims = (rows, hidden)
+    inter = (rows, intermediate)
+    layers = [
+        f'<layer id="0" name="input" type="Parameter" version="opset1">'
+        f'<data shape="{rows},{hidden}" element_type="f16"/>'
+        f"<output>{_port(0, x_dims, 'input')}</output></layer>",
+        const(1, "gate_weight", (intermediate, hidden), 0),
+        matmul(2, "gate", x_dims, (intermediate, hidden), inter),
+        const(3, "up_weight", (intermediate, hidden), proj_bytes),
+        matmul(4, "up", x_dims, (intermediate, hidden), inter),
+        f'<layer id="5" name="silu" type="Swish" version="opset4">'
+        f"<input>{_port(0, inter)}</input>"
+        f"<output>{_port(1, inter)}</output></layer>",
+        f'<layer id="6" name="gated" type="Multiply" version="opset1">'
+        f'<data auto_broadcast="numpy"/>'
+        f"<input>{_port(0, inter)}{_port(1, inter)}</input>"
+        f"<output>{_port(2, inter)}</output></layer>",
+        const(7, "down_weight", (hidden, intermediate), 2 * proj_bytes),
+        f'<layer id="8" name="down" type="MatMul" version="opset1">'
+        f'<data transpose_a="false" transpose_b="true"/>'
+        f"<input>{_port(0, inter)}{_port(1, (hidden, intermediate))}</input>"
+        f"<output>{_port(2, x_dims, 'output')}</output></layer>",
+        f'<layer id="9" name="output" type="Result" version="opset1" '
+        f'output_names="output"><input>{_port(0, x_dims)}</input></layer>',
+    ]
+    edges = [
+        '<edge from-layer="0" from-port="0" to-layer="2" to-port="0"/>',
+        '<edge from-layer="1" from-port="0" to-layer="2" to-port="1"/>',
+        '<edge from-layer="0" from-port="0" to-layer="4" to-port="0"/>',
+        '<edge from-layer="3" from-port="0" to-layer="4" to-port="1"/>',
+        # SiLU on the GATE projection. On the up projection it is a different
+        # function with identical op counts -- test_npufuse pins this edge.
+        '<edge from-layer="2" from-port="2" to-layer="5" to-port="0"/>',
+        '<edge from-layer="5" from-port="1" to-layer="6" to-port="0"/>',
+        '<edge from-layer="4" from-port="2" to-layer="6" to-port="1"/>',
+        '<edge from-layer="6" from-port="2" to-layer="8" to-port="0"/>',
+        '<edge from-layer="7" from-port="0" to-layer="8" to-port="1"/>',
+        '<edge from-layer="8" from-port="2" to-layer="9" to-port="0"/>',
+    ]
+    return (
+        '<?xml version="1.0"?>\n<net name="torchnative_mlp" version="11">\n'
         "  <layers>\n    " + "\n    ".join(layers) + "\n  </layers>\n"
         "  <edges>\n    " + "\n    ".join(edges) + "\n  </edges>\n</net>\n"
     )
@@ -874,6 +1040,24 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     lib.ov_model_free.restype = None
     # Variadic: argtypes covers the fixed prefix only, which is what ctypes wants.
     lib.ov_core_compile_model.restype = ctypes.c_int
+    # The fixed prefix MUST be declared, or the properties segfault on Apple
+    # arm64. That ABI passes variadic arguments on the stack, not in registers,
+    # and ctypes only uses the variadic convention (`ffi_prep_cif_var`) when it
+    # knows where the fixed arguments end -- which is `len(argtypes)`. With no
+    # argtypes it passed CACHE_DIR's key and value in registers, and
+    # `ov_core_compile_model` read garbage off the stack: every real-runtime
+    # test in test_intelnpu.py died with SIGSEGV on this Mac from the moment
+    # the cache properties landed (2591995) -- unseen, because the gate does
+    # not set TORCHNATIVE_OPENVINO_C. Windows x64 and Linux x86-64 pass
+    # variadic arguments like fixed ones, so the defect was arm64-Darwin only.
+    # Found by this round (docs/devices/NPUFUSE.md section 6).
+    lib.ov_core_compile_model.argtypes = [
+        ctypes.c_void_p,                  # const ov_core_t* core
+        ctypes.c_void_p,                  # const ov_model_t* model
+        ctypes.c_char_p,                  # const char* device_name
+        ctypes.c_size_t,                  # const size_t property_args_size
+        ctypes.POINTER(ctypes.c_void_p),  # ov_compiled_model_t** compiled_model
+    ]
     lib.ov_compiled_model_get_property.argtypes = [ctypes.c_void_p, ctypes.c_char_p, c_char_pp]
     lib.ov_compiled_model_get_property.restype = ctypes.c_int
     lib.ov_compiled_model_free.argtypes = [ctypes.c_void_p]
@@ -901,6 +1085,15 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     lib.ov_compiled_model_create_infer_request.restype = ctypes.c_int
     lib.ov_infer_request_get_input_tensor.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
     lib.ov_infer_request_get_input_tensor.restype = ctypes.c_int
+    # The dynamic row axis (docs/devices/NPUFUSE.md section 3). On a model whose
+    # input has a `-1` dimension, the request's input tensor comes back with
+    # zero bytes -- measured: `ov_tensor_get_byte_size` reads 0 -- so there is
+    # nothing to copy into until it is given a concrete shape. Setting the shape
+    # on the request's own tensor keeps the element type the IR declared, so
+    # this module still never binds `ov_element_type_e` for activations.
+    # `ov_tensor_set_shape` is in ov_tensor.h beside `ov_tensor_get_byte_size`.
+    lib.ov_tensor_set_shape.argtypes = [ctypes.c_void_p, _Shape]
+    lib.ov_tensor_set_shape.restype = ctypes.c_int
     lib.ov_infer_request_get_output_tensor.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
     lib.ov_infer_request_get_output_tensor.restype = ctypes.c_int
     lib.ov_infer_request_infer.argtypes = [ctypes.c_void_p]
@@ -925,6 +1118,14 @@ class OpenVINO:
     name and, when the runtime offers it, `ov_get_last_err_msg()` -- so a failure
     on the user's machine reports OpenVINO's account of itself rather than ours.
     """
+
+    #: This runtime can compile a `-1` row axis and run it at any row count
+    #: (`infer(..., shape=...)`). Declared rather than probed so a stand-in
+    #: runtime that lacks the `shape` argument takes the static path instead
+    #: of being handed a dynamic model it cannot run. Whether the *device*
+    #: accepts the dynamic axis is a separate question, answered by trying:
+    #: `_NPULinear._compile_for`.
+    dynamic_shapes = True
 
     def __init__(self, path: str | None = None, cache_dir: "str | None" = _UNSET):
         self._lib = load_openvino_c(path)
@@ -1006,8 +1207,16 @@ class OpenVINO:
         )
         return self._take_string(value)
 
-    def compile_ir(self, xml: str, device: str = "NPU", weights: bytes | None = None):
+    def compile_ir(self, xml: str, device: str = "NPU", weights: bytes | None = None,
+                   properties: "dict | None" = None):
         """Read IR from memory and compile it for `device`. Returns an opaque handle.
+
+        `properties` is extra `{key: value}` strings for `ov_core_compile_model`,
+        after the cache directory. Nothing in the lowering passes any; it exists
+        so a measurement can name the execution precision it ran at
+        (`INFERENCE_PRECISION_HINT`) instead of inheriting the plugin's default
+        silently -- docs/devices/NPUFUSE.md section 4 is the measurement that
+        needed it.
 
         **Nothing touches the filesystem**, and that is the sense in which this is
         not an "OpenVINO export path": no `.xml`/`.bin` pair is written, no `ovc`
@@ -1068,6 +1277,11 @@ class OpenVINO:
                         ctypes.c_char_p(self._cache_key),
                         ctypes.c_char_p(self.cache_dir.encode("utf-8")),
                     )
+                for key, value in (properties or {}).items():
+                    props += (
+                        ctypes.c_char_p(str(key).encode("utf-8")),
+                        ctypes.c_char_p(str(value).encode("utf-8")),
+                    )
                 self._check(
                     self._lib.ov_core_compile_model(
                         self._core,
@@ -1092,6 +1306,7 @@ class OpenVINO:
                 # What this rules out is the accidental version -- the shared
                 # core `_compile_model` builds having no other name.
                 compiled._torchnative_core = self
+                _COUNTERS["ov_compile"] += 1
                 return compiled
             finally:
                 self._lib.ov_model_free(model)
@@ -1099,8 +1314,15 @@ class OpenVINO:
             if weights_tensor is not None:
                 self._lib.ov_tensor_free(weights_tensor)
 
-    def infer(self, compiled, input_bytes: bytes) -> bytes:
+    def infer(self, compiled, input_bytes: bytes, shape=None) -> bytes:
         """Run one synchronous inference and return the output tensor's raw bytes.
+
+        `shape` is for a model compiled with a dynamic row axis: the request's
+        input tensor has no concrete shape (and zero bytes) until it is given
+        one, so the concrete shape of *this* call is set on it first, through
+        `ov_tensor_set_shape`. The byte-count check below then runs against
+        that shape, exactly as it does for a static model. Leave it None for a
+        static model, whose input tensor already has its one shape.
 
         The input tensor is **borrowed from the infer request** rather than created:
         `ov_infer_request_get_input_tensor` hands back the buffer OpenVINO already
@@ -1124,6 +1346,15 @@ class OpenVINO:
                 self._lib.ov_infer_request_get_input_tensor(request, ctypes.byref(tensor)),
                 "ov_infer_request_get_input_tensor",
             )
+            if shape is not None:
+                dims = tuple(int(d) for d in shape)
+                arr = (ctypes.c_int64 * len(dims))(*dims)
+                self._check(
+                    self._lib.ov_tensor_set_shape(
+                        tensor, _Shape(len(dims), ctypes.cast(arr, ctypes.POINTER(ctypes.c_int64)))
+                    ),
+                    f"ov_tensor_set_shape(input, {list(dims)})",
+                )
             size = ctypes.c_size_t()
             self._check(
                 self._lib.ov_tensor_get_byte_size(tensor, ctypes.byref(size)),
@@ -1449,10 +1680,18 @@ class _NPULinear:
     refused before it ever produces a number -- because once it has produced a
     number the number is correct and there is nothing left to notice.
 
-    The batch dimension is part of the compiled shape, so a differently-shaped
-    input recompiles. That is stated rather than hidden: it is the cost of a
-    static-shape IR and it is why this is a leaf-replacement stage and not yet a
-    whole-model one.
+    **The row axis is dynamic when the runtime and the device allow it**
+    (GitHub issue #3, docs/devices/NPUFUSE.md section 3). The first compile
+    emits the IR with a `-1` row axis; if the device compiles it, that one
+    model serves every row count and `generate()` never compiles again. If the
+    device refuses it, the refusal is recorded on `shape_fallback_reason`,
+    carried into `_compile_model`'s report and warned about at `to()`, and
+    every new row count compiles its own static model -- the behaviour this
+    class had before. A fallback that cost a recompile per prompt length and
+    said nothing would be the silent degradation docs/graph/NPU2.md is about.
+
+    `compiles` counts the compiled models this module has stored, and moves
+    `_COUNTERS["lowered"]` with it.
     """
 
     def __new__(cls, *args, **kwargs):
@@ -1461,7 +1700,11 @@ class _NPULinear:
         # torch being importable at all.
         torch = _torch()
         if not issubclass(cls, torch.nn.Module):
-            cls = type("_NPULinear", (_NPULinear, torch.nn.Module), {})
+            # `cls`, not `_NPULinear`: a subclass (`_NPUGatedMLP`) must stay
+            # itself. Hard-coding the base here would hand back an `_NPULinear`
+            # for every subclass, which would still construct -- with the
+            # subclass's arguments fed to the wrong `__init__`.
+            cls = type(cls.__name__, (cls, torch.nn.Module), {})
             obj = torch.nn.Module.__new__(cls)
             return obj
         return super().__new__(cls)
@@ -1500,6 +1743,19 @@ class _NPULinear:
         # sharing did not make a core mandatory. See `_ensure_core`.
         self._ov = core
         self.execution_devices = None
+        self._init_shape_state()
+
+    def _init_shape_state(self):
+        # None until the first compile decides it: "dynamic" (one model, `-1`
+        # rows) or "static-per-length" (one model per row count).
+        self.shape_mode = None
+        self.shape_fallback_reason = None
+        # True only when the DEVICE refused the dynamic compile -- the case
+        # `to()` warns about. False when no dynamic compile was attempted
+        # because the runtime object does not declare `dynamic_shapes` (only
+        # test stand-ins; the real `OpenVINO` declares it).
+        self.shape_fallback_refused = False
+        self.compiles = 0
 
     # -- construction -----------------------------------------------------
     @classmethod
@@ -1529,47 +1785,315 @@ class _NPULinear:
             blob += f16_bytes(self.bias)
         return blob
 
-    def _compile_for(self, batch: int):
-        if batch in self._compiled:
-            return self._compiled[batch]
-        if self._ov is None:
-            self._ov = open_core(self.library, self.device_name)
-        xml = linear_ir(self.in_features, self.out_features, batch, self.bias is not None)
-        compiled = self._ov.compile_ir(xml, self.device_name, self._weights_blob())
+    def _ir(self, batch):
+        """This module's IR at row count `batch` (`None` for the dynamic axis).
+
+        One of the two methods a subclass overrides (with `_weights_blob`);
+        compiling, asserting the device and choosing a shape mode are the same
+        whatever the graph is.
+        """
+        return linear_ir(self.in_features, self.out_features, batch, self.bias is not None)
+
+    def _finish(self, compiled, key):
+        """Assert the device on a freshly compiled model, then keep and count it."""
         devices = self._ov.execution_devices(compiled)
         # The assertion, before any number comes back.
         verdict_execution_devices(devices, self.device_name)
         self.execution_devices = list(devices)
-        self._compiled[batch] = compiled
+        self._compiled[key] = compiled
+        self.compiles += 1
+        _COUNTERS["lowered"] += 1
         return compiled
 
+    def _compile_for(self, batch: int):
+        """The compiled model that serves `batch` rows, compiling only if none does.
+
+        The dynamic attempt happens **once**, at the first compile. If it
+        succeeds, `self._compiled[None]` serves every row count and this never
+        compiles again. If the device refuses it -- `ov_core_compile_model`
+        fails, which `OpenVINO._check` raises as `IntelNPUUnavailable` -- the
+        refusal is kept, verbatim, on `shape_fallback_reason`, and this falls
+        back to one static model per row count. A static compile that then
+        *also* fails is not caught: that is not a shape problem.
+
+        A runtime object that does not declare `dynamic_shapes` takes the
+        static path from the start, and that is recorded too. The real
+        `OpenVINO` declares it; stand-ins in older tests do not.
+
+        A dynamic compile that succeeds but reports the wrong
+        `EXECUTION_DEVICES` raises `IntelNPUExecutionError` from `_finish` and
+        is **not** a reason to fall back -- the device question is not a shape
+        question, and treating it as one would retry the same wrong placement.
+        """
+        if self.shape_mode == "dynamic":
+            return self._compiled[None]
+        if batch in self._compiled:
+            return self._compiled[batch]
+        if self._ov is None:
+            self._ov = open_core(self.library, self.device_name)
+        if self.shape_mode is None:
+            if getattr(self._ov, "dynamic_shapes", False):
+                try:
+                    compiled = self._ov.compile_ir(
+                        self._ir(None), self.device_name, self._weights_blob()
+                    )
+                except IntelNPUUnavailable as exc:
+                    self.shape_mode = "static-per-length"
+                    self.shape_fallback_refused = True
+                    self.shape_fallback_reason = (
+                        f"{self.device_name} refused the dynamic row axis "
+                        f"({DYNAMIC_ROWS}), so every new row count compiles "
+                        f"its own model: {exc}"
+                    )
+                else:
+                    self.shape_mode = "dynamic"
+                    return self._finish(compiled, None)
+            else:
+                self.shape_mode = "static-per-length"
+                self.shape_fallback_reason = (
+                    f"the OpenVINO object in use ({type(self._ov).__name__}) does "
+                    f"not declare dynamic_shapes, so no dynamic row axis was tried"
+                )
+        compiled = self._ov.compile_ir(self._ir(batch), self.device_name, self._weights_blob())
+        return self._finish(compiled, batch)
+
     def forward(self, x):
+        """Flatten the leading dimensions into rows, run, and restore the shape.
+
+        `_NPUGatedMLP` inherits this unchanged: its `in_features` and
+        `out_features` are both `hidden`.
+        """
         torch = _torch()
+        width_in, width_out = self.in_features, self.out_features
         shape = tuple(int(d) for d in x.shape)
-        if shape[-1] != self.in_features:
+        if shape[-1] != width_in:
             raise IntelNPUUnsupported(
                 f"torchnative intelnpu: input last dimension {shape[-1]} does not "
-                f"match in_features={self.in_features}."
+                f"match in_features={width_in}."
             )
-        batch = 1
+        rows = 1
         for dim in shape[:-1]:
-            batch *= dim
-        compiled = self._compile_for(batch)
+            rows *= dim
+        compiled = self._compile_for(rows)
         # Bytes in, bytes out. Neither direction builds Python scalars: the old
         # spelling did `tolist()` on the way in and `torch.tensor(unpack_f16(...))`
         # on the way back, on *every* call, which is the reason the device was
         # idle between matmuls (docs/devices/INTELNPU.md, `The weights path`).
-        blob = self._ov.infer(compiled, f16_bytes(x))
-        result = f16_tensor(blob, (batch, self.out_features))
-        result = result.to(torch.float32).reshape(*shape[:-1], self.out_features)
+        if self.shape_mode == "dynamic":
+            blob = self._ov.infer(compiled, f16_bytes(x), (rows, width_in))
+        else:
+            blob = self._ov.infer(compiled, f16_bytes(x))
+        result = f16_tensor(blob, (rows, width_out))
+        result = result.to(torch.float32).reshape(*shape[:-1], width_out)
         return result.to(x.dtype)
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, device={self.device_name!r}, "
-            f"execution_devices={self.execution_devices}"
+            f"execution_devices={self.execution_devices}, shapes={self.shape_mode!r}"
         )
+
+
+# --------------------------------------------------------------------------
+# The fused gated MLP (GitHub issue #3, docs/devices/NPUFUSE.md section 2).
+# --------------------------------------------------------------------------
+
+#: The children a gated MLP is recognised by. By attribute name, as
+#: `transformers` spells them in `LlamaMLP`, `Qwen2MLP`, `Qwen3MLP`,
+#: `MistralMLP`, `GemmaMLP`, ... -- and **then by behaviour**, because a name
+#: is a claim about a function, not the function (`_gated_mlp_refusal`).
+GATED_MLP_CHILDREN = ("gate_proj", "up_proj", "down_proj")
+
+
+def _gated_mlp_candidate(mod) -> bool:
+    """Whether `mod` is shaped like a gated MLP at all: has all three children.
+
+    A module that is not a candidate is not refused -- it is not a gated MLP,
+    and inventing a refusal for every `Sequential` would bury the real ones.
+    """
+    names = {n for n, _ in mod.named_children()}
+    return set(GATED_MLP_CHILDREN) <= names
+
+
+def _gated_mlp_refusal(mod):
+    """`None` if `mod` computes `down(silu(gate(x)) * up(x))` and can be lowered
+    as one graph; otherwise **the reason, naming what is missing**.
+
+    Structure first, each check naming its child: all three are bias-free
+    `torch.nn.Linear` of floating dtype, `gate`/`up` are `[I, H]`, `down` is
+    `[H, I]`, and `mlp_ir`'s own dimension limits hold.
+
+    **Then behaviour, because structure is not enough.** A module can have
+    exactly these children and compute something else: Gemma's MLP is the same
+    three projections with a GELU, and a module that applies the activation
+    to `up` instead of `gate` has identical names, shapes and op counts.
+    Lowering either as this graph would return confident wrong numbers. So
+    `mod` is run once on a fixed probe and compared with the function this
+    lowering computes, built from `mod`'s own three Linears.
+
+    The probe is deterministic and draws no random numbers (it must not move
+    the caller's RNG). It is accepted only if it **can tell the difference**:
+    the reference must differ from the two nearest wrong functions -- the
+    activation on `up` instead of `gate`, and no activation -- by far more
+    than the tolerance, or the comparison could not have failed and the
+    module is refused for that reason instead (AGENTS.md §17.5).
+
+    The tolerance is 64 ulp of `mod`'s dtype relative to the output's scale:
+    two spellings of the same function in the same dtype (`SiLUActivation`
+    vs `F.silu`) differ by rounding, and a different activation differs by
+    orders of magnitude more.
+    """
+    torch = _torch()
+    for name in GATED_MLP_CHILDREN:
+        if name not in {n for n, _ in mod.named_children()}:
+            return f"it has no `{name}` child"
+    gate, up, down = mod.gate_proj, mod.up_proj, mod.down_proj
+    for name, child in (("gate_proj", gate), ("up_proj", up), ("down_proj", down)):
+        if not isinstance(child, torch.nn.Linear):
+            return (f"`{name}` is {type(child).__name__}, not torch.nn.Linear -- "
+                    f"only a float Linear's weight can be laid into this IR")
+        if getattr(child, "bias", None) is not None:
+            return (f"`{name}` has a bias, and the fused IR emits none; lowering "
+                    f"it would drop the bias")
+        if not child.weight.dtype.is_floating_point:
+            return (f"`{name}` has a {child.weight.dtype} weight; the fused IR is "
+                    f"f16 and integer weights need the quantized path")
+    inter, hidden = (int(d) for d in gate.weight.shape)
+    if tuple(up.weight.shape) != (inter, hidden):
+        return (f"`up_proj` has weight shape {tuple(up.weight.shape)} but "
+                f"`gate_proj` has {(inter, hidden)}; the elementwise product "
+                f"needs them equal")
+    if tuple(down.weight.shape) != (hidden, inter):
+        return (f"`down_proj` has weight shape {tuple(down.weight.shape)}, not "
+                f"{(hidden, inter)} -- it does not map the gated product back to "
+                f"the input width")
+    try:
+        mlp_ir(hidden, inter, 1)
+    except IntelNPUUnsupported as exc:
+        return str(exc).split("torchnative intelnpu: ", 1)[-1]
+
+    dtype = gate.weight.dtype
+    silu = torch.nn.functional.silu
+    probe = (torch.sin(torch.arange(2 * hidden, dtype=torch.float32) * 0.37 + 0.1)
+             * 2.0).reshape(2, hidden).to(dtype)
+    try:
+        with torch.no_grad():
+            got = mod(probe)
+            g, u = gate(probe), up(probe)
+            reference = down(silu(g) * u)
+            wrong_side = down(silu(u) * g)
+            no_act = down(g * u)
+    except Exception as exc:  # noqa: BLE001 -- named, not swallowed
+        return (f"running it once on a probe input raised "
+                f"{type(exc).__name__}: {exc}, so what it computes could not be "
+                f"checked")
+    if not hasattr(got, "shape") or tuple(got.shape) != tuple(reference.shape):
+        return (f"its forward returned {type(got).__name__} "
+                f"{tuple(getattr(got, 'shape', ()))}, not a tensor of shape "
+                f"{tuple(reference.shape)}")
+    scale = float(reference.abs().max())
+    try:
+        eps = float(torch.finfo(dtype).eps)
+    except Exception:  # noqa: BLE001
+        eps = 2.0 ** -10
+    tolerance = 64 * eps * max(scale, 1e-30)
+    distinct = min(float((reference - wrong_side).abs().max()),
+                   float((reference - no_act).abs().max()))
+    if not distinct > 100 * tolerance:
+        return (f"the probe cannot tell `down(silu(gate(x)) * up(x))` from its "
+                f"nearest wrong variants on these weights (they differ by "
+                f"{distinct:.3e}, tolerance {tolerance:.3e}), so its behaviour "
+                f"could not be checked")
+    error = float((got.to(reference.dtype) - reference).abs().max())
+    if not error <= tolerance:
+        return (f"it does not compute down(silu(gate(x)) * up(x)) -- its forward "
+                f"differs from that by {error:.3e} on a probe (tolerance "
+                f"{tolerance:.3e}); a different activation (e.g. GELU) or a "
+                f"different wiring is a different function")
+    return None
+
+
+class _NPUGatedMLP(_NPULinear):
+    """A gated-MLP subtree, `down(silu(gate(x)) * up(x))`, as ONE compiled model.
+
+    Inherits `_NPULinear`'s device layer and nothing about Linear: the shared
+    core, the dynamic-axis attempt and its named fallback, the
+    `EXECUTION_DEVICES` assertion, the compile counter and the byte crossing
+    are identical. It overrides the two things that differ -- the IR
+    (`mlp_ir`) and the weights blob (gate, up, down) -- plus construction.
+
+    Constructed from the module it replaces. The constructor calls
+    `_gated_mlp_refusal` and raises its reason by name, so this class and the
+    matcher cannot disagree about what is lowerable.
+
+    `in_features == out_features == hidden`, which is what lets
+    `_NPULinear.forward` serve it unchanged.
+    """
+
+    def __init__(self, mod, device: str = "NPU", library: str | None = None,
+                 core: "OpenVINO | None" = None):
+        torch = _torch()
+        torch.nn.Module.__init__(self)
+        reason = _gated_mlp_refusal(mod)
+        if reason is not None:
+            raise IntelNPUUnsupported(
+                f"torchnative intelnpu: {type(mod).__name__} is not lowered as one "
+                f"gated-MLP graph: {reason}. Its Linears can still be lowered as "
+                f"separate leaves; _compile_model does exactly that and names this "
+                f"module in its report's `unfused`."
+            )
+        self.intermediate, self.hidden = (int(d) for d in mod.gate_proj.weight.shape)
+        self.gate_weight = torch.nn.Parameter(mod.gate_proj.weight.detach().to(torch.float16))
+        self.up_weight = torch.nn.Parameter(mod.up_proj.weight.detach().to(torch.float16))
+        self.down_weight = torch.nn.Parameter(mod.down_proj.weight.detach().to(torch.float16))
+        self.in_features = self.out_features = self.hidden
+        self.bias = None
+        self.device_name = device
+        self.library = library
+        self._compiled = {}
+        self._ov = core
+        self.execution_devices = None
+        self._init_shape_state()
+
+    @classmethod
+    def from_torch(cls, mod, device: str = "NPU", library: str | None = None,
+                   core: "OpenVINO | None" = None):
+        return cls(mod, device=device, library=library, core=core)
+
+    def _weights_blob(self) -> bytes:
+        """gate, then up, then down -- the order `mlp_ir` writes its offsets in."""
+        return (f16_bytes(self.gate_weight) + f16_bytes(self.up_weight)
+                + f16_bytes(self.down_weight))
+
+    def _ir(self, batch):
+        return mlp_ir(self.hidden, self.intermediate, batch)
+
+    def extra_repr(self) -> str:
+        return (
+            f"hidden={self.hidden}, intermediate={self.intermediate}, "
+            f"device={self.device_name!r}, execution_devices={self.execution_devices}, "
+            f"shapes={self.shape_mode!r}"
+        )
+
+
+def _fusion_decision(path, child, predicate):
+    """`(fuse, reason)` for one module in the walk. `reason` is None when fusing.
+
+    Shared by `plan_lowering` and `_compile_model` so the plan and the
+    lowering cannot disagree. Returns `(False, None)` for a module that is not
+    a candidate at all -- nothing to report.
+    """
+    if not _gated_mlp_candidate(child):
+        return False, None
+    if predicate is not None:
+        excluded = [n for n in GATED_MLP_CHILDREN
+                    if not predicate(f"{path}.{n}", getattr(child, n))]
+        if excluded:
+            return False, (f"the predicate excludes {excluded}, and fusing would "
+                           f"lower them anyway")
+    reason = _gated_mlp_refusal(child)
+    return reason is None, reason
 
 
 def plan_lowering(model, predicate=None):
@@ -1599,12 +2123,21 @@ def plan_lowering(model, predicate=None):
     """
     torch = _torch()
     eligible, skipped, left = [], [], {}
+    fused, unfused = [], []
     moved = 0
 
     def walk(parent, prefix):
         nonlocal moved
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
+            fuse, why = _fusion_decision(path, child, predicate)
+            if fuse:
+                eligible.append(path)
+                fused.append(path)
+                moved += sum(getattr(child, n).weight.numel() for n in GATED_MLP_CHILDREN)
+                continue
+            if why is not None:
+                unfused.append((path, why))
             if isinstance(child, torch.nn.Linear):
                 if predicate is not None and not predicate(path, child):
                     skipped.append((path, "excluded by predicate"))
@@ -1637,6 +2170,8 @@ def plan_lowering(model, predicate=None):
     total = sum(p.numel() for p in model.parameters())
     return {
         "eligible": eligible,
+        "fused": fused,
+        "unfused": unfused,
         "skipped": skipped,
         "left_on_cpu": dict(sorted(left.items())),
         "fully_offloaded": not left and not skipped,
@@ -1733,6 +2268,7 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
             f"verdict_execution_devices() refuses."
         )
     swapped, left, skipped = [], {}, []
+    fused, unfused = [], []
     moved_parameters = 0
     # None during the walk, deliberately. The walk needs no OpenVINO -- it is
     # `named_children()` plus the pure `linear_ir` eligibility check -- and
@@ -1746,6 +2282,25 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
         nonlocal moved_parameters
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
+            # A gated MLP is tested BEFORE recursing into it, so it is lowered
+            # as one graph rather than as its three projections. Order is the
+            # mechanism: recursing first would silently produce the slower
+            # lowering, with a report that looked better (more swapped) for it.
+            # A candidate that is refused is named in `unfused` with the
+            # reason, and the walk then descends into it as before, so its
+            # Linears are still lowered as leaves.
+            fuse, why = _fusion_decision(path, child, predicate)
+            if fuse:
+                numel = sum(getattr(child, n).weight.numel() for n in GATED_MLP_CHILDREN)
+                parent.add_module(
+                    name, _NPUGatedMLP.from_torch(child, device, library, core=core)
+                )
+                swapped.append(path)
+                fused.append(path)
+                moved_parameters += numel
+                continue
+            if why is not None:
+                unfused.append((path, why))
             if isinstance(child, torch.nn.Linear):
                 if predicate is not None and not predicate(path, child):
                     skipped.append((path, "excluded by predicate"))
@@ -1848,6 +2403,11 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     # batch=1 only. The prompt-length shape is not knowable until there is a
     # prompt, and guessing one would compile an IR nothing uses.
     #
+    # With a dynamic row axis (docs/devices/NPUFUSE.md section 3) this same
+    # call compiles the `-1` IR instead, which serves the prompt length too --
+    # so where the device accepts it, these are the ONLY compiles, and
+    # `generate()` compiles nothing. `_compile_for` decides; nothing here does.
+    #
     # `eager=False` keeps the old lazy behaviour, for a caller who wants to
     # lower and inspect a model without paying minutes of compile.
     #
@@ -1878,9 +2438,36 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                 progress(index, total, path)
 
     total_parameters = sum(p.numel() for p in model.parameters())
+    shape_modes = {}
+    for leaf in leaves:
+        if leaf.shape_mode is not None:
+            shape_modes[leaf.shape_mode] = shape_modes.get(leaf.shape_mode, 0) + 1
     return model, {
         "device": device,
         "swapped": swapped,
+        # Gated-MLP subtrees lowered as one graph each (`_NPUGatedMLP`). Every
+        # entry is also in `swapped`.
+        "fused": fused,
+        # `(path, reason)` for modules shaped like a gated MLP that were NOT
+        # fused, with what is missing. Their Linears were still offered to the
+        # leaf path, so they may well be in `swapped`; this says why they are
+        # three compiled models instead of one.
+        "unfused": unfused,
+        # How many lowered modules compiled a dynamic row axis and how many fell
+        # back to a model per row count, as of the eager compiles. A lazy
+        # (eager=False) module that has not compiled yet is not counted.
+        "shape_modes": dict(sorted(shape_modes.items())),
+        # `(path, reason)` for every module whose dynamic compile the DEVICE
+        # refused -- OpenVINO's own refusal text, verbatim. Non-empty means
+        # generate() WILL recompile per prompt length on this device, and
+        # `to()` warns. (A runtime object that never offered a dynamic axis is
+        # counted in `shape_modes` and carries its reason on the module, but
+        # is not a device refusal and is not listed here.)
+        "shape_fallbacks": [
+            (p, leaf.shape_fallback_reason)
+            for p, leaf in zip(swapped, leaves)
+            if leaf.shape_fallback_refused
+        ],
         "left_on_cpu": dict(sorted(left.items())),
         # `(name, reason)`, the same shape `torchnative.quant.quantize_`'s
         # report uses. Predicate exclusions and oversized leaves both land
@@ -1929,12 +2516,21 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
 #: two would report coverage this module does not have. OpenVINO's opset is
 #: enormous; the archived library's own reflected op table is 61 entries
 #: (`backend/ops.py`, `get_supported_ops()`); what *this* file can emit is
-#: `MatMul` and `Add`, arranged as one Linear.
-SUPPORTED_MODULES = frozenset({"torch.nn.Linear"})
+#: `MatMul` and `Add` arranged as one Linear, and `MatMul`, `Swish` and
+#: `Multiply` arranged as one gated MLP.
+SUPPORTED_MODULES = frozenset({
+    "torch.nn.Linear",
+    # A subtree, matched by `_gated_mlp_refusal` (children by name, then the
+    # function by behaviour) rather than by class, so it is spelled as the
+    # pattern: transformers' LlamaMLP, Qwen2MLP, Qwen3MLP, MistralMLP, ...
+    "gated MLP: down_proj(silu(gate_proj(x)) * up_proj(x))",
+})
 
 
 def supported_ops() -> frozenset:
-    """OpenVINO ops this module can emit: `MatMul` and `Add`, as one Linear.
+    """OpenVINO ops this module can emit: `MatMul` and `Add` as one Linear
+    (`linear_ir`), and `MatMul`, `Swish` and `Multiply` as one gated MLP
+    (`mlp_ir`, docs/devices/NPUFUSE.md).
 
     There is no captured-graph lowering table here, and the withdrawn
     `compile_module` said so by name. This module reaches the device by *module
@@ -1944,7 +2540,7 @@ def supported_ops() -> frozenset:
     never written, the other because it was withdrawn --- and this function
     still answers honestly for what the emitters in this file can produce.
     """
-    return frozenset({"MatMul", "Add"})
+    return frozenset({"MatMul", "Add", "Swish", "Multiply"})
 
 
 # --------------------------------------------------------------------------

@@ -133,7 +133,8 @@ def _to_compiled(self, device, args, kwargs):
     **`openvino` (Intel NPU) is wired.** It goes to
     `torchnative.export.intelnpu._compile_model`, which walks `named_children()`
     and swaps each eligible `torch.nn.Linear` for a leaf whose forward runs on
-    the OpenVINO device. That call is **in place** and returns the same object,
+    the OpenVINO device, and each gated MLP for one fused graph
+    (docs/devices/NPUFUSE.md). That call is **in place** and returns the same object,
     so what comes back here is `self`: still an `nn.Module`, still with its
     `parameters()`, `state_dict()` and `named_children()`, so `generate()`
     keeps working and does not learn anything about the NPU. This module's
@@ -279,6 +280,7 @@ def _lower_for_openvino(model, device, resolution, **options):
     # this line is unreachable for a model that was not actually lowered.
     model.torchnative_offload = report
 
+    fused = report.get("fused", [])
     if not report["fully_offloaded"]:
         left = ", ".join(
             f"{name} x{count}" for name, count in report["left_on_cpu"].items()
@@ -286,7 +288,8 @@ def _lower_for_openvino(model, device, resolution, **options):
         skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
         warnings.warn(
             f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
-            f"{len(report['swapped'])} Linear(s) now run on the {resolution.unit}, "
+            f"{len(report['swapped'])} module(s) now run on the {resolution.unit} "
+            f"({len(fused)} of them fused gated MLPs, the rest Linears), "
             f"which is fraction_moved="
             f"{report['fraction_moved']:.4f} "
             f"({report['parameters_moved']} of {report['parameters_total']} "
@@ -296,6 +299,41 @@ def _lower_for_openvino(model, device, resolution, **options):
             f"This warning exists because docs/graph/NPU2.md is about a partial "
             f"offload that went unnoticed while every answer it produced was "
             f"right.",
+            UserWarning,
+            stacklevel=4,
+        )
+
+    # Two more things the caller must hear without asking, each silent only
+    # when there is nothing to say (docs/devices/NPUFUSE.md):
+    #
+    # * a module shaped like a gated MLP that was NOT fused. Its Linears are
+    #   still lowered, so the model is no less offloaded -- but it is three
+    #   compiled models and two host round trips where the caller may expect
+    #   one, and the reason (a GELU, a bias, ...) is the thing to fix.
+    # * a dynamic row axis the device refused. Every new prompt length then
+    #   compiles every module again inside generate(), which presents as a
+    #   hang and not as an error -- the exact placement problem the eager
+    #   compile above exists to move out of generate().
+    unfused = report.get("unfused", [])
+    if unfused:
+        named = "; ".join(f"{p}: {why}" for p, why in unfused[:4])
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): {len(unfused)} "
+            f"gated-MLP-shaped module(s) were not fused into one graph and run "
+            f"as separate Linears instead: {named}. The list is on "
+            f"`.torchnative_offload['unfused']`.",
+            UserWarning,
+            stacklevel=4,
+        )
+    fallbacks = report.get("shape_fallbacks", [])
+    if fallbacks:
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): the "
+            f"{resolution.unit} refused the dynamic row axis for "
+            f"{len(fallbacks)} of {len(report['swapped'])} module(s), so "
+            f"generate() will recompile them for every new prompt length. "
+            f"First refusal, {fallbacks[0][0]}: {fallbacks[0][1]}. The list is "
+            f"on `.torchnative_offload['shape_fallbacks']`.",
             UserWarning,
             stacklevel=4,
         )
