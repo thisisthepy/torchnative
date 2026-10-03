@@ -5,7 +5,7 @@ docs/numerics/INT8.md is the specification. Two claims, graded separately.
 **The fork builds anywhere.** `int8` needs `DType::I8`, which no released
 `candle-core` has, so `torchnative/rust/torch_c/Cargo.toml` patches candle. The first landing
 pointed `[patch.crates-io]` at an absolute path on one developer's machine, and
-the patch file carried in `vendor/` did not even apply -- the tree actually
+the patch file carried in `torchnative/rust/vendor/` did not even apply -- the tree actually
 built was a hand-fixed copy with Metal refusals the patch did not contain. The
 tests below hold down each link that failure broke: the patch path is relative
 and inside the repository; it is the same directory `scripts/vendor/vendor_candle.sh`
@@ -39,8 +39,8 @@ except ImportError:  # pragma: no cover
 _CRATE_DIR = os.path.abspath(os.path.join(str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file())), "torchnative", "rust", "torch_c"))
 _REPO_ROOT = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
 _SCRIPT = os.path.join(_REPO_ROOT, "scripts", "vendor", "vendor_candle.sh")
-_FORK = os.path.join(_REPO_ROOT, "vendor", "candle-core")
-_KERNELS_FORK = os.path.join(_REPO_ROOT, "vendor", "candle-metal-kernels")
+_FORK = os.path.join(_REPO_ROOT, "torchnative", "rust", "vendor", "candle-core")
+_KERNELS_FORK = os.path.join(_REPO_ROOT, "torchnative", "rust", "vendor", "candle-metal-kernels")
 
 
 # --------------------------------------------------------------------------

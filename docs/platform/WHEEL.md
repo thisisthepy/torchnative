@@ -906,7 +906,7 @@ dropped" 케이스가 **실제로 드롭이 있었는지와 무관하게** 통�
 
 **손대지 않은 것**
 
-- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
+- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `torchnative/rust/vendor/` — 한 줄도
 - `torchnative/rust/torch_c/build.rs` 와 `.cargo/config.toml` — §7.1 이 지적하는 것은 그 두 파일의
   **주석**이지 배선이 아니고, 소유 범위 밖이라 남겼습니다
 - `docs/devices/DEVICE.md` — §7.3.1 이 그 문서의 표를 정정해야 하지만 소유 범위 밖입니다
@@ -1149,7 +1149,7 @@ scripts/wheel/build.py: .../aarch64-apple-ios/release/lib_C.dylib is stale.
 
 **손대지 않은 것**
 
-- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
+- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `torchnative/rust/vendor/` — 한 줄도
 - 업로드. 아무것도 PyPI 에 올리지 않았습니다
 
 **검증** (전부 종료 코드로 판정)

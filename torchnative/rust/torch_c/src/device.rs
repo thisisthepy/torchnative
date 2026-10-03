@@ -1196,7 +1196,7 @@ fn mps_driver_allocated_memory() -> PyResult<u64> {
 /// `torch.mps.current_allocated_memory()` -- bytes of buffers in this crate's
 /// Metal allocator that a live storage (or an in-flight command) still holds:
 /// `MetalDevice::live_buffer_bytes`, a vendored addition to candle's backend
-/// (`vendor/int8-candle-0.11.0-cpu.patch`). It is a count of what this crate
+/// (`torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch`). It is a count of what this crate
 /// allocated, and it falls when the last reference to a storage goes, because
 /// the allocator's own "free" test is the one it applies.
 ///
@@ -1918,7 +1918,7 @@ mod cuda_tests {
 /// a `read_flat` one call deeper.
 ///
 /// The six numbers come from `candle_core::metal_backend::counters`, which is
-/// part of the vendored fork (`vendor/int8-candle-0.11.0-cpu.patch`) because
+/// part of the vendored fork (`torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch`) because
 /// there is nowhere else they can come from: the doors are inside candle's
 /// Metal backend, and anything counted on this side of the boundary would be
 /// counting this crate's *intent* rather than the GPU's work. Their exact
@@ -2003,7 +2003,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // shaders fine.
 //
 // **This build vendors a seventh** (2026-09-20, docs/devices/matrix.md §7.17):
-// `vendor/candle-metal-kernels` adds `i8` to those same macros. So the "six"
+// `torchnative/rust/vendor/candle-metal-kernels` adds `i8` to those same macros. So the "six"
 // above is the *upstream* count and `MPS_SUPPORTED_DTYPE_NAMES` below is the
 // *build* count, and they differ by `int8`. It also demonstrates the price of
 // closing this gap: 51 lines and no new shader body. `I16`/`I32` are the same

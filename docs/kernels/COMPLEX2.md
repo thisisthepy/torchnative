@@ -74,7 +74,7 @@ arm. **No `[patch]` was added and none should be.**
 > went red with it. The claim here is about a complex fork, so the marker now pins that the
 > fork carries none.
 
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/dtype.rs Complex absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/dtype.rs Complex absent -->
 
 ### 1.2 A pair, not interleaving — and the shape site that proves it
 

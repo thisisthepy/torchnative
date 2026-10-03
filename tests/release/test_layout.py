@@ -23,7 +23,7 @@ REPO = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "AGENTS.
 APPROVED_TRACKED = {
     "pyproject.toml", "setup.py", "README.md", "PROJECT.md",
     "AGENTS.md", "LICENSE", ".gitignore", ".github", "torchnative",
-    "tests", "docs", "scripts", "vendor",
+    "tests", "docs", "scripts",
 }
 APPROVED_IGNORED = {".caches", ".scratch", ".worktrees"}
 
