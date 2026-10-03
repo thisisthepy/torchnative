@@ -279,7 +279,7 @@ removed overloads.json's `floor` entry (cp backup), rebuilt, reinstalled:
   FAIL test_demand8_four_names_reach_their_kernels_through_the_vendored_tree:
   AssertionError: floor_fn: expected [1.0, -3.0, -1.0, 3.0], got
   'ERROR:NotImplementedError:... torch.floor(...) -- overload resolution has no table entry
-   for this op (rust/torch_c/src/overloads.json)'
+   for this op (crates/torch_c/src/overloads.json)'
   FAIL test_schema_text_survives_the_round_trip_through_the_transcribed_tables: 290
 ```
 
@@ -336,11 +336,11 @@ is the one that closed" — two different claims, and the first does not imply t
 ## 3. Gates
 
 ```text
-rust/torch_c/pytests/run.sh   391 ok, exit 0        (389 -> 391: +2 = the road test
+tests/run.sh   391 ok, exit 0        (389 -> 391: +2 = the road test
                                                      and the capture test)
 DOCWATCH                      PASS -- 362/362 evaluated marker(s) hold
                               (353 before this document's own 9 markers)
-tools/golden/compare.py       SUMMARY: 8681/8681 cases passed, 0 failed,
+tests/golden/compare.py       SUMMARY: 8681/8681 cases passed, 0 failed,
                               ops covered=207, pending case builders=0
 ```
 
@@ -360,8 +360,8 @@ no table entry), and `_EXPECTED_MUTABLE` gained exactly the two mutating names.
 <!-- DOCWATCH: op-implemented aten.floor_.default -->
 <!-- DOCWATCH: op-implemented aten.index_add_.default -->
 <!-- DOCWATCH: op-implemented aten.upsample_bicubic2d.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json floor present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json index_add_ present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs ndimension present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json floor present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json index_add_ present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs ndimension present -->
 <!-- DOCWATCH: count smoke_ok ge 391 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8681 -->

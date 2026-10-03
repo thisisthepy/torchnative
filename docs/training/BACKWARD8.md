@@ -346,12 +346,12 @@ eager_enabled()`, and a prefill under `torch.no_grad()` never reaches the first 
 ## 6. Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     422 ok, 0 FAIL
     DOCWATCH: PASS -- 417/417 evaluated marker(s) hold
     EXIT=0
 
-TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tools/golden/compare.py
+TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tests/golden/compare.py
     SUMMARY: 8681/8681 cases passed, 0 failed, ops covered=207, pending case builders=0
     EXIT=0
 ```
@@ -384,18 +384,18 @@ its *derivative*, which the golden harness does not count.
 | 5 | **Any per-dispatch cost.** | Nine agents were on the machine. §10 row 1 stands unchanged, and this round deliberately reports no time at all |
 | 6 | **A preallocated, slice-written KV cache.** | §2.1 measures the cache transformers actually ships. A cache that wrote in place would be §2.4's shape, and no such implementation was run |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs forgive_own_write present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs EAGER_MAX_NODES present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs release_values present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs eager_tape_bytes present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs batch_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_backward_uses_the_dropout_draw_the_forward_made present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs forgive_own_write present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs EAGER_MAX_NODES present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs release_values present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs eager_tape_bytes present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs batch_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_backward_uses_the_dropout_draw_the_forward_made present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated present -->
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
 <!-- DOCWATCH: count smoke_ok ge 415 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8681 -->

@@ -7,12 +7,12 @@ DEMAND1.md left it. This round closes ranks 2 (`aten.squeeze.default`), 3
 
 Method: same as DEMAND1.md — `transformers` 5.15.1, `torch` 2.13.0 upstream as the oracle,
 `torch/torch._C._linalg` reached through the vendored tree with
-`PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`, upstream through
+`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1`, upstream through
 `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`, `print("shim" if hasattr(torch._C,
 "_aten_implemented") else "upstream")` as the first line of every script. Build:
 `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-kern2`,
 `TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib`, `cargo build --release` in
-`rust/torch_c`, then `bash vendor/install_shim.sh`. Scratch scripts under `/tmp/` (not
+`crates/torch_c`, then `bash scripts/vendor/install_shim.sh`. Scratch scripts under `/tmp/` (not
 committed).
 
 ---
@@ -373,25 +373,25 @@ keys, `linalg_vector_norm.default` shares `norm_pow_walk`).
 Built via the instructed pipeline throughout:
 `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-kern2`,
 `TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib` exported before every run, `cargo build
---release` in `rust/torch_c`, `bash vendor/install_shim.sh` after.
+--release` in `crates/torch_c`, `bash scripts/vendor/install_shim.sh` after.
 
 ```
-$ PYTHON=$PY sh rust/torch_c/pytests/run.sh
+$ PYTHON=$PY sh tests/run.sh
 348 ok
 SELF-TEST: PASS -- 21 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 DOCWATCH: PASS -- 276/276 evaluated marker(s) hold
 
-$ $PY tools/golden/compare.py
+$ $PY tests/golden/compare.py
 SUMMARY: 8240/8240 cases passed, 0 failed, ops covered=189, pending case builders=1
 
-$ $PY tools/golden/compare.py --self-test
+$ $PY tests/golden/compare.py --self-test
 SELF-TEST: PASS -- 21 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 
-$ $PY rust/torch_c/pytests/verify_schemas.py
+$ $PY tests/verify_schemas.py
 SUMMARY: 4588/4588 table entries matched upstream, 0 failed
 ```
 
-Two pre-existing running-count assertions in `rust/torch_c/pytests/test_shim.py` needed updating
+Two pre-existing running-count assertions in `tests/test_shim.py` needed updating
 for this round's four new `_aten_implemented()` entries and two new `overloads.json` schema
 pairs, each with a comment explaining the movement in the file's own established style (matching
 every prior round's entries in the same two tests):
@@ -408,9 +408,9 @@ every prior round's entries in the same two tests):
 
 `git status --short` was checked before, during and after this round; nothing outside
 `docs/architectures/DEMAND.md`, `docs/architectures/DEMAND1.md` (one marker flip, §6 below), `docs/architectures/DEMAND2.md` (this file),
-`rust/torch_c/src/aten.rs`, `rust/torch_c/src/bootstrap.py`, `rust/torch_c/src/overloads.json`,
-`rust/torch_c/pytests/test_shim.py` and `tools/golden/cases.py` moved.
-`rust/torch_c/src/tensor.rs`, `dtype.rs`, `flash.rs`, `bootstrap.py`'s untouched regions, and the
+`crates/torch_c/src/aten.rs`, `crates/torch_c/src/bootstrap.py`, `crates/torch_c/src/overloads.json`,
+`tests/test_shim.py` and `tests/golden/cases.py` moved.
+`crates/torch_c/src/tensor.rs`, `dtype.rs`, `flash.rs`, `bootstrap.py`'s untouched regions, and the
 vendored tree were not modified (`tensor.rs` in particular — another agent's worktree was
 reported editing it concurrently; nothing in this round touched it).
 

@@ -13,7 +13,7 @@ question is settled none of the four can be estimated at all.
 answer is *not* the same shape as its answer.
 
 The assertions behind every claim here live in
-`rust/torch_c/pytests/test_tail2.py`, which is written to go red when any of
+`tests/test_tail2.py`, which is written to go red when any of
 this stops being true.
 
 ---
@@ -36,7 +36,7 @@ this stops being true.
 
 ## 1. The tag half is already done
 
-`rust/torch_c/src/dtype.rs` enumerates `Complex32`, `Complex64` and `Complex128`
+`crates/torch_c/src/dtype.rs` enumerates `Complex32`, `Complex64` and `Complex128`
 alongside every other name the vendored tree uses, with the three aliases
 (`chalf`, `cfloat`, `cdouble`), the `abbr` entries (`c32`/`c64`/`c128`), correct
 `itemsize` (2/8/16), and both directions of the real↔complex mapping:
@@ -57,7 +57,7 @@ and `torch/utils/_dtype_abbrs.py` build tables over `torch.complex64` while
 `import torch` is still running. A shim without these names cannot finish the
 import.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/dtype.rs Complex128 present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/dtype.rs Complex128 present -->
 
 ---
 
@@ -388,7 +388,7 @@ four of anything:
 |---|---|
 | feature added | **none** |
 | defect fixed | none |
-| tests added | `pytests/test_tail2.py`, 10 tests |
+| tests added | `tests/test_tail2.py`, 10 tests |
 | documentation | this file |
 | deleted | nothing |
 

@@ -45,16 +45,16 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 | Nullifications attempted / uncaught | **17 / 1** (§11) — and the uncaught one is the most useful finding here |
 | Walls remaining | 3 named, all on real architectures (§10) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs meta_has_no_bytes present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs pre_dispatch_mode present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs meta_has_no_bytes present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs pre_dispatch_mode present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11405 -->
 
@@ -65,12 +65,12 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 `docs/graph/EXPORT4.md` §1 lost its first hours to a worktree whose vendored tree had
 no `torch/__init__.py`, so every probe silently imported upstream torch 2.13.0
 and reported that export already worked. **The tree was unbuilt again at the
-start of this round** — `torchnative/src/main/torch/` held only `nn/` and a
-README — so the first action was `vendor/vendor_torch.sh` and
-`vendor/install_shim.sh`, and the first assertion after it was:
+start of this round** — `python/torch/` held only `nn/` and a
+README — so the first action was `scripts/vendor/vendor_torch.sh` and
+`scripts/vendor/install_shim.sh`, and the first assertion after it was:
 
 ```
-file        /Volumes/.../torchnative/src/main/torch/__init__.py
+file        /Volumes/.../python/torch/__init__.py
 aten_impl   True
 nops        302
 ```
@@ -434,7 +434,7 @@ reimplemented; that helper already encodes it and is called for exactly that
 reason. The pop/restore pair is `torch._ops`' own
 `_pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`. A failure to reach
 `torch._ops` is `None` and not an error, because the standalone `_C` that
-`tools/golden/loader.py` imports has no `torch` package around it.
+`tests/golden/loader.py` imports has no `torch` package around it.
 
 With that, the same module:
 
@@ -459,8 +459,8 @@ assertion that only checked "did it export" passed on the graph above.
 ## 7. The hand-off — `docs/graph/EXPORT.md` §8, paid
 
 Thirty-two `torch._C` names moved from
-`torchnative/src/main/torchnative/export/upstream.py` into
-`rust/torch_c/src/bootstrap.py`.
+`python/torchnative/export/upstream.py` into
+`crates/torch_c/src/bootstrap.py`.
 
 **Done as a separate step, after §2–§6 had landed and gated**, so a bisect
 across the two is possible; §12 says which gates covered which.
@@ -535,7 +535,7 @@ deleted those tests with it.
 
 ## 8. The three verdicts, never collapsed
 
-`rust/torch_c/pytests/export_sweep.py` keeps `exported` / `replayed` / `agreed`
+`tests/export_sweep.py` keeps `exported` / `replayed` / `agreed`
 apart and headlines the third. So does `test_export5.py`, as three separate
 tests plus a fourth for the empty-graph case §6 made necessary.
 
@@ -816,7 +816,7 @@ weakening hides.
 | **feature added** | the meta storage handle (§2); `is_contiguous(memory_format=)` (§3); nine backend flag pairs, `_dispatch_key_set`, `_functionality_to_backend_keys` (§4); `aten.zeros_like` on meta (§4); `_set_conj`/`_set_neg`, `grad_dtype`, `_has_symbolic_sizes_strides`, `_dispatch_tls_set_dispatch_key_included` (§5.1); **the pre-dispatch stage of the dispatcher door** (§6) |
 | **defect fixed** | **3** — `_PreserveDispatchKeyGuard` restoring nothing (§5); `to(memory_format=)` silently dropping the request (§3.1); `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11.2) |
 | **moved** | 32 census names, staging module → `bootstrap.py` (§7). No behaviour change intended; the functions are byte-identical apart from one dropped dead parameter |
-| **tests added** | **21**, in `rust/torch_c/pytests/test_export5.py` |
+| **tests added** | **21**, in `tests/test_export5.py` |
 | **tests rewritten** | 3 (§13) |
 | **measurement** | the three verdicts with a derived tolerance (§8); the 40-architecture sweep, both sides (§10); the wall sequence (§10); 17 nullifications (§11) |
 | **documentation corrected** | `docs/graph/EXPORT.md` §3.3 (wall 8 closed); `docs/graph/EXPORT4.md` §3 and §7 (the four claims, and the wall) |

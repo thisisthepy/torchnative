@@ -70,7 +70,7 @@ non-contiguous meta tensor to a dense-device `zeros_like`.  §3.
 
 `torch/_meta_registrations.py::_constant_pad_nd_meta`, confirmed against a
 separate upstream subprocess over **182 layout x pad cases, 180 answered**
-(`pytests/test_canine.py::test_constant_pad_nd_meta_layout_agrees_with_upstream`).
+(`tests/test_canine.py::test_constant_pad_nd_meta_layout_agrees_with_upstream`).
 Strides are integers, so the comparison is exact and there is no tolerance
 here to widen.
 
@@ -268,7 +268,7 @@ for `constant_pad_nd` -- it named the input's layout when the op had no meta arm
 at any layout -- but the refusal itself was correct and the gate is behaving as
 `STRIDE.md` §3 designed it to.  It is not counted as a defect.
 
-**Tests added**: 4, all in `rust/torch_c/pytests/test_canine.py`, each comparing
+**Tests added**: 4, all in `tests/test_canine.py`, each comparing
 against upstream torch's own answer in a second subprocess.
 
 **Tests corrected**: none.
@@ -290,9 +290,9 @@ meta support is a property of an op already on the list and the golden harness
 compares values, which a meta tensor has none of (`docs/devices/META.md` §7).
 Op coverage is unchanged, which is why the gate's `ops=` count does not move.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs strides_like_channels_last present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs strides_like_channels_last present -->
 <!-- DOCWATCH: op-implemented aten.constant_pad_nd.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_canine.py test_constant_pad_nd_meta_layout_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_canine.py test_constant_pad_nd_meta_negative_pad_preserves_where_positive_pad_contiguates present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_canine.py test_constant_pad_nd_meta_keeps_a_channels_last_input_channels_last present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_canine.py test_padding_a_noncontiguous_tensor_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/test_canine.py test_constant_pad_nd_meta_layout_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_canine.py test_constant_pad_nd_meta_negative_pad_preserves_where_positive_pad_contiguates present -->
+<!-- DOCWATCH: symbol-in-file tests/test_canine.py test_constant_pad_nd_meta_keeps_a_channels_last_input_channels_last present -->
+<!-- DOCWATCH: symbol-in-file tests/test_canine.py test_padding_a_noncontiguous_tensor_exports_replays_and_agrees present -->

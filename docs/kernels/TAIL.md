@@ -1,15 +1,15 @@
 # 꼬리 다섯 개 — 골든 케이스는 붙었고, 붙이는 과정에서 커널 버그 두 종류를 찾았다
 
 앞선 세션이 `aten.baddbmm.default` · `aten.split_with_sizes.default` · `aten._safe_softmax.default` ·
-`aten.add_.Tensor` · `aten.mul.Scalar` 다섯 개를 `rust/torch_c/src/aten.rs` 에 구현하고 커밋
+`aten.add_.Tensor` · `aten.mul.Scalar` 다섯 개를 `crates/torch_c/src/aten.rs` 에 구현하고 커밋
 (`9612146`)까지 마친 뒤 인터럽트로 죽었다. 다섯 다 빌드는 깨끗했고 `_aten_implemented()` 에도
-이미 올라 있었지만, `tools/golden/cases.py` 에 케이스 빌더가 하나도 없어 `compare.py` 가 다섯
+이미 올라 있었지만, `tests/golden/cases.py` 에 케이스 빌더가 하나도 없어 `compare.py` 가 다섯
 전부를 `<no case builder registered>` 로 하드 실패시키고 있었다. 이 문서는 그 다섯 개의 케이스
 빌더를 채운 기록이다.
 
 **결론 먼저.** 다섯 다 채웠고, 골든은 **2257/2258** 이다 (1 개는 의도적으로 빨갛게 남겨둔 것 — 아래
 §2 참고). 케이스를 쓰면서 커널의 자기 자신 doc comment 를 다시 재봤고, doc comment 가 주장하는
-것과 실제 torch 2.13.0 의 동작이 다른 지점을 세 군데 찾았다. **`rust/torch_c/src/aten.rs` 는 건드리지
+것과 실제 torch 2.13.0 의 동작이 다른 지점을 세 군데 찾았다. **`crates/torch_c/src/aten.rs` 는 건드리지
 않았다** — 작업 범위 밖이고, 지시가 명시적으로 "고치지 말고 보고" 였다.
 
 ---
@@ -24,9 +24,9 @@
 | `--inject-fault value` | — | 2247/2258 (11개 CAUGHT) | `1` (문서화된 동작 — §4) |
 | `--inject-fault shape` | — | 2247/2258 (11개 CAUGHT) | `1` |
 | `--inject-fault dtype` | — | 2247/2258 (11개 CAUGHT) | `1` |
-| `--self-test` (`pytests/run.sh`) | — | 11 comparators × 11 fault modes, 0 problem, 0 미가동 | `0` |
+| `--self-test` (`tests/run.sh`) | — | 11 comparators × 11 fault modes, 0 problem, 0 미가동 | `0` |
 | 스키마 (`verify_schemas.py`) | — | 204/204 (overloads 93/93, methods 111/111) | `0` |
-| 호스트 빌드 + 실제 임포트 | — | 통과 (`pytests/run.sh` 자체가 이걸 포함) | `0` |
+| 호스트 빌드 + 실제 임포트 | — | 통과 (`tests/run.sh` 자체가 이걸 포함) | `0` |
 | Android (`cargo ndk`) | — | 통과 | `0` |
 | iOS (`aarch64-apple-ios`) | — | 통과, `@rpath/Python.framework/Python` 링크 확인 | `0` |
 | falcon/bloom/gpt_bigcode 미구현 (재측정) | — | **0 / 0 / 0** (§5) | — |
@@ -39,7 +39,7 @@
 
 ## 1. 다섯 개의 케이스 빌더 — 무엇을 어떻게 쟀는지
 
-전부 `tools/golden/cases.py` 에 있다. 커널의 doc comment 를 출발점으로 삼되, **doc comment 를
+전부 `tests/golden/cases.py` 에 있다. 커널의 doc comment 를 출발점으로 삼되, **doc comment 를
 그대로 베끼지 않고 하나씩 상류 torch 2.13.0 (`/Volumes/macMini/caches/spike-venv/bin/python`)
 으로 재확인**한 뒤 케이스를 썼다 — 이 모듈 자체의 규칙(`_pair` 위의 note)이 그렇게 하라고 되어
 있다.
@@ -110,7 +110,7 @@
 
 ## 2. 커널이 틀린 곳 — 고치지 않고 보고만 한다
 
-지시대로 `rust/torch_c/src/aten.rs` 는 건드리지 않았다. 아래 셋은 케이스 작성 중 상류와 대조하다
+지시대로 `crates/torch_c/src/aten.rs` 는 건드리지 않았다. 아래 셋은 케이스 작성 중 상류와 대조하다
 찾은, doc comment 의 주장과 실제 동작이 갈리는 지점이다.
 
 ### 2.1 `baddbmm` 의 `alpha=0` 은 `addmm` 의 quick return 이 아니다 — 골든에 빨간 케이스로 pin
@@ -134,7 +134,7 @@ m2, alpha=0)`) 은 실제로 깨끗한 0 을 준다 — 그건 `addmm_cases` 가
 `0 * inf = nan` 을 계산한다. 커널의 Rust 코드는 `!alpha_zero` 분기로 곱셈 자체를 건너뛰므로
 (`addmm_scale` 의 규칙을 그대로 재사용), 상류가 NaN 을 주는 자리에서 깨끗한 0 을 준다.
 
-`tools/golden/cases.py::baddbmm_cases` 에 이 케이스를 **`expect="match"` 로 그대로 남겨뒀다** —
+`tests/golden/cases.py::baddbmm_cases` 에 이 케이스를 **`expect="match"` 로 그대로 남겨뒀다** —
 `c_error`/`torch_error` 어느 쪽도 맞지 않는다 (양쪽 다 *성공*하고, 값만 다르다). `_FULL_FILLS`
 모듈이 이미 세운 선례와 같은 방식: 실제 버그를 담은 **살아있는 회귀 트랩**으로 남겨서, 커널이
 고쳐질 때까지 골든이 계속 빨갛게 이 사실을 말하게 했다. 케이스 이름에
@@ -223,7 +223,7 @@ comment 가 "bmm 의 랭크 체크를 그대로 재사용한다"고 적은 것�
 
 `value`/`shape`/`dtype` 세 모드 다 `exit=1` 이고 `2247/2258` 통과, `11` 실패다. `compare.py` 의
 안내 문구 그대로: *"exit code stays 1 whenever any fault was CAUGHT ... Use --self-test for the
-pass/fail gate."* 게이트는 `pytests/run.sh` (자기검사 포함) 이고 그건 `exit=0` 이다.
+pass/fail gate."* 게이트는 `tests/run.sh` (자기검사 포함) 이고 그건 `exit=0` 이다.
 
 ---
 
@@ -354,7 +354,7 @@ aten.mul.Scalar: torch.bool operands are logical, not arithmetic, in torch
 사유를 문자열로 단언한다 — `.Scalar` 메시지에 `"logical"` 이 다시 나타나면 실패하고,
 `div.Tensor` 메시지가 "상류도 거부한다" 로 돌아가도 실패한다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason present -->
 <!-- DOCWATCH: op-implemented aten.add.Scalar -->
 <!-- DOCWATCH: op-implemented aten.sub.Scalar -->
 

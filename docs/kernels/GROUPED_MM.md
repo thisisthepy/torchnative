@@ -14,7 +14,7 @@ were found.
 
 ## 1. The schema, from the vendored tree
 
-`torchnative/src/main/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
+`python/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
 
 ```yaml
 - func: _grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor
@@ -433,7 +433,7 @@ it; it only means a seeded shim run cannot be set up the obvious way.
 |---|---|---|---|
 | Golden cases | 2843 / 2843 | 2918 / 2918 | **2971 / 2971**, 0 failed |
 | Ops covered by the golden suite | 119 | 121 | **121** (no new op — these are name bindings) |
-| Smoke tests (`pytests/run.sh`) | 211 | 220 | **223** |
+| Smoke tests (`tests/run.sh`) | 211 | 220 | **223** |
 | Schema table entries vs upstream | 4203 / 4203 | 4217 / 4217 | **4231 / 4231** |
 | Golden `--self-test` comparators | 12 | 12 | **13** |
 | Mixtral, operator sweep | 1 missing | **0 missing** | 0 missing |

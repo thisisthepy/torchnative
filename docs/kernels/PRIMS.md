@@ -41,7 +41,7 @@ docs/graph/DECOMP.md §12.4 가 "NNAPI 를 막는 것은 분해 24 개가 아니
 
 ## 2. 열린 것 — 상류의 분해가 끝까지 돕니다
 
-`rust/torch_c/pytests/nnapi_sizing.py`, 같은 세 그래프:
+`tests/nnapi_sizing.py`, 같은 세 그래프:
 
 | | 이전 (docs/graph/DECOMP.md §12.5) | 지금 |
 |---|---|---|
@@ -94,7 +94,7 @@ TorchScript 노드 종류(`aten::add`)로 키가 잡혀 있으므로, `prims.*` 
   — `getattr(torch.ops, namespace)` 로 바꿈
 - `test_every_implemented_op_has_schema_text` — `startswith("aten::")` 를 키가 나르는
   네임스페이스로 바꿈
-- `tools/golden/reach.py` — `aten` 밖 키의 스펠링은 `torch.ops.<ns>.<op>.<overload>` 입니다
+- `tests/golden/reach.py` — `aten` 밖 키의 스펠링은 `torch.ops.<ns>.<op>.<overload>` 입니다
   (`torch.broadcast_in_dim` 은 없고, 있어서도 안 됩니다). 면제가 아니라 shape 3 과 같은 코퍼스
   검사로 넣었으므로, 아무 테스트도 부르지 않는 prims 커널은 여전히 여기서 빨개집니다.
   `test_the_thirteen_prims_ops_are_callable_by_their_own_key` 가 열세 개를 전부 그 이름으로

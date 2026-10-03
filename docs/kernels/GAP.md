@@ -1,11 +1,11 @@
 # 60개 구현 vs 실사용 op — 갭 측정
 
-> **Superseded by current codebase (`rust/torch_c/src/aten.rs`).** The counts in this document reflect
+> **Superseded by current codebase (`crates/torch_c/src/aten.rs`).** The counts in this document reflect
 > an early snapshot (60 implemented ops, 8 missing for greedy Llama). Current `aten.rs` contains
 > 304 ops in `IMPLEMENTED` (plus 15 in `IMPLEMENTED_AWAITING_GOLDEN`, total 319 ops), and all 8 operators
 > listed in §3 as missing for greedy Llama (`_scaled_dot_product_flash_attention_for_cpu.default`,
 > `_unsafe_view.default`, `alias.default`, `bmm.default`, `neg.default`, `rsub.Scalar`, `silu.default`,
-> `t.default`) have since been implemented. Refer to `rust/torch_c/src/aten.rs` as the source of truth.
+> `t.default`) have since been implemented. Refer to `crates/torch_c/src/aten.rs` as the source of truth.
 
 `fac5702` 로 `_aten_implemented()` 가 60개가 됐습니다. `docs/design/CORE_ATEN.md` §2 가 예전에 잰
 "소형 Llama 가 부르는 op" 48개와 정확히 대조하고, `do_sample=True` 경로와 다른 아키텍처(GPT-2)로
@@ -18,7 +18,7 @@
 
 ## 0. 측정 방법과 그 신뢰도
 
-- **구현 목록 (60):** `rust/torch_c/src/aten.rs` 의 `IMPLEMENTED` 상수를 소스에서 직접 파싱.
+- **구현 목록 (60):** `crates/torch_c/src/aten.rs` 의 `IMPLEMENTED` 상수를 소스에서 직접 파싱.
   빌드하지 않았습니다 — 다른 두 에이전트가 같은 크레이트를 빌드 중이라는 지시를 따라 정적 소스만
   읽었습니다. `_aten_implemented()` 는 이 상수를 그대로 반환하는 함수(`aten.rs:270`)이므로 소스
   파싱 = 런타임 값입니다.
@@ -36,9 +36,9 @@
 **중요한 구조적 발견 — 분해 테이블은 eager 실행에 적용되지 않습니다.**
 
 > **정정 (조율 세션).** 이 절의 결론은 맞지만 **근거가 틀려서 아래로 대체합니다.** 초안은
-> "`torch/_decomp` 가 벤더링되어 있지 않다"고 했는데, `torchnative/src/main/torch/_decomp/` 는 560K 로
-> **벤더링되어 있고** `decompositions.py` 도 있습니다 — `rust/torch_c/src/lib.rs:4` 가 명시적으로
-> 그렇게 적고 있습니다. 초안이 확인한 `torchnative/src/main/torch/` 는 이 저장소에 없는 경로입니다.
+> "`torch/_decomp` 가 벤더링되어 있지 않다"고 했는데, `python/torch/_decomp/` 는 560K 로
+> **벤더링되어 있고** `decompositions.py` 도 있습니다 — `crates/torch_c/src/lib.rs:4` 가 명시적으로
+> 그렇게 적고 있습니다. 초안이 확인한 `python/torch/` 는 이 저장소에 없는 경로입니다.
 
 진짜 이유는 벤더링 여부가 아니라 **분해가 적용되는 시점**입니다. 분해표는 추적·컴파일
 (`torch.compile` / `export`) 시점의 그래프 변환이지, eager 디스패치의 폴백이 아닙니다.

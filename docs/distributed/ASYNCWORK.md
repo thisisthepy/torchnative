@@ -123,7 +123,7 @@ upstream does not offer.
 
 ## 6. The tests, and what each one can fail on
 
-`rust/torch_c/pytests/test_asyncwork.py`, at world 3 and 4, against three real
+`tests/test_asyncwork.py`, at world 3 and 4, against three real
 process groups per size — the shim, gloo in float32, gloo in float64. The
 tolerance is `docs/numerics/AGREE.md` §2's method, read off upstream's own
 float32-vs-float64 error on the same collective, exact for integer dtypes; the
@@ -236,7 +236,7 @@ would have contradicted it.
 
 ```sh
 PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
-    bash rust/torch_c/pytests/run.sh
+    bash tests/run.sh
 ```
 
 Every group runs in real `subprocess.Popen`s on an **ephemeral port bound and
@@ -247,22 +247,22 @@ on the way in and the gloo workers assert its absence, and
 `test_every_rank_really_ran_the_shim_and_the_oracle_really_ran_upstream` checks
 the same fact from outside.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py AsyncWork present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _tree_clone present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _tree_copy present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _drain_async present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _async_queue present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _async_shutdown present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _ASYNC_COLLECTIVES present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _make_async_collective present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_is_completed_is_false_before_wait_for_a_collective_that_has_not_finished present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_wait_is_required_because_the_buffer_before_it_holds_the_input present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_two_overlapping_collectives_do_not_corrupt_each_other present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_wait_on_an_already_completed_handle_is_a_no_op_and_not_an_error present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_the_async_answer_is_the_synchronous_answer_and_both_are_upstreams present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_an_abandoned_handle_does_not_wedge_or_corrupt_the_next_collective present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_asynchrony_is_not_a_property_of_allreduce_alone present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_asyncwork.py test_integer_collectives_are_exact_through_the_async_path present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _require_sum absent -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py AsyncWork present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _tree_clone present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _tree_copy present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _drain_async present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _async_queue present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _async_shutdown present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _ASYNC_COLLECTIVES present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _make_async_collective present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_is_completed_is_false_before_wait_for_a_collective_that_has_not_finished present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_wait_is_required_because_the_buffer_before_it_holds_the_input present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_two_overlapping_collectives_do_not_corrupt_each_other present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_wait_on_an_already_completed_handle_is_a_no_op_and_not_an_error present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_the_async_answer_is_the_synchronous_answer_and_both_are_upstreams present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_an_abandoned_handle_does_not_wedge_or_corrupt_the_next_collective present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_asynchrony_is_not_a_property_of_allreduce_alone present -->
+<!-- DOCWATCH: symbol-in-file tests/test_asyncwork.py test_integer_collectives_are_exact_through_the_async_path present -->
+<!-- DOCWATCH: symbol-in-file tests/test_collect2.py test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _require_sum absent -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->

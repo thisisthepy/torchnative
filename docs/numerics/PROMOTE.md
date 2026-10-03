@@ -31,7 +31,7 @@ The following operations raise the `dtype promotion not implemented in torch._C 
 The list above was inherited. It was re-derived two ways.
 
 **Statically**, by grepping the message. It is emitted from seven places in
-`rust/torch_c/src/aten.rs`, not eighteen -- most sites share a helper:
+`crates/torch_c/src/aten.rs`, not eighteen -- most sites share a helper:
 
 | line | emitter | serves |
 |---|---|---|

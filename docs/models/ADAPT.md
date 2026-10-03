@@ -38,8 +38,8 @@ Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                302 ok, 0 FAIL, DOCWATCH 159/159    exit 0
-tools/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
+tests/run.sh                302 ok, 0 FAIL, DOCWATCH 159/159    exit 0
+tests/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
 compare.py --self-test        19 comparators x 11 fault modes     exit 0
 verify_schemas.py             4475/4475                           exit 0
 sweep26   (shim, .eval())     26/26                               exit 0
@@ -108,8 +108,8 @@ make *that* refusal stale (§2.2, §8.3).
 > the call rather than about the world — an unrecorded delta has nothing to
 > send, and an uninitialised process group has nobody to send to.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py publish present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py ProcessGroupLocal present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py publish present -->
 
 ---
 
@@ -133,7 +133,7 @@ class Tent(GradientMethod):                # stage = STAGE_NARROW_BACKWARD, DESI
 (Since SPEC S6.5 the stage is a type: `GradientMethod` and `Tent` live in
 `torchnative/adapt/gradient.py`, `adapt.Tent` still resolves to them, and a
 build configured with `TORCHNATIVE_BACKWARD=off` refuses that module at
-import. `rust/torch_c/pytests/test_stagetype.py` holds it.)
+import. `tests/test_stagetype.py` holds it.)
 
 That is the whole of `Tent` apart from docstrings — 40 lines, no state, no
 `reset()`, no base copy, no serialisation. The second method inherits all of
@@ -187,10 +187,10 @@ have described a capability nothing here has. A refusal naming a runnable check
 is the honest shape until it stops refusing — which is what happened to the row
 above it.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py Delta present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py revert_by_subtraction present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/gradient.py Tent present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py Delta present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py revert_by_subtraction present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/adapt/gradient.py Tent present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
 
 ### 2.3 What `Tent.select` picks, and why by class name
 
@@ -522,7 +522,7 @@ Passing `use_cache=False` to a `transformers` forward used to reach a
 
 ```
 not implemented in torch._C shim: torch.diff(...) -- overload resolution has no
-table entry for this op (rust/torch_c/src/overloads.json)
+table entry for this op (crates/torch_c/src/overloads.json)
 ```
 
 So an adaptation step ran on the default cache path, which is what
@@ -539,7 +539,7 @@ called, and it was a table entry rather than a kernel.
 > `docs/architectures/ARCH100.md` later measured across the whole tail, where names outnumber
 > kernels 49 to 22.
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json diff present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json diff present -->
 
 ### 8.3 A delta cannot be written down — **closed, and the wall was misread**
 
@@ -621,7 +621,7 @@ nothing in this document's tests is entitled to claim it.
 ### 9.1 What this suite still cannot see
 
 * **It runs on a 24-token toy, not on SmolLM2.** The real-checkpoint numbers in
-  §3–§6 are measurements in this document, not tests in `pytests/`, for the
+  §3–§6 are measurements in this document, not tests in `tests/`, for the
   reason `docs/training/BACKWARD.md` §7.1 gives — the suite does not download a
   checkpoint. So §6's 1.512e-06 can move without anything going red.
 * **One method.** The claim that `Delta` generalises across methods is
@@ -653,9 +653,9 @@ nothing in this document's tests is entitled to claim it.
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 302 ok, 0 FAIL | **310 ok, 0 FAIL** |
+| `tests/run.sh` | 302 ok, 0 FAIL | **310 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 159/159 | **173/173** (14 new markers, all in this document) |
-| `tools/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
 | `compare.py --self-test` | 19 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4475/4475 | **4475/4475** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -663,7 +663,7 @@ nothing in this document's tests is entitled to claim it.
 | prefill sha256, f32 × 5 and bf16 × 4 | — | **9/9 unchanged, and 9/9 equal through the wrapper** (§7) |
 
 `ops=166` is unchanged **on purpose**: nothing in this round touched
-`rust/torch_c/src/`, and the whole of `torchnative.adapt` and
+`crates/torch_c/src/`, and the whole of `torchnative.adapt` and
 `torchnative.delta` is Python over the capture and tape surfaces
 `docs/training/BACKWARD.md` built. A change in that number would have meant an
 adaptation API had needed a kernel, which would have been news.
@@ -675,9 +675,9 @@ adaptation API had needed a kernel, which would have been news.
 > that — only that it did not go **down**. A marker asserting equality on a number other work
 > legitimately moves fails on somebody else's commit, which is the crying-wolf failure
 > `docs/verification/DOCWATCH.md` warns about, arriving in a marker rather than in the checker.
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
 
 ### 11.1 The eight new tests
 
@@ -707,9 +707,9 @@ two cannot drift apart; the step is the only thing that differs.
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-adapt
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"    # VENDOR.md wall 3
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"    # VENDOR.md wall 3
 
 # §3, §5, §6  Tent on SmolLM2: upstream writes, the shim loads and compares
 $PY   /tmp/adapt/tent_up.py   1e-3 10 t1
@@ -731,9 +731,9 @@ $SHIM /tmp/adapt/seqlen_adapt.py f32  ;  $SHIM /tmp/adapt/seqlen_adapt.py bf16
 $PY /tmp/adapt/sab.py            # or /tmp/adapt/sab.py S12 S13 for one
 
 # §11  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/adapt/ev1  ;  $SHIM /tmp/train/sweeptrain.py /tmp/adapt/tr1
 ```
 
@@ -751,7 +751,7 @@ architectures §8.1 named, adapting.
 
 §8.1 and `docs/training/BACKWARD.md` §8 both describe this as **one arm in `tape.rs`**.
 That description was never checked against the models it was about — it was
-inferred from a four-line toy `nn.LayerNorm` module in `pytests/`. Running
+inferred from a four-line toy `nn.LayerNorm` module in `tests/`. Running
 `trace.differentiable()` on the real checkpoints, *before* writing anything:
 
 | | nodes | on a gradient path | missing rules |
@@ -885,8 +885,8 @@ both sides, so the two processes see identical bytes with no shared RNG.
 | 8.4 `Tensor.backward()` | refuses | unchanged |
 | — | — | **new:** `BertForMaskedLM` cannot load (§13.4) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
 
 ### 13.6 Every command in §13
 
@@ -907,9 +907,9 @@ $SHIM /tmp/rules/ln_shim.py bert 5e-2 10 anti
 
 | gate | §11 | now |
 |---|---|---|
-| `pytests/run.sh` | 310 ok | **317 ok, 0 FAIL** |
+| `tests/run.sh` | 310 ok | **317 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 173/173 | **190/190** |
-| `tools/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 19 × 11 | **20 comparators × 11 fault modes** |
 | `verify_schemas.py` | 4475/4475 | **4479/4479** |
 | sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
@@ -1065,9 +1065,9 @@ today, and those are different claims.*
 
 | gate | §13.7 | now |
 |---|---|---|
-| `pytests/run.sh` | 317 ok | **325 ok, 0 FAIL** |
+| `tests/run.sh` | 317 ok | **325 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 190/190 | **210/210** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **unchanged** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **unchanged** |
 | `compare.py --self-test` | 20 × 11 | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |
@@ -1080,9 +1080,9 @@ open item, L5, which had no oracle then and has one now (`docs/training/BACKWARD
 section named is closed; the oracle that closed it immediately found a second one, in
 `grad_weight`/`grad_bias` at mixed precision, and that is named in §18.7 rather than fixed.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 
 ### 14.6 Every command in §14

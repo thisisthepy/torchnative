@@ -34,7 +34,7 @@ walls above untouched. §4 sizes both. §6 says what to do.
 
 Measured 2026-09-06, `darwin/arm64`, CPython 3.13, `work/export`.
 Reproduction in §7. Gates unmoved: suite **602 ok** (587 + the 15 new tests in
-`rust/torch_c/pytests/test_export.py`), `DOCWATCH: PASS`, golden **9691/9691
+`tests/test_export.py`), `DOCWATCH: PASS`, golden **9691/9691
 ops=255** — no Rust changed.
 
 ---
@@ -58,7 +58,8 @@ ops=255** — no Rust changed.
 
 ## 1. The census reproduces exactly
 
-`tools/spike/export_depth3.py`, unmodified, on this tree:
+`tools/spike/export_depth3.py` (deleted in #43; tag `archive/pre-restructure` keeps it,
+docs/graph/COMPILE.md says how to restore it), unmodified, on this tree:
 
 ```
  0  torch._C._unset_dispatch_mode                    12  TensorBase.is_inference
@@ -84,15 +85,15 @@ replaced by behaviour.**
 
 ## 2. The re-derived census
 
-`torchnative/src/main/torchnative/export/upstream.py` implements them. It is a
+`python/torchnative/export/upstream.py` implements them. It is a
 **staging area, not the final home** — every function in it belongs in
-`rust/torch_c/src/bootstrap.py` beside `_install_dispatch_keys`, and §8 carries
+`crates/torch_c/src/bootstrap.py` beside `_install_dispatch_keys`, and §8 carries
 the hand-off. It monkey-patches at runtime only because it runs after
 `import torch`.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/upstream.py install present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/upstream.py installed_names present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/upstream.py _is_definitely_a_view present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py install present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py installed_names present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py _is_definitely_a_view present -->
 
 ### 2.1 All 18 are real; round 19 was the artefact
 
@@ -210,7 +211,7 @@ contiguously — `x.view(12)`, `x[:]`, `x.reshape(3,4)` on a contiguous `x` — 
 indistinguishable from its base under every signal this shim exposes. Upstream
 answers `True` there because `TensorImpl` carries a base pointer;
 `PyTensorBase` does not. That is one wrong answer, it is in
-`rust/torch_c/src/tensor.rs`, and it is recorded here rather than papered over.
+`crates/torch_c/src/tensor.rs`, and it is recorded here rather than papered over.
 
 `_base` **refuses by name** when `_is_view()` said `True`. There is no base
 object to return, and `None` there means "not a view" to the caller —
@@ -251,7 +252,7 @@ Past the 29, in order:
 
 ```
 NotImplementedError: not implemented in torch._C shim: torch.empty_strided(...) --
-overload resolution has no table entry for this op (rust/torch_c/src/overloads.json)
+overload resolution has no table entry for this op (crates/torch_c/src/overloads.json)
 ```
 
 `overloads.json` has `empty` and `empty_like` and no `empty_strided`; `aten.rs`
@@ -379,14 +380,14 @@ an `ExportedProgram`. It would print. It would serialise. That is precisely the
 half-working graph this round was told to watch for, and it is one plausible,
 well-intentioned commit away.
 
-`rust/torch_c/pytests/test_export.py::test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted`
+`tests/test_export.py::test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted`
 is that guard, and it is written so closing either half makes it demand the
 other rather than going quiet.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export.py test_capture_is_the_only_working_front_end_and_records_the_module_it_ran present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export.py test_the_dispatch_mode_stack_counts_instead_of_answering_zero present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export.py test_base_refuses_for_a_detected_view_rather_than_answering_none present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export.py test_capture_is_the_only_working_front_end_and_records_the_module_it_ran present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export.py test_the_dispatch_mode_stack_counts_instead_of_answering_zero present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export.py test_base_refuses_for_a_detected_view_rather_than_answering_none present -->
 
 ### 4.3 None of it is abi3
 
@@ -447,7 +448,7 @@ being able to produce a plausible-looking wrong answer.
    mode stack *before* `aten_dispatch_inner`, and return the mode's result. This
    is the only item that is a design change rather than a fill, it is the one
    that makes every later item mean something, and until it lands **nothing
-   should make a graph front end reachable**. `rust/torch_c/src/aten.rs`.
+   should make a graph front end reachable**. `crates/torch_c/src/aten.rs`.
 2. **`_NodeBase`.** 12 members and 4 methods, plus `_fx_map_arg` /
    `_fx_map_aggregate` / `_NodeIter`. Mechanical, testable in isolation
    (`torch.fx.Graph()` either builds or it does not), and worth having on its own
@@ -472,15 +473,15 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-export
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd rust/torch_c && cargo build --release && cd ../..
-bash vendor/install_shim.sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 602 ok, DOCWATCH: PASS
+cd crates/torch_c && cargo build --release && cd ../..
+bash scripts/vendor/install_shim.sh
+PYTHON=$PY sh tests/run.sh          # 602 ok, DOCWATCH: PASS
 
 # COMPILE.md's census, unmodified
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY tools/spike/export_depth3.py
+PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY tools/spike/export_depth3.py
 
 # §4.1 in four lines
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c '
+PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
 import torch, torch.fx; torch.fx.Graph()'
 
 # §4.2 side by side -- the same script against the shim and against upstream
@@ -498,19 +499,19 @@ with Log():
     (torch.ones(3) * 2 + 1).relu()
 print("SEEN:", seen)
 PY
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY /tmp/mode_probe.py
+PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY /tmp/mode_probe.py
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY /tmp/mode_probe.py
 ```
 
 `test_export.py` runs its own subprocess with the vendored tree on
-`PYTHONPATH`, so it needs `vendor/install_shim.sh` to have run — the same silent
+`PYTHONPATH`, so it needs `scripts/vendor/install_shim.sh` to have run — the same silent
 skip as the decompose-road tests, for the same reason.
 
 ---
 
 ## 8. Hand-off: the `bootstrap.py` patch
 
-`torchnative/src/main/torchnative/export/upstream.py` is where this work lives
+`python/torchnative/export/upstream.py` is where this work lives
 today and it is the wrong place. It monkey-patches `torch._C` after
 `import torch`, which forces a `rebind()` pass over `sys.modules` to re-point
 roughly forty `from torch._C import ...` bindings — including aliases like
@@ -595,7 +596,7 @@ number:
 | **feature added** | none reaching `_aten_implemented()`; no Rust changed |
 | **binding surface implemented** | 29 `torch._C` names, in a staging module, behind a hand-off (§8) |
 | **defect found** | `_len_torch_dispatch_stack` answering a constant `0` (§2.2); `_base`/`_is_view` able to disagree with each other (§2.5) |
-| **tests added** | 15, in `rust/torch_c/pytests/test_export.py` |
+| **tests added** | 15, in `tests/test_export.py` |
 | **measurement** | the re-derived census (§2), the storage-model comparison (§2.5), the two walls (§4), the capture/upstream overload disagreement (§5) |
 | **documentation corrected** | none — `docs/graph/COMPILE.md` §3 is accurate as written and §1 says so |
 

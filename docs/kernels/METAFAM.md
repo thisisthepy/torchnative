@@ -15,7 +15,7 @@ process with `PYTHONPATH` stripped -- the same method docs/architectures/VOICE4.
 | How many meta kernels did this round add? | **12**: `sum.dim_IntList`, `mean.dim`, `mean.default`, `cumsum.default`, `any.default`, `amax.default` (reduction family) and `reshape.default`, `t.default`, `transpose.int`, `permute.default`, `unsqueeze.default`, `squeeze.dim`, `squeeze.default`, `slice.Tensor` (view family) -- 6 + 8 = 14 names, 12 new functions (`slice.Tensor`'s complex-input arm and `unsqueeze.default`'s complex-input arm already existed and are untouched). | §3 |
 | New operators? | **Zero.** Every op above was already in `_aten_implemented()` -- a dense kernel and golden cases, months old. | §3.1 |
 | Was VOICE4's guessed priority (`sum.dim_IntList`, `mean.dim`, `reshape` "next") right? | **No.** Measured against real `from_pretrained` forward passes, the first wall hit is `aten.embedding.default` (5 of 7 architectures), then `slice.Tensor`, then `cumsum.default` -- a different family (contraction) ranks above the reduction/view families this round closed. See §2. | §2 |
-| Did every kernel get tested against upstream across edge cases? | Yes -- `rust/torch_c/pytests/test_metafam.py`, 15 tests, ~140 individual probe cases across 0-dim, empty, keepdim, negative dims, dtype promotion, and refusals. | §4 |
+| Did every kernel get tested against upstream across edge cases? | Yes -- `tests/test_metafam.py`, 15 tests, ~140 individual probe cases across 0-dim, empty, keepdim, negative dims, dtype promotion, and refusals. | §4 |
 | Did nullification catch real bugs? | **8/8 caught.** Every deliberately broken kernel went red. | §5 |
 | Gate | 1021 ok / 0 FAIL, DOCWATCH 903/903, golden 11405/11405 pending 0 ops=302, cargo test 30/30. | §7 |
 | Are the families fully closed? | **No.** `max.dim`, `argmax`, `topk`, `sort` (reduction) and `squeeze.dims`, `narrow`, `unfold`, `flip` (view), plus the contraction/indexing/composite/combine-split families §7.4 also lists, remain refused. See §6. | §6 |
@@ -43,11 +43,11 @@ round's task is that sentence's imperative.
 ### 2.1 Derivation, not the doc
 
 Before writing anything, the current meta-kernel surface was read off `meta_dispatch`'s own
-match arms in `rust/torch_c/src/aten.rs`, not off META.md §7.4's table:
+match arms in `crates/torch_c/src/aten.rs`, not off META.md §7.4's table:
 
 ```
 grep -oE '"aten\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+"|"prims\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+"' \
-    <(awk '/^fn meta_dispatch/,/^fn meta_result/' rust/torch_c/src/aten.rs) | sort -u
+    <(awk '/^fn meta_dispatch/,/^fn meta_result/' crates/torch_c/src/aten.rs) | sort -u
 ```
 
 66 ops, going in. That reconciles exactly with META.md §7.4's own 2026-09 correction note
@@ -130,7 +130,7 @@ per META.md §7.1's rule restated in §0 above. None restate a rule the dense ke
 | `squeeze.default` | remove every size-1 axis | input's own | `squeeze_default`'s own rule |
 | `slice.Tensor` | clamp start/end, step-aware length | input's own | `slice_tensor`'s own clamp arithmetic |
 
-Implementation: `rust/torch_c/src/aten.rs`, in `meta_dispatch`, immediately after the
+Implementation: `crates/torch_c/src/aten.rs`, in `meta_dispatch`, immediately after the
 `aten.view.default` arm. A shared helper, `reduce_dims_or_all`, factors the
 `None`/`Some([])` -> "every axis" collapse that `sum`/`mean`/`amax`'s meta arms all need
 (this collapse is a property of what EMPTY means to a given op -- `squeeze.dims` treats it
@@ -178,7 +178,7 @@ plus wildcards, rank-0, bad-numel and two-wildcard refusals -- all agree.
 
 ---
 
-## 4. Tests — `rust/torch_c/pytests/test_metafam.py`
+## 4. Tests — `tests/test_metafam.py`
 
 Same method as VOICE4.md §6: one probe script, run as a subprocess against the shim (vendored
 tree, `TORCH_USE_RTLD_GLOBAL=1`) and against upstream (`PYTHONPATH` stripped), shape+dtype (or
@@ -288,7 +288,7 @@ instructions).
 
 ```
 PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
-    bash rust/torch_c/pytests/run.sh
+    bash tests/run.sh
 ```
 
 ```
@@ -345,7 +345,7 @@ budget; flagged here per AGENTS.md §17.5 rather than silently assumed innocent.
 <!-- DOCWATCH: op-implemented aten.squeeze.dim -->
 <!-- DOCWATCH: op-implemented aten.squeeze.default -->
 <!-- DOCWATCH: op-implemented aten.slice.Tensor -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reduce_dims_or_all present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metafam.py test_sum_dim_int_list_answers_what_upstream_answers present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metafam.py test_the_new_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reduce_dims_or_all present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metafam.py test_sum_dim_int_list_answers_what_upstream_answers present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metafam.py test_the_new_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->

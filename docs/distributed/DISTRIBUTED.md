@@ -5,8 +5,8 @@
 
 측정일 2026-08-25. 호스트 `darwin/arm64`, CPython 3.13.0, 상류 torch 2.13.0 · transformers 5.15.1
 (`/Volumes/macMini/caches/spike-venv`). **벤더링 트리는 한 줄도 고치지 않았습니다** — 바뀐 것은
-`rust/torch_c/src/bootstrap.py`, `rust/torch_c/pytests/{test_shim.py,verify_schemas.py}`,
-그리고 새로 만든 `torchnative/src/main/torchnative/distributed/__init__.py` 뿐입니다.
+`crates/torch_c/src/bootstrap.py`, `tests/{test_shim.py,verify_schemas.py}`,
+그리고 새로 만든 `python/torchnative/distributed/__init__.py` 뿐입니다.
 
 ---
 
@@ -24,8 +24,8 @@
 | `AutoModelForCausalLM.from_config(...)` | 실패 | **통과 — 진짜 transformers 모델 객체** |
 | 순전파 | 실패 | 실패 — **`torch._C.is_autocast_enabled`** (§7) |
 | `init_process_group(world_size=1)` | 실패 | 통과 (`backend="local"`) |
-| `pytests/run.sh` | 113 통과 | **129 통과** |
-| `tools/golden/compare.py` | 2268/2268 | 2268/2268 (변화 없음) |
+| `tests/run.sh` | 113 통과 | **129 통과** |
+| `tests/golden/compare.py` | 2268/2268 | 2268/2268 (변화 없음) |
 | `verify_schemas.py` | 233/233 | **255/255** |
 
 **판정: `import transformers` 는 됩니다.** 그리고 그 너머로 `from_config` 까지 갑니다.
@@ -290,9 +290,9 @@ torch.distributed.init_process_group(backend="local", rank=0, world_size=1,
 ### 6.2 게이트
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   exit 0   129 통과 (전 113, +16)
-$PY tools/golden/compare.py                 exit 0   2268/2268, ops=97 (변화 없음)
-$PY rust/torch_c/pytests/verify_schemas.py  exit 0   255/255 (전 233, +22)
+PYTHON=$PY sh tests/run.sh   exit 0   129 통과 (전 113, +16)
+$PY tests/golden/compare.py                 exit 0   2268/2268, ops=97 (변화 없음)
+$PY tests/verify_schemas.py  exit 0   255/255 (전 233, +22)
 ```
 
 `verify_schemas.py` 에 `_NON_ATEN_SCHEMA_TEXT` 대조를 붙였습니다 — 22 개 스키마를 상류 레지스트리
@@ -351,7 +351,7 @@ model(input_ids)
 | 1 | `AutoModelForCausalLM.from_config` 로 만든 모델의 **순전파** | ~~**미통과.** §7 의 autocast 벽~~ **정정 (문서 감사, 2026-09): §7 자신의 correction 과 어긋남 — 통과함, `docs/models/E2E_REAL.md` §4.** 실측 재확인: `AutoModelForCausalLM.from_config(...)` 로 만든 `LlamaForCausalLM` 의 순전파가 오늘도 통과합니다 |
 | 2 | `from_pretrained` / 실제 체크포인트 경로 | ~~**미시도.** 1 번 뒤에 있습니다~~ **정정 (문서 감사, 2026-09): 됩니다** — `torch._C._set_default_dtype` 도 지금 존재합니다(실측), `docs/design/DESIGN.md` §11.1 감사(round 1)가 실제 Hub 체크포인트 적재까지 확인했습니다 |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py is_autocast_enabled present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py is_autocast_enabled present -->
 | 3 | `world_size >= 2` | **구현하지 않음.** `ProcessGroupLocal` 이 이름을 대고 거절합니다. 전송 계층이 없습니다 |
 | 4 | `torchnative.nn.federated` (스택의 맨 위 칸) | **비어 있습니다.** 이번 작업은 그 아래 두 칸만 세웠습니다 |
 | 5 | 장치 추상의 가속기 칸 (Metal · Vulkan · NPU) | **없음.** `local` 백엔드는 `devices=["cpu"]` 로만 등록합니다 |
@@ -419,18 +419,18 @@ model(input_ids)
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-dist
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-dist
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 129
-$PY tools/golden/compare.py                        # 2268/2268 ops=97
-$PY rust/torch_c/pytests/verify_schemas.py         # 255/255
+PYTHON=$PY sh tests/run.sh          # 129
+$PY tests/golden/compare.py                        # 2268/2268 ops=97
+$PY tests/verify_schemas.py         # 255/255
 
 # 이 문서의 판정
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
   "from transformers import AutoModelForCausalLM; print('OK')"
 ```
 

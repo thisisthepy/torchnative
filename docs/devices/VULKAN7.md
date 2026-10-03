@@ -16,21 +16,21 @@
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 38 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs VIEW_RANK_MAX present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs materialise_view present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs check_index_range present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs broadcast_binary present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs matmul_vulkan present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs gather_vulkan present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs strided_gather_u32 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_view_ops_are_bit_identical_to_upstream_and_ran_on_the_gpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_an_index_range_is_inherited_through_views_and_a_loose_one_refuses_by_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_broadcasting_arithmetic_is_bit_identical_to_upstream_and_one_shader present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_matmul_agrees_with_upstream_and_ran_as_one_batched_product present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_gather_refuses_what_upstream_refuses_before_any_gpu_work present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_tanh_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs VIEW_RANK_MAX present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs materialise_view present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs check_index_range present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs broadcast_binary present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs matmul_vulkan present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs gather_vulkan present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs strided_gather_u32 present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_view_ops_are_bit_identical_to_upstream_and_ran_on_the_gpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_index_range_is_inherited_through_views_and_a_loose_one_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_broadcasting_arithmetic_is_bit_identical_to_upstream_and_one_shader present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_matmul_agrees_with_upstream_and_ran_as_one_batched_product present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_gather_refuses_what_upstream_refuses_before_any_gpu_work present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_tanh_agrees_with_upstream_at_a_derived_tolerance present -->
 
 `count vulkan_tests_ok` 는 `docs/devices/VULKAN5.md` §2.3 의 장치 그대로입니다 — 로더가 없는 기계에서는
 PASS 가 아니라 SKIP 입니다. **사전학습 BERT 테스트는 로컬 가중치가 없으면 SKIP 으로 세어집니다**

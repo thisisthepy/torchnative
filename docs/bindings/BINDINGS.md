@@ -1,15 +1,15 @@
 # Four binding debts, three paid
 
 A kernel that exists, is golden-compared, and cannot be called from Python is
-not a feature. `tools/golden/compare.py` calls `_C._aten_dispatch(key, ...)`
+not a feature. `tests/golden/compare.py` calls `_C._aten_dispatch(key, ...)`
 with a key it took from its own case table, so it proves the arithmetic and is
 structurally blind to whether anything a user writes arrives there —
-`docs/bindings/REACH.md` is the argument and `tools/golden/reach.py` is the check.
+`docs/bindings/REACH.md` is the argument and `tests/golden/reach.py` is the check.
 
 Three such kernels had been sitting green and unreachable, each for the same
 non-technical reason: the round that wrote the kernel did not own
 `bootstrap.py`, and the missing piece was a composite in that file.
-`tools/golden/reach_allow.json` recorded two of them by name, with reasons that
+`tests/golden/reach_allow.json` recorded two of them by name, with reasons that
 said in as many words that the gap was **owed, not deliberate**, and that the
 entry should be deleted the moment the binding landed. This round landed them.
 
@@ -27,7 +27,7 @@ anything:
 |---|---|
 | feature added | three `bootstrap.py` composites: `_linalg.linalg_qr`, `_linalg.linalg_norm`, `_nn.upsample_nearest2d` |
 | defect fixed | none |
-| tests added | `pytests/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
+| tests added | `tests/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
 | tests inverted | two — the pins in `test_tail1.py` and `test_tail2.py` that asserted these gaps *existed* |
 | documentation | this file |
 | deleted | two `reach_allow.json` entries |
@@ -37,7 +37,7 @@ anything:
 
 ## 1. How each was proved
 
-Not by `_aten_dispatch`. Every proof in `pytests/test_bindings.py` goes through
+Not by `_aten_dispatch`. Every proof in `tests/test_bindings.py` goes through
 **the spelling a user writes**, in a subprocess with the vendored tree on
 `PYTHONPATH`, and compares element-wise against **upstream torch run in a
 separate subprocess** with `PYTHONPATH` stripped. Both subprocesses print their
@@ -217,7 +217,7 @@ to upstream within one ULP across `float64`/`float32`/`float16`/`bfloat16`
 including the saturating tail, and then **removed**, because the only spelling
 is `torch._C._nn.mish` and `bootstrap.py` belonged to another round.
 
-The kernel is not in the tree. `mish` appears nowhere in `rust/torch_c/src`, it
+The kernel is not in the tree. `mish` appears nowhere in `crates/torch_c/src`, it
 is not in `_aten_implemented()`, and it has no golden cases. So the two lines
 beside `silu`'s would install a door onto nothing: `_nn.mish` would dispatch
 `aten.mish.default` and raise `aten op not implemented in torch._C shim` — a
@@ -248,7 +248,7 @@ red, so the two cannot come apart the way they did last time.
   plausible green.
 * `bootstrap.py` is `include_str!`'d at **compile** time. Editing it and
   re-running without a rebuild tests the old binary. Every result here is from
-  a rebuild followed by `vendor/install_shim.sh`, because the vendored-tree
+  a rebuild followed by `scripts/vendor/install_shim.sh`, because the vendored-tree
   subprocess tests read the installed shim and not the staged one.
 
 What they cannot see: whether `vilt` and `rwkv` produce *correct outputs*

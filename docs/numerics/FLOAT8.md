@@ -81,4 +81,4 @@ new refusals across the arithmetic surface is its own change with its own
 per-op wording to transcribe. It is the next round, and it is named rather than
 left for a sweep to rediscover.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs float8_e4m3fn present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs float8_e4m3fn present -->

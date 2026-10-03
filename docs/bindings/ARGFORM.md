@@ -1,7 +1,7 @@
 # ARGFORM — the argument-form gaps, and the two owed bindings picked up alongside them
 
-Worktree `work/argform` on develop `eb84708`. Territory: `rust/torch_c/src/bootstrap.py`,
-`rust/torch_c/pytests/test_argform.py`. `test_shim.py`, `aten.rs`, `capture.rs`, `tape.rs`,
+Worktree `work/argform` on develop `eb84708`. Territory: `crates/torch_c/src/bootstrap.py`,
+`tests/test_argform.py`. `test_shim.py`, `aten.rs`, `capture.rs`, `tape.rs`,
 `tensor.rs`, `device.rs`, `methods.json`, `overloads.json`, `tools/`, `torchnative/` were not
 touched, per this round's territory split.
 
@@ -182,7 +182,7 @@ g[0:3:2] = 0.0
   patched    [[0,0,0,0], [5,6,7,8], [0,0,0,0]]   -- exact match, separate-process comparison
 ```
 
-`tools/golden/compare.py --self-test` aside, running the full comparison shows exactly the one
+`tests/golden/compare.py --self-test` aside, running the full comparison shows exactly the one
 promotion docs/bindings/SETITEM.md §2.1 named already flipping from `expect="c_error"` to a live pass:
 
 ```text
@@ -190,11 +190,11 @@ FAIL aten.copy_.default :: member x[0:4:2] = 0.0 [refused -- ...] -- gap appears
      sides now succeed, promote this case to expect=match and diff real values
 ```
 
-**This is `tools/golden/cases.py`, out of this round's territory**, and docs/bindings/SETITEM.md already
+**This is `tests/golden/cases.py`, out of this round's territory**, and docs/bindings/SETITEM.md already
 names the one-line promotion needed for all three flipped cases (§2.1) — so this is the expected,
 documented next step, not a new finding.
 
-**A new finding this round did surface, though**: `rust/torch_c/pytests/test_shim.py`'s existing
+**A new finding this round did surface, though**: `tests/test_shim.py`'s existing
 `test_setitem_writes_the_basic_index_through_to_the_base` pins the *old* refusal —
 
 ```python
@@ -208,7 +208,7 @@ documented next step, not a new finding.
 ```
 
 — and with the patch applied this assertion now fails, because the write is (correctly) no longer
-refused. `git diff eb84708 develop -- rust/torch_c/pytests/test_shim.py` is empty, so whoever lands
+refused. `git diff eb84708 develop -- tests/test_shim.py` is empty, so whoever lands
 this patch for real needs to update this one assertion too (delete the `try`/`except` and assert
 the written values instead, matching the `d`/`e` cases just above it in the same test) — a step
 docs/bindings/SETITEM.md's own verification (§7, "481 ok, 0 FAIL") did not appear to hit, most likely because
@@ -220,8 +220,8 @@ green to one red the moment the patch takes effect.
 ## 7. Verification run (this round's own bootstrap.py + test_argform.py only, no glu kernel, no setitem promotion)
 
 ```text
-suite (rust/torch_c/pytests/run.sh)    519 ok, 0 FAIL, DOCWATCH PASS -- 480/480
-golden (tools/golden/compare.py)       9137/9137, ops=224 -- exactly unmoved
+suite (tests/run.sh)    519 ok, 0 FAIL, DOCWATCH PASS -- 480/480
+golden (tests/golden/compare.py)       9137/9137, ops=224 -- exactly unmoved
 ```
 
 With the setitem patch additionally applied (§6.2, verified separately since it is not part of this

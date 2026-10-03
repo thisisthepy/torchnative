@@ -11,8 +11,8 @@ predicate this repository has now repaired four times.
 | gate | before | after |
 |---|---:|---:|
 | architectures forwarding (of 20) | 19 | **20** |
-| `pytests/run.sh` | 249 ok | **253 ok** |
-| `tools/golden/compare.py` | 3422/3422, ops=134 | **4284/4284, ops=139** |
+| `tests/run.sh` | 249 ok | **253 ok** |
+| `tests/golden/compare.py` | 3422/3422, ops=134 | **4284/4284, ops=139** |
 | `compare.py` pending case builders | 2 | **1** |
 | `verify_schemas.py` | 4334/4334 | **4353/4353** |
 | `cargo test --release` | 18 | 18 |
@@ -46,7 +46,7 @@ fourth time and this time in one shared function rather than a fourth private co
 ### 1.1 The schema, read rather than remembered
 
 The brief said to read upstream's schema instead of recalling it, and the vendored tree has it:
-`torchnative/src/main/torchgen/packaged/ATen/native/native_functions.yaml:8722`.
+`python/torchgen/packaged/ATen/native/native_functions.yaml:8722`.
 
 ```yaml
 - func: tril(Tensor self, SymInt diagonal=0) -> Tensor
@@ -492,11 +492,11 @@ from small integers where `x * 0` and `select(false)` agree. Those twelve cases 
 ### 6.1 The gates, all exit 0
 
 ```
-bash vendor/install_shim.sh                     exit 0
-PYTHON=$PY sh rust/torch_c/pytests/run.sh       253 ok, 0 FAIL            exit 0
-$PY tools/golden/compare.py                     4284/4284, ops=139        exit 0
-$PY tools/golden/compare.py --self-test         13 x 11, 0 problems       exit 0
-$PY rust/torch_c/pytests/verify_schemas.py      4353/4353                 exit 0
+bash scripts/vendor/install_shim.sh                     exit 0
+PYTHON=$PY sh tests/run.sh       253 ok, 0 FAIL            exit 0
+$PY tests/golden/compare.py                     4284/4284, ops=139        exit 0
+$PY tests/golden/compare.py --self-test         13 x 11, 0 problems       exit 0
+$PY tests/verify_schemas.py      4353/4353                 exit 0
 cargo test --release                            18 passed                 exit 0
 ```
 
@@ -582,7 +582,7 @@ correction, so it keeps the exact bits it had.
   Its kernels are all present; nobody has transcribed the sequence. That is the largest item this
   round names and leaves.
   > **Correction (문서 감사, 2026-09):** built since — `_sdpa_math` exists in
-  > `rust/torch_c/src/bootstrap.py` (landed in `1938ad1`, "Feat: Open training mode, which every
+  > `crates/torch_c/src/bootstrap.py` (landed in `1938ad1`, "Feat: Open training mode, which every
   > sweep in this repository had assumed away", which post-dates this document's own commit
   > `3b7d981`; `git merge-base --is-ancestor 3b7d981 1938ad1` confirms the order). Live-verified:
   > `F.scaled_dot_product_attention(q, k, v, dropout_p=0.1, is_causal=True)` — the exact scenario
@@ -590,7 +590,7 @@ correction, so it keeps the exact bits it had.
   > (`dropout_p != 0.0` routes to `_sdpa_math`) — succeeds today. Round 2's `docs/kernels/SDPA.md`/
   > `docs/models/CKPT2.md`/`docs/models/GENERATE.md` audits already independently confirm the same function
   > (its `enable_gqa` branch, specifically).
-  > <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
+  > <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _sdpa_math present -->
 * **`aten.amin.default`.** Named in §2.4, not written. It is a direction-specific `CustomOp1`, not
   a sign flip. **Status: confirmed still true** — `aten.amin.default` and `aten.argmin.default` are
   both still absent from the current 168-op `_aten_implemented()` list.

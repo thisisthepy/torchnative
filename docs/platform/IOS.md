@@ -18,8 +18,8 @@
 
 | | |
 |---|---|
-| `tools/wheel/verify_ios_sim.py` | 시뮬레이터 안에서 임포트·계산까지. `verify_android.py` 와 **판정 문장이 같다** — *`torch.__file__` 이 설치 위치 안을 가리켜야 한다* |
-| `tools/wheel/verify_ios_device.py` | 기기 휠. **아무것도 실행하지 않는다.** 링크가 풀리는지만 본다 (§11). 이 도구가 말하는 것은 **"심볼이 다 풀린다"** 이지 **"기기에서 돈다"** 가 아니다 |
+| `scripts/wheel/verify_ios_sim.py` | 시뮬레이터 안에서 임포트·계산까지. `verify_android.py` 와 **판정 문장이 같다** — *`torch.__file__` 이 설치 위치 안을 가리켜야 한다* |
+| `scripts/wheel/verify_ios_device.py` | 기기 휠. **아무것도 실행하지 않는다.** 링크가 풀리는지만 본다 (§11). 이 도구가 말하는 것은 **"심볼이 다 풀린다"** 이지 **"기기에서 돈다"** 가 아니다 |
 
 ```
 PASS -- torchnative-0.0.1a0-cp313-abi3-ios_14_0_arm64_iphonesimulator.whl unpacks into
@@ -84,7 +84,7 @@ version = 'Darwin Kernel Version 25.5.0: ... xnu-12377.121.6~2/RELEASE_ARM64_T81
 
 **전부 일치한다.** 개수 두 개(1260·896)까지 같다는 것은 크로스 빌드가 op 등록을 하나도 흘리지
 않았다는 뜻이다. (이 표는 처음 1251·896 으로 기록됐다. 2026-08-29 재측정에서 양쪽 다 1260 이다 —
-그 사이 `rust/torch_c` 에 착지한 것들이 늘린 수이고, **호스트와 시뮬레이터가 여전히 같다**는 것이
+그 사이 `crates/torch_c` 에 착지한 것들이 늘린 수이고, **호스트와 시뮬레이터가 여전히 같다**는 것이
 이 표가 말하는 바다.)
 
 `sys.path` 에 저장소로 이어지는 항목이 **하나도 없다** — 하네스가 이것을 단언으로 검사한다:
@@ -208,8 +208,8 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-ios
 BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-bash vendor/vendor_torch.sh
-bash vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh
+bash scripts/vendor/install_shim.sh
 
 # 1) 시뮬레이터용 _C 를 크로스 빌드한다.
 #    시뮬레이터도 PYO3_CONFIG_FILE 이 필요하다 (WHEEL.md §7.1). 기기와 달리
@@ -223,13 +223,13 @@ pointer_width=64
 suppress_build_script_link_lines=true
 EOF
 
-( cd rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphonesimulator/lib \
   cargo build --release --target aarch64-apple-ios-sim )
 
 # 1b) 기기용도 같이 만든다 — §11 의 대조에는 두 휠이 다 필요하다.
-( cd rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos/lib \
   TORCHNATIVE_PYTHON_FRAMEWORK_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos \
@@ -238,16 +238,16 @@ EOF
 # 2) 휠을 만든다.
 #    build.py 는 여기서 크로스 산출물이 **현재 소스로 빌드된 것인지** 확인하고,
 #    아니면 이름을 대고 거절한다 (WHEEL.md §11). 위 cargo 단계를 건너뛰면 이 줄이 멈춘다.
-$BPY tools/wheel/build.py --target ios-arm64-sim
-$BPY tools/wheel/build.py --target ios-arm64
+$BPY scripts/wheel/build.py --target ios-arm64-sim
+$BPY scripts/wheel/build.py --target ios-arm64
 
 # 3) 판정한다 — 시뮬레이터를 띄우고, 임포트시키고, 계산시킨다
-$PY tools/wheel/verify_ios_sim.py dist/torchnative-*iphonesimulator*.whl
+$PY scripts/wheel/verify_ios_sim.py dist/torchnative-*iphonesimulator*.whl
 
 # 4) 기기 휠은 실행할 수 없다. 링크가 풀리는지만 본다 (§11).
 #    시뮬레이터 휠이 dist/ 에 같이 있어야 §11.3 의 대조가 성립한다.
-$PY tools/wheel/verify_ios_device.py dist/torchnative-*iphoneos*.whl
-$PY tools/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.whl
+$PY scripts/wheel/verify_ios_device.py dist/torchnative-*iphoneos*.whl
+$PY scripts/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.whl
 ```
 
 하네스는 시뮬레이터를 **자기가 부팅했을 때만** 종료시킨다. 이미 떠 있던 것은 건드리지 않는다.
@@ -314,11 +314,11 @@ site-packages 에 휠을 푼다 (205 MB). 공유본의 site-packages 는 그대�
 
 ## 11. 기기 휠 — 실기 없이 어디까지 확인되는가 (2026-08-29)
 
-`tools/wheel/verify_ios_device.py`.
+`scripts/wheel/verify_ios_device.py`.
 
 ```sh
-$PY tools/wheel/verify_ios_device.py dist/torchnative-*iphoneos*.whl
-$PY tools/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.whl
+$PY scripts/wheel/verify_ios_device.py dist/torchnative-*iphoneos*.whl
+$PY scripts/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.whl
 ```
 
 ### 11.0 먼저, 이 도구가 하지 않는 것
@@ -420,7 +420,7 @@ SELF-TEST: PASS -- 5/5 fault modes rejected, and each
 
 **두 종류의 답을 섞지 않는 것이 이 도구의 골격이다.** `FAIL:` 은 휠에 대한 발견이고
 `CANNOT JUDGE:` 는 검사가 못 본 것이다. 둘 다 종료 코드 1 이지만 문장이 다르고, self-test 가
-그 문장까지 맞춰 본다. `rust/torch_c/pytests/run.sh` 주석에 있는 실패 — SIGKILL 당한 `cmp` 의
+그 문장까지 맞춰 본다. `tests/run.sh` 주석에 있는 실패 — SIGKILL 당한 `cmp` 의
 종료 코드를 "다름" 으로 읽어 멀쩡한 아티팩트를 낡았다고 보고한 것 — 의 같은 뿌리다.
 
 ### 11.5 그래서 기기 휠에 대해 지금 말할 수 있는 것

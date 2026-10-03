@@ -26,7 +26,7 @@ import succeeding, which the brief for this round explicitly rules out.
 ## 1. Baseline — reproduced, unchanged from the brief
 
 ```
-$ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=torchnative/src/main HF_HOME=... \
+$ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=python HF_HOME=... \
     python3 /tmp/arch7/sweep.py /tmp/out
 ...
 gpt_bigcode    FAIL ModuleNotFoundError: Could not import module 'GPTBigCodeForCausalLM'. ...
@@ -70,7 +70,7 @@ own functions rather than `MkldnnLinear`'s.
 `torch.jit.script` at module scope runs at import time, as a decorator. Upstream ships an off
 switch for exactly this — the question was whether it degrades to something usable or to nothing.
 
-**Read directly from the vendored tree** (`torchnative/src/main/torch/jit/_state.py`, byte-identical
+**Read directly from the vendored tree** (`python/torch/jit/_state.py`, byte-identical
 to `/Volumes/macMini/caches/spike-venv/.../torch/jit/_state.py`, `diff` exit 0 — this file is
 unmodified upstream, torch 2.13.0):
 
@@ -172,7 +172,7 @@ here — some of the functions *are* on the forward path.)
 
 ## 4. The fix — one `setdefault`, in territory, both directions tested
 
-`rust/torch_c/src/bootstrap.py`, executed once per `_C` import (before `torch/__init__.py`
+`crates/torch_c/src/bootstrap.py`, executed once per `_C` import (before `torch/__init__.py`
 reaches `import torch.jit`, since `_C`'s own import is what runs this file):
 
 ```python
@@ -181,7 +181,7 @@ os.environ.setdefault("PYTORCH_JIT", "0")
 
 `setdefault`, not an unconditional set: a caller who exports `PYTORCH_JIT=1` explicitly still
 reaches the real (`NotImplementedError`-naming) path. Verified in both directions —
-`rust/torch_c/pytests/test_shim.py`:
+`tests/test_shim.py`:
 
 * `test_torch_jit_script_defaults_to_returning_the_original_function` — subprocess with
   `PYTORCH_JIT` unset, vendored `torch` on `PYTHONPATH`: `torch.jit.script(f) is f`,
@@ -197,7 +197,7 @@ reaches the real (`NotImplementedError`-naming) path. Verified in both direction
   `from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeForCausalLM`
   succeeds. (Import only — §6 covers why this test does not also construct the model.)
 
-All three added at the end of `rust/torch_c/pytests/test_shim.py`; `_main()` picks up every
+All three added at the end of `tests/test_shim.py`; `_main()` picks up every
 `test_*` in `globals()`, so no registration step was needed. 245 tests, 0 FAIL (was 242).
 
 ---
@@ -206,10 +206,10 @@ All three added at the end of `rust/torch_c/pytests/test_shim.py`; `_main()` pic
 
 | gate | before this change | after |
 |---|---|---|
-| `vendor/install_shim.sh` | exit 0 | exit 0 |
-| `pytests/run.sh` | 242 ok, 0 FAIL | **245 ok**, 0 FAIL |
-| `tools/golden/compare.py` | 3302/3302, ops=133 | 3302/3302, ops=133 (unchanged — no kernel touched) |
-| `tools/golden/compare.py --self-test` | 13×11, 0 problems | unchanged |
+| `scripts/vendor/install_shim.sh` | exit 0 | exit 0 |
+| `tests/run.sh` | 242 ok, 0 FAIL | **245 ok**, 0 FAIL |
+| `tests/golden/compare.py` | 3302/3302, ops=133 | 3302/3302, ops=133 (unchanged — no kernel touched) |
+| `tests/golden/compare.py --self-test` | 13×11, 0 problems | unchanged |
 | `verify_schemas.py` | 4331/4331 | unchanged |
 | 20-arch sweep | 19/20, gpt_bigcode fails at **import** | 19/20, gpt_bigcode fails at **construction**, one named kernel |
 
@@ -224,7 +224,7 @@ resolved op reached — there is nothing behind `tril` to resolve to).
 Sweep reproduction:
 
 ```
-export TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=<repo>/torchnative/src/main HF_HOME=...
+export TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=<repo>/python HF_HOME=...
 python3 /tmp/arch7/sweep.py <outdir>
 ```
 
@@ -242,7 +242,7 @@ transformers/models/gpt_bigcode/modeling_gpt_bigcode.py:386, in GPTBigCodeModel.
     )
 torch_c_bootstrap.py:3044, in fn
 NotImplementedError: not implemented in torch._C shim: torch.tril(...) -- overload resolution has
-no table entry for this op (rust/torch_c/src/overloads.json); call torch.ops.aten.tril.<overload>,
+no table entry for this op (crates/torch_c/src/overloads.json); call torch.ops.aten.tril.<overload>,
 which carries the overload and reaches the same dispatcher
 ```
 
@@ -374,7 +374,7 @@ that was explicitly out of scope for this round (the brief names GPT-BigCode as 
 twenty, and none of these six are in that twenty).
 
 Also affected, inside the vendored tree itself rather than `transformers`: eight files under
-`torchnative/src/main/torch/distributed/optim/` (`functional_sgd.py`, `functional_adamw.py`,
+`python/torch/distributed/optim/` (`functional_sgd.py`, `functional_adamw.py`,
 `functional_adam.py`, `functional_adagrad.py`, `functional_adadelta.py`, `functional_adamax.py`,
 `functional_rmsprop.py`, `functional_rprop.py`) each have a module-scope `@torch.jit.script` on
 their optimizer step function, plus `torch/distributed/optim/optimizer.py:104`. `torch.distributed`
@@ -389,9 +389,9 @@ not verified further. The remaining matches are all under `torch/testing/_intern
 ## 9. What was and was not done
 
 **Done, in territory:**
-* `rust/torch_c/src/bootstrap.py` — `os.environ.setdefault("PYTORCH_JIT", "0")`, one line, with the
+* `crates/torch_c/src/bootstrap.py` — `os.environ.setdefault("PYTORCH_JIT", "0")`, one line, with the
   reasoning inline.
-* `rust/torch_c/pytests/test_shim.py` — three new tests, all through the Python-facing
+* `tests/test_shim.py` — three new tests, all through the Python-facing
   `torch.jit.script`/`import` path, covering the default, the explicit-override, and GPT-BigCode's
   import specifically.
 * This document.

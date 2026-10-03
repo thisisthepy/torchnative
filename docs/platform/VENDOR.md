@@ -32,7 +32,7 @@ DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 �
 | abi3 | **켬.** `abi3-py313`, 세 타깃 전부 종료 코드 0, 호스트 스모크 13/13 |
 | 산출물 이름 | `_C.so` → **`_C.abi3.so`** (ABI3.md §7 항목 2) |
 | 벤더링한 것 | torch **2.13.0** 파이썬 트리, `.py` **2285 개**, 53 MB, 네이티브 산출물 **0 개** |
-| 저장소 배치 | `vendor/` 안, **`.gitignore` 로 제외**. 재현은 `vendor/vendor_torch.sh` |
+| 저장소 배치 | `vendor/` 안, **`.gitignore` 로 제외**. 재현은 `scripts/vendor/vendor_torch.sh` |
 | **엄격 모드 `import torch`** | **`torch/__init__.py:1050` 에서 정지.** `_initExtension` 없음 |
 | 기록 모드 `import torch` | `torch/__init__.py:2885` (전체 3087 행의 **93%**) 까지. `torch._decomp` 안에서 정지 |
 | `import transformers` | **성공(종료 코드 0), 그리고 `is_torch_available() == True`** — 이것이 함정입니다 (§5) |
@@ -125,23 +125,23 @@ torch/test/                상류 자체 테스트
 
 ```bash
 # 1. 벤더링 (기본 소스는 spike-venv 의 torch 2.13.0)
-./vendor/vendor_torch.sh                       # TORCHNATIVE_TORCH_SRC 로 소스 변경 가능
+./scripts/vendor/vendor_torch.sh                       # TORCHNATIVE_TORCH_SRC 로 소스 변경 가능
 
 # 2. 우리 _C 를 넣기
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
-./vendor/install_shim.sh
+./scripts/vendor/install_shim.sh
 
 # 3. 상류 _C 의 이름 표면을 뜬다 (계측기 입력. 진짜 torch 가 있는 인터프리터에서)
-/Volumes/macMini/caches/spike-venv/bin/python vendor/probe.py \
+/Volumes/macMini/caches/spike-venv/bin/python scripts/vendor/probe.py \
     --dump-surface /tmp/bw_surface.json
 
 # 4. 시험
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
-  $PY vendor/probe.py --mode strict --target torch; echo "EXIT=$?"
+  $PY scripts/vendor/probe.py --mode strict --target torch; echo "EXIT=$?"
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
-  $PY vendor/probe.py --mode record --surface /tmp/bw_surface.json \
+  $PY scripts/vendor/probe.py --mode record --surface /tmp/bw_surface.json \
      --target torch --report /tmp/rec.json; echo "EXIT=$?"
 ```
 
@@ -153,7 +153,7 @@ fsspec·jinja2·typing_extensions)이 이미 거기 있고, `PYTHONPATH` 가 `si
 
 ### 판정은 종료 코드로
 
-`vendor/probe.py` 는 성공/실패를 **종료 코드로만** 냅니다. IMPORT_WALLS 2 차가 `grep -q MODEL_OK`
+`scripts/vendor/probe.py` 는 성공/실패를 **종료 코드로만** 냅니다. IMPORT_WALLS 2 차가 `grep -q MODEL_OK`
 로 판정하다 트레이스백이 소스 줄을 그대로 출력하는 바람에 한 회차를 통째로 버린 전례가 있어,
 이 계측기에는 성공 마커 문자열 자체를 두지 않았습니다.
 
@@ -181,7 +181,7 @@ record 모드는 상류 `_C` 의 **이름과 종류만** 읽습니다(`--dump-su
 ### 1 `[S]` `torch/__init__.py:444` — 파이썬 트리가 네이티브 라이브러리를 먼저 찾는다
 
 ```
-OSError: dlopen(torchnative/src/main/torch/lib/libtorch_global_deps.dylib): no such file
+OSError: dlopen(python/torch/lib/libtorch_global_deps.dylib): no such file
 ```
 
 `_load_global_deps()` 가 `ctypes.CDLL(torch/lib/libtorch_global_deps.dylib, RTLD_GLOBAL)` 을
@@ -200,7 +200,7 @@ OSError: dlopen(torchnative/src/main/torch/lib/libtorch_global_deps.dylib): no s
 
 ```
 ImportError: cannot import name '_initExtension' from 'torch._C'
-    (torchnative/src/main/torch/_C.abi3.so)
+    (python/torch/_C.abi3.so)
 ```
 
 **이것이 정직한 답입니다.** 우리 `_C` 로 `import torch` 는 `torch/__init__.py` 3087 행 중
@@ -231,7 +231,7 @@ TORCH_C.md 가 `TensorBase` 라는 **이름**을 미리 맞춰 둔 판단은 옳
 ### 4 `[R]` `torch/__init__.py:2179` — `torch/bin/torch_shm_manager` 가 **존재**해야 한다
 
 ```
-RuntimeError: Unable to find torch_shm_manager at torchnative/src/main/torch/bin/torch_shm_manager
+RuntimeError: Unable to find torch_shm_manager at python/torch/bin/torch_shm_manager
 ```
 
 `_manager_path()` 가 Windows 가 아닌 모든 플랫폼에서 **무조건** 이 파일의 존재를 확인하고, 없으면
@@ -611,12 +611,12 @@ IMPORT_WALLS 4 차는 A(candle + shim) 에 "파이썬 트리 prune 이 싸지 �
 
 | 파일 | 변경 |
 |---|---|
-| `rust/torch_c/Cargo.toml` | `abi3-py313` 추가 |
-| `rust/torch_c/pytests/run.sh` | 산출물 이름 `_C.so` → `_C.abi3.so` |
-| `.gitignore` | `/torchnative/src/main/torch/` · `/torchnative/src/main/torch-*.dist-info/` · `/vendor/.stamp` |
-| `vendor/vendor_torch.sh` | 신규 |
-| `vendor/install_shim.sh` | 신규 |
-| `vendor/probe.py` | 신규 |
+| `crates/torch_c/Cargo.toml` | `abi3-py313` 추가 |
+| `tests/run.sh` | 산출물 이름 `_C.so` → `_C.abi3.so` |
+| `.gitignore` | `/python/torch/` · `/python/torch-*.dist-info/` · `/vendor/.stamp` |
+| `scripts/vendor/vendor_torch.sh` | 신규 |
+| `scripts/vendor/install_shim.sh` | 신규 |
+| `scripts/vendor/probe.py` | 신규 |
 | `docs/platform/VENDOR.md` | 이 문서 |
 
 **벤더링한 트리의 파이썬 소스는 한 줄도 수정하지 않았습니다.** 벽 1 은 상류가 제공하는 환경
@@ -624,8 +624,8 @@ IMPORT_WALLS 4 차는 A(candle + shim) 에 "파이썬 트리 prune 이 싸지 �
 두 가지**입니다.
 
 ```
-$ diff -rq --exclude=__pycache__ <상류>/torch torchnative/src/main/torch | grep -v '^Only in <상류>'
-Only in torchnative/src/main/torch: _C.abi3.so                     # 우리 것 (§2 의 구멍)
+$ diff -rq --exclude=__pycache__ <상류>/torch python/torch | grep -v '^Only in <상류>'
+Only in python/torch: _C.abi3.so                     # 우리 것 (§2 의 구멍)
 Files .../bin/torch_shm_manager and ... differ       # 벽 4 의 0 바이트 표식
 ```
 

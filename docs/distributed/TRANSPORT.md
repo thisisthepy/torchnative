@@ -23,7 +23,7 @@ The `Store` interface essentially requires `.set`, `.get`, and `.wait` to comple
 
 ## 2. Implemented Components
 
-The `delta` aggregation demands a process group with more than one rank. To unblock this, we built a minimal but completely honest distributed stack over real OS sockets, entirely in Python inside `rust/torch_c/src/bootstrap.py`:
+The `delta` aggregation demands a process group with more than one rank. To unblock this, we built a minimal but completely honest distributed stack over real OS sockets, entirely in Python inside `crates/torch_c/src/bootstrap.py`:
 
 - **`TCPStore`:** Implements `world_size = 2` rendezvous using Python's `socket` module. The master rank launches a daemon thread serving a JSON-over-TCP protocol that implements the blocking `set`, `get`, and `wait` primitives. 
 - **`ProcessGroupLocal` at `world_size = 2`:** No longer refuses. We repurposed `backend="local"` to support `world_size = 2` using an actual TCP transport. During initialization, rank 0 binds to a free port and sets `pg_local_port` in the store; rank 1 waits for it and connects.

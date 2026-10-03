@@ -19,11 +19,11 @@ Commands run in the worktree, in the foreground, before touching any file
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-docaudit
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          -> EXIT=0, 268 "ok " lines, SELF-TEST PASS
-$PY tools/golden/compare.py                        -> EXIT=0, SUMMARY: 5634/5634 cases passed, 0 failed, ops covered=148, pending case builders=1
-$PY rust/torch_c/pytests/verify_schemas.py         -> EXIT=0, SUMMARY: 4392/4392 table entries matched upstream, 0 failed
+PYTHON=$PY sh tests/run.sh          -> EXIT=0, 268 "ok " lines, SELF-TEST PASS
+$PY tests/golden/compare.py                        -> EXIT=0, SUMMARY: 5634/5634 cases passed, 0 failed, ops covered=148, pending case builders=1
+$PY tests/verify_schemas.py         -> EXIT=0, SUMMARY: 4392/4392 table entries matched upstream, 0 failed
 ```
 
 torch version seen by verify_schemas.py: `torch 2.13.0`.
@@ -46,7 +46,7 @@ OpOverload.tags 148/148, CompositeImplicitAutograd registrations 744/744.
 > pattern: `run.sh` 274 "ok " lines (not 268), `compare.py` SUMMARY:
 > 6374/6374 cases passed, 0 failed, ops covered=161 (not 148), pending case
 > builders=1, `verify_schemas.py` SUMMARY: 4458/4458 (not 4392). This is
-> also `tools/docwatch/check_docs.py`'s acceptance baseline — see
+> also `tests/docwatch/check_docs.py`'s acceptance baseline — see
 > docs/verification/DOCWATCH.md — and the markers below check the corrected numbers, not
 > the ones above, so this correction does not itself go stale silently the
 > next time a kernel round lands:
@@ -82,13 +82,13 @@ with the same env vars as above exported first.
   2.13.0 (same for `silu`, `softplus`) — there is no bare `torch.<name>` to reach for those
   three, only `torch.nn.functional.<name>`/`torch._C._nn.<name>`, both already answered by this
   shim. Separately, "not fixed here" is stale: 22 of the 25 names now have an
-  `overloads.json`/`methods.json` entry (confirmed via `rust/torch_c/src/overloads.json`'s own
+  `overloads.json`/`methods.json` entry (confirmed via `crates/torch_c/src/overloads.json`'s own
   comment, and by grepping the 25 names as JSON keys — all 22 non-gelu/silu/softplus names are
   present); `reshape` is the one still-pending name (confirmed via
-  `tools/golden/compare.py`'s current `PENDING` line naming only `aten.reshape.default`).
+  `tests/golden/compare.py`'s current `PENDING` line naming only `aten.reshape.default`).
   **How checked:** `hasattr(torch, name)` for all 25 names against
   `/Volumes/macMini/caches/spike-venv/bin/python` (real torch 2.13.0); `grep -n '"<name>":'
-  rust/torch_c/src/overloads.json` for each of the 25; `$PY tools/golden/compare.py` baseline run
+  crates/torch_c/src/overloads.json` for each of the 25; `$PY tests/golden/compare.py` baseline run
   (PENDING line).
   **Fixed:** yes — added a `> **Correction (docs/bindings/SPELLINGS.md §5–§7): ...**` blockquote after
   the "well-defined next round" paragraph, matching this doc's existing correction style (the
@@ -105,7 +105,7 @@ with the same env vars as above exported first.
   `NotImplementedError`. **Status: confirmed true, still current.**
   **How checked:** called `torch.pow(torch.tensor([True, False]), 2)` and
   `torch.pow(True, torch.tensor([True, False]))` against the loaded shim
-  (`PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`); both still raise
+  (`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1`); both still raise
   `NotImplementedError` with the same message the doc describes.
 
 - §10 (`gpt_bigcode`, TorchScript wall): re-ran the import chain description mentally against
@@ -141,13 +141,13 @@ numeric tables are explicit before/after for their own round (e.g. §0's "168/16
 2702/2702 ops=118" is that round's baseline, explicitly "이 작업 전후로 같은 값" — same before
 and after *that* round, not a claim about today).
 
-- §15 (2026-08-31, the most recent section — an audit of `tools/wheel/`'s own verification
+- §15 (2026-08-31, the most recent section — an audit of `scripts/wheel/`'s own verification
   scripts) claims current self-test counts: `verify_ios_device.py --self-test` 8/8,
   `verify_cross.py --self-test` (android/device 11/11, manylinux 12/12, Windows 9/9),
   `verify_linux.py --self-test` 6/6, `build.py --self-test` LINUX 11/11 / VERIFY 4/4 /
   UPSTREAM-DIST-INFO 2/2.
   **Status: the ones checkable on this host are confirmed true.**
-  **How checked:** ran `$PY tools/wheel/build.py --self-test` directly (foreground, exit 0) —
+  **How checked:** ran `$PY scripts/wheel/build.py --self-test` directly (foreground, exit 0) —
   output matched exactly: "LINUX SELF-TEST: PASS -- 11/11", "VERIFY SELF-TEST: PASS -- 4/4",
   "UPSTREAM-DIST-INFO SELF-TEST: PASS -- 2/2" (PREFLIGHT-CACHE 3/3 also matched, not separately
   claimed as changed in §15). Did not run `verify_ios_device.py`/`verify_cross.py`/
@@ -262,13 +262,13 @@ exactly the annotation pattern this audit is supposed to add, already present.
 - **Claim (§7.10 correction blockquote):** `torch.amax`/`Tensor.amax` "now resolve and reach this
   kernel" (landed in docs/kernels/TRIL.md §2, entries in `overloads.json`/`methods.json`).
   **Status: confirmed true.** **How checked:** `grep '"amax"'` in both
-  `rust/torch_c/src/overloads.json` and `rust/torch_c/src/methods.json` (both present); live call
+  `crates/torch_c/src/overloads.json` and `crates/torch_c/src/methods.json` (both present); live call
   `torch.amax(t, dim=1)` and `t.amax(dim=1)` against the running shim — both return the kernel's
   answer (`tensor([5., 6.])` for the test input).
 - **Claim (§8.12 correction blockquote):** `tensor.rs::transposed_contiguous`, "the same copy in
   32x32 cache blocks", landed in docs/kernels/KERNELS26.md §7, wired into the SDPA call site and into
   `aten.contiguous.default`. **Status: confirmed true — the function and both call sites exist.**
-  **How checked:** `grep -rn transposed_contiguous rust/torch_c/src/` — function defined at
+  **How checked:** `grep -rn transposed_contiguous crates/torch_c/src/` — function defined at
   `tensor.rs:2390`, referenced from `aten.rs:3152` (the SDPA k-transpose path, matching the
   `aten.rs:3143` comment citing this exact function) and from `tensor.rs`'s own unit tests. Did
   not re-run the cargo benchmark that produced the 5.25x/4.84x figures (out of scope: that
@@ -304,10 +304,10 @@ still accurate (re-ran `run.sh`, 268 ok, matches this session's baseline).
   ... wrote a Python-side property override instead ... this replaces it." So the documentation
   text (apparently carried over unedited from the investigating agent's draft) describes a fix
   that had already been superseded before the commit merged.
-  **How checked:** `grep "fn dtype" rust/torch_c/src/tensor.rs` → confirms `interned(py, self.tag)`
-  is what ships today; `grep _install_tensor_dtype_identity rust/torch_c/src/bootstrap.py` →
+  **How checked:** `grep "fn dtype" crates/torch_c/src/tensor.rs` → confirms `interned(py, self.tag)`
+  is what ships today; `grep _install_tensor_dtype_identity crates/torch_c/src/bootstrap.py` →
   confirms the Python override this section's code listing shows does not exist in the file;
-  `git log -S"fn dtype(&self)" -- rust/torch_c/src/tensor.rs` → identifies `b8c3ea1` as the commit
+  `git log -S"fn dtype(&self)" -- crates/torch_c/src/tensor.rs` → identifies `b8c3ea1` as the commit
   that made the change, and `git show b8c3ea1` → confirms both the code change and the commit
   message's own account of what replaced what.
   **Downstream effect:** §9.4's cost table ("roughly doubles the cost... ~0.07 → ~0.15 µs") is
@@ -325,7 +325,7 @@ still accurate (re-ran `run.sh`, 268 ok, matches this session's baseline).
 - **Claim (test existence, §9.5's correction block):** `test_decompose_lowers_baddbmm_default_
   now_that_the_dtype_is_a_singleton` replaced the old assertion. **Status: confirmed true** —
   `grep` finds both the old test name still present (as a different function, presumably renamed
-  scope) and the new one defined at `rust/torch_c/pytests/test_shim.py:7625`.
+  scope) and the new one defined at `tests/test_shim.py:7625`.
 - Gate-count tables in §4, §8.3, §8.4's prefill table, §9.4/§9.6/§9.7's profile counts: round-scoped
   snapshots consistent with house style, not re-verified individually given time budget — no
   contradiction found while checking the items above.
@@ -347,9 +347,9 @@ similar dates.
   measured 6.2x faster) "이 회차에서 재지 않았습니다" (not measured this round) and is left as a
   named gap. **Status: still an open gap, not resolved by a later round.**
   **How checked:** `grep -rln "fused gemv\|융합 gemv\|fused_gemv\|gemv_trans"` across `docs/` and
-  `rust/torch_c/src/` — only DTYPE_PERF.md and DTYPE.md (its own prior-round source) reference it;
+  `crates/torch_c/src/` — only DTYPE_PERF.md and DTYPE.md (its own prior-round source) reference it;
   no later document or source symbol picks it up. Confirmed `widen_gemm_operand` (§5's actual
-  fix) still exists in `rust/torch_c/src/aten.rs:1860`, so the fix this round *did* land is still
+  fix) still exists in `crates/torch_c/src/aten.rs:1860`, so the fix this round *did* land is still
   in place; the fix this round explicitly declined to attempt is still undone.
 - No false claims found. The document's numeric tables are internally consistent (§3's model-level
   numbers are what §4's layout explanation is built to explain, and §6's verification counts match
@@ -381,7 +381,7 @@ be the "invented spelling" / "already landed" class of error the brief warns abo
   write-lost (materialised here, a view upstream) and this is structural (blocked by candle's
   `pub(crate)` storage boundary), not yet fixed. **Status: confirmed still true** — and this is the
   same divergence already independently confirmed in this session's baseline run of
-  `tools/golden/compare.py` (its `KNOWN DIVERGENCE` section names exactly these same two ops with
+  `tests/golden/compare.py` (its `KNOWN DIVERGENCE` section names exactly these same two ops with
   the same explanation), so it is cross-checked from two directions.
 - **Claim (§6.5):** a partial-overlap `copy_` (`x[0:2].copy_(x[1:3])`) computes a defined answer
   here where upstream raises — a known, recorded, unfixed divergence ("cost decision", not a wall).
@@ -498,7 +498,7 @@ stale silently as unrelated kernel work lands.
 
 - **Claim (§0 and §4, headline):** of 37 non-Core-ATen, capture-reachable implemented ops, 9 lower
   to Core ATen via upstream's decomposition rules. **Status: FALSE today — stale by natural
-  kernel-count growth, not a bug.** **How checked:** re-ran `rust/torch_c/pytests/decomp_sweep.py`
+  kernel-count growth, not a bug.** **How checked:** re-ran `tests/decomp_sweep.py`
   against the current build (the script itself is unchanged since this document's single commit,
   confirmed via `git log`). Current output: `_aten_all_implemented() = 157` (not 129), `non-core =
   67` (not 52), capture-rejects `22` (not 15), **population 45** (not 37), **LOWERED 11** (not 9) —
@@ -607,7 +607,7 @@ turned up its most consequential finding this pass.
   priority list but pulled in because DESIGN.md pointed at it) diagnosed the same defect, measured
   that landing the fix moves bits *only toward* upstream agreement (0 regressions, 35 cases newly
   agreeing with upstream out of 507), and left the accept/gate decision open, uncommitted, for the
-  coordinating session. `git log -S"fn batched_matmul" -- rust/torch_c/src/aten.rs` finds commit
+  coordinating session. `git log -S"fn batched_matmul" -- crates/torch_c/src/aten.rs` finds commit
   `2e00ec3` ("Perf: Fold instead of broadcasting, and stop copying the weight every call"), and
   `gemm_with_layout_fallback`/`batched_matmul` are present in the current `aten.rs` as the default
   path (`.contiguous()` now only runs as a fallback when candle refuses a strided operand) —
@@ -683,7 +683,7 @@ counts do.
   `torch._decomp.core_aten_decompositions()` has 940 entries. **Status: confirmed true, live.**
   How checked: iterated `torch.ops.aten.*` overloads checking `torch.Tag.core in op.tags` → 189;
   `len(torch._decomp.core_aten_decompositions())` → 940. No `count` primitive in
-  `tools/docwatch/check_docs.py`'s registry covers an upstream-torch-tag census (only
+  `tests/docwatch/check_docs.py`'s registry covers an upstream-torch-tag census (only
   `smoke_ok`/`golden_*`/`schema_*`/`decomp_*`, all sourced from this repo's own harnesses) — not
   markable without extending the primitive set, which is out of scope per this round's brief.
   Reported, not marked.
@@ -712,7 +712,7 @@ so §0/§10/§12's numeric tables are round-scoped, house style, not re-annotate
   `torch._C._dynamo.eval_frame.set_guard_error_hook` being unimplemented ("미구현 — 여기서
   멈췄습니다", "다음 임계 경로는 op 이 아니라 `_C._dynamo` 입니다"). **Status: FALSE today — this
   is exactly the "refusal names a kernel as missing" shape this round was told to prioritise, and
-  it is a real hit.** `git log -S"set_guard_error_hook" -- rust/torch_c/src/bootstrap.py` finds
+  it is a real hit.** `git log -S"set_guard_error_hook" -- crates/torch_c/src/bootstrap.py` finds
   `2d3663f` ("Feat: Port torch's CPU generator, and give `_C._dynamo` the two names that do
   work") — its own commit message names `set_guard_error_hook` as one of "the two names that do
   work", landed as a real no-op at `bootstrap.py:2695`. Live-verified two ways: (1)
@@ -724,7 +724,7 @@ so §0/§10/§12's numeric tables are round-scoped, house style, not re-annotate
   **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote after §8's
   table and after §0's `from_config` line, pointing at `2d3663f` and the live re-verification,
   without rewriting the original (correct-at-the-time) diagnosis. Marked
-  `<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py set_guard_error_hook present -->`.
+  `<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py set_guard_error_hook present -->`.
 - **Claim (§5, the 13/14-op table):** `arange`, `embedding`, `is_floating_point`, `isin`, `pow`,
   `randint` all now resolve and reach a kernel. **Status: confirmed true.** Marked
   `op-implemented` for `aten.arange.default`, `aten.embedding.default`,
@@ -754,7 +754,7 @@ flags). §0/§2/§8/§10's numeric tables are explicit before/after for this rou
   same failure shape as the OVERLOAD.md finding above, and arguably higher-severity: this is the
   wall FROM_CONFIG.md's own account measures `uniform_`/`normal_` being called 15/17 times during
   model init, i.e. it blocks constructing any `nn.Linear`, the single most common layer.**
-  `git log -S'"aten.uniform_.default"' -- rust/torch_c/src/aten.rs` finds the same commit as the
+  `git log -S'"aten.uniform_.default"' -- crates/torch_c/src/aten.rs` finds the same commit as the
   OVERLOAD.md fix, `2d3663f` ("Feat: Port torch's CPU generator, and give `_C._dynamo` the two
   names that do work") — its first half (ported CPU generator, MT19937) is exactly what
   `uniform_inplace`/`normal_inplace` (`aten.rs:10274`/`10350`) needed, because candle's CPU
@@ -826,7 +826,7 @@ a kernel as missing, in the "why we didn't reuse an upstream name" table.
   failure pattern flagged for extra scrutiny** (after OVERLOAD.md's `set_guard_error_hook` and
   TENSORBASE.md's `uniform_`/`normal_`), and unlike those two it was not a later regression but a
   transcription lag at the point of writing. **Found independently before this audit, in code**:
-  `rust/torch_c/src/bootstrap.py`'s own comment at the exact refusal site already says "The reason
+  `crates/torch_c/src/bootstrap.py`'s own comment at the exact refusal site already says "The reason
   given here used to be `_safe_softmax` has no kernel, and that stopped being true," and further
   notes a `_sdpa_math` composite has since been written (handling the non-flash/train-mode/dropout
   path) — none of which had been carried back into `docs/kernels/SDPA.md`. The bootstrap.py comment even
@@ -834,7 +834,7 @@ a kernel as missing, in the "why we didn't reuse an upstream name" table.
   bool-mask refusal below it, not this doc's transcription) — i.e. the code's own account already
   undercounts by one, which this audit's finding corrects.
   **How checked:** `git merge-base --is-ancestor` for the ordering; `grep -n safe_softmax
-  rust/torch_c/src/bootstrap.py` to find the self-correcting comment; live call
+  crates/torch_c/src/bootstrap.py` to find the self-correcting comment; live call
   `torch.ops.aten._safe_softmax.default(...)` succeeds against today's shim; `_sdpa_math` exists
   in `bootstrap.py` at line 5263.
   **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote directly after
@@ -853,7 +853,7 @@ a kernel as missing, in the "why we didn't reuse an upstream name" table.
 
 ### docs/design/TORCH_C.md
 
-387 lines. The genesis document — `rust/torch_c` at 3 implemented ops, before OVERLOAD.md,
+387 lines. The genesis document — `crates/torch_c` at 3 implemented ops, before OVERLOAD.md,
 TENSORBASE.md, BOOL.md, VIEWS.md existed. §5 ("다음에 와야 하는 것", next steps in priority
 order) is a five-item punch list, and this round's job is exactly to check whether "next step"
 items are still open. Checked all five against today's tree:
@@ -869,7 +869,7 @@ items are still open. Checked all five against today's tree:
   `docs/design/DESIGN.md` §5 names as the main risk of the candle path; Python scalars still get
   wrapped-number promotion. **Fixed:** added a correction noting the open question became a
   closed decision, with the opposite answer to what §2's framing implied was coming. Marked
-  `symbol-in-file rust/torch_c/src/aten.rs same_dtype present` (the function that enforces it).
+  `symbol-in-file crates/torch_c/src/aten.rs same_dtype present` (the function that enforces it).
 - **Item 3 (`torch.bool`):** **Status: closed.** `docs/numerics/BOOL.md` (unread this round, referenced
   only) is presumably the landing document. Live-verified: `hasattr(torch, 'bool')` → `True`,
   `aten.eq.Scalar(...)` returns a `torch.bool`-dtype result. **Fixed:** correction added pointing
@@ -944,7 +944,7 @@ variant, module-swap path, SmolLM2 q8_0 20/20 token match). Also opens by pointi
   `symbol-in-file` for both `batched_matmul` and `gemm_with_layout_fallback`.
 - **Claim (§7 item 4, quant.rs `_quantized_linear`):** `bfloat16` activations are refused by name
   (candle's `QMatMul::forward` only accepts f32/f16). **Status: confirmed still true.** How
-  checked: read `rust/torch_c/src/quant.rs:274-296` directly — the refusal is live in source,
+  checked: read `crates/torch_c/src/quant.rs:274-296` directly — the refusal is live in source,
   unchanged, citing `docs/numerics/DTYPE.md` §6.2 by name.
 - §2's bit-exactness verification axis (GGML block format round-trip, 6 injected-fault
   self-checks), §5's SmolLM2 q8_0/q4_0 results, §6.2-6.3's A/B cost tables: round-scoped
@@ -980,7 +980,7 @@ DECOMP.md/CAPTURE.md.
   **Fixed:** yes — struck through both §8 table cells with `> **정정 (문서 감사, 2026-09)**`
   inline corrections pointing at §7's own existing correction and at round 1's DESIGN.md finding,
   rather than leaving a same-document contradiction standing. Marked
-  `symbol-in-file rust/torch_c/src/bootstrap.py is_autocast_enabled present`.
+  `symbol-in-file crates/torch_c/src/bootstrap.py is_autocast_enabled present`.
 - §8 items 3-6 (`world_size >= 2` unimplemented, `torchnative.nn.federated` empty, no
   accelerator device abstraction, DDP machinery refused by name): not re-verified — these read as
   deliberate scope limits for this round rather than "next step" claims, and nothing else in this
@@ -1026,7 +1026,7 @@ doesn't run — was also stale.
   ...**` blockquote plus struck-through §8 table cells; `E2E_REAL.md`'s own top correction
   paragraph (which repeated CKPT2.md's now-stale claim) gets a matching strikethrough +
   correction rather than being left to repeat the error. Marked `op-implemented
-  aten.where.ScalarOther` and `symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present`
+  aten.where.ScalarOther` and `symbol-in-file crates/torch_c/src/bootstrap.py _sdpa_math present`
   on `CKPT2.md` (the `_sdpa_math` marker duplicates one already added to `SDPA.md`/`TENSORBASE.md`
   above — DOCWATCH doesn't mind the same fact being checked from multiple documents that each
   depend on it).
@@ -1127,7 +1127,7 @@ to host, 4 at 1 ULP). Mostly a measurement transcript; one refusal-shaped claim 
   in `docs/models/SAMPLING.md` just above — the overloads table kept growing in rounds after this
   document was written, and nothing came back to update it. **Fixed:** yes — added a
   `> **Correction (문서 감사, 2026-09): ...**` blockquote before the reproduction transcript,
-  cross-referencing the SAMPLING.md finding. Marked `json-key rust/torch_c/src/overloads.json
+  cross-referencing the SAMPLING.md finding. Marked `json-key crates/torch_c/src/overloads.json
   relu present`.
 - §1-§5 (environment, the 54-case battery, bit-exactness/1-ULP breakdown), §6 (the
   `_multiprocessing`/`_posixshmem` stub decision, explicitly left undecided by the document's own
@@ -1195,13 +1195,13 @@ recommendation: "abi3 를 켜라, floor 는 `abi3-py313`." Not a landing documen
 opening "현재 상태" line makes a present-tense claim about the build that the recommendation
 implicitly invites a reader to check.
 
-- **Claim (opening line):** `rust/torch_c/Cargo.toml`'s `pyo3` dependency has
+- **Claim (opening line):** `crates/torch_c/Cargo.toml`'s `pyo3` dependency has
   `features = ["extension-module"]` only — non-abi3, version-locked. **Status: FALSE today — the
-  document's own recommendation was adopted.** How checked: `rust/torch_c/Cargo.toml` line 23
+  document's own recommendation was adopted.** How checked: `crates/torch_c/Cargo.toml` line 23
   today reads `features = ["extension-module", "abi3-py313"]`. **Fixed:** yes — added a
   `> **Correction (문서 감사, 2026-09): ...**` blockquote noting the recommendation was adopted,
   without rewriting the original "current state" framing (which was true when written). Marked
-  `symbol-in-file rust/torch_c/Cargo.toml abi3-py313 present`.
+  `symbol-in-file crates/torch_c/Cargo.toml abi3-py313 present`.
 - §1-§4 (the abi3 feature-loss survey, the ~1ns boundary-call cost measurement, the cross-build
   wiring impact assessment) and §5 (PythonMultiplatform's actual interpreter version, 3.14.7 not
   3.13 — a claim about a *sibling* repository, not this one): design-rationale/measurement
@@ -1223,7 +1223,7 @@ looks for, already present.
   embedding path, `_multiprocessing`, PEP 730 `.so`→`.framework` conversion — are infrastructure/
   hardware gaps, not kernel-capability claims of the kind that go stale as `_aten_implemented()`
   grows. Not re-verified: this round's tooling has no physical iOS device or provisioning
-  profile, same constraint the document itself names, and `tools/wheel/` is outside this round's
+  profile, same constraint the document itself names, and `scripts/wheel/` is outside this round's
   territory (forbidden for edits; reading it to verify a claim would still require a device this
   environment doesn't have).
 - No refusal-shaped "kernel X is missing" claims found in this document — its subject is
@@ -1245,7 +1245,7 @@ tracking its own multi-round history rather than needing two separate audited en
   설치하지 않는다" row is an environment/tooling-availability fact (no docker/podman/colima/lima/
   qemu, by deliberate policy) rather than a kernel-capability claim — not the shape this round's
   refusal-pattern check targets, and not verified live (checking whether container tooling has
-  since been installed is outside this round's territory; `tools/wheel/`/`scripts/` are
+  since been installed is outside this round's territory; `scripts/wheel/`/`scripts/` are
   forbidden, and the claim is about host tooling, not this repo's code).
 - No refusal-shaped "kernel X is missing because Y" claims found — this document's content is
   cross-compilation plumbing (linker, glibc stubs, PyO3 cross config, manylinux tagging), not op
@@ -1511,11 +1511,11 @@ The checkpoint-reading predecessor to `docs/models/CKPT2.md` (already audited ab
   "`docs/models/CKPT.md` §6 '모르는 것' 의 첫 줄 — '실제 사전훈련 체크포인트로는 검증하지 못했습니다' —
   이 닫혔습니다." So this finding isn't new — it was already on record in a sibling document; it
   just hadn't been back-annotated into CKPT.md itself. **How checked:** `UntypedStorage.from_file`
-  exists at `rust/torch_c/src/storage.rs:211`; SmolLM2-135M's 273 tensors bit-match upstream
+  exists at `crates/torch_c/src/storage.rs:211`; SmolLM2-135M's 273 tensors bit-match upstream
   (CKPT2.md §7, independently reconfirmed live in this round's CKPT2.md/E2E_REAL.md audit above).
   **Fixed:** yes — struck through both mmap table rows and the "모르는 것" opening bullet,
   pointing at CKPT2.md's own closing text rather than re-deriving it. Marked `symbol-in-file
-  rust/torch_c/src/storage.rs from_file present`.
+  crates/torch_c/src/storage.rs from_file present`.
 - §1-§5 (the `636a3cc` diagnosis, the silent-zero-path finding, the view-backed-tensor fix), §6's
   other rows (legacy `torch.load` format, `get_record_offset_no_read`, unsupported dtypes,
   negative stride, checkpoint writing — all still refused by name, not re-verified individually
@@ -1553,16 +1553,16 @@ Two further checks, since the sub-agent's three fixes arrived unverified:
 ## Findings (round 3 — the last 24, plus LOSS.md and SCALAR.md's full read)
 
 Same method as rounds 1-2. Territory this round: `docs/*.md` except BACKWARD.md, ADAPT.md,
-TRAIN.md, CAPTURE.md (owned concurrently by another agent), plus `tools/docwatch/`. Forbidden:
-`rust/`, `tools/wheel/`, `tools/golden/`, `scripts/`, `torchnative/`.
+TRAIN.md, CAPTURE.md (owned concurrently by another agent), plus `tests/docwatch/`. Forbidden:
+`rust/`, `scripts/wheel/`, `tests/golden/`, `scripts/`, `torchnative/`.
 
 Baseline (worktree `/Volumes/macMini/worktrees/bw-doclast`, established before touching any file,
 same commands as rounds 1-2):
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          -> EXIT=0, 317 "ok " lines, DOCWATCH: PASS -- 190/190
-$PY tools/golden/compare.py                        -> EXIT=0, SUMMARY: 7685/7685 cases passed, 0 failed, ops covered=168, pending case builders=1
-$PY rust/torch_c/pytests/verify_schemas.py         -> EXIT=0, SUMMARY: 4479/4479 table entries matched upstream, 0 failed
+PYTHON=$PY sh tests/run.sh          -> EXIT=0, 317 "ok " lines, DOCWATCH: PASS -- 190/190
+$PY tests/golden/compare.py                        -> EXIT=0, SUMMARY: 7685/7685 cases passed, 0 failed, ops covered=168, pending case builders=1
+$PY tests/verify_schemas.py         -> EXIT=0, SUMMARY: 4479/4479 table entries matched upstream, 0 failed
 ```
 
 Implemented-ops snapshot captured in `/tmp/doclast_implemented_ops.txt` (168 ops). All 190
@@ -1593,7 +1593,7 @@ it was implemented. Exactly the shape this round was told to expect: a 3-op snap
   `_aten_implemented()` snapshot — all present. Live-ran the exact scenario this document's own §6
   names as the next step: `AutoModelForCausalLM.from_config(cfg)` with the identical llama config
   against our own shim (not real torch) — succeeds, and the parameter count matches this document's
-  own real-torch measurement exactly (95,040). `rust/torch_c/src/rng.rs` has a ported MT19937 engine
+  own real-torch measurement exactly (95,040). `crates/torch_c/src/rng.rs` has a ported MT19937 engine
   and `torch.manual_seed` remap, closing §4.3's "미확인" on RNG algorithm match (cross-referencing
   round 2's RNG.md/TENSORBASE.md findings, same landing commit `2d3663f`).
   **Fixed:** yes — added a `> **Correction (문서 감사, 2026-09): ...**` blockquote after the opening
@@ -1979,7 +1979,7 @@ that framing is still accurate.
   landing commit** — the same same-commit-inconsistency shape found in this round's `docs/bindings/SCHEMA.md`
   audit, not the usual "later unrelated commit" mechanism. **How checked:** `git show --stat
   2e00ec3` (this document's own single commit, "Perf: Fold instead of broadcasting, and stop copying
-  the weight every call") shows `docs/perf/LINEAR.md | 370 +++...` and `rust/torch_c/src/aten.rs | 131
+  the weight every call") shows `docs/perf/LINEAR.md | 370 +++...` and `crates/torch_c/src/aten.rs | 131
   +++...` in the same diff — the commit that contains the sentence "커밋하지 않았습니다" is itself
   the commit landing the change. Option **①** (A+B, unconditional, no opt-in) is what actually
   shipped: `gemm_with_layout_fallback`/`batched_matmul` are the default path in `aten.rs` today
@@ -2031,7 +2031,7 @@ included this round) table is the target shape this round prioritises.
   quoting the identical sentence. `git log` confirms `docs/kernels/SDPA.md`'s real landing commit
   (`4cd3bde`, 2026-08-28 21:52) is one day after `docs/numerics/BF16.md`'s (`fc89498`, 2026-08-28 15:07) —
   not the round 2 audit commit that later also touched SDPA.md's file. The block-wise kernel was
-  reproduced bit-exact (`rust/torch_c/src/flash.rs`), but it is 20x slower at T=512, so it ships
+  reproduced bit-exact (`crates/torch_c/src/flash.rs`), but it is 20x slower at T=512, so it ships
   **behind an opt-in switch, off by default** — "not reproduced" is closed, "not the default path"
   is the fact that remains. **Fixed:** yes — inline correction in §6.3's table row, naming the
   sequel and what specifically changed (closed vs. still-true halves), rather than a blanket
@@ -2077,7 +2077,7 @@ for RNG.md → generator-port and round 2's pattern for CAPTURE.md → DECOMP.md
   trip, then wiring `mm`/`linear`, then upstream 4-bit op names). Framed as a recommendation, not a
   claim about current state. **Status: adopted, and in the recommended order.** **How checked:**
   `git log` shows this document's own commit (`abc341d`, 18:23) landed about four hours before
-  `docs/graph/QUANT2.md`'s (`b032276`, 22:08) — same day. `rust/torch_c/src/tensor.rs:82` has
+  `docs/graph/QUANT2.md`'s (`b032276`, 22:08) — same day. `crates/torch_c/src/tensor.rs:82` has
   `Repr::Quantized(Arc<QTensor>)` today, and round 2's `docs/graph/QUANT2.md` audit already independently
   confirmed the SmolLM2-135M q8_0/q4_0 20/20 token-match verification axis this document's step 1
   called a prerequisite. §6.4 item 2's separate judgment — `torch.int8` itself correctly refuses by
@@ -2095,7 +2095,7 @@ for RNG.md → generator-port and round 2's pattern for CAPTURE.md → DECOMP.md
   A/B numbers and the per-layer remaining-cost table, bf16's hardware ceiling on this CPU), §5 (the
   exact-equality test suite and its own "verification lied once" self-correction — a `TORCH_C_
   ARTEFACT` omission that silently compared against a stale cached build, caught and fixed the same
-  way `pytests/run.sh`'s own comment warns about): round-scoped measurement narrative, already
+  way `tests/run.sh`'s own comment warns about): round-scoped measurement narrative, already
   unusually self-aware about its own honesty, not re-verified — no reason to suspect any.
 - §7's unknowns (device measurement, `gemm-f16`'s runtime dispatch on `neon`-only targets, fused-
   gemv at DRAM-bound model scale, further bf16-narrowing headroom, SmolLM2 model-level re-measurement
@@ -2252,7 +2252,7 @@ is between two machines of entirely different absolute scale, so a direct compar
 grounds) wherever that applies.
 
 - **Checked for staleness rather than found stale.** §5's `GEMM_THREADING_THRESHOLD = 4_000_000`
-  constant is confirmed unchanged in `rust/torch_c/src/lib.rs:601` today — the one mechanically
+  constant is confirmed unchanged in `crates/torch_c/src/lib.rs:601` today — the one mechanically
   checkable fact this document commits to a specific number for (as opposed to a ratio). §6's fix
   ("`parity` now builds the host side without `accelerate` for a gemm-vs-gemm comparison rather than
   widening the tolerance list") is a design decision, not independently re-run (`scripts/` is
@@ -2415,7 +2415,7 @@ house style before this round touched it.
 
 - **Claim (§1, the abi3 recommendation):** "조사 완료. 권고는 `abi3-py313` 을 켜는 것" (investigation
   complete, recommendation is to enable `abi3-py313`) — a recommendation, not a claim it was already
-  adopted. **Status: adopted, confirmed live.** **How checked:** `rust/torch_c/Cargo.toml:23` has
+  adopted. **Status: adopted, confirmed live.** **How checked:** `crates/torch_c/Cargo.toml:23` has
   `features = ["extension-module", "abi3-py313"]` today, with a comment citing "`abi3-py313` is
   ABI3.md §7's recommendation" — the same landing round1's `docs/design/ABI3.md` audit already confirmed
   independently. Not marked as a correction (the document never claimed adoption, only recommended
@@ -2460,8 +2460,8 @@ crates, ~36% release-build CPU time), ending in a validated but deliberately **n
 - **Claim (§9, the standing decision):** the patch stays local until one of three conditions is
   met — upstream PR #3490 merges, a public fork carries the patch, or candle is vendored into this
   repo. Until then, "이 최적화를 켜지 않습니다" (this optimization stays off). **Status: confirmed
-  still the current state.** **How checked:** `rust/torch_c/Cargo.toml` has no `[patch.crates-io]`
-  block today; `rust/torch_c/Cargo.lock` still lists `tokenizers` (line 1231). Whether upstream PR
+  still the current state.** **How checked:** `crates/torch_c/Cargo.toml` has no `[patch.crates-io]`
+  block today; `crates/torch_c/Cargo.lock` still lists `tokenizers` (line 1231). Whether upstream PR
   #3490 has since merged was not checked — `rust/`'s `Cargo.lock`/`Cargo.toml` are this round's
   forbidden territory, and confirming a GitHub PR's status is outside a documentation-claim audit's
   normal method (no live command in this repo answers it); reported as unconfirmed rather than
@@ -2481,26 +2481,26 @@ crates, ~36% release-build CPU time), ending in a validated but deliberately **n
 
 ### docs/verification/HARNESS.md
 
-375 lines, the round that found `tools/golden/compare.py`'s own self-test (`--inject-fault`) had
+375 lines, the round that found `tests/golden/compare.py`'s own self-test (`--inject-fault`) had
 only ever exercised one comparator out of ten, covering 1377 of 1781 cases (77.3%) and leaving the
 other 404 (22.7%, nine comparators for multi-result ops) never proven able to fail. §6 found three
 genuine gaps in the untested comparators themselves (indices dtype/shape not compared in
 `_pair_result_check`+`dtype-last` and `_topk_multiset_check`+`shape-last`/`dtype-last`) and
-explicitly left them unfixed as out of this document's own file scope (`tools/golden/cases.py`).
-Worth checking whether a later round — this round's own territory excludes `tools/golden/` for
+explicitly left them unfixed as out of this document's own file scope (`tests/golden/cases.py`).
+Worth checking whether a later round — this round's own territory excludes `tests/golden/` for
 edits, but not for reading — picked them up.
 
 - **Claim (§6, §4's table):** three comparator blind spots are real defects, not by-design gaps, and
   are left unfixed, with the exact one-line fix given for each. **Status: FALSE today — all three
-  closed.** **How checked:** `tools/golden/cases.py` has `indices dtype mismatch`/`indices shape
+  closed.** **How checked:** `tests/golden/cases.py` has `indices dtype mismatch`/`indices shape
   mismatch` checks at two sites (lines 6287/6295 and 9575/9578), textually matching this section's
-  own proposed fix; `tools/golden/compare.py`'s `KNOWN_GAP` dict is empty today (`KNOWN_GAP: dict[
+  own proposed fix; `tests/golden/compare.py`'s `KNOWN_GAP` dict is empty today (`KNOWN_GAP: dict[
   tuple[str, str], str] = {}`) — this section's own closing instruction ("고친 뒤에는 `KNOWN_GAP`
   에서 해당 항목을 지워야 합니다... 안 지우면 `--self-test` 가... 실패합니다") was followed,
   since `--self-test`'s design would fail loudly if a fix landed without the table update.
   **Fixed:** yes — added a `> **정정 (문서 감사, 2026-09): ...**` blockquote after §6's "고치지
   않았습니다" sentence and a shorter inline note after §4's `GAP` legend line, without editing the
-  actual `tools/golden/` files this round is forbidden from touching (only observed that another,
+  actual `tests/golden/` files this round is forbidden from touching (only observed that another,
   earlier round already had). Marked `symbol-in-file` against the literal fix text.
 - §1-§3 (the coverage-gap discovery and its historical justification — the three original `value_
   check` users were legitimately unfixable by the default pipeline when written, and became a real
@@ -2530,15 +2530,15 @@ Android alone) or from `wgpu` (one WGSL kernel covering all three targets) — a
 AGENTS.md §17.7 territory (a cross-target kernel-ownership decision beyond this task's scope). §5.4's
 "아직 하지 않은 것" (not yet done) list is the checkable "next step" shape this round prioritises.
 
-- **Claim (§5.4):** no Vulkan dependency has been added to `rust/torch_c`; `"vulkan"` is only a
-  reserved device-string placeholder in `device.rs`; `rust/vk_probe` remains a separate, unmerged
+- **Claim (§5.4):** no Vulkan dependency has been added to `crates/torch_c`; `"vulkan"` is only a
+  reserved device-string placeholder in `device.rs`; `crates/vulkan_probe` remains a separate, unmerged
   workspace member. **Status: confirmed still true today.** **How checked:**
-  `rust/torch_c/Cargo.toml` has no `ash`/`wgpu`/vulkan dependency; `device.rs:69` still only lists
-  `"vulkan"` as a device-type string in a table, with no backing implementation; `rust/vk_probe/`
+  `crates/torch_c/Cargo.toml` has no `ash`/`wgpu`/vulkan dependency; `device.rs:69` still only lists
+  `"vulkan"` as a device-type string in a table, with no backing implementation; `crates/vulkan_probe/`
   still exists as a sibling crate (`Cargo.toml`, `Cargo.lock`, `build.rs`, `shaders/`, `src/`) with
-  no reference from `rust/torch_c`.
+  no reference from `crates/torch_c`.
 - **Claim (§5.3, the deferred decision):** whether Apple GPU support goes through candle's `metal`
-  feature (favoring `ash`) is still open, evidenced by `rust/torch_c/Cargo.toml` currently enabling
+  feature (favoring `ash`) is still open, evidenced by `crates/torch_c/Cargo.toml` currently enabling
   only `accelerate` on Apple targets, not `metal`. **Status: confirmed still true today** —
   `Cargo.toml:107` still reads `features = ["accelerate"]` only; `metal` is absent. The decision
   this document flagged as outside its own scope remains unmade.
@@ -2554,7 +2554,7 @@ AGENTS.md §17.7 territory (a cross-target kernel-ownership decision beyond this
   the two claims above — no reason to suspect any, and the document's own tamper self-test (§1) is
   already the kind of "can this check actually fail" demonstration this audit looks for.
 - **Fixed: none — no false or stale claims found.** Both checkable "not yet done" claims (no Vulkan
-  dependency wired into `rust/torch_c`, the Apple-GPU-backend decision still unmade) remain
+  dependency wired into `crates/torch_c`, the Apple-GPU-backend decision still unmade) remain
   accurate; the decision this document explicitly declined to make on its own authority has not
   been made by anyone else either.
 

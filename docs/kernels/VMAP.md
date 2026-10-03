@@ -18,7 +18,7 @@ the demand turned out to be far narrower than "vmap", and it is fenced so that
 anything outside that narrowness still refuses.
 
 The assertions behind every claim here live in
-`rust/torch_c/pytests/test_vmap.py`.
+`tests/test_vmap.py`.
 
 ---
 
@@ -151,7 +151,7 @@ is not a limitation to work around later; it is why §4.1 refuses a 2-D
 
 ## 3. What was built
 
-`rust/torch_c/src/bootstrap.py`, in the functorch section, next to the dynamic
+`crates/torch_c/src/bootstrap.py`, in the functorch section, next to the dynamic
 layer stack that was already there. Four names that were raising stubs:
 
     _vmap_increment_nesting     pushes a level, after checking §4.1
@@ -316,7 +316,7 @@ about batching rules can be made then, with that closure in hand.
 
 ## 6. Which architectures clear
 
-`pytests/arch_sweep.py --only nemotron3_5_asr nemotron_asr_streaming
+`tests/arch_sweep.py --only nemotron3_5_asr nemotron_asr_streaming
 nemotron_asr_streaming_encoder t5gemma2`, shim side, after this round:
 
 | architecture | before | after |
@@ -361,11 +361,11 @@ up without the thing behind it going up as far.
   multiple outputs, with `out_dims=None`, or over anything that is not a
   scalar closure: all refuse.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _VMAP_MAX_RANK present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _vmap_self_check present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _VmapBroadcastInterpreter present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vmap.py test_the_vmapped_mask_is_bit_identical_to_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vmap.py test_a_closure_that_reads_across_the_batch_dimension_is_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vmap.py test_vmap_landed_without_a_kernel_or_a_repr_arm present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _VMAP_MAX_RANK present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _vmap_self_check present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _VmapBroadcastInterpreter present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vmap.py test_the_vmapped_mask_is_bit_identical_to_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vmap.py test_a_closure_that_reads_across_the_batch_dimension_is_refused present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vmap.py test_vmap_landed_without_a_kernel_or_a_repr_arm present -->
 <!-- DOCWATCH: count golden_ops_covered ge 287 -->
 <!-- DOCWATCH: count golden_cases_passed ge 10691 -->

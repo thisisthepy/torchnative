@@ -104,7 +104,7 @@ dir(_C._nn) = 70,  전부 function,  호출 결과 Counter({'NotImplementedError
 `1 - x` 는 메서드처럼 보이지만, 벤더링된 트리는 이렇게 씁니다.
 
 ```python
-# torchnative/src/main/torch/_tensor.py:1108
+# python/torch/_tensor.py:1108
 def __rsub__(self, other):
     return _C._VariableFunctions.rsub(self, other)
 ```
@@ -187,12 +187,12 @@ Llama 는 `repeat_kv` 를 스스로 하고 `False` 로 넘기므로 경로에 �
 
 ## 7. 판정 — 실제로 도는가
 
-`vendor/install_shim.sh` 로 벤더 트리에 넣고, **같은 스크립트를 상류 torch 와 벤더 트리에서 각각
+`scripts/vendor/install_shim.sh` 로 벤더 트리에 넣고, **같은 스크립트를 상류 torch 와 벤더 트리에서 각각
 돌려** 숫자를 대조했습니다. 가중치는 결정적 공식으로 채워 양쪽이 같은 수를 받습니다.
 
 ```
 상류  /Volumes/macMini/caches/spike-venv/.../torch/__init__.py
-셰임  /Volumes/macMini/thisisthepy/torchnative/torchnative/src/main/torch/__init__.py
+셰임  /Volumes/macMini/thisisthepy/torchnative/python/torch/__init__.py
 ```
 
 | 케이스 | n | 최대 상대오차 |
@@ -232,7 +232,7 @@ RoPE(`cos`/`sin`/`cat`/`-x`), `F.scaled_dot_product_attention(is_causal=True)`, 
 | `--inject-fault value` | exit 1 |
 | `--inject-fault shape` | exit 1 |
 | `--inject-fault dtype` | exit 1 |
-| 스모크 (`pytests/run.sh`) | exit 0, 62 ok |
+| 스모크 (`tests/run.sh`) | exit 0, 62 ok |
 | 스키마 (`verify_schemas.py`) | exit 0, **154/154** |
 | 호스트 빌드 | exit 0 |
 | Android (`aarch64-linux-android`) | exit 0 |

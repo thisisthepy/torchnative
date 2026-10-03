@@ -381,7 +381,7 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 되돌립니다. 단계 0 의 step 은 캡처도 테이프도 옵티마이저도 쓰지 않습니다: 선택된 정규화 모듈을
 forward 동안만 training 모드로 두어 러닝 통계가 갱신되게 하고, 원래 모드로 되돌립니다.
 `torchnative.adapt.BatchNormStats` 가 그것이고, 상류 torch 가 같은 모듈을 같은 모드로 돌렸을 때의
-통계와 대조해 검증합니다 (`rust/torch_c/pytests/test_stage0.py`).
+통계와 대조해 검증합니다 (`tests/test_stage0.py`).
 
 TTL 은 이 델타가 사는 범위이고 (§3 의 중첩), TTA · TTT 는 그 안의 좁은 영역입니다. 따라서
 **`adapt/` 아래에 TTA 와 TTT 를 나란한 모듈로 두면 안 됩니다** — 중첩을 평평하게 펴는 것이라,
@@ -935,10 +935,10 @@ autograd 에 쓸 수 없으므로, **online/offline 을 오가는 `ttadapters` �
 > 임포트가 사라지고 docstring 만 남아, `import torchnative.nn.federated` 가 예외 없이 성공합니다
 > (재확인). 어느 커밋이 고쳤는지는 추적하지 않았다 — 이 문서 감사의 범위는 현재 상태 확인까지다.
 >
-> Standing check (docs/verification/DOCWATCH.md) — path is `torchnative/src/main/torchnative/...` in this
+> Standing check (docs/verification/DOCWATCH.md) — path is `python/torchnative/...` in this
 > tree, not the bare `torchnative/...` §9 above writes (the vendored tree's own root):
-> <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py DistributedDataFederated absent -->
-> <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/api/__init__.py "*args, *kwargs" absent -->
+> <!-- DOCWATCH: symbol-in-file python/torchnative/nn/federated/__init__.py DistributedDataFederated absent -->
+> <!-- DOCWATCH: symbol-in-file python/torchnative/api/__init__.py "*args, *kwargs" absent -->
 
 ---
 
@@ -997,7 +997,7 @@ torchnative/
 │     ├─ android/  ios/  macos/  linux/  windows/
 │     └─ test/
 │
-├─ tools/scan/                   정적 스캔 (§6). 배포물 아님, CI 전용
+├─ scripts/scan/                   정적 스캔 (§6). 배포물 아님, CI 전용
 └─ docs/design/DESIGN.md
 ```
 
@@ -1200,15 +1200,15 @@ F.linear, lm_head 모양 (49152 × 576, 가중치 113 MB)
 > 쪽으로만 움직인다는 것(507 케이스 중 48 개 변경, 상류 이탈 0 · 상류 일치로 개선 35)을 재서
 > 두 갈래 선택지(그대로 착지 vs `docs/kernels/SDPA.md` 식 옵트인)를 제시했다. `git log -S` 로 확인:
 > 커밋 `2e00ec3` "Perf: Fold instead of broadcasting, and stop copying the weight every call"
-> 가 그 변경을 **옵트인이 아니라 기본값으로 착지**시켰다 — `rust/torch_c/src/aten.rs`
+> 가 그 변경을 **옵트인이 아니라 기본값으로 착지**시켰다 — `crates/torch_c/src/aten.rs`
 > 의 `gemm_with_layout_fallback`/`batched_matmul` 가 지금 이 빌드에 있고,
 > `lhs.contiguous()?, rhs.contiguous()?` 가 candle 이 스트라이드 실패로 거절할 때만 도는
 > 폴백으로 바뀌어 있다(재확인). LINEAR.md §6 에 이후에도 남은 벽 다섯 개(bf16/f16 가중치가
 > 여전히 호출마다 넓혀짐 등)가 이름으로 적혀 있다.
 >
 > Standing check (docs/verification/DOCWATCH.md):
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_with_layout_fallback present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs gemm_with_layout_fallback present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs batched_matmul present -->
 
 **이 결함이 다른 수치를 오염시킵니다.** `docs/graph/QUANT2.md` 의 "27 배" 는 대부분 양자화가 아니라
 이 복사를 피한 것입니다. 전치 복사가 없는 밀집 경로와 비교하면 양자화는 이 호스트에서

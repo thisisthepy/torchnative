@@ -73,7 +73,7 @@ each moved with the arithmetic that keeps it a check (§8).
                       15 blocked       2 blocked
 ```
 
-`rust/torch_c/pytests/arch_sweep.py --only <the fifteen>`, run on both sides. Upstream forwards
+`tests/arch_sweep.py --only <the fifteen>`, run on both sides. Upstream forwards
 all fifteen (the baseline docs/architectures/ARCH100.md established, re-confirmed here rather than assumed);
 the shim forwards thirteen.
 
@@ -118,7 +118,7 @@ being dominated by one family applies here too.
 
 **`reduce=` is not implemented, and the measurement is the reason.** Not one of the eleven passes
 it. `scatter.reduce` and `scatter.value_reduce` have no kernel and no table entry; the refusal is
-the *unimplemented-op* one, which is a precise work item. `pytests/test_scatter.py` has a test
+the *unimplemented-op* one, which is a precise work item. `tests/test_scatter.py` has a test
 that fails if that ever silently changes.
 
 <!-- DOCWATCH: op-not-implemented aten.scatter.reduce -->
@@ -292,7 +292,7 @@ Output is `int64`, or `int32` with `out_int32=True`, with `self`'s shape (0-d fo
 overload). `torch.bucketize` exists upstream and `Tensor.bucketize` does **not**
 (`hasattr(torch.Tensor, "bucketize")` is `False` on 2.13.0), so it is `overloads.json`-only.
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json bucketize present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json bucketize present -->
 
 ---
 
@@ -399,9 +399,9 @@ architectures use the functional form and rebind — and adding it would be one 
 identity and one more `_view_write_cases` entry for a spelling nobody reached. It is a decision,
 recorded here, not an oversight.
 
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json masked_scatter present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json scatter_ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json prod present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json masked_scatter present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json scatter_ present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json prod present -->
 
 ---
 
@@ -451,13 +451,13 @@ check on the schema parse rather than a restatement of what changed.
 ## 9. Where the tests are, and what each can fail on
 
 ```text
-tools/golden/cases.py       164 new cases across eight ops (34 scatter.value, 36 scatter_.value,
+tests/golden/cases.py       164 new cases across eight ops (34 scatter.value, 36 scatter_.value,
                             2 scatter_.src, 18 masked_scatter, 20 bucketize.Tensor,
                             21 bucketize.Scalar, 21 prod.default, 12 prod.dim_int), every one
                             compared against upstream element-wise, in a separate process.
                             Boundary values, dtype refusals, and the view-write cases for
                             scatter_.
-rust/torch_c/pytests/test_scatter.py
+tests/test_scatter.py
                             23 tests, all through the USER-LEVEL spelling (torch.<name> /
                             Tensor.<name>), each comparing a vendored-tree subprocess against
                             an upstream subprocess with PYTHONPATH stripped. Nothing here is a
@@ -481,10 +481,10 @@ Three of them are shaped so that they cannot pass against a plausible wrong impl
 * `test_prod_accumulates_step_by_step_in_the_output_dtype` asserts the answer is **not**
   `2.171875`, which is precisely what the obvious f64-accumulator implementation returns.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs scatter_value present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs masked_scatter_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs bucketize_position present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs int_narrower present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs scatter_value present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs masked_scatter_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs bucketize_position present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs int_narrower present -->
 
 ---
 
@@ -501,7 +501,7 @@ Three of them are shaped so that they cannot pass against a plausible wrong impl
 | `.out` variants of all five ops | dead keys against the `reach_allow.json` ratchet |
 
 <!-- `smoke_ok` counts `test_shim.py` alone, which is how docwatch measures it (a fresh
-     stage, `pytests/` NOT on PYTHONPATH, so the split-off suite files do not run). The whole
+     stage, `tests/` NOT on PYTHONPATH, so the split-off suite files do not run). The whole
      suite is 504: 479 here + 23 in `test_scatter.py` + 2 in `test_split_probe.py`. -->
 <!-- DOCWATCH: count smoke_ok ge 479 -->
 <!-- DOCWATCH: count golden_cases_passed ge 9301 -->

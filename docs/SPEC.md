@@ -6,15 +6,15 @@ A behaviour change starts here, then a failing test, then code (AGENTS.md rule 5
 **How to read the status.** Each item is `implemented`, `partial` or `planned`.
 
 - `implemented` means a test in this repository asserts the behaviour; the test is cited as
-  `file::function`. Suites under `rust/torch_c/pytests/` run in the gate
-  (`bash rust/torch_c/pytests/run.sh`, AGENTS.md §13); `torchnative/src/test/` holds the
-  package-level import tests. This document was written by reading those tests, **not** by running
+  `file::function`. Suites under `tests/` run in the gate
+  (`bash tests/run.sh`, AGENTS.md §13), the package-level import tests
+  (`tests/test_import.py`) among them. This document was written by reading those tests, **not** by running
   the gate; the last recorded gate result is the baseline in AGENTS.md §13.
 - `partial` means some of the stated behaviour is asserted and the rest is named as missing.
 - `planned` means no test asserts it yet. A roadmap claim never upgrades an item.
 - Claim grades follow AGENTS.md §16: *builds* / *reaches* / *agrees*.
 
-Test paths below are relative to `rust/torch_c/pytests/` unless they start with another directory.
+Test paths below are relative to `tests/` unless they start with another directory.
 
 ---
 
@@ -24,7 +24,7 @@ Test paths below are relative to `rust/torch_c/pytests/` unless they start with 
 |---|---|---|---|
 | S1.1 | `import torch` resolves to upstream's vendored Python tree with **our** `torch._C`; probes can tell the shim from upstream via `torch._C._aten_implemented`. | implemented | `test_shim.py::test_every_advertised_op_is_actually_dispatchable`; `test_tnnamespace.py::test_importing_torchnative_does_not_import_torch` |
 | S1.2 | **Single door:** every operator reaches its kernel through `_aten_dispatch`; dispatch modes see the same operators as upstream, in the same order. | implemented | `test_dispatch.py::test_a_mode_sees_the_same_operators_as_upstream_in_the_same_order`, `::test_the_replaced_call_never_reaches_a_kernel`; `test_shim.py::test_the_dispatch_table_matches_the_two_lists` |
-| S1.3 | **Agreement with upstream:** each implemented ATen op is compared against upstream torch on value, shape and dtype (golden harness); the harness injects faults into its own comparators (`--self-test`). | implemented | `tools/golden/compare.py`, `tools/golden/cases.py` (run by the gate); DOCWATCH markers `golden_cases_failed eq 0`, `golden_pending eq 0` in `README.md` |
+| S1.3 | **Agreement with upstream:** each implemented ATen op is compared against upstream torch on value, shape and dtype (golden harness); the harness injects faults into its own comparators (`--self-test`). | implemented | `tests/golden/compare.py`, `tests/golden/cases.py` (run by the gate); DOCWATCH markers `golden_cases_failed eq 0`, `golden_pending eq 0` in `README.md` |
 | S1.4 | **Refusal by name:** an unsupported op, argument form, dtype or device refuses with its own name and reason; it never falls back silently. | implemented | `test_shim.py::test_ops_without_a_meta_kernel_name_themselves`; `test_vulkan4.py::test_an_op_that_is_not_taught_refuses_and_names_itself`; `test_argform.py::test_a_per_axis_differing_stride_is_still_refused_by_name` |
 | S1.5 | The `meta` device carries shape and dtype without storage, with the dense kernels' promotion rules, enough for `from_pretrained` init paths that compute on meta. | implemented | `test_shim.py::test_meta_tensors_carry_shape_and_dtype_and_no_data`, `::test_the_llama3_rope_init_runs_on_meta_end_to_end` |
 | S1.6 | Seeded RNG (`uniform_`, `bernoulli_`, …) reproduces upstream's stream. | implemented | `test_shim.py::test_uniform_matches_torchs_stream_bit_for_bit`, `::test_bernoulli_draws_in_double_for_every_dtype` |
@@ -56,7 +56,7 @@ Test paths below are relative to `rust/torch_c/pytests/` unless they start with 
 | S4.1 | `torchnative.device` offers `cpu`/`mps`/`vulkan`/`cuda`/`npu`; every availability answer names the probe behind it; `npu` resolves per host and never resolves to the CPU; eager and compiled devices differ by type. | implemented | `test_devicens.py::test_the_namespace_has_the_decided_members`, `::test_npu_never_resolves_to_the_cpu`, `::test_eager_and_compiled_are_distinguished_by_type_not_by_convention` |
 | S4.2 | `nn.Module.to(<torchnative device>)` keeps upstream semantics for every ordinary argument and returns the same module. | implemented | `test_devicens.py::test_to_is_unchanged_for_every_ordinary_argument_form`, `::test_ordinary_calls_reach_upstream_with_identical_arguments` |
 | S4.3 | `torchnative.transformers` exposes every `Auto*` class (enumerated, not hand-listed) subclassing upstream; unsupported arguments (`export=`, `load_in_4bit=`) refuse by name. | implemented | `test_tntransformers.py::test_the_family_is_enumerated_not_hand_listed`, `::test_export_refuses_by_name`, `::test_load_in_4bit_refuses_by_name` |
-| S4.4 | `import torchnative` does not import `torch`; every subpackage is reachable. | implemented | `test_tnnamespace.py::test_importing_torchnative_does_not_import_torch`; `torchnative/src/test/test_import.py` |
+| S4.4 | `import torchnative` does not import `torch`; every subpackage is reachable. | implemented | `test_tnnamespace.py::test_importing_torchnative_does_not_import_torch`; `tests/test_import.py` |
 
 ## S5. Accelerator back ends (front end fixed, back end swapped)
 
@@ -85,7 +85,7 @@ Test paths below are relative to `rust/torch_c/pytests/` unless they start with 
 
 | # | Behaviour | Status | Evidence |
 |---|---|---|---|
-| S7.1 | `torchnative.kernels`: a bundle resolver satisfying the HF `kernels` contract, resolving at build time on mobile. | planned | `torchnative/src/main/torchnative/kernels/__init__.py` is a docstring only; `torchnative/src/test/test_import.py` only imports it |
+| S7.1 | `torchnative.kernels`: a bundle resolver satisfying the HF `kernels` contract, resolving at build time on mobile. | planned | `python/torchnative/kernels/__init__.py` is a docstring only; `tests/test_import.py` only imports it |
 | S7.2 | `torchnative.api.TorchNativeAPI`: deployment, lifetime policy, device orchestration. | planned | skeleton class; no behavioural test |
 | S7.3 | Flash-attention / flash-linear-attention kernels across platforms. | planned | no test |
 
@@ -95,8 +95,8 @@ Test paths below are relative to `rust/torch_c/pytests/` unless they start with 
 |---|---|---|---|
 | S8.1 | Nine platform wheel targets, all `cp313-abi3`; Android x86_64 refuses by name; tags match what `packaging` generates. | implemented | `test_wheelmatrix.py::test_the_android_tags_are_what_packaging_generates`, `::test_the_readme_does_not_call_a_never_executed_target_measured` |
 | S8.2 | The version lives only in `pyproject.toml`, is a pre-release, and the README never claims an unpublished version is on PyPI. | implemented | `test_release.py::test_pyproject_is_the_only_place_a_version_is_declared`, `::test_the_readme_does_not_claim_an_unpublished_version_is_on_pypi` |
-| S8.3 | Release CI: a `v*` tag builds and publishes the wheels via PyPI Trusted Publishing; the tag must equal the version. | implemented | `test_cipub.py` (static checks over `.github/workflows/publish-pypi.yml` and `tools/ci/check_tag_version.py`) |
-| S8.4 | `main` carries a reduced, CI-generated layout reached only by a pull request from `release` (`tools/release/sync-release.sh`). | partial | `tools/release/test-sync-release.sh` passes; `tools/release/publish_main.sh` (a different, local mechanism) is still present and tested by `test_publish.py` — see PROJECT.md "릴리스" |
+| S8.3 | Release CI: a `v*` tag builds and publishes the wheels via PyPI Trusted Publishing; the tag must equal the version. | implemented | `test_cipub.py` (static checks over `.github/workflows/publish-pypi.yml` and `.github/scripts/check_tag_version.py`) |
+| S8.4 | `main` carries a reduced, CI-generated layout reached only by a pull request from `release` (`.github/scripts/release/sync-release.sh`, run by `release-sync.yml`); that layout keeps `docs/guide/`, the Pages site. | implemented | `.github/scripts/release/test-sync-release.sh` passes; `test_publish.py::test_docs_guide_survives_the_main_only_layout`, `::test_the_guide_check_can_fail` |
 
 ---
 

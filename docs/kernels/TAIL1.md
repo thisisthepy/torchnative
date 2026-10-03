@@ -183,7 +183,7 @@ The binding for each is one line in `bootstrap.py`, beside the `upsample_bilinea
 `bootstrap.py:2780` already writes. **This round did not own `bootstrap.py`,** so the state is
 pinned rather than fixed, in three places that all fail when it changes:
 
-* `tools/golden/reach_allow.json` — one `shape2_kernel_without_spelling` entry each, each naming
+* `tests/golden/reach_allow.json` — one `shape2_kernel_without_spelling` entry each, each naming
   the fix. An entry whose gap has closed fails the suite, so closing it deletes the entry.
 * `test_tail1.py::test_two_kernels_still_have_no_python_spelling_and_it_is_one_line_each` —
   runs the vendored tree in a subprocess and asserts all three (including `nn.MSELoss`) still
@@ -264,13 +264,13 @@ not inferred from `(m, 0)`.
 Every op is compared against upstream element-wise, on inputs where a plausible wrong
 implementation differs.
 
-* **Golden harness** (`tools/golden/cases.py`, run against upstream in a separate process):
+* **Golden harness** (`tests/golden/cases.py`, run against upstream in a separate process):
   <!-- DOCWATCH: count golden_cases_total ge 9360 -->
   <!-- DOCWATCH: count golden_cases_passed ge 9360 -->
   <!-- DOCWATCH: count golden_ops_covered ge 233 -->
   <!-- DOCWATCH: count golden_pending eq 0 -->
   9360 cases pass of 9360, 233 ops covered, 0 pending builders.
-* **`pytests/test_tail1.py`**, a new suite file (`run.sh` globs `pytests/test_*.py`; the file
+* **`tests/test_tail1.py`**, a new suite file (`run.sh` globs `tests/test_*.py`; the file
   shares helpers with `test_shim` the way `test_split_probe.py` does).
 * Three pinned counts in `test_shim.py` moved and each carries the arithmetic that keeps it a
   check: `tag_core_count` 110 → 112 (`acos` and `logical_and` are the only two of the nine that
@@ -292,26 +292,26 @@ The ops now in `_aten_implemented()`:
 
 and the table rows that make six of them callable:
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json broadcast_tensors present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json logical_and present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json acos present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json argsort present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json max_pool1d present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json _is_all_true present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json _is_all_true present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json argsort present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json broadcast_tensors present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json logical_and present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json acos present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json argsort present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json max_pool1d present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json _is_all_true present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json _is_all_true present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json argsort present -->
 
 There is deliberately **no** `torch.linalg_qr` or `torch.upsample_nearest2d` row, and upstream
 has neither name:
 
 <!-- DOCWATCH: hasattr linalg_qr false -->
 <!-- DOCWATCH: hasattr upsample_nearest2d false -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json linalg_qr absent -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json upsample_nearest2d absent -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json linalg_qr absent -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json upsample_nearest2d absent -->
 
 ### 6.1 One entry outside this round's territory
 
-`rust/torch_c/src/device.rs`'s `MPS_HOST_READBACK_OPS` gained four names (`acos`, `linalg_qr`,
+`crates/torch_c/src/device.rs`'s `MPS_HOST_READBACK_OPS` gained four names (`acos`, `linalg_qr`,
 `max_pool1d`, `upsample_nearest2d`) and its length went 56 → 60. That list is a **safety
 ratchet**: an op that reads device bytes back to the host and is not on it computes a wrong
 answer on `mps` instead of refusing, and `test_the_mps_readback_list_is_what_the_kernels_actually_do`
@@ -321,7 +321,7 @@ round was given.
 
 ## 7. The sweep after
 
-`pytests/arch_sweep.py`, re-run. What the nine ops actually move:
+`tests/arch_sweep.py`, re-run. What the nine ops actually move:
 
 * **`gemma3n_text`** clears `broadcast_tensors`.
 * **`longt5`** clears `logical_and`. **`yoso`** clears `acos`. **`canine`** clears `max_pool1d`.

@@ -98,9 +98,9 @@ patch, and the argument-form class as a whole (four of the seven) is cheaper tha
 close — no new operator, no candle call, just a wider dispatch table entry.
 
 Verified directly against this worktree's freshly built shim
-(`PYTHONPATH=.../torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>`),
+(`PYTHONPATH=.../python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>`),
 not read from a stale JSON — every one of the seven above reproduced its listed wall when run
-individually, after `cargo build --release` and `vendor/install_shim.sh` in this worktree.
+individually, after `cargo build --release` and `scripts/vendor/install_shim.sh` in this worktree.
 
 ## 3. The delta against ARCH200 — newly forwarding / moved wall / unchanged
 
@@ -189,7 +189,7 @@ the upstream-clean set that ARCH200's 27 did not already account for.
   confined to this document's own territory (`README.md`, `docs/architectures/ARCH300.md`, a pointer added to
   `docs/architectures/ARCH200.md`'s head, `docs/platform/RELEASE_0_1_0b0.md`).
 * **Suite gate: 868 ok, `DOCWATCH: PASS` 777/777, `EXIT=0`**, measured in this worktree on a
-  freshly built shim (`cargo build --release` then `vendor/install_shim.sh`,
+  freshly built shim (`cargo build --release` then `scripts/vendor/install_shim.sh`,
   `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-arch300`), with `PYTHON=$PY` set for
   `run.sh` — its default `python3` lacks numpy in this environment.
 
@@ -199,14 +199,14 @@ Same method as ARCH100 §7 / ARCH200 §6 — `arch_sweep.py` needed no changes t
 
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-cd rust/torch_c/pytests
+cd tests
 
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
+PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL          $PY arch_sweep.py --out /tmp/upstream.json
 $PY arch_sweep.py --compare /tmp/shim.json /tmp/upstream.json
 
 # to re-check one architecture against the live shim without a full 528-way sweep:
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>
+PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>
 ```
 
 This round did not re-run the full upstream sweep — §0 records exactly why the reuse was
@@ -218,9 +218,9 @@ read from that earlier JSON.
 ## 6. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    868 ok, 0 FAIL, exit 0
+tests/run.sh    868 ok, 0 FAIL, exit 0
 DOCWATCH                       PASS -- 777/777 evaluated marker(s) hold
-tools/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
+tests/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
 ```
 
 All three measured on the freshly built `lib_C.dylib` in this worktree
@@ -236,8 +236,8 @@ landing operator work in parallel worktrees while this document was written, so 
 is `ge`, not `eq` — a later round raising the forward count is progress, not a contradiction of
 this one.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11336 -->
 <!-- DOCWATCH: count golden_ops_covered ge 299 -->

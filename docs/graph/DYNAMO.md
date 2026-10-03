@@ -139,7 +139,7 @@ from transformers.generation.utils import GenerationMixin
 `torch.compile` 을 쓰지 않는 한 아무도 관측하지 않습니다. 그러므로 시그니처(인자 개수·타입)만
 맞는 아무 동작 없는 no-op 이면 충분합니다 — 예외만 던지지 않으면 됩니다.
 
-`.pyi` 스텁(`torchnative/src/main/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
+`.pyi` 스텁(`python/torch/_C/_dynamo/eval_frame.pyi:12-18`)의 실제 시그니처:
 
 ```python
 def set_guard_error_hook(hook: DynamoGuardHook) -> None: ...
@@ -198,14 +198,14 @@ B·C 단계에서 **`_C._dynamo` 이름이 단 하나도 추가로 접근되지 
 
 ## 5. 부수 발견 — 기존 `surface.json` 이 이 표면을 놓치고 있었다
 
-`vendor/gen_surface.py::submodule_stubs()` 는 `torch/_C/` 아래에서 `.pyi` 파일 또는
+`scripts/vendor/gen_surface.py::submodule_stubs()` 는 `torch/_C/` 아래에서 `.pyi` 파일 또는
 `__init__.pyi` 가 있는 디렉터리를 **한 항목**으로 등록합니다. `_dynamo/` 는 디렉터리이고
 `__init__.pyi` 가 있으므로 **"_dynamo" 라는 이름 하나**로 등록되고, 그 안의
 `eval_frame.pyi`(105줄) · `guards.pyi`(509줄) · `compiled_autograd.pyi`(13줄) 는
 **재귀적으로 파싱되지 않습니다.**
 
 ```
-$ python3 -c "import json; d=json.load(open('rust/torch_c/src/surface.json'));
+$ python3 -c "import json; d=json.load(open('crates/torch_c/src/surface.json'));
               print(d['submodules']['_dynamo'])"
 {'functions': ['strip_function_call', 'is_valid_var_name', 'get_type_slots', 'has_slot'],
  'types': {'PyMappingSlots': ..., 'PyNumberSlots': ..., 'PySequenceSlots': ..., 'PyTypeSlots': ...},
@@ -266,10 +266,10 @@ IMPORT_TORCH.md 의 관문 조건(`transformers` 가 요구하는 `torch >= 2.5.
 
 1. **`_C._dynamo` 를 패키지로 등록**하고 그 아래 4개 서브모듈(`eval_frame` · `guards` ·
    `utils` · `compiled_autograd`)도 패키지로 등록합니다 — VENDOR.md 벽 8과 같은 메커니즘
-   (`_SubmoduleFinder`, `rust/torch_c/src/bootstrap.py:260` 부근)을 그대로 재사용하면 됩니다.
+   (`_SubmoduleFinder`, `crates/torch_c/src/bootstrap.py:260` 부근)을 그대로 재사용하면 됩니다.
    이미 있는 인프라입니다.
 2. **52개 이름을 채웁니다** — 소스는 이미 벤더링된 `.pyi` 3개
-   (`torchnative/src/main/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
+   (`python/torch/_C/_dynamo/{eval_frame,guards,compiled_autograd}.pyi`)와 §3.1의 접근 목록의
    교집합입니다. 클래스(19개)는 빈 몸체의 자리표 타입으로, 함수(29개, 호출 2개 제외)는
    시그니처만 맞춘 no-op 으로 충분합니다 — **호출되지 않으므로 동작을 구현할 필요가 없습니다.**
 3. **`set_guard_error_hook` · `set_code_exec_strategy` 2개만 신경 씁니다** — 인자 개수와
@@ -358,14 +358,14 @@ README 의 "Dynamo 안에서 멈춘다"는 한 줄을 대체하는 것이 목적
 ## 10. 실행 환경과 정직성 노트
 
 산출물이 낡아 있었습니다 — `$CARGO_TARGET_DIR/release/lib_C.dylib` 의 mtime 이 8/24 였고, 이번
-조사는 8/30 부터입니다. **측정 전에 `vendor/install_shim.sh` 로 다시 빌드하고 설치했습니다**
+조사는 8/30 부터입니다. **측정 전에 `scripts/vendor/install_shim.sh` 로 다시 빌드하고 설치했습니다**
 (경고 1개, `dtype.rs::by_name` dead-code, 무해). 이 문서의 모든 트레이스백은 그 재빌드 이후
 산출물로 낸 것입니다.
 
 ```
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 export TORCH_USE_RTLD_GLOBAL=1
-export PYTHONPATH=<worktree>/torchnative/src/main
+export PYTHONPATH=<worktree>/python
 ```
 
 이 파트에서 "됐다"고 적은 모든 것은 **스텁을 얹은 뒤의 결과**입니다. 스텁을 얹지 않은 원래
@@ -526,7 +526,7 @@ tree-view 노드 타입이 줄줄이 필요합니다. 이건 **막힌 심볼 하
 | 5 | `eval_frame.set_fullgraph_compiled_frame_count` | 부기 | `lambda v: -1` |
 | 6 | `torch._C._dispatch_tls_local_include_set` | 디스패치 키 TLS 조회 | 빈 `DispatchKeySet()` 리턴 |
 | 7 | `torch._C._dispatch_tls_local_exclude_set` | 〃 | 〃 |
-| 8 | `torch._C._ForceDispatchKeyGuard` | 컨텍스트 매니저 | **다른 종류의 실패** — `TypeError: '...' object does not support the context manager protocol`. 합성된 클래스는 생성은 되지만(`_permissive_init`) `__enter__`/`__exit__` 는 안 생깁니다 — 이 셰임의 모듈 catch-all(`_attach_module_catchall`, `rust/torch_c/src/bootstrap.py:360`)이 던더는 일부러 걸러내기 때문(`if attr.startswith("__") ...: raise AttributeError`). 진짜 `__enter__`/`__exit__` 를 가진 클래스로 교체 |
+| 8 | `torch._C._ForceDispatchKeyGuard` | 컨텍스트 매니저 | **다른 종류의 실패** — `TypeError: '...' object does not support the context manager protocol`. 합성된 클래스는 생성은 되지만(`_permissive_init`) `__enter__`/`__exit__` 는 안 생깁니다 — 이 셰임의 모듈 catch-all(`_attach_module_catchall`, `crates/torch_c/src/bootstrap.py:360`)이 던더는 일부러 걸러내기 때문(`if attr.startswith("__") ...: raise AttributeError`). 진짜 `__enter__`/`__exit__` 를 가진 클래스로 교체 |
 | — | `torch._C._functorch.get_dynamic_layer_stack_depth` | — | **이미 진짜로 구현돼 있었습니다.** 스텁 없이 통과 — functorch/vmap 지원의 부산물로 보임(미확인, 이 조사 범위 밖) |
 | 9 | `torch._C._functorch.pop_dynamic_layer_stack_and_undo_to_depth` | 부기 | `lambda d: None` |
 
@@ -735,10 +735,10 @@ abi3 트레이드오프에 대한 별도 결정이 나기 전까지는 다음 �
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-dynamo
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh          # 산출물이 낡아 있을 수 있음 — 반드시 재빌드
+bash scripts/vendor/install_shim.sh          # 산출물이 낡아 있을 수 있음 — 반드시 재빌드
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 export TORCH_USE_RTLD_GLOBAL=1
-export PYTHONPATH=$PWD/torchnative/src/main
+export PYTHONPATH=$PWD/python
 
 # §11 — 세 모델, 같은 벽 (backend='eager', pt2_archive_constants 만 스텁)
 $PY -c "import sys; sys.path.insert(0,'/tmp'); import dynamo_probe_stub as s; s.install_all_known_stubs(); \
@@ -757,6 +757,6 @@ grep -n "_PyInterpreterState_SetEvalFrameFunc\|_PyInterpreterFrame" \
 ```
 
 스텁 스크립트(`/tmp/dynamo_probe_stub.py`, `/tmp/dynamo_probe_stub2.py`)는 저장소 밖이고,
-어떤 심볼을 어떤 순서로 무엇으로 때웠는지 코드에 그대로 남아 있습니다. `rust/torch_c/src/bootstrap.py`
-·`aten.rs`·`overloads.json`·`tools/golden/`·`tools/wheel/` 은 이번 조사에서 전혀 건드리지
+어떤 심볼을 어떤 순서로 무엇으로 때웠는지 코드에 그대로 남아 있습니다. `crates/torch_c/src/bootstrap.py`
+·`aten.rs`·`overloads.json`·`tests/golden/`·`scripts/wheel/` 은 이번 조사에서 전혀 건드리지
 않았습니다 — `git status --short` 로 확인 가능한 변경 범위는 이 문서 하나뿐입니다.

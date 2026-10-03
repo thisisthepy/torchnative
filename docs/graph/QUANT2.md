@@ -12,7 +12,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, rustc 1.98.0.
 >
 > 1. **검증 축이 섰고, 그것은 허용오차가 아니라 비트 일치입니다.** GGML 블록 형식은 완전히
 >    명세된 함수이므로 **두 번 써서 정확히 대조**할 수 있습니다 — Q8_0·Q4_0 양자화기를
->    `pytests/ggml_ref.py` 에 형식으로부터 재구현해 **블롭을 바이트 단위로**, 세 형식의
+>    `tests/ggml_ref.py` 에 형식으로부터 재구현해 **블롭을 바이트 단위로**, 세 형식의
 >    역양자화기를 재구현해 **`float32` 를 비트 단위로** 대조합니다. **고의로 나쁜 구현 6 개를
 >    주입해 축이 전부 잡아내는지 확인**했습니다(§2.4).
 > 2. **양자화된 matmul 자체를 `==` 로 판정할 수 있습니다.** 형식이 손실 없이 담는 피연산자
@@ -57,11 +57,11 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, rustc 1.98.0.
 
 | 층 | 무엇 |
 |---|---|
-| `rust/torch_c/src/tensor.rs` | `Repr::Quantized(Arc<QTensor>)` — 세 번째 변형. `tensor()` 가 `Meta` 처럼 거절 |
-| `rust/torch_c/src/quant.rs` | `_quantize` · `_dequantize` · `_quantized_linear` · `_quantized_blob` · `_quantized_from_blob` · `_quantized_format` · `_quantized_nbytes` · `_quantized_formats` |
-| `rust/torch_c/pytests/ggml_ref.py` | **검증 축.** 형식으로부터 재구현한 Q8_0·Q4_0 양자화기와 Q8_0·Q4_0·Q4K 역양자화기 |
+| `crates/torch_c/src/tensor.rs` | `Repr::Quantized(Arc<QTensor>)` — 세 번째 변형. `tensor()` 가 `Meta` 처럼 거절 |
+| `crates/torch_c/src/quant.rs` | `_quantize` · `_dequantize` · `_quantized_linear` · `_quantized_blob` · `_quantized_from_blob` · `_quantized_format` · `_quantized_nbytes` · `_quantized_formats` |
+| `tests/ggml_ref.py` | **검증 축.** 형식으로부터 재구현한 Q8_0·Q4_0 양자화기와 Q8_0·Q4_0·Q4K 역양자화기 |
 | `torchnative/.../torchnative/quant/` | `QuantizedLinear` · `quantize_(model, format=...)` · `storage_bytes` |
-| `rust/torch_c/pytests/test_shim.py` | 13 개 테스트 (180 → 193) |
+| `tests/test_shim.py` | 13 개 테스트 (180 → 193) |
 
 **aten 이름을 쓰지 않았습니다.** 상류의 양자화 표면(`torch.quantize_per_tensor`,
 `aten::_int_mm`, `aten::_dyn_quant_matmul_4bit`)은 per-tensor-affine `int8` 과 KleidiAI 4-bit
@@ -378,12 +378,12 @@ AMX 로 갑니다.**
 ### 6.1 무엇이 일어나는가
 
 ```python
-# rust/torch_c/src/bootstrap.py  linear()
+# crates/torch_c/src/bootstrap.py  linear()
 wt = _t(weight)                                   # 전치 "뷰"
 return dispatch("aten.matmul.default", input, wt)
 ```
 ```rust
-// rust/torch_c/src/aten.rs  matmul_default()
+// crates/torch_c/src/aten.rs  matmul_default()
 lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
     .and_then(|l| rhs_inner.fast_to(acc).and_then(|r| r.contiguous())
 ```
@@ -461,8 +461,8 @@ lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
 > 는 candle 이 스트라이드 낀 피연산자를 거부할 때만 도는 폴백입니다(round 1 의 DESIGN.md 감사가
 > 이미 소스를 읽어 확인). §6.2/§6.3 의 "4.7~82배" 측정 자체는 **이 문서를 쓴 시점의 참인
 > 측정**으로 남지만, "고치지 않았다"/"다음 벽" 은 낡았습니다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs gemm_with_layout_fallback present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs batched_matmul present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs gemm_with_layout_fallback present -->
 
 ---
 
@@ -502,10 +502,10 @@ lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
 이 작업 전후 모두, 전부 exit 0:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        180 -> 193  (+13)
-$PY tools/golden/compare.py                      2744/2744, ops=118   (변화 없음)
-$PY rust/torch_c/pytests/verify_schemas.py       4200/4200            (변화 없음)
-( cd rust/torch_c && cargo test --release )      7                    (변화 없음)
+PYTHON=$PY sh tests/run.sh        180 -> 193  (+13)
+$PY tests/golden/compare.py                      2744/2744, ops=118   (변화 없음)
+$PY tests/verify_schemas.py       4200/4200            (변화 없음)
+( cd crates/torch_c && cargo test --release )      7                    (변화 없음)
 ```
 
 **골든이 한 비트도 안 움직였습니다.** 이 회차는 기존 경로를 건드리지 않았습니다 — `aten.rs`
@@ -516,11 +516,11 @@ $PY rust/torch_c/pytests/verify_schemas.py       4200/4200            (변화 �
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-quant
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-quant
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # 빼먹으면 캐시의 다른 빌드를 잽니다
 ```
 
@@ -534,7 +534,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # 빼먹으면 �
 | `up_time.py` | 상류 torch 기준선 | §5.5 |
 
 ```sh
-RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
+RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
     $PY /Volumes/macMini/caches/quant-scratch/layer_ab.py
 OMP_NUM_THREADS=1 $PY /Volumes/macMini/caches/quant-scratch/up_time.py     # PYTHONPATH 없이
 ```

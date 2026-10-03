@@ -1,6 +1,6 @@
 # Four bindings that were "one binding away" from someone else's file
 
-Four rounds each stopped with a wall inside `rust/torch_c/src/bootstrap.py`,
+Four rounds each stopped with a wall inside `crates/torch_c/src/bootstrap.py`,
 which was another agent's file at the time and stayed unowned until this
 round. This is that: three of the four are bindings this round landed there,
 proven against upstream element-wise, in a separate process, through the
@@ -16,7 +16,7 @@ two lines onto nothing, and that is not repeated here.
 ## 1. `torch._C._nn.avg_pool2d` -- `efficientnet`
 
 **Kernel: present.** `aten.avg_pool2d.default` is dispatched in
-`rust/torch_c/src/aten.rs` (`avg_pool2d_default`, confirmed both by grep and
+`crates/torch_c/src/aten.rs` (`avg_pool2d_default`, confirmed both by grep and
 by `"aten.avg_pool2d.default" in _C._aten_implemented()` at runtime) and has
 been golden-compared since `sew_d` -- `docs/kernels/TAIL3.md` §7 already established
 this; this round only re-confirmed it before writing the binding.
@@ -115,12 +115,12 @@ exist as real ops, element-wise, in a separate process:
 | `F.pad(x3d, [1,1,1,1,1,1], mode='reflect')` | 0.0 | 1536 |
 | `F.pad(x3d, [1,1,1,1,1,1], mode='replicate')` | 0.0 | 1536 |
 
-**The six `tools/golden/reach_allow.json` entries were deleted** --
+**The six `tests/golden/reach_allow.json` entries were deleted** --
 `aten.reflection_pad{1,2,3}d.default` and `aten.replication_pad{1,2,3}d
 .default` under `shape2_kernel_without_spelling` -- because they now
 self-fail the reach suite the moment `F.pad` reaches them, which is the
 design docs/kernels/PAD.md §5 and the entries' own `reason` text both call for. Golden
-itself (`tools/golden/compare.py`) is unmoved: these six entries gated
+itself (`tests/golden/compare.py`) is unmoved: these six entries gated
 *reach*, not the kernel comparison, and no kernel changed.
 
 Per docs/kernels/PAD.md §5's own caveat: this is the step that makes "four speech
@@ -144,7 +144,7 @@ torch.std(x, dim=1, unbiased=False)   -> aten.std.correction((4,5), [1], correct
 `torch.std` is **not** a composite over `var` the way `avg_pool1d` is a
 composite over `avg_pool2d` -- it dispatches straight to `aten::std
 .correction`, a leaf. Neither `aten.std.correction` nor `aten.var.correction`
-appears anywhere in `rust/torch_c/src/aten.rs`'s dispatch table (grepped for
+appears anywhere in `crates/torch_c/src/aten.rs`'s dispatch table (grepped for
 `"aten.std`, `"aten.var`, `aten::std`, `aten::var` -- zero hits, and zero
 hits for `"std"`/`"var"` as op names in `bootstrap.py` too), and `std` has no
 `overloads.json` row (confirming docs/kernels/TAIL3.md §8's own note). So per this
@@ -178,7 +178,7 @@ named refusal.
 
 ## 5. Architecture sweep, before and after
 
-`PYTHONPATH=<vendored tree> TORCH_USE_RTLD_GLOBAL=1 pytests/arch_sweep.py
+`PYTHONPATH=<vendored tree> TORCH_USE_RTLD_GLOBAL=1 tests/arch_sweep.py
 --out ... --only efficientnet longt5 gemma3n_text`, run after the
 rebuild+reinstall above (`TORCH_C_ARTEFACT` pointed at the freshly built
 `lib_C.dylib`, not a stale one -- and `side=shim` printed and checked, since

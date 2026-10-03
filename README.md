@@ -164,7 +164,7 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 |---|---|
 | ATen operators | **302**, each compared against upstream |
 | Golden comparison cases | **11,420 / 11,420** — values, shapes, dtypes, through the door and through the member |
-| Smoke tests | **480** in `test_shim.py` alone; the gate runs every suite in `rust/torch_c/pytests/` |
+| Smoke tests | **480** in `test_shim.py` alone; the gate runs every suite in `tests/` |
 | Signature and schema tables | **5,024 of 5,037** entries checked against upstream |
 | Architectures — forward | **297 of 297** swept (reachability; not a fresh full sweep — see the long form) |
 | Architectures — agree with upstream | **284 of 285** judgeable, at a derived tolerance ([`AGREE.md`](docs/numerics/AGREE.md)) |
@@ -188,12 +188,12 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 <!-- DOCWATCH: symbol-in-file docs/architectures/ARCH300.md 6 present -->
 <!-- DOCWATCH: symbol-in-file docs/numerics/AGREE.md 284 present -->
 <!-- DOCWATCH: symbol-in-file docs/numerics/AGREE.md 285 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_oracle_factor_is_stated_and_is_not_a_free_parameter present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_agree.py test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing present -->
+<!-- DOCWATCH: symbol-in-file tests/test_agree.py test_the_oracle_factor_is_stated_and_is_not_a_free_parameter present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs _shim_mps_host_readback_ops present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs _shim_mps_host_readback_ops present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py ProcessGroupLocal present -->
 
 ---
 
@@ -272,10 +272,10 @@ is no sdist.
 **Build from source** (Rust toolchain, CPython 3.13+):
 
 ```sh
-bash vendor/vendor_torch.sh     # assemble the vendored torch tree
-bash vendor/install_shim.sh     # build the extension and install it
-python tools/wheel/build.py                            # -> dist/*.whl
-python tools/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
+bash scripts/vendor/vendor_torch.sh     # assemble the vendored torch tree
+bash scripts/vendor/install_shim.sh     # build the extension and install it
+python scripts/wheel/build.py                            # -> dist/*.whl
+python scripts/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
 ```
 
 Cross-compilation: [`docs/platform/RUST_CROSSBUILD.md`](docs/platform/RUST_CROSSBUILD.md).
@@ -296,8 +296,8 @@ assertion.
 - **Documentation is checked** — DOCWATCH markers tie the numbers on this page to live runs.
 
 ```sh
-bash rust/torch_c/pytests/run.sh                # the gate
-python tools/golden/compare.py                  # golden comparison against upstream
+bash tests/run.sh                # the gate
+python tests/golden/compare.py                  # golden comparison against upstream
 ```
 
 ---
@@ -342,4 +342,4 @@ Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause
 AND BSD-3-Clause AND BSL-1.0 AND MIT
 ```
 
-`tools/wheel/build.py` ships torch's `dist-info`, third-party notices included.
+`scripts/wheel/build.py` ships torch's `dist-info`, third-party notices included.

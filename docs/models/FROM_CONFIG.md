@@ -13,13 +13,13 @@ transformers 5.15.1 실물로 계측해서 목록을 만들었습니다.**
 > `AutoModelForCausalLM.from_config(cfg)` (이 문서와 동일한 llama config) 을 직접 호출하면
 > 성공하고, 파라미터 수까지 이 문서가 실물 torch 로 잰 것과 정확히 같다(95,040개). §4.3 이
 > 미확인으로 남긴 "candle RNG 가 torch RNG 값과 같은가"도 `docs/numerics/RNG.md`/`docs/bindings/TENSORBASE.md`의
-> 포트로 답이 났다(`rust/torch_c/src/rng.rs`에 MT19937 엔진과 `torch.manual_seed` 리매핑이
+> 포트로 답이 났다(`crates/torch_c/src/rng.rs`에 MT19937 엔진과 `torch.manual_seed` 리매핑이
 > 있다). 아래 §2.1/§5/§6 원문은 계측 당시 그대로 남긴다.
 > <!-- DOCWATCH: op-implemented aten.normal_.default -->
 > <!-- DOCWATCH: op-implemented aten.uniform_.default -->
 > <!-- DOCWATCH: op-implemented aten.empty.memory_format -->
 > <!-- DOCWATCH: op-implemented aten.arange.start_step -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/rng.rs manual_seed present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/rng.rs manual_seed present -->
 
 환경: `/Volumes/macMini/caches/spike-venv/bin/python` (torch 2.13.0, transformers 5.15.1, 둘 다
 실물 설치). 대상 모델:
@@ -350,11 +350,11 @@ default`·`aten.normal_.default` 자체의 C++ 구현)에 **감춰져 있습니�
 
 **우리 shim 이 지금 가진 것: 아무것도 없습니다.**
 
-- `rust/torch_c/src/aten.rs` 의 `IMPLEMENTED` 상수는 `["aten.add.Tensor", "aten.full.default",
+- `crates/torch_c/src/aten.rs` 의 `IMPLEMENTED` 상수는 `["aten.add.Tensor", "aten.full.default",
   "aten.mm.default"]` **세 개뿐**입니다. §2.1 이 요구하는 14 개 중 **0 개가 구현되어 있습니다.**
 - `Generator` 는 `bootstrap.py` 안에서 **이름만** 존재합니다(`IMPORT_TORCH.md` 벽 19 — 메타클래스
   훅만 연결). `manual_seed`·`seed`·`get_state`·`set_state`·실제 난수 상태 — 전부 **미구현**이고,
-  `grep -rn "manual_seed\|default_generator\|seed" rust/torch_c/src/*.rs` 는 아무것도 찾지
+  `grep -rn "manual_seed\|default_generator\|seed" crates/torch_c/src/*.rs` 는 아무것도 찾지
   못했습니다.
 - **candle 의 RNG 가 torch 의 CPU RNG 알고리즘과 값이 같은지는 미확인입니다.** `aten.uniform_.
   default`/`aten.normal.*` 을 candle 의 난수 생성으로 구현하면 **구조적으로는** 동작하겠지만
@@ -384,7 +384,7 @@ default`·`aten.normal_.default` 자체의 C++ 구현)에 **감춰져 있습니�
 "이름의 문제"에서 처음으로 "값을 만드는 문제"로 넘어가는 지점입니다.** `import torch` 는 계산 없이
 1207 개의 이름만 옳으면 통과했지만(`IMPORT_TORCH.md` §1), `from_config` 는 그 이름들 중 최소
 14 개(§2.1) 를 **실제로 실행해서 올바른 shape·dtype 의 텐서를 만들어내야** 통과합니다. 이 14 개는
-전부 `rust/torch_c/src/aten.rs` 의 `IMPLEMENTED` 목록에 없습니다.
+전부 `crates/torch_c/src/aten.rs` 의 `IMPLEMENTED` 목록에 없습니다.
 
 ---
 

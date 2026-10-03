@@ -1,10 +1,10 @@
 # BIND — the Python argument-binding layer
 
-What was hot in `rust/torch_c/src/bootstrap.py`'s overload resolution, what was
+What was hot in `crates/torch_c/src/bootstrap.py`'s overload resolution, what was
 precomputed, why that is safe, and what is still slower than upstream.
 
-**This is `rust/torch_c/src/bootstrap.py`, and Android loads the same file** —
-it is embedded in the artefact `vendor/install_shim.sh` installs, and the
+**This is `crates/torch_c/src/bootstrap.py`, and Android loads the same file** —
+it is embedded in the artefact `scripts/vendor/install_shim.sh` installs, and the
 Android build embeds that same source. Nothing here is host-specific: it is
 plain Python doing dict and attribute work, so the win applies on device too,
 where the interpreter is slower and therefore the share it occupies is larger.
@@ -73,7 +73,7 @@ before and after every measurement and no measurement was taken above load 2.4.
 export HF_HOME=/Volumes/macMini/caches/hf-home
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-bind
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-# ours:     PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1
+# ours:     PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1
 # upstream: no PYTHONPATH
 ```
 
@@ -223,9 +223,9 @@ just slower — which is what the skip is designed to fail into.
 The repository's own gates, run on the final artefact:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   -> 197 ok, exit 0
-$PY tools/golden/compare.py                 -> 2811/2811, ops covered=119, exit 0
-$PY rust/torch_c/pytests/verify_schemas.py  -> 4203/4203, exit 0
+PYTHON=$PY sh tests/run.sh   -> 197 ok, exit 0
+$PY tests/golden/compare.py                 -> 2811/2811, ops covered=119, exit 0
+$PY tests/verify_schemas.py  -> 4203/4203, exit 0
 ```
 
 Unchanged from before the work, which is the point.
@@ -357,16 +357,16 @@ which is a large part of why this project exists), so this section reports
 
 ### 7.1 `bootstrap.py` is baked into the artefact, not loaded from disk
 
-`rust/torch_c/src/lib.rs:568` does
+`crates/torch_c/src/lib.rs:568` does
 `std::ffi::CString::new(include_str!("bootstrap.py"))` — the source text is
 compiled into `lib_C.so` at Rust build time. Swapping the `.py` file on the
 device without rebuilding does nothing; the interpreter never reads a
 `bootstrap.py` file at all on either platform. **Both sides were rebuilt** for
-`aarch64-linux-android` via `scripts/device_android.sh build`:
+`aarch64-linux-android` via `scripts/devices/device_android.sh build`:
 
-* new (HEAD, `972dfe4`): `rust/torch_c/src/bootstrap.py` unchanged, built as-is.
-* old (`972dfe4^`): `git show 972dfe4^:rust/torch_c/src/bootstrap.py` copied
-  over `rust/torch_c/src/bootstrap.py`, built, then the working tree file was
+* new (HEAD, `972dfe4`): `crates/torch_c/src/bootstrap.py` unchanged, built as-is.
+* old (`972dfe4^`): `git show 972dfe4^:crates/torch_c/src/bootstrap.py` copied
+  over `crates/torch_c/src/bootstrap.py`, built, then the working tree file was
   immediately restored from a `cp` backup (`git status --short` confirmed a
   clean diff afterward).
 
@@ -375,7 +375,7 @@ Both `.so` artefacts were saved to `/tmp/bw_bind_android/lib_C.{old,new}.so`
 staged file rather than rebuilding per round: `_C.abi3.so` is the only file
 that differs between old and new, so once the rest of the tree (CPython
 runtime + vendored `torch` + deps) is staged once via
-`scripts/device_android.sh stage`, alternation is a single `adb push` of the
+`scripts/devices/device_android.sh stage`, alternation is a single `adb push` of the
 5.4 MB `.so` to `/data/local/tmp/bw_device/site/torch/_C.abi3.so` — no re-stage
 of the ~440 MB tree per round.
 
@@ -430,17 +430,17 @@ device measurement supports, rather than merely assumes, the transfer.**
 ### 7.4 Method notes
 
 * **Rebuild required, `.py` swap alone does not work** (§7.1) — both artefacts
-  were built via `scripts/device_android.sh build` for `aarch64-linux-android`,
+  were built via `scripts/devices/device_android.sh build` for `aarch64-linux-android`,
   saved to `/tmp/bw_bind_android/lib_C.{old,new}.so` (verified distinct md5),
-  and `rust/torch_c/src/bootstrap.py` was restored to HEAD (`cp` backup, not
+  and `crates/torch_c/src/bootstrap.py` was restored to HEAD (`cp` backup, not
   `git checkout`) immediately after the old build — `git status --short` was
   clean on that file before device rounds began.
 * Only `/data/local/tmp/bw_device/site/torch/_C.abi3.so` was swapped between
   rounds (direct `adb push`, not a full re-stage) — the CPython runtime,
   vendored `torch` tree and dependencies were staged once via
-  `scripts/device_android.sh stage` and are identical across all rounds; the
+  `scripts/devices/device_android.sh stage` and are identical across all rounds; the
   `.so` is the only variable.
-* `_multiprocessing`/`_posixshmem` stubs from `scripts/device_parity.py`
+* `_multiprocessing`/`_posixshmem` stubs from `scripts/devices/device_parity.py`
   (`_install_android_stubs`, gated on `BW_STUB_MULTIPROCESSING=1`) were copied
   into the microbenchmark script — `torch/multiprocessing/__init__.py` imports
   `multiprocessing.resource_tracker` unconditionally and Android's CPython
@@ -580,7 +580,7 @@ read the zero as coverage.
 verbatim copy of its predecessor. This round compares **`resolve`**, which is a
 superset — it includes candidate ordering, the refusal `TypeError`, and the
 keyword half. The pre-merge `resolve` *and* `_bind` are extracted verbatim from
-`git show HEAD:rust/torch_c/src/bootstrap.py` and exec'd against the live
+`git show HEAD:crates/torch_c/src/bootstrap.py` and exec'd against the live
 module's globals; one substitution is applied and asserted to occur exactly once
 (`self._bind(` → `_old_bind(self, `, since the new class has no `_bind`). The
 new side is likewise loaded from the source file rather than off the class, so
@@ -633,10 +633,10 @@ cannot express it.
 The repository's gates, on the final artefact:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   -> 211 ok,                        exit 0
-$PY tools/golden/compare.py                 -> 2843/2843, ops covered=119,    exit 0
-$PY tools/golden/compare.py --self-test     -> PASS, 12 x 11 fault modes,     exit 0
-$PY rust/torch_c/pytests/verify_schemas.py  -> 4203/4203,                     exit 0
+PYTHON=$PY sh tests/run.sh   -> 211 ok,                        exit 0
+$PY tests/golden/compare.py                 -> 2843/2843, ops covered=119,    exit 0
+$PY tests/golden/compare.py --self-test     -> PASS, 12 x 11 fault modes,     exit 0
+$PY tests/verify_schemas.py  -> 4203/4203,                     exit 0
 ```
 
 Golden is a real guard on this path now — it carries 32 keyword cases, which is
@@ -769,7 +769,7 @@ the floor at 2%; item 1 is ~4% of a `view` and the rest are smaller.
   The final rebuild from the reverted source reproduced `lib_C.new.dylib`
   byte for byte, which is why §8.4's first run did not need repeating.
 * `TORCH_C_ARTEFACT` was set explicitly for every gate run, per DISPATCH.md's
-  note that `tools/golden/loader.py` otherwise ignores a custom
+  note that `tests/golden/loader.py` otherwise ignores a custom
   `CARGO_TARGET_DIR` and can compare a stale binary.
 * `uptime` was recorded before every round. No timing round was taken above
   load 3.3 except the control, which ran at 3.7–4.1 — the direction that makes
@@ -974,8 +974,8 @@ does not have to re-derive it.
 > are unaffected and reconfirmed live in this audit.
 >
 > Standing check (docs/verification/DOCWATCH.md):
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs interned present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_tensor_dtype_identity absent -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs interned present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_tensor_dtype_identity absent -->
 
 ### 9.4 What it costs -- measured, and it is not the story
 
@@ -1022,7 +1022,7 @@ the smoke test written *against* that documented bug now disagrees with it:
 FAIL test_decompose_refuses_by_name_what_it_cannot_lower: AssertionError
 ```
 
-`rust/torch_c/pytests/test_shim.py`'s
+`tests/test_shim.py`'s
 `test_decompose_refuses_by_name_what_it_cannot_lower` asserts, as its third
 of three refusal cases, that lowering `aten.baddbmm.default` produces a
 result the capture *disagrees* with (`"aten.baddbmm.default" in
@@ -1034,7 +1034,7 @@ and the assertion fails. Confirmed directly: calling `_decomp_road_fixture()`
 after the fix returns `refuse_disagrees: "ACCEPTED"` where it used to return
 the `DecompositionRefused` message the test checks the wording of.
 
-**This is not touched.** `rust/torch_c/pytests/test_shim.py` and
+**This is not touched.** `tests/test_shim.py` and
 `docs/graph/DECOMP.md` are outside this round's territory (`bootstrap.py` +
 `docs/bindings/BIND.md`), and the assertion encodes a bug this round's fix genuinely
 removes -- updating it is a real, small change (the test's case 3 needs a
@@ -1070,7 +1070,7 @@ It was not: the same two commands against the **unmodified baseline artefact**
 produced the identical 2784/2843 and the identical crash. The cause was this
 session's own environment -- `PYTHONPATH`/`TORCH_USE_RTLD_GLOBAL` had been
 left set (needed for the direct `.dtype` micro-benchmarks) when invoking
-`tools/golden/compare.py` and `verify_schemas.py`, which the brief's own
+`tests/golden/compare.py` and `verify_schemas.py`, which the brief's own
 VERIFY block does not set for those two commands. Unset, both baseline and
 fixed builds read exactly 2843/2843 and 4203/4203. Recorded per the brief's
 own instruction to suspect the harness before the code when a baseline
@@ -1152,7 +1152,7 @@ optimisation.
   against this machine's noise floor, reported as did-not-regress.
 - **One smoke test now fails**, `test_decompose_refuses_by_name_what_it_cannot
   _lower`, because it pinned the bug this fix removes as expected behaviour.
-  Not fixed here -- out of territory (`rust/torch_c/pytests/test_shim.py`).
+  Not fixed here -- out of territory (`tests/test_shim.py`).
   Golden (2843/2843), the self-test (PASS) and schemas (4203/4203) all hold
   exactly, unaffected.
 - **The profile shows nothing else to fold in `bootstrap.py`.** `resolve` is

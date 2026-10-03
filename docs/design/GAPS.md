@@ -1,7 +1,7 @@
 # GAPS — what refuses, why, and which of it is actually missing
 
 Measured 2026-09-12 on `work/gaps`, host `darwin/arm64`, CPython 3.13, the
-vendored tree rebuilt from `vendor/vendor_torch.sh` + `vendor/install_shim.sh`
+vendored tree rebuilt from `scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh`
 against upstream torch 2.13.0 in `/Volumes/macMini/caches/spike-venv`.
 
 This document exists because counting refusals is not a measurement. A count of
@@ -120,7 +120,7 @@ the vendored `torch/_tensor.py`, so its stub is unreachable from a caller.
 Calling each is what separates them.
 
 **Closed** by adding the same schemas to `methods.json`.
-`rust/torch_c/pytests/test_methodspell.py` holds it, and its load-bearing test
+`tests/test_methodspell.py` holds it, and its load-bearing test
 is the general one: it walks `_C._shim_overloads`, keeps the names upstream
 carries on `torch._C.TensorBase` and has *not* replaced on `torch.Tensor`, and
 calls each — so a future `overloads.json` entry that forgets its sibling goes
@@ -148,7 +148,7 @@ attribute road, and only before anything has imported the subpackage.
 
 **Closed** by listing every subpackage. Laziness is preserved and is itself
 tested: `import torchnative` still pulls in neither `torch` nor
-`transformers`. `rust/torch_c/pytests/test_tnnamespace.py` holds it, reading
+`transformers`. `tests/test_tnnamespace.py` holds it, reading
 the name list off the disk and probing each in a **fresh subprocess** — done
 in-process, one earlier `from torchnative import x` would bind the attribute
 and the test would pass against unfixed code. Nullified by dropping `adapt`
@@ -172,7 +172,7 @@ against the shim built from this worktree:
     torch.backends.mps.is_built()           True
     torch.empty(2, 2, device="mps")         ok      (m + m).device -> mps:0
 
-and `rust/torch_c/Cargo.toml:170` reads
+and `crates/torch_c/Cargo.toml:170` reads
 `candle-core = { ..., features = ["metal"] }`.
 
 **Closed 2026-09-12.** `torch.backends.mps.is_available()` and `is_built()` now
@@ -232,7 +232,7 @@ found. It returns `(outputs, None)`, not `(outputs, 0.0)`: a stage-0 method
 descends nothing, and a zero in `history` would draw a flat curve that looked
 like convergence.
 
-**Measured at grade `agrees`.** `rust/torch_c/pytests/test_stage0.py` runs the
+**Measured at grade `agrees`.** `tests/test_stage0.py` runs the
 same `nn.BatchNorm1d` model source on both sides — this stack in a vendored-tree
 subprocess, upstream torch 2.13 from the spike venv in-process — over three
 batches drawn from three different distributions, and compares the buffers
@@ -421,7 +421,7 @@ README and understated the count.
 ## 6. Entry count
 
 **21** `raise NotImplementedError` statements in
-`torchnative/src/main/torchnative/`, not 15 — the count that produced the table
+`python/torchnative/`, not 15 — the count that produced the table
 at the head of this document covered only `nn/federated` and `adapt`. All 21
 are classified above:
 

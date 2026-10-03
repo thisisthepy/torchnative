@@ -319,7 +319,7 @@ beside it). It is also the only gap on this list shared with Parler-TTS.
 ### 5.3 `upsample_nearest1d`, `col2im` / `im2col`
 
 **Kernels landed in docs/architectures/VOICE3.md; the three `torch._C._nn.*` bindings are still open** and are
-recorded in `tools/golden/reach_allow.json` as one `_install_nn` entry each — the same shape as
+recorded in `tests/golden/reach_allow.json` as one `_install_nn` entry each — the same shape as
 the `reflection_pad*` entries §5.2 needs.
 
 The guess above that the 1-D nearest case has neighbours to follow was half right. The index
@@ -379,11 +379,11 @@ task than it was this morning, which is the argument for having landed `cumprod`
 <!-- DOCWATCH: op-implemented aten.stft.center -->
 <!-- DOCWATCH: op-not-implemented aten.polar.default -->
 <!-- DOCWATCH: op-not-implemented aten.view_as_complex.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json hann_window present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json sinc present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json clip present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json cumprod present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json cumprod present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs hann_window_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs sinc_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs cumprod_default present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json hann_window present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json sinc present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json clip present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json cumprod present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json cumprod present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs hann_window_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs sinc_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs cumprod_default present -->

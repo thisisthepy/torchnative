@@ -19,7 +19,7 @@
 | `verify_schemas.py` | 154/154 | **170/170** (+16) |
 | 골든 하네스 | 1616/1616, ops covered=78 | **1616/1616, ops covered=78** (무회귀) |
 | `--inject-fault value/shape/dtype` | 1/1/1 | **1/1/1** (그대로) |
-| 호스트 스모크 (`pytests/run.sh`) | — | **62/62, exit 0** |
+| 호스트 스모크 (`tests/run.sh`) | — | **62/62, exit 0** |
 | 3 타깃 (host / androidNdk arm64-v8a / aarch64-apple-ios) | — | **전부 exit 0** |
 
 19 개 중 **커널이 있어서 실제로 고칠 수 있었던 것은 7 개** (`argmax`, `softmax`, `le`,
@@ -31,7 +31,7 @@
 ## 1. 채운 철자와 상류 대조 결과
 
 전부 `/Volumes/macMini/caches/spike-venv/bin/python`(torch 2.13.0)을 상류로 두고,
-`tools/golden/loader.py::load_shim()` 로 이 빌드의 `_C.so` 를 직접 로드해 `TensorBase.<method>`
+`tests/golden/loader.py::load_shim()` 로 이 빌드의 `_C.so` 를 직접 로드해 `TensorBase.<method>`
 와 `_VariableFunctions.<fn>` 양쪽을 실측했다. 재현 스크립트는 이 보고서 이후 폐기했으므로
 숫자만 남긴다.
 
@@ -168,7 +168,7 @@ out 변형(`sort.values`, `sort.values_stable`)은 넣지 않았다 — 커널�
 갱신. `bootstrap.py`: `_install_tensor_softmax` 신설, `_install_tensor_methods` 에서 호출.
 
 모든 스키마 문자열은 `str(torch.ops.aten.<op>.<ov>._schema)` (torch 2.13.0)에서 그대로
-전사했다 — 지어낸 것이 없다. `pytests/verify_schemas.py` 가 그것을 재확인한다(170/170).
+전사했다 — 지어낸 것이 없다. `tests/verify_schemas.py` 가 그것을 재확인한다(170/170).
 
 ---
 
@@ -209,7 +209,7 @@ tril triu flip gather index_select`) 중 커널이 **새로 생긴 것은 `split
 | `layer_norm` (함수, Python 합성) | `bootstrap.py` `_install_composites` | 일치 (`F.layer_norm`/`torch.layer_norm`/`nn.LayerNorm`이 전부 도달하는 지점) |
 | `_get_cudnn_enabled`/`_set_cudnn_enabled` | `bootstrap.py` `_install_behaviour` | 상태 게터/세터, `F.layer_norm`이 읽는 값을 실제로 반환 |
 
-전부 `tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해
+전부 `tests/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해
 `TensorBase.<method>`와 `_VariableFunctions.<fn>` 양쪽을 실측했다 (이전 회차와 같은 방법).
 `torch 2.13.0`을 상류로 두고 동일 입력에 `torch.allclose`로 비교했으며, 전부 일치했다
 (`tanh`/`addmm`/`mm`/`select`/`scatter.src`/`split`/`layer_norm`/`native_layer_norm`의
@@ -269,7 +269,7 @@ cuDNN 백엔드는 없어도(`_has_cudnn=False`, 안 바뀜) 게터/세터 자�
 `verify_schemas.py`: **170/170 → 199/199** (+29 — `overloads.json` 72→90, `methods.json`
 98→109). 골든 하네스는 **1781/1781, ops covered=82 그대로**(무회귀 — 스펠링 추가는 커널
 집합을 바꾸지 않는다, `_aten_implemented()`가 유일한 출처이기 때문). `--inject-fault
-value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`) exit 0. 3 타깃
+value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`tests/run.sh`) exit 0. 3 타깃
 (host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0.
 
 ### 4.5 손대지 않은 것
@@ -317,7 +317,7 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 | `zero_` (메서드 `aten::zero_`, 함수 `aten::zero_`) | `methods.json`/`overloads.json` | 평범한 표 항목. `torch.ops.aten.zero_.overloads()`가 `['default']` 하나뿐이라 `.out` 걱정이 없다 |
 | `gelu` (`_C._nn.gelu`) | `bootstrap.py` `_install_nn` | `silu`/`linear`와 같은 자리의 Python 합성. `dispatch("aten.gelu.default", input, approximate=approximate)`로 넘긴다 |
 
-셋 다 `_C.so`를 재빌드해 `tools/golden/loader.py`로 직접 로드하고 상류 torch 2.13.0과 값을
+셋 다 `_C.so`를 재빌드해 `tests/golden/loader.py`로 직접 로드하고 상류 torch 2.13.0과 값을
 대조했다 — `gather`(메서드/함수 둘 다), `zero_`(메서드/함수 둘 다), `gelu`(`approximate='none'`/
 `'tanh'` 둘 다)가 **전부 비트까지 일치**했다(`torch.tensor(...).tolist()`를 나란히 찍어 비교).
 `gelu`의 두 근사식 값은 `docs/architectures/ARCH.md` §1이 실측한 상류 수치와도 그대로 일치한다:
@@ -335,7 +335,7 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 통과했다.** 상류는 이걸 `TypeError`로 거부한다(측정, `torch._C._nn.gelu(x, "tanh")` ->
 `gelu() takes 1 positional argument but 2 were given`).
 
-`vendor/probe.py --mode strict --target torch`로 벤더 트리 전체를 이 빌드의 `_C` 위에 얹어
+`scripts/vendor/probe.py --mode strict --target torch`로 벤더 트리 전체를 이 빌드의 `_C` 위에 얹어
 `F.gelu(x, "tanh")`를 직접 불러보고서야 잡았다 — 추론이 아니라 실행해서 발견했다. 고친 것은
 `aten.rs`가 아니라 **이 합성 자신의 Python 시그니처**다: `def gelu(input, *, approximate="none")`.
 `*`가 없으면 `dispatch` 쪽 키워드 전용 검사가 아무리 정확해도 그 앞에서 이미 잘못된 값을
@@ -345,11 +345,11 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
     torch.nn.functional.gelu(x, "tanh")  ->  TypeError: gelu() takes 1 positional argument but 2 were given
     (상류와 셰임 양쪽 동일 메시지, 재빌드 후 재측정)
 
-### 5.3 `nn.LayerNorm(...)`이 이제 열린다 — `vendor/probe.py`로 끝까지 확인했다
+### 5.3 `nn.LayerNorm(...)`이 이제 열린다 — `scripts/vendor/probe.py`로 끝까지 확인했다
 
 `docs/architectures/ARCH.md` §0/§4.3이 지목한 벽은 `reset_parameters`의 `init.zeros_(self.bias)` ->
 `TensorBase.zero_`였다. `zero_` 스펠링을 채운 뒤 `TORCH_USE_RTLD_GLOBAL=1`로 벤더 트리 전체를
-이 `_C` 위에서 `import torch`시키고(`vendor/probe.py --mode strict --target torch`, exit 0,
+이 `_C` 위에서 `import torch`시키고(`scripts/vendor/probe.py --mode strict --target torch`, exit 0,
 `torch.__version__ == 2.13.0`까지 확인), 그 프로세스 안에서 직접 실행했다:
 
     torch.nn.LayerNorm(8)                 -> 생성자 성공
@@ -383,12 +383,12 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 `zero_`], `methods.json` 109→111 [`gather`, `zero_`]; `gelu`는 `_install_nn` 합성이라 이 표에
 없다). 골든 하네스는 **1934/1934, ops covered=85 그대로**(무회귀 — 스펠링은 `_aten_implemented()`가
 답하는 커널 집합을 바꾸지 않는다). `--inject-fault value/shape/dtype` 전부 그대로 exit 1. 호스트
-스모크(`pytests/run.sh`, `test_shim.py` 65개 + `compare.py --self-test`) exit 0. 3 타깃
+스모크(`tests/run.sh`, `test_shim.py` 65개 + `compare.py --self-test`) exit 0. 3 타깃
 (host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0.
 
 ### 5.6 손대지 않은 것 / 이 회차 밖
 
-`aten.rs`, `tools/golden/cases.py`, `tools/golden/compare.py`, `rust/torch_c/pytests/test_shim.py`는
+`aten.rs`, `tests/golden/cases.py`, `tests/golden/compare.py`, `tests/test_shim.py`는
 이번 회차의 파일 범위 밖이라 한 줄도 고치지 않았다 — 커널 추가도 하지 않았다. `nn.LayerNorm`에
 대한 회귀 테스트를 `test_shim.py`에 박아 두는 것은 다음 회차의 작업 항목이다(§4가 남긴 것과 같은
 이유 — 이번에 손으로 확인한 것을 자동화하지 못했다).
@@ -407,7 +407,7 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 불리는 모든 이름을 뽑고(독스트링의 `>>> torch.randn(...)` 같은 예시 코드는 AST 파싱이라 자동으로
 제외된다), 71개 맨 스펠링을 얻었다. 그다음 `aten.rs`의 `IMPLEMENTED`/`IMPLEMENTED_AWAITING_GOLDEN`
 (96개, 권위 있는 출처 — `aten.rs`를 grep하지 않았다)과 대조해 커널이 있는 것만 추렸고, 각각을
-`tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 **실제로 호출**했다.
+`tests/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 **실제로 호출**했다.
 
 결과: 71개 중 커널이 있는 것은 15개(`arange` `bmm` `cat` `embedding` `is_floating_point` `layer_norm`
 `pow` `zeros` — 이미 동작, `arange`/`bmm`/`cat`/`embedding`/`is_floating_point`/`pow`/`zeros`는 기존
@@ -422,7 +422,7 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 
 ### 6.1 채운 것과 상류 대조
 
-전부 `tools/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 `_VariableFunctions`/
+전부 `tests/golden/loader.py::load_shim()`으로 이 빌드의 `_C.so`를 직접 로드해 `_VariableFunctions`/
 `TensorBase` 양쪽에서, `torch 2.13.0`을 상류로 두고 값을 대조했다(`spike-venv`).
 
 | 이름 | 파일 | 상류와 값 대조 |
@@ -435,8 +435,8 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`pytests/run.sh`
 | `any` (함수) | `overloads.json` | 일치 (무인자, `dim=int`) |
 | `unsqueeze` (함수) | `overloads.json` | 일치 |
 
-**진짜 판정 — `nn.ReLU`가 상류와 같은 값을 내는지.** `vendor/probe.py`의 `load_shim_as_torch_C`로
-벤더 트리 전체(`torchnative/src/main`)를 이 빌드의 `_C` 위에 얹고(`TORCH_USE_RTLD_GLOBAL=1`,
+**진짜 판정 — `nn.ReLU`가 상류와 같은 값을 내는지.** `scripts/vendor/probe.py`의 `load_shim_as_torch_C`로
+벤더 트리 전체(`python`)를 이 빌드의 `_C` 위에 얹고(`TORCH_USE_RTLD_GLOBAL=1`,
 `spike-venv`의 3.13 인터프리터), `nn.Sequential(nn.ReLU())`를 실제로 순전파시켰다:
 
     입력 (arange -4..4, reshape 2x4): [[-4,-3,-2,-1],[0,1,2,3]]
@@ -484,12 +484,12 @@ out=o)`(dim 없이) 호출 자체가 상류에서 `TypeError`를 낸다(측정, 
 
 ### 6.4 `test_shim.py`를 한 줄 고쳤다 — 파일 범위 밖이지만 회귀였다
 
-`rust/torch_c/pytests/test_shim.py::test_overload_resolution_refuses_rather_than_guessing`가
+`tests/test_shim.py::test_overload_resolution_refuses_rather_than_guessing`가
 "표 항목이 없는 op"의 예시로 정확히 `relu`를 썼다. `relu`에 표 항목을 주는 순간 이 테스트가
 깨진다 — `torch.relu(1)`이 이제 "no table entry"가 아니라 "no matching overload"로 거부되기
 때문이다(정확히 의도한 동작 변화). 지시받은 파일 범위는 `bootstrap.py`/`overloads.json`/
 `methods.json`/`docs/bindings/SPELLINGS.md`뿐이고 `test_shim.py`는 명시적으로 금지된 `aten.rs`/
-`tools/golden/`은 아니었지만 범위 밖이었다 — 그래도 고치지 않으면 스모크가 계속 빨간 채로
+`tests/golden/`은 아니었지만 범위 밖이었다 — 그래도 고치지 않으면 스모크가 계속 빨간 채로
 남으므로, 예시 op를 아직 커널이 없는 `flatten`(§5.4가 남긴 11개 중 하나)으로 바꿨다. 테스트가
 검증하려는 것("표에 없는 op는 옛 방식대로 거부한다") 자체는 바뀌지 않았다.
 
@@ -500,14 +500,14 @@ out=o)`(dim 없이) 호출 자체가 상류에서 `TypeError`를 낸다(측정, 
 `unsqueeze`], `methods.json` 111→113 [+2: `relu` `baddbmm`]). 골든 하네스는 **2258/2258,
 ops covered=96 그대로**(무회귀 — `_aten_implemented()`가 답하는 커널 집합은 이번 회차가 바꾸지
 않았다, 커널을 추가하지 않았다). `--inject-fault value/shape/dtype` 전부 그대로 exit 1(2248/2258,
-10 failed, ops covered=96 — 이전과 동일한 모양). 호스트 스모크(`pytests/run.sh`) **exit 0**,
+10 failed, ops covered=96 — 이전과 동일한 모양). 호스트 스모크(`tests/run.sh`) **exit 0**,
 `test_shim.py` 70개(예시 op 하나 교체 반영) + `compare.py --self-test`(11 comparator x 11 fault
 mode, 0 problem) 전부 통과. 3 타깃(host / androidNdk arm64-v8a / aarch64-apple-ios) 전부 exit 0
 (각각 `lib_C.dylib`/`lib_C.so`/`lib_C.dylib`, `file`로 포맷 확인).
 
 ### 6.6 손대지 않은 것
 
-`aten.rs`, `tools/golden/`은 지시대로 한 줄도 고치지 않았다. 71개 중 커널이 없는 56개
+`aten.rs`, `tests/golden/`은 지시대로 한 줄도 고치지 않았다. 71개 중 커널이 없는 56개
 (`abs` `floor` `sign` `log` `minimum` `clamp_min` `rand` `batch_norm` `group_norm`
 `instance_norm` `kl_div` `embedding_bag` `grid_sampler` `broadcast_shapes` `broadcast_tensors`
 `empty_like` `ones_like` `zeros_like` `celu` `selu` `rrelu` `rms_norm` 등, 손실 함수류
@@ -531,8 +531,8 @@ op가 아니다).
 숫자로만 남겼다 — 151/151, 총 4295/4295), 이번 회차는 그 §9가 "잘 정의된 다음 회차"라고
 남긴 25개 이름을 마저 채우는 것이다. §6까지의 233/233은 이제 오래된 기준선이므로, 이번
 회차는 `docs/architectures/ARCH20.md` §9의 기준선(151/151, 4295/4295)에서 이어 쓴다. 파일 범위는
-`overloads.json`/`methods.json`/`bootstrap.py`/`tools/golden/cases.py`/
-`rust/torch_c/pytests/test_shim.py`/이 문서였고, `aten.rs`/`tensor.rs`/`dtype.rs`는 다른
+`overloads.json`/`methods.json`/`bootstrap.py`/`tests/golden/cases.py`/
+`tests/test_shim.py`/이 문서였고, `aten.rs`/`tensor.rs`/`dtype.rs`는 다른
 에이전트가 작업 중이라 금지됐다 — §6의 "표 항목이 커널을 보장하지 않는다"는 원칙이 이번에도
 그대로 적용된다.
 
@@ -623,7 +623,7 @@ op가 아니다).
 ### 7.3 `reshape`/`max.other` — `IMPLEMENTED_AWAITING_GOLDEN` 두 개에 케이스를 지어 줬다
 
 `aten.rs`의 `IMPLEMENTED_AWAITING_GOLDEN` 코멘트가 스스로 적어 둔 절차("케이스 빌더 하나,
-줄 이동 하나")의 앞 절반을 이번 회차가 했다. `tools/golden/cases.py`에 `reshape_cases`(13개)와
+줄 이동 하나")의 앞 절반을 이번 회차가 했다. `tests/golden/cases.py`에 `reshape_cases`(13개)와
 `max_other_cases`(20개)를 새로 넣고 `CASE_BUILDERS`에 등록했다. **줄 이동(`aten.rs`의
 `IMPLEMENTED_AWAITING_GOLDEN` → `IMPLEMENTED`)은 `aten.rs`라 이번 회차가 손댈 수 없다** —
 빠뜨린 게 아니라 다음 담당자에게 넘기는 한 줄짜리 finding이다. `compare.py`를 그대로 돌려
@@ -666,7 +666,7 @@ reshape한 값을 상류와 비트까지 대조해 확인했다.
 찾아낸 규칙대로, 두 모양으로 실측했다(`cp` 백업, `git checkout` 아님):
 
 **삭제.** `abs` `max` `bitwise_and` `reshape` `scalar_tensor` `convolution` 여섯 항목을
-`overloads.json`에서 지우고 재빌드, `pytests/run.sh` 재실행. 새로 넣은
+`overloads.json`에서 지우고 재빌드, `tests/run.sh` 재실행. 새로 넣은
 `test_spelling_road_through_the_vendored_tree`가 첫 실패 지점에서 멈췄지만(pytest는
 assert 하나에서 멈춘다), 서브프로세스 스크립트를 직접 돌려 모든 필드를 대조하면 **~70개
 필드 중 15개**가 정확히 지운 여섯 이름의 *함수* 스펠링에서만 "표에 항목이 없다"는
@@ -752,7 +752,7 @@ assert 하나에서 멈춘다), 서브프로세스 스크립트를 직접 돌려
 `verify_schemas.py`: **4295/4295 → 4331/4331** (+36, §7.6). 골든 하네스는
 **3302/3302 그대로, ops covered=133 그대로**(무회귀 — `PENDING: 2`로 `max.other`/
 `reshape.default`가 보류 중임을 보고할 뿐 본 게이트는 건드리지 않는다). `--self-test`
-**13 comparators x 11 fault modes, 0 problem — PASS**. 호스트 스모크(`pytests/run.sh`)
+**13 comparators x 11 fault modes, 0 problem — PASS**. 호스트 스모크(`tests/run.sh`)
 **242개, exit 0**(새 `test_spelling_road_through_the_vendored_tree` 1개 포함). `verify_schemas.py`
 distinct pair **215 → 217**(+2, §7.6). SmolLM2-135M float32 prefill **비트까지 동일**(§7.7).
 20-아키텍처 스윕 **19/20 그대로**(§7.8).
@@ -857,7 +857,7 @@ develop `e34f65d` (§8 이 돈 체크아웃보다 뒤) 이고, 지시 자체가 
 
 `overloads.json` 항목 수: **96/96 → 101/101**(+5 키), 스키마 문자열 수 **220 → 228**(+8 =
 masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 항목, 180 스키마
-문자열 그대로**(변경 없음 — 다섯 개 다 이미 있었다). `pytests/verify_schemas.py`:
+문자열 그대로**(변경 없음 — 다섯 개 다 이미 있었다). `tests/verify_schemas.py`:
 `overloads.json 228/228 matched`, `methods.json 180/180 matched`, `SUMMARY 4487/4487 matched,
 0 failed`.
 
@@ -935,7 +935,7 @@ masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 �
 
 추가한 6개 각각에 "이름을 빼면 실제로 빨개지는" 케이스를 뒀다:
 
-* `rust/torch_c/pytests/test_shim.py`의
+* `tests/test_shim.py`의
   `test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree` —
   벤더 트리를 이 셈의 `_C` 위에 얹은 진짜 `import torch`로 `torch.<name>(...)`와
   `tensor.<name>(...)` 양쪽, 6개 전부를 값 대조(수작업 계산 기대값, `math.exp` 등, 상류
@@ -948,7 +948,7 @@ masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 �
   실측을 그대로 테스트로 박음.
 
 **사보타지**: `overloads.json`의 `neg_` 항목을 지우고(`cp`로 백업한 뒤) 다시 빌드 + 재설치 +
-`pytests/run.sh`를 돌리자
+`tests/run.sh`를 돌리자
 
     FAIL test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree:
     AssertionError: neg__fn: expected [-1.0, 2.0, -3.0, 4.0], got
@@ -961,12 +961,12 @@ masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 �
 
 ### 9.5 게이트
 
-    pytests/run.sh              333 ok -> 335 ok (+2 = 새 subprocess road 테스트 1 +
+    tests/run.sh              333 ok -> 335 ok (+2 = 새 subprocess road 테스트 1 +
                                  raw dispatch capture 테스트 1), exit 0
     DOCWATCH                    248/248 그대로
     verify_schemas.py           overloads.json 220 -> 228 스키마 문자열(+8),
                                  methods.json 180 그대로, SUMMARY 4487/4487, 0 failed
-    tools/golden/compare.py     7763/7763 cases passed, 0 failed, ops covered=168 그대로
+    tests/golden/compare.py     7763/7763 cases passed, 0 failed, ops covered=168 그대로
                                  (무회귀 -- 스펠링만 추가했고 `_aten_implemented()`가 답하는
                                  커널 집합은 이번 회차가 바꾸지 않았다), pending case builders=1 그대로
 

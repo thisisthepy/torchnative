@@ -33,8 +33,8 @@ worktree at `develop` `bf54489`. Upstream C++ read from `/Volumes/macMini/caches
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                293 ok, 0 FAIL, DOCWATCH 71/71     exit 0
-tools/golden/compare.py       6675/6675, ops=163, pending=1      exit 0
+tests/run.sh                293 ok, 0 FAIL, DOCWATCH 71/71     exit 0
+tests/golden/compare.py       6675/6675, ops=163, pending=1      exit 0
 compare.py --self-test        16 comparators x 11 fault modes    exit 0
 verify_schemas.py             4465/4465                          exit 0
 sweep26   (shim, .eval())     26/26                              exit 0
@@ -91,16 +91,16 @@ log_softmax.int     ->  _log_softmax(converted, dim, False)
 so the trace shows `_log_softmax` and `nll_loss_forward` and nothing else — which is exactly what
 §5.3 reported. This is the sixth time in this repository a gap has been a *name* rather than a
 kernel (docs/architectures/ARCH20.md §5 and §9, docs/kernels/GROUPED_MM.md §6.1, docs/kernels/TRIL.md §2, docs/bindings/SPELLINGS.md), and
-it is the same blindness `tools/golden/compare.py` has by construction: golden compares by dispatch
+it is the same blindness `tests/golden/compare.py` has by construction: golden compares by dispatch
 key, so it cannot see a missing name either. The golden cases below therefore carry a **spellings**
 block that calls the names instead of the key.
 
 <!-- DOCWATCH: op-implemented aten._log_softmax.default -->
 <!-- DOCWATCH: op-implemented aten.nll_loss_forward.default -->
 <!-- DOCWATCH: hasattr nll_loss_forward false -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json _log_softmax present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json log_softmax absent -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py cross_entropy_loss present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json _log_softmax present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json log_softmax absent -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py cross_entropy_loss present -->
 
 ---
 
@@ -144,7 +144,7 @@ implementation passes every `float32` case anyone would write first.
 ### 2.2 The separating input, which is not the obvious one
 
 Knowing the rule is not the same as being able to check it. One `bfloat16` ULP is about 0.4%
-relative and `tools/golden/dtypes.py` allows 6% for that dtype, so an *ordinary* input differs by
+relative and `tests/golden/dtypes.py` allows 6% for that dtype, so an *ordinary* input differs by
 one ULP whichever way the kernel is written and `math.isclose` absorbs it. That is the shape of
 miss `docs/training/TRAIN.md` §5 records against a `log2` fault, and it would have happened again here.
 
@@ -159,7 +159,7 @@ bfloat16 [0.0, ln(0.002)]     sum = 1 + 0.002 = 1.00203
 ```
 
 A **relative** difference of 1.0, because the value the two disagree about is near zero while the
-disagreement is not. Both spellings are in `tools/golden/cases.py` — `(1,2)` at `dim=-1` takes the
+disagreement is not. Both spellings are in `tests/golden/cases.py` — `(1,2)` at `dim=-1` takes the
 last-dim kernel, the same two numbers as `(2,1)` at `dim=0` take the strided one — so a shim that
 uses one rule for both fails exactly one of each pair.
 
@@ -191,10 +191,10 @@ It is carried in the case list as documentation of the near miss, not as a check
 
 ### 2.4 What landed
 
-* `rust/torch_c/src/aten.rs` — `log_softmax_default` and `log_softmax_body`, the narrowing threaded
+* `crates/torch_c/src/aten.rs` — `log_softmax_default` and `log_softmax_body`, the narrowing threaded
   through as an `Option<fn(f64) -> f64>` taken from the existing `float_narrower(tag)`.
-* `rust/torch_c/src/overloads.json` — `_log_softmax`, the dispatched leaf.
-* `rust/torch_c/src/bootstrap.py` — `Tensor.log_softmax` beside `Tensor.softmax`, and
+* `crates/torch_c/src/overloads.json` — `_log_softmax`, the dispatched leaf.
+* `crates/torch_c/src/bootstrap.py` — `Tensor.log_softmax` beside `Tensor.softmax`, and
   `torch.log_softmax` bound to it. **Not** an `overloads.json` entry: `aten::log_softmax.int` is
   `CompositeImplicitAutograd`, the `softmax` trap one line above it in the same file. The two
   spellings of one function land on opposite sides of that boundary, one underscore apart, and
@@ -241,7 +241,7 @@ then taking an early return that never updates it. The third is the 1-D input fa
 the *reduce* path regardless of `reduction`, which also makes `reduction=none` produce a scalar
 there and a vector two rows above it.
 
-`_nll_pair_check` in `tools/golden/cases.py` therefore checks both members with equal weight. A
+`_nll_pair_check` in `tests/golden/cases.py` therefore checks both members with equal weight. A
 sabotage that computes the "obvious" count for the first row fails **146 cases** (§5.1, N1).
 
 ### 3.2 The summation is an eight-level cascade
@@ -298,8 +298,8 @@ Double`). It fires on the elementwise path as well as the reduce path, so both h
 
 ### 3.4 What landed
 
-* `rust/torch_c/src/aten.rs` — `nll_loss_forward_default` and `nll_cascade`.
-* `rust/torch_c/src/bootstrap.py` — `torch._C._nn.nll_loss`, `nll_loss_nd` and
+* `crates/torch_c/src/aten.rs` — `nll_loss_forward_default` and `nll_cascade`.
+* `crates/torch_c/src/bootstrap.py` — `torch._C._nn.nll_loss`, `nll_loss_nd` and
   `cross_entropy_loss`, the three composites §1 found. `nll_loss_nd`'s 4-D and >4-D arms refuse by
   naming `aten.nll_loss2d_forward.default`: that op reduces over a spatial extent, so `nll_loss` is
   not a slower road to the same answer.
@@ -308,10 +308,10 @@ Double`). It fires on the elementwise path as well as the reduce path, so both h
   probe that was wrong, not the shim — recorded because a shim that invented the name to make a
   probe green would have been worse than the refusal.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs log_softmax_body present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs nll_cascade present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _bit_exact present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _nll_pair_check present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs log_softmax_body present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs nll_cascade present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _bit_exact present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _nll_pair_check present -->
 
 ---
 
@@ -353,7 +353,7 @@ and it says the answer is not the one with the cascade in it.
 ## 5. Sabotage
 
 18 faults, each the most plausible wrong shape for the thing it breaks. Every one was applied to
-the source, **rebuilt**, and run through `tools/golden/compare.py` and `pytests/run.sh`.
+the source, **rebuilt**, and run through `tests/golden/compare.py` and `tests/run.sh`.
 
 ### 5.1 The table
 
@@ -509,7 +509,7 @@ same way, in `docs/numerics/SCALAR.md` §8: `softplus`'s Sleef-versus-scalar tai
 `p = 2` sum (one ULP at `float64`). The pattern is worth naming: **wherever upstream's answer
 depends on its vectoriser, the honest test is a ceiling, and the honest fix is usually none.**
 
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _bounded_divergence present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _bounded_divergence present -->
 
 ---
 
@@ -557,7 +557,7 @@ name (`DisableTorchFunction`) governs, and clearing it would silently drop a
 
 The two markers are answered **above** `_aten_dispatch`, in `_op_callable`, not in `aten.rs`. They
 take a `str`, return an object with no storage, and have no dtype, device or shape;
-`_aten_implemented()` means "has a kernel *and* `tools/golden/cases.py` compares it against
+`_aten_implemented()` means "has a kernel *and* `tests/golden/cases.py` compares it against
 upstream", and golden cannot compare a marker. `_C._shim_profiler_markers` lists the three keys so
 the size of that bypass is readable rather than inferred.
 
@@ -615,8 +615,8 @@ gap an op scan cannot see. None of them was implemented here: the brief's bar fo
 `zero_grad()` completing, and the three kernels are only reachable once something writes a
 gradient.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _PROFILER_MARKERS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _PROFILER_MARKERS present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one present -->
 <!-- DOCWATCH: op-not-implemented aten.lerp_.Scalar -->
 <!-- DOCWATCH: op-not-implemented aten.addcmul_.default -->
 <!-- DOCWATCH: op-not-implemented aten.addcdiv_.default -->
@@ -698,10 +698,10 @@ the test written on that claim failed immediately. It was the assertion that was
 
 ### 7.4 What landed
 
-* `rust/torch_c/src/aten.rs` — `native_dropout_default`, **one kernel and not a decomposition**. A
+* `crates/torch_c/src/aten.rs` — `native_dropout_default`, **one kernel and not a decomposition**. A
   `bootstrap.py` decomposition would emit its steps through the one door and capture would record
   `bernoulli_` among them, which is the thing being fixed.
-* `rust/torch_c/src/bootstrap.py` — `_dropout_impl` takes the `native_dropout` route **only while
+* `crates/torch_c/src/bootstrap.py` — `_dropout_impl` takes the `native_dropout` route **only while
   `_capture_active()`**, and `torch.native_dropout` is spelled (`hasattr(torch,
   'native_dropout')` is `True` upstream). Outside a region eager keeps the eager path, because
   upstream's CPU eager never reaches `native_dropout` either
@@ -736,15 +736,15 @@ falcon, vits               aten.add_.Tensor                   in place
 
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: hasattr native_dropout true -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs native_dropout_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_capture_takes_the_functional_dropout_and_only_inside_a_region present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs native_dropout_default present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_capture_takes_the_functional_dropout_and_only_inside_a_region present -->
 
 ---
 
 ## 8. Sabotage: 26 faults
 
-Every one applied to the source, **rebuilt**, and run through `tools/golden/compare.py` and
-`pytests/run.sh`. §5 has L1–L8 and N1–N10; this section adds Z1–Z4 and D1–D8 and then says what
+Every one applied to the source, **rebuilt**, and run through `tests/golden/compare.py` and
+`tests/run.sh`. §5 has L1–L8 and N1–N10; this section adds Z1–Z4 and D1–D8 and then says what
 none of them can see.
 
 | # | fault | golden | smoke |
@@ -808,7 +808,7 @@ fault was wrong, not the case list** — but it was only visible because the fau
   `native_dropout_backward` and `_log_softmax_backward_data` are all absent, and the mask
   `native_dropout` now returns has no consumer in this repository yet.
 * **The capture sweep is not a gate.** It is a measurement in `/tmp/loss/capsweep.py`, not a test
-  in `pytests/`, so 17/23 can regress to 14/23 without anything going red except the single
+  in `tests/`, so 17/23 can regress to 14/23 without anything going red except the single
   `torch.dropout` capture assertion in `test_capture_takes_the_functional_dropout_and_only_inside_a_region`.
   That assertion covers the *mechanism*; it does not cover the architectures.
 * **`cross_entropy_loss`'s other two branches** (§9) are refused, not implemented, so nothing here
@@ -839,9 +839,9 @@ fault was wrong, not the case list** — but it was only visible because the fau
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 293 ok, 0 FAIL | **296 ok, 0 FAIL** |
+| `tests/run.sh` | 293 ok, 0 FAIL | **296 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 71/71 | **71/71** |
-| `tools/golden/compare.py` | 6675/6675, ops=163, pending 1 | **7447/7447, ops=166, pending 1** |
+| `tests/golden/compare.py` | 6675/6675, ops=163, pending 1 | **7447/7447, ops=166, pending 1** |
 | `compare.py --self-test` | 16 comparators × 11 fault modes | **19 comparators × 11 fault modes** |
 | `verify_schemas.py` | 4465/4465 | **4475/4475** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -875,9 +875,9 @@ All nine equal `docs/training/TRAIN.md` §6's values.
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-trainstep
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
 
 # §1  the walls, climbed one rung at a time
 $SHIM /tmp/loss/wall.py
@@ -912,9 +912,9 @@ $SHIM /tmp/loss/capsweep.py /tmp/loss/cs         # 14/23 -> 17/23
 sh /tmp/loss/sab.sh <tag> /tmp/loss/faults/<tag>.py
 
 # §10 gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/verify_schemas.py
 $SHIM /tmp/train/sweeptrain.py /tmp/loss/F/tr    ;  $SHIM /tmp/k26/sweep26.py /tmp/loss/F/ev
 $SHIM /tmp/loss/seqlen.py f32                    ;  $SHIM /tmp/loss/seqlen.py bf16
 ```

@@ -1,12 +1,12 @@
 # REACH — the check that fails when a name and a kernel are not connected
 
-`tools/golden/compare.py` is this repository's correctness number and it is
+`tests/golden/compare.py` is this repository's correctness number and it is
 structurally blind to one question: **is the thing it just proved correct
 reachable from Python at all?** It dispatches by key — `_aten_dispatch("aten.
 roll.default", ...)` — using keys taken from its own case table, so a kernel it
 compares 8509 times can still be unreachable, and a name in `overloads.json`
 can still resolve to nothing. docs/verification/GOLDEN.md names this class; this document is
-the inventory of it on the current tree, and `tools/golden/reach.py` is the
+the inventory of it on the current tree, and `tests/golden/reach.py` is the
 check that keeps it at that inventory.
 
 It has bitten four times, in three distinct shapes:
@@ -25,7 +25,7 @@ a missing table entry or composite, shape 3 is a missing test.
 
 ## 1. Inventory, on develop `9f4557e` + this round
 
-Measured by `tools/golden/reach.py` against this checkout's own artefact
+Measured by `tests/golden/reach.py` against this checkout's own artefact
 (`TORCH_C_ARTEFACT` set — the warning `compare.py` prints when it is not is
 there because the fallback path is shared by a dozen checkouts, and an
 inventory taken from another agent's build is not an inventory).
@@ -61,7 +61,7 @@ calling `torch.<name>(...)` or `t.<name>(...)`.
 
 Four of those 55 were found by this check rather than by inspection, and they
 are the reason it strips comments and docstrings before searching: `cat`,
-`where`, `erf` and `sigmoid` each appear in `pytests/test_shim.py` **only inside
+`where`, `erf` and `sigmoid` each appear in `tests/test_shim.py` **only inside
 a comment or a docstring** —
 
     #  ... so that `torch.sigmoid(x, out=y)` refuses by the right name --
@@ -102,11 +102,11 @@ attached to happens to work.
 
 ## 3. The check
 
-`tools/golden/reach.py`, run three ways:
+`tests/golden/reach.py`, run three ways:
 
-    python3 tools/golden/reach.py                  # inventory + verdict
-    python3 tools/golden/reach.py --verify-upstream # + put the reasons to upstream
-    # and in the suite, three tests in pytests/test_shim.py:
+    python3 tests/golden/reach.py                  # inventory + verdict
+    python3 tests/golden/reach.py --verify-upstream # + put the reasons to upstream
+    # and in the suite, three tests in tests/test_shim.py:
     #   test_reach_probe_tells_a_missing_arm_from_a_refused_call
     #   test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name
     #   test_reach_allowlist_reasons_are_answerable_by_upstream
@@ -124,12 +124,12 @@ an audit of a table that did.
 
 **Cost:** no build, no upstream import on the default path, one zero-argument
 dispatch per declared key (287 of them, all landing in an exception), and one
-regex pass over `pytests/*.py`. This is deliberate: the check is only worth
+regex pass over `tests/*.py`. This is deliberate: the check is only worth
 anything if nobody has a reason to switch it off.
 
 ### 3.1 The allowlist, and why every entry can be questioned
 
-`tools/golden/reach_allow.json`. Some gaps are correct — upstream has no
+`tests/golden/reach_allow.json`. Some gaps are correct — upstream has no
 `torch.new_zeros` and no `Tensor.native_group_norm`, and docs/bindings/SPELLINGS.md
 records three names deliberately left unspelled because inventing a door
 upstream lacks is worse than the gap. So the check needs an allowlist; the
@@ -155,10 +155,10 @@ Two things keep it from becoming one.
 Each shape was broken on purpose, one at a time, and restored.
 
 **Shape 3** — deleted the three `torch.roll(...)` / `r6.roll(2)` calls from
-`pytests/test_shim.py` and changed nothing else:
+`tests/test_shim.py` and changed nothing else:
 
 ```text
-FAIL: shape 3: nothing in pytests/ calls `torch.roll(...)` or `.roll(...)`.
+FAIL: shape 3: nothing in tests/ calls `torch.roll(...)` or `.roll(...)`.
 REACH: FAIL (5)
 ```
 
@@ -205,7 +205,7 @@ not stated.
 * **Composite reach is by name, not by call graph.** A kernel counts as spelled
   if its key appears as a string literal in `bootstrap.py`'s *code* (docstrings
   and comments excluded, via `ast`). A key sitting in dead code would count.
-* **It sees `pytests/` only.** Coverage that lives anywhere else — a sample app,
+* **It sees `tests/` only.** Coverage that lives anywhere else — a sample app,
   a device script — does not count, which is the conservative direction.
 
 ## 6. Gates
@@ -217,14 +217,14 @@ golden: 8509/8509 table entries matched upstream, ops covered 203
 REACH: PASS
 ```
 
-<!-- DOCWATCH: symbol-in-file tools/golden/reach.py has_dispatch_arm present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/reach.py executable_text present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/reach.py has_dispatch_arm present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/reach.py executable_text present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name present -->
 <!-- DOCWATCH: hasattr alias false -->
 <!-- DOCWATCH: op-implemented aten.alias.default -->
 <!-- DOCWATCH: op-implemented aten.roll.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json roll present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json roll present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json roll present -->
+<!-- DOCWATCH: json-key crates/torch_c/src/methods.json roll present -->
 <!-- DOCWATCH: count smoke_ok ge 389 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8509 -->
 <!-- DOCWATCH: count golden_ops_covered ge 203 -->

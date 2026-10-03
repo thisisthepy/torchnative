@@ -18,7 +18,7 @@ make — and `torch.compile` silently starts returning the eager function.**
 §5 reproduces that in five lines on today's tree.
 
 Measured 2026-09-06, `darwin/arm64`, CPython 3.13, against
-`rust/torch_c` at `work/compile`. Reproduction in §8.
+`crates/torch_c` at `work/compile`. Reproduction in §8.
 
 ---
 
@@ -152,13 +152,13 @@ Of the three possibilities in the brief — refuse, silently no-op, partially wo
 The brief expected `_compile_fast_path` in `bootstrap.py` to be a `torch.compile`
 path. It is not, and the name collision is worth writing down so the next reader
 does not spend the same half hour. `_compile_fast_path`
-(`rust/torch_c/src/bootstrap.py`) `exec`-compiles a per-operator Python closure
+(`crates/torch_c/src/bootstrap.py`) `exec`-compiles a per-operator Python closure
 that calls `dispatch(key, arg, arg, ...)` positionally instead of building a
 `**kwargs` dict. It is a dispatch optimisation for *every* `torch.*` call. It
 has no relationship to Dynamo, PEP 523, graphs or backends. **Nothing in this
 repository has ever implemented any part of `torch.compile`.**
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _compile_fast_path present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _compile_fast_path present -->
 
 ---
 
@@ -270,7 +270,7 @@ to be written, in Rust, none of it existing today:
   generation — so on the platform this project exists for, the fully-paid
   version of this option still does not deliver the headline feature.
 
-`docs/design/ABI3.md` and `rust/torch_c/Cargo.toml` also record that the asymmetry runs
+`docs/design/ABI3.md` and `crates/torch_c/Cargo.toml` also record that the asymmetry runs
 the wrong way for reversibility, and that is worth restating here because it is
 the one part of this option that is *cheap*: Limited API is a subset, so
 abi3 → version-pinned needs no source change, while the reverse means hunting
@@ -278,7 +278,7 @@ down every private API already in use. **Nothing about staying on abi3 foreclose
 Option A later.** It can be taken the day someone is actually willing to write a
 frame hook.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml abi3-py313 present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml abi3-py313 present -->
 
 ### Option B — abi3 only, refuse `torch.compile` by name
 
@@ -405,7 +405,7 @@ Three notes for whoever applies it:
 `torch.compile` itself: `torch/__init__.py` is vendored upstream source that
 this project does not modify (`docs/design/DESIGN.md` §1), and the cell is ours.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py set_eval_frame present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py set_eval_frame present -->
 
 ### 5.2 A second silent no-op, found while measuring
 
@@ -493,10 +493,10 @@ platforms matter enough on their own to justify a desktop-only second flavour
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-compile
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-(cd rust/torch_c && cargo build --release) && bash vendor/install_shim.sh
+(cd crates/torch_c && cargo build --release) && bash scripts/vendor/install_shim.sh
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-export PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1
+export PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1
 
 $PY tools/spike/compile_depth.py eager   # §1.1  the 5-step chain
 $PY tools/spike/export_depth.py          # §3    three front doors compared
@@ -507,7 +507,10 @@ $PY tools/spike/silent_eager.py          # §5    SILENT EAGER FALLBACK
 
 The `tools/spike/` scripts are **not part of the crate** and nothing that ships
 imports them; each says so in its docstring. They monkey-patch `torch._C` at
-runtime and write nothing.
+runtime and write nothing. They were deleted in the layout change of issue #43;
+tag `archive/pre-restructure` keeps them, so
+`git show archive/pre-restructure:tools/spike/compile_depth.py > .scratch/compile_depth.py`
+restores one to run.
 
 §1.2's file table comes from the upstream source tree outside this repository:
 

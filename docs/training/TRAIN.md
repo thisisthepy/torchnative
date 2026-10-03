@@ -32,8 +32,8 @@ torch` dies in `_load_global_deps` before any of this is reachable.
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                274 ok, 0 FAIL                        exit 0
-tools/golden/compare.py       6374/6374, ops=161, pending=1          exit 0
+tests/run.sh                274 ok, 0 FAIL                        exit 0
+tests/golden/compare.py       6374/6374, ops=161, pending=1          exit 0
 compare.py --self-test        16 comparators x 11 fault modes        exit 0
 verify_schemas.py             4458/4458                              exit 0
 sweep26   (shim, .eval())     26/26                                  exit 0
@@ -142,7 +142,7 @@ which takes `generator->random64()` regardless of `scalar_t`. `bernoulli_` is **
 *32-bit* word) — that asymmetry is the trap here, and reading it wrong desynchronises the stream at
 half the rate rather than producing visibly wrong values.
 
-`rust/torch_c/src/rng.rs` already has `uniform_fill_f64` — `random64()` through
+`crates/torch_c/src/rng.rs` already has `uniform_fill_f64` — `random64()` through
 `transformation::uniform_real<double>`, with the `mul_add` contraction docs/numerics/RNG.md §1.2 measured.
 So **the answer is yes**: a fixed seed makes shim and upstream dropout comparable value for value,
 and the golden cases below do that rather than settling for a distributional check.
@@ -162,14 +162,14 @@ own siblings. It is out of reach of the composite (`empty_like` is always contig
 
 **One change, three names, because the composite cannot be split from its primitives.**
 
-* `rust/torch_c/src/aten.rs` — `aten.bernoulli_.float`, a new kernel.
-* `rust/torch_c/src/aten.rs` — `aten.div_.Scalar`, one line onto the existing
+* `crates/torch_c/src/aten.rs` — `aten.bernoulli_.float`, a new kernel.
+* `crates/torch_c/src/aten.rs` — `aten.div_.Scalar`, one line onto the existing
   `arith_inplace_scalar` helper. The out-of-place `div.Scalar` and the in-place
   `add_`/`sub_`/`mul_` scalar forms were all already there; this was the hole in the middle of them.
-* `rust/torch_c/src/methods.json` — `bernoulli_`, both overloads in the vendored `.pyi`'s order
+* `crates/torch_c/src/methods.json` — `bernoulli_`, both overloads in the vendored `.pyi`'s order
   (`.Tensor` then `.float`). Only `.float` has a kernel; `.Tensor` resolves and then refuses, which
   is what `methods.json`'s own README says an entry means.
-* `rust/torch_c/src/bootstrap.py` — `torch.dropout` / `torch.dropout_` rewritten from a
+* `crates/torch_c/src/bootstrap.py` — `torch.dropout` / `torch.dropout_` rewritten from a
   `dispatch("aten.dropout.default", ...)` stub into `at::native::_dropout_impl`, which is the
   decomposition above.
 
@@ -292,7 +292,7 @@ Fixed in `div_scalar_reduced_float`, for both the in-place and out-of-place form
 ## 5. Sabotage: what each case can and cannot see
 
 Nine faults, each the most plausible wrong shape for the thing it breaks. Every one was applied to
-the source, rebuilt, and run through `tools/golden/compare.py` and `pytests/run.sh`.
+the source, rebuilt, and run through `tests/golden/compare.py` and `tests/run.sh`.
 
 | # | fault | golden | smoke |
 |---|---|---:|---|
@@ -385,8 +385,8 @@ suite that can see the difference, and it exists because the sabotage went looki
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 274 ok, 0 FAIL | **285 ok, 0 FAIL** |
-| `tools/golden/compare.py` | 6374/6374, ops=161, pending 1 | **6587/6587, ops=163, pending 1** |
+| `tests/run.sh` | 274 ok, 0 FAIL | **285 ok, 0 FAIL** |
+| `tests/golden/compare.py` | 6374/6374, ops=161, pending 1 | **6587/6587, ops=163, pending 1** |
 | `compare.py --self-test` | 16 comparators x 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4458/4458 | **4465/4465** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -417,7 +417,7 @@ value to check against, and it matches.
 
 Before this, **`.eval()` was assumed everywhere and nothing would have noticed training regressing**
 — not the smoke tests, not golden, not either sweep. `test_train_mode_forwards_the_four_
-architectures_eval_mode_hid` in `pytests/test_shim.py` is that gap closed, built in the shape
+architectures_eval_mode_hid` in `tests/test_shim.py` is that gap closed, built in the shape
 `test_a_real_transformers_llama_forward_matches_upstream` set: the same `transformers` in both
 interpreters, the vendored tree in a subprocess and upstream in this one, weights pushed in by one
 shared procedure so neither side depends on the other's random stream.
@@ -515,11 +515,11 @@ sides, and only the second one is bit-exact today because the first was fixed in
 | sweeptrain (`.train()`) | 26/26 | **26/26** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
 | prefill sha256, f32 × 5 and bf16 × 4 | 9/9 | **9/9 unchanged** |
-| `tools/golden/compare.py` ops covered | 163 | 168, **unchanged by this round** |
+| `tests/golden/compare.py` ops covered | 163 | 168, **unchanged by this round** |
 
 A round that gave two architectures a `.train()` backward and moved **no** forward number is the
 claim: the kernels were all here already (§3, §4), and what was missing was two derivatives.
 
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten.bernoulli_.float -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs native_dropout_backward present -->

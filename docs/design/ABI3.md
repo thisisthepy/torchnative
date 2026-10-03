@@ -1,16 +1,16 @@
 # `torch._C` 를 abi3 로 만들 것인가
 
-`rust/torch_c` 를 CPython Limited API(abi3) 로 빌드할지, 특정 버전(3.13)에 고정할지에 대한
+`crates/torch_c` 를 CPython Limited API(abi3) 로 빌드할지, 특정 버전(3.13)에 고정할지에 대한
 판단 근거입니다. `docs/platform/RUST_CROSSBUILD.md` §1 이 **미결**로 남긴 항목입니다.
 
-현재 상태: `rust/torch_c/Cargo.toml:13` 이 `features = ["extension-module"]` — **non-abi3(버전 고정)**
+현재 상태: `crates/torch_c/Cargo.toml:13` 이 `features = ["extension-module"]` — **non-abi3(버전 고정)**
 이고, 이 상태로 세 타깃이 빌드됩니다.
 
 > **Correction (문서 감사, 2026-09):** 이 문서의 권고("abi3 를 켜라, floor 는 `abi3-py313`")가
-> 채택됐습니다. `rust/torch_c/Cargo.toml` 의 `pyo3` 의존성이 지금
+> 채택됐습니다. `crates/torch_c/Cargo.toml` 의 `pyo3` 의존성이 지금
 > `features = ["extension-module", "abi3-py313"]` 입니다(줄 번호는 이동했을 수 있음, 실측
 > 재확인 2026-09). "현재 상태" 줄은 이 문서를 쓴 시점의 상태로 남겨 두고 여기서 정정합니다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/Cargo.toml abi3-py313 present -->
+> <!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml abi3-py313 present -->
 
 ---
 
@@ -43,7 +43,7 @@
 | **[출처]** | 파일 경로 · 행 번호, 또는 공식 문서 URL |
 | **[추론]** | 이름과 API 성격으로 분류한 것. 측정하지 않음 |
 
-실험은 저장소 밖 `/Volumes/macMini/caches/abi3-probe` 에서 `rust/torch_c` 를 복사해 진행했습니다.
+실험은 저장소 밖 `/Volumes/macMini/caches/abi3-probe` 에서 `crates/torch_c` 를 복사해 진행했습니다.
 **저장소의 어떤 파일도 수정하지 않았습니다.**
 
 - 호스트: macOS 26 (Darwin 25.5.0), aarch64, 8 코어 / 16 GB
@@ -429,7 +429,7 @@ abi3 를 켜면 1~3 은 여전히 필요하지만(파이썬 자체는 실어야 
 
 ### 5d. [실측] 버전이 어긋나도 조용히 로드된다 — 이것이 가장 나쁘다
 
-빌드 산출물의 파일명은 `_C.so` 입니다 (`rust/torch_c/src/lib.rs:1` 주석 — "renamed on install").
+빌드 산출물의 파일명은 `_C.so` 입니다 (`crates/torch_c/src/lib.rs:1` 주석 — "renamed on install").
 **여기에는 ABI 태그가 없습니다.** macOS 의 `EXTENSION_SUFFIXES` 는
 `['.cpython-313-darwin.so', '.abi3.so', '.so']` 이므로 맨 `.so` 는 **어느 인터프리터에서든
 로드 후보**입니다.
@@ -556,7 +556,7 @@ nm -u <artifact> | sed 's/^_//' | grep -E '^(Py|_Py)' | sort > /tmp/used.txt
 
 ## 7. 권고
 
-**`rust/torch_c/Cargo.toml` 을 `features = ["extension-module", "abi3-py313"]` 로 바꾼다.**
+**`crates/torch_c/Cargo.toml` 을 `features = ["extension-module", "abi3-py313"]` 로 바꾼다.**
 
 근거를 무게순으로:
 
@@ -656,7 +656,7 @@ abi3 가 그쪽입니다.
 `/Volumes/macMini/caches/abi3-probe` 에 실험 트리가 남아 있습니다 (594 MB, 대부분 cargo 산출물).
 
 ```
-torch_c/          rust/torch_c 의 복사본. src/lib.rs 를 torch 모양 pyclass 로 교체
+torch_c/          crates/torch_c 의 복사본. src/lib.rs 를 torch 모양 pyclass 로 교체
 t-abi3/  t-ver/   §4a 마이크로벤치용 darwin 빌드 (abi3-py313 / non-abi3)
 t-abi311/         §5d 다중 버전 로드 확인용
 t-feat/ t-feat3/  §1c 기능 확인용 darwin / ios · android

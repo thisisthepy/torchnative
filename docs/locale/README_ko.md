@@ -161,7 +161,7 @@ flowchart TB
 |---|---|
 | ATen 연산자 | **302** 개, 각각 upstream 과 비교 |
 | 골든 비교 케이스 | **11,420 / 11,420** — 값, 형상, dtype; 문을 통해서도, 멤버를 통해서도 |
-| 스모크 테스트 | `test_shim.py` 하나에만 **480** 개; 게이트는 `rust/torch_c/pytests/` 의 모든 스위트를 돈다 |
+| 스모크 테스트 | `test_shim.py` 하나에만 **480** 개; 게이트는 `tests/` 의 모든 스위트를 돈다 |
 | 시그니처·스키마 표 | **5,037 중 5,024** 항목을 upstream 과 대조 |
 | 아키텍처 — forward | 스윕한 **297 중 297** (도달함; 새로 한 전체 스윕은 아님 — 긴 버전 참조) |
 | 아키텍처 — upstream 과 일치 | 판정 가능한 **285 중 284**, 유도한 허용오차로 ([`AGREE.md`](../numerics/AGREE.md)) |
@@ -245,10 +245,10 @@ pip install --pre torchnative
 **소스에서 빌드** (Rust 툴체인, CPython 3.13+):
 
 ```sh
-bash vendor/vendor_torch.sh     # 벤더링 torch 트리 조립
-bash vendor/install_shim.sh     # 확장 빌드 및 설치
-python tools/wheel/build.py                            # -> dist/*.whl
-python tools/wheel/verify.py dist/torchnative-*.whl    # 깨끗한 venv, 실제 import
+bash scripts/vendor/vendor_torch.sh     # 벤더링 torch 트리 조립
+bash scripts/vendor/install_shim.sh     # 확장 빌드 및 설치
+python scripts/wheel/build.py                            # -> dist/*.whl
+python scripts/wheel/verify.py dist/torchnative-*.whl    # 깨끗한 venv, 실제 import
 ```
 
 크로스 컴파일: [`docs/platform/RUST_CROSSBUILD.md`](../platform/RUST_CROSSBUILD.md).
@@ -267,8 +267,8 @@ python tools/wheel/verify.py dist/torchnative-*.whl    # 깨끗한 venv, 실제 
 - **문서도 검사** — DOCWATCH 마커가 이 페이지의 숫자를 실제 실행에 묶어 둡니다.
 
 ```sh
-bash rust/torch_c/pytests/run.sh                # 게이트
-python tools/golden/compare.py                  # upstream 대비 골든 비교
+bash tests/run.sh                # 게이트
+python tests/golden/compare.py                  # upstream 대비 골든 비교
 ```
 
 ---
@@ -311,4 +311,4 @@ Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause
 AND BSD-3-Clause AND BSL-1.0 AND MIT
 ```
 
-`tools/wheel/build.py` 가 서드파티 고지를 포함한 torch 의 `dist-info` 를 함께 싣습니다.
+`scripts/wheel/build.py` 가 서드파티 고지를 포함한 torch 의 `dist-info` 를 함께 싣습니다.

@@ -16,7 +16,7 @@
 
 ## 1. 프로브가 실제로 증명한 것 — 코드 이전에 답한다
 
-**지시대로 코드보다 먼저 적습니다.** `rust/vk_probe` 는 **`rust/torch_c` 와 워크스페이스가 분리된
+**지시대로 코드보다 먼저 적습니다.** `crates/vulkan_probe` 는 **`crates/torch_c` 와 워크스페이스가 분리된
 독립 크레이트**입니다 (`Cargo.toml` 주석이 그렇게 하도록 의도했다고 명시). 그것이 증명한 것은:
 
 - Vulkan 인스턴스·물리 장치·큐·버퍼·디스크립터·**컴퓨트 셰이더 디스패치**·펜스가 끝까지 돈다
@@ -231,8 +231,8 @@ pub enum Repr {
 **호출 지점이 396 곳**입니다:
 
 ```
-$ grep -rn "\.tensor()" rust/torch_c/src/*.rs | wc -l     ->  396
-$ grep -rn "Repr::Quant" rust/torch_c/src/*.rs | wc -l    ->   20
+$ grep -rn "\.tensor()" crates/torch_c/src/*.rs | wc -l     ->  396
+$ grep -rn "Repr::Quant" crates/torch_c/src/*.rs | wc -l    ->   20
 ```
 
 즉 **`Repr::Vulkan` 을 추가하면 396 개 호출 지점이 전부 자동으로 거부합니다.** 지시가 금지한
@@ -291,7 +291,7 @@ CPU 스토리지를 읽을 수 없습니다. op 은 하나씩 명시적으로 op
 ## 8. 규율
 
 - **설치한 것 없음.** 로더·ICD 는 전부 이미 디스크에 있던 Android SDK 번들입니다.
-- **`rust/torch_c` 를 변경하지 않았습니다.** 이 라운드의 변경은 `docs/devices/VULKAN2.md` 하나입니다.
+- **`crates/torch_c` 를 변경하지 않았습니다.** 이 라운드의 변경은 `docs/devices/VULKAN2.md` 하나입니다.
 - 빌드 종료 코드는 파일로 리다이렉트한 뒤 `$?` 로 읽었습니다. 파이프로 읽지 않았습니다.
 - 프로브는 전부 포그라운드에서 돌았고 스스로 종료했습니다. **남긴 프로세스가 없습니다.**
 - 커밋하지 않았습니다.

@@ -2,7 +2,7 @@
 
 ## 0. The question, and the verdict
 
-`torchnative/src/main/torchnative/export/intelnpu.py:212` says
+`python/torchnative/export/intelnpu.py:212` says
 
     MAX_DIM = 2 ** 17     # 131072
 
@@ -35,7 +35,7 @@ shape of any limit in this stack.
 **But (c) does not tell us the real ceiling, and this document does not claim
 one.** What the evidence establishes is that `2**17` is unsourced, not that
 `151936` compiles. §5 says what would settle that, and
-`tools/devices/intelnpu_dimsweep.py` is the experiment. **`MAX_DIM` is
+`scripts/devices/intelnpu_dimsweep.py` is the experiment. **`MAX_DIM` is
 therefore unchanged by this round.** Raising it on the strength of "OpenVINO
 does not contain that number" would be exactly the inference the rules of
 evidence in `docs/devices/QNNOPS.md` §5 forbid: concluding a permissive fact
@@ -210,7 +210,7 @@ Named, with what would settle each. Nothing below is used to support §0.
   `2**17` is not sourced to OpenVINO. It does **not** show that
   `out_features=151936` compiles, or that anything between 8193 and 151936
   does. No dimension above 8192 was compiled for `NPU` in this round, on any
-  machine. Settled by: `tools/devices/intelnpu_dimsweep.py` Stage B on the
+  machine. Settled by: `scripts/devices/intelnpu_dimsweep.py` Stage B on the
   Windows NPU laptop (§5).
 * **The driver-resident compiler (`NPU_COMPILER_TYPE=DRIVER`).** OpenVINO can
   hand compilation to a compiler inside the NPU driver rather than to the
@@ -243,8 +243,8 @@ Named, with what would settle each. Nothing below is used to support §0.
 
 ## 5. The experiment that settles it
 
-`tools/devices/intelnpu_dimsweep.py`, shaped after
-`tools/devices/intelnpu_verify.py`: **Stage A is SELECTION** (which dimensions
+`scripts/devices/intelnpu_dimsweep.py`, shaped after
+`scripts/devices/intelnpu_verify.py`: **Stage A is SELECTION** (which dimensions
 `linear_ir` will emit, pure Python, no OpenVINO, no NPU — a green Stage A is
 not a hardware result and the tool says so), **Stage B is EXECUTION** (compile
 each dimension for `NPU` and read `EXECUTION_DEVICES` back).

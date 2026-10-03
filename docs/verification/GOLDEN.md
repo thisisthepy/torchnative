@@ -1,6 +1,6 @@
 # GOLDEN — closing the keyword-dispatch blind spot
 
-`tools/golden/compare.py` is this repository's headline correctness number:
+`tests/golden/compare.py` is this repository's headline correctness number:
 every case it runs calls both upstream torch and this shim's `_C._aten_dispatch`
 on the same inputs and diffs value, shape and dtype. docs/design/DISPATCH.md §4.1
 found that this number was structurally blind to one entire code path — this
@@ -10,12 +10,12 @@ records what closed it, and what is still open.
 
 ## 1. The gap, as found
 
-Every one of the 2811 cases `tools/golden/cases.py` built (before this
+Every one of the 2811 cases `tests/golden/cases.py` built (before this
 change) called `_aten_dispatch` **positionally**:
 `c_module._aten_dispatch("aten.add.Tensor", a_c, b_c)`. Production code never
 calls that way — `bootstrap.py`'s `resolve()`/`_bind()` binds a call into a
 dict and dispatches with `dispatch(key, **bound)`, always by keyword. The
-keyword lookup goes through `optional()` in `rust/torch_c/src/aten.rs`, which
+keyword lookup goes through `optional()` in `crates/torch_c/src/aten.rs`, which
 for an argument found in `kwargs` (not in the positional tuple) consults
 `interned_name()` — a hand-written table mapping ~74 argument names to
 pre-interned `PyString`s, added for the performance work docs/design/DISPATCH.md §3
@@ -49,12 +49,12 @@ have at least one golden case that supplies it by keyword** — enough that
 tampering any one `interned_name()` arm turns at least one case red, without
 inflating the suite by more than the number of names that needed it.
 
-Which names that is was read out of `rust/torch_c/src/aten.rs` mechanically
+Which names that is was read out of `crates/torch_c/src/aten.rs` mechanically
 (grepping `aten_dispatch_inner`'s `match op` block for the op → function
 mapping, then each function's `optional`/`required`/`tensor_arg`/
 `{dim,bool,int,float,scalar,dtype}_arg`/`device_arg_or_label` call sites for
 `(index, name)`), not guessed from the schema tables — the schema tables
-(`rust/torch_c/pytests/verify_schemas.py`'s 4203 entries) say what upstream
+(`tests/verify_schemas.py`'s 4203 entries) say what upstream
 accepts, but what matters for this specific gap is what **this shim's
 `optional()` helper is actually asked to look up**, which can be a subset
 (not every schema argument is implemented) with different names in a few
@@ -73,7 +73,7 @@ is trusted to mean anything.
 ## 3. What was added
 
 32 new cases (2811 → 2843), one or a small handful of arguments per op,
-appended to the existing per-op builder in `tools/golden/cases.py` (search
+appended to the existing per-op builder in `tests/golden/cases.py` (search
 `Keyword-argument coverage` — every addition carries that marker and cites
 this doc). No existing case was changed; nothing was removed.
 
@@ -180,22 +180,22 @@ tampered lookup observable, so that is the case that was added
 
 Acceptance test, run exactly as docs/design/DISPATCH.md §4.1 ran it originally —
 `"dim" => intern!(py, "dim")` changed to `intern!(py, "TAMPERED_dim")` in
-`rust/torch_c/src/aten.rs`, restored from a `cp` backup afterward (md5
+`crates/torch_c/src/aten.rs`, restored from a `cp` backup afterward (md5
 verified identical before and after; never `git checkout -- <path>`).
 
 **With `aten.rs` unmodified** (this change's new baseline):
 
 ```
-tools/golden/compare.py     -> 2843/2843 cases passed, ops covered=119, exit 0
-tools/golden/compare.py --self-test -> PASS, 12 comparators x 11 fault modes, exit 0
-rust/torch_c/pytests/run.sh -> 177 ok / 34 pre-existing, unrelated failures (see §6), exit 1
+tests/golden/compare.py     -> 2843/2843 cases passed, ops covered=119, exit 0
+tests/golden/compare.py --self-test -> PASS, 12 comparators x 11 fault modes, exit 0
+tests/run.sh -> 177 ok / 34 pre-existing, unrelated failures (see §6), exit 1
 ```
 
 **With the tamper applied:**
 
 ```
-tools/golden/compare.py -> 2838/2843 cases passed, 5 FAILED, exit 1
-rust/torch_c/pytests/run.sh -> 176 ok / 35 failures (one new), exit 1
+tests/golden/compare.py -> 2838/2843 cases passed, 5 FAILED, exit 1
+tests/run.sh -> 176 ok / 35 failures (one new), exit 1
 ```
 
 Golden turns red. The five cases that catch it are exactly the ones that
@@ -230,7 +230,7 @@ lucky case.
 
 ## 6. A verification pitfall found along the way
 
-`tools/golden/loader.py`'s `load_shim()` defaults to
+`tests/golden/loader.py`'s `load_shim()` defaults to
 `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib` (no `TORCH_C_ARTEFACT`
 env var, no `--artefact` flag) when neither is given. Building with a
 different `CARGO_TARGET_DIR` — as this task's own instructions require, to
@@ -259,8 +259,8 @@ concluded that the 4203-entry baseline "could not be reproduced in this
 sandbox". It was argued in detail, with a minimal two-directory reproduction,
 and it was wrong.
 
-The cause was that **this worktree had never had `vendor/vendor_torch.sh`
-run in it.** `torchnative/src/main/torch/` held four files instead of the
+The cause was that **this worktree had never had `scripts/vendor/vendor_torch.sh`
+run in it.** `python/torch/` held four files instead of the
 upstream tree, so every subprocess that puts that directory on `PYTHONPATH`
 found nothing to shadow with and fell through to the real `torch` — which is
 exactly the symptom described, arrived at by a different route. The vendored
@@ -270,18 +270,18 @@ does not have it and nothing in the suite says so.
 Running it takes both numbers straight back:
 
 ```
-bash vendor/vendor_torch.sh && bash vendor/install_shim.sh
-sh rust/torch_c/pytests/run.sh          211 ok, exit 0
-python tools/golden/compare.py          2843/2843, ops=119, exit 0
-python rust/torch_c/pytests/verify_schemas.py   4203/4203, exit 0
-python tools/golden/compare.py --self-test      exit 0
+bash scripts/vendor/vendor_torch.sh && bash scripts/vendor/install_shim.sh
+sh tests/run.sh          211 ok, exit 0
+python tests/golden/compare.py          2843/2843, ops=119, exit 0
+python tests/verify_schemas.py   4203/4203, exit 0
+python tests/golden/compare.py --self-test      exit 0
 ```
 
 The mechanism the old text described is real Python behaviour; it just was not
 what was happening here, and the reasoning ran downhill from a wrong premise
 to a confident conclusion. The tell was available and not taken: a baseline
 that disagrees with the number the task hands you is more likely to be your
-environment than a stale figure in the brief — and `ls torchnative/src/main/torch`
+environment than a stale figure in the brief — and `ls python/torch`
 answers it in one command.
 
 It is kept rather than deleted because §6 records a false-green from the same
@@ -294,9 +294,9 @@ result without checking what produced it.
 ```
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-golden
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # see §6
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-$PY tools/golden/compare.py                 # 2843/2843, ops covered=119, exit 0
-$PY tools/golden/compare.py --self-test     # PASS, exit 0
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   # 177 ok / 34 pre-existing unrelated (§7), exit 1
+$PY tests/golden/compare.py                 # 2843/2843, ops covered=119, exit 0
+$PY tests/golden/compare.py --self-test     # PASS, exit 0
+PYTHON=$PY sh tests/run.sh   # 177 ok / 34 pre-existing unrelated (§7), exit 1
 ```

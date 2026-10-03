@@ -7,13 +7,13 @@ three different claims, and this is the first. The first real use should be a
 `workflow_dispatch` with `dry_run: true`, which builds and verifies nine
 wheels and uploads nothing.
 
-Tests: **38** in `rust/torch_c/pytests/test_cipub.py`.
+Tests: **38** in `tests/test_cipub.py`.
 
 ---
 
 ## 0. What it replaces, and why that matters more than the automation
 
-The manual release was: one person, one Mac, nine `python tools/wheel/build.py
+The manual release was: one person, one Mac, nine `python scripts/wheel/build.py
 --target ...` invocations, `twine upload`. The problem was not the typing. It
 was that the toolchain lived in that machine's scratch directories — a `zig`
 shim at `/tmp/zigbin`, an emsdk under `/Volumes/macMini/caches`, a
@@ -29,7 +29,7 @@ Moving the wiring into a file is the point. The automation is a side effect.
 
 ---
 
-## 1. Can `vendor/vendor_torch.sh` run on a CI runner?
+## 1. Can `scripts/vendor/vendor_torch.sh` run on a CI runner?
 
 **Yes, and it produces a byte-identical tree — with one pin that is not
 optional.**
@@ -86,7 +86,7 @@ The five are each accounted for, and none of them comes from vendoring:
 
 | member | why it is only in the wheel |
 |---|---|
-| `torch/_C.abi3.so` | our shim, put there by `vendor/install_shim.sh` |
+| `torch/_C.abi3.so` | our shim, put there by `scripts/vendor/install_shim.sh` |
 | `torch/bin/torch_shm_manager` | the zero-byte wall-4 marker `install_shim.sh` places |
 | `torch/lib/libtorch_global_deps.dylib` | `build.py`'s `global_deps_stub()`, per target |
 | `torch-2.13.0.dist-info/INSTALLER` | see §2.2 |
@@ -113,7 +113,7 @@ rewrites the Mach-O install name because cargo embeds `CARGO_TARGET_DIR`
 into it (`_fix_install_name`); rustc additionally embeds absolute source and
 `~/.cargo/registry` paths in panic strings and debug info. A different
 toolchain version changes codegen outright. What CI can promise about `_C` is
-what `tools/wheel/verify_cross.py` already checks — architecture, Mach-O
+what `scripts/wheel/verify_cross.py` already checks — architecture, Mach-O
 `LC_BUILD_VERSION` platform / ELF machine / PE machine, the `PyInit__C`
 export, the DT_NEEDED set, the glibc floor derived from `.gnu.version_r` —
 not a hash.
@@ -138,7 +138,7 @@ published artefact, so it is left as a recommendation rather than made here.
 
 ### 2.3 The machinery, reused rather than rewritten
 
-`tools/wheel/verify_cross.py --reference <wheel>` is the member-list
+`scripts/wheel/verify_cross.py --reference <wheel>` is the member-list
 comparison (its `_default_reference` picks the same-version macOS wheel; the
 docstring records the 2026-08-30 incident where an unscoped picker compared
 0.0.4a0 against 0.0.2a0 and passed). The `collect` job runs it for each of the
@@ -213,7 +213,7 @@ refuses rather than warns when it is unset.
 `fail-fast: false`: one broken target reports next to the other eight rather
 than hiding them behind a cancellation.
 
-Every job builds the host shim first (`vendor/install_shim.sh`), because
+Every job builds the host shim first (`scripts/vendor/install_shim.sh`), because
 `build.py`'s `preflight` requires `torch/_C.abi3.so` to exist even when the
 wheel is for another platform — a tree with the hole still open is the
 `py3-none-any` shell.
@@ -224,7 +224,7 @@ wheel is for another platform — a tree with the hole still open is the
 
 ### 5.1 The tag must be the version
 
-`tools/ci/check_tag_version.py`, run in `preflight`, which every other job
+`.github/scripts/check_tag_version.py`, run in `preflight`, which every other job
 depends on. Nothing checked this before: `build.py` reads the version out of
 the metadata and never sees the tag; the release process read the tag and never
 saw `pyproject.toml`. `git tag v0.1.0b4 && git push --tags` would have
@@ -239,8 +239,8 @@ reader copies into `pip install torchnative==...`.
 
 Run it locally:
 
-    python tools/ci/check_tag_version.py v0.1.0b3     # exit 0
-    python tools/ci/check_tag_version.py v0.1.0b4     # exit 1, names both
+    python .github/scripts/check_tag_version.py v0.1.0b3     # exit 0
+    python .github/scripts/check_tag_version.py v0.1.0b4     # exit 1, names both
 
 ### 5.2 Nine wheels or no upload
 
@@ -270,7 +270,7 @@ notices.
 
 ### 5.4 The gate: run, not required
 
-The workflow **runs** `rust/torch_c/pytests/run.sh` on the tagged tree rather
+The workflow **runs** `tests/run.sh` on the tagged tree rather
 than requiring a green status on the commit.
 
 Requiring is faster and trusts two things: that the gate ran on *this* tree — a

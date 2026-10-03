@@ -1,9 +1,9 @@
 # Three `_nn` bindings, one `fft_fftn` that is still a kernel, and why zero export names moved
 
 `docs/architectures/VOICE3.md` landed three kernels — `im2col`, `col2im`, `upsample_nearest1d` —
-and could not bind any of them, because `rust/torch_c/src/bootstrap.py` was another
-round's file. It recorded the gap in `tools/golden/reach_allow.json` and asserted it
-from both sides in `pytests/test_voice3.py`. This round closes it.
+and could not bind any of them, because `crates/torch_c/src/bootstrap.py` was another
+round's file. It recorded the gap in `tests/golden/reach_allow.json` and asserted it
+from both sides in `tests/test_voice3.py`. This round closes it.
 
 The bar was set by `docs/bindings/BINDINGS.md`, which was told "`mish` just needs a binding"
 and found the kernel gone: **each binding here says whether its kernel was really
@@ -30,19 +30,19 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/bind3`.
 | `aten.fft_fftn.default` | **Not landed.** It is a composite, its three parts are not all reachable, and §6 names which one is missing |
 | Export names moved into `bootstrap.py` | **Zero.** §7, and the measurement that decides it |
 | Golden | **10691/10691, ops=287** — exactly unmoved; no kernel changed |
-| Suite | **755 ok** across `pytests/` (`test_shim.py`'s own share, which `smoke_ok` counts, is 480), `DOCWATCH: PASS` |
+| Suite | **755 ok** across `tests/` (`test_shim.py`'s own share, which `smoke_ok` counts, is 480), `DOCWATCH: PASS` |
 
 ---
 
 ## 1. `torch._C._nn.im2col` — `F.unfold`, `llama4`'s vision tower
 
-**The kernel was really there.** `im2col_default` at `rust/torch_c/src/aten.rs:26469`,
+**The kernel was really there.** `im2col_default` at `crates/torch_c/src/aten.rs:26469`,
 listed in `IMPLEMENTED`, with its own dtype check, its own sliding-block refusal, and
 golden cases including a multi-channel input. Checked before a line of the binding was
 written, because `docs/bindings/BINDINGS.md`'s `mish` is what happens when it is not.
 
 <!-- DOCWATCH: op-implemented aten.im2col.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs im2col_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs im2col_default present -->
 
 `torch/nn/functional.py`'s `unfold` ends in a straight forward with no branch:
 
@@ -70,7 +70,7 @@ would have been the easier change and would have put a door on this shim that up
 does not have. `test_no_torch_level_spelling_was_invented_for_these_three` holds it from
 this side too.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bind3.py test_no_torch_level_spelling_was_invented_for_these_three present -->
+<!-- DOCWATCH: symbol-in-file tests/test_bind3.py test_no_torch_level_spelling_was_invented_for_these_three present -->
 
 ## 2. `torch._C._nn.col2im` — `F.fold`, `f5-tts`
 
@@ -78,7 +78,7 @@ this side too.
 that is the op: **overlapping windows are summed, not overwritten.**
 
 <!-- DOCWATCH: op-implemented aten.col2im.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs col2im_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs col2im_default present -->
 
 `F.fold` forwards the same way `F.unfold` does, one argument longer. The binding adds
 nothing to the kernel's arithmetic; what it adds is that `F.fold` reaches it.
@@ -97,7 +97,7 @@ fails as a broken control instead of passing vacuously.
 `aten.rs`'s own comment records that it was checked *not* to be an alias of the 2-D op.
 
 <!-- DOCWATCH: op-implemented aten.upsample_nearest1d.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs upsample_nearest1d_default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs upsample_nearest1d_default present -->
 
 ### 3.1 The discriminator is the third argument's TYPE, not the arity
 
@@ -161,7 +161,7 @@ both readings, **asserts they differ before asserting anything else**, and then 
 upstream to equal one and not the other. That is the `§5.5` shape — a verification that
 can fail.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bind3.py test_the_scale_factor_is_forwarded_and_not_merely_used_to_size_the_output present -->
+<!-- DOCWATCH: symbol-in-file tests/test_bind3.py test_the_scale_factor_is_forwarded_and_not_merely_used_to_size_the_output present -->
 
 ## 4. What the check then deleted
 
@@ -184,7 +184,7 @@ aten.upsample_nearest1d.default
 `reach.py` now reports shape 2 as four entries (`_fft_c2c`, `_fft_c2r`, `_fft_r2c`,
 `alias`), down from seven, and `REACH: PASS`.
 
-<!-- DOCWATCH: json-key tools/golden/reach_allow.json shape2_kernel_without_spelling present -->
+<!-- DOCWATCH: json-key tests/golden/reach_allow.json shape2_kernel_without_spelling present -->
 
 **`test_voice3.py`'s negative test was inverted, not deleted.** It asserted that the
 three `_nn` names refused while their kernels answered; it now asserts that the same
@@ -192,11 +192,11 @@ three probe cases agree with upstream element-wise. Its docstring said "delete t
 test", and the coverage was kept instead: those are the only cases in that file that go
 through the `F.*` spelling rather than through `torch.ops.aten.*`.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_voice3.py test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F present -->
+<!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F present -->
 
 ## 5. `llama4`'s vision tower — what is and is not claimed
 
-`pytests/arch_sweep.py --only llama4` reports **1/1 forward** on the shim and 1/1 on
+`tests/arch_sweep.py --only llama4` reports **1/1 forward** on the shim and 1/1 on
 upstream. **That is not evidence for this round**, and saying so is the point of this
 section.
 
@@ -292,7 +292,7 @@ the lie.
 `docs/graph/EXPORT.md` §6 orders the work: **dispatcher mode entrance first, `_NodeBase`
 second, the three of §3 third, the 29 names last.** The entrance is in `aten.rs`, which
 was not this round's file, so the question put to this round was the narrow one: of the
-29 implementations staged in `torchnative/src/main/torchnative/export/upstream.py`, how
+29 implementations staged in `python/torchnative/export/upstream.py`, how
 many can move into `bootstrap.py` **without making the empty-graph path reachable**?
 
 **None.** Not because the names are individually dangerous — three of the eight groups
@@ -358,8 +358,8 @@ no matching benefit, and `docs/graph/EXPORT.md` §8 is written as one patch for 
 `upstream.py` is unchanged by this round, `test_export.py` is unchanged, and
 `set_eval_frame`'s refusal was not approached.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/upstream.py install present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py install present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
 
 ---
 
@@ -371,10 +371,10 @@ Split as `docs/architectures/ARCH100.md` §5.3 asks, because "landed" is not one
 |---|---|
 | **feature added** | 3 `_install_nn` bindings — `im2col`, `col2im`, `upsample_nearest1d` — and the `_int_pair` helper they share. No kernel, no `aten.rs` change, no new dispatch key |
 | **defect fixed** | none |
-| **tests added** | `pytests/test_bind3.py`, 17 tests, every positive one element-wise against a live upstream in its own process |
-| **tests inverted** | 1 in `pytests/test_voice3.py` — the one asserting these three unreachable from `F.*`. Not deleted |
+| **tests added** | `tests/test_bind3.py`, 17 tests, every positive one element-wise against a live upstream in its own process |
+| **tests inverted** | 1 in `tests/test_voice3.py` — the one asserting these three unreachable from `F.*`. Not deleted |
 | **documentation** | this file |
-| **deleted** | 3 entries from `tools/golden/reach_allow.json`, deleted *because* the gaps closed and `reach.py` fails on a stale entry |
+| **deleted** | 3 entries from `tests/golden/reach_allow.json`, deleted *because* the gaps closed and `reach.py` fails on a stale entry |
 | **architectures moved** | none claimed. `llama4`'s vision **patch embedding** runs and matches upstream (§5); the tower as a whole still stops, on complex `view` |
 | **not done, and why** | `fft_fftn` (§6 — three complex-representation gaps in `aten.rs`); the 29 export names (§7 — measured, zero) |
 
@@ -390,14 +390,14 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-bind3
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd rust/torch_c && cargo build --release && cd ../..     # bootstrap.py is include_str!'d
-bash vendor/install_shim.sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh                # 755 ok, DOCWATCH: PASS
-TORCH_C_ARTEFACT=$TORCH_C_STAGE/_C.abi3.so $PY tools/golden/compare.py   # 10691/10691 ops=287
-TORCH_C_ARTEFACT=$TORCH_C_STAGE/_C.abi3.so $PY tools/golden/reach.py     # REACH: PASS, shape 2 = 4
+cd crates/torch_c && cargo build --release && cd ../..     # bootstrap.py is include_str!'d
+bash scripts/vendor/install_shim.sh
+PYTHON=$PY sh tests/run.sh                # 755 ok, DOCWATCH: PASS
+TORCH_C_ARTEFACT=$TORCH_C_STAGE/_C.abi3.so $PY tests/golden/compare.py   # 10691/10691 ops=287
+TORCH_C_ARTEFACT=$TORCH_C_STAGE/_C.abi3.so $PY tests/golden/reach.py     # REACH: PASS, shape 2 = 4
 
-cd rust/torch_c/pytests
-PYTHONPATH=$PWD/../../../torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+cd tests
+PYTHONPATH=$PWD/../../../python TORCH_USE_RTLD_GLOBAL=1 \
     $PY arch_sweep.py --only llama4 --out /tmp/shim.json                 # 1/1 forward
 ```
 

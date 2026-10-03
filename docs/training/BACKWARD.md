@@ -35,8 +35,8 @@ Written incrementally, one stage at a time, for the reason `docs/kernels/KERNELS
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                296 ok, 0 FAIL, DOCWATCH 95/95      exit 0
-tools/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
+tests/run.sh                296 ok, 0 FAIL, DOCWATCH 95/95      exit 0
+tests/golden/compare.py       7447/7447, ops=166, pending=1       exit 0
 compare.py --self-test        19 comparators x 11 fault modes     exit 0
 verify_schemas.py             4475/4475                           exit 0
 sweep26   (shim, .eval())     26/26                               exit 0
@@ -47,7 +47,7 @@ sweeptrain (shim, .train())   26/26                               exit 0
 
 ## 1. What the tape is, and what it did not need
 
-`rust/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
+`crates/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
 
 ```
 replay   the forward, keeping every intermediate     (PyCaptureTrace::run)
@@ -84,7 +84,7 @@ not needed — a `scatter` into a zero buffer is.
 CPU kernel here nor a Core ATen decomposition, is not needed either: §3.4.
 
 **Zero new aten kernels were written for this document.** `ops=166` before and after, and
-`tools/golden/compare.py` is unchanged at 7447/7447 — which is the check that says so, because a
+`tests/golden/compare.py` is unchanged at 7447/7447 — which is the check that says so, because a
 new kernel would have had to appear there.
 
 ### 1.2 The surface
@@ -122,10 +122,10 @@ whole reverse walk is **0.4 s**.
 projection onto the declared outputs. A backward that materialised activations its own way would be
 differentiating a different forward from the one `replay` proves equal to eager.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs RULE_OPS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs sdpa_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs nll_loss_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs crate::tape::backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs RULE_OPS present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs sdpa_backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs nll_loss_backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs crate::tape::backward present -->
 
 ---
 
@@ -421,7 +421,7 @@ wrong gradient looks exactly as plausible as a right one and the program keeps r
 ```
 NotImplementedError: torch._C tape: no derivative rule for aten.topk.default -- a gradient
 reached it, and the tape refuses to guess. Add a rule in tape.rs and a gradient case in
-pytests/test_shim.py; trace.differentiable() lists every op in a trace that would need one
+tests/test_shim.py; trace.differentiable() lists every op in a trace that would need one
 ```
 
 `differentiable()` names it *before* a backward is run, which is what makes "what stops this model"
@@ -465,7 +465,7 @@ against a known-good implementation first.
 
 ## 7. Sabotage: 17 faults
 
-Every one applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
+Every one applied to `crates/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
 
 | # | fault | caught |
 |---|---|---|
@@ -502,10 +502,10 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 ### 7.1 What this suite still cannot see
 
 * **Nothing here compares against upstream.** The tape tests use finite differences, because
-  `pytests/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
+  `tests/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
   upstream comparison is §2, §3 and §4, and those are measurements in this document rather than
-  tests in `pytests/` — so §4's 8.8e-05 can move without anything going red.
-* **`tools/golden/compare.py` cannot see the tape at all.** It compares *ops* by dispatch key, and a
+  tests in `tests/` — so §4's 8.8e-05 can move without anything going red.
+* **`tests/golden/compare.py` cannot see the tape at all.** It compares *ops* by dispatch key, and a
   derivative rule is not an op. That is why the rule table is pinned by a test instead.
 * **No `float32` case separates a summation order** — the same statement `docs/training/LOSS.md` §5.3 makes,
   for the same reason, and it is why §4.4's attribution had to be done in `float64`.
@@ -535,9 +535,9 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 296 ok, 0 FAIL | **302 ok, 0 FAIL** |
+| `tests/run.sh` | 296 ok, 0 FAIL | **302 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 95/95 | **109/109** (14 new markers, all in this document) |
-| `tools/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
+| `tests/golden/compare.py` | 7447/7447, ops=166, pending 1 | **7447/7447, ops=166, pending 1** |
 | `compare.py --self-test` | 19 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4475/4475 | **4475/4475** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -572,11 +572,11 @@ test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise
 test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none
 ```
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _set_grad present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs _shim_grad present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _set_grad present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs _shim_grad present -->
 
 ---
 
@@ -606,9 +606,9 @@ Two things did **not** change with it, and they are what keeps the reversal narr
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-tape
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 3
 
 # §2, §3  the small cases, both sides, then the element-wise comparison
 $PY   /tmp/tape/run_up.py   <case> /tmp/tape/up_<case>.json
@@ -630,9 +630,9 @@ $PY   /tmp/tape/fdup.py
 $PY /tmp/tape/sab.py            # or /tmp/tape/sab.py T5 T8 for one
 
 # §9  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/tape/ev   ;  $SHIM /tmp/train/sweeptrain.py /tmp/tape/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -651,7 +651,7 @@ and this section is the rules themselves.
 
 §8's row and `docs/models/ADAPT.md` §8.1 both say closing `nn.LayerNorm` is *"one arm in `tape.rs` and one
 gradient case"*. **Neither had asked a `gpt2`.** Both were reading a four-line `nn.LayerNorm` toy in
-`pytests/`, and `trace.differentiable()` on the real checkpoints says:
+`tests/`, and `trace.differentiable()` on the real checkpoints says:
 
 | | nodes | on a gradient path | missing rules |
 |---|---:|---:|---|
@@ -694,7 +694,7 @@ per tuple position — which the walk already supported, `node.outputs` being a 
 
 **A chunk that no gradient reached still occupies its width in the input**, so it has to appear in
 the `cat` at full size as a zero. GPT-2 uses all three of its chunks, so *the model that needs this
-rule cannot exercise that zero* — the gradient case in `pytests/` is what does, and §14's S2 is the
+rule cannot exercise that zero* — the gradient case in `tests/` is what does, and §14's S2 is the
 fault.
 
 ### 12.4 The gradient cases, and the hole both of them would have had
@@ -729,8 +729,8 @@ are: median relative L2 `8.780e-05`, worst `3.031e-04` at `model.layers.24.input
 sign agreement `134513262/134515008 = 0.999987`. A rule that changed a model that does not use it
 would mean the walk had started doing something other than what the trace says.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten.split.Tensor present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten.split.Tensor present -->
 <!-- DOCWATCH: op-implemented aten.native_layer_norm.default -->
 <!-- DOCWATCH: op-implemented aten.split.Tensor -->
 
@@ -814,7 +814,7 @@ rule builds:
 is out-of-place: the `[49152, 1024]` zeros *and* the `[49152, 1024]` one-hot are both live at
 201 MB each, which the arithmetic-on-shapes estimate counted once.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten.index_put_.default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten.index_put_.default present -->
 <!-- DOCWATCH: op-implemented aten.index_put_.default -->
 
 ---
@@ -968,14 +968,14 @@ and there is no backend here that does not — `docs/models/ADAPT.md` §1's tabl
 names a check that can be run, and it is now the only one of `docs/design/DESIGN.md` §3's three lifetime
 questions that answers with a refusal rather than by doing the thing.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py persist present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py persist present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
 
 ---
 
 ## 15. Sabotage: 12 faults on the three rules this round touched
 
-Each applied to `rust/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
+Each applied to `crates/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
 the four adaptation-road tests that go through the vendored tree.
 
 | # | fault | caught |
@@ -1018,7 +1018,7 @@ Measured directly, running the same case under both builds:
   computes its statistics at the *parameter* dtype and a recomputation computes them at the input's.
   That is exactly why the rule reads them, and `aten.rs` measured the dtype rule it depends on.
 
-What would close it is an oracle for mixed-precision *values*, and `pytests/test_shim.py` has none —
+What would close it is an oracle for mixed-precision *values*, and `tests/test_shim.py` has none —
 §7.1's first bullet already says these tests run against bare `_C` with no upstream in the process.
 The two-interpreter shape `docs/models/ADAPT.md` §11.1 uses would provide one. **It is named as a hole, not
 as a property.** This is `docs/numerics/SCALAR.md`'s statement arriving a third time: this suite separates
@@ -1052,9 +1052,9 @@ a promotion this shim declines by name. The rule now computes its interior in th
 and narrows each result to the dtype of the thing it is a gradient for, which is what upstream does.
 `cast_like` went from dead code to the thing L6 removes.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
 
 ---
 
@@ -1062,9 +1062,9 @@ and narrows each result to the dtype of the thing it is a gradient for, which is
 
 | gate | before this round | after |
 |---|---|---|
-| `pytests/run.sh` | 312 ok, 0 FAIL | **317 ok, 0 FAIL** |
+| `tests/run.sh` | 312 ok, 0 FAIL | **317 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 178/178 | **190/190** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 20 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -1122,9 +1122,9 @@ checking nothing.
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-rules
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"
 
 # §12.1  the sizing check, before any rule was written
 $SHIM /tmp/rules/wall.py gpt2   ;  $SHIM /tmp/rules/wall.py bert
@@ -1146,9 +1146,9 @@ $SHIM /tmp/rules/persist_real.py        # a Tent delta on SmolLM2, written and r
 $PY /tmp/rules/sab.py                   # or /tmp/rules/sab.py L5 S2 for one
 
 # §16  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/rules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/rules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -1284,7 +1284,7 @@ therefore_redraws_its_mask` pins the property so it cannot go quiet.
 §15.1 named a hole rather than a property: **L5** — the layer-norm rule recomputing its statistics
 instead of reading the two the forward returns — is *exactly* a no-op at matched dtypes and moves 22
 of 24 `grad_input` elements at mixed precision, so no `float32` or `float64` case could ever catch
-it. It said what would close it: *"an oracle for mixed-precision values, and `pytests/test_shim.py`
+it. It said what would close it: *"an oracle for mixed-precision values, and `tests/test_shim.py`
 has none"*.
 
 It has one, and **not the two-interpreter shape §15.1 guessed at**: upstream `torch` is importable
@@ -1340,13 +1340,13 @@ gradient bit-identical, and no spelling reproduces this one** — so the choice 
 measured 3e-03 gap and an unmeasured guess at upstream's accumulation order. That is a real item,
 not a closed one, and it belongs to whoever owns `native_layer_norm` next.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs native_dropout_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten._safe_softmax.default present -->
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
 
 ---
 
@@ -1392,9 +1392,9 @@ equal, so neither new rule could have landed without a case.
 
 | gate | §16 | now |
 |---|---|---|
-| `pytests/run.sh` | 317 ok, 0 FAIL | **325 ok, 0 FAIL** |
+| `tests/run.sh` | 317 ok, 0 FAIL | **325 ok, 0 FAIL** |
 | `run.sh` DOCWATCH | 190/190 | **210/210** |
-| `tools/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
+| `tests/golden/compare.py` | 7685/7685, ops=168, pending 1 | **7685/7685, ops=168, pending 1** |
 | `compare.py --self-test` | 20 comparators × 11 fault modes | **unchanged** |
 | `verify_schemas.py` | 4479/4479 | **4479/4479** |
 | sweep26 (`.eval()`) | 26/26 | **26/26** |
@@ -1445,8 +1445,8 @@ new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert
 
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 <!-- DOCWATCH: count golden_ops_covered ge 168 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
 
 ---
 
@@ -1456,9 +1456,9 @@ new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-trainrules
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"
 
 # §18.1  the .train() sizing, before any rule was written
 $SHIM /tmp/trrules/wall_train.py gpt2
@@ -1480,9 +1480,9 @@ $PY /tmp/trrules/mp_gw.py ; $PY /tmp/trrules/mp_gw3.py ; $PY /tmp/trrules/mp_gw5
 $PY /tmp/trrules/sab.py                  # or /tmp/trrules/sab.py L5 V2 for one
 
 # §20  gates
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py  ;  $PY tools/golden/compare.py --self-test
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
+$PY tests/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/trrules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/trrules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 $SHIM /tmp/tape/smol_shim2.py sdpa 8 sdpa8

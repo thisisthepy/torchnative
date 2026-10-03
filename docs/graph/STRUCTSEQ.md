@@ -70,7 +70,7 @@ received. Everything below is about the two things that happen in between.
 
 ## 2. Defect one: the `Python` dispatch key lived nowhere
 
-`rust/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
+`crates/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
 else — `any_dispatch_mode_active` reads
 `torch.utils._python_dispatch._is_in_torch_dispatch_mode`, and when that is
 false the call goes straight to the dense path.
@@ -416,7 +416,7 @@ markers.
 allowed to choose the result class. They are listed once, as features, because
 the surface they add and the defect they close are the same code.
 
-**Tests added**: 7, all in `rust/torch_c/pytests/test_structseq.py`, each
+**Tests added**: 7, all in `tests/test_structseq.py`, each
 comparing against upstream torch's own answer in a second subprocess. One of
 them (`test_no_dispatch_still_suppresses_subclass_dispatch`) compares the shim
 against itself instead, because upstream segfaults on the question — §2.3.
@@ -434,10 +434,10 @@ its own §4.2 asked for rather than a correction to it.
 **Measured and deliberately NOT written**: §4.3's list — no structseq, no
 operator changes, no `Meta` dispatch-key predicate, no vendored-tree edits.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs subclass_dispatch_target present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs dispatch_through_subclass present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs reshape_to_schema present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs subclass_dispatch_target present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs dispatch_through_subclass present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reshape_to_schema present -->
+<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
+<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
+<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
+<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->

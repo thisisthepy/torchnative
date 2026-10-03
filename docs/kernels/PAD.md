@@ -1,9 +1,9 @@
 # PAD — the op in front of the speech roadmap, from two directions
 
-Worktree `work/pad` on develop. Territory: `rust/torch_c/src/aten.rs`,
-`methods.json`, `overloads.json`, `tools/golden/cases.py`, and the new
-`rust/torch_c/pytests/test_pad.py`. `bootstrap.py`, `tensor.rs`, `dtype.rs`,
-`device.rs`, `capture.rs`, `tape.rs`, `tools/wheel/` and `torchnative/` were
+Worktree `work/pad` on develop. Territory: `crates/torch_c/src/aten.rs`,
+`methods.json`, `overloads.json`, `tests/golden/cases.py`, and the new
+`tests/test_pad.py`. `bootstrap.py`, `tensor.rs`, `dtype.rs`,
+`device.rs`, `capture.rs`, `tape.rs`, `scripts/wheel/` and `torchnative/` were
 not touched. Two files outside that list were edited and both are named with
 their reasons in §6.
 
@@ -30,7 +30,7 @@ Landed, split the way docs/architectures/VOICE.md §3 asks for rather than as on
 * **feature added** — 7 kernels: 6 padding
   (`reflection_pad{1,2,3}d`, `replication_pad{1,2,3}d`, one shared gather) and
   `rms_norm` (§8).
-* **tests added** — 23 in `pytests/test_pad.py`; 169 golden cases (9691 → 9860).
+* **tests added** — 23 in `tests/test_pad.py`; 169 golden cases (9691 → 9860).
 * **defect fixed** — none; nothing here existed to be broken.
 * **not done** — `circular` (§3), the `bootstrap.py` binding (§5), and the four
   other voice ops (§9).
@@ -224,7 +224,7 @@ identical for `return_complex=True`, `return_complex=False` **and**
 ```text
 NotImplementedError: not implemented in torch._C shim: torch.stft(...)
 -- overload resolution has no table entry for this op
-(rust/torch_c/src/overloads.json); call torch.ops.aten.stft.<overload>, which
+(crates/torch_c/src/overloads.json); call torch.ops.aten.stft.<overload>, which
 carries the overload and reaches the same dispatcher
 ```
 
@@ -254,7 +254,7 @@ has no kernel either.
 `torch._C._nn.pad` is a `bootstrap.py::_install_nn` composite (around line
 7437) that today refuses every non-constant mode by name. `bootstrap.py` was
 another agent's file this round, so the kernels are proven through
-`_C._aten_dispatch` and `tools/golden/compare.py` instead — the same hand-off
+`_C._aten_dispatch` and `tests/golden/compare.py` instead — the same hand-off
 docs/kernels/GLU.md §1.1 made, which worked.
 
 Replace the `if mode != "constant": raise ...` guard with:
@@ -281,9 +281,9 @@ letting the kernel judge reproduces that; deriving `n` from the rank would
 accept combinations upstream rejects.
 
 Whoever lands this should then **delete the six
-`aten.*_pad*d.default` entries from `tools/golden/reach_allow.json`** — they
+`aten.*_pad*d.default` entries from `tests/golden/reach_allow.json`** — they
 are written to fail the suite the moment the binding lands — and re-run
-`pytests/arch_sweep.py`, since `univnet` (docs/architectures/ARCH100.md lists `_nn.pad` as
+`tests/arch_sweep.py`, since `univnet` (docs/architectures/ARCH100.md lists `_nn.pad` as
 its wall) and docs/architectures/VOICE.md ranks 12 and 13 only clear at that point. **Until
 then, "four speech models clear `F.pad`" is not true end-to-end**; what is true
 is that the kernels they need exist and are golden-compared, and the remaining
@@ -291,7 +291,7 @@ step is binding surface, not numerics.
 
 ## 6. The two files edited outside the stated territory, and why
 
-* **`rust/torch_c/pytests/test_shim.py`** — one pinned count,
+* **`tests/test_shim.py`** — one pinned count,
   `tag_core_count`, 117 → 122. This is the one edit the round's rules allow
   there, and the arithmetic is what keeps it a check: **the delta is five, not
   six.** `replication_pad1d` is `['pt2_compliant_tag']` upstream while
@@ -299,7 +299,7 @@ step is binding surface, not numerics.
   up, served here by the *same function* — are both `core`. Each of the six was
   read off its own `.tags`; inferring from a sibling would have written 123,
   and the test would still have passed the day it was written.
-* **`tools/golden/reach_allow.json`** — six `shape2_kernel_without_spelling`
+* **`tests/golden/reach_allow.json`** — six `shape2_kernel_without_spelling`
   entries. `reach.py` fails the suite for a kernel with no Python spelling, and
   these have none: upstream has `torch._C._nn.reflection_pad1d` but **no**
   `torch.reflection_pad1d` and no `Tensor.reflection_pad1d` (checked for all

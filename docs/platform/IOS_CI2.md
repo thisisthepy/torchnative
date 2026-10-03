@@ -11,7 +11,7 @@ Before writing a single step, two claims from `docs/platform/TARGET_PYTHON.md` n
 verifying against the actual harness rather than taken on faith:
 
 - **Does `verify_ios_sim.py` key off `TARGET_PYTHON_IOS_SIM`, or a hardcoded
-  path?** Read from the source (`tools/wheel/verify_ios_sim.py:86-88`):
+  path?** Read from the source (`scripts/wheel/verify_ios_sim.py:86-88`):
 
       TARGET_PYTHON = Path(os.environ.get(
           "TARGET_PYTHON_IOS_SIM",
@@ -40,7 +40,7 @@ verifying against the actual harness rather than taken on faith:
 
 ## What the new job does
 
-`.github/workflows/verify-published-wheel.yml` gained one matrix leg,
+`.github/workflows/test-published-wheel.yml` gained one matrix leg,
 `ios-simulator-arm64` on `macos-15`, in the same job as the existing
 `linux-x86_64` / `windows-amd64` legs (same shape the reverted attempt used:
 one job, `if: matrix.label == '...'` / `!= '...'` guards per step, rather than
@@ -93,7 +93,7 @@ a separate job). Its steps, guarded to run only for that label:
    tag, matching the existing Linux/Windows legs' "install what a user gets"
    framing and reusing the exact invocation the reverted attempt already had.
 6. **Verify it computes in a simulator** — `python
-   tools/wheel/verify_ios_sim.py dist/torchnative-*-ios_*_iphonesimulator.whl`,
+   scripts/wheel/verify_ios_sim.py dist/torchnative-*-ios_*_iphonesimulator.whl`,
    unchanged from the harness that already runs on every release build here.
 
 The five existing Linux/Windows steps (`Install the published wheel` through
@@ -105,7 +105,7 @@ cleanly, and they skip the new steps cleanly by the mirror-image guard.
 
 **Executed, in this round:**
 
-- Read `tools/wheel/verify_ios_sim.py` end to end to confirm the
+- Read `scripts/wheel/verify_ios_sim.py` end to end to confirm the
   `TARGET_PYTHON_IOS_SIM` / hardcoded-default question above.
 - Fetched and read `iOS/README.rst` from `python/cpython` at the pinned
   commit over the network, to write the configure invocation from the actual
@@ -168,4 +168,4 @@ the runner's own `uname().version`, not an iPhone's. The README's platform
 table keeps separate simulator and device columns; this round does not touch
 the device column and nothing here should be read as closing it.
 
-<!-- DOCWATCH: symbol-in-file tools/wheel/verify_ios_sim.py TARGET_PYTHON_IOS_SIM present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/verify_ios_sim.py TARGET_PYTHON_IOS_SIM present -->

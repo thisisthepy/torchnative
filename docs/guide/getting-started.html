@@ -55,10 +55,10 @@ print(tok.decode(out[0], skip_special_tokens=True))</code></pre>
 
 <h2><span data-lang="en">Build from source</span><span data-lang="ko">소스에서 빌드</span></h2>
 <p data-lang="en">Needs a Rust toolchain and CPython 3.13+.</p><p data-lang="ko">Rust 툴체인과 CPython 3.13+ 가 필요합니다.</p>
-<pre><code>bash vendor/vendor_torch.sh     <span class="c"># assemble the vendored torch tree</span>
-bash vendor/install_shim.sh     <span class="c"># build the extension and install it</span>
-python tools/wheel/build.py                            <span class="c"># -> dist/*.whl</span>
-python tools/wheel/verify.py dist/torchnative-*.whl    <span class="c"># clean venv, real import</span></code></pre>
+<pre><code>bash scripts/vendor/vendor_torch.sh     <span class="c"># assemble the vendored torch tree</span>
+bash scripts/vendor/install_shim.sh     <span class="c"># build the extension and install it</span>
+python scripts/wheel/build.py                            <span class="c"># -> dist/*.whl</span>
+python scripts/wheel/verify.py dist/torchnative-*.whl    <span class="c"># clean venv, real import</span></code></pre>
 
 <div class="pager"><a href="index.html">← <span data-lang="en">Home</span><span data-lang="ko">홈</span></a><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span> →</a></div>
 </div></main>

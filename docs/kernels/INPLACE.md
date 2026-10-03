@@ -48,7 +48,7 @@ receiver's identity. That is what makes a view taken before the call see the wri
 what makes `t.sqrt_() is t` true (the wrapper is never rebound; `write_into` mutates candle's
 `Arc<RwLock<Storage>>` in place and the kernel returns the same `PyTensorBase`).
 
-Evidence, both properties in one probe (`PYTHONPATH=.../torchnative/src/main
+Evidence, both properties in one probe (`PYTHONPATH=.../python
 TORCH_USE_RTLD_GLOBAL=1`, real vendored `import torch` against this shim):
 
 ```
@@ -231,7 +231,7 @@ and §1/§2 are what check the first.
 
 ## 5. Golden and smoke coverage
 
-`tools/golden/cases.py`: one `CASE_BUILDERS` entry per new kernel (`cos__cases` ...
+`tests/golden/cases.py`: one `CASE_BUILDERS` entry per new kernel (`cos__cases` ...
 `clamp_min__cases`), covering float dtypes with domain-relevant probe values (signed grid for
 `cos_`/`sin_`/`erf_`/`tanh_`/`expm1_`/`sigmoid_`, positive grid for `sqrt_`/`rsqrt_`/`log_`/
 `log2_`/`reciprocal_`), the refusal rows from §2 above (`expect="both_error"`), an
@@ -241,7 +241,7 @@ return value -- shared machinery `exp__cases`/`neg__cases` already use), and a
 shape, `select.int` on a 2-D base). `detach_` has no builder -- it has no kernel, so it is not in
 `_aten_implemented()`, and the harness's coverage rule only requires a builder for what is.
 
-`rust/torch_c/pytests/test_shim.py::test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree`
+`tests/test_shim.py::test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree`
 (the §9 road script) used three of the 15 kernel-less names (`sqrt_`/`abs_`/`tanh_`) as its
 "still refused, by exact key" regression pin. Implementing 14 of the 15 turned that pin red by
 construction -- not a defect, the premise the pin was checking (no kernel) stopped being true.
@@ -259,7 +259,7 @@ not a generic string), and `native_group_norm` is checked to be reachable as a f
 FAIL test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree:
 AssertionError: sqrt__fn: got 'ERROR:NotImplementedError:not implemented in torch._C shim:
 torch.sqrt_(...) -- overload resolution has no table entry for this op
-(rust/torch_c/src/overloads.json); call torch.ops.aten.sqrt_.<overload>, which carries the
+(crates/torch_c/src/overloads.json); call torch.ops.aten.sqrt_.<overload>, which carries the
 overload and reaches the same dispatcher'
 ```
 
@@ -273,12 +273,12 @@ backup, rebuilt, reinstalled, reran: 343 ok again.
 ## 6. Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     343 ok, 0 FAIL
     DOCWATCH: PASS -- 257/257 evaluated marker(s) hold
     EXIT=0
 
-$PY tools/golden/compare.py
+$PY tests/golden/compare.py
     SUMMARY: 8003/8003 cases passed, 0 failed, ops covered=182, pending case builders=1
     (168 -> 182, +14 -- exactly the 14 kernels this round added; `detach_` has no kernel so it
     does not move this number, `native_group_norm`'s kernel already existed before this round)
@@ -304,12 +304,12 @@ number, following the pattern every earlier round in this file already uses):
 
 ## 7. Files touched, and what was deliberately not touched
 
-`rust/torch_c/src/aten.rs` (14 kernels + `IMPLEMENTED` entries + `detach_inplace_refusal` +
-dispatch wiring), `rust/torch_c/src/methods.json` / `overloads.json` (15 spellings + 1 function
-spelling for `native_group_norm`), `tools/golden/cases.py` (14 case builders + 14
-`_view_write_cases` entries), `rust/torch_c/pytests/test_shim.py` (two counters updated, one
+`crates/torch_c/src/aten.rs` (14 kernels + `IMPLEMENTED` entries + `detach_inplace_refusal` +
+dispatch wiring), `crates/torch_c/src/methods.json` / `overloads.json` (15 spellings + 1 function
+spelling for `native_group_norm`), `tests/golden/cases.py` (14 case builders + 14
+`_view_write_cases` entries), `tests/test_shim.py` (two counters updated, one
 road script/test extended).
 
 **Not touched**: `capture.rs` (§4 -- the name rule already covered the new ops),
 `clamp_dtype_refusals` in `aten.rs` (§2c names the bug it has; fixing it is `clamp_`'s file, not
-this round's), `torchnative/src/main/torch/` (upstream's tree, off limits).
+this round's), `python/torch/` (upstream's tree, off limits).

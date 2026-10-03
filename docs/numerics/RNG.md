@@ -17,7 +17,7 @@ Apple Silicon / darwin 25.5.0). 이 문서는 `docs/numerics/RNG.md` 외의 어�
 않았습니다.
 
 > **Correction (문서 감사, 2026-09):** §5 의 권고가 그대로 채택되어 포팅됐습니다. `git log
-> -S'"aten.uniform_.default"' -- rust/torch_c/src/aten.rs` 가 찾는 `2d3663f` ("Feat: Port
+> -S'"aten.uniform_.default"' -- crates/torch_c/src/aten.rs` 가 찾는 `2d3663f` ("Feat: Port
 > torch's CPU generator, and give `_C._dynamo` the two names that do work") 의 커밋 메시지가
 > 이 문서를 그대로 요약합니다 — "candle's CPU backend refuses seeding outright: MT19937 with the
 > pre-decrement that twists before the first draw, uniform_real at 24 and 53 bits, and the
@@ -154,7 +154,7 @@ RNG 커널은 `cpu_serial_kernel` / 뮤텍스 잠금이라 스레드 수와 무�
 ## 2. candle 의 RNG — 실체
 
 소스는 `/Users/ibrew/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/candle-core-0.11.0/`.
-torchnative 의 `rust/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
+torchnative 의 `crates/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
 (`Cargo.lock:866-868`, `:895-898`; candle 의 요구는 `Cargo.toml:231-234` 의 `rand 0.9.0` /
 `rand_distr 0.5.1`).
 
@@ -202,11 +202,11 @@ Box–Muller 와 Ziggurat 은 같은 분포를 내지만 **같은 수열을 내�
 샘플링이라 소비 개수조차 데이터 의존적이어서, 설령 두 엔진의 비트 스트림을 같게 맞춘다 해도
 정렬이 어긋납니다.
 
-`rust/torch_c/src/aten.rs:858-868` 의 `randint` 주석은 이 상황을 이미 정직하게 적어 두었습니다 —
+`crates/torch_c/src/aten.rs:858-868` 의 `randint` 주석은 이 상황을 이미 정직하게 적어 두었습니다 —
 "The generator is candle's, not torch's, so the *values* will not match a seeded torch run."
 다만 그 주석의 **"torch's Philox stream" 이라는 표현은 CPU 에 대해서는 틀립니다** — Philox 는 CUDA
 생성기(`CUDAGeneratorImpl`)이고 CPU 는 §1.1 의 MT19937 입니다. (이 문서는 그 파일을 고치지 않았습니다.
-다른 작업이 `rust/torch_c/` 를 동시에 쓰고 있으므로 지적만 남깁니다.)
+다른 작업이 `crates/torch_c/` 를 동시에 쓰고 있으므로 지적만 남깁니다.)
 
 ---
 
@@ -227,7 +227,7 @@ Box–Muller 와 Ziggurat 은 같은 분포를 내지만 **같은 수열을 내�
 
 **그리고 candle 의 `rand_uniform`/`rand_normal` 은 쓸 수 없습니다** — 시드를 못 받으므로(§2.1)
 우회가 아니라 배제입니다. 대신 값을 **직접 `Vec` 에 채워 `Tensor::from_vec` 으로 만드는** 길이
-있고, `rust/torch_c` 는 이미 그 패턴을 여러 곳에서 씁니다(`src/aten.rs:385, 390, 520, 538, 837`,
+있고, `crates/torch_c` 는 이미 그 패턴을 여러 곳에서 씁니다(`src/aten.rs:385, 390, 520, 538, 837`,
 `src/lib.rs:81, 228, 238, 248`). 즉 배선 비용은 새로 드는 것이 아닙니다.
 
 ### 3.2 비용은 작다 — 파이썬으로 먼저 해서 재봤다
@@ -296,7 +296,7 @@ aarch64 에서 컴파일되지 않으므로 다른 호스트에서의 동작은 
 수열을 낼 수도 있고 같을 수도 있으며, **둘 다 확인되지 않았습니다.**
 
 **의미**: aarch64 스칼라 경로는 비트 단위 동일을 기준으로 삼아도 됩니다. 그 외 경로는 근거가
-없으므로 float32 허용오차(~1e-6 상대)가 안전한 기본값입니다 — `tools/golden/compare.py:211` 의
+없으므로 float32 허용오차(~1e-6 상대)가 안전한 기본값입니다 — `tests/golden/compare.py:211` 의
 `dt.tolerance_for(t_dtype)` 경로가 이미 하는 일입니다. **측정되지 않은 플랫폼에 비트 일치를
 요구하지 마십시오** — 실패할지 아닐지를 아는 사람이 없습니다.
 
@@ -384,7 +384,7 @@ GENERATE {'do_sample': True, 'top_k': 5, 'temperature': 1.0}:
 `FROM_CONFIG.md` §2.1 의 14 개 목록에 **없습니다** — `from_config` 만 계측했기 때문입니다.
 (`docs/design/C_SURFACE.md` 가 `generate()` 를 추적했다면 겹칠 수 있으나 이 문서는 그 파일을 열지 않았습니다.)
 
-**(e) 현재 `aten.randint.low` 의 값 비교 승격.** `tools/golden/cases.py` 는 `_range_check` 로
+**(e) 현재 `aten.randint.low` 의 값 비교 승격.** `tests/golden/cases.py` 는 `_range_check` 로
 dtype·shape·범위만 보고 수열은 안 봅니다. 그 파일의 모듈 주석이 적은 판단 — "seed 는 한 생성기의
 스트림을 고정할 뿐, 다른 알고리즘이 같은 값을 내게 만들지 못한다" — 은 **candle 을 쓰는 한
 정확하고**, 포팅하면 그 제약이 사라집니다. 다만 torch 의 `randint` 가 균일 정수를 뽑는 정확한
@@ -461,7 +461,7 @@ dtype·shape·범위만 보고 수열은 안 봅니다. 그 파일의 모듈 주
 `DESIGN.md` §5 가 걱정한 "수치 불일치가 조용히 번짐" 은 **랜덤 초기화 모델로는 관측할 수 없습니다.**
 `from_pretrained` 는 고정된 가중치를 읽으므로(§4.1(d)) 양쪽이 **같은 입력·같은 가중치**에서
 출발하고, 그때 비로소 순전파 출력을 값으로 대조할 수 있습니다. 즉 op 단위 골든은 지금처럼
-`tools/golden/` 이 맡고, **모델 단위 골든은 체크포인트 적재 이후로 미루는 것이 옳습니다.**
+`tests/golden/` 이 맡고, **모델 단위 골든은 체크포인트 적재 이후로 미루는 것이 옳습니다.**
 RNG 포팅은 그 대조를 가능하게 하려고 하는 것이 아니라, `from_config` 를 통과시키고 시드 재현성을
 주장할 수 있게 하려고 하는 것입니다 — **두 목적을 섞지 마십시오.**
 

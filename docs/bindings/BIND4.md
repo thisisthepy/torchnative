@@ -1,8 +1,8 @@
 # BIND4 — four small `bootstrap.py` items, plus one handed off mid-round
 
 Worktree `work/bind4` on develop `26ef12c`, vendored tree assembled fresh. torch 2.13.0
-upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `rust/torch_c/src/
-bootstrap.py`, `tools/golden/reach_allow.json`, and a new `rust/torch_c/pytests/
+upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `crates/torch_c/src/
+bootstrap.py`, `tests/golden/reach_allow.json`, and a new `tests/
 test_bind4.py`. `aten.rs`, `tensor.rs`, `dtype.rs`, `device.rs`, `capture.rs`, `tape.rs` were
 not touched. `test_rnn.py` and `test_tail2.py` were each touched once, at the exact spot their
 own docstrings said to invert when the fix landed (§1, §5) — `test_shim.py` was not touched at
@@ -59,7 +59,7 @@ still matches unchanged.
 
 `arch_sweep.py --one lasr_ctc` / `--one lasr_encoder`: both **ok**.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bind4.py test_conv1d_same_odd_total_now_computes present -->
+<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_conv1d_same_odd_total_now_computes present -->
 
 ---
 
@@ -87,7 +87,7 @@ A sequence fourth argument is `.vec`'s `scale_factors`; a float is the leaf's `s
 following `upsample_bilinear2d`'s shape (mutual-exclusion refusal, scale forwarded rather than
 only used to size the output).
 
-`tools/golden/reach_allow.json`'s `aten.upsample_linear1d.default` entry is deleted — its own
+`tests/golden/reach_allow.json`'s `aten.upsample_linear1d.default` entry is deleted — its own
 text said "fails the suite the moment the entry lands", and it did (`REACH` failure), confirming
 the entry described a real, now-closed gap and not a stale one.
 
@@ -100,7 +100,7 @@ at the kernel rather than being papered over by the new binding.
 
 `arch_sweep.py --one sam_vision_model` / `--one sam_hq_vision_model`: both **ok**.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bind4.py test_f_interpolate_linear_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_f_interpolate_linear_agrees_with_upstream present -->
 
 ---
 
@@ -189,7 +189,7 @@ kernels in `aten.rs`, not `bootstrap.py`. `fastspeech2_conformer` is therefore *
 past this point from this file** — recorded rather than left unattributed, per docs/kernels/TAIL4.md
 §8.2's own prediction that this was "the next wall" and not the last one.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bind4.py test_zeros_tensor_in_size_tuple_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_zeros_tensor_in_size_tuple_agrees present -->
 
 ---
 
@@ -290,12 +290,12 @@ someone lands that name"). The new assertion checks the narrower thing this tree
 refusal is no longer the catch-all (`"fft_fftn" not in msg`), and is specifically the `_to_copy`
 complex64 gate (`"_to_copy" in msg and "complex64" in msg`) — not merely "still raises something".
 
-`tools/golden/reach_allow.json`'s `aten._fft_c2c.default` entry is deleted: its own text said
+`tests/golden/reach_allow.json`'s `aten._fft_c2c.default` entry is deleted: its own text said
 "delete this entry if a caller for the bare spelling is found", and `fft_fftn` is now that
 caller — confirmed by `reach.py`'s static scan failing exactly there before the entry was
 removed (`"a spelling now reaches it (or its kernel is gone)"`).
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_tensor_complex_parts present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_tensor_complex_parts present -->
 
 ---
 
@@ -303,8 +303,8 @@ removed (`"a spelling now reaches it (or its kernel is gone)"`).
 
 ```text
 cargo build --release                                          EXIT=0
-PYTHON=$PY sh rust/torch_c/pytests/run.sh                       833 ok, 0 FAIL, DOCWATCH 742/742, EXIT=0
-tools/golden/compare.py                                         11307/11307, ops=298, 0 failed -- exactly unmoved
+PYTHON=$PY sh tests/run.sh                       833 ok, 0 FAIL, DOCWATCH 742/742, EXIT=0
+tests/golden/compare.py                                         11307/11307, ops=298, 0 failed -- exactly unmoved
 arch_sweep --one lasr_ctc / lasr_encoder / sam_vision_model      ok / ok / ok
 arch_sweep --one fastspeech2_conformer                            moved wall (torch.zeros -> repeat_interleave)
 arch_sweep --one nystromformer / univnet                          unchanged (both aten.rs, not actionable here)

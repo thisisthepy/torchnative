@@ -21,7 +21,7 @@ Read these first, because they decide how the rest should be taken:
   arm answered a contiguous stride where upstream's is not.
 * **Every layout claim below is compared with upstream torch in a separate
   process**, exactly (strides are integers; there is no tolerance). The
-  comparison is `pytests/test_metastride.py`: 1,333 cases across 13 tests.
+  comparison is `tests/test_metastride.py`: 1,333 cases across 13 tests.
 
 ---
 
@@ -78,7 +78,7 @@ Meta { shape, stride, storage_offset, storage_nbytes: Arc<AtomicUsize>, storage_
   constructor behind every fake tensor. The dense half still refuses a
   non-contiguous stride by name — candle cannot hold one.
 
-The arithmetic is in `rust/torch_c/src/layout.rs`, one function per upstream
+The arithmetic is in `crates/torch_c/src/layout.rs`, one function per upstream
 rule, each naming the rule it ports: `computeStride` (`view`),
 `inferExpandGeometry`, `inferUnsqueezeGeometry`, `computeStorageNbytes`,
 `compute_elementwise_output_logical_to_physical_perm`,
@@ -359,7 +359,7 @@ view losing its storage identity (N6).
 8. Dense `is_contiguous()` was `False` for an empty permuted tensor.
 9. Three meta arms returned unpromoted `TensorBase` objects in tuples.
 
-**Tests added**: 13 in `rust/torch_c/pytests/test_metastride.py` (1,333
+**Tests added**: 13 in `tests/test_metastride.py` (1,333
 cases compared with upstream) and 6 Rust unit tests in `layout.rs`.
 
 **Tests rewritten**: 3 —
@@ -406,23 +406,23 @@ Three runs are not counted, and why:
   evidence either way;
 * the nullification campaign's 31 builds (§7), which are red by design.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs storage_nbytes present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs meta_view present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs meta_stride_rule present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs relay_elementwise present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/layout.rs elementwise_stride present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/layout.rs view_stride present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/layout.rs collapse_view present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/layout.rs strides_like_channels_last present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs meta_len_cell present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_as_strided_on_meta_answers_upstreams_layout_and_refusals present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_view_kernels_on_meta_carry_the_real_stride_offset_and_storage present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_layout_following_meta_kernels_answer_upstreams_output_stride present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_always_contiguous_meta_kernels_are_contiguous_on_every_input_layout present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_gated_meta_kernels_agree_with_upstream_on_contiguous_inputs present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_a_stride_unaware_meta_kernel_refuses_a_non_contiguous_input present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metastride.py test_a_module_whose_trace_needs_real_meta_strides_exports_replays_and_agrees present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_a_meta_tensor_reports_the_stride_it_stores_not_one_derived_from_its_shape present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable absent -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export5.py test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs storage_nbytes present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs meta_view present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs meta_stride_rule present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs relay_elementwise present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs elementwise_stride present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs view_stride present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs collapse_view present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs strides_like_channels_last present -->
+<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs meta_len_cell present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_as_strided_on_meta_answers_upstreams_layout_and_refusals present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_view_kernels_on_meta_carry_the_real_stride_offset_and_storage present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_layout_following_meta_kernels_answer_upstreams_output_stride present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_always_contiguous_meta_kernels_are_contiguous_on_every_input_layout present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_gated_meta_kernels_agree_with_upstream_on_contiguous_inputs present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_a_stride_unaware_meta_kernel_refuses_a_non_contiguous_input present -->
+<!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_a_module_whose_trace_needs_real_meta_strides_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export4.py test_a_meta_tensor_reports_the_stride_it_stores_not_one_derived_from_its_shape present -->
+<!-- DOCWATCH: symbol-in-file tests/test_export4.py test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable absent -->
+<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it present -->
 <!-- DOCWATCH: op-implemented aten.as_strided.default -->

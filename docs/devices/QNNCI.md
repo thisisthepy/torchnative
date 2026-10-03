@@ -1,20 +1,20 @@
 # QNNCI — closing docs/devices/QNN.md's host gap with a hosted Linux x86-64 runner
 
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py verify_facts present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py collect_facts present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py render_summary present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py MIN_DELEGATED_FRACTION present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py DEFAULT_SOC_MODEL present -->
-<!-- DOCWATCH: symbol-in-file tools/ci/qnn_lower.py integrity_ok present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml EXPECTED_QNN_SDK_VERSION present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "ubuntu-24.04" present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "steps.lower.outputs.integrity_ok" present -->
-<!-- DOCWATCH: symbol-in-file .github/workflows/qnn-lower.yml "upload-artifact@v4" present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_the_verification_runs_before_every_upload present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py verify_facts present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py collect_facts present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py render_summary present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py MIN_DELEGATED_FRACTION present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py DEFAULT_SOC_MODEL present -->
+<!-- DOCWATCH: symbol-in-file .github/scripts/qnn_lower.py integrity_ok present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml EXPECTED_QNN_SDK_VERSION present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "ubuntu-24.04" present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "steps.lower.outputs.integrity_ok" present -->
+<!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "upload-artifact@v4" present -->
+<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
+<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
+<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_the_verification_runs_before_every_upload present -->
+<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
+<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
 
 ## 0. At a glance
 
@@ -25,8 +25,8 @@
 | Has this job ever run? | **No. It has never run.** Every sentence below is about what it is written to do, not about what it did |
 | Does it prove anything about the HTP? | **No.** §1 below, and `docs/devices/QNN.md` §6.4 stays true |
 | Runner | `ubuntu-24.04`, pinned. §3 is the decision and its reason |
-| Where the logic lives | `tools/ci/qnn_lower.py`, not inline YAML. §5 |
-| Tests | **30** in `rust/torch_c/pytests/test_qnnci.py`, none of which need executorch |
+| Where the logic lives | `.github/scripts/qnn_lower.py`, not inline YAML. §5 |
+| Tests | **30** in `tests/test_qnnci.py`, none of which need executorch |
 | Nullifications attempted / uncaught | **14 / 0**, and one of them found a real hole in this document's own test file first (§5.2) |
 
 ---
@@ -213,12 +213,12 @@ artefact gate, so a red run still hands back the measurement.
 
 ## 5. What was extracted, and what is tested on this machine
 
-### 5.1 `tools/ci/qnn_lower.py`
+### 5.1 `.github/scripts/qnn_lower.py`
 
 `AGENTS.md` §17.5 is the most-cited rule in this repository, and logic living
 only inside a `run: |` block is its purest form: it cannot be imported, cannot
 be nullified, and cannot be exercised anywhere except by pushing to a branch
-and watching. `tools/ci/verify_published.py` is this repository's existing
+and watching. `.github/scripts/verify_published.py` is this repository's existing
 answer and this file follows it.
 
 Everything the job *decides* is in that file:
@@ -243,7 +243,7 @@ NDK, and an NDK or CMake breakage there must not turn a successful verified
 lowering into a run somebody reads as failed. It is still reported red on its
 own line.
 
-### 5.2 `rust/torch_c/pytests/test_qnnci.py` — a new file, and why not `test_qnn.py`
+### 5.2 `tests/test_qnnci.py` — a new file, and why not `test_qnn.py`
 
 **A new file.** `test_qnn.py`'s three fixtures all skip by name when their
 environment is absent — `_qnn_et_fixture` skips unless
