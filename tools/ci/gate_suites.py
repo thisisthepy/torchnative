@@ -174,6 +174,7 @@ SUITES = {
     "test_skipvis.py": BOTH,
     "test_split_probe.py": BOTH,
     "test_stage0.py": BOTH,
+    "test_stagetype.py": BOTH,
     "test_strided.py": BOTH,
     "test_structseq.py": BOTH,
     "test_tail1.py": BOTH,
