@@ -267,9 +267,9 @@ one stays.
     bash scripts/vendor/install_shim.sh
     PYTHON=$PY sh tests/run.sh
     PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
-        $PY tests/nnapi_sizing.py
+        $PY tests/_support/nnapi_sizing.py
 
-The nine tests this document is about are in `tests/test_shim.py`
+The nine tests this document is about are in `tests/_support/test_shim.py`
 and share one subprocess fixture (`_REFOLD_SCRIPT`):
 
     test_the_refold_goes_prims_to_aten_because_the_other_direction_is_partial

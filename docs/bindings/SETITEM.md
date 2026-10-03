@@ -194,7 +194,7 @@ rather than one because **a lowering that handled a 1-D stepped write and not a 
 later axis would close the first and leave the 13 exactly where they are** — which is the failure
 the two new cases exist to catch.
 
-`tests/test_setitem.py` does not need editing. Every one of its stepped-write tests
+`tests/bindings/test_setitem.py` does not need editing. Every one of its stepped-write tests
 is written two-sided: upstream's exact values if the write happens, a refusal that names itself and
 mutates nothing if it does not. §6 says why that shape and not a pinned refusal.
 
@@ -255,7 +255,7 @@ backend limitation immediately; more, because closing it made `view_as` visible,
 ## 4. Semantics, measured rather than reasoned
 
 Each row was run on upstream in its own process, then on the patched shim, and compared element for
-element. They are the tests in `tests/test_setitem.py`.
+element. They are the tests in `tests/bindings/test_setitem.py`.
 
 | question | upstream 2.13.0 | patched shim |
 |---|---|---|
@@ -352,7 +352,7 @@ however it is reached — and the reason the lowering is possible would have qui
 
 ## 6. Why the tests are shaped the way they are
 
-`tests/test_setitem.py` had to be written in a tree where the fix could not land, which is a
+`tests/bindings/test_setitem.py` had to be written in a tree where the fix could not land, which is a
 constraint worth naming because it produced a better test than the unconstrained version would have.
 
 A test that pinned the refusal would have to be **deleted** when the patch lands. A test that pinned

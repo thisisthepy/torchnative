@@ -75,7 +75,7 @@ so explicitly where one does not.
 | **BREAKS** | anything else — a panic, a hard crash, or a cell this harness could not build. A BREAKS is as much a statement about the harness as about the shim. |
 | **n/a** | not a verdict. The operator takes neither a tensor nor a `device=`, so it has no `mps` cell at all. |
 
-`tests/dtype_device_matrix.py` is the sweep that produces the
+`tests/_support/dtype_device_matrix.py` is the sweep that produces the
 table below, and it is a script rather than a test for the same reason
 `agree_sweep.py` is: it makes numbers a document quotes, so the document can be
 re-measured instead of re-asserted.
@@ -156,7 +156,7 @@ records, and it is what the declined change below would have created.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs metal_dtype_gate present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs storage_for present -->
-<!-- DOCWATCH: symbol-in-file tests/test_dtmdev.py test_float64_refuses_by_name_on_every_road_onto_metal present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/test_dtmdev.py test_float64_refuses_by_name_on_every_road_onto_metal present -->
 
 ### 3.2 `_tensor_from_flat` builds on the host and moves last
 
@@ -173,7 +173,7 @@ bytes. Ten dtypes land carrying upstream's values; `float64` still refuses by
 name and `int8` refuses naming `I8` (this repository's candle fork is CPU-only,
 docs/numerics/INT8.md §1.2).
 
-<!-- DOCWATCH: symbol-in-file tests/test_dtmdev.py test_tensor_from_flat_lands_upstreams_values_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/test_dtmdev.py test_tensor_from_flat_lands_upstreams_values_on_the_device present -->
 
 ### 3.3 `tolist` reads on the host
 
@@ -192,8 +192,8 @@ that gate was removed. The two functions stay separate, and
 not by a source scan, which docs/devices/MPSATTN.md §3.1 records how to defeat —
 if a kernel is ever routed through the new path.
 
-<!-- DOCWATCH: symbol-in-file tests/test_dtmdev.py test_tolist_on_a_device_tensor_is_upstreams_values present -->
-<!-- DOCWATCH: symbol-in-file tests/test_dtmdev.py test_fixing_tolist_did_not_open_the_host_readback_hole present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/test_dtmdev.py test_tolist_on_a_device_tensor_is_upstreams_values present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/test_dtmdev.py test_fixing_tolist_did_not_open_the_host_readback_hole present -->
 
 ### 3.4 Declined: a `float64` guard in `visit_for_device`
 
@@ -269,8 +269,8 @@ marker, and the per-op derivation matches kernels against them **by qualified
 path** (`crate::tensor::to_le_bytes(`), not by bare name — `to_le_bytes` is also
 an inherent method on every Rust integer, and a bare-name match would have
 marked a dozen clean kernels.
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _cross_file_readback_helpers present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _reaches_cross_file_readback present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _cross_file_readback_helpers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _reaches_cross_file_readback present -->
 
 #### Why a refusal and not a device kernel
 
@@ -293,8 +293,8 @@ twenty-third, and it was open.**
 
 There is still **no Metal dispatch counter** in this build (§7.5), so the `mps`
 row above is the ceiling this document keeps naming, not a counter reading.
-<!-- DOCWATCH: symbol-in-file tests/test_viewdtype.py test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host present -->
-<!-- DOCWATCH: symbol-in-file tests/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_view_dtype_refuses_on_mps_rather_than_answering_from_the_host present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
 <!-- DOCWATCH: op-implemented aten.view.dtype -->
 
 ### 4.2 Four cells whose values disagree with upstream
@@ -513,16 +513,16 @@ AGENTS.md §13.1 records as impossible on Metal has now been run on Metal.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reject_bool_gemm present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reject_device_int_gemm present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs exact_int_gemm_dtype present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_every_float_factory_in_cause_d_answers_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_constant_is_rounded_once_and_not_twice present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_no_float_constant_is_still_materialised_on_the_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_cpu_answers_are_unchanged present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_upstream_integer_matmul_wraps_in_the_storage_width present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_integer_matmul_agrees_with_upstream_including_at_overflow present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_the_overflow_cases_really_do_overflow present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_bool_matmul_refuses_in_upstreams_own_words present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_the_mps_integer_refusal_names_the_op_the_dtype_and_the_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_gemmint.py test_the_mps_integer_refusal_is_not_served_by_a_readback present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_every_float_factory_in_cause_d_answers_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_constant_is_rounded_once_and_not_twice present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_no_float_constant_is_still_materialised_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_cpu_answers_are_unchanged present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_upstream_integer_matmul_wraps_in_the_storage_width present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_integer_matmul_agrees_with_upstream_including_at_overflow present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_the_overflow_cases_really_do_overflow present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_bool_matmul_refuses_in_upstreams_own_words present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_the_mps_integer_refusal_names_the_op_the_dtype_and_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_gemmint.py test_the_mps_integer_refusal_is_not_served_by_a_readback present -->
 
 ### 4.3c §4.3b re-run rather than re-read — the work landed, three of its numbers did not
 
@@ -835,9 +835,9 @@ behind it. **Not done here** — it is new operator work, not verification, and
 it is proposed rather than taken.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs amax_keepdim_anywhere present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
-<!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
 <!-- DOCWATCH: op-implemented aten.amax.default -- the operator the mps NaN defect above is pinned on -->
 <!-- DOCWATCH: op-not-implemented aten.amin.default -- asserted by the NaN table rather than assumed -->
 
@@ -859,7 +859,7 @@ matrix names.
   defect that needs broadcasting, a non-contiguous input or an empty tensor is
   invisible here.
 * **The oracle is asked on the `cpu`** even for `mps` cells, following
-  `tests/test_dtypedev.py`: the question is whether the shim's
+  `tests/devices/test_dtypedev.py`: the question is whether the shim's
   number is upstream's number, not whether upstream would produce it on that
   device.
 * **Casting every tensor operand to the cell's dtype casts index operands too**,
@@ -874,14 +874,14 @@ matrix names.
   the document for the dtype axis, and its frozen `mps` column in
   `test_dtypedev.py` is what actually holds those cells down in the gate.
 
-<!-- DOCWATCH: symbol-in-file tests/dtype_device_matrix.py result_dtype_name present -->
-<!-- DOCWATCH: symbol-in-file tests/dtype_device_matrix.py tally present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/dtype_device_matrix.py result_dtype_name present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/dtype_device_matrix.py tally present -->
 
 ---
 
 ## 6. The table
 
-**Re-measured 2026-09-20** by `tests/dtype_device_matrix.py
+**Re-measured 2026-09-20** by `tests/_support/dtype_device_matrix.py
 --drive` against the artefact built from this tree — 308 operators, 4928 cells.
 The 2026-09-19 table it replaces is compared against cell by cell in §7.7; the
 2026-09-16 one before that, in §7.1.
@@ -889,7 +889,7 @@ Reproduce with:
 
 ```sh
 PYTHONPATH=<stage>:tests python3 \
-    tests/dtype_device_matrix.py --drive \
+    tests/_support/dtype_device_matrix.py --drive \
     --json /tmp/matrix.json --markdown /tmp/matrix.md
 ```
 
@@ -1390,10 +1390,10 @@ identity returns. A test that no mutant can redden is worthless, and that one
 needed a fourth mutant to show it is not.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs integral_abs_on_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_agrees_with_upstream_on_both_devices present -->
-<!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_wraps_at_the_signed_minimum_exactly_as_upstream_does present -->
-<!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_on_mps_does_not_come_back_through_the_readback_gate present -->
-<!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_inplace_agrees_with_upstream_on_cpu_and_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_absmps.py test_abs_agrees_with_upstream_on_both_devices present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_absmps.py test_abs_wraps_at_the_signed_minimum_exactly_as_upstream_does present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_absmps.py test_abs_on_mps_does_not_come_back_through_the_readback_gate present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_absmps.py test_abs_inplace_agrees_with_upstream_on_cpu_and_on_mps present -->
 <!-- DOCWATCH: op-implemented aten.abs.default -->
 
 
@@ -1595,15 +1595,15 @@ rebinding the wrapper, which is the obvious wrong way to do this.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs write_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs clamp_values absent -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs clamp_values present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_in_place_ops_agree_with_upstream_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_a_view_taken_before_the_write_sees_it_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_writing_into_an_offset_slice_on_mps_touches_only_that_slice present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_a_self_overlapping_copy_on_mps_is_not_half_overwritten present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_in_place_ops_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_view_taken_before_the_write_sees_it_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_writing_into_an_offset_slice_on_mps_touches_only_that_slice present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_self_overlapping_copy_on_mps_is_not_half_overwritten present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_a_strided_receiver_on_mps_refuses_and_names_its_layout present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_the_device_write_door_performs_no_host_readback present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_clamp_propagates_nan_on_mps_exactly_as_upstream_does present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsinplace.py test_fill_on_mps_is_refused_by_name_for_the_integer_dtypes present -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.copy_.default -->
@@ -1668,10 +1668,10 @@ now exists; the work of pointing it at each cell does not.
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalcount.py test_abs_on_mps_opens_a_metal_kernel_and_reads_nothing_back present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalcount.py test_a_cpu_op_moves_no_metal_counter present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalcount.py test_a_readback_costs_exactly_the_tensors_bytes present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalcount.py test_metal_counters_answers_with_all_six_names present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_abs_on_mps_opens_a_metal_kernel_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_a_cpu_op_moves_no_metal_counter present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_a_readback_costs_exactly_the_tensors_bytes present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_metal_counters_answers_with_all_six_names present -->
 <!-- DOCWATCH: op-implemented aten.abs.default -->
 
 ### 7.12 The experiment that could not be run on Metal, run
@@ -1715,7 +1715,7 @@ it discovered.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs integral_abs_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs twin_abs_i64 absent -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_every_host_readback_in_aten_is_classified present -->
 
 ### 7.13 `DType::I8` on Metal — declined, with the reason measured
 
@@ -1919,11 +1919,11 @@ it. Every other test in the file dies to at least one: softmax and the in-place
 family to M-A (and softmax also to M-C), the §7.14 pin and the 43-operator
 sweep to M-B.
 
-<!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_softmax_on_mps_opens_metal_kernels_and_reads_nothing_back present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_the_in_place_family_on_mps_computes_on_the_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_softmax_on_mps_opens_metal_kernels_and_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_the_in_place_family_on_mps_computes_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs softmax_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs twin_softmax absent -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
@@ -2161,15 +2161,15 @@ shape is `[2, 3]`.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_NOTES present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs host_readback_note present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _ops_that_reach_the_host present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _host_reaching_functions present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _callees present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_the_ten_newly_refused_ops_are_refused_and_the_message_says_what_works present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_no_newly_refused_op_answers_any_mps_dtype present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_the_derivation_finds_the_ten_without_being_told_their_names present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_a_readback_behind_two_un_named_hops_is_still_derived present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _ops_that_reach_the_host present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _host_reaching_functions present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _callees present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_the_ten_newly_refused_ops_are_refused_and_the_message_says_what_works present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_no_newly_refused_op_answers_any_mps_dtype present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_every_dtype_a_refusal_note_advertises_agrees_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_the_derivation_finds_the_ten_without_being_told_their_names present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_a_readback_behind_two_un_named_hops_is_still_derived present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsrefuse.py test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs norm_pow_walk present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs order_along present -->
 <!-- DOCWATCH: op-implemented aten.sort.default -->
@@ -2314,15 +2314,15 @@ M-2 and M-5.
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/ternary.metal where_u8_i8 present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs cast_i8_f32 present -->
-<!-- DOCWATCH: symbol-in-file tests/test_i8mps.py test_int8_builds_on_mps_and_makes_the_round_trip present -->
-<!-- DOCWATCH: symbol-in-file tests/test_i8mps.py test_int8_binary_operators_agree_with_upstream_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_i8mps.py test_int8_casts_agree_with_upstream_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_i8mps.py test_int8_where_agrees_with_upstream_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_i8mps.py test_the_inputs_actually_wrap present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_builds_on_mps_and_makes_the_round_trip present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_binary_operators_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_casts_agree_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_where_agrees_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_the_inputs_actually_wrap present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_committed_metal_kernels_fork_is_the_pinned_crate_plus_the_patch present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_metal_kernels_check_refuses_a_tree_that_drifted_from_the_patch present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_metal_kernels_script_refuses_a_crate_that_is_not_the_pinned_one present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_lock_resolves_metal_kernels_from_the_fork_not_the_registry present -->
 
 ---
 
@@ -2418,10 +2418,10 @@ They are listed as unexercised now, with the measured refusal as the reason.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs host_vec present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64_host present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs host_const_tests present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_constant_gate_agrees_with_upstream_on_mps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_constant_gate_operators_compute_on_the_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_rng_writers_narrow_on_the_host_and_draw_the_same_stream present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_float64_on_mps_is_still_refused_in_upstreams_words present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_sites_this_round_converted_are_accounted_for present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_a_zero_dim_device_tensor_can_stand_in_for_a_scalar present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_integer_arm_narrows_on_the_host_too present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_constant_gate_agrees_with_upstream_on_mps present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_constant_gate_operators_compute_on_the_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_rng_writers_narrow_on_the_host_and_draw_the_same_stream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_float64_on_mps_is_still_refused_in_upstreams_words present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_sites_this_round_converted_are_accounted_for present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_a_zero_dim_device_tensor_can_stand_in_for_a_scalar present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsconst.py test_the_integer_arm_narrows_on_the_host_too present -->

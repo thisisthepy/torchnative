@@ -211,7 +211,7 @@ Fix:
     `remainder.Scalar`'s own documented gap, and the shim's refusal there is
     this shim's, not upstream's -- so the golden case expects `c_error`, not
     `both_error`.
-  - `tests/test_shim.py`: two pinned counts moved because
+  - `tests/_support/test_shim.py`: two pinned counts moved because
     `fmod.Tensor`/`fmod.Scalar` are newly-reachable, newly-tagged-`core`
     kernels:
       - `test_core_ops_and_op_tags_agree`'s `tag_core_count`: `108 -> 110`

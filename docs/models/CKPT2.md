@@ -307,7 +307,7 @@ meta 커널은 조밀 커널의 규칙을 **같은 헬퍼로 같은 순서로** 
 **"empty" 는 여기서도 0 을 답합니다.** 그것이 안전한 이유를 가정하지 않고 적어 둡니다:
 이 커널이 만드는 값은 전부 읽히기 전에 덮어씌워집니다 — 누락 키는
 `_initialize_missing_keys` 가, 비영속 버퍼는 모듈 자신의 초기화가. 만약 하나라도 그렇지
-않다면 그 0 이 순전파에 도달하고, `tests/test_shim.py` 의 로짓 비교가 말합니다.
+않다면 그 0 이 순전파에 도달하고, `tests/_support/test_shim.py` 의 로짓 비교가 말합니다.
 실측 로짓 차이가 2.235e-08 이라는 것이 지금은 그렇지 않다는 증거입니다.
 
 ---
@@ -436,7 +436,7 @@ SmolLM2-135M 은 `num_attention_heads=9`, `num_key_value_heads=3` 의 **그룹 �
 ```
 PYTHON=$PY sh tests/run.sh     exit 0   155 통과 (전 149, +6)
 $PY tests/golden/compare.py                   exit 0   2496/2496, ops=117 (전 2486/116)
-$PY tests/verify_schemas.py    exit 0   272/272 (전 270)
+$PY tests/_support/verify_schemas.py    exit 0   272/272 (전 270)
 ```
 
 **보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
@@ -471,7 +471,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 155
 $PY tests/golden/compare.py                        # 2496/2496 ops=117
-$PY tests/verify_schemas.py         # 272/272
+$PY tests/_support/verify_schemas.py         # 272/272
 ```
 
 §7 의 진짜 모델은 회귀 스위트에 **넣지 않았습니다** — 269 MB 를 받아야 하고 네트워크가

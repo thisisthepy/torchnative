@@ -23,7 +23,7 @@ bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 PYTHON=$PY sh tests/run.sh          -> EXIT=0, 268 "ok " lines, SELF-TEST PASS
 $PY tests/golden/compare.py                        -> EXIT=0, SUMMARY: 5634/5634 cases passed, 0 failed, ops covered=148, pending case builders=1
-$PY tests/verify_schemas.py         -> EXIT=0, SUMMARY: 4392/4392 table entries matched upstream, 0 failed
+$PY tests/_support/verify_schemas.py         -> EXIT=0, SUMMARY: 4392/4392 table entries matched upstream, 0 failed
 ```
 
 torch version seen by verify_schemas.py: `torch 2.13.0`.
@@ -325,7 +325,7 @@ still accurate (re-ran `run.sh`, 268 ok, matches this session's baseline).
 - **Claim (test existence, §9.5's correction block):** `test_decompose_lowers_baddbmm_default_
   now_that_the_dtype_is_a_singleton` replaced the old assertion. **Status: confirmed true** —
   `grep` finds both the old test name still present (as a different function, presumably renamed
-  scope) and the new one defined at `tests/test_shim.py:7625`.
+  scope) and the new one defined at `tests/_support/test_shim.py:7625`.
 - Gate-count tables in §4, §8.3, §8.4's prefill table, §9.4/§9.6/§9.7's profile counts: round-scoped
   snapshots consistent with house style, not re-verified individually given time budget — no
   contradiction found while checking the items above.
@@ -498,7 +498,7 @@ stale silently as unrelated kernel work lands.
 
 - **Claim (§0 and §4, headline):** of 37 non-Core-ATen, capture-reachable implemented ops, 9 lower
   to Core ATen via upstream's decomposition rules. **Status: FALSE today — stale by natural
-  kernel-count growth, not a bug.** **How checked:** re-ran `tests/decomp_sweep.py`
+  kernel-count growth, not a bug.** **How checked:** re-ran `tests/_support/decomp_sweep.py`
   against the current build (the script itself is unchanged since this document's single commit,
   confirmed via `git log`). Current output: `_aten_all_implemented() = 157` (not 129), `non-core =
   67` (not 52), capture-rejects `22` (not 15), **population 45** (not 37), **LOWERED 11** (not 9) —
@@ -1562,7 +1562,7 @@ same commands as rounds 1-2):
 ```
 PYTHON=$PY sh tests/run.sh          -> EXIT=0, 317 "ok " lines, DOCWATCH: PASS -- 190/190
 $PY tests/golden/compare.py                        -> EXIT=0, SUMMARY: 7685/7685 cases passed, 0 failed, ops covered=168, pending case builders=1
-$PY tests/verify_schemas.py         -> EXIT=0, SUMMARY: 4479/4479 table entries matched upstream, 0 failed
+$PY tests/_support/verify_schemas.py         -> EXIT=0, SUMMARY: 4479/4479 table entries matched upstream, 0 failed
 ```
 
 Implemented-ops snapshot captured in `/tmp/doclast_implemented_ops.txt` (168 ops). All 190

@@ -54,7 +54,7 @@ Which names that is was read out of `torchnative/rust/torch_c/src/aten.rs` mecha
 mapping, then each function's `optional`/`required`/`tensor_arg`/
 `{dim,bool,int,float,scalar,dtype}_arg`/`device_arg_or_label` call sites for
 `(index, name)`), not guessed from the schema tables — the schema tables
-(`tests/verify_schemas.py`'s 4203 entries) say what upstream
+(`tests/_support/verify_schemas.py`'s 4203 entries) say what upstream
 accepts, but what matters for this specific gap is what **this shim's
 `optional()` helper is actually asked to look up**, which can be a subset
 (not every schema argument is implemented) with different names in a few
@@ -273,7 +273,7 @@ Running it takes both numbers straight back:
 bash scripts/vendor/vendor_torch.sh && bash scripts/vendor/install_shim.sh
 sh tests/run.sh          211 ok, exit 0
 python tests/golden/compare.py          2843/2843, ops=119, exit 0
-python tests/verify_schemas.py   4203/4203, exit 0
+python tests/_support/verify_schemas.py   4203/4203, exit 0
 python tests/golden/compare.py --self-test      exit 0
 ```
 

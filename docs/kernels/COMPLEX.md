@@ -13,7 +13,7 @@ question is settled none of the four can be estimated at all.
 answer is *not* the same shape as its answer.
 
 The assertions behind every claim here live in
-`tests/test_tail2.py`, which is written to go red when any of
+`tests/ops/test_tail2.py`, which is written to go red when any of
 this stops being true.
 
 ---
@@ -388,7 +388,7 @@ four of anything:
 |---|---|
 | feature added | **none** |
 | defect fixed | none |
-| tests added | `tests/test_tail2.py`, 10 tests |
+| tests added | `tests/ops/test_tail2.py`, 10 tests |
 | documentation | this file |
 | deleted | nothing |
 

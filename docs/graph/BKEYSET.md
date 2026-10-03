@@ -7,7 +7,7 @@ resolved.** This round is that name.
 
     Features added    1   (torch._C._dispatch_get_backend_keyset_from_autograd)
     Defects fixed     0
-    Tests added       9   (tests/test_bkeyset.py)
+    Tests added       9   (tests/bindings/test_bkeyset.py)
     Docs corrected    1   (ALIASINC.md §4's forward pointer)
     Removed           0
 
@@ -308,13 +308,13 @@ two CoreML suites are the ones it would have shown up in. Nothing in this
 round's own numbers is load-sensitive: agreement against a live upstream and
 `resolve_key` outcome counts mean the same thing under contention.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_shim_agrees_with_upstream_on_the_backend_keyset_for_every_shared_key present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_only_sixteen_keys_answer_a_nonempty_backend_keyset present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_autogradother_keyset_is_exactly_the_dispatch_autogradother_backends_value present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_membership_probe_is_only_valid_away_from_the_alias_keys present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_name present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_staged_sweep_shows_this_name_alone_unblocks_nothing present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_chain_terminates_and_no_fourth_name_appears present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_shim_agrees_with_upstream_on_the_backend_keyset_for_every_shared_key present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_only_sixteen_keys_answer_a_nonempty_backend_keyset present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_autogradother_keyset_is_exactly_the_dispatch_autogradother_backends_value present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_membership_probe_is_only_valid_away_from_the_alias_keys present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_name present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_staged_sweep_shows_this_name_alone_unblocks_nothing present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bkeyset.py test_the_chain_terminates_and_no_fourth_name_appears present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _AUTOGRAD_BACKEND_KEYSET present -->

@@ -259,7 +259,7 @@ is the point:
 ```
 PYTHON=$PY sh tests/run.sh   -> 197 ok,                      exit 0
 $PY tests/golden/compare.py                 -> 2811/2811, ops covered=119,  exit 0
-$PY tests/verify_schemas.py  -> 4203/4203,                   exit 0
+$PY tests/_support/verify_schemas.py  -> 4203/4203,                   exit 0
 ```
 
 **And a real model agrees bit for bit.** Every prefill round in §5.2 dumps a

@@ -188,9 +188,9 @@ row, is [`docs/platform/STATUS.md`](docs/platform/STATUS.md).
 <!-- DOCWATCH: symbol-in-file docs/architectures/ARCH300.md 6 present -->
 <!-- DOCWATCH: symbol-in-file docs/numerics/AGREE.md 284 present -->
 <!-- DOCWATCH: symbol-in-file docs/numerics/AGREE.md 285 present -->
-<!-- DOCWATCH: symbol-in-file tests/test_agree.py test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing present -->
-<!-- DOCWATCH: symbol-in-file tests/test_agree.py test_the_oracle_factor_is_stated_and_is_not_a_free_parameter present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_agree.py test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_agree.py test_the_oracle_factor_is_stated_and_is_not_a_free_parameter present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs _shim_mps_host_readback_ops present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->

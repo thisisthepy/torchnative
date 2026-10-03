@@ -23,7 +23,7 @@ installing after `import torch` meant a `rebind()` pass over roughly forty
 match by object identity rather than by name.  All of it is gone.
 
 And the measurement that made it urgent rather than tidy: before the move,
-`tests/export_sweep.py` run against the shim stopped at census
+`tests/_support/export_sweep.py` run against the shim stopped at census
 name #0 (`torch._C._unset_dispatch_mode`) on **every** architecture, because
 the sweep's subprocess never called `install()`.  Every export number in
 `docs/graph/EXPORT.md` and `docs/graph/EXPORT4.md` was taken under the patch, and

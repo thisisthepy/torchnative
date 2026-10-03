@@ -53,7 +53,7 @@ place `chunk`, `flatten`, and `T` already live for the identical reason
 (`methods.json`'s README: "a `methods.json` entry would name a key no dispatcher
 ever sees"). `bootstrap.py` is outside this worktree's territory
 (`torchnative/rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
-`tests/golden/cases.py`, `tests/test_indexsel.py`), so it was not touched.
+`tests/golden/cases.py`, `tests/ops/test_indexsel.py`), so it was not touched.
 
 What *is* in territory, and what this round did instead: `methods.json` carries an
 entry for `reshape_as` whose "schema" is this shim's own invention --
@@ -65,7 +65,7 @@ is advertised through `_aten_dispatch`, but it is **not** in `_aten_implemented(
 -- it is in `IMPLEMENTED_AWAITING_GOLDEN`, with a comment explaining why
 `compare.py`'s per-op golden loop structurally cannot reach it (no
 `torch.ops.aten.reshape_as` to resolve `torch_call` against). It is proven against
-upstream instead in `tests/test_indexsel.py`, through the full vendored `torch`
+upstream instead in `tests/ops/test_indexsel.py`, through the full vendored `torch`
 package, each side in its own process (§4).
 
 **This is the two-part answer §3.5.2 of this repository's own retrospective warns
@@ -164,7 +164,7 @@ non-promoting copy of `mul`.
   `_chunk_list_check` instead of writing a second dtype-blind comparator.
   `reshape_as.default` is deliberately excluded from the per-op loop (§2) and
   proven in `test_indexsel.py` instead, subprocess-isolated against upstream.
-* `tests/arch_sweep.py --one <model_type>`, run individually (never as a full
+* `tests/_support/arch_sweep.py --one <model_type>`, run individually (never as a full
   sweep -- its own module docstring forbids wiring it into `run.sh`) against the
   shim build from this round, for every architecture ARCH100 named across all
   eleven ops, **including `longt5`/`convbert`** rather than skipping them as

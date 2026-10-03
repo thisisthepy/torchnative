@@ -37,13 +37,13 @@
 <!-- DOCWATCH: op-implemented aten.mul_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.fill_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
 
 ---
 

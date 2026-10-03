@@ -14,7 +14,7 @@ The project has verified roughly twelve architectures deeply (docs/DEMAND*.md). 
 ships hundreds. The question that decides whether a non-alpha release is weeks away or a different
 project entirely — **how many distinct operators does this shim still lack across the whole
 field** — had never been measured. This document is that measurement, and
-`tests/arch_sweep.py` is the script that takes it, so it can be taken again in a
+`tests/_support/arch_sweep.py` is the script that takes it, so it can be taken again in a
 month rather than re-derived.
 
 ---
@@ -323,7 +323,7 @@ the **shared** `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib`, and i
 binary. It warns on stderr when it does this. Set the variable.
 
 <!-- DOCWATCH: op-implemented aten.adaptive_avg_pool2d.default -->
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 457 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8921 -->

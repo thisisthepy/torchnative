@@ -45,12 +45,12 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 | Nullifications attempted / uncaught | **17 / 1** (§11) — and the uncaught one is the most useful finding here |
 | Walls remaining | 3 named, all on real architectures (§10) |
 
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_meta_storage_identity_is_shared_by_a_view_and_not_by_a_stranger present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs meta_has_no_bytes present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs pre_dispatch_mode present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
@@ -535,7 +535,7 @@ deleted those tests with it.
 
 ## 8. The three verdicts, never collapsed
 
-`tests/export_sweep.py` keeps `exported` / `replayed` / `agreed`
+`tests/_support/export_sweep.py` keeps `exported` / `replayed` / `agreed`
 apart and headlines the third. So does `test_export5.py`, as three separate
 tests plus a fourth for the empty-graph case §6 made necessary.
 
@@ -816,7 +816,7 @@ weakening hides.
 | **feature added** | the meta storage handle (§2); `is_contiguous(memory_format=)` (§3); nine backend flag pairs, `_dispatch_key_set`, `_functionality_to_backend_keys` (§4); `aten.zeros_like` on meta (§4); `_set_conj`/`_set_neg`, `grad_dtype`, `_has_symbolic_sizes_strides`, `_dispatch_tls_set_dispatch_key_included` (§5.1); **the pre-dispatch stage of the dispatcher door** (§6) |
 | **defect fixed** | **3** — `_PreserveDispatchKeyGuard` restoring nothing (§5); `to(memory_format=)` silently dropping the request (§3.1); `_functionality_to_backend_keys` answering `[]` for a non-functionality key (§11.2) |
 | **moved** | 32 census names, staging module → `bootstrap.py` (§7). No behaviour change intended; the functions are byte-identical apart from one dropped dead parameter |
-| **tests added** | **21**, in `tests/test_export5.py` |
+| **tests added** | **21**, in `tests/export/test_export5.py` |
 | **tests rewritten** | 3 (§13) |
 | **measurement** | the three verdicts with a derived tolerance (§8); the 40-architecture sweep, both sides (§10); the wall sequence (§10); 17 nullifications (§11) |
 | **documentation corrected** | `docs/graph/EXPORT.md` §3.3 (wall 8 closed); `docs/graph/EXPORT4.md` §3 and §7 (the four claims, and the wall) |

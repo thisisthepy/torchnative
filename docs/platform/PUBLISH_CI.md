@@ -7,7 +7,7 @@ three different claims, and this is the first. The first real use should be a
 `workflow_dispatch` with `dry_run: true`, which builds and verifies nine
 wheels and uploads nothing.
 
-Tests: **38** in `tests/test_cipub.py`.
+Tests: **38** in `tests/release/test_cipub.py`.
 
 ---
 

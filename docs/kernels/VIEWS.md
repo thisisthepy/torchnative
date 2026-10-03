@@ -22,7 +22,7 @@ Baseline, before any of it (this worktree, `e50084f`):
 PYTHON=$PY sh tests/run.sh    223 ok
 $PY tests/golden/compare.py                  2971/2971, ops=121
 $PY tests/golden/compare.py --self-test      13 comparators x 11 fault modes, 0 problems
-$PY tests/verify_schemas.py   4231/4231
+$PY tests/_support/verify_schemas.py   4231/4231
 ```
 
 ---

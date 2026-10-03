@@ -1723,7 +1723,7 @@ _DISPATCH_REGISTRATIONS: dict = {}
 #: `_dispatch_is_included_in_alias(k, alias)` -- which concrete keys each alias
 #: key expands to. Measured against a live upstream over the full 145x145
 #: `DispatchKey` cross product, not inferred from the names:
-#: `tests/test_aliasinc.py`.
+#: `tests/bindings/test_aliasinc.py`.
 #:
 #: **Only six of upstream's 145 keys expand beyond themselves**; every other
 #: key includes itself and nothing else, which is why this is six entries and
@@ -1845,7 +1845,7 @@ _ALIAS_EXPANSION = {
 #: the backend keys an autograd key was entered from. Measured against a live
 #: upstream over all 145 `DispatchKey`s by *enum membership*, never inferred
 #: from the names and never read out of a keyset's `repr`:
-#: `tests/test_bkeyset.py`.
+#: `tests/bindings/test_bkeyset.py`.
 #:
 #: **Only 16 of upstream's 145 keys answer a non-empty set**, and two of those
 #: 16 are keys the vendored enum does not have (`AutogradMAIA` and
@@ -1975,7 +1975,7 @@ _AUTOGRAD_BACKEND_KEYSET = {
 #: Those registrations are recorded into `_shim_registrations` and dropped, so
 #: marking their key effective would claim a kernel that can never run. When a
 #: round wires Python fallbacks through to `_aten_dispatch`, this is the set it
-#: adds to, and `tests/test_bfallback.py` reddens until both
+#: adds to, and `tests/bindings/test_bfallback.py` reddens until both
 #: sides move together.
 _SHIM_BACKEND_FALLBACKS: frozenset = frozenset()
 
@@ -5420,7 +5420,7 @@ def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
     recognise.
 
     Both aten keys (`aten.real.default`, `aten.imag.default`) are implemented
-    and proven element-wise against upstream in `tests/test_complex.py`; this
+    and proven element-wise against upstream in `tests/ops/test_complex.py`; this
     adds nothing to their arithmetic, only the property that reaches them --
     checked before writing it, the way docs/bindings/BINDINGS.md's `mish` was not.
     """
@@ -8094,7 +8094,7 @@ def _install_namespace_types(module, namespace) -> None:
 # nowhere else they could come from. The text is transcribed from upstream
 # 2.13.0's own registry (`torch._C._jit_get_all_schemas()` filtered by
 # namespace, after importing `torch.distributed._functional_collectives`), not
-# written by hand; `tests/verify_schemas.py` re-derives it the same way.
+# written by hand; `tests/_support/verify_schemas.py` re-derives it the same way.
 #
 # Whether an op *runs* is a separate question from whether its schema is known,
 # and this table answers only the second. Calling one still goes through
@@ -8823,7 +8823,7 @@ def _install_conv_backend_query(module) -> None:
     with **zero members**, which is why the generated `torch._C.ConvBackend`
     is an empty enum. They are transcribed from upstream 2.13.0, exactly as
     `overloads.json` is, and
-    `tests/test_convbackend.py::test_the_conv_backend_enum_is_upstreams_names_and_values`
+    `tests/bindings/test_convbackend.py::test_the_conv_backend_enum_is_upstreams_names_and_values`
     re-derives them from a live upstream rather than trusting this list.
     `MpsTranspose,` carries a trailing comma in upstream's own enum
     definition; it is transcribed as found rather than tidied, because the
@@ -13187,7 +13187,7 @@ def _install_functionality_to_backend_keys(module) -> None:
 # than carried.
 #
 # **What was measured before this moved, and is the reason it matters:**
-# `tests/export_sweep.py` run against the shim stopped at census
+# `tests/_support/export_sweep.py` run against the shim stopped at census
 # name #0 (`torch._C._unset_dispatch_mode`) on all 25 architectures, because
 # the sweep's subprocess never called `upstream.install()`. Every export
 # measurement in docs/graph/EXPORT.md and docs/graph/EXPORT4.md was taken under that
@@ -14488,7 +14488,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     # is empty, and the predicate reads it -- because everything that pushes
     # onto it (`_wrap_for_grad`, `_add_batch_dim`, `_vmap_increment_nesting`
     # and its `_grad`/`_jvp`/`_func` siblings) is a raising stub, which
-    # `tests/test_shim.py` asserts. A tensor cannot acquire a level here
+    # `tests/_support/test_shim.py` asserts. A tensor cannot acquire a level here
     # without one of those first, so `-1` is derived from the stack rather
     # than written down. If functorch ever lands, the pushers change and these
     # three follow without being touched.
@@ -15520,7 +15520,7 @@ def _install_distributed_c10d(module, spec) -> None:
         thing that copies staging onto the caller's buffer is **publication**,
         which happens at a synchronisation point and nowhere else. Two
         consequences, both deliberate, both tested in
-        `tests/test_asyncwork.py`:
+        `tests/distributed/test_asyncwork.py`:
 
         * Reading the output buffer before `wait()` yields the
           **pre-collective contents**, deterministically, on every run and at

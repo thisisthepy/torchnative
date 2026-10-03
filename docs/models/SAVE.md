@@ -405,7 +405,7 @@ $PY tests/golden/compare.py                  7763/7763, ops=168
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _ZipWriter present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs snapshot present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs storage_snapshot present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit present -->
 <!-- DOCWATCH: count smoke_ok ge 339 -->
 
 ---

@@ -101,7 +101,7 @@ bodies that already existed, and one deliberate refusal.** Eight `_aten_implemen
 table rows. "Eight ops" would overstate it by a factor of three, which is the counting failure
 `AGENTS.md` §17.3 names.
 
-`tests/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
+`tests/ops/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
 itself — `index_add_common` reached from exactly two dispatch arms, `Bitwise::Xor` as an arm and
 not a function — so the claim in this table cannot rot into prose.
 
@@ -291,7 +291,7 @@ recorded here as sized work items rather than left as sweep lines.
 
 ## 8. Architectures
 
-Ran with `tests/arch_sweep.py --only ...`, before and after.
+Ran with `tests/_support/arch_sweep.py --only ...`, before and after.
 
 | architecture | before | after |
 |---|---|---|
@@ -326,13 +326,13 @@ plausible wrong implementation differs.
   <!-- DOCWATCH: count golden_ops_covered ge 263 -->
   <!-- DOCWATCH: count golden_pending eq 0 -->
   9870 cases pass of 9870, 263 ops covered, 0 pending builders (9691/255 before).
-* **`tests/test_tail3.py`**, a new suite file, holding down the four things a value comparison
+* **`tests/ops/test_tail3.py`**, a new suite file, holding down the four things a value comparison
   structurally cannot: the striding verdict as arithmetic on the printed layouts, the
   alias-versus-kernel split as source structure, the two adjacent ops that must **disagree**, and
   the `erfinv` far tail judged by round trip rather than by agreement.
-  <!-- DOCWATCH: symbol-in-file tests/test_tail3.py test_the_refused_matmul_operands_were_already_contiguous present -->
-  <!-- DOCWATCH: symbol-in-file tests/test_tail3.py test_scatter_reduce_sum_and_index_add_accumulate_DIFFERENTLY present -->
-  <!-- DOCWATCH: symbol-in-file tests/test_tail3.py test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_the_refused_matmul_operands_were_already_contiguous present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_scatter_reduce_sum_and_index_add_accumulate_DIFFERENTLY present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream present -->
 * **Two pinned counts in `test_shim.py`** moved, each carrying the arithmetic that keeps it a
   check: `tag_core_count` 117 → 120 (`bitwise_xor.Tensor`, `bitwise_xor.Scalar` and
   `scatter_reduce.two` are the only three of the eight new keys upstream tags `core` — each read

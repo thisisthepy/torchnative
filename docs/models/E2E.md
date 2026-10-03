@@ -2,7 +2,7 @@
 
 지금까지 "shim 이 상류와 같은 토큰을 낸다"는 여러 번 실측됐지만 전부 캐시 디렉터리 아래의
 일회성 프로브 스크립트(`caches/bw-sample-probe/`, 커밋 대상 아님)로만 존재했습니다. 이 문서는
-그 성질을 `tests/test_shim.py` 의 테스트 세 개로 회귀 스위트에 박아 넣은 기록입니다.
+그 성질을 `tests/_support/test_shim.py` 의 테스트 세 개로 회귀 스위트에 박아 넣은 기록입니다.
 
 **한 줄 결론.** 상류와 shim 을 한 프로세스에서 동시에 쓸 수 없다고 알려져 있었는데, 실제로는
 **된다** — 다만 `import torch` 로 vendor 트리를 통해서가 아니라, shim 을 `torch._C` 가 아닌 독립
@@ -14,7 +14,7 @@
 
 ## 1. 추가한 테스트와 각각이 잡는 것
 
-세 개 모두 `tests/test_shim.py` 끝, `_main()` 바로 앞 새 절에 있습니다. 헬퍼
+세 개 모두 `tests/_support/test_shim.py` 끝, `_main()` 바로 앞 새 절에 있습니다. 헬퍼
 (`_e2e_*`, `_E2EBackend`)는 세 테스트가 공유합니다.
 
 ### 1.1 `test_two_layer_llama_greedy_matches_upstream_token_for_token`
@@ -128,7 +128,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 
 세 개 다 깬 뒤 개별적으로 `tests/run.sh` 를 다시 돌려 `EXIT=1` 과 위 `FAIL` 줄을 직접 봤고,
 그때마다 `cp` 로 떠 둔 사본으로 되돌린 뒤 `diff` 로 바이트 단위 동일함을 확인했습니다. 마지막에
-`git status --short` 로 이 worktree 전체에서 `tests/test_shim.py` 한 파일만
+`git status --short` 로 이 worktree 전체에서 `tests/_support/test_shim.py` 한 파일만
 변경됐음을(= `src/` 무손상) 확인했습니다.
 
 ---
@@ -145,7 +145,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 
 ## 6. 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 tests/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
+`PYTHONPATH=<stage> python3 tests/_support/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
 
 | | 테스트 수 | wall time |
 |---|---|---|
@@ -212,7 +212,7 @@ forward pass 비용입니다. `tests/run.sh` 전체(cargo 증분 빌드 포함)�
 
 ### 9.1 무엇을 바꿨나
 
-`tests/test_shim.py` 만 건드렸습니다(`src/`, `tests/golden/` 무손상 — 아래 §9.4).
+`tests/_support/test_shim.py` 만 건드렸습니다(`src/`, `tests/golden/` 무손상 — 아래 §9.4).
 
 1. **`_E2E_LOGIT_ATOL = 1e-5`** — greedy 테스트가 쓰던 상수를 이름 붙여 모듈 상수로 올리고,
    근거를 그 자리 주석에 모았습니다(§9.2).
@@ -299,8 +299,8 @@ FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionE
 것으로 어느 assert 에서 죽었는지 구분됩니다. 즉 이 주입은 "토큰만 봤다면 통과했을 오류"를
 정확히 재현했고, 새 로짓 assert 가 그것을 잡는다는 것을 직접 확인했습니다.
 
-원상복구 후 `diff /tmp/test_shim.py.orig tests/test_shim.py` 류의 바이트 비교와
-`git diff tests/test_shim.py` 로 주입 코드가 한 줄도 남지 않았음을 확인했고,
+원상복구 후 `diff /tmp/test_shim.py.orig tests/_support/test_shim.py` 류의 바이트 비교와
+`git diff tests/_support/test_shim.py` 로 주입 코드가 한 줄도 남지 않았음을 확인했고,
 `bash tests/run.sh` 를 다시 돌려 65 개 전부 `ok`, `EXIT=0` 을 재확인했습니다.
 
 **greedy 테스트의 기존 로짓 assert** 는 이미 §4 표에서 확인되어 있던 것을 재사용했습니다(다시
@@ -316,7 +316,7 @@ FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionE
 
 ### 9.6 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 tests/test_shim.py` 단독 실행, `spike-venv` 인터프리터, 이 파일
+`PYTHONPATH=<stage> python3 tests/_support/test_shim.py` 단독 실행, `spike-venv` 인터프리터, 이 파일
 그대로(§6 의 위치에서 실행 — `/tmp` 로 복사하면 `surface.json` 상대경로가 깨져 별도 비교로는
 못 씁니다):
 

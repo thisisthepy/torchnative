@@ -78,7 +78,7 @@ bash .github/scripts/release/test-sync-release.sh
   `.github/scripts/release/sync-release.sh` 로 `release` 를 재생성하고 `release → main` PR 을 엽니다.
   `main` 의 보호는 메인테이너의 몫이고, release PR 은 메인테이너가 병합합니다.
   `pages.yml` 이 `main` 푸시 때 `docs/guide/` 를 Pages 로 배포합니다 — `docs/guide/` 가 main 레이아웃에서
-  살아남는다는 것은 `tests/test_publish.py` 가 실제 트리로 확인합니다.
+  살아남는다는 것은 `tests/release/test_publish.py` 가 실제 트리로 확인합니다.
 - PyPI 배포는 `v*` 태그로 `publish-pypi.yml` 이 수행합니다(Trusted Publishing, 토큰 없음).
   **사용자 승인 없이 업로드하지 않습니다** (AGENTS.md §17.7).
 

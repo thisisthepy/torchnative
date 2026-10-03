@@ -34,7 +34,7 @@ walls above untouched. §4 sizes both. §6 says what to do.
 
 Measured 2026-09-06, `darwin/arm64`, CPython 3.13, `work/export`.
 Reproduction in §7. Gates unmoved: suite **602 ok** (587 + the 15 new tests in
-`tests/test_export.py`), `DOCWATCH: PASS`, golden **9691/9691
+`tests/export/test_export.py`), `DOCWATCH: PASS`, golden **9691/9691
 ops=255** — no Rust changed.
 
 ---
@@ -380,14 +380,14 @@ an `ExportedProgram`. It would print. It would serialise. That is precisely the
 half-working graph this round was told to watch for, and it is one plausible,
 well-intentioned commit away.
 
-`tests/test_export.py::test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted`
+`tests/export/test_export.py::test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted`
 is that guard, and it is written so closing either half makes it demand the
 other rather than going quiet.
 
-<!-- DOCWATCH: symbol-in-file tests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export.py test_capture_is_the_only_working_front_end_and_records_the_module_it_ran present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export.py test_the_dispatch_mode_stack_counts_instead_of_answering_zero present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export.py test_base_refuses_for_a_detected_view_rather_than_answering_none present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_capture_is_the_only_working_front_end_and_records_the_module_it_ran present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_the_dispatch_mode_stack_counts_instead_of_answering_zero present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_base_refuses_for_a_detected_view_rather_than_answering_none present -->
 
 ### 4.3 None of it is abi3
 
@@ -596,7 +596,7 @@ number:
 | **feature added** | none reaching `_aten_implemented()`; no Rust changed |
 | **binding surface implemented** | 29 `torch._C` names, in a staging module, behind a hand-off (§8) |
 | **defect found** | `_len_torch_dispatch_stack` answering a constant `0` (§2.2); `_base`/`_is_view` able to disagree with each other (§2.5) |
-| **tests added** | 15, in `tests/test_export.py` |
+| **tests added** | 15, in `tests/export/test_export.py` |
 | **measurement** | the re-derived census (§2), the storage-model comparison (§2.5), the two walls (§4), the capture/upstream overload disagreement (§5) |
 | **documentation corrected** | none — `docs/graph/COMPILE.md` §3 is accurate as written and §1 says so |
 

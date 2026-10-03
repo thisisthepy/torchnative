@@ -448,9 +448,9 @@ margin.** `judge` uses `max(agreement * 100, tolerance)`, and
 `test_the_numeric_control_has_a_floor_and_not_just_a_ratio` fails if the floor is
 removed.
 
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_verdict_refuses_partial_offload present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_the_numeric_control_has_a_floor_and_not_just_a_ratio present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_dynamo_backend_refuses_permanently present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_verdict_refuses_partial_offload present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_numeric_control_has_a_floor_and_not_just_a_ratio present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_dynamo_backend_refuses_permanently present -->
 
 ### 3.3 What was measured on an arm64 Mac — which is much more than expected
 
@@ -715,7 +715,7 @@ The pure and refusal tests need nothing:
 
 ```sh
 PYTHON=/Volumes/macMini/caches/spike-venv/bin/python
-$PYTHON tests/test_intelnpu.py      # 26 ok, 7 skips naming what is absent
+$PYTHON tests/devices/npu/test_intelnpu.py      # 26 ok, 7 skips naming what is absent
 ```
 
 The real-OpenVINO half needs an `openvino_c`, which on macOS means downloading the wheel
@@ -726,7 +726,7 @@ mkdir -p /tmp/ov && cd /tmp/ov
 $PYTHON -m pip download openvino --no-deps -d .
 unzip -q openvino-*.whl
 export TORCHNATIVE_OPENVINO_C=/tmp/ov/openvino/libs/libopenvino_c.*.dylib
-cd - && $PYTHON tests/test_intelnpu.py   # 32 ok, 1 skip
+cd - && $PYTHON tests/devices/npu/test_intelnpu.py   # 32 ok, 1 skip
 ```
 
 The seven OpenVINO tests skip **by name** without that variable, saying it is unset;
@@ -739,10 +739,10 @@ reason is counted as a pass.
 ## The granularity fix — one oversized leaf no longer refuses a whole model
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py plan_lowering present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
-<!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_the_plan_and_the_real_lowering_cannot_drift_apart present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_intelnpu.py test_the_plan_and_the_real_lowering_cannot_drift_apart present -->
 
 **The report from the field.** A user ran `Qwen/Qwen3-4B-Instruct-2507` on an
 actual Intel NPU and the whole model was refused for one layer:
@@ -827,10 +827,10 @@ stop checking.**
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py f16_tensor present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs shim_f16_bytes present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs py_float present -->
-<!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
-<!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
-<!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->
-<!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_tolist_builds_its_scalars_through_the_fallible_pyo3_spelling present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/npu/test_npublob.py test_tolist_builds_its_scalars_through_the_fallible_pyo3_spelling present -->
 
 **The second report from the same field run.** With the granularity fix in place
 the same user's Qwen3-4B *did* lower — 252 Linears, `EXECUTION_DEVICES=['NPU']` —

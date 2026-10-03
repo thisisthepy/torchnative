@@ -317,7 +317,7 @@ silu x 1.001  (0.1%  높게)   1.44e-06     1e-5 미만 — 못 잡음
 ```
 PYTHON=$PY sh tests/run.sh    exit 0   142 통과 (전 129, +13)
 $PY tests/golden/compare.py                  exit 0   2486/2486, ops=116 (전 2383/109)
-$PY tests/verify_schemas.py   exit 0   270/270 (전 255)
+$PY tests/_support/verify_schemas.py   exit 0   270/270 (전 255)
 ```
 
 테스트 +13 은 §2~§4 가 9개, §6.1 이 4개입니다.
@@ -496,7 +496,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 142
 $PY tests/golden/compare.py                        # 2486/2486 ops=116
-$PY tests/verify_schemas.py         # 270/270
+$PY tests/_support/verify_schemas.py         # 270/270
 
 # 이 문서의 두 판정
 PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \

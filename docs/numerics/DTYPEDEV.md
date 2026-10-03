@@ -56,7 +56,7 @@ and never as a dimension of the sweep. Every case it runs is a CPU case.
 
 So the gap is not "another comparison harness" — a second one beside the golden
 harness would be a liability, and this round did not build one. The gap is the
-**device column**, and `tests/test_dtypedev.py` is 23 operators
+**device column**, and `tests/devices/test_dtypedev.py` is 23 operators
 wide rather than 304 precisely so that it stays the device test and does not
 become a second opinion on operator coverage. Where the two overlap (`cpu`,
 float dtypes) they agree; where they do not overlap is where this file is the
@@ -444,7 +444,7 @@ both give `int64(32768) -> int16` as `-32768` and `int64(2**31) -> int16` as `0`
 | `abs`, `max`, `argmax`, comparisons | **not claimed, and not a dtype gap** | order- and sign-based rather than ring. `max`, `argmax` and the comparisons are *already* refused on `mps` for `int64` too, by the host-readback gate — so `int16` reaching them is not what is missing. **`abs` is no longer in that company** (2026-09-19): its integral path became `maximum(x, 0 - x)` in candle, so it left `MPS_HOST_READBACK_OPS` and now computes on Metal for `float32`/`float16`/`bfloat16`/`int64`/`uint8`/`uint32`, graded against upstream by `test_the_dtype_device_matrix_agrees_with_upstream` and by `test_absmps.py` ([`docs/devices/matrix.md`](../devices/matrix.md) §7.3). `int16`/`int32` still do not reach it, for `_shim_mps_unsupported_int_dtypes`' own reason rather than the readback gate's. |
 
 The `add`/`sub`/`mul`/`neg` row and the reduction row are both **checked**, not
-merely argued, in `tests/test_intmps.py`: the promote–compute–
+merely argued, in `tests/devices/mps/test_intmps.py`: the promote–compute–
 narrow round trip is run on the **cpu**, where both widths have kernels, at
 `iinfo.max`, `iinfo.min` and values that overflow mid-reduction, and compared
 against upstream 2.13.0.
@@ -625,7 +625,7 @@ is a stronger statement than the two of them agreeing when nothing is wrong.
 | **defect fixed** | `torch.backends.mps.is_available()` and `is_built()` answered `False` on a machine computing on Metal. Both now answer from the artefact. |
 | **defect fixed** | `float64` on `mps` constructed successfully and produced an unusable tensor whose only escape hatch was also closed. Now refuses by name on all three roads. |
 | **feature added** | `torch._C._mps_probe()`, `torch._C._mps_get_default_generator()`. |
-| **tests added** | `tests/test_dtypedev.py` — 11 tests, 4 verified nullifications. |
+| **tests added** | `tests/devices/test_dtypedev.py` — 11 tests, 4 verified nullifications. |
 | **documents corrected** | [`../devices/DEVICE_NS.md`](../devices/DEVICE_NS.md) §6 and the `torchnative/device/__init__.py` module docstring both described the constant in the present tense; both now say what closed it and neither had its *measurement* rewritten. |
 | **deleted** | nothing. |
 

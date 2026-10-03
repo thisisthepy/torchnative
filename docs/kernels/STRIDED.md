@@ -118,7 +118,7 @@ asserts, because a barrier that only ever grows is a leak with a refusal on top.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs StridedBarrier present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs as_strided_default present -->
-<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total present -->
 
 ---
 
@@ -224,8 +224,8 @@ and there is no third against candle 0.11.0's public surface. It is written down
 here rather than left to be discovered, and the candle patch of §1 removes it
 along with everything else in this document.
 
-<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_the_barrier_reaches_an_alias_of_the_base_that_PREDATES_the_call present -->
-<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_a_noncontiguous_receiver_is_refused_because_upstream_reads_storage_order present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_the_barrier_reaches_an_alias_of_the_base_that_PREDATES_the_call present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_a_noncontiguous_receiver_is_refused_because_upstream_reads_storage_order present -->
 
 ---
 
@@ -267,7 +267,7 @@ Here that advice is wrong and following it would be the silent failure — the
 gap is not closed when both sides succeed, it is closed when candle can build
 the view.
 
-<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_measured present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_measured present -->
 
 ---
 
@@ -275,7 +275,7 @@ the view.
 
 Both were blocked on `aten.as_strided.default` in `docs/architectures/ARCH200.md` and both were
 left there deliberately by `docs/kernels/TAIL4.md` §8. Re-run with
-`tests/arch_sweep.py --one`, shim side:
+`tests/_support/arch_sweep.py --one`, shim side:
 
 | architecture | before | after |
 |---|---|---|
@@ -310,7 +310,7 @@ not the same unit of work:
   `Tensor.as_strided` table rows.
 * **Safety mechanism added (1):** `storage.rs::StridedBarrier` and its reader at
   the write door. It is not an op and does not appear in any op count.
-* **Tests added:** 12 in `tests/test_strided.py`, 29 golden cases.
+* **Tests added:** 12 in `tests/ops/test_strided.py`, 29 golden cases.
 * **Tests inverted (2), not deleted:**
   `test_tail4.py::test_the_as_strided_refusal_was_INVERTED_by_the_strided_round`
   and `…::test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed`.

@@ -272,7 +272,7 @@ failure would have read as "OpenVINO would not compile it" and lost the limit.
   `import_model` is not established; only header-level validation was read.
 
 The standing check that no thread pool arrived without this document being revisited is
-`test_the_compile_path_still_spawns_no_threads` in `tests/test_ovpar.py`.
+`test_the_compile_path_still_spawns_no_threads` in `tests/devices/npu/test_ovpar.py`.
 
 ---
 

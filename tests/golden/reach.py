@@ -217,11 +217,13 @@ def executable_text(text: str) -> str:
 def test_corpus(repo_root: pathlib.Path) -> str:
     """Everything the smoke suite can execute, as text.
 
-    `tests/*.py` only. The golden harness is deliberately excluded: it
+    every `.py` under `tests/` except the golden, docwatch and bench folders. The golden harness is deliberately excluded: it
     dispatches by key and never spells a name, which is the blindness this file
     exists to cover, so counting it as coverage would defeat the check.
     """
-    paths = sorted((repo_root / "tests").glob("*.py"))
+    paths = sorted(p for p in (repo_root / "tests").rglob("*.py")
+                   if not {"__pycache__", "golden", "docwatch", "bench"}
+                   & set(p.relative_to(repo_root / "tests").parts))
     return "\n".join(executable_text(p.read_text()) for p in paths)
 
 

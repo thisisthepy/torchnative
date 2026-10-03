@@ -131,13 +131,13 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 올립니다. 그 스캔은 **테스트가 매번 다시 돌립니다:**
 
 * `test_the_mps_readback_list_is_what_the_kernels_actually_do`
-  <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_mps_readback_list_is_what_the_kernels_actually_do present -->
+  <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_mps_readback_list_is_what_the_kernels_actually_do present -->
   소스에서 다시 유도한 집합을 **아티팩트가 게이트하고 있는 표**
   (`_C._shim_mps_host_readback_ops()`) 와 비교합니다. 소스끼리 비교했다면 아무도 다시 빌드하지
   않은 변경 뒤에도 자기 자신과 일치했을 것입니다. `to_vec1` 이 생긴 커널은 목록에 오르기
   전까지 스위트를 빨갛게 만들고, 없어진 커널은 사라진 이유로 계속 거절당하지 않습니다.
 * `test_every_host_readback_in_aten_is_classified`
-  <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
+  <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_every_host_readback_in_aten_is_classified present -->
   스캔이 **헬퍼 호출을 이름으로 한 단계만** 따라간다는 것이 이 방식의 한계입니다. 두 단계
   아래 새로 생긴 되읽기는 어떤 op 에도 닿지 않고 조용히 빠집니다. 그래서 더 강한 것을
   단언합니다 — `aten.rs` 안에서 되읽기 표식을 가진 **모든 함수**는 (a) 이미 거절되는 커널,
@@ -158,9 +158,9 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 모든 `*.rs` 에서 되읽기 표식을 가진 함수를 뽑고, 커널은 **정규화된 경로**
 (`crate::tensor::to_le_bytes(`)로 대조합니다 — 이름만으로 맞추면 정수의 고유 메서드인
 `to_le_bytes` 때문에 멀쩡한 커널 여러 개가 목록에 오릅니다.
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _cross_file_readback_helpers present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _reaches_cross_file_readback present -->
-<!-- DOCWATCH: symbol-in-file tests/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _cross_file_readback_helpers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _reaches_cross_file_readback present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
 
 ### 3.2 왜 "안전한 op 의 허용 목록" 이 아닌가
 
@@ -216,7 +216,7 @@ macOS SIP 가 `/bin/sh` 를 exec 할 때 `DYLD_*` 를 떼어내기 때문입니�
 2. **함정을 탐지해 이름을 댄다.** 떼어진 변수는 흔적을 남기지 않지만 **서명은 남깁니다** —
    `VK_DRIVER_FILES` 는 `DYLD_*` 가 아니라 SIP 가 건드리지 않습니다. 둘 중 하나만 세팅된
    상태는 **둘 다 세팅하고 하나를 잃은 사람**의 모양입니다. `run.sh` 가 그때 경고하고,
-   <!-- DOCWATCH: symbol-in-file tests/test_shim.py _sip_stripped_the_loader_path present -->
+   <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _sip_stripped_the_loader_path present -->
    `_vulkan_or_skip` 의 스킵 줄도 "no vulkan" 대신 SIP 와 통과용 변수를 말합니다.
 
 **실측 — 이것이 §6.1 이 불가능하다고 적은 조합입니다:**

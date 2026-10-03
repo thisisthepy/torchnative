@@ -1,7 +1,7 @@
 # ARGFORM — the argument-form gaps, and the two owed bindings picked up alongside them
 
 Worktree `work/argform` on develop `eb84708`. Territory: `torchnative/rust/torch_c/src/bootstrap.py`,
-`tests/test_argform.py`. `test_shim.py`, `aten.rs`, `capture.rs`, `tape.rs`,
+`tests/bindings/test_argform.py`. `test_shim.py`, `aten.rs`, `capture.rs`, `tape.rs`,
 `tensor.rs`, `device.rs`, `methods.json`, `overloads.json`, `tools/`, `torchnative/` were not
 touched, per this round's territory split.
 
@@ -194,7 +194,7 @@ FAIL aten.copy_.default :: member x[0:4:2] = 0.0 [refused -- ...] -- gap appears
 names the one-line promotion needed for all three flipped cases (§2.1) — so this is the expected,
 documented next step, not a new finding.
 
-**A new finding this round did surface, though**: `tests/test_shim.py`'s existing
+**A new finding this round did surface, though**: `tests/_support/test_shim.py`'s existing
 `test_setitem_writes_the_basic_index_through_to_the_base` pins the *old* refusal —
 
 ```python
@@ -208,7 +208,7 @@ documented next step, not a new finding.
 ```
 
 — and with the patch applied this assertion now fails, because the write is (correctly) no longer
-refused. `git diff eb84708 develop -- tests/test_shim.py` is empty, so whoever lands
+refused. `git diff eb84708 develop -- tests/_support/test_shim.py` is empty, so whoever lands
 this patch for real needs to update this one assertion too (delete the `try`/`except` and assert
 the written values instead, matching the `d`/`e` cases just above it in the same test) — a step
 docs/bindings/SETITEM.md's own verification (§7, "481 ok, 0 FAIL") did not appear to hit, most likely because

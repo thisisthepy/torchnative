@@ -76,7 +76,7 @@ so a per-machine tree would need the vendoring step in front of every cargo invo
 `vendor/*.sh`, `run.sh`, a dozen cross builds across two CI workflows, `cargo ndk`, the device
 scripts — and the first one missed would reproduce this defect. Committed, a fresh clone builds
 with plain `cargo build`. The cost is a copy that could drift from its two inputs, and
-`tests/test_int8.py` runs `--check` in the gate, including a test that a
+`tests/numerics/test_int8.py` runs `--check` in the gate, including a test that a
 drifted copy and a wrong crate are **refused**.
 
 **The patch carried in `vendor/` was not the fork that was built.** Applied to the published
@@ -117,10 +117,10 @@ made to drop `tokenizers` from the graph — the diff below. That is a separate 
 declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that
 `candle-core` has no registry `source`.
 
-<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '"../../vendor/candle-core"' present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '"../../../vendor/candle-core"' present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml 'candle-vendor' absent -->
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706 present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_committed_fork_is_the_pinned_crate_plus_the_patch present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_committed_fork_is_the_pinned_crate_plus_the_patch present -->
 
 What follows is the history of that machine-local tree. `docs/numerics/FLOAT8C.md` did not say
 **what its patch was**. Diffed against the crates.io
@@ -176,7 +176,7 @@ lines inside macros that already fan out over dtype. docs/devices/matrix.md
 **The patch file's name.** `int8-candle-0.11.0-cpu.patch` still says `cpu`
 although it has carried Metal counters for some time and now carries Metal
 `I8` as well. Renaming it reaches `vendor_candle.sh`, this section and
-`tests/test_int8.py`; it is deliberately **left alone**, and
+`tests/numerics/test_int8.py`; it is deliberately **left alone**, and
 `vendor_candle.sh`'s header says so where a reader meets it.
 
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
@@ -465,7 +465,7 @@ lines of §3 away from `torch.tensor([1], dtype=torch.int8)` working.
   dtype that does not construct.
 - **`int8` overflow behaviour.** §2.4 exercised no overflow, and upstream's wrapping
   semantics for `int8` were not compared against candle's. **Closed 2026-09-15** by
-  `tests/test_int8.py`, exact against upstream in the same interpreter:
+  `tests/numerics/test_int8.py`, exact against upstream in the same interpreter:
   ordinary arithmetic, the wrap-around edges (`127 + 1`, `-(-128)`, `abs(-128)`, scalar
   forms, and `sum` widening to `int64`), casts into `int8` from six dtypes and out of it to
   eight, and `int8 × uint8 → int16` in both orders. Each was broken on purpose and went red:
@@ -473,6 +473,6 @@ lines of §3 away from `torch.tensor([1], dtype=torch.int8)` working.
   and the `Int8`/`UInt8` rule removed from `promote_types` (promotion). Grade **agrees** for
   those cases only; the 135 of §4.3 are still unjudged.
 
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_int8_wraps_at_the_edges_exactly_where_upstream_wraps present -->
-<!-- DOCWATCH: symbol-in-file tests/test_int8.py test_int8_with_uint8_promotes_to_int16_in_both_orders present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_int8_wraps_at_the_edges_exactly_where_upstream_wraps present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_int8_with_uint8_promotes_to_int16_in_both_orders present -->
 - **The 34 of §4.5**, and **CUDA/Metal**.

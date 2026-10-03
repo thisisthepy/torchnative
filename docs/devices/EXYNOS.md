@@ -211,5 +211,5 @@ ExynosNpuUnimplemented: torchnative.device.npu: Samsung Exynos SoC (Exynos 2400)
    - Updated `_resolve_qnn()` to raise `ExynosNpuUnimplemented` when `is_exynos` or `soc_status == "exynos-unimplemented"` is present.
    - Updated `NpuDevice.resolve()` to re-raise `ExynosNpuUnimplemented` directly.
 
-3. **`tests/test_npuvendor.py`**:
+3. **`tests/devices/npu/test_npuvendor.py`**:
    - Added `test_android_exynos_soc_refuses_by_name_with_unimplemented_and_fallbacks()` verifying that Exynos devices raise an Exynos-named refusal containing `unimplemented` and directing users to `cpu` and `vulkan`.

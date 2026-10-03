@@ -326,7 +326,7 @@ widen(x.t())  ==  widen(x).t()        원소마다, 비트마다
 PYTHON=$PY sh tests/run.sh    241        (전 241 -- 안 떨어짐)
 $PY tests/golden/compare.py                  3302/3302  ops=133   (변화 없음)
 $PY tests/golden/compare.py --self-test      exit 0
-$PY tests/verify_schemas.py   4295/4295
+$PY tests/_support/verify_schemas.py   4295/4295
 ( cd torchnative/rust/torch_c && cargo test --release )  10         (전 7 -- +3)
 ```
 
@@ -472,7 +472,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 PYTHON=$PY sh tests/run.sh        # 241
 $PY tests/golden/compare.py                      # 3302/3302 ops=133
 $PY tests/golden/compare.py --self-test          # exit 0
-$PY tests/verify_schemas.py       # 4295/4295
+$PY tests/_support/verify_schemas.py       # 4295/4295
 ( cd torchnative/rust/torch_c && cargo test --release )      # 10
 ```
 

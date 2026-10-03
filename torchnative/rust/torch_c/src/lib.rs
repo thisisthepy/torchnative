@@ -582,7 +582,7 @@ fn _shim_target() -> &'static str {
 ///
 /// A setter and not only `BW_SDPA_REFERENCE`, because the things that have to
 /// run with it on are individual cases inside a suite that must stay fast:
-/// `tests/test_shim.py`'s three tolerance-free sdpa tests and
+/// `tests/_support/test_shim.py`'s three tolerance-free sdpa tests and
 /// `tests/golden/cases.py`'s sixteen block-boundary cases, both of which flip
 /// it and flip it back. An env-only switch would mean a second process for
 /// them, which neither harness has a place to spawn.
@@ -604,7 +604,7 @@ const SURFACE: &str = include_str!("surface.json");
 /// Unlike `SURFACE` this is not generated from the vendored tree -- the tree
 /// carries aten overload *names* and Python-level signatures but nothing that
 /// joins them (docs/bindings/OVERLOAD.md §2) -- so it is transcribed and checked by
-/// `tests/verify_schemas.py` against an installed upstream torch. Compiled
+/// `tests/_support/verify_schemas.py` against an installed upstream torch. Compiled
 /// in the same way: nothing is read from disk at runtime.
 const OVERLOADS: &str = include_str!("overloads.json");
 
@@ -613,7 +613,7 @@ const OVERLOADS: &str = include_str!("overloads.json");
 /// `_VariableFunctions` entry are different C functions with different
 /// signature lists, which is why docs/design/C_SURFACE.md counted the two surfaces
 /// apart -- 50 `TensorBase` members called against 13 hoisted functions.
-/// Checked by the same `tests/verify_schemas.py`.
+/// Checked by the same `tests/_support/verify_schemas.py`.
 const METHODS: &str = include_str!("methods.json");
 
 /// Everything that is a name rather than a behaviour is built in Python, from

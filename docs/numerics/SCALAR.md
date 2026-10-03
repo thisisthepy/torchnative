@@ -450,7 +450,7 @@ applies.
 Six faults in `aten.rs`, each the most plausible wrong shape for what this round
 changed, plus a re-run of docs/training/TRAIN.md §5's S4 — the one that started it. Every
 one was applied to the source, **rebuilt**, and run through
-`tests/golden/compare.py` and `tests/test_shim.py`.
+`tests/golden/compare.py` and `tests/_support/test_shim.py`.
 
 | # | fault | golden | smoke |
 |---|---|---:|---|
@@ -528,9 +528,9 @@ dtype.
 > <!-- DOCWATCH: op-implemented aten.pow.Tensor_Scalar -->
 > <!-- DOCWATCH: op-implemented aten.pow.Scalar -->
 > <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _scalar_rule_cases present -->
-> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed present -->
-> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul present -->
-> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_pow_narrows_its_scalar_where_mul_widens_it present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_pow_narrows_its_scalar_where_mul_widens_it present -->
 >
 > §6's second bullet said `aten.add.Scalar` and `aten.sub.Scalar` were
 > implemented in `aten.rs` but absent from `_aten_implemented()`, which is why

@@ -292,7 +292,7 @@ torch.distributed.init_process_group(backend="local", rank=0, world_size=1,
 ```
 PYTHON=$PY sh tests/run.sh   exit 0   129 통과 (전 113, +16)
 $PY tests/golden/compare.py                 exit 0   2268/2268, ops=97 (변화 없음)
-$PY tests/verify_schemas.py  exit 0   255/255 (전 233, +22)
+$PY tests/_support/verify_schemas.py  exit 0   255/255 (전 233, +22)
 ```
 
 `verify_schemas.py` 에 `_NON_ATEN_SCHEMA_TEXT` 대조를 붙였습니다 — 22 개 스키마를 상류 레지스트리
@@ -427,7 +427,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 129
 $PY tests/golden/compare.py                        # 2268/2268 ops=97
-$PY tests/verify_schemas.py         # 255/255
+$PY tests/_support/verify_schemas.py         # 255/255
 
 # 이 문서의 판정
 PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \

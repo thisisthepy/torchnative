@@ -389,13 +389,13 @@ its *derivative*, which the golden harness does not count.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs release_values present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_tape_bytes present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs batch_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_backward_uses_the_dropout_draw_the_forward_made present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_backward_uses_the_dropout_draw_the_forward_made present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated present -->
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
 <!-- DOCWATCH: count smoke_ok ge 415 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8681 -->

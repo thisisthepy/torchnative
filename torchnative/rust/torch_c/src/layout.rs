@@ -11,7 +11,7 @@
 //! obviously so (`ge` in `logical_to_physical_perm`) is argued at its site.
 //!
 //! None of these is trusted because it reads like upstream:
-//! `tests/test_metastride.py` compares the layouts they produce against
+//! `tests/ops/test_metastride.py` compares the layouts they produce against
 //! upstream torch, run in a separate process, case by case.
 
 /// The row-major stride for a shape. `make_contiguous_strides_for`, and

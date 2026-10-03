@@ -471,7 +471,7 @@ if type(data) is torch.Tensor or type(data) is Parameter:
 | 골든 하네스 | `tests/golden/compare.py` | **0** — **1027/1027, ops covered=60**, 대기 2 (이전 490/490, 19) |
 | 골든 자가검사 | `--inject-fault value/shape/dtype` | **1 / 1 / 1** (의도대로) |
 | 호스트 스모크 | `tests/run.sh` | **0** — 54/54 (이전 34) |
-| 스키마 검증 | `tests/verify_schemas.py` | **0** — 127/127 (두 표) |
+| 스키마 검증 | `tests/_support/verify_schemas.py` | **0** — 127/127 (두 표) |
 | 사용자 API 대조 108 케이스 | 상류 torch 와 shim 을 각각 돌려 diff | **107/108 동일** (§6-1) |
 | 엄격 `import torch` | `probe.py --mode strict --target torch` | **0** |
 | 기록 `import torch` | `probe.py --mode record --target torch` | **0** |
@@ -528,7 +528,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 ./scripts/vendor/install_shim.sh                                # 빌드 + 구멍에 넣기
 $PY tests/golden/compare.py;                       echo "EXIT=$?"
-$PY tests/verify_schemas.py;        echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py;        echo "EXIT=$?"
 bash tests/run.sh;             echo "EXIT=$?"
 
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
@@ -576,8 +576,8 @@ cargo build --release --target aarch64-apple-ios
 | `torchnative/rust/torch_c/src/tensor.rs` | `requires_grad` 필드, `replace_with`, `#[new]`, `_set_tensor_class` · `promote` |
 | `torchnative/rust/torch_c/src/lib.rs` | `methods.json` 삽입, `_tensor_from_flat` 이 bool 을 정규화 |
 | `torchnative/rust/torch_c/src/overloads.json` | `zeros` 추가 |
-| `tests/verify_schemas.py` | 두 표를 모두 검증. op 이름을 **스키마에서** 유도 |
-| `tests/test_shim.py` | 34 → 54. 메서드 해석 · 인덱싱 · in-place · grad 모드 · `_make_subclass` · RNG 벽 |
+| `tests/_support/verify_schemas.py` | 두 표를 모두 검증. op 이름을 **스키마에서** 유도 |
+| `tests/_support/test_shim.py` | 34 → 54. 메서드 해석 · 인덱싱 · in-place · grad 모드 · `_make_subclass` · RNG 벽 |
 | `docs/bindings/TENSORBASE.md` | 이 문서 |
 
 벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. **`tests/golden/` 과 `docs/` 의 기존

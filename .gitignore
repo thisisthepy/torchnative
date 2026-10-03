@@ -212,7 +212,7 @@ cython_debug/
 # subagent worktrees live inside the repo
 .worktrees/
 
-# The VOICE4 (BigVGAN) assets that tests/test_voice4.py reads when
+# The VOICE4 (BigVGAN) assets that tests/models/test_voice4.py reads when
 # TORCH_C_VOICE4_ASSETS points here: model weights, the HF cache, vendored
 # third-party source and generated reference output. Large, not ours to
 # redistribute, and never tracked. The scripts that produced them were removed

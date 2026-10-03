@@ -261,7 +261,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
   **미측정**입니다.
 - **회귀 스위트에 박혀 있지 않습니다.** 위 숫자는 전부 `/Volumes/macMini/caches/ckpt-probe/`
   의 스크립트로 잰 것이고, 커밋 대상이 아닙니다(이 작업의 파일 범위가 `torchnative/rust/torch_c/src/`,
-  `tests/golden/cases.py`, 이 문서였습니다). **`tests/test_shim.py` 에 넣는 것이 다음
+  `tests/golden/cases.py`, 이 문서였습니다). **`tests/_support/test_shim.py` 에 넣는 것이 다음
   작업이고, 넣기 전까지 §1 의 어떤 성질도 회귀로부터 보호되지 않습니다.** docs/models/E2E.md 가 같은
   이유로 만들어졌던 자리입니다.
 - `serialization_id()` 는 레코드가 없으면 빈 문자열을 답합니다. 상류가 그 값을 어떻게 쓰는지는
@@ -300,7 +300,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
 §1-7 의 모든 숫자는 `/Volumes/macMini/caches/ckpt-probe/` 아래의, 커밋 대상이 아닌 스크립트
 (`make_ckpt.py`/`verify.py`/`make_hard.py`/`verify_hard.py`)로 잰 것이었다. worktree 가 정리되면
 그 스크립트도 함께 사라지고, 그때까지는 §1 의 어떤 성질도 회귀로부터 보호되지 않았다. 이 절은
-그것을 `tests/test_shim.py` 의 다섯 테스트로 옮겨 박은 기록이다. `docs/models/E2E.md` 가
+그것을 `tests/_support/test_shim.py` 의 다섯 테스트로 옮겨 박은 기록이다. `docs/models/E2E.md` 가
 샘플링 경로에 대해 이미 한 일과 같은 종류의 작업이다.
 
 ### 8.1 추가한 다섯 테스트와 각각이 잡는 것
@@ -364,8 +364,8 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
 | filled 가드 — strided gather | 연속 읽기 기대값을 `[0,1,2,3]` 대신 `[9,9,9,9]` 로 | `FAIL ...: AssertionError: [0.0, 1.0, 2.0, 3.0]` |
 | 14 개 어려운 케이스 | 비트 일치 기준(`== 0.0`)을 `== 999.0` 으로 | `FAIL ...: AssertionError: ('w_f32', 0.0)` |
 
-마지막에 `diff /tmp/test_shim.py.orig tests/test_shim.py` 로 완전히 동일함을,
-`git status --short` 로 `tests/test_shim.py` 와 `docs/models/CKPT.md` 두 파일 외에는
+마지막에 `diff /tmp/test_shim.py.orig tests/_support/test_shim.py` 로 완전히 동일함을,
+`git status --short` 로 `tests/_support/test_shim.py` 와 `docs/models/CKPT.md` 두 파일 외에는
 아무것도 바뀌지 않았음을 확인했다.
 
 **filled 가드에 대해 못 한 것.** 지시받은 것은 "가드를 우회했을 때 실제로 0.0 이 나오는 것을
@@ -380,7 +380,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
 
 ### 8.5 허용오차 근거
 
-- **로짓 비교(`torch.load` zip, safetensors 두 경로)**: `tests/test_shim.py` 에 이미 있는
+- **로짓 비교(`torch.load` zip, safetensors 두 경로)**: `tests/_support/test_shim.py` 에 이미 있는
   `_E2E_LOGIT_ATOL = 1e-5` 를 그대로 재사용했다. 새 상수를 만들지 않은 이유는 근거가 이미 같기
   때문이다 — §1 의 표가 스스로 적은 정상 범위(`2.3e-09~5.2e-06`)가 `_E2E_LOGIT_ATOL` 정의부
   주석이 `do_sample`/`greedy` 측정에서 뽑은 범위와 **동일**하고, 오늘 이 세션에서 재측정한
@@ -397,7 +397,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
 
 ### 8.6 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 tests/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
+`PYTHONPATH=<stage> python3 tests/_support/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
 
 ```
 이전 (테스트 65개)   2.09s

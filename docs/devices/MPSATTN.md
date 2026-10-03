@@ -14,7 +14,7 @@
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs softmax_on_device present -->
-<!-- DOCWATCH: symbol-in-file tests/test_mpsattn.py test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsattn.py test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream present -->
 
 ---
 
@@ -279,7 +279,7 @@ softmax 는 `exp` 하나와 리덕션 둘이므로 정확히 그 두 가지가 �
 결론냈을 것이고 아니었습니다.** 그래서
 `test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer` 를 추가했고, 같은 무력화를 다시
 걸어 그것이 실제로 빨개지는 것을 확인했습니다.
-<!-- DOCWATCH: symbol-in-file tests/test_mpsattn.py test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsattn.py test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer present -->
 
 ---
 

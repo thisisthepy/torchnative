@@ -1157,7 +1157,7 @@ scripts/wheel/build.py: .../aarch64-apple-ios/release/lib_C.dylib is stale.
 ```
 PYTHON=$PY sh tests/run.sh              ->  EXIT=0,  ok 197
 $PY tests/golden/compare.py                            ->  EXIT=0,  2811/2811, ops=119
-$PY tests/verify_schemas.py             ->  EXIT=0,  4203/4203
+$PY tests/_support/verify_schemas.py             ->  EXIT=0,  4203/4203
 $BPY scripts/wheel/build.py --self-test                  ->  EXIT=0,  8/8
 $BPY scripts/wheel/build.py                              ->  EXIT=0
 $BPY scripts/wheel/build.py --target ios-arm64           ->  EXIT=0

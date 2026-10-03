@@ -552,7 +552,7 @@ and type rather than merely being refusals of some kind.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs FLOAT8_E4M3FN_REFUSALS present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_shim_only_refusal present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/dtypes.py float8_e4m3fn present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py _FLOAT8_TRANSCRIBED present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _FLOAT8_TRANSCRIBED present -->
 
 ---
 

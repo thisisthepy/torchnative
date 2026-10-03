@@ -201,7 +201,7 @@ mul(...)                          -> NotImplementedError:
 
 ## 5. 두 장치가 검사받는 방식이 다르다 — 그리고 그래야 한다
 
-`tests/test_shim.py` 에 11개가 늘었습니다. 두 묶음이 **서로 다른 성질**을 단언합니다.
+`tests/_support/test_shim.py` 에 11개가 늘었습니다. 두 묶음이 **서로 다른 성질**을 단언합니다.
 
 | 테스트 | 무엇을 단언하는가 |
 |---|---|
@@ -255,7 +255,7 @@ vulkan 테스트 넷이 전부 스킵됩니다.** macOS 의 SIP 가 보호된 �
 ```sh
 V=~/Library/Android/sdk/emulator/lib64/vulkan
 env DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
-    PYTHONPATH=<stage> $PY tests/test_shim.py
+    PYTHONPATH=<stage> $PY tests/_support/test_shim.py
 ```
 
 `run.sh` 는 이 라운드의 담당 범위가 아니라 고치지 않았습니다. 고친다면 `run.sh` 가 파이썬을

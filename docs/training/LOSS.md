@@ -616,7 +616,7 @@ gap an op scan cannot see. None of them was implemented here: the brief's bar fo
 gradient.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _PROFILER_MARKERS present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one present -->
 <!-- DOCWATCH: op-not-implemented aten.lerp_.Scalar -->
 <!-- DOCWATCH: op-not-implemented aten.addcmul_.default -->
 <!-- DOCWATCH: op-not-implemented aten.addcdiv_.default -->
@@ -737,7 +737,7 @@ falcon, vits               aten.add_.Tensor                   in place
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: hasattr native_dropout true -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs native_dropout_default present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_capture_takes_the_functional_dropout_and_only_inside_a_region present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_capture_takes_the_functional_dropout_and_only_inside_a_region present -->
 
 ---
 
@@ -914,7 +914,7 @@ sh /tmp/loss/sab.sh <tag> /tmp/loss/faults/<tag>.py
 # §10 gates
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/train/sweeptrain.py /tmp/loss/F/tr    ;  $SHIM /tmp/k26/sweep26.py /tmp/loss/F/ev
 $SHIM /tmp/loss/seqlen.py f32                    ;  $SHIM /tmp/loss/seqlen.py bf16
 ```

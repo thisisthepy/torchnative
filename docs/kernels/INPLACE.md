@@ -241,7 +241,7 @@ return value -- shared machinery `exp__cases`/`neg__cases` already use), and a
 shape, `select.int` on a 2-D base). `detach_` has no builder -- it has no kernel, so it is not in
 `_aten_implemented()`, and the harness's coverage rule only requires a builder for what is.
 
-`tests/test_shim.py::test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree`
+`tests/_support/test_shim.py::test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree`
 (the §9 road script) used three of the 15 kernel-less names (`sqrt_`/`abs_`/`tanh_`) as its
 "still refused, by exact key" regression pin. Implementing 14 of the 15 turned that pin red by
 construction -- not a defect, the premise the pin was checking (no kernel) stopped being true.
@@ -307,7 +307,7 @@ number, following the pattern every earlier round in this file already uses):
 `torchnative/rust/torch_c/src/aten.rs` (14 kernels + `IMPLEMENTED` entries + `detach_inplace_refusal` +
 dispatch wiring), `torchnative/rust/torch_c/src/methods.json` / `overloads.json` (15 spellings + 1 function
 spelling for `native_group_norm`), `tests/golden/cases.py` (14 case builders + 14
-`_view_write_cases` entries), `tests/test_shim.py` (two counters updated, one
+`_view_write_cases` entries), `tests/_support/test_shim.py` (two counters updated, one
 road script/test extended).
 
 **Not touched**: `capture.rs` (§4 -- the name rule already covered the new ops),

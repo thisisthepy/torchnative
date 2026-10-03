@@ -354,7 +354,7 @@ aten.mul.Scalar: torch.bool operands are logical, not arithmetic, in torch
 사유를 문자열로 단언한다 — `.Scalar` 메시지에 `"logical"` 이 다시 나타나면 실패하고,
 `div.Tensor` 메시지가 "상류도 거부한다" 로 돌아가도 실패한다.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason present -->
 <!-- DOCWATCH: op-implemented aten.add.Scalar -->
 <!-- DOCWATCH: op-implemented aten.sub.Scalar -->
 

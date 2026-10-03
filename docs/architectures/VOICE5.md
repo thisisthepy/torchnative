@@ -36,7 +36,7 @@ Three objections. Each was checked rather than assumed:
 
 | objection | status now |
 |---|---|
-| "cannot be scored" | **False, and was already false.** `tests/agree2_scores.json` records `higgs_audio_v2` at `rel` 2.854e-07 against an `oracle_rel` of 3.111e-07 over n=16384 logits, `self_repeat_rel` 0.0, `missing: []`, `unexpected: []`. That is a *shrunk config with random weights* (`tests/agree_sweep.py`'s stated limit), so it says the arithmetic agrees, not that the model runs — which is precisely the gap this round closes. |
+| "cannot be scored" | **False, and was already false.** `tests/_support/agree2_scores.json` records `higgs_audio_v2` at `rel` 2.854e-07 against an `oracle_rel` of 3.111e-07 over n=16384 logits, `self_repeat_rel` 0.0, `missing: []`, `unexpected: []`. That is a *shrunk config with random weights* (`tests/_support/agree_sweep.py`'s stated limit), so it says the arithmetic agrees, not that the model runs — which is precisely the gap this round closes. |
 | "`generate` is nondeterministic" | **A property of the call, not the model.** This checkpoint's `generation_config.json` ships `do_sample: true, temperature: 1.0, top_k: 50, top_p: 0.95`; every one is overridden here. §2 lists what was pinned. |
 | "tens of gigabytes" | **Stands, and is a constraint rather than a reason to stop.** 11.5 GB + 806 MB, onto the external disk. §2.1. |
 
@@ -238,7 +238,7 @@ is **not** adopted, so the size and itemsize checks below are unchanged.
 
 ## 6. The measurement
 
-`tests/higgs_e2e.json` is the record; `higgs_e2e.py` regenerates it (nine runs,
+`tests/_support/higgs_e2e.json` is the record; `higgs_e2e.py` regenerates it (nine runs,
 about fifteen minutes, not wired into `run.sh`).
 
 ### 6.1 The waveform
@@ -389,14 +389,14 @@ number has to be nailed to something outside the derivation.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reduced_dims present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs refuse_duplicate_dims present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py norm_except_dim present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_higgs_reached_audio_under_the_shim present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_weight_norm_wall_reports_itself_and_not_a_typeerror present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_greedy_trajectory_diverges_at_an_exact_bfloat16_TIE present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_read_only_storage_refusal_survives_the_deepcopy_fix present -->
-<!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_torchaudio_stub_was_never_called present -->
-<!-- DOCWATCH: symbol-in-file tests/higgs_e2e.py CONVERSATION present -->
-<!-- DOCWATCH: json-key tests/higgs_e2e.json waveform present -->
-<!-- DOCWATCH: json-key tests/higgs_e2e.json trajectory present -->
-<!-- DOCWATCH: json-key tests/higgs_e2e.json pinned present -->
-<!-- DOCWATCH: json-key tests/higgs_e2e.json logits present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_higgs_reached_audio_under_the_shim present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_weight_norm_wall_reports_itself_and_not_a_typeerror present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_greedy_trajectory_diverges_at_an_exact_bfloat16_TIE present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_read_only_storage_refusal_survives_the_deepcopy_fix present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_higgs.py test_the_torchaudio_stub_was_never_called present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/higgs_e2e.py CONVERSATION present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json waveform present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json trajectory present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json pinned present -->
+<!-- DOCWATCH: json-key tests/_support/higgs_e2e.json logits present -->

@@ -229,10 +229,10 @@ It is recorded rather than fixed.
 ## 4. What is guarded
 
 `test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config` in
-`tests/test_shim.py`, running on the local 2-layer tied fixture in a
+`tests/_support/test_shim.py`, running on the local 2-layer tied fixture in a
 subprocess (the existing `_hfquant_fixture` harness, one new mode).
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config present -->
 
 | assertion | what it would catch |
 |---|---|

@@ -282,5 +282,5 @@ this round's, in either direction. With the variable set, this worktree's artefa
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs check_constants_are_fresh present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs const_stamps present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs STORAGE_VERSIONS present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_constant_version_check_sees_a_write_through_a_view present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_constant_version_check_sees_a_write_through_a_view present -->

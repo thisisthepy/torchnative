@@ -24,7 +24,7 @@
 #   vendor/int8-candle-0.11.0-cpu.patch, applied with `git apply`. (The name
 #   says `cpu` for where the work started; the file has carried Metal counters
 #   and now Metal `I8` for some time. It is quoted by docs/numerics/INT8.md
-#   §1.2 and tests/test_int8.py, so it is left alone.)
+#   §1.2 and tests/numerics/test_int8.py, so it is left alone.)
 #
 #   candle-metal-kernels 0.11.0, pinned by the sha256 the lock already
 #   recorded, plus vendor/int8-candle-metal-kernels-0.11.0.patch.
@@ -42,7 +42,7 @@
 # the first one missed fails on every machine but the one that ran it, which is
 # the defect this replaces. Committed, a fresh clone builds with plain `cargo
 # build`. The cost, a copy that could drift from its two inputs, is what
-# `--check` answers, and tests/test_int8.py runs it in the gate.
+# `--check` answers, and tests/numerics/test_int8.py runs it in the gate.
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)

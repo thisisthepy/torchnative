@@ -31,7 +31,7 @@
     "  * everything not measured as used stays a raising stub.",
     "",
     "Provenance: every string is `str(torch.ops.aten.<op>.<ov>._schema)` from",
-    "torch 2.13.0, transcribed. `tests/verify_schemas.py` re-derives both",
+    "torch 2.13.0, transcribed. `tests/_support/verify_schemas.py` re-derives both",
     "tables from an installed upstream torch and diffs, so a transcription",
     "slip or an upstream drift fails loudly instead of silently binding the",
     "wrong overload.",

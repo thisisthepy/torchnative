@@ -348,7 +348,7 @@ tell them nothing is there.
   closing §3.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs set_size_class present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams present -->
 <!-- DOCWATCH: op-implemented aten.mul.Scalar -->
 <!-- DOCWATCH: op-implemented aten.add.Scalar -->
 <!-- DOCWATCH: op-implemented aten.rsub.Scalar -->

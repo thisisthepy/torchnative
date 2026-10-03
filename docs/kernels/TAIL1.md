@@ -270,7 +270,7 @@ implementation differs.
   <!-- DOCWATCH: count golden_ops_covered ge 233 -->
   <!-- DOCWATCH: count golden_pending eq 0 -->
   9360 cases pass of 9360, 233 ops covered, 0 pending builders.
-* **`tests/test_tail1.py`**, a new suite file (`run.sh` globs `tests/test_*.py`; the file
+* **`tests/ops/test_tail1.py`**, a new suite file (`run.sh` finds every `test_*.py` under `tests/`; the file
   shares helpers with `test_shim` the way `test_split_probe.py` does).
 * Three pinned counts in `test_shim.py` moved and each carries the arithmetic that keeps it a
   check: `tag_core_count` 110 → 112 (`acos` and `logical_and` are the only two of the nine that
@@ -321,7 +321,7 @@ round was given.
 
 ## 7. The sweep after
 
-`tests/arch_sweep.py`, re-run. What the nine ops actually move:
+`tests/_support/arch_sweep.py`, re-run. What the nine ops actually move:
 
 * **`gemma3n_text`** clears `broadcast_tensors`.
 * **`longt5`** clears `logical_and`. **`yoso`** clears `acos`. **`canine`** clears `max_pool1d`.

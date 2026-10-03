@@ -48,7 +48,7 @@ The approved root entries:
 | Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/`, `vendor/` |
 | Git-ignored | `.caches/`, `.scratch/` (torchnative's temporary-file directory, in the role python-multiplatform gives its .tmp directory), `.worktrees/` |
 
-`tests/test_layout.py`
+`tests/release/test_layout.py`
 runs in the gate and compares `git ls-files`'s top-level names, plus whichever of the git-ignored
 three are present, against this table, so an unapproved entry turns the gate red. Change the table
 and the test's list together, and only with approval.
@@ -199,7 +199,19 @@ torchnative/rust/vulkan_probe/   standalone Vulkan probe crate
 torchnative/rust/wasm_probe/     standalone wasm probe crate
 torchnative/python/torchnative/    the Python package (quant, export, adapt, delta, device, ...)
 torchnative/python/torch/          upstream's VENDORED tree: generated, git-ignored, never edit it
-tests/                 the gate (run.sh) and its suites, test_*.py
+tests/                 the gate (run.sh, suite_ledger.py); suites are test_*.py in function folders:
+tests/ops/             operator kernels (complex, fft, scatter, pad, tail*, meta kernels)
+tests/bindings/        torch._C binding surface and dispatcher-key queries (bind*, argform, setitem)
+tests/models/          whole-model agreement and generate (qwen3, higgs, voice, continuous batching)
+tests/devices/         device backends: mps/ vulkan/ cuda/ npu/ qnn/ coreml/ (+ dtype x device matrix)
+tests/numerics/        agreement sweeps and tolerances (agree, int8, remeasure)
+tests/export/          torch.export walls
+tests/training/        backward, adapt stages
+tests/distributed/     collectives, gloo oracle
+tests/api/             `import torchnative` surface
+tests/release/         publish, wheel, layout, docrefs, release consistency
+tests/gate/            the gate's own machinery (ledger, locks, skip visibility)
+tests/_support/        shared helpers on PYTHONPATH (test_shim, _skip, sweeps, fixtures); never add a suite elsewhere
 tests/golden/          value-comparison harness against upstream
 tests/docwatch/        the documentation checker (DOCWATCH)
 tests/bench/               measurement harnesses
@@ -261,7 +273,7 @@ TORCHNATIVE_VULKAN_DYLD="$HOME/Library/Android/sdk/emulator/lib64/vulkan" \
 VK_DRIVER_FILES="$HOME/Library/Android/sdk/emulator/lib64/vulkan/libkosmickrisp_icd.json"
 ```
 
-**What the gate runs:** crate unit tests → every Python suite in `tests/` (43 files
+**What the gate runs:** crate unit tests → every Python suite under `tests/` (`find tests -name test_*.py`; 43 files
 at the time `CLAUDE.md` recorded the baseline) → golden self-test → the documentation checker
 (DOCWATCH, over `docs/**/*.md` and `README.md`).
 

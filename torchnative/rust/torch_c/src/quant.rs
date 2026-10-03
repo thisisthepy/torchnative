@@ -19,7 +19,7 @@
 //!
 //! The verification axis is docs/graph/QUANT2.md §2 and it is not a tolerance: the
 //! Q8_0 and Q4_0 quantisers are reimplemented from the format in
-//! `tests/ggml_ref.py` and the blob compared **byte for byte**, and the
+//! `tests/_support/ggml_ref.py` and the blob compared **byte for byte**, and the
 //! dequantiser is reimplemented for those two plus Q4K and the reconstruction
 //! compared **bit for bit** as `float32`. What is left to a bound is only the
 //! part that is genuinely lossy, and that bound has a floor as well as a
@@ -167,7 +167,7 @@ fn quantize(py: Python<'_>, tensor: PyTensorBase, format: &str) -> PyResult<Py<P
 /// `_C._dequantize(t)` -- back to a dense `float32` tensor.
 ///
 /// This is the round trip the verification axis is built on: it is
-/// deterministic, it needs no model, and `tests/ggml_ref.py` reimplements it
+/// deterministic, it needs no model, and `tests/_support/ggml_ref.py` reimplements it
 /// from the format so the comparison is against an independent derivation
 /// rather than against candle restating itself.
 #[pyfunction]
@@ -206,7 +206,7 @@ fn quantized_nbytes(tensor: PyTensorBase) -> PyResult<usize> {
 /// `_C._quantized_blob(t)` -- the raw GGML bytes.
 ///
 /// **This exists for the verification axis and nothing else.** It is what lets
-/// `tests/ggml_ref.py` compare candle's quantiser against an independent
+/// `tests/_support/ggml_ref.py` compare candle's quantiser against an independent
 /// reimplementation *byte for byte* rather than through a tolerance on the
 /// reconstruction, which is the difference between checking the format and
 /// checking that two lossy things are near each other. docs/graph/QUANT2.md §2.1.

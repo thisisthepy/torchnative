@@ -18,12 +18,12 @@
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 19 -->
-<!-- DOCWATCH: symbol-in-file tests/vulkan_coverage.py UNVERIFIED present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/vulkan_coverage.py UNVERIFIED present -->
 <!-- DOCWATCH: symbol-in-file tests/run.sh vulkan_coverage.py present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs MVK_CONFIG_FAST_MATH_ENABLED present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs loader_candidates_for present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be present -->
 
 위의 `count vulkan_tests_ok` 마커는 **로더가 없는 기계에서는 PASS 가 아니라 SKIP** 으로 보고됩니다
 (§2.3). 이 문서의 일치 주장은 그 기계에서 확인된 적이 없다는 뜻이고, DOCWATCH 출력이 그렇게 말합니다.
@@ -106,7 +106,7 @@ MoltenVK 는 **portability 드라이버**라서, 로더가 `VK_KHR_portability_e
 
 ### 2.2 이제 건너뜀은 세 번째 결과다
 
-`tests/vulkan_coverage.py`:
+`tests/_support/vulkan_coverage.py`:
 
 - 테스트의 건너뜀 도우미가 `vulkan_skip(reason)` 을 기록하고, 러너는 그 테스트에 대해 `ok` 대신
   **`SKIP test_x: <로더 자신의 문구>`** 를 찍습니다.

@@ -2,7 +2,7 @@
 
 Worktree `work/pad` on develop. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `methods.json`, `overloads.json`, `tests/golden/cases.py`, and the new
-`tests/test_pad.py`. `bootstrap.py`, `tensor.rs`, `dtype.rs`,
+`tests/ops/test_pad.py`. `bootstrap.py`, `tensor.rs`, `dtype.rs`,
 `device.rs`, `capture.rs`, `tape.rs`, `scripts/wheel/` and `torchnative/` were
 not touched. Two files outside that list were edited and both are named with
 their reasons in §6.
@@ -30,7 +30,7 @@ Landed, split the way docs/architectures/VOICE.md §3 asks for rather than as on
 * **feature added** — 7 kernels: 6 padding
   (`reflection_pad{1,2,3}d`, `replication_pad{1,2,3}d`, one shared gather) and
   `rms_norm` (§8).
-* **tests added** — 23 in `tests/test_pad.py`; 169 golden cases (9691 → 9860).
+* **tests added** — 23 in `tests/ops/test_pad.py`; 169 golden cases (9691 → 9860).
 * **defect fixed** — none; nothing here existed to be broken.
 * **not done** — `circular` (§3), the `bootstrap.py` binding (§5), and the four
   other voice ops (§9).
@@ -283,7 +283,7 @@ accept combinations upstream rejects.
 Whoever lands this should then **delete the six
 `aten.*_pad*d.default` entries from `tests/golden/reach_allow.json`** — they
 are written to fail the suite the moment the binding lands — and re-run
-`tests/arch_sweep.py`, since `univnet` (docs/architectures/ARCH100.md lists `_nn.pad` as
+`tests/_support/arch_sweep.py`, since `univnet` (docs/architectures/ARCH100.md lists `_nn.pad` as
 its wall) and docs/architectures/VOICE.md ranks 12 and 13 only clear at that point. **Until
 then, "four speech models clear `F.pad`" is not true end-to-end**; what is true
 is that the kernels they need exist and are golden-compared, and the remaining
@@ -291,7 +291,7 @@ step is binding surface, not numerics.
 
 ## 6. The two files edited outside the stated territory, and why
 
-* **`tests/test_shim.py`** — one pinned count,
+* **`tests/_support/test_shim.py`** — one pinned count,
   `tag_core_count`, 117 → 122. This is the one edit the round's rules allow
   there, and the arithmetic is what keeps it a check: **the delta is five, not
   six.** `replication_pad1d` is `['pt2_compliant_tag']` upstream while

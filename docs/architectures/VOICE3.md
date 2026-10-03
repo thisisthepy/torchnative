@@ -49,7 +49,7 @@ core while `std.correction`, which this shim implements with the *same function*
 
 ## 1. What cleared
 
-`tests/arch_sweep.py --only rwkv vilt llama4 gemma3n_text`, both sides. Upstream is 4/4.
+`tests/_support/arch_sweep.py --only rwkv vilt llama4 gemma3n_text`, both sides. Upstream is 4/4.
 
 | architecture | before | after |
 |---|---|---|
@@ -376,6 +376,6 @@ No timings: four other agents were running (docs/perf/PERF.md's rule).
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs kaiser_window_default present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_reduce present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs col2im_default present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_i0_is_bit_identical_to_upstream_across_the_whole_range present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_col2im_sums_overlapping_windows_rather_than_overwriting present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_var_and_std_clamp_the_divisor_at_zero_so_an_overshoot_is_inf_not_nan present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice3.py test_i0_is_bit_identical_to_upstream_across_the_whole_range present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice3.py test_col2im_sums_overlapping_windows_rather_than_overwriting present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice3.py test_var_and_std_clamp_the_divisor_at_zero_so_an_overshoot_is_inf_not_nan present -->

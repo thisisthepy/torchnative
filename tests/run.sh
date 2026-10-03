@@ -39,10 +39,10 @@ stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage-$(printf '%s' "$repo_root" 
 #
 # The package list is not guessed. It is every third-party (non-stdlib,
 # non-local) top-level import actually reached by the suites under the *same*
-# interpreter that runs them, derived by inspecting tests/*.py:
+# interpreter that runs them, derived by inspecting tests/**/*.py:
 #
 #   grep -hoE '^(import [A-Za-z0-9_.]+|from [A-Za-z0-9_.]+ import)' \
-#       tests/test_*.py tests/test_shim.py \
+#       tests/**/test_*.py \
 #       | sed -E 's/^(import|from) //; s/ import$//; s/\..*$//' | sort -u
 #
 # and then reading each non-stdlib hit in context to exclude the ones that are
@@ -303,7 +303,8 @@ fi
 # these are pure-Rust assertions over constant tables with no Python involved.
 cargo test --release --quiet || exit $?
 
-# Every `test_*.py` in `tests/`, not just `test_shim.py`.
+# Every `test_*.py` under `tests/` (function subfolders: ops/, bindings/, devices/...),
+# not just `test_shim.py`.
 #
 # One file was the whole suite for a long time, and the cost showed up in
 # merges rather than in tests: several rounds land in parallel, all of them
@@ -313,7 +314,7 @@ cargo test --release --quiet || exit $?
 # them, caught only because DOCWATCH markers named them.
 #
 # Splitting by topic makes those merges disjoint. The files share helpers by
-# importing `test_shim`, which is why `tests/` is on PYTHONPATH; each one's
+# importing `test_shim`, which is why `tests/_support/` is on PYTHONPATH; each one's
 # `__main__` guard keeps that import from running anything.
 # `TORCHNATIVE_VULKAN_DYLD`: an opt-in way to let the vulkan tests actually run.
 #
@@ -363,10 +364,10 @@ mkdir -p "$suite_logs"
 "${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
     --logs "$suite_logs" --pytests "$tests_dir" \
     --python "${PYTHON:-python3}" \
-    --suite-env "PYTHONPATH=$stage:$tests_dir" \
+    --suite-env "PYTHONPATH=$stage:$tests_dir/_support" \
     ${vk_env:+--suite-env "$vk_env"} \
-    -- "$tests_dir"/test_*.py || suite_failed=1
-"${PYTHON:-python3}" "$tests_dir/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+    -- $(find "$tests_dir" -name 'test_*.py' -not -path '*/__pycache__/*' | sort) || suite_failed=1
+"${PYTHON:-python3}" "$tests_dir/_support/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
 [ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a

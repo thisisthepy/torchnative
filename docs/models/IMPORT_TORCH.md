@@ -574,7 +574,7 @@ bash tests/run.sh; echo "EXIT=$?"
 | `torchnative/rust/torch_c/src/tensor.rs` | dtype 태그 필드, bool 단일 생성자와 불변식 검사, bool `tolist` |
 | `torchnative/rust/torch_c/src/aten.rs` | `checked_convert`(골든 버그 2 종), bool 팩토리, 태그 기준 dtype 비교 |
 | `torchnative/rust/torch_c/src/lib.rs` | 부트스트랩 실행, `_tensor_from_flat` 의 bool 거부 |
-| `tests/test_shim.py` | 13 → 27 개. 승격 메시지 단언을 torch 철자로 |
+| `tests/_support/test_shim.py` | 13 → 27 개. 승격 메시지 단언을 torch 철자로 |
 | `scripts/vendor/gen_surface.py` | **신규** — `.pyi` + 트리 스캔 → `surface.json` |
 
 **벤더링 트리의 파이썬 소스는 여전히 한 줄도 고치지 않았습니다.** `docs/` 의 다른 파일도

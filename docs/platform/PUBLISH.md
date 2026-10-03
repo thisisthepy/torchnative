@@ -60,7 +60,7 @@ Everything else is kept, including every subdirectory of `docs/`. That matters
 for one directory in particular: **`docs/guide/` is the GitHub Pages site**, and
 `.github/workflows/pages.yml` deploys it from `main`. A layout that dropped it
 would empty the published site while every check on `develop` stayed green.
-`tests/test_publish.py` therefore runs the real `sync-release.sh` over the real
+`tests/release/test_publish.py` therefore runs the real `sync-release.sh` over the real
 tree and asserts that `docs/guide/index.html` and every other file under
 `docs/guide/` reach `release`, and it runs a deliberately broken copy of the
 script to prove that assertion can fail (AGENTS.md §17.5).
@@ -92,7 +92,7 @@ left as history.
 | Check | What it can see |
 |---|---|
 | `.github/scripts/release/test-sync-release.sh` | the regeneration mechanics in a throwaway repository under `.scratch/`: what is dropped and kept, one commit over the source, no-op runs, the diverged-`main` second parent, `--push` with `--force-with-lease`, refusal while `release` is checked out |
-| `tests/test_publish.py` | the real tree: `docs/guide/` survives the main-only layout, and the workflow set is the named one |
+| `tests/release/test_publish.py` | the real tree: `docs/guide/` survives the main-only layout, and the workflow set is the named one |
 
 Neither check builds a wheel from the `release` tree; the wheel is built and
 published from a `v*` tag by `publish-pypi.yml` (`docs/platform/PUBLISH_CI.md`).

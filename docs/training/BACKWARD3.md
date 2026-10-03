@@ -203,7 +203,7 @@ become false under W4, so if that path ever opens it belongs in this argument.
 
 ### 2.3 What this repo's suite depends on
 
-One assertion, and it is deliberate. `tests/test_shim.py:405`, inside
+One assertion, and it is deliberate. `tests/_support/test_shim.py:405`, inside
 `test_the_autograd_boundary_is_where_autograd_md_says_it_is`:
 
 ```python
@@ -345,7 +345,7 @@ inverting it is the right response. That is the same convention
 `test_the_autograd_boundary_is_where_autograd_md_says_it_is` uses and the reason that test survived
 `docs/training/BACKWARD.md` landing a backward.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_backward_seed_is_absent_and_nothing_guesses_a_one present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_backward_seed_is_absent_and_nothing_guesses_a_one present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_autograd_shape present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs reachable present -->
 

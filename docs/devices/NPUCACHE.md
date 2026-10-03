@@ -6,7 +6,7 @@ model survives the process. The house rule is *where* — this repository had no
 cache-path convention before this round, so whatever was chosen here becomes the
 answer the QNN and CoreML caches inherit.
 
-Evidence: `tests/test_ovcache.py`. Implementation:
+Evidence: `tests/devices/npu/test_ovcache.py`. Implementation:
 `torchnative/python/torchnative/_cachedir.py` (the path) and
 `torchnative/python/torchnative/export/intelnpu.py` (the property).
 

@@ -16,12 +16,12 @@
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py DEVICE_DIR present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py fastrpc_nodes present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py SOC_TABLE_UNAVAILABLE present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_a_real_checkpoint_still_generates_with_a_submodule_delegated present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_the_qnn_module_refuses_the_very_file_the_generic_one_runs present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_no_claim_is_made_that_anything_ran_on_an_npu present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_an_artefact_built_for_the_wrong_silicon_is_refused_before_it_is_pushed present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_a_real_checkpoint_still_generates_with_a_submodule_delegated present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_the_qnn_module_refuses_the_very_file_the_generic_one_runs present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_no_claim_is_made_that_anything_ran_on_an_npu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_an_artefact_built_for_the_wrong_silicon_is_refused_before_it_is_pushed present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset present -->
 
 ## 0. At a glance
 
@@ -33,7 +33,7 @@
 | Does an artefact load and run and agree with upstream? | **Yes** — the *XNNPACK control*, at a derived tolerance, ratio 0.16 (§7) |
 | Did anything run on a Hexagon NPU? | **No, and this round cannot claim it did.** §6.4 |
 | Was a Snapdragon device attached? | **Not at first.** One appeared mid-round and steps 1-3 of §5 were run against it, read-only: **SM8550, HTP v73** (§5.1) |
-| New tests | 19, `tests/test_qnn.py` |
+| New tests | 19, `tests/devices/qnn/test_qnn.py` |
 | Nullifications attempted / uncaught | **7 / 1**, and the uncaught one found a real hole (§8.3) |
 | Defects found | **1** — an absent SoC table reported as an unrecognised chipset, found by running against real silicon (§5.1) |
 | Rust changed | **none**, so golden is required to be exactly unmoved (§9) |
@@ -900,7 +900,7 @@ with a false reason is counted as a pass).
 ```text
  M torchnative/python/torchnative/export/__init__.py
 ?? docs/devices/QNN.md
-?? tests/test_qnn.py
+?? tests/devices/qnn/test_qnn.py
 ?? torchnative/python/torchnative/export/npu.py
 ?? torchnative/python/torchnative/export/qnn.py
 ?? torchnative/python/torchnative/export/qnn_device.py

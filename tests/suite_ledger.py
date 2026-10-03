@@ -26,7 +26,7 @@ is simply absent, and no count is ever compared with anything.
 So the loop moved here, where the accounting can exist:
 
 * **Every suite file is accounted for.** The caller passes its glob expansion;
-  this script *independently* globs `test_*.py` in the pytests directory and
+  this script *independently* walks `test_*.py` under the pytests directory (recursively) and
   refuses if the two sets differ. A suite that silently stopped running is
   then arithmetic (`suites=83/84`, named) rather than absence.
 * **A lost or unreadable log fails loudly, naming the suite.** Not `cat:` on
@@ -110,8 +110,28 @@ def main(argv=None):
     # 1. The caller's list against the directory. A suite that stopped being
     #    run -- a half-expanded glob, a file renamed out of the pattern -- is
     #    invisible from inside the loop, so it is checked before the loop.
-    on_disk = sorted(p.name for p in Path(args.pytests).glob("test_*.py"))
-    listed = sorted(p.name for p in given)
+    #    Suites live in function subfolders (tests/ops/, tests/devices/mps/,
+    #    ...), so the directory is walked recursively and suites are compared
+    #    by path relative to it. Logs and the ledger are still keyed by the
+    #    file's basename, which is what a reader recognises -- so a basename
+    #    that occurs twice is refused: two suites would share one log.
+    root = Path(args.pytests).resolve()
+
+    def _rel(p):
+        try:
+            return p.resolve().relative_to(root).as_posix()
+        except ValueError:
+            return p.name
+
+    on_disk = sorted(_rel(p) for p in root.rglob("test_*.py")
+                     if "__pycache__" not in p.parts)
+    listed = sorted(_rel(p) for p in given)
+    for label, names in (("on disk", on_disk), ("listed", listed)):
+        base = [n.rsplit("/", 1)[-1] for n in names]
+        dup = sorted({b for b in base if base.count(b) > 1})
+        if dup:
+            problems.append("suite basenames %s are not unique (%s): their "
+                            "logs would collide" % (label, ", ".join(dup)))
     if listed != on_disk:
         missing = [n for n in on_disk if n not in listed]
         extra = [n for n in listed if n not in on_disk]

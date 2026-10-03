@@ -347,7 +347,7 @@ shim mirrors it; where it does not, neither does this.
 
 ---
 
-## 6. Tests — `tests/test_metaemb.py`
+## 6. Tests — `tests/ops/test_metaemb.py`
 
 20 test functions over a single probe of **~290 recorded cases**, run in two subprocesses
 (shim / upstream) and diffed key by key.
@@ -547,9 +547,9 @@ adding an op without a case.
 <!-- DOCWATCH: op-implemented aten.index.Tensor -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs meta_values_indices present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mm_shape_refusal present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_index_half_is_int64_whatever_the_input_dtype_was present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_value_half_keeps_the_inputs_own_dtype_and_does_not_widen present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_three_data_dependent_ops_refuse_by_name_with_the_reason present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_thirteen_upstream_self_disagreements_are_followed_to_the_dense_side present -->
-<!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_every_op_this_round_gave_a_meta_kernel_is_already_a_dense_op present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_index_half_is_int64_whatever_the_input_dtype_was present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_value_half_keeps_the_inputs_own_dtype_and_does_not_widen present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_three_data_dependent_ops_refuse_by_name_with_the_reason present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_the_thirteen_upstream_self_disagreements_are_followed_to_the_dense_side present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_metaemb.py test_every_op_this_round_gave_a_meta_kernel_is_already_a_dense_op present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->

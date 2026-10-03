@@ -9,7 +9,7 @@ CPython 3.13, upstream torch 2.13.0, `candle-core` 0.11.0.
 **exactly which further complex ops two architectures still stop on** — and
 this round taught those.
 
-The proof is `tests/test_cplx2.py`: ten tests, every value
+The proof is `tests/ops/test_cplx2.py`: ten tests, every value
 compared element-wise against a live upstream torch in a separate process, on
 **both** components.
 
@@ -129,7 +129,7 @@ Worth naming, because each one returns the right shape and the right dtype:
 
 ## 2. The bar: proving the imaginary part survives
 
-Every positive assertion in `tests/test_cplx2.py` is:
+Every positive assertion in `tests/ops/test_cplx2.py` is:
 
 1. reported through `torch.view_as_real(z).tolist()` — the only spelling that
    shows **both** halves. `.real` alone is precisely the read that cannot see
@@ -477,7 +477,7 @@ to be *written down* rather than inferred from the absence of a row.
 | **functionality added** | 5 ops: `_to_copy` (real→complex and complex→complex), `slice.Tensor`, `constant_pad_nd`, `view`/`_unsafe_view`, `complex` |
 | **architectures moved** | **1** — `llama4`'s full vision tower, measured directly and element-wise (§5). `fnet` **not** claimed (§6) |
 | **defects fixed** | none. Nothing found wrong in existing code this round |
-| **tests added** | `tests/test_cplx2.py`, 10 tests. Nine of the ten are element-wise comparisons against a live upstream; one is the refusal sweep. **Four of them were shown red by nullification** (§2.3) |
+| **tests added** | `tests/ops/test_cplx2.py`, 10 tests. Nine of the ten are element-wise comparisons against a live upstream; one is the refusal sweep. **Four of them were shown red by nullification** (§2.3) |
 | **tests inverted** | 1 — `slice` out of `test_complex.py`'s untaught-op sweep, with the coverage moved rather than dropped (§3.1) |
 | **documentation** | this file. `docs/bindings/BIND3.md` §5 and §6 are now partly superseded and say so from here rather than being edited, since they are a record of what that round measured |
 | **deleted** | nothing |

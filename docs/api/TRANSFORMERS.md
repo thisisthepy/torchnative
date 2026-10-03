@@ -5,12 +5,12 @@
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/transformers/__init__.py UnsupportedArgument present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/transformers/__init__.py _refuse_unsupported present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/transformers/__init__.py _auto_classes present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_the_family_is_enumerated_not_hand_listed present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_from_config_returns_a_real_nn_module_that_backprops present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_export_refuses_by_name present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_load_in_4bit_refuses_by_name present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_the_refusals_come_before_any_resolution present -->
-<!-- DOCWATCH: symbol-in-file tests/test_tntransformers.py test_the_reverse_order_is_not_detected_and_this_measures_that present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_the_family_is_enumerated_not_hand_listed present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_from_config_returns_a_real_nn_module_that_backprops present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_export_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_load_in_4bit_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_the_refusals_come_before_any_resolution present -->
+<!-- DOCWATCH: symbol-in-file tests/api/test_tntransformers.py test_the_reverse_order_is_not_detected_and_this_measures_that present -->
 
 ## 0. The diff this API exists to be
 

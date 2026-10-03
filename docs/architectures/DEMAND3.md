@@ -156,7 +156,7 @@ SUMMARY: 8126/8126 cases passed, 0 failed, ops covered=185, pending case builder
 $ $PY tests/golden/compare.py --self-test
 SELF-TEST: PASS -- 21 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 
-$ $PY tests/verify_schemas.py
+$ $PY tests/_support/verify_schemas.py
 SUMMARY: 4574/4574 table entries matched upstream, 0 failed
 ```
 

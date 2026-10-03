@@ -181,7 +181,7 @@ os.environ.setdefault("PYTORCH_JIT", "0")
 
 `setdefault`, not an unconditional set: a caller who exports `PYTORCH_JIT=1` explicitly still
 reaches the real (`NotImplementedError`-naming) path. Verified in both directions —
-`tests/test_shim.py`:
+`tests/_support/test_shim.py`:
 
 * `test_torch_jit_script_defaults_to_returning_the_original_function` — subprocess with
   `PYTORCH_JIT` unset, vendored `torch` on `PYTHONPATH`: `torch.jit.script(f) is f`,
@@ -197,7 +197,7 @@ reaches the real (`NotImplementedError`-naming) path. Verified in both direction
   `from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeForCausalLM`
   succeeds. (Import only — §6 covers why this test does not also construct the model.)
 
-All three added at the end of `tests/test_shim.py`; `_main()` picks up every
+All three added at the end of `tests/_support/test_shim.py`; `_main()` picks up every
 `test_*` in `globals()`, so no registration step was needed. 245 tests, 0 FAIL (was 242).
 
 ---
@@ -391,7 +391,7 @@ not verified further. The remaining matches are all under `torch/testing/_intern
 **Done, in territory:**
 * `torchnative/rust/torch_c/src/bootstrap.py` — `os.environ.setdefault("PYTORCH_JIT", "0")`, one line, with the
   reasoning inline.
-* `tests/test_shim.py` — three new tests, all through the Python-facing
+* `tests/_support/test_shim.py` — three new tests, all through the Python-facing
   `torch.jit.script`/`import` path, covering the default, the explicit-override, and GPT-BigCode's
   import specifically.
 * This document.

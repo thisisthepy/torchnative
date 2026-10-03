@@ -1150,7 +1150,7 @@ impl PyTensorBase {
         // changed, `x.as_strided((2,3),(3,1)).fill_(7.)` returns a filled view
         // and leaves `x` at `[0., 1., 2., ...]` where upstream leaves it all
         // 7s -- a **stale base**, with no exception raised. That build fails 2
-        // golden cases and 4 tests in `tests/test_strided.py`, which is the
+        // golden cases and 4 tests in `tests/ops/test_strided.py`, which is the
         // other half of the check: a guard nothing goes red for is a guard
         // nobody is exercising.
         if crate::storage::write_is_barred(&dest) {
@@ -2215,7 +2215,7 @@ impl PyTensorBase {
     /// did not, and so this family is now a live predicate with a constructor
     /// behind it rather than a set of constants (docs/graph/QUANT2.md §4).
     ///
-    /// The other half of the argument is in `tests/test_shim.py`
+    /// The other half of the argument is in `tests/_support/test_shim.py`
     /// (`test_the_alternative_representations_have_no_constructors`): each of
     /// the representations *still* answering `False` has exactly one way into
     /// existence and every one of those ways refuses by name, so `False` is
@@ -4371,7 +4371,7 @@ pub mod complex_ops {
     /// and choosing the pair was the decision that bought the correct `.shape`
     /// (docs/kernels/COMPLEX.md §3.2). So this is a **narrowing**, it is stated here
     /// rather than left to be discovered, it is asserted as a narrowing in
-    /// `tests/test_complex.py::test_view_as_complex_copies_where_upstream_aliases`,
+    /// `tests/ops/test_complex.py::test_view_as_complex_copies_where_upstream_aliases`,
     /// and it is safe for the models measured only because all three of
     /// `llama4`'s call sites feed a freshly computed expression that is never
     /// written to again. docs/kernels/COMPLEX2.md §6.
@@ -4445,7 +4445,7 @@ pub mod complex_ops {
     /// closed.
     ///
     /// `stack([re, im], -1)`, which is the exact inverse of the narrow-and-
-    /// squeeze above. Round-tripping is what `tests/test_complex.py` checks
+    /// squeeze above. Round-tripping is what `tests/ops/test_complex.py` checks
     /// element-wise against upstream, because losing the imaginary part is the
     /// failure that still returns plausible numbers and this is the one op
     /// that would show it.
@@ -4580,7 +4580,7 @@ pub mod complex_ops {
     ///
     /// A constant rather than a doc sentence because the refusal names it and
     /// a refusal that names a stale list is worse than one that names none:
-    /// `tests/test_complex.py` checks this against the dispatch table, so
+    /// `tests/ops/test_complex.py` checks this against the dispatch table, so
     /// the two cannot drift.
     pub const COMPLEX_OPS: &[&str] = &[
         "aten._to_copy.default",

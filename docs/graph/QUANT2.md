@@ -12,7 +12,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, rustc 1.98.0.
 >
 > 1. **검증 축이 섰고, 그것은 허용오차가 아니라 비트 일치입니다.** GGML 블록 형식은 완전히
 >    명세된 함수이므로 **두 번 써서 정확히 대조**할 수 있습니다 — Q8_0·Q4_0 양자화기를
->    `tests/ggml_ref.py` 에 형식으로부터 재구현해 **블롭을 바이트 단위로**, 세 형식의
+>    `tests/_support/ggml_ref.py` 에 형식으로부터 재구현해 **블롭을 바이트 단위로**, 세 형식의
 >    역양자화기를 재구현해 **`float32` 를 비트 단위로** 대조합니다. **고의로 나쁜 구현 6 개를
 >    주입해 축이 전부 잡아내는지 확인**했습니다(§2.4).
 > 2. **양자화된 matmul 자체를 `==` 로 판정할 수 있습니다.** 형식이 손실 없이 담는 피연산자
@@ -59,9 +59,9 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, rustc 1.98.0.
 |---|---|
 | `torchnative/rust/torch_c/src/tensor.rs` | `Repr::Quantized(Arc<QTensor>)` — 세 번째 변형. `tensor()` 가 `Meta` 처럼 거절 |
 | `torchnative/rust/torch_c/src/quant.rs` | `_quantize` · `_dequantize` · `_quantized_linear` · `_quantized_blob` · `_quantized_from_blob` · `_quantized_format` · `_quantized_nbytes` · `_quantized_formats` |
-| `tests/ggml_ref.py` | **검증 축.** 형식으로부터 재구현한 Q8_0·Q4_0 양자화기와 Q8_0·Q4_0·Q4K 역양자화기 |
+| `tests/_support/ggml_ref.py` | **검증 축.** 형식으로부터 재구현한 Q8_0·Q4_0 양자화기와 Q8_0·Q4_0·Q4K 역양자화기 |
 | `torchnative/.../torchnative/quant/` | `QuantizedLinear` · `quantize_(model, format=...)` · `storage_bytes` |
-| `tests/test_shim.py` | 13 개 테스트 (180 → 193) |
+| `tests/_support/test_shim.py` | 13 개 테스트 (180 → 193) |
 
 **aten 이름을 쓰지 않았습니다.** 상류의 양자화 표면(`torch.quantize_per_tensor`,
 `aten::_int_mm`, `aten::_dyn_quant_matmul_4bit`)은 per-tensor-affine `int8` 과 KleidiAI 4-bit
@@ -504,7 +504,7 @@ lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
 ```
 PYTHON=$PY sh tests/run.sh        180 -> 193  (+13)
 $PY tests/golden/compare.py                      2744/2744, ops=118   (변화 없음)
-$PY tests/verify_schemas.py       4200/4200            (변화 없음)
+$PY tests/_support/verify_schemas.py       4200/4200            (변화 없음)
 ( cd torchnative/rust/torch_c && cargo test --release )      7                    (변화 없음)
 ```
 

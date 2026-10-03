@@ -141,7 +141,7 @@ _load_pretrained_model(...)             가중치가 하나씩 디스크에서 �
 
 ### 2.2 회귀로부터 지켜집니다
 
-`tests/test_shim.py` 의
+`tests/_support/test_shim.py` 의
 `test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land` 가 68 MB 짜리
 로컬 체크포인트로 같은 세 프로세스를 돌리고, **사후 경로 대비 절감이 밀집 가중치의 40% 를
 넘을 것**을 요구합니다(실측 절감은 78%).
@@ -164,7 +164,7 @@ FAILED  a 256-block format was accepted on a 64-wide model
 (`report.swapped_before_weights`), 테스트가 그것을 요구합니다. 사후 교체는 이 값을 참으로
 만들 수 없습니다.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land present -->
 
 ---
 
@@ -227,7 +227,7 @@ SmolLM2-135M 실측: **블롭 동일 210/210**, **로짓 최대차 0**, 비트 �
 대해서도 돌려 **달라야 한다**고 요구합니다. 달라질 수 없는 두 값의 비트 일치는 아무것도
 판정하지 않기 때문입니다.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_quantizer_plugin_and_quantize_produce_the_same_model present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_and_quantize_produce_the_same_model present -->
 
 ---
 
@@ -313,7 +313,7 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 
 형식을 구성 시점에 검사하는 이유: 오타 하나가 **수 GB 를 내려받은 뒤에** 드러나면 안 됩니다.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work present -->
 
 ---
 
@@ -344,7 +344,7 @@ _hf._register()  (두 번째)          -> 예외 없음
 경로가 둘일 수 있는 모듈에게는 곤란합니다. 그래서 `_register()` 는 모듈 수준 플래그가 아니라
 **표 자체**를 보고 건너뜁니다.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_quantizer_registers_a_name_and_changes_nothing_else present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_registers_a_name_and_changes_nothing_else present -->
 
 ---
 
@@ -371,7 +371,7 @@ SmolLM2-135M 의 `config.json` 은 `bfloat16` 을 요청합니다. candle 의 `Q
 |---|---|
 | `torchnative/quant/hf.py` | **새 파일.** `TorchnativeConfig` · `TorchnativeHfQuantizer` · `_QuantizeOnLoad` · `_LoadReport` · `_register` |
 | `torchnative/quant/__init__.py` | `QuantizedLinear.pending_from_linear` · `QuantizedLinear.adopt` · `forward` 의 미착 가중치 거절 · PEP 562 `__getattr__` |
-| `tests/test_shim.py` | 4 개 테스트 (329 → 333) |
+| `tests/_support/test_shim.py` | 4 개 테스트 (329 → 333) |
 | `torchnative/rust/torch_c/src/` | **변경 없음.** Rust 는 한 줄도 고치지 않았습니다 |
 
 ### 9.1 `QuantizedLinear` 를 다시 만들지 않았습니다

@@ -175,7 +175,7 @@ already use, or to `TensorBase`'s existing native size/re-wrap constructor.
 
 This round added **no kernel**: `ops covered` was 185 before it and 185 after. That is also why the
 golden harness cannot see any of this — it dispatches by op key, and no key changed — and why the
-coverage is six vendored-tree road tests instead (`test_ctor_*` in `tests/test_shim.py`).
+coverage is six vendored-tree road tests instead (`test_ctor_*` in `tests/_support/test_shim.py`).
 docs/verification/GOLDEN.md's blind spot, the same shape `as_tensor` and `meshgrid` had in docs/architectures/DEMAND1.md.
 
 That claim was first written as `count golden_ops_covered eq 185`, which is the one thing a marker

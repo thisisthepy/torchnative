@@ -16,8 +16,8 @@
 - **한 번 잘못 고쳤다가 되돌린 것 둘.** §8. 둘 다 측정이 되돌리게 했습니다.
 
 바뀐 파일은 셋입니다 — `torchnative/rust/torch_c/src/bootstrap.py`,
-`tests/test_shim.py` (테스트 9 개 추가),
-`tests/verify_schemas.py` (검사 4 개 추가).
+`tests/_support/test_shim.py` (테스트 9 개 추가),
+`tests/_support/verify_schemas.py` (검사 4 개 추가).
 `overloads.json` 과 `methods.json` 은 **한 글자도 바뀌지 않았습니다** — 이 작업에서 그 둘은
 고칠 대상이 아니라 **오라클**이었습니다.
 
@@ -309,7 +309,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh        # 164 (기존 155 + 신규 9)
 $PY tests/golden/compare.py                      # 2536/2536 ops=117
-$PY tests/verify_schemas.py       # 3075/3075
+$PY tests/_support/verify_schemas.py       # 3075/3075
 ```
 
 `verify_schemas.py` 는 **상류 torch 가 있는 환경**에서 돌고, shim 은 벤더 트리를 `PYTHONPATH`

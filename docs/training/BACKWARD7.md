@@ -445,11 +445,11 @@ Nobody would have found that from the passing runs.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_free present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs poison_on_write_to_recorded_storage present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs backward_in present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
 <!-- The engine landed in docs/training/BACKWARD9.md and the test above was inverted rather than
      deleted, which is what this line asked for. The marker follows it to its new name so
      that the lineage stays greppable; §6 and §10 row 4 are history and are left as written. -->

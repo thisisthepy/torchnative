@@ -259,7 +259,7 @@ The second row is measured, not assumed: it is what the test reports when the
 rewrite is disabled on purpose. bfloat16-sourced weights reach the unit
 through `ios16.conv` at the size where anything does.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_a_bfloat16_linear_is_not_excluded_from_the_conv_path present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_a_bfloat16_linear_is_not_excluded_from_the_conv_path present -->
 
 ## 7b. The defect that made this module report as a subprocess exit
 
@@ -276,11 +276,11 @@ one missing import away for each of them. The guard now carries its own
 `import io, os, sys`; three redundant stdlib imports cost nothing and no
 script can get it wrong.
 
-<!-- DOCWATCH: symbol-in-file tests/test_anedecode.py test_the_stdout_guard_carries_its_own_imports present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anedecode.py test_the_stdout_guard_carries_its_own_imports present -->
 
 ## 8. Reproducing
 
-`tests/test_anedecode.py` is every measurement in this document,
+`tests/devices/coreml/test_anedecode.py` is every measurement in this document,
 as assertions on `preferred`. It skips by name where coremltools or the
 vendored shim is absent.
 

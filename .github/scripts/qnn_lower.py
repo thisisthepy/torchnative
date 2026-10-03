@@ -14,7 +14,7 @@ that cannot fail is not a verification. Logic that lives only inside a
 `run: |` block cannot be imported, cannot be nullified, and cannot be tested
 anywhere except by pushing to a branch and waiting. `.github/scripts/verify_published.py`
 is this repository's existing answer to that and this file follows it.
-`tests/test_qnnci.py` is what exercises the decisions below,
+`tests/devices/qnn/test_qnnci.py` is what exercises the decisions below,
 on a machine that has no executorch and never will.
 
 **The decision this file exists to make.** `docs/devices/QNN.md` §6.2: QNN's dangerous

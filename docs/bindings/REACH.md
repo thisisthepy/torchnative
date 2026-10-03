@@ -61,7 +61,7 @@ calling `torch.<name>(...)` or `t.<name>(...)`.
 
 Four of those 55 were found by this check rather than by inspection, and they
 are the reason it strips comments and docstrings before searching: `cat`,
-`where`, `erf` and `sigmoid` each appear in `tests/test_shim.py` **only inside
+`where`, `erf` and `sigmoid` each appear in `tests/_support/test_shim.py` **only inside
 a comment or a docstring** —
 
     #  ... so that `torch.sigmoid(x, out=y)` refuses by the right name --
@@ -106,7 +106,7 @@ attached to happens to work.
 
     python3 tests/golden/reach.py                  # inventory + verdict
     python3 tests/golden/reach.py --verify-upstream # + put the reasons to upstream
-    # and in the suite, three tests in tests/test_shim.py:
+    # and in the suite, three tests in tests/_support/test_shim.py:
     #   test_reach_probe_tells_a_missing_arm_from_a_refused_call
     #   test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name
     #   test_reach_allowlist_reasons_are_answerable_by_upstream
@@ -155,7 +155,7 @@ Two things keep it from becoming one.
 Each shape was broken on purpose, one at a time, and restored.
 
 **Shape 3** — deleted the three `torch.roll(...)` / `r6.roll(2)` calls from
-`tests/test_shim.py` and changed nothing else:
+`tests/_support/test_shim.py` and changed nothing else:
 
 ```text
 FAIL: shape 3: nothing in tests/ calls `torch.roll(...)` or `.roll(...)`.
@@ -219,7 +219,7 @@ REACH: PASS
 
 <!-- DOCWATCH: symbol-in-file tests/golden/reach.py has_dispatch_arm present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/reach.py executable_text present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name present -->
 <!-- DOCWATCH: hasattr alias false -->
 <!-- DOCWATCH: op-implemented aten.alias.default -->
 <!-- DOCWATCH: op-implemented aten.roll.default -->

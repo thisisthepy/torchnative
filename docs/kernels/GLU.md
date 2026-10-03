@@ -2,7 +2,7 @@
 
 Worktree `work/glu` on develop `eb84708`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `methods.json`, `overloads.json`, `tests/golden/cases.py`,
-`tests/test_glu.py`. `bootstrap.py`, `capture.rs`, `tape.rs`,
+`tests/ops/test_glu.py`. `bootstrap.py`, `capture.rs`, `tape.rs`,
 `tensor.rs`, `device.rs`, `scripts/wheel/`, `torchnative/` were not touched, per
 this round's territory split.
 
@@ -19,7 +19,7 @@ operators this round covers are about to be in demand from two directions.
 next to `silu_default`), added to `IMPLEMENTED`, wired into the dispatch
 match, golden-compared in `tests/golden/cases.py` (`glu_cases`, registered
 in `CASE_BUILDERS`), and pinned with regression tests in the new
-`tests/test_glu.py`.
+`tests/ops/test_glu.py`.
 
 Measured against upstream 2.13.0 (`torch.ops.aten.glu.default`, `F.glu`),
 not assumed:
@@ -79,7 +79,7 @@ already proven here. **So "seven ASR encoders clear glu" is not yet true
 end-to-end**; what is true is that the kernel they all need now exists,
 golden-compared, and the remaining step is binding surface, not numerics —
 the same `missing_shim_name` vs. kernel distinction ARCH100.md §2 draws.
-Whoever owns `bootstrap.py` next should re-run `tests/arch_sweep.py`
+Whoever owns `bootstrap.py` next should re-run `tests/_support/arch_sweep.py`
 after adding the three lines above; that is the check this round could not
 finish itself.
 

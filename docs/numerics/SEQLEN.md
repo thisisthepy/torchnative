@@ -557,7 +557,7 @@ Gates as they stood at the end of §3 (§7.11 has the current ones):
 PYTHON=$PY sh tests/run.sh      242          (unchanged)
 $PY tests/golden/compare.py                    3302/3302 ops=133, pending 2
 $PY tests/golden/compare.py --self-test        PASS 13 comparators x 11 fault modes
-$PY tests/verify_schemas.py     4331/4331
+$PY tests/_support/verify_schemas.py     4331/4331
 ( cd torchnative/rust/torch_c && cargo test --release )    13           (was 10, +3)
 ```
 
@@ -948,7 +948,7 @@ Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json amax present -->
 > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json amax present -->
 > <!-- DOCWATCH: op-implemented aten.amax.default -->
-> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
 
 ### 7.11 Counts
 

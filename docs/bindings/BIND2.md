@@ -178,7 +178,7 @@ named refusal.
 
 ## 5. Architecture sweep, before and after
 
-`PYTHONPATH=<vendored tree> TORCH_USE_RTLD_GLOBAL=1 tests/arch_sweep.py
+`PYTHONPATH=<vendored tree> TORCH_USE_RTLD_GLOBAL=1 tests/_support/arch_sweep.py
 --out ... --only efficientnet longt5 gemma3n_text`, run after the
 rebuild+reinstall above (`TORCH_C_ARTEFACT` pointed at the freshly built
 `lib_C.dylib`, not a stale one -- and `side=shim` printed and checked, since

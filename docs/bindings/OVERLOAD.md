@@ -104,11 +104,11 @@ C_SURFACE 의 13 개 중 **11 개**는 오버로드 *이름*이 트리에 있습
 들어가므로 `cargo build` 는 torch 를 요구하지 않습니다. 상류를 쓰는 것은 **생성과 검증 시점**
 뿐이고, 그것은 `tests/golden/compare.py` 와 같은 종류의 의존입니다.
 
-옮겨 적은 것에는 검사가 필요하므로, `tests/verify_schemas.py` 를 두었습니다.
+옮겨 적은 것에는 검사가 필요하므로, `tests/_support/verify_schemas.py` 를 두었습니다.
 상류에서 다시 뽑아 표와 대조합니다.
 
 ```
-$ /Volumes/macMini/caches/spike-venv/bin/python tests/verify_schemas.py
+$ /Volumes/macMini/caches/spike-venv/bin/python tests/_support/verify_schemas.py
 torch 2.13.0
 SUMMARY: 45/45 table entries matched upstream, 0 failed        EXIT=0
 ```
@@ -439,7 +439,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 | 호스트 스모크 | `tests/run.sh` | **0** — 34/34 (이전 27) |
 | 골든 하네스 | `tests/golden/compare.py` | **0** — **490/490, ops covered=19** (이전 188/188, 3) |
 | 골든 자가검사 | `--inject-fault value/shape/dtype` | **1 / 1 / 1** (의도대로) |
-| 스키마 검증 | `tests/verify_schemas.py` | **0** — 45/45 |
+| 스키마 검증 | `tests/_support/verify_schemas.py` | **0** — 45/45 |
 | 사용자 API 대조 49 케이스 | 상류 torch 와 shim 을 각각 돌려 diff | **49/49 동일** |
 | 엄격 `import torch` | `probe.py --mode strict --target torch` | **0** |
 | 기록 `import torch` | `probe.py --mode record --target torch` | **0** |
@@ -487,7 +487,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 ./scripts/vendor/install_shim.sh                       # 빌드 + 구멍에 넣기
 $PY tests/golden/compare.py;                        echo "EXIT=$?"
-$PY tests/verify_schemas.py;         echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py;         echo "EXIT=$?"
 bash tests/run.sh;              echo "EXIT=$?"
 
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
@@ -515,11 +515,11 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
 | 파일 | 변경 |
 |---|---|
 | `torchnative/rust/torch_c/src/overloads.json` | **신규** — 스키마 표 45 개 (14 op) |
-| `tests/verify_schemas.py` | **신규** — 표를 상류와 대조하는 검증기 |
+| `tests/_support/verify_schemas.py` | **신규** — 표를 상류와 대조하는 검증기 |
 | `torchnative/rust/torch_c/src/bootstrap.py` | 오버로드 해석기(`_TypeChecker` · `_Overloads`), `torch.tensor` 팩토리, `_shim_overloads`, `_DISCOVERED_RETURNS` 2 항목 |
 | `torchnative/rust/torch_c/src/aten.rs` | aten op 17 개 추가(3 → 20), `Scalar` 인자 처리, `scalar_type_name` · `arange_has_cpu_kernel` |
 | `torchnative/rust/torch_c/src/lib.rs` | `overloads.json` 을 `include_str!` 로 삽입, `_tensor_new_from_data` |
-| `tests/test_shim.py` | 27 → 34 개. 해석기 · `torch.tensor` · 두 목록의 서로소성 |
+| `tests/_support/test_shim.py` | 27 → 34 개. 해석기 · `torch.tensor` · 두 목록의 서로소성 |
 
 벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. `tests/golden/` 과 `docs/` 의 기존
 파일도 건드리지 않았습니다.

@@ -416,7 +416,7 @@ markers.
 allowed to choose the result class. They are listed once, as features, because
 the surface they add and the defect they close are the same code.
 
-**Tests added**: 7, all in `tests/test_structseq.py`, each
+**Tests added**: 7, all in `tests/export/test_structseq.py`, each
 comparing against upstream torch's own answer in a second subprocess. One of
 them (`test_no_dispatch_still_suppresses_subclass_dispatch`) compares the shim
 against itself instead, because upstream segfaults on the question — §2.3.
@@ -437,7 +437,7 @@ operator changes, no `Meta` dispatch-key predicate, no vendored-tree edits.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs subclass_dispatch_target present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_subclass present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reshape_to_schema present -->
-<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
-<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
-<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
-<!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_structseq.py test_a_four_line_layer_norm_module_exports_replays_and_agrees present -->

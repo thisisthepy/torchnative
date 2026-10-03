@@ -465,7 +465,7 @@ this shim's autocast surface — so 5.x is both the honest target and the cheape
 
 ## 7. Tests
 
-Not added directly — `tests/test_shim.py` is out of this session's territory (another
+Not added directly — `tests/_support/test_shim.py` is out of this session's territory (another
 agent's). Two snippets, in that file's own style (plain asserts, `import _C` for the door,
 `_upstream_torch` for cross-checking where the fixture already does), to be placed near
 `test_autocast_is_off_and_cannot_be_turned_on`:

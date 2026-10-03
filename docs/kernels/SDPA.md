@@ -107,7 +107,7 @@ float32                      3562/4096     4.17233e-07
 그렇습니다. 그러니 이것은 반올림 규칙 문제가 아니라 **재결합 순서** 문제이고,
 소박한 정식화로는 어떻게 고쳐도 없어지지 않습니다.
 
-**그래서 이 회차의 검사는 허용오차가 없습니다.** `tests/test_shim.py` 의
+**그래서 이 회차의 검사는 허용오차가 없습니다.** `tests/_support/test_shim.py` 의
 `test_sdpa_*` 셋은 전부 `==` 로 비교합니다. 골든에는 §4 가 발견한 **블록 경계를 넘는 도형**을
 넣었지만(16개 케이스), 그쪽의 성질은 여전히 허용오차이고 그 사실을 케이스 주석에 적었습니다.
 
@@ -378,7 +378,7 @@ dtype 을 주지 않은 기본 경로(= `bfloat16`), `attn_implementation="sdpa"
 ```
 PYTHON=$PY sh tests/run.sh     exit 0   184 통과 (전 176, +3 비트 단위, +1 스위치, +4 dtype 회차)
 $PY tests/golden/compare.py                   exit 0   2760/2760, ops=118 (전 2744, +16)
-$PY tests/verify_schemas.py    exit 0   4200/4200 (변화 없음)
+$PY tests/_support/verify_schemas.py    exit 0   4200/4200 (변화 없음)
 ```
 
 **환경변수 없이 돌린 결과입니다.** +3 과 +16 은 스위치를 스스로 켜고 되돌리므로, 기본
@@ -422,7 +422,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 179
 $PY tests/golden/compare.py                        # 2760/2760 ops=118
-$PY tests/verify_schemas.py         # 4200/4200
+$PY tests/_support/verify_schemas.py         # 4200/4200
 ```
 
 §3 · §5 · §7 은 269 MB 의 체크포인트를 읽거나 상류 torch 와 시임을 한 프로세스에 함께
@@ -620,7 +620,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 184
 $PY tests/golden/compare.py                        # 2760/2760 ops=118
-$PY tests/verify_schemas.py         # 4200/4200
+$PY tests/_support/verify_schemas.py         # 4200/4200
 
 # §12.1 · §12.3. 측정 전에 uptime 을 보고 기록하십시오.
 $PY /Volumes/macMini/caches/optin-scratch/bench.py $TORCH_C_ARTEFACT

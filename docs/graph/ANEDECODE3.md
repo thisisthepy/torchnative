@@ -26,6 +26,6 @@ The tensor round trip is not a bottleneck here. Measured in a solitary test subp
 |---|---|
 | **features added** | `_group_decoder_layers` and `_build_decoder_subgraph_program` for tracing subgraphs into single programs |
 | **defects fixed** | PyTorch's `repeat_interleave` semantics mismatch with `mb.tile` in GQA (now implemented via `expand_dims` -> `tile` -> `reshape`) |
-| **tests added** | 5, in `tests/test_anetracer.py` |
+| **tests added** | 5, in `tests/devices/coreml/test_anetracer.py` |
 | **docs corrected** | 1 — Added ANEDECODE3.md |
 | **removed** | 0 |

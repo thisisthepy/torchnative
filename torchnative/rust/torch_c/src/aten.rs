@@ -410,7 +410,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // `complex64` tensor -- there is no dense storage to read on either side of
     // that comparison, so a case builder would have to compare something other
     // than the thing the op produced. They are proven against upstream
-    // element-wise in `tests/test_complex.py` instead, which runs upstream in
+    // element-wise in `tests/ops/test_complex.py` instead, which runs upstream in
     // a separate process and checks both halves, exactly as
     // `aten.reshape_as.default` below is proven in `test_indexsel.py`.
     //
@@ -421,7 +421,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // five above: `_fft_r2c` and `_fft_c2c` RETURN a complex tensor and
     // `_fft_c2r` TAKES one, so on at least one side of every comparison there
     // is no dense storage for the golden harness to read. They are proven
-    // element-wise against a live upstream in `tests/test_fft.py` instead --
+    // element-wise against a live upstream in `tests/ops/test_fft.py` instead --
     // and `aten.stft.default`, which is built on `_fft_r2c` and whose
     // `return_complex=False` form is real on both sides, IS golden-compared,
     // so the transform is not unmeasured by the harness, only unnamed by it.
@@ -432,7 +432,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // RETURNS a complex tensor, so the golden harness -- which compares by
     // reading both sides as dense tensors -- has nothing to read on this
     // side. Proven element-wise against a live upstream in
-    // `tests/test_cplx2.py` instead, on both components.
+    // `tests/ops/test_cplx2.py` instead, on both components.
     "aten.complex.default",
     "aten.imag.default",
     "aten.polar.default",
@@ -448,7 +448,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // `resolve_torch_overload` refuses by design when `torch.ops.aten` has
     // no matching entry, so this cannot go through `compare.py`'s normal
     // per-op golden loop -- it is proven against upstream directly in
-    // `tests/test_indexsel.py` instead (docs/kernels/INDEXSEL.md).
+    // `tests/ops/test_indexsel.py` instead (docs/kernels/INDEXSEL.md).
     "aten.reshape_as.default",
     "aten.zeros.default",
 ];
@@ -2257,7 +2257,7 @@ fn visit_for_device(
 /// upstream", and the golden harness compares values -- which a meta tensor by
 /// definition has none of. Meta support is a property of ops already on the
 /// list, so op coverage stays 96 and the evidence lives in
-/// `tests/test_shim.py` instead. docs/devices/META.md §7.
+/// `tests/_support/test_shim.py` instead. docs/devices/META.md §7.
 ///
 /// **Every call goes through `meta_stride_rule` first** (docs/graph/STRIDE.md
 /// §3): a meta tensor stores its stride now, so each arm below is also a claim
@@ -2306,7 +2306,7 @@ fn meta_dispatch(
 /// A meta kernel's result is a claim about shape, dtype **and stride**, and a
 /// wrong stride is believed downstream (the prims view metas build
 /// `as_strided` calls out of it). So every op is in exactly one of these, and
-/// the lists are checked against upstream by `tests/test_metastride.py`
+/// the lists are checked against upstream by `tests/ops/test_metastride.py`
 /// rather than by reading.
 enum MetaStrideRule {
     /// The arm computes the layout itself: the views (which share their
@@ -2842,7 +2842,7 @@ fn meta_table(
         // produces is overwritten before it is read -- missing keys by
         // `_initialize_missing_keys`, non-persistent buffers by the module's
         // own initialisation -- and if one ever were not, the zeros would
-        // reach the forward pass, where `tests/test_shim.py` compares logits
+        // reach the forward pass, where `tests/_support/test_shim.py` compares logits
         // against upstream.
         "aten.empty_like.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
@@ -5363,7 +5363,7 @@ fn aten_dispatch_inner(
         // one applies its shape change to `re` and to `im` separately.
         // Applying it to `re` alone would compile, would return the right
         // shape and the right dtype, and would be wrong -- so each has an
-        // element-wise both-components test in `tests/test_cplx2.py` on an
+        // element-wise both-components test in `tests/ops/test_cplx2.py` on an
         // input whose `re` and `im` differ.
         "aten._to_copy.default" if to_copy_reaches_complex(args, kwargs) => {
             complex_to_copy(py, args, kwargs)
@@ -8395,7 +8395,7 @@ fn baddbmm_default(
 /// The blocking the reference reproduces is upstream's, not a choice: 32 query
 /// rows (64 or 256 for longer queries) by 512 key columns, and the mask's
 /// fused multiply-add strides by the *mask* dtype's vector width. Both are the
-/// kind of detail that no tolerance can check, so `tests/test_shim.py`
+/// kind of detail that no tolerance can check, so `tests/_support/test_shim.py`
 /// checks them with none -- with the switch on.
 ///
 /// Nothing above the fork differs between the two: the argument checks, the
@@ -12206,7 +12206,7 @@ fn expm1_default(
 /// twelve digits -- while `erfc` of upstream's is `9.998953310354861e-13`,
 /// wrong in the fourth. That whole region is unreachable at `float32`, whose
 /// largest value below one is `1 - 6e-8`, so no `float32` caller can see it;
-/// `docs/kernels/TAIL3.md` records it and `tests/test_tail3.py` pins it by the
+/// `docs/kernels/TAIL3.md` records it and `tests/ops/test_tail3.py` pins it by the
 /// `erfc` round trip rather than by agreement, because agreeing there would
 /// mean being wrong.
 ///
@@ -23668,7 +23668,7 @@ fn floor_inplace(
 ///
 /// Capture refuses it automatically -- `capture.rs::is_mutating` reads the
 /// trailing `_` off the op segment -- and that is checked rather than assumed
-/// in `tests/test_shim.py`.
+/// in `tests/_support/test_shim.py`.
 /// `aten::index_add(Tensor self, int dim, Tensor index, Tensor source,
 ///     *, Scalar alpha=1) -> Tensor`
 ///
@@ -23691,7 +23691,7 @@ fn floor_inplace(
 /// (`index_add_(): self (Float) and source (Long) must have the same scalar
 /// type`), because upstream's out-of-place form dispatches into the same
 /// `index_add_out` and the messages come from there. That is measured, not
-/// inherited by convenience: `tests/test_tail3.py` compares the two sides'
+/// inherited by convenience: `tests/ops/test_tail3.py` compares the two sides'
 /// text.
 ///
 /// **`alpha` is still keyword-only**: `index_add(0, idx, src, 3)` raises
@@ -27745,7 +27745,7 @@ fn reshape_as_default(
 /// that pre-existing laxity rather than adding a new one: making it strict
 /// while `view` stays lax would put two different answers behind one rule.
 /// The gap is one row, recorded in `docs/kernels/TAIL3.md` and pinned by a
-/// `tests/test_tail3.py` case that asserts the *shim's* answer so the day
+/// `tests/ops/test_tail3.py` case that asserts the *shim's* answer so the day
 /// `view` is tightened this fails and is revisited.
 ///
 /// Both sides refuse a shape that does not divide (`arange(6.).view_as(
@@ -29467,7 +29467,7 @@ fn dft_in_place(re: &mut Vec<f64>, im: &mut Vec<f64>, inverse: bool) {
 ///
 /// Getting this wrong scales every output by `n` or `sqrt(n)`, which is a
 /// uniform factor and therefore the kind of error that still looks like a
-/// spectrum. `tests/test_fft.py` pins all three codes in both directions
+/// spectrum. `tests/ops/test_fft.py` pins all three codes in both directions
 /// against a live upstream.
 fn fft_norm_factor(op: &str, code: i64, n: usize) -> PyResult<f64> {
     let n = n.max(1) as f64;
@@ -31050,14 +31050,14 @@ fn std_correction(
 /// by-product: `torch/_refs/__init__.py:3343` (`native_layer_norm`) and
 /// `torch/_decomp/decompositions.py:2095` (`_batch_norm_no_update`) both use
 /// the mean directly. So both halves are compared against upstream
-/// element-wise in `tests/test_varmean.py`, and the mean comes out of the
+/// element-wise in `tests/export/test_varmean.py`, and the mean comes out of the
 /// same `f64` accumulator the variance was computed from -- recomputing it
 /// through `mean.dim` would narrow twice, which upstream's fused kernel does
 /// not do.
 ///
 /// `correction` is `var`'s trap, identically: **`correction=None` means 1**,
 /// not 0. At n=2 the two conventions differ by a factor of two, which is
-/// where `tests/test_varmean.py` pins it.
+/// where `tests/export/test_varmean.py` pins it.
 ///
 /// The three dispatch targets each spell out their own `read_flat`, for the
 /// reason `var_std_dtype_check` records above: the MPS readback list is
@@ -31782,7 +31782,7 @@ fn upsample_nearest1d_default(
 /// by feeding one-hot inputs, so it is the weights themselves and not an
 /// accumulation artefact. The two differ by ~3 ULP on every output the fusion
 /// touches, which the golden `float32` tolerance (1e-5) would NOT have caught;
-/// `tests/test_rnn.py` compares bit patterns instead.
+/// `tests/ops/test_rnn.py` compares bit patterns instead.
 ///
 /// `uint8` is **refused** here, where `upsample_bilinear2d` has a separate
 /// fixed-point kernel and `upsample_nearest1d` computes: measured, upstream
@@ -32013,7 +32013,7 @@ fn upsample_linear1d_default(
 ///
 /// **Both biases are added, not one.** `b_ih` and `b_hh` are separately stored
 /// and separately added; folding them would be invisible in a forward whose
-/// reference is itself wrong, and is why `tests/test_rnn.py` compares
+/// reference is itself wrong, and is why `tests/ops/test_rnn.py` compares
 /// against upstream on a multi-step sequence with a non-trivial `(h_0, c_0)` --
 /// a single timestep from a zero hidden state cannot tell a correct
 /// recurrence from one that drops `h` or transposes the gates.
@@ -33231,7 +33231,7 @@ fn logical_not_default(
 // buffer, and `view_as_complex` allocates unconditionally, so **no complex
 // tensor in this shim ever shares storage with anything** -- which means no
 // view exists that could observe the difference. It is asserted as a
-// narrowing in `tests/test_cplx2.py` rather than left to be discovered.
+// narrowing in `tests/ops/test_cplx2.py` rather than left to be discovered.
 
 /// Wrap two finished halves. The single exit of every kernel below, so that
 /// "the result was built from both halves" is structural rather than
@@ -33365,7 +33365,7 @@ fn complex_to_copy(
 /// reach independently of `_to_copy`: trimming an axis is a slice.
 ///
 /// **Upstream returns a view and this returns a copy.** See the block comment
-/// above; `tests/test_cplx2.py::test_slice_is_a_copy_where_upstream_aliases`
+/// above; `tests/ops/test_cplx2.py::test_slice_is_a_copy_where_upstream_aliases`
 /// asserts it as a narrowing.
 fn complex_slice(
     py: Python<'_>,
@@ -33805,7 +33805,7 @@ fn unfold_default(
 /// caller-facing route to that situation is already refused earlier, by
 /// `storage_for`'s `metal_dtype_gate` in upstream's own words -- which is
 /// exactly why the Python suite cannot tell whether this refusal exists:
-/// `tests/test_mpsconst.py` stayed green with the whole
+/// `tests/devices/mps/test_mpsconst.py` stayed green with the whole
 /// condition replaced by `if false`. A guard no test can kill is not a guard,
 /// so it is killed here instead, one level below the gate that hides it.
 ///

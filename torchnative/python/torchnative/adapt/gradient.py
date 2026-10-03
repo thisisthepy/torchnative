@@ -18,7 +18,7 @@ time (``torchnative.adapt.BACKWARD`` reports what was read). Under it this
 module refuses to import, naming itself and the reason, and every
 :class:`~torchnative.adapt.Method` subclass declaring stage 1 or 2 is refused
 when its class statement runs -- which is when the module that defines it is
-imported. SPEC S6.5; held by ``tests/test_stagetype.py``.
+imported. SPEC S6.5; held by ``tests/training/test_stagetype.py``.
 """
 
 from __future__ import annotations

@@ -517,7 +517,7 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 *또한* `tests/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
 meta 는 정의상 값이 없습니다.** meta 지원은 이미 목록에 있는 op 들의 *성질*이므로 op 수가 늘지
 않고, 새 철자를 만들지 않았으므로 `overloads.json`/`methods.json` 도 그대로입니다. 증거는
-`tests/test_shim.py` 에 있습니다(§11).
+`tests/_support/test_shim.py` 에 있습니다(§11).
 
 ---
 
@@ -710,7 +710,7 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 **골든 op 수 96 과 스키마 233 은 그대로입니다.** 이유는 §7 입니다 — 새 aten op 도, 새 철자도
 만들지 않았습니다.
 
-### 새로 붙인 테스트 (`tests/test_shim.py`, +7)
+### 새로 붙인 테스트 (`tests/_support/test_shim.py`, +7)
 
 | 테스트 | 무엇을 고정하나 |
 |---|---|
@@ -886,7 +886,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 $PY tests/golden/compare.py                       > /tmp/g.log 2>&1;  echo "EXIT=$?"
 $PY tests/golden/compare.py --inject-fault value  > /tmp/fv.log 2>&1; echo "EXIT=$?"
-$PY tests/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
 PYTHON=$PY sh tests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 전사 대조: 같은 프로브를 두 torch 로 돌리고 diff

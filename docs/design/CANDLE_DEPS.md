@@ -366,7 +366,7 @@ true` 등으로 워크스페이스 상속을 쓰기 때문에 `candle-core` 디�
 
 ```
 $PY tests/golden/compare.py                 # SUMMARY: 1212/1212 cases passed, 0 failed, ops covered=70   EXIT=0
-$PY tests/verify_schemas.py  # SUMMARY: 127/127 table entries matched upstream, 0 failed    EXIT=0
+$PY tests/_support/verify_schemas.py  # SUMMARY: 127/127 table entries matched upstream, 0 failed    EXIT=0
 sh tests/run.sh              # 62/62 스모크 테스트 전부 ok                                   EXIT=0
 ```
 

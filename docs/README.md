@@ -40,7 +40,7 @@ run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
 
 ## The check that keeps this true
 
-`tests/test_docrefs.py` runs in the gate and enforces:
+`tests/release/test_docrefs.py` runs in the gate and enforces:
 
 1. **No `docs/*.md` reference in a tracked file dangles.** 7,081 references in
    438 tracked files (counted 2026-10-03) name documents by path, in Markdown

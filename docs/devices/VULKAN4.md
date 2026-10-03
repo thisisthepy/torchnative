@@ -22,8 +22,8 @@
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs SHADER_DISPATCHES present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs maybe_upload present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_every_taught_op_ran_on_the_gpu_or_says_it_did_not present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_matmul_residue_is_fma_contraction_and_not_a_defect present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_every_taught_op_ran_on_the_gpu_or_says_it_did_not present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_matmul_residue_is_fma_contraction_and_not_a_defect present -->
 
 ---
 

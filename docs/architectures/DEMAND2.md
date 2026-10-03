@@ -387,11 +387,11 @@ SUMMARY: 8240/8240 cases passed, 0 failed, ops covered=189, pending case builder
 $ $PY tests/golden/compare.py --self-test
 SELF-TEST: PASS -- 21 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 
-$ $PY tests/verify_schemas.py
+$ $PY tests/_support/verify_schemas.py
 SUMMARY: 4588/4588 table entries matched upstream, 0 failed
 ```
 
-Two pre-existing running-count assertions in `tests/test_shim.py` needed updating
+Two pre-existing running-count assertions in `tests/_support/test_shim.py` needed updating
 for this round's four new `_aten_implemented()` entries and two new `overloads.json` schema
 pairs, each with a comment explaining the movement in the file's own established style (matching
 every prior round's entries in the same two tests):
@@ -409,7 +409,7 @@ every prior round's entries in the same two tests):
 `git status --short` was checked before, during and after this round; nothing outside
 `docs/architectures/DEMAND.md`, `docs/architectures/DEMAND1.md` (one marker flip, §6 below), `docs/architectures/DEMAND2.md` (this file),
 `torchnative/rust/torch_c/src/aten.rs`, `torchnative/rust/torch_c/src/bootstrap.py`, `torchnative/rust/torch_c/src/overloads.json`,
-`tests/test_shim.py` and `tests/golden/cases.py` moved.
+`tests/_support/test_shim.py` and `tests/golden/cases.py` moved.
 `torchnative/rust/torch_c/src/tensor.rs`, `dtype.rs`, `flash.rs`, `bootstrap.py`'s untouched regions, and the
 vendored tree were not modified (`tensor.rs` in particular — another agent's worktree was
 reported editing it concurrently; nothing in this round touched it).

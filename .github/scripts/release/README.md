@@ -20,7 +20,7 @@ ignored and overwritten.
    pull request. That merge is the only way `main` changes.
 4. On push to `main`, `pages.yml` deploys `docs/guide/` to GitHub Pages. `docs/guide/`
    survives the main-only layout (it is not Markdown directly under `docs/`);
-   `tests/test_publish.py` asserts that against the real tree.
+   `tests/release/test_publish.py` asserts that against the real tree.
 
 ## What is dropped on release
 

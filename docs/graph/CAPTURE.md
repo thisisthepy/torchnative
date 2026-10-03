@@ -10,7 +10,7 @@
 - **꺼져 있을 때 얼마인가.** §7. 그리고 그 측정이 오염된 조건에서 났다는 것도 §7 에 있습니다.
 
 구현은 `torchnative/rust/torch_c/src/capture.rs`, 훅은 `aten.rs` 의 `aten_dispatch` 끝 한 줄,
-테스트는 `tests/test_shim.py` 의 capture 절(22 개)과 `capture.rs` 의 단위 테스트 2 개입니다.
+테스트는 `tests/_support/test_shim.py` 의 capture 절(22 개)과 `capture.rs` 의 단위 테스트 2 개입니다.
 
 ---
 
@@ -304,7 +304,7 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 | `cargo build --release` | 0 |
 | `PYTHON=... sh tests/run.sh` | 0 — **113/113 통과** (capture 22 개 포함) |
 | `python tests/golden/compare.py` | 0 — **2268/2268**, ops=97, KNOWN DIVERGENCE 0 |
-| `python tests/verify_schemas.py` | 0 — **233/233** |
+| `python tests/_support/verify_schemas.py` | 0 — **233/233** |
 
 ### 테스트가 실패할 수 있는지 확인했다
 
@@ -437,7 +437,7 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 못박아 두었습니다: `test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs RANDOM present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
 
 ---
 
@@ -486,7 +486,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 # 건너뛰어도 run.sh 가 낡음을 감지해 이름을 대고 거절한다 (§8, 고쳐짐)
 PYTHON=$PY sh tests/run.sh     # capture 22 개 포함
 $PY tests/golden/compare.py                   # 벤더 트리를 PYTHONPATH 에 넣지 말 것
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 ```
 
 §5-1 의 Core ATen 실측:

@@ -128,12 +128,12 @@ the NNAPI replay, `test_vulkan4.py` and `test_cuda.py` for the rows that did not
 
 **One correction had nothing behind it**: the host-readback count. The README published 54, the
 runtime reported 85, and nothing anywhere compared the two — the same shape as the golden `ge`
-floors that could not see `passed < total`. `tests/test_remeasure2.py` adds four
+floors that could not see `passed < total`. `tests/numerics/test_remeasure2.py` adds four
 guards, and reads the number **out of the README prose** rather than restating it, so it checks the
 document instead of copying it.
 
-<!-- DOCWATCH: symbol-in-file tests/test_remeasure2.py test_the_readme_host_readback_count_is_the_number_the_runtime_reports present -->
-<!-- DOCWATCH: symbol-in-file tests/test_remeasure2.py test_softmax_is_not_in_the_host_readback_set present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_remeasure2.py test_the_readme_host_readback_count_is_the_number_the_runtime_reports present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_remeasure2.py test_softmax_is_not_in_the_host_readback_set present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 <!-- DOCWATCH: count golden_cases_failed eq 0 -->
 

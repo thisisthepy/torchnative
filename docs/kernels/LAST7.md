@@ -8,7 +8,7 @@
 
 Worktree `work/last7` on develop `b33e2ee`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `overloads.json`, `methods.json`, `tests/golden/cases.py`,
-`tests/test_last7.py`, plus the three inversions §7 lists.
+`tests/ops/test_last7.py`, plus the three inversions §7 lists.
 
 ## 0. The alias-versus-kernel split, first
 
@@ -107,8 +107,8 @@ one case each so that closing one cannot hide the other — the same register
 and `aten.view.dtype`, which are `expect="diverge"` and lose a write *silently*.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs unfold_default present -->
-<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
-<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
 
 ---
 
@@ -134,7 +134,7 @@ So it is **inverted, not deleted**:
 until somebody writes it down. That is the fifth inversion this repository has
 kept rather than dropped.
 
-<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
 
 ### 3.1 Where `unfold` and `as_strided` genuinely differ
 
@@ -231,8 +231,8 @@ is inverted to `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream
 `test_a_per_axis_differing_stride_is_still_refused_by_name` for the half that did
 not close, so the two halves of `docs/bindings/ARGFORM.md` §1's finding stay separable.
 
-<!-- DOCWATCH: symbol-in-file tests/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file tests/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py unfold_cases present -->
 
 ---
@@ -270,7 +270,7 @@ general `SymInt` rule, not something about `multinomial` — which means the fix
 needs nothing: `aten.multinomial.default` is implemented and golden-compared.
 
 **An `overloads.json` row is not an available workaround.** Every schema string
-in both tables is checked against upstream by `tests/verify_schemas.py`, so a
+in both tables is checked against upstream by `tests/_support/verify_schemas.py`, so a
 fabricated `aten::multinomial.num_samples_tensor` would fail that check rather
 than route around the type checker. Recorded so the next round does not re-derive
 it, and `test_multinomial_with_a_tensor_num_samples_is_an_argument_form_not_a_kernel`
@@ -338,8 +338,8 @@ into "forgotten".
 > fourth and it is the one that cannot be done without the other three.
 > `docs/kernels/REPEAT.md` §2 states it that way.
 
-<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
-<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
 
 ---
 

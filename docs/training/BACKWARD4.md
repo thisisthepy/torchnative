@@ -411,7 +411,7 @@ that cannot fail under the conditions you tried it is not yet known to be a chec
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs NoGradGuard present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _GradFnNode present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _grad_fn_name present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream present -->
 
 ---
 

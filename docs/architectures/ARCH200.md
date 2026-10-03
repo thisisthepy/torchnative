@@ -7,7 +7,7 @@
 
 Worktree `work/sweep2` on develop `2498122` (vendored tree assembled fresh). torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). No Rust, `bootstrap.py`, or `aten.rs`
-was changed in this round — it re-runs `tests/arch_sweep.py` exactly as
+was changed in this round — it re-runs `tests/_support/arch_sweep.py` exactly as
 `docs/architectures/ARCH100.md` §7 describes and reports the delta. Golden stays at **10039/10039, ops=270**,
 exactly unmoved.
 
@@ -237,7 +237,7 @@ graph) and `gpt_neo` forwards outright.
   re-swept in full (§7 has the exact commands), not just the shim side.
 * **Golden: 10039/10039 cases, ops=270 — exactly unmoved.** No Rust, `bootstrap.py`, or `aten.rs`
   was touched in this worktree; `git status --short` before writing this document showed changes
-  confined to `tests/arch_sweep.py`'s own artifacts (none — the script needed no
+  confined to `tests/_support/arch_sweep.py`'s own artifacts (none — the script needed no
   edits), `docs/architectures/ARCH100.md` (pointer only), `docs/architectures/ARCH200.md` (new), and `README.md`.
 * **Suite gate: 668 ok, `DOCWATCH: PASS` 616/616, `EXIT=0`**, measured before the sweep ran, on
   the freshly built shim, from `tests/run.sh` with `PYTHON=$PY` set (its default
@@ -287,8 +287,8 @@ correct result: this round changed no Rust. The 16 names in §2 are data for the
 same way ARCH100's 31 were — this round measured and implemented nothing.
 
 <!-- DOCWATCH: op-implemented aten.scatter.value -->
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 <!-- DOCWATCH: count golden_cases_passed ge 10039 -->
 <!-- DOCWATCH: count golden_ops_covered ge 270 -->

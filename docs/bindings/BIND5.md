@@ -3,7 +3,7 @@
 Worktree `work/bind5` on develop `b33e2ee`, vendored tree assembled fresh. torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory:
 `torchnative/rust/torch_c/src/bootstrap.py`, `tests/golden/reach_allow.json`, and a new
-`tests/test_bind5.py`. `aten.rs`, `tensor.rs`, `dtype.rs`, `device.rs`,
+`tests/bindings/test_bind5.py`. `aten.rs`, `tensor.rs`, `dtype.rs`, `device.rs`,
 `capture.rs` and `tape.rs` were not touched; `test_shim.py` was not touched at all. The
 only `reach_allow.json` edit is a **deletion**: `multinomial`'s "unexercised spelling"
 entry, which §7 closes and whose own text said to remove it when a test spelled the
@@ -168,11 +168,11 @@ the factory one is the regression check, the method one is the claim.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _coerce_symint_size_tensors present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_tensor_size_list_tensor_forms present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_new_zeros_led_and_longformer_spelling_now_computes present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_float_tensor_in_a_size_list_is_refused_as_upstream_refuses_it present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_bool_tensor_is_refused_with_upstreams_own_exception_type present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_size_list_rule_is_installed_at_exactly_two_call_sites present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_wrappers_are_transparent_to_a_device_context present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_new_zeros_led_and_longformer_spelling_now_computes present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_a_float_tensor_in_a_size_list_is_refused_as_upstream_refuses_it present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_a_bool_tensor_is_refused_with_upstreams_own_exception_type present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_the_size_list_rule_is_installed_at_exactly_two_call_sites present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_the_wrappers_are_transparent_to_a_device_context present -->
 
 ---
 
@@ -262,10 +262,10 @@ graph():
 ```
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_fx_node_base present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_fx_graph_constructs_and_its_root_node_matches_upstreams present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_sort_key_survives_insertion_in_the_middle present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_node_added_to_a_graph_round_trips_through_every_member present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_node_iterator_skips_erased_nodes_without_unlinking_them present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_fx_graph_constructs_and_its_root_node_matches_upstreams present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_the_sort_key_survives_insertion_in_the_middle present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_a_node_added_to_a_graph_round_trips_through_every_member present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_the_node_iterator_skips_erased_nodes_without_unlinking_them present -->
 
 ---
 
@@ -497,10 +497,10 @@ which is how this was found rather than remembered.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _symint_from_tensor present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _fast_symint_coerce present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_multinomial_takes_a_tensor_num_samples_which_is_vilts_wall present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_bool_tensor_in_a_scalar_int_position_raises_upstreams_class present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_positional_and_keyword_spellings_of_it_agree present -->
-<!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_tensor_inside_a_sized_int_LIST_is_still_refused_here present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_multinomial_takes_a_tensor_num_samples_which_is_vilts_wall present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_a_bool_tensor_in_a_scalar_int_position_raises_upstreams_class present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_the_positional_and_keyword_spellings_of_it_agree present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind5.py test_a_tensor_inside_a_sized_int_LIST_is_still_refused_here present -->
 
 ---
 
@@ -510,7 +510,7 @@ which is how this was found rather than remembered.
 |---|---|
 | **feature added** | two argument forms — `Tensor.new_zeros` with a single-element integral Tensor in `size` (§1), and a single-element integral Tensor in any scalar `int`/`SymInt` position (§7); `torch._C._NodeBase`, `_NodeIter`, `_fx_map_arg`, `_fx_map_aggregate` — enough that `torch.fx.Graph()` constructs (§2) |
 | **defect fixed** | `docs/bindings/BIND4.md` §3's coercion accepted float, whole-float and bool Tensors that upstream refuses (§1.3); the generated fast path reproduced only one of `resolve`'s two coercions, so positional and keyword spellings could disagree (§7.2); the `repeat_interleave` refusal claimed a missing kernel that exists (§4.2) |
-| **tests added** | 27, in `tests/test_bind5.py`. No test was modified, inverted or deleted anywhere |
+| **tests added** | 27, in `tests/bindings/test_bind5.py`. No test was modified, inverted or deleted anywhere |
 | **documentation corrected** | `docs/graph/EXPORT.md` §4.1's `_NodeBase` census listed `_erased`/`_next`/`_prev` as "present and real"; all three were raising getters (§2.1). `docs/bindings/BIND3.md` §7's verdict on the §8 hand-off is superseded by measurement (§3.2) |
 | **deleted** | `reach_allow.json`'s `multinomial` entry, which §7 closes (§7.4) |
 | **kernels added** | **none.** Golden 11336/11336 ops=299, exactly unmoved |
@@ -553,7 +553,7 @@ torch.export.export(M(), (torch.ones(3),))'
 # §4, one at a time -- --one takes a single name
 for m in led longformer fastspeech2_conformer sam3_lite_text_text_model vilt; do
   PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
-    $PY tests/arch_sweep.py --one $m
+    $PY tests/_support/arch_sweep.py --one $m
 done
 ```
 

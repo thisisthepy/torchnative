@@ -37,7 +37,7 @@ at import, and refuses any :class:`Method` subclass declaring stage 1 or 2 when
 its class statement runs, each naming itself and the reason. :class:`Adapted`
 then accepts stage 0 only as a ``StatisticsMethod`` and stage 1 only as a
 ``GradientMethod``, so a stage set by attribute cannot route around the type.
-Held by ``tests/test_stagetype.py``.
+Held by ``tests/training/test_stagetype.py``.
 
 **A method is not the central type; the delta is.** DESIGN.md §3 says every
 adaptation method reduces to a weight delta over base weights, methods differing
@@ -620,7 +620,7 @@ class Adapted(torch.nn.Module):
         and ``num_batches_tracked``, and a revert that only knew about
         ``named_parameters()`` would return, report success, and leave the model
         carrying the test distribution's statistics. Held by
-        `tests/test_stage0.py`.
+        `tests/training/test_stage0.py`.
         """
         if self._delta is not None:
             self._delta.revert(self.model)

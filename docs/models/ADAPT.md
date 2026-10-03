@@ -133,7 +133,7 @@ class Tent(GradientMethod):                # stage = STAGE_NARROW_BACKWARD, DESI
 (Since SPEC S6.5 the stage is a type: `GradientMethod` and `Tent` live in
 `torchnative/adapt/gradient.py`, `adapt.Tent` still resolves to them, and a
 build configured with `TORCHNATIVE_BACKWARD=off` refuses that module at
-import. `tests/test_stagetype.py` holds it.)
+import. `tests/training/test_stagetype.py` holds it.)
 
 That is the whole of `Tent` apart from docstrings — 40 lines, no state, no
 `reset()`, no base copy, no serialisation. The second method inherits all of
@@ -675,9 +675,9 @@ adaptation API had needed a kernel, which would have been news.
 > that — only that it did not go **down**. A marker asserting equality on a number other work
 > legitimately moves fails on somebody else's commit, which is the crying-wolf failure
 > `docs/verification/DOCWATCH.md` warns about, arriving in a marker rather than in the checker.
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_reduces_prediction_entropy_and_upstream_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_delta_reverts_the_base_weights_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not present -->
 
 ### 11.1 The eight new tests
 
@@ -733,7 +733,7 @@ $PY /tmp/adapt/sab.py            # or /tmp/adapt/sab.py S12 S13 for one
 # §11  gates
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/adapt/ev1  ;  $SHIM /tmp/train/sweeptrain.py /tmp/adapt/tr1
 ```
 
@@ -886,7 +886,7 @@ both sides, so the two processes see identical bytes with no shared RNG.
 | — | — | **new:** `BertForMaskedLM` cannot load (§13.4) |
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
 
 ### 13.6 Every command in §13
 
@@ -1080,8 +1080,8 @@ open item, L5, which had no oracle then and has one now (`docs/training/BACKWARD
 section named is closed; the oracle that closed it immediately found a second one, in
 `grad_weight`/`grad_bias` at mixed precision, and that is named in §18.7 rather than fixed.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 

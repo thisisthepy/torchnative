@@ -3,7 +3,7 @@
 `docs/architectures/VOICE3.md` landed three kernels — `im2col`, `col2im`, `upsample_nearest1d` —
 and could not bind any of them, because `torchnative/rust/torch_c/src/bootstrap.py` was another
 round's file. It recorded the gap in `tests/golden/reach_allow.json` and asserted it
-from both sides in `tests/test_voice3.py`. This round closes it.
+from both sides in `tests/models/test_voice3.py`. This round closes it.
 
 The bar was set by `docs/bindings/BINDINGS.md`, which was told "`mish` just needs a binding"
 and found the kernel gone: **each binding here says whether its kernel was really
@@ -70,7 +70,7 @@ would have been the easier change and would have put a door on this shim that up
 does not have. `test_no_torch_level_spelling_was_invented_for_these_three` holds it from
 this side too.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bind3.py test_no_torch_level_spelling_was_invented_for_these_three present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind3.py test_no_torch_level_spelling_was_invented_for_these_three present -->
 
 ## 2. `torch._C._nn.col2im` — `F.fold`, `f5-tts`
 
@@ -161,7 +161,7 @@ both readings, **asserts they differ before asserting anything else**, and then 
 upstream to equal one and not the other. That is the `§5.5` shape — a verification that
 can fail.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bind3.py test_the_scale_factor_is_forwarded_and_not_merely_used_to_size_the_output present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind3.py test_the_scale_factor_is_forwarded_and_not_merely_used_to_size_the_output present -->
 
 ## 4. What the check then deleted
 
@@ -192,11 +192,11 @@ three probe cases agree with upstream element-wise. Its docstring said "delete t
 test", and the coverage was kept instead: those are the only cases in that file that go
 through the `F.*` spelling rather than through `torch.ops.aten.*`.
 
-<!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice3.py test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F present -->
 
 ## 5. `llama4`'s vision tower — what is and is not claimed
 
-`tests/arch_sweep.py --only llama4` reports **1/1 forward** on the shim and 1/1 on
+`tests/_support/arch_sweep.py --only llama4` reports **1/1 forward** on the shim and 1/1 on
 upstream. **That is not evidence for this round**, and saying so is the point of this
 section.
 
@@ -359,7 +359,7 @@ no matching benefit, and `docs/graph/EXPORT.md` §8 is written as one patch for 
 `set_eval_frame`'s refusal was not approached.
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/upstream.py install present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
 
 ---
 
@@ -371,8 +371,8 @@ Split as `docs/architectures/ARCH100.md` §5.3 asks, because "landed" is not one
 |---|---|
 | **feature added** | 3 `_install_nn` bindings — `im2col`, `col2im`, `upsample_nearest1d` — and the `_int_pair` helper they share. No kernel, no `aten.rs` change, no new dispatch key |
 | **defect fixed** | none |
-| **tests added** | `tests/test_bind3.py`, 17 tests, every positive one element-wise against a live upstream in its own process |
-| **tests inverted** | 1 in `tests/test_voice3.py` — the one asserting these three unreachable from `F.*`. Not deleted |
+| **tests added** | `tests/bindings/test_bind3.py`, 17 tests, every positive one element-wise against a live upstream in its own process |
+| **tests inverted** | 1 in `tests/models/test_voice3.py` — the one asserting these three unreachable from `F.*`. Not deleted |
 | **documentation** | this file |
 | **deleted** | 3 entries from `tests/golden/reach_allow.json`, deleted *because* the gaps closed and `reach.py` fails on a stale entry |
 | **architectures moved** | none claimed. `llama4`'s vision **patch embedding** runs and matches upstream (§5); the tower as a whole still stops, on complex `view` |

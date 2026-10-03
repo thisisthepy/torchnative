@@ -15,7 +15,7 @@ already established for the same reason: this project ships wheels for macOS,
 Linux, Windows, Android, iOS and wasm32, and a path rule that is right on Linux
 and wrong on Windows is exactly the defect no single-platform test run would
 catch. Every one of the six answers is decided here and asserted in
-`tests/test_ovcache.py`, from whichever one machine is running.
+`tests/devices/npu/test_ovcache.py`, from whichever one machine is running.
 
 **What each platform gets, and why that one:**
 

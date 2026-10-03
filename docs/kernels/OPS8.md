@@ -21,7 +21,7 @@
 |---|---|---|---|
 | 골든 (`tests/golden/compare.py`) | 1043/1043, ops covered=**62** | **1212/1212**, ops covered=**70** | **0** |
 | 골든 실패 / pending | 0 / 0 | **0 / 0** | — |
-| 스키마 (`tests/verify_schemas.py`) | 127/127 | **127/127** | **0** |
+| 스키마 (`tests/_support/verify_schemas.py`) | 127/127 | **127/127** | **0** |
 | 스모크 (`tests/run.sh`) | 60 ok | **60 ok** | **0** |
 | `--inject-fault value` | — | 첫 `match` 케이스에서 잡힘 | **1** |
 | `--inject-fault shape` | — | 잡힘 | **1** |
@@ -340,7 +340,7 @@ PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 # 붙이면 벤더링 트리가 상류 torch 를 가려서 비교의 양쪽이 같은 것이 되고 가짜 실패가 난다.
 cd ../..
 $PY tests/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
-$PY tests/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
 for m in value shape dtype; do
   $PY tests/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
 done

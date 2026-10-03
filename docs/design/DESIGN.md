@@ -381,7 +381,7 @@ FL 만 상태가 기기를 떠납니다. 그래서 FL 에만 직렬화 포맷 ·
 되돌립니다. 단계 0 의 step 은 캡처도 테이프도 옵티마이저도 쓰지 않습니다: 선택된 정규화 모듈을
 forward 동안만 training 모드로 두어 러닝 통계가 갱신되게 하고, 원래 모드로 되돌립니다.
 `torchnative.adapt.BatchNormStats` 가 그것이고, 상류 torch 가 같은 모듈을 같은 모드로 돌렸을 때의
-통계와 대조해 검증합니다 (`tests/test_stage0.py`).
+통계와 대조해 검증합니다 (`tests/training/test_stage0.py`).
 
 TTL 은 이 델타가 사는 범위이고 (§3 의 중첩), TTA · TTT 는 그 안의 좁은 영역입니다. 따라서
 **`adapt/` 아래에 TTA 와 TTT 를 나란한 모듈로 두면 안 됩니다** — 중첩을 평평하게 펴는 것이라,

@@ -3,7 +3,7 @@
 Worktree `work/rnn` on develop `a523ae4`, vendored tree assembled fresh. torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `overloads.json`, `methods.json`, `tests/golden/cases.py`, and a new
-`tests/test_rnn.py`. `tensor.rs`, `dtype.rs`, `bootstrap.py`, `capture.rs`,
+`tests/ops/test_rnn.py`. `tensor.rs`, `dtype.rs`, `bootstrap.py`, `capture.rs`,
 `tape.rs`, `device.rs`, `scripts/wheel/` and `torchnative/` were not touched.
 
 docs/architectures/ARCH200.md §2 named three operators worth six of its twenty-seven blocked architectures:
@@ -28,7 +28,7 @@ docs/architectures/ARCH20.md (`bootstrap.py:8883`). docs/architectures/ARCH200.m
 was measured on a checkout where that work had not yet merged — its own §1 says so — so the
 classifier attributed a different refusal to the name it saw in the traceback.
 
-`tests/test_rnn.py::test_conv1d_is_a_name_not_a_kernel` asserts there is no `aten.conv1d.*`
+`tests/ops/test_rnn.py::test_conv1d_is_a_name_not_a_kernel` asserts there is no `aten.conv1d.*`
 key in this build and that there does not need to be, so the finding cannot rot back into a
 kernel request.
 
@@ -290,7 +290,7 @@ That single failure is also the only reason docwatch reports `smoke_ok = 479` ag
 functionality added     2 kernels (aten.lstm.input, aten.upsample_linear1d.default)
                         1 overload table entry (torch.lstm, both overloads)
 defects fixed           0 pre-existing (the staged-hidden-row bug was this round's own)
-tests added             25 in tests/test_rnn.py; 770 golden cases (10039 -> 10809 is
+tests added             25 in tests/ops/test_rnn.py; 770 golden cases (10039 -> 10809 is
                         this round plus what merged before it -- the round's own
                         contribution is the two builders)
 documentation corrected 1 (docs/architectures/ARCH200.md's `torch.conv1d` row: a name, and already spelled)

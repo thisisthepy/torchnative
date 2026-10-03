@@ -225,7 +225,7 @@ The repository's own gates, run on the final artefact:
 ```
 PYTHON=$PY sh tests/run.sh   -> 197 ok, exit 0
 $PY tests/golden/compare.py                 -> 2811/2811, ops covered=119, exit 0
-$PY tests/verify_schemas.py  -> 4203/4203, exit 0
+$PY tests/_support/verify_schemas.py  -> 4203/4203, exit 0
 ```
 
 Unchanged from before the work, which is the point.
@@ -636,7 +636,7 @@ The repository's gates, on the final artefact:
 PYTHON=$PY sh tests/run.sh   -> 211 ok,                        exit 0
 $PY tests/golden/compare.py                 -> 2843/2843, ops covered=119,    exit 0
 $PY tests/golden/compare.py --self-test     -> PASS, 12 x 11 fault modes,     exit 0
-$PY tests/verify_schemas.py  -> 4203/4203,                     exit 0
+$PY tests/_support/verify_schemas.py  -> 4203/4203,                     exit 0
 ```
 
 Golden is a real guard on this path now — it carries 32 keyword cases, which is
@@ -1022,7 +1022,7 @@ the smoke test written *against* that documented bug now disagrees with it:
 FAIL test_decompose_refuses_by_name_what_it_cannot_lower: AssertionError
 ```
 
-`tests/test_shim.py`'s
+`tests/_support/test_shim.py`'s
 `test_decompose_refuses_by_name_what_it_cannot_lower` asserts, as its third
 of three refusal cases, that lowering `aten.baddbmm.default` produces a
 result the capture *disagrees* with (`"aten.baddbmm.default" in
@@ -1034,7 +1034,7 @@ and the assertion fails. Confirmed directly: calling `_decomp_road_fixture()`
 after the fix returns `refuse_disagrees: "ACCEPTED"` where it used to return
 the `DecompositionRefused` message the test checks the wording of.
 
-**This is not touched.** `tests/test_shim.py` and
+**This is not touched.** `tests/_support/test_shim.py` and
 `docs/graph/DECOMP.md` are outside this round's territory (`bootstrap.py` +
 `docs/bindings/BIND.md`), and the assertion encodes a bug this round's fix genuinely
 removes -- updating it is a real, small change (the test's case 3 needs a
@@ -1152,7 +1152,7 @@ optimisation.
   against this machine's noise floor, reported as did-not-regress.
 - **One smoke test now fails**, `test_decompose_refuses_by_name_what_it_cannot
   _lower`, because it pinned the bug this fix removes as expected behaviour.
-  Not fixed here -- out of territory (`tests/test_shim.py`).
+  Not fixed here -- out of territory (`tests/_support/test_shim.py`).
   Golden (2843/2843), the self-test (PASS) and schemas (4203/4203) all hold
   exactly, unaffected.
 - **The profile shows nothing else to fold in `bootstrap.py`.** `resolve` is

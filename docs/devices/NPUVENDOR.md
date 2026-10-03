@@ -7,7 +7,7 @@
 
 `torchnative/python/torchnative/device/__init__.py`,
 `torchnative/python/torchnative/device/_pcivendor.py`.
-Tests: `tests/test_npuvendor.py`, `tests/test_devicens.py`.
+Tests: `tests/devices/npu/test_npuvendor.py`, `tests/devices/test_devicens.py`.
 Hardware script for the one machine that can settle this: `scripts/devices/npuvendor_verify.py`.
 
 ## 0. The defect

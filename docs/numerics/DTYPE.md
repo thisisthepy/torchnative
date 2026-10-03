@@ -62,7 +62,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, half 2.7.1, rustc 1.98.
 ```
 PYTHON=$PY sh tests/run.sh        전 171 통과 -> 후 175 (+4)
 $PY tests/golden/compare.py                      2744/2744, ops=118        (변화 없음)
-$PY tests/verify_schemas.py       3076/3076                 (변화 없음)
+$PY tests/_support/verify_schemas.py       3076/3076                 (변화 없음)
 cd torchnative/rust/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
 ```
 
@@ -544,7 +544,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # <- 빼먹으�
 
 PYTHON=$PY sh tests/run.sh        # 175
 $PY tests/golden/compare.py                      # 2744/2744 ops=118
-$PY tests/verify_schemas.py       # 3076/3076
+$PY tests/_support/verify_schemas.py       # 3076/3076
 ( cd torchnative/rust/torch_c && cargo test --release )      # 7
 ```
 

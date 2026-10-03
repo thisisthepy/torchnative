@@ -10,7 +10,7 @@
 Worktree `work/agree` on develop `b33e2ee` (vendored tree assembled fresh). torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout. No Rust,
 `bootstrap.py` or `aten.rs` was changed in this round: it adds
-`tests/agree_sweep.py`, `tests/test_agree.py` and this document.
+`tests/_support/agree_sweep.py`, `tests/numerics/test_agree.py` and this document.
 Golden stays at **11336/11336, ops=299** — exactly unmoved, which is the correct result for a
 round that changed no kernel.
 
@@ -328,11 +328,11 @@ binary and reports a plausible but wrong number (`docs/architectures/ARCH100.md`
 `HF_HOME=/tmp/hf-agree` was set and removed afterward; no checkpoint was downloaded, since this
 sweep builds every model from a config.
 
-<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py calibration_batch present -->
-<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py diff_stats present -->
-<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py verdict present -->
-<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py bisect_one present -->
-<!-- DOCWATCH: symbol-in-file tests/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py calibration_batch present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py diff_stats present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py verdict present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py bisect_one present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
 <!-- DOCWATCH: count golden_cases_passed ge 11336 -->
 <!-- DOCWATCH: count golden_ops_covered ge 299 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->

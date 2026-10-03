@@ -26,7 +26,7 @@ That laziness is also what makes the `nn.Module.to` patch safe to install at
 # Written out rather than scanned off `__path__`: a directory listing at import
 # time is a stat call per entry on a road that exists to be cheap, and it would
 # also make `__all__` depend on what happens to be installed. Added here is
-# added on purpose. `tests/test_tnnamespace.py` compares this
+# added on purpose. `tests/api/test_tnnamespace.py` compares this
 # list against the disk and fails if a new subpackage is not added.
 __all__ = [
     "adapt",

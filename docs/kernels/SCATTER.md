@@ -73,7 +73,7 @@ each moved with the arithmetic that keeps it a check (§8).
                       15 blocked       2 blocked
 ```
 
-`tests/arch_sweep.py --only <the fifteen>`, run on both sides. Upstream forwards
+`tests/_support/arch_sweep.py --only <the fifteen>`, run on both sides. Upstream forwards
 all fifteen (the baseline docs/architectures/ARCH100.md established, re-confirmed here rather than assumed);
 the shim forwards thirteen.
 
@@ -118,7 +118,7 @@ being dominated by one family applies here too.
 
 **`reduce=` is not implemented, and the measurement is the reason.** Not one of the eleven passes
 it. `scatter.reduce` and `scatter.value_reduce` have no kernel and no table entry; the refusal is
-the *unimplemented-op* one, which is a precise work item. `tests/test_scatter.py` has a test
+the *unimplemented-op* one, which is a precise work item. `tests/ops/test_scatter.py` has a test
 that fails if that ever silently changes.
 
 <!-- DOCWATCH: op-not-implemented aten.scatter.reduce -->
@@ -457,7 +457,7 @@ tests/golden/cases.py       164 new cases across eight ops (34 scatter.value, 36
                             compared against upstream element-wise, in a separate process.
                             Boundary values, dtype refusals, and the view-write cases for
                             scatter_.
-tests/test_scatter.py
+tests/ops/test_scatter.py
                             23 tests, all through the USER-LEVEL spelling (torch.<name> /
                             Tensor.<name>), each comparing a vendored-tree subprocess against
                             an upstream subprocess with PYTHONPATH stripped. Nothing here is a

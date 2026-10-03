@@ -23,12 +23,12 @@
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs logsumexp_lastdim present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs LOGSUMEXP_LASTDIM_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_sdpa_logsumexp_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_wrong_logsumexp_is_rejected_by_this_tolerance present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_logsumexp_ran_on_the_gpu_and_cost_exactly_one_more_shader present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_fully_masked_row_reports_upstreams_logsumexp_convention present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_every_test_in_this_file_is_actually_collected present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_sdpa_logsumexp_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_a_wrong_logsumexp_is_rejected_by_this_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_the_logsumexp_ran_on_the_gpu_and_cost_exactly_one_more_shader present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_a_fully_masked_row_reports_upstreams_logsumexp_convention present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/vulkan/test_vulkan4.py test_every_test_in_this_file_is_actually_collected present -->
 
 ---
 

@@ -354,7 +354,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # 빼먹으면 �
 
 PYTHON=$PY sh tests/run.sh          # 197
 $PY tests/golden/compare.py                        # 2760/2760 ops=118
-$PY tests/verify_schemas.py         # 4200/4200
+$PY tests/_support/verify_schemas.py         # 4200/4200
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/linear-scratch/` 에 있습니다:

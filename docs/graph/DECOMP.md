@@ -13,7 +13,7 @@
 
   > **Correction (문서 감사, 재측정 2026-09):** 이 숫자는 이 문서가 쓰인 시점(2026-08-30)의
   > 것이고, 그 뒤로 이 문서의 영역 밖에서 커널이 계속 늘어나(148 개로, `docs/verification/AUDIT.md` 베이스라인)
-  > 모집단과 낮아진 개수가 둘 다 커졌습니다. `tests/decomp_sweep.py` 를 오늘의
+  > 모집단과 낮아진 개수가 둘 다 커졌습니다. `tests/_support/decomp_sweep.py` 를 오늘의
   > 빌드로 재실행(스크립트 자체는 이 문서 이후 바뀌지 않음, `git log` 확인):
   > `_aten_all_implemented() = 157`, `core = 90`, `non-core = 67`, 캡처가 애초에 거절하는 것
   > 22 개(변이 19 · 난수 3), **모집단 45**(37 아님). 그중 **LOWERED 11**(9 아님) — §4 의 9 개
@@ -53,8 +53,8 @@
 
 바뀐 파일: `torchnative/rust/torch_c/src/bootstrap.py`, `torchnative/rust/torch_c/src/overloads.json`,
 `torchnative/python/torchnative/export/decompose.py`,
-`tests/test_shim.py`, `tests/verify_schemas.py`,
-그리고 §4 의 표를 만드는 `tests/decomp_sweep.py`.
+`tests/_support/test_shim.py`, `tests/_support/verify_schemas.py`,
+그리고 §4 의 표를 만드는 `tests/_support/decomp_sweep.py`.
 
 ---
 
@@ -288,7 +288,7 @@ torch.sub         aten.rsub.Scalar 의 규칙이 부른다    → aten::sub.{out
 
 ## 4. 실측 — 무엇이 덮이고 무엇이 안 덮이는가
 
-`tests/decomp_sweep.py` 가 이 표를 만듭니다.
+`tests/_support/decomp_sweep.py` 가 이 표를 만듭니다.
 
 ### 모집단
 
@@ -541,7 +541,7 @@ dtype 이 이제 인턴되므로 규칙과 기록이 일치하고, 트레이스�
 
 없다는 것은 찾아보고 내린 결론입니다. 두 가지로 훑었습니다:
 
-- `tests/decomp_sweep.py` — 구현된 비 Core op 전체(모집단 38 개). 결과: LOWERED 10,
+- `tests/_support/decomp_sweep.py` — 구현된 비 Core op 전체(모집단 38 개). 결과: LOWERED 10,
   REFUSED 26(전부 벽 1 또는 벽 2), CAPTURE_RAISED 1, NO_CASE 2. **DISAGREES 0.**
 - 낮아지는 그 10 개를 dtype 8 종 · 여러 shape · `beta`/`alpha` 조합 · 다중 op 트레이스로 넓혀
   **188 개 트레이스**를 분해. **DISAGREES 0.**
@@ -625,7 +625,7 @@ DESIGN.md §5 의 3 층 구조에서 **2 층("분해 테이블을 벤더링 — 
 | `cargo build --release` | 0 |
 | `PYTHON=... sh tests/run.sh` | 0 — **176/176 통과** (이전 169) |
 | `python tests/golden/compare.py` | 0 — **2744/2744**, ops=118 |
-| `python tests/verify_schemas.py` | 0 — **4200/4200** (이전 3076) |
+| `python tests/_support/verify_schemas.py` | 0 — **4200/4200** (이전 3076) |
 
 `verify_schemas.py` 가 새로 확인하는 것 셋:
 
@@ -687,14 +687,14 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh    # 176
 $PY tests/golden/compare.py                  # 2744/2744 ops=118
-$PY tests/verify_schemas.py   # 4200/4200
+$PY tests/_support/verify_schemas.py   # 4200/4200
 ```
 
 §4 의 표:
 
 ```sh
 PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
-    $PY tests/decomp_sweep.py          # --json 이면 거절문까지
+    $PY tests/_support/decomp_sweep.py          # --json 이면 거절문까지
 ```
 
 §3 의 숫자:
@@ -725,7 +725,7 @@ print("CIA:", len(torch._C._dispatch_get_registrations_for_dispatch_key(
 
 이번 회차가 한 것: 목적지를 매개변수로 만든 모듈(`torchnative/export/target.py`)을 세우고,
 **이 프로젝트가 실제로 돌리는 모델에서 캡처한 그래프**에 대고 개수를 셌습니다. 추정이 아니라
-계수입니다. 재현은 `tests/nnapi_sizing.py`.
+계수입니다. 재현은 `tests/_support/nnapi_sizing.py`.
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py nnapi_ops present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py coreml_ops present -->

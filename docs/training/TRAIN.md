@@ -417,7 +417,7 @@ value to check against, and it matches.
 
 Before this, **`.eval()` was assumed everywhere and nothing would have noticed training regressing**
 — not the smoke tests, not golden, not either sweep. `test_train_mode_forwards_the_four_
-architectures_eval_mode_hid` in `tests/test_shim.py` is that gap closed, built in the shape
+architectures_eval_mode_hid` in `tests/_support/test_shim.py` is that gap closed, built in the shape
 `test_a_real_transformers_llama_forward_matches_upstream` set: the same `transformers` in both
 interpreters, the vendored tree in a subprocess and upstream in this one, weights pushed in by one
 shared procedure so neither side depends on the other's random stream.

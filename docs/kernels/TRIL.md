@@ -496,7 +496,7 @@ bash scripts/vendor/install_shim.sh                     exit 0
 PYTHON=$PY sh tests/run.sh       253 ok, 0 FAIL            exit 0
 $PY tests/golden/compare.py                     4284/4284, ops=139        exit 0
 $PY tests/golden/compare.py --self-test         13 x 11, 0 problems       exit 0
-$PY tests/verify_schemas.py      4353/4353                 exit 0
+$PY tests/_support/verify_schemas.py      4353/4353                 exit 0
 cargo test --release                            18 passed                 exit 0
 ```
 

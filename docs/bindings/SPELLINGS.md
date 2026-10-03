@@ -168,7 +168,7 @@ out 변형(`sort.values`, `sort.values_stable`)은 넣지 않았다 — 커널�
 갱신. `bootstrap.py`: `_install_tensor_softmax` 신설, `_install_tensor_methods` 에서 호출.
 
 모든 스키마 문자열은 `str(torch.ops.aten.<op>.<ov>._schema)` (torch 2.13.0)에서 그대로
-전사했다 — 지어낸 것이 없다. `tests/verify_schemas.py` 가 그것을 재확인한다(170/170).
+전사했다 — 지어낸 것이 없다. `tests/_support/verify_schemas.py` 가 그것을 재확인한다(170/170).
 
 ---
 
@@ -388,7 +388,7 @@ value/shape/dtype` 전부 그대로 exit 1. 호스트 스모크(`tests/run.sh`) 
 
 ### 5.6 손대지 않은 것 / 이 회차 밖
 
-`aten.rs`, `tests/golden/cases.py`, `tests/golden/compare.py`, `tests/test_shim.py`는
+`aten.rs`, `tests/golden/cases.py`, `tests/golden/compare.py`, `tests/_support/test_shim.py`는
 이번 회차의 파일 범위 밖이라 한 줄도 고치지 않았다 — 커널 추가도 하지 않았다. `nn.LayerNorm`에
 대한 회귀 테스트를 `test_shim.py`에 박아 두는 것은 다음 회차의 작업 항목이다(§4가 남긴 것과 같은
 이유 — 이번에 손으로 확인한 것을 자동화하지 못했다).
@@ -484,7 +484,7 @@ out=o)`(dim 없이) 호출 자체가 상류에서 `TypeError`를 낸다(측정, 
 
 ### 6.4 `test_shim.py`를 한 줄 고쳤다 — 파일 범위 밖이지만 회귀였다
 
-`tests/test_shim.py::test_overload_resolution_refuses_rather_than_guessing`가
+`tests/_support/test_shim.py::test_overload_resolution_refuses_rather_than_guessing`가
 "표 항목이 없는 op"의 예시로 정확히 `relu`를 썼다. `relu`에 표 항목을 주는 순간 이 테스트가
 깨진다 — `torch.relu(1)`이 이제 "no table entry"가 아니라 "no matching overload"로 거부되기
 때문이다(정확히 의도한 동작 변화). 지시받은 파일 범위는 `bootstrap.py`/`overloads.json`/
@@ -532,7 +532,7 @@ op가 아니다).
 남긴 25개 이름을 마저 채우는 것이다. §6까지의 233/233은 이제 오래된 기준선이므로, 이번
 회차는 `docs/architectures/ARCH20.md` §9의 기준선(151/151, 4295/4295)에서 이어 쓴다. 파일 범위는
 `overloads.json`/`methods.json`/`bootstrap.py`/`tests/golden/cases.py`/
-`tests/test_shim.py`/이 문서였고, `aten.rs`/`tensor.rs`/`dtype.rs`는 다른
+`tests/_support/test_shim.py`/이 문서였고, `aten.rs`/`tensor.rs`/`dtype.rs`는 다른
 에이전트가 작업 중이라 금지됐다 — §6의 "표 항목이 커널을 보장하지 않는다"는 원칙이 이번에도
 그대로 적용된다.
 
@@ -857,7 +857,7 @@ develop `e34f65d` (§8 이 돈 체크아웃보다 뒤) 이고, 지시 자체가 
 
 `overloads.json` 항목 수: **96/96 → 101/101**(+5 키), 스키마 문자열 수 **220 → 228**(+8 =
 masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 항목, 180 스키마
-문자열 그대로**(변경 없음 — 다섯 개 다 이미 있었다). `tests/verify_schemas.py`:
+문자열 그대로**(변경 없음 — 다섯 개 다 이미 있었다). `tests/_support/verify_schemas.py`:
 `overloads.json 228/228 matched`, `methods.json 180/180 matched`, `SUMMARY 4487/4487 matched,
 0 failed`.
 
@@ -935,7 +935,7 @@ masked_fill 2 + clamp_ 2 + exp_ 1 + fill_ 2 + neg_ 1). `methods.json`은 **114 �
 
 추가한 6개 각각에 "이름을 빼면 실제로 빨개지는" 케이스를 뒀다:
 
-* `tests/test_shim.py`의
+* `tests/_support/test_shim.py`의
   `test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree` —
   벤더 트리를 이 셈의 `_C` 위에 얹은 진짜 `import torch`로 `torch.<name>(...)`와
   `tensor.<name>(...)` 양쪽, 6개 전부를 값 대조(수작업 계산 기대값, `math.exp` 등, 상류

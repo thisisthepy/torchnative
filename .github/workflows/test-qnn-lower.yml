@@ -35,7 +35,7 @@
 # Modelled on `test-published-wheel.yml`, which is this repository's example
 # of a CI job careful about the boundary between what it ran and what it
 # proved. The verification logic is NOT in this file: it is
-# `.github/scripts/qnn_lower.py`, tested by `tests/test_qnnci.py` on a
+# `.github/scripts/qnn_lower.py`, tested by `tests/devices/qnn/test_qnnci.py` on a
 # machine that has no executorch. AGENTS.md §17.5 -- logic that lives only in a
 # `run: |` block can never be tested, only pushed and watched.
 name: qnn lower

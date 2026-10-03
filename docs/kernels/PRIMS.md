@@ -41,7 +41,7 @@ docs/graph/DECOMP.md §12.4 가 "NNAPI 를 막는 것은 분해 24 개가 아니
 
 ## 2. 열린 것 — 상류의 분해가 끝까지 돕니다
 
-`tests/nnapi_sizing.py`, 같은 세 그래프:
+`tests/_support/nnapi_sizing.py`, 같은 세 그래프:
 
 | | 이전 (docs/graph/DECOMP.md §12.5) | 지금 |
 |---|---|---|

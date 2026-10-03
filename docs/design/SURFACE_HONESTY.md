@@ -437,7 +437,7 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 
 ```
  M torchnative/rust/torch_c/src/bootstrap.py        __bool__ · _BUILD_FLAGS 14 개 · install 의 불변식 검사
- M tests/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
+ M tests/_support/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
  M scripts/vendor/gen_surface.py                `_bool` 주석을 "bool" kind 로 보존
  M torchnative/rust/torch_c/src/surface.json        재생성. 14 개 이름의 kind 만 바뀜, 그 외 바이트 동일
 ```
@@ -458,7 +458,7 @@ FAIL test_every_build_flag_the_stubs_declare_answers_with_a_real_bool: Assertion
 |---|---|
 | 스모크 (`tests/run.sh`) | **exit 0** — ok 62 / FAIL 0 |
 | 골든 (`tests/golden/compare.py`) | **exit 0** — 1043/1043, ops covered=**62** |
-| 스키마 (`tests/verify_schemas.py`) | **exit 0** — 127/127 |
+| 스키마 (`tests/_support/verify_schemas.py`) | **exit 0** — 127/127 |
 | strict probe `--target torch` | **exit 0** |
 | strict probe `--target transformers` | **exit 0** |
 | 호스트 `cargo build --release` | **exit 0** |
@@ -479,7 +479,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 scripts/vendor/vendor_torch.sh && scripts/vendor/install_shim.sh
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 TORCH_USE_RTLD_GLOBAL=1 $PY scripts/vendor/probe.py --mode strict --target torch
 ```
 

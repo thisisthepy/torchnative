@@ -824,7 +824,7 @@ Nothing in `torchnative/rust/torch_c/src/` changed. One test was added, because 
 in a document and **nothing checked it** — which is precisely the mechanism `docs/verification/AUDIT.md` found
 behind six of eleven false claims, and `docs/verification/DOCWATCH.md` exists to stop.
 
-`test_the_autograd_boundary_is_where_autograd_md_says_it_is` in `tests/test_shim.py`
+`test_the_autograd_boundary_is_where_autograd_md_says_it_is` in `tests/_support/test_shim.py`
 pins the three facts §1 measured, against `_C` alone (no vendored-tree subprocess needed):
 
 | assertion | what it catches |

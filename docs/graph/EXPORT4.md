@@ -38,13 +38,13 @@ develop `976a01b`.
 | Where does it stop now? | `meta_utils.py:2071`, `r.untyped_storage()` — `docs/graph/EXPORT.md` §3.3 (§7) |
 | Is the remaining wall a missing name? | **No.** A storage handle with identity and size but no bytes — a design question (§7) |
 | Does a `TorchDispatchMode` see operators? | **Yes**, and now stops seeing them under `no_dispatch()` (§5) |
-| Tests added | 18, in `tests/test_export4.py` |
+| Tests added | 18, in `tests/export/test_export4.py` |
 | Nullifications attempted / caught | **9 / 9** (§8) |
-| New measurement tool | `tests/export_sweep.py` (§9) |
+| New measurement tool | `tests/_support/export_sweep.py` (§9) |
 
-<!-- DOCWATCH: symbol-in-file tests/test_export4.py test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export4.py test_no_dispatch_actually_suppresses_now_that_the_door_reads_the_stack present -->
-<!-- DOCWATCH: symbol-in-file tests/test_export4.py test_empty_strided_refuses_a_non_contiguous_stride_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export4.py test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export4.py test_no_dispatch_actually_suppresses_now_that_the_door_reads_the_stack present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export4.py test_empty_strided_refuses_a_non_contiguous_stride_by_name present -->
 
 ---
 
@@ -107,7 +107,7 @@ Separated:
 |---|---|
 | **feature added** | `aten.empty_strided.default` (§4); `torch.is_inference_mode_enabled`; `torch._C._should_allow_numbers_as_tensors`; `torch._C._dispatch_has_computed_kernel_for_dispatch_key`; `torch._C._set_throw_on_mutable_data_ptr` and the per-tensor bit behind it; `torch._C._set_warn_deprecated_on_mutable_data_ptr`, its softer sibling; `stride()`/`storage_offset()` on a meta tensor |
 | **defect fixed** | **`no_dispatch()` suppressed nothing** once the door began consulting the mode stack (§5) — predicted by `docs/graph/EXPORT.md` §2.4 and not caught by any check for a missing name, because no name was missing |
-| **tests added** | 18, `tests/test_export4.py`; 4 existing count/named-list assertions updated in `test_shim.py` and `test_dispatch.py` (§12) |
+| **tests added** | 18, `tests/export/test_export4.py`; 4 existing count/named-list assertions updated in `test_shim.py` and `test_dispatch.py` (§12) |
 | **measurement** | the re-derived wall sequence (§1, §7); the two predicate tables derived from upstream rather than transcribed (§6); `export_sweep.py` (§9) |
 | **documentation corrected** | `docs/graph/EXPORT.md` §2.4's "entering a counter is a correct implementation" is no longer true, and §3.1/§3.2 are now closed; §13 records all three |
 | **deleted** | none |
@@ -486,7 +486,7 @@ load-bearing without proving *which* behaviour depends on it.
 
 ## 9. `export_sweep.py` — the tool for the claim this round could not make
 
-`tests/export_sweep.py`, new. `arch_sweep.py` asks "does a forward
+`tests/_support/export_sweep.py`, new. `arch_sweep.py` asks "does a forward
 pass run" across every `transformers` architecture; this asks the harder
 question, and keeps **three** verdicts apart rather than merging them:
 

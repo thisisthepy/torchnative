@@ -5728,7 +5728,7 @@ def lift_fresh_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `aten::lift_fresh_copy(Tensor self) -> Tensor` is the op functionalisation
 # rewrites `lift_fresh` into, and the one that actually appears in an
 # `ExportedProgram` -- `lift_fresh` never survives into one
-# (`tests/test_liftfresh.py`, measured on both sides).
+# (`tests/export/test_liftfresh.py`, measured on both sides).
 #
 # It is a **copy**, not the alias `lift_fresh` returns, and it lays its output
 # out **contiguously**, which is where it parts company with
@@ -10849,7 +10849,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # So the aten op always broadcasts and has no flag; `enable_gqa` is a
 # validation switch in the Python-level wrapper, and that half is tested in
-# tests/test_shim.py where the wrapper lives.
+# tests/_support/test_shim.py where the wrapper lives.
 #
 # **Which repetition** is the part that fails plausibly rather than loudly.
 # Measured three ways on q=(2,9,4,8), k=v=(2,3,4,8):
@@ -11000,7 +11000,7 @@ def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
 #                    remainder that is fused where the body is not
 #
 # These are tolerance checks like every other case in this file. The exact
-# ones live in `tests/test_shim.py` -- see the section comment there for why
+# ones live in `tests/_support/test_shim.py` -- see the section comment there for why
 # one bfloat16 ulp is invisible to `dtypes.py::TOLERANCES`, and what that cost.
 #
 # **These sixteen run with the reference kernel switched on; the sdpa cases
@@ -20402,7 +20402,7 @@ def clamp_min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
         the bool-bound row's message names `clamp_min_scalar_cpu`, not
         `clamp_scalar_cpu`, and the case is `both_error` so the two sides only
         have to agree that it refuses; the wording is asserted in
-        `tests/test_shim.py`, where the string is visible.
+        `tests/_support/test_shim.py`, where the string is visible.
       * "clamp both ends" -- a kernel that also applied a ceiling would pass
         every non-negative case, so `[1, 5, 10, -3]` with `min=2` is here:
         the answer keeps `10`.
@@ -23949,7 +23949,7 @@ def _pad_nd_cases(op: str, mode: str, ndim: int):
     element, replicate does. Both are plausible-looking output, so an
     implementation with the two swapped passes any check that only asserts
     "the shape grew and the middle survived". Both spellings run the same
-    values here, and `tests/test_pad.py` additionally asserts they
+    values here, and `tests/ops/test_pad.py` additionally asserts they
     *disagree*.
     """
     def build(torch_module, c_module, torch_call) -> list[Case]:
@@ -24075,7 +24075,7 @@ def _stft_cases(op: str, centred: bool):
     So every case below passes `return_complex=False`. The transform is not
     unmeasured by that -- the trailing 2 carries both halves, so a dropped or
     conjugated imaginary part fails these cases exactly as it fails
-    `tests/test_fft.py`.
+    `tests/ops/test_fft.py`.
 
     The signal is asymmetric and non-periodic on purpose. A symmetric input has
     a real spectrum, and a conjugation error is invisible in one.
@@ -26370,7 +26370,7 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `TensorBase.reshape_as` is deliberately NOT here -- it has no genuine
 # `torch.ops.aten` entry to resolve against (see `IMPLEMENTED_AWAITING_GOLDEN`'s
 # comment in aten.rs), so it is proven against upstream directly in
-# `tests/test_indexsel.py` instead of through this harness.
+# `tests/ops/test_indexsel.py` instead of through this harness.
 
 
 def index_select_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -28069,7 +28069,7 @@ def erfinv_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     The `float64` rows stop at `1 - 1e-9`. Beyond that the two sides diverge
     by up to 5.5e-05 and **upstream is the one that is wrong** -- `erfc` of
     the shim's answer round-trips to twelve digits and `erfc` of torch's to
-    four. That is pinned in `tests/test_tail3.py` by the round trip rather
+    four. That is pinned in `tests/ops/test_tail3.py` by the round trip rather
     than here by agreement, because agreeing there would mean being wrong.
     The whole region is unreachable at `float32`, whose largest value below
     one is `1 - 6e-8`.
@@ -29048,7 +29048,7 @@ var_correction_cases = _var_cases("aten.var.correction", _var_correction_spellin
 # square root is taken in the f64 accumulator, before the single narrowing,
 # and `torch.std(x)` is therefore not bit-equal to `torch.var(x).sqrt()`
 # (measured: 53 of 288 combinations differ by one ULP at float32). That is a
-# claim about *upstream* and lives in `tests/test_voice3.py`; here it is
+# claim about *upstream* and lives in `tests/models/test_voice3.py`; here it is
 # enough that both ops are compared against upstream separately.
 std_default_cases = _bare_cases("aten.std.default", "std")
 std_dim_cases = _var_cases("aten.std.dim", _var_dim_spelling)
@@ -29470,7 +29470,7 @@ def upsample_linear1d_cases(torch_module, c_module, torch_call) -> list[Case]:
     NOT separated here, and deliberately: the FUSED multiply-add in the source
     index (docs/kernels/RNN.md §3). It is ~3 ULP, which is inside this harness's
     `float32` tolerance of 1e-5, so it is proven by bit pattern in
-    `tests/test_rnn.py` instead. A golden case that claimed to check it
+    `tests/ops/test_rnn.py` instead. A golden case that claimed to check it
     would be a check that cannot fail.
     """
     op = "aten.upsample_linear1d.default"
@@ -29699,7 +29699,7 @@ def lstm_input_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     NOT covered here, and refused by name in the kernel rather than guessed
     at: `aten::lstm.data` (the packed-sequence overload), `proj_size != 0`,
-    and `dropout > 0` with `train=True`. See `tests/test_rnn.py` for the
+    and `dropout > 0` with `train=True`. See `tests/ops/test_rnn.py` for the
     refusals, which need a live upstream to state what upstream does instead.
     """
     cases: list[Case] = []
@@ -29741,7 +29741,7 @@ def lstm_input_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # `dropout > 0` with `train=False` is the eval path every checkpoint takes
     # and must COMPUTE -- the mask only exists in training. The refusal for
-    # `train=True` needs a live upstream and lives in tests/test_rnn.py.
+    # `train=True` needs a live upstream and lives in tests/ops/test_rnn.py.
     dirs, hidden, batch, seq, in_size = 1, 4, 3, 4, 5
     p_t, p_c = [], []
     seed, feat = 100, in_size

@@ -25,7 +25,7 @@ Apple Silicon / darwin 25.5.0, aarch64). 실험 스크립트는 `/Volumes/macMin
 골든 대조        1616/1616 통과, 0 실패, ops covered=78, pending case builders=0   EXIT=0
 inject-fault     value / shape / dtype                                             각각 EXIT=1
 스키마 대조      127/127 (overloads 47 + methods 80)                                EXIT=0
-스모크           tests/test_shim.py 전체                             EXIT=0
+스모크           tests/_support/test_shim.py 전체                             EXIT=0
 호스트 빌드      aarch64-apple-darwin                                               EXIT=0
 Android 빌드     aarch64-linux-android  lib_C.so   3,960,224 B                      EXIT=0
 iOS 빌드         aarch64-apple-ios      lib_C.dylib 3,112,632 B                      EXIT=0
@@ -390,7 +390,7 @@ PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 # 골든 · 스키마 — PYTHONPATH=vendor 를 붙이지 않는다.
 cd ../..
 $PY tests/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
-$PY tests/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
 for m in value shape dtype; do
   $PY tests/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
 done

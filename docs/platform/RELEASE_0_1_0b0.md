@@ -422,7 +422,7 @@ agents building concurrently.
 1. ~~Build the wheels~~ **done** — §7.1.
 2. Upload. The token is not in this worktree and was not read here.
 3. **Then** bump two things that must not lead the upload, and which two tests in
-   `tests/test_release.py` hold to that rule:
+   `tests/release/test_release.py` hold to that rule:
    `.github/workflows/test-published-wheel.yml`'s default version, and the README platform
    table's **on PyPI `…`** row, both to `0.0.13a0`. **Both still read `0.0.12a0`, and that is
    correct** — CI installs *from PyPI*, so defaulting it to an unpublished version makes every

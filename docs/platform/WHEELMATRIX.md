@@ -51,7 +51,7 @@ failure names the key instead of reporting `8 != 9`:
     wasm32-emscripten
     windows-arm64      windows-x86_64
 
-`tests/test_wheelmatrix.py::test_the_registry_cannot_silently_lose_an_entry`
+`tests/release/test_wheelmatrix.py::test_the_registry_cannot_silently_lose_an_entry`
 drives the collision rather than arguing it.
 
 ---

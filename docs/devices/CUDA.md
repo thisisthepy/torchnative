@@ -19,8 +19,8 @@ claims more than §8 allows.**
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs CUDA_HOST_READBACK_OPS present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs cuda_arch_mismatch present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs note_cuda_dispatch present -->
-<!-- DOCWATCH: symbol-in-file tests/test_cuda.py test_the_refusals_this_host_cannot_enter_are_still_named_one_by_one present -->
-<!-- DOCWATCH: symbol-in-file tests/test_cuda.py test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/cuda/test_cuda.py test_the_refusals_this_host_cannot_enter_are_still_named_one_by_one present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/cuda/test_cuda.py test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs present -->
 
 ---
 

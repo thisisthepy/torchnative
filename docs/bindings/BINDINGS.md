@@ -27,7 +27,7 @@ anything:
 |---|---|
 | feature added | three `bootstrap.py` composites: `_linalg.linalg_qr`, `_linalg.linalg_norm`, `_nn.upsample_nearest2d` |
 | defect fixed | none |
-| tests added | `tests/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
+| tests added | `tests/bindings/test_bindings.py`, 13 tests, differential against upstream in a second subprocess |
 | tests inverted | two — the pins in `test_tail1.py` and `test_tail2.py` that asserted these gaps *existed* |
 | documentation | this file |
 | deleted | two `reach_allow.json` entries |
@@ -37,7 +37,7 @@ anything:
 
 ## 1. How each was proved
 
-Not by `_aten_dispatch`. Every proof in `tests/test_bindings.py` goes through
+Not by `_aten_dispatch`. Every proof in `tests/bindings/test_bindings.py` goes through
 **the spelling a user writes**, in a subprocess with the vendored tree on
 `PYTHONPATH`, and compares element-wise against **upstream torch run in a
 separate subprocess** with `PYTHONPATH` stripped. Both subprocesses print their

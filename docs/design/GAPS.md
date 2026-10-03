@@ -120,7 +120,7 @@ the vendored `torch/_tensor.py`, so its stub is unreachable from a caller.
 Calling each is what separates them.
 
 **Closed** by adding the same schemas to `methods.json`.
-`tests/test_methodspell.py` holds it, and its load-bearing test
+`tests/bindings/test_methodspell.py` holds it, and its load-bearing test
 is the general one: it walks `_C._shim_overloads`, keeps the names upstream
 carries on `torch._C.TensorBase` and has *not* replaced on `torch.Tensor`, and
 calls each — so a future `overloads.json` entry that forgets its sibling goes
@@ -148,7 +148,7 @@ attribute road, and only before anything has imported the subpackage.
 
 **Closed** by listing every subpackage. Laziness is preserved and is itself
 tested: `import torchnative` still pulls in neither `torch` nor
-`transformers`. `tests/test_tnnamespace.py` holds it, reading
+`transformers`. `tests/api/test_tnnamespace.py` holds it, reading
 the name list off the disk and probing each in a **fresh subprocess** — done
 in-process, one earlier `from torchnative import x` would bind the attribute
 and the test would pass against unfixed code. Nullified by dropping `adapt`
@@ -232,7 +232,7 @@ found. It returns `(outputs, None)`, not `(outputs, 0.0)`: a stage-0 method
 descends nothing, and a zero in `history` would draw a flat curve that looked
 like convergence.
 
-**Measured at grade `agrees`.** `tests/test_stage0.py` runs the
+**Measured at grade `agrees`.** `tests/training/test_stage0.py` runs the
 same `nn.BatchNorm1d` model source on both sides — this stack in a vendored-tree
 subprocess, upstream torch 2.13 from the spike venv in-process — over three
 batches drawn from three different distributions, and compares the buffers

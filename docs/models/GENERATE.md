@@ -423,7 +423,7 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 인덱스 텐서가 둘 이상인 advanced indexing 입니다. 어텐션 커널이 아니고, eager **순전파**
 에서는 도달하지 않습니다 — eager 마스크 빌더가 생성 경로에서만 쓰는 벡터화 인덱싱입니다.
 
-`tests/test_shim.py::test_eager_generate_stops_at_index_tensor_and_says_so` 가 이것을
+`tests/_support/test_shim.py::test_eager_generate_stops_at_index_tensor_and_says_so` 가 이것을
 **이름으로** 고정합니다. 두 가지가 그 테스트를 깨야 하고, 둘 다 깨야 맞습니다: 이 op 이
 구현되면(그러면 `_GENERATE_PATHS` 에 `eager` 를 넣을 차례) 깨지고, `generate` 가 **더
 앞에서** 막히기 시작해도 깨집니다. "eager 는 여전히 안 된다" 에 조용히 동의하지 않습니다.
@@ -474,7 +474,7 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 ```
 PYTHON=$PY sh tests/run.sh     exit 0   159 통과 (전 155, +4)
 $PY tests/golden/compare.py                   exit 0   2702/2702, ops=118 (전 2536/117)
-$PY tests/verify_schemas.py    exit 0   272/272 (변화 없음)
+$PY tests/_support/verify_schemas.py    exit 0   272/272 (변화 없음)
 ```
 
 **보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
@@ -525,7 +525,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 PYTHON=$PY sh tests/run.sh          # 159
 $PY tests/golden/compare.py                        # 2702/2702 ops=118
-$PY tests/verify_schemas.py         # 272/272
+$PY tests/_support/verify_schemas.py         # 272/272
 ```
 
 §6 의 진짜 모델은 회귀 스위트에 **넣지 않았습니다** — `docs/models/CKPT2.md` §10 과 같은 이유로,

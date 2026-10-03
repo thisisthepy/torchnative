@@ -224,7 +224,7 @@ evidence.
    (`echo %ERRORLEVEL%`).
 9. Optional: run the gate's real-runtime half against the laptop's runtime:
    `set TORCHNATIVE_OPENVINO_C=<path to openvino_c.dll>`, then
-   `python tests/test_npufuse.py`. This exercises the **CPU**
+   `python tests/devices/npu/test_npufuse.py`. This exercises the **CPU**
    plugin on the laptop. It is not NPU evidence, but it checks the x86-64
    build of the same path.
 

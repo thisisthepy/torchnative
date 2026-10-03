@@ -469,7 +469,7 @@ impl TorchDType {
     /// `complex(bfloat16)` either), so a pair of those cannot be built.
     ///
     /// It is the same table as `to_complex`, read from the storage side, and
-    /// `tests/test_complex.py` asserts the two agree rather than trusting
+    /// `tests/ops/test_complex.py` asserts the two agree rather than trusting
     /// that they were kept in step by hand.
     pub fn complex_for_component(component: DType) -> Option<Self> {
         Some(match component {

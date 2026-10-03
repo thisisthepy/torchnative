@@ -92,7 +92,7 @@ is a place where the measurement is not of what it says:
 ## 3. What the model asks for — measured, not inventoried
 
 `TorchDispatchMode` over the real forward and over `__init__`, on upstream. Checked in as
-`tests/voice4_bigvgan_ops.json`; `voice4_capture.py` regenerates it.
+`tests/_support/voice4_bigvgan_ops.json`; `voice4_capture.py` regenerates it.
 
 ```
 forward        14 distinct ops, 2168 calls
@@ -336,10 +336,10 @@ golden cases                   unchanged -- a meta kernel has no values to compa
 <!-- DOCWATCH: op-implemented aten.convolution.default -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs sum_natural_tag present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs resolve_shape present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_sum_meta_kernel_answers_what_upstream_answers present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_view_meta_kernel_answers_what_upstream_answers present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
-<!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_two_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
-<!-- DOCWATCH: json-key tests/voice4_bigvgan_ops.json forward_ops present -->
-<!-- DOCWATCH: json-key tests/voice4_bigvgan_ops.json construction_ops present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_sum_meta_kernel_answers_what_upstream_answers present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_view_meta_kernel_answers_what_upstream_answers present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->
+<!-- DOCWATCH: symbol-in-file tests/models/test_voice4.py test_the_two_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
+<!-- DOCWATCH: json-key tests/_support/voice4_bigvgan_ops.json forward_ops present -->
+<!-- DOCWATCH: json-key tests/_support/voice4_bigvgan_ops.json construction_ops present -->
 <!-- DOCWATCH: count golden_ops_covered ge 301 -->

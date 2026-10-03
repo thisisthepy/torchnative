@@ -77,7 +77,7 @@ python3 tests/docwatch/check_docs.py [FILES...]
 ```
 
 With no arguments it scans every `docs/*.md`. It needs the same environment
-`tests/decomp_sweep.py` documents needing — a built shim on
+`tests/_support/decomp_sweep.py` documents needing — a built shim on
 `PYTHONPATH`:
 
 ```

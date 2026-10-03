@@ -121,7 +121,7 @@ discrepancy in either writer.)
 
 This direction is already covered by the existing suite
 (`test_ckpt_torch_load_zip_round_trip_matches_upstream_within_measured_tolerance`
-and neighbours in `tests/test_shim.py`, `_ckpt_fixture`), which builds a
+and neighbours in `tests/_support/test_shim.py`, `_ckpt_fixture`), which builds a
 checkpoint with upstream torch and reads it back with the shim in a
 subprocess. Not re-derived here since it already runs on every suite pass;
 confirmed it still passes as part of the full-suite re-run below.
@@ -150,7 +150,7 @@ No changes to `aten.rs`, `capture.rs`, `tape.rs`, `tests/golden/`,
 `.github/`, or `torchnative/python/torch/` (the generated tree). No new
 permanent pytest was added for the SmolLM2 round trip: it depends on a
 network-cacheable Hub download and a full 135M-parameter forward pass, which
-does not fit the existing `tests/test_shim.py` fixtures (all synthetic,
+does not fit the existing `tests/_support/test_shim.py` fixtures (all synthetic,
 in-repo, no network dependency) without either committing weights or adding
 a network-conditional skip the rest of the suite does not have a precedent
 for. The three round-trip runs above were captured directly in this document

@@ -83,7 +83,7 @@ mm1024/f32  1.9132 / 1.7276  10.7%  <-   add1024/f32  0.1268 / 0.1137 11.5%  <-
 ```
 sh tests/run.sh        171 통과, 실패 0
 tests/golden/compare.py               2744/2744, 실패 0, ops covered=118
-tests/verify_schemas.py 3076/3076
+tests/_support/verify_schemas.py 3076/3076
 git status --short                    (비어 있음)
 ```
 
@@ -552,7 +552,7 @@ adb shell "cd /data/local/tmp/bw_device/qbench && RAYON_NUM_THREADS=1 ./qbench_n
 ```sh
 PYTHON=$PY sh tests/run.sh          # 171
 $PY tests/golden/compare.py                        # 2744/2744 ops=118
-$PY tests/verify_schemas.py         # 3076/3076
+$PY tests/_support/verify_schemas.py         # 3076/3076
 ```
 
 ---

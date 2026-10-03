@@ -42,7 +42,7 @@ around a `try`). Upstream reproduced 20/20 and the shim reproduced 13/20 with th
 names and the same seven messages, so the brief's measurement stands as given.
 
 The shim side needs `TORCH_USE_RTLD_GLOBAL=1` and `PYTHONPATH=python`, the same
-two the checkpoint tests in `tests/test_shim.py` already set (VENDOR.md wall 1).
+two the checkpoint tests in `tests/_support/test_shim.py` already set (VENDOR.md wall 1).
 
 ### 0.1 The twenty, before and after
 
@@ -646,7 +646,7 @@ bash scripts/vendor/install_shim.sh                       exit 0
 PYTHON=$PY sh tests/run.sh         241 ok, 0 FAIL          exit 0
 $PY tests/golden/compare.py                       3302/3302, ops=133      exit 0
 $PY tests/golden/compare.py --self-test           13 x 11, 0 problems     exit 0
-$PY tests/verify_schemas.py        4295/4295               exit 0
+$PY tests/_support/verify_schemas.py        4295/4295               exit 0
 ```
 
 | | before | after |

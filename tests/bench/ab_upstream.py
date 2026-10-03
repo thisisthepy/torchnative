@@ -44,7 +44,7 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = str(next(p for p in __import__("pathlib").Path(__file__).resolve().parents if (p / "AGENTS.md").is_file()))
 SHIM_PATH = os.path.join(REPO, "torchnative", "python")
 
 WARMUP = 5

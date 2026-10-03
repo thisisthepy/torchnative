@@ -236,8 +236,8 @@ landing operator work in parallel worktrees while this document was written, so 
 is `ge`, not `eq` — a later round raising the forward count is progress, not a contradiction of
 this one.
 
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11336 -->
 <!-- DOCWATCH: count golden_ops_covered ge 299 -->

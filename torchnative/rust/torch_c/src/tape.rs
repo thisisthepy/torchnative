@@ -357,7 +357,7 @@ fn i64_list(operands: &[Option<Operand<'_>>], index: usize, name: &str, op: &str
 ///
 /// This list is what `differentiable()` reports against, and it is checked
 /// against the *implementation* by a test rather than by reading: every name
-/// here has a gradient case in `tests/test_shim.py` compared against
+/// here has a gradient case in `tests/_support/test_shim.py` compared against
 /// upstream, and that test asserts its own case list equals this one. A name
 /// added here without a case makes that test fail, which is the only way a
 /// second list of op names stays honest in this repository (docs/verification/AUDIT.md).
@@ -436,7 +436,7 @@ fn no_rule(op: &str) -> PyErr {
     crate::err::not_implemented(format!(
         "torch._C tape: no derivative rule for {op} -- a gradient reached it, and the tape \
          refuses to guess. Add a rule in tape.rs and a gradient case in \
-         tests/test_shim.py; trace.differentiable() lists every op in a trace that would \
+         tests/_support/test_shim.py; trace.differentiable() lists every op in a trace that would \
          need one"
     ))
 }
@@ -2679,7 +2679,7 @@ pub fn differentiable<'py>(
 
 /// The rule table, readable from Python.
 ///
-/// `tests/test_shim.py` asserts that its own gradient-case list equals this,
+/// `tests/_support/test_shim.py` asserts that its own gradient-case list equals this,
 /// which is what keeps the table and the cases from drifting -- the failure
 /// mode docs/verification/AUDIT.md found six times is a second list nobody re-reads.
 #[pyfunction]

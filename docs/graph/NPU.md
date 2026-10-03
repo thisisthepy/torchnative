@@ -284,7 +284,7 @@ being appended to this one.
     bash scripts/vendor/install_shim.sh
     PYTHON=$PY sh tests/run.sh
 
-The eleven tests this document is about are in `tests/test_shim.py`
+The eleven tests this document is about are in `tests/_support/test_shim.py`
 and all begin `test_upstreams_nnapi_`, `test_the_serialiser`, `test_a_conv_relu`,
 `test_serialised_shapes`, `test_constant_folding`, `test_an_op_with_no_`,
 `test_the_blob_decoder`, `test_what_serialises`, `test_coreml`. They skip rather

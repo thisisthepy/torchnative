@@ -59,7 +59,7 @@ still matches unchanged.
 
 `arch_sweep.py --one lasr_ctc` / `--one lasr_encoder`: both **ok**.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_conv1d_same_odd_total_now_computes present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind4.py test_conv1d_same_odd_total_now_computes present -->
 
 ---
 
@@ -100,7 +100,7 @@ at the kernel rather than being papered over by the new binding.
 
 `arch_sweep.py --one sam_vision_model` / `--one sam_hq_vision_model`: both **ok**.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_f_interpolate_linear_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind4.py test_f_interpolate_linear_agrees_with_upstream present -->
 
 ---
 
@@ -189,7 +189,7 @@ kernels in `aten.rs`, not `bootstrap.py`. `fastspeech2_conformer` is therefore *
 past this point from this file** — recorded rather than left unattributed, per docs/kernels/TAIL4.md
 §8.2's own prediction that this was "the next wall" and not the last one.
 
-<!-- DOCWATCH: symbol-in-file tests/test_bind4.py test_zeros_tensor_in_size_tuple_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bind4.py test_zeros_tensor_in_size_tuple_agrees present -->
 
 ---
 

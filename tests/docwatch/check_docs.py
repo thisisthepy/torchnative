@@ -256,11 +256,11 @@ class LiveFacts:
             }
         return self._golden_cache
 
-    # -- tests/verify_schemas.py SUMMARY line ---------------
+    # -- tests/_support/verify_schemas.py SUMMARY line ---------------
     def schema(self) -> dict:
         if self._schema_cache is None:
             proc = subprocess.run(
-                [self.python_exe, str(REPO_ROOT / "tests" / "verify_schemas.py")],
+                [self.python_exe, str(REPO_ROOT / "tests" / "_support" / "verify_schemas.py")],
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
@@ -283,7 +283,7 @@ class LiveFacts:
             }
         return self._schema_cache
 
-    # -- tests/test_shim.py, staged without a cargo build --
+    # -- tests/_support/test_shim.py, staged without a cargo build --
     def smoke_ok(self) -> int:
         if self._smoke_cache is None:
             artefact = self.env.get("TORCH_C_ARTEFACT")
@@ -300,7 +300,7 @@ class LiveFacts:
                 env = dict(self.env)
                 env["PYTHONPATH"] = stage
                 proc = subprocess.run(
-                    [self.python_exe, str(REPO_ROOT / "tests" / "test_shim.py")],
+                    [self.python_exe, str(REPO_ROOT / "tests" / "_support" / "test_shim.py")],
                     capture_output=True,
                     text=True,
                     cwd=REPO_ROOT,
@@ -315,7 +315,7 @@ class LiveFacts:
                 self._smoke_cache = ok_count
         return self._smoke_cache
 
-    # -- tests/test_vulkan4.py `VULKAN:` tally -----------------
+    # -- tests/devices/vulkan/test_vulkan4.py `VULKAN:` tally -----------------
     def vulkan(self) -> dict:
         if self._vulkan_cache is None:
             artefact = self.env.get("TORCH_C_ARTEFACT")
@@ -327,9 +327,9 @@ class LiveFacts:
 
                 shutil.copy(artefact, os.path.join(stage, "_C.abi3.so"))
                 env = dict(self.env)
-                env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests}"
+                env["PYTHONPATH"] = f"{stage}{os.pathsep}{pytests / '_support'}"
                 proc = subprocess.run(
-                    [self.python_exe, str(pytests / "test_vulkan4.py")],
+                    [self.python_exe, str(pytests / "devices" / "vulkan" / "test_vulkan4.py")],
                     capture_output=True, text=True, cwd=REPO_ROOT, env=env,
                 )
             m = re.search(r"^VULKAN: ran=(\d+) ok=(\d+) failed=(\d+) skipped=(\d+) device=(.*)$",
@@ -348,14 +348,14 @@ class LiveFacts:
                 "the claim is unmeasured here, not confirmed")
         return v["ok"]
 
-    # -- tests/decomp_sweep.py, vendored-tree import --------
+    # -- tests/_support/decomp_sweep.py, vendored-tree import --------
     def decomp(self) -> dict:
         if self._decomp_cache is None:
             env = dict(self.env)
             env["PYTHONPATH"] = str(REPO_ROOT / "torchnative" / "python")
             env["TORCH_USE_RTLD_GLOBAL"] = "1"
             proc = subprocess.run(
-                [self.python_exe, str(REPO_ROOT / "tests" / "decomp_sweep.py")],
+                [self.python_exe, str(REPO_ROOT / "tests" / "_support" / "decomp_sweep.py")],
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,
@@ -406,10 +406,10 @@ class LiveFacts:
     # only guard against that, and AGREE2.md §7 says so.
     def agree(self) -> dict:
         if self._agree_cache is None:
-            path = REPO_ROOT / "tests" / "agree2_scores.json"
+            path = REPO_ROOT / "tests" / "_support" / "agree2_scores.json"
             if not path.exists():
                 raise LiveFactsError(f"no recorded agreement sweep at {path}")
-            sys.path.insert(0, str(REPO_ROOT / "tests"))
+            sys.path.insert(0, str(REPO_ROOT / "tests" / "_support"))
             try:
                 import agree_sweep
             except Exception as exc:                      # noqa: BLE001
@@ -441,7 +441,7 @@ class LiveFacts:
             }
         return self._agree_cache
 
-    # -- silent-skip visibility (tests/_skip.py) ------------
+    # -- silent-skip visibility (tests/_support/_skip.py) ------------
     #
     # A test whose fixture is missing used to print "   (skipped: ...)" and
     # `return`, which suite_ledger.py's `^SKIP\s` tally cannot see -- the
@@ -463,9 +463,9 @@ class LiveFacts:
     def skip_lines_visible(self) -> int:
         if self._skipvis_cache is None:
             env = dict(self.env)
-            env["PYTHONPATH"] = str(REPO_ROOT / "torchnative" / "python")
+            env["PYTHONPATH"] = os.pathsep.join([str(REPO_ROOT / "torchnative" / "python"), str(REPO_ROOT / "tests" / "_support")])
             proc = subprocess.run(
-                [self.python_exe, str(REPO_ROOT / "tests" / "test_intelnpu.py")],
+                [self.python_exe, str(REPO_ROOT / "tests" / "devices" / "npu" / "test_intelnpu.py")],
                 capture_output=True,
                 text=True,
                 cwd=REPO_ROOT,

@@ -10,11 +10,11 @@
 <!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "ubuntu-24.04" present -->
 <!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "steps.lower.outputs.integrity_ok" present -->
 <!-- DOCWATCH: symbol-in-file .github/workflows/test-qnn-lower.yml "upload-artifact@v4" present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_the_verification_runs_before_every_upload present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
-<!-- DOCWATCH: symbol-in-file tests/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_a_program_with_no_qnn_delegate_is_never_uploaded present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_poor_coverage_fails_the_job_and_keeps_the_artefact present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_the_verification_runs_before_every_upload present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_the_threshold_cannot_be_lowered_from_the_command_line present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnnci.py test_nothing_in_the_lowering_job_disables_its_own_assertions present -->
 
 ## 0. At a glance
 
@@ -26,7 +26,7 @@
 | Does it prove anything about the HTP? | **No.** §1 below, and `docs/devices/QNN.md` §6.4 stays true |
 | Runner | `ubuntu-24.04`, pinned. §3 is the decision and its reason |
 | Where the logic lives | `.github/scripts/qnn_lower.py`, not inline YAML. §5 |
-| Tests | **30** in `tests/test_qnnci.py`, none of which need executorch |
+| Tests | **30** in `tests/devices/qnn/test_qnnci.py`, none of which need executorch |
 | Nullifications attempted / uncaught | **14 / 0**, and one of them found a real hole in this document's own test file first (§5.2) |
 
 ---
@@ -243,7 +243,7 @@ NDK, and an NDK or CMake breakage there must not turn a successful verified
 lowering into a run somebody reads as failed. It is still reported red on its
 own line.
 
-### 5.2 `tests/test_qnnci.py` — a new file, and why not `test_qnn.py`
+### 5.2 `tests/devices/qnn/test_qnnci.py` — a new file, and why not `test_qnn.py`
 
 **A new file.** `test_qnn.py`'s three fixtures all skip by name when their
 environment is absent — `_qnn_et_fixture` skips unless

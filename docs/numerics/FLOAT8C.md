@@ -253,7 +253,7 @@ dtype specifically, an earlier round on it having left four binaries spinning at
 
 ### 6.2 The gate is load-bearing
 
-`tests/test_shim.py` gained seven tests, and one of the previous
+`tests/_support/test_shim.py` gained seven tests, and one of the previous
 round's was rewritten rather than deleted:
 `test_float8_shim_only_refusals_do_not_borrow_upstreams_wording` asserted the
 ten still refused, and it **failed** when they started computing — which is the
@@ -292,7 +292,7 @@ side changes its mind.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64 present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_pow_refuses present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _float8_extra present -->
 
 ---

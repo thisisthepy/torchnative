@@ -421,7 +421,7 @@ wrong gradient looks exactly as plausible as a right one and the program keeps r
 ```
 NotImplementedError: torch._C tape: no derivative rule for aten.topk.default -- a gradient
 reached it, and the tape refuses to guess. Add a rule in tape.rs and a gradient case in
-tests/test_shim.py; trace.differentiable() lists every op in a trace that would need one
+tests/_support/test_shim.py; trace.differentiable() lists every op in a trace that would need one
 ```
 
 `differentiable()` names it *before* a backward is run, which is what makes "what stops this model"
@@ -502,7 +502,7 @@ cases were made asymmetric and the faults then failed. This is the pattern `docs
 ### 7.1 What this suite still cannot see
 
 * **Nothing here compares against upstream.** The tape tests use finite differences, because
-  `tests/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
+  `tests/_support/test_shim.py` runs against bare `_C` with no upstream torch in the process. The
   upstream comparison is §2, §3 and §4, and those are measurements in this document rather than
   tests in `tests/` — so §4's 8.8e-05 can move without anything going red.
 * **`tests/golden/compare.py` cannot see the tape at all.** It compares *ops* by dispatch key, and a
@@ -572,9 +572,9 @@ test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise
 test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none
 ```
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _set_grad present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs _shim_grad present -->
 
@@ -632,7 +632,7 @@ $PY /tmp/tape/sab.py            # or /tmp/tape/sab.py T5 T8 for one
 # §9  gates
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/tape/ev   ;  $SHIM /tmp/train/sweeptrain.py /tmp/tape/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -969,7 +969,7 @@ names a check that can be run, and it is now the only one of `docs/design/DESIGN
 questions that answers with a refusal rather than by doing the thing.
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py persist present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
 
 ---
 
@@ -1018,7 +1018,7 @@ Measured directly, running the same case under both builds:
   computes its statistics at the *parameter* dtype and a recomputation computes them at the input's.
   That is exactly why the rule reads them, and `aten.rs` measured the dtype rule it depends on.
 
-What would close it is an oracle for mixed-precision *values*, and `tests/test_shim.py` has none —
+What would close it is an oracle for mixed-precision *values*, and `tests/_support/test_shim.py` has none —
 §7.1's first bullet already says these tests run against bare `_C` with no upstream in the process.
 The two-interpreter shape `docs/models/ADAPT.md` §11.1 uses would provide one. **It is named as a hole, not
 as a property.** This is `docs/numerics/SCALAR.md`'s statement arriving a third time: this suite separates
@@ -1052,9 +1052,9 @@ a promotion this shim declines by name. The rule now computes its interior in th
 and narrows each result to the dtype of the thing it is a gradient for, which is what upstream does.
 `cast_like` went from dead code to the thing L6 removes.
 
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_split_rule_supplies_a_zero_for_a_chunk_no_gradient_reached present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_layer_norm_gradient_keeps_the_dtype_it_was_asked_for present -->
 
 ---
 
@@ -1148,7 +1148,7 @@ $PY /tmp/rules/sab.py                   # or /tmp/rules/sab.py L5 S2 for one
 # §16  gates
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/rules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/rules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 ```
@@ -1284,7 +1284,7 @@ therefore_redraws_its_mask` pins the property so it cannot go quiet.
 §15.1 named a hole rather than a property: **L5** — the layer-norm rule recomputing its statistics
 instead of reading the two the forward returns — is *exactly* a no-op at matched dtypes and moves 22
 of 24 `grad_input` elements at mixed precision, so no `float32` or `float64` case could ever catch
-it. It said what would close it: *"an oracle for mixed-precision values, and `tests/test_shim.py`
+it. It said what would close it: *"an oracle for mixed-precision values, and `tests/_support/test_shim.py`
 has none"*.
 
 It has one, and **not the two-interpreter shape §15.1 guessed at**: upstream `torch` is importable
@@ -1344,9 +1344,9 @@ not a closed one, and it belongs to whoever owns `native_layer_norm` next.
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan present -->
 
 ---
 
@@ -1445,8 +1445,8 @@ new mixed-precision pair: it asserts the *dtype* of `grad_input` and they assert
 
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 <!-- DOCWATCH: count golden_ops_covered ge 168 -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
-<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two present -->
 
 ---
 
@@ -1482,7 +1482,7 @@ $PY /tmp/trrules/sab.py                  # or /tmp/trrules/sab.py L5 V2 for one
 # §20  gates
 PYTHON=$PY sh tests/run.sh
 $PY tests/golden/compare.py  ;  $PY tests/golden/compare.py --self-test
-$PY tests/verify_schemas.py
+$PY tests/_support/verify_schemas.py
 $SHIM /tmp/k26/sweep26.py /tmp/trrules/ev  ;  $SHIM /tmp/train/sweeptrain.py /tmp/trrules/tr
 $SHIM /tmp/loss/seqlen.py f32            ;  $SHIM /tmp/loss/seqlen.py bf16
 $SHIM /tmp/tape/smol_shim2.py sdpa 8 sdpa8

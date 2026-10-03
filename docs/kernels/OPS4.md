@@ -415,7 +415,7 @@ FAIL test_unimplemented_op_names_itself      : TypeError: aten.relu.default: mis
 stand here and now has a kernel, which is the right failure mode for this test -- it goes red when
 the op it samples stops being a sample."* 이번에 `relu` 가 그렇게 됐습니다.
 
-`tests/test_shim.py` 는 파일 범위 밖이라 **한 글자도 안 고쳤습니다.**
+`tests/_support/test_shim.py` 는 파일 범위 밖이라 **한 글자도 안 고쳤습니다.**
 고치려면 표본을 다른 이름으로 바꾸면 됩니다. `_aten_all_implemented()` 103 개에 없고 §3 의
 어느 아키텍처 꼬리에도 없는 이름이면 되고, `docs/design/TORCH_C.md` §1 이 예시로 `relu` 를 쓰고 있으므로
 그 문서도 함께 봐야 합니다. **어떤 이름을 고를지는 조율 세션의 판단입니다** — 잘못 고르면
@@ -490,7 +490,7 @@ aten.relu.default            15   dtype 8 + max 판별 2 + 모양 4 + bool 거�
   > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json permute present -->
 - **`compare.py` 의 `KNOWN_GAP` 세 항목 제거**(§9.1) 와 **`test_shim.py` 의 relu 표본
   교체**(§9.2). 둘 다 파일 범위 밖이고, 둘 다 지금 빨간 상태입니다.
-- **§4·§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `tests/test_shim.py` 가 범위 밖입니다.
+- **§4·§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `tests/_support/test_shim.py` 가 범위 밖입니다.
   MPT · OPT 레이어 · GPT-J 로터리 세 전사는 그대로 옮기면 테스트가 됩니다.
 - **`falcon`/`gptj`/`bloom` 을 열지 못했습니다.** 각각 `add_`+`div_` · `repeat` · `baddbmm` 이
   남습니다(§3.1). 앞의 것은 in-place 계열이라 op 하나가 아닙니다.
@@ -529,7 +529,7 @@ sh scripts/vendor/vendor_torch.sh                       # 새 worktree 라면 �
 
 $PY tests/golden/compare.py             > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
 $PY tests/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"   # 1 (§9.1)
-$PY tests/verify_schemas.py > /tmp/sch.log 2>&1; echo "EXIT=$?"  # 0
+$PY tests/_support/verify_schemas.py > /tmp/sch.log 2>&1; echo "EXIT=$?"  # 0
 PYTHON=$PY sh tests/run.sh  > /tmp/run.log 2>&1; echo "EXIT=$?" # 1 (§9.2)
 ```
 
