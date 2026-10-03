@@ -47,10 +47,19 @@ build caches, model weights, `node_modules`) into every worktree is how 86 workt
 
 | Branch | Who writes to it |
 |---|---|
-| `work/<topic>` | You. All work happens here. |
-| `develop` | Merged into from work branches after verification. Never commit to it directly. |
+| `feat/<topic>` | You. All work happens here. Never name a branch `work/...`. |
+| `develop` | Merged into from `feat/` branches after verification. Never commit to it directly. |
 | `release` | **CI only.** Not a standing branch: CI regenerates it from every push to `develop`, in the main-only file layout, and opens the PR into `main`. It may not exist. Never write to it. |
 | `main` | **Pull request from `release` only.** Never push or merge to it directly. |
+
+Only `main`, `develop` and `release` are standing branches. A `feat/` branch lives until its pull
+request merges: merge with `gh pr merge --delete-branch`, then delete the local branch and its
+worktree. Periodically delete every branch already merged into `develop`, remote and local
+(`git branch -r --merged origin/develop`); an unmerged branch older than a few days is either
+landed or reported, not left. Branches named `release-*` are preserved snapshots: keep them.
+Renaming a branch that has an open pull request closes that pull request on GitHub (measured
+2026-10-03: #26 closed when `work/ci-gate` became `feat/ci-gate`); open a replacement that links
+the old one.
 
 `main` carries a reduced layout: of the Markdown files, only `README.md` stays at the repository
 root, and `docs/` keeps only its subdirectories (no Markdown files directly under `docs/`).
@@ -63,7 +72,7 @@ Every new feature goes through an issue and a pull request:
 1. Before starting, search the repository's issues (`gh issue list --state all --search "<keywords>"`).
 2. If no issue covers the work, open one (`gh issue create`) stating what and why, and the
    completion criterion — which tests must pass.
-3. Work on a `work/<topic>` branch, push every commit, and open a pull request into `develop`
+3. Work on a `feat/<topic>` branch, push every commit, and open a pull request into `develop`
    whose body contains `Closes #<number>`.
 4. Merge into `develop` through that pull request (`gh pr merge`), not by a local merge, so the
    issue is linked.
@@ -504,7 +513,7 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 ## 19. Parallel work and devices
 
 - **Worktrees live inside this repository** at `.worktrees/<name>` (git-ignored):
-  `git worktree add -b work/<name> .worktrees/tn-<name> develop`. Then §14.1. The repository itself
+  `git worktree add -b feat/<name> .worktrees/tn-<name> develop`. Then §14.1. The repository itself
   sits on the external volume (`/Volumes/macMini/thisisthepy/torchnative`), so this still avoids the
   internal SSD, and nothing is scattered outside the repository (§15.1).
 - **Agent rules live in `tools/agent_rules.txt`**, a repository-relative path, so every worktree has
