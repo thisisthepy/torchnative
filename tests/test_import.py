@@ -1,4 +1,8 @@
 import os, sys  # moved from torchnative/src/test/ in #43; the gate now runs it
+
+# The shim imports upstream extension libraries that resolve only with global
+# symbols, as every other suite that imports torch sets.
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
 
 
