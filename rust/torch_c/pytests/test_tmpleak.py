@@ -12,11 +12,14 @@ rendezvous files, and the `collect2-harness-probe-*` rank logs.
 That last one is not only a storage problem. Its rank logs are 1 MB runs of a
 single character, and when `TMPDIR` lives inside the checkout -- which the
 rule "nothing is created outside this repository" (CLAUDE.md §7) asks for --
-`test_docrefs.py` walks into it. `test_docrefs.py` reads every file in the
-tree, tracked or not, and its `DOCS_REF` pattern starts with an unbounded
+`test_docrefs.py` walked into it. `test_docrefs.py` read every file in the
+tree, tracked or not, and its `DOCS_REF` pattern started with an unbounded
 `[A-Za-z0-9_.:-]*` prefix, which is quadratic on a 1 MB run with no `docs/`
 in it. A sibling worktree's gate sat in that suite at 100% CPU for over half
-an hour. A leaked directory became a hung gate.
+an hour. A leaked directory became a hung gate. (GitHub issue #8 fixed both
+sides there: it now reads only `git ls-files`, its pattern starts at the
+literal `docs/`, and a test bounds a 1 MB single-character input by timeout.
+A leak is still a leak, which is what this file pins.)
 
 What this file pins:
 

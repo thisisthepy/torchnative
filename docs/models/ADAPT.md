@@ -125,11 +125,15 @@ So `torchnative.delta.Delta` owns everything about a weight change and
 `torchnative.adapt.Method` owns nothing. A method declares three things:
 
 ```python
-class Tent(Method):
-    stage = STAGE_NARROW_BACKWARD          # DESIGN.md §3 axis 1
+class Tent(GradientMethod):                # stage = STAGE_NARROW_BACKWARD, DESIGN.md §3 axis 1
     def select(self, model):   ...         # which parameters move
     def objective(self, outputs): ...      # what scalar is descended
 ```
+
+(Since SPEC S6.5 the stage is a type: `GradientMethod` and `Tent` live in
+`torchnative/adapt/gradient.py`, `adapt.Tent` still resolves to them, and a
+build configured with `TORCHNATIVE_BACKWARD=off` refuses that module at
+import. `rust/torch_c/pytests/test_stagetype.py` holds it.)
 
 That is the whole of `Tent` apart from docstrings — 40 lines, no state, no
 `reset()`, no base copy, no serialisation. The second method inherits all of
@@ -185,7 +189,7 @@ above it.
 
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py Delta present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py revert_by_subtraction present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py Tent present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/gradient.py Tent present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
 
 ### 2.3 What `Tent.select` picks, and why by class name

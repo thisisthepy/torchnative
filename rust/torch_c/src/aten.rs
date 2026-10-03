@@ -15395,8 +15395,8 @@ fn float_narrower(tag: TorchDType) -> fn(f64) -> f64 {
     match tag {
         TorchDType::Float64 => |x| x,
         TorchDType::Float32 => |x| x as f32 as f64,
-        TorchDType::Float16 => |x| half::f16::from_f64(x).to_f64(),
-        TorchDType::BFloat16 => |x| half::bf16::from_f64(x).to_f64(),
+        TorchDType::Float16 => |x| candle_core::c10_f16_from_f64(x).to_f64(),
+        TorchDType::BFloat16 => |x| candle_core::c10_bf16_from_f64(x).to_f64(),
         // Every other floating dtype is one `PyDtype::storage()` refuses, so
         // the operands could not have been built. Identity keeps this total.
         _ => |x| x,
@@ -33859,19 +33859,146 @@ mod host_const_tests {
         assert_eq!(t.dtype(), DType::F64);
     }
 
-    /// One step, not two -- asserted where the Python suite asserts it, so
-    /// that a rewrite of `host_const` that reintroduces the intermediate is
-    /// caught by `cargo test` before the suite ever runs.
+    /// The steps given are the steps applied -- `host_const` inserts no `f32`
+    /// of its own -- and the `f64 -> f16` step is c10's, which is
+    /// per-architecture (`torch/headeronly/util/Half.h:85-91`, issue #28).
+    ///
+    /// On aarch64 c10 builds `Half` from `float16_t`, so the direct step rounds
+    /// once and the witness tells the two paths apart. Everywhere else c10
+    /// builds `Half` from `float`, so the direct step *is* `f16(f32(x))` and
+    /// the two paths agree; asserting that they differ there is what failed
+    /// CI on linux x86_64.
     #[test]
     fn the_narrowing_steps_are_applied_exactly_as_given() {
-        const X: f64 = 0.031265258789971995;
-        let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
-        let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
         let read = |t: &candle_core::Tensor| {
             t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
         };
-        assert_eq!(read(&one), 0.031280517578125, "f16(x), one step");
-        assert_eq!(read(&two), 0.03125, "f16(f32(x)) -- the trap, for contrast");
-        assert_ne!(read(&one), read(&two));
+        const X: f64 = 0.031265258789971995;
+        let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
+        let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
+        assert_eq!(read(&two), 0.03125, "f16(f32(x)) on every platform");
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(read(&one), 0.031280517578125, "aarch64: f16(x), one rounding");
+            assert_ne!(read(&one), read(&two));
+        } else {
+            assert_eq!(read(&one), 0.03125, "not aarch64: c10 narrows f64 -> f16 via f32");
+        }
+        // The f32 step alone is still visible on every platform.
+        let via32 = host_const(X, &[DType::F32], &Device::Cpu).unwrap();
+        assert_eq!(read(&via32), X as f32 as f64);
+    }
+
+    /// `f64 -> bf16` is `bf16(f32(x))` on every platform (c10 has no
+    /// `BFloat16(double)`). Both witnesses, through `host_const` (the cast
+    /// kernel), through `float_narrower`, and through the helper itself.
+    #[test]
+    fn bf16_from_f64_is_two_roundings_everywhere() {
+        use super::{float_narrower, TorchDType};
+        let read = |t: &candle_core::Tensor| {
+            t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
+        };
+        // [x, c10's answer, what the rejected rule gives]
+        let cases: [(f64, f64, &str); 2] = [
+            // `half::bf16::from_f64` truncates 2^-22 away and lands on 1.0.
+            (1.0 + 2f64.powi(-8) + 2f64.powi(-22), 1.0078125, "truncate-then-round gives 1.0"),
+            // A single rounding gives 1.0078125; f32 makes it a tie first.
+            (1.0 + 3.0 * 2f64.powi(-8) - 2f64.powi(-30), 1.015625, "one rounding gives 1.0078125"),
+        ];
+        for (x, want, rejected) in cases {
+            let t = host_const(x, &[DType::BF16], &Device::Cpu).unwrap();
+            assert_eq!(read(&t), want, "host_const({x:e}) as bf16 ({rejected})");
+            assert_eq!(float_narrower(TorchDType::BFloat16)(x), want, "float_narrower ({rejected})");
+            assert_eq!(candle_core::c10_bf16_from_f64(x).to_f64(), want, "helper ({rejected})");
+            // `WithDType::from_f64` is candle's own door to the same narrowing
+            // (affine, elu, powf, the rng bounds reach it as `T::from_f64`).
+            // Nothing in the Python suites or the golden cases reached it when
+            // this was nullified alone, so it is pinned here directly.
+            assert_eq!(
+                <half::bf16 as candle_core::WithDType>::from_f64(x).to_f64(),
+                want,
+                "WithDType::from_f64 ({rejected})"
+            );
+            let scaled = candle_core::Tensor::new(&[half::bf16::ONE], &Device::Cpu)
+                .unwrap()
+                .affine(x, 0.0)
+                .unwrap();
+            assert_eq!(
+                scaled.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                vec![want],
+                "candle affine's T::from_f64(mul) on bf16 ({rejected})"
+            );
+            let neg = host_const(-x, &[DType::BF16], &Device::Cpu).unwrap();
+            assert_eq!(read(&neg), -want, "sign mirror ({rejected})");
+        }
+    }
+
+    /// `c10_f16_from_f64` against an oracle that did not come from it.
+    ///
+    /// aarch64: the oracle is the hardware's own single rounding, `fcvt h, d`,
+    /// which `half::f16::from_f64` issues when `fp16` is detected -- and which
+    /// is what c10's `float16_t` conversion compiles to. If `fp16` is not
+    /// detected the comparison is skipped by name rather than run against
+    /// `half`'s truncating fallback. Elsewhere the oracle is `f16(f32(x))`.
+    #[test]
+    fn f16_from_f64_follows_c10_per_architecture() {
+        use half::f16;
+        let mut values: Vec<f64> = vec![
+            0.031265258789971995, 65504.0, 65519.999, 65520.0, 65520.0001, -65520.0,
+            2f64.powi(-24), 2f64.powi(-25), 2f64.powi(-25) + 2f64.powi(-60),
+            3.0 * 2f64.powi(-26), 2f64.powi(-14) - 2f64.powi(-40), 0.0, -0.0, 1e-300,
+            -1e-300, 1e300, f64::INFINITY, f64::NEG_INFINITY, f64::MIN_POSITIVE / 3.0,
+        ];
+        // Deterministic sweep: random bit patterns across f16's whole range,
+        // and doubles one f64-ulp either side of every f16 rounding boundary.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let r = next();
+            let exp = 1023 - 30 + (r % 48); // 2^-30 .. 2^17
+            values.push(f64::from_bits((r & 0x800F_FFFF_FFFF_FFFF) | (exp << 52)));
+        }
+        for bits in 0u16..0x7C00 {
+            let lo = f16::from_bits(bits).to_f64();
+            let hi = f16::from_bits(bits + 1).to_f64();
+            let mid = (lo + hi) / 2.0;
+            for m in [mid, f64::from_bits(mid.to_bits() + 1), f64::from_bits(mid.to_bits() - 1)] {
+                values.push(m);
+                values.push(-m);
+            }
+        }
+        let oracle: Box<dyn Fn(f64) -> f16> = if cfg!(target_arch = "aarch64") {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !std::arch::is_aarch64_feature_detected!("fp16") {
+                    eprintln!(
+                        "SKIP f16_from_f64_follows_c10_per_architecture: aarch64 without \
+                         fp16, so half::f16::from_f64 is not fcvt h,d and is no oracle"
+                    );
+                    return;
+                }
+            }
+            Box::new(f16::from_f64)
+        } else {
+            Box::new(|x: f64| f16::from_f32(x as f32))
+        };
+        let mut bad = Vec::new();
+        for &x in &values {
+            let got = candle_core::c10_f16_from_f64(x);
+            let want = oracle(x);
+            if got.to_bits() != want.to_bits() {
+                bad.push(format!("{x:e}: got {got} want {want}"));
+            }
+            // candle's `WithDType::from_f64` must be the same function.
+            let via_trait = <f16 as candle_core::WithDType>::from_f64(x);
+            if via_trait.to_bits() != want.to_bits() {
+                bad.push(format!("{x:e}: WithDType::from_f64 gave {via_trait} want {want}"));
+            }
+        }
+        assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
     }
 }
