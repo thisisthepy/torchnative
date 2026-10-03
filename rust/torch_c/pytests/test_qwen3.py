@@ -588,10 +588,83 @@ def _check_generate(case, dtype, device="cpu"):
     assert shim["input_ids"] == up["input_ids"], (shim["input_ids"], up["input_ids"])
     prompt_len = len(up["input_ids"][0])
     assert len(up["generated"][0]) > prompt_len, "upstream generated nothing"
-    assert shim["generated"] == up["generated"], (
-        f"{case}/{dtype}/{device}: greedy generate diverged\n"
-        f"  upstream {up['generated'][0][prompt_len:]}\n"
-        f"  shim     {shim['generated'][0][prompt_len:]}")
+    if shim["generated"] == up["generated"]:
+        return None
+    message = (f"{case}/{dtype}/{device}: greedy generate diverged\n"
+               f"  upstream {up['generated'][0][prompt_len:]}\n"
+               f"  shim     {shim['generated'][0][prompt_len:]}")
+    # float32 has no tie allowance: it must be token for token.
+    assert dtype != "float32", message
+    return _check_divergence_is_a_tie(case, dtype, device, up, shim, message)
+
+
+def _check_divergence_is_a_tie(case, dtype, device, up, shim, message):
+    """A low-precision greedy run may part from upstream only at a tie that
+    the derived bound cannot resolve -- and nowhere else.
+
+    The two sides share every token before the first divergence, so both are
+    asked for the logits of that shared prefix, with a float64 upstream as the
+    oracle. Accepted only if (a) the shim's logits there are within the bound
+    derived for this model and dtype (docs/numerics/AGREE.md §2), and (b)
+    upstream's own margin between its token and the shim's token is within
+    that bound too: a margin the bound can see would make the shim's choice a
+    defect, not a tie. After the divergence the prefixes differ, so nothing
+    later is compared.
+
+    What this cannot see: a defect that only ever moves near-tied logits. The
+    logit tests are what bound that.
+    """
+    import numpy as np
+
+    u_seq, s_seq = up["generated"][0], shim["generated"][0]
+    k = next(i for i, (a, b) in enumerate(zip(u_seq, s_seq)) if a != b)
+    assert k >= len(up["input_ids"][0]), "the sides differ inside the prompt"
+    prefix = u_seq[:k]
+    ups = _side_ids(case, False, dtype, "cpu", prefix)
+    up64 = _side_ids(case, False, "float64", "cpu", prefix)
+    sh = _side_ids(case, True, dtype, device, prefix)
+    for rec in (ups, up64, sh):
+        _reached(rec)
+    u = _read(ups, "logits")[0, -1].astype(np.float64)
+    u64 = _read(up64, "logits")[0, -1].astype(np.float64)
+    s = _read(sh, "logits")[0, -1].astype(np.float64)
+    report = _judge_tie(u, u64, s, u_seq[k], s_seq[k], k, message)
+    print("     tie: " + report.replace("\n", "\n     "))
+    return k
+
+
+def _judge_tie(u, u64, s, a, b, k, message=""):
+    """The decision alone, on one row of logits: upstream `u`, its float64
+    oracle `u64`, the shim `s`; upstream chose token `a`, the shim `b`."""
+    import numpy as np
+
+    bound, tol, own, scale = _bound(u, u64)
+    dist = float(np.max(np.abs(s - u)))
+    margin = float(u[a] - u[b])
+    margin64 = float(u64[a] - u64[b])
+    report = (f"{message}\n  first divergence at position {k}: upstream chose {a}, "
+              f"shim chose {b}\n  shim-vs-upstream logit distance {dist:.3e}, "
+              f"upstream margin {margin:.3e} (float64 oracle {margin64:.3e}), "
+              f"derived bound {bound:.3e} (p90 {tol:.3e}, own worst {own:.3e}, "
+              f"scale {scale:.3e})")
+    assert dist <= bound, report + "\n  -> the shim's logits are outside the bound: a defect"
+    assert abs(margin) <= bound, (
+        report + "\n  -> upstream's margin is larger than the bound, so the bound "
+        "can resolve this choice: the shim picked the wrong token, a defect")
+    return report
+
+
+def _side_ids(case, shim, dtype, device, ids):
+    """One forward over explicit token ids (no generate, no digest)."""
+    c = _case(case)
+    args = {
+        "shim": shim, "dtype": dtype, "device": device, "attn": None,
+        "tag": f"{case}-{'shim' if shim else 'up'}-{dtype}-{device}-prefix{len(ids)}",
+        "out": _workdir(), "path": c["path"], "ids": list(ids),
+        "prompt": None, "hf_home": c["hf_home"],
+        "digest": False, "control": False, "nocache": False, "generate": None,
+    }
+    return _run_side(args)
 
 
 def _check_metal_ran(case, dtype, stage="forward"):
@@ -701,6 +774,38 @@ def test_tiny_qwen3_default_dtype_logits_agree_with_upstream_on_cpu():
 
 def test_tiny_qwen3_the_bound_can_see_q_norm_and_k_norm():
     _check_control("tiny")
+
+
+def test_the_tie_allowance_refuses_a_margin_the_bound_can_see():
+    """Nullification of the bf16 generate criterion, without a model: the
+    tie allowance must reject (a) a shim choice upstream separates by more
+    than the bound, and (b) shim logits outside the bound -- and accept a
+    genuine tie."""
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    u64 = rng.normal(size=4096) * 10.0
+    u = u64 + rng.normal(size=4096) * 1e-3          # upstream's own error
+    bound = _bound(u, u64)[0]
+    a, b = 7, 11
+    tie = u.copy(); tie[a] = 50.0; tie[b] = 50.0 - bound / 4
+    tie64 = u64.copy(); tie64[a] = 50.0; tie64[b] = 50.0 - bound / 4
+    _judge_tie(tie, tie64, tie, a, b, 0)              # a tie: accepted
+    wide = tie.copy(); wide[b] = 50.0 - 1000 * bound
+    wide64 = tie64.copy(); wide64[b] = 50.0 - 1000 * bound
+    try:
+        _judge_tie(wide, wide64, wide, a, b, 0)
+    except AssertionError as e:
+        assert "margin is larger than the bound" in str(e), e
+    else:
+        raise AssertionError("a margin 1000x the bound was accepted as a tie")
+    off = tie.copy(); off += 100 * bound
+    try:
+        _judge_tie(tie, tie64, off, a, b, 0)
+    except AssertionError as e:
+        assert "outside the bound" in str(e), e
+    else:
+        raise AssertionError("shim logits 100x outside the bound were accepted")
 
 
 def test_tiny_qwen3_greedy_generate_matches_upstream_on_cpu_float32():
