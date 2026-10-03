@@ -729,9 +729,19 @@ pub fn exponential_serial(gen: &mut CpuGenerator, size: usize, lambda: f64) -> V
 /// `torch.manual_seed`'s remap of a negative seed, from its own docstring:
 /// "Negative inputs are remapped to positive values with the formula
 /// `0xffff_ffff_ffff_ffff + seed`".
+///
+/// **The docstring is off by one and this follows the measurement, not the
+/// docstring.** On torch 2.13.0 `manual_seed(-1)` reports `initial_seed()` =
+/// 18446744073709551615 (2^64 - 1), `-5` gives ...611, `-2^63` gives 2^63: the
+/// seed is reinterpreted as a uint64, i.e. `2^64 + seed`. The docstring's
+/// formula gave 2^64 - 2 for `-1`; found by `test_cbwalls.py` comparing a
+/// negative-seeded `torch.Generator()` with upstream's.
 pub fn normalise_seed(seed: i128) -> Option<u64> {
     let value = if seed < 0 {
-        (u64::MAX as i128).checked_add(seed)?
+        if seed < i64::MIN as i128 {
+            return None;
+        }
+        (1i128 << 64) + seed
     } else {
         seed
     };

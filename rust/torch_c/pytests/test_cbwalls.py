@@ -248,6 +248,10 @@ y = torch.zeros(2 ** 20, dtype=torch.float32, device="mps")   # exactly 4 MiB
 torch.zeros(1, device="mps").cpu()
 with_xy = mps.current_allocated_memory()
 del x
+# read BEFORE anything allocates again: the allocator sweeps its free pool on the
+# next allocation, so a count that wrongly included pool-only buffers would be
+# indistinguishable from the right one after `settle()` (found by nullifying it).
+immediate = mps.current_allocated_memory()
 settle()
 without_x = mps.current_allocated_memory()
 del y
@@ -256,6 +260,7 @@ end = mps.current_allocated_memory()
 out["d_x"] = with_x - base_cur
 out["d_y"] = with_xy - with_x
 out["freed_x"] = with_xy - without_x
+out["immediate_freed_x"] = with_xy - immediate
 out["back_to_base"] = end - base_cur
 out["drv_delta"] = drv_with_x - base_drv
 """ + _TAIL
@@ -270,12 +275,13 @@ def test_current_allocated_memory_moves_by_exactly_the_size_of_a_known_tensor():
     assert shim["d_x"] == 16 * mib, shim
     assert shim["d_y"] == 4 * mib, shim
     assert shim["freed_x"] == 16 * mib, shim
+    assert shim["immediate_freed_x"] == 16 * mib, shim
     assert shim["back_to_base"] == 0, shim
     # Upstream's own allocator agrees for sizes that need no rounding, which is
     # why these sizes were chosen. For a size that is not a power of two the two
     # round differently (ours to the next power of two, upstream's to its own
     # pages): not asserted, and documented on `_mps_currentAllocatedMemory`.
-    for key in ("d_x", "d_y", "freed_x", "back_to_base"):
+    for key in ("d_x", "d_y", "freed_x", "immediate_freed_x", "back_to_base"):
         assert shim[key] == upstream[key], (key, shim, upstream)
 
 
