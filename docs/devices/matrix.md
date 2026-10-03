@@ -71,7 +71,7 @@ so explicitly where one does not.
 |---|---|
 | **AGREES** | both sides computed and every element matches within `tools/golden/dtypes.py`'s tolerance **for the result's dtype**. The only verdict that is a claim about numbers. |
 | **REACHES** | the shim computed and the claim stops there — upstream refused (no oracle), or both computed and the values differ. A REACHES is **never** recorded as an AGREES. |
-| **REFUSES** | the shim raised a refusal. Counted in two halves: refusals that name the dtype/device/reason, and refusals that hand back a candle symbol. CLAUDE.md §6 makes only the first kind acceptable. |
+| **REFUSES** | the shim raised a refusal. Counted in two halves: refusals that name the dtype/device/reason, and refusals that hand back a candle symbol. AGENTS.md §18 makes only the first kind acceptable. |
 | **BREAKS** | anything else — a panic, a hard crash, or a cell this harness could not build. A BREAKS is as much a statement about the harness as about the shim. |
 | **n/a** | not a verdict. The operator takes neither a tensor nor a `device=`, so it has no `mps` cell at all. |
 
@@ -151,7 +151,7 @@ the shape `test_intmps.py` already rejected for the integer dtypes.
 **existing** gate and is called from the nine factory sites. This is not a
 second guard: it is the same guard asked one step earlier on the paths that
 would otherwise never reach it, so nullifying `metal_dtype_gate` takes both out
-together. Two guards that shadow each other is the defect CLAUDE.md §5.5
+together. Two guards that shadow each other is the defect AGENTS.md §17.5
 records, and it is what the declined change below would have created.
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs metal_dtype_gate present -->
@@ -206,13 +206,13 @@ passes through, so the object that guard inspects — an existing `float64` tens
 on Metal — cannot be built. Twenty-two roads onto the device were probed and not
 one produces it. A test for that guard could not be written: its precondition is
 unconstructible, so gutting it leaves every test green, which is the
-"verification that cannot fail" shape of CLAUDE.md §5.5. Worse, as a second
+"verification that cannot fail" shape of AGENTS.md §17.5. Worse, as a second
 guard behind the first, the two would shadow each other and neither could be
 nullified alone.
 
 ### 3.5 Nullification
 
-Each change was broken on purpose and the suite re-run (§6 of CLAUDE.md's rule;
+Each change was broken on purpose and the suite re-run (§18 of AGENTS.md's rule;
 an unnoticed nullification is worth more than a feature):
 
 | nullification | result |
@@ -504,7 +504,7 @@ This paragraph said there was not, citing §7.5 — but §7.11 built one, and th
 round that wrote this was scoped against a tree that predated it. The `mps`
 half of cause D is no longer resting on a structural derivation: it is
 bracketed by `_C._metal_counters()` in §4.3c, where the host-twin experiment
-CLAUDE.md §2 records as impossible on Metal has now been run on Metal.
+AGENTS.md §13.1 records as impossible on Metal has now been run on Metal.
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs host_full present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs exact_int_matmul present -->
@@ -680,7 +680,7 @@ unconverted `f64`). `scalar_tensor`'s `compute_encoders` is legitimately 0 —
 a one-element result has nothing to broadcast — and the test excludes it by
 name rather than asserting a bug into existence.
 
-**CLAUDE.md §2 says this experiment cannot be run on Metal. It can now, and it
+**AGENTS.md §13.1 says this experiment cannot be run on Metal. It can now, and it
 was.** A mutant replacing `host_full`'s device path with a host-side fill of
 the whole block, built through `vendor/install_shim.sh` so it reached the
 vendored tree:
@@ -690,7 +690,7 @@ vendored tree:
 | M-B: whole block filled on the host, then uploaded | **all green** — `test_every_float_factory_in_cause_d_answers_on_mps` and the rounding witness both pass | **RED**: 24 bytes uploaded where 4 were expected, 0 compute shaders where ≥ 1 were expected |
 
 That is the host twin, on Metal, invisible to every value in the file and
-caught only by the counter — the same result CLAUDE.md §2 records three times
+caught only by the counter — the same result AGENTS.md §13.1 records three times
 on Vulkan and explicitly declines to claim cross-backend. It may now be
 claimed.
 
@@ -762,7 +762,7 @@ neighbour the implementing commit did not come back to:
 | `test_shim` | `these functions in aten.rs read device bytes to the host and are neither a refused kernel, a known readback helper, nor an exemption with a reason: ['exact_int_matmul']` | the scan is a real instrument and it fired correctly. `exact_int_matmul` refuses a non-host operand at its first statement, so it is an exemption with a reason, and it is written down as one rather than filtered out |
 
 **And twenty golden cases, which the suites cannot see.** With the five suites
-green the gate was still red, in the one marker CLAUDE.md §2 says `ge` is
+green the gate was still red, in the one marker AGENTS.md §13 says `ge` is
 useless for: `golden_cases_failed eq 0`, reading **20**. Every one of the twenty
 said the same thing — *"gap appears CLOSED: both sides now succeed, promote this
 case to expect=match and diff real values"*. They are `mm`, `bmm`, `matmul`,
@@ -800,7 +800,7 @@ probe got the shim". A sixteenth, `test_shim`'s HF-quantiser provenance check,
 asks the same question of traceback frames and answered the same way — it
 reported that transformers' own refusal came from torchnative.
 
-This is the CLAUDE.md §5.5 shape inverted: not a check that cannot fail, but a
+This is the AGENTS.md §17.5 shape inverted: not a check that cannot fail, but a
 check that cannot pass, and both are the same defect — the instrument stopped
 depending on the thing it claims to measure. Replaced with
 `hasattr(torch._C, "_aten_implemented")`, which is what actually distinguishes
@@ -1537,8 +1537,8 @@ Two things are worth keeping apart.
   AGREES.
 * **Lifting §7.7's gate would have converted a refusal into a wrong answer.**
   `clamp_`/`clamp_min_` were refused on Metal before this round, so the
-  divergence was unreachable through them. That is the one direction CLAUDE.md
-  §4 does not permit, and it is the argument for re-measuring the whole matrix
+  divergence was unreachable through them. That is the one direction AGENTS.md
+  §16 does not permit, and it is the argument for re-measuring the whole matrix
   after a change rather than testing the change.
 
 The fix is in `clamp_values` and is device-resident: `where(x != x, x,
@@ -1642,7 +1642,7 @@ straight to a `candle_metal_kernels::call_*` that encodes at least one
 count of candle's GPU op invocations — *not* a count of `dispatch_threads`,
 which happen in `candle-metal-kernels`, a crate this vendoring does not cover.
 Quoting it as "N kernels ran" would be the same kind of inflation-by-citation
-CLAUDE.md §2 records for the "four rounds"/"five rounds" count.
+AGENTS.md §13.1 records for the "four rounds"/"five rounds" count.
 
 Measured, one `aten.abs.default` on an `mps` `float32` `[2, 3]`:
 
@@ -1676,7 +1676,7 @@ now exists; the work of pointing it at each cell does not.
 
 ### 7.12 The experiment that could not be run on Metal, run
 
-CLAUDE.md §2 records three rounds that replaced a device kernel with a
+AGENTS.md §13.1 records three rounds that replaced a device kernel with a
 host-computed twin — `7dff9f0`, `35e002f`, `22d9158` — and notes that all three
 are Vulkan, because Vulkan was the only backend with a counter. This is the
 Metal one.
@@ -1804,7 +1804,7 @@ this corrects it: the blind spot is **one un-named hop**, in the same file.
 Twelve production cells sit in it.
 
 **It was not fixed in the round that found it, and that was a decision rather
-than an omission** — a capability decision, which CLAUDE.md §5.7 leaves with
+than an omission** — a capability decision, which AGENTS.md §17.7 leaves with
 the user, and an audit is not the round to take it in. `test_metalplace.py`
 pinned all three halves instead — the download happens, the op is not refused,
 the scan does not derive it — so that fixing any one of them would turn the
@@ -1821,8 +1821,8 @@ found them**, not as a description of the current build: `sort` on
 #### The claims that are now counted, and the bracket they were counted in
 
 The bracket is the same for every number below, and it is stated because
-counters from different brackets read like regressions side by side (CLAUDE.md
-§2): operands are built **before** the first snapshot, the counters are read
+counters from different brackets read like regressions side by side (AGENTS.md
+§16): operands are built **before** the first snapshot, the counters are read
 immediately before and immediately after the single `_aten_dispatch` under
 test, and results are read back **after** the second snapshot. Nothing else
 runs between the two reads.
@@ -1839,7 +1839,7 @@ computed in a **separate subprocess** at `tools/golden/dtypes.py`'s derived
 tolerance, except the 43-operator sweep, which is **placement only and says
 so** — its values are graded by `test_mpsinplace.py` and by §6's table, and
 duplicating an oracle for 43 operators would have made the file about
-agreement instead of about where the work happened (CLAUDE.md §4).
+agreement instead of about where the work happened (AGENTS.md §16).
 
 #### What the counter cannot reach, stated rather than approximated
 
@@ -2274,7 +2274,7 @@ after the last one and both trees are byte for byte their patches again.
 | M-4: `CpuStorage::I8` returned to the refusing arm in `candle-core` | §4.3a cause A, restored | RED in four tests — `unsupported dtype I8 for op to_dtype`, the exact pre-change message |
 | M-5: **a host twin** — `to_dtype` for `I8` downloads, converts on the CPU and uploads | nothing a value can see | RED **only on the counters** — `read 2 tensor(s) back to the host (16 bytes)`. Every element was still correct and `.device` still said `mps` |
 
-**M-5 is the one that matters**, and it is the experiment CLAUDE.md §2 records
+**M-5 is the one that matters**, and it is the experiment AGENTS.md §13.1 records
 as never having been run on Metal. It has now been: a host-computed twin of
 the `int8` cast produced **correct values under an `mps` label**, and the
 agreement assertions did not notice. `host_downloads == 0` did.

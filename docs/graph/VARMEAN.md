@@ -452,7 +452,7 @@ Three things keep this from being a skip:
    raises unless `127.0.0.1` is among what it parsed -- a fact about every
    host, not about this one. A detector that quietly returned an empty set
    would put the gate permanently in the cannot-run branch: an assertion
-   switched off with nothing saying so, which is CLAUDE.md §5.5's shape and
+   switched off with nothing saying so, which is AGENTS.md §17.5's shape and
    the direction this project has been bitten in before.
 2. **Both branches of the decision are exercised here**, on a host that only
    ever takes one. `_nullification_can_run` is a pure function of two measured

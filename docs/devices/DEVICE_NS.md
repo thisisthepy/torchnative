@@ -101,7 +101,7 @@ verified by hardcoding the host and watching it go red (§7, N2).
 `cpu`, `mps`, `vulkan` and `cuda` are `EagerDevice`: they dispatch operator by
 operator and they are **tensor destinations**. `npu` is a `CompiledDevice`: an
 NPU is handed a whole subgraph ahead of time and cannot dispatch a single
-operator (CLAUDE.md §8), so it is not a destination at all.
+operator (AGENTS.md §20), so it is not a destination at all.
 
 The difference is expressed as **the absence of an attribute**:
 
@@ -301,7 +301,7 @@ evidence: `intelnpu.probe`, `assert_execution_device`,
 `verdict_execution_devices`) and what is missing (the equivalent leaf). It is
 **not** stubbed into a fake success. Returning the model unchanged would be an
 argument accepted and dropped —
-[`../graph/NPU2.md`](../graph/NPU2.md) §1 exactly, and CLAUDE.md §6 on promised
+[`../graph/NPU2.md`](../graph/NPU2.md) §1 exactly, and AGENTS.md §18 on promised
 refusals that never happen.
 `test_to_the_compiled_target_either_lowers_or_names_what_it_resolved_to` holds
 both halves: on a wired backend it fails if `to()` does not lower and attach a
@@ -362,7 +362,7 @@ as [`../graph/NPU2.md`](../graph/NPU2.md)'s, pointing the other way.
 **This is a defect in `bootstrap.py`, not in this namespace, and it was not
 fixed here.** Fixing it meant deciding what `torch.backends.mps.is_available()`
 should return, which changes behaviour for every existing caller and reached
-past that round's request (CLAUDE.md §5.7). It was recorded, measured, and left
+past that round's request (AGENTS.md §17.7). It was recorded, measured, and left
 — and picked up by [`../numerics/DTYPEDEV.md`](../numerics/DTYPEDEV.md), which
 is the round that decided it.
 
@@ -385,7 +385,7 @@ Every row was applied to the source, the suite was run, and the source restored.
 **N5 escaped the first time, and that is the finding.** The differential test
 compares observable module state, and `non_blocking` has no observable effect on
 a CPU-to-CPU copy, so a wrapper that silently dropped it produced byte-identical
-parameters and a green suite. This is CLAUDE.md §5.5's shape: a verification
+parameters and a green suite. This is AGENTS.md §17.5's shape: a verification
 that could not fail for that class of change.
 
 The fix is `test_ordinary_calls_reach_upstream_with_identical_arguments`, which

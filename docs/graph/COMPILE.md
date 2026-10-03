@@ -252,7 +252,7 @@ the expensive part. Each row of the matrix needs a target CPython distribution
 on the build host, a cross toolchain (`cargo-zigbuild` for Linux, `cargo-xwin`
 for Windows, NDK for Android, two Apple SDKs for iOS), a `verify_<platform>.py`
 run, and — for Android and iOS — a device or emulator, of which this machine
-can run **one at a time** (CLAUDE.md). Multiply the emulator-serialised part by
+can run **one at a time** (AGENTS.md). Multiply the emulator-serialised part by
 the number of live CPython minors.
 
 **Code cost, which dominates everything above.** A non-abi3 wheel does not give

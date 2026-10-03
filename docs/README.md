@@ -11,7 +11,7 @@ Several families here (`BACKWARD1-9`, `DEMAND1-8`, `TAIL*`) are named after the
 round rather than the subject, which is why the folder assignments below were made
 by reading the documents rather than by their filename prefix.
 
-**`CLAUDE.md` and `README.md` stay at the repository root.** They are not round
+**`AGENTS.md` and `README.md` stay at the repository root.** They are not round
 records; they are the front door.
 
 | Folder | What belongs there |
@@ -27,7 +27,7 @@ records; they are the front door.
 | `devices/` | Device backends and the device abstraction: CPU, `meta`, MPS, CUDA, Vulkan, and vendor NPUs. |
 | `distributed/` | `torch.distributed`, collectives, transport, and federated rounds. |
 | `platform/` | Building and shipping: cross-builds, wheels, WASM, iOS/Android/Linux/Windows targets, vendoring, release notes. |
-| `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see CLAUDE.md §4. |
+| `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see AGENTS.md §16. |
 | `api/` | The user-facing Python API this project offers in its own namespaces: `torchnative.device`, `torchnative.transformers`, and the argument forms and refusals they present. Distinct from `bindings/`, which is the `torch._C` surface we must reproduce; this folder is the surface we chose. |
 | `verification/` | The checkers themselves and the audits of this documentation: DOCWATCH, the golden harness, and what they structurally cannot see. |
 | `guide/` | The bilingual (en/ko) GitHub Pages site, deployed from `main` by `.github/workflows/pages.yml`. Static HTML/CSS/JS; `check_guide.py` is its test. |
@@ -68,6 +68,6 @@ run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
 Each of these was verified by deliberately breaking it and watching the test go
 red. Two of them were *vacuous when first written* -- their regexes could not
 match `docs/<folder>/NAME.md` at all, so they matched nothing after the sort and
-passed green. That is CLAUDE.md §5.5 reproduced inside the test written to
+passed green. That is AGENTS.md §17.5 reproduced inside the test written to
 prevent it; the comments in the test record it so the next round does not
 reintroduce it.

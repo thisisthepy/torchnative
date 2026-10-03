@@ -540,7 +540,7 @@ jobs:
       # (verify_cross.py) needs the macOS wheel as its `--reference` to answer
       # its most useful question -- "does this wheel carry the same tree" -- and
       # no build job has the other eight wheels. Run per-job it would have to be
-      # `--reference` -less, which is the CLAUDE.md §5.5 shape: a check that
+      # `--reference` -less, which is the AGENTS.md §17.5 shape: a check that
       # reports on whatever it was given. It runs once, in `collect`, with all
       # nine present and a real reference.
 

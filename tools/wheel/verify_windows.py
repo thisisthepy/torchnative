@@ -293,7 +293,7 @@ def check_wheel(wheel: Path) -> int:
 
 # ------------------------------------------------------------------ self-test
 #
-# "실패할 수 없는 검증은 검증이 아니다" (CLAUDE.md §5.5). The resolver above passes
+# "실패할 수 없는 검증은 검증이 아니다" (AGENTS.md §17.5). The resolver above passes
 # on the wheel this repository builds, which on its own says nothing. So it is
 # also run on images it must reject, and on a real Windows CPython extension
 # from the target distribution that it must accept -- the same shape as

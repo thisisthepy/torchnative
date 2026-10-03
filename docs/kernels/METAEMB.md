@@ -109,7 +109,7 @@ again.
 | 6 | `index.Tensor` (integer half) | — | **7 / 8** |
 
 **Rounds 0–2 added ten kernels and moved the count from 0 to 0.** That is the whole of
-CLAUDE.md §5.3's point in one table: a kernel count is not progress, and this round would
+AGENTS.md §17.3's point in one table: a kernel count is not progress, and this round would
 have reported "twelve kernels added" as a success at the end of round 2 while nothing a
 user could do had changed.
 
@@ -418,7 +418,7 @@ which is a representation change and out of this round's scope — §9.
 `max.dim`, `argmax`, `topk`, `sort` and `index.Tensor` as ops that must refuse. All eight now
 answer, so the test would have failed as a **regression detector** without being wrong about
 anything real. The refusing list was replaced with twelve ops **confirmed still refusing by
-direct dispatch before the edit** (METAFAM.md's discipline, and CLAUDE.md §5.5's), and the
+direct dispatch before the edit** (METAFAM.md's discipline, and AGENTS.md §17.5's), and the
 answering half — the half that stops this test passing on an empty meta table — grew by 17
 names plus a new multi-output section that reads the index dtype.
 
@@ -426,7 +426,7 @@ names plus a new multi-output section that reads the index dtype.
 
 ## 7. Nullification — 12 of 12 caught
 
-CLAUDE.md §5.5. Each row is a deliberate ONE-LINE break of the landed code, a full rebuild
+AGENTS.md §17.5. Each row is a deliberate ONE-LINE break of the landed code, a full rebuild
 and reinstall of the vendored shim, a re-run of `test_metaemb.py`, and a restore from a
 known-good copy. Automated end to end so that no round was skipped or hand-waved.
 
@@ -493,7 +493,7 @@ one failure was `test_all_five_reduce_ops_agree_with_upstream_and_the_bitwise_th
 timing out at 600s in its multiprocess (`gloo32-3`) leg while a sibling worktree's gate ran
 concurrently on the same eight cores. 1034 + 1 = 1035, the documented baseline. It passes in
 the landing run above, so it was contention and not this round's changes -- stated rather
-than assumed innocent, per CLAUDE.md §5.5. That failing baseline run also exited before
+than assumed innocent, per AGENTS.md §17.5. That failing baseline run also exited before
 `run.sh` reached the golden self-test and DOCWATCH, which is why the baseline for those two
 is taken from the documented figures rather than from that run.
 

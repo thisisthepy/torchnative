@@ -451,7 +451,7 @@ PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY <스크립트>
 
 ## 12. 보고 분류
 
-`CLAUDE.md` §5.3.
+`AGENTS.md` §17.3.
 
 | 종류 | 무엇 |
 |---|---|

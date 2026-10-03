@@ -64,7 +64,7 @@ def test_the_family_is_enumerated_not_hand_listed():
     """Every `_BaseAutoModelClass` in `modeling_auto` must be reachable.
 
     Enumeration is the point: a hand-written list answers "which did the author
-    think of" rather than "which exist" (CLAUDE.md section 5.4). This computes
+    think of" rather than "which exist" (AGENTS.md section 17.4). This computes
     the population independently and requires the module to cover all of it.
     """
     _shim()

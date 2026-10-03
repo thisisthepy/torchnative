@@ -20,7 +20,7 @@ entry should be deleted the moment the binding landed. This round landed them.
 | `aten.linalg_vector_norm.default` | `torch.linalg.norm` / `torch._C._linalg.linalg_norm` | `owlv2`, `owlvit` | **landed** |
 | `aten.mish.default` | `torch._C._nn.mish` | F5-TTS | **not payable — §5** |
 
-Split the way `CLAUDE.md` §5.3 asks, so that "four names" is not four of
+Split the way `AGENTS.md` §17.3 asks, so that "four names" is not four of
 anything:
 
 | class | what |

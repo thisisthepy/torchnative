@@ -56,7 +56,7 @@ Exit code is 0 iff every evaluated marker is PASS (SKIPPED does not count
 against it; a marker this run could not evaluate is not the same claim as
 one it evaluated and found false). Non-zero otherwise. Never grep stdout for
 a success marker -- read the exit code, and read it without a pipe in the
-way (CLAUDE.md's own rule, and this tool's acceptance criteria follow it).
+way (AGENTS.md's own rule, and this tool's acceptance criteria follow it).
 """
 from __future__ import annotations
 
@@ -161,7 +161,7 @@ def parse_markers(paths: list[Path]) -> list[Claim]:
 class LiveFactsError(RuntimeError):
     """Ground truth could not be produced -- distinct from a claim being
     false. A marker whose source raised this is reported ERROR, not FAIL:
-    CLAUDE.md's own house style (run.sh's cmp-exit-code guard, build.py's
+    AGENTS.md's own house style (run.sh's cmp-exit-code guard, build.py's
     three-way verdict) is explicit that collapsing "wrong" and "could not
     tell" into one outcome is the bug, not a simplification."""
 

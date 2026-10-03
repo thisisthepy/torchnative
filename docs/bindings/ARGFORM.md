@@ -103,8 +103,8 @@ are handled too — the same `_list_with_default` rule, measured alongside the b
 than assumed to follow from it.
 
 ARCH100.md §6 named `dinov3_convnext` and `efficientnet` as *unclassified* failures with this exact
-`adaptive_avg_pool2d: output_size must be 2` message, suspecting but not asserting (per CLAUDE.md
-§5.4) that it was this same gap. Confirmed after the fix: `dinov3_convnext` clears its wall entirely
+`adaptive_avg_pool2d: output_size must be 2` message, suspecting but not asserting (per AGENTS.md
+§17.4) that it was this same gap. Confirmed after the fix: `dinov3_convnext` clears its wall entirely
 (forward runs). `efficientnet` clears this wall and reaches a new one (§5).
 
 ## 5. Which architectures clear their wall — measured with `arch_sweep.py --one`, both artefacts rebuilt

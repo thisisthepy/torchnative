@@ -41,7 +41,7 @@ boot simulators and emulators, and reach the network; the gate runs on every
 commit. The live case here is the cheapest possible one -- spawn the already-built
 simulator launcher and ask it for `sys.platform` -- and it **skips by name** when
 no simulator is booted, because a check that quietly passes when its subject is
-absent is the shape `CLAUDE.md` §5.5 is about.
+absent is the shape `AGENTS.md` §17.5 is about.
 """
 
 import json

@@ -57,7 +57,7 @@ of the 297, after excluding what cannot be judged:
 <!-- DOCWATCH: count agree_state_dict_clean ge 297 -->
 
 The markers are `ge` on everything a later round could legitimately raise and `le` on the two that
-must not grow — divergence and unjudgeability. That is CLAUDE.md's rule, and it is the right way
+must not grow — divergence and unjudgeability. That is AGENTS.md's rule, and it is the right way
 round here: an operator landing can only add architectures to the population, never remove one.
 
 **Nothing that agreed before disagrees now.** The one change in the `diverge` column is an
@@ -322,7 +322,7 @@ $PY agree_sweep.py --report --dir $D
 
 Both drivers are resumable, and `--deadline` exists so the sweep can be issued repeatedly **in the
 foreground** rather than backgrounded and lost. This round took three `--produce` passes and two
-`--replay` passes at those deadlines. Do not filter the population to go faster: CLAUDE.md records a
+`--replay` passes at those deadlines. Do not filter the population to go faster: AGENTS.md records a
 round invalidated by exactly that.
 
 ## 9. Gates

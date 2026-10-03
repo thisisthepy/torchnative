@@ -344,7 +344,7 @@ def test_a_noncontiguous_fake_tensor_is_not_this_operators_gap():
     because that is a claim that can go red: if `lift_fresh_copy` ever becomes
     the odd one out in either direction -- refusing when the others succeed,
     or succeeding when the others refuse -- this fails and says so.  A test
-    that simply omitted the case would be CLAUDE.md §5.5's shape.
+    that simply omitted the case would be AGENTS.md §17.5's shape.
 
     `torch.export` does not reach this: the constant a Python literal produces
     is contiguous, which is why THE BAR below passes with this gap open.
@@ -645,7 +645,7 @@ def test_expired_still_refuses_rather_than_guessing():
     this shim genuinely cannot say whether that storage is still alive.
     Answering `False` ("still alive") would be the cheap way to make
     `_expired` return something, and it would be a claim that is wrong the
-    moment it matters -- CLAUDE.md §5.5's shape, a check that cannot fail.
+    moment it matters -- AGENTS.md §17.5's shape, a check that cannot fail.
 
     Nothing on the `torch.export` path calls it: `fake_tensor.py` tracks
     liveness with `weakref.ref` on the tensors instead.  So it refuses, and

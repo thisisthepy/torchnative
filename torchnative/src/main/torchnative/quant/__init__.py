@@ -190,7 +190,7 @@ class QuantizedLinear(torch.nn.Module):
 class _Report:
     """What `quantize_` did, and what it refused to do.
 
-    A count of replacements on its own is the metric CLAUDE.md §5.3 warns
+    A count of replacements on its own is the metric AGENTS.md §17.3 warns
     about: it goes up whether or not anything was gained. So this also carries
     the bytes on both sides and every skip with its reason, and `__str__`
     prints all three.

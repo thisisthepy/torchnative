@@ -11,7 +11,7 @@ measurement rather than a worry: **three rounds replaced a device kernel with a
 host-computed twin, and every value came back correct, every agreement test
 stayed green, and the `.device` label never changed.** All three were Vulkan
 (`7dff9f0`, `35e002f`, `22d9158`) -- not because Metal is safer but because
-Vulkan was the only backend where the experiment could be *run* (CLAUDE.md §2).
+Vulkan was the only backend where the experiment could be *run* (AGENTS.md §13.1).
 On Metal the failure mode could not be excluded, only hoped against.
 
 `_C._metal_counters()` is the instrument. Its six numbers are incremented
@@ -35,7 +35,7 @@ dispatches and an exact count of candle's GPU op invocations. It is not a count
 of `dispatch_threads`: those live in `candle-metal-kernels`, a crate this
 vendoring does not cover (docs/devices/matrix.md §7.11). That distinction is
 written down because the number would otherwise be quoted as something it is
-not -- the failure `CLAUDE.md` §2 records for the "four rounds"/"five rounds"
+not -- the failure `AGENTS.md` §13.1 records for the "four rounds"/"five rounds"
 inflation.
 
 **What each test here is for, and which mutant kills it.** A counter test is

@@ -15,7 +15,7 @@ Free-text prose cannot be parsed reliably into a checkable claim.
 from the surrounding narrative sentences that are *not* claims (design
 rationale, historical color, a sentence explaining why a number is what it
 is). A pattern match broad enough to catch prose like that is also broad
-enough to fire on sentences that only *look* like the pattern, and CLAUDE.md
+enough to fire on sentences that only *look* like the pattern, and AGENTS.md
 already has the relevant judgment on this repository's other checkers
 (`run.sh`'s `cmp` exit-code handling, `build.py`'s three-way verdict): a check
 that cannot distinguish "wrong" from "could not tell" gets ignored, and an

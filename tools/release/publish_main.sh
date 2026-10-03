@@ -61,7 +61,7 @@
 #
 # The second is the real one. A wrong exclusion that removes `tools/wheel/` or
 # `vendor/` produces a branch that is spotlessly clean and completely useless,
-# and the leak check would pass it without a murmur. CLAUDE.md 5.5: a check
+# and the leak check would pass it without a murmur. AGENTS.md 17.5: a check
 # that cannot fail is not a check, and the leak check cannot fail on the one
 # mistake that would actually hurt a user.
 #
@@ -99,7 +99,7 @@ cd -- "$REPO"
 #                           They are the record of how the work was done, not
 #                           part of what ships, and they are the bulk of the
 #                           tree a user would clone.
-#   CLAUDE.md, PROJECT.md   instructions to agents working ON the repository.
+#   AGENTS.md, PROJECT.md   instructions to agents working ON the repository.
 #                           Meaningless to somebody consuming the wheel, and
 #                           actively confusing on the front page. README.md is
 #                           kept -- it is the front page.
@@ -141,7 +141,7 @@ cd -- "$REPO"
 # by default and has to be excluded deliberately.
 EXCLUDE_PATHS=(
     "docs"
-    "CLAUDE.md"
+    "AGENTS.md"
     "PROJECT.md"
     "rust/torch_c/pytests"
     "tools/docwatch"

@@ -187,8 +187,8 @@ pub fn eager_max_nodes_py() -> usize {
 
 /// Set the bound. `0` means unbounded, which restores exactly the behaviour
 /// `docs/training/BACKWARD7.md` §10 row 2 described -- kept so that the bound can be
-/// **nullified** and the tests that assert it seen to go red (`CLAUDE.md`
-/// §5.5), not because unbounded is an option anyone should choose.
+/// **nullified** and the tests that assert it seen to go red (`AGENTS.md`
+/// §17.5), not because unbounded is an option anyone should choose.
 #[pyfunction]
 #[pyo3(name = "_eager_set_max_nodes")]
 pub fn eager_set_max_nodes(value: usize) {

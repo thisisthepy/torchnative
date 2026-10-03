@@ -18,7 +18,7 @@ nothing to place, so it ran **on the CPU in all sixteen columns** and its CPU
 result was recorded under `mps`. That is why those rows read `AGREES` even at
 `float64_mps`, a cell measured here to raise `unsupported const-set f64`. A
 correct answer computed somewhere other than where the label says is the exact
-failure this namespace exists to prevent (CLAUDE.md §4), so this harness reads
+failure this namespace exists to prevent (AGENTS.md §16), so this harness reads
 each op's **schema** and injects `device=` and `dtype=` whenever the op accepts
 them, and records `n/a` -- never a verdict -- when it cannot place the cell on
 the device at all.
@@ -34,7 +34,7 @@ the device at all.
               name in the document; it is never reported as AGREES.
     REFUSES   the shim raised a refusal. Split in the counts into those that
               name the dtype/device/reason and those that hand back a candle
-              symbol, because CLAUDE.md §6 makes only the first kind acceptable.
+              symbol, because AGENTS.md §18 makes only the first kind acceptable.
     BREAKS    anything else: a panic, a hard crash, or a harness that could not
               build the cell. A BREAKS is a statement about this harness as
               much as about the shim, and is never read as a refusal.

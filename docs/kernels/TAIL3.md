@@ -99,7 +99,7 @@ this tail, so the first question per op was "does a kernel already exist under a
 **Counted honestly: two new kernels, one new factory, one fallback path, three bindings over
 bodies that already existed, and one deliberate refusal.** Eight `_aten_implemented()` keys, nine
 table rows. "Eight ops" would overstate it by a factor of three, which is the counting failure
-`CLAUDE.md` §5.3 names.
+`AGENTS.md` §17.3 names.
 
 `pytests/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
 itself — `index_add_common` reached from exactly two dispatch arms, `Bitwise::Xor` as an arm and

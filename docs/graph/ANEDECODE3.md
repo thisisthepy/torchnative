@@ -20,7 +20,7 @@ The compiled mlprogram output matches the PyTorch reference element-wise within 
 
 The tensor round trip is not a bottleneck here. Measured in a solitary test subprocess on this host, a 20-step loop using the growing cache (via symbolic sequence dimensions) computes successfully and proves that generation loop latency is reasonable.
 
-## 4. Split the way CLAUDE.md §5.3 asks
+## 4. Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|

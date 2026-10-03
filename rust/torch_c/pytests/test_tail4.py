@@ -784,7 +784,7 @@ def test_the_only_new_arithmetic_this_round_is_ties_to_even():
     So the count is **two new bodies and one genuinely new piece of
     arithmetic**: `nearbyint_ties_even`, which exists because candle's
     `Tensor::round` is the other rule. "Eight ops" would overstate it by a
-    factor of four, which is the counting failure CLAUDE.md §5.3 names.
+    factor of four, which is the counting failure AGENTS.md §17.3 names.
     """
     text = _aten_source()
     if text is None:

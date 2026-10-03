@@ -130,7 +130,7 @@ def _oracle(script, payload):
 
     The subprocess is the point. A same-process oracle shares an interpreter
     with the artefact under test, and this repository has already been bitten
-    by a probe that silently imported the wrong `torch` (CLAUDE.md §3). Here
+    by a probe that silently imported the wrong `torch` (AGENTS.md §15.2). Here
     the child's `PYTHONPATH` is emptied, so the only `torch` it can find is the
     real one in site-packages, and it asserts that what it got has **no**
     `_aten_implemented` -- i.e. that it is upstream and not the shim.

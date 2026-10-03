@@ -22,7 +22,7 @@ ours, so it can carry meaning ours can honour.
 operator, they are tensor destinations, and `.torch_device` hands back the
 `torch.device` that names them. `npu` is a `CompiledDevice`: an NPU takes a
 whole subgraph ahead of time and cannot be handed single operators
-(CLAUDE.md section 8), so it is not a tensor destination and `.torch_device`
+(AGENTS.md section 20), so it is not a tensor destination and `.torch_device`
 refuses by name. That is not a convention --- it is the absence of an
 attribute, so the wrong use cannot be spelled.
 
@@ -122,7 +122,7 @@ class Availability:
     string a reader can go and call themselves. `kind` is `"measured"` when
     the answer came from doing the thing, and `"declared"` when it came from a
     build-time constant --- a distinction this repository has been bitten by
-    (CLAUDE.md section 4: "built" and "reached" are different claims).
+    (AGENTS.md section 16: "built" and "reached" are different claims).
 
     `reason` is `None` when available, and a **name** otherwise --- never
     prose alone. `detail` carries the probe's own payload unedited.

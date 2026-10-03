@@ -271,7 +271,7 @@ ge.Scalar   histc.default   index_put_.default   masked_fill_.Scalar   softplus.
 zeros_like.default                       ← mamba·mixtral 12 개 중 11 개 (mixtral 값은 doc-comment
                                             를 베끼지 않고 tools/golden/cases.py 의 이미 측정된
                                             픽스처 값을 그대로 재사용했다)
-mm.default (n=128, gemm threading threshold)  ← 정확성만, 성능은 안 쟀다 (CLAUDE.md)
+mm.default (n=128, gemm threading threshold)  ← 정확성만, 성능은 안 쟀다 (AGENTS.md)
 sum.dim_IntList (dim=[])                 ← 이번에 고친 커널이 기기에서도 같은 값을 내는지
 ```
 

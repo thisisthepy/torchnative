@@ -459,7 +459,7 @@ class _LoadReport:
     `_Report` to the caller; `from_pretrained` returns only a model, so the
     same information has to be reachable from the model or it is not reachable
     at all -- and "how many layers were replaced" is exactly the number
-    CLAUDE.md §5.3 warns about reading on its own.
+    AGENTS.md §17.3 warns about reading on its own.
     """
 
     def __init__(

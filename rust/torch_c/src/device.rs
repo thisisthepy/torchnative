@@ -1912,7 +1912,7 @@ mod cuda_tests {
 /// for a host-computed twin keeps every value correct, keeps its `.device`
 /// label, and keeps its agreement test green. Three rounds performed exactly
 /// that substitution and **only a dispatch counter caught it** -- all three on
-/// Vulkan, because Vulkan was the only backend with one (CLAUDE.md §2). So
+/// Vulkan, because Vulkan was the only backend with one (AGENTS.md §13.1). So
 /// every `mps` placement claim in this repository rested on source-derived
 /// evidence that docs/devices/MPSATTN.md §3.1 records as defeatable by moving
 /// a `read_flat` one call deeper.

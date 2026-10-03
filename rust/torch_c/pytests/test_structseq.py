@@ -109,7 +109,7 @@ def _run(script, shim, timeout=900):
         )
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     # The side each probe landed on is asserted, not assumed: an empty vendored
-    # tree makes the "shim" side silently import upstream (CLAUDE.md §3).
+    # tree makes the "shim" side silently import upstream (AGENTS.md §15.2).
     assert out["is_shim"] is shim, f"probe meant for shim={shim} ran on the other side"
     return out
 

@@ -31,7 +31,7 @@ trains and the model that runs on an accelerator are one `nn.Module`, and
 `transformers.models.auto.modeling_auto` and takes every public name bound to a
 `_BaseAutoModelClass` subclass --- 49 of them in the pinned transformers ---
 so a transformers release that adds one is covered without an edit here. A
-hand-written list is the CLAUDE.md section 5.4 trap: it answers "which did I
+hand-written list is the AGENTS.md section 17.4 trap: it answers "which did I
 think of", not "which exist".
 
 **The shadowing hazard.** Because the class name is identical to
@@ -104,7 +104,7 @@ def _refuse_unsupported(cls_name, kwargs):
     """Refuse `export=` and `load_in_4bit=` by name, before anything else.
 
     Both appear in this project's README example. Neither is implementable in
-    this build, and CLAUDE.md section 6 is explicit that a promised refusal
+    this build, and AGENTS.md section 18 is explicit that a promised refusal
     which does not happen is worse than no refusal: an argument accepted and
     silently dropped leaves the caller believing something that is not true.
     So they are checked here, ahead of the delegation, and named.

@@ -41,7 +41,7 @@ PASS 가 아니라 SKIP 입니다. **사전학습 BERT 테스트는 로컬 가�
 
 ## 1. 시작점 — 벽을 다시 쟀다
 
-VULKAN6 의 문장을 인용하기 전에 **실제 `bert-base-uncased` 로 재측정**했습니다(`CLAUDE.md` §6):
+VULKAN6 의 문장을 인용하기 전에 **실제 `bert-base-uncased` 로 재측정**했습니다(`AGENTS.md` §18):
 
 ```
 AutoModel.from_pretrained(<hf-home>/bert-base-uncased, attn_implementation="eager")
@@ -159,7 +159,7 @@ values may all be in range; upload them directly with .to("vulkan") to record th
    않았습니다 — 하지만 동일 shape 만 됐습니다. 이름 목록은 **어떤 shape 으로** 불리는지를 담지
    않으므로(VULKAN4 §2 는 추적의 배치 크기조차 기록하지 않았습니다), 위치 임베딩 덧셈이
    브로드캐스트라는 사실을 볼 수 없었습니다. 배치 1 이면 `[1, S, H] + [1, S, H]` 라 브로드캐스트도
-   아닙니다. `CLAUDE.md` §5.4 가 BigVGAN 의 meta 커널로 기록한 함정과 같은 모양입니다 — **목록은
+   아닙니다. `AGENTS.md` §17.4 가 BigVGAN 의 meta 커널로 기록한 함정과 같은 모양입니다 — **목록은
    "커널이 있는가" 에 답했고 질문은 "이 모델이 도는가" 였습니다.**
 2. **추적은 upstream 에서 했고, 셰임은 matmul 을 분해하지 않는다.** VULKAN4 §2.1 이 바로 이 차이를
    적어 두었습니다: *"shim 은 `aten.matmul.default` 를 하나의 op 으로 유지합니다 … upstream 은 그것을
@@ -273,7 +273,7 @@ broadcast_add, lhs: [2, 3], rhs: [3, 2]`)를 냅니다. upstream 의 문구가 �
 
 ## 8. 무력화 — 일부러 깨고 빨개지는지 봤다
 
-`CLAUDE.md` §5.5. 먼저 **구현 전의 빌드**에서 새 테스트·수정 테스트를 돌려 **FAIL 11** 을 확인했고
+`AGENTS.md` §17.5. 먼저 **구현 전의 빌드**에서 새 테스트·수정 테스트를 돌려 **FAIL 11** 을 확인했고
 (red 단계), 그다음 보증을 하나씩 깼습니다. **16 개 전부 빨개졌고, 초록으로 남은 무력화는 없습니다.**
 
 | # | 무력화 | 빨개진 테스트 (대표 메시지) |

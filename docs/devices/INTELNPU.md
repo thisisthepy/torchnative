@@ -483,7 +483,7 @@ then checked back through `ov_core_read_model_from_memory_buffer`.
 
 ### 3.4 The negative controls on the tests themselves
 
-CLAUDE.md §5.5 — a verification that cannot fail is not a verification. Four faults were
+AGENTS.md §17.5 — a verification that cannot fail is not a verification. Four faults were
 injected and each was required to turn the suite red:
 
 | Injected fault | Caught by |

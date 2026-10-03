@@ -12,7 +12,7 @@ The README said the `mps` host-readback set was **54** ops. It is 85, and it
 had been 87 before MPSATTN.md took two out of it. Nothing anywhere compared the
 published number to the runtime list, so the drift was invisible -- the same
 shape of defect as the golden `ge` floors that could not see `passed < total`
-(CLAUDE.md §5.5).
+(AGENTS.md §17.5).
 """
 
 import os

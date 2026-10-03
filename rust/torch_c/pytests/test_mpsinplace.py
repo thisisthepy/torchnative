@@ -61,7 +61,7 @@ see below.
   grading around it.** Three separate rounds planted a host-computed twin,
   found the values entirely correct and the agreement test green, and **only a
   dispatch counter caught the fallback** -- all three on Vulkan, which is the
-  correction CLAUDE.md §2 records against the inflated citation of that number.
+  correction AGENTS.md §13.1 records against the inflated citation of that number.
   A Metal counter now exists (`_C._metal_counters()`,
   docs/devices/matrix.md §7.11) and **this file does not use it**: no test
   below asserts a counter delta for the in-place family, so these cells remain
@@ -584,7 +584,7 @@ def test_clamp_propagates_nan_on_mps_exactly_as_upstream_does():
       until this round, by the write-back gate, so the divergence could not be
       reached at all. Lifting that gate without this fix would have converted
       a refusal into a silently wrong answer, which is the one direction
-      CLAUDE.md §4 does not permit. The sweep caught it because the in-place
+      AGENTS.md §16 does not permit. The sweep caught it because the in-place
       case builder does have a NaN in it and the out-of-place one does not.
 
     The fix is a device-resident `where(x != x, x, clamped)` in

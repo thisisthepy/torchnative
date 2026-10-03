@@ -559,7 +559,7 @@ $PY rust/torch_c/pytests/verify_schemas.py         # 3076/3076
 
 ## 11. 보고 분류
 
-`CLAUDE.md` §5.3 에 따라 종류를 나눕니다.
+`AGENTS.md` §17.3 에 따라 종류를 나눕니다.
 
 | 종류 | 무엇 |
 |---|---|

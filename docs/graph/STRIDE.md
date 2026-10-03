@@ -46,7 +46,7 @@ invariant with `test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable`.
 **The test asked a freshly constructed tensor, and only that.** The meta view
 arms that falsified the invariant had existed for several rounds; no test
 built a meta tensor through one of them and then asked its stride. That is
-`CLAUDE.md` §5.4's shape: the check answered "is a new meta tensor
+`AGENTS.md` §17.4's shape: the check answered "is a new meta tensor
 contiguous", and the claim was "is every meta tensor contiguous".
 
 ## 2. The layout model

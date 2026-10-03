@@ -295,7 +295,7 @@ ever executed.** Precisely:
 ## 8. Nullification — what each new guarantee is actually held down by
 
 Every guarantee below was broken deliberately and the suite re-run, because a
-test that cannot fail is not a test (CLAUDE.md §5.5). Observed red tests:
+test that cannot fail is not a test (AGENTS.md §17.5). Observed red tests:
 
 | # | Break | Went red |
 |---|---|---|

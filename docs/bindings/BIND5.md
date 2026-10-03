@@ -223,7 +223,7 @@ which is what every `fx` pass does. The check was falsified before being trusted
 replacing the three branches with the equal-branch alone turns
 `test_the_sort_key_survives_insertion_in_the_middle` and
 `test_a_graph_of_nodes_round_trips_exactly_as_upstream_builds_it` red, and nothing else
-in the 889 moves. A test that cannot fail is not a test (CLAUDE.md §5.5), so it was made
+in the 889 moves. A test that cannot fail is not a test (AGENTS.md §17.5), so it was made
 to fail on purpose once.
 
 ### 2.3 Three more rules that were measured rather than chosen
@@ -504,7 +504,7 @@ which is how this was found rather than remembered.
 
 ---
 
-## 8. What this round changed, split the way CLAUDE.md §5.3 asks
+## 8. What this round changed, split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|

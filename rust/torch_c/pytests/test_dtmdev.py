@@ -23,7 +23,7 @@ goes red when the implementation is gutted.
    Measured here before the fix, all four.
 
    A refusal that names an internal symbol is the shape `test_intmps.py`
-   already rejected for `int16`/`int32`, and CLAUDE.md §6 is the rule: a
+   already rejected for `int16`/`int32`, and AGENTS.md §18 is the rule: a
    refusal says its own name. So this test asks every road onto Metal that
    takes a dtype, factories included, and requires upstream's sentence -- not
    merely *an* exception, which a typo would also produce.
@@ -49,7 +49,7 @@ refusing `float64` on a Metal device at *dispatch* time. It is unreachable.
 every dense tensor passes through, so no `float64` Metal tensor exists to be
 dispatched on -- thirteen roads onto the device were probed and not one
 produces the object that guard inspects. A second guard behind the first is
-the shape CLAUDE.md §5.5 records as "두 곳에 있어 서로를 가려주어": neither copy
+the shape AGENTS.md §17.5 records as "두 곳에 있어 서로를 가려주어": neither copy
 can be tested alone, because nullifying either leaves the other holding the
 line. The gate belongs at construction, and it is already there.
 
@@ -380,7 +380,7 @@ def test_tensor_from_flat_lands_upstreams_values_on_the_device():
             assert fragment in str(e), (
                 "%s refused with %r, which does not name what was refused. A "
                 "refusal that does not say what it refused sends the reader to "
-                "the wrong place (CLAUDE.md §6)."
+                "the wrong place (AGENTS.md §18)."
                 % (name, str(e).splitlines()[0]))
             continue
         unexpected.append("%s landed on %s" % (name, t.device))

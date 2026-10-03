@@ -93,7 +93,7 @@ decode 에서도 우리 bf16 이 상류 bf16 보다 **5.4 ~ 6.8 배** 빠릅니�
 
 ### 2.3 교대 측정과 대조군 — 위 숫자가 소음이 아니라는 것
 
-`CLAUDE.md` 의 측정 위생: **upstream → shim → upstream → shim → upstream → shim** 으로
+`AGENTS.md` 의 측정 위생: **upstream → shim → upstream → shim → upstream → shim** 으로
 3 회차, 각 셀은 프로세스 3 개의 최솟값. 그리고 **대조군**으로 시임을 자기 자신과 비교했습니다.
 
 ```
@@ -332,7 +332,7 @@ $PY rust/torch_c/pytests/verify_schemas.py   4295/4295
 
 ### 6.3 Rust 단위 테스트 3 개 — 그리고 고장 내서 확인했다
 
-`CLAUDE.md` §5.5. 추가한 셋은 `aten.rs` 의 `widen_tests` 에 있습니다.
+`AGENTS.md` §17.5. 추가한 셋은 `aten.rs` 의 `widen_tests` 에 있습니다.
 
 | 테스트 | 무엇을 잡는가 |
 |---|---|
@@ -441,7 +441,7 @@ f32    변화 없음     (0.5%, 회차간 편차 3.3% 안)
 
 ## 9. 보고 분류
 
-`CLAUDE.md` §5.3.
+`AGENTS.md` §17.3.
 
 | 종류 | 무엇 |
 |---|---|

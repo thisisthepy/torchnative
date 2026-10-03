@@ -870,7 +870,7 @@ def test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp():
       process, so a broken detector fails the test rather than excusing
       everything (see the next test).
 
-    What this cannot see (CLAUDE.md §5.4): a CoreML user with no
+    What this cannot see (AGENTS.md §17.4): a CoreML user with no
     `libcoremlpython` (Swift, `coremlcompiler`) writing here during the window,
     and a foreign Python process that loads, compiles and **crashes** between
     two detector samples. The first would show up as an unexcused survivor, a

@@ -877,7 +877,7 @@ dist/torchnative-0.0.2a0-cp313-abi3-manylinux_2_17_x86_64.whl
 
 **빈 global-deps 스텁은 버전 요구를 하나도 기록하지 않는다** (`DT_NEEDED []`, undefined 0).
 설계상 비어 있으므로 libc 심볼을 참조하지 않기 때문이다. 이것이 `LinuxTarget.GLIBC_TARGET` 과
-아티팩트 floor 사이에 **교차 검사를 넣지 않은 이유**다 — 넣어도 실패할 수 없다 (CLAUDE.md §5.5).
+아티팩트 floor 사이에 **교차 검사를 넣지 않은 이유**다 — 넣어도 실패할 수 없다 (AGENTS.md §17.5).
 
 ### 9.4 층 6 — `verify_linux.py` 가 처음으로 우리 아티팩트를 봤다
 
@@ -980,7 +980,7 @@ $BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl      # EXIT=0
 
 `_wrong_elf_machine()` 이 `e_machine := EM_X86_64` **대입**이었다. aarch64 Android 휠에는 손상이지만
 **x86-64 manylinux 휠에는 무연산이다.** 그 결함 모드는 "없어서" 통과하고 있었다 —
-CLAUDE.md §5.5 가 말하는 바로 그 모양이고, **Linux 휠이 존재하기 전까지는 드러날 수 없었다.**
+AGENTS.md §17.5 가 말하는 바로 그 모양이고, **Linux 휠이 존재하기 전까지는 드러날 수 없었다.**
 대입을 뒤집기(x86_64 ↔ aarch64)로 바꿨다. Android 쪽 동작은 그대로다(aarch64 → x86_64).
 
 그리고 이 계열 전용 결함 모드를 하나 더 넣었다 — §9.6 의 하한 검사가 실제로 실패하는지:
