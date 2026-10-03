@@ -625,9 +625,9 @@ def _check_divergence_is_a_tie(case, dtype, device, up, shim, message):
     sh = _side_ids(case, True, dtype, device, prefix)
     for rec in (ups, up64, sh):
         _reached(rec)
-    u = _read(ups, "logits")[0, -1].astype(np.float64)
-    u64 = _read(up64, "logits")[0, -1].astype(np.float64)
-    s = _read(sh, "logits")[0, -1].astype(np.float64)
+    u = _read(ups, "logits").reshape(ups["logits"]["shape"])[0, -1]
+    u64 = _read(up64, "logits").reshape(up64["logits"]["shape"])[0, -1]
+    s = _read(sh, "logits").reshape(sh["logits"]["shape"])[0, -1]
     report = _judge_tie(u, u64, s, u_seq[k], s_seq[k], k, message)
     print("     tie: " + report.replace("\n", "\n     "))
     return k
