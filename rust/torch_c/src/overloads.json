@@ -285,7 +285,18 @@
     "`IMPLEMENTED`: the golden harness compares by reading both sides as real",
     "tensors and there is no dense storage to read on a complex one. They are",
     "compared against upstream element-wise in `pytests/test_complex.py`",
-    "instead. See `aten.rs`'s note on that list."
+    "instead. See `aten.rs`'s note on that list.",
+    "",
+    "`index_select` (issue #13, transformers continuous batching) is the",
+    "`stack` pattern again: `aten.index_select.default` has been in",
+    "`IMPLEMENTED` and golden-compared, and `Tensor.index_select` had a",
+    "`methods.json` row, but `torch.index_select(...)` refused. The paged KV",
+    "cache reads every layer through exactly that spelling",
+    "(`generation/continuous_batching/cache.py:427` in transformers 5.15.1,",
+    "`torch.index_select(k_cache, 0, layer_read_index)`), so continuous",
+    "batching stopped at its first forward. The dispatch-mode survey could not",
+    "see it, for the reason the `stack` note gives. `.out` is omitted for the",
+    "reason `sum.out` is, and the one schema mirrors `methods.json`'s row."
   ],
   "as_strided": [
     "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
@@ -974,6 +985,9 @@
   ],
   "index_copy": [
     "aten::index_copy(Tensor self, int dim, Tensor index, Tensor source) -> Tensor"
+  ],
+  "index_select": [
+    "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor"
   ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"

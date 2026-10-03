@@ -572,8 +572,10 @@ cases = {
     "zeros": lambda: torch.zeros((2, 3), pin_memory=False),
     "ones": lambda: torch.ones((2, 3), pin_memory=False),
     "full": lambda: torch.full((2, 3), 4.0, pin_memory=False),
-    # The refusal half: asking to PIN is asking for something this shim cannot
-    # do, and it must still say so.
+    # `pin_memory=True` on cpu: the shim serves an ordinary cpu tensor (issue #30).
+    # Upstream on a Mac answers with an *mps* tensor, or raises for `arange`, so
+    # these two are not compared against it -- the test below checks the shim's
+    # own answer.
     "arange_pinned": lambda: torch.arange(0, 6, 2, pin_memory=True),
     "empty_pinned": lambda: torch.empty((2, 3), pin_memory=True),
 }
@@ -581,6 +583,7 @@ for name, fn in cases.items():
     try:
         t = fn()
         out["cases"][name] = {"shape": list(t.shape), "dtype": str(t.dtype),
+                              "device": str(t.device),
                               "values": t.flatten().tolist()}
     except Exception as exc:
         out["cases"][name] = {"raised": type(exc).__name__}
@@ -588,7 +591,7 @@ print(json.dumps(out))
 """
 
 
-def test_pin_memory_false_is_accepted_and_pin_memory_true_is_still_refused():
+def test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor():
     """`pin_memory=False` asks for nothing; refusing it refuses a no-op.
 
     The wall behind the layout one, and the same shape: `torch.export` passes
@@ -596,9 +599,14 @@ def test_pin_memory_false_is_accepted_and_pin_memory_true_is_still_refused():
     `argument 'layout'` straight to `argument 'pin_memory'`.
 
     `False` and `None` mean the same thing here -- do not pin -- and the shim
-    accepted one and refused the other.  `True` is a different request, this
-    shim cannot honour it, and it still raises; that half is asserted so that
-    "accept `False`" cannot quietly become "accept anything".
+    accepted one and refused the other.
+
+    `True` used to be refused ("accepting it would hand back ordinary memory while
+    claiming it was pinned"). Issue #30 decided otherwise for cpu: the call is
+    served as an ordinary cpu tensor and `is_pinned()` says False, so nothing
+    claims to be pinned. What did NOT change is the half `test_cbwalls.py` pins:
+    a non-cpu target still refuses by name. Upstream is not the reference for the
+    `True` cases -- on a Mac it returns an mps tensor, and for `arange` it raises.
     """
     if not _available():
         print("SKIP no vendored shim")
@@ -609,16 +617,17 @@ def test_pin_memory_false_is_accepted_and_pin_memory_true_is_still_refused():
     for name in sorted(up["cases"]):
         u, s = up["cases"][name], shim["cases"][name]
         if name.endswith("_pinned"):
-            assert "raised" in s, (
-                f"{name}: the shim accepted pin_memory=True and answered {s}, "
-                "which claims pinned memory it did not allocate"
-            )
+            assert "raised" not in s, f"{name}: the shim refused a cpu pin_memory=True: {s}"
+            assert s["device"] == "cpu", f"{name}: {s}"
             continue
         assert "raised" not in u, f"upstream itself refuses {name}: {u}"
+        s = {k: v for k, v in s.items() if k != "device"}
+        u = {k: v for k, v in u.items() if k != "device"}
         assert s == u, f"{name}: shim {s} != upstream {u}"
+    assert shim["cases"]["arange_pinned"]["values"] == [0, 2, 4], shim["cases"]["arange_pinned"]
     accepted = sum(1 for n in up["cases"] if not n.endswith("_pinned"))
     print(f"PINMEMORY: {accepted} factories accept pin_memory=False, "
-          f"{len(up['cases']) - accepted} still refuse pin_memory=True")
+          f"{len(up['cases']) - accepted} serve pin_memory=True unpinned on cpu")
 
 
 # ---------------------------------------------------------------------------

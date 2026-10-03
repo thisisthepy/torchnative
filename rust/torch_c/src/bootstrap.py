@@ -3093,6 +3093,12 @@ class _Overloads:
                 source = by_name[name].default_source
                 if source is None or not _is_schema_default(value, source):
                     result[name] = value
+            # `pin_memory=True` on a cpu result is served unpinned -- see
+            # `_pin_memory_is_cpu`. One dict probe on the hot path.
+            if result.get("pin_memory") is True and _pin_memory_is_cpu(result):
+                del result["pin_memory"]
+            if "generator" in result:
+                key = _GENERATOR_KEY_ALIAS.get(key, key)
             return key, result
 
         owner = "Tensor." if self.self_bound else "torch."
@@ -3102,6 +3108,58 @@ class _Overloads:
             f"({_describe_call(shown, kwargs)}). Candidates tried, in order:\n"
             + "\n".join(f"  {schema}" for schema in self.schemas)
         )
+
+
+# The `*_generator` overloads of `randint` and `randperm` are separate schemas
+# upstream (`generator` is required, keyword-only, and has no default) but the
+# same draw: the kernels in aten.rs read the stream off `generator=` themselves
+# (`generator_arg`), so these three keys are served by the plain kernels rather
+# than by three more implemented ops that would each need a golden case for
+# what is one computation. Applied once, in `_Overloads.resolve`, only when a
+# generator is present.
+_GENERATOR_KEY_ALIAS = {
+    "aten.randint.low_generator": "aten.randint.low",
+    "aten.randint.generator": "aten.randint.default",
+    "aten.randperm.generator": "aten.randperm.default",
+}
+
+
+def _pin_memory_is_cpu(bound) -> bool:
+    """May `pin_memory=True` be accepted for this call? Only when the result is
+    a cpu tensor.
+
+    **What accepting means.** This shim has no pinned allocator, so the call is
+    served as if `pin_memory` had not been passed: an ordinary cpu tensor, and
+    `Tensor.is_pinned()` says `False`. Pinning changes where the bytes live,
+    never what they are, so no value differs. (Issue #30, decision 2.)
+
+    **The upstream deviation, measured on Mac with torch 2.13.0.**
+    `torch.zeros(2, device="cpu", pin_memory=True)` returns an *mps* tensor
+    there -- upstream pins through the accelerator's host allocator, and on a
+    Mac that accelerator is mps. So upstream's continuous batching, which pins
+    its cpu IO buffers whenever it sees a second device, does not run on a Mac
+    with a cpu model; this shim's does. That is a deviation in the shim's
+    favour, not an agreement claim: the two builds hand back different devices
+    for the same call. On Linux upstream pins in cuda host memory and answers
+    cpu, which is what this does too, minus the pinning.
+
+    A non-cpu target keeps the refusal by name from the kernel -- upstream
+    raises there too ("Only dense CPU tensors can be pinned"), and quietly
+    returning an unpinned accelerator tensor would be a different answer.
+    `bound` is the binder's `{name: value}` result; a `*_like` / `new_*` call
+    inherits its device from `self`.
+    """
+    device = bound.get("device")
+    if device is None:
+        like = bound.get("self")
+        device = getattr(like, "device", None) if like is not None else None
+        if device is None:
+            return True
+    if isinstance(device, str):
+        return device.split(":")[0] == "cpu"
+    if isinstance(device, int):
+        return False
+    return getattr(device, "type", None) == "cpu"
 
 
 def _describe_call(args, kwargs) -> str:
@@ -5785,10 +5843,11 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         # refuses, and the two are not the same case: a pinned allocation is a
         # capability this shim does not have, while the flag is one it has had
         # all along under a different spelling.
-        if pin_memory:
+        if pin_memory and not _pin_memory_is_cpu({"device": device, "self": self}):
             raise NotImplementedError(
                 "not implemented in torch._C shim: TensorBase.new_tensor("
-                "pin_memory=True)"
+                "pin_memory=True) on a non-cpu device -- there is no pinned "
+                "allocator, and upstream refuses a non-cpu pin too"
             )
         dtype = self.dtype if dtype is None else dtype
         device = self.device if device is None else device
@@ -5803,6 +5862,17 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     new_tensor.__name__ = "new_tensor"
     new_tensor.__qualname__ = "TensorBase.new_tensor"
     setattr(tensorbase, "new_tensor", new_tensor)
+
+    # `Tensor.is_pinned()` -- always `False`: this shim never pins. The
+    # factories accept `pin_memory=True` on cpu and hand back ordinary memory
+    # (`_pin_memory_is_cpu`), and this is the half that keeps that honest: a
+    # tensor that was asked to be pinned does not claim to be.
+    def is_pinned(self, device=None):
+        return False
+
+    is_pinned.__name__ = "is_pinned"
+    is_pinned.__qualname__ = "TensorBase.is_pinned"
+    setattr(tensorbase, "is_pinned", is_pinned)
 
     # -- the device spellings that are `.to()` in disguise -------------------
     #
@@ -6200,8 +6270,16 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             return index
         if len(ellipses) > 1:
             raise IndexError("an index can only have a single ellipsis ('...')")
+        # A bool/uint8 mask consumes as many dims as it has (upstream's
+        # `count_specified_dimensions`); every other index consumes one.
+        # `y[0, m2, ..., 2]` with a 2-D `m2` is where counting it as one goes
+        # wrong: the ellipsis would expand one dim too wide.
         consumed = sum(
-            1 for item in index if item is not None and item is not Ellipsis
+            item.dim()
+            if isinstance(item, tensorbase) and item.dtype in (module.bool, module.uint8)
+            else 1
+            for item in index
+            if item is not None and item is not Ellipsis
         )
         at = ellipses[0]
         fill = (slice(None),) * max(self.dim() - consumed, 0)
@@ -6283,6 +6361,108 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     return tuple(index)
         return (index,)
 
+    def _mixed_getitem(self, index):
+        """Basic and advanced indices in one subscript -- `x[0, t]`.
+
+        Upstream's `applySlicing` walks the index once: an integer is a
+        `select.int` *at the current dim, which does not advance*, a slice is a
+        `slice.Tensor` (nothing for a full slice) and advances, a `None` is an
+        `unsqueeze` and advances, and a tensor is *recorded* at the current
+        dim rather than applied. One `index.Tensor` over the recorded tensors
+        closes the walk. Measured with a `TorchDispatchMode` logger on torch
+        2.13.0, `x` of shape (2, 5, 6, 7):
+
+            x[0, t]          (3, 6, 7)  [select.int, index.Tensor]
+            x[0, :, u]       (5, 3, 7)  [select.int, index.Tensor]
+            x[:, t, 0]       (2, 3, 7)  [select.int, index.Tensor]
+            x[1:, t]         (1, 3, 6, 7)  [slice.Tensor, index.Tensor]
+            x[0, None, t]    (1, 3, 6, 7)  [select.int, unsqueeze, index.Tensor]
+            x[0, t, 1, u]    (3,)       [select.int, select.int, index.Tensor]
+            x[z, t]          (3, 6, 7)  [_local_scalar_dense, select.int, index.Tensor]
+            y[0, m2, 1]      (3, 3)     [select.int, select.int, index.Tensor]
+
+        The second row is the one a NumPy-shaped implementation gets wrong:
+        NumPy treats the `0` as an advanced index too and, because a slice
+        separates it from `u`, moves the broadcast dims to the front --
+        (3, 5, 7). Upstream selects first, so there is nothing to move.
+
+        Two upstream details are reproduced exactly: a 0-d *integer* tensor
+        index is read out (`_local_scalar_dense`) and selected like a Python
+        int (row 7), and a bool/uint8 mask advances the walk by its own rank,
+        not by one (row 8 -- the `1` selects dim 2, after a 2-D mask).
+
+        The call site that made this necessary is transformers' continuous
+        batching (issue #13): `batch_data["input_ids"][0, logits_indices]` in
+        `generation/continuous_batching/model_runner.py:187` (5.15.1), reached
+        whenever a logits processor is active -- i.e. every sampling request.
+
+        Refused by name rather than approximated (AGENTS.md §18): a Python `bool` in a mixed
+        index (upstream lowers it to a 0-d mask -- `unsqueeze`, `empty`,
+        `fill_` -- not measured as used); a 0-d bool/uint8/float tensor index;
+        and a bool/uint8 mask of rank > 1 followed by another tensor index,
+        where the recorded list's layout after the mask has not been measured.
+        """
+        result = self
+        dim = 0
+        indices = []
+        wide_mask_seen = False
+        for item in index:
+            if item is None:
+                result = dispatch("aten.unsqueeze.default", result, dim)
+                dim += 1
+            elif isinstance(item, bool):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__getitem__ with a "
+                    "Python bool index mixed with other indices"
+                )
+            elif isinstance(item, int):
+                result = dispatch("aten.select.int", result, dim, item)
+            elif isinstance(item, slice):
+                if not _is_full_slice(item):
+                    result = dispatch(
+                        "aten.slice.Tensor",
+                        result,
+                        dim,
+                        item.start,
+                        item.stop,
+                        1 if item.step is None else item.step,
+                    )
+                dim += 1
+            elif _is_sequence_index(item) or isinstance(item, tensorbase):
+                tensor = (
+                    _lift_sequence_index(item) if _is_sequence_index(item) else item
+                )
+                is_mask = tensor.dtype in (module.bool, module.uint8)
+                if tensor.dim() == 0:
+                    if is_mask or tensor.is_floating_point():
+                        raise NotImplementedError(
+                            "not implemented in torch._C shim: TensorBase.__getitem__ "
+                            f"with a 0-d {tensor.dtype} tensor index mixed with other "
+                            "indices"
+                        )
+                    position = dispatch("aten._local_scalar_dense.default", tensor)
+                    result = dispatch("aten.select.int", result, dim, position)
+                    continue
+                if wide_mask_seen:
+                    raise NotImplementedError(
+                        "not implemented in torch._C shim: TensorBase.__getitem__ with "
+                        "a tensor index after a bool/uint8 mask of rank > 1 in a mixed "
+                        "index"
+                    )
+                indices.extend([None] * (dim - len(indices)))
+                indices.append(tensor)
+                if is_mask:
+                    wide_mask_seen = tensor.dim() > 1
+                    dim += tensor.dim()
+                else:
+                    dim += 1
+            else:
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: TensorBase.__getitem__ with "
+                    f"an index of type {type(item).__name__}"
+                )
+        return dispatch("aten.index.Tensor", result, indices)
+
     def __getitem__(self, index):
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
@@ -6299,12 +6479,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                 )
                 for item in index
             ):
-                raise NotImplementedError(
-                    "not implemented in torch._C shim: TensorBase.__getitem__ mixing "
-                    "a tensor index with integer or slice indices -- upstream applies "
-                    "basic indexing first and then aten.index.Tensor, and this shim "
-                    "does not reproduce that composition yet"
-                )
+                return _mixed_getitem(self, index)
             result = self
             dim = 0
             for item in index:
@@ -7505,9 +7680,11 @@ def _tensor_factory(module, dispatch):
         # `requires_grad` is carried, not refused -- `_strip_python_only_kwargs`
         # carries the argument. `pin_memory` is a different case and still
         # refuses: it names an allocation this shim cannot make.
-        if pin_memory:
+        if pin_memory and not _pin_memory_is_cpu({"device": device}):
             raise NotImplementedError(
-                "not implemented in torch._C shim: torch.tensor(pin_memory=True)"
+                "not implemented in torch._C shim: torch.tensor(pin_memory=True) "
+                "on a non-cpu device -- there is no pinned allocator, and "
+                "upstream refuses a non-cpu pin too"
             )
         if isinstance(device, str):
             device = module.device(device)
@@ -12657,6 +12834,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._get_schema = _get_schema
 
     _install_autocast(module)
+    _install_generator_streams(module)
     _install_default_generator(module)
     _install_mps_backend(module)
     _install_backend_flag_toggles(module)
@@ -17336,6 +17514,59 @@ def _install_mps_backend(module) -> None:
     module._mps_get_default_generator = _mps_get_default_generator
 
 
+def _install_generator_streams(module) -> None:
+    """`torch.Generator()` -- an independent stream per generator.
+
+    Each instance owns a `CpuGenerator` in `rng.rs`, named by the integer id it
+    carries as `_shim_gen_id`; `generator_arg` in aten.rs turns that id into the
+    stream a kernel draws from. Two generators, or a generator and the global
+    stream, never share state, so what a request draws from its own seeded
+    generator does not depend on what anyone else draws in between.
+
+    The stream is the global generator's own engine (MT19937, same seeding, same
+    transformations), and the global one was measured to reproduce upstream's
+    `torch.manual_seed(s); torch.rand/randn/randint/randperm/normal_/uniform_/
+    multinomial` values exactly -- so a seeded `torch.Generator()` does too.
+    A fresh generator starts at upstream's default seed, 67280421310721.
+
+    **Not implemented, by name:** `get_state`/`set_state` (the default
+    generator's refusal and its reason apply here too), and any non-cpu device.
+    """
+    Generator = module.Generator
+
+    def __init__(self, device="cpu"):
+        kind = getattr(device, "type", None)
+        if kind is None:
+            kind = str(device).split(":")[0]
+        if kind != "cpu":
+            raise NotImplementedError(
+                f"torch._C shim: torch.Generator(device={str(device)!r}) -- "
+                "only cpu generators exist here; there is no per-device "
+                "stream for an accelerator"
+            )
+        self._shim_gen_id = module._shim_gen_new()
+
+    def __del__(self):
+        gid = getattr(self, "_shim_gen_id", None)
+        if gid is not None:
+            self._shim_gen_id = None
+            module._shim_gen_free(gid)
+
+    def manual_seed(self, seed):
+        module._shim_gen_manual_seed(self._shim_gen_id, int(seed))
+        return self
+
+    def seed(self):
+        return module._shim_gen_reseed(self._shim_gen_id)
+
+    def initial_seed(self):
+        return module._shim_gen_initial_seed(self._shim_gen_id)
+
+    for fn in (__init__, __del__, manual_seed, seed, initial_seed):
+        fn.__qualname__ = f"Generator.{fn.__name__}"
+        setattr(Generator, fn.__name__, fn)
+
+
 def _install_default_generator(module) -> None:
     """`torch.default_generator` -- an object with state, not a placeholder.
 
@@ -17365,6 +17596,14 @@ def _install_default_generator(module) -> None:
     interop until someone tries it.
     """
     generator = module.Generator()
+    # `Generator.__init__` (`_install_generator_streams`) gave this instance a
+    # stream of its own; the default generator is *the* process stream
+    # (`rng::default_generator`), which `generator_arg` selects by
+    # `_shim_is_default_generator` below, so the extra one is returned.
+    _own = getattr(generator, "_shim_gen_id", None)
+    if _own is not None:
+        module._shim_gen_free(_own)
+        generator._shim_gen_id = None
 
     # Read by `generator_arg` in aten.rs: it is how a kernel tells "the default
     # generator was named explicitly" from "some other generator was", and the

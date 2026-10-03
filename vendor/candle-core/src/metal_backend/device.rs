@@ -128,6 +128,36 @@ impl MetalDevice {
         &self.device
     }
 
+    /// Bytes of pooled buffers that something outside the allocator still
+    /// holds, summed over both pools by `Buffer::length()`.
+    ///
+    /// The allocator keeps one `Arc` per buffer it ever handed out and treats
+    /// `strong_count == 1` as "free, reusable" (`find_available_buffer`,
+    /// `drop_unused_buffers`). A buffer whose count is above one is therefore
+    /// exactly one that a live storage, or an in-flight command buffer, still
+    /// references -- the same predicate the allocator itself uses to decide
+    /// what is free, read rather than re-derived.
+    ///
+    /// It counts buffer lengths, which for `allocate_buffer` and `new_buffer`
+    /// are rounded up to a power of two, so a tensor whose byte size is not one
+    /// moves it by the rounded size. Buffers from `new_private_buffer` are not
+    /// pooled and are not seen. A free buffer a later allocation reuses is
+    /// counted at the reused buffer's length, which may exceed the request.
+    pub fn live_buffer_bytes(&self) -> Result<usize> {
+        let mut total = 0usize;
+        for pool in [&self.buffers, &self.private_buffers] {
+            let pool = pool.read().map_err(MetalError::from)?;
+            for subbuffers in pool.values() {
+                for s in subbuffers {
+                    if Arc::strong_count(s) > 1 {
+                        total += s.length();
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
     fn drop_unused_buffers(&self) -> Result<()> {
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         for subbuffers in buffers.values_mut() {

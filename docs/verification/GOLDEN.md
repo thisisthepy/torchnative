@@ -162,6 +162,11 @@ building block `clone`'s `memory_format` case above uses — a value the shim
 is documented to *refuse*, so the tamper is observable as "refusal stopped
 firing" rather than "no-op stayed a no-op."
 
+*(2026-10-03, issue #30: the premise above no longer holds. `torch.Generator()` now owns a stream, and
+`generator_arg()` returns which stream to draw from, so a non-default generator is *served*, not refused. The
+observable shape is a seeded generator's draw compared with upstream's, which `test_cbwalls.py` does in a
+separate subprocess; no golden case was added for it.)*
+
 `clone.default`'s `memory_format` is the same shape for the same reason:
 `reject_memory_format` never uses the value it reads except to decide
 whether to error, and `contiguous_format`/`preserve_format` are silently

@@ -85,9 +85,9 @@ upstream이 받는 kwarg는 `dtype`, `device`, `layout`, `requires_grad`, `out`,
 | kwarg | 처리 |
 |---|---|
 | `dtype`, `layout`, `device` | 이미 검증된 `varfns.empty`/`varfns.empty_like`로 그대로 전달. 정수 `dtype`은 그 경로 끝의 `normal_`/`uniform_`이 이름을 대며 거부(`test_rng_ops_refuse_integer_tensors`와 같은 거부) |
-| `generator` | `TensorBase.normal_`/`uniform_`로 전달. `torch.default_generator`가 아니면 거부하는 것도 그쪽이 이미 함 |
+| `generator` | `TensorBase.normal_`/`uniform_`로 전달. (2026-10-03, issue #30 갱신: `torch.Generator()`는 이제 자기만의 스트림을 갖는다 — `rng.rs`의 `stream()`, `generator_arg`가 고른다. 시드를 준 생성기는 전역 스트림과 같은 mt19937이므로 upstream과 같은 값을 낸다(`test_cbwalls.py`). `torch.Generator`가 만든 것이 아닌 객체는 여전히 이름을 대며 거부) |
 | `requires_grad=True` | `varfns.empty`가 이미 거부(`_strip_python_only_kwargs`). `False`는 무해하게 버려짐 |
-| `pin_memory=True` | **이름을 대며 거부** — `aten.rs`의 `empty.memory_format`/`empty_like`는 `pin_memory`가 조금이라도 명시되면 위치 기반으로 거부한다(`reject_unsupported`). `pin_memory=False`(기본값)는 아예 전달하지 않아 이 거부에 걸리지 않게 함 — 이건 새로 만든 문제였다: 처음엔 `pin_memory=pin_memory`를 항상 넘겼더니 아무도 `pin_memory`를 말하지 않은 평범한 `torch.randn(4, 4)`까지 "pin_memory not implemented"로 죽었다(§4) |
+| `pin_memory=True` | **(2026-10-03, issue #30 갱신: cpu 대상이면 이제 받아서 평범한(핀 안 된) cpu 텐서를 돌려주고 `is_pinned()`는 `False`다. 비-cpu 대상은 아래 설명대로 이름을 대며 거부한다. upstream은 Mac에서 같은 호출에 *mps* 텐서를 돌려준다 — 실측이며 일치 주장이 아니라 편차다. 이하는 갱신 전의 서술.)** 이름을 대며 거부 — `aten.rs`의 `empty.memory_format`/`empty_like`는 `pin_memory`가 조금이라도 명시되면 위치 기반으로 거부한다(`reject_unsupported`). `pin_memory=False`(기본값)는 아예 전달하지 않아 이 거부에 걸리지 않게 함 — 이건 새로 만든 문제였다: 처음엔 `pin_memory=pin_memory`를 항상 넘겼더니 아무도 `pin_memory`를 말하지 않은 평범한 `torch.randn(4, 4)`까지 "pin_memory not implemented"로 죽었다(§4) |
 | `out` | **이름을 대며 거부.** upstream은 `out=`을 준 텐서를 요청 크기로 **리사이즈**한다(`torch.randn(4, 4, out=torch.empty(2, 2))`는 `(4, 4)`를 반환, 실측). `aten::empty.out`도 범용 `resize_`도 `aten.rs`에 없으므로 잘못된 크기로 계산하거나 조용히 무시하는 대신 거부한다 |
 
 `torch.normal`은 `size=`가 없고 `mean`/`std` 중 하나가 Tensor일 때 `dtype`/`layout`/`device`/
@@ -116,3 +116,16 @@ requires_grad=requires_grad)`처럼 `pin_memory`(기본값 `False`)를 항상 �
   집합은 변하지 않는 것이 옳다.
 - `rust/torch_c/pytests/verify_schemas.py`는 4203/4203로 그대로 — `overloads.json`을 건드리지
   않았다.
+
+## 6. 연속 배칭(CB)이 cpu 에서 부딪힌 벽 셋 (issue #30, 2026-10-03, 미빌드)
+
+- **`torch.mps` 메모리 질의.** transformers 의 CB 는 mps 가 있으면 cpu 모델이어도 `torch.mps.recommended_max_memory()` 외 둘을 부릅니다.
+  `_mps_recommendedMaxMemory`/`_mps_driverAllocatedMemory` 는 `MTLDevice.recommendedMaxWorkingSetSize`/`currentAllocatedSize` 를 그대로 읽고,
+  `_mps_currentAllocatedMemory` 는 candle Metal 할당자의 풀에서 **밖에서 아직 잡고 있는** 버퍼(`Arc::strong_count > 1`)의 `length()` 합입니다
+  (벤더 포크의 `MetalDevice::live_buffer_bytes`). 단위는 버퍼 길이라 2 의 거듭제곱 크기의 텐서는 정확히 그 크기만큼, 아닌 크기는 올림한 크기만큼 움직입니다 —
+  upstream 의 올림과 자릿수까지 같다고 주장하지 않습니다. Metal 이 없는 빌드(비-Apple)에서는 셋 다 이름을 대며 `RuntimeError` 로 거부합니다.
+- **`pin_memory=True`.** 위 §3 의 갱신. upstream 은 Mac 에서 `torch.zeros(2, device="cpu", pin_memory=True)` 에 mps 텐서를 돌려주고
+  `torch.tensor(..., pin_memory=True)` 는 segfault 합니다(2.13.0 실측) — 그래서 upstream 의 cpu CB 는 Mac 에서 돌지 않고 이 shim 의 것은 돕니다. 편차이지 일치가 아닙니다.
+- **`torch.Generator()`.** §3 의 갱신.
+
+세 가지 모두 `rust/torch_c/pytests/test_cbwalls.py` 가 서브프로세스에서 upstream 과 대조합니다. 이 절은 빌드 전에 쓰였고, 빌드되어 그 스위트가 초록이 되기 전까지는 주장이 아니라 계획입니다.
