@@ -52,6 +52,12 @@ in one step is `0.031280517578125`. The two differ by one ulp of `float16`
 and **agree exactly on `float32`**, which is the dtype anyone would reach for
 first. `test_one_step_narrowing_*` uses `float16` by name.
 
+**That trap is aarch64's** (issue #28). c10 builds `Half` from `float16_t`
+on aarch64 and from `float` elsewhere, so off aarch64 upstream *is*
+f16(f32(x)) and the one-step tests skip by name. `bfloat16` is
+bf16(f32(x)) on every platform; `test_f16_and_bf16_narrowing_follow_c10_*`
+asks upstream for both, everywhere.
+
 **What is not claimed.** Nothing here argues `float64` should compute on
 Metal. The 260 `float64_mps` cells stay correctly refused, and
 `test_float64_on_mps_is_still_refused_*` is the assertion that this round did
@@ -95,6 +101,26 @@ _FLOAT_DTYPES = ("float32", "float16", "bfloat16")
 _ONE_ULP = 0.031265258789971995
 _SINGLE_ROUNDED = 0.031280517578125      # f16(x)
 _DOUBLE_ROUNDED = 0.03125                # f16(f32(x))
+
+# Which of the two upstream itself gives is per-architecture (issue #28):
+# c10 builds `Half` from `float16_t` on aarch64 (not CUDA) -- one rounding --
+# and from `float` everywhere else -- f16(f32(x)). Off aarch64 the one-step
+# witness has nothing to witness, so those tests skip by name. Every test that
+# uses this also asks upstream, so a wrong guess is a FAIL.
+import platform  # noqa: E402
+
+_F16_SINGLE_ROUNDING = platform.machine().lower() in ("arm64", "aarch64")
+_F16_UPSTREAM = _SINGLE_ROUNDED if _F16_SINGLE_ROUNDING else _DOUBLE_ROUNDED
+
+# `float64 -> bfloat16` witnesses, with upstream's answer on every platform
+# (c10 has no `BFloat16(double)`, so it is bf16(f32(x)) everywhere):
+#   1 + 2^-8 + 2^-22: exact in f32, just above a bf16 tie. c10 gives
+#     1.0078125; `half::bf16::from_f64` truncates the 2^-22 away, sees the
+#     tie, and gives 1.0.
+#   1 + 3*2^-8 - 2^-30: just below a bf16 tie, which f32 rounds onto. c10
+#     gives 1.015625; a single rounding gives 1.0078125.
+_BF16_WITNESSES = {1 + 2**-8 + 2**-22: 1.0078125,
+                   1 + 3 * 2**-8 - 2**-30: 1.015625}
 
 
 def _counters():
@@ -344,22 +370,55 @@ def test_constant_gate_agrees_with_upstream_on_mps():
     assert _agree_on("mps", {"device": mps}, 0.5) == len(_CASES) * len(_FLOAT_DTYPES)
 
 
-def _narrowing_case(dev_kw):
-    ctype = dt_utils.c_dtype(_C, "float16")
+# The five constant writers the witnesses go through, as upstream spells them.
+# Evaluated by `_ORACLE` with `t`, `m`, `v` and `dt` in scope.
+_NARROWING_EXPRS = {
+    "full": "torch.full(list(t.shape), v, dtype=dt)",
+    "scalar_tensor": "torch.scalar_tensor(v, dtype=dt)",
+    "fill_": "t.clone().fill_(v)",
+    "masked_fill": "t.masked_fill(m, v)",
+    "full_like": "torch.full_like(t, v)",
+}
+
+
+def _narrowing_case(dev_kw, dtype="float16", value=_ONE_ULP):
+    ctype = dt_utils.c_dtype(_C, dtype)
     dev = dev_kw.get("device")
-    t = _C._tensor_from_flat(list(_VALUES), list(_SHAPE), ctype, dev)
+    # A fresh `t` per writer. `fill_` writes through its receiver, and with
+    # one shared `t` the `masked_fill` after it measured an already-filled
+    # tensor -- invisible while this only looked for the witness value, and
+    # the first thing a bit-exact comparison with upstream reported.
+    fresh = lambda: _C._tensor_from_flat(list(_VALUES), list(_SHAPE), ctype, dev)
     m = _C._tensor_from_flat(list(_MASK), list(_SHAPE),
                              dt_utils.c_dtype(_C, "bool"), dev)
     out = {}
     out["full"] = _host(_C._aten_dispatch(
-        "aten.full.default", list(_SHAPE), _ONE_ULP, dtype=ctype, **dev_kw))
+        "aten.full.default", list(_SHAPE), value, dtype=ctype, **dev_kw))
     out["scalar_tensor"] = _host(_C._aten_dispatch(
-        "aten.scalar_tensor.default", _ONE_ULP, dtype=ctype, **dev_kw))
-    out["fill_"] = _host(_C._aten_dispatch("aten.fill_.Scalar", t, _ONE_ULP))
+        "aten.scalar_tensor.default", value, dtype=ctype, **dev_kw))
+    out["fill_"] = _host(_C._aten_dispatch("aten.fill_.Scalar", fresh(), value))
     out["masked_fill"] = _host(_C._aten_dispatch(
-        "aten.masked_fill.Scalar", t, m, _ONE_ULP))
-    out["full_like"] = _host(_C._aten_dispatch("aten.full_like.default", t, _ONE_ULP))
+        "aten.masked_fill.Scalar", fresh(), m, value))
+    out["full_like"] = _host(_C._aten_dispatch("aten.full_like.default", fresh(), value))
     return out
+
+
+def _upstream_narrowing(dtype, value):
+    """The same five writers, asked of upstream in a subprocess."""
+    ref = _oracle(_ORACLE, {
+        key: {"dtype": dtype, "values": _VALUES, "shape": _SHAPE,
+              "mask": _MASK, "v": value, "expr": expr}
+        for key, expr in _NARROWING_EXPRS.items()})
+    return {key: ref[key]["values"] for key in _NARROWING_EXPRS}
+
+
+def _assert_bit_exact(where, dtype, value, out, ref):
+    assert sorted(out) == sorted(ref), (sorted(out), sorted(ref))
+    for key in sorted(out):
+        assert out[key] == ref[key], (
+            "%s(%r) as %s on %s gave %r, upstream %r -- bit-exact is the "
+            "only grade here, since the whole difference is one ulp"
+            % (key, value, dtype, where, out[key], ref[key]))
 
 
 def _assert_single_rounded(where, out):
@@ -379,16 +438,34 @@ def _assert_single_rounded(where, out):
             % (key, "float16", where, _SINGLE_ROUNDED, values))
 
 
+def _one_step(where, dev_kw):
+    if not _F16_SINGLE_ROUNDING:
+        _skip.skip("   (skipped the f16 one-step witness on %s: %s is not "
+                   "aarch64, and upstream c10 narrows f64 -> f16 through float "
+                   "there -- test_f16_narrowing_follows_c10_* carries it)"
+                   % (where, platform.machine()))
+        return
+    ref = _upstream_narrowing("float16", _ONE_ULP)
+    assert ref["full"][0] == _SINGLE_ROUNDED, (
+        "upstream on %s gave %r for full(%r, float16); aarch64 c10 rounds "
+        "once, which is %r" % (platform.machine(), ref["full"][0], _ONE_ULP,
+                               _SINGLE_ROUNDED))
+    out = _narrowing_case(dev_kw)
+    _assert_single_rounded(where, out)
+    _assert_bit_exact(where, "float16", _ONE_ULP, out, ref)
+
+
 def test_one_step_narrowing_on_cpu():
-    """`float16`, by name, because `float32` cannot see this.
+    """`float16`, by name, because `float32` cannot see this. aarch64 only.
 
     `host_const` applies the narrowing steps the call site passes, in order,
     and every call site passes exactly one: the storage dtype. Insert `f32`
     in front of it -- which is what narrowing on the device would force, since
     Metal cannot hold the `f64` -- and `0.031265258789971995` comes back
-    `0.03125` instead of `0.031280517578125`.
+    `0.03125` instead of `0.031280517578125`. That is a defect only where
+    upstream rounds once, which is aarch64; elsewhere this skips by name.
     """
-    _assert_single_rounded("cpu", _narrowing_case({}))
+    _one_step("cpu", {})
 
 
 def test_one_step_narrowing_on_mps():
@@ -396,7 +473,43 @@ def test_one_step_narrowing_on_mps():
     mps = _mps_or_skip("one-step narrowing on mps")
     if mps is None:
         return
-    _assert_single_rounded("mps", _narrowing_case({"device": mps}))
+    _one_step("mps", {"device": mps})
+
+
+def _c10_narrowing(where, dev_kw):
+    """f16 per platform and both bf16 witnesses, bit-exact against upstream."""
+    ref = _upstream_narrowing("float16", _ONE_ULP)
+    assert ref["full"][0] == _F16_UPSTREAM, (
+        "upstream on %s gave %r for full(%r, float16), expected %r for this "
+        "platform's c10 rule" % (platform.machine(), ref["full"][0], _ONE_ULP,
+                                 _F16_UPSTREAM))
+    _assert_bit_exact(where, "float16", _ONE_ULP,
+                      _narrowing_case(dev_kw, "float16", _ONE_ULP), ref)
+    for value, expect in sorted(_BF16_WITNESSES.items()):
+        ref = _upstream_narrowing("bfloat16", value)
+        assert ref["full"][0] == expect, (
+            "upstream gave %r for full(%r, bfloat16), expected bf16(f32(x)) "
+            "= %r" % (ref["full"][0], value, expect))
+        _assert_bit_exact(where, "bfloat16", value,
+                          _narrowing_case(dev_kw, "bfloat16", value), ref)
+
+
+def test_f16_and_bf16_narrowing_follow_c10_on_cpu():
+    """issue #28, on every platform: the narrowing is c10's, asked of upstream.
+
+    `float16` one rounding on aarch64 and two elsewhere; `bfloat16` two
+    everywhere, with one witness against `half`'s truncating `from_f64` and
+    one against a single rounding.
+    """
+    _c10_narrowing("cpu", {})
+
+
+def test_f16_and_bf16_narrowing_follow_c10_on_mps():
+    """The same witnesses on the device, where the constant is built on the host."""
+    mps = _mps_or_skip("c10 narrowing on mps")
+    if mps is None:
+        return
+    _c10_narrowing("mps", {"device": mps})
 
 
 def test_the_two_devices_narrow_identically():
@@ -408,12 +521,15 @@ def test_the_two_devices_narrow_identically():
     mps = _mps_or_skip("cross-device narrowing")
     if mps is None:
         return
-    on_cpu = _narrowing_case({})
-    on_mps = _narrowing_case({"device": mps})
-    assert sorted(on_cpu) == sorted(on_mps)
-    for key in sorted(on_cpu):
-        assert on_cpu[key] == on_mps[key], (
-            "%s: cpu %r vs mps %r" % (key, on_cpu[key], on_mps[key]))
+    for dtype, value in [("float16", _ONE_ULP)] + [
+            ("bfloat16", v) for v in sorted(_BF16_WITNESSES)]:
+        on_cpu = _narrowing_case({}, dtype, value)
+        on_mps = _narrowing_case({"device": mps}, dtype, value)
+        assert sorted(on_cpu) == sorted(on_mps)
+        for key in sorted(on_cpu):
+            assert on_cpu[key] == on_mps[key], (
+                "%s(%r) as %s: cpu %r vs mps %r"
+                % (key, value, dtype, on_cpu[key], on_mps[key]))
 
 
 # ---------------------------------------------------------------------------
