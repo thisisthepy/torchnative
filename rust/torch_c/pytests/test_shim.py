@@ -18306,7 +18306,37 @@ MODE, CKPT_BIG, CKPT_TIED = sys.argv[1], sys.argv[2], sys.argv[3]
 out = {"shim": hasattr(torch._C, "_aten_implemented")}
 
 
+_HWM_RESET = False
+
+
+def reset_peak():
+    # Start the high-water mark at the load, on Linux, where that is possible.
+    #
+    # `ru_maxrss` can only rise, so it carries every transient since the
+    # interpreter started. On macOS the load is where the peak is and that is
+    # harmless. The first Linux gate (issue #40) read **479.8 MB for both the
+    # plugin and the post-hoc process** -- identical to a tenth of a megabyte,
+    # which a difference in the load cannot produce and a high-water mark set
+    # before the load can. Linux lets a process reset its own mark
+    # (`/proc/self/clear_refs` <- 5 resets `VmHWM` to the current RSS), so there
+    # the peak is read from the start of the load. Nothing else changes: same
+    # three processes, same comparison, same threshold.
+    #
+    global _HWM_RESET
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/clear_refs", "w") as f:
+                f.write("5")
+            _HWM_RESET = True
+        except OSError:
+            _HWM_RESET = False
+
+
 def peak_mb():
+    if _HWM_RESET:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024.0
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return r / (1024.0 * 1024.0) if sys.platform == "darwin" else r / 1024.0
 
@@ -18349,6 +18379,8 @@ def load(path, dtype_override=None, **kw):
 
 
 if MODE in ("dense", "posthoc", "plugin"):
+    reset_peak()
+    out["peak_from_load"] = _HWM_RESET
     if MODE == "dense":
         m = load(CKPT_BIG)
     elif MODE == "posthoc":

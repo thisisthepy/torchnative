@@ -126,23 +126,40 @@ import torch.nn.functional as F
 out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
 torch.manual_seed(0)
 
-x = torch.randn(1, 3, 8, 8)
+
+def det(*shape):
+    # RNG-free, so both interpreters start from identical bytes. With
+    # `torch.randn` these inputs were only equal where upstream's `normal_`
+    # stream equals the shim's, which is a separate claim with its own test
+    # (`test_shim.py::test_randn_matches_upstreams_stream_bit_for_bit`): on
+    # x86_64 Linux upstream fills 16 or more normals with an AVX2 kernel whose
+    # last bits differ (issue #40), and the pooling and padding comparisons
+    # below failed on their *inputs*. Arithmetic inputs keep them measuring
+    # pooling and padding on every platform.
+    n = 1
+    for d in shape:
+        n *= d
+    return torch.tensor([((i * 7919) % 2003 - 1001) / 317.0 for i in range(n)],
+                        dtype=torch.float32).reshape(shape)
+
+
+x = det(1, 3, 8, 8)
 out["avg_pool2d"] = F.avg_pool2d(
     x, 3, 2, 1, ceil_mode=True, count_include_pad=False
 ).tolist()
 
-a = torch.randn(2, 3, 4, 8)   # batch, q, h, d
-b = torch.randn(2, 5, 4, 8)   # batch, k, h, d
+a = det(2, 3, 4, 8)   # batch, q, h, d
+b = det(2, 5, 4, 8) * 0.5   # batch, k, h, d
 out["einsum_ellipsis"] = torch.einsum('...qhd,...khd->...hqk', a, b).tolist()
 
 out["pad_reflect2d"] = F.pad(x, [1, 1, 1, 1], mode="reflect").tolist()
 out["pad_replicate2d"] = F.pad(x, [1, 1, 1, 1], mode="replicate").tolist()
 
-x1 = torch.randn(1, 3, 8)
+x1 = det(1, 3, 8)
 out["pad_reflect1d"] = F.pad(x1, [1, 1], mode="reflect").tolist()
 out["pad_replicate1d"] = F.pad(x1, [1, 1], mode="replicate").tolist()
 
-x3 = torch.randn(1, 3, 6, 6, 6)
+x3 = det(1, 3, 6, 6, 6)
 out["pad_reflect3d"] = F.pad(x3, [1, 1, 1, 1, 1, 1], mode="reflect").tolist()
 out["pad_replicate3d"] = F.pad(x3, [1, 1, 1, 1, 1, 1], mode="replicate").tolist()
 

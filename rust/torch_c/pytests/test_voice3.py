@@ -207,6 +207,16 @@ wide_std = torch.tensor([-20.9247, 45.96, -35.8534, -12.5087,
                          -1.5798, 36.5793, 21.9547, 22.7914])
 rec("std_wide_sample", lambda: torch.std(wide_std))
 rec("std_wide_sample_as_sqrt_var", lambda: torch.var(wide_std).sqrt())
+# More candidates of the same shape, for platforms where `wide_std` does not
+# split: whether a given sample does depends on how upstream's build
+# accumulates the variance (it splits on macOS arm64 and under x86_64 AVX2,
+# and did not on the first Linux gate's runner, issue #40). Candidate 0 is
+# `wide_std` itself, so a platform where it splits uses it exactly as before.
+for k in range(48):
+    cand = wide_std if k == 0 else torch.tensor(
+        [round(((k * 2654435761 + i * 40503) % 20001 - 10000) / 197.0, 4) for i in range(8)])
+    rec("std_split_%d" % k, lambda c=cand: torch.std(c))
+    rec("std_split_%d_as_sqrt_var" % k, lambda c=cand: torch.var(c).sqrt())
 rec("var_method", lambda: six.var(0))
 rec("var_ops_correction", lambda: aten.var.correction(six, [0], correction=0))
 rec("var_ops_dim", lambda: aten.var.dim(six, [0], False, False))
@@ -957,11 +967,21 @@ def test_std_takes_the_root_in_the_accumulator_not_on_the_narrowed_variance():
     direct, want_direct = _value("std_wide_sample")
     if direct is None:
         return
-    composite, want_composite = _value("std_wide_sample_as_sqrt_var")
-    assert want_direct["ok"] != want_composite["ok"], (
-        "upstream's std and var().sqrt() now agree on this sample -- pick "
-        "another one; the point of this test is a case where they do not"
-    )
+    # The first candidate on which upstream, *on this platform*, splits.
+    # Candidate 0 is `std_wide_sample`, so wherever it splits nothing changed.
+    for k in range(48):
+        _, w_d = _value("std_split_%d" % k)
+        _, w_c = _value("std_split_%d_as_sqrt_var" % k)
+        if w_d["ok"] != w_c["ok"]:
+            break
+    else:
+        raise AssertionError(
+            "upstream's std and var().sqrt() agree on all 48 candidates on this "
+            "platform -- add candidates; the point of this test is a case where "
+            "they do not")
+    direct, want_direct = _value("std_split_%d" % k)
+    composite, want_composite = _value("std_split_%d_as_sqrt_var" % k)
+    assert want_direct["ok"] != want_composite["ok"]
     assert direct["ok"] == want_direct["ok"], (
         f"std: shim {direct['ok']} != upstream {want_direct['ok']}; matching "
         f"{want_composite['ok']} instead would mean std was implemented as "

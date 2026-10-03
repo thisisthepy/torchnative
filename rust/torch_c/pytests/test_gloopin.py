@@ -28,7 +28,8 @@ measurements rather than with the claim:
   `device.cc` (165 for an interface, 154 for a hostname), which is the
   evidence that the interface path is the one being taken.
 * `test_a_pinned_child_binds_only_the_loopback_address` -- what the pinned
-  child actually binds, read out of `lsof`, must be `127.0.0.1`.
+  child actually binds, read out of `lsof` on macOS and out of the kernel's
+  own socket tables (`/proc/self/net/tcp*`) on Linux, must be `127.0.0.1`.
 * `test_removing_the_pin_restores_the_dependency_on_host_name_resolution` --
   the nullification. The identical child with the pin removed binds
   `10.9.8.x`, an address that only exists because the host name was resolved.
@@ -66,13 +67,68 @@ port = sys.argv[1]
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = port
 dist.init_process_group(backend="gloo", rank=0, world_size=1)
-lsof = subprocess.run(
-    ["/usr/sbin/lsof", "-nP", "-a", "-p", str(os.getpid()),
-     "-iTCP", "-sTCP:LISTEN"],
-    capture_output=True, text=True)
-print("LISTENERS>>>" + json.dumps(lsof.stdout))
+LISTENERS_SOURCE
+print("LISTENERS>>>" + json.dumps(listeners()))
 dist.destroy_process_group()
 '''
+
+# Where a child reads its own listening sockets from, per platform.
+#
+# macOS: `lsof`, at the path the base system installs it. Linux: the kernel's
+# own socket tables. The first Linux gate (issue #40) died here on
+# `FileNotFoundError: '/usr/sbin/lsof'` -- `ubuntu-24.04` has no lsof at that
+# path, so the child never reached the question, and both tests reported a
+# rendezvous failure that was really a missing binary. `/proc/self/net/tcp{,6}`
+# lists every TCP socket in the namespace with its state and inode, and
+# `/proc/self/fd` names the inodes this process owns, so the intersection is
+# exactly what `lsof -p <pid> -iTCP -sTCP:LISTEN` reports -- printed in lsof's
+# `TCP <addr>:<port> (LISTEN)` shape so the parser below is the same on both.
+_LISTENERS_SOURCE = r'''
+def _linux_listeners():
+    import ipaddress
+    owned = set()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink("/proc/self/fd/" + fd)
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            owned.add(target[len("socket:["):-1])
+    lines = []
+    for table in ("/proc/self/net/tcp", "/proc/self/net/tcp6"):
+        try:
+            rows = open(table).read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            cols = row.split()
+            if cols[3] != "0A" or cols[9] not in owned:   # 0A is TCP_LISTEN
+                continue
+            hexaddr, hexport = cols[1].split(":")
+            raw = b"".join(bytes.fromhex(hexaddr[i:i + 8])[::-1]
+                           for i in range(0, len(hexaddr), 8))
+            ip = ipaddress.ip_address(raw)
+            if ip.version == 6 and ip.ipv4_mapped is not None:
+                ip = ip.ipv4_mapped
+            if ip.is_unspecified:
+                addr = "*"
+            elif ip.version == 6:
+                addr = "[%s]" % ip
+            else:
+                addr = str(ip)
+            lines.append("python %d TCP %s:%d (LISTEN)" % (os.getpid(), addr, int(hexport, 16)))
+    return "\n".join(lines) + "\n"
+
+
+def listeners():
+    if sys.platform.startswith("linux"):
+        return _linux_listeners()
+    return subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(os.getpid()),
+         "-iTCP", "-sTCP:LISTEN"],
+        capture_output=True, text=True).stdout
+'''
+_CHILD = _CHILD.replace("LISTENERS_SOURCE", _LISTENERS_SOURCE)
 
 
 def _free_port():
@@ -119,7 +175,7 @@ def _routable(addresses):
     have come from resolving this host's name.
     """
     return [a for a in addresses
-            if a not in ("127.0.0.1", "::1", "*", "localhost")]
+            if a not in ("127.0.0.1", "::1", "[::1]", "*", "localhost")]
 
 
 _INET = re.compile(r"inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)")
