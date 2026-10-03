@@ -25675,6 +25675,10 @@ _MPS_READBACK_EXEMPT = {
         "from a constant the test itself built on the CPU. It is the Rust "
         "half of the float16 double-rounding assertion in "
         "test_mpsconst.py, and it touches no device (matrix.md 7.18).",
+    "bf16_from_f64_is_two_roundings_everywhere":
+        "a #[cfg(test)] proof -- issue #28's bfloat16 witnesses, read back "
+        "from constants and a candle `affine` the test itself built on the "
+        "CPU. It touches no device.",
 }
 
 

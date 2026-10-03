@@ -723,11 +723,11 @@ impl UnaryOpT for Erf {
     const V: Self = Erf;
     #[inline(always)]
     fn bf16(v: bf16) -> bf16 {
-        bf16::from_f64(Self::f64(v.to_f64()))
+        crate::dtype::c10_bf16_from_f64(Self::f64(v.to_f64()))
     }
     #[inline(always)]
     fn f16(v: f16) -> f16 {
-        f16::from_f64(Self::f64(v.to_f64()))
+        crate::dtype::c10_f16_from_f64(Self::f64(v.to_f64()))
     }
     #[inline(always)]
     fn f32(v: f32) -> f32 {
@@ -1042,11 +1042,11 @@ impl UnaryOpT for GeluErf {
     const V: Self = GeluErf;
     #[inline(always)]
     fn bf16(v: bf16) -> bf16 {
-        bf16::from_f64(Self::f64(v.to_f64()))
+        crate::dtype::c10_bf16_from_f64(Self::f64(v.to_f64()))
     }
     #[inline(always)]
     fn f16(v: f16) -> f16 {
-        f16::from_f64(Self::f64(v.to_f64()))
+        crate::dtype::c10_f16_from_f64(Self::f64(v.to_f64()))
     }
     #[inline(always)]
     fn f32(v: f32) -> f32 {
