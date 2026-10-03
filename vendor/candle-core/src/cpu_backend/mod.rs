@@ -1901,7 +1901,7 @@ impl BackendStorage for CpuStorage {
                 Ok(Self::BF16(data))
             }
             (Self::F64(storage), DType::BF16) => {
-                let data = unary_map(storage, layout, bf16::from_f64);
+                let data = unary_map(storage, layout, crate::dtype::c10_bf16_from_f64);
                 Ok(Self::BF16(data))
             }
             (Self::U8(storage), DType::F16) => {
@@ -1929,7 +1929,7 @@ impl BackendStorage for CpuStorage {
                 Ok(Self::F16(data))
             }
             (Self::F64(storage), DType::F16) => {
-                let data = unary_map(storage, layout, f16::from_f64);
+                let data = unary_map(storage, layout, crate::dtype::c10_f16_from_f64);
                 Ok(Self::F16(data))
             }
             (Self::U8(storage), DType::F32) => {
@@ -2495,11 +2495,11 @@ impl BackendStorage for CpuStorage {
         // TODO: Have some generic map for functions that apply on num_traits::Float elements.
         match self {
             Self::BF16(storage) => {
-                let data = unary_map(storage, layout, |v| v.powf(bf16::from_f64(e)));
+                let data = unary_map(storage, layout, |v| v.powf(crate::dtype::c10_bf16_from_f64(e)));
                 Ok(Self::BF16(data))
             }
             Self::F16(storage) => {
-                let data = unary_map(storage, layout, |v| v.powf(f16::from_f64(e)));
+                let data = unary_map(storage, layout, |v| v.powf(crate::dtype::c10_f16_from_f64(e)));
                 Ok(Self::F16(data))
             }
             Self::F32(storage) => {
@@ -2531,11 +2531,11 @@ impl BackendStorage for CpuStorage {
         // TODO: Have some generic map for functions that apply on num_traits::Float elements.
         match self {
             Self::BF16(storage) => {
-                let data = unary_map(storage, layout, |v| elu(v, bf16::from_f64(alpha)));
+                let data = unary_map(storage, layout, |v| elu(v, crate::dtype::c10_bf16_from_f64(alpha)));
                 Ok(Self::BF16(data))
             }
             Self::F16(storage) => {
-                let data = unary_map(storage, layout, |v| elu(v, f16::from_f64(alpha)));
+                let data = unary_map(storage, layout, |v| elu(v, crate::dtype::c10_f16_from_f64(alpha)));
                 Ok(Self::F16(data))
             }
             Self::F32(storage) => {
@@ -3251,7 +3251,7 @@ impl BackendDevice for CpuDevice {
             | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_uniform").bt()),
             DType::BF16 => {
                 let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distr::Uniform::new(bf16::from_f64(min), bf16::from_f64(max))
+                let uniform = rand::distr::Uniform::new(crate::dtype::c10_bf16_from_f64(min), crate::dtype::c10_bf16_from_f64(max))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
                     data.push(rng.sample::<bf16, _>(uniform))
@@ -3260,7 +3260,7 @@ impl BackendDevice for CpuDevice {
             }
             DType::F16 => {
                 let mut data = Vec::with_capacity(elem_count);
-                let uniform = rand::distr::Uniform::new(f16::from_f64(min), f16::from_f64(max))
+                let uniform = rand::distr::Uniform::new(crate::dtype::c10_f16_from_f64(min), crate::dtype::c10_f16_from_f64(max))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
                     data.push(rng.sample::<f16, _>(uniform))
@@ -3315,7 +3315,7 @@ impl BackendDevice for CpuDevice {
             | DType::F8E8M0 => Err(Error::UnsupportedDTypeForOp(dtype, "rand_normal").bt()),
             DType::BF16 => {
                 let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(bf16::from_f64(mean), bf16::from_f64(std))
+                let normal = rand_distr::Normal::new(crate::dtype::c10_bf16_from_f64(mean), crate::dtype::c10_bf16_from_f64(std))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
                     data.push(normal.sample(&mut rng))
@@ -3324,7 +3324,7 @@ impl BackendDevice for CpuDevice {
             }
             DType::F16 => {
                 let mut data = Vec::with_capacity(elem_count);
-                let normal = rand_distr::Normal::new(f16::from_f64(mean), f16::from_f64(std))
+                let normal = rand_distr::Normal::new(crate::dtype::c10_f16_from_f64(mean), crate::dtype::c10_f16_from_f64(std))
                     .map_err(Error::wrap)?;
                 for _i in 0..elem_count {
                     data.push(normal.sample(&mut rng))

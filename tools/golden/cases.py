@@ -230,6 +230,18 @@ def full_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
+    # The f64 -> bf16 / f16 narrowing witnesses (issue #28), bit-exact: a fill
+    # value is a Python double, and `full` narrows it the way c10 narrows a
+    # double. See `_NARROWING_WITNESSES` at `aten._to_copy.default`.
+    for dtype_name in ["bfloat16", "float16"]:
+        for fill in _NARROWING_WITNESSES:
+            case = _full_case(
+                torch_module, c_module, torch_call, (2,), fill, dtype_name, "match",
+                "issue #28: c10's f64 narrowing, bit-exact",
+            )
+            case.value_check = _exact_value_check
+            cases.append(case)
+
     # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # size/fill_value/dtype all by keyword, not just positionally.
     cases.append(
@@ -8764,6 +8776,27 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten._to_copy.default ----------------------------------------------------
 # `float()`, `long()`, `to(dtype)` all dispatch to the same cast op.
 
+# Doubles whose narrowing to `bfloat16` / `float16` tells c10's rule apart from
+# the other plausible ones (issue #28). Every entry is derived from the bit
+# layout, and each one's purpose is stated so it is not "simplified" away:
+_NARROWING_WITNESSES: tuple[float, ...] = (
+    # Just above the bf16 tie between 1.0 and 1.0078125. Exact in f32, so
+    # one and two roundings both give 1.0078125; `half::bf16::from_f64` drops
+    # the 2^-22 bit with the low 32 mantissa bits, sees a tie, and gives 1.0.
+    1 + 2**-8 + 2**-22,
+    # Just below the bf16 tie between 1.0078125 and 1.015625. f32 snaps it
+    # onto the tie, which then goes to even: two roundings (c10) give
+    # 1.015625, one rounding gives 1.0078125.
+    1 + 3 * 2**-8 - 2**-30,
+    # The float16 one-vs-two-step witness: f16 directly is 0.031280517578125,
+    # f16(f32(x)) is 0.03125. Which one upstream gives is per-architecture.
+    0.031265258789971995,
+    # Negative and subnormal-range mirrors, and an exact value as a control.
+    -(1 + 2**-8 + 2**-22),
+    2**-25 + 2**-40,
+    1.5,
+)
+
 def to_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten._to_copy.default"
     cases: list[Case] = []
@@ -8787,6 +8820,31 @@ def to_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
                 run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
                 note=note,
+            )
+        )
+
+    # **`float64 -> bfloat16` / `float16` narrowing, bit for bit** (issue #28).
+    # c10 builds `BFloat16` only from `float`, so a double becomes
+    # `bf16(f32(x))` on every platform; `Half` is built from `float16_t` on
+    # aarch64 (one rounding) and from `float` elsewhere (two). `half`'s own
+    # `bf16::from_f64` truncates the low 32 mantissa bits first and is neither.
+    # The default pipeline's tolerance would hide a one-ulp miss, so these are
+    # `_exact_value_check`. Each witness is derived, not chosen -- see
+    # `_NARROWING_WITNESSES`.
+    for dst_dtype in ["bfloat16", "float16"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, list(_NARROWING_WITNESSES),
+                                  (len(_NARROWING_WITNESSES),), "float64")
+        t_dt = dt.torch_dtype(torch_module, dst_dtype)
+        c_dt = dt.c_dtype(c_module, dst_dtype)
+        cases.append(
+            Case(
+                name=f"_to_copy(float64 -> {dst_dtype}) [c10 narrowing witnesses, bit-exact]",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, dtype=c_dt),
+                note="issue #28: f64 -> bf16 is bf16(f32(x)) everywhere; f64 -> f16 is "
+                     "one rounding on aarch64 and f16(f32(x)) elsewhere",
+                value_check=_exact_value_check,
             )
         )
 

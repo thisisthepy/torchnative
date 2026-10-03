@@ -236,11 +236,75 @@ with_dtype!(i16, I16, |v: f64| v as i16, |v: i16| v as f64);
 with_dtype!(i8, I8, |v: f64| v as i8, |v: i8| v as f64);
 with_dtype!(i32, I32, |v: f64| v as i32, |v: i32| v as f64);
 with_dtype!(i64, I64, |v: f64| v as i64, |v: i64| v as f64);
-with_dtype!(f16, F16, f16::from_f64, f16::to_f64);
-with_dtype!(bf16, BF16, bf16::from_f64, bf16::to_f64);
+with_dtype!(f16, F16, c10_f16_from_f64, f16::to_f64);
+with_dtype!(bf16, BF16, c10_bf16_from_f64, bf16::to_f64);
 with_dtype!(f32, F32, |v: f64| v as f32, |v: f32| v as f64);
 with_dtype!(f64, F64, |v: f64| v, |v: f64| v);
 with_dtype!(f8e4m3, F8E4M3, f8e4m3::from_f64, |v: f8e4m3| v.to_f64());
+
+/// `f64 -> bfloat16` exactly as upstream PyTorch's c10 does it.
+///
+/// `c10::BFloat16` has no constructor from `double`; its only converting
+/// constructor takes `float` (`torch/headeronly/util/BFloat16.h`), so a double
+/// becomes `bf16(f32(x))` -- two round-to-nearest-even steps -- on every
+/// platform. `half::bf16::from_f64` is neither one rounding nor two: it drops
+/// the low 32 mantissa bits and then rounds, so `1 + 2^-8 + 2^-22` becomes a
+/// tie and lands on `1.0` where upstream gives `1.0078125` (issue #28).
+///
+/// Every `f64 -> bf16` in this fork and in `torch_c` goes through here.
+#[inline]
+pub fn c10_bf16_from_f64(v: f64) -> bf16 {
+    bf16::from_f32(v as f32)
+}
+
+/// `f64 -> float16` exactly as upstream PyTorch's c10 does it, which is
+/// per-architecture (`torch/headeronly/util/Half.h:85-91`):
+///
+/// * on aarch64 (not CUDA) `c10::Half` is constructed from `float16_t`, so a
+///   double is narrowed by the compiler in **one** rounding (`fcvt h, d`);
+/// * everywhere else it is constructed from `float`, so a double becomes
+///   `f16(f32(x))` -- **two** roundings.
+///
+/// `half::f16::from_f64` is not used for the aarch64 arm: it only rounds once
+/// when the `fp16` feature is detected at run time and otherwise truncates the
+/// low 32 mantissa bits first. The single rounding is done here in software so
+/// that it does not depend on what the CPU reports.
+#[inline]
+pub fn c10_f16_from_f64(v: f64) -> f16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        f16_from_f64_round_once(v)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        f16::from_f32(v as f32)
+    }
+}
+
+/// `f64 -> float16` in one round-to-nearest-even step, by exact arithmetic.
+///
+/// Scale by the `float16` ulp of `|v|` (a power of two, so exact), round to an
+/// integer with ties to even (exact), scale back (exact). The result is a
+/// value `float16` represents -- or a value past `65504`, which IEEE overflow
+/// sends to infinity -- so the final narrowing through `f32` is exact and adds
+/// no second rounding.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline]
+fn f16_from_f64_round_once(v: f64) -> f16 {
+    if !v.is_finite() {
+        return f16::from_f32(v as f32);
+    }
+    let exp = ((v.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+    // float16 keeps 10 fraction bits; below its smallest normal (2^-14) the
+    // spacing is fixed at 2^-24.
+    let ulp_exp = exp.max(-14) - 10;
+    let ulp = f64::from_bits(((ulp_exp + 1023) as u64) << 52);
+    let rounded = (v / ulp).round_ties_even() * ulp;
+    if rounded.abs() > 65504.0 {
+        return if rounded > 0.0 { f16::INFINITY } else { f16::NEG_INFINITY };
+    }
+    f16::from_f32(rounded as f32)
+}
 
 pub trait IntDType: WithDType + num_traits::Bounded {
     fn is_true(&self) -> bool;

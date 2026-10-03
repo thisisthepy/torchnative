@@ -33,7 +33,12 @@ upstream as well as of this build, and it is the test that fails if anybody
 Nullifications this file is meant to catch:
 
 * ``host_full`` narrowing through ``f32`` instead of straight to the storage
-  dtype -> test_the_constant_is_rounded_once_and_not_twice
+  dtype -> test_the_constant_is_rounded_once_and_not_twice (aarch64 only:
+  elsewhere upstream itself narrows ``f64 -> f16`` through ``f32``)
+* ``candle_core::c10_bf16_from_f64`` reverted to ``half::bf16::from_f64``
+  -> test_the_bf16_constant_is_narrowed_as_c10_does (issue #28)
+* ``candle_core::c10_f16_from_f64`` rounding the wrong number of times for
+  the platform -> test_the_f16_constant_follows_c10_on_this_platform
 * ``host_full`` reverting to ``Tensor::full(.., device)``
   -> test_the_float_factories_answer_on_mps, and the structural derivation
 * the fix applied to ``full`` only and not the family
@@ -67,6 +72,51 @@ _DTYPES = ("float32", "float16", "bfloat16")
 # `float16` neighbours, close enough that `float32` snaps it back onto the tie
 # and then the tie rounds the other way.
 _DOUBLE_ROUNDING_WITNESS = 0.031265258789971995
+
+
+# Whether upstream narrows `f64 -> float16` in ONE rounding on this machine.
+# c10 builds `Half` from `float16_t` on aarch64 (not CUDA) and from `float`
+# everywhere else (torch/headeronly/util/Half.h:85-91), so on x86_64 upstream
+# itself gives f16(f32(x)) and the one-step witness has nothing to witness.
+# The tests below ask upstream as well, so a wrong guess here is a FAIL, not
+# a silent pass.
+import platform  # noqa: E402
+
+_F16_SINGLE_ROUNDING = platform.machine().lower() in ("arm64", "aarch64")
+
+# Two `float64 -> bfloat16` witnesses (issue #28). c10 has no
+# `BFloat16(double)`, so upstream is bf16(f32(x)) on every platform.
+#   _BF16_TRUNCATION_WITNESS: just above the tie between 1.0 and 1.0078125,
+#     exact in f32. One and two roundings both give 1.0078125; `half`'s
+#     `bf16::from_f64`, which drops the low 32 mantissa bits first, gives 1.0.
+#   _BF16_TWO_STEP_WITNESS: just below the tie between 1.0078125 and
+#     1.015625. f32 snaps it onto the tie, which goes to even: two roundings
+#     give 1.015625 and one rounding gives 1.0078125.
+_BF16_TRUNCATION_WITNESS = 1 + 2**-8 + 2**-22
+_BF16_TWO_STEP_WITNESS = 1 + 3 * 2**-8 - 2**-30
+
+
+def _bf16_round_once(x):
+    """`float64 -> bfloat16` in one round-to-nearest-even step, exactly.
+
+    Python's `round` on a float is exact ties-to-even, and dividing and
+    multiplying by a power of two is exact, so this is the true single
+    rounding (finite, normal-range inputs only, which is all it is used for).
+    """
+    import math
+    e = math.frexp(abs(x))[1] - 1
+    ulp = 2.0 ** (e - 7)
+    return round(x / ulp) * ulp
+
+
+def _bf16_rules(x):
+    """The three candidate rules, computed here and not by either torch."""
+    import struct
+    f32 = struct.unpack("<f", struct.pack("<f", x))[0]
+    hi = struct.unpack("<d", struct.pack(
+        "<Q", struct.unpack("<Q", struct.pack("<d", x))[0] & ~0xFFFFFFFF))[0]
+    return {"one": _bf16_round_once(x), "two": _bf16_round_once(f32),
+            "truncate": _bf16_round_once(hi)}
 
 
 def _mps_or_skip(what):
@@ -103,6 +153,8 @@ for key, case in req.items():
         t = torch.zeros(case["shape"], dtype=dt).new_full(case["shape"], v)
     elif name == "scalar_tensor":
         t = torch.scalar_tensor(v, dtype=dt)
+    elif name == "cast":
+        t = torch.tensor([v], dtype=torch.float64).to(dt)
     elif name == "fill_":
         t = torch.zeros(case["shape"], dtype=dt)
         t.fill_(v)
@@ -260,22 +312,39 @@ def test_the_constant_is_rounded_once_and_not_twice():
 
     Metal has `f32` but not `f64`, so the tempting repair is to narrow the
     scalar to `f32` on the host and let the device const-set it. For a
-    `float16` destination that rounds twice and lands on a different number.
+    `float16` destination that rounds twice and lands on a different number
+    -- **on aarch64**, where upstream rounds `f64 -> f16` once. On every other
+    platform upstream itself rounds through `float` (c10 `Half(float)`), the
+    two paths agree, and this witness has nothing to tell apart: it is
+    skipped there by name, and `test_the_f16_constant_follows_c10_on_this_platform`
+    carries the agreement instead.
 
     Asked of upstream too, because the claim is about what upstream's answer
-    *is*, not merely about internal consistency. If upstream double-rounded,
-    this build would have to as well and the whole argument would invert.
+    *is*, not merely about internal consistency.
     """
     v = _DOUBLE_ROUNDING_WITNESS
     want = _oracle({"w/%s" % dt: {"case": "full", "dtype": dt, "value": v,
                                   "shape": [1], "source": _SOURCE,
                                   "cond": _COND}
                     for dt in _DTYPES})
-
-    # The premise: the witness really does distinguish the two roundings.
     once = want["w/float16"]["values"][0]
     via32 = _host(_C._tensor_from_flat([v], [1], _C.float64)
                   .to(_C.float32).to(_C.float16))[0]
+
+    if not _F16_SINGLE_ROUNDING:
+        # State the platform's semantics before stepping aside: upstream here
+        # must be the two-step value, or the platform guess above is wrong.
+        assert once == via32 == 0.03125, (
+            "on %s upstream gave %r for f16(%r) and f16(f32(x)) is %r; c10 "
+            "narrows through float off aarch64, so these should both be "
+            "0.03125" % (platform.machine(), once, v, via32))
+        _skip.skip("   (skipped the f16 one-vs-two-step witness: %s is not "
+                   "aarch64, and upstream c10 narrows f64 -> f16 through "
+                   "float there, so both paths give %r)"
+                   % (platform.machine(), once))
+        return
+
+    # The premise: the witness really does distinguish the two roundings.
     assert once != via32, (
         "the witness %r no longer distinguishes single from double rounding "
         "(f16 direct %r, f16 via f32 %r). This test proves nothing until a "
@@ -294,6 +363,84 @@ def test_the_constant_is_rounded_once_and_not_twice():
                 "device sees it rounds twice; the constant has to be "
                 "converted straight to the storage dtype, once, on the host."
                 % (v, dt, label, _host(got), want["w/%s" % dt]["values"]))
+
+
+def _ask_narrowing(case, dt, v, device):
+    if case == "full":
+        return _C._aten_dispatch("aten.full.default", [1], v,
+                                 dtype=getattr(_C, dt), device=device)
+    t = _C._tensor_from_flat([v], [1], _C.float64).to(getattr(_C, dt))
+    return t.to("mps") if device is not None else t
+
+
+def _narrowing_agrees(dt, witnesses):
+    """`full` and the f64 cast, on cpu and mps, against upstream. Failures."""
+    cases = ("full", "cast")
+    want = _oracle({"%s/%r" % (c, v): {"case": c, "dtype": dt, "value": v,
+                                       "shape": [1], "source": _SOURCE,
+                                       "cond": _COND}
+                    for c in cases for v in witnesses})
+    bad = []
+    for label, device in (("cpu", None), ("mps", _C.device("mps"))):
+        if device is not None and _mps_or_skip(
+                "the %s narrowing witness on mps" % dt) is None:
+            continue
+        for c in cases:
+            for v in witnesses:
+                got = _host(_ask_narrowing(c, dt, v, device))
+                if got != want["%s/%r" % (c, v)]["values"]:
+                    bad.append("%s(%r) as %s on %s gave %r, upstream %r"
+                               % (c, v, dt, label, got,
+                                  want["%s/%r" % (c, v)]["values"]))
+    return want, bad
+
+
+def test_the_bf16_constant_is_narrowed_as_c10_does():
+    """`float64 -> bfloat16` is bf16(f32(x)) upstream, on every platform.
+
+    issue #28: `half`'s `bf16::from_f64` truncates the low 32 mantissa bits
+    and then rounds, which is neither one rounding nor two. Two witnesses,
+    each asked of upstream in a subprocess and of this build on cpu and on
+    mps, through `full` and through `.to(torch.bfloat16)`:
+
+    * the truncation witness, where the truncating rule disagrees with c10;
+    * the two-step witness, where a single rounding disagrees with c10.
+    """
+    w = (_BF16_TRUNCATION_WITNESS, _BF16_TWO_STEP_WITNESS)
+    want, bad = _narrowing_agrees("bfloat16", w)
+
+    # The premises, against rules computed in this file rather than by either
+    # torch: each witness separates c10's rule from the one it targets.
+    for c in ("full", "cast"):
+        up = [want["%s/%r" % (c, v)]["values"][0] for v in w]
+        r0, r1 = _bf16_rules(w[0]), _bf16_rules(w[1])
+        assert up[0] == r0["two"] == 1.0078125 != r0["truncate"], (
+            "truncation witness: upstream %s gave %r; rules %r" % (c, up[0], r0))
+        assert up[1] == r1["two"] == 1.015625 != r1["one"], (
+            "two-step witness: upstream %s gave %r; rules %r" % (c, up[1], r1))
+
+    assert not bad, "bfloat16 narrowing disagrees with upstream:\n  " + \
+        "\n  ".join(bad)
+
+
+def test_the_f16_constant_follows_c10_on_this_platform():
+    """`float64 -> float16` against upstream, on every platform.
+
+    The per-platform half of the witness above: one rounding on aarch64,
+    f16(f32(x)) elsewhere. Upstream is asked; the value it gives is checked
+    against the rule this platform should have, so the platform guess is
+    itself under test.
+    """
+    v = _DOUBLE_ROUNDING_WITNESS
+    want, bad = _narrowing_agrees("float16", (v,))
+    expect = 0.031280517578125 if _F16_SINGLE_ROUNDING else 0.03125
+    for c in ("full", "cast"):
+        got = want["%s/%r" % (c, v)]["values"][0]
+        assert got == expect, (
+            "upstream %s(%r) as float16 on %s is %r, expected %r for this "
+            "platform's c10 rule" % (c, v, platform.machine(), got, expect))
+    assert not bad, "float16 narrowing disagrees with upstream:\n  " + \
+        "\n  ".join(bad)
 
 
 def test_no_float_constant_is_still_materialised_on_the_device():
