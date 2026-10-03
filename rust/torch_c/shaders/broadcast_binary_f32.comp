@@ -1,0 +1,60 @@
+#version 450
+
+// `add` / `sub` / `mul` / `div` `.Tensor` over two broadcast float32 operands
+// -- `docs/devices/VULKAN7.md` §3.2.
+//
+// c[i] = a[offset_a(i)] OP b[offset_b(i)]
+//
+// where the offsets are the output multi-index of `i` dotted with each
+// operand's stride, and a broadcast axis has stride 0. That is exactly
+// upstream's broadcasting, and it costs one dispatch rather than an `expand`
+// per operand first.
+//
+// Each element is one IEEE operation on the same two float32 values upstream
+// uses, so the answer is bit-identical rather than close -- the equal-shape
+// kernels (`add_f32.comp` and friends) make the same promise, and division
+// stays a division (MoltenVK's fast-math is off for this instance, see
+// `vulkan.rs`).
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// 112 bytes -- inside the 128 every Vulkan device must accept.
+layout(push_constant, std430) uniform Push {
+    uint n;            // output elements
+    uint rank;         // 0..=8
+    uint which;        // 0 add, 1 sub, 2 mul, 3 div
+    uint unused;
+    uint shape[8];     // output shape
+    uint stride_a[8];  // a's stride per output axis, 0 where broadcast
+    uint stride_b[8];
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint rem = i;
+    uint ia = 0u;
+    uint ib = 0u;
+    for (int d = int(pc.rank) - 1; d >= 0; --d) {
+        uint e = pc.shape[d];
+        uint k = rem % e;
+        rem /= e;
+        ia += k * pc.stride_a[d];
+        ib += k * pc.stride_b[d];
+    }
+    float x = a[ia];
+    float y = b[ib];
+    if (pc.which == 0u) {
+        c[i] = x + y;
+    } else if (pc.which == 1u) {
+        c[i] = x - y;
+    } else if (pc.which == 2u) {
+        c[i] = x * y;
+    } else {
+        c[i] = x / y;
+    }
+}

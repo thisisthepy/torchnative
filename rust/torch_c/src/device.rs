@@ -700,20 +700,52 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
+/// **Ten of these were added on 2026-09-20 and none of them is a new defect**
+/// (docs/devices/matrix.md §7.16). They are kernels that have always read
+/// their operand to the host, and were invisible to the derivation because it
+/// followed six helper *names* one hop. Each reaches `read_flat` through an
+/// un-named hop in the same file, or through another operator's kernel; the
+/// hop chain is written beside each entry below, and
+/// `test_shim.py::_ops_that_reach_the_host` now follows the call graph
+/// instead of a name list, so the chain is re-derived on every gate run
+/// rather than trusted.
+///
+/// **What refusing them cost, named rather than glossed.** Twelve cells
+/// published AGREES in §6's `mps` columns are withdrawn and all twelve are
+/// integral. The float columns of those operators were **already** not
+/// running on mps -- `sort` on `float32`/`mps` raises `Metal contiguous
+/// to_dtype F32 F64 not implemented` from inside candle, measured, because
+/// `read_flat` widens to `f64` and Metal has no double. The two `norm` ops
+/// withdraw nothing: every one of their mps cells was already REFUSES or
+/// BREAKS.
+///
+/// The alternative considered and rejected was an "allowed but host-assisted"
+/// third category. It would create a state `_metal_counters()` cannot tell
+/// from a real fallback -- the instrument §7.14 was built on -- and
+/// `MPS_READBACK_BUT_ALLOWED` is deliberately two names for that reason.
+pub const MPS_HOST_READBACK_OPS: [&str; 99] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._unique2.default",
-    "aten.abs.default",
-    "aten.abs_.default",
+    // `aten.abs.default` and `aten.abs_.default` were here until their
+    // integral path stopped being a `to_vec1::<i64>()` loop and became
+    // `integral_abs_on_device` -- `maximum(x, 0 - x)` in candle, on the
+    // device. Removing a name from this list without removing the readback
+    // is the defeat docs/devices/MPSATTN.md §3.1 records; the derivation
+    // scan in test_shim.py re-derives the whole list from `aten.rs` on every
+    // gate run, so it would put them straight back.
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
     "aten.allclose.default",
     "aten.argmax.default",
+    // §7.16: argsort_default -> argsort_core -> order_along -> read_flat
+    "aten.argsort.default",
+    // §7.16: argsort_stable -> argsort_core -> order_along -> read_flat
+    "aten.argsort.stable",
     "aten.avg_pool2d.default",
     "aten.bitwise_and.Scalar",
     "aten.bitwise_and.Tensor",
@@ -732,6 +764,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.erfinv.default",
     "aten.expm1.default",
     "aten.expm1_.default",
+    // §7.16: floor_divide_scalar -> floor_divide_impl -> read_flat
+    "aten.floor_divide.Scalar",
+    // §7.16: floor_divide_default -> floor_divide_impl -> read_flat
+    "aten.floor_divide.default",
     "aten.fmod.Scalar",
     "aten.fmod.Tensor",
     "aten.gather.default",
@@ -744,6 +780,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.index_put_.default",
     "aten.isin.Tensor_Tensor",
     "aten.linalg_qr.default",
+    // §7.16: linalg_vector_norm_default -> norm_pow_walk -> read_flat
+    "aten.linalg_vector_norm.default",
     "aten.log2.default",
     "aten.log2_.default",
     "aten.lstm.input",
@@ -762,6 +800,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.native_dropout.default",
     "aten.nll_loss_forward.default",
     "aten.nonzero.default",
+    // §7.16: norm_scalaropt_dim -> norm_pow_walk -> read_flat
+    "aten.norm.ScalarOpt_dim",
     "aten.one_hot.default",
     "aten.pow.Scalar",
     "aten.pow.Tensor_Tensor",
@@ -772,13 +812,21 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.repeat_interleave.Tensor",
     "aten.scatter.src",
     "aten.scatter.value",
+    // §7.16: scatter_inplace -> scatter_src -> read_flat
+    "aten.scatter_.src",
+    // §7.16: scatter_inplace -> scatter_src -> read_flat
+    "aten.scatter_.value",
     "aten.scatter_reduce.two",
     "aten.softplus.default",
+    // §7.16: sort_default -> order_along -> read_flat
+    "aten.sort.default",
     "aten.std.correction",
     "aten.std.default",
     "aten.std.dim",
     "aten.stft.center",
     "aten.stft.default",
+    // §7.16: topk_default -> order_along -> read_flat
+    "aten.topk.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
     "aten.upsample_linear1d.default",
@@ -787,11 +835,37 @@ pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten.var.correction",
     "aten.var.default",
     "aten.var.dim",
+    // `var_mean` reads back for the same reason its `var` siblings do: it
+    // shares `var_reduce_values`, whose two-pass mean has to see each lane
+    // twice. docs/graph/VARMEAN.md §1.1.
+    "aten.var_mean.correction",
+    "aten.var_mean.default",
+    "aten.var_mean.dim",
+    // `aten.view.dtype` is the one silent CPU fallback `docs/devices/matrix.md`
+    // §4.1 found, and it stayed open longer than the others because it was
+    // invisible to the derivation: its kernel holds no marker of its own and
+    // calls no in-file helper. It calls `crate::tensor::to_le_bytes`, a
+    // `to_vec1` per dtype, and then `crate::tensor::from_le_bytes`, which
+    // opens `let device = candle_core::Device::Cpu;`. So an `mps` input came
+    // back as a **cpu** tensor with correct values, and everything downstream
+    // of it left the device too.
+    //
+    // It is refused rather than moved onto the device because a byte
+    // reinterpretation is not expressible through candle 0.11.0 on any
+    // backend, and one of the pairs measured -- `int64 -> float64` -- asks
+    // Metal for a double, which it does not have. This op was the twenty-third
+    // road onto the device for `float64`; §3.1 closed the other twenty-two.
+    //
+    // The name is on this list *and* derivable: the scan in `test_shim.py`
+    // now follows helper calls across modules by qualified path, so removing
+    // the `to_le_bytes` is the only way to take the name off -- which is the
+    // order docs/devices/MPSATTN.md §3.1 insists on.
+    "aten.view.dtype",
     "aten.where.default",
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the eighty-seven above.
+/// reason each is different in kind from the ninety-nine above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
@@ -825,6 +899,53 @@ pub const MPS_READBACK_BUT_ALLOWED: [&str; 2] = [
     "aten._local_scalar_dense.default",
     "aten.uniform_.default",
 ];
+
+/// What a refused op still does, per op, so the refusal is a direction rather
+/// than a wall.
+///
+/// **This is measured, not asserted.** Each entry names the dtypes whose
+/// **CPU** column agrees with upstream element-wise, and
+/// `test_mpsrefuse.py` re-measures every one of them against an oracle
+/// computed in a separate subprocess -- so a note that drifts away from what
+/// the build does turns the gate red rather than misdirecting a user.
+///
+/// It covers the ten names the deepened derivation added
+/// (docs/devices/matrix.md §7.16) and no others. The other eighty-nine
+/// predate the note mechanism and carry the generic wording; extending the
+/// table is a measurement each time, which is why it was not done in bulk.
+///
+/// The second field is deliberately *not* "and the float column works on
+/// mps". For all ten it does not: `read_flat` widens to `f64` and Metal has
+/// no double, so `sort` on `float32`/`mps` raises from inside candle. Writing
+/// the comforting sentence would have been the §7.9 `clamp` mistake in prose.
+pub const MPS_HOST_READBACK_NOTES: [(&str, &str); 10] = [
+    ("aten.argsort.default", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.argsort.stable", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.floor_divide.Scalar", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.floor_divide.default", "float32, float16, bfloat16, float64, int64, int32, int8"),
+    ("aten.linalg_vector_norm.default", "float32, float16, bfloat16, float64"),
+    ("aten.norm.ScalarOpt_dim", "float32, float16, bfloat16, float64"),
+    ("aten.scatter_.src", "int64, int32"),
+    ("aten.scatter_.value", "int64, int32"),
+    ("aten.sort.default", "float32, float16, bfloat16, float64, int64, int32, int8, bool"),
+    ("aten.topk.default", "float32, float16, bfloat16, float64, int64, int32, int8"),
+];
+
+/// The note for an op, or `None` when it has none.
+pub fn host_readback_note(op: &str) -> Option<&'static str> {
+    MPS_HOST_READBACK_NOTES
+        .iter()
+        .find(|(name, _)| *name == op)
+        .map(|(_, note)| *note)
+}
+
+/// The table, readable from Python for the same reason the list is: a test
+/// has to check the *artefact*, not the constant beside it.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_host_readback_notes")]
+fn shim_mps_host_readback_notes() -> Vec<(&'static str, &'static str)> {
+    MPS_HOST_READBACK_NOTES.to_vec()
+}
 
 /// Is this candle handle a Metal one?
 ///
@@ -881,12 +1002,24 @@ fn host_readback_gate(
     if !MPS_HOST_READBACK_OPS.contains(&op) {
         return Ok(());
     }
+    // The note, when there is one, is what turns a refusal into a direction.
+    // A user who hits `sort` on `int64`/`mps` should leave this message
+    // knowing where the op *does* agree with upstream, not only that it did
+    // not work here.
+    let note = match host_readback_note(op) {
+        Some(dtypes) => format!(
+            " On the CPU this op agrees with upstream element-wise for {dtypes}; \
+             no dtype of it computes on {device}, so .cpu() is the whole answer \
+             rather than a dtype change."
+        ),
+        None => String::new(),
+    };
     Err(not_implemented(format!(
         "{op}: not implemented for the {device} device. This kernel reads the tensor \
          back to host memory and computes there, so it would return a correct \
          value that the GPU did not compute, under {article} {device} label -- the shim \
          refuses that rather than doing it silently. Move the tensor with \
-         .cpu() to ask for the CPU on purpose. {} of the ops this build \
+         .cpu() to ask for the CPU on purpose.{note} {} of the ops this build \
          implements are refused on {device} for this reason; \
          torch._C.{lister}() lists them ({doc}).",
         MPS_HOST_READBACK_OPS.len(),
@@ -984,6 +1117,110 @@ fn mps_probe(py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
         }
     }
     Ok(d.into_any().unbind())
+}
+
+// ---------------------------------------------------------------------------
+// torch.mps memory queries
+// ---------------------------------------------------------------------------
+
+/// The cached `MetalDevice` at index 0, or the refusal that names why there is
+/// none. The three `_mps_*Memory` functions below share it.
+///
+/// Index 0 only: `torch.mps.*` takes no device argument, and upstream's own
+/// MPS allocator is a single process-wide object.
+#[cfg(target_vendor = "apple")]
+fn mps_memory_device(what: &str) -> PyResult<candle_core::MetalDevice> {
+    let resolved = PyDevice {
+        kind: "mps".to_string(),
+        index: Some(0),
+    }
+    .resolve()
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim: {what}: no Metal device could be opened ({e})"
+        ))
+    })?;
+    match resolved {
+        Device::Metal(m) => Ok(m),
+        _ => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim: {what}: resolving mps:0 did not give a Metal device"
+        ))),
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn mps_no_metal(what: &str) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "torch._C shim: {what}: this build has no Metal (it is not an Apple \
+         target), so there is no MTLDevice to ask. torch.backends.mps.is_available() \
+         is False here, which is the gate callers are meant to test first"
+    ))
+}
+
+/// `torch.mps.recommended_max_memory()` -- `MTLDevice.recommendedMaxWorkingSetSize`,
+/// read from the device, not estimated. Upstream returns the same property
+/// (`torch/mps/__init__.py`: "returned from device.recommendedMaxWorkingSetSize").
+#[pyfunction]
+#[pyo3(name = "_mps_recommendedMaxMemory")]
+fn mps_recommended_max_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_recommendedMaxMemory")?;
+        Ok(m.metal_device().recommended_max_working_set_size() as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_recommendedMaxMemory"))
+    }
+}
+
+/// `torch.mps.driver_allocated_memory()` -- `MTLDevice.currentAllocatedSize`,
+/// the driver's total for the process. It includes this crate's pooled
+/// buffers that are free but not yet released, so it does **not** fall when a
+/// tensor dies; that is also what upstream documents for it ("includes cached
+/// allocations in MPSAllocator pools").
+#[pyfunction]
+#[pyo3(name = "_mps_driverAllocatedMemory")]
+fn mps_driver_allocated_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_driverAllocatedMemory")?;
+        Ok(m.metal_device().current_allocated_size() as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_driverAllocatedMemory"))
+    }
+}
+
+/// `torch.mps.current_allocated_memory()` -- bytes of buffers in this crate's
+/// Metal allocator that a live storage (or an in-flight command) still holds:
+/// `MetalDevice::live_buffer_bytes`, a vendored addition to candle's backend
+/// (`vendor/int8-candle-0.11.0-cpu.patch`). It is a count of what this crate
+/// allocated, and it falls when the last reference to a storage goes, because
+/// the allocator's own "free" test is the one it applies.
+///
+/// Unit: `Buffer::length()`, which candle rounds up to a power of two, so a
+/// tensor of 2^k bytes moves it by exactly that and any other size by the
+/// rounded size. Not counted: buffers made by `new_private_buffer`, which are
+/// not pooled. Upstream counts tensor-owned allocator bytes with its own
+/// rounding; the two agree on what is measured, not on every digit.
+#[pyfunction]
+#[pyo3(name = "_mps_currentAllocatedMemory")]
+fn mps_current_allocated_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_currentAllocatedMemory")?;
+        m.live_buffer_bytes()
+            .map(|b| b as u64)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim: _mps_currentAllocatedMemory: {e}"
+            )))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_currentAllocatedMemory"))
+    }
 }
 
 /// Refuse a float64 tensor on a Metal device, by name, at the moment it would
@@ -1667,10 +1904,73 @@ mod cuda_tests {
     }
 }
 
+
+/// `_C._metal_counters()` -- **the runtime answer to "did the GPU do it?" on
+/// Metal**, which until now this build could not ask.
+///
+/// docs/devices/matrix.md §7.5 named the absence and its cost: a kernel swapped
+/// for a host-computed twin keeps every value correct, keeps its `.device`
+/// label, and keeps its agreement test green. Three rounds performed exactly
+/// that substitution and **only a dispatch counter caught it** -- all three on
+/// Vulkan, because Vulkan was the only backend with one (AGENTS.md §13.1). So
+/// every `mps` placement claim in this repository rested on source-derived
+/// evidence that docs/devices/MPSATTN.md §3.1 records as defeatable by moving
+/// a `read_flat` one call deeper.
+///
+/// The six numbers come from `candle_core::metal_backend::counters`, which is
+/// part of the vendored fork (`vendor/int8-candle-0.11.0-cpu.patch`) because
+/// there is nowhere else they can come from: the doors are inside candle's
+/// Metal backend, and anything counted on this side of the boundary would be
+/// counting this crate's *intent* rather than the GPU's work. Their exact
+/// meanings are documented beside the statics; the short form:
+///
+/// * `compute_encoders` -- kernel launches, at the one door candle opens them
+///   through. **A lower bound on GPU dispatches, not a count of
+///   `dispatch_threads`**: those are encoded in `candle-metal-kernels`, which
+///   this vendoring does not cover. A host-computed twin cannot raise it.
+/// * `blit_encoders` -- device copies, including the one `to_cpu` makes.
+/// * `host_uploads` / `host_downloads` (+ `_bytes`) -- crossings of the host
+///   boundary, at candle's only two doors for them.
+///
+/// **This function perturbs nothing.** It opens no device -- a build with no
+/// Metal device reports six zeros, which is the truthful answer -- and
+/// allocates nothing. On a non-Apple build `built` is `false` and every
+/// counter is `None` rather than `0`, because a zero there would read as "the
+/// GPU ran no kernels" when the truth is "there is no Metal in this artefact".
+#[pyfunction]
+#[pyo3(name = "_metal_counters")]
+fn metal_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    const NAMES: [&str; 6] = [
+        "compute_encoders",
+        "blit_encoders",
+        "host_uploads",
+        "host_upload_bytes",
+        "host_downloads",
+        "host_download_bytes",
+    ];
+    let d = PyDict::new(py);
+    d.set_item("built", cfg!(target_vendor = "apple"))?;
+    #[cfg(target_vendor = "apple")]
+    {
+        let snap = candle_core::metal_backend::counters::snapshot();
+        for (name, value) in NAMES.iter().zip(snap.iter()) {
+            d.set_item(*name, *value)?;
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        for name in NAMES.iter() {
+            d.set_item(*name, py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_host_readback_notes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_unsupported_int_dtypes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_host_readback_ops, m)?)?;
@@ -1679,6 +1979,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_probe, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
     m.add_function(wrap_pyfunction!(mps_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_recommended_max_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_driver_allocated_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_current_allocated_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
     Ok(())
 }
 
@@ -1690,12 +1994,21 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // docs/numerics/DTYPEDEV.md §4.2 is the argument; this comment says only what a
 // reader of this file needs.
 //
-// **The fact.** `candle-metal-kernels` 0.11.0 instantiates every one of its
-// kernels for six element types and no others -- `binary.metal`'s `init_binary`
-// macro expands to `f32 f16 bf16 u8 u32 i64`, and `candle_metal_kernels::DType`
-// (`lib.rs`) has exactly those six variants. `I16` and `I32` are not among
-// them, which is a fact about candle's Metal backend and not about Metal: MSL
-// has `short` and `int` and would compile the shaders fine.
+// **The fact.** `candle-metal-kernels` 0.11.0 **as published** instantiates
+// every one of its kernels for six element types and no others --
+// `binary.metal`'s `init_binary` macro expands to `f32 f16 bf16 u8 u32 i64`,
+// and `candle_metal_kernels::DType` (`lib.rs`) has exactly those six variants.
+// `I16` and `I32` are not among them, which is a fact about candle's Metal
+// backend and not about Metal: MSL has `short` and `int` and would compile the
+// shaders fine.
+//
+// **This build vendors a seventh** (2026-09-20, docs/devices/matrix.md §7.17):
+// `vendor/candle-metal-kernels` adds `i8` to those same macros. So the "six"
+// above is the *upstream* count and `MPS_SUPPORTED_DTYPE_NAMES` below is the
+// *build* count, and they differ by `int8`. It also demonstrates the price of
+// closing this gap: 51 lines and no new shader body. `I16`/`I32` are the same
+// shape of change and are still not done -- this comment explains a refusal,
+// not an impossibility.
 //
 // **What that makes an int16/int32 tensor on Metal.** Not "a tensor missing
 // some operators" -- a *sealed buffer*. Measured on this machine, every cast
@@ -1748,9 +2061,18 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// can hand the same answer to a test and the artefact is what gets checked.
 pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 2] = [DType::I16, DType::I32];
 
-/// The six candle instantiates, named in the refusal so the reader learns the
-/// rule and not just this one case.
-const MPS_SUPPORTED_DTYPE_NAMES: &str = "float32, float16, bfloat16, uint8, uint32 and int64";
+/// The dtypes candle instantiates *in this build*, named in the refusal so the
+/// reader learns the rule and not just this one case.
+///
+/// It was six until 2026-09-20 -- the six `candle-metal-kernels` publishes.
+/// `int8` is the seventh and is **this repository's**, from the second
+/// vendored fork (docs/devices/matrix.md §7.17). It has to be listed: a
+/// refusal that tells an `int16` user to widen, while naming a supported set
+/// that omits a dtype this build does in fact support, sends them past the
+/// cheapest answer. That the list is a build property and not candle's is why
+/// this constant exists rather than a literal at the call site.
+const MPS_SUPPORTED_DTYPE_NAMES: &str =
+    "float32, float16, bfloat16, uint8, uint32, int64 and int8";
 
 pub fn is_mps_unsupported_int(dtype: DType) -> bool {
     MPS_UNSUPPORTED_INT_DTYPES.contains(&dtype)

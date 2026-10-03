@@ -1,0 +1,40 @@
+#version 450
+
+// `aten.transpose.int(x, 1, 2)` on a 3-D f32 tensor -- the last two dimensions
+// swapped, once per batch.
+//
+// This is the op an attention block asks for between its two `bmm`s
+// (`k.transpose(1, 2)`), and without it a transformer forward stops one op
+// after `embedding` -- measured, `docs/devices/VULKAN6.md` §3.
+//
+// Same reasoning as `transpose2d_f32.comp`: a `VkTensor` carries a shape and no
+// strides, so the bytes move. Only the *last two* dimensions of a 3-D tensor
+// are handled here; any other pair, and any higher rank, refuses by name in
+// `vulkan.rs` rather than being permuted by some other route.
+//
+//   input  a is [batch, p1, p2] row-major
+//   output c is [batch, p2, p1] row-major
+//   c[b, r, s] = a[b, s, r]
+//
+// Pure data movement: no arithmetic, so the result is bit-identical to the CPU
+// answer by construction and the test asserts exactly that.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: total elements, p1: rows of the input, p2: cols of the input
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint mn = pc.p1 * pc.p2;
+    uint batch = i / mn;
+    uint j = i - batch * mn;
+    uint r = j / pc.p1;          // row of the output, 0 .. p2-1
+    uint s = j - r * pc.p1;      // col of the output, 0 .. p1-1
+    c[i] = a[batch * mn + s * pc.p2 + r];
+}

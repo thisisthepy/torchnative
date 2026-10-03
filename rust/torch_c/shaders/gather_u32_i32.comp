@@ -1,0 +1,49 @@
+#version 450
+
+// `aten.gather.default` -- `docs/devices/VULKAN7.md`.
+//
+// out[coord] = src[coord with coord[dim] replaced by idx[coord]]
+//
+// The output has the index's shape; both the index and the source are
+// contiguous on this device, so output element `i` *is* index element `i`, and
+// the source offset is built from `i`'s multi-index with the source's own
+// strides. BERT's embeddings call this on the int64 `token_type_ids` buffer,
+// so the payload is `uint` for the reason `strided_gather_u32.comp` gives: it
+// is copied, never computed on, and one kernel serves float32 and int32 words
+// alike.
+//
+// No bounds check on `idx` here: the host checks the range recorded at upload
+// before dispatching (docs/devices/VULKAN6.md §2), so an out-of-range index is
+// upstream's error with zero shaders.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { uint a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer I { int idx[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { uint c[]; };
+
+layout(push_constant, std430) uniform Push {
+    uint n;          // output elements (= index elements)
+    uint rank;       // 1..=8
+    uint dim;        // the gathered axis
+    uint unused;
+    uint shape[8];   // index (= output) shape
+    uint stride[8];  // source strides
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint rem = i;
+    uint src = 0u;
+    for (int d = int(pc.rank) - 1; d >= 0; --d) {
+        uint e = pc.shape[d];
+        uint k = rem % e;
+        rem /= e;
+        if (uint(d) == pc.dim) {
+            k = uint(idx[i]);
+        }
+        src += k * pc.stride[d];
+    }
+    c[i] = a[src];
+}

@@ -80,7 +80,7 @@ REPO = Path(__file__).resolve().parents[2]
 # Same default and same variable as tools/wheel/build.py, so the DLLs the
 # imports are resolved against are the ones the wheel was built for.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
 
 #: Wheel tag -> the distribution the imports are resolved against, and the
 #: `pe_info` machine the member must be.
@@ -293,7 +293,7 @@ def check_wheel(wheel: Path) -> int:
 
 # ------------------------------------------------------------------ self-test
 #
-# "실패할 수 없는 검증은 검증이 아니다" (CLAUDE.md §5.5). The resolver above passes
+# "실패할 수 없는 검증은 검증이 아니다" (AGENTS.md §17.5). The resolver above passes
 # on the wheel this repository builds, which on its own says nothing. So it is
 # also run on images it must reject, and on a real Windows CPython extension
 # from the target distribution that it must accept -- the same shape as

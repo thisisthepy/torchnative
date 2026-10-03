@@ -51,9 +51,16 @@ def stage_0_status(model) -> int:
     from torchnative.export import intelnpu
 
     lowered = [m for m in model.modules()
-               if type(m).__name__ == "_NPULinear"]
+               if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP")]
     compiled = [m for m in lowered if getattr(m, "_compiled", None)]
-    shapes = sorted({b for m in lowered for b in getattr(m, "_compiled", {})})
+    # `None` is the dynamic row axis (docs/devices/NPUFUSE.md): one model for
+    # every prompt length. Spelled out rather than sorted alongside the ints.
+    shapes = sorted(
+        ("dynamic" if b is None else str(b))
+        for b in {b for m in lowered for b in getattr(m, "_compiled", {})}
+    )
+    print(f"fused gated MLPs: {len(report.get('fused', []))}  "
+          f"shape modes {report.get('shape_modes')}")
     print(f"lowered leaves  : {len(lowered)}")
     print(f"  compiled so far: {len(compiled)}  for batch shapes {shapes}")
     print(f"  (the rest compile on their first forward -- that is stage 1)")
@@ -75,7 +82,8 @@ def stage_1_forward(model, tokenizer, prompt: str) -> int:
     logits = out.logits if hasattr(out, "logits") else out
     print(f"forward         : {_fmt(dt)}  logits {tuple(logits.shape)}")
 
-    lowered = [m for m in model.modules() if type(m).__name__ == "_NPULinear"]
+    lowered = [m for m in model.modules()
+               if type(m).__name__ in ("_NPULinear", "_NPUGatedMLP")]
     compiled = [m for m in lowered if getattr(m, "_compiled", None)]
     on_npu = [m for m in lowered if m.execution_devices]
     bad = [m for m in on_npu if list(m.execution_devices) != ["NPU"]]

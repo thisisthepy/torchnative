@@ -1,0 +1,130 @@
+{
+ "_what": "docs/architectures/VOICE5.md -- Higgs Audio v2 end to end under the torch._C shim, and against upstream 2.13.0. Regenerate with rust/torch_c/pytests/higgs_e2e.py.",
+ "taken": "2026-09-17",
+ "commit": "0276ae7",
+ "model": {
+  "generation": "bosonai/higgs-audio-v2-generation-3B-base",
+  "tokenizer": "bosonai/higgs-audio-v2-tokenizer",
+  "n_params": 5377281024,
+  "hf_home": "/Volumes/macMini/caches/hf"
+ },
+ "pinned": {
+  "do_sample": false,
+  "num_beams": 1,
+  "seed": 0,
+  "use_cache": true,
+  "lm_dtype": "bfloat16",
+  "audio_tokenizer_dtype": "float32",
+  "max_new_tokens": 64,
+  "prompt": "the model card's Single-speaker smart voice example, add_generation_prompt=True",
+  "input_ids_len": 57
+ },
+ "end_to_end": {
+  "shim_reached_audio": true,
+  "n_samples": 53760,
+  "seconds": 2.24,
+  "shim_t_load_s": 63.3,
+  "shim_t_generate_s": 85.6,
+  "shim_t_decode_s": 0.8,
+  "upstream_t_generate_s": 18.1,
+  "text_sequences_identical": true,
+  "audio_codes_identical": false
+ },
+ "trajectory": {
+  "first_differing_step": 6,
+  "first_differing_codebook": 5,
+  "codes_matching": 85,
+  "codes_total": 512,
+  "tie": {
+   "step": 6,
+   "codebook": 5,
+   "upstream_bf16_token": 75,
+   "shim_bf16_token": 764,
+   "upstream_f32_token": 764,
+   "upstream_bf16_logit_at_upstream_token": 10.25,
+   "upstream_bf16_logit_at_shim_token": 10.25,
+   "upstream_f32_logit_at_upstream_token": 10.192272186279297,
+   "upstream_f32_logit_at_shim_token": 10.269563674926758
+  },
+  "note": "upstream's own top-2 logits are EXACTLY EQUAL in bfloat16 at this position; float32 ranks them apart and agrees with the token the SHIM picked.",
+  "first_differing_step_full_run": 6,
+  "first_differing_codebook_full_run": 5,
+  "prefix_identical_steps": 6,
+  "tie_measured_on": "the 8-step scores run (same prompt, same pinned conditions); the 64-step run diverges at the same (step, codebook)"
+ },
+ "logits": {
+  "per_step": [
+   {
+    "step": 0,
+    "scale": 5.484990119934082,
+    "oracle_rel": 0.007135617948165578,
+    "shim_vs_upstream_rel": 0.0,
+    "shim_vs_f32_rel": 0.007135617948165578,
+    "ratio": 1.0
+   },
+   {
+    "step": 1,
+    "scale": 10.857763290405273,
+    "oracle_rel": 0.011681930648500377,
+    "shim_vs_upstream_rel": 0.002878125002744794,
+    "shim_vs_f32_rel": 0.011681930648500377,
+    "ratio": 1.0
+   },
+   {
+    "step": 2,
+    "scale": 16.307540893554688,
+    "oracle_rel": 0.0035284837812321343,
+    "shim_vs_upstream_rel": 0.0038325827546875687,
+    "shim_vs_f32_rel": 0.004912280311883907,
+    "ratio": 1.3921787987271281
+   },
+   {
+    "step": 3,
+    "scale": 15.337179183959961,
+    "oracle_rel": 0.004706290769458254,
+    "shim_vs_upstream_rel": 0.004075064863646126,
+    "shim_vs_f32_rel": 0.006201826392138687,
+    "ratio": 1.317773740710157
+   },
+   {
+    "step": 4,
+    "scale": 19.370826721191406,
+    "oracle_rel": 0.007017108886151999,
+    "shim_vs_upstream_rel": 0.0064530028480019284,
+    "shim_vs_f32_rel": 0.004380154397073148,
+    "ratio": 0.6242106924857925
+   },
+   {
+    "step": 5,
+    "scale": 15.609650611877441,
+    "oracle_rel": 0.009423395969123722,
+    "shim_vs_upstream_rel": 0.012011799921859273,
+    "shim_vs_f32_rel": 0.009977758301994055,
+    "ratio": 1.0588282965808433
+   },
+   {
+    "step": 6,
+    "scale": 18.343856811523438,
+    "oracle_rel": 0.00915863838949644,
+    "shim_vs_upstream_rel": 0.010221405559719277,
+    "shim_vs_f32_rel": 0.008512015225635366,
+    "ratio": 0.9293974566565864
+   }
+  ],
+  "oracle": "upstream bfloat16 vs upstream float32, same prompt, same prefix"
+ },
+ "waveform": {
+  "n_samples": 53760,
+  "sample_rate": 24000,
+  "scale": 0.6890355348587036,
+  "shim_vs_upstream_f32": 2.065293910138132e-06,
+  "upstream_f32_vs_f64": 2.2150487793475257e-06,
+  "shim_vs_upstream_f64": 2.423364181017329e-06,
+  "ratio": 1.094045514307439,
+  "pearson": 0.9999999999991092,
+  "bit_identical": 1290,
+  "rms_shim": 0.11360748031575375,
+  "rms_upstream": 0.11360748346566428
+ },
+ "torchaudio_stub_calls": []
+}

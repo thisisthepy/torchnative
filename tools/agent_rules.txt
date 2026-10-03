@@ -1,0 +1,34 @@
+HARD RULES — violating any invalidates the round:
+- NEVER create anything outside this repository: no file, directory, symlink, or renamed
+  leftover. That includes /tmp and any scratch directory the harness offers you -- both are
+  outside. Put throwaway files in `.scratch/` (gitignored). If something outside the
+  repository genuinely has to change, do not change it: say what and why, and stop. This
+  is the user's explicit rule, and the coordinating session broke it twice in one day with
+  a symlink and a renamed directory.
+- Never run `git commit`, `git push`, `git merge`, or `git checkout -- <path>`. The coordinating session commits. To back up a file before editing, use `cp file file.bak`, and keep the backup outside the worktree.
+- Never run `git add -A`.
+- Never modify `torchnative/src/main/torch/` — upstream's vendored tree, gitignored, script-generated, silently wiped.
+- Never install anything into .caches/spike-venv (transformers 5.15.1 pinned; do NOT install ml_dtypes). You may read it and run its python.
+- Run long commands in the FOREGROUND. You are headless — there is no next turn, so backgrounding a command and waiting for a notification loses the work entirely.
+- Never read an exit code through a pipe. Redirect to a file, then check $? on its own line. Note `echo "EXIT=$?"` as the last command makes the script's own exit code 0 — read the EXIT= line from the file instead.
+- Never suppress stderr on a command whose success you will rely on. `2>/dev/null` once hid a failing `rm` and the coordinating session read the failure as success.
+- Kill anything you start that does not exit on its own, and never use an unscoped `pkill`. A liveness check with `pgrep -f "pytests/run.sh"` matches your own poller loop — use `kill -0 <captured pid>` instead.
+- A wait loop must match BOTH `pytests/run.sh` and `docwatch/check_docs.py`: run.sh `exec`s into the latter at the end, so matching run.sh alone reports "clear" while a gate is still running. One worktree spent 14+ minutes in DOCWATCH alone.
+- In zsh, `$path` is tied to `$PATH`. Never name a loop variable `path` — reading into it destroys PATH and every later command fails with "command not found".
+- Do NOT leave scratch files in the worktree root. Scratch files named `test_*.py` get picked up as gate suites.
+- Other agents are working in other worktrees. Stay in your territory.
+
+TDD AND PROOF:
+- Write the failing test BEFORE the implementation. A round reporting "tests added: 0" has not met the bar unless it is a measurement-only round that says so.
+- For every new guarantee, break the implementation on purpose and confirm the test goes RED. If gutting the code leaves the test green, the test is worthless — say so and fix it.
+- Build mutants through `vendor/install_shim.sh` so they reach the VENDORED tree, not only the stage. A mutation that looks harmless because a subprocess probe read the unmutated `.so` produces the inverse misdiagnosis.
+- Never widen a tolerance to make something pass. If accuracy falls short, change the arithmetic — one round fixed its own with Kahan-Babuska-Neumaier compensation.
+- An assertion-free test is worse than no test.
+- A suite with no `if __name__ == "__main__":` block defines its tests and calls none. The gate counts it PASSING and the ok count sits exactly at baseline. Confirm the ok count rises by the number of tests you wrote.
+- A test defined below `raise SystemExit(_main())` is never collected. That hid a headline claim for a week.
+- Never make a test pass by changing what it tests.
+- ONE CELL SHAPE CANNOT SPEAK FOR A COLUMN. `clamp` was wrong on Metal from the day `mps` landed while every published table graded it AGREES, because the cell is one shape and that shape has no NaN. This has now caught four rounds.
+- The standard is three grades: builds / reaches / AGREES. Agrees means element-wise agreement with upstream on real inputs, measured in a SEPARATE SUBPROCESS rather than against a table written beside the implementation.
+- Dispatch counters are the only instrument that detects a silent host fallback; values and `.device` labels cannot. `_cuda_counters()`, `_vulkan_counters()` and `_metal_counters()` exist. Assert on them, and state your bracket — counters from different brackets read like regressions side by side.
+
+REPORT, separated and counted: features added / defects fixed / tests added / docs corrected / removed. Do not merge them; a test count is not progress. State explicitly what you did not finish and why. If a count did not move, say so plainly. Finish by running `git status --short` and pasting it verbatim.

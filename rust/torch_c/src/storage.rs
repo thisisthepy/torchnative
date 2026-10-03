@@ -104,16 +104,38 @@ pub struct PyStorageBase {
     /// than answered with a CPU buffer.
     ///
     /// A **meta** storage is the one kind here that has a size and no bytes:
-    /// `buf` is empty, `len` is what the tensor's bytes *would* occupy, and
+    /// `buf` is empty, `meta_len` is what the storage *would* occupy, and
     /// `filled` is false and stays false. It exists because
     /// `torch/_subclasses/meta_utils.py:2071` asks a meta tensor for its
     /// storage in order to key an aliasing memo, and a size-and-identity
     /// handle is exactly what that question wants -- see docs/graph/EXPORT5.md §2 for
     /// which of upstream's expectations it meets and which it refuses by name.
     device: String,
+    /// **A meta storage's size, shared** with every meta tensor that addresses
+    /// it and every other handle to it (docs/graph/STRIDE.md §2). `None` for a
+    /// storage with bytes, whose size is `len`.
+    ///
+    /// Shared because upstream's is: all of these are one `StorageImpl`, and
+    /// `set_` past its end *grows* it (measured), after which every view and
+    /// every handle reports the new size. A plain `usize` per handle would
+    /// have to either refuse the growth or let the objects disagree.
+    meta_len: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl PyStorageBase {
+    /// This storage's size in bytes, now: the shared cell for a meta storage.
+    fn size_bytes(&self) -> usize {
+        match &self.meta_len {
+            Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.len,
+        }
+    }
+
+    /// The shared size cell of a meta storage, for `set_` to adopt and grow.
+    pub fn meta_len_cell(&self) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.meta_len.clone()
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.buf[self.off..self.off + self.len]
     }
@@ -135,6 +157,29 @@ impl PyStorageBase {
         self.device == "meta"
     }
 
+    /// `is_meta`, for `tensor.rs`.
+    ///
+    /// `TensorBase.set_` has to tell a meta storage from a dense one, because
+    /// the two mean different things: a meta storage is a size and an identity
+    /// with no bytes, so adopting it is metadata and nothing else, while an
+    /// unfilled DENSE storage is the silent-zeros failure `docs/models/CKPT.md`
+    /// §4 records. Same method, opposite verdicts, and this is what separates
+    /// them.
+    pub fn is_meta_storage(&self) -> bool {
+        self.is_meta()
+    }
+
+    /// The storage identity token, for `tensor.rs`.
+    ///
+    /// For a meta storage this is `Repr::Meta`'s own `storage_id`, put here by
+    /// `meta()` above. Handing it back on `set_` is what keeps
+    /// `meta_utils.py`'s aliasing memo true: the tensor that adopts the storage
+    /// must answer the same `_cdata` as the storage it adopted.
+    pub fn identity(&self) -> usize {
+        self.origin
+    }
+
+
     /// The refusal a meta storage gives to anything that wants its bytes.
     ///
     /// Separate from `snapshot_is_read_only` because it is a different fact
@@ -149,7 +194,7 @@ impl PyStorageBase {
              which is what meta_utils.py's aliasing memo asks of it; it is not a \
              buffer of zeros standing in for one. Refused rather than answered \
              (docs/graph/EXPORT5.md §2, storage.rs)",
-            self.len
+            self.size_bytes()
         ))
     }
 
@@ -212,6 +257,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
                 origin: 0,
                 filled: false,
                 device: "cpu".to_string(),
+                meta_len: None,
             },
         )?
         .into_any(),
@@ -239,7 +285,11 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
 /// delivered bytes may set it, nothing ever delivers bytes here, and `set_`
 /// refuses on an unfilled storage. So a meta storage cannot be laundered into
 /// a real tensor's bytes by the one path that would produce silent zeros.
-pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyAny>> {
+pub fn meta(
+    py: Python<'_>,
+    nbytes: Arc<std::sync::atomic::AtomicUsize>,
+    storage_id: usize,
+) -> PyResult<Py<PyAny>> {
     let obj = match STORAGE_CLASS.get() {
         Some(cls) => cls.bind(py).call1((0usize,))?,
         None => Bound::new(
@@ -251,6 +301,7 @@ pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyA
                 origin: 0,
                 filled: false,
                 device: "cpu".to_string(),
+                meta_len: None,
             },
         )?
         .into_any(),
@@ -259,7 +310,8 @@ pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyA
         let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
         me.buf = Arc::new(Vec::new());
         me.off = 0;
-        me.len = nbytes;
+        me.len = 0;
+        me.meta_len = Some(nbytes);
         me.origin = storage_id;
         me.filled = false;
         me.device = "meta".to_string();
@@ -293,6 +345,8 @@ fn view_of<'py>(
         me.filled = parent.filled;
         me.origin = parent.origin;
         me.device = parent.device.clone();
+        // A byte range of a storage is not the storage: its size is `len`.
+        me.meta_len = None;
     }
     Ok(obj)
 }
@@ -326,6 +380,7 @@ impl PyStorageBase {
             origin: 0,
             filled: false,
             device,
+            meta_len: None,
         })
     }
 
@@ -534,12 +589,96 @@ impl PyStorageBase {
         Err(self.snapshot_is_read_only("UntypedStorage.__setitem__"))
     }
 
-    #[pyo3(signature = (*_args, **_kwargs))]
-    fn copy_(&self, _args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        if self.is_meta() {
-            return Err(self.meta_has_no_bytes("UntypedStorage.copy_"));
+    /// `UntypedStorage.copy_(source, non_blocking=False)` -- **the fill door,
+    /// not a write door.** docs/architectures/VOICE5.md §5.
+    ///
+    /// This refused unconditionally, and that refusal was reached by the
+    /// ordinary user path: `copy.deepcopy(tensor)` is
+    /// `Tensor.__deepcopy__` -> `UntypedStorage.clone()` ->
+    /// `type(self)(self.nbytes(), device=self.device).copy_(self)`, and
+    /// `transformers.ProcessorMixin.__repr__` deep-copies every attribute it
+    /// holds -- which for `HiggsAudioV2Processor` includes an entire audio
+    /// tokenizer model. So `AutoProcessor.from_pretrained` stopped here,
+    /// before a single operator ran.
+    ///
+    /// The rule this module enforces is **filled once, by the reader that
+    /// delivers the bytes**, and a storage allocated one line earlier by
+    /// `clone()` has not been filled. Filling it is that rule, not an
+    /// exception to it, so exactly that case is accepted and every other
+    /// keeps the refusal it had:
+    ///
+    /// ```text
+    /// destination is meta            refused -- it has no bytes at all
+    /// destination is a SNAPSHOT      refused -- a write would be invisible
+    ///                                to the tensor it was taken from
+    /// destination already filled     refused -- filled once
+    /// destination shares its buffer  refused -- the fill would be visible to
+    ///                                some holders of the alias and not others
+    /// source is not a storage        refused -- nothing to read bytes from
+    /// sizes differ                   refused, with upstream's own wording
+    /// fresh, unshared, unfilled      FILLED, and `filled` is set
+    /// ```
+    ///
+    /// Returns the destination, which is what upstream's `copy_` returns and
+    /// what `storage.py`'s `clone()` relies on (`return type(self)(...)
+    /// .copy_(self)` answers `None` otherwise).
+    #[pyo3(signature = (source = None, non_blocking = false))]
+    fn copy_(
+        slf: &Bound<'_, Self>,
+        source: Option<&Bound<'_, PyAny>>,
+        non_blocking: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = non_blocking;
+        {
+            let me = slf.borrow();
+            if me.is_meta() {
+                return Err(me.meta_has_no_bytes("UntypedStorage.copy_"));
+            }
+            if me.origin != 0 || me.filled {
+                return Err(me.snapshot_is_read_only("UntypedStorage.copy_"));
+            }
         }
-        Err(self.snapshot_is_read_only("UntypedStorage.copy_"))
+        let Some(source) = source else {
+            return Err(slf.borrow().snapshot_is_read_only("UntypedStorage.copy_"));
+        };
+        let Ok(src) = source.cast::<Self>() else {
+            return Err(not_implemented(format!(
+                "torch._C shim: UntypedStorage.copy_(source) where source is a {} -- \
+                 the only source this shim can read bytes from is another \
+                 UntypedStorage (storage.rs)",
+                source.get_type().name()?
+            )));
+        };
+        let bytes = {
+            let src = src.borrow();
+            if src.is_meta() {
+                return Err(src.meta_has_no_bytes("UntypedStorage.copy_(source=...)"));
+            }
+            src.bytes().to_vec()
+        };
+        let mut me = slf.borrow_mut();
+        if bytes.len() != me.len {
+            // Upstream's own wording for a size-mismatched storage copy.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "size mismatch, source has {} bytes and destination has {}",
+                bytes.len(),
+                me.len
+            )));
+        }
+        let off = me.off;
+        let len = me.len;
+        let Some(buf) = Arc::get_mut(&mut me.buf) else {
+            return Err(not_implemented(
+                "torch._C shim: UntypedStorage.copy_ into a storage whose bytes \
+                 are shared with a view -- this shim's views alias, so the fill \
+                 would be visible to some holders and not others. Fill the \
+                 storage before slicing it (see storage.rs)",
+            ));
+        };
+        buf[off..off + len].copy_from_slice(&bytes);
+        me.filled = true;
+        drop(me);
+        Ok(slf.clone().into_any().unbind())
     }
 
     #[pyo3(signature = (*_args, **_kwargs))]
@@ -550,34 +689,33 @@ impl PyStorageBase {
     ) -> PyResult<()> {
         // Upstream's meta storage *does* resize (measured: 2.13.0 resizes a
         // meta storage to 8 bytes and reports it). This one refuses, and that
-        // is a divergence rather than a gap: `len` here is derived from the
-        // meta tensor's shape and dtype at the moment the handle was made, so
-        // a resize would leave the storage and the tensor disagreeing about a
-        // number the tensor is the authority on. docs/graph/EXPORT5.md §2 lists it
-        // among the expectations this handle refuses by name.
+        // is a divergence rather than a gap. docs/graph/EXPORT5.md §2 lists it
+        // among the expectations this handle refuses by name. The size is a
+        // cell shared with the tensors now (docs/graph/STRIDE.md §2), so the
+        // refusal is no longer forced -- `set_` grows it -- but lifting it is
+        // a change of its own, with its own measurement of what upstream does
+        // to the tensors when the storage shrinks.
         if self.is_meta() {
             return Err(not_implemented(format!(
                 "torch._C shim: UntypedStorage.resize_ on a storage of a meta \
-                 tensor. Upstream resizes one; this handle's size ({} bytes) is \
-                 derived from the meta tensor's shape and dtype and is not \
-                 independently settable, so resizing would leave the storage and \
-                 the tensor disagreeing (docs/graph/EXPORT5.md §2)",
-                self.len
+                 tensor. Upstream resizes one; this shim refuses it by name \
+                 (this storage is {} bytes; docs/graph/EXPORT5.md §2)",
+                self.size_bytes()
             )));
         }
         Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
     fn nbytes(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     fn size(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     fn __len__(&self) -> usize {
-        self.len
+        self.size_bytes()
     }
 
     /// `UntypedStorage.filename` reads this (`torch/storage.py:484`). Upstream
@@ -665,6 +803,80 @@ impl PyStorageBase {
         self.base_address()
     }
 
+    /// `storage._weak_ref()` -- the storage identity `StorageWeakRef` keys on.
+    ///
+    /// Reached from `torch.export` through fake mode's constant propagation:
+    /// `_dispatch_impl` -> `from_real_tensor(make_constant=True)` ->
+    /// `add_constant_storage_mapping` -> `StorageWeakRef(...)`.  It was the
+    /// wall standing directly behind `aten.lift_fresh_copy.default`
+    /// (`docs/graph/LIFTFRESH.md`), inherited from `_StorageBase` in the
+    /// vendored tree, whose body is upstream's own bare
+    /// `raise NotImplementedError` -- upstream overrides it on the C
+    /// `UntypedStorage` and this shim did not.
+    ///
+    /// **What the caller needs here is an identity, not a weak reference.**
+    /// `StorageWeakRef.__hash__` and `__eq__` read `cdata` and nothing else,
+    /// and `fake_tensor.py` never calls `_expired` -- it tracks liveness with
+    /// Python `weakref.ref` on the *tensors*.  So this answers `_cdata`, which
+    /// is already this shim's storage identity and already has the relation
+    /// upstream's has: shared between a storage and its views, distinct across
+    /// storages.
+    ///
+    /// Nothing is retained, which is why `_expired` below refuses rather than
+    /// guessing and `_free_weak_ref` has nothing to release.
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _weak_ref(
+        &self,
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> usize {
+        self.base_address()
+    }
+
+    /// `torch.Storage._free_weak_ref(cdata)` -- a no-op, because `_weak_ref`
+    /// retained nothing to free.
+    ///
+    /// It has to exist and it has to not raise: `StorageWeakRef.__del__` calls
+    /// it, and an exception raised in `__del__` is only *ignored* by the
+    /// interpreter, never surfaced -- it would print during interpreter
+    /// shutdown and change nothing else, which is the worst of both.
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _free_weak_ref(_args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) {}
+
+    /// `torch.Storage._expired(cdata)` -- refused, deliberately.
+    ///
+    /// `_weak_ref` hands back an identity and retains nothing, so this shim
+    /// genuinely does not know whether that storage is still alive.  Answering
+    /// `False` ("still alive") is the cheap way to make this return something
+    /// and it is a claim that is wrong exactly when it is load-bearing.
+    ///
+    /// Nothing on the `torch.export` path reaches it, so refusing costs
+    /// nothing today and keeps the limitation visible;
+    /// `test_liftfresh.py::test_expired_still_refuses_rather_than_guessing`
+    /// holds the refusal in place so that answering it later requires a
+    /// liveness mechanism rather than a constant.
+    ///
+    /// Named here rather than left to `_StorageBase._expired`'s bare
+    /// `raise NotImplementedError` for `_write_file`'s reason above: an
+    /// anonymous refusal is the one DESIGN.md §6 forbids, and this shim's
+    /// class is first in the MRO.
+    #[staticmethod]
+    #[pyo3(signature = (*_args, **_kwargs))]
+    fn _expired(
+        _args: &Bound<'_, PyAny>,
+        _kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "UntypedStorage._expired is not implemented in torch._C shim: \
+             `_weak_ref()` answers a storage identity and retains nothing, so \
+             there is no liveness to report. Answering `False` here would be a \
+             guess. Nothing on the torch.export path calls this -- \
+             torch/_subclasses/fake_tensor.py tracks liveness with weakref.ref \
+             on the tensors and uses StorageWeakRef only as a dict key.",
+        ))
+    }
+
     /// The legacy (non-zip) `torch.save` format's writer, and it stays refused.
     ///
     /// `torch.save(obj, f, _use_new_zipfile_serialization=False)` reaches
@@ -745,7 +957,7 @@ impl PyStorageBase {
     fn __repr__(&self) -> String {
         format!(
             "<torch._C.StorageBase {} bytes on {}{}{}>",
-            self.len,
+            self.size_bytes(),
             self.device,
             if self.off == 0 {
                 String::new()

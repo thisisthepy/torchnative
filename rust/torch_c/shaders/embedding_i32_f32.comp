@@ -1,0 +1,41 @@
+#version 450
+
+// `aten.embedding.default` for a float32 table and int32 indices on the device.
+//
+// out[i * D + d] = w[idx[i] * D + d]
+//
+// **Binding 1 is `int`, and that is the whole design change of this round.**
+// Every other kernel in `shaders/` declares three `float` buffers because every
+// other tensor this device stores is float32; an embedding is a gather, and a
+// gather's index operand is an integer. `vulkan.rs` narrows torch's int64 to
+// int32 here (and refuses, by name, any value that does not fit) rather than
+// asking for `shaderInt64` -- measured on this machine, see
+// `_vulkan_probe()["shader_int64"]`.
+//
+// There is deliberately **no bounds check on `idx` here.** A shader cannot
+// raise, and the two things it could do instead -- clamp, or write garbage --
+// are both the silent-wrong-answer failure this device exists to prevent. The
+// range is checked on the host before this dispatch, against the min and max
+// recorded when the indices were uploaded, so an out-of-range index is an
+// `IndexError` with zero shader dispatches.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer W { float w[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer I { int idx[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer O { float o[]; };
+
+// n: total elements in the output (rows * D)
+// p1: D, the embedding dimension (weight.shape[1])
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    uint d = pc.p1;
+    uint row = i / d;
+    uint col = i % d;
+
+    o[i] = w[uint(idx[row]) * d + col];
+}

@@ -54,6 +54,8 @@ __all__ = [
     "CoreMLRefused",
     "CoreMLUnsupported",
     "PRECISIONS",
+    "_build_decoder_subgraph_program",
+    "_group_decoder_layers",
     "compute_plan",
     "computes",
     "coreml_ops",
@@ -64,6 +66,7 @@ __all__ = [
     "to_mil_program",
     "verify",
 ]
+
 
 
 class CoreMLRefused(RuntimeError):
@@ -478,6 +481,327 @@ def _register_all():
     return mb
 
 
+# ---------------------------------------------------------------------------
+# Decoder subgraph lowering: recognise decoder layers, group by weight
+# threshold, and emit one MIL program per group
+# ---------------------------------------------------------------------------
+#
+# ANEDECODE2.md did the measurement; this section does the implementation.
+#
+# The scheduling unit is the compiled program, not the operation, with a
+# threshold near 4.7M weights. A single SmolLM2-135M layer is 3.54M -- under
+# the threshold -- so two layers must be grouped. A Llama-3-8B layer is over
+# 50M, so one suffices alone. The grouping is by weight count, not layer count.
+#
+# The KV cache must live INSIDE the program. Keeping it outside breaks the
+# compiled program at every attention block, leaving a largest contiguous piece
+# of 3.54M -- under the threshold -- so the model falls back to the CPU
+# entirely (ANEDECODE2 §3).
+#
+# This is a NARROW decoder-layer recogniser, not a general tracer. It
+# recognises a specific structure (RMSNorm + Attention with QKV/O projections +
+# MLP with gate/up/down + residuals) and refuses everything else. Everything
+# unrecognised stays on the existing leaf path.
+
+
+#: The ANE weight threshold, measured in ANEDECODE.md §3 and ANEDECODE2 §1.
+#: 8 chained 1x1 convs go to the CPU; 16 go to the Neural Engine. SmolLM2's
+#: single layer is 3.54M (under); two layers are 7.08M (over).
+_ANE_WEIGHT_THRESHOLD = 4_700_000
+
+
+def _group_decoder_layers(layers_info, *, threshold=_ANE_WEIGHT_THRESHOLD):
+    """Group decoder layers until each group's total weight count clears `threshold`.
+
+    `layers_info` is a list of dicts, each with at least a `"weights"` key
+    giving the parameter count for that layer.
+
+    Returns a list of groups, where each group is a list of layer-info dicts.
+    The grouping is greedy: accumulate layers until the running weight total
+    clears the threshold, then start a new group. The last group may be under
+    the threshold if the model's remaining layers do not reach it.
+
+    **This is a weight count, not a layer count.** SmolLM2-135M's layer is
+    3.54M so two are needed; a Llama-3-8B layer is over 50M and clears the
+    threshold alone. A fixed two-layer rule would push 100M+ chunks at the
+    compiler (ANEDECODE2 §1).
+    """
+    if not layers_info:
+        return []
+    groups = []
+    current = []
+    current_weight = 0
+    for info in layers_info:
+        current.append(info)
+        current_weight += info["weights"]
+        if current_weight >= threshold:
+            groups.append(current)
+            current = []
+            current_weight = 0
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _build_decoder_subgraph_program(
+    layer_weights,
+    *,
+    hidden_size,
+    num_heads,
+    kv_heads,
+    head_dim,
+    rms_eps=1e-5,
+    max_seq_len=2048,
+):
+    """Build a MIL program for a multi-layer decoder subgraph.
+
+    `layer_weights` is a list of dicts, one per layer, each containing numpy
+    arrays for the projections and norm weights:
+        "q_proj", "k_proj", "v_proj", "o_proj" -- shape (out, in)
+        "gate_proj", "up_proj", "down_proj"    -- shape (out, in)
+        "input_ln", "post_ln"                  -- shape (hidden,)
+
+    The program takes:
+        - x:          hidden state,    shape (1, hidden, 1, 1) -- rank-4 ANE layout
+        - cos:        RoPE cos,        shape (1, num_heads, 1, head_dim)
+        - sin:        RoPE sin,        shape (1, num_heads, 1, head_dim)
+        - k_cache_i:  per-layer K cache, shape (1, kv_heads, seq, head_dim)
+        - v_cache_i:  per-layer V cache, shape (1, kv_heads, seq, head_dim)
+
+    and returns:
+        - x_out:      hidden state,    shape (1, hidden, 1, 1)
+        - k_out_i:    updated K cache per layer
+        - v_out_i:    updated V cache per layer
+
+    All projections are emitted as 1x1 convolutions over rank-4 tensors,
+    because `ios16.linear` at batch 1 is categorically CPU-preferred while
+    `ios16.conv` is not (ANEDECODE.md §1).
+
+    The KV cache uses symbolic `RangeDim` for the sequence dimension, and
+    `mb.concat` grows it inside the program -- keeping it outside would break
+    the program at every attention block (ANEDECODE2 §3).
+
+    Returns `(program, input_types)` where `input_types` is the list of
+    `ct.TensorType` with `RangeDim` for the cache sequence dimensions, to be
+    passed to `ct.convert(inputs=...)`.
+    """
+    import numpy as np
+    import coremltools as ct
+    from coremltools.converters.mil import Builder as mb
+    from coremltools.converters.mil.mil import get_new_symbol
+
+    n_layers = len(layer_weights)
+    heads_per_group = num_heads // kv_heads
+
+    # Build symbolic dimension for each layer's cache
+    cache_symbols = [get_new_symbol(f"s{i}") for i in range(n_layers)]
+
+    # Input specs for mb.program (static shapes for non-cache, symbolic for caches)
+    input_specs = [
+        mb.TensorSpec(shape=(1, hidden_size, 1, 1)),         # x
+        mb.TensorSpec(shape=(1, num_heads, 1, head_dim)),    # cos
+        mb.TensorSpec(shape=(1, num_heads, 1, head_dim)),    # sin
+    ]
+    for i in range(n_layers):
+        input_specs.append(mb.TensorSpec(shape=(1, kv_heads, cache_symbols[i], head_dim)))
+        input_specs.append(mb.TensorSpec(shape=(1, kv_heads, cache_symbols[i], head_dim)))
+
+    # ct.TensorType input overrides for ct.convert (with RangeDim)
+    input_type_names = ["x", "cos", "sin"]
+    input_types = [
+        ct.TensorType(name="x", shape=(1, hidden_size, 1, 1)),
+        ct.TensorType(name="cos", shape=(1, num_heads, 1, head_dim)),
+        ct.TensorType(name="sin", shape=(1, num_heads, 1, head_dim)),
+    ]
+    for i in range(n_layers):
+        input_type_names.extend([f"k_cache_{i}", f"v_cache_{i}"])
+        input_types.extend([
+            ct.TensorType(
+                name=f"k_cache_{i}",
+                shape=(1, kv_heads, ct.RangeDim(1, max_seq_len), head_dim)),
+            ct.TensorType(
+                name=f"v_cache_{i}",
+                shape=(1, kv_heads, ct.RangeDim(1, max_seq_len), head_dim)),
+        ])
+
+    # Build all input parameter names for the mb.program function
+    param_names = input_type_names
+
+    # Pre-reshape all conv weights to (out, in, 1, 1)
+    all_conv_weights = []
+    for lw in layer_weights:
+        reshaped = {}
+        for key in ("q_proj", "k_proj", "v_proj", "o_proj",
+                     "gate_proj", "up_proj", "down_proj"):
+            w = lw[key]
+            reshaped[key] = w.reshape(w.shape[0], w.shape[1], 1, 1)
+        reshaped["input_ln"] = lw["input_ln"]
+        reshaped["post_ln"] = lw["post_ln"]
+        all_conv_weights.append(reshaped)
+
+    half_dim = head_dim // 2
+
+    def body(inputs):
+        """The MIL body. `inputs` is [x, cos, sin, k0, v0, k1, v1, ...]."""
+        x = inputs[0]
+        cos_input = inputs[1]
+        sin_input = inputs[2]
+
+        cache_outputs = []
+
+        for layer_idx, lw in enumerate(all_conv_weights):
+            k_cache = inputs[3 + layer_idx * 2]
+            v_cache = inputs[3 + layer_idx * 2 + 1]
+
+            # --- RMSNorm (input_layernorm) ---
+            # x is (1, H, 1, 1); norm over axis 1
+            # variance = mean(x^2, axis=1, keepdims=True)
+            x_sq = mb.mul(x=x, y=x)
+            variance = mb.reduce_mean(x=x_sq, axes=[1], keep_dims=True)
+            # rsqrt(variance + eps)
+            var_eps = mb.add(x=variance, y=np.float32(rms_eps))
+            inv_std = mb.rsqrt(x=var_eps)
+            x_norm = mb.mul(x=x, y=inv_std)
+            # Scale by learned weight: (H,) -> (1, H, 1, 1)
+            ln_w = lw["input_ln"].reshape(1, hidden_size, 1, 1)
+            x_norm = mb.mul(x=x_norm, y=ln_w)
+
+            # Save residual
+            residual = x
+
+            # --- Q, K, V projections (1x1 conv) ---
+            q = mb.conv(x=x_norm, weight=lw["q_proj"],
+                        strides=[1, 1], pad_type="custom",
+                        pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+            k = mb.conv(x=x_norm, weight=lw["k_proj"],
+                        strides=[1, 1], pad_type="custom",
+                        pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+            v = mb.conv(x=x_norm, weight=lw["v_proj"],
+                        strides=[1, 1], pad_type="custom",
+                        pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+
+            # Reshape Q: (1, num_heads*head_dim, 1, 1) -> (1, num_heads, 1, head_dim)
+            q = mb.reshape(x=q, shape=[1, num_heads, 1, head_dim])
+            # Reshape K: (1, kv_heads*head_dim, 1, 1) -> (1, kv_heads, 1, head_dim)
+            k = mb.reshape(x=k, shape=[1, kv_heads, 1, head_dim])
+            # Reshape V: same as K
+            v = mb.reshape(x=v, shape=[1, kv_heads, 1, head_dim])
+
+            # --- RoPE ---
+            # q: (1, num_heads, 1, head_dim)
+            # Split into first half and second half along last dim
+            q1 = mb.slice_by_index(
+                x=q, begin=[0, 0, 0, 0], end=[1, num_heads, 1, half_dim],
+                begin_mask=[True, True, True, False],
+                end_mask=[True, True, True, False])
+            q2 = mb.slice_by_index(
+                x=q, begin=[0, 0, 0, half_dim], end=[1, num_heads, 1, head_dim],
+                begin_mask=[True, True, True, False],
+                end_mask=[True, True, True, False])
+            neg_q2 = mb.mul(x=q2, y=np.float32(-1.0))
+            rot_q = mb.concat(values=[neg_q2, q1], axis=3)
+            q = mb.add(x=mb.mul(x=q, y=cos_input),
+                       y=mb.mul(x=rot_q, y=sin_input))
+
+            # RoPE for K (kv_heads)
+            cos_kv = mb.slice_by_index(
+                x=cos_input, begin=[0, 0, 0, 0],
+                end=[1, kv_heads, 1, head_dim],
+                begin_mask=[True, False, True, True],
+                end_mask=[True, False, True, True])
+            sin_kv = mb.slice_by_index(
+                x=sin_input, begin=[0, 0, 0, 0],
+                end=[1, kv_heads, 1, head_dim],
+                begin_mask=[True, False, True, True],
+                end_mask=[True, False, True, True])
+
+            k1 = mb.slice_by_index(
+                x=k, begin=[0, 0, 0, 0], end=[1, kv_heads, 1, half_dim],
+                begin_mask=[True, True, True, False],
+                end_mask=[True, True, True, False])
+            k2 = mb.slice_by_index(
+                x=k, begin=[0, 0, 0, half_dim], end=[1, kv_heads, 1, head_dim],
+                begin_mask=[True, True, True, False],
+                end_mask=[True, True, True, False])
+            neg_k2 = mb.mul(x=k2, y=np.float32(-1.0))
+            rot_k = mb.concat(values=[neg_k2, k1], axis=3)
+            k = mb.add(x=mb.mul(x=k, y=cos_kv),
+                       y=mb.mul(x=rot_k, y=sin_kv))
+
+            # --- KV cache concat ---
+            k = mb.concat(values=[k_cache, k], axis=2)
+            v = mb.concat(values=[v_cache, v], axis=2)
+            cache_outputs.extend([k, v])
+
+            # --- GQA: repeat KV heads ---
+            k_exp = mb.expand_dims(x=k, axes=[2])
+            k_rep = mb.tile(x=k_exp, reps=[1, 1, heads_per_group, 1, 1])
+            k_rep = mb.reshape(x=k_rep, shape=[1, num_heads, -1, head_dim])
+
+            v_exp = mb.expand_dims(x=v, axes=[2])
+            v_rep = mb.tile(x=v_exp, reps=[1, 1, heads_per_group, 1, 1])
+            v_rep = mb.reshape(x=v_rep, shape=[1, num_heads, -1, head_dim])
+
+            # --- Attention ---
+            # Q: (1, num_heads, 1, head_dim)
+            # K_rep: (1, num_heads, seq+1, head_dim)
+            k_T = mb.transpose(x=k_rep, perm=[0, 1, 3, 2])
+            attn_weights = mb.matmul(x=q, y=k_T)
+            scale = np.float32(1.0 / np.sqrt(head_dim))
+            attn_weights = mb.mul(x=attn_weights, y=scale)
+            attn_probs = mb.softmax(x=attn_weights, axis=3)
+            attn_out = mb.matmul(x=attn_probs, y=v_rep)
+
+            # attn_out: (1, num_heads, 1, head_dim) -> (1, hidden, 1, 1)
+            attn_out = mb.reshape(x=attn_out, shape=[1, hidden_size, 1, 1])
+
+            # --- O projection (1x1 conv) ---
+            attn_out = mb.conv(x=attn_out, weight=lw["o_proj"],
+                               strides=[1, 1], pad_type="custom",
+                               pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+
+            # --- Residual ---
+            x = mb.add(x=residual, y=attn_out)
+
+            # --- RMSNorm (post_attention_layernorm) ---
+            residual = x
+            x_sq = mb.mul(x=x, y=x)
+            variance = mb.reduce_mean(x=x_sq, axes=[1], keep_dims=True)
+            var_eps = mb.add(x=variance, y=np.float32(rms_eps))
+            inv_std = mb.rsqrt(x=var_eps)
+            x_norm = mb.mul(x=x, y=inv_std)
+            ln_w = lw["post_ln"].reshape(1, hidden_size, 1, 1)
+            x_norm = mb.mul(x=x_norm, y=ln_w)
+
+            # --- MLP: SwiGLU ---
+            gate = mb.conv(x=x_norm, weight=lw["gate_proj"],
+                           strides=[1, 1], pad_type="custom",
+                           pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+            gate = mb.silu(x=gate)
+            up = mb.conv(x=x_norm, weight=lw["up_proj"],
+                         strides=[1, 1], pad_type="custom",
+                         pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+            down_in = mb.mul(x=gate, y=up)
+            down = mb.conv(x=down_in, weight=lw["down_proj"],
+                           strides=[1, 1], pad_type="custom",
+                           pad=[0, 0, 0, 0], dilations=[1, 1], groups=1)
+
+            # --- Residual ---
+            x = mb.add(x=residual, y=down)
+
+        return [x] + cache_outputs
+
+    # Build the program with dynamically named parameters
+    namespace = {"body": body}
+    exec(  # noqa: S102 -- parameter names built from layer count, not user input
+        f"def program({', '.join(param_names)}):\n"
+        f"    return body([{', '.join(param_names)}])\n",
+        namespace,
+    )
+    program = mb.program(input_specs=input_specs)(namespace["program"])
+    return program, input_types
+
+
 def to_mil_program(trace, *, fold: bool = True):
     """Emit `trace` as a MIL program. Returns `(program, input_names, trace)`.
 
@@ -715,6 +1039,24 @@ class CoreMLUnsupported(NotImplementedError):
     """Something is refused by name: a leaf, a precision, or an empty lowering."""
 
 
+class ComputePlanRefused(RuntimeError):
+    """CoreML declined to construct a compute plan at all.
+
+    Raised by `compute_plan` in place of the bare `RuntimeError` that
+    `MLComputePlan.load_from_path` throws, so that callers can catch **this**
+    condition without also catching every other RuntimeError CoreML can
+    produce -- a bare `except RuntimeError` around a plan read would swallow
+    real lowering failures and let a broken model through silently.
+
+    It is a distinct condition from a plan that loads and names no device for
+    its operations; that one comes back as `UNKNOWN` rows. Measured
+    2026-09-17: the 211-leaf naive path raised this on 1 run in 4, while the
+    same leaf compiled alone answered 12 of 12 under both `ComputeUnit.ALL`
+    and `CPU_AND_NE` -- so neither the program nor the compute-unit argument
+    is established as the cause, and nothing this library passes provoked it.
+    """
+
+
 #: The two spellings, and the whole set of them. A precision outside this is a
 #: refusal and not a fallback -- an argument accepted and dropped is how a mode
 #: goes silent, which is the failure docs/graph/NPU2.md is about.
@@ -832,9 +1174,19 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
         package = os.path.join(directory, "m.mlpackage")
         model.save(package)
         compiled = os.path.join(directory, "m.mlmodelc")
-        plan = MLComputePlan.load_from_path(
-            ct_utils.compile_model(package, compiled),
-            compute_units=compute_units)
+        # Named rather than left as a bare RuntimeError. See
+        # `ComputePlanRefused`: this is CoreML declining to build the plan,
+        # which is a different fact from the plan coming back empty, and the
+        # callers that must survive it have to be able to catch *it* and not
+        # every RuntimeError a lowering can raise.
+        try:
+            plan = MLComputePlan.load_from_path(
+                ct_utils.compile_model(package, compiled),
+                compute_units=compute_units)
+        except ComputePlanRefused:
+            raise
+        except RuntimeError as error:
+            raise ComputePlanRefused(str(error)) from error
         function = plan.model_structure.program.functions["main"]
         rows = []
         for operation in function.block.operations:
@@ -1169,6 +1521,68 @@ _UNKNOWN_PLAN = (
 )
 
 
+#: Said once per model when CoreML declined to build a plan at all.
+#:
+#: Deliberately a *different* string from `_UNKNOWN_PLAN`, because the two are
+#: different conditions and they send a reader to different places. An unknown
+#: plan is CoreML answering "no device for any operation" -- docs/graph/NPU2.md
+#: §9.1's artefact-identity measurement. A refusal never gets as far as an
+#: artefact to identify: `MLComputePlan.load_from_path` raises
+#: `Failed to construct compute plan, internal failure.` before a plan exists.
+#:
+#: Measured 2026-09-17 on a quiet machine: the 211-leaf naive path raised this
+#: on 1 run in 4, while the same leaf compiled on its own answered 12 of 12
+#: under both `ALL` and `CPU_AND_NE`. So it is not a property of the program
+#: and not one of the compute-unit argument -- nothing here provoked it, and
+#: nothing here can be set to avoid it.
+#:
+#: What it does NOT say is the point. No unit, no precision: reading a refusal
+#: as "CPU" is how a CPU-bound model gets reported as an offloaded one, and
+#: blaming the precision would send the caller to change a setting that has
+#: nothing to do with it.
+_REFUSED_PLAN = (
+    "torchnative coreml: CoreML **refused** to construct a compute plan for "
+    "this program -- MLComputePlan.load_from_path raised {detail} -- so "
+    "**what ran is unknown**. This is a different failure from a plan that "
+    "comes back naming no device for its operations (see `_UNKNOWN_PLAN` and "
+    "docs/graph/NPU2.md \u00a79.1): there, CoreML answered and the answer was "
+    "empty; here it declined to answer at all, and no argument this library "
+    "passes provoked it. Do not read it as CPU and do not read it as "
+    "offloaded -- there is no evidence either way. The lowering succeeded and "
+    "the forward below this warning ran and returned a real answer; the plan "
+    "is a diagnostic read and only the question \"which unit\" is "
+    "unanswered. Refusals are recorded on the model as "
+    "`.torchnative_offload['refused']`."
+)
+
+
+def _say_refused(report, detail) -> None:
+    """Say that CoreML declined to build a plan. Once per model.
+
+    Once per model and not per shape for the reason `_say_unknown` is: a leaf
+    compiles per shape, the naive path has 211 of them, and the measured
+    failure raised while many were compiling. A sentence per leaf per shape is
+    a wall a caller filters out, and this is the sentence that stands between
+    "unknown" and a caller who believes the Neural Engine ran it.
+
+    Also **records** the refusal on the report, rather than only warning.
+    A warning can be suppressed; the record is what a test can assert on, and
+    telling "CoreML refused" apart from "the answer was CPU" is the whole
+    reason this function is separate from `_say_unknown`.
+    """
+    import warnings
+
+    report.setdefault("refused", []).append(str(detail))
+    if report.get("_refused_warned"):
+        return
+    report["_refused_warned"] = True
+    warnings.warn(
+        _REFUSED_PLAN.format(detail=detail),
+        UserWarning,
+        stacklevel=4,
+    )
+
+
 #: Said once per model, by whoever gets there first. Held as one string
 #: because `_compile_model` says it at `to()` time for a leaf it could probe
 #: and `_say_what_ran` says it at the first forward for one it could not, and
@@ -1269,6 +1683,13 @@ class _CoreMLLinear:
             self._bias_np = _np(self.bias) if self.bias is not None else None
         return self._weight_np, self._bias_np
 
+    #: The input shape a batch-1 program is given, as a function of
+    #: `in_features`. Rank 4, `(B, C, 1, S)`, which is Apple's
+    #: `ml-ane-transformers` layout and the shape `mb.conv` needs.
+    @staticmethod
+    def _rank4(in_features):
+        return (1, in_features, 1, 1)
+
     def _compile_for(self, batch: int, *, probe: bool = False):
         if batch in self._compiled:
             return self._compiled[batch]
@@ -1281,9 +1702,39 @@ class _CoreMLLinear:
         if bias is not None:
             kwargs["bias"] = bias
 
-        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, self.in_features))])
-        def program(x):
-            return mb.linear(x=x, **kwargs)
+        if batch == 1:
+            # docs/graph/ANEDECODE.md: a rank-2 `ios16.linear` at batch 1 is
+            # CPU-*preferred* at every output width measured, up to 49152, and
+            # stays CPU-preferred in a program holding 64 of them. The same
+            # arithmetic as a 1x1 `ios16.conv` over `(1, C, 1, 1)` is not --
+            # 576->49152 crosses to the Neural Engine. So the form is the
+            # variable and the size is not, which is why this is a rewrite and
+            # not a threshold.
+            #
+            # **Only at batch 1**, and that bound is measured too, in the
+            # opposite direction: `(1, 576, 1, S)` conv stays CPU-preferred out
+            # to S=128 while a rank-2 `linear` at batch 128 is
+            # NeuralEngine-preferred. Applying this above batch 1 would trade
+            # the prefill result docs/graph/NPU2.md §8.2 reports as working for
+            # nothing. `_compile_for` is keyed by batch, so the two forms never
+            # meet.
+            #
+            # It costs no accuracy: the dot products are identical and the
+            # 576->576 output is bit-for-bit what the linear form produced.
+            kwargs["weight"] = weight.reshape(
+                self.out_features, self.in_features, 1, 1)
+            spec = mb.TensorSpec(shape=self._rank4(self.in_features))
+
+            @mb.program(input_specs=[spec])
+            def program(x):
+                return mb.conv(x=x, strides=[1, 1], pad_type="custom",
+                               pad=[0, 0, 0, 0], dilations=[1, 1], groups=1,
+                               **kwargs)
+        else:
+            @mb.program(
+                input_specs=[mb.TensorSpec(shape=(batch, self.in_features))])
+            def program(x):
+                return mb.linear(x=x, **kwargs)
 
         units = self._units()
         model = ct.convert(
@@ -1295,7 +1746,23 @@ class _CoreMLLinear:
                                else ct.precision.FLOAT16),
             compute_units=units,
         )
-        rows = compute_plan(model, compute_units=units)
+        # A refused plan is a refused *diagnostic*. The model compiled and
+        # predicts; reading the plan is how this library answers "which unit",
+        # and CoreML declining to answer that is not a reason to destroy the
+        # caller's forward. It used to be: the RuntimeError came out of
+        # `model(x)` and ended the process's work. See `ComputePlanRefused`.
+        #
+        # Not swallowed, and not retried. There is no plan record appended --
+        # an empty `plans` list is not the same claim as a plan whose rows are
+        # all unknown -- the refusal is recorded on the report by name, and
+        # `_say_refused` says it. Nothing below reads a unit out of it,
+        # because there is nothing to read.
+        try:
+            rows = compute_plan(model, compute_units=units)
+        except ComputePlanRefused as error:
+            self._compiled[batch] = model
+            _say_refused(self._report, error)
+            return model
         self._report.setdefault("plans", []).append({
             "leaf": "linear", "batch": batch,
             "shape": [batch, self.in_features],
@@ -1321,8 +1788,13 @@ class _CoreMLLinear:
         for dim in shape[:-1]:
             batch *= dim
         model = self._compile_for(batch)
-        feed = _feed_buffer(self._feeds, batch, (batch, self.in_features))
-        feed[...] = _np(x.detach()).reshape(batch, self.in_features)
+        # The batch-1 program is a rank-4 conv, so the buffer it is fed has to
+        # be rank 4 as well. `_feed_buffer` is keyed by batch and the two ranks
+        # never share a key, because `_compile_for` never emits both for one.
+        fed = (self._rank4(self.in_features) if batch == 1
+               else (batch, self.in_features))
+        feed = _feed_buffer(self._feeds, batch, fed)
+        feed[...] = _np(x.detach()).reshape(fed)
         produced = list(_predict(
             model,
             {model.get_spec().description.input[0].name: feed}).values())[0]
@@ -1465,7 +1937,23 @@ class _CoreMLConv2d:
                                else ct.precision.FLOAT16),
             compute_units=units,
         )
-        rows = compute_plan(model, compute_units=units)
+        # A refused plan is a refused *diagnostic*. The model compiled and
+        # predicts; reading the plan is how this library answers "which unit",
+        # and CoreML declining to answer that is not a reason to destroy the
+        # caller's forward. It used to be: the RuntimeError came out of
+        # `model(x)` and ended the process's work. See `ComputePlanRefused`.
+        #
+        # Not swallowed, and not retried. There is no plan record appended --
+        # an empty `plans` list is not the same claim as a plan whose rows are
+        # all unknown -- the refusal is recorded on the report by name, and
+        # `_say_refused` says it. Nothing below reads a unit out of it,
+        # because there is nothing to read.
+        try:
+            rows = compute_plan(model, compute_units=units)
+        except ComputePlanRefused as error:
+            self._compiled[shape] = model
+            _say_refused(self._report, error)
+            return model
         self._report.setdefault("plans", []).append({
             "leaf": "conv2d", "shape": list(shape),
             "probe": bool(probe), "rows": rows,

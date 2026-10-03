@@ -127,7 +127,7 @@ class DelegateWithdrawn(DelegateRefused):
 
     A subclass of `DelegateRefused` on purpose: everything that already caught
     a refusal from this layer keeps catching it, and the withdrawal reads as
-    what it is -- a refusal that names itself and its reason, per CLAUDE.md §6.
+    what it is -- a refusal that names itself and its reason, per AGENTS.md §18.
     """
 
 

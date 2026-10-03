@@ -1,0 +1,31 @@
+#version 450
+
+// `aten.mul.Scalar` and `aten.div.Scalar` for f32: out[i] = a[i] * s, a[i] / s.
+//
+// The scalar arrives in the push constants as its *bit pattern*, not as a
+// buffer: `dispatch_kernel` pushes four `uint`s, and `uintBitsToFloat` is an
+// exact reinterpretation, so the value the shader divides by is bit-for-bit
+// the float32 the host held. A one-element staging buffer would cost an
+// allocation and an upload per call to say the same thing.
+//
+// Two ops in one kernel and not four: `a / s` must stay a division rather than
+// becoming `a * (1/s)`, because the reciprocal is a rounding upstream does not
+// do -- the same class of rewrite MoltenVK's fast-math was turned off for
+// (docs/devices/VULKAN5.md §3.1). `p2` picks which, and both are the exactly
+// rounded IEEE operation, so both are asserted bit-identical to upstream.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: elements, p1: the scalar's float32 bits, p2: 0 = multiply, 1 = divide
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float s = uintBitsToFloat(pc.p1);
+    c[i] = (pc.p2 == 0u) ? (a[i] * s) : (a[i] / s);
+}

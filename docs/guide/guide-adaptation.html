@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test-time adaptation · torchnative</title>
+<meta name="description" content="torchnative runs the real PyTorch and transformers on device by replacing only torch._C.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Sans+KR:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
+<link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/mark.svg" type="image/svg+xml">
+<script src="assets/site.js"></script>
+</head>
+<body>
+<header class="top"><div class="top-inner">
+<a class="brand" href="index.html"><svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/><rect x="3" y="9.75" width="18" height="4.5" rx="1.5" fill="#e8590c"/><rect x="3" y="16.5" width="18" height="4.5" rx="1.5" fill="currentColor" opacity="0.28"/></svg><span class="brand-name" translate="no">torchnative</span></a>
+<span class="spacer"></span>
+<button class="toggle" id="lang-toggle" type="button" aria-label="Language / 언어"><span data-lang="en">한국어</span><span data-lang="ko">English</span></button>
+<button class="toggle" id="theme-toggle" type="button" aria-label="Theme / 테마"><span data-lang="en">Theme</span><span data-lang="ko">테마</span></button>
+</div></header>
+<div class="layout">
+<aside class="side"><details open><summary><span data-lang="en">Contents</span><span data-lang="ko">목차</span></summary><nav aria-label="Guide"><ul><li class="group"><span data-lang="en">Start</span><span data-lang="ko">시작</span></li><li><a href="index.html"><span data-lang="en">Home</span><span data-lang="ko">홈</span></a></li><li><a href="getting-started.html"><span data-lang="en">Getting started</span><span data-lang="ko">시작하기</span></a></li><li><a href="concepts.html"><span data-lang="en">Concepts</span><span data-lang="ko">개념</span></a></li><li class="group"><span data-lang="en">Guides</span><span data-lang="ko">가이드</span></li><li><a href="guide-inference.html"><span data-lang="en">Inference</span><span data-lang="ko">추론</span></a></li><li><a href="guide-adaptation.html"><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></a></li><li><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span></a></li><li><a href="guide-federated.html"><span data-lang="en">Federated learning</span><span data-lang="ko">연합학습</span></a></li><li class="group"><span data-lang="en">Project</span><span data-lang="ko">프로젝트</span></li><li><a href="ecosystem.html"><span data-lang="en">Ecosystem</span><span data-lang="ko">생태계</span></a></li><li><a href="status.html"><span data-lang="en">Status &amp; FAQ</span><span data-lang="ko">현황과 FAQ</span></a></li><li><a href="contributing.html"><span data-lang="en">Contributing</span><span data-lang="ko">기여하기</span></a></li></ul></nav></details></aside>
+<main><div class="content">
+
+<span class="eyebrow"><span data-lang="en">Guide</span><span data-lang="ko">가이드</span></span>
+<h1><span data-lang="en">Test-time adaptation</span><span data-lang="ko">테스트 타임 적응</span></h1>
+<p class="lede" data-lang="en">A model that ships to a device meets data its training set never had. Let it adapt in place — and be able to take it back.</p><p class="lede" data-lang="ko">기기로 간 모델은 학습 데이터에 없던 데이터를 만납니다. 제자리에서 적응하게 하고, 언제든 되돌릴 수 있게 합니다.</p>
+
+<h2><span data-lang="en">Wrap, serve, revert</span><span data-lang="ko">감싸고, 서빙하고, 되돌리기</span></h2>
+<pre><code><span class="k">from</span> torchnative <span class="k">import</span> adapt
+
+model = adapt.wrap(model, method=adapt.Tent(), lr=1e-3)
+model.online()      <span class="c"># adapt as it serves</span>
+...
+model.revert()      <span class="c"># the base weights are back, byte for byte</span></code></pre>
+<p data-lang="en"><code>Tent</code> minimises prediction entropy over the normalisation weights. On SmolLM2-135M, ten steps took entropy on unlabelled text from 4.1604 to 2.9828, and a held-out sentence fell from 3.7237 to 2.9439, agreeing with upstream's own autograd to a median relative 1.5e-06.</p><p data-lang="ko"><code>Tent</code> 는 정규화 가중치에 대해 예측 엔트로피를 최소화합니다. SmolLM2-135M 에서 열 스텝이 레이블 없는 텍스트의 엔트로피를 4.1604 에서 2.9828 로, 한 번도 적응에 쓰지 않은 문장을 3.7237 에서 2.9439 로 낮췄고, upstream autograd 와 중앙 상대오차 1.5e-06 으로 일치했습니다.</p>
+
+<h2><span data-lang="en">Two stages</span><span data-lang="ko">두 단계</span></h2>
+<div class="table-wrap"><table>
+<thead><tr><th><span data-lang="en">Stage</span><span data-lang="ko">단계</span></th><th><span data-lang="en">Needs backward</span><span data-lang="ko">역전파 필요</span></th><th><span data-lang="en">Example</span><span data-lang="ko">예</span></th></tr></thead>
+<tbody>
+<tr><td>0</td><td><span data-lang="en">no</span><span data-lang="ko">아니오</span></td><td><span data-lang="en"><code>adapt.BatchNormStats()</code> — re-estimate normalisation statistics</span><span data-lang="ko"><code>adapt.BatchNormStats()</code> — 정규화 통계 재추정</span></td></tr>
+<tr><td>1</td><td><span data-lang="en">yes</span><span data-lang="ko">예</span></td><td><span data-lang="en"><code>adapt.Tent()</code> — entropy minimisation</span><span data-lang="ko"><code>adapt.Tent()</code> — 엔트로피 최소화</span></td></tr>
+</tbody></table></div>
+<p data-lang="en">A method declares only what it moves, what it descends and which stage it is. The delta owns everything else — revert, write and read back — so no method reimplements <code>reset()</code> or checkpointing.</p><p data-lang="ko">방법은 무엇을 움직이고, 무엇을 내려가며, 어느 단계인지만 선언합니다. 나머지 — 되돌리기, 쓰고 다시 읽기 — 는 델타가 소유하므로 어떤 방법도 <code>reset()</code> 이나 체크포인팅을 다시 구현하지 않습니다.</p>
+
+<div class="note"><p data-lang="en">The controls are part of the claim: the same loop with the sign flipped sends entropy up, <code>lr=0</code> holds it to the last digit, and an objective on a detached tensor is refused by name. A loop that silently does nothing would pass any test that only checks it finished.</p><p data-lang="ko">대조군도 주장의 일부입니다: 부호를 뒤집으면 엔트로피가 올라가고, <code>lr=0</code> 은 마지막 자리까지 그대로이며, 분리된 텐서 위의 목적함수는 이름으로 거부됩니다. 아무것도 안 하는 루프는 끝났는지만 보는 테스트를 모두 통과하기 때문입니다.</p></div>
+
+<div class="pager"><a href="guide-inference.html">← <span data-lang="en">Inference</span><span data-lang="ko">추론</span></a><a href="guide-accelerators.html"><span data-lang="en">Accelerators &amp; NPUs</span><span data-lang="ko">가속기와 NPU</span> →</a></div>
+</div></main>
+</div>
+<footer><div class="top-inner">
+<span><span data-lang="en">Apache-2.0 · part of the thisisthepy ecosystem</span><span data-lang="ko">Apache-2.0 · thisisthepy 생태계의 일부</span></span>
+<span class="spacer"></span>
+<a href="https://github.com/thisisthepy/torchnative" translate="no">GitHub</a>
+</div></footer>
+</body>
+</html>

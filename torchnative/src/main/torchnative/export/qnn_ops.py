@@ -21,7 +21,7 @@ absent from the table and named in `UNVERIFIED` instead.
 
 Where these facts came from (see `docs/devices/QNNOPS.md` for the full audit
 trail): a real ExecuTorch wheel is installed at
-`/Volumes/macMini/caches/qnn-venv` --- `executorch==1.4.1`
+`/Volumes/macMini/thisisthepy/torchnative/.caches/qnn-venv` --- `executorch==1.4.1`
 (`executorch-1.4.1.dist-info`), macosx_14_0_arm64. Its
 `executorch/backends/qualcomm/builders/op_*.py` files are the QNN backend's
 **node visitors**: each one registers itself (`@register_node_visitor`) against
@@ -60,7 +60,7 @@ __all__ = [
 #: later round can tell whether the table is stale against a newer wheel.
 EXECUTORCH_VERSION = "1.4.1"
 SOURCE_PACKAGE = (
-    "/Volumes/macMini/caches/qnn-venv/lib/python3.13/site-packages/executorch"
+    "/Volumes/macMini/thisisthepy/torchnative/.caches/qnn-venv/lib/python3.13/site-packages/executorch"
     "-1.4.1.dist-info (executorch==1.4.1, macosx_14_0_arm64 wheel)"
 )
 

@@ -51,7 +51,7 @@ Same definition as `verify_android.py`, for the same reasons:
     is checked to be inside site-packages anyway.
 
 The distribution is **copied** to a scratch prefix first. The one under
-`/Volumes/macMini/caches/target-python/` is shared with other work in this repository
+`/Volumes/macMini/thisisthepy/torchnative/.caches/target-python/` is shared with other work in this repository
 and unpacking a wheel into its site-packages would be a side effect on everyone else.
 
 What this cannot answer
@@ -84,9 +84,9 @@ from verify_android import unpack, stage_dependencies  # noqa: E402
 
 TARGET_PYTHON = Path(os.environ.get(
     "TARGET_PYTHON_IOS_SIM",
-    "/Volumes/macMini/caches/target-python/arm64-iphonesimulator"))
+    "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python/arm64-iphonesimulator"))
 SCRATCH = Path(os.environ.get(
-    "IOS_SIM_SCRATCH", "/Volumes/macMini/caches/ios-wheel-check"))
+    "IOS_SIM_SCRATCH", "/Volumes/macMini/thisisthepy/torchnative/.caches/ios-wheel-check"))
 
 LAUNCHER_C = r'''/* A real python3.13 for the iOS simulator.
    Py_BytesMain is CPython's whole CLI entry point, so this binary parses

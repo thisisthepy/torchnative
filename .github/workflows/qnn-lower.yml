@@ -36,7 +36,7 @@
 # of a CI job careful about the boundary between what it ran and what it
 # proved. The verification logic is NOT in this file: it is
 # `tools/ci/qnn_lower.py`, tested by `rust/torch_c/pytests/test_qnnci.py` on a
-# machine that has no executorch. CLAUDE.md §5.5 -- logic that lives only in a
+# machine that has no executorch. AGENTS.md §17.5 -- logic that lives only in a
 # `run: |` block can never be tested, only pushed and watched.
 name: qnn lower
 
@@ -47,7 +47,7 @@ on:
         description: >-
           Qualcomm chipset to build the HTP context binary for. Must be a name
           in ExecuTorch's own QcomChipset table. The default is the device this
-          project actually has (CLAUDE.md §7, docs/devices/QNN.md §5.1: Galaxy Tab S9
+          project actually has (AGENTS.md §19, docs/devices/QNN.md §5.1: Galaxy Tab S9
           Ultra, ro.soc.model=SM8550, HTP v73) and NOT the SM8650 the doc's
           example line uses -- SM8650 is HTP v75, and an artefact built for v75
           is refused by v73 at backend init with the method load aborting
@@ -225,7 +225,7 @@ jobs:
           # raise bare would end the job with a traceback whose top frame is
           # some op builder -- so it is caught, and the WALL IS NAMED via
           # `qnn_aot_refusal()`, which reports which module is missing.
-          # CLAUDE.md §6: refusals give their name and their reason.
+          # AGENTS.md §18: refusals give their name and their reason.
           try:
               import executorch.backends.qualcomm  # noqa: F401
           except Exception:

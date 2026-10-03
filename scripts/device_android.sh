@@ -21,7 +21,7 @@
 # cmd_parity, and docs/devices/DEVICE.md §5.1 for what that costs.
 #
 # Nothing here installs an app or touches anything outside /data/local/tmp. The
-# emulator is shared with other projects (CLAUDE.md: one device test at a time).
+# emulator is shared with other projects (AGENTS.md: one device test at a time).
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -32,12 +32,12 @@ crate=$repo/rust/torch_c
 # `vendor/torch`. Read the same variable so the two cannot drift apart.
 vendor_root=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/src/main}
 
-: "${CARGO_TARGET_DIR:=/Volumes/macMini/caches/cargo-target-device}"
+: "${CARGO_TARGET_DIR:=/Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target-device}"
 : "${ANDROID_SDK_ROOT:=$HOME/Library/Android/sdk}"
 : "${ANDROID_NDK_HOME:=$ANDROID_SDK_ROOT/ndk/27.1.12297006}"
-: "${TARGET_PYTHON:=/Volumes/macMini/caches/target-python/aarch64-linux-android/prefix}"
-: "${SPIKE_SITE:=/Volumes/macMini/caches/spike-venv/lib/python3.13/site-packages}"
-: "${HOST_PYTHON:=/Volumes/macMini/caches/spike-venv/bin/python}"
+: "${TARGET_PYTHON:=/Volumes/macMini/thisisthepy/torchnative/.caches/target-python/aarch64-linux-android/prefix}"
+: "${SPIKE_SITE:=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/lib/python3.13/site-packages}"
+: "${HOST_PYTHON:=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python}"
 : "${DEVICE_ROOT:=/data/local/tmp/bw_device}"
 export CARGO_TARGET_DIR
 

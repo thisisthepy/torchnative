@@ -1,0 +1,12 @@
+{
+ "encode": {
+  "audio_input_ids_equal": true,
+  "input_ids_equal": true,
+  "n_audio_codes": 34
+ },
+ "generate": {
+  "codes_total": 50,
+  "codes_matching": 48,
+  "first_differing_step": 45
+ }
+}

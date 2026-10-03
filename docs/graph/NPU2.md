@@ -1,0 +1,1985 @@
+# NPU2 — which unit actually ran it, and the blob on a real NNAPI runtime
+
+
+### 11.6 The fix: assert the verdict CoreML gave, report the one it withheld
+
+Because nothing here can make CoreML answer, the test must distinguish the two
+outcomes and rest its claim only on the first:
+
+* every graph CoreML **did** name devices for is held to the full claim —
+  `preferred == CPU`, and `NeuralEngine` absent from the supported column.
+  Nothing is relaxed for them, and a silent graph never excuses a
+  `NeuralEngine` verdict in a loud one.
+* every graph CoreML **declined** to name is reported by name, as a refusal.
+* **a floor under the evidence**: at least two of the three graphs must have
+  answered. This is §9.4's "at least two shapes must answer", and it is what
+  keeps the whole claim from being satisfied on a machine where
+  `MLComputePlan` says nothing at all — a reachable state, since §10.4
+  established it depends on free disk.
+
+The floor is a floor and not a tolerance. It is exercised on synthetic plans
+(`test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs`)
+so it cannot drift vacuous on a day when CoreML happens to be talkative, and a
+companion test pins the loophole shut: a `NeuralEngine` verdict fails even when
+another graph is silent.
+
+What this deliberately does **not** do:
+
+* no retry, at any level. A second attempt that happened to answer would hide
+  exactly the condition §10.4 needs visible.
+* no widening to accept an empty plan unconditionally. The empty plan is
+  accepted only under an asserted condition — that enough *other* graphs
+  answered — which is the difference between a guard and a hole.
+* no skip and no deletion. The failing run still fails; it fails when the
+  evidence is too thin, rather than when CoreML is quiet about one graph.
+
+The sentence the gate now prints for the silent case names the refusal:
+
+    CoreML named no compute device for {'sigmoid': ['ios16.sigmoid']} --
+    reported, not asserted; ['cnn_conv_pool_relu', 'mlp_gelu_softmax']
+    answered and carry the claim (floor 2).
+
+which is the distinction §11.3 restored, doing its job.
+
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py verify_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py run_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py devices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py build_runner present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py DEVICE_DIR present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_runner.c ANeuralNetworksCompilation_createForDevices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_runner.c ANeuralNetworksModel_getSupportedOperationsForDevices present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_coreml_models_docs_npu_executed_ran_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_graph_executes_on_the_neural_engine_and_agrees_with_replay present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_conv_relu_blob_executes_on_nnapi_and_agrees_with_replay present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_whole_model_executes_on_nnapi_and_the_control_is_orders_larger present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_driver_that_does_not_claim_the_operations_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_executing_on_a_device_widened_nothing present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_device_module_refuses_to_guess_which_emulator_to_use present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLLinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py _lower_for_coreml present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLConv2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _eligible_conv2d present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_conv2d_lowers_to_coreml_instead_of_being_left_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_unknown present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_plan_with_no_rows_at_all_warns_that_what_ran_is_unknown present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_full_offload_is_still_silent present -->
+
+## 1. The headline: the CoreML models docs/graph/NPU.md executed ran on the **CPU**
+
+`docs/graph/NPU.md` §2 recorded the `.mlpackage` as **executed** — compiled by macOS,
+run through `MLModel.predict`, agreeing with `DecomposedTrace.replay` at
+2–3e-08. Every word of that is true. It is also not the sentence
+"ran on the NPU", and this round's first job was to find out which one it was.
+
+`MLModel` chooses among three units, and `MLComputePlan` is CoreML's own answer
+to which one it picked. Read for all three of docs/graph/NPU.md's float32 graphs
+(`MLComputePlan.load_from_path`, `ComputeUnit.ALL`, per operation):
+
+| graph | operations | preferred | supported |
+|---|---|---|---|
+| `mlp_gelu_softmax` | `linear`, `gelu`, `linear`, `softmax` | **CPU** | CPU, GPU |
+| `cnn_conv_pool_relu` | `conv`, `reduce_mean`, `relu` | **CPU** | CPU, GPU |
+| `sigmoid` | `sigmoid` | **CPU** | CPU, GPU |
+
+**The Neural Engine is not in the supported column at all.** Not "available but
+not preferred" — CoreML does not offer the unit for these programs, so no
+`compute_units` setting could have reached it. The machine has one:
+`MLComputeDevice.get_all_compute_devices()` returns Neural Engine, GPU and CPU.
+
+### 1.1 And the reason is the flag docs/graph/NPU.md was right to set
+
+`compile_model(float32=True)` is not a detail there either — §6 of that
+document measured coremltools' float16 default disagreeing with replay by
+2.3e-04 against 3.0e-08, and pinned float32 so a numerical claim would mean
+what it says.
+
+That pin *is* what puts the Neural Engine out of reach. The same CNN, both
+precisions, one `MLComputePlan` read each:
+
+| | `conv` supported devices | `conv` preferred |
+|---|---|---|
+| `float32=True` | CPU, GPU | CPU |
+| `float32=False` (float16) | CPU, GPU, **NeuralEngine** | CPU |
+
+The Neural Engine is float16 hardware. So the two claims docs/graph/NPU.md wanted are
+**mutually exclusive on one run**: float32 buys a 3e-08 agreement and forfeits
+the NPU; float16 reaches the NPU and the agreement becomes a float16 agreement.
+`test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach` measures both
+on one model, so the comparison cannot be confounded by graph shape.
+
+None of this is a defect in docs/graph/NPU.md. It is a distinction that document did
+not draw, and drawing it is what this round is for.
+
+## 2. A graph that does execute on the Neural Engine
+
+Three convolutions and a pool at 64×64, at float16, compiled with
+`ComputeUnit.CPU_AND_NE` so the GPU is not an option:
+
+```
+ios16.cast          CPU           (boundary conversion)
+ios16.conv          NeuralEngine
+ios16.relu          NeuralEngine
+ios16.conv          NeuralEngine
+ios16.relu          NeuralEngine
+ios16.conv          NeuralEngine
+ios16.relu          NeuralEngine
+ios16.reduce_mean   NeuralEngine
+ios16.relu          NeuralEngine
+ios16.cast          CPU
+```
+
+Every compute operation is on the Neural Engine; only the two `cast` operations
+at the boundary stay on the CPU. It then **runs**, 128 outputs, compared
+element-wise against `DecomposedTrace.replay`:
+
+| run | max abs diff vs `replay` |
+|---|---|
+| `CPU_AND_NE` | **2.0e-04** |
+| `CPU_ONLY`, same package | 7.7e-05 |
+| the two against **each other** | **1.2e-04** |
+
+2.0e-04 is float16, and it is the same order docs/graph/NPU.md measured for the
+float16 default (2.3e-04). That is the honest tolerance for an NPU claim here,
+not a regression.
+
+**The third row is the one that makes this evidence rather than a plan.** A
+compute plan is a statement of intent; identical outputs from the two runs
+would be exactly what it would look like if the Neural Engine plan were being
+ignored. They are not identical, and the size of the difference is the size
+half precision produces. The test asserts that difference is non-zero and says
+in its message what a zero would mean.
+
+### 2.1 Why the small models stayed on the CPU even at float16
+
+The CNN of §1.1 has the Neural Engine in its *supported* set at float16 and
+still gets `preferred: CPU`. The wide model does not. Nothing was changed
+between them except size — 3→8 channels at 16×16 against 3→64→128→128 at 64×64.
+The planner is weighing dispatch cost against work, and below some amount of
+work the CPU wins. That is CoreML's decision and this document reports it
+rather than arguing with it; the consequence for a reader is only that
+"reaches the Neural Engine" is a property of a *model*, not of this lowering.
+
+**No timing is reported here.** Four agents were running on this machine while
+these numbers were taken, and docs/devices/MPS.md and docs/devices/VULKAN3.md both record why a
+throughput number measured like that is worse than no number.
+
+### 2.2 And now `to(torchnative.device.npu)` lowers for it
+
+Everything above is a measurement of artefacts built by hand in a test. The
+device namespace could see the hardware and not use it: on this machine
+`device.npu.availability()` returned `available=True, kind=measured` and
+`resolve()` named the Apple Neural Engine through the `coreml` backend, and
+then `model.to(device.npu)` raised `NotImplementedError` — only the `openvino`
+arm had been wired. `torchnative.export.coreml` now has the equivalent of
+`intelnpu.plan_lowering` and `_compile_model`, and `device/_module_to.py` has
+the dispatch arm.
+
+**There is no float32 road to the unit, and that was checked rather than
+assumed.** coremltools' `compute_precision` accepts exactly three things
+(`converters/_converters_entry.py`): `precision.FLOAT32` (no transform),
+`precision.FLOAT16` (cast everything), and
+`transform.FP16ComputePrecision(op_selector=...)` — which is a *subset selector
+for the float16 cast*, not a third precision and not a float32 route. Nothing
+in the API asks for float32 on the Neural Engine, because the Neural Engine is
+float16 hardware. Measured here for `ios16.linear` at three sizes, one
+`MLComputePlan` read each:
+
+| program | precision | preferred | supported |
+|---|---|---|---|
+| `linear` (1, 1024→1024) | float32 | CPU | CPU, GPU |
+| `linear` (1, 4096→4096) | float32 | CPU | CPU, GPU |
+| `linear` (128, 1024→1024) | float32 | GPU | CPU, GPU |
+| `linear` (1, 1024→1024) | float16 | CPU | CPU, GPU, **NeuralEngine** |
+| `linear` (1, 4096→4096) | float16 | CPU | CPU, GPU, **NeuralEngine** |
+| `linear` (128, 1024→1024) | float16 | **NeuralEngine** | CPU, GPU, **NeuralEngine** |
+
+The float32 rows are the §1.1 finding again on a different operator: the unit is
+absent from the *supported* column at every size, so this is a property of the
+precision and not of the size. The float16 rows add §2.1's: the unit is
+supported at every size and *preferred* only once there is enough work, which
+is why batch 1 goes to the CPU and batch 128 does not.
+
+**So they are two products, and therefore two spellings.**
+
+```python
+model.to(torchnative.device.npu)                        # float16
+model.to(torchnative.device.npu, precision="float32")   # float32
+```
+
+With the grades stated rather than averaged. Both through `coreml.verify`,
+which runs the compiled model and compares against `DecomposedTrace.replay`,
+on one `Linear(1024, 1024)` at batch 128 with `ComputeUnit.CPU_AND_NE`:
+
+| spelling | max abs diff vs `replay` | grade | unit |
+|---|---|---|---|
+| `precision="float32"` | **2.7e-06** | **agrees** (≤ 2e-05) | CPU / GPU |
+| `precision="float16"` | **1.5e-03** | agrees *at float16* | **Neural Engine** |
+
+2e-05 is `verify`'s own default and is where docs/graph/NPU.md set it; it is the
+bar the word *agrees* means in this project, and the float16 path does not meet
+it. That is reported and not papered over by widening one tolerance to cover
+both — 1.5e-03 is larger than §2's 2.0e-04 because a `Linear(1024, 1024)`
+accumulates over 1024 terms where that CNN did not, and it is half precision
+behaving exactly as half precision does.
+
+**Nothing succeeds without saying what ran.** `MLComputePlan` is read at every
+compile, not optionally, and the per-operation rows land on
+`model.torchnative_offload["plans"]` keyed by the shape that produced them —
+because §2.1 means "which unit" is not answerable until there is a real shape.
+Two things warn, and only these two, so that silence stays informative:
+
+* at `to()`, when the chosen precision puts the unit out of the supported
+  column entirely (`precision="float32"`), since that is decided by the
+  precision and not the shape;
+* at the forward that compiles a new shape, when the unit *is* supported and
+  CoreML preferred something else anyway.
+
+The eager batch-1 compile does not warn. It is a probe this code chose the
+shape for, and warning that CoreML preferred the CPU for a shape nobody asked
+for is noise; its plan is still recorded, marked `probe: True`.
+
+**Linear only, and conv is named rather than half-done.** `supported_ops()` has
+a MIL lowering for `aten.convolution.default` and conv leaves are still left on
+the CPU and reported, because a conv leaf's program cannot be built without its
+input's spatial dimensions and those are not knowable at `to()` time. A
+Linear's can: batch is the only free dimension. Widening this needs a shape
+source, not a bigger table.
+
+Zero leaves lowered raises, as on the Intel arm. `rust/torch_c/pytests/test_anepath.py`
+holds all of it, and each guarantee was nullified individually and seen to go
+red.
+
+## 3. NNAPI, executed — and by which driver
+
+docs/graph/NPU.md §2 put the NNAPI blob under **structurally validated** and said
+plainly why: "There is no NNAPI runtime on a Mac." That is still true of the
+Mac. It is not true of the Android emulators already on this machine.
+
+### 3.1 What was missing was one program
+
+`nnapi.py` ends at `parse_model`, which decodes the blob back through the
+layout `serialize_model` wrote. That proves the *layout* and says nothing about
+arithmetic — a `_SIGNATURES` entry in the wrong position decodes perfectly and
+computes something else, which is why `verify_shapes` exists.
+
+`nnapi_runner.c` is the other half. It reads the same layout and replays it
+into `ANeuralNetworksModel`: every operand, every immediate, every weight
+buffer and every opcode comes out of the blob. It is a **replayer, not a
+converter** — there is no second lowering on the device that could agree with
+the first by sharing a mistake, the same reason `verify_shapes` compares
+against capture rather than against a recomputation.
+
+`nnapi_device.py` builds it with the NDK, pushes it, runs it, pulls the output
+bytes back and compares them against `DecomposedTrace.replay`.
+
+Two layout details are not incidental, because getting either wrong produces a
+disagreement that *looks* arithmetic:
+
+* **Weights are not in the blob.** A `NUMBERED_BUFFER` value carries
+  `(buf_num, offset, size)` and the bytes live in `used_weights[buf_num]`,
+  already permuted to NHWC where the operand is CHANNELS_LAST. They travel in a
+  side file, each buffer length-prefixed.
+* **Shapes in the blob are NNAPI's, not PyTorch's** — upstream ran `fix_shape`
+  over them. So an input operand marked CHANNELS_LAST is fed NHWC, and an
+  output operand marked CHANNELS_LAST has the *reference* permuted to match
+  rather than the device's answer reshaped. Reshaping would make a layout error
+  agree on the first element and look like noise afterwards.
+
+### 3.2 Which driver answered
+
+Read from the device with `ANeuralNetworks_getDeviceCount`, not assumed:
+
+| name | type | version | feature level |
+|---|---|---|---|
+| `nnapi-sample_all` | 2 | `JUST_AN_EXAMPLE` | 1000008 |
+| `nnapi-sample_quant` | 2 | `JUST_AN_EXAMPLE` | 1000008 |
+| `nnapi-sample_sl_shim` | 2 | `JUST_AN_EXAMPLE` | 1000008 |
+| `nnapi-reference` | 2 | 13818094 | 1000008 |
+
+**These are all software.** `nnapi-reference` is the runtime's own CPU
+reference implementation; the three `nnapi-sample_*` are the sample drivers the
+emulator image ships, and they report their version as `JUST_AN_EXAMPLE`. No
+hardware accelerator is present on an emulator, and this document does not
+claim one. What it claims is that the blob upstream's serialiser wrote is
+accepted by a real NNAPI runtime and computes the right numbers — which is the
+thing that was untested, and which a driver swap does not change.
+
+The driver is *chosen*, with `ANeuralNetworksCompilation_createForDevices`,
+rather than left to the runtime. So "which driver ran this" is a decision this
+side made and can report, not an observation it has to infer.
+
+### 3.3 `Conv2d → ReLU`
+
+436-byte blob, 9 operands, 2 operations, 256 output elements.
+
+| driver | operations claimed | max abs diff vs `replay` |
+|---|---|---|
+| `nnapi-reference` | 2/2 | **1.2e-07** |
+| `nnapi-sample_all` | 2/2 | 1.2e-07 |
+| `nnapi-sample_sl_shim` | 2/2 | 1.2e-07 |
+
+All three drivers are run, not one, so a result that depended on a particular
+software implementation would show up as a disagreement between them.
+
+### 3.4 The whole model — docs/graph/REFOLD.md §4's deliverable, executed
+
+`Conv → BatchNorm → ReLU → Conv → ReLU6 → AdaptiveAvgPool → Linear → Softmax`,
+folded and constant-folded exactly as that document describes, is the same
+artefact it was:
+
+```
+pairs folded  1
+bytes         1156
+opcodes       CONV_2D(3) RELU(19) CONV_2D(3) RELU6(21)
+              AVERAGE_POOL_2D(1) RESHAPE(22) FULLY_CONNECTED(9) SOFTMAX(25)
+outside nnapi.supported_ops()   0
+```
+
+and it now runs. `nnapi-reference`, 8/8 operations claimed, 5 outputs:
+
+| | |
+|---|---|
+| device vs `replay`, same input | **~3e-08** (1.5e-08 and 3.0e-08 on two runs) |
+| device vs `replay`, **different** input | **7.2e-02** |
+
+> **docs/graph/REFOLD.md §4's line moves.** That section carries a blockquote saying
+> "Still structurally validated, not executed. There is no NNAPI runtime on a
+> Mac; docs/graph/NPU.md §2 draws that line and nothing here moves it." This does.
+
+### 3.5 The control, and the version of it that would have been worthless
+
+The first attempt at that second row gave **7.3e-04**, not 7.2e-02, and it
+would have been a bad check. A softmax over a randomly-initialised `Linear(4,5)`
+is nearly uniform — every output sits near 0.2 whatever the input is — so
+feeding the device the *wrong picture entirely* moved the answer by less than a
+thousandth. A 1e-4 tolerance would then have been passing on the model's
+flatness rather than on the device's arithmetic, with only a factor of seven
+between "right" and "completely wrong".
+
+Widening the last layer's initialisation spreads the output (`0.106, 0.018,
+0.099, 0.281, 0.495` instead of five numbers near 0.2) and the control moves to
+7.2e-02 — **six orders of magnitude above the agreement.** The test requires
+four. AGENTS.md §17.5: this is the same shape as the `padding=1, stride=1`
+convolution in docs/graph/NPU.md §4 whose fault injection was the identity.
+
+### 3.6 The negative control for the driver selection itself
+
+`nnapi-sample_quant` is a quantised-only sample driver.
+`ANeuralNetworksModel_getSupportedOperationsForDevices` reports it claiming
+**0 of 8** operations and the compilation fails, so `verify_on_device` refuses
+by name with that line in the message. If it ever succeeded, the device name
+would not be deciding anything and every "this driver ran it" sentence above
+would be unfounded.
+
+That is also why the runner reports `supports N/M` before compiling: a driver
+with partial support would otherwise fall back invisibly and the answer would
+be attributed to the wrong device.
+
+## 4. What this round did **not** widen
+
+docs/graph/REFOLD.md left a standing warning — it measured `mobilenet_v2` getting
+*worse* under a bigger table, 203 nodes to 1,191, and told the next person that
+more ops lowering is not automatically progress.
+
+**Nothing here widens anything, and that is checked rather than asserted.**
+`nnapi.supported_ops()` is the same **25** overloads it was, pinned by value in
+`test_executing_on_a_device_widened_nothing`, and the whole model still has
+zero ops outside it. No entry was added to `_SIGNATURES`; no decomposition or
+refold rule changed; no Rust changed, so the golden harness is untouched at
+11385/11385, ops=300.
+
+Split the way AGENTS.md §17.3 asks:
+
+| | |
+|---|---|
+| **feature added** | `nnapi_device.py` + `nnapi_runner.c` — execution of an NNAPI blob on a device |
+| **claim corrected** | docs/graph/NPU.md's executed CoreML claim is a CPU claim; docs/graph/REFOLD.md §4's "not executed" no longer holds |
+| **coverage added** | **none** — 25 serialisable overloads before and after |
+| **tests added** | 9, in `rust/torch_c/pytests/test_npu2.py` |
+
+## 5. What is still missing, and how big it is
+
+* **No hardware NNAPI accelerator was reached.** Everything in §3 is a software
+  driver on an emulator. Reaching a real NPU needs a physical Android device
+  with a vendor driver, which is a hardware acquisition and not a code change.
+  Nothing else about the path would differ: the same blob, the same runner, the
+  same `createForDevices` call with a different name.
+* **NNAPI is deprecated.** The runtime is present and complete on API 36 (via
+  `/apex/com.android.neuralnetworks/lib64/libneuralnetworks.so`) but Android 15
+  deprecated it for new development. Whatever succeeds this path on Android,
+  the serialiser work is not wasted — but a future round should not assume the
+  API keeps growing.
+* **The API-26 emulator cannot be used for this.** NNAPI arrives at API 27;
+  `libneuralnetworks.so` is simply absent on 26. That is why §6 says API 36.
+* **One CoreML claim cannot be made at once.** §1.1: float32 agreement and
+  Neural Engine execution exclude each other. A round that wants both needs
+  either a float32 accuracy claim on the CPU *and* a separate float16 claim on
+  the Neural Engine — which is what §1 and §2 are — or a way to bound the
+  float16 error against the float32 answer, which is a numerical-analysis
+  question and not an export question.
+* **The Neural Engine only takes large enough models** (§2.1). A future round
+  that wants "our lowering runs on the NPU" for a *small* model will find the
+  planner declining, and that is not something the lowering can fix.
+
+## 6. Reproducing
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-npu2
+export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
+export TORCH_C_STAGE=/tmp/stage-npu2
+PY=/Volumes/macMini/caches/spike-venv/bin/python
+
+cd rust/torch_c && cargo build --release && cd -
+bash vendor/install_shim.sh
+
+# The NNAPI half needs a device with API >= 27. `pmp_api26` cannot run it.
+emulator -avd pmp_api36 -port 5556 -no-window -no-audio -no-snapshot-save &
+export ANDROID_SERIAL=emulator-5556        # required; never inferred
+export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
+adb wait-for-device
+
+PYTHON=$PY sh rust/torch_c/pytests/run.sh
+```
+
+Without `ANDROID_SERIAL` the NNAPI tests **skip by name**, saying that this
+module will not guess which shared emulator to use; without `coremltools` the
+CoreML tests skip saying so. docs/devices/VULKAN3.md §6.1 is why both skip lines name
+the missing thing: a skip with a false reason is counted as a pass.
+
+The emulators here are shared with other projects. This round wrote only inside
+`/data/local/tmp/bw_device`, removed every file it pushed, and **installed no
+app** — docs/devices/VULKAN3.md §4's precedent for using what is already on disk
+without modifying it.
+
+## 7. Which module types are worth lowering, measured per type
+
+§4 left `Linear` as the only lowered leaf and named the obstacle for the next
+one: a conv's MIL program needs spatial dimensions that are not knowable at
+`to()` time. This section answers that, and it answers a question §4 did not
+ask — **which types reach the unit at all**. An op lowered to CoreML that
+CoreML then runs on the CPU is a tensor round trip bought for nothing.
+
+### 7.1 The sweep: `MLComputePlan` per candidate op, both precisions
+
+One MIL program per op, converted at each precision, compiled by the OS, and
+read through `MLComputePlan` with `ComputeUnit.ALL`. Boundary `cast`s dropped.
+
+| op | shape | float32 supported | float16 supported | float16 preferred |
+|---|---|---|---|---|
+| `linear` | 128x1024 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x64x32x32 -> 128 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `conv` | 1x128x32x32 -> 256 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x64x64x64 -> 64 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x3x224x224 -> 64, s2 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | depthwise, groups=64 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `layer_norm` | up to 1024x4096 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `batch_norm` | 1x64x32x32 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `batch_norm` | 32x256x64x64 | CPU, GPU | CPU, GPU, **NE** | GPU |
+| `relu`, `gelu` | up to 1024x4096 | CPU, GPU | CPU, GPU, **NE** | CPU / GPU |
+| `softmax` | up to 1x32x512x512 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `max_pool` | up to 32x256x64x64 | CPU, GPU | CPU, GPU, **NE** | CPU / GPU |
+| `matmul` | 1x8x128x64 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `matmul` | 1x32x512x64 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `gather` (embedding) | 1000x256 | CPU, GPU | **CPU, GPU** | CPU |
+
+Three things fall out of it, and none of them is visible from "it compiled":
+
+1. **float32 never reaches the unit, for any op.** §1.1 measured that for
+   `linear`; it holds for every op in the table. The two spellings stay two
+   products.
+2. **Only the compute-bound ops are ever *preferred* on the unit.** `conv`,
+   `linear` and a large enough `matmul` cross over with size; the
+   memory-bound ones — norms, activations, softmax, pooling — list the unit as
+   supported at every size tried and CoreML picks the CPU or the GPU anyway.
+3. **`gather` does not list the unit at all**, at either precision. An
+   embedding table is not an ANE candidate here, and no amount of size changes
+   that.
+
+### 7.2 What that bought: `Conv2d` lowers, and the rest are refused by a number
+
+`nn.Conv2d` is now a second lowered leaf type (`_CoreMLConv2d`). Measured on
+`Conv2d(128, 256, 3, padding=1)` at `(1, 128, 32, 32)`, through
+`to(torchnative.device.npu)` and the report it attaches:
+
+| precision | `ios16.conv` preferred | supported | `coreml.verify` vs `replay` | tolerance |
+|---|---|---|---|---|
+| float16 | **NeuralEngine** | CPU, GPU, NeuralEngine | 1.26e-03 | float16 grade |
+| float32 | CPU | CPU, GPU | **4.5e-06** | meets verify's 2e-05 |
+
+The float32 number is `verify`'s own default bar and no tolerance was widened
+to reach it. The float16 number is a 576-term sum in half precision and is
+given its own, weaker, named grade — the same two-grade split §1.1 introduced.
+
+The shape obstacle turned out to **generalise rather than block**. A Linear is
+already compiled per shape and cached, because a MIL input spec is static; a
+conv needs the same cache with a wider key, and nothing else changes. What
+does not generalise is the **eager probe**: batch 1 is a shape this library
+may choose and a spatial size is not, so a conv leaf is *deferred* —
+`report["deferred"]` names it at `to()` time, no plan exists for it until the
+first forward, and the plan that then appears is keyed by the shape that
+actually ran. The float32 "this precision cannot reach the unit" warning
+therefore lands at the first forward for a conv and at `to()` for a Linear;
+one flag on the report keeps it from being said twice.
+
+**Not lowered, each with its obstacle:**
+
+| type | obstacle |
+|---|---|
+| `LayerNorm` | no MIL lowering here for `aten.native_layer_norm.default` at all, and its three outputs are not the shape `_BUILDERS` takes. Even with one, 7.1 says CPU. |
+| `ReLU`, `GELU`, `SiLU`, `Sigmoid`, `Tanh` | lowerings exist and the unit is supported — and never preferred. A leaf swap buys a tensor round trip and does not reach the unit. |
+| `Softmax`, `MaxPool2d`, `AvgPool2d` | same as above, measured. |
+| `BatchNorm2d` | same, and in `eval()` it is normally folded into the conv in front of it (docs/graph/REFOLD.md), so a leaf for it is the wrong granularity. |
+| `Embedding` | `gather` does not list the Neural Engine as supported at either precision. |
+| `ConvTranspose2d` | `conv_transpose` is a different MIL op with its own padding convention; unmapped rather than approximated. |
+| `Conv2d` with `padding_mode != "zeros"` | `pad_type="custom"` is *zero* padding; a reflect/replicate pad is a separate `mb.pad`, and emitting zeros would be wrong only at the border — the worst kind of wrong. Skipped **by name**, not silently. |
+| `Conv2d` with a string `padding` | `"same"`/`"valid"` resolve against the input's spatial size, and the selection runs where there is no input. |
+| `Conv1d`, `Conv3d` | this leaf emits a 2-D convolution; a 4-D weight is required and anything else is refused. |
+
+Everything in that table is still **named** in `left_on_cpu` or `skipped`, a
+partial offload still warns, and zero leaves lowered is still a refusal.
+
+### 7.3 Two things that broke, now fixed
+
+**The segfault.** The test fixture reproducibly **segfaulted at interpreter
+shutdown** after marshalling a 1024x4096 tensor through `coreml._np`, which
+went via `tolist()` and built four million Python floats. The same defect
+family hit `intelnpu.py` as a `MemoryError` (docs/devices/INTELNPU.md), and the
+root cause is the same: `tolist()` in Rust builds `N` `PyFloat` objects via
+`pyo3::ffi::PyFloat_FromDouble`, then nests them in Python lists. At
+interpreter shutdown, pyo3's module finalization and CPython's GC teardown walk
+millions of these objects, and the ordering between pyo3's module state and
+CPython's type deallocation is not guaranteed — a `tp_dealloc` for a
+`pyo3`-managed type can fire after the module's state has been freed, which
+dereferences a dangling pointer.
+
+The fix is `torch._C._shim_tensor_bytes`: it reads the candle storage directly
+(flatten, contiguify, copy to a single `bytes` object), and `np.frombuffer`
+wraps the result without building any Python scalar objects. For a 1024x4096
+float32 tensor that is 16 MB of bytes instead of ~128 MB of `PyFloat` heap.
+The numerical result is bit-identical: float32 and float64 are IEEE-754 in both
+candle and numpy, int32 and int64 are two's-complement little-endian in both,
+and bool is a single byte. `verify()`'s claims are unaffected — neither
+widened nor narrowed.
+
+**The tempfile leak.** `compute_plan` called `tempfile.mkdtemp` and never
+cleaned up. 277 directories were left behind after the test round. Fixed with a
+`try/finally` wrapping `shutil.rmtree(directory, ignore_errors=True)`.
+
+Tests: 7 in `rust/torch_c/pytests/test_npmarshal.py`. Three nullifications, each
+red on the test it targets: (1) force `_np` back to `tolist()` and the heap test
+goes red (peak 731 KB vs limit 240 KB), (2) make `_shim_tensor_bytes` return
+empty bytes and the dtype test fails with a reshape error, (3) remove the
+`finally: rmtree` and the tempdir test finds a leaked directory.
+
+### 7.4 Split the way AGENTS.md §17.3 asks
+
+| | |
+|---|---|
+| **feature added** | `_CoreMLConv2d` — `nn.Conv2d` lowers, compiled per input shape, deferred until the first forward |
+| **claim corrected** | "conv cannot be lowered because its shape is unknown at `to()` time" — the shape is unknown, and per-shape compilation already answered that for `Linear` |
+| **coverage added** | one leaf type (two, from one). `supported_ops()` is unchanged: `aten.convolution.default` already had a MIL lowering |
+| **rejections recorded** | eight types, each with the measurement or the missing lowering that decided it (§7.2) |
+| **tests added** | 7, in `rust/torch_c/pytests/test_coremlops.py`; five nullifications, each red on the test it targets |
+
+## 8. The first real model: bfloat16, and what a decode step actually gets
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _WIDENED_DTYPES present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_float16_is_in_the_map_too_and_is_not_a_second_refusal present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_widening_keeps_bfloat16s_range_which_a_float16_route_would_lose present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_no_smollm2_weight_leaves_float16s_range_so_the_cast_loses_no_value present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_path_a_user_types_survives_its_own_first_forward present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_second_forward_at_another_shape_also_survives_and_is_not_stale present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py _NAIVE_SCRIPT present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _feed_buffer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _predict present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _RETAINED_FEEDS present -->
+
+§7 landed two leaf types and measured the Neural Engine running them. Every
+module it was measured on was built here, in float32. The obvious next thing
+was a real one:
+
+```python
+m = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
+                                         dtype="auto")
+m.to(torchnative.device.npu)
+#  CoreMLRefused: torchnative coreml: no numpy dtype mapped for torch.bfloat16
+```
+
+**The path worked on everything it was built against and refused the first
+real model it met.** Modern Hugging Face checkpoints are overwhelmingly
+bfloat16 and `dtype="auto"` is the spelling the documentation teaches, so this
+is not an edge case; it is the first line every user writes. `float16` was
+missing from the same map, for no reason at all.
+
+### 8.1 The conversion: widen to float32, and let `ct.convert` keep the narrowing
+
+numpy has no bfloat16 (`hasattr(np, "bfloat16")` is False) and `ml_dtypes` is
+not a dependency here, so a bf16 numpy array cannot be produced at all.
+Something has to change dtype. The candidate answer was float16, since that is
+what the Neural Engine runs and what `compile_model(float32=False)` already
+casts to. It is the wrong one, and the reason is measurable rather than
+stylistic.
+
+| | bf16 | f16 | f32 |
+|---|---|---|---|
+| exponent bits | 8 | **5** | 8 |
+| mantissa bits | 7 | **10** | 23 |
+| largest finite | ~3.4e38 | **65504** | ~3.4e38 |
+
+f16 *gains* mantissa over bf16 and *loses* range. So bf16 -> f16 is exact for
+every value inside f16's normal range and the entire error is at the two ends:
+above 65504 to `inf`, below 5.96e-08 to zero. bf16 -> **f32**, by contrast, is
+exact everywhere — same radix, fewer mantissa bits, same exponent width.
+
+`_WIDENED_DTYPES` therefore widens both half-width floats to float32 before
+`_np` reads any bytes, and three things fall out of that:
+
+1. **It cannot move a number**, so it cannot move either agreement grade. The
+   array `_np` returns for a half-width tensor is bit-identical to the array
+   it returns for that tensor's float32 widening; the program handed to CoreML
+   is the same program.
+2. **The float16 narrowing stays where it already was** — in
+   `ct.convert(compute_precision=FLOAT16)`, the same cast a float32 checkpoint
+   has always gone through. Narrowing in `_np` would round twice.
+3. **`precision="float32"` keeps meaning what it says.** A `_np` that rounded
+   to f16 would have thrown the range away before the spelling was consulted.
+
+There is a second, non-obvious reason the widening has to happen anyway:
+`torch._C._shim_tensor_bytes` **refuses both half-width floats by name** —
+reaching their bit pattern means naming the `half` crate's types, which
+`rust/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
+which numpy *does* have, cannot cross as its own bytes. Widening first is what
+keeps the byte route, and with it the shutdown segfault §7.3 removed.
+
+What the f16 cast then costs was measured on the checkpoint rather than
+argued, over all 134,515,008 SmolLM2-135M weights read straight out of the
+safetensors file:
+
+| | |
+|---|---|
+| largest weight magnitude | **9.31** (f16's largest finite is 65504) |
+| elements that would overflow to `inf` | **0** |
+| nonzero elements landing in f16 subnormals | 43,020 |
+| nonzero elements flushing to zero | **60** (all below 5.97e-08) |
+| worst absolute elementwise error | **2.98e-08** |
+| worst per-tensor relative Frobenius error | 7.4e-09 |
+
+2.98e-08 is under `verify`'s float32 bar of 2e-05, let alone the float16 one.
+**The bf16 source moves neither grade**, measured through `coreml.verify` at
+SmolLM2's 576->1536 projection and no second comparator: float32 **0.0**,
+float16 **1.2e-03** — exactly where §1.1 and §7.2 left them.
+
+### 8.2 It lowers, it runs, and a decode step reaches the unit on nothing
+
+`from_pretrained(dtype="auto").to(device.npu)` now completes on SmolLM2-135M.
+
+| | |
+|---|---|
+| `Linear` leaves swapped | **211 of 211**, none skipped, none deferred |
+| parameters moved | 134,479,872 of 162,826,560 (`fraction_moved` 0.826) |
+| left on the CPU, **named** | `Embedding` 1, `LlamaRMSNorm` 61, `SiLUActivation` 30, `LlamaRotaryEmbedding` 1 |
+| `fully_offloaded` | False, and it warns |
+
+`fraction_moved` is 0.826 rather than 0.9997 because of weight tying: before
+the swap `parameters()` deduplicates `lm_head` against the embedding, and
+after it the lowered leaf holds its own copy, so the denominator grows.
+
+And it executes, through the path a caller takes and no other (§8.3). All 211
+leaves, a five-token input, compared against the same model's own eager
+forward before the swap: **the same next token**, max absolute logit
+difference **0.75** on logits whose own scale is 27.4. That is a 30-layer
+float16 accumulation and it is not offered as an `agrees`; it is offered as
+*the same answer*.
+
+Then the part that matters more than either. `MLComputePlan`, read per distinct
+Linear shape in the model, at a decode-shaped batch and a prefill-shaped one:
+
+| shape | example leaf | batch 1 (decode) | batch 128 (prefill) |
+|---|---|---|---|
+| 576 -> 192 | `layers.0.self_attn.k_proj` | **CPU** | NeuralEngine |
+| 576 -> 576 | `layers.0.self_attn.q_proj` | **CPU** | NeuralEngine |
+| 576 -> 1536 | `layers.0.mlp.gate_proj` | **CPU** | NeuralEngine |
+| 1536 -> 576 | `layers.0.mlp.down_proj` | **CPU** | NeuralEngine |
+| 576 -> 49152 | `lm_head` | **CPU** | **CPU** |
+
+**A decode step reaches the Neural Engine on none of its 211 Linears.** The
+unit is in the *supported* column for every one of them; CoreML prefers the CPU
+at every one. That is §2.1's crossover at model scale — CoreML weighs dispatch
+cost against work, and one token through a 576-wide projection is not enough
+work — and it is the reason this section exists rather than a defect to fix.
+A finer sweep puts the crossover between batch 1 and 16 for three of the
+shapes, at 128 for 576->1536, and at 256 for `lm_head`, which is GPU-preferred
+again by 512.
+
+The existing per-shape warning is what a caller sees: at batch 1 every leaf
+says `MLComputePlan says ['CPU']`, so "`to(device.npu)` succeeded" is never
+mistaken for "the Neural Engine ran it". That is §1's failure, refused.
+
+**So the honest summary is: generation on this arm is a prefill story, not a
+decode story.** Nothing measured here reaches the unit one token at a time.
+
+> **Superseded in its explanation by [`ANEDECODE.md`](ANEDECODE.md); the table
+> above is reproduced there unchanged and was re-measured before anything was
+> altered.** The sentence to strike is "CoreML weighs dispatch cost against
+> work, and one token through a 576-wide projection is not enough work". It is
+> not a work threshold. A rank-2 `ios16.linear` at batch 1 is CPU-preferred at
+> every width out to 49152 *and* in a program holding 64 of them — 21M weights
+> — while the **same arithmetic** as a 1x1 `ios16.conv` over `(1, C, 1, 1)`
+> reaches the unit. The size that does matter is counted **per program, in
+> weights**, not in arithmetic: a 576→576 conv at S=128 does 42M MACs and stays
+> on the CPU, while sixteen of them at S=1 do 5.3M MACs and do not. This
+> project compiles one program per leaf, so the sentence above described a
+> property of the lowering as a property of the token.
+>
+> `lm_head` is the one shape that clears the threshold on its own, and it is
+> NeuralEngine-preferred at batch 1 since the conv rewrite. The other four are
+> not; ANEDECODE.md §7 says what they would need.
+
+### 8.3 The first forward ended the process — and the first diagnosis was wrong
+
+This section replaces one that was published here and is **superseded**. What
+it said:
+
+> `ct.convert` called from **inside** a model's forward pass segfaults the
+> interpreter, reproducibly, at the seventh leaf. The eager probe does not
+> cover it because it probes batch 1. Deferring compilation out of `forward`
+> is a design change and is left named rather than guessed at.
+
+Every observation in that paragraph was real. **The cause was not.** It was
+correlation dressed as a mechanism, and it was published because the controls
+that would have refuted it were never run. The rule it broke is
+AGENTS.md §17.5's: a verification that cannot fail is not a verification, and
+"it crashed inside `convert`, and `convert` was inside a forward" is a claim
+with no control attached. The negative control belonged *before* the sentence,
+not after the round.
+
+Worse, it was found late for the same reason. The tests for §8.1–8.2 compiled
+every leaf at the real shape before forwarding — an escape hatch **a caller
+does not have**, because these leaves compile lazily and the forward is the
+only thing that supplies a real shape. So the suite was green while the path a
+user types
+
+```python
+m = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
+                                         dtype="auto")
+m.to(torchnative.device.npu)     # LOWERED 0.826
+m(torch.tensor([[1, 2, 3, 4, 5]]))   # process ends. no traceback. no message.
+```
+
+**ended the process.** `to()` reported success, attached a report naming 211
+swapped Linears, and died on the first forward — a model that cannot be used,
+handed back with a success message.
+
+#### The controls, and the real cause
+
+| | |
+|---|---|
+| `gc.collect()` x300 **before** any forward | fine |
+| `gc.collect()` x300 **after** a model forward | **crash** |
+| `gc.collect()` x300 *inside* a trivial `nn.Module.forward` | fine |
+| one `_CoreMLLinear` forward, then `gc.collect()` — no transformers, no model | **crash** |
+| `MLModel.predict(plain numpy array)`, drop it, `gc.collect()` | **crash, 5 runs of 5** |
+| the same, array kept alive | **0 of 5** |
+
+Rows three and four are the ones that kill the old explanation: a forward with
+a collection inside it is fine, and a collection *outside* a forward is not.
+
+`predict` is not as synchronous as it looks. CoreML wraps each numpy input in
+an `MLFeatureValue` and binds it into an `MLE5InputPort`, and that binding
+outlives the call — the stream is **lingering**. Milliseconds later a
+libdispatch worker runs `-[MLE5ExecutionStream resetAfterLingering:]`, which
+tears the binder down, destroys the `MLFeatureValue`, and drops
+`libcoremlpython`'s reference to the Python array **on a thread that does not
+hold the GIL**. The macOS crash report is unambiguous — faulting thread,
+innermost frame first:
+
+```
+Python              _PyObject_Free                       <- no GIL held
+libcoremlpython.so  (pybind11 handle destructor)
+libobjc             object_cxxDestructFromClass / _objc_rootDealloc
+CoreML              -[MLFeatureValue dealloc]
+CoreML              -[MLE5InputPortBinder reset]
+CoreML              -[MLE5ExecutionStream _reset]
+CoreML              -[MLE5ExecutionStream resetAfterLingering:]_block_invoke
+libdispatch         _dispatch_workloop_worker_thread
+
+EXC_BAD_ACCESS (SIGSEGV), KERN_INVALID_ADDRESS at 0x10
+```
+
+Freeing a Python object from a thread without the GIL corrupts CPython's heap,
+and the next thing to walk it dies. **`gc.collect()` is what usually walks
+it** — and `coremltools.converters.convert` ends with a `gc.collect()` (line
+679 of coremltools 9.0). That is the whole of the coincidence: a convert
+shortly after a predict is simply the likeliest moment for the two to meet.
+This is a defect in CoreML's Python bindings, not in this repository; what is
+ours is not handing it a short-lived array.
+
+#### The fix, and what it costs
+
+`coreml._feed_buffer`: one float32 input buffer per compiled shape, allocated
+once, refilled in place, held by the leaf. A single `_predict` funnel carries
+both leaf types and `verify`. Two holders, each measured:
+
+| removed | result |
+|---|---|
+| nothing | the naive path passes, five consecutive suite runs |
+| the leaf's buffer reuse (fresh array per forward), retention kept | intermittent: 1 clean run in 3 |
+| both the reuse and `_RETAINED_FEEDS`, right after a forward | **5 crashes in 5** |
+| `leaf._feeds.clear()` only (the backstop still holds it) | 0 crashes in 5 |
+
+So reuse is what makes it deterministic and `_RETAINED_FEEDS` is a real
+backstop rather than decoration. Nothing is ever removed from it, which means
+**a caller cannot release these buffers, deliberately.** For all 211 leaves of
+SmolLM2-135M that is `batch x 150,336 x 4` bytes = **601,344 bytes per batch
+row**: 0.57 MiB at a decode batch of 1, 73 MiB at a prefill batch of 128.
+Measured on the model: 2.87 MiB after one batch-5 forward, 4.59 MiB (422
+buffers) after a second forward at a different shape.
+
+That is a minority of what compile-per-shape already costs beside it:
+`_compiled` holds one CoreML program per leaf per shape, each carrying that
+leaf's weights in float16, so a second distinct batch value adds ~269 MB
+(134,479,872 parameters x 2 bytes). Both grow with the number of *distinct*
+batch values a model is called at. That is the number to watch, and it is a
+property of compiling per shape rather than of this fix.
+
+#### And the tests now drive the path a caller takes
+
+`rust/torch_c/pytests/test_bf16ane.py` gained `_NAIVE_SCRIPT`:
+`from_pretrained` -> `to(device.npu)` -> `model(x)` in one process with
+**nothing in front of it**. The pre-compilation was deleted from the other
+fixture, and the executed claims of §8.2 now hang off the naive one, so an
+executed claim cannot again be made on a path nobody can take.
+
+A second fixture-level lesson landed with it: `_npu_fixture` parses the last
+line of stdout as JSON, and **CoreML's ANE compiler writes diagnostics
+straight to file descriptor 1** when it cannot produce a bundle — which
+`sys.stdout = io.StringIO()` does not intercept, because the write never goes
+through Python. That made the suite flaky, which is worse than broken: a flaky
+gate gets re-run rather than read. Fd 1 itself is now pointed at `/dev/null`
+for the body of each fixture and the JSON is written to a dup of the original.
+
+### 8.4 What compiling leaves on disk, and which half had an owner
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp present -->
+
+A full gate run was costing 2.7 GB of the internal disk and filling
+`$TMPDIR` until CoreML could not write at all (§8.3's investigation was
+blocked by it). A separate round had tried `atexit.register(shutil.rmtree, ...)`
+in six harnesses and the number did not move, because the growth was not the
+named harness directories: it was **`.mlmodelc` bundles**, on this arm.
+
+#### The anatomy, measured
+
+Each compile writes **two** compiled bundles, and they are not the same kind
+of thing:
+
+| bundle | written by | reachable from Python? | lifetime |
+|---|---|---|---|
+| `tmpXXXXXXXX.mlmodelc` | `MLModel` loading `ct.convert`'s package | yes — `MLModel.get_compiled_model_path()` | **removed when the `MLModel` is collected**, including at interpreter shutdown |
+| `m_<UUID>.mlmodelc` | **our** `compute_plan`, via `coremltools.models.utils.compile_model(package)` with no destination | no | **nothing ever removed it** |
+
+`MLModel.predict` writes neither. `ct.convert` writes only the first. So the
+one that accumulated was ours, and it was one per compile —
+**not content-addressed**: compiling the *same* program three times left
+three.
+
+Two more facts that explain why earlier attempts missed it:
+
+* **`NSTemporaryDirectory()` is not `$TMPDIR`.** CoreML's native side ignores
+  the environment variable, so pointing `TMPDIR` at another volume moves the
+  `.mlpackage` (Python `tempfile`) and not the `.mlmodelc`. Measured: with
+  `TMPDIR` on the external disk, zero `.mlmodelc` appeared there and they
+  still landed in `/var/folders/.../T`.
+* **coremltools' own cleanup is for the package, not the bundle.** `MLModel`
+  registers `atexit` cleanup for a temporary `.mlpackage` and holds no path to
+  the compiled output at all.
+
+#### The fix, and the numbers
+
+`compute_plan` already made a temporary directory and already removed it in a
+`finally`. It now names the compiled bundle **inside** that directory, so the
+existing cleanup reaches it — one argument, `compile_model(package, compiled)`.
+
+Measured on one run of `rust/torch_c/pytests/test_bf16ane.py`, the suite that
+compiles most:
+
+| | entries | `m_*.mlmodelc` | `tmp*.mlmodelc` | `*.mlpackage` |
+|---|---|---|---|---|
+| before | 9107 -> 9547 | 7998 -> 8436 (**+438**) | +0 | +0 |
+| after | 9547 -> 9549 | 8436 -> 8436 (**+0**) | +0 | +0 |
+
+And over a whole gate, which is the number that matters:
+
+| one `run.sh` | entries | `m_*.mlmodelc` | MB of them | `/` free |
+|---|---|---|---|---|
+| before | +501 | **+454** | **+650 MB** | **-2735 MB** |
+| after | +55 | **+6** | **+1 MB** | **+462 MB** |
+
+`tmp*.mlmodelc` and `*.mlpackage` were **+0 on both** — the two halves that
+clean themselves were already clean, so this was the whole of what this
+repository leaked per run. A gate now *returns* disk rather than consuming it,
+because the transient package and bundle of each compile are removed while the
+stale ones from earlier runs are not replaced.
+
+The residual **+6** is `rust/torch_c/pytests/test_npu2.py`'s own `plan_for`,
+measured by running that suite alone: it has the same undestined
+`compile_model` and no `finally` around its `mkdtemp`. It is 1 MB per gate and
+is left alone deliberately — its `directory` leaks either way, so naming a
+destination there would move bytes rather than free them, and the callers use
+the package it returns.
+
+#### It does not reintroduce §8.3's crash — checked before it was written
+
+§8.3 established that CoreML releases a bound input from a libdispatch worker
+without the GIL, and that *reusing* the feed buffer is what makes the forward
+deterministic. Dropping an `MLModel` tears down an execution stream, so eager
+cleanup is exactly the shape of change that could bring it back. Measured on
+the §8.3 harness, after a real `predict`:
+
+| | crashes |
+|---|---|
+| keep everything (shipped) | 0/5 |
+| drop the `MLModel`, retention kept | 0/5 |
+| drop the `MLModel` **and** clear both retentions | 0/5 |
+| clear both retentions, **keep** the `MLModel` — the known-bad control | **5/5** |
+
+The control still reproduces, so the comparison is real: dropping the model
+does not reintroduce the crash, it *removes* it — the teardown then happens on
+the main thread under the GIL instead of in the lingering worker. None of this
+changes what ships, because the compile cache is load-bearing and is kept; it
+is recorded so the next person does not have to re-derive it.
+
+#### What this does not recover, named
+
+* **The 311 `tmpXXXXXXXX.mlmodelc` (348 MB) already on this machine.** Those
+  are residue from the era §8.3 ended: a process that segfaults never runs
+  shutdown, so the half that normally dies with the `MLModel` survived. They
+  stopped accumulating when that crash was fixed — measured **+0** per gate
+  both before and after this change — and the existing ones are a
+  developer-hygiene matter, not a defect.
+* **`com.apple.e5rt.e5bundlecache`.** Apple's, not redirectable, and not
+  something library code should delete. It is the remainder of the 2.7 GB.
+* **Nothing for a caller to call.** There is no `release()` here, deliberately:
+  measured, dropping the compiled models recovers nothing at process exit
+  (`m_*` residue was +3 for three compiles whether they were dropped eagerly
+  or left to shutdown), and the cache a `generate()` loop depends on is worth
+  more than bounding peak disk. A long-lived process that wants that bound can
+  clear a leaf's `_compiled`; §8.3's table above is the evidence that doing so
+  is safe.
+
+### 8.5 Split the way AGENTS.md §17.3 asks
+
+| | |
+|---|---|
+| **feature added** | `_WIDENED_DTYPES` — `bfloat16` and `float16` checkpoints lower; `from_pretrained(dtype="auto").to(device.npu)` works |
+| **defect fixed** | `_np` refused every real Hugging Face checkpoint |
+| **defect fixed** | the first forward after `to(device.npu)` ended the process; CoreML frees the input array off-thread without the GIL (§8.3) |
+| **claim withdrawn** | "`ct.convert` inside a forward segfaults" — correlation, published without its control (§8.3) |
+| **claim added** | a decode-shaped batch reaches the Neural Engine on **none** of SmolLM2's Linears; prefill reaches it on four of five shapes |
+| **claim unchanged** | both agreement grades — float32 0.0, float16 1.2e-03 — measured through `coreml.verify` and no second comparator |
+| **test defect fixed** | the fixtures avoided the caller's path; `_NAIVE_SCRIPT` drives it with nothing in front of it |
+| **defect fixed** | `compute_plan` orphaned one `.mlmodelc` per compile, forever — +454 directories and +650 MB per gate run (§8.4) |
+| **limitation named** | the `m_<UUID>` bundle had no owner at any level; `NSTemporaryDirectory()` ignores `$TMPDIR`; `e5bundlecache` is Apple's (§8.4) |
+| **tests added** | 19, in `rust/torch_c/pytests/test_bf16ane.py`; nine nullifications, each red on the tests it targets |
+
+### 8.6 The bundle count was counting other processes' models (2026-09-17)
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_every_bundle_this_process_compiles_is_attributed_to_it present -->
+
+§8.4's guard took a snapshot of `NSTemporaryDirectory()` before three probe
+compiles and another after releasing them, and asserted that the difference
+was empty. It failed intermittently on `develop`: survivor counts of 3, 1, 0
+and 0 over four runs of one binary, including runs on an otherwise quiet
+machine. The survivors were always `tmp*`, never `m_*`.
+
+**It was not a lifetime defect in our code.** That directory is per *user*,
+not per process, and every Python process that loads an `MLModel` writes its
+`tmpXXXXXXXX.mlmodelc` there. A passing run shows `during: 3`, one bundle per
+compile. The failing gate run showed `during: 6, survived: 3`: three bundles
+that were not ours appeared inside the window and were still alive at the
+second snapshot. Measured:
+
+| | runs | old assertion red | new tests red |
+|---|---|---|---|
+| fixture alone, machine quiet | 2 | 0 | — |
+| beside a neighbour process that converts and holds 3 models | 10 | **6** | — |
+| same, after the change | 20 | 20 (computed from the same runs) | **0** |
+
+In the attribution run, 8 of 10 survivors carried the neighbour's own
+`get_compiled_model_path()` names. The other 2 belonged to another agent's
+`export_sweep.py`, which was running on the machine at the time. All were gone
+once their owners released them. With the neighbour running, the probe's own
+three bundles were removed on `del` every time. Real contamination also
+happened without a neighbour of ours: one ordinary run during this round came
+back `during: 6, survived: 3`.
+
+**The fix is to the measurement, not to a number.** The fixture now records
+every compiled bundle this process writes during the window:
+
+* each `MLModel` load's path, through a recording `_MLModelProxy` subclass;
+* each `_MLModelProxy.compileModel` output;
+* each `compile_model` destination.
+
+It also samples `lsof` for processes that have `libcoremlpython` mapped. Then:
+
+* **Anything this process wrote must be gone after release, unconditionally.**
+* **An unrecorded survivor is tolerated only if another such process was
+  observed**, and the test prints that it tolerated it.
+* **The detector must see this process**, so a broken detector cannot turn
+  the tolerance into a blanket excuse.
+* **With no stranger observed, every addition must be recorded.** That is the
+  generic check that found `m_<UUID>`, kept wherever the machine allows it.
+
+Nullified, each on the real fixture:
+
+* `compile_model(package)` with no destination makes the first test red, with
+  three `m_*` in `plan_survived`.
+* An `MLModel` retained in `_RETAINED_FEEDS` makes the first test red, through
+  `loads_survived`.
+* A recorder blind to loads makes the second test red.
+* An `lsof` filter that matches nothing makes both tests red.
+* An unknown `tmp*.mlmodelc` written inside a stranger-free window makes both
+  tests red. Removing the stranger condition leaves the first test green, so
+  that condition is the thing that bites there.
+
+**Blind spots.** This cannot see a CoreML writer without `libcoremlpython`, or
+a foreign process that loads, compiles and crashes entirely between two
+`lsof` samples.
+
+| | |
+|---|---|
+| **test defect fixed** | the survivor count was a directory difference over a directory shared with every CoreML process of the user |
+| **defects fixed in product code** | 0; no object outlived its scope |
+| **tests added** | 1 (`test_every_bundle_this_process_compiles_is_attributed_to_it`); 1 rewritten; five nullifications plus one control |
+
+## 9. An empty compute plan is not silence — and the plan itself is not a property of the program
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was
+**red on develop**, in two consecutive full gate runs:
+
+```
+FAIL test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission:
+     AssertionError: ('relu', {'relu': [], 'gelu': []})
+```
+
+A previous round saw this mid-work and reported it as having cleared on its
+own. It had not. That observation is withdrawn here — and it is withdrawn
+without a sentence to strike, because the claim never reached this document:
+searching §8.4 and the whole of `docs/graph/` for it finds nothing. It lived in
+a hand-off report. **A finding that only exists in a report is a finding the
+next person cannot check**, which is how it survived two red gates.
+
+### 9.1 Why the plan was empty — established
+
+> **Superseded in part by §9.6 (2026-09-16).** The silence measured below is
+> real, but it is not a property of the artefact's bytes alone: it belongs
+> overwhelmingly to `ComputeUnit.ALL` — 75% silent there against 0.7% at
+> `CPU_AND_NE`, measured over 168 observations. The table in this section and the eliminations
+> under it were all taken at `ALL`, which is `compute_plan`'s default, so they
+> are measurements *within* that configuration rather than about CoreML in
+> general. Read §9.6 before building on this section.
+
+`compute_plan` returned **zero** rows for a single-`relu` and a single-`gelu`
+float16 program at `(256, 1024)`, while returning full rows for a `linear` at
+the same precision in the same process.
+`get_compute_device_usage_for_mlprogram_operation` answered `None` for *every*
+operation of those two, including the `ios16.cast`s that do get a usage in a
+`linear` program.
+
+The cause is **the identity of the compiled artefact, not the program it
+encodes.** The decisive measurement, run in a fresh interpreter with no torch
+loaded, reading `.mlmodelc` directories straight off disk:
+
+| `.mlmodelc` | differs from the first by | per-op usage |
+|---|---|---|
+| as `compile_model` produced it (op named `relu_0`) | — | **none** |
+| the same bundle, `relu_0` → `relu_7` in `model.mil` + `coremldata.bin` | 2 bytes | **all** |
+| that one, `relu_7` → `relu_0` again | back to the original | **none** |
+| the same bundle, `relu_0` → `relu_8` | 2 bytes | **all** |
+
+A rename changes nothing the model computes. It changes the bytes, and with
+them whatever CoreML keys a cached plan on — and the answer follows the bytes.
+
+The three candidates worth eliminating rather than assuming, eliminated:
+
+* **not the program shape.** A single elementwise op is not what CoreML has no
+  per-op usage for: the same `relu` at `(255, 1024)`, `(128, 1024)`,
+  `(256, 1023)`, `(64, 4096)` and `(909, 1024)` all plan normally, as does
+  `gelu`. Only `(256, 1024)` — the one shape the fixture asked at — is silent.
+* **not a coremltools version behaviour.** coremltools 9.0 builds a
+  single-`relu` program at `(256, 1024)` through `mb.program` directly, at the
+  same precision and deployment target, and plans it fully. Same version, same
+  graph, same shape.
+* **not our call.** The same call, on a two-byte-renamed copy of the same
+  artefact, returns every row.
+
+### 9.2 The cold-cache hypothesis, tested and discarded
+
+A plausible reading was that `MLComputePlan`'s per-op usage depends on
+`~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache` being warm
+for a given program, and that the 10 GB deletion between the green report and
+the red gates had cooled it. That would make an empty plan a *transient* state
+and every warning in `export/coreml.py` keyed on plan contents unreliable on a
+cold machine — a much larger finding. It is not what happens:
+
+| | first plan | after a real `predict` | recompiled |
+|---|---|---|---|
+| `(909, 1024)` — a shape nothing had ever compiled | **full** | — | full |
+| `(256, 1024)` — the known-silent one | none | **none** | **none** |
+
+A never-before-compiled program plans fully on its first, cold attempt, and the
+silent one stays silent after being run. So it is not warm-versus-cold; it is
+sticky, and tied to the artefact. What has **not** been established is which
+cache holds it and how an entry comes to be in that state. Deleting
+`e5bundlecache` would test it, and this round did not: it is Apple's, it is
+11 GB, and it is outside the change being made here.
+
+### 9.3 The half that mattered more: "nothing to say" was being said as nothing
+
+`_say_what_ran` began `if not compute: return`, and `_compile_model`'s
+`to()`-time guard began `if probe_rows and not any(...)`. Both drop the
+operations CoreML returned no usage for and then return early when nothing is
+left. So a model whose plan CoreML declines to produce got **no warning at
+all** — the same silence a FULL offload is deliberately given.
+
+That is §1's failure with a new entrance. "CoreML told us CPU" and "CoreML told
+us nothing" are different facts, and they were collapsing into one output.
+
+The rule now, and where `unknown` sits:
+
+| plan | said |
+|---|---|
+| every computing op known and preferred `NeuralEngine` | **nothing** — the silence is earned by positive evidence, and is what keeps a warning worth reading |
+| known, unit supported but not preferred | §2.1's sentence, per shape |
+| known, unit not in the supported column | `_UNREACHABLE_PRECISION`, once |
+| **any op unnamed, or no computing op at all** | **`_UNKNOWN_PLAN`, once** |
+
+`unknown` cannot borrow FULL's silence, because that silence is paid for with
+evidence and `unknown` has none; it is at least as loud as PARTIAL. It is also
+checked **first**, ahead of `_UNREACHABLE_PRECISION`, because that sentence
+reads an empty `supported` column as the precision's fault — and an empty
+column CoreML never filled in is not the same as one it filled in without the
+unit. Said as-is, it would have sent a caller to change a setting that cannot
+help.
+
+`compute_plan` no longer drops an unnamed operation. It drops `const` **by
+name** — that one has no compute device by construction — and emits every
+other operation as a row, with `preferred="unknown"` and an empty `supported`
+when CoreML would not say. Defaulting to *keep* is the point: the failure being
+guarded against is a silent drop.
+
+### 9.4 The fixture asks at four shapes now, and that is not belt-and-braces
+
+§9.1 is exactly the situation where a one-shape measurement can be taken away
+by one artefact. The relu/gelu claim — supported on the unit, preferred
+elsewhere, which is the number that decided not to lower them — is now taken at
+`(256, 1024)`, `(255, 1024)`, `(128, 1024)` and `(256, 1023)`.
+
+It requires at least two to answer, and **as of §9.6 it asks at `CPU_AND_NE`
+rather than `ALL`.** The threshold was never the flake: it was the residue of
+asking the question in the configuration that answers 25% of the time, and
+§9.6.1 records the measurement that a stricter threshold is not available even
+at `CPU_AND_NE`. The shape CoreML declines is still present as a named
+`unknown` row rather than as an absence.
+
+### 9.5 Split the way AGENTS.md §17.3 asks
+
+| | |
+|---|---|
+| **defect fixed** | an empty or partly-unnamed `MLComputePlan` produced **no warning at all**, in both places that read one — the §1 silence, reached a different way |
+| **defect fixed** | `compute_plan` silently dropped every operation CoreML named no device for, so "no plan" and "no computing operations" were the same empty list |
+| **defect fixed** | an unknown plan was read as `_UNREACHABLE_PRECISION`, blaming the precision for a `supported` column CoreML never filled in |
+| **claim amended** | the empty plan tracks the compiled artefact's **bytes**, not the program: a two-byte rename inside `.mlmodelc` restores it (§9.1) — but only within `ComputeUnit.ALL`, which §9.6 shows is the thing the silence actually belongs to |
+| **claim withdrawn** | that the failure had "cleared on its own" — it is deterministic, and it reproduces at `af47641` as well |
+| **hypothesis discarded** | that per-op usage needs a warm `e5bundlecache`; a never-compiled shape plans fully cold, and the silent one stays silent after a real `predict` (§9.2) |
+| **limitation named** | which cache holds the bad entry, and how one gets into that state, is **not** established; `e5bundlecache` was not deleted to find out |
+| **claim unchanged** | relu and gelu are supported on the unit and preferred elsewhere — re-measured at four shapes, not widened, not re-graded |
+| **test defect fixed** | the relu/gelu measurement rested on a single artefact and became `assert []` when that artefact went silent |
+| **tests added** | 8, in `rust/torch_c/pytests/test_emptyplan.py` |
+
+### 9.6 The silence belongs to `ComputeUnit.ALL` — measured, 2026-09-16
+
+> **Superseded by §9.7 (2026-09-19).** The numbers below are kept visible
+> rather than edited away, as §9.6 kept §9.1's. Two of them did not survive:
+> the columns of the table below have since **swapped** — `CPU_AND_NE` is now
+> the silent one and `ALL` answers — and the "0.7% per observation" is not a
+> rate at all. Measured over 800 observations in fresh subprocesses, the
+> silence is deterministic per (op, shape, setting) within a day and
+> re-assigns between days, so §9.6.1's `4 * 0.007**3` was never valid.
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was the
+flakiest thing on `develop`. Across four solitary gate runs it graded 4, then
+1, then 1, then 0 answered shapes — and the run that answered all four was
+taken as a clean baseline, which is how a different branch came to be suspected
+of a regression it had nothing to do with.
+
+§9.1 read that silence as belonging to the compiled artefact's bytes. It does
+not. It belongs to the **compute-unit configuration the plan is asked for**,
+and `compute_plan`'s default is `ComputeUnit.ALL`.
+
+Measured at the fixture's own four shapes, both ops, three fresh interpreters
+back to back, load average 1.5, nothing else on the machine — 24 rows, byte
+identical every time:
+
+| | `ComputeUnit.ALL` | `ComputeUnit.CPU_AND_NE` |
+|---|---|---|
+| relu, all four shapes | **no plan at all**, 4/4 | `supported=[CPU, NeuralEngine]`, `preferred=CPU`, 4/4 |
+| gelu `(256,1024)`, `(255,1024)` | `supported=[CPU, GPU, NeuralEngine]`, `preferred=CPU` | `supported=[CPU, NeuralEngine]`, `preferred=CPU` |
+| gelu `(128,1024)`, `(256,1023)` | **no plan at all** | `supported=[CPU, NeuralEngine]`, `preferred=CPU` |
+| **answered** | **2 of 8** | **8 of 8** |
+
+Widened to every observation taken this round — 3 probe runs, 12 solitary runs
+of `test_coremlops.py`, and 3 full gate runs:
+
+| | observations | silent | rate |
+|---|---|---|---|
+| `ComputeUnit.ALL` | 24 | 18 | **75%** |
+| `ComputeUnit.CPU_AND_NE` | 144 | 1 | **0.7%** |
+
+Two things follow, and the second matters more than the first.
+
+**It is whole-program, not per-operation.** Either every operation of the
+compiled program has a device usage or none of them does — including the
+`ios16.cast`s at the boundary, which is what §9.1 observed. There is no partial
+plan. That is consistent with `docs/graph/ANEDECODE.md`'s finding that the
+scheduling unit is the compiled program.
+
+**The answer at `ALL` is not stable, and that is the flake.** §9.1 records
+relu planning normally at `(255, 1024)`, `(128, 1024)` and `(256, 1023)`, and
+on 2026-09-16 relu plans at **none** of them at `ALL` — while `(909, 1024)` and
+`(64, 4096)` still do, and a `linear` at `(128, 1024)` still comes back
+`preferred=NeuralEngine`. Same machine, same coremltools, same artefacts, a
+different answer three days apart. A test cannot be founded on that.
+
+`CPU_AND_NE` is not a weaker question. It is the **stronger** one: with the GPU
+out of the arbitration, the CPU is CoreML's only alternative to the Neural
+Engine, and CoreML still picks the CPU. That is exactly the claim leaving relu
+and gelu unlowered has to rest on. It does not distort the positive result
+either — `linear` at `(128, 1024)` reads `preferred=NeuralEngine` at
+`CPU_AND_NE` just as it does at `ALL`.
+
+What is **not** established: why `ALL` declines for some programs and not
+others, nor what changed between 2026-09-13 and 2026-09-16 to move which ones.
+The fix does not need it — the question has a configuration that answers — but
+nothing here should be read as an account of CoreML's arbitration.
+
+The `unknown` row stays in `compute_plan`, and §9.3's warnings stay keyed on
+it. Making the absence visible was always the point, and the fixture still has
+an absence to tolerate about once in 144 observations — §9.6.1 is the
+measurement that says so, and the reason the test's threshold did not move.
+
+#### 9.6.1 `== 4` was tried, and the third gate run refused it
+
+The obvious strengthening — require all four shapes to answer, since
+`CPU_AND_NE` answered all eight every time in isolation — was written first and
+then **measured rather than assumed**. It passed 12 of 12 solitary runs of
+`test_coremlops.py` and full gate runs 1 and 2; **gate run 3 returned
+`unknown` for gelu at `(256, 1023)`** and the test went red.
+
+So CoreML's willingness to produce a per-operation plan is not a guarantee at
+*any* compute-unit setting. It is 75% silent at `ALL` and 0.7% silent at
+`CPU_AND_NE`, and the second number is small but is not zero. The threshold
+therefore stays at `>= 2`, with the reason recorded instead of inherited: at
+0.7% per observation, three of an op's four shapes going silent together is
+about `4 * 0.007**3` — roughly one run in a million — whereas the
+configuration this test used to run in failed outright most of the time. The
+four-shape sweep (§9.4) is the redundancy; `>= 2` is what makes the redundancy
+load-bearing. An op silent at *every* shape — which is exactly what `ALL` did
+to relu, 4 of 4 — still fails.
+
+This is written down because the number looks like the weak old rule and is
+not: nothing about the threshold was the flake. The compute-unit argument was.
+
+| | |
+|---|---|
+| **defect fixed** | the fixture asked `MLComputePlan` with `ComputeUnit.ALL`, which returns no plan for 6 of its 8 (op, shape) pairs and returns a *different* 6 on different days — the whole of the flake |
+| **test strengthened** | the payload names the compute units, so a silent revert to `ALL` fails here by name rather than as an intermittently empty plan |
+| **claim added** | the plan is whole-program: either every operation has a usage or none does, boundary casts included |
+| **claim amended** | §9.1's artefact-bytes account is scoped to `ALL` rather than withdrawn (§9.1, §9.5) |
+| **claim withdrawn** | that `CPU_AND_NE` answers 8 of 8 unconditionally — it is 143 of 144 (§9.6.1) |
+| **limitation named** | why `ALL` declines for a given program, and why `CPU_AND_NE` declines once in 144, is not established |
+| **threshold unchanged** | `answered >= 2`, now with the arithmetic behind it (§9.6.1) rather than as a residue |
+| **tests added** | 0 — this is the existing test moved off a configuration that answers on luck |
+
+### 9.7 The two columns swapped, and the silence was never a rate — measured, 2026-09-19
+
+> **Corrected AND partly withdrawn by §9.8 (same day).** Two things below did
+> not survive. (1) "re-assigns between days" — it re-assigns in **minutes**,
+> triggered by the onset of CoreML/ANE activity, not by elapsed time: 0 flips
+> in 30.8 idle minutes, 6 flips all falling inside gate runs. (2) **The union
+> guarantee this section's fix rests on is false.** §9.7 assumes the two
+> compute-unit settings are not silent on the same cell at once; gate run 4 on
+> 2026-09-19 had relu silent at both settings on three of four shapes and went
+> red. The widening below is still an improvement and the threshold is still
+> right, but it is **not** the guarantee §9.7 claims it is. See §9.8 Finding 2.
+
+**§9.6 above is superseded. Its numbers are left in place on purpose**, the way
+§9.6 left §9.1's in place: the argument in §9.6 is still the right argument and
+the measurement behind it was honestly taken, but the column it chose is no
+longer the answering one, and the "0.7%" it reported is not a quantity that
+exists.
+
+#### What was asked
+
+A full gate run failed `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission`
+with relu silent at three of its four shapes at `CPU_AND_NE`. On §9.6's rate
+that is `4 * 0.007**3` — about one run in a million. The back-to-back gate run
+before it had passed. So either the machine hit one in a million, or the rate
+moved.
+
+#### The rate moved, and it is not a rate
+
+Every observation below is in a **separate, fresh subprocess** — 100 of them,
+800 observations, on a quiet machine with nothing else running.
+
+| | observations | silent | rate | 95% CI (Wilson) |
+|---|---|---|---|---|
+| §9.6, 2026-09-16, `CPU_AND_NE` | 144 | 1 | 0.69% | [0.12%, 3.83%] |
+| **today, `CPU_AND_NE`, same 8 pairs** | **800** | **300** | **37.5%** | **[34.2%, 40.9%]** |
+
+The intervals do not overlap and are not close. But the aggregate rate is the
+less important half, because **the silence is not distributed at random across
+observations at all.** Broken out per (op, shape), every cell is at 0 or at 1:
+
+| (op, shape) at `CPU_AND_NE` | silent / runs | rate | 95% CI |
+|---|---|---|---|
+| relu `(256, 1024)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(128, 1024)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(256, 1023)` | 100 / 100 | 100% | [96.3%, 100%] |
+| relu `(255, 1024)` | 0 / 100 | 0% | [0%, 3.7%] |
+| gelu, all four shapes | 0 / 400 | 0% | [0%, 0.95%] |
+
+Not one cell flipped in 800 observations. **"A 0.7% per-observation silence
+rate" was a description of a quantity that does not behave like a rate**: it is
+deterministic given (op, shape, compute-unit setting) within a day, and it
+re-assigns itself between days. §9.6's single silent observation in 144 was
+that re-assignment beginning, not a coin landing badly, and the arithmetic
+§9.6.1 built on it — `4 * 0.007**3` — was never valid, including on the day it
+was written.
+
+#### The columns swapped
+
+Asking the **same compiled artefact** at all three settings, in one process:
+
+| relu artefact | `ALL` | `CPU_AND_NE` | `CPU_ONLY` |
+|---|---|---|---|
+| `(256, 1024)` | answers, `preferred=CPU`, `supported=[CPU, GPU, NeuralEngine]` | **no plan at all** | answers |
+| `(255, 1024)` | answers | answers, `supported=[CPU, NeuralEngine]` | answers |
+
+This is §9.6's table with the columns exchanged. §9.6 chose `CPU_AND_NE`
+*because* it answered 8 of 8 while `ALL` answered 2 of 8; today `ALL` answers 8
+of 8 and `CPU_AND_NE` answers 5 of 8. §9.6 already recorded the same
+re-assignment happening once before, between 09-13 and 09-16, and named it as
+not established. It has now happened twice. **Neither setting is the reliable
+one; what is reliable is that at least one of them answers.**
+
+The whole-program claim from §9.6 survives unchanged and is re-measured here:
+at `(256, 1024)` at `CPU_AND_NE` the boundary `ios16.cast`s are silent too, all
+three operations or none.
+
+#### The suspect was wrong, measured rather than argued
+
+The round's hypothesis was `ad9c5cc` ("group decoder layers into one compiled
+program"), which landed the same day and added `test_anetracer.py` — heavier
+CoreML/ANE work, in the same gate run, alphabetically ahead of
+`test_coremlops.py`. Two independent results refute it.
+
+**It is not in the code.** `ad9c5cc` touches `export/coreml.py` with +324 lines
+and **0 deletions**, all of them new `_group_decoder_layers` /
+`_build_decoder_subgraph_program` definitions. It does not modify
+`compile_model`, `compute_plan` or `computes`, which are the entire path this
+measurement runs through. Those three functions are byte-identical to what
+§9.6 measured.
+
+**It is not in the run order either.** 30 trials per arm, each observation in
+its own fresh subprocess, **order counterbalanced** — odd trials ran arm A
+first, even trials ran arm B first, so position-in-sequence and arm do not vary
+together:
+
+| arm | observations | silent | rate | 95% CI |
+|---|---|---|---|---|
+| A — probe alone | 240 | 90 | 37.5% | [31.6%, 43.8%] |
+| B — `test_anetracer.py`'s full fixture in a subprocess immediately before | 240 | 90 | 37.5% | [31.6%, 43.8%] |
+
+Difference **0.00 pp**, 95% CI [−8.7 pp, +8.7 pp]. Per cell it is stronger than
+that interval suggests: all 480 cell-observations agreed, 30/30 or 0/30, with
+zero flips in either arm. **No detectable effect, and an effect large enough to
+matter would have had to flip cells that did not move at all.**
+
+The counterbalancing is there because this project has published a
+position-versus-setting confound before — an A/B for `compute_units` run with
+both settings inside one process — and retracted it.
+
+#### Mechanism: not established
+
+What changed between 2026-09-16 and 2026-09-19 to swap the columns is **not
+known**, and nothing here should be read as an account of it. What is ruled out
+is `ad9c5cc` (both by diff and by the A/B above) and any change to this
+repository's CoreML export path, which is unmodified. coremltools is 9.0 on
+both dates. The remaining candidates — the OS's CoreML/ANE segmenter and
+whatever state it keeps — were not instrumented, and saying "the rate moved and
+the cause is unknown" is the honest stopping point rather than naming a
+mechanism inferred from timing.
+
+#### What the test does now, and why it is not a weakening
+
+The threshold **stays at `answered >= 2`**. It was not touched. What changed is
+that the fixture asks the **same compiled artefact at both `CPU_AND_NE` and
+`ALL`**, and a shape counts as measured if either setting answered for it.
+
+This is strictly more evidence per shape, not less:
+
+- **Every row either setting returns is graded.** Previously four rows per op
+  were checked for `NeuralEngine in supported` and `preferred != NeuralEngine`;
+  now up to eight are. An op that became NeuralEngine-preferred reddens the
+  test from whichever setting saw it.
+- **Only the bookkeeping reads the union** — "was this shape measured at all".
+- **An op silent at both settings at every shape still fails**, which is what
+  `ALL` did to relu on 2026-09-16 and what `CPU_AND_NE` does to three of four
+  shapes today.
+
+It is §9.4's redundancy-across-shapes applied to the second axis the last three
+days proved was also unreliable. Verified by gutting: the test goes red when
+relu is silenced at both settings, when relu is made NeuralEngine-preferred at
+`ALL`, when `NeuralEngine` is dropped from `supported` at `ALL`, when only one
+of four shapes answers anywhere, and when the second setting's payload key is
+removed. Two of those five fire specifically from the newly-added `ALL` rows,
+which is the check that the new rows are graded rather than merely counted.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_all present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_units_2 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _REJECTED_UNITS_2 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py computes present -->
+
+| | |
+|---|---|
+| **claim withdrawn** | that the `CPU_AND_NE` silence is a 0.7% per-observation rate (§9.6). It is not a rate: it is deterministic per (op, shape, setting) within a day — 800 observations, zero cell flips — and re-assigns between days |
+| **claim withdrawn** | §9.6.1's `4 * 0.007**3` "one run in a million". The arithmetic assumed independence across shapes that the data never had |
+| **claim amended** | §9.6's "the silence belongs to `ComputeUnit.ALL`" is scoped to 2026-09-16 rather than withdrawn. The finding that it belongs to a *setting* is right; which setting is not stable |
+| **claim added** | at least one of `ALL` / `CPU_AND_NE` answers for every (op, shape) measured on both dates — the property the test now rests on |
+| **claim confirmed** | the plan is whole-program, boundary `ios16.cast`s included (§9.6), re-measured today at `(256, 1024)` |
+| **hypothesis refuted** | that `ad9c5cc` / `test_anetracer.py` caused it — by diff (+324/−0, export path untouched) and by a counterbalanced A/B, 240 observations per arm, 0.00 pp difference |
+| **limitation named** | what changed between 09-16 and 09-19 is not established, and no mechanism is claimed |
+| **threshold unchanged** | `answered >= 2`. Not weakened — the settings axis was widened, and every returned row is graded |
+| **tests added** | 0. Existing test strengthened: up to 8 graded rows per op instead of 4, and two payload keys whose absence fails it |
+| **defect fixed** | the fixture interrogated a single compute-unit setting whose willingness to answer is not stable across days — deterministically red on develop as of today |
+
+### 9.8 The assignment moves on activity, not on elapsed time — and §9.7's guarantee is false. Measured, 2026-09-19
+
+Two findings, and the second one **falsifies the fix §9.7 landed**. They are
+kept together because the same hour of sampling produced both.
+
+§9.7 said the silent cells "re-assign between days". They re-assign in
+**minutes**, the trigger is activity rather than the clock, and — the part that
+matters — the two compute-unit settings **do** go silent on the same cell at
+the same time, which is precisely what §9.7 assumed they would not.
+
+The prompt was a timestamp, not a measurement: two full gate runs on `f81086b`
+about 15 minutes apart, nothing rebuilt between them, run 1 green and run 2 red.
+
+#### Method
+
+One sample every 60 s, each in a **fresh subprocess**, reading all 16 cells of
+the grid (2 ops x 4 shapes x 2 settings) from freshly compiled artefacts.
+**87 samples over 91.7 minutes = 1392 cell-observations**, interleaved with
+four full gate runs on an otherwise idle machine.
+
+#### Finding 1 — the trigger is activity onset, not elapsed time
+
+| phase | span | duration | flips |
+|---|---|---|---|
+| quiet — nothing but the sampler | 14:30 – 15:01 | 30.8 min | **0** |
+| **gate run 1** | 15:01:23 – 15:16:30 | 15.1 min | **3 + 1** |
+| idle gap | 15:16:30 – 15:17:00 | 0.5 min | 0 |
+| **gate run 2** | 15:17:00 – 15:32:06 | 15.1 min | **0** |
+| idle gap | 15:32:06 – 15:33:36 | 1.5 min | 0 |
+| **gate run 3** | 15:33:36 – 15:49:02 | 15.4 min | **1** |
+| idle gap | 15:49:02 – 15:49:14 | 0.2 min | 0 |
+| **gate run 4** | 15:49:14 – 16:01:40 | 12.4 min | **1** |
+
+All six flips in the hour and a half fell **inside a gate run**. None fell in
+the 30.8 quiet minutes, and none in any idle gap. Measured from the start of
+the gate that contained them, the flips land at **+53 s, +3 m 01 s, +4 m 05 s**
+(run 1), **+41 s** (run 3) and **+4 m 16 s** (run 4) — early in the run, not
+spread through it. Run 2 moved nothing at all, so heavy CoreML work is not
+sufficient either; **not every provocation flips something.**
+
+```
+15:02:16  [GATE1]  relu [256,1023] @ ALL          answer -> SILENT
+15:02:16  [GATE1]  relu [256,1024] @ ALL          answer -> SILENT
+15:04:24  [GATE1]  gelu [256,1024] @ ALL          answer -> SILENT
+15:05:28  [GATE1]  relu [256,1024] @ CPU_AND_NE   SILENT -> answer
+15:34:17  [GATE3]  relu [128,1024] @ ALL          answer -> SILENT
+15:53:30  [GATE4]  relu [256,1024] @ CPU_AND_NE   answer -> SILENT
+```
+
+**The drift has a direction.** Five of the six flips are `answer -> SILENT`,
+and the total silent count rose monotonically apart from one transient dip:
+**4 -> 6 -> 7 -> 6 -> 7 -> 8 of 16** across the four runs. Waiting does not
+restore it; over this hour, work only ever cost answers.
+
+**It is global state, not per-process.** The sampler is a different process
+from the gate's fixture, and at 15:06 the two agreed cell for cell — the gate
+printed `relu[256,1024]@CPU_AND_NE = C:CN` and `@ALL = SILENT` at 15:06:07,
+which is exactly what the 15:06:32 sample independently recorded.
+
+**Mechanism still not established.** Activity-onset is the measured *trigger*.
+What it acts on was not instrumented; ANE power or scheduler state is the
+obvious candidate and there is no evidence for it here, so it is not claimed.
+
+#### Finding 2 — §9.7's union guarantee is falsified, and the test is still flaky
+
+§9.7 rests on "at least one of `ALL` / `CPU_AND_NE` answers", and asserts
+`answered >= 2` over the union. **That does not hold.** The four gate runs,
+read off the new `PLAN` lines, show the relu union decaying monotonically:
+
+| | gate 1 (15:06) | gate 2 (15:21) | gate 3 (15:38) | gate 4 (15:54) |
+|---|---|---|---|---|
+| relu `CPU_AND_NE` | 2/4 | 2/4 | 2/4 | 1/4 |
+| relu `ALL` | 2/4 | 2/4 | 1/4 | 1/4 |
+| **relu union** | **3/4** | **3/4** | **2/4** | **1/4** |
+| gelu union | 4/4 | 4/4 | 4/4 | 4/4 |
+
+**Gate run 4 failed**, `1798 ok, 1 FAIL, suites 97/97`, on
+`answered >= 2` with the relu union at 1 of 4: `[256,1024]`, `[128,1024]` and
+`[256,1023]` were silent **at both settings simultaneously**. That is the
+event §9.7 claimed had not been observed, and it is now observed.
+
+So §9.7's widening **reduced** the flakiness without removing it — gate 3 would
+have been red under the pre-§9.7 single-setting test at 2/4 and passed at 2/4
+on the union, which is real; but the union is not a guarantee, it is a second
+sample of a quantity whose silences are **correlated across settings**, and
+§9.7's independence assumption between settings was the same mistake §9.6.1
+made between shapes. Two rounds have now assumed independence in this quantity
+and been wrong both times.
+
+What this does **not** license is lowering the threshold. `answered >= 1` would
+make the test pass by requiring almost nothing, and an op silent at every shape
+and both settings — which is one more flip away — would still fail it. The
+honest position is that **the test is correct and the measurement is sometimes
+unavailable**, and that the gap is unresolved. Options not taken here, recorded
+so the next round does not re-derive them:
+
+- **Re-ask on silence.** `preferred: unknown` is a refusal to answer, not a
+  verdict (§9.3), so recompiling and re-querying a refused cell is re-asking a
+  question rather than retrying until a result is liked. It would need a bound
+  and a named failure when the bound is hit.
+- **More shapes.** The drift touched 4 of 8 relu cells in 90 minutes; a wider
+  sweep buys headroom but not a guarantee, since the drift is directional.
+- **Skip with a named reason when the measurement is unavailable.** Rejected
+  without being tried: this repo already has 24 silent skips and a `skip ...`
+  line that the ledger counts as `ok`, and adding a 25th to make a red test
+  green is the worst of the options.
+
+#### 9.8.1 A pass now leaves evidence
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` printed
+**nothing on success**. Its whole contribution to a gate log was one line,
+`ok   test_the_rejected...`, so 8 of 8 rows answering and exactly 2 answering
+were indistinguishable afterwards — and when the green run and the red run 15
+minutes apart needed comparing, the green one had kept nothing to compare.
+
+It now prints the measured rows, **before** the assertions so a red run carries
+them too, indented so `suite_ledger.py`'s `^ok\s` / `^FAIL\s` / `^SKIP\s`
+matchers cannot miscount them, with the fixture's wall-clock so a log can be
+lined up against a cadence sample:
+
+```
+  PLAN measured_at=2026-09-19T15:06:07
+  PLAN relu CPU_AND_NE answered=2/4  [128,1024]=SILENT [255,1024]=C:CN [256,1023]=SILENT [256,1024]=C:CN
+  PLAN relu ALL        answered=2/4  [128,1024]=C:CGN [255,1024]=C:CGN [256,1023]=SILENT [256,1024]=SILENT
+  PLAN gelu CPU_AND_NE answered=4/4  [128,1024]=C:CN [255,1024]=C:CN [256,1023]=C:CN [256,1024]=C:CN
+  PLAN gelu ALL        answered=2/4  [128,1024]=C:CGN [255,1024]=SILENT [256,1023]=C:CGN [256,1024]=SILENT
+```
+
+`C`/`G`/`N` abbreviate `CPU`/`GPU`/`NeuralEngine`; the form is
+`preferred:supported`. **Nothing here asserts** — it changes what the log
+remembers, not what the test requires, and §9.7's five gutting checks were
+re-run against it unchanged and all five still go red.
+
+**It paid for itself within the hour.** Finding 2's decay table is read
+entirely off these lines; without them gate 4 would have been one more
+`FAIL ... flaky` with no way to see that the union had been eroding across the
+three green runs before it. The 15:06:07 stamp is also what let the gate's own
+measurement be matched against the independent sampler, which is the evidence
+that the state is global rather than per-process.
+
+#### 9.8.2 It is not only this test — `test_anedecode.py` fails from the same drift
+
+Gate run 5 (16:09) passed `test_coremlops.py` — the relu union had recovered to
+exactly 2 of 4 — and failed **`test_anedecode.py`** instead:
+
+```
+FAIL test_a_flexible_input_dimension_does_not_change_the_decision:
+     RuntimeError: npu subprocess exited 1
+     ... raise ComputePlanRefused(str(error)) from error
+```
+
+Same phenomenon, different suite: `MLComputePlan` refused to answer, and that
+suite surfaces the refusal as `ComputePlanRefused` rather than as an `unknown`
+row. So the drift measured in §9.8 is **not scoped to the test §9.7 fixed** —
+it destabilises the ANE-dependent part of the gate generally, and any suite
+that asks `MLComputePlan` a question is exposed to it.
+
+This also means the gate is **not reliably green on this machine at present**,
+for a reason outside the repository. Across **six** full runs of the same tree
+on 2026-09-19, nothing rebuilt between them:
+
+| run | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| result | ok | ok | ok | **FAIL** | **FAIL** | ok |
+| failing suite | — | — | — | `test_coremlops` | `test_anedecode` | — |
+| relu union | 3/4 | 3/4 | 2/4 | **1/4** | 2/4 | 3/4 |
+
+**2 red in 6, and the two reds were different suites.** A round that reads a
+single green run here as a clean baseline will be wrong about a third of the
+time — which is exactly how §9.6's flake came to be mis-attributed to an
+innocent branch. The relu union row also shows the drift is not monotone over
+a longer window: it fell 3 -> 1 across runs 1-4 and recovered to 3 by run 6,
+without the machine being idle for any of it.
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_measured_at present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _ABBREV present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/suite_ledger.py tally present -->
+
+| | |
+|---|---|
+| **claim withdrawn** | §9.7's "at least one of `ALL` / `CPU_AND_NE` answers". Gate run 4 had relu silent at both settings on three of four shapes and went red |
+| **claim corrected** | §9.7's "re-assigns between days" — it re-assigns in minutes, on activity onset |
+| **claim added** | all 6 flips in 1392 cell-observations fell inside a gate run; 0 in 30.8 idle minutes and 0 in every idle gap; flips land within ~4 min of a run's start |
+| **claim added** | the drift is directional — 5 of 6 flips were `answer -> SILENT`, total silent 4 -> 8 of 16 over four runs |
+| **claim added** | the state is global, not per-process — independent sampler and gate fixture agreed cell-for-cell at the same minute |
+| **claim added** | heavy CoreML work is not sufficient to flip anything — gate run 2 moved nothing |
+| **limitation named** | what the activity acts on is not instrumented; no mechanism is claimed |
+| **limitation named** | **the test remains flaky.** §9.7 reduced the failure rate and did not remove it; three candidate fixes are recorded above, none implemented |
+| **test strengthened** | a passing run records which shapes answered at which setting, with a timestamp |
+| **threshold unchanged** | `answered >= 2`. Not lowered to make gate 4 pass — that is the one move ruled out |
+| **tests added** | 0 |
+| **defect fixed** | a green run of this test destroyed the only record of the quantity it measured |
+
+
+## 10. Two failures in one file, and only one of them was the fixture's
+
+`test_coremlops.py` was intermittently red under the gate — fail, pass, fail
+across three consecutive full runs — with
+
+```
+FAIL test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time:
+     JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+and every other test in the file green on every run. Investigating it turned up
+a **second**, unrelated failure in the same file that is not a test bug at all.
+They are separated here because a fragile fixture and a non-deterministic
+product need opposite responses, and reporting them as one "flaky file" is how
+the first one survived three gate runs.
+
+### 10.1 The intermittent one is the fixture, and §9's own guard already existed
+
+`_npu_fixture` reads the **last line of the subprocess's stdout** as JSON.
+`test_coremlops.py`'s script had a second writer on that stream and no guard:
+CoreML's ANE compiler writes diagnostics straight to **file descriptor 1**,
+which `sys.stdout = io.StringIO()` does not intercept because the write never
+goes through Python. `test_bf16ane.py` had already met this and carried a
+`_STDOUT_GUARD` for it; the guard was a local in that file, so the next fixture
+to need it did not get it.
+
+Why it lands on the *last* line rather than harmlessly above it: Python's
+stdout is block-buffered into the parent's pipe, so the fixture's 5 KB of JSON
+is flushed at interpreter exit, while a native write reaches the pipe the
+moment it is made. A native chunk **with no trailing newline**, or one written
+during shutdown after the flush, therefore shares a line with the JSON. Driven
+directly, with the guard nullified back to `sys.stdout = io.StringIO()`, the
+parent's stdout is:
+
+```
+CreateBnnsGraphProgramFromMIL: noise
+unterminated native chunk{"ok": true}
+a write during shutdown
+```
+
+— whose last line parses to exactly `Expecting value: line 1 column 1
+(char 0)`. Why only one test failed: `_main` runs tests in `sorted()` order,
+`test_a_conv_leaf_is_deferred...` sorts first, and `_CACHE` is populated only
+on success — so the first test pays for the subprocess, and a test *after* a
+failed one silently re-runs it and passes.
+
+Fixed three ways:
+
+* `_STDOUT_GUARD` moved into `test_shim.py`, beside the parent that depends on
+  it, and spliced into every CoreML-reaching fixture script: `test_coremlops`,
+  `test_anepath`, and both of `test_npu2`'s. `test_bf16ane` re-binds the
+  imported name so its existing guard test drives the same text.
+* `_npu_fixture` **reports what it got**. The bare `json.loads` discarded the
+  one string that named the writer, which is why characterising this cost three
+  gate runs; an empty stdout raised `IndexError` and did not even look like a
+  parse problem. Both now raise with the offending line's `repr`, the tail of
+  stdout and stderr, and a pointer to the guard.
+
+### 10.2 The other one is CoreML, and the silent set is growing
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` is red
+on this host — **deterministically**, on the pre-change file as well as the
+changed one, so it is neither this round's doing nor the flakiness above.
+
+§9.1 established that an artefact can come back from `MLComputePlan` with no
+device for any operation, that it is tied to the artefact's bytes, and that it
+is sticky. What is added here is that **an artefact can transition into that
+state**, and that the set of silent ones only grows. Same program, same shapes,
+same interpreter build, measured hours apart on one machine:
+
+| | `(256,1024)` | `(255,1024)` | `(128,1024)` | `(256,1023)` |
+|---|---|---|---|---|
+| relu, earlier (10 runs, identical) | unknown | CPU | CPU | CPU |
+| relu, later (3 runs, identical) | unknown | CPU | CPU | CPU |
+| gelu, earlier (10 runs, identical) | unknown | unknown | **CPU** | CPU |
+| gelu, later (3 runs, identical) | unknown | unknown | **unknown** | CPU |
+
+Nothing in this repository changed between the two blocks; what ran in between
+was `test_bf16ane`, `test_anepath` and `test_npu2`, i.e. more CoreML compiles.
+`gelu` is now down to **one** answering shape, and §9.4's deliberate "at least
+two shapes must answer or the claim is untested" is what fails. That threshold
+is doing exactly its job: the measurement behind "relu and gelu are supported
+on the unit and preferred elsewhere" is no longer obtainable here, and the test
+says so instead of passing on one shape.
+
+It is **not** weakened to fit. Lowering the threshold, or treating `unknown` as
+a pass, would convert a claim this host can no longer measure into a green
+line, which is §9's failure with a third entrance.
+
+Untested hypothesis, recorded as untested: the transition correlates with
+`~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache` reaching
+**18 GB** against 13 GB free on `/`, and bundle-creation failure is also the
+condition under which the ANE compiler writes the fd-1 diagnostics of §10.1 —
+which would make one platform condition the root of both symptoms. Testing it
+means deleting Apple's 18 GB cache, which is outside this change and not
+library code's to delete.
+
+| | |
+|---|---|
+| **fixture defect fixed** | one stdout guard, now shared, spliced into four CoreML fixture scripts |
+| **legibility fixed** | `_npu_fixture` raises with the subprocess's own output instead of discarding it |
+| **product finding** | `MLComputePlan`'s per-op usage is not stable over time for a fixed program; artefacts enter the silent set and stay |
+| **left red, deliberately** | `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` on this host — the measurement is unavailable, and saying so is the point |
+| **tests added** | 2, in `rust/torch_c/pytests/test_coremlops.py`; both nullified |
+
+### 10.4 The host condition was the cause, and clearing Apple's cache proved it
+
+§10 left one failure open and deliberately red:
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission`,
+with `gelu` down to a single answering shape against §9.4's "at least two
+must answer". The round that found it recorded an **untested** hypothesis
+rather than acting on it: `~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache`
+stood at **18 GB against 12 GB free**, and a failure to create a bundle is
+also the condition that produces the fd-1 diagnostics of §10.1 -- one
+platform condition possibly rooting both symptoms. Testing it meant
+deleting Apple's cache, which is outside what a round may do.
+
+**Tested, 2026-09-13: the hypothesis holds.** The cache was removed (19 GB
+recovered, `/` from 12 GB to 31 GB) and the next full gate run passed that
+test, with no change to the repository between the two runs.
+
+So the "sticky, artefact-tied" silence of §9.1 is real but has a
+precondition that is *not* the artefact: when the ANE bundle cache cannot
+grow, CoreML stops answering `MLComputePlan` for programs it has not
+already cached, and the answers it does give are the ones already there.
+That is why the silent set only ever grew, and why the same program
+answered earlier and not later.
+
+Two consequences worth carrying:
+
+* **A green `MLComputePlan` result depends on free disk.** Any conclusion
+  drawn from an empty plan on a machine short of space is a conclusion
+  about the machine. §9.3's `unknown` row is what keeps that from reading
+  as "the CPU ran it", and this is the case it was written for.
+* **The threshold was right not to move.** Lowering "at least two shapes
+  must answer" would have turned a disk-full machine into a green line,
+  permanently, on every host. The round that declined to weaken it and
+  asked instead is the reason this was diagnosable at all.
+
+## 11. The fifth flake: a refusal read as an answer, in two shapes (2026-09-17)
+
+Four CoreML-adjacent flakes were diagnosed and fixed this week. This is the
+fifth, the one that made a gate run a coin toss, and it appeared in at least
+four separate branches' gates on the same day. It showed up as two sentences:
+
+    FAIL test_the_coreml_models_docs_npu_executed_ran_on_the_cpu:
+         AssertionError: ('sigmoid', 'no compute operations in the plan at all')
+
+    FAIL test_the_path_a_user_types_survives_its_own_first_forward:
+         RuntimeError: { NSLocalizedDescription =
+                         "Failed to construct compute plan, internal failure."; }
+
+Neither sentence is true. The first says the *program* has no operations; the
+second kills a forward that had already compiled. Both are CoreML declining to
+answer a **diagnostic** question, read as though it were an answer.
+
+### 11.1 They are two different conditions, measured apart
+
+Established by measurement rather than by their shared consequence, because
+the consequence — "no plan" — is the only thing they have in common.
+
+| | silence | refusal |
+|---|---|---|
+| what `load_from_path` does | returns a plan | **raises** |
+| what the plan says | lists every op, `None` for each | there is no plan |
+| rate observed | **12 of 12** for the fixture's 3rd program | **1 run in 4** on the 211-leaf naive path |
+| the same program alone | answers | answers **12 of 12**, both settings |
+| governed by `compute_units` | **no** — 8 of 8 silent under both settings, §11.2 | no: refused under `ALL` and unprovoked |
+
+Neither is a condition this project controls -- that was the day's other
+wrong turn, corrected in §11.2 -- so both fixes are about *reading* CoreML's
+answer honestly rather than about changing what is asked. Conflating them is not academic: it is how
+"the ANE rejects relu" came to be believed when the truth was "CoreML did not
+answer".
+
+### 11.2 The `ComputeUnit` lead was wrong, and how the confound produced it
+
+The obvious suspect was the compute-unit argument. §9.6 had measured the
+silence as belonging to `ComputeUnit.ALL` — 75% silent against 0.7% at
+`CPU_AND_NE` over 168 observations — and this fixture was still asking under
+`ALL`. An experiment appeared to confirm it outright:
+
+    ALL          mlp ok, cnn ok, sigmoid SILENT
+    CPU_AND_NE   mlp ok, cnn ok, sigmoid ok
+    CPU_ONLY     mlp ok, cnn ok, sigmoid ok
+
+**That experiment was confounded.** All three passes ran in **one process**,
+so the `ALL` pass compiled at positions 1–3 and the other two at 4–6 and 7–9.
+Position and setting varied together, and the conclusion was drawn from the
+one that was easier to see.
+
+Separated — **one sequence per fresh process, 8 processes per setting**, on
+2026-09-17:
+
+| setting | `sigmoid` silent |
+|---|---|
+| `ComputeUnit.ALL` | **8 of 8** |
+| `ComputeUnit.CPU_AND_NE` | **8 of 8** |
+
+The compute-unit argument does not touch this failure. The fixture was briefly
+moved to `CPU_AND_NE` on the strength of the confounded result and has been
+**moved back to `ALL`**, which is what `MLModel` itself would use.
+
+The gate said so before the measurement did: the run that caught it printed
+`CoreML named no device for: nothing` for its `ALL` pass in the *same* run
+whose `CPU_AND_NE` pass had gone silent — the two loops being at positions 1–3
+and 4–6 respectively. A result that contradicts the hypothesis in the same
+breath as confirming it is the shape of a confound.
+
+What *is* established about the condition:
+
+* it is **positional and stateful**, not a property of the program: `sigmoid`
+  compiled first answers; `mlp` then `sigmoid` answers; `cnn` then `sigmoid`
+  answers; four `sigmoid`s in a row all answer. It takes the accumulation of
+  both predecessors.
+* it is **not load** (reproduced at load 1.41 with nothing else running) and
+  **not** the stale `.mlmodelc` debris in the system temp, which was cleared
+  this week without stopping it.
+* it **drifts with host state**. The same fixture went from 12-of-12 silent to
+  0-of-8 within one hour with nothing in this repository changed, and the ANE
+  bundle cache moved between 13 GB and 1.4 GB across the same window — §10.4's
+  precondition, and §11.5.
+
+So the cause sits inside CoreML, keyed on something this project does not
+control and cannot set. That is what decides the shape of the fix in §11.6:
+the suite cannot make CoreML answer, so it must be able to tell that CoreML
+did not.
+
+### 11.3 The fixture's reader was turning a refusal into a claim about the program
+
+`plan_for` in `test_npu2.py` dropped every operation CoreML returned no usage
+for — the same `continue` that §9.3 removed from `compute_plan` and for the
+same reason, left behind in the test's private copy. With every operation
+unnamed, the plan became an **empty list**, and the assertion that fired was
+`rows` — printing *"no compute operations in the plan at all"*, a statement
+about the program, when the truth was that CoreML named no device.
+
+It reads `unknown` rows now, exactly as `compute_plan` does, and the assertion
+that fires names which of the three things went wrong. Pinned with an
+**injected** total silence rather than by waiting for CoreML to produce one,
+because whether CoreML is silent today drifts (§11.5) and a test that only
+bites on a bad day is not a test.
+
+### 11.4 The refusing shape was a diagnostic read destroying a computation
+
+`_compile_for` reads the compute plan on the **forward** path — that is how
+this library can say which unit ran a shape nobody knew until the call. When
+`load_from_path` raised, that `RuntimeError` came out of `model(x)`. The model
+had compiled and would have predicted correctly; the question "which unit"
+had failed, and it took the answer down with it.
+
+The fix is not a retry and not a swallow:
+
+* `compute_plan` raises `ComputePlanRefused` rather than a bare
+  `RuntimeError`, so a caller can catch **this** condition without also
+  catching every lowering failure CoreML can raise.
+* `_compile_for` keeps the compiled model, records the refusal on the report
+  as `torchnative_offload['refused']`, and says `_REFUSED_PLAN` — a sentence
+  distinct from `_UNKNOWN_PLAN`, naming no unit and no precision, because it
+  has evidence about neither.
+* **No plan record is appended.** An empty `plans` list is not the same claim
+  as a plan whose rows are all unknown.
+
+### 11.5 What the rate does *not* prove — and the host condition behind it
+
+Between 18:30 and 18:48 on the same machine the sigmoid silence went from
+**12 of 12 to 0 of 8 with nothing in this repository changed**, before the
+fix in §11.2 was applied. Anyone measuring only the after-rate would have
+credited the fix with a change that had already happened.
+
+The likely reason is §10.4's precondition, and it is **back**:
+
+    ~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache   13 GB
+    /                                                     12 GB free
+
+§10.4 established that when the ANE bundle cache cannot grow, CoreML stops
+answering `MLComputePlan` for programs it has not already cached — and that a
+failure to create a bundle is also the condition behind the fd-1 diagnostics
+of §10.1. A `load_from_path` that fails internally is the same family.
+
+This is **not** the stale-`.mlmodelc` debris in the system temp, which was
+cleared this week and did not stop the recurrence; that is a different
+directory. Clearing Apple's cache is outside what a round may do on its own,
+so it is recorded here and not acted on.
+
+Two things follow, and they are why the fix does not rest on the rate:
+
+* **The A/B is what proves §11.2, not the after-count.** At 18:30, under the
+  *same* host condition, `ALL` was silent 12 of 12 while `CPU_AND_NE`
+  answered. `CPU_AND_NE` is robust to a condition that `ALL` is not.
+* **A green `MLComputePlan` depends on free disk**, so the suite must be able
+  to say "CoreML refused" on a host that is short of it. That is what §11.3's
+  `unknown` rows and §11.4's `refused` record are for: on such a host the
+  gate now reports a refusal by name instead of either crashing or claiming
+  the CPU ran it.
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py ComputePlanRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _REFUSED_PLAN present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_refused present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py _ANSWERING_FLOOR present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_refused_compute_plan_does_not_end_the_forward present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refused_compute_plan_says_so_in_its_own_sentence present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refusal_and_a_silence_do_not_share_one_sentence present -->

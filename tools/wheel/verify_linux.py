@@ -77,7 +77,7 @@ REPO = Path(__file__).resolve().parents[2]
 # Same default and same variable as tools/wheel/build.py, so the libpython the
 # imports are resolved against is the one the tag was derived from.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
-    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
+    "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/thisisthepy/torchnative/.caches/target-python"))
 
 #: Tag architecture -> the distribution the imports are resolved against, and
 #: the `elf_info` machine the members must be.

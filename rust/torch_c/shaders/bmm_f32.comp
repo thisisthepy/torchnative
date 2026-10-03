@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: total elements in C (batch * M * N)
+// p1: M
+// p2: K
+// p3: N
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    
+    uint M = pc.p1;
+    uint K = pc.p2;
+    uint N = pc.p3;
+    
+    uint mn = M * N;
+    uint batch = idx / mn;
+    uint rem = idx % mn;
+    uint row = rem / N;
+    uint col = rem % N;
+    
+    uint a_offset = batch * M * K;
+    uint b_offset = batch * K * N;
+    uint c_offset = batch * M * N;
+    
+    float sum = 0.0;
+    for (uint i = 0; i < K; i++) {
+        sum += a[a_offset + row * K + i] * b[b_offset + i * N + col];
+    }
+    
+    c[idx] = sum;
+}

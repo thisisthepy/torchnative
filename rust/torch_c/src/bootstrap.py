@@ -316,6 +316,34 @@ class _ShimMeta(type):
         setattr(cls, name, value)
         return value
 
+    def __instancecheck__(cls, instance):
+        """`isinstance(arg.type, torch.TensorType)`, the other half of `get()`.
+
+        Five places in the vendored tree ask this of a *schema* type rather
+        than comparing against the singleton -- `torch/library.py:100,164,178`,
+        `torch/distributed/tensor/_sharding_prop.py:119`,
+        `torch/_higher_order_ops/out_dtype.py:58` -- and a `_SchemaType` is not
+        an instance of the synthesised stub class, so every one of them read
+        `False`.
+
+        The alias annotation is stripped before comparing, because it is not
+        part of the type: upstream's `Tensor(a!)` argument is a `TensorType`
+        with an `AliasInfo` beside it, which is exactly how this shim stores it
+        too. `Tensor?` and `Tensor[]` are NOT `TensorType` on either side --
+        upstream wraps them in `OptionalType`/`ListType` -- so the decomposition
+        refuses them by checking the two flags.
+
+        Everything that is not a `_SchemaType` falls through to the ordinary
+        rule, so this cannot change what any other synthesised class means.
+        """
+        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
+        if spelling is not None and type(instance) is _SchemaType:
+            base, is_list, optional, _ = _decompose_type(str(instance))
+            if is_list or optional:
+                return False
+            return base == spelling
+        return type.__instancecheck__(cls, instance)
+
 
 # Types whose metatype must be exactly `type`. `torch/autograd/variable.py:14`
 # is `class Variable(_C._LegacyVariableBase, metaclass=VariableMeta)` where
@@ -492,9 +520,28 @@ def _build_type(name, spec, module_name, resolved):
 
 
 def _singleton_getter():
+    """`_C.<X>Type.get()`, the TorchScript type singletons.
+
+    For the twelve scalar types `_SchemaType` knows a spelling for, `get()`
+    hands back **the interned `_SchemaType`** rather than an instance of the
+    stub class. That is what makes
+
+        schema.returns[0].type is torch._C.TensorType.get()
+
+    -- `torch/_subclasses/fake_impls.py:159`, the tensor-constructor test --
+    answerable at all. Before this it was `False` for every op in the file.
+
+    Everything else keeps the old behaviour: one stub instance per class,
+    created on demand. `torch/_higher_order_ops/schema.py:56` builds a dict of
+    these at import and the tree uses them as keys, so `get()` must be stable
+    whichever branch it takes.
+    """
     cache: dict = {}
 
     def get(cls):
+        spelling = _SchemaType._SINGLETON_SPELLINGS.get(cls.__name__)
+        if spelling is not None:
+            return _SchemaType(spelling)
         if cls not in cache:
             cache[cls] = cls()
         return cache[cls]
@@ -535,17 +582,66 @@ def _order_types(types_spec):
 class _SchemaType:
     """A type inside a schema, kept as its source spelling.
 
-    Not comparable to the TorchScript type singletons (`_C.TensorType.get()`
-    and friends): `torch/_library/utils.py:163` decides "is this a tensor
-    argument" by comparing against those objects, and answering `True` from a
-    string match would be claiming a correspondence the shim has not built.
-    Answering `False` makes the callers take their conservative branch, which
-    is the safe direction.
+    **It IS the TorchScript type singleton now**, and that is a change from
+    what this docstring used to say. The old text declined the correspondence
+    -- "answering `True` from a string match would be claiming a correspondence
+    the shim has not built" -- and was right to while the correspondence did
+    not exist. It exists now: instances are interned per spelling (`__new__`),
+    `_C.TensorType.get()` returns the interned `Tensor`, and `_ShimMeta`'s
+    `__instancecheck__` reads the same table. So `type is TensorType.get()` and
+    `isinstance(type, TensorType)` are answered by identity and by a decomposed
+    spelling respectively, not simulated.
+
+    The conservative `False` was not free. `torch/_subclasses/fake_impls.py:159`
+    uses that identity to decide "is this op a tensor constructor", and a
+    blanket `False` meant no factory op ever reached upstream's constructor
+    handler -- which is `docs/graph/EXPORT5.md` §10's `Could not find common
+    device` wall, on ten architectures.
+
+    What is still declined: a parametrised type lattice. `isSubtypeOf` answers
+    only equality-on-spelling plus `Any`, and `containedTypes` unwraps one
+    layer; anything wider would be inventing rules.
     """
 
     __slots__ = ("_spelling",)
 
+    #: spelling -> the one instance for it. See `__new__`.
+    _INTERNED: dict = {}
+
+    def __new__(cls, spelling: str):
+        """One object per spelling, for the whole process.
+
+        Interning is not a memory optimisation; it is what makes **identity**
+        answerable. `torch/_subclasses/fake_impls.py:159` decides whether an op
+        is a tensor constructor with
+
+            schema.returns[0].type is torch._C.TensorType.get()
+
+        and `is` cannot be satisfied by a type that mints a fresh object per
+        schema. With the table interned, `TensorType.get()` can hand back the
+        `Tensor` entry and every schema that spells `Tensor` gets that same
+        object. `docs/graph/EXPORT5.md` §10's `Could not find common device for
+        aten.arange.start_step` was this: no op was ever a constructor, so
+        `arange` reached the generic path, which looks for a device among
+        arguments that `arange` does not have.
+
+        Safe because a `_SchemaType` is immutable -- `__slots__`, one field,
+        written once here -- so two callers sharing one cannot disturb each
+        other. Unbounded, like `_decompose_type`'s memo and for the same
+        reason: the tables hold a few hundred distinct spellings.
+        """
+        interned = cls._INTERNED.get(spelling)
+        if interned is not None:
+            return interned
+        self = super().__new__(cls)
+        self._spelling = spelling
+        cls._INTERNED[spelling] = self
+        return self
+
     def __init__(self, spelling: str) -> None:
+        # `__new__` has already set it, on the first construction and on every
+        # later one. Assigning again is harmless and keeps the field's owner
+        # visible in one place.
         self._spelling = spelling
 
     def __str__(self) -> str:
@@ -633,6 +729,81 @@ class _SchemaType:
             return [_SchemaType(base)]
         return []
 
+    #: Schema base spelling -> the spelling upstream's `annotation_str` uses.
+    #:
+    #: Not invented and not a reading: it is the exact map read off upstream
+    #: torch 2.13.0 by parsing all 2584 `- func:` entries of the vendored
+    #: `native_functions.yaml` on both sides and pairing argument by argument.
+    #: `test_export6.py` re-derives it that way on every run, so a wrong entry
+    #: here is a failure and not a drift.
+    #:
+    #: The lossy rows are upstream's, not a simplification made here.
+    #: `ScalarType`, `Layout`, `MemoryFormat` and `DeviceIndex` all annotate as
+    #: plain `int`, and `SymInt`/`SymBool` as `int`/`bool` -- because
+    #: `torch/fx/operator_schemas.py:71` `_type_eval_globals` has no name for
+    #: any of them, so any more faithful spelling would `eval` to `NameError`
+    #: and stop `torch.export` exactly as the missing attribute did.
+    _ANNOTATION_BASES = {
+        "Tensor": "Tensor",
+        "Scalar": "number",
+        "number": "number",
+        "int": "int",
+        "SymInt": "int",
+        "DeviceIndex": "int",
+        "Layout": "int",
+        "MemoryFormat": "int",
+        "ScalarType": "int",
+        "bool": "bool",
+        "SymBool": "bool",
+        "float": "float",
+        "SymFloat": "float",
+        "complex": "complex",
+        "str": "str",
+        "Device": "Device",
+        "Generator": "Generator",
+        "Storage": "Storage",
+        "Stream": "Stream",
+        "QScheme": "QScheme",
+        "None": "NoneType",
+    }
+
+    @property
+    def annotation_str(self) -> str:
+        """The Python annotation for this type, as `eval`'d by `torch.fx`.
+
+        `torch/fx/operator_schemas.py:95` is the caller that matters:
+
+            return eval(ts_type.annotation_str, _type_eval_globals)
+
+        and `torch/export`'s normalisation reaches it for every argument of
+        every op it traces. Its absence was `docs/graph/EXPORT5.md` §10's
+        largest wall -- 14 of the 26 architectures that stopped at export.
+
+        Deliberately *not* `__str__`. Upstream's `JitType.__str__` and its
+        `annotation_str` happen to coincide, but this shim's `__str__` is the
+        schema spelling (`Tensor?`, `int[]`), which `_decompose_type` and every
+        binding path reads. Two different jobs, and merging them would have
+        `_bind` start seeing `Optional[Tensor]` where it expects `Tensor?`.
+
+        Recursive rather than table-driven on the whole spelling, because `?`
+        and `[]` nest in both orders: `int[]?` is `Optional[List[int]]` and
+        `Tensor?[]` is `List[Optional[Tensor]]`, and a flat table would have to
+        enumerate the cross product.
+
+        An unrecognised base passes through unchanged, which is upstream's own
+        fallback (`AnyEnumType`, `t`, `__torch__.X` all annotate as their own
+        name). It is not a guess in the dangerous direction: a base this shim
+        has never seen produces a `NameError` inside `eval` -- loud, named, and
+        at the call site -- rather than a plausible wrong type.
+        """
+        base, is_list, optional, _ = _decompose_type(self._spelling)
+        if is_list:
+            inner = _SchemaType(base).annotation_str
+            rendered = f"List[{inner}]"
+        else:
+            rendered = self._ANNOTATION_BASES.get(base, base)
+        return f"Optional[{rendered}]" if optional else rendered
+
 
 #: `(op spelling, predicate)` for every question answered from a schema with no
 #: text behind it. Read through `_C._shim_unanswered_predicates()`; see
@@ -649,22 +820,138 @@ class _AliasInfo:
         self.after_set = set(symbols)
 
 
-class _Argument:
-    __slots__ = ("name", "type", "kwarg_only", "default_value", "alias_info", "N")
+#: Sentinel for "the default has not been evaluated yet". `None` cannot be it:
+#: `None` is the single most common default in the file (1112 arguments), so a
+#: `None` cache would re-evaluate every one of them on every read.
+_UNEVALUATED = object()
 
-    def __init__(self, name, typ, kwarg_only, default_value, alias_info, N=None):
+
+class _Argument:
+    __slots__ = (
+        "name", "type", "kwarg_only", "default_source", "alias_info", "N",
+        "_default_cache",
+    )
+
+    def __init__(self, name, typ, kwarg_only, default_source, alias_info, N=None):
         self.name = name
         self.type = typ
         self.kwarg_only = kwarg_only
-        self.default_value = default_value
+        #: The default exactly as the schema spells it -- `"None"`, `"0"`,
+        #: `"[-2,-1]"`, `"Mean"` -- or `None` when there is no default at all.
+        #: This is what the binder reads (`_ArgPlan.default_source`), because
+        #: "is this argument equal to its own default" is decided on the text.
+        self.default_source = default_source
         self.alias_info = alias_info
         self.N = N
+        self._default_cache = _UNEVALUATED
 
     def has_default_value(self):
-        return self.default_value is not None
+        """Whether the schema declares a default, independent of its value.
+
+        Deliberately not `self.default_value is not None`, which is what it
+        used to be. That coupling is why `default_value` had to stay a string:
+        1112 of this file's arguments default to `None`, and under the old test
+        every one of them would have answered "no default". Upstream draws the
+        distinction and so does this -- `Tensor? bias=None` HAS a default, and
+        that default IS `None`.
+        """
+        return self.default_source is not None
+
+    @property
+    def default_value(self):
+        """The default as a Python VALUE, which is upstream's contract.
+
+        This used to answer the schema's source text, and it was never wrong
+        for the only caller it had: this shim's own binder re-parses that text.
+        The first reader from outside the shim got a string. It is
+        `torch/_subclasses/fake_impls.py:218`, and it does not inspect what it
+        got -- `normalize_function(..., normalize_to_only_use_kwargs=True)`
+        fills every unsupplied argument from here and hands the lot straight
+        back to the op:
+
+            r = func(*args, **{..., 'layout': 'None', 'device': 'None'})
+
+        so `torch.device('None')` is what raised, one frame further in, naming
+        a device type it had never heard of. That is the `docs/graph/COMPILE.md`
+        shape exactly: the failure surfaced nowhere near the wrong answer.
+
+        Evaluated lazily and cached. Schema parsing is per-op and on the import
+        path; almost no caller reads a default at all, and the ones that do
+        read all of them.
+        """
+        if self._default_cache is _UNEVALUATED:
+            self._default_cache = _default_python_value(
+                str(self.type), self.default_source
+            )
+        return self._default_cache
 
     def __repr__(self):
         return f"{self.type} {self.name}"
+
+
+def _default_python_value(type_spelling: str, source):
+    """`("int[2]", "0")` -> `[0, 0]`. The schema's default text as a value.
+
+    Every rule here is upstream's own, read off `torch._C.parse_schema` over
+    all 2584 `- func:` entries of the vendored `native_functions.yaml` and
+    compared argument by argument -- `test_export6.py` re-derives the whole
+    comparison on every run, so a rule that is merely plausible fails.
+
+    The four that are not obvious:
+
+    * **The sized-list broadcast.** `int[2] padding=0` defaults to `[0, 0]`,
+      not to `0`. It is the same rule the schema *printer* above already
+      encodes in the other direction (`_print_schema_default`'s rule 4), and
+      it has to be here too or `conv2d`'s stride would arrive as a scalar.
+    * **The element type decides int vs float.** `float alpha=1` is `1.0`
+      while `Scalar alpha=1` is `1`, because the second is an int IValue.
+      Deciding on the literal alone would get twelve arguments wrong.
+    * **Three defaults are enumerators**, `Mean` / `long` /
+      `contiguous_format`, and upstream answers their integer.
+      `_SCHEMA_ENUM_DEFAULTS` is the same table the printer uses.
+    * **An unparseable literal is returned as text** rather than guessed at.
+      Nothing in 2.13.0's file reaches that, and if something ever does, a
+      caller sees the schema's own spelling instead of a wrong number.
+    """
+    if source is None:
+        return None
+    text = source.strip()
+    if text == "None":
+        return None
+    if text == "True":
+        return True
+    if text == "False":
+        return False
+    base, is_list, _optional, size = _decompose_type(type_spelling)
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        return [_default_scalar(base, part.strip()) for part in _split_top_level(inner)]
+    value = _default_scalar(base, text)
+    if is_list:
+        return [value] * (size or 1)
+    return value
+
+
+def _default_scalar(base: str, literal: str):
+    if literal in _SCHEMA_ENUM_DEFAULTS:
+        return int(_SCHEMA_ENUM_DEFAULTS[literal])
+    if len(literal) >= 2 and literal[0] in "\"'" and literal[-1] == literal[0]:
+        return _unquote_schema_string(literal)
+    if base in ("float", "SymFloat"):
+        try:
+            return float(literal)
+        except ValueError:
+            return literal
+    try:
+        return int(literal)
+    except ValueError:
+        pass
+    try:
+        return float(literal)
+    except ValueError:
+        return literal
 
 
 def _split_top_level(text: str) -> list:
@@ -920,8 +1207,19 @@ def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
         spelling, name = chunk, ""
 
     alias_info = None
-    if "(" in spelling and spelling.endswith(")"):
-        inner = spelling[spelling.index("(") + 1 : -1]
+    if "(" in spelling and ")" in spelling:
+        # The annotation directly follows the base type and is the *first*
+        # parenthesised group, which matters because a list or optional suffix
+        # can come after it: `Tensor(a!)[]`, `Tensor(a!)?`, `Tensor(a)[]`.
+        #
+        # This used to require `spelling.endswith(")")`, which is true for
+        # `Tensor(a!)` and false for `Tensor(a!)[]` -- so a **mutable list of
+        # tensors got no `alias_info` at all** and every consumer read it as
+        # non-mutating. Found by the exhaustive `_SchemaInfo` comparison in
+        # `test_liftfresh.py` rather than predicted: upstream answers
+        # `is_write=True` for `_amp_foreach_non_finite_check_and_unscale_`'s
+        # `Tensor(a!)[] self` and this answered False.
+        inner = spelling[spelling.index("(") + 1 : spelling.index(")")]
         # `Tensor(a!)` mutates; `Tensor(a)` only aliases.
         alias_info = _AliasInfo("!" in inner, inner.replace("!", "").split("|"))
     return _Argument(name.strip(), _SchemaType(spelling.strip()), kwarg_only, default,
@@ -1422,6 +1720,266 @@ _DISPATCH_REGISTRATIONS: dict = {}
 #: -- the file lists what upstream's C++ build registers, and answering with
 #: that here would claim 1500 kernels this shim does not have. Those are
 #: refused by name; see `_dispatch_registrations`.
+#: `_dispatch_is_included_in_alias(k, alias)` -- which concrete keys each alias
+#: key expands to. Measured against a live upstream over the full 145x145
+#: `DispatchKey` cross product, not inferred from the names:
+#: `rust/torch_c/pytests/test_aliasinc.py`.
+#:
+#: **Only six of upstream's 145 keys expand beyond themselves**; every other
+#: key includes itself and nothing else, which is why this is six entries and
+#: not a 145-row table. `ADInplaceOrView` reads like an alias and is not one.
+#:
+#: Upstream's whole rule is then
+#:
+#:     k != Undefined and (k == alias or k in _ALIAS_EXPANSION.get(alias, ()))
+#:
+#: which reproduces 20869 of the 20881 pairs upstream answers. The 12 misses
+#: are six symmetric pairs of *enum-value aliases* -- `EndOfDenseBackends` is
+#: the same number as `Meta` -- and none of those six names exists in the
+#: vendored `DispatchKey`, so the rule is exact on everything askable here.
+#:
+#: **This is a list, and lists rot.** What keeps it from rotting silently is
+#: that the tests re-derive all of it from a live upstream every run and assert
+#: three separate things: the full cross product agrees, *exactly* these six
+#: aliases expand (so a new upstream alias reddens rather than being answered
+#: `False`), and the 123/17/22 name partition between this enum and upstream's
+#: is unchanged (so a vendor bump cannot shrink what the first test compares
+#: and still look green).
+#:
+#: Names upstream has and the vendored stub does not are dropped, and are
+#: recorded in the comment above each entry. That direction is safe: a key this
+#: enum cannot spell cannot be passed in. The reverse -- the 17 the stub has
+#: and upstream's runtime enum does not (`Vulkan`, `MKLDNN`, `Named`,
+#: `Tracer`, ...) -- answer `False` for every alias, because upstream cannot be
+#: asked about them and guessing would be claiming a kernel.
+_ALIAS_EXPANSION = {
+    # upstream: 27 keys; 3 not in the vendored enum (AutogradMAIA, EndOfAutogradFunctionalityBackends, StartOfAutogradFunctionalityBackends)
+    "Autograd": (
+        "Autograd", "AutogradCPU", "AutogradCUDA", "AutogradFunctionality", "AutogradHIP",
+        "AutogradHPU", "AutogradIPU", "AutogradLazy", "AutogradMPS", "AutogradMTIA",
+        "AutogradMeta", "AutogradNestedTensor", "AutogradOther", "AutogradPrivateUse1",
+        "AutogradPrivateUse2", "AutogradPrivateUse3", "AutogradVE", "AutogradXLA",
+        "AutogradXPU", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "FuncTorchBatchedDecomposition",
+    ),
+    # upstream: 82 keys; 12 not in the vendored enum (EndOfDenseBackends, EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfDenseBackends, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "CompositeExplicitAutograd": (
+        "Autograd", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "Lazy", "MAIA", "MPS", "MTIA", "Meta", "PrivateUse1",
+        "PrivateUse2", "PrivateUse3", "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP",
+        "QuantizedHPU", "QuantizedIPU", "QuantizedLazy", "QuantizedMPS", "QuantizedMTIA",
+        "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU", "Sparse",
+        "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrLazy", "SparseCsrMPS",
+        "SparseCsrMTIA", "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP",
+        "SparseHPU", "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU", "VE", "XLA", "XPU",
+    ),
+    # upstream: 57 keys; 9 not in the vendored enum (EndOfDenseBackends, EndOfQuantizedBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, StartOfDenseBackends, StartOfQuantizedBackends, StartOfSparseCsrBackends)
+    "CompositeExplicitAutogradNonFunctional": (
+        "Autograd", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "MAIA", "MPS", "MTIA", "Meta", "PrivateUse1", "PrivateUse2",
+        "PrivateUse3", "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP", "QuantizedHPU",
+        "QuantizedIPU", "QuantizedMPS", "QuantizedMTIA", "QuantizedMeta",
+        "QuantizedPrivateUse1", "QuantizedPrivateUse2", "QuantizedPrivateUse3",
+        "QuantizedVE", "QuantizedXPU", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrMPS", "SparseCsrMTIA",
+        "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXPU", "VE", "XPU",
+    ),
+    # upstream: 122 keys; 18 not in the vendored enum (AutogradMAIA, EndOfAutogradFunctionalityBackends, EndOfDenseBackends, EndOfNestedTensorBackends, EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, NestedTensorMAIA, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfAutogradFunctionalityBackends, StartOfDenseBackends, StartOfNestedTensorBackends, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "CompositeImplicitAutograd": (
+        "Autograd", "AutogradCPU", "AutogradCUDA", "AutogradFunctionality", "AutogradHIP",
+        "AutogradHPU", "AutogradIPU", "AutogradLazy", "AutogradMPS", "AutogradMTIA",
+        "AutogradMeta", "AutogradNestedTensor", "AutogradOther", "AutogradPrivateUse1",
+        "AutogradPrivateUse2", "AutogradPrivateUse3", "AutogradVE", "AutogradXLA",
+        "AutogradXPU", "CPU", "CUDA", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "Dense", "FuncTorchBatchedDecomposition",
+        "HIP", "HPU", "IPU", "Lazy", "MAIA", "MPS", "MTIA", "Meta", "NestedTensor",
+        "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP", "NestedTensorHPU",
+        "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS", "NestedTensorMTIA",
+        "NestedTensorMeta", "NestedTensorPrivateUse1", "NestedTensorPrivateUse2",
+        "NestedTensorPrivateUse3", "NestedTensorVE", "NestedTensorXLA", "NestedTensorXPU",
+        "PrivateUse1", "PrivateUse2", "PrivateUse3", "QuantizedCPU", "QuantizedCUDA",
+        "QuantizedHIP", "QuantizedHPU", "QuantizedIPU", "QuantizedLazy", "QuantizedMPS",
+        "QuantizedMTIA", "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU", "Sparse",
+        "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU", "SparseCsrCUDA",
+        "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU", "SparseCsrLazy", "SparseCsrMPS",
+        "SparseCsrMTIA", "SparseCsrMeta", "SparseCsrPrivateUse1", "SparseCsrPrivateUse2",
+        "SparseCsrPrivateUse3", "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP",
+        "SparseHPU", "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU", "VE", "XLA", "XPU",
+    ),
+    # upstream: 26 keys; 3 not in the vendored enum (EndOfNestedTensorBackends, NestedTensorMAIA, StartOfNestedTensorBackends)
+    "CompositeImplicitAutogradNestedTensor": (
+        "Autograd", "AutogradNestedTensor", "CompositeExplicitAutograd",
+        "CompositeExplicitAutogradNonFunctional", "CompositeImplicitAutograd",
+        "CompositeImplicitAutogradNestedTensor", "FuncTorchBatchedDecomposition",
+        "NestedTensor", "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP",
+        "NestedTensorHPU", "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS",
+        "NestedTensorMTIA", "NestedTensorMeta", "NestedTensorPrivateUse1",
+        "NestedTensorPrivateUse2", "NestedTensorPrivateUse3", "NestedTensorVE",
+        "NestedTensorXLA", "NestedTensorXPU",
+    ),
+    # upstream: 7 keys; 0 not in the vendored enum (none)
+    "FuncTorchBatchedDecomposition": (
+        "Autograd", "CompositeExplicitAutograd", "CompositeExplicitAutogradNonFunctional",
+        "CompositeImplicitAutograd", "CompositeImplicitAutogradNestedTensor",
+        "FuncTorchBatched", "FuncTorchBatchedDecomposition",
+    ),
+}
+
+
+#: `_dispatch_get_backend_keyset_from_autograd(k)` -- `c10::getBackendKeySetFromAutograd`,
+#: the backend keys an autograd key was entered from. Measured against a live
+#: upstream over all 145 `DispatchKey`s by *enum membership*, never inferred
+#: from the names and never read out of a keyset's `repr`:
+#: `rust/torch_c/pytests/test_bkeyset.py`.
+#:
+#: **Only 16 of upstream's 145 keys answer a non-empty set**, and two of those
+#: 16 are keys the vendored enum does not have (`AutogradMAIA` and
+#: `EndOfAutogradFunctionalityBackends`, the latter being `AutogradMeta`'s
+#: value under a second name). So this is 14 entries, and everything else --
+#: every backend key, every autocast key, and `Autograd` itself -- answers the
+#: empty set.
+#:
+#: **The obvious rule is wrong for four keys.** "Strip `Autograd`, return that
+#: backend" would invent memberships for `AutogradHIP`, `AutogradVE`,
+#: `AutogradMTIA` and `AutogradFunctionality`, all of which exist upstream and
+#: all of which answer **empty** -- upstream's `getBackendKeySetFromAutograd`
+#: is a `switch` with explicit cases and those are not among them. That is why
+#: this is a measured table and not a derivation;
+#: `test_four_autograd_keys_answer_empty_so_the_name_rule_is_wrong` is what
+#: keeps the exception from being quietly "fixed" into the derivation.
+#:
+#: **This is a list, and lists rot.** The same three-way guard
+#: `_ALIAS_EXPANSION` has applies here and for the same reason: the tests
+#: re-derive every number from a live upstream on each run and assert the
+#: agreement element-wise, the *shape* (exactly these 16 keys answer non-empty,
+#: so a new autograd backend reddens rather than being answered empty), and the
+#: 123/17/22 name partition this agreement is valid over (so a vendor bump
+#: cannot shrink what the comparison covers and still look green).
+#:
+#: Members upstream reports that this enum cannot spell are dropped, and named
+#: in the comment above each entry. They are the `StartOf*`/`EndOf*` sentinels
+#: -- which are other keys' values under a second name, not extra keys -- plus
+#: the `MAIA` backends. That direction is safe: a name this enum cannot spell
+#: cannot be passed in or asked about. The reverse, the 17 names the stub has
+#: and upstream's runtime enum does not, answer the **empty** set, which is the
+#: direction that never claims a backend.
+#:
+#: What answering this bought, measured rather than assumed: **nothing yet.**
+#: Of 4893 `resolve_key` results over the aten surface, the 3547 that died on
+#: this name now split onto `_dispatch_is_alias_key` (2719) and
+#: `_dispatch_has_backend_fallback` (828), and **zero newly resolve**. The
+#: chain does terminate, though, and it is exactly those two names plus the
+#: `_dispatch_autogradother_backends` value: `docs/graph/BKEYSET.md` 3.
+_AUTOGRAD_BACKEND_KEYSET = {
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradCPU": (
+        "CPU", "Dense",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradCUDA": (
+        "CUDA", "Dense",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradHPU": (
+        "Dense", "HPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradIPU": (
+        "Dense", "IPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradLazy": (
+        "Dense", "Lazy",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradMPS": (
+        "Dense", "MPS",
+    ),
+    # upstream: 4 keys; 2 not in the vendored enum (EndOfDenseBackends, StartOfDenseBackends)
+    "AutogradMeta": (
+        "Dense", "Meta",
+    ),
+    # upstream: 19 keys; 3 not in the vendored enum (EndOfNestedTensorBackends, NestedTensorMAIA, StartOfNestedTensorBackends)
+    "AutogradNestedTensor": (
+        "NestedTensor", "NestedTensorCPU", "NestedTensorCUDA", "NestedTensorHIP",
+        "NestedTensorHPU", "NestedTensorIPU", "NestedTensorLazy", "NestedTensorMPS",
+        "NestedTensorMTIA", "NestedTensorMeta", "NestedTensorPrivateUse1",
+        "NestedTensorPrivateUse2", "NestedTensorPrivateUse3", "NestedTensorVE",
+        "NestedTensorXLA", "NestedTensorXPU",
+    ),
+    # upstream: 57 keys; 10 not in the vendored enum (EndOfQuantizedBackends, EndOfSparseBackends, EndOfSparseCsrBackends, Quantized, QuantizedMAIA, SparseCsrMAIA, SparseMAIA, StartOfQuantizedBackends, StartOfSparseBackends, StartOfSparseCsrBackends)
+    "AutogradOther": (
+        "QuantizedCPU", "QuantizedCUDA", "QuantizedHIP", "QuantizedHPU",
+        "QuantizedIPU", "QuantizedLazy", "QuantizedMPS", "QuantizedMTIA",
+        "QuantizedMeta", "QuantizedPrivateUse1", "QuantizedPrivateUse2",
+        "QuantizedPrivateUse3", "QuantizedVE", "QuantizedXLA", "QuantizedXPU",
+        "Sparse", "SparseCPU", "SparseCUDA", "SparseCsr", "SparseCsrCPU",
+        "SparseCsrCUDA", "SparseCsrHIP", "SparseCsrHPU", "SparseCsrIPU",
+        "SparseCsrLazy", "SparseCsrMPS", "SparseCsrMTIA", "SparseCsrMeta",
+        "SparseCsrPrivateUse1", "SparseCsrPrivateUse2", "SparseCsrPrivateUse3",
+        "SparseCsrVE", "SparseCsrXLA", "SparseCsrXPU", "SparseHIP", "SparseHPU",
+        "SparseIPU", "SparseLazy", "SparseMPS", "SparseMTIA", "SparseMeta",
+        "SparsePrivateUse1", "SparsePrivateUse2", "SparsePrivateUse3", "SparseVE",
+        "SparseXLA", "SparseXPU",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse1": (
+        "Dense", "PrivateUse1",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse2": (
+        "Dense", "PrivateUse2",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradPrivateUse3": (
+        "Dense", "PrivateUse3",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradXLA": (
+        "Dense", "XLA",
+    ),
+    # upstream: 3 keys; 1 not in the vendored enum (StartOfDenseBackends)
+    "AutogradXPU": (
+        "Dense", "XPU",
+    ),
+}
+
+
+#: `_dispatch_has_backend_fallback(k)` -- the dispatch keys this shim has a
+#: fallback kernel at, meaning a kernel that catches *every* operator sent to
+#: that key. **It is empty, and that is the answer rather than a placeholder.**
+#:
+#: Upstream's own set has 37 keys and must not be copied: `resolve_key` hands
+#: back the key itself when this says `True`, so borrowing upstream's set would
+#: promise a fallback for 1861 more `(op, key)` pairs than this shim can serve
+#: -- the same claim `_DISPATCH_REGISTRATIONS` refuses above, at a different
+#: scale. `docs/graph/BFALLBACK.md` has the measurement and names the 32
+#: spellable capability gaps that answering `False` leaves open.
+#:
+#: This is deliberately *not* fed by `_dispatch_library(...).fallback(...)`.
+#: Those registrations are recorded into `_shim_registrations` and dropped, so
+#: marking their key effective would claim a kernel that can never run. When a
+#: round wires Python fallbacks through to `_aten_dispatch`, this is the set it
+#: adds to, and `rust/torch_c/pytests/test_bfallback.py` reddens until both
+#: sides move together.
+_SHIM_BACKEND_FALLBACKS: frozenset = frozenset()
+
+
 _FILE_DECLARED_DISPATCH_KEYS = (
     "CompositeImplicitAutograd",
     "CompositeImplicitAutogradNestedTensor",
@@ -2234,9 +2792,10 @@ class _ArgPlan:
         # The list twin of `scalar_int`: a `SymInt[]`/`int[]` position whose
         # elements may each need `_symint_from_tensor`'s unpack.
         self.int_list = bool(is_list and base in ("int", "SymInt"))
-        # `_Argument.has_default_value()` is exactly this test.
-        self.default_source = argument.default_value
-        self.has_default = argument.default_value is not None
+        # `_Argument.has_default_value()` is exactly this test. The SOURCE
+        # text, not the value: `_is_schema_default` compares on the spelling.
+        self.default_source = argument.default_source
+        self.has_default = argument.default_source is not None
         self.predicate = None
 
 
@@ -2534,6 +3093,12 @@ class _Overloads:
                 source = by_name[name].default_source
                 if source is None or not _is_schema_default(value, source):
                     result[name] = value
+            # `pin_memory=True` on a cpu result is served unpinned -- see
+            # `_pin_memory_is_cpu`. One dict probe on the hot path.
+            if result.get("pin_memory") is True and _pin_memory_is_cpu(result):
+                del result["pin_memory"]
+            if "generator" in result:
+                key = _GENERATOR_KEY_ALIAS.get(key, key)
             return key, result
 
         owner = "Tensor." if self.self_bound else "torch."
@@ -2543,6 +3108,58 @@ class _Overloads:
             f"({_describe_call(shown, kwargs)}). Candidates tried, in order:\n"
             + "\n".join(f"  {schema}" for schema in self.schemas)
         )
+
+
+# The `*_generator` overloads of `randint` and `randperm` are separate schemas
+# upstream (`generator` is required, keyword-only, and has no default) but the
+# same draw: the kernels in aten.rs read the stream off `generator=` themselves
+# (`generator_arg`), so these three keys are served by the plain kernels rather
+# than by three more implemented ops that would each need a golden case for
+# what is one computation. Applied once, in `_Overloads.resolve`, only when a
+# generator is present.
+_GENERATOR_KEY_ALIAS = {
+    "aten.randint.low_generator": "aten.randint.low",
+    "aten.randint.generator": "aten.randint.default",
+    "aten.randperm.generator": "aten.randperm.default",
+}
+
+
+def _pin_memory_is_cpu(bound) -> bool:
+    """May `pin_memory=True` be accepted for this call? Only when the result is
+    a cpu tensor.
+
+    **What accepting means.** This shim has no pinned allocator, so the call is
+    served as if `pin_memory` had not been passed: an ordinary cpu tensor, and
+    `Tensor.is_pinned()` says `False`. Pinning changes where the bytes live,
+    never what they are, so no value differs. (Issue #30, decision 2.)
+
+    **The upstream deviation, measured on Mac with torch 2.13.0.**
+    `torch.zeros(2, device="cpu", pin_memory=True)` returns an *mps* tensor
+    there -- upstream pins through the accelerator's host allocator, and on a
+    Mac that accelerator is mps. So upstream's continuous batching, which pins
+    its cpu IO buffers whenever it sees a second device, does not run on a Mac
+    with a cpu model; this shim's does. That is a deviation in the shim's
+    favour, not an agreement claim: the two builds hand back different devices
+    for the same call. On Linux upstream pins in cuda host memory and answers
+    cpu, which is what this does too, minus the pinning.
+
+    A non-cpu target keeps the refusal by name from the kernel -- upstream
+    raises there too ("Only dense CPU tensors can be pinned"), and quietly
+    returning an unpinned accelerator tensor would be a different answer.
+    `bound` is the binder's `{name: value}` result; a `*_like` / `new_*` call
+    inherits its device from `self`.
+    """
+    device = bound.get("device")
+    if device is None:
+        like = bound.get("self")
+        device = getattr(like, "device", None) if like is not None else None
+        if device is None:
+            return True
+    if isinstance(device, str):
+        return device.split(":")[0] == "cpu"
+    if isinstance(device, int):
+        return False
+    return getattr(device, "type", None) == "cpu"
 
 
 def _describe_call(args, kwargs) -> str:
@@ -3039,6 +3656,106 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     module.Size = Size
     resolved["Size"] = Size
+
+    # `torch._C._SchemaInfo` -- the third wall of `docs/graph/LIFTFRESH.md`,
+    # and a derivation rather than new information.
+    #
+    # Fake mode's constant bookkeeping reaches it immediately after the storage
+    # map: `invalidate_written_to_constants` -> `get_schema_info(func)` ->
+    # `schema_info.is_mutable()`, so that an op which *writes* to a traced
+    # constant can invalidate every alias of that constant. It was a generated
+    # placeholder and every call raised.
+    #
+    # The answer is already in the schema this shim parses: an argument is
+    # mutated exactly when it carries a write alias annotation -- `Tensor(a!)`
+    # -- which is `argument.alias_info.is_write`, and that field already agrees
+    # with upstream's for every schema (measured before this was written, and
+    # `test_liftfresh.py` keeps it measured over all 2584 `- func:` entries of
+    # `native_functions.yaml`). So this is written in Python over the parsed
+    # schema rather than in Rust over the text: there is nothing to re-parse.
+    #
+    # Only the three members the export path uses are implemented. The rest of
+    # upstream's `_SchemaInfo` -- the alias/containment analysis it exposes for
+    # `torch.jit` -- stays absent rather than guessed at, so reaching for one
+    # raises `AttributeError` here instead of quietly answering.
+    class _SchemaInfo:
+        __module__ = "torch._C"
+        __qualname__ = "_SchemaInfo"
+
+        __slots__ = ("_schema", "_writes")
+
+        #: The ops whose mutability is **not** in their alias annotations.
+        #:
+        #: Found by the 2584-schema comparison in `test_liftfresh.py`, not
+        #: predicted: the derivation above is right for every aten schema
+        #: except these, where upstream's `SchemaInfo` hardcodes that
+        #: `running_mean`/`running_var` are written. They are the batch-norm
+        #: family, whose mutation is *conditional on the `training` argument*
+        #: and therefore cannot be spelled in a static alias annotation;
+        #: upstream answers the conservative `True` and so does this.
+        #:
+        #: Exactly 14 (op, argument) pairs over 7 **overload-qualified** names,
+        #: which is the complete disagreement set -- the test asserts every
+        #: other schema agrees, so this table cannot silently grow stale in
+        #: either direction.
+        #:
+        #: The key includes the overload, and that is not tidiness: upstream's
+        #: table contains `native_batch_norm.out` but **not**
+        #: `cudnn_batch_norm.out`, whose `running_mean`/`running_var` it
+        #: reports as not mutable even though `cudnn_batch_norm` without the
+        #: overload are. Keying on the base name made this shim answer `True`
+        #: for `cudnn_batch_norm.out` and the sweep caught it. There is no rule
+        #: behind that asymmetry to infer -- it is upstream's hand-maintained
+        #: list, so it is copied as measured rather than reasoned about.
+        _TRAINING_DEPENDENT_WRITES = {
+            "aten::batch_norm": ("running_mean", "running_var"),
+            "aten::_batch_norm_impl_index": ("running_mean", "running_var"),
+            "aten::cudnn_batch_norm": ("running_mean", "running_var"),
+            "aten::instance_norm": ("running_mean", "running_var"),
+            "aten::miopen_batch_norm": ("running_mean", "running_var"),
+            "aten::native_batch_norm": ("running_mean", "running_var"),
+            "aten::native_batch_norm.out": ("running_mean", "running_var"),
+        }
+
+        def __init__(self, schema):
+            self._schema = schema
+            # Name -> is_write, for the arguments that carry an alias set at
+            # all. Built once: `invalidate_written_to_constants` asks
+            # `is_mutable()` for every dispatch and then `is_mutable(name)` for
+            # every argument of the mutating ones.
+            self._writes = {
+                argument.name: bool(
+                    argument.alias_info is not None and argument.alias_info.is_write
+                )
+                for argument in schema.arguments
+            }
+            key = schema.name
+            if getattr(schema, "overload_name", ""):
+                key = f"{key}.{schema.overload_name}"
+            for name in self._TRAINING_DEPENDENT_WRITES.get(key, ()):
+                if name in self._writes:
+                    self._writes[name] = True
+
+        def is_mutable(self, name=None):
+            """`is_mutable()` -- does this op write to any argument.
+
+            `is_mutable(name)` -- does it write to *that* argument. Upstream
+            answers `False` for a name that is not an argument at all rather
+            than raising, so this does too (measured); `has_argument` is the
+            question that distinguishes the two cases.
+            """
+            if name is None:
+                return any(self._writes.values())
+            return self._writes.get(name, False)
+
+        def has_argument(self, name):
+            return name in self._writes
+
+        def __repr__(self):
+            return f"<torch._C._SchemaInfo for {self._schema}>"
+
+    module._SchemaInfo = _SchemaInfo
+    resolved["_SchemaInfo"] = _SchemaInfo
 
     # `TensorBase.shape` (and `size()` with no `dim`, which goes through it)
     # answers with this class from here on. Registered rather than imported,
@@ -3762,6 +4479,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_dynamo_bool(module, _put)
     _install_inference_mode(module, _put)
     _install_raii_guards(module, _put)
+    _install_torchaudio(module)
 
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
     # -- which is how most of the `torch` namespace comes into being
@@ -5125,10 +5843,11 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         # refuses, and the two are not the same case: a pinned allocation is a
         # capability this shim does not have, while the flag is one it has had
         # all along under a different spelling.
-        if pin_memory:
+        if pin_memory and not _pin_memory_is_cpu({"device": device, "self": self}):
             raise NotImplementedError(
                 "not implemented in torch._C shim: TensorBase.new_tensor("
-                "pin_memory=True)"
+                "pin_memory=True) on a non-cpu device -- there is no pinned "
+                "allocator, and upstream refuses a non-cpu pin too"
             )
         dtype = self.dtype if dtype is None else dtype
         device = self.device if device is None else device
@@ -5143,6 +5862,17 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     new_tensor.__name__ = "new_tensor"
     new_tensor.__qualname__ = "TensorBase.new_tensor"
     setattr(tensorbase, "new_tensor", new_tensor)
+
+    # `Tensor.is_pinned()` -- always `False`: this shim never pins. The
+    # factories accept `pin_memory=True` on cpu and hand back ordinary memory
+    # (`_pin_memory_is_cpu`), and this is the half that keeps that honest: a
+    # tensor that was asked to be pinned does not claim to be.
+    def is_pinned(self, device=None):
+        return False
+
+    is_pinned.__name__ = "is_pinned"
+    is_pinned.__qualname__ = "TensorBase.is_pinned"
+    setattr(tensorbase, "is_pinned", is_pinned)
 
     # -- the device spellings that are `.to()` in disguise -------------------
     #
@@ -5540,8 +6270,16 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             return index
         if len(ellipses) > 1:
             raise IndexError("an index can only have a single ellipsis ('...')")
+        # A bool/uint8 mask consumes as many dims as it has (upstream's
+        # `count_specified_dimensions`); every other index consumes one.
+        # `y[0, m2, ..., 2]` with a 2-D `m2` is where counting it as one goes
+        # wrong: the ellipsis would expand one dim too wide.
         consumed = sum(
-            1 for item in index if item is not None and item is not Ellipsis
+            item.dim()
+            if isinstance(item, tensorbase) and item.dtype in (module.bool, module.uint8)
+            else 1
+            for item in index
+            if item is not None and item is not Ellipsis
         )
         at = ellipses[0]
         fill = (slice(None),) * max(self.dim() - consumed, 0)
@@ -5623,6 +6361,108 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     return tuple(index)
         return (index,)
 
+    def _mixed_getitem(self, index):
+        """Basic and advanced indices in one subscript -- `x[0, t]`.
+
+        Upstream's `applySlicing` walks the index once: an integer is a
+        `select.int` *at the current dim, which does not advance*, a slice is a
+        `slice.Tensor` (nothing for a full slice) and advances, a `None` is an
+        `unsqueeze` and advances, and a tensor is *recorded* at the current
+        dim rather than applied. One `index.Tensor` over the recorded tensors
+        closes the walk. Measured with a `TorchDispatchMode` logger on torch
+        2.13.0, `x` of shape (2, 5, 6, 7):
+
+            x[0, t]          (3, 6, 7)  [select.int, index.Tensor]
+            x[0, :, u]       (5, 3, 7)  [select.int, index.Tensor]
+            x[:, t, 0]       (2, 3, 7)  [select.int, index.Tensor]
+            x[1:, t]         (1, 3, 6, 7)  [slice.Tensor, index.Tensor]
+            x[0, None, t]    (1, 3, 6, 7)  [select.int, unsqueeze, index.Tensor]
+            x[0, t, 1, u]    (3,)       [select.int, select.int, index.Tensor]
+            x[z, t]          (3, 6, 7)  [_local_scalar_dense, select.int, index.Tensor]
+            y[0, m2, 1]      (3, 3)     [select.int, select.int, index.Tensor]
+
+        The second row is the one a NumPy-shaped implementation gets wrong:
+        NumPy treats the `0` as an advanced index too and, because a slice
+        separates it from `u`, moves the broadcast dims to the front --
+        (3, 5, 7). Upstream selects first, so there is nothing to move.
+
+        Two upstream details are reproduced exactly: a 0-d *integer* tensor
+        index is read out (`_local_scalar_dense`) and selected like a Python
+        int (row 7), and a bool/uint8 mask advances the walk by its own rank,
+        not by one (row 8 -- the `1` selects dim 2, after a 2-D mask).
+
+        The call site that made this necessary is transformers' continuous
+        batching (issue #13): `batch_data["input_ids"][0, logits_indices]` in
+        `generation/continuous_batching/model_runner.py:187` (5.15.1), reached
+        whenever a logits processor is active -- i.e. every sampling request.
+
+        Refused by name rather than approximated (AGENTS.md §18): a Python `bool` in a mixed
+        index (upstream lowers it to a 0-d mask -- `unsqueeze`, `empty`,
+        `fill_` -- not measured as used); a 0-d bool/uint8/float tensor index;
+        and a bool/uint8 mask of rank > 1 followed by another tensor index,
+        where the recorded list's layout after the mask has not been measured.
+        """
+        result = self
+        dim = 0
+        indices = []
+        wide_mask_seen = False
+        for item in index:
+            if item is None:
+                result = dispatch("aten.unsqueeze.default", result, dim)
+                dim += 1
+            elif isinstance(item, bool):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__getitem__ with a "
+                    "Python bool index mixed with other indices"
+                )
+            elif isinstance(item, int):
+                result = dispatch("aten.select.int", result, dim, item)
+            elif isinstance(item, slice):
+                if not _is_full_slice(item):
+                    result = dispatch(
+                        "aten.slice.Tensor",
+                        result,
+                        dim,
+                        item.start,
+                        item.stop,
+                        1 if item.step is None else item.step,
+                    )
+                dim += 1
+            elif _is_sequence_index(item) or isinstance(item, tensorbase):
+                tensor = (
+                    _lift_sequence_index(item) if _is_sequence_index(item) else item
+                )
+                is_mask = tensor.dtype in (module.bool, module.uint8)
+                if tensor.dim() == 0:
+                    if is_mask or tensor.is_floating_point():
+                        raise NotImplementedError(
+                            "not implemented in torch._C shim: TensorBase.__getitem__ "
+                            f"with a 0-d {tensor.dtype} tensor index mixed with other "
+                            "indices"
+                        )
+                    position = dispatch("aten._local_scalar_dense.default", tensor)
+                    result = dispatch("aten.select.int", result, dim, position)
+                    continue
+                if wide_mask_seen:
+                    raise NotImplementedError(
+                        "not implemented in torch._C shim: TensorBase.__getitem__ with "
+                        "a tensor index after a bool/uint8 mask of rank > 1 in a mixed "
+                        "index"
+                    )
+                indices.extend([None] * (dim - len(indices)))
+                indices.append(tensor)
+                if is_mask:
+                    wide_mask_seen = tensor.dim() > 1
+                    dim += tensor.dim()
+                else:
+                    dim += 1
+            else:
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: TensorBase.__getitem__ with "
+                    f"an index of type {type(item).__name__}"
+                )
+        return dispatch("aten.index.Tensor", result, indices)
+
     def __getitem__(self, index):
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
@@ -5639,12 +6479,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                 )
                 for item in index
             ):
-                raise NotImplementedError(
-                    "not implemented in torch._C shim: TensorBase.__getitem__ mixing "
-                    "a tensor index with integer or slice indices -- upstream applies "
-                    "basic indexing first and then aten.index.Tensor, and this shim "
-                    "does not reproduce that composition yet"
-                )
+                return _mixed_getitem(self, index)
             result = self
             dim = 0
             for item in index:
@@ -6569,6 +7404,16 @@ def _install_engine(module) -> None:
         makes this exactly one copy in both cases rather than two in one.
         """
         dense = gradient.contiguous()
+        if dense.device.type == "vulkan":
+            # **A device with no strides at all** (docs/devices/VULKAN4.md §6):
+            # a `VkTensor` is a shape and a contiguous buffer, so `contiguous()`
+            # here shares the input's `VkBuffer` rather than materialising, and
+            # `data_ptr()` has no host address to answer with -- it refuses,
+            # which is what stopped the first training step on this device
+            # (docs/devices/VULKAN10.md §4). The test above therefore cannot be
+            # asked; the answer it would give is always "same storage", so the
+            # clone is unconditional and is a real on-device copy.
+            return dense.clone()
         if dense.data_ptr() == gradient.data_ptr():
             dense = dense.clone()
         return dense
@@ -6835,9 +7680,11 @@ def _tensor_factory(module, dispatch):
         # `requires_grad` is carried, not refused -- `_strip_python_only_kwargs`
         # carries the argument. `pin_memory` is a different case and still
         # refuses: it names an allocation this shim cannot make.
-        if pin_memory:
+        if pin_memory and not _pin_memory_is_cpu({"device": device}):
             raise NotImplementedError(
-                "not implemented in torch._C shim: torch.tensor(pin_memory=True)"
+                "not implemented in torch._C shim: torch.tensor(pin_memory=True) "
+                "on a non-cpu device -- there is no pinned allocator, and "
+                "upstream refuses a non-cpu pin too"
             )
         if isinstance(device, str):
             device = module.device(device)
@@ -7937,6 +8784,156 @@ def _install_dispatcher_kernel_predicates(module) -> None:
     module._shim_has_computed_kernel_keys = answerable
 
 
+def _install_conv_backend_query(module) -> None:
+    """`torch._C._select_conv_backend` and `_conv_determine_backend_memory_format`.
+
+    **A backend-selection QUERY, not a computation.** Its only consumer in the
+    vendored tree is `_subclasses/fake_impls.py:1811`, which asks it which
+    kernel a convolution would dispatch to and then asks
+    `_conv_determine_backend_memory_format` what memory format that kernel's
+    output would have -- the answer is used for exactly one thing, a
+    `t.to(memory_format=mem_fmt)` on the result. Nothing convolves.
+
+    So the honest answer is a statement about *this shim's* convolution, and
+    upstream supplies the vocabulary for it. `_ConvBackend.Overrideable` is
+    upstream's own name for "a backend outside this enumeration handles this",
+    and upstream returns exactly that whenever it cannot see a device it knows
+    -- `_meta_registrations.py:2793` says so in a comment, and it is measured
+    rather than taken on that comment's word: upstream answers `Overrideable`
+    for a meta-tensor convolution in all six shapes the probe builds (2d, 3d,
+    1d, depthwise, transposed, dilated).
+
+    This shim has ONE convolution path and it is none of the twenty-two
+    upstream enumerates -- no cudnn, no mkldnn, no nnpack, no xnnpack, no
+    Winograd. Naming any of them would be a claim about which kernel runs.
+    `Overrideable` is the true one.
+
+    It is also the *safe* one, and that is a measurement too, not a
+    convenience. On a CPU tensor upstream answers `channels_last` for
+    `Slow2d` and a channels-last input, and `contiguous_format` for
+    `Overrideable` on the same input. That second answer is what this shim's
+    convolution actually produces: `docs/graph/STRIDE.md` §3.1 measured its
+    meta arm contiguous even for a channels-last input, and §9 records that
+    the dense side cannot hold a caller-chosen stride at all. Answering
+    `Slow2d` would have been a plausible-looking lie that made the exported
+    graph record a layout this build never produces.
+
+    `_ConvBackend`'s member names and values cannot come from the vendored
+    tree -- `torch/_C/__init__.pyi` declares `class ConvBackend(Enum): ...`
+    with **zero members**, which is why the generated `torch._C.ConvBackend`
+    is an empty enum. They are transcribed from upstream 2.13.0, exactly as
+    `overloads.json` is, and
+    `pytests/test_convbackend.py::test_the_conv_backend_enum_is_upstreams_names_and_values`
+    re-derives them from a live upstream rather than trusting this list.
+    `MpsTranspose,` carries a trailing comma in upstream's own enum
+    definition; it is transcribed as found rather than tidied, because the
+    name is the thing being reproduced.
+    """
+    import enum
+
+    # The FUNCTIONAL api, not a class body, for one reason: `MpsTranspose,`
+    # is not an identifier and cannot be written as an assignment target.
+    _ConvBackend = enum.Enum("_ConvBackend", module="torch._C",
+                             qualname="_ConvBackend", names=[
+        ("CudaDepthwise2d", 0),
+        ("CudaDepthwise3d", 1),
+        ("Cudnn", 2),
+        ("CudnnTranspose", 3),
+        ("Empty", 4),
+        ("Miopen", 5),
+        ("MiopenDepthwise", 6),
+        ("MiopenTranspose", 7),
+        ("Mkldnn", 8),
+        ("MkldnnEmpty", 10),
+        ("NnpackSpatial", 11),
+        ("Overrideable", 12),
+        ("Slow2d", 13),
+        ("Slow3d", 14),
+        ("SlowDilated2d", 15),
+        ("SlowDilated3d", 16),
+        ("SlowTranspose2d", 17),
+        ("SlowTranspose3d", 18),
+        ("Winograd3x3Depthwise", 19),
+        ("Xnnpack2d", 20),
+        ("Mps", 21),
+        ("MpsTranspose,", 22),
+    ])
+
+    # Upstream's `repr` is `<_ConvBackend.Overrideable: 12>` and its `str` is
+    # `_ConvBackend.Overrideable`; Python 3.11 changed `enum.Enum.__str__`, so
+    # both are stated rather than inherited.
+    _ConvBackend.__str__ = lambda self: f"_ConvBackend.{self.name}"
+    _ConvBackend.__repr__ = lambda self: f"<_ConvBackend.{self.name}: {self.value}>"
+    _ConvBackend.__module__ = "torch._C"
+    _ConvBackend.__qualname__ = "_ConvBackend"
+
+    module._ConvBackend = _ConvBackend
+    # **`torch._C.ConvBackend` is deliberately NOT pointed at this class.**
+    # `torch/_C/__init__.pyi` spells the annotation `ConvBackend` and
+    # `surface.json` harvested that name into an empty enum, so aliasing the
+    # two looks like tidying. It is not: `torch/__init__.py:1091` walks every
+    # PUBLIC name in `dir(_C)` and rewrites `__obj.__module__` to `"torch"`,
+    # so the alias silently moved this class's `__module__` off `torch._C`,
+    # which is where upstream's is. Upstream has no runtime `ConvBackend` at
+    # all -- only the underscored name -- so the empty enum is a stub
+    # artefact and is left exactly as it was.
+
+    def _select_conv_backend(*args, **kwargs):
+        # Every argument is accepted and none is consulted, and that is the
+        # claim rather than laziness: the answer does not depend on the
+        # convolution's shape because this build has one convolution path.
+        # Upstream's own answer for a device it does not enumerate is the
+        # same constant (measured across six shapes on meta tensors).
+        if len(args) < 2 and not {"input", "weight"} <= set(kwargs):
+            raise TypeError(
+                "torch._C._select_conv_backend(): expected at least an input "
+                "and a weight"
+            )
+        return _ConvBackend.Overrideable
+
+    _select_conv_backend.__name__ = "_select_conv_backend"
+    _select_conv_backend.__qualname__ = "torch._C._select_conv_backend"
+    module._select_conv_backend = _select_conv_backend
+
+    def _conv_determine_backend_memory_format(input, weight, backend):
+        """`torch.contiguous_format`, for every backend and every layout.
+
+        Not a shortcut, and the first draft got this wrong in the opposite
+        direction -- it refused every native backend by name, on the strength
+        of a CPU measurement where `Slow2d` answers `channels_last` for a
+        channels-last input. Re-measured on the device this is actually asked
+        about, that refusal was a DIVERGENCE and not a narrowing: on a **meta**
+        tensor upstream answers `torch.contiguous_format` for `Slow2d`,
+        `Empty` and `Overrideable` alike, contiguous input and channels-last
+        input alike, because it has no device to consult
+        (`_meta_registrations.py:2793` says exactly this).
+
+        So the constant is upstream's own answer everywhere this shim is
+        asked, and it is also true of this shim's convolution on the dense
+        side: `docs/graph/STRIDE.md` §3.1 measured the meta arm contiguous even
+        for a channels-last input, and §9 records that the dense side cannot
+        hold a caller-chosen stride at all.
+
+        The one place upstream disagrees is a DENSE channels-last input with a
+        native backend, where it answers `channels_last`. That pair is not
+        reachable through this shim's own `_select_conv_backend`, which never
+        names a native backend; it is recorded rather than refused, and
+        `test_convbackend.py::test_the_one_place_this_constant_differs_from_upstream_is_recorded`
+        is that record.
+        """
+        return module.contiguous_format
+
+    _conv_determine_backend_memory_format.__name__ = (
+        "_conv_determine_backend_memory_format"
+    )
+    _conv_determine_backend_memory_format.__qualname__ = (
+        "torch._C._conv_determine_backend_memory_format"
+    )
+    module._conv_determine_backend_memory_format = (
+        _conv_determine_backend_memory_format
+    )
+
+
 def _install_arg_parser_predicates(module) -> None:
     """`torch._C._should_allow_numbers_as_tensors` -- a fixed table, not a policy.
 
@@ -8105,6 +9102,203 @@ def _install_dispatch_keys(module) -> None:
     # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
     # `core_aten_decompositions()` stopped at.
     module._dispatch_get_registrations_for_dispatch_key = _dispatch_registrations
+
+    def _dispatch_is_included_in_alias(k, alias):
+        """`torch._C._dispatch_is_included_in_alias` -- `c10::isIncludedInAlias`.
+
+        The only caller in the vendored tree is `resolve_key`
+        (`torch/_ops.py:218-254`), which asks about six `cand` aliases while
+        computing an op's dispatch table entry. Before this existed the name
+        was a synthesised `_Unimplemented` and `resolve_key` **raised**
+        `NotImplementedError` the moment branch 1 missed -- see
+        `docs/graph/METAKEY.md` 2.2, which measured that and named closing it
+        as a precondition for its own question mattering.
+
+        Upstream's two edge rules are asymmetric and both are kept:
+
+        * `k == Undefined` returns `False`. Upstream tests this first, so it
+          returns rather than tripping the assert below.
+        * `alias == Undefined` **raises**, because `runtimeDispatchKeySetHas`
+          asserts `t != DispatchKey::Undefined`
+          (`c10/core/DispatchKeySet.cpp:9`). Answering `False` here instead
+          would be tidier and would hide a caller bug upstream makes loud, so
+          it raises.
+
+        `docs/graph/METAKEY.md` 4 is the reason a default here was measured
+        rather than chosen: a blanket `True` on the *Meta* predicate did not
+        merely disagree with upstream, it stopped `import torch`, because
+        `torch/library.py:493` consults that one before allowing a meta
+        registration. **That does not repeat here, and the measurement said so
+        against the guess.** Both blanket answers were built and run
+        (`docs/graph/ALIASINC.md` 5): `import torch` survives both, and over
+        the whole aten surface -- 4893 `resolve_key(op, key)` results across
+        `Meta`, `CPU` and `AutogradCPU` -- **0 differ** from this real table.
+
+        The reason is that branch 1 (`py_kernels`) answers 1346 of the 4893,
+        and the remaining 3547 reach
+        `_dispatch_get_backend_keyset_from_autograd` -- the *next*
+        unimplemented name, and one that sits above branches 2.3-2.5 -- before
+        any answer here can matter. Branches 2.1 and 2.2 do come first, but
+        nothing in this tree registers a `py_kernel` at
+        `CompositeExplicitAutograd[NonFunctional]`, so they never fire.
+
+        So this table is justified by agreement with upstream over all 15129
+        askable pairs, **not** by anything observable here today. What closing
+        it bought is exactly that those 3547 now fail one gap later, naming the
+        real blocker instead of this one.
+        """
+        k_name = getattr(k, "name", k)
+        alias_name = getattr(alias, "name", alias)
+        if alias_name == "Undefined":
+            if k_name == "Undefined":
+                # Upstream's `k != Undefined` short-circuits before the assert.
+                return False
+            raise RuntimeError(
+                "t != DispatchKey::Undefined INTERNAL ASSERT FAILED: "
+                "_dispatch_is_included_in_alias was asked about the Undefined alias"
+            )
+        if k_name == "Undefined":
+            return False
+        return k_name == alias_name or k_name in _ALIAS_EXPANSION.get(alias_name, ())
+
+    module._dispatch_is_included_in_alias = _dispatch_is_included_in_alias
+
+    def _dispatch_get_backend_keyset_from_autograd(k):
+        """`torch._C._dispatch_get_backend_keyset_from_autograd` -- `c10::getBackendKeySetFromAutograd`.
+
+        The only caller in the vendored tree is `resolve_key`
+        (`torch/_ops.py:240`), which feeds the result straight into
+        `op.has_kernel_for_any_dispatch_key(...)` to decide whether a backend
+        kernel exists before it will hand back a composite one. Before this
+        existed the name was a synthesised `_Unimplemented` and `resolve_key`
+        raised `NotImplementedError` for **3547 of 4893** results over the aten
+        surface -- the exact population `docs/graph/ALIASINC.md` 4 handed on.
+
+        Upstream has no edge cases here: every key answers, `Undefined`
+        included, and 129 of the 145 answer the empty set. `Autograd` itself is
+        one of the 129.
+
+        **Implementing this unblocks nothing, and that is measured.** The 3547
+        do not resolve; they split onto `_dispatch_is_alias_key` (2719) and
+        `_dispatch_has_backend_fallback` (828). `docs/graph/BKEYSET.md` 3 has
+        the staged map, including the part worth more than this function: with
+        those two answered plus the `_dispatch_autogradother_backends` value,
+        **no result dies on an unimplemented name at all** -- 3301 resolve and
+        1592 raise upstream's own `could not find kernel`. The chain
+        terminates, and it is three more names.
+
+        So this table is justified by element-wise agreement with upstream over
+        all 123 askable keys, **not** by anything observable here today. That
+        is the same footing `_dispatch_is_included_in_alias` stands on, and for
+        the same reason: at `resolve_key` the observable behaviour cannot yet
+        tell a correct table from a constant.
+        """
+        names = _AUTOGRAD_BACKEND_KEYSET.get(getattr(k, "name", k), ())
+        return DispatchKeySet._of(
+            getattr(DispatchKey, n) for n in names if hasattr(DispatchKey, n)
+        )
+
+    module._dispatch_get_backend_keyset_from_autograd = (
+        _dispatch_get_backend_keyset_from_autograd
+    )
+
+    def _dispatch_is_alias_key(k):
+        """`torch._C._dispatch_is_alias_key` -- `c10::isAliasDispatchKey`.
+
+        The only caller in the vendored tree is
+        `OperatorBase.has_kernel_for_any_dispatch_key` (`torch/_ops.py:113`),
+        which skips alias keys when asking whether an op has a kernel in a
+        keyset -- an alias key in `py_kernels` describes how an op is put
+        together, not which backend runs it, so it must not count as a backend
+        kernel.
+
+        **This adds no table.** The alias keys are exactly the keys that expand
+        beyond themselves under `_dispatch_is_included_in_alias`, so the answer
+        is membership in `_ALIAS_EXPANSION`, which already exists and is
+        already held to upstream over all 15129 askable pairs. Adding a second
+        six-name list beside it would give this file two places to rot
+        independently. That identity is not assumed:
+        `test_the_alias_keys_are_exactly_the_keys_that_expand_beyond_themselves`
+        re-derives both sets from a live upstream every run and reddens if they
+        ever come apart.
+
+        Two things that look like edge cases and are not. `ADInplaceOrView`
+        reads like an alias key and upstream answers `False` for it
+        (`docs/graph/ALIASINC.md` §1.1 measured that). And upstream's
+        `DispatchKeySet.has()` answers `True` for all six alias keys on *any*
+        keyset including the empty one (`docs/graph/BKEYSET.md` §2.1) -- that
+        is a property of the bit-set representation, not a membership, and
+        nothing here imitates it.
+
+        This is the first name in this chain that moves the resolved count:
+        1346 -> 1440 of 4893 `resolve_key` results over the aten surface, 87
+        landing on `CompositeImplicitAutograd` and 7 on `Autograd`.
+        """
+        return getattr(k, "name", k) in _ALIAS_EXPANSION
+
+    module._dispatch_is_alias_key = _dispatch_is_alias_key
+
+    def _dispatch_has_backend_fallback(k):
+        """`torch._C._dispatch_has_backend_fallback` -- `Dispatcher::hasBackendFallbackForDispatchKey`.
+
+        **This one is not a lookup, and copying upstream's answer would be the
+        single largest false claim in this file.**
+
+        `resolve_key` (`torch/_ops.py:257`) consults this last: if the answer
+        is `True` it hands back the dispatch key *itself*, on the promise that
+        "the dispatch key will implicitly route to backend fallback". Upstream
+        can promise that because its C++ build registers catch-every-operator
+        fallback kernels at 37 keys -- `ADInplaceOrView`, the autograd and
+        autocast keys, `Functionalize`, `Python`, `BackendSelect`, `Meta`,
+        `MPS`, the functorch keys and the rest.
+
+        **This shim has registered none, and that is derived rather than
+        assumed.** The only door a registration can arrive through here is
+        `_C._dispatch_library(...)`, whose `fallback` lands in
+        `_shim_registrations`; after a full `import torch` there are zero of
+        them. `_SHIM_BACKEND_FALLBACKS` below is the set of keys a fallback is
+        actually *effective* at, and nothing populates it -- because a Python
+        fallback that arrives through that door is recorded and then dropped
+        (`_install_library`'s docstring), so `_aten_dispatch` would never run
+        it. Answering `True` for a recorded-and-dropped fallback would claim a
+        kernel just as much as copying upstream's 37 would, so the two sets are
+        kept apart and `test_a_python_registered_fallback_is_recorded_but_is_not_effective`
+        pins the asymmetry.
+
+        What that honesty costs, measured rather than estimated:
+
+            resolved, before                        1346
+            + `_dispatch_is_alias_key`              1440
+            + this, answered honestly               1440   unchanged
+            + upstream's 37-key set patched in      3301   1861 claimed kernels
+
+        `docs/graph/BKEYSET.md` §3 projected 3301 for this step; **1440 is the
+        real number** and the 3301 was an upper bound measured with upstream's
+        set patched in, never a target. The 1861 difference is the size of the
+        claim this declines to make -- the same shape `_dispatch_registrations`
+        refuses by name, where answering from upstream's file "would claim 1500
+        kernels this shim does not have".
+
+        **What it does buy is that the chain terminates.** The other 3453 stop
+        dying on an unimplemented name and start raising upstream's own `could
+        not find kernel` -- an honest refusal that names itself. No
+        `resolve_key` result on the aten surface dies on a gap in this shim any
+        more.
+
+        The 32 spellable keys where upstream answers `True` and this answers
+        `False` are real missing capabilities, and they are listed by
+        `test_the_capability_gaps_this_honest_answer_names` rather than
+        described here, so the list is re-derived from both live sides instead
+        of rotting in a comment.
+        """
+        return getattr(k, "name", k) in _SHIM_BACKEND_FALLBACKS
+
+    module._dispatch_has_backend_fallback = _dispatch_has_backend_fallback
+
+    # Countable rather than implicit, in the shape `_shim_registrations` and
+    # `_shim_unknown_tags` already use: the size of this set is the size of
+    # what `resolve_key`'s last branch can honestly promise, and it is 0.
+    module._shim_backend_fallbacks = lambda: sorted(_SHIM_BACKEND_FALLBACKS)
 
     # A `DispatchKeySet` *value*, not a function.
     # `torch/_subclasses/functional_tensor.py:146` does
@@ -8318,6 +9512,16 @@ def _install_nn(module, dispatch) -> None:
     # below, `gelu(x, "tanh")` would bind fine at this level and silently
     # reach the tanh branch where upstream raises -- caught by testing the
     # positional form directly, not reasoned out in advance.
+    def elu(input, alpha=1.0, inplace=False):
+        """`torch._C._nn.elu` -- Higgs' encode path wall.
+        Decomposed to `where` and `expm1` to avoid a kernel gap."""
+        if inplace:
+            raise NotImplementedError("elu inplace")
+        import torch
+        pos = input > 0.0
+        neg_val = torch.expm1(input) * alpha
+        return torch.where(pos, input, neg_val)
+
     def gelu(input, *, approximate="none"):
         return dispatch("aten.gelu.default", input, approximate=approximate)
 
@@ -9250,6 +10454,7 @@ def _install_nn(module, dispatch) -> None:
     for fn, name in (
         (linear, "linear"),
         (silu, "silu"),
+        (elu, "elu"),
         (gelu, "gelu"),
         (scaled_dot_product_attention, "scaled_dot_product_attention"),
         (pad, "pad"),
@@ -10513,6 +11718,26 @@ def _install_composites(module, varfns, dispatch) -> None:
                 )
             dims = [d for d in range(rank) if d != axis]
             keepdim = True
+        if not dims:
+            # **A rank-1 `v` exempts its only axis, so there is nothing left to
+            # reduce -- and an EMPTY `dim` list does not say that.** It says
+            # "every axis" to `aten.norm.ScalarOpt_dim` (the opposite reading,
+            # measured, and the one its own kernel documents), so this branch
+            # used to answer `[1]` where upstream answers `[4]`: the whole
+            # tensor's norm instead of an element-wise magnitude.
+            #
+            # Upstream's C++ never has the ambiguity because it does not pass a
+            # dim list at all -- it is `v.view(v.size(0), -1).norm(pow, 1)`,
+            # which for a rank-1 `v` reduces a trailing axis of extent ONE.
+            # That construction is reproduced here rather than special-cased to
+            # `abs`, because the reduction of a single element is `|x|` only
+            # for some `pow` (`pow=0` counts non-zeros instead).
+            #
+            # Found by docs/architectures/VOICE5.md §4.4 while giving `norm.ScalarOpt_dim`
+            # a meta kernel: the meta answer was right and the DENSE answer it
+            # was being compared against was wrong.
+            widened = dispatch("aten.unsqueeze.default", v, rank)
+            return dispatch("aten.norm.ScalarOpt_dim", widened, pow, [rank], False)
         return dispatch("aten.norm.ScalarOpt_dim", v, pow, dims, keepdim)
 
     norm_except_dim.__name__ = norm_except_dim.__qualname__ = "norm_except_dim"
@@ -11235,6 +12460,21 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         storage_cls = getattr(torch_module, "UntypedStorage", None)
         if storage_cls is not None:
             module._set_storage_class(storage_cls)
+        # `torch.Storage` -- the legacy alias upstream's `_initExtension` also
+        # sets, and it is `FloatStorage` there, not `UntypedStorage` (measured
+        # on 2.13.0: `torch.Storage is torch.FloatStorage` is True and
+        # `is torch.UntypedStorage` is False). So it is set from the same
+        # class here rather than from the one the name suggests.
+        #
+        # It is on the `torch.export` path, not decoration:
+        # `torch/multiprocessing/reductions.py:33` reads
+        # `torch.Storage._free_weak_ref` in `StorageWeakRef.__init__`, which
+        # fake mode's constant propagation reaches for every traced constant
+        # (`docs/graph/LIFTFRESH.md` §3). `FloatStorage` inherits it from
+        # `TypedStorage`, which delegates to `UntypedStorage._free_weak_ref`.
+        float_storage_cls = getattr(torch_module, "FloatStorage", None)
+        if float_storage_cls is not None and not hasattr(torch_module, "Storage"):
+            torch_module.Storage = float_storage_cls
         kinds = (module.dtype, module.layout, module.memory_format, module.qscheme)
         for name, value in list(vars(module).items()):
             # Filtered on the *type*, not on the leading underscore. Skipping
@@ -11396,6 +12636,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     _install_dispatch_keys(module)
     _install_arg_parser_predicates(module)
     _install_dispatcher_kernel_predicates(module)
+    _install_conv_backend_query(module)
     _install_dispatch_suppression(module)
     _install_fx_node_base(module)
     # Seeded with the schemas that exist only in C++ upstream, or only in
@@ -11593,6 +12834,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._get_schema = _get_schema
 
     _install_autocast(module)
+    _install_generator_streams(module)
     _install_default_generator(module)
     _install_mps_backend(module)
     _install_backend_flag_toggles(module)
@@ -11616,9 +12858,10 @@ _AUTOCAST_DEVICE_TYPES = (
 def _refuse_unrepresentable_memory_format(op, kwargs):
     """Pop `memory_format`, and **refuse the two this build cannot produce.**
 
-    `contiguous_format` and `preserve_format` are accepted and dropped, which is
-    honest: every tensor this shim can build is contiguous, so both of them ask
-    for what the result already is.
+    `contiguous_format` and `preserve_format` are accepted and dropped. That
+    matches upstream, measured: `x.t().to(memory_format=contiguous_format)`
+    returns `x.t()` itself on both sides, because `to` with nothing else to
+    change is a no-op.
 
     `channels_last` and `channels_last_3d` were being dropped in the same
     breath, and that was a silent wrong answer on the public surface --
@@ -11627,12 +12870,14 @@ def _refuse_unrepresentable_memory_format(op, kwargs):
     every later `is_contiguous(memory_format=channels_last)` disagreed with what
     it had asked for.
 
-    It was found by `test_export5.py::test_channels_last_is_false_as_a_fact_
-    because_the_build_cannot_make_one`, which is a test written to check the
-    *premise* of an answer rather than the answer -- the premise being "no
-    tensor in this build can be in that layout" (docs/graph/EXPORT5.md §3). The
-    premise was false by way of this door, and nothing else in the suite could
-    have noticed, because dropping an argument raises nothing.
+    It was found by a test written to check the *premise* of an answer rather
+    than the answer -- the premise being "no tensor in this build can be in
+    that layout" (docs/graph/EXPORT5.md §3). The premise was false by way of
+    this door, and nothing else in the suite could have noticed, because
+    dropping an argument raises nothing. It was also false by way of
+    `permute`, which that test did not try (docs/graph/STRIDE.md §4); the test
+    that replaced it is
+    `test_export5.py::test_channels_last_contiguity_is_read_off_the_stride_as_upstream_reads_it`.
 
     candle carries a `Layout` and no memory-format tag, and no kernel here reads
     one, so there is no representation to return. Refusing is the only answer
@@ -16269,6 +17514,59 @@ def _install_mps_backend(module) -> None:
     module._mps_get_default_generator = _mps_get_default_generator
 
 
+def _install_generator_streams(module) -> None:
+    """`torch.Generator()` -- an independent stream per generator.
+
+    Each instance owns a `CpuGenerator` in `rng.rs`, named by the integer id it
+    carries as `_shim_gen_id`; `generator_arg` in aten.rs turns that id into the
+    stream a kernel draws from. Two generators, or a generator and the global
+    stream, never share state, so what a request draws from its own seeded
+    generator does not depend on what anyone else draws in between.
+
+    The stream is the global generator's own engine (MT19937, same seeding, same
+    transformations), and the global one was measured to reproduce upstream's
+    `torch.manual_seed(s); torch.rand/randn/randint/randperm/normal_/uniform_/
+    multinomial` values exactly -- so a seeded `torch.Generator()` does too.
+    A fresh generator starts at upstream's default seed, 67280421310721.
+
+    **Not implemented, by name:** `get_state`/`set_state` (the default
+    generator's refusal and its reason apply here too), and any non-cpu device.
+    """
+    Generator = module.Generator
+
+    def __init__(self, device="cpu"):
+        kind = getattr(device, "type", None)
+        if kind is None:
+            kind = str(device).split(":")[0]
+        if kind != "cpu":
+            raise NotImplementedError(
+                f"torch._C shim: torch.Generator(device={str(device)!r}) -- "
+                "only cpu generators exist here; there is no per-device "
+                "stream for an accelerator"
+            )
+        self._shim_gen_id = module._shim_gen_new()
+
+    def __del__(self):
+        gid = getattr(self, "_shim_gen_id", None)
+        if gid is not None:
+            self._shim_gen_id = None
+            module._shim_gen_free(gid)
+
+    def manual_seed(self, seed):
+        module._shim_gen_manual_seed(self._shim_gen_id, int(seed))
+        return self
+
+    def seed(self):
+        return module._shim_gen_reseed(self._shim_gen_id)
+
+    def initial_seed(self):
+        return module._shim_gen_initial_seed(self._shim_gen_id)
+
+    for fn in (__init__, __del__, manual_seed, seed, initial_seed):
+        fn.__qualname__ = f"Generator.{fn.__name__}"
+        setattr(Generator, fn.__name__, fn)
+
+
 def _install_default_generator(module) -> None:
     """`torch.default_generator` -- an object with state, not a placeholder.
 
@@ -16298,6 +17596,14 @@ def _install_default_generator(module) -> None:
     interop until someone tries it.
     """
     generator = module.Generator()
+    # `Generator.__init__` (`_install_generator_streams`) gave this instance a
+    # stream of its own; the default generator is *the* process stream
+    # (`rng::default_generator`), which `generator_arg` selects by
+    # `_shim_is_default_generator` below, so the extra one is returned.
+    _own = getattr(generator, "_shim_gen_id", None)
+    if _own is not None:
+        module._shim_gen_free(_own)
+        generator._shim_gen_id = None
 
     # Read by `generator_arg` in aten.rs: it is how a kernel tells "the default
     # generator was named explicitly" from "some other generator was", and the
@@ -16324,3 +17630,68 @@ def _install_default_generator(module) -> None:
     # shape for a per-instance value -- and nothing reads it on this path.
 
     module.default_generator = generator
+
+
+def _install_torchaudio(module):
+    import sys
+    import importlib.util
+
+    if "torchaudio" in sys.modules:
+        return
+
+    try:
+        if importlib.util.find_spec("torchaudio") is not None:
+            return
+    except Exception:
+        pass
+
+    import warnings
+    warnings.warn("torchaudio is not installed; installing Higgs shim for torchaudio.functional.resample", RuntimeWarning)
+
+    import math
+
+    class TorchaudioFunctional:
+        @staticmethod
+        def resample(waveform, orig_freq, new_freq, lowpass_filter_width=6, rolloff=0.99, resampling_method="sinc_interp_hann", beta=None):
+            if orig_freq == new_freq: return waveform
+            gcd = math.gcd(int(orig_freq), int(new_freq))
+            orig_freq = int(orig_freq) // gcd
+            new_freq = int(new_freq) // gcd
+            base_freq = min(orig_freq, new_freq) * rolloff
+            width = math.ceil(lowpass_filter_width * orig_freq / base_freq)
+            idx_dtype = waveform.dtype if waveform.dtype.is_floating_point else module.float64
+            idx = (module._VariableFunctions.arange(-width, width + orig_freq, dtype=idx_dtype)[None, None] / orig_freq)
+            t = (module._VariableFunctions.arange(0, -new_freq, -1, dtype=waveform.dtype)[:, None, None] / new_freq + idx)
+            t *= base_freq
+            t = t.clamp(-lowpass_filter_width, lowpass_filter_width)
+            if resampling_method == "sinc_interp_hann":
+                window = module._VariableFunctions.cos(t * math.pi / lowpass_filter_width / 2) ** 2
+            else:
+                if beta is None: beta = 14.769656459379492
+                beta_tensor = module._VariableFunctions.tensor(float(beta), dtype=waveform.dtype)
+                window = module._VariableFunctions.i0(beta_tensor * module._VariableFunctions.sqrt(1 - (t / lowpass_filter_width) ** 2)) / module._VariableFunctions.i0(beta_tensor)
+            t *= math.pi
+            scale = base_freq / orig_freq
+            kernels = module._VariableFunctions.where(t == 0, module._VariableFunctions.tensor(1.0, dtype=waveform.dtype), module._VariableFunctions.sin(t) / t)
+            kernels *= window * scale
+            if not waveform.dtype.is_floating_point: kernels = kernels.to(dtype=module.float32)
+            shape = waveform.size()
+            waveform = waveform.view(-1, shape[-1])
+            num_wavs, length = waveform.shape
+            waveform = module._VariableFunctions.pad(waveform, (width, width + orig_freq))
+            resampled = module._aten_dispatch("aten.conv1d.default", waveform[:, None], kernels, None, [orig_freq], [0], [1], 1)
+            resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
+            target_length = module._VariableFunctions.ceil(module._VariableFunctions.tensor(new_freq * length / orig_freq)).to(dtype=module.int64)
+            resampled = resampled[..., :target_length]
+            return resampled.view(shape[:-1] + resampled.shape[-1:])
+
+    class Torchaudio:
+        functional = TorchaudioFunctional()
+
+    import importlib.machinery
+    torchaudio = Torchaudio()
+    torchaudio.__spec__ = importlib.machinery.ModuleSpec("torchaudio", None)
+    torchaudio.__path__ = []
+    sys.modules["torchaudio"] = torchaudio
+    sys.modules["torchaudio.functional"] = torchaudio.functional
+

@@ -1,0 +1,57 @@
+#version 450
+
+// `logsumexp` over the last dimension, one row per invocation.
+//
+// The reduction upstream's `_scaled_dot_product_flash_attention_for_cpu`
+// returns in its second slot, computed on the *same* masked, scaled scores the
+// softmax above it consumes:
+//
+//     lse[row] = m + log(sum_i exp(a[row, i] - m)),   m = max_i a[row, i]
+//
+// Shifting by the row maximum is not an optimisation. Without it a masked row
+// of large-magnitude logits overflows `exp` to `inf` and the log of that is
+// `inf` rather than the finite answer.
+//
+// **The fully-masked row is upstream's convention, measured, not inferred.**
+// When every score in a row is `-inf` the shifted form is `exp(-inf - -inf)`
+// = `exp(NaN)` = NaN. Upstream's flash kernel reports **0.0** for such a row
+// (measured: `_scaled_dot_product_flash_attention_for_cpu` with a row of
+// `-inf` mask returns logsumexp 0.0 and an all-zero output), which is *not*
+// what `torch.logsumexp` gives for the same row (`-inf`). This follows the op
+// being implemented, so the branch is here.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+// n: number of rows
+// p1: row_length
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.n) return;
+
+    uint row_len = pc.p1;
+    uint offset = row * row_len;
+
+    float m = a[offset];
+    for (uint i = 1; i < row_len; i++) {
+        m = max(m, a[offset + i]);
+    }
+
+    // Every score is -inf: the row was masked out entirely.
+    if (isinf(m) && m < 0.0) {
+        c[row] = 0.0;
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint i = 0; i < row_len; i++) {
+        sum += exp(a[offset + i] - m);
+    }
+
+    c[row] = m + log(sum);
+}

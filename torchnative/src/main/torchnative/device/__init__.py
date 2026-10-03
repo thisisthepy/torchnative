@@ -22,7 +22,7 @@ ours, so it can carry meaning ours can honour.
 operator, they are tensor destinations, and `.torch_device` hands back the
 `torch.device` that names them. `npu` is a `CompiledDevice`: an NPU takes a
 whole subgraph ahead of time and cannot be handed single operators
-(CLAUDE.md section 8), so it is not a tensor destination and `.torch_device`
+(AGENTS.md section 20), so it is not a tensor destination and `.torch_device`
 refuses by name. That is not a convention --- it is the absence of an
 attribute, so the wrong use cannot be spelled.
 
@@ -81,6 +81,7 @@ __all__ = [
     "DeviceUnavailable",
     "EagerDevice",
     "EagerUseRefused",
+    "ExynosNpuUnimplemented",
     "NpuResolution",
     "npu_candidates",
     "cpu",
@@ -105,6 +106,10 @@ class NpuUnresolved(DeviceUnavailable):
     """`npu` does not resolve to any accelerator on this host."""
 
 
+class ExynosNpuUnimplemented(NpuUnresolved):
+    """Samsung Exynos SoC detected, but Exynos NPU support is unimplemented in torchnative."""
+
+
 # --------------------------------------------------------------------------
 # Availability records
 # --------------------------------------------------------------------------
@@ -117,7 +122,7 @@ class Availability:
     string a reader can go and call themselves. `kind` is `"measured"` when
     the answer came from doing the thing, and `"declared"` when it came from a
     build-time constant --- a distinction this repository has been bitten by
-    (CLAUDE.md section 4: "built" and "reached" are different claims).
+    (AGENTS.md section 16: "built" and "reached" are different claims).
 
     `reason` is `None` when available, and a **name** otherwise --- never
     prose alone. `detail` carries the probe's own payload unedited.
@@ -526,6 +531,8 @@ class NpuDevice(CompiledDevice):
         for backend, unit in candidates:
             try:
                 return getattr(self, f"_resolve_{backend}")(h, backend, unit)
+            except ExynosNpuUnimplemented:
+                raise
             except NpuUnresolved as exc:
                 refusals.append((backend, unit, str(exc)))
         raise NpuUnresolved(self._compose_refusal(h, m, refusals))
@@ -642,15 +649,26 @@ class NpuDevice(CompiledDevice):
                 f"{type(exc).__name__}: {exc}"
             ) from None
         report = dict(device_report())
+        if report.get("is_exynos") or report.get("soc_status") == "exynos-unimplemented":
+            raw_soc = report.get("soc_model") or report.get("soc_raw") or "Exynos"
+            raise ExynosNpuUnimplemented(
+                f"torchnative.device.npu: Samsung Exynos SoC ({raw_soc}) detected on {h}. "
+                f"Exynos NPU support is unimplemented in torchnative. "
+                f"Working execution paths on this device: torchnative.device.cpu and torchnative.device.vulkan."
+            )
         if not report.get("reachable"):
             raise NpuUnresolved(
                 f"torchnative.device.npu resolves to the {unit} on {h}, and the "
                 f"device is not reachable: {report.get('reason')}"
             )
         if not report.get("htp_arch"):
+            soc_prop = report.get("soc_property", "unknown")
+            soc_raw = report.get("soc_raw", "unknown")
             raise NpuUnresolved(
-                f"torchnative.device.npu resolves to the {unit} on {h}; the "
-                f"device is reachable but reports no HTP architecture, so there "
+                f"torchnative.device.npu resolves to the {unit} on {h}; however, "
+                f"no supported NPU vendor matched on this Android device, and the SoC properties read: "
+                f"{soc_prop}={soc_raw!r}. "
+                f"The device is reachable but reports no HTP architecture, so there "
                 f"is no Hexagon NPU to target on it."
             )
         # `htp_arch` alone is not enough, and this gate is here because for a
