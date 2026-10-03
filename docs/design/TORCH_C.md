@@ -1,6 +1,6 @@
 # `torch._C` — 바닥 놓기
 
-A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `rust/torch_c` 를 함수 하나짜리 스파이크에서
+A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `torchnative/rust/torch_c` 를 함수 하나짜리 스파이크에서
 **실제 시작점**으로 키운 작업의 기록입니다.
 
 **목표는 커버리지가 아니라 바닥입니다.** 구현한 aten op 은 3 개이고, 그것이 적은 것이 아니라
@@ -28,7 +28,7 @@ A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `rust/torch_c` 를 
 ### 파일 배치
 
 ```
-rust/torch_c/
+torchnative/rust/torch_c/
 ├─ Cargo.toml            candle-core, PyO3
 ├─ build.rs              타깃별 링크 배선 중 "경로" 인 것
 ├─ .cargo/config.toml    타깃별 링크 배선 중 "상수" 인 것
@@ -39,7 +39,7 @@ rust/torch_c/
 │  ├─ device.rs          torch.device — 살아 있는 백엔드가 아니라 라벨
 │  ├─ aten.rs            디스패치 단일 관문 + 구현된 op
 │  └─ err.rs             예외 문구. §6 의 발견 장치가 여기 얹힘
-└─ pytests/
+└─ tests/
    ├─ test_shim.py       빌드된 _C.so 에 대고 도는 스모크 테스트
    └─ run.sh             빌드 → `_C.so` 로 개명 → 실행
 ```
@@ -220,7 +220,7 @@ cargo::rustc-link-lib=framework=Python       # clang 의 -framework Python
 
 ### 곁다리로 잡힌 함정 — `--manifest-path` 는 `.cargo/config.toml` 을 안 읽는다
 
-`pytests/run.sh` 를 처음에 `cargo build --manifest-path <crate>/Cargo.toml` 로 썼더니 링크가
+`tests/run.sh` 를 처음에 `cargo build --manifest-path <crate>/Cargo.toml` 로 썼더니 링크가
 `_Py*` 미정의 심볼 벽으로 실패했습니다. **cargo 의 config 탐색은 매니페스트가 아니라 작업
 디렉터리 기준**이라 `-undefined dynamic_lookup` 이 통째로 빠진 것입니다. 스크립트는 `cd` 하도록
 고쳤습니다. 하드코딩된 `-F` 와 같은 함정의 반대편이고, **링크 배선을 `.cargo/config.toml` 에
@@ -244,7 +244,7 @@ undefined 로 남은 `Py*` 심볼은 **올바른 모양**입니다 — 로드 �
 ### 링크 성공은 증명이 아니다 — 그래서 호스트에서 돌렸다
 
 ```
-$ ./pytests/run.sh
+$ bash tests/run.sh
 ok   test_add_broadcasts_and_applies_alpha
 ok   test_add_refuses_to_guess_a_promotion
 ok   test_device_is_a_label_not_a_backend
@@ -320,7 +320,7 @@ onig_sys v69.9.3 → onig v6.5.3 → tokenizers v0.22.2 → candle-core v0.11.0
 > 꼽은 '조용한 수치 드리프트' 를 만들지 않기 위한 기존 규칙." 즉 **미해결이 아니라 해결된
 > 결정**입니다 — "텐서끼리는 승격하지 않고 이름을 댄다, 파이썬 스칼라는 wrapped-number 규칙을
 > 재현한다"로 갈렸습니다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs same_dtype present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs same_dtype present -->
 
 ### 3. `torch.bool`
 
@@ -391,10 +391,10 @@ KV 캐시 갱신(`add_`, `copy_`) 과 한 묶음입니다.
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 DIST=/Volumes/macMini/caches/target-python
-cd rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준으로 찾는다
+cd torchnative/rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준으로 찾는다
 
 # 호스트 + 실제 임포트 검증
-./pytests/run.sh; echo "EXIT=$?"
+bash tests/run.sh; echo "EXIT=$?"
 
 # Android
 ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \

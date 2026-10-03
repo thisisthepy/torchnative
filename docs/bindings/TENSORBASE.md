@@ -46,7 +46,7 @@ x.item()   ->  NotImplementedError: TensorBase.item
 
 | 갈래 | 49 개 중 | 어디에 |
 |---|---|---|
-| A. 표 기반 오버로드 해석 | **34** | `rust/torch_c/src/methods.json` + `bootstrap.py::_tensor_method` |
+| A. 표 기반 오버로드 해석 | **34** | `torchnative/rust/torch_c/src/methods.json` + `bootstrap.py::_tensor_method` |
 | B. 파이썬 레벨로 직접 작성 | **5** (`to` · `float` · `long` · `item`/`__bool__` · `__getitem__`) | `bootstrap.py::_install_tensor_{conversions,scalars,indexing}` |
 | C. Rust 네이티브 (아이덴티티) | **7** (`shape` · `dtype` · `device` · `dim` · `ndim` · `numel` · `size`) | `tensor.rs` — 이전부터 있던 것 |
 | D. autograd 모양 (**때움**) | **3** (`requires_grad` · `requires_grad_` · `grad_fn`) | `bootstrap.py::_install_autograd_shape` — §5 |
@@ -142,7 +142,7 @@ aten 스키마에도 바인딩되지 않습니다 — 표로 만들면 상류가
 ### C. Rust 네이티브 — 디스패처를 지나지 않는 아홉
 
 `shape` · `dtype` · `device` · `dim` · `ndim` · `numel` · `size` 는 `TensorImpl` 의 메타데이터를
-읽을 뿐 aten 을 지나지 않습니다. `tools/golden/cases.py` 의 모듈 주석도 같은 것을 독립적으로
+읽을 뿐 aten 을 지나지 않습니다. `tests/golden/cases.py` 의 모듈 주석도 같은 것을 독립적으로
 관측했습니다("Nine of the 50 names never reach the ATen dispatcher at all"). 이 일곱에
 `grad_fn` · `requires_grad` 를 더한 아홉이 그 목록이고, 뒤의 둘은 §5 입니다.
 
@@ -208,7 +208,7 @@ PyTensorBase::boolean(Tensor::from_vec(bytes, shape, &device)?)
 과 `index.Tensor` 를 상류와 대조할 수 없었습니다.** 골든 대조가 불가능한 op 이 정규화하는
 생성자보다 나쁩니다.
 
-> `tools/golden/cases.py` 의 주석이 이 거부를 우회하는 방법을 길게 설명하고 있습니다(빌더를
+> `tests/golden/cases.py` 의 주석이 이 거부를 우회하는 방법을 길게 설명하고 있습니다(빌더를
 > 람다 안으로 미루기). **그 우회는 이제 필요 없습니다** — 다만 하네스 파일은 다른 작업이
 > 쥐고 있어 한 줄도 고치지 않았고, 우회한 채로도 전부 통과합니다.
 
@@ -414,7 +414,7 @@ PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
 **이 둘이 들어오는 순간 `nn.Linear` 가 만들어집니다.** 그 뒤의 벽은 아직 모릅니다.
 
 > **Correction (문서 감사, 2026-09):** 이 둘이 들어왔습니다. `git log -S'"aten.uniform_.default"'
-> -- rust/torch_c/src/aten.rs` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator, and
+> -- torchnative/rust/torch_c/src/aten.rs` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator, and
 > give `_C._dynamo` the two names that do work") — 커밋 메시지가 그대로 말하듯, candle CPU
 > 백엔드가 시딩을 거부해서 상류 CPU generator(MT19937)를 이식한 결과입니다.
 > `uniform_inplace`/`normal_inplace` 가 `aten.rs:10274`/`10350` 에 있고, 둘 다 현재
@@ -423,8 +423,8 @@ PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
 > 문서로 보입니다(같은 커밋).
 > <!-- DOCWATCH: op-implemented aten.uniform_.default -->
 > <!-- DOCWATCH: op-implemented aten.normal_.default -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs uniform_inplace present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs normal_inplace present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs uniform_inplace present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs normal_inplace present -->
 
 ### 7.2 벽 2 — `_C` 는 `TensorBase` 가 아니라 `torch.Tensor` 를 돌려줘야 한다
 
@@ -457,7 +457,7 @@ if type(data) is torch.Tensor or type(data) is Parameter:
   `TensorBase.__new__(cls, data)` 를 써야 합니다 — `Parameter.__new__` 가 호출자이므로
   `cls(data)` 는 재진입합니다(실측: `RecursionError`).
 
-**골든 하네스는 영향을 받지 않습니다.** `tools/golden/loader.py` 는 `_C` 를 `torch` 패키지 없이
+**골든 하네스는 영향을 받지 않습니다.** `tests/golden/loader.py` 는 `_C` 를 `torch` 패키지 없이
 단독으로 로드하므로 클래스가 등록되지 않고 `promote` 는 항등입니다 — 1027/1027 이 그 증거입니다.
 
 ---
@@ -468,10 +468,10 @@ if type(data) is torch.Tensor or type(data) is Parameter:
 
 | | 명령 | 결과 |
 |---|---|---|
-| 골든 하네스 | `tools/golden/compare.py` | **0** — **1027/1027, ops covered=60**, 대기 2 (이전 490/490, 19) |
+| 골든 하네스 | `tests/golden/compare.py` | **0** — **1027/1027, ops covered=60**, 대기 2 (이전 490/490, 19) |
 | 골든 자가검사 | `--inject-fault value/shape/dtype` | **1 / 1 / 1** (의도대로) |
-| 호스트 스모크 | `rust/torch_c/pytests/run.sh` | **0** — 54/54 (이전 34) |
-| 스키마 검증 | `rust/torch_c/pytests/verify_schemas.py` | **0** — 127/127 (두 표) |
+| 호스트 스모크 | `tests/run.sh` | **0** — 54/54 (이전 34) |
+| 스키마 검증 | `tests/_support/verify_schemas.py` | **0** — 127/127 (두 표) |
 | 사용자 API 대조 108 케이스 | 상류 torch 와 shim 을 각각 돌려 diff | **107/108 동일** (§6-1) |
 | 엄격 `import torch` | `probe.py --mode strict --target torch` | **0** |
 | 기록 `import torch` | `probe.py --mode record --target torch` | **0** |
@@ -526,10 +526,10 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 cd /Volumes/macMini/thisisthepy/torchnative
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-./vendor/install_shim.sh                                # 빌드 + 구멍에 넣기
-$PY tools/golden/compare.py;                       echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py;        echo "EXIT=$?"
-(cd rust/torch_c && ./pytests/run.sh);             echo "EXIT=$?"
+./scripts/vendor/install_shim.sh                                # 빌드 + 구멍에 넣기
+$PY tests/golden/compare.py;                       echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py;        echo "EXIT=$?"
+bash tests/run.sh;             echo "EXIT=$?"
 
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
   "import torch
@@ -570,18 +570,18 @@ cargo build --release --target aarch64-apple-ios
 
 | 파일 | 변경 |
 |---|---|
-| `rust/torch_c/src/methods.json` | **신규** — 메서드 오버로드 표, 48 이름 · 80 스키마 |
-| `rust/torch_c/src/aten.rs` | aten op 19 → 73. 산술 · 비교 · 비트 · 축소 · 형태 · 인덱싱 · in-place |
-| `rust/torch_c/src/bootstrap.py` | 메서드 설치, `self_bound` 해석, `int[N]` 규칙, `__getitem__`, `to`/`item`/`__bool__`, grad 모드, `_make_subclass`, `_DISCOVERED_RETURNS` 12 항목 |
-| `rust/torch_c/src/tensor.rs` | `requires_grad` 필드, `replace_with`, `#[new]`, `_set_tensor_class` · `promote` |
-| `rust/torch_c/src/lib.rs` | `methods.json` 삽입, `_tensor_from_flat` 이 bool 을 정규화 |
-| `rust/torch_c/src/overloads.json` | `zeros` 추가 |
-| `rust/torch_c/pytests/verify_schemas.py` | 두 표를 모두 검증. op 이름을 **스키마에서** 유도 |
-| `rust/torch_c/pytests/test_shim.py` | 34 → 54. 메서드 해석 · 인덱싱 · in-place · grad 모드 · `_make_subclass` · RNG 벽 |
+| `torchnative/rust/torch_c/src/methods.json` | **신규** — 메서드 오버로드 표, 48 이름 · 80 스키마 |
+| `torchnative/rust/torch_c/src/aten.rs` | aten op 19 → 73. 산술 · 비교 · 비트 · 축소 · 형태 · 인덱싱 · in-place |
+| `torchnative/rust/torch_c/src/bootstrap.py` | 메서드 설치, `self_bound` 해석, `int[N]` 규칙, `__getitem__`, `to`/`item`/`__bool__`, grad 모드, `_make_subclass`, `_DISCOVERED_RETURNS` 12 항목 |
+| `torchnative/rust/torch_c/src/tensor.rs` | `requires_grad` 필드, `replace_with`, `#[new]`, `_set_tensor_class` · `promote` |
+| `torchnative/rust/torch_c/src/lib.rs` | `methods.json` 삽입, `_tensor_from_flat` 이 bool 을 정규화 |
+| `torchnative/rust/torch_c/src/overloads.json` | `zeros` 추가 |
+| `tests/_support/verify_schemas.py` | 두 표를 모두 검증. op 이름을 **스키마에서** 유도 |
+| `tests/_support/test_shim.py` | 34 → 54. 메서드 해석 · 인덱싱 · in-place · grad 모드 · `_make_subclass` · RNG 벽 |
 | `docs/bindings/TENSORBASE.md` | 이 문서 |
 
-벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. **`tools/golden/` 과 `docs/` 의 기존
+벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. **`tests/golden/` 과 `docs/` 의 기존
 파일도 건드리지 않았습니다** — `git status --short` 로 확인했습니다.
 
-> `tools/golden/cases.py` 가 수정된 상태로 보이지만 **이번 작업의 것이 아닙니다.** 동시에 도는
+> `tests/golden/cases.py` 가 수정된 상태로 보이지만 **이번 작업의 것이 아닙니다.** 동시에 도는
 > 다른 작업이 43 개의 케이스 빌더를 먼저 심어 둔 것이고(§2), 이번 구현이 그중 39 개를 켰습니다.

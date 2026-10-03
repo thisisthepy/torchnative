@@ -11,7 +11,7 @@
 ## 1. 왜 `overloads.json` 항목이 아닌가
 
 `overloads.json`의 값은 "`aten::<op>` 스키마 문자열 목록"이고, 각 항목은 `aten.rs`의 `dispatch`
-`match` 문에 실제로 존재하는 커널 키를 가리켜야 합니다(그렇지 않으면 `pytests/verify_schemas.py`가
+`match` 문에 실제로 존재하는 커널 키를 가리켜야 합니다(그렇지 않으면 `tests/_support/verify_schemas.py`가
 잡습니다 — 그 스크립트가 세는 4203개가 정확히 이 두 테이블의 항목 수입니다). `aten.rs`에는
 `aten::randn`도 `aten::rand`도 커널이 없습니다. 있는 것은 셋뿐입니다:
 
@@ -103,18 +103,18 @@ requires_grad=requires_grad)`처럼 `pin_memory`(기본값 `False`)를 항상 �
 `aten.rs`까지 도달해 `reject_unsupported`에 걸렸습니다. `requires_grad`는 이 문제가 없는데,
 `requires_grad`는 애초에 아텐 스키마 인자가 아니라 `_strip_python_only_kwargs`가 별도로 다루는
 파이썬 전용 키워드라서 `False`를 명시적으로 버리기 때문입니다. 고친 뒤에는 `pin_memory`를 참일
-때만 넘깁니다 — `docs/kernels/RANDOM.md`를 쓰는 동안 `rust/torch_c/pytests/test_shim.py`에서
+때만 넘깁니다 — `docs/kernels/RANDOM.md`를 쓰는 동안 `tests/_support/test_shim.py`에서
 `test_randn_and_rand_are_wired_rather_than_refused` 등 다섯 개가 바로 이 이유로 빨갛게 실패하는
 것을 보고서야 발견했습니다.
 
 ## 5. 검증
 
-- `rust/torch_c/pytests/test_shim.py` — `randn`/`rand`/`rand_like`/`randn_like`/`normal`을
+- `tests/_support/test_shim.py` — `randn`/`rand`/`rand_like`/`randn_like`/`normal`을
   다루는 섹션(순수 shim 동작 + `_upstream_torch`가 있을 때의 시드-스트림 비트 비교 둘 다).
-- `tools/golden/compare.py`는 늘지 않는다 — `_C._aten_implemented()`에 새 aten 키가 생기지
+- `tests/golden/compare.py`는 늘지 않는다 — `_C._aten_implemented()`에 새 aten 키가 생기지
   않았으므로(합성은 이미 있는 `empty`/`uniform_`/`normal_`/`mul`/`add`만 쓴다), 이 하네스가 보는
   집합은 변하지 않는 것이 옳다.
-- `rust/torch_c/pytests/verify_schemas.py`는 4203/4203로 그대로 — `overloads.json`을 건드리지
+- `tests/_support/verify_schemas.py`는 4203/4203로 그대로 — `overloads.json`을 건드리지
   않았다.
 
 ## 6. 연속 배칭(CB)이 cpu 에서 부딪힌 벽 셋 (issue #30, 2026-10-03, 미빌드)
@@ -128,4 +128,4 @@ requires_grad=requires_grad)`처럼 `pin_memory`(기본값 `False`)를 항상 �
   `torch.tensor(..., pin_memory=True)` 는 segfault 합니다(2.13.0 실측) — 그래서 upstream 의 cpu CB 는 Mac 에서 돌지 않고 이 shim 의 것은 돕니다. 편차이지 일치가 아닙니다.
 - **`torch.Generator()`.** §3 의 갱신.
 
-세 가지 모두 `rust/torch_c/pytests/test_cbwalls.py` 가 서브프로세스에서 upstream 과 대조합니다. 이 절은 빌드 전에 쓰였고, 빌드되어 그 스위트가 초록이 되기 전까지는 주장이 아니라 계획입니다.
+세 가지 모두 `tests/models/test_cbwalls.py` 가 서브프로세스에서 upstream 과 대조합니다. 이 절은 빌드 전에 쓰였고, 빌드되어 그 스위트가 초록이 되기 전까지는 주장이 아니라 계획입니다.

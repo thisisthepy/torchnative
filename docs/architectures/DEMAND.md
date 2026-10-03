@@ -1,7 +1,7 @@
 # DEMAND — regenerating the work queue by running real models
 
-Measurement round only. **Nothing in this round changed source** — `rust/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
-`bootstrap.py`, `tools/golden/cases.py`, `torchnative/src/main/torch/` (vendored) are all untouched.
+Measurement round only. **Nothing in this round changed source** — `torchnative/rust/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
+`bootstrap.py`, `tests/golden/cases.py`, `torchnative/python/torch/` (vendored) are all untouched.
 `git status --short` in the worktree is empty throughout. Every finding below is a *candidate*
 for the next round, not something applied here.
 
@@ -108,14 +108,14 @@ are vision-transformer/CNN construction-time utilities rather than forward-path 
   shim, forward and construction failures alike) returned in well under a second, toy configs
   being tiny. `float8_e4m3fn` specifically (the brief's named hang case) was not exercised this
   round — no target below asked for a non-default dtype.
-- Each side run as its own subprocess (`PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`
+- Each side run as its own subprocess (`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1`
   for the shim; `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL` for upstream) — never both `torch`
   variants in one interpreter.
-- Built via the instructed pipeline: `cargo build --release` in `rust/torch_c` with
+- Built via the instructed pipeline: `cargo build --release` in `torchnative/rust/torch_c` with
   `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep`,
   `TORCH_C_ARTEFACT=.../release/lib_C.dylib` exported before every gate run (docs/verification/GOLDEN.md §6's
   own trap — a build without the matching artefact env var silently measures a stale binary).
-  `bash vendor/install_shim.sh` after.
+  `bash scripts/vendor/install_shim.sh` after.
 - Scratch scripts under `/tmp/sweep/` (not committed, matching ARCH26/KERNELS26 convention):
   `check_common.py` (18-architecture pass/fail sweep, shared by both sides via `PYTHONPATH`),
   `dump_model.py` + `compare_dumps.py` (numeric comparison for the 8 that forward), `quant_build_ckpt.py`
@@ -209,24 +209,24 @@ exists.
 ## 4. Gates — tree unchanged, pasted in full
 
 ```
-$ PYTHON=$PY sh rust/torch_c/pytests/run.sh
+$ PYTHON=$PY sh tests/run.sh
 343 ok
 SELF-TEST: PASS -- 20 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 DOCWATCH: PASS -- 257/257 evaluated marker(s) hold
 
-$ $PY tools/golden/compare.py
+$ $PY tests/golden/compare.py
 SUMMARY: 7763/7763 cases passed, 0 failed, ops covered=168, pending case builders=1
 
-$ $PY tools/golden/compare.py --self-test
+$ $PY tests/golden/compare.py --self-test
 SELF-TEST: PASS -- 20 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 
-$ $PY rust/torch_c/pytests/verify_schemas.py
+$ $PY tests/_support/verify_schemas.py
 SUMMARY: 4487/4487 table entries matched upstream, 0 failed
 ```
 
 All four numbers match the brief's expected baseline (343 ok, DOCWATCH 257/257, 7763/7763
 ops=168) exactly. `git status --short` was empty before, during (checked between models), and
-after this round — nothing in `rust/torch_c/src/`, `bootstrap.py`, `tools/golden/cases.py`, or the
+after this round — nothing in `torchnative/rust/torch_c/src/`, `bootstrap.py`, `tests/golden/cases.py`, or the
 vendored tree moved.
 
 ---
@@ -292,4 +292,4 @@ closed under slicing / `+` / reflected `+` / `*`, `__qualname__` had to be set
 or the class was unpicklable, and `stride()` is a plain tuple upstream and had
 to be left one. `ops covered` is unchanged at 203 — no kernel.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_autograd_shape present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_autograd_shape present -->

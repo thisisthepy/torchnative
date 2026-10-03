@@ -22,8 +22,8 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 | `aten.where.ScalarOther` | 이름 대고 거절 | **통과** |
 | `aten.mul.Tensor` 의 dtype 승격 | 이름 대고 거절 | **통과** |
 | `aten.bitwise_and.Tensor` 의 dtype 승격 | (미발견) | **통과** — 이번에 드러난 네 번째 벽 |
-| `pytests/run.sh` | 155 통과 | **159 통과** |
-| `tools/golden/compare.py` | 2536/2536, ops=117 | **2702/2702, ops=118** |
+| `tests/run.sh` | 155 통과 | **159 통과** |
+| `tests/golden/compare.py` | 2536/2536, ops=117 | **2702/2702, ops=118** |
 | `verify_schemas.py` | 272/272 | **272/272** (변화 없음) |
 
 **이번 회차의 한 문장**: 이 저장소가 처음으로 **허브의 진짜 사전학습 모델로 문장을 생성했고,
@@ -49,7 +49,7 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
    불일치이지 확률이 아닙니다
 
 그리고 **모든 규칙을 커널의 doc comment 가 아니라 상류 torch 2.13.0 에서 직접 쟀습니다.**
-`tools/golden/cases.py` 의 `_pair` 위 note 가 요구하는 것이고, 이번에도 그 차이가
+`tests/golden/cases.py` 의 `_pair` 위 note 가 요구하는 것이고, 이번에도 그 차이가
 드러났습니다 — §4 의 `enable_gqa` 는 기존 doc comment 가 "래퍼에서 헤드를 미리 반복하라"
 고 적어둔 것이 **틀렸음**을 측정으로 보였습니다.
 
@@ -423,7 +423,7 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 인덱스 텐서가 둘 이상인 advanced indexing 입니다. 어텐션 커널이 아니고, eager **순전파**
 에서는 도달하지 않습니다 — eager 마스크 빌더가 생성 경로에서만 쓰는 벡터화 인덱싱입니다.
 
-`pytests/test_shim.py::test_eager_generate_stops_at_index_tensor_and_says_so` 가 이것을
+`tests/_support/test_shim.py::test_eager_generate_stops_at_index_tensor_and_says_so` 가 이것을
 **이름으로** 고정합니다. 두 가지가 그 테스트를 깨야 하고, 둘 다 깨야 맞습니다: 이 op 이
 구현되면(그러면 `_GENERATE_PATHS` 에 `eager` 를 넣을 차례) 깨지고, `generate` 가 **더
 앞에서** 막히기 시작해도 깨집니다. "eager 는 여전히 안 된다" 에 조용히 동의하지 않습니다.
@@ -454,7 +454,7 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 
 ## 8. 소유권 — 지시를 벗어난 편집 하나
 
-이 회차는 **`rust/torch_c/src/bootstrap.py` 와 `overloads.json`/`methods.json` 을 건드리지
+이 회차는 **`torchnative/rust/torch_c/src/bootstrap.py` 와 `overloads.json`/`methods.json` 을 건드리지
 말라**는 지시를 받았습니다(다른 에이전트가 스키마 텍스트 작업으로 소유).
 
 - `overloads.json`, `methods.json` — **건드리지 않았습니다.** `where.ScalarOther` 의 스키마는
@@ -472,9 +472,9 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 ## 9. 검증
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     exit 0   159 통과 (전 155, +4)
-$PY tools/golden/compare.py                   exit 0   2702/2702, ops=118 (전 2536/117)
-$PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (변화 없음)
+PYTHON=$PY sh tests/run.sh     exit 0   159 통과 (전 155, +4)
+$PY tests/golden/compare.py                   exit 0   2702/2702, ops=118 (전 2536/117)
+$PY tests/_support/verify_schemas.py    exit 0   272/272 (변화 없음)
 ```
 
 **보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
@@ -516,16 +516,16 @@ $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (변화 없음)
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-gen
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-gen
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 159
-$PY tools/golden/compare.py                        # 2702/2702 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py         # 272/272
+PYTHON=$PY sh tests/run.sh          # 159
+$PY tests/golden/compare.py                        # 2702/2702 ops=118
+$PY tests/_support/verify_schemas.py         # 272/272
 ```
 
 §6 의 진짜 모델은 회귀 스위트에 **넣지 않았습니다** — `docs/models/CKPT2.md` §10 과 같은 이유로,
@@ -540,7 +540,7 @@ $PY rust/torch_c/pytests/verify_schemas.py         # 272/272
 # 상류가 진실을 적는다 (벤더 트리를 PYTHONPATH 에 넣지 않는다)
 DT=float32 ATTN=sdpa $PY /Volumes/macMini/caches/gen-scratch/gen.py truth
 # shim 이 같은 체크포인트를 읽고 대조한다
-DT=float32 ATTN=sdpa PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+DT=float32 ATTN=sdpa PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
     $PY /Volumes/macMini/caches/gen-scratch/gen.py shim
 ```
 

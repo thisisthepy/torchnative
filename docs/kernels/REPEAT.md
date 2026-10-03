@@ -1,8 +1,8 @@
 # REPEAT — the last three blocked architectures, and a fourth that was never ours
 
-Worktree `work/repeat` on develop `da9e3bf`. Territory: `rust/torch_c/src/aten.rs`,
+Worktree `work/repeat` on develop `da9e3bf`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `bootstrap.py`, `device.rs`, `capture.rs`, `methods.json`, `overloads.json`,
-`tools/golden/cases.py`, `rust/torch_c/pytests/test_repeat.py`, plus the two
+`tests/golden/cases.py`, `tests/ops/test_repeat.py`, plus the two
 inversions §7 lists.
 
 ## 0. What was blocked, and what each of them actually was
@@ -98,10 +98,10 @@ asserts that, so a future round cannot mistake this for a kernel change.
 asserts the **absence** of the row with the reason in its message, so somebody
 tidying the tables cannot add it back without reading why.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_tensor_where present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_tensor_where_takes_the_receiver_as_the_true_branch_not_the_condition present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_tensor_where_is_not_a_methods_json_row_and_the_table_still_has_none present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json where present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_tensor_where present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_tensor_where_takes_the_receiver_as_the_true_branch_not_the_condition present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_tensor_where_is_not_a_methods_json_row_and_the_table_still_has_none present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json where present -->
 
 ---
 
@@ -189,10 +189,10 @@ call died in Python before reaching the arm that claimed to refuse it. It takes
 a sentinel default now, and a `dim` beside a lone repeats vector is a
 combination error, as it is upstream.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs repeat_interleave_tensor present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py repeat_interleave_tensor_cases present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_repeat_interleave_tensor_answers_the_index_vector_not_the_data present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_the_composite_reaches_the_kernel_on_the_spelling_the_model_uses present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs repeat_interleave_tensor present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py repeat_interleave_tensor_cases present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_repeat_interleave_tensor_answers_the_index_vector_not_the_data present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_the_composite_reaches_the_kernel_on_the_spelling_the_model_uses present -->
 
 ---
 
@@ -233,9 +233,9 @@ _capture_end(...)  ->  NotImplementedError
 `index_select` is exercised in the same loop and **is** recorded, so a refusal
 that fired for every op would not pass there.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs DATA_DEPENDENT_SHAPE present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_the_two_lists_the_kernel_had_to_join_are_both_asserted_here present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs DATA_DEPENDENT_SHAPE present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_the_two_lists_the_kernel_had_to_join_are_both_asserted_here present -->
 
 ---
 
@@ -324,9 +324,9 @@ the refusal test, not by any value test, which is the argument for writing the
 refusals down: the shape `[2, 1]` is plausible and nothing else looks at it.
 `_fast_symint_list_coerce` is the fix and both spellings are asserted.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _coerce_symint_list present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _fast_symint_list_coerce present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_the_int_list_symint_rule_refuses_exactly_what_upstream_refuses present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _coerce_symint_list present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _fast_symint_list_coerce present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_the_int_list_symint_rule_refuses_exactly_what_upstream_refuses present -->
 
 ---
 
@@ -360,7 +360,7 @@ architectures are no longer "three ours and one not ours", they are **four that
 forward**, three of them because of this round and one of them for a reason that
 was never in this repository.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_repeat.py test_sam3_lite_texts_embedding_call_is_refused_by_upstream_too present -->
+<!-- DOCWATCH: symbol-in-file tests/ops/test_repeat.py test_sam3_lite_texts_embedding_call_is_refused_by_upstream_too present -->
 
 ---
 
@@ -407,7 +407,7 @@ that is the check rather than an omission: `TensorBase.where` is Python-level
 surface (§1), not a `methods.json` row, so neither table grew. A `+1` here would
 have meant somebody added the row this round exists to argue against.
 
-`tools/golden/reach_allow.json` is untouched.
+`tests/golden/reach_allow.json` is untouched.
 
 ---
 

@@ -101,7 +101,7 @@ bodies that already existed, and one deliberate refusal.** Eight `_aten_implemen
 table rows. "Eight ops" would overstate it by a factor of three, which is the counting failure
 `AGENTS.md` §17.3 names.
 
-`pytests/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
+`tests/ops/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
 itself — `index_add_common` reached from exactly two dispatch arms, `Bitwise::Xor` as an arm and
 not a function — so the claim in this table cannot rot into prose.
 
@@ -176,7 +176,7 @@ accepted the layouts upstream's `view` refuses** (`w.view(6)` returns the reshap
 raises upstream). `view_as` inherits that pre-existing laxity rather than adding a second rule;
 making it strict while `view` stays lax would put two answers behind one definition.
 
-The gap is recorded, not fixed. `tools/golden/cases.py` carries it as a `torch_error` row and
+The gap is recorded, not fixed. `tests/golden/cases.py` carries it as a `torch_error` row and
 `test_tail3.py::test_view_as_and_reshape_as_are_different_ops_upstream` fails the day `view` is
 tightened — which is when `view_as` must be tightened with it.
 
@@ -255,7 +255,7 @@ What was done instead is `clamp.Tensor`'s pattern: the schema is in `methods.jso
 kernel**, so `x.as_strided(...)` refuses with `aten op not implemented in torch._C shim:
 aten.as_strided.default` — naming the overload it needed — rather than "no matching signature". It
 is **not** in `_aten_implemented()`, so the surface stays honest and the golden harness does not
-demand case builders for a kernel that does not exist. `tools/golden/reach_allow.json` carries the
+demand case builders for a kernel that does not exist. `tests/golden/reach_allow.json` carries the
 entry and its reason; the checker matches that file exactly in both directions, so the entry has to
 be deleted the day the gap closes.
 
@@ -284,14 +284,14 @@ misleading in the same way `MatMulUnexpectedStriding` was:
   one branch — expand `...` to the operand's leading axes given its rank, per operand — and not a
   general einsum planner.
 
-Both live in `rust/torch_c/src/bootstrap.py`, which this worktree was told not to edit. They are
+Both live in `torchnative/rust/torch_c/src/bootstrap.py`, which this worktree was told not to edit. They are
 recorded here as sized work items rather than left as sweep lines.
 
 ---
 
 ## 8. Architectures
 
-Ran with `pytests/arch_sweep.py --only ...`, before and after.
+Ran with `tests/_support/arch_sweep.py --only ...`, before and after.
 
 | architecture | before | after |
 |---|---|---|
@@ -320,19 +320,19 @@ failure: `torch.std` has no `overloads.json` row and `_gaussian_topk` calls it t
 Every op is compared against upstream element-wise, in a separate process, on inputs where a
 plausible wrong implementation differs.
 
-* **Golden harness** (`tools/golden/cases.py`):
+* **Golden harness** (`tests/golden/cases.py`):
   <!-- DOCWATCH: count golden_cases_total ge 9870 -->
   <!-- DOCWATCH: count golden_cases_passed ge 9870 -->
   <!-- DOCWATCH: count golden_ops_covered ge 263 -->
   <!-- DOCWATCH: count golden_pending eq 0 -->
   9870 cases pass of 9870, 263 ops covered, 0 pending builders (9691/255 before).
-* **`pytests/test_tail3.py`**, a new suite file, holding down the four things a value comparison
+* **`tests/ops/test_tail3.py`**, a new suite file, holding down the four things a value comparison
   structurally cannot: the striding verdict as arithmetic on the printed layouts, the
   alias-versus-kernel split as source structure, the two adjacent ops that must **disagree**, and
   the `erfinv` far tail judged by round trip rather than by agreement.
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail3.py test_the_refused_matmul_operands_were_already_contiguous present -->
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail3.py test_scatter_reduce_sum_and_index_add_accumulate_DIFFERENTLY present -->
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail3.py test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_the_refused_matmul_operands_were_already_contiguous present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_scatter_reduce_sum_and_index_add_accumulate_DIFFERENTLY present -->
+  <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream present -->
 * **Two pinned counts in `test_shim.py`** moved, each carrying the arithmetic that keeps it a
   check: `tag_core_count` 117 → 120 (`bitwise_xor.Tensor`, `bitwise_xor.Scalar` and
   `scatter_reduce.two` are the only three of the eight new keys upstream tags `core` — each read
@@ -358,22 +358,22 @@ The ops now in `_aten_implemented()`:
 
 and the table rows that make them callable:
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json bitwise_xor present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json erfinv present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json index_add present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json scatter_reduce present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json eye present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json bitwise_xor present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json __xor__ present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json erfinv present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json index_add present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json scatter_reduce present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json view_as present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json bitwise_xor present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json erfinv present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json index_add present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json scatter_reduce present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json eye present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json bitwise_xor present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json __xor__ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json erfinv present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json index_add present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json scatter_reduce present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json view_as present -->
 
 and the one that is a schema with no kernel behind it, on purpose (§6):
 
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json as_strided present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fold_batch_axes_matmul present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fold_batch_axes_matmul present -->
 
 `aten.as_strided.default` is deliberately **not** an `op-implemented` marker: the whole point of §6
 is that it is listed and unimplemented, and a marker asserting otherwise would be the false claim

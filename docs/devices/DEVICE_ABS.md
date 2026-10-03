@@ -26,7 +26,7 @@
 ## 1. 무엇을 어떻게 쟀나
 
 **설계부터 하지 않았습니다.** 같은 프로브 스크립트를 두 torch 에 대해 돌리고 전사(transcript) 를
-줄 단위로 비교하는 방식입니다 — 한쪽은 벤더 트리(`PYTHONPATH=$PWD/torchnative/src/main`,
+줄 단위로 비교하는 방식입니다 — 한쪽은 벤더 트리(`PYTHONPATH=$PWD/torchnative/python`,
 `TORCH_USE_RTLD_GLOBAL=1`), 다른 쪽은 spike-venv 의 상류 torch. 각 줄은
 `이름 | 값` 또는 `이름 | <예외타입: 메시지>` 이고, **아무것도 단언하지 않습니다.** 전사가 곧
 측정값입니다.
@@ -184,7 +184,7 @@ Generator.device        []
 ```
 
 **왼쪽 열은 디스패처 호출을 하나도 만들지 않습니다.** TensorImpl 에 이미 앉아 있는 메타데이터를
-읽을 뿐입니다. `tools/golden/cases.py` 가 이미 기록해 둔 "50 개 중 9 개는 ATen 디스패처에 전혀
+읽을 뿐입니다. `tests/golden/cases.py` 가 이미 기록해 둔 "50 개 중 9 개는 ATen 디스패처에 전혀
 닿지 않는다"(`device`, `dim`, `dtype`, `shape`, ...) 와 **같은 가족**입니다.
 
 두 가지가 여기서 따라 나옵니다.
@@ -194,7 +194,7 @@ Generator.device        []
    내려가고, 그것은 이미 커널과 골든 케이스가 있는 `aten._to_copy.default` 입니다.
 2. **골든 케이스를 붙일 자리가 없습니다.** 하네스는 `_aten_implemented()` 의 op 마다 케이스를
    요구하는데 이번에 추가된 op 이 없습니다(96 그대로). `<no case builder registered>` 위험은
-   따라서 없고, 대신 `pytests/test_shim.py` 에 스펠링별 테스트를 붙였습니다(§8).
+   따라서 없고, 대신 `tests/_support/test_shim.py` 에 스펠링별 테스트를 붙였습니다(§8).
 
 **그러므로 장치별 분기는 `_aten_dispatch` 안이 아니라 그 아래(커널)에 들어갑니다.** 문에 들어가는
 것은 분기가 아니라 **거부**입니다 — §6.
@@ -266,7 +266,7 @@ MPS 가 있는 이 호스트에서 상류를 직접 쟀습니다.
 `resolve()` 가 여전히 `cpu` 하나만 받습니다. **백엔드를 늘리지 않았습니다** — 늘린 것은 라벨이
 정확한가, 그리고 라벨을 소비하는 길이 뚫려 있는가입니다.
 
-### 5.1 라벨 (`rust/torch_c/src/device.rs`)
+### 5.1 라벨 (`torchnative/rust/torch_c/src/device.rs`)
 
 - `DEVICE_TYPES` — 상류 20 개 목록. 생성 시점 검증.
 - `parse_device_string` — 빈 문자열 · 공백 · 대문자 · 음수 인덱스 · 비숫자 인덱스를 상류와
@@ -507,7 +507,7 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 (`docs/bindings/OVERLOAD.md` §9 항목 7), `is_floating_point`/`cpu`/`get_device` 는 §3.3 의 이유로
 테이블 항목이 아닙니다.
 
-새로 붙인 테스트 (`rust/torch_c/pytests/test_shim.py`):
+새로 붙인 테스트 (`tests/_support/test_shim.py`):
 
 | 테스트 | 무엇을 고정하나 |
 |---|---|
@@ -589,22 +589,22 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 
 ```bash
 cd /path/to/repo
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-devabs
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-$PY tools/golden/compare.py                     > /tmp/g.log 2>&1;  echo "EXIT=$?"
-$PY tools/golden/compare.py --inject-fault value > /tmp/fv.log 2>&1; echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py      > /tmp/s.log 2>&1;  echo "EXIT=$?"
-PYTHON=$PY sh rust/torch_c/pytests/run.sh       > /tmp/p.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py                     > /tmp/g.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py --inject-fault value > /tmp/fv.log 2>&1; echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py      > /tmp/s.log 2>&1;  echo "EXIT=$?"
+PYTHON=$PY sh tests/run.sh       > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 표면 대조: 같은 프로브를 두 torch 로 돌리고 전사를 diff
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
-  PYTHONPATH=$PWD/torchnative/src/main $PY <probe> > ours.txt
+  PYTHONPATH=$PWD/torchnative/python $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 ```
 

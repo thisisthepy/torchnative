@@ -228,7 +228,7 @@ SmolLM2-135M, `S=128` prefill, 같은 토큰 128 개. `from_pretrained` 로 실�
 ### 4.3 원인 — `fast_to` 가 비연속에서 candle 로 떨어진다
 
 ```rust
-// rust/torch_c/src/reduced.rs:324
+// torchnative/rust/torch_c/src/reduced.rs:324
 if src == target || !t.device().is_cpu() || !t.layout().is_contiguous() {
     return t.to_dtype(target);          // <- candle 의 원소 단위 경로
 }
@@ -249,7 +249,7 @@ if src == target || !t.device().is_cpu() || !t.layout().is_contiguous() {
 
 ## 5. 무엇을 고쳤나
 
-`rust/torch_c/src/aten.rs` 에 `widen_gemm_operand` 하나를 추가하고, GEMM 피연산자를 넓히던
+`torchnative/rust/torch_c/src/aten.rs` 에 `widen_gemm_operand` 하나를 추가하고, GEMM 피연산자를 넓히던
 5 개 자리가 그것을 부르게 했습니다 (`mm` · `bmm` · `matmul` · `addmm` · `baddbmm`).
 
 ```rust
@@ -323,11 +323,11 @@ widen(x.t())  ==  widen(x).t()        원소마다, 비트마다
 ### 6.2 표준 검증 경로 (전부 exit 0, 전/후 동일)
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh    241        (전 241 -- 안 떨어짐)
-$PY tools/golden/compare.py                  3302/3302  ops=133   (변화 없음)
-$PY tools/golden/compare.py --self-test      exit 0
-$PY rust/torch_c/pytests/verify_schemas.py   4295/4295
-( cd rust/torch_c && cargo test --release )  10         (전 7 -- +3)
+PYTHON=$PY sh tests/run.sh    241        (전 241 -- 안 떨어짐)
+$PY tests/golden/compare.py                  3302/3302  ops=133   (변화 없음)
+$PY tests/golden/compare.py --self-test      exit 0
+$PY tests/_support/verify_schemas.py   4295/4295
+( cd torchnative/rust/torch_c && cargo test --release )  10         (전 7 -- +3)
 ```
 
 ### 6.3 Rust 단위 테스트 3 개 — 그리고 고장 내서 확인했다
@@ -466,14 +466,14 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-dtypeperf
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
 cd /Volumes/macMini/worktrees/bw-dtypeperf
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        # 241
-$PY tools/golden/compare.py                      # 3302/3302 ops=133
-$PY tools/golden/compare.py --self-test          # exit 0
-$PY rust/torch_c/pytests/verify_schemas.py       # 4295/4295
-( cd rust/torch_c && cargo test --release )      # 10
+PYTHON=$PY sh tests/run.sh        # 241
+$PY tests/golden/compare.py                      # 3302/3302 ops=133
+$PY tests/golden/compare.py --self-test          # exit 0
+$PY tests/_support/verify_schemas.py       # 4295/4295
+( cd torchnative/rust/torch_c && cargo test --release )      # 10
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/dtypeperf-scratch/` 에 있습니다:
@@ -487,5 +487,5 @@ $PY rust/torch_c/pytests/verify_schemas.py       # 4295/4295
 | `ab.sh` | old↔new 산출물 교대 3 회차 + 대조군 (`cmp` 로 교체 확인) | §6.4 |
 
 **상류를 재려면 `PYTHONPATH` 를 빼고, 시임을 재려면 넣습니다**
-(`PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`). 넣은 채로 `compare.py` 를
+(`PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1`). 넣은 채로 `compare.py` 를
 돌리면 상류가 가려져 기준선이 사라집니다.

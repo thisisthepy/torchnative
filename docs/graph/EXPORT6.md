@@ -361,7 +361,7 @@ running a model probe on the same machine at the time.
    cpu target is now served as an ordinary unpinned cpu tensor; a non-cpu target still refuses by
    name. The test that pinned the old `True` refusal was rewritten, see `docs/kernels/RANDOM.md` §3.)
 
-**Tests added**: 11 in `rust/torch_c/pytests/test_export6.py`. Every one
+**Tests added**: 11 in `tests/export/test_export6.py`. Every one
 compares against upstream torch's own answer in a second subprocess rather than
 against a table written beside it; none asserts "export() returned".
 
@@ -375,15 +375,15 @@ gap this round closed. §3.
 
 **Removed**: nothing.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_every_schema_type_answers_annotation_str_exactly_as_upstream_does present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_a_dispatch_mode_receives_positional_arguments_positionally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_every_schema_default_is_the_python_value_upstream_gives_not_its_source_text present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_the_torchscript_type_singletons_are_the_objects_a_schema_hands_out present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _default_python_value present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs seat_positionally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs is_meta_storage present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_every_schema_type_answers_annotation_str_exactly_as_upstream_does present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_a_dispatch_mode_receives_positional_arguments_positionally present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_every_schema_default_is_the_python_value_upstream_gives_not_its_source_text present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_the_torchscript_type_singletons_are_the_objects_a_schema_hands_out present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
+<!-- DOCWATCH: symbol-in-file tests/export/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _default_python_value present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs seat_positionally present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs is_meta_storage present -->
 <!-- DOCWATCH: op-implemented aten.new_empty.default -->
 <!-- DOCWATCH: op-implemented aten.squeeze.dims -->

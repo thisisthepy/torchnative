@@ -128,7 +128,7 @@ OK: LlamaModel imported successfully, __doc__ len= 883
 
 ## 4. 재현 — 일반적인 이름-흉내 스텁으로 `modeling_llama.py` 전체를 통과시켜 봤다
 
-2 차가 쓴 원본 프로브 스크립트는 남아있지 않습니다(`vendor/probe.py` 는 3~4 차가 **실물 torch +
+2 차가 쓴 원본 프로브 스크립트는 남아있지 않습니다(`scripts/vendor/probe.py` 는 3~4 차가 **실물 torch +
 우리 `_C` 셔플**을 재는 별개의 도구이고, 스텁-torch 방식이 아닙니다). 그래서 category 1~5 가 정리한
 요구사항만 따라 새로 하나 만들어 재현을 시도했습니다. 코드는 `/tmp/stub_env/`(커밋 대상 아님).
 

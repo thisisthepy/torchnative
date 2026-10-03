@@ -94,7 +94,7 @@ safetensors 경로가 첫 벽에서 완전한 state dict 까지 간다" 고 적�
 ## 3. 각 경로가 어디서 막혔나 — 실측
 
 측정 방법: 각 경로를 독립된 `try/except` 로 돌려 **첫 벽이 다음 벽을 가리지 않게** 했습니다.
-`vendor/probe.py` 의 record 모드와 같은 발상이되, 대상이 import 가 아니라 로드 경로입니다.
+`scripts/vendor/probe.py` 의 record 모드와 같은 발상이되, 대상이 import 가 아니라 로드 경로입니다.
 
 ### 3.1 safetensors
 
@@ -211,7 +211,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
 
 | | 어디 | |
 |---|---|---|
-| `StorageBase` | `rust/torch_c/src/storage.rs` (신규) | 바이트 버퍼 + `filled` 불변식 |
+| `StorageBase` | `torchnative/rust/torch_c/src/storage.rs` (신규) | 바이트 버퍼 + `filled` 불변식 |
 | `TensorBase.set_` | `tensor.rs` | strided gather, 네 가지 거부 |
 | `TensorBase.element_size` | `tensor.rs` | dtype 태그 기준 |
 | `gather_strided` | `tensor.rs` | 뷰를 정의대로 읽음 |
@@ -222,7 +222,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
 `torch.bool` 정규화를 따로 갖고 있으면 §1 의 "두 리더가 비트 단위로 같다" 가 우연이 됩니다.
 
 **`_aten_dispatch` 는 그대로 단일 출입구입니다.** 여기 추가된 것 중 aten op 은 하나도 없고
-(`_aten_implemented()` 는 91 개 그대로, 골든 pending 0), 따라서 `tools/golden/cases.py` 에
+(`_aten_implemented()` 는 91 개 그대로, 골든 pending 0), 따라서 `tests/golden/cases.py` 에
 붙일 케이스도 없습니다.
 
 ### 때운 것 (papered over — 구현이 아님)
@@ -242,7 +242,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
 | ~~`torch.load(mmap=True)`~~ **정정 (문서 감사, 2026-09): 닫힘** | `UntypedStorage.from_file` + 스토리지 슬라이싱 — `docs/models/CKPT2.md` 가 구현, 가중치가 비트 단위로 상류와 일치 |
 | ~~`safetensors` 기본 `mmap` 백엔드~~ **정정 (문서 감사, 2026-09): 닫힘** | 같은 것 — `docs/models/CKPT2.md` §7 이 SmolLM2-135M 273 텐서 전부 비트 일치를 확인 |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs from_file present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs from_file present -->
 | `get_record_offset_no_read` | torch 의 레코드 정렬 산술 재현. **틀린 오프셋은 예외가 아니라 옆 텐서의 바이트**라 추측하지 않음 |
 | `int8` · `uint16` · `uint64` · complex 로 저장된 체크포인트 | candle 이 못 담음. dtype 이름을 대며 거부 |
 | 음수 stride | torch 가 만들지 않으므로 추측하지 않음 |
@@ -260,8 +260,8 @@ after (see storage.rs and docs/models/CKPT.md §4).
   아닙니다. HF 체크포인트 특유의 것(공유 텐서 메타데이터, 샤딩된 `.index.json`, `_metadata`)은
   **미측정**입니다.
 - **회귀 스위트에 박혀 있지 않습니다.** 위 숫자는 전부 `/Volumes/macMini/caches/ckpt-probe/`
-  의 스크립트로 잰 것이고, 커밋 대상이 아닙니다(이 작업의 파일 범위가 `rust/torch_c/src/`,
-  `tools/golden/cases.py`, 이 문서였습니다). **`pytests/test_shim.py` 에 넣는 것이 다음
+  의 스크립트로 잰 것이고, 커밋 대상이 아닙니다(이 작업의 파일 범위가 `torchnative/rust/torch_c/src/`,
+  `tests/golden/cases.py`, 이 문서였습니다). **`tests/_support/test_shim.py` 에 넣는 것이 다음
   작업이고, 넣기 전까지 §1 의 어떤 성질도 회귀로부터 보호되지 않습니다.** docs/models/E2E.md 가 같은
   이유로 만들어졌던 자리입니다.
 - `serialization_id()` 는 레코드가 없으면 빈 문자열을 답합니다. 상류가 그 값을 어떻게 쓰는지는
@@ -275,14 +275,14 @@ after (see storage.rs and docs/models/CKPT.md §4).
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-ckpt
 cd /path/to/repo
-bash vendor/vendor_torch.sh
-sh vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh
+sh scripts/vendor/install_shim.sh
 
 # 상류가 체크포인트를 만든다 (벤더 트리를 PYTHONPATH 에 넣지 않는다)
 /Volumes/macMini/caches/spike-venv/bin/python make_ckpt.py
 
 # shim 이 그것을 읽는다
-TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
+TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     /Volumes/macMini/caches/spike-venv/bin/python verify.py
 ```
 
@@ -300,7 +300,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 §1-7 의 모든 숫자는 `/Volumes/macMini/caches/ckpt-probe/` 아래의, 커밋 대상이 아닌 스크립트
 (`make_ckpt.py`/`verify.py`/`make_hard.py`/`verify_hard.py`)로 잰 것이었다. worktree 가 정리되면
 그 스크립트도 함께 사라지고, 그때까지는 §1 의 어떤 성질도 회귀로부터 보호되지 않았다. 이 절은
-그것을 `rust/torch_c/pytests/test_shim.py` 의 다섯 테스트로 옮겨 박은 기록이다. `docs/models/E2E.md` 가
+그것을 `tests/_support/test_shim.py` 의 다섯 테스트로 옮겨 박은 기록이다. `docs/models/E2E.md` 가
 샘플링 경로에 대해 이미 한 일과 같은 종류의 작업이다.
 
 ### 8.1 추가한 다섯 테스트와 각각이 잡는 것
@@ -321,7 +321,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 
 이번에는 그 트릭을 못 썼다. `torch.load`/`nn.Module`/`state_dict` 는 **순수 파이썬 torch**
 (`torch/serialization.py`, `torch/nn/modules.py`, ...) 안에 있고, 그 코드가 셰임을 쓰게 하려면
-벤더 트리(`torchnative/src/main/torch`, `_C.abi3.so` 가 이미 심어져 있는 그 패키지)를 **`torch`
+벤더 트리(`torchnative/python/torch`, `_C.abi3.so` 가 이미 심어져 있는 그 패키지)를 **`torch`
 라는 이름으로** import 해야 한다 — 상류 `torch` 와 이름이 같다. 한 인터프리터에서 `torch` 라는
 이름은 하나뿐이고, 게다가 그렇게 하려면 이미 독립 모듈로 한 번 로드해 둔 셰임 네이티브 라이브러리를
 **다른 경로에서 두 번째로 `dlopen`** 하게 되는데, 이게 안전한지는 이 작업에서도 이전 어디에서도
@@ -339,19 +339,19 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 결과를 나눠 쓴다. 실패 시에는 `lru_cache` 가 예외를 캐싱하지 않으므로 각 테스트가 독립적으로
 재실행하고 독립적으로 빨갛게 보고한다(§8.4).
 
-### 8.3 새 전제조건 — `pytests/run.sh` 가 보장하지 않는 것
+### 8.3 새 전제조건 — `tests/run.sh` 가 보장하지 않는 것
 
-`pytests/run.sh` 는 독립 모듈 `_C.abi3.so` 만 스테이징한다. 이 다섯 테스트가 필요로 하는
-`torchnative/src/main/torch/_C.abi3.so` (벤더 트리 안에 심어진 셰임)는 **별도로**
-`vendor/vendor_torch.sh` + `vendor/install_shim.sh` 를 돌려야 생긴다 — `run.sh` 자신은 이 경로를
+`tests/run.sh` 는 독립 모듈 `_C.abi3.so` 만 스테이징한다. 이 다섯 테스트가 필요로 하는
+`torchnative/python/torch/_C.abi3.so` (벤더 트리 안에 심어진 셰임)는 **별도로**
+`scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh` 를 돌려야 생긴다 — `run.sh` 자신은 이 경로를
 전혀 건드리지 않는다. 그래서 다섯 테스트 모두 `_upstream_torch is None` 뿐 아니라
-`torchnative/src/main/torch/_C.abi3.so` 존재 여부도 같이 확인하고(`_ckpt_shim_available()`), 둘
+`torchnative/python/torch/_C.abi3.so` 존재 여부도 같이 확인하고(`_ckpt_shim_available()`), 둘
 중 하나라도 없으면 `docs/models/E2E.md` 와 같은 이유로 조용히 통과한다(`pytest.skip` 을 쓰지 않는 이유도
 같다 — 이 파일은 pytest 에 의존하지 않는다).
 
 ### 8.4 각 테스트가 실제로 빨간지 확인한 방법
 
-구현(`rust/torch_c/src/`)은 건드리지 않았다 — 이 작업의 파일 범위 밖이다. 대신 매 테스트마다
+구현(`torchnative/rust/torch_c/src/`)은 건드리지 않았다 — 이 작업의 파일 범위 밖이다. 대신 매 테스트마다
 `test_shim.py` 안의 **기대값**을 하나씩 흔들어 다시 돌리고, `FAIL` 을 직접 본 뒤 원본 사본
 (`cp` 로 떠 둠)과 `diff` 로 바이트 단위 원상복구를 확인했다. 다섯 개 전부:
 
@@ -364,8 +364,8 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 | filled 가드 — strided gather | 연속 읽기 기대값을 `[0,1,2,3]` 대신 `[9,9,9,9]` 로 | `FAIL ...: AssertionError: [0.0, 1.0, 2.0, 3.0]` |
 | 14 개 어려운 케이스 | 비트 일치 기준(`== 0.0`)을 `== 999.0` 으로 | `FAIL ...: AssertionError: ('w_f32', 0.0)` |
 
-마지막에 `diff /tmp/test_shim.py.orig rust/torch_c/pytests/test_shim.py` 로 완전히 동일함을,
-`git status --short` 로 `rust/torch_c/pytests/test_shim.py` 와 `docs/models/CKPT.md` 두 파일 외에는
+마지막에 `diff /tmp/test_shim.py.orig tests/_support/test_shim.py` 로 완전히 동일함을,
+`git status --short` 로 `tests/_support/test_shim.py` 와 `docs/models/CKPT.md` 두 파일 외에는
 아무것도 바뀌지 않았음을 확인했다.
 
 **filled 가드에 대해 못 한 것.** 지시받은 것은 "가드를 우회했을 때 실제로 0.0 이 나오는 것을
@@ -373,14 +373,14 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 됨)을 보이지만, "가드가 아예 없었다면 0.0 이 나온다"는 것 자체를 이번 세션에서 다시 재현하지는
 못했다 — `set_` 이 그 확인이 걸리는 유일한 문이라(§4, storage.rs 주석: "the one door"), 소스를
 고치지 않고는 우회할 방법이 없었다. `git stash`로 가드를 빼고 다시 빌드하는 것도 고려했지만
-지시받은 파일 범위(`rust/torch_c/src/` 제외)를 넘는 일이라 하지 않았다. 대신 이미 §4 가 기록해
+지시받은 파일 범위(`torchnative/rust/torch_c/src/` 제외)를 넘는 일이라 하지 않았다. 대신 이미 §4 가 기록해
 둔, 가드가 생기기 전에 실측된 값(`down.bias[:4] = [0.0, 0.0, 0.0, 0.0]`, 참값은
 `[0.06125, 0.14750, 0.23375, -0.18000]`)을 그대로 근거로 남긴다. **이 부분은 재현이 아니라
 인용이다.**
 
 ### 8.5 허용오차 근거
 
-- **로짓 비교(`torch.load` zip, safetensors 두 경로)**: `pytests/test_shim.py` 에 이미 있는
+- **로짓 비교(`torch.load` zip, safetensors 두 경로)**: `tests/_support/test_shim.py` 에 이미 있는
   `_E2E_LOGIT_ATOL = 1e-5` 를 그대로 재사용했다. 새 상수를 만들지 않은 이유는 근거가 이미 같기
   때문이다 — §1 의 표가 스스로 적은 정상 범위(`2.3e-09~5.2e-06`)가 `_E2E_LOGIT_ATOL` 정의부
   주석이 `do_sample`/`greedy` 측정에서 뽑은 범위와 **동일**하고, 오늘 이 세션에서 재측정한
@@ -397,7 +397,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 
 ### 8.6 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 pytests/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
+`PYTHONPATH=<stage> python3 tests/_support/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
 
 ```
 이전 (테스트 65개)   2.09s
@@ -406,7 +406,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
 
 증가분은 대부분 상류 `torch.save`/`safetensors.save_file`(이 프로세스, 1 회) +
 서브프로세스 기동 및 그 안에서의 `import torch`(벤더+셰임)/`import safetensors`(1 회) 비용이다
-— `functools.lru_cache` 덕분에 다섯 테스트가 그 비용을 한 번만 낸다. `pytests/run.sh` 전체(cargo
+— `functools.lru_cache` 덕분에 다섯 테스트가 그 비용을 한 번만 낸다. `tests/run.sh` 전체(cargo
 증분 빌드 + golden 자가검사 포함)는 약 5 초로, "몇 분씩" 걸리는 영역과는 여전히 자릿수가 다르다.
 
 ### 8.7 넣지 않은 것과 이유
@@ -429,7 +429,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
   재현하지는 못했다** — §4 의 기존 기록을 인용했을 뿐이다.
 - `docs/models/E2E.md` §3 이 이미 적은 것과 같은 한계가 여기에도 그대로 적용된다: 상류 torch 가 없는
   인터프리터, 그리고 벤더 셰임이 설치되지 않은 환경에서는 이 다섯 테스트가 **아무것도 검증하지
-  않고 조용히 통과**한다. `pytests/run.sh` 만 돌리는 환경(벤더 트리 설치 없이)이 실제로 있는지는
+  않고 조용히 통과**한다. `tests/run.sh` 만 돌리는 환경(벤더 트리 설치 없이)이 실제로 있는지는
   확인하지 않았다.
 - 다른 아키텍처(AVX2/VSX)에서 서브프로세스 접근 자체나 `_E2E_LOGIT_ATOL` 재사용이 여전히
   유효한지는 §8 이 새로 확인하지 않았다 — `docs/models/E2E.md` §8 이 이미 같은 범위를 미확인으로 남겨

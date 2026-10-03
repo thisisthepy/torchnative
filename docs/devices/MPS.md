@@ -40,7 +40,7 @@ aten._softmax.default (f32)  같은 형태
 
 ### 1.2 `tril` 은 CPU 에서 계산되지 않았다
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs tril_triu present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs tril_triu present -->
 <!-- DOCWATCH: op-implemented aten.tril.default -->
 
 `tril_triu` 는 마스크를 호스트에서 만들지만 그 마스크는 **입력과 무관한 상수**이고, 계산은
@@ -115,8 +115,8 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 | 구조적으로 불가능하게 | Vulkan 의 `Repr::Vulkan` 이 그것이고, **여기서는 성립하지 않는다.** mps 텐서는 진짜 candle 텐서라 `tensor()` 가 거절할 근거가 없고, 모든 Metal 텐서를 감싸면 `mps` 가 주는 유일한 이점(커널을 하나도 안 가르쳐도 된다)을 버리게 된다 |
 | **문 앞에서 거절** | 문이 이미 하나다. `aten_dispatch` 의 `check_devices_agree` 가 인자의 장치를 **이미 스캔하고 있고**, meta 와 vulkan 이 이미 그 결과로 갈라진다. mps 는 거기에 팔 하나 |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs mps_host_readback_gate present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs mps_host_readback_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
 
 `aten.rs` 에 들어간 것은 그 팔 하나(3줄)이고, 나머지는 전부 `device.rs` 에 있습니다.
 
@@ -131,13 +131,13 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 올립니다. 그 스캔은 **테스트가 매번 다시 돌립니다:**
 
 * `test_the_mps_readback_list_is_what_the_kernels_actually_do`
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_mps_readback_list_is_what_the_kernels_actually_do present -->
+  <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_mps_readback_list_is_what_the_kernels_actually_do present -->
   소스에서 다시 유도한 집합을 **아티팩트가 게이트하고 있는 표**
   (`_C._shim_mps_host_readback_ops()`) 와 비교합니다. 소스끼리 비교했다면 아무도 다시 빌드하지
   않은 변경 뒤에도 자기 자신과 일치했을 것입니다. `to_vec1` 이 생긴 커널은 목록에 오르기
   전까지 스위트를 빨갛게 만들고, 없어진 커널은 사라진 이유로 계속 거절당하지 않습니다.
 * `test_every_host_readback_in_aten_is_classified`
-  <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
+  <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_every_host_readback_in_aten_is_classified present -->
   스캔이 **헬퍼 호출을 이름으로 한 단계만** 따라간다는 것이 이 방식의 한계입니다. 두 단계
   아래 새로 생긴 되읽기는 어떤 op 에도 닿지 않고 조용히 빠집니다. 그래서 더 강한 것을
   단언합니다 — `aten.rs` 안에서 되읽기 표식을 가진 **모든 함수**는 (a) 이미 거절되는 커널,
@@ -158,9 +158,9 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 모든 `*.rs` 에서 되읽기 표식을 가진 함수를 뽑고, 커널은 **정규화된 경로**
 (`crate::tensor::to_le_bytes(`)로 대조합니다 — 이름만으로 맞추면 정수의 고유 메서드인
 `to_le_bytes` 때문에 멀쩡한 커널 여러 개가 목록에 오릅니다.
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _cross_file_readback_helpers present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _reaches_cross_file_readback present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _cross_file_readback_helpers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _reaches_cross_file_readback present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_viewdtype.py test_no_aten_kernel_reaches_a_cross_file_readback_unrefused present -->
 
 ### 3.2 왜 "안전한 op 의 허용 목록" 이 아닌가
 
@@ -202,21 +202,21 @@ ops=222. 그것이 이 라운드의 음성 대조군입니다.
 
 ## 5. `run.sh` — 거짓말하던 스킵 (docs/devices/VULKAN3.md §6.1)
 
-§6.1 이 기록한 함정: `DYLD_LIBRARY_PATH=... sh rust/torch_c/pytests/run.sh` 는 로더를 정확히
+§6.1 이 기록한 함정: `DYLD_LIBRARY_PATH=... sh tests/run.sh` 는 로더를 정확히
 가리켜도 vulkan 테스트 넷을 전부 스킵했고, **스킵 줄은 "no vulkan" 이라고 말했습니다.**
 macOS SIP 가 `/bin/sh` 를 exec 할 때 `DYLD_*` 를 떼어내기 때문입니다.
 
 **스크립트가 그 변수를 복원할 수는 없습니다 — 애초에 받은 적이 없습니다.** 그래서 두 가지를
 했습니다.
 
-1. **통과용 이름을 하나 만든다.** <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/run.sh TORCH_C_DYLD_LIBRARY_PATH present -->
+1. **통과용 이름을 하나 만든다.** <!-- DOCWATCH: symbol-in-file tests/run.sh TORCH_C_DYLD_LIBRARY_PATH present -->
    `TORCH_C_DYLD_LIBRARY_PATH` 는 `DYLD_*` 가 아니므로 exec 를
    살아서 통과하고, `run.sh` 가 파이썬을 부르기 직전에 `DYLD_LIBRARY_PATH` 로 다시 내보냅니다.
 
 2. **함정을 탐지해 이름을 댄다.** 떼어진 변수는 흔적을 남기지 않지만 **서명은 남깁니다** —
    `VK_DRIVER_FILES` 는 `DYLD_*` 가 아니라 SIP 가 건드리지 않습니다. 둘 중 하나만 세팅된
    상태는 **둘 다 세팅하고 하나를 잃은 사람**의 모양입니다. `run.sh` 가 그때 경고하고,
-   <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _sip_stripped_the_loader_path present -->
+   <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py _sip_stripped_the_loader_path present -->
    `_vulkan_or_skip` 의 스킵 줄도 "no vulkan" 대신 SIP 와 통과용 변수를 말합니다.
 
 **실측 — 이것이 §6.1 이 불가능하다고 적은 조합입니다:**
@@ -224,7 +224,7 @@ macOS SIP 가 `/bin/sh` 를 exec 할 때 `DYLD_*` 를 떼어내기 때문입니�
 ```
 $ V=~/Library/Android/sdk/emulator/lib64/vulkan
 $ TORCH_C_DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
-      PYTHON=$PY sh rust/torch_c/pytests/run.sh
+      PYTHON=$PY sh tests/run.sh
 
 461 ok,  스킵 0개,  EXIT=0,  DOCWATCH PASS 452/452
 ```
@@ -239,11 +239,11 @@ $ TORCH_C_DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
 
 | | 값 |
 |---|---|
-| `pytests/run.sh` (로더 없음) | **461 ok**, 0 FAIL, EXIT=0 |
+| `tests/run.sh` (로더 없음) | **461 ok**, 0 FAIL, EXIT=0 |
 | 같은 스위트, `TORCH_C_DYLD_LIBRARY_PATH` 로 로더 지정 | **461 ok**, **스킵 0개**, EXIT=0 |
 | DOCWATCH | **PASS — 452/452** |
 | golden `compare.py` | 이 회차 기준 **8921/8921**, ops=222 — 이 회차가 **움직이지 않았다**는 뜻이지 그 수가 고정이라는 뜻이 아니다. 같은 배치의 `docs/kernels/FIXES.md` 가 `fmod` 로 224 로 올렸다. `eq` 로 적었다가 그 병합에서 바로 터졌고, 다른 회차가 올릴 수 있는 수는 `ge` 로 적는다 <!-- DOCWATCH: count golden_cases_passed ge 8921 --> <!-- DOCWATCH: count golden_ops_covered ge 222 --> |
-| `aarch64-linux-android` | EXIT=0 (`scripts/device_android.sh build`) |
+| `aarch64-linux-android` | EXIT=0 (`scripts/devices/device_android.sh build`) |
 | `aarch64-apple-ios-sim` | EXIT=0 (`PYO3_CONFIG_FILE` 레시피) |
 | 가드 무력화 시 | `test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op` **FAIL**, EXIT=1 |
 

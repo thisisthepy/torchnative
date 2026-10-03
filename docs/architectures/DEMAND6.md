@@ -13,7 +13,7 @@ here so a future round does not re-discover them as "regressions."
 
 Every script printed `print("shim" if hasattr(torch._C, "_aten_implemented") else "upstream")` as
 line one, both sides, every run, and every dump/log below has it transcribed at the top — no run
-printed the wrong label. Environment: `PYTHONPATH=torchnative/src/main
+printed the wrong label. Environment: `PYTHONPATH=python
 TORCH_USE_RTLD_GLOBAL=1` for the shim, `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL` for upstream,
 never both `torch` variants in one interpreter. `pip` was not run this round, so there is no
 `transformers`-replaces-`torch` risk to check provenance against — noted per the brief's warning,
@@ -23,8 +23,8 @@ not because it fired. `torch` version used: the repo's pinned upstream (`2.13.0`
 second. Nothing was left running; no background probe processes were started, all runs were
 foreground per the instructions.
 
-Build: `cargo build --release` in `rust/torch_c` with `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep2`,
-`TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib` exported before `bash vendor/install_shim.sh`.
+Build: `cargo build --release` in `torchnative/rust/torch_c` with `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep2`,
+`TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib` exported before `bash scripts/vendor/install_shim.sh`.
 Scratch scripts under `/tmp/sweep2/` (not committed): `check_common.py` (19-target pass/fail sweep,
 shared by both sides via `PYTHONPATH`), `dump_model.py` + `compare_dumps.py` (numeric comparison
 for the 14 that forward on both sides).
@@ -92,7 +92,7 @@ former shape). One is a **missing kernel** (`adaptive_avg_pool2d` — no leaf im
 anywhere, the same shape `adaptive_avg_pool1d` was before DEMAND1 closed it).
 
 **docs/verification/GOLDEN.md's blind spot, and why it does not invalidate this table:** GOLDEN.md documents
-that `tools/golden/compare.py`'s 2811 (now 8469) cases called `_aten_dispatch` **positionally**,
+that `tests/golden/compare.py`'s 2811 (now 8469) cases called `_aten_dispatch` **positionally**,
 never exercising `bootstrap.py`'s keyword-argument path through `interned_name()` — a wrong
 interned string there would pass every golden case and still break real calls. This sweep's
 targets all go through real `transformers` forward code, which calls through `bootstrap.py`'s
@@ -171,5 +171,5 @@ DOCWATCH: PASS -- 323/323
 
 All three ran once, at the end, against the same build used for the model sweep above (no rebuild
 in between). Numbers are unchanged from docs/architectures/DEMAND4.md §4's own gate line, as expected — this
-round changed no source under `rust/torch_c/src/` or elsewhere; only `/tmp/sweep2/*.py` scratch
+round changed no source under `torchnative/rust/torch_c/src/` or elsewhere; only `/tmp/sweep2/*.py` scratch
 scripts and this document were written.

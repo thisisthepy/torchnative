@@ -10,7 +10,7 @@
 Worktree `work/agree` on develop `b33e2ee` (vendored tree assembled fresh). torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout. No Rust,
 `bootstrap.py` or `aten.rs` was changed in this round: it adds
-`rust/torch_c/pytests/agree_sweep.py`, `rust/torch_c/pytests/test_agree.py` and this document.
+`tests/_support/agree_sweep.py`, `tests/numerics/test_agree.py` and this document.
 Golden stays at **11336/11336, ops=299** — exactly unmoved, which is the correct result for a
 round that changed no kernel.
 
@@ -294,10 +294,10 @@ side runs **first** — it is the producer of weights, inputs and the float64 or
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 D=/Volumes/macMini/tmp-agree                 # NOT /tmp: ~8 GB of bundles, and /tmp is internal
-cd rust/torch_c/pytests
+cd tests
 
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
                                            $PY agree_sweep.py --replay  --dir $D
 $PY agree_sweep.py --report --dir $D
 
@@ -315,9 +315,9 @@ backgrounded.
 ## 9. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    884 ok, 0 FAIL, exit 0        (868 before; +16 from test_agree.py)
+tests/run.sh    884 ok, 0 FAIL, exit 0        (868 before; +16 from test_agree.py)
 DOCWATCH                       PASS -- 785/785 evaluated marker(s) hold
-tools/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
+tests/golden/compare.py        11336/11336 cases passed, 0 failed, ops covered=299, pending=0
 ```
 
 Golden is **exactly unmoved** from this worktree's starting point, which is the correct result:
@@ -328,11 +328,11 @@ binary and reports a plausible but wrong number (`docs/architectures/ARCH100.md`
 `HF_HOME=/tmp/hf-agree` was set and removed afterward; no checkpoint was downloaded, since this
 sweep builds every model from a config.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py calibration_batch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py diff_stats present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py verdict present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py bisect_one present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py calibration_batch present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py diff_stats present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py verdict present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/agree_sweep.py bisect_one present -->
+<!-- DOCWATCH: symbol-in-file tests/numerics/test_agree.py test_the_shim_reproduces_upstreams_seeded_random_numbers present -->
 <!-- DOCWATCH: count golden_cases_passed ge 11336 -->
 <!-- DOCWATCH: count golden_ops_covered ge 299 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->

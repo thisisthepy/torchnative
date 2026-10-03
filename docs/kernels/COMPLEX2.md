@@ -13,9 +13,9 @@ Its §3.3 gave a five-step list. Steps 1 through 4 are done. Step 5 (`fft_fftn`,
 for `fnet`) is untouched and remains a separate decision.
 
 The assertions behind everything here live in
-`rust/torch_c/pytests/test_complex.py` (11 tests, all element-wise against a
+`tests/ops/test_complex.py` (11 tests, all element-wise against a
 live upstream in a separate process) and in the two tests of
-`pytests/test_tail2.py` that this round inverted.
+`tests/ops/test_tail2.py` that this round inverted.
 
 ---
 
@@ -97,7 +97,7 @@ is `3`, both agreeing.
 bytes rather than 4, and `numel() * element_size()` sizes the two buffers
 together and correctly.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs no_real_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs no_real_storage present -->
 
 ### 1.3 One entrance
 
@@ -198,7 +198,7 @@ Both nullifications were built and run, not reasoned about.
 
 ## 3. The bar: the imaginary part survives
 
-`pytests/test_complex.py` runs one probe script under **two interpreters** — the
+`tests/ops/test_complex.py` runs one probe script under **two interpreters** — the
 vendored shim on `PYTHONPATH`, and upstream torch with the environment stripped
 — and compares element-wise. Each side asserts its own marker, so a mis-wired
 environment fails loudly instead of comparing something against itself.
@@ -402,7 +402,7 @@ line is now a type-and-shape summary.
 ## 8. `llama4`, measured
 
 ```
-pytests/arch_sweep.py --only llama4 llama4_text --out ...
+tests/_support/arch_sweep.py --only llama4 llama4_text --out ...
 ```
 
 | | before | after |
@@ -433,8 +433,8 @@ Split as `docs/architectures/ARCH100.md` §5.3 asks:
 |---|---|
 | **feature added** | `Repr::Complex { re, im }` and its constructor; 12 ops taught the arm (`view_as_complex`, `view_as_real`, `polar`, `real`, `imag`, `mul.Tensor`, `mul.Scalar`, `copy_`, `detach`, `alias`/`clone`/`contiguous`/`lift_fresh`, `unsqueeze`); `torch._C._complex_ops()`; five `overloads.json` entries |
 | **defect fixed** | `complex32.itemsize` 2 → 4; `bfloat16.to_complex()` identity → `complex64`; `view_as_complex` aliasing its base for shapes where the narrow stayed contiguous |
-| **tests added** | `pytests/test_complex.py`, 11 tests, every positive one element-wise against a live upstream |
-| **tests inverted** | 2 in `pytests/test_tail2.py` — the two that asserted these operators *absent*, which is what that file's docstring asks an implementing round to do. Neither was deleted. |
+| **tests added** | `tests/ops/test_complex.py`, 11 tests, every positive one element-wise against a live upstream |
+| **tests inverted** | 2 in `tests/ops/test_tail2.py` — the two that asserted these operators *absent*, which is what that file's docstring asks an implementing round to do. Neither was deleted. |
 | **documentation** | this file; the `Repr::Complex` and `complex_ops` doc comments; `overloads.json`'s `polar` note |
 | **deleted** | nothing |
 | **architectures moved** | `llama4` blocked → forward; `llama4_text` blocked → forward |

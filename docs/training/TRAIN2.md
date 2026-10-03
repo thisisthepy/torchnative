@@ -261,7 +261,7 @@ the same line from the other side — **11385/11385, ops 300**, unmoved by this 
 
 | | |
 |---|---|
-| suite | **939 ok**, 0 FAIL, EXIT=0 (929 before; +10, all of them `pytests/test_train.py`) |
+| suite | **939 ok**, 0 FAIL, EXIT=0 (929 before; +10, all of them `tests/training/test_train.py`) |
 | DOCWATCH | **PASS — 837/837** (830 before; +7, all in this document) |
 | golden | **11385/11385**, ops covered 300, 0 pending — unmoved |
 
@@ -275,10 +275,10 @@ Counted per AGENTS.md §17.3, since "+10 tests" is four different things otherwi
 | **documentation corrected** | `docs/platform/RELEASE_0_1_0b0.md` §5's transformer clause is now measurably false (§4) — **not edited by this round**, because that file is not this round's territory; it is named here so the next round has the measurement |
 | **deleted** | nothing |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs convolution_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs avg_pool_backward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_train.py test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_train.py test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_train.py test_the_weight_gradient_needs_stride_and_dilation_exchanged present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_train.py test_max_pool2d_backward_is_still_refused_by_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_train.py test_the_training_loop_actually_accumulates_into_dot_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs convolution_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs avg_pool_backward present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_train.py test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_train.py test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_train.py test_the_weight_gradient_needs_stride_and_dilation_exchanged present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_train.py test_max_pool2d_backward_is_still_refused_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/training/test_train.py test_the_training_loop_actually_accumulates_into_dot_grad present -->

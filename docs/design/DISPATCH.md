@@ -209,7 +209,7 @@ the biggest number on the page deserves better than being waved at.
 
 ### 3.3 Taken: the two changes
 
-Both are in `rust/torch_c/src/aten.rs`. **`bootstrap.py` is not touched at
+Both are in `torchnative/rust/torch_c/src/aten.rs`. **`bootstrap.py` is not touched at
 all** — the call site turned out not to be where the cost was (§1), so the
 brief's `dispatch(key, **bound)` stays exactly as `972dfe4` left it.
 
@@ -257,9 +257,9 @@ The three gates, on the final artefact, unchanged from before the work — which
 is the point:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   -> 197 ok,                      exit 0
-$PY tools/golden/compare.py                 -> 2811/2811, ops covered=119,  exit 0
-$PY rust/torch_c/pytests/verify_schemas.py  -> 4203/4203,                   exit 0
+PYTHON=$PY sh tests/run.sh   -> 197 ok,                      exit 0
+$PY tests/golden/compare.py                 -> 2811/2811, ops covered=119,  exit 0
+$PY tests/_support/verify_schemas.py  -> 4203/4203,                   exit 0
 ```
 
 **And a real model agrees bit for bit.** Every prefill round in §5.2 dumps a
@@ -294,7 +294,7 @@ The crate also still cross-compiles for the device target, which matters
 because `aten.rs` is shared:
 
 ```
-sh scripts/device_android.sh build   -> aarch64-linux-android, exit 0
+sh scripts/devices/device_android.sh build   -> aarch64-linux-android, exit 0
 ```
 
 ### 4.1 Which gate actually guards change (b) — and it is not the golden one
@@ -306,12 +306,12 @@ keyword misses — and the three gates were re-run:
 
 | gate | tampered result |
 |---|---|
-| `tools/golden/compare.py` | **2811/2811, exit 0 — did not notice** |
-| `pytests/run.sh` | 149 ok, **exit 1** (48 tests red) |
+| `tests/golden/compare.py` | **2811/2811, exit 0 — did not notice** |
+| `tests/run.sh` | 149 ok, **exit 1** (48 tests red) |
 | SmolLM2 prefill | **dies immediately**, `aten.normal_.default: missing required argument 'self'` |
 
 **The golden harness is blind to this entire code path**, and the reason is
-structural rather than accidental: every builder in `tools/golden/cases.py`
+structural rather than accidental: every builder in `tests/golden/cases.py`
 calls the door **positionally** — `c_module._aten_dispatch("aten.add.Tensor",
 a_c, b_c)` — so `optional()` takes the `index < args.len()` branch and the
 keyword lookup never runs. All 2811 cases share that shape. The headline

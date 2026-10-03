@@ -21,14 +21,14 @@ it looks like.
 
 The existing six are unchanged and were rebuilt to prove it (§5).
 
-<!-- DOCWATCH: symbol-in-file tools/wheel/build.py EXPECTED_TARGET_KEYS present -->
-<!-- DOCWATCH: symbol-in-file tools/wheel/build.py check_registry present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/build.py EXPECTED_TARGET_KEYS present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/build.py check_registry present -->
 
 ---
 
 ## 1. The registry now holds nine targets, and says so twice
 
-`tools/wheel/build.py`'s `TARGETS` is a dict comprehension keyed on `t.key`:
+`scripts/wheel/build.py`'s `TARGETS` is a dict comprehension keyed on `t.key`:
 
 ```python
 TARGETS: dict[str, Target] = {t.key: t for t in ( ... )}
@@ -51,7 +51,7 @@ failure names the key instead of reporting `8 != 9`:
     wasm32-emscripten
     windows-arm64      windows-x86_64
 
-`rust/torch_c/pytests/test_wheelmatrix.py::test_the_registry_cannot_silently_lose_an_entry`
+`tests/release/test_wheelmatrix.py::test_the_registry_cannot_silently_lose_an_entry`
 drives the collision rather than arguing it.
 
 ---
@@ -161,11 +161,11 @@ tag manylinux_2_17_x86_64  yielded by packaging._manylinux.platform_tags(['x86_6
 visible** — and it is packaging saying it, not this file. That is what stops
 `_MANYLINUX_ARCH_FLOOR` above from being self-confirming.
 
-`tools/wheel/verify_cross.py` now runs the same confirmation, so its manylinux
+`scripts/wheel/verify_cross.py` now runs the same confirmation, so its manylinux
 branch is no longer a step weaker than its android and ios branches.
 
-<!-- DOCWATCH: symbol-in-file tools/wheel/build.py _confirm_manylinux_with_packaging present -->
-<!-- DOCWATCH: symbol-in-file tools/wheel/build.py _MANYLINUX_ARCH_FLOOR present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/build.py _confirm_manylinux_with_packaging present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/build.py _MANYLINUX_ARCH_FLOOR present -->
 
 ### 2.3 `win_arm64` — a NAME, and looked up rather than assumed
 
@@ -234,7 +234,7 @@ artefact against the target and the artefact is correct. `python313.dll`'s PE
 machine is now checked too. `AndroidTarget._api_and_abi` has the identical trap
 and the identical check, on `MULTIARCH`.
 
-<!-- DOCWATCH: symbol-in-file tools/wheel/build.py _confirm_windows_normalisation present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/build.py _confirm_windows_normalisation present -->
 
 ---
 
@@ -275,7 +275,7 @@ QEMU — and both a container and the wheel are the real thing.
 
 **Run A, at exactly the glibc the tag names.** `quay.io/pypa/manylinux2014_aarch64`
 is CentOS 7 AltArch, `ldd (GNU libc) 2.17`, `uname -m` = `aarch64`. The wheel was
-installed with `--no-deps` and `tools/ci/verify_published.py` — the script the
+installed with `--no-deps` and `.github/scripts/verify_published.py` — the script the
 Linux and Windows CI legs run — was executed against it:
 
 ```
@@ -352,7 +352,7 @@ this machine, Docker's VM is Linux, and the existing CI job runs
 `win_amd64` sat on before its CI leg existed, and the README column says exactly
 that. GitHub's `windows-11-arm` runner images would close it the same way
 `ubuntu-latest` closed Linux x86-64 — that is a change to
-`.github/workflows/verify-published-wheel.yml` and a published `win_arm64`
+`.github/workflows/test-published-wheel.yml` and a published `win_arm64`
 wheel to install, neither of which is this round's to make.
 
 ### 3.3 `android-x86_64` — refuses, and the missing piece is not the toolchain
@@ -406,7 +406,7 @@ claim `android-arm64-v8a` already has.
 
 The refusal is checked in `main()` **before** the artefact, so `--target
 android-x86_64` answers with this reason instead of "no cross-built extension
-at …, run `scripts/device_android.sh build`" — advice that cannot succeed.
+at …, run `scripts/devices/device_android.sh build`" — advice that cannot succeed.
 
 ---
 

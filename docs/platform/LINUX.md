@@ -41,20 +41,20 @@ Linux x86_64 가 올라 있는데 실제로 만든 적이 없다. 이 문서는 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-linux
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linux
 BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 ```
 
 기준선 회귀 (전부 exit 0 이어야 한다):
 
 ```sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        # 197
-$PY tools/golden/compare.py                      # 2811/2811 ops=119
-$BPY tools/wheel/build.py --self-test            # 8/8
+PYTHON=$PY sh tests/run.sh        # 197
+$PY tests/golden/compare.py                      # 2811/2811 ops=119
+$BPY scripts/wheel/build.py --self-test            # 8/8
 ```
 
 ---
@@ -333,12 +333,12 @@ BuildID[sha1]=8336b419..., with debug_info, not stripped
 
 | 검사 | 결과 |
 |---|---|
-| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | **exit 0, `^ok ` 197줄** |
-| `$PY tools/golden/compare.py` | **exit 0, 2811/2811, ops=119** |
-| `$BPY tools/wheel/build.py --self-test` | **exit 0, 8/8** |
+| `PYTHON=$PY sh tests/run.sh` | **exit 0, `^ok ` 197줄** |
+| `$PY tests/golden/compare.py` | **exit 0, 2811/2811, ops=119** |
+| `$BPY scripts/wheel/build.py --self-test` | **exit 0, 8/8** |
 
-`vendor/vendor_torch.sh` → `native_left=0`, `py_modules=2372`.
-`vendor/install_shim.sh` → `Finished release profile in 55.94s`.
+`scripts/vendor/vendor_torch.sh` → `native_left=0`, `py_modules=2372`.
+`scripts/vendor/install_shim.sh` → `Finished release profile in 55.94s`.
 
 ### 4.2 크로스 시도
 
@@ -346,7 +346,7 @@ BuildID[sha1]=8336b419..., with debug_info, not stripped
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linux
 S=$(rustc --print sysroot)
 LLD=$S/lib/rustlib/aarch64-apple-darwin/bin/rust-lld
-cd rust/torch_c
+cd torchnative/rust/torch_c
 PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib \
 RUSTFLAGS="-Clinker=$LLD -Clinker-flavor=ld.lld" \
   cargo build --release --target x86_64-unknown-linux-gnu
@@ -414,16 +414,16 @@ export AR_x86_64_unknown_linux_gnu="zig ar"
 
 - 값이 `/Users/ibrew/.rustup/...` 로 시작하는 **한 기계의 절대 경로**가 된다. cargo 는
   `rustflags` 안에서 환경변수를 전개하지 않는다. iOS 의 `-F` 가 정확히 이렇게 한 기계에
-  묶였고 `docs/platform/RUST_CROSSBUILD.md` §0.5 가 그것을 결함으로 기록했다. `rust/torch_c/build.rs`
+  묶였고 `docs/platform/RUST_CROSSBUILD.md` §0.5 가 그것을 결함으로 기록했다. `torchnative/rust/torch_c/build.rs`
   전체가 그 정정이다.
 - `cargo-zigbuild` 를 쓰면 래퍼가 링커를 **스스로** 지정한다. 미리 박아둔 값은 그것과 싸운다.
 
 따라서 §2.4 · §4.2 의 `RUSTFLAGS` 는 **측정용 일회성 환경변수이지 커밋된 설정이 아니다.**
-`rust/torch_c/.cargo/config.toml` 은 **손대지 않았다.**
+`torchnative/rust/torch_c/.cargo/config.toml` 은 **손대지 않았다.**
 
 ## 5. `build.py --target linux-x86_64` — 넘었다
 
-`tools/wheel/build.py` 에 `LinuxTarget` 을 넣었다. `AndroidTarget`/`IOSTarget` 이 본보기라는 지시대로
+`scripts/wheel/build.py` 에 `LinuxTarget` 을 넣었다. `AndroidTarget`/`IOSTarget` 이 본보기라는 지시대로
 같은 세 가지(아티팩트 · 컴파일러 · 태그)를 채우지만, **태그의 출처가 반대다.** 그것이 이 층의 전부다.
 
 ### 5.1 태그 출처가 뒤집힌다
@@ -443,7 +443,7 @@ Android · iOS 는 **타깃 CPython** 에서 최소 OS 버전을 읽는다:
 그래서 `LinuxTarget.platform_tag()` 는 **아티팩트를 읽고 인터프리터를 무시한다.**
 (인터프리터는 여전히 확인한다 — `MULTIARCH` 가 `x86_64-linux-gnu` 가 아니면 배포본이 다른 것이므로 거절.)
 
-`tools/wheel/binfmt.py` 에 `elf_dynamic()` 을 추가했다: `DT_SONAME` · `DT_NEEDED` ·
+`scripts/wheel/binfmt.py` 에 `elf_dynamic()` 을 추가했다: `DT_SONAME` · `DT_NEEDED` ·
 `.gnu.version_r` 을 읽는다. Mach-O 에도 Android 에도 대응물이 없는 섹션이다.
 
 ### 5.2 manylinux 태그 규칙 — 확인한 것
@@ -474,8 +474,8 @@ Android · iOS 는 **타깃 CPython** 에서 최소 OS 버전을 읽는다:
   돌린 뒤:
 
   ```
-  tools/wheel/build.py: .../x86_64-unknown-linux-gnu/release/lib_C.so is stale.
-    rust/torch_c/src/lib.rs was modified 58389.0 h ... after lib_C.so was written
+  scripts/wheel/build.py: .../x86_64-unknown-linux-gnu/release/lib_C.so is stale.
+    torchnative/rust/torch_c/src/lib.rs was modified 58389.0 h ... after lib_C.so was written
     ...
     Fix: docs/platform/LINUX.md §2.5 -- no toolchain on this machine can produce it yet.
   ```
@@ -489,16 +489,16 @@ Android · iOS 는 **타깃 CPython** 에서 최소 OS 버전을 읽는다:
 
 ```
 build it for x86_64-unknown-linux-gnu first
-  (scripts/device_android.sh build, or docs/platform/RUST_CROSSBUILD.md §0.5 for iOS)
+  (scripts/devices/device_android.sh build, or docs/platform/RUST_CROSSBUILD.md §0.5 for iOS)
 ```
 
-Linux 사용자에게 `scripts/device_android.sh build` 를 실행하라고 말한다.
+Linux 사용자에게 `scripts/devices/device_android.sh build` 를 실행하라고 말한다.
 각 타깃은 이미 `rebuild_hint` 로 자기 답을 들고 있고 낡음 검사는 그것을 인용하고 있었으므로,
 이 메시지도 같은 것을 쓰게 했다. 실측 결과:
 
 ```
 --- android-arm64-v8a
-  Fix: scripts/device_android.sh build
+  Fix: scripts/devices/device_android.sh build
 --- ios-arm64
   Fix: re-run the cross build for this target -- docs/platform/WHEEL.md §7.1 has the exact
        command (cargo build --release --target aarch64-apple-ios, with
@@ -529,7 +529,7 @@ target linux-x86_64: lib_C.so (2,511,824 B)
 `_dbm.so` 를 우리 확장으로 착각한다.
 
 ```
-tools/wheel/build.py: no C compiler that targets x86_64-unknown-linux-gnu.
+scripts/wheel/build.py: no C compiler that targets x86_64-unknown-linux-gnu.
   Tried, in order: $CC_x86_64_unknown_linux_gnu, $TARGET_CC, `zig` on PATH.
   ...
   Fix: install zig (docs/platform/LINUX.md §2.5), or point CC_x86_64_unknown_linux_gnu
@@ -585,7 +585,7 @@ LINUX SELF-TEST: FAIL -- 1/10 wrong
 
 ## 6. 심볼 해결 검증 — 넘었다. 다만 **iOS 만큼 강하지 않다**
 
-`tools/wheel/verify_linux.py` 를 만들었다. `verify_ios_device.py` 가 본보기라는 지시대로 같은
+`scripts/wheel/verify_linux.py` 를 만들었다. `verify_ios_device.py` 가 본보기라는 지시대로 같은
 구조지만, **먼저 말할 것은 어디까지 못 미치는가다.**
 
 ### 6.1 왜 약한가 — ELF 에는 two-level namespace 가 없다
@@ -646,7 +646,7 @@ zip 아카이브 안의 바이트를 다루므로 어차피 경로가 아니라 
 libc 심볼을 glibc 에서 버전 붙여 가져온다.
 
 ```
-$ python tools/wheel/verify_linux.py --self-test
+$ python scripts/wheel/verify_linux.py --self-test
   _dbm.cpython-313-x86_64-linux-gnu.so
     152 undefined (3 exported)
       84  -> libc.so.6  (bound by .gnu.version_r; needs GLIBC_2.14 ... GLIBC_2.17)
@@ -742,19 +742,19 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linux
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/vendor_torch.sh
-bash vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh
+bash scripts/vendor/install_shim.sh
 ```
 
 | 명령 | 기준선 | 변경 후 |
 |---|---|---|
-| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | exit 0, 197 | **exit 0, 197** |
-| `$PY tools/golden/compare.py` | exit 0, 2811/2811 ops=119 | **exit 0, 2811/2811 ops=119** |
-| `$BPY tools/wheel/build.py --self-test` | exit 0, 8/8 | **exit 0, 8/8 + 새 10/10** |
-| `$BPY tools/wheel/verify_linux.py --self-test` | (신규) | **exit 0, 5/5** |
-| `$BPY tools/wheel/build.py` (호스트 휠) | — | **exit 0**, `macosx_11_0_arm64`, 2,687 entries |
-| `$BPY tools/wheel/verify.py <위 휠>` | — | **exit 0**, 깨끗한 venv 에 설치 후 `aten.mm.default` 계산 |
-| `$BPY tools/wheel/verify_{cross,android,ios_sim,ios_device}.py --help` | — | **전부 import 됨** |
+| `PYTHON=$PY sh tests/run.sh` | exit 0, 197 | **exit 0, 197** |
+| `$PY tests/golden/compare.py` | exit 0, 2811/2811 ops=119 | **exit 0, 2811/2811 ops=119** |
+| `$BPY scripts/wheel/build.py --self-test` | exit 0, 8/8 | **exit 0, 8/8 + 새 10/10** |
+| `$BPY scripts/wheel/verify_linux.py --self-test` | (신규) | **exit 0, 5/5** |
+| `$BPY scripts/wheel/build.py` (호스트 휠) | — | **exit 0**, `macosx_11_0_arm64`, 2,687 entries |
+| `$BPY scripts/wheel/verify.py <위 휠>` | — | **exit 0**, 깨끗한 venv 에 설치 후 `aten.mm.default` 계산 |
+| `$BPY scripts/wheel/verify_{cross,android,ios_sim,ios_device}.py --help` | — | **전부 import 됨** |
 
 `binfmt.py` 변경은 **추가만**이다 — `elf_info` · `describe` · `macho_*` 는 그대로이므로
 Android · iOS 검증기가 읽는 것은 바뀌지 않았고, 위 마지막 줄이 그것을 확인한다.
@@ -816,7 +816,7 @@ export PATH="/Volumes/macMini/caches/zig-venv/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-desk2
 export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
 export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib
-cd /Volumes/macMini/worktrees/bw-desk2/rust/torch_c
+cd /Volumes/macMini/worktrees/bw-desk2/torchnative/rust/torch_c
 cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 #   EXIT=0, Finished `release` profile in 59.22s
 ```
@@ -842,7 +842,7 @@ DT_NEEDED  libm.so.6, libc.so.6, ld-linux-x86-64.so.2, libpthread.so.0, libdl.so
 1회차는 배포본의 `_dbm...so` 를 스탠드인으로 놓고 태그 유도를 돌렸다. 이번엔 진짜다:
 
 ```sh
-$BPY tools/wheel/build.py --target linux-x86_64
+$BPY scripts/wheel/build.py --target linux-x86_64
 ```
 
 ```
@@ -882,7 +882,7 @@ dist/torchnative-0.0.2a0-cp313-abi3-manylinux_2_17_x86_64.whl
 ### 9.4 층 6 — `verify_linux.py` 가 처음으로 우리 아티팩트를 봤다
 
 ```sh
-$BPY tools/wheel/verify_linux.py dist/torchnative-*manylinux*.whl     # EXIT=0
+$BPY scripts/wheel/verify_linux.py dist/torchnative-*manylinux*.whl     # EXIT=0
 ```
 
 ```
@@ -959,7 +959,7 @@ PEP 599 목록과 `GLIBC_ABI_DT_RELR` 순서 규칙은 **`build.LinuxTarget` 에
 복사하면 둘이 조용히 어긋난다.
 
 ```
-$BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl      # EXIT=0
+$BPY scripts/wheel/verify_cross.py dist/torchnative-*manylinux*.whl      # EXIT=0
   tag                 manylinux_2_17_x86_64  (PEP 600-shaped: glibc 2.17, x86_64)
   ! packaging has no manylinux_platforms, so unlike the android and ios tags
     this spelling is not confirmed against pip's own generator
@@ -986,7 +986,7 @@ AGENTS.md §17.5 가 말하는 바로 그 모양이고, **Linux 휠이 존재하
 그리고 이 계열 전용 결함 모드를 하나 더 넣었다 — §9.6 의 하한 검사가 실제로 실패하는지:
 
 ```
-$BPY tools/wheel/verify_cross.py dist/torchnative-*manylinux*.whl --self-test   # EXIT=0
+$BPY scripts/wheel/verify_cross.py dist/torchnative-*manylinux*.whl --self-test   # EXIT=0
 
   caught      extension built for the wrong platform
   caught      global-deps library missing
@@ -1045,22 +1045,22 @@ export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 BPY=/Volumes/macMini/caches/wheel-build-venv/bin/python
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/vendor_torch.sh          # py_modules=2372, native_left=0
-bash vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh          # py_modules=2372, native_left=0
+bash scripts/vendor/install_shim.sh
 ```
 
 | 명령 | 기준선 | 2회차 |
 |---|---|---|
-| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | exit 0, 197 | **exit 0, `^ok ` 197줄** |
-| `$PY tools/golden/compare.py` | exit 0, 2811/2811 ops=119 | **exit 0, 2811/2811 ops=119** |
-| `$BPY tools/wheel/build.py --self-test` | exit 0, 8/8 + 10/10 | **exit 0, 8/8 + 11/11** (케이스 7 추가, §9.8) |
-| `$BPY tools/wheel/verify_linux.py --self-test` | exit 0, 5/5 | **exit 0, 5/5** |
-| `$BPY tools/wheel/build.py` (호스트 휠) | exit 0, `macosx_11_0_arm64` | **exit 0**, 2,687 entries |
-| `$BPY tools/wheel/verify.py <위 휠>` | exit 0 | **exit 0**, 깨끗한 venv 에서 `aten.mm.default` 계산 |
-| `$BPY tools/wheel/build.py --target linux-x86_64` | (1회차엔 불가) | **exit 0**, `manylinux_2_17_x86_64`, 2,687 entries |
-| `$BPY tools/wheel/verify_cross.py <manylinux 휠>` | (1회차엔 거절) | **exit 0** |
-| `$BPY tools/wheel/verify_cross.py <manylinux 휠> --self-test` | (신규) | **exit 0, 11/11** |
-| `$BPY tools/wheel/verify_linux.py <manylinux 휠>` | (1회차엔 불가) | **exit 0**, unresolved 0 |
+| `PYTHON=$PY sh tests/run.sh` | exit 0, 197 | **exit 0, `^ok ` 197줄** |
+| `$PY tests/golden/compare.py` | exit 0, 2811/2811 ops=119 | **exit 0, 2811/2811 ops=119** |
+| `$BPY scripts/wheel/build.py --self-test` | exit 0, 8/8 + 10/10 | **exit 0, 8/8 + 11/11** (케이스 7 추가, §9.8) |
+| `$BPY scripts/wheel/verify_linux.py --self-test` | exit 0, 5/5 | **exit 0, 5/5** |
+| `$BPY scripts/wheel/build.py` (호스트 휠) | exit 0, `macosx_11_0_arm64` | **exit 0**, 2,687 entries |
+| `$BPY scripts/wheel/verify.py <위 휠>` | exit 0 | **exit 0**, 깨끗한 venv 에서 `aten.mm.default` 계산 |
+| `$BPY scripts/wheel/build.py --target linux-x86_64` | (1회차엔 불가) | **exit 0**, `manylinux_2_17_x86_64`, 2,687 entries |
+| `$BPY scripts/wheel/verify_cross.py <manylinux 휠>` | (1회차엔 거절) | **exit 0** |
+| `$BPY scripts/wheel/verify_cross.py <manylinux 휠> --self-test` | (신규) | **exit 0, 11/11** |
+| `$BPY scripts/wheel/verify_linux.py <manylinux 휠>` | (1회차엔 불가) | **exit 0**, unresolved 0 |
 
 > **10/10 이 아니라 11/11 인 이유.** 이 절을 처음 쓸 때는 10개였다. Windows 를 붙이면서
 > (`docs/platform/WINDOWS.md`) 결함 목록이 계열별로 구성되게 바뀌었고, 그때 "확장 모듈 자체가 없음" 이

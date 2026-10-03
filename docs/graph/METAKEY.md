@@ -7,7 +7,7 @@ nothing, and this document is the count.
 
     Features added    0
     Defects fixed     0
-    Tests added       5   (rust/torch_c/pytests/test_metakey.py)
+    Tests added       5   (tests/bindings/test_metakey.py)
     Docs corrected    1   (VARMEAN.md §4.1's forward pointer)
     Removed           0
 
@@ -245,7 +245,7 @@ regression; the tree stops loading.
 
 ## 6. The gate
 
-Run twice from the worktree root, `vendor/install_shim.sh` re-run after each
+Run twice from the worktree root, `scripts/vendor/install_shim.sh` re-run after each
 source change and once more after the deliberate breaks of §4 were reverted.
 Both runs identical:
 
@@ -262,8 +262,8 @@ Against the baseline on `develop` (94/94, 1769 ok, DOCWATCH 1319/1319) that is
 the artefact is `develop`'s: golden's numbers are unmoved because there was
 nothing for them to move for.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metakey.py test_the_meta_predicate_answers_false_for_every_name_and_never_raises present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metakey.py test_upstream_answers_false_for_a_measured_minority_so_true_is_not_the_target present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metakey.py test_deriving_the_answer_from_this_shims_meta_arms_would_disagree_in_the_harmful_direction present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metakey.py test_most_of_upstreams_meta_registrations_already_answer_true_here_through_py_kernels present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_metakey.py test_the_only_caller_that_asks_about_the_meta_key_is_resolve_key_and_it_asks_about_prims present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_metakey.py test_the_meta_predicate_answers_false_for_every_name_and_never_raises present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_metakey.py test_upstream_answers_false_for_a_measured_minority_so_true_is_not_the_target present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_metakey.py test_deriving_the_answer_from_this_shims_meta_arms_would_disagree_in_the_harmful_direction present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_metakey.py test_most_of_upstreams_meta_registrations_already_answer_true_here_through_py_kernels present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_metakey.py test_the_only_caller_that_asks_about_the_meta_key_is_resolve_key_and_it_asks_about_prims present -->

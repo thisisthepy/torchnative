@@ -1,27 +1,27 @@
 # QNN — ExecuTorch's Qualcomm backend behind an `nn.Module`, and the claim it does not make
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/npu.py DelegateModule present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/npu.py delegate_ present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/npu.py NpuModelForCausalLM present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/npu.py delegated_paths present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py qnn_aot_refusal present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py soc_targets present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py lower_cpu_reference present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py delegation_report present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py read_artefact present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py match_device present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn.py runtime_backends present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn_device.py device_soc present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn_device.py htp_stub_for present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn_device.py DEVICE_DIR present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn_device.py fastrpc_nodes present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/qnn_device.py SOC_TABLE_UNAVAILABLE present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_a_real_checkpoint_still_generates_with_a_submodule_delegated present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_the_qnn_module_refuses_the_very_file_the_generic_one_runs present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_no_claim_is_made_that_anything_ran_on_an_npu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_an_artefact_built_for_the_wrong_silicon_is_refused_before_it_is_pushed present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_qnn.py test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py DelegateModule present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py delegate_ present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py NpuModelForCausalLM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py delegated_paths present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py qnn_aot_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py soc_targets present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py lower_cpu_reference present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py delegation_report present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py read_artefact present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py match_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py runtime_backends present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py device_soc present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py htp_stub_for present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py DEVICE_DIR present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py fastrpc_nodes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py SOC_TABLE_UNAVAILABLE present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_a_real_checkpoint_still_generates_with_a_submodule_delegated present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_the_qnn_module_refuses_the_very_file_the_generic_one_runs present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_no_claim_is_made_that_anything_ran_on_an_npu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_an_artefact_built_for_the_wrong_silicon_is_refused_before_it_is_pushed present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/qnn/test_qnn.py test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset present -->
 
 ## 0. At a glance
 
@@ -33,7 +33,7 @@
 | Does an artefact load and run and agree with upstream? | **Yes** — the *XNNPACK control*, at a derived tolerance, ratio 0.16 (§7) |
 | Did anything run on a Hexagon NPU? | **No, and this round cannot claim it did.** §6.4 |
 | Was a Snapdragon device attached? | **Not at first.** One appeared mid-round and steps 1-3 of §5 were run against it, read-only: **SM8550, HTP v73** (§5.1) |
-| New tests | 19, `rust/torch_c/pytests/test_qnn.py` |
+| New tests | 19, `tests/devices/qnn/test_qnn.py` |
 | Nullifications attempted / uncaught | **7 / 1**, and the uncaught one found a real hole (§8.3) |
 | Defects found | **1** — an absent SoC table reported as an unrecognised chipset, found by running against real silicon (§5.1) |
 | Rust changed | **none**, so golden is required to be exactly unmoved (§9) |
@@ -412,7 +412,7 @@ adb -s "$ANDROID_SERIAL" shell getprop ro.board.platform      # fallback
 
 # ═══ 3. Map it through ExecuTorch's own table, and check the DSP is there.
 #     Prints the chipset name, soc_model, htp_arch and the stub/skel pair.
-PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
   "$PYTHON" -c '
 from torchnative.export import qnn_device as D
 import json; print(json.dumps(D.device_report(), indent=2))'
@@ -874,17 +874,17 @@ were already working and the one found a test that was not.
 ## 9. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    1120 ok, 0 FAIL, exit 0     (1101 on develop; +19)
+tests/run.sh    1120 ok, 0 FAIL, exit 0     (1101 on develop; +19)
 cargo test --release           30 passed, 0 failed
 DOCWATCH                       PASS -- 1028/1028 evaluated marker(s) hold
                                                            (1006 on develop; +22)
-tools/golden/compare.py        11420/11420 cases passed, 0 failed,
+tests/golden/compare.py        11420/11420 cases passed, 0 failed,
                                ops covered=302, pending case builders=0
 ```
 
 **Golden is exactly unmoved**, which is the correct result and the check that
 this round did what it says: no Rust changed, no op was added to
-`_aten_implemented()`, and no case builder was needed in `tools/golden/cases.py`.
+`_aten_implemented()`, and no case builder was needed in `tests/golden/cases.py`.
 The two counts that moved are the two this round added to — 19 tests and 22
 DOCWATCH markers — and both moved by exactly the amount added.
 
@@ -898,18 +898,18 @@ with a false reason is counted as a pass).
 `git status --short`:
 
 ```text
- M torchnative/src/main/torchnative/export/__init__.py
+ M torchnative/python/torchnative/export/__init__.py
 ?? docs/devices/QNN.md
-?? rust/torch_c/pytests/test_qnn.py
-?? torchnative/src/main/torchnative/export/npu.py
-?? torchnative/src/main/torchnative/export/qnn.py
-?? torchnative/src/main/torchnative/export/qnn_device.py
+?? tests/devices/qnn/test_qnn.py
+?? torchnative/python/torchnative/export/npu.py
+?? torchnative/python/torchnative/export/qnn.py
+?? torchnative/python/torchnative/export/qnn_device.py
 ```
 
 One tracked file modified, `+10` lines, all of them a docstring paragraph
 (`git diff --stat`: `1 file changed, 10 insertions(+)`). No Rust, no
-`bootstrap.py`, no `overloads.json`, no `tools/golden/`, and nothing under
-`torchnative/src/main/torch/` touched by hand.
+`bootstrap.py`, no `overloads.json`, no `tests/golden/`, and nothing under
+`torchnative/python/torch/` touched by hand.
 
 ---
 
@@ -1001,8 +1001,8 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-qnn
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-sh vendor/vendor_torch.sh            # fresh worktree only
-PYTHON=$PY bash vendor/install_shim.sh
+sh scripts/vendor/vendor_torch.sh            # fresh worktree only
+PYTHON=$PY bash scripts/vendor/install_shim.sh
 
 # The ExecuTorch half needs its own interpreter. It must NOT be spike-venv:
 # executorch pulls torch 2.14.0 and spike-venv's torch 2.13.0 is the upstream
@@ -1011,7 +1011,7 @@ $PY -m venv /Volumes/macMini/caches/qnn-venv
 /Volumes/macMini/caches/qnn-venv/bin/pip install executorch py-cpuinfo transformers
 export TORCHNATIVE_QNN_PYTHON=/Volumes/macMini/caches/qnn-venv/bin/python
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
 ```
 
 Without `TORCHNATIVE_QNN_PYTHON`, eight tests **skip by name** and two skip

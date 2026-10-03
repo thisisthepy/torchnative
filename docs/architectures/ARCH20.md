@@ -19,8 +19,8 @@ The two jobs met in the middle: `falcon`'s third wall *was* `__iadd__`.
 | | before | after |
 |---|---|---|
 | architectures forwarding (of 20) | **13** | **19** |
-| `pytests/run.sh` smoke tests | 229 | **241** |
-| `tools/golden/compare.py` cases / ops | 3075 / 122 | **3302 / 133** |
+| `tests/run.sh` smoke tests | 229 | **241** |
+| `tests/golden/compare.py` cases / ops | 3075 / 122 | **3302 / 133** |
 | `verify_schemas.py` | 4234 / 4234 | **4295 / 4295** |
 | SmolLM2-135M float32 prefill | — | **bit-identical (§11.4)** |
 
@@ -41,8 +41,8 @@ brief; the script is `/tmp/arch7/sweep.py` (not committed — it is four lines o
 around a `try`). Upstream reproduced 20/20 and the shim reproduced 13/20 with the same seven
 names and the same seven messages, so the brief's measurement stands as given.
 
-The shim side needs `TORCH_USE_RTLD_GLOBAL=1` and `PYTHONPATH=torchnative/src/main`, the same
-two the checkpoint tests in `pytests/test_shim.py` already set (VENDOR.md wall 1).
+The shim side needs `TORCH_USE_RTLD_GLOBAL=1` and `PYTHONPATH=python`, the same
+two the checkpoint tests in `tests/_support/test_shim.py` already set (VENDOR.md wall 1).
 
 ### 0.1 The twenty, before and after
 
@@ -111,7 +111,7 @@ Two things about the loop are worth keeping:
 * **The rebuild is not optional and not obvious.** `bootstrap.py` is `include_str!`-ed into the
   artefact, so editing it and re-running the sweep tests the old binary with no sign that
   anything is stale. Every round here ended with
-  `strings torchnative/src/main/torch/_C.abi3.so | grep -c <a marker from the edit>`.
+  `strings torchnative/python/torch/_C.abi3.so | grep -c <a marker from the edit>`.
 * **The sweep runs one architecture per line and writes the full traceback per failure.**
   Reading only the last line would have hidden that `bert`'s wall moved from `_C` to `_nn` to a
   kernel — three different problems that all print as `NotImplementedError`.
@@ -584,10 +584,10 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 
 > **Correction (docs/bindings/SPELLINGS.md §5–§7): this "next round" already happened, and `gelu`/`silu`/
 > `softplus` were never in the gap it closed.** 22 of the 25 names above now have an
-> `overloads.json`/`methods.json` entry with a golden case (`rust/torch_c/src/overloads.json`'s
+> `overloads.json`/`methods.json` entry with a golden case (`torchnative/rust/torch_c/src/overloads.json`'s
 > own comment: *"docs/architectures/ARCH20.md §9's 25-name inventory ... 22 got a `torch.<name>` entry here, 3
 > did not"*). `reshape` is the one exception still pending promotion in `aten.rs` itself
-> (`tools/golden/compare.py` reports it as the sole `PENDING` case builder, not yet in
+> (`tests/golden/compare.py` reports it as the sole `PENDING` case builder, not yet in
 > `_aten_implemented()` — docs/bindings/SPELLINGS.md §7.3), not a missing table entry.
 >
 > The three left out — `gelu`, `silu`, `softplus` — were never "a real gap" by this section's own
@@ -603,10 +603,10 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 > <!-- DOCWATCH: hasattr gelu false -->
 > <!-- DOCWATCH: hasattr silu false -->
 > <!-- DOCWATCH: hasattr softplus false -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json triu present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json gelu absent -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json silu absent -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json softplus absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json triu present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json gelu absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json silu absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json softplus absent -->
 > <!-- DOCWATCH: count golden_pending eq 0 -->
 
 ---
@@ -642,11 +642,11 @@ not evaluated at import.
 ### 11.1 The gates, all exit 0
 
 ```
-bash vendor/install_shim.sh                       exit 0
-PYTHON=$PY sh rust/torch_c/pytests/run.sh         241 ok, 0 FAIL          exit 0
-$PY tools/golden/compare.py                       3302/3302, ops=133      exit 0
-$PY tools/golden/compare.py --self-test           13 x 11, 0 problems     exit 0
-$PY rust/torch_c/pytests/verify_schemas.py        4295/4295               exit 0
+bash scripts/vendor/install_shim.sh                       exit 0
+PYTHON=$PY sh tests/run.sh         241 ok, 0 FAIL          exit 0
+$PY tests/golden/compare.py                       3302/3302, ops=133      exit 0
+$PY tests/golden/compare.py --self-test           13 x 11, 0 problems     exit 0
+$PY tests/_support/verify_schemas.py        4295/4295               exit 0
 ```
 
 | | before | after |

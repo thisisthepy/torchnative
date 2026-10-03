@@ -8,7 +8,7 @@ IMPORT_TORCH.md §9.1 이 "때우고 넘어간 것 중 가장 큰 것"으로 지
 숫자는 전부 직접 센 것입니다. 셋을 썼습니다.
 
 - **shim** — `TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor /Volumes/macMini/caches/spike-venv/bin/python`
-  (벤더링 트리 + `rust/torch_c` shim)
+  (벤더링 트리 + `torchnative/rust/torch_c` shim)
 - **진짜 torch** — `/Volumes/macMini/caches/spike-venv/bin/python` (PYTHONPATH 없이. pip 로 설치된
   진짜 torch 2.13.0 + transformers 5.15.1)
 - 계측 스크립트는 전부 `/tmp` 에 두었고, 이 저장소에는 아무것도 추가하지 않았습니다.
@@ -39,8 +39,8 @@ IMPORT_TORCH.md §9.1 이 "때우고 넘어간 것 중 가장 큰 것"으로 지
 > succeeds end-to-end today (independently confirmed while auditing `docs/models/FROM_CONFIG.md`, this
 > round). "973" itself is still not reproduced or explained — that part of §0's row is unresolved,
 > not fixed, and is left as reported.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _log_api_usage_once present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _dispatch_get_registrations_for_dispatch_key present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _log_api_usage_once present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dispatch_get_registrations_for_dispatch_key present -->
 
 ---
 
@@ -254,7 +254,7 @@ shim 에만 있고 진짜 torch 에는 없는 것:   210개  (전부 실재하�
 
 **원인은 `_dispatch_has_kernel` 이 아니라 `bootstrap.py` 의 `_jit_get_operation` 이 모든 op 에
 대해 `overload_names` 를 무조건 `["default"]` 하나로만 돌려주는 것입니다**
-(`rust/torch_c/src/bootstrap.py:1247-1253`). `register_decomposition(aten.foo)` 처럼 op
+(`torchnative/rust/torch_c/src/bootstrap.py:1247-1253`). `register_decomposition(aten.foo)` 처럼 op
 패킷 전체를 등록하는 코드는 `OpOverloadPacket.op_overloads()` 를 호출해 실제 오버로드 수만큼
 등록하는데, 이 shim 아래에서는 그 함수가 항상 정확히 1개(그리고 그 이름이 실재하는지도 확인 안
 된 `"default"`)만 돌려줍니다. 그 결과:

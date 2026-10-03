@@ -29,67 +29,61 @@
 ## 3. 구조
 
 ```
-rust/torch_c/            torch._C 확장 (Rust · pyo3 abi3-py313 · candle-core)
+torchnative/rust/torch_c/          torch._C 확장 (Rust · pyo3 abi3-py313 · candle-core)
   src/aten.rs            연산자 커널 — 모든 op 은 _aten_dispatch 한 문으로 들어온다
   src/bootstrap.py       include_str! 로 확장에 구워지는 파이썬 부트스트랩
-  pytests/               게이트 스위트 (run.sh)
-torchnative/src/main/
+torchnative/rust/vulkan_probe/     Vulkan 프로브 크레이트
+torchnative/rust/wasm_probe/       wasm 프로브 크레이트
+python/
   torchnative/           파이썬 패키지: delta · adapt · nn/federated · device · transformers
                          · export · quant · kernels · api · distributed
   torch/                 upstream 벤더링 트리 (생성물, gitignore, 손대지 않음)
-vendor/                  벤더링(vendor_torch.sh)과 _C 설치(install_shim.sh)
-tools/                   golden · wheel · docwatch · ci · release · bench · scan · spike · colab
+tests/                   게이트 스위트 (run.sh) · golden/ (upstream 값 대조) · docwatch/ (문서 검사기)
+tests/bench/                 측정 스크립트
+scripts/                 vendor/ (vendor_torch.sh · install_shim.sh · vendor_candle.sh) · wheel/ ·
+                         devices/ · scan/ · colab/
+vendor/                  candle-core · candle-metal-kernels 포크와 그 패치
+.github/                 workflows/ · scripts/ (CI 스크립트) · scripts/release/ (release-sync)
 docs/<folder>/           회차별 측정 기록. 색인은 docs/README.md
 docs/guide/              GitHub Pages 가이드 (영/한)
 ```
+
+루트에 둘 수 있는 항목은 AGENTS.md §2 의 목록이 정합니다(#43).
 
 ## 4. 빌드와 테스트
 
 ```sh
 # 벤더 트리와 확장 (worktree 마다 먼저 — AGENTS.md §14.1)
-PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/vendor_torch.sh
-PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/install_shim.sh
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash scripts/vendor/vendor_torch.sh
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash scripts/vendor/install_shim.sh
 
 # 게이트 (단독 실행, 파이프 금지 — AGENTS.md §13)
 PATH="$HOME/.cargo/bin:$PATH" PYTHON="$PWD/.caches/spike-venv/bin/python" \
-    bash rust/torch_c/pytests/run.sh > .scratch/gate.log 2>&1; echo "EXIT=$?"
+    bash tests/run.sh > .scratch/gate.log 2>&1; echo "EXIT=$?"
 
 # 휠
-python tools/wheel/build.py && python tools/wheel/verify.py dist/torchnative-*.whl
+python scripts/wheel/build.py && python scripts/wheel/verify.py dist/torchnative-*.whl
 
 # 가이드 사이트 검사
 python3 docs/guide/check_guide.py
 
 # 릴리스 브랜치 도구 검사
-bash tools/release/test-sync-release.sh
+bash .github/scripts/release/test-sync-release.sh
 ```
 
 ## 5. 브랜치와 릴리스
 
-- 작업은 `work/<topic>` → PR → `develop` (AGENTS.md §4). `main` 은 `release` 에서 온 PR 로만 바뀝니다.
-- `release-sync.yml` 이 `develop` 푸시마다 `tools/release/sync-release.sh` 로 `release` 를 재생성하고
-  `release → main` PR 을 엽니다. `main-source-guard.yml` 이 다른 출처의 PR 을 막고,
-  `pages.yml` 이 `main` 푸시 때 `docs/guide/` 를 Pages 로 배포합니다.
+- 작업은 `feat/<topic>` → PR → `develop` (AGENTS.md §4). `main` 은 `release` 에서 온 PR 로만 바뀝니다.
+- `main` 으로 가는 길은 하나, release-sync 입니다. `release-sync.yml` 이 `develop` 푸시마다
+  `.github/scripts/release/sync-release.sh` 로 `release` 를 재생성하고 `release → main` PR 을 엽니다.
+  `main` 의 보호는 메인테이너의 몫이고, release PR 은 메인테이너가 병합합니다.
+  `pages.yml` 이 `main` 푸시 때 `docs/guide/` 를 Pages 로 배포합니다 — `docs/guide/` 가 main 레이아웃에서
+  살아남는다는 것은 `tests/release/test_publish.py` 가 실제 트리로 확인합니다.
 - PyPI 배포는 `v*` 태그로 `publish-pypi.yml` 이 수행합니다(Trusted Publishing, 토큰 없음).
   **사용자 승인 없이 업로드하지 않습니다** (AGENTS.md §17.7).
 
-### 열린 문제 — `tools/release/publish_main.sh`
-
-기존 스크립트는 `develop` 트리에서 경로를 빼 `main` 을 **로컬에서 직접** 만든 뒤(조율 세션이
-푸시) 휠 빌드로 검증합니다. 새 규칙("`main` 은 CI 가 만든 `release` 의 PR 로만")과 충돌합니다.
-
-| | `publish_main.sh` | `sync-release.sh` |
-|---|---|---|
-| `main` 을 바꾸는 방법 | 로컬 `update-ref` 후 수동 푸시 | CI 가 `release` 생성 → PR → 병합 |
-| 제외 대상 | `docs/` 전체, `AGENTS.md`, `PROJECT.md`, `pytests/`, `tools/{docwatch,golden,spike,bench,scan,colab}` | 루트의 `README.md` 외 `*.md`, `docs/` 바로 아래 `*.md` 만 |
-| 검증 | 공개 트리에서 실제 휠 빌드 | 없음 |
-| `README` 링크 | `docs/` 링크를 `develop` 절대 URL 로 재작성 | 재작성 없음 (`docs/<sub>/` 가 남으므로 불필요) |
-
-제안: `publish_main.sh` 는 지우지 않고, ① `main` 을 움직이는 부분(`update-ref`)을 떼어
-"공개 트리가 휠을 빌드하는가" 검사만 남겨 `release-sync.yml` 의 한 단계(또는 `release → main` PR 의
-필수 체크)로 돌리고, ② PyPI 배포는 `main` 병합 뒤 태그로 걸어 `publish-pypi.yml` 이 받게 합니다.
-제외 목록을 `sync-release.sh` 에 맞출지(문서는 `main` 에 남김)는 사용자가 정할 일입니다.
-또한 이 스크립트는 `/Volumes/macMini/worktrees/` 와 `${TMPDIR:-/tmp}` 에 씁니다 — AGENTS.md §15.1 위반.
+옛 수동 경로 `publish_main.sh` 는 #43 에서 지웠습니다. `docs/` 를 통째로 빼서, 그 경로로 만든
+`main` 은 Pages 사이트를 비웠을 것이고, 어떤 워크플로도 그것을 부르지 않았습니다.
 
 ## 6. 패키징 결정 (`pyproject.toml` · `setup.py`)
 
@@ -101,7 +95,7 @@ bash tools/release/test-sync-release.sh
 선언적인 것은 전부 `pyproject.toml` 에 있고, `setup.py` 에는 `[tool.setuptools]` 로 쓸 수 없는
 두 사실만 남았습니다.
 
-1. **`has_ext_modules()` 가 `True` 여야 합니다.** `torch/_C.abi3.so` 는 `vendor/install_shim.sh` 가
+1. **`has_ext_modules()` 가 `True` 여야 합니다.** `torch/_C.abi3.so` 는 `scripts/vendor/install_shim.sh` 가
    미리 빌드해 패키지 데이터로 들어오므로 setuptools 는 확장을 못 봅니다. 그대로 두면
    `py3-none-any` 휠이 나옵니다 — PyPI 의 **`0.0.1a0` 이 바로 그 휠**이고, `0.0.2a0` 부터는 올바릅니다.
 2. **`py_limited_api = "cp313"`** (`bdist_wheel` 명령 옵션). 태그를 `cp313-abi3-<plat>` 로 만듭니다.
@@ -115,7 +109,7 @@ Hatchling 은 둘 다 빌드 훅으로만 가능하고 `py_limited_api` 가 없�
 `Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT`
 — torch 2.13.0 의 `License-Expression` 그대로입니다. 플랫폼 휠은 upstream 파이썬 트리를 싣기
 때문입니다. **이 필드로는 어느 항이 우리 것인지 표현할 수 없습니다**(우리 라이선스 Apache-2.0 은
-이미 포함). upstream 라이선스 원문은 `tools/wheel/build.py` 가 torch 의 `dist-info` 와 함께 넣습니다.
+이미 포함). upstream 라이선스 원문은 `scripts/wheel/build.py` 가 torch 의 `dist-info` 와 함께 넣습니다.
 
 ### 6.3 `dependencies` — `torch` 는 없고, upstream 의 순수 파이썬 의존성은 있다
 
@@ -162,11 +156,11 @@ npu = ["openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (
 
 ### 6.6 `[tool.setuptools]`
 
-- **`package-dir = { "" = "torchnative/src/main" }`** — 없으면 `src` 가 루트로 잡혀 `import main.torchnative`
-  가 되는 휠이 나왔습니다.
-- **`packages.find` 는 `torch` 를 포함합니다.** `src/main/torch` 는 남의 torch 에 붙이는 것이 아니라
+- **`package-dir = { "" = "torchnative/python" }`** — 없으면 저장소 루트가 패키지 루트로 잡힙니다. 옛
+  `torchnative/src/main` 레이아웃에서는 `import main.torchnative` 가 되는 휠이 나왔습니다.
+- **`packages.find` 는 `torch` 를 포함합니다.** `torchnative/python/torch` 는 남의 torch 에 붙이는 것이 아니라
   우리가 조립한 트리입니다. 제외했던 것이 PyPI 의 `py3-none-any` 배포판을 만들었습니다. 트리는 git 에
-  없으므로 두 벤더 스크립트를 돌리기 전에는 찾을 것이 없고, `tools/wheel/build.py` 는 그 상태에서 빌드를
+  없으므로 두 벤더 스크립트를 돌리기 전에는 찾을 것이 없고, `scripts/wheel/build.py` 는 그 상태에서 빌드를
   거부합니다.
 - **upstream 패키지는 셋입니다** — `functorch`, `torch`, `torchgen` (`top_level.txt`). `import torch` 가
   `torch/utils/_python_dispatch.py:13` 에서 `torchgen` 에 닿습니다.
@@ -178,8 +172,9 @@ npu = ["openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (
 
 ### 6.7 `[tool.ppp]`
 
-pypackpack 소스셋 레이아웃을 따릅니다. `src/main` 의 최상위 패키지를 스캔하므로 한 패키지가 `torch` 와
-`torchnative` 를 함께 제공할 수 있습니다(`docs/design/DESIGN.md` §10).
+소스셋은 `python/` 입니다(#43 이전에는 pypackpack 의 `src/main` 레이아웃이었습니다). 그 최상위
+패키지를 스캔하므로 한 패키지가 `torch` 와 `torchnative` 를 함께 제공할 수 있습니다
+(`docs/design/DESIGN.md` §10).
 
 ## 7. 주요 결정 (요약)
 
@@ -194,8 +189,7 @@ pypackpack 소스셋 레이아웃을 따릅니다. `src/main` 의 최상위 패�
 
 ## 8. 열린 질문
 
-1. `publish_main.sh` 를 새 릴리스 흐름에 어떻게 붙일지(§5), 그리고 `main` 에 `docs/<sub>/` 를 남길지.
-2. `docs/SPEC.md` 의 "Outside intent" 4 건 — WASM · Linux/Windows 휠, Vulkan 자작 백엔드, CUDA,
+1. `docs/SPEC.md` 의 "Outside intent" 4 건 — WASM · Linux/Windows 휠, Vulkan 자작 백엔드, CUDA,
    `torchnative.transformers` 미러가 의도 안에 있는지.
-3. 단계 0/1 을 **타입으로** 가르는 강제(DESIGN.md §2 의 첫째 강제 사항)는 아직 테스트가 없습니다.
-4. 임시 파일 위치: 공용 규정은 `.tmp/`, 이 저장소의 관행은 `.scratch/`. 하나로 정할지.
+2. 단계 0/1 을 **타입으로** 가르는 강제(DESIGN.md §2 의 첫째 강제 사항)는 아직 테스트가 없습니다.
+3. (닫힘, #43) 임시 파일 위치는 `.scratch/` 하나입니다 — python-multiplatform 의 `.tmp/` 자리.

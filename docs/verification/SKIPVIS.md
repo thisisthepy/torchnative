@@ -14,7 +14,7 @@
 
 ## 고친 모양
 
-`rust/torch_c/pytests/_skip.py` 가 공유 등록 지점입니다. 건너뛰는 지점은
+`tests/_support/_skip.py` 가 공유 등록 지점입니다. 건너뛰는 지점은
 
 ```python
 if fixture is None:
@@ -28,7 +28,7 @@ suite=...)` 를 통해 **`ok` 와 `SKIP` 이 배타적으로** 찍히도록 합�
 등록 함수(`vulkan_coverage.vulkan_skip`)를 그대로 재사용했습니다 — 이 문서와 `_skip.py` 는 그것을
 중복 구현하지 않습니다.
 
-`rust/torch_c/pytests/test_skipvis.py` 가 회귀를 막는 스캐너입니다: 모든 `test_*.py` 의 AST 를
+`tests/gate/test_skipvis.py` 가 회귀를 막는 스캐너입니다: 모든 `test_*.py` 의 AST 를
 훑어 `print(...(skipped...)...)` 바로 뒤에 `return` 이 오는 모양(등록 호출 없이)을 찾으면 실패합니다.
 `test_vulkan4.py` 와 `test_coremlops.py` 는 이 문서를 쓰는 시점에 다른 회차가 편집 중이어서 스캔에서
 명시적으로 제외했습니다 — `test_skipvis.py` 의 `_EXEMPT` 를 보십시오.
@@ -44,7 +44,7 @@ suite=...)` 를 통해 **`ok` 와 `SKIP` 이 배타적으로** 찍히도록 합�
 
 <!-- DOCWATCH: count skip_lines_visible ge 1 -->
 
-위 마커는 `rust/torch_c/pytests/test_intelnpu.py` 를 이 호스트에서 직접 실행해 `SKIP ` 로 시작하는
+위 마커는 `tests/devices/npu/test_intelnpu.py` 를 이 호스트에서 직접 실행해 `SKIP ` 로 시작하는
 줄을 셉니다. 그 스위트는 벤더링된 `_C` 빌드 없이도 돌고, macOS 에는 Intel NPU/OpenVINO 런타임이 없으므로
 몇 개는 항상 건너뛰어집니다 — 그래서 `ge 1` 이 어떤 호스트에서도 참이어야 합니다. `eq` 가 아니라 `ge`
 를 쓴 이유는 AGENTS.md 의 규정 그대로: 나중에 건너뛰기 지점이 늘어나는 것(예: 새 환경 변수 가드

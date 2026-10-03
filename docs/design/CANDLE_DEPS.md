@@ -1,7 +1,7 @@
 # CANDLE_DEPS — `candle-core` 의 `tokenizers` 비선택 의존 조사
 
 `docs/design/TORCH_C.md` §5-1 이 최상위 미해결 항목으로 올린 것의 후속 조사입니다. **이 문서는 조사
-결과만 담습니다 — 코드는 고치지 않았습니다.** `rust/torch_c/Cargo.toml` 은 읽기만 했고, 실험은
+결과만 담습니다 — 코드는 고치지 않았습니다.** `torchnative/rust/torch_c/Cargo.toml` 은 읽기만 했고, 실험은
 전부 `/Volumes/macMini/caches/candle-probe` 에서 했습니다.
 
 ## 0. 한눈에
@@ -51,7 +51,7 @@ candle-core 자신의 소스 안에서 이 trait 을 호출하는 곳은 **없�
 `candle-transformers`)이 GGUF 로더에서 토크나이저까지 한 번에 얻고 싶을 때 쓰라고 얹어둔 공개
 API 표면입니다.
 
-**`torch_c` 는 이걸 쓰지 않습니다.** `rust/torch_c/src/` 전체(881 줄)를 `tokenizer|Tokenizer|
+**`torch_c` 는 이걸 쓰지 않습니다.** `torchnative/rust/torch_c/src/` 전체(881 줄)를 `tokenizer|Tokenizer|
 quantized` 로 grep 해도 일치가 없습니다 — `torch_c` 는 텐서 연산(`aten.*`)만 구현하고 있고
 GGUF 로딩 경로 자체를 아직 붙이지 않았습니다.
 
@@ -135,15 +135,15 @@ PR #3490 의 패치를 그대로 `candle-core 0.11.0`(현재 `torch_c` 가 고�
 ```
 
 `cargo build --release` 로 정상 빌드됨을 확인(§3 에 시간 포함). **중요한 성질 하나**:
-`rust/torch_c/Cargo.toml:30` 이 이미 `default-features = false` 로 `candle-core` 를 선언하고
+`torchnative/rust/torch_c/Cargo.toml:30` 이 이미 `default-features = false` 로 `candle-core` 를 선언하고
 있으므로(`# 이미 있음 절 참조`), 이 패치가 적용된 `candle-core` 로 바꿔 끼우기만 하면
 **`torch_c/Cargo.toml` 을 추가로 고칠 필요가 없습니다** — `tokenizers` feature 를 명시적으로
 요청하지 않는 한 자동으로 빠집니다.
 
-적용 수단은 워크스페이스 루트의 `[patch.crates-io]` 로 거는 것이 표준이지만, **`rust/torch_c` 는
-`[workspace]` 를 선언하지 않은 단독 크레이트이고 `rust/Cargo.toml` 워크스페이스 루트도 없습니다**
-(`find . -iname Cargo.toml` 결과 `rust/torch_c/Cargo.toml` 하나뿐). Cargo 규약상 `[patch]` 는
-그 크레이트 자신의 루트 매니페스트에 적어야 하므로, **적용하려면 `rust/torch_c/Cargo.toml` 을
+적용 수단은 워크스페이스 루트의 `[patch.crates-io]` 로 거는 것이 표준이지만, **`torchnative/rust/torch_c` 는
+`[workspace]` 를 선언하지 않은 단독 크레이트이고 워크스페이스 루트 `Cargo.toml` 도 없습니다**
+(`find . -iname Cargo.toml` 결과 `torchnative/rust/torch_c/Cargo.toml` 하나뿐). Cargo 규약상 `[patch]` 는
+그 크레이트 자신의 루트 매니페스트에 적어야 하므로, **적용하려면 `torchnative/rust/torch_c/Cargo.toml` 을
 고쳐야 합니다** — 이번 조사에서는 금지된 파일이라 실제로 걸지 않았습니다. 적용할 때 필요한
 모양(다른 워크스트림이 가져다 쓸 수 있도록 기록):
 
@@ -168,7 +168,7 @@ PR #3490 이 머지되고 새 버전이 나오면 이 `[patch]` 를 지우고 �
 
 ### 3a. 크레이트 수
 
-`rust/torch_c` 실제 그래프(수정 없이 `cargo metadata` 로 읽음, 2026-08-24):
+`torchnative/rust/torch_c` 실제 그래프(수정 없이 `cargo metadata` 로 읽음, 2026-08-24):
 
 - 전체 해석된 패키지: **150 개** (`docs/design/TORCH_C.md` 가 적은 "129 크레이트 / 락파일 150 패키지"의
   150 과 일치).
@@ -236,7 +236,7 @@ DESIGN.md §4("텐서 엔진은 candle")가 candle 을 고른 근거 셋:
 
 **권고:** §2c 의 3 줄 패치를 `[patch.crates-io]` 로 걸어 지금 뗄 수 있고, 위험은 낮습니다
 (diff 가 상류 PR #3490 과 동일한 모양이라 즉흥 패치가 아니라 커뮤니티가 이미 검토한 형태이고,
-`torch_c` 는 해당 기능을 아예 쓰지 않아 회귀 위험이 없습니다). 다만 이 패치는 `rust/torch_c/
+`torch_c` 는 해당 기능을 아예 쓰지 않아 회귀 위험이 없습니다). 다만 이 패치는 `torchnative/rust/torch_c/
 Cargo.toml` 을 건드려야 적용되므로 **이 조사 세션의 범위 밖**입니다 — 해당 파일을 담당하는
 워크스트림에 §2c 의 diff 와 `[patch]` 블록을 그대로 넘기면 됩니다.
 
@@ -294,7 +294,7 @@ cd /Volumes/macMini/caches/candle-probe/patched  && cargo clean && /usr/bin/time
 
 ## 8. 적용함 (2026-08-24)
 
-§5 의 권고를 실행했습니다. `rust/torch_c/Cargo.toml` 에 `[patch.crates-io]` 블록을 추가해
+§5 의 권고를 실행했습니다. `torchnative/rust/torch_c/Cargo.toml` 에 `[patch.crates-io]` 블록을 추가해
 `candle-core` 를 §2c 의 패치가 적용된 로컬 vendor 사본으로 바꿔 끼웠습니다.
 
 ### 8a. 적용 방법
@@ -319,7 +319,7 @@ patch 블록 추가 외에 바꾸지 않았습니다 — `default-features = fal
 
 이 `[patch]` 는 `/Volumes/macMini/caches/candle-vendor/candle-0.11.0-patched` 라는 이 기계의
 절대 경로를 가리킵니다. **다른 기계에서는 그 경로가 없으므로 그대로 깨집니다.** 재현 수단은
-`rust/torch_c/Cargo.toml` 의 patch 블록 옆 주석에 그대로 적어 두었습니다 — candle 0.11.0 태그를
+`torchnative/rust/torch_c/Cargo.toml` 의 patch 블록 옆 주석에 그대로 적어 두었습니다 — candle 0.11.0 태그를
 그 경로에 얕은 클론하고, §2c 의 diff 를 `candle-core/Cargo.toml` 과
 `candle-core/src/quantized/mod.rs` 에 적용해 로컬 커밋 하나로 고정하면 됩니다. §2c 에서 이미
 검토했듯 상류 포크(`git` 소스)로 옮기는 편이 더 재현 가능하지만, 그러려면 GitHub 에 새 포크를
@@ -332,19 +332,19 @@ true` 등으로 워크스페이스 상속을 쓰기 때문에 `candle-core` 디�
 
 ### 8c. 다시 잰 숫자
 
-**크레이트 수** — 이번엔 probe 가 아니라 `rust/torch_c` 실물 `Cargo.lock` 으로 직접 셌습니다
-(`grep -c '^name = ' rust/torch_c/Cargo.lock`):
+**크레이트 수** — 이번엔 probe 가 아니라 `torchnative/rust/torch_c` 실물 `Cargo.lock` 으로 직접 셌습니다
+(`grep -c '^name = ' torchnative/rust/torch_c/Cargo.lock`):
 
 | | 패키지 수 |
 |---|---|
-| 패치 전 (`git show HEAD:rust/torch_c/Cargo.lock`) | **150** |
+| 패치 전 (`git show HEAD:torchnative/rust/torch_c/Cargo.lock`) | **150** |
 | 패치 후 | **106** |
 | 차이 | **−44** (§3a 의 probe 측정과 정확히 일치) |
 
 패치 후 lockfile 에 `tokenizers`/`onig`/`onig_sys` 가 전혀 없음을 확인했습니다.
 
 **빌드 시간** — §3b 는 최소 probe 크레이트(candle-core 만 의존)를 단독 load 5.22 에서 쟀습니다.
-이번엔 **`rust/torch_c` 실물 크레이트**를 `cargo clean && /usr/bin/time -p cargo build --release`
+이번엔 **`torchnative/rust/torch_c` 실물 크레이트**를 `cargo clean && /usr/bin/time -p cargo build --release`
 로 쟀습니다(`CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-deps`, 다른 에이전트 전용
 디렉터리와 분리). **주의: 이 기계는 이 세션 내내 다른 에이전트 둘이 Android/iOS 빌드를 돌리고
 있어 load 가 요동쳤습니다(측정 시작 시 8.7, 베이스라인 완료 시점엔 30 까지 치솟음, 패치 빌드
@@ -359,22 +359,22 @@ true` 등으로 워크스페이스 상속을 쓰기 때문에 `candle-core` 디�
 
 이 숫자는 §3b 의 −36%(user CPU, load 5.22 단독)와 같은 방향·비슷한 크기입니다. 다만 load 가
 오염되어 있었다는 것을 그대로 적습니다 — **정밀한 재현치가 필요하면 load 가 낮을 때
-`rust/torch_c` 에서 §7 재현 절차를 다시 돌리는 편이 낫습니다.** 크레이트 수(−44, §8c 위)는 load 와
+`torchnative/rust/torch_c` 에서 §7 재현 절차를 다시 돌리는 편이 낫습니다.** 크레이트 수(−44, §8c 위)는 load 와
 무관한 지표라 그대로 신뢰할 수 있습니다.
 
 ### 8d. 판정 기준 확인
 
 ```
-$PY tools/golden/compare.py                 # SUMMARY: 1212/1212 cases passed, 0 failed, ops covered=70   EXIT=0
-$PY rust/torch_c/pytests/verify_schemas.py  # SUMMARY: 127/127 table entries matched upstream, 0 failed    EXIT=0
-sh rust/torch_c/pytests/run.sh              # 62/62 스모크 테스트 전부 ok                                   EXIT=0
+$PY tests/golden/compare.py                 # SUMMARY: 1212/1212 cases passed, 0 failed, ops covered=70   EXIT=0
+$PY tests/_support/verify_schemas.py  # SUMMARY: 127/127 table entries matched upstream, 0 failed    EXIT=0
+sh tests/run.sh              # 62/62 스모크 테스트 전부 ok                                   EXIT=0
 ```
 
 3 타깃:
 
 | 타깃 | 명령 | 결과 |
 |---|---|---|
-| 호스트 (`aarch64-apple-darwin`) | `pytests/run.sh` (위) | **exit 0** |
+| 호스트 (`aarch64-apple-darwin`) | `tests/run.sh` (위) | **exit 0** |
 | Android (`aarch64-linux-android`, `arm64-v8a`) | `cargo ndk -t arm64-v8a --platform 21 build --release` | **exit 0**, `Finished release ... in 47.37s` |
 | iOS (`aarch64-apple-ios`) | `cargo build --release --target aarch64-apple-ios` (`PYO3_CONFIG_FILE=/Volumes/macMini/caches/bw-pyo3-ios.config`) | **exit 0**, `Finished release ... in 38.52s` |
 
@@ -420,7 +420,7 @@ sh rust/torch_c/pytests/run.sh              # 62/62 스모크 테스트 전부 o
 > 에 **게시된** `candle-core-0.11.0.crate` 는 `cargo package` 가 `Cargo.toml` 을 정규화해 두어
 > 워크스페이스 없이 홀로 빌드되며 **1.9MB** 입니다. `torch.int8` 을 위한 `I8` 포크가 바로 그
 > 형태로 착지했습니다: `vendor/candle-core/` (커밋됨), `[patch.crates-io]` 는 상대 경로
-> `../../vendor/candle-core`, sha256 고정과 재생성 검사는 `vendor/vendor_candle.sh`
+> `../../vendor/candle-core`, sha256 고정과 재생성 검사는 `scripts/vendor/vendor_candle.sh`
 > (`docs/numerics/INT8.md` §1.2). **다만 이 문서의 최적화(`tokenizers` 제거)는 그 포크에 싣지
 > 않았습니다** — 별개의 결정이고, 필요하면 `vendor/int8-candle-0.11.0-cpu.patch` 에 hunk 를
 > 더하는 것으로 켤 수 있습니다.

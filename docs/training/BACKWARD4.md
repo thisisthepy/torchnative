@@ -322,13 +322,13 @@ rather than against literals.
 ### 6.1 Suite and golden, on the final artefact
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     374 ok, 0 FAIL          (373 before; +1 test, 2 inverted, none removed, none weakened)
     SELF-TEST: PASS -- 19 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
     DOCWATCH: PASS -- 318/318 evaluated marker(s) hold
     EXIT=0
 
-$PY tools/golden/compare.py
+$PY tests/golden/compare.py
     SUMMARY: 8440/8440 cases passed, 0 failed, ops covered=197, pending case builders=0
     EXIT=0
 ```
@@ -406,12 +406,12 @@ that cannot fail under the conditions you tried it is not yet known to be a chec
 | 4 | **Anything about `torch.autograd.Function`, hooks that fire, `create_graph`, or double backward.** | All four need a graph, which is W8/W9/W10 and is untouched. `register_hook` on a non-leaf refuses by name and that is the whole of the answer |
 | 5 | **That W10 is closer.** | §4.2 declined it explicitly. `docs/training/BACKWARD2.md` §8 row 4's uncosted third option is still uncosted |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs mark_from_op present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs any_operand_requires_grad present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs NoGradGuard present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _GradFnNode present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _grad_fn_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs mark_from_op present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs any_operand_requires_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs NoGradGuard present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _GradFnNode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _grad_fn_name present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream present -->
 
 ---
 

@@ -14,7 +14,7 @@ DEMAND.md §0.1 rank 1 calls this gap **structural**, and gives the reason:
 > which must not be modified.
 
 The second half of that is a non sequitur, and measuring it is what this round started with.
-Run on the shim (`PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`):
+Run on the shim (`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1`):
 
 ```text
 shim
@@ -168,14 +168,14 @@ One function in `bootstrap.py`, installed at the `_initExtension` hook of §1. N
 change; no vendored-tree change; no new kernel — every form routes to
 `aten.lift_fresh.default`, which is the primitive `torch.tensor`, `new_tensor` and `as_tensor`
 already use, or to `TensorBase`'s existing native size/re-wrap constructor.
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _make_tensor_class_new present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _array_like_data present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sized_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _make_tensor_class_new present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _array_like_data present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sized_tensor present -->
 <!-- DOCWATCH: op-implemented aten.lift_fresh.default -->
 
 This round added **no kernel**: `ops covered` was 185 before it and 185 after. That is also why the
 golden harness cannot see any of this — it dispatches by op key, and no key changed — and why the
-coverage is six vendored-tree road tests instead (`test_ctor_*` in `pytests/test_shim.py`).
+coverage is six vendored-tree road tests instead (`test_ctor_*` in `tests/_support/test_shim.py`).
 docs/verification/GOLDEN.md's blind spot, the same shape `as_tensor` and `meshgrid` had in docs/architectures/DEMAND1.md.
 
 That claim was first written as `count golden_ops_covered eq 185`, which is the one thing a marker

@@ -42,39 +42,39 @@ The sentence the gate now prints for the silent case names the refusal:
 which is the distinction §11.3 restored, doing its job.
 
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py verify_on_device present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py run_on_device present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py devices present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py build_runner present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_device.py DEVICE_DIR present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_runner.c ANeuralNetworksCompilation_createForDevices present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi_runner.c ANeuralNetworksModel_getSupportedOperationsForDevices present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_coreml_models_docs_npu_executed_ran_on_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_graph_executes_on_the_neural_engine_and_agrees_with_replay present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_conv_relu_blob_executes_on_nnapi_and_agrees_with_replay present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_whole_model_executes_on_nnapi_and_the_control_is_orders_larger present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_driver_that_does_not_claim_the_operations_refuses_by_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_executing_on_a_device_widened_nothing present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_device_module_refuses_to_guess_which_emulator_to_use present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py plan_lowering present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLLinear present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _compile_model present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py _lower_for_coreml present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLConv2d present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _eligible_conv2d present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_conv2d_lowers_to_coreml_instead_of_being_left_on_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_unknown present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_plan_with_no_rows_at_all_warns_that_what_ran_is_unknown present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_full_offload_is_still_silent present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py verify_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py run_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py devices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py build_runner present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py DEVICE_DIR present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_runner.c ANeuralNetworksCompilation_createForDevices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_runner.c ANeuralNetworksModel_getSupportedOperationsForDevices present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_the_coreml_models_docs_npu_executed_ran_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_graph_executes_on_the_neural_engine_and_agrees_with_replay present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_conv_relu_blob_executes_on_nnapi_and_agrees_with_replay present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_the_whole_model_executes_on_nnapi_and_the_control_is_orders_larger present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_driver_that_does_not_claim_the_operations_refuses_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_executing_on_a_device_widened_nothing present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_the_device_module_refuses_to_guess_which_emulator_to_use present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _CoreMLLinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py _lower_for_coreml present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _CoreMLConv2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _eligible_conv2d present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py test_conv2d_lowers_to_coreml_instead_of_being_left_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _say_unknown present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_emptyplan.py test_a_plan_with_no_rows_at_all_warns_that_what_ran_is_unknown present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_emptyplan.py test_a_full_offload_is_still_silent present -->
 
 ## 1. The headline: the CoreML models docs/graph/NPU.md executed ran on the **CPU**
 
@@ -257,7 +257,7 @@ input's spatial dimensions and those are not knowable at `to()` time. A
 Linear's can: batch is the only free dimension. Widening this needs a shape
 source, not a bigger table.
 
-Zero leaves lowered raises, as on the Intel arm. `rust/torch_c/pytests/test_anepath.py`
+Zero leaves lowered raises, as on the Intel arm. `tests/devices/coreml/test_anepath.py`
 holds all of it, and each guarantee was nullified individually and seen to go
 red.
 
@@ -407,7 +407,7 @@ Split the way AGENTS.md §17.3 asks:
 | **feature added** | `nnapi_device.py` + `nnapi_runner.c` — execution of an NNAPI blob on a device |
 | **claim corrected** | docs/graph/NPU.md's executed CoreML claim is a CPU claim; docs/graph/REFOLD.md §4's "not executed" no longer holds |
 | **coverage added** | **none** — 25 serialisable overloads before and after |
-| **tests added** | 9, in `rust/torch_c/pytests/test_npu2.py` |
+| **tests added** | 9, in `tests/devices/coreml/test_npu2.py` |
 
 ## 5. What is still missing, and how big it is
 
@@ -442,8 +442,8 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-npu2
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd rust/torch_c && cargo build --release && cd -
-bash vendor/install_shim.sh
+cd torchnative/rust/torch_c && cargo build --release && cd -
+bash scripts/vendor/install_shim.sh
 
 # The NNAPI half needs a device with API >= 27. `pmp_api26` cannot run it.
 emulator -avd pmp_api36 -port 5556 -no-window -no-audio -no-snapshot-save &
@@ -451,7 +451,7 @@ export ANDROID_SERIAL=emulator-5556        # required; never inferred
 export PATH="$PATH:$HOME/Library/Android/sdk/platform-tools"
 adb wait-for-device
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
 ```
 
 Without `ANDROID_SERIAL` the NNAPI tests **skip by name**, saying that this
@@ -578,7 +578,7 @@ widened nor narrowed.
 cleaned up. 277 directories were left behind after the test round. Fixed with a
 `try/finally` wrapping `shutil.rmtree(directory, ignore_errors=True)`.
 
-Tests: 7 in `rust/torch_c/pytests/test_npmarshal.py`. Three nullifications, each
+Tests: 7 in `tests/devices/coreml/test_npmarshal.py`. Three nullifications, each
 red on the test it targets: (1) force `_np` back to `tolist()` and the heap test
 goes red (peak 731 KB vs limit 240 KB), (2) make `_shim_tensor_bytes` return
 empty bytes and the dtype test fails with a reshape error, (3) remove the
@@ -592,24 +592,24 @@ empty bytes and the dtype test fails with a reshape error, (3) remove the
 | **claim corrected** | "conv cannot be lowered because its shape is unknown at `to()` time" — the shape is unknown, and per-shape compilation already answered that for `Linear` |
 | **coverage added** | one leaf type (two, from one). `supported_ops()` is unchanged: `aten.convolution.default` already had a MIL lowering |
 | **rejections recorded** | eight types, each with the measurement or the missing lowering that decided it (§7.2) |
-| **tests added** | 7, in `rust/torch_c/pytests/test_coremlops.py`; five nullifications, each red on the test it targets |
+| **tests added** | 7, in `tests/devices/coreml/test_coremlops.py`; five nullifications, each red on the test it targets |
 
 ## 8. The first real model: bfloat16, and what a decode step actually gets
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _WIDENED_DTYPES present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_float16_is_in_the_map_too_and_is_not_a_second_refusal present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_widening_keeps_bfloat16s_range_which_a_float16_route_would_lose present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_no_smollm2_weight_leaves_float16s_range_so_the_cast_loses_no_value present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_path_a_user_types_survives_its_own_first_forward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_second_forward_at_another_shape_also_survives_and_is_not_stale present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py _NAIVE_SCRIPT present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _feed_buffer present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _predict present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _RETAINED_FEEDS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _WIDENED_DTYPES present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_float16_is_in_the_map_too_and_is_not_a_second_refusal present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_the_widening_keeps_bfloat16s_range_which_a_float16_route_would_lose present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_no_smollm2_weight_leaves_float16s_range_so_the_cast_loses_no_value present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_the_path_a_user_types_survives_its_own_first_forward present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_a_second_forward_at_another_shape_also_survives_and_is_not_stale present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py _NAIVE_SCRIPT present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _feed_buffer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _predict present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _RETAINED_FEEDS present -->
 
 §7 landed two leaf types and measured the Neural Engine running them. Every
 module it was measured on was built here, in float32. The obvious next thing
@@ -664,7 +664,7 @@ exact everywhere — same radix, fewer mantissa bits, same exponent width.
 There is a second, non-obvious reason the widening has to happen anyway:
 `torch._C._shim_tensor_bytes` **refuses both half-width floats by name** —
 reaching their bit pattern means naming the `half` crate's types, which
-`rust/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
+`torchnative/rust/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
 which numpy *does* have, cannot cross as its own bytes. Widening first is what
 keeps the byte route, and with it the shutdown segfault §7.3 removed.
 
@@ -861,7 +861,7 @@ property of compiling per shape rather than of this fix.
 
 #### And the tests now drive the path a caller takes
 
-`rust/torch_c/pytests/test_bf16ane.py` gained `_NAIVE_SCRIPT`:
+`tests/devices/coreml/test_bf16ane.py` gained `_NAIVE_SCRIPT`:
 `from_pretrained` -> `to(device.npu)` -> `model(x)` in one process with
 **nothing in front of it**. The pre-compilation was deleted from the other
 fixture, and the executed claims of §8.2 now hang off the naive one, so an
@@ -877,7 +877,7 @@ for the body of each fixture and the JSON is written to a dup of the original.
 
 ### 8.4 What compiling leaves on disk, and which half had an owner
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp present -->
 
 A full gate run was costing 2.7 GB of the internal disk and filling
 `$TMPDIR` until CoreML could not write at all (§8.3's investigation was
@@ -917,7 +917,7 @@ Two more facts that explain why earlier attempts missed it:
 `finally`. It now names the compiled bundle **inside** that directory, so the
 existing cleanup reaches it — one argument, `compile_model(package, compiled)`.
 
-Measured on one run of `rust/torch_c/pytests/test_bf16ane.py`, the suite that
+Measured on one run of `tests/devices/coreml/test_bf16ane.py`, the suite that
 compiles most:
 
 | | entries | `m_*.mlmodelc` | `tmp*.mlmodelc` | `*.mlpackage` |
@@ -938,7 +938,7 @@ repository leaked per run. A gate now *returns* disk rather than consuming it,
 because the transient package and bundle of each compile are removed while the
 stale ones from earlier runs are not replaced.
 
-The residual **+6** is `rust/torch_c/pytests/test_npu2.py`'s own `plan_for`,
+The residual **+6** is `tests/devices/coreml/test_npu2.py`'s own `plan_for`,
 measured by running that suite alone: it has the same undestined
 `compile_model` and no `finally` around its `mkdtemp`. It is 1 MB per gate and
 is left alone deliberately — its `directory` leaks either way, so naming a
@@ -997,11 +997,11 @@ is recorded so the next person does not have to re-derive it.
 | **test defect fixed** | the fixtures avoided the caller's path; `_NAIVE_SCRIPT` drives it with nothing in front of it |
 | **defect fixed** | `compute_plan` orphaned one `.mlmodelc` per compile, forever — +454 directories and +650 MB per gate run (§8.4) |
 | **limitation named** | the `m_<UUID>` bundle had no owner at any level; `NSTemporaryDirectory()` ignores `$TMPDIR`; `e5bundlecache` is Apple's (§8.4) |
-| **tests added** | 19, in `rust/torch_c/pytests/test_bf16ane.py`; nine nullifications, each red on the tests it targets |
+| **tests added** | 19, in `tests/devices/coreml/test_bf16ane.py`; nine nullifications, each red on the tests it targets |
 
 ### 8.6 The bundle count was counting other processes' models (2026-09-17)
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_every_bundle_this_process_compiles_is_attributed_to_it present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_bf16ane.py test_every_bundle_this_process_compiles_is_attributed_to_it present -->
 
 §8.4's guard took a snapshot of `NSTemporaryDirectory()` before three probe
 compiles and another after releasing them, and asserted that the difference
@@ -1212,7 +1212,7 @@ at `CPU_AND_NE`. The shape CoreML declines is still present as a named
 | **limitation named** | which cache holds the bad entry, and how one gets into that state, is **not** established; `e5bundlecache` was not deleted to find out |
 | **claim unchanged** | relu and gelu are supported on the unit and preferred elsewhere — re-measured at four shapes, not widened, not re-graded |
 | **test defect fixed** | the relu/gelu measurement rested on a single artefact and became `assert []` when that artefact went silent |
-| **tests added** | 8, in `rust/torch_c/pytests/test_emptyplan.py` |
+| **tests added** | 8, in `tests/devices/coreml/test_emptyplan.py` |
 
 ### 9.6 The silence belongs to `ComputeUnit.ALL` — measured, 2026-09-16
 
@@ -1463,12 +1463,12 @@ of four shapes answers anywhere, and when the second setting's payload key is
 removed. Two of those five fire specifically from the newly-added `ALL` rows,
 which is the check that the new rows are graded rather than merely counted.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_all present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_units_2 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _REJECTED_UNITS_2 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py computes present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py rejected_plans_all present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py rejected_plans_units_2 present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py _REJECTED_UNITS_2 present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py computes present -->
 
 | | |
 |---|---|
@@ -1657,9 +1657,9 @@ innocent branch. The relu union row also shows the drift is not monotone over
 a longer window: it fell 3 -> 1 across runs 1-4 and recovered to 3 by run 6,
 without the machine being idle for any of it.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py rejected_plans_measured_at present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py _ABBREV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/suite_ledger.py tally present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py rejected_plans_measured_at present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_coremlops.py _ABBREV present -->
+<!-- DOCWATCH: symbol-in-file tests/suite_ledger.py tally present -->
 
 | | |
 |---|---|
@@ -1780,7 +1780,7 @@ library code's to delete.
 | **legibility fixed** | `_npu_fixture` raises with the subprocess's own output instead of discarding it |
 | **product finding** | `MLComputePlan`'s per-op usage is not stable over time for a fixed program; artefacts enter the silent set and stay |
 | **left red, deliberately** | `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` on this host — the measurement is unavailable, and saying so is the point |
-| **tests added** | 2, in `rust/torch_c/pytests/test_coremlops.py`; both nullified |
+| **tests added** | 2, in `tests/devices/coreml/test_coremlops.py`; both nullified |
 
 ### 10.4 The host condition was the cause, and clearing Apple's cache proved it
 
@@ -1973,13 +1973,13 @@ Two things follow, and they are why the fix does not rest on the rate:
   gate now reports a refusal by name instead of either crashing or claiming
   the CPU ran it.
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py ComputePlanRefused present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _REFUSED_PLAN present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py _ANSWERING_FLOOR present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_refused_compute_plan_does_not_end_the_forward present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refused_compute_plan_says_so_in_its_own_sentence present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_refusal_and_a_silence_do_not_share_one_sentence present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py ComputePlanRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _REFUSED_PLAN present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _say_refused present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py _ANSWERING_FLOOR present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_plan_forced_silent_comes_back_as_unknown_rows_not_as_nothing present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_npu2.py test_a_refused_compute_plan_does_not_end_the_forward present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_emptyplan.py test_a_refused_compute_plan_says_so_in_its_own_sentence present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_emptyplan.py test_a_refusal_and_a_silence_do_not_share_one_sentence present -->

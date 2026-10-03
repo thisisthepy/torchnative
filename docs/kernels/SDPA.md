@@ -5,7 +5,7 @@
 `aten::_scaled_dot_product_flash_attention_for_cpu` 의 블록 단위 재결합으로 좁혀 두었습니다.
 
 > **먼저 읽어야 할 것 — 이 커널은 켜져 있지 않습니다.**
-> 재현한 커널(`rust/torch_c/src/flash.rs`)은 **T=512 에서 20배 느립니다.** 그래서 기본
+> 재현한 커널(`torchnative/rust/torch_c/src/flash.rs`)은 **T=512 에서 20배 느립니다.** 그래서 기본
 > 경로는 candle 이 그대로 유지하고, 이 커널은 **명시적으로 요청할 때만** 닿습니다.
 > 측정과 그 판단은 **§12** 에 있습니다. §3 · §5 · §6 의 "비트 일치" 는 전부 **스위치를 켠
 > 상태의 주장**이고, 스위치를 끈 기본 경로에 대한 주장이 아닙니다.
@@ -31,8 +31,8 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 | f32 경로, 토큰 (프롬프트 5개) | (1개만 재고 20/20) | **5/5, 로짓 5.3e-05 ~ 7.1e-05** (§8) |
 | **커널의 비용** (T=512, bf16) | — | **20.2배** — 그래서 기본값이 아님 (§12) |
 | **기본 경로의 비용** (스위치 도입 후) | — | **변화 없음**, develop 대비 0.98~1.02배 (§12.3) |
-| `pytests/run.sh` | 176 통과 | **184 통과** |
-| `tools/golden/compare.py` | 2744/2744 | **2760/2760**, ops=118 |
+| `tests/run.sh` | 176 통과 | **184 통과** |
+| `tests/golden/compare.py` | 2744/2744 | **2760/2760**, ops=118 |
 | `verify_schemas.py` | 4200/4200 | 4200/4200 (변화 없음) |
 
 **한 문장으로**: 이 회차가 연 것은 **"이 한 커널이 상류와 비트 단위로 같아진다"** 이고,
@@ -69,7 +69,7 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 ## 2. 상류 커널의 모양
 
 `aten::_scaled_dot_product_flash_attention_for_cpu` 는 교과서 공식이 아닙니다.
-`rust/torch_c/src/flash.rs` 가 재현한 것은 다음 다섯 가지입니다.
+`torchnative/rust/torch_c/src/flash.rs` 가 재현한 것은 다음 다섯 가지입니다.
 
 | | 상류가 하는 것 |
 |---|---|
@@ -87,7 +87,7 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 
 ## 3. 왜 허용오차로는 안 보였나
 
-`tools/golden/compare.py` 는 이 op 을 `bfloat16` 에 대해 `TOLERANCES` 의 6e-2 로
+`tests/golden/compare.py` 는 이 op 을 `bfloat16` 에 대해 `TOLERANCES` 의 6e-2 로
 비교합니다. **bfloat16 의 1 ulp 는 값의 1/256** 이므로, 허용오차는 그것의 열다섯 배입니다.
 즉 **모든 원소가 1 ulp 씩 틀려도 골든은 초록**입니다.
 
@@ -107,7 +107,7 @@ float32                      3562/4096     4.17233e-07
 그렇습니다. 그러니 이것은 반올림 규칙 문제가 아니라 **재결합 순서** 문제이고,
 소박한 정식화로는 어떻게 고쳐도 없어지지 않습니다.
 
-**그래서 이 회차의 검사는 허용오차가 없습니다.** `rust/torch_c/pytests/test_shim.py` 의
+**그래서 이 회차의 검사는 허용오차가 없습니다.** `tests/_support/test_shim.py` 의
 `test_sdpa_*` 셋은 전부 `==` 로 비교합니다. 골든에는 §4 가 발견한 **블록 경계를 넘는 도형**을
 넣었지만(16개 케이스), 그쪽의 성질은 여전히 허용오차이고 그 사실을 케이스 주석에 적었습니다.
 
@@ -376,9 +376,9 @@ dtype 을 주지 않은 기본 경로(= `bfloat16`), `attn_implementation="sdpa"
 ## 10. 검증
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     exit 0   184 통과 (전 176, +3 비트 단위, +1 스위치, +4 dtype 회차)
-$PY tools/golden/compare.py                   exit 0   2760/2760, ops=118 (전 2744, +16)
-$PY rust/torch_c/pytests/verify_schemas.py    exit 0   4200/4200 (변화 없음)
+PYTHON=$PY sh tests/run.sh     exit 0   184 통과 (전 176, +3 비트 단위, +1 스위치, +4 dtype 회차)
+$PY tests/golden/compare.py                   exit 0   2760/2760, ops=118 (전 2744, +16)
+$PY tests/_support/verify_schemas.py    exit 0   4200/4200 (변화 없음)
 ```
 
 **환경변수 없이 돌린 결과입니다.** +3 과 +16 은 스위치를 스스로 켜고 되돌리므로, 기본
@@ -413,16 +413,16 @@ LN2 상수를 1 ulp 움직임 (§4.1)                         FAIL 2개, 8×8 �
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-sdpa
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sdpa
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 179
-$PY tools/golden/compare.py                        # 2760/2760 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py         # 4200/4200
+PYTHON=$PY sh tests/run.sh          # 179
+$PY tests/golden/compare.py                        # 2760/2760 ops=118
+$PY tests/_support/verify_schemas.py         # 4200/4200
 ```
 
 §3 · §5 · §7 은 269 MB 의 체크포인트를 읽거나 상류 torch 와 시임을 한 프로세스에 함께
@@ -517,7 +517,7 @@ float32  T=512     6.9630 ms     156.1144 ms    22.42배
 > `enable_flash_sdp`/`sdpa_kernel(MATH)` 는 여전히 백엔드 **선택** 이름이지 op 산술 선택
 > 이름이 아니므로, 지금도 안 맞는 이유가 유효합니다. 낡은 것은 괄호 안의 근거 하나뿐입니다.
 > <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sdpa_math present -->
 | `torch.backends.cpu.get_cpu_capability` / `ATEN_CPU_CAPABILITY` | 읽기 전용이고, 환경변수 쪽은 빌드 전체의 **ISA 등급**을 고르는 것이지 한 op 의 참조 구현을 고르는 것이 아닙니다 |
 | `torch.use_deterministic_algorithms` | 한 빌드의 **실행 간 재현성**에 관한 것이고, 여기서는 **두 경로 다 이미 그렇습니다.** 사용자는 이것을 문서에 적힌 목적으로 켜는데, 거기에 20배를 매달아 두면 함정이 됩니다 |
 
@@ -565,7 +565,7 @@ float32  T=512   6.9705 ms      6.9630 ms     0.999
 | 무엇 | 어디서 켜나 |
 |---|---|
 | 비트 단위 pytest 3개 | `test_shim.py::_sdpa_call` — 모든 호출이 지나는 한 지점 |
-| 블록 경계 골든 16개 | `tools/golden/cases.py::_sdpa_block_cases` 의 `run_c` 래퍼. `finally` 로 복원 |
+| 블록 경계 골든 16개 | `tests/golden/cases.py::_sdpa_block_cases` 의 `run_c` 래퍼. `finally` 로 복원 |
 
 **켜지 않는 것도 의도입니다**: 골든의 *기존* sdpa 케이스들은 그대로 기본 경로를 지납니다.
 그것이 이 하네스에서 **기본 경로의 유일한 커버리지**이고, 같이 옮기면 실제로 매 순전파가
@@ -611,16 +611,16 @@ flash.rs 의 기본값을 true 로 (= 켠 채 출고)   pytest 1개 FAIL — 나
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-optin
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-optin
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 184
-$PY tools/golden/compare.py                        # 2760/2760 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py         # 4200/4200
+PYTHON=$PY sh tests/run.sh          # 184
+$PY tests/golden/compare.py                        # 2760/2760 ops=118
+$PY tests/_support/verify_schemas.py         # 4200/4200
 
 # §12.1 · §12.3. 측정 전에 uptime 을 보고 기록하십시오.
 $PY /Volumes/macMini/caches/optin-scratch/bench.py $TORCH_C_ARTEFACT

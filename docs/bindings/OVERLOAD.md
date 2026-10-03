@@ -96,19 +96,19 @@ C_SURFACE 의 13 개 중 **11 개**는 오버로드 *이름*이 트리에 있습
 
 ### 그래서 어떻게 했나 — 옮겨 적고, 검증기를 함께 둔다
 
-`rust/torch_c/src/overloads.json` 에 **실제 aten 스키마 문자열 45 개**를 적었습니다.
+`torchnative/rust/torch_c/src/overloads.json` 에 **실제 aten 스키마 문자열 45 개**를 적었습니다.
 출처는 `str(torch.ops.aten.<op>.<ov>._schema)`, torch 2.13.0.
 
 **IMPORT_TORCH.md §1 이 `surface.json` 에 금지한 것과 다릅니다.** 거기서 금지한 것은
 *빌드가* 상류 `.so` 를 요구하게 되는 것이었습니다. 여기서는 표가 **아티팩트에 컴파일되어**
 들어가므로 `cargo build` 는 torch 를 요구하지 않습니다. 상류를 쓰는 것은 **생성과 검증 시점**
-뿐이고, 그것은 `tools/golden/compare.py` 와 같은 종류의 의존입니다.
+뿐이고, 그것은 `tests/golden/compare.py` 와 같은 종류의 의존입니다.
 
-옮겨 적은 것에는 검사가 필요하므로, `rust/torch_c/pytests/verify_schemas.py` 를 두었습니다.
+옮겨 적은 것에는 검사가 필요하므로, `tests/_support/verify_schemas.py` 를 두었습니다.
 상류에서 다시 뽑아 표와 대조합니다.
 
 ```
-$ /Volumes/macMini/caches/spike-venv/bin/python rust/torch_c/pytests/verify_schemas.py
+$ /Volumes/macMini/caches/spike-venv/bin/python tests/_support/verify_schemas.py
 torch 2.13.0
 SUMMARY: 45/45 table entries matched upstream, 0 failed        EXIT=0
 ```
@@ -347,7 +347,7 @@ torch.tensor(data) = _aten_dispatch("aten.lift_fresh.default",
 
 ### 7.1 `_aten_implemented()` 가 op 하나를 **덜** 보고한다 (보고의 문제, 능력의 문제가 아님)
 
-골든 하네스는 "`_aten_implemented()` 에 있는데 `tools/golden/cases.py::CASE_BUILDERS` 에 없는
+골든 하네스는 "`_aten_implemented()` 에 있는데 `tests/golden/cases.py::CASE_BUILDERS` 에 없는
 op" 을 **일부러 하드 실패로** 다룹니다. 상류와 대조하지 않은 op 이 몰래 들어오지 못하게 하는
 옳은 규칙입니다. 이번 작업은 하네스를 고칠 수 없었고, 하네스에 케이스 빌더가 없는 op 이 하나
 나왔습니다.
@@ -400,7 +400,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 
 > **Correction (문서 감사, 2026-09):** 3 번은 더 이상 미구현이 아닙니다 — `RUN THE CHECK: 이 절이
 > "여기서 멈췄습니다" 라고 이름 댄 바로 그 심볼이 이제 존재합니다.** `git log -S"set_guard_error_hook"
-> -- rust/torch_c/src/bootstrap.py` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator,
+> -- torchnative/rust/torch_c/src/bootstrap.py` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator,
 > and give _C._dynamo the two names that do work") 이고, 그 커밋 메시지가 이름 댄 "두 개" 중
 > 하나가 정확히 이 심볼입니다(다른 하나는 `set_eval_frame_isolate_recompiles_id`). 실측:
 > `hasattr(torch._C._dynamo.eval_frame, 'set_guard_error_hook')` → `True`; 더 결정적으로,
@@ -408,7 +408,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 > `AutoModelForCausalLM.from_config(LlamaConfig(...))` 를 이 문서가 쓴 것과 같은 작은 설정으로
 > 직접 호출해 `LlamaForCausalLM` 인스턴스를 얻었습니다(2026-09, 이 셰임에서). §0 표의
 > "`from_config` 는 여전히 실패합니다" 도 같은 이유로 낡았습니다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py set_guard_error_hook present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py set_guard_error_hook present -->
 
 ---
 
@@ -436,10 +436,10 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 
 | | 명령 | 결과 |
 |---|---|---|
-| 호스트 스모크 | `rust/torch_c/pytests/run.sh` | **0** — 34/34 (이전 27) |
-| 골든 하네스 | `tools/golden/compare.py` | **0** — **490/490, ops covered=19** (이전 188/188, 3) |
+| 호스트 스모크 | `tests/run.sh` | **0** — 34/34 (이전 27) |
+| 골든 하네스 | `tests/golden/compare.py` | **0** — **490/490, ops covered=19** (이전 188/188, 3) |
 | 골든 자가검사 | `--inject-fault value/shape/dtype` | **1 / 1 / 1** (의도대로) |
-| 스키마 검증 | `rust/torch_c/pytests/verify_schemas.py` | **0** — 45/45 |
+| 스키마 검증 | `tests/_support/verify_schemas.py` | **0** — 45/45 |
 | 사용자 API 대조 49 케이스 | 상류 torch 와 shim 을 각각 돌려 diff | **49/49 동일** |
 | 엄격 `import torch` | `probe.py --mode strict --target torch` | **0** |
 | 기록 `import torch` | `probe.py --mode record --target torch` | **0** |
@@ -448,8 +448,8 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 | `aarch64-linux-android` | `cargo ndk -t arm64-v8a` | **0** |
 | `aarch64-apple-ios` | `cargo build --target aarch64-apple-ios` | **0** |
 
-**`tools/golden/` 과 `docs/` 의 기존 파일은 한 줄도 고치지 않았습니다.** `git status --short` 로
-확인한 변경 범위는 `rust/torch_c/` 아래 6 개 파일과 이 문서뿐입니다.
+**`tests/golden/` 과 `docs/` 의 기존 파일은 한 줄도 고치지 않았습니다.** `git status --short` 로
+확인한 변경 범위는 `torchnative/rust/torch_c/` 아래 6 개 파일과 이 문서뿐입니다.
 
 ### 크기
 
@@ -485,10 +485,10 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 cd /Volumes/macMini/thisisthepy/torchnative
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-./vendor/install_shim.sh                       # 빌드 + 구멍에 넣기
-$PY tools/golden/compare.py;                        echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py;         echo "EXIT=$?"
-(cd rust/torch_c && ./pytests/run.sh);              echo "EXIT=$?"
+./scripts/vendor/install_shim.sh                       # 빌드 + 구멍에 넣기
+$PY tests/golden/compare.py;                        echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py;         echo "EXIT=$?"
+bash tests/run.sh;              echo "EXIT=$?"
 
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
   "import torch; print(torch.full((2,), True).dtype, torch.arange(0,5,2).tolist())"
@@ -514,12 +514,12 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
 
 | 파일 | 변경 |
 |---|---|
-| `rust/torch_c/src/overloads.json` | **신규** — 스키마 표 45 개 (14 op) |
-| `rust/torch_c/pytests/verify_schemas.py` | **신규** — 표를 상류와 대조하는 검증기 |
-| `rust/torch_c/src/bootstrap.py` | 오버로드 해석기(`_TypeChecker` · `_Overloads`), `torch.tensor` 팩토리, `_shim_overloads`, `_DISCOVERED_RETURNS` 2 항목 |
-| `rust/torch_c/src/aten.rs` | aten op 17 개 추가(3 → 20), `Scalar` 인자 처리, `scalar_type_name` · `arange_has_cpu_kernel` |
-| `rust/torch_c/src/lib.rs` | `overloads.json` 을 `include_str!` 로 삽입, `_tensor_new_from_data` |
-| `rust/torch_c/pytests/test_shim.py` | 27 → 34 개. 해석기 · `torch.tensor` · 두 목록의 서로소성 |
+| `torchnative/rust/torch_c/src/overloads.json` | **신규** — 스키마 표 45 개 (14 op) |
+| `tests/_support/verify_schemas.py` | **신규** — 표를 상류와 대조하는 검증기 |
+| `torchnative/rust/torch_c/src/bootstrap.py` | 오버로드 해석기(`_TypeChecker` · `_Overloads`), `torch.tensor` 팩토리, `_shim_overloads`, `_DISCOVERED_RETURNS` 2 항목 |
+| `torchnative/rust/torch_c/src/aten.rs` | aten op 17 개 추가(3 → 20), `Scalar` 인자 처리, `scalar_type_name` · `arange_has_cpu_kernel` |
+| `torchnative/rust/torch_c/src/lib.rs` | `overloads.json` 을 `include_str!` 로 삽입, `_tensor_new_from_data` |
+| `tests/_support/test_shim.py` | 27 → 34 개. 해석기 · `torch.tensor` · 두 목록의 서로소성 |
 
-벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. `tools/golden/` 과 `docs/` 의 기존
+벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. `tests/golden/` 과 `docs/` 의 기존
 파일도 건드리지 않았습니다.

@@ -25,7 +25,7 @@ Apple Silicon / darwin 25.5.0, aarch64). 실험 스크립트는 `/Volumes/macMin
 골든 대조        1616/1616 통과, 0 실패, ops covered=78, pending case builders=0   EXIT=0
 inject-fault     value / shape / dtype                                             각각 EXIT=1
 스키마 대조      127/127 (overloads 47 + methods 80)                                EXIT=0
-스모크           rust/torch_c/pytests/test_shim.py 전체                             EXIT=0
+스모크           tests/_support/test_shim.py 전체                             EXIT=0
 호스트 빌드      aarch64-apple-darwin                                               EXIT=0
 Android 빌드     aarch64-linux-android  lib_C.so   3,960,224 B                      EXIT=0
 iOS 빌드         aarch64-apple-ios      lib_C.dylib 3,112,632 B                      EXIT=0
@@ -352,9 +352,9 @@ NaN 을 돌려주는 케이스를 처음 넣었을 때 **양쪽이 NaN 으로 �
   `"multinomial"`/`"sort"`/`"topk"` 키가 있습니다. 스키마 대조 숫자(127/127)가 이 문서를 쓴
   시점 이후 바뀌었는지는 확인하지 않았습니다 — 이 항목의 요점(파이썬 철자로 안 닿는다)만
   재확인했습니다.
-  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json multinomial present -->
-  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json sort present -->
-  <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json topk present -->
+  <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json multinomial present -->
+  <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json sort present -->
+  <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json topk present -->
 - **`topk` 의 동점 순서 (§4.2).** 재현하지 않았고, 재현하지 않기로 한 근거를 적었습니다.
   로짓이 정확히 같은 값을 갖는 모델에서 `top_k` 의 컷이 갈릴 수 있는지는 **확인하지 않았습니다.**
 - **축소 dtype 의 비-마지막-축 `_softmax` (§4.3).** 차이는 재었고 원인은 추론입니다.
@@ -382,17 +382,17 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 DIST=/Volumes/macMini/caches/target-python
 
 # 벤더 트리는 git 에 없다 — 새 worktree 에서는 이것부터
-./vendor/vendor_torch.sh
+./scripts/vendor/vendor_torch.sh
 
-cd rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
-PYTHON=$PY ./pytests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
+cd torchnative/rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
+PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 
 # 골든 · 스키마 — PYTHONPATH=vendor 를 붙이지 않는다.
 cd ../..
-$PY tools/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
+$PY tests/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
+$PY tests/_support/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
 for m in value shape dtype; do
-  $PY tools/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
+  $PY tests/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
 done
 
 # 3 타깃 — docs/design/TORCH_C.md §7 과 동일
@@ -407,12 +407,12 @@ done
 ## 8. 이 작업이 건드린 파일
 
 ```
-rust/torch_c/src/aten.rs     여덟 개의 커널, IMPLEMENTED 70 -> 78,
+torchnative/rust/torch_c/src/aten.rs     여덟 개의 커널, IMPLEMENTED 70 -> 78,
                              IMPLEMENTED_AWAITING_GOLDEN 에서 fill_.Tensor 제거
-rust/torch_c/src/rng.rs      exponential_serial / uniform_sample_f64 추가
-tools/golden/cases.py        여덟 개의 케이스 빌더, uniform_/normal_ 승격,
+torchnative/rust/torch_c/src/rng.rs      exponential_serial / uniform_sample_f64 추가
+tests/golden/cases.py        여덟 개의 케이스 빌더, uniform_/normal_ 승격,
                              _pair_result_check 의 NaN 처리
 docs/models/SAMPLING.md             이 문서
 ```
 
-`rust/torch_c/src/bootstrap.py`·`overloads.json`·`methods.json` 은 건드리지 않았습니다.
+`torchnative/rust/torch_c/src/bootstrap.py`·`overloads.json`·`methods.json` 은 건드리지 않았습니다.

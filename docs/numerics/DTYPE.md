@@ -60,10 +60,10 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, half 2.7.1, rustc 1.98.
 이 작업을 시작한 트리 상태(`6076cf4`)와 끝낸 상태 양쪽에서, 전부 exit 0:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        전 171 통과 -> 후 175 (+4)
-$PY tools/golden/compare.py                      2744/2744, ops=118        (변화 없음)
-$PY rust/torch_c/pytests/verify_schemas.py       3076/3076                 (변화 없음)
-cd rust/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
+PYTHON=$PY sh tests/run.sh        전 171 통과 -> 후 175 (+4)
+$PY tests/golden/compare.py                      2744/2744, ops=118        (변화 없음)
+$PY tests/_support/verify_schemas.py       3076/3076                 (변화 없음)
+cd torchnative/rust/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
 ```
 
 > **문서 정정.** `docs/devices/DEVICE_ABS.md` §5.1 은 *"이 크레이트에는 돌릴 수 있는 Rust 단위 테스트가
@@ -71,7 +71,7 @@ cd rust/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
 > not found in flat namespace '_PyExc_BaseException'` 로 죽습니다"* 라고 적고 있습니다.
 > **rustc 1.98.0 에서는 죽지 않습니다.** `capture.rs` 에 이미 있던 두 개를 포함해 7 개가 돕니다
 > (실측, 이 회차 전후 모두). 그 문장을 근거로 Rust 테스트를 쓰지 않기로 한 판단은 이제 유효하지
-> 않습니다. 다만 `pytests/run.sh` 는 `cargo test` 를 부르지 않으므로 **표준 검증 경로에는 여전히
+> 않습니다. 다만 `tests/run.sh` 는 `cargo test` 를 부르지 않으므로 **표준 검증 경로에는 여전히
 > 들어 있지 않고**, 그래서 이 회차의 정확성 검사는 `test_shim.py` 쪽에도 두었습니다(§5).
 
 ---
@@ -176,7 +176,7 @@ NEON into uninit capacity      0.0704 ms         14.90     <- 1.48 배
 
 ## 3. 무엇을 고쳤나 — 그리고 A/B
 
-`rust/torch_c/src/reduced.rs` (신규, 746 줄) 이 두 가지를 합니다.
+`torchnative/rust/torch_c/src/reduced.rs` (신규, 746 줄) 이 두 가지를 합니다.
 
 1. **`{f16,bf16} <-> f32` 변환 4 개**를 candle 대신 직접 합니다. `candle_core::CustomOp1`
    두 개(`Widen`, `Narrow`)로 들어가고, `FastDType::fast_to` 라는 이름의 확장 트레이트로
@@ -395,7 +395,7 @@ FAIL test_reduced_float_conversion_carries_the_values_no_shift_would:
 
 > **그리고 검증이 한 번 거짓말을 했습니다.** 처음 두 번의 고장 확인에서 `TORCH_C_ARTEFACT` 를
 > export 하지 않은 채 `compare.py` 를 돌렸고, **골든이 고정 캐시 경로의 다른 빌드를 재면서
-> 2744/2744 초록을 냈습니다.** `pytests/run.sh` 의 주석이 경고하는 바로 그 함정입니다.
+> 2744/2744 초록을 냈습니다.** `tests/run.sh` 의 주석이 경고하는 바로 그 함정입니다.
 > 절사를 재도입한 빌드가 골든을 통과했다고 보고할 뻔했습니다. 위 표는 산출물을 고정하고
 > **다시 돌린** 결과입니다.
 
@@ -478,7 +478,7 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 > 대고 거절한다(`torch.tensor([1,2,3], dtype=torch.int8)` → `NotImplementedError: ... dtype not
 > storable by the candle backend`) — §6.4 항목 2 의 "결함이 아니라 정확한 보고" 라는 판단은
 > 그대로 유효하다. 아래 원문은 권고 시점 그대로 남긴다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs Quantized present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs Quantized present -->
 
 **추천: (b) candle `QTensor` 를 `Repr` 의 세 번째 변형으로.** 근거는 셋입니다.
 
@@ -536,16 +536,16 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-dtype
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-dtype
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh                      # PATH 에 cargo 가 있어야 함
+bash scripts/vendor/install_shim.sh                      # PATH 에 cargo 가 있어야 함
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # <- 빼먹으면 §5.4 의 거짓 초록
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        # 175
-$PY tools/golden/compare.py                      # 2744/2744 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py       # 3076/3076
-( cd rust/torch_c && cargo test --release )      # 7
+PYTHON=$PY sh tests/run.sh        # 175
+$PY tests/golden/compare.py                      # 2744/2744 ops=118
+$PY tests/_support/verify_schemas.py       # 3076/3076
+( cd torchnative/rust/torch_c && cargo test --release )      # 7
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/dtype-scratch/` 에 있습니다:
@@ -572,7 +572,7 @@ $PY rust/torch_c/pytests/verify_schemas.py       # 3076/3076
 
 | 종류 | 무엇 |
 |---|---|
-| **기능 추가** | `rust/torch_c/src/reduced.rs` — 축소 float 변환 4 개와 융합 산술 4 개. `aten.rs` 의 opmath 경로 80 곳이 그것을 탄다 |
+| **기능 추가** | `torchnative/rust/torch_c/src/reduced.rs` — 축소 float 변환 4 개와 융합 산술 4 개. `aten.rs` 의 opmath 경로 80 곳이 그것을 탄다 |
 | **결함 수정** | 없음. **한 비트도 바뀌지 않았습니다** — 골든 2744 개와 스키마 3076 개가 변화 없음 |
 | **테스트 추가** | Rust 5 개(전수 비트 패턴 포함) · `test_shim.py` 4 개 (171 → 175). 전부 허용오차 없음 |
 | **측정** | 층별 분해(§2) · A/B(§3) · f32 대비 위치(§3.2) · candle f16 GEMM 의 누산 dtype(§4.2) · 융합 gemv 프로토타입(§4.3) |

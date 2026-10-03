@@ -13,7 +13,7 @@ prior attempt at this exact brief did not).
 
 Method follows docs/architectures/ARCH20.md: toy `AutoConfig` (small hidden size, one layer or few, few heads,
 tiny vocab — coverage, not model quality), `TORCH_USE_RTLD_GLOBAL=1`,
-`PYTHONPATH=torchnative/src/main`, transformers 5.15.1 in `spike-venv`. Scratch scripts live under
+`PYTHONPATH=python`, transformers 5.15.1 in `spike-venv`. Scratch scripts live under
 `/tmp/arch26/`, not committed, the same as ARCH20's `/tmp/arch7/sweep.py`.
 
 ---
@@ -35,7 +35,7 @@ embeddings stage, before the model reaches an attention block, and it fires whet
 
 ```
 NotImplementedError: not implemented in torch._C shim: torch.sqrt(...) -- overload resolution
-has no table entry for this op (rust/torch_c/src/overloads.json)
+has no table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 `deberta_v2` uses real `nn.LayerNorm`, so it gets past embeddings, but its attention block calls
@@ -56,7 +56,7 @@ False
 and a `TorchDispatchMode` trace of `torch.sqrt(x)` on upstream fires exactly one op,
 `aten.sqrt.default` — a leaf kernel, not a composite that decomposes into ops this shim already
 has (the way `torch.square` decomposes into `pow.Tensor_Scalar`, ARCH20.md §3). Grepping
-`rust/torch_c/src/aten.rs`, `overloads.json`, and `methods.json` for `sqrt` finds only
+`torchnative/rust/torch_c/src/aten.rs`, `overloads.json`, and `methods.json` for `sqrt` finds only
 `rsqrt`/`clamp`-adjacent entries — no `sqrt` kernel exists to wire a name to. Composing `sqrt` out
 of `pow(x, 0.5)` in `bootstrap.py` was considered and rejected: that would be inventing a
 computation path upstream does not take, in a round whose whole point is not doing that silently
@@ -87,7 +87,7 @@ Unlike the two existing no-ops, `set_eval_frame` is a **get-and-set** — the ca
 value to restore the prior state on the way out, so an unconditional `None` return (which is what
 the existing no-op shape would have produced) would have been a real behavioral bug for any nested
 `disable()` context, not merely an unreachable stub. Fixed as a state cell — get returns what was
-last set, set stores and returns the prior — in `rust/torch_c/src/bootstrap.py`, alongside a
+last set, set stores and returns the prior — in `torchnative/rust/torch_c/src/bootstrap.py`, alongside a
 sibling cell for `set_eval_frame_isolate_recompiles_id` (same call shape, same file, a few lines
 away, not yet observed to be called by anything but added for the same reason: an unconditional
 `None` there would be a landmine the moment something does call it while nested).
@@ -174,7 +174,7 @@ no-argument and tensor-argument spellings of set_ are not implemented in this sh
 ```
 
 **This is a missing kernel, confirmed by trace, not a name that needs wiring.** `tensor.rs::set_`
-(`rust/torch_c/src/tensor.rs:1244`) implements only the storage-argument overload
+(`torchnative/rust/torch_c/src/tensor.rs:1244`) implements only the storage-argument overload
 (`aten.set_.source_Storage_storage_offset`-shaped: copies out of an already-filled
 `torch.UntypedStorage`) and explicitly refuses anything else by name. A `TorchDispatchMode` trace
 of `a.set_(b)` for tensor `b` on upstream fires exactly one op:
@@ -184,7 +184,7 @@ aten.set_.source_Tensor
 ```
 
 which is a distinct overload from the one implemented, and `tensor.rs` is forbidden territory this
-round (`rust/torch_c/src/{aten.rs,tensor.rs,dtype.rs,flash.rs}`).
+round (`torchnative/rust/torch_c/src/{aten.rs,tensor.rs,dtype.rs,flash.rs}`).
 
 **Finding, by name: `aten.set_.source_Tensor` is a missing kernel/overload.** It is reached through
 `torch.nn.utils.parametrizations.weight_norm` — a fairly generic utility (any architecture using
@@ -292,10 +292,10 @@ wall.
 **Not fixable in territory.** `torch.Tensor(n)` — upstream's legacy "allocate n uninitialized
 elements" constructor, distinct from `TensorBase(existing_tensor)` (which re-wraps a tensor that
 already exists) — is refused **in Rust**, at `#[new] fn py_new` in
-`rust/torch_c/src/tensor.rs:920-929`, the PyO3-generated `__new__` for the native `TensorBase`
+`torchnative/rust/torch_c/src/tensor.rs:920-929`, the PyO3-generated `__new__` for the native `TensorBase`
 type. `torch.Tensor` itself (the subclass users actually construct) is `class Tensor(TensorBase)`
 in the *vendored* `torch/_tensor.py`, which is out of bounds for a different reason
-(`torchnative/src/main/torch` is the vendored tree, absolutely off-limits this round). Both places
+(`torchnative/python/torch` is the vendored tree, absolutely off-limits this round). Both places
 that could plausibly grow a `__new__` override are therefore forbidden territory for this brief —
 `tensor.rs` explicitly, the vendored tree by the brief's own rule. `bootstrap.py` has no hook into
 `TensorBase.__new__` the way it has hooks into ordinary members (`setattr(tensorbase, name, fn)`
@@ -512,11 +512,11 @@ All of the following were re-run against the artefact rebuilt after every fix ab
 the end:
 
 ```
-bash vendor/install_shim.sh                       exit 0
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          261 ok, 0 FAIL          exit 0
-$PY tools/golden/compare.py                        4284/4284, ops=139, pending=1   exit 0
-$PY tools/golden/compare.py --self-test             13 x 11, 0 problems    exit 0
-$PY rust/torch_c/pytests/verify_schemas.py          4353/4353              exit 0
+bash scripts/vendor/install_shim.sh                       exit 0
+PYTHON=$PY sh tests/run.sh          261 ok, 0 FAIL          exit 0
+$PY tests/golden/compare.py                        4284/4284, ops=139, pending=1   exit 0
+$PY tests/golden/compare.py --self-test             13 x 11, 0 problems    exit 0
+$PY tests/_support/verify_schemas.py          4353/4353              exit 0
 ```
 
 All five numbers are unchanged from the pre-existing baseline measured at the start of this round
@@ -533,9 +533,9 @@ bert bloom cohere falcon gpt_bigcode mamba persimmon
 TOTAL 20/20
 ```
 
-`git status --short` in the worktree shows exactly two changes: `rust/torch_c/src/bootstrap.py`
+`git status --short` in the worktree shows exactly two changes: `torchnative/rust/torch_c/src/bootstrap.py`
 (modified) and `docs/architectures/ARCH26.md` (new) — nothing in `aten.rs`, `tensor.rs`, `dtype.rs`, `flash.rs`,
-`tools/golden/cases.py`, `tools/wheel/`, or the vendored tree.
+`tests/golden/cases.py`, `scripts/wheel/`, or the vendored tree.
 
 ## 10. The new sweep denominator
 

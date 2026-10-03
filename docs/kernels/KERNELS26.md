@@ -42,8 +42,8 @@ forwards, which is the deepest tensor-shaped forward this architecture has.
 ### The baseline, every gate, before any edit
 
 ```
-pytests/run.sh                261 ok, 0 FAIL                        exit 0
-tools/golden/compare.py       4290/4290, ops=139, pending=1          exit 0
+tests/run.sh                261 ok, 0 FAIL                        exit 0
+tests/golden/compare.py       4290/4290, ops=139, pending=1          exit 0
 compare.py --self-test        13 comparators x 11 fault modes        exit 0
 verify_schemas.py             4353/4353                              exit 0
 sweep26 (shim)                20/26                                  exit 0
@@ -161,7 +161,7 @@ Three routes are tested, and they fail independently:
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 261 | **264** (+3: two `sqrt` tests, one road test) |
+| `tests/run.sh` | 261 | **264** (+3: two `sqrt` tests, one road test) |
 | `compare.py` | 4290/4290, ops=139 | **4339/4339, ops=140** (+49 cases) |
 | `compare.py --self-test` | 13 comparators | **14** (+`_signed_zero_check`), 0 problems |
 | `verify_schemas.py` | 4353/4353 | **4359/4359** (+6: `sqrt` in both tables, `.out` included) |
@@ -295,7 +295,7 @@ attributable to the forward alone and to nothing upstream of it.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 264 | **265** (+1) |
+| `tests/run.sh` | 264 | **265** (+1) |
 | `compare.py` | 4339/4339, ops=140 | **4481/4481, ops=141** (+142 cases) |
 | `verify_schemas.py` | 4359/4359 | **4363/4363** (+4) |
 | sweep26 (shim) | 20/26 | **22/26** |
@@ -417,7 +417,7 @@ to nothing.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 265 | **266** (+1) |
+| `tests/run.sh` | 265 | **266** (+1) |
 | `compare.py` | 4481/4481, ops=141 | **4682/4682, ops=143** (+201 cases) |
 | `verify_schemas.py` | 4363/4363 | **4376/4376** (+13) |
 | sweep26 (shim) | 22/26 | **22/26** |
@@ -503,7 +503,7 @@ surface.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 266 | **267** (+1) |
+| `tests/run.sh` | 266 | **267** (+1) |
 | `compare.py` | 4682/4682, ops=143 | **4682/4682** (unchanged — a constructor spelling, no new dispatch key) |
 | `verify_schemas.py` | 4376/4376 | **4376/4376** (unchanged — not a table entry) |
 | sweep26 (shim) | 22/26 | **22/26** |
@@ -613,7 +613,7 @@ composite and the trace that found `_weight_norm_interface` ran on a *forward*, 
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 267 | **268** (+1) |
+| `tests/run.sh` | 267 | **268** (+1) |
 | `compare.py` | 4682/4682, ops=143 | **4682/4682** (unchanged) |
 | `verify_schemas.py` | 4376/4376 | **4376/4376** (unchanged) |
 | sweep26 (shim) | 22/26 | **22/26** |
@@ -689,7 +689,7 @@ the wall behind a kernel turned out to be a spelling.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
+| `tests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
 | `compare.py` | 4682/4682, ops=143 | **4709/4709, ops=143** (+27 cases, same op) |
 | `verify_schemas.py` | 4376/4376 | **4376/4376** (unchanged — same schema) |
 | sweep26 (shim) | 22/26 | **22/26** |
@@ -960,11 +960,11 @@ the one it demonstrated on `sam3_video` — appearing a second time in the same 
 ### 8.4 Final gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   268 ok, 0 FAIL                    exit 0   (was 261)
-$PY tools/golden/compare.py                 4709/4709, ops=143, pending 1     exit 0   (was 4290/4290, ops=139)
-$PY tools/golden/compare.py --self-test     14 comparators x 11 fault modes   exit 0   (was 13)
-$PY rust/torch_c/pytests/verify_schemas.py  4376/4376                         exit 0   (was 4353/4353)
-( cd rust/torch_c && cargo test --release ) 28 passed                         exit 0   (was 24)
+PYTHON=$PY sh tests/run.sh   268 ok, 0 FAIL                    exit 0   (was 261)
+$PY tests/golden/compare.py                 4709/4709, ops=143, pending 1     exit 0   (was 4290/4290, ops=139)
+$PY tests/golden/compare.py --self-test     14 comparators x 11 fault modes   exit 0   (was 13)
+$PY tests/_support/verify_schemas.py  4376/4376                         exit 0   (was 4353/4353)
+( cd torchnative/rust/torch_c && cargo test --release ) 28 passed                         exit 0   (was 24)
 sweep26 (shim)                              22/26                             exit 0   (was 20/26)
 sweep26 (upstream)                          26/26                             exit 0
 ```
@@ -991,8 +991,8 @@ The starting point is §8.4's, re-measured on this worktree before any edit and
 identical to it:
 
 ```
-pytests/run.sh                268 ok, 0 FAIL                        exit 0
-tools/golden/compare.py       4709/4709, ops=143, pending=1          exit 0
+tests/run.sh                268 ok, 0 FAIL                        exit 0
+tests/golden/compare.py       4709/4709, ops=143, pending=1          exit 0
 compare.py --self-test        14 comparators x 11 fault modes        exit 0
 verify_schemas.py             4376/4376                              exit 0
 sweep26 (shim)                22/26                                  exit 0
@@ -1219,7 +1219,7 @@ pins the whole four-element list rather than checking membership.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
+| `tests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
 | `compare.py` | 4709/4709, ops=143 | **5162/5162, ops=145** (+453 cases, +2 ops) |
 | `verify_schemas.py` | 4376/4376 | **4380/4380** (+4) |
 | `test_core_ops_and_op_tags_agree` | 88 | **90** — both overloads are `['core', 'pointwise', 'pt2_compliant_tag']`, read off each rather than copied from `div.Tensor` beside them |
@@ -1370,7 +1370,7 @@ forward call. Sabotage C2 is exactly that transcription.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
+| `tests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
 | `compare.py` | 5162/5162, ops=145 | **5184/5184, ops=145** (+22 cases, same op) |
 | `verify_schemas.py` | 4380/4380 | **4380/4380** (unchanged — same schema, and `conv_transpose2d` is a spelling, not a table entry) |
 | sweep26 (shim) | 22/26 | **22/26** |
@@ -1544,7 +1544,7 @@ spellings against each other.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
+| `tests/run.sh` | 268 | **268** (the new assertions joined the existing road test) |
 | `compare.py` | 5184/5184, ops=145 | **5613/5613, ops=147** (+429 cases, +2 ops) |
 | `compare.py --self-test` | 14 comparators | **15** — `_weight_norm_pair_check` |
 | `verify_schemas.py` | 4380/4380 | **4386/4386** (+6) |
@@ -1714,7 +1714,7 @@ fails on values across 20 cases while the dtype and shape stay right.
 
 | gate | before §13 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **268** |
+| `tests/run.sh` | 268 | **268** |
 | `compare.py` | 5613/5613, ops=147 | **5634/5634, ops=148** (+21 cases, +1 op) |
 | `verify_schemas.py` | 4386/4386 | **4392/4392** (+6) |
 | schema identities | 228 | **230** (+2) |
@@ -1801,10 +1801,10 @@ rearranged weights from index arithmetic instead), which is a second caller for
 ### 14.1 Final gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   268 ok, 0 FAIL                    exit 0
-$PY tools/golden/compare.py                 5634/5634, ops=148, pending 1     exit 0   (was 4709/4709, ops=143)
-$PY tools/golden/compare.py --self-test     15 comparators x 11 fault modes   exit 0   (was 14)
-$PY rust/torch_c/pytests/verify_schemas.py  4392/4392                         exit 0   (was 4376/4376)
+PYTHON=$PY sh tests/run.sh   268 ok, 0 FAIL                    exit 0
+$PY tests/golden/compare.py                 5634/5634, ops=148, pending 1     exit 0   (was 4709/4709, ops=143)
+$PY tests/golden/compare.py --self-test     15 comparators x 11 fault modes   exit 0   (was 14)
+$PY tests/_support/verify_schemas.py  4392/4392                         exit 0   (was 4376/4376)
 sweep26 (shim)                              22/26                             exit 0   (was 22/26)
 ```
 
@@ -1830,8 +1830,8 @@ The starting point, re-measured on this worktree before any edit and identical
 to §14.1's:
 
 ```
-pytests/run.sh                268 ok, 0 FAIL                        exit 0
-tools/golden/compare.py       5634/5634, ops=148, pending=1         exit 0
+tests/run.sh                268 ok, 0 FAIL                        exit 0
+tests/golden/compare.py       5634/5634, ops=148, pending=1         exit 0
 compare.py --self-test        15 comparators x 11 fault modes       exit 0
 verify_schemas.py             4392/4392                             exit 0
 sweep26 (shim)                22/26                                 exit 0
@@ -1962,7 +1962,7 @@ is §0's "a validation that cannot fail is not a validation" in a new place.
 
 | gate | before §15 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 268 | **269** (+1) |
+| `tests/run.sh` | 268 | **269** (+1) |
 | `compare.py` | 5634/5634, ops=148 | **5656/5656, ops=149** (+22 cases, +1 op) |
 | `verify_schemas.py` | 4392/4392 | **4399/4399** (+7) |
 | schema identities | 230 | **232** (+2) |
@@ -2055,7 +2055,7 @@ once and applied to the pair is what stops them drifting apart a second time.
 
 | gate | before §16 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 269 | **270** (+1) |
+| `tests/run.sh` | 269 | **270** (+1) |
 | `compare.py` | 5656/5656, ops=149 | **5784/5784, ops=152** (+128 cases, +3 ops) |
 | `verify_schemas.py` | 4399/4399 | **4415/4415** (+16) |
 | schema identities | 232 | **238** (+6) |
@@ -2160,7 +2160,7 @@ above, which is why both were measured rather than one inferred from the other.
 
 | gate | before §17 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 270 | **270** |
+| `tests/run.sh` | 270 | **270** |
 | `compare.py` | 5784/5784, ops=152 | **5830/5830, ops=153** (+46 cases, +1 op) |
 | `compare.py --self-test` | 15 comparators | **16 comparators** x 11 fault modes |
 | `verify_schemas.py` | 4415/4415 | **4421/4421** (+6) |
@@ -2267,7 +2267,7 @@ wrapper that supplies `"dim"`.
 
 | gate | before §18 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 270 | **271** (+1) |
+| `tests/run.sh` | 270 | **271** (+1) |
 | `compare.py` | 5830/5830, ops=153 | **5892/5892, ops=154** (+62 cases, +1 op) |
 | `verify_schemas.py` | 4421/4421 | **4427/4427** (+6) |
 | schema identities | 240 | **242** (+2) |
@@ -2394,7 +2394,7 @@ there is nothing inconsistent to reproduce.
 
 | gate | before §19 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 271 | **272** (+1) |
+| `tests/run.sh` | 271 | **272** (+1) |
 | `compare.py` | 5892/5892, ops=154 | **5941/5941, ops=155** (+49 cases, +1 op) |
 | `verify_schemas.py` | 4427/4427 | **4430/4430** (+3) |
 | schema identities | 242 | **242** (unchanged) |
@@ -2531,7 +2531,7 @@ spelling case could have seen it — the third time this round (after §15.4 and
 
 | gate | before §20 | after |
 |---|---:|---:|
-| `pytests/run.sh` | 272 | **272** |
+| `tests/run.sh` | 272 | **272** |
 | `compare.py` | 5941/5941, ops=155 | **6033/6033, ops=156** (+92 cases, +1 op) |
 | `verify_schemas.py` | 4430/4430 | **4433/4433** (+3) |
 | schema identities | 242 | **242** (unchanged) |
@@ -3240,11 +3240,11 @@ going to be found was by breaking the kernel on purpose.
 ## 26. Final gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh   274 ok, 0 FAIL                    exit 0   (was 268)
-$PY tools/golden/compare.py                 6374/6374, ops=161, pending 1     exit 0   (was 5634/5634, ops=148)
-$PY tools/golden/compare.py --self-test     16 comparators x 11 fault modes    exit 0   (was 15)
-$PY rust/torch_c/pytests/verify_schemas.py  4458/4458                          exit 0   (was 4392/4392)
-( cd rust/torch_c && cargo test --release ) 28 passed                          exit 0
+PYTHON=$PY sh tests/run.sh   274 ok, 0 FAIL                    exit 0   (was 268)
+$PY tests/golden/compare.py                 6374/6374, ops=161, pending 1     exit 0   (was 5634/5634, ops=148)
+$PY tests/golden/compare.py --self-test     16 comparators x 11 fault modes    exit 0   (was 15)
+$PY tests/_support/verify_schemas.py  4458/4458                          exit 0   (was 4392/4392)
+( cd torchnative/rust/torch_c && cargo test --release ) 28 passed                          exit 0
 sweep26 (shim)                              26/26                              exit 0   (was 22/26)
 sweep26 (upstream)                          26/26                              exit 0
 ```

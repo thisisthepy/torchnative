@@ -55,7 +55,7 @@ project does *not* do, and that is still the larger part.
   opposite of NNAPI and CoreML, which fail closed at runtime. An
   optimistic table would therefore be worse than none.
 
-- **`tools/devices/intelnpu_verify.py`** — the script to run on an Intel
+- **`scripts/devices/intelnpu_verify.py`** — the script to run on an Intel
   NPU machine. It keeps **selection** (Stage A, `plan_lowering`, pure
   Python, no OpenVINO, no hardware) apart from **execution** (Stage B,
   `probe`, which needs both). Reporting the two together is how a
@@ -93,7 +93,7 @@ project does *not* do, and that is still the larger part.
 
 - **A suite that passed on the environment rather than on the code.**
   `test_qnnprobe.py` reaches `torch`, whose `_load_global_deps()` dlopens
-  `torch/lib/libtorch_global_deps.*` — a file `tools/wheel/build.py`
+  `torch/lib/libtorch_global_deps.*` — a file `scripts/wheel/build.py`
   creates for a wheel and which does not exist in the source tree. It
   passed standalone because `TORCH_USE_RTLD_GLOBAL` happened to be set in
   the running shell, and failed under `run.sh`, which does not set it.

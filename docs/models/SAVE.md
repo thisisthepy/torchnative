@@ -390,22 +390,22 @@ Delta.publish()
 ## 8. 회귀
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh    339 ok   (이전 333, +6)
+PYTHON=$PY sh tests/run.sh    339 ok   (이전 333, +6)
                                               DOCWATCH: PASS -- 248/248
-$PY tools/golden/compare.py                  7763/7763, ops=168
+$PY tests/golden/compare.py                  7763/7763, ops=168
 ```
 
 `_aten_dispatch` 에 추가된 op 은 없습니다 — 이 회차가 더한 것 중 aten op 은 하나도 없고,
-따라서 `tools/golden/cases.py` 에 붙일 케이스도 없습니다.
+따라서 `tests/golden/cases.py` 에 붙일 케이스도 없습니다.
 
 위 표의 회차 고유 숫자가 아니라, **뒤에 와도 계속 참이어야 하는 것**에 대한 상시 검사
 (docs/verification/DOCWATCH.md). `339` 은 이 회차의 스냅숏이므로 하한으로만 겁니다 — 이 저장소의
 다른 문서가 `smoke_ok` 를 다루는 방식과 같습니다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _ZipWriter present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs snapshot present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs storage_snapshot present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _ZipWriter present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs snapshot present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs storage_snapshot present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit present -->
 <!-- DOCWATCH: count smoke_ok ge 339 -->
 
 ---

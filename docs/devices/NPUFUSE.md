@@ -161,7 +161,7 @@ precision). Then the 4x-ratio rule against the f64 truth.
 | 576 × 1536 (SmolLM2-135M layer 0), 3 prompts | `f32` | 5.32e-04 | 7.81e-03 | 1.00 | agrees |
 | 576 × 1536 (SmolLM2-135M layer 0), 3 prompts | plugin default (f16) | 9.39e-03 | 7.81e-03 | 23.5 | **fails both** |
 
-The SmolLM2 rows come from running `tools/devices/intelnpu_fuse_verify.py`
+The SmolLM2 rows come from running `scripts/devices/intelnpu_fuse_verify.py`
 here, with the CPU plugin remapped to stand in for the NPU. That was a smoke
 test of the tool's plumbing. Its oracle is the **shim's** f16 against the
 shim's f64, not upstream's, because that is what the tool can compute on the
@@ -207,7 +207,7 @@ evidence.
    prints `REFUSED` or `NOT PROVEN`, stop and send that output.
 4. Optional, to keep the run's compile cache out of your user cache:
    `set TORCHNATIVE_CACHE_DIR=%CD%\.scratch\npucache`.
-5. Run `python tools/devices/intelnpu_fuse_verify.py --model Qwen/Qwen3-0.6B`.
+5. Run `python scripts/devices/intelnpu_fuse_verify.py --model Qwen/Qwen3-0.6B`.
    Any Llama/Qwen/Mistral-family causal LM works. Qwen3-0.6B is small enough to
    load twice: one copy stays on the CPU as the reference.
 6. Copy these lines from the output:
@@ -224,7 +224,7 @@ evidence.
    (`echo %ERRORLEVEL%`).
 9. Optional: run the gate's real-runtime half against the laptop's runtime:
    `set TORCHNATIVE_OPENVINO_C=<path to openvino_c.dll>`, then
-   `python rust/torch_c/pytests/test_npufuse.py`. This exercises the **CPU**
+   `python tests/devices/npu/test_npufuse.py`. This exercises the **CPU**
    plugin on the laptop. It is not NPU evidence, but it checks the x86-64
    build of the same path.
 

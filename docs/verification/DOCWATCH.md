@@ -62,7 +62,7 @@ scans 74 documents' prose. See "What this cannot see" at the end.
 
 ## Where it runs
 
-`rust/torch_c/pytests/run.sh` and `tools/golden/compare.py --self-test` set
+`tests/run.sh` and `tests/golden/compare.py --self-test` set
 the shape this follows: read ground truth from the live tree (never from a
 hardcoded expectation baked into the checker), report `PASS`/`FAIL` per
 category with counts, exit non-zero on any failure, and — the specific
@@ -70,19 +70,19 @@ lesson from `run.sh`'s own incident report in its own comments — distinguish
 "this is wrong" from "I could not check this" rather than collapsing both to
 a single failure.
 
-`tools/docwatch/check_docs.py` is the entry point:
+`tests/docwatch/check_docs.py` is the entry point:
 
 ```
-python3 tools/docwatch/check_docs.py [FILES...]
+python3 tests/docwatch/check_docs.py [FILES...]
 ```
 
 With no arguments it scans every `docs/*.md`. It needs the same environment
-`rust/torch_c/pytests/decomp_sweep.py` documents needing — a built shim on
+`tests/_support/decomp_sweep.py` documents needing — a built shim on
 `PYTHONPATH`:
 
 ```
-PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
-    python3 tools/docwatch/check_docs.py
+PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
+    python3 tests/docwatch/check_docs.py
 ```
 
 Static-only markers (`symbol-in-file`, `json-key`) work without that
@@ -106,7 +106,7 @@ command — a marker cannot ask the checker to run anything other than these):
 | name | source |
 |---|---|
 | `smoke_ok` | `test_shim.py`'s own count of `ok ` lines |
-| `golden_cases_passed`, `golden_cases_total`, `golden_ops_covered`, `golden_pending` | `tools/golden/compare.py`'s `SUMMARY:` line |
+| `golden_cases_passed`, `golden_cases_total`, `golden_ops_covered`, `golden_pending` | `tests/golden/compare.py`'s `SUMMARY:` line |
 | `schema_entries_matched`, `schema_entries_total` | `verify_schemas.py`'s `SUMMARY:` line |
 | `decomp_implemented`, `decomp_population`, `decomp_lowered` | `decomp_sweep.py`'s summary line + verdict tally |
 
@@ -294,7 +294,7 @@ What is structurally invisible to this design, by category:
   `torch.compile` hit now" half is not.
 - **`docs/platform/WHEEL.md`'s self-test counts** (`build.py --self-test` and
   siblings). These fit the `count` primitive's shape exactly, but the
-  scripts that produce them live under `tools/wheel/`, outside this task's
+  scripts that produce them live under `scripts/wheel/`, outside this task's
   territory — extending the registry to them is a natural, low-risk
   follow-up, deliberately not done here.
 - **74 documents total, 11 audited.** The other 63 were not read this round

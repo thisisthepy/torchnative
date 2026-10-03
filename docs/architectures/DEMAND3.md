@@ -1,7 +1,7 @@
 # DEMAND3 — re-sweeping the ten stalled models plus `whisper.generate()`
 
-Measurement round only. **Nothing in this round changed source** — `rust/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
-`bootstrap.py`, `tools/golden/cases.py`, `torchnative/src/main/torch/` (vendored) are all untouched.
+Measurement round only. **Nothing in this round changed source** — `torchnative/rust/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
+`bootstrap.py`, `tests/golden/cases.py`, `torchnative/python/torch/` (vendored) are all untouched.
 `git status --short` in the worktree is empty throughout.
 
 docs/architectures/DEMAND.md ran 18 architectures; 7 forwarded and matched upstream, 1 (`whisper`) forwarded but
@@ -43,10 +43,10 @@ Same as docs/architectures/DEMAND.md §1: `transformers` 5.15.1, `torch` 2.13.0 
 `"shim" if hasattr(torch._C, "_aten_implemented") else "upstream"` as its first line, both sides,
 every run — transcribed literally below. Every run wrapped in a 120s `SIGALRM` (see
 `/tmp/sweep-resweep/common.py`). Each side its own subprocess
-(`PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1` for the shim;
+(`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1` for the shim;
 `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL` for upstream). Built via
 `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-resweep`,
-`TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib`, `bash vendor/install_shim.sh`.
+`TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib`, `bash scripts/vendor/install_shim.sh`.
 Scratch scripts under `/tmp/sweep-resweep/` (not committed).
 
 "Matches upstream" method as DEMAND.md §1: `torch.manual_seed(0)` immediately before model
@@ -69,7 +69,7 @@ matching DEMAND.md), comparing every `state_dict` tensor and available output te
 | `convnext` (`ConvNextForImageClassification`) | did not forward (construction-time) — `torch.linspace`, `modeling_convnext.py:219` stochastic-depth schedule | **unchanged** | no | n/a | **same wall**: `NotImplementedError: not implemented in torch._C shim: torch.linspace(...) -- overload resolution has no table entry for this op`. Consistent with DEMAND.md §0.1 rank 4 — `linspace` was not one of the five closed this round. |
 | `swin` (`SwinForImageClassification`) | did not construct — `torch.meshgrid`, `modeling_swin.py:354 _create_relative_position_index` | **construction now succeeds, forward moved further, still does not forward** | no | n/a | **NEW WALL**: `NotImplementedError: not implemented in torch._C shim: torch.adaptive_avg_pool1d(...) -- overload resolution has no table entry for this op`. This is the biggest jump of the round — `meshgrid` was a construction-time blocker (the model never got to run at all), and closing it took `swin` all the way through construction and most of the forward pass (patch embed, all window-attention blocks) to the final classification head's pooling. |
 | `sentence_embed` (`bert` + mean-pool + `F.normalize`) | forward yes, normalize no — `torch._C._linalg.linalg_vector_norm`, `torch/nn/functional.py:6100 normalize` | **unchanged** | forward: yes (unchanged from DEMAND.md, architecturally identical to `bert`); normalize: no | n/a for normalize | **same wall**: `NotImplementedError: not implemented in torch._C shim: torch._C._linalg.linalg_vector_norm`. Consistent with DEMAND.md §0.1 rank 3 — `linalg_vector_norm` was not one of the five closed this round. |
-| `whisper` `.generate()` | forward yes, generate no — `torch.as_tensor(...)`, `generation_whisper.py:1608 _retrieve_init_tokens` | **moved past `as_tensor`, generate still does not complete** | n/a (forward already established in DEMAND.md) | n/a | **NEW WALL**: `NotImplementedError: aten op not implemented in torch._C shim: aten.where.default`, reached inside the actual autoregressive decode loop (init-token construction, the previous wall, now succeeds). Checked `rust/torch_c/src/aten.rs`: `where.self` and `where.ScalarOther` are implemented, but not `where.default` — the **single-argument** form `torch.where(condition)` (upstream: equivalent to `nonzero(condition, as_tuple=True)`), a genuinely different overload from the three-argument `where` already covered, not a case the existing code should already handle. Not investigated further, per this round's implement-nothing rule. |
+| `whisper` `.generate()` | forward yes, generate no — `torch.as_tensor(...)`, `generation_whisper.py:1608 _retrieve_init_tokens` | **moved past `as_tensor`, generate still does not complete** | n/a (forward already established in DEMAND.md) | n/a | **NEW WALL**: `NotImplementedError: aten op not implemented in torch._C shim: aten.where.default`, reached inside the actual autoregressive decode loop (init-token construction, the previous wall, now succeeds). Checked `torchnative/rust/torch_c/src/aten.rs`: `where.self` and `where.ScalarOther` are implemented, but not `where.default` — the **single-argument** form `torch.where(condition)` (upstream: equivalent to `nonzero(condition, as_tuple=True)`), a genuinely different overload from the three-argument `where` already covered, not a case the existing code should already handle. Not investigated further, per this round's implement-nothing rule. |
 
 ## 3. Headline: closing those five moved most of the queue, not nothing
 
@@ -146,23 +146,23 @@ vision/audio, extended to text once the reason to extend it was found.
 ## 6. Gates — tree unchanged, pasted in full
 
 ```
-$ PYTHON=$PY sh rust/torch_c/pytests/run.sh
+$ PYTHON=$PY sh tests/run.sh
 ... smoke_ok = 348 (claim: ge 339)
 DOCWATCH: PASS -- 274/274 evaluated marker(s) hold
 
-$ $PY tools/golden/compare.py
+$ $PY tests/golden/compare.py
 SUMMARY: 8126/8126 cases passed, 0 failed, ops covered=185, pending case builders=1
 
-$ $PY tools/golden/compare.py --self-test
+$ $PY tests/golden/compare.py --self-test
 SELF-TEST: PASS -- 21 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 
-$ $PY rust/torch_c/pytests/verify_schemas.py
+$ $PY tests/_support/verify_schemas.py
 SUMMARY: 4574/4574 table entries matched upstream, 0 failed
 ```
 
 All four numbers match the round's expected baseline exactly (348 ok, DOCWATCH 274/274, 8126/8126
 ops=185). `git status --short` was empty before, during, and after this round except for this file
-itself — nothing in `rust/torch_c/src/`, `bootstrap.py`, `tools/golden/cases.py`, or the vendored
+itself — nothing in `torchnative/rust/torch_c/src/`, `bootstrap.py`, `tests/golden/cases.py`, or the vendored
 tree moved.
 
 ---

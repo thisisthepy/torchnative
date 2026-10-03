@@ -7,7 +7,7 @@ resolutions for the end of it. This round is that end.
     Features added    2   (torch._C._dispatch_is_alias_key,
                            torch._C._dispatch_has_backend_fallback)
     Defects fixed     0
-    Tests added       9   (rust/torch_c/pytests/test_bfallback.py)
+    Tests added       9   (tests/bindings/test_bfallback.py)
     Docs corrected    1   (BKEYSET.md §3's projection and §5's forward pointer)
     Removed           0
 
@@ -270,7 +270,7 @@ named here rather than counted as coverage.
 
 ## 6. The gate
 
-Run twice from the worktree root, `vendor/install_shim.sh` re-run after every
+Run twice from the worktree root, `scripts/vendor/install_shim.sh` re-run after every
 source change and once more after §4's five breaks were reverted and the
 restored `bootstrap.py` was confirmed byte-identical to the pre-break copy.
 
@@ -298,13 +298,13 @@ count was the only tell.
 `bootstrap.py` changed, so the artefact is this branch's rather than
 `develop`'s.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_the_alias_key_predicate_agrees_with_upstream_on_every_shared_key present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_the_alias_keys_are_exactly_the_keys_that_expand_beyond_themselves present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_this_shim_has_registered_no_backend_fallback_and_the_predicate_says_so present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_a_python_registered_fallback_is_recorded_but_is_not_effective present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_the_capability_gaps_this_honest_answer_names present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_the_honest_fallback_answer_resolves_nothing_extra_and_that_is_the_result present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_no_resolve_key_result_on_the_whole_aten_surface_dies_on_a_gap_any_more present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_upstreams_fallback_set_would_resolve_1861_more_by_claiming_kernels present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bfallback.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _SHIM_BACKEND_FALLBACKS present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_the_alias_key_predicate_agrees_with_upstream_on_every_shared_key present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_the_alias_keys_are_exactly_the_keys_that_expand_beyond_themselves present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_this_shim_has_registered_no_backend_fallback_and_the_predicate_says_so present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_a_python_registered_fallback_is_recorded_but_is_not_effective present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_the_capability_gaps_this_honest_answer_names present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_the_honest_fallback_answer_resolves_nothing_extra_and_that_is_the_result present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_no_resolve_key_result_on_the_whole_aten_surface_dies_on_a_gap_any_more present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_upstreams_fallback_set_would_resolve_1861_more_by_claiming_kernels present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_bfallback.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _SHIM_BACKEND_FALLBACKS present -->

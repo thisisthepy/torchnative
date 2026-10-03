@@ -25,8 +25,8 @@ transformers 5.15.1 · safetensors 0.8.0 (`/Volumes/macMini/caches/spike-venv`).
 | `_metadata` 가 붙은 state dict | **미측정** | **통과, 비트 일치** |
 | `bfloat16` 체크포인트 | 미시도 | **적재는 비트 일치.** 순전파는 다름 (§6.1) |
 | **허브의 진짜 사전학습 모델** | 미시도 | **SmolLM2-135M, 273 텐서 · 1.63억 파라미터, worst `0.0`** (§7) |
-| `pytests/run.sh` | 149 통과 | **155 통과** |
-| `tools/golden/compare.py` | 2486/2486, ops=116 | **2496/2496, ops=117** |
+| `tests/run.sh` | 149 통과 | **155 통과** |
+| `tests/golden/compare.py` | 2486/2486, ops=116 | **2496/2496, ops=117** |
 | `verify_schemas.py` | 270/270 | **272/272** |
 
 **이번 회차의 한 문장**: 이 저장소가 처음으로 **허브에서 받은 진짜 사전학습 체크포인트를
@@ -269,7 +269,7 @@ self.stride(-1) must be 1 to view Byte as Float (different element sizes), but g
 바이트를 합치거나 쪼개므로, 그 차원이 빽빽하기만 하면 행 우선으로 읽어 다시 읽은 결과가
 같은 자리에 같은 바이트를 놓습니다. 검사를 빼면 상류가 거절하는 모양을 조용히 답하게 됩니다.
 
-**골든 케이스 10개**로 상류와 대조합니다 (`tools/golden/cases.py::view_dtype_cases`) —
+**골든 케이스 10개**로 상류와 대조합니다 (`tests/golden/cases.py::view_dtype_cases`) —
 폭 1/2/4/8 을 넓히는 방향과 좁히는 방향, 같은 폭의 정수↔부동소수, rank 3, 빈 텐서.
 `ops covered` 가 116 → 117 이 된 것이 이것입니다.
 
@@ -307,7 +307,7 @@ meta 커널은 조밀 커널의 규칙을 **같은 헬퍼로 같은 순서로** 
 **"empty" 는 여기서도 0 을 답합니다.** 그것이 안전한 이유를 가정하지 않고 적어 둡니다:
 이 커널이 만드는 값은 전부 읽히기 전에 덮어씌워집니다 — 누락 키는
 `_initialize_missing_keys` 가, 비영속 버퍼는 모듈 자신의 초기화가. 만약 하나라도 그렇지
-않다면 그 0 이 순전파에 도달하고, `pytests/test_shim.py` 의 로짓 비교가 말합니다.
+않다면 그 0 이 순전파에 도달하고, `tests/_support/test_shim.py` 의 로짓 비교가 말합니다.
 실측 로짓 차이가 2.235e-08 이라는 것이 지금은 그렇지 않다는 증거입니다.
 
 ---
@@ -383,7 +383,7 @@ WEIGHTS worst difference: 0.0     at None
 > 않음을 알 수 있습니다). `docs/design/DESIGN.md` §11.1 감사(round 1)가 이미 같은 모델로 이것을
 > 확인했었고, 이 문서 자체의 §7.1/§8 이 그 사실을 반영하지 못한 채 남아 있었습니다.
 > <!-- DOCWATCH: op-implemented aten.where.ScalarOther -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _sdpa_math present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sdpa_math present -->
 
 적재가 아니라 **커널** 문제입니다. 두 어텐션 구현이 각각 다른 벽을 냅니다.
 
@@ -434,9 +434,9 @@ SmolLM2-135M 은 `num_attention_heads=9`, `num_key_value_heads=3` 의 **그룹 �
 ## 9. 검증
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     exit 0   155 통과 (전 149, +6)
-$PY tools/golden/compare.py                   exit 0   2496/2496, ops=117 (전 2486/116)
-$PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (전 270)
+PYTHON=$PY sh tests/run.sh     exit 0   155 통과 (전 149, +6)
+$PY tests/golden/compare.py                   exit 0   2496/2496, ops=117 (전 2486/116)
+$PY tests/_support/verify_schemas.py    exit 0   272/272 (전 270)
 ```
 
 **보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
@@ -463,19 +463,19 @@ $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (전 270)
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-ckpt2
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-ckpt2
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 155
-$PY tools/golden/compare.py                        # 2496/2496 ops=117
-$PY rust/torch_c/pytests/verify_schemas.py         # 272/272
+PYTHON=$PY sh tests/run.sh          # 155
+$PY tests/golden/compare.py                        # 2496/2496 ops=117
+$PY tests/_support/verify_schemas.py         # 272/272
 ```
 
 §7 의 진짜 모델은 회귀 스위트에 **넣지 않았습니다** — 269 MB 를 받아야 하고 네트워크가
-필요하므로 `pytests/run.sh` 의 성질(오프라인에서 몇 초)을 바꿉니다. 손으로 재현하는
+필요하므로 `tests/run.sh` 의 성질(오프라인에서 몇 초)을 바꿉니다. 손으로 재현하는
 방법은 이렇습니다:
 
 ```sh
@@ -483,7 +483,7 @@ export HF_HOME=/Volumes/macMini/caches/hf-home
 # 상류가 진실을 적는다 (벤더 트리를 PYTHONPATH 에 넣지 않는다)
 ATTN=eager $PY /Volumes/macMini/caches/ckpt2-scratch/real_model.py truth
 # shim 이 같은 체크포인트를 읽고 대조한다
-ATTN=eager PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+ATTN=eager PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
     $PY /Volumes/macMini/caches/ckpt2-scratch/real_model.py shim
 ```
 

@@ -12,9 +12,9 @@
 | 지금 도는가 | **돈다.** shrunk BERT (2 layer, eager) 가 `mps` 에서 forward 하고, 출력 256개가 upstream 의 `float64` 진실로부터 **5.257e-07** 떨어져 있다 — upstream 자신의 `float32` 오차 **4.320e-07** 의 **1.22배** (§4) |
 | 목록은 어떻게 됐나 | **87 → 85.** 둘 다 **다시 쓰여서** 빠졌다. 게이트를 넓힌 곳은 없다 |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs softmax_on_device present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsattn.py test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs softmax_on_device present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsattn.py test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream present -->
 
 ---
 
@@ -279,7 +279,7 @@ softmax 는 `exp` 하나와 리덕션 둘이므로 정확히 그 두 가지가 �
 결론냈을 것이고 아니었습니다.** 그래서
 `test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer` 를 추가했고, 같은 무력화를 다시
 걸어 그것이 실제로 빨개지는 것을 확인했습니다.
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsattn.py test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer present -->
+<!-- DOCWATCH: symbol-in-file tests/devices/mps/test_mpsattn.py test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer present -->
 
 ---
 
@@ -319,7 +319,7 @@ softmax 는 `exp` 하나와 리덕션 둘이므로 정확히 그 두 가지가 �
 
 | | 값 |
 |---|---|
-| `pytests/run.sh` | **976 ok**, 0 FAIL, EXIT=0 (기준선 966 + `test_mpsattn.py` 의 10개) |
+| `tests/run.sh` | **976 ok**, 0 FAIL, EXIT=0 (기준선 966 + `test_mpsattn.py` 의 10개) |
 | `cargo test` | **30 passed, 0 failed** |
 | DOCWATCH | **PASS — 883/883** |
 | golden `compare.py` | **11405/11405, ops=301 — 움직이지 않았다** |

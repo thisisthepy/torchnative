@@ -7,7 +7,7 @@ first for the Meta answer to matter."* This round closed it.
 
     Features added    1   (torch._C._dispatch_is_included_in_alias)
     Defects fixed     0
-    Tests added       8   (rust/torch_c/pytests/test_aliasinc.py)
+    Tests added       8   (tests/bindings/test_aliasinc.py)
     Docs corrected    1   (METAKEY.md §5's forward pointer)
     Removed           0
 
@@ -249,7 +249,7 @@ it and names it.
 
 ## 6. The gate
 
-Run twice from the worktree root, `vendor/install_shim.sh` re-run after each
+Run twice from the worktree root, `scripts/vendor/install_shim.sh` re-run after each
 source change and once more after §5's four breaks were reverted.
 
 ```
@@ -290,11 +290,11 @@ breath as §4's "nothing downstream moved": an unmoved number is a legitimate
 result *and* the first thing to check when a new suite looks green, and telling
 those two apart is the whole job.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_the_shim_agrees_with_upstream_over_the_full_key_by_alias_cross_product present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_an_undefined_alias_raises_while_an_undefined_key_answers_false present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_exactly_six_aliases_expand_beyond_themselves present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_the_six_value_alias_pairs_the_name_rule_cannot_see_are_all_absent_here present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_the_enum_divergence_that_bounds_what_agreement_can_mean present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_predicate present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_aliasinc.py test_closing_the_gap_lets_resolve_key_answer_where_it_used_to_raise present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _ALIAS_EXPANSION present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_the_shim_agrees_with_upstream_over_the_full_key_by_alias_cross_product present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_an_undefined_alias_raises_while_an_undefined_key_answers_false present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_exactly_six_aliases_expand_beyond_themselves present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_the_six_value_alias_pairs_the_name_rule_cannot_see_are_all_absent_here present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_the_enum_divergence_that_bounds_what_agreement_can_mean present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_predicate present -->
+<!-- DOCWATCH: symbol-in-file tests/bindings/test_aliasinc.py test_closing_the_gap_lets_resolve_key_answer_where_it_used_to_raise present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _ALIAS_EXPANSION present -->

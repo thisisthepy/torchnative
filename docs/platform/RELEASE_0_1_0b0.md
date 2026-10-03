@@ -115,7 +115,7 @@ float32 accumulation over depth. §3 of `AGREE.md` is a ranking of depth, not of
 | **float8 (E4M3) computes what upstream computes** | Across the 23 op rows that previously hung or refused, without forking candle |
 | **A verifiable WASM/Pyodide wheel** | `PyEmscriptenTarget` and a checker for it; the ABI trap is closed structurally rather than by convention |
 | **`from_pretrained(dtype=torch.int8)`** | Beside a `TorchnativeConfig`, widens to float32 and *discloses* rather than raising |
-| **Landed after this note was first drafted** | `torch.fft.fftn` and **complex tensors** (`complex64` arithmetic, `.real`/`.imag`); `as_strided` as a read-only view and `TensorBase.unfold` beside it; `lstm`; per-axis convolution padding; `torch.multinomial(Tensor, Tensor)`'s argument form. Each is checked against upstream on this host by `tools/ci/verify_published.py`'s new `signal_and_complex` section, where all four agree **exactly** — `fftn` of an impulse, `[1,2,3,4]`'s transform real and imaginary, `(2i)^2 = -4`, a non-descending `as_strided`, and a two-step `LSTM` — so those are identities on a new platform rather than tolerances (`docs/kernels/FFT.md`, `docs/kernels/STRIDED.md`, `docs/kernels/RNN.md`, `docs/kernels/COMPLEX.md`, `docs/kernels/LAST7.md`, `docs/bindings/BIND5.md`) |
+| **Landed after this note was first drafted** | `torch.fft.fftn` and **complex tensors** (`complex64` arithmetic, `.real`/`.imag`); `as_strided` as a read-only view and `TensorBase.unfold` beside it; `lstm`; per-axis convolution padding; `torch.multinomial(Tensor, Tensor)`'s argument form. Each is checked against upstream on this host by `.github/scripts/verify_published.py`'s new `signal_and_complex` section, where all four agree **exactly** — `fftn` of an impulse, `[1,2,3,4]`'s transform real and imaginary, `(2i)^2 = -4`, a non-descending `as_strided`, and a two-step `LSTM` — so those are identities on a new platform rather than tolerances (`docs/kernels/FFT.md`, `docs/kernels/STRIDED.md`, `docs/kernels/RNN.md`, `docs/kernels/COMPLEX.md`, `docs/kernels/LAST7.md`, `docs/bindings/BIND5.md`) |
 
 Counted at the tip of this branch on the day of the build rather than on the
 day the note was drafted, which is why they are higher than the paragraph they
@@ -367,14 +367,14 @@ would otherwise count these as features.
 
 Do not read a platform as verified unless it is listed here. And a wheel
 that *built* is not a platform that works: all seven wheels for this
-release build and pass `tools/wheel/verify_cross.py`, which is a claim about
+release build and pass `scripts/wheel/verify_cross.py`, which is a claim about
 tags, binaries and symbol resolution. `computes` is a separate claim and is
 made below only where something ran.
 
 | | |
 |---|---|
-| macOS arm64 | the machine everything above was measured on. The `macosx_11_0_arm64` wheel installs into a clean venv and its torch computes (`tools/wheel/verify.py` PASS) |
-| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to, which is `0.0.12a0`. `tools/ci/verify_published.py` carries a `loss.backward()` training step, three operator checks, and now a `signal_and_complex` section for `torch.fft.fftn`, complex tensors, `as_strided` and `lstm` — each skipping **by name** on an older wheel. **None of those have run green on Linux or Windows**, because the wheel they check is this one and it is not uploaded; they skip themselves, and a skip is not a platform result. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a **symbol-level** claim, as `verify_cross.py` says of itself, and not a run |
+| macOS arm64 | the machine everything above was measured on. The `macosx_11_0_arm64` wheel installs into a clean venv and its torch computes (`scripts/wheel/verify.py` PASS) |
+| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to, which is `0.0.12a0`. `.github/scripts/verify_published.py` carries a `loss.backward()` training step, three operator checks, and now a `signal_and_complex` section for `torch.fft.fftn`, complex tensors, `as_strided` and `lstm` — each skipping **by name** on an older wheel. **None of those have run green on Linux or Windows**, because the wheel they check is this one and it is not uploaded; they skip themselves, and a skip is not a platform result. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a **symbol-level** claim, as `verify_cross.py` says of itself, and not a run |
 | iOS simulator arm64 | **computes on this machine, and CI is now green.** An earlier simulator wheel (built while this release was still numbered `0.0.13a0`) was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops); that has **not** been re-run against the wheel rebuilt for §7 below. The CI leg was the separate question and it is answered: the `setuptools<81` pin landed, was pushed, and **run 34038982934 is green on all three legs** — `linux-x86_64` 43s, `windows-amd64` 1m38s, `ios-simulator-arm64` 5m5s. That run installs the **published `0.0.12a0`** wheel, which is what the workflow's default says and what it should say until an upload happens; it is a green result for the iOS staging harness and for the checks that predate 0.0.13a0, and not for the ones that skip themselves by name |
 | iOS device | never executed, on any release. The `ios_12_0_arm64_iphoneos` wheel builds and passes `verify_cross.py`; nothing has imported it |
 | Android arm64 | emulator and device runs exist for earlier releases; **not re-run for this one**. The `android_21_arm64_v8a` wheel builds and passes `verify_cross.py` |
@@ -389,7 +389,7 @@ This document and the version bump are prepared; **nothing has been published.**
 ### 7.1 The seven wheels, rebuilt at this head
 
 All seven were built again from this checkout after `cargo build --release` and
-`vendor/install_shim.sh`, one target at a time with `rm -rf build` between them —
+`scripts/vendor/install_shim.sh`, one target at a time with `rm -rf build` between them —
 `build.py` refuses while a `build/` cache from a previous target is present. The Linux leg
 needs `/Volumes/macMini/caches/zig-venv/bin` on `PATH` (`cargo zigbuild`), the Windows leg
 `/Volumes/macMini/caches/msvc-shims` (`cargo xwin`), and the WASM leg an `EM_CACHE` pointed
@@ -422,8 +422,8 @@ agents building concurrently.
 1. ~~Build the wheels~~ **done** — §7.1.
 2. Upload. The token is not in this worktree and was not read here.
 3. **Then** bump two things that must not lead the upload, and which two tests in
-   `rust/torch_c/pytests/test_release.py` hold to that rule:
-   `.github/workflows/verify-published-wheel.yml`'s default version, and the README platform
+   `tests/release/test_release.py` hold to that rule:
+   `.github/workflows/test-published-wheel.yml`'s default version, and the README platform
    table's **on PyPI `…`** row, both to `0.0.13a0`. **Both still read `0.0.12a0`, and that is
    correct** — CI installs *from PyPI*, so defaulting it to an unpublished version makes every
    push a red run that says nothing about any platform, and a red CI that is expected to be red

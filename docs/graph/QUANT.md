@@ -81,13 +81,13 @@ mm1024/f32  1.9132 / 1.7276  10.7%  <-   add1024/f32  0.1268 / 0.1137 11.5%  <-
 **검증된 기준선** (이 측정을 시작한 트리 상태, 전부 exit 0):
 
 ```
-sh rust/torch_c/pytests/run.sh        171 통과, 실패 0
-tools/golden/compare.py               2744/2744, 실패 0, ops covered=118
-rust/torch_c/pytests/verify_schemas.py 3076/3076
+sh tests/run.sh        171 통과, 실패 0
+tests/golden/compare.py               2744/2744, 실패 0, ops covered=118
+tests/_support/verify_schemas.py 3076/3076
 git status --short                    (비어 있음)
 ```
 
-> **함정 하나 기록.** `vendor/install_shim.sh` 와 `pytests/run.sh` 는 `cargo` 를 부르는데,
+> **함정 하나 기록.** `scripts/vendor/install_shim.sh` 와 `tests/run.sh` 는 `cargo` 를 부르는데,
 > `PATH` 에 `~/.cargo/bin` 이 없으면 **exit 127 로 죽고 낡은 산출물이 남습니다.** 이번에 두 번
 > 걸렸습니다. 파이프로 종료 코드를 읽었다면 성공으로 보였을 것입니다.
 
@@ -103,7 +103,7 @@ git status --short                    (비어 있음)
 |---|---|
 | **저장 가능 (9)** | `float32` · `float64` · `float16` · `bfloat16` · `int16` · `int32` · `int64` · `uint8` · `bool` |
 | **거부 (39)** | `int8` · `qint8` · `quint8` · `quint4x2` · `quint2x4` · `qint32` · `uint16` · `uint64` · `complex*` (3) · `float8_*` (4) · `float4_e2m1fn_x2` · `bits*` (5) · sub-byte `int1..7`/`uint1..7` (14) |
-| **미측정 (1)** | `float8_e4m3fn` — 독립 프로브에서 **무한 대기**하는 것이 이미 알려져 있어 건너뛰었습니다 (`tools/golden/dtypes.py` 의 기록) |
+| **미측정 (1)** | `float8_e4m3fn` — 독립 프로브에서 **무한 대기**하는 것이 이미 알려져 있어 건너뛰었습니다 (`tests/golden/dtypes.py` 의 기록) |
 
 거부는 전부 같은 한 줄입니다:
 
@@ -499,11 +499,11 @@ candle `QMatMul` 출력을 f32 `matmul` 과 대조 (**무작위 가우시안 가
 ```sh
 export PATH="$HOME/.cargo/bin:$HOME/Library/Android/sdk/platform-tools:$PATH"
 cd /Volumes/macMini/worktrees/bw-quant
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-quant
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh                       # PATH 에 cargo 가 있어야 함 -- §1 의 함정
+bash scripts/vendor/install_shim.sh                       # PATH 에 cargo 가 있어야 함 -- §1 의 함정
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 ```
 
@@ -519,13 +519,13 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 ```sh
 # §3  호스트 dtype 스윕
-RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
+RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     $PY /Volumes/macMini/caches/quant-scratch/bench.py ours
 OMP_NUM_THREADS=1 $PY /Volumes/macMini/caches/quant-scratch/bench.py upstream   # PYTHONPATH 없이
 
 # §3.4  accelerate 끈 빌드 (환경변수 RUSTFLAGS 로 주지 말 것 -- PERF_ANDROID.md §7.2)
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-quant-noaccel \
-  ( cd rust/torch_c && cargo build --release \
+  ( cd torchnative/rust/torch_c && cargo build --release \
       --config 'target."cfg(target_vendor = \"apple\")".rustflags = ["--cfg", "torch_c_no_accelerate"]' )
 # 산출물 교체는 cp 로 백업하고 cp 로 복구합니다 -- `git checkout --` 금지
 
@@ -550,9 +550,9 @@ adb shell "cd /data/local/tmp/bw_device/qbench && RAYON_NUM_THREADS=1 ./qbench_n
 회귀 (전부 exit 0, 이 문서를 쓰는 동안 변하지 않았습니다):
 
 ```sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 171
-$PY tools/golden/compare.py                        # 2744/2744 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py         # 3076/3076
+PYTHON=$PY sh tests/run.sh          # 171
+$PY tests/golden/compare.py                        # 2744/2744 ops=118
+$PY tests/_support/verify_schemas.py         # 3076/3076
 ```
 
 ---

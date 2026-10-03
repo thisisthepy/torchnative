@@ -9,8 +9,8 @@
   **무엇이 부족한지 네 가지를 이름으로** 적었습니다.
 - **꺼져 있을 때 얼마인가.** §7. 그리고 그 측정이 오염된 조건에서 났다는 것도 §7 에 있습니다.
 
-구현은 `rust/torch_c/src/capture.rs`, 훅은 `aten.rs` 의 `aten_dispatch` 끝 한 줄,
-테스트는 `rust/torch_c/pytests/test_shim.py` 의 capture 절(22 개)과 `capture.rs` 의 단위 테스트 2 개입니다.
+구현은 `torchnative/rust/torch_c/src/capture.rs`, 훅은 `aten.rs` 의 `aten_dispatch` 끝 한 줄,
+테스트는 `tests/_support/test_shim.py` 의 capture 절(22 개)과 `capture.rs` 의 단위 테스트 2 개입니다.
 
 ---
 
@@ -302,9 +302,9 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 | 검사 | 결과 |
 |---|---|
 | `cargo build --release` | 0 |
-| `PYTHON=... sh rust/torch_c/pytests/run.sh` | 0 — **113/113 통과** (capture 22 개 포함) |
-| `python tools/golden/compare.py` | 0 — **2268/2268**, ops=97, KNOWN DIVERGENCE 0 |
-| `python rust/torch_c/pytests/verify_schemas.py` | 0 — **233/233** |
+| `PYTHON=... sh tests/run.sh` | 0 — **113/113 통과** (capture 22 개 포함) |
+| `python tests/golden/compare.py` | 0 — **2268/2268**, ops=97, KNOWN DIVERGENCE 0 |
+| `python tests/_support/verify_schemas.py` | 0 — **233/233** |
 
 ### 테스트가 실패할 수 있는지 확인했다
 
@@ -325,8 +325,8 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 
 | | 무엇을 읽나 |
 |---|---|
-| `pytests/run.sh` | 빌드해서 `$TMPDIR` 에 스테이징한 것 |
-| 벤더 트리 도로 테스트 (서브프로세스) | `torchnative/src/main/torch/_C.abi3.so` — **`install_shim.sh` 만 갱신한다** |
+| `tests/run.sh` | 빌드해서 `$TMPDIR` 에 스테이징한 것 |
+| 벤더 트리 도로 테스트 (서브프로세스) | `torchnative/python/torch/_C.abi3.so` — **`install_shim.sh` 만 갱신한다** |
 
 즉 `run.sh` 를 단독으로 돌리면 도로 테스트(capture · checkpoint · device · meta 넷 다)는
 **직전에 설치된 산출물**을 재고, 방금 빌드한 것을 재지 않습니다. `install_shim.sh` 를 먼저
@@ -334,7 +334,7 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 
 **이 자리에서는 "발견"으로 적혔지만, 검증 하네스 자체의 결함이었습니다.** `run.sh` 를 단독으로
 돌리는 것이 일반적인 사용법인데, 그 경로에서는 도로 테스트 넷이 항상 낡은 산출물을 재고 있었고
-아무것도 그것을 알려주지 않았습니다 — 재현: `rust/torch_c/src/tensor.rs` 의 `gather_strided`
+아무것도 그것을 알려주지 않았습니다 — 재현: `torchnative/rust/torch_c/src/tensor.rs` 의 `gather_strided`
 (`set_` 이 strided 뷰를 읽는 함수, `torch.load` 의 모든 텐서가 지나갑니다) 의 순회 순서를
 뒤집는 탬퍼는 `test_ckpt_*` 넷을 확실히 빨갛게 만들지만(고친 뒤 `install_shim.sh` 로 확인),
 **고치기 전에는 `run.sh` 단독 실행이 113/113 을 그대로 보고했습니다.** `set_` 은 어떤 단독(bare
@@ -373,7 +373,7 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 | **구간 자동 선택** | 없음. `begin`/`end` 를 사람이 부른다. 진짜 델리게이트는 "어디부터 어디까지" 를 스스로 정해야 하고, 그 정책은 아직 없다 |
 | **트레이스 직렬화** | 없음. 프로세스 밖으로 못 나간다. `.pte` 로 가려면 필요하다 |
 | **가드 캐시** | 없음. 같은 형태가 다시 들어와도 자동으로 재사용되지 않는다. 재사용은 호출자가 `replay` 를 부르는 것뿐 |
-| 분해 패스 (→ Core ATen) | **생겼다 — 부분적으로만 닿는다.** `torchnative.export.decompose`. 트레이스에 나타날 수 있는 non-core op 37 개 중 9 개를 낮추고, 나머지는 전부 이름과 원인을 대고 거절한다. 이 §5-1 이 지목한 `aten.t.default` 는 **이제 그 안에 있고**, §5-1 의 예제 모듈은 5 노드 전부가 Core ATen 으로 내려간다. docs/graph/DECOMP.md — **37/9 는 그 문서가 쓰인 시점의 수. 그 뒤 두 번 더 낡았다(문서 감사 재측정 45/11, 이후 KERNELS26 라운드로 50/12) — 고정된 숫자를 여기 세 번째로 베끼는 대신 docs/graph/DECOMP.md §0 의 correction 을 보고, `tools/docwatch/check_docs.py` 가 `ge` 로 지키게 둔다:** `<!-- DOCWATCH: count decomp_population ge 50 -->` `<!-- DOCWATCH: count decomp_lowered ge 12 -->` |
+| 분해 패스 (→ Core ATen) | **생겼다 — 부분적으로만 닿는다.** `torchnative.export.decompose`. 트레이스에 나타날 수 있는 non-core op 37 개 중 9 개를 낮추고, 나머지는 전부 이름과 원인을 대고 거절한다. 이 §5-1 이 지목한 `aten.t.default` 는 **이제 그 안에 있고**, §5-1 의 예제 모듈은 5 노드 전부가 Core ATen 으로 내려간다. docs/graph/DECOMP.md — **37/9 는 그 문서가 쓰인 시점의 수. 그 뒤 두 번 더 낡았다(문서 감사 재측정 45/11, 이후 KERNELS26 라운드로 50/12) — 고정된 숫자를 여기 세 번째로 베끼는 대신 docs/graph/DECOMP.md §0 의 correction 을 보고, `tests/docwatch/check_docs.py` 가 `ge` 로 지키게 둔다:** `<!-- DOCWATCH: count decomp_population ge 50 -->` `<!-- DOCWATCH: count decomp_lowered ge 12 -->` |
 | stride / dim order | 없음 (§5-2). 이 층 밖 |
 | 파라미터 FQN | 없음 (§5-3) |
 | **멀티스레드** | 플래그는 전역, 레코더는 스레드 로컬. 스레드 A 가 기록 중일 때 스레드 B 의 op 은 **오염 없이 그냥 기록되지 않는다.** 단일 스레드에서만 검증했고, 다중 스레드 프로그램에서는 조용히 불완전한 트레이스가 나올 수 있다 |
@@ -436,8 +436,8 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 바뀝니다), 호출자가 시드를 관리하거나. 어느 쪽도 이 라운드가 택하지 않았고, 성질만 테스트로
 못박아 두었습니다: `test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs RANDOM present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs RANDOM present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
 
 ---
 
@@ -478,15 +478,15 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-capture
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-bash vendor/vendor_torch.sh          # 새 worktree 만
-PYTHON=$PY bash vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh          # 새 worktree 만
+PYTHON=$PY bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 # install_shim.sh 를 반드시 먼저. 도로 테스트는 벤더 트리의 산출물을 읽는다 (§8) --
 # 건너뛰어도 run.sh 가 낡음을 감지해 이름을 대고 거절한다 (§8, 고쳐짐)
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     # capture 22 개 포함
-$PY tools/golden/compare.py                   # 벤더 트리를 PYTHONPATH 에 넣지 말 것
-$PY rust/torch_c/pytests/verify_schemas.py
+PYTHON=$PY sh tests/run.sh     # capture 22 개 포함
+$PY tests/golden/compare.py                   # 벤더 트리를 PYTHONPATH 에 넣지 말 것
+$PY tests/_support/verify_schemas.py
 ```
 
 §5-1 의 Core ATen 실측:

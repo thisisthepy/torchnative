@@ -1,12 +1,12 @@
 # NPU — serialising a captured graph for NNAPI and CoreML
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi.py to_jit_module present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi.py parse_model present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi.py verify_shapes present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/nnapi.py fold_constants present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py to_mil_program present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compile_model present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py coreml_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py to_jit_module present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py parse_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py verify_shapes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py fold_constants present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py to_mil_program present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py coreml_ops present -->
 
 ## 1. The question this round had to answer first — and the answer is *both*
 
@@ -280,11 +280,11 @@ being appended to this one.
     export TORCH_C_STAGE=/tmp/stage-npu
     PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-    cd rust/torch_c && cargo build --release && cd -
-    bash vendor/install_shim.sh
-    PYTHON=$PY sh rust/torch_c/pytests/run.sh
+    cd torchnative/rust/torch_c && cargo build --release && cd -
+    bash scripts/vendor/install_shim.sh
+    PYTHON=$PY sh tests/run.sh
 
-The eleven tests this document is about are in `rust/torch_c/pytests/test_shim.py`
+The eleven tests this document is about are in `tests/_support/test_shim.py`
 and all begin `test_upstreams_nnapi_`, `test_the_serialiser`, `test_a_conv_relu`,
 `test_serialised_shapes`, `test_constant_folding`, `test_an_op_with_no_`,
 `test_the_blob_decoder`, `test_what_serialises`, `test_coreml`. They skip rather

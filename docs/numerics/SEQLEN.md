@@ -204,7 +204,7 @@ SmolLM2-135M has 30 layers, so that runs **61 times per forward**
 
 ### 2.2 What the code does
 
-`rust/torch_c/src/aten.rs`, `pow_tensor_scalar` → `side_from_tensor` →
+`torchnative/rust/torch_c/src/aten.rs`, `pow_tensor_scalar` → `side_from_tensor` →
 `pow_from_pairs`. For a `float32` tensor and any scalar exponent it makes
 **six full passes over the data**:
 
@@ -269,7 +269,7 @@ What this does **not** explain is the quadratic term — 14.9 ms at `S=128`,
 
 ## 3. The fix — square by multiplying
 
-One function in `rust/torch_c/src/aten.rs`, `pow_square_fast_path`, taken before
+One function in `torchnative/rust/torch_c/src/aten.rs`, `pow_square_fast_path`, taken before
 `pow_tensor_scalar` falls into the generic path:
 
 ```rust
@@ -537,7 +537,7 @@ leaf.**
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-f32len
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 ```
 
 Harnesses live in `/Volumes/macMini/caches/f32len-scratch/`:
@@ -554,11 +554,11 @@ Harnesses live in `/Volumes/macMini/caches/f32len-scratch/`:
 Gates as they stood at the end of §3 (§7.11 has the current ones):
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh      242          (unchanged)
-$PY tools/golden/compare.py                    3302/3302 ops=133, pending 2
-$PY tools/golden/compare.py --self-test        PASS 13 comparators x 11 fault modes
-$PY rust/torch_c/pytests/verify_schemas.py     4331/4331
-( cd rust/torch_c && cargo test --release )    13           (was 10, +3)
+PYTHON=$PY sh tests/run.sh      242          (unchanged)
+$PY tests/golden/compare.py                    3302/3302 ops=133, pending 2
+$PY tests/golden/compare.py --self-test        PASS 13 comparators x 11 fault modes
+$PY tests/_support/verify_schemas.py     4331/4331
+( cd torchnative/rust/torch_c && cargo test --release )    13           (was 10, +3)
 ```
 
 §7's harnesses are in `/Volumes/macMini/caches/amax-scratch/`, with
@@ -945,17 +945,17 @@ Neither is needed for the SDPA path, which calls the kernel directly in Rust.
 > `test_amax_now_has_both_python_spellings_and_they_reach_the_kernel`.
 >
 > Standing check (docs/verification/DOCWATCH.md):
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json amax present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json amax present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json amax present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json amax present -->
 > <!-- DOCWATCH: op-implemented aten.amax.default -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
+> <!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_amax_now_has_both_python_spellings_and_they_reach_the_kernel present -->
 
 ### 7.11 Counts
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 242 | **246** (+4: row width at 512, NaN from five positions, all-`-inf`, the missing spelling) |
-| `tools/golden/compare.py` | 3302/3302, ops=133 | **3422/3422, ops=134** (+120 cases, pending 2 unchanged) |
+| `tests/run.sh` | 242 | **246** (+4: row width at 512, NaN from five positions, all-`-inf`, the missing spelling) |
+| `tests/golden/compare.py` | 3302/3302, ops=133 | **3422/3422, ops=134** (+120 cases, pending 2 unchanged) |
 | `compare.py --self-test` | PASS | PASS, 13 comparators × 11 fault modes |
 | `verify_schemas.py` | 4331/4331 | **4334/4334** (+3: `amax`'s schema text, its `OpOverload.tags`, its packet) |
 | `cargo test --release` | 13 | **18** (+5) |
@@ -1098,7 +1098,7 @@ compiles to the same instructions. Reading that as "the model calls
 
 ### 8.3 The change — scale and mask in one pass
 
-`rust/torch_c/src/tensor.rs::scale_and_causal_mask`, a `CustomOp1` reached from
+`torchnative/rust/torch_c/src/tensor.rs::scale_and_causal_mask`, a `CustomOp1` reached from
 one place. Three stages of §8.2 become one:
 
 ```rust
@@ -1315,8 +1315,8 @@ measured, 0.5%**.
 
 | gate | before | after |
 |---|---:|---:|
-| `pytests/run.sh` | 261 | **261** (unchanged — no new Python-visible op) |
-| `tools/golden/compare.py` | 4284/4284, ops=139 | **4290/4290, ops=139** (+6 cases, pending 1 unchanged) |
+| `tests/run.sh` | 261 | **261** (unchanged — no new Python-visible op) |
+| `tests/golden/compare.py` | 4284/4284, ops=139 | **4290/4290, ops=139** (+6 cases, pending 1 unchanged) |
 | `compare.py --self-test` | PASS | PASS, 13 comparators x 11 fault modes |
 | `verify_schemas.py` | 4353/4353 | **4353/4353** (unchanged) |
 | `cargo test --release` | 18 | **24** (+6) |
@@ -1438,7 +1438,7 @@ than 1.288, so the excess on it is ~+0.03 rather than +1.15):
   > reading 0.995–1.019 and a sabotage that moves every one of them.
   >
   > Standing check (docs/verification/DOCWATCH.md):
-  > <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs transposed_contiguous present -->
+  > <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs transposed_contiguous present -->
 - The last row is the change this round made, and it is now **faster than
   upstream's three separate ops** for the same work.
 

@@ -174,29 +174,29 @@ cython_debug/
 .pypirc
 
 # Rust: build output lives in CARGO_TARGET_DIR on the external volume
-/rust/*/target/
+/torchnative/rust/*/target/
 
 # Vendored upstream trees (docs/platform/VENDOR.md). The torch Python tree alone is
-# ~1084 modules; it is reproduced by vendor/vendor_torch.sh, never committed.
+# ~1084 modules; it is reproduced by scripts/vendor/vendor_torch.sh, never committed.
 #
-# It now lands inside the package, at torchnative/src/main/torch/, so that one
+# It now lands inside the package, at torchnative/python/torch/, so that one
 # build sees both `torch` and `torchnative` as top-level packages. That
 # directory therefore holds two kinds of file: upstream's, ignored here, and our
 # add-hook, which is tracked -- hence the negations rather than a blanket rule.
-/torchnative/src/main/torch/*
-!/torchnative/src/main/torch/README.md
-!/torchnative/src/main/torch/nn/
-/torchnative/src/main/torch/nn/*
-!/torchnative/src/main/torch/nn/federated.py
-/torchnative/src/main/torch-*.dist-info/
-/torchnative/src/main/.stamp
+/torchnative/python/torch/*
+!/torchnative/python/torch/README.md
+!/torchnative/python/torch/nn/
+/torchnative/python/torch/nn/*
+!/torchnative/python/torch/nn/federated.py
+/torchnative/python/torch-*.dist-info/
+/torchnative/python/.stamp
 # The torch distribution installs three top-level packages, not one (its own
 # top_level.txt names them), and the wheel needs all three -- `import torch`
 # reaches `import torchgen` by way of `torch/utils/_python_dispatch.py`.
 # Nothing of ours lives in these two, so they are blanket-ignored rather than
 # negated the way `torch/` above has to be.
-/torchnative/src/main/torchgen/
-/torchnative/src/main/functorch/
+/torchnative/python/torchgen/
+/torchnative/python/functorch/
 /vendor/probe/
 
 # The tree used to land in /vendor. Kept ignored so a checkout made before the
@@ -212,19 +212,16 @@ cython_debug/
 # subagent worktrees live inside the repo
 .worktrees/
 
-# tests/ holds the VOICE4 (BigVGAN) fixtures. The scripts are tracked; the
-# assets are not -- model weights, the HF cache, vendored third-party source
-# and generated reference output are large and reproducible from the scripts.
-tests/*
-!tests/*.py
-!tests/*.sh
-!tests/README.md
+# The VOICE4 (BigVGAN) assets that tests/models/test_voice4.py reads when
+# TORCH_C_VOICE4_ASSETS points here: model weights, the HF cache, vendored
+# third-party source and generated reference output. Large, not ours to
+# redistribute, and never tracked. The scripts that produced them were removed
+# in the layout change (#43); tag `archive/pre-restructure` keeps them.
+/tests/fixtures/voice4/
 
 # workspace caches (spike-venv, hf, gradle, konan, cargo targets)
 .caches/
 
-# ephemeral logs and scripts of the coordinating session
+# temporary files: agents' scratch, gate logs, the coordinating session's
+# scripts (AGENTS.md rule 2). Delete what you put here when done.
 .scratch/
-
-# agent temporary files (AGENTS.md rule 2); delete when done
-.tmp/

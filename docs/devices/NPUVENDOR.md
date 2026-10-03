@@ -1,14 +1,14 @@
 # NPUVENDOR — the operating system is not the silicon vendor
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NPU_CANDIDATES present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py npu_candidates present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_pcivendor.py npu_vendor_report present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NPU_CANDIDATES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py npu_candidates present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py npu_vendor_report present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
 
-`torchnative/src/main/torchnative/device/__init__.py`,
-`torchnative/src/main/torchnative/device/_pcivendor.py`.
-Tests: `rust/torch_c/pytests/test_npuvendor.py`, `rust/torch_c/pytests/test_devicens.py`.
-Hardware script for the one machine that can settle this: `tools/devices/npuvendor_verify.py`.
+`torchnative/python/torchnative/device/__init__.py`,
+`torchnative/python/torchnative/device/_pcivendor.py`.
+Tests: `tests/devices/npu/test_npuvendor.py`, `tests/devices/test_devicens.py`.
+Hardware script for the one machine that can settle this: `scripts/devices/npuvendor_verify.py`.
 
 ## 0. The defect
 
@@ -246,7 +246,7 @@ ever executed.** Precisely:
   process.** The code is written to name an `OSError` here rather than return an
   empty list, so a permission failure is reported as "could not look" — but
   whether it *is* a permission failure on a stock Windows 11 install is unknown
-  here. *Settled by:* running `tools/devices/npuvendor_verify.py` on any Windows
+  here. *Settled by:* running `scripts/devices/npuvendor_verify.py` on any Windows
   machine, elevated and not.
 * **That an Intel NPU actually appears under that key with `VEN_8086&DEV_7D1D`
   (or a sibling), and that its `CompatibleIDs` really contains `CC_1200`.** The

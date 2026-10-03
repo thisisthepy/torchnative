@@ -203,7 +203,7 @@ become false under W4, so if that path ever opens it belongs in this argument.
 
 ### 2.3 What this repo's suite depends on
 
-One assertion, and it is deliberate. `rust/torch_c/pytests/test_shim.py:405`, inside
+One assertion, and it is deliberate. `tests/_support/test_shim.py:405`, inside
 `test_the_autograd_boundary_is_where_autograd_md_says_it_is`:
 
 ```python
@@ -345,9 +345,9 @@ inverting it is the right response. That is the same convention
 `test_the_autograd_boundary_is_where_autograd_md_says_it_is` uses and the reason that test survived
 `docs/training/BACKWARD.md` landing a backward.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_backward_seed_is_absent_and_nothing_guesses_a_one present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_autograd_shape present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs reachable present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_backward_seed_is_absent_and_nothing_guesses_a_one present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_autograd_shape present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs reachable present -->
 
 ### 5.2 The docstring
 
@@ -460,13 +460,13 @@ try is what decides.
 Both pass on the final artefact, and the two controls with them.
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     344 ok, 0 FAIL          (343 before; +1 test, none inverted, none removed)
     SELF-TEST: PASS -- 20 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
     DOCWATCH: PASS -- 260/260 evaluated marker(s) hold        (257 before; +3, all here)
     EXIT=0
 
-$PY tools/golden/compare.py
+$PY tests/golden/compare.py
     SUMMARY: 7763/7763 cases passed, 0 failed, ops covered=168, pending case builders=1
     EXIT=0
 ```

@@ -120,7 +120,7 @@ generate with Qwen3-4B at all**; if you have that version, this replaces it.
   compiler names is `VPU_DIMENSION_LIMIT = 8192`, which it tiles past
   rather than refusing. **The real ceiling is still unmeasured** — no
   dimension above 8192 has been compiled for `NPU` here — so the
-  constant is unchanged and `tools/devices/intelnpu_dimsweep.py` is the
+  constant is unchanged and `scripts/devices/intelnpu_dimsweep.py` is the
   experiment that would settle it.
 
 - **Qualcomm and Apple remain refusals.** `torch.compile` remains a
@@ -163,11 +163,11 @@ against the **published** artefacts in `dist/torchnative-0.1.0b3-*` — not a
 fresh build — because the question is what a user gets.
 
 Read the grades strictly. *builds* means the artefact exists and
-`tools/wheel/verify_cross.py` accepts its tag and contents; that is a claim
+`scripts/wheel/verify_cross.py` accepts its tag and contents; that is a claim
 about tags, binaries and symbol resolution and nothing else. *reaches* means
 an interpreter **for that platform** unpacked the wheel into its own
 site-packages, imported torch, and `torch.__file__` came back out of that
-site-packages — the judgement every runtime harness in `tools/wheel/` makes,
+site-packages — the judgement every runtime harness in `scripts/wheel/` makes,
 and the one that stops a run from silently measuring some other torch.
 *agrees* would mean outputs compared against a reference, and **no row below
 earns it**: the runtime harnesses check `aten.mm.default` against a fixed
@@ -198,7 +198,7 @@ dead end, and the specific reason it is not is worth writing down, because
 * macOS also ships **Safari**, and a browser is the environment Pyodide is
   primarily built for.
 
-So `tools/wheel/verify_wasm_browser.py` stages the wheel on the host — reusing
+So `scripts/wheel/verify_wasm_browser.py` stages the wheel on the host — reusing
 `verify_android.py`'s `unpack` and `stage_dependencies` unchanged, so the
 definition of "installed" cannot drift between the three runtime harnesses —
 tars the staged tree, serves it over loopback with the local Pyodide
@@ -228,26 +228,26 @@ Two things this arrangement does not carry, stated rather than papered over:
 D=dist; P=/Volumes/macMini/caches/spike-venv/bin/python
 
 # macOS arm64 -- reaches network for the dependency resolve
-$P tools/wheel/verify.py $D/torchnative-0.1.0b3-cp313-abi3-macosx_11_0_arm64.whl
+$P scripts/wheel/verify.py $D/torchnative-0.1.0b3-cp313-abi3-macosx_11_0_arm64.whl
 
 # iOS simulator -- boots and shuts down a simulator itself
-$P tools/wheel/verify_ios_sim.py     $D/torchnative-0.1.0b3-cp313-abi3-ios_14_0_arm64_iphonesimulator.whl
+$P scripts/wheel/verify_ios_sim.py     $D/torchnative-0.1.0b3-cp313-abi3-ios_14_0_arm64_iphonesimulator.whl
 
 # Android -- start the AVD yourself, on a port nothing else is using
 ~/Library/Android/sdk/emulator/emulator -avd pmp_api26 -port 5560     -no-window -no-audio -no-snapshot -gpu swiftshader_indirect &
-ANDROID_SERIAL=emulator-5560 $P tools/wheel/verify_android.py     $D/torchnative-0.1.0b3-cp313-abi3-android_21_arm64_v8a.whl
+ANDROID_SERIAL=emulator-5560 $P scripts/wheel/verify_android.py     $D/torchnative-0.1.0b3-cp313-abi3-android_21_arm64_v8a.whl
 adb -s emulator-5560 shell rm -rf /data/local/tmp/bw_wheel
 adb -s emulator-5560 emu kill     # only because this command started it
 
 # WASM -- opens a Safari tab; needs a logged-in GUI session
-$P tools/wheel/verify_wasm_browser.py     $D/torchnative-0.1.0b3-cp313-abi3-pyemscripten_2026_0_wasm32.whl
+$P scripts/wheel/verify_wasm_browser.py     $D/torchnative-0.1.0b3-cp313-abi3-pyemscripten_2026_0_wasm32.whl
 
 # artefact-only, no interpreter for the target on this machine
-$P tools/wheel/verify_linux.py   $D/torchnative-0.1.0b3-cp313-abi3-manylinux_2_17_x86_64.whl
-$P tools/wheel/verify_linux.py   $D/torchnative-0.1.0b3-cp313-abi3-manylinux_2_17_aarch64.whl
-$P tools/wheel/verify_windows.py $D/torchnative-0.1.0b3-cp313-abi3-win_amd64.whl
-$P tools/wheel/verify_windows.py $D/torchnative-0.1.0b3-cp313-abi3-win_arm64.whl
-$P tools/wheel/verify_ios_device.py     $D/torchnative-0.1.0b3-cp313-abi3-ios_12_0_arm64_iphoneos.whl
+$P scripts/wheel/verify_linux.py   $D/torchnative-0.1.0b3-cp313-abi3-manylinux_2_17_x86_64.whl
+$P scripts/wheel/verify_linux.py   $D/torchnative-0.1.0b3-cp313-abi3-manylinux_2_17_aarch64.whl
+$P scripts/wheel/verify_windows.py $D/torchnative-0.1.0b3-cp313-abi3-win_amd64.whl
+$P scripts/wheel/verify_windows.py $D/torchnative-0.1.0b3-cp313-abi3-win_arm64.whl
+$P scripts/wheel/verify_ios_device.py     $D/torchnative-0.1.0b3-cp313-abi3-ios_12_0_arm64_iphoneos.whl
 ```
 
 `verify_cross.py` was also run against all nine; it passes on eight and

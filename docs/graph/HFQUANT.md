@@ -85,8 +85,8 @@ from torchnative.quant import TorchnativeConfig
 m = AutoModelForCausalLM.from_pretrained(name, quantization_config=TorchnativeConfig("q8_0"))
 ```
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/quant/hf.py TorchnativeConfig present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/quant/hf.py TorchnativeHfQuantizer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/quant/hf.py TorchnativeConfig present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/quant/hf.py TorchnativeHfQuantizer present -->
 
 ---
 
@@ -141,7 +141,7 @@ _load_pretrained_model(...)             가중치가 하나씩 디스크에서 �
 
 ### 2.2 회귀로부터 지켜집니다
 
-`rust/torch_c/pytests/test_shim.py` 의
+`tests/_support/test_shim.py` 의
 `test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land` 가 68 MB 짜리
 로컬 체크포인트로 같은 세 프로세스를 돌리고, **사후 경로 대비 절감이 밀집 가중치의 40% 를
 넘을 것**을 요구합니다(실측 절감은 78%).
@@ -164,7 +164,7 @@ FAILED  a 256-block format was accepted on a 64-wide model
 (`report.swapped_before_weights`), 테스트가 그것을 요구합니다. 사후 교체는 이 값을 참으로
 만들 수 없습니다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land present -->
 
 ---
 
@@ -227,7 +227,7 @@ SmolLM2-135M 실측: **블롭 동일 210/210**, **로짓 최대차 0**, 비트 �
 대해서도 돌려 **달라야 한다**고 요구합니다. 달라질 수 없는 두 값의 비트 일치는 아무것도
 판정하지 않기 때문입니다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_quantizer_plugin_and_quantize_produce_the_same_model present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_and_quantize_produce_the_same_model present -->
 
 ---
 
@@ -286,7 +286,7 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 **양자화된 것처럼 보이는데 실은 전부 밀집인 모델**이 손에 남고 — `q4_k` + 576 조합에서는
 정확히 *전부* 입니다 — 그것이 이 저장소가 반복해서 대가를 치른 "성공처럼 읽히는 실패" 입니다.
 
-**규칙을 두 번 쓰지 않았습니다.** 블록 크기는 `rust/torch_c/src/quant.rs` 에만 있습니다.
+**규칙을 두 번 쓰지 않았습니다.** 블록 크기는 `torchnative/rust/torch_c/src/quant.rs` 에만 있습니다.
 플러그인은 후보 폭의 1×N 텐서를 **실제로 양자화해 보고** 같은 거절을 받습니다
 (`_probe_shape`). 그래서 벽이 움직이면 검사도 함께 움직이고, 이 저장소가 모르는 블록 크기를
 가진 형식이 나중에 들어와도 편집이 필요 없습니다.
@@ -313,7 +313,7 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 
 형식을 구성 시점에 검사하는 이유: 오타 하나가 **수 GB 를 내려받은 뒤에** 드러나면 안 됩니다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work present -->
 
 ---
 
@@ -344,7 +344,7 @@ _hf._register()  (두 번째)          -> 예외 없음
 경로가 둘일 수 있는 모듈에게는 곤란합니다. 그래서 `_register()` 는 모듈 수준 플래그가 아니라
 **표 자체**를 보고 건너뜁니다.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_quantizer_registers_a_name_and_changes_nothing_else present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_the_quantizer_registers_a_name_and_changes_nothing_else present -->
 
 ---
 
@@ -371,8 +371,8 @@ SmolLM2-135M 의 `config.json` 은 `bfloat16` 을 요청합니다. candle 의 `Q
 |---|---|
 | `torchnative/quant/hf.py` | **새 파일.** `TorchnativeConfig` · `TorchnativeHfQuantizer` · `_QuantizeOnLoad` · `_LoadReport` · `_register` |
 | `torchnative/quant/__init__.py` | `QuantizedLinear.pending_from_linear` · `QuantizedLinear.adopt` · `forward` 의 미착 가중치 거절 · PEP 562 `__getattr__` |
-| `rust/torch_c/pytests/test_shim.py` | 4 개 테스트 (329 → 333) |
-| `rust/torch_c/src/` | **변경 없음.** Rust 는 한 줄도 고치지 않았습니다 |
+| `tests/_support/test_shim.py` | 4 개 테스트 (329 → 333) |
+| `torchnative/rust/torch_c/src/` | **변경 없음.** Rust 는 한 줄도 고치지 않았습니다 |
 
 ### 9.1 `QuantizedLinear` 를 다시 만들지 않았습니다
 
@@ -416,8 +416,8 @@ placeholder 가 필요한 이유는 transformers 의 키 대조입니다. 적재
 이 작업 전후 모두, 전부 exit 0:
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     329 -> 333  (+4),  DOCWATCH 241 -> 248
-$PY tools/golden/compare.py                   7751/7751, ops=168   (변화 없음)
+PYTHON=$PY sh tests/run.sh     329 -> 333  (+4),  DOCWATCH 241 -> 248
+$PY tests/golden/compare.py                   7751/7751, ops=168   (변화 없음)
 ```
 
 **골든이 한 비트도 안 움직였습니다.** 이 회차는 Rust 를 건드리지 않았습니다.
@@ -433,9 +433,9 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 cd /Volumes/macMini/worktrees/bw-hfq
-bash vendor/vendor_torch.sh && bash vendor/install_shim.sh
+bash scripts/vendor/vendor_torch.sh && bash scripts/vendor/install_shim.sh
 
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY <스크립트>
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY <스크립트>
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/hfq-scratch/` 에 있습니다:

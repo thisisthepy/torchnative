@@ -327,10 +327,10 @@ added and the nullification re-run against it.
 
 ```sh
 PATH="$HOME/.cargo/bin:$PATH" PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
-    bash rust/torch_c/pytests/run.sh
+    bash tests/run.sh
 ```
 
-`rust/torch_c/pytests/test_collect2.py` runs three process groups at each of
+`tests/distributed/test_collect2.py` runs three process groups at each of
 world 3 and world 4 — the shim, upstream gloo in float32, and upstream gloo in
 float64 — on an **ephemeral port bound and released by the parent**, never a
 fixed one. Several rounds of this repository share this machine, and a fixed
@@ -352,22 +352,22 @@ Its `reduce_scatter_tensor` shape check is a C++ `Check failed:` that calls
 raising anything Python can catch, and `send` with no matching `recv` blocks
 until the harness times out.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _reduce_fold present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _reduce_kind present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _reduce_scatter_fold present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _pick_fold present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _check_root_n present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _extremum present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _require_sum absent -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_every_collective_matches_upstream_gloo_at_world_three_and_four present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_tolerance_is_derived_from_upstream_and_is_not_a_free_parameter present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_product_fold_is_in_ascending_rank_order_and_says_so present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_barrier_actually_blocks_rather_than_reporting_that_it_did present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_collectives_that_used_to_return_their_own_input_no_longer_do present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_all_to_all_single_refuses_uneven_splits_by_name present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_point_to_point_still_refuses_by_name_and_was_not_weakened present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_kind present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_scatter_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _pick_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _check_root_n present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _extremum present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _require_sum absent -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_every_collective_matches_upstream_gloo_at_world_three_and_four present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_the_tolerance_is_derived_from_upstream_and_is_not_a_free_parameter present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_the_product_fold_is_in_ascending_rank_order_and_says_so present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_barrier_actually_blocks_rather_than_reporting_that_it_did present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_the_collectives_that_used_to_return_their_own_input_no_longer_do present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_all_to_all_single_refuses_uneven_splits_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/distributed/test_collect2.py test_point_to_point_still_refuses_by_name_and_was_not_weakened present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 
 ---
@@ -449,5 +449,5 @@ retry, widens a timeout, or lets a hang pass.
 | **defect fixed** | `_c2_spawn` deadlocked on a rank that wrote more than 64 KiB, producing the same timeout message a genuine hang produces |
 | **defect fixed** | a timeout named rank 0 whichever rank wedged, and killed the other ranks' output unread |
 | **defect fixed** | `timeout` was a per-rank budget, so a spawn's real limit was `world x timeout` |
-| **tests added** | 2, in `rust/torch_c/pytests/test_collect2.py` |
+| **tests added** | 2, in `tests/distributed/test_collect2.py` |
 | **not fixed** | the `aw-gloo32-3` hang itself, which was not reproduced (§11.3) |

@@ -309,24 +309,24 @@ place rather than edited away.
 ## 7. Regression
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     354 ok   (before 348, +6)
+PYTHON=$PY sh tests/run.sh     354 ok   (before 348, +6)
                                               DOCWATCH: PASS -- 274/274
-$PY tools/golden/compare.py                   8126/8126, ops=185
+$PY tests/golden/compare.py                   8126/8126, ops=185
 ```
 
-**No aten op was added**, so `tools/golden/cases.py` gains nothing — this round
+**No aten op was added**, so `tests/golden/cases.py` gains nothing — this round
 is Python above the dispatcher, and the only Rust it touched is none.
 
 `354` is this round's snapshot and is asserted as a lower bound only, the way
 every other document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 354 -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py FedAvg present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py Engine present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py agree present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py publish present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_fedavg_over_two_processes_equals_the_same_average_computed_centrally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_federated_refuses_a_world_of_one_by_name_at_every_door present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvg present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py agree present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py publish present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_fedavg_over_two_processes_equals_the_same_average_computed_centrally present -->
+<!-- DOCWATCH: symbol-in-file tests/_support/test_shim.py test_federated_refuses_a_world_of_one_by_name_at_every_door present -->
 
 ---
 
