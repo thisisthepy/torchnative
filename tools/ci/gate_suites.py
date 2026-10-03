@@ -73,6 +73,12 @@ _ANE_SILENT = (
     "runner it would print `ok` having run nothing. Local-only until its skips "
     "go through `_skip`, and even then it would only skip.")
 
+_DEV_TOOLCHAIN = (
+    "needs the release machine's toolchain, which a hosted runner does not "
+    "have: the pinned interpreter at .caches/spike-venv (transformers 5.15.1, "
+    "AGENTS.md §15.2), the rust cross targets and the target CPython "
+    "distributions under tools/wheel.")
+
 #: Every gate suite, and the runners it runs on. `()` means local-only.
 SUITES = {
     "test_absmps.py": BOTH,
@@ -177,8 +183,8 @@ SUITES = {
     "test_tmpleak.py": BOTH,
     "test_tnnamespace.py": BOTH,
     "test_tntransformers.py": BOTH,
-    "test_toolguard_run_preflight.py": BOTH,
-    "test_toolguard_wheel_staging.py": BOTH,
+    "test_toolguard_run_preflight.py": LOCAL_ONLY,
+    "test_toolguard_wheel_staging.py": LOCAL_ONLY,
     "test_train.py": BOTH,
     "test_varmean.py": BOTH,
     "test_viewdtype.py": BOTH,
@@ -187,7 +193,7 @@ SUITES = {
     "test_voice4.py": BOTH,
     "test_vulkan4.py": BOTH,
     "test_vulkancov.py": BOTH,
-    "test_wheelmatrix.py": BOTH,
+    "test_wheelmatrix.py": LOCAL_ONLY,
 }
 
 #: Why a suite is kept off a runner. Required for every suite whose tuple is
@@ -202,6 +208,20 @@ WHY_NOT = {
         "at import, and what it measures is subgraph placement on the Apple "
         "Neural Engine, which no hosted runner has. It also has no `_skip` "
         "runner of its own."),
+    "test_toolguard_run_preflight.py": _DEV_TOOLCHAIN + (
+        " Measured on run 37078300696 (macos): 3 of 3 tests FAIL with "
+        "`known-good interpreter missing: .../.caches/spike-venv/bin/python`."),
+    "test_toolguard_wheel_staging.py": _DEV_TOOLCHAIN + (
+        " Measured on run 37078300696 (macos): its one test FAILs with "
+        "FileNotFoundError on the same interpreter."),
+    "test_wheelmatrix.py": _DEV_TOOLCHAIN + (
+        " Measured on run 37078300696 (macos): 20 of 22 ok; "
+        "`test_every_target_names_a_rust_target_that_is_installed` needs the "
+        "nine cross targets the release machine has, and "
+        "`test_build_pys_own_self_test_passes` asserts `LINUX SELF-TEST: PASS`, "
+        "which build.py prints only where the target CPython distribution "
+        "exists (it skips loudly otherwise). The 20 lose CI coverage until "
+        "those two take the runner's toolchain into account; follow-up."),
 }
 
 
