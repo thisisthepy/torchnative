@@ -1,7 +1,7 @@
 # Publishing from a tag: `.github/workflows/publish-pypi.yml`
 
-**This workflow has never run.** It was written and validated without a runner
-— YAML parsed, job graph read, tag/version logic exercised locally, and every
+**This workflow has never run.** It was written and validated without a runner,
+YAML parsed, job graph read, tag/version logic exercised locally, and every
 guarantee nullified and confirmed red (§7). Written, reached and agreed are
 three different claims, and this is the first. The first real use should be a
 `workflow_dispatch` with `dry_run: true`, which builds and verifies nine
@@ -15,9 +15,9 @@ Tests: **38** in `tests/release/test_cipub.py`.
 
 The manual release was: one person, one Mac, nine `python scripts/wheel/build.py
 --target ...` invocations, `twine upload`. The problem was not the typing. It
-was that the toolchain lived in that machine's scratch directories — a `zig`
+was that the toolchain lived in that machine's scratch directories, a `zig`
 shim at `/tmp/zigbin`, an emsdk under `/Volumes/macMini/caches`, a
-hand-written `PYO3_CONFIG_FILE` for iOS — so the recipe existed only as
+hand-written `PYO3_CONFIG_FILE` for iOS, so the recipe existed only as
 whatever was on PATH that afternoon. Restoring it cost a full round.
 
 Second, on 2026-09-11 eight cross artefacts were **44 hours stale** against the
@@ -31,7 +31,7 @@ Moving the wiring into a file is the point. The automation is a side effect.
 
 ## 1. Can `scripts/vendor/vendor_torch.sh` run on a CI runner?
 
-**Yes, and it produces a byte-identical tree — with one pin that is not
+**Yes, and it produces a byte-identical tree: with one pin that is not
 optional.**
 
 The script reads a torch installation and copies its Python tree, dropping
@@ -52,7 +52,7 @@ directory's `WHEEL` file reads:
 
 So the *platform of the torch wheel that was vendored from* is shipped inside
 all nine of our wheels, including the Windows and wasm ones. Vendor from a
-Linux torch wheel on a Linux runner and that member changes — and so does
+Linux torch wheel on a Linux runner and that member changes, and so does
 `METADATA`, whose `Requires-Dist` differs between the CUDA and macOS builds
 (the local tree's METADATA mentions `nvidia` 15 times; a CPU-only build's
 would not match either).
@@ -79,8 +79,8 @@ in `dist/`:
     only on disk                     0
     only in wheel                    5
 
-`.stamp` also agrees: `py_modules=2372`, `native_left=0`, `add_hooks=1`
-— the same numbers the real tree carries.
+`.stamp` also agrees: `py_modules=2372`, `native_left=0`, `add_hooks=1`,
+the same numbers the real tree carries.
 
 The five are each accounted for, and none of them comes from vendoring:
 
@@ -102,8 +102,8 @@ happens once per cache eviction.
 
 ### 2.1 What was determined, and what was not
 
-**Determined, by measurement:** the ~2,666 vendored members — 98% of each
-15 MB wheel — come out byte-identical from a wheel-only vendoring source, with
+**Determined, by measurement:** the ~2,666 vendored members: 98% of each
+15 MB wheel, come out byte-identical from a wheel-only vendoring source, with
 no macOS and no spike-venv involved. That is the part that was in doubt and it
 is now not.
 
@@ -113,9 +113,9 @@ rewrites the Mach-O install name because cargo embeds `CARGO_TARGET_DIR`
 into it (`_fix_install_name`); rustc additionally embeds absolute source and
 `~/.cargo/registry` paths in panic strings and debug info. A different
 toolchain version changes codegen outright. What CI can promise about `_C` is
-what `scripts/wheel/verify_cross.py` already checks — architecture, Mach-O
+what `scripts/wheel/verify_cross.py` already checks, architecture, Mach-O
 `LC_BUILD_VERSION` platform / ELF machine / PE machine, the `PyInit__C`
-export, the DT_NEEDED set, the glibc floor derived from `.gnu.version_r` —
+export, the DT_NEEDED set, the glibc floor derived from `.gnu.version_r`,
 not a hash.
 
 **Zip metadata** (member mtimes, the zip's own ordering) differs by
@@ -131,7 +131,7 @@ wheel**. They are written into site-packages by the installer, and the released
     REQUESTED   b''
 
 The workflow recreates both after unzipping, so the CI wheel matches the
-verified one. **They should probably be dropped instead** — they record which
+verified one. **They should probably be dropped instead**. They record which
 tool installed torch on somebody's laptop, they say `uv` inside a wheel
 installed by pip, and nothing reads them. That is a content change to the
 published artefact, so it is left as a recommendation rather than made here.
@@ -149,7 +149,7 @@ eight cross wheels against the macOS one. No third comparison tool was written.
 ## 3. The three target CPythons CI cannot obtain
 
 Every target's platform tag is **derived from a target CPython distribution**
-rather than written down — `ANDROID_API_LEVEL`, `IPHONEOS_DEPLOYMENT_TARGET`,
+rather than written down, `ANDROID_API_LEVEL`, `IPHONEOS_DEPLOYMENT_TARGET`,
 `MULTIARCH`. So a missing distribution is not a build inconvenience, it is a
 missing tag.
 
@@ -163,9 +163,9 @@ question:
 | `x86_64-pc-windows-msvc` | **download**, same release |
 | `aarch64-pc-windows-msvc` | **download**, same release |
 | Pyodide 314.0.6 core | **download**, pyodide release asset |
-| `arm64-iphoneos` | rebuildable (CPython @ `d894d467a61`, 30–60 min) — **not downloadable** |
+| `arm64-iphoneos` | rebuildable (CPython @ `d894d467a61`, 30–60 min), **not downloadable** |
 | `arm64-iphonesimulator` | same |
-| `aarch64-linux-android` | **not reproducible at all** — TARGET_PYTHON.md §5: cross-built on a machine that is not this one, from a `heads/3.13-dirty` tree, and nothing records what the modifications were |
+| `aarch64-linux-android` | **not reproducible at all**, TARGET_PYTHON.md §5: cross-built on a machine that is not this one, from a `heads/3.13-dirty` tree, and nothing records what the modifications were |
 
 The last one is the hard stop, and it is why "nine wheels in CI" is not
 achievable today by building alone.
@@ -190,8 +190,8 @@ Why a bundle rather than rebuilding the two iOS ones in CI, which is possible:
 
 * It makes iOS *identical* to the local distributions rather than
   "functionally equivalent". TARGET_PYTHON.md §6.3 is explicit that a rebuild
-  can never be byte-identical — build timestamps and absolute source paths are
-  embedded — so a rebuild would silently change what the iOS wheels were built
+  can never be byte-identical, build timestamps and absolute source paths are
+  embedded, so a rebuild would silently change what the iOS wheels were built
   against.
 * It is one mechanism for three problems instead of two mechanisms for two,
   and the Android one has no second option.
@@ -207,7 +207,7 @@ refuses rather than warns when it is unset.
 
 | runner | targets | why |
 |---|---|---|
-| `macos-14` | `host`, `ios-arm64`, `ios-arm64-sim` | not a preference. The macOS wheel's tag is read out of the Mach-O the host build produced (`honest_macos_plat`), and both iOS builds need `xcrun` and an iOS SDK — the iOS distribution's own compiler shims in `bin/arm64-apple-ios-simulator-clang` are two-line `xcrun` wrappers. There is no cross-from-Linux route for either. |
+| `macos-14` | `host`, `ios-arm64`, `ios-arm64-sim` | not a preference. The macOS wheel's tag is read out of the Mach-O the host build produced (`honest_macos_plat`), and both iOS builds need `xcrun` and an iOS SDK, the iOS distribution's own compiler shims in `bin/arm64-apple-ios-simulator-clang` are two-line `xcrun` wrappers. There is no cross-from-Linux route for either. |
 | `ubuntu-24.04` | `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-arm64`, `android-arm64-v8a`, `wasm32-emscripten` | all six are already cross builds today, through toolchains that do not care what host they run on: `cargo zigbuild`, `cargo xwin`, `cargo ndk`, emscripten. On Linux the NDK also stops going through the `darwin-x86_64` prebuilts under Rosetta. A Linux runner is a tenth the cost. |
 
 `fail-fast: false`: one broken target reports next to the other eight rather
@@ -215,7 +215,7 @@ than hiding them behind a cancellation.
 
 Every job builds the host shim first (`scripts/vendor/install_shim.sh`), because
 `build.py`'s `preflight` requires `torch/_C.abi3.so` to exist even when the
-wheel is for another platform — a tree with the hole still open is the
+wheel is for another platform, a tree with the hole still open is the
 `py3-none-any` shell.
 
 ---
@@ -228,8 +228,8 @@ wheel is for another platform — a tree with the hole still open is the
 depends on. Nothing checked this before: `build.py` reads the version out of
 the metadata and never sees the tag; the release process read the tag and never
 saw `pyproject.toml`. `git tag v0.1.0b4 && git push --tags` would have
-published **0.1.0b3** under that name — nine internally consistent wheels, all
-the wrong version — and PyPI never allows a filename to be reused, even after
+published **0.1.0b3** under that name, nine internally consistent wheels, all
+the wrong version, and PyPI never allows a filename to be reused, even after
 deletion, so the real 0.1.0b4 would have been burnt.
 
 The comparison is on the **literal text** as well as the parsed version.
@@ -245,7 +245,7 @@ Run it locally:
 ### 5.2 Nine wheels or no upload
 
 `collect` downloads all nine artefacts and checks the **filenames by name**,
-not by count — a count passes when two jobs both produce a macOS wheel and the
+not by count, a count passes when two jobs both produce a macOS wheel and the
 Windows one is missing, and cannot say which. Same reasoning as `build.py`'s
 `EXPECTED_TARGET_KEYS`, which exists because a dict comprehension collapsed
 two entries and a count could not tell.
@@ -261,7 +261,7 @@ directory, but each file is a separate request, so a network failure at file 4
 leaves 3 live. `skip-existing: true` lets a re-run complete the set instead of
 dying on the three already there.
 
-What is left is a window — seconds to minutes, until the re-run — in which PyPI
+What is left is a window (seconds to minutes, until the re-run) in which PyPI
 serves a partial platform set, and `pip install torchnative` on a platform
 whose wheel has not landed resolves to the previous release or to nothing.
 There is no way to close that from the client side. It is smaller than today's
@@ -273,8 +273,8 @@ notices.
 The workflow **runs** `tests/run.sh` on the tagged tree rather
 than requiring a green status on the commit.
 
-Requiring is faster and trusts two things: that the gate ran on *this* tree — a
-tag can be moved, and cutting a hotfix tag on an older commit is ordinary — and
+Requiring is faster and trusts two things: that the gate ran on *this* tree, a
+tag can be moved, and cutting a hotfix tag on an older commit is ordinary, and
 that the status API's answer is about the same suite. A release is a handful per
 month. An hour of runner time is the cheaper side of that trade.
 

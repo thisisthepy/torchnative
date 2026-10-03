@@ -1,15 +1,15 @@
 # A loss value: what stood in front of one, and what it cost
 
 `docs/training/TRAIN.md` closes at **26 of 26 architectures forwarding in `.train()`**, and every one of
-those forwards is *lossless* — the sweep feeds ids and reads logits. `docs/training/AUTOGRAD.md` §5.3 found
+those forwards is *lossless*, the sweep feeds ids and reads logits. `docs/training/AUTOGRAD.md` §5.3 found
 why that matters: a training step needs a scalar to call `.backward()` on, and this shim could not
 compute a cross-entropy forward at all. It named two missing ops and called them "the smallest
 genuinely useful next commit in this direction".
 
 **They were the right two ops and they were not the whole requirement.** §1 is that finding.
 
-This round also closes the two items `docs/training/AUTOGRAD.md` §6.6 puts beside the loss —
-`optimizer.zero_grad()` (§6) and `native_dropout` (§7) — and neither of those turned out to be the
+This round also closes the two items `docs/training/AUTOGRAD.md` §6.6 puts beside the loss,
+`optimizer.zero_grad()` (§6) and `native_dropout` (§7), and neither of those turned out to be the
 size it was measured at either. The pattern is the same one every time and it is worth naming
 once: **an op scan sees the leaves a call lands on, never the names a caller uses to get there.**
 
@@ -17,11 +17,11 @@ once: **an op scan sees the leaves a call lands on, never the names a caller use
 
 | question | answer |
 |---|---|
-| Does a real SmolLM2-135M forward produce a loss? | **Yes.** `12.871352195739746` against upstream's `12.871366500854492` — **1.11e-06 relative** (§4) |
+| Does a real SmolLM2-135M forward produce a loss? | **Yes.** `12.871352195739746` against upstream's `12.871366500854492`, **1.11e-06 relative** (§4) |
 | Which of the two kernels carries that residual? | **Neither carries it jointly.** Fed identical logits, `nll_loss_forward` is **bit-identical** to upstream on the real 49152-class tensor; all of it is `_log_softmax`'s summation order (§4.1) |
-| Did the loss need more than the two ops AUTOGRAD.md names? | **Yes — two kernels and four more names**, all `CompositeImplicitAutograd` and so invisible to a dispatch trace (§1) |
-| Does `optimizer.zero_grad()` complete? | **Yes**, on SGD/SGD+momentum/Adam/AdamW over all 272 real SmolLM2 parameter tensors — and **vacuously**, because `p.grad` is still `None` (§6.3) |
-| What were Adam's three kernels? | `lerp_.Scalar`, `addcmul_`, `addcdiv_`, all small — but Adam stops **before** them, on `torch.is_complex`, a name (§6.4) |
+| Did the loss need more than the two ops AUTOGRAD.md names? | **Yes, two kernels and four more names**, all `CompositeImplicitAutograd` and so invisible to a dispatch trace (§1) |
+| Does `optimizer.zero_grad()` complete? | **Yes**, on SGD/SGD+momentum/Adam/AdamW over all 272 real SmolLM2 parameter tensors, and **vacuously**, because `p.grad` is still `None` (§6.3) |
+| What were Adam's three kernels? | `lerp_.Scalar`, `addcmul_`, `addcdiv_`, all small, but Adam stops **before** them, on `torch.is_complex`, a name (§6.4) |
 | Did `native_dropout` make the four architectures capturable? | **Three of the four.** `gpt2`, `bert`, `gpt_bigcode` crossed; `opt`'s wall was never dropout (§7.5) |
 | Is there a fourth wall? | Yes, and it is the same wall each time: **a missing *name*, not a missing kernel.** §1's four, §6's `DisableTorchFunctionSubclass` and §6.4's `torch.is_complex` |
 
@@ -57,7 +57,7 @@ That measurement is correct and it is incomplete, and the reason is structural r
 oversight. **`TorchDispatchMode` sits below the composite layer.** Every
 `CompositeImplicitAutograd` op has already been decomposed by the time a dispatch record is
 emitted, so an op scan sees the leaves a call *lands on* and never the names a caller *uses to get
-there*. Climbing the real path instead of scanning it — `/tmp/loss/wall.py`, one rung at a time,
+there*. Climbing the real path instead of scanning it, `/tmp/loss/wall.py`, one rung at a time,
 against this build:
 
 ```
@@ -88,7 +88,7 @@ nll_loss            ->  nll_loss_forward(...)[0]
 log_softmax.int     ->  _log_softmax(converted, dim, False)
 ```
 
-so the trace shows `_log_softmax` and `nll_loss_forward` and nothing else — which is exactly what
+so the trace shows `_log_softmax` and `nll_loss_forward` and nothing else, which is exactly what
 §5.3 reported. This is the sixth time in this repository a gap has been a *name* rather than a
 kernel (docs/architectures/ARCH20.md §5 and §9, docs/kernels/GROUPED_MM.md §6.1, docs/kernels/TRIL.md §2, docs/bindings/SPELLINGS.md), and
 it is the same blindness `tests/golden/compare.py` has by construction: golden compares by dispatch
@@ -106,7 +106,7 @@ block that calls the names instead of the key.
 
 ## 2. `_log_softmax`: upstream has two kernels and they do different arithmetic
 
-The formula is the one everybody knows — `x - max - log(sum(exp(x - max)))` — and transcribing it
+The formula is the one everybody knows, `x - max - log(sum(exp(x - max)))`, and transcribing it
 that way is wrong for two of the four dtypes.
 
 ### 2.1 The fork
@@ -159,8 +159,8 @@ bfloat16 [0.0, ln(0.002)]     sum = 1 + 0.002 = 1.00203
 ```
 
 A **relative** difference of 1.0, because the value the two disagree about is near zero while the
-disagreement is not. Both spellings are in `tests/golden/cases.py` — `(1,2)` at `dim=-1` takes the
-last-dim kernel, the same two numbers as `(2,1)` at `dim=0` take the strided one — so a shim that
+disagreement is not. Both spellings are in `tests/golden/cases.py`, `(1,2)` at `dim=-1` takes the
+last-dim kernel, the same two numbers as `(2,1)` at `dim=0` take the strided one, so a shim that
 uses one rule for both fails exactly one of each pair.
 
 **`float16` does not separate**, and that was measured rather than assumed: the same input gives
@@ -182,7 +182,7 @@ It is carried in the case list as documentation of the near miss, not as a check
 
   Two golden cases, not one, because a hard-coded message passes the first and fails the third.
   (`_softmax`, next door in `aten.rs`, answers `softmax_lastdim_kernel_impl` for both. Upstream
-  distinguishes those two as well — measured — so that is a pre-existing near-miss in that op. It
+  distinguishes those two as well (measured) so that is a pre-existing near-miss in that op. It
   is recorded here and deliberately not changed: it is on the eval hot path's refusal branch and
   outside this round.)
 * **The fork is `dim + 1 == rank`, not `inner == 1`.** A shape like `(3,4,1)` at `dim=1` has an
@@ -191,10 +191,10 @@ It is carried in the case list as documentation of the near miss, not as a check
 
 ### 2.4 What landed
 
-* `torchnative/rust/torch_c/src/aten.rs` — `log_softmax_default` and `log_softmax_body`, the narrowing threaded
+* `torchnative/rust/torch_c/src/aten.rs`: `log_softmax_default` and `log_softmax_body`, the narrowing threaded
   through as an `Option<fn(f64) -> f64>` taken from the existing `float_narrower(tag)`.
-* `torchnative/rust/torch_c/src/overloads.json` — `_log_softmax`, the dispatched leaf.
-* `torchnative/rust/torch_c/src/bootstrap.py` — `Tensor.log_softmax` beside `Tensor.softmax`, and
+* `torchnative/rust/torch_c/src/overloads.json`: `_log_softmax`, the dispatched leaf.
+* `torchnative/rust/torch_c/src/bootstrap.py`: `Tensor.log_softmax` beside `Tensor.softmax`, and
   `torch.log_softmax` bound to it. **Not** an `overloads.json` entry: `aten::log_softmax.int` is
   `CompositeImplicitAutograd`, the `softmax` trap one line above it in the same file. The two
   spellings of one function land on opposite sides of that boundary, one underscore apart, and
@@ -202,7 +202,7 @@ It is carried in the case list as documentation of the near miss, not as a check
 
 ### 2.5 Agreement with upstream
 
-Every combination in `/tmp/loss/ls_check.py` — 4 dtypes x 14 shape/dim pairs, plus the separators,
+Every combination in `/tmp/loss/ls_check.py`, 4 dtypes x 14 shape/dim pairs, plus the separators,
 the `-inf`/`+inf`/`NaN` edges, seven refusals and seven spellings:
 
 ```
@@ -225,7 +225,7 @@ what that residual grows to at a real vocabulary width, which is larger than thi
 ### 3.1 `total_weight` is the part a forward-only test cannot see
 
 The op returns **two** tensors and every caller in `transformers` drops the second.
-`nll_loss_backward` takes it as an argument — it is the divisor the mean's gradient needs — so it
+`nll_loss_backward` takes it as an argument: it is the divisor the mean's gradient needs, so it
 is not decoration, and its rules do not follow from the loss. Measured, all five:
 
 | call | loss | `total_weight` |
@@ -248,7 +248,7 @@ sabotage that computes the "obvious" count for the first row fails **146 cases**
 
 Upstream does not sum the per-element losses in a loop. It accumulates into **eight partial sums
 with a carry every 2^4 elements**, all in `scalar_t`. That is observable, not an implementation
-detail — measured against a plain left-to-right sum in the same dtype:
+detail, measured against a plain left-to-right sum in the same dtype:
 
 ```
   n=300   bfloat16   upstream -225        naive -226       (f64 reference -226.61255)
@@ -266,7 +266,7 @@ found by a mismatch rather than by reading:
 2. **`float32`/`float64` contract `sum -= data * weight` into an FMA and the reduced dtypes
    cannot.** `c10::BFloat16::operator*` returns a `BFloat16`, so the product is rounded before the
    subtraction; native `float`/`double` are contracted by the compiler. Using an FMA everywhere and
-   using it nowhere both mismatch, **in opposite dtypes**, which is how the split was found — the
+   using it nowhere both mismatch, **in opposite dtypes**, which is how the split was found, the
    first transcription was FMA-free and failed only `float32`-with-weight.
 3. **`total_weight` for the unweighted case is a cast of a count**,
    `static_cast<scalar_t>(batch_size - num_ignored)`, so it rounds exactly once and never goes
@@ -284,7 +284,7 @@ the list.
 ### 3.3 Checks, in upstream's order, and two that are not there
 
 `ignore_index` is tested **before** the bounds check, so a target equal to an out-of-range
-`ignore_index` is legal — `nll_loss_forward(x, [0, 77], None, mean, 77)` succeeds where the same
+`ignore_index` is legal: `nll_loss_forward(x, [0, 77], None, mean, 77)` succeeds where the same
 call with `ignore_index=-100` raises `IndexError: Target 77 is out of bounds.` Reversing those two
 lines is §5.1's N6 and it fails 3 cases.
 
@@ -292,20 +292,20 @@ lines is §5.1's N6 and it fails 3 cases.
 sum (measured: loss `1.25`, `total_weight` `2.0`, identical to `reduction=2`). This reproduces that
 rather than adding a refusal upstream does not have.
 
-The weight's dtype must match the input's **exactly** — it is `data_ptr<scalar_t>()` that raises,
+The weight's dtype must match the input's **exactly**. It is `data_ptr<scalar_t>()` that raises,
 not a promotion rule, and the message names both dtypes (`expected scalar type Float but found
 Double`). It fires on the elementwise path as well as the reduce path, so both have cases.
 
 ### 3.4 What landed
 
-* `torchnative/rust/torch_c/src/aten.rs` — `nll_loss_forward_default` and `nll_cascade`.
-* `torchnative/rust/torch_c/src/bootstrap.py` — `torch._C._nn.nll_loss`, `nll_loss_nd` and
+* `torchnative/rust/torch_c/src/aten.rs`: `nll_loss_forward_default` and `nll_cascade`.
+* `torchnative/rust/torch_c/src/bootstrap.py`: `torch._C._nn.nll_loss`, `nll_loss_nd` and
   `cross_entropy_loss`, the three composites §1 found. `nll_loss_nd`'s 4-D and >4-D arms refuse by
   naming `aten.nll_loss2d_forward.default`: that op reduces over a spatial extent, so `nll_loss` is
   not a slower road to the same answer.
 * **`torch._C._nn.nll_loss_forward` is deliberately absent.** Upstream has no such name
   (`hasattr` is `False` on 2.13.0). The first climb in §1 listed it as a wall, and it was the
-  probe that was wrong, not the shim — recorded because a shim that invented the name to make a
+  probe that was wrong, not the shim, recorded because a shim that invented the name to make a
   probe green would have been worse than the refusal.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs log_softmax_body present -->
@@ -318,7 +318,7 @@ Double`). It fires on the elementwise path as well as the reduce path, so both h
 ## 4. The result: a real SmolLM2-135M loss
 
 Real weights from the HF cache, `float32`, `.train()`, deterministic ids `(i*7919+13) % 49152`,
-`labels=ids`, `S=8`, 134,515,008 parameters — the recipe docs/training/AUTOGRAD.md §5 used.
+`labels=ids`, `S=8`, 134,515,008 parameters: the recipe docs/training/AUTOGRAD.md §5 used.
 
 | | upstream | shim | |
 |---|---|---|---|
@@ -341,7 +341,7 @@ nll_of_shared_ls            12.871373176574707     12.871352195739746      2.098
 nll_tw                                      7.0                    7.0      0.0000e+00
 ```
 
-> **`nll_loss_forward` is bit-identical to upstream on the real thing** — a 49152-class, 8-row
+> **`nll_loss_forward` is bit-identical to upstream on the real thing**, a 49152-class, 8-row
 > tensor, gathered and cascade-summed, `0.0000e+00`. The entire residual is `_log_softmax`'s
 > summation order over the vocabulary.
 
@@ -359,14 +359,14 @@ the source, **rebuilt**, and run through `tests/golden/compare.py` and `tests/ru
 
 | # | fault | golden | smoke |
 |---|---|---:|---|
-| L1 | `_log_softmax` keeps the sum in f32 on both paths (never narrows) — *the obvious implementation* | 5 FAIL | 0 |
+| L1 | `_log_softmax` keeps the sum in f32 on both paths (never narrows), *the obvious implementation* | 5 FAIL | 0 |
 | L2 | …narrows on both paths | 6 FAIL | 0 |
 | L3 | `x - (max + logsum)` instead of `x - max - logsum` | 1 FAIL | 0 |
-| L4 | no max subtraction — `log(sum(exp(x)))` | 2 FAIL | 0 |
+| L4 | no max subtraction, `log(sum(exp(x)))` | 2 FAIL | 0 |
 | L5 | last-dim chosen by `inner == 1` instead of `dim + 1 == rank` | 4 FAIL | 0 |
 | L6 | one hard-coded refusal message (the `_softmax` shape) | **0** | 1 FAIL |
 | L7 | `half_to_float=True` honoured instead of refused | 2 FAIL | 0 |
-| L8 | kernel present, `Tensor.log_softmax` absent — *the §1 gap* | 4 FAIL | 0 |
+| L8 | kernel present, `Tensor.log_softmax` absent, *the §1 gap* | 4 FAIL | 0 |
 | N1 | `total_weight` counted instead of 0 for `reduction=none`, 2-D | 146 FAIL | 0 |
 | N2 | plain left-to-right sum instead of the cascade | 151 FAIL | 0 |
 | N3 | the cascade carry runs for ignored targets too | 22 FAIL | 0 |
@@ -376,35 +376,35 @@ the source, **rebuilt**, and run through `tests/golden/compare.py` and `tests/ru
 | N7 | mean divides by the kept count instead of `total_weight` | 73 FAIL | 0 |
 | N8 | `total_weight` summed through the cascade instead of cast once | **0**, then 2 FAIL | 0 |
 | N9 | empty batch answers 0 for mean instead of NaN | 1 FAIL | 0 |
-| N10 | kernel present, `_nn.cross_entropy_loss` absent — *the §1 gap again* | 4 FAIL | 0 |
+| N10 | kernel present, `_nn.cross_entropy_loss` absent, *the §1 gap again* | 4 FAIL | 0 |
 
 ### 5.2 The four results that are more interesting than the counts
 
 **L1 and L2 could not fail on the first attempt, and the reason is a tolerance.** Both came back
-**0 golden failures** against a case list that already contained the `[0, ln(0.002)]` separator —
+**0 golden failures** against a case list that already contained the `[0, ln(0.002)]` separator,
 the case built specifically to see them. `dtypes.py` gives `bfloat16` `atol=6e-2`; the effect is
 0.002. `math.isclose` absorbed it.
 
 Widening the input does not fix that, and the bound is structural rather than a matter of searching
 harder: the `bfloat16` rounding of the sum is at most 2^-9 relative, so `log(sum)` moves by at most
-**0.00195 absolute** for *any* input, and reaching an absolute 6e-2 would need `log(sum) > 16` —
+**0.00195 absolute** for *any* input, and reaching an absolute 6e-2 would need `log(sum) > 16`,
 a reduction over e^16 elements. Nor can `rtol` help: the effect is one ULP, which is 0.4% relative
 against a 6% tolerance.
 
 The fix is `_bit_exact`, a `value_check` with no tolerance at all, applied to the separators and to
 the whole reduced-dtype grid. It is a bound this kernel actually meets: measured, `bfloat16` and
 `float16` agree with upstream bit for bit on all 14 shape/dim combinations **and at real
-vocabulary width** — 0 of 393,216 elements differ on a `[8, 49152]` SmolLM2 logits tensor. With
+vocabulary width**, 0 of 393,216 elements differ on a `[8, 49152]` SmolLM2 logits tensor. With
 `_bit_exact` in place L1 fails 5 cases and L2 fails 6.
 
 *(The first `_bit_exact` checked values only, and `compare.py --self-test` immediately reported it
-as accepting a wrong answer under the `shape` and `dtype` fault modes — a `value_check` replaces the
+as accepting a wrong answer under the `shape` and `dtype` fault modes, a `value_check` replaces the
 default pipeline entirely rather than adding to it. That is the self-test doing its job on a
 comparator written in the same hour.)*
 
 **N8 could not fail either, and needed a searched separator rather than a wider grid.** Summing
 `1.0` through the cascade agrees with casting the count for every batch size in the grid, including
-`n=300`. It stops agreeing where a `bfloat16` partial saturates — at 256 the ULP is 2, so `256 + 1`
+`n=300`. It stops agreeing where a `bfloat16` partial saturates, at 256 the ULP is 2, so `256 + 1`
 is `256`. Searching `n` over `[250,270] ∪ [500,530] ∪ {1000,1023,1024,1025,2049,4097,300,301,320,
 384,385}` found **ten** separating batch sizes and `n=300` is not one of them:
 
@@ -414,18 +414,18 @@ n=515 bfloat16   cast 516   cascade-of-ones 512
 ```
 
 Two cases at `n=258` were added on that measurement, and N8 then fails both. `float16` never
-separates in that range — its 11-bit significand counts exactly past 2048 — so this is a
+separates in that range (its 11-bit significand counts exactly past 2048) so this is a
 `bfloat16`-only check and is labelled as one.
 
 **L6 cannot be caught by golden, and that is correct.** `expect="both_error"` asserts that both
-sides refuse, not that they refuse alike — deliberately, since this shim prefixes its messages with
+sides refuse, not that they refuse alike, deliberately, since this shim prefixes its messages with
 the op key. So the two `log_softmax_lastdim_kernel_impl` / `log_softmax_kernel_impl` cases pass
 with a single hard-coded message. It is checked in
 `test_log_softmax_names_the_kernel_its_dim_actually_selected` instead, where a string can be
 compared, and that test fails on L6.
 
 **L8 and N10 are the §1 finding as a fault.** Both leave the kernel completely intact and remove
-only a *name*, and both are caught **only** by the spellings cases — every dispatch-key case in the
+only a *name*, and both are caught **only** by the spellings cases, every dispatch-key case in the
 op's list passes. That is the blindness §1 describes, demonstrated rather than asserted: golden
 compares by dispatch key, so without those cases a shim with both kernels and no
 `torch._C._nn.cross_entropy_loss` would show 7232/7232.
@@ -434,11 +434,11 @@ compares by dispatch key, so without those cases a shim with both kernels and no
 
 Asked of each, as the brief requires:
 
-* No `float32` case can separate a **summation order** — see §2.5 and §5.4. The `float32` entries
+* No `float32` case can separate a **summation order**: see §2.5 and §5.4. The `float32` entries
   in the grid check the formula, the refusals and the shape rules, not the accumulation.
 * The refusal cases check *that* both sides refuse and not *how*; only the smoke test checks
   message text, and only for `_log_softmax`'s two kernel names.
-* `_nll_pair_check` compares exactly, so it would catch any arithmetic change — but it says nothing
+* `_nll_pair_check` compares exactly, so it would catch any arithmetic change, but it says nothing
   about **performance**: the cascade is reproduced for its rounding, and the shim's version is a
   scalar loop either way.
 * Nothing here exercises `nll_loss2d`, `nll_loss_backward`, or the two `cross_entropy_loss`
@@ -460,8 +460,8 @@ because the widest `float32` case is 6 elements. It is a serial sum of 49,152 te
 upstream's 4-lane one; the error grows with `n` and the case list does not.
 
 It is left rather than fixed, for a reason worth stating: **upstream's own `float32` answer is not
-reproducible across ISAs.** `map_reduce_all` accumulates in `Vectorized<float>` lanes — 4 on NEON,
-8 on AVX2, 16 on AVX512 — so matching it bit for bit would mean matching *this machine's* upstream
+reproducible across ISAs.** `map_reduce_all` accumulates in `Vectorized<float>` lanes, 4 on NEON,
+8 on AVX2, 16 on AVX512, so matching it bit for bit would mean matching *this machine's* upstream
 and diverging from another's. Bit-exactness at `float32` is not a well-defined target here, which
 is exactly why the reduced dtypes' bit-exactness above is worth having: those go through the
 narrowing path, where rounding the sum to 8 significand bits erases the lane-order difference
@@ -472,7 +472,7 @@ The consequence for §4 is bounded and measured: it moves the SmolLM2 loss by 2.
 
 #### 5.4.1 It is now watched, and the fix is still not attempted
 
-Everything above stands. The `float32` residual is **not** fixed and should not be — the argument
+Everything above stands. The `float32` residual is **not** fixed and should not be, the argument
 in the paragraph above is the whole reason, and it has not weakened.
 
 What did change is the last clause of the second paragraph: *"no case in this file sees it because
@@ -495,8 +495,8 @@ default pipeline this case is a failure, and it is not one. The ceilings are the
 with roughly 2× headroom, so re-measurement noise does not move them and a real regression does.
 
 The comparator is `_bounded_divergence(max_abs, max_rel)`, and it is new. Two comparators already
-existed for the two ordinary answers — the default pipeline ("agree within the dtype's tolerance")
-and `_bit_exact` ("agree exactly") — and neither can say the third thing this repository keeps
+existed for the two ordinary answers, the default pipeline ("agree within the dtype's tolerance")
+and `_bit_exact` ("agree exactly"), and neither can say the third thing this repository keeps
 having to say: *these do not agree, here is by how much, and the cause is a property of how
 upstream's wheel was compiled rather than of the operator.* `--self-test` puts it through all
 eleven fault modes and it catches the same seven the default pipeline does, so it is a ceiling and
@@ -523,7 +523,7 @@ optimiser.zero_grad()   FAIL  profiler._record_function_enter_new.default
 
 `torch.optim.Optimizer.zero_grad` and `_patch_step_function` both wrap their body in
 `with torch.autograd.profiler.record_function(...)`, so **two profiler markers gate every optimiser
-in `torch.optim`, SGD included** — and neither is arithmetic. Climbing it found a third name on the
+in `torch.optim`, SGD included**, and neither is arithmetic. Climbing it found a third name on the
 same road that §7 did not list: `record_function.__exit__` opens with
 `with torch._C.DisableTorchFunctionSubclass():`, which `surface.json` had harvested from the `.pyi`
 as a `"function"` and turned into a raising stub.
@@ -548,7 +548,7 @@ profiler ever lands.
 `DisableTorchFunctionSubclass` is a no-op for a separate reason, and it is worth keeping the two
 apart: what it disables is subclass `__torch_function__` dispatch, and `_is_torch_function_enabled()`
 already returns `False` here because no type in the vendored tree overrides the protocol. It is
-**not** wired to `_MODE_STACK` — that is the torch-function *mode* stack, which upstream's other
+**not** wired to `_MODE_STACK`: that is the torch-function *mode* stack, which upstream's other
 name (`DisableTorchFunction`) governs, and clearing it would silently drop a
 `with torch.device(...)` block spanning a `record_function` region, i.e. every `optimizer.step()`.
 §8's Z4 is that mis-wiring and a test catches it.
@@ -561,7 +561,7 @@ take a `str`, return an object with no storage, and have no dtype, device or sha
 upstream", and golden cannot compare a marker. `_C._shim_profiler_markers` lists the three keys so
 the size of that bypass is readable rather than inferred.
 
-### 6.3 It works, and it works vacuously — which is the honest statement
+### 6.3 It works, and it works vacuously, which is the honest statement
 
 On real SmolLM2-135M, 272 parameter tensors, 134,515,008 parameters:
 
@@ -572,7 +572,7 @@ SGD/SGD+momentum/Adam/AdamW  .step()                  OK
 ```
 
 **and every one of those completes without touching a gradient**, because `p.grad` is `None` for
-every parameter, so `if p.grad is not None` skips the body. That is not a defect of this change —
+every parameter, so `if p.grad is not None` skips the body. That is not a defect of this change,
 it is `docs/training/AUTOGRAD.md` §7's second gap, `.grad` having no setter, and that document argues
 deliberately for leaving it: *"making `.grad` writable while nothing writes to it would move the
 shim from 'honestly reports no gradient' to 'has a slot that is always empty'"*. That argument is
@@ -582,7 +582,7 @@ what it iterates over is still empty.
 ### 6.4 A real step: SGD works, Adam needs four things and not three
 
 `docs/training/AUTOGRAD.md` §6.6 measured the optimiser step on upstream and concluded *SGD needs zero new
-aten kernels, Adam needs three*. The first half is now demonstrated rather than predicted — through
+aten kernels, Adam needs three*. The first half is now demonstrated rather than predicted, through
 the functional API, which takes gradients as an explicit list and so does not need a `.grad` setter:
 
 ```
@@ -598,7 +598,7 @@ torch.optim.adam.adam(...)   NotImplementedError: torch.is_complex(...) -- overl
                              resolution has no table entry for this op
 ```
 
-`torch.is_complex` is a **name**, not a kernel — `Tensor.is_complex()` already works, and
+`torch.is_complex` is a **name**, not a kernel: `Tensor.is_complex()` already works, and
 `aten.is_complex.default` has no kernel either. It is the §1 finding a fourth time. Stubbing past
 it, the next wall is `TensorBase.lerp_`, which *is* one of the three. So the requirement is:
 
@@ -610,7 +610,7 @@ it, the next wall is `TensorBase.lerp_`, which *is* one of the three. So the req
 | `aten.addcdiv_.default` | `self += value * t1 / t2`, elementwise in place |
 
 All three kernels are the `add_`/`mul_`/`div_` family this shim already has, so **yes, they are
-small** — but the count in §6.6 was three and the list is four, and the fourth is again the kind of
+small**, but the count in §6.6 was three and the list is four, and the fourth is again the kind of
 gap an op scan cannot see. None of them was implemented here: the brief's bar for this item is
 `zero_grad()` completing, and the three kernels are only reachable once something writes a
 gradient.
@@ -647,12 +647,12 @@ are the case list:
 |---|---|---|
 | mask dtype | the input's | **`bool`** |
 | where the scale goes | on the **mask**: `noise.div_(1-p)` | on the **output**: `.mul_(scale)` |
-| `p` outside [0,1] | `TORCH_CHECK` naming **`p`** | no check of its own — `bernoulli_`'s, naming **`1-p`** |
+| `p` outside [0,1] | `TORCH_CHECK` naming **`p`** | no check of its own, `bernoulli_`'s, naming **`1-p`** |
 | `train=False` | returns the input **object** | returns a **clone** |
 | `numel == 0` | returns the input object | returns the input object, and a mask of the **input's dtype** |
 
 The third is the sharpest and is measured: `native_dropout(x, 1.5, True)` raises
-`bernoulli_ expects p to be in [0, 1], but got p=-0.5` — the *survival* probability — while
+`bernoulli_ expects p to be in [0, 1], but got p=-0.5`: the *survival* probability, while
 `native_dropout(x, 1.5, False)` **succeeds**, because that branch never reaches `bernoulli_`. A
 range check written into the op itself would refuse a call upstream accepts; §8's D7 is that fault
 and two cases catch it.
@@ -660,7 +660,7 @@ and two cases catch it.
 ### 7.2 The scale is narrowed, and that was not readable from the source
 
 `output.mul_(scale)` reads like an ordinary in-place scalar multiply, and a standalone
-`Tensor.mul_(python_float)` on a reduced dtype does **not** narrow its scalar — `mul_kernel`'s
+`Tensor.mul_(python_float)` on a reduced dtype does **not** narrow its scalar, `mul_kernel`'s
 reduced-float branch takes `original_scalar_value<opmath_t>`, which is `float`
 (docs/training/TRAIN.md §5, docs/numerics/SCALAR.md). Stepping the C++ body from Python and calling the kernel give
 different answers:
@@ -675,7 +675,7 @@ bfloat16, x = -9.875, p = 0.7, on a survivor
 The narrowed reading reproduces upstream on **1280 of 1280** combinations (4 dtypes × 5 values of
 `p` × 64 elements); the un-narrowed one misses 41 of 377 in the development harness and **0 of 377
 in `float32` alone**. This is the family docs/numerics/SCALAR.md closed by recording that it *has no rule to
-infer* — `hardshrink` narrows, `softshrink` widens — so it is measured per op, and this op narrows.
+infer* (`hardshrink` narrows, `softshrink` widens) so it is measured per op, and this op narrows.
 
 ### 7.3 Which makes the substitution safe, and that is the point
 
@@ -689,19 +689,19 @@ upstream over 4 dtypes × 6 values of `p`:
 The reason is the narrowing: the eager path stores its scale *into a mask of the input's dtype*, so
 it multiplies by `dtype(1/(1-p))`; the functional path narrows the scalar and multiplies by the
 same thing. **So rewriting `torch.dropout` to `native_dropout` inside a capture region does not
-change any number** — and it would have, silently, on exactly the architectures this is for, if the
+change any number**, and it would have, silently, on exactly the architectures this is for, if the
 scale had not been narrowed. That is the property `test_capture_takes_the_functional_dropout_and_
 only_inside_a_region` asserts, and D3 fails it.
 
-The document's first draft claimed the opposite here — that the survivors *differ* by an ULP — and
+The document's first draft claimed the opposite here (that the survivors *differ* by an ULP) and
 the test written on that claim failed immediately. It was the assertion that was wrong.
 
 ### 7.4 What landed
 
-* `torchnative/rust/torch_c/src/aten.rs` — `native_dropout_default`, **one kernel and not a decomposition**. A
+* `torchnative/rust/torch_c/src/aten.rs`: `native_dropout_default`, **one kernel and not a decomposition**. A
   `bootstrap.py` decomposition would emit its steps through the one door and capture would record
   `bernoulli_` among them, which is the thing being fixed.
-* `torchnative/rust/torch_c/src/bootstrap.py` — `_dropout_impl` takes the `native_dropout` route **only while
+* `torchnative/rust/torch_c/src/bootstrap.py`: `_dropout_impl` takes the `native_dropout` route **only while
   `_capture_active()`**, and `torch.native_dropout` is spelled (`hasattr(torch,
   'native_dropout')` is `True` upstream). Outside a region eager keeps the eager path, because
   upstream's CPU eager never reaches `native_dropout` either
@@ -710,7 +710,7 @@ the test written on that claim failed immediately. It was the assertion that was
 
 ### 7.5 The result: 14 of 23 to 17 of 23, and it is three architectures, not four
 
-The `.train()` forward of each architecture, captured — **model built outside the region**, because
+The `.train()` forward of each architecture, captured, **model built outside the region**, because
 weight initialisation calls `normal_`/`uniform_` and a tape over a training step records the
 forward, not the constructor:
 
@@ -719,14 +719,14 @@ forward, not the constructor:
 | architectures capturable in `.train()` | **14/23** | **17/23** |
 
 The three that crossed are `gpt2`, `bert` and `gpt_bigcode`, each recording **4
-`native_dropout` nodes** — and they are exactly the three that refused on `aten.bernoulli_.float`.
+`native_dropout` nodes**, and they are exactly the three that refused on `aten.bernoulli_.float`.
 
 **`opt` did not cross, and it is not a dropout wall.** It refused before and after on
 `aten._local_scalar_dense.default reads a tensor value onto the host`, a data-dependent host read,
 so it never reached `bernoulli_` at all. `docs/training/AUTOGRAD.md` §6.5 names four architectures; the
 measurement says three of them were blocked on this and the fourth was blocked on something else.
 
-The six still refusing, with the wall each stops at — none of them dropout:
+The six still refusing, with the wall each stops at, none of them dropout:
 
 ```
 opt, deberta, deberta_v2   aten._local_scalar_dense.default   a host read
@@ -753,7 +753,7 @@ none of them can see.
 | Z2 | only the `.default` exit overload registered, not `._RecordFunction` | 0 | 1 FAIL |
 | Z3 | `DisableTorchFunctionSubclass` left as the harvested raising stub | 0 | 1 FAIL |
 | Z4 | …wired to the torch-function **mode** stack instead of being a no-op | 0 | 1 FAIL |
-| D1 | the capture route removed — kernel present, wiring absent | 0 | 1 FAIL |
+| D1 | the capture route removed, kernel present, wiring absent | 0 | 1 FAIL |
 | D2 | scale the **mask** instead of the output | **0** | **0** |
 | D3 | the scale **not narrowed** to the input's dtype | 40 FAIL | 1 FAIL |
 | D4 | the `numel == 0` mask made `bool`, tidying upstream's quirk | 2 FAIL | 0 |
@@ -764,7 +764,7 @@ none of them can see.
 
 ### 8.1 Z1–Z4 are caught only by the smoke test, and that is structural
 
-None of the four moves a number, so golden — which compares values by dispatch key — reports
+None of the four moves a number, so golden (which compares values by dispatch key) reports
 0 failures for all of them. They are caught by
 `test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one`, which is where a claim about
 *names and context managers* can live. Z4 in particular is caught by an assertion that exists only
@@ -780,7 +780,7 @@ mine  narrow(narrow(x * 1.0) * s)        s = narrow(1/(1-p))
 D2    narrow(x * narrow(1.0 * s))
 ```
 
-`narrow` is idempotent and `s` is already narrowed, so both are `narrow(x * s)` for every input —
+`narrow` is idempotent and `s` is already narrowed, so both are `narrow(x * s)` for every input,
 including the `inf * 0 = NaN` and signed-zero paths, checked. This is §5.2's shape again: a fault
 that cannot be caught because it is not a different computation. It is worth having in the table
 because *the difference between the two spellings is real in the source* and only the narrowing
@@ -789,16 +789,16 @@ makes them coincide; D3, which removes the narrowing, fails 40 cases.
 ### 8.3 D5 and D7 could not fail on the first attempt
 
 **D5** changes only object identity, which no value comparison sees. Fixed by four cases that
-return `float(out is input)` as a one-element tensor — the only shape this harness compares — and
+return `float(out is input)` as a one-element tensor (the only shape this harness compares) and
 they pin both answers: a clone on the `train` and `train=False` branches, the input itself on the
 `numel == 0` one.
 
 **D7**, as first written, inserted the range check just above `let p1m`, which is *below* the
-`train=False` early return — so the branch the check was supposed to break never reached it, and
+`train=False` early return, so the branch the check was supposed to break never reached it, and
 golden's `both_error` cases pass whatever message the other branch raises. Rewritten to put the
 check where `_dropout_impl` has it (at the top, above every branch), it fails the two
 `native_dropout(p=1.5, train=False) [ACCEPTED on both sides]` cases. **The first version of the
-fault was wrong, not the case list** — but it was only visible because the fault was run.
+fault was wrong, not the case list**, but it was only visible because the fault was run.
 
 ### 8.4 What this suite still cannot see
 
@@ -825,7 +825,7 @@ fault was wrong, not the case list** — but it was only visible because the fau
 | `nll_loss_nd` for rank 3, 4 and above | routes to `aten.nll_loss2d_forward.default`, which reduces over a spatial extent. Substituting `nll_loss` would be silently wrong rather than slow |
 | Adam's three kernels and `torch.is_complex` | §6.4. Reachable only once something writes a gradient |
 | `.grad`'s setter | docs/training/AUTOGRAD.md §7 argues for leaving it, and that argument still holds. It is the next decision, not an oversight |
-| the `profiler::` schema table | the three keys answered above the door still report a placeholder schema. `_NON_ATEN_SCHEMA_TEXT` would need `profiler` added to `verify_schemas.py`'s `NON_ATEN_NAMESPACES`, and that check demands *every* op in a namespace — six here, two of them carrying `Future(t)` types the shim's parser has not been asked for |
+| the `profiler::` schema table | the three keys answered above the door still report a placeholder schema. `_NON_ATEN_SCHEMA_TEXT` would need `profiler` added to `verify_schemas.py`'s `NON_ATEN_NAMESPACES`, and that check demands *every* op in a namespace, six here, two of them carrying `Future(t)` types the shim's parser has not been asked for |
 | any backward | the whole document is still a forward. docs/training/AUTOGRAD.md §6.6 step 3 is unmoved |
 
 <!-- DOCWATCH: op-not-implemented aten.nll_loss2d_forward.default -->
@@ -863,7 +863,7 @@ wiring sits inside `_dropout_impl`, which every eval forward calls.
 | 32 | `331668f36da02f21…` | ✅ | `b81325c83a0a3d15…` | ✅ |
 | 128 | `00159a9dbd308eda…` | ✅ | `7ff8e9334449b147…` | ✅ |
 | 512 | `07c2797dabc4552e…` | ✅ | `9ab1e82f01378e38…` | ✅ |
-| 1024 | `eda1e173727bb7f5…` | ✅ | — | |
+| 1024 | `eda1e173727bb7f5…` | ✅ | n/a | |
 
 All nine equal `docs/training/TRAIN.md` §6's values.
 

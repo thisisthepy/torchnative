@@ -2610,7 +2610,7 @@ def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[
             )
         )
 
-    # **`torch.bool` — and the two ops do NOT agree, which is the whole point
+    # **`torch.bool`, and the two ops do NOT agree, which is the whole point
     # of casing them separately.** Measured on 2.13.0:
     #
     #   add.Scalar(bool_t, 3)   -> tensor([4,3,4], int64)   upstream COMPUTES

@@ -3,7 +3,7 @@
     python scripts/devices/intelnpu_fuse_verify.py --model Qwen/Qwen3-0.6B
 
 Run on the Windows laptop with the Intel NPU, inside the environment that has
-torchnative's shim as `torch` and `pip install openvino` (docs/devices/NPUFUSE.md
+torchnative's shim as `torch` and `uv add openvino` (docs/devices/NPUFUSE.md
 section 5 has the numbered procedure). Nothing here can run on a Mac: the
 point of this script is the one fact a Mac cannot produce -- what the **NPU**
 does with the graph.

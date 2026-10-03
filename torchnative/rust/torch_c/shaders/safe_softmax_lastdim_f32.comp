@@ -25,7 +25,7 @@ void main() {
     
     // _safe_softmax: if every element is -inf, the row is dead.
     // exp(-inf - (-inf)) = NaN on many GPUs, so we detect it here and
-    // write zeros instead — the only place _safe_softmax differs from
+    // write zeros instead: the only place _safe_softmax differs from
     // _softmax (docs/devices/VULKAN7.md).
     if (isinf(m) && m < 0.0) {
         for (uint i = 0; i < row_len; i++) {

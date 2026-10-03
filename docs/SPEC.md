@@ -1,6 +1,6 @@
 # Specification
 
-What torchnative does — the behavioural contract. It must stay inside [`INTENT.md`](INTENT.md).
+What torchnative does, the behavioural contract. It must stay inside [`INTENT.md`](INTENT.md).
 A behaviour change starts here, then a failing test, then code (AGENTS.md rule 5).
 
 **How to read the status.** Each item is `implemented`, `partial` or `planned`.
@@ -65,7 +65,7 @@ Test paths below are relative to `tests/` unless they start with another directo
 | S5.1 | Graph capture through the single door, decomposition and refolding to a core op set (substrate for NPU delegates). | implemented | `export/test_export.py::test_capture_is_the_only_working_front_end_and_records_the_module_it_ran`; `_support/test_shim.py::test_decompose_refuses_by_name_what_it_cannot_lower` |
 | S5.2 | **Apple / CoreML:** eligible leaves lower to CoreML; a float16 graph runs on the Neural Engine; every leaf not lowered is named and a partial offload warns. | implemented | `devices/coreml/test_coremlops.py::test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32`, `::test_every_leaf_not_lowered_is_named_and_a_partial_offload_warns` (macOS only; `MLComputePlan` is nondeterministic under load, AGENTS.md §13.3) |
 | S5.3 | **Windows / Intel NPU:** `model.to(device.npu)` lowers eligible `nn.Linear` leaves through OpenVINO and returns the same module; zero lowered leaves is a refusal. **Tested against a faked probe and runtime; no Intel NPU has run it.** | partial | `devices/npu/test_npuwire.py::test_to_device_npu_returns_a_real_module_on_a_faked_intel_npu_host`, `::test_zero_leaves_lowered_is_a_refusal_and_not_a_success`; `test_intelnpu.py` |
-| S5.4 | **Android / NNAPI:** the captured graph lowers to an NNAPI blob that executes through `ANeuralNetworksModel`. Only the CPU reference driver has run it — execution, not acceleration. | partial | `test_npu2.py` |
+| S5.4 | **Android / NNAPI:** the captured graph lowers to an NNAPI blob that executes through `ANeuralNetworksModel`. Only the CPU reference driver has run it, execution, not acceleration. | partial | `test_npu2.py` |
 | S5.5 | **Android / QNN (ExecuTorch):** a submodule is delegated and the model still generates; the HTP ahead-of-time half refuses by name here. No claim that anything ran on an NPU. | partial | `devices/qnn/test_qnn.py::test_a_real_checkpoint_still_generates_with_a_submodule_delegated`, `::test_no_claim_is_made_that_anything_ran_on_an_npu` |
 | S5.6 | Quantisation by **module replacement** (`torchnative.quant`, Q8_0/Q4_0/Q4K), reachable through a registered `HfQuantizer` so leaves are swapped before the weights land. | implemented | `_support/test_shim.py::test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land`, `::test_the_quantizer_plugin_and_quantize_produce_the_same_model` |
 
@@ -100,7 +100,7 @@ Test paths below are relative to `tests/` unless they start with another directo
 
 ---
 
-## Outside intent — needs a decision
+## Outside intent: needs a decision
 
 Behaviour that exists or is planned but that [`INTENT.md`](INTENT.md) does not clearly cover.
 

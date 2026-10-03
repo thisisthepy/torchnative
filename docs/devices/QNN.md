@@ -1,4 +1,4 @@
-# QNN — ExecuTorch's Qualcomm backend behind an `nn.Module`, and the claim it does not make
+# QNN: ExecuTorch's Qualcomm backend behind an `nn.Module`, and the claim it does not make
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py DelegateModule present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py delegate_ present -->
@@ -29,18 +29,18 @@
 |---|---|
 | Can the QNN ahead-of-time lowering run on this arm64 Mac? | **No**, and §1 is the measurement rather than the doc quote |
 | Where does the upstream/torchnative boundary fall? | **At the `.pte` file.** §2 |
-| Does the front end survive? `from_pretrained` / `generate`? | **Yes** — SmolLM2-135M, one submodule delegated, six tokens generated (§4.1) |
-| Does an artefact load and run and agree with upstream? | **Yes** — the *XNNPACK control*, at a derived tolerance, ratio 0.16 (§7) |
+| Does the front end survive? `from_pretrained` / `generate`? | **Yes**, SmolLM2-135M, one submodule delegated, six tokens generated (§4.1) |
+| Does an artefact load and run and agree with upstream? | **Yes**, the *XNNPACK control*, at a derived tolerance, ratio 0.16 (§7) |
 | Did anything run on a Hexagon NPU? | **No, and this round cannot claim it did.** §6.4 |
 | Was a Snapdragon device attached? | **Not at first.** One appeared mid-round and steps 1-3 of §5 were run against it, read-only: **SM8550, HTP v73** (§5.1) |
 | New tests | 19, `tests/devices/qnn/test_qnn.py` |
 | Nullifications attempted / uncaught | **7 / 1**, and the uncaught one found a real hole (§8.3) |
-| Defects found | **1** — an absent SoC table reported as an unrecognised chipset, found by running against real silicon (§5.1) |
+| Defects found | **1**, an absent SoC table reported as an unrecognised chipset, found by running against real silicon (§5.1) |
 | Rust changed | **none**, so golden is required to be exactly unmoved (§9) |
 
 ---
 
-## 1. Step one — what ExecuTorch's QNN backend actually requires
+## 1. Step one: what ExecuTorch's QNN backend actually requires
 
 The instruction was to answer this *before* writing code, with citations. It
 was, and the answer changed the design: the lowering was always going to be
@@ -50,13 +50,13 @@ offline, and §1.3 is why it has no choice.
 
 | | |
 |---|---|
-| **ExecuTorch version** | `1.4.1` — the current PyPI release, installed and used here. The QNN backend has shipped in-tree since 0.2 |
-| **QNN SDK version** | **2.37.0.250724**. Read out of the installed package, not transcribed — `executorch/backends/qualcomm/scripts/download_qnn_sdk.py` resolves `QNN_VERSION` from `qnn_config.sh` and falls back to that literal. ExecuTorch's own documentation says "Although newer versions are available, we have verified and recommend using **QNN 2.37.0** for stability" |
+| **ExecuTorch version** | `1.4.1`, the current PyPI release, installed and used here. The QNN backend has shipped in-tree since 0.2 |
+| **QNN SDK version** | **2.37.0.250724**. Read out of the installed package, not transcribed, `executorch/backends/qualcomm/scripts/download_qnn_sdk.py` resolves `QNN_VERSION` from `qnn_config.sh` and falls back to that literal. ExecuTorch's own documentation says "Although newer versions are available, we have verified and recommend using **QNN 2.37.0** for stability" |
 | **Host OS for the lowering** | "The QNN Backend is currently verified on the following Linux host operating systems: **Ubuntu 22.04 LTS (x64)**, **CentOS Stream 9**, **Windows Subsystem for Linux (WSL)** with Ubuntu 22.04." macOS/Darwin appears **nowhere** in that document |
 | **Android NDK** | "This example is verified with **NDK 26c**", `ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM=android-30` (the last two from `backends/qualcomm/scripts/build.sh`) |
 
 Plus: `g++` **13 or higher** for the AOT part, and the chipsets ExecuTorch's own
-docs name as verified — "This example is verified with **SM8550 and SM8450**".
+docs name as verified, "This example is verified with **SM8550 and SM8450**".
 
 ### 1.2 What must be on the device
 
@@ -67,7 +67,7 @@ Four kinds of file, and they go in one directory that is on both
 |---|---|
 | the model | the `.pte`, with the QNN context binary embedded in its delegate segment |
 | the ExecuTorch runtime | `qnn_executor_runner` and `libqnn_executorch_backend.so`, built for `arm64-v8a` with `-DEXECUTORCH_BUILD_QNN=ON` |
-| the QNN backend | `libQnnHtp.so`, `libQnnSystem.so` — from `$QNN_SDK_ROOT/lib/aarch64-android/` |
+| the QNN backend | `libQnnHtp.so`, `libQnnSystem.so`, from `$QNN_SDK_ROOT/lib/aarch64-android/` |
 | the HTP **stub and skeleton** for this silicon | `libQnnHtpV<arch>Stub.so` and `libQnnHtpV<arch>Skel.so` |
 
 The last row is the one worth understanding. The **stub** runs on the
@@ -77,7 +77,7 @@ skel. `torchnative.export.qnn_device.htp_stub_for(arch)` derives the pair from
 the architecture number rather than carrying a list, because the list grows
 every silicon generation and a stale copy would silently omit the newest part.
 
-### 1.3 Can the lowering run on an arm64 Mac? — **No**, and here is the measurement
+### 1.3 Can the lowering run on an arm64 Mac?: **No**, and here is the measurement
 
 The doc's OS list is evidence and not proof: "not verified" is a weaker claim
 than "cannot". So this was measured, in a venv on the external SSD, on the
@@ -129,7 +129,7 @@ sdk_lib_dir = str(qnn_sdk_dir / "lib" / "x86_64-linux-clang")          # :689
 qnn_lib     = qnn_sdk_dir / "lib" / "x86_64-linux-clang" / "libQnnHtp.so"  # :696
 ```
 
-The same is true of the whole profiling toolchain — ExecuTorch's own QNN
+The same is true of the whole profiling toolchain, ExecuTorch's own QNN
 debugger shells out to `$QNN_SDK_ROOT/bin/x86_64-linux-clang/qnn-context-binary-generator`
 and `.../qnn-profile-viewer` (`backends/qualcomm/debugger/utils.py:244,323`).
 
@@ -150,8 +150,8 @@ This is the half that made the round deliverable rather than a report:
 | `.to_executorch()` → `.pte` bytes | **works** |
 | `executorch.runtime.Runtime.load_program` / `execute` | **works** |
 | the `.pte` flatbuffer schema (`_deserialize_pte_binary`) | **works** |
-| **the QNN option flatbuffer** (`qc_schema`, `option_to_flatbuffer`, `flatbuffer_to_option`) | **works** — pure Python, no SDK |
-| `QcomChipset` / `_soc_info_table` | **works** — plain `IntEnum`s |
+| **the QNN option flatbuffer** (`qc_schema`, `option_to_flatbuffer`, `flatbuffer_to_option`) | **works**, pure Python, no SDK |
+| `QcomChipset` / `_soc_info_table` | **works**, plain `IntEnum`s |
 | anything that touches `PyQnnManagerAdaptor` | **cannot** |
 
 The last three rows are why the artefact reader in §4.3 is fully tested here
@@ -160,12 +160,12 @@ inspectable; only the *compiler* is not.
 
 ### 1.5 Sources
 
-* [Qualcomm AI Engine Backend — ExecuTorch 1.3/stable](https://docs.pytorch.org/executorch/stable/backends-qualcomm.html)
-  and its [markdown source](https://docs.pytorch.org/executorch/stable/_sources/backends-qualcomm.md.txt) — host OS list, QNN 2.37.0, NDK 26c, g++ 13, SM8550/SM8450, the device push list and the `LD_LIBRARY_PATH`/`ADSP_LIBRARY_PATH` run line
-* [`backends/qualcomm/README.md`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/README.md) — `QcomChipset` is the authority on supported SoCs
-* [`backends/qualcomm/serialization/qc_schema.py`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/serialization/qc_schema.py) — `QcomChipset`, `HtpArch`, `QnnExecuTorchBackendType`, `QnnExecuTorchHtpPrecision`, `_soc_info_table`
-* [`backends/qualcomm/scripts/build.sh`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/scripts/build.sh) — `EXECUTORCH_BUILD_QNN=ON`, `ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM=android-30`
-* [pytorch/executorch#16465](https://github.com/pytorch/executorch/issues/16465) — the verbatim HTP-init failure quoted in §6.3, and `ro.soc.model` as the property QNN's SoC detection reads
+* [Qualcomm AI Engine Backend: ExecuTorch 1.3/stable](https://docs.pytorch.org/executorch/stable/backends-qualcomm.html)
+  and its [markdown source](https://docs.pytorch.org/executorch/stable/_sources/backends-qualcomm.md.txt), host OS list, QNN 2.37.0, NDK 26c, g++ 13, SM8550/SM8450, the device push list and the `LD_LIBRARY_PATH`/`ADSP_LIBRARY_PATH` run line
+* [`backends/qualcomm/README.md`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/README.md), `QcomChipset` is the authority on supported SoCs
+* [`backends/qualcomm/serialization/qc_schema.py`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/serialization/qc_schema.py), `QcomChipset`, `HtpArch`, `QnnExecuTorchBackendType`, `QnnExecuTorchHtpPrecision`, `_soc_info_table`
+* [`backends/qualcomm/scripts/build.sh`](https://github.com/pytorch/executorch/blob/main/backends/qualcomm/scripts/build.sh), `EXECUTORCH_BUILD_QNN=ON`, `ANDROID_ABI=arm64-v8a`, `ANDROID_PLATFORM=android-30`
+* [pytorch/executorch#16465](https://github.com/pytorch/executorch/issues/16465), the verbatim HTP-init failure quoted in §6.3, and `ro.soc.model` as the property QNN's SoC detection reads
 * the installed wheel itself, for everything in §1.3
 
 ---
@@ -175,7 +175,7 @@ inspectable; only the *compiler* is not.
 **At the `.pte` file, and at nothing else.**
 
 ```
-OFFLINE — Linux x86-64, upstream torch, upstream executorch, QNN SDK
+OFFLINE, Linux x86-64, upstream torch, upstream executorch, QNN SDK
 ────────────────────────────────────────────────────────────────────
   transformers model
     → torch.export.export                        UPSTREAM torch
@@ -185,7 +185,7 @@ OFFLINE — Linux x86-64, upstream torch, upstream executorch, QNN SDK
     → .to_executorch()                           UPSTREAM
     → layer0_mlp.pte  ◄── the boundary ──────────────────────────────
 ────────────────────────────────────────────────────────────────────
-ON DEVICE — torchnative
+ON DEVICE, torchnative
   QnnModule(".../layer0_mlp.pte")                torchnative
     reads the delegate table, refuses if it is not QnnBackend
     ExecuTorch runtime loads it and calls forward()
@@ -206,7 +206,7 @@ torchnative's own `torch.export` is the weakest thing in this tree. Putting it
 on the critical path to a vendor NPU would make the whole Android story depend
 on it, and it would fail on the first real architecture. `docs/graph/DYNAMO.md` §18
 reached the same conclusion from the other side for `torch.compile`, and
-`docs/graph/CAPTURE.md` §9 lists trace serialisation as *absent* — a captured trace
+`docs/graph/CAPTURE.md` §9 lists trace serialisation as *absent*: a captured trace
 cannot leave the process, so there is no torchnative-native path to a `.pte`
 even in principle today.
 
@@ -218,10 +218,10 @@ what ships is a file.
 The boundary is narrow but it is not empty. On the torchnative side:
 
 * **reading the artefact and deciding whether it is what it claims to be**
-  (§4.3) — the delegate table, the compile spec, the SoC and HTP architecture;
+  (§4.3), the delegate table, the compile spec, the SoC and HTP architecture;
 * **refusing** an artefact that would run on the CPU while looking like
   success (§6.2, §8);
-* **the front end** — putting the artefact behind an `nn.Module` inside a real
+* **the front end**: putting the artefact behind an `nn.Module` inside a real
   `transformers` model without touching `from_pretrained` or `generate` (§3).
 
 That third item is the part shared with the Apple and Windows back ends, and
@@ -229,7 +229,7 @@ it is deliberately in its own file (§10).
 
 ---
 
-## 3. The front end — `torchnative/export/npu.py`
+## 3. The front end: `torchnative/export/npu.py`
 
 Vendor-neutral, 250 lines, and it contains no string that names Qualcomm.
 
@@ -247,7 +247,7 @@ model.generate(input_ids, max_new_tokens=6)
 ### 3.1 `from_pretrained` returns the model, not a wrapper
 
 This is the one design decision in the file. `generate()` is
-`GenerationMixin.generate` — several thousand lines that read `self.config`,
+`GenerationMixin.generate`: several thousand lines that read `self.config`,
 `self.device`, `self.can_generate()`, the cache classes,
 `_prepare_generation_config`. **A wrapper has to forward all of it, and every
 forward is a place to be wrong.** Returning the model means there is nothing to
@@ -292,9 +292,9 @@ validated** are different claims and this section does not merge them.
 | the front-end swap on SmolLM2-135M | **executed** | under the shim, real checkpoint, `generate()` produced six tokens |
 | an XNNPACK-delegated `.pte` from a hand-written MLP | **executed** | `Runtime.load_program` → `execute`, compared to eager |
 | an XNNPACK-delegated `.pte` from **SmolLM2's layer-0 MLP** | **executed** | same, and §7 is the numerical comparison |
-| the device's SoC and FastRPC node | **read from the device** | §5.1 — `getprop`, read-only, SM8550/v73 |
-| a **QNN**-delegated `.pte` | **not produced** | §1.3 — the host cannot |
-| anything on an HTP | **not executed** | §6.4 — nothing to push |
+| the device's SoC and FastRPC node | **read from the device** | §5.1, `getprop`, read-only, SM8550/v73 |
+| a **QNN**-delegated `.pte` | **not produced** | §1.3, the host cannot |
+| anything on an HTP | **not executed** | §6.4, nothing to push |
 
 ### 4.1 The front end, on a real checkpoint
 
@@ -317,7 +317,7 @@ runs under the shim where there is no ExecuTorch runtime. **That is the point
 of splitting the claims**: this row is about the *replacement*, not about what
 the replacement computes, and §7 is the row about what it computes.
 
-Six calls for six new tokens is the assertion with teeth — a delegate that had
+Six calls for six new tokens is the assertion with teeth, a delegate that had
 been swapped in and then bypassed would report zero and every other line above
 would be identical.
 
@@ -341,7 +341,7 @@ anything, and so that §4.3's `QnnModule` has something real to refuse.
 
 ### 4.3 The artefact reader
 
-Everything is read through **upstream's own** schema —
+Everything is read through **upstream's own** schema,
 `executorch.exir._serialize._deserialize_pte_binary` for the program and
 `qc_schema_serialize.flatbuffer_to_option` for the QNN compile spec. There is
 no second parser here that could agree with the first by sharing a mistake,
@@ -359,7 +359,7 @@ match_device(art, "SM8550")   # (False, 'built for HTP v75 ... SM8550 is HTP v73
 ```
 
 **`is_qnn` is "at least one segment", not "all".** A real model legitimately
-mixes — QNN for what the partitioner claimed, portable kernels for the rest —
+mixes, QNN for what the partitioner claimed, portable kernels for the rest,
 and a reader that demanded purity would call every real model `False`. What it
 must not do is call a program with **zero** QNN segments `True`, which is the
 entire silent-fallback shape.
@@ -381,7 +381,7 @@ behind the delegate is still XNNPACK's and a real QNN backend would reject it
 instantly.
 
 It is **not a QNN artefact**. It exists because a reader tested only against
-non-QNN files passes while returning `False` unconditionally — nullification 2
+non-QNN files passes while returning `False` unconditionally, nullification 2
 (§8.3) made `is_qnn` return `True` always and nine tests went red, which is the
 check that the fixture is doing work in both directions.
 
@@ -392,7 +392,7 @@ check that the fixture is doing work in both directions.
 `adb devices -l` listed **nothing** when this round started, so the steps below
 were written to be run when a Snapdragon device is attached, with every one of
 them reading the device rather than assuming it. **A device then appeared
-mid-round**, and steps 1–3 — which are read-only — were run against it. §5.1 is
+mid-round**, and steps 1–3 (which are read-only) were run against it. §5.1 is
 what they returned, and what running them found.
 
 Copy-pasteable. Steps 1–3 run on the Mac, 4–8 on a **Linux x86-64** host,
@@ -524,7 +524,7 @@ adb -s "$ANDROID_SERIAL" shell "ls -d $D 2>&1"   # must say No such file
 Steps 1, 3, 9 and 14 are what `torchnative.export.qnn_device` automates;
 `device_report()` is step 2+3 and `cleanup()` is step 14.
 
-### 5.1 Steps 1–3, executed — and the defect they found
+### 5.1 Steps 1–3, executed, and the defect they found
 
 A Samsung Galaxy Tab S9 Ultra attached itself to this machine partway through
 the round. It is **shared**, so only the read-only steps were run against it:
@@ -561,12 +561,12 @@ staged          ()          staged_complete  False
 **So the target this round would lower for is real, identified, and not
 guessed**: SM8550, HTP **v73**. That is one generation below the SM8650/v75 the
 §4.3 fixture uses, which is why `match_device` refusing an SM8650 artefact for
-an SM8550 device is not a hypothetical — it is the exact mismatch a careless
+an SM8550 device is not a hypothetical. It is the exact mismatch a careless
 copy of the tutorial's `--soc_model SM8650` would produce against *this* device.
 
 #### The defect
 
-Run from the shim interpreter — the one with no ExecuTorch — `device_report()`
+Run from the shim interpreter (the one with no ExecuTorch) `device_report()`
 returned **`chipset: null`** for a device whose `ro.soc.model` is `SM8550`, a
 chipset ExecuTorch knows perfectly well. `resolve_soc` needs ExecuTorch to read
 `QcomChipset`, could not import it, raised, and `device_soc` caught that and
@@ -574,12 +574,12 @@ rendered it as "the table does not have this part".
 
 **A refusal about the host wearing a verdict about the device.** The two lead a
 reader to opposite actions: one says `pip install executorch`, the other says
-this silicon will never work — which is what pytorch/executorch#16465 *actually*
+this silicon will never work, which is what pytorch/executorch#16465 *actually*
 describes, a device reporting `CQ8750S` on which QNN's own detection later
 fails with "No Snapdragon SOC detected".
 
-Fixed by making the outcome three-valued — `SOC_KNOWN`, `SOC_NOT_IN_TABLE`,
-`SOC_TABLE_UNAVAILABLE` — and deciding between the last two by asking whether
+Fixed by making the outcome three-valued, `SOC_KNOWN`, `SOC_NOT_IN_TABLE`,
+`SOC_TABLE_UNAVAILABLE`, and deciding between the last two by asking whether
 `soc_targets()` can be read at all, rather than by parsing the message. The
 raw string is carried in every case, because it is the only thing in the report
 that came from the device.
@@ -594,7 +594,7 @@ first version passed everything (§8.3, nullification 7).
 `ls /dev/ | grep rpc` returns an **empty listing** to the `shell` user on
 Android 16 / API 36, on a device where `ls -l /dev/adsprpc-smd` succeeds. A
 FastRPC check built on the directory listing would report "no DSP" on a device
-that has one — a false negative about the only piece of hardware this round is
+that has one, a false negative about the only piece of hardware this round is
 about. `fastrpc_nodes()` stats named paths instead.
 
 ---
@@ -602,7 +602,7 @@ about. `fastrpc_nodes()` stats named paths instead.
 ## 6. The verification trap
 
 This is the section the round exists for. `docs/graph/NPU2.md` is this project's
-record of paying for the mistake twice — the CoreML models `docs/graph/NPU.md`
+record of paying for the mistake twice, the CoreML models `docs/graph/NPU.md`
 called "executed" had run on the **CPU**, and every NNAPI driver on the
 emulator was software. **The results were correct either way.**
 
@@ -613,18 +613,18 @@ like instead?
 
 Four things, and the first two are necessary but not sufficient on their own.
 
-**(a) AOT — the partition, before anything is pushed.**
+**(a) AOT: the partition, before anything is pushed.**
 `delegation_report(edge)` gives `delegated_nodes / total_nodes`. This is the
 *ceiling* on how much could have run on the NPU. It is not evidence that
 anything did; it is evidence about what could not have.
 
-**(b) AOT — the artefact, decoded.** `read_artefact(path).htp_plan()` must
+**(b) AOT: the artefact, decoded.** `read_artefact(path).htp_plan()` must
 report `backend_type == kHtpBackend` and an `htp_arch` matching the device's.
 An HTP context binary is compiled *for one HTP generation*, and QNN's CPU
 reference implementation cannot execute one. So this is a strong structural
-claim — and still a claim about a file.
+claim, and still a claim about a file.
 
-**(c) RUNTIME — the optrace / QHAS summary.** This is the closest QNN analogue
+**(c) RUNTIME: the optrace / QHAS summary.** This is the closest QNN analogue
 of `MLComputePlan`, and it is the one that answers "which unit". Lower with
 `profile_level=kProfileOptrace`, run, pull `qnn-profiling-data_0.log`, and
 decode it with **`libQnnHtpOptraceProfilingReader.so`**. The output,
@@ -632,15 +632,15 @@ decode it with **`libQnnHtpOptraceProfilingReader.so`**. The output,
 counters**. A graph that ran anywhere else produces nothing for that reader to
 read. Step 12 above is the procedure.
 
-**(d) RUNTIME — the negative control, and this is the one that makes it
+**(d) RUNTIME: the negative control, and this is the one that makes it
 evidence rather than a plan.** Move `libQnnHtpV<arch>Skel.so` out of
 `ADSP_LIBRARY_PATH` and run again. The skeleton is the code that executes *on
 the DSP*; without it the backend cannot initialise and the run **must fail**.
 If it still succeeds and returns the same numbers, the DSP was never involved.
 
-This is exactly the argument `docs/graph/NPU2.md` §2 makes with its third row — two
+This is exactly the argument `docs/graph/NPU2.md` §2 makes with its third row, two
 runs that are *identical* are what it looks like when the accelerator plan is
-being ignored — transplanted to a backend where the tell is a hard failure
+being ignored, transplanted to a backend where the tell is a hard failure
 rather than a difference.
 
 ### 6.2 What the silent fallback looks like
@@ -650,10 +650,10 @@ backwards would send a reader to the wrong log.
 
 | layer | silent? | what it looks like |
 |---|---|---|
-| **AOT partition** | **YES — this is the dangerous one** | `QnnPartitioner` tags what it can. Everything it declined stays in the program as **portable CPU kernels**. The `.pte` loads, runs, and returns the right answer. A model reporting 2 delegated nodes of 900 ran on the CPU and **nothing in its output says so.** |
+| **AOT partition** | **YES. This is the dangerous one** | `QnnPartitioner` tags what it can. Everything it declined stays in the program as **portable CPU kernels**. The `.pte` loads, runs, and returns the right answer. A model reporting 2 delegated nodes of 900 ran on the CPU and **nothing in its output says so.** |
 | **AOT backend type** | **semi-silent** | a compile spec with `kCpuBackend` or `kGpuBackend` still produces a `QnnBackend` delegate. It still delegates. It still gets the right answer. It never goes near the NPU. This is the fallback that looks most like success, which is why `match_device` refuses it by name and why nullification 3 (§8.3) was run against exactly that check. |
-| **AOT precision** | semi-silent | `kHtpQuantized` is the *default*. A float32 comparison against a quantised artefact is meaningless — §7.2. |
-| **runtime HTP init** | **NO — loud, and fail-closed** | §6.3 |
+| **AOT precision** | semi-silent | `kHtpQuantized` is the *default*. A float32 comparison against a quantised artefact is meaningless, §7.2. |
+| **runtime HTP init** | **NO, loud, and fail-closed** | §6.3 |
 
 **So the trap for QNN is at compile time, not at run time.** The number to
 read is `delegated_fraction`, and step 6 of §5 asserts on it rather than
@@ -675,9 +675,9 @@ Aborted
 ```
 
 **The method load fails and the process aborts. There is no CPU fallback.**
-The same check catches a mismatched architecture and says so by number —
+The same check catches a mismatched architecture and says so by number,
 `QnnDsp Arch 68 set by custom config is different from arch associated with
-SoC 57` — which is what `match_device` exists to catch one step earlier.
+SoC 57`, which is what `match_device` exists to catch one step earlier.
 
 This is a genuinely better property than NNAPI's, where `nnapi-reference` is
 a perfectly good software driver that answers correctly, and than CoreML's,
@@ -688,7 +688,7 @@ where the planner simply prefers the CPU and says nothing.
 Three of the four things in §6.1 were not observed, and the fourth was
 observed only for a non-QNN artefact:
 
-* **no QNN artefact was produced** — §1.3, the host cannot compile one;
+* **no QNN artefact was produced**: §1.3, the host cannot compile one;
 * **no QNN artefact reached a device.** A Snapdragon device did appear
   (§5.1, SM8550/v73) and was identified read-only, but there was nothing to
   push to it and nothing was pushed;
@@ -699,7 +699,7 @@ observed only for a non-QNN artefact:
 **So nothing in this round ran on a Hexagon NPU, and no sentence here says
 otherwise.** `test_no_claim_is_made_that_anything_ran_on_an_npu` asserts the
 absence rather than leaving it to prose, and it goes red the day the AOT half
-becomes available on the host — so the sentence gets rewritten deliberately
+becomes available on the host, so the sentence gets rewritten deliberately
 instead of inherited, which is the failure mode `docs/verification/DOCWATCH.md` exists for.
 
 What is *not* missing is the path: §5 is the procedure, and every piece of it
@@ -746,7 +746,7 @@ float32 path is.** It is here, on all five samples, by roughly six-fold. That
 is what two independent float32 truncation orders look like; it is not a
 claim that the artefact is "better".
 
-The test also asserts `min(oracle) > 0` — an upstream error of exactly zero
+The test also asserts `min(oracle) > 0`, an upstream error of exactly zero
 would drop the tolerance to the 8-ulp floor and make the derivation
 decorative, which is AGENTS.md §17.5's check-that-cannot-fail wearing the
 tolerance's clothes.
@@ -755,7 +755,7 @@ tolerance's clothes.
 
 **It cannot mean anything about QNN.** It is the XNNPACK artefact, on this
 Mac's CPU, in float32. What it establishes is that the shared
-export/lower/serialise/load/execute pipeline **preserves the function** —
+export/lower/serialise/load/execute pipeline **preserves the function**,
 which is a real and necessary result, and is not the result the round was
 after.
 
@@ -772,9 +772,9 @@ The Hexagon Tensor Processor is not float32 hardware. So:
 
 * with `kHtpFp16`, the honest tolerance is a **float16** tolerance. `docs/graph/NPU2.md`
   §2 measured the analogous CoreML number at 2.0e-04 against 3.0e-08 for
-  float32 — four orders of magnitude — and called it "the honest tolerance for
+  float32 (four orders of magnitude) and called it "the honest tolerance for
   an NPU claim here, not a regression". The same applies.
-* with `kHtpQuantized` — the default — the numbers are **quantised**, the
+* with `kHtpQuantized`: the default, the numbers are **quantised**, the
   artefact needs a calibrated quantizer that this round did not build, and a
   float32 element-wise comparison is not merely loose but *category-wrong*.
   `docs/graph/QUANT2.md` §2.1 is the precedent: quantisation cannot go on this
@@ -835,23 +835,23 @@ this round adds a second road rather than closing the first.
 
 ### 8.3 Nullification: 7 attempted, 1 uncaught
 
-The repository's standing rule — a verification that cannot fail is not a
-verification — applied by breaking the code on purpose. Sources were backed up
+The repository's standing rule, a verification that cannot fail is not a
+verification, applied by breaking the code on purpose. Sources were backed up
 with `cp` first and restored after; `git status --short` confirmed the restore.
 
 | # | fault injected | tests that went red |
 |---|---|---|
-| 1 | `delegate_` stops pre-validating the whole plan | 1 — `..._leaves_the_model_alone` |
+| 1 | `delegate_` stops pre-validating the whole plan | 1, `..._leaves_the_model_alone` |
 | 2 | `PteArtefact.is_qnn` returns `True` always | **9** |
-| 3 | `match_device` stops comparing the HTP arch | 1 — `..._wrong_silicon...` |
+| 3 | `match_device` stops comparing the HTP arch | 1, `..._wrong_silicon...` |
 | 4 | `htp_plan` reads `htp_arch` from `soc_model` | 2 |
-| 5 | `qnn_aot_refusal` stops checking the adaptor | **0 — NOT CAUGHT** |
+| 5 | `qnn_aot_refusal` stops checking the adaptor | **0, NOT CAUGHT** |
 | 6 | `QnnModule` stops checking the runtime registry | 1 |
-| 7 | `device_soc` collapses `SOC_TABLE_UNAVAILABLE` into `SOC_NOT_IN_TABLE` | 1 — and this is the fault §5.1 found in the wild, so the test was written *from* it |
+| 7 | `device_soc` collapses `SOC_TABLE_UNAVAILABLE` into `SOC_NOT_IN_TABLE` | 1, and this is the fault §5.1 found in the wild, so the test was written *from* it |
 
 **Nullification 5 is the useful one.** Deleting the check that names
 `PyQnnManagerAdaptor` changed nothing, because the function then fell through
-to the *next* import check (`qnn_partitioner`), which also fails — so
+to the *next* import check (`qnn_partitioner`), which also fails, so
 `qnn_aot_available()` stayed `False`, `lower()` still refused, and every
 assertion still passed. The sentence §1.3 leads with had simply stopped being
 produced and no test noticed.
@@ -860,12 +860,12 @@ The reason it was invisible is worth writing down: the test that asserts the
 adaptor is named reads the **shim** fixture, and the shim interpreter has no
 executorch at all, so the refusal there is about the *package* and the branch
 that names the adaptor is unreachable from it. The fix reads
-`qnn_aot_refusal()` on the interpreter that *does* have executorch — the only
-one where the distinction is observable — and requires `PyQnnManagerAdaptor`,
+`qnn_aot_refusal()` on the interpreter that *does* have executorch: the only
+one where the distinction is observable, and requires `PyQnnManagerAdaptor`,
 `x86_64-linux-clang` and `is_linux_x86` to all appear. Re-run with the same
 fault: **caught**.
 
-This is `docs/graph/EXPORT5.md` §11's finding repeating — the uncaught nullification
+This is `docs/graph/EXPORT5.md` §11's finding repeating, the uncaught nullification
 is worth more than the five caught ones, because the five confirmed tests that
 were already working and the one found a test that was not.
 
@@ -885,13 +885,13 @@ tests/golden/compare.py        11420/11420 cases passed, 0 failed,
 **Golden is exactly unmoved**, which is the correct result and the check that
 this round did what it says: no Rust changed, no op was added to
 `_aten_implemented()`, and no case builder was needed in `tests/golden/cases.py`.
-The two counts that moved are the two this round added to — 19 tests and 22
-DOCWATCH markers — and both moved by exactly the amount added.
+The two counts that moved are the two this round added to, 19 tests and 22
+DOCWATCH markers, and both moved by exactly the amount added.
 
 The gate was run with `TORCHNATIVE_QNN_PYTHON` set, so the ExecuTorch tests ran
 rather than skipping. Measured without it: **eight skip entirely and two skip
 their ExecuTorch half**, all ten naming `TORCHNATIVE_QNN_PYTHON`. The `ok`
-count is unchanged at 19, because a skip is a pass here — which is exactly why
+count is unchanged at 19, because a skip is a pass here, which is exactly why
 each skip line has to name the missing thing (docs/devices/VULKAN3.md §6.1: a skip
 with a false reason is counted as a pass).
 
@@ -942,7 +942,7 @@ those line up with names here and the alignment is deliberate:
 `DelegateModule` subclass and let `npu.delegate_` do the swapping, rather than
 each back end growing its own replacement walk. The two rounds would then share
 one front end and one refusal vocabulary, and the difference between them would
-be exactly the thing that should differ — which vendor artefact sits behind the
+be exactly the thing that should differ, which vendor artefact sits behind the
 leaf.
 
 **Expected conflict, and it is small**: both rounds edited the module docstring
@@ -962,8 +962,8 @@ round touches a tracked file.
   **unknown**. They may be poor: QNN's 112 op builders are not the same set as
   XNNPACK's, and `docs/graph/REFOLD.md` §1.1 is this project's record of assuming a
   bigger table meant better coverage and being wrong three times.
-* **Nothing ran on an NPU.** §6.4. The device that appeared is the right one —
-  SM8550, HTP v73, `/dev/adsprpc-smd` present — and it is not what was missing.
+* **Nothing ran on an NPU.** §6.4. The device that appeared is the right one,
+  SM8550, HTP v73, `/dev/adsprpc-smd` present, and it is not what was missing.
   What was missing is the artefact, and producing one needs a Linux x86-64 host
   this round did not have.
 * **The quantised path was not built.** `kHtpQuantized` is QNN's default and
@@ -971,13 +971,13 @@ round touches a tracked file.
   (`executorch.backends.qualcomm.quantizer`) and, per §7.2, its own numerical
   axis. `docs/graph/QUANT2.md` §2 is what that axis has to look like.
 * **`lower()` has never executed.** It refuses on every host reachable from
-  here, so its body — the four-line `torch.export` →
-  `to_edge_transform_and_lower_to_qnn` → `to_executorch` sequence — is
+  here, so its body, the four-line `torch.export` →
+  `to_edge_transform_and_lower_to_qnn` → `to_executorch` sequence: is
   **wired, not run**. That is stated plainly rather than implied by the tests
   passing.
 * **`qnn_device` reads but never writes.** `device_report()` and `fastrpc_nodes()`
-  ran against a real SM8550 (§5.1) and found a defect doing it. `cleanup()` —
-  a `rm -rf` of one directory — has **not** run, because nothing was ever
+  ran against a real SM8550 (§5.1) and found a defect doing it. `cleanup()`,
+  a `rm -rf` of one directory, has **not** run, because nothing was ever
   staged: the device is shared, this round had no QNN artefact to push, and
   `/data/local/tmp/bw_qnn` was verified absent rather than created and removed.
 * **No whole model, only one submodule.** `model.layers.0.mlp` is the smallest

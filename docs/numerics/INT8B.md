@@ -1,4 +1,4 @@
-# `from_pretrained(dtype=torch.int8)` — where the request dies, and what is left of it
+# `from_pretrained(dtype=torch.int8)`: where the request dies, and what is left of it
 
 Round date 2026-09-06. Branch `work/scalar3`, on develop `479b3cf`. Host Apple M1,
 CPython 3.13, transformers 5.15.1, upstream torch 2.13.0, `candle-core` 0.11.0.
@@ -18,7 +18,7 @@ slot where `dtype=torch.bfloat16` works.
 >
 > | spelling | today | after this round |
 > |---|---|---|
-> | `from_pretrained(name, dtype=torch.int8)` | `ValueError` from transformers | **unchanged — `ValueError` from transformers** |
+> | `from_pretrained(name, dtype=torch.int8)` | `ValueError` from transformers | **unchanged, `ValueError` from transformers** |
 > | `from_pretrained(name, dtype=torch.int8, quantization_config=TorchnativeConfig("q8_0"))` | `ValueError` from **us**, saying "cannot run int8 activations" | **loads**, `q8_0` weights, `float32` activations, bit-identical to the same config at `float32` |
 >
 > The bare form is closed by `transformers.modeling_utils.local_torch_dtype`, and the
@@ -61,10 +61,10 @@ else:
 ```
 
 `dtype` is not a parameter of that function. So with `dtype=torch.int8` and no
-`quantization_config=`, `hf_quantizer` is `None` — decided, irrevocably, before
+`quantization_config=`, `hf_quantizer` is `None`: decided, irrevocably, before
 anything about `int8` has been read.
 
-### 1.2 `_get_dtype` does not refuse — it delegates
+### 1.2 `_get_dtype` does not refuse: it delegates
 
 `_get_dtype` (`modeling_utils.py:816`) resolves `"auto"`, rejects a `dtype` that is
 neither `str`, `dict` nor `torch.dtype`, and then does this:
@@ -98,7 +98,7 @@ def local_torch_dtype(dtype, model_class_name=None):
 
 The guard exists because the next line is `torch.set_default_dtype`, which cannot take
 an integer dtype in upstream torch either. On the shim, `torch.int8.is_floating_point`
-is `False` and `is_signed` is `True` and `itemsize` is `1` — all correct, and nothing
+is `False` and `is_signed` is `True` and `itemsize` is `1`, all correct, and nothing
 here should change that.
 
 Measured, on the shim, transformers 5.15.1, `HuggingFaceTB/SmolLM2-135M`:
@@ -111,12 +111,12 @@ ValueError: LlamaForCausalLM cannot be instantiated under `dtype=torch.int8`
 
 The regression test asserts the traceback contains a frame named `local_torch_dtype`,
 that some frame is inside `transformers`, and that **no** frame is inside
-`torchnative` — so a later round cannot mistake this for something this repository
+`torchnative`, so a later round cannot mistake this for something this repository
 broke, and cannot "fix" it in the wrong file.
 
 ### 1.4 So: the honest answer is not one of the three offered
 
-The framing offered three answers — map it to q8_0, refuse by name, or lie. **On the
+The framing offered three answers, map it to q8_0, refuse by name, or lie. **On the
 bare spelling none of them is available**, because no code in this repository runs.
 Refusing "by name" would already be an improvement over what happens, and we cannot
 even do that: the message the user sees is transformers' own, and it names
@@ -159,7 +159,7 @@ will report torch.float32 and not the dtype you passed; model.torchnative_quanti
 records what actually happened.
 ```
 
-**Only `torch.int8`.** `torch.uint8` is not widened — `q8_0` is a *signed* 8-bit block
+**Only `torch.int8`.** `torch.uint8` is not widened: `q8_0` is a *signed* 8-bit block
 format, so `uint8` is a different request and keeps the old refusal. `torch.float64`
 keeps it too. Both are asserted.
 
@@ -179,7 +179,7 @@ keeps it too. Both are asserted.
 | logits `[0,-1,:3]` | `3.036725, -12.787579, -12.650931` | identical | `2.598259, -13.394009, -13.257526` |
 
 **`dtype=torch.int8` and the explicit `quantization_config` produce the same model.**
-Not "close" — the same. They are one path: `update_dtype` returns `float32` and
+Not "close", the same. They are one path: `update_dtype` returns `float32` and
 everything downstream is the load `docs/graph/HFQUANT.md` already measured. The dense column
 is the negative control; it differs, so the identity above is evidence of something.
 
@@ -192,7 +192,7 @@ Generation, all three:
 
 (SmolLM2-135M at greedy decoding is repetitive on this prompt in every configuration
 including dense float32. It is not a quantisation artefact, and it is not a quality
-claim either way — one prompt, per `docs/graph/QUANT2.md` §5.3.)
+claim either way, one prompt, per `docs/graph/QUANT2.md` §5.3.)
 
 ### 3.1 Can the user tell what they loaded?
 
@@ -202,7 +202,7 @@ surfaces carry the truth, and one of them is unprompted.
 
 | surface | what it says |
 |---|---|
-| a warning at load, unprompted | the text in §2 — names `q8_0`, names candle's missing `I8`, and says in advance that `model.dtype` will read `float32` |
+| a warning at load, unprompted | the text in §2, names `q8_0`, names candle's missing `I8`, and says in advance that `model.dtype` will read `float32` |
 | `str(model)` | `QuantizedLinear(in_features=576, out_features=576, bias=False, format=q8_0)` × 210, and one plain `Linear` for `lm_head` |
 | `model.torchnative_quantization` | the load report, now with a line naming the dtype that was asked for |
 
@@ -219,7 +219,7 @@ format=q8_0 converted=210 left dense=1
 
 **What is still not visible from `model.dtype`.** A caller who writes
 `dtype=torch.int8`, suppresses warnings and then reads `model.dtype` gets `float32`
-with no indication. That is transformers' contract, not a choice made here —
+with no indication. That is transformers' contract, not a choice made here,
 `model.dtype` reads `config.dtype`, which is the *activation* dtype, and every
 quantised model in transformers behaves this way (bitsandbytes 8-bit reports `float16`).
 It is recorded rather than fixed.
@@ -236,7 +236,7 @@ subprocess (the existing `_hfquant_fixture` harness, one new mode).
 
 | assertion | what it would catch |
 |---|---|
-| bare `int8` raises, message says "not a floating-point dtype" | someone quietly making `int8` loadable as float32 — the dishonest option |
+| bare `int8` raises, message says "not a floating-point dtype" | someone quietly making `int8` loadable as float32, the dishonest option |
 | the traceback has a `local_torch_dtype` frame, has a `transformers` frame, has **no** `torchnative` frame | this repository taking the blame, or the credit, for a refusal that is not its |
 | `int8` + config logits **bit-identical** to `float32` + config | two paths where there should be one |
 | a **dense** load's logits differ | the line above comparing two values that could not have differed |
@@ -256,7 +256,7 @@ dtype is read, and §1.3 shows the guard sits in front of `torch.set_default_dty
 |---|---|---|
 | Runtime monkeypatch of `modeling_utils` from `torchnative.quant` | ~30 lines | An import that changes what an unrelated `from_pretrained` does. `docs/graph/HFQUANT.md` §7 went out of its way to guarantee the opposite, and there is a regression test asserting it (`test_the_quantizer_registers_a_name_and_changes_nothing_else`). |
 | Upstream PR: a dtype→quantizer registry in `get_hf_quantizer` | small in transformers, unknown in review | Not this repository's to land, and it would be a new public concept in transformers (`dtype` selecting a quantiser) rather than a bug fix. |
-| A real `torch.int8` storage, so the guard is the only obstacle left | **+252 lines in a forked `candle-core`, +7 here** (`docs/numerics/INT8.md` §2, §3) | Still would not make the bare spelling work — `local_torch_dtype` refuses on `is_floating_point`, not on whether the dtype exists. **This is the important one:** landing the candle patch does **not** unlock the user's spelling. |
+| A real `torch.int8` storage, so the guard is the only obstacle left | **+252 lines in a forked `candle-core`, +7 here** (`docs/numerics/INT8.md` §2, §3) | Still would not make the bare spelling work, `local_torch_dtype` refuses on `is_floating_point`, not on whether the dtype exists. **This is the important one:** landing the candle patch does **not** unlock the user's spelling. |
 
 The last row is the finding worth carrying forward. `docs/numerics/INT8.md` sized the storage
 half carefully and left it unlanded; **this round establishes that landing it would not
@@ -268,9 +268,9 @@ candle's `DType`.
 ## 6. What this round did not establish
 
 - **No timings.** Six other agents were running. Nothing here is a performance claim.
-- **No memory measurement.** `docs/graph/HFQUANT.md` §2's peak-RSS numbers apply unchanged —
-  §3 shows the `int8` spelling produces a bit-identical model to the one measured there
-  — but they were not re-taken.
+- **No memory measurement.** `docs/graph/HFQUANT.md` §2's peak-RSS numbers apply unchanged,
+  §3 shows the `int8` spelling produces a bit-identical model to the one measured there,
+  but they were not re-taken.
 - **No perplexity.** One prompt, as in `docs/graph/QUANT2.md` §5.3. Accuracy for this model
   is `docs/graph/HFQUANT.md` §3's table and is unmoved.
 - **Llama only, host only.** No device, no other architecture.
@@ -287,7 +287,7 @@ candle's `DType`.
 | kind | what |
 |---|---|
 | **feature added** | `TorchnativeHfQuantizer.update_dtype` accepts `torch.int8` beside a `TorchnativeConfig`, widening activations to `float32` with a disclosure; `_LoadReport` carries the requested dtype |
-| **defect fixed** | none. **Golden 8681/8681, ops=207, unmoved — no Rust changed** |
+| **defect fixed** | none. **Golden 8681/8681, ops=207, unmoved, no Rust changed** |
 | **test added** | 1 (415 → 416), plus one new mode in the existing subprocess fixture |
 | **documentation corrected** | `docs/graph/HFQUANT.md` §1 and `torchnative/quant/hf.py`'s module docstring both named `_get_dtype` as the refusal site. It is `local_torch_dtype`, and the difference is what made §2 possible |
 | **deleted** | none |

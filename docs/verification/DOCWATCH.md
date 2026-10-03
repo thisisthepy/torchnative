@@ -11,7 +11,7 @@ was decided rather than reconstructed afterward.
 
 Free-text prose cannot be parsed reliably into a checkable claim.
 `docs/verification/AUDIT.md` itself is the proof: its findings quote things like "37개 중
-9개" and "여전히 한 번도 실행되지 않았습니다" — no regex distinguishes those
+9개" and "여전히 한 번도 실행되지 않았습니다". No regex distinguishes those
 from the surrounding narrative sentences that are *not* claims (design
 rationale, historical color, a sentence explaining why a number is what it
 is). A pattern match broad enough to catch prose like that is also broad
@@ -25,8 +25,8 @@ Three designs were on the table:
 
 1. **A machine-readable marker the documents opt into.** An HTML comment
    (invisible when the file renders) naming exactly what to check and against
-   what ground truth. Zero false positives by construction — nothing fires
-   unless someone deliberately wrote a marker — at the cost of coverage: only
+   what ground truth. Zero false positives by construction, nothing fires
+   unless someone deliberately wrote a marker, at the cost of coverage: only
    claims someone annotated are checked.
 2. **Conservative pattern matching over the prose**, with a manual allow-list
    for everything else. Rejected: the allow-list *is* the coverage, so this
@@ -52,8 +52,8 @@ sits immediately next to the sentence it backs, in an HTML comment:
 
 Design 3's narrowing is still real inside design 1: op-existence, symbol-
 existence, json-key and count checks are the only primitives this tool
-offers. There is no free-form "python-eval this arbitrary claim" primitive
-— every primitive is a fixed, reviewable operation with one ground-truth
+offers. There is no free-form "python-eval this arbitrary claim" primitive,
+every primitive is a fixed, reviewable operation with one ground-truth
 source, so a marker is auditable by reading it, the same way `run.sh`'s
 guard is auditable by reading its `cmp` exit code branches. What this trades
 away, honestly: a marker has to be added by a human (or an audit round) who
@@ -65,8 +65,8 @@ scans 74 documents' prose. See "What this cannot see" at the end.
 `tests/run.sh` and `tests/golden/compare.py --self-test` set
 the shape this follows: read ground truth from the live tree (never from a
 hardcoded expectation baked into the checker), report `PASS`/`FAIL` per
-category with counts, exit non-zero on any failure, and — the specific
-lesson from `run.sh`'s own incident report in its own comments — distinguish
+category with counts, exit non-zero on any failure, and, the specific
+lesson from `run.sh`'s own incident report in its own comments, distinguish
 "this is wrong" from "I could not check this" rather than collapsing both to
 a single failure.
 
@@ -77,7 +77,7 @@ python3 tests/docwatch/check_docs.py [FILES...]
 ```
 
 With no arguments it scans every `docs/*.md`. It needs the same environment
-`tests/_support/decomp_sweep.py` documents needing — a built shim on
+`tests/_support/decomp_sweep.py` documents needing: a built shim on
 `PYTHONPATH`:
 
 ```
@@ -89,7 +89,7 @@ Static-only markers (`symbol-in-file`, `json-key`) work without that
 environment too (`--no-live` skips anything that needs the shim or the
 harness scripts, and reports what it skipped rather than silently passing).
 
-## Primitives (final set — see "rejected primitives" below for what did not make it)
+## Primitives (final set: see "rejected primitives" below for what did not make it)
 
 | Marker | Ground truth | What it catches |
 |---|---|---|
@@ -101,7 +101,7 @@ harness scripts, and reports what it skipped rather than silently passing).
 | `count <name> <op> <value>` | one of a fixed registry of live harness runs (below) | "N of M", "K tests", "P/Q cases" |
 
 `count`'s registry (deliberately small and named, not a free-form shell
-command — a marker cannot ask the checker to run anything other than these):
+command, a marker cannot ask the checker to run anything other than these):
 
 | name | source |
 |---|---|
@@ -110,7 +110,7 @@ command — a marker cannot ask the checker to run anything other than these):
 | `schema_entries_matched`, `schema_entries_total` | `verify_schemas.py`'s `SUMMARY:` line |
 | `decomp_implemented`, `decomp_population`, `decomp_lowered` | `decomp_sweep.py`'s summary line + verdict tally |
 
-`op` is one of `eq`, `ge`, `le` — `ge`/`le` exist because AUDIT.md's own
+`op` is one of `eq`, `ge`, `le`: `ge`/`le` exist because AUDIT.md's own
 findings distinguish "this exact number" from "at least this many", and a
 count marker for "148 ops implemented, and growth is expected" should use
 `ge` so a *later* correct growth does not itself trip the checker; a marker
@@ -121,7 +121,7 @@ in either direction is news.
 
 - **A general `path:line` exact-line check.** AUDIT.md's own method used
   `path:line` in its findings (`test_shim.py:7625`), but a line number is
-  invalidated by any unrelated edit above it in the same file — it would cry
+  invalidated by any unrelated edit above it in the same file. It would cry
   wolf constantly, which is exactly the failure mode this document opens by
   rejecting. `symbol-in-file` checks the same underlying claim (the named
   thing still exists in that file) without depending on which line it is on.
@@ -146,20 +146,20 @@ Recorded as each step actually ran, not reconstructed after.
 ### Finding on the current tree, before any marker was added
 
 The very first live-count check this tool ran was against `docs/verification/AUDIT.md`'s
-own baseline paragraph — the numbers that paragraph says were established
+own baseline paragraph, the numbers that paragraph says were established
 "before touching any file" for the audit round that produced it (268 `ok`
 lines, 5634/5634 golden cases, ops covered=148, 4392/4392 schema entries).
 Re-running the exact same commands today (before I had added a single
 marker) gave 274 / 6374/6374 ops=161 / 4458/4458. The gap is
-`cb6780d`/`f596426` ("Feat/Docs: Twenty-six of twenty-six" — the KERNELS26
+`cb6780d`/`f596426` ("Feat/Docs: Twenty-six of twenty-six": the KERNELS26
 round), which landed *after* `docs/verification/AUDIT.md`'s last commit and moved every
 gate count the audit used as its ground truth. **The document whose whole
 thesis is "a later commit closes a gap and nobody updates the document that
-named it" was already, itself, an instance of exactly that** — this is not
+named it" was already, itself, an instance of exactly that**. This is not
 a hypothetical the design needed to manufacture; it was sitting in the tree
 before this task started, one commit later than the audit that should have
 caught it. That is the finding the task brief predicted ("if it finds
-nothing, that is suspicious") — it did not find nothing. A `>
+nothing, that is suspicious"). It did not find nothing. A `>
 **Correction (docs/verification/DOCWATCH.md, 2026-09):**` block was added to
 `docs/verification/AUDIT.md` at the same spot, with `ge`-comparison markers on the
 corrected numbers (so the *next* growth round does not repeat the same
@@ -177,7 +177,7 @@ today's tree:
 DOCWATCH: PASS -- 43/43 evaluated marker(s) hold
 ```
 
-(43, not 39 — four more were added afterward for `DESIGN.md`'s two
+(43, not 39, four more were added afterward for `DESIGN.md`'s two
 remaining §9 import-wall claims, once `symbol-in-file` proved able to check
 them too.) `--no-live` alone (no shim, no torch) still evaluates the 14
 static (`symbol-in-file`/`json-key`) markers and correctly skips the rest
@@ -196,11 +196,11 @@ the same staleness mechanism while wiring them up, independent of the
 AUDIT.md baseline finding above: `docs/verification/AUDIT.md`'s own correction to
 DECOMP.md (45 population / 11 lowered, replacing the original 37/9) was
 *also* already stale by the time this task started, for the identical
-reason — the same KERNELS26 commit. Today's number is 50/12. A nested
+reason, the same KERNELS26 commit. Today's number is 50/12. A nested
 `> >`-style re-correction was added (matching `docs/design/DESIGN.md`'s own
 nesting convention for a second correction on top of a first), with `ge`
 markers this time specifically so a third round of kernel growth does not
-require a third manual correction — the check catches it the moment growth
+require a third manual correction, the check catches it the moment growth
 happens, run.sh moving is enough to make the next `check_docs.py` run go
 red.
 
@@ -227,12 +227,12 @@ pre-fault version.
 
 `git show 36d3a2d:docs/DECOMP.md` (the commit immediately before
 `docs/verification/AUDIT.md`'s correction landed, `23c7097`) has, unhedged and in the
-present tense: "**37 개 중 9 개**" (37 population, 9 lowered) — no
+present tense: "**37 개 중 9 개**" (37 population, 9 lowered), no
 round-scoping language, the exact shape of claim `docs/verification/AUDIT.md` later
 found false. That historical text was extracted into a scratch file with
 two markers instantiating exactly that claim (`count decomp_population eq
 37`, `count decomp_lowered eq 9`) and run against **today's** tree (no
-special historical build needed — the claim is about a count, and the
+special historical build needed, the claim is about a count, and the
 checker's job is exactly "does this count still hold"):
 
 ```
@@ -242,8 +242,8 @@ count decomp_lowered eq 9  -- decomp_lowered = 12 (claim: eq 9)
 
 Both fail. Had this marker existed in `docs/graph/DECOMP.md` on 2026-08-30, the
 first `decomp_sweep.py`-moving commit after it (kernel work landing on top,
-unrelated to DECOMP.md itself) would have turned this check red immediately
-— not days or weeks later when a manual audit happened to read that
+unrelated to DECOMP.md itself) would have turned this check red immediately,
+not days or weeks later when a manual audit happened to read that
 paragraph again. This is the mechanism `docs/verification/AUDIT.md` names as the one
 that recurred nearly every time; this is that same mechanism caught at the
 moment it would have first fired, not after the fact.
@@ -252,10 +252,10 @@ moment it would have first fired, not after the fact.
 
 `docs/verification/AUDIT.md` records roughly 30 distinct findings (claim + status +
 how-checked) across its eleven files. This tool's markers now stand in for
-about 15 of them directly — the ones that reduce to an op's presence in
+about 15 of them directly, the ones that reduce to an op's presence in
 `_aten_implemented()`, an upstream `hasattr`, a JSON table key, a symbol's
 existence in a source file, or a harness's own summary count. That is
-roughly half, and it is not a representative half — it is specifically the
+roughly half, and it is not a representative half. It is specifically the
 half AUDIT.md's own account says did the most damage in aggregate count
 (the six-of-eleven staleness pattern is dominated by exactly these
 existence/count claims), but *not* the single highest-severity one
@@ -279,11 +279,11 @@ What is structurally invisible to this design, by category:
 - **Numeric/behavioral divergences from upstream** (`VIEWS.md`'s
   write-through-view semantics, the partial-overlap `copy_` divergence,
   the `slice.Tensor` step>1 write-loss). These are "does the computed
-  *value* match a specific expectation", not "does this thing exist" — the
+  *value* match a specific expectation", not "does this thing exist": the
   existence half of these claims (`aten.ge.Tensor`/`aten.index_put_.default`
   now have kernels) is covered; the behavioral half is not.
 - **Prose reasoning and design arguments** (the A-vs-B tensor engine
-  decision, the TTL/TTA/TTT taxonomy) — `docs/verification/AUDIT.md` itself declined to
+  decision, the TTL/TTA/TTT taxonomy), `docs/verification/AUDIT.md` itself declined to
   check these, on the same grounds this document opens with: they are not
   checkable facts.
 - **Cross-document narrative claims** ("a wall in document A is superseded
@@ -295,16 +295,16 @@ What is structurally invisible to this design, by category:
 - **`docs/platform/WHEEL.md`'s self-test counts** (`build.py --self-test` and
   siblings). These fit the `count` primitive's shape exactly, but the
   scripts that produce them live under `scripts/wheel/`, outside this task's
-  territory — extending the registry to them is a natural, low-risk
+  territory, extending the registry to them is a natural, low-risk
   follow-up, deliberately not done here.
 - **74 documents total, 11 audited.** The other 63 were not read this round
-  (by `docs/verification/AUDIT.md`'s own account) and carry zero markers by construction
-  — this tool only checks what someone read and tagged, and nobody has
+  (by `docs/verification/AUDIT.md`'s own account) and carry zero markers by construction,
+  this tool only checks what someone read and tagged, and nobody has
   read those 63 yet.
 
 The honest framing, in the terms the task brief itself offered: this is
 thirty-ish claims checked correctly, not three hundred checked
 approximately. The four that fired for real (the AUDIT.md baseline, the
 DECOMP.md/CAPTURE.md re-staleness, the deliberate fault, the historical
-replay) are not synthetic — three of the four were sitting in the tree
+replay) are not synthetic, three of the four were sitting in the tree
 before this task touched anything.

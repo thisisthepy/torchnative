@@ -1,4 +1,4 @@
-# The FFT — the third wall, and `torch.stft` produces upstream's numbers
+# The FFT: the third wall, and `torch.stft` produces upstream's numbers
 
 Worktree `work/fft` on develop `2498122`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `src/overloads.json`, `tests/golden/cases.py` and the new
@@ -6,8 +6,8 @@ Worktree `work/fft` on develop `2498122`. Territory: `torchnative/rust/torch_c/s
 each is named with its reason in §8. `tensor.rs`, `dtype.rs`, `bootstrap.py`,
 `capture.rs`, `tape.rs`, `scripts/wheel/` and `torchnative/` were not touched.
 
-`docs/kernels/COMPLEX.md` set an ordering — **reflect pad → complex tensors → the
-FFT** — and the two previous rounds cleared the first two (`docs/kernels/PAD.md`,
+`docs/kernels/COMPLEX.md` set an ordering: **reflect pad → complex tensors → the
+FFT**, and the two previous rounds cleared the first two (`docs/kernels/PAD.md`,
 `docs/kernels/COMPLEX2.md`). This is the third and last of them.
 
 ## 0. Answers first
@@ -15,25 +15,25 @@ FFT** — and the two previous rounds cleared the first two (`docs/kernels/PAD.m
 | question | answer | where |
 |---|---|---|
 | Does `torch.stft` produce upstream's numbers? | **Yes, on a real signal, through the public Python entry point, with `center=False`.** Element-wise against a live upstream, worst relative disagreement **4.9e-7**. | §1 |
-| And with `center=True`? | **Yes, but one line short of reachable.** `torch/functional.py:678` pads in Python through `torch._C._nn.pad`, whose `reflect` branch is still missing from `bootstrap.py` — another agent's file, and docs/kernels/PAD.md §5 already wrote the four-line patch. With that composite installed in-process the centred output agrees with upstream to 1.2e-7. | §6 |
+| And with `center=True`? | **Yes, but one line short of reachable.** `torch/functional.py:678` pads in Python through `torch._C._nn.pad`, whose `reflect` branch is still missing from `bootstrap.py`, another agent's file, and docs/kernels/PAD.md §5 already wrote the four-line patch. With that composite installed in-process the centred output agrees with upstream to 1.2e-7. | §6 |
 | Is `n_fft` a power of two in every model? | **No, and this was measured rather than assumed.** `whisper`, `qwen3_asr` and `voxtral_realtime` all use **400**. So no size is refused: radix-2 where it applies, **Bluestein** everywhere else. | §4 |
-| What are the normalisation conventions? | The `normalization` argument is **not** a `norm=` string. `0 → 1`, `1 → 1/sqrt(n)`, `2 → 1/n`, and the **same three codes serve both directions** — `rfft`'s `backward` default is `0` and `ifft`'s `backward` default is `2`. `stft(normalized=True)` is code **1**. | §2.2 |
+| What are the normalisation conventions? | The `normalization` argument is **not** a `norm=` string. `0 → 1`, `1 → 1/sqrt(n)`, `2 → 1/n`, and the **same three codes serve both directions**, `rfft`'s `backward` default is `0` and `ifft`'s `backward` default is `2`. `stft(normalized=True)` is code **1**. | §2.2 |
 | And `onesided`? | `n // 2 + 1` bins. Default `True` for a real input. `_fft_c2r` additionally reads only the first `last_dim_size // 2 + 1` bins, **even when more are supplied**. | §3 |
-| Was candle forked? | **No.** candle 0.11.0 still has no FFT (docs/architectures/VOICE.md §3) and now still has none — the arithmetic is written in `aten.rs`. | §2 |
+| Was candle forked? | **No.** candle 0.11.0 still has no FFT (docs/architectures/VOICE.md §3) and now still has none, the arithmetic is written in `aten.rs`. | §2 |
 | Did `as_strided` have to land? | **No, and that is asserted.** Upstream's `stft` frames its input with `as_strided`; this one gathers. `aten.as_strided.default` was still unimplemented after this round; `docs/kernels/STRIDED.md` landed it later and `stft` still does not use it. | §5.2 |
 | What did the test catch? | **Two defects, both of which return a plausible spectrum**: a conjugated Bluestein transform, and `_fft_c2r` reading one bin too many. | §2.1, §3 |
 
 Split the way docs/architectures/ARCH100.md §5.3 asks, rather than as one number:
 
-* **feature added** — 5 kernels: `_fft_r2c`, `_fft_c2c`, `_fft_c2r`,
+* **feature added**: 5 kernels: `_fft_r2c`, `_fft_c2c`, `_fft_c2r`,
   `stft.default`, `stft.center`; one `overloads.json` row (two schemas).
-* **tests added** — 14 in `tests/ops/test_fft.py`; 38 golden cases
+* **tests added**: 14 in `tests/ops/test_fft.py`; 38 golden cases
   (10039 → 10077, ops 270 → 272).
-* **defect fixed** — none pre-existing; the two in §2.1 and §3 were this
+* **defect fixed**: none pre-existing; the two in §2.1 and §3 were this
   round's own, found before landing.
-* **tests inverted** — 1 in `tests/ops/test_tail2.py` (the `fft_` absence
+* **tests inverted**: 1 in `tests/ops/test_tail2.py` (the `fft_` absence
   assertion), 1 example moved in `test_shim.py`, 2 pinned counts.
-* **not done** — `istft` (§7.2), `fft_fftn`'s *spelling* (§5.3), a
+* **not done**: `istft` (§7.2), `fft_fftn`'s *spelling* (§5.3), a
   device-side transform (§7.1), `torch.stft(center=True)`'s last line (§6).
 
 <!-- The three `_fft_*` keys are in IMPLEMENTED_AWAITING_GOLDEN, not in
@@ -52,7 +52,7 @@ Split the way docs/architectures/ARCH100.md §5.3 asks, rather than as one numbe
 
 ## 1. The bar: `torch.stft`, on a real signal
 
-Not `torch.ops.aten.stft` — the public function, which goes through
+Not `torch.ops.aten.stft`, the public function, which goes through
 `torch/functional.py` and back into the shim's `_VF.stft`:
 
 ```python
@@ -71,7 +71,7 @@ whisper's shape, n_fft=400        (201, 8)     6.3e-08
 
 **The shim is the more accurate of the two.** It transforms in `f64` on the
 host where upstream transforms in `f32`, so the residual above is upstream's
-rounding rather than this code's — which is why `test_fft.py`'s tolerance of
+rounding rather than this code's, which is why `test_fft.py`'s tolerance of
 `1e-5` is twenty times the observed worst case and still nowhere near wide
 enough to hide any of the failure modes §2 lists.
 
@@ -80,7 +80,7 @@ stops and what it does when that line is supplied.
 
 ## 2. The transform, which is arithmetic and not a binding
 
-`docs/architectures/VOICE.md` §3 grepped candle 0.11.0 and found no FFT of any kind — the
+`docs/architectures/VOICE.md` §3 grepped candle 0.11.0 and found no FFT of any kind, the
 only hits for "fft" are a comment in `conv.rs` and a commented-out row in
 `npy.rs`'s dtype table. That was re-checked rather than inherited, and it still
 holds. So there is no candle call to reach for.
@@ -89,7 +89,7 @@ holds. So there is no candle call to reach for.
 other kernel in `aten.rs` keeps its data on the device. This one reads it back.
 The reason is that the alternatives are worse rather than that this is good:
 
-* a **DFT matrix multiply** stays on-device and is one `matmul` — but it
+* a **DFT matrix multiply** stays on-device and is one `matmul`, but it
   accumulates 1024 `f32` products per output bin and diverges from upstream by
   ~1e-4 relative. That is a *uniform* error, which is the size that a loose
   tolerance hides and a "looks like a spectrum" eyeball check cannot see.
@@ -145,7 +145,7 @@ wrong by a factor of `n` inverse. `forward` and `inverse` select the **sign of
 the exponent and nothing else**; the scale is applied once, at the end, from
 the code.
 
-**`torch.stft(normalized=True)` is code 1**, traced —
+**`torch.stft(normalized=True)` is code 1**, traced:
 `_fft_r2c(frames, [2], 1, True)`. Code 2 would divide by `n_fft` where this
 divides by `sqrt(n_fft)`; both produce a spectrum, and only the ratio
 distinguishes them, which is how `test_fft.py` pins it.
@@ -159,8 +159,8 @@ complex into r2c     Only supports floating-point dtypes, but found: ComplexFloa
 real into c2c        Only supports complex dtypes, but found: Float
 ```
 
-The first reads like an upstream defect — it names `Double`, which is not what
-it can take — and it is reproduced anyway, because a caller diagnosing a dtype
+The first reads like an upstream defect. It names `Double`, which is not what
+it can take, and it is reproduced anyway, because a caller diagnosing a dtype
 problem matches on the message it actually gets. All four are compared against
 a **running** upstream in `test_fft.py` rather than against this transcription,
 so they cannot drift.
@@ -178,7 +178,7 @@ for an even length (8 → 5) and an odd one (5 → 3), because `n // 2 + 1` and
 `(n + 1) // 2` agree on odd lengths and disagree on even ones.
 
 **`_fft_c2r` has the mirror trap and it cost a second defect.**
-`last_dim_size` is authoritative, not the input's bin count — a 5-bin input
+`last_dim_size` is authoritative, not the input's bin count: a 5-bin input
 with `last_dim_size = 9` gives a length-9 tensor and with `last_dim_size = 7` a
 length-7 one. The first build rebuilt the Hermitian spectrum from *all* the
 bins it was given:
@@ -191,17 +191,17 @@ _fft_c2r(rfft([1,2,4,8,3,-1,0.5,7]), [0], 2, 7)
 
 Bin 4 is simply not part of a 7-point Hermitian spectrum. The rule is
 `used = min(last_dim_size // 2 + 1, bins)`, and everything past it is dropped
-rather than mirrored. Wrong by 0.58 on values of order 10 — a signal of the
+rather than mirrored. Wrong by 0.58 on values of order 10, a signal of the
 right length and the wrong values, with no shape to give it away.
 
 **`dim` may name more than one axis.** Upstream does a `c2c` over every axis
 except the last named one and an `r2c` over that one, and the `onesided`
 truncation applies to the last entry only:
 `_fft_r2c(randn(4,8), [0,1], 0, True)` is `(4, 5)`. That is `rfft2`'s shape, so
-the multi-axis path is implemented rather than refused — §5.3 on why that is
+the multi-axis path is implemented rather than refused, §5.3 on why that is
 not the same as landing `fft_fftn`.
 
-## 4. "n_fft is a power of two" — measured, and false
+## 4. "n_fft is a power of two": measured, and false
 
 This round was scoped to *measure* that claim and, if it held, to implement the
 power-of-two path well and **refuse other sizes by name**. It does not hold.
@@ -233,7 +233,7 @@ X[k] = conj(chirp[k]) * sum_n (x[n] * conj(chirp[n])) * chirp[k - n]
 ```
 
 padded to the next power of two at least `2n - 1` long. `m*m % (2n)` rather
-than `m*m` keeps the angle small — for `n = 16384`, `m^2` leaves an `f64`'s
+than `m*m` keeps the angle small, for `n = 16384`, `m^2` leaves an `f64`'s
 exact-integer range around `m = 2^26`, and long before that the argument
 reduction inside `sin_cos` is discarding the bits this function's accuracy
 rests on. The residue is exact, since `exp(-iπm²/n)` has period `2n` in `m²`.
@@ -268,7 +268,7 @@ anyway because it is a real upstream overload with a real schema, and because
 having it lets the centred transform be exercised at the aten level while
 `bootstrap.py`'s pad branch is missing (§6).
 
-### 5.2 The frames are a gather, not `as_strided` — and that is asserted
+### 5.2 The frames are a gather, not `as_strided`, and that is asserted
 
 `docs/architectures/VOICE.md` §3 named `aten.as_strided.default` alongside `_fft_r2c` as
 `stft`'s walls. **Only one of the two fell.** Upstream's frames are a strided
@@ -283,11 +283,11 @@ it, so the claim "`as_strided` was not needed" stays true by measurement rather
 than by this paragraph.
 
 **`docs/kernels/STRIDED.md` implemented `as_strided`, and `stft` still does not use
-it** — which is the note this paragraph was written to leave, arriving at its
+it**, which is the note this paragraph was written to leave, arriving at its
 addressee. The test was inverted rather than deleted and now checks the
 kernel's source instead of the op list: `stft`'s frames must remain an
 `index_select` gather. The reason is no longer only "the aliasing is
-unobservable" but a cost — an `as_strided` result bars in-place writes to its
+unobservable" but a cost, an `as_strided` result bars in-place writes to its
 base's storage while it lives (`docs/kernels/STRIDED.md` §2), so routing `stft` through
 it would bar `stft`'s own input for the duration of the window multiply in
 exchange for aliasing nothing here can observe.
@@ -296,7 +296,7 @@ exchange for aliasing nothing here can observe.
 
 `_fft_r2c`'s multi-axis `dim` is the arithmetic `torch.fft.fftn` /
 `torch.fft.rfft2` need, and `_fft_c2c` takes a multi-axis `dim` too. What is
-**not** here is `aten.fft_fftn.default` — the op `fnet` dispatches, which is a
+**not** here is `aten.fft_fftn.default`: the op `fnet` dispatches, which is a
 separate kernel above these with its own `s=`/`dim=`/`norm=` argument handling.
 `docs/kernels/COMPLEX.md` §3.3 step 5 is therefore still open, and it is now a binding
 rather than arithmetic.
@@ -322,7 +322,7 @@ Ordering, measured rather than guessed:
 
 | check | message |
 |---|---|
-| **`return_complex` missing, first of all** | `stft requires the return_complex parameter be given for real inputs, ...` — no prefix, and it fires **ahead of** the dtype and rank checks |
+| **`return_complex` missing, first of all** | `stft requires the return_complex parameter be given for real inputs, ...`, no prefix, and it fires **ahead of** the dtype and rank checks |
 | `align_to_window` with `center=True` | `stft align_to_window should only be set when center = false.` |
 | dtype | `expected a tensor of floating point or complex values` |
 | rank | `expected a 1D or 2D tensor` |
@@ -332,7 +332,7 @@ Ordering, measured rather than guessed:
 | window | `expected a 1D window tensor of size equal to win_length={w}, but got window with size [8]` |
 
 **`expected 0 < n_fft < 64` is what the message says and `n_fft <= 64` is what
-it enforces** — `stft(randn(16), n_fft=16)` computes and returns a single
+it enforces**, `stft(randn(16), n_fft=16)` computes and returns a single
 frame. Reproduced with its own bound rather than corrected, because a caller
 matching on the text gets upstream's text. An empty signal reports
 `expected 0 < n_fft < 0`.
@@ -362,15 +362,15 @@ composition rather than to aten::constant_pad_nd, and none of those has a kernel
 here; mode='constant' is implemented
 ```
 
-The six pad kernels behind that message exist and are golden-compared —
-docs/kernels/PAD.md landed them — and `bootstrap.py`'s `_install_nn` composite is the
+The six pad kernels behind that message exist and are golden-compared,
+docs/kernels/PAD.md landed them, and `bootstrap.py`'s `_install_nn` composite is the
 one line between them and `F.pad`. docs/kernels/PAD.md §5 contains the exact patch;
 `bootstrap.py` was not that round's file and it is not this one's either.
 
 **So the wall has moved by exactly one line, backwards, and it is the line the
 previous round already wrote the fix for.** With that composite installed
-in-process — which is what `test_fft.py`'s probe does, and what docs/kernels/PAD.md §4
-did — the centred transform agrees with upstream:
+in-process, which is what `test_fft.py`'s probe does, and what docs/kernels/PAD.md §4
+did, the centred transform agrees with upstream:
 
 ```text
 torch.stft(sig, 16, 4, window=hann(16), center=True)          (9, 17)    1.2e-07
@@ -410,7 +410,7 @@ classification test caught it.
 
 Not implemented, and it is a genuinely different problem rather than this one
 unwritten: an overlap-add with a window-sum normalisation on top of `_fft_c2r`.
-`_fft_c2r` — the transform half — **is** implemented and compared. `istft` is
+`_fft_c2r`: the transform half, **is** implemented and compared. `istft` is
 now `test_shim.py`'s standing example of a name with no `overloads.json` entry,
 which `stft` was until this round.
 
@@ -428,7 +428,7 @@ with the reason; delete them if a caller for the bare spelling is found.
 
 Upstream routes a complex input to `_fft_c2c`; this shim's `stft` is built on
 `_fft_r2c` only and refuses a complex input by name. No measured caller passes
-one — `torch.stft` on a real waveform is the whole of docs/architectures/VOICE.md's demand.
+one, `torch.stft` on a real waveform is the whole of docs/architectures/VOICE.md's demand.
 
 ## 8. The five files edited outside the stated territory
 
@@ -453,8 +453,8 @@ stft.default       ['pt2_compliant_tag']           <- NOT core
 stft.center        ['pt2_compliant_tag']           <- NOT core
 ```
 
-`_fft_c2c` not being core while its two siblings are — all three implemented
-here by the same `dft_in_place` — is upstream's table and not derivable.
+`_fft_c2c` not being core while its two siblings are: all three implemented
+here by the same `dft_in_place`, is upstream's table and not derivable.
 Inferring from the round would have written 130.
 
 **Schema identities 337 → 339. The delta is two, not five.** `overloads.json`

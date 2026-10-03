@@ -39,7 +39,7 @@ Everything else remains refused by name:
 - Any `world_size` other than 1 and 2 refuses.
 
 > **Superseded on the last point.** `docs/distributed/FEDERATED4.md` extended the transport
-> to `world_size >= 1` — a star of loopback sockets with the hub at rank 0 — so
+> to `world_size >= 1` (a star of loopback sockets with the hub at rank 0) so
 > a world larger than two no longer refuses. Everything else in this list still
 > holds: `allreduce(op=SUM)` remains the only collective. Left in place rather
 > than rewritten, because this document is the record of what two ranks cost.

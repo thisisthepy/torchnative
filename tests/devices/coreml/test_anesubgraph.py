@@ -9,7 +9,7 @@ Neural Engine. Two layers' 7.08M weights clear it.
 This test file measures the subgraph approach end to end:
 
 * A two-layer decode subgraph with norms, residual connections, projections
-  and MLP — built as 1x1 convolutions in the ANE-preferred rank-4 layout —
+  and MLP, built as 1x1 convolutions in the ANE-preferred rank-4 layout,
   gets `preferred: NeuralEngine` on **every** computing operation.
 * The same subgraph at one layer does not, confirming the threshold is the
   reason and not any operation-level property.
@@ -22,7 +22,7 @@ This test file measures the subgraph approach end to end:
   already goes through.
 
 Every assertion is on `MLComputePlan`'s `preferred` column. `supported` is not
-evidence — it was NeuralEngine throughout while everything ran on the CPU.
+evidence, it was NeuralEngine throughout while everything ran on the CPU.
 
 <!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anesubgraph.py test_a_two_layer_subgraph_is_neural_engine_preferred_on_every_op present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/coreml/test_anesubgraph.py test_a_one_layer_subgraph_is_cpu_confirming_the_threshold present -->

@@ -1,4 +1,4 @@
-# 네 아키텍처가 공유하던 4-op 묶음 — 그리고 그 넷 중 하나만 실제로 열렸다
+# 네 아키텍처가 공유하던 4-op 묶음: 그리고 그 넷 중 하나만 실제로 열렸다
 
 `docs/architectures/ARCH.md` 가 32 개 아키텍처를 실측해 남긴 지형에서 **가장 큰 단일 덩어리**를 구현한 기록입니다.
 `aten.le.Tensor` · `aten.scalar_tensor.default` · `aten.where.self` · `aten.permute.default` 넷과,
@@ -10,7 +10,7 @@
    상류 `MptForCausalLM` 과 **로짓 최대차 1.05e-05** 로 일치합니다(전사 충실도는 **0**).
 2. **그런데 "넷을 넣으면 아키텍처 4 개가 한꺼번에 열린다"는 전제는 틀렸습니다.** 다시 재보니
    `mpt` 만 미구현 0 이 되고 `falcon` · `gptj` · `bloom` 은 각각 1~2 개가 남습니다. ARCH.md 는
-   그런 주장을 한 적이 없고 — 그 문서의 "나머지 17 개는 전부 1" 이 바로 이 남은 것들입니다 —
+   그런 주장을 한 적이 없고, 그 문서의 "나머지 17 개는 전부 1" 이 바로 이 남은 것들입니다.
    **작업 지시가 그 표를 한 칸 넓게 읽은 것**입니다. §3 에 실측을 적었습니다.
 
 기준선 대비:
@@ -23,8 +23,8 @@
 | 미구현 0 인 아키텍처 | 5 / 20 실측 | **14 / 20 실측** |
 | 스키마 | 199/199 | 199/199 (변화 없음) |
 | 3 타깃 | exit 0 | exit 0 |
-| 스모크 | 65 ok | **63 ok, 2 FAIL** — §7, 의도된 적색 |
-| `--self-test` | exit 0 | **exit 1** — §6, 의도된 적색 |
+| 스모크 | 65 ok | **63 ok, 2 FAIL**, §7, 의도된 적색 |
+| `--self-test` | exit 0 | **exit 1**, §6, 의도된 적색 |
 
 ---
 
@@ -56,7 +56,7 @@ mpt      4  permute(float32(1,2,6,32), [0,2,1,3])
 **(2) `layout=torch.strided` 가 실제로 넘어온다.** `reject_unsupported` 는 `None` 이 아닌 모든
 layout 을 거부합니다. 그대로 뒀다면 셰임이 갖고 있는 유일한 레이아웃을 이름으로 요청했다는
 이유로 세 아키텍처가 막혔을 것입니다. `reject_layout` 을 따로 만들어 `strided` 만 통과시켰습니다
-(`full`/`ones`/`empty` 는 **안 건드렸습니다** — 실측된 호출자가 없습니다).
+(`full`/`ones`/`empty` 는 **안 건드렸습니다**. 실측된 호출자가 없습니다).
 
 **(3) `permute` 는 두 모양뿐이다.** 2-D `[1,0]` 과 4-D `[0,2,1,3]`. 둘 다 대합(involution)이라
 **역치환 혼동을 모델 실행으로는 잡을 수 없습니다.** 골든에 `[2,0,1]` 과 `[1,2,0]` 을 서로의
@@ -64,7 +64,7 @@ layout 을 거부합니다. 그대로 뒀다면 셰임이 갖고 있는 유일�
 
 ---
 
-## 2. `where.self` — 승격표를 다 재고, 그래도 승격하지 않기로 했다
+## 2. `where.self`: 승격표를 다 재고, 그래도 승격하지 않기로 했다
 
 `aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor`
 
@@ -109,7 +109,7 @@ where(tensor(True), ones(2,3), zeros(3))  ->  (2, 3)
 
 **그런데 구현하지 않았습니다.** `same_dtype` 으로 거부하고 이름을 대게 했습니다. 근거 셋:
 
-1. `same_dtype` 의 주석이 이 저장소의 규약을 적어두고 있습니다 — 두 텐서 사이의 조용한 승격은
+1. `same_dtype` 의 주석이 이 저장소의 규약을 적어두고 있습니다. 두 텐서 사이의 조용한 승격은
    `DESIGN.md` §5 가 candle 의 주된 위험이라고 부르는 수치 표류이고, 거부는 작업 항목입니다.
    `add.Tensor` · `lt.Tensor` · `cat.default` 가 전부 이미 그렇게 합니다. `where` 만 예외로 두면
    **한 파일 안에 두 규약**이 생깁니다.
@@ -120,11 +120,11 @@ where(tensor(True), ones(2,3), zeros(3))  ->  (2, 3)
 ### 2.4 안 고른 분기는 값이 읽히지 않는다
 
 `where(True, 1.0, nan)` 은 `1.0` 입니다(실측). 혼합이 아니라 선택이므로 `where_cond` 도 같습니다.
-골든에 있습니다 — 두 분기를 곱해 더하는 구현이라면 여기서만 틀립니다.
+골든에 있습니다. 두 분기를 곱해 더하는 구현이라면 여기서만 틀립니다.
 
 ---
 
-## 3. 다시 쟀다 — 그리고 넷 중 하나만 열렸다
+## 3. 다시 쟀다: 그리고 넷 중 하나만 열렸다
 
 구현 후 같은 방법으로 다시 쟀습니다. `_aten_all_implemented()` 를 **빌드한 산출물에서 직접**
 읽고, "이번 6 개를 빼면 어땠을까"를 같은 실행에서 함께 계산했습니다.
@@ -153,7 +153,7 @@ mixtral   ops=65    12     9    남음: _grouped_mm, clamp_, div_, empty_like, f
 > 둘 다 미구현 0 으로 만들었습니다(`mixtral` 은 `_grouped_mm.default` 하나만 범위 밖으로
 > 남겼습니다). 권위 있는 값은 이 표가 아니라 `_aten_implemented()` 실측입니다.
 
-### 3.1 전제가 틀렸다 — 그리고 어디서 틀렸는지 확인했다
+### 3.1 전제가 틀렸다: 그리고 어디서 틀렸는지 확인했다
 
 작업 지시는 "넷을 넣으면 아키텍처 4 개가 한꺼번에 열린다" 였습니다. **열린 것은 `mpt` 하나입니다.**
 
@@ -170,7 +170,7 @@ op 뿐"** 은 다른 문장이고, 지시는 앞 문장을 뒤 문장으로 읽�
 
 `falcon` 의 `div_.Tensor` 는 트레이스에서 attention 스케일링(`scores /= sqrt(d)`)의 in-place
 형태로 나옵니다. `add_`/`div_` 는 값이 아니라 **in-place 계열이 통째로 없는 것**이고, 이것은
-`mixtral` 의 `clamp_`/`div_`/`masked_fill_` 과 같은 항목입니다 — 다음 덩어리는 op 하나가
+`mixtral` 의 `clamp_`/`div_`/`masked_fill_` 과 같은 항목입니다. 다음 덩어리는 op 하나가
 아니라 **in-place 오버로드 계열**로 보입니다. 이번 작업의 범위 밖이라 안 건드렸습니다.
 
 ### 3.2 못 잰 것
@@ -180,13 +180,13 @@ op 뿐"** 은 다른 문장이고, 지시는 앞 문장을 뒤 문장으로 읽�
 `The size of tensor a (2) must match the size of tensor b (0)`,
 `Unrecognized configuration class`). ARCH.md 가 다섯 개를 못 쟀다고 적은 것과 같은 종류이고,
 **설정을 고치면 꼬리가 더 나올 수 있습니다.** `relu` 가 연다고 적힌 셋 중 `nemotron` 은 그래서
-이번에도 확인 못 했습니다 — `opt` 와 `persimmon` 둘은 확인했습니다.
+이번에도 확인 못 했습니다. `opt` 와 `persimmon` 둘은 확인했습니다.
 
 `vit` 은 `AutoModelForCausalLM`/`AutoModel` 의 텍스트 입력 경로가 아니라 빼뒀습니다.
 
 ---
 
-## 4. 진짜 판정 — MPT 를 aten 레벨로 조립해 상류와 대조
+## 4. 진짜 판정: MPT 를 aten 레벨로 조립해 상류와 대조
 
 `transformers` 는 셰임 위에서 아직 임포트되지 않으므로 `MptForCausalLM` 로는 판정할 수
 없습니다. `docs/architectures/ARCH.md` §5 와 같은 2 단 방법을 씁니다.
@@ -221,16 +221,16 @@ B  aten (torch)      vs aten (_C 셰임)    : max|d| logits = 1.04904e-05
 **A 가 정확히 0 입니다.** 전사가 `MptForCausalLM` 과 op 단위로 같다는 뜻이고, 따라서 B 의
 `1.05e-05` 는 "MPT 를 셰임에서 돌린 오차" 입니다. 스케일 정규화하면 `9.4e-07`.
 
-### 4.1 A 를 먼저 틀려봤다 — 그게 이 절의 근거다
+### 4.1 A 를 먼저 틀려봤다: 그게 이 절의 근거다
 
 처음 돌렸을 때 A 가 **14.5** 였고 B 는 그때도 `1e-05` 였습니다. 원인은 셰임이 아니라 전사였습니다:
 **MPT 는 `lm_head` 를 `wte` 에 묶습니다**(`tie_word_embeddings=True` 이고 두 `Parameter` 가
-같은 객체 — 실측). `lm_head` 에 따로 가중치를 준 것이 전부였습니다.
+같은 객체, 실측). `lm_head` 에 따로 가중치를 준 것이 전부였습니다.
 
 이것이 2 단 방법의 값어치입니다. **A 없이 B 만 봤다면 `1e-05` 를 보고 "MPT 가 통과했다"고
 적었을 것이고, 실제로는 MPT 가 아닌 것을 돌리고 있었습니다.**
 
-### 4.2 토큰 일치는 증거가 아니다 — 대조군 세 개
+### 4.2 토큰 일치는 증거가 아니다: 대조군 세 개
 
 `docs/architectures/ARCH.md` §5.1 이 **틀린 gelu 로도 토큰이 똑같이 나왔다**고 적었습니다. 같은 질문을 이번
 op 들에 했습니다. 셰임 쪽만 한 군데씩 일부러 틀리고 로짓 차이를 잰 것:
@@ -252,7 +252,7 @@ permute([0,2,1,3]) -> 항등 치환                         max|d| = 15.1902    
 
 ---
 
-## 5. `relu` 와 `stack` 은 MPT 가 안 부른다 — 따로 조립했다
+## 5. `relu` 와 `stack` 은 MPT 가 안 부른다: 따로 조립했다
 
 같은 A/B 방법을 두 조각에 적용했습니다.
 
@@ -293,7 +293,7 @@ signbit(relu(-0.0))                ==  True
 
 `nan` 이 **살아남고** `-0.0` 이 **부호를 유지**합니다. 앞의 것은 비교 순서로 한쪽이 이기는
 최댓값이 아니라는 뜻이고, 뒤의 것은 "클램프 후 정규화" 가 아니라는 뜻입니다. 둘 다
-`x < 0 ? 0 : x` 에서 그냥 나옵니다 — `-0.0 < 0` 도 `nan < 0` 도 거짓이라 원소가 그대로 지나갑니다.
+`x < 0 ? 0 : x` 에서 그냥 나옵니다. `-0.0 < 0` 도 `nan < 0` 도 거짓이라 원소가 그대로 지나갑니다.
 
 **`max` 모양의 구현은 위의 모든 케이스를 통과하고 정확히 이 두 입력에서만 틀립니다.**
 골든이 둘 다 박아 뒀습니다(`float32` 와 `float64` 양쪽).
@@ -301,7 +301,7 @@ signbit(relu(-0.0))                ==  True
 정수 dtype 은 **거부하지 않습니다.** `silu` 는 상류에 정수 CPU 커널이 없어 거부하지만 `relu` 는
 있습니다. 한 함수 아래의 거부를 여기로 옮겼다면 상류가 답하는 호출을 거부했을 것입니다.
 `bool` 만 거부하고 문구도 상류의 것입니다(`Boolean inputs not supported for relu`).
-`uint8` 에서는 항등인데 이건 특례가 아니라 결과입니다 — 음수 원소가 없습니다.
+`uint8` 에서는 항등인데 이건 특례가 아니라 결과입니다. 음수 원소가 없습니다.
 
 ---
 
@@ -330,11 +330,11 @@ scalar_tensor(nan,   int64)    -> 거부
 ```
 
 즉 `checked_convert(..., numel = 1)` 이 정확히 이 표입니다. **재서 확인했지 유추하지
-않았습니다** — `float16` 은 통과하고 `float32` 는 거부한다는 비대칭을 뒤집으면 절반이 틀립니다.
+않았습니다**. `float16` 은 통과하고 `float32` 는 거부한다는 비대칭을 뒤집으면 절반이 틀립니다.
 
 ---
 
-## 8. `permute` 는 별칭인가 — 상류는 그렇고, 이 셰임은 아니다
+## 8. `permute` 는 별칭인가: 상류는 그렇고, 이 셰임은 아니다
 
 **질문에 답이 있습니다.** 추측이 아니라 양쪽을 다 돌렸습니다.
 
@@ -351,7 +351,7 @@ scalar_tensor(nan,   int64)    -> 거부
   t / transpose / slice 도 전부 동일                  [0,1,2,3,4,5]
 ```
 
-**candle 쪽에서는 저장소가 공유됩니다** — `Tensor::permute` 는 `Arc<Storage>` 를 복제하고
+**candle 쪽에서는 저장소가 공유됩니다**. `Tensor::permute` 는 `Arc<Storage>` 를 복제하고
 layout 만 바꿉니다. 별칭이 관측되지 않는 이유는 `permute` 가 아니라 **이 파일의 in-place op 들이
 저장소에 쓰지 않기 때문**입니다. `replace_with` 에 새 텐서를 넘기므로 뷰는 그 쓰기를 못 봅니다
 (`aten.rs` 의 "In-place ops" 주석이 이미 그렇게 적어 두었습니다).
@@ -360,7 +360,7 @@ layout 만 바꿉니다. 별칭이 관측되지 않는 이유는 `permute` 가 �
 하나 더 얹은 것이 아니라, 같은 하나의 질문에 속합니다.** 셰임에는 op 별 별칭 규칙이 없고
 **규칙이 하나** 있습니다: 어떤 뷰를 통해서도 쓰기가 원본에 닿지 않습니다. `docs/models/GPT2.md` §7 이
 `split` 에 대해 "안 쟀다" 고 남긴 항목을, 이번에 **네 op 전부에 대해 쟀습니다.** 답은
-"별칭 아님" 이고, 고치지는 않았습니다 — 고치는 것은 `replace_with` 의 설계를 바꾸는 일이고
+"별칭 아님" 이고, 고치지는 않았습니다. 고치는 것은 `replace_with` 의 설계를 바꾸는 일이고
 이 작업의 범위 밖입니다.
 
 ---
@@ -384,7 +384,7 @@ layout 만 바꿉니다. 별칭이 관측되지 않는 이유는 `permute` 가 �
 `_pair_result_check` 는 9/11, `_topk_multiset_check` 는 8/11 을 잡습니다
 (`permute-all` 만 의도된 무시로 남습니다).
 
-### 9.1 그래서 `--self-test` 가 실패한다 — 그게 설계다
+### 9.1 그래서 `--self-test` 가 실패한다: 그게 설계다
 
 ```
 PROBLEM: _pair_result_check + dtype-last: UNEXPECTED -- KNOWN_GAP says this
@@ -411,14 +411,14 @@ FAIL test_unimplemented_op_names_itself      : TypeError: aten.relu.default: mis
 ```
 
 두 테스트 다 **`aten.relu.default` 를 "구현되지 않은 op" 의 표본으로** 쓰고 있었습니다.
-`test_shim.py` 자신이 그 위험을 주석으로 적어 두었습니다 — *"`aten.embedding.default` used to
+`test_shim.py` 자신이 그 위험을 주석으로 적어 두었습니다. *"`aten.embedding.default` used to
 stand here and now has a kernel, which is the right failure mode for this test -- it goes red when
 the op it samples stops being a sample."* 이번에 `relu` 가 그렇게 됐습니다.
 
 `tests/_support/test_shim.py` 는 파일 범위 밖이라 **한 글자도 안 고쳤습니다.**
 고치려면 표본을 다른 이름으로 바꾸면 됩니다. `_aten_all_implemented()` 103 개에 없고 §3 의
 어느 아키텍처 꼬리에도 없는 이름이면 되고, `docs/design/TORCH_C.md` §1 이 예시로 `relu` 를 쓰고 있으므로
-그 문서도 함께 봐야 합니다. **어떤 이름을 고를지는 조율 세션의 판단입니다** — 잘못 고르면
+그 문서도 함께 봐야 합니다. **어떤 이름을 고를지는 조율 세션의 판단입니다**. 잘못 고르면
 같은 일이 또 일어나고, 이번 실패가 그 증거입니다.
 
 ---
@@ -437,7 +437,7 @@ aarch64-apple-ios                                                               
 ```
 
 스키마 199/199 는 **변하지 않았습니다.** `overloads.json`/`methods.json` 은 범위 밖이고 한 줄도
-안 고쳤으므로 그것이 맞는 결과입니다 — 여섯 op 의 파이썬 철자가 아직 없다는 뜻이기도 합니다(§11).
+안 고쳤으므로 그것이 맞는 결과입니다. 여섯 op 의 파이썬 철자가 아직 없다는 뜻이기도 합니다(§11).
 
 골든 케이스 증가분 1934 → 2095 (+161):
 
@@ -458,13 +458,13 @@ aten.relu.default            15   dtype 8 + max 판별 2 + 모양 4 + bool 거�
 
 ### 구현한 것
 
-- `aten.le.Tensor` — `compare_tensor` 재사용. 별도 키, 같은 커널(`lt.Tensor`/`lt.Scalar` 와 동형).
-- `aten.scalar_tensor.default` — `full` 과 **다른** dtype 추론, **같은** 넘침 규칙(§7).
-- `aten.where.self` — 셋 broadcast, `uint8` 조건 허용, 승격은 거부(§2).
-- `aten.permute.default` — 정확한 길이 규칙, 중복 거부, 음수 정규화(§8).
-- `aten.stack.default` — `cat` 이 아닌 별도 커널, `dim == rank` 허용, 크기 완전 일치 요구.
-- `aten.relu.default` — `x < 0 ? 0 : x`, `max` 아님(§6).
-- `reject_layout` — `strided` 만 통과. `full`/`ones`/`empty` 는 안 건드렸습니다.
+- `aten.le.Tensor`: `compare_tensor` 재사용. 별도 키, 같은 커널(`lt.Tensor`/`lt.Scalar` 와 동형).
+- `aten.scalar_tensor.default`: `full` 과 **다른** dtype 추론, **같은** 넘침 규칙(§7).
+- `aten.where.self`: 셋 broadcast, `uint8` 조건 허용, 승격은 거부(§2).
+- `aten.permute.default`: 정확한 길이 규칙, 중복 거부, 음수 정규화(§8).
+- `aten.stack.default`: `cat` 이 아닌 별도 커널, `dim == rank` 허용, 크기 완전 일치 요구.
+- `aten.relu.default`: `x < 0 ? 0 : x`, `max` 아님(§6).
+- `reject_layout`: `strided` 만 통과. `full`/`ones`/`empty` 는 안 건드렸습니다.
 - 골든 161 케이스 + `_pair_result_check`/`_topk_multiset_check` 의 인덱스 구멍 셋(§9).
 
 ### 때운 것
@@ -482,7 +482,7 @@ aten.relu.default            15   dtype 8 + max 판별 2 + 모양 4 + bool 거�
   > `torch.stack(...)`, `torch.ones(2,3).permute(1,0)`, `F.relu(...)` 전부 오늘 성공합니다.
   > `overloads.json` 에 `where`/`stack`/`relu` 키가, `methods.json` 에 `permute` 키가
   > 있습니다. `docs/models/GPT2.md`/`docs/models/SAMPLING.md`/`docs/devices/DEVICE.md`/`docs/architectures/ARCH.md` 감사(이
-  > 라운드)에서 반복해서 발견한 것과 같은 패턴입니다 — 나머지 두 op 이름은 이 문단이 밝히지
+  > 라운드)에서 반복해서 발견한 것과 같은 패턴입니다. 나머지 두 op 이름은 이 문단이 밝히지
   > 않아 확인하지 못했습니다.
   > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json where present -->
   > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json stack present -->
@@ -535,7 +535,7 @@ PYTHON=$PY sh tests/run.sh  > /tmp/run.log 2>&1; echo "EXIT=$?" # 1 (§9.2)
 
 ---
 
-## 13. `mamba` 와 `mixtral` — 실측 20 개 중 마지막 둘
+## 13. `mamba` 와 `mixtral`: 실측 20 개 중 마지막 둘
 
 §3 의 표가 남긴 두 아키텍처를 마저 열었습니다. 시작 전에 §3 의 목록부터 다시 쟀는데,
 **낡아 있었습니다**: `split_with_sizes.default` 는 다른 작업에서 이미 구현되어
@@ -627,4 +627,4 @@ mixtral   ops=65     9     1    남음: _grouped_mm.default (범위 밖, §13.3)
 처럼 끝까지 조립해 로짓을 비교하는 것은 별도 작업입니다.
 
 `compare.py`/`verify_schemas.py` 는 `PYTHONPATH=$PWD/vendor` **없이** 돌립니다.
-파이프로 종료 코드를 읽지 마십시오 — 파일로 리다이렉트한 뒤 `$?` 를 읽습니다.
+파이프로 종료 코드를 읽지 마십시오. 파일로 리다이렉트한 뒤 `$?` 를 읽습니다.

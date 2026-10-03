@@ -1,4 +1,4 @@
-# Samsung Exynos NPU (Exynos Neural Network / ENN) — SDK landscape, delegate status, NNAPI deprecation, and refusal architecture
+# Samsung Exynos NPU (Exynos Neural Network / ENN): SDK landscape, delegate status, NNAPI deprecation, and refusal architecture
 
 This document analyzes the hardware access paths, vendor SDK ecosystem, PyTorch/ExecuTorch delegate status, Android NNAPI deprecation, and `torchnative` device resolution architecture for Samsung Exynos NPUs.
 
@@ -32,9 +32,9 @@ On Android hosts, `torchnative` previously had a single NPU candidate: Qualcomm 
    > it, argued that the delegate road was closed for Exynos and open for every other vendor.
    > **The same road QNN uses exists here.** What is actually gated is the SDK, and even that
    > is a developer-portal registration rather than the NDA partner agreement item 1 describes
-   > — those are different barriers and this document had conflated them.
+   >, those are different barriers and this document had conflated them.
 3. **NNAPI Deprecation (`DOCUMENTED`)**: Google Android Neural Networks API (NNAPI, `libneuralnetworks.so`), which previously bridged vendor HALs including Samsung's `nnapi.exynos.so`, was officially **deprecated in Android 13 (API level 33)**. Google explicitly advises against using NNAPI for new applications, directing developers to vendor-specific delegates or cross-platform Vulkan compute shaders.
-4. **Resolution Strategy in `torchnative` (`DEMONSTRATED`)**: Rather than failing with a misleading Qualcomm QNN error message, `torchnative` probes Android SoC properties (`ro.soc.manufacturer`, `ro.soc.model`, `ro.board.platform`, `ro.hardware`). When a Samsung Exynos SoC is detected, `torchnative.device.npu.resolve()` raises `ExynosNpuUnimplemented` — naming the detected Exynos SoC, explicitly stating that Exynos NPU support is `unimplemented` in `torchnative`, and providing actionable guidance toward supported execution paths (`torchnative.device.cpu` and `torchnative.device.vulkan`).
+4. **Resolution Strategy in `torchnative` (`DEMONSTRATED`)**: Rather than failing with a misleading Qualcomm QNN error message, `torchnative` probes Android SoC properties (`ro.soc.manufacturer`, `ro.soc.model`, `ro.board.platform`, `ro.hardware`). When a Samsung Exynos SoC is detected, `torchnative.device.npu.resolve()` raises `ExynosNpuUnimplemented`, naming the detected Exynos SoC, explicitly stating that Exynos NPU support is `unimplemented` in `torchnative`, and providing actionable guidance toward supported execution paths (`torchnative.device.cpu` and `torchnative.device.vulkan`).
 
 ---
 
@@ -113,7 +113,7 @@ So the delegate road is open for Exynos on the same terms as for Qualcomm. What 
 them is the SDK: QNN's runtime libraries ship in a downloadable SDK, while Exynos AI
 LiteCore requires registration on Samsung's developer portal. That is a real obstacle for
 CI and for a contributor without an account, and it is the honest reason this project has
-not built against it — **not** an absence of a delegate.
+not built against it, **not** an absence of a delegate.
 
 What remains unverified here is everything downstream of that: nothing in this repository
 has been built against LiteCore, and no Exynos device has run anything. The refusal in

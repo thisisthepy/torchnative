@@ -29,7 +29,7 @@ family whose headline number moved at all.
 
 ---
 
-## 1. `_dispatch_is_alias_key` — the cheap one, and it adds no table
+## 1. `_dispatch_is_alias_key`: the cheap one, and it adds no table
 
 Upstream answers `True` for six of its 145 keys and never raises:
 
@@ -41,7 +41,7 @@ FuncTorchBatchedDecomposition
 
 The only caller in the vendored tree is
 `OperatorBase.has_kernel_for_any_dispatch_key` (`torch/_ops.py:113`), which
-skips alias keys when asking whether an op has a kernel in a keyset — an alias
+skips alias keys when asking whether an op has a kernel in a keyset, an alias
 key in `py_kernels` says how an op is put together, not which backend runs it.
 
 **The implementation is membership in `_ALIAS_EXPANSION`, not a new six-name
@@ -57,11 +57,11 @@ computes both sets in a separate subprocess and reddens if they come apart.
 
 ### 1.1 The probe for "expands beyond itself" has to compare enum *values*
 
-A name-inequality probe reports **twelve** names as expanding, not six —
+A name-inequality probe reports **twelve** names as expanding, not six,
 `Meta`, `AutogradMeta`, `SparseMeta`, `QuantizedMeta`, `SparseCsrMeta`,
 `NestedTensorMeta` and five `EndOf*` sentinels. That is not a second finding:
 it is `docs/graph/ALIASINC.md` §3 arriving from the other direction. Upstream
-spells six keys twice — `EndOfDenseBackends` **is** `Meta` — so
+spells six keys twice (`EndOfDenseBackends` **is** `Meta`) so
 `is_included_in_alias(Meta, EndOfDenseBackends)` is `True` by value while the
 names differ, and a name-based probe reads that as an expansion.
 
@@ -72,13 +72,13 @@ disagree" and was actually the probe.
 ### 1.2 What it buys
 
 `resolve_key(op, k)` over every aten overload against `Meta`, `CPU` and
-`AutogradCPU` — 4893 results — goes **1346 → 1440**: 87 onto
+`AutogradCPU`: 4893 results, goes **1346 → 1440**: 87 onto
 `CompositeImplicitAutograd` and 7 onto `Autograd`. That is the first movement
 in this chain after two consecutive rounds of zero, and it is 94.
 
 ---
 
-## 2. `_dispatch_has_backend_fallback` — the judgement, and the evidence for it
+## 2. `_dispatch_has_backend_fallback`: the judgement, and the evidence for it
 
 `resolve_key` (`torch/_ops.py:257`) consults this last: if it says `True`,
 `resolve_key` hands back the dispatch key *itself*, commented "the dispatch key
@@ -99,7 +99,7 @@ the list.
 **The only door a registration can arrive through here is
 `_C._dispatch_library(...)`**, whose `fallback` method appends to
 `_shim_registrations`. After a full `import torch` on this shim that list holds
-**1895 registrations — 131 `define`, 1764 `impl`, and zero `fallback`.**
+**1895 registrations: 131 `define`, 1764 `impl`, and zero `fallback`.**
 
 So the honest answer is not a choice between upstream's 37 and some smaller
 number. It is that this shim has registered no backend fallback at all, read
@@ -112,7 +112,7 @@ answers from, and it is empty.
 papers over: registrations that arrive through `_dispatch_library` are recorded
 and **dropped**, because `_aten_dispatch` is the only thing that answers a call
 and knows nothing about them. So a `fallback` that did arrive must **not** make
-this predicate answer `True` — that would claim a kernel that can never run,
+this predicate answer `True`, that would claim a kernel that can never run,
 which is the same failure as copying upstream's 37, just smaller.
 
 The two sets are therefore kept apart, and the asymmetry is asserted rather
@@ -136,21 +136,21 @@ Measured on this tree, four ways, 4893 results each:
 |---|---:|---|
 | before this round | 1346 | 2719 × `GAP:_dispatch_is_alias_key`, 828 × `GAP:_dispatch_has_backend_fallback` |
 | + `_dispatch_is_alias_key` | **1440** | 3453 × `GAP:_dispatch_has_backend_fallback` |
-| + this, answered honestly | **1440** | 3453 × `NOKERNEL` — upstream's own refusal |
+| + this, answered honestly | **1440** | 3453 × `NOKERNEL`, upstream's own refusal |
 | + upstream's 37-key set | 3301 | 1592 × `NOKERNEL` |
 
 BKEYSET §3 projected the last row for this step. **The third row is the real
 one.** The 1861 difference is the size of the claim declined: 1585 results that
 would have been handed `AutogradCPU` and 276 handed `Meta`, each on the promise
 of a fallback that does not exist here. `_DISPATCH_REGISTRATIONS` refuses the
-same shape at a different scale — answering from upstream's file there "would
+same shape at a different scale, answering from upstream's file there "would
 claim 1500 kernels this shim does not have".
 
 **And the chain does terminate.** In the honest row every one of the 4893
 either resolves or raises `could not find kernel`; none dies on an
 unimplemented name. `_dispatch_autogradother_backends` is still an
 `_Unimplemented` and is still never blamed, because `resolve_key` only reads it
-when `k == AutogradOther` and these three keys never are —
+when `k == AutogradOther` and these three keys never are,
 `test_no_resolve_key_result_on_the_whole_aten_surface_dies_on_a_gap_any_more`
 would name it if that changed.
 
@@ -189,7 +189,7 @@ and `AutogradMAIA`.
 This list is **not written into the implementation.** It is re-derived from
 both live sides on every run by
 `test_the_capability_gaps_this_honest_answer_names`, so the count moves the day
-either side does — which is the point of printing it beside the 1440.
+either side does, which is the point of printing it beside the 1440.
 
 ---
 
@@ -200,13 +200,13 @@ Every break was built, the shim reinstalled, and the suite run.
 | break | `import torch` | which tests reddened |
 |---|---|---|
 | `_dispatch_is_alias_key` always `False` | **survives** | agreement, naming all six |
-| drop `Autograd` from the six | survives | agreement — **one key**, named |
+| drop `Autograd` from the six | survives | agreement, **one key**, named |
 | copy upstream's 37-key fallback set | survives | the empty-registry test, the gap list, the declined-claim test |
 | `_dispatch_has_backend_fallback` always `True` | survives | five of nine, including the stub-only-keys guard |
 | make a recorded Python fallback effective | survives | the asymmetry test, naming `CPU` |
 
-`import torch` survives all five, so `docs/graph/METAKEY.md` §4's warning — a
-wrong default in this machinery stopping the tree from loading — does not reach
+`import torch` survives all five, so `docs/graph/METAKEY.md` §4's warning, a
+wrong default in this machinery stopping the tree from loading, does not reach
 either of these names. Measured, not inherited.
 
 The second row is the point, and it is the same one ALIASINC §5 and BKEYSET §4
@@ -228,7 +228,7 @@ fallback registry must be non-empty. A real fallback landing later raises the
 count and keeps the test green; a copied table raises it with an empty registry
 and reddens. Re-run under the always-`True` break it now fails with *"3453 more
 results resolve because of this name while the shim's fallback registry is
-empty — those are claimed kernels"*.
+empty, those are claimed kernels"*.
 
 ### 4.2 Two tests still have no teeth against a wrong answer, and are counted as such
 
@@ -236,7 +236,7 @@ Stated rather than buried, in BKEYSET §4.1's shape.
 
 * `test_no_resolve_key_result_on_the_whole_aten_surface_dies_on_a_gap_any_more`
   stayed green under all five breaks. It guards *that both names answer at
-  all*, which is the §2.4 result and is the thing this round claims — and it
+  all*, which is the §2.4 result and is the thing this round claims, and it
   was RED before the implementation, blaming both names 3547 times. But it
   cannot tell a correct answer from a constant.
 * `test_the_alias_keys_are_exactly_the_keys_that_expand_beyond_themselves` is
@@ -277,7 +277,7 @@ restored `bootstrap.py` was confirmed byte-identical to the pre-break copy.
 Baseline on `develop`, measured **in a worktree**: suites 99/99, ok 1802,
 FAIL 0, SKIP 24, DOCWATCH 1373/1373. The main repository's baseline is ok 1801 /
 SKIP 25, and the one-test difference is `test_toolguard_wheel_staging` refusing
-to fake a wheel over a real cross-build artefact that only the main tree has —
+to fake a wheel over a real cross-build artefact that only the main tree has,
 `AGENTS.md` §13.2 records it, and the two are not compared directly.
 
 ```
@@ -288,7 +288,7 @@ run 2   GATE_EXIT=0   suites 100/100   ok=1811   FAIL=0   SKIP=24
 ```
 
 That is **+1 suite, +9 tests, +10 markers**. **The `ok` count rose by exactly
-nine, the number of tests written** — checked deliberately, because
+nine, the number of tests written**, checked deliberately, because
 `docs/graph/ALIASINC.md` §6.1 records a run in this same family where the suite
 had no `if __name__ == "__main__":` block, the runner imported the file, eight
 test functions were defined and none called, and the gate counted a suite that

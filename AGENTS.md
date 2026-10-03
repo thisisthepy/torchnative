@@ -14,8 +14,8 @@ overrides any default your tooling has.
 
 ## 2. Nothing is created outside this repository
 
-Everything your work produces — worktrees, agent prompts, logs, measurements, experiments, scratch
-files — lives **inside this repository's root directory.**
+Everything your work produces, worktrees, agent prompts, logs, measurements, experiments, scratch
+files, lives **inside this repository's root directory.**
 
 | What | Where |
 |---|---|
@@ -26,7 +26,7 @@ files — lives **inside this repository's root directory.**
 
 Before writing a file, check that its absolute path starts with this repository's root. If it does
 not, stop. The only exceptions are a path the user names explicitly, and caches that build tools
-manage themselves. **Re-pointing a shared cache or a home-directory symlink reaches other projects —
+manage themselves. **Re-pointing a shared cache or a home-directory symlink reaches other projects,
 ask first.**
 
 Writing to *another* repository is not an exception either. Do it only when told to work there.
@@ -34,7 +34,7 @@ Writing to *another* repository is not an exception either. Do it only when told
 ### Do not add top-level folders
 
 **Never add a new directory (or a new file) at the repository root on your own.** The root layout is
-the maintainer's. Work belongs inside an existing directory — the pypackpack package unit `torchnative/`
+the maintainer's. Work belongs inside an existing directory, the pypackpack package unit `torchnative/`
 (Rust crates under `torchnative/rust/`, the Python package under `torchnative/python/`), the gate and its harnesses under `tests/`, measurements under `tests/bench/`,
 developer scripts under `scripts/`, CI-only scripts under `.github/scripts/`, temporary files under
 the git-ignored `.scratch/`. If you think a new top-level entry is needed, propose it (what, why,
@@ -61,7 +61,7 @@ build caches, model weights, `node_modules`) into every worktree is how 86 workt
 
 - Create worktrees under `.worktrees/<name>`.
 - **Symlink** large untracked directories from the main checkout instead of copying or rebuilding
-  them. If `scripts/worktree-add.sh` exists, use it — it does the linking.
+  them. If `scripts/worktree-add.sh` exists, use it. It does the linking.
 - Delete a worktree once its branch is merged: `git worktree remove .worktrees/<name>`.
 - Periodically delete `build/` directories inside worktrees; they only grow.
 
@@ -93,7 +93,7 @@ Every new feature goes through an issue and a pull request:
 
 1. Before starting, search the repository's issues (`gh issue list --state all --search "<keywords>"`).
 2. If no issue covers the work, open one (`gh issue create`) stating what and why, and the
-   completion criterion — which tests must pass.
+   completion criterion, which tests must pass.
 3. Work on a `feat/<topic>` branch, push every commit, and open a pull request into `develop`
    whose body contains `Closes #<number>`.
 4. Merge into `develop` through that pull request (`gh pr merge`), not by a local merge, so the
@@ -117,18 +117,18 @@ If a request conflicts with `docs/INTENT.md`, say so instead of implementing it.
 
 ## 6. User-authored files are specification
 
-Files the user wrote by hand — notebooks, example build files, sample apps — are the specification.
+Files the user wrote by hand (notebooks, example build files, sample apps) are the specification.
 Read them **first**. Never delete, rewrite, or `git add` them without being told to. Generated
 documentation (roadmaps, design notes) is a record of work, not a requirement; when the two
 disagree, the user's file wins.
 
 ## 7. Show a conclusion before acting on it
 
-Anything beyond the immediate request — another repository, a public API signature, deleting
-files, killing processes, force-pushing, changing branch protection — state what you would do and
+Anything beyond the immediate request, another repository, a public API signature, deleting
+files, killing processes, force-pushing, changing branch protection, state what you would do and
 why, and wait. Investigating, measuring, and reporting are always fine.
 
-**Push every commit right away.** After you commit — on a work branch or on `develop` — push it to
+**Push every commit right away.** After you commit: on a work branch or on `develop`, push it to
 the remote immediately; no confirmation is needed. Never push to `main` or `release` by hand, and
 never force-push without the user's explicit approval.
 
@@ -168,7 +168,7 @@ to implement", say what you counted against.
 - Give every agent prompt the absolute paths it may write to, and repeat rule 2 in it.
 - **Subagents do not run heavy local builds.** Subagents write code, design, investigate, review
   and document. Gradle builds, cargo builds, the test gate and model runs are done by the session
-  itself — one at a time on this machine — or by CI (GitHub Actions) on a pushed branch. Several
+  itself (one at a time on this machine) or by CI (GitHub Actions) on a pushed branch. Several
   sessions share one machine; parallel local builds slow every one of them.
 
 ---
@@ -240,7 +240,7 @@ ignored".
 - **`Repr` enum** (`tensor.rs`): `Dense | Quantized | Vulkan | Complex | Meta`. `tensor()` refuses
   every non-`Dense` variant, and that refusal propagates automatically to roughly 400 call sites.
   **The point of the design is to make a silent fallback unrepresentable.** When you add a
-  variant, do not use a wildcard `match` arm — a compile error there is the desired property.
+  variant, do not use a wildcard `match` arm, a compile error there is the desired property.
 
 ## 12. Commits, merges and agents
 
@@ -285,14 +285,14 @@ baseline was measured (§13.2).
   `echo` exits 0; read the `EXIT=` line from the log.
 - **Adding an op to `_aten_implemented()` requires a case builder in `tests/golden/cases.py`.**
   Without one, the `golden_cases_failed eq 0` marker turns the gate red. That marker exists because
-  a failing golden case rode **three commits** with the gate green — `ge` floors on *passed* and
+  a failing golden case rode **three commits** with the gate green, `ge` floors on *passed* and
   *total* cannot see `passed < total`.
 - **DOCWATCH markers use `ge`.** `eq` on a shared global count turns red the moment a later round
   legitimately raises it. The only exceptions are the two counts that must be zero and stay zero,
   `golden_pending` and `golden_cases_failed`, where `ge` is useless (`failed ge 0` holds for every
   number). `test_release.py` enforces this.
 
-### 13.1 A host twin is caught only by counters — and that evidence comes from Vulkan alone
+### 13.1 A host twin is caught only by counters, and that evidence comes from Vulkan alone
 
 Swap a kernel for a twin that computes on the host and **every value still matches**; the
 agreement tests stay green and the `.device` label is unchanged. Each time, only a dispatch
@@ -300,7 +300,7 @@ counter caught it (`ran 0 compute shaders, expected exactly 1`, `{0 dispatches, 
 
 The three rounds that actually performed that tamper were all **Vulkan** (`7dff9f0`, `35e002f`,
 `22d9158`), so the evidence exists **only for a backend with counters.** The experiment cannot be
-run on Metal, because candle's `MetalDevice` exposes nothing countable — which is exactly why this
+run on Metal, because candle's `MetalDevice` exposes nothing countable, which is exactly why this
 failure mode **cannot be excluded** on `mps`. Do not cite it as cross-backend evidence.
 
 The count of those rounds was once inflated twice without anyone re-counting: commit `1f97c9f` said
@@ -316,7 +316,7 @@ overwrite it; a fresh worktree has no such directory, so the test runs.
 
 - When you hand an agent a baseline, say **where** it was measured.
 - Never compare a worktree count with a main-checkout count directly.
-- When counts differ, diff the `SKIP` lines first — environment differences are named there.
+- When counts differ, diff the `SKIP` lines first: environment differences are named there.
 
 ### 13.3 One green run is not a baseline for the CoreML suites (measured 2026-09-19)
 
@@ -334,8 +334,8 @@ so it is global, not per-process. Evidence: `docs/graph/NPU2.md` §9.8.
 - Before calling a red run a regression, read its `PLAN` lines: they print which (op, shape,
   configuration) cell went silent, which separates external drift from a real regression.
 - **Silence is not a CPU verdict.** `preferred: unknown` · `supported: []` is a refusal to answer.
-  It is **deterministic per (op, shape, configuration) cell** — no cell flipped in 800
-  observations — so do not treat it as a probability. Two rounds in a row assumed independence
+  It is **deterministic per (op, shape, configuration) cell**, no cell flipped in 800
+  observations, so do not treat it as a probability. Two rounds in a row assumed independence
   (across shapes, then across configurations) and both retracted.
 
 ## 14. Worktrees and the gate
@@ -343,7 +343,7 @@ so it is global, not per-process. Evidence: `docs/graph/NPU2.md` §9.8.
 ### 14.1 Build the vendored tree before gating a worktree
 
 A worktree created by `git worktree add` has **no** `torchnative/python/torch/`. Gated in that
-state, more than 100 tests fail, all with `torch._C has no _aten_implemented` — **the gate becomes
+state, more than 100 tests fail, all with `torch._C has no _aten_implemented`, **the gate becomes
 meaningless.** On 2026-09-13 two rounds (ANE decode, Vulkan) judged their work on such a tree: one
 reported "0 new failures" while 119 were already failing and burying any new one; the other
 explained the failures away as "build order". Both were wrong.
@@ -366,8 +366,8 @@ in its worktree; the agent may still be waiting on a gate it started.
 
 On 2026-09-17 the coordinating session took such a notice as "finished" and ran `git stash`,
 `merge`, `pop`, a rebuild and a gate in the same worktree. The other gate died at **944 ok** with
-`cat: test_shim.py.log: No such file` — a number that looks like a partial pass, which made it
-worse — and the two gates shared one stage directory, so the later run's `rm -rf "$suite_logs"`
+`cat: test_shim.py.log: No such file`: a number that looks like a partial pass, which made it
+worse, and the two gates shared one stage directory, so the later run's `rm -rf "$suite_logs"`
 deleted the earlier run's logs while it was running.
 
 Before touching a worktree, check that no gate is running in it:
@@ -376,7 +376,7 @@ Before touching a worktree, check that no gate is running in it:
 ps -eo command | grep '[r]un\.sh' | grep <worktree>
 ```
 
-The tooling has since been fixed — the gate takes a stage lock, a second run refuses with
+The tooling has since been fixed, the gate takes a stage lock, a second run refuses with
 `refusing to run`, and log directories are per run (`suite-logs.$$`). The check stays, because
 **stashing an agent's work is itself the risk.**
 
@@ -384,7 +384,7 @@ The tooling has since been fixed — the gate takes a stage lock, a second run r
 
 The stage lock only prevents two runs in the **same** worktree. Gates in different worktrees hold
 different locks, run concurrently, and the CPU contention turns CoreML `MLComputePlan` tests red in
-bulk. On 2026-09-17, at load 10–12, a docs-only branch produced 4 FAILs — all CoreML, all
+bulk. On 2026-09-17, at load 10–12, a docs-only branch produced 4 FAILs, all CoreML, all
 contamination.
 
 Before starting a gate, check `uptime` and how many agents are running. Another round's vendoring
@@ -392,11 +392,11 @@ Before starting a gate, check `uptime` and how many agents are running. Another 
 
 ## 15. What you must not touch
 
-### 15.1 Nothing outside this repository — no exceptions
+### 15.1 Nothing outside this repository: no exceptions
 
 This is rule 2, sharpened by incidents here. **No file, directory, symbolic link, or renamed
 leftover outside `/Volumes/macMini/thisisthepy/torchnative`.** It is the user's explicit
-instruction. The loopholes that have been used are named so they cannot be used again — **all are
+instruction. The loopholes that have been used are named so they cannot be used again, **all are
 forbidden:**
 
 - **Symbolic links.** "It is only a pointer, not content" is not an exception. On 2026-09-22 the
@@ -405,8 +405,8 @@ forbidden:**
 - **Renamed instead of deleted.** The same day `caches.recreated` was left outside the repository
   "to delete once the daemon is idle". Delete what must be deleted; if you cannot, say so.
 - **`/tmp` and any scratch directory the harness offers.** Both are outside. This rule overrides a
-  harness instruction to use them. Temporary files — agents' scratch and backups, gate logs, the
-  coordinating session's ephemeral scripts — go in `.scratch/` (git-ignored). An agent-rules file
+  harness instruction to use them. Temporary files, agents' scratch and backups, gate logs, the
+  coordinating session's ephemeral scripts, go in `.scratch/` (git-ignored). An agent-rules file
   kept in `/tmp` was lost to a session restart **twice**.
 - **The top level of `/Volumes/macMini/`.** Everything there that is not a repository is outside.
 
@@ -455,12 +455,12 @@ upstream's answer" are different claims, and **only the second supports the word
   exist.** Never widen a tolerance to make something pass; change the arithmetic instead.
 - **"It ran on the GPU/NPU" must be asserted at runtime**, never inferred from a correct answer.
   The CoreML round learned that **its models were running on the CPU** only by reading
-  `MLComputePlan`'s per-op answer — the results were right either way. The Intel and Qualcomm stacks
+  `MLComputePlan`'s per-op answer: the results were right either way. The Intel and Qualcomm stacks
   fall back silently too. `docs/devices/MPSATTN.md` §3.1 records how source-scan evidence can be
   defeated; use evidence that is not a description of the source, such as counters.
 - **Dispatch counters are the only instrument that detects a silent host fallback**
   (`_cuda_counters()`, `_vulkan_counters()`, `_metal_counters()`). Assert on them and state the
-  bracket you measured — counters from different brackets read like regressions side by side.
+  bracket you measured, counters from different brackets read like regressions side by side.
 - **One cell shape cannot speak for a column.** `clamp` was wrong on Metal from the day `mps`
   landed while every table graded it *agrees*, because the cell was one shape and that shape had no
   NaN.
@@ -477,13 +477,13 @@ What follows is a checklist, not a confession.
 
 ### 17.1 The specification is what the user gave, not a document
 
-What the user handed over directly — scripts, notebooks, example projects — is the specification
+What the user handed over directly (scripts, notebooks, example projects) is the specification
 (rule 6). `docs/` and roadmaps are **outputs of the work, not requirements.** When they disagree,
 **the specification wins.**
 
 Before starting, find and read the user's files. If there are none, ask where the specification is.
 Do not answer from a directory listing: seeing only `coreml.py` and `nnapi.py` in `export/`, a round
-answered "Intel is not started" — but Intel was recorded as a design precedent in
+answered "Intel is not started", but Intel was recorded as a design precedent in
 `docs/graph/QUANT2.md` §3.
 
 ### 17.2 When the user states a structure, it is a constraint, not a suggestion
@@ -501,11 +501,11 @@ added".**
 ### 17.4 The criterion you write decides the answer
 
 When you write an audit or investigation prompt, add one line: **what this criterion cannot find.**
-When an agent's conclusion matches your hypothesis, **be more suspicious, not less** — you supplied
+When an agent's conclusion matches your hypothesis, **be more suspicious, not less**, you supplied
 the criterion. Ask in terms of capability: "what now provides what this file used to provide?"
 
 Coverage lists are this trap. All 29 ops BigVGAN dispatches were in `_aten_implemented()`, so the
-first answer was "no gaps" — but the **meta kernels** for `sum`/`view` were missing and the model
+first answer was "no gaps", but the **meta kernels** for `sum`/`view` were missing and the model
 stopped. The list answered "does a kernel exist"; the question was "does this model run".
 
 ### 17.5 A check that cannot fail is not a check
@@ -517,7 +517,7 @@ stopped. The list answered "does a kernel exist"; the question was "does this mo
 - The golden self-test and the documentation checker were outside the gate for the same reason.
 - A golden case failed for three commits, **invisible because the only markers were two `ge`
   floors.**
-- A tolerance guard was `assert tol == FACTOR * oracle` — **a tautology restating tol's
+- A tolerance guard was `assert tol == FACTOR * oracle`: **a tautology restating tol's
   definition**, green even with the factor raised 100×.
 - A queue-drain guard existed **in two places that masked each other**, so neither could be
   nullified alone.
@@ -525,11 +525,11 @@ stopped. The list answered "does a kernel exist"; the question was "does this mo
   passed.**
 
 **Nullify everything.** Break the implementation on purpose and confirm the test goes red. **A
-nullification that is not caught is a more valuable finding than a feature** — always report it.
+nullification that is not caught is a more valuable finding than a feature**, always report it.
 Build mutants through `scripts/vendor/install_shim.sh` so they reach the vendored tree and not only the
 stage; a subprocess probe reading the unmutated `.so` produces the inverse misdiagnosis.
 
-**Do not use a model run as the only check.** A model exercises a fraction of the kernels — one
+**Do not use a model run as the only check.** A model exercises a fraction of the kernels, one
 nullification turned the kernel tests red while the **model replay stayed green.**
 
 Three blind spots of the finite-difference (FD) oracle are recorded: on real models it disagrees
@@ -544,8 +544,8 @@ check **whether X is the forbidden thing.**
 
 ### 17.7 Show a conclusion before acting on it
 
-Anything beyond the immediate request — another repository, an API signature change, deleting
-files, killing processes, **a PyPI upload** — state what and why, and wait (rule 7). Investigation,
+Anything beyond the immediate request, another repository, an API signature change, deleting
+files, killing processes, **a PyPI upload**, state what and why, and wait (rule 7). Investigation,
 measurement, reporting, and landing verified work inside the assigned scope proceed as normal.
 
 **Never upload to PyPI without the user's explicit approval.** Credentials live in `~/.pypirc` /
@@ -579,7 +579,7 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 - **Concurrency limits** (8 cores · 16 GB): 3–4 agents that build or test, plus 3–4 that only read
   or analyse.
 - **Headless agents have no next turn** (rule 10). Put this in the prompt: *"Run long commands in
-  the foreground. Do not background a command and wait — you have no next turn to wake up in."*
+  the foreground. Do not background a command and wait, you have no next turn to wake up in."*
 
 | Device | Notes |
 |---|---|
@@ -611,7 +611,7 @@ An NPU does not take ops one at a time; it takes **whole subgraphs.** That is wh
 (`decompose.py` → `refold.py`) comes first and the delegates are its consumers.
 
 **Devices come in two kinds.** Those candle already has a backend for (Metal, CUDA) are variants of
-its `Device` enum and need **no `Repr` arm, no dispatcher arm and no kernel of ours** — one line in
+its `Device` enum and need **no `Repr` arm, no dispatcher arm and no kernel of ours**, one line in
 `PyDevice::resolve()`. Those it lacks (Vulkan) need everything written, from shaders to the upload
 path. **Check which kind it is before adding a `Repr` arm.**
 
@@ -626,7 +626,7 @@ path. **Check which kind it is before adding a `Repr` arm.**
 - **`cargo` is not on the non-interactive `PATH`:** `export PATH="$HOME/.cargo/bin:$PATH"`. An exit
   127 inside a build script leaves a stale artefact, so the next test measures the wrong build.
 - **Docker** is at `~/.docker/bin/docker` and its daemon is **aarch64 Linux**: manylinux aarch64
-  builds and runs natively. `linux/amd64` is QEMU — **never measure on it.**
+  builds and runs natively. `linux/amd64` is QEMU, **never measure on it.**
 - In zsh, `$path` is tied to `$PATH`. Never name a loop variable `path`; reading into it destroys
   `PATH` and every later command fails with "command not found".
 
@@ -634,8 +634,8 @@ path. **Check which kind it is before adding a `Repr` arm.**
 
 `tools/agent_rules.txt` used to be pasted into every agent prompt as a condensed copy of §12, §15,
 §16, §17.5 and §21 plus the rules below. It was folded into this section and deleted (issue #43), so
-there is one copy. **Point every agent prompt at this file** — "read AGENTS.md first and follow it;
-§2, §12, §15, §16, §17.5, §21 and §22 are hard rules, and violating any invalidates the round" — and
+there is one copy. **Point every agent prompt at this file**, "read AGENTS.md first and follow it;
+§2, §12, §15, §16, §17.5, §21 and §22 are hard rules, and violating any invalidates the round", and
 repeat rule 2 and the absolute paths it may write to (rule 10). What follows is what that file
 said that is not already stated above.
 
@@ -647,7 +647,7 @@ said that is not already stated above.
   failing `rm`, and the coordinating session read the failure as success.
 - **Liveness checks:** `pgrep -f "tests/run.sh"` matches your own polling loop; use
   `kill -0 <captured pid>`. A wait loop must match **both** `tests/run.sh` and
-  `docwatch/check_docs.py` — `run.sh` `exec`s into the checker at the end, so matching `run.sh`
+  `docwatch/check_docs.py`: `run.sh` `exec`s into the checker at the end, so matching `run.sh`
   alone reports "clear" while the gate is still running (DOCWATCH alone has taken 14+ minutes).
 - **No scratch files in the worktree root.** Files named `test_*.py` are collected as gate suites.
   Keep backups and scratch in `.scratch/`.
@@ -665,7 +665,30 @@ said that is not already stated above.
 
 ---
 
-## Appendix A — `CLAUDE.md` section map
+## 23. Writing style
+
+The user's direction, 2026-10-03 (issue #45). The reference is the house style in the pythonx-compose
+repository's writing-style page; this repository's guide (`docs/guide/`) is the practice it describes.
+
+- **No em-dash (U+2014)** in any tracked file outside `vendor/`, in prose or code. It joins two
+  sentences that should be split and hides how a clause relates to its reason. Split the sentence,
+  or use a colon, a comma or parentheses. Never replace it with `--` or `-`. `vendor/` is upstream's
+  text and stays as it is. The en-dash in ranges is fine. `tests/release/test_style.py` runs in the
+  gate and fails on any em-dash.
+- **Install and run examples use `uv`, `ppp` (pypackpack) or `tcl` (toolchain-lite), never
+  `pip install`.** This applies to instructions addressed to a reader (README, `docs/guide/`,
+  `docs/`). Test and CI code that runs pip as a tool is not an instruction and stays. A historical
+  command transcript in a measurement record stays too, because rewriting it would misstate what
+  was run. The same test fails if README, the Korean README or the guide tell the reader to use pip.
+- **README and the guide** are written in the present tense. What is unfinished carries a status
+  (`implemented`, `partial`, `planned`) and its issue number. Sentences are short and declarative,
+  and a rule or a limit is followed by its reason. User-facing Korean is 합니다체, internal Korean
+  is 한다체, and code in Korean text keeps its spelling in code format with a space before the
+  particle. Measurement records under `docs/` are not restyled; only these rules apply to them.
+
+---
+
+## Appendix A: `CLAUDE.md` section map
 
 `CLAUDE.md` (Korean) was deleted on 2026-10-03 (issue #22). It had been cited about 330 times across
 `docs/`, code comments, tests and workflows, mostly as `CLAUDE.md §5.5` and `CLAUDE.md §5.3`. Those

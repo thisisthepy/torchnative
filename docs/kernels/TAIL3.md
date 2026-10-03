@@ -4,7 +4,7 @@
 exposed the next wall, and this round is those: `TensorBase.index_add` (`jetmoe`),
 `TensorBase.scatter_reduce` (`tapas`), `TensorBase.view_as`, `bitwise_xor` (`gpt_neo`),
 `as_strided` (`longformer`), `avg_pool2d` (`efficientnet`), `erfinv` (`gemma3n_text`),
-`einsum` (`longt5`) — plus the item `docs/architectures/ARCH100.md` classified not as a gap but as a **backend
+`einsum` (`longt5`): plus the item `docs/architectures/ARCH100.md` classified not as a gap but as a **backend
 limitation**, `aten.matmul.default` / `MatMulUnexpectedStriding`, against five architectures.
 
 That last one is first, because it was the largest single item and because the classification was
@@ -15,7 +15,7 @@ wrong.
 ## 1. The matmul striding verdict: `contiguous()` was neither the fix nor the avoidance
 
 `docs/bindings/SETITEM.md` proposed a `contiguous()` as the plausible fix. **The operands were already
-contiguous**, and this is decidable from the error text alone — the refusal prints the layout it
+contiguous**, and this is decidable from the error text alone, the refusal prints the layout it
 refused:
 
 ```text
@@ -24,7 +24,7 @@ qwen3_next   lhs [1, 32,  1, 64,128]  stride [262144,   8192, 8192,128, 1]
 olmo_hybrid  lhs [1, 30,  1, 64, 96]  stride [184320,   6144, 6144, 96, 1]
 ```
 
-Each of those is exactly the reversed cumulative product of the reversed shape — the contiguous
+Each of those is exactly the reversed cumulative product of the reversed shape, the contiguous
 strides. `32*64 = 2048`, `2048*49 = 100352`. So `gemm_with_layout_fallback`'s existing
 `.contiguous()` retry *did* run, returned the same tensor because `is_contiguous()` was already
 true, and the identical error came back. `contiguous()` there is a **no-op**. It would not have
@@ -50,8 +50,8 @@ misnomer, and the misnomer is what produced the wrong classification.
 
 ### The fix matches upstream rather than avoiding the error
 
-`at::native::matmul`'s N-D × N-D branch reshapes both operands to rank 3 — `(prod(batch), m, k)`
-and `(prod(batch), k, n)` — calls `bmm`, and views the result back out. `fold_batch_axes_matmul`
+`at::native::matmul`'s N-D × N-D branch reshapes both operands to rank 3, `(prod(batch), m, k)`
+and `(prod(batch), k, n)`, calls `bmm`, and views the result back out. `fold_batch_axes_matmul`
 does exactly that. This is the distinction the round was asked to establish: the arithmetic is
 identical because a batched GEMM is defined per batch element and how the batch index is spelled
 cannot change any dot product, so folding is **matching upstream, not routing around candle**.
@@ -59,7 +59,7 @@ Nothing is silently copied that upstream does not copy: the reshape is free when
 contiguous (all five architectures), and when the batch axes have to be broadcast to agree the
 copy is the one `broadcast_matmul` was already performing one level down.
 
-It is reached only **after** candle has refused, for `gemm_with_layout_fallback`'s stated reason —
+It is reached only **after** candle has refused, for `gemm_with_layout_fallback`'s stated reason,
 the accepted set differs by backend and by rank, and restating candle's predicate here would mean
 keeping a copy of it in sync with candle. Every shape candle already accepts takes the path it
 took before, so no existing answer can change.
@@ -80,7 +80,7 @@ rather than by ops landed.
 
 ---
 
-## 2. Alias or kernel — the split, counted honestly
+## 2. Alias or kernel: the split, counted honestly
 
 `docs/architectures/ARCH100.md` established that missing **bindings** outnumber missing **kernels** 49 to 22 in
 this tail, so the first question per op was "does a kernel already exist under another name".
@@ -89,7 +89,7 @@ this tail, so the first question per op was "does a kernel already exist under a
 |---|---|---|
 | `matmul.default` (rank ≥ 5) | **neither** | a *fallback path*, not a new op: 60 lines folding the batch axes after candle refuses |
 | `index_add.default` | **yes** | `index_add_`'s body with `write_back` swapped for `finish`. Both overloads dispatch at one function |
-| `view_as.default` | **yes — but of `view`, not of `reshape_as`** | `aten.view.default`'s body. See §4 |
+| `view_as.default` | **yes, but of `view`, not of `reshape_as`** | `aten.view.default`'s body. See §4 |
 | `bitwise_xor.{Tensor,Scalar}` | **yes** | a third arm on the `Bitwise` enum, three match lines |
 | `eye.{default,m}` | **no** | new factory: candle 0.11.0 has no `Tensor::eye` |
 | `erfinv.default` | **no** | **new arithmetic**: no candle kernel, no closed form, AS 241 |
@@ -102,8 +102,8 @@ table rows. "Eight ops" would overstate it by a factor of three, which is the co
 `AGENTS.md` §17.3 names.
 
 `tests/ops/test_tail3.py::test_the_two_new_kernels_are_the_only_new_arithmetic` asserts the sharing
-itself — `index_add_common` reached from exactly two dispatch arms, `Bitwise::Xor` as an arm and
-not a function — so the claim in this table cannot rot into prose.
+itself, `index_add_common` reached from exactly two dispatch arms, `Bitwise::Xor` as an arm and
+not a function, so the claim in this table cannot rot into prose.
 
 ---
 
@@ -111,7 +111,7 @@ not a function — so the claim in this table cannot rot into prose.
 
 This is the finding the round would most easily have got wrong, and the first draft did.
 
-The same probe on both ops — 64 accumulations of `bfloat16(0.01)` into one position:
+The same probe on both ops, 64 accumulations of `bfloat16(0.01)` into one position:
 
 ```text
 zeros(2, bf16).index_add_(0, [0]*64, [0.01]*64)                     ->  0.6523
@@ -121,7 +121,7 @@ zeros(2, bf16).scatter_reduce(0, [0]*64, [0.01]*64, reduce="sum")   ->  0.6406
 `index_add_` accumulates **at the receiver's dtype, per step** (docs/architectures/DEMAND8.md measured it).
 `scatter_reduce` accumulates **wide and narrows once**. Two adjacent ops with opposite answers, and
 the first `scatter_reduce_two` inherited `index_add_`'s rule from the kernel three hundred lines
-above it — wrong by one `bfloat16` step, and invisible on any index without repeats.
+above it, wrong by one `bfloat16` step, and invisible on any index without repeats.
 
 The same list, each measured rather than assumed from a neighbour:
 
@@ -131,7 +131,7 @@ The same list, each measured rather than assumed from a neighbour:
 * Integer `mean` **truncates toward zero**: `int64` zeros with `1,2,4` give `7/4 = 1`, and `7/3 = 2`
   with `include_self=False`.
 * `nan` wins in `amin` and `amax`. Rust's `f64::min` discards it, so the comparison is written out.
-* `bool` `sum` is a logical or; integral `sum` wraps (`uint8` `200+200 = 144`) — those two *are*
+* `bool` `sum` is a logical or; integral `sum` wraps (`uint8` `200+200 = 144`), those two *are*
   `index_add_`'s answers, re-measured rather than inherited.
 
 ### `include_self=False` seeds only what is written
@@ -171,14 +171,14 @@ w.view_as(zeros(6))     ->  RuntimeError: view size is not compatible with input
 ```
 
 So spelling `view_as` as `reshape_as` would have been wrong about torch. It is spelled as
-`aten.view.default` instead — which in this shim is `reshape_like`, and **that op has always
+`aten.view.default` instead, which in this shim is `reshape_like`, and **that op has always
 accepted the layouts upstream's `view` refuses** (`w.view(6)` returns the reshaped values here and
 raises upstream). `view_as` inherits that pre-existing laxity rather than adding a second rule;
 making it strict while `view` stays lax would put two answers behind one definition.
 
 The gap is recorded, not fixed. `tests/golden/cases.py` carries it as a `torch_error` row and
 `test_tail3.py::test_view_as_and_reshape_as_are_different_ops_upstream` fails the day `view` is
-tightened — which is when `view_as` must be tightened with it.
+tightened, which is when `view_as` must be tightened with it.
 
 ---
 
@@ -207,7 +207,7 @@ Measured against `torch.erfinv` at `float64`:
 
 **The last two rows are upstream drifting, not this.** At `y = 0.999999999999` the answers are
 `5.04203993266166` (upstream) and `5.042031898572695` (here); `erfc` of the second is
-`9.999778782798894e-13` against a target of `9.999778782798785e-13` — twelve digits — while `erfc`
+`9.999778782798894e-13` against a target of `9.999778782798785e-13`: twelve digits, while `erfc`
 of upstream's is `9.998953310354861e-13`, wrong in the fourth. Asserting agreement there would be
 asserting the wrong answer, so `test_tail3.py` pins it by the **`erfc` round trip** instead. The
 whole region is unreachable at `float32`, whose largest value below one is `1 - 6e-8`.
@@ -224,7 +224,7 @@ The domain, all of it measured and none of it raising: `erfinv(±1)` is `±inf`,
 ## 6. `as_strided` is refused by name, and here is its size
 
 > **Superseded by `docs/kernels/STRIDED.md`, and left standing.** The constructor this
-> section says is missing is still missing — that part was never overturned and
+> section says is missing is still missing, that part was never overturned and
 > `docs/kernels/STRIDED.md` §1 re-verifies it in candle's source. What this section did
 > not consider is the third option: implement the gather *and refuse the writes
 > upstream would have propagated*, in both directions, keyed on the storage
@@ -246,14 +246,14 @@ candle 0.11.0 exposes no way to build a `Tensor` over an existing storage with a
   `pub(crate)`.
 
 So the aliasing the op promises cannot be produced. A materialising gather would return the right
-values for `longformer`'s read-only `_chunk` and **silently wrong ones for any writer** — the
+values for `longformer`'s read-only `_chunk` and **silently wrong ones for any writer**, the
 divergence shape `docs/devices/VULKAN2.md` requires be unrepresentable rather than merely unused, and the
 same gap `docs/kernels/VIEWS.md` §6.4 already carries for `slice.Tensor` with step > 1 and for
 `view.dtype`.
 
 What was done instead is `clamp.Tensor`'s pattern: the schema is in `methods.json` with **no
 kernel**, so `x.as_strided(...)` refuses with `aten op not implemented in torch._C shim:
-aten.as_strided.default` — naming the overload it needed — rather than "no matching signature". It
+aten.as_strided.default` (naming the overload it needed) rather than "no matching signature". It
 is **not** in `_aten_implemented()`, so the surface stays honest and the golden harness does not
 demand case builders for a kernel that does not exist. `tests/golden/reach_allow.json` carries the
 entry and its reason; the checker matches that file exactly in both directions, so the entry has to
@@ -262,7 +262,7 @@ be deleted the day the gap closes.
 **Sizing it properly** means the same work `slice.Tensor` and `view.dtype` need, and doing it once
 would close all three: either a stride-carrying tensor wrapper in this crate that owns the
 `Arc<Storage>` and its own `Layout`, or a candle patch exposing a storage-sharing constructor
-(`vendor/` already carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists **— which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). Estimate: the
+(`vendor/` already carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists **, which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). Estimate: the
 wrapper touches every kernel that calls `read_flat`/`write_flat`; the patch is perhaps twenty lines
 of candle and a re-vendor. Neither is a `longformer`-shaped task.
 
@@ -273,15 +273,15 @@ of candle and a re-vendor. Neither is a `longformer`-shaped task.
 `efficientnet` and `longt5` are **not** missing aten ops, and the sweep's names for them are
 misleading in the same way `MatMulUnexpectedStriding` was:
 
-* **`efficientnet` — `torch._C._nn.avg_pool2d`.** `aten.avg_pool2d.default` has been implemented
+* **`efficientnet`: `torch._C._nn.avg_pool2d`.** `aten.avg_pool2d.default` has been implemented
   and golden-compared since `sew_d`. What is missing is one binding in `bootstrap.py`'s
   `_install_nn`, beside the `upsample_bilinear2d`/`upsample_bicubic2d`/`softplus` it already
   writes. `torch/nn/modules/pooling.py:779` calls `F.avg_pool2d`, which binds straight to the `_nn`
   name.
-* **`longt5` — `torch.einsum` with an ellipsis.** `einsum` exists in `bootstrap.py` and parses
+* **`longt5`: `torch.einsum` with an ellipsis.** `einsum` exists in `bootstrap.py` and parses
   fixed subscripts; it refuses `'...qhd,...khd->...hqk'` by name, saying the ellipsis needs its own
   rank arithmetic. `longt5` (`modeling_longt5.py:662`) passes exactly one equation form, so this is
-  one branch — expand `...` to the operand's leading axes given its rank, per operand — and not a
+  one branch (expand `...` to the operand's leading axes given its rank, per operand) and not a
   general einsum planner.
 
 Both live in `torchnative/rust/torch_c/src/bootstrap.py`, which this worktree was told not to edit. They are
@@ -303,10 +303,10 @@ Ran with `tests/_support/arch_sweep.py --only ...`, before and after.
 | `olmo_hybrid` | `matmul MatMulUnexpectedStriding` | **forward passes** |
 | `qwen3_5_moe` | `matmul MatMulUnexpectedStriding` | **forward passes** |
 | `minicpmv4_6` | `matmul MatMulUnexpectedStriding` | **forward passes** |
-| `gemma3n_text` | `erfinv` | `torch.std` — the next wall |
-| `longformer` | `TensorBase.as_strided` | `aten.as_strided.default` — refused by name, §6 |
-| `efficientnet` | `torch._C._nn.avg_pool2d` | unchanged — `bootstrap.py`, §7 |
-| `longt5` | `torch.einsum` | unchanged — `bootstrap.py`, §7 |
+| `gemma3n_text` | `erfinv` | `torch.std`, the next wall |
+| `longformer` | `TensorBase.as_strided` | `aten.as_strided.default`, refused by name, §6 |
+| `efficientnet` | `torch._C._nn.avg_pool2d` | unchanged, `bootstrap.py`, §7 |
+| `longt5` | `torch.einsum` | unchanged, `bootstrap.py`, §7 |
 
 **Eight cleared.** Five of those eight are the matmul item, and all five needed `eye` as well as
 the fold. `gemma3n_text` moved one wall (`erfinv` → `std`), which is a result rather than a
@@ -335,14 +335,14 @@ plausible wrong implementation differs.
   <!-- DOCWATCH: symbol-in-file tests/ops/test_tail3.py test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream present -->
 * **Two pinned counts in `test_shim.py`** moved, each carrying the arithmetic that keeps it a
   check: `tag_core_count` 117 → 120 (`bitwise_xor.Tensor`, `bitwise_xor.Scalar` and
-  `scatter_reduce.two` are the only three of the eight new keys upstream tags `core` — each read
+  `scatter_reduce.two` are the only three of the eight new keys upstream tags `core`, each read
   off its own `.tags`; `as_strided.default` **is** core and is deliberately absent because it has
   no kernel), and distinct schema identities 322 → 331.
 * **`device.rs::MPS_HOST_READBACK_OPS` 66 → 71.** `bitwise_xor.{Scalar,Tensor}`, `erfinv.default`,
   `scatter_reduce.two` and `index_add.default` all read the tensor back to the host through
   `read_flat`, so all five are refused on `mps` rather than silently computing on the CPU. `eye`
   is not on the list: it reads nothing, it only writes.
-* The fold is checked **not** to have replaced the ordinary path — it is reached from the error arm
+* The fold is checked **not** to have replaced the ordinary path: it is reached from the error arm
   only, and `test_the_fold_is_reached_only_after_candle_refuses` asserts that guard is still there.
 
 The ops now in `_aten_implemented()`:

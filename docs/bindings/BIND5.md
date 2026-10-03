@@ -1,4 +1,4 @@
-# BIND5 — one argument form, three architectures; and `torch.export`'s step two
+# BIND5: one argument form, three architectures; and `torch.export`'s step two
 
 Worktree `work/bind5` on develop `b33e2ee`, vendored tree assembled fresh. torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory:
@@ -16,14 +16,14 @@ at a time:
 
 | what is in the size list | upstream | this build, before | this build, after |
 |---|---|---|---|
-| `tensor(3)` — 0-dim, int64 | **accepts** → `(2, 3)` | `zeros` yes, `new_zeros` **no** | **accepts, both** |
-| `tensor([3])` / `tensor([[3]])` — one element, 1-D and 2-D | **accepts** | as above | **accepts, both** |
+| `tensor(3)`, 0-dim, int64 | **accepts** → `(2, 3)` | `zeros` yes, `new_zeros` **no** | **accepts, both** |
+| `tensor([3])` / `tensor([[3]])`, one element, 1-D and 2-D | **accepts** | as above | **accepts, both** |
 | `tensor(3, uint8/int16/int32/int64)` | **accepts** | as above | **accepts, both** |
-| `tensor(3.5)` — float | **refuses**, `TypeError` | **accepted it, gave `(2, 3)`** | **refuses**, `TypeError` |
-| `tensor(3.0)` — whole-valued float | **refuses**, `TypeError` | **accepted it** | **refuses**, `TypeError` |
-| `tensor(True)` — bool | **refuses**, `RuntimeError` | **accepted it, gave `(2, 1)`** | **refuses**, `RuntimeError` |
-| `tensor([3, 4])` — two elements | **refuses**, `TypeError` | refused (`RuntimeError`) | **refuses**, `TypeError` |
-| `tensor(-1)` — negative | **refuses**, `RuntimeError` | refuses, `OverflowError` | refuses, `OverflowError` (§1.4) |
+| `tensor(3.5)`, float | **refuses**, `TypeError` | **accepted it, gave `(2, 3)`** | **refuses**, `TypeError` |
+| `tensor(3.0)`, whole-valued float | **refuses**, `TypeError` | **accepted it** | **refuses**, `TypeError` |
+| `tensor(True)`, bool | **refuses**, `RuntimeError` | **accepted it, gave `(2, 1)`** | **refuses**, `RuntimeError` |
+| `tensor([3, 4])`, two elements | **refuses**, `TypeError` | refused (`RuntimeError`) | **refuses**, `TypeError` |
+| `tensor(-1)`, negative | **refuses**, `RuntimeError` | refuses, `OverflowError` | refuses, `OverflowError` (§1.4) |
 
 Three of the eight rows are the deliverable: **this build was more permissive than the
 thing it replaces**, in exactly the shape `docs/bindings/ARGFORM.md` forbids, and nothing could
@@ -36,12 +36,12 @@ and this one did not. Same three-line shape, same table:
 | in a scalar `int`/`SymInt` position | upstream | this build, after |
 |---|---|---|
 | `tensor(2)`, `tensor([2])`, `tensor([[2]])`, any integral dtype | **accepts** | **accepts** |
-| `tensor(2.0)` — float | **refuses**, `TypeError` | **refuses**, `TypeError` |
-| `tensor([2, 3])` — two elements, and an empty tensor | **refuses**, `TypeError` | **refuses**, `TypeError` |
-| `tensor(True)` — bool | **refuses**, `RuntimeError` | **refuses**, `RuntimeError` |
+| `tensor(2.0)`, float | **refuses**, `TypeError` | **refuses**, `TypeError` |
+| `tensor([2, 3])`, two elements, and an empty tensor | **refuses**, `TypeError` | **refuses**, `TypeError` |
+| `tensor(True)`, bool | **refuses**, `RuntimeError` | **refuses**, `RuntimeError` |
 
 Suite **895 ok**, 0 FAIL, `DOCWATCH: PASS` 799/799, `EXIT=0`. Golden **11336/11336,
-ops=299 — exactly unmoved**. No kernel added anywhere in this round.
+ops=299, exactly unmoved**. No kernel added anywhere in this round.
 
 This worktree branched before the `arch300` and `last7` rounds landed on develop, so its
 numbers are its own: develop is at 886 ok / DOCWATCH 792 / golden 11385 ops=300, and the
@@ -54,17 +54,17 @@ coordinator re-measures the pinned counts at the merge.
 | item | verdict | architectures |
 |---|---|---|
 | 1. `Tensor.new_zeros((…, 0-dim int Tensor, …))` | upstream **accepts**; landed | `led`, `longformer`: **move**, onto `TensorBase.where` (§4.1) |
-| 1b. float / bool / multi-element Tensor in a size list | upstream **refuses**; this build now refuses too | — (the fix is a *narrowing* of docs/bindings/BIND4.md §3) |
+| 1b. float / bool / multi-element Tensor in a size list | upstream **refuses**; this build now refuses too | n/a (the fix is a *narrowing* of docs/bindings/BIND4.md §3) |
 | 2. `torch.zeros((tuple))` for `fastspeech2_conformer` | already landed by docs/bindings/BIND4.md §3; **nothing left to pass** | stops one wall later at `repeat_interleave`, `aten.rs` (§4.2) |
 | 3. `torch.embedding(Parameter, None, …)` | upstream **refuses identically**; **not a gap** | `sam3_lite_text_text_model`: same wall, correctly (§4.3) |
 | 4. `torch._C._NodeBase` + `_NodeIter` + `_fx_map_arg`/`_fx_map_aggregate` | landed | `torch.fx.Graph()` **builds** (§2) |
-| 5. where the `export` wall moves | **`torch.empty_strided`**, `docs/graph/EXPORT.md` §3.1 — item **three** (§3) |
+| 5. where the `export` wall moves | **`torch.empty_strided`**, `docs/graph/EXPORT.md` §3.1, item **three** (§3) |
 | 6. `docs/bindings/BIND3.md` §7's objection to the §8 hand-off | **re-measured and gone** (§3.2) | |
 | 7. single-element integral Tensor in a scalar `int`/`SymInt` | upstream **accepts**; landed in `_TypeChecker` | `vilt`: **forward runs** (§7) |
 
 ---
 
-## 1. The size-list rule — `led`, `longformer`, and a defect in `zeros`
+## 1. The size-list rule: `led`, `longformer`, and a defect in `zeros`
 
 ### 1.1 What `led` and `longformer` actually pass
 
@@ -77,7 +77,7 @@ diagonal_attention_scores = diagonal_chunked_attention_scores.new_zeros(
 )
 ```
 
-`docs/kernels/STRIDED.md` §6 called this "an argument form, not a missing op", and it is — but
+`docs/kernels/STRIDED.md` §6 called this "an argument form, not a missing op", and it is, but
 the tuple is not the form. **A plain `x.new_zeros((2, 3))` already worked here.** What
 stops it is `chunks_count`, and the only way to know what `chunks_count` is is to look
 at the real call rather than at the source: instrumented with a `new_zeros` spy on the
@@ -89,7 +89,7 @@ NEW_ZEROS TUPLE ELEMENT TYPES: ['int', 'Tensor=tensor(2)', 'int', 'int']
 ```
 
 So it is the **same** form `docs/bindings/BIND4.md` §3 landed for `torch.zeros`, arriving at a
-method. Three architectures, one rule — which is what this round was told to check
+method. Three architectures, one rule, which is what this round was told to check
 rather than assume.
 
 ### 1.2 What upstream accepts, measured for the family and not only for the caller
@@ -112,7 +112,7 @@ position with no matching measurement behind each of them.
 `test_the_size_list_rule_is_installed_at_exactly_two_call_sites` pins the count as source
 structure, so widening it is a deliberate edit and not a quiet one.
 
-### 1.3 The defect this round found — `docs/bindings/BIND4.md` §3 was too permissive
+### 1.3 The defect this round found: `docs/bindings/BIND4.md` §3 was too permissive
 
 `_coerce_symint_size_tensors` was `int(item) if isinstance(item, TensorBase) else item`.
 Applied to anything Tensor-shaped, that is not upstream's rule; it is `__int__`'s. Three
@@ -130,10 +130,10 @@ own `__int__`", and float and bool were not considered at all. Nothing failed, b
 nothing asked. This is the shape `docs/bindings/ARGFORM.md` names: **a build that accepts what the
 thing it replaces refuses**, arriving through a fix that was otherwise right.
 
-The rule is now written out: **one element (by `numel()`, not by `dim()` — `tensor([3])`
+The rule is now written out: **one element (by `numel()`, not by `dim()`, `tensor([3])`
 and `tensor([[3]])` are both accepted upstream) and an integral non-`bool` dtype.**
 Everything else raises, with upstream's message text, and `bool` raises upstream's
-*different exception class* because upstream reaches it one layer further in — past the
+*different exception class* because upstream reaches it one layer further in, past the
 unpack, at the scalar conversion. `test_bind5.py` compares the class, so a single blanket
 `TypeError` fails.
 
@@ -144,7 +144,7 @@ size-list rule. Upstream accepts `int8` there; recorded here rather than left as
 
 ### 1.4 The one row where the classes still differ, and why it is left
 
-A negative size refuses on both sides and with different classes — upstream
+A negative size refuses on both sides and with different classes, upstream
 `RuntimeError: zeros: Dimension size must be non-negative`, here `OverflowError: can't
 convert negative int to unsigned` from the kernel below. The value is *let through* the
 parser deliberately: the non-negativity rule belongs to the kernel, which already
@@ -163,7 +163,7 @@ reproduces the `_MODE_STACK` guard for that reason and still does.
 `Tensor.new_zeros` **does not need it, and that is measured rather than reasoned about**:
 a bound tensor method is not among `_device_constructors()`'s 36 names, so the answer
 inside `with torch.device("meta")` is the receiver's device on both sides.
-`test_the_wrappers_are_transparent_to_a_device_context` asserts both, in both columns —
+`test_the_wrappers_are_transparent_to_a_device_context` asserts both, in both columns,
 the factory one is the regression check, the method one is the claim.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _coerce_symint_size_tensors present -->
@@ -176,7 +176,7 @@ the factory one is the regression check, the method one is the claim.
 
 ---
 
-## 2. `torch.fx.Graph()` builds — `docs/graph/EXPORT.md` §6 item 2
+## 2. `torch.fx.Graph()` builds: `docs/graph/EXPORT.md` §6 item 2
 
 Taken **only because item 1 landed first.** `docs/graph/EXPORT.md` §6 forbids filling this in
 while the dispatcher ignores modes, and the reason is stated as a consequence: export
@@ -191,7 +191,7 @@ A synthesised type with three real-looking members and four raising stubs, so an
 `Node(self, "", "root", "", (), {})`).
 
 **`docs/graph/EXPORT.md` §4.1's census undercounted by three, and the three matter.** It listed
-`_erased`, `_next` and `_prev` as "present and real". They were present and **raising** —
+`_erased`, `_next` and `_prev` as "present and real". They were present and **raising**,
 class-level getters whose body raised `NotImplementedError`. That is not a cosmetic
 correction: `torch/fx/node.py:885`'s `__setattr__` calls `hasattr(self, name)` on the
 very first assignment, and a getter that raises `NotImplementedError` rather than
@@ -218,7 +218,7 @@ it). On three placeholders at `(0,)`/`(1,)`/`(2,)`: inserting before the middle 
 first gives `(-1,)`.
 
 **A monotonically increasing counter reproduces the right list order and the right key
-for an append-only graph**, and diverges the moment anything is inserted in the middle —
+for an append-only graph**, and diverges the moment anything is inserted in the middle,
 which is what every `fx` pass does. The check was falsified before being trusted:
 replacing the three branches with the equal-branch alone turns
 `test_the_sort_key_survives_insertion_in_the_middle` and
@@ -231,7 +231,7 @@ to fail on purpose once.
 * **The container conversion is asymmetric.** After `_update_args_kwargs`, a top-level
   `args` tuple is still a plain `tuple`, a nested list is an `immutable_list`, and the
   top-level `kwargs` dict is an `immutable_dict`. That falls out of `map_aggregate`
-  mapping a tuple to a tuple and a list/dict to its immutable twin, applied to both — and
+  mapping a tuple to a tuple and a list/dict to its immutable twin, applied to both, and
   the import of `torch.fx.immutable_collections` is **lazy**, because `torch.fx` does not
   exist when `bootstrap.py` runs.
 * **`_NodeIter` skips erased nodes without unlinking them.** `graph.py:1619` sets
@@ -251,7 +251,7 @@ two different users. Only `__lt__`/`__gt__`/`__le__`/`__ge__` are installed, ove
 
 Same script both sides. Node names, opcodes, sort keys, `users`, `_input_nodes`, the
 printed graph, the graph after `replace_all_uses_with` and `erase_node`, `g.lint()`, the
-reversed iteration order, and `GraphModule.code` — **identical**:
+reversed iteration order, and `GraphModule.code`, **identical**:
 
 ```text
 graph():
@@ -269,7 +269,7 @@ graph():
 
 ---
 
-## 3. Where the wall moves — verbatim
+## 3. Where the wall moves: verbatim
 
 `torch.export.export(M(), (torch.ones(3),))` for `M.forward = (t * 2 + 1).relu()`, with
 `torchnative.export.upstream.install()` applied (the 29 staged names of
@@ -291,7 +291,7 @@ same dispatcher
 ```
 
 **That is `docs/graph/EXPORT.md` §3.1 exactly, item three, at the line §3.1 names.** It is not
-item 2 and it is not a graph front end returning an empty graph — `export` does not
+item 2 and it is not a graph front end returning an empty graph, `export` does not
 return. Which is the prediction this round was given and it held.
 
 Without `install()`, `export` stops earlier and at a name rather than a kernel:
@@ -308,16 +308,16 @@ more.
 
 ### 3.1 `fx.Graph` is reached with or without the names
 
-`torch.fx.Graph()` builds in **both** columns — it does not depend on the 29 at all. That
+`torch.fx.Graph()` builds in **both** columns: it does not depend on the 29 at all. That
 is worth saying because it makes item 2 independently useful, which is the argument
 `docs/graph/EXPORT.md` §6 gives for doing it on its own terms ("`torch.fx` is more than
 export's substrate").
 
-### 3.2 `docs/bindings/BIND3.md` §7's objection, re-measured — it is gone
+### 3.2 `docs/bindings/BIND3.md` §7's objection, re-measured: it is gone
 
 That round refused to move any of the 29 names into `bootstrap.py`, and the reason was
 specific and measurable: with the dispatcher ignoring modes, installing them turned a
-refusal into a **silent eager fallback** — `with FakeTensorMode():` entered, reported
+refusal into a **silent eager fallback**, `with FakeTensorMode():` entered, reported
 itself active, handed back real tensors and said nothing. One level below the empty
 graph.
 
@@ -329,7 +329,7 @@ Re-measured on this tree, with the entrance landed:
 | `with FakeTensorMode(): ones(3) * 2` | refuses by name (`_only_lift_cpu_tensors`) | **raises** `torch.is_inference_mode_enabled` | returns a `FakeTensor` |
 | `torch.fx.Graph()` | **builds** | **builds** | builds |
 
-**`FakeTensorMode` no longer returns an eager tensor silently — it raises.** The
+**`FakeTensorMode` no longer returns an eager tensor silently: it raises.** The
 condition `docs/bindings/BIND3.md` §7 held the hand-off on is not satisfiable any more, so
 `docs/graph/EXPORT.md` §8's patch is unblocked. It was **not** taken here: it is item 4, it is
 a different file (`torchnative/python/torchnative/export/upstream.py`) and it changes
@@ -343,15 +343,15 @@ the dispatcher in the argument parser, and is unchanged by this round.
 
 Its load-bearing test is written as *"if no mode sees an operator, no graph front end may
 return a graph"*. With modes working it takes the `modes_work` branch, which demands that
-a returned graph **contain operators** — and `export` does not return, so there is nothing
+a returned graph **contain operators**, and `export` does not return, so there is nothing
 to check and nothing weakened. The stricter half is now the live half, which is what that
 test was built for.
 
 ---
 
-## 4. The architectures — `arch_sweep.py --one`, one at a time
+## 4. The architectures: `arch_sweep.py --one`, one at a time
 
-### 4.1 `led` and `longformer` — **move**
+### 4.1 `led` and `longformer`: **move**
 
 Both stopped at `new_zeros`. Both now run the whole chunked-attention construction and
 stop, together, one call later, in the same borrowed function
@@ -365,13 +365,13 @@ NotImplementedError: not implemented in torch._C shim: TensorBase.where
 
 **Named as actionable, and not by this round.** `torch.where` works here and every
 `where` overload is implemented (`aten.where.self`, `.default`, `.Scalar`,
-`.ScalarSelf`, `.ScalarOther`); what is missing is the **method** — `methods.json` has no
+`.ScalarSelf`, `.ScalarOther`); what is missing is the **method**, `methods.json` has no
 `where` row, so `TensorBase.where` falls through to the surface stub. `methods.json` is
 not this round's file, and a Python-level `Tensor.where` in `bootstrap.py` would be a new
 binding rather than the argument form this round was scoped to, so it is recorded here as
 the next item rather than taken.
 
-### 4.2 `fastspeech2_conformer` — **nothing left to pass to `zeros`**
+### 4.2 `fastspeech2_conformer`: **nothing left to pass to `zeros`**
 
 The `torch.zeros((tuple))` gap named for this architecture in `docs/kernels/TAIL4.md` §8.2 was
 **already closed** by `docs/bindings/BIND4.md` §3 and is closed on this tree; re-measured before
@@ -386,13 +386,13 @@ tensor `repeats` ...
 ```
 
 **One correction, in this file's own refusal text.** It said "this shim has neither
-kernel". `aten.index_select.default` **is** implemented here — checked rather than
+kernel". `aten.index_select.default` **is** implemented here, checked rather than
 inherited. Only `aten::repeat_interleave.Tensor` is missing, and building the index
 without it would mean reading `repeats` back to the host, which is a decision and not a
 transcription. The message now says that instead of a false symmetry, so the next round
 is not told to add a kernel that is already there.
 
-### 4.3 `sam3_lite_text_text_model` — **not a gap, re-confirmed**
+### 4.3 `sam3_lite_text_text_model`: **not a gap, re-confirmed**
 
 `docs/bindings/ARGFORM.md` §3 measured that this is upstream's own
 refusal. Re-measured on this tree, both sides, same call:
@@ -408,17 +408,17 @@ Same class, same rule, and **it was checked before implementing** rather than af
 model is producing an `indices` that evaluates to `None` under the sweep's shrunk
 random-weight config; that is a harness question and there is no argument form to add.
 
-### 4.4 `vilt` — **forwards**
+### 4.4 `vilt`: **forwards**
 
 Not one of the three that shared §1's gap; picked up mid-round, and its wall is §7's.
 `arch_sweep.py --one vilt`: **ok**, forward, `all_modalities`.
 
 ---
 
-## 7. `torch.multinomial(Tensor, Tensor)` — `vilt`, and a third coercion site
+## 7. `torch.multinomial(Tensor, Tensor)`: `vilt`, and a third coercion site
 
 Added mid-round. `vilt` stopped at `torch.multinomial(probs, num_samples)` with a Tensor
-`num_samples`. **Not a missing kernel and not a schema gap** — `multinomial.default`
+`num_samples`. **Not a missing kernel and not a schema gap**, `multinomial.default`
 exists here and its schema matches upstream's, which `verify_schemas.py` checks. It is
 upstream's argument parser, and here that is `_TypeChecker`.
 
@@ -449,7 +449,7 @@ separates the two.
 **It is upstream's parser and not one binding**, checked before being written table-wide
 rather than after: `select`, `transpose`, `unsqueeze`, `narrow`, `sum(dim=)` and
 `repeat_interleave` all take it upstream, unprompted. That is what makes `_TypeChecker`
-the right place and a `multinomial` wrapper the wrong one — the opposite conclusion from
+the right place and a `multinomial` wrapper the wrong one, the opposite conclusion from
 §1, and it is the *measurement* that differs, not the taste: §1's rule is about
 `SymInt[]` **elements**, this one is about scalar positions.
 
@@ -459,7 +459,7 @@ every schema string against upstream.
 
 ### 7.2 The defect the change exposed: a THIRD coercion site
 
-`_Overloads.resolve` has two coercion sites (positional and keyword). There is a third —
+`_Overloads.resolve` has two coercion sites (positional and keyword). There is a third,
 `_compile_fast_path` generates one, and it reproduced only the sized-int-list coercion.
 So with the predicates widened, the fast path handed the **raw Tensor** to the dispatcher
 while the slow path handed an int.
@@ -467,7 +467,7 @@ while the slow path handed an int.
 That did not fail. `aten.rs` unpacks a single-element tensor anyway, **including a `bool`
 one**, so `x.select(0, tensor(True))` came back as a shape-`(4,)` tensor rather than as
 upstream's `RuntimeError`. A divergence from upstream returning a plausible answer, by
-spelling — positional went one way and keyword the other. The fast path now emits the
+spelling, positional went one way and keyword the other. The fast path now emits the
 same coercion, and `test_the_positional_and_keyword_spellings_of_it_agree` holds the two
 spellings against each other rather than each against upstream separately, which is what
 makes it a check on the *pair*.
@@ -476,7 +476,7 @@ makes it a check on the *pair*.
 
 A Tensor as an **element of a sized int list** (`grid.sum(dim=tensor(0))`, an
 `int[1]? dim`). Upstream accepts it; this build refuses it. That position reaches the
-same parser check upstream, so opening it is one line — and it is the table-wide widening
+same parser check upstream, so opening it is one line, and it is the table-wide widening
 §1.2 declined, with no measured caller behind it. **This build is narrower than upstream
 here, on purpose**, and `test_a_tensor_inside_a_sized_int_LIST_is_still_refused_here`
 asserts the absence in both directions so a later round inverts it rather than closing it
@@ -486,7 +486,7 @@ silently.
 
 `multinomial`'s `shape3_unexercised_spelling` entry is **deleted**. Its own text said the
 name was allowlisted because "a test asserting a value against upstream on a random op is
-exactly the shallow-coverage failure mode this file warns against" — true, and the reason
+exactly the shallow-coverage failure mode this file warns against", true, and the reason
 it is closable now is that the test does not depend on the RNG at all: a **one-hot**
 weight vector with `replacement=True` has exactly one legal answer, so the values are
 compared and not only the shape. The suite fails the moment the entry is stale
@@ -508,7 +508,7 @@ which is how this was found rather than remembered.
 
 | | |
 |---|---|
-| **feature added** | two argument forms — `Tensor.new_zeros` with a single-element integral Tensor in `size` (§1), and a single-element integral Tensor in any scalar `int`/`SymInt` position (§7); `torch._C._NodeBase`, `_NodeIter`, `_fx_map_arg`, `_fx_map_aggregate` — enough that `torch.fx.Graph()` constructs (§2) |
+| **feature added** | two argument forms, `Tensor.new_zeros` with a single-element integral Tensor in `size` (§1), and a single-element integral Tensor in any scalar `int`/`SymInt` position (§7); `torch._C._NodeBase`, `_NodeIter`, `_fx_map_arg`, `_fx_map_aggregate`, enough that `torch.fx.Graph()` constructs (§2) |
 | **defect fixed** | `docs/bindings/BIND4.md` §3's coercion accepted float, whole-float and bool Tensors that upstream refuses (§1.3); the generated fast path reproduced only one of `resolve`'s two coercions, so positional and keyword spellings could disagree (§7.2); the `repeat_interleave` refusal claimed a missing kernel that exists (§4.2) |
 | **tests added** | 27, in `tests/bindings/test_bind5.py`. No test was modified, inverted or deleted anywhere |
 | **documentation corrected** | `docs/graph/EXPORT.md` §4.1's `_NodeBase` census listed `_erased`/`_next`/`_prev` as "present and real"; all three were raising getters (§2.1). `docs/bindings/BIND3.md` §7's verdict on the §8 hand-off is superseded by measurement (§3.2) |
@@ -517,7 +517,7 @@ which is how this was found rather than remembered.
 
 "No unimplemented left" is **not** claimed for anything here. `led`/`longformer` moved to
 a named next item, `fastspeech2_conformer` did not move, `sam3_lite_text_text_model`
-cannot move from this file, and `torch.export` does not produce a graph — §3 says exactly
+cannot move from this file, and `torch.export` does not produce a graph, §3 says exactly
 where it stops.
 
 ---
@@ -559,7 +559,7 @@ done
 
 `test_bind5.py` runs its own upstream subprocess with `PYTHONPATH` and
 `TORCH_USE_RTLD_GLOBAL` stripped, and skips silently on the shim side when
-`scripts/vendor/install_shim.sh` has not run — the same guard `test_bind4.py` and
+`scripts/vendor/install_shim.sh` has not run: the same guard `test_bind4.py` and
 `test_bind3.py` carry, for the same reason.
 
 <!-- DOCWATCH: count golden_cases_total ge 11336 -->

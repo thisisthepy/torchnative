@@ -1,4 +1,4 @@
-# REFOLD — folding `prims.*` back to `aten`, and BatchNorm into the convolution
+# REFOLD: folding `prims.*` back to `aten`, and BatchNorm into the convolution
 
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py refold present -->
 <!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py REFOLDABLE present -->
@@ -14,8 +14,8 @@ because there are two honest answers to "outside NNAPI" and they differ:
 
 | | counts |
 |---|---|
-| **ADDER\_MAP** | `target.NNAPI` — base names parsed out of `torch/backends/_nnapi/serializer.py`. An **upper bound** on coverage (docs/graph/DECOMP.md §12.2): it has no overloads in it |
-| **serialisable** | `nnapi.supported_ops()` — captured overloads that have a calling convention and can actually be handed to an adder. This is the one that decides whether a blob comes out |
+| **ADDER\_MAP** | `target.NNAPI`, base names parsed out of `torch/backends/_nnapi/serializer.py`. An **upper bound** on coverage (docs/graph/DECOMP.md §12.2): it has no overloads in it |
+| **serialisable** | `nnapi.supported_ops()`, captured overloads that have a calling convention and can actually be handed to an adder. This is the one that decides whether a blob comes out |
 
 ### 1.1 The refold, against the ADDER\_MAP count
 
@@ -29,7 +29,7 @@ because there are two honest answers to "outside NNAPI" and they differ:
 
 **One model improves and two do not, and the two that do not are the point of
 this table.** docs/kernels/PRIMS.md §3 reported `vit` going 10 → 11 when the thirteen
-prims kernels landed — lowering ran to completion and the graph *ended* on
+prims kernels landed, lowering ran to completion and the graph *ended* on
 `prims.erf` and `prims.transpose` instead of stopping at `aten.erf` and
 `aten.permute`. The refold takes it back to 10. It does not take it below 10,
 and nothing here claims it does.
@@ -51,18 +51,18 @@ one, and the correct pass is §3's fold, not lowering at all.**
 
 | model | serialisable-outside before | after fold | pairs folded | nodes |
 |---|---|---|---|---|
-| `mobilenet_v2` | **2** — `native_batch_norm`, `constant_pad_nd` | **1** — `constant_pad_nd` | 52 | 203 → **151** |
-| `conv_bn_relu_conv_relu6_pool_linear_softmax` | **1** — `native_batch_norm` | **0** | 1 | 10 → 9 → 8 after constant folding |
-| `vit`, `smollm2_llama`, `mlp_gelu` | 9 / 18 / 2 | unchanged | 0 | unchanged — no convolution+BatchNorm pair to fold |
+| `mobilenet_v2` | **2**, `native_batch_norm`, `constant_pad_nd` | **1**, `constant_pad_nd` | 52 | 203 → **151** |
+| `conv_bn_relu_conv_relu6_pool_linear_softmax` | **1**, `native_batch_norm` | **0** | 1 | 10 → 9 → 8 after constant folding |
+| `vit`, `smollm2_llama`, `mlp_gelu` | 9 / 18 / 2 | unchanged | 0 | unchanged, no convolution+BatchNorm pair to fold |
 
 docs/graph/NPU.md §7 said `mobilenet_v2` was **two ops away**. It is now one.
 
-## 2. The refold — `torchnative/export/refold.py`
+## 2. The refold: `torchnative/export/refold.py`
 
 ### 2.1 The direction is forced, not chosen
 
 `prims.transpose` is **stricter** than `aten.permute`, and that decides which
-way the rewrite may go. Measured, not recalled — the test calls both:
+way the rewrite may go. Measured, not recalled, the test calls both:
 
 ```
 prims.transpose(randn(3,4), [-1, 0])  ->  ValueError: Received an invalid permutation, [-1, 0]!
@@ -73,38 +73,38 @@ So every argument `prims.transpose` accepts, `aten.permute` accepts and
 computes identically: **prims → aten is total**. The converse is partial, and
 `[-1, 0]` is a permutation real graphs produce, so a "canonicalise to prims"
 pass would turn working graphs into raises. `prims.split_dim` gives the same
-asymmetry a second time — it rejects a negative `dim` every aten op in this
+asymmetry a second time, it rejects a negative `dim` every aten op in this
 shim accepts.
 
 ### 2.2 The table, and the one that is absent
 
 | prims | aten | why it is the same function |
 |---|---|---|
-| `cos` `sin` `erf` `tanh` `sqrt` `rsqrt` `reciprocal` `neg` | same name | upstream's own `impl_aten` for `prims.cos` **is** `torch.cos` (docs/kernels/PRIMS.md §1) — the same kernel under another key |
+| `cos` `sin` `erf` `tanh` `sqrt` `rsqrt` `reciprocal` `neg` | same name | upstream's own `impl_aten` for `prims.cos` **is** `torch.cos` (docs/kernels/PRIMS.md §1), the same kernel under another key |
 | `clone` | `aten.clone.default` | same, `memory_format` carried through rather than dropped |
 | `view_of(a)` | `aten.alias.default` | docs/kernels/PRIMS.md §1 states the identity |
 | `transpose(a, perm)` | `aten.permute.default` | full permutation, not `aten.transpose.int`'s two-axis swap |
 | `split_dim(a, dim, n)` | `aten.view.default(a, shape)` | splits one axis into two adjacent ones, so it never reorders and never crosses a discontiguity; shape read from the meta capture recorded for the node |
-| **`broadcast_in_dim`** | **none — refused by name** | see below |
+| **`broadcast_in_dim`** | **none, refused by name** | see below |
 
 `prims.broadcast_in_dim(a, shape, broadcast_dimensions)` is XLA's broadcast:
 the caller names which result axis each input axis becomes, so it can insert an
 axis in the middle and broadcast a size-3 axis against a size-2 one.
-`broadcast_in_dim(ones(3), [3, 2], [0])` **has no `expand` spelling at all** —
+`broadcast_in_dim(ones(3), [3, 2], [0])` **has no `expand` spelling at all**,
 and that is kept as a live control rather than a recollection: the test calls
 `aten.expand(ones(3), [3, 2])` and requires it to raise. If expand ever
 computes it, the test goes red and the reason for the refusal gets re-examined.
 
 A `view` + `expand` composite does compute it. It is deliberately not emitted.
-Refolding is a *re-spelling* — one node in, one node out, nothing to prove
+Refolding is a *re-spelling*, one node in, one node out, nothing to prove
 beyond the identity. A two-node composite is a decomposition, and this project
 does not write decompositions; it runs upstream's (docs/graph/DECOMP.md §12.1).
 
 ### 2.3 It is terminal, and it has to be
 
 `lower_and_refold` lowers first and refolds once, and does not feed the result
-back. It cannot: the two passes are inverses on the ops they share — the union
-table lowers `aten.tanh` to `prims.tanh` and this pass folds it back — so a
+back. It cannot: the two passes are inverses on the ops they share, the union
+table lowers `aten.tanh` to `prims.tanh` and this pass folds it back, so a
 loop over both does not terminate. Lowering's fixed point is prims; the refold
 is the single step off it.
 
@@ -119,7 +119,7 @@ answer** and it is measured two ways:
   on inputs the trace has not seen. `smollm2_llama`, `vit`, `mobilenet_v2`,
   `mlp_gelu`: all `0.0`.
 
-## 3. The BatchNorm fold — `torchnative/export/fuse.py`
+## 3. The BatchNorm fold: `torchnative/export/fuse.py`
 
 ### 3.1 Why it is not a decomposition
 
@@ -149,7 +149,7 @@ case is measured beside them:
 
 | | random channel, max abs diff | constant channel (`mean = x = 632`, `bias = 0.1`) |
 |---|---|---|
-| upstream | — | **0.0999755859375** |
+| upstream | n/a | **0.0999755859375** |
 | fused (this fold) | **0.0** | **0.0999755859375** |
 | the obvious unfused form | 4.77e-07 | 0.10000000149011612 |
 
@@ -164,7 +164,7 @@ Not folding is always safe; folding wrongly is not. Each of these must fold
 
 | case | why |
 |---|---|
-| training-mode batch norm | statistics depend on `x`, so there is no constant `alpha`. (Capture refuses it first — it mutates running statistics, docs/graph/CAPTURE.md §4 — which is also a refusal) |
+| training-mode batch norm | statistics depend on `x`, so there is no constant `alpha`. (Capture refuses it first (it mutates running statistics, docs/graph/CAPTURE.md §4) which is also a refusal) |
 | the convolution's result read more than once | its unfused value is still needed |
 | transposed convolution | its weight carries output channels on **axis 1**, so scaling axis 0 would scale the input channels |
 | non-constant BN parameters, or `save_mean`/`save_invstd` read | the affine is not known at fold time, or the fused convolution does not produce what is being read |
@@ -177,7 +177,7 @@ not bit-exact against the unfused graph and this document does not say it is.
 
 | graph | max abs diff over 3 unseen inputs | output magnitude |
 |---|---|---|
-| `conv_bn_relu_conv_relu6_pool_linear_softmax` | **1.49e-08** | O(1) — softmax output |
+| `conv_bn_relu_conv_relu6_pool_linear_softmax` | **1.49e-08** | O(1), softmax output |
 | `mobilenet_v2` (52 pairs) | 2.1e-32 | **2.3e-26** |
 
 `mobilenet_v2`'s absolute number is meaningless on its own: at
@@ -187,7 +187,7 @@ bounds it **relatively** (ratio ~1e-6), and the absolute proof of the fold is
 the first row, whose output is O(1). Writing the 2.1e-32 down as the headline
 would be AGENTS.md §17.5's check that cannot fail.
 
-## 4. The deliverable — a whole model inside NNAPI's set
+## 4. The deliverable: a whole model inside NNAPI's set
 
 `Conv → BatchNorm → ReLU → Conv → ReLU6 → AdaptiveAvgPool → Linear → Softmax`,
 the network docs/graph/NPU.md §7 measured at one unmapped op before lowering and ten
@@ -195,8 +195,8 @@ after.
 
 | step | ops outside `nnapi.supported_ops()` |
 |---|---|
-| captured | 1 — `aten.native_batch_norm.default`; `N.serialize` **refuses by name** |
-| after `fold_conv_batch_norm` | 1 — `aten.t.default`, over a constant weight |
+| captured | 1, `aten.native_batch_norm.default`; `N.serialize` **refuses by name** |
+| after `fold_conv_batch_norm` | 1, `aten.t.default`, over a constant weight |
 | after `fold_constants` (docs/graph/NPU.md §5) | **0** |
 
 Upstream's serialiser then writes the blob, and it decodes:
@@ -224,7 +224,7 @@ not what made this model reachable and the test says so instead of passing.
 
 ## 5. What is still outside, and why each one is not a refold
 
-### `mobilenet_v2` — `constant_pad_nd`, and it is not asymmetry-free
+### `mobilenet_v2`: `constant_pad_nd`, and it is not asymmetry-free
 
 The obvious next pass is folding a zero `constant_pad_nd` into the following
 convolution's `padding`, which is exact when the pad is symmetric. **It does
@@ -241,16 +241,16 @@ convolutions. NNAPI's explicit-padding `CONV_2D` does take four separate
 padding values, but upstream's `add_conv_underscore` reads torch's **symmetric**
 `padding` argument, so asymmetric padding is unreachable *through this
 serialiser* regardless. So such a pass would remove 47 nodes and leave the
-`constant_pad_nd` count at 1 — the headline number would not move. It was
+`constant_pad_nd` count at 1: the headline number would not move. It was
 measured and not built.
 
-### `vit` — `native_layer_norm`, SDPA, `select.int`, `contiguous`
+### `vit`: `native_layer_norm`, SDPA, `select.int`, `contiguous`
 
 None is a prims problem. `native_layer_norm` is the analogue of §3's job for a
 normalisation with no preceding linear op to absorb it, and SDPA is a composite
 NNAPI has no adder for at all.
 
-### `smollm2_llama` — `embedding`, `arange`, `index.Tensor`, SDPA
+### `smollm2_llama`: `embedding`, `arange`, `index.Tensor`, SDPA
 
 Same. `prims.broadcast_in_dim` is also in its residue, and §2.2 says why that
 one stays.
@@ -282,5 +282,5 @@ and share one subprocess fixture (`_REFOLD_SCRIPT`):
     test_folding_batch_norm_into_conv_takes_mobilenet_to_one_op_outside
     test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set
 
-No Rust changed this round. The golden harness is **8921/8921, ops covered 222**
-— unmoved, and that is the check that it did not.
+No Rust changed this round. The golden harness is **8921/8921, ops covered 222**,
+unmoved, and that is the check that it did not.

@@ -3,19 +3,19 @@
 `docs/graph/STRIDE.md` §5 measured where `torch.export` stops and narrowed the
 question sharply: of the forty `transformers` architectures the sweep covers,
 only **ten** are ones upstream torch can export at all, and those ten stopped
-at exactly two places — `torch.var_mean` (6) and
+at exactly two places, `torch.var_mean` (6) and
 `torch._C._select_conv_backend` (4).
 
 This round closed both. Read these three things first, because they decide how
 the rest should be taken:
 
 * **The headline is still 0 of 10 under the replay-and-agree bar**, and the bar
-  is not "export() returned" — it is that the exported program replays and its
+  is not "export() returned". It is that the exported program replays and its
   outputs agree element-wise with the unexported module. §3 reports it.
 * **Both named walls are at zero, measured.** `var_mean` went from 11 of the
   forty to 0 and `_select_conv_backend` from 5 to 0. Nine of the ten now stop
   at **one** new wall, the same one for all nine, and it is not a missing
-  operator (§4) — it is a result *type*. Two explanations for it were tested
+  operator (§4), it is a result *type*. Two explanations for it were tested
   and rejected; §4.1 records them, because both look right. The tenth reaches
   `FakeTensorDeviceMismatchError`, which `STRIDE.md` §6 analysed and
   deferred.
@@ -28,19 +28,19 @@ the rest should be taken:
 
 ---
 
-## 1. `var_mean` — a real operator, returning a pair
+## 1. `var_mean`: a real operator, returning a pair
 
 There was no `aten.var_mean.*` kernel of any kind, and no `var_mean` entry in
 `torchnative/rust/torch_c/src/overloads.json`, so `torch.var_mean(...)` refused at overload
 resolution before reaching a dispatcher. `aten.var.*` and `aten.std.*` existed
 and still do.
 
-**The pattern named in this round's brief — an operator already implemented but
-lacking a *meta* kernel — was checked for first and is not what this was.**
+**The pattern named in this round's brief: an operator already implemented but
+lacking a *meta* kernel, was checked for first and is not what this was.**
 `aten.var_mean` was absent on both sides of that line. It was worth checking
 anyway: the same check applied to §4's wall found a real instance of the
-pattern — `aten.native_layer_norm.default` **has** a meta arm here and the
-surface answers that it has none — which turned out not to be the cause of
+pattern, `aten.native_layer_norm.default` **has** a meta arm here and the
+surface answers that it has none, which turned out not to be the cause of
 that wall either (§4.1), but is a measured gap now on the record.
 
 ### 1.1 What landed
@@ -60,15 +60,15 @@ plus a meta arm for each, and an entry in `meta_stride_rule`'s
 it: `var_reduce_values` returns `(out, means, out_dims)` and both `var_reduce`
 (one tensor, optionally rooted for `std`) and `var_mean_reduce` (the pair) are
 thin exits over it. That sharing is the point and not a tidiness: the five
-clamped-denominator rows `var` records — `max(0, n - correction)`, `inf` where
-`m2 > 0` and `nan` where `m2 == 0` — apply to the pair because it is the same
+clamped-denominator rows `var` records, `max(0, n - correction)`, `inf` where
+`m2 > 0` and `nan` where `m2 == 0`: apply to the pair because it is the same
 code, and a fresh implementation would have had to remember them.
 
 **The mean is a result, not a by-product.** It comes out of the same `f64`
 accumulator the variance was computed from and is narrowed once. Recomputing it
 through `mean.dim` would narrow twice, which upstream's fused kernel does not
 do, and a comparator that checked only the variance would accept a kernel that
-returned the wrong tensor as its second element entirely — which is one wrong
+returned the wrong tensor as its second element entirely, which is one wrong
 variable away here, since the mean is already sitting in scope.
 
 ### 1.2 The dtype and correction behaviour, measured
@@ -80,7 +80,7 @@ variable away here, since the mean is already sitting in scope.
   probe.
 * **Both halves keep the input's dtype**, including `float16` and `bfloat16`;
   `complex64` gives a real variance and a complex mean (recorded, not
-  implemented — this shim's `var` family does not take complex either).
+  implemented, this shim's `var` family does not take complex either).
 * **The refusal wording is not `var`'s.** Upstream's CPU kernel says
   `var_mean only support floating point and complex dtypes`, where `var` says
   `std and var only support floating point and complex dtypes`. Transcribed
@@ -94,7 +94,7 @@ translating the deprecated `unbiased` forms on the way. This shim's resolver
 takes the first schema in `overloads.json` that binds, so `torch.var_mean(x)`
 reaches `.default` and `torch.var_mean(x, dim=0)` reaches `.dim`.
 **`torch.var` has had exactly this disagreement since it landed**
-(`docs/graph/EXPORT5.md` §9) — measured on both sides, not assumed — and
+(`docs/graph/EXPORT5.md` §9) (measured on both sides, not assumed) and
 `var_mean` inherits the table's shape rather than inventing a second
 convention. The values agree, so no value test can see it; it is pinned by
 `test_var_mean_resolves_the_overload_var_resolves_and_that_is_not_upstreams`
@@ -104,13 +104,13 @@ so that a silent change in either direction reddens something.
 refuses an integral input with `var_mean only support...` and its *meta* kernel
 refuses it with `mean(): could not infer output dtype...`, because its meta arm
 is the `_refs` decomposition and the refusal surfaces from the `mean` inside
-it. `docs/devices/META.md` §7.1 settles which one this shim follows — the dense
-kernel's, called rather than restated — and `_weight_norm_interface` already
+it. `docs/devices/META.md` §7.1 settles which one this shim follows, the dense
+kernel's, called rather than restated, and `_weight_norm_interface` already
 carries four divergences of this shape.
 
 ---
 
-## 2. `_select_conv_backend` — a query, not a computation
+## 2. `_select_conv_backend`: a query, not a computation
 
 ### 2.1 What it is
 
@@ -126,13 +126,13 @@ shim's own convolution, not a reimplementation of ATen's selection.
 `_ConvBackend.Overrideable` is upstream's name for "a backend outside this
 enumeration handles this", and upstream returns exactly that whenever it cannot
 see a device it knows. `torch/_meta_registrations.py:2793` says so in a
-comment; it is measured here rather than taken on that comment's word —
+comment; it is measured here rather than taken on that comment's word,
 upstream answers `Overrideable` for a meta-tensor convolution in all six shapes
 the probe builds (2d, 3d, 1d, depthwise, transposed, dilated), for both the
 `bias=` and the `bias_sizes=` spelling `fake_impls.py` uses.
 
 This shim has **one** convolution path and it is none of the twenty-two
-upstream enumerates — no cudnn, no mkldnn, no nnpack, no xnnpack, no Winograd.
+upstream enumerates, no cudnn, no mkldnn, no nnpack, no xnnpack, no Winograd.
 Naming any of them would be a claim about which kernel runs.
 
 `_ConvBackend`'s twenty-two names and values cannot come from the vendored
@@ -152,21 +152,21 @@ Two things the measurement decided that reading would have got wrong:
   upstream answers `torch.contiguous_format` for `Slow2d`, `Empty` and
   `Overrideable` alike, contiguous input and channels-last input alike. The
   constant is now upstream's own answer everywhere this shim is asked, and the
-  one place it differs — a *dense* channels-last input with a native backend —
+  one place it differs, a *dense* channels-last input with a native backend,
   is recorded by a test that also shows it is unreachable through this shim's
   own query.
 * **`torch._C.ConvBackend` must NOT be pointed at the real class.**
   `torch/__init__.py:1091` walks every public name in `dir(_C)` and rewrites
-  `__obj.__module__` to `"torch"`. Aliasing the two names — which the `.pyi`
-  annotation invites — silently moved the class's `__module__` off `torch._C`,
+  `__obj.__module__` to `"torch"`. Aliasing the two names, which the `.pyi`
+  annotation invites, silently moved the class's `__module__` off `torch._C`,
   where upstream's is. Upstream has no runtime `ConvBackend` at all. Caught by
   the differential test, not by reading.
 
 ### 2.3 It could not have moved the count, and that was measured first
 
-Before writing anything, both queries were stubbed out in a probe — a token
+Before writing anything, both queries were stubbed out in a probe, a token
 backend and "no memory-format request", which is what a shim whose convolution
-is always contiguous would answer — and the four architectures behind them were
+is always contiguous would answer, and the four architectures behind them were
 re-run:
 
 ```
@@ -199,7 +199,7 @@ All forty, export-stage failures only, by first wall:
 
 | wall | before | after |
 |---|---:|---:|
-| `torch.var_mean` — no table entry | 11 | **0** |
+| `torch.var_mean`, no table entry | 11 | **0** |
 | `torch._C._select_conv_backend` | 5 | **0** |
 | `return_types_native_layer_norm.__new__()` (§4) | 0 | 14 |
 | `aten.lift_fresh_copy.default` | 7 | 7 |
@@ -222,7 +222,7 @@ Nine of the ten now stop at one wall, and it is the same wall.
 
 ---
 
-## 4. The next wall, measured — and one hypothesis checked and rejected
+## 4. The next wall, measured, and one hypothesis checked and rejected
 
 All nine stop here, and a four-line module reproduces it:
 
@@ -261,9 +261,9 @@ Two plausible explanations were tested and **both are wrong**. They are
 recorded because each looks right and would have been published as the cause:
 
 * **"the shim reaches `_refs` where upstream does not."** It does not: the
-  route is identical on both sides —
+  route is identical on both sides,
   `fake_tensor.py:3052` → `fake_impls.py:205` →
-  `_refs/__init__.py:3513 native_layer_norm_fake` → the `_out_wrapper`'d ref —
+  `_refs/__init__.py:3513 native_layer_norm_fake` → the `_out_wrapper`'d ref,
   and `torch._refs.native_layer_norm(...)` called directly returns
   `return_types_native_layer_norm` on **both** sides. `_out_wrapper`'s exit is
   `return out if is_tensor else return_type(*out)`, unconditionally.
@@ -271,8 +271,8 @@ recorded because each looks right and would have been published as the cause:
   `FakeTensorMode`: NamedTuple on both. Only the **full dispatch** differs.
 * **"`_dispatch_has_kernel_for_dispatch_key(name, 'Meta')` is a constant
   `False` here and `True` upstream, so the meta kernel is skipped."** The
-  measurement is real — `bootstrap.py` answers `lambda *a, **k: False`, and
-  its own comment says the answer is conservative — but it is **not the
+  measurement is real, `bootstrap.py` answers `lambda *a, **k: False`, and
+  its own comment says the answer is conservative, but it is **not the
   mechanism for this**: the branch that consults a meta kernel
   (`fake_tensor.py:2946`) goes through `cpp_meta_supports_symint`, which is a
   fixed `ordered_set` and identical on both sides, and `OpOverload.decompose`
@@ -287,11 +287,11 @@ recorded because each looks right and would have been published as the cause:
 
   > **Measured on its own terms, and left alone: `docs/graph/METAKEY.md`.**
   > The 2083/408 reproduces exactly, and a third answer nobody had named turns
-  > up beside them — upstream **raises** for 300 names rather than answering.
+  > up beside them, upstream **raises** for 300 names rather than answering.
   > Two things above this need correcting. The gap a caller can see is **148**,
   > not 1375: `OpOverload.has_kernel_for_dispatch_key` ORs in `py_kernels`, and
   > `activate_meta()` has already covered 1227 of the 1375. And **"a registry of
-  > which ops this shim has a meta arm for" is the wrong registry** — 28 of the
+  > which ops this shim has a meta arm for" is the wrong registry**, 28 of the
   > 114 ops with a meta arm here are ops upstream answers `False` for, because
   > it reaches them through `CompositeExplicitAutograd`. The one caller is
   > `resolve_key`, it is not reached on this shim, and 15 of the 17 names it
@@ -306,13 +306,13 @@ same `_refs` function that returns a NamedTuple. The remaining candidates are
 had monkey-patched the ref, which forces a miss and may not be the path a cold
 upstream run takes) and a branch above `fake_tensor.py:3049` that returns
 before the `op_implementations_checks` loop. **That is the next round's first
-task**, and it is one line of measurement away — not a redesign.
+task**, and it is one line of measurement away, not a redesign.
 
 > **Answered, and the answer moved the count: `docs/graph/STRUCTSEQ.md`.**
 > The cache *is* where upstream's plain `tuple` comes from, and it is still not
 > the mechanism. Two things below this were wrong. The `Python` dispatch key
 > was carried nowhere, so `fx - fx` on a `FakeTensor` with the mode popped
-> returned a bare `meta` tensor — which is what made `_make_cache_entry` bypass
+> returned a bare `meta` tensor, which is what made `_make_cache_entry` bypass
 > and kept the cache's `tuple(outputs)` out of reach. And
 > `OpOverload.__call__` did not re-box a mode's answer through the schema,
 > which is the step that keeps the `_out_wrapper` NamedTuple from ever escaping
@@ -382,7 +382,7 @@ golden ops=304, and every delta accounts for itself:
 
 Each was written into the source, rebuilt (`bootstrap.py` is `include_str!`'d,
 so editing without rebuilding retests the old binary), installed, run, and
-reverted by `copy2` **and an explicit `utime`** — `EXPORT6` §4.1's stale-mtime
+reverted by `copy2` **and an explicit `utime`**, `EXPORT6` §4.1's stale-mtime
 trap, which makes cargo skip a rebuild and leave the wrong binary installed.
 
 | | nullification | red |
@@ -470,7 +470,7 @@ and `test_the_precondition_decides_both_ways_on_synthetic_inputs`.
 
 ## 6. This round, separated
 
-**Features added** — kernels or surface the shim did not have:
+**Features added**: kernels or surface the shim did not have:
 
 1. `aten.var_mean.default` / `.dim` / `.correction`, dense.
 2. Meta arms for all three, in the `AlwaysContiguous` layout class.
@@ -480,7 +480,7 @@ and `test_the_precondition_decides_both_ways_on_synthetic_inputs`.
 6. `torch._C._conv_determine_backend_memory_format`, answering
    `torch.contiguous_format`.
 7. `var_mean`'s three overloads added to `device.rs::MPS_HOST_READBACK_OPS`
-   (87 → 90) — a *refusal* is the capability here: they read an `mps` tensor
+   (87 → 90), a *refusal* is the capability here: they read an `mps` tensor
    back to the host, as their `var` siblings do, so they must be refused at
    the door rather than computing on the CPU under an `mps` label. The gate
    derived this itself: `test_the_mps_readback_list_is_what_the_kernels_actually_do`
@@ -488,9 +488,9 @@ and `test_the_precondition_decides_both_ways_on_synthetic_inputs`.
 
 **Defects fixed**: none. Nothing that was here was wrong; these were absences.
 The four gate failures this round produced were all *consequences* correctly
-reported by tests doing their job, not pre-existing defects — see below.
+reported by tests doing their job, not pre-existing defects, see below.
 
-**Tests added**: 12 — 7 in `tests/export/test_varmean.py`, 3 in
+**Tests added**: 12: 7 in `tests/export/test_varmean.py`, 3 in
 `tests/bindings/test_convbackend.py`, and 2 in
 `tests/distributed/test_gloopin.py` (§5.2: the interface detector's own
 check, and the precondition driven both ways). Every one compares against upstream
@@ -498,10 +498,10 @@ torch's own answer in a second subprocess; the numeric tolerances are imported
 from `tests/golden/dtypes.py` rather than restated, so widening one is not
 possible without widening the golden harness's. Plus 3 golden case builders
 (`aten.var_mean.*`), which reuse `var`'s own tables with a `(var, mean)`
-comparator — so the five clamped-denominator rows and the `correction=None`
+comparator, so the five clamped-denominator rows and the `correction=None`
 default apply to the pair by construction.
 
-**Tests conditioned**: 1 — `test_gloopin.py`'s pin nullification, §5.2. Not
+**Tests conditioned**: 1: `test_gloopin.py`'s pin nullification, §5.2. Not
 corrected and not weakened: the assertion is byte-identical to `develop`
 (`179 insertions(+), 0 deletions(-)`); what changed is that it now measures
 and reports whether the comparison is possible on this host instead of failing
@@ -519,7 +519,7 @@ both updated by **naming** what moved rather than re-baselining a number:
   `vit` goes 11 → 12 outside NNAPI and 10 → 11 after the refold, because
   `_refs.native_layer_norm` now terminates at `aten.var_mean.dim` instead of
   refusing. The test now asserts **that op by name** and that the refold still
-  removes exactly one — so a different op moving outside would still fail it.
+  removes exactly one, so a different op moving outside would still fail it.
 
 **Docs corrected**: 3 live counts in `README.md` (the `mps` host-readback set,
 87 → 90, in all three places that state it) and a forward note on
@@ -533,9 +533,9 @@ left alone.
 **Removed**: nothing.
 
 **Measured and deliberately NOT written**: a port of ATen's `select_conv_backend`
-CPU rules (§2.2 — `Overrideable` is upstream's own answer and the port would be
+CPU rules (§2.2, `Overrideable` is upstream's own answer and the port would be
 a claim about kernels not in this build), and the per-op `Meta` dispatch-key
-predicate of §4.1 — which is a real gap (408 of upstream's 2083 aten overloads
+predicate of §4.1, which is a real gap (408 of upstream's 2083 aten overloads
 answer `False` there, so the blanket answer is wrong) but is **not** the cause
 of §4's wall, and landing it on that mistaken ground would have been the
 round's worst move.

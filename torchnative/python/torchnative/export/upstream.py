@@ -1,4 +1,4 @@
-"""The `torch.export` census names — **moved, and this is what is left.**
+"""The `torch.export` census names: **moved, and this is what is left.**
 
 `docs/graph/EXPORT.md` §8 described this module as "a staging area, not the final
 home" and wrote the patch that would move it.  `docs/graph/EXPORT4.md` §10 listed
@@ -17,8 +17,8 @@ would have deleted those tests with it.
 
 Why the monkey-patch had to go, restated because it is the point of the move:
 installing after `import torch` meant a `rebind()` pass over roughly forty
-`from torch._C import ...` bindings that other torch modules had already made
-— including aliases like `torch/utils/_mode_utils.py:15`'s
+`from torch._C import ...` bindings that other torch modules had already made,
+including aliases like `torch/utils/_mode_utils.py:15`'s
 ``no_dispatch = torch._C._DisableTorchDispatch``, which is why that pass had to
 match by object identity rather than by name.  All of it is gone.
 
@@ -41,7 +41,7 @@ __all__ = ["install", "installed_names", "InstallReport"]
 def _bootstrap():
     """The module the implementations now live in.
 
-    It is `_torch_c_bootstrap` in `sys.modules` — `torchnative/rust/torch_c/src/bootstrap.py`
+    It is `_torch_c_bootstrap` in `sys.modules`, `torchnative/rust/torch_c/src/bootstrap.py`
     is `include_str!`'d into the extension at Rust build time and executed under
     that name, which is why this is a `sys.modules` lookup and not an import.
     """
@@ -61,7 +61,7 @@ class InstallReport:
 
     Kept so that callers which print it keep working.  The numbers are zero
     because there is nothing left to install: `replaced` counted placeholders
-    this module overwrote at runtime, and after the hand-off there are none —
+    this module overwrote at runtime, and after the hand-off there are none,
     the bootstrap never creates them in the first place.
     """
 
@@ -132,7 +132,7 @@ def install(torch_module=None):
 
     It is deliberately not an error to call this.  Probes and tests written
     against the staging arrangement keep running, and what they measure
-    afterwards is the bootstrap's behaviour — which is the point.  It does not
+    afterwards is the bootstrap's behaviour, which is the point.  It does not
     silently *look* like it installed something: every count in the report is
     zero and the repr says `moved-to-bootstrap`.
     """

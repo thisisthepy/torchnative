@@ -4,12 +4,12 @@ Round date 2026-09-07. Branch `work/vmap`, on develop `a523ae4`. Host Apple M1,
 CPython 3.13, upstream torch 2.13.0, transformers 5.x, `candle-core` 0.11.0.
 
 `docs/kernels/COMPLEX.md` §7 sized `torch._C._functorch._vmap_increment_nesting` as the
-largest single entry on `docs/architectures/ARCH200.md`'s blocked list — four architectures
-where every other entry blocks one or two — and refused to stub it, for a
+largest single entry on `docs/architectures/ARCH200.md`'s blocked list, four architectures
+where every other entry blocks one or two, and refused to stub it, for a
 reason worth repeating before anything else in this document:
 
 > A no-op counter is worse than nothing. It lets the call proceed and the
-> result is used as an attention mask, which does not raise — it just produces
+> result is used as an attention mask, which does not raise. It just produces
 > a wrong mask and a model that appears to run.
 
 That is still the whole risk. This round did not stub it and did not build a
@@ -28,7 +28,7 @@ The assertions behind every claim here live in
 |---|---|---|
 | What do the four pass to `vmap`? | **A scalar closure over four index scalars**, nested four deep, `in_dims` one-hot over a 1-D `arange`, `out_dims=0` throughout. | §1 |
 | Is `out_dims` ever non-zero? | **No.** `masking_utils.py:348` hardcodes `out_dims=0` at every level. | §1.2 |
-| Is a general `vmap` needed? | **No.** For a closure that is pointwise over the mapped indices, `vmap` *is* broadcasting — and transformers ships that identity itself, as the default path. | §2 |
+| Is a general `vmap` needed? | **No.** For a closure that is pointwise over the mapped indices, `vmap` *is* broadcasting, and transformers ships that identity itself, as the default path. | §2 |
 | Did it need a `Repr` arm? | **No, and that is the difference from `docs/kernels/COMPLEX2.md`.** A batched value here is a plain dense tensor with extra size-1 dimensions. No arm, no tag, no kernel, no `aten.*` name. | §3 |
 | Does the mask match upstream? | **Bit-identical, every element, four closures, compared against upstream torch in a separate process.** | §3.4 |
 | What stops a wrong answer for closures this does not fit? | Three gates, each of which turns red on its own when nullified. | §4 |
@@ -78,7 +78,7 @@ def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
 `and_masks` (`masking_utils.py:48`) then `&`s each with the base
 (`causal_mask_function` or `bidirectional_mask_function`) starting from
 `q_idx.new_ones((), dtype=torch.bool)`, and `sdpa_mask` (`:504`) `&`s in
-`padding_mask_function`, which is `padding_mask[batch_idx, kv_idx]` — advanced
+`padding_mask_function`, which is `padding_mask[batch_idx, kv_idx]`: advanced
 indexing of a real 2-D tensor by two mapped indices.
 
 So the complete operator set reachable inside these closures is: `div`
@@ -99,7 +99,7 @@ def _vmap_expansion_sdpa(mask_function):          # masking_utils.py:339
 
 Four levels. Each `in_dims` is one-hot: a single `0`, the rest `None`. Every
 mapped argument is a 1-D `arange` (`masking_utils.py:507-510`), so every mapped
-value is a **scalar** — logical rank 0. `out_dims` is 0 at every level, never
+value is a **scalar**, logical rank 0. `out_dims` is 0 at every level, never
 anything else. `randomness` is never passed, so it is `torch.vmap`'s default,
 `"error"`.
 
@@ -124,7 +124,7 @@ with its own docstring: *"Allows the usage of any index-based mask function
 without relying on vmap. NOTE: This is limited to index based functions only."*
 
 That is the identity this round rests on, so it was measured rather than
-assumed — **on upstream torch, in its own process**, for all four closure
+assumed, **on upstream torch, in its own process**, for all four closure
 configurations `test_vmap.py` uses:
 
     upstream, chunked_limited              vmap == broadcast   (all 162 elements)
@@ -139,7 +139,7 @@ upstream, this shim would be faithfully reproducing the wrong thing.
 The reason it holds is mechanical. Give level `L` tensor dimension `L-1` and
 pad every batched value out to a fixed rank with size-1 dimensions; then
 right-aligned broadcasting lines the levels up, an elementwise op composes them
-correctly, and `out_dims=0` asks for the mapped dimension to be first — which
+correctly, and `out_dims=0` asks for the mapped dimension to be first, which
 is where it already is. `_remove_batch_dim` becomes bookkeeping.
 
 **It holds only for logical rank 0.** A batched value with a shape of its own
@@ -161,14 +161,14 @@ layer stack that was already there. Four names that were raising stubs:
 
 `_VMAP_MAX_RANK` is 8; a fifth nesting past that refuses rather than colliding.
 `maybe_get_level` and `unwrap_if_dead` were widened to tolerate a stack of these
-interpreters and still answer `-1`/unchanged — which is not a weakening but the
+interpreters and still answer `-1`/unchanged, which is not a weakening but the
 same derivation they already used: **a tensor can only carry a level if
 something wrapped it, and nothing here is a wrapper.**
 
 ### 3.1 Not a `Repr` arm, which is the difference from `docs/kernels/COMPLEX2.md`
 
 The brief for this round expected a batched dimension to be the same shape of
-problem as `Repr::Complex` — 19 `match Repr` sites, 14 demanded by the
+problem as `Repr::Complex`, 19 `match Repr` sites, 14 demanded by the
 compiler, a central refusal that ~400 call sites inherit, and nullifying that
 refusal made 6 of 10 sampled ops compute silently.
 
@@ -187,7 +187,7 @@ parked list) rather than the consequence.
 
 `_vmap_increment_nesting` refuses unless it is called from
 `torch/_functorch/vmap.py:_flat_vmap`. That is not a way of dodging the
-refusal tests in `test_shim.py` and `test_tail2.py` — it is what §4.3 needs.
+refusal tests in `test_shim.py` and `test_tail2.py`. It is what §4.3 needs.
 The self-check re-runs the closure, and the closure and its batched arguments
 live in that frame (`func`, `batched_inputs`). A call from anywhere else has
 nothing to check against, so it says so and raises.
@@ -202,7 +202,7 @@ assumed.
 `torch/_functorch/vmap.py:487` is a context manager whose `finally` calls
 `_vmap_decrement_nesting()` even when the increment raised. So a refusal was
 immediately followed by an unpaired decrement, and the decrement's own
-`RuntimeError` **replaced** the refusal — measured: `randomness="different"`
+`RuntimeError` **replaced** the refusal: measured: `randomness="different"`
 reported *"decrement with no level on the stack"* and never mentioned
 randomness. A refused increment now leaves a debt that the decrement pays. The
 debt is only recorded when the call came from `_flat_vmap`; recording it for a
@@ -231,7 +231,7 @@ against a constant proves nothing.
 This is the part that matters, because the failure mode is a plausible wrong
 answer. Each gate was nullified and the suite re-run.
 
-### 4.1 The shape gate — entry
+### 4.1 The shape gate: entry
 
 `_add_batch_dim` requires a 1-D tensor and `in_dim == 0`. `_remove_batch_dim`
 requires `out_dim == 0`, one output, `randomness == "error"`, a rank within
@@ -261,7 +261,7 @@ representation answers something else, of the right dtype and the right shape.
 That is precisely the class of error `docs/kernels/COMPLEX.md` §7 was worried about, and
 no shape check can be the gate for it.
 
-### 4.3 The value gate — the definition of `vmap`, re-run
+### 4.3 The value gate: the definition of `vmap`, re-run
 
 At the innermost `_remove_batch_dim`, the closure is re-run on eight sampled
 index points (both corners plus six deterministic interior points) with plain
@@ -281,9 +281,9 @@ Any disagreement raises. The closure and its arguments come from the
 That nullification result is the document. It is the failure `docs/kernels/COMPLEX.md`
 §7 predicted, reproduced on demand, and the gate that stops it.
 
-Eight points is a sample, not a proof. It is a strong one — an op that mixes
+Eight points is a sample, not a proof. It is a strong one, an op that mixes
 across a level almost never agrees with the definition at both corners and six
-interior points at once — but §5 is what a proof would cost.
+interior points at once, but §5 is what a proof would cost.
 
 ---
 
@@ -297,7 +297,7 @@ refuse when it is not.
 A real `vmap` is a per-operator batching-rule system: for each `aten` op, a
 function that takes operands carrying a batch dimension at an arbitrary
 position and produces a result carrying one, without materialising the loop.
-Upstream's is `BatchRulesReduceOps.cpp` and friends — roughly 30 files. Here it
+Upstream's is `BatchRulesReduceOps.cpp` and friends, roughly 30 files. Here it
 would additionally need a wrapper tensor type (`_maybe_remove_batch_dim` does
 `isinstance(x, torch.Tensor)`, so it would have to be a `Tensor` subclass) and
 therefore a `Repr` arm after all, with the `docs/kernels/COMPLEX2.md` audit that
@@ -335,7 +335,7 @@ modeling_nemotron_asr_streaming.py:628
     matrix_bd = matrix_bd.masked_fill_(attention_mask.logical_not(), float("-inf"))
 ```
 
-`aten.logical_not.default` does not exist in this shim — `~` (`bitwise_not`)
+`aten.logical_not.default` does not exist in this shim: `~` (`bitwise_not`)
 does, and answers correctly for bool, but `logical_not` has no kernel and no
 spelling. That is an `aten.rs` item, deliberately not taken in this round
 (`aten.rs` had two other rounds in it), and it is small: the `bool` case is
@@ -345,7 +345,7 @@ this round's gate pinned, so it belongs to whichever round owns that number.
 It is worth being exact about what this means for `docs/architectures/ARCH200.md`'s
 arithmetic: **the 4 architectures blocked on `_vmap_increment_nesting` become 1
 forward and 3 blocked on a new, much smaller operator.** Counting this round as
-"four unblocked" would be the §17.3 error from `AGENTS.md` — a number that went
+"four unblocked" would be the §17.3 error from `AGENTS.md`, a number that went
 up without the thing behind it going up as far.
 
 ---

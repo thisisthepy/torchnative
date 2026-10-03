@@ -1,9 +1,9 @@
-# ARCH100 — every `transformers` architecture, swept: 215 of 297 forward, 31 operators missing
+# ARCH100: every `transformers` architecture, swept: 215 of 297 forward, 31 operators missing
 
 > **Superseded by `docs/numerics/AGREE2.md` (2026-09-12).** Current tree measures **297/297 (100%) forwarding** and 288 of 290 judgeable agree numerically.
 > Earlier rounds: `ARCH200.md` (270/297, 16 missing ops) and `ARCH300.md` (290/297, 7 blocked).
-> Two batches of operator work landed between this round and ARCH200 — `__setitem__`, the scatter family, `index_select`, `glu`, `linalg_qr`, `linalg_norm`, complex tensors, reflect/replicate padding, rank-5 `matmul`, `eye`, `erfinv`, `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and more.
-> This document is left in place as the record of what was true at `6d016f0` — the comparison ARCH200 exists to make depends on this baseline staying unedited.
+> Two batches of operator work landed between this round and ARCH200, `__setitem__`, the scatter family, `index_select`, `glu`, `linalg_qr`, `linalg_norm`, complex tensors, reflect/replicate padding, rank-5 `matmul`, `eye`, `erfinv`, `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and more.
+> This document is left in place as the record of what was true at `6d016f0`, the comparison ARCH200 exists to make depends on this baseline staying unedited.
 > A reader arriving at the 82 below is three rounds behind.
 
 Worktree `work/arch` on develop `6d016f0`. torch 2.13.0 upstream
@@ -12,8 +12,8 @@ No Rust was changed in this round: golden stays at **8921/8921, ops=222**, exact
 
 The project has verified roughly twelve architectures deeply (docs/DEMAND*.md). `transformers`
 ships hundreds. The question that decides whether a non-alpha release is weeks away or a different
-project entirely — **how many distinct operators does this shim still lack across the whole
-field** — had never been measured. This document is that measurement, and
+project entirely, **how many distinct operators does this shim still lack across the whole
+field**, had never been measured. This document is that measurement, and
 `tests/_support/arch_sweep.py` is the script that takes it, so it can be taken again in a
 month rather than re-derived.
 
@@ -34,7 +34,7 @@ DISTINCT MISSING OPERATORS                 31
 ```
 
 **215 of 297 forward; the remaining 82 need 31 distinct operators.** The answer to the question
-this round exists to settle is therefore "weeks, not a different project" — the tail is 31 names,
+this round exists to settle is therefore "weeks, not a different project", the tail is 31 names,
 not 300, and §2's ranking says the first four of them account for 32 of the 82.
 
 Two qualifications sit on that number and both are in the honest direction:
@@ -56,7 +56,7 @@ backend refusals (candle layout, not a missing op)  1 distinct,  3 architectures
 unclassified -- NOT guessed at                                   2 architectures
 ```
 
-## 2. The ranked list — the deliverable
+## 2. The ranked list: the deliverable
 
 Each row is a distinct missing operator and the number of the 297 upstream-clean architectures
 whose forward (or construction) stops there **first**.
@@ -106,14 +106,14 @@ whose forward (or construction) stops there **first**.
 Read as a roadmap, the shape is unusually favourable:
 
 * **The head is four names for 32 architectures.** `__setitem__`, `scatter_`, `_nn.glu` and
-  `index_select` are 32 of the 82 blocked, and none of them is exotic — `glu` is a gated linear
+  `index_select` are 32 of the 82 blocked, and none of them is exotic: `glu` is a gated linear
   unit, `index_select` is a gather. `__setitem__` alone is 13, and its 13 are dominated by one
   family (`qwen3_5*` / `qwen3_vl*`, six rows), which is worth knowing before it is ranked as
   thirteen independent wins.
 * **`missing_shim_name` outnumbers `missing_aten_op` 49 to 22.** A *spelling* gap is much cheaper
   than a kernel: docs/architectures/DEMAND8.md §2.1 landed `ndimension` as one method on `PyTensorBase` with no
-  kernel, no `overloads.json` entry and no golden case. Not all 49 are that cheap — `linalg_qr`
-  and `fft_fftn` need real numerics — but the counting split says most of the remaining work is
+  kernel, no `overloads.json` entry and no golden case. Not all 49 are that cheap, `linalg_qr`
+  and `fft_fftn` need real numerics, but the counting split says most of the remaining work is
   binding surface rather than arithmetic.
 * **The tail is genuinely a tail.** 20 of the 31 block exactly one architecture each.
 
@@ -131,8 +131,8 @@ torch.embedding(): (Parameter, NoneType, int, bool, bool)                 sam3_l
 aten.convolution.default: an asymmetric padding [0, 5]                    nystromformer
 ```
 
-`axis=` is the same gap twice — it is numpy's spelling of `dim`, which upstream accepts as an
-alias — and `torch.ones(..., dtype=bool)` is a `dtype` the overload resolver does not take from
+`axis=` is the same gap twice: it is numpy's spelling of `dim`, which upstream accepts as an
+alias, and `torch.ones(..., dtype=bool)` is a `dtype` the overload resolver does not take from
 a Python `type`. Four of these six are keyword-alias work.
 
 The backend row is different in kind and should not be read as a missing op:
@@ -148,7 +148,7 @@ the headline would have read "215 of 528, 41%" and would have been wrong: the 23
 `transformers` refusing our synthetic configs, not this shim refusing anything.
 
 The exclusions are dominated by this script's own config-shrinking meeting architectures that
-will not shrink — `RuntimeError: selected index k out of range`, `IndexError: tuple index out of
+will not shrink, `RuntimeError: selected index k out of range`, `IndexError: tuple index out of
 range`, `Given normalized_shape=[N], expected ...`, 18 architectures wanting `pip install timm`,
 one wanting `scipy`. **These are not operator gaps and folding them in was the specific way this
 measurement could have produced a wrong number.** They are also not evidence that those 231
@@ -166,7 +166,7 @@ blocked in the FORWARD    76
 ```
 
 **The headline is a forward-time number.** This was checked rather than assumed, because
-docs/kernels/PRIMS.md §6 records `rwkv` as a case where the last wall moved *into* `_init_weights` — and
+docs/kernels/PRIMS.md §6 records `rwkv` as a case where the last wall moved *into* `_init_weights`, and
 `rwkv` is one of the six here, still stopped at `torch.linalg.qr` inside `nn.init.orthogonal_`.
 If the split had come out the other way the headline would have meant something quite different:
 "cannot even be built" is a far weaker result than "builds and stops at one operator".
@@ -196,12 +196,12 @@ text encoders and decoders, encoder-decoders (`t5`, `m2m_100`, `led`, `longt5`),
 `vits`), multimodal (`clip`, `blip`, `llava`, `owlvit`, `idefics3`, `qwen3_vl`, `kosmos-2.5`) and
 the odd ones (`fnet`, `canine`, `tapas`, `rwkv`, `yoso`).
 
-### 5.1 No checkpoints — and the claim that makes that legitimate, measured
+### 5.1 No checkpoints, and the claim that makes that legitimate, measured
 
 Downloading hundreds of checkpoints is not viable here (disk was at 86%), so every model is built
 from a config with random weights: `AutoModel.from_config` on a shrunk config. The whole sweep
-rests on one claim — **a tiny random-weight instance reaches the same operators as the real
-checkpoint** — and the claim is about the graph, which a config decides and weights do not.
+rests on one claim, **a tiny random-weight instance reaches the same operators as the real
+checkpoint**, and the claim is about the graph, which a config decides and weights do not.
 
 That is an argument, not a measurement, so it was measured, on three architectures, tracing the
 shim's own `torch._C._aten_dispatch` so that what is compared is exactly the set of keys the shim
@@ -234,7 +234,7 @@ tiny random groupvit      ->  wall: ('missing_shim_name', 'TensorBase.scatter_')
 holding on a failure, which is the case the sweep actually depends on.
 
 **What this could not have caught**, since AGENTS.md §17.4 asks for it: an operator that only a
-*trained* weight distribution reaches — a `torch.where` on a threshold that random weights never
+*trained* weight distribution reaches: a `torch.where` on a threshold that random weights never
 cross, or a data-dependent branch. Nothing in these three architectures had one, and three
 architectures are not a proof that none does. The failure mode is one-directional, though: it
 makes this sweep **under**-report missing operators, never over-report.
@@ -251,16 +251,16 @@ Stated so the number can be argued with:
   architectures before the fix).
 * **Inputs are minimal and chosen from `main_input_name`.** Multimodal models that refuse a
   single-modality forward get a second attempt carrying every modality their signature accepts.
-  The refusal reported is the **first classifiable** one across attempts, not the last — the
+  The refusal reported is the **first classifiable** one across attempts, not the last, the
   fallback attempt fails for input reasons, and an earlier run of this sweep buried real refusals
   under `'NoneType' object has no attribute 'device'` because it kept the last.
-* **Only `AutoModel`** — the base body. Task heads (`...ForCausalLM`, `...ForObjectDetection`) add
+* **Only `AutoModel`**: the base body. Task heads (`...ForCausalLM`, `...ForObjectDetection`) add
   operators this sweep never reaches, and generation adds more still. **This is a lower bound on
   the gap for that reason too.**
 * **Every architecture runs in its own subprocess.** A shim gap can be a segfault as easily as an
   exception, and one crash must not take the sweep with it. (None crashed: all 528 returned JSON.)
 
-## 6. Unclassified — 2, and not guessed at
+## 6. Unclassified: 2, and not guessed at
 
 ```text
 dinov3_convnext   forward   RuntimeError: adaptive_avg_pool2d: output_size must be 2
@@ -270,7 +270,7 @@ efficientnet      forward   RuntimeError: adaptive_avg_pool2d: output_size must 
 The refusal names an operator that **is** implemented (`aten.adaptive_avg_pool2d.default` is in
 `_aten_implemented()`), and the message matches no rule the classifier has, so it is reported as
 unclassified rather than filed under a kind. It is most likely a single-element `output_size`
-argument form, which would put it in §2.1 rather than in the 31 — but "most likely" is exactly
+argument form, which would put it in §2.1 rather than in the 31, but "most likely" is exactly
 what AGENTS.md §17.4 says not to write down, so it is counted here instead, and the ranking in §2
 does not include it either way.
 
@@ -295,8 +295,8 @@ takes minutes per side, needs the network for `--verify-random-weights`, and its
 measurement rather than an invariant. A measurement that becomes a gate becomes a number people
 edit.
 
-What *is* in the suite is one test —
-`test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name` — because §2's
+What *is* in the suite is one test,
+`test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name`, because §2's
 ranking is produced by parsing refusal text and is only as good as that parser. It checks nine
 refusal strings **transcribed from this round's real runs**, including the two the classifier must
 *not* get wrong: `no matching overload` is not a missing operator, and `No module named 'timm'` is
@@ -313,13 +313,13 @@ tests/golden/compare.py        8921/8921 cases passed, 0 failed,
 ```
 
 Golden is **exactly unmoved**, which is the correct result: this round changed no Rust, no
-`bootstrap.py`, no `tools/`. It measured, and it implemented nothing — the 31 names in §2 are
+`bootstrap.py`, no `tools/`. It measured, and it implemented nothing, the 31 names in §2 are
 data for the rounds that follow, and deliberately not closed here.
 
 One trap worth recording for the next person, since it produced a false number for ten minutes:
 running `compare.py` without `TORCH_C_ARTEFACT` set makes `tests/golden/loader.py` fall back to
 the **shared** `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib`, and it reported
-`8509/8509, ops=203` — a plausible-looking green summary measured against another checkout's
+`8509/8509, ops=203`: a plausible-looking green summary measured against another checkout's
 binary. It warns on stderr when it does this. Set the variable.
 
 <!-- DOCWATCH: op-implemented aten.adaptive_avg_pool2d.default -->

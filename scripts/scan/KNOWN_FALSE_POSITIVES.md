@@ -10,13 +10,13 @@
 가용성 가드를 붙이면 위험이 사라집니다.** 스캐너는 `import_time` 을 올바르게 `false` 로 보고하면서도
 심각도는 CRITICAL 로 유지했습니다.
 
-사례: `thelethe/ops/normal_scan.py:237` — `compiled_scan()` 안에서 `_torch_compile_available()`
+사례: `thelethe/ops/normal_scan.py:237`, `compiled_scan()` 안에서 `_torch_compile_available()`
 뒤에 있음. 고쳐진 코드인데 고치기 전과 같은 심각도로 보고됨.
 
 **적용한 수정:** `import_time == false` 이고, 같은 함수 스코프 안의 `if <가드>:` 또는
 `<x> if <가드> else <y>` 삼항식의 참 분기에 놓여 있으면 finding 자체를 내지 않습니다
 (`is_guarded_by_availability_check`, `Scanner.scan_attribute_namespaces`). 모듈 스코프의
-`torch.compile` (여전히 `import_time == true`)은 가드 여부와 무관하게 그대로 CRITICAL 로 잡힙니다 —
+`torch.compile` (여전히 `import_time == true`)은 가드 여부와 무관하게 그대로 CRITICAL 로 잡힙니다.
 import 시점 실행이라는 위험 자체는 가드로 없앨 수 없기 때문입니다.
 
 검증: `scan-target-lethe` (미수정 원본)의 모듈 스코프 `torch.compile` 은 여전히 CRITICAL. `fix-lethe`
@@ -47,11 +47,11 @@ if use_cudnn:
 검증: `scan-target-tta` (미수정 원본)의 가드 없는 `torch.backends.cudnn.*` / `torch.cuda.*` 는
 여전히 WARN. `fix-tta` 의 `base.py:51-53,64` (`if use_cudnn:` 안)는 더 이상 잡히지 않음. 같은 파일의
 무관한 CUDA_UNGUARDED 항목들(`base.py` 밖, 예: `models/rcnn/*.py`, `utils/validator.py` 등)은
-가드가 없으므로 그대로 유지됨 — 수정이 과도하게 억제하지 않음을 확인.
+가드가 없으므로 그대로 유지됨, 수정이 과도하게 억제하지 않음을 확인.
 
 ## 왜 중요했는가
 
-**오탐이 많으면 CI 게이트는 무시당합니다.** 위 둘은 "고쳐도 경보가 안 꺼지는" 형태라 특히 나빴습니다 —
+**오탐이 많으면 CI 게이트는 무시당합니다.** 위 둘은 "고쳐도 경보가 안 꺼지는" 형태라 특히 나빴습니다.
 고친 사람이 스캐너를 신뢰하지 않게 됩니다.
 
 ## 남은 것

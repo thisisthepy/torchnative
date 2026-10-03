@@ -1,4 +1,4 @@
-# `docs/` — what is here, and where a new document goes
+# `docs/`: what is here, and where a new document goes
 
 183 documents accumulated flat in this directory. The cost was not untidiness:
 a flat list gives a new round no place to *look*, so each round read the two or
@@ -16,9 +16,9 @@ records; they are the front door.
 
 | Folder | What belongs there |
 |---|---|
-| `design/` | What this project is and the shape of its core — the `torch._C` surface, the dispatcher's design, abi3, and the decisions that constrain everything else. |
+| `design/` | What this project is and the shape of its core, the `torch._C` surface, the dispatcher's design, abi3, and the decisions that constrain everything else. |
 | `bindings/` | The Python-facing surface: names, spellings, argument forms, overload resolution, `methods.json`/`overloads.json`, and whether a name reaches a kernel at all. |
-| `kernels/` | Individual operator kernels and the rounds that added them — what a kernel does, what it cost, and where it still diverges. |
+| `kernels/` | Individual operator kernels and the rounds that added them, what a kernel does, what it cost, and where it still diverges. |
 | `architectures/` | Sweeps over real model architectures and the demand lists derived from them: which models forward, which are blocked, and on what. |
 | `numerics/` | Dtypes, promotion, scalar rules, RNG, and agreement with upstream's actual numbers. The "does it produce upstream's answer" axis. |
 | `models/` | Running real checkpoints end to end: `from_pretrained`, `generate`, saving, loading, `transformers` compatibility. |
@@ -27,7 +27,7 @@ records; they are the front door.
 | `devices/` | Device backends and the device abstraction: CPU, `meta`, MPS, CUDA, Vulkan, and vendor NPUs. |
 | `distributed/` | `torch.distributed`, collectives, transport, and federated rounds. |
 | `platform/` | Building and shipping: cross-builds, wheels, WASM, iOS/Android/Linux/Windows targets, vendoring, release notes. |
-| `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see AGENTS.md §16. |
+| `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded, see AGENTS.md §16. |
 | `api/` | The user-facing Python API this project offers in its own namespaces: `torchnative.device`, `torchnative.transformers`, and the argument forms and refusals they present. Distinct from `bindings/`, which is the `torch._C` surface we must reproduce; this folder is the surface we chose. |
 | `verification/` | The checkers themselves and the audits of this documentation: DOCWATCH, the golden harness, and what they structurally cannot see. |
 | `guide/` | The bilingual (en/ko) GitHub Pages site, deployed from `main` by `.github/workflows/pages.yml`. Static HTML/CSS/JS; `check_guide.py` is its test. |
@@ -56,7 +56,7 @@ run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
    `docs/CUDA.md`, so no textual rewrite can see it. Four of these survived the
    sort and the gate found them one suite at a time by `FileNotFoundError`.
 4. **DOCWATCH still enumerates documents recursively.** `run.sh` fed the
-   documentation checker with `docs/*.md`, and a shell glob does not recurse — so
+   documentation checker with `docs/*.md`, and a shell glob does not recurse, so
    the moment a document moved into a subfolder it would have silently dropped
    out of the check, leaving the gate green and the marker count *smaller*. The
    test asserts the non-recursive glob has not come back, in `run.sh` *and* in

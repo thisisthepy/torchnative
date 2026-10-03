@@ -7,7 +7,7 @@ Sources, in order of authority: the maintainer's design statement in
 [`docs/design/DESIGN.md`](design/DESIGN.md) §0–§3 and §8, the project description in the former
 `AGENTS.md` §11 and §20 (formerly `CLAUDE.md` §0 and §8), and the README's own positioning. Anything that
 is this document's inference rather than a statement found there is marked
-`> Inferred — confirm with the maintainer.`
+`> Inferred: confirm with the maintainer.`
 
 ---
 
@@ -16,14 +16,14 @@ is this document's inference rather than a statement found there is marked
 torchnative is an **on-device AI library**. Its goals, in the maintainer's words
 (DESIGN.md §0):
 
-1. cover **federated learning (FL)** and the whole of **test-time learning (TTL)** — which contains
+1. cover **federated learning (FL)** and the whole of **test-time learning (TTL)**, which contains
    test-time adaptation (TTA) and test-time training (TTT) as nested cases, not siblings;
 2. on top of that, provide **kernel optimisation across platforms** (flash-attention,
    flash-linear-attention and the like).
 
 All of it rests on one premise: **a real PyTorch model has to actually run on the device.**
 
-## 2. The premise — no façade
+## 2. The premise: no façade
 
 [PythonMultiplatform](https://github.com/thisisthepy/PythonMultiplatform) exists because a real
 CPython on the device means real pip packages on the device. A façade that imitates the
@@ -34,7 +34,7 @@ succeeding on the device**, and the only obstacle is `torch`. The target users i
 libraries (`test-time-adapters`: RT-DETR, YOLO11, Grounding DINO, ResNet) that no LLM-only engine
 covers, so the answer has to be a general tensor layer.
 
-## 3. The approach — replace `torch._C`, vendor the rest
+## 3. The approach: replace `torch._C`, vendor the rest
 
 PyTorch is mostly Python. The only native part is `torch._C` (ATen tensors, the dispatcher,
 autograd), and PyTorch's own mobile build cannot produce it (`INTERN_BUILD_MOBILE` forces
@@ -46,7 +46,7 @@ autograd), and PyTorch's own mobile build cannot produce it (`INTERN_BUILD_MOBIL
 - **The real `transformers`, the real `from_pretrained`, the real `generate`** run on top. Only the
   computation underneath is ours (AGENTS.md §11).
 - **Correctness means agreeing with upstream PyTorch**, measured element-wise against upstream
-  itself — "it runs" is not "it is a drop-in".
+  itself, "it runs" is not "it is a drop-in".
 - **What is unsupported refuses by name.** A silent fallback or a plausible invented answer is
   a defect, not a partial feature (AGENTS.md §18).
 
@@ -58,12 +58,12 @@ torchnative's own surface is (DESIGN.md §2–§3):
 | Area | Intent |
 |---|---|
 | `delta/` | **The core abstraction**: a weight delta over base weights whose *lifetime is part of its type*. TTA's adapted parameters and FL's local update are the same object with a different lifetime and destination. |
-| `adapt/` | Adaptation that closes inside one device — stage 0 (no backward: e.g. normalisation statistics) and stage 1 (gradient: entropy, auxiliary tasks), separated **by type** so a backward-free build rejects gradient methods at import time. |
+| `adapt/` | Adaptation that closes inside one device, stage 0 (no backward: e.g. normalisation statistics) and stage 1 (gradient: entropy, auxiliary tasks), separated **by type** so a backward-free build rejects gradient methods at import time. |
 | `federated/` | A **layer above** `adapt/`, not a sibling: aggregation, communication, privacy. Using adaptation alone must not pull in the federated stack. Built on `torch.distributed`, because federated averaging *is* collective communication. |
-| `kernels/` | A bundle resolver satisfying Hugging Face's `kernels` contract, with resolution **inverted from runtime download to build time** — iOS will not execute downloaded native code (DESIGN.md §8). |
+| `kernels/` | A bundle resolver satisfying Hugging Face's `kernels` contract, with resolution **inverted from runtime download to build time**, iOS will not execute downloaded native code (DESIGN.md §8). |
 | `api/` | Deployment, lifetime policy and device orchestration (`TorchNativeAPI`). |
 
-## 5. Accelerators — fixed front end, swapped back end
+## 5. Accelerators: fixed front end, swapped back end
 
 **The front end is fixed; only the back end is swapped** (AGENTS.md §20):
 
@@ -83,7 +83,7 @@ The deployment target is an **embedded CPython 3.13+** inside Kotlin Multiplatfo
 (Android, iOS, desktop), via PythonMultiplatform (DESIGN.md §2). torchnative ships as **one
 `cp313-abi3` wheel per platform** so one binary serves 3.13 and every later CPython.
 
-> Inferred — confirm with the maintainer: Linux, Windows and WASM (Pyodide) wheels are in scope as
+> Inferred, confirm with the maintainer: Linux, Windows and WASM (Pyodide) wheels are in scope as
 > *distribution* targets because the wheels exist and are published, but the intent statement
 > (DESIGN.md) names the mobile/desktop embedding as the reason the project exists.
 

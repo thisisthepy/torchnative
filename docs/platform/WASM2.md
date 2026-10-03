@@ -1,4 +1,4 @@
-# WASM §10 — the checker, then the target
+# WASM §10: the checker, then the target
 
 docs/platform/WASM.md §9 built a wasm wheel by hand and deliberately landed no
 `PyEmscriptenTarget`, because `verify_cross.py` could not check one. This round
@@ -20,10 +20,10 @@ Answered from the artefact (`binfmt.wasm_info` / `wasm_imports` /
 | question | how |
 |---|---|
 | wasm32, not wasm64 | the memory type's limits flags. A side module *imports* its memory, so this is read out of the import section, not section 5 |
-| is it loadable at all | side module (imports `env.memory` + `env.__indirect_function_table`) vs main-module link (defines and exports them). Emscripten's `dlopen` refuses the latter. This is the wasm spelling of PE's `dll`-not-`exe` bit. **Not** the presence of `dylink.0` — `pyodide.asm.wasm` is a main module and carries one too |
+| is it loadable at all | side module (imports `env.memory` + `env.__indirect_function_table`) vs main-module link (defines and exports them). Emscripten's `dlopen` refuses the latter. This is the wasm spelling of PE's `dll`-not-`exe` bit. **Not** the presence of `dylink.0`, `pyodide.asm.wasm` is a main module and carries one too |
 | `PyInit__C` is exported, and is a **function** | export section, with the kind kept. An export of that name with kind `global` is a linker accident that fails at import with nothing pointing at the module |
 | does the interpreter resolve what the module asks of it | `check_linkage`, scoped to `Py*`/`_Py*` under import module `env`, resolved against `pyodide.asm.wasm`'s export section |
-| nothing linked in that should not be | every wasm member is checked, not only the extension — `ctypes.CDLL` on the global-deps stub is also `dlopen` |
+| nothing linked in that should not be | every wasm member is checked, not only the extension, `ctypes.CDLL` on the global-deps stub is also `dlopen` |
 
 **Declined, loudly.** Each of these is a question another family *does* answer,
 and the report prints a `!` line for it rather than substituting a nearby easier
@@ -32,7 +32,7 @@ check:
 - **The platform.** A wasm module records no Emscripten version, no Pyodide ABI
   version, no minimum anything. Two modules built a major release apart are
   byte-indistinguishable in their headers. The `2026_0` in the tag is checked
-  against `pyodide-lock.json` — a check on *this machine's distribution*, not on
+  against `pyodide-lock.json`, a check on *this machine's distribution*, not on
   the wheel. Build against a different Pyodide and nothing in the bytes says so.
 - **The abi3 binding.** `WindowsExpectation` proves it by which DLL each import
   is attributed to (`python3.dll`, not `python313.dll`). Emscripten attributes
@@ -41,7 +41,7 @@ check:
 - **A manylinux-style floor.** No counterpart, same as Mach-O and Android.
 - **Whether every import resolves.** Only the `Py*` subset is decidable. Non-`Py`
   `env` imports come from Emscripten's JS library at load time or from sibling
-  side modules, neither visible in any artefact here — shipped, working Pyodide
+  side modules, neither visible in any artefact here, shipped, working Pyodide
   wheels have hundreds of them, so a whole-`env` check would reject correct
   wheels. The narrow check is the true one; the breadth it lacks is printed.
 - **`packaging` confirmation.** There is no `pyemscripten_platforms` generator to
@@ -52,8 +52,8 @@ check:
 
 A checker nobody has seen reject is not a checker. `_wasm_without_pyinit`
 renames the export in place (`PyInit__C` → `PyInit__X`) rather than deleting it,
-so no section size or LEB has to be re-encoded and the module stays well-formed
-— a truncated module would be rejected by `_wasm_sections` returning `None`,
+so no section size or LEB has to be re-encoded and the module stays well-formed,
+a truncated module would be rejected by `_wasm_sections` returning `None`,
 which is a *different* check firing and would make the fault mode a lie.
 
     FAIL: torch/_C.abi3.so exports no PyInit__C -- the import system `dlsym`s
@@ -67,14 +67,14 @@ platform claim can be checked against).
 
 This is only meaningful because the base wheel **passes** first. The §9
 hand-built wheel is missing the 116-file `torch-2.13.0.dist-info` tree, so it
-fails for that reason alone — and every fault mode would then have "caught"
+fails for that reason alone, and every fault mode would then have "caught"
 trivially. A completed copy of it was made for the self-test.
 
 ## 10.3 `PyEmscriptenTarget`, and the trap made structural
 
 The tag is `pyemscripten_2026_0_wasm32`. `2026_0` is Pyodide's
 `PYODIDE_ABI_VERSION`, which CPython's build never sees. Ask the interpreter the
-way every other target does and it answers `emscripten-5.0.3-wasm32` — a tag
+way every other target does and it answers `emscripten-5.0.3-wasm32`, a tag
 `packaging` accepts and **nothing on PyPI uses**. Wrong in the shape that works.
 
 The refusal is **structural, not a comment**:
@@ -90,7 +90,7 @@ The refusal is **structural, not a comment**:
 - `platform_tag` reads `info.abi_version` and `info.arch` out of the lock file,
   and fails hard if it is absent rather than guessing.
 
-`self_test_pyemscripten()` in `build.py` exercises all of it — 4/4:
+`self_test_pyemscripten()` in `build.py` exercises all of it: 4/4:
 
     ok    PyEmscriptenTarget.sysconfig() refuses rather than answering
     ok    the tag follows pyodide-lock.json's info.abi_version
@@ -104,12 +104,12 @@ synthesised near-miss.
 
 ## 10.4 §9's two inversions, verified rather than trusted
 
-- **`.abi3.so` is in Pyodide's `EXTENSION_SUFFIXES`** — confirmed from the bytes:
+- **`.abi3.so` is in Pyodide's `EXTENSION_SUFFIXES`**: confirmed from the bytes:
   `pyodide.asm.wasm` contains the string `.abi3.so`, and
   `check_suffix_is_searched` (unchanged, no wasm exception) reports
   `ext suffix  .abi3.so present in pyodide.asm.wasm`. `Target.extension_member`
   needs no wasm case.
-- **The abi3 tag is in `sys_tags()`** — *not* re-verified here. It requires the
+- **The abi3 tag is in `sys_tags()`**: *not* re-verified here. It requires the
   target interpreter, which is not runnable on this machine; §9.3 read it off
   the real one. `setup.py`'s `py_limited_api` is unchanged and no wasm exception
   was added; the claim stands on §9's evidence, not on this round's.

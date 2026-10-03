@@ -1,9 +1,9 @@
-# iOS — 시뮬레이터는 계산까지, 기기는 링크까지
+# iOS: 시뮬레이터는 계산까지, 기기는 링크까지
 
 **결론: 시뮬레이터 휠은 로드·임포트·계산까지 전부 확인됐다.** `docs/platform/WHEEL.md` §7 이
 "아티팩트만 확인" 으로 남겨 두었던 칸이 시뮬레이터 쪽에 한해 채워졌다.
 
-**기기 휠은 실행이 확인되지 않았다.** 이유는 §7 에 있다 — 편의상의 유보가 아니라 별개의
+**기기 휠은 실행이 확인되지 않았다.** 이유는 §7 에 있다. 편의상의 유보가 아니라 별개의
 아티팩트이기 때문이다. **다만 "실기가 없으니 전부 미검증" 은 사실이 아니었다.** 두 슬라이스의
 실질적 차이는 **CPython 심볼을 어떻게 푸느냐** 하나이고, 그 하나는 실기 없이 답할 수 있다 (§11).
 
@@ -11,14 +11,14 @@
 
 | | 빌드됨 | 심볼 해결됨 | 설치됨 | 임포트됨 | 계산됨 |
 |---|---|---|---|---|---|
-| `ios_14_0_arm64_iphonesimulator` | ✅ | ✅ (플랫 조회로 — §11.1) | ✅ 시뮬레이터 CPython 의 site-packages 에 언팩 | ✅ | ✅ `aten.mm`, `x+x`, `nn.Linear` |
+| `ios_14_0_arm64_iphonesimulator` | ✅ | ✅ (플랫 조회로, §11.1) | ✅ 시뮬레이터 CPython 의 site-packages 에 언팩 | ✅ | ✅ `aten.mm`, `x+x`, `nn.Linear` |
 | `ios_12_0_arm64_iphoneos` (실기) | ✅ | ✅ **222/222**, 각 심볼이 *묶인 그 라이브러리*에서 실제로 export 됨 (§11) | ❌ 기기 없음 | ❌ | ❌ |
 
 판정 하네스는 둘이고, **말하는 것이 다르다**:
 
 | | |
 |---|---|
-| `scripts/wheel/verify_ios_sim.py` | 시뮬레이터 안에서 임포트·계산까지. `verify_android.py` 와 **판정 문장이 같다** — *`torch.__file__` 이 설치 위치 안을 가리켜야 한다* |
+| `scripts/wheel/verify_ios_sim.py` | 시뮬레이터 안에서 임포트·계산까지. `verify_android.py` 와 **판정 문장이 같다**. *`torch.__file__` 이 설치 위치 안을 가리켜야 한다* |
 | `scripts/wheel/verify_ios_device.py` | 기기 휠. **아무것도 실행하지 않는다.** 링크가 풀리는지만 본다 (§11). 이 도구가 말하는 것은 **"심볼이 다 풀린다"** 이지 **"기기에서 돈다"** 가 아니다 |
 
 ```
@@ -26,7 +26,7 @@ PASS -- torchnative-0.0.1a0-cp313-abi3-ios_14_0_arm64_iphonesimulator.whl unpack
         an iOS CPython's site-packages and its torch computes in the simulator
 ```
 
-## 1. 시뮬레이터가 답할 수 없는 것 — 먼저 적는다
+## 1. 시뮬레이터가 답할 수 없는 것: 먼저 적는다
 
 **시뮬레이터는 이 M1 맥 위에서 도는 일반 프로세스다.** `simctl spawn` 이 해 주는 것은
 `DYLD_ROOT_PATH` 로 시뮬레이터 런타임 루트를 씌우는 것뿐이고, **CPU 는 호스트 M1 그대로다.**
@@ -39,7 +39,7 @@ PASS -- torchnative-0.0.1a0-cp313-abi3-ios_14_0_arm64_iphonesimulator.whl unpack
 | 임베드 경로 (`PYTHONHOME`, 프레임워크 링크) | 실기 코드 서명 · 프로비저닝 |
 
 **그래서 이 문서에는 성능 수치가 하나도 없다.** 재면 다음 사람이 그것을 아이폰 숫자로 읽는다.
-이 저장소는 이미 같은 함정에 빠진 적이 있다 — 안드로이드 에뮬레이터가 광고한 `shaderFloat16`
+이 저장소는 이미 같은 함정에 빠진 적이 있다. 안드로이드 에뮬레이터가 광고한 `shaderFloat16`
 비트가 사실 **호스트 M1 의 것이 그대로 전달된 것**이었다 (`docs/devices/DEVICE.md` §10 정정).
 
 ### 그 노출이 여기서도 그대로 보인다
@@ -58,19 +58,19 @@ version = 'Darwin Kernel Version 25.5.0: ... xnu-12377.121.6~2/RELEASE_ARM64_T81
 흉내 내지 않고 호스트 커널 위에 iOS 사용자 공간만 씌운다. 성능이나 CPU 특성을 여기서 읽으면
 안 되는 이유가 이 한 줄에 다 들어 있다. 하네스는 이 값을 매번 출력하고 그 옆에 경고를 찍는다.
 
-## 2. 사다리 — 작은 것부터, 각 단계가 실제로 관측된 것
+## 2. 사다리: 작은 것부터, 각 단계가 실제로 관측된 것
 
 | 단계 | 결과 |
 |---|---|
 | 런처가 `print("hello")` | ✅ |
 | `import sys` | ✅ `sys.platform == 'ios'`, CPython `3.13.0+` |
 | stdlib (`json` `zipfile` `ctypes` `sysconfig`) | ✅ |
-| `import _multiprocessing` | ❌ 배포본에 없음 — 스텁 필요 (§5) |
+| `import _multiprocessing` | ❌ 배포본에 없음, 스텁 필요 (§5) |
 | 휠을 site-packages 에 언팩 | ✅ 호스트 네이티브 침입 0건 |
 | `import torch` | ✅ 단, 런처가 UIKit 를 링크해야 한다 (§4) |
 | `aten.mm` · `x+x` · `nn.Linear` | ✅ 호스트와 동일 (§3) |
 
-## 3. 계산 결과 — 호스트와 대조
+## 3. 계산 결과: 호스트와 대조
 
 | | 시뮬레이터 (iOS 18.0) | 호스트 (macOS arm64) |
 |---|---|---|
@@ -83,11 +83,11 @@ version = 'Darwin Kernel Version 25.5.0: ... xnu-12377.121.6~2/RELEASE_ARM64_T81
 | `importlib.metadata.version("torch")` | 2.13.0 | 2.13.0 |
 
 **전부 일치한다.** 개수 두 개(1260·896)까지 같다는 것은 크로스 빌드가 op 등록을 하나도 흘리지
-않았다는 뜻이다. (이 표는 처음 1251·896 으로 기록됐다. 2026-08-29 재측정에서 양쪽 다 1260 이다 —
+않았다는 뜻이다. (이 표는 처음 1251·896 으로 기록됐다. 2026-08-29 재측정에서 양쪽 다 1260 이다.
 그 사이 `torchnative/rust/torch_c` 에 착지한 것들이 늘린 수이고, **호스트와 시뮬레이터가 여전히 같다**는 것이
 이 표가 말하는 바다.)
 
-`sys.path` 에 저장소로 이어지는 항목이 **하나도 없다** — 하네스가 이것을 단언으로 검사한다:
+`sys.path` 에 저장소로 이어지는 항목이 **하나도 없다**. 하네스가 이것을 단언으로 검사한다:
 
 ```
 <prefix>/lib/python313.zip
@@ -96,10 +96,10 @@ version = 'Darwin Kernel Version 25.5.0: ... xnu-12377.121.6~2/RELEASE_ARM64_T81
 <prefix>/lib/python3.13/site-packages     ← torch.__file__ 이 여기 안
 ```
 
-`PYTHONPATH` 를 쓰지 않는다. 안드로이드에서 얻은 교훈 그대로 — `PYTHONPATH` 엔트리는 **망가진
+`PYTHONPATH` 를 쓰지 않는다. 안드로이드에서 얻은 교훈 그대로, `PYTHONPATH` 엔트리는 **망가진
 설치를 가려 주는 바로 그것**이다 (`WHEEL.md` §7.3).
 
-## 4. 무엇이 막고 있었나 — `platform.system()` 이 UIKit 를 부른다
+## 4. 무엇이 막고 있었나: `platform.system()` 이 UIKit 를 부른다
 
 `import torch` 는 처음에 **`torch/__init__.py:370` 에서** 죽었다.
 
@@ -114,12 +114,12 @@ AttributeError: 'NoneType' object has no attribute 'decode'
 ```
 
 **휠의 결함이 아니다.** iOS 의 CPython 은 `platform.system()` 을 Objective-C 런타임에 물어본다
-(`_ios_support.py:40` — `objc_getClass(b"UIDevice")`). `simctl spawn` 으로 띄운 **맨 프로세스에는
+(`_ios_support.py:40`, `objc_getClass(b"UIDevice")`). `simctl spawn` 으로 띄운 **맨 프로세스에는
 UIKit 가 로드되어 있지 않아** 그 클래스 조회가 nil 을 돌려주고, 이어지는 `objc_msgSend` 가 전부
 nil 을 타고 내려가 마지막 `.decode()` 에서 터진다.
 
 **진짜 앱에는 UIKit 가 항상 로드되어 있다.** 즉 이것은 앱 경로에는 없고 **spawn 하네스에만 있는
-결손**이다. 그래서 프로브에 우회를 넣지 않고 **런처를 `-framework UIKit` 로 링크했다** — 하네스를
+결손**이다. 그래서 프로브에 우회를 넣지 않고 **런처를 `-framework UIKit` 로 링크했다**. 하네스를
 앱에 가깝게 만든 것이지 측정을 피해 간 것이 아니다.
 
 ```
@@ -141,13 +141,13 @@ UIKit 링크 후:  platform.system() -> 'iOS'
 | `TORCH_USE_RTLD_GLOBAL` | 없어도 성공. 붙여도 같은 값 | **불필요** |
 | UIKit 링크 | `AttributeError: 'NoneType' object has no attribute 'decode'` | **필수** (하네스에만) |
 
-**`TORCH_USE_RTLD_GLOBAL` 은 안드로이드와 같은 이유로 불필요하다** — 휠이
+**`TORCH_USE_RTLD_GLOBAL` 은 안드로이드와 같은 이유로 불필요하다**. 휠이
 `torch/lib/libtorch_global_deps.so` 를 싣기 때문이다. 그리고 그것이 장식이 아니라 실제로
 로드되고 있다는 것을 음성 대조로 확인했다 (§6).
 
-**`_multiprocessing` 은 휠의 결함이 아니라 iOS CPython 배포본의 성질이다** — 안드로이드 배포본과
+**`_multiprocessing` 은 휠의 결함이 아니라 iOS CPython 배포본의 성질이다**. 안드로이드 배포본과
 똑같이 그것도 `_posixshmem` 도 빌드하지 않는다. 하네스는 스텁 없이 한 번 돌려서 그 실패를
-**출력에 남긴다** — 필요한 것을 배경에 숨기지 않기 위해서다.
+**출력에 남긴다**. 필요한 것을 배경에 숨기지 않기 위해서다.
 
 ## 6. 실패할 수 있는 검증인지 확인했다
 
@@ -191,11 +191,11 @@ The device wheel is a different artefact and this harness cannot run it.
 
 **그런데 그 "서로 다른 메커니즘" 이야말로 실기 없이 검사할 수 있는 것이다.** 위 문단은 2026-08-28
 에 쓰였고, 그때는 "시뮬레이터 결과가 기기 칸을 채워 주지 않는다" 에서 멈췄다. 멈출 이유가
-없었다 — 기기 산출물이 프레임워크에 대해 하는 주장은 **파일 안에 심볼 이름으로 적혀 있고**,
+없었다. 기기 산출물이 프레임워크에 대해 하는 주장은 **파일 안에 심볼 이름으로 적혀 있고**,
 그 프레임워크는 이 디스크에 있다. 대조하면 된다. §11 이 그 대조다.
 
 또 하나 여기서 명확히 해 둘 것: 위 표는 두 슬라이스가 "크기도 아키텍처도 심볼도 같다" 고
-적었는데, **심볼은 같지 않다.** 정의된 심볼 집합은 같지만 **미해결 심볼의 성질이 다르다** —
+적었는데, **심볼은 같지 않다.** 정의된 심볼 집합은 같지만 **미해결 심볼의 성질이 다르다**.
 기기 쪽 118 개는 `Python` 에 이름으로 묶여 있고, 시뮬레이터 쪽 같은 118 개는 아무 데도 묶여
 있지 않다(`dynamically looked up`). 그 차이가 §11 의 검사가 성립하는 이유이고, 동시에 시뮬레이터
 산출물을 기기 휠에 넣었을 때 그 검사가 잡아내는 근거다.
@@ -213,7 +213,7 @@ bash scripts/vendor/install_shim.sh
 
 # 1) 시뮬레이터용 _C 를 크로스 빌드한다.
 #    시뮬레이터도 PYO3_CONFIG_FILE 이 필요하다 (WHEEL.md §7.1). 기기와 달리
-#    TORCHNATIVE_PYTHON_FRAMEWORK_DIR 은 필요 없다 — 프레임워크를 링크하지 않는다.
+#    TORCHNATIVE_PYTHON_FRAMEWORK_DIR 은 필요 없다: 프레임워크를 링크하지 않는다.
 cat > /tmp/pyo3-ios.cfg <<'EOF'
 implementation=CPython
 version=3.13
@@ -228,7 +228,7 @@ EOF
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphonesimulator/lib \
   cargo build --release --target aarch64-apple-ios-sim )
 
-# 1b) 기기용도 같이 만든다 — §11 의 대조에는 두 휠이 다 필요하다.
+# 1b) 기기용도 같이 만든다: §11 의 대조에는 두 휠이 다 필요하다.
 ( cd torchnative/rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos/lib \
@@ -241,7 +241,7 @@ EOF
 $BPY scripts/wheel/build.py --target ios-arm64-sim
 $BPY scripts/wheel/build.py --target ios-arm64
 
-# 3) 판정한다 — 시뮬레이터를 띄우고, 임포트시키고, 계산시킨다
+# 3) 판정한다: 시뮬레이터를 띄우고, 임포트시키고, 계산시킨다
 $PY scripts/wheel/verify_ios_sim.py dist/torchnative-*iphonesimulator*.whl
 
 # 4) 기기 휠은 실행할 수 없다. 링크가 풀리는지만 본다 (§11).
@@ -260,12 +260,12 @@ $PY scripts/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.w
 
 | | Android (`verify_android.py`) | iOS 시뮬레이터 (`verify_ios_sim.py`) |
 |---|---|---|
-| 배포본에 인터프리터가 있는가 | 있음 (`bin/python3.13`) | **없음** — `Python.framework/Python` 은 `MH_DYLIB` 뿐 |
-| 실행 파일 | 배포본의 것을 push | **직접 컴파일한다** — `Py_BytesMain` 3줄 (아래) |
-| 기기로 옮기기 | `adb push` | **불필요** — 시뮬레이터는 호스트 파일시스템을 그대로 본다 |
+| 배포본에 인터프리터가 있는가 | 있음 (`bin/python3.13`) | **없음**, `Python.framework/Python` 은 `MH_DYLIB` 뿐 |
+| 실행 파일 | 배포본의 것을 push | **직접 컴파일한다**. `Py_BytesMain` 3줄 (아래) |
+| 기기로 옮기기 | `adb push` | **불필요**. 시뮬레이터는 호스트 파일시스템을 그대로 본다 |
 | 실행 진입점 | `adb shell` | `xcrun simctl spawn <UDID>` (`DYLD_ROOT_PATH` 를 대신 채워 줌) |
 | 환경 변수 전달 | 그대로 | `SIMCTL_CHILD_` 접두사 필요 |
-| 추가로 필요한 것 | — | **UIKit 링크** (§4) |
+| 추가로 필요한 것 | n/a | **UIKit 링크** (§4) |
 | 스텁 | `_multiprocessing`, `_posixshmem` | **같음** |
 
 ### 인터프리터를 직접 만든 것에 대해
@@ -304,7 +304,7 @@ site-packages 에 휠을 푼다 (205 MB). 공유본의 site-packages 는 그대�
 
 | 빈 칸 | 필요한 것 |
 |---|---|
-| iOS **실기** 로드·임포트·계산 | 기기 + 프로비저닝 프로파일. 이 기계에 없다. §7 때문에 시뮬레이터 결과로 대신할 수 없다. **링크 해결까지는 §11 이 채웠다** — 남은 것은 dyld 가 실행 시점에 `@rpath/Python.framework/Python` 을 *찾는가*, 코드 서명, 그리고 그 위의 전부다 |
+| iOS **실기** 로드·임포트·계산 | 기기 + 프로비저닝 프로파일. 이 기계에 없다. §7 때문에 시뮬레이터 결과로 대신할 수 없다. **링크 해결까지는 §11 이 채웠다**. 남은 것은 dyld 가 실행 시점에 `@rpath/Python.framework/Python` 을 *찾는가*, 코드 서명, 그리고 그 위의 전부다 |
 | **실제 앱 번들** 경로 | `Python.framework` 를 `Frameworks/` 에 `Embed & Sign` 하고 앱 프로세스가 스스로 `Py_Initialize` 를 부르는 형태. rpath 가 `@rpath` 에서 `@executable_path/Frameworks` 로 바뀐다. §11 이 답하지 **못하는** 것이 정확히 이것이다 |
 | 아이폰 성능 | 실기에서만. 시뮬레이터에서 재면 M1 숫자다 (§1) |
 | `_multiprocessing` | iOS CPython 배포본 재빌드, 또는 상류 `torch/multiprocessing` 지연 임포트. 안드로이드와 같은 항목이고 휠 작업의 몫이 아니다 |
@@ -312,7 +312,7 @@ site-packages 에 휠을 푼다 (205 MB). 공유본의 site-packages 는 그대�
 
 ---
 
-## 11. 기기 휠 — 실기 없이 어디까지 확인되는가 (2026-08-29)
+## 11. 기기 휠: 실기 없이 어디까지 확인되는가 (2026-08-29)
 
 `scripts/wheel/verify_ios_device.py`.
 
@@ -333,7 +333,7 @@ $PY scripts/wheel/verify_ios_device.py --self-test dist/torchnative-*iphoneos*.w
 
 첫 줄은 시뮬레이터(iPhone 16 Pro / iOS 18.0)를 띄우고 `verify_ios_sim.py` 가 스테이징한
 site-packages 의 `_C.abi3.so` 를 **기기 슬라이스로 바꿔 넣고** 실제로 재현한 것이다. 둘째 줄은
-`verify_ios_device.py` 가 **매 실행마다 찍는다** — "심볼이 풀린다" 를 "돌아간다" 로 읽지 않게
+`verify_ios_device.py` 가 **매 실행마다 찍는다**. "심볼이 풀린다" 를 "돌아간다" 로 읽지 않게
 하려고 출력 맨 앞에 둔다.
 
 ```
@@ -341,19 +341,19 @@ site-packages 의 `_C.abi3.so` 를 **기기 슬라이스로 바꿔 넣고** 실�
   torch/_C.abi3.so: incompatible platform (have 'iOS', need 'macOS')
 ```
 
-### 11.1 그러면 무엇이 남아 있나 — 링크는 실기 없이 답이 나온다
+### 11.1 그러면 무엇이 남아 있나: 링크는 실기 없이 답이 나온다
 
 두 슬라이스가 실제로 다른 것은 **CPython 심볼을 푸는 방식** 하나다.
 
 | | 시뮬레이터 | 기기 |
 |---|---|---|
-| CPython 심볼 118 개 | `dynamically looked up` — **아무 라이브러리에도 묶여 있지 않다** | 전부 `Python` 에 **이름으로 묶여 있다** (2단계 네임스페이스) |
+| CPython 심볼 118 개 | `dynamically looked up`, **아무 라이브러리에도 묶여 있지 않다** | 전부 `Python` 에 **이름으로 묶여 있다** (2단계 네임스페이스) |
 | `LC_LOAD_DYLIB` 의 Python | **없음.** `-undefined dynamic_lookup` 으로 해소 (§7, `WHEEL.md` §7.1) | `@rpath/Python.framework/Python` |
-| 실기에서 폴백 | — | **없다.** 그래서 이 링크가 유일한 경로다 |
+| 실기에서 폴백 | n/a | **없다.** 그래서 이 링크가 유일한 경로다 |
 
 기기 산출물이 프레임워크에 대해 하는 주장은 **파일 안에 심볼 이름으로 적혀 있다.** 그리고 그
 프레임워크는 이 디스크에 있다(`target-python/arm64-iphoneos/Python.framework/Python`).
-그러니 대조하면 된다 — 실기가 필요한 것은 *실행*이지 *대조*가 아니다.
+그러니 대조하면 된다. 실기가 필요한 것은 *실행*이지 *대조*가 아니다.
 
 ### 11.2 측정
 
@@ -378,7 +378,7 @@ torchnative-0.0.1a0-cp313-abi3-ios_12_0_arm64_iphoneos.whl
 | `Python` 118 | 기기용 `Python.framework/Python` 의 `nm -gU` 출력(1670 개)과 대조 |
 | `libSystem` 88 · `Accelerate` 16 | SDK 에는 arm64 dylib 이 없고 `.tbd` 텍스트 스텁만 있다. `libSystem.B.tbd` 는 **자기가 re-export 하는 라이브러리들의 스텁을 같은 파일 안에 다 담은 다중 문서**라서, 그 파일 하나를 읽는 것이 재export 폐포를 읽는 것이다 |
 | `libiconv` | `LC_LOAD_DYLIB` 에는 있지만 미해결 심볼이 **0 개**라 표에 나오지 않는다 |
-| `libtorch_global_deps.so` | 심볼이 하나도 없는 것이 정상이다 — 설계상 빈 라이브러리다 (`WHEEL.md` §3.2) |
+| `libtorch_global_deps.so` | 심볼이 하나도 없는 것이 정상이다. 설계상 빈 라이브러리다 (`WHEEL.md` §3.2) |
 
 ### 11.3 나머지 아카이브는 시뮬레이터 휠과 **바이트 단위로 같다**
 
@@ -412,7 +412,7 @@ SELF-TEST: PASS -- 5/5 fault modes rejected, and each
 
 | 망가뜨린 것 | 나와야 하는 답 | 무엇을 증명하는가 |
 |---|---|---|
-| `Python.framework` 자리에 CPython 이 아닌 진짜 Mach-O(빈 global-deps)를 놓음 | **FAIL** — 118 개 미해결 | 프레임워크를 **실제로 조회하고 있다.** 안 그러면 무엇을 놓든 통과한다 |
+| `Python.framework` 자리에 CPython 이 아닌 진짜 Mach-O(빈 global-deps)를 놓음 | **FAIL**, 118 개 미해결 | 프레임워크를 **실제로 조회하고 있다.** 안 그러면 무엇을 놓든 통과한다 |
 | `Python.framework` 를 아예 치움 | **CANNOT JUDGE** | 검사가 못 보는 것과 휠의 결함을 **섞지 않는다** |
 | `.tbd` 가 없는 빈 SDK 를 가리킴 | **CANNOT JUDGE** | 같은 구분을 다른 제공자에서 |
 | 기기 슬라이스 자리에 **시뮬레이터 슬라이스**를 넣음 | **FAIL** | `WHEEL.md` §7.4 가 "이 필드 말고는 구별되지 않는다" 고 한 그 치환을 잡는다 |
@@ -420,8 +420,8 @@ SELF-TEST: PASS -- 5/5 fault modes rejected, and each
 
 **두 종류의 답을 섞지 않는 것이 이 도구의 골격이다.** `FAIL:` 은 휠에 대한 발견이고
 `CANNOT JUDGE:` 는 검사가 못 본 것이다. 둘 다 종료 코드 1 이지만 문장이 다르고, self-test 가
-그 문장까지 맞춰 본다. `tests/run.sh` 주석에 있는 실패 — SIGKILL 당한 `cmp` 의
-종료 코드를 "다름" 으로 읽어 멀쩡한 아티팩트를 낡았다고 보고한 것 — 의 같은 뿌리다.
+그 문장까지 맞춰 본다. `tests/run.sh` 주석에 있는 실패, SIGKILL 당한 `cmp` 의
+종료 코드를 "다름" 으로 읽어 멀쩡한 아티팩트를 낡았다고 보고한 것, 의 같은 뿌리다.
 
 ### 11.5 그래서 기기 휠에 대해 지금 말할 수 있는 것
 

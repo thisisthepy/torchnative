@@ -4,9 +4,9 @@ Round date 2026-09-06. Branch `work/tail2`, on develop `eb84708`. Host Apple M1,
 CPython 3.13, upstream torch 2.13.0, `candle-core` 0.11.0.
 
 **This is a sizing document, and the answer is negative.** It exists because four
-names in `docs/architectures/ARCH100.md`'s tail — `view_as_complex` (`llama4`), `polar`
+names in `docs/architectures/ARCH100.md`'s tail, `view_as_complex` (`llama4`), `polar`
 (`llama4_text`), `fft_fftn` (`fnet`), and the `torch.stft` a concurrent speech
-round wants — are not four work items. They are one question, and until that
+round wants, are not four work items. They are one question, and until that
 question is settled none of the four can be estimated at all.
 
 `docs/numerics/INT8.md` is the model for the shape of this document, and §2 says why the
@@ -22,14 +22,14 @@ this stops being true.
 
 | question | answer | where |
 |---|---|---|
-| Does `TorchDType` have complex variants? | **Yes — `Complex32`, `Complex64`, `Complex128`, plus the `chalf`/`cfloat`/`cdouble` aliases.** They are import-blocking names and have been present since the dtype tag was split from storage. | §1 |
+| Does `TorchDType` have complex variants? | **Yes, `Complex32`, `Complex64`, `Complex128`, plus the `chalf`/`cfloat`/`cdouble` aliases.** They are import-blocking names and have been present since the dtype tag was split from storage. | §1 |
 | Does candle? | **No.** 0.11.0 and `main` both enumerate ten-plus real dtypes and not one complex one. Same negative as `I8`. | §2.1 |
-| Is it the same size of gap as `torch.int8`? | **No — it is categorically larger.** `I8` was a new arm on an enum. Complex requires *removing* `PartialOrd` from the `WithDType` bound and `min`/`max` from `VecOps`, which every comparison, reduction, sort and clamp kernel in candle is generic over. | §2.2 |
+| Is it the same size of gap as `torch.int8`? | **No. It is categorically larger.** `I8` was a new arm on an enum. Complex requires *removing* `PartialOrd` from the `WithDType` bound and `min`/`max` from `VecOps`, which every comparison, reduction, sort and clamp kernel in candle is generic over. | §2.2 |
 | So is complex representable here at all? | **Yes, but not through candle.** The design is a fourth `Repr` arm holding two real tensors, exactly as `Repr::Quantized` and `Repr::Vulkan` already hold things candle cannot. | §3 |
 | Can this round land it? | **No.** `Repr`, the `tag` field and every constructor live in `tensor.rs`, which this round does not own. §3.3 is the exact change list for the round that does. | §3.3 |
 | Does the shim silently lose imaginary parts today? | **No, and that is the thing to protect.** Complex tags report `_has_storage == False` and every constructor refuses by name. | §4 |
 | What does this mean for `torch.stft`? | **STFT's first wall is not complex.** It is `torch._C._nn.pad(mode='reflect')`, reached before any transform, and `return_complex=False` does not route around it. | §5 |
-| `linalg_norm`? | A **binding** gap, not a kernel gap — the kernel exists. Its install site is in `bootstrap.py`, which this round does not own. | §6 |
+| `linalg_norm`? | A **binding** gap, not a kernel gap, the kernel exists. Its install site is in `bootstrap.py`, which this round does not own. | §6 |
 | `_vmap_increment_nesting`? | **Real vmap, all four architectures.** Not an import path, and a no-op counter would produce wrong masks rather than unblock anything. | §7 |
 
 ---
@@ -46,7 +46,7 @@ fn to_real(&self)    { Complex64 => Float32, ... }
 fn to_complex(&self) { Float32 => Complex64, ... }
 ```
 
-This is `docs/numerics/BOOL.md`'s split doing exactly the job it was built for — **`_C`
+This is `docs/numerics/BOOL.md`'s split doing exactly the job it was built for, **`_C`
 owns the dtype tag and candle owns the storage**, related by `storage()`, which
 returns `None` for every dtype candle cannot hold. The three complex tags are in
 that `None` set.
@@ -71,7 +71,7 @@ import.
 
 `docs/numerics/INT8.md` §1.1 already established that 0.11.0 is `max_version` on
 crates.io and that `main` at `ddf1b879` (2026-09-04) adds only the MX float
-formats. There is no complex variant in either, so — as with `I8` — the cheap
+formats. There is no complex variant in either, so (as with `I8`) the cheap
 answer of bumping the pin does not exist.
 
 ### 2.2 …and unlike `I8`, it cannot be added as one more arm
@@ -121,7 +121,7 @@ Steps 1 and 2 are a **refactor of candle's core numeric trait**, not an
 addition to it. `docs/numerics/INT8.md` was able to produce a patch and measure candle's
 own suite at 0 failed precisely because `I8` touched nothing structural. A
 complex fork would change the type signature of the trait every backend
-implements — CPU, CUDA, Metal — and would have to be carried against upstream
+implements (CPU, CUDA, Metal) and would have to be carried against upstream
 forever.
 
 **No patch is offered and none should be landed.** The standing rule holds with
@@ -156,7 +156,7 @@ pub enum Repr {
 
 Both of the non-obvious arms exist for the same reason a complex arm would:
 **candle cannot hold the thing, and the shim can.** `Repr::Quantized`'s comment
-says it outright — "the reason this is a third arm and not a `Tensor` wearing a
+says it outright, "the reason this is a third arm and not a `Tensor` wearing a
 label is that candle's quantisation is not a `DType`". Complex is not a `DType`
 either.
 
@@ -171,8 +171,8 @@ dimension in one place and not another is the silent-wrong-answer shape.
 
     Repr::Complex { re: Tensor, im: Tensor }     // both real, both the true shape
 
-gets the shape right by construction — `re.shape()` *is* the complex tensor's
-shape — and makes each operator's obligation explicit rather than implicit.
+gets the shape right by construction, `re.shape()` *is* the complex tensor's
+shape, and makes each operator's obligation explicit rather than implicit.
 
 Measured against upstream, this carries llama4's entire complex surface:
 
@@ -196,10 +196,10 @@ base[0, 0] = 99.
 v.tolist()            # [(99+2j)]   -- aliases
 ```
 
-A pair-of-tensors representation loses that. `llama4` does not depend on it —
+A pair-of-tensors representation loses that. `llama4` does not depend on it,
 all three of its call sites feed a freshly computed expression
 (`xq.float().reshape(...)`, `torch.stack([cos, sin], -1)`) that is never written
-to again — so the narrowing is safe *for the models measured*, and it belongs in
+to again, so the narrowing is safe *for the models measured*, and it belongs in
 `docs/kernels/VIEWS.md`'s ledger rather than in a footnote.
 
 ### 3.4 Why this round did not land it
@@ -214,7 +214,7 @@ whether that operation is defined for complex or must refuse.
 **That refusal work is the majority of the cost and it is the part that must not
 be skipped.** An arm added with a `_ => unreachable!()` or a fallthrough that
 operates on `re` alone would return plausible numbers with the imaginary part
-dropped — the exact failure `docs/devices/VULKAN2.md` required be made
+dropped, the exact failure `docs/devices/VULKAN2.md` required be made
 *unrepresentable* rather than merely unused.
 
 For the round that picks this up, in order:
@@ -222,7 +222,7 @@ For the round that picks this up, in order:
 1. `Repr::Complex { re, im }` + the arm in every existing `match` on `Repr`,
    defaulting to **refuse**, not to `re`.
 2. A `PyTensorBase::complex(re, im)` constructor, the only way to attach a
-   complex tag — mirroring how `boolean()` is the only way to attach `Bool`.
+   complex tag, mirroring how `boolean()` is the only way to attach `Bool`.
 3. `polar`, `view_as_complex`, `view_as_real`, `mul` in `aten.rs`, plus the four
    upstream error messages transcribed in `test_tail2.py::_UPSTREAM_REFUSALS`.
 4. Flip `test_tail2.py`'s absence assertions into element-wise comparisons
@@ -256,14 +256,14 @@ reader tell whether their gap is the dtype or the operator.
 
 `test_tail2.py` asserts `_has_storage is False` directly rather than through any
 operator that happens to consult it, because that single fact is what the whole
-refusal rests on — and because an implementation is more likely to break it by
+refusal rests on, and because an implementation is more likely to break it by
 accident than deliberately. It also asserts `float32`/`bool` still report
 `True`, so a change that made `_has_storage` uniformly `False` is caught rather
 than passing the loop.
 
 ---
 
-## 5. `torch.stft` — for the concurrent speech round
+## 5. `torch.stft`: for the concurrent speech round
 
 **The complex answer is not your first blocker.** Measured on the shim:
 
@@ -297,7 +297,7 @@ independent things, in that order, and only the first is available now.
 
 ## 6. `linalg_norm` is a binding, and the kernel is already there
 
-> **Closed since.** The install below was made — `docs/bindings/BINDINGS.md` §1.3. The vector cases are
+> **Closed since.** The install below was made, `docs/bindings/BINDINGS.md` §1.3. The vector cases are
 > compared element-wise against upstream; the matrix `ord`s (`'fro'`, `'nuc'`, `±2`, a 2-tuple
 > `dim`) refuse by name, because they are `linalg_matrix_norm` upstream and the flattened
 > vector norm would answer them with the right shape and the wrong number.
@@ -315,7 +315,7 @@ module._linalg.linalg_vector_norm = _torch_level_function(...)
 ```
 
 **This round did not make that edit**, because `bootstrap.py` is outside its
-territory and is being edited concurrently by the round taking `_nn.glu` — two
+territory and is being edited concurrently by the round taking `_nn.glu`, two
 rounds appending to the same install function is exactly the merge collision
 the suite file was split to avoid. It is a ~15-line addition and belongs to
 whichever round owns `bootstrap.py` next; the kernel it needs is already
@@ -326,8 +326,8 @@ present, so nothing blocks it but the file.
 ## 7. `_vmap_increment_nesting`: real vmap, in all four
 
 > **Superseded by `docs/kernels/VMAP.md` (2026-09-07).** The sizing below is
-> correct — they do genuinely vmap, and a no-op counter would have
-> produced a wrong mask — but the conclusion that closing it needs "a
+> correct, they do genuinely vmap, and a no-op counter would have
+> produced a wrong mask, but the conclusion that closing it needs "a
 > batching rule for every op reachable inside a vmapped closure" was
 > too pessimistic for *these* closures. They are pointwise over four
 > index scalars, and for that shape vmap is broadcasting. VMAP.md §2 is
@@ -336,7 +336,7 @@ present, so nothing blocks it but the file.
 
 `nemotron3_5_asr`, `nemotron_asr_streaming`, `nemotron_asr_streaming_encoder`
 and `t5gemma2` (`docs/architectures/ARCH100.md:71`). The question worth asking was whether
-they genuinely vmap or merely touch an import path — because a counter with no
+they genuinely vmap or merely touch an import path, because a counter with no
 observable effect would have been a four-architecture win for almost nothing.
 
 **They genuinely vmap.** The chain, identical in all four:
@@ -353,14 +353,14 @@ torch/_functorch/vmap.py:487  _vmap_increment_nesting(batch_size, randomness)
                        :204  _remove_batch_dim
 ```
 
-The `use_vmap` flag is off by default — `masking_utils.py:514` is the "fast
-non-vmap mask creation" path — and these four turn it on because they supply a
+The `use_vmap` flag is off by default, `masking_utils.py:514` is the "fast
+non-vmap mask creation" path, and these four turn it on because they supply a
 genuine mask closure: chunked-limited attention context
 (`modeling_nemotron_asr_streaming.py:876-881`, which does `torch.div(...,
 rounding_mode="trunc")`, a subtraction, two comparisons and a `&` per index) and
 non-causal sliding-window masking (`modeling_t5gemma2.py:805`).
 
-So the cheap fix is not available, and it is worse than unavailable — it is
+So the cheap fix is not available, and it is worse than unavailable. It is
 actively harmful. A `_vmap_increment_nesting` that returns a level and does
 nothing lets the call proceed to `_add_batch_dim`, and whatever comes back is
 then used **as an attention mask**. A wrong attention mask does not raise; it
@@ -371,7 +371,7 @@ That is the same failure shape as a dropped imaginary part, which is why
 
 **Sized, not built.** Closing this means a batched-tensor level in the shim:
 `_add_batch_dim`/`_remove_batch_dim`, the nesting stack, and a batching rule for
-every op reachable inside a vmapped closure — for these four that is `div`
+every op reachable inside a vmapped closure, for these four that is `div`
 (trunc), `sub`, comparison and `bitwise_and`, but the surface is open-ended
 because the closure is user-supplied. That is a `tensor.rs`-and-dispatch round
 of its own, comparable in scope to `Repr::Complex`, and it should not be started

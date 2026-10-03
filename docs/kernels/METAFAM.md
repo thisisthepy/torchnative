@@ -1,4 +1,4 @@
-# METAFAM — closing the two families docs/architectures/VOICE4.md left open
+# METAFAM: closing the two families docs/architectures/VOICE4.md left open
 
 Worktree `work/metafam` on develop `c6e4a3a`. Upstream torch 2.13.0
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout, in its own
@@ -178,7 +178,7 @@ plus wildcards, rank-0, bad-numel and two-wildcard refusals -- all agree.
 
 ---
 
-## 4. Tests — `tests/ops/test_metafam.py`
+## 4. Tests: `tests/ops/test_metafam.py`
 
 Same method as VOICE4.md §6: one probe script, run as a subprocess against the shim (vendored
 tree, `TORCH_USE_RTLD_GLOBAL=1`) and against upstream (`PYTHONPATH` stripped), shape+dtype (or
@@ -213,7 +213,7 @@ checked rather than only written down.
 
 ---
 
-## 5. Nullification — 8/8 caught
+## 5. Nullification: 8/8 caught
 
 AGENTS.md §17.5: a verification that cannot fail is not a verification. Each row below is a
 DELIBERATE one-line break of the landed code, a full rebuild + reinstall, and a re-run of
@@ -255,7 +255,7 @@ Per §1's table, the two families named by VOICE4.md are 21 + 12 = 33 ops in MET
 count. This round closed 14 names (12 new match arms; `slice.Tensor` and `unsqueeze.default`
 already had complex-input arms that untouched). **Left in the reduction family:**
 
-- `max.dim`, `argmax.default`, `topk.default`, `sort.default` — all return an INDEX tensor
+- `max.dim`, `argmax.default`, `topk.default`, `sort.default`: all return an INDEX tensor
   alongside (or instead of) a value tensor, so their meta kernel has to invent an `int64`
   shape rule for the index half too. Not attempted: this is a different shape of problem
   (multi-output) from the single-tensor-out kernels this round closes, and deserved its own
@@ -270,13 +270,13 @@ already had complex-input arms that untouched). **Left in the reduction family:*
 
 **Not attempted at all, named because §2.2 measured it as the actual top of real demand:**
 
-- `aten.embedding.default` — the contraction family, first wall for 5 of 7 real architectures'
+- `aten.embedding.default`: the contraction family, first wall for 5 of 7 real architectures'
   forward pass under meta, ranked ABOVE the reduction/view families in measured priority.
   Out of this round's scope (VOICE4.md named the reduction/view families specifically); flagged
   for the next round rather than folded in here.
 
 **Everything META.md §7.4 already listed under 축약 (contraction, 8), 인덱싱 (indexing, 7),
-합성·활성 (composite, 6), 결합·분할 (combine/split, 4), and 그 외 (other, 10)** — untouched,
+합성·활성 (composite, 6), 결합·분할 (combine/split, 4), and 그 외 (other, 10)**, untouched,
 out of scope for a round titled "close the [reduction and view] families".
 
 GraalVM native image: not attempted, out of this round's scope (per the coordinating

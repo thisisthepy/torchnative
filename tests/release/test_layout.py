@@ -95,8 +95,6 @@ def _main():
     return 1 if failures else 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(_main())
 
 
 TESTS_APPROVED = {
@@ -122,3 +120,7 @@ def test_tests_has_only_function_folders_and_no_loose_suite():
 def test_the_tests_layout_check_can_fail():
     assert _tests_top_level({"ops", "test_loose.py", "run.sh"}) == ["test_loose.py"]
     assert _tests_top_level({"ops", "stray_dir"}) == ["stray_dir"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -1,4 +1,4 @@
-# FEDERATED3 — the four things FEDERATED2 scoped out
+# FEDERATED3: the four things FEDERATED2 scoped out
 
 > **Superseded in part by [`FEDERATED4.md`](FEDERATED4.md), 2026-09-12.** This
 > document is the round record of 2026-09-06 and is left as written. Two of its
@@ -6,7 +6,7 @@
 > transport was a world of two, and `on_missing='average_arrived'` and a
 > proper-subset cohort were refused *because of that*. The transport now
 > carries a world of three or more, and both are **built**. Section 4.1's
-> measurement is unaffected — it is why they refuse below a world of three
+> measurement is unaffected. It is why they refuse below a world of three
 > rather than why they do not exist.
 
 `docs/distributed/FEDERATED.md` landed one round of `FedAvg` between two OS processes;
@@ -16,7 +16,7 @@ selection**, **dropout policy**, **aggregators other than FedAvg**, and
 **secure aggregation / differential privacy**. This document is what happened
 to those four. Two are built, one is built by half and the half that is
 missing is missing for a reason that is measured rather than asserted, and the
-fourth is still not offered — with the chain of things it needs written down
+fourth is still not offered, with the chain of things it needs written down
 instead of a shrug.
 
 Measured 2026-09-06, host `darwin/arm64`, CPython 3.13, upstream torch 2.13.0
@@ -25,9 +25,9 @@ no aten op was added.
 
 | | |
 |---|---|
-| aggregators other than FedAvg | **built** — `FedAvgM` (server momentum) and `FedProx` (a proximal term on the *local* objective) |
-| dropout policy | **built** — `on_missing='refuse'`, `federated.RankDropped`, and the round is *undone* rather than left half-applied |
-| participant selection | **half built** — the cohort is agreed across the ranks; a proper subset refuses and names `world_size N` as the next thing |
+| aggregators other than FedAvg | **built**, `FedAvgM` (server momentum) and `FedProx` (a proximal term on the *local* objective) |
+| dropout policy | **built**, `on_missing='refuse'`, `federated.RankDropped`, and the round is *undone* rather than left half-applied |
+| participant selection | **half built**, the cohort is agreed across the ranks; a proper subset refuses and names `world_size N` as the next thing |
 | secure aggregation, differential privacy | **not offered**, and now refusing by name from `Engine(secure_aggregation=…)` / `Engine(differential_privacy=…)` with the dependency chain |
 
 ---
@@ -39,7 +39,7 @@ inherits that**. `FedAvgM`'s velocity over a world of one is a running sum of
 the rank's own deltas. `FedProx`'s server step *is* `FedAvg`, so at any world
 size a class that only overrode `aggregate` would be `FedAvg` wearing a name.
 A cohort of one is the identity by definition. And the failure a dropout
-policy exists to prevent — dividing by whoever arrived — **produces the
+policy exists to prevent (dividing by whoever arrived) **produces the
 identity at two ranks**, because two minus one is one.
 
 So every test here is two `subprocess.Popen`s that share nothing but a TCP
@@ -54,7 +54,7 @@ dropout round **2.0 s**.
 
 ---
 
-## 2. `FedAvgM` — the first aggregator whose answer depends on the past
+## 2. `FedAvgM`: the first aggregator whose answer depends on the past
 
 ```
 v_k  <-  beta * v_(k-1)  +  mean_k          mean_k = sum(w_j d_j) / sum(w_j)
@@ -66,7 +66,7 @@ contributes `w^local - w_global`, and the group still forms the weighted mean
 of those with `all_reduce(SUM)`.
 
 **Why this is a second aggregator and not a knob.** One round cannot
-distinguish it from `FedAvg` — at `k = 0` the velocity is the mean. So the
+distinguish it from `FedAvg`, at `k = 0` the velocity is the mean. So the
 acceptance test does not try: it runs **three rounds** and checks each against
 the recursion computed centrally, `torch.equal`.
 
@@ -89,7 +89,7 @@ table's own dtype**, so there is one rounding rather than a promotion rule.
 
 | control | measured |
 |---|---|
-| `FedAvgM(momentum=0)` is `FedAvg` | **bit for bit** — the same table through both classes, equal as JSON |
+| `FedAvgM(momentum=0)` is `FedAvg` | **bit for bit**, the same table through both classes, equal as JSON |
 | momentum actually carries | from round 1 the aggregate is **not** the round's mean: `‖v − mean‖∞` is 0.2824 / 1.1697 (round 1) and 0.2665 / 2.3477 (round 2), asserted `> 1e-3` |
 | the aggregate is neither operand | asserted at every round |
 | the two ranks' deltas differ | asserted at every round |
@@ -97,7 +97,7 @@ table's own dtype**, so there is one rounding rather than a promotion rule.
 
 The last one is worth its own line. **Nothing reduces the velocity.** It stays
 in step because the mean is already identical on both ranks and the update
-applied to it is deterministic — but "it cannot drift" is an argument, and a
+applied to it is deterministic, but "it cannot drift" is an argument, and a
 server state that drifted would still return a table of the right names and
 shapes and still report success. So it is checked.
 
@@ -107,7 +107,7 @@ at zero for a renamed parameter is the `FedAvg` answer reported as the
 
 ---
 
-## 3. `FedProx` — the difference is in the local objective, so the aggregator refuses without one
+## 3. `FedProx`: the difference is in the local objective, so the aggregator refuses without one
 
 FedProx (Li et al. 2020) adds `mu/2 ‖w − w_global‖²` to what each client
 minimises, which on the gradient is `mu (w − w_global)`. **Its server step is
@@ -115,7 +115,7 @@ FedAvg's, unchanged.** That is the whole trap: a `FedProx` class that only
 overrode `aggregate` would compute FedAvg's weighted mean, at every world
 size, for ever, and nothing downstream could tell.
 
-So the term goes where it belongs — on the local step — through a new hook:
+So the term goes where it belongs (on the local step) through a new hook:
 
 ```python
 torchnative.adapt.Adapted.add_grad_hook(hook)   # hook(wrapper, params, names)
@@ -144,22 +144,22 @@ rank 1                    1.53059           1.81749
 ```
 
 The first row is what a constant nudge, a flipped sign, or a term computed
-against the live weights instead of the base would all break — and it is exact
+against the live weights instead of the base would all break, and it is exact
 zero, not a tolerance. The last two columns are the second half: the term pulls
 back toward the weights the round started from, so the contributed delta is
-*smaller*. `mu = 0.05` with `lr = 4.0` — a shrink factor of 0.2 per step, which
+*smaller*. `mu = 0.05` with `lr = 4.0`, a shrink factor of 0.2 per step, which
 is why this damps rather than overshooting past the base.
 
 The aggregate over the two ranks is still checked against the central weighted
 mean of the two prox deltas, `torch.equal`: FedProx changed what was
 contributed, not how it was combined.
 
-`FedProx(mu=0)` refuses — at `mu = 0` it *is* FedAvg, and a caller who means
+`FedProx(mu=0)` refuses: at `mu = 0` it *is* FedAvg, and a caller who means
 FedAvg should say FedAvg rather than reach it through a tuning knob.
 
 ---
 
-## 4. Dropout — the divisor nobody chose
+## 4. Dropout: the divisor nobody chose
 
 The failure this guards is an aggregator that **silently divides by however
 many ranks arrived**. It returns a table of the right names and shapes and
@@ -167,9 +167,9 @@ every caller downstream sees success.
 
 `docs/distributed/FEDERATED.md` §8 listed "a rank that dies mid-round was not tested",
 because with no timeout knob on `TCPStore.wait` the experiment looked like a
-30-second hang inside the suite. **It is not.** Rank 1 exits with `os._exit(0)`
-— no atexit, no flush, a device that lost power rather than one that said
-goodbye — and rank 0 notices when `_recv_all` reads zero bytes from a closed
+30-second hang inside the suite. **It is not.** Rank 1 exits with `os._exit(0)`,
+no atexit, no flush, a device that lost power rather than one that said
+goodbye, and rank 0 notices when `_recv_all` reads zero bytes from a closed
 socket. The whole two-process test takes **2.0 s**, not 30.
 
 ```
@@ -185,9 +185,9 @@ before == after                     bit-identical: the round was undone
 
 Three parts, and the third is the policy:
 
-1. **Mechanism.** `_collective` translates the three faces of a lost peer —
+1. **Mechanism.** `_collective` translates the three faces of a lost peer:
    `RuntimeError('connection closed')`, `BrokenPipeError`, a 30 s
-   `socket.timeout` — into `federated.RankDropped`, which names the rank, the
+   `socket.timeout`: into `federated.RankDropped`, which names the rank, the
    collective, and the fact that no partial average exists. All three mean the
    same thing at this layer and none of them says so; they name the socket.
 2. **Policy.** `Engine(on_missing='refuse')` is the default and is
@@ -196,7 +196,7 @@ Three parts, and the third is the policy:
    `allow_missing=True` now points at `on_missing`.
 3. **The round is undone.** The local epochs had already moved the model.
    Leaving them would keep an update no other rank has, and **the two ranks
-   would silently stop holding the same weights** — the one property that makes
+   would silently stop holding the same weights**, the one property that makes
    this federated learning rather than two devices training alone. So
    `participate` reverts to the delta's base, which is the last aggregate every
    rank agreed on, and marks the Engine used.
@@ -212,7 +212,7 @@ norm1.weight              0.0                      0.1432
 norm2.weight              6.0e-8                   0.5770
 ```
 
-So the "partial average" is rank 0's own delta: the **identity** — the same
+So the "partial average" is rank 0's own delta: the **identity**, the same
 degenerate answer `world_size = 1` gives, arrived at by a socket close instead
 of by a decision. That is why `on_missing='average_arrived'` cannot be honestly
 served here even as an experiment: at two ranks its output is the operand, and a
@@ -225,19 +225,19 @@ test of it would pass with no aggregation at all.
 > it is absent.
 
 One thing fell out of writing that control. `x * 3 / 3` **is not `x`** in
-float32 — 6.0e-8 on `norm2.weight`. The first draft asserted `torch.equal` and
+float32, 6.0e-8 on `norm2.weight`. The first draft asserted `torch.equal` and
 went red for a reason with nothing to do with aggregation.
 
 ---
 
-## 5. Participant selection — the half that does not need a bigger world
+## 5. Participant selection: the half that does not need a bigger world
 
 A round picking a subset of the available ranks needs two things, and only one
 of them needs a transport this project does not have.
 
 **The half that is built: the ranks have to agree.** Two ranks holding
 different cohorts complete every collective and produce a weighted mean, over a
-cohort neither of them chose — the same silent shape as the schema and base
+cohort neither of them chose, the same silent shape as the schema and base
 disagreements `docs/distributed/FEDERATED.md` §3 found. And a rule as ordinary as "sample
 half the clients at random" disagrees whenever the ranks seed differently,
 which is the default. So `federated.cohort(select, group)` evaluates the rule
@@ -256,7 +256,7 @@ the model has moved. `Round.cohort` records what the round actually aggregated
 over.
 
 **The half that refuses.** A proper subset needs the collective to run on a
-sub-group — `torch.distributed.new_group` — and `ProcessGroupLocal` refuses any
+sub-group (`torch.distributed.new_group`) and `ProcessGroupLocal` refuses any
 world but 1 and 2 (`docs/distributed/TRANSPORT.md` §3). At two ranks every subset that is
 not both leaves one, and `FedAvg` over a world of one is the identity. So there
 is no version of this that can be *tested* here, and a version that cannot be
@@ -266,7 +266,7 @@ next thing to build.
 
 ---
 
-## 6. Secure aggregation and differential privacy — a round of its own, and why
+## 6. Secure aggregation and differential privacy: a round of its own, and why
 
 Both were "not offered at all". They still are, but they now refuse from a
 named surface rather than by absence, and each names the chain it needs.
@@ -274,7 +274,7 @@ named surface rather than by absence, and each names the chain it needs.
 **Secure aggregation** (Bonawitz et al. 2017) is pairwise masks between
 clients. That needs **point-to-point `send`/`recv`, which the transport refuses
 by name**, plus a key agreement, threshold secret sharing so that a dropout does
-not destroy the sum — the same problem §4 is about — and an unmasking round.
+not destroy the sum (the same problem §4 is about) and an unmasking round.
 It is not one flag's worth of work, and it is *downstream of the dropout
 policy*, not parallel to it.
 
@@ -283,19 +283,19 @@ granularity. Producing one needs per-example gradient clipping inside the local
 step, noise calibrated to the clipping norm, and an accountant over the rounds.
 Two of those are missing at the bottom: this stack's backward produces one
 gradient per parameter **over the batch**, not per example, and the sampling
-rate an accountant integrates over is set by participant selection — which §5
+rate an accountant integrates over is set by participant selection, which §5
 refuses. Adding a noise term without the rest produces a model that is worse
 and a guarantee that is absent, and reports both as success.
 
 So yes: **a round of its own**, and it is ordered after `world_size N`.
 
-The digest in `federated.agree` is not a security boundary and never was — 56
+The digest in `federated.agree` is not a security boundary and never was, 56
 bits, detecting an accident, with nothing trying to stop two ranks that want to
 collide it.
 
 ---
 
-## 7. Sabotage — each test was made to fail
+## 7. Sabotage: each test was made to fail
 
 Five defects, introduced one at a time into the aggregation layer, the
 two-process tests re-run, and the reds counted. `cp` backups; `git checkout`
@@ -303,11 +303,11 @@ was not used.
 
 | defect | went red |
 |---|---|
-| `FedAvgM` ignores its velocity (`v = mean`) | **2** — the momentum acceptance test, and the `momentum=0` control (whose second half measures that momentum *does* something) |
-| `cohort` does not agree the set across the ranks | **1** — the disagreement arm accepted two different cohorts |
-| a lost peer is not translated into `RankDropped` | **1** — the dropout test |
-| the `FedProx` proximal term is a no-op | **1** — the prox test (step 3 stopped differing from the unregularised run) |
-| the dropped round is left half-applied | **1** — the dropout test, on `before == after` |
+| `FedAvgM` ignores its velocity (`v = mean`) | **2**, the momentum acceptance test, and the `momentum=0` control (whose second half measures that momentum *does* something) |
+| `cohort` does not agree the set across the ranks | **1**, the disagreement arm accepted two different cohorts |
+| a lost peer is not translated into `RankDropped` | **1**, the dropout test |
+| the `FedProx` proximal term is a no-op | **1**, the prox test (step 3 stopped differing from the unregularised run) |
+| the dropped round is left half-applied | **1**, the dropout test, on `before == after` |
 
 The fourth and fifth are the ones worth noting: both leave a path that
 *completes and returns a plausible answer*. A no-op proximal term is FedProx
@@ -320,13 +320,13 @@ different weights with nothing raised.
 
 | | why it refuses rather than approximates |
 |---|---|
-| a cohort that is a **proper subset** | ~~needs `new_group` over a world larger than 2; at two ranks every subset is a world of one, where FedAvg is the identity (§5)~~ — **built since, `FEDERATED4.md`**: the transport carries a world of three, and `cohort()` serves a proper subset there |
-| `on_missing='average_arrived'` | ~~the divisor is chosen by a socket timeout; and at two ranks the survivor set is one, so its output is the operand (§4.1)~~ — **built since, `FEDERATED4.md` §6**: the divisor is `min_participants=k`, named by the caller, and it refuses below a world of three |
+| a cohort that is a **proper subset** | ~~needs `new_group` over a world larger than 2; at two ranks every subset is a world of one, where FedAvg is the identity (§5)~~, **built since, `FEDERATED4.md`**: the transport carries a world of three, and `cohort()` serves a proper subset there |
+| `on_missing='average_arrived'` | ~~the divisor is chosen by a socket timeout; and at two ranks the survivor set is one, so its output is the operand (§4.1)~~, **built since, `FEDERATED4.md` §6**: the divisor is `min_participants=k`, named by the caller, and it refuses below a world of three |
 | secure aggregation | needs point-to-point send/recv (refused by the transport), key agreement, threshold sharing, an unmasking round (§6) |
 | differential privacy | needs per-example gradients (this backward is per-batch), a clipping norm, an accountant over a sampling rate selection defines (§6) |
-| `FedAdam`, `FedYogi`, `SCAFFOLD` | **not built, and not refused by name** — `Engine` takes any object with `.aggregate`, so each is a class and not a change here. The adaptive three would also need `sqrt` on the server path, where `torch.equal` against a central computation is a claim about one more kernel; nobody has checked that |
+| `FedAdam`, `FedYogi`, `SCAFFOLD` | **not built, and not refused by name**, `Engine` takes any object with `.aggregate`, so each is a class and not a change here. The adaptive three would also need `sqrt` on the server path, where `torch.equal` against a central computation is a claim about one more kernel; nobody has checked that |
 | gradient compression | no surface takes a codec |
-| optimiser reset between rounds | unchanged from `docs/distributed/FEDERATED2.md` §4 — the state carries forward and nobody has measured the difference |
+| optimiser reset between rounds | unchanged from `docs/distributed/FEDERATED2.md` §4, the state carries forward and nobody has measured the difference |
 | a cross-machine, non-CPU or on-device round | unchanged. Every number here is a `TinyLM` of 24 vocabulary entries on `127.0.0.1` |
 
 **Not done and not refused, because there is nothing to refuse:** no
@@ -352,7 +352,7 @@ PYTHON=$PY sh tests/run.sh     397 ok   (before 389, +8)
 $PY tests/golden/compare.py                   8509/8509, ops=203
 ```
 
-**No aten op was added** — this round is Python above the dispatcher, and the
+**No aten op was added**: this round is Python above the dispatcher, and the
 only Rust it touched is none. `397` is a lower bound only, the way every other
 document here treats `smoke_ok`.
 
@@ -372,8 +372,8 @@ document here treats `smoke_ok`.
 ## 11. What is not known
 
 * **Nothing was run at a world larger than two**, so every claim about
-  `world_size N` — that cohort agreement generalises, that a survivor set of
-  two or more makes `average_arrived` meaningful — is a design statement and
+  `world_size N`: that cohort agreement generalises, that a survivor set of
+  two or more makes `average_arrived` meaningful, is a design statement and
   not a measurement.
 * **`FedAvgM`'s velocity was never reduced**, only shown to agree. Two ranks
   that fell out of step for some other reason (a different `momentum`, a
@@ -388,5 +388,5 @@ document here treats `smoke_ok`.
   exiting still waits 30 s for the socket timeout, and that path was reasoned
   about, not run. A rank that dies *between* two collectives of the same round
   was not tried either.
-* **`float32` only, CPU only, loopback only** — unchanged from
+* **`float32` only, CPU only, loopback only**: unchanged from
   `docs/distributed/FEDERATED.md` §8.

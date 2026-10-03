@@ -1,4 +1,4 @@
-# NPUFUSE — a fused gated MLP and a dynamic row axis for the Intel NPU path
+# NPUFUSE: a fused gated MLP and a dynamic row axis for the Intel NPU path
 
 GitHub issue #3. Measured 2026-10-02 on an arm64 Mac (no Intel NPU) against
 develop `59dc043`. Rules cited are `AGENTS.md`'s.
@@ -29,7 +29,7 @@ The grades are `AGENTS.md` §16's: *builds* / *reaches* / *agrees*.
 | Fused MLP output = upstream torch's | **agrees** at f32 *execution* precision (ratio 0.92). At the plugin's default f16 execution it is within the derived tolerance, but **fails the 4x rule** (ratio 7.1) | real runtime, CPU plugin, upstream torch 2.13 in a separate subprocess | no |
 | Unsupported patterns refuse by name | builds/reaches (pure) | six patterns, pure | yes |
 | A refused dynamic axis is named, warned and visibly recompiles | reaches (faked device refusal) | faked | yes |
-| Anything on an Intel **NPU** | **nothing** | §5, Windows | — |
+| Anything on an Intel **NPU** | **nothing** | §5, Windows | n/a |
 
 The gate does not set `TORCHNATIVE_OPENVINO_C`, so every real-runtime row
 **skips in the gate**. Each row says what it is missing. The real-runtime rows
@@ -201,7 +201,7 @@ evidence.
    `python -c "import torch; print(hasattr(torch._C, '_aten_implemented'))"`
    must print `True`. If it prints `False`, stop: you are measuring upstream
    torch.
-3. `pip install openvino` (or `pip install torchnative[npu]`), if it is not
+3. `uv add openvino` (or `uv add "torchnative[npu]"`), if it is not
    already installed. Then
    `python -m torchnative.export.intelnpu NPU` must end with `PROVEN:`. If it
    prints `REFUSED` or `NOT PROVEN`, stop and send that output.
@@ -286,7 +286,7 @@ guarded only when someone runs `test_npufuse.py` with
   arm. That decision belongs after step 7's numbers, not before.
 * **Attention is still per-leaf.** The archived library also has a
   `LlamaAttention` fast path. This round fused only the MLP.
-* **The status page** — done after this branch was brought up to develop: the
+* **The status page**: done after this branch was brought up to develop: the
   "recompiling for the accelerator" row of
   [`docs/platform/STATUS.md`](../platform/STATUS.md) now carries one sentence on
   the fused MLP and the dynamic axis, at the grade measured here (CPU plugin).

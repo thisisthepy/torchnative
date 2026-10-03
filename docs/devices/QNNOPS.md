@@ -1,4 +1,4 @@
-# QNNOPS — ground truth for what QNN/Hexagon HTP actually supports, per op
+# QNNOPS: ground truth for what QNN/Hexagon HTP actually supports, per op
 
 `torchnative.export.qnn_ops` (`torchnative/python/torchnative/export/qnn_ops.py`).
 Tests: `tests/devices/qnn/test_qnn_ops.py`.
@@ -17,7 +17,7 @@ recalled.
 QNN's failure mode is silent and at *compile* time. The partitioner declines a
 node it cannot take and the graph falls back to CPU; the program still runs and
 still produces the right numbers. So "it ran and the answer was correct" proves
-nothing about whether Hexagon executed anything — the opposite of NNAPI/CoreML,
+nothing about whether Hexagon executed anything, the opposite of NNAPI/CoreML,
 which fail closed at *run* time (`docs/devices/MPS.md`, `docs/graph/NPU2.md`
 record the same asymmetry for other backends). A table entry here that is
 optimistic rather than sourced would manufacture exactly that false confidence,
@@ -31,21 +31,21 @@ could not be traced is named below in **UNVERIFIED**, not folded into the table.
 |---|---|
 | QNN SDK headers (`QnnTypes.h`, `QnnOpDef.h`, HTP op-package headers) | **No.** `find / -iname "*.h" -path "*QNN*"`, `find / -iname "QnnTypes.h" -o -iname "QnnOpDef.h"`, and `find / -iname "*htp*constraint*" -o -iname "*HtpOpPackage*"` all returned empty on this box |
 | ExecuTorch's QNN backend partitioner source, local checkout | **Yes.** A real installed wheel: `/Volumes/macMini/caches/qnn-venv/lib/python3.13/site-packages/executorch-1.4.1.dist-info` (`executorch==1.4.1`, `macosx_14_0_arm64`) |
-| Official Qualcomm documentation | Not consulted for this table — the local partitioner source is strictly better (it is literally the code the partitioner runs, not a description of it) and was sufficient for every entry below |
+| Official Qualcomm documentation | Not consulted for this table, the local partitioner source is strictly better (it is literally the code the partitioner runs, not a description of it) and was sufficient for every entry below |
 
 Everything in the sourced table traces to the second row. Nothing here is a
 paraphrase of a doc page or of memory.
 
 ## 2. How the supported table was built
 
-`executorch/backends/qualcomm/builders/op_*.py` — 115 files — are QNN's **node
+`executorch/backends/qualcomm/builders/op_*.py`: 115 files, are QNN's **node
 visitors**. Each registers itself with `@register_node_visitor` against a
 `target = [...]` list of ATen/edge op-overload strings
 (`node_visitor_manager.register_node_visitor`), and
 `executorch/backends/qualcomm/partition/qnn_partitioner.py` accepts a graph
 node into the QNN partition **iff a visitor is registered for its target**.
 `target` is therefore not documentation of the partitioner's behaviour, it is
-the partitioner's input — the same list the real object consults.
+the partitioner's input, the same list the real object consults.
 
 ```sh
 cd /Volumes/macMini/caches/qnn-venv/lib/python3.13/site-packages/executorch/backends/qualcomm/builders
@@ -55,7 +55,7 @@ grep -oE '^\s*target\s*=\s*\[[^]]*\]' op_*.py   # one line per builder file
 extracted **127 unique targets across 115 files**. `qnn_ops.supported_ops()`
 returns exactly that set, and
 `test_qnn_ops.test_supported_ops_matches_a_fresh_extraction_from_the_installed_wheel`
-re-derives the same extraction at test time and diffs it against the module —
+re-derives the same extraction at test time and diffs it against the module,
 so a stale table fails a test rather than sitting undetected.
 
 ## 3. The explicit refusal lists
@@ -68,7 +68,7 @@ visitor error would otherwise stop them:
 |---|---|---|
 | `not_supported_operator` (3 entries) | `common_defs.py` | Never partitioned. Each has a source-code comment reason, reproduced verbatim in `qnn_ops.not_supported_ops()`: `aten._embedding_bag.default` ("output size is data dependent on the slice index"), `dim_order_ops._clone_dim_order.default` ("for graph sharding purpose..."), `quantized_decomposed.embedding_4bit.dtype` ("QNN does not support 4-bit embedding") |
 | `to_be_implemented_operator` (6 entries) | `common_defs.py` | ExecuTorch's own partitioner names these as not yet done for QNN: `adaptive_max_pool3d`, `max_pool3d_with_indices`, `median.default`, `median.dim`, `round.decimals`, `le.Scalar` |
-| `constant_operator` | `common_defs.py` | Folded as constants rather than run as ops (`arange.start_step`, `full.default`, `full_like.default`, `scalar_tensor.default`) — not a refusal, noted for completeness |
+| `constant_operator` | `common_defs.py` | Folded as constants rather than run as ops (`arange.start_step`, `full.default`, `full_like.default`, `scalar_tensor.default`), not a refusal, noted for completeness |
 
 A test (`test_the_refusal_lists_are_disjoint_from_the_supported_set`) asserts
 none of these overlap the supported set, since overlap would mean the table
@@ -83,13 +83,13 @@ Source: `executorch/backends/qualcomm/builders/node_visitor.py`,
 | | Unquantized | Quantized |
 |---|---|---|
 | Accepted | bool, float16, float32, float64\*, int8, int16, int32, int64, uint8, uint16, uint32 | int8, int16, int32, uint8, uint16 |
-| Notably absent | — | int64 ("there is no int64 tensor data type in Qnn" — source comment), uint32, bool, float |
+| Notably absent | n/a | int64 ("there is no int64 tensor data type in Qnn", source comment), uint32, bool, float |
 
 \* float64 has no native QNN type either; `QNN_TENSOR_TYPE_MAP` maps it to
-`QNN_DATATYPE_FLOAT_32` — a silent downcast, which `qnn_ops.check_leaf` names
+`QNN_DATATYPE_FLOAT_32`: a silent downcast, which `qnn_ops.check_leaf` names
 explicitly rather than reporting as a plain accept.
 
-## 5. UNVERIFIED — what this document could not settle, and why
+## 5. UNVERIFIED: what this document could not settle, and why
 
 * **Max tensor rank / max dimension size.** `intelnpu.py`'s `MAX_DIM` has a
   direct analogue nowhere in `executorch/backends/qualcomm/builders/` or
@@ -107,7 +107,7 @@ explicitly rather than reporting as a plain accept.
   sizes/strides, `layer_norm`'s axis restrictions, `topk`'s `k` limits). The
   builder files (`op_conv.py`, `op_layer_norm.py`, `op_topk.py`, ...) contain
   QNN-parameter *construction* code but this audit did not walk all 115 files
-  line-by-line for embedded shape assertions — only the `target =` extraction
+  line-by-line for embedded shape assertions, only the `target =` extraction
   (§2) and the two partition-level refusal files (§3) were read in full.
   A sibling round doing a per-op deep dive should treat this as open, not
   closed, for any op it plans to rely on heavily.
@@ -124,7 +124,7 @@ explicitly rather than reporting as a plain accept.
 
 127 sourced supported-op entries, 3 sourced explicit-refusal entries, 6 sourced
 to-be-implemented entries, 2 sourced dtype tables (11 unquantized / 5
-quantized types) — **145 total sourced facts**, all traced to
+quantized types), **145 total sourced facts**, all traced to
 `executorch==1.4.1` installed at `/Volumes/macMini/caches/qnn-venv`. Zero
 entries were put in the table unsourced; the numeric-constraint gaps are listed
 in §5 instead of being guessed into `constraints()`.
