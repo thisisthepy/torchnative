@@ -1365,7 +1365,7 @@ def test_no_claim_is_made_that_anything_ran_on_an_npu():
 
 #: What `torchnative.export.npu` used to export as the way to run a model.
 #: Written out here rather than read off `npu._WITHDRAWN`, so that quietly
-#: restoring one of them makes this test fail rather than agree (CLAUDE.md §5.5).
+#: restoring one of them makes this test fail rather than agree (AGENTS.md §17.5).
 WITHDRAWN_NPU = (
     "NpuModelForCausalLM",
     "delegate_",

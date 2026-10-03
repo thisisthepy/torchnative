@@ -9,7 +9,7 @@ under `lib/x86_64-linux-clang/`, and ExecuTorch's own installer gates on
 host, which is the one thing that was missing. `.github/workflows/qnn-lower.yml`
 is the job; this file is everything that job decides.
 
-**Why this is a file and not inline YAML.** `CLAUDE.md` §5.5 -- a verification
+**Why this is a file and not inline YAML.** `AGENTS.md` §17.5 -- a verification
 that cannot fail is not a verification. Logic that lives only inside a
 `run: |` block cannot be imported, cannot be nullified, and cannot be tested
 anywhere except by pushing to a branch and waiting. `tools/ci/verify_published.py`
@@ -68,7 +68,7 @@ MIN_DELEGATED_FRACTION = 0.9
 # is what keeps the two from drifting apart.
 QNN_BACKEND_ID = "QnnBackend"
 
-# The device that will run this. `CLAUDE.md` §7: Galaxy Tab S9 Ultra,
+# The device that will run this. `AGENTS.md` §19: Galaxy Tab S9 Ultra,
 # `ro.soc.model = SM8550`, Snapdragon 8 Gen 2, HTP v73, arm64-v8a.
 # `docs/devices/QNN.md` §5.1 read those off the physical device rather than assuming
 # them. The doc's *example* says SM8650, which is a different HTP generation
@@ -365,7 +365,7 @@ def build_parser():
 def _resolve_submodule(model, path):
     """`model.layers.0.mlp` -> the module, or a named refusal.
 
-    Refuses by name (`CLAUDE.md` §6) rather than raising a bare
+    Refuses by name (`AGENTS.md` §18) rather than raising a bare
     `AttributeError` from somewhere three frames down, because the most likely
     cause of a miss here is a `transformers` version whose Llama attribute
     names moved, and that reader needs to be told which component was absent.
@@ -393,7 +393,7 @@ def main(argv=None):
     # `torchnative.export.qnn` is a thin driver (docs/devices/QNN.md §2): the exporter
     # and the partitioner are UPSTREAM's. So this process must be running
     # upstream torch, NOT this project's shim -- which is the opposite of the
-    # `assert hasattr(torch._C, "_aten_implemented")` that CLAUDE.md §3 asks
+    # `assert hasattr(torch._C, "_aten_implemented")` that AGENTS.md §15.2 asks
     # of every *probe*. That rule exists so a probe of our shim cannot
     # silently measure upstream; here upstream is the thing under test, and
     # the shim would be the contamination. Asserted in that direction:

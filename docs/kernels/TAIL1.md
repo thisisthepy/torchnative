@@ -191,7 +191,7 @@ pinned rather than fixed, in three places that all fail when it changes:
 * this section.
 
 **So `vilt` and `rwkv` do not clear their walls this round**, and `gemma3n_text` does. Reporting
-"eight ops implemented, eight architectures cleared" would be the counting `CLAUDE.md` §5.3
+"eight ops implemented, eight architectures cleared" would be the counting `AGENTS.md` §17.3
 warns about. §7 has the sweep.
 
 A note on `reach.py` worth carrying forward: `_nn` gives every name in its stub list a *raising*

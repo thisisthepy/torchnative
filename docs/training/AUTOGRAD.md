@@ -839,7 +839,7 @@ invert the test rather than deleting it, and revisit this document in the same c
 
 ### 10.1 Proof that it can fail
 
-`CLAUDE.md`'s rule — a check that cannot fail is not a check — applied before claiming it as a
+`AGENTS.md`'s rule — a check that cannot fail is not a check — applied before claiming it as a
 gate. Three faults, each shaped like the real change that would make the claim wrong, injected
 into a scratch copy under `/tmp/ag/` (never into the tree):
 

@@ -221,7 +221,7 @@ question is unchanged by this round and remains as §3 states it.
   — is not measured, and the per-leaf tensor round trip is very likely to eat
   it. **No speed claim is made here, in either direction.**
 * **No timings at all.** The host was under load average 38 for this round's
-  duration, with other agents building. CLAUDE.md's rule on solitary
+  duration, with other agents building. AGENTS.md's rule on solitary
   measurement applies and a number taken under that load would be worthless.
   `preferred` is a scheduler decision and is not load-sensitive; latency is.
 * **The alternative, if §7's first bullet proves too expensive:** make the
@@ -284,7 +284,7 @@ script can get it wrong.
 as assertions on `preferred`. It skips by name where coremltools or the
 vendored shim is absent.
 
-## 9. Split the way CLAUDE.md §5.3 asks
+## 9. Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|

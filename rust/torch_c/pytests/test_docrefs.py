@@ -7,7 +7,7 @@ every one of those strings moves with its target, and a missed one is invisible:
 nothing dereferences a path written in a comment.
 
 The specific failure this file was written against is sharper than a broken
-link, and it is the shape CLAUDE.md §5.5 records repeatedly -- a check that
+link, and it is the shape AGENTS.md §17.5 records repeatedly -- a check that
 cannot fail. `run.sh` fed the documentation checker with a shell glob:
 
     "$repo_root"/docs/*.md "$repo_root/README.md"

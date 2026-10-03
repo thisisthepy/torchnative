@@ -149,7 +149,7 @@ def _interface_addresses(reader=_read_interface_text):
     matters more than it looks: this function gates a nullification, and a
     detector that quietly returned an empty set would make the gate *always*
     take the cannot-run branch -- an assertion silently switched off forever,
-    which is the "verification that cannot fail" shape CLAUDE.md §5.5 records
+    which is the "verification that cannot fail" shape AGENTS.md §17.5 records
     and which this repository has been bitten by before.
 
     So the check is a fact about every machine rather than about this one:

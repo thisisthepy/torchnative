@@ -331,7 +331,7 @@ worked around:
   upstream does not reproduce *itself* across dtypes there either.
 * **float32 for the language model.** 21.5 GB on a 16 GB host. The oracle runs are 8 steps; a
   64-step float32 pair was not attempted because at 40 s/token it is ~45 min per side and would
-  have been swapping against other work on the machine, which `CLAUDE.md` warns contaminates
+  have been swapping against other work on the machine, which `AGENTS.md` warns contaminates
   exactly this kind of number.
 * **Voice cloning / the ENCODE path.** `_extract_semantic_features` resamples 24 kHz → 16 kHz
   through `torchaudio.functional.resample`, which is not installed (§2.2). The reference-audio

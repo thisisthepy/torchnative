@@ -21,7 +21,7 @@
 # cmd_parity, and docs/devices/DEVICE.md §5.1 for what that costs.
 #
 # Nothing here installs an app or touches anything outside /data/local/tmp. The
-# emulator is shared with other projects (CLAUDE.md: one device test at a time).
+# emulator is shared with other projects (AGENTS.md: one device test at a time).
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)

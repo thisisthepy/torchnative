@@ -360,7 +360,7 @@ are unmoved *for stated reasons*, not for lack of reaching them: both were
 measured against upstream, both have their fix located to a named file and a
 named function, and both have a test that inverts when that fix lands.
 
-Counted the way `CLAUDE.md` §5.3 asks — split rather than totalled:
+Counted the way `AGENTS.md` §17.3 asks — split rather than totalled:
 
 | | this round |
 |---|---|

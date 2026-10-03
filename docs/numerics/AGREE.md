@@ -189,7 +189,7 @@ formula.
 question the sweep was asked — but it is a *negative* result about operators, and the technique
 that would have found a positive one is the same technique, so its silence is informative.
 
-**What §4 could not have caught**, since CLAUDE.md §5.4 asks for it: an operator that is wrong in
+**What §4 could not have caught**, since AGENTS.md §17.4 asks for it: an operator that is wrong in
 a way both the composed and the isolated run share (the replay uses the shim's own kernel in
 both), a defect that only fires at shapes outside these configs, and — the big one — an operator
 that is wrong only in a *fused* or *composed* path that no leaf module isolates.
@@ -220,7 +220,7 @@ and the calibration batch of §6 at 1234.
 ## 6. Two harness artefacts that were found and removed, because both looked like defects
 
 Recorded at length because each produced a large, plausible, entirely false number, and because
-§5.5 of CLAUDE.md is about verification that cannot fail.
+§17.5 of AGENTS.md is about verification that cannot fail.
 
 **BatchNorm running statistics.** Fresh `BatchNorm` has `running_var=1`, and `docs/architectures/DEMAND8.md`
 §1.1 measured that this drives a deep convnet's activations to ~1e-23. It does here too:
@@ -308,7 +308,7 @@ PYTHONPATH=... TORCH_USE_RTLD_GLOBAL=1     $PY agree_sweep.py --bisect  ARCH --d
 
 Both drivers are **resumable**: each architecture's record is written the moment it finishes and a
 re-run skips what is already on disk, so `--deadline 500` can be issued repeatedly in the
-foreground rather than backgrounded and lost. That is not a convenience — CLAUDE.md records three
+foreground rather than backgrounded and lost. That is not a convenience — AGENTS.md records three
 rounds lost to backgrounding a sweep, and a driver that must start over is a driver that gets
 backgrounded.
 

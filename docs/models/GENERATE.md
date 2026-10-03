@@ -194,7 +194,7 @@ test_grouped_query_attention_forward_matches_upstream_on_both_paths   0.0500  (�
 test_greedy_generate_matches_upstream_token_for_token                 토큰이 갈림
 ```
 
-경계보다 10^5 배 큽니다. 이 판정은 실패할 수 있는 판정입니다 (`CLAUDE.md` §5.5).
+경계보다 10^5 배 큽니다. 이 판정은 실패할 수 있는 판정입니다 (`AGENTS.md` §17.5).
 
 ### 4.3 나눠떨어지지 않는 헤드 수는 이름을 대고 거절한다
 
@@ -477,7 +477,7 @@ $PY tools/golden/compare.py                   exit 0   2702/2702, ops=118 (전 2
 $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (변화 없음)
 ```
 
-**보고를 종류별로 나눕니다** (`CLAUDE.md` §5.3):
+**보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
 
 | 종류 | 무엇 |
 |---|---|
@@ -489,7 +489,7 @@ $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (변화 없음)
 
 ### 9.1 실패할 수 있는 판정인지 확인했다
 
-`CLAUDE.md` §5.5. 세 커널을 각각 고장 내고 다시 돌렸습니다 (`cp` 백업, `git checkout` 아님):
+`AGENTS.md` §17.5. 세 커널을 각각 고장 내고 다시 돌렸습니다 (`cp` 백업, `git checkout` 아님):
 
 | 무엇을 깼나 | 무엇이 빨개졌나 |
 |---|---|
@@ -502,7 +502,7 @@ $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (변화 없음)
 
 ### 9.2 테스트 수가 진척이 아닌 이유
 
-`CLAUDE.md` §5.3. `+4` 중 셋은 **이 회차가 새로 연 능력**에 대한 값 비교이고, 하나
+`AGENTS.md` §17.3. `+4` 중 셋은 **이 회차가 새로 연 능력**에 대한 값 비교이고, 하나
 (`test_eager_generate_stops_at_index_tensor_and_says_so`)는 **되지 않는 것을 이름으로
 고정한 것**입니다 — 기능 추가가 아니라 미해결 항목에 자물쇠를 채운 것입니다.
 

@@ -60,7 +60,7 @@ from torchnative.device import _module_to  # noqa: E402
 
 
 def _shim():
-    """CLAUDE.md section 3: is this the shim or did we silently get upstream?"""
+    """AGENTS.md section 15.2: is this the shim or did we silently get upstream?"""
     assert hasattr(torch._C, "_aten_implemented"), (
         "not the torchnative shim -- torch._C has no _aten_implemented, so the "
         "vendored tree is missing and every probe below would measure upstream"

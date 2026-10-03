@@ -902,7 +902,7 @@ assumed was reachable.
 
 ### 7.5a Three negative controls — including one that made this section weaker
 
-§5.5 of CLAUDE.md: a check that cannot fail is not a check. Three were run.
+§17.5 of AGENTS.md: a check that cannot fail is not a check. Three were run.
 
 | control | change | result |
 |---|---|---|
@@ -964,7 +964,7 @@ What is missing is only the artefact:
 | is it worth shipping | all of the above **plus** the §1d `simd128` fix | absent, and §1d is upstream |
 
 **The next step is a download and is not attempted here.** Fetching and unpacking a Pyodide
-distribution is outside the immediate request (CLAUDE.md §5.7) and the brief said to install
+distribution is outside the immediate request (AGENTS.md §17.7) and the brief said to install
 nothing. It is recorded as the one remaining step rather than done.
 
 Two things that would otherwise be found the hard way, if someone does take that step:
@@ -1136,7 +1136,7 @@ other.
 §7 closed layer 3 against a host this crate itself synthesised (`gen_pystubs.py`'s stub table).
 §7.6 named the remaining gap precisely: *"does the extension load into a real CPython"* — needs
 a downloaded Pyodide distribution, and that download was out of scope for that session
-(CLAUDE.md §5.7). This section does the download and answers the question it was blocking.
+(AGENTS.md §17.7). This section does the download and answers the question it was blocking.
 
 **New vocabulary for this section, stricter than §7's:** "real interpreter" means Pyodide's own
 `pyodide.asm.wasm`/`pyodide.asm.mjs`, loaded through its own JS loader, running our `.wasm` as a
@@ -1404,7 +1404,7 @@ does. That is a **new wall**, not documented before this session, and §8.3c nam
 
 ### 8.3c A new wall: `torch.multiprocessing` cannot exist on Emscripten, and `torch/__init__.py` imports it unconditionally
 
-Named precisely, because CLAUDE.md §5.5 asks not to leave "it needed a workaround" vague:
+Named precisely, because AGENTS.md §17.5 asks not to leave "it needed a workaround" vague:
 
 - `_multiprocessing` and `_posixshmem` are C extension modules **Pyodide does not ship, on
   purpose** — multiprocessing needs POSIX shared memory and process forking, neither of which a
@@ -1520,7 +1520,7 @@ EM_CACHE=/Volumes/macMini/caches/emcc-scratch and cargo-target-emcc-torchc absor
 | §7.6 | "the next step is a download and is not attempted here" | **done** — Pyodide 314.0.6 fetched, CPython 3.14.2 confirmed from the interpreter itself (§8.0) |
 | §7.5/§7.5a | "the imports resolved" proven against `pyinit_host.c`, a host this crate wrote | **repeated against Pyodide itself** (§8.2, §8.2a) — same conclusion, stronger host |
 | §7's implicit scope | only `rust/wasm_probe` was ever run under emscripten | `rust/torch_c` itself now builds for `wasm32-unknown-emscripten` unmodified (§8.3) — a question §7 never asked |
-| this section's own §8.3, first draft | "blocked at dependency resolution" for `rust/torch_c` | **wrong, corrected in place** (§8.3) — it built on the first real attempt; the guess was never run before being written, which is exactly the CLAUDE.md §5.5 mistake this document otherwise tries to avoid |
+| this section's own §8.3, first draft | "blocked at dependency resolution" for `rust/torch_c` | **wrong, corrected in place** (§8.3) — it built on the first real attempt; the guess was never run before being written, which is exactly the AGENTS.md §17.5 mistake this document otherwise tries to avoid |
 | §5b's suggested README rows | "extension builds: emscripten builds, loads and runs under Node" | should now read **loads into a real CPython, and reaches `import torch` with a real forward pass** — a materially stronger claim than "runs under Node" |
 
 ---

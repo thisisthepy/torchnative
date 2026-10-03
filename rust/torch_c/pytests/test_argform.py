@@ -15,7 +15,7 @@ plus two more found separately and left in `bootstrap.py`'s territory:
     F.adaptive_avg_pool2d(x, 2) -- a bare int                  dinov3_convnext, efficientnet
 
 Every alias here was checked against real torch 2.13.0 *before* being added
-(CLAUDE.md's own warning: upstream accepts a numpy spelling on some ops and
+(AGENTS.md's own warning: upstream accepts a numpy spelling on some ops and
 refuses it on others, so accepting it everywhere would be a shim more
 permissive than the thing it replaces). What each measurement found and what
 was done about it is in docs/bindings/ARGFORM.md; this file is the proof the code
@@ -78,7 +78,7 @@ def test_ones_dtype_accepts_python_bool_int_float_like_upstream():
 def test_dtype_python_type_alias_does_not_touch_an_explicit_torch_dtype():
     # The translation only fires for the three bare Python types. A caller
     # spelling the ordinary way must see no behaviour change at all -- this
-    # is the "does the new path ever shadow the old one" check CLAUDE.md
+    # is the "does the new path ever shadow the old one" check AGENTS.md
     # asks for.
     explicit = _vf("ones")(2, dtype=_C.float32)
     assert explicit.dtype == _C.float32, explicit.dtype

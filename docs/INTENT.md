@@ -5,7 +5,7 @@ boundary for [`SPEC.md`](SPEC.md): **the spec may not go beyond it** (AGENTS.md 
 
 Sources, in order of authority: the maintainer's design statement in
 [`docs/design/DESIGN.md`](design/DESIGN.md) §0–§3 and §8, the project description in the former
-`CLAUDE.md` §0 and §8 (now AGENTS.md §11 and §20), and the README's own positioning. Anything that
+`AGENTS.md` §11 and §20 (formerly `CLAUDE.md` §0 and §8), and the README's own positioning. Anything that
 is this document's inference rather than a statement found there is marked
 `> Inferred — confirm with the maintainer.`
 

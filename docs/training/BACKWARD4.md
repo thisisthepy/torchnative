@@ -176,7 +176,7 @@ Upstream returns early for a tensor that is already an accumulating leaf:
 
 ## 4. What landed
 
-Split the way `CLAUDE.md` §5.3 asks for:
+Split the way `AGENTS.md` §17.3 asks for:
 
 | | |
 |---|---|
@@ -400,7 +400,7 @@ that cannot fail under the conditions you tried it is not yet known to be a chec
 
 | # | not established | why |
 |---|---|---|
-| 1 | **The cost of the door's new pass, in time.** | Load average on this machine was 4.2 with other agents running, and `CLAUDE.md` forbids reporting a number taken there. What is structural rather than measured: the common case is one relaxed atomic load plus one `bool` borrow per tensor operand, and it returns before allocating; the SmolLM2 prefill above runs under `no_grad`, so it pays only the atomic. A before/after benchmark was **not attempted** |
+| 1 | **The cost of the door's new pass, in time.** | Load average on this machine was 4.2 with other agents running, and `AGENTS.md` forbids reporting a number taken there. What is structural rather than measured: the common case is one relaxed atomic load plus one `bool` borrow per tensor operand, and it returns before allocating; the SmolLM2 prefill above runs under `no_grad`, so it pays only the atomic. A before/after benchmark was **not attempted** |
 | 2 | **That the naming fallback is right for the 150 ops the test does not cover.** | §3.1 measured 48. The fallback's claim is only that it is a smaller divergence than printing no field at all, and §4.1's footnote records the one op where shim and upstream disagree for a reason that is not the table's |
 | 3 | **That no caller anywhere reaches past nullness.** | §1.1 counted one path on one architecture, and §1.3 read the vendored tree. `generate`, PEFT, `Trainer`, gradient checkpointing and every `torch.nn` module SmolLM2 does not use were not exercised |
 | 4 | **Anything about `torch.autograd.Function`, hooks that fire, `create_graph`, or double backward.** | All four need a graph, which is W8/W9/W10 and is untouched. `register_hook` on a non-leaf refuses by name and that is the whole of the answer |

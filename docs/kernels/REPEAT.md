@@ -22,7 +22,7 @@ worth keeping apart:
 second thing after `where` fell, which §4 is; that one was not on anybody's
 list and was found by running the sweep rather than by reading one.
 
-Counted the way `CLAUDE.md` §5.3 asks — split rather than totalled:
+Counted the way `AGENTS.md` §17.3 asks — split rather than totalled:
 
 | | this round |
 |---|---|

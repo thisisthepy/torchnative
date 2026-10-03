@@ -55,7 +55,7 @@ def _available():
         os.path.join(_VENDOR_DIR, "torch", "__init__.py"))
 
 
-# Shared preamble: the shim, not upstream (CLAUDE.md §3), and a refusal
+# Shared preamble: the shim, not upstream (AGENTS.md §15.2), and a refusal
 # recorder that keeps the exception's type and full text.
 _PRELUDE = r'''
 import json, sys, importlib.util

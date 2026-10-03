@@ -265,7 +265,7 @@ the same line from the other side — **11385/11385, ops 300**, unmoved by this 
 | DOCWATCH | **PASS — 837/837** (830 before; +7, all in this document) |
 | golden | **11385/11385**, ops covered 300, 0 pending — unmoved |
 
-Counted per CLAUDE.md §5.3, since "+10 tests" is four different things otherwise:
+Counted per AGENTS.md §17.3, since "+10 tests" is four different things otherwise:
 
 | | |
 |---|---|

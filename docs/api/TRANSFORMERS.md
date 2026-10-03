@@ -49,7 +49,7 @@ transformers (5.15.1) that is **49 classes**, and `covered()` returns all 49 —
 `AutoModel`, `AutoModelForCausalLM`, `AutoModelForSeq2SeqLM`,
 `AutoModelForSequenceClassification`, `AutoBackbone`, and the other 44.
 
-A hand-written list is the CLAUDE.md §5.4 trap: it answers "which did the author
+A hand-written list is the AGENTS.md §17.4 trap: it answers "which did the author
 think of", not "which exist". `test_the_family_is_enumerated_not_hand_listed`
 computes the population independently in the test and requires equality, so a
 transformers release that adds a class is covered without an edit here — and a
@@ -121,7 +121,7 @@ rather than the hole quietly outliving its documentation.
 ## 5. `export=` and `load_in_4bit=` refuse by name
 
 Both appear in the README example. **Neither is implemented, and both refuse.**
-CLAUDE.md §6: a promised refusal that does not happen is worse than no refusal,
+AGENTS.md §18: a promised refusal that does not happen is worse than no refusal,
 and an argument accepted and dropped is the worst outcome available — the caller
 would believe something untrue and have nothing to check.
 

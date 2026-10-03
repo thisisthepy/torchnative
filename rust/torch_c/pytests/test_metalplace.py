@@ -116,7 +116,7 @@ _HOST_COMPUTED_ON_MPS = {
 # kept separate from the eight on purpose: the eight were found by a counter
 # on a running device, these two by following calls in the source, and
 # conflating the two kinds of evidence is how a number gets quoted into
-# something it never measured (CLAUDE.md §2).
+# something it never measured (AGENTS.md §13.1).
 _DERIVED_AS_WELL = ("aten.linalg_vector_norm.default", "aten.norm.ScalarOpt_dim")
 
 _EXEMPT = ("aten._local_scalar_dense.default", "aten.uniform_.default")
@@ -435,7 +435,7 @@ def test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back():
     **Grade: reaches + placed, not agrees** -- values are graded by
     `test_mpsinplace.py` and by §6's table, and duplicating an oracle for 43
     operators here would make this file about agreement instead of about where
-    the work happened. Stated rather than blurred, per CLAUDE.md §4.
+    the work happened. Stated rather than blurred, per AGENTS.md §16.
 
     Every operator that reaches must have `host_downloads == 0`, and there is
     **no longer an exception**. `scatter_.src` and `scatter_.value` were the

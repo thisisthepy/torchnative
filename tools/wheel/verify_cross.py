@@ -899,7 +899,7 @@ def check_suffix_is_searched(exp: Expectation, problems: list[str]) -> None:
 
 # ------------------------------------------------------------------ self-test
 #
-# "실패할 수 없는 검증은 검증이 아니다" (CLAUDE.md §5.5). Everything above passes
+# "실패할 수 없는 검증은 검증이 아니다" (AGENTS.md §17.5). Everything above passes
 # on the wheels this repository builds, which says nothing on its own -- an empty
 # function passes too. So each check is given a wheel it must reject, built by
 # damaging a good one in exactly the way that check exists to notice.
@@ -930,8 +930,8 @@ def _wrong_elf_machine(data: bytes) -> bytes:
 
     Flipped rather than assigned. Written as `e_machine := EM_X86_64` it damaged
     an aarch64 Android wheel and silently did nothing to an x86-64 manylinux
-    one, so the fault mode passed by being absent -- exactly the shape CLAUDE.md
-    §5.5 warns about, and it survived until a Linux wheel existed to run it on.
+    one, so the fault mode passed by being absent -- exactly the shape AGENTS.md
+    §17.5 warns about, and it survived until a Linux wheel existed to run it on.
     """
     import struct as _s
     EM_X86_64, EM_AARCH64 = 0x3E, 0xB7

@@ -55,7 +55,7 @@ grep -oE '"aten\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+"|"prims\.[a-zA-Z0-9_]+\.[a-zA-Z0-9
 **the doc was not stale beyond what it had already corrected itself**, so no further dated
 correction to META.md was needed from this step. The reconciliation is worth stating because
 the instruction was to trust the derivation over the doc if they disagreed; here they agreed,
-which is itself the check that matters (CLAUDE.md §5.4 -- "if the agent's conclusion matches
+which is itself the check that matters (AGENTS.md §17.4 -- "if the agent's conclusion matches
 my hypothesis, that is when to suspect it hardest" applies here as "matches the doc", and the
 match was verified by direct enumeration, not by re-reading the doc's prose).
 
@@ -215,7 +215,7 @@ checked rather than only written down.
 
 ## 5. Nullification — 8/8 caught
 
-CLAUDE.md §5.5: a verification that cannot fail is not a verification. Each row below is a
+AGENTS.md §17.5: a verification that cannot fail is not a verification. Each row below is a
 DELIBERATE one-line break of the landed code, a full rebuild + reinstall, and a re-run of
 `test_metafam.py -k <marker>`, then a restore from the known-good source.
 
@@ -304,7 +304,7 @@ the 10 failures were multiprocess (`fed4-*`) and `torch.compile`/`stft` tests co
 a concurrently-building sibling worktree (`bw-export5`) on the same machine, not this round's
 changes; 996 + 10 = 1006 matches the documented baseline count exactly, and none of the 10
 failing tests touch meta, reduction, or view code. Not re-verified in isolation given the time
-budget; flagged here per CLAUDE.md §5.5 rather than silently assumed innocent.
+budget; flagged here per AGENTS.md §17.5 rather than silently assumed innocent.
 
 ---
 

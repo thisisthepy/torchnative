@@ -180,7 +180,7 @@ def test_count_markers_use_ge_wherever_another_round_could_raise_them():
 
 
 def test_the_release_notes_exist_and_split_the_work_four_ways():
-    """CLAUDE.md 5.3: a release note that reports one number has merged
+    """AGENTS.md 17.3: a release note that reports one number has merged
     implementation, defect fixes, measurement and documentation into a single
     figure that looks like progress. The four headings are the whole point."""
     notes = REPO / f"docs/platform/RELEASE_{_project_version().replace('.', '_')}.md"
@@ -216,7 +216,7 @@ def test_the_abi3_wheel_loads_on_later_cpythons():
     This loads the BUILT extension under whichever later interpreters exist on
     the machine and makes it compute. It skips BY NAME when none are present,
     because the alternative -- passing silently on a host with only 3.13 --
-    is a check that cannot fail (CLAUDE.md §5.5).
+    is a check that cannot fail (AGENTS.md §17.5).
     """
     artefact = REPO / "torchnative/src/main/torch/_C.abi3.so"
     if not artefact.exists():

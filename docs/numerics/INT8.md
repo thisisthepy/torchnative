@@ -457,7 +457,7 @@ lines of §3 away from `torch.tensor([1], dtype=torch.int8)` working.
 
 - **Any performance number.** Five other agents were running throughout
   (`load average 21.49` at the start, `7.65` at the lowest); per `docs/graph/QUANT.md` §1
-  and CLAUDE.md's rule on measurement isolation, no timing was taken and none is
+  and AGENTS.md's rule on measurement isolation, no timing was taken and none is
   claimed.
 - **Whether the 135 would be *bit-identical* to upstream.** The probe establishes
   that upstream computes and that this build computes the neighbouring dtype. It does

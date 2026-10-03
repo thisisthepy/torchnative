@@ -29,7 +29,7 @@ The obvious reading of "make it async" is "run it on a thread", and that
 reading is what this repository keeps recording as a failure. A worker thread
 that finishes quickly makes every test pass. "The buffer is invalid before
 `wait()`" then holds only on a slow day, and the suite is measuring the
-scheduler rather than the contract. `CLAUDE.md` §5.5: a check that cannot fail
+scheduler rather than the contract. `AGENTS.md` §17.5: a check that cannot fail
 is not a check.
 
 So the design question was not *when* the collective runs. It was **who owns
@@ -202,7 +202,7 @@ answer would have been half right: the *property* was tested, but no test
 distinguished the guard that was doing the work. The two were collapsed into
 one choke point at `_star_exchange`, which every collective body reaches, and
 the single nullification now goes red. Defence in depth and testability were in
-tension here and testability won, which is the choice `CLAUDE.md` §5.5 asks for.
+tension here and testability won, which is the choice `AGENTS.md` §17.5 asks for.
 
 The second escape was in the test rather than the code. The first version of
 `abandoned_then_synchronous` issued the async and the synchronous collective

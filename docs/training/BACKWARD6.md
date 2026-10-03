@@ -52,7 +52,7 @@ Every shim reading printed `shim`; every upstream reading was taken with
 
 ## 1. What landed
 
-Split the way `CLAUDE.md` §5.3 asks for.
+Split the way `AGENTS.md` §17.3 asks for.
 
 | | |
 |---|---|
@@ -188,7 +188,7 @@ register -- and a branch that is not taken, which does not show above the noise;
 pays a mutex, a `BTreeMap` entry and a read lock on candle's storage `RwLock`, which is the ~27 ns.
 The SmolLM2 prefill in `docs/training/BACKWARD5.md` §3 issues no in-place op at all.
 
-**The caveat, and it is the one `CLAUDE.md` requires.** `uptime` reported load averages between 1.97
+**The caveat, and it is the one `AGENTS.md` requires.** `uptime` reported load averages between 1.97
 and 3.24 on 8 cores across the two runs, with other agents active. That is not a quiet machine, so
 **these numbers are indicative and not a measurement in the sense `docs/training/BACKWARD5.md` §3's byte
 counts are.** What survives the contamination is the comparison, because before and after were taken

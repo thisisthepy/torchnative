@@ -114,7 +114,7 @@ both the same way keeps them symmetric rather than making `MIN` the odd one.)
 
 Three of these are **new capability**, four are **defect fixes to code that was
 returning wrong numbers**, three were **already working and only documented**,
-and the rest are **refusals that replaced silence**. `CLAUDE.md` §5.3 asks for
+and the rest are **refusals that replaced silence**. `AGENTS.md` §17.3 asks for
 that split rather than a count of eight.
 
 ### 3.1 How they are built, and what it costs

@@ -30,7 +30,7 @@ Four things are checked, and they are not the same claim:
   list, so adding a target to the registry and forgetting the workflow is a red
   test rather than an eight-wheel release.
 * **nothing disables its own assertions** -- `|| true`, `continue-on-error`,
-  `set +e`. CLAUDE.md §5.5.
+  `set +e`. AGENTS.md §17.5.
 
 The `check_tag_version` half is the part that can be run and falsified locally:
 it is given agreeing and disagreeing pairs, including the one a reviewer waves
@@ -398,7 +398,7 @@ def test_the_tag_trigger_exists_and_is_scoped():
 
 
 def test_nothing_in_the_workflow_disables_its_own_assertions():
-    """CLAUDE.md §5.5, applied to the file that decides what ships."""
+    """AGENTS.md §17.5, applied to the file that decides what ships."""
     doc = _yaml()
     if doc is None:
         return _skip("pyyaml is not installed in this interpreter")
@@ -535,7 +535,7 @@ def test_the_doc_exists():
 
 
 def test_the_doc_says_the_workflow_has_never_run():
-    """CLAUDE.md §4: written, reached and agreed are three different claims.
+    """AGENTS.md §16: written, reached and agreed are three different claims.
 
     This workflow has been validated without a runner and has not executed.
     Delete this assertion when it has -- and record the run, not the intent.
@@ -549,7 +549,7 @@ def test_the_doc_says_the_workflow_has_never_run():
 
 
 def test_the_doc_states_this_files_own_test_count_correctly():
-    """CLAUDE.md §5.3: a stale count is the small end of a real species."""
+    """AGENTS.md §17.3: a stale count is the small end of a real species."""
     if not DOC.is_file():
         return _skip(f"no {DOC.relative_to(REPO)}")
     actual = len(re.findall(r"^def test_", pathlib.Path(__file__).read_text(), re.M))

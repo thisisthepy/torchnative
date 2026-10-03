@@ -47,10 +47,19 @@ build caches, model weights, `node_modules`) into every worktree is how 86 workt
 
 | Branch | Who writes to it |
 |---|---|
-| `work/<topic>` | You. All work happens here. |
-| `develop` | Merged into from work branches after verification. Never commit to it directly. |
+| `feat/<topic>` | You. All work happens here. Never name a branch `work/...`. |
+| `develop` | Merged into from `feat/` branches after verification. Never commit to it directly. |
 | `release` | **CI only.** Not a standing branch: CI regenerates it from every push to `develop`, in the main-only file layout, and opens the PR into `main`. It may not exist. Never write to it. |
 | `main` | **Pull request from `release` only.** Never push or merge to it directly. |
+
+Only `main`, `develop` and `release` are standing branches. A `feat/` branch lives until its pull
+request merges: merge with `gh pr merge --delete-branch`, then delete the local branch and its
+worktree. Periodically delete every branch already merged into `develop`, remote and local
+(`git branch -r --merged origin/develop`); an unmerged branch older than a few days is either
+landed or reported, not left. Branches named `release-*` are preserved snapshots: keep them.
+Renaming a branch that has an open pull request closes that pull request on GitHub (measured
+2026-10-03: #26 closed when `work/ci-gate` became `feat/ci-gate`); open a replacement that links
+the old one.
 
 `main` carries a reduced layout: of the Markdown files, only `README.md` stays at the repository
 root, and `docs/` keeps only its subdirectories (no Markdown files directly under `docs/`).
@@ -63,7 +72,7 @@ Every new feature goes through an issue and a pull request:
 1. Before starting, search the repository's issues (`gh issue list --state all --search "<keywords>"`).
 2. If no issue covers the work, open one (`gh issue create`) stating what and why, and the
    completion criterion — which tests must pass.
-3. Work on a `work/<topic>` branch, push every commit, and open a pull request into `develop`
+3. Work on a `feat/<topic>` branch, push every commit, and open a pull request into `develop`
    whose body contains `Closes #<number>`.
 4. Merge into `develop` through that pull request (`gh pr merge`), not by a local merge, so the
    issue is linked.
@@ -144,9 +153,11 @@ to implement", say what you counted against.
 
 # torchnative-specific rules
 
-Sections 11 and later apply to this repository only. They replace the Korean `CLAUDE.md`, whose
-section numbers are cited throughout `docs/`, code comments and tests; the table in
-[Appendix A](#appendix-a--claudemd-section-map) maps every old number to its section here.
+Sections 11 and later apply to this repository only. They replace the Korean `CLAUDE.md`, which
+was deleted (issue #22, confirmed by the user on 2026-10-03; Claude Code reads `AGENTS.md`). Every
+citation of it in `docs/`, code comments, tests and workflows has been rewritten to point here; the
+table in [Appendix A](#appendix-a--claudemd-section-map) remains as a historical map of the old
+numbers.
 
 `tools/agent_rules.txt` is the hard-rules preamble pasted into every agent prompt. It is a
 condensed copy of §12, §15, §17.5 and §22; when you change one, change the other.
@@ -206,8 +217,9 @@ TORCHNATIVE_VULKAN_DYLD="$HOME/Library/Android/sdk/emulator/lib64/vulkan" \
 VK_DRIVER_FILES="$HOME/Library/Android/sdk/emulator/lib64/vulkan/libkosmickrisp_icd.json"
 ```
 
-**What the gate runs:** crate unit tests → every Python suite in `rust/torch_c/pytests/` → golden
-self-test → the documentation checker (DOCWATCH, over `docs/**/*.md` and `README.md`).
+**What the gate runs:** crate unit tests → every Python suite in `rust/torch_c/pytests/` (43 files
+at the time `CLAUDE.md` recorded the baseline) → golden self-test → the documentation checker
+(DOCWATCH, over `docs/**/*.md` and `README.md`).
 
 **Baseline (2026-09-07, `dd2e0a3`):** 1122 ok / 0 FAIL · DOCWATCH 1011/1011 · golden 11420/11420
 ops=302 failed=0 pending=0 · `cargo test` 30/30 · golden self-test PASS. Always say **where** a
@@ -401,8 +413,8 @@ upstream's answer" are different claims, and **only the second supports the word
 
 ## 17. Check periodically that you are doing what was asked
 
-These subsections are numbered to match `CLAUDE.md` §5.1–§5.7 exactly (§17.*n* = old §5.*n*),
-because those numbers are cited throughout the repository. Do not renumber them.
+These subsections are numbered to match the old `CLAUDE.md` §5.1–§5.7 exactly (§17.*n* = old
+§5.*n*), because those numbers were cited throughout the repository and still appear in history. Do not renumber them.
 
 Individually reasonable steps have repeatedly summed to something the instruction did not ask for.
 What follows is a checklist, not a confession.
@@ -501,7 +513,9 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
 ## 19. Parallel work and devices
 
 - **Worktrees live inside this repository** at `.worktrees/<name>` (git-ignored):
-  `git worktree add -b work/<name> .worktrees/tn-<name> develop`. Then §14.1.
+  `git worktree add -b feat/<name> .worktrees/tn-<name> develop`. Then §14.1. The repository itself
+  sits on the external volume (`/Volumes/macMini/thisisthepy/torchnative`), so this still avoids the
+  internal SSD, and nothing is scattered outside the repository (§15.1).
 - **Agent rules live in `tools/agent_rules.txt`**, a repository-relative path, so every worktree has
   them automatically. Never keep them in `/tmp` or elsewhere outside the repository.
 - `build/` and `target/` only grow; delete them periodically.
@@ -587,8 +601,10 @@ These are the operational rules from `tools/agent_rules.txt` that are not alread
 
 ## Appendix A — `CLAUDE.md` section map
 
-`CLAUDE.md` (Korean) is cited roughly 310 times across `docs/`, code comments, tests and workflows,
-mostly as `CLAUDE.md §5.5` and `CLAUDE.md §5.3`. When those citations are rewritten, use this table.
+`CLAUDE.md` (Korean) was deleted on 2026-10-03 (issue #22). It had been cited about 330 times across
+`docs/`, code comments, tests and workflows, mostly as `CLAUDE.md §5.5` and `CLAUDE.md §5.3`. Those
+citations were rewritten through this table; it is kept as a historical map, so that an old quotation
+of a `CLAUDE.md` section number (in a commit message, an archived log) can still be resolved.
 
 | `CLAUDE.md` | `AGENTS.md` |
 |---|---|
@@ -619,5 +635,5 @@ mostly as `CLAUDE.md §5.5` and `CLAUDE.md §5.3`. When those citations are rewr
 | (python-multiplatform) 게이트를 두 worktree 에서 동시에 돌리면 … | §14.3 |
 | `tools/agent_rules.txt` | §12, §15, §16, §17.5, §21, §22 |
 
-Rewrite rule: `CLAUDE.md §5.N` → `AGENTS.md §17.N`; `CLAUDE.md §N` for N ≠ 5 → the row above.
-A bare "CLAUDE.md 5.5" (no `§`) is the same citation.
+Mapping rule that was applied: `CLAUDE.md §5.N` → `AGENTS.md §17.N`; `CLAUDE.md §N` for N ≠ 5 → the
+row above. A bare "CLAUDE.md 5.5" (no `§`) was the same citation.

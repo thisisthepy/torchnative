@@ -113,7 +113,7 @@ tell them from the shorter alternative:
   later calls `arg_of` returns the existing `Ref::Const` without touching `const_stamps`, so
   re-stamping would have swallowed every past write rather than this one.
 
-**Nullified** (`CLAUDE.md` §5.5), by disabling the call and rebuilding:
+**Nullified** (`AGENTS.md` §17.5), by disabling the call and rebuilding:
 
 ```
 breaks: test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers
@@ -361,7 +361,7 @@ its *derivative*, which the golden harness does not count.
 
 ## 7. Reported by kind, not by count
 
-`CLAUDE.md` §5.3: test counts are not progress, so this is split.
+`AGENTS.md` §17.3: test counts are not progress, so this is split.
 
 | kind | what |
 |---|---|

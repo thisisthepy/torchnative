@@ -162,7 +162,7 @@ against *itself across the guard* — inside it the subclass must not be
 consulted, outside it the same op on the same tensor must be — which is the
 property that matters and needs no second side. It is written that way rather
 than skipped, and the crash is recorded here rather than worked around,
-because a test that quietly dropped the case would be CLAUDE.md §5.5's shape.
+because a test that quietly dropped the case would be AGENTS.md §17.5's shape.
 
 ---
 

@@ -345,7 +345,7 @@ this round's gate pinned, so it belongs to whichever round owns that number.
 It is worth being exact about what this means for `docs/architectures/ARCH200.md`'s
 arithmetic: **the 4 architectures blocked on `_vmap_increment_nesting` become 1
 forward and 3 blocked on a new, much smaller operator.** Counting this round as
-"four unblocked" would be the §5.3 error from `CLAUDE.md` — a number that went
+"four unblocked" would be the §17.3 error from `AGENTS.md` — a number that went
 up without the thing behind it going up as far.
 
 ---

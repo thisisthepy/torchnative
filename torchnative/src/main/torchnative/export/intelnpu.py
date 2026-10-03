@@ -141,7 +141,7 @@ class IntelNPUWithdrawn(IntelNPUUnsupported):
 
     A subclass of `IntelNPUUnsupported` so that anything already catching this
     module's refusals keeps catching it. A withdrawal *is* a refusal: it names
-    itself, gives the reason, and names what to use instead (CLAUDE.md §6).
+    itself, gives the reason, and names what to use instead (AGENTS.md §18).
     """
 
 class IntelNPUCacheWarning(UserWarning):

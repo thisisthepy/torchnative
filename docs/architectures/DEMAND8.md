@@ -110,7 +110,7 @@ DEMAND7 §3's rank 2 ("correctness bug") should be struck. The right statement i
 what "matches" means for every other row on that table too — the difference is only that
 `mobilenet_v2` is deep enough for the noise floor to be visible at 1e-04 rather than 1e-07.
 
-**What this measurement could not have caught**, stated because §5.4 of CLAUDE.md asks for it:
+**What this measurement could not have caught**, stated because §17.4 of AGENTS.md asks for it:
 a defect that upstream's float64 path shares with the shim (it does not — the two implementations
 are unrelated), or a defect that only fires on inputs outside this one calibrated configuration.
 The per-op replay in §1.3 is the part that generalises least by shape and most by op: it says

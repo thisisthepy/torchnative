@@ -157,7 +157,7 @@ already says what is unmeasured once it lands, for exactly this reason.
   requests a non-default dtype, matching every prior round's note on this.
 - No performance/overhead measurement (`@HighOverheadNativeCall` sites, FFI-per-call cost) was run
   this round — this task is a correctness/coverage sweep, not the performance-measurement class of
-  task CLAUDE.md §3 asks for separately, and mixing the two would have violated the "measurement
+  task AGENTS.md §16 asks for separately, and mixing the two would have violated the "measurement
   work runs alone" rule by adding unrelated model-loading load during a timing run (moot here since
   no timing run happened, but noted for the next round that might combine them).
 

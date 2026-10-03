@@ -511,7 +511,7 @@ def test_the_mps_fill_is_bracketed_by_the_metal_counters():
 
     `_C._metal_counters()` (docs/devices/matrix.md section 7.11) is the only
     instrument in this project that can see a silent host fallback -- values
-    and `.device` labels cannot, and CLAUDE.md section 2 records three rounds
+    and `.device` labels cannot, and AGENTS.md section 13.1 records three rounds
     where nothing but a counter caught it. This file originally said no such
     counter existed, which was true of the tree it was scoped against and is
     not true of this one.
@@ -673,7 +673,7 @@ def test_the_nan_seed_call_sites_answer_where_they_are_reachable():
 
     They are unreachable through the matrix sweep by construction: it builds
     one shape per operator and that shape has no NaN, so the seed is dead code
-    for it. That is precisely the blindness CLAUDE.md section 2 records for
+    for it. That is precisely the blindness AGENTS.md section 13.1 records for
     `clamp`, whose cell had no NaN either and graded AGREES for months while
     the operator was wrong.
 
