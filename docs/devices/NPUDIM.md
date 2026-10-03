@@ -2,7 +2,7 @@
 
 ## 0. The question, and the verdict
 
-`python/torchnative/export/intelnpu.py:212` says
+`torchnative/python/torchnative/export/intelnpu.py:212` says
 
     MAX_DIM = 2 ** 17     # 131072
 

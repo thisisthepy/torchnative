@@ -53,7 +53,7 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 
 # The model card's own "Single-speaker smart voice" example, verbatim.
 # `add_generation_prompt=True` is part of it and is load bearing: without it,

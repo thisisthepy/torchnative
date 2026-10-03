@@ -98,9 +98,9 @@ block that calls the names instead of the key.
 <!-- DOCWATCH: op-implemented aten._log_softmax.default -->
 <!-- DOCWATCH: op-implemented aten.nll_loss_forward.default -->
 <!-- DOCWATCH: hasattr nll_loss_forward false -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json _log_softmax present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json log_softmax absent -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py cross_entropy_loss present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json _log_softmax present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json log_softmax absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py cross_entropy_loss present -->
 
 ---
 
@@ -191,10 +191,10 @@ It is carried in the case list as documentation of the near miss, not as a check
 
 ### 2.4 What landed
 
-* `crates/torch_c/src/aten.rs` — `log_softmax_default` and `log_softmax_body`, the narrowing threaded
+* `torchnative/rust/torch_c/src/aten.rs` — `log_softmax_default` and `log_softmax_body`, the narrowing threaded
   through as an `Option<fn(f64) -> f64>` taken from the existing `float_narrower(tag)`.
-* `crates/torch_c/src/overloads.json` — `_log_softmax`, the dispatched leaf.
-* `crates/torch_c/src/bootstrap.py` — `Tensor.log_softmax` beside `Tensor.softmax`, and
+* `torchnative/rust/torch_c/src/overloads.json` — `_log_softmax`, the dispatched leaf.
+* `torchnative/rust/torch_c/src/bootstrap.py` — `Tensor.log_softmax` beside `Tensor.softmax`, and
   `torch.log_softmax` bound to it. **Not** an `overloads.json` entry: `aten::log_softmax.int` is
   `CompositeImplicitAutograd`, the `softmax` trap one line above it in the same file. The two
   spellings of one function land on opposite sides of that boundary, one underscore apart, and
@@ -298,8 +298,8 @@ Double`). It fires on the elementwise path as well as the reduce path, so both h
 
 ### 3.4 What landed
 
-* `crates/torch_c/src/aten.rs` — `nll_loss_forward_default` and `nll_cascade`.
-* `crates/torch_c/src/bootstrap.py` — `torch._C._nn.nll_loss`, `nll_loss_nd` and
+* `torchnative/rust/torch_c/src/aten.rs` — `nll_loss_forward_default` and `nll_cascade`.
+* `torchnative/rust/torch_c/src/bootstrap.py` — `torch._C._nn.nll_loss`, `nll_loss_nd` and
   `cross_entropy_loss`, the three composites §1 found. `nll_loss_nd`'s 4-D and >4-D arms refuse by
   naming `aten.nll_loss2d_forward.default`: that op reduces over a spatial extent, so `nll_loss` is
   not a slower road to the same answer.
@@ -308,8 +308,8 @@ Double`). It fires on the elementwise path as well as the reduce path, so both h
   probe that was wrong, not the shim — recorded because a shim that invented the name to make a
   probe green would have been worse than the refusal.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs log_softmax_body present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs nll_cascade present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs log_softmax_body present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs nll_cascade present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _bit_exact present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _nll_pair_check present -->
 
@@ -615,7 +615,7 @@ gap an op scan cannot see. None of them was implemented here: the brief's bar fo
 `zero_grad()` completing, and the three kernels are only reachable once something writes a
 gradient.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _PROFILER_MARKERS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _PROFILER_MARKERS present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one present -->
 <!-- DOCWATCH: op-not-implemented aten.lerp_.Scalar -->
 <!-- DOCWATCH: op-not-implemented aten.addcmul_.default -->
@@ -698,10 +698,10 @@ the test written on that claim failed immediately. It was the assertion that was
 
 ### 7.4 What landed
 
-* `crates/torch_c/src/aten.rs` — `native_dropout_default`, **one kernel and not a decomposition**. A
+* `torchnative/rust/torch_c/src/aten.rs` — `native_dropout_default`, **one kernel and not a decomposition**. A
   `bootstrap.py` decomposition would emit its steps through the one door and capture would record
   `bernoulli_` among them, which is the thing being fixed.
-* `crates/torch_c/src/bootstrap.py` — `_dropout_impl` takes the `native_dropout` route **only while
+* `torchnative/rust/torch_c/src/bootstrap.py` — `_dropout_impl` takes the `native_dropout` route **only while
   `_capture_active()`**, and `torch.native_dropout` is spelled (`hasattr(torch,
   'native_dropout')` is `True` upstream). Outside a region eager keeps the eager path, because
   upstream's CPU eager never reaches `native_dropout` either
@@ -736,7 +736,7 @@ falcon, vits               aten.add_.Tensor                   in place
 
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: hasattr native_dropout true -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs native_dropout_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs native_dropout_default present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_capture_takes_the_functional_dropout_and_only_inside_a_region present -->
 
 ---

@@ -172,7 +172,7 @@ against the shim built from this worktree:
     torch.backends.mps.is_built()           True
     torch.empty(2, 2, device="mps")         ok      (m + m).device -> mps:0
 
-and `crates/torch_c/Cargo.toml:170` reads
+and `torchnative/rust/torch_c/Cargo.toml:170` reads
 `candle-core = { ..., features = ["metal"] }`.
 
 **Closed 2026-09-12.** `torch.backends.mps.is_available()` and `is_built()` now
@@ -421,7 +421,7 @@ README and understated the count.
 ## 6. Entry count
 
 **21** `raise NotImplementedError` statements in
-`python/torchnative/`, not 15 — the count that produced the table
+`torchnative/python/torchnative/`, not 15 — the count that produced the table
 at the head of this document covered only `nn/federated` and `adapt`. All 21
 are classified above:
 

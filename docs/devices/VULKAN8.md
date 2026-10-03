@@ -21,8 +21,8 @@
 | 호스트로 떨어지지 않았음은 무엇이 보증하나 | 디스패치 카운터. 호스트 쌍둥이로 바꾸면 **값은 전부 맞고 카운터만 빨개진다** (§6 N4) |
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs logsumexp_lastdim present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs LOGSUMEXP_LASTDIM_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs logsumexp_lastdim present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs LOGSUMEXP_LASTDIM_F32_SPV present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_sdpa_logsumexp_agrees_with_upstream_at_a_derived_tolerance present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_wrong_logsumexp_is_rejected_by_this_tolerance present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_logsumexp_ran_on_the_gpu_and_cost_exactly_one_more_shader present -->

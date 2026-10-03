@@ -22,10 +22,10 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 64 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs like_fill present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs FILL_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/shaders/fill_f32.comp uintBitsToFloat present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/shaders/sum_dims_f32.comp do_mean present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs like_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs FILL_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/fill_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/sum_dims_f32.comp do_mean present -->
 <!-- DOCWATCH: op-implemented aten.mean.default -->
 <!-- DOCWATCH: op-implemented aten.mean.dim -->
 <!-- DOCWATCH: op-implemented aten.ones_like.default -->

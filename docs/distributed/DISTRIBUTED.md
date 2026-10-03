@@ -5,8 +5,8 @@
 
 측정일 2026-08-25. 호스트 `darwin/arm64`, CPython 3.13.0, 상류 torch 2.13.0 · transformers 5.15.1
 (`/Volumes/macMini/caches/spike-venv`). **벤더링 트리는 한 줄도 고치지 않았습니다** — 바뀐 것은
-`crates/torch_c/src/bootstrap.py`, `tests/{test_shim.py,verify_schemas.py}`,
-그리고 새로 만든 `python/torchnative/distributed/__init__.py` 뿐입니다.
+`torchnative/rust/torch_c/src/bootstrap.py`, `tests/{test_shim.py,verify_schemas.py}`,
+그리고 새로 만든 `torchnative/python/torchnative/distributed/__init__.py` 뿐입니다.
 
 ---
 
@@ -351,7 +351,7 @@ model(input_ids)
 | 1 | `AutoModelForCausalLM.from_config` 로 만든 모델의 **순전파** | ~~**미통과.** §7 의 autocast 벽~~ **정정 (문서 감사, 2026-09): §7 자신의 correction 과 어긋남 — 통과함, `docs/models/E2E_REAL.md` §4.** 실측 재확인: `AutoModelForCausalLM.from_config(...)` 로 만든 `LlamaForCausalLM` 의 순전파가 오늘도 통과합니다 |
 | 2 | `from_pretrained` / 실제 체크포인트 경로 | ~~**미시도.** 1 번 뒤에 있습니다~~ **정정 (문서 감사, 2026-09): 됩니다** — `torch._C._set_default_dtype` 도 지금 존재합니다(실측), `docs/design/DESIGN.md` §11.1 감사(round 1)가 실제 Hub 체크포인트 적재까지 확인했습니다 |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py is_autocast_enabled present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py is_autocast_enabled present -->
 | 3 | `world_size >= 2` | **구현하지 않음.** `ProcessGroupLocal` 이 이름을 대고 거절합니다. 전송 계층이 없습니다 |
 | 4 | `torchnative.nn.federated` (스택의 맨 위 칸) | **비어 있습니다.** 이번 작업은 그 아래 두 칸만 세웠습니다 |
 | 5 | 장치 추상의 가속기 칸 (Metal · Vulkan · NPU) | **없음.** `local` 백엔드는 `devices=["cpu"]` 로만 등록합니다 |
@@ -430,7 +430,7 @@ $PY tests/golden/compare.py                        # 2268/2268 ops=97
 $PY tests/verify_schemas.py         # 255/255
 
 # 이 문서의 판정
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
   "from transformers import AutoModelForCausalLM; print('OK')"
 ```
 

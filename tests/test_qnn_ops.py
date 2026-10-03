@@ -21,7 +21,7 @@ import re
 import sys
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 import torchnative.export.qnn_ops as qnn_ops  # noqa: E402

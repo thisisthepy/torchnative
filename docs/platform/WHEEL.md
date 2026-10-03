@@ -36,7 +36,7 @@ PyPI 의 `torchnative 0.0.1a0` 은 **껍데기**입니다. 열어 보면 `torchn
 | `cp313-abi3-ios_14_0_arm64_iphonesimulator` | 13,270,683 B | 56.9 MB | 3,476,720 B | **계산됨** — 시뮬레이터 (§7.4, `docs/platform/IOS.md`) |
 
 *(이 표의 바이트 수는 2026-08-28 회차의 것입니다. 2026-08-29 재빌드에서는 엔트리 2,687 개,
-휠 13.5 MB, iOS 실기 `_C` 4,160,720 B 로 커졌습니다 — 그 사이 `crates/torch_c` 에 착지한 것들
+휠 13.5 MB, iOS 실기 `_C` 4,160,720 B 로 커졌습니다 — 그 사이 `torchnative/rust/torch_c` 에 착지한 것들
 때문입니다. 네 번째 휠(안드로이드)을 이 회차에 다시 만들지 않아 표 전체를 갱신하지 않았습니다.)*
 
 기존 검증은 그대로입니다 — shim 테스트 **168/168**, 골든 하네스 **2702/2702, ops=118**.
@@ -179,7 +179,7 @@ torch
 torchgen
 ```
 
-**PYTHONPATH 워크플로에서는 이 결손이 보이지 않습니다.** `PYTHONPATH=$PWD/python`
+**PYTHONPATH 워크플로에서는 이 결손이 보이지 않습니다.** `PYTHONPATH=$PWD/torchnative/python`
 은 `torch` 에 대해서만 site-packages 를 가리고, `torchgen` 과 `functorch` 는 **그 밑의 상류
 설치본으로 조용히 해소**됩니다. 즉 지금까지의 "`import torch` 완주" 는 배포본의 3 분의 2 를
 참조 설치가 대주는 상태에서 측정된 것입니다.
@@ -268,7 +268,7 @@ retag: macosx_11_0_universal2 -> macosx_11_0_arm64 (extension is arm64)
 ### 3.4 `_C.abi3.so` 가 빌드 머신 경로를 광고하고 있었다
 
 ```
-$ otool -L python/torch/_C.abi3.so
+$ otool -L torchnative/python/torch/_C.abi3.so
 	/Volumes/macMini/caches/cargo-target-wheel/release/deps/lib_C.dylib   # LC_ID_DYLIB
 ```
 
@@ -491,13 +491,13 @@ pointer_width=64
 suppress_build_script_link_lines=true
 EOF
 
-( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd torchnative/rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=$TP/arm64-iphoneos/lib \
   TORCHNATIVE_PYTHON_FRAMEWORK_DIR=$TP/arm64-iphoneos \
   cargo build --release --target aarch64-apple-ios )
 
-( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd torchnative/rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=$TP/arm64-iphonesimulator/lib \
   cargo build --release --target aarch64-apple-ios-sim )
@@ -860,7 +860,7 @@ dropped" 케이스가 **실제로 드롭이 있었는지와 무관하게** 통�
 
 **변경하지 않은 것**
 
-- `crates/torch_c/` — 한 줄도. §5 의 구멍은 그대로 남겼다
+- `torchnative/rust/torch_c/` — 한 줄도. §5 의 구멍은 그대로 남겼다
 - `scripts/vendor/install_shim.sh` — 소스 트리 동작을 기존 문서대로 유지
 - 벤더링 트리 자체 — 전부 `vendor_torch.sh` 가 생성한 것
 - `pypackpack` 저장소
@@ -895,7 +895,7 @@ dropped" 케이스가 **실제로 드롭이 있었는지와 무관하게** 통�
   이것을 필수로 기록하고 있고, 그 표는 이 결과로 정정되어야 합니다 (§7.3.1). 파일을 치우면
   다시 실패하는 것까지 확인했습니다
 - iOS **시뮬레이터도 `PYO3_CONFIG_FILE` 이 필요하다.** RUST_CROSSBUILD.md §0.5 와
-  `crates/torch_c/build.rs` 주석은 실기 전용으로 적고 있습니다 (§7.1)
+  `torchnative/rust/torch_c/build.rs` 주석은 실기 전용으로 적고 있습니다 (§7.1)
 - 세 타깃 산출물의 배포 대상: 실기 `ios 10.0+`, 시뮬레이터 `iossimulator 14.0+`,
   안드로이드 API 21. 시뮬레이터 쪽이 CPython 의 12.0 보다 높아 **태그 하한을 산출물이 정합니다**
 
@@ -906,8 +906,8 @@ dropped" 케이스가 **실제로 드롭이 있었는지와 무관하게** 통�
 
 **손대지 않은 것**
 
-- `crates/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
-- `crates/torch_c/build.rs` 와 `.cargo/config.toml` — §7.1 이 지적하는 것은 그 두 파일의
+- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
+- `torchnative/rust/torch_c/build.rs` 와 `.cargo/config.toml` — §7.1 이 지적하는 것은 그 두 파일의
   **주석**이지 배선이 아니고, 소유 범위 밖이라 남겼습니다
 - `docs/devices/DEVICE.md` — §7.3.1 이 그 문서의 표를 정정해야 하지만 소유 범위 밖입니다
 - 업로드. 아무것도 PyPI 에 올리지 않았습니다
@@ -1029,10 +1029,10 @@ self-test 는 함수를 시험하는 것이고, 그 함수가 **빌드 경로에
 ```
 $ $BPY scripts/wheel/build.py --target ios-arm64
 vendored torch 2.13.0 (2372 modules) + _C.abi3.so (4,047,888 B)
-  current: 18 recorded inputs, newest crates/torch_c/src/aten.rs, 0.0 h before it
+  current: 18 recorded inputs, newest torchnative/rust/torch_c/src/aten.rs, 0.0 h before it
   current: torch/_C.abi3.so is byte-identical to lib_C.dylib
 scripts/wheel/build.py: .../aarch64-apple-ios/release/lib_C.dylib is stale.
-  crates/torch_c/src/aten.rs was modified 0.2 h (554 s) after lib_C.dylib was written,
+  torchnative/rust/torch_c/src/aten.rs was modified 0.2 h (554 s) after lib_C.dylib was written,
   and it is one of the 18 inputs that build read.
   ...
   Fix: re-run the cross build for this target -- docs/platform/WHEEL.md §7.1 has the exact
@@ -1149,7 +1149,7 @@ scripts/wheel/build.py: .../aarch64-apple-ios/release/lib_C.dylib is stale.
 
 **손대지 않은 것**
 
-- `crates/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
+- `torchnative/rust/torch_c/` · `tests/golden/` · `scripts/` · `vendor/` — 한 줄도
 - 업로드. 아무것도 PyPI 에 올리지 않았습니다
 
 **검증** (전부 종료 코드로 판정)
@@ -1253,7 +1253,7 @@ resolved" 칸을 `symbols_ok and not findings.blind` 로 계산하는데, 이 `f
 
 **손대지 않은 것**
 
-- `crates/torch_c/` · `tests/golden/` — 한 줄도 (다른 에이전트 담당)
+- `torchnative/rust/torch_c/` · `tests/golden/` — 한 줄도 (다른 에이전트 담당)
 - `dist/` — PyPI 에 올라간 0.0.4a0 휠들에 손대지 않았습니다. 검증은 전부 `/tmp` 사본과 실제
   배포된 `torchnative` 저장소의 `dist/` (읽기 전용) 로 했습니다 — `twine check dist/*0.0.4a0*`
   와 sha256 로 그대로임을 확인했습니다

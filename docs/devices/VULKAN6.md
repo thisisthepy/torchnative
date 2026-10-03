@@ -18,11 +18,11 @@ int64 인데 `vulkan.rs` 의 `check_dtype` 은 float32 만 받았기 때문입�
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 29 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs check_storage_dtype present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs index_range present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs embedding_vulkan present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs transpose_batched2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs check_storage_dtype present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs index_range present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs embedding_vulkan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs transpose_batched2d present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_int64_value_beyond_the_bound_refuses_by_name_and_uploads_nothing present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_transformer_block_forwards_on_the_gpu_and_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_embedding_is_bit_identical_to_upstream_and_ran_on_the_gpu present -->

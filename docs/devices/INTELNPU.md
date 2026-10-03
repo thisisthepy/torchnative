@@ -384,15 +384,15 @@ it was not.
 
 ## 3. What was built, and where each claim was measured
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py verdict_execution_devices present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py assert_execution_device present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py linear_ir present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py NPULinear present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py compile_model present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py evidence present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py judge present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py IntelNPUUnsupported present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py dynamo_backend present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py verdict_execution_devices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py assert_execution_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py linear_ir present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py NPULinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py evidence present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py judge present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py IntelNPUUnsupported present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py dynamo_backend present -->
 
 ### 3.1 The verification trap, and how it is closed
 
@@ -738,7 +738,7 @@ reason is counted as a pass.
 
 ## The granularity fix — one oversized leaf no longer refuses a whole model
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py plan_lowering present -->
 <!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
 <!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
 <!-- DOCWATCH: symbol-in-file tests/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
@@ -823,10 +823,10 @@ stop checking.**
 
 ## The weights path — bytes, not Python floats
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py f16_bytes present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/intelnpu.py f16_tensor present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs shim_f16_bytes present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs py_float present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/intelnpu.py f16_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs shim_f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs py_float present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->

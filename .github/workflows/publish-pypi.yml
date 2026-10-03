@@ -199,16 +199,16 @@ jobs:
       - name: vendor
         run: |
           TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash scripts/vendor/vendor_torch.sh
-          cat python/.stamp
+          cat torchnative/python/.stamp
 
       # `native_left=0` is vendor_torch.sh's own measurement that no upstream
       # compiled artefact survived the copy. build.py refuses on a non-zero, but
       # only after the cargo builds have run in whichever job got there first.
       - name: the stamp must say the tree has exactly one hole
         run: |
-          grep -qx 'native_left=0' python/.stamp
-          grep -qx "version=${TORCH_WHEEL_VERSION}" python/.stamp
-          grep -qx 'add_hooks=1' python/.stamp
+          grep -qx 'native_left=0' torchnative/python/.stamp
+          grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/python/.stamp
+          grep -qx 'add_hooks=1' torchnative/python/.stamp
 
       # tar rather than upload-artifact's own walk: the tree is ~2,400 files and
       # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
@@ -454,7 +454,7 @@ jobs:
       # artefacts shipping on 2026-09-11. Here it can only pass, because the
       # directory did not exist five minutes ago; the guard is left alone.
       - name: cross-build _C
-        working-directory: crates/torch_c
+        working-directory: torchnative/rust/torch_c
         env:
           PYO3_CROSS: "1"
           PYO3_CROSS_PYTHON_VERSION: "3.13"

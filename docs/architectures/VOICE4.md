@@ -334,8 +334,8 @@ golden cases                   unchanged -- a meta kernel has no values to compa
 <!-- DOCWATCH: op-implemented aten.kaiser_window.beta -->
 <!-- DOCWATCH: op-implemented aten.sinc.default -->
 <!-- DOCWATCH: op-implemented aten.convolution.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs sum_natural_tag present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs resolve_shape present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs sum_natural_tag present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs resolve_shape present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_sum_meta_kernel_answers_what_upstream_answers present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_view_meta_kernel_answers_what_upstream_answers present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice4.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->

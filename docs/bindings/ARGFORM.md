@@ -1,6 +1,6 @@
 # ARGFORM — the argument-form gaps, and the two owed bindings picked up alongside them
 
-Worktree `work/argform` on develop `eb84708`. Territory: `crates/torch_c/src/bootstrap.py`,
+Worktree `work/argform` on develop `eb84708`. Territory: `torchnative/rust/torch_c/src/bootstrap.py`,
 `tests/test_argform.py`. `test_shim.py`, `aten.rs`, `capture.rs`, `tape.rs`,
 `tensor.rs`, `device.rs`, `methods.json`, `overloads.json`, `tools/`, `torchnative/` were not
 touched, per this round's territory split.

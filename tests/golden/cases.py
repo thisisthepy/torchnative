@@ -2,7 +2,7 @@
 
 The set of *ops* to check is never hardcoded here or anywhere in this
 harness -- `compare.py` gets that list from `_C._aten_implemented()` at run
-time, so it grows automatically as `crates/torch_c` implements more. What
+time, so it grows automatically as `torchnative/rust/torch_c` implements more. What
 *is* necessarily hand-written, per op, is which inputs to feed both sides:
 `aten.full.default`, `aten.add.Tensor` and `aten.mm.default` take
 different arguments and there is no generic way to invent valid calls for
@@ -34,7 +34,7 @@ Every case's `expect` documents what the harness should see:
                    silently excluding.
 
 Below the three ops this harness started with (full/add/mm) are 16 more
-CASE_BUILDERS entries pre-seeded for ops crates/torch_c is actively
+CASE_BUILDERS entries pre-seeded for ops torchnative/rust/torch_c is actively
 implementing but has not landed yet -- see the longer note right before
 `arange_default_cases` for which ops, why, and how `compare.py` keeps them
 from failing the harness before they exist.
@@ -77,7 +77,7 @@ class Case:
 # final report): torch refuses on overflow, `_C` silently wraps/saturates
 # instead of refusing. They are left as `expect="match"` -- NOT "c_error"
 # -- specifically so the harness keeps failing on them until someone fixes
-# crates/torch_c (out of scope for this change) rather than the gap being
+# torchnative/rust/torch_c (out of scope for this change) rather than the gap being
 # quietly filed away as "known and accepted".
 _FULL_FILLS: dict[str, list[tuple[Any, str, str]]] = {
     "float64": [
@@ -106,7 +106,7 @@ _FULL_FILLS: dict[str, list[tuple[Any, str, str]]] = {
             "(RuntimeError: value cannot be converted to type c10::Half "
             "without overflow); _C silently returns inf instead of "
             "refusing. Left as expect=match so the harness keeps failing "
-            "until crates/torch_c is fixed.",
+            "until torchnative/rust/torch_c is fixed.",
         ),
     ],
     "bfloat16": [
@@ -143,7 +143,7 @@ _FULL_FILLS: dict[str, list[tuple[Any, str, str]]] = {
             "cannot be converted to type int without overflow); _C "
             "silently wraps around to int32 min (two's-complement "
             "overflow) instead of refusing. Left as expect=match so the "
-            "harness keeps failing until crates/torch_c is fixed.",
+            "harness keeps failing until torchnative/rust/torch_c is fixed.",
         ),
     ],
     "int16": [
@@ -622,7 +622,7 @@ def _reduced_float_reduce_cases(torch_module, c_module, op, torch_call) -> list[
 # `bfloat16` moved from the gap list to the match list when `mm`/`bmm`/`addmm`
 # started accumulating reduced-precision GEMMs in float32, which is what torch
 # does (`at::opmath_type`, measured bitwise -- see `gemm_accumulate_in` in
-# crates/torch_c/src/aten.rs). candle still has no BF16 matmul kernel; the point
+# torchnative/rust/torch_c/src/aten.rs). candle still has no BF16 matmul kernel; the point
 # is that it is never asked for one, because upstream does not ask for one
 # either. The integral dtypes stay: that gap is real, and float32 cannot stand
 # in for an int64 product.
@@ -1210,7 +1210,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- pre-seeded case builders for ops crates/torch_c does not implement yet --
+# --- pre-seeded case builders for ops torchnative/rust/torch_c does not implement yet --
 #
 # docs/design/C_SURFACE.md traced a small Llama forward+generate() against real
 # upstream torch and found exactly 13 torch.<op> names actually get called
@@ -1218,7 +1218,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 # full, is_floating_point, isin, ones, pow, randint, rsqrt, tensor. `full`
 # already has a builder above (aten.full.default, one of the three ops this
 # harness started with). The other 12 are written here ahead of the
-# implementation that is landing them in crates/torch_c, so the moment an op
+# implementation that is landing them in torchnative/rust/torch_c, so the moment an op
 # shows up in `_C._aten_implemented()` the golden comparison for it is
 # already in place -- no gap between "implemented" and "checked".
 #
@@ -1238,7 +1238,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `randint` was a third entry here, and the reason it gave -- "two independent
 # RNG implementations produce different sequences even given the same seed, so
 # this harness does not attempt to synchronize seeds" -- was true of candle and
-# has not been true since `crates/torch_c/src/rng.rs` ported torch's own
+# has not been true since `torchnative/rust/torch_c/src/rng.rs` ported torch's own
 # generator. The note outlived its reason, and while it did, `randint` really
 # was drawing from the wrong generator and nothing here could see it
 # (docs/kernels/RANDINT.md §8). Its cases are now seeded on both sides and compared
@@ -2936,7 +2936,7 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 # These used to be the module note's third example of an op whose sequence
 # "cannot be matched across two independent RNG implementations even with the
 # same seed". That was true of candle, and it stopped being true the moment
-# `crates/torch_c/src/rng.rs` landed torch's own generator. Nothing noticed,
+# `torchnative/rust/torch_c/src/rng.rs` landed torch's own generator. Nothing noticed,
 # because a comparator that asserts only membership of `[lo, hi)` passes just
 # as happily on a generator that is right as on one that is wrong -- and this
 # one was wrong: `randint` was still drawing from candle while `randn` and
@@ -5696,7 +5696,7 @@ def repeat_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `aten.lift_fresh.default` is the op name most likely to show up in
 # `_aten_implemented()` for the "tensor" entry point; this builder checks
 # it is a true identity (same dtype/shape/values as its input) across the
-# dtypes/shapes this harness already exercises elsewhere. If crates/torch_c
+# dtypes/shapes this harness already exercises elsewhere. If torchnative/rust/torch_c
 # ends up exposing tensor construction under a different name, this
 # builder simply stays pending -- see the module note above.
 
@@ -5763,7 +5763,7 @@ def lift_fresh_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
 # upstream torch (torch 2.13.0) and found 50 `TensorBase` members actually
 # get accessed via a `torch.Tensor` instance -- 49 real API names plus the
 # `__class__` bookkeeping dunder (not a real API, not covered here). Another
-# change is implementing the crates/torch_c side of these; the builders below
+# change is implementing the torchnative/rust/torch_c side of these; the builders below
 # are written ahead of that landing, exactly like the 16 pre-seeded above,
 # so coverage activates the moment each op appears in `_aten_implemented()`
 # -- see the module note above `arange_default_cases` for how `compare.py`
@@ -7540,7 +7540,7 @@ def clone_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, self=kw_c, memory_format=torch_module.channels_last),
             expect="c_error",
             note="memory_format=torch.channels_last is not implemented in torch._C shim -- "
-                 "see reject_memory_format in crates/torch_c/src/aten.rs",
+                 "see reject_memory_format in torchnative/rust/torch_c/src/aten.rs",
         )
     )
     return cases
@@ -9015,7 +9015,7 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
 # right: two independent generators cannot be lined up by a seed. docs/numerics/RNG.md
 # then established that candle's CPU backend *refuses* to be seeded at all, so
 # there was no version of that plan, and torch's own CPU generator was ported
-# into `crates/torch_c/src/rng.rs` instead. That makes the seed mean the same
+# into `torchnative/rust/torch_c/src/rng.rs` instead. That makes the seed mean the same
 # thing on both sides, and these cases were promoted off `_range_check` to say
 # so: seed both generators to the same value inside the run lambdas, then
 # compare the draws **element by element**.
@@ -13516,7 +13516,7 @@ def native_layer_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="c_error",
             note="documented gap: upstream's mean (0) and rstd (nan) disagree about "
                  "what a reduction over no elements is, and one observation is not "
-                 "enough to reproduce that. See crates/torch_c/src/aten.rs.",
+                 "enough to reproduce that. See torchnative/rust/torch_c/src/aten.rs.",
         )
     )
 
@@ -13769,7 +13769,7 @@ def native_group_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
             torch_module, c_module, torch_call, "float32",
             [], (2, 6, 0), 2, 6, 0, 3, expect="c_error",
             note="documented gap: upstream's mean (0) and rstd (nan) disagree about what "
-                 "a reduction over no elements is; see crates/torch_c/src/aten.rs",
+                 "a reduction over no elements is; see torchnative/rust/torch_c/src/aten.rs",
         )
     )
 
@@ -14865,7 +14865,7 @@ def gelu_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `scatter.src` read backwards. The cases below are the three places candle's
 # own `Tensor::gather` and torch disagree (index dtype, out-of-range handling,
 # contiguity), plus the rank rule that is easy to get wrong in the safe-looking
-# direction -- see the kernel's docstring in crates/torch_c/src/aten.rs.
+# direction -- see the kernel's docstring in torchnative/rust/torch_c/src/aten.rs.
 
 _GATHER_SELF = ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3))
 
@@ -15586,7 +15586,7 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
                 torch_module, c_module, torch_call, mask4,
                 ([1, 2, 3, 4], (4,), lhs_dtype), ([9, 8, 7, 6], (4,), rhs_dtype),
                 note=f"both promote to {upstream} ({note}); the condition's dtype takes "
-                     "no part -- see promote_operands in crates/torch_c/src/aten.rs",
+                     "no part -- see promote_operands in torchnative/rust/torch_c/src/aten.rs",
             )
         )
 
@@ -16293,7 +16293,7 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- the five ops docs/kernels/TAIL.md needed to open falcon/bloom/gpt_bigcode ------
 #
-# All five already had a kernel in crates/torch_c/src/aten.rs and showed up in
+# All five already had a kernel in torchnative/rust/torch_c/src/aten.rs and showed up in
 # `_aten_implemented()` before this file had a builder for any of them --
 # `compare.py` was failing every one with `<no case builder registered>`.
 # Each builder below re-measures the claims the kernel's own doc comment
@@ -16302,7 +16302,7 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # Two real, measured discrepancies came out of that re-measurement and are
 # encoded as `expect="c_error"`/`"torch_error"` cases below rather than
-# "fixed" (crates/torch_c/src/aten.rs is out of scope for this task):
+# "fixed" (torchnative/rust/torch_c/src/aten.rs is out of scope for this task):
 #
 #   * `aten.mul.Scalar(bool_tensor, scalar)` -- upstream computes this
 #     *arithmetically* (`True`/`False` read as `1`/`0`, promoted exactly like
@@ -21446,7 +21446,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
 # The six ops `repr(tensor)` dispatches that this shim lacked -- measured
 # with a `TorchDispatchMode` logger wrapped around
 # `torch._tensor_str._str_intern` and diffed against `_aten_implemented()`.
-# crates/torch_c is landing kernels for these concurrently with this change;
+# torchnative/rust/torch_c is landing kernels for these concurrently with this change;
 # they may not appear in `_aten_implemented()` yet (see the "PENDING"
 # printout in compare.py's `run()`), which is expected -- the point of
 # adding builders now is that the harness fails loudly, not silently, the

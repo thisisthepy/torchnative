@@ -402,9 +402,9 @@ $PY tests/golden/compare.py                  7763/7763, ops=168
 (docs/verification/DOCWATCH.md). `339` 은 이 회차의 스냅숏이므로 하한으로만 겁니다 — 이 저장소의
 다른 문서가 `smoke_ok` 를 다루는 방식과 같습니다.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _ZipWriter present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs snapshot present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs storage_snapshot present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _ZipWriter present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs snapshot present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs storage_snapshot present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit present -->
 <!-- DOCWATCH: count smoke_ok ge 339 -->
 

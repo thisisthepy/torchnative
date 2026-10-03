@@ -85,8 +85,8 @@ from torchnative.quant import TorchnativeConfig
 m = AutoModelForCausalLM.from_pretrained(name, quantization_config=TorchnativeConfig("q8_0"))
 ```
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/quant/hf.py TorchnativeConfig present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/quant/hf.py TorchnativeHfQuantizer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/quant/hf.py TorchnativeConfig present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/quant/hf.py TorchnativeHfQuantizer present -->
 
 ---
 
@@ -286,7 +286,7 @@ format='q4_k' cannot be applied to 180 layer(s), so nothing was loaded:
 **양자화된 것처럼 보이는데 실은 전부 밀집인 모델**이 손에 남고 — `q4_k` + 576 조합에서는
 정확히 *전부* 입니다 — 그것이 이 저장소가 반복해서 대가를 치른 "성공처럼 읽히는 실패" 입니다.
 
-**규칙을 두 번 쓰지 않았습니다.** 블록 크기는 `crates/torch_c/src/quant.rs` 에만 있습니다.
+**규칙을 두 번 쓰지 않았습니다.** 블록 크기는 `torchnative/rust/torch_c/src/quant.rs` 에만 있습니다.
 플러그인은 후보 폭의 1×N 텐서를 **실제로 양자화해 보고** 같은 거절을 받습니다
 (`_probe_shape`). 그래서 벽이 움직이면 검사도 함께 움직이고, 이 저장소가 모르는 블록 크기를
 가진 형식이 나중에 들어와도 편집이 필요 없습니다.
@@ -372,7 +372,7 @@ SmolLM2-135M 의 `config.json` 은 `bfloat16` 을 요청합니다. candle 의 `Q
 | `torchnative/quant/hf.py` | **새 파일.** `TorchnativeConfig` · `TorchnativeHfQuantizer` · `_QuantizeOnLoad` · `_LoadReport` · `_register` |
 | `torchnative/quant/__init__.py` | `QuantizedLinear.pending_from_linear` · `QuantizedLinear.adopt` · `forward` 의 미착 가중치 거절 · PEP 562 `__getattr__` |
 | `tests/test_shim.py` | 4 개 테스트 (329 → 333) |
-| `crates/torch_c/src/` | **변경 없음.** Rust 는 한 줄도 고치지 않았습니다 |
+| `torchnative/rust/torch_c/src/` | **변경 없음.** Rust 는 한 줄도 고치지 않았습니다 |
 
 ### 9.1 `QuantizedLinear` 를 다시 만들지 않았습니다
 
@@ -435,7 +435,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 cd /Volumes/macMini/worktrees/bw-hfq
 bash scripts/vendor/vendor_torch.sh && bash scripts/vendor/install_shim.sh
 
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY <스크립트>
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY <스크립트>
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/hfq-scratch/` 에 있습니다:

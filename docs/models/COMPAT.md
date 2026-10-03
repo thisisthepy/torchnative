@@ -238,7 +238,7 @@ family, all bookkeeping around a cache this shim never populates (`__enter__`/`_
   write; unknown device types still refuse on read exactly as before, until a `set` gives them a
   value.
 
-All five: `crates/torch_c/src/bootstrap.py`, `_install_autocast`.
+All five: `torchnative/rust/torch_c/src/bootstrap.py`, `_install_autocast`.
 
 ### 3.2 `TensorBase.permute` and `Tensor.T` — binding gaps, not kernel gaps
 
@@ -254,7 +254,7 @@ reachable as `torch.permute(x, dims)` (an entry existed in `overloads.json`), an
   `tensorbase` member gets by default — added as a computed `property` calling the now-wired
   `permute` member.
 
-Both: `crates/torch_c/src/methods.json` (`permute`), `crates/torch_c/src/bootstrap.py`
+Both: `torchnative/rust/torch_c/src/methods.json` (`permute`), `torchnative/rust/torch_c/src/bootstrap.py`
 (`_install_tensor_T`).
 
 ### 3.3 What those fixes revealed once applied
@@ -290,7 +290,7 @@ five component ops (`aminmax` is the exception) are still missing kernels regard
 
 None of `mixtral`'s five (§1: `aminmax`, `index_add_`, `nonzero`, `scatter_.value`, `zeros`), `gpt2`'s
 `tril`, or `opt`'s `all` are reachable from `bootstrap.py`/`overloads.json`/`methods.json` alone —
-each is a genuinely missing aten kernel (`crates/torch_c/src/aten.rs`, out of territory this session,
+each is a genuinely missing aten kernel (`torchnative/rust/torch_c/src/aten.rs`, out of territory this session,
 owned by another agent). `bert`'s and `falcon`'s `__getitem__` failure is the indexing region another
 agent is rewriting right now, also out of territory by name. None were implemented.
 
@@ -361,7 +361,7 @@ reason — 4.x's older attention-masking and MoE code calls different primitives
 - `TensorBase.permute` — `methods.json`.
 - `Tensor.T` — `bootstrap.py`.
 
-**(b) a kernel we do not have** (`crates/torch_c/src/aten.rs`, out of territory this session, owned by
+**(b) a kernel we do not have** (`torchnative/rust/torch_c/src/aten.rs`, out of territory this session, owned by
 another agent this pass):
 
 | op | needed by | 4.x-specific? |

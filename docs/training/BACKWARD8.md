@@ -384,11 +384,11 @@ its *derivative*, which the golden harness does not count.
 | 5 | **Any per-dispatch cost.** | Nine agents were on the machine. §10 row 1 stands unchanged, and this round deliberately reports no time at all |
 | 6 | **A preallocated, slice-written KV cache.** | §2.1 measures the cache transformers actually ships. A cache that wrote in place would be §2.4's shape, and no such implementation was run |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs forgive_own_write present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs EAGER_MAX_NODES present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs release_values present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs eager_tape_bytes present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs batch_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs forgive_own_write present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs EAGER_MAX_NODES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs release_values present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_tape_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs batch_norm_backward present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too present -->

@@ -35,7 +35,7 @@ records; they are the front door.
 
 This directory holds **documents only**. The three non-Markdown files that
 used to sit here have moved to where the thing they are is kept:
-`_profile_decode.py` and `_profile_sdpa_shapes.py` to `benches/` (they are
+`_profile_decode.py` and `_profile_sdpa_shapes.py` to `tests/bench/` (they are
 run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
 
 ## The check that keeps this true

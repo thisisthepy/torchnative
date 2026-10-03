@@ -98,7 +98,7 @@ import test_shim as _shim_tests
 import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_SRC = os.path.join(_HERE, "..", "crates", "torch_c", "src")
+_SRC = os.path.join(_HERE, "..", "torchnative", "rust", "torch_c", "src")
 
 # Four (source dtype, target dtype) pairs. Three are the ones §4.1 measured as
 # silently answering on the host; `bool->uint8` is the fourth it named and is
@@ -305,7 +305,7 @@ def test_no_aten_kernel_reaches_a_cross_file_readback_unrefused():
     """
     parsed = _shim_tests._aten_rs_functions()
     if parsed is None:
-        _skip.skip("   (skipped cross-file readback scan: crates/torch_c/src is "
+        _skip.skip("   (skipped cross-file readback scan: torchnative/rust/torch_c/src is "
                    "not beside this file -- installed rather than in-tree)")
         return
     bodies, text = parsed

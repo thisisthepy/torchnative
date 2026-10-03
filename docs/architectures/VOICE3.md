@@ -296,7 +296,7 @@ place its dtype set differs from `upsample_nearest2d`'s.
 Two hand-offs, both in files this round was told not to edit. Each is asserted from this side so
 neither can be forgotten.
 
-**(a) `MPS_HOST_READBACK_OPS` in `crates/torch_c/src/device.rs`.** Twelve of the fifteen
+**(a) `MPS_HOST_READBACK_OPS` in `torchnative/rust/torch_c/src/device.rs`.** Twelve of the fifteen
 registrations pull the tensor to the host and must be declared there:
 
 ```
@@ -319,7 +319,7 @@ one family in this file that silently computed on the CPU with an `mps` tensor, 
 saying so. The read is now spelled at each of the six dispatch targets, which puts all twelve on
 the derived set — which is how the list above was produced rather than written by hand.
 
-**(b) Three `_install_nn` entries in `crates/torch_c/src/bootstrap.py`.** `im2col`, `col2im` and
+**(b) Three `_install_nn` entries in `torchnative/rust/torch_c/src/bootstrap.py`.** `im2col`, `col2im` and
 `upsample_nearest1d` are reached upstream *only* through `torch._C._nn.*` — there is no
 `torch.im2col` and no `Tensor.im2col` (checked), so a row in `overloads.json`/`methods.json`
 would invent a door upstream does not have. Each needs one entry shaped like
@@ -363,19 +363,19 @@ No timings: four other agents were running (docs/perf/PERF.md's rule).
 <!-- DOCWATCH: op-implemented aten.std.default -->
 <!-- DOCWATCH: op-implemented aten.std.dim -->
 <!-- DOCWATCH: op-implemented aten.std.correction -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json diag present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json i0 present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json var present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json std present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json kaiser_window present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json _unique2 present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json diag present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json var present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json std present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs calc_i0_f32 present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs kaiser_window_default present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs var_reduce present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs col2im_default present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json diag present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json i0 present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json var present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json std present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json kaiser_window present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json _unique2 present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json diag present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json var present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json std present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs calc_i0_f32 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs kaiser_window_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_reduce present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs col2im_default present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_i0_is_bit_identical_to_upstream_across_the_whole_range present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_col2im_sums_overlapping_windows_rather_than_overwriting present -->
 <!-- DOCWATCH: symbol-in-file tests/test_voice3.py test_var_and_std_clamp_the_divisor_at_zero_so_an_overshoot_is_inf_not_nan present -->

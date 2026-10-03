@@ -15,11 +15,11 @@ Two things make the comparison fair, both inherited from PERF.md §0:
 Usage (one command, from the repo root)::
 
     PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python \
-        python benches/ab_upstream.py
+        python tests/bench/ab_upstream.py
 
     # or pick a suite / more rounds
-    ... benches/ab_upstream.py --suite ops --rounds 5
-    ... benches/ab_upstream.py --suite model
+    ... tests/bench/ab_upstream.py --suite ops --rounds 5
+    ... tests/bench/ab_upstream.py --suite model
 
 Suites:
 
@@ -45,7 +45,7 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SHIM_PATH = os.path.join(REPO, "python")
+SHIM_PATH = os.path.join(REPO, "torchnative", "python")
 
 WARMUP = 5
 REPS = 15

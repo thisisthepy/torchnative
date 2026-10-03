@@ -3,9 +3,9 @@ name = "wasm_probe"
 version = "0.0.0"
 edition = "2021"
 
-# Deliberately NOT a dependency of `crates/torch_c`, and deliberately not in a
+# Deliberately NOT a dependency of `torchnative/rust/torch_c`, and deliberately not in a
 # workspace with it -- the same arrangement, and for the same reason, as
-# `crates/vulkan_probe`. This crate exists to answer one question: does the candle
+# `torchnative/rust/vulkan_probe`. This crate exists to answer one question: does the candle
 # surface `torch_c` actually calls compile for `wasm32`? Adding a wasm target's
 # constraints to the real extension module before that is answered would put
 # the three platforms that currently build at risk for nothing.
@@ -16,7 +16,7 @@ edition = "2021"
 # PyO3 to be embedded in.
 [lib]
 name = "wasm_probe"
-# `cdylib` because `crates/torch_c` is a `cdylib`, and that is not a cosmetic
+# `cdylib` because `torchnative/rust/torch_c` is a `cdylib`, and that is not a cosmetic
 # difference: an `rlib` build never invokes the linker, so it cannot tell you
 # whether the undefined `_Py*` symbols an `extension-module` build leaves
 # behind can actually be resolved on the target. `rlib` is kept alongside so a
@@ -25,7 +25,7 @@ name = "wasm_probe"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Same version and same feature pinning as `crates/torch_c/Cargo.toml:36`.
+# Same version and same feature pinning as `torchnative/rust/torch_c/Cargo.toml:36`.
 # Accelerate is Apple-only and is not requested here; on wasm32 candle falls
 # back to the `gemm` CPU path, which is what a wasm build would use anyway.
 candle-core = { version = "0.11.0", default-features = false }
@@ -47,7 +47,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 # arrangement as `vk_probe`'s `wgpu-route`. `cargo build` answers layer 1;
 # `cargo build --features pyo3-route` answers layer 2.
 #
-# Same version and same two features as `crates/torch_c/Cargo.toml:23`, because
+# Same version and same two features as `torchnative/rust/torch_c/Cargo.toml:23`, because
 # the question is not "does some PyO3 build for wasm" but "does *our* pairing
 # -- abi3-py313 plus extension-module -- build for wasm".
 [features]

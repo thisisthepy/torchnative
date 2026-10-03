@@ -52,7 +52,7 @@ import tempfile
 # whole file then crashed before running one test, and the suite reported
 # 1209 ok / 0 FAIL rather than a failure, because a crashed file has no
 # result to report.
-_SRC_MAIN = str(pathlib.Path(__file__).resolve().parents[1] / "python")
+_SRC_MAIN = str(pathlib.Path(__file__).resolve().parents[1] / "torchnative" / "python")
 if _SRC_MAIN not in sys.path:
     sys.path.append(_SRC_MAIN)
 

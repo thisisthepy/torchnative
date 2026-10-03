@@ -1,7 +1,7 @@
 # BIND4 — four small `bootstrap.py` items, plus one handed off mid-round
 
 Worktree `work/bind4` on develop `26ef12c`, vendored tree assembled fresh. torch 2.13.0
-upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `crates/torch_c/src/
+upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `torchnative/rust/torch_c/src/
 bootstrap.py`, `tests/golden/reach_allow.json`, and a new `tests/
 test_bind4.py`. `aten.rs`, `tensor.rs`, `dtype.rs`, `device.rs`, `capture.rs`, `tape.rs` were
 not touched. `test_rnn.py` and `test_tail2.py` were each touched once, at the exact spot their
@@ -295,7 +295,7 @@ complex64 gate (`"_to_copy" in msg and "complex64" in msg`) — not merely "stil
 caller — confirmed by `reach.py`'s static scan failing exactly there before the entry was
 removed (`"a spelling now reaches it (or its kernel is gone)"`).
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_tensor_complex_parts present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_tensor_complex_parts present -->
 
 ---
 

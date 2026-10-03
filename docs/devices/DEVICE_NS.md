@@ -1,14 +1,14 @@
 # `torchnative.device` — a namespace this project owns, and what each name resolves to
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py Availability present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py NpuResolution present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py EagerDevice present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py CompiledDevice present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py EagerUseRefused present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py NpuUnresolved present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py NPU_CANDIDATES present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/_module_to.py make present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/_module_to.py install present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py Availability present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NpuResolution present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py EagerDevice present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py CompiledDevice present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py EagerUseRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NpuUnresolved present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NPU_CANDIDATES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py make present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py install present -->
 <!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_mps_availability_is_measured_not_declared present -->
 <!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_npu_resolves_differently_per_host present -->
 <!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_npu_never_resolves_to_the_cpu present -->

@@ -38,7 +38,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, os.pardir, "crates", "torch_c", "src")
+SRC = os.path.join(HERE, os.pardir, "torchnative", "rust", "torch_c", "src")
 TABLES = (
     ("overloads.json", os.path.join(SRC, "overloads.json")),
     ("methods.json", os.path.join(SRC, "methods.json")),
@@ -236,7 +236,7 @@ def _normalise(schema: str) -> str:
 # the same reason `tests/golden/compare.py` goes to a second process.
 
 REPO_ROOT = os.path.abspath(os.path.join(HERE, os.pardir))
-VENDOR_DIR = os.path.join(REPO_ROOT, "python")
+VENDOR_DIR = os.path.join(REPO_ROOT, "torchnative", "python")
 VENDOR_SHIM = os.path.join(VENDOR_DIR, "torch", "_C.abi3.so")
 
 _SHIM_REPORT_SCRIPT = r"""

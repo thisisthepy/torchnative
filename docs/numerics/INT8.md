@@ -42,7 +42,7 @@ fetched 2026-09-06 (`main` at `ddf1b879dc3a`, committed 2026-09-04) declares
 and `grep -w I8` over that file returns **nothing**. So the cheap answer — bump the
 pin — does not exist. Whatever this costs, it costs a fork.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml '[patch.crates-io]' present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '[patch.crates-io]' present -->
 
 ### 1.2 The fork, and where it lives
 
@@ -58,7 +58,7 @@ other checkout, CI and the wheel builds failed at resolution. It is now:
 
 | | |
 |---|---|
-| `crates/torch_c/Cargo.toml` | `[patch.crates-io] candle-core = { path = "../../vendor/candle-core" }` |
+| `torchnative/rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-core = { path = "../../vendor/candle-core" }` |
 | `vendor/candle-core/` | **committed.** The published crate plus the patch, 113 files, 1.9 MB |
 | `vendor/int8-candle-0.11.0-cpu.patch` | the only place the fork is edited |
 | `scripts/vendor/vendor_candle.sh` | regenerates the tree; `--check` rebuilds it in a temp dir and diffs |
@@ -104,9 +104,9 @@ nothing here can compile (§5 item 4 still stands for CUDA).
 
 **The wheel build refused the fork, and so would it have refused the absolute path.**
 `scripts/wheel/build.py`'s freshness check reads cargo's dep-info and treated any input outside
-`crates/torch_c` as "built from a different checkout" — and a path dependency's sources are in
+`torchnative/rust/torch_c` as "built from a different checkout" — and a path dependency's sources are in
 that dep-info. The gate's `test_toolguard_wheel_staging.py` went red on it
-(`the build read 52 input(s) from outside .../crates/torch_c, e.g. .../vendor/candle-core/src/accelerate.rs`).
+(`the build read 52 input(s) from outside .../torchnative/rust/torch_c, e.g. .../vendor/candle-core/src/accelerate.rs`).
 The rule is now the crate plus each `[patch]` `path` that resolves **inside the repository**:
 an input elsewhere in the repository, or a `[patch]` at an outside absolute path, is still
 foreign. `build.py --self-test` carries both as cases, and the fork case was run red before
@@ -117,8 +117,8 @@ made to drop `tokenizers` from the graph — the diff below. That is a separate 
 declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that
 `candle-core` has no registry `source`.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml '"../../vendor/candle-core"' present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml 'candle-vendor' absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '"../../vendor/candle-core"' present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml 'candle-vendor' absent -->
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_int8.py test_the_committed_fork_is_the_pinned_crate_plus_the_patch present -->
 
@@ -160,13 +160,13 @@ moves to AGREES — which is why neither crate is vendored on its own.
 
 | | |
 |---|---|
-| `crates/torch_c/Cargo.toml` | `[patch.crates-io] candle-metal-kernels = { path = "../../vendor/candle-metal-kernels" }` |
+| `torchnative/rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-metal-kernels = { path = "../../vendor/candle-metal-kernels" }` |
 | `vendor/candle-metal-kernels/` | **committed.** The published crate plus the patch, 984 KB |
 | `vendor/int8-candle-metal-kernels-0.11.0.patch` | the only place this fork is edited |
 | `scripts/vendor/vendor_candle.sh` | now loops over **both** crates; `--check` covers both |
 
 Pinned by sha256 `242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e`,
-which is the `checksum` `crates/torch_c/Cargo.lock` already recorded for the
+which is the `checksum` `torchnative/rust/torch_c/Cargo.lock` already recorded for the
 registry package — cargo's own pin, not one chosen here. The patch is **51
 added lines across 12 files and no new shader body**: `DType` gains a variant,
 `utils.rs` gains `impl EncoderParam for i8`, and the rest are instantiation

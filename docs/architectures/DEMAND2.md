@@ -12,7 +12,7 @@ Method: same as DEMAND1.md — `transformers` 5.15.1, `torch` 2.13.0 upstream as
 "_aten_implemented") else "upstream")` as the first line of every script. Build:
 `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-kern2`,
 `TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib`, `cargo build --release` in
-`crates/torch_c`, then `bash scripts/vendor/install_shim.sh`. Scratch scripts under `/tmp/` (not
+`torchnative/rust/torch_c`, then `bash scripts/vendor/install_shim.sh`. Scratch scripts under `/tmp/` (not
 committed).
 
 ---
@@ -373,7 +373,7 @@ keys, `linalg_vector_norm.default` shares `norm_pow_walk`).
 Built via the instructed pipeline throughout:
 `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-kern2`,
 `TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib` exported before every run, `cargo build
---release` in `crates/torch_c`, `bash scripts/vendor/install_shim.sh` after.
+--release` in `torchnative/rust/torch_c`, `bash scripts/vendor/install_shim.sh` after.
 
 ```
 $ PYTHON=$PY sh tests/run.sh
@@ -408,9 +408,9 @@ every prior round's entries in the same two tests):
 
 `git status --short` was checked before, during and after this round; nothing outside
 `docs/architectures/DEMAND.md`, `docs/architectures/DEMAND1.md` (one marker flip, §6 below), `docs/architectures/DEMAND2.md` (this file),
-`crates/torch_c/src/aten.rs`, `crates/torch_c/src/bootstrap.py`, `crates/torch_c/src/overloads.json`,
+`torchnative/rust/torch_c/src/aten.rs`, `torchnative/rust/torch_c/src/bootstrap.py`, `torchnative/rust/torch_c/src/overloads.json`,
 `tests/test_shim.py` and `tests/golden/cases.py` moved.
-`crates/torch_c/src/tensor.rs`, `dtype.rs`, `flash.rs`, `bootstrap.py`'s untouched regions, and the
+`torchnative/rust/torch_c/src/tensor.rs`, `dtype.rs`, `flash.rs`, `bootstrap.py`'s untouched regions, and the
 vendored tree were not modified (`tensor.rs` in particular — another agent's worktree was
 reported editing it concurrently; nothing in this round touched it).
 

@@ -20,8 +20,8 @@
 > 트랜스포머는 여전히 0 개**입니다. 또 §4.1 의 "33 케이스 비트 동일" 은 kosmickrisp 에서만 참이었고
 > MoltenVK 기본 설정에서는 `div` 가 어긋났습니다 — VULKAN5.md §3.1.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs SHADER_DISPATCHES present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs maybe_upload present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs SHADER_DISPATCHES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs maybe_upload present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_every_taught_op_ran_on_the_gpu_or_says_it_did_not present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_matmul_residue_is_fma_contraction_and_not_a_defect present -->
 
@@ -145,7 +145,7 @@ NotImplementedError: device not available in torch._C shim: vulkan
 
 ### 3.1 셰이더 아홉 개 — 그리고 툴체인 대조군 하나
 
-`crates/torch_c/shaders/` 가 1개에서 **10개**가 되었습니다.
+`torchnative/rust/torch_c/shaders/` 가 1개에서 **10개**가 되었습니다.
 
 ```
 add_f32        (기존)     sub_f32   mul_f32   div_f32          원소별 이항

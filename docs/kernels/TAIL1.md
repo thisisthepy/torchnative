@@ -292,26 +292,26 @@ The ops now in `_aten_implemented()`:
 
 and the table rows that make six of them callable:
 
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json broadcast_tensors present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json logical_and present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json acos present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json argsort present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json max_pool1d present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json _is_all_true present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json _is_all_true present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json argsort present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json broadcast_tensors present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json logical_and present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json acos present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json argsort present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json max_pool1d present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json _is_all_true present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json _is_all_true present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json argsort present -->
 
 There is deliberately **no** `torch.linalg_qr` or `torch.upsample_nearest2d` row, and upstream
 has neither name:
 
 <!-- DOCWATCH: hasattr linalg_qr false -->
 <!-- DOCWATCH: hasattr upsample_nearest2d false -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json linalg_qr absent -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json upsample_nearest2d absent -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json linalg_qr absent -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json upsample_nearest2d absent -->
 
 ### 6.1 One entry outside this round's territory
 
-`crates/torch_c/src/device.rs`'s `MPS_HOST_READBACK_OPS` gained four names (`acos`, `linalg_qr`,
+`torchnative/rust/torch_c/src/device.rs`'s `MPS_HOST_READBACK_OPS` gained four names (`acos`, `linalg_qr`,
 `max_pool1d`, `upsample_nearest2d`) and its length went 56 → 60. That list is a **safety
 ratchet**: an op that reads device bytes back to the host and is not on it computes a wrong
 answer on `mps` instead of refusing, and `test_the_mps_readback_list_is_what_the_kernels_actually_do`

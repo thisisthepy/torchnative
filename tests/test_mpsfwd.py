@@ -105,7 +105,7 @@ def test_the_ops_that_left_the_refusal_list_no_longer_read_back():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        _skip.skip("   (skipped: crates/torch_c/src/aten.rs is not beside this file "
+        _skip.skip("   (skipped: torchnative/rust/torch_c/src/aten.rs is not beside this file "
               "-- installed rather than in-tree)")
         return
     bodies, text = parsed

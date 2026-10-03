@@ -1,7 +1,7 @@
 # RNN — `lstm`, `upsample_linear1d`, and the name that was not a kernel
 
 Worktree `work/rnn` on develop `a523ae4`, vendored tree assembled fresh. torch 2.13.0 upstream
-(`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `crates/torch_c/src/aten.rs`,
+(`/Volumes/macMini/caches/spike-venv/bin/python`). Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `overloads.json`, `methods.json`, `tests/golden/cases.py`, and a new
 `tests/test_rnn.py`. `tensor.rs`, `dtype.rs`, `bootstrap.py`, `capture.rs`,
 `tape.rs`, `device.rs`, `scripts/wheel/` and `torchnative/` were not touched.

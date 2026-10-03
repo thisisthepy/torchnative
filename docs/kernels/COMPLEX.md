@@ -36,7 +36,7 @@ this stops being true.
 
 ## 1. The tag half is already done
 
-`crates/torch_c/src/dtype.rs` enumerates `Complex32`, `Complex64` and `Complex128`
+`torchnative/rust/torch_c/src/dtype.rs` enumerates `Complex32`, `Complex64` and `Complex128`
 alongside every other name the vendored tree uses, with the three aliases
 (`chalf`, `cfloat`, `cdouble`), the `abbr` entries (`c32`/`c64`/`c128`), correct
 `itemsize` (2/8/16), and both directions of the real↔complex mapping:
@@ -57,7 +57,7 @@ and `torch/utils/_dtype_abbrs.py` build tables over `torch.complex64` while
 `import torch` is still running. A shim without these names cannot finish the
 import.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/dtype.rs Complex128 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/dtype.rs Complex128 present -->
 
 ---
 

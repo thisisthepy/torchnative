@@ -142,7 +142,7 @@ which takes `generator->random64()` regardless of `scalar_t`. `bernoulli_` is **
 *32-bit* word) — that asymmetry is the trap here, and reading it wrong desynchronises the stream at
 half the rate rather than producing visibly wrong values.
 
-`crates/torch_c/src/rng.rs` already has `uniform_fill_f64` — `random64()` through
+`torchnative/rust/torch_c/src/rng.rs` already has `uniform_fill_f64` — `random64()` through
 `transformation::uniform_real<double>`, with the `mul_add` contraction docs/numerics/RNG.md §1.2 measured.
 So **the answer is yes**: a fixed seed makes shim and upstream dropout comparable value for value,
 and the golden cases below do that rather than settling for a distributional check.
@@ -162,14 +162,14 @@ own siblings. It is out of reach of the composite (`empty_like` is always contig
 
 **One change, three names, because the composite cannot be split from its primitives.**
 
-* `crates/torch_c/src/aten.rs` — `aten.bernoulli_.float`, a new kernel.
-* `crates/torch_c/src/aten.rs` — `aten.div_.Scalar`, one line onto the existing
+* `torchnative/rust/torch_c/src/aten.rs` — `aten.bernoulli_.float`, a new kernel.
+* `torchnative/rust/torch_c/src/aten.rs` — `aten.div_.Scalar`, one line onto the existing
   `arith_inplace_scalar` helper. The out-of-place `div.Scalar` and the in-place
   `add_`/`sub_`/`mul_` scalar forms were all already there; this was the hole in the middle of them.
-* `crates/torch_c/src/methods.json` — `bernoulli_`, both overloads in the vendored `.pyi`'s order
+* `torchnative/rust/torch_c/src/methods.json` — `bernoulli_`, both overloads in the vendored `.pyi`'s order
   (`.Tensor` then `.float`). Only `.float` has a kernel; `.Tensor` resolves and then refuses, which
   is what `methods.json`'s own README says an entry means.
-* `crates/torch_c/src/bootstrap.py` — `torch.dropout` / `torch.dropout_` rewritten from a
+* `torchnative/rust/torch_c/src/bootstrap.py` — `torch.dropout` / `torch.dropout_` rewritten from a
   `dispatch("aten.dropout.default", ...)` stub into `at::native::_dropout_impl`, which is the
   decomposition above.
 
@@ -522,4 +522,4 @@ claim: the kernels were all here already (§3, §4), and what was missing was tw
 
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten.bernoulli_.float -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs native_dropout_backward present -->

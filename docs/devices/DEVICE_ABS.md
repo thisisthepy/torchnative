@@ -26,7 +26,7 @@
 ## 1. 무엇을 어떻게 쟀나
 
 **설계부터 하지 않았습니다.** 같은 프로브 스크립트를 두 torch 에 대해 돌리고 전사(transcript) 를
-줄 단위로 비교하는 방식입니다 — 한쪽은 벤더 트리(`PYTHONPATH=$PWD/python`,
+줄 단위로 비교하는 방식입니다 — 한쪽은 벤더 트리(`PYTHONPATH=$PWD/torchnative/python`,
 `TORCH_USE_RTLD_GLOBAL=1`), 다른 쪽은 spike-venv 의 상류 torch. 각 줄은
 `이름 | 값` 또는 `이름 | <예외타입: 메시지>` 이고, **아무것도 단언하지 않습니다.** 전사가 곧
 측정값입니다.
@@ -266,7 +266,7 @@ MPS 가 있는 이 호스트에서 상류를 직접 쟀습니다.
 `resolve()` 가 여전히 `cpu` 하나만 받습니다. **백엔드를 늘리지 않았습니다** — 늘린 것은 라벨이
 정확한가, 그리고 라벨을 소비하는 길이 뚫려 있는가입니다.
 
-### 5.1 라벨 (`crates/torch_c/src/device.rs`)
+### 5.1 라벨 (`torchnative/rust/torch_c/src/device.rs`)
 
 - `DEVICE_TYPES` — 상류 20 개 목록. 생성 시점 검증.
 - `parse_device_string` — 빈 문자열 · 공백 · 대문자 · 음수 인덱스 · 비숫자 인덱스를 상류와
@@ -604,7 +604,7 @@ PYTHON=$PY sh tests/run.sh       > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 표면 대조: 같은 프로브를 두 torch 로 돌리고 전사를 diff
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
-  PYTHONPATH=$PWD/python $PY <probe> > ours.txt
+  PYTHONPATH=$PWD/torchnative/python $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 ```
 

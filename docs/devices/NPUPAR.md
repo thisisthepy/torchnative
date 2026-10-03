@@ -117,7 +117,7 @@ But the compile *path* is not all foreign, and the two Python-side pieces are no
 * **The IR text is built in Python.** `linear_ir` produces the XML document as a Python
   string. GIL held.
 * **The weights go through `torch._C._shim_f16_bytes`, and it does not release the GIL.**
-  `crates/torch_c/src/tensor.rs`, `shim_f16_bytes`, takes `py: Python<'py>` and **never calls
+  `torchnative/rust/torch_c/src/tensor.rs`, `shim_f16_bytes`, takes `py: Python<'py>` and **never calls
   `py.allow_threads`**. Holding a `Python<'py>` token *is* holding the GIL in pyo3; the
   whole body — `flatten_all`, `contiguous`, `reduced::to_dtype` to F16, `to_vec1`, and the
   element-by-element `to_bits().to_le_bytes()` loop — runs with it held. For a Qwen3
@@ -285,4 +285,4 @@ The standing check that no thread pool arrived without this document being revis
 * [openvinotoolkit/openvino#27366](https://github.com/openvinotoolkit/openvino/issues/27366) — "Is Core threading safe?", closed stale, unanswered
 * [CPython `ctypes` documentation](https://docs.python.org/3/library/ctypes.html) — `CDLL` releases the GIL; `PyDLL` does not
 * `openvino/include/openvino/runtime/core.hpp` and `openvino/c/ov_core.h`, from the 2026.3.1 win_amd64 and 2025.4.1 manylinux wheels — no thread-safety statement
-* `crates/torch_c/src/tensor.rs`, `shim_f16_bytes` — takes `Python<'py>`, no `allow_threads`
+* `torchnative/rust/torch_c/src/tensor.rs`, `shim_f16_bytes` — takes `Python<'py>`, no `allow_threads`

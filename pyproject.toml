@@ -79,12 +79,12 @@ test = ["torch>=2.13,<2.14"]
 # `import main.torchnative` under the old `torchnative/src/main` layout).
 # PROJECT.md.
 [tool.setuptools]
-package-dir = { "" = "python" }
+package-dir = { "" = "torchnative/python" }
 
 # Three upstream packages, not one -- `torch` alone looked fine for a long time
 # because PYTHONPATH shadowed only that one. PROJECT.md.
 [tool.setuptools.packages.find]
-where = ["python"]
+where = ["torchnative/python"]
 include = [
     "torchnative*",
     "torch", "torch.*",

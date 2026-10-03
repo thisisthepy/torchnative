@@ -411,7 +411,7 @@ print(json.dumps(out))
     _root = os.path.abspath(__file__)
     for _ in range(2):
         _root = os.path.dirname(_root)
-    env["PYTHONPATH"] = os.path.join(_root, "python")
+    env["PYTHONPATH"] = os.path.join(_root, "torchnative", "python")
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     proc = subprocess.run([sys.executable, "-c", script],
                           capture_output=True, text=True, env=env, timeout=180)

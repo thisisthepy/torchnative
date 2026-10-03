@@ -315,7 +315,7 @@ scripts/vendor/vendor_torch.sh && scripts/vendor/install_shim.sh     # or the sh
 cd tests
 
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D --deadline 520
-PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
                                            $PY agree_sweep.py --replay  --dir $D --deadline 500
 $PY agree_sweep.py --report --dir $D
 ```

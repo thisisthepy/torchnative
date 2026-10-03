@@ -148,7 +148,7 @@ has. Now it is accepted, widened, and disclosed:
 _WEIGHT_DTYPES = (torch.int8,)
 ```
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/quant/hf.py _WEIGHT_DTYPES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/quant/hf.py _WEIGHT_DTYPES present -->
 
 ```
 dtype=torch.int8 was read as a request about *weights*, not activations. The weights

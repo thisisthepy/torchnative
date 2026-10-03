@@ -122,7 +122,7 @@ from binfmt import (describe, elf_dynamic, elf_info, macho_arches,  # noqa: E402
                     macho_info, wasm_info)
 
 REPO = Path(__file__).resolve().parents[2]
-SRC = REPO / "python"
+SRC = REPO / "torchnative" / "python"
 
 # The two artefacts the vendor scripts produce. Their absence is the whole
 # failure mode this script exists to catch, so they are named individually
@@ -406,7 +406,7 @@ TARGET_PYTHON_ROOT = Path(os.environ.get(
 # and every build wiring in this repository overrides it, so read the same
 # variable rather than inventing a third convention.
 CARGO_TARGET_DIR = Path(os.environ.get(
-    "CARGO_TARGET_DIR", REPO / "crates" / "torch_c" / "target"))
+    "CARGO_TARGET_DIR", REPO / "torchnative" / "rust" / "torch_c" / "target"))
 
 #: Where the Pyodide distribution lives, and deliberately **not** a
 #: subdirectory of `TARGET_PYTHON_ROOT`. Everything under that root is a
@@ -417,7 +417,7 @@ CARGO_TARGET_DIR = Path(os.environ.get(
 PYODIDE_ROOT = Path(os.environ.get(
     "TORCHNATIVE_PYODIDE", "/Volumes/macMini/thisisthepy/torchnative/.caches/pyodide/pyodide"))
 
-CRATE = REPO / "crates" / "torch_c"
+CRATE = REPO / "torchnative" / "rust" / "torch_c"
 
 # ------------------------------------------------------- artefact freshness
 #
@@ -1132,7 +1132,7 @@ class LinuxTarget(Target):
         self.rebuild_hint = (
             f"PYO3_CROSS_LIB_DIR=<target-python>/lib cargo zigbuild --release "
             f"--target {rust_target}.{self.GLIBC_TARGET[0]}."
-            f"{self.GLIBC_TARGET[1]}, from crates/torch_c "
+            f"{self.GLIBC_TARGET[1]}, from torchnative/rust/torch_c "
             "(docs/platform/LINUX.md §9.2 has the whole environment; §9.1 installs "
             "cargo-zigbuild and ziglang, which it needs)"
         )
@@ -1597,7 +1597,7 @@ class WindowsTarget(Target):
             "PYO3_CROSS_LIB_DIR=<target-python>/libs "
             "PYO3_CROSS_PYTHON_VERSION=3.13 "
             f"cargo xwin build --release --target {rust_target}, from "
-            "crates/torch_c (docs/platform/WINDOWS.md §3 has the whole environment, "
+            "torchnative/rust/torch_c (docs/platform/WINDOWS.md §3 has the whole environment, "
             "including the four MSVC tool shims §3.2 installs, which "
             "cargo-xwin needs and this machine does not otherwise have)"
         )
@@ -1794,7 +1794,7 @@ class PyEmscriptenTarget(Target):
         "EM_CACHE=/tmp/em-cache-<scratch> "
         "PATH=<emsdk>/upstream/emscripten:$PATH "
         "cargo build --release --target wasm32-unknown-emscripten, from "
-        "crates/torch_c (docs/platform/WASM.md §9.6; never write to the shared emsdk "
+        "torchnative/rust/torch_c (docs/platform/WASM.md §9.6; never write to the shared emsdk "
         "cache -- set EM_CACHE first)"
     )
 
@@ -2445,7 +2445,7 @@ def self_test() -> None:
 
     Costs no build: the artefact is a scratch file with a chosen mtime and the
     dep-info is written by hand. The prerequisites are real files under
-    `crates/torch_c`, because the containment rule is one of the things under
+    `torchnative/rust/torch_c`, because the containment rule is one of the things under
     test.
     """
     import tempfile
@@ -2505,7 +2505,7 @@ def self_test() -> None:
              f"@ART@: {CRATE}/src/deleted_by_the_test.rs", 0.0),
             ("prerequisites from another checkout", UNKNOWN,
              "different checkout",
-             "@ART@: /some/other/worktree/crates/torch_c/src/lib.rs", 0.0),
+             "@ART@: /some/other/worktree/torchnative/rust/torch_c/src/lib.rs", 0.0),
             # The `candle-core` fork is a `[patch]` path inside this repository
             # (docs/numerics/INT8.md §1.2), so cargo's dep-info lists its sources
             # beside the crate's. Reading those as "another checkout" refused

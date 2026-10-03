@@ -136,7 +136,7 @@ _NUMPY_DTYPES = {
 #:    is not available to be produced here. Something has to change dtype.
 #: 2. `torch._C._shim_tensor_bytes` **refuses both half-width floats** by
 #:    name --- reaching their bit pattern means naming the `half` crate's
-#:    types, which `crates/torch_c/src/tensor.rs` deliberately does not depend
+#:    types, which `torchnative/rust/torch_c/src/tensor.rs` deliberately does not depend
 #:    on. So even `float16`, which numpy *does* have, cannot come across as
 #:    its own bytes. Widening first is what keeps the byte route (and the
 #:    shutdown segfault docs/graph/NPU2.md §7.3 fixed) rather than falling

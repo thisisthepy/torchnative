@@ -307,4 +307,4 @@ count was the only tell.
 <!-- DOCWATCH: symbol-in-file tests/test_bfallback.py test_no_resolve_key_result_on_the_whole_aten_surface_dies_on_a_gap_any_more present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bfallback.py test_upstreams_fallback_set_would_resolve_1861_more_by_claiming_kernels present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bfallback.py test_the_enum_divergence_that_bounds_what_this_agreement_can_mean present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _SHIM_BACKEND_FALLBACKS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _SHIM_BACKEND_FALLBACKS present -->

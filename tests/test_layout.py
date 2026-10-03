@@ -21,9 +21,9 @@ import subprocess
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 APPROVED_TRACKED = {
-    "Cargo.toml", "pyproject.toml", "setup.py", "README.md", "PROJECT.md",
-    "AGENTS.md", "LICENSE", ".gitignore", ".github", "crates", "python",
-    "tests", "benches", "docs", "scripts", "vendor",
+    "pyproject.toml", "setup.py", "README.md", "PROJECT.md",
+    "AGENTS.md", "LICENSE", ".gitignore", ".github", "torchnative",
+    "tests", "docs", "scripts", "vendor",
 }
 APPROVED_IGNORED = {".caches", ".scratch", ".worktrees"}
 

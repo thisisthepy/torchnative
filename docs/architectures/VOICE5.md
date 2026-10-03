@@ -386,9 +386,9 @@ number has to be nailed to something outside the derivation.
 <!-- DOCWATCH: op-implemented aten.norm.ScalarOpt_dim -->
 <!-- DOCWATCH: op-implemented aten._weight_norm_interface.default -->
 <!-- DOCWATCH: op-implemented aten.masked_scatter.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reduced_dims present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs refuse_duplicate_dims present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py norm_except_dim present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reduced_dims present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs refuse_duplicate_dims present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py norm_except_dim present -->
 <!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_higgs_reached_audio_under_the_shim present -->
 <!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_weight_norm_wall_reports_itself_and_not_a_typeerror present -->
 <!-- DOCWATCH: symbol-in-file tests/test_higgs.py test_the_tolerance_would_actually_reject_a_wrong_waveform present -->

@@ -1,6 +1,6 @@
 # `torch._C` — 바닥 놓기
 
-A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `crates/torch_c` 를 함수 하나짜리 스파이크에서
+A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `torchnative/rust/torch_c` 를 함수 하나짜리 스파이크에서
 **실제 시작점**으로 키운 작업의 기록입니다.
 
 **목표는 커버리지가 아니라 바닥입니다.** 구현한 aten op 은 3 개이고, 그것이 적은 것이 아니라
@@ -28,7 +28,7 @@ A/B 결정이 A(candle 위 PyO3 어댑터)로 확정된 뒤, `crates/torch_c` �
 ### 파일 배치
 
 ```
-crates/torch_c/
+torchnative/rust/torch_c/
 ├─ Cargo.toml            candle-core, PyO3
 ├─ build.rs              타깃별 링크 배선 중 "경로" 인 것
 ├─ .cargo/config.toml    타깃별 링크 배선 중 "상수" 인 것
@@ -320,7 +320,7 @@ onig_sys v69.9.3 → onig v6.5.3 → tokenizers v0.22.2 → candle-core v0.11.0
 > 꼽은 '조용한 수치 드리프트' 를 만들지 않기 위한 기존 규칙." 즉 **미해결이 아니라 해결된
 > 결정**입니다 — "텐서끼리는 승격하지 않고 이름을 댄다, 파이썬 스칼라는 wrapped-number 규칙을
 > 재현한다"로 갈렸습니다.
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs same_dtype present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs same_dtype present -->
 
 ### 3. `torch.bool`
 
@@ -391,7 +391,7 @@ KV 캐시 갱신(`add_`, `copy_`) 과 한 묶음입니다.
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 DIST=/Volumes/macMini/caches/target-python
-cd crates/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준으로 찾는다
+cd torchnative/rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준으로 찾는다
 
 # 호스트 + 실제 임포트 검증
 bash tests/run.sh; echo "EXIT=$?"

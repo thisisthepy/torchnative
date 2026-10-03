@@ -25,8 +25,8 @@
 | 기기 CPython | `3.13.0+ (heads/3.13-dirty:b4c504d76ff, Oct 13 2024)` `[Clang 17.0.2]`, `sys.platform='android'`, `os.uname().machine='aarch64'` |
 | 배포본 | `/Volumes/macMini/caches/target-python/aarch64-linux-android/prefix` |
 | 호스트 | `darwin/arm64`, `/Volumes/macMini/caches/spike-venv/bin/python` (CPython 3.13.0) |
-| 벤더링 트리 | `python/torch` — torch **2.13.0**, `scripts/vendor/vendor_torch.sh` 로 생성 (`py_modules=2286`, `native_left=0`) |
-| `_C` | `crates/torch_c`, PyO3 0.29.2 `abi3-py313` + candle-core 0.11.0 |
+| 벤더링 트리 | `torchnative/python/torch` — torch **2.13.0**, `scripts/vendor/vendor_torch.sh` 로 생성 (`py_modules=2286`, `native_left=0`) |
+| `_C` | `torchnative/rust/torch_c`, PyO3 0.29.2 `abi3-py313` + candle-core 0.11.0 |
 
 **`pmp_api26` 은 `PythonMultiplatform` 이 쓰는 공용 에뮬레이터다.** 앱 설치·`pm` 조작을 전혀
 하지 않았고 `/data/local/tmp/bw_device` 아래에만 파일을 올렸다. `DEVICE_LOAD.md` 와 같은 규율이다.
@@ -37,7 +37,7 @@
 
 ```
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-device2
-cd crates/torch_c && ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \
+cd torchnative/rust/torch_c && ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=<배포본>/prefix/lib \
   cargo ndk -t arm64-v8a --platform 21 build --release
@@ -215,7 +215,7 @@ MISMATCH rsqrt.default             1/12 elements, max 1 ULP
 - **비트 재현성을 요구하는 기능(체크포인트 해시, 결정론적 재생, 크로스 플랫폼 골든)은
   이 차이 위에 세울 수 없다.** f32 행렬곱을 지나는 순간 플랫폼이 답을 바꾼다.
 - **`scripts/devices/device_android.sh parity` 는 이 차이를 재지 않는다.** 그 스크립트는 호스트
-  쪽을 `accelerate` 없이 따로 빌드해서(`crates/torch_c/Cargo.toml` 의
+  쪽을 `accelerate` 없이 따로 빌드해서(`torchnative/rust/torch_c/Cargo.toml` 의
   `torch_c_no_accelerate` cfg) **gemm 대 gemm** 으로 비교한다.
 
 ### 5.2 왜 parity 는 배송 빌드를 재지 않는가
@@ -386,11 +386,11 @@ ModuleNotFoundError: No module named '_multiprocessing'
 ## 7. 양쪽에서 똑같이 실패하는 것 하나 — `_C` 의 갭이지 기기 문제가 아니다
 
 > **Correction (문서 감사, 2026-09):** 닫혔습니다. `torch.relu` 가 지금
-> `crates/torch_c/src/overloads.json` 에 있고(`grep -c '"relu"'` → 1), 실측:
+> `torchnative/rust/torch_c/src/overloads.json` 에 있고(`grep -c '"relu"'` → 1), 실측:
 > `torch.relu(torch.tensor([-1.0, 2.0]))` → `tensor([0., 2.])`, 성공. 어느 라운드가 채웠는지는
 > 추적하지 않았습니다 — `docs/models/SAMPLING.md` 감사에서 방금 발견한 것과 같은 모양입니다(overloads
 > 테이블이 이 문서를 쓴 뒤 다른 라운드에서 계속 채워졌다).
-> <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json relu present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json relu present -->
 
 ```
 nn.ReLU()(x)  ->  F.relu(x)  ->  torch.relu(x)
@@ -398,7 +398,7 @@ NotImplementedError: not implemented in torch._C shim: torch.relu(...)
   -- overload resolution has no table entry for this op
 ```
 
-`torch.relu` (오버로드 접미사 없는 스펠링) 가 `crates/torch_c/src/overloads.json` 에 없다.
+`torch.relu` (오버로드 접미사 없는 스펠링) 가 `torchnative/rust/torch_c/src/overloads.json` 에 없다.
 `torch.ops.aten.relu.default` 는 양쪽에서 **비트 동일하게 돈다.** 호스트와 기기가 **같은**
 메시지로 실패하므로 이것은 기기 문제가 아니라 오버로드 테이블의 빠진 항목이다 —
 양쪽에서 돌린 것의 값이 여기 있다. `nn.Sequential` 케이스가 `nn.ReLU` 대신 `nn.Tanh` 를
@@ -503,7 +503,7 @@ bionic 쪽이 나중에 고쳐지면 면제 항목이 남아돌게 되는데, �
 
 ## 11. 다음에 무엇을 해야 다음 단계가 열리는가
 
-1. **`crates/torch_c/src/overloads.json` 에 접미사 없는 스펠링을 채운다** (§7). `torch.relu`
+1. **`torchnative/rust/torch_c/src/overloads.json` 에 접미사 없는 스펠링을 채운다** (§7). `torch.relu`
    하나가 아니라 `F.*` 가 부르는 bare 스펠링 전반의 문제일 가능성이 높다 — `nn` 모듈이
    순전파에서 어떤 bare 스펠링을 부르는지 세어보는 것이 먼저다.
 2. **`_multiprocessing` 부재를 어디서 처리할지 정한다** (§6). 지금은 계측용 런타임 스텁이라

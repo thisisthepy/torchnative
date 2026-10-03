@@ -1,21 +1,21 @@
 # QNN — ExecuTorch's Qualcomm backend behind an `nn.Module`, and the claim it does not make
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/npu.py DelegateModule present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/npu.py delegate_ present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/npu.py NpuModelForCausalLM present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/npu.py delegated_paths present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py qnn_aot_refusal present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py soc_targets present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py lower_cpu_reference present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py delegation_report present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py read_artefact present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py match_device present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn.py runtime_backends present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn_device.py device_soc present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn_device.py htp_stub_for present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn_device.py DEVICE_DIR present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn_device.py fastrpc_nodes present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/qnn_device.py SOC_TABLE_UNAVAILABLE present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py DelegateModule present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py delegate_ present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py NpuModelForCausalLM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/npu.py delegated_paths present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py qnn_aot_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py soc_targets present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py lower_cpu_reference present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py delegation_report present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py read_artefact present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py match_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn.py runtime_backends present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py device_soc present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py htp_stub_for present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py DEVICE_DIR present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py fastrpc_nodes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/qnn_device.py SOC_TABLE_UNAVAILABLE present -->
 <!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_a_real_checkpoint_still_generates_with_a_submodule_delegated present -->
 <!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_the_qnn_module_refuses_the_very_file_the_generic_one_runs present -->
 <!-- DOCWATCH: symbol-in-file tests/test_qnn.py test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance present -->
@@ -898,18 +898,18 @@ with a false reason is counted as a pass).
 `git status --short`:
 
 ```text
- M python/torchnative/export/__init__.py
+ M torchnative/python/torchnative/export/__init__.py
 ?? docs/devices/QNN.md
 ?? tests/test_qnn.py
-?? python/torchnative/export/npu.py
-?? python/torchnative/export/qnn.py
-?? python/torchnative/export/qnn_device.py
+?? torchnative/python/torchnative/export/npu.py
+?? torchnative/python/torchnative/export/qnn.py
+?? torchnative/python/torchnative/export/qnn_device.py
 ```
 
 One tracked file modified, `+10` lines, all of them a docstring paragraph
 (`git diff --stat`: `1 file changed, 10 insertions(+)`). No Rust, no
 `bootstrap.py`, no `overloads.json`, no `tests/golden/`, and nothing under
-`python/torch/` touched by hand.
+`torchnative/python/torch/` touched by hand.
 
 ---
 

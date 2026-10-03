@@ -46,9 +46,9 @@ from test_shim import _C
 import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
-_SRC = os.path.join(_REPO_ROOT, "crates", "torch_c", "src")
+_SRC = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src")
 _ATEN_RS = os.path.join(_SRC, "aten.rs")
 _TENSOR_RS = os.path.join(_SRC, "tensor.rs")
 _STORAGE_RS = os.path.join(_SRC, "storage.rs")

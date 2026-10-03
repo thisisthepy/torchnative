@@ -32,7 +32,7 @@ import sys
 import _C
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 
 
 # ---------------------------------------------------------------------------

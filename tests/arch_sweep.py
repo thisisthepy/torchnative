@@ -22,7 +22,7 @@ than an invariant. Run it by hand, both sides, then compare:
     PY=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python
     root=$(git rev-parse --show-toplevel)
 
-    PYTHONPATH=$root/python TORCH_USE_RTLD_GLOBAL=1 \
+    PYTHONPATH=$root/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
         $PY arch_sweep.py --out /tmp/shim.json
     env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL \
         $PY arch_sweep.py --out /tmp/upstream.json

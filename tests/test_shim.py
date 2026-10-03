@@ -2215,7 +2215,7 @@ def test_every_build_flag_the_stubs_declare_answers_with_a_real_bool():
     import os
 
     here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, os.pardir, "crates", "torch_c", "src", "surface.json")) as fh:
+    with open(os.path.join(here, os.pardir, "torchnative", "rust", "torch_c", "src", "surface.json")) as fh:
         surface = json.load(fh)
     declared = [n for n, kind in surface["module"].items() if kind == "bool"]
     assert len(declared) >= 14, declared
@@ -4079,7 +4079,7 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
 # `torch` (shim-backed); this process keeps plain upstream `torch`
 # (`_upstream_torch` above, already guarded for its absence).
 #
-# The subprocess needs `python/torch/_C.abi3.so` to exist,
+# The subprocess needs `torchnative/python/torch/_C.abi3.so` to exist,
 # which `scripts/vendor/install_shim.sh` places there -- a *different* build step
 # than the one `tests/run.sh` runs for the standalone `_C` every other test
 # in this file uses. So the guard below checks for that file too, not just
@@ -4095,7 +4095,7 @@ import sys
 import tempfile
 
 _CKPT_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_CKPT_VENDOR_DIR = os.path.join(_CKPT_REPO_ROOT, "python")
+_CKPT_VENDOR_DIR = os.path.join(_CKPT_REPO_ROOT, "torchnative", "python")
 _CKPT_VENDOR_SHIM = os.path.join(_CKPT_VENDOR_DIR, "torch", "_C.abi3.so")
 
 _CKPT_V, _CKPT_H, _CKPT_F = 32, 16, 32  # vocab, hidden, ffn -- same shape as caches/ckpt-probe/make_ckpt.py's Tiny
@@ -9880,7 +9880,7 @@ def test_decompose_lowers_sum_default_now_that_the_kernel_agrees():
     and refused rather than emit a lowered graph that silently disagreed
     with eager.
 
-    The kernel is fixed (`crates/torch_c/src/aten.rs::sum_or_mean` now expands
+    The kernel is fixed (`torchnative/rust/torch_c/src/aten.rs::sum_or_mean` now expands
     an empty `dim` list to every axis before reducing), so the rule and the
     recording agree and the pass lowers the trace instead of refusing it.
     Both are asserted directly: `sum.dim_IntList([])` itself, and that
@@ -10568,7 +10568,7 @@ def _schema_table_keys():
     """
     keys = {}
     for filename in ("overloads.json", "methods.json"):
-        path = os.path.join(_CKPT_REPO_ROOT, "crates", "torch_c", "src", filename)
+        path = os.path.join(_CKPT_REPO_ROOT, "torchnative", "rust", "torch_c", "src", filename)
         with open(path, encoding="utf-8") as fh:
             table = json.load(fh)
         for name, schemas in table.items():
@@ -11640,7 +11640,7 @@ def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
 
 # --- the fused reduced-float kernels (docs/numerics/DTYPE.md) ------------------------
 #
-# `crates/torch_c/src/reduced.rs` replaced two things the ops above used to do
+# `torchnative/rust/torch_c/src/reduced.rs` replaced two things the ops above used to do
 # through candle: the `{float16,bfloat16} <-> float32` conversions, and the
 # three-pass shape of widen / compute / narrow. Both are claimed to compute the
 # *same function* as before, only faster, and that claim is what the tests
@@ -11824,7 +11824,7 @@ def test_reduced_float_conversion_carries_the_values_no_shift_would():
 # `aten::_scaled_dot_product_flash_attention_for_cpu` is a *blocked* kernel
 # with an online softmax, and for `bfloat16`/`float16` inputs every step of it
 # happens in portable code -- upstream reaches its own kernel rather than a
-# BLAS. `crates/torch_c/src/flash.rs` reproduces that arrangement, and
+# BLAS. `torchnative/rust/torch_c/src/flash.rs` reproduces that arrangement, and
 # docs/kernels/SDPA.md is the measurement. These tests assert the consequence: **exact**
 # agreement, with no tolerance.
 #
@@ -25748,7 +25748,7 @@ def _rs_functions_from_text(text):
 
 
 def _src_dir():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crates", "torch_c", "src")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "torchnative", "rust", "torch_c", "src")
 
 
 def _aten_rs_functions():
@@ -25988,7 +25988,7 @@ def test_the_mps_readback_list_is_what_the_kernels_actually_do():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        vulkan_coverage.vulkan_skip("   (skipped mps readback derivation: crates/torch_c/src/aten.rs "
+        vulkan_coverage.vulkan_skip("   (skipped mps readback derivation: torchnative/rust/torch_c/src/aten.rs "
               "is not beside this file -- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -26425,7 +26425,7 @@ def test_the_checked_in_spirv_is_not_stale():
     `glslc` back on the critical path of the suite -- the exact dependency the
     checked-in words exist to avoid.
     """
-    shaders = pathlib.Path(__file__).resolve().parents[1] / "crates" / "torch_c" / "shaders"
+    shaders = pathlib.Path(__file__).resolve().parents[1] / "torchnative" / "rust" / "torch_c" / "shaders"
     if not shaders.is_dir():
         vulkan_coverage.vulkan_skip("   (skipped spirv staleness: no shaders/ directory)")
         return
@@ -28616,7 +28616,7 @@ def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name(
          "aten.scatter.value", "missing_aten_op", "aten.scatter.value"),
         ("NotImplementedError: not implemented in torch._C shim: torch.argsort(...) -- "
          "overload resolution has no table entry for this op "
-         "(crates/torch_c/src/overloads.json)", "missing_aten_op", "argsort"),
+         "(torchnative/rust/torch_c/src/overloads.json)", "missing_aten_op", "argsort"),
         ("NotImplementedError: not implemented in torch._C shim: TensorBase.scatter_",
          "missing_shim_name", "TensorBase.scatter_"),
         ("NotImplementedError: not implemented in torch._C shim: torch._C._nn.glu",

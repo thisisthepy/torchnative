@@ -25,12 +25,12 @@
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-crate=$repo/crates/torch_c
+crate=$repo/torchnative/rust/torch_c
 
 # The vendored tree moved into the package (`scripts/vendor/vendor_torch.sh` writes to
 # `$TORCHNATIVE_VENDOR_DIR`, default `python`); it is no longer
 # `vendor/torch`. Read the same variable so the two cannot drift apart.
-vendor_root=${TORCHNATIVE_VENDOR_DIR:-$repo/python}
+vendor_root=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/python}
 
 : "${CARGO_TARGET_DIR:=/Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target-device}"
 : "${ANDROID_SDK_ROOT:=$HOME/Library/Android/sdk}"
@@ -221,7 +221,7 @@ host_parity_artefact() {
         linked=$(otool -L "$host_so" | grep -c -i Accelerate || true)
         [ "$linked" = 0 ] || {
             echo "refusing to measure $host_so: it still links Accelerate." >&2
-            echo "The 'torch_c_no_accelerate' cfg in crates/torch_c/Cargo.toml did not take." >&2
+            echo "The 'torch_c_no_accelerate' cfg in torchnative/rust/torch_c/Cargo.toml did not take." >&2
             exit 1; }
     fi
 }

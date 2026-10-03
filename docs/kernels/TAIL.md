@@ -1,7 +1,7 @@
 # 꼬리 다섯 개 — 골든 케이스는 붙었고, 붙이는 과정에서 커널 버그 두 종류를 찾았다
 
 앞선 세션이 `aten.baddbmm.default` · `aten.split_with_sizes.default` · `aten._safe_softmax.default` ·
-`aten.add_.Tensor` · `aten.mul.Scalar` 다섯 개를 `crates/torch_c/src/aten.rs` 에 구현하고 커밋
+`aten.add_.Tensor` · `aten.mul.Scalar` 다섯 개를 `torchnative/rust/torch_c/src/aten.rs` 에 구현하고 커밋
 (`9612146`)까지 마친 뒤 인터럽트로 죽었다. 다섯 다 빌드는 깨끗했고 `_aten_implemented()` 에도
 이미 올라 있었지만, `tests/golden/cases.py` 에 케이스 빌더가 하나도 없어 `compare.py` 가 다섯
 전부를 `<no case builder registered>` 로 하드 실패시키고 있었다. 이 문서는 그 다섯 개의 케이스
@@ -9,7 +9,7 @@
 
 **결론 먼저.** 다섯 다 채웠고, 골든은 **2257/2258** 이다 (1 개는 의도적으로 빨갛게 남겨둔 것 — 아래
 §2 참고). 케이스를 쓰면서 커널의 자기 자신 doc comment 를 다시 재봤고, doc comment 가 주장하는
-것과 실제 torch 2.13.0 의 동작이 다른 지점을 세 군데 찾았다. **`crates/torch_c/src/aten.rs` 는 건드리지
+것과 실제 torch 2.13.0 의 동작이 다른 지점을 세 군데 찾았다. **`torchnative/rust/torch_c/src/aten.rs` 는 건드리지
 않았다** — 작업 범위 밖이고, 지시가 명시적으로 "고치지 말고 보고" 였다.
 
 ---
@@ -110,7 +110,7 @@
 
 ## 2. 커널이 틀린 곳 — 고치지 않고 보고만 한다
 
-지시대로 `crates/torch_c/src/aten.rs` 는 건드리지 않았다. 아래 셋은 케이스 작성 중 상류와 대조하다
+지시대로 `torchnative/rust/torch_c/src/aten.rs` 는 건드리지 않았다. 아래 셋은 케이스 작성 중 상류와 대조하다
 찾은, doc comment 의 주장과 실제 동작이 갈리는 지점이다.
 
 ### 2.1 `baddbmm` 의 `alpha=0` 은 `addmm` 의 quick return 이 아니다 — 골든에 빨간 케이스로 pin

@@ -108,8 +108,8 @@ make *that* refusal stale (§2.2, §8.3).
 > the call rather than about the world — an unrecorded delta has nothing to
 > send, and an uninitialised process group has nobody to send to.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py ProcessGroupLocal present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py publish present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py publish present -->
 
 ---
 
@@ -187,10 +187,10 @@ have described a capability nothing here has. A refusal naming a runnable check
 is the honest shape until it stops refusing — which is what happened to the row
 above it.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py Delta present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py revert_by_subtraction present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/adapt/gradient.py Tent present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py Delta present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py revert_by_subtraction present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/gradient.py Tent present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py STAGE_NARROW_BACKWARD present -->
 
 ### 2.3 What `Tent.select` picks, and why by class name
 
@@ -522,7 +522,7 @@ Passing `use_cache=False` to a `transformers` forward used to reach a
 
 ```
 not implemented in torch._C shim: torch.diff(...) -- overload resolution has no
-table entry for this op (crates/torch_c/src/overloads.json)
+table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 So an adaptation step ran on the default cache path, which is what
@@ -539,7 +539,7 @@ called, and it was a table entry rather than a kernel.
 > `docs/architectures/ARCH100.md` later measured across the whole tail, where names outnumber
 > kernels 49 to 22.
 
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json diff present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json diff present -->
 
 ### 8.3 A delta cannot be written down — **closed, and the wall was misread**
 
@@ -663,7 +663,7 @@ nothing in this document's tests is entitled to claim it.
 | prefill sha256, f32 × 5 and bf16 × 4 | — | **9/9 unchanged, and 9/9 equal through the wrapper** (§7) |
 
 `ops=166` is unchanged **on purpose**: nothing in this round touched
-`crates/torch_c/src/`, and the whole of `torchnative.adapt` and
+`torchnative/rust/torch_c/src/`, and the whole of `torchnative.adapt` and
 `torchnative.delta` is Python over the capture and tape surfaces
 `docs/training/BACKWARD.md` built. A change in that number would have meant an
 adaptation API had needed a kernel, which would have been news.
@@ -885,7 +885,7 @@ both sides, so the two processes see identical bytes with no shared RNG.
 | 8.4 `Tensor.backward()` | refuses | unchanged |
 | — | — | **new:** `BertForMaskedLM` cannot load (§13.4) |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs layer_norm_backward present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_an_op_with_no_derivative_rule_is_refused_by_naming_it present -->
 
 ### 13.6 Every command in §13
@@ -1082,7 +1082,7 @@ section named is closed; the oracle that closed it immediately found a second on
 
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tent_in_training_mode_adapts_and_the_dropout_is_really_on present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dtype_from_legacy_name present -->
 <!-- DOCWATCH: count smoke_ok ge 325 -->
 
 ### 14.6 Every command in §14

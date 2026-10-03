@@ -13,7 +13,7 @@
 
 ## 1. 무엇을 증명했나
 
-`crates/vulkan_probe` — `crates/torch_c` 와 워크스페이스가 분리된 독립 크레이트입니다. 두 개의 바이너리가
+`torchnative/rust/vulkan_probe` — `torchnative/rust/torch_c` 와 워크스페이스가 분리된 독립 크레이트입니다. 두 개의 바이너리가
 **같은 세 케이스**를 돌리고 **같은 채점 코드**(`src/check.rs`)로 판정합니다.
 
 | 케이스 | 크기 | `ash` | `wgpu` |
@@ -37,7 +37,7 @@ export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006
 ADB=~/Library/Android/sdk/platform-tools/adb
 BIN=$CARGO_TARGET_DIR/aarch64-linux-android/release
 
-cd crates/vulkan_probe
+cd torchnative/rust/vulkan_probe
 cargo ndk -t arm64-v8a --platform 26 build --release > /tmp/vk.log 2>&1; echo "EXIT=$?"
 cargo ndk -t arm64-v8a --platform 26 build --release --features wgpu-route > /tmp/wg.log 2>&1; echo "EXIT=$?"
 
@@ -216,7 +216,7 @@ comparison MISSED the perturbation)` 이 나왔습니다. 버그가 아니라 �
 ※ `default-features = false, features = ["vulkan", "wgsl"]` 기준으로 이 저장소에서 직접 센 값입니다.
 피처를 늘리면 늘어납니다.
 † `vulkano` 행은 `/tmp` 의 별도 프로브에서 나온 값이고 **이 저장소에서 재현하지 않았습니다.**
-`ash`·`wgpu` 행은 전부 `crates/vulkan_probe` 에서 직접 측정했습니다.
+`ash`·`wgpu` 행은 전부 `torchnative/rust/vulkan_probe` 에서 직접 측정했습니다.
 
 **두 경로 모두 `libvulkan.so` 가 `NEEDED` 에 없습니다.** `dlopen` 으로 열기 때문입니다. 이것은
 편의가 아니라 요구사항입니다 — 링크했다면 Vulkan 없는 폰에서 `_C.so` 자체가 로드에 실패하고,
@@ -282,7 +282,7 @@ CMake 로 빌드**하는 것이 눈에 띄는 비용인데, 확인해 보니 **�
 `pytorch/executorch` 는 `9a2d135d511d` (2026-08-24) 로 **7069 커밋 앞서 있습니다.** 포크에 고유
 커밋이 기록되어 있지 않아 **리베이스라기보다 현재 업스트림에서 다시 포크하는 것에 가깝습니다.**
 저장소 안에 이 포크를 빌드하거나 링크하는 배선은 **없습니다** — 참조는 문서와
-`crates/torch_c/src/device.rs` 가 `"vulkan"` 장치 문자열을 예약해 둔 것뿐입니다.
+`torchnative/rust/torch_c/src/device.rs` 가 `"vulkan"` 장치 문자열을 예약해 둔 것뿐입니다.
 
 **포기하는 것:** `docs/design/DESIGN.md` §5 가 candle 을 고른 근거 자체 — "소유하는 코드가 작다".
 Vulkan 하나를 얻으려고 그 논거를 되돌리게 됩니다.
@@ -321,7 +321,7 @@ Vulkan 하나를 얻으려고 그 논거를 되돌리게 됩니다.
 | candle 의 기존 `metal` 피처를 켠다 | **`ash` 가 맞습니다.** Vulkan 은 안드로이드 구멍만 메우면 되고, 커널을 두 번 쓸 일이 없습니다 |
 | 우리가 커널을 직접 소유한다 (candle 에 없는 융합 커널 등) | **`wgpu` 가 맞습니다.** WGSL 을 한 번 써서 세 타깃을 다 덮습니다 |
 
-candle 에는 `metal` 피처가 **있고**, 지금 `crates/torch_c/Cargo.toml` 은 Apple 에서 `accelerate` 만
+candle 에는 `metal` 피처가 **있고**, 지금 `torchnative/rust/torch_c/Cargo.toml` 은 Apple 에서 `accelerate` 만
 켜고 `metal` 은 켜지 않았습니다. 첫 번째 칸이 사실이라면 `ash` 가 분명히 맞습니다.
 
 **저는 이 결정을 하지 않았습니다.** 세 타깃에 걸친 커널 소유권 결정이라 이번 지시(안드로이드
@@ -330,17 +330,17 @@ Vulkan 이 서는가)의 범위를 넘습니다 — AGENTS.md §17.7 항목입�
 
 ### 5.4 아직 하지 않은 것 (제안)
 
-**`crates/torch_c` 에 Vulkan 의존성을 넣지 않았습니다.** 지시대로입니다. 확인:
+**`torchnative/rust/torch_c` 에 Vulkan 의존성을 넣지 않았습니다.** 지시대로입니다. 확인:
 
 - `cargo metadata` — `torch_c` 의 워크스페이스 멤버는 자기 자신뿐 (`vk_probe` 는 별도 워크스페이스)
 - `cargo check --release` — `torch_c` 는 그대로 `EXIT=0`
-- `git status --short` — 변경은 `crates/vulkan_probe/` 와 `docs/devices/VULKAN.md` 뿐
+- `git status --short` — 변경은 `torchnative/rust/vulkan_probe/` 와 `docs/devices/VULKAN.md` 뿐
 
 다음 단계로 제안하는 것:
 
 1. `ash` 를 `[target.'cfg(target_os = "android")'.dependencies]` 로만 넣습니다. iOS/macOS 에는
    넣지 않습니다.
-2. `crates/torch_c/src/device.rs` 가 이미 예약해 둔 `"vulkan"` 장치 문자열 뒤에 배선합니다.
+2. `torchnative/rust/torch_c/src/device.rs` 가 이미 예약해 둔 `"vulkan"` 장치 문자열 뒤에 배선합니다.
 3. 커널은 `matmul` 하나부터. 골든 스위트를 CPU 대조로 그대로 돌립니다.
 4. §5.3 을 먼저 결정합니다 — 1번보다 앞섭니다.
 

@@ -67,8 +67,8 @@ So this implementation gathers, and the shim's `as_strided` result is a
 mistake for the real thing.
 
 <!-- DOCWATCH: op-implemented aten.as_strided.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json as_strided present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json as_strided present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json as_strided present -->
 
 ---
 
@@ -116,8 +116,8 @@ is not permanent: drop the result and the base is writable again, which
 `test_the_barrier_lifts_when_the_view_dies_which_is_what_keeps_it_from_poisoning`
 asserts, because a barrier that only ever grows is a leak with a refusal on top.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs StridedBarrier present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs as_strided_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs StridedBarrier present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs as_strided_default present -->
 <!-- DOCWATCH: symbol-in-file tests/test_strided.py test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total present -->
 
 ---

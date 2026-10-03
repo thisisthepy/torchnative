@@ -26,7 +26,7 @@ What this cannot see, stated rather than implied:
     it. Two of these were in `test_release.py` and the gate found them by
     FileNotFoundError, one run apart. If you build a documentation path from a
     variable, the suite that reads it is the only thing that will notice.
-  * **References inside the vendored tree** (`python/torch/`),
+  * **References inside the vendored tree** (`torchnative/python/torch/`),
     which is upstream's and regenerated.
   * **Files git does not track.** The scan is `git ls-files` (GitHub issue #8):
     scratch notes, logs, caches and sibling worktrees inside the checkout are
@@ -137,7 +137,7 @@ def _text_files(repo=REPO):
     every worktree's copy of the docs, and a leaked 1 MB log hung it (GitHub
     issue #8). The index is the definition the docstring always gave.
 
-    `python/torch/` needs no special case any more: upstream's
+    `torchnative/python/torch/` needs no special case any more: upstream's
     vendored files there are gitignored, so they are not listed, and the two
     of ours that are tracked beside them (`README.md`, `nn/federated.py`) are
     read like any other file. A file staged with `git add` is included; a new

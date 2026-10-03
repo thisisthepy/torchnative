@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build `crates/torch_c` for the host and drop it into the hole that
+# Build `torchnative/rust/torch_c` for the host and drop it into the hole that
 # `vendor_torch.sh` left in the vendored tree.
 #
 # The filename is `_C.abi3.so` (ABI3.md §7 item 2). Upstream ships
@@ -12,8 +12,8 @@
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-dest=${TORCHNATIVE_VENDOR_DIR:-$repo/python}
-crate=$repo/crates/torch_c
+dest=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/python}
+crate=$repo/torchnative/rust/torch_c
 target_dir=${CARGO_TARGET_DIR:-$crate/target}
 
 if [ ! -d "$dest/torch" ]; then

@@ -174,29 +174,29 @@ cython_debug/
 .pypirc
 
 # Rust: build output lives in CARGO_TARGET_DIR on the external volume
-/crates/*/target/
+/torchnative/rust/*/target/
 
 # Vendored upstream trees (docs/platform/VENDOR.md). The torch Python tree alone is
 # ~1084 modules; it is reproduced by scripts/vendor/vendor_torch.sh, never committed.
 #
-# It now lands inside the package, at python/torch/, so that one
+# It now lands inside the package, at torchnative/python/torch/, so that one
 # build sees both `torch` and `torchnative` as top-level packages. That
 # directory therefore holds two kinds of file: upstream's, ignored here, and our
 # add-hook, which is tracked -- hence the negations rather than a blanket rule.
-/python/torch/*
-!/python/torch/README.md
-!/python/torch/nn/
-/python/torch/nn/*
-!/python/torch/nn/federated.py
-/python/torch-*.dist-info/
-/python/.stamp
+/torchnative/python/torch/*
+!/torchnative/python/torch/README.md
+!/torchnative/python/torch/nn/
+/torchnative/python/torch/nn/*
+!/torchnative/python/torch/nn/federated.py
+/torchnative/python/torch-*.dist-info/
+/torchnative/python/.stamp
 # The torch distribution installs three top-level packages, not one (its own
 # top_level.txt names them), and the wheel needs all three -- `import torch`
 # reaches `import torchgen` by way of `torch/utils/_python_dispatch.py`.
 # Nothing of ours lives in these two, so they are blanket-ignored rather than
 # negated the way `torch/` above has to be.
-/python/torchgen/
-/python/functorch/
+/torchnative/python/torchgen/
+/torchnative/python/functorch/
 /vendor/probe/
 
 # The tree used to land in /vendor. Kept ignored so a checkout made before the

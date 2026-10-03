@@ -223,8 +223,8 @@ REACH: PASS
 <!-- DOCWATCH: hasattr alias false -->
 <!-- DOCWATCH: op-implemented aten.alias.default -->
 <!-- DOCWATCH: op-implemented aten.roll.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json roll present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json roll present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json roll present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json roll present -->
 <!-- DOCWATCH: count smoke_ok ge 389 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8509 -->
 <!-- DOCWATCH: count golden_ops_covered ge 203 -->

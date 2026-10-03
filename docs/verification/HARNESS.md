@@ -82,7 +82,7 @@ verify_schemas.py    170/170                                                   e
 ## 3. 어떻게 메웠나
 
 두 가지를 바꿨습니다. **둘 다 `compare.py` 안에서 끝납니다** — `cases.py` 와
-`crates/torch_c/` 는 한 글자도 건드리지 않았습니다.
+`torchnative/rust/torch_c/` 는 한 글자도 건드리지 않았습니다.
 
 ### 3.1 주입 단위를 "실행당 1건" 에서 "비교기당 1건" 으로
 
@@ -368,7 +368,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 sh scripts/vendor/vendor_torch.sh                              # 새 worktree 라면 먼저
-(cd crates/torch_c && cargo build --release)
+(cd torchnative/rust/torch_c && cargo build --release)
 
 $PY tests/golden/compare.py            > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
 $PY tests/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"  # 0

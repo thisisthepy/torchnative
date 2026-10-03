@@ -3,13 +3,13 @@
 `docs/kernels/TAIL.md`가 쌓아 둔 미해결 목록(§6) 중 우선순위가 높은 순서로 셋을 받았다. **결론 먼저:**
 `baddbmm`의 `alpha=0` 발산은 고쳤고 골든의 `KNOWN DIVERGENCE`가 0건이 됐다.
 <!-- DOCWATCH: op-implemented aten.baddbmm.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs baddbmm_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs baddbmm_default present -->
 `relu_`는 새 커널로
 채웠다.
 <!-- DOCWATCH: op-implemented aten.relu_.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs relu_inplace present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs relu_inplace present -->
 `uint8` 음수 포화는 **고치지 못했다** — 버그의 실체를 확인했지만 고칠 자리가 이 작업의
-파일 범위(`crates/torch_c/src/aten.rs`, `tests/golden/cases.py`, 이 문서) 밖인 `crates/torch_c/src/lib.rs`에
+파일 범위(`torchnative/rust/torch_c/src/aten.rs`, `tests/golden/cases.py`, 이 문서) 밖인 `torchnative/rust/torch_c/src/lib.rs`에
 있다. `topk` 동점 순서는 지시대로 손대지 않았다.
 
 ---
@@ -32,7 +32,7 @@ baddbmm(self=zeros, inf_batch1, batch2, alpha=0)
 
 ### 고친 것
 
-`crates/torch_c/src/aten.rs::baddbmm_default`에서 `if !alpha_zero { ... }`로 곱을 건너뛰던 분기를
+`torchnative/rust/torch_c/src/aten.rs::baddbmm_default`에서 `if !alpha_zero { ... }`로 곱을 건너뛰던 분기를
 제거하고, **곱은 항상 계산**하도록 바꿨다. `alpha`에 의한 스케일은 여전히 `addmm_scale`이 맡는데,
 이 함수는 `alpha==1`일 때 이미 `clone()`으로 축약하지만 `alpha==0`일 때는 실제 `affine(0.0, 0.0)`
 (부동소수) 또는 `broadcast_mul`(정수)을 수행하므로, IEEE 규칙(`0 * inf == nan`)이 그대로 지켜진다.
@@ -90,7 +90,7 @@ alpha=0)` → `[[0,0],[0,0]]`, 성공). 그러므로 이건 새 버그가 아니
 
 ### 구현
 
-`crates/torch_c/src/aten.rs`에 `relu_inplace`를 추가했다(`add_inplace` 바로 뒤, "In-place ops"
+`torchnative/rust/torch_c/src/aten.rs`에 `relu_inplace`를 추가했다(`add_inplace` 바로 뒤, "In-place ops"
 섹션). 값 규칙은 `relu_default`와 동일: `x < 0 ? 0 : x`를 원소별로 계산해 `nan`을 보존하고
 `-0.0`의 부호를 유지한다(`max(x,0)`이 아니다 — `relu_default`의 doc comment가 이미 재측정한
 차이). `bool`은 상류의 정확한 문구("Boolean inputs not supported for relu")로 거부하고, 이것도
@@ -163,14 +163,14 @@ in-place 오버로드에서 다시 측정해 pin했다.
 
 ### 왜 못 고쳤나
 
-이 포화는 `crates/torch_c/src/aten.rs`의 커널 코드가 아니라 **`crates/torch_c/src/lib.rs`의
+이 포화는 `torchnative/rust/torch_c/src/aten.rs`의 커널 코드가 아니라 **`torchnative/rust/torch_c/src/lib.rs`의
 `_tensor_from_flat`**에서 나온다. 그 함수는 `Tensor::from_vec(values, shape, &device)`로 `f64`
 벡터를 올린 뒤 `.to_dtype(target)`을 부르는데, 이 `to_dtype`은 candle_core(외부 크레이트)의
 변환이고, 그 안에서 `f64 -> u8`은 Rust의 `as` 캐스트다 — Rust 1.45부터 부동소수 `as` 캐스트는
 saturating이다(`-1.0f64 as u8 == 0`, `300.0f64 as u8 == 255`), 감기(wrapping)가 아니다.
 관측된 셰임 숫자와 정확히 일치한다.
 
-이 작업의 파일 범위는 `crates/torch_c/src/aten.rs`, `tests/golden/cases.py`, 이 문서
+이 작업의 파일 범위는 `torchnative/rust/torch_c/src/aten.rs`, `tests/golden/cases.py`, 이 문서
 (`docs/kernels/KERNELS.md`) 셋으로 명시적으로 제한됐다(`device.rs`/`tensor.rs`/`bootstrap.py`는 별도
 에이전트가 쓰고 있어 손대지 말라는 지시와 함께). `_tensor_from_flat`은 그 셋에도, 금지 목록에도
 없는 **네 번째 파일**(`lib.rs`)에 있다 — 범위 밖이라 고치지 않았다.

@@ -321,10 +321,10 @@ is Python above the dispatcher, and the only Rust it touched is none.
 every other document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 354 -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/nn/federated/__init__.py FedAvg present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/nn/federated/__init__.py Engine present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/nn/federated/__init__.py agree present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py publish present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvg present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py agree present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py publish present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_fedavg_over_two_processes_equals_the_same_average_computed_centrally present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_federated_refuses_a_world_of_one_by_name_at_every_door present -->
 

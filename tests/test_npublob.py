@@ -71,7 +71,7 @@ import tracemalloc
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.abspath(os.path.join(_HERE, ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 
 
 def _shim_torch():
@@ -124,7 +124,7 @@ def _intelnpu_source():
 
 def _tensor_rs_source():
     return open(
-        os.path.join(_ROOT, "crates", "torch_c", "src", "tensor.rs"), encoding="utf-8"
+        os.path.join(_ROOT, "torchnative", "rust", "torch_c", "src", "tensor.rs"), encoding="utf-8"
     ).read()
 
 

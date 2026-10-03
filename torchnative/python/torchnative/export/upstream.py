@@ -4,7 +4,7 @@
 home" and wrote the patch that would move it.  `docs/graph/EXPORT4.md` §10 listed
 paying that debt as the next mechanical task.  `docs/graph/EXPORT5.md` §7 paid it:
 every implementation that used to live here is now in
-`crates/torch_c/src/bootstrap.py`, installed at the end of its `install()`,
+`torchnative/rust/torch_c/src/bootstrap.py`, installed at the end of its `install()`,
 before any `from torch._C import ...` in the vendored tree has run.
 
 **Nothing in this file implements anything any more.**  What is left is a
@@ -41,7 +41,7 @@ __all__ = ["install", "installed_names", "InstallReport"]
 def _bootstrap():
     """The module the implementations now live in.
 
-    It is `_torch_c_bootstrap` in `sys.modules` — `crates/torch_c/src/bootstrap.py`
+    It is `_torch_c_bootstrap` in `sys.modules` — `torchnative/rust/torch_c/src/bootstrap.py`
     is `include_str!`'d into the extension at Rust build time and executed under
     that name, which is why this is a `sys.modules` lookup and not an import.
     """
@@ -164,7 +164,7 @@ def __getattr__(name):
         return getattr(module, name)
     raise AttributeError(
         f"torchnative.export.upstream has no attribute {name!r}. The "
-        f"implementations moved to crates/torch_c/src/bootstrap.py in "
+        f"implementations moved to torchnative/rust/torch_c/src/bootstrap.py in "
         f"docs/graph/EXPORT5.md §7; this module forwards to it and the bootstrap does "
         f"not have that name either."
     )

@@ -379,7 +379,7 @@ the kernel message too — measured, not assumed.
 
 ## 4. What this round changes
 
-A single gate at the single door (`aten_dispatch`, `crates/torch_c/src/aten.rs`),
+A single gate at the single door (`aten_dispatch`, `torchnative/rust/torch_c/src/aten.rs`),
 before `aten_dispatch_inner`, keyed on a static table of 114 `(op, kernel-name)`
 pairs. On a hit it raises
 
@@ -549,8 +549,8 @@ it, and nothing hangs:
 Two rows moved *toward* upstream: `t + t` and `matmul` now carry upstream's text
 and type rather than merely being refusals of some kind.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs FLOAT8_E4M3FN_REFUSALS present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs float8_shim_only_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs FLOAT8_E4M3FN_REFUSALS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_shim_only_refusal present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/dtypes.py float8_e4m3fn present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py _FLOAT8_TRANSCRIBED present -->
 
@@ -594,4 +594,4 @@ Recorded rather than half-fixed: a predicate that blocked on *any* second dtype
 would close this row and reopen `gather` and `masked_fill`, which is a worse
 trade than the one it fixes.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs float8_promotion_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_promotion_refusal present -->

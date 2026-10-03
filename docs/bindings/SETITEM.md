@@ -71,7 +71,7 @@ That refusal was correct and it is the reason the fix below does not go through 
 
 **The translation is Python-level and lives in `bootstrap.py`, which was another round's file.** So
 it is written here to be applied rather than applied here. It was applied, built, and measured in
-this worktree (§3, §4) and then reverted; nothing in `crates/torch_c/src/` changed this round.
+this worktree (§3, §4) and then reverted; nothing in `torchnative/rust/torch_c/src/` changed this round.
 
 The lowering: **a stepped slice is a set of positions, and `aten.index_put_.default` already writes
 a set of positions through the receiver's own storage.** It needed no kernel change — §5 is the
@@ -175,7 +175,7 @@ crate and the vendored shim are rebuilt:
 
 ```sh
 export CARGO_TARGET_DIR=...; export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-cd crates/torch_c && cargo build --release
+cd torchnative/rust/torch_c && cargo build --release
 cd - && bash scripts/vendor/install_shim.sh
 ```
 
@@ -327,7 +327,7 @@ rebinding kernel reproduces every number through the receiver and loses them thr
 
 ## 5. What did NOT change, and why that is the interesting part
 
-**No kernel.** `crates/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
+**No kernel.** `torchnative/rust/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
 `aten.index_put_.default` already answered for both architecture shapes before this round began,
 which was checked by driving it directly rather than assumed:
 

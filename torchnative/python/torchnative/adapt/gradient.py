@@ -11,7 +11,7 @@ names here lazily -- so a stage-0 deployment never executes this file.
 
 **What a backward-free build is, in this repository today.** No build of
 ``torch._C`` from this crate lacks the tape -- ``tape::register`` is
-unconditional in ``crates/torch_c/src/lib.rs`` -- so there is no artefact that
+unconditional in ``torchnative/rust/torch_c/src/lib.rs`` -- so there is no artefact that
 could be probed for the absence. What exists is a configuration:
 ``TORCHNATIVE_BACKWARD=off`` in the environment at ``torchnative.adapt`` import
 time (``torchnative.adapt.BACKWARD`` reports what was read). Under it this

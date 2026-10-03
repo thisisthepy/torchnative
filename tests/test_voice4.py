@@ -67,7 +67,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
 # removed because `run.sh` refuses to run when the in-checkout `_C.abi3.so`
 # does not match what was just compiled, and a suite reading a tree outside
 # the checkout is exactly the case that guard cannot see.
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 _MANIFEST_PATH = os.path.join(_HERE, "voice4_bigvgan_ops.json")
 

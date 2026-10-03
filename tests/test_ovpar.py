@@ -54,7 +54,7 @@ import sys
 import threading
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
@@ -71,7 +71,7 @@ from torchnative.export.intelnpu import (  # noqa: E402
 )
 
 _SOURCE_PATH = os.path.join(
-    _ROOT, "python", "torchnative", "export", "intelnpu.py"
+    _ROOT, "torchnative", "python", "torchnative", "export", "intelnpu.py"
 )
 _DOC_PATH = os.path.join(_ROOT, "docs", "devices", "NPUPAR.md")
 

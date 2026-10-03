@@ -46,7 +46,7 @@ fourth time and this time in one shared function rather than a fourth private co
 ### 1.1 The schema, read rather than remembered
 
 The brief said to read upstream's schema instead of recalling it, and the vendored tree has it:
-`python/torchgen/packaged/ATen/native/native_functions.yaml:8722`.
+`torchnative/python/torchgen/packaged/ATen/native/native_functions.yaml:8722`.
 
 ```yaml
 - func: tril(Tensor self, SymInt diagonal=0) -> Tensor
@@ -582,7 +582,7 @@ correction, so it keeps the exact bits it had.
   Its kernels are all present; nobody has transcribed the sequence. That is the largest item this
   round names and leaves.
   > **Correction (문서 감사, 2026-09):** built since — `_sdpa_math` exists in
-  > `crates/torch_c/src/bootstrap.py` (landed in `1938ad1`, "Feat: Open training mode, which every
+  > `torchnative/rust/torch_c/src/bootstrap.py` (landed in `1938ad1`, "Feat: Open training mode, which every
   > sweep in this repository had assumed away", which post-dates this document's own commit
   > `3b7d981`; `git merge-base --is-ancestor 3b7d981 1938ad1` confirms the order). Live-verified:
   > `F.scaled_dot_product_attention(q, k, v, dropout_p=0.1, is_causal=True)` — the exact scenario
@@ -590,7 +590,7 @@ correction, so it keeps the exact bits it had.
   > (`dropout_p != 0.0` routes to `_sdpa_math`) — succeeds today. Round 2's `docs/kernels/SDPA.md`/
   > `docs/models/CKPT2.md`/`docs/models/GENERATE.md` audits already independently confirm the same function
   > (its `enable_gqa` branch, specifically).
-  > <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _sdpa_math present -->
+  > <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sdpa_math present -->
 * **`aten.amin.default`.** Named in §2.4, not written. It is a direction-specific `CustomOp1`, not
   a sign flip. **Status: confirmed still true** — `aten.amin.default` and `aten.argmin.default` are
   both still absent from the current 168-op `_aten_implemented()` list.

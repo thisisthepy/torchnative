@@ -13,12 +13,12 @@ The proof is `tests/test_cplx2.py`: ten tests, every value
 compared element-wise against a live upstream torch in a separate process, on
 **both** components.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs complex_to_copy present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs complex_slice present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs complex_constant_pad_nd present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs complex_view present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs complex_default present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json complex present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs complex_to_copy present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs complex_slice present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs complex_constant_pad_nd present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs complex_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs complex_default present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json complex present -->
 
 ---
 

@@ -352,13 +352,13 @@ Its `reduce_scatter_tensor` shape check is a C++ `Check failed:` that calls
 raising anything Python can catch, and `send` with no matching `recv` blocks
 until the harness times out.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _reduce_fold present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _reduce_kind present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _reduce_scatter_fold present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _pick_fold present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _check_root_n present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _extremum present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _require_sum absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_kind present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _reduce_scatter_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _pick_fold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _check_root_n present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _extremum present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _require_sum absent -->
 <!-- DOCWATCH: symbol-in-file tests/test_collect2.py test_every_collective_matches_upstream_gloo_at_world_three_and_four present -->
 <!-- DOCWATCH: symbol-in-file tests/test_collect2.py test_the_tolerance_is_derived_from_upstream_and_is_not_a_free_parameter present -->
 <!-- DOCWATCH: symbol-in-file tests/test_collect2.py test_the_product_fold_is_in_ascending_rank_order_and_says_so present -->

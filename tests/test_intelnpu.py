@@ -41,7 +41,7 @@ import tempfile
 # Resolved from __file__, not from the cwd: run.sh invokes each test file
 # directly and the cwd it uses is not this file's business.
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 import torchnative.export.intelnpu as intelnpu  # noqa: E402

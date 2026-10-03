@@ -16,7 +16,7 @@ but every one of those runs inside `torch.no_grad()`, which isolates the mode ax
 harder half untouched. README §2 and §3 sell federated learning and test-time adaptation. A
 federated round is *forward, backward, optimiser step, aggregate*. We have the first.
 
-**This is an investigation, not an implementation.** No kernel was written, `crates/torch_c/src/` is
+**This is an investigation, not an implementation.** No kernel was written, `torchnative/rust/torch_c/src/` is
 untouched, and the vendored tree was not modified. The whole diff is this document plus **one
 test** that pins what §1 measured (§10). Everything below is either a command that was run, or is
 labelled as coming from a stub.
@@ -239,7 +239,7 @@ nothing new.
 | Python `autograd.Function` | `python_function.cpp` | **no** — not traversed (§2.4) |
 | derivative formulas | `derivatives.yaml` (687 entries) + `FunctionsManual.cpp` (8765 lines) | **partly** — §4 counts exactly how much |
 
-The vendored tree contains **no** `torch/csrc/autograd/` at all (`python/torch/csrc/`
+The vendored tree contains **no** `torch/csrc/autograd/` at all (`torchnative/python/torch/csrc/`
 holds only `inductor`), so none of this arrives for free the way the Python-level `torch/autograd/`
 package does.
 
@@ -319,7 +319,7 @@ sizes the expense.
 Ground truth is the vendored `derivatives.yaml` — this is torch 2.13.0's own file, in the tree:
 
 ```
-$ grep -c "^- name:" python/torchgen/packaged/autograd/derivatives.yaml
+$ grep -c "^- name:" torchnative/python/torchgen/packaged/autograd/derivatives.yaml
 687
 ```
 
@@ -798,7 +798,7 @@ grep -rl "internal/pycore" $P/dynamo/  ;  grep -rl "internal/pycore" $P/autograd
 grep -c "Py_\|PyObject\|PyGILState" $P/autograd/engine.cpp             # -> 0
 
 # §4  the formula count
-grep -c "^- name:" python/torchgen/packaged/autograd/derivatives.yaml   # -> 687
+grep -c "^- name:" torchnative/python/torchgen/packaged/autograd/derivatives.yaml   # -> 687
 $SHIM -c "import torch,json; json.dump(sorted(torch._C._aten_implemented()),
                                        open('/tmp/ag/shim_ops.json','w'))"            # -> 163
 $PY /tmp/ag/classify.py                                  # 122 = 66 trivial + 31 composed + 25 kernel
@@ -820,7 +820,7 @@ harnesses, and every number they produce is quoted above with the command that m
 
 ## 10. The one thing this round implemented
 
-Nothing in `crates/torch_c/src/` changed. One test was added, because §1's boundary was written down
+Nothing in `torchnative/rust/torch_c/src/` changed. One test was added, because §1's boundary was written down
 in a document and **nothing checked it** — which is precisely the mechanism `docs/verification/AUDIT.md` found
 behind six of eleven false claims, and `docs/verification/DOCWATCH.md` exists to stop.
 

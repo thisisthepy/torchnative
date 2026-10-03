@@ -83,9 +83,9 @@ def test_pyproject_is_the_only_place_a_version_is_declared():
         "setup.py declares a version now. pyproject.toml is the authority; two "
         "declarations means one of them goes stale at the next release."
     )
-    cargo = (REPO / "crates/torch_c/Cargo.toml").read_text()
+    cargo = (REPO / "torchnative/rust/torch_c/Cargo.toml").read_text()
     assert re.search(r'^version = "0\.0\.0"', cargo, re.M), (
-        "crates/torch_c/Cargo.toml no longer carries the placeholder 0.0.0 -- if "
+        "torchnative/rust/torch_c/Cargo.toml no longer carries the placeholder 0.0.0 -- if "
         "the crate version is now meaningful it has to be kept in step here."
     )
 
@@ -218,7 +218,7 @@ def test_the_abi3_wheel_loads_on_later_cpythons():
     because the alternative -- passing silently on a host with only 3.13 --
     is a check that cannot fail (AGENTS.md §17.5).
     """
-    artefact = REPO / "python/torch/_C.abi3.so"
+    artefact = REPO / "torchnative/python/torch/_C.abi3.so"
     if not artefact.exists():
         _skip.skip("   (skipped: no built _C.abi3.so; run scripts/vendor/install_shim.sh)")
         return

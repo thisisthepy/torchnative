@@ -375,8 +375,8 @@ SUMMARY: 4583/4583 table entries matched upstream, 0 failed     (기준선 4574 
 <!-- DOCWATCH: op-implemented aten.randint.low -->
 <!-- DOCWATCH: op-implemented aten.randint.default -->
 <!-- DOCWATCH: op-implemented aten.randperm.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/rng.rs randint_from_to_fill present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/rng.rs randperm_fill present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/rng.rs RANDINT_WIDE_THRESHOLD present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs randint_from_to_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs randperm_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs RANDINT_WIDE_THRESHOLD present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _rng_stream_check present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json randperm present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json randperm present -->

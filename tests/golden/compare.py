@@ -7,7 +7,7 @@ promotion, broadcasting, and view/stride aliasing on top of candle can
 silently diverge from torch's answers, and linking + importing proves
 nothing about whether the numbers agree. This harness asks `_C` what it has
 implemented (`_C._aten_implemented()`) -- never a hardcoded list, so
-coverage grows automatically as crates/torch_c grows -- and for every op it
+coverage grows automatically as torchnative/rust/torch_c grows -- and for every op it
 finds, runs a battery of dtype/shape/boundary-value cases against both
 `_C._aten_dispatch(...)` and the matching `torch.ops.aten.*` overload,
 comparing dtype, shape, and value.
@@ -700,7 +700,7 @@ def run(artefact: str | None, verbose: bool, inject_fault: str | None) -> int:
     # This is deliberate -- see cases.py's module docstring on pre-seeding
     # builders for ops another change is actively implementing -- and must
     # stay silent (not a failure, doesn't touch the pass/fail count) since
-    # it is expected to be non-empty until crates/torch_c catches up. It is
+    # it is expected to be non-empty until torchnative/rust/torch_c catches up. It is
     # still printed so "how much coverage is waiting" is visible at a glance.
     pending_builders = sorted(op for op in CASE_BUILDERS if op not in implemented)
     if pending_builders:

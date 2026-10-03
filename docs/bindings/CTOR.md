@@ -168,9 +168,9 @@ One function in `bootstrap.py`, installed at the `_initExtension` hook of §1. N
 change; no vendored-tree change; no new kernel — every form routes to
 `aten.lift_fresh.default`, which is the primitive `torch.tensor`, `new_tensor` and `as_tensor`
 already use, or to `TensorBase`'s existing native size/re-wrap constructor.
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _make_tensor_class_new present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _array_like_data present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _sized_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _make_tensor_class_new present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _array_like_data present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sized_tensor present -->
 <!-- DOCWATCH: op-implemented aten.lift_fresh.default -->
 
 This round added **no kernel**: `ops covered` was 185 before it and 185 after. That is also why the

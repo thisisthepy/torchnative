@@ -29,17 +29,17 @@
 ## 3. 구조
 
 ```
-crates/torch_c/          torch._C 확장 (Rust · pyo3 abi3-py313 · candle-core)
+torchnative/rust/torch_c/          torch._C 확장 (Rust · pyo3 abi3-py313 · candle-core)
   src/aten.rs            연산자 커널 — 모든 op 은 _aten_dispatch 한 문으로 들어온다
   src/bootstrap.py       include_str! 로 확장에 구워지는 파이썬 부트스트랩
-crates/vulkan_probe/     Vulkan 프로브 크레이트
-crates/wasm_probe/       wasm 프로브 크레이트
+torchnative/rust/vulkan_probe/     Vulkan 프로브 크레이트
+torchnative/rust/wasm_probe/       wasm 프로브 크레이트
 python/
   torchnative/           파이썬 패키지: delta · adapt · nn/federated · device · transformers
                          · export · quant · kernels · api · distributed
   torch/                 upstream 벤더링 트리 (생성물, gitignore, 손대지 않음)
 tests/                   게이트 스위트 (run.sh) · golden/ (upstream 값 대조) · docwatch/ (문서 검사기)
-benches/                 측정 스크립트
+tests/bench/                 측정 스크립트
 scripts/                 vendor/ (vendor_torch.sh · install_shim.sh · vendor_candle.sh) · wheel/ ·
                          devices/ · scan/ · colab/
 vendor/                  candle-core · candle-metal-kernels 포크와 그 패치
@@ -156,9 +156,9 @@ npu = ["openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (
 
 ### 6.6 `[tool.setuptools]`
 
-- **`package-dir = { "" = "python" }`** — 없으면 저장소 루트가 패키지 루트로 잡힙니다. 옛
+- **`package-dir = { "" = "torchnative/python" }`** — 없으면 저장소 루트가 패키지 루트로 잡힙니다. 옛
   `torchnative/src/main` 레이아웃에서는 `import main.torchnative` 가 되는 휠이 나왔습니다.
-- **`packages.find` 는 `torch` 를 포함합니다.** `python/torch` 는 남의 torch 에 붙이는 것이 아니라
+- **`packages.find` 는 `torch` 를 포함합니다.** `torchnative/python/torch` 는 남의 torch 에 붙이는 것이 아니라
   우리가 조립한 트리입니다. 제외했던 것이 PyPI 의 `py3-none-any` 배포판을 만들었습니다. 트리는 git 에
   없으므로 두 벤더 스크립트를 돌리기 전에는 찾을 것이 없고, `scripts/wheel/build.py` 는 그 상태에서 빌드를
   거부합니다.

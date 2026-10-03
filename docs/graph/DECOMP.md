@@ -51,8 +51,8 @@
   없는 것이며, "없다" 를 확인한 방법과 그 확인이 실패할 수 있다는 것은 §7.2.1 입니다.
 - **ExecuTorch Edge 까지 얼마나 남았는가.** §8. 분해는 필요조건이고 충분조건이 아닙니다.
 
-바뀐 파일: `crates/torch_c/src/bootstrap.py`, `crates/torch_c/src/overloads.json`,
-`python/torchnative/export/decompose.py`,
+바뀐 파일: `torchnative/rust/torch_c/src/bootstrap.py`, `torchnative/rust/torch_c/src/overloads.json`,
+`torchnative/python/torchnative/export/decompose.py`,
 `tests/test_shim.py`, `tests/verify_schemas.py`,
 그리고 §4 의 표를 만드는 `tests/decomp_sweep.py`.
 
@@ -485,7 +485,7 @@ eager 와 값·shape·dtype 모두 일치합니다 — 이번에도 커널이 �
 
 ### 7.1 `aten.sum.dim_IntList` 의 빈 `dim` 목록 — **고쳐짐** (2026-08-28)
 
-`crates/torch_c/src/aten.rs::sum_or_mean` 이 빈 `dim` 목록을 모든 축으로 확장하도록 고쳐졌습니다.
+`torchnative/rust/torch_c/src/aten.rs::sum_or_mean` 이 빈 `dim` 목록을 모든 축으로 확장하도록 고쳐졌습니다.
 그 전에는 입력을 그대로 돌려줬고, `aten.sum.default` 의 상류 규칙이
 `sum(x, dim=[], dtype=None)` 을 만들어 그 경로의 첫 호출자가 되었습니다. `mean.dim` 이 같은
 커널을 공유해 같은 수정으로 함께 고쳐졌습니다.
@@ -727,11 +727,11 @@ print("CIA:", len(torch._C._dispatch_get_registrations_for_dispatch_key(
 **이 프로젝트가 실제로 돌리는 모델에서 캡처한 그래프**에 대고 개수를 셌습니다. 추정이 아니라
 계수입니다. 재현은 `tests/nnapi_sizing.py`.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/target.py nnapi_ops present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/target.py coreml_ops present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/target.py full_decomposition_table present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/target.py lower_to present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/target.py survey present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py nnapi_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py coreml_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py full_decomposition_table present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py lower_to present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/target.py survey present -->
 
 ### 12.1 헤드라인 — 상류의 분해표는 이 빌드에서 **돕니다**
 

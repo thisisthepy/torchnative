@@ -14,7 +14,7 @@ were found.
 
 ## 1. The schema, from the vendored tree
 
-`python/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
+`torchnative/python/torchgen/packaged/ATen/native/native_functions.yaml:7026`:
 
 ```yaml
 - func: _grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor

@@ -347,7 +347,7 @@ tell them nothing is there.
   name the user-level expression and one names the key. Closing it properly means
   closing §3.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs set_size_class present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs set_size_class present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams present -->
 <!-- DOCWATCH: op-implemented aten.mul.Scalar -->
 <!-- DOCWATCH: op-implemented aten.add.Scalar -->

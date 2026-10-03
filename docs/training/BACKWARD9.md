@@ -331,10 +331,10 @@ TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tests/golden/compare.
 | 5 | **That `.grad`'s interaction with the storage guard has no case left.** | §2 argues it structurally cannot fire, because the tape is taken before the write and the write is off grad mode. That is an argument about two code paths, not a sweep |
 | 6 | **`backward()` across a capture-region boundary.** | `docs/training/BACKWARD7.md` §10 row 7, unchanged. `eager_record` returns early while a region is open, so those ops are absent from the eager graph, and now that `.backward()` exists the question is askable and still unasked |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_engine present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _accumulate_into_grad present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _dense_copy_of present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs duplicate_for_retained_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_engine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _accumulate_into_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _dense_copy_of present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs duplicate_for_retained_backward present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_two_leaves_of_one_add_do_not_share_one_gradient_tensor present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_accumulated_grad_is_dense_enough_to_be_written_in_place present -->

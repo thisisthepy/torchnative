@@ -2,7 +2,7 @@
 
 // `aten.add.Tensor` for f32, same shape, alpha == 1: c[i] = a[i] + b[i].
 //
-// Copied deliberately from `crates/vulkan_probe/shaders/vecadd.comp` rather than
+// Copied deliberately from `torchnative/rust/vulkan_probe/shaders/vecadd.comp` rather than
 // shared with it. The probe answers "can a compute shader run at all" and must
 // keep answering that if this file changes; a shared file would make one
 // question's edit silently redefine the other's evidence.

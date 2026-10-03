@@ -60,7 +60,7 @@ from test_shim import _C
 import _skip
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ATEN_RS = os.path.join(_HERE, "..", "crates", "torch_c", "src", "aten.rs")
+_ATEN_RS = os.path.join(_HERE, "..", "torchnative", "rust", "torch_c", "src", "aten.rs")
 
 # The three float dtypes Metal has. `float64` is absent because Metal has no
 # double on any of twenty-two roads (docs/devices/matrix.md section 3.1) and a

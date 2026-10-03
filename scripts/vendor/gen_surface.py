@@ -6,7 +6,7 @@ Why this exists
 VENDOR.md measured the hole: upstream `torch._C` is 989 names, 32 C
 submodules, a 694-member `TensorBase`, and a 985-member
 `_VariableFunctions`. `import torch` demands most of that surface before it
-finishes, so `crates/torch_c` has to present it.
+finishes, so `torchnative/rust/torch_c` has to present it.
 
 Where the names come from matters. `scripts/vendor/probe.py --dump-surface` reads
 them off an *installed* upstream `_C.so`, which is right for an instrument
@@ -14,7 +14,7 @@ them off an *installed* upstream `_C.so`, which is right for an instrument
 from the binary we are replacing, and it would tie the build to having real
 torch installed).
 
-This script reads `python/torch/_C/*.pyi` instead. Those files are part of
+This script reads `torchnative/python/torch/_C/*.pyi` instead. Those files are part of
 the vendored BSD Python tree -- upstream ships them precisely so that other
 tools can know `_C`'s interface without loading it. They are also the
 tree's *own* statement of what it expects, which is the thing the shim has
@@ -30,7 +30,7 @@ Output is a single JSON blob compiled into the crate (`include_str!`), so
 the built `_C.so` needs neither the stubs nor an interpreter with torch in
 it at runtime.
 
-    scripts/vendor/gen_surface.py                 # writes crates/torch_c/src/surface.json
+    scripts/vendor/gen_surface.py                 # writes torchnative/rust/torch_c/src/surface.json
     scripts/vendor/gen_surface.py --print-summary
 """
 
@@ -355,11 +355,11 @@ def main() -> int:
         "--vendor-dir",
         default=os.environ.get(
             "TORCHNATIVE_VENDOR_DIR",
-            os.path.join(REPO, "python"),
+            os.path.join(REPO, "torchnative", "python"),
         ),
     )
     ap.add_argument(
-        "--out", default=os.path.join(REPO, "crates", "torch_c", "src", "surface.json")
+        "--out", default=os.path.join(REPO, "torchnative", "rust", "torch_c", "src", "surface.json")
     )
     ap.add_argument("--print-summary", action="store_true")
     args = ap.parse_args()

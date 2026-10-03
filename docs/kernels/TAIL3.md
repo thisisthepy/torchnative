@@ -284,7 +284,7 @@ misleading in the same way `MatMulUnexpectedStriding` was:
   one branch — expand `...` to the operand's leading axes given its rank, per operand — and not a
   general einsum planner.
 
-Both live in `crates/torch_c/src/bootstrap.py`, which this worktree was told not to edit. They are
+Both live in `torchnative/rust/torch_c/src/bootstrap.py`, which this worktree was told not to edit. They are
 recorded here as sized work items rather than left as sweep lines.
 
 ---
@@ -358,22 +358,22 @@ The ops now in `_aten_implemented()`:
 
 and the table rows that make them callable:
 
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json bitwise_xor present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json erfinv present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json index_add present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json scatter_reduce present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json eye present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json bitwise_xor present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json __xor__ present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json erfinv present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json index_add present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json scatter_reduce present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json view_as present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json bitwise_xor present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json erfinv present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json index_add present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json scatter_reduce present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json eye present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json bitwise_xor present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json __xor__ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json erfinv present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json index_add present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json scatter_reduce present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json view_as present -->
 
 and the one that is a schema with no kernel behind it, on purpose (§6):
 
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json as_strided present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs fold_batch_axes_matmul present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json as_strided present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fold_batch_axes_matmul present -->
 
 `aten.as_strided.default` is deliberately **not** an `op-implemented` marker: the whole point of §6
 is that it is listed and unimplemented, and a marker asserting otherwise would be the false claim

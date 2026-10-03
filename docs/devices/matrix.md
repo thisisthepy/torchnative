@@ -131,7 +131,7 @@ correction above (`AGREES -> BREAKS`, 168, and `AGREES -> REFUSES`, 54).
 
 ### 3.1 `float64` on Metal refuses by name — including the factories
 
-Metal has no `double`. `metal_dtype_gate` (`crates/torch_c/src/device.rs`) already
+Metal has no `double`. `metal_dtype_gate` (`torchnative/rust/torch_c/src/device.rs`) already
 refused it with upstream's own sentence on every road through
 `PyTensorBase::new`, which is the one constructor every dense tensor passes
 through. **The factories did not reach it**: they call candle first, and candle
@@ -147,15 +147,15 @@ Eight roads spoke that way: `ones`, `full`, `scalar_tensor`, `arange`,
 sentence — both name an internal symbol for a fact about Metal's API — and it is
 the shape `test_intmps.py` already rejected for the integer dtypes.
 
-`storage_for` (`crates/torch_c/src/aten.rs`) pairs `PyDtype::storage` with the
+`storage_for` (`torchnative/rust/torch_c/src/aten.rs`) pairs `PyDtype::storage` with the
 **existing** gate and is called from the nine factory sites. This is not a
 second guard: it is the same guard asked one step earlier on the paths that
 would otherwise never reach it, so nullifying `metal_dtype_gate` takes both out
 together. Two guards that shadow each other is the defect AGENTS.md §17.5
 records, and it is what the declined change below would have created.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs metal_dtype_gate present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs storage_for present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs metal_dtype_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs storage_for present -->
 <!-- DOCWATCH: symbol-in-file tests/test_dtmdev.py test_float64_refuses_by_name_on_every_road_onto_metal present -->
 
 ### 3.2 `_tensor_from_flat` builds on the host and moves last
@@ -506,13 +506,13 @@ half of cause D is no longer resting on a structural derivation: it is
 bracketed by `_C._metal_counters()` in §4.3c, where the host-twin experiment
 AGENTS.md §13.1 records as impossible on Metal has now been run on Metal.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs host_full present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs exact_int_matmul present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs gemm_multiply present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs gemm_broadcast_multiply present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reject_bool_gemm present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reject_device_int_gemm present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs exact_int_gemm_dtype present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs host_full present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs exact_int_matmul present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gemm_multiply present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs gemm_broadcast_multiply present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reject_bool_gemm present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reject_device_int_gemm present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs exact_int_gemm_dtype present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_every_float_factory_in_cause_d_answers_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_constant_is_rounded_once_and_not_twice present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_no_float_constant_is_still_materialised_on_the_device present -->
@@ -834,7 +834,7 @@ because it only inspects `Tensor::full`. Eight measured cells
 behind it. **Not done here** — it is new operator work, not verification, and
 it is proposed rather than taken.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs amax_keepdim_anywhere present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs amax_keepdim_anywhere present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_mps_fill_is_bracketed_by_the_metal_counters present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_nan_seed_call_sites_answer_where_they_are_reachable present -->
 <!-- DOCWATCH: symbol-in-file tests/test_constset.py test_the_nan_seed_on_mps_is_either_refused_or_a_recorded_defect present -->
@@ -1389,7 +1389,7 @@ mutants leave it green, because `abs(INT_MIN) == INT_MIN` is also what an
 identity returns. A test that no mutant can redden is worthless, and that one
 needed a fourth mutant to show it is not.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs integral_abs_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs integral_abs_on_device present -->
 <!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_agrees_with_upstream_on_both_devices present -->
 <!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_wraps_at_the_signed_minimum_exactly_as_upstream_does present -->
 <!-- DOCWATCH: symbol-in-file tests/test_absmps.py test_abs_on_mps_does_not_come_back_through_the_readback_gate present -->
@@ -1592,9 +1592,9 @@ characterises the mechanism rather than discriminating a fault in it. It is
 kept: it is the test that would fire if a future round served devices by
 rebinding the wrapper, which is the obvious wrong way to do this.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs write_on_device present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs clamp_values absent -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs clamp_values present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs write_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs clamp_values absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs clamp_values present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_in_place_ops_agree_with_upstream_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_a_view_taken_before_the_write_sees_it_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsinplace.py test_writing_into_an_offset_slice_on_mps_touches_only_that_slice present -->
@@ -1664,7 +1664,7 @@ test in this round asserts a counter delta for `softmax_on_device`, for the
 remain where §7.5 put them until someone writes the assertion. The instrument
 now exists; the work of pointing it at each cell does not.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs metal_counters present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs metal_counters present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
@@ -1713,8 +1713,8 @@ planted and all four opened a compute encoder and downloaded nothing. The
 substitution above is a mutant this round introduced and removed, not a defect
 it discovered.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs integral_abs_on_device present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs twin_abs_i64 absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs integral_abs_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs twin_abs_i64 absent -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_host_readback_in_aten_is_classified present -->
 
 ### 7.13 `DType::I8` on Metal — declined, with the reason measured
@@ -1750,7 +1750,7 @@ adding shader instantiations to `candle-metal-kernels`, a **second** crate to
 vendor. This round's approval was to patch this fork, so that decision is left
 where it belongs: with the user, stated rather than taken.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs shim_mps_unsupported_int_dtypes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs shim_mps_unsupported_int_dtypes present -->
 
 ### 7.14 The counter pointed at the rest of the table — and twelve cells are computed on the host
 
@@ -1924,8 +1924,8 @@ sweep to M-B.
 <!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_every_in_place_operator_that_reaches_on_mps_reads_nothing_back present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_eight_operators_answer_an_mps_dispatch_from_the_host present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs softmax_on_device present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs twin_softmax absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs softmax_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs twin_softmax absent -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
 
 ### 7.15 `candle_metal_kernels::DType` — the instantiation is macro-driven, and that is the shape of the `I8` decision
@@ -2159,8 +2159,8 @@ above says these operators are correct on the CPU at every shape; it says the
 dtypes each note advertises agree with upstream at the shape measured, and the
 shape is `[2, 3]`.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs MPS_HOST_READBACK_NOTES present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs host_readback_note present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_NOTES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs host_readback_note present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py _ops_that_reach_the_host present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py _host_reaching_functions present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py _callees present -->
@@ -2170,8 +2170,8 @@ shape is `[2, 3]`.
 <!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_the_derivation_finds_the_ten_without_being_told_their_names present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_a_readback_behind_two_un_named_hops_is_still_derived present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsrefuse.py test_the_matrix_grades_every_mps_cell_of_the_ten_as_refuses present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs norm_pow_walk present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs order_along present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs norm_pow_walk present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs order_along present -->
 <!-- DOCWATCH: op-implemented aten.sort.default -->
 <!-- DOCWATCH: op-implemented aten.topk.default -->
 
@@ -2187,7 +2187,7 @@ the second crate was approved, so the other half could be built.
 
 §7.15 was read-only and this round depended on it, so it was verified against
 `candle-metal-kernels-0.11.0` as published — the crate whose sha256
-`242e83c6…3d3e` is the `checksum` `crates/torch_c/Cargo.lock` already carried,
+`242e83c6…3d3e` is the `checksum` `torchnative/rust/torch_c/Cargo.lock` already carried,
 i.e. cargo's own pin and not one chosen here.
 
 | §7.15 said | measured |
@@ -2307,7 +2307,7 @@ M-2 and M-5.
   attributed to it here.
 
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh candle-metal-kernels present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/Cargo.toml candle-metal-kernels present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml candle-metal-kernels present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/lib.rs I8 present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/binary.metal "init_binary_k(bop, bop, i8, int8_t, int8_t)" present -->
 <!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i8, int8_t)" present -->
@@ -2415,9 +2415,9 @@ next sweep moves them.
 Those lines are `remainder_op` and `fmod_op`; the cases reach `arith_scalar`.
 They are listed as unexercised now, with the measured refusal as the reason.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs host_vec present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs widen_f64_host present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs host_const_tests present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs host_vec present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64_host present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs host_const_tests present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_constant_gate_agrees_with_upstream_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_constant_gate_operators_compute_on_the_device present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsconst.py test_the_rng_writers_narrow_on_the_host_and_draw_the_same_stream present -->

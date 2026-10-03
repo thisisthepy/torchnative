@@ -275,8 +275,8 @@ Counted per AGENTS.md §17.3, since "+10 tests" is four different things otherwi
 | **documentation corrected** | `docs/platform/RELEASE_0_1_0b0.md` §5's transformer clause is now measurably false (§4) — **not edited by this round**, because that file is not this round's territory; it is named here so the next round has the measurement |
 | **deleted** | nothing |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs convolution_backward present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs avg_pool_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs convolution_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs avg_pool_backward present -->
 <!-- DOCWATCH: symbol-in-file tests/test_train.py test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file tests/test_train.py test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file tests/test_train.py test_the_weight_gradient_needs_stride_and_dilation_exchanged present -->

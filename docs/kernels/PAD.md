@@ -1,6 +1,6 @@
 # PAD — the op in front of the speech roadmap, from two directions
 
-Worktree `work/pad` on develop. Territory: `crates/torch_c/src/aten.rs`,
+Worktree `work/pad` on develop. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `methods.json`, `overloads.json`, `tests/golden/cases.py`, and the new
 `tests/test_pad.py`. `bootstrap.py`, `tensor.rs`, `dtype.rs`,
 `device.rs`, `capture.rs`, `tape.rs`, `scripts/wheel/` and `torchnative/` were
@@ -224,7 +224,7 @@ identical for `return_complex=True`, `return_complex=False` **and**
 ```text
 NotImplementedError: not implemented in torch._C shim: torch.stft(...)
 -- overload resolution has no table entry for this op
-(crates/torch_c/src/overloads.json); call torch.ops.aten.stft.<overload>, which
+(torchnative/rust/torch_c/src/overloads.json); call torch.ops.aten.stft.<overload>, which
 carries the overload and reaches the same dispatcher
 ```
 

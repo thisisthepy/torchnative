@@ -278,9 +278,9 @@ this round's, in either direction. With the variable set, this worktree's artefa
 | 6 | **Whether the six `float8_e4m3fn` in-place cases really are a closed gap.** | §9's note: they came from the shared target directory's artefact, not from this worktree's. Somebody's build fills F8 in place now. Chasing it here would have been reporting on another agent's tree |
 | 7 | **W9, W8, or the eager recorder.** | Not started. `docs/training/BACKWARD5.md` §6's order was W10a → W9 → W8; this is the first of those and, as that section insisted, it does not commit the project to the rest |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs note_mutation present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs check_constants_are_fresh present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs const_stamps present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs STORAGE_VERSIONS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs note_mutation present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs check_constants_are_fresh present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs const_stamps present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs STORAGE_VERSIONS present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_constant_version_check_sees_a_write_through_a_view present -->

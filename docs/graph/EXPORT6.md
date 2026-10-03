@@ -382,8 +382,8 @@ gap this round closed. §3.
 <!-- DOCWATCH: symbol-in-file tests/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
 <!-- DOCWATCH: symbol-in-file tests/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
 <!-- DOCWATCH: symbol-in-file tests/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _default_python_value present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs seat_positionally present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs is_meta_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _default_python_value present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs seat_positionally present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs is_meta_storage present -->
 <!-- DOCWATCH: op-implemented aten.new_empty.default -->
 <!-- DOCWATCH: op-implemented aten.squeeze.dims -->

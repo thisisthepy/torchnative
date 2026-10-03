@@ -290,7 +290,7 @@ meta support is a property of an op already on the list and the golden harness
 compares values, which a meta tensor has none of (`docs/devices/META.md` §7).
 Op coverage is unchanged, which is why the gate's `ops=` count does not move.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs strides_like_channels_last present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs strides_like_channels_last present -->
 <!-- DOCWATCH: op-implemented aten.constant_pad_nd.default -->
 <!-- DOCWATCH: symbol-in-file tests/test_canine.py test_constant_pad_nd_meta_layout_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file tests/test_canine.py test_constant_pad_nd_meta_negative_pad_preserves_where_positive_pad_contiguates present -->

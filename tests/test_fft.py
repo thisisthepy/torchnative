@@ -39,7 +39,7 @@ from test_shim import _C
 import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 
 # The shim transforms in `f64` on the host and upstream transforms in `f32`, so
@@ -578,7 +578,7 @@ def test_as_strided_landed_and_stft_still_does_not_use_it():
         "as_strided left _aten_implemented(); if it was reverted, invert this "
         "test back rather than deleting it -- docs/kernels/STRIDED.md §1"
     )
-    path = os.path.join(_REPO_ROOT, "crates", "torch_c", "src", "aten.rs")
+    path = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")
     if not os.path.isfile(path):
         _skip.skip("   (skipped: aten.rs is not beside this file)")
         return

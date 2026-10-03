@@ -297,7 +297,7 @@ D=/Volumes/macMini/tmp-agree                 # NOT /tmp: ~8 GB of bundles, and /
 cd tests
 
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D
-PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
                                            $PY agree_sweep.py --replay  --dir $D
 $PY agree_sweep.py --report --dir $D
 

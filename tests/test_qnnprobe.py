@@ -45,7 +45,7 @@ import sys
 import _skip
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 

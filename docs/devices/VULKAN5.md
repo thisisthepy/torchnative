@@ -20,8 +20,8 @@
 <!-- DOCWATCH: count vulkan_tests_ok ge 19 -->
 <!-- DOCWATCH: symbol-in-file tests/vulkan_coverage.py UNVERIFIED present -->
 <!-- DOCWATCH: symbol-in-file tests/run.sh vulkan_coverage.py present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs MVK_CONFIG_FAST_MATH_ENABLED present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs loader_candidates_for present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs MVK_CONFIG_FAST_MATH_ENABLED present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs loader_candidates_for present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_native_layer_norm_agrees_with_upstream_at_a_derived_tolerance present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_bmm_agrees_with_upstream_and_is_the_kernel_it_claims_to_be present -->
 

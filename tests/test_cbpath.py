@@ -31,7 +31,7 @@ import sys
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 # run.sh's own override, so the suite can be pointed at another built tree
 _VENDOR_DIR = os.environ.get(
-    "TORCHNATIVE_VENDOR_DIR", os.path.join(_REPO_ROOT, "python")
+    "TORCHNATIVE_VENDOR_DIR", os.path.join(_REPO_ROOT, "torchnative", "python")
 )
 
 

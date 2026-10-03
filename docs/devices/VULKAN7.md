@@ -16,14 +16,14 @@
 | 성능은 | 재지 않았다. `docs/devices/VULKAN2.md` §4.4 의 이유 그대로 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 38 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs VIEW_RANK_MAX present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs materialise_view present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs check_index_range present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs broadcast_binary present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs matmul_vulkan present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs gather_vulkan present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs strided_gather_u32 present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs VIEW_RANK_MAX present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs materialise_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs check_index_range present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs broadcast_binary present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs matmul_vulkan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs gather_vulkan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs strided_gather_u32 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs VULKAN_INDEX_MAX present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_pretrained_bert_forwards_on_the_gpu_and_agrees_with_upstream present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_view_ops_are_bit_identical_to_upstream_and_ran_on_the_gpu present -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_index_range_is_inherited_through_views_and_a_loose_one_refuses_by_name present -->

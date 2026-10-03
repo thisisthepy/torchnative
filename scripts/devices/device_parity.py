@@ -234,7 +234,7 @@ def _(a, b):
 @case("sum.dim_IntList (dim=[])")
 def _(a, b):
     # The fix docs/graph/DECOMP.md §6.1 records: an empty `dim` list means "reduce
-    # every dimension", not "reduce none". `crates/torch_c/src/aten.rs` is
+    # every dimension", not "reduce none". `torchnative/rust/torch_c/src/aten.rs` is
     # ordinary CPU-only Rust with no platform-conditional code in this
     # function, so there is no reason to expect the device to disagree with
     # the host here -- this case exists to check that expectation rather
@@ -331,7 +331,7 @@ def _(a, b):
     # Recorded because it fails, and it fails the same way on both ends. The
     # module calls `torch.relu(...)` (no overload suffix) via `F.relu`, and the
     # shim's overload table has no entry for that spelling. It is a gap in
-    # `crates/torch_c/src/overloads.json`, not a device problem -- which is
+    # `torchnative/rust/torch_c/src/overloads.json`, not a device problem -- which is
     # exactly what running it on both host and device establishes.
     import torch.nn as nn
 

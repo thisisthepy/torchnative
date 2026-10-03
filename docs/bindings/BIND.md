@@ -1,9 +1,9 @@
 # BIND — the Python argument-binding layer
 
-What was hot in `crates/torch_c/src/bootstrap.py`'s overload resolution, what was
+What was hot in `torchnative/rust/torch_c/src/bootstrap.py`'s overload resolution, what was
 precomputed, why that is safe, and what is still slower than upstream.
 
-**This is `crates/torch_c/src/bootstrap.py`, and Android loads the same file** —
+**This is `torchnative/rust/torch_c/src/bootstrap.py`, and Android loads the same file** —
 it is embedded in the artefact `scripts/vendor/install_shim.sh` installs, and the
 Android build embeds that same source. Nothing here is host-specific: it is
 plain Python doing dict and attribute work, so the win applies on device too,
@@ -357,16 +357,16 @@ which is a large part of why this project exists), so this section reports
 
 ### 7.1 `bootstrap.py` is baked into the artefact, not loaded from disk
 
-`crates/torch_c/src/lib.rs:568` does
+`torchnative/rust/torch_c/src/lib.rs:568` does
 `std::ffi::CString::new(include_str!("bootstrap.py"))` — the source text is
 compiled into `lib_C.so` at Rust build time. Swapping the `.py` file on the
 device without rebuilding does nothing; the interpreter never reads a
 `bootstrap.py` file at all on either platform. **Both sides were rebuilt** for
 `aarch64-linux-android` via `scripts/devices/device_android.sh build`:
 
-* new (HEAD, `972dfe4`): `crates/torch_c/src/bootstrap.py` unchanged, built as-is.
-* old (`972dfe4^`): `git show 972dfe4^:crates/torch_c/src/bootstrap.py` copied
-  over `crates/torch_c/src/bootstrap.py`, built, then the working tree file was
+* new (HEAD, `972dfe4`): `torchnative/rust/torch_c/src/bootstrap.py` unchanged, built as-is.
+* old (`972dfe4^`): `git show 972dfe4^:torchnative/rust/torch_c/src/bootstrap.py` copied
+  over `torchnative/rust/torch_c/src/bootstrap.py`, built, then the working tree file was
   immediately restored from a `cp` backup (`git status --short` confirmed a
   clean diff afterward).
 
@@ -432,7 +432,7 @@ device measurement supports, rather than merely assumes, the transfer.**
 * **Rebuild required, `.py` swap alone does not work** (§7.1) — both artefacts
   were built via `scripts/devices/device_android.sh build` for `aarch64-linux-android`,
   saved to `/tmp/bw_bind_android/lib_C.{old,new}.so` (verified distinct md5),
-  and `crates/torch_c/src/bootstrap.py` was restored to HEAD (`cp` backup, not
+  and `torchnative/rust/torch_c/src/bootstrap.py` was restored to HEAD (`cp` backup, not
   `git checkout`) immediately after the old build — `git status --short` was
   clean on that file before device rounds began.
 * Only `/data/local/tmp/bw_device/site/torch/_C.abi3.so` was swapped between
@@ -580,7 +580,7 @@ read the zero as coverage.
 verbatim copy of its predecessor. This round compares **`resolve`**, which is a
 superset — it includes candidate ordering, the refusal `TypeError`, and the
 keyword half. The pre-merge `resolve` *and* `_bind` are extracted verbatim from
-`git show HEAD:crates/torch_c/src/bootstrap.py` and exec'd against the live
+`git show HEAD:torchnative/rust/torch_c/src/bootstrap.py` and exec'd against the live
 module's globals; one substitution is applied and asserted to occur exactly once
 (`self._bind(` → `_old_bind(self, `, since the new class has no `_bind`). The
 new side is likewise loaded from the source file rather than off the class, so
@@ -974,8 +974,8 @@ does not have to re-derive it.
 > are unaffected and reconfirmed live in this audit.
 >
 > Standing check (docs/verification/DOCWATCH.md):
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs interned present -->
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_tensor_dtype_identity absent -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs interned present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_tensor_dtype_identity absent -->
 
 ### 9.4 What it costs -- measured, and it is not the story
 

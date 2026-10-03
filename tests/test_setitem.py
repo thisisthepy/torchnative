@@ -309,7 +309,7 @@ def test_the_setitem_document_carries_the_patch_it_promises():
     assert anchor in text, (
         "SETITEM.md no longer quotes the anchor its patch replaces"
     )
-    bootstrap = (root / "crates" / "torch_c" / "src" / "bootstrap.py").read_text()
+    bootstrap = (root / "torchnative" / "rust" / "torch_c" / "src" / "bootstrap.py").read_text()
     assert bootstrap.count(anchor) == 2, (
         f"the anchor SETITEM.md's patch keys on appears {bootstrap.count(anchor)} "
         "times in bootstrap.py, not the 2 it did when the patch was written "

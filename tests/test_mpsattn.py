@@ -105,7 +105,7 @@ def test_the_softmax_ops_left_the_refusal_list_by_being_rewritten():
     """
     parsed = _aten_rs_functions()
     if parsed is None:
-        _skip.skip("   (skipped mpsattn source claim: crates/torch_c/src/aten.rs is "
+        _skip.skip("   (skipped mpsattn source claim: torchnative/rust/torch_c/src/aten.rs is "
               "not beside this file -- installed rather than in-tree)")
         return
     bodies, text = parsed
@@ -372,7 +372,7 @@ def test_a_float_literal_and_a_scalar_where_reach_the_device_at_all():
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 
 # Shrunk, for `arch_sweep.py`'s reason: the operators reached are the same and

@@ -1,12 +1,12 @@
 # NPU — serialising a captured graph for NNAPI and CoreML
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi.py to_jit_module present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi.py parse_model present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi.py verify_shapes present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi.py fold_constants present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py to_mil_program present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py compile_model present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py coreml_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py to_jit_module present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py parse_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py verify_shapes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi.py fold_constants present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py to_mil_program present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py coreml_ops present -->
 
 ## 1. The question this round had to answer first — and the answer is *both*
 
@@ -280,7 +280,7 @@ being appended to this one.
     export TORCH_C_STAGE=/tmp/stage-npu
     PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-    cd crates/torch_c && cargo build --release && cd -
+    cd torchnative/rust/torch_c && cargo build --release && cd -
     bash scripts/vendor/install_shim.sh
     PYTHON=$PY sh tests/run.sh
 

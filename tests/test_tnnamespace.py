@@ -43,7 +43,7 @@ import subprocess
 import sys
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 _PKG = os.path.join(_VENDOR_DIR, "torchnative")
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")

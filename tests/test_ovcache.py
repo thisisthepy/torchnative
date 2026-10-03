@@ -1,6 +1,6 @@
 """Where a compiled OpenVINO model is allowed to live, and that it gets there.
 
-`python/torchnative/export/intelnpu.py` compiled every leaf from
+`torchnative/python/torchnative/export/intelnpu.py` compiled every leaf from
 scratch, every time, because `ov_core_compile_model(core, model, device, 0, &out)`
 passed **zero properties** and so never set `ov::cache_dir`. On a 36-layer
 Qwen3-4B that is 252 `_NPULinear` leaves, each compiled once at the prompt shape
@@ -37,7 +37,7 @@ import sys
 import warnings
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 # Before torch, not after: a suite that imports torch first passes in a shell
@@ -497,7 +497,7 @@ def test_the_non_variadic_compile_model_props_is_still_not_used():
     a zero.
     """
     source = open(
-        os.path.join(_ROOT, "python", "torchnative", "export", "intelnpu.py"),
+        os.path.join(_ROOT, "torchnative", "python", "torchnative", "export", "intelnpu.py"),
         encoding="utf-8",
     ).read()
     binds = [

@@ -259,7 +259,7 @@ not a generic string), and `native_group_norm` is checked to be reachable as a f
 FAIL test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree:
 AssertionError: sqrt__fn: got 'ERROR:NotImplementedError:not implemented in torch._C shim:
 torch.sqrt_(...) -- overload resolution has no table entry for this op
-(crates/torch_c/src/overloads.json); call torch.ops.aten.sqrt_.<overload>, which carries the
+(torchnative/rust/torch_c/src/overloads.json); call torch.ops.aten.sqrt_.<overload>, which carries the
 overload and reaches the same dispatcher'
 ```
 
@@ -304,12 +304,12 @@ number, following the pattern every earlier round in this file already uses):
 
 ## 7. Files touched, and what was deliberately not touched
 
-`crates/torch_c/src/aten.rs` (14 kernels + `IMPLEMENTED` entries + `detach_inplace_refusal` +
-dispatch wiring), `crates/torch_c/src/methods.json` / `overloads.json` (15 spellings + 1 function
+`torchnative/rust/torch_c/src/aten.rs` (14 kernels + `IMPLEMENTED` entries + `detach_inplace_refusal` +
+dispatch wiring), `torchnative/rust/torch_c/src/methods.json` / `overloads.json` (15 spellings + 1 function
 spelling for `native_group_norm`), `tests/golden/cases.py` (14 case builders + 14
 `_view_write_cases` entries), `tests/test_shim.py` (two counters updated, one
 road script/test extended).
 
 **Not touched**: `capture.rs` (§4 -- the name rule already covered the new ops),
 `clamp_dtype_refusals` in `aten.rs` (§2c names the bug it has; fixing it is `clamp_`'s file, not
-this round's), `python/torch/` (upstream's tree, off limits).
+this round's), `torchnative/python/torch/` (upstream's tree, off limits).

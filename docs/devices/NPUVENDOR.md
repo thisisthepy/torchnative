@@ -1,12 +1,12 @@
 # NPUVENDOR — the operating system is not the silicon vendor
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py NPU_CANDIDATES present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/__init__.py npu_candidates present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/_pcivendor.py npu_vendor_report present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NPU_CANDIDATES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py npu_candidates present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py npu_vendor_report present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_pcivendor.py SOURCED_NPU_DEVICES present -->
 
-`python/torchnative/device/__init__.py`,
-`python/torchnative/device/_pcivendor.py`.
+`torchnative/python/torchnative/device/__init__.py`,
+`torchnative/python/torchnative/device/_pcivendor.py`.
 Tests: `tests/test_npuvendor.py`, `tests/test_devicens.py`.
 Hardware script for the one machine that can settle this: `scripts/devices/npuvendor_verify.py`.
 

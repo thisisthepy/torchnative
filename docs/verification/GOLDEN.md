@@ -15,7 +15,7 @@ change) called `_aten_dispatch` **positionally**:
 `c_module._aten_dispatch("aten.add.Tensor", a_c, b_c)`. Production code never
 calls that way — `bootstrap.py`'s `resolve()`/`_bind()` binds a call into a
 dict and dispatches with `dispatch(key, **bound)`, always by keyword. The
-keyword lookup goes through `optional()` in `crates/torch_c/src/aten.rs`, which
+keyword lookup goes through `optional()` in `torchnative/rust/torch_c/src/aten.rs`, which
 for an argument found in `kwargs` (not in the positional tuple) consults
 `interned_name()` — a hand-written table mapping ~74 argument names to
 pre-interned `PyString`s, added for the performance work docs/design/DISPATCH.md §3
@@ -49,7 +49,7 @@ have at least one golden case that supplies it by keyword** — enough that
 tampering any one `interned_name()` arm turns at least one case red, without
 inflating the suite by more than the number of names that needed it.
 
-Which names that is was read out of `crates/torch_c/src/aten.rs` mechanically
+Which names that is was read out of `torchnative/rust/torch_c/src/aten.rs` mechanically
 (grepping `aten_dispatch_inner`'s `match op` block for the op → function
 mapping, then each function's `optional`/`required`/`tensor_arg`/
 `{dim,bool,int,float,scalar,dtype}_arg`/`device_arg_or_label` call sites for
@@ -180,7 +180,7 @@ tampered lookup observable, so that is the case that was added
 
 Acceptance test, run exactly as docs/design/DISPATCH.md §4.1 ran it originally —
 `"dim" => intern!(py, "dim")` changed to `intern!(py, "TAMPERED_dim")` in
-`crates/torch_c/src/aten.rs`, restored from a `cp` backup afterward (md5
+`torchnative/rust/torch_c/src/aten.rs`, restored from a `cp` backup afterward (md5
 verified identical before and after; never `git checkout -- <path>`).
 
 **With `aten.rs` unmodified** (this change's new baseline):
@@ -260,7 +260,7 @@ sandbox". It was argued in detail, with a minimal two-directory reproduction,
 and it was wrong.
 
 The cause was that **this worktree had never had `scripts/vendor/vendor_torch.sh`
-run in it.** `python/torch/` held four files instead of the
+run in it.** `torchnative/python/torch/` held four files instead of the
 upstream tree, so every subprocess that puts that directory on `PYTHONPATH`
 found nothing to shadow with and fell through to the real `torch` — which is
 exactly the symptom described, arrived at by a different route. The vendored
@@ -281,7 +281,7 @@ The mechanism the old text described is real Python behaviour; it just was not
 what was happening here, and the reasoning ran downhill from a wrong premise
 to a confident conclusion. The tell was available and not taken: a baseline
 that disagrees with the number the task hands you is more likely to be your
-environment than a stale figure in the brief — and `ls python/torch`
+environment than a stale figure in the brief — and `ls torchnative/python/torch`
 answers it in one command.
 
 It is kept rather than deleted because §6 records a false-green from the same

@@ -346,7 +346,7 @@ BuildID[sha1]=8336b419..., with debug_info, not stripped
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linux
 S=$(rustc --print sysroot)
 LLD=$S/lib/rustlib/aarch64-apple-darwin/bin/rust-lld
-cd crates/torch_c
+cd torchnative/rust/torch_c
 PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib \
 RUSTFLAGS="-Clinker=$LLD -Clinker-flavor=ld.lld" \
   cargo build --release --target x86_64-unknown-linux-gnu
@@ -414,12 +414,12 @@ export AR_x86_64_unknown_linux_gnu="zig ar"
 
 - 값이 `/Users/ibrew/.rustup/...` 로 시작하는 **한 기계의 절대 경로**가 된다. cargo 는
   `rustflags` 안에서 환경변수를 전개하지 않는다. iOS 의 `-F` 가 정확히 이렇게 한 기계에
-  묶였고 `docs/platform/RUST_CROSSBUILD.md` §0.5 가 그것을 결함으로 기록했다. `crates/torch_c/build.rs`
+  묶였고 `docs/platform/RUST_CROSSBUILD.md` §0.5 가 그것을 결함으로 기록했다. `torchnative/rust/torch_c/build.rs`
   전체가 그 정정이다.
 - `cargo-zigbuild` 를 쓰면 래퍼가 링커를 **스스로** 지정한다. 미리 박아둔 값은 그것과 싸운다.
 
 따라서 §2.4 · §4.2 의 `RUSTFLAGS` 는 **측정용 일회성 환경변수이지 커밋된 설정이 아니다.**
-`crates/torch_c/.cargo/config.toml` 은 **손대지 않았다.**
+`torchnative/rust/torch_c/.cargo/config.toml` 은 **손대지 않았다.**
 
 ## 5. `build.py --target linux-x86_64` — 넘었다
 
@@ -475,7 +475,7 @@ Android · iOS 는 **타깃 CPython** 에서 최소 OS 버전을 읽는다:
 
   ```
   scripts/wheel/build.py: .../x86_64-unknown-linux-gnu/release/lib_C.so is stale.
-    crates/torch_c/src/lib.rs was modified 58389.0 h ... after lib_C.so was written
+    torchnative/rust/torch_c/src/lib.rs was modified 58389.0 h ... after lib_C.so was written
     ...
     Fix: docs/platform/LINUX.md §2.5 -- no toolchain on this machine can produce it yet.
   ```
@@ -816,7 +816,7 @@ export PATH="/Volumes/macMini/caches/zig-venv/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-desk2
 export ZIG_GLOBAL_CACHE_DIR=/Volumes/macMini/caches/zig-cache
 export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-unknown-linux-gnu/lib
-cd /Volumes/macMini/worktrees/bw-desk2/crates/torch_c
+cd /Volumes/macMini/worktrees/bw-desk2/torchnative/rust/torch_c
 cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 #   EXIT=0, Finished `release` profile in 59.22s
 ```

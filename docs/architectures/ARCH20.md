@@ -111,7 +111,7 @@ Two things about the loop are worth keeping:
 * **The rebuild is not optional and not obvious.** `bootstrap.py` is `include_str!`-ed into the
   artefact, so editing it and re-running the sweep tests the old binary with no sign that
   anything is stale. Every round here ended with
-  `strings python/torch/_C.abi3.so | grep -c <a marker from the edit>`.
+  `strings torchnative/python/torch/_C.abi3.so | grep -c <a marker from the edit>`.
 * **The sweep runs one architecture per line and writes the full traceback per failure.**
   Reading only the last line would have hidden that `bert`'s wall moved from `_C` to `_nn` to a
   kernel — three different problems that all print as `NotImplementedError`.
@@ -584,7 +584,7 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 
 > **Correction (docs/bindings/SPELLINGS.md §5–§7): this "next round" already happened, and `gelu`/`silu`/
 > `softplus` were never in the gap it closed.** 22 of the 25 names above now have an
-> `overloads.json`/`methods.json` entry with a golden case (`crates/torch_c/src/overloads.json`'s
+> `overloads.json`/`methods.json` entry with a golden case (`torchnative/rust/torch_c/src/overloads.json`'s
 > own comment: *"docs/architectures/ARCH20.md §9's 25-name inventory ... 22 got a `torch.<name>` entry here, 3
 > did not"*). `reshape` is the one exception still pending promotion in `aten.rs` itself
 > (`tests/golden/compare.py` reports it as the sole `PENDING` case builder, not yet in
@@ -603,10 +603,10 @@ repeating. It is a well-defined next round: the list above is the whole of it.
 > <!-- DOCWATCH: hasattr gelu false -->
 > <!-- DOCWATCH: hasattr silu false -->
 > <!-- DOCWATCH: hasattr softplus false -->
-> <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json triu present -->
-> <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json gelu absent -->
-> <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json silu absent -->
-> <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json softplus absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json triu present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json gelu absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json silu absent -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json softplus absent -->
 > <!-- DOCWATCH: count golden_pending eq 0 -->
 
 ---

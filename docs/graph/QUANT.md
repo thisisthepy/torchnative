@@ -519,13 +519,13 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
 ```sh
 # §3  호스트 dtype 스윕
-RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
+RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     $PY /Volumes/macMini/caches/quant-scratch/bench.py ours
 OMP_NUM_THREADS=1 $PY /Volumes/macMini/caches/quant-scratch/bench.py upstream   # PYTHONPATH 없이
 
 # §3.4  accelerate 끈 빌드 (환경변수 RUSTFLAGS 로 주지 말 것 -- PERF_ANDROID.md §7.2)
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-quant-noaccel \
-  ( cd crates/torch_c && cargo build --release \
+  ( cd torchnative/rust/torch_c && cargo build --release \
       --config 'target."cfg(target_vendor = \"apple\")".rustflags = ["--cfg", "torch_c_no_accelerate"]' )
 # 산출물 교체는 cp 로 백업하고 cp 로 복구합니다 -- `git checkout --` 금지
 

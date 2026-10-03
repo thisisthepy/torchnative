@@ -84,7 +84,7 @@ version = 'Darwin Kernel Version 25.5.0: ... xnu-12377.121.6~2/RELEASE_ARM64_T81
 
 **전부 일치한다.** 개수 두 개(1260·896)까지 같다는 것은 크로스 빌드가 op 등록을 하나도 흘리지
 않았다는 뜻이다. (이 표는 처음 1251·896 으로 기록됐다. 2026-08-29 재측정에서 양쪽 다 1260 이다 —
-그 사이 `crates/torch_c` 에 착지한 것들이 늘린 수이고, **호스트와 시뮬레이터가 여전히 같다**는 것이
+그 사이 `torchnative/rust/torch_c` 에 착지한 것들이 늘린 수이고, **호스트와 시뮬레이터가 여전히 같다**는 것이
 이 표가 말하는 바다.)
 
 `sys.path` 에 저장소로 이어지는 항목이 **하나도 없다** — 하네스가 이것을 단언으로 검사한다:
@@ -223,13 +223,13 @@ pointer_width=64
 suppress_build_script_link_lines=true
 EOF
 
-( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd torchnative/rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphonesimulator/lib \
   cargo build --release --target aarch64-apple-ios-sim )
 
 # 1b) 기기용도 같이 만든다 — §11 의 대조에는 두 휠이 다 필요하다.
-( cd crates/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
+( cd torchnative/rust/torch_c && PYO3_CONFIG_FILE=/tmp/pyo3-ios.cfg \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos/lib \
   TORCHNATIVE_PYTHON_FRAMEWORK_DIR=/Volumes/macMini/caches/target-python/arm64-iphoneos \

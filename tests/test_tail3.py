@@ -48,7 +48,7 @@ import sys
 from test_shim import _C
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 
 
@@ -355,7 +355,7 @@ def test_the_fold_is_reached_only_after_candle_refuses():
     rank-4-and-below shape starts taking a different code path than the one
     the existing golden cases were measured against.
     """
-    src = open(os.path.join(_REPO_ROOT, "crates", "torch_c", "src", "aten.rs")).read()
+    src = open(os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")).read()
     assert "fold_batch_axes_matmul" in src
     assert "Err(e) if is_matmul_striding_refusal(&e) => match fold_batch_axes_matmul" in src, (
         "the fold is no longer guarded by candle's own refusal"
@@ -402,7 +402,7 @@ def test_the_two_new_kernels_are_the_only_new_arithmetic():
     overloads are a third arm on an enum. Only `scatter_reduce.two` and
     `erfinv.default` compute something nothing else in the file computes.
     """
-    src = open(os.path.join(_REPO_ROOT, "crates", "torch_c", "src", "aten.rs")).read()
+    src = open(os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")).read()
     # Shared bodies, asserted by the sharing itself rather than by prose.
     assert src.count("index_add_common(py, args, kwargs,") == 2, (
         "index_add and index_add_ no longer share one body -- if that was "

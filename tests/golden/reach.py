@@ -134,7 +134,7 @@ _KEY_LITERAL = re.compile(r"aten\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+")
 
 
 def composite_keys(repo_root: pathlib.Path) -> set:
-    src = (repo_root / "crates/torch_c/src/bootstrap.py").read_text()
+    src = (repo_root / "torchnative/rust/torch_c/src/bootstrap.py").read_text()
     return {s for s in code_string_constants(src) if _KEY_LITERAL.fullmatch(s)}
 
 

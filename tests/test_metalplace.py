@@ -618,7 +618,7 @@ def test_the_readback_derivation_scan_reaches_these_kernels():
     """
     witness = test_shim._ops_that_reach_the_host()
     if witness is None:
-        _skip.skip("   (skipped the derivation depth check: crates/torch_c/src "
+        _skip.skip("   (skipped the derivation depth check: torchnative/rust/torch_c/src "
                    "is not beside this file -- installed rather than in-tree)")
         return
 

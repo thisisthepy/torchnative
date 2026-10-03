@@ -964,7 +964,7 @@ PYTHON=$PY sh tests/run.sh   268 ok, 0 FAIL                    exit 0   (was 261
 $PY tests/golden/compare.py                 4709/4709, ops=143, pending 1     exit 0   (was 4290/4290, ops=139)
 $PY tests/golden/compare.py --self-test     14 comparators x 11 fault modes   exit 0   (was 13)
 $PY tests/verify_schemas.py  4376/4376                         exit 0   (was 4353/4353)
-( cd crates/torch_c && cargo test --release ) 28 passed                         exit 0   (was 24)
+( cd torchnative/rust/torch_c && cargo test --release ) 28 passed                         exit 0   (was 24)
 sweep26 (shim)                              22/26                             exit 0   (was 20/26)
 sweep26 (upstream)                          26/26                             exit 0
 ```
@@ -3244,7 +3244,7 @@ PYTHON=$PY sh tests/run.sh   274 ok, 0 FAIL                    exit 0   (was 268
 $PY tests/golden/compare.py                 6374/6374, ops=161, pending 1     exit 0   (was 5634/5634, ops=148)
 $PY tests/golden/compare.py --self-test     16 comparators x 11 fault modes    exit 0   (was 15)
 $PY tests/verify_schemas.py  4458/4458                          exit 0   (was 4392/4392)
-( cd crates/torch_c && cargo test --release ) 28 passed                          exit 0
+( cd torchnative/rust/torch_c && cargo test --release ) 28 passed                          exit 0
 sweep26 (shim)                              26/26                              exit 0   (was 22/26)
 sweep26 (upstream)                          26/26                              exit 0
 ```

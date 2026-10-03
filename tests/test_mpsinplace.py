@@ -106,7 +106,7 @@ sys.path.insert(0, os.path.join(
 import dtypes as dt_utils  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_TENSOR_RS = os.path.join(_HERE, "..", "crates", "torch_c", "src", "tensor.rs")
+_TENSOR_RS = os.path.join(_HERE, "..", "torchnative", "rust", "torch_c", "src", "tensor.rs")
 
 # Real inputs: negatives on both sides of zero, a zero, and magnitudes that are
 # exact in float16 so the float16 row tests the operator rather than testing
@@ -429,7 +429,7 @@ def test_the_device_write_door_performs_no_host_readback():
     refused every device, and it starts mattering the moment the door opens.
     """
     if not os.path.exists(_TENSOR_RS):
-        _skip.skip("   (skipped device write-door scan: crates/torch_c/src/tensor.rs "
+        _skip.skip("   (skipped device write-door scan: torchnative/rust/torch_c/src/tensor.rs "
                    "is not beside this file -- installed rather than in-tree)")
         return
     text = open(_TENSOR_RS, encoding="utf-8").read()

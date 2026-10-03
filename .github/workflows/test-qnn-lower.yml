@@ -78,7 +78,7 @@ on:
     paths:
       - ".github/workflows/test-qnn-lower.yml"
       - ".github/scripts/qnn_lower.py"
-      - "python/torchnative/export/qnn.py"
+      - "torchnative/python/torchnative/export/qnn.py"
 
 permissions:
   contents: read

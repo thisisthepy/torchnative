@@ -35,7 +35,7 @@ import sys
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 
 
@@ -302,7 +302,7 @@ def _upstream():
 def _available():
     """Same silent skip as the decompose-road tests, for the same reason.
 
-    These need `python/torch/_C.abi3.so`, which
+    These need `torchnative/python/torch/_C.abi3.so`, which
     `scripts/vendor/install_shim.sh` places and `tests/run.sh` deliberately does not.
     """
     return os.path.isfile(_VENDOR_SHIM)

@@ -47,7 +47,7 @@ sweeptrain (shim, .train())   26/26                               exit 0
 
 ## 1. What the tape is, and what it did not need
 
-`crates/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
+`torchnative/rust/torch_c/src/tape.rs`, 1644 lines, and the shape of it is the point:
 
 ```
 replay   the forward, keeping every intermediate     (PyCaptureTrace::run)
@@ -122,10 +122,10 @@ whole reverse walk is **0.4 s**.
 projection onto the declared outputs. A backward that materialised activations its own way would be
 differentiating a different forward from the one `replay` proves equal to eager.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs RULE_OPS present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs sdpa_backward present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs nll_loss_backward present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs crate::tape::backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs RULE_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs sdpa_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs nll_loss_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs crate::tape::backward present -->
 
 ---
 
@@ -465,7 +465,7 @@ against a known-good implementation first.
 
 ## 7. Sabotage: 17 faults
 
-Every one applied to `crates/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
+Every one applied to `torchnative/rust/torch_c/src/tape.rs`, **rebuilt**, and run through the five tape tests.
 
 | # | fault | caught |
 |---|---|---|
@@ -575,8 +575,8 @@ test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_every_tape_rule_agrees_with_central_differences_in_float64 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_has_a_gradient_case_for_every_rule_it_claims present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _set_grad present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs _shim_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _set_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs _shim_grad present -->
 
 ---
 
@@ -729,8 +729,8 @@ are: median relative L2 `8.780e-05`, worst `3.031e-04` at `model.layers.24.input
 sign agreement `134513262/134515008 = 0.999987`. A rule that changed a model that does not use it
 would mean the walk had started doing something other than what the trace says.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs layer_norm_backward present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten.split.Tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs layer_norm_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten.split.Tensor present -->
 <!-- DOCWATCH: op-implemented aten.native_layer_norm.default -->
 <!-- DOCWATCH: op-implemented aten.split.Tensor -->
 
@@ -814,7 +814,7 @@ rule builds:
 is out-of-place: the `[49152, 1024]` zeros *and* the `[49152, 1024]` one-hot are both live at
 201 MB each, which the arithmetic-on-shapes estimate counted once.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten.index_put_.default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten.index_put_.default present -->
 <!-- DOCWATCH: op-implemented aten.index_put_.default -->
 
 ---
@@ -968,14 +968,14 @@ and there is no backend here that does not — `docs/models/ADAPT.md` §1's tabl
 names a check that can be run, and it is now the only one of `docs/design/DESIGN.md` §3's three lifetime
 questions that answers with a refusal rather than by doing the thing.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/delta/__init__.py persist present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py persist present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_delta_is_written_and_read_back_bit_for_bit present -->
 
 ---
 
 ## 15. Sabotage: 12 faults on the three rules this round touched
 
-Each applied to `crates/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
+Each applied to `torchnative/rust/torch_c/src/tape.rs`, **rebuilt**, and run through the eight tape tests plus
 the four adaptation-road tests that go through the vendored tree.
 
 | # | fault | caught |
@@ -1340,8 +1340,8 @@ gradient bit-identical, and no spelling reproduces this one** — so the choice 
 measured 3e-03 gap and an unmeasured guess at upstream's accumulation order. That is a real item,
 not a closed one, and it belongs to whoever owns `native_layer_norm` next.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs native_dropout_backward present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs aten._safe_softmax.default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs native_dropout_backward present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs aten._safe_softmax.default present -->
 <!-- DOCWATCH: op-implemented aten.native_dropout.default -->
 <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit present -->

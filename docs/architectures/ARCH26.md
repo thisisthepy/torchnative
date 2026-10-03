@@ -35,7 +35,7 @@ embeddings stage, before the model reaches an attention block, and it fires whet
 
 ```
 NotImplementedError: not implemented in torch._C shim: torch.sqrt(...) -- overload resolution
-has no table entry for this op (crates/torch_c/src/overloads.json)
+has no table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 `deberta_v2` uses real `nn.LayerNorm`, so it gets past embeddings, but its attention block calls
@@ -56,7 +56,7 @@ False
 and a `TorchDispatchMode` trace of `torch.sqrt(x)` on upstream fires exactly one op,
 `aten.sqrt.default` — a leaf kernel, not a composite that decomposes into ops this shim already
 has (the way `torch.square` decomposes into `pow.Tensor_Scalar`, ARCH20.md §3). Grepping
-`crates/torch_c/src/aten.rs`, `overloads.json`, and `methods.json` for `sqrt` finds only
+`torchnative/rust/torch_c/src/aten.rs`, `overloads.json`, and `methods.json` for `sqrt` finds only
 `rsqrt`/`clamp`-adjacent entries — no `sqrt` kernel exists to wire a name to. Composing `sqrt` out
 of `pow(x, 0.5)` in `bootstrap.py` was considered and rejected: that would be inventing a
 computation path upstream does not take, in a round whose whole point is not doing that silently
@@ -87,7 +87,7 @@ Unlike the two existing no-ops, `set_eval_frame` is a **get-and-set** — the ca
 value to restore the prior state on the way out, so an unconditional `None` return (which is what
 the existing no-op shape would have produced) would have been a real behavioral bug for any nested
 `disable()` context, not merely an unreachable stub. Fixed as a state cell — get returns what was
-last set, set stores and returns the prior — in `crates/torch_c/src/bootstrap.py`, alongside a
+last set, set stores and returns the prior — in `torchnative/rust/torch_c/src/bootstrap.py`, alongside a
 sibling cell for `set_eval_frame_isolate_recompiles_id` (same call shape, same file, a few lines
 away, not yet observed to be called by anything but added for the same reason: an unconditional
 `None` there would be a landmine the moment something does call it while nested).
@@ -174,7 +174,7 @@ no-argument and tensor-argument spellings of set_ are not implemented in this sh
 ```
 
 **This is a missing kernel, confirmed by trace, not a name that needs wiring.** `tensor.rs::set_`
-(`crates/torch_c/src/tensor.rs:1244`) implements only the storage-argument overload
+(`torchnative/rust/torch_c/src/tensor.rs:1244`) implements only the storage-argument overload
 (`aten.set_.source_Storage_storage_offset`-shaped: copies out of an already-filled
 `torch.UntypedStorage`) and explicitly refuses anything else by name. A `TorchDispatchMode` trace
 of `a.set_(b)` for tensor `b` on upstream fires exactly one op:
@@ -184,7 +184,7 @@ aten.set_.source_Tensor
 ```
 
 which is a distinct overload from the one implemented, and `tensor.rs` is forbidden territory this
-round (`crates/torch_c/src/{aten.rs,tensor.rs,dtype.rs,flash.rs}`).
+round (`torchnative/rust/torch_c/src/{aten.rs,tensor.rs,dtype.rs,flash.rs}`).
 
 **Finding, by name: `aten.set_.source_Tensor` is a missing kernel/overload.** It is reached through
 `torch.nn.utils.parametrizations.weight_norm` — a fairly generic utility (any architecture using
@@ -292,10 +292,10 @@ wall.
 **Not fixable in territory.** `torch.Tensor(n)` — upstream's legacy "allocate n uninitialized
 elements" constructor, distinct from `TensorBase(existing_tensor)` (which re-wraps a tensor that
 already exists) — is refused **in Rust**, at `#[new] fn py_new` in
-`crates/torch_c/src/tensor.rs:920-929`, the PyO3-generated `__new__` for the native `TensorBase`
+`torchnative/rust/torch_c/src/tensor.rs:920-929`, the PyO3-generated `__new__` for the native `TensorBase`
 type. `torch.Tensor` itself (the subclass users actually construct) is `class Tensor(TensorBase)`
 in the *vendored* `torch/_tensor.py`, which is out of bounds for a different reason
-(`python/torch` is the vendored tree, absolutely off-limits this round). Both places
+(`torchnative/python/torch` is the vendored tree, absolutely off-limits this round). Both places
 that could plausibly grow a `__new__` override are therefore forbidden territory for this brief —
 `tensor.rs` explicitly, the vendored tree by the brief's own rule. `bootstrap.py` has no hook into
 `TensorBase.__new__` the way it has hooks into ordinary members (`setattr(tensorbase, name, fn)`
@@ -533,7 +533,7 @@ bert bloom cohere falcon gpt_bigcode mamba persimmon
 TOTAL 20/20
 ```
 
-`git status --short` in the worktree shows exactly two changes: `crates/torch_c/src/bootstrap.py`
+`git status --short` in the worktree shows exactly two changes: `torchnative/rust/torch_c/src/bootstrap.py`
 (modified) and `docs/architectures/ARCH26.md` (new) — nothing in `aten.rs`, `tensor.rs`, `dtype.rs`, `flash.rs`,
 `tests/golden/cases.py`, `scripts/wheel/`, or the vendored tree.
 

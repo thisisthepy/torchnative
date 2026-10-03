@@ -405,7 +405,7 @@ intermediate=128, vocab=100, `generate(max_new_tokens=4, do_sample=False)`)을 �
 
 ### A. candle 의 `U8` 에 별칭 — `torch.bool → DType::U8`
 
-`_C` 가 `torch.bool` 이라는 이름을 `DType::U8` 에 붙입니다. 지금 `crates/torch_c/src/dtype.rs:20-22`
+`_C` 가 `torch.bool` 이라는 이름을 `DType::U8` 에 붙입니다. 지금 `torchnative/rust/torch_c/src/dtype.rs:20-22`
 의 `PyDtype { inner: DType }` 구조를 그대로 두고 등록 목록에 한 줄 더하면 되는, 가장 싼 변경입니다.
 
 | | |
@@ -558,7 +558,7 @@ maximum((2,3,0), 1)   = [2, 3, 1]        <- torch.bool 은 [1, 1, 1]
 
 ### 6.4 코드에 무엇이 바뀌는가 (구현하지 않음, 형태만)
 
-지금 `crates/torch_c/src/dtype.rs:20-22` 는 candle 의 dtype 을 그대로 감쌉니다:
+지금 `torchnative/rust/torch_c/src/dtype.rs:20-22` 는 candle 의 dtype 을 그대로 감쌉니다:
 
 ```rust
 pub struct PyDtype { inner: DType }        // DType = candle_core::DType
@@ -569,7 +569,7 @@ B 는 이 한 줄이 바뀐다는 뜻입니다 — `inner` 가 shim 소유 열�
 `__eq__` (`:67`), `__hash__` (`:74`), `is_signed` (`:85`), `itemsize` (`:89`), `register`
 (`:96-113`) 가 그 열거형 위에서 다시 쓰입니다. `device.rs` 가 이미 하는 것과 같은 모양입니다.
 
-**이 문서는 그 변경을 하지 않습니다.** `crates/torch_c/` 는 다른 작업이 동시에 쓰고 있습니다.
+**이 문서는 그 변경을 하지 않습니다.** `torchnative/rust/torch_c/` 는 다른 작업이 동시에 쓰고 있습니다.
 
 ---
 

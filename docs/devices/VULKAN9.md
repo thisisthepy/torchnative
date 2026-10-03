@@ -21,8 +21,8 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 52 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs sum_vulkan present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs SUM_DIMS_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs sum_vulkan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs SUM_DIMS_F32_SPV present -->
 <!-- DOCWATCH: op-implemented aten.sum.dim_IntList -->
 <!-- DOCWATCH: op-implemented aten.sum.default -->
 <!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_sum_over_dims_agrees_with_upstream_at_a_derived_tolerance present -->

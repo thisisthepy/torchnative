@@ -454,7 +454,7 @@ NotImplementedError: aten.index.Tensor: more than one index tensor is not
 
 ## 8. 소유권 — 지시를 벗어난 편집 하나
 
-이 회차는 **`crates/torch_c/src/bootstrap.py` 와 `overloads.json`/`methods.json` 을 건드리지
+이 회차는 **`torchnative/rust/torch_c/src/bootstrap.py` 와 `overloads.json`/`methods.json` 을 건드리지
 말라**는 지시를 받았습니다(다른 에이전트가 스키마 텍스트 작업으로 소유).
 
 - `overloads.json`, `methods.json` — **건드리지 않았습니다.** `where.ScalarOther` 의 스키마는
@@ -540,7 +540,7 @@ $PY tests/verify_schemas.py         # 272/272
 # 상류가 진실을 적는다 (벤더 트리를 PYTHONPATH 에 넣지 않는다)
 DT=float32 ATTN=sdpa $PY /Volumes/macMini/caches/gen-scratch/gen.py truth
 # shim 이 같은 체크포인트를 읽고 대조한다
-DT=float32 ATTN=sdpa PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 \
+DT=float32 ATTN=sdpa PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
     $PY /Volumes/macMini/caches/gen-scratch/gen.py shim
 ```
 

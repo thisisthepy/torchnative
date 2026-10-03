@@ -11,7 +11,7 @@
 | 목록은 어떻게 됐나 | **71 → 67.** 넷(`prims.neg` 포함)이 **다시 쓰여서** 빠졌다. 게이트를 넓힌 곳은 없다 |
 | 거절 아닌 벽은 몇 개였나 | **다섯.** f64 상수, `U8 -> F64` 위닝 두 곳, `cpu_fwd` 만 있는 `CustomOp1` 셋 (§4) |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
 <!-- DOCWATCH: symbol-in-file tests/test_mpsfwd.py test_the_ops_that_left_the_refusal_list_no_longer_read_back present -->
 
 ---

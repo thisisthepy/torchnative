@@ -14,11 +14,11 @@ claims more than §8 allows.**
 | What does the user get when CUDA is unavailable | A `NotImplementedError` naming **which** of `not_built` / `no_driver` / `no_device` / `wrong_arch` / `unclassified` it was (§4) |
 | Did anything run on a GPU | **No.** §6 is the procedure for a machine that has one; §5 is the instrument it reads |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs classify_cuda_refusal present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs cuda_host_readback_gate present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs CUDA_HOST_READBACK_OPS present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs cuda_arch_mismatch present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs note_cuda_dispatch present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs classify_cuda_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs cuda_host_readback_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs CUDA_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs cuda_arch_mismatch present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs note_cuda_dispatch present -->
 <!-- DOCWATCH: symbol-in-file tests/test_cuda.py test_the_refusals_this_host_cannot_enter_are_still_named_one_by_one present -->
 <!-- DOCWATCH: symbol-in-file tests/test_cuda.py test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs present -->
 
@@ -39,7 +39,7 @@ did, and it is the one that decides the shipping story.
 
 ### 0.1 One premise that was not on the list and was also false
 
-`crates/torch_c/CLAUDE.md` and a repository-root `CLAUDE.md` were named as
+`torchnative/rust/torch_c/CLAUDE.md` and a repository-root `CLAUDE.md` were named as
 required reading. **Neither exists in this checkout** — `find . -iname
 'CLAUDE.md'` outside `dist/` and `build/` returns nothing, and there is none in
 `~/.claude/` either. Everything else on the reading list was there and was
@@ -565,7 +565,7 @@ cat >> "$HOME/.cargo/config.toml" <<'EOF'
 rustflags = ["--cfg", "torch_c_cuda"]
 EOF
 export CUDA_COMPUTE_CAP=75          # the number from step 1
-cd crates/torch_c && cargo build --release && cd ../..
+cd torchnative/rust/torch_c && cargo build --release && cd ../..
 ```
 
 The config file rather than `RUSTFLAGS` for the reason `Cargo.toml` records:
@@ -576,7 +576,7 @@ to them. The config file also reaches `scripts/vendor/install_shim.sh`'s own
 ### Step 4 — confirm the artefact really is a CUDA one
 
 ```bash
-readelf -d crates/torch_c/target/release/lib_C.so | grep -E "libcuda|libcublas|libcudart"
+readelf -d torchnative/rust/torch_c/target/release/lib_C.so | grep -E "libcuda|libcublas|libcudart"
 ```
 
 Nothing here means the cfg did not reach the dependency table, and everything
@@ -586,7 +586,7 @@ features | grep 'candle-core feature "cuda"'` is the second opinion.
 ### Step 5 — the probe, before any tensor exists
 
 ```bash
-mkdir -p /tmp/stage && cp crates/torch_c/target/release/lib_C.so /tmp/stage/_C.abi3.so
+mkdir -p /tmp/stage && cp torchnative/rust/torch_c/target/release/lib_C.so /tmp/stage/_C.abi3.so
 PYTHONPATH=/tmp/stage python -c "import _C, json; print(json.dumps(_C._cuda_probe(), indent=1))"
 ```
 

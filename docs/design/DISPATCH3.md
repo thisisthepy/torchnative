@@ -47,14 +47,14 @@ Gates: suite **826 ok** (814 + the 12 in `tests/test_dispatch.py`),
 
 ## 1. What changed, and where it is
 
-One place: `crates/torch_c/src/aten.rs`, in `aten_dispatch_entry` — the `*args,
+One place: `torchnative/rust/torch_c/src/aten.rs`, in `aten_dispatch_entry` — the `*args,
 **kwargs` door `_aten_dispatch` is bound to. Nothing else in the crate moved,
 and `capture.rs` was not touched at all.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs any_dispatch_mode_active present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs innermost_dispatch_mode present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs dispatch_through_mode present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs overriding_types present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs any_dispatch_mode_active present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs innermost_dispatch_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs overriding_types present -->
 
 ```rust
 let rest = args.get_slice(1, args.len());
@@ -215,7 +215,7 @@ and not a dispatcher one.
 ### 4.1 Infra modes are not on the stack, and the length does not say so
 
 `FakeTensorMode` and `ProxyTorchDispatchMode` carry a `_mode_key`, and
-`python/torchnative/export/upstream.py`'s
+`torchnative/python/torchnative/export/upstream.py`'s
 `_push_on_torch_dispatch_stack` routes them into a keyed slot rather than onto
 the ordinary stack — reproducing upstream's split. But its
 `_len_torch_dispatch_stack` returns `len(mode_stack)` only, where upstream's
@@ -248,7 +248,7 @@ raises:
 ```
 NotImplementedError: not implemented in torch._C shim:
   torch.is_inference_mode_enabled(...) -- overload resolution has no table
-  entry for this op (crates/torch_c/src/overloads.json)
+  entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 and behind that, on the `from_tensor` path, `docs/graph/EXPORT.md` §3.1 exactly as
@@ -297,7 +297,7 @@ than asserted in prose: `test_the_overload_spelling_...` asserts
 
 | | |
 |---|---|
-| where | `crates/torch_c/src/bootstrap.py`'s overload resolution (the `raw_parse` reproduction), plus `crates/torch_c/src/overloads.json` |
+| where | `torchnative/rust/torch_c/src/bootstrap.py`'s overload resolution (the `raw_parse` reproduction), plus `torchnative/rust/torch_c/src/overloads.json` |
 | what | let a `Scalar` argument bind a `Tensor` parameter when another argument is a tensor, as upstream's parser does, and wrap it |
 | ops affected | **21** names in `overloads.json` carry both a `.Tensor` and a `.Scalar` overload: `add`, `sub`, `rsub`, `mul`, `multiply`, `div`, `fmod`, `remainder`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `greater`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `masked_fill`, `fill_`, `bucketize` |
 | what it moves | every one of those 21 spellings changes which kernel a plain `x <op> 2` reaches, and with it the dtype rule — upstream's wrapped number promotes *weakly* (an int literal does not widen a float tensor), which the `.Scalar` kernels get for free and a real 0-dim tensor argument does not |

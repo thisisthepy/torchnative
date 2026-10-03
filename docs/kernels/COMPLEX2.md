@@ -97,7 +97,7 @@ is `3`, both agreeing.
 bytes rather than 4, and `numel() * element_size()` sizes the two buffers
 together and correctly.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs no_real_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs no_real_storage present -->
 
 ### 1.3 One entrance
 

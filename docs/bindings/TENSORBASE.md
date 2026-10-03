@@ -46,7 +46,7 @@ x.item()   ->  NotImplementedError: TensorBase.item
 
 | 갈래 | 49 개 중 | 어디에 |
 |---|---|---|
-| A. 표 기반 오버로드 해석 | **34** | `crates/torch_c/src/methods.json` + `bootstrap.py::_tensor_method` |
+| A. 표 기반 오버로드 해석 | **34** | `torchnative/rust/torch_c/src/methods.json` + `bootstrap.py::_tensor_method` |
 | B. 파이썬 레벨로 직접 작성 | **5** (`to` · `float` · `long` · `item`/`__bool__` · `__getitem__`) | `bootstrap.py::_install_tensor_{conversions,scalars,indexing}` |
 | C. Rust 네이티브 (아이덴티티) | **7** (`shape` · `dtype` · `device` · `dim` · `ndim` · `numel` · `size`) | `tensor.rs` — 이전부터 있던 것 |
 | D. autograd 모양 (**때움**) | **3** (`requires_grad` · `requires_grad_` · `grad_fn`) | `bootstrap.py::_install_autograd_shape` — §5 |
@@ -414,7 +414,7 @@ PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
 **이 둘이 들어오는 순간 `nn.Linear` 가 만들어집니다.** 그 뒤의 벽은 아직 모릅니다.
 
 > **Correction (문서 감사, 2026-09):** 이 둘이 들어왔습니다. `git log -S'"aten.uniform_.default"'
-> -- crates/torch_c/src/aten.rs` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator, and
+> -- torchnative/rust/torch_c/src/aten.rs` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator, and
 > give `_C._dynamo` the two names that do work") — 커밋 메시지가 그대로 말하듯, candle CPU
 > 백엔드가 시딩을 거부해서 상류 CPU generator(MT19937)를 이식한 결과입니다.
 > `uniform_inplace`/`normal_inplace` 가 `aten.rs:10274`/`10350` 에 있고, 둘 다 현재
@@ -423,8 +423,8 @@ PENDING: 2 case builder(s) registered for ops not yet in _aten_implemented()
 > 문서로 보입니다(같은 커밋).
 > <!-- DOCWATCH: op-implemented aten.uniform_.default -->
 > <!-- DOCWATCH: op-implemented aten.normal_.default -->
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs uniform_inplace present -->
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs normal_inplace present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs uniform_inplace present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs normal_inplace present -->
 
 ### 7.2 벽 2 — `_C` 는 `TensorBase` 가 아니라 `torch.Tensor` 를 돌려줘야 한다
 
@@ -570,12 +570,12 @@ cargo build --release --target aarch64-apple-ios
 
 | 파일 | 변경 |
 |---|---|
-| `crates/torch_c/src/methods.json` | **신규** — 메서드 오버로드 표, 48 이름 · 80 스키마 |
-| `crates/torch_c/src/aten.rs` | aten op 19 → 73. 산술 · 비교 · 비트 · 축소 · 형태 · 인덱싱 · in-place |
-| `crates/torch_c/src/bootstrap.py` | 메서드 설치, `self_bound` 해석, `int[N]` 규칙, `__getitem__`, `to`/`item`/`__bool__`, grad 모드, `_make_subclass`, `_DISCOVERED_RETURNS` 12 항목 |
-| `crates/torch_c/src/tensor.rs` | `requires_grad` 필드, `replace_with`, `#[new]`, `_set_tensor_class` · `promote` |
-| `crates/torch_c/src/lib.rs` | `methods.json` 삽입, `_tensor_from_flat` 이 bool 을 정규화 |
-| `crates/torch_c/src/overloads.json` | `zeros` 추가 |
+| `torchnative/rust/torch_c/src/methods.json` | **신규** — 메서드 오버로드 표, 48 이름 · 80 스키마 |
+| `torchnative/rust/torch_c/src/aten.rs` | aten op 19 → 73. 산술 · 비교 · 비트 · 축소 · 형태 · 인덱싱 · in-place |
+| `torchnative/rust/torch_c/src/bootstrap.py` | 메서드 설치, `self_bound` 해석, `int[N]` 규칙, `__getitem__`, `to`/`item`/`__bool__`, grad 모드, `_make_subclass`, `_DISCOVERED_RETURNS` 12 항목 |
+| `torchnative/rust/torch_c/src/tensor.rs` | `requires_grad` 필드, `replace_with`, `#[new]`, `_set_tensor_class` · `promote` |
+| `torchnative/rust/torch_c/src/lib.rs` | `methods.json` 삽입, `_tensor_from_flat` 이 bool 을 정규화 |
+| `torchnative/rust/torch_c/src/overloads.json` | `zeros` 추가 |
 | `tests/verify_schemas.py` | 두 표를 모두 검증. op 이름을 **스키마에서** 유도 |
 | `tests/test_shim.py` | 34 → 54. 메서드 해석 · 인덱싱 · in-place · grad 모드 · `_make_subclass` · RNG 벽 |
 | `docs/bindings/TENSORBASE.md` | 이 문서 |

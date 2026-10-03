@@ -6,7 +6,7 @@ The model is from_config (random weights, no download needed).
 
 Usage:
     PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
-        /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python benches/profile_decode.py
+        /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tests/bench/profile_decode.py
 """
 
 import cProfile

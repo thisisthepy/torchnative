@@ -1,7 +1,7 @@
 //! Layer-1 probe: does the candle surface `torch_c` calls survive `wasm32`?
 //!
-//! Every item touched here is one that `crates/torch_c/src/` imports. The list
-//! was taken from `grep -rhoE "use candle_core::\{?[^;]*" crates/torch_c/src/`,
+//! Every item touched here is one that `torchnative/rust/torch_c/src/` imports. The list
+//! was taken from `grep -rhoE "use candle_core::\{?[^;]*" torchnative/rust/torch_c/src/`,
 //! so "this probe compiles" means "the imports the shipping crate makes exist
 //! on this target", not "candle compiles at all".
 //!

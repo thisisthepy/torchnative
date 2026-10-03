@@ -39,7 +39,7 @@ import _skip
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 BUILD_PY = REPO_ROOT / "scripts" / "wheel" / "build.py"
-VENDORED_TORCH = REPO_ROOT / "python" / "torch"
+VENDORED_TORCH = REPO_ROOT / "torchnative" / "python" / "torch"
 HOST_SHIM = VENDORED_TORCH / "_C.abi3.so"
 
 GOOD_PYTHON = "/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python"
@@ -117,7 +117,7 @@ def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
     # Only the linux-x86_64 subdirectory is faked, and it is removed in
     # `finally` below.
     cargo_target_dir_env = os.environ.get(
-        "CARGO_TARGET_DIR", str(REPO_ROOT / "crates" / "torch_c" / "target"))
+        "CARGO_TARGET_DIR", str(REPO_ROOT / "torchnative" / "rust" / "torch_c" / "target"))
     rel_dir = (Path(cargo_target_dir_env) / "x86_64-unknown-linux-gnu"
                / "release")
     if rel_dir.exists():
@@ -144,7 +144,7 @@ def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
             # input, so `require_current`'s freshness check (artefact newer
             # than every recorded input) passes honestly rather than being
             # bypassed.
-            src_file = REPO_ROOT / "crates" / "torch_c" / "src" / "lib.rs"
+            src_file = REPO_ROOT / "torchnative" / "rust" / "torch_c" / "src" / "lib.rs"
             (rel_dir / "lib_C.d").write_text(f"{artefact}: {src_file}\n")
 
             env = dict(os.environ)

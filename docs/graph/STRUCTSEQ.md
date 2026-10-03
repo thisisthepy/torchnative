@@ -70,7 +70,7 @@ received. Everything below is about the two things that happen in between.
 
 ## 2. Defect one: the `Python` dispatch key lived nowhere
 
-`crates/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
+`torchnative/rust/torch_c/src/aten.rs`'s door consulted the **mode stack** and nothing
 else — `any_dispatch_mode_active` reads
 `torch.utils._python_dispatch._is_in_torch_dispatch_mode`, and when that is
 false the call goes straight to the dense path.
@@ -434,9 +434,9 @@ its own §4.2 asked for rather than a correction to it.
 **Measured and deliberately NOT written**: §4.3's list — no structseq, no
 operator changes, no `Meta` dispatch-key predicate, no vendored-tree edits.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs subclass_dispatch_target present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs dispatch_through_subclass present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reshape_to_schema present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs subclass_dispatch_target present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_subclass present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reshape_to_schema present -->
 <!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_a_fake_tensor_argument_reaches_its_subclass_with_every_mode_popped present -->
 <!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_no_dispatch_still_suppresses_subclass_dispatch present -->
 <!-- DOCWATCH: symbol-in-file tests/test_structseq.py test_the_dispatcher_reboxes_a_modes_answer_into_the_schemas_shape present -->

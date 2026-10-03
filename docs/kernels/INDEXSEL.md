@@ -52,7 +52,7 @@ The correct home for this is `bootstrap.py`'s Python-level surface -- the same
 place `chunk`, `flatten`, and `T` already live for the identical reason
 (`methods.json`'s README: "a `methods.json` entry would name a key no dispatcher
 ever sees"). `bootstrap.py` is outside this worktree's territory
-(`crates/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
+(`torchnative/rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
 `tests/golden/cases.py`, `tests/test_indexsel.py`), so it was not touched.
 
 What *is* in territory, and what this round did instead: `methods.json` carries an

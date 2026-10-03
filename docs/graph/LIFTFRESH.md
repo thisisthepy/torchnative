@@ -419,10 +419,10 @@ N1 reddening 5 rather than 9 is not under-reach: the `_weak_ref` and
 on its own before its implementation was written -- §2 and §3 are separate TDD
 cycles, not one.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs lift_fresh_copy_default present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs _weak_ref present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs _free_weak_ref present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _TRAINING_DEPENDENT_WRITES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs lift_fresh_copy_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs _weak_ref present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs _free_weak_ref present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _TRAINING_DEPENDENT_WRITES present -->
 <!-- DOCWATCH: symbol-in-file tests/test_liftfresh.py test_lift_fresh_copy_is_contiguous_where_clone_preserves present -->
 <!-- DOCWATCH: symbol-in-file tests/test_liftfresh.py test_a_module_with_a_tensor_literal_exports_replays_and_agrees present -->
 <!-- DOCWATCH: symbol-in-file tests/test_liftfresh.py test_storage_weak_ref_is_an_identity_the_constant_map_can_key_on present -->

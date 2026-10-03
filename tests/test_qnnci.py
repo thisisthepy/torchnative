@@ -36,7 +36,7 @@ import re
 REPO = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = REPO / ".github/workflows/test-qnn-lower.yml"
 SCRIPT = REPO / ".github/scripts/qnn_lower.py"
-QNN_MODULE = REPO / "python/torchnative/export/qnn.py"
+QNN_MODULE = REPO / "torchnative/python/torchnative/export/qnn.py"
 DOC = REPO / "docs/devices/QNNCI.md"
 
 

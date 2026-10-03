@@ -211,7 +211,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
 
 | | 어디 | |
 |---|---|---|
-| `StorageBase` | `crates/torch_c/src/storage.rs` (신규) | 바이트 버퍼 + `filled` 불변식 |
+| `StorageBase` | `torchnative/rust/torch_c/src/storage.rs` (신규) | 바이트 버퍼 + `filled` 불변식 |
 | `TensorBase.set_` | `tensor.rs` | strided gather, 네 가지 거부 |
 | `TensorBase.element_size` | `tensor.rs` | dtype 태그 기준 |
 | `gather_strided` | `tensor.rs` | 뷰를 정의대로 읽음 |
@@ -242,7 +242,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
 | ~~`torch.load(mmap=True)`~~ **정정 (문서 감사, 2026-09): 닫힘** | `UntypedStorage.from_file` + 스토리지 슬라이싱 — `docs/models/CKPT2.md` 가 구현, 가중치가 비트 단위로 상류와 일치 |
 | ~~`safetensors` 기본 `mmap` 백엔드~~ **정정 (문서 감사, 2026-09): 닫힘** | 같은 것 — `docs/models/CKPT2.md` §7 이 SmolLM2-135M 273 텐서 전부 비트 일치를 확인 |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs from_file present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs from_file present -->
 | `get_record_offset_no_read` | torch 의 레코드 정렬 산술 재현. **틀린 오프셋은 예외가 아니라 옆 텐서의 바이트**라 추측하지 않음 |
 | `int8` · `uint16` · `uint64` · complex 로 저장된 체크포인트 | candle 이 못 담음. dtype 이름을 대며 거부 |
 | 음수 stride | torch 가 만들지 않으므로 추측하지 않음 |
@@ -260,7 +260,7 @@ after (see storage.rs and docs/models/CKPT.md §4).
   아닙니다. HF 체크포인트 특유의 것(공유 텐서 메타데이터, 샤딩된 `.index.json`, `_metadata`)은
   **미측정**입니다.
 - **회귀 스위트에 박혀 있지 않습니다.** 위 숫자는 전부 `/Volumes/macMini/caches/ckpt-probe/`
-  의 스크립트로 잰 것이고, 커밋 대상이 아닙니다(이 작업의 파일 범위가 `crates/torch_c/src/`,
+  의 스크립트로 잰 것이고, 커밋 대상이 아닙니다(이 작업의 파일 범위가 `torchnative/rust/torch_c/src/`,
   `tests/golden/cases.py`, 이 문서였습니다). **`tests/test_shim.py` 에 넣는 것이 다음
   작업이고, 넣기 전까지 §1 의 어떤 성질도 회귀로부터 보호되지 않습니다.** docs/models/E2E.md 가 같은
   이유로 만들어졌던 자리입니다.
@@ -282,7 +282,7 @@ sh scripts/vendor/install_shim.sh
 /Volumes/macMini/caches/spike-venv/bin/python make_ckpt.py
 
 # shim 이 그것을 읽는다
-TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
+TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     /Volumes/macMini/caches/spike-venv/bin/python verify.py
 ```
 
@@ -321,7 +321,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
 
 이번에는 그 트릭을 못 썼다. `torch.load`/`nn.Module`/`state_dict` 는 **순수 파이썬 torch**
 (`torch/serialization.py`, `torch/nn/modules.py`, ...) 안에 있고, 그 코드가 셰임을 쓰게 하려면
-벤더 트리(`python/torch`, `_C.abi3.so` 가 이미 심어져 있는 그 패키지)를 **`torch`
+벤더 트리(`torchnative/python/torch`, `_C.abi3.so` 가 이미 심어져 있는 그 패키지)를 **`torch`
 라는 이름으로** import 해야 한다 — 상류 `torch` 와 이름이 같다. 한 인터프리터에서 `torch` 라는
 이름은 하나뿐이고, 게다가 그렇게 하려면 이미 독립 모듈로 한 번 로드해 둔 셰임 네이티브 라이브러리를
 **다른 경로에서 두 번째로 `dlopen`** 하게 되는데, 이게 안전한지는 이 작업에서도 이전 어디에서도
@@ -342,16 +342,16 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
 ### 8.3 새 전제조건 — `tests/run.sh` 가 보장하지 않는 것
 
 `tests/run.sh` 는 독립 모듈 `_C.abi3.so` 만 스테이징한다. 이 다섯 테스트가 필요로 하는
-`python/torch/_C.abi3.so` (벤더 트리 안에 심어진 셰임)는 **별도로**
+`torchnative/python/torch/_C.abi3.so` (벤더 트리 안에 심어진 셰임)는 **별도로**
 `scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh` 를 돌려야 생긴다 — `run.sh` 자신은 이 경로를
 전혀 건드리지 않는다. 그래서 다섯 테스트 모두 `_upstream_torch is None` 뿐 아니라
-`python/torch/_C.abi3.so` 존재 여부도 같이 확인하고(`_ckpt_shim_available()`), 둘
+`torchnative/python/torch/_C.abi3.so` 존재 여부도 같이 확인하고(`_ckpt_shim_available()`), 둘
 중 하나라도 없으면 `docs/models/E2E.md` 와 같은 이유로 조용히 통과한다(`pytest.skip` 을 쓰지 않는 이유도
 같다 — 이 파일은 pytest 에 의존하지 않는다).
 
 ### 8.4 각 테스트가 실제로 빨간지 확인한 방법
 
-구현(`crates/torch_c/src/`)은 건드리지 않았다 — 이 작업의 파일 범위 밖이다. 대신 매 테스트마다
+구현(`torchnative/rust/torch_c/src/`)은 건드리지 않았다 — 이 작업의 파일 범위 밖이다. 대신 매 테스트마다
 `test_shim.py` 안의 **기대값**을 하나씩 흔들어 다시 돌리고, `FAIL` 을 직접 본 뒤 원본 사본
 (`cp` 로 떠 둠)과 `diff` 로 바이트 단위 원상복구를 확인했다. 다섯 개 전부:
 
@@ -373,7 +373,7 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
 됨)을 보이지만, "가드가 아예 없었다면 0.0 이 나온다"는 것 자체를 이번 세션에서 다시 재현하지는
 못했다 — `set_` 이 그 확인이 걸리는 유일한 문이라(§4, storage.rs 주석: "the one door"), 소스를
 고치지 않고는 우회할 방법이 없었다. `git stash`로 가드를 빼고 다시 빌드하는 것도 고려했지만
-지시받은 파일 범위(`crates/torch_c/src/` 제외)를 넘는 일이라 하지 않았다. 대신 이미 §4 가 기록해
+지시받은 파일 범위(`torchnative/rust/torch_c/src/` 제외)를 넘는 일이라 하지 않았다. 대신 이미 §4 가 기록해
 둔, 가드가 생기기 전에 실측된 값(`down.bias[:4] = [0.0, 0.0, 0.0, 0.0]`, 참값은
 `[0.06125, 0.14750, 0.23375, -0.18000]`)을 그대로 근거로 남긴다. **이 부분은 재현이 아니라
 인용이다.**

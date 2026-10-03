@@ -82,7 +82,7 @@ STAGE_FULL_AUTOGRAD = 2
 #
 # **A configuration, because no build without one exists.** Every `torch._C`
 # this crate builds carries the tape (`tape::register` is unconditional in
-# `crates/torch_c/src/lib.rs`), so there is no artefact whose absent backward a
+# `torchnative/rust/torch_c/src/lib.rs`), so there is no artefact whose absent backward a
 # probe could detect -- and a probe whose "no" branch can never be reached is a
 # check that cannot fail (AGENTS.md §17.5). What a deployment *can* say is that
 # it does not want stage 1 on board. It says so here, once, at import, and the

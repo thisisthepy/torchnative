@@ -427,7 +427,7 @@ def test_the_derivation_finds_the_ten_without_being_told_their_names():
     """
     witness = test_shim._ops_that_reach_the_host()
     if witness is None:
-        _skip.skip("   (skipped: crates/torch_c/src is not beside this file -- "
+        _skip.skip("   (skipped: torchnative/rust/torch_c/src is not beside this file -- "
                    "installed rather than in-tree)")
         return
 

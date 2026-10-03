@@ -24,10 +24,10 @@
 - 대상 아티팩트: `/Volumes/macMini/caches/cargo-target/aarch64-apple-ios-sim/release/lib_C.dylib`
   (1,704,928 바이트, Mach-O 64-bit dylib arm64) — 이번에 새로 빌드했다(아래 "빌드" 절).
 
-## 빌드 — `crates/torch_c` 를 건드리지 않고 시뮬레이터 타깃 추가
+## 빌드 — `torchnative/rust/torch_c` 를 건드리지 않고 시뮬레이터 타깃 추가
 
 `.cargo/config.toml` 에는 `[target.aarch64-apple-ios]`(실기기) 규칙만 있고 `aarch64-apple-ios-sim`
-은 **다른 타깃 트리플이라 그 규칙을 상속하지 않는다.** 지시대로 `crates/torch_c` 를 전혀 열지도
+은 **다른 타깃 트리플이라 그 규칙을 상속하지 않는다.** 지시대로 `torchnative/rust/torch_c` 를 전혀 열지도
 고치지도 않고, `RUST_CROSSBUILD.md` §0.5 가 이미 문서화해 둔 값(프레임워크 경로, `PYO3_CONFIG_FILE`
 내용)만 가져와 환경 변수·명령줄 인자로 재현했다.
 
@@ -74,7 +74,7 @@ $ nm -u lib_C.dylib | grep -c '^_Py'
 **빌드 로그에 경고 하나가 남는다:** `linker stderr: ld: -undefined dynamic_lookup is deprecated on
 iOS-simulator`. 컴파일은 `EXIT=0` 으로 통과했고 `otool -L` 로 프레임워크가 실제로 링크됐음을
 확인했으므로 이번 검증(로드 여부)에는 영향이 없었지만, 어디서 `-undefined dynamic_lookup` 이
-아직 나오는지는 `crates/torch_c` 안을 보지 않고는 특정할 수 없었다 — 다른 작업이 그 디렉터리를
+아직 나오는지는 `torchnative/rust/torch_c` 안을 보지 않고는 특정할 수 없었다 — 다른 작업이 그 디렉터리를
 쓰고 있어 확인하지 않았다. `Cargo.kt` 구현 시점에 다시 볼 필요가 있다.
 
 ## 기기(시뮬레이터)에 올린 방법 — Android 와 근본적으로 다른 지점
@@ -99,7 +99,7 @@ Python.framework/Headers/Python.h       # 헤더
 앱 번들 안에 있어야 한다" 는 제약과 같은 결의 것이다 — CPython 배포본 자체가 이미 "독립 실행형
 인터프리터를 기기에 그냥 올려 돌리는" 경로를 막아 둔 셈이다.
 
-**앱은 만들지 않되, 최소 실행 파일 하나는 필요했다.** `crates/torch_c` 를 건드리지 않는 선에서
+**앱은 만들지 않되, 최소 실행 파일 하나는 필요했다.** `torchnative/rust/torch_c` 를 건드리지 않는 선에서
 `/tmp` 에 15줄짜리 C 드라이버를 작성해 `Py_Initialize` → `PyRun_SimpleString("import _C; ...")` →
 `Py_Finalize` 만 하도록 했다(Info.plist, 번들 구조, 코드 서명 엔타이틀먼트 없음).
 
@@ -264,7 +264,7 @@ DRIVER_EXIT_RC=0
   `Python.framework` 하나만 요구해 해당 없었지만, op 구현이 늘어 이들에 의존하게 되면 iOS
   프레임워크 배포본에 그런 부속 `.dylib` 가 아예 없다는 점(§`RUST_CROSSBUILD.md`)을 다시 봐야 한다.
 - **빌드 로그의 `-undefined dynamic_lookup is deprecated on iOS-simulator` 경고의 근원은 특정하지
-  않았다.** `crates/torch_c` 를 열지 않기로 한 제약 때문이다. `EXIT=0` 이고 `otool -L` 로 실제
+  않았다.** `torchnative/rust/torch_c` 를 열지 않기로 한 제약 때문이다. `EXIT=0` 이고 `otool -L` 로 실제
   프레임워크 링크를 확인했으므로 이번 로드 검증 결과에는 영향이 없었지만, `Cargo.kt` 가 이
   경로를 정식으로 구현할 때 재확인이 필요하다.
 

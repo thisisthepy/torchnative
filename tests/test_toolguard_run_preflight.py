@@ -20,7 +20,7 @@ import fails.
 `torch` is deliberately NOT in that list, and its absence here is itself the
 fix for a second, sharper trap the first version of this preflight fell into:
 `torch` is not a third-party package this repository *consumes* -- through
-`python/torch` it is a build *product*, laid down by
+`torchnative/python/torch` it is a build *product*, laid down by
 `scripts/vendor/vendor_torch.sh` + `scripts/vendor/install_shim.sh`, gitignored, and absent by
 default in a fresh worktree. Requiring `import torch` to succeed before the
 gate runs makes the preflight refuse the one interpreter the gate exists to

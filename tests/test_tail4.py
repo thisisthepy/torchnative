@@ -57,10 +57,10 @@ from test_shim import _C
 import _skip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
-_ATEN_RS = os.path.join(_REPO_ROOT, "crates", "torch_c", "src", "aten.rs")
-_TENSOR_RS = os.path.join(_REPO_ROOT, "crates", "torch_c", "src", "tensor.rs")
+_ATEN_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "aten.rs")
+_TENSOR_RS = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src", "tensor.rs")
 
 
 _PROBE_SCRIPT = r"""
@@ -945,7 +945,7 @@ def test_the_round_decimals_overload_resolves_before_the_bare_one():
     *plausible numbers* -- `round(2.675)` is `3.0` -- so nothing but an
     explicit check catches it.
     """
-    root = os.path.join(_REPO_ROOT, "crates", "torch_c", "src")
+    root = os.path.join(_REPO_ROOT, "torchnative", "rust", "torch_c", "src")
     for name in ("overloads.json", "methods.json"):
         path = os.path.join(root, name)
         if not os.path.isfile(path):

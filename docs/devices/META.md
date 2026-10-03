@@ -891,14 +891,14 @@ PYTHON=$PY sh tests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 전사 대조: 같은 프로브를 두 torch 로 돌리고 diff
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
-  PYTHONPATH=$PWD/python $PY <probe> > ours.txt
+  PYTHONPATH=$PWD/torchnative/python $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 
 # A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- AGENTS.md)
-git stash push -- crates/torch_c/src
-(cd crates/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
+git stash push -- torchnative/rust/torch_c/src
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
 git stash pop
-(cd crates/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
 for i in 1 2 3 4; do $PY /tmp/dev_bench.py /tmp/base_C.so; $PY /tmp/dev_bench.py /tmp/meta_C.so; done
 ```
 

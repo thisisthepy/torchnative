@@ -46,9 +46,9 @@ on:
   push:
     paths:
       - ".github/workflows/build-cuda-wheel.yml"
-      - "crates/torch_c/Cargo.toml"
-      - "crates/torch_c/build.rs"
-      - "crates/torch_c/src/device.rs"
+      - "torchnative/rust/torch_c/Cargo.toml"
+      - "torchnative/rust/torch_c/build.rs"
+      - "torchnative/rust/torch_c/src/device.rs"
 
 permissions:
   contents: read
@@ -155,7 +155,7 @@ jobs:
       # `--config` flag or `RUSTFLAGS`, and the choice matters twice.
       #
       # Not `RUSTFLAGS`: it *replaces* the rustflags from `.cargo/config.toml`
-      # rather than adding to them, which is the trap `crates/torch_c/Cargo.toml`
+      # rather than adding to them, which is the trap `torchnative/rust/torch_c/Cargo.toml`
       # records against the Accelerate opt-out. Nothing in this repository's
       # `.cargo/config.toml` targets Linux today, so it would happen to work --
       # and would break silently the day something does.
@@ -178,7 +178,7 @@ jobs:
       # claim the job exists to make, kept as its own step so that a failure
       # further down cannot be confused with the compiler rejecting the code.
       - name: Build the CUDA extension
-        working-directory: crates/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           cargo build --release
@@ -189,7 +189,7 @@ jobs:
       # wearing this job's name. `cargo tree -e features` is how docs/devices/VULKAN3.md
       # §1.3 checked the same thing for Metal.
       - name: The cuda feature really is in the graph
-        working-directory: crates/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           cargo tree -e features --target x86_64-unknown-linux-gnu | tee /tmp/tree.txt
@@ -200,7 +200,7 @@ jobs:
       # the artefact names CUDA libraries as load-time dependencies, so it
       # cannot be the same wheel as the CPU one.
       - name: What the artefact needs at load time
-        working-directory: crates/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           readelf -d target/release/lib_C.so | tee /tmp/needed.txt
@@ -220,7 +220,7 @@ jobs:
       # what the toolkit action exported, and neither outcome is a defect. It is
       # here because it is the observation a reader of this log will want.
       - name: Does it even import here (observation, not a gate)
-        working-directory: crates/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eu
           cp target/release/lib_C.so /tmp/_C.abi3.so
@@ -254,7 +254,7 @@ jobs:
           # Picks up the cfg from $CARGO_HOME/config.toml, so this is the same
           # artefact the build step verified rather than a fresh CPU one.
           PYTHON=python bash scripts/vendor/install_shim.sh
-          readelf -d python/torch/_C.abi3.so | grep -E "libcuda|libcublas"
+          readelf -d torchnative/python/torch/_C.abi3.so | grep -E "libcuda|libcublas"
 
       - name: Build the wheel
         run: |

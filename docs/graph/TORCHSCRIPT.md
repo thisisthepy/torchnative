@@ -70,7 +70,7 @@ own functions rather than `MkldnnLinear`'s.
 `torch.jit.script` at module scope runs at import time, as a decorator. Upstream ships an off
 switch for exactly this — the question was whether it degrades to something usable or to nothing.
 
-**Read directly from the vendored tree** (`python/torch/jit/_state.py`, byte-identical
+**Read directly from the vendored tree** (`torchnative/python/torch/jit/_state.py`, byte-identical
 to `/Volumes/macMini/caches/spike-venv/.../torch/jit/_state.py`, `diff` exit 0 — this file is
 unmodified upstream, torch 2.13.0):
 
@@ -172,7 +172,7 @@ here — some of the functions *are* on the forward path.)
 
 ## 4. The fix — one `setdefault`, in territory, both directions tested
 
-`crates/torch_c/src/bootstrap.py`, executed once per `_C` import (before `torch/__init__.py`
+`torchnative/rust/torch_c/src/bootstrap.py`, executed once per `_C` import (before `torch/__init__.py`
 reaches `import torch.jit`, since `_C`'s own import is what runs this file):
 
 ```python
@@ -242,7 +242,7 @@ transformers/models/gpt_bigcode/modeling_gpt_bigcode.py:386, in GPTBigCodeModel.
     )
 torch_c_bootstrap.py:3044, in fn
 NotImplementedError: not implemented in torch._C shim: torch.tril(...) -- overload resolution has
-no table entry for this op (crates/torch_c/src/overloads.json); call torch.ops.aten.tril.<overload>,
+no table entry for this op (torchnative/rust/torch_c/src/overloads.json); call torch.ops.aten.tril.<overload>,
 which carries the overload and reaches the same dispatcher
 ```
 
@@ -374,7 +374,7 @@ that was explicitly out of scope for this round (the brief names GPT-BigCode as 
 twenty, and none of these six are in that twenty).
 
 Also affected, inside the vendored tree itself rather than `transformers`: eight files under
-`python/torch/distributed/optim/` (`functional_sgd.py`, `functional_adamw.py`,
+`torchnative/python/torch/distributed/optim/` (`functional_sgd.py`, `functional_adamw.py`,
 `functional_adam.py`, `functional_adagrad.py`, `functional_adadelta.py`, `functional_adamax.py`,
 `functional_rmsprop.py`, `functional_rprop.py`) each have a module-scope `@torch.jit.script` on
 their optimizer step function, plus `torch/distributed/optim/optimizer.py:104`. `torch.distributed`
@@ -389,7 +389,7 @@ not verified further. The remaining matches are all under `torch/testing/_intern
 ## 9. What was and was not done
 
 **Done, in territory:**
-* `crates/torch_c/src/bootstrap.py` — `os.environ.setdefault("PYTORCH_JIT", "0")`, one line, with the
+* `torchnative/rust/torch_c/src/bootstrap.py` — `os.environ.setdefault("PYTORCH_JIT", "0")`, one line, with the
   reasoning inline.
 * `tests/test_shim.py` — three new tests, all through the Python-facing
   `torch.jit.script`/`import` path, covering the default, the explicit-override, and GPT-BigCode's

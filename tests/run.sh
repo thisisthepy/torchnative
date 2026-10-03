@@ -11,7 +11,7 @@ set -eu
 
 tests_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH='' cd -- "$tests_dir/.." && pwd)
-crate_dir=$repo_root/crates/torch_c
+crate_dir=$repo_root/torchnative/rust/torch_c
 target_dir=${CARGO_TARGET_DIR:-$crate_dir/target}
 # Per-checkout, not per-machine. The default used to be a single
 # $TMPDIR/torch-c-stage shared by every worktree on the box, and this project
@@ -63,7 +63,7 @@ stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage-$(printf '%s' "$repo_root" 
 #     this guard got wrong. `torch` LOOKS like a third-party import every
 #     suite needs, but it is not one thing -- it is either the oracle
 #     (upstream, pip-installed, importable stand-alone) or *this repo's own
-#     build product* (the vendored tree at python/torch, laid
+#     build product* (the vendored tree at torchnative/python/torch, laid
 #     down by scripts/vendor/vendor_torch.sh and gitignored, absent in a fresh
 #     worktree, on PYTHONPATH only because run.sh puts it there for the
 #     capture/checkpoint/device/meta subprocess tests -- see the vendor_shim
@@ -219,7 +219,7 @@ fi
 # refused with a message telling the reader to reinstall a shim that was already
 # current. That is the repeated defect of this repository wearing a new hat, so
 # the two are separated and only one of them is a staleness claim.
-vendor_dir=${TORCHNATIVE_VENDOR_DIR:-$repo_root/python}
+vendor_dir=${TORCHNATIVE_VENDOR_DIR:-$repo_root/torchnative/python}
 vendor_shim="$vendor_dir/torch/_C.abi3.so"
 if [ -f "$vendor_shim" ]; then
     cmp -s "$stage/_C.abi3.so" "$vendor_shim" && cmp_status=0 || cmp_status=$?
@@ -241,7 +241,7 @@ if [ "$cmp_status" -eq 1 ]; then
     cat >&2 <<EOF
 run.sh: refusing to run -- $vendor_shim is stale.
 
-It does not match what was just built from crates/torch_c/src. The capture,
+It does not match what was just built from torchnative/rust/torch_c/src. The capture,
 checkpoint, device, and meta tests read that file (not this script's
 staged artefact) through a vendored-tree subprocess, so running them now
 would silently re-test the old build instead of catching a change here.

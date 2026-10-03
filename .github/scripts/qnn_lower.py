@@ -408,7 +408,7 @@ def main(argv=None):
             "measures at 0 of 40 architectures. Refusing."
         )
 
-    sys.path.insert(0, os.path.join("python"))
+    sys.path.insert(0, os.path.join("torchnative", "python"))
     from torchnative.export import qnn
 
     # The wall, named, before anything else happens. On a host where the QNN

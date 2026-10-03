@@ -85,7 +85,7 @@ Test paths below are relative to `tests/` unless they start with another directo
 
 | # | Behaviour | Status | Evidence |
 |---|---|---|---|
-| S7.1 | `torchnative.kernels`: a bundle resolver satisfying the HF `kernels` contract, resolving at build time on mobile. | planned | `python/torchnative/kernels/__init__.py` is a docstring only; `tests/test_import.py` only imports it |
+| S7.1 | `torchnative.kernels`: a bundle resolver satisfying the HF `kernels` contract, resolving at build time on mobile. | planned | `torchnative/python/torchnative/kernels/__init__.py` is a docstring only; `tests/test_import.py` only imports it |
 | S7.2 | `torchnative.api.TorchNativeAPI`: deployment, lifetime policy, device orchestration. | planned | skeleton class; no behavioural test |
 | S7.3 | Flash-attention / flash-linear-attention kernels across platforms. | planned | no test |
 

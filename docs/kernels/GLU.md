@@ -1,6 +1,6 @@
 # GLU — the ASR encoders' shared wall, and the six ops behind it
 
-Worktree `work/glu` on develop `eb84708`. Territory: `crates/torch_c/src/aten.rs`,
+Worktree `work/glu` on develop `eb84708`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `methods.json`, `overloads.json`, `tests/golden/cases.py`,
 `tests/test_glu.py`. `bootstrap.py`, `capture.rs`, `tape.rs`,
 `tensor.rs`, `device.rs`, `scripts/wheel/`, `torchnative/` were not touched, per

@@ -4,8 +4,8 @@
 `torch.*` function and every `TensorBase` method. Both now compile a per-operator
 closure, `_fast`, and try it before `entry.resolve`.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _compile_fast_path present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _CAPTURE_ACTIVE present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _compile_fast_path present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _CAPTURE_ACTIVE present -->
 
 Measured on 2026-09-02, `darwin/arm64`, CPython 3.13, upstream torch 2.13.0.
 

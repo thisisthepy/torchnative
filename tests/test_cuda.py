@@ -42,9 +42,9 @@ import test_shim as shim_helpers
 
 REPO = os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))
-CARGO_TOML = os.path.join(REPO, "crates", "torch_c", "Cargo.toml")
-ATEN_RS = os.path.join(REPO, "crates", "torch_c", "src", "aten.rs")
-DEVICE_RS = os.path.join(REPO, "crates", "torch_c", "src", "device.rs")
+CARGO_TOML = os.path.join(REPO, "torchnative", "rust", "torch_c", "Cargo.toml")
+ATEN_RS = os.path.join(REPO, "torchnative", "rust", "torch_c", "src", "aten.rs")
+DEVICE_RS = os.path.join(REPO, "torchnative", "rust", "torch_c", "src", "device.rs")
 CUDA_MD = os.path.join(REPO, "docs", "devices", "CUDA.md")
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "build-cuda-wheel.yml")
 
@@ -285,7 +285,7 @@ def test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs():
 
     parsed = shim_helpers._aten_rs_functions()
     if parsed is None:
-        print("   (not re-derived: crates/torch_c/src/aten.rs is not beside this "
+        print("   (not re-derived: torchnative/rust/torch_c/src/aten.rs is not beside this "
               "file -- installed rather than in-tree. The equality above still "
               "held.)")
         return
@@ -321,7 +321,7 @@ def test_the_readback_gate_is_more_necessary_on_cuda_than_it_was_on_metal():
     Asserted from the source of `read_flat`, because the claim is about what
     that helper does, not about what a device did.
     """
-    text = _read(os.path.join(REPO, "crates", "torch_c", "src", "aten.rs"))
+    text = _read(os.path.join(REPO, "torchnative", "rust", "torch_c", "src", "aten.rs"))
     assert "fn read_flat" in text
     assert "widen_f64" in text, (
         "read_flat no longer widens through f64 -- docs/devices/CUDA.md §5's argument "

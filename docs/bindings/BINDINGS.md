@@ -217,7 +217,7 @@ to upstream within one ULP across `float64`/`float32`/`float16`/`bfloat16`
 including the saturating tail, and then **removed**, because the only spelling
 is `torch._C._nn.mish` and `bootstrap.py` belonged to another round.
 
-The kernel is not in the tree. `mish` appears nowhere in `crates/torch_c/src`, it
+The kernel is not in the tree. `mish` appears nowhere in `torchnative/rust/torch_c/src`, it
 is not in `_aten_implemented()`, and it has no golden cases. So the two lines
 beside `silu`'s would install a door onto nothing: `_nn.mish` would dispatch
 `aten.mish.default` and raise `aten op not implemented in torch._C shim` — a

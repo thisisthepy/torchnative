@@ -1,11 +1,11 @@
 # REFOLD — folding `prims.*` back to `aten`, and BatchNorm into the convolution
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/refold.py refold present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/refold.py REFOLDABLE present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/refold.py UNREFOLDABLE_PRIMS present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/refold.py lower_and_refold present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/fuse.py fold_conv_batch_norm present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/fuse.py batch_norm_affine present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py refold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py REFOLDABLE present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py UNREFOLDABLE_PRIMS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/refold.py lower_and_refold present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/fuse.py fold_conv_batch_norm present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/fuse.py batch_norm_affine present -->
 
 ## 1. The table this round is judged by
 
@@ -263,7 +263,7 @@ one stays.
     export TORCH_C_STAGE=/tmp/stage-refold
     PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-    cd crates/torch_c && cargo build --release && cd -
+    cd torchnative/rust/torch_c && cargo build --release && cd -
     bash scripts/vendor/install_shim.sh
     PYTHON=$PY sh tests/run.sh
     PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \

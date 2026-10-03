@@ -44,7 +44,7 @@ import os
 import sys
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 # Before anything can reach `torch`. See the module docstring.

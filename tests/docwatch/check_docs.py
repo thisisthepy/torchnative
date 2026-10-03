@@ -352,7 +352,7 @@ class LiveFacts:
     def decomp(self) -> dict:
         if self._decomp_cache is None:
             env = dict(self.env)
-            env["PYTHONPATH"] = str(REPO_ROOT / "python")
+            env["PYTHONPATH"] = str(REPO_ROOT / "torchnative" / "python")
             env["TORCH_USE_RTLD_GLOBAL"] = "1"
             proc = subprocess.run(
                 [self.python_exe, str(REPO_ROOT / "tests" / "decomp_sweep.py")],
@@ -463,7 +463,7 @@ class LiveFacts:
     def skip_lines_visible(self) -> int:
         if self._skipvis_cache is None:
             env = dict(self.env)
-            env["PYTHONPATH"] = str(REPO_ROOT / "python")
+            env["PYTHONPATH"] = str(REPO_ROOT / "torchnative" / "python")
             proc = subprocess.run(
                 [self.python_exe, str(REPO_ROOT / "tests" / "test_intelnpu.py")],
                 capture_output=True,

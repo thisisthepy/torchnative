@@ -5,7 +5,7 @@
 `aten::_scaled_dot_product_flash_attention_for_cpu` 의 블록 단위 재결합으로 좁혀 두었습니다.
 
 > **먼저 읽어야 할 것 — 이 커널은 켜져 있지 않습니다.**
-> 재현한 커널(`crates/torch_c/src/flash.rs`)은 **T=512 에서 20배 느립니다.** 그래서 기본
+> 재현한 커널(`torchnative/rust/torch_c/src/flash.rs`)은 **T=512 에서 20배 느립니다.** 그래서 기본
 > 경로는 candle 이 그대로 유지하고, 이 커널은 **명시적으로 요청할 때만** 닿습니다.
 > 측정과 그 판단은 **§12** 에 있습니다. §3 · §5 · §6 의 "비트 일치" 는 전부 **스위치를 켠
 > 상태의 주장**이고, 스위치를 끈 기본 경로에 대한 주장이 아닙니다.
@@ -69,7 +69,7 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`).
 ## 2. 상류 커널의 모양
 
 `aten::_scaled_dot_product_flash_attention_for_cpu` 는 교과서 공식이 아닙니다.
-`crates/torch_c/src/flash.rs` 가 재현한 것은 다음 다섯 가지입니다.
+`torchnative/rust/torch_c/src/flash.rs` 가 재현한 것은 다음 다섯 가지입니다.
 
 | | 상류가 하는 것 |
 |---|---|
@@ -517,7 +517,7 @@ float32  T=512     6.9630 ms     156.1144 ms    22.42배
 > `enable_flash_sdp`/`sdpa_kernel(MATH)` 는 여전히 백엔드 **선택** 이름이지 op 산술 선택
 > 이름이 아니므로, 지금도 안 맞는 이유가 유효합니다. 낡은 것은 괄호 안의 근거 하나뿐입니다.
 > <!-- DOCWATCH: op-implemented aten._safe_softmax.default -->
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _sdpa_math present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sdpa_math present -->
 | `torch.backends.cpu.get_cpu_capability` / `ATEN_CPU_CAPABILITY` | 읽기 전용이고, 환경변수 쪽은 빌드 전체의 **ISA 등급**을 고르는 것이지 한 op 의 참조 구현을 고르는 것이 아닙니다 |
 | `torch.use_deterministic_algorithms` | 한 빌드의 **실행 간 재현성**에 관한 것이고, 여기서는 **두 경로 다 이미 그렇습니다.** 사용자는 이것을 문서에 적힌 목적으로 켜는데, 거기에 20배를 매달아 두면 함정이 됩니다 |
 

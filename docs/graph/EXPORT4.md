@@ -155,10 +155,10 @@ The honest summary is: **export got materially further, and it does not work.**
 
 ## 4. `aten.empty_strided` — and a refusal that is forced, not chosen
 
-`crates/torch_c/src/aten.rs`, `crates/torch_c/src/overloads.json`.
+`torchnative/rust/torch_c/src/aten.rs`, `torchnative/rust/torch_c/src/overloads.json`.
 
 <!-- DOCWATCH: op-implemented aten.empty_strided.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json empty_strided present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json empty_strided present -->
 
 It is the constructor behind every fake tensor (`meta_utils.py:2009`), so
 `torch.export` reaches it before anything interesting. **It serves the
@@ -523,7 +523,7 @@ inferring one from the other.
 ## 10. What was left undone, and why
 
 * **`docs/graph/EXPORT.md` §8's hand-off.** The 29 names are still in
-  `python/torchnative/export/upstream.py`, so every measurement
+  `torchnative/python/torchnative/export/upstream.py`, so every measurement
   here is under a runtime monkey-patch (§1.1). Moving them is mechanical and
   large, it touches the `rebind()` pass over ~40 `from torch._C import ...`
   bindings, and doing it in the same round as six behavioural changes would have

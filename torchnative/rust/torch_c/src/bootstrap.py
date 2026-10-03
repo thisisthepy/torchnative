@@ -43,7 +43,7 @@ The three rules
 
 Where the names come from
 -------------------------
-`scripts/vendor/gen_surface.py`, from `python/torch/_C/*.pyi` -- the vendored tree's
+`scripts/vendor/gen_surface.py`, from `torchnative/python/torch/_C/*.pyi` -- the vendored tree's
 own stubs. Not from an installed upstream `_C.so`. The distinction matters:
 the stubs are the tree's statement of what it expects, they ship under the
 same BSD licence as the rest of the vendored tree, and using them keeps the
@@ -5277,7 +5277,7 @@ def _torch_level_function(name: str, dispatch, overloads):
             raise NotImplementedError(
                 f"not implemented in torch._C shim: torch.{name}(...) -- overload "
                 f"resolution has no table entry for this op "
-                f"(crates/torch_c/src/overloads.json); call "
+                f"(torchnative/rust/torch_c/src/overloads.json); call "
                 f"torch.ops.aten.{name}.<overload>, which carries the overload "
                 f"and reaches the same dispatcher"
             )
@@ -13170,7 +13170,7 @@ def _install_functionality_to_backend_keys(module) -> None:
 # ---------------------------------------------------------------------------
 #
 # These 32 `torch._C` names lived in
-# `python/torchnative/export/upstream.py`, which installed them
+# `torchnative/python/torchnative/export/upstream.py`, which installed them
 # by monkey-patching `torch._C` *after* `import torch`. docs/graph/EXPORT.md §8 said
 # that was the wrong home and gave the patch; docs/graph/EXPORT4.md §10 listed paying
 # it as the next mechanical task. This is it.
@@ -13536,7 +13536,7 @@ def _is_definitely_a_view(t) -> bool:
     contiguously -- `x.view(12)`, `x[:]`, `x.reshape(3, 4)` on a contiguous `x`
     -- is bit-for-bit indistinguishable from the base under every signal this
     shim exposes.  Upstream answers `True` there because `TensorImpl` carries a
-    base pointer; nothing in `PyTensorBase` does (`crates/torch_c/src/tensor.rs`
+    base pointer; nothing in `PyTensorBase` does (`torchnative/rust/torch_c/src/tensor.rs`
     has storage identity via `storage.rs::origin`, but no base *tensor*).  This
     returns `False` for that case, and that is the one wrong answer in the pair.
 

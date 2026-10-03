@@ -78,7 +78,7 @@ Meta { shape, stride, storage_offset, storage_nbytes: Arc<AtomicUsize>, storage_
   constructor behind every fake tensor. The dense half still refuses a
   non-contiguous stride by name — candle cannot hold one.
 
-The arithmetic is in `crates/torch_c/src/layout.rs`, one function per upstream
+The arithmetic is in `torchnative/rust/torch_c/src/layout.rs`, one function per upstream
 rule, each naming the rule it ports: `computeStride` (`view`),
 `inferExpandGeometry`, `inferUnsqueezeGeometry`, `computeStorageNbytes`,
 `compute_elementwise_output_logical_to_physical_perm`,
@@ -406,15 +406,15 @@ Three runs are not counted, and why:
   evidence either way;
 * the nullification campaign's 31 builds (§7), which are red by design.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs storage_nbytes present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs meta_view present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs meta_stride_rule present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs relay_elementwise present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs elementwise_stride present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs view_stride present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs collapse_view present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/layout.rs strides_like_channels_last present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs meta_len_cell present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs storage_nbytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs meta_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs meta_stride_rule present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs relay_elementwise present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/layout.rs elementwise_stride present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/layout.rs view_stride present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/layout.rs collapse_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/layout.rs strides_like_channels_last present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs meta_len_cell present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_as_strided_on_meta_answers_upstreams_layout_and_refusals present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_view_kernels_on_meta_carry_the_real_stride_offset_and_storage present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metastride.py test_layout_following_meta_kernels_answer_upstreams_output_stride present -->

@@ -8,7 +8,7 @@ SmolLM2-135M: B=1, H=9 query, H_kv=3, head_dim=64, S=varying
 
 Usage:
     PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 \
-        /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python benches/profile_sdpa_shapes.py
+        /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tests/bench/profile_sdpa_shapes.py
 """
 
 import sys

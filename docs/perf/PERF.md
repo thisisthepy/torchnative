@@ -5,7 +5,7 @@ CPython 3.13.0, 양쪽 다 torch 2.13.0 계열.
 
 > **재측정 (2026-09-12, op 304).** 아래 §1~§4 의 수치는 **op 96 시절의 것**이고, 하니스는
 > `/tmp/bench.py` 로 저장소 밖이라 재현할 수 없었습니다. 하니스를 저장소 안
-> (`benches/ab_upstream.py`) 으로 옮기고 **op 304 의 현재 트리에서 다시 쟀습니다.**
+> (`tests/bench/ab_upstream.py`) 으로 옮기고 **op 304 의 현재 트리에서 다시 쟀습니다.**
 > 결과는 **§0.5** 에 있습니다. 원래 절은 지우지 않고 남겨두되, 각 절 머리에 무엇이
 > 움직였는지 표시했습니다.
 
@@ -26,7 +26,7 @@ CPython 3.13.0, 양쪽 다 torch 2.13.0 계열.
 상류와 우리 torch 는 **같은 프로세스에 못 올라갑니다**(이름 충돌). 그래서 별도 프로세스이고,
 연산은 양쪽 다 `torch.ops.aten.*` 로 불러 **스펠링 차이가 숫자에 섞이지 않게** 했습니다.
 
-스크립트는 `/tmp/bench.py` 로 저장소 밖이었습니다. **2026-09-12 에 `benches/ab_upstream.py` 로
+스크립트는 `/tmp/bench.py` 로 저장소 밖이었습니다. **2026-09-12 에 `tests/bench/ab_upstream.py` 로
 저장소 안에 옮겼습니다** — 그 하니스가 이 절의 방법(별도 프로세스·A/B 교대·`torch.ops.aten.*`)을
 그대로 구현하고, 여기에 load average 기록과 분포 보고를 더합니다.
 
@@ -45,8 +45,8 @@ CPython 3.13.0, 양쪽 다 torch 2.13.0 계열.
 
 ```
 PYTHON=/Volumes/macMini/caches/spike-venv/bin/python \
-    /Volumes/macMini/caches/spike-venv/bin/python benches/ab_upstream.py --suite ops   --rounds 5
-PYTHON=...                                          ... benches/ab_upstream.py --suite model --rounds 3
+    /Volumes/macMini/caches/spike-venv/bin/python tests/bench/ab_upstream.py --suite ops   --rounds 5
+PYTHON=...                                          ... tests/bench/ab_upstream.py --suite model --rounds 3
 ```
 
 하니스는 §0 의 방법을 그대로 코드로 옮긴 것입니다 — 두 torch 는 같은 프로세스에 못 올라가므로
@@ -177,7 +177,7 @@ oneDNN 없이 빌드되어 bf16 GEMM 이 붙을 백엔드가 없고 참조 구�
 
 ## 3. 원인과 해법 — `accelerate` feature 하나 *(결론 재확인됨, §0.5.1)*
 
-`crates/torch_c/Cargo.toml` 이 `candle-core` 를 `default-features = false` 로 고정하고 있고,
+`torchnative/rust/torch_c/Cargo.toml` 이 `candle-core` 를 `default-features = false` 로 고정하고 있고,
 그 주석이 이유를 적어뒀습니다 — **"상류의 미래 기본값이 Accelerate/Metal/MKL/CUDA 를 조용히
 링크하지 못하게"** 하는 격리 목적입니다. 능력 부재가 아니라 우리가 끈 것입니다.
 

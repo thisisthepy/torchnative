@@ -59,7 +59,7 @@ from test_shim import _C
 
 REPO = os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))
-VENDOR_DIR = os.path.join(REPO, "python")
+VENDOR_DIR = os.path.join(REPO, "torchnative", "python")
 
 # The four ops docs/devices/VULKAN3.md landed, so this file can state the widening as a
 # difference rather than a number, and so a later round that removes one is a
@@ -1062,7 +1062,7 @@ def test_the_checked_in_spirv_is_not_stale_for_any_shader():
     guard existed for `add_f32` alone; this round added nine more files, and a
     guard that covers one of ten is a guard someone will trust.
     """
-    shaders = os.path.join(REPO, "crates", "torch_c", "shaders")
+    shaders = os.path.join(REPO, "torchnative", "rust", "torch_c", "shaders")
     comps = sorted(f for f in os.listdir(shaders) if f.endswith(".comp"))
     assert len(comps) >= 10, f"expected at least ten shaders, found {comps}"
     for comp in comps:
@@ -1085,8 +1085,8 @@ def test_the_checked_in_spirv_is_not_stale_for_any_shader():
 
 def test_every_shader_on_disk_is_reachable_from_the_dispatcher():
     """A shader nobody dispatches is dead weight that still looks like coverage."""
-    shaders = os.path.join(REPO, "crates", "torch_c", "shaders")
-    src = os.path.join(REPO, "crates", "torch_c", "src", "vulkan.rs")
+    shaders = os.path.join(REPO, "torchnative", "rust", "torch_c", "shaders")
+    src = os.path.join(REPO, "torchnative", "rust", "torch_c", "src", "vulkan.rs")
     with open(src) as fh:
         text = fh.read()
     for comp in sorted(f for f in os.listdir(shaders) if f.endswith(".comp")):

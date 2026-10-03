@@ -68,7 +68,7 @@ float64 oracle; the shim side is a replay.
     D=/tmp/agree
 
     env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D
-    PYTHONPATH=$root/python TORCH_USE_RTLD_GLOBAL=1 \
+    PYTHONPATH=$root/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
         $PY agree_sweep.py --replay --dir $D
     $PY agree_sweep.py --report --dir $D
 

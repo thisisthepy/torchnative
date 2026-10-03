@@ -32,7 +32,7 @@ invariant. Run it by hand, both sides, then compare:
     root=$(git rev-parse --show-toplevel)
     cd $root/tests
 
-    PYTHONPATH=$root/python TORCH_USE_RTLD_GLOBAL=1 \
+    PYTHONPATH=$root/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
         $PY export_sweep.py --out /tmp/exp-shim.json
     env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL \
         $PY export_sweep.py --out /tmp/exp-up.json

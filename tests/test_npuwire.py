@@ -55,7 +55,7 @@ import sys
 import warnings
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
@@ -268,7 +268,7 @@ def test_a_generate_style_loop_still_runs_after_to_device_npu():
     for i, got in enumerate(outs):
         assert got.shape == expected.shape, (i, got.shape, expected.shape)
         # Not `torch.allclose`: this shim has no table entry for it
-        # (crates/torch_c/src/overloads.json), so calling it raises
+        # (torchnative/rust/torch_c/src/overloads.json), so calling it raises
         # NotImplementedError. That went unnoticed while this file lived in a
         # worktree with no vendored tree, where `import torch` fell through to
         # an upstream install that does have it. The subtraction below is the

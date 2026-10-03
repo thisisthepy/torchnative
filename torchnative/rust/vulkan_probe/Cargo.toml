@@ -3,7 +3,7 @@ name = "vk_probe"
 version = "0.0.0"
 edition = "2021"
 
-# Deliberately NOT a dependency of `crates/torch_c`, and deliberately not in a
+# Deliberately NOT a dependency of `torchnative/rust/torch_c`, and deliberately not in a
 # workspace with it. This crate exists to answer one question -- can a Vulkan
 # compute shader run on our Android target and agree with the CPU -- and adding
 # a Vulkan dependency to the real extension module before that is answered would
@@ -29,7 +29,7 @@ opt-level = 2
 
 # The wgpu route, behind a feature so the default build stays at three crates.
 # `cargo build` proves the ash route; `cargo build --features wgpu-route` adds
-# the comparison. Nothing here is a dependency of `crates/torch_c`.
+# the comparison. Nothing here is a dependency of `torchnative/rust/torch_c`.
 [[bin]]
 name = "vk_probe_wgpu"
 path = "src/wgpu_main.rs"

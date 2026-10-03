@@ -157,7 +157,7 @@ it, "7 of 8" would have looked like one architecture still owed.
 
 ## 3. The kernels
 
-22 op names, 17 new `match` arms in `meta_dispatch` (`crates/torch_c/src/aten.rs`).
+22 op names, 17 new `match` arms in `meta_dispatch` (`torchnative/rust/torch_c/src/aten.rs`).
 
 | arm | ops | shape | dtype |
 |---|---|---|---|
@@ -545,8 +545,8 @@ adding an op without a case.
 <!-- DOCWATCH: op-implemented aten.relu.default -->
 <!-- DOCWATCH: op-implemented aten.repeat.default -->
 <!-- DOCWATCH: op-implemented aten.index.Tensor -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs meta_values_indices present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs mm_shape_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs meta_values_indices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs mm_shape_refusal present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_index_half_is_int64_whatever_the_input_dtype_was present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_value_half_keeps_the_inputs_own_dtype_and_does_not_widen present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metaemb.py test_the_three_data_dependent_ops_refuse_by_name_with_the_reason present -->

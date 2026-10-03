@@ -35,7 +35,7 @@ transformers 쪽에서 멈춥니다 (§8 항목 3).
 > 직접 성공한다. `docs/design/REGISTRATIONS.md`/`docs/models/FROM_CONFIG.md` 감사(이 라운드)가 각각 독립적으로
 > 재확인했다: `torch._C._log_api_usage_once` 가 생겼고, 14개 초기화 op 이 전부 구현됐다. 아래
 > §0/§11 원문은 이 문서가 쓰인 시점 그대로 남긴다.
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _log_api_usage_once present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _log_api_usage_once present -->
 
 ---
 
@@ -48,8 +48,8 @@ transformers 쪽에서 멈춥니다 (§8 항목 3).
 그래서 두 조각을 넣었습니다.
 
 ```
-crates/torch_c/src/surface.json    벤더링 트리의 .pyi 에서 뽑은 이름표 (120 KB)
-crates/torch_c/src/bootstrap.py    그 표로 표면을 짓는 코드 (1297 행)
+torchnative/rust/torch_c/src/surface.json    벤더링 트리의 .pyi 에서 뽑은 이름표 (120 KB)
+torchnative/rust/torch_c/src/bootstrap.py    그 표로 표면을 짓는 코드 (1297 행)
 ```
 
 둘 다 `include_str!` 로 `.so` 안에 들어가고, `lib.rs::run_bootstrap` 이 `#[pymodule]` 초기화
@@ -72,7 +72,7 @@ crates/torch_c/src/bootstrap.py    그 표로 표면을 짓는 코드 (1297 행)
 옳지만(구멍을 재는 것이니까) shim 의 입력으로는 틀립니다 — 우리가 교체하려는 바로 그 바이너리에서
 빌려오는 것이고, 빌드가 진짜 torch 설치를 요구하게 됩니다.
 
-`scripts/vendor/gen_surface.py` 는 대신 `python/torch/_C/*.pyi` 를 읽습니다. **벤더링한 BSD 트리의 일부**
+`scripts/vendor/gen_surface.py` 는 대신 `torchnative/python/torch/_C/*.pyi` 를 읽습니다. **벤더링한 BSD 트리의 일부**
 이고, 상류가 "다른 도구가 `_C` 를 로드하지 않고도 인터페이스를 알 수 있도록" 넣어 둔 파일이며,
 무엇보다 **트리 자신이 무엇을 기대하는지에 대한 진술**입니다.
 
@@ -381,7 +381,7 @@ $ ... --inject-fault {value,shape,dtype}                     EXIT=1 / 1 / 1
 
 `--inject-fault` 세 가지가 전부 여전히 1 로 떨어집니다 — 비교기가 고무도장이 되지 않았다는 확인입니다.
 
-**`tests/golden/` 은 한 줄도 고치지 않았습니다.** 실패 5 건은 전부 `crates/torch_c` 쪽 변경으로
+**`tests/golden/` 은 한 줄도 고치지 않았습니다.** 실패 5 건은 전부 `torchnative/rust/torch_c` 쪽 변경으로
 닫혔습니다.
 
 ---
@@ -545,7 +545,7 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 cd /Volumes/macMini/thisisthepy/torchnative
 
 ./scripts/vendor/vendor_torch.sh          # 없으면
-./scripts/vendor/gen_surface.py           # .pyi -> crates/torch_c/src/surface.json
+./scripts/vendor/gen_surface.py           # .pyi -> torchnative/rust/torch_c/src/surface.json
 ./scripts/vendor/install_shim.sh          # 빌드 + 구멍에 넣기
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
@@ -567,13 +567,13 @@ bash tests/run.sh; echo "EXIT=$?"
 
 | 파일 | 변경 |
 |---|---|
-| `crates/torch_c/src/bootstrap.py` | **신규** — 표면 빌더 (1297 행) |
-| `crates/torch_c/src/surface.json` | **신규(생성물)** — `.pyi` 에서 뽑은 이름표 |
-| `crates/torch_c/src/info.rs` | **신규** — `finfo` / `iinfo` |
-| `crates/torch_c/src/dtype.rs` | candle `DType` 래퍼 → `_C` 소유 33 dtype + 별칭 · `abbr` · `_get_all_dtypes` |
-| `crates/torch_c/src/tensor.rs` | dtype 태그 필드, bool 단일 생성자와 불변식 검사, bool `tolist` |
-| `crates/torch_c/src/aten.rs` | `checked_convert`(골든 버그 2 종), bool 팩토리, 태그 기준 dtype 비교 |
-| `crates/torch_c/src/lib.rs` | 부트스트랩 실행, `_tensor_from_flat` 의 bool 거부 |
+| `torchnative/rust/torch_c/src/bootstrap.py` | **신규** — 표면 빌더 (1297 행) |
+| `torchnative/rust/torch_c/src/surface.json` | **신규(생성물)** — `.pyi` 에서 뽑은 이름표 |
+| `torchnative/rust/torch_c/src/info.rs` | **신규** — `finfo` / `iinfo` |
+| `torchnative/rust/torch_c/src/dtype.rs` | candle `DType` 래퍼 → `_C` 소유 33 dtype + 별칭 · `abbr` · `_get_all_dtypes` |
+| `torchnative/rust/torch_c/src/tensor.rs` | dtype 태그 필드, bool 단일 생성자와 불변식 검사, bool `tolist` |
+| `torchnative/rust/torch_c/src/aten.rs` | `checked_convert`(골든 버그 2 종), bool 팩토리, 태그 기준 dtype 비교 |
+| `torchnative/rust/torch_c/src/lib.rs` | 부트스트랩 실행, `_tensor_from_flat` 의 bool 거부 |
 | `tests/test_shim.py` | 13 → 27 개. 승격 메시지 단언을 torch 철자로 |
 | `scripts/vendor/gen_surface.py` | **신규** — `.pyi` + 트리 스캔 → `surface.json` |
 

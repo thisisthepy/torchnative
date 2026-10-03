@@ -440,11 +440,11 @@ Nobody would have found that from the passing runs.
 | 6 | **W10b.** | Not built, and §5 is the argument that this round did not make it necessary. It did make it *reachable*, which is more than `docs/training/BACKWARD5.md` §6 could say |
 | 7 | **That an eager tape and a capture region interact correctly beyond "the region wins".** | `eager_record` returns immediately while a region is open, so ops inside a captured region are absent from the eager graph. Nothing tests what a `.backward()` across that boundary should do, because nothing can call one yet |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs eager_record present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs node_objects present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs eager_free present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs poison_on_write_to_recorded_storage present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs backward_in present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_record present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs node_objects present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs eager_free present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs poison_on_write_to_recorded_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs backward_in present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->

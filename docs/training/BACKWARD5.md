@@ -358,10 +358,10 @@ this round found W10's difficulty is not where it was thought to be: the expensi
 version machinery is structurally unnecessary to a replay tape, and the half that *is* necessary is
 small enough to be worth having on its own.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs is_mutating present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs const_objects present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs keepalive present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tape.rs derivative present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs is_mutating present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs const_objects present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs keepalive present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs derivative present -->
 <!-- The test §5 pinned was **inverted, not deleted**, by docs/training/BACKWARD6.md, exactly as §5 and
      §6 asked. It is now `test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture`
      and asserts the refusal by name; §1.3's defect is fixed. -->

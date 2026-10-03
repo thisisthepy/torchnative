@@ -49,7 +49,7 @@ import sys
 from test_shim import _C  # noqa: F401  (import-time marker, as the siblings do)
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 
 # The same tolerance and the same reasoning as `test_complex.py`: float32 on two

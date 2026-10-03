@@ -634,7 +634,7 @@ unchanged from before it except for `float64`/`mps`, which went from 3 to 0 —
 **a capability was removed, on purpose**, because those three were `construct`,
 `clone` and `index0` on a tensor nothing could compute with.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs metal_dtype_gate present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs mps_probe present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_mps_backend present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs metal_dtype_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs metal_dtype_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs mps_probe present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_mps_backend present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs metal_dtype_gate present -->

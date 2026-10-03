@@ -7,13 +7,13 @@ While they are conceptually similar, they return different shapes:
 - `nonzero.default` returns a single 2-D tensor of shape `(z, ndim)`.
 - For a 0-D input tensor (e.g. `torch.tensor(5)`), `nonzero.default` returns a 2-D tensor of shape `(1, 0)` (if non-zero) or `(0, 0)` (if zero). `where.default` returns a tuple of one 1-D tensor of size `[1]` (if non-zero) or `[0]`.
 
-Because of these shape differences and the 0-D corner cases, `nonzero.default` cannot be trivially implemented as a spelling over `where.default`. A separate kernel is needed to emit the `(z, ndim)` flat tensor efficiently. We implemented `nonzero_default` in `crates/torch_c/src/aten.rs` and bound it to `aten.nonzero.default`.
+Because of these shape differences and the 0-D corner cases, `nonzero.default` cannot be trivially implemented as a spelling over `where.default`. A separate kernel is needed to emit the `(z, ndim)` flat tensor efficiently. We implemented `nonzero_default` in `torchnative/rust/torch_c/src/aten.rs` and bound it to `aten.nonzero.default`.
 
-We also intercepted `nonzero` in `crates/torch_c/src/bootstrap.py` for both the `torch._C._VariableFunctions` namespace and `TensorBase` to handle the Python-only `as_tuple` argument. If `as_tuple=True`, it dispatches to `aten.where.default`, matching upstream's behavior. If `as_tuple=False`, it dispatches to `aten.nonzero.default`.
+We also intercepted `nonzero` in `torchnative/rust/torch_c/src/bootstrap.py` for both the `torch._C._VariableFunctions` namespace and `TensorBase` to handle the Python-only `as_tuple` argument. If `as_tuple=True`, it dispatches to `aten.where.default`, matching upstream's behavior. If `as_tuple=False`, it dispatches to `aten.nonzero.default`.
 
 ## Capture Refusal
 Both `aten.nonzero.default` and `aten.where.default` produce an output whose shape depends on the tensor values (specifically, the number of non-zero elements). A trace whose node output shape is not a function of its inputs cannot be recorded, because a replay with different inputs might produce a different shape, invalidating the rest of the graph.
-We explicitly added both ops to `DATA_DEPENDENT_SHAPE` in `crates/torch_c/src/capture.rs` so that graph capture refuses them by name rather than recording an operation whose replay would be unsound.
+We explicitly added both ops to `DATA_DEPENDENT_SHAPE` in `torchnative/rust/torch_c/src/capture.rs` so that graph capture refuses them by name rather than recording an operation whose replay would be unsound.
 
 ## Meta Path
 `aten.nonzero.default` and `aten.where.default` bypass standard kernels for meta tensors and are routed to `meta_dispatch`. Upstream raises a `RuntimeError` by default because the shape is data-dependent, unless `torch.fx.experimental._config.meta_nonzero_assume_all_nonzero` is True.

@@ -31,7 +31,7 @@ the rest should be taken:
 ## 1. `var_mean` — a real operator, returning a pair
 
 There was no `aten.var_mean.*` kernel of any kind, and no `var_mean` entry in
-`crates/torch_c/src/overloads.json`, so `torch.var_mean(...)` refused at overload
+`torchnative/rust/torch_c/src/overloads.json`, so `torch.var_mean(...)` refused at overload
 resolution before reaching a dispatcher. `aten.var.*` and `aten.std.*` existed
 and still do.
 
@@ -540,10 +540,10 @@ answer `False` there, so the blanket answer is wrong) but is **not** the cause
 of §4's wall, and landing it on that mistaken ground would have been the
 round's worst move.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs var_mean_reduce present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs var_reduce_values present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs var_mean_correction present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_conv_backend_query present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_mean_reduce present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_reduce_values present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_mean_correction present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_conv_backend_query present -->
 <!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_agrees_with_upstream_element_wise_on_both_halves present -->
 <!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_correction_defaults_to_one_not_zero present -->
 <!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_on_meta_answers_upstreams_shape_dtype_and_stride present -->

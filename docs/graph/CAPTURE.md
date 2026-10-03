@@ -9,7 +9,7 @@
   **무엇이 부족한지 네 가지를 이름으로** 적었습니다.
 - **꺼져 있을 때 얼마인가.** §7. 그리고 그 측정이 오염된 조건에서 났다는 것도 §7 에 있습니다.
 
-구현은 `crates/torch_c/src/capture.rs`, 훅은 `aten.rs` 의 `aten_dispatch` 끝 한 줄,
+구현은 `torchnative/rust/torch_c/src/capture.rs`, 훅은 `aten.rs` 의 `aten_dispatch` 끝 한 줄,
 테스트는 `tests/test_shim.py` 의 capture 절(22 개)과 `capture.rs` 의 단위 테스트 2 개입니다.
 
 ---
@@ -326,7 +326,7 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 | | 무엇을 읽나 |
 |---|---|
 | `tests/run.sh` | 빌드해서 `$TMPDIR` 에 스테이징한 것 |
-| 벤더 트리 도로 테스트 (서브프로세스) | `python/torch/_C.abi3.so` — **`install_shim.sh` 만 갱신한다** |
+| 벤더 트리 도로 테스트 (서브프로세스) | `torchnative/python/torch/_C.abi3.so` — **`install_shim.sh` 만 갱신한다** |
 
 즉 `run.sh` 를 단독으로 돌리면 도로 테스트(capture · checkpoint · device · meta 넷 다)는
 **직전에 설치된 산출물**을 재고, 방금 빌드한 것을 재지 않습니다. `install_shim.sh` 를 먼저
@@ -334,7 +334,7 @@ op 이 `aten.<op>.<overload>` 로 이름 붙는 것이 특히 중요합니다. �
 
 **이 자리에서는 "발견"으로 적혔지만, 검증 하네스 자체의 결함이었습니다.** `run.sh` 를 단독으로
 돌리는 것이 일반적인 사용법인데, 그 경로에서는 도로 테스트 넷이 항상 낡은 산출물을 재고 있었고
-아무것도 그것을 알려주지 않았습니다 — 재현: `crates/torch_c/src/tensor.rs` 의 `gather_strided`
+아무것도 그것을 알려주지 않았습니다 — 재현: `torchnative/rust/torch_c/src/tensor.rs` 의 `gather_strided`
 (`set_` 이 strided 뷰를 읽는 함수, `torch.load` 의 모든 텐서가 지나갑니다) 의 순회 순서를
 뒤집는 탬퍼는 `test_ckpt_*` 넷을 확실히 빨갛게 만들지만(고친 뒤 `install_shim.sh` 로 확인),
 **고치기 전에는 `run.sh` 단독 실행이 113/113 을 그대로 보고했습니다.** `set_` 은 어떤 단독(bare
@@ -436,7 +436,7 @@ mtime 비교였다면 아무 실질적 변경이 없는 재빌드에도 매번 �
 바뀝니다), 호출자가 시드를 관리하거나. 어느 쪽도 이 라운드가 택하지 않았고, 성질만 테스트로
 못박아 두었습니다: `test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/capture.rs RANDOM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs RANDOM present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask present -->
 
 ---

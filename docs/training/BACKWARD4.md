@@ -406,11 +406,11 @@ that cannot fail under the conditions you tried it is not yet known to be a chec
 | 4 | **Anything about `torch.autograd.Function`, hooks that fire, `create_graph`, or double backward.** | All four need a graph, which is W8/W9/W10 and is untouched. `register_hook` on a non-leaf refuses by name and that is the whole of the answer |
 | 5 | **That W10 is closer.** | §4.2 declined it explicitly. `docs/training/BACKWARD2.md` §8 row 4's uncosted third option is still uncosted |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs mark_from_op present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs any_operand_requires_grad present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs NoGradGuard present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _GradFnNode present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _grad_fn_name present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs mark_from_op present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs any_operand_requires_grad present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs NoGradGuard present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _GradFnNode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _grad_fn_name present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream present -->
 
 ---

@@ -317,4 +317,4 @@ round's own numbers is load-sensitive: agreement against a live upstream and
 <!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_name present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_staged_sweep_shows_this_name_alone_unblocks_nothing present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bkeyset.py test_the_chain_terminates_and_no_fourth_name_appears present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _AUTOGRAD_BACKEND_KEYSET present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _AUTOGRAD_BACKEND_KEYSET present -->

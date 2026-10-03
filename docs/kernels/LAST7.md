@@ -6,7 +6,7 @@
 > across all four required files, `Tensor.unfold` landed (`aten.rs` line 282), and `fastspeech2_conformer`
 > now forwards and only diverges numerically (288/290 agree per AGREE2.md).
 
-Worktree `work/last7` on develop `b33e2ee`. Territory: `crates/torch_c/src/aten.rs`,
+Worktree `work/last7` on develop `b33e2ee`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
 `overloads.json`, `methods.json`, `tests/golden/cases.py`,
 `tests/test_last7.py`, plus the three inversions §7 lists.
 
@@ -34,7 +34,7 @@ anyway**: `docs/bindings/ARGFORM.md` §1 had already measured that `padding=[0, 
 asymmetric padding at all. §4.
 
 <!-- DOCWATCH: op-implemented aten.unfold.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json unfold present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json unfold present -->
 
 ---
 
@@ -106,7 +106,7 @@ one case each so that closing one cannot hide the other — the same register
 `as_strided_cases` uses, and a stronger one than `aten.slice.Tensor` (step > 1)
 and `aten.view.dtype`, which are `expect="diverge"` and lose a write *silently*.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs unfold_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs unfold_default present -->
 <!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
 <!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
 

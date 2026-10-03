@@ -1,7 +1,7 @@
-"""`benches/ab_upstream.py` -- the harness that replaces `/tmp/bench.py`.
+"""`tests/bench/ab_upstream.py` -- the harness that replaces `/tmp/bench.py`.
 
 `docs/perf/PERF.md` was measured by a script outside the repository, so its
-numbers could be read but not re-run. The harness now lives in `benches/`,
+numbers could be read but not re-run. The harness now lives in `tests/bench/`,
 and a harness nobody checks rots the same way the `/tmp` one vanished. What can
 fail here, stated rather than implied:
 
@@ -38,7 +38,7 @@ import tempfile
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-HARNESS = REPO / "benches/ab_upstream.py"
+HARNESS = REPO / "tests/bench/ab_upstream.py"
 
 
 def _load():
@@ -55,7 +55,7 @@ def test_the_harness_is_in_the_repository_and_imports_without_torch():
     mod = _load()
     assert "torch" not in sys.modules or True  # importing the driver must not need torch
     assert hasattr(mod, "suite_ops") and hasattr(mod, "suite_model")
-    assert mod.SHIM_PATH == str(REPO / "python")
+    assert mod.SHIM_PATH == str(REPO / "torchnative" / "python")
 
 
 def test_time_discards_its_warmup_iterations_before_timing():
@@ -73,7 +73,7 @@ def test_every_benched_aten_spelling_is_implemented_by_this_shim():
     # interpreter's `import torch` is *upstream* (only `_C.abi3.so` is staged),
     # so asking it would answer the wrong question and would do so quietly.
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO / "python")
+    env["PYTHONPATH"] = str(REPO / "torchnative" / "python")
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     proc = subprocess.run(
         [sys.executable, "-c", "import json,torch; print(json.dumps(torch._C._aten_implemented()))"],
@@ -126,7 +126,7 @@ def test_the_driver_reports_a_distribution_and_the_load_average():
 
 def test_perf_md_points_at_the_harness_rather_than_tmp():
     perf = (REPO / "docs/perf/PERF.md").read_text()
-    assert "benches/ab_upstream.py" in perf, (
+    assert "tests/bench/ab_upstream.py" in perf, (
         "PERF.md does not name the in-repo harness; its method is unreproducible"
     )
 

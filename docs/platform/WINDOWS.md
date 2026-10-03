@@ -188,7 +188,7 @@ file .../probe.dll
 그다음 진짜 크레이트:
 
 ```sh
-cd /Volumes/macMini/worktrees/bw-desk2/crates/torch_c
+cd /Volumes/macMini/worktrees/bw-desk2/torchnative/rust/torch_c
 export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-pc-windows-msvc/libs
 export PYO3_CROSS_PYTHON_VERSION=3.13
 cargo xwin build --release --target x86_64-pc-windows-msvc

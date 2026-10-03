@@ -1,7 +1,7 @@
 # DEMAND — regenerating the work queue by running real models
 
-Measurement round only. **Nothing in this round changed source** — `crates/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
-`bootstrap.py`, `tests/golden/cases.py`, `python/torch/` (vendored) are all untouched.
+Measurement round only. **Nothing in this round changed source** — `torchnative/rust/torch_c/{aten.rs,tensor.rs,dtype.rs,flash.rs}`,
+`bootstrap.py`, `tests/golden/cases.py`, `torchnative/python/torch/` (vendored) are all untouched.
 `git status --short` in the worktree is empty throughout. Every finding below is a *candidate*
 for the next round, not something applied here.
 
@@ -111,7 +111,7 @@ are vision-transformer/CNN construction-time utilities rather than forward-path 
 - Each side run as its own subprocess (`PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1`
   for the shim; `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL` for upstream) — never both `torch`
   variants in one interpreter.
-- Built via the instructed pipeline: `cargo build --release` in `crates/torch_c` with
+- Built via the instructed pipeline: `cargo build --release` in `torchnative/rust/torch_c` with
   `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep`,
   `TORCH_C_ARTEFACT=.../release/lib_C.dylib` exported before every gate run (docs/verification/GOLDEN.md §6's
   own trap — a build without the matching artefact env var silently measures a stale binary).
@@ -226,7 +226,7 @@ SUMMARY: 4487/4487 table entries matched upstream, 0 failed
 
 All four numbers match the brief's expected baseline (343 ok, DOCWATCH 257/257, 7763/7763
 ops=168) exactly. `git status --short` was empty before, during (checked between models), and
-after this round — nothing in `crates/torch_c/src/`, `bootstrap.py`, `tests/golden/cases.py`, or the
+after this round — nothing in `torchnative/rust/torch_c/src/`, `bootstrap.py`, `tests/golden/cases.py`, or the
 vendored tree moved.
 
 ---
@@ -292,4 +292,4 @@ closed under slicing / `+` / reflected `+` / `*`, `__qualname__` had to be set
 or the class was unpicklable, and `stride()` is a plain tuple upstream and had
 to be left one. `ops covered` is unchanged at 203 — no kernel.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_autograd_shape present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_autograd_shape present -->

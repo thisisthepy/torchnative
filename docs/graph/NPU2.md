@@ -42,13 +42,13 @@ The sentence the gate now prints for the silent case names the refusal:
 which is the distinction §11.3 restored, doing its job.
 
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_device.py verify_on_device present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_device.py run_on_device present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_device.py devices present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_device.py build_runner present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_device.py DEVICE_DIR present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_runner.c ANeuralNetworksCompilation_createForDevices present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/nnapi_runner.c ANeuralNetworksModel_getSupportedOperationsForDevices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py verify_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py run_on_device present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py devices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py build_runner present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_device.py DEVICE_DIR present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_runner.c ANeuralNetworksCompilation_createForDevices present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/nnapi_runner.c ANeuralNetworksModel_getSupportedOperationsForDevices present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_the_coreml_models_docs_npu_executed_ran_on_the_cpu present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_a_graph_executes_on_the_neural_engine_and_agrees_with_replay present -->
@@ -57,22 +57,22 @@ which is the distinction §11.3 restored, doing its job.
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_a_driver_that_does_not_claim_the_operations_refuses_by_name present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_executing_on_a_device_widened_nothing present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_the_device_module_refuses_to_guess_which_emulator_to_use present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py plan_lowering present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py compute_plan present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _CoreMLLinear present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _compile_model present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/device/_module_to.py _lower_for_coreml present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _CoreMLLinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py _lower_for_coreml present -->
 <!-- DOCWATCH: symbol-in-file tests/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
 <!-- DOCWATCH: symbol-in-file tests/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _CoreMLConv2d present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _eligible_conv2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _CoreMLConv2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _eligible_conv2d present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py test_conv2d_lowers_to_coreml_instead_of_being_left_on_the_cpu present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _say_unknown present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _say_unknown present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
 <!-- DOCWATCH: symbol-in-file tests/test_emptyplan.py test_a_plan_with_no_rows_at_all_warns_that_what_ran_is_unknown present -->
 <!-- DOCWATCH: symbol-in-file tests/test_emptyplan.py test_a_full_offload_is_still_silent present -->
 
@@ -442,7 +442,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-npu2
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd crates/torch_c && cargo build --release && cd -
+cd torchnative/rust/torch_c && cargo build --release && cd -
 bash scripts/vendor/install_shim.sh
 
 # The NNAPI half needs a device with API >= 27. `pmp_api26` cannot run it.
@@ -596,7 +596,7 @@ empty bytes and the dtype test fails with a reshape error, (3) remove the
 
 ## 8. The first real model: bfloat16, and what a decode step actually gets
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _WIDENED_DTYPES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _WIDENED_DTYPES present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_float16_is_in_the_map_too_and_is_not_a_second_refusal present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_the_widening_keeps_bfloat16s_range_which_a_float16_route_would_lose present -->
@@ -607,9 +607,9 @@ empty bytes and the dtype test fails with a reshape error, (3) remove the
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_the_path_a_user_types_survives_its_own_first_forward present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py test_a_second_forward_at_another_shape_also_survives_and_is_not_stale present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bf16ane.py _NAIVE_SCRIPT present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _feed_buffer present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _predict present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _RETAINED_FEEDS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _feed_buffer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _predict present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _RETAINED_FEEDS present -->
 
 §7 landed two leaf types and measured the Neural Engine running them. Every
 module it was measured on was built here, in float32. The obvious next thing
@@ -664,7 +664,7 @@ exact everywhere — same radix, fewer mantissa bits, same exponent width.
 There is a second, non-obvious reason the widening has to happen anyway:
 `torch._C._shim_tensor_bytes` **refuses both half-width floats by name** —
 reaching their bit pattern means naming the `half` crate's types, which
-`crates/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
+`torchnative/rust/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
 which numpy *does* have, cannot cross as its own bytes. Widening first is what
 keeps the byte route, and with it the shutdown segfault §7.3 removed.
 
@@ -1467,8 +1467,8 @@ which is the check that the new rows are graded rather than merely counted.
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py rejected_plans_units_2 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py _REJECTED_UNITS_2 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py compute_plan present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py computes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py computes present -->
 
 | | |
 |---|---|
@@ -1973,9 +1973,9 @@ Two things follow, and they are why the fix does not rest on the rate:
   gate now reports a refusal by name instead of either crashing or claiming
   the CPU ran it.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py ComputePlanRefused present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _REFUSED_PLAN present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/coreml.py _say_refused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py ComputePlanRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _REFUSED_PLAN present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/coreml.py _say_refused present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_the_floor_rejects_a_run_in_which_coreml_answered_for_too_few_graphs present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py test_a_silent_graph_never_excuses_a_neural_engine_verdict_in_another present -->
 <!-- DOCWATCH: symbol-in-file tests/test_npu2.py _ANSWERING_FLOOR present -->

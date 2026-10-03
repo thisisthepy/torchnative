@@ -201,12 +201,12 @@ Same method as ARCH100 §7 / ARCH200 §6 — `arch_sweep.py` needed no changes t
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 cd tests
 
-PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL          $PY arch_sweep.py --out /tmp/upstream.json
 $PY arch_sweep.py --compare /tmp/shim.json /tmp/upstream.json
 
 # to re-check one architecture against the live shim without a full 528-way sweep:
-PYTHONPATH=$REPO/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --one <name>
 ```
 
 This round did not re-run the full upstream sweep — §0 records exactly why the reuse was

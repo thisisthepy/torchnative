@@ -33,7 +33,7 @@ import sys
 
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_REPO_ROOT, "python")
+_VENDOR_DIR = os.path.join(_REPO_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 _NATIVE_FUNCTIONS = os.path.join(
     _VENDOR_DIR, "torchgen", "packaged", "ATen", "native", "native_functions.yaml"

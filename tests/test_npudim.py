@@ -32,7 +32,7 @@ import subprocess
 import sys
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 sys.path.insert(0, _VENDOR_DIR)
 
 _DOC = os.path.join(_ROOT, "docs", "devices", "NPUDIM.md")

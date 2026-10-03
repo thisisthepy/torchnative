@@ -21,7 +21,7 @@ files — lives **inside this repository's root directory.**
 |---|---|
 | Worktrees | `.worktrees/<name>` (git-ignored) |
 | Temporary files | `.scratch/` (git-ignored); delete when done |
-| Benchmarks | `benches/` |
+| Benchmarks | `tests/bench/` |
 | Developer tooling | `scripts/` (CI-only scripts: `.github/scripts/`) |
 
 Before writing a file, check that its absolute path starts with this repository's root. If it does
@@ -34,8 +34,8 @@ Writing to *another* repository is not an exception either. Do it only when told
 ### Do not add top-level folders
 
 **Never add a new directory (or a new file) at the repository root on your own.** The root layout is
-the maintainer's. Work belongs inside an existing directory — Rust crates under `crates/`, the Python
-package under `python/`, the gate and its harnesses under `tests/`, measurements under `benches/`,
+the maintainer's. Work belongs inside an existing directory — the pypackpack package unit `torchnative/`
+(Rust crates under `torchnative/rust/`, the Python package under `torchnative/python/`), the gate and its harnesses under `tests/`, measurements under `tests/bench/`,
 developer scripts under `scripts/`, CI-only scripts under `.github/scripts/`, temporary files under
 the git-ignored `.scratch/`. If you think a new top-level entry is needed, propose it (what, why,
 which alternatives inside existing directories you ruled out) and wait for approval. This mirrors
@@ -45,10 +45,10 @@ The approved root entries:
 
 | Kind | Entries |
 |---|---|
-| Tracked | `Cargo.toml`, `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `crates/`, `python/`, `tests/`, `benches/`, `docs/`, `scripts/`, `vendor/` |
+| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/`, `vendor/` |
 | Git-ignored | `.caches/`, `.scratch/` (torchnative's temporary-file directory, in the role python-multiplatform gives its .tmp directory), `.worktrees/` |
 
-An approved entry need not exist (there is no root `Cargo.toml`; §11 says why). `tests/test_layout.py`
+`tests/test_layout.py`
 runs in the gate and compares `git ls-files`'s top-level names, plus whichever of the git-ignored
 three are present, against this table, so an unapproved entry turns the gate red. Change the table
 and the test's list together, and only with approval.
@@ -192,17 +192,17 @@ imported, the real `from_pretrained` and `generate` run, and only the computatio
 is ours.
 
 ```
-crates/torch_c/        the `torch._C` extension (Rust, pyo3 abi3-py313, candle-core)
+torchnative/rust/torch_c/        the `torch._C` extension (Rust, pyo3 abi3-py313, candle-core)
   src/aten.rs          operator kernels; every op enters through one door, `_aten_dispatch`
   src/bootstrap.py     Python bootstrap baked into the extension with `include_str!`
-crates/vulkan_probe/   standalone Vulkan probe crate
-crates/wasm_probe/     standalone wasm probe crate
-python/torchnative/    the Python package (quant, export, adapt, delta, device, ...)
-python/torch/          upstream's VENDORED tree: generated, git-ignored, never edit it
+torchnative/rust/vulkan_probe/   standalone Vulkan probe crate
+torchnative/rust/wasm_probe/     standalone wasm probe crate
+torchnative/python/torchnative/    the Python package (quant, export, adapt, delta, device, ...)
+torchnative/python/torch/          upstream's VENDORED tree: generated, git-ignored, never edit it
 tests/                 the gate (run.sh) and its suites, test_*.py
 tests/golden/          value-comparison harness against upstream
 tests/docwatch/        the documentation checker (DOCWATCH)
-benches/               measurement harnesses
+tests/bench/               measurement harnesses
 scripts/vendor/        vendor_torch.sh, install_shim.sh, vendor_candle.sh, gen_surface.py, probe.py
 scripts/wheel/         cross builds and wheel verification
 scripts/devices/       on-device harnesses (Android parity, Intel NPU, ...)
@@ -214,13 +214,13 @@ docs/<folder>/         round-by-round records of what was measured (index: docs/
 
 **No root `Cargo.toml` workspace.** The crates stay independent, each with its own `Cargo.lock`,
 `.cargo/config.toml` and `target/`. A workspace would move every member's build output to one root
-`target/` (an unapproved root entry, §2) and break the per-crate `crates/torch_c/target` that
+`target/` (an unapproved root entry, §2) and break the per-crate `torchnative/rust/torch_c/target` that
 `scripts/vendor/install_shim.sh`, `tests/run.sh`, `scripts/wheel/build.py` and the cross builds read;
 it would replace the per-crate lock files with one, so `vulkan_probe` and `wasm_probe` would resolve
 against `torch_c`'s graph; and `[patch.crates-io]` (the `vendor/candle-*` forks) and `[profile.*]` are
 honoured only at a workspace root, so `torch_c`'s patch entries and `vulkan_probe`'s release profile
 would be ignored. Measured on 2026-10-03 with a trial root `[workspace]` and `cargo metadata`:
-`target_directory` moved from `crates/torch_c/target` to `<root>/target`, and cargo warned
+`target_directory` moved from `torchnative/rust/torch_c/target` to `<root>/target`, and cargo warned
 "patch for the non root package will be ignored" and "profiles for the non root package will be
 ignored".
 
@@ -299,7 +299,7 @@ a quotation, count the original.**
 
 Same commit, different `SKIP` counts: 24 in a worktree, 25 in the main checkout. The difference is
 `test_toolguard_wheel_staging`: the main checkout holds a real cross-build artefact under
-`crates/torch_c/target/x86_64-unknown-linux-gnu/release`, so that test correctly declines to
+`torchnative/rust/torch_c/target/x86_64-unknown-linux-gnu/release`, so that test correctly declines to
 overwrite it; a fresh worktree has no such directory, so the test runs.
 
 - When you hand an agent a baseline, say **where** it was measured.
@@ -330,7 +330,7 @@ so it is global, not per-process. Evidence: `docs/graph/NPU2.md` §9.8.
 
 ### 14.1 Build the vendored tree before gating a worktree
 
-A worktree created by `git worktree add` has **no** `python/torch/`. Gated in that
+A worktree created by `git worktree add` has **no** `torchnative/python/torch/`. Gated in that
 state, more than 100 tests fail, all with `torch._C has no _aten_implemented` — **the gate becomes
 meaningless.** On 2026-09-13 two rounds (ANE decode, Vulkan) judged their work on such a tree: one
 reported "0 new failures" while 119 were already failing and burying any new one; the other
@@ -407,7 +407,7 @@ what was already there.
 
 ### 15.2 Generated and shared trees
 
-- **`python/torch/`** is upstream's vendored tree: git-ignored, generated by
+- **`torchnative/python/torch/`** is upstream's vendored tree: git-ignored, generated by
   `scripts/vendor/vendor_torch.sh`, and **silently wiped.** Never edit it by hand. If its `__init__.py` is
   missing, the tree has not been built (§14.1 for the command). One round lost hours to this: with
   the tree empty, every probe silently **imports upstream torch** and reports that "export already
@@ -417,7 +417,7 @@ what was already there.
   assert hasattr(torch._C, "_aten_implemented")   # the shim, not upstream
   ```
 
-- **`crates/torch_c/src/bootstrap.py`** is baked into the extension at build time with
+- **`torchnative/rust/torch_c/src/bootstrap.py`** is baked into the extension at build time with
   `include_str!`. **Edit it without rebuilding and you test the old binary.**
 - **`.caches/spike-venv`** is pinned (`transformers` 5.15.1; do not install `ml_dtypes`). Never
   install into it; read it and run its Python. If you need another package, make a separate venv

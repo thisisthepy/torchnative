@@ -17,7 +17,7 @@ Apple Silicon / darwin 25.5.0). 이 문서는 `docs/numerics/RNG.md` 외의 어�
 않았습니다.
 
 > **Correction (문서 감사, 2026-09):** §5 의 권고가 그대로 채택되어 포팅됐습니다. `git log
-> -S'"aten.uniform_.default"' -- crates/torch_c/src/aten.rs` 가 찾는 `2d3663f` ("Feat: Port
+> -S'"aten.uniform_.default"' -- torchnative/rust/torch_c/src/aten.rs` 가 찾는 `2d3663f` ("Feat: Port
 > torch's CPU generator, and give `_C._dynamo` the two names that do work") 의 커밋 메시지가
 > 이 문서를 그대로 요약합니다 — "candle's CPU backend refuses seeding outright: MT19937 with the
 > pre-decrement that twists before the first draw, uniform_real at 24 and 53 bits, and the
@@ -154,7 +154,7 @@ RNG 커널은 `cpu_serial_kernel` / 뮤텍스 잠금이라 스레드 수와 무�
 ## 2. candle 의 RNG — 실체
 
 소스는 `/Users/ibrew/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/candle-core-0.11.0/`.
-torchnative 의 `crates/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
+torchnative 의 `torchnative/rust/torch_c/Cargo.lock` 이 `rand 0.9.5`, `rand_distr 0.5.1` 을 고정하고 있습니다
 (`Cargo.lock:866-868`, `:895-898`; candle 의 요구는 `Cargo.toml:231-234` 의 `rand 0.9.0` /
 `rand_distr 0.5.1`).
 
@@ -202,11 +202,11 @@ Box–Muller 와 Ziggurat 은 같은 분포를 내지만 **같은 수열을 내�
 샘플링이라 소비 개수조차 데이터 의존적이어서, 설령 두 엔진의 비트 스트림을 같게 맞춘다 해도
 정렬이 어긋납니다.
 
-`crates/torch_c/src/aten.rs:858-868` 의 `randint` 주석은 이 상황을 이미 정직하게 적어 두었습니다 —
+`torchnative/rust/torch_c/src/aten.rs:858-868` 의 `randint` 주석은 이 상황을 이미 정직하게 적어 두었습니다 —
 "The generator is candle's, not torch's, so the *values* will not match a seeded torch run."
 다만 그 주석의 **"torch's Philox stream" 이라는 표현은 CPU 에 대해서는 틀립니다** — Philox 는 CUDA
 생성기(`CUDAGeneratorImpl`)이고 CPU 는 §1.1 의 MT19937 입니다. (이 문서는 그 파일을 고치지 않았습니다.
-다른 작업이 `crates/torch_c/` 를 동시에 쓰고 있으므로 지적만 남깁니다.)
+다른 작업이 `torchnative/rust/torch_c/` 를 동시에 쓰고 있으므로 지적만 남깁니다.)
 
 ---
 
@@ -227,7 +227,7 @@ Box–Muller 와 Ziggurat 은 같은 분포를 내지만 **같은 수열을 내�
 
 **그리고 candle 의 `rand_uniform`/`rand_normal` 은 쓸 수 없습니다** — 시드를 못 받으므로(§2.1)
 우회가 아니라 배제입니다. 대신 값을 **직접 `Vec` 에 채워 `Tensor::from_vec` 으로 만드는** 길이
-있고, `crates/torch_c` 는 이미 그 패턴을 여러 곳에서 씁니다(`src/aten.rs:385, 390, 520, 538, 837`,
+있고, `torchnative/rust/torch_c` 는 이미 그 패턴을 여러 곳에서 씁니다(`src/aten.rs:385, 390, 520, 538, 837`,
 `src/lib.rs:81, 228, 238, 248`). 즉 배선 비용은 새로 드는 것이 아닙니다.
 
 ### 3.2 비용은 작다 — 파이썬으로 먼저 해서 재봤다

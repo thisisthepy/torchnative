@@ -7,8 +7,8 @@ cache-path convention before this round, so whatever was chosen here becomes the
 answer the QNN and CoreML caches inherit.
 
 Evidence: `tests/test_ovcache.py`. Implementation:
-`python/torchnative/_cachedir.py` (the path) and
-`python/torchnative/export/intelnpu.py` (the property).
+`torchnative/python/torchnative/_cachedir.py` (the path) and
+`torchnative/python/torchnative/export/intelnpu.py` (the property).
 
 ## 1. What was wrong
 

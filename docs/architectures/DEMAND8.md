@@ -279,7 +279,7 @@ removed overloads.json's `floor` entry (cp backup), rebuilt, reinstalled:
   FAIL test_demand8_four_names_reach_their_kernels_through_the_vendored_tree:
   AssertionError: floor_fn: expected [1.0, -3.0, -1.0, 3.0], got
   'ERROR:NotImplementedError:... torch.floor(...) -- overload resolution has no table entry
-   for this op (crates/torch_c/src/overloads.json)'
+   for this op (torchnative/rust/torch_c/src/overloads.json)'
   FAIL test_schema_text_survives_the_round_trip_through_the_transcribed_tables: 290
 ```
 
@@ -360,8 +360,8 @@ no table entry), and `_EXPECTED_MUTABLE` gained exactly the two mutating names.
 <!-- DOCWATCH: op-implemented aten.floor_.default -->
 <!-- DOCWATCH: op-implemented aten.index_add_.default -->
 <!-- DOCWATCH: op-implemented aten.upsample_bicubic2d.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json floor present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json index_add_ present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs ndimension present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json floor present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json index_add_ present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs ndimension present -->
 <!-- DOCWATCH: count smoke_ok ge 391 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8681 -->

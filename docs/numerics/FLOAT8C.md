@@ -50,7 +50,7 @@ evidence that the route works was sitting in the harness the whole time.
 
 ### Where the route lives
 
-`crates/torch_c/src/reduced.rs::to_dtype` — the funnel `fast_to` already goes
+`torchnative/rust/torch_c/src/reduced.rs::to_dtype` — the funnel `fast_to` already goes
 through, and therefore the one `aten._to_copy.default` uses. That placement is
 not cosmetic. After routing every `to_dtype(DType::F64)` call site in `aten.rs`
 through a new `widen_f64`, **`x.to(torch.float64)` still hung**, because the
@@ -288,10 +288,10 @@ side changes its mind.
 <!-- DOCWATCH: count golden_cases_total ge 8509 -->
 <!-- DOCWATCH: count golden_ops_covered ge 203 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/reduced.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs widen_f64 present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs float8_pow_refuses present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/reduced.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_pow_refuses present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs F8E4M3 present -->
 <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
 <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _float8_extra present -->
 

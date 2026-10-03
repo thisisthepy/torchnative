@@ -51,10 +51,10 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 <!-- DOCWATCH: symbol-in-file tests/test_export5.py test_preserve_dispatch_key_guard_actually_restores_what_it_saved present -->
 <!-- DOCWATCH: symbol-in-file tests/test_export5.py test_the_census_names_are_present_with_no_monkey_patch_at_all present -->
 <!-- DOCWATCH: symbol-in-file tests/test_export5.py test_functionality_to_backend_keys_matches_upstream_key_for_key present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/storage.rs meta_has_no_bytes present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs pre_dispatch_mode present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/storage.rs meta_has_no_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs pre_dispatch_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _refuse_unrepresentable_memory_format present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_dispatch_key_set present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11405 -->
 
@@ -65,7 +65,7 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/export5`, on develop
 `docs/graph/EXPORT4.md` §1 lost its first hours to a worktree whose vendored tree had
 no `torch/__init__.py`, so every probe silently imported upstream torch 2.13.0
 and reported that export already worked. **The tree was unbuilt again at the
-start of this round** — `python/torch/` held only `nn/` and a
+start of this round** — `torchnative/python/torch/` held only `nn/` and a
 README — so the first action was `scripts/vendor/vendor_torch.sh` and
 `scripts/vendor/install_shim.sh`, and the first assertion after it was:
 
@@ -459,8 +459,8 @@ assertion that only checked "did it export" passed on the graph above.
 ## 7. The hand-off — `docs/graph/EXPORT.md` §8, paid
 
 Thirty-two `torch._C` names moved from
-`python/torchnative/export/upstream.py` into
-`crates/torch_c/src/bootstrap.py`.
+`torchnative/python/torchnative/export/upstream.py` into
+`torchnative/rust/torch_c/src/bootstrap.py`.
 
 **Done as a separate step, after §2–§6 had landed and gated**, so a bisect
 across the two is possible; §12 says which gates covered which.

@@ -27,12 +27,12 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 71 -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs require_exclusive present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs vulkan_storage present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs require_exclusive present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs vulkan_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.mul_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.fill_.Scalar -->

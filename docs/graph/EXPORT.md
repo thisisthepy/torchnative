@@ -85,15 +85,15 @@ replaced by behaviour.**
 
 ## 2. The re-derived census
 
-`python/torchnative/export/upstream.py` implements them. It is a
+`torchnative/python/torchnative/export/upstream.py` implements them. It is a
 **staging area, not the final home** — every function in it belongs in
-`crates/torch_c/src/bootstrap.py` beside `_install_dispatch_keys`, and §8 carries
+`torchnative/rust/torch_c/src/bootstrap.py` beside `_install_dispatch_keys`, and §8 carries
 the hand-off. It monkey-patches at runtime only because it runs after
 `import torch`.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py install present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py installed_names present -->
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py _is_definitely_a_view present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/upstream.py install present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/upstream.py installed_names present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/upstream.py _is_definitely_a_view present -->
 
 ### 2.1 All 18 are real; round 19 was the artefact
 
@@ -211,7 +211,7 @@ contiguously — `x.view(12)`, `x[:]`, `x.reshape(3,4)` on a contiguous `x` — 
 indistinguishable from its base under every signal this shim exposes. Upstream
 answers `True` there because `TensorImpl` carries a base pointer;
 `PyTensorBase` does not. That is one wrong answer, it is in
-`crates/torch_c/src/tensor.rs`, and it is recorded here rather than papered over.
+`torchnative/rust/torch_c/src/tensor.rs`, and it is recorded here rather than papered over.
 
 `_base` **refuses by name** when `_is_view()` said `True`. There is no base
 object to return, and `None` there means "not a view" to the caller —
@@ -252,7 +252,7 @@ Past the 29, in order:
 
 ```
 NotImplementedError: not implemented in torch._C shim: torch.empty_strided(...) --
-overload resolution has no table entry for this op (crates/torch_c/src/overloads.json)
+overload resolution has no table entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 `overloads.json` has `empty` and `empty_like` and no `empty_strided`; `aten.rs`
@@ -448,7 +448,7 @@ being able to produce a plausible-looking wrong answer.
    mode stack *before* `aten_dispatch_inner`, and return the mode's result. This
    is the only item that is a design change rather than a fill, it is the one
    that makes every later item mean something, and until it lands **nothing
-   should make a graph front end reachable**. `crates/torch_c/src/aten.rs`.
+   should make a graph front end reachable**. `torchnative/rust/torch_c/src/aten.rs`.
 2. **`_NodeBase`.** 12 members and 4 methods, plus `_fx_map_arg` /
    `_fx_map_aggregate` / `_NodeIter`. Mechanical, testable in isolation
    (`torch.fx.Graph()` either builds or it does not), and worth having on its own
@@ -473,15 +473,15 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-export
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd crates/torch_c && cargo build --release && cd ../..
+cd torchnative/rust/torch_c && cargo build --release && cd ../..
 bash scripts/vendor/install_shim.sh
 PYTHON=$PY sh tests/run.sh          # 602 ok, DOCWATCH: PASS
 
 # COMPILE.md's census, unmodified
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY tools/spike/export_depth3.py
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY tools/spike/export_depth3.py
 
 # §4.1 in four lines
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
 import torch, torch.fx; torch.fx.Graph()'
 
 # §4.2 side by side -- the same script against the shim and against upstream
@@ -499,7 +499,7 @@ with Log():
     (torch.ones(3) * 2 + 1).relu()
 print("SEEN:", seen)
 PY
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY /tmp/mode_probe.py
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY /tmp/mode_probe.py
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY /tmp/mode_probe.py
 ```
 
@@ -511,7 +511,7 @@ skip as the decompose-road tests, for the same reason.
 
 ## 8. Hand-off: the `bootstrap.py` patch
 
-`python/torchnative/export/upstream.py` is where this work lives
+`torchnative/python/torchnative/export/upstream.py` is where this work lives
 today and it is the wrong place. It monkey-patches `torch._C` after
 `import torch`, which forces a `rebind()` pass over `sys.modules` to re-point
 roughly forty `from torch._C import ...` bindings — including aliases like

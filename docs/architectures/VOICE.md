@@ -379,11 +379,11 @@ task than it was this morning, which is the argument for having landed `cumprod`
 <!-- DOCWATCH: op-implemented aten.stft.center -->
 <!-- DOCWATCH: op-not-implemented aten.polar.default -->
 <!-- DOCWATCH: op-not-implemented aten.view_as_complex.default -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json hann_window present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json sinc present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json clip present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json cumprod present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json cumprod present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs hann_window_default present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs sinc_default present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs cumprod_default present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json hann_window present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json sinc present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json clip present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json cumprod present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json cumprod present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs hann_window_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs sinc_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs cumprod_default present -->

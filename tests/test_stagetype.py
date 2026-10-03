@@ -3,7 +3,7 @@ backward-free build refuses stage 1 **at import time** (INTENT §4).
 
 **What "a backward-free build" means here, because it did not exist before.**
 No `torch._C` built from this crate lacks the tape -- `tape::register` is
-unconditional in `crates/torch_c/src/lib.rs` -- so there is no artefact to probe
+unconditional in `torchnative/rust/torch_c/src/lib.rs` -- so there is no artefact to probe
 for an absent backward, and inventing a build flag to manufacture one would be
 a build system nobody asked for. The smallest honest form is a configuration:
 `TORCHNATIVE_BACKWARD=off` in the environment when `torchnative.adapt` is
@@ -45,7 +45,7 @@ import sys
 os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_VENDOR_DIR = os.path.join(_ROOT, "python")
+_VENDOR_DIR = os.path.join(_ROOT, "torchnative", "python")
 _VENDOR_SHIM = os.path.join(_VENDOR_DIR, "torch", "_C.abi3.so")
 _ENV = "TORCHNATIVE_BACKWARD"
 

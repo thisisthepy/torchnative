@@ -38,7 +38,7 @@ That is the good failure mode, and it is also exactly one arm of work.
 
 ### The change
 
-`crates/torch_c/src/aten.rs`, two lines: `"aten.ge.Tensor"` in the implemented list, and
+`torchnative/rust/torch_c/src/aten.rs`, two lines: `"aten.ge.Tensor"` in the implemented list, and
 
 ```rust
 "aten.ge.Tensor" => compare_tensor(py, args, kwargs, "aten.ge.Tensor", Cmp::Ge),

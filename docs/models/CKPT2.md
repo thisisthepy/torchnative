@@ -383,7 +383,7 @@ WEIGHTS worst difference: 0.0     at None
 > 않음을 알 수 있습니다). `docs/design/DESIGN.md` §11.1 감사(round 1)가 이미 같은 모델로 이것을
 > 확인했었고, 이 문서 자체의 §7.1/§8 이 그 사실을 반영하지 못한 채 남아 있었습니다.
 > <!-- DOCWATCH: op-implemented aten.where.ScalarOther -->
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _sdpa_math present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _sdpa_math present -->
 
 적재가 아니라 **커널** 문제입니다. 두 어텐션 구현이 각각 다른 벽을 냅니다.
 
@@ -483,7 +483,7 @@ export HF_HOME=/Volumes/macMini/caches/hf-home
 # 상류가 진실을 적는다 (벤더 트리를 PYTHONPATH 에 넣지 않는다)
 ATTN=eager $PY /Volumes/macMini/caches/ckpt2-scratch/real_model.py truth
 # shim 이 같은 체크포인트를 읽고 대조한다
-ATTN=eager PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 \
+ATTN=eager PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
     $PY /Volumes/macMini/caches/ckpt2-scratch/real_model.py shim
 ```
 

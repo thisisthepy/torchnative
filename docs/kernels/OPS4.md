@@ -484,10 +484,10 @@ aten.relu.default            15   dtype 8 + max 판별 2 + 모양 4 + bool 거�
   > 있습니다. `docs/models/GPT2.md`/`docs/models/SAMPLING.md`/`docs/devices/DEVICE.md`/`docs/architectures/ARCH.md` 감사(이
   > 라운드)에서 반복해서 발견한 것과 같은 패턴입니다 — 나머지 두 op 이름은 이 문단이 밝히지
   > 않아 확인하지 못했습니다.
-  > <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json where present -->
-  > <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json stack present -->
-  > <!-- DOCWATCH: json-key crates/torch_c/src/overloads.json relu present -->
-  > <!-- DOCWATCH: json-key crates/torch_c/src/methods.json permute present -->
+  > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json where present -->
+  > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json stack present -->
+  > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json relu present -->
+  > <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json permute present -->
 - **`compare.py` 의 `KNOWN_GAP` 세 항목 제거**(§9.1) 와 **`test_shim.py` 의 relu 표본
   교체**(§9.2). 둘 다 파일 범위 밖이고, 둘 다 지금 빨간 상태입니다.
 - **§4·§5 의 판정을 회귀 테스트로 못 박지 못했습니다.** `tests/test_shim.py` 가 범위 밖입니다.
@@ -525,7 +525,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
 sh scripts/vendor/vendor_torch.sh                       # 새 worktree 라면 먼저
-(cd crates/torch_c && cargo build --release)
+(cd torchnative/rust/torch_c && cargo build --release)
 
 $PY tests/golden/compare.py             > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
 $PY tests/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"   # 1 (§9.1)

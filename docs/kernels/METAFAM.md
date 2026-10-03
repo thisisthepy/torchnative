@@ -43,11 +43,11 @@ round's task is that sentence's imperative.
 ### 2.1 Derivation, not the doc
 
 Before writing anything, the current meta-kernel surface was read off `meta_dispatch`'s own
-match arms in `crates/torch_c/src/aten.rs`, not off META.md §7.4's table:
+match arms in `torchnative/rust/torch_c/src/aten.rs`, not off META.md §7.4's table:
 
 ```
 grep -oE '"aten\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+"|"prims\.[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+"' \
-    <(awk '/^fn meta_dispatch/,/^fn meta_result/' crates/torch_c/src/aten.rs) | sort -u
+    <(awk '/^fn meta_dispatch/,/^fn meta_result/' torchnative/rust/torch_c/src/aten.rs) | sort -u
 ```
 
 66 ops, going in. That reconciles exactly with META.md §7.4's own 2026-09 correction note
@@ -130,7 +130,7 @@ per META.md §7.1's rule restated in §0 above. None restate a rule the dense ke
 | `squeeze.default` | remove every size-1 axis | input's own | `squeeze_default`'s own rule |
 | `slice.Tensor` | clamp start/end, step-aware length | input's own | `slice_tensor`'s own clamp arithmetic |
 
-Implementation: `crates/torch_c/src/aten.rs`, in `meta_dispatch`, immediately after the
+Implementation: `torchnative/rust/torch_c/src/aten.rs`, in `meta_dispatch`, immediately after the
 `aten.view.default` arm. A shared helper, `reduce_dims_or_all`, factors the
 `None`/`Some([])` -> "every axis" collapse that `sum`/`mean`/`amax`'s meta arms all need
 (this collapse is a property of what EMPTY means to a given op -- `squeeze.dims` treats it
@@ -345,7 +345,7 @@ budget; flagged here per AGENTS.md §17.5 rather than silently assumed innocent.
 <!-- DOCWATCH: op-implemented aten.squeeze.dim -->
 <!-- DOCWATCH: op-implemented aten.squeeze.default -->
 <!-- DOCWATCH: op-implemented aten.slice.Tensor -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs reduce_dims_or_all present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs reduce_dims_or_all present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metafam.py test_sum_dim_int_list_answers_what_upstream_answers present -->
 <!-- DOCWATCH: symbol-in-file tests/test_metafam.py test_the_new_meta_kernels_are_the_meta_half_of_ops_already_implemented present -->
 <!-- DOCWATCH: count golden_ops_covered ge 302 -->

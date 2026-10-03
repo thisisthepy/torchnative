@@ -40,7 +40,7 @@ aten._softmax.default (f32)  같은 형태
 
 ### 1.2 `tril` 은 CPU 에서 계산되지 않았다
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs tril_triu present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs tril_triu present -->
 <!-- DOCWATCH: op-implemented aten.tril.default -->
 
 `tril_triu` 는 마스크를 호스트에서 만들지만 그 마스크는 **입력과 무관한 상수**이고, 계산은
@@ -115,8 +115,8 @@ mps for this reason; torch._C._shim_mps_host_readback_ops() lists them.
 | 구조적으로 불가능하게 | Vulkan 의 `Repr::Vulkan` 이 그것이고, **여기서는 성립하지 않는다.** mps 텐서는 진짜 candle 텐서라 `tensor()` 가 거절할 근거가 없고, 모든 Metal 텐서를 감싸면 `mps` 가 주는 유일한 이점(커널을 하나도 안 가르쳐도 된다)을 버리게 된다 |
 | **문 앞에서 거절** | 문이 이미 하나다. `aten_dispatch` 의 `check_devices_agree` 가 인자의 장치를 **이미 스캔하고 있고**, meta 와 vulkan 이 이미 그 결과로 갈라진다. mps 는 거기에 팔 하나 |
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs mps_host_readback_gate present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs mps_host_readback_gate present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
 
 `aten.rs` 에 들어간 것은 그 팔 하나(3줄)이고, 나머지는 전부 `device.rs` 에 있습니다.
 

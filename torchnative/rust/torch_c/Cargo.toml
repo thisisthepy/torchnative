@@ -277,7 +277,7 @@ cudarc = { version = "0.19.8", default-features = false, features = [
 # drops `tokenizers` from the graph; that is a separate decision and is not
 # carried here, so the lock matches develop's apart from candle-core's source.
 [patch.crates-io]
-candle-core = { path = "../../vendor/candle-core" }
+candle-core = { path = "../../../vendor/candle-core" }
 
 # The other half of `DType::I8`, and it is a half rather than an extra.
 #
@@ -300,4 +300,4 @@ candle-core = { path = "../../vendor/candle-core" }
 # pulls it in, and that entry is `cfg(target_vendor = "apple")`. A `[patch]`
 # entry for a crate absent from a target's graph costs that target nothing,
 # which is why Android, Linux and wasm builds are unaffected.
-candle-metal-kernels = { path = "../../vendor/candle-metal-kernels" }
+candle-metal-kernels = { path = "../../../vendor/candle-metal-kernels" }

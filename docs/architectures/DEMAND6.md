@@ -23,7 +23,7 @@ not because it fired. `torch` version used: the repo's pinned upstream (`2.13.0`
 second. Nothing was left running; no background probe processes were started, all runs were
 foreground per the instructions.
 
-Build: `cargo build --release` in `crates/torch_c` with `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep2`,
+Build: `cargo build --release` in `torchnative/rust/torch_c` with `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-sweep2`,
 `TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib` exported before `bash scripts/vendor/install_shim.sh`.
 Scratch scripts under `/tmp/sweep2/` (not committed): `check_common.py` (19-target pass/fail sweep,
 shared by both sides via `PYTHONPATH`), `dump_model.py` + `compare_dumps.py` (numeric comparison
@@ -171,5 +171,5 @@ DOCWATCH: PASS -- 323/323
 
 All three ran once, at the end, against the same build used for the model sweep above (no rebuild
 in between). Numbers are unchanged from docs/architectures/DEMAND4.md §4's own gate line, as expected — this
-round changed no source under `crates/torch_c/src/` or elsewhere; only `/tmp/sweep2/*.py` scratch
+round changed no source under `torchnative/rust/torch_c/src/` or elsewhere; only `/tmp/sweep2/*.py` scratch
 scripts and this document were written.

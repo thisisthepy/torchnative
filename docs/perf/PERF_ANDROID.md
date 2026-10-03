@@ -107,7 +107,7 @@ AMX 를 부르는 것**이지, candle 의 커널이 나빴던 것이 아닙니�
 그리고 상류 자신도 f32 GEMM 을 그쪽으로 보내지 않습니다. 벤더 트리에서 KleidiAI 가 걸리는
 자리는 **`aten._dyn_quant_pack_4bit_weight` 하나**입니다:
 
-    python/torch/_meta_registrations.py:4270
+    torchnative/python/torch/_meta_registrations.py:4270
         if torch.backends.kleidiai.is_available() and (...)   # 4-bit 양자화 가중치 패킹
 
 **KleidiAI 는 f32 행렬곱의 답이 아닙니다.** 상류가 그것을 쓰는 곳은 양자화 경로입니다.
@@ -205,7 +205,7 @@ $ llvm-nm -C lib_C.so | grep -i neonfp16
 
 ### 4.3 고른 값과 그 근거
 
-    crates/torch_c/src/lib.rs
+    torchnative/rust/torch_c/src/lib.rs
     const GEMM_THREADING_THRESHOLD: usize = 4_000_000;
 
 - **실기(§4.1)에서 안전합니다.** 손해가 확실한 n=96 을 단일로 되돌리고, 이득이 확실한
@@ -356,11 +356,11 @@ $ADB shell "cd $D && BW_STUB_MULTIPROCESSING=1 TORCH_USE_RTLD_GLOBAL=1 \
 
 ```sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-blas-noaccel
-( cd crates/torch_c && cargo build --release \
+( cd torchnative/rust/torch_c && cargo build --release \
     --config 'target."cfg(target_vendor = \"apple\")".rustflags = ["--cfg", "torch_c_no_accelerate"]' )
 otool -L $CARGO_TARGET_DIR/release/lib_C.dylib | grep -c Accelerate   # 0 이어야 함
-cp $CARGO_TARGET_DIR/release/lib_C.dylib python/torch/_C.abi3.so
-RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python \
+cp $CARGO_TARGET_DIR/release/lib_C.dylib torchnative/python/torch/_C.abi3.so
+RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     /Volumes/macMini/caches/spike-venv/bin/python <bench.py> host-noaccel-t1
 ```
 

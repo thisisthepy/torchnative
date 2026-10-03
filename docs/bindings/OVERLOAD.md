@@ -96,7 +96,7 @@ C_SURFACE 의 13 개 중 **11 개**는 오버로드 *이름*이 트리에 있습
 
 ### 그래서 어떻게 했나 — 옮겨 적고, 검증기를 함께 둔다
 
-`crates/torch_c/src/overloads.json` 에 **실제 aten 스키마 문자열 45 개**를 적었습니다.
+`torchnative/rust/torch_c/src/overloads.json` 에 **실제 aten 스키마 문자열 45 개**를 적었습니다.
 출처는 `str(torch.ops.aten.<op>.<ov>._schema)`, torch 2.13.0.
 
 **IMPORT_TORCH.md §1 이 `surface.json` 에 금지한 것과 다릅니다.** 거기서 금지한 것은
@@ -400,7 +400,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 
 > **Correction (문서 감사, 2026-09):** 3 번은 더 이상 미구현이 아닙니다 — `RUN THE CHECK: 이 절이
 > "여기서 멈췄습니다" 라고 이름 댄 바로 그 심볼이 이제 존재합니다.** `git log -S"set_guard_error_hook"
-> -- crates/torch_c/src/bootstrap.py` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator,
+> -- torchnative/rust/torch_c/src/bootstrap.py` 가 찾는 커밋은 `2d3663f` ("Feat: Port torch's CPU generator,
 > and give _C._dynamo the two names that do work") 이고, 그 커밋 메시지가 이름 댄 "두 개" 중
 > 하나가 정확히 이 심볼입니다(다른 하나는 `set_eval_frame_isolate_recompiles_id`). 실측:
 > `hasattr(torch._C._dynamo.eval_frame, 'set_guard_error_hook')` → `True`; 더 결정적으로,
@@ -408,7 +408,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 > `AutoModelForCausalLM.from_config(LlamaConfig(...))` 를 이 문서가 쓴 것과 같은 작은 설정으로
 > 직접 호출해 `LlamaForCausalLM` 인스턴스를 얻었습니다(2026-09, 이 셰임에서). §0 표의
 > "`from_config` 는 여전히 실패합니다" 도 같은 이유로 낡았습니다.
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py set_guard_error_hook present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py set_guard_error_hook present -->
 
 ---
 
@@ -449,7 +449,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &["aten.randint.default"];
 | `aarch64-apple-ios` | `cargo build --target aarch64-apple-ios` | **0** |
 
 **`tests/golden/` 과 `docs/` 의 기존 파일은 한 줄도 고치지 않았습니다.** `git status --short` 로
-확인한 변경 범위는 `crates/torch_c/` 아래 6 개 파일과 이 문서뿐입니다.
+확인한 변경 범위는 `torchnative/rust/torch_c/` 아래 6 개 파일과 이 문서뿐입니다.
 
 ### 크기
 
@@ -514,11 +514,11 @@ TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
 
 | 파일 | 변경 |
 |---|---|
-| `crates/torch_c/src/overloads.json` | **신규** — 스키마 표 45 개 (14 op) |
+| `torchnative/rust/torch_c/src/overloads.json` | **신규** — 스키마 표 45 개 (14 op) |
 | `tests/verify_schemas.py` | **신규** — 표를 상류와 대조하는 검증기 |
-| `crates/torch_c/src/bootstrap.py` | 오버로드 해석기(`_TypeChecker` · `_Overloads`), `torch.tensor` 팩토리, `_shim_overloads`, `_DISCOVERED_RETURNS` 2 항목 |
-| `crates/torch_c/src/aten.rs` | aten op 17 개 추가(3 → 20), `Scalar` 인자 처리, `scalar_type_name` · `arange_has_cpu_kernel` |
-| `crates/torch_c/src/lib.rs` | `overloads.json` 을 `include_str!` 로 삽입, `_tensor_new_from_data` |
+| `torchnative/rust/torch_c/src/bootstrap.py` | 오버로드 해석기(`_TypeChecker` · `_Overloads`), `torch.tensor` 팩토리, `_shim_overloads`, `_DISCOVERED_RETURNS` 2 항목 |
+| `torchnative/rust/torch_c/src/aten.rs` | aten op 17 개 추가(3 → 20), `Scalar` 인자 처리, `scalar_type_name` · `arange_has_cpu_kernel` |
+| `torchnative/rust/torch_c/src/lib.rs` | `overloads.json` 을 `include_str!` 로 삽입, `_tensor_new_from_data` |
 | `tests/test_shim.py` | 27 → 34 개. 해석기 · `torch.tensor` · 두 목록의 서로소성 |
 
 벤더링 트리의 파이썬 소스는 한 줄도 고치지 않았습니다. `tests/golden/` 과 `docs/` 의 기존

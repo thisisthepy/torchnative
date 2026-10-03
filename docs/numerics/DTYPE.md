@@ -63,7 +63,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, half 2.7.1, rustc 1.98.
 PYTHON=$PY sh tests/run.sh        전 171 통과 -> 후 175 (+4)
 $PY tests/golden/compare.py                      2744/2744, ops=118        (변화 없음)
 $PY tests/verify_schemas.py       3076/3076                 (변화 없음)
-cd crates/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
+cd torchnative/rust/torch_c && cargo test --release          전 2 통과 -> 후 7 (+5)
 ```
 
 > **문서 정정.** `docs/devices/DEVICE_ABS.md` §5.1 은 *"이 크레이트에는 돌릴 수 있는 Rust 단위 테스트가
@@ -176,7 +176,7 @@ NEON into uninit capacity      0.0704 ms         14.90     <- 1.48 배
 
 ## 3. 무엇을 고쳤나 — 그리고 A/B
 
-`crates/torch_c/src/reduced.rs` (신규, 746 줄) 이 두 가지를 합니다.
+`torchnative/rust/torch_c/src/reduced.rs` (신규, 746 줄) 이 두 가지를 합니다.
 
 1. **`{f16,bf16} <-> f32` 변환 4 개**를 candle 대신 직접 합니다. `candle_core::CustomOp1`
    두 개(`Widen`, `Narrow`)로 들어가고, `FastDType::fast_to` 라는 이름의 확장 트레이트로
@@ -478,7 +478,7 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 > 대고 거절한다(`torch.tensor([1,2,3], dtype=torch.int8)` → `NotImplementedError: ... dtype not
 > storable by the candle backend`) — §6.4 항목 2 의 "결함이 아니라 정확한 보고" 라는 판단은
 > 그대로 유효하다. 아래 원문은 권고 시점 그대로 남긴다.
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/tensor.rs Quantized present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs Quantized present -->
 
 **추천: (b) candle `QTensor` 를 `Repr` 의 세 번째 변형으로.** 근거는 셋입니다.
 
@@ -545,7 +545,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # <- 빼먹으�
 PYTHON=$PY sh tests/run.sh        # 175
 $PY tests/golden/compare.py                      # 2744/2744 ops=118
 $PY tests/verify_schemas.py       # 3076/3076
-( cd crates/torch_c && cargo test --release )      # 7
+( cd torchnative/rust/torch_c && cargo test --release )      # 7
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/dtype-scratch/` 에 있습니다:
@@ -572,7 +572,7 @@ $PY tests/verify_schemas.py       # 3076/3076
 
 | 종류 | 무엇 |
 |---|---|
-| **기능 추가** | `crates/torch_c/src/reduced.rs` — 축소 float 변환 4 개와 융합 산술 4 개. `aten.rs` 의 opmath 경로 80 곳이 그것을 탄다 |
+| **기능 추가** | `torchnative/rust/torch_c/src/reduced.rs` — 축소 float 변환 4 개와 융합 산술 4 개. `aten.rs` 의 opmath 경로 80 곳이 그것을 탄다 |
 | **결함 수정** | 없음. **한 비트도 바뀌지 않았습니다** — 골든 2744 개와 스키마 3076 개가 변화 없음 |
 | **테스트 추가** | Rust 5 개(전수 비트 패턴 포함) · `test_shim.py` 4 개 (171 → 175). 전부 허용오차 없음 |
 | **측정** | 층별 분해(§2) · A/B(§3) · f32 대비 위치(§3.2) · candle f16 GEMM 의 누산 dtype(§4.2) · 융합 gemv 프로토타입(§4.3) |

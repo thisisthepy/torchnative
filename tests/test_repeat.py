@@ -108,7 +108,7 @@ def test_tensor_where_is_not_a_methods_json_row_and_the_table_still_has_none():
     assert callable(getattr(_C.TensorBase, "where", None))
 
     path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "crates", "torch_c", "src", "methods.json"
+        os.path.dirname(os.path.abspath(__file__)), "..", "torchnative", "rust", "torch_c", "src", "methods.json"
     )
     if not os.path.exists(path):
         _skip.skip("   (skipped the methods.json half: the tree is not beside this "

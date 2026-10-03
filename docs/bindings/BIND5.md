@@ -2,7 +2,7 @@
 
 Worktree `work/bind5` on develop `b33e2ee`, vendored tree assembled fresh. torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). Territory:
-`crates/torch_c/src/bootstrap.py`, `tests/golden/reach_allow.json`, and a new
+`torchnative/rust/torch_c/src/bootstrap.py`, `tests/golden/reach_allow.json`, and a new
 `tests/test_bind5.py`. `aten.rs`, `tensor.rs`, `dtype.rs`, `device.rs`,
 `capture.rs` and `tape.rs` were not touched; `test_shim.py` was not touched at all. The
 only `reach_allow.json` edit is a **deletion**: `multinomial`'s "unexercised spelling"
@@ -166,8 +166,8 @@ inside `with torch.device("meta")` is the receiver's device on both sides.
 `test_the_wrappers_are_transparent_to_a_device_context` asserts both, in both columns —
 the factory one is the regression check, the method one is the claim.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _coerce_symint_size_tensors present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_tensor_size_list_tensor_forms present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _coerce_symint_size_tensors present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_tensor_size_list_tensor_forms present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_new_zeros_led_and_longformer_spelling_now_computes present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_float_tensor_in_a_size_list_is_refused_as_upstream_refuses_it present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_bool_tensor_is_refused_with_upstreams_own_exception_type present -->
@@ -261,7 +261,7 @@ graph():
     return mul_tensor
 ```
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _install_fx_node_base present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_fx_node_base present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_fx_graph_constructs_and_its_root_node_matches_upstreams present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_sort_key_survives_insertion_in_the_middle present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_node_added_to_a_graph_round_trips_through_every_member present -->
@@ -285,7 +285,7 @@ graph():
     lambda: torch.empty_strided(
   File "torch_c_bootstrap.py", line 4272, in fn
 NotImplementedError: not implemented in torch._C shim: torch.empty_strided(...) --
-overload resolution has no table entry for this op (crates/torch_c/src/overloads.json);
+overload resolution has no table entry for this op (torchnative/rust/torch_c/src/overloads.json);
 call torch.ops.aten.empty_strided.<overload>, which carries the overload and reaches the
 same dispatcher
 ```
@@ -332,7 +332,7 @@ Re-measured on this tree, with the entrance landed:
 **`FakeTensorMode` no longer returns an eager tensor silently — it raises.** The
 condition `docs/bindings/BIND3.md` §7 held the hand-off on is not satisfiable any more, so
 `docs/graph/EXPORT.md` §8's patch is unblocked. It was **not** taken here: it is item 4, it is
-a different file (`python/torchnative/export/upstream.py`) and it changes
+a different file (`torchnative/python/torchnative/export/upstream.py`) and it changes
 three tests in `test_export.py`, none of which is this round's territory. Recorded so the
 round that does it does not have to re-derive the verdict.
 
@@ -495,8 +495,8 @@ which is how this was found rather than remembered.
 
 `arch_sweep.py --one vilt`: **ok**, forward runs on `all_modalities`.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _symint_from_tensor present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _fast_symint_coerce present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _symint_from_tensor present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _fast_symint_coerce present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_multinomial_takes_a_tensor_num_samples_which_is_vilts_wall present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_a_bool_tensor_in_a_scalar_int_position_raises_upstreams_class present -->
 <!-- DOCWATCH: symbol-in-file tests/test_bind5.py test_the_positional_and_keyword_spellings_of_it_agree present -->
@@ -531,19 +531,19 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-bind5
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd crates/torch_c && cargo build --release && cd ../..
+cd torchnative/rust/torch_c && cargo build --release && cd ../..
 bash scripts/vendor/install_shim.sh                       # bootstrap.py is include_str!'d
 PYTHON=$PY sh tests/run.sh         # 895 ok, DOCWATCH: PASS 799/799
 $PY tests/golden/compare.py                       # 11336/11336, ops=299
 
 # §2, in four lines
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
 import torch, torch.fx
 g = torch.fx.Graph(); a = g.placeholder("a")
 g.output(g.call_function(torch.ops.aten.mul.Tensor, (a, 2))); print(g)'
 
 # §3, both columns
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c '
 import torch, torch.nn as nn
 from torchnative.export import upstream; upstream.install()
 class M(nn.Module):
@@ -552,7 +552,7 @@ torch.export.export(M(), (torch.ones(3),))'
 
 # §4, one at a time -- --one takes a single name
 for m in led longformer fastspeech2_conformer sam3_lite_text_text_model vilt; do
-  PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 \
+  PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
     $PY tests/arch_sweep.py --one $m
 done
 ```

@@ -1,7 +1,7 @@
 # Three `_nn` bindings, one `fft_fftn` that is still a kernel, and why zero export names moved
 
 `docs/architectures/VOICE3.md` landed three kernels — `im2col`, `col2im`, `upsample_nearest1d` —
-and could not bind any of them, because `crates/torch_c/src/bootstrap.py` was another
+and could not bind any of them, because `torchnative/rust/torch_c/src/bootstrap.py` was another
 round's file. It recorded the gap in `tests/golden/reach_allow.json` and asserted it
 from both sides in `tests/test_voice3.py`. This round closes it.
 
@@ -36,13 +36,13 @@ Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/bind3`.
 
 ## 1. `torch._C._nn.im2col` — `F.unfold`, `llama4`'s vision tower
 
-**The kernel was really there.** `im2col_default` at `crates/torch_c/src/aten.rs:26469`,
+**The kernel was really there.** `im2col_default` at `torchnative/rust/torch_c/src/aten.rs:26469`,
 listed in `IMPLEMENTED`, with its own dtype check, its own sliding-block refusal, and
 golden cases including a multi-channel input. Checked before a line of the binding was
 written, because `docs/bindings/BINDINGS.md`'s `mish` is what happens when it is not.
 
 <!-- DOCWATCH: op-implemented aten.im2col.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs im2col_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs im2col_default present -->
 
 `torch/nn/functional.py`'s `unfold` ends in a straight forward with no branch:
 
@@ -78,7 +78,7 @@ this side too.
 that is the op: **overlapping windows are summed, not overwritten.**
 
 <!-- DOCWATCH: op-implemented aten.col2im.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs col2im_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs col2im_default present -->
 
 `F.fold` forwards the same way `F.unfold` does, one argument longer. The binding adds
 nothing to the kernel's arithmetic; what it adds is that `F.fold` reaches it.
@@ -97,7 +97,7 @@ fails as a broken control instead of passing vacuously.
 `aten.rs`'s own comment records that it was checked *not* to be an alias of the 2-D op.
 
 <!-- DOCWATCH: op-implemented aten.upsample_nearest1d.default -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs upsample_nearest1d_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs upsample_nearest1d_default present -->
 
 ### 3.1 The discriminator is the third argument's TYPE, not the arity
 
@@ -292,7 +292,7 @@ the lie.
 `docs/graph/EXPORT.md` §6 orders the work: **dispatcher mode entrance first, `_NodeBase`
 second, the three of §3 third, the 29 names last.** The entrance is in `aten.rs`, which
 was not this round's file, so the question put to this round was the narrow one: of the
-29 implementations staged in `python/torchnative/export/upstream.py`, how
+29 implementations staged in `torchnative/python/torchnative/export/upstream.py`, how
 many can move into `bootstrap.py` **without making the empty-graph path reachable**?
 
 **None.** Not because the names are individually dangerous — three of the eight groups
@@ -358,7 +358,7 @@ no matching benefit, and `docs/graph/EXPORT.md` §8 is written as one patch for 
 `upstream.py` is unchanged by this round, `test_export.py` is unchanged, and
 `set_eval_frame`'s refusal was not approached.
 
-<!-- DOCWATCH: symbol-in-file python/torchnative/export/upstream.py install present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/export/upstream.py install present -->
 <!-- DOCWATCH: symbol-in-file tests/test_export.py test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted present -->
 
 ---
@@ -390,7 +390,7 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export TORCH_C_STAGE=/tmp/stage-bind3
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-cd crates/torch_c && cargo build --release && cd ../..     # bootstrap.py is include_str!'d
+cd torchnative/rust/torch_c && cargo build --release && cd ../..     # bootstrap.py is include_str!'d
 bash scripts/vendor/install_shim.sh
 PYTHON=$PY sh tests/run.sh                # 755 ok, DOCWATCH: PASS
 TORCH_C_ARTEFACT=$TORCH_C_STAGE/_C.abi3.so $PY tests/golden/compare.py   # 10691/10691 ops=287

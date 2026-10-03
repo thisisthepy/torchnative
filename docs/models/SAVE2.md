@@ -147,7 +147,7 @@ ops=203).
 ## 4. What this round did NOT touch
 
 No changes to `aten.rs`, `capture.rs`, `tape.rs`, `tests/golden/`,
-`.github/`, or `python/torch/` (the generated tree). No new
+`.github/`, or `torchnative/python/torch/` (the generated tree). No new
 permanent pytest was added for the SmolLM2 round trip: it depends on a
 network-cacheable Hub download and a full 135M-parameter forward pass, which
 does not fit the existing `tests/test_shim.py` fixtures (all synthetic,

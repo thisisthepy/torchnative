@@ -297,4 +297,4 @@ those two apart is the whole job.
 <!-- DOCWATCH: symbol-in-file tests/test_aliasinc.py test_the_enum_divergence_that_bounds_what_agreement_can_mean present -->
 <!-- DOCWATCH: symbol-in-file tests/test_aliasinc.py test_no_resolve_key_result_on_the_whole_aten_surface_still_blames_this_predicate present -->
 <!-- DOCWATCH: symbol-in-file tests/test_aliasinc.py test_closing_the_gap_lets_resolve_key_answer_where_it_used_to_raise present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/bootstrap.py _ALIAS_EXPANSION present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _ALIAS_EXPANSION present -->

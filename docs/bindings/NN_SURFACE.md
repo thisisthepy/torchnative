@@ -104,7 +104,7 @@ dir(_C._nn) = 70,  전부 function,  호출 결과 Counter({'NotImplementedError
 `1 - x` 는 메서드처럼 보이지만, 벤더링된 트리는 이렇게 씁니다.
 
 ```python
-# python/torch/_tensor.py:1108
+# torchnative/python/torch/_tensor.py:1108
 def __rsub__(self, other):
     return _C._VariableFunctions.rsub(self, other)
 ```

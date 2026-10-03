@@ -209,7 +209,7 @@ the biggest number on the page deserves better than being waved at.
 
 ### 3.3 Taken: the two changes
 
-Both are in `crates/torch_c/src/aten.rs`. **`bootstrap.py` is not touched at
+Both are in `torchnative/rust/torch_c/src/aten.rs`. **`bootstrap.py` is not touched at
 all** — the call site turned out not to be where the cost was (§1), so the
 brief's `dispatch(key, **bound)` stays exactly as `972dfe4` left it.
 

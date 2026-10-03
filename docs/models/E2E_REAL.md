@@ -355,7 +355,7 @@ $PY tests/verify_schemas.py   exit 0   270/270 (전 255)
 
 ### 5.2 이 회차에 저지른 사고 하나 — 기록해 둡니다
 
-커널 검증을 되돌리면서 `git checkout -- crates/torch_c/src/aten.rs` 를 썼습니다.
+커널 검증을 되돌리면서 `git checkout -- torchnative/rust/torch_c/src/aten.rs` 를 썼습니다.
 **커밋되지 않은 그 파일의 작업 전체가 사라졌습니다** — CLAUDE.md 가
 "에이전트 작업을 되돌려 볼 때는 stash 를 쓴다" 로 정확히 경고한 그 실수입니다. 대화에 남은
 편집 기록으로 재구성해 복구했고, 이후의 탬퍼 검증은 전부 **직접 되돌리는 국소 편집**으로
@@ -499,9 +499,9 @@ $PY tests/golden/compare.py                        # 2486/2486 ops=116
 $PY tests/verify_schemas.py         # 270/270
 
 # 이 문서의 두 판정
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
   "import torch; print(torch.ops.aten.mm.default(torch.ones(3,4), torch.ones(4,2)))"
-PYTHONPATH=$PWD/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
 "
 import torch
 from transformers import AutoModelForCausalLM

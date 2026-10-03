@@ -44,7 +44,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, Accelerate 켜짐.
 같은 복사를 하는 자리가 하나 더 있고, **그쪽이 실모델이 지나가는 자리**입니다.
 
 ```python
-# crates/torch_c/src/bootstrap.py  linear()
+# torchnative/rust/torch_c/src/bootstrap.py  linear()
 wt = _t(weight)                                   # 전치 "뷰" -- 공짜
 return dispatch("aten.matmul.default", input, wt)
 ```
@@ -139,7 +139,7 @@ match multiply(lhs, rhs) {
 
 ## 3. 무엇을 고쳤는가
 
-`crates/torch_c/src/aten.rs` 한 파일, 115 줄 추가 · 16 줄 삭제.
+`torchnative/rust/torch_c/src/aten.rs` 한 파일, 115 줄 추가 · 16 줄 삭제.
 
 | # | 무엇 | 어디 |
 |---|---|---|
@@ -303,13 +303,13 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 
 > **정정 (문서 감사, 2026-09):** 이 문단은 이 문서 자신을 착지시킨 바로 그 커밋(`2e00ec3`,
 > "Perf: Fold instead of broadcasting, and stop copying the weight every call")과 자기모순이다 —
-> `git show --stat 2e00ec3` 로 확인하면 그 커밋이 `docs/perf/LINEAR.md` 370줄 신설과 `crates/torch_c/
+> `git show --stat 2e00ec3` 로 확인하면 그 커밋이 `docs/perf/LINEAR.md` 370줄 신설과 `torchnative/rust/torch_c/
 > src/aten.rs` 131줄 변경을 **함께** 실었다. 즉 이 문단이 커밋에 들어가는 순간 "커밋하지 않았다"는
 > 이미 틀렸다. 골랐던 것은 **①** — A+B 를 그대로, 옵트인 없이, 기본값으로 착지 — 였다:
 > `gemm_with_layout_fallback`/`batched_matmul` 이 오늘 `aten.rs` 의 기본 경로다(라운드 1
 > `docs/design/DESIGN.md` 감사가 이미 확인). `docs/graph/QUANT2.md` 감사(라운드 2)도 같은 커밋을 독립적으로
 > 확인했다. 아래 표 자체는 그 판단이 내려지기 직전 시점의 정확한 기록이라 그대로 둔다.
-> <!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs batched_matmul present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs batched_matmul present -->
 
 | 선택지 | 무엇 | 대가 |
 |---|---|---|
@@ -373,7 +373,7 @@ PROBE_REPO=$PWD TORCH_C_ARTEFACT=$TORCH_C_ARTEFACT $PY .../bitprobe.py --backend
 PROBE_REPO=$PWD $PY .../bitprobe.py --backend torch up.txt      # 상류. PYTHONPATH 없이
 
 # §5.3 은 벤더링 트리를 통해서만 나옵니다.
-TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/python $PY .../smol_check.py out.json
+TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python $PY .../smol_check.py out.json
 ```
 
 **측정 전에 `uptime` 을 보고 기록하십시오.** 이 문서의 수치는 load 1.4 ~ 2.0 에서 잰 것이고,

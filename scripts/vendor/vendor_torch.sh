@@ -28,7 +28,7 @@
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-dest=${TORCHNATIVE_VENDOR_DIR:-$repo/python}
+dest=${TORCHNATIVE_VENDOR_DIR:-$repo/torchnative/python}
 
 # The spike venv that IMPORT_WALLS 3차/5차 measured against. Override to vendor
 # from a different upstream; the stamp records which one was used.
@@ -76,7 +76,7 @@ rsync -a --delete \
 # The torch *distribution* is three top-level packages, not one --
 # `torch-$version.dist-info/top_level.txt` says `functorch`, `torch`,
 # `torchgen`. Only `torch` used to be copied, and for the PYTHONPATH workflow
-# that was invisible: `$PWD/python` shadows site-packages for
+# that was invisible: `$PWD/torchnative/python` shadows site-packages for
 # `torch`, and `torchgen`/`functorch` then quietly resolved to the *upstream
 # install* underneath. So "import torch completes" was measured with two thirds
 # of the distribution supplied by the reference installation.

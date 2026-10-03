@@ -1,6 +1,6 @@
 # QNNOPS — ground truth for what QNN/Hexagon HTP actually supports, per op
 
-`torchnative.export.qnn_ops` (`python/torchnative/export/qnn_ops.py`).
+`torchnative.export.qnn_ops` (`torchnative/python/torchnative/export/qnn_ops.py`).
 Tests: `tests/test_qnn_ops.py`.
 
 This is **not** the AOT-lowering round. `docs/devices/QNN.md` is that round: it

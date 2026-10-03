@@ -1,6 +1,6 @@
 # Four bindings that were "one binding away" from someone else's file
 
-Four rounds each stopped with a wall inside `crates/torch_c/src/bootstrap.py`,
+Four rounds each stopped with a wall inside `torchnative/rust/torch_c/src/bootstrap.py`,
 which was another agent's file at the time and stayed unowned until this
 round. This is that: three of the four are bindings this round landed there,
 proven against upstream element-wise, in a separate process, through the
@@ -16,7 +16,7 @@ two lines onto nothing, and that is not repeated here.
 ## 1. `torch._C._nn.avg_pool2d` -- `efficientnet`
 
 **Kernel: present.** `aten.avg_pool2d.default` is dispatched in
-`crates/torch_c/src/aten.rs` (`avg_pool2d_default`, confirmed both by grep and
+`torchnative/rust/torch_c/src/aten.rs` (`avg_pool2d_default`, confirmed both by grep and
 by `"aten.avg_pool2d.default" in _C._aten_implemented()` at runtime) and has
 been golden-compared since `sew_d` -- `docs/kernels/TAIL3.md` §7 already established
 this; this round only re-confirmed it before writing the binding.
@@ -144,7 +144,7 @@ torch.std(x, dim=1, unbiased=False)   -> aten.std.correction((4,5), [1], correct
 `torch.std` is **not** a composite over `var` the way `avg_pool1d` is a
 composite over `avg_pool2d` -- it dispatches straight to `aten::std
 .correction`, a leaf. Neither `aten.std.correction` nor `aten.var.correction`
-appears anywhere in `crates/torch_c/src/aten.rs`'s dispatch table (grepped for
+appears anywhere in `torchnative/rust/torch_c/src/aten.rs`'s dispatch table (grepped for
 `"aten.std`, `"aten.var`, `aten::std`, `aten::var` -- zero hits, and zero
 hits for `"std"`/`"var"` as op names in `bootstrap.py` too), and `std` has no
 `overloads.json` row (confirming docs/kernels/TAIL3.md §8's own note). So per this

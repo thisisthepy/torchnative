@@ -292,7 +292,7 @@ Output is `int64`, or `int32` with `out_int32=True`, with `self`'s shape (0-d fo
 overload). `torch.bucketize` exists upstream and `Tensor.bucketize` does **not**
 (`hasattr(torch.Tensor, "bucketize")` is `False` on 2.13.0), so it is `overloads.json`-only.
 
-<!-- DOCWATCH: json-key crates/torch_c/src/overloads.json bucketize present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json bucketize present -->
 
 ---
 
@@ -399,9 +399,9 @@ architectures use the functional form and rebind — and adding it would be one 
 identity and one more `_view_write_cases` entry for a spelling nobody reached. It is a decision,
 recorded here, not an oversight.
 
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json masked_scatter present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json scatter_ present -->
-<!-- DOCWATCH: json-key crates/torch_c/src/methods.json prod present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json masked_scatter present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json scatter_ present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json prod present -->
 
 ---
 
@@ -481,10 +481,10 @@ Three of them are shaped so that they cannot pass against a plausible wrong impl
 * `test_prod_accumulates_step_by_step_in_the_output_dtype` asserts the answer is **not**
   `2.171875`, which is precisely what the obvious f64-accumulator implementation returns.
 
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs scatter_value present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs masked_scatter_default present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs bucketize_position present -->
-<!-- DOCWATCH: symbol-in-file crates/torch_c/src/aten.rs int_narrower present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs scatter_value present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs masked_scatter_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs bucketize_position present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs int_narrower present -->
 
 ---
 
