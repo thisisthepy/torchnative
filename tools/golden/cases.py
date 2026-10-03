@@ -2407,6 +2407,29 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
+    # The Scalar exponent is narrowed to the tensor's dtype first (aten.rs
+    # `side_from_scalar` -> `float_narrower`), so the c10 narrowing witnesses
+    # (issue #28) show through as a different power. Measured upstream:
+    # 3 ** (1+2^-8+2^-22) in bfloat16 is 3.03125 (exponent 1.0078125), where
+    # `half`'s truncating `bf16::from_f64` would make it 3 ** 1.0 = 3.0; and
+    # 3 ** (1+3*2^-8-2^-30) is 3.046875 (exponent 1.015625, two roundings),
+    # where a single rounding gives 3.03125. Bit-exact, since that is the
+    # whole difference. This is the only upstream-asked case that reaches
+    # `float_narrower`'s bfloat16 arm with a witness.
+    for dtype_name in ["bfloat16", "float16"]:
+        base_t, base_c = pair_from_flat(torch_module, c_module, [2.0, 3.0, 0.5], (3,), dtype_name)
+        for exponent in _NARROWING_WITNESSES[:3]:
+            cases.append(
+                Case(
+                    name=f"pow(dtype={dtype_name}, exponent={exponent!r}) [c10 narrowing witness, bit-exact]",
+                    op=op,
+                    run_torch=lambda base_t=base_t, exponent=exponent: torch_call(base_t, exponent),
+                    run_c=lambda base_c=base_c, exponent=exponent: c_module._aten_dispatch(op, base_c, exponent),
+                    note="issue #28: the exponent is narrowed as c10 narrows a double",
+                    value_check=_exact_value_check,
+                )
+            )
+
     for dtype_name in _POW_INT_DTYPES:
         base_t, base_c = pair_from_flat(torch_module, c_module, [0, 1, 2, -2, 4], (5,), dtype_name)
         cases.append(

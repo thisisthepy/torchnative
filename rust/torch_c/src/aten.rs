@@ -33848,10 +33848,6 @@ mod host_const_tests {
         assert_eq!(t.dtype(), DType::F64);
     }
 
-    fn read(t: &candle_core::Tensor) -> f64 {
-        t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
-    }
-
     /// The steps given are the steps applied -- `host_const` inserts no `f32`
     /// of its own -- and the `f64 -> f16` step is c10's, which is
     /// per-architecture (`torch/headeronly/util/Half.h:85-91`, issue #28).
@@ -33863,6 +33859,9 @@ mod host_const_tests {
     /// CI on linux x86_64.
     #[test]
     fn the_narrowing_steps_are_applied_exactly_as_given() {
+        let read = |t: &candle_core::Tensor| {
+            t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
+        };
         const X: f64 = 0.031265258789971995;
         let one = host_const(X, &[DType::F16], &Device::Cpu).unwrap();
         let two = host_const(X, &[DType::F32, DType::F16], &Device::Cpu).unwrap();
@@ -33884,6 +33883,9 @@ mod host_const_tests {
     #[test]
     fn bf16_from_f64_is_two_roundings_everywhere() {
         use super::{float_narrower, TorchDType};
+        let read = |t: &candle_core::Tensor| {
+            t.to_dtype(DType::F64).unwrap().to_scalar::<f64>().unwrap()
+        };
         // [x, c10's answer, what the rejected rule gives]
         let cases: [(f64, f64, &str); 2] = [
             // `half::bf16::from_f64` truncates 2^-22 away and lands on 1.0.
@@ -33896,6 +33898,24 @@ mod host_const_tests {
             assert_eq!(read(&t), want, "host_const({x:e}) as bf16 ({rejected})");
             assert_eq!(float_narrower(TorchDType::BFloat16)(x), want, "float_narrower ({rejected})");
             assert_eq!(candle_core::c10_bf16_from_f64(x).to_f64(), want, "helper ({rejected})");
+            // `WithDType::from_f64` is candle's own door to the same narrowing
+            // (affine, elu, powf, the rng bounds reach it as `T::from_f64`).
+            // Nothing in the Python suites or the golden cases reached it when
+            // this was nullified alone, so it is pinned here directly.
+            assert_eq!(
+                <half::bf16 as candle_core::WithDType>::from_f64(x).to_f64(),
+                want,
+                "WithDType::from_f64 ({rejected})"
+            );
+            let scaled = candle_core::Tensor::new(&[half::bf16::ONE], &Device::Cpu)
+                .unwrap()
+                .affine(x, 0.0)
+                .unwrap();
+            assert_eq!(
+                scaled.to_dtype(DType::F64).unwrap().to_vec1::<f64>().unwrap(),
+                vec![want],
+                "candle affine's T::from_f64(mul) on bf16 ({rejected})"
+            );
             let neg = host_const(-x, &[DType::BF16], &Device::Cpu).unwrap();
             assert_eq!(read(&neg), -want, "sign mirror ({rejected})");
         }
@@ -33961,6 +33981,11 @@ mod host_const_tests {
             let want = oracle(x);
             if got.to_bits() != want.to_bits() {
                 bad.push(format!("{x:e}: got {got} want {want}"));
+            }
+            // candle's `WithDType::from_f64` must be the same function.
+            let via_trait = <f16 as candle_core::WithDType>::from_f64(x);
+            if via_trait.to_bits() != want.to_bits() {
+                bad.push(format!("{x:e}: WithDType::from_f64 gave {via_trait} want {want}"));
             }
         }
         assert!(bad.is_empty(), "{} of {} differ, first: {:?}", bad.len(), values.len(), &bad[..bad.len().min(5)]);
