@@ -1977,14 +1977,20 @@ pub fn eager_reason() -> Option<String> {
 /// was the list of what stood between the two.
 #[pyfunction]
 #[pyo3(name = "_eager_backward")]
-#[pyo3(signature = (output, grad_output = None, wrt = None, retain_graph = false))]
+#[pyo3(signature = (output, grad_output = None, wrt = None, retain_graph = false, create_graph = false))]
 pub fn eager_backward<'py>(
     py: Python<'py>,
     output: &Bound<'py, PyAny>,
     grad_output: Option<&Bound<'py, PyAny>>,
     wrt: Option<&Bound<'py, PyAny>>,
     retain_graph: bool,
+    create_graph: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
+    // `create_graph=True` (issue #10, docs/training/BACKWARD10.md §4) needs the
+    // tape to outlive this backward -- the second backward walks the forward
+    // half as well as the ops this one is about to record -- so it implies
+    // `retain_graph`, which is also upstream's default for it.
+    let retain_graph = retain_graph || create_graph;
     if is_active() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "torch._C eager: cannot differentiate the eager graph while a capture region is \
@@ -2143,7 +2149,22 @@ pub fn eager_backward<'py>(
 
     let seeds = grad_output.filter(|value| !value.is_none());
     let grads = {
-        let _guard = crate::tensor::NoGradGuard::enter();
+        // `create_graph`: the walk runs **on** the tape. With grad mode on,
+        // every op a derivative rule issues goes through the door, is marked,
+        // and is appended to the live eager tape -- whose `known` map still
+        // names the forward's values, because the retained path above
+        // duplicated rather than took it. So a rule that reads a forward
+        // result (`tanh`'s `1 - y*y`) records a node *of* that result, and
+        // the second backward differentiates through it. Without the
+        // duplicate the forward's values would be strangers to the new tape
+        // and read as constants: a second derivative silently missing every
+        // term that goes through them. That is why this is not
+        // `NoGradGuard` simply removed.
+        let _guard = if create_graph {
+            crate::tensor::GradModeGuard::enter(true)
+        } else {
+            crate::tensor::GradModeGuard::enter(false)
+        };
         let indices = PyList::new(py, &selected)?;
         crate::tape::backward_in(py, &trace, &env, seeds, Some(indices.as_any()))?
     };
@@ -2159,6 +2180,46 @@ pub fn eager_backward<'py>(
     out.set_item("wrt", PyList::new(py, &selected)?)?;
     out.set_item("nodes", trace.nodes.len())?;
     Ok(out)
+}
+
+/// Record one `torch.autograd.Function` call on the eager tape (issue #10,
+/// docs/training/BACKWARD10.md §2).
+///
+/// The node's op is `tape::FUNCTION_OP`, its first argument is the `ctx` --
+/// held as a literal, which is how the tape comes to hold a *callback* rather
+/// than an op -- and its second is one entry per forward argument: the tensor,
+/// or `None`. Its outputs are the forward's outputs with `None` in the slots
+/// that are not differentiable, so the record calls them `Slot::Other` and no
+/// gradient is accumulated there.
+///
+/// Called by `_FunctionBase.apply` in `bootstrap.py` only when upstream would
+/// build a node (grad mode on, a tensor argument requiring grad). Returns
+/// whether the tape took it; a capture region refuses rather than records,
+/// because a trace replays through `aten_dispatch` and a callback is not an
+/// op it can replay.
+#[pyfunction]
+#[pyo3(name = "_eager_record_function")]
+pub fn eager_record_function<'py>(
+    py: Python<'py>,
+    ctx: &Bound<'py, PyAny>,
+    inputs: &Bound<'py, PyTuple>,
+    outputs: &Bound<'py, PyTuple>,
+) -> PyResult<bool> {
+    if is_active() {
+        return Err(crate::err::not_implemented(
+            "torch._C eager: an autograd.Function on a gradient path inside a capture \
+             region -- a trace replays aten ops through the door and cannot replay a \
+             Python callback"
+                .to_string(),
+        ));
+    }
+    if !eager_enabled() {
+        return Ok(false);
+    }
+    let args = PyTuple::new(py, [ctx.clone().into_any(), inputs.clone().into_any()])?;
+    let out = outputs.clone().into_any().unbind();
+    eager_record(py, crate::tape::FUNCTION_OP, &args, None, &out);
+    Ok(true)
 }
 
 /// The two ways a tensor can fail to be differentiable here, told apart.
@@ -2214,6 +2275,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(capture_end, m)?)?;
     m.add_function(wrap_pyfunction!(capture_value, m)?)?;
     m.add_function(wrap_pyfunction!(eager_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_record_function, m)?)?;
     m.add_function(wrap_pyfunction!(eager_reset, m)?)?;
     m.add_function(wrap_pyfunction!(eager_tape_size, m)?)?;
     m.add_function(wrap_pyfunction!(eager_reason, m)?)?;

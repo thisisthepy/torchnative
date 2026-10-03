@@ -6662,9 +6662,46 @@ _GRAD_FN_NAMES = {
 
 _GRAD_FN_CLASSES = {}
 
+#: The tape's name for a `torch.autograd.Function` node (issue #10,
+#: docs/training/BACKWARD10.md §2). `tape.rs` matches the same string
+#: (`FUNCTION_OP`); a tensor's `from_op` is this plus `:<Name>Backward`.
+_FUNCTION_OP = "autograd.Function"
+
+#: `id(output) -> (weakref(output), weakref(ctx))` for every differentiable
+#: output of an `autograd.Function`. Both references are weak on purpose. The
+#: ctx is kept alive by the eager tape, which holds it as the node's literal
+#: first argument until `backward()` frees the tape -- the window in which
+#: `grad_fn.register_hook` is called. A strong reference here would be a
+#: global root for the cycle `ctx.to_save -> output -> ctx` that
+#: `save_for_backward(output)` makes, and every such call would leak. After the
+#: tape is freed `grad_fn` falls back to the hollow node, named as upstream's.
+_FUNCTION_NODES = {}
+
+
+def _remember_function_node(tensor, ctx) -> None:
+    import weakref
+
+    key = id(tensor)
+
+    def _gone(ref, key=key):
+        entry = _FUNCTION_NODES.get(key)
+        if entry is not None and entry[0] is ref:
+            del _FUNCTION_NODES[key]
+
+    _FUNCTION_NODES[key] = (weakref.ref(tensor, _gone), weakref.ref(ctx))
+
+
+def _function_node_of(tensor):
+    entry = _FUNCTION_NODES.get(id(tensor))
+    if entry is None or entry[0]() is not tensor:
+        return None
+    return entry[1]()
+
 
 def _grad_fn_name(op: str) -> str:
     """`aten.native_layer_norm.default` -> `NativeLayerNormBackward0`."""
+    if op.startswith(_FUNCTION_OP + ":"):
+        return op.split(":", 1)[1]
     known = _GRAD_FN_NAMES.get(op)
     if known is not None:
         return known
@@ -6701,6 +6738,16 @@ class _GradFnNode:
 
     def __init__(self, op):
         self._shim_op = op
+
+    def _register_hook_dict(self, tensor):
+        """`Tensor.register_hook` on a non-leaf calls this, once, so that
+        upstream's node can find the tensor's hook dict. Here the tape finds it
+        on the tensor itself: `tape.rs`'s `run_tensor_hooks` reads
+        `_backward_hooks` off the very object the op produced, when the walk
+        reaches that object's node. So there is nothing to record, and the
+        absence of a body is the implementation rather than a stub
+        (issue #10, docs/training/BACKWARD10.md §3)."""
+        return None
 
     def __repr__(self):
         return f"<{type(self).__name__} object at {id(self):#x}>"
@@ -6746,6 +6793,11 @@ def _grad_fn(self):
     op = self._shim_from_op
     if op is None:
         return None
+    if op.startswith(_FUNCTION_OP + ":"):
+        # An `autograd.Function` output: upstream's grad_fn *is* the ctx.
+        node = _function_node_of(self)
+        if node is not None:
+            return node
     cls = _GRAD_FN_CLASSES.get(op)
     if cls is None:
         cls = type(_grad_fn_name(op), (_GradFnNode,), {"__slots__": ()})
@@ -7179,12 +7231,14 @@ def _install_engine(module) -> None:
     flags, which is why one function serves both and why `allow_unused` is not
     a separate parameter.
 
-    Three things are refused by name rather than approximated, and each is
+    Two things are refused by name rather than approximated, and each is
     refused because answering would be a *wrong* answer rather than a slow one:
-    `create_graph=True` (the backward runs under `NoGradGuard`, so its own ops
-    are not on the tape and a second backward would silently see nothing),
     more than one root tensor (the eager tape has one output and summing seeds
     across roots is not what upstream does), and `GradientEdge` inputs.
+    `create_graph=True` was the third until issue #10: the backward ran under
+    `NoGradGuard`, so its own ops were not on the tape. It now runs *on* the
+    tape (docs/training/BACKWARD10.md §4), and leaf tensor hooks fire here
+    (§3).
 
     **`.grad` accumulation is the piece with design content**, and
     `_accumulate_into_grad` below is where it is.
@@ -7274,6 +7328,79 @@ def _install_engine(module) -> None:
         else:
             _no_grad_call(lambda: existing.add_(gradient))
 
+    def _run_hooks(hooks, gradient, create_graph):
+        """A tensor's `register_hook` hooks over one gradient, in order.
+
+        Grad mode is the backward's -- on only under `create_graph` -- for
+        Python's flag and the door's alike, and both are put back separately
+        (see `_in_backward_grad_mode` beside `_FunctionBase.apply`).
+        """
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(bool(create_graph))
+        try:
+            for hook in list(hooks.values()):
+                replaced = hook(gradient)
+                if replaced is not None:
+                    gradient = replaced
+            return gradient
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+    def _shim_run_hooks(self, gradient):
+        """Called by `tape.rs`'s `run_tensor_hooks` for a non-leaf whose hook
+        dict is non-empty, with the door flag already the backward's."""
+        hooks = self._backward_hooks
+        if not hooks:
+            return gradient
+        return _run_hooks(hooks, gradient, module._shim_grad_enabled_flag())
+
+    module.TensorBase._shim_run_hooks = _shim_run_hooks
+
+    def _post_accumulate_grad_hooks(self, *_value):
+        # Read and written by `Tensor.register_post_accumulate_grad_hook`
+        # (`torch/_tensor.py:755`). Before issue #10 it was simply absent and
+        # the call died with a bare `AttributeError`. It is refused by name
+        # rather than built because it has nowhere to live: upstream keeps
+        # the dict in a C slot that pickling skips, and the only per-tensor
+        # storage a Python property can reach here is `__dict__`, which
+        # `torch.save` of a hooked `Parameter` would then try to pickle,
+        # hooks and all. A Rust slot beside `backward_hooks` is the way.
+        raise NotImplementedError(
+            "not implemented in torch._C shim: "
+            "Tensor.register_post_accumulate_grad_hook -- this shim has no "
+            "per-tensor slot for the hook dict that pickling skips, as "
+            "upstream's C slot is; register_hook on the leaf runs before "
+            "accumulation and is supported. docs/training/BACKWARD10.md §3"
+        )
+
+    module.TensorBase._post_accumulate_grad_hooks = property(
+        _post_accumulate_grad_hooks, _post_accumulate_grad_hooks
+    )
+
+    def _accumulate_with_graph(leaf, gradient):
+        """`AccumulateGrad` under grad mode, which is what `create_graph=True`
+        means for `.grad`: upstream stores the gradient *with* its graph and
+        adds out of place after (`variable.grad = old + new`), so `.grad` is
+        itself differentiable. An in-place `add_` here would be a write the
+        tape does not record."""
+        was = module.is_grad_enabled()
+        door = module._shim_grad_enabled_flag()
+        module._set_grad_enabled(True)
+        try:
+            existing = leaf.grad
+            # A clone first, for docs/training/BACKWARD9.md §2.1's reason: two
+            # leaves can be handed one gradient object. `contiguous()` after
+            # it for §2.2's: a `sum()` gradient is an expanded view.
+            if existing is None:
+                leaf.grad = gradient.clone().contiguous()
+            else:
+                leaf.grad = existing + gradient
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
     def run_backward(
         self,
         tensors,
@@ -7284,16 +7411,6 @@ def _install_engine(module) -> None:
         allow_unreachable=False,
         accumulate_grad=False,
     ):
-        if create_graph:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: create_graph=True -- the eager "
-                "backward runs under a NoGradGuard, so the ops it performs are not "
-                "themselves recorded and a second backward through them would find "
-                "an empty graph rather than fail. Double backward, "
-                "torch.autograd.grad(..., create_graph=True) and any "
-                "gradient-penalty term need it; first-order training does not. "
-                "docs/training/BACKWARD9.md §6"
-            )
         tensors = tuple(tensors)
         if len(tensors) != 1:
             raise NotImplementedError(
@@ -7317,7 +7434,17 @@ def _install_engine(module) -> None:
         # `_eager_backward`, which *raises* for a tensor no recorded op read --
         # and that is precisely the case `allow_unused=True` exists to answer
         # with `None`. Selecting in Python is what makes both defaults reachable.
-        answer = module._eager_backward(root, seed, None, bool(keep_graph))
+        #
+        # `create_graph=True` (docs/training/BACKWARD10.md §4) is the same call
+        # with the backward run *on* the tape: grad mode on, so every op a rule
+        # issues is recorded against the forward's own values and the
+        # gradients it returns have a `grad_fn`. Upstream defaults
+        # `retain_graph` to `create_graph`, and the tape has to survive for the
+        # second backward to walk the forward half too, so `_eager_backward`
+        # retains whenever it is asked to create a graph.
+        answer = module._eager_backward(
+            root, seed, None, bool(keep_graph), bool(create_graph)
+        )
         leaves = answer["tensors"]
         grads = answer["grads"]
         found = {}
@@ -7325,13 +7452,32 @@ def _install_engine(module) -> None:
             if gradient is not None:
                 found[id(leaf)] = gradient
 
+        def _leaf_gradient(leaf):
+            """The leaf's gradient after its `register_hook` hooks.
+
+            Upstream runs a leaf's tensor hooks on the summed gradient before
+            `AccumulateGrad` stores it, and before `torch.autograd.grad`
+            captures it -- measured on 2.13.0, a `g * 10` hook moves both.
+            Until issue #10 this shim stored `_backward_hooks` and never read
+            it: the hook was silently skipped and `.grad` was the unhooked
+            number. Each hook may return a replacement or `None`, in
+            registration order, as upstream's do.
+            """
+            gradient = found.get(id(leaf))
+            if gradient is None:
+                return None
+            hooks = getattr(leaf, "_backward_hooks", None)
+            if hooks:
+                gradient = _run_hooks(hooks, gradient, create_graph)
+            return gradient
+
         inputs = tuple(inputs or ())
         if accumulate_grad:
             # `Tensor.backward()`. Upstream accumulates into every leaf that
             # requires grad, or into `inputs` alone when it is given.
             targets = inputs if inputs else [t for t in leaves if id(t) in found]
             for leaf in targets:
-                gradient = found.get(id(leaf))
+                gradient = _leaf_gradient(leaf)
                 if gradient is None:
                     if not allow_unreachable:
                         raise RuntimeError(
@@ -7340,14 +7486,17 @@ def _install_engine(module) -> None:
                             "is the desired behavior."
                         )
                     continue
-                _accumulate_into_grad(leaf, gradient)
+                if create_graph:
+                    _accumulate_with_graph(leaf, gradient)
+                else:
+                    _accumulate_into_grad(leaf, gradient)
             return ()
 
         # `torch.autograd.grad()`. Nothing is written to `.grad`; the answer is
         # returned in `inputs` order, and `allow_unreachable` is `allow_unused`.
         out = []
         for leaf in inputs:
-            gradient = found.get(id(leaf))
+            gradient = _leaf_gradient(leaf)
             if gradient is None and not allow_unreachable:
                 raise RuntimeError(
                     "One of the differentiated Tensors appears to not have been "
@@ -12349,14 +12498,31 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # through `_ShimMeta.__getattr__`, so a stub was never going to appear
     # here; it has to be a real entry in the class dict.
     #
-    # **What upstream's version does that this does not, stated rather than
-    # skipped.** `THPFunction_apply` allocates a graph node, records the input
-    # metadata, marks the outputs' `grad_fn`, and handles dirty/
-    # non-differentiable marking. All of that is autograd bookkeeping
-    # (DESIGN.md §3 stage 0: there is none here), and none of it changes the
-    # *value* `forward` returns -- which is the only thing a forward-only shim
-    # can observe. So this runs the user's `forward` with a real ctx and
-    # returns its result.
+    # **What upstream's version does, and what this does now** (issue #10,
+    # docs/training/BACKWARD10.md §2). Until this round this ran the user's
+    # `forward` *with grad mode on* and returned its result, and that was not
+    # the forward-only no-op it looked like: the forward's own aten ops were
+    # recorded on the eager tape, so `loss.backward()` differentiated **the
+    # forward's ops and never called the user's `backward`**. Measured, a
+    # gradient-reversal layer (`forward: x.view_as(x)`, `backward: -g`) gave
+    # `+g` -- the opposite sign -- with no error, and a straight-through
+    # estimator over `round` refused for want of a rule `round` should never
+    # have needed. Neither was the refusal SPEC S6.1 said it was.
+    #
+    # Now it is upstream's `THPFunction_apply`, in the shape the eager tape can
+    # hold:
+    #
+    #   * `forward` runs under no-grad, as upstream's does, so its inner ops
+    #     are not recorded and cannot be differentiated instead of `backward`;
+    #   * the call is recorded as **one** tape node, `autograd.Function`, whose
+    #     first argument is `ctx` as a literal -- the tape holding a callback
+    #     rather than an op, which is what docs/training/BACKWARD9.md §6 said
+    #     this needed. `tape.rs`'s `function_backward` calls back into
+    #     `_FunctionBase._shim_run_backward` below when a gradient reaches it;
+    #   * differentiable outputs get a `grad_fn` that **is** `ctx`, as
+    #     upstream's do, so `grad_fn.name()`, `register_hook` and
+    #     `register_prehook` work -- which is all `nn.Module`'s full backward
+    #     hooks need (`torch/utils/hooks.py:BackwardHook`).
     #
     # Both of upstream's two `forward` shapes are honoured, because a model may
     # use either and picking one would silently mis-call the other:
@@ -12368,31 +12534,29 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # read out of `sys.modules` at call time rather than reimplemented -- same
     # late-binding shape as `_set_generator_metaclass` above, and for the same
     # reason: the predicate belongs to the tree and would drift if copied.
-    def _function_base_apply(cls, *args, **kwargs):
-        backward_cls = getattr(cls, "_backward_cls", None)
-        if backward_cls is None:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: _FunctionBase.apply on a "
-                f"class with no _backward_cls ({cls!r}) -- upstream's version "
-                "allocates a graph node, and this shim only reproduces the "
-                "forward call that autograd.Function's metaclass sets up"
-            )
-        ctx = backward_cls()
-        # Upstream fills this from the inputs' `requires_grad`. Nothing here
-        # requires grad -- `requires_grad=True` is refused at construction --
-        # so it is all-False, and it is provided rather than left missing
-        # because a `forward` is allowed to read it.
-        #
-        # It goes into a private slot and not onto `ctx` directly: upstream's
-        # `needs_input_grad` is a **read-only getset** on the C node
-        # (`type(torch._C._FunctionBase.needs_input_grad)` is
-        # `getset_descriptor`), and the shim's placeholder surface reproduces
-        # that shape as a `property` -- so a plain assignment raises
-        # "property ... has no setter". The property installed below reads this
-        # slot, which keeps the attribute read-only from the model's side, as
-        # upstream's is.
-        ctx._shim_needs_input_grad = tuple(False for _ in args)
+    import collections
 
+    tensor_type = module.TensorBase
+
+    def _in_backward_grad_mode(fn, *args):
+        """Run `fn` with Python's grad mode set to the door's, and put both back.
+
+        Inside the tape's backward the door flag is the backward's grad mode
+        (`NoGradGuard`, or on under `create_graph=True`) while Python's still
+        reads the caller's. Restoring has to write the two separately:
+        `_set_grad_enabled(was)` alone would also set the door to the caller's
+        mode and switch recording back on for the rest of the walk.
+        """
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(door)
+        try:
+            return fn(*args)
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+    def _run_forward(cls, ctx, args, kwargs):
         fn_module = sys.modules.get("torch.autograd.function")
         setup_context = getattr(cls, "setup_context", None)
         separate = (
@@ -12403,14 +12567,124 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         )
         if separate:
             output = cls.forward(*args, **kwargs)
-            # Upstream calls this so the ctx a later backward would read is
-            # populated. There is no backward here, but the user's
-            # `setup_context` may also be where `mark_dirty`/`mark_
-            # non_differentiable` are called, and skipping it would make this
-            # shim run a *different* forward from upstream's.
+            # Upstream calls this so the ctx a later backward reads is
+            # populated, and `setup_context` may also be where
+            # `mark_dirty`/`mark_non_differentiable` are called.
             cls.setup_context(ctx, args, output)
             return output
         return cls.forward(ctx, *args, **kwargs)
+
+    def _floating(value):
+        return bool(value.is_floating_point() or value.is_complex())
+
+    def _function_base_apply(cls, *args, **kwargs):
+        backward_cls = getattr(cls, "_backward_cls", None)
+        if backward_cls is None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: _FunctionBase.apply on a "
+                f"class with no _backward_cls ({cls!r}) -- upstream's version "
+                "allocates a graph node, and this shim only reproduces the "
+                "forward call that autograd.Function's metaclass sets up"
+            )
+        ctx = backward_cls()
+        # Upstream's `needs_input_grad`: one flag per argument, `True` where
+        # the argument is a tensor that requires grad, and all-`False` when no
+        # node is built (grad mode off, or nothing requires grad).
+        #
+        # It goes into a private slot and not onto `ctx` directly: upstream's
+        # `needs_input_grad` is a **read-only getset** on the C node
+        # (`type(torch._C._FunctionBase.needs_input_grad)` is
+        # `getset_descriptor`), and the shim's placeholder surface reproduces
+        # that shape as a `property` -- so a plain assignment raises
+        # "property ... has no setter". The property installed below reads this
+        # slot, which keeps the attribute read-only from the model's side, as
+        # upstream's is.
+        flags = tuple(
+            isinstance(a, tensor_type) and bool(a.requires_grad) for a in args
+        )
+        differentiable = bool(module.is_grad_enabled()) and any(flags)
+        ctx._shim_needs_input_grad = flags if differentiable else tuple(False for _ in args)
+
+        if not differentiable:
+            # No node: upstream runs `forward` and returns its result. It runs
+            # it under no-grad as well, which only matters when something
+            # requires grad -- and then this branch is not taken.
+            return _run_forward(cls, ctx, args, kwargs)
+
+        if module._capture_active():
+            raise NotImplementedError(
+                "not implemented in torch._C shim: autograd.Function "
+                f"{cls.__name__} on a gradient path inside a capture region -- "
+                "its node is a Python callback, and a capture trace replays aten "
+                "ops through the door; it has no way to replay a callback. "
+                "docs/training/BACKWARD10.md §2"
+            )
+
+        door = module._shim_grad_enabled_flag()
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(False)
+        try:
+            output = _run_forward(cls, ctx, args, kwargs)
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+        if getattr(ctx, "dirty_tensors", None):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: ctx.mark_dirty in "
+                f"{cls.__name__}.forward -- an input modified in place has to "
+                "become a non-leaf with this node as its grad_fn, and this shim "
+                "never rewrites the leafness of a tensor that already exists "
+                "(tensor.rs `mark_from_op`, docs/training/BACKWARD4.md §4.2). "
+                "Return a new tensor instead of writing into the input. "
+                "docs/training/BACKWARD10.md §2"
+            )
+
+        is_tuple = isinstance(output, tuple)
+        outputs = list(output) if is_tuple else [output]
+        non_diff = {id(t) for t in (getattr(ctx, "non_differentiable", None) or ())}
+        input_ids = {id(a) for a in args if isinstance(a, tensor_type)}
+        # An input returned as-is becomes a *view* of it, as upstream's does:
+        # it is a new tensor with this node as its grad_fn, and the input keeps
+        # its own. `BackwardHookFunction.forward` is exactly this -- it returns
+        # its arguments -- and it is how every `nn.Module` full backward hook
+        # is installed.
+        module._set_grad_enabled(False)
+        try:
+            for position, value in enumerate(outputs):
+                if isinstance(value, tensor_type) and id(value) in input_ids:
+                    fresh = value.view_as(value)
+                    if id(value) in non_diff:
+                        non_diff.add(id(fresh))
+                    outputs[position] = fresh
+        finally:
+            module._set_grad_enabled(was)
+            module._shim_set_grad_enabled_flag(door)
+
+        differentiable_outputs = [
+            isinstance(v, tensor_type) and id(v) not in non_diff and _floating(v)
+            for v in outputs
+        ]
+        ctx._shim_input_meta = tuple(
+            (tuple(a.shape), a.dtype, a.device) if isinstance(a, tensor_type) else None
+            for a in args
+        )
+        ctx._shim_output_meta = tuple(
+            (tuple(v.shape), v.dtype, v.device) if isinstance(v, tensor_type) else None
+            for v in outputs
+        )
+        if module._eager_enabled():
+            module._eager_record_function(
+                ctx,
+                tuple(a if isinstance(a, tensor_type) else None for a in args),
+                tuple(v if keep else None for v, keep in zip(outputs, differentiable_outputs)),
+            )
+        op = f"{_FUNCTION_OP}:{backward_cls.__name__}"
+        for value, keep in zip(outputs, differentiable_outputs):
+            if keep:
+                value._shim_set_from_op(op)
+                _remember_function_node(value, ctx)
+        return tuple(outputs) if is_tuple else outputs[0]
 
     _function_base_apply.__name__ = "apply"
     _function_base_apply.__qualname__ = "_FunctionBase.apply"
@@ -12419,6 +12693,162 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._FunctionBase.needs_input_grad = property(
         lambda self: getattr(self, "_shim_needs_input_grad", ())
     )
+
+    def _saved_tensors(self):
+        """`ctx.saved_tensors` -- what `save_for_backward` stored.
+
+        `FunctionCtx.save_for_backward` (upstream Python) writes `to_save`;
+        upstream's C getset then hands those back. There is no SavedVariable
+        here and no version check of its own: a write into a saved tensor that
+        the tape also holds poisons the tape by name
+        (`poison_on_write_to_recorded_storage`), and every saved input or
+        output is such a tensor.
+        """
+        saved = getattr(self, "to_save", None)
+        return tuple(saved) if saved is not None else ()
+
+    module._FunctionBase.saved_tensors = property(_saved_tensors)
+
+    def _node_hooks(self, slot):
+        hooks = self.__dict__.get(slot)
+        if hooks is None:
+            hooks = collections.OrderedDict()
+            self.__dict__[slot] = hooks
+        return hooks
+
+    def _register_node_hook(self, fn):
+        """`grad_fn.register_hook(fn)`: `fn(grad_inputs, grad_outputs)` runs
+        after this node's backward and may return replacement `grad_inputs`."""
+        from torch.utils.hooks import RemovableHandle
+
+        hooks = _node_hooks(self, "_shim_post_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = fn
+        return handle
+
+    def _register_node_prehook(self, fn):
+        """`grad_fn.register_prehook(fn)`: `fn(grad_outputs)` runs before this
+        node's backward and may return replacement `grad_outputs`."""
+        from torch.utils.hooks import RemovableHandle
+
+        hooks = _node_hooks(self, "_shim_pre_hooks")
+        handle = RemovableHandle(hooks)
+        hooks[handle.id] = fn
+        return handle
+
+    module._FunctionBase.register_hook = _register_node_hook
+    module._FunctionBase.register_prehook = _register_node_prehook
+    module._FunctionBase.name = lambda self: type(self).__name__
+    # `Tensor.register_hook` on an output of this node calls this. The tape
+    # reads the hooks off the tensor itself (`tape.rs`'s `run_tensor_hooks`),
+    # so there is nothing to copy here -- see `_GradFnNode._register_hook_dict`.
+    module._FunctionBase._register_hook_dict = lambda self, tensor: None
+
+    def _sum_to(grad, shape):
+        lead = grad.dim() - len(shape)
+        if lead > 0:
+            grad = grad.sum(dim=tuple(range(lead)))
+        dims = tuple(
+            i for i, size in enumerate(shape) if size == 1 and grad.shape[i] != 1
+        )
+        if dims:
+            grad = grad.sum(dim=dims, keepdim=True)
+        return grad
+
+    def _expandable(have, want):
+        if len(have) < len(want):
+            return False
+        for h, w in zip(reversed(have), reversed(want)):
+            if h != w and w != 1:
+                return False
+        return True
+
+    def _shim_run_backward(self, grad_outputs, outputs):
+        """The node's backward, called by `tape.rs`'s `function_backward`.
+
+        Upstream's `PyNode::apply` plus `validate_outputs`, in order:
+        materialise absent output gradients as zeros (unless
+        `ctx.set_materialize_grads(False)`), run pre-hooks, call the user's
+        `backward` through `BackwardCFunction.apply` (which is what resolves
+        `vjp` and `boxed_grads_call`), check the count, cast and reduce each
+        gradient to its input's metadata, run post-hooks. Returns one entry per
+        forward argument, `None` for the non-tensor ones.
+
+        Grad mode is set to the door's, which is the backward's: off for a
+        plain `backward()`, on under `create_graph=True`. Python's flag would
+        otherwise still read the caller's, and `once_differentiable` keys on it.
+        """
+        name = type(self).__name__
+        grads = list(grad_outputs)
+        if getattr(self, "materialize_grads", True):
+            for position, gradient in enumerate(grads):
+                meta = self._shim_output_meta[position]
+                if gradient is None and meta is not None:
+                    shape, dtype, device = meta
+                    grads[position] = sys.modules["torch"].zeros(
+                        shape, dtype=dtype, device=device
+                    )
+
+        def call():
+            nonlocal grads
+            for hook in list(self.__dict__.get("_shim_pre_hooks", {}).values()):
+                replaced = hook(tuple(grads))
+                if replaced is not None:
+                    grads = list(replaced)
+            return self.apply(*grads)
+
+        result = _in_backward_grad_mode(call)
+        if not isinstance(result, tuple):
+            result = (result,)
+        metas = self._shim_input_meta
+        expected = len(metas)
+        if len(result) > expected and all(r is None for r in result[expected:]):
+            result = result[:expected]
+        if len(result) != expected:
+            raise RuntimeError(
+                f"function {name} returned an incorrect number of gradients "
+                f"(expected {expected}, got {len(result)})"
+            )
+        result = list(result)
+        tensor_positions = []
+        for position, (gradient, meta) in enumerate(zip(result, metas)):
+            if meta is None:
+                if gradient is not None:
+                    raise RuntimeError(
+                        f"function {name} returned a gradient different than None "
+                        f"at position {position + 1}, but the corresponding forward "
+                        "input was not a Variable"
+                    )
+                continue
+            tensor_positions.append(position)
+            if gradient is None:
+                continue
+            shape, dtype, _device = meta
+            have = tuple(gradient.shape)
+            if have != shape:
+                if not _expandable(have, shape):
+                    raise RuntimeError(
+                        f"Function {name} returned an invalid gradient at index "
+                        f"{position} - got {list(have)} but expected shape "
+                        f"compatible with {list(shape)}"
+                    )
+                gradient = _in_backward_grad_mode(_sum_to, gradient, shape)
+            if gradient.dtype != dtype:
+                gradient = _in_backward_grad_mode(gradient.to, dtype)
+            result[position] = gradient
+
+        post = list(self.__dict__.get("_shim_post_hooks", {}).values())
+        if post:
+            grad_inputs = tuple(result[p] for p in tensor_positions)
+            for hook in post:
+                replaced = _in_backward_grad_mode(hook, grad_inputs, tuple(grads))
+                if replaced is not None:
+                    grad_inputs = tuple(replaced)
+            for p, gradient in zip(tensor_positions, grad_inputs):
+                result[p] = gradient
+        return result
+
+    module._FunctionBase._shim_run_backward = _shim_run_backward
 
     def _multiprocessing_init():
         """VENDOR.md wall 17 -- C writing into a *Python* package's namespace.

@@ -242,6 +242,12 @@ Each of these raises where a caller meets it. None degrades quietly.
 | **`retain_grad` on non-leaves** | `retains_grad` reports `True` and `.grad` stays `None`. The engine accumulates onto the tape's *constants*, and a non-leaf is a node result. The tape holds the value; nothing surfaces it | Small: `backward_in` already computes it. It needs a way to name the node from Python, which is the `GradientEdge` problem again |
 | **`nn.MSELoss` and anything through `torch.broadcast_tensors`** | No overload-table entry. Not an engine gap; named here because §1's criterion is spelled out because of it | An `overloads.json` entry, owned elsewhere |
 
+**Re-measured by `docs/training/BACKWARD10.md` (issue #10).** Rows 1, 4 and 5 of this table are no longer
+refusals: `create_graph=True`, `torch.autograd.Function` and hooks agree with upstream on training loops. Two
+of them had also never been refusals in the sense written here -- a custom `Function`'s `backward` was never
+called (the tape differentiated its forward's ops instead) and a leaf `register_hook` was stored and never
+fired -- both silently. The row descriptions above are left as they were measured.
+
 ## 7. The forward did not move
 
 This round edits `record_into`'s caller and adds a parameter to `eager_backward`, so the measurement
@@ -341,7 +347,7 @@ TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib $PY tools/golden/compare.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_run_backward_accumulates_rather_than_assigning_on_the_second_backward present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_retain_graph_differentiates_the_same_forward_twice present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstreams present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_create_graph_and_several_roots_by_name present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_refuses_several_roots_by_name_and_records_create_graph present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
 <!-- DOCWATCH: count smoke_ok ge 463 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8921 -->

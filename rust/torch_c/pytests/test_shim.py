@@ -23247,40 +23247,47 @@ def test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstre
     assert [float(v) for v in got[0].flatten()] == [3.0]
 
 
-def test_the_engine_refuses_create_graph_and_several_roots_by_name():
-    """docs/training/BACKWARD9.md §6. What is *not* built, refused where a caller meets it.
+def test_the_engine_refuses_several_roots_by_name_and_records_create_graph():
+    """docs/training/BACKWARD9.md §6, inverted for its first half by issue #10
+    (docs/training/BACKWARD10.md §4). Not deleted: its old docstring said a
+    `create_graph=True` that quietly behaved like `False` would carry a wrong
+    number to a loss, and that is still the property asserted -- from the other
+    side.
 
-    Both would otherwise be silently wrong rather than slow.
-    `create_graph=True` asks for a backward that is itself differentiable, and
-    the eager backward runs under a `NoGradGuard` -- so its ops are not
-    recorded and a double backward would find an *empty* graph rather than
-    fail. Several roots asks for one traversal seeded from several places,
-    which the eager tape's single output cannot express.
+    `create_graph=True` now runs the backward *on* the tape, so the gradient it
+    returns has a graph: for `x * x` it is `2x`, it requires grad, and a second
+    backward through it gives `2`. A build that ran the backward under
+    `NoGradGuard` and simply stopped refusing would return a constant `2x`
+    here, `requires_grad` false -- the empty-graph failure the refusal existed
+    to prevent.
 
-    Refusing by name is the whole of docs/design/DESIGN.md §6 here: a
-    `create_graph=True` that quietly behaved like `False` is the shape of
-    wrongness a gradient-penalty term would carry all the way to a number.
+    Several roots still refuse: one traversal seeded from several places is
+    not something the eager tape's single output can express.
     """
     _C._eager_reset()
     engine = _C._ImperativeEngine()
-    x = _tape_f64([1.0], [1]).to(_C.float32)
+    x = _tape_f64([3.0], [1]).to(_C.float32)
     x.requires_grad = True
+    square = _C._aten_dispatch("aten.mul.Tensor", x, x)
+    total = _C._aten_dispatch("aten.sum.default", square)
+
+    (grad,) = engine.run_backward((total,), (), False, True, (x,), False, False)
+    assert grad.tolist() == [6.0], grad.tolist()
+    assert grad.requires_grad, "create_graph=True returned a gradient with no graph"
+    assert grad.grad_fn is not None
+    (second,) = engine.run_backward(
+        (_C._aten_dispatch("aten.sum.default", grad),), (), False, False, (x,), False, False)
+    assert second.tolist() == [2.0], second.tolist()
+
+    _C._eager_reset()
     total = _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Scalar", x, 2.0))
-
-    try:
-        engine.run_backward((total,), (), False, True, (), True, True)
-    except NotImplementedError as exc:
-        assert "create_graph=True" in str(exc), str(exc)
-        assert "NoGradGuard" in str(exc), str(exc)
-    else:
-        raise AssertionError("create_graph=True was accepted")
-
     try:
         engine.run_backward((total, total), (), False, False, (), True, True)
     except NotImplementedError as exc:
         assert "2 root tensors" in str(exc), str(exc)
     else:
         raise AssertionError("several roots were accepted")
+    _C._eager_reset()
 
 
 # --- lowering toward a device operator set (docs/graph/DECOMP.md §12) --------------

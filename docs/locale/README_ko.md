@@ -218,7 +218,7 @@ dtype · 양자화 표와 모든 칸의 근거는 [`docs/platform/STATUS.md`](..
 | ✅ 장치 추상화 | `torch.device` 어휘, 장치별 디스패치, 장치마다 `Repr` 팔; `cpu` · `mps` · `vulkan` · `cuda` · `npu` 를 가진 `torchnative.device` |
 | ✅ `torchnative.transformers` | `transformers` 에서 열거한 49 개 `Auto*` 클래스 전부, 진짜 모델을 반환 |
 | 🟡 NPU 백엔드 | Intel NPU 는 OpenVINO 로 배선(실기 실행 없음); Apple ANE 와 Hexagon 은 해석 후 이름으로 거부 |
-| 🟡 Eager 학습 | backward 와 옵티마이저 스텝 일치; double-backward, `autograd.Function`, 훅은 거부 |
+| 🟡 Eager 학습 | backward 와 옵티마이저 스텝 일치; double-backward, `autograd.Function`, 훅도 일치, 남은 것은 이름으로 거부 (`docs/training/BACKWARD10.md`) |
 | 🟡 연합학습 | 다중 프로세스 FedAvg; 보안 집계 · 프라이버시 · 참여자 선택 없음 |
 
 > 이 표는 계획이 아니라 **측정된 것**을 기록합니다. **마지막 재측정 2026-09-07**

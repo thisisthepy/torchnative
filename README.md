@@ -243,7 +243,7 @@ The dtype and quantisation matrices, and the reasoning behind every cell, are in
 | ✅ Device abstraction | `torch.device` vocabulary, per-device dispatch, a `Repr` arm per device; `torchnative.device` with `cpu` · `mps` · `vulkan` · `cuda` · `npu` |
 | ✅ `torchnative.transformers` | all 49 `Auto*` classes, enumerated from `transformers`, returning real models |
 | 🟡 NPU back ends | Intel NPU wired through OpenVINO (no hardware has run it); Apple ANE and Hexagon refuse by name after resolving |
-| 🟡 Eager training | backward and optimizer steps agree; double-backward, `autograd.Function` and hooks refuse |
+| 🟡 Eager training | backward and optimizer steps agree; double-backward, `autograd.Function` and hooks agree too, with named refusals left (`docs/training/BACKWARD10.md`) |
 | 🟡 Federated learning | multi-process FedAvg; no secure aggregation, privacy or participant selection |
 
 > This table records what has been **measured**, not what is planned. **Last re-measured 2026-09-07**

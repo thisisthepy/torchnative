@@ -428,8 +428,15 @@ pub const RULE_OPS: &[&str] = &[
     "aten.where.self",
 ];
 
+/// The tape's name for a `torch.autograd.Function` call (issue #10,
+/// docs/training/BACKWARD10.md §2). Not an aten op and not in `RULE_OPS`: its
+/// derivative is the user's `backward`, reached through `function_backward`,
+/// and `RULE_OPS` is the list of rules that carry a float64 finite-difference
+/// case of their own. `bootstrap.py`'s `_FUNCTION_OP` is the same string.
+pub const FUNCTION_OP: &str = "autograd.Function";
+
 pub fn has_rule(op: &str) -> bool {
-    RULE_OPS.contains(&op)
+    RULE_OPS.contains(&op) || op == FUNCTION_OP
 }
 
 fn no_rule(op: &str) -> PyErr {
@@ -469,6 +476,7 @@ fn derivative<'py>(
     };
 
     match op {
+        FUNCTION_OP => function_backward(py, node, env, gouts, outs),
         // -------------------------------------------------------------- shape
         "aten.t.default" => {
             let ops = bind(py, node, env, &["self"])?;
@@ -1180,6 +1188,23 @@ fn derivative<'py>(
                     "aten.where.ScalarOther",
                     vec![mask, flat_grad, scalar(py, 0.0)?],
                 )?;
+            }
+            // `index_put_` writes into a fresh table, and an in-place write is
+            // never recorded (`mark_from_op`'s last clause). Under
+            // `create_graph=True` that would hand back a weight gradient with
+            // no graph behind it while `flat_grad` has one: a second
+            // derivative through this rule silently zero. Refused by name
+            // instead (issue #10, docs/training/BACKWARD10.md §4).
+            if crate::tensor::grad_enabled_flag()
+                && flat_grad.getattr("requires_grad")?.extract::<bool>()?
+            {
+                return Err(crate::err::not_implemented(
+                    "torch._C tape: create_graph=True through aten.embedding.default -- its \
+                     weight gradient is built by index_put_ into a zero table, an in-place \
+                     write the eager tape does not record, so the gradient would come back \
+                     without the graph a second backward needs"
+                        .to_string(),
+                ));
             }
             let dtype = weight.value.getattr("dtype")?;
             let size = ints(py, &[rows as i64, width as i64])?;
@@ -2528,9 +2553,18 @@ pub(crate) fn backward_in<'py>(
             built
         }
         Some(given) => {
-            let items: Vec<Obj<'py>> = match given.extract::<Vec<Obj<'py>>>() {
-                Ok(list) => list,
-                Err(_) => vec![given.clone()],
+            // A tensor first: a tensor *is* a sequence, and extracting it as
+            // a `Vec` iterated its rows -- so `y.backward(torch.ones_like(y))`
+            // for any non-scalar `y` with more than one row was refused as "1
+            // output and N gradients". Found by the gradient-penalty test
+            // (`grad_outputs=torch.ones_like(d)`, docs/training/BACKWARD10.md §4).
+            let items: Vec<Obj<'py>> = if given.cast::<PyTensorBase>().is_ok() {
+                vec![given.clone()]
+            } else {
+                match given.extract::<Vec<Obj<'py>>>() {
+                    Ok(list) => list,
+                    Err(_) => vec![given.clone()],
+                }
             };
             if items.len() != trace.outputs.len() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2584,6 +2618,20 @@ pub(crate) fn backward_in<'py>(
             .map(|slots| slots.iter().map(|s| s.bind(py).clone()).collect())
             .unwrap_or_default();
 
+        // Tensor hooks on a non-leaf (issue #10, docs/training/BACKWARD10.md
+        // §3). Every consumer of this node's results has a higher index and
+        // has already been walked, so each gradient here is the *total* one --
+        // which is what upstream hands a tensor hook, once. The hooks are read
+        // off the very object the op produced; a replayed `CaptureTrace` env
+        // holds fresh objects with none, and pays one attribute read.
+        for (slot, gout) in gouts.iter_mut().enumerate() {
+            let (Some(gradient), Some(holder)) = (gout.as_ref(), outs.get(slot)) else {
+                continue;
+            };
+            let hooked = run_tensor_hooks(py, holder, gradient.clone())?;
+            *gout = Some(hooked);
+        }
+
         let (operands, contributions) = derivative(py, node, env, &gouts, &outs)?;
         for (operand, contribution) in operands.iter().zip(contributions.into_iter()) {
             let (Some(operand), Some(contribution)) = (operand, contribution) else {
@@ -2617,6 +2665,84 @@ pub(crate) fn backward_in<'py>(
     out.set_item("inputs", PyList::new(py, input_grads)?)?;
     out.set_item("constants", PyList::new(py, const_grads)?)?;
     Ok(out)
+}
+
+/// A non-leaf's `register_hook` hooks over its total gradient.
+///
+/// The common case -- no hooks -- is one attribute read and a falsy test; only
+/// a tensor with a non-empty dict crosses into `TensorBase._shim_run_hooks`
+/// (`bootstrap.py`), which runs them in order under the backward's grad mode.
+fn run_tensor_hooks<'py>(py: Python<'py>, holder: &Obj<'py>, gradient: Obj<'py>) -> PyResult<Obj<'py>> {
+    if holder.is_none() || holder.cast::<PyTensorBase>().is_err() {
+        return Ok(gradient);
+    }
+    let hooks = holder.getattr("_backward_hooks")?;
+    if hooks.is_none() || !hooks.is_truthy()? {
+        return Ok(gradient);
+    }
+    let _ = py;
+    holder.call_method1("_shim_run_hooks", (gradient,))
+}
+
+/// The derivative of an `autograd.Function` node: the user's `backward`.
+///
+/// Everything with semantics -- zero-materialisation, pre- and post-hooks,
+/// the gradient count, dtype and shape validation -- is upstream Python
+/// behaviour and lives in `_FunctionBase._shim_run_backward` in
+/// `bootstrap.py`. What is here is the part only the tape can do: bind the
+/// recorded tensor arguments to their `Ref`s, so that the gradients the
+/// callback returns accumulate where the forward read them from.
+fn function_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+    outs: &[Obj<'py>],
+) -> PyResult<Rule<'py>> {
+    let malformed = || {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "torch._C tape: an autograd.Function node was recorded without its ctx and \
+             argument tuple",
+        )
+    };
+    let ctx = match node.args.first() {
+        Some(Arg::Literal(object)) => object.bind(py).clone(),
+        _ => return Err(malformed()),
+    };
+    let items = match node.args.get(1) {
+        Some(Arg::Tuple(items)) | Some(Arg::List(items)) => items,
+        _ => return Err(malformed()),
+    };
+    let mut operands: Vec<Option<Operand<'py>>> = Vec::with_capacity(items.len());
+    for item in items {
+        operands.push(match item {
+            Arg::Value(reference) => {
+                Some(Operand { target: Some(*reference), value: env.get(py, *reference)? })
+            }
+            _ => None,
+        });
+    }
+    let none = || py.None().into_bound(py);
+    let grad_outputs = PyTuple::new(
+        py,
+        gouts.iter().map(|g| g.clone().unwrap_or_else(none)),
+    )?;
+    let outputs = PyTuple::new(py, outs.iter().cloned())?;
+    let answer = ctx.call_method1("_shim_run_backward", (grad_outputs, outputs))?;
+    let answer: Vec<Obj<'py>> = answer.extract()?;
+    if answer.len() != operands.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C tape: autograd.Function backward answered {} gradients for {} \
+             recorded arguments",
+            answer.len(),
+            operands.len()
+        )));
+    }
+    let contributions = answer
+        .into_iter()
+        .map(|g| if g.is_none() { None } else { Some(g) })
+        .collect();
+    Ok((operands, contributions))
 }
 
 fn accumulate<'py>(

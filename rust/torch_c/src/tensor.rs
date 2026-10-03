@@ -4123,6 +4123,26 @@ pub fn set_grad_enabled_flag(value: bool) {
 /// upstream's `GradMode` python flag.
 pub struct NoGradGuard(bool);
 
+/// The door's grad mode set to `value` for a scope, restored on drop.
+///
+/// `NoGradGuard` is this with `false`. The other half exists for
+/// `create_graph=True` (issue #10), whose backward has to *record* -- so the
+/// door must mark what the derivative rules dispatch even when the caller's
+/// mode is off, which is upstream's `AutoGradMode(create_graph)`.
+pub struct GradModeGuard(bool);
+
+impl GradModeGuard {
+    pub fn enter(value: bool) -> Self {
+        Self(GRAD_ENABLED.swap(value, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl Drop for GradModeGuard {
+    fn drop(&mut self) {
+        GRAD_ENABLED.store(self.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl NoGradGuard {
     pub fn enter() -> Self {
         Self(GRAD_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed))
