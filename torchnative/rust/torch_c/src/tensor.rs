@@ -1235,7 +1235,7 @@ impl PyTensorBase {
 /// layout** -- naming the *backend*, as the old sentence did, is what sent 112
 /// cells of docs/devices/matrix.md to the wrong diagnosis (§7.2).
 ///
-/// **Nothing here changes `vendor/candle-core`.** Every call below is on the
+/// **Nothing here changes `torchnative/rust/vendor/candle-core`.** Every call below is on the
 /// published API of the pinned crate; the fork's contract is "two inputs and
 /// nothing else" (docs/numerics/INT8.md §1.2) and it is untouched.
 fn write_on_device(

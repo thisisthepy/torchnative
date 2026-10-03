@@ -40,9 +40,9 @@ python/
   torch/                 upstream 벤더링 트리 (생성물, gitignore, 손대지 않음)
 tests/                   게이트 스위트 (run.sh) · golden/ (upstream 값 대조) · docwatch/ (문서 검사기)
 tests/bench/                 측정 스크립트
-scripts/                 vendor/ (vendor_torch.sh · install_shim.sh · vendor_candle.sh) · wheel/ ·
+scripts/                 torchnative/rust/vendor/ (vendor_torch.sh · install_shim.sh · vendor_candle.sh) · wheel/ ·
                          devices/ · scan/ · colab/
-vendor/                  candle-core · candle-metal-kernels 포크와 그 패치
+torchnative/rust/vendor/                  candle-core · candle-metal-kernels 포크와 그 패치
 .github/                 workflows/ · scripts/ (CI 스크립트) · scripts/release/ (release-sync)
 docs/<folder>/           회차별 측정 기록. 색인은 docs/README.md
 docs/guide/              GitHub Pages 가이드 (영/한)

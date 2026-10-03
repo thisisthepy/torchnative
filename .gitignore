@@ -197,13 +197,13 @@ cython_debug/
 # negated the way `torch/` above has to be.
 /torchnative/python/torchgen/
 /torchnative/python/functorch/
-/vendor/probe/
+/torchnative/rust/vendor/probe/
 
 # The tree used to land in /vendor. Kept ignored so a checkout made before the
 # move -- a worktree, say -- does not fill `git status` with 2286 files.
-/vendor/torch/
-/vendor/torch-*.dist-info/
-/vendor/.stamp
+/torchnative/rust/vendor/torch/
+/torchnative/rust/vendor/torch-*.dist-info/
+/torchnative/rust/vendor/.stamp
 
 # macOS Finder metadata. Three of these had been committed, and the sdist
 # carried them to PyPI.

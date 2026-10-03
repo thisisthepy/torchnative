@@ -380,8 +380,8 @@ aten.matmul.default: candle: Metal error mlx matmul doesn't support I32
 `candle-metal-kernels` ships `badd_i64`/`badd_u32` and not `badd_i16`/`badd_i32`,
 and the `to_dtype` matrix has no `I16→I64` or `I32→I64` arm. Closing it means
 either writing Metal shaders into `candle-metal-kernels` (upstream patch, of the
-shape `vendor/int8-candle-0.11.0-cpu.patch` already is for another gap; and
-`vendor/int8-candle-metal-kernels-0.11.0.patch` is now that shape for the
+shape `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` already is for another gap; and
+`torchnative/rust/vendor/int8-candle-metal-kernels-0.11.0.patch` is now that shape for the
 Metal half, so the road below is walked rather than hypothetical --
 see [`docs/devices/matrix.md`](../devices/matrix.md) §7.17 for what it cost),
 or a
@@ -454,7 +454,7 @@ against upstream 2.13.0.
 | road | verdict |
 |---|---|
 | 1. promotion with a proven wrap identity | **identity proven; road impassable.** The widening cast is itself a missing Metal kernel (above). Doing it via the host is the failure mode this document's §1 ranks worst. |
-| 2. real Metal kernels for `i16`/`i32` | **fork only — there is no extension point, and that fork has since been made for `I8`** (2026-09-20, [`docs/devices/matrix.md`](../devices/matrix.md) §7.17: 51 lines, zero new shader bodies, `I16`/`I32` would be the same shape). `candle_metal_kernels::DType` (`lib.rs`) has exactly six variants, `F32 F16 BF16 I64 U32 U8`; `binary.metal`'s `init_binary` macro instantiates over the same six; the shaders are `include_str!`'d compile-time constants and `Kernels::load_library` takes a closed `Source` enum. Adding `I16`/`I32` means patching `candle-metal-kernels` **and** `candle-core`'s Metal dispatch — a shader patch in the shape of `vendor/int8-candle-0.11.0-cpu.patch`, but larger, and not something this round could grade across the matrix. Left for a round that owns it. |
+| 2. real Metal kernels for `i16`/`i32` | **fork only — there is no extension point, and that fork has since been made for `I8`** (2026-09-20, [`docs/devices/matrix.md`](../devices/matrix.md) §7.17: 51 lines, zero new shader bodies, `I16`/`I32` would be the same shape). `candle_metal_kernels::DType` (`lib.rs`) has exactly six variants, `F32 F16 BF16 I64 U32 U8`; `binary.metal`'s `init_binary` macro instantiates over the same six; the shaders are `include_str!`'d compile-time constants and `Kernels::load_library` takes a closed `Source` enum. Adding `I16`/`I32` means patching `candle-metal-kernels` **and** `candle-core`'s Metal dispatch — a shader patch in the shape of `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch`, but larger, and not something this round could grade across the matrix. Left for a round that owns it. |
 | 3. **refuse by name, close nothing** | **taken.** |
 
 **What was delivered instead, and it is a deliverable on its own.** The refusal

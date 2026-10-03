@@ -45,7 +45,7 @@ The approved root entries:
 
 | Kind | Entries |
 |---|---|
-| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/`, `vendor/` |
+| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/` |
 | Git-ignored | `.caches/`, `.scratch/` (torchnative's temporary-file directory, in the role python-multiplatform gives its .tmp directory), `.worktrees/` |
 
 `tests/release/test_layout.py`
@@ -219,7 +219,7 @@ scripts/vendor/        vendor_torch.sh, install_shim.sh, vendor_candle.sh, gen_s
 scripts/wheel/         cross builds and wheel verification
 scripts/devices/       on-device harnesses (Android parity, Intel NPU, ...)
 scripts/scan/, scripts/colab/   upstream-source scanner; Colab notebook
-vendor/                the candle-core / candle-metal-kernels forks and their patches
+torchnative/rust/vendor/                the candle-core / candle-metal-kernels forks and their patches
 .github/scripts/       CI-only scripts; .github/scripts/release/ is release-sync
 docs/<folder>/         round-by-round records of what was measured (index: docs/README.md)
 ```
@@ -229,7 +229,7 @@ docs/<folder>/         round-by-round records of what was measured (index: docs/
 `target/` (an unapproved root entry, §2) and break the per-crate `torchnative/rust/torch_c/target` that
 `scripts/vendor/install_shim.sh`, `tests/run.sh`, `scripts/wheel/build.py` and the cross builds read;
 it would replace the per-crate lock files with one, so `vulkan_probe` and `wasm_probe` would resolve
-against `torch_c`'s graph; and `[patch.crates-io]` (the `vendor/candle-*` forks) and `[profile.*]` are
+against `torch_c`'s graph; and `[patch.crates-io]` (the `torchnative/rust/vendor/candle-*` forks) and `[profile.*]` are
 honoured only at a workspace root, so `torch_c`'s patch entries and `vulkan_probe`'s release profile
 would be ignored. Measured on 2026-10-03 with a trial root `[workspace]` and `cargo metadata`:
 `target_directory` moved from `torchnative/rust/torch_c/target` to `<root>/target`, and cargo warned

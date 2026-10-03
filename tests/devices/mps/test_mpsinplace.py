@@ -23,7 +23,7 @@ walking the destination's layout over a `&mut CpuStorage` slice. There is no
 CPU slice behind a Metal buffer, so the door could not open on a device. The
 refusal was honest; what it named was the *door*, not the operator.
 
-**What lifts it, and why it needs no change to `vendor/candle-core`.** For a
+**What lifts it, and why it needs no change to `torchnative/rust/vendor/candle-core`.** For a
 receiver whose layout is **contiguous** -- a whole tensor, or a `detach()`,
 `view()`, `reshape()`, `unsqueeze()` or leading-axis `slice`/`select` of one --
 the set of storage positions the view addresses is one contiguous run starting

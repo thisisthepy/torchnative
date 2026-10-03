@@ -59,8 +59,8 @@ other checkout, CI and the wheel builds failed at resolution. It is now:
 | | |
 |---|---|
 | `torchnative/rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-core = { path = "../../vendor/candle-core" }` |
-| `vendor/candle-core/` | **committed.** The published crate plus the patch, 113 files, 1.9 MB |
-| `vendor/int8-candle-0.11.0-cpu.patch` | the only place the fork is edited |
+| `torchnative/rust/vendor/candle-core/` | **committed.** The published crate plus the patch, 113 files, 1.9 MB |
+| `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` | the only place the fork is edited |
 | `scripts/vendor/vendor_candle.sh` | regenerates the tree; `--check` rebuilds it in a temp dir and diffs |
 
 The base is the **published** `candle-core-0.11.0.crate`, pinned by sha256
@@ -73,13 +73,13 @@ crate is 1.9 MB.
 
 **Committed, not gitignored, deliberately.** `[patch]` is resolved before any build script runs,
 so a per-machine tree would need the vendoring step in front of every cargo invocation — two
-`vendor/*.sh`, `run.sh`, a dozen cross builds across two CI workflows, `cargo ndk`, the device
+`torchnative/rust/vendor/*.sh`, `run.sh`, a dozen cross builds across two CI workflows, `cargo ndk`, the device
 scripts — and the first one missed would reproduce this defect. Committed, a fresh clone builds
 with plain `cargo build`. The cost is a copy that could drift from its two inputs, and
 `tests/numerics/test_int8.py` runs `--check` in the gate, including a test that a
 drifted copy and a wrong crate are **refused**.
 
-**The patch carried in `vendor/` was not the fork that was built.** Applied to the published
+**The patch carried in `torchnative/rust/vendor/` was not the fork that was built.** Applied to the published
 crate it failed one hunk of `dtype.rs` (the hand-built tree held a `dtype.rs.rej`), and it had no
 `metal_backend/mod.rs` hunks at all — the four `UnsupportedDTypeForOp` refusals that keep an
 `mps` user from a silent fallback existed only in the machine-local tree. The patch was
@@ -117,7 +117,7 @@ made to drop `tokenizers` from the graph — the diff below. That is a separate 
 declined; the fork carries only `I8`, and `Cargo.lock` matches develop's except that
 `candle-core` has no registry `source`.
 
-<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '"../../../vendor/candle-core"' present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml '"../vendor/candle-core"' present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml 'candle-vendor' absent -->
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706 present -->
 <!-- DOCWATCH: symbol-in-file tests/numerics/test_int8.py test_the_committed_fork_is_the_pinned_crate_plus_the_patch present -->
@@ -161,8 +161,8 @@ moves to AGREES — which is why neither crate is vendored on its own.
 | | |
 |---|---|
 | `torchnative/rust/torch_c/Cargo.toml` | `[patch.crates-io] candle-metal-kernels = { path = "../../vendor/candle-metal-kernels" }` |
-| `vendor/candle-metal-kernels/` | **committed.** The published crate plus the patch, 984 KB |
-| `vendor/int8-candle-metal-kernels-0.11.0.patch` | the only place this fork is edited |
+| `torchnative/rust/vendor/candle-metal-kernels/` | **committed.** The published crate plus the patch, 984 KB |
+| `torchnative/rust/vendor/int8-candle-metal-kernels-0.11.0.patch` | the only place this fork is edited |
 | `scripts/vendor/vendor_candle.sh` | now loops over **both** crates; `--check` covers both |
 
 Pinned by sha256 `242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e`,
@@ -179,7 +179,7 @@ although it has carried Metal counters for some time and now carries Metal
 `tests/numerics/test_int8.py`; it is deliberately **left alone**, and
 `vendor_candle.sh`'s header says so where a reader meets it.
 
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh int8-candle-metal-kernels present -->
 
 ## 2. Adding `I8` to `candle-core`: measured, not estimated
@@ -442,12 +442,12 @@ ends here rather than in a diff.
 4. **CUDA and Metal were not touched** and 33 `I16` sites there are unexamined.
 
 > **Superseded 2026-09-15.** The fork has landed (§1.2), and item 1's objection is answered
-> by committing the published crate under `vendor/candle-core` rather than by an absolute
-> path. The patch named in the next paragraph moved to `vendor/`, and the copy that was
+> by committing the published crate under `torchnative/rust/vendor/candle-core` rather than by an absolute
+> path. The patch named in the next paragraph moved to `torchnative/rust/vendor/`, and the copy that was
 > carried **did not apply** — it has been regenerated from the tree that was actually built.
 > Items 3 and 4 are unchanged.
 
-What is landed instead is the evidence: `vendor/int8-candle-0.11.0-cpu.patch` is the
+What is landed instead is the evidence: `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` is the
 exact +252-line diff that compiles under `--no-default-features` and
 `--features accelerate`, keeps candle's own suite at 0 failed, and passes the
 functional probe in §2.4. Applying it is a `[patch.crates-io]` entry and the seven

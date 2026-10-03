@@ -530,7 +530,7 @@ def _source_roots() -> list[str]:
     repository.
 
     cargo's dep-info lists a path dependency's sources beside the crate's, and
-    the `candle-core` fork is one (`vendor/candle-core`, docs/numerics/INT8.md
+    the `candle-core` fork is one (`torchnative/rust/vendor/candle-core`, docs/numerics/INT8.md
     §1.2). Reading those as "another checkout" refused every wheel build.
     Declared roots rather than "anywhere under REPO", so an input from a stray
     corner of the repository is still foreign; and inside REPO only, so a
@@ -2512,7 +2512,7 @@ def self_test() -> None:
             # every wheel build the fork landed into.
             ("a prerequisite from this checkout's [patch] source", FRESH,
              "recorded inputs",
-             f"@ART@: {real[0]} {REPO / 'vendor' / 'candle-core' / 'src' / 'lib.rs'}",
+             f"@ART@: {real[0]} {REPO / 'torchnative' / 'rust' / 'vendor' / 'candle-core' / 'src' / 'lib.rs'}",
              0.0),
             # ...and only those: the rule is the declared source roots, not
             # "anywhere in the repository".

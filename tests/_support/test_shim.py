@@ -3239,7 +3239,7 @@ def test_the_dispatch_table_matches_the_two_lists():
 # every change.
 #
 # The approach: `import torch` here is the *real* upstream package (nothing
-# on `sys.path` shadows it -- this file never adds `vendor/` to the path),
+# on `sys.path` shadows it -- this file never adds `torchnative/rust/vendor/` to the path),
 # and `_C` (imported at the top of this file) is the shim, loaded standalone
 # as a module literally named `_C`, never as `torch._C`. The two do not
 # collide in one process -- confirmed by running the model-comparison probes
