@@ -26,6 +26,19 @@ argument behind it, written out in DESIGN.md §3 -- a running statistic is a
 re-estimate rather than an additive offset, so ``apply`` and ``publish`` are not
 defined on it.
 
+**The two stages are two types, in two modules** (SPEC S6.5, INTENT §4).
+Stage 0's base, :class:`StatisticsMethod`, is defined here. Stage 1's base,
+``GradientMethod``, and :class:`Tent` are defined in
+``torchnative.adapt.gradient`` and reached from here lazily, so ``adapt.Tent``
+works as it always did and a stage-0 user never executes the stage-1 module.
+A build configured without a backward -- ``TORCHNATIVE_BACKWARD=off`` when this
+module is imported; :data:`BACKWARD` says what was read -- refuses that module
+at import, and refuses any :class:`Method` subclass declaring stage 1 or 2 when
+its class statement runs, each naming itself and the reason. :class:`Adapted`
+then accepts stage 0 only as a ``StatisticsMethod`` and stage 1 only as a
+``GradientMethod``, so a stage set by attribute cannot route around the type.
+Held by ``rust/torch_c/pytests/test_stagetype.py``.
+
 **A method is not the central type; the delta is.** DESIGN.md §3 says every
 adaptation method reduces to a weight delta over base weights, methods differing
 only in lifetime and destination. So :class:`Method` declares three things and
@@ -49,13 +62,12 @@ not, and says which op stopped it.
 
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 
 from torchnative.delta import BufferSnapshot, Delta
-
-__all__ = [
-    "Method", "StatisticsMethod", "Tent", "BatchNormStats", "Adapted", "wrap",
-]
 
 
 # DESIGN.md §3 axis 1. Stated as a module constant rather than a bare integer at
@@ -64,6 +76,86 @@ __all__ = [
 STAGE_FORWARD_ONLY = 0
 STAGE_NARROW_BACKWARD = 1
 STAGE_FULL_AUTOGRAD = 2
+
+
+# -- does this build have a backward? (SPEC S6.5) ---------------------------
+#
+# **A configuration, because no build without one exists.** Every `torch._C`
+# this crate builds carries the tape (`tape::register` is unconditional in
+# `rust/torch_c/src/lib.rs`), so there is no artefact whose absent backward a
+# probe could detect -- and a probe whose "no" branch can never be reached is a
+# check that cannot fail (AGENTS.md §17.5). What a deployment *can* say is that
+# it does not want stage 1 on board. It says so here, once, at import, and the
+# answer is fixed for the process: a stage that could change after methods were
+# imported would make "refused at import time" mean nothing.
+BACKWARD_ENV = "TORCHNATIVE_BACKWARD"
+_BACKWARD_OFF = frozenset({"0", "off", "no", "false"})
+_BACKWARD_ON = frozenset({"1", "on", "yes", "true"})
+
+
+def _read_backward(value):
+    """Unset or empty means the build has its backward, which every build does.
+
+    Anything that is neither an "on" nor an "off" spelling is refused by name:
+    reading it as "on" would put stage 1 into a deployment that meant to
+    exclude it, and reading it as "off" would refuse a working build over a
+    typo. Either is a silent choice.
+    """
+    if value is None or not value.strip():
+        return True
+    v = value.strip().lower()
+    if v in _BACKWARD_OFF:
+        return False
+    if v in _BACKWARD_ON:
+        return True
+    raise ValueError(
+        "torchnative.adapt: %s=%r is neither on nor off. It says whether this "
+        "build has a backward, which decides whether stage-1 (gradient) "
+        "adaptation methods may be imported (SPEC S6.5), so it is not guessed "
+        "at.\nCheck: set it to one of %s for a build without a backward, one "
+        "of %s (or unset it) for a build with one."
+        % (BACKWARD_ENV, value, sorted(_BACKWARD_OFF), sorted(_BACKWARD_ON))
+    )
+
+
+#: The raw value of ``TORCHNATIVE_BACKWARD`` this module was imported under.
+BACKWARD_SETTING = os.environ.get(BACKWARD_ENV)
+#: Whether this build admits stage-1 methods. Read once, at import.
+BACKWARD = _read_backward(BACKWARD_SETTING)
+
+# The stage-1 names, which live in `torchnative.adapt.gradient` and are listed
+# here only when this build can import them -- `from torchnative.adapt import *`
+# in a backward-free build must give stage 0, not a refusal.
+_GRADIENT_NAMES = ("GradientMethod", "Tent")
+
+__all__ = [
+    "Method", "StatisticsMethod", "BatchNormStats", "Adapted", "wrap",
+    "BACKWARD", "BACKWARD_ENV",
+    "STAGE_FORWARD_ONLY", "STAGE_NARROW_BACKWARD", "STAGE_FULL_AUTOGRAD",
+] + (list(_GRADIENT_NAMES) if BACKWARD else [])
+
+
+def __getattr__(name):
+    """``adapt.Tent`` and ``adapt.GradientMethod``, from the stage-1 module.
+
+    PEP 562, so the stage-1 module is executed when a stage-1 name is asked
+    for and not before. In a backward-free build that import raises the
+    module's own ``ImportError`` and it propagates unchanged -- through
+    ``from torchnative.adapt import Tent`` too, which would otherwise replace
+    it with a bare "cannot import name".
+    """
+    if name in _GRADIENT_NAMES:
+        from torchnative.adapt import gradient
+
+        return getattr(gradient, name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
+
+
+def _no_backward_reason():
+    return (
+        "needs a backward, which this build is configured without (%s=%r)"
+        % (BACKWARD_ENV, BACKWARD_SETTING)
+    )
 
 
 class Method:
@@ -76,12 +168,41 @@ class Method:
     ``stage`` is DESIGN.md §3's first axis, declared per method rather than by
     directory, because normalisation calibration sits on both sides of the line:
     recomputing statistics needs no backward, updating the affine parameters by
-    a loss does. A build without a backward can refuse a method at ``wrap``
-    time by reading this, instead of at the first step by exploding.
+    a loss does. The declaration is backed by a type -- stage 0 is
+    :class:`StatisticsMethod`, stage 1 is ``torchnative.adapt.gradient.
+    GradientMethod`` -- and a build without a backward refuses stage 1 at
+    import, by :meth:`__init_subclass__` and by the stage-1 module, rather than
+    at the first step by exploding (SPEC S6.5).
     """
 
     #: One of the ``STAGE_*`` constants above.
     stage = None
+
+    def __init_subclass__(cls, **kwargs):
+        """Refuse a stage-1 or stage-2 class in a build without a backward.
+
+        At class creation, which is when the module defining it is imported --
+        so a gradient method a *user* wrote, and that never went near
+        ``torchnative.adapt.gradient``, is refused at import time too (SPEC
+        S6.5). Named by module and qualified name, so a deployment that pulled
+        it in transitively is told which file did.
+        """
+        super().__init_subclass__(**kwargs)
+        stage = getattr(cls, "stage", None)
+        if (not BACKWARD and isinstance(stage, int)
+                and stage >= STAGE_NARROW_BACKWARD):
+            raise ImportError(
+                "torchnative.adapt: %s.%s declares stage %d, and stage %d "
+                "%s. Refused when the class is created -- at the import of the "
+                "module that defines it -- rather than at the first step "
+                "(INTENT §4, SPEC S6.5).\n"
+                "Stage 0 is available: subclass "
+                "torchnative.adapt.StatisticsMethod.\n"
+                "Check: torchnative.adapt.BACKWARD"
+                % (cls.__module__, cls.__qualname__, stage, stage,
+                   _no_backward_reason()),
+                name=cls.__module__,
+            )
 
     def select(self, model):
         """The names of the parameters this method adapts.
@@ -220,68 +341,10 @@ class BatchNormStats(StatisticsMethod):
         ]
 
 
-class Tent(Method):
-    """Entropy minimisation on the normalisation affine parameters.
-
-    Wang et al., *Tent: Fully Test-Time Adaptation by Entropy Minimization*
-    (ICLR 2021): adapt to unlabelled test data by descending the entropy of the
-    model's own predictions, moving only the affine parameters of the
-    normalisation layers.
-
-    It is DESIGN.md §3's stage 1 -- "optimisation-based, normalisation
-    calibration, updating the affine {gamma, beta} by a loss" -- and that is
-    the row of the survey table that needs a backward. The row above it, which
-    only recomputes statistics, needs none; both are normalisation calibration,
-    which is why the stage is declared here and not read off a directory name.
-
-    **What is deliberately not done.** The paper also puts normalisation layers
-    into batch-statistic mode, because its models are BatchNorm ones and the
-    test-time statistics are half the method. This selects and updates affine
-    parameters only. On a model whose normalisation has no running statistics --
-    LayerNorm, RMSNorm, so every transformer -- the two halves coincide and
-    nothing is missing. On a BatchNorm model they do not.
-
-        Check: any(hasattr(m, "running_mean") and m.running_mean is not None
-                   for m in model.modules())
-
-    If that is True for your model, this class is implementing half of Tent and
-    :meth:`select` will tell you which layers it picked.
-    """
-
-    stage = STAGE_NARROW_BACKWARD
-
-    def __init__(self, select=None, affine_only=True):
-        self._select = select
-        self.affine_only = affine_only
-
-    def select(self, model):
-        if self._select is not None:
-            return list(self._select(model) if callable(self._select) else self._select)
-        names = []
-        for mod_name, module in model.named_modules():
-            if not _is_normalisation(module):
-                continue
-            for own_name, param in module.named_parameters(recurse=False):
-                if self.affine_only and own_name not in ("weight", "bias"):
-                    continue
-                names.append(f"{mod_name}.{own_name}" if mod_name else own_name)
-        return names
-
-    def objective(self, outputs):
-        """Mean prediction entropy, over every position of the batch.
-
-        ``-(p * log p).sum(-1)`` with ``p`` from ``softmax`` and ``log p`` from
-        ``log_softmax`` rather than from ``log(p)``: the second spelling is one
-        op shorter and loses the large negative logits, which at a 49152-wide
-        vocabulary is most of them.
-
-        Both spellings have derivative rules, so the choice here is numerical
-        and not a matter of what the tape can carry.
-        """
-        logits = _logits_of(outputs)
-        p = torch.softmax(logits, dim=-1)
-        logp = torch.log_softmax(logits, dim=-1)
-        return -(p * logp).sum(-1).mean()
+# `Tent`, the stage-1 method, and `GradientMethod`, its base, are in
+# `torchnative.adapt.gradient` (SPEC S6.5) and reached through `__getattr__`
+# above. `_is_normalisation` and `_logits_of` stay here because they are
+# shared helpers, not stage-1 code: neither needs a backward.
 
 
 def _logits_of(outputs):
@@ -358,13 +421,18 @@ class Adapted(torch.nn.Module):
                 "without a backward has to be able to refuse at wrap time "
                 "rather than at the first step" % (type(method).__name__,)
             )
-        if method.stage == STAGE_FORWARD_ONLY and not hasattr(method, "select_modules"):
+        # The stage is a type (SPEC S6.5). Checked by `isinstance` and not by
+        # `hasattr(method, "select_modules")`, which is how this read until the
+        # split: a duck that grew the right method name was stage 0 by
+        # convention, and that is what S6.5 replaces.
+        if method.stage == STAGE_FORWARD_ONLY and not isinstance(method, StatisticsMethod):
             raise NotImplementedError(
-                "torchnative.adapt: %r declares stage 0 (forward only) but does "
-                "not declare select_modules(model). A stage-0 method does not "
-                "move parameters -- it recalibrates the running statistics of "
-                "named modules -- so Method.select, which returns parameter "
-                "names, is not its contract.\n"
+                "torchnative.adapt: %r declares stage 0 (forward only) but is "
+                "not a StatisticsMethod, the stage-0 type, so it does not "
+                "declare select_modules(model) as that type defines it. A "
+                "stage-0 method does not move parameters -- it recalibrates the "
+                "running statistics of named modules -- so Method.select, which "
+                "returns parameter names, is not its contract.\n"
                 "Check: subclass torchnative.adapt.StatisticsMethod (or use "
                 "BatchNormStats), which declares select_modules."
                 % (type(method).__name__,)
@@ -379,6 +447,24 @@ class Adapted(torch.nn.Module):
                 "that returns instead of refusing, an autograd exists that this "
                 "refusal predates." % (type(method).__name__,)
             )
+        if method.stage == STAGE_NARROW_BACKWARD:
+            # Read off `sys.modules` rather than imported: an instance of
+            # `GradientMethod` cannot exist unless its module is loaded, and
+            # importing it here would turn a backward-free build's wrap of a
+            # stage-0 duck into the stage-1 module's import refusal.
+            gradient = sys.modules.get(__name__ + ".gradient")
+            if gradient is None or not isinstance(method, gradient.GradientMethod):
+                raise TypeError(
+                    "torchnative.adapt: %r declares stage 1 (gradient) but is "
+                    "not a GradientMethod, the stage-1 type. The stage is "
+                    "decided by the type, not by an attribute (SPEC S6.5), so "
+                    "a stage set on an instance cannot route around the "
+                    "import-time refusal of a build without a backward.%s\n"
+                    "Check: subclass torchnative.adapt.gradient.GradientMethod."
+                    % (type(method).__name__,
+                       "" if BACKWARD else
+                       " And stage 1 " + _no_backward_reason() + ".")
+                )
         self.model = model
         self.method = method
         self._lr = lr
