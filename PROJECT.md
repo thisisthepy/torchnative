@@ -81,7 +81,7 @@ bash tools/release/test-sync-release.sh
 | | `publish_main.sh` | `sync-release.sh` |
 |---|---|---|
 | `main` 을 바꾸는 방법 | 로컬 `update-ref` 후 수동 푸시 | CI 가 `release` 생성 → PR → 병합 |
-| 제외 대상 | `docs/` 전체, `CLAUDE.md`, `PROJECT.md`, `pytests/`, `tools/{docwatch,golden,spike,bench,scan,colab}` | 루트의 `README.md` 외 `*.md`, `docs/` 바로 아래 `*.md` 만 |
+| 제외 대상 | `docs/` 전체, `AGENTS.md`, `PROJECT.md`, `pytests/`, `tools/{docwatch,golden,spike,bench,scan,colab}` | 루트의 `README.md` 외 `*.md`, `docs/` 바로 아래 `*.md` 만 |
 | 검증 | 공개 트리에서 실제 휠 빌드 | 없음 |
 | `README` 링크 | `docs/` 링크를 `develop` 절대 URL 로 재작성 | 재작성 없음 (`docs/<sub>/` 가 남으므로 불필요) |
 

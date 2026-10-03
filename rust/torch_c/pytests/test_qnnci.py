@@ -8,7 +8,7 @@ is right for what it tests and wrong for what is tested here. The decisions in
 `tools/ci/qnn_lower.py` are exactly the ones a green CI run never exercises,
 and putting them behind an executorch-shaped skip would mean that on this
 project's own machine -- the only machine that runs the gate -- they never run
-at all. A test that always skips is the `CLAUDE.md` §5.5 shape wearing a new
+at all. A test that always skips is the `AGENTS.md` §17.5 shape wearing a new
 hat, and §5.5 is the most-cited rule in this repository.
 
 So **nothing in this file imports executorch, torch, or torchnative.** It
@@ -262,7 +262,7 @@ def test_the_backend_id_here_matches_the_one_the_qnn_module_uses():
 
 
 def test_the_default_soc_is_the_device_this_project_actually_has():
-    """CLAUDE.md §7 and docs/devices/QNN.md §5.1: SM8550, read off the device.
+    """AGENTS.md §19 and docs/devices/QNN.md §5.1: SM8550, read off the device.
 
     The doc's example command line says SM8650, which is HTP v75 against this
     device's v73. Defaulting to the doc's example rather than the measurement
@@ -448,7 +448,7 @@ def test_the_pte_upload_is_gated_on_the_verification_result():
 def test_nothing_in_the_lowering_job_disables_its_own_assertions():
     """`|| true`, `continue-on-error`, and `set +e`, in the job that decides.
 
-    CLAUDE.md §5.5. The `android-runtime` job IS `continue-on-error` and says
+    AGENTS.md §17.5. The `android-runtime` job IS `continue-on-error` and says
     at length why; this asserts that the exemption did not spread to the job
     that carries the claim.
     """
@@ -491,7 +491,7 @@ def test_no_assertion_in_the_extracted_script_is_commented_out():
 
 
 def test_the_job_runs_the_extracted_script_rather_than_inline_logic():
-    """The reason `tools/ci/` exists (CLAUDE.md §5.5).
+    """The reason `tools/ci/` exists (AGENTS.md §17.5).
 
     If the verification migrated back into a `run: |` block, everything in the
     first half of this file would still pass while testing nothing the job
@@ -607,7 +607,7 @@ def test_the_sdk_version_is_asserted_against_executorchs_own_answer():
     of this test grepped the raw text, and a nullification that replaced the
     call with a literal tuple went **uncaught**: the workflow also names
     `qnn.qnn_sdk_version()` in a comment two lines above, and the comment
-    satisfied the grep. That is `CLAUDE.md` §5.5's shape exactly -- a check
+    satisfied the grep. That is `AGENTS.md` §17.5's shape exactly -- a check
     that a prose mention can satisfy is a check on the prose.
     """
     doc = _yaml()
@@ -651,14 +651,14 @@ def test_the_doc_does_not_claim_the_job_has_run():
         return _skip(f"no {DOC.relative_to(REPO)}")
     text = DOC.read_text()
     assert "has never run" in text or "never been run" in text, (
-        "docs/devices/QNNCI.md must say the job has not run. CLAUDE.md §4: built, "
+        "docs/devices/QNNCI.md must say the job has not run. AGENTS.md §16: built, "
         "reached and agreed are three different claims, and this job is not "
         "yet even the first."
     )
 
 
 def test_the_doc_states_this_files_own_test_count_correctly():
-    """CLAUDE.md §5.3: report "N of M", and do not let N drift.
+    """AGENTS.md §17.3: report "N of M", and do not let N drift.
 
     docs/devices/QNNCI.md §0 and §5.2 both carry the number of tests in this file. A
     stale count is a small lie, but it is the same species as the one

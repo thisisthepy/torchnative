@@ -7581,7 +7581,7 @@ def test_the_alternative_representations_have_no_constructors():
     Six of the predicates `repr` reads -- `is_nested`, `is_sparse`,
     `is_quantized`, `_is_zerotensor`, `is_neg` and `_is_functional_tensor` --
     ask "which representation is this tensor?". Five of them answer `False`
-    for every tensor this build can make, and CLAUDE.md §5.5 is right to be
+    for every tensor this build can make, and AGENTS.md §17.5 is right to be
     suspicious of that: a predicate that cannot say anything else is not a
     predicate.
 
@@ -12432,7 +12432,7 @@ def test_dequantisation_matches_the_reference_reconstruction_bit_for_bit():
 
 
 def test_the_quantisation_axis_fails_when_the_reference_is_perturbed():
-    """**The check on the checks.** CLAUDE.md §5.5: a verification that cannot
+    """**The check on the checks.** AGENTS.md §17.5: a verification that cannot
     fail is not a verification.
 
     Six faults, each shaped like a mistake somebody would actually make while
@@ -18621,7 +18621,7 @@ def test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land():
     # `peak_rss_MB` is a whole-process high-water mark, so it is the one number
     # in this suite that other work on the machine can move. Measured: this
     # assertion failed at load 5 with `saved` 27.1 of 68.0 MB, and passed twice
-    # in a row at load 3 immediately afterwards with nothing rebuilt. CLAUDE.md
+    # in a row at load 3 immediately afterwards with nothing rebuilt. AGENTS.md
     # already says measurement runs must be solitary; the cost of ignoring that
     # here is a gate that reddens during a merge and cannot be told apart from
     # a real regression.
@@ -26892,7 +26892,7 @@ def test_serialised_shapes_agree_with_what_capture_recorded():
     The second half is the part that makes this a test rather than a
     formality: it swaps `stride` and `padding` in the convolution plan and
     requires that the swap be *caught*. A checker that cannot fail is not a
-    checker (CLAUDE.md §5.5).
+    checker (AGENTS.md §17.5).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
@@ -27443,7 +27443,7 @@ def test_the_eager_backward_uses_the_dropout_draw_the_forward_made():
         )
 
     # **The nullification, with real machinery rather than a hypothetical.**
-    # CLAUDE.md §5.5: a check that cannot fail is not a check, and the
+    # AGENTS.md §17.5: a check that cannot fail is not a check, and the
     # assertion above would be worthless if nothing in this tree could actually
     # produce a gradient at the wrong draw. Something can. The *capture* tape
     # differentiates by replaying the forward, so `native_dropout` draws a
@@ -28255,7 +28255,7 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     asserts that they do not. Both still have prims folded out of them, so the
     pass is doing its work; what is left outside is outside for reasons prims
     have nothing to do with, and a test that only pinned the model that
-    improved would report the pass as more than it is (CLAUDE.md §5.3).
+    improved would report the pass as more than it is (AGENTS.md §17.3).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         vulkan_coverage.vulkan_skip("   (skipped: vendored tree has no _C.abi3.so)")
@@ -28420,7 +28420,7 @@ def test_folding_batch_norm_into_conv_takes_mobilenet_to_one_op_outside():
     # this is a numerical claim and not a bit-exactness one.
     # A *relative* bound, because this toy config's output magnitude is
     # degenerate (~1e-26): an absolute threshold here would pass on any answer
-    # at all, which is CLAUDE.md §5.5's check-that-cannot-fail. The absolute
+    # at all, which is AGENTS.md §17.5's check-that-cannot-fail. The absolute
     # proof of the fold is the `whole` network, whose output is O(1).
     assert mobile["fuse_replay_max_abs_diff"] <= 1e-5 * mobile[
         "fuse_replay_scale"

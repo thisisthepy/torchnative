@@ -8,7 +8,7 @@ for those six only. §7.15 then read the instantiation and found it
 macro-driven. This file is the round that vendored the **second** crate and
 measured the result rather than predicting it.
 
-**The three grades, kept apart (CLAUDE.md §4).**
+**The three grades, kept apart (AGENTS.md §16).**
 
     builds     the MSL compiles and the symbol resolves.
     reaches    the dispatch returns a tensor on `mps`.
@@ -29,7 +29,7 @@ where a widened-then-narrowed kernel and a true 8-bit one part company). A previ
 rather than as a hazard; the answer here comes from upstream, never from
 intuition.
 
-**Why the counter and not a source argument.** CLAUDE.md §2: a host-computed
+**Why the counter and not a source argument.** AGENTS.md §13.1: a host-computed
 twin leaves every value correct, every agreement test green and the `.device`
 label unchanged, and the only instrument that has ever caught one is a
 dispatch counter. So each agreement assertion below is paired with a
@@ -269,7 +269,7 @@ def test_int8_binary_operators_agree_with_upstream_on_mps():
         assert d["host_downloads"] == 0, (
             "%s on mps read %d tensor(s) back to the host (%d bytes) during "
             "the dispatch. A correct value the GPU did not compute is the "
-            "failure CLAUDE.md §4 exists to refuse."
+            "failure AGENTS.md §16 exists to refuse."
             % (op, d["host_downloads"], d["host_download_bytes"]))
         assert d["compute_encoders"] >= 1, (
             "%s on mps opened no compute encoder, so no shader ran. %s"

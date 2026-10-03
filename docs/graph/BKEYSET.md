@@ -303,7 +303,7 @@ Both runs were taken while another round's gate was running in a different
 worktree (load average ~3.4–4.1). The stage lock guards duplicate runs inside
 one worktree, not across worktrees. Neither run showed a red in
 `test_coremlops` or `test_anedecode`, so nothing here needed the `PLAN`-line
-adjudication CLAUDE.md §2 describes — but the contention is stated because the
+adjudication AGENTS.md §13.3 describes — but the contention is stated because the
 two CoreML suites are the ones it would have shown up in. Nothing in this
 round's own numbers is load-sensitive: agreement against a live upstream and
 `resolve_key` outcome counts mean the same thing under contention.

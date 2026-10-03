@@ -12,7 +12,7 @@ removed. Two things can go wrong and they fail in opposite directions:
 The leak check sees only the first. It would pass a tree with no `vendor/` and
 no `tools/wheel/` without a murmur -- which is why the script also builds, and
 why the tests below spend most of their effort proving that the build check is
-invoked rather than declared (CLAUDE.md 5.5).
+invoked rather than declared (AGENTS.md 17.5).
 
 Every assertion here is nullified by construction: the leak test runs a
 DELIBERATELY BROKEN copy of the script and requires it to go red, and the build
@@ -50,14 +50,14 @@ D = "do" + "cs"
 # exclusion_list_matches_the_script` compares the two, so neither can drift:
 # editing the script without editing this list is a red suite, and so is the
 # reverse. This is the point of duplicating it.
-# NOTE ON ORDER: `"docs"` is deliberately NOT adjacent to `"CLAUDE.md"` here.
+# NOTE ON ORDER: `"docs"` is deliberately NOT adjacent to `"AGENTS.md"` here.
 # `test_docrefs.py`'s SPLIT_PATH forbids a bare docs-directory literal sitting
 # next to a document-filename literal -- that adjacency is how paths were built
 # under the old flat layout, and
 # a textual rewrite cannot see it. The comparison below is order-insensitive
 # for exactly this reason; it is a set of decisions, not a sequence.
 EXPECTED_EXCLUDED = [
-    "CLAUDE.md",
+    "AGENTS.md",
     "PROJECT.md",
     "docs",
     "rust/torch_c/pytests",
@@ -236,7 +236,7 @@ def _fixture(tmp, build_exit=0):
             p.chmod(mode)
     # `.github` has a dot and is a directory, so the shape is spelled out
     # rather than guessed from the name.
-    files = {"CLAUDE.md", "PROJECT.md", "setup.py", "pyproject.toml",
+    files = {"AGENTS.md", "PROJECT.md", "setup.py", "pyproject.toml",
              "LICENSE", "README.md"}
     for rel in EXPECTED_EXCLUDED + MUST_BE_KEPT:
         w(rel if rel in files else f"{rel}/f.txt")

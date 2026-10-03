@@ -132,7 +132,7 @@ order, and drops the trace at the end of the call. Nothing enforces that order, 
 and a caller who keeps a trace — which the class does not do and the `CaptureTrace` API fully
 permits — gets a gradient at the wrong point with no message. That is a check that cannot fail
 because the situation it guards against is currently unreachable by accident, which is
-`CLAUDE.md` §5.5's shape, and §5 pins it.
+`AGENTS.md` §17.5's shape, and §5 pins it.
 
 ---
 
@@ -282,7 +282,7 @@ adds is that the *producer* need not be written, because `Recorder` is already i
 
 ## 5. What landed
 
-Split the way `CLAUDE.md` §5.3 asks for.
+Split the way `AGENTS.md` §17.3 asks for.
 
 | | |
 |---|---|
@@ -432,7 +432,7 @@ reconstructed recipe that disagreed would say nothing about the tape. That is th
 | # | not established | why |
 |---|---|---|
 | 1 | **That A5/A6's shape occurs in a real training loop.** | §1.1 constructed it. `optimizer.step()` writes to parameters, which are leaves and not views, so the shipped path does not obviously reach it — but `nn.utils.clip_grad_norm_`, the `_foreach_` fused optimisers, and any model that writes through a slice do, and **none of them was measured.** Until that is known, W10b's priority is a guess |
-| 2 | **The per-dispatch cost of an always-on recorder (W8).** | No timing was taken. `CLAUDE.md` forbids reporting one from a loaded machine and other agents were running. §3's numbers are byte counts and node counts, which contamination cannot move |
+| 2 | **The per-dispatch cost of an always-on recorder (W8).** | No timing was taken. `AGENTS.md` forbids reporting one from a loaded machine and other agents were running. §3's numbers are byte counts and node counts, which contamination cannot move |
 | 3 | **Whether the forward-comparison alternative to W10b works.** | §6 proposes it from §1.2's observation that the loss diverges before the gradient does. It was **not built and not costed**, and there is an obvious hole: a mutation that changes the forward by less than float32 noise would pass |
 | 4 | **That a `Node` built outside `capture::record` feeds `derivative()`.** | Inherited unopen from `docs/training/BACKWARD2.md` §8 row 3. §4 argues the *producer* need not be written because `Recorder` is it, which is a weaker claim than having done it |
 | 5 | **That §3's view-op list is the right one.** | The 18.9/75.7/302.6 MiB figures subtract slots produced by ops on a hand-written list of view spellings. A view op missing from that list inflates the number; a non-view op wrongly on it deflates it. The list was not checked against `native_functions.yaml`'s alias annotations |

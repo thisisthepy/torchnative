@@ -4940,7 +4940,7 @@ def _inplace_probe(payload):
 # numbers; the suite was green because the test did not exist yet at the moment
 # the runner looked.
 #
-# That is the "verification that cannot fail" shape of CLAUDE.md §5.5, in its
+# That is the "verification that cannot fail" shape of AGENTS.md §17.5, in its
 # purest form: not a weak assertion, an *unreached* one. The guard against it
 # coming back is `test_every_test_in_this_file_is_actually_collected` above,
 # which counts `def test_` in the source and requires the collected list to

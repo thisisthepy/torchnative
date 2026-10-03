@@ -277,7 +277,7 @@ as the next thing this makes answerable.
 `api/__init__.py:19` defines `TorchNativeAPI` with `__init__` and
 `deploy(self, model)`, both `pass`. A caller who writes
 `TorchNativeAPI().deploy(model)` gets `None` and no indication that nothing
-happened — which is the shape this repo's own CLAUDE.md §6 puts *below* a
+happened — which is the shape this repo's own AGENTS.md §18 puts *below* a
 refusal.
 
 `DESIGN.md:89` and :919 give the intended role (the device-side counterpart of

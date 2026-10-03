@@ -69,14 +69,14 @@ answer is nothing:
 * **README §2 forbids it.** *"Federated averaging **is** collective
   communication, so this is built on `torch.distributed` rather than beside
   it."* An in-process aggregator is precisely "beside it". Building one would
-  be the §5.2 failure in CLAUDE.md — choosing a design that makes the stated
+  be the §17.2 failure in AGENTS.md — choosing a design that makes the stated
   structure unreachable and then reporting the substitute as the thing.
 * **At world_size 1, FedAvg is the identity.** `docs/distributed/DISTRIBUTED.md` §4.1 says
   a single-rank reduction *is* the identity and that this is a fact rather than
   a stub. So a "federated round" run through the transport that does exist is
   arithmetically indistinguishable from one local training step — and a test of
   it would pass for a correct aggregator, a broken aggregator, and no aggregator
-  at all. That is CLAUDE.md §5.5's verification that cannot fail.
+  at all. That is AGENTS.md §17.5's verification that cannot fail.
 
 Test-time adaptation has neither problem: one device, no transport, no
 aggregation, and — the property that decided it — **an objective whose value is
@@ -766,7 +766,7 @@ one, so no amount of staring at the toy would have produced it. The
 `differentiable()` surface §1.2 built for exactly this question answered it in
 one call and cost nothing, which is the argument for having built it.
 
-*The lesson is CLAUDE.md §5.4's, arriving from the direction it usually does: a
+*The lesson is AGENTS.md §17.4's, arriving from the direction it usually does: a
 sizing I wrote, from a fixture I chose, was inherited by two documents as a
 fact. What broke it was running the check against the thing rather than against
 the fixture.*

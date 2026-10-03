@@ -826,7 +826,7 @@ def test_the_whole_model_executes_on_nnapi_and_the_control_is_orders_larger():
     that would have been passing on the model's flatness. The last layer is
     widened so the output spreads, and the test then requires the gap between
     "same input" and "different input" to be at least four orders of
-    magnitude. CLAUDE.md §5.5: a check that cannot fail is not a check.
+    magnitude. AGENTS.md §17.5: a check that cannot fail is not a check.
     """
     result = _nnapi_or_skip()
     if result is None:

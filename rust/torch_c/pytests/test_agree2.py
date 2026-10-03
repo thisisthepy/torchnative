@@ -18,7 +18,7 @@ draws the line where it belongs:
     direction is held by `test_agree.py`'s
     `test_the_oracle_factor_is_stated_and_is_not_a_free_parameter`, and the two
     files are only jointly sufficient -- which is the honest statement, since
-    widening a threshold until a flag disappears is exactly what CLAUDE.md
+    widening a threshold until a flag disappears is exactly what AGENTS.md
     warns about.
   * A change to the TREE -- an operator landing, a kernel regressing -- cannot
     be caught here, and nothing in this file pretends otherwise. Only re-running
@@ -193,7 +193,7 @@ def test_docwatch_exposes_the_agreement_counts_as_live_sources():
 
 
 def test_the_document_pins_its_counts_and_uses_ge_where_a_round_could_raise_them():
-    """CLAUDE.md is explicit: `ge` for anything a later round could legitimately
+    """AGENTS.md is explicit: `ge` for anything a later round could legitimately
     raise, and the exceptions are the ones that must stay at zero -- here,
     divergence and unjudgeability, which are `le`."""
     with open(_DOC) as fh:

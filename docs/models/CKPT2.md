@@ -56,7 +56,7 @@ transformers 5.15.1 · safetensors 0.8.0 (`/Volumes/macMini/caches/spike-venv`).
 
 ### 1.1 실제로 깨서 확인했다
 
-`CLAUDE.md` §5.5. 국소 편집으로 구현을 고장 내고 다시 돌렸습니다 (`git checkout` 은 쓰지
+`AGENTS.md` §17.5. 국소 편집으로 구현을 고장 내고 다시 돌렸습니다 (`git checkout` 은 쓰지
 않았습니다 — `cp` 백업).
 
 | 무엇을 깼나 | 무엇이 빨개졌나 |
@@ -439,7 +439,7 @@ $PY tools/golden/compare.py                   exit 0   2496/2496, ops=117 (전 2
 $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (전 270)
 ```
 
-**보고를 종류별로 나눕니다** (`CLAUDE.md` §5.3):
+**보고를 종류별로 나눕니다** (`AGENTS.md` §17.3):
 
 | 종류 | 무엇 |
 |---|---|
@@ -451,7 +451,7 @@ $PY rust/torch_c/pytests/verify_schemas.py    exit 0   272/272 (전 270)
 
 ### 9.1 테스트 수가 진척이 아닌 이유를 적어 둡니다
 
-`CLAUDE.md` §5.3. +6 중 **다섯**은 이 회차가 새로 연 능력에 대한 값 비교이고, 하나
+`AGENTS.md` §17.3. +6 중 **다섯**은 이 회차가 새로 연 능력에 대한 값 비교이고, 하나
 (어려운 형태 넷)는 **이미 되고 있었지만 아무도 확인한 적이 없던 것**을 고정한 것입니다.
 후자는 기능 추가가 아닙니다 — `tied`/`shard`/`meta` 는 §3 의 벽 넷을 메우자 별도 작업
 없이 통과했고, 이 회차가 한 일은 그것을 **재고 박은 것**입니다.

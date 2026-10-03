@@ -632,7 +632,7 @@ _MM_MATCH_DTYPES = ["float32", "float64", "float16", "bfloat16"]
 # the five gemm operators a host kernel that wraps in the storage width the way
 # upstream does. Twenty cases in this file then went red with "gap appears
 # CLOSED: both sides now succeed" -- which is the `golden_cases_failed eq 0`
-# marker doing exactly what CLAUDE.md §2 put it there for, and the commit that
+# marker doing exactly what AGENTS.md §13 put it there for, and the commit that
 # closed the gap not coming back here. `uint8` stays: the exact kernel covers
 # the signed widths only.
 _MM_C_ERROR_DTYPES = ["uint8"]

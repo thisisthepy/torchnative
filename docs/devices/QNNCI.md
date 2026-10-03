@@ -58,7 +58,7 @@ moment in the whole round to let *lowered for* slide into *ran on*.
 * **numbers.** No element-wise comparison against upstream happens here
   (`docs/devices/QNN.md` §7.2), and no timing (§11).
 
-In `CLAUDE.md` §4's three grades, a green run moves the QNN lowering from
+In `AGENTS.md` §16's three grades, a green run moves the QNN lowering from
 **built** to **reached**. It does not touch **agreed**, and it does not touch
 the separate question of *which unit* executed anything.
 
@@ -215,7 +215,7 @@ artefact gate, so a red run still hands back the measurement.
 
 ### 5.1 `tools/ci/qnn_lower.py`
 
-`CLAUDE.md` §5.5 is the most-cited rule in this repository, and logic living
+`AGENTS.md` §17.5 is the most-cited rule in this repository, and logic living
 only inside a `run: |` block is its purest form: it cannot be imported, cannot
 be nullified, and cannot be exercised anywhere except by pushing to a branch
 and watching. `tools/ci/verify_published.py` is this repository's existing
@@ -251,8 +251,8 @@ environment is absent — `_qnn_et_fixture` skips unless
 right for what it tests and wrong for what is tested here: the decisions in
 `qnn_lower.py` are exactly the ones a *successful* CI run never exercises, and
 putting them behind an executorch-shaped skip would mean that on this project's
-only machine they never run at all. A test that always skips is `CLAUDE.md`
-§5.5 wearing a new hat.
+only machine they never run at all. A test that always skips is `AGENTS.md`
+§17.5 wearing a new hat.
 
 So nothing in the file imports executorch, torch or torchnative. **30** tests,
 two halves:
@@ -389,7 +389,7 @@ until they happen `docs/devices/QNN.md` §6.4 stands unchanged.
 * **The job has not run.** Everything above is a description of a file.
 * **No count marker.** This document adds no `DOCWATCH: count`, because this
   round measured no number. A `ge` bound on a number nothing has produced is a
-  marker that cannot fail, which is the thing `CLAUDE.md` §5.5 and the
+  marker that cannot fail, which is the thing `AGENTS.md` §17.5 and the
   `golden_cases_failed` history are both about. When the first run reports
   `delegated_fraction`, it belongs in `docs/devices/QNN.md` §11 as a measurement.
 * **The device half is untouched.** `docs/devices/QNN.md` §5 steps 9–14 need the

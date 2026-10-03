@@ -363,7 +363,7 @@ def _require_shim():
 
 @functools.lru_cache(maxsize=None)
 def _workdir():
-    # Inside the repository (CLAUDE.md §3.0): `.scratch/` is gitignored.
+    # Inside the repository (AGENTS.md §15.1): `.scratch/` is gitignored.
     base = os.path.join(_REPO_ROOT, ".scratch")
     os.makedirs(base, exist_ok=True)
     root = tempfile.mkdtemp(prefix="stream-", dir=base)

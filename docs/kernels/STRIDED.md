@@ -253,7 +253,7 @@ answers the right shape and the right dtype with values from before a write that
 upstream applied, and raises nothing.
 
 The build with the barrier off is not merely wrong, it is **caught**, which is
-the other half of the check (`CLAUDE.md` §5.5 — a new public path that does not
+the other half of the check (`AGENTS.md` §17.5 — a new public path that does not
 break when nullified is a path nobody uses):
 
 ```text
@@ -303,7 +303,7 @@ turned a gap into a regression, and it does not.
 
 ## 7. What is verified, and how
 
-Split the way `CLAUDE.md` §5.3 asks, because "one op" and "one test file" are
+Split the way `AGENTS.md` §17.3 asks, because "one op" and "one test file" are
 not the same unit of work:
 
 * **Feature added (1):** `aten.as_strided.default`, plus `torch.as_strided` and

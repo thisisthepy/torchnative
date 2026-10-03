@@ -155,7 +155,7 @@ first — was followed here and found nothing, because **the missing thing was n
 kernel but a device**. An operator can be on every coverage list this repository keeps and still
 be a wall.
 
-It is also `CLAUDE.md` §5.4 exactly: the criterion ("is the op in `_aten_implemented()`?") decided
+It is also `AGENTS.md` §17.4 exactly: the criterion ("is the op in `_aten_implemented()`?") decided
 the answer, and the answer agreed with the hypothesis, which is when to suspect it hardest. What
 broke the loop was not a better list. It was running the model.
 
@@ -276,7 +276,7 @@ assert tol == _ORACLE_FACTOR * oracle      # <- true for ANY factor
 ```
 
 a **tautology**. It restates the definition of `tol` and therefore cannot fail. This is
-`CLAUDE.md` §5.5's category — a verification that cannot fail is not a verification — and it
+`AGENTS.md` §17.5's category — a verification that cannot fail is not a verification — and it
 arrived the way that category always does: the test was written to document the derivation, and
 documenting a derivation reads exactly like checking it.
 

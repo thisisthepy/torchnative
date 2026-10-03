@@ -449,7 +449,7 @@ from moved from `torch_c_bootstrap.py:264` (the table-less stub) to
 
 ## 6. Sabotage: six faults on what landed
 
-`CLAUDE.md`'s rule — a check that cannot fail is not a check — applied before claiming the
+`AGENTS.md`'s rule — a check that cannot fail is not a check — applied before claiming the
 tests as a gate. Each fault is applied to the tree, **rebuilt**, and the five affected tests
 re-run; the tree is restored from a `cp` backup after every one.
 

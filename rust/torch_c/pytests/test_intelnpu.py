@@ -405,7 +405,7 @@ def test_judge_refuses_arithmetic_outside_the_f16_tolerance():
 
 
 def test_the_numeric_control_has_a_floor_and_not_just_a_ratio():
-    """CLAUDE.md section 5.5, in the form this round nearly shipped.
+    """AGENTS.md section 17.5, in the form this round nearly shipped.
 
     `evidence`'s weights and inputs are quarter-integers, exactly representable
     in f16, so a correct device gives `linear_max_abs_diff == 0.0`. A pure ratio
@@ -705,7 +705,7 @@ def _openvino_run():
     # The compile cache goes to a throwaway directory, as in test_npufuse.py:
     # its default is the user's home cache (~/.cache/torchnative/openvino), and
     # a test must not write outside the repository (AGENTS.md, the rule that
-    # was CLAUDE.md §3.0). These tests only began running on Apple arm64 once
+    # was AGENTS.md §15.1). These tests only began running on Apple arm64 once
     # `ov_core_compile_model` got its argtypes, which is when the write showed up.
     with tempfile.TemporaryDirectory(prefix="intelnpu-ovcache-") as cache:
         env["TORCHNATIVE_CACHE_DIR"] = cache
@@ -932,7 +932,7 @@ def test_probe_on_real_hardware():
 #: Listed here rather than read off `intelnpu._WITHDRAWN`, deliberately: a test
 #: that asks the module which names it withdrew cannot fail when a name is
 #: quietly put back. This list is the independent statement of the claim
-#: (CLAUDE.md §5.5).
+#: (AGENTS.md §17.5).
 WITHDRAWN_INTELNPU = (
     "compile_model",
     "NPULinear",

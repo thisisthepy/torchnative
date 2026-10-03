@@ -305,7 +305,7 @@ seed in §1.3 gets a consumer that can use it. That is the commit W4 belongs in,
 ## 5. What landed
 
 **No behaviour changed.** One test, one docstring, and this document. Split the way
-`CLAUDE.md` §5.3 asks for:
+`AGENTS.md` §17.3 asks for:
 
 | | |
 |---|---|
@@ -430,7 +430,7 @@ keep consistent with `no_grad`, `detach`, `.data` and in-place ops — is precis
 
 ## 7.5 Sabotage: five faults on what landed
 
-`CLAUDE.md`'s rule — a check that cannot fail is not a check — and it matters more than usual here,
+`AGENTS.md`'s rule — a check that cannot fail is not a check — and it matters more than usual here,
 because the *only* thing this round landed is a test. Each fault is applied to the tree, **rebuilt**,
 and `test_the_backward_seed_is_absent_and_nothing_guesses_a_one` re-run alone; the tree is restored
 from a `cp` backup after every one.
@@ -511,6 +511,6 @@ questions.
 |---|---|---|
 | 1 | **That no consumer of `requires_grad` on an intermediate exists anywhere.** | §2 counted reads on one path: `from_pretrained` + `.train()` + a forward with `labels=`, on one architecture. `generate`, PEFT, `Trainer`, and every `torch.nn` module SmolLM2 does not use were not exercised. The counter is a Python property wrapper, so a read from *inside* the shim's Rust would also not be counted — there are none today, and that is asserted from the source rather than measured |
 | 2 | **That W4 + W5 together would be honest.** | §4.1 asserts it and this round did not build it. The claim is that every row of §1.1 moves onto upstream's answer *at once*; four of those rows depend on machinery (a node, a refcount) that nobody here has written |
-| 3 | **The cost of W4 in time.** | §4's last row is a node count, not a benchmark. Load average on this machine was 12.36 on 8 cores with three other agents running, and `CLAUDE.md`'s rule says that number is not usable. A before/after was **not attempted**, for that reason |
+| 3 | **The cost of W4 in time.** | §4's last row is a node count, not a benchmark. Load average on this machine was 12.36 on 8 cores with three other agents running, and `AGENTS.md`'s rule says that number is not usable. A before/after was **not attempted**, for that reason |
 | 4 | **That `1723`/`1853` is the only such pair.** | §6 identified one number by reproducing it. Other counts in `docs/training/BACKWARD.md` and `docs/models/ADAPT.md` are quoted with `wrt_constants` left implicit and were not re-derived |
 | 5 | **Anything about `torch.autograd.Function`, hooks, `create_graph`, or double backward.** | Inherited unchanged from `docs/training/BACKWARD2.md` §7.3: each is behind W5 rather than beside it |

@@ -19,7 +19,7 @@ fail here, stated rather than implied:
     process, so each side is a subprocess, and the upstream side must have the
     vendored tree *off* `PYTHONPATH` -- otherwise "upstream" is the shim and
     every ratio is 1.0x with nothing to say it went wrong. That is the
-    false-green shape of CLAUDE.md §5.5, so the test drives `run_side` with a
+    false-green shape of AGENTS.md §17.5, so the test drives `run_side` with a
     stand-in interpreter that records the environment it was handed.
 
 What this file cannot see: whether the numbers are right. Timing is not

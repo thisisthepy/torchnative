@@ -505,7 +505,7 @@ def test_permute_member_matches_the_door_and_T_is_permute_reversed():
 
     Both were reachable through `torch.permute(x, dims)` before this fix and
     not through `x.permute(dims)` or `x.T` -- the distinction the door and the
-    member catch separately, per CLAUDE.md's own note about that class of
+    member catch separately, per AGENTS.md's own note about that class of
     bug. Tested both ways here rather than only the member, so a future
     regression on the door does not slip past this file.
     """

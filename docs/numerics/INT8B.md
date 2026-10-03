@@ -282,7 +282,7 @@ candle's `DType`.
 
 ## 7. Report classification
 
-`CLAUDE.md` §5.3.
+`AGENTS.md` §17.3.
 
 | kind | what |
 |---|---|

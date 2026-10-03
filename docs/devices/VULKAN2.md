@@ -149,7 +149,7 @@ VK_KHR_portability_enumeration instance extension.
 
 ### 4.3 검증이 실패할 수 있는지 — 확인했습니다
 
-CLAUDE.md §5.5. `kosmickrisp` (실제 M1 GPU) 경로에서 대조군을 돌렸습니다:
+AGENTS.md §17.5. `kosmickrisp` (실제 M1 GPU) 경로에서 대조군을 돌렸습니다:
 
 ```
 $ VK_PROBE_TAMPER=1024 ./vk_probe    ->  MISMATCH ×3, RESULT: PASS (comparison caught the perturbation)

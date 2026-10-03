@@ -397,7 +397,7 @@ TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
 # documents now live in `docs/<folder>/` (docs/README.md is the index). With the
 # glob, the moment a document moved into a subfolder it left DOCWATCH silently:
 # the gate stays green and the marker count gets *smaller*, which is the
-# "verification that cannot fail" shape CLAUDE.md §5.5 records. The count is the
+# "verification that cannot fail" shape AGENTS.md §17.5 records. The count is the
 # proof -- it went 1070 -> 1070 across the move, not down.
 # `test_docrefs.py` fails if this glob comes back, here or in check_docs.py.
 doc_files=$(find "$repo_root/docs" -name '*.md' | sort)

@@ -88,7 +88,7 @@
 
 **왜 여태 안 걸렸는가**: 이것을 덮던 유일한 테스트가 shim 자신의 철자인 `is_mutable()` 를
 썼습니다. 괄호를 붙이면 메서드든 property 든 (property 면 `False()` 로 터지지만, 당시엔
-메서드였으므로) 통과합니다. **CLAUDE.md §5.5 가 말하는 "실패할 수 없는 검증"** 의 표본입니다.
+메서드였으므로) 통과합니다. **AGENTS.md §17.5 가 말하는 "실패할 수 없는 검증"** 의 표본입니다.
 
 `_is_view_op` 는 메서드로 둡니다 — `torch/distributed/tensor/_dispatch.py:569` 가 괄호를 붙입니다.
 
@@ -303,7 +303,7 @@ $PY rust/torch_c/pytests/verify_schemas.py  exit 0   255/255 (전 233, +22)
 
 ### 6.3 실패할 수 있는지 확인했다
 
-`CLAUDE.md` §5.5. 새 테스트가 진짜로 도는지 **일부러 깨서** 확인했습니다:
+`AGENTS.md` §17.5. 새 테스트가 진짜로 도는지 **일부러 깨서** 확인했습니다:
 
 ```
 기대값을 [9,9,9] 로 바꿈   → FAIL test_world_size_one_collectives_agree_with_upstream_gloo

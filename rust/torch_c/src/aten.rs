@@ -4473,7 +4473,7 @@ fn meta_table(
         // this round was scoped to; they are here because §2's question --
         // "how many of the eight construct end to end" -- cannot be answered
         // by stopping at a family boundary, and a kernel count is not an
-        // answer to it (CLAUDE.md §5.3).
+        // answer to it (AGENTS.md §17.3).
         "aten.cat.default" => {
             let tensors: Vec<PyTensorBase> = required(op, args, kwargs, 0, "tensors")?.extract()?;
             if tensors.is_empty() {
@@ -20942,7 +20942,7 @@ fn clamp_dtype_refusals(
 /// `nan`. candle's CPU `maximum`/`minimum` do the same. Its **Metal** kernels
 /// are MSL `max`/`min`, which return the *non-NaN* operand, so the same
 /// expression came back `0.0` on an `mps` tensor -- a silently wrong number,
-/// which is the one direction CLAUDE.md §4 does not permit.
+/// which is the one direction AGENTS.md §16 does not permit.
 ///
 /// It was found by re-measuring the (dtype x device) matrix after the in-place
 /// write door opened on Metal, and it is **older than that door**: `clamp` and
@@ -26124,14 +26124,14 @@ fn finish(py: Python<'_>, tensor: Tensor, tag: TorchDType) -> PyResult<Py<PyAny>
 /// spoke like that -- `ones`, `full`, `scalar_tensor`, `arange`, `ones_like`,
 /// `full_like`, `new_ones`, `new_full`. A caller can act on neither sentence:
 /// both name an internal symbol for a fact about Metal's API, which is the
-/// shape CLAUDE.md §6 rejects and which `test_intmps.py` already rejected for
+/// shape AGENTS.md §18 rejects and which `test_intmps.py` already rejected for
 /// the integer dtypes (`name_mps_int_refusal`, device.rs).
 ///
 /// So this is **not a second gate**. It is the same gate asked one step earlier
 /// on the paths that would otherwise never reach it -- nullifying
 /// `metal_dtype_gate` takes this and the constructor's copy out together, which
-/// is what keeps the guard testable rather than mutually shadowed (CLAUDE.md
-/// §5.5). `test_dtmdev.test_float64_refuses_by_name_on_every_road_onto_metal`
+/// is what keeps the guard testable rather than mutually shadowed (AGENTS.md
+/// §17.5). `test_dtmdev.test_float64_refuses_by_name_on_every_road_onto_metal`
 /// is the test, and it walks 22 roads rather than the four that were broken,
 /// so a road that regresses in the other direction is red too.
 fn storage_for(op: &str, tag: TorchDType, device: &Device) -> PyResult<candle_core::DType> {

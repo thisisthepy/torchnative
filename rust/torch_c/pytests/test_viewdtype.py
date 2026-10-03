@@ -42,7 +42,7 @@ asks for a double, which Metal does not have -- §3.1 of the matrix refuses
 `float64` by name on all the other roads onto the device, and this op was the
 road that stayed open. So the honest answer is a refusal that names the
 reason, which is this repository's standing answer for a kernel that cannot
-be written honestly (CLAUDE.md §6).
+be written honestly (AGENTS.md §18).
 
 **Evidence, per device, stated separately rather than blurred.**
 

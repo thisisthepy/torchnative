@@ -748,7 +748,7 @@ claim that the artefact is "better".
 
 The test also asserts `min(oracle) > 0` — an upstream error of exactly zero
 would drop the tolerance to the 8-ulp floor and make the derivation
-decorative, which is CLAUDE-file §5.5's check-that-cannot-fail wearing the
+decorative, which is AGENTS.md §17.5's check-that-cannot-fail wearing the
 tolerance's clothes.
 
 ### 7.2 What this comparison can and cannot mean

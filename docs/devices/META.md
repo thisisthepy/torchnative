@@ -762,7 +762,7 @@ llama3-rope from_pretrained + generate                            EXIT=0
 
 ### 11.3 사보타주 — 13 개 결함, 13 개 다 잡힘
 
-*"실패할 수 없는 검증은 검증이 아니다"* (CLAUDE.md §5.5). meta 커널의 출력은 모양과 dtype
+*"실패할 수 없는 검증은 검증이 아니다"* (AGENTS.md §17.5). meta 커널의 출력은 모양과 dtype
 **둘뿐**이므로, `.shape` 만 읽는 테스트는 dtype 결함을 구조적으로 못 봅니다. 그래서 규칙마다
 한 줄씩 고장 내고 세었습니다. 각 회차는 재빌드 + 전체 스위트입니다.
 
@@ -894,7 +894,7 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
   PYTHONPATH=$PWD/torchnative/src/main $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 
-# A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- CLAUDE.md)
+# A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- AGENTS.md)
 git stash push -- rust/torch_c/src
 (cd rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
 git stash pop

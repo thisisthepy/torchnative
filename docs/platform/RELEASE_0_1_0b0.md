@@ -14,7 +14,7 @@ those numbers are stale and are not part of this release's claims.
 `0.0.12a0` has been the published release while a great deal landed behind it.
 This is what changed, split four ways rather than summed into one number:
 **features added**, **defects fixed**, **measured but not implemented**, and
-**documentation corrected**. CLAUDE.md §5.3 asks for that split because the
+**documentation corrected**. AGENTS.md §17.3 asks for that split because the
 four are not the same kind of thing and a single figure that mixes them reads
 as progress whichever of the four it was.
 
@@ -218,7 +218,7 @@ would otherwise count these as features.
 - **This release's README.** The Roadmap table said `torch.distributed` was
   coming "from `world_size = 1` upward", that NPU "needs a capture layer", and
   that Metal was "disabled here" — after all three had landed. A roadmap is a
-  progress record, not a specification (CLAUDE.md §5.1), and a stale one
+  progress record, not a specification (AGENTS.md §17.1), and a stale one
   misleads in the direction a reader cannot check.
 
 ---

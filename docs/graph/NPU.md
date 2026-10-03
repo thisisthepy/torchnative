@@ -148,7 +148,7 @@ from a real CPU execution.
 The test injects the fault and requires it to be caught: it swaps `stride` and
 `padding` in the convolution plan. The first version of that injection used the
 `padding=1, stride=1` convolution, where the swap is the **identity** — it
-"passed" while checking nothing, which is CLAUDE.md §5.5 exactly. It now runs on
+"passed" while checking nothing, which is AGENTS.md §17.5 exactly. It now runs on
 a `stride=2, padding=1` convolution, where the swap moves the output shape —
 the serialiser then reports `(1, 4, 10, 10)` for a node capture recorded as
 `(1, 4, 4, 4)`, and `verify_shapes` returns that disagreement instead of an

@@ -62,7 +62,7 @@ asserts the two are identical, so neither can be edited alone.
 | Path | Why |
 |---|---|
 | `docs/` | 179 documents recording what each round measured. The record of how the work was done, not part of what ships — and the bulk of what a user would otherwise clone. |
-| `CLAUDE.md` | Instructions to agents working **on** the repository. Meaningless to somebody consuming the wheel. |
+| `AGENTS.md` | Instructions to agents working **on** the repository. Meaningless to somebody consuming the wheel. |
 | `PROJECT.md` | The same, for project structure and reasoning. `README.md` is kept: it is the front page. |
 | `rust/torch_c/pytests/` | The development gate — ~50 suites needing a vendored tree, a pinned spike venv, Android emulators and a Vulkan ICD. None of it runs from an installed wheel. |
 | `tools/docwatch/` | Checks markers in `docs/`, which is excluded. Keeping it would ship a checker with nothing to check. |
@@ -138,14 +138,14 @@ Both checks are nullified by `test_publish.py` rather than assumed: the leak
 test runs a copy of the script with the exclusion step replaced by `true` and
 requires it to go red, and the build test runs the same script against a
 fixture that builds and one that refuses, requiring different verdicts
-(CLAUDE.md §5.5).
+(AGENTS.md §17.5).
 
 ---
 
 ## 5. Procedure for a maintainer
 
 Publishing is a coordinating-session action taken with the user's approval, in
-the same class as the PyPI upload (CLAUDE.md §5.7). The script moves a local ref
+the same class as the PyPI upload (AGENTS.md §17.7). The script moves a local ref
 and **pushes nothing**.
 
 1. Land the release on `develop` and upload to PyPI first. `main` is a snapshot

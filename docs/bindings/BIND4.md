@@ -315,7 +315,7 @@ No kernel was added anywhere in this round. Golden's case count and ops-covered 
 identical to the round's starting point, which is the expected result for a round that is
 entirely `bootstrap.py` bindings, argument-form fixes, and one type-checker guard.
 
-### 6.1 Counted the way CLAUDE.md §5.3 asks
+### 6.1 Counted the way AGENTS.md §17.3 asks
 
 ```text
 functionality added     3 bindings (upsample_linear1d, fft_fftn, real/imag) that reach

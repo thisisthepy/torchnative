@@ -38,7 +38,7 @@ To achieve the Neural Engine offload for a model whose layers are under 4.7M wei
 
 (Note: Implementing full Llama Attention and RoPE in `coreml.py` requires tracing the PyTorch module rather than leaf-by-leaf substitution, which is a major architectural shift beyond this single step).
 
-## 5. Split the way CLAUDE.md §5.3 asks
+## 5. Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|

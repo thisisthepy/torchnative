@@ -371,7 +371,7 @@ between "right" and "completely wrong".
 Widening the last layer's initialisation spreads the output (`0.106, 0.018,
 0.099, 0.281, 0.495` instead of five numbers near 0.2) and the control moves to
 7.2e-02 — **six orders of magnitude above the agreement.** The test requires
-four. CLAUDE.md §5.5: this is the same shape as the `padding=1, stride=1`
+four. AGENTS.md §17.5: this is the same shape as the `padding=1, stride=1`
 convolution in docs/graph/NPU.md §4 whose fault injection was the identity.
 
 ### 3.6 The negative control for the driver selection itself
@@ -400,7 +400,7 @@ zero ops outside it. No entry was added to `_SIGNATURES`; no decomposition or
 refold rule changed; no Rust changed, so the golden harness is untouched at
 11385/11385, ops=300.
 
-Split the way CLAUDE.md §5.3 asks:
+Split the way AGENTS.md §17.3 asks:
 
 | | |
 |---|---|
@@ -584,7 +584,7 @@ goes red (peak 731 KB vs limit 240 KB), (2) make `_shim_tensor_bytes` return
 empty bytes and the dtype test fails with a reshape error, (3) remove the
 `finally: rmtree` and the tempdir test finds a leaked directory.
 
-### 7.4 Split the way CLAUDE.md §5.3 asks
+### 7.4 Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|
@@ -765,7 +765,7 @@ it said:
 Every observation in that paragraph was real. **The cause was not.** It was
 correlation dressed as a mechanism, and it was published because the controls
 that would have refuted it were never run. The rule it broke is
-CLAUDE.md §5.5's: a verification that cannot fail is not a verification, and
+AGENTS.md §17.5's: a verification that cannot fail is not a verification, and
 "it crashed inside `convert`, and `convert` was inside a forward" is a claim
 with no control attached. The negative control belonged *before* the sentence,
 not after the round.
@@ -984,7 +984,7 @@ is recorded so the next person does not have to re-derive it.
   clear a leaf's `_compiled`; §8.3's table above is the evidence that doing so
   is safe.
 
-### 8.5 Split the way CLAUDE.md §5.3 asks
+### 8.5 Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|
@@ -1199,7 +1199,7 @@ asking the question in the configuration that answers 25% of the time, and
 at `CPU_AND_NE`. The shape CoreML declines is still present as a named
 `unknown` row rather than as an absence.
 
-### 9.5 Split the way CLAUDE.md §5.3 asks
+### 9.5 Split the way AGENTS.md §17.3 asks
 
 | | |
 |---|---|

@@ -203,7 +203,7 @@ refusals, and it cost a test's first draft (§8 row 3).
 
 ## 5. What was checked by being switched off
 
-`CLAUDE.md` §5.5. Six nullifications, each a one-line change to a shipped source, rebuilt and
+`AGENTS.md` §17.5. Six nullifications, each a one-line change to a shipped source, rebuilt and
 re-run. **Every one turns something red, and they name different things.**
 
 | # | nullified | red | green (control) |
@@ -290,7 +290,7 @@ Both carried an instruction to invert, and both got a *stronger* assertion rathe
 
 ## 9. Reported by kind, not by count
 
-`CLAUDE.md` §5.3.
+`AGENTS.md` §17.3.
 
 | kind | what |
 |---|---|

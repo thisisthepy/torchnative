@@ -332,7 +332,7 @@ the table there is that measurement.
 
 ## 8. Cost, and the number is not usable
 
-`docs/training/BACKWARD5.md` §7 row 2 asked for the per-dispatch cost of an always-on recorder. **`CLAUDE.md`
+`docs/training/BACKWARD5.md` §7 row 2 asked for the per-dispatch cost of an always-on recorder. **`AGENTS.md`
 forbids reporting one from a loaded machine, and this machine was loaded: `uptime` reported load
 averages of 7.2 to 8.1 on 8 cores with five other agents running.** For scale, `aten.add.Tensor`
 measures 1364-1567 ns here and `docs/training/BACKWARD6.md` §6 measured the same op at 889 ns at load 2.0-3.2
@@ -411,7 +411,7 @@ it already computed, and the new branch is `on_graph && eager_enabled()`. A Smol
 
 ### 9.2 What was checked by being switched off
 
-`CLAUDE.md` §5.5: a verification that cannot fail is not a verification. Each of the four W8/W9
+`AGENTS.md` §17.5: a verification that cannot fail is not a verification. Each of the four W8/W9
 tests was re-run with `_eager_set_enabled(False)`, which nullifies the recorder without touching
 the tests, and **all four fail**:
 

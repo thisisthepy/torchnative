@@ -38,7 +38,7 @@ and nothing here claims it does.
 distinct prims keys and three, respectively) and neither moved. Their residue
 is outside NNAPI for reasons prims have nothing to do with: SDPA, `embedding`,
 `arange`, `index.Tensor`, `constant_pad_nd`. Counting the fold as progress on
-those two would be CLAUDE.md §5.3's "test count is not progress" wearing a
+those two would be AGENTS.md §17.3's "test count is not progress" wearing a
 different hat.
 
 **§12.5's warning held a third time.** `mobilenet_v2` under the union table is
@@ -185,7 +185,7 @@ not bit-exact against the unfused graph and this document does not say it is.
 ~1e-26, so *any* answer would clear an absolute threshold. The test therefore
 bounds it **relatively** (ratio ~1e-6), and the absolute proof of the fold is
 the first row, whose output is O(1). Writing the 2.1e-32 down as the headline
-would be CLAUDE.md §5.5's check that cannot fail.
+would be AGENTS.md §17.5's check that cannot fail.
 
 ## 4. The deliverable — a whole model inside NNAPI's set
 

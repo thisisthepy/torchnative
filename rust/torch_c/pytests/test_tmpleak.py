@@ -11,7 +11,7 @@ rendezvous files, and the `collect2-harness-probe-*` rank logs.
 
 That last one is not only a storage problem. Its rank logs are 1 MB runs of a
 single character, and when `TMPDIR` lives inside the checkout -- which the
-rule "nothing is created outside this repository" (CLAUDE.md §7) asks for --
+rule "nothing is created outside this repository" (AGENTS.md §19) asks for --
 `test_docrefs.py` walked into it. `test_docrefs.py` read every file in the
 tree, tracked or not, and its `DOCS_REF` pattern started with an unbounded
 `[A-Za-z0-9_.:-]*` prefix, which is quadratic on a 1 MB run with no `docs/`
@@ -32,7 +32,7 @@ What this file pins:
    is either handed to `atexit.register(<shutil>.rmtree, name, ...)` within
    three lines, or the next statement is a `try:` whose `finally` removes it.
 
-What this CANNOT find (CLAUDE.md §5.4):
+What this CANNOT find (AGENTS.md §17.4):
 
 * directories created by third parties on our behalf -- coremltools'
   compiled `.mlmodelc` bundles (the `tmp*` entries), upstream torch's

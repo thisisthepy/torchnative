@@ -574,7 +574,7 @@ def test_the_activations_and_repeat_and_advanced_indexing_agree():
 
 
 def test_the_three_data_dependent_ops_refuse_by_name_with_the_reason():
-    """CLAUDE.md's rule that a refusal names itself, applied to the ops that
+    """AGENTS.md's rule that a refusal names itself, applied to the ops that
     must NEVER get a meta kernel.
 
     `masked_select`, `_unique2` and `repeat_interleave.Tensor` have an output

@@ -278,7 +278,7 @@ Baseline on `develop`, measured **in a worktree**: suites 99/99, ok 1802,
 FAIL 0, SKIP 24, DOCWATCH 1373/1373. The main repository's baseline is ok 1801 /
 SKIP 25, and the one-test difference is `test_toolguard_wheel_staging` refusing
 to fake a wheel over a real cross-build artefact that only the main tree has —
-`CLAUDE.md` §2 records it, and the two are not compared directly.
+`AGENTS.md` §13.2 records it, and the two are not compared directly.
 
 ```
 run 1   GATE_EXIT=0   suites 100/100   ok=1811   FAIL=0   SKIP=24

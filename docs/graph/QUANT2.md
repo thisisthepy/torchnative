@@ -163,7 +163,7 @@ Q4K 보다 나쁜 이유입니다(8.5% 대 7.5%, `docs/graph/QUANT.md` §7) — 
 
 ### 2.4 축이 울 수 있는가 — 결함 6 개를 주입했다
 
-`CLAUDE.md` §5.5: **실패할 수 없는 검증은 검증이 아닙니다.** 골든 하네스가 `--self-test` 로
+`AGENTS.md` §17.5: **실패할 수 없는 검증은 검증이 아닙니다.** 골든 하네스가 `--self-test` 로
 비교기마다 결함을 주입하는 것과 같은 논거를, 이 축에도 적용했습니다
 (`test_the_quantisation_axis_fails_when_the_reference_is_perturbed`).
 
@@ -245,7 +245,7 @@ pub fn tensor(&self) -> PyResult<&Tensor> {
 뒷받침하고 있었습니다.
 
 **세 번째 팔이 왔고 컴파일러가 여섯 개를 전부 물었습니다.** 다섯은 다시 `False` 를 답했고,
-`is_quantized` 는 아니었습니다. `CLAUDE.md` §5.5 가 의심하라고 한 그 술어가 이제 반증 가능합니다.
+`is_quantized` 는 아니었습니다. `AGENTS.md` §17.5 가 의심하라고 한 그 술어가 이제 반증 가능합니다.
 
 딸려온 결정 세 개, 전부 측정 근거가 있습니다:
 
@@ -446,7 +446,7 @@ lhs.tensor()?.fast_to(acc).and_then(|l| l.contiguous())      // <- 여기
   요청 범위가 아닙니다.
 - 이 회차의 요청은 "양자화 경로를 세워라" 이고, **`aten.rs` 는 최소한만 건드리라**는 지시가
   있었습니다. `Where` 두 팔이 그 최소한입니다.
-- `CLAUDE.md` §5.7: 즉시 요청 범위를 넘는 것은 **말하고 기다립니다.**
+- `AGENTS.md` §17.7: 즉시 요청 범위를 넘는 것은 **말하고 기다립니다.**
 
     **다음 사람에게:** 이것이 §7 표의 1 번이고, 이 저장소에서 가장 큰 단일 성능 항목으로
     보입니다. 양자화보다 큽니다.
@@ -543,7 +543,7 @@ OMP_NUM_THREADS=1 $PY /Volumes/macMini/caches/quant-scratch/up_time.py     # PYT
 
 ## 10. 보고 분류
 
-`CLAUDE.md` §5.3.
+`AGENTS.md` §17.3.
 
 | 종류 | 무엇 |
 |---|---|

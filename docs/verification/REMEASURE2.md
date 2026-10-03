@@ -72,7 +72,7 @@ on this image. The blob executed and agreed to 1.2e-07 — on a CPU.
 
 So "has never met an NPU" **stands**, and had this round taken the brief's list on trust it would
 have replaced a true sentence with a false one, in a round whose entire purpose is to stop that.
-This is CLAUDE.md §5.4: the criterion I am handed decides the answer, and an agreeing result is
+This is AGENTS.md §17.4: the criterion I am handed decides the answer, and an agreeing result is
 the moment to look harder rather than less hard. The row now separates the two claims — the blob
 **executes** (understated before) and NNAPI **has not reached an NPU** (true before, true now) —
 because they were fused into one sentence and one of them moved.
@@ -139,13 +139,13 @@ document instead of copying it.
 
 **Nullification.** The count guard was shown to fail: setting the README back to 54 turned it red
 with `README.md says 54 host-readback ops; the runtime reports 85`, and the other three stayed
-green. A guard that cannot fail is not a guard (CLAUDE.md §5.5).
+green. A guard that cannot fail is not a guard (AGENTS.md §17.5).
 
 ---
 
 ## 6. Tally
 
-Counted as CLAUDE.md §5.3 asks — by kind, not by test count.
+Counted as AGENTS.md §17.3 asks — by kind, not by test count.
 
 - **Claims evaluated:** 24 rows and bullets.
 - **Stale:** **9** — eager training, `torch.distributed` (Roadmap *and* Status), NPU (Status), Metal

@@ -353,7 +353,7 @@ def test_the_overflow_cases_really_do_overflow():
     """Guards the test above against being quietly defanged.
 
     A previous round made two sentences the same length so the padding
-    disappeared and the masked path was never taken (CLAUDE.md section 5.5).
+    disappeared and the masked path was never taken (AGENTS.md section 17.5).
     The equivalent here is inputs that stop overflowing -- every assertion
     would stay green while the interesting half went untested. So: at least
     one element of at least one case per dtype must have a true product-sum
@@ -474,7 +474,7 @@ def test_the_mps_integer_refusal_is_not_served_by_a_readback():
     file was written against a tree that predated it: the round was scoped
     before the int8 / ``candle-metal-kernels`` work landed, and inherited that
     tree's ceiling along with its numbers. ``_C._metal_counters()`` is the
-    only instrument that can see a silent host fallback (CLAUDE.md section 2),
+    only instrument that can see a silent host fallback (AGENTS.md section 13.1),
     so the refusal is bracketed by it rather than argued for.
 
     **Bracket**: counters read immediately before and immediately after a

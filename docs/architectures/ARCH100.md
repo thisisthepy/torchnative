@@ -233,7 +233,7 @@ tiny random groupvit      ->  wall: ('missing_shim_name', 'TensorBase.scatter_')
 **The same wall, from a real checkpoint and from a 32-hidden-size random one.** That is the claim
 holding on a failure, which is the case the sweep actually depends on.
 
-**What this could not have caught**, since CLAUDE.md §5.4 asks for it: an operator that only a
+**What this could not have caught**, since AGENTS.md §17.4 asks for it: an operator that only a
 *trained* weight distribution reaches — a `torch.where` on a threshold that random weights never
 cross, or a data-dependent branch. Nothing in these three architectures had one, and three
 architectures are not a proof that none does. The failure mode is one-directional, though: it
@@ -271,7 +271,7 @@ The refusal names an operator that **is** implemented (`aten.adaptive_avg_pool2d
 `_aten_implemented()`), and the message matches no rule the classifier has, so it is reported as
 unclassified rather than filed under a kind. It is most likely a single-element `output_size`
 argument form, which would put it in §2.1 rather than in the 31 — but "most likely" is exactly
-what CLAUDE.md §5.4 says not to write down, so it is counted here instead, and the ranking in §2
+what AGENTS.md §17.4 says not to write down, so it is counted here instead, and the ranking in §2
 does not include it either way.
 
 An earlier run of this sweep had **17** unclassified. Fifteen of them became classifiable once the

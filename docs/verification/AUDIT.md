@@ -280,7 +280,7 @@ exactly the annotation pattern this audit is supposed to add, already present.
   "after" to 2-3 significant figures (i.e. the document already cross-checks itself round to
   round). Not independently re-measured — reproducing a performance curve is outside what a
   documentation audit can check against the tree, and re-running would risk exactly the
-  "measurement contaminated by a concurrent agent" failure mode CLAUDE.md §"측정 작업은 단독으로
+  "measurement contaminated by a concurrent agent" failure mode AGENTS.md §16 "측정 작업은 단독으로
   돌린다" warns about, which this session is not isolated for (KERNELS26.md/ARCH26.md work is
   running concurrently). Spot-checked only the two claims above because they are "X now works"
   assertions checkable by existence rather than by re-measuring a curve.
@@ -845,7 +845,7 @@ a kernel as missing, in the "why we didn't reuse an upstream name" table.
 - Everything else (§0-§11's bit-exactness tables, §12's 20x cost measurement and the switch
   design): round-scoped performance/correctness measurements, not re-measured — same reasoning
   applied to SEQLEN.md/DTYPE_PERF.md in round 1 (re-measuring risks contamination from concurrent
-  agents per CLAUDE.md's own rule, and these are explicitly dated "측정일 2026-08-28" transcripts).
+  agents per AGENTS.md's own rule, and these are explicitly dated "측정일 2026-08-28" transcripts).
 - **Fixed: one** — smaller in scope than the OVERLOAD.md/TENSORBASE.md findings (this one didn't
   block a whole capability, just mis-stated a design-decision rationale), but notable as the only
   one of the three where the staleness predates the document's own writing rather than arriving
@@ -1133,7 +1133,7 @@ to host, 4 at 1 ULP). Mostly a measurement transcript; one refusal-shaped claim 
   `_multiprocessing`/`_posixshmem` stub decision, explicitly left undecided by the document's own
   account — "이 문서는 셋 중 무엇도 고르지 않았다"): not re-verified — §6 is an open decision, not
   a falsifiable claim, and §1-§5 are device-measurement transcripts (out of scope to re-run per
-  CLAUDE.md's single-device-at-a-time constraint and this round's time budget).
+  AGENTS.md's single-device-at-a-time constraint and this round's time budget).
 - **Fixed: one**, matching the SAMPLING.md pattern exactly (a Python-surface overload-table gap
   that got filled by unrelated later work).
 
@@ -1276,7 +1276,7 @@ investigation. Unusually — and by its own account, deliberately — self-super
 an explicit reading-order instruction ("Read §8 before §7, and §7 before §2d/§3c/§5. §8 supersedes
 §7 where they differ...") and even documents its own past mistake in a table at the end (§8.3's
 first draft guessed "blocked at dependency resolution" without running the build, and the document
-flags this itself as "exactly the CLAUDE.md §5.5 mistake this document otherwise tries to avoid").
+flags this itself as "exactly the AGENTS.md §17.5 mistake this document otherwise tries to avoid").
 This is the most self-critical document found in either round of this audit.
 
 - The blocked/not-attempted items (candle WASM SIMD lacking `CurrentCpuF16`/`CurrentCpuBF16` for
@@ -1970,7 +1970,7 @@ in round 1's `docs/design/DESIGN.md` audit and round 2's `docs/graph/QUANT2.md` 
 landed as `2e00ec3`), but this document itself, the source of that fix, had never been read by this
 audit until now. §7's "판단이 필요한 것" (judgment needed) section frames the whole change as
 **uncommitted**, pending a coordinating-session decision between four options — exactly the
-"decision not yet shown to the user" shape `CLAUDE.md` §5.7 warns about, so worth checking whether
+"decision not yet shown to the user" shape `AGENTS.md` §17.7 warns about, so worth checking whether
 that framing is still accurate.
 
 - **Claim (§7's opening paragraph):** "비트가 바뀌므로 여기서 임의로 고르지 않았습니다 ...
@@ -2018,7 +2018,7 @@ that framing is still accurate.
 396 lines, the round that overturned `docs/models/GENERATE.md` §6.2's own root-cause diagnosis (measured
 "GEMM reassociation" and proved it wrong by disproof, then traced the real cause to `aten.add.
 Tensor` truncating instead of round-to-nearest-even for bf16) — an explicit, well-executed instance
-of the house style CLAUDE.md §5.5 asks for ("a check that cannot fail is not a check": the bug
+of the house style AGENTS.md §17.5 asks for ("a check that cannot fail is not a check": the bug
 survived because golden's `add` cases were all ≤24 elements and the bug only lives in the ≥32-element
 vectorized path, plus a tolerance that passed 1-ulp errors). §6.3's "이번 회차가 넣지 않은 것" (not
 included this round) table is the target shape this round prioritises.
@@ -2229,7 +2229,7 @@ kind of "next step, not done here" claim this round prioritises.
   scalar vs. vectorized `exp`), §6 (the unconfirmed-items table), §7 (the MLX GPU-vs-CPU comparison
   and its crossover-point findings): round-scoped measurement narrative with its own honest
   limitations already stated, not re-verified or re-measured — re-measuring performance is out of
-  scope for a documentation audit and risks exactly the contamination CLAUDE.md's own rule warns
+  scope for a documentation audit and risks exactly the contamination AGENTS.md's own rule warns
   against.
 - **Fixed: one** — a forward pointer rather than a correction to a false claim (the document never
   claimed Android had a solution; it correctly named the gap as open, and it still is, just not
@@ -2527,7 +2527,7 @@ edits, but not for reading — picked them up.
 identical to CPU on an emulator, `ash` recommended) that explicitly declines to make one decision —
 whether Apple GPU support should come from candle's existing `metal` feature (favoring `ash` for
 Android alone) or from `wgpu` (one WGSL kernel covering all three targets) — and defers it as
-CLAUDE.md §5.7 territory (a cross-target kernel-ownership decision beyond this task's scope). §5.4's
+AGENTS.md §17.7 territory (a cross-target kernel-ownership decision beyond this task's scope). §5.4's
 "아직 하지 않은 것" (not yet done) list is the checkable "next step" shape this round prioritises.
 
 - **Claim (§5.4):** no Vulkan dependency has been added to `rust/torch_c`; `"vulkan"` is only a

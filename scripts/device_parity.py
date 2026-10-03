@@ -505,7 +505,7 @@ def _(a, b):
 
 # --- expansion: the gemm threading threshold (25a79df) ------------------------
 #
-# Correctness only -- CLAUDE.md says not to measure performance on a shared,
+# Correctness only -- AGENTS.md says not to measure performance on a shared,
 # loaded emulator, and this script never has. 25a79df raised the threading
 # crossover from 589,824 to 4,000,000 total multiply-adds; n=128 (2,097,152)
 # sits between the two, so a matmul this size took the threaded path before
