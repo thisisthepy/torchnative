@@ -64,7 +64,7 @@ Evidence, in order of how conclusive it is:
 - `vtool -show-build`: `platform IOSSIMULATOR`, `minos 14.0`, `sdk 18.0`.
   (`CFLAGS` says `-mios-version-min=12.0` and `IPHONEOS_DEPLOYMENT_TARGET` in
   sysconfig is `12.0`; the linker floors arm64-simulator at 14.0. Both numbers
-  are true of different things, and `tools/wheel/build.py` reads the sysconfig
+  are true of different things, and `scripts/wheel/build.py` reads the sysconfig
   one for the wheel tag.)
 - Single-slice `arm64` Mach-O, `Python.framework/Python`
   sha256 `52a87e2c8575312f2ce048f79d4e83b329748e34693c6988f6ffe1a849ad5761`.
@@ -89,7 +89,7 @@ not the recipe: the OpenSSL/xz/bzip2/libffi versions are not recorded anywhere
 `clang-1600.0.26.3` / SDK 18.0. What is reproducible is a functionally
 equivalent distribution, which is what the verification needs.
 
-**What reads it.** `tools/wheel/verify_ios_sim.py` — and it is the most
+**What reads it.** `scripts/wheel/verify_ios_sim.py` — and it is the most
 layout-sensitive consumer in the repository. It `copytree`s the whole
 directory to a scratch prefix and then requires, by exact path:
 
@@ -104,7 +104,7 @@ A same-project rebuild is fine. A *different* project's distribution would
 break it: `Python-Apple-support` ships an `.xcframework` (no top-level
 `Python.framework`, no `bin/` shims), so both the `-F` and the compiler
 invocation fail; `python-build-standalone` publishes no iOS target at all.
-`tools/wheel/verify_cross.py` additionally globs
+`scripts/wheel/verify_cross.py` additionally globs
 `<root>/<subdir>/Python.framework/Python` for the framework identity check.
 
 **What the iOS CI job would then need.** With the provenance closed, the
@@ -163,13 +163,13 @@ symlink giving `-lpython3.13` something to resolve against; `docs/design/ABI3.md
 line 261 records the aarch64-apple-ios abi3 build succeeding with
 `linkstub.disabled` passed as `-L`. A fresh rebuild will not have it.
 
-**What reads it.** `tools/wheel/verify_ios_device.py` (via
+**What reads it.** `scripts/wheel/verify_ios_device.py` (via
 `TORCHNATIVE_TARGET_PYTHON`, then `/arm64-iphoneos`), which resolves
 `@rpath/Python.framework/Python` for the 118 Python symbols an on-device
 `_C.abi3.so` binds, and reports "no device Python.framework on disk" as a
 *blind* verdict rather than a pass when the directory is absent — so losing
 this directory degrades the check honestly instead of silently.
-`tools/wheel/verify_cross.py` uses the same framework path.
+`scripts/wheel/verify_cross.py` uses the same framework path.
 
 ---
 
@@ -209,10 +209,10 @@ The archive unpacks to a `python/` root; the directory on disk is that root's
 contents renamed to the triple. That renaming is local convention, not
 upstream layout.
 
-**What reads it.** `tools/wheel/verify_linux.py` — `LINUX_PYTHON.glob(
+**What reads it.** `scripts/wheel/verify_linux.py` — `LINUX_PYTHON.glob(
 "lib/libpython3.*.so.*")` for the export set the wheel's undefined symbols are
 unioned against, plus `lib/python3.13/lib-dynload/_dbm…so` and `_tkinter…so`
-and `lib/libtcl9*.so` as its positive controls. `tools/wheel/verify_cross.py`
+and `lib/libtcl9*.so` as its positive controls. `scripts/wheel/verify_cross.py`
 globs `<triple>/lib/libpython3.*.so`. A same-project rebuild is safe. A
 distribution without `lib-dynload/_dbm` or without Tcl/Tk would lose the
 controls (the script's own §"positive controls" reasoning), and one that ships
@@ -244,11 +244,11 @@ python.org installer does not ship. Bundled `pip` is 26.2.1, matching §3.
 Verified the same way: `_download/windows.tar.gz` hashes to that value, and
 that value appears against that filename in the 20260825 `SHA256SUMS`.
 
-**What reads it.** `tools/wheel/verify_windows.py` reads exports out of
+**What reads it.** `scripts/wheel/verify_windows.py` reads exports out of
 `python3.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` (its `RESOLVABLE`
 tuple), and deliberately refuses to resolve against `python313.dll` so an
 abi3 extension cannot be let off for binding the version-specific DLL.
-`tools/wheel/verify_cross.py` globs `python3??.dll` for the interpreter's
+`scripts/wheel/verify_cross.py` globs `python3??.dll` for the interpreter's
 dynload table. **This is the layout-sensitive part**: the three names in
 `RESOLVABLE` are hardcoded, so a distribution that omits the vcruntime DLLs
 (they are redistributables, and some layouts assume a system install) would
@@ -303,18 +303,18 @@ was ordinary, so the prior should be "they mattered somewhat".
 
 **What reads it.**
 
-- `scripts/device_android.sh` — `TARGET_PYTHON` defaults to
+- `scripts/devices/device_android.sh` — `TARGET_PYTHON` defaults to
   `…/aarch64-linux-android/prefix`.
-- `tools/wheel/verify_android.py` — pushes exactly three paths to the device:
+- `scripts/wheel/verify_android.py` — pushes exactly three paths to the device:
   `prefix/bin/python3.13`, `prefix/lib/libpython3.13.so`, and the whole
   `prefix/lib/python3.13` stdlib, then runs
   `LD_LIBRARY_PATH=… PYTHONHOME=… ./bin/python3.13`. This is the one place a
   target distribution is *executed* rather than inspected, so it is the most
   sensitive to a swap: a static-only or `bin/`-less distribution has nothing
   to push, and a different API level changes what the device will load.
-- `tools/wheel/verify_cross.py` globs
+- `scripts/wheel/verify_cross.py` globs
   `aarch64-linux-android/prefix/lib/libpython3.*.so`.
-- `tools/wheel/build.py` reads `ANDROID_API_LEVEL` out of the sysconfig for
+- `scripts/wheel/build.py` reads `ANDROID_API_LEVEL` out of the sysconfig for
   the wheel's platform tag, deliberately rather than hardcoding it — so
   replacing this distribution correctly changes the tag, by design.
 

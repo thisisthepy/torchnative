@@ -1,0 +1,415 @@
+#!/bin/sh
+# Build the host artefact, rename it to `_C.abi3.so`, and run the smoke tests
+# against it. Renaming is not incidental: cargo emits `lib_C.dylib`, and Python
+# only loads a file whose name ends in one of importlib's extension suffixes
+# (RUST_CROSSBUILD.md §2).
+#
+# The suffix is `.abi3.so`, not a bare `.so`: ABI3.md §7 item 2. An untagged
+# `_C.so` loads into *any* interpreter, which is precisely the silent failure
+# the abi3 build exists to remove -- so the filename should say what it is.
+set -eu
+
+tests_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH='' cd -- "$tests_dir/.." && pwd)
+crate_dir=$repo_root/torchnative/rust/torch_c
+target_dir=${CARGO_TARGET_DIR:-$crate_dir/target}
+# Per-checkout, not per-machine. The default used to be a single
+# $TMPDIR/torch-c-stage shared by every worktree on the box, and this project
+# runs several concurrently: two suites overlapping would stage into the same
+# path and each would validate the other's artefact. It was caught by the
+# documentation checker reporting ops=168 while compare.py in the same tree
+# reported 166 -- a disagreement only possible if the two were reading
+# different binaries. That is the false-green shape, and a suite that can
+# silently check somebody else's build is worse than one that refuses.
+#
+# The hash is of the checkout path, so each worktree gets its own and reruns
+# in the same worktree still reuse theirs.
+stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage-$(printf '%s' "$repo_root" | cksum | cut -d' ' -f1)}
+
+# Fail closed on the interpreter *before* building or running anything.
+#
+# `${PYTHON:-python3}` below picks whatever `python3` resolves to on $PATH if
+# PYTHON is unset, and on this machine that is a bare framework interpreter
+# with neither `numpy` nor `typing_extensions` -- running the suite against it
+# produced 473 FAIL out of 1311 with nothing actually broken. The same trap
+# in the other direction is silent: an interpreter that imports everything but
+# is the wrong build, or a partial environment where only some suites fail and
+# get misread as real regressions. Refusing before any suite runs turns both
+# into one loud, named error instead of a pile of misleading FAILs.
+#
+# The package list is not guessed. It is every third-party (non-stdlib,
+# non-local) top-level import actually reached by the suites under the *same*
+# interpreter that runs them, derived by inspecting tests/*.py:
+#
+#   grep -hoE '^(import [A-Za-z0-9_.]+|from [A-Za-z0-9_.]+ import)' \
+#       tests/test_*.py tests/test_shim.py \
+#       | sed -E 's/^(import|from) //; s/ import$//; s/\..*$//' | sort -u
+#
+# and then reading each non-stdlib hit in context to exclude the ones that are
+# not actually required of $PYTHON:
+#   - `_C`, `test_shim`, `agree_sweep`, `ggml_ref`, `test_collect2`: local
+#     files on PYTHONPATH, not packages.
+#   - `torchnative`: this repo's own package.
+#   - `executorch` (test_qnn.py): imported only inside a script handed to a
+#     *separate* interpreter, $TORCHNATIVE_QNN_PYTHON, by design (ExecuTorch
+#     pulls its own torch and must not replace the oracle build).
+#   - `vsbig` (test_voice4.py): imported only inside a subprocess script that
+#     runs when TORCH_C_VOICE4_ASSETS is set; the test skips by name otherwise.
+#   - `build` (test_wheelmatrix.py, `import build as _build`): shadowed by
+#     `scripts/wheel/build.py` via an explicit `sys.path.insert(0, ...)` right
+#     above the import -- it is this repo's script, not the PyPI `build`
+#     package.
+#   - `torch`, `torchgen`, `functorch`: this is the line the first version of
+#     this guard got wrong. `torch` LOOKS like a third-party import every
+#     suite needs, but it is not one thing -- it is either the oracle
+#     (upstream, pip-installed, importable stand-alone) or *this repo's own
+#     build product* (the vendored tree at torchnative/python/torch, laid
+#     down by scripts/vendor/vendor_torch.sh and gitignored, absent in a fresh
+#     worktree, on PYTHONPATH only because run.sh puts it there for the
+#     capture/checkpoint/device/meta subprocess tests -- see the vendor_shim
+#     staleness check above). A preflight that requires `import torch` to
+#     succeed under a bare interpreter answers a question about the oracle
+#     half by accident and is silent about the vendored half, and either way
+#     it is checking a build *output* before the build has run -- the same
+#     inversion the old manual publishing script's PUBLISH_PYTHON guard had
+#     (main is now published only by release-sync,
+#     .github/workflows/release-sync.yml), with "vendor" in place of "install". Its absence in a fresh
+#     checkout is normal pre-build state, not a wrong interpreter, so it does
+#     not belong here.
+# What is left -- numpy, safetensors, transformers, typing_extensions -- is
+# imported either at module scope or inside a script the suite hands to
+# `sys.executable` (i.e. the *same* interpreter), unconditionally or on a
+# path the gate always takes, and every one of the four is a package this
+# repository consumes from the environment rather than one it produces, so
+# all four are required of $PYTHON. `typing_extensions` is not imported by
+# name anywhere in tests/ -- it is `transformers`' and (the oracle) torch's
+# own hard runtime dependency (torch's METADATA lists `typing-extensions>=
+# 4.10.0`; `import torch` with it hidden fails with exactly ModuleNotFoundError:
+# typing_extensions, confirmed by hand), so a $PYTHON that has transformers
+# but not typing_extensions still fails deep inside a suite's own `import
+# transformers` in a way this preflight would otherwise miss.
+#
+# `env -u PYTHONPATH` on the check itself: a PYTHONPATH inherited from
+# whoever invoked this script (a caller's shell, a wrapper, a test harness
+# passing one through to isolate itself) can shadow or add to what the bare
+# interpreter sees, making the preflight's verdict depend on the caller
+# rather than on the interpreter named by $PYTHON. The suites' own PYTHONPATH
+# is set explicitly, below, when they actually run; the preflight should see
+# what $PYTHON gets on its own, not what happened to be lying around.
+_run_py=${PYTHON:-python3}
+_run_py_missing=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' 2>&1 || true
+import importlib
+missing = []
+for mod in ("numpy", "safetensors", "transformers", "typing_extensions"):
+    try:
+        importlib.import_module(mod)
+    except ImportError as exc:
+        missing.append(mod + " (" + str(exc) + ")")
+if missing:
+    print("\n".join(missing))
+PYEOF
+)
+if [ -n "$_run_py_missing" ]; then
+    cat >&2 <<EOF
+run.sh: refusing to start -- $_run_py cannot import what the suites need.
+
+Interpreter: $_run_py
+Could not import:
+$_run_py_missing
+
+This is not a test failure; it means the wrong interpreter is about to run
+the gate. Nothing has been built or run yet.
+
+Fix: set PYTHON to this repo's known-good interpreter and re-run:
+    PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python $0
+EOF
+    exit 1
+fi
+
+# `cd` rather than `--manifest-path`: cargo discovers `.cargo/config.toml` from
+# the *working directory*, not from the manifest. Building this crate from
+# elsewhere silently drops `-undefined dynamic_lookup` and the link fails with
+# a wall of undefined `_Py*` symbols. Same trap as the hardcoded iOS `-F` path,
+# from the other side -- see build.rs.
+cd -- "$crate_dir"
+cargo build --release
+
+# One gate per stage, and it says so rather than racing.
+#
+# `$stage` is per-checkout (above), which stops two *worktrees* from validating
+# each other's artefact -- but two runs in the SAME worktree still share it, and
+# on 2026-09-17 that produced the defect this project keeps finding, in the
+# instrument: the second run's `rm -rf "$suite_logs"` deleted the first run's
+# logs while it was still writing them. One run died on `cat: ... No such file
+# or directory` at 944 ok / 0 FAIL -- a number shaped like a partial pass --
+# and three others dropped test_bf16ane.py's whole section, 21 tests, from the
+# aggregate **and still exited 0** (1669 reported against 1690 in the logs).
+#
+# `mkdir` is the lock because it is atomic on every filesystem this runs on:
+# it either creates the directory or fails, with no window between the test and
+# the take. The holder's pid goes inside so the refusal can name it, and so a
+# lock left behind by a crashed run can be distinguished from a live one --
+# refusing is honest, but refusing forever because a run was killed is just a
+# wedged checkout. The trap releases it on any exit, including the `exec` at
+# the end of this script (which replaces this process and would otherwise
+# leave the lock held forever -- hence the explicit release before it).
+stage_lock="$stage/lock"
+mkdir -p "$stage"
+if ! mkdir "$stage_lock" 2>/dev/null; then
+    holder=$(cat "$stage_lock/pid" 2>/dev/null || echo "")
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        cat >&2 <<EOF
+run.sh: refusing to run -- another gate already holds this stage.
+
+Stage:  $stage
+Holder: pid $holder (still running)
+
+Two gates in one stage share \$stage/_C.abi3.so and the suite logs, and the
+second one destroys the first one's: that is how a run came out 944 ok / 0 FAIL
+mid-way, and how three others silently dropped a whole suite from the aggregate
+while exiting 0. Refusing is the honest outcome; racing is not.
+
+Fix: wait for pid $holder to finish, or run with a stage of your own:
+    TORCH_C_STAGE=\$TMPDIR/my-gate $0
+EOF
+        exit 1
+    fi
+    # Nobody is behind it. Take it over rather than wedging the checkout.
+    echo "run.sh: taking over a stale stage lock left by pid ${holder:-unknown}" >&2
+    rm -rf "$stage_lock"
+    mkdir "$stage_lock" || { echo "run.sh: cannot take $stage_lock" >&2; exit 1; }
+fi
+echo $$ > "$stage_lock/pid"
+trap 'rm -rf "$stage_lock"' EXIT INT TERM HUP
+
+rm -f "$stage/_C.so"
+if [ -f "$target_dir/release/lib_C.dylib" ]; then
+    cp "$target_dir/release/lib_C.dylib" "$stage/_C.abi3.so"
+elif [ -f "$target_dir/release/lib_C.so" ]; then
+    cp "$target_dir/release/lib_C.so" "$stage/_C.abi3.so"
+else
+    echo "no host artefact under $target_dir/release" >&2
+    exit 1
+fi
+
+# Four tests in test_shim.py (capture/checkpoint/device/meta) do not import
+# the artefact staged above -- they shell out to a subprocess that puts the
+# vendored tree on PYTHONPATH, and that subprocess loads
+# `$vendor_dir/torch/_C.abi3.so`. `scripts/vendor/install_shim.sh` is the only thing
+# that writes that file; this script never has. So a source change that only
+# this script rebuilds does not reach those four tests -- they would keep
+# testing whatever `install_shim.sh` last installed, silently, with a green
+# result (docs/graph/CAPTURE.md §8).
+#
+# Refuse by name rather than install it here: installing would make this
+# script a build step for a *different* artefact (the one that ships inside
+# the vendored tree) with its own failure modes (torch/bin/torch_shm_manager,
+# TORCHNATIVE_VENDOR_DIR) that have nothing to do with "run the smoke tests".
+# Comparing bytes rather than mtimes because this crate rebuilds
+# byte-identical output when nothing relevant changed (measured: a `touch` +
+# rebuild of dtype.rs reproduced the previous dylib exactly on this
+# toolchain), so a byte compare does not nag on a no-op rebuild the way an
+# mtime check would.
+#
+# `cmp` distinguishes three outcomes and this has to distinguish them too: 0 is
+# same, 1 is differ, anything above 1 is "the comparison itself failed". Reading
+# every non-zero as "stale" conflates the check with its own failure -- which
+# happened: under memory pressure from a concurrent build the kernel killed
+# `cmp` with SIGKILL, the guard read exit 137 as a difference, and the suite
+# refused with a message telling the reader to reinstall a shim that was already
+# current. That is the repeated defect of this repository wearing a new hat, so
+# the two are separated and only one of them is a staleness claim.
+vendor_dir=${TORCHNATIVE_VENDOR_DIR:-$repo_root/torchnative/python}
+vendor_shim="$vendor_dir/torch/_C.abi3.so"
+if [ -f "$vendor_shim" ]; then
+    cmp -s "$stage/_C.abi3.so" "$vendor_shim" && cmp_status=0 || cmp_status=$?
+else
+    cmp_status=0
+fi
+if [ "$cmp_status" -gt 1 ]; then
+    cat >&2 <<EOF
+run.sh: refusing to run -- could not compare against $vendor_shim.
+
+\`cmp\` exited $cmp_status, which is neither "same" (0) nor "different" (1), so
+whether the vendored shim is current is unknown. This is not a staleness
+report. A SIGKILL here has meant memory pressure from a concurrent build;
+re-running once the machine is quieter has been enough.
+EOF
+    exit 1
+fi
+if [ "$cmp_status" -eq 1 ]; then
+    cat >&2 <<EOF
+run.sh: refusing to run -- $vendor_shim is stale.
+
+It does not match what was just built from torchnative/rust/torch_c/src. The capture,
+checkpoint, device, and meta tests read that file (not this script's
+staged artefact) through a vendored-tree subprocess, so running them now
+would silently re-test the old build instead of catching a change here.
+
+Fix: run scripts/vendor/install_shim.sh, then re-run this script.
+EOF
+    exit 1
+fi
+
+# macOS SIP strips every `DYLD_*` variable from the environment when it execs
+# a protected binary, and `/bin/sh` is one. So `DYLD_LIBRARY_PATH=... sh run.sh`
+# arrives here with that variable already gone -- it was in the caller's shell
+# and is not in this one. Nothing in this script can restore it, because
+# nothing in this script ever saw it.
+#
+# docs/devices/VULKAN3.md §6.1 is what that cost: the four Vulkan tests skipped saying
+# "no vulkan" while the loader was pointed at correctly, and the person who had
+# just supplied the loader had no way to tell. A skip that gives a false reason
+# is worse than a failure, because it is counted as a pass.
+#
+# `TORCH_C_DYLD_LIBRARY_PATH` is the way in. It is not a `DYLD_*` name, so it
+# survives the exec, and it is re-exported below for the two Python
+# invocations that need it -- exporting it here rather than at the top so it is
+# obvious that its only purpose is to reach the loader.
+if [ -n "${TORCH_C_DYLD_LIBRARY_PATH:-}" ]; then
+    DYLD_LIBRARY_PATH="$TORCH_C_DYLD_LIBRARY_PATH${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    export DYLD_LIBRARY_PATH
+fi
+
+# The trap leaves no trace of itself -- a stripped variable is simply absent --
+# but it does leave a signature, and this is it. `VK_DRIVER_FILES` is not a
+# `DYLD_*` name, so SIP does not strip it; a caller who set one and not the
+# other set both and lost one on the way in. Said here as well as in the skip
+# line, because this is where a reader is looking when they wonder why.
+if [ -n "${VK_DRIVER_FILES:-}" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ]; then
+    cat >&2 <<EOF
+run.sh: VK_DRIVER_FILES is set but DYLD_LIBRARY_PATH is not.
+
+macOS SIP strips DYLD_* when exec'ing /bin/sh, so if you passed
+DYLD_LIBRARY_PATH on this command line it did not reach this script and will
+not reach Python. The Vulkan tests will skip -- truthfully, but for a reason
+that is about this process and not about your machine.
+
+Pass it as TORCH_C_DYLD_LIBRARY_PATH instead; this script re-exports it.
+(docs/devices/VULKAN3.md §6.1)
+EOF
+fi
+
+# The crate's own unit tests, before the Python suite.
+#
+# There are 30 of them and **nothing ran them until docs/training/TRAIN2.md noticed**.
+# One had been red for an unknown length of time -- `RULE_OPS` was not sorted,
+# and its own `assert_eq!(sorted, RULE_OPS)` said so to nobody. A test that
+# nothing invokes is not a gate, which is the same finding this repository
+# already recorded for the golden self-test and the documentation checker, both
+# of which are invoked from this script for exactly that reason.
+#
+# They cost about a second: the crate is already built by the line above, and
+# these are pure-Rust assertions over constant tables with no Python involved.
+cargo test --release --quiet || exit $?
+
+# Every `test_*.py` in `tests/`, not just `test_shim.py`.
+#
+# One file was the whole suite for a long time, and the cost showed up in
+# merges rather than in tests: several rounds land in parallel, all of them
+# append before `if __name__ == "__main__"`, and git resolves that as one
+# conflict hunk spanning thousands of lines. Reconstructing it by hand has
+# twice silently dropped tests that the branch had added -- once seven of
+# them, caught only because DOCWATCH markers named them.
+#
+# Splitting by topic makes those merges disjoint. The files share helpers by
+# importing `test_shim`, which is why `tests/` is on PYTHONPATH; each one's
+# `__main__` guard keeps that import from running anything.
+# `TORCHNATIVE_VULKAN_DYLD`: an opt-in way to let the vulkan tests actually run.
+#
+# docs/devices/VULKAN3.md §6.1 recorded the trap and left it: macOS SIP **strips
+# `DYLD_*` from the environment when a protected binary is exec'd**, and
+# `/bin/sh` is one. So `DYLD_LIBRARY_PATH=... sh run.sh` sets a variable that
+# this script can still see and the interpreter it launches cannot -- the
+# vulkan tests skip saying "no loader", on a machine where the caller supplied
+# one. That is the closest thing to a false green this device has produced.
+#
+# Re-exporting it here, immediately before the interpreter is launched, is the
+# fix that document proposed. Under a *different* name, so that a caller who
+# exports `DYLD_LIBRARY_PATH` and watches it vanish is not told twice that it
+# worked; and opt-in, so a run that does not set it behaves exactly as before
+# and the tests skip by name as they always did.
+vk_env=""
+if [ -n "${TORCHNATIVE_VULKAN_DYLD:-}" ]; then
+    vk_env="DYLD_LIBRARY_PATH=$TORCHNATIVE_VULKAN_DYLD"
+    echo "vulkan: re-exporting DYLD_LIBRARY_PATH=$TORCHNATIVE_VULKAN_DYLD (SIP strips it through /bin/sh)"
+fi
+
+# Each suite's output is also kept, so the Vulkan tally below can be read from
+# it. docs/devices/VULKAN5.md §2 is why: on a machine with no Vulkan loader
+# every Vulkan test printed "(skipped ...)" and then `ok`, and this gate came
+# out 0 FAIL having executed none of them. Suites now print `SKIP` for those
+# and a `VULKAN:` tally line; `vulkan_coverage.py` adds the tallies up and says
+# UNVERIFIED when nothing ran. With TORCHNATIVE_REQUIRE_VULKAN=1 a skip fails
+# the gate -- the only form of this run that is evidence for a Vulkan kernel.
+#
+# The loop itself now lives in `suite_ledger.py`, and the logs go in a
+# PID-suffixed directory rather than one shared `$stage/suite-logs` that the
+# next run began by deleting. The shell version could not notice what it lost:
+# `cat` was the only reader, a missing section was simply absent, and no count
+# was ever compared with anything. The ledger accounts for every `test_*.py`
+# file, re-reads each log from disk after the loop, and fails naming the suite
+# if what it printed and what is on disk disagree -- see its docstring, and
+# `test_gatelock.py` for the collision staged deliberately.
+#
+# Finished runs' directories are left behind on purpose (~390 KB each,
+# in $TMPDIR, which the OS purges). Reaping them would mean deleting a
+# directory this run does not own, which is the move that caused the
+# defect above; the storage is not worth reintroducing it.
+suite_failed=0
+suite_logs="$stage/suite-logs.$$"
+rm -rf "$suite_logs"
+mkdir -p "$suite_logs"
+"${PYTHON:-python3}" "$tests_dir/suite_ledger.py" \
+    --logs "$suite_logs" --pytests "$tests_dir" \
+    --python "${PYTHON:-python3}" \
+    --suite-env "PYTHONPATH=$stage:$tests_dir" \
+    ${vk_env:+--suite-env "$vk_env"} \
+    -- "$tests_dir"/test_*.py || suite_failed=1
+"${PYTHON:-python3}" "$tests_dir/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
+[ "$suite_failed" -eq 0 ] || exit 1
+
+# The golden harness has its own self-test -- it injects a fault shaped like a
+# plausible misimplementation at each comparator and checks the comparator
+# rejects it. Nothing invoked it, so the gate existed without ever being pulled;
+# it caught that the previous injection reached exactly one case out of 1781.
+# It builds nothing, so it costs a few seconds here.
+#
+# TORCH_C_ARTEFACT points it at the artefact this script just staged, since
+# tests/golden/loader.py otherwise falls back to a fixed cache path that may
+# hold an entirely different build.
+TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
+    "${PYTHON:-python3}" "$repo_root/tests/golden/compare.py" --self-test || exit $?
+
+# The documentation checker, for the same reason the golden self-test is here:
+# a gate nobody pulls is not a gate. An audit found false claims spread across
+# six of eleven load-bearing documents, and every one arrived the same way --
+# a later commit closed a gap and nobody returned to the document that had
+# named it. The markers assert only what has a single ground truth (an op in
+# `_aten_implemented()`, a key in a table, a count read from a suite's own
+# summary line), so this cannot cry wolf on prose; docs/verification/DOCWATCH.md says what
+# it structurally cannot see.
+#
+# README.md is passed explicitly. With no arguments the checker scans `docs/*.md`
+# only -- so the fifteen markers on the README, which hold down every number a
+# reader of the front page sees, were outside the gate while every number in
+# `docs/` was inside it. The claims most likely to be read were the ones least
+# likely to be checked.
+# `find`, not `"$repo_root"/docs/*.md`. A shell glob does not recurse, and the
+# documents now live in `docs/<folder>/` (docs/README.md is the index). With the
+# glob, the moment a document moved into a subfolder it left DOCWATCH silently:
+# the gate stays green and the marker count gets *smaller*, which is the
+# "verification that cannot fail" shape AGENTS.md §17.5 records. The count is the
+# proof -- it went 1070 -> 1070 across the move, not down.
+# `test_docrefs.py` fails if this glob comes back, here or in check_docs.py.
+doc_files=$(find "$repo_root/docs" -name '*.md' | sort)
+# `$vk_env` too: the `vulkan_tests_ok` count re-runs test_vulkan4.py, and
+# without it a machine that selected its loader through TORCHNATIVE_VULKAN_DYLD
+# would report that marker SKIPPED while the suites above had run on the GPU.
+# `exec` replaces this process, so the EXIT trap never fires: release the lock
+# by hand here or every run would leave its stage locked for the next one.
+rm -rf "$stage_lock"
+trap - EXIT INT TERM HUP
+exec env $vk_env TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
+    "${PYTHON:-python3}" "$repo_root/tests/docwatch/check_docs.py" \
+        $doc_files "$repo_root/README.md"

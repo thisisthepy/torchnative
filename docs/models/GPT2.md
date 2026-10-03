@@ -158,7 +158,7 @@ NaN 이면 일치로 셉니다.
 | `--inject-fault shape` | **exit 1** |
 | `--inject-fault dtype` | **exit 1** |
 | `verify_schemas.py` | **exit 0**, **154/154** (변화 없음) |
-| 스모크 (`pytests/run.sh`) | **exit 0**, 62 ok |
+| 스모크 (`tests/run.sh`) | **exit 0**, 62 ok |
 | 호스트 빌드 | **exit 0** |
 | Android (`aarch64-linux-android`) | **exit 0** |
 | iOS (`aarch64-apple-ios`) | **exit 0** |
@@ -340,11 +340,11 @@ argmax 는 소수의 토큰에 몰립니다. 강한 판정은 샘플링 쪽과 �
 > 재확인, `nn.LayerNorm(4)` 생성 포함). `overloads.json`/`methods.json` 이 이 문서를 쓴 뒤
 > 다른 라운드들에서 계속 채워진 결과로 보입니다 — `docs/models/SAMPLING.md`/`docs/devices/DEVICE.md`/
 > `docs/architectures/ARCH.md` 감사(이 라운드)에서 이미 반복해서 발견한 것과 같은 패턴입니다.
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json addmm present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json tanh present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json split present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json tanh present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py layer_norm present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json addmm present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json tanh present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json split present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json tanh present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py layer_norm present -->
 
 **이번 작업이 만든 새 빚이 아닙니다.** 같은 상태인 것이 이미 여럿 있었습니다(이 문서를 쓴
 시점 기준) — `F.softmax` / `x.softmax` (`TensorBase.softmax` 없음), `torch.multinomial`,

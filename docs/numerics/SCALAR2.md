@@ -248,7 +248,7 @@ new type — it is a registration.
 `tensor.rs` gets a `SIZE_CLASS` `OnceLock` and a `_set_size_class` function, the
 same shape as the `TENSOR_CLASS` / `_set_tensor_class` pair beside it and for the
 same reason: `_C` cannot build a Python `tuple` subclass for itself and **must
-not import `torch` to find one**, because `tools/golden/loader.py` imports `_C`
+not import `torch` to find one**, because `tests/golden/loader.py` imports `_C`
 standalone with no `torch` package around it. Nothing registers there, `shape`
 stays the plain tuple it has always been, and the harness — which compares shapes
 as sequences — cannot tell. `ops covered` is unchanged at 203 and the golden
@@ -347,8 +347,8 @@ tell them nothing is there.
   name the user-level expression and one names the key. Closing it properly means
   closing §3.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs set_size_class present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs set_size_class present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams present -->
 <!-- DOCWATCH: op-implemented aten.mul.Scalar -->
 <!-- DOCWATCH: op-implemented aten.add.Scalar -->
 <!-- DOCWATCH: op-implemented aten.rsub.Scalar -->

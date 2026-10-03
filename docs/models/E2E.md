@@ -2,7 +2,7 @@
 
 지금까지 "shim 이 상류와 같은 토큰을 낸다"는 여러 번 실측됐지만 전부 캐시 디렉터리 아래의
 일회성 프로브 스크립트(`caches/bw-sample-probe/`, 커밋 대상 아님)로만 존재했습니다. 이 문서는
-그 성질을 `rust/torch_c/pytests/test_shim.py` 의 테스트 세 개로 회귀 스위트에 박아 넣은 기록입니다.
+그 성질을 `tests/test_shim.py` 의 테스트 세 개로 회귀 스위트에 박아 넣은 기록입니다.
 
 **한 줄 결론.** 상류와 shim 을 한 프로세스에서 동시에 쓸 수 없다고 알려져 있었는데, 실제로는
 **된다** — 다만 `import torch` 로 vendor 트리를 통해서가 아니라, shim 을 `torch._C` 가 아닌 독립
@@ -14,7 +14,7 @@
 
 ## 1. 추가한 테스트와 각각이 잡는 것
 
-세 개 모두 `rust/torch_c/pytests/test_shim.py` 끝, `_main()` 바로 앞 새 절에 있습니다. 헬퍼
+세 개 모두 `tests/test_shim.py` 끝, `_main()` 바로 앞 새 절에 있습니다. 헬퍼
 (`_e2e_*`, `_E2EBackend`)는 세 테스트가 공유합니다.
 
 ### 1.1 `test_two_layer_llama_greedy_matches_upstream_token_for_token`
@@ -26,7 +26,7 @@ Llama 모양 디코더(RMSNorm · RoPE · flash `sdpa` · SwiGLU)를 결정적 �
 **오늘 이 기계에서 재측정한 값**: `torch=[7,42,3,88,63,63,63,63]`,
 `shim=[7,42,3,88,63,63,63,63]` — 일치. 마지막 스텝 로짓의 최대 절대오차 `~2.3e-06`.
 
-허용오차는 `tools/golden/dtypes.py` 의 `TOLERANCES["float32"]`(`atol=rtol=1e-5`)를 그대로
+허용오차는 `tests/golden/dtypes.py` 의 `TOLERANCES["float32"]`(`atol=rtol=1e-5`)를 그대로
 가져다 썼습니다 — 이 테스트가 새로 지어낸 숫자가 아니라, 골든 하네스가 이미 float32 에 대해
 "정상적인 부동소수점 반올림"으로 인정하는 경계입니다.
 
@@ -75,7 +75,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 **상류 torch 가 아예 존재하지 않으므로** "동시에 쓴다"는 개념이 성립하지 않습니다. 이것이 원래
 전제가 가리키는 상황입니다.
 
-하지만 `tools/golden/loader.py` 의 `load_shim()` 은 그 경로를 쓰지 않습니다. 빌드된 `.dylib` 를
+하지만 `tests/golden/loader.py` 의 `load_shim()` 은 그 경로를 쓰지 않습니다. 빌드된 `.dylib` 를
 임시 디렉터리에 `_C.so` 로 복사한 뒤 `importlib.util.spec_from_file_location("_C", ...)` 로
 **`_C` 라는 이름의 독립 모듈**로 로드합니다 — `torch._C` 가 아닙니다. 이 경로에서 별도로
 `sys.path` 에 vendor 를 넣지 않고 `import torch` 하면, 그것은 `spike-venv` 에 실제로 설치된
@@ -117,7 +117,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 
 세 테스트 모두, **shim 쪽 입력만** 건드려 상류와 의도적으로 어긋나게 만든 뒤(=커널은 그대로,
 `src/` 는 전혀 건드리지 않음 — 다른 두 에이전트가 그 디렉터리에서 동시에 작업 중이었으므로),
-`PYTHON=$PY ./pytests/run.sh` 로 다시 돌려 `FAIL` 로 잡히는지 보고, 원래대로 되돌린 뒤
+`PYTHON=$PY bash tests/run.sh` 로 다시 돌려 `FAIL` 로 잡히는지 보고, 원래대로 되돌린 뒤
 `git diff`(정확히는 되돌린 파일과 되돌리기 전 사본의 `diff`)로 완전히 원상복구됐는지 확인했습니다.
 
 | 테스트 | 무엇을 깼나 | 결과 |
@@ -126,9 +126,9 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 | do_sample | shim 쪽 재시딩 시드에 `+1` | `FAIL ...: AssertionError: ('reseed', 1.0, 50, 0.95, 0, [7, 42, 3, 88, 58, 63, 41, 78, 83, 78], [7, 42, 3, 88, 63, 41, 85, 13, 47, 91])` |
 | multinomial | 두 번째 뽑기 직전 shim 쪽에서만 `multinomial` 을 한 번 더 불러 스트림을 한 칸 밀어놓음 | `FAIL ...: AssertionError: (5, 3, True, 0, 'draw2')` |
 
-세 개 다 깬 뒤 개별적으로 `pytests/run.sh` 를 다시 돌려 `EXIT=1` 과 위 `FAIL` 줄을 직접 봤고,
+세 개 다 깬 뒤 개별적으로 `tests/run.sh` 를 다시 돌려 `EXIT=1` 과 위 `FAIL` 줄을 직접 봤고,
 그때마다 `cp` 로 떠 둔 사본으로 되돌린 뒤 `diff` 로 바이트 단위 동일함을 확인했습니다. 마지막에
-`git status --short` 로 이 worktree 전체에서 `rust/torch_c/pytests/test_shim.py` 한 파일만
+`git status --short` 로 이 worktree 전체에서 `tests/test_shim.py` 한 파일만
 변경됐음을(= `src/` 무손상) 확인했습니다.
 
 ---
@@ -138,14 +138,14 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 이상적으로는 이 스위트 자체가 "`_upstream_torch is None` 이었다"를 최종 리포트에 드러내야
 합니다(현재는 `ok` 로만 찍힙니다 — 통과와 무보증 통과가 구별되지 않습니다). `_main()` 의 출력
 형식을 바꾸는 일이라 이 작업의 파일 범위(`test_shim.py` 는 되지만, 판정 기준이 요구하는
-`pytests/run.sh` 의 exit 코드 계약을 건드리는 것은 이 작업 하나의 판단으로 정하기엔 큽니다)
+`tests/run.sh` 의 exit 코드 계약을 건드리는 것은 이 작업 하나의 판단으로 정하기엔 큽니다)
 밖으로 보고 손대지 않았습니다. **알려진 미해결 사항으로 남깁니다.**
 
 ---
 
 ## 6. 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 pytests/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
+`PYTHONPATH=<stage> python3 tests/test_shim.py` 단독 실행, `spike-venv` 인터프리터:
 
 | | 테스트 수 | wall time |
 |---|---|---|
@@ -153,7 +153,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 | 이후 | 65 | 2.23s |
 
 **약 1.7 초 증가**, 대부분 상류 `import torch`(무거움) + 15 개 구성 × 2 backend × 6 스텝
-forward pass 비용입니다. `pytests/run.sh` 전체(cargo 증분 빌드 포함)는 2.3 초로, "몇 분씩"
+forward pass 비용입니다. `tests/run.sh` 전체(cargo 증분 빌드 포함)는 2.3 초로, "몇 분씩"
 걸리는 영역과는 자릿수가 다릅니다.
 
 ---
@@ -176,7 +176,7 @@ forward pass 비용입니다. `pytests/run.sh` 전체(cargo 증분 빌드 포함
   §4.3 이 이미 "측정했으나 원인 미확인"으로 남긴 것)는 새 테스트로 옮기지 않았습니다. 그 오차는
   샘플링 경로가 물지 않는다고 이미 측정되어 있고(로짓은 float32, softmax 는 마지막 축), 여기서
   구현하는 3 개 테스트의 범위 밖입니다.
-- **`pytests/run.sh`/`_main()` 자체를 고쳐 "상류 torch 없음"을 별도 상태로 보고하는 것**은
+- **`tests/run.sh`/`_main()` 자체를 고쳐 "상류 torch 없음"을 별도 상태로 보고하는 것**은
   §5 에 적은 대로 일부러 손대지 않았습니다.
 
 ---
@@ -212,7 +212,7 @@ forward pass 비용입니다. `pytests/run.sh` 전체(cargo 증분 빌드 포함
 
 ### 9.1 무엇을 바꿨나
 
-`rust/torch_c/pytests/test_shim.py` 만 건드렸습니다(`src/`, `tools/golden/` 무손상 — 아래 §9.4).
+`tests/test_shim.py` 만 건드렸습니다(`src/`, `tests/golden/` 무손상 — 아래 §9.4).
 
 1. **`_E2E_LOGIT_ATOL = 1e-5`** — greedy 테스트가 쓰던 상수를 이름 붙여 모듈 상수로 올리고,
    근거를 그 자리 주석에 모았습니다(§9.2).
@@ -249,7 +249,7 @@ forward pass 비용입니다. `pytests/run.sh` 전체(cargo 증분 빌드 포함
 
 **정상 쪽 최댓값(`5.2e-06`)과 틀린 쪽(`5.87e-04`) 사이의 비율은 약 113 배**입니다. 그 사이
 어디를 잡아도 원칙적으로는 되지만, 새 상수를 발명하지 않고 이미 골든 하네스가 float32 에
-대해 쓰는 경계(`tools/golden/dtypes.py` `TOLERANCES["float32"]`, `atol=rtol=1e-5`)를 그대로
+대해 쓰는 경계(`tests/golden/dtypes.py` `TOLERANCES["float32"]`, `atol=rtol=1e-5`)를 그대로
 가져다 썼습니다 — 이 파일의 greedy 테스트가 이미 그렇게 하고 있었던 것과 같은 이유입니다.
 자리를 확인하면:
 
@@ -287,7 +287,7 @@ x 3 시드 재측정, `max_scale` 열). `HARNESS.md` 가 예시로 든 `k=512` �
 **로짓 assert.** `test_do_sample_matches_upstream_across_configs_and_reseed_modes` 의 첫 번째
 구성(`reseed, temperature=1.0, top_k=50, top_p=0.95, seed=0`)에서, 셰임 쪽 `c_logits` 의 마지막
 스텝 첫 원소에 `+5.9e-4` 를 더해(§ARCH.md 의 틀린-gelu 오차와 같은 자릿수) 임시로 주입한 뒤
-`./pytests/run.sh` 를 다시 돌렸습니다:
+`bash tests/run.sh` 를 다시 돌렸습니다:
 
 ```
 FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionError:
@@ -299,9 +299,9 @@ FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionE
 것으로 어느 assert 에서 죽었는지 구분됩니다. 즉 이 주입은 "토큰만 봤다면 통과했을 오류"를
 정확히 재현했고, 새 로짓 assert 가 그것을 잡는다는 것을 직접 확인했습니다.
 
-원상복구 후 `diff /tmp/test_shim.py.orig rust/torch_c/pytests/test_shim.py` 류의 바이트 비교와
-`git diff rust/torch_c/pytests/test_shim.py` 로 주입 코드가 한 줄도 남지 않았음을 확인했고,
-`./pytests/run.sh` 를 다시 돌려 65 개 전부 `ok`, `EXIT=0` 을 재확인했습니다.
+원상복구 후 `diff /tmp/test_shim.py.orig tests/test_shim.py` 류의 바이트 비교와
+`git diff tests/test_shim.py` 로 주입 코드가 한 줄도 남지 않았음을 확인했고,
+`bash tests/run.sh` 를 다시 돌려 65 개 전부 `ok`, `EXIT=0` 을 재확인했습니다.
 
 **greedy 테스트의 기존 로짓 assert** 는 이미 §4 표에서 확인되어 있던 것을 재사용했습니다(다시
 깨지는지는 새로 확인하지 않았습니다 — 로직을 바꾸지 않고 상수 이름만 바꿨으므로).
@@ -316,7 +316,7 @@ FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionE
 
 ### 9.6 스위트 실행 시간 변화
 
-`PYTHONPATH=<stage> python3 pytests/test_shim.py` 단독 실행, `spike-venv` 인터프리터, 이 파일
+`PYTHONPATH=<stage> python3 tests/test_shim.py` 단독 실행, `spike-venv` 인터프리터, 이 파일
 그대로(§6 의 위치에서 실행 — `/tmp` 로 복사하면 `surface.json` 상대경로가 깨져 별도 비교로는
 못 씁니다):
 

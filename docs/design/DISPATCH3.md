@@ -23,7 +23,7 @@ reached from its infra slot. It still cannot return a fake, and the reason is
 one level below this round — §4.
 
 Measured 2026-09-07, `darwin/arm64`, CPython 3.13, `work/dispatch`.
-Gates: suite **826 ok** (814 + the 12 in `rust/torch_c/pytests/test_dispatch.py`),
+Gates: suite **826 ok** (814 + the 12 in `tests/test_dispatch.py`),
 `DOCWATCH: PASS`, golden **11307/11307 ops=298 — exactly unmoved**.
 
 ---
@@ -47,14 +47,14 @@ Gates: suite **826 ok** (814 + the 12 in `rust/torch_c/pytests/test_dispatch.py`
 
 ## 1. What changed, and where it is
 
-One place: `rust/torch_c/src/aten.rs`, in `aten_dispatch_entry` — the `*args,
+One place: `torchnative/rust/torch_c/src/aten.rs`, in `aten_dispatch_entry` — the `*args,
 **kwargs` door `_aten_dispatch` is bound to. Nothing else in the crate moved,
 and `capture.rs` was not touched at all.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs any_dispatch_mode_active present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs innermost_dispatch_mode present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs dispatch_through_mode present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs overriding_types present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs any_dispatch_mode_active present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs innermost_dispatch_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs dispatch_through_mode present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs overriding_types present -->
 
 ```rust
 let rest = args.get_slice(1, args.len());
@@ -144,7 +144,7 @@ adding the recursion without a case that needs it would be a guess.
 
 ## 2. `SEEN`, side by side
 
-`rust/torch_c/pytests/test_dispatch.py` runs **one script twice** — once with
+`tests/test_dispatch.py` runs **one script twice** — once with
 the vendored tree on `PYTHONPATH`, once with it removed — and compares. Not a
 list of three strings written in the test file: the failure this round exists
 to rule out is a mode that enters, reports itself active, and quietly returns
@@ -165,7 +165,7 @@ with Log():
 | nested: inner mode sees / outer sees | 1 / 1 | 1 / 1 |
 | a mode's own internal ops seen by itself | 0 | 0 |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_a_mode_sees_the_same_operators_as_upstream_in_the_same_order present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_a_mode_sees_the_same_operators_as_upstream_in_the_same_order present -->
 
 The re-entrancy row is the one that would have been quiet if it were wrong.
 `_Reentrant.__torch_dispatch__` makes **two operator calls of its own**; a mode
@@ -173,7 +173,7 @@ still on the stack while it runs would see them, report three entries for one
 user call, and then see the ones those made. One entry is the whole claim, and
 it is checked against upstream's one rather than against the literal 1.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_the_mode_is_popped_so_it_does_not_see_its_own_internal_operators present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_the_mode_is_popped_so_it_does_not_see_its_own_internal_operators present -->
 
 ---
 
@@ -206,7 +206,7 @@ a mode that returns nonsense gets further here than upstream. Tightening it
 would mean deciding, per op, what a return type is, which is a schema question
 and not a dispatcher one.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_a_mode_replaces_the_result_rather_than_annotating_it present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_a_mode_replaces_the_result_rather_than_annotating_it present -->
 
 ---
 
@@ -215,7 +215,7 @@ and not a dispatcher one.
 ### 4.1 Infra modes are not on the stack, and the length does not say so
 
 `FakeTensorMode` and `ProxyTorchDispatchMode` carry a `_mode_key`, and
-`torchnative/src/main/torchnative/export/upstream.py`'s
+`torchnative/python/torchnative/export/upstream.py`'s
 `_push_on_torch_dispatch_stack` routes them into a keyed slot rather than onto
 the ordinary stack — reproducing upstream's split. But its
 `_len_torch_dispatch_stack` returns `len(mode_stack)` only, where upstream's
@@ -238,7 +238,7 @@ The discrepancy itself is in `upstream.py`, which is `docs/graph/EXPORT.md` §8'
 staging module and out of this round's territory. It is named here so the
 hand-off in §8 can carry it.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_an_infra_mode_is_found_in_its_slot_and_not_only_on_the_stack present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_an_infra_mode_is_found_in_its_slot_and_not_only_on_the_stack present -->
 
 ### 4.2 It is reached, and then it stops for reasons that are not this round's
 
@@ -248,7 +248,7 @@ raises:
 ```
 NotImplementedError: not implemented in torch._C shim:
   torch.is_inference_mode_enabled(...) -- overload resolution has no table
-  entry for this op (rust/torch_c/src/overloads.json)
+  entry for this op (torchnative/rust/torch_c/src/overloads.json)
 ```
 
 and behind that, on the `from_tensor` path, `docs/graph/EXPORT.md` §3.1 exactly as
@@ -270,7 +270,7 @@ The test is written to demand more when they land: it asserts the mode is
 *reached* today and, the moment a fake comes back, requires the fake's shape
 to agree with upstream's instead of accepting a refusal.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake present -->
 
 ---
 
@@ -291,13 +291,13 @@ That it is the same disagreement `capture.rs` already had is checked rather
 than asserted in prose: `test_the_overload_spelling_...` asserts
 `mode_seen == capture_ops`, so it is one gap in one place and not two.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_the_overload_spelling_is_the_only_remaining_disagreement_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_the_overload_spelling_is_the_only_remaining_disagreement_with_upstream present -->
 
 **Size of X.**
 
 | | |
 |---|---|
-| where | `rust/torch_c/src/bootstrap.py`'s overload resolution (the `raw_parse` reproduction), plus `rust/torch_c/src/overloads.json` |
+| where | `torchnative/rust/torch_c/src/bootstrap.py`'s overload resolution (the `raw_parse` reproduction), plus `torchnative/rust/torch_c/src/overloads.json` |
 | what | let a `Scalar` argument bind a `Tensor` parameter when another argument is a tensor, as upstream's parser does, and wrap it |
 | ops affected | **21** names in `overloads.json` carry both a `.Tensor` and a `.Scalar` overload: `add`, `sub`, `rsub`, `mul`, `multiply`, `div`, `fmod`, `remainder`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `greater`, `bitwise_and`, `bitwise_or`, `bitwise_xor`, `masked_fill`, `fill_`, `bucketize` |
 | what it moves | every one of those 21 spellings changes which kernel a plain `x <op> 2` reaches, and with it the dtype rule — upstream's wrapped number promotes *weakly* (an int literal does not widen a float tensor), which the `.Scalar` kernels get for free and a real 0-dim tensor argument does not |
@@ -338,7 +338,7 @@ The mode-answering case is the other half: a mode that returns without calling
 correct — no kernel ran and no value exists to record — and it is what
 "must not fire while a mode is answering" means here.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_capture_records_each_operator_once_while_a_mode_is_on_the_stack present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_capture_records_each_operator_once_while_a_mode_is_on_the_stack present -->
 
 **The eager tape and `backward()`.** `docs/training/BACKWARD7.md`'s recorder is gated
 on `mark_from_op`'s answer, beside the capture hook, and both sit in
@@ -351,7 +351,7 @@ on `mark_from_op`'s answer, beside the capture hook, and both sit in
 | under a logging mode | `[3.0, 3.0, 3.0]` |
 | upstream | `[3.0, 3.0, 3.0]` |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_dispatch.py test_autograd_runs_the_same_with_and_without_a_mode_on_the_stack present -->
+<!-- DOCWATCH: symbol-in-file tests/test_dispatch.py test_autograd_runs_the_same_with_and_without_a_mode_on_the_stack present -->
 
 ---
 
@@ -421,7 +421,7 @@ Split the way `docs/graph/COMPILE.md` §5.3 asks for.
 | **feature added** | the mode-stack consult in `aten_dispatch_entry`: user stack + infra slots, upstream's pop order, the mode's return value as the result |
 | **binding surface implemented** | none. No `torch._C` name was added; `bootstrap.py` was not touched |
 | **defect found** | `upstream.py`'s `_len_torch_dispatch_stack` not counting infra modes, where upstream's C++ does (§4.1) — a dispatcher reading it alone sees zero under `FakeTensorMode` |
-| **tests added** | 12, in `rust/torch_c/pytests/test_dispatch.py`, every one compared against upstream in a separate process |
+| **tests added** | 12, in `tests/test_dispatch.py`, every one compared against upstream in a separate process |
 | **measurement** | `SEEN` side by side (§2), replacement (§3), the fake path's stopping point (§4.2), capture and the tape under a mode (§6) |
 | **documentation corrected** | none. `docs/graph/EXPORT.md` §4.2 is accurate as written and this closes what it named |
 

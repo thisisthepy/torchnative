@@ -74,15 +74,17 @@ npu = [
 # dependency. Conflicts with the platform wheels by design. PROJECT.md.
 test = ["torch>=2.13,<2.14"]
 
-# Without package-dir, auto-discovery ships `main/` and a wheel answers
-# `import main.torchnative`. PROJECT.md.
+# Without package-dir, auto-discovery treats the repository root as the package
+# root and a wheel answers `import python.torchnative` (it once answered
+# `import main.torchnative` under the old `torchnative/src/main` layout).
+# PROJECT.md.
 [tool.setuptools]
-package-dir = { "" = "torchnative/src/main" }
+package-dir = { "" = "torchnative/python" }
 
 # Three upstream packages, not one -- `torch` alone looked fine for a long time
 # because PYTHONPATH shadowed only that one. PROJECT.md.
 [tool.setuptools.packages.find]
-where = ["torchnative/src/main"]
+where = ["torchnative/python"]
 include = [
     "torchnative*",
     "torch", "torch.*",
@@ -104,4 +106,5 @@ torchnative = ["**/*"]
 "*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
-# pypackpack source-set layout; PROJECT.md.
+# pypackpack. The source set is `python/` (torch + torchnative side by side);
+# PROJECT.md §6.7.

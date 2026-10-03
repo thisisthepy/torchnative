@@ -37,19 +37,19 @@ Vocabulary used throughout, kept strict:
   5.0.3 with `emcc` and a bundled Node 24 is already on this machine. Nothing was installed
   and the emsdk was not used; only inspected.
 - `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wasm2`
-- All probing is done in a **separate experiment crate**, following the `rust/vk_probe`
+- All probing is done in a **separate experiment crate**, following the `torchnative/rust/vulkan_probe`
   precedent. No dependency is added to the shipping crate.
 
 ## Layer 1 — does candle build for `wasm32`? **Yes, and better than expected.**
 
-**Verdict: works.** The candle surface `rust/torch_c/src/` actually calls compiles for
+**Verdict: works.** The candle surface `torchnative/rust/torch_c/src/` actually calls compiles for
 both `wasm32-wasip1` and `wasm32-unknown-unknown`, including the entire quantised path.
 One qualification, in §1d: SIMD is broken upstream, so it compiles *scalar-only*.
 
 ### 1a. The probe
 
-`rust/wasm_probe/` — a separate crate, **not** a dependency of `rust/torch_c` and not in a
-workspace with it, following the `rust/vk_probe` precedent for exactly the stated reason:
+`torchnative/rust/wasm_probe/` — a separate crate, **not** a dependency of `torchnative/rust/torch_c` and not in a
+workspace with it, following the `torchnative/rust/vulkan_probe` precedent for exactly the stated reason:
 putting a wasm target's constraints on the shipping crate before the question is answered
 risks the three platforms that currently build, for nothing.
 
@@ -57,7 +57,7 @@ Its `src/lib.rs` names every `candle_core` item the shipping crate imports. The 
 not invented — it is the output of
 
 ```
-grep -rhoE "use candle_core::\{?[^;]*" rust/torch_c/src/
+grep -rhoE "use candle_core::\{?[^;]*" torchnative/rust/torch_c/src/
 ```
 
 which is:
@@ -70,7 +70,7 @@ Error::{Msg, MatMulUnexpectedStriding, WithBacktrace}
 
 plus the twelve `GgmlDType` variants `quant.rs` enumerates and the `half::{f16, bf16}`
 constructors `reduced.rs` uses. `candle-core` is pinned to the same version and the same
-`default-features = false` as `rust/torch_c/Cargo.toml:36`.
+`default-features = false` as `torchnative/rust/torch_c/Cargo.toml:36`.
 
 It is a library and not a `#[test]`, deliberately: **there is no wasm runtime on this
 machine** (§0), so the only question answerable here is compilation. Every reference is
@@ -146,7 +146,7 @@ enable the "wasm_js" configuration flag.
 Getting past it needs **both** `--cfg getrandom_backend="wasm_js"` in `RUSTFLAGS` **and** an
 explicit `getrandom` dependency with `features = ["wasm_js"]` — the cfg alone gives a second,
 different error. Two major versions sit in candle's graph simultaneously (`rand` 0.8 pulls
-`getrandom` 0.3, `rand` 0.9 pulls 0.4), so both must be pinned. `rust/wasm_probe/Cargo.toml`
+`getrandom` 0.3, `rand` 0.9 pulls 0.4), so both must be pinned. `torchnative/rust/wasm_probe/Cargo.toml`
 carries that block with a comment saying it is a finding and not a wanted dependency.
 
 **This is a real, if small, structural fact: `wasm32-unknown-unknown` forces a browser
@@ -223,13 +223,13 @@ cannot pass is not a check.
 
 - The probe was an `rlib`. `cargo build --features pyo3-route --target wasm32-wasip1` gave
   **exit 0** — but an `rlib` build never invokes the linker, so that exit 0 said nothing.
-- Changing it to `cdylib` (which is what `rust/torch_c/Cargo.toml:10` is) made **the host
+- Changing it to `cdylib` (which is what `torchnative/rust/torch_c/Cargo.toml:10` is) made **the host
   build fail too**, with undefined `_Py*` symbols. Had that not been checked, "wasm fails to
   link" would have been reported as a wasm finding when it was a miswired probe.
 
-The cause: `rust/torch_c/.cargo/config.toml` supplies `-C link-arg=-undefined -C
+The cause: `torchnative/rust/torch_c/.cargo/config.toml` supplies `-C link-arg=-undefined -C
 link-arg=dynamic_lookup` on Apple targets, and the probe had no such file.
-`rust/wasm_probe/.cargo/config.toml` now mirrors it. **Control: host `cdylib` with
+`torchnative/rust/wasm_probe/.cargo/config.toml` now mirrors it. **Control: host `cdylib` with
 `extension-module` + `abi3-py313` links, exit 0, 1.5 MB `libwasm_probe.dylib`.**
 
 ### 2b. Results — measured
@@ -247,7 +247,7 @@ nothing for the build script to fail on. The failure, when it came, was purely a
 
 `--allow-undefined` tells `wasm-ld` to turn unresolved symbols into **module imports**
 rather than errors. That is the wasm analogue of the note already in
-`rust/torch_c/.cargo/config.toml`: *"Android needs no extra flags: ELF shared libraries may
+`torchnative/rust/torch_c/.cargo/config.toml`: *"Android needs no extra flags: ELF shared libraries may
 carry undefined symbols and the interpreter resolves them at load time."* wasm can express
 the same thing; it just will not do it by default.
 
@@ -306,7 +306,7 @@ wasm platform on this machine.
 
 The layers above quietly assumed one thing: that the `.wasm` produced in §2c, which exports
 `PyInit_wasm_probe` and imports 45 `Py*` symbols, can be *loaded by an interpreter*. That is
-the same assumption `rust/torch_c/.cargo/config.toml` states for Android — *"ELF shared
+the same assumption `torchnative/rust/torch_c/.cargo/config.toml` states for Android — *"ELF shared
 libraries may carry undefined symbols and the interpreter resolves them at load time."*
 **Whether that sentence has a wasm translation is the whole of layer 3, and the answer
 differs between the two wasm platforms.**
@@ -342,7 +342,7 @@ there*. The answer:
 > On WASI, `torch._C` cannot be a wheel. It would have to be a **CPython fork built with
 > `torch._C` as a builtin module**, shipped as a whole interpreter binary.
 
-That is a different product from the one `tools/wheel/build.py` makes. Note also that the
+That is a different product from the one `scripts/wheel/build.py` makes. Note also that the
 §2c artefact *already showed this*: it imports its `Py*` symbols from a module literally
 named `env`, meaning the instantiating host must supply all 45 — which is not something a
 Python interpreter does for a module it imports.
@@ -357,7 +357,7 @@ native extension modules, why Pyodide works, and why PyO3 special-cases it. Our 
 survives.
 
 **The cost lands squarely on this project's most load-bearing decision.**
-`rust/torch_c/Cargo.toml:13-23` spends ten lines justifying `abi3-py313`, and `docs/design/ABI3.md`
+`torchnative/rust/torch_c/Cargo.toml:13-23` spends ten lines justifying `abi3-py313`, and `docs/design/ABI3.md`
 §7 recommends it, on the grounds that one artefact loads into many interpreter versions and
 that a version-pinned `.so` is a silent failure mode. **On Emscripten that argument does not
 hold**:
@@ -405,7 +405,7 @@ Pyodide can be published to PyPI directly and installed at runtime, rather than 
 in Pyodide's own index. The tag replaced the earlier `pyodide_${YEAR}_${PATCH}_wasm32`, and
 before that the form was `emscripten_3_1_45_wasm32`-style, versioned on the compiler.
 
-`maturin` already emits the tag. Our wheel builder does not — `tools/wheel/build.py` has
+`maturin` already emits the tag. Our wheel builder does not — `scripts/wheel/build.py` has
 `AndroidTarget` (PEP 738, `android_<api>_<abi>`), `IOSTarget` (`ios_<major>_<minor>_...`) and
 the macOS path, and nothing for wasm. Adding a `PyEmscriptenTarget` is the same shape of work
 as the two that exist. **That file is another workstream's area and was not touched.**
@@ -482,7 +482,7 @@ true** — see below.
 2. **Fix candle's `simd128` first** (§1d), or accept scalar kernels. This is a small upstream
    patch and it gates whether the result is worth shipping.
 3. **Drop `abi3` for that target only** (§3c) and expect a wheel per Pyodide release.
-4. **Then** add a `PyEmscriptenTarget` to `tools/wheel/build.py` (§4a).
+4. **Then** add a `PyEmscriptenTarget` to `scripts/wheel/build.py` (§4a).
 
 Steps 1-3 are all cheaper than step 4 is misleading: the packaging works, which makes it
 tempting to start there.
@@ -521,7 +521,7 @@ runnable **today**.
 | does the wasip1 `.wasm` instantiate | `wasmtime` or `wasmer` | **no** — and §3b says the answer would be "no host supplies those 45 imports", so this is low value |
 | does the emscripten build link | `emcc` + `EM_CACHE` pointed away from the shared emsdk | **yes**, gated on not disturbing another workstream |
 | does `import torch` work in Pyodide | a Pyodide distribution matching the Emscripten version, plus Node (present) | **no Pyodide** — it is a download, not a build |
-| do the golden tests pass on WASM | Pyodide + `numpy`/`torch` reference wheels for `pyemscripten`, and a harness that does not assume a local CPython | **no** — `tools/golden/compare.py` runs against a host interpreter |
+| do the golden tests pass on WASM | Pyodide + `numpy`/`torch` reference wheels for `pyemscripten`, and a harness that does not assume a local CPython | **no** — `tests/golden/compare.py` runs against a host interpreter |
 | is it fast enough to matter | all of the above **plus** the `simd128` fix (§1d) | **no** — and without §1d the measurement would only restate "scalar is slow" |
 
 The cheapest meaningful next step is the second row, and it needs no installation.
@@ -531,7 +531,7 @@ The cheapest meaningful next step is the second row, and it needs no installatio
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wasm2
-cd rust/wasm_probe
+cd torchnative/rust/wasm_probe
 
 # layer 1 -- candle only
 cargo build --release                                          # host control, exit 0
@@ -550,8 +550,8 @@ RUSTFLAGS='-C link-arg=--allow-undefined' \
 cargo tree --target <triple> --prefix none | grep -oE '^[a-z0-9_-]+ v[0-9.]+' | sort -u | wc -l
 ```
 
-`rust/wasm_probe/` is an investigation crate. It is **not** a dependency of `rust/torch_c`
-and shares no workspace with it; `rust/torch_c/` and `tools/wheel/` were not modified.
+`torchnative/rust/wasm_probe/` is an investigation crate. It is **not** a dependency of `torchnative/rust/torch_c`
+and shares no workspace with it; `torchnative/rust/torch_c/` and `scripts/wheel/` were not modified.
 
 ## Summary table
 
@@ -723,7 +723,7 @@ not run" surprise §1e predicted, and it is now located precisely.
 This is the result the first pass could not reach at all, and it is the one thing about WASM
 that nobody in this project knew: **our layer-1 code runs.**
 
-`rust/wasm_probe/src/main.rs` is a new `[[bin]]` in the same probe crate. It is deliberately
+`torchnative/rust/wasm_probe/src/main.rs` is a new `[[bin]]` in the same probe crate. It is deliberately
 *not* an "ok / not ok" harness — it prints computed **values** and compares each to a number
 worked out by hand, because an exit code alone cannot tell "candle ran" apart from "the runtime
 started and the code had been gc'd away". That is the same false positive as §2b and §7.1, and
@@ -796,7 +796,7 @@ row was **read from CPython and Pyodide policy documents, not measured** — §3
 also the row that decides whether `torch._C` can ever be a wheel on WASM, so it is worth more
 than a citation.
 
-`rust/wasm_probe/dlopen_host.c` is a 60-line C program: `dlopen` a path, `dlsym`
+`torchnative/rust/wasm_probe/dlopen_host.c` is a 60-line C program: `dlopen` a path, `dlsym`
 `wasm_probe_run`, call it, compare the returned bitfield against 31. It loads the
 **candle-only** side module, not the PyO3 one, on purpose — that separates "does the dynamic
 loader work" from "can 54 CPython symbols be resolved" (§7.5), so a failure can only be blamed
@@ -860,7 +860,7 @@ Emscripten version and linker flags PEP 783 already pins (§3c), and it belongs 
 `wasm_probe_run`, and importing the 54 CPython symbols of §7.2a.
 
 There is no CPython for this target on this machine, so the host supplies those 54 itself.
-`rust/wasm_probe/gen_pystubs.py` generates them **from the side module's own import table**
+`torchnative/rust/wasm_probe/gen_pystubs.py` generates them **from the side module's own import table**
 (`wasm-dis` output), not from CPython headers — there are none to take, and guessing is not an
 option: a WebAssembly import whose type does not match the exporting module is a `LinkError` at
 *instantiation*, so an arity wrong by one gives "will not load" rather than "misbehaves".
@@ -868,7 +868,7 @@ option: a WebAssembly import whose type does not match the exporting module is a
 its argument, because PyO3's multi-phase init is literally `return PyModuleDef_Init(&MODULE_DEF)`
 and that is the smallest thing that lets `PyInit_` run to completion.
 
-`rust/wasm_probe/pyinit_host.c`, `emcc -fwasm-exceptions -sMAIN_MODULE=1`, Node 24:
+`torchnative/rust/wasm_probe/pyinit_host.c`, `emcc -fwasm-exceptions -sMAIN_MODULE=1`, Node 24:
 
 ```
 loading: side_pyo3.wasm
@@ -960,7 +960,7 @@ What is missing is only the artefact:
 | to answer | needed | status |
 |---|---|---|
 | does the extension load into a real CPython | a built Pyodide distribution (`pyodide-core`, a download, not a build) | **absent** — nothing Pyodide-shaped anywhere on this machine |
-| do the golden tests pass | the above **plus** `numpy`/reference wheels for `pyemscripten_2026_0`, and a harness not assuming a host interpreter | absent; `tools/golden/compare.py` runs against a host CPython |
+| do the golden tests pass | the above **plus** `numpy`/reference wheels for `pyemscripten_2026_0`, and a harness not assuming a host interpreter | absent; `tests/golden/compare.py` runs against a host CPython |
 | is it worth shipping | all of the above **plus** the §1d `simd128` fix | absent, and §1d is upstream |
 
 **The next step is a download and is not attempted here.** Fetching and unpacking a Pyodide
@@ -1001,7 +1001,7 @@ And the platforms, read off their own specifications:
 | `pyemscripten_2026_5` | 3.15 | **6.0.5** |
 
 **Read the right-hand column.** Three CPython feature releases, three *different compilers*. The
-entire premise of `abi3` — `rust/torch_c/Cargo.toml:13-23` spends ten lines on it, and
+entire premise of `abi3` — `torchnative/rust/torch_c/Cargo.toml:13-23` spends ten lines on it, and
 `docs/design/ABI3.md` §7 recommends it — is that one artefact serves many interpreter versions. On
 Emscripten, supporting 3.13, 3.14 and 3.15 means **building three times with three different
 Emscripten toolchains**, and the `abi3` tag changes nothing about that count. The limited API
@@ -1053,7 +1053,7 @@ export PATH="/Volumes/macMini/caches/emsdk/upstream/emscripten:\
 /Volumes/macMini/caches/emsdk/node/24.19.0_64bit/bin:$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-emcc
 export EM_CACHE=/Volumes/macMini/caches/emcc-scratch          # not the shared emsdk cache
-cd rust/wasm_probe
+cd torchnative/rust/wasm_probe
 
 # 7.1 / 7.2 -- compile and link
 cargo build --release --target wasm32-unknown-emscripten                        # exit 0 (65 B .wasm!)
@@ -1080,9 +1080,9 @@ emcc pyinit_host.c -O1 -fwasm-exceptions -sMAIN_MODULE=1 -sALLOW_MEMORY_GROWTH=1
 node py.js wasm_probe.wasm                                                      # exit 0
 ```
 
-New files, all inside `rust/wasm_probe/`: `src/main.rs`, `dlopen_host.c`, `pyinit_host.c`,
-`gen_pystubs.py`, plus a `wasm_probe_run` export added to `src/lib.rs`. `rust/torch_c/` and
-`tools/wheel/` were not touched.
+New files, all inside `torchnative/rust/wasm_probe/`: `src/main.rs`, `dlopen_host.c`, `pyinit_host.c`,
+`gen_pystubs.py`, plus a `wasm_probe_run` export added to `src/lib.rs`. `torchnative/rust/torch_c/` and
+`scripts/wheel/` were not touched.
 
 **The shared emsdk.** §2d declined to run `emcc` because 22 files under
 `/Volumes/macMini/caches/emsdk` had been modified that day and a `cache.lock` was present.
@@ -1103,13 +1103,13 @@ the correct response to a shared toolchain is to redirect its cache, not to skip
 
 ### 7.9a Regressions, re-run after these changes
 
-The changes are confined to `rust/wasm_probe/` and this file, but the shipping crate's suites
+The changes are confined to `torchnative/rust/wasm_probe/` and this file, but the shipping crate's suites
 were re-run anyway, because "I only touched X" is a claim and not a check:
 
 | check | result |
 |---|---|
-| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | **exit 0** — 197 ok, 0 not ok |
-| `$PY tools/golden/compare.py` | **exit 0** — 2811/2811 cases, 0 failed, ops covered = 119 |
+| `PYTHON=$PY sh tests/run.sh` | **exit 0** — 197 ok, 0 not ok |
+| `$PY tests/golden/compare.py` | **exit 0** — 2811/2811 cases, 0 failed, ops covered = 119 |
 
 ## 7.10 Summary of §7 — the four layers, executed
 
@@ -1145,7 +1145,7 @@ side module through Pyodide's actual import machinery — not `pyinit_host.c`, n
 
 ## 8.0 Pyodide obtained, and the CPython-3.13 question answered
 
-The brief asked for Pyodide matching CPython 3.13 specifically, because `rust/torch_c` pins
+The brief asked for Pyodide matching CPython 3.13 specifically, because `torchnative/rust/torch_c` pins
 `abi3-py313`. **It exists, and it does not pair with the toolchain on this machine:**
 
 | Pyodide series | CPython | Emscripten |
@@ -1193,7 +1193,7 @@ eligible to be found by `import`.
 
 ## 8.1 Rung 2 — built against this interpreter, with a named caveat
 
-`rust/wasm_probe` was rebuilt exactly as §7.9 reproduces it — `cargo build --release --lib
+`torchnative/rust/wasm_probe` was rebuilt exactly as §7.9 reproduces it — `cargo build --release --lib
 --features pyo3-route --target wasm32-unknown-emscripten`, same emsdk, same `EM_CACHE`
 redirection — **exit 0, 893,771-byte `wasm_probe.wasm`**, byte-identical in size to §7.5's
 artefact. That number is not incidental: it means this session's rebuild reproduced §7 exactly
@@ -1211,7 +1211,7 @@ but it is a statement about the limited API, not about 3.14 headers.
 
 ## 8.2 Rung 3 — loaded by the real interpreter, and proven unstubbed
 
-`rust/wasm_probe/src/lib.rs`'s `pyo3_route::probe_all()` was already exposed for exactly this.
+`torchnative/rust/wasm_probe/src/lib.rs`'s `pyo3_route::probe_all()` was already exposed for exactly this.
 Loaded into Pyodide 314.0.6 via its own `pyodide.mjs` loader (`loadPyodide()`), the `.wasm`
 written into Pyodide's virtual FS as `/probe_modules/wasm_probe.abi3.so`, `sys.path` extended,
 then plain `import wasm_probe`:
@@ -1253,7 +1253,7 @@ returning anything — see §8.2a for the demonstration that this is not a vacuo
 is explicit that Emscripten's aborting-stub substitution is the reason "it loaded" is not
 evidence, so that control needed repeating against Pyodide itself, not just cited from §7.
 
-Added `rust/wasm_probe/src/lib.rs::pyo3_route::probe_bogus_symbol()`, gated behind a new
+Added `torchnative/rust/wasm_probe/src/lib.rs::pyo3_route::probe_bogus_symbol()`, gated behind a new
 `bogus-symbol-test` feature (off by default — this artefact is never meant to be loaded by
 anything else). It declares one `extern "C"` import, `Wasm4Probe_DoesNotExistInAnyCPython`, a
 name that cannot collide with any real CPython symbol past or future, and calls it. Built with
@@ -1296,19 +1296,19 @@ the false signal the brief warned about. Paired with this control, `probe_all() 
 known to mean the 45 functions and 9 data symbols `probe_all()` actually touches were genuinely
 resolved against Pyodide's own CPython — not that the loader waved everything through.
 
-## 8.3 Rung 4 and rung 5 — `rust/torch_c` builds for this target, and a real forward pass ran
+## 8.3 Rung 4 and rung 5 — `torchnative/rust/torch_c` builds for this target, and a real forward pass ran
 
 The first draft of this section, written before actually running the command, guessed that
-`rust/torch_c`'s larger dependency graph would fail to cross-compile and stopped there. **That
+`torchnative/rust/torch_c`'s larger dependency graph would fail to cross-compile and stopped there. **That
 guess was wrong and is corrected here rather than left.** The command was then run for real:
 
 ```sh
-cd rust/torch_c
+cd torchnative/rust/torch_c
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-emcc-torchc \
   cargo build --release --target wasm32-unknown-emscripten
 ```
 
-**exit 0. `_C.wasm`, 3,261,949 bytes**, no edits to `rust/torch_c` — its `aten.rs`, `bootstrap.py`
+**exit 0. `_C.wasm`, 3,261,949 bytes**, no edits to `torchnative/rust/torch_c` — its `aten.rs`, `bootstrap.py`
 and `overloads.json` (this task's forbidden files, owned by other agents this session) were read,
 not touched. Disassembled the same way as §7.2a/§8.2a: exports `PyInit__C`; imports 157 `env` +
 96 `GOT.func` + 57 `GOT.mem`, of which 94 are `Py*`/`_Py*` functions and ~21 are `Py*Type`/`PyExc_*`
@@ -1319,11 +1319,11 @@ with the same `abi3-py313` + `extension-module` pairing §7/§8 already establis
 
 ### 8.3a `import torch` — reached, against the real interpreter
 
-`vendor/vendor_torch.sh` was run (unmodified, as documented) against
+`scripts/vendor/vendor_torch.sh` was run (unmodified, as documented) against
 `TORCHNATIVE_TORCH_SRC=/Volumes/macMini/caches/spike-venv/...`, producing torch 2.13.0, 2372
-Python modules, in `torchnative/src/main/torch(gen)?/functorch/` — gitignored, not committed.
+Python modules, in `torchnative/python/torch(gen)?/functorch/` — gitignored, not committed.
 That tree, plus the `wasm32-unknown-emscripten` `_C.wasm` renamed to `_C.abi3.so` (the same
-naming `vendor/install_shim.sh` uses for the host build), was copied whole into `/tmp` (scratch,
+naming `scripts/vendor/install_shim.sh` uses for the host build), was copied whole into `/tmp` (scratch,
 not the repo) and mounted into Pyodide via `pyodide.FS.mount(NODEFS, ...)`.
 
 First attempt hit a wall already named in `docs/platform/VENDOR.md` ("wall 1"): `torch/__init__.py`
@@ -1385,7 +1385,7 @@ out = lin(torch.ones(1, 3))                          # aten::linear forward
 | `(a@b).shape, .sum()` | `(2, 4), 24` | `(2, 4), 24.0` |
 | `Linear(3,4,bias=False)(ones(1,3)).shape, .sum()` | `(1, 4), 12` | `(1, 4), 12.0` |
 
-The host control was built fresh (`cargo build --release` for `rust/torch_c`, same worktree, same
+The host control was built fresh (`cargo build --release` for `torchnative/rust/torch_c`, same worktree, same
 commit) and run through the same vendoring + `TORCH_USE_RTLD_GLOBAL=1` steps, via the venv that
 `vendor_torch.sh` itself reads from (`/Volumes/macMini/caches/spike-venv`, CPython 3.13.0 — the
 floor `abi3-py313` names). **Identical results on both sides**, and they are not trivially
@@ -1417,7 +1417,7 @@ Named precisely, because AGENTS.md §17.5 asks not to leave "it needed a workaro
   this unless something intervenes before that line runs.
 - What was done here is a **diagnostic stub in the calling harness**, deliberately not landed
   anywhere in the repo (not the vendored tree, which is regenerated and gitignored anyway; not
-  `torch_c`; not `tools/wheel/`). It answers "is this the last wall" (yes, for the two-op
+  `torch_c`; not `scripts/wheel/`). It answers "is this the last wall" (yes, for the two-op
   computation in §8.3b) without claiming a real fix exists. A real fix is a design decision that
   belongs with whoever owns the vendoring/wall-tracking work in `docs/platform/VENDOR.md` — candidates
   visible from here, not chosen or landed: patch `torch/__init__.py` to make the
@@ -1434,7 +1434,7 @@ Named precisely, because AGENTS.md §17.5 asks not to leave "it needed a workaro
 | 1 | Pyodide obtained, CPython identified | **done** — 314.0.6, CPython 3.14.2, Emscripten 5.0.3 (exactly this machine's emsdk); CPython 3.13 exists as Pyodide `0.28.x` but needs Emscripten 4.0.9, not present |
 | 2 | extension built against that interpreter's ABI | **done, with caveat** — `abi3-py313` never consults target headers; that is what "built against the limited API" means here, for both `wasm_probe` and the real `torch_c` |
 | 3 | loaded by that interpreter, imports proven resolved not stubbed | **done** — `import wasm_probe` succeeds, `probe_all()==101` matches the host control exactly, and a deliberately-unresolvable symbol was shown to import-fine-but-abort-on-call against the *real* interpreter (§8.2a) |
-| 4 | `import torch` reached | **done** — real `rust/torch_c` built for `wasm32-unknown-emscripten` unmodified (3.26 MB, `PyInit__C` exported), real vendored torch 2.13.0 tree, loaded into real Pyodide 3.14.2; needed the documented `TORCH_USE_RTLD_GLOBAL` off-switch plus a new, previously-undocumented stdlib stub for `multiprocessing` (§8.3c) |
+| 4 | `import torch` reached | **done** — real `torchnative/rust/torch_c` built for `wasm32-unknown-emscripten` unmodified (3.26 MB, `PyInit__C` exported), real vendored torch 2.13.0 tree, loaded into real Pyodide 3.14.2; needed the documented `TORCH_USE_RTLD_GLOBAL` off-switch plus a new, previously-undocumented stdlib stub for `multiprocessing` (§8.3c) |
 | 5 | something computed (`aten.mm`, `nn.Linear`) | **done** — both computed inside Pyodide, both bit-for-bit matching a fresh host build of the same commit |
 
 **The headline: every rung the brief asked for was reached, by execution, against a real
@@ -1458,7 +1458,7 @@ curl -sL -o pyodide-core-314.0.6.tar.bz2 \
 tar xjf pyodide-core-314.0.6.tar.bz2                                  # -> ./pyodide/
 
 # rung 2/3: build wasm_probe, real functionality
-cd /path/to/repo/rust/wasm_probe
+cd /path/to/repo/torchnative/rust/wasm_probe
 cargo build --release --lib --features pyo3-route --target wasm32-unknown-emscripten
 node --experimental-wasm-stack-switching /tmp/wasm4_load_probe.mjs \
   "$CARGO_TARGET_DIR/wasm32-unknown-emscripten/release/wasm_probe.wasm" wasm_probe
@@ -1470,19 +1470,19 @@ node --experimental-wasm-stack-switching /tmp/wasm4_bogus_test.mjs \
   "$CARGO_TARGET_DIR/wasm32-unknown-emscripten/release/wasm_probe.wasm"
 
 # rung 4/5: build the real torch_c, unmodified, for this target
-cd /path/to/repo/rust/torch_c
+cd /path/to/repo/torchnative/rust/torch_c
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-emcc-torchc \
   cargo build --release --target wasm32-unknown-emscripten            # exit 0, _C.wasm 3,261,949 B
 
 # vendor the real torch Python tree (unmodified script; not committed, gitignored)
-cd /path/to/repo && sh vendor/vendor_torch.sh                          # torch 2.13.0, 2372 modules
+cd /path/to/repo && sh scripts/vendor/vendor_torch.sh                          # torch 2.13.0, 2372 modules
 
 # assemble a scratch tree -- NOT the repo -- with the wasm-built _C dropped in
 mkdir -p /tmp/wasm4_torch_test
-cp -R torchnative/src/main/torch      /tmp/wasm4_torch_test/torch
-cp -R torchnative/src/main/torchgen   /tmp/wasm4_torch_test/torchgen
-cp -R torchnative/src/main/functorch  /tmp/wasm4_torch_test/functorch
-cp -R torchnative/src/main/torch-2.13.0.dist-info /tmp/wasm4_torch_test/
+cp -R torchnative/python/torch      /tmp/wasm4_torch_test/torch
+cp -R torchnative/python/torchgen   /tmp/wasm4_torch_test/torchgen
+cp -R torchnative/python/functorch  /tmp/wasm4_torch_test/functorch
+cp -R torchnative/python/torch-2.13.0.dist-info /tmp/wasm4_torch_test/
 cp "$CARGO_TARGET_DIR/wasm32-unknown-emscripten/release/_C.wasm" \
    /tmp/wasm4_torch_test/torch/_C.abi3.so
 mkdir -p /tmp/wasm4_torch_test/torch/bin && : > /tmp/wasm4_torch_test/torch/bin/torch_shm_manager
@@ -1497,11 +1497,11 @@ reproduced by the shape above: `loadPyodide({indexURL})`, mount or write files i
 `os.environ["TORCH_USE_RTLD_GLOBAL"]="1"` and the two `sys.modules` stubs from §8.3c, extend
 `sys.path`, then plain `import torch`.
 
-**New files, all inside `rust/wasm_probe/`:** the `bogus-symbol-test` feature and
+**New files, all inside `torchnative/rust/wasm_probe/`:** the `bogus-symbol-test` feature and
 `probe_bogus_symbol()` in `src/lib.rs`, and the corresponding `Cargo.toml` feature entry.
-`rust/torch_c/` was read and built against (not modified — its `aten.rs`, `bootstrap.py`,
-`overloads.json` were untouched); `tools/wheel/` was not touched. `torchnative/src/main/torch/`
-was vendored (gitignored, not committed) via the existing `vendor/vendor_torch.sh`, unmodified,
+`torchnative/rust/torch_c/` was read and built against (not modified — its `aten.rs`, `bootstrap.py`,
+`overloads.json` were untouched); `scripts/wheel/` was not touched. `torchnative/python/torch/`
+was vendored (gitignored, not committed) via the existing `scripts/vendor/vendor_torch.sh`, unmodified,
 and only ever *copied* (never edited) into `/tmp` scratch space for the Pyodide runs.
 
 The emsdk was checked before and after this session's use, the same way §7.9 did — this time
@@ -1519,8 +1519,8 @@ EM_CACHE=/Volumes/macMini/caches/emcc-scratch and cargo-target-emcc-torchc absor
 |---|---|---|
 | §7.6 | "the next step is a download and is not attempted here" | **done** — Pyodide 314.0.6 fetched, CPython 3.14.2 confirmed from the interpreter itself (§8.0) |
 | §7.5/§7.5a | "the imports resolved" proven against `pyinit_host.c`, a host this crate wrote | **repeated against Pyodide itself** (§8.2, §8.2a) — same conclusion, stronger host |
-| §7's implicit scope | only `rust/wasm_probe` was ever run under emscripten | `rust/torch_c` itself now builds for `wasm32-unknown-emscripten` unmodified (§8.3) — a question §7 never asked |
-| this section's own §8.3, first draft | "blocked at dependency resolution" for `rust/torch_c` | **wrong, corrected in place** (§8.3) — it built on the first real attempt; the guess was never run before being written, which is exactly the AGENTS.md §17.5 mistake this document otherwise tries to avoid |
+| §7's implicit scope | only `torchnative/rust/wasm_probe` was ever run under emscripten | `torchnative/rust/torch_c` itself now builds for `wasm32-unknown-emscripten` unmodified (§8.3) — a question §7 never asked |
+| this section's own §8.3, first draft | "blocked at dependency resolution" for `torchnative/rust/torch_c` | **wrong, corrected in place** (§8.3) — it built on the first real attempt; the guess was never run before being written, which is exactly the AGENTS.md §17.5 mistake this document otherwise tries to avoid |
 | §5b's suggested README rows | "extension builds: emscripten builds, loads and runs under Node" | should now read **loads into a real CPython, and reaches `import torch` with a real forward pass** — a materially stronger claim than "runs under Node" |
 
 ---
@@ -1530,7 +1530,7 @@ EM_CACHE=/Volumes/macMini/caches/emcc-scratch and cargo-target-emcc-torchc absor
 §8 ended with `import torch` and two computed ops inside real Pyodide, and with the sentence
 "there is still no WASM wheel". That sentence is now wrong. **A `pyemscripten` wheel of this
 distribution was built, installed into a real Pyodide 3.14.2, and `import torch` came up out of
-it and computed.** The artefact under test was `rust/torch_c` built from this worktree's HEAD, not
+it and computed.** The artefact under test was `torchnative/rust/torch_c` built from this worktree's HEAD, not
 §8's month-old one.
 
 The question this section was opened to answer was "which loader — Pyodide or a statically linked
@@ -1560,7 +1560,7 @@ Assembled member by member against the vendored tree, each wall found by running
 |---|---|---|---|
 | 1 | `ModuleNotFoundError: typing_extensions` | the six `pyproject.toml` dependencies; five are in Pyodide's index | none — `micropip` resolves them |
 | 2 | `OSError: could not load dynamic lib .../torch/lib/libtorch_global_deps.so` | an **empty side module built by `emcc`** | one `cc()` — see §9.4 |
-| 3 | `RuntimeError: Unable to find torch_shm_manager` | the empty marker `vendor/install_shim.sh:52` already places | none |
+| 3 | `RuntimeError: Unable to find torch_shm_manager` | the empty marker `scripts/vendor/install_shim.sh:52` already places | none |
 | 4 | `ModuleNotFoundError: _multiprocessing` | §8.3c's stub, still diagnostic, still not landed | **unsolved — §9.5** |
 
 Wall 2 is the one that is genuinely target-specific and the one a wheel *must* solve, because
@@ -1612,11 +1612,11 @@ the `cp314-cp314` + `EXT_SUFFIX`-named variant and finding it works too. Two spe
 tag `pyemscripten_2026_0` pins CPython 3.14 *and* Emscripten 5.0.3 together, so the wheel is
 single-platform whatever the ABI field says. The correction is narrower and worth having: `abi3`
 here is **inert, not harmful**. It buys nothing, it costs nothing, and — this is the part that
-matters for `tools/wheel/` — it means the wasm wheel is the *only* one of the seven targets that
+matters for `scripts/wheel/` — it means the wasm wheel is the *only* one of the seven targets that
 needs no ABI-tag machinery, because the pin it would have needed is already carried by the
 platform tag beside it.
 
-## 9.4 What `tools/wheel/build.py` would need — sized
+## 9.4 What `scripts/wheel/build.py` would need — sized
 
 Nothing was landed there. §4a guessed "the same shape of work as the two that exist"; having built
 the wheel by hand, that guess is right, and here is the itemised version. A `PyEmscriptenTarget`
@@ -1629,7 +1629,7 @@ needs the three answers `Target` asks for and no fourth:
 | `global_deps_name` | inherit `libtorch_global_deps.so` | zero |
 | `cc()` | `[emcc, "-shared", "-fPIC", "-fwasm-exceptions", "-sSIDE_MODULE=2"]` — the two extra flags are the whole difference from `AndroidTarget.cc()` | ~10 lines |
 | `platform_tag()` | **`pyemscripten_{abi_version}_wasm32`** — see the trap below | ~15 lines |
-| `check_image()` | wasm magic `b"\0asm"` + version word. `tools/wheel/binfmt.py` has Mach-O, ELF and PE readers and **no wasm reader**; this is the only genuinely new code | ~20 lines in `binfmt.py`, ~10 here |
+| `check_image()` | wasm magic `b"\0asm"` + version word. `scripts/wheel/binfmt.py` has Mach-O, ELF and PE readers and **no wasm reader**; this is the only genuinely new code | ~20 lines in `binfmt.py`, ~10 here |
 | `sysconfig()` / `python_root` | see the trap below | ~5 lines, plus an unzip step |
 
 ### 9.4a The trap: the tag is *not* derivable from the target's `_sysconfigdata`
@@ -1668,7 +1668,7 @@ work well enough to be believed.
 
 ### 9.4b `verify_cross.py` is the larger half
 
-`build.py` is ~60 lines of new code. `tools/wheel/verify_cross.py` is 1043 lines built on ELF/Mach-O
+`build.py` is ~60 lines of new code. `scripts/wheel/verify_cross.py` is 1043 lines built on ELF/Mach-O
 symbol tables (`elf_dynamic`, `elf_symbols`, `macho_info`) and its mutation suite at line 725
 drops members and asserts the checker notices. **A wasm module has none of those structures** — its
 imports and exports live in the wasm import/export sections, a different format from all three
@@ -1706,9 +1706,9 @@ export PATH="/Volumes/macMini/caches/emsdk/upstream/emscripten:\
 export EM_CACHE=/tmp/em-cache-wasm                      # not the shared emsdk cache
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wasm-wheel
 
-cd rust/torch_c && cargo build --release --target wasm32-unknown-emscripten   # _C.wasm, 4,724,414 B
+cd torchnative/rust/torch_c && cargo build --release --target wasm32-unknown-emscripten   # _C.wasm, 4,724,414 B
 # global-deps stub, as in §9.2
-# assemble the wheel: the four package roots from torchnative/src/main, plus
+# assemble the wheel: the four package roots from python, plus
 #   torch/_C.abi3.so                       <- _C.wasm
 #   torch/lib/libtorch_global_deps.so      <- the emcc stub
 #   torch/bin/torch_shm_manager            <- empty
@@ -1719,10 +1719,10 @@ cd rust/torch_c && cargo build --release --target wasm32-unknown-emscripten   # 
 ```
 
 Scratch only, as §8 was: the wheel and the stub live in `/tmp`, the Node drivers are not committed,
-and nothing under `tools/wheel/` was modified — §9.4 sizes that work rather than starting it, because
+and nothing under `scripts/wheel/` was modified — §9.4 sizes that work rather than starting it, because
 a `PyEmscriptenTarget` that `verify_cross.py` cannot check would read as progress it is not.
 
-`torchnative/src/main/torch/` was only ever *read* and copied. The shared emsdk was not written to:
+`torchnative/python/torch/` was only ever *read* and copied. The shared emsdk was not written to:
 `EM_CACHE` absorbed the one `emcc` invocation, and the sysroot stamp it generated landed in
 `/tmp/em-cache-wasm`.
 

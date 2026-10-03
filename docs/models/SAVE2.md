@@ -98,7 +98,7 @@ Bit-exact, not approximate.
 ### 2.2 shim writes -> upstream torch reads (cross-process)
 
 Wrote `state_dict()` with the shim in one process
-(`PYTHONPATH=.../torchnative/src/main TORCH_USE_RTLD_GLOBAL=1`), then loaded
+(`PYTHONPATH=.../python TORCH_USE_RTLD_GLOBAL=1`), then loaded
 the resulting file with plain upstream torch in a separate process
 (`env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`):
 
@@ -121,7 +121,7 @@ discrepancy in either writer.)
 
 This direction is already covered by the existing suite
 (`test_ckpt_torch_load_zip_round_trip_matches_upstream_within_measured_tolerance`
-and neighbours in `pytests/test_shim.py`, `_ckpt_fixture`), which builds a
+and neighbours in `tests/test_shim.py`, `_ckpt_fixture`), which builds a
 checkpoint with upstream torch and reads it back with the shim in a
 subprocess. Not re-derived here since it already runs on every suite pass;
 confirmed it still passes as part of the full-suite re-run below.
@@ -129,16 +129,16 @@ confirmed it still passes as part of the full-suite re-run below.
 ## 3. Regression
 
 Rebuilt `lib_C.dylib` from this worktree, reinstalled via
-`vendor/install_shim.sh`, cleared `build/test-results` first, and reran the
+`scripts/vendor/install_shim.sh`, cleared `build/test-results` first, and reran the
 full suite plus golden compare. No source files were touched by this round
 (`git status --short` in this worktree shows only this doc as new) — the
 rebuild exists to prove the binary the suite runs against is the one in this
 tree, not a stale artefact from before this session started.
 
 ```
-pytests/run.sh                 389 ok
-tools/docwatch/check_docs.py   DOCWATCH: PASS -- 350/350 evaluated marker(s) hold
-tools/golden/compare.py        SUMMARY: 8509/8509 cases passed, 0 failed, ops covered=203
+tests/run.sh                 389 ok
+tests/docwatch/check_docs.py   DOCWATCH: PASS -- 350/350 evaluated marker(s) hold
+tests/golden/compare.py        SUMMARY: 8509/8509 cases passed, 0 failed, ops covered=203
 ```
 
 All three meet or exceed the round's gates (389 ok / 350+ DOCWATCH / 8509/8509,
@@ -146,11 +146,11 @@ ops=203).
 
 ## 4. What this round did NOT touch
 
-No changes to `aten.rs`, `capture.rs`, `tape.rs`, `tools/golden/`,
-`.github/`, or `torchnative/src/main/torch/` (the generated tree). No new
+No changes to `aten.rs`, `capture.rs`, `tape.rs`, `tests/golden/`,
+`.github/`, or `torchnative/python/torch/` (the generated tree). No new
 permanent pytest was added for the SmolLM2 round trip: it depends on a
 network-cacheable Hub download and a full 135M-parameter forward pass, which
-does not fit the existing `pytests/test_shim.py` fixtures (all synthetic,
+does not fit the existing `tests/test_shim.py` fixtures (all synthetic,
 in-repo, no network dependency) without either committing weights or adding
 a network-conditional skip the rest of the suite does not have a precedent
 for. The three round-trip runs above were captured directly in this document

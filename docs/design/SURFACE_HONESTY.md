@@ -353,7 +353,7 @@ brainwave.federated       라운드 · 클라이언트 선택 · 집계 · 이�
 
    `DESIGN.md` §2 가 이미 두 가지를 못 박아뒀습니다 — **주입 지점을 하나로 모을 것**, 그리고
    **add-hook 은 편의이지 의존이 아닐 것**(데스크톱에서 상류 torch 위에서도 동작해야 하므로).
-   `torchnative/src/main/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
+   `torchnative/python/torch/README.md` 는 그 합치는 방법이 아직 미정이라고 적어두었고,
    그것은 여전히 열린 항목입니다.
 2. **`ProcessGroup` 의 가정은 cross-device FL 과 안 맞습니다.** 그것은 고정 세계 크기 ·
    전원 참석 · 동기 · 신뢰를 전제하는데, FL 은 부분 참여 · 이탈 · 비동기가 정상입니다.
@@ -426,7 +426,7 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 > `from_config` 는 오늘 이 정확한 시나리오로 성공한다(실측, 파라미터 수 95,040개 —
 > `docs/models/FROM_CONFIG.md` 감사(이 라운드)가 실물 torch 로 잰 것과 정확히 같음). §2.6 이 스스로
 > "그때까지 검증은 손으로 옮겨 적은 모델로 계속합니다" 라고 적어 둔 "그때" 가 왔다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_distributed_c10d present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_distributed_c10d present -->
 
 이제 위 §0 요약표의 "`from_config` 진행: 변화 없음" 줄도 같은 이유로 낡았다 — 아래에서 다시
 쓰지 않고 이 정정을 가리킨다.
@@ -436,10 +436,10 @@ AttributeError: module 'torch.distributed' has no attribute 'Store'
 ## 3. 변경 범위와 검증
 
 ```
- M rust/torch_c/src/bootstrap.py        __bool__ · _BUILD_FLAGS 14 개 · install 의 불변식 검사
- M rust/torch_c/pytests/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
- M vendor/gen_surface.py                `_bool` 주석을 "bool" kind 로 보존
- M rust/torch_c/src/surface.json        재생성. 14 개 이름의 kind 만 바뀜, 그 외 바이트 동일
+ M torchnative/rust/torch_c/src/bootstrap.py        __bool__ · _BUILD_FLAGS 14 개 · install 의 불변식 검사
+ M tests/test_shim.py    테스트 2 개 (구현 전 둘 다 적색 확인)
+ M scripts/vendor/gen_surface.py                `_bool` 주석을 "bool" kind 로 보존
+ M torchnative/rust/torch_c/src/surface.json        재생성. 14 개 이름의 kind 만 바뀜, 그 외 바이트 동일
 ```
 
 `surface.json` 은 변경 **전에** 한 번 재생성해 `git` 판본과 완전히 동일함을 확인한 뒤 바꿨습니다.
@@ -456,9 +456,9 @@ FAIL test_every_build_flag_the_stubs_declare_answers_with_a_real_bool: Assertion
 
 | 검증 | 결과 |
 |---|---|
-| 스모크 (`pytests/run.sh`) | **exit 0** — ok 62 / FAIL 0 |
-| 골든 (`tools/golden/compare.py`) | **exit 0** — 1043/1043, ops covered=**62** |
-| 스키마 (`pytests/verify_schemas.py`) | **exit 0** — 127/127 |
+| 스모크 (`tests/run.sh`) | **exit 0** — ok 62 / FAIL 0 |
+| 골든 (`tests/golden/compare.py`) | **exit 0** — 1043/1043, ops covered=**62** |
+| 스키마 (`tests/verify_schemas.py`) | **exit 0** — 127/127 |
 | strict probe `--target torch` | **exit 0** |
 | strict probe `--target transformers` | **exit 0** |
 | 호스트 `cargo build --release` | **exit 0** |
@@ -476,11 +476,11 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-surface
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-vendor/vendor_torch.sh && vendor/install_shim.sh
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
-$PY tools/golden/compare.py
-$PY rust/torch_c/pytests/verify_schemas.py
-TORCH_USE_RTLD_GLOBAL=1 $PY vendor/probe.py --mode strict --target torch
+scripts/vendor/vendor_torch.sh && scripts/vendor/install_shim.sh
+PYTHON=$PY sh tests/run.sh
+$PY tests/golden/compare.py
+$PY tests/verify_schemas.py
+TORCH_USE_RTLD_GLOBAL=1 $PY scripts/vendor/probe.py --mode strict --target torch
 ```
 
 §1.3 의 진리 검사 계측과 §2.4 의 카멜레온 깊이 측정은 `/tmp` 의 임시 스크립트로 돌렸습니다 —

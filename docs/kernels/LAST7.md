@@ -6,9 +6,9 @@
 > across all four required files, `Tensor.unfold` landed (`aten.rs` line 282), and `fastspeech2_conformer`
 > now forwards and only diverges numerically (288/290 agree per AGREE2.md).
 
-Worktree `work/last7` on develop `b33e2ee`. Territory: `rust/torch_c/src/aten.rs`,
-`overloads.json`, `methods.json`, `tools/golden/cases.py`,
-`rust/torch_c/pytests/test_last7.py`, plus the three inversions §7 lists.
+Worktree `work/last7` on develop `b33e2ee`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
+`overloads.json`, `methods.json`, `tests/golden/cases.py`,
+`tests/test_last7.py`, plus the three inversions §7 lists.
 
 ## 0. The alias-versus-kernel split, first
 
@@ -34,7 +34,7 @@ anyway**: `docs/bindings/ARGFORM.md` §1 had already measured that `padding=[0, 
 asymmetric padding at all. §4.
 
 <!-- DOCWATCH: op-implemented aten.unfold.default -->
-<!-- DOCWATCH: json-key rust/torch_c/src/methods.json unfold present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json unfold present -->
 
 ---
 
@@ -72,7 +72,7 @@ A step equal to the size is a plain reshape, and a reshape agrees with **four**
 different wrong implementations at once: a stride read off the wrong axis, the
 window axis inserted next to its source instead of appended, a gather that walks
 storage order rather than the receiver's logical order, and an off-by-one in the
-window count. Every value case in `tools/golden/cases.py::unfold_cases` and in
+window count. Every value case in `tests/golden/cases.py::unfold_cases` and in
 `test_last7.py` overlaps its windows for that reason, and one case deliberately
 uses `step > size` (windows that *skip*) so that the window-count arithmetic is
 exercised in both directions from `step == size`.
@@ -101,14 +101,14 @@ wrong number:
 | write through the window, base read after | propagates | `RuntimeError` |
 | write to the base, window read after | propagates | `RuntimeError` |
 
-Both directions are registered in `tools/golden/cases.py` as `expect="c_error"`,
+Both directions are registered in `tests/golden/cases.py` as `expect="c_error"`,
 one case each so that closing one cannot hide the other — the same register
 `as_strided_cases` uses, and a stronger one than `aten.slice.Tensor` (step > 1)
 and `aten.view.dtype`, which are `expect="diverge"` and lose a write *silently*.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs unfold_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs unfold_default present -->
+<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_through_an_unfold_window_is_refused_rather_than_lost present -->
+<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_writing_to_the_base_of_a_live_unfold_is_refused_too present -->
 
 ---
 
@@ -134,7 +134,7 @@ So it is **inverted, not deleted**:
 until somebody writes it down. That is the fifth inversion this repository has
 kept rather than dropped.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
+<!-- DOCWATCH: symbol-in-file tests/test_strided.py test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier present -->
 
 ### 3.1 Where `unfold` and `as_strided` genuinely differ
 
@@ -231,9 +231,9 @@ is inverted to `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream
 `test_a_per_axis_differing_stride_is_still_refused_by_name` for the half that did
 not close, so the two halves of `docs/bindings/ARGFORM.md` §1's finding stay separable.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py unfold_cases present -->
+<!-- DOCWATCH: symbol-in-file tests/test_argform.py test_per_axis_conv_padding_now_computes_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_argform.py test_a_per_axis_differing_stride_is_still_refused_by_name present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py unfold_cases present -->
 
 ---
 
@@ -270,7 +270,7 @@ general `SymInt` rule, not something about `multinomial` — which means the fix
 needs nothing: `aten.multinomial.default` is implemented and golden-compared.
 
 **An `overloads.json` row is not an available workaround.** Every schema string
-in both tables is checked against upstream by `pytests/verify_schemas.py`, so a
+in both tables is checked against upstream by `tests/verify_schemas.py`, so a
 fabricated `aten::multinomial.num_samples_tensor` would fail that check rather
 than route around the type checker. Recorded so the next round does not re-derive
 it, and `test_multinomial_with_a_tensor_num_samples_is_an_argument_form_not_a_kernel`
@@ -338,8 +338,8 @@ into "forgotten".
 > fourth and it is the one that cannot be done without the other three.
 > `docs/kernels/REPEAT.md` §2 states it that way.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
+<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
+<!-- DOCWATCH: symbol-in-file tests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
 
 ---
 
@@ -387,7 +387,7 @@ closed and each was inverted into a **stronger** assertion:
    → `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream`, which
    diffs values instead of asserting a refusal, **plus** a second test keeping
    the stride half of the refusal named. §4.
-3. `tools/golden/cases.py`'s `asymmetric padding -- c_error, torch computes`
+3. `tests/golden/cases.py`'s `asymmetric padding -- c_error, torch computes`
    → five live value-diffing rows across two dtypes. §4.
 
 One pinned count moved, with the arithmetic that keeps it a check:
@@ -398,7 +398,7 @@ from is the check**: `methods.json`-only, because upstream has `Tensor.unfold` a
 have meant an `overloads.json` row for a door upstream does not have — the trap
 that note already records in the other direction for `complex`.
 
-`tools/golden/reach_allow.json` lost its `multinomial` entry, which the reach test
+`tests/golden/reach_allow.json` lost its `multinomial` entry, which the reach test
 demanded by name once §5.1's test spelled the function. The allowlist's stated
 reason was that a value assertion on a random op is unsound; the test that
 replaced it asserts a **shape**, so the reason does not survive the entry.

@@ -2,7 +2,7 @@
 
 This round re-measures the 19 architectures from docs/architectures/DEMAND.md and docs/architectures/DEMAND6.md, and then widens the set with 10 new architectures and tasks (including a decoder-only MoE, vision transformers with detection/segmentation, a multimodal model, state-space/recurrent models, and `.generate()` across seq2seq).
 
-**Nothing in this round changed source** — `rust/torch_c/`, `bootstrap.py`, `tools/golden/cases.py`, `torchnative/src/main/torch/` (vendored) are all untouched. `git status --short` is empty throughout.
+**Nothing in this round changed source** — `torchnative/rust/torch_c/`, `bootstrap.py`, `tests/golden/cases.py`, `torchnative/python/torch/` (vendored) are all untouched. `git status --short` is empty throughout.
 
 ## 1. The existing nineteen
 

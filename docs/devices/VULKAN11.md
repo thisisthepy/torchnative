@@ -27,23 +27,23 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 71 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs require_exclusive present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs vulkan_storage present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs require_exclusive present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs vulkan_storage present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_ADD_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs INPLACE_SCALAR_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_add_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/inplace_scalar_f32.comp uintBitsToFloat present -->
 <!-- DOCWATCH: op-implemented aten.add_.Tensor -->
 <!-- DOCWATCH: op-implemented aten.mul_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.fill_.Scalar -->
 <!-- DOCWATCH: op-implemented aten.zero_.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_device_can_say_which_tensors_share_a_buffer_and_that_is_the_analysis present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_storage_report_refuses_a_tensor_that_is_not_on_this_device present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_in_place_ops_agree_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_in_place_op_wrote_into_the_buffer_it_was_given_and_cost_one_shader present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_an_in_place_write_through_a_shared_buffer_refuses_and_leaves_the_alias_intact present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_in_place_refuses_the_operands_it_has_no_kernel_for_rather_than_reaching_for_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_torch_optim_sgd_drives_a_parameter_on_this_device_and_agrees_with_upstream present -->
 
 ---
 
@@ -242,7 +242,7 @@ torch.optim.SGD (losses, weights): 8 cases, tolerance 9.537e-07;
 만들었기 때문**입니다 — 분석이 성립하는지 재 보지 않고 커널을 쓸 수는 없었습니다. 그래서
 그 둘에는 M5 를 따로 붙였습니다.
 
-**다섯 번 모두 `vendor/install_shim.sh` 로 빌드했습니다.** 그 스크립트가 아티팩트를
+**다섯 번 모두 `scripts/vendor/install_shim.sh` 로 빌드했습니다.** 그 스크립트가 아티팩트를
 **vendored 트리에 직접** 설치하고, 같은 파일을 stage 로 복사했습니다 — 즉 서브프로세스 프로브가
 읽는 `.so` 와 인프로세스 테스트가 읽는 `.so` 가 매번 같은 변이체였습니다. `docs/devices/VULKAN9.md`
 §6.1 이 기록한 함정의 반대 오진(변이가 무해해 보이는 것)을 막는 것이 이것입니다.

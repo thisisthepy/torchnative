@@ -115,14 +115,14 @@ To determine whether the `linear` time could be easily reclaimed, we checked how
 
 ## 1. The kernel already exists, and it is off because it is slower
 
-**`rust/torch_c/src/flash.rs` is a blocked attention kernel with an online
+**`torchnative/rust/torch_c/src/flash.rs` is a blocked attention kernel with an online
 softmax — 845 lines of it — and it has been in this tree the whole time.** Its
 own header says so: *"a **blocked** kernel with an online softmax, and the order
 in which it recombines the blocks is observable"*. It is `aten::_scaled_dot_
 product_flash_attention_for_cpu` reproduced.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/flash.rs reference_enabled present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/flash.rs attend present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/flash.rs reference_enabled present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/flash.rs attend present -->
 
 It is **off by default**, and the header gives the reason in its second
 sentence: *"This kernel is 20x slower at T=512 than the candle formulation it
@@ -185,4 +185,4 @@ overhead, not arithmetic.
 
 ---
 
-*Reproduce §0 with `tools/bench/profile_decode.py` and `tools/bench/profile_sdpa_shapes.py`.*
+*Reproduce §0 with `tests/bench/profile_decode.py` and `tests/bench/profile_sdpa_shapes.py`.*

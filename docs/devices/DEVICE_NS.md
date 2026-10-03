@@ -1,21 +1,21 @@
 # `torchnative.device` — a namespace this project owns, and what each name resolves to
 
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py Availability present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NpuResolution present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py EagerDevice present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py CompiledDevice present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py EagerUseRefused present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NpuUnresolved present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NPU_CANDIDATES present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py make present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py install present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_mps_availability_is_measured_not_declared present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_npu_resolves_differently_per_host present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_npu_never_resolves_to_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_to_is_unchanged_for_every_ordinary_argument_form present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_ordinary_calls_reach_upstream_with_identical_arguments present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_cuda_keeps_its_five_named_reasons present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_npu_refuses_to_be_a_tensor_destination present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py Availability present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NpuResolution present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py EagerDevice present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py CompiledDevice present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py EagerUseRefused present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NpuUnresolved present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/__init__.py NPU_CANDIDATES present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py make present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/device/_module_to.py install present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_mps_availability_is_measured_not_declared present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_npu_resolves_differently_per_host present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_npu_never_resolves_to_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_to_is_unchanged_for_every_ordinary_argument_form present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_ordinary_calls_reach_upstream_with_identical_arguments present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_cuda_keeps_its_five_named_reasons present -->
+<!-- DOCWATCH: symbol-in-file tests/test_devicens.py test_npu_refuses_to_be_a_tensor_destination present -->
 
 ## 0. What this is
 
@@ -309,7 +309,7 @@ report, and on an unwired one it fails if `self` comes back (N7).
 
 **What the Intel branch is and is not evidence of.** No machine in this
 repository has an Intel NPU, and `library_candidates` refuses on darwin by
-design. `rust/torch_c/pytests/test_npuwire.py` therefore fakes exactly two
+design. `tests/test_npuwire.py` therefore fakes exactly two
 boundaries and nothing above them — the probe (`TORCHNATIVE_DEVICE_HOST=windows`
 plus `intelnpu.npu_available` / `available_devices`, the shape §8 established)
 and the OpenVINO runtime (`intelnpu.OpenVINO`, four methods). The resolver,

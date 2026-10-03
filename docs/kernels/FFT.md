@@ -1,10 +1,10 @@
 # The FFT — the third wall, and `torch.stft` produces upstream's numbers
 
-Worktree `work/fft` on develop `2498122`. Territory: `rust/torch_c/src/aten.rs`,
-`src/overloads.json`, `tools/golden/cases.py` and the new
-`rust/torch_c/pytests/test_fft.py`. Five files outside that list were edited and
+Worktree `work/fft` on develop `2498122`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
+`src/overloads.json`, `tests/golden/cases.py` and the new
+`tests/test_fft.py`. Five files outside that list were edited and
 each is named with its reason in §8. `tensor.rs`, `dtype.rs`, `bootstrap.py`,
-`capture.rs`, `tape.rs`, `tools/wheel/` and `torchnative/` were not touched.
+`capture.rs`, `tape.rs`, `scripts/wheel/` and `torchnative/` were not touched.
 
 `docs/kernels/COMPLEX.md` set an ordering — **reflect pad → complex tensors → the
 FFT** — and the two previous rounds cleared the first two (`docs/kernels/PAD.md`,
@@ -27,11 +27,11 @@ Split the way docs/architectures/ARCH100.md §5.3 asks, rather than as one numbe
 
 * **feature added** — 5 kernels: `_fft_r2c`, `_fft_c2c`, `_fft_c2r`,
   `stft.default`, `stft.center`; one `overloads.json` row (two schemas).
-* **tests added** — 14 in `pytests/test_fft.py`; 38 golden cases
+* **tests added** — 14 in `tests/test_fft.py`; 38 golden cases
   (10039 → 10077, ops 270 → 272).
 * **defect fixed** — none pre-existing; the two in §2.1 and §3 were this
   round's own, found before landing.
-* **tests inverted** — 1 in `pytests/test_tail2.py` (the `fft_` absence
+* **tests inverted** — 1 in `tests/test_tail2.py` (the `fft_` absence
   assertion), 1 example moved in `test_shim.py`, 2 pinned counts.
 * **not done** — `istft` (§7.2), `fft_fftn`'s *spelling* (§5.3), a
   device-side transform (§7.1), `torch.stft(center=True)`'s last line (§6).
@@ -39,12 +39,12 @@ Split the way docs/architectures/ARCH100.md §5.3 asks, rather than as one numbe
 <!-- The three `_fft_*` keys are in IMPLEMENTED_AWAITING_GOLDEN, not in
      `_aten_implemented()` (§3, §7.3), so `op-implemented` is the wrong marker
      for them and `op-not-implemented` would be a lie in the other direction.
-     Their dispatch arms are watched directly instead; `pytests/test_fft.py`
-     and `pytests/test_tail2.py` both pin the parked list itself. -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fft_r2c_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fft_c2c_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fft_c2r_default present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fft_bluestein present -->
+     Their dispatch arms are watched directly instead; `tests/test_fft.py`
+     and `tests/test_tail2.py` both pin the parked list itself. -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fft_r2c_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fft_c2c_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fft_c2r_default present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs fft_bluestein present -->
 <!-- DOCWATCH: op-implemented aten.stft.default -->
 <!-- DOCWATCH: op-implemented aten.stft.center -->
 <!-- DOCWATCH: op-implemented aten.as_strided.default -->
@@ -383,7 +383,7 @@ whisper's shape, n_fft=400, center=True                       (201, 11)  6.3e-08
 here should be read as saying it does.** What is true is that the kernels are
 right and the remaining step is binding surface in another file. Whoever lands
 docs/kernels/PAD.md §5's patch should also delete the six `aten.*_pad*d.default`
-entries from `tools/golden/reach_allow.json`, which are written to fail the
+entries from `tests/golden/reach_allow.json`, which are written to fail the
 suite the moment the branch lands.
 
 ## 7. Left standing, each a decision rather than an omission
@@ -421,7 +421,7 @@ deliberately does **not** put a row in `overloads.json` for it. The door nobody
 uses is not the one that reaches the kernel: `torch.fft.rfft`/`fft`/`ifft`/
 `irfft` are C++-level composites that land on `aten::_fft_*` through the
 dispatcher, and `torch.stft` reaches it through `aten::stft`, which is spelled
-and exercised. Three entries in `tools/golden/reach_allow.json` record this
+and exercised. Three entries in `tests/golden/reach_allow.json` record this
 with the reason; delete them if a caller for the bare spelling is found.
 
 ### 7.4 Complex input to `stft`
@@ -434,10 +434,10 @@ one — `torch.stft` on a real waveform is the whole of docs/architectures/VOICE
 
 | file | edit | why |
 |---|---|---|
-| `rust/torch_c/src/device.rs` | +5 op names in `MPS_HOST_READBACK_OPS`, `71` → `76` | **Required, not optional.** The gate is symmetric: an op that reads back and is not declared fails, *and* a declared op that does not read back fails. There is no way to classify these five from inside `aten.rs`. Data only; no logic changed. §7.1. |
-| `tools/golden/reach_allow.json` | +3 entries for the `_fft_*` keys | Same class of edit docs/kernels/PAD.md made. Each carries its reason and an `upstream_absent` claim that is put to a real upstream by `reach.py`. §7.3. |
-| `rust/torch_c/pytests/test_shim.py` | 2 pinned counts, 1 example moved | §8.1. |
-| `rust/torch_c/pytests/test_tail2.py` | 1 assertion inverted | That file's docstring asks an implementing round to invert rather than delete. Nothing was removed: the list is now pinned to exactly the three, so a fourth still fails. |
+| `torchnative/rust/torch_c/src/device.rs` | +5 op names in `MPS_HOST_READBACK_OPS`, `71` → `76` | **Required, not optional.** The gate is symmetric: an op that reads back and is not declared fails, *and* a declared op that does not read back fails. There is no way to classify these five from inside `aten.rs`. Data only; no logic changed. §7.1. |
+| `tests/golden/reach_allow.json` | +3 entries for the `_fft_*` keys | Same class of edit docs/kernels/PAD.md made. Each carries its reason and an `upstream_absent` claim that is put to a real upstream by `reach.py`. §7.3. |
+| `tests/test_shim.py` | 2 pinned counts, 1 example moved | §8.1. |
+| `tests/test_tail2.py` | 1 assertion inverted | That file's docstring asks an implementing round to invert rather than delete. Nothing was removed: the list is now pinned to exactly the three, so a fourth still fails. |
 | `docs/architectures/VOICE.md` | 1 DOCWATCH marker inverted | `op-not-implemented aten.stft.default` was true when written and is now false. Inverted to `op-implemented` for both overloads rather than deleted, with a note pointing at this file. |
 
 ### 8.1 The two pinned counts, with the arithmetic that keeps them checks
@@ -466,7 +466,7 @@ reasoning the six pad kernels record above it in that file.
 ## 9. Gates
 
 ```text
-suite      684 ok  (baseline 668 + 16 in pytests/test_fft.py), EXIT=0
+suite      684 ok  (baseline 668 + 16 in tests/test_fft.py), EXIT=0
 DOCWATCH   PASS -- 625/625
 golden     10077/10077 cases passed, 0 failed, ops covered=272, pending 0
            (baseline 10039/10039, ops 270)

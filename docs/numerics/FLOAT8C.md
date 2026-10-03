@@ -44,13 +44,13 @@ Exact rather than tolerated. `float8_e4m3fn` is 4 exponent bits and 3 mantissa
 bits with a maximum magnitude of 448 and no infinities, so all 256 of its bit
 patterns are representable in `f32`, and `f32 -> f64` is exact for every one of
 them. The two-step result is bit-identical to what a non-recursive `to_f64`
-would have produced. `tools/golden/compare.py::_as_list` had already been
+would have produced. `tests/golden/compare.py::_as_list` had already been
 reading float8 results by this same widening since `docs/numerics/FLOAT8B.md` §5.1 — the
 evidence that the route works was sitting in the harness the whole time.
 
 ### Where the route lives
 
-`rust/torch_c/src/reduced.rs::to_dtype` — the funnel `fast_to` already goes
+`torchnative/rust/torch_c/src/reduced.rs::to_dtype` — the funnel `fast_to` already goes
 through, and therefore the one `aten._to_copy.default` uses. That placement is
 not cosmetic. After routing every `to_dtype(DType::F64)` call site in `aten.rs`
 through a new `widen_f64`, **`x.to(torch.float64)` still hung**, because the
@@ -253,7 +253,7 @@ dtype specifically, an earlier round on it having left four binaries spinning at
 
 ### 6.2 The gate is load-bearing
 
-`rust/torch_c/pytests/test_shim.py` gained seven tests, and one of the previous
+`tests/test_shim.py` gained seven tests, and one of the previous
 round's was rewritten rather than deleted:
 `test_float8_shim_only_refusals_do_not_borrow_upstreams_wording` asserted the
 ten still refused, and it **failed** when they started computing — which is the
@@ -280,20 +280,20 @@ side changes its mind.
 
 ### 6.4 Gates
 
-    rust/torch_c/pytests/run.sh          EXIT=0, smoke_ok = 387, DOCWATCH: PASS -- 329/329
-    tools/golden/compare.py              EXIT=0, SUMMARY: 8509/8509 cases passed, 0 failed,
+    tests/run.sh          EXIT=0, smoke_ok = 387, DOCWATCH: PASS -- 329/329
+    tests/golden/compare.py              EXIT=0, SUMMARY: 8509/8509 cases passed, 0 failed,
                                          ops covered=203, pending case builders=0
 
 <!-- DOCWATCH: count smoke_ok ge 380 -->
 <!-- DOCWATCH: count golden_cases_total ge 8509 -->
 <!-- DOCWATCH: count golden_ops_covered ge 203 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/reduced.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs widen_f64 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs float8_pow_refuses present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs F8E4M3 present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _float8_extra present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/reduced.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs widen_f64 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_pow_refuses present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs F8E4M3 present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_float8_no_op_refuses_in_the_shims_own_words_any_more present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _float8_extra present -->
 
 ---
 

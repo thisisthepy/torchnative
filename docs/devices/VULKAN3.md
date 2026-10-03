@@ -53,7 +53,7 @@ candle-core = { version = "0.11.0", default-features = false, features = ["metal
 
 Accelerate 항목에 합치지 **않은** 이유가 하나 있고, 그것이 잘못된 게이트를 하나 막습니다.
 Accelerate 항목은 `not(torch_c_no_accelerate)` 로 묶여 있는데, 그 cfg 는
-`scripts/device_android.sh parity` 가 호스트 빌드에서 **BLAS 를 빼려고** 켜는 것입니다.
+`scripts/devices/device_android.sh parity` 가 호스트 빌드에서 **BLAS 를 빼려고** 켜는 것입니다.
 거기에 metal 을 얹으면 parity 빌드가 **`mps` 장치까지 잃고**, §5 의 mps 테스트들은 실패가 아니라
 **스킵**됩니다 — 아무 말 없이 검사를 그만두는 게이트입니다. Cargo 는 같은 의존성의 여러 항목에서
 피처를 합집합으로 모으므로, 두 항목은 평소 `["accelerate","metal"]`, parity cfg 아래에서는
@@ -83,7 +83,7 @@ Accelerate 항목은 `not(torch_c_no_accelerate)` 로 묶여 있는데, 그 cfg 
 |---|---|---|
 | `aarch64-apple-darwin` | `accelerate`, `metal` | EXIT=0 |
 | `aarch64-apple-ios-sim` | `accelerate`, `metal` | **EXIT=0** — `otool -L` 에 `Metal.framework` 가 실제로 박힘 |
-| `aarch64-linux-android` | **없음** | EXIT=0 (`scripts/device_android.sh build`) |
+| `aarch64-linux-android` | **없음** | EXIT=0 (`scripts/devices/device_android.sh build`) |
 | `wasm32-unknown-emscripten` | **없음** | 해당 없음 |
 
 Android 와 wasm 은 `target_vendor = "apple"` 에 매칭되지 않으므로 **의존성 그래프에 들어오지도
@@ -201,7 +201,7 @@ mul(...)                          -> NotImplementedError:
 
 ## 5. 두 장치가 검사받는 방식이 다르다 — 그리고 그래야 한다
 
-`pytests/test_shim.py` 에 11개가 늘었습니다. 두 묶음이 **서로 다른 성질**을 단언합니다.
+`tests/test_shim.py` 에 11개가 늘었습니다. 두 묶음이 **서로 다른 성질**을 단언합니다.
 
 | 테스트 | 무엇을 단언하는가 |
 |---|---|
@@ -230,11 +230,11 @@ mul(...)                          -> NotImplementedError:
 
 | | 값 |
 |---|---|
-| `pytests/run.sh` (로더 없음) | **426 ok**, 0 FAIL, EXIT=0 — vulkan 넷은 이름을 대고 스킵 |
+| `tests/run.sh` (로더 없음) | **426 ok**, 0 FAIL, EXIT=0 — vulkan 넷은 이름을 대고 스킵 |
 | 같은 스위트, 로더 있음 | **426 ok**, 0 FAIL, EXIT=0 — **스킵 0개.** mps 와 vulkan 이 둘 다 실제 M1 위에서 |
 | DOCWATCH | **PASS — 417/417** |
 | golden `compare.py` | **8681/8681**, ops=207 — **움직이지 않음** |
-| `aarch64-linux-android` | EXIT=0 (`scripts/device_android.sh build`) |
+| `aarch64-linux-android` | EXIT=0 (`scripts/devices/device_android.sh build`) |
 | `aarch64-apple-ios-sim` | EXIT=0 (`PYO3_CONFIG_FILE` 레시피) |
 
 golden 이 움직이지 않은 것이 이 라운드의 음성 대조군입니다. 새 장치는 CPU 결과를 하나도 바꾸지
@@ -242,7 +242,7 @@ golden 이 움직이지 않은 것이 이 라운드의 음성 대조군입니다
 
 ### 6.1 함정 — `run.sh` 를 통해서는 Vulkan 이 절대 보이지 않는다
 
-`DYLD_LIBRARY_PATH=... sh rust/torch_c/pytests/run.sh` 로 돌리면 **로더를 정확히 가리켰는데도
+`DYLD_LIBRARY_PATH=... sh tests/run.sh` 로 돌리면 **로더를 정확히 가리켰는데도
 vulkan 테스트 넷이 전부 스킵됩니다.** macOS 의 SIP 가 보호된 바이너리(`/bin/sh`)를 exec 할 때
 환경에서 `DYLD_*` 를 **떼어냅니다.** 그래서 변수는 셸에는 있고 파이썬에는 없습니다.
 
@@ -255,7 +255,7 @@ vulkan 테스트 넷이 전부 스킵됩니다.** macOS 의 SIP 가 보호된 �
 ```sh
 V=~/Library/Android/sdk/emulator/lib64/vulkan
 env DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
-    PYTHONPATH=<stage> $PY rust/torch_c/pytests/test_shim.py
+    PYTHONPATH=<stage> $PY tests/test_shim.py
 ```
 
 `run.sh` 는 이 라운드의 담당 범위가 아니라 고치지 않았습니다. 고친다면 `run.sh` 가 파이썬을

@@ -16,7 +16,7 @@ but every one of those runs inside `torch.no_grad()`, which isolates the mode ax
 harder half untouched. README §2 and §3 sell federated learning and test-time adaptation. A
 federated round is *forward, backward, optimiser step, aggregate*. We have the first.
 
-**This is an investigation, not an implementation.** No kernel was written, `rust/torch_c/src/` is
+**This is an investigation, not an implementation.** No kernel was written, `torchnative/rust/torch_c/src/` is
 untouched, and the vendored tree was not modified. The whole diff is this document plus **one
 test** that pins what §1 measured (§10). Everything below is either a command that was run, or is
 labelled as coming from a stub.
@@ -29,9 +29,9 @@ The gates, before this work and after it:
 
 | gate | before | after |
 |---|---|---|
-| `pytests/run.sh` | 285 ok, 0 FAIL | **286 ok, 0 FAIL** (§10's test) |
+| `tests/run.sh` | 285 ok, 0 FAIL | **286 ok, 0 FAIL** (§10's test) |
 | `run.sh` DOCWATCH | 43/43 | **59/59** (16 new markers, all in this document) |
-| `tools/golden/compare.py` | 6587/6587, ops=163, pending 1 | unchanged |
+| `tests/golden/compare.py` | 6587/6587, ops=163, pending 1 | unchanged |
 | `verify_schemas.py` | 4465/4465 | unchanged |
 
 `ops=163` is unchanged on purpose: no kernel landed, so nothing here could have moved it.
@@ -65,7 +65,7 @@ kernel work already done — not a "do we abandon abi3" decision. §4 and §5 gi
 ### 1.1 The literal command from the brief
 
 ```
-$ PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 python -c \
+$ PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 python -c \
     "import torch; x = torch.randn(4, requires_grad=True); (x*x).sum().backward()"
 ```
 
@@ -239,7 +239,7 @@ nothing new.
 | Python `autograd.Function` | `python_function.cpp` | **no** — not traversed (§2.4) |
 | derivative formulas | `derivatives.yaml` (687 entries) + `FunctionsManual.cpp` (8765 lines) | **partly** — §4 counts exactly how much |
 
-The vendored tree contains **no** `torch/csrc/autograd/` at all (`torchnative/src/main/torch/csrc/`
+The vendored tree contains **no** `torch/csrc/autograd/` at all (`torchnative/python/torch/csrc/`
 holds only `inductor`), so none of this arrives for free the way the Python-level `torch/autograd/`
 package does.
 
@@ -319,12 +319,12 @@ sizes the expense.
 Ground truth is the vendored `derivatives.yaml` — this is torch 2.13.0's own file, in the tree:
 
 ```
-$ grep -c "^- name:" torchnative/src/main/torchgen/packaged/autograd/derivatives.yaml
+$ grep -c "^- name:" torchnative/python/torchgen/packaged/autograd/derivatives.yaml
 687
 ```
 
 687 entries is upstream's whole differentiable surface. This shim implements 163 ops
-(`torch._C._aten_implemented()`, which is the same 163 `tools/golden/compare.py` reports). The
+(`torch._C._aten_implemented()`, which is the same 163 `tests/golden/compare.py` reports). The
 question is how many formulas *those* need.
 
 ```
@@ -779,9 +779,9 @@ is the one assumption here that is not a measurement**, and it is the one to che
 export PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-autograd
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-SHIM="PYTHONPATH=torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 1
+SHIM="PYTHONPATH=python TORCH_USE_RTLD_GLOBAL=1 $PY"     # VENDOR.md wall 1
 
 # §1  where it stops
 $SHIM -c "import torch; torch.randn(4, requires_grad=True)"            # wall 1
@@ -798,7 +798,7 @@ grep -rl "internal/pycore" $P/dynamo/  ;  grep -rl "internal/pycore" $P/autograd
 grep -c "Py_\|PyObject\|PyGILState" $P/autograd/engine.cpp             # -> 0
 
 # §4  the formula count
-grep -c "^- name:" torchnative/src/main/torchgen/packaged/autograd/derivatives.yaml   # -> 687
+grep -c "^- name:" torchnative/python/torchgen/packaged/autograd/derivatives.yaml   # -> 687
 $SHIM -c "import torch,json; json.dump(sorted(torch._C._aten_implemented()),
                                        open('/tmp/ag/shim_ops.json','w'))"            # -> 163
 $PY /tmp/ag/classify.py                                  # 122 = 66 trivial + 31 composed + 25 kernel
@@ -820,11 +820,11 @@ harnesses, and every number they produce is quoted above with the command that m
 
 ## 10. The one thing this round implemented
 
-Nothing in `rust/torch_c/src/` changed. One test was added, because §1's boundary was written down
+Nothing in `torchnative/rust/torch_c/src/` changed. One test was added, because §1's boundary was written down
 in a document and **nothing checked it** — which is precisely the mechanism `docs/verification/AUDIT.md` found
 behind six of eleven false claims, and `docs/verification/DOCWATCH.md` exists to stop.
 
-`test_the_autograd_boundary_is_where_autograd_md_says_it_is` in `rust/torch_c/pytests/test_shim.py`
+`test_the_autograd_boundary_is_where_autograd_md_says_it_is` in `tests/test_shim.py`
 pins the three facts §1 measured, against `_C` alone (no vendored-tree subprocess needed):
 
 | assertion | what it catches |

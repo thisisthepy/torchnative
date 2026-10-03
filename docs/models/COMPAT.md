@@ -57,7 +57,7 @@ Two venvs, both pointed at `python 3.13`:
 | `/Volumes/macMini/caches/spike-venv` | 5.15.1 | 2.13.0 (pip) | existing, **not modified**. Reference for every 5.x number below. |
 | `/Volumes/macMini/caches/compat-tf4-venv` | **4.57.6** (latest stable 4.x, measured against PyPI 2026-08-30 — see §6) | 2.13.0 (pip) | new, created for this investigation |
 
-Both venvs run the shim by setting `TORCH_USE_RTLD_GLOBAL=1` and `PYTHONPATH=<repo>/torchnative/src/main`,
+Both venvs run the shim by setting `TORCH_USE_RTLD_GLOBAL=1` and `PYTHONPATH=<repo>/python`,
 and run against upstream by leaving those unset — the same dual-purpose pattern `spike-venv` already
 used for every prior measurement in this repository (it has both a real pip `torch` and is the
 vehicle for running the shim).
@@ -77,7 +77,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-compat
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 export HF_HOME=/Volumes/macMini/caches/hf-home
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 
 # op-coverage sweep, either venv, unset TORCH_USE_RTLD_GLOBAL/PYTHONPATH
 /Volumes/macMini/caches/compat-tf4-venv/bin/python /tmp/compat_trace.py > /tmp/trace_4x.json
@@ -85,7 +85,7 @@ bash vendor/install_shim.sh
 
 # full shim run, either venv, WITH TORCH_USE_RTLD_GLOBAL=1 and PYTHONPATH set
 export TORCH_USE_RTLD_GLOBAL=1
-export PYTHONPATH=$(pwd)/torchnative/src/main
+export PYTHONPATH=$(pwd)/python
 /Volumes/macMini/caches/compat-tf4-venv/bin/python /tmp/compat_shim_run.py > /tmp/shimrun_4x.json
 /Volumes/macMini/caches/spike-venv/bin/python /tmp/compat_shim_run.py > /tmp/shimrun_5x.json
 ```
@@ -238,7 +238,7 @@ family, all bookkeeping around a cache this shim never populates (`__enter__`/`_
   write; unknown device types still refuse on read exactly as before, until a `set` gives them a
   value.
 
-All five: `rust/torch_c/src/bootstrap.py`, `_install_autocast`.
+All five: `torchnative/rust/torch_c/src/bootstrap.py`, `_install_autocast`.
 
 ### 3.2 `TensorBase.permute` and `Tensor.T` — binding gaps, not kernel gaps
 
@@ -254,7 +254,7 @@ reachable as `torch.permute(x, dims)` (an entry existed in `overloads.json`), an
   `tensorbase` member gets by default — added as a computed `property` calling the now-wired
   `permute` member.
 
-Both: `rust/torch_c/src/methods.json` (`permute`), `rust/torch_c/src/bootstrap.py`
+Both: `torchnative/rust/torch_c/src/methods.json` (`permute`), `torchnative/rust/torch_c/src/bootstrap.py`
 (`_install_tensor_T`).
 
 ### 3.3 What those fixes revealed once applied
@@ -290,7 +290,7 @@ five component ops (`aminmax` is the exception) are still missing kernels regard
 
 None of `mixtral`'s five (§1: `aminmax`, `index_add_`, `nonzero`, `scatter_.value`, `zeros`), `gpt2`'s
 `tril`, or `opt`'s `all` are reachable from `bootstrap.py`/`overloads.json`/`methods.json` alone —
-each is a genuinely missing aten kernel (`rust/torch_c/src/aten.rs`, out of territory this session,
+each is a genuinely missing aten kernel (`torchnative/rust/torch_c/src/aten.rs`, out of territory this session,
 owned by another agent). `bert`'s and `falcon`'s `__getitem__` failure is the indexing region another
 agent is rewriting right now, also out of territory by name. None were implemented.
 
@@ -361,7 +361,7 @@ reason — 4.x's older attention-masking and MoE code calls different primitives
 - `TensorBase.permute` — `methods.json`.
 - `Tensor.T` — `bootstrap.py`.
 
-**(b) a kernel we do not have** (`rust/torch_c/src/aten.rs`, out of territory this session, owned by
+**(b) a kernel we do not have** (`torchnative/rust/torch_c/src/aten.rs`, out of territory this session, owned by
 another agent this pass):
 
 | op | needed by | 4.x-specific? |
@@ -465,7 +465,7 @@ this shim's autocast surface — so 5.x is both the honest target and the cheape
 
 ## 7. Tests
 
-Not added directly — `rust/torch_c/pytests/test_shim.py` is out of this session's territory (another
+Not added directly — `tests/test_shim.py` is out of this session's territory (another
 agent's). Two snippets, in that file's own style (plain asserts, `import _C` for the door,
 `_upstream_torch` for cross-checking where the fixture already does), to be placed near
 `test_autocast_is_off_and_cannot_be_turned_on`:

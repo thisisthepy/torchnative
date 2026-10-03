@@ -151,9 +151,9 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 
 | file | change |
 |---|---|
-| `torchnative/src/main/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
-| `torchnative/src/main/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
-| `rust/torch_c/pytests/test_shim.py` | 3 new tests, updated worker and assertions |
+| `torchnative/python/torchnative/delta/__init__.py` | `+re_snapshot(model)` method |
+| `torchnative/python/torchnative/nn/federated/__init__.py` | `Engine.__init__` accepts `rounds=N`; `participate` loops N rounds with re_snapshot; returns `list[Round]` |
+| `tests/test_shim.py` | 3 new tests, updated worker and assertions |
 
 ---
 
@@ -162,8 +162,8 @@ weights: they must agree, because the Engine is a *use* of `Delta.publish` and
 *[To be filled in with gate results.]*
 
 <!-- DOCWATCH: count smoke_ok ge 370 -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/delta/__init__.py re_snapshot present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py Engine present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/delta/__init__.py re_snapshot present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py Engine present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_multi_round_fedavg_equals_the_same_rounds_computed_centrally present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_multi_round_engine_leaves_both_ranks_holding_the_same_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_stale_base_makes_multi_round_deltas_cumulative present -->

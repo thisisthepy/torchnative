@@ -282,10 +282,10 @@ randn(4)               [-1.30546951, -1.01470625, -0.68631357, -0.96611220]
 
 | 자리 | 무엇이었나 | 잘못된 이유로 통과했나 |
 |---|---|---|
-| `tools/golden/cases.py::randint_low_cases` (13 케이스) | `_range_check(low, high)` — dtype·shape·`[low, high)` 소속만 보고 **수열은 보지 않는다**. 양쪽을 시드로 맞추지도 않았다 | **아니다.** 통과 근거가 문서화되어 있었고(`cases.py` 모듈 주석, `RNG.md` §5 의 표) 그 근거가 당시엔 참이었다 — candle 생성기는 시드를 받지 못한다. 값이 다른 것을 *알고* 비교하지 않은 것이지, 같다고 오판한 것이 아니다. **다만 그 근거는 `rng.rs` 가 들어온 순간 낡았고**(RNG.md §5 표의 `randint` 행이 "포팅 이후 승격"이라고 예고한 그대로), 그때 갱신되지 않았다 |
+| `tests/golden/cases.py::randint_low_cases` (13 케이스) | `_range_check(low, high)` — dtype·shape·`[low, high)` 소속만 보고 **수열은 보지 않는다**. 양쪽을 시드로 맞추지도 않았다 | **아니다.** 통과 근거가 문서화되어 있었고(`cases.py` 모듈 주석, `RNG.md` §5 의 표) 그 근거가 당시엔 참이었다 — candle 생성기는 시드를 받지 못한다. 값이 다른 것을 *알고* 비교하지 않은 것이지, 같다고 오판한 것이 아니다. **다만 그 근거는 `rng.rs` 가 들어온 순간 낡았고**(RNG.md §5 표의 `randint` 행이 "포팅 이후 승격"이라고 예고한 그대로), 그때 갱신되지 않았다 |
 | `docs/architectures/DEMAND3.md` 의 11-모델 스윕 | 토큰 id 를 `torch.randint` 로 뽑아 양쪽에 먹였다 | **그렇다 — 그리고 그것이 이 결함을 찾아낸 경로다.** `t5` 는 가중치가 비트 단위로 같은데 출력이 단위 단위로 어긋났고, 원인이 하네스가 두 쪽에서 다른 토큰을 뽑은 것이었다. DEMAND3 는 그 뒤 손으로 만든 토큰 리스트로 바꿔서 스윕을 마쳤다(§5) |
-| `rust/torch_c/pytests/test_shim.py:6004` | `d("aten.randint.default", 10, [2])` 를 **거부 경로**로만 쓴다(잘못된 인자에 op 이름이 찍히는지) | 아니다 — 값을 보지 않는다 |
-| `rust/torch_c/pytests/decomp_sweep.py:47-48` | 이름만 등장 | 아니다 |
+| `tests/test_shim.py:6004` | `d("aten.randint.default", 10, [2])` 를 **거부 경로**로만 쓴다(잘못된 인자에 op 이름이 찍히는지) | 아니다 — 값을 보지 않는다 |
+| `tests/decomp_sweep.py:47-48` | 이름만 등장 | 아니다 |
 
 **시드를 걸고 정수를 뽑아 값을 비교하던 자리는 이 라운드 이전의 저장소에 없었습니다.**
 스위트에서 `manual_seed`/`_shim_manual_seed` 를 부르는 **72 곳**(이 라운드 이전 기준)을 전부
@@ -355,17 +355,17 @@ randn(4)               [-1.30546951, -1.01470625, -0.68631357, -0.96611220]
 ## 9. 게이트
 
 ```
-$ PYTHON=$PY sh rust/torch_c/pytests/run.sh
+$ PYTHON=$PY sh tests/run.sh
 ok 358   (기준선 348)
 SELF-TEST: PASS -- 20 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
 DOCWATCH: PASS -- 283/283 evaluated marker(s) hold        (기준선 275/275)
 EXIT=0
 
-$ $PY tools/golden/compare.py
+$ $PY tests/golden/compare.py
 SUMMARY: 8304/8304 cases passed, 0 failed, ops covered=187, pending case builders=1
                                           (기준선 8126 / 0 / 185)
 
-$ $PY rust/torch_c/pytests/verify_schemas.py
+$ $PY tests/verify_schemas.py
 SUMMARY: 4583/4583 table entries matched upstream, 0 failed     (기준선 4574 — `randperm` 4 개 추가)
 ```
 
@@ -375,8 +375,8 @@ SUMMARY: 4583/4583 table entries matched upstream, 0 failed     (기준선 4574 
 <!-- DOCWATCH: op-implemented aten.randint.low -->
 <!-- DOCWATCH: op-implemented aten.randint.default -->
 <!-- DOCWATCH: op-implemented aten.randperm.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/rng.rs randint_from_to_fill present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/rng.rs randperm_fill present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/rng.rs RANDINT_WIDE_THRESHOLD present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/cases.py _rng_stream_check present -->
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json randperm present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs randint_from_to_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs randperm_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/rng.rs RANDINT_WIDE_THRESHOLD present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/cases.py _rng_stream_check present -->
+<!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json randperm present -->

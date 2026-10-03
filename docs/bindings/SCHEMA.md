@@ -15,9 +15,9 @@
   없는 op 에 대한 것이고, 그것이 사실인지는 `verify_schemas.py` 가 매번 다시 확인합니다.
 - **한 번 잘못 고쳤다가 되돌린 것 둘.** §8. 둘 다 측정이 되돌리게 했습니다.
 
-바뀐 파일은 셋입니다 — `rust/torch_c/src/bootstrap.py`,
-`rust/torch_c/pytests/test_shim.py` (테스트 9 개 추가),
-`rust/torch_c/pytests/verify_schemas.py` (검사 4 개 추가).
+바뀐 파일은 셋입니다 — `torchnative/rust/torch_c/src/bootstrap.py`,
+`tests/test_shim.py` (테스트 9 개 추가),
+`tests/verify_schemas.py` (검사 4 개 추가).
 `overloads.json` 과 `methods.json` 은 **한 글자도 바뀌지 않았습니다** — 이 작업에서 그 둘은
 고칠 대상이 아니라 **오라클**이었습니다.
 
@@ -301,20 +301,20 @@ DESIGN.md §6 의 거절 규약이고, "모른다" 를 "아니다" 와 절대 �
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-schema
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-schema
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh        # 164 (기존 155 + 신규 9)
-$PY tools/golden/compare.py                      # 2536/2536 ops=117
-$PY rust/torch_c/pytests/verify_schemas.py       # 3075/3075
+PYTHON=$PY sh tests/run.sh        # 164 (기존 155 + 신규 9)
+$PY tests/golden/compare.py                      # 2536/2536 ops=117
+$PY tests/verify_schemas.py       # 3075/3075
 ```
 
 `verify_schemas.py` 는 **상류 torch 가 있는 환경**에서 돌고, shim 은 벤더 트리를 `PYTHONPATH`
 에 얹은 별도 프로세스에서 답합니다 — 한 인터프리터가 둘을 다 가질 수 없기 때문이고,
-`tools/golden/compare.py` 가 두 번째 프로세스로 가는 이유와 같습니다.
+`tests/golden/compare.py` 가 두 번째 프로세스로 가는 이유와 같습니다.
 
 ```
 overloads.json:                          126/126

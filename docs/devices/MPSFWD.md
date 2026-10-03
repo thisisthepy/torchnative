@@ -11,8 +11,8 @@
 | 목록은 어떻게 됐나 | **71 → 67.** 넷(`prims.neg` 포함)이 **다시 쓰여서** 빠졌다. 게이트를 넓힌 곳은 없다 |
 | 거절 아닌 벽은 몇 개였나 | **다섯.** f64 상수, `U8 -> F64` 위닝 두 곳, `cpu_fwd` 만 있는 `CustomOp1` 셋 (§4) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_mpsfwd.py test_the_ops_that_left_the_refusal_list_no_longer_read_back present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs MPS_HOST_READBACK_OPS present -->
+<!-- DOCWATCH: symbol-in-file tests/test_mpsfwd.py test_the_ops_that_left_the_refusal_list_no_longer_read_back present -->
 
 ---
 
@@ -179,7 +179,7 @@ argmax(cpu) = argmax(mps) = 2034
 그래서 이 문서는 **"로짓이 cpu 와 일치한다" 고 쓰지 않습니다.** 쓰는 것은 위의 숫자이고,
 그 숫자의 출처는 위의 표입니다.
 
-`pytests/test_mpsfwd.py` 안의 검증은 두 종류로 나뉘고 그 경계가 위 표와 같습니다:
+`tests/test_mpsfwd.py` 안의 검증은 두 종류로 나뉘고 그 경계가 위 표와 같습니다:
 `neg`·`pow(2)`·`cumsum`·`all` 은 **동등(equality)** 으로, SDPA 와 트랜스포머 블록은
 **1e-5 상대** 로 비교합니다. 전자에 tolerance 를 쓰면 틀린 커널을 숨기고, 후자에 동등을 쓰면
 GPU 의 `exp` 하나에 빨개집니다.
@@ -207,10 +207,10 @@ GPU 의 `exp` 하나에 빨개집니다.
 
 | | 값 |
 |---|---|
-| `pytests/run.sh` | **677 ok**, 0 FAIL, EXIT=0 |
+| `tests/run.sh` | **677 ok**, 0 FAIL, EXIT=0 |
 | DOCWATCH | **PASS — 616/616** |
 | golden `compare.py` | **10039/10039, ops=270 — 움직이지 않았다** <!-- DOCWATCH: count golden_cases_passed ge 10039 --> <!-- DOCWATCH: count golden_ops_covered ge 270 --> |
-| `aarch64-linux-android` | EXIT=0 (`scripts/device_android.sh build`) |
+| `aarch64-linux-android` | EXIT=0 (`scripts/devices/device_android.sh build`) |
 | `aarch64-apple-ios-sim` | EXIT=0 (`PYO3_CONFIG_FILE` 레시피) |
 | `MPS_HOST_READBACK_OPS` | 71 → **67** |
 

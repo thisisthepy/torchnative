@@ -107,7 +107,7 @@ AMX 를 부르는 것**이지, candle 의 커널이 나빴던 것이 아닙니�
 그리고 상류 자신도 f32 GEMM 을 그쪽으로 보내지 않습니다. 벤더 트리에서 KleidiAI 가 걸리는
 자리는 **`aten._dyn_quant_pack_4bit_weight` 하나**입니다:
 
-    torchnative/src/main/torch/_meta_registrations.py:4270
+    torchnative/python/torch/_meta_registrations.py:4270
         if torch.backends.kleidiai.is_available() and (...)   # 4-bit 양자화 가중치 패킹
 
 **KleidiAI 는 f32 행렬곱의 답이 아닙니다.** 상류가 그것을 쓰는 곳은 양자화 경로입니다.
@@ -205,7 +205,7 @@ $ llvm-nm -C lib_C.so | grep -i neonfp16
 
 ### 4.3 고른 값과 그 근거
 
-    rust/torch_c/src/lib.rs
+    torchnative/rust/torch_c/src/lib.rs
     const GEMM_THREADING_THRESHOLD: usize = 4_000_000;
 
 - **실기(§4.1)에서 안전합니다.** 손해가 확실한 n=96 을 단일로 되돌리고, 이득이 확실한
@@ -276,7 +276,7 @@ $ llvm-nm -C lib_C.so | grep -i neonfp16
 이 작업과 무관하지만 측정 중에 걸렸고, **원인이 오늘 들어간 변경이라 적어 둡니다.**
 
 ```
-$ bash scripts/device_android.sh parity
+$ bash scripts/devices/device_android.sh parity
 MISMATCH addmm.default / bmm.default / mm.default        1 ULP
 MISMATCH cos.default / sin.default / rsqrt.default        1 ULP
 MISMATCH native_layer_norm.default / nn.Linear forward    2 ULP
@@ -293,7 +293,7 @@ identical 31/33
 PARITY: ok
 ```
 
-`docs/perf/PERF.md` §3 이 **오늘** Apple 타깃에 `accelerate` 를 켰고, `scripts/device_android.sh` 의
+`docs/perf/PERF.md` §3 이 **오늘** Apple 타깃에 `accelerate` 를 켰고, `scripts/devices/device_android.sh` 의
 `EXPECTED_LIBM_DIVERGENCE` 는 그 이전에 쓰인 목록입니다. Accelerate 는 BLAS 로 누적 순서를
 바꾸고(`mm`·`addmm`·`bmm`·`layer_norm`) vForce 로 초월함수를 대체합니다(`sin`·`cos`·`rsqrt`).
 **8 건 전부 그것으로 설명됩니다.**
@@ -314,7 +314,7 @@ PARITY: ok
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-blas
-bash vendor/vendor_torch.sh                       # 새 worktree 라면
+bash scripts/vendor/vendor_torch.sh                       # 새 worktree 라면
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-blas
 export ANDROID_SERIAL=emulator-5554               # 5556 은 다른 에이전트 것
 ```
@@ -327,9 +327,9 @@ export ANDROID_SERIAL=emulator-5554               # 5556 은 다른 에이전트
 `torch/__init__.py` 가 무조건 import 합니다).
 
 ```sh
-bash scripts/device_android.sh build
-bash scripts/device_android.sh stage
-bash scripts/device_android.sh run <bench.py> baseline
+bash scripts/devices/device_android.sh build
+bash scripts/devices/device_android.sh stage
+bash scripts/devices/device_android.sh run <bench.py> baseline
 ```
 
 임계값을 바꿔 재려면 `adb shell` 에 환경 변수를 직접 얹습니다 (`device_android.sh run` 은
@@ -356,11 +356,11 @@ $ADB shell "cd $D && BW_STUB_MULTIPROCESSING=1 TORCH_USE_RTLD_GLOBAL=1 \
 
 ```sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-blas-noaccel
-( cd rust/torch_c && cargo build --release \
+( cd torchnative/rust/torch_c && cargo build --release \
     --config 'target."cfg(target_vendor = \"apple\")".rustflags = ["--cfg", "torch_c_no_accelerate"]' )
 otool -L $CARGO_TARGET_DIR/release/lib_C.dylib | grep -c Accelerate   # 0 이어야 함
-cp $CARGO_TARGET_DIR/release/lib_C.dylib torchnative/src/main/torch/_C.abi3.so
-RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main \
+cp $CARGO_TARGET_DIR/release/lib_C.dylib torchnative/python/torch/_C.abi3.so
+RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python \
     /Volumes/macMini/caches/spike-venv/bin/python <bench.py> host-noaccel-t1
 ```
 
@@ -374,9 +374,9 @@ RAYON_NUM_THREADS=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main
 ### 7.3 회귀
 
 ```sh
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-/Volumes/macMini/caches/spike-venv/bin/python tools/golden/compare.py
+/Volumes/macMini/caches/spike-venv/bin/python tests/golden/compare.py
 # SUMMARY: 2268/2268 cases passed, 0 failed, ops covered=97
 ```
 
@@ -463,7 +463,7 @@ add 1.80x), 같은 세션에 착지한 나머지 넷 — 디스패치 키워드 
 0.0.2a0 부터 0.0.6a0 까지 **바이트 단위로 동일**함을 먼저 확인했다 — `bootstrap.py` 는
 `include_str!` 로 `.so` 에 굳어 있으므로(`docs/bindings/BIND.md` §7.1 이 이미 기록) 이 세션에서도
 **`_C.abi3.so` 하나만 바꿔치기하면 버전을 전환할 수 있다.** CPython 런타임과 의존성은
-`scripts/device_android.sh stage` 가 이전 세션에 이미 올려둔 것을 그대로 재사용했다.
+`scripts/devices/device_android.sh stage` 가 이전 세션에 이미 올려둔 것을 그대로 재사용했다.
 
 방법은 `docs/bindings/BIND.md` §7.2 를 따른다: old/new 를 번갈아 3 회, 각 회차는 워밍업 후 최솟값,
 최종 배수는 양쪽 최솟값의 비, 같은 아티팩트를 두 라벨로 돌리는 대조군을 둔다. `uptime` 을

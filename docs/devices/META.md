@@ -514,10 +514,10 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 갈래이고, §12 에 함께 적었습니다.
 
 **`_aten_implemented()` 는 139 그대로이고 스키마도 4353 그대로입니다.** 그 상수는 "커널이 있고
-*또한* `tools/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
+*또한* `tests/golden/cases.py` 가 상류와 대조한다" 를 뜻하는데, **골든 하네스는 값을 비교하고
 meta 는 정의상 값이 없습니다.** meta 지원은 이미 목록에 있는 op 들의 *성질*이므로 op 수가 늘지
 않고, 새 철자를 만들지 않았으므로 `overloads.json`/`methods.json` 도 그대로입니다. 증거는
-`pytests/test_shim.py` 에 있습니다(§11).
+`tests/test_shim.py` 에 있습니다(§11).
 
 ---
 
@@ -710,7 +710,7 @@ ios arm64      Mach-O 64-bit dynamically linked shared library    EXIT=0
 **골든 op 수 96 과 스키마 233 은 그대로입니다.** 이유는 §7 입니다 — 새 aten op 도, 새 철자도
 만들지 않았습니다.
 
-### 새로 붙인 테스트 (`rust/torch_c/pytests/test_shim.py`, +7)
+### 새로 붙인 테스트 (`tests/test_shim.py`, +7)
 
 | 테스트 | 무엇을 고정하나 |
 |---|---|
@@ -876,29 +876,29 @@ llama3-rope from_pretrained + generate                            EXIT=0
 
 ```bash
 cd /path/to/repo
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-meta
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-$PY tools/golden/compare.py                       > /tmp/g.log 2>&1;  echo "EXIT=$?"
-$PY tools/golden/compare.py --inject-fault value  > /tmp/fv.log 2>&1; echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
-PYTHON=$PY sh rust/torch_c/pytests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py                       > /tmp/g.log 2>&1;  echo "EXIT=$?"
+$PY tests/golden/compare.py --inject-fault value  > /tmp/fv.log 2>&1; echo "EXIT=$?"
+$PY tests/verify_schemas.py        > /tmp/s.log 2>&1;  echo "EXIT=$?"
+PYTHON=$PY sh tests/run.sh         > /tmp/p.log 2>&1;  echo "EXIT=$?"
 
 # 전사 대조: 같은 프로브를 두 torch 로 돌리고 diff
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 \
-  PYTHONPATH=$PWD/torchnative/src/main $PY <probe> > ours.txt
+  PYTHONPATH=$PWD/torchnative/python $PY <probe> > ours.txt
 (cd /tmp && $PY <probe> > upstream.txt)
 
 # A/B 벤치: 기준선 산출물을 stash 로 만든다 (checkout 금지 -- AGENTS.md)
-git stash push -- rust/torch_c/src
-(cd rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
+git stash push -- torchnative/rust/torch_c/src
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/base_C.so
 git stash pop
-(cd rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
+(cd torchnative/rust/torch_c && cargo build --release) && cp $TORCH_C_ARTEFACT /tmp/meta_C.so
 for i in 1 2 3 4; do $PY /tmp/dev_bench.py /tmp/base_C.so; $PY /tmp/dev_bench.py /tmp/meta_C.so; done
 ```
 

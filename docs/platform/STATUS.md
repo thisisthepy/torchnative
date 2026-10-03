@@ -136,7 +136,7 @@ machine is an arm64 Mac with no `nvcc`, so no compiler has yet seen the CUDA-gat
 these cells.
 
 **Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
-machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
+machine this project does not have, so `.github/workflows/test-published-wheel.yml` installs the
 **published** wheel from PyPI on `ubuntu-latest` and `windows-latest` at Python 3.13 and asks it to
 work. Both answered `RESULT: ALL PASS` — `mm`, `nn.Linear`, and the mixed-dtype promotion where the
 value and not just the label is at stake (`int64(2049) - float16(1.0)` is `2047.0`) — and then both
@@ -158,7 +158,7 @@ six of eleven stale claims.
 **Linux aarch64 is the one column verified here rather than by CI, and it went further than CI
 does.** Docker on this machine runs a native aarch64 Linux VM, so `manylinux2014_aarch64` —
 CentOS 7, `ldd (GNU libc) 2.17` — is the wheel's own tagged floor, not an approximation of it. The
-wheel was installed there and `tools/ci/verify_published.py`, the script both CI legs run, answered
+wheel was installed there and `.github/scripts/verify_published.py`, the script both CI legs run, answered
 `RESULT: ALL PASS` over 31 checks. Then on a modern aarch64 Linux the same wheel was installed by
 **bare distribution name** from a local directory, so pip had to match `manylinux_2_17_aarch64`
 against the machine to find any candidate at all, and SmolLM2-135M generated text
@@ -304,9 +304,9 @@ than assertion.
 | **Tokens are not enough** | A wrong `gelu` approximation produced *identical tokens* while logits differed by 5.9e-04. End-to-end tests compare logits too, with a tolerance measured to sit between normal float32 noise and that failure. |
 
 ```sh
-sh rust/torch_c/pytests/run.sh                  # smoke tests + harness self-test
-python tools/golden/compare.py                  # golden comparison against upstream
-python rust/torch_c/pytests/verify_schemas.py   # signature tables vs upstream
+sh tests/run.sh                  # smoke tests + harness self-test
+python tests/golden/compare.py                  # golden comparison against upstream
+python tests/verify_schemas.py   # signature tables vs upstream
 ```
 
 ---
@@ -359,7 +359,7 @@ model.to(device.npu)                     # Intel NPU: resolves the unit, lowers 
 | `torchnative.device` | **Done.** `cpu` · `mps` · `vulkan` · `cuda` · `npu`. Availability is measured through the existing probes, and every answer names the probe that produced it. `npu` **resolves per host** — Apple Neural Engine / Intel NPU / Hexagon — and refuses by name where there is none, never falling back to the CPU. Eager and compiled are different *types*, so `torch.empty(..., device=npu)` cannot be spelled. |
 | `nn.Module.to()` | **Done.** Intercepted ahead of `_parse_to`, since `to()` descends to tensors and an npu is not a tensor destination. An eager torchnative device moves parameters through upstream's own path; the model is never wrapped. Upstream semantics are held by two tests — one differential against the unpatched `to`, one asserting byte-identical passthrough of the arguments. |
 | `torchnative.transformers` | **Done.** All **49** `Auto*` classes, enumerated from `transformers` rather than hand-listed. `from_pretrained` returns the real model — `loss.backward()` populated 16/16 grads on a GPT-2 built through it. `export=` and `load_in_4bit=` **refuse by name** rather than being silently dropped. |
-| recompiling for the accelerator | **Intel NPU: wired. Apple ANE and Hexagon: not implemented.** `model.to(torchnative.device.npu)` always resolves first, then dispatches on the resolved *backend*. `openvino` lowers every eligible `torch.nn.Linear` in place and returns the same `nn.Module`, so `generate()` and `backward()` still work; the partial-offload report lands on `model.torchnative_offload` **and** a `UserWarning` fires whenever anything stayed on the CPU, because [`docs/graph/NPU2.md`](../graph/NPU2.md) is about a partial offload that went unnoticed while every answer was right. Zero leaves lowered is a refusal, not a success. `coreml` and `qnn` still refuse by name rather than returning the model unchanged. **No machine here has an Intel NPU**, so `rust/torch_c/pytests/test_npuwire.py` fakes the probe and the OpenVINO runtime and nothing above them: it is evidence about dispatch, not about hardware. Since issue #3, a gated MLP (`down(silu(gate(x)) * up(x))`) lowers as **one** OpenVINO graph and lowered modules compile once with a dynamic row axis, so `generate()` stops recompiling per length — measured on OpenVINO's CPU plugin only, agreeing with upstream at f32 execution; see [`docs/devices/NPUFUSE.md`](../devices/NPUFUSE.md). |
+| recompiling for the accelerator | **Intel NPU: wired. Apple ANE and Hexagon: not implemented.** `model.to(torchnative.device.npu)` always resolves first, then dispatches on the resolved *backend*. `openvino` lowers every eligible `torch.nn.Linear` in place and returns the same `nn.Module`, so `generate()` and `backward()` still work; the partial-offload report lands on `model.torchnative_offload` **and** a `UserWarning` fires whenever anything stayed on the CPU, because [`docs/graph/NPU2.md`](../graph/NPU2.md) is about a partial offload that went unnoticed while every answer was right. Zero leaves lowered is a refusal, not a success. `coreml` and `qnn` still refuse by name rather than returning the model unchanged. **No machine here has an Intel NPU**, so `tests/test_npuwire.py` fakes the probe and the OpenVINO runtime and nothing above them: it is evidence about dispatch, not about hardware. Since issue #3, a gated MLP (`down(silu(gate(x)) * up(x))`) lowers as **one** OpenVINO graph and lowered modules compile once with a dynamic row axis, so `generate()` stops recompiling per length — measured on OpenVINO's CPU plugin only, agreeing with upstream at f32 execution; see [`docs/devices/NPUFUSE.md`](../devices/NPUFUSE.md). |
 
 [`docs/devices/DEVICE_NS.md`](../devices/DEVICE_NS.md) and
 [`docs/api/TRANSFORMERS.md`](../api/TRANSFORMERS.md) record what was measured,
@@ -454,7 +454,7 @@ kind of claim nobody re-reads.
 Linux and Windows were in that position and are not any more: CI installs the published wheel on
 `ubuntu-latest` and `windows-latest` and both compute, matching macOS arm64 character for character
 on a real SmolLM2 generation. **The green runs installed the version the workflow defaults to**,
-which is what `tools/ci/verify_published.py` was written against; checks added for a later release
+which is what `.github/scripts/verify_published.py` was written against; checks added for a later release
 skip themselves by name on an older wheel rather than failing the platform.
 
 What follows is the artefact-level check that used to be all there was, and it still runs — it catches a broken wheel before anything is uploaded. Every
@@ -490,8 +490,8 @@ answer and an `nn.Linear` forward runs ([`docs/platform/WHEEL.md`](../platform/W
 Requires a Rust toolchain and CPython 3.13+.
 
 ```sh
-bash vendor/vendor_torch.sh     # assemble the vendored torch tree
-bash vendor/install_shim.sh     # build the extension and install it
+bash scripts/vendor/vendor_torch.sh     # assemble the vendored torch tree
+bash scripts/vendor/install_shim.sh     # build the extension and install it
 ```
 
 ### Building a wheel
@@ -500,10 +500,10 @@ Additionally requires `pip`, `setuptools` and `wheel` in the building interprete
 compiler for the empty `libtorch_global_deps` (see [`docs/platform/WHEEL.md`](../platform/WHEEL.md) §3.2).
 
 ```sh
-bash vendor/vendor_torch.sh
-bash vendor/install_shim.sh
-python tools/wheel/build.py                            # -> dist/*.whl
-python tools/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
+bash scripts/vendor/vendor_torch.sh
+bash scripts/vendor/install_shim.sh
+python scripts/wheel/build.py                            # -> dist/*.whl
+python scripts/wheel/verify.py dist/torchnative-*.whl    # clean venv, real import
 ```
 
 `verify.py` is the part that matters: it installs into a throwaway virtualenv and asserts that

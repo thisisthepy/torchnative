@@ -37,8 +37,8 @@ transformers 5.15.1 (`/Volumes/macMini/caches/spike-venv`). **벤더링 트리�
 | `from_pretrained` — **모델 생성** | 미시도 | **통과** (§6.1) |
 | `from_pretrained` — **가중치 적재** | 미시도 | **미통과.** `UntypedStorage.from_file` (§6.2) |
 | `torch.set_default_dtype` | 이름을 대고 거절 | **실물 전역.** 읽는 자리 12곳이 전부 따라갑니다 (§6.1) |
-| `pytests/run.sh` | 129 통과 | **142 통과** |
-| `tools/golden/compare.py` | 2383/2383, ops=109 | **2486/2486, ops=116** |
+| `tests/run.sh` | 129 통과 | **142 통과** |
+| `tests/golden/compare.py` | 2383/2383, ops=109 | **2486/2486, ops=116** |
 | `verify_schemas.py` | 255/255 | **270/270** |
 
 **이번 회차에 실제로 열린 것 셋**: 텐서를 찍을 수 있게 되었고, **손으로 옮겨 적지 않은**
@@ -315,13 +315,13 @@ silu x 1.001  (0.1%  높게)   1.44e-06     1e-5 미만 — 못 잡음
 ## 5. 검증
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh    exit 0   142 통과 (전 129, +13)
-$PY tools/golden/compare.py                  exit 0   2486/2486, ops=116 (전 2383/109)
-$PY rust/torch_c/pytests/verify_schemas.py   exit 0   270/270 (전 255)
+PYTHON=$PY sh tests/run.sh    exit 0   142 통과 (전 129, +13)
+$PY tests/golden/compare.py                  exit 0   2486/2486, ops=116 (전 2383/109)
+$PY tests/verify_schemas.py   exit 0   270/270 (전 255)
 ```
 
 테스트 +13 은 §2~§4 가 9개, §6.1 이 4개입니다.
-골든 케이스 +103: 새 커널 7개에 대한 102개(다른 세션이 `tools/golden/cases.py` 에 작성)와,
+골든 케이스 +103: 새 커널 7개에 대한 102개(다른 세션이 `tests/golden/cases.py` 에 작성)와,
 §3.1 의 `max` NaN 1개. §6.1 의 메타 커널 넷은 `ops covered` 를 늘리지 않습니다 — 이미 세어지던
 키의 메타 경로이기 때문입니다.
 
@@ -355,7 +355,7 @@ $PY rust/torch_c/pytests/verify_schemas.py   exit 0   270/270 (전 255)
 
 ### 5.2 이 회차에 저지른 사고 하나 — 기록해 둡니다
 
-커널 검증을 되돌리면서 `git checkout -- rust/torch_c/src/aten.rs` 를 썼습니다.
+커널 검증을 되돌리면서 `git checkout -- torchnative/rust/torch_c/src/aten.rs` 를 썼습니다.
 **커밋되지 않은 그 파일의 작업 전체가 사라졌습니다** — CLAUDE.md 가
 "에이전트 작업을 되돌려 볼 때는 stash 를 쓴다" 로 정확히 경고한 그 실수입니다. 대화에 남은
 편집 기록으로 재구성해 복구했고, 이후의 탬퍼 검증은 전부 **직접 되돌리는 국소 편집**으로
@@ -488,20 +488,20 @@ MAP_SHARED 는 쓰기가 파일로 돌아가야 합니다. 이름을 대고 거�
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-e2e
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-e2e
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 142
-$PY tools/golden/compare.py                        # 2486/2486 ops=116
-$PY rust/torch_c/pytests/verify_schemas.py         # 270/270
+PYTHON=$PY sh tests/run.sh          # 142
+$PY tests/golden/compare.py                        # 2486/2486 ops=116
+$PY tests/verify_schemas.py         # 270/270
 
 # 이 문서의 두 판정
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
   "import torch; print(torch.ops.aten.mm.default(torch.ones(3,4), torch.ones(4,2)))"
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c \
+PYTHONPATH=$PWD/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY -c \
 "
 import torch
 from transformers import AutoModelForCausalLM

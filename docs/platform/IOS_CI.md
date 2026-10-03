@@ -1,7 +1,7 @@
 # Why the iOS simulator is not checked in CI, and what it would take
 
 The obvious job works on paper. A hosted `macos-latest` runner has Xcode and
-simulators, the simulator wheel is on PyPI, and `tools/wheel/verify_ios_sim.py`
+simulators, the simulator wheel is on PyPI, and `scripts/wheel/verify_ios_sim.py`
 is the same harness that passes here on every release build. It was added, run,
 and failed in sixteen seconds:
 
@@ -79,7 +79,7 @@ guessing would have been worse than looking.
 > (`docs/platform/TARGET_PYTHON.md`). Step 2 stays "no" — there is no published,
 > checksummed `arm64-iphonesimulator` CPython — but the pinned source commit is
 > enough to *build* one in the job instead of fetching it, which is what
-> `docs/platform/TARGET_PYTHON.md` sized. `.github/workflows/verify-published-wheel.yml`
+> `docs/platform/TARGET_PYTHON.md` sized. `.github/workflows/test-published-wheel.yml`
 > now has an `ios-simulator-arm64` leg that does exactly that: build the
 > distribution, cache it on commit + Xcode version, download the **published**
 > simulator wheel from PyPI, and run `verify_ios_sim.py` against it — unchanged,
@@ -87,4 +87,4 @@ guessing would have been worse than looking.
 > runner yet; `docs/platform/IOS_CI2.md` says exactly what has and has not been
 > exercised.
 
-<!-- DOCWATCH: symbol-in-file tools/wheel/verify_ios_sim.py arm64-iphonesimulator present -->
+<!-- DOCWATCH: symbol-in-file scripts/wheel/verify_ios_sim.py arm64-iphonesimulator present -->

@@ -7,7 +7,7 @@
 
 Worktree `work/sweep2` on develop `2498122` (vendored tree assembled fresh). torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). No Rust, `bootstrap.py`, or `aten.rs`
-was changed in this round — it re-runs `rust/torch_c/pytests/arch_sweep.py` exactly as
+was changed in this round — it re-runs `tests/arch_sweep.py` exactly as
 `docs/architectures/ARCH100.md` §7 describes and reports the delta. Golden stays at **10039/10039, ops=270**,
 exactly unmoved.
 
@@ -237,10 +237,10 @@ graph) and `gpt_neo` forwards outright.
   re-swept in full (§7 has the exact commands), not just the shim side.
 * **Golden: 10039/10039 cases, ops=270 — exactly unmoved.** No Rust, `bootstrap.py`, or `aten.rs`
   was touched in this worktree; `git status --short` before writing this document showed changes
-  confined to `rust/torch_c/pytests/arch_sweep.py`'s own artifacts (none — the script needed no
+  confined to `tests/arch_sweep.py`'s own artifacts (none — the script needed no
   edits), `docs/architectures/ARCH100.md` (pointer only), `docs/architectures/ARCH200.md` (new), and `README.md`.
 * **Suite gate: 668 ok, `DOCWATCH: PASS` 616/616, `EXIT=0`**, measured before the sweep ran, on
-  the freshly built shim, from `rust/torch_c/pytests/run.sh` with `PYTHON=$PY` set (its default
+  the freshly built shim, from `tests/run.sh` with `PYTHON=$PY` set (its default
   `python3` lacks numpy in this environment, per CLAUDE.md).
 
 ## 6. How this round was taken, and how to take it again
@@ -249,9 +249,9 @@ Identical method to ARCH100 §7 — the script needed no changes, so the command
 
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-cd rust/torch_c/pytests
+cd tests
 
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL          $PY arch_sweep.py --out /tmp/upstream.json
 $PY arch_sweep.py --compare /tmp/shim.json /tmp/upstream.json
 ```
@@ -272,9 +272,9 @@ invalidated it).
 ## 7. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    668 ok, exit 0
+tests/run.sh    668 ok, exit 0
 DOCWATCH                       PASS -- 616/616 evaluated marker(s) hold
-tools/golden/compare.py        10039/10039 cases passed, 0 failed, ops covered=270, pending=0
+tests/golden/compare.py        10039/10039 cases passed, 0 failed, ops covered=270, pending=0
 ```
 
 All three measured on the freshly built `lib_C.dylib` in this worktree
@@ -287,8 +287,8 @@ correct result: this round changed no Rust. The 16 names in §2 are data for the
 same way ARCH100's 31 were — this round measured and implemented nothing.
 
 <!-- DOCWATCH: op-implemented aten.scatter.value -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 <!-- DOCWATCH: count golden_cases_passed ge 10039 -->
 <!-- DOCWATCH: count golden_ops_covered ge 270 -->

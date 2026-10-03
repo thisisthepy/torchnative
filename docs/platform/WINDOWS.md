@@ -188,7 +188,7 @@ file .../probe.dll
 그다음 진짜 크레이트:
 
 ```sh
-cd /Volumes/macMini/worktrees/bw-desk2/rust/torch_c
+cd /Volumes/macMini/worktrees/bw-desk2/torchnative/rust/torch_c
 export PYO3_CROSS_LIB_DIR=/Volumes/macMini/caches/target-python/x86_64-pc-windows-msvc/libs
 export PYO3_CROSS_PYTHON_VERSION=3.13
 cargo xwin build --release --target x86_64-pc-windows-msvc
@@ -289,7 +289,7 @@ if sys.platform == "win32":
 ### 4.4 실측
 
 ```sh
-$BPY tools/wheel/build.py --target windows-x86_64          # EXIT=0
+$BPY scripts/wheel/build.py --target windows-x86_64          # EXIT=0
 ```
 
 ```
@@ -315,7 +315,7 @@ Linux 휠보다 entry 가 하나 적다 — global-deps 가 없기 때문이다.
 
 ## 5. 심볼 해결 검증 — **iOS 만큼 강하다**
 
-`tools/wheel/verify_windows.py`. `docs/platform/LINUX.md` §6.1 이 ELF 에 대해 "iOS 만큼 강하지 않다" 고
+`scripts/wheel/verify_windows.py`. `docs/platform/LINUX.md` §6.1 이 ELF 에 대해 "iOS 만큼 강하지 않다" 고
 적었고 그것은 맞았다. **PE 는 그 제약을 받지 않는다.**
 
 ### 5.1 왜 강한가 — import table 이 곧 답이다
@@ -336,7 +336,7 @@ Linux 에서 우리 아티팩트의 CPython import 118개는 **어느 라이브�
 ### 5.2 어디까지 실제로 돌았나 — 우리 아티팩트로
 
 ```sh
-$BPY tools/wheel/verify_windows.py dist/torchnative-*win_amd64.whl     # EXIT=0
+$BPY scripts/wheel/verify_windows.py dist/torchnative-*win_amd64.whl     # EXIT=0
 ```
 
 ```
@@ -390,7 +390,7 @@ python3.dll: 902 exported symbols | vcruntime140.dll: 71 | vcruntime140_1.dll: 3
 ### 5.4 자체검사 — 실패할 수 있는지 확인했다
 
 ```sh
-$BPY tools/wheel/verify_windows.py --self-test        # EXIT=0
+$BPY scripts/wheel/verify_windows.py --self-test        # EXIT=0
   ok    _socket.pyd: all 181 imports name a DLL
   ok    our torch/_C.pyd attributes 119 imports to python3.dll, by name
   ok    ...and none to python313.dll, which would make the abi3 tag false
@@ -433,7 +433,7 @@ SELF-TEST: PASS -- 5/5 cases, on real Windows PE from the target distribution
 자체검사 8개 전부 잡힌다:
 
 ```
-$BPY tools/wheel/verify_cross.py dist/torchnative-*win_amd64.whl --self-test   # EXIT=0
+$BPY scripts/wheel/verify_cross.py dist/torchnative-*win_amd64.whl --self-test   # EXIT=0
   caught      extension built for the wrong platform
   caught      a global-deps library on a platform that loads none
   caught      a member edited without updating RECORD
@@ -520,21 +520,21 @@ Windows 를 넣으면서 **공유 코드**를 건드렸다 (`Target.extension_me
 
 | 명령 | 결과 |
 |---|---|
-| `PYTHON=$PY sh rust/torch_c/pytests/run.sh` | **exit 0, 197** |
-| `$PY tools/golden/compare.py` | **exit 0, 2811/2811 ops=119** |
-| `$BPY tools/wheel/build.py --self-test` | **exit 0, 8/8 + LINUX 11/11** |
-| `$BPY tools/wheel/build.py` (호스트) | **exit 0**, `macosx_11_0_arm64`, 2,687 entries |
-| `$BPY tools/wheel/verify.py <호스트 휠>` | **exit 0**, 깨끗한 venv 에서 `aten.mm.default` 계산 |
-| `$BPY tools/wheel/build.py --target linux-x86_64` | **exit 0**, `manylinux_2_17_x86_64` |
-| `$BPY tools/wheel/verify_cross.py <manylinux>` | **exit 0** |
-| `$BPY tools/wheel/verify_cross.py <manylinux> --self-test` | **exit 0, 11/11** |
-| `$BPY tools/wheel/verify_linux.py <manylinux>` | **exit 0**, unresolved 0 |
-| `$BPY tools/wheel/verify_linux.py --self-test` | **exit 0, 5/5** |
-| `$BPY tools/wheel/build.py --target windows-x86_64` | **exit 0**, `win_amd64` |
-| `$BPY tools/wheel/verify_cross.py <win_amd64>` | **exit 0** |
-| `$BPY tools/wheel/verify_cross.py <win_amd64> --self-test` | **exit 0, 8/8** |
-| `$BPY tools/wheel/verify_windows.py <win_amd64>` | **exit 0** |
-| `$BPY tools/wheel/verify_windows.py --self-test` | **exit 0, 5/5** |
+| `PYTHON=$PY sh tests/run.sh` | **exit 0, 197** |
+| `$PY tests/golden/compare.py` | **exit 0, 2811/2811 ops=119** |
+| `$BPY scripts/wheel/build.py --self-test` | **exit 0, 8/8 + LINUX 11/11** |
+| `$BPY scripts/wheel/build.py` (호스트) | **exit 0**, `macosx_11_0_arm64`, 2,687 entries |
+| `$BPY scripts/wheel/verify.py <호스트 휠>` | **exit 0**, 깨끗한 venv 에서 `aten.mm.default` 계산 |
+| `$BPY scripts/wheel/build.py --target linux-x86_64` | **exit 0**, `manylinux_2_17_x86_64` |
+| `$BPY scripts/wheel/verify_cross.py <manylinux>` | **exit 0** |
+| `$BPY scripts/wheel/verify_cross.py <manylinux> --self-test` | **exit 0, 11/11** |
+| `$BPY scripts/wheel/verify_linux.py <manylinux>` | **exit 0**, unresolved 0 |
+| `$BPY scripts/wheel/verify_linux.py --self-test` | **exit 0, 5/5** |
+| `$BPY scripts/wheel/build.py --target windows-x86_64` | **exit 0**, `win_amd64` |
+| `$BPY scripts/wheel/verify_cross.py <win_amd64>` | **exit 0** |
+| `$BPY scripts/wheel/verify_cross.py <win_amd64> --self-test` | **exit 0, 8/8** |
+| `$BPY scripts/wheel/verify_windows.py <win_amd64>` | **exit 0** |
+| `$BPY scripts/wheel/verify_windows.py --self-test` | **exit 0, 5/5** |
 
 **Android · iOS 는 이 워크트리에서 휠까지 갈 수 없다** — 아티팩트가 없고 기기·시뮬레이터가
 금지되어 있다. 그 둘에 대해 확인한 것은 코드 수준이다:

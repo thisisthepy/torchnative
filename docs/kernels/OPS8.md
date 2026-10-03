@@ -19,10 +19,10 @@
 
 | 검증 | 이전 | 이후 | 종료 코드 |
 |---|---|---|---|
-| 골든 (`tools/golden/compare.py`) | 1043/1043, ops covered=**62** | **1212/1212**, ops covered=**70** | **0** |
+| 골든 (`tests/golden/compare.py`) | 1043/1043, ops covered=**62** | **1212/1212**, ops covered=**70** | **0** |
 | 골든 실패 / pending | 0 / 0 | **0 / 0** | — |
-| 스키마 (`pytests/verify_schemas.py`) | 127/127 | **127/127** | **0** |
-| 스모크 (`pytests/run.sh`) | 60 ok | **60 ok** | **0** |
+| 스키마 (`tests/verify_schemas.py`) | 127/127 | **127/127** | **0** |
+| 스모크 (`tests/run.sh`) | 60 ok | **60 ok** | **0** |
 | `--inject-fault value` | — | 첫 `match` 케이스에서 잡힘 | **1** |
 | `--inject-fault shape` | — | 잡힘 | **1** |
 | `--inject-fault dtype` | — | 잡힘 | **1** |
@@ -228,7 +228,7 @@ NotImplementedError: not implemented in torch._C shim: torch._C._nn.scaled_dot_p
 
 **커널은 이제 전부 있습니다** — `linear` 은 `t` + `matmul`(또는 `addmm`)이고, sdpa 는 §3 의 융합
 커널입니다. 없는 것은 그 파이썬 이름에서 aten 키로 내려가는 배선이고, 그것은
-`rust/torch_c/src/bootstrap.py` 에 있습니다. 이 작업의 파일 범위 밖이라 손대지 않았습니다.
+`torchnative/rust/torch_c/src/bootstrap.py` 에 있습니다. 이 작업의 파일 범위 밖이라 손대지 않았습니다.
 
 같은 상태인 `_C._nn` 이름을 몇 개 더 확인했습니다: `gelu`, `silu`, `softmax`, `layer_norm`,
 `pad`, `_parse_to` — 전부 같은 문구로 거부합니다. `_C._nn` 표면 전체가 아직 비어 있는 것으로
@@ -242,7 +242,7 @@ NotImplementedError: not implemented in torch._C shim: torch._C._nn.scaled_dot_p
 > 컴포지트를 경유하는 것이지 `_C._nn.layer_norm` 자체가 채워진 것이 아닙니다. **"`_C._nn`
 > 표면 전체가 비어 있다"는 더 이상 맞지 않지만, "완전히 채워졌다"도 아닙니다** — 이름마다
 > 다릅니다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py linear present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py linear present -->
 
 ### 5-2. `torch.bmm(...)` 같은 파이썬 철자는 아직 해석되지 않습니다
 
@@ -255,8 +255,8 @@ NotImplementedError: not implemented in torch._C shim: torch._C._nn.scaled_dot_p
 > `t.t()`, `t.neg()`, `t.bmm(...)` 전부 오늘 성공합니다. `overloads.json`/`methods.json` 에
 > `bmm`/`t`/`neg` 키가 있습니다 (지금 스키마 총계는 §0 의 127/127 이 아닙니다 —
 > `docs/verification/AUDIT.md` 의 이 라운드 기준선은 4475/4475).
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json bmm present -->
-> <!-- DOCWATCH: json-key rust/torch_c/src/methods.json bmm present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json bmm present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/methods.json bmm present -->
 
 ### 5-3. `torch.distributed` — 임포트 벽, aten 과 무관
 
@@ -331,23 +331,23 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 DIST=/Volumes/macMini/caches/target-python
-cd rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
+cd torchnative/rust/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
 
 # 호스트 빌드 + 스모크
-PYTHON=$PY ./pytests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
+PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 
 # 골든 · 스키마 — PYTHONPATH=vendor 를 **붙이지 않는다**.
 # 붙이면 벤더링 트리가 상류 torch 를 가려서 비교의 양쪽이 같은 것이 되고 가짜 실패가 난다.
 cd ../..
-$PY tools/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
-$PY rust/torch_c/pytests/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
+$PY tests/golden/compare.py > /tmp/golden.log 2>&1; echo "EXIT=$?"
+$PY tests/verify_schemas.py > /tmp/schemas.log 2>&1; echo "EXIT=$?"
 for m in value shape dtype; do
-  $PY tools/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
+  $PY tests/golden/compare.py --inject-fault $m > /tmp/fault-$m.log 2>&1; echo "$m EXIT=$?"
 done
 
 # Llama 순전파 — 벤더링 트리에 새 산출물을 먼저 넣어야 한다.
 # 이것을 빼먹으면 낡은 _C.abi3.so 를 재게 되고, 방금 구현한 op 이 "미구현" 으로 나온다.
-./vendor/install_shim.sh > /tmp/install.log 2>&1; echo "EXIT=$?"
+./scripts/vendor/install_shim.sh > /tmp/install.log 2>&1; echo "EXIT=$?"
 PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
   $PY <순전파 스크립트> ...
 
@@ -362,10 +362,10 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
 ## 8. 이 작업이 건드린 파일
 
 ```
-rust/torch_c/src/aten.rs      8 개 커널 + 디스패치 + IMPLEMENTED (62 -> 70)
-tools/golden/cases.py         8 개 케이스 빌더 (169 케이스) + CASE_BUILDERS 등록
+torchnative/rust/torch_c/src/aten.rs      8 개 커널 + 디스패치 + IMPLEMENTED (62 -> 70)
+tests/golden/cases.py         8 개 케이스 빌더 (169 케이스) + CASE_BUILDERS 등록
 docs/kernels/OPS8.md                  이 문서
 ```
 
-`rust/torch_c/src/bootstrap.py` 는 **건드리지 않았습니다** (지시대로). §5-1/§5-2 가 그 파일에서
+`torchnative/rust/torch_c/src/bootstrap.py` 는 **건드리지 않았습니다** (지시대로). §5-1/§5-2 가 그 파일에서
 해야 할 일을 적어 둔 것입니다.

@@ -22,24 +22,24 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 64 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs like_fill present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs FILL_F32_SPV present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/fill_f32.comp uintBitsToFloat present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/shaders/sum_dims_f32.comp do_mean present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs like_fill present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs FILL_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/fill_f32.comp uintBitsToFloat present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/shaders/sum_dims_f32.comp do_mean present -->
 <!-- DOCWATCH: op-implemented aten.mean.default -->
 <!-- DOCWATCH: op-implemented aten.mean.dim -->
 <!-- DOCWATCH: op-implemented aten.ones_like.default -->
 <!-- DOCWATCH: op-implemented aten.zeros_like.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_ones_like_and_zeros_like_are_filled_by_a_shader_not_by_an_upload present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_ones_like_refuses_a_dtype_this_device_cannot_hold present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_ones_like_refuses_a_device_it_would_have_to_leave_to_honour present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_mean_over_dims_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_mean_default_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_wrong_mean_reduction_is_rejected_by_this_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_mean_reduction_ran_on_the_gpu_in_exactly_one_dispatch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_training_step_runs_end_to_end_on_the_vulkan_device_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_training_step_never_left_the_gpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_three_training_steps_drive_the_loss_down_and_track_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_ones_like_and_zeros_like_are_filled_by_a_shader_not_by_an_upload present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_ones_like_refuses_a_dtype_this_device_cannot_hold present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_ones_like_refuses_a_device_it_would_have_to_leave_to_honour present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_mean_over_dims_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_mean_default_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_wrong_mean_reduction_is_rejected_by_this_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_mean_reduction_ran_on_the_gpu_in_exactly_one_dispatch present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_training_step_runs_end_to_end_on_the_vulkan_device_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_training_step_never_left_the_gpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_three_training_steps_drive_the_loss_down_and_track_upstream present -->
 
 ---
 

@@ -31,7 +31,7 @@ the rest should be taken:
 ## 1. `var_mean` — a real operator, returning a pair
 
 There was no `aten.var_mean.*` kernel of any kind, and no `var_mean` entry in
-`rust/torch_c/src/overloads.json`, so `torch.var_mean(...)` refused at overload
+`torchnative/rust/torch_c/src/overloads.json`, so `torch.var_mean(...)` refused at overload
 resolution before reaching a dispatcher. `aten.var.*` and `aten.std.*` existed
 and still do.
 
@@ -490,12 +490,12 @@ and `test_the_precondition_decides_both_ways_on_synthetic_inputs`.
 The four gate failures this round produced were all *consequences* correctly
 reported by tests doing their job, not pre-existing defects — see below.
 
-**Tests added**: 12 — 7 in `rust/torch_c/pytests/test_varmean.py`, 3 in
-`rust/torch_c/pytests/test_convbackend.py`, and 2 in
-`rust/torch_c/pytests/test_gloopin.py` (§5.2: the interface detector's own
+**Tests added**: 12 — 7 in `tests/test_varmean.py`, 3 in
+`tests/test_convbackend.py`, and 2 in
+`tests/test_gloopin.py` (§5.2: the interface detector's own
 check, and the precondition driven both ways). Every one compares against upstream
 torch's own answer in a second subprocess; the numeric tolerances are imported
-from `tools/golden/dtypes.py` rather than restated, so widening one is not
+from `tests/golden/dtypes.py` rather than restated, so widening one is not
 possible without widening the golden harness's. Plus 3 golden case builders
 (`aten.var_mean.*`), which reuse `var`'s own tables with a `(var, mean)`
 comparator — so the five clamped-denominator rows and the `correction=None`
@@ -540,16 +540,16 @@ answer `False` there, so the blanket answer is wrong) but is **not** the cause
 of §4's wall, and landing it on that mistaken ground would have been the
 round's worst move.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs var_mean_reduce present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs var_reduce_values present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs var_mean_correction present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_conv_backend_query present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_varmean.py test_var_mean_agrees_with_upstream_element_wise_on_both_halves present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_varmean.py test_var_mean_correction_defaults_to_one_not_zero present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_varmean.py test_var_mean_on_meta_answers_upstreams_shape_dtype_and_stride present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_varmean.py test_a_module_that_uses_var_mean_exports_replays_and_agrees present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_convbackend.py test_the_conv_backend_enum_is_upstreams_names_and_values present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_convbackend.py test_select_conv_backend_answers_overrideable_exactly_where_upstream_does present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_mean_reduce present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_reduce_values present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs var_mean_correction present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/bootstrap.py _install_conv_backend_query present -->
+<!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_agrees_with_upstream_element_wise_on_both_halves present -->
+<!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_correction_defaults_to_one_not_zero present -->
+<!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_var_mean_on_meta_answers_upstreams_shape_dtype_and_stride present -->
+<!-- DOCWATCH: symbol-in-file tests/test_varmean.py test_a_module_that_uses_var_mean_exports_replays_and_agrees present -->
+<!-- DOCWATCH: symbol-in-file tests/test_convbackend.py test_the_conv_backend_enum_is_upstreams_names_and_values present -->
+<!-- DOCWATCH: symbol-in-file tests/test_convbackend.py test_select_conv_backend_answers_overrideable_exactly_where_upstream_does present -->
 <!-- DOCWATCH: op-implemented aten.var_mean.default -->
 <!-- DOCWATCH: op-implemented aten.var_mean.dim -->
 <!-- DOCWATCH: op-implemented aten.var_mean.correction -->

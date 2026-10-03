@@ -44,7 +44,7 @@ CPython 3.13.0, 상류 torch 2.13.0, candle-core 0.11.0, Accelerate 켜짐.
 같은 복사를 하는 자리가 하나 더 있고, **그쪽이 실모델이 지나가는 자리**입니다.
 
 ```python
-# rust/torch_c/src/bootstrap.py  linear()
+# torchnative/rust/torch_c/src/bootstrap.py  linear()
 wt = _t(weight)                                   # 전치 "뷰" -- 공짜
 return dispatch("aten.matmul.default", input, wt)
 ```
@@ -139,7 +139,7 @@ match multiply(lhs, rhs) {
 
 ## 3. 무엇을 고쳤는가
 
-`rust/torch_c/src/aten.rs` 한 파일, 115 줄 추가 · 16 줄 삭제.
+`torchnative/rust/torch_c/src/aten.rs` 한 파일, 115 줄 추가 · 16 줄 삭제.
 
 | # | 무엇 | 어디 |
 |---|---|---|
@@ -211,7 +211,7 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 `mm`/`bmm`/`addmm`/`baddbmm` 은 비교합니다.
 
 **"골든 2760/2760 통과" 는 이 변경의 근거가 될 수 없고**, §4 의 프로브가 그 자리를 메우려고
-쓴 것입니다. `tools/golden/cases.py` 에 `matmul` 케이스 빌더를 넣는 것이 남은 일입니다.
+쓴 것입니다. `tests/golden/cases.py` 에 `matmul` 케이스 빌더를 넣는 것이 남은 일입니다.
 
 ---
 
@@ -289,7 +289,7 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 | # | 벽 | 크기 | 무엇이 필요한가 |
 |---|---|---|---|
 | 1 | **`bfloat16`/`float16` 가중치가 호출마다 `float32` 로 실체화됨** | **이 회차가 없앤 것과 같은 종류의 복사이고, 아직 있습니다.** A+B 를 적용한 뒤에도 같은 모양에서: `lm_head` `(1,6,576)` `float32` **4.75 ms** 대 `bfloat16` **77.84 ms** (16.4×), `float16` 79.33 ms. `gate` 는 0.094 대 1.87 ms (19.9×) | `opmath_in` 의 넓히기는 상류가 하는 것이라 지울 수 없습니다(`docs/numerics/BF16.md`). 넓힌 가중치를 **캐시**하거나, 넓히기를 GEMM 안으로 밀어 넣어야 합니다. 수명이 걸린 설계 판단 |
-| 2 | **골든이 `aten.matmul.default` 를 안 봄** | `IMPLEMENTED_AWAITING_GOLDEN` 에 있음 (§4.3). 이 문서의 변경이 가장 크게 건드린 커널이 **골든 밖**이었습니다. **정정 (문서 감사, 2026-09): 닫혔다** — `aten.matmul.default` 가 오늘 168-op `_aten_implemented()` 목록에 있고(§6의 이 정정이 참조하는 라운드 3 기준선의 `pending case builders=1` 은 `aten.reshape.default` 하나뿐, `matmul` 아님), 골든이 오늘 이 op 을 비교한다 | `tools/golden/cases.py` 에 케이스 빌더 하나 + `IMPLEMENTED` 로 한 줄 이동 |
+| 2 | **골든이 `aten.matmul.default` 를 안 봄** | `IMPLEMENTED_AWAITING_GOLDEN` 에 있음 (§4.3). 이 문서의 변경이 가장 크게 건드린 커널이 **골든 밖**이었습니다. **정정 (문서 감사, 2026-09): 닫혔다** — `aten.matmul.default` 가 오늘 168-op `_aten_implemented()` 목록에 있고(§6의 이 정정이 참조하는 라운드 3 기준선의 `pending case builders=1` 은 `aten.reshape.default` 하나뿐, `matmul` 아님), 골든이 오늘 이 op 을 비교한다 | `tests/golden/cases.py` 에 케이스 빌더 하나 + `IMPLEMENTED` 로 한 줄 이동 |
 | 3 | **왼쪽이 2-D, 오른쪽이 N-D 인 matmul** | 접기가 반대 방향은 안 함. `broadcast_matmul` 이 여전히 왼쪽을 실체화 | 상류의 `should_fold` 반대 갈래. 실측 사용례를 못 찾아 손대지 않았습니다 |
 | 4 | **`addmm` 의 bias 브로드캐스트 복사** | `bias.broadcast_as(target).contiguous()` — `lm_head` 에서 196 KB, 가중치 113 MB 대비 0.17% | 작아서 손대지 않았습니다. 이름만 적어둡니다 |
 | 5 | **기기 측정 없음** | 전부 호스트 M1 (Accelerate). 안드로이드는 `gemm` 백엔드라 §2 표의 오른쪽 열이 적용됨 | `gemm` 은 마지막 두 차원 스트라이드를 임의로 받으므로 **폴백이 더 적게 발동할 것**으로 보이지만, 재지 않았습니다 |
@@ -303,13 +303,13 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 
 > **정정 (문서 감사, 2026-09):** 이 문단은 이 문서 자신을 착지시킨 바로 그 커밋(`2e00ec3`,
 > "Perf: Fold instead of broadcasting, and stop copying the weight every call")과 자기모순이다 —
-> `git show --stat 2e00ec3` 로 확인하면 그 커밋이 `docs/perf/LINEAR.md` 370줄 신설과 `rust/torch_c/
+> `git show --stat 2e00ec3` 로 확인하면 그 커밋이 `docs/perf/LINEAR.md` 370줄 신설과 `torchnative/rust/torch_c/
 > src/aten.rs` 131줄 변경을 **함께** 실었다. 즉 이 문단이 커밋에 들어가는 순간 "커밋하지 않았다"는
 > 이미 틀렸다. 골랐던 것은 **①** — A+B 를 그대로, 옵트인 없이, 기본값으로 착지 — 였다:
 > `gemm_with_layout_fallback`/`batched_matmul` 이 오늘 `aten.rs` 의 기본 경로다(라운드 1
 > `docs/design/DESIGN.md` 감사가 이미 확인). `docs/graph/QUANT2.md` 감사(라운드 2)도 같은 커밋을 독립적으로
 > 확인했다. 아래 표 자체는 그 판단이 내려지기 직전 시점의 정확한 기록이라 그대로 둔다.
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs batched_matmul present -->
+> <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs batched_matmul present -->
 
 | 선택지 | 무엇 | 대가 |
 |---|---|---|
@@ -345,16 +345,16 @@ sha256 이라 **허용오차가 아니라 비트 비교**입니다.
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 cd /Volumes/macMini/worktrees/bw-linear
-bash vendor/vendor_torch.sh
+bash scripts/vendor/vendor_torch.sh
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-linear
 export HF_HOME=/Volumes/macMini/caches/hf-home
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-bash vendor/install_shim.sh
+bash scripts/vendor/install_shim.sh
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib   # 빼먹으면 캐시의 다른 빌드를 잽니다
 
-PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 197
-$PY tools/golden/compare.py                        # 2760/2760 ops=118
-$PY rust/torch_c/pytests/verify_schemas.py         # 4200/4200
+PYTHON=$PY sh tests/run.sh          # 197
+$PY tests/golden/compare.py                        # 2760/2760 ops=118
+$PY tests/verify_schemas.py         # 4200/4200
 ```
 
 측정 스크립트는 저장소 밖 `/Volumes/macMini/caches/linear-scratch/` 에 있습니다:
@@ -373,7 +373,7 @@ PROBE_REPO=$PWD TORCH_C_ARTEFACT=$TORCH_C_ARTEFACT $PY .../bitprobe.py --backend
 PROBE_REPO=$PWD $PY .../bitprobe.py --backend torch up.txt      # 상류. PYTHONPATH 없이
 
 # §5.3 은 벤더링 트리를 통해서만 나옵니다.
-TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/src/main $PY .../smol_check.py out.json
+TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/torchnative/python $PY .../smol_check.py out.json
 ```
 
 **측정 전에 `uptime` 을 보고 기록하십시오.** 이 문서의 수치는 load 1.4 ~ 2.0 에서 잰 것이고,

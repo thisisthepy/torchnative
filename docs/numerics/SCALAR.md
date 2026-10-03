@@ -450,7 +450,7 @@ applies.
 Six faults in `aten.rs`, each the most plausible wrong shape for what this round
 changed, plus a re-run of docs/training/TRAIN.md §5's S4 — the one that started it. Every
 one was applied to the source, **rebuilt**, and run through
-`tools/golden/compare.py` and `pytests/test_shim.py`.
+`tests/golden/compare.py` and `tests/test_shim.py`.
 
 | # | fault | golden | smoke |
 |---|---|---:|---|
@@ -527,10 +527,10 @@ dtype.
 > <!-- DOCWATCH: op-implemented aten.div.Scalar_mode -->
 > <!-- DOCWATCH: op-implemented aten.pow.Tensor_Scalar -->
 > <!-- DOCWATCH: op-implemented aten.pow.Scalar -->
-> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py _scalar_rule_cases present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul present -->
-> <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_pow_narrows_its_scalar_where_mul_widens_it present -->
+> <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _scalar_rule_cases present -->
+> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed present -->
+> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul present -->
+> <!-- DOCWATCH: symbol-in-file tests/test_shim.py test_pow_narrows_its_scalar_where_mul_widens_it present -->
 >
 > §6's second bullet said `aten.add.Scalar` and `aten.sub.Scalar` were
 > implemented in `aten.rs` but absent from `_aten_implemented()`, which is why
@@ -538,7 +538,7 @@ dtype.
 > rather than deleted, so that the closure cannot silently come undone:
 > <!-- DOCWATCH: op-implemented aten.add.Scalar -->
 > <!-- DOCWATCH: op-implemented aten.sub.Scalar -->
-> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py _add_sub_scalar_cases present -->
+> <!-- DOCWATCH: symbol-in-file tests/golden/cases.py _add_sub_scalar_cases present -->
 
 ---
 
@@ -793,8 +793,8 @@ refusals are unchanged and only their stated reasons moved.
 
 | gate | before this section | after |
 |---|---|---|
-| `pytests/run.sh` | 302 ok, DOCWATCH 159/159 | **304 ok, DOCWATCH 164/164** |
-| `tools/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168** |
+| `tests/run.sh` | 302 ok, DOCWATCH 159/159 | **304 ok, DOCWATCH 164/164** |
+| `tests/golden/compare.py` | 7447/7447, ops=166 | **7685/7685, ops=168** |
 | `compare.py --self-test` | 19 × 11, 0 problems | unchanged |
 | `verify_schemas.py` | 4475/4475 | **4479/4479** |
 | sweep26 / sweeptrain | 26/26 | **26/26 / 26/26** |

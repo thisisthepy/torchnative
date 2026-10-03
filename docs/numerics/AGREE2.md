@@ -1,12 +1,12 @@
 # AGREE2 — the agreement sweep taken again: 288 of 290 judgeable architectures match, and all 297 now replay
 
-Worktree `work/agree2` on develop `44f4dec`, vendored tree assembled fresh (`vendor/vendor_torch.sh`
-then `vendor/install_shim.sh`) so every number below is this checkout's own `lib_C.dylib`. torch
+Worktree `work/agree2` on develop `44f4dec`, vendored tree assembled fresh (`scripts/vendor/vendor_torch.sh`
+then `scripts/vendor/install_shim.sh`) so every number below is this checkout's own `lib_C.dylib`. torch
 2.13.0 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout, same
 venv `docs/architectures/ARCH100.md`, `ARCH200.md`, `ARCH300.md` and `docs/numerics/AGREE.md` used.
 No Rust, `bootstrap.py` or `aten.rs` was changed: this round measures, and adds
-`rust/torch_c/pytests/agree2_scores.json`, `rust/torch_c/pytests/test_agree2.py`, the
-`agree_*` count sources in `tools/docwatch/check_docs.py`, and this document.
+`tests/agree2_scores.json`, `tests/test_agree2.py`, the
+`agree_*` count sources in `tests/docwatch/check_docs.py`, and this document.
 
 **Measured 2026-09-12.** Every count here was taken this round unless it is explicitly dated to an
 earlier one.
@@ -275,7 +275,7 @@ New to this round, and each is a thing this round could NOT settle:
 * **UNVERIFIED — whether MoE routing is stable at trained weights or longer sequences.** §4 measures
   stability only at these shrunk configs with random weights.
 * **The counts are pinned to a recorded measurement, not to a live one,** and only in one
-  direction. §1's markers re-derive the verdicts from `rust/torch_c/pytests/agree2_scores.json` by
+  direction. §1's markers re-derive the verdicts from `tests/agree2_scores.json` by
   calling `agree_sweep.verdict`, so deleting a refusal branch or dropping architectures from the
   recording fires them (both nullified and confirmed red). **Widening the rule does not fire them
   and cannot** — `ge 288` and `le 2` accept anything that moves architectures *into* `agree`, which
@@ -294,7 +294,7 @@ These are not:
 /Volumes/macMini/caches/agree-sweep/       69 MB  inputs, up32, up64, shim32 and the per-module
                                                   capture, plus _produce/_replay/_report and the
                                                   per-architecture records both drivers resume from
-rust/torch_c/pytests/agree2_scores.json   128 KB  the per-architecture scores, in the repo
+tests/agree2_scores.json   128 KB  the per-architecture scores, in the repo
 ```
 
 The sweep produced **6.2 GB**; the `*.weights.npz` state-dict bundles were **all of it** and have
@@ -311,11 +311,11 @@ To retake the whole thing:
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 D=/Volumes/macMini/caches/agree-sweep          # NOT /tmp -- 6.2 GB, and /tmp is internal
 REPO=$(git rev-parse --show-toplevel)
-vendor/vendor_torch.sh && vendor/install_shim.sh     # or the shim side reports "not the shim"
-cd rust/torch_c/pytests
+scripts/vendor/vendor_torch.sh && scripts/vendor/install_shim.sh     # or the shim side reports "not the shim"
+cd tests
 
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL $PY agree_sweep.py --produce --dir $D --deadline 520
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 \
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 \
                                            $PY agree_sweep.py --replay  --dir $D --deadline 500
 $PY agree_sweep.py --report --dir $D
 ```
@@ -328,7 +328,7 @@ round invalidated by exactly that.
 ## 9. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    1517 ok, 0 FAIL, exit 0      (1504 on develop; +13 from test_agree2.py)
+tests/run.sh    1517 ok, 0 FAIL, exit 0      (1504 on develop; +13 from test_agree2.py)
 DOCWATCH                       PASS -- 1141/1141 evaluated marker(s) hold   (1126/1126 on develop;
                                                                             +15 markers, 8 of them
                                                                             the counts in §1)
@@ -340,7 +340,7 @@ Golden was not re-run by this round directly, but `run.sh` runs it: **11478/1147
 the tree moved between the two rounds, which is the same reason this document exists. This round
 changed no Rust, so it did not move it.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py verdict present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/agree_sweep.py ORACLE_FACTOR present -->
-<!-- DOCWATCH: symbol-in-file tools/docwatch/check_docs.py agree_no_oracle present -->
-<!-- DOCWATCH: json-key rust/torch_c/pytests/agree2_scores.json scores present -->
+<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py verdict present -->
+<!-- DOCWATCH: symbol-in-file tests/agree_sweep.py ORACLE_FACTOR present -->
+<!-- DOCWATCH: symbol-in-file tests/docwatch/check_docs.py agree_no_oracle present -->
+<!-- DOCWATCH: json-key tests/agree2_scores.json scores present -->

@@ -25,8 +25,8 @@
 | 기기 CPython | `3.13.0+ (heads/3.13-dirty:b4c504d76ff, Oct 13 2024)` `[Clang 17.0.2]`, `sys.platform='android'`, `os.uname().machine='aarch64'` |
 | 배포본 | `/Volumes/macMini/caches/target-python/aarch64-linux-android/prefix` |
 | 호스트 | `darwin/arm64`, `/Volumes/macMini/caches/spike-venv/bin/python` (CPython 3.13.0) |
-| 벤더링 트리 | `torchnative/src/main/torch` — torch **2.13.0**, `vendor/vendor_torch.sh` 로 생성 (`py_modules=2286`, `native_left=0`) |
-| `_C` | `rust/torch_c`, PyO3 0.29.2 `abi3-py313` + candle-core 0.11.0 |
+| 벤더링 트리 | `torchnative/python/torch` — torch **2.13.0**, `scripts/vendor/vendor_torch.sh` 로 생성 (`py_modules=2286`, `native_left=0`) |
+| `_C` | `torchnative/rust/torch_c`, PyO3 0.29.2 `abi3-py313` + candle-core 0.11.0 |
 
 **`pmp_api26` 은 `PythonMultiplatform` 이 쓰는 공용 에뮬레이터다.** 앱 설치·`pm` 조작을 전혀
 하지 않았고 `/data/local/tmp/bw_device` 아래에만 파일을 올렸다. `DEVICE_LOAD.md` 와 같은 규율이다.
@@ -37,7 +37,7 @@
 
 ```
 CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-device2
-cd rust/torch_c && ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \
+cd torchnative/rust/torch_c && ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \
   PYO3_CROSS=1 PYO3_CROSS_PYTHON_VERSION=3.13 \
   PYO3_CROSS_LIB_DIR=<배포본>/prefix/lib \
   cargo ndk -t arm64-v8a --platform 21 build --release
@@ -56,7 +56,7 @@ bionic 으로 해결되며, 그 사실이 링크 정보에 그대로 적혀 있�
 
 ## 3. 스테이징
 
-`scripts/device_android.sh stage` 가 `/data/local/tmp/bw_device` 에 올린 것:
+`scripts/devices/device_android.sh stage` 가 `/data/local/tmp/bw_device` 에 올린 것:
 
 ```
 bw_device/            399 MB
@@ -125,7 +125,7 @@ mm          : [[3.0, 3.0], [3.0, 3.0]]
 
 ## 5. 결과 — 호스트 대비 비트 대조
 
-`scripts/device_parity.py` 를 양쪽에서 돌리고 모든 결과를 **big-endian IEEE-754 hex** 로
+`scripts/devices/device_parity.py` 를 양쪽에서 돌리고 모든 결과를 **big-endian IEEE-754 hex** 로
 찍어 비교했다. 오차 허용치가 아니라 비트 비교다.
 
 ```
@@ -214,8 +214,8 @@ MISMATCH rsqrt.default             1/12 elements, max 1 ULP
 
 - **비트 재현성을 요구하는 기능(체크포인트 해시, 결정론적 재생, 크로스 플랫폼 골든)은
   이 차이 위에 세울 수 없다.** f32 행렬곱을 지나는 순간 플랫폼이 답을 바꾼다.
-- **`scripts/device_android.sh parity` 는 이 차이를 재지 않는다.** 그 스크립트는 호스트
-  쪽을 `accelerate` 없이 따로 빌드해서(`rust/torch_c/Cargo.toml` 의
+- **`scripts/devices/device_android.sh parity` 는 이 차이를 재지 않는다.** 그 스크립트는 호스트
+  쪽을 `accelerate` 없이 따로 빌드해서(`torchnative/rust/torch_c/Cargo.toml` 의
   `torch_c_no_accelerate` cfg) **gemm 대 gemm** 으로 비교한다.
 
 ### 5.2 왜 parity 는 배송 빌드를 재지 않는가
@@ -254,12 +254,12 @@ Accelerate 를 링크하지 않는지 `otool` 로 확인한 뒤에만** 잰다. 
   주장이 있었지만 **정확성 쪽은 기기에서 한 번도 재지 않았다**
 - `sum.dim_IntList`([]) 결함 수정 (`docs/graph/DECOMP.md` §6.1, 이 회차에 같이 고쳤다)
 
-**이 중 어느 것도 기기에서 확인된 적이 없었다.** `scripts/device_parity.py` 의 배터리는
+**이 중 어느 것도 기기에서 확인된 적이 없었다.** `scripts/devices/device_parity.py` 의 배터리는
 33 케이스에 멈춰 있었고 위 항목 전부가 빠져 있었다.
 
 #### 무엇을 더했는가
 
-`scripts/device_parity.py` 에 21 케이스를 더해 **54 개**로 늘렸다 (원래 33 개는 그대로 두고
+`scripts/devices/device_parity.py` 에 21 케이스를 더해 **54 개**로 늘렸다 (원래 33 개는 그대로 두고
 추가만 했다 — 기존 케이스 이름과 겹치지 않는 새 키를 썼다):
 
 ```
@@ -269,14 +269,14 @@ cat.default (empty)                      ← legacy-empty 규칙: (0,) 1-D 는 �
 clamp_.default   convolution.default   div_.Tensor   exp.default   floor_divide.default
 ge.Scalar   histc.default   index_put_.default   masked_fill_.Scalar   softplus.default
 zeros_like.default                       ← mamba·mixtral 12 개 중 11 개 (mixtral 값은 doc-comment
-                                            를 베끼지 않고 tools/golden/cases.py 의 이미 측정된
+                                            를 베끼지 않고 tests/golden/cases.py 의 이미 측정된
                                             픽스처 값을 그대로 재사용했다)
 mm.default (n=128, gemm threading threshold)  ← 정확성만, 성능은 안 쟀다 (AGENTS.md)
 sum.dim_IntList (dim=[])                 ← 이번에 고친 커널이 기기에서도 같은 값을 내는지
 ```
 
 **뺀 것 하나, 의도적으로.** `empty_like.default` 는 안 넣었다 — 초기화되지 않은 메모리는
-비트로 비교할 대상이 없다. `tools/golden/cases.py` 의 `_dtype_shape_only_check` 가 골든
+비트로 비교할 대상이 없다. `tests/golden/cases.py` 의 `_dtype_shape_only_check` 가 골든
 하네스에서 이미 같은 이유로 값 비교를 건너뛰고, 이 배터리는 값 비교(비트 대조)가 전부이므로
 같은 논리로 뺐다 — shape/dtype 만 비교하는 별도 경로는 이 스크립트에 없다.
 
@@ -319,7 +319,7 @@ bionic 의 `expf` 가 서로 다른 구현일 뿐, 어느 쪽도 "틀린" 것이
 같은 `expf` 차이가 한 겹 위로 전파된 것**이다 — 새 op 이 아니라 새로 이 `expf` 경로를
 지나는 op 일 뿐이다.
 
-그래서 `scripts/device_android.sh` 의 `EXPECTED_LIBM_DIVERGENCE` 에 두 항목을 추가했다:
+그래서 `scripts/devices/device_android.sh` 의 `EXPECTED_LIBM_DIVERGENCE` 에 두 항목을 추가했다:
 
 ```python
 EXPECTED_LIBM_DIVERGENCE = {
@@ -386,11 +386,11 @@ ModuleNotFoundError: No module named '_multiprocessing'
 ## 7. 양쪽에서 똑같이 실패하는 것 하나 — `_C` 의 갭이지 기기 문제가 아니다
 
 > **Correction (문서 감사, 2026-09):** 닫혔습니다. `torch.relu` 가 지금
-> `rust/torch_c/src/overloads.json` 에 있고(`grep -c '"relu"'` → 1), 실측:
+> `torchnative/rust/torch_c/src/overloads.json` 에 있고(`grep -c '"relu"'` → 1), 실측:
 > `torch.relu(torch.tensor([-1.0, 2.0]))` → `tensor([0., 2.])`, 성공. 어느 라운드가 채웠는지는
 > 추적하지 않았습니다 — `docs/models/SAMPLING.md` 감사에서 방금 발견한 것과 같은 모양입니다(overloads
 > 테이블이 이 문서를 쓴 뒤 다른 라운드에서 계속 채워졌다).
-> <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json relu present -->
+> <!-- DOCWATCH: json-key torchnative/rust/torch_c/src/overloads.json relu present -->
 
 ```
 nn.ReLU()(x)  ->  F.relu(x)  ->  torch.relu(x)
@@ -398,7 +398,7 @@ NotImplementedError: not implemented in torch._C shim: torch.relu(...)
   -- overload resolution has no table entry for this op
 ```
 
-`torch.relu` (오버로드 접미사 없는 스펠링) 가 `rust/torch_c/src/overloads.json` 에 없다.
+`torch.relu` (오버로드 접미사 없는 스펠링) 가 `torchnative/rust/torch_c/src/overloads.json` 에 없다.
 `torch.ops.aten.relu.default` 는 양쪽에서 **비트 동일하게 돈다.** 호스트와 기기가 **같은**
 메시지로 실패하므로 이것은 기기 문제가 아니라 오버로드 테이블의 빠진 항목이다 —
 양쪽에서 돌린 것의 값이 여기 있다. `nn.Sequential` 케이스가 `nn.ReLU` 대신 `nn.Tanh` 를
@@ -432,11 +432,11 @@ export PATH="$HOME/.cargo/bin:$HOME/Library/Android/sdk/platform-tools:$PATH"
 export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-device2
 export ANDROID_SERIAL=emulator-5554  # 여러 대가 붙어 있으면 필수
 
-bash vendor/vendor_torch.sh          # 벤더링 트리
-bash vendor/install_shim.sh          # 호스트 _C (배송 설정 — 골든·pytests 용)
-sh scripts/device_android.sh build   # 안드로이드 _C
-sh scripts/device_android.sh stage   # 기기에 올림
-sh scripts/device_android.sh parity  # 양쪽 실행 + 비트 대조
+bash scripts/vendor/vendor_torch.sh          # 벤더링 트리
+bash scripts/vendor/install_shim.sh          # 호스트 _C (배송 설정 — 골든·pytests 용)
+sh scripts/devices/device_android.sh build   # 안드로이드 _C
+sh scripts/devices/device_android.sh stage   # 기기에 올림
+sh scripts/devices/device_android.sh parity  # 양쪽 실행 + 비트 대조
 ```
 
 `parity` 는 실패하면 종료 코드 1 과 `PARITY: ...` 한 줄을 낸다.
@@ -503,7 +503,7 @@ bionic 쪽이 나중에 고쳐지면 면제 항목이 남아돌게 되는데, �
 
 ## 11. 다음에 무엇을 해야 다음 단계가 열리는가
 
-1. **`rust/torch_c/src/overloads.json` 에 접미사 없는 스펠링을 채운다** (§7). `torch.relu`
+1. **`torchnative/rust/torch_c/src/overloads.json` 에 접미사 없는 스펠링을 채운다** (§7). `torch.relu`
    하나가 아니라 `F.*` 가 부르는 bare 스펠링 전반의 문제일 가능성이 높다 — `nn` 모듈이
    순전파에서 어떤 bare 스펠링을 부르는지 세어보는 것이 먼저다.
 2. **`_multiprocessing` 부재를 어디서 처리할지 정한다** (§6). 지금은 계측용 런타임 스텁이라

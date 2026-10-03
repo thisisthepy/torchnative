@@ -21,18 +21,18 @@
 | `VULKAN_INDEX_MAX` · `check_dtype` 을 건드렸나 | **아니오.** 한 글자도 바뀌지 않았다 |
 
 <!-- DOCWATCH: count vulkan_tests_ok ge 52 -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs sum_vulkan present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/vulkan.rs SUM_DIMS_F32_SPV present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs sum_vulkan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/vulkan.rs SUM_DIMS_F32_SPV present -->
 <!-- DOCWATCH: op-implemented aten.sum.dim_IntList -->
 <!-- DOCWATCH: op-implemented aten.sum.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_sum_over_dims_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_sum_default_agrees_with_upstream_at_a_derived_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_wrong_sum_reduction_is_rejected_by_this_tolerance present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_sum_reduction_ran_on_the_gpu_in_exactly_one_dispatch present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_sum_refuses_what_this_device_does_not_do_rather_than_reaching_for_the_cpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_the_vulkan_sdpa_backward_never_left_the_gpu present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_vulkan4.py test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_sum_over_dims_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_sum_default_agrees_with_upstream_at_a_derived_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_wrong_sum_reduction_is_rejected_by_this_tolerance present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_sum_reduction_ran_on_the_gpu_in_exactly_one_dispatch present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_sum_refuses_what_this_device_does_not_do_rather_than_reaching_for_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_a_backward_through_the_vulkan_sdpa_now_runs_and_agrees_with_upstream present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_the_vulkan_sdpa_backward_never_left_the_gpu present -->
+<!-- DOCWATCH: symbol-in-file tests/test_vulkan4.py test_what_the_sdpa_backward_still_cannot_reach_is_unreachable_for_a_reason present -->
 
 ---
 

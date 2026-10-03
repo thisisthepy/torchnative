@@ -1,6 +1,6 @@
 # HARNESS — 검사기를 검사한다
 
-`tools/golden/compare.py` 의 자가검사(`--inject-fault`)가 **비교기 열 개 중 하나만**
+`tests/golden/compare.py` 의 자가검사(`--inject-fault`)가 **비교기 열 개 중 하나만**
 검사하고 있었습니다. 나머지 아홉은 한 번도 "틀린 답을 거부하는가" 를 확인받은 적이 없고,
 그 아홉이 판정하던 케이스가 **1781 중 404 개(22.7%)** 입니다.
 
@@ -82,7 +82,7 @@ verify_schemas.py    170/170                                                   e
 ## 3. 어떻게 메웠나
 
 두 가지를 바꿨습니다. **둘 다 `compare.py` 안에서 끝납니다** — `cases.py` 와
-`rust/torch_c/` 는 한 글자도 건드리지 않았습니다.
+`torchnative/rust/torch_c/` 는 한 글자도 건드리지 않았습니다.
 
 ### 3.1 주입 단위를 "실행당 1건" 에서 "비교기당 1건" 으로
 
@@ -134,7 +134,7 @@ docstring 에서 인용해 적었습니다.
 ### 3.3 `--self-test` — 표 전체를 돌리는 게이트
 
 ```bash
-$PY tools/golden/compare.py --self-test        # exit 0 이어야 정상
+$PY tests/golden/compare.py --self-test        # exit 0 이어야 정상
 ```
 
 `--inject-fault` 는 역사적으로 **exit 1 이 정상**입니다(잡힌 결함이 케이스를 실패시키므로).
@@ -212,15 +212,15 @@ _triple_result_check    | CAUGHT | CAUGHT     | CAUGHT | CAUGHT     | CAUGHT | C
 | `_topk_multiset_check` + `shape-last` | `indices` 의 **shape 을 비교하지 않는다.** 값 쪽 shape 과 `(값, 인덱스)` multiset 만 보는데, multiset 은 인덱스 텐서의 reshape 을 견딘다 |
 | `_topk_multiset_check` + `dtype-last` | 위와 같은 dtype 구멍 |
 
-세 결함 다 **`tools/golden/cases.py` 안에 있고, 이번 작업의 파일 범위 밖**입니다.
+세 결함 다 **`tests/golden/cases.py` 안에 있고, 이번 작업의 파일 범위 밖**입니다.
 고치지 않았습니다. 필요한 수정은 각각 한 줄입니다.
 
-> **정정 (문서 감사, 2026-09):** 전부 닫혔다 — `tools/golden/cases.py` 에 `indices dtype
+> **정정 (문서 감사, 2026-09):** 전부 닫혔다 — `tests/golden/cases.py` 에 `indices dtype
 > mismatch`/`indices shape mismatch` 검사가 오늘 두 자리(6287·6295, 9575·9578행)에 있고, 그
-> 텍스트가 이 절이 제안한 한 줄과 그대로 일치한다. `tools/golden/compare.py` 의 `KNOWN_GAP` 은
-> 오늘 빈 딕셔너리다 — 아래 §6 의 요구대로 고친 뒤 지워졌다. `tools/golden/`/`rust/` 는 이
+> 텍스트가 이 절이 제안한 한 줄과 그대로 일치한다. `tests/golden/compare.py` 의 `KNOWN_GAP` 은
+> 오늘 빈 딕셔너리다 — 아래 §6 의 요구대로 고친 뒤 지워졌다. `tests/golden/`/`rust/` 는 이
 > 라운드의 금지 영역이라 직접 고치지 않았지만, 이미 다른 작업이 고쳐 두었다.
-> <!-- DOCWATCH: symbol-in-file tools/golden/cases.py "indices dtype mismatch" present -->
+> <!-- DOCWATCH: symbol-in-file tests/golden/cases.py "indices dtype mismatch" present -->
 
 ```python
 # _pair_result_check (cases.py:2108 근처, indices shape 비교 옆)
@@ -367,14 +367,14 @@ export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-harness
 export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 
-sh vendor/vendor_torch.sh                              # 새 worktree 라면 먼저
-(cd rust/torch_c && cargo build --release)
+sh scripts/vendor/vendor_torch.sh                              # 새 worktree 라면 먼저
+(cd torchnative/rust/torch_c && cargo build --release)
 
-$PY tools/golden/compare.py            > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
-$PY tools/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"  # 0
+$PY tests/golden/compare.py            > /tmp/g.log 2>&1; echo "EXIT=$?"   # 0
+$PY tests/golden/compare.py --self-test > /tmp/s.log 2>&1; echo "EXIT=$?"  # 0
 for m in value value-last shape shape-last dtype dtype-last \
          permute permute-all constant chunk-count chunk-pad; do
-    $PY tools/golden/compare.py --inject-fault $m > /tmp/fi-$m.log 2>&1
+    $PY tests/golden/compare.py --inject-fault $m > /tmp/fi-$m.log 2>&1
     echo "$m EXIT=$?"                                                      # 전부 1
 done
 ```

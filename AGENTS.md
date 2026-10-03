@@ -20,9 +20,9 @@ files — lives **inside this repository's root directory.**
 | What | Where |
 |---|---|
 | Worktrees | `.worktrees/<name>` (git-ignored) |
-| Temporary files | `.tmp/` (git-ignored); delete when done |
-| Benchmarks | `benchmarks/` |
-| Developer tooling | `tools/` |
+| Temporary files | `.scratch/` (git-ignored); delete when done |
+| Benchmarks | `tests/bench/` |
+| Developer tooling | `scripts/` (CI-only scripts: `.github/scripts/`) |
 
 Before writing a file, check that its absolute path starts with this repository's root. If it does
 not, stop. The only exceptions are a path the user names explicitly, and caches that build tools
@@ -30,6 +30,28 @@ manage themselves. **Re-pointing a shared cache or a home-directory symlink reac
 ask first.**
 
 Writing to *another* repository is not an exception either. Do it only when told to work there.
+
+### Do not add top-level folders
+
+**Never add a new directory (or a new file) at the repository root on your own.** The root layout is
+the maintainer's. Work belongs inside an existing directory — the pypackpack package unit `torchnative/`
+(Rust crates under `torchnative/rust/`, the Python package under `torchnative/python/`), the gate and its harnesses under `tests/`, measurements under `tests/bench/`,
+developer scripts under `scripts/`, CI-only scripts under `.github/scripts/`, temporary files under
+the git-ignored `.scratch/`. If you think a new top-level entry is needed, propose it (what, why,
+which alternatives inside existing directories you ruled out) and wait for approval. This mirrors
+python-multiplatform #116; here it came with the layout change of issue #43.
+
+The approved root entries:
+
+| Kind | Entries |
+|---|---|
+| Tracked | `pyproject.toml`, `setup.py`, `README.md`, `PROJECT.md`, `AGENTS.md`, `LICENSE`, `.gitignore`, `.github/`, `torchnative/`, `tests/`, `docs/`, `scripts/`, `vendor/` |
+| Git-ignored | `.caches/`, `.scratch/` (torchnative's temporary-file directory, in the role python-multiplatform gives its .tmp directory), `.worktrees/` |
+
+`tests/test_layout.py`
+runs in the gate and compares `git ls-files`'s top-level names, plus whichever of the git-ignored
+three are present, against this table, so an unapproved entry turns the gate red. Change the table
+and the test's list together, and only with approval.
 
 ## 3. Worktrees link large artefacts instead of copying them
 
@@ -39,7 +61,7 @@ build caches, model weights, `node_modules`) into every worktree is how 86 workt
 
 - Create worktrees under `.worktrees/<name>`.
 - **Symlink** large untracked directories from the main checkout instead of copying or rebuilding
-  them. If `tools/worktree-add.sh` exists, use it — it does the linking.
+  them. If `scripts/worktree-add.sh` exists, use it — it does the linking.
 - Delete a worktree once its branch is merged: `git worktree remove .worktrees/<name>`.
 - Periodically delete `build/` directories inside worktrees; they only grow.
 
@@ -63,7 +85,7 @@ the old one.
 
 `main` carries a reduced layout: of the Markdown files, only `README.md` stays at the repository
 root, and `docs/` keeps only its subdirectories (no Markdown files directly under `docs/`).
-CI runs `tools/release/sync-release.sh` (`.github/workflows/release-sync.yml`) to produce that layout; do not hand-edit `release` or `main`.
+CI runs `.github/scripts/release/sync-release.sh` (`.github/workflows/release-sync.yml`) to produce that layout; do not hand-edit `release` or `main`.
 
 ### Issues and pull requests
 
@@ -159,8 +181,8 @@ citation of it in `docs/`, code comments, tests and workflows has been rewritten
 table in [Appendix A](#appendix-a--claudemd-section-map) remains as a historical map of the old
 numbers.
 
-`tools/agent_rules.txt` is the hard-rules preamble pasted into every agent prompt. It is a
-condensed copy of §12, §15, §17.5 and §22; when you change one, change the other.
+§22 holds the hard rules that used to be pasted into every agent prompt from `tools/agent_rules.txt`.
+That file was folded into §22 and deleted (issue #43); point agents at this file instead.
 
 ## 11. What this project is
 
@@ -170,15 +192,37 @@ imported, the real `from_pretrained` and `generate` run, and only the computatio
 is ours.
 
 ```
-rust/torch_c/          the `torch._C` extension (Rust, pyo3 abi3-py313, candle-core)
+torchnative/rust/torch_c/        the `torch._C` extension (Rust, pyo3 abi3-py313, candle-core)
   src/aten.rs          operator kernels; every op enters through one door, `_aten_dispatch`
   src/bootstrap.py     Python bootstrap baked into the extension with `include_str!`
-torchnative/           the Python package (quant, export, adapt, delta, device, ...)
-  src/main/torch/      upstream's VENDORED tree: generated, git-ignored, never edit it
-tools/golden/          value-comparison harness against upstream
-tools/wheel/           cross builds and wheel verification
+torchnative/rust/vulkan_probe/   standalone Vulkan probe crate
+torchnative/rust/wasm_probe/     standalone wasm probe crate
+torchnative/python/torchnative/    the Python package (quant, export, adapt, delta, device, ...)
+torchnative/python/torch/          upstream's VENDORED tree: generated, git-ignored, never edit it
+tests/                 the gate (run.sh) and its suites, test_*.py
+tests/golden/          value-comparison harness against upstream
+tests/docwatch/        the documentation checker (DOCWATCH)
+tests/bench/               measurement harnesses
+scripts/vendor/        vendor_torch.sh, install_shim.sh, vendor_candle.sh, gen_surface.py, probe.py
+scripts/wheel/         cross builds and wheel verification
+scripts/devices/       on-device harnesses (Android parity, Intel NPU, ...)
+scripts/scan/, scripts/colab/   upstream-source scanner; Colab notebook
+vendor/                the candle-core / candle-metal-kernels forks and their patches
+.github/scripts/       CI-only scripts; .github/scripts/release/ is release-sync
 docs/<folder>/         round-by-round records of what was measured (index: docs/README.md)
 ```
+
+**No root `Cargo.toml` workspace.** The crates stay independent, each with its own `Cargo.lock`,
+`.cargo/config.toml` and `target/`. A workspace would move every member's build output to one root
+`target/` (an unapproved root entry, §2) and break the per-crate `torchnative/rust/torch_c/target` that
+`scripts/vendor/install_shim.sh`, `tests/run.sh`, `scripts/wheel/build.py` and the cross builds read;
+it would replace the per-crate lock files with one, so `vulkan_probe` and `wasm_probe` would resolve
+against `torch_c`'s graph; and `[patch.crates-io]` (the `vendor/candle-*` forks) and `[profile.*]` are
+honoured only at a workspace root, so `torch_c`'s patch entries and `vulkan_probe`'s release profile
+would be ignored. Measured on 2026-10-03 with a trial root `[workspace]` and `cargo metadata`:
+`target_directory` moved from `torchnative/rust/torch_c/target` to `<root>/target`, and cargo warned
+"patch for the non root package will be ignored" and "profiles for the non root package will be
+ignored".
 
 - **One door.** Every operator goes through `_aten_dispatch`. Do not build a bypass.
 - **`Repr` enum** (`tensor.rs`): `Dense | Quantized | Vulkan | Complex | Meta`. `tensor()` refuses
@@ -204,7 +248,7 @@ docs/<folder>/         round-by-round records of what was measured (index: docs/
 
 ```sh
 PATH="$HOME/.cargo/bin:$PATH" PYTHON="$PWD/.caches/spike-venv/bin/python" \
-    bash rust/torch_c/pytests/run.sh > .scratch/gate.log 2>&1; echo "EXIT=$?"
+    bash tests/run.sh > .scratch/gate.log 2>&1; echo "EXIT=$?"
 ```
 
 In a worktree, `.caches/` does not exist; point `PYTHON` at the main checkout's
@@ -217,7 +261,7 @@ TORCHNATIVE_VULKAN_DYLD="$HOME/Library/Android/sdk/emulator/lib64/vulkan" \
 VK_DRIVER_FILES="$HOME/Library/Android/sdk/emulator/lib64/vulkan/libkosmickrisp_icd.json"
 ```
 
-**What the gate runs:** crate unit tests → every Python suite in `rust/torch_c/pytests/` (43 files
+**What the gate runs:** crate unit tests → every Python suite in `tests/` (43 files
 at the time `CLAUDE.md` recorded the baseline) → golden self-test → the documentation checker
 (DOCWATCH, over `docs/**/*.md` and `README.md`).
 
@@ -227,7 +271,7 @@ baseline was measured (§13.2).
 
 - **Never read the exit code through a pipe** (rule 8). In a background run, a script ending in
   `echo` exits 0; read the `EXIT=` line from the log.
-- **Adding an op to `_aten_implemented()` requires a case builder in `tools/golden/cases.py`.**
+- **Adding an op to `_aten_implemented()` requires a case builder in `tests/golden/cases.py`.**
   Without one, the `golden_cases_failed eq 0` marker turns the gate red. That marker exists because
   a failing golden case rode **three commits** with the gate green — `ge` floors on *passed* and
   *total* cannot see `passed < total`.
@@ -255,7 +299,7 @@ a quotation, count the original.**
 
 Same commit, different `SKIP` counts: 24 in a worktree, 25 in the main checkout. The difference is
 `test_toolguard_wheel_staging`: the main checkout holds a real cross-build artefact under
-`rust/torch_c/target/x86_64-unknown-linux-gnu/release`, so that test correctly declines to
+`torchnative/rust/torch_c/target/x86_64-unknown-linux-gnu/release`, so that test correctly declines to
 overwrite it; a fresh worktree has no such directory, so the test runs.
 
 - When you hand an agent a baseline, say **where** it was measured.
@@ -286,7 +330,7 @@ so it is global, not per-process. Evidence: `docs/graph/NPU2.md` §9.8.
 
 ### 14.1 Build the vendored tree before gating a worktree
 
-A worktree created by `git worktree add` has **no** `torchnative/src/main/torch/`. Gated in that
+A worktree created by `git worktree add` has **no** `torchnative/python/torch/`. Gated in that
 state, more than 100 tests fail, all with `torch._C has no _aten_implemented` — **the gate becomes
 meaningless.** On 2026-09-13 two rounds (ANE decode, Vulkan) judged their work on such a tree: one
 reported "0 new failures" while 119 were already failing and burying any new one; the other
@@ -295,8 +339,8 @@ explained the failures away as "build order". Both were wrong.
 **Before distributing work**, the coordinating session runs, in every worktree:
 
 ```sh
-PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/vendor_torch.sh
-PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash vendor/install_shim.sh
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash scripts/vendor/vendor_torch.sh
+PYTHON=/Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python bash scripts/vendor/install_shim.sh
 ```
 
 Do not delegate this to an agent: the permission classifier sometimes blocks it, and then an agent
@@ -349,9 +393,9 @@ forbidden:**
 - **Renamed instead of deleted.** The same day `caches.recreated` was left outside the repository
   "to delete once the daemon is idle". Delete what must be deleted; if you cannot, say so.
 - **`/tmp` and any scratch directory the harness offers.** Both are outside. This rule overrides a
-  harness instruction to use them. Temporary files go in `.tmp/`; the coordinating session's
-  ephemeral gate logs and scripts go in `.scratch/`. Both are git-ignored. An agent-rules file kept
-  in `/tmp` was lost to a session restart **twice**.
+  harness instruction to use them. Temporary files — agents' scratch and backups, gate logs, the
+  coordinating session's ephemeral scripts — go in `.scratch/` (git-ignored). An agent-rules file
+  kept in `/tmp` was lost to a session restart **twice**.
 - **The top level of `/Volumes/macMini/`.** Everything there that is not a repository is outside.
 
 If something outside the repository **must** change (for example, a `~/.gradle` link that points
@@ -363,8 +407,8 @@ what was already there.
 
 ### 15.2 Generated and shared trees
 
-- **`torchnative/src/main/torch/`** is upstream's vendored tree: git-ignored, generated by
-  `vendor/vendor_torch.sh`, and **silently wiped.** Never edit it by hand. If its `__init__.py` is
+- **`torchnative/python/torch/`** is upstream's vendored tree: git-ignored, generated by
+  `scripts/vendor/vendor_torch.sh`, and **silently wiped.** Never edit it by hand. If its `__init__.py` is
   missing, the tree has not been built (§14.1 for the command). One round lost hours to this: with
   the tree empty, every probe silently **imports upstream torch** and reports that "export already
   works perfectly". **Assert in every probe:**
@@ -373,7 +417,7 @@ what was already there.
   assert hasattr(torch._C, "_aten_implemented")   # the shim, not upstream
   ```
 
-- **`rust/torch_c/src/bootstrap.py`** is baked into the extension at build time with
+- **`torchnative/rust/torch_c/src/bootstrap.py`** is baked into the extension at build time with
   `include_str!`. **Edit it without rebuilding and you test the old binary.**
 - **`.caches/spike-venv`** is pinned (`transformers` 5.15.1; do not install `ml_dtypes`). Never
   install into it; read it and run its Python. If you need another package, make a separate venv
@@ -470,7 +514,7 @@ stopped. The list answered "does a kernel exist"; the question was "does this mo
 
 **Nullify everything.** Break the implementation on purpose and confirm the test goes red. **A
 nullification that is not caught is a more valuable finding than a feature** — always report it.
-Build mutants through `vendor/install_shim.sh` so they reach the vendored tree and not only the
+Build mutants through `scripts/vendor/install_shim.sh` so they reach the vendored tree and not only the
 stage; a subprocess probe reading the unmutated `.so` produces the inverse misdiagnosis.
 
 **Do not use a model run as the only check.** A model exercises a fraction of the kernels — one
@@ -516,8 +560,9 @@ wrong in opposite directions, one contradicting its own paragraph, one true but 
   `git worktree add -b feat/<name> .worktrees/tn-<name> develop`. Then §14.1. The repository itself
   sits on the external volume (`/Volumes/macMini/thisisthepy/torchnative`), so this still avoids the
   internal SSD, and nothing is scattered outside the repository (§15.1).
-- **Agent rules live in `tools/agent_rules.txt`**, a repository-relative path, so every worktree has
-  them automatically. Never keep them in `/tmp` or elsewhere outside the repository.
+- **Agent rules live in this file** (§22 and the sections it names), a repository-relative path, so
+  every worktree has them automatically. Never keep them in `/tmp` or elsewhere outside the
+  repository.
 - `build/` and `target/` only grow; delete them periodically.
 - **Concurrency limits** (8 cores · 16 GB): 3–4 agents that build or test, plus 3–4 that only read
   or analyse.
@@ -575,16 +620,25 @@ path. **Check which kind it is before adding a `Repr` arm.**
 
 ## 22. Rules for agent rounds
 
-These are the operational rules from `tools/agent_rules.txt` that are not already stated above.
+`tools/agent_rules.txt` used to be pasted into every agent prompt as a condensed copy of §12, §15,
+§16, §17.5 and §21 plus the rules below. It was folded into this section and deleted (issue #43), so
+there is one copy. **Point every agent prompt at this file** — "read AGENTS.md first and follow it;
+§2, §12, §15, §16, §17.5, §21 and §22 are hard rules, and violating any invalidates the round" — and
+repeat rule 2 and the absolute paths it may write to (rule 10). What follows is what that file
+said that is not already stated above.
+
+- **Backups:** before editing a file you may need to restore, `cp` it into `.scratch/` of the main
+  checkout, not into the worktree (where it shows up in `git status`) and never outside the
+  repository. Restoring is `cp` back, not `git checkout -- <path>` (§12).
 
 - **Never suppress stderr on a command whose success you rely on.** `2>/dev/null` once hid a
   failing `rm`, and the coordinating session read the failure as success.
-- **Liveness checks:** `pgrep -f "pytests/run.sh"` matches your own polling loop; use
-  `kill -0 <captured pid>`. A wait loop must match **both** `pytests/run.sh` and
+- **Liveness checks:** `pgrep -f "tests/run.sh"` matches your own polling loop; use
+  `kill -0 <captured pid>`. A wait loop must match **both** `tests/run.sh` and
   `docwatch/check_docs.py` — `run.sh` `exec`s into the checker at the end, so matching `run.sh`
   alone reports "clear" while the gate is still running (DOCWATCH alone has taken 14+ minutes).
 - **No scratch files in the worktree root.** Files named `test_*.py` are collected as gate suites.
-  Keep backups and scratch in `.tmp/`.
+  Keep backups and scratch in `.scratch/`.
 - **Stay in your territory.** Other agents work in other worktrees.
 - **TDD, with proof.** Write the failing test before the implementation. A round reporting "tests
   added: 0" has not met the bar unless it is a measurement-only round that says so.
@@ -633,7 +687,7 @@ of a `CLAUDE.md` section number (in a commit message, an archived log) can still
 | (python-multiplatform) worktree 를 만들면 벤더 트리부터 세운다 | §14.1 |
 | (python-multiplatform) 에이전트 완료 알림은 … 조용하다는 뜻이 아니다 | §14.2 |
 | (python-multiplatform) 게이트를 두 worktree 에서 동시에 돌리면 … | §14.3 |
-| `tools/agent_rules.txt` | §12, §15, §16, §17.5, §21, §22 |
+| `tools/agent_rules.txt` (folded into §22 and deleted, #43) | §12, §15, §16, §17.5, §21, §22 |
 
 Mapping rule that was applied: `CLAUDE.md §5.N` → `AGENTS.md §17.N`; `CLAUDE.md §N` for N ≠ 5 → the
 row above. A bare "CLAUDE.md 5.5" (no `§`) was the same citation.

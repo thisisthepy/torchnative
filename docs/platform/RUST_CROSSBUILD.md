@@ -36,9 +36,9 @@ CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target
 떠 있는 것을 활성으로 오독했는데 실제로는 4 일 8 시간 묵은 좀비였습니다. `ps -o etime` 을 함께
 보아야 합니다.
 
-## 0.5 실제로 통과한 빌드 (`rust/torch_c`)
+## 0.5 실제로 통과한 빌드 (`torchnative/rust/torch_c`)
 
-**세 타깃 모두 빌드됩니다.** 최소 PyO3 크레이트(`rust/torch_c`, PyO3 0.29.2)로 확인했습니다.
+**세 타깃 모두 빌드됩니다.** 최소 PyO3 크레이트(`torchnative/rust/torch_c`, PyO3 0.29.2)로 확인했습니다.
 
 | 타깃 | 산출물 | 검증 |
 |---|---|---|

@@ -45,15 +45,15 @@ Measured with a `TorchDispatchMode` logger: `x.reshape_as(y)` on 2.13.0 fires
 exactly one record, `aten.view.default`, with `y`'s shape as the argument.
 `reshape_as` is a C++-level method (`THPVariable_reshape_as`) that computes a shape
 and calls `reshape`/`view` itself -- there is no `aten::reshape_as` schema for
-`tools/golden/loader.py`'s `resolve_torch_overload` to find, and it refuses by
+`tests/golden/loader.py`'s `resolve_torch_overload` to find, and it refuses by
 design when one is missing rather than guessing.
 
 The correct home for this is `bootstrap.py`'s Python-level surface -- the same
 place `chunk`, `flatten`, and `T` already live for the identical reason
 (`methods.json`'s README: "a `methods.json` entry would name a key no dispatcher
 ever sees"). `bootstrap.py` is outside this worktree's territory
-(`rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
-`tools/golden/cases.py`, `pytests/test_indexsel.py`), so it was not touched.
+(`torchnative/rust/torch_c/src/aten.rs`, `methods.json`, `overloads.json`,
+`tests/golden/cases.py`, `tests/test_indexsel.py`), so it was not touched.
 
 What *is* in territory, and what this round did instead: `methods.json` carries an
 entry for `reshape_as` whose "schema" is this shim's own invention --
@@ -65,7 +65,7 @@ is advertised through `_aten_dispatch`, but it is **not** in `_aten_implemented(
 -- it is in `IMPLEMENTED_AWAITING_GOLDEN`, with a comment explaining why
 `compare.py`'s per-op golden loop structurally cannot reach it (no
 `torch.ops.aten.reshape_as` to resolve `torch_call` against). It is proven against
-upstream instead in `pytests/test_indexsel.py`, through the full vendored `torch`
+upstream instead in `tests/test_indexsel.py`, through the full vendored `torch`
 package, each side in its own process (§4).
 
 **This is the two-part answer §3.5.2 of this repository's own retrospective warns
@@ -140,14 +140,14 @@ non-promoting copy of `mul`.
 
 ## 4. What the suite shows
 
-* `rust/torch_c/pytests/run.sh` (every `test_*.py`, including the new
+* `tests/run.sh` (every `test_*.py`, including the new
   `test_indexsel.py`): full pass after one fix -- `test_core_ops_and_op_tags_agree`'s
   pinned `tag_core_count` moved from 110 to 112 (two of the eleven new keys,
   `index_select.default` and `logical_and.default`, are `core` upstream; the other
   nine are not, read off each op's own `.tags` rather than inferred -- see the
   updated comment block in `test_shim.py` for the per-op table). This is the one
   permitted edit to that file, with the arithmetic that keeps it a check.
-* `tools/golden/compare.py`: all ten real-kernel keys (`index_select.default`,
+* `tests/golden/compare.py`: all ten real-kernel keys (`index_select.default`,
   `argsort.default`, `argsort.stable`, `where.Scalar`, `new_full.default`,
   `unflatten.int`, `chunk.default`, `diff.default`, `multiply.Tensor`,
   `multiply.Scalar`, `logical_and.default` -- eleven keys, ten distinct ops since
@@ -164,7 +164,7 @@ non-promoting copy of `mul`.
   `_chunk_list_check` instead of writing a second dtype-blind comparator.
   `reshape_as.default` is deliberately excluded from the per-op loop (§2) and
   proven in `test_indexsel.py` instead, subprocess-isolated against upstream.
-* `pytests/arch_sweep.py --one <model_type>`, run individually (never as a full
+* `tests/arch_sweep.py --one <model_type>`, run individually (never as a full
   sweep -- its own module docstring forbids wiring it into `run.sh`) against the
   shim build from this round, for every architecture ARCH100 named across all
   eleven ops, **including `longt5`/`convbert`** rather than skipping them as

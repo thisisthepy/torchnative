@@ -14,7 +14,7 @@ The project has verified roughly twelve architectures deeply (docs/DEMAND*.md). 
 ships hundreds. The question that decides whether a non-alpha release is weeks away or a different
 project entirely — **how many distinct operators does this shim still lack across the whole
 field** — had never been measured. This document is that measurement, and
-`rust/torch_c/pytests/arch_sweep.py` is the script that takes it, so it can be taken again in a
+`tests/arch_sweep.py` is the script that takes it, so it can be taken again in a
 month rather than re-derived.
 
 ---
@@ -283,14 +283,14 @@ classification here becomes a wrong roadmap.
 
 ```text
 PY=/Volumes/macMini/caches/spike-venv/bin/python
-cd rust/torch_c/pytests
+cd tests
 
-PYTHONPATH=$REPO/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
+PYTHONPATH=$REPO/torchnative/python TORCH_USE_RTLD_GLOBAL=1 $PY arch_sweep.py --out /tmp/shim.json
 env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL          $PY arch_sweep.py --out /tmp/upstream.json
 $PY arch_sweep.py --compare /tmp/shim.json /tmp/upstream.json
 ```
 
-It is **not** wired into `rust/torch_c/pytests/run.sh` and must not be: it constructs 528 models,
+It is **not** wired into `tests/run.sh` and must not be: it constructs 528 models,
 takes minutes per side, needs the network for `--verify-random-weights`, and its result is a
 measurement rather than an invariant. A measurement that becomes a gate becomes a number people
 edit.
@@ -306,9 +306,9 @@ being guessed at.
 ## 8. Gates
 
 ```text
-rust/torch_c/pytests/run.sh    457 ok, exit 0     (456 -> 457: +1 = the classifier test)
+tests/run.sh    457 ok, exit 0     (456 -> 457: +1 = the classifier test)
 DOCWATCH                       PASS -- 442/442 evaluated marker(s) hold
-tools/golden/compare.py        8921/8921 cases passed, 0 failed,
+tests/golden/compare.py        8921/8921 cases passed, 0 failed,
                                ops covered=222, pending case builders=0
 ```
 
@@ -317,13 +317,13 @@ Golden is **exactly unmoved**, which is the correct result: this round changed n
 data for the rounds that follow, and deliberately not closed here.
 
 One trap worth recording for the next person, since it produced a false number for ten minutes:
-running `compare.py` without `TORCH_C_ARTEFACT` set makes `tools/golden/loader.py` fall back to
+running `compare.py` without `TORCH_C_ARTEFACT` set makes `tests/golden/loader.py` fall back to
 the **shared** `/Volumes/macMini/caches/cargo-target/release/lib_C.dylib`, and it reported
 `8509/8509, ops=203` — a plausible-looking green summary measured against another checkout's
 binary. It warns on stderr when it does this. Set the variable.
 
 <!-- DOCWATCH: op-implemented aten.adaptive_avg_pool2d.default -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py classify present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/arch_sweep.py verify_random_weights present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py classify present -->
+<!-- DOCWATCH: symbol-in-file tests/arch_sweep.py verify_random_weights present -->
 <!-- DOCWATCH: count smoke_ok ge 457 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8921 -->

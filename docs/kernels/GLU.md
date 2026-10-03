@@ -1,9 +1,9 @@
 # GLU — the ASR encoders' shared wall, and the six ops behind it
 
-Worktree `work/glu` on develop `eb84708`. Territory: `rust/torch_c/src/aten.rs`,
-`methods.json`, `overloads.json`, `tools/golden/cases.py`,
-`rust/torch_c/pytests/test_glu.py`. `bootstrap.py`, `capture.rs`, `tape.rs`,
-`tensor.rs`, `device.rs`, `tools/wheel/`, `torchnative/` were not touched, per
+Worktree `work/glu` on develop `eb84708`. Territory: `torchnative/rust/torch_c/src/aten.rs`,
+`methods.json`, `overloads.json`, `tests/golden/cases.py`,
+`tests/test_glu.py`. `bootstrap.py`, `capture.rs`, `tape.rs`,
+`tensor.rs`, `device.rs`, `scripts/wheel/`, `torchnative/` were not touched, per
 this round's territory split.
 
 docs/architectures/ARCH100.md's sweep named seven blocked architectures at one operator,
@@ -17,9 +17,9 @@ operators this round covers are about to be in demand from two directions.
 `aten::glu(Tensor self, int dim=-1) -> Tensor`: split `self` in half along
 `dim`, return `a * sigmoid(b)`. Implemented in `aten.rs` (`glu_default`,
 next to `silu_default`), added to `IMPLEMENTED`, wired into the dispatch
-match, golden-compared in `tools/golden/cases.py` (`glu_cases`, registered
+match, golden-compared in `tests/golden/cases.py` (`glu_cases`, registered
 in `CASE_BUILDERS`), and pinned with regression tests in the new
-`rust/torch_c/pytests/test_glu.py`.
+`tests/test_glu.py`.
 
 Measured against upstream 2.13.0 (`torch.ops.aten.glu.default`, `F.glu`),
 not assumed:
@@ -61,7 +61,7 @@ same shape as `pad`/`upsample_bilinear2d`/`leaky_relu` already there.
 editing `aten.rs`-adjacent files concurrently, and `bootstrap.py` is the file
 most likely to collide). The kernel this file lands, `aten.glu.default`, is
 proven directly against upstream through `_C._aten_dispatch("aten.glu.default",
-...)` in `test_glu.py` and through `tools/golden/compare.py`, exactly as the
+...)` in `test_glu.py` and through `tests/golden/compare.py`, exactly as the
 gates ask — but a checkpoint calling `F.glu` will not reach it until someone
 adds to `_install_nn`:
 
@@ -79,7 +79,7 @@ already proven here. **So "seven ASR encoders clear glu" is not yet true
 end-to-end**; what is true is that the kernel they all need now exists,
 golden-compared, and the remaining step is binding surface, not numerics —
 the same `missing_shim_name` vs. kernel distinction ARCH100.md §2 draws.
-Whoever owns `bootstrap.py` next should re-run `pytests/arch_sweep.py`
+Whoever owns `bootstrap.py` next should re-run `tests/arch_sweep.py`
 after adding the three lines above; that is the check this round could not
 finish itself.
 
@@ -136,7 +136,7 @@ guessing:
 ## 3. Verification run
 
 `cargo build --release` (`CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-glu`),
-then `PYTHON=$PY sh rust/torch_c/pytests/run.sh` and
-`TORCH_C_ARTEFACT=.../lib_C.dylib $PY tools/golden/compare.py`. Results are
+then `PYTHON=$PY sh tests/run.sh` and
+`TORCH_C_ARTEFACT=.../lib_C.dylib $PY tests/golden/compare.py`. Results are
 in the report this document accompanies rather than duplicated here, per
 the rule that a number superseded by a later run should not be pinned twice.

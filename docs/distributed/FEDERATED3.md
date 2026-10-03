@@ -338,18 +338,18 @@ measurement of what any of this costs on a real model, and no run on a phone.
 
 | file | change |
 |---|---|
-| `torchnative/src/main/torchnative/adapt/__init__.py` | `+Adapted.add_grad_hook` / `.grad_hooks`; the step calls them after the gradients are assigned and before `optimizer.step()` |
-| `torchnative/src/main/torchnative/nn/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
-| `rust/torch_c/pytests/test_shim.py` | 8 new tests, 2 new two-process fixtures |
+| `torchnative/python/torchnative/adapt/__init__.py` | `+Adapted.add_grad_hook` / `.grad_hooks`; the step calls them after the gradients are assigned and before `optimizer.step()` |
+| `torchnative/python/torchnative/nn/federated/__init__.py` | `+FedAvgM`, `+FedProx`, `+cohort`, `+RankDropped`, `+_collective`; `Engine` gains `select=`, `on_missing=`, `secure_aggregation=`, `differential_privacy=`, unwinds a dropped round, and `Round` gains `.cohort` |
+| `tests/test_shim.py` | 8 new tests, 2 new two-process fixtures |
 
 ---
 
 ## 10. Regression
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh     397 ok   (before 389, +8)
+PYTHON=$PY sh tests/run.sh     397 ok   (before 389, +8)
                                               DOCWATCH: PASS -- 350/350
-$PY tools/golden/compare.py                   8509/8509, ops=203
+$PY tests/golden/compare.py                   8509/8509, ops=203
 ```
 
 **No aten op was added** — this round is Python above the dispatcher, and the
@@ -357,15 +357,15 @@ only Rust it touched is none. `397` is a lower bound only, the way every other
 document here treats `smoke_ok`.
 
 <!-- DOCWATCH: count smoke_ok ge 397 -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py FedAvgM present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py FedProx present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py RankDropped present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/nn/federated/__init__.py cohort present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/adapt/__init__.py add_grad_hook present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_fedavgm_over_two_processes_equals_the_server_momentum_computed_centrally present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_dropped_rank_refuses_by_name_and_leaves_the_round_uncontributed present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedAvgM present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py FedProx present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py RankDropped present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/nn/federated/__init__.py cohort present -->
+<!-- DOCWATCH: symbol-in-file torchnative/python/torchnative/adapt/__init__.py add_grad_hook present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_fedavgm_over_two_processes_equals_the_server_momentum_computed_centrally present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_dropped_rank_refuses_by_name_and_leaves_the_round_uncontributed present -->
 
 ---
 

@@ -379,7 +379,7 @@ the kernel message too — measured, not assumed.
 
 ## 4. What this round changes
 
-A single gate at the single door (`aten_dispatch`, `rust/torch_c/src/aten.rs`),
+A single gate at the single door (`aten_dispatch`, `torchnative/rust/torch_c/src/aten.rs`),
 before `aten_dispatch_inner`, keyed on a static table of 114 `(op, kernel-name)`
 pairs. On a hit it raises
 
@@ -439,7 +439,7 @@ fail if the gap silently closes as well as if it silently widens.
 
 ## 5. Is the dtype now includable in the golden suite?
 
-`tools/golden/dtypes.py` excludes `float8_e4m3fn` with this reason:
+`tests/golden/dtypes.py` excludes `float8_e4m3fn` with this reason:
 
 > `torch.tensor(..., dtype=torch.float8_e4m3fn)` and
 > `_C._tensor_from_flat(..., dtype=_C.float8_e4m3fn)` both hang indefinitely when
@@ -507,10 +507,10 @@ The tree was restored from a `cp` backup and rebuilt.
 
 ### 7.2 Gates
 
-    rust/torch_c/pytests/run.sh   EXIT=0, 379 ok, DOCWATCH: PASS -- 316/316
-    tools/golden/compare.py       EXIT=0, SUMMARY: 8465/8465 cases passed,
+    tests/run.sh   EXIT=0, 379 ok, DOCWATCH: PASS -- 316/316
+    tests/golden/compare.py       EXIT=0, SUMMARY: 8465/8465 cases passed,
                                   0 failed, ops covered=197
-    tools/golden/compare.py --self-test
+    tests/golden/compare.py --self-test
                                   SELF-TEST: PASS -- 19 comparators x 11 fault
                                   modes, 0 problem(s)
 
@@ -549,10 +549,10 @@ it, and nothing hangs:
 Two rows moved *toward* upstream: `t + t` and `matmul` now carry upstream's text
 and type rather than merely being refusals of some kind.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs FLOAT8_E4M3FN_REFUSALS present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs float8_shim_only_refusal present -->
-<!-- DOCWATCH: symbol-in-file tools/golden/dtypes.py float8_e4m3fn present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py _FLOAT8_TRANSCRIBED present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs FLOAT8_E4M3FN_REFUSALS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_shim_only_refusal present -->
+<!-- DOCWATCH: symbol-in-file tests/golden/dtypes.py float8_e4m3fn present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py _FLOAT8_TRANSCRIBED present -->
 
 ---
 
@@ -594,4 +594,4 @@ Recorded rather than half-fixed: a predicate that blocked on *any* second dtype
 would close this row and reopen `gather` and `masked_fill`, which is a worse
 trade than the one it fixes.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs float8_promotion_refusal present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs float8_promotion_refusal present -->

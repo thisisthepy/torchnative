@@ -71,7 +71,7 @@ That refusal was correct and it is the reason the fix below does not go through 
 
 **The translation is Python-level and lives in `bootstrap.py`, which was another round's file.** So
 it is written here to be applied rather than applied here. It was applied, built, and measured in
-this worktree (§3, §4) and then reverted; nothing in `rust/torch_c/src/` changed this round.
+this worktree (§3, §4) and then reverted; nothing in `torchnative/rust/torch_c/src/` changed this round.
 
 The lowering: **a stepped slice is a set of positions, and `aten.index_put_.default` already writes
 a set of positions through the receiver's own storage.** It needed no kernel change — §5 is the
@@ -175,8 +175,8 @@ crate and the vendored shim are rebuilt:
 
 ```sh
 export CARGO_TARGET_DIR=...; export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
-cd rust/torch_c && cargo build --release
-cd - && bash vendor/install_shim.sh
+cd torchnative/rust/torch_c && cargo build --release
+cd - && bash scripts/vendor/install_shim.sh
 ```
 
 Then **three golden cases flip from `expect="c_error"` to `expect="match"`** and `compare.py` says
@@ -194,7 +194,7 @@ rather than one because **a lowering that handled a 1-D stepped write and not a 
 later axis would close the first and leave the 13 exactly where they are** — which is the failure
 the two new cases exist to catch.
 
-`rust/torch_c/pytests/test_setitem.py` does not need editing. Every one of its stepped-write tests
+`tests/test_setitem.py` does not need editing. Every one of its stepped-write tests
 is written two-sided: upstream's exact values if the write happens, a refusal that names itself and
 mutates nothing if it does not. §6 says why that shape and not a pinned refusal.
 
@@ -255,7 +255,7 @@ backend limitation immediately; more, because closing it made `view_as` visible,
 ## 4. Semantics, measured rather than reasoned
 
 Each row was run on upstream in its own process, then on the patched shim, and compared element for
-element. They are the tests in `pytests/test_setitem.py`.
+element. They are the tests in `tests/test_setitem.py`.
 
 | question | upstream 2.13.0 | patched shim |
 |---|---|---|
@@ -327,7 +327,7 @@ rebinding kernel reproduces every number through the receiver and loses them thr
 
 ## 5. What did NOT change, and why that is the interesting part
 
-**No kernel.** `rust/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
+**No kernel.** `torchnative/rust/torch_c/src/aten.rs`, `methods.json` and `overloads.json` are untouched.
 `aten.index_put_.default` already answered for both architecture shapes before this round began,
 which was checked by driving it directly rather than assumed:
 
@@ -352,7 +352,7 @@ however it is reached — and the reason the lowering is possible would have qui
 
 ## 6. Why the tests are shaped the way they are
 
-`pytests/test_setitem.py` had to be written in a tree where the fix could not land, which is a
+`tests/test_setitem.py` had to be written in a tree where the fix could not land, which is a
 constraint worth naming because it produced a better test than the unconstrained version would have.
 
 A test that pinned the refusal would have to be **deleted** when the patch lands. A test that pinned

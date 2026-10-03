@@ -1,7 +1,7 @@
 # Does the CUDA extension BUILD? -- and nothing beyond that.
 #
 # **The runner has no GPU. This job makes a BUILD claim only.** It is modelled
-# on `verify-published-wheel.yml`, which exists because a hosted runner is the
+# on `test-published-wheel.yml`, which exists because a hosted runner is the
 # Linux and Windows machine this project does not have; that job is careful to
 # distinguish "the wheel installs" from "the wheel computes", and this one has
 # to be careful about a wider gap still. A green check here means the CUDA
@@ -46,9 +46,9 @@ on:
   push:
     paths:
       - ".github/workflows/build-cuda-wheel.yml"
-      - "rust/torch_c/Cargo.toml"
-      - "rust/torch_c/build.rs"
-      - "rust/torch_c/src/device.rs"
+      - "torchnative/rust/torch_c/Cargo.toml"
+      - "torchnative/rust/torch_c/build.rs"
+      - "torchnative/rust/torch_c/src/device.rs"
 
 permissions:
   contents: read
@@ -155,12 +155,12 @@ jobs:
       # `--config` flag or `RUSTFLAGS`, and the choice matters twice.
       #
       # Not `RUSTFLAGS`: it *replaces* the rustflags from `.cargo/config.toml`
-      # rather than adding to them, which is the trap `rust/torch_c/Cargo.toml`
+      # rather than adding to them, which is the trap `torchnative/rust/torch_c/Cargo.toml`
       # records against the Accelerate opt-out. Nothing in this repository's
       # `.cargo/config.toml` targets Linux today, so it would happen to work --
       # and would break silently the day something does.
       #
-      # Not `--config` on the command line: `vendor/install_shim.sh` runs its
+      # Not `--config` on the command line: `scripts/vendor/install_shim.sh` runs its
       # own `cargo build --release`, and a flag passed here would not reach it.
       # A config file reaches every cargo invocation in the job, so the shim
       # that gets vendored is the same artefact this job verified.
@@ -178,7 +178,7 @@ jobs:
       # claim the job exists to make, kept as its own step so that a failure
       # further down cannot be confused with the compiler rejecting the code.
       - name: Build the CUDA extension
-        working-directory: rust/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           cargo build --release
@@ -189,7 +189,7 @@ jobs:
       # wearing this job's name. `cargo tree -e features` is how docs/devices/VULKAN3.md
       # §1.3 checked the same thing for Metal.
       - name: The cuda feature really is in the graph
-        working-directory: rust/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           cargo tree -e features --target x86_64-unknown-linux-gnu | tee /tmp/tree.txt
@@ -200,7 +200,7 @@ jobs:
       # the artefact names CUDA libraries as load-time dependencies, so it
       # cannot be the same wheel as the CPU one.
       - name: What the artefact needs at load time
-        working-directory: rust/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eux
           readelf -d target/release/lib_C.so | tee /tmp/needed.txt
@@ -220,7 +220,7 @@ jobs:
       # what the toolkit action exported, and neither outcome is a defect. It is
       # here because it is the observation a reader of this log will want.
       - name: Does it even import here (observation, not a gate)
-        working-directory: rust/torch_c
+        working-directory: torchnative/rust/torch_c
         run: |
           set -eu
           cp target/release/lib_C.so /tmp/_C.abi3.so
@@ -236,7 +236,7 @@ jobs:
       #
       # UNTESTED on a hosted runner at the time of writing -- this project's
       # only machine cannot run GitHub Actions, and the same honesty is applied
-      # here as `verify-published-wheel.yml` applies to its iOS block.
+      # here as `test-published-wheel.yml` applies to its iOS block.
       - name: Vendor the upstream tree the wheel packages
         run: |
           set -eux
@@ -246,21 +246,21 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -c "import torch, os; print(torch.__version__)"
           SRC=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-          TORCHNATIVE_TORCH_SRC="$SRC" sh vendor/vendor_torch.sh
+          TORCHNATIVE_TORCH_SRC="$SRC" sh scripts/vendor/vendor_torch.sh
 
       - name: Install the CUDA shim into the vendored tree
         run: |
           set -eux
           # Picks up the cfg from $CARGO_HOME/config.toml, so this is the same
           # artefact the build step verified rather than a fresh CPU one.
-          PYTHON=python bash vendor/install_shim.sh
-          readelf -d torchnative/src/main/torch/_C.abi3.so | grep -E "libcuda|libcublas"
+          PYTHON=python bash scripts/vendor/install_shim.sh
+          readelf -d torchnative/python/torch/_C.abi3.so | grep -E "libcuda|libcublas"
 
       - name: Build the wheel
         run: |
           set -eux
           python -m pip install build setuptools wheel
-          python tools/wheel/build.py
+          python scripts/wheel/build.py
           ls -la dist/
 
       - name: Say what this run did and did not establish

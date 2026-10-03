@@ -358,27 +358,27 @@ this round found W10's difficulty is not where it was thought to be: the expensi
 version machinery is structurally unnecessary to a replay tape, and the half that *is* necessary is
 small enough to be worth having on its own.
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs is_mutating present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs const_objects present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs keepalive present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs derivative present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs is_mutating present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs const_objects present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/capture.rs keepalive present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tape.rs derivative present -->
 <!-- The test §5 pinned was **inverted, not deleted**, by docs/training/BACKWARD6.md, exactly as §5 and
      §6 asked. It is now `test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture`
      and asserts the refusal by name; §1.3's defect is fixed. -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
+<!-- DOCWATCH: symbol-in-file tests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
 
 ---
 
 ## 6.5 Gates
 
 ```
-PYTHON=$PY sh rust/torch_c/pytests/run.sh
+PYTHON=$PY sh tests/run.sh
     381 ok, 0 FAIL          (380 before; +1 test, 0 inverted, 0 removed, 0 weakened)
     SELF-TEST: PASS -- 19 comparators x 11 fault modes, 0 problem(s), 0 comparator(s) never exercised
     DOCWATCH: PASS -- 334/334 evaluated marker(s) hold
     EXIT=0
 
-$PY tools/golden/compare.py
+$PY tests/golden/compare.py
     SUMMARY: 8476/8476 cases passed, 0 failed, ops covered=203, pending case builders=0
     EXIT=0
 ```
@@ -390,7 +390,7 @@ $PY tools/golden/compare.py
 `docs/training/BACKWARD4.md` §7 built its control by stashing and rebuilding rather than trusting a digest
 whose recipe is not in the tree. **This round can do better than either, and it is worth saying why
 rather than quoting numbers.** The round's only edits are `docs/training/BACKWARD5.md` and one test in
-`rust/torch_c/pytests/test_shim.py`. Neither is a compile input: `bootstrap.py` is the only Python
+`tests/test_shim.py`. Neither is a compile input: `bootstrap.py` is the only Python
 `include_str!`'d into the crate and it was not touched, and `git status --short` at the end of the
 round is exactly those two paths. **Every source the artefact is built from is byte-identical to
 `develop` `61cf4f0`**, so the forward cannot have moved — that is a stronger statement than a digest

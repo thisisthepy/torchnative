@@ -30,7 +30,7 @@ VENDOR.md 는 상류 `torch._C` 의 크기(이름 989 개·서브모듈 32 개·
 
 ### 1-1. 왜 PEP 562 `__getattr__` 로는 안 되는가
 
-`vendor/probe.py` (다른 작업 셋의 것, VENDOR.md 가 씀)는 **빈 shim** 위에서 모듈 레벨
+`scripts/vendor/probe.py` (다른 작업 셋의 것, VENDOR.md 가 씀)는 **빈 shim** 위에서 모듈 레벨
 `__getattr__` 로 "없는 이름" 접근을 잡습니다. 이번 계측은 **진짜 torch** 위에서 돕니다 —
 `torch._C` 의 989 개 이름이 전부 이미 존재하므로, PEP 562 `__getattr__` 은 아예 호출되지
 않습니다(그 훅은 "없는" 속성에만 걸립니다). **이미 있는 속성에 대한 접근도 잡아야 하므로
