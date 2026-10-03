@@ -10062,21 +10062,17 @@ fn argmax_default(
     let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
     let tag = input.tag();
 
+    // Every step below is a candle op on the tensor's own device -- no
+    // readback, so `argmax` is not on `MPS_HOST_READBACK_OPS` and greedy
+    // `generate` picks its token on Metal (issue #29). The index comes from
+    // `first_extremum_index`, whose header says why it is not candle's
+    // `argmax_keepdim` on the values.
     let tensor = match dim {
         None => {
             // `dim=None` flattens, so the whole tensor is one reduced slice and
-            // the answer is a *flat* index -- which is why the correction has
-            // to happen against `flat`, not against the original shape.
+            // the answer is a *flat* index.
             let flat = input.tensor()?.flatten_all().map_err(|e| candle_err(OP, e))?;
-            let mut reduced = flat
-                .argmax_keepdim(0)
-                .and_then(|t| t.to_dtype(candle_core::DType::I64))
-                .map_err(|e| candle_err(OP, e))?;
-            if let Some((any, first)) = nan_along_dim(OP, &flat, 0, tag)? {
-                reduced = any
-                    .where_cond(&first, &reduced)
-                    .map_err(|e| candle_err(OP, e))?;
-            }
+            let reduced = first_extremum_index(OP, &flat, 0, tag, Extremum::Max)?;
             if keepdim {
                 reduced.reshape(1).map_err(|e| candle_err(OP, e))?
             } else {
@@ -10085,16 +10081,7 @@ fn argmax_default(
         }
         Some(dim) => {
             let dim = normalise_dim(OP, dim, input.tensor()?.rank())?;
-            let mut reduced = input
-                .tensor()?
-                .argmax_keepdim(dim)
-                .and_then(|t| t.to_dtype(candle_core::DType::I64))
-                .map_err(|e| candle_err(OP, e))?;
-            if let Some((any, first)) = nan_along_dim(OP, input.tensor()?, dim, tag)? {
-                reduced = any
-                    .where_cond(&first, &reduced)
-                    .map_err(|e| candle_err(OP, e))?;
-            }
+            let reduced = first_extremum_index(OP, input.tensor()?, dim, tag, Extremum::Max)?;
             if keepdim {
                 reduced
             } else {
@@ -10228,35 +10215,64 @@ fn isin_tensor_tensor(
     let tag = promote_operands(OP, &elements, &test)?;
     let invert = bool_arg(args, kwargs, 3, "invert")?.unwrap_or(false);
 
-    // Compared as f64 when either side is floating, as i64 otherwise. Equality
-    // is exact in both, since the two operands share a dtype -- there is no
-    // promotion step that could round one side onto the other.
-    let (haystack, needles) = if tag.is_floating_point() {
-        (
-            side_from_tensor(OP, elements.tensor()?, tag)?.as_f64(),
-            side_from_tensor(OP, test.tensor()?, tag)?.as_f64(),
-        )
-    } else {
-        (
-            side_from_tensor(OP, elements.tensor()?, tag)?
-                .as_i64()
-                .into_iter()
-                .map(|v| v as f64)
-                .collect(),
-            side_from_tensor(OP, test.tensor()?, tag)?
-                .as_i64()
-                .into_iter()
-                .map(|v| v as f64)
-                .collect(),
-        )
+    // **On the device, as a broadcast equality and a max-reduction** (issue
+    // #29). This used to read both operands to the host through
+    // `side_from_tensor` and compare in a Rust loop, which put the op on
+    // `MPS_HOST_READBACK_OPS` -- and `generate` calls it twice per step
+    // (`_prepare_special_tokens`, `EosTokenCriteria`), so greedy decoding
+    // could not run on mps at all.
+    //
+    // Both sides are cast to the promoted dtype first, which is what the host
+    // loop compared in (`side_from_tensor` narrowed to `tag` before widening
+    // to f64 exactly), so equality is the same equality: exact, `nan` never
+    // matches (not even itself), and `-0.0` matches `0.0` -- upstream's
+    // answers for both. `I8` is widened to `I64` because candle's Metal
+    // backend has no `I8` max-reduction; every `i8` is an `i64`.
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let cast = |t: &Tensor| -> PyResult<Tensor> {
+        let t = if t.dtype() == storage { t.clone() } else { t.to_dtype(storage).map_err(|e| candle_err(OP, e))? };
+        widen_i8(OP, &t)
     };
-
-    let bytes: Vec<u8> = haystack
-        .iter()
-        .map(|value| u8::from(needles.iter().any(|n| n == value) != invert))
-        .collect();
-    let tensor = Tensor::from_vec(bytes, elements.tensor()?.dims().to_vec(), elements.tensor()?.device())
+    let dims = elements.tensor()?.dims().to_vec();
+    let haystack = cast(elements.tensor()?)?
+        .flatten_all()
         .map_err(|e| candle_err(OP, e))?;
+    let needles = cast(test.tensor()?)?
+        .flatten_all()
+        .map_err(|e| candle_err(OP, e))?;
+    let (m, n) = (haystack.elem_count(), needles.elem_count());
+    let device = haystack.device().clone();
+
+    // `[m, n]` bytes per chunk at most `ISIN_CHUNK_BYTES`, so a long
+    // `test_elements` costs a few more launches rather than `m * n` bytes of
+    // device memory at once. `generate`'s calls are `[1..batch] x [#eos]`, one
+    // chunk.
+    const ISIN_CHUNK_BYTES: usize = 1 << 24;
+    let mut found = Tensor::zeros(m, candle_core::DType::U8, &device)
+        .map_err(|e| candle_err(OP, e))?;
+    if m > 0 && n > 0 {
+        let column = haystack.unsqueeze(1).map_err(|e| candle_err(OP, e))?;
+        let step = std::cmp::max(1, ISIN_CHUNK_BYTES / m);
+        let mut start = 0;
+        while start < n {
+            let len = std::cmp::min(step, n - start);
+            let hits = needles
+                .narrow(0, start, len)
+                .and_then(|row| row.unsqueeze(0))
+                .and_then(|row| column.broadcast_eq(&row))
+                .and_then(|hits| hits.max_keepdim(1))
+                .and_then(|hits| hits.squeeze(1))
+                .map_err(|e| candle_err(OP, e))?;
+            found = found.maximum(&hits).map_err(|e| candle_err(OP, e))?;
+            start += len;
+        }
+    }
+    if invert {
+        // `1 - found` on the 0/1 byte mask: `invert=True` is the complement.
+        let one = host_const(1u8, &[], &device).map_err(|e| candle_err(OP, e))?;
+        found = one.broadcast_sub(&found).map_err(|e| candle_err(OP, e))?;
+    }
+    let tensor = found.reshape(dims).map_err(|e| candle_err(OP, e))?;
     finish(py, tensor, TorchDType::Bool)
 }
 
@@ -11822,9 +11838,21 @@ enum Bitwise {
 /// distinction BOOL.md §3 measured and refused to collapse -- aliasing `bool`
 /// onto `uint8` would make `~mask` a bit flip instead of a negation.
 ///
-/// Computed element by element through `i64`, the same shape of implementation
-/// `pow` and `isin` use above. candle has no bitwise kernels, and the ops that
-/// reach here in a transformer are mask combinations, not hot arithmetic.
+/// **Computed with candle ops on the operands' own device** (issue #29), so
+/// it is not on `MPS_HOST_READBACK_OPS`: `generate` combines its stopping
+/// masks with `|` and `&` every step, and masking_utils' `and_mask` does on
+/// the eager attention path. It used to be a host loop over `to_vec1::<i64>`.
+///
+/// candle has no bitwise kernel on any backend, so there are two paths:
+///
+/// * `bool` with `bool` -- the only combination a transformer reaches with
+///   two masks -- is `minimum` / `maximum` / `ne` on the 0/1 bytes, one
+///   launch. That is exactly logical and / or / xor because `boolean()`
+///   guarantees every byte is 0 or 1 (BOOL.md §5-B).
+/// * everything else, `bool` mixed with an integer included (`generate`'s
+///   `unfinished_sequences & ~criteria(...)` is `int64 & bool`), goes through
+///   `bitwise_on_device`: the bits as a trailing axis, combined, and summed
+///   back. Exact for every value of every integer width; see its header.
 fn bitwise_binary(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11853,42 +11881,148 @@ fn bitwise_binary(
         )));
     }
 
-    let shape = lhs
-        .tensor()?
-        .shape()
-        .broadcast_shape_binary_op(rhs.tensor()?.shape(), "bitwise")
-        .map_err(|e| candle_err(op, e))?;
-    let dims = shape.dims().to_vec();
-    let broadcast = |t: &Tensor| -> PyResult<Vec<i64>> {
-        t.broadcast_as(shape.clone())
-            .and_then(|t| t.contiguous())
-            .and_then(|t| t.flatten_all())
-            .and_then(|t| t.to_dtype(candle_core::DType::I64))
-            .and_then(|t| t.to_vec1::<i64>())
-            .map_err(|e| candle_err(op, e))
-    };
-    let (a, b) = (broadcast(lhs.tensor()?)?, broadcast(rhs.tensor()?)?);
-    let values: Vec<i64> = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| match kind {
-            Bitwise::And => x & y,
-            Bitwise::Or => x | y,
-            Bitwise::Xor => x ^ y,
-        })
-        .collect();
-
+    let (a, b) = (lhs.tensor()?, rhs.tensor()?);
     if tag == TorchDType::Bool {
-        let bytes: Vec<u8> = values.into_iter().map(|v| u8::from(v != 0)).collect();
-        let out = Tensor::from_vec(bytes, dims, lhs.tensor()?.device())
-            .map_err(|e| candle_err(op, e))?;
+        // Both operands are `bool` (nothing else promotes to it), so both are
+        // 0/1 bytes and the logical op is one elementwise launch.
+        let out = match kind {
+            Bitwise::And => a.broadcast_minimum(b),
+            Bitwise::Or => a.broadcast_maximum(b),
+            Bitwise::Xor => a.broadcast_ne(b),
+        }
+        .map_err(|e| candle_err(op, e))?;
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(op)?;
-    let out = Tensor::from_vec(values, dims, lhs.tensor()?.device())
-        .and_then(|t| t.fast_to(storage))
-        .map_err(|e| candle_err(op, e))?;
+    let out = bitwise_on_device(op, a, b, kind, storage)?;
     finish(py, out, tag)
+}
+
+/// `a OP b` for integer tensors, bit for bit, in candle ops that every
+/// backend has -- the one bitwise implementation this crate has, and it never
+/// leaves the operands' device.
+///
+/// **The method.** Both operands are widened to `i64` (exact for every
+/// integer storage) and broadcast. A two's-complement `i64` is a sign bit and
+/// 63 value bits, and the value bits of a negative `x` are the complement of
+/// those of `!x = -1 - x`, which is non-negative and computed without overflow
+/// for every `x`. So with `u = x < 0 ? -1 - x : x`:
+///
+/// * `q = u / [2^0, 2^1, .., 2^62]` along a new trailing axis -- truncating
+///   division of non-negative values is the floor, so `q - 2 * (q / 2)` is
+///   bit `k` of `u`;
+/// * bit `k` of `x` is that bit, flipped where `x < 0`; the sign bit is
+///   `x < 0`.
+///
+/// The planes combine with `minimum` (and), `maximum` (or) and `ne` (xor) on
+/// 0/1 values, and the result is `sum_k r_k * 2^k` plus `i64::MIN` where the
+/// sign bit is set. The sum is at most `2^63 - 1` and adding `i64::MIN` to a
+/// non-negative value cannot overflow, so **no step wraps** and the answer is
+/// the same on every backend. The result is then narrowed to the promoted
+/// storage; `a OP b` of two in-range values is in range, so the cast is exact.
+///
+/// **Cost.** About twenty launches per chunk regardless of width, and 63
+/// `i64` lanes per element, which is why the flattened operands are walked in
+/// chunks of `BITWISE_CHUNK` elements (~16 MiB per intermediate). The
+/// transformer callers are a handful of elements. The planes' powers of two
+/// are one 504-byte host-to-device upload per call -- a constant this crate
+/// built, not a readback of anything dispatched.
+fn bitwise_on_device(
+    op: &str,
+    a: &Tensor,
+    b: &Tensor,
+    kind: Bitwise,
+    storage: candle_core::DType,
+) -> PyResult<Tensor> {
+    use candle_core::DType::I64;
+    const BITWISE_CHUNK: usize = 1 << 15;
+    let err = |e| candle_err(op, e);
+    let shape = a
+        .shape()
+        .broadcast_shape_binary_op(b.shape(), "bitwise")
+        .map_err(err)?;
+    let device = a.device().clone();
+    let flat = |t: &Tensor| -> PyResult<Tensor> {
+        t.to_dtype(I64)
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.flatten_all())
+            .map_err(err)
+    };
+    let (fa, fb) = (flat(a)?, flat(b)?);
+    let total = fa.elem_count();
+    if total == 0 {
+        return Tensor::zeros(shape, storage, &device).map_err(err);
+    }
+
+    let powers: Vec<i64> = (0..63).map(|k| 1i64 << k).collect();
+    let powers = Tensor::from_vec(powers, 63, &Device::Cpu)
+        .and_then(|t| t.to_device(&device))
+        .map_err(err)?;
+    let zero = host_const(0i64, &[], &device).map_err(err)?;
+    let one = host_const(1i64, &[], &device).map_err(err)?;
+    let two = host_const(2i64, &[], &device).map_err(err)?;
+    let minus_one = host_const(-1i64, &[], &device).map_err(err)?;
+    let min = host_const(i64::MIN, &[], &device).map_err(err)?;
+
+    // `(sign, bits)`: the sign as a 0/1 byte mask `[n]`, the 63 value bits as
+    // 0/1 `i64` `[n, 63]`.
+    let planes = |x: &Tensor| -> PyResult<(Tensor, Tensor)> {
+        let negative = x.broadcast_lt(&zero).map_err(err)?;
+        let flipped = minus_one.broadcast_sub(x).map_err(err)?;
+        let u = negative.where_cond(&flipped, x).map_err(err)?;
+        let q = u
+            .unsqueeze(1)
+            .and_then(|u| u.broadcast_div(&powers))
+            .map_err(err)?;
+        let bits = q
+            .broadcast_div(&two)
+            .and_then(|h| h.broadcast_mul(&two))
+            .and_then(|h| q.sub(&h))
+            .map_err(err)?;
+        let inverted = one.broadcast_sub(&bits).map_err(err)?;
+        let bits = negative
+            .unsqueeze(1)
+            .and_then(|m| m.broadcast_as(bits.shape()))
+            .and_then(|m| m.where_cond(&inverted, &bits))
+            .map_err(err)?;
+        Ok((negative, bits))
+    };
+    let combine = |x: &Tensor, y: &Tensor| -> candle_core::Result<Tensor> {
+        match kind {
+            Bitwise::And => x.minimum(y),
+            Bitwise::Or => x.maximum(y),
+            Bitwise::Xor => x.ne(y),
+        }
+    };
+
+    let mut pieces = Vec::with_capacity(total.div_ceil(BITWISE_CHUNK));
+    let mut start = 0;
+    while start < total {
+        let len = std::cmp::min(BITWISE_CHUNK, total - start);
+        let (sa, ba) = planes(&fa.narrow(0, start, len).map_err(err)?)?;
+        let (sb, bb) = planes(&fb.narrow(0, start, len).map_err(err)?)?;
+        // `ne` answers bytes and `minimum`/`maximum` answer `i64`; both are
+        // 0/1, and the sum below wants `i64`.
+        let bits = combine(&ba, &bb).and_then(|r| r.to_dtype(I64)).map_err(err)?;
+        let sign = combine(&sa, &sb).map_err(err)?;
+        let magnitude = bits
+            .broadcast_mul(&powers)
+            .and_then(|r| r.sum_keepdim(1))
+            .and_then(|r| r.squeeze(1))
+            .map_err(err)?;
+        let with_sign = magnitude.broadcast_add(&min).map_err(err)?;
+        pieces.push(sign.where_cond(&with_sign, &magnitude).map_err(err)?);
+        start += len;
+    }
+    let out = if pieces.len() == 1 {
+        pieces.pop().expect("one piece")
+    } else {
+        Tensor::cat(&pieces, 0).map_err(err)?
+    };
+    out.reshape(shape)
+        .and_then(|t| if storage == I64 { Ok(t) } else { t.to_dtype(storage) })
+        .map_err(err)
 }
 
 /// `aten::bitwise_and.Scalar` / `aten::bitwise_or.Scalar`.
@@ -11952,6 +12086,13 @@ fn bitwise_scalar(
 
 /// `aten::bitwise_not(Tensor self) -> Tensor`. Logical negation on `bool`,
 /// two's-complement `!x` on the integers.
+///
+/// **One subtraction on the tensor's own device** (issue #29), not a host
+/// loop: `generate` negates its stopping mask every step. In two's complement
+/// `!x == -1 - x` for every signed `x` and the subtraction never overflows
+/// (`-1 - MIN == MAX`, `-1 - MAX == MIN`); an unsigned `!x` is `MAX - x`; and
+/// `bool`'s `not` is `1 - x` on its 0/1 bytes. Each is done in the storage
+/// dtype, so there is no widening and no cast.
 fn bitwise_not_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -11966,24 +12107,18 @@ fn bitwise_not_default(
             scalar_type_name(tag)
         )));
     }
-    let dims = input.tensor()?.dims().to_vec();
-    let values: Vec<i64> = input
-        .tensor()?
-        .flatten_all()
-        .and_then(|t| t.to_dtype(candle_core::DType::I64))
-        .and_then(|t| t.to_vec1::<i64>())
-        .map_err(|e| candle_err(OP, e))?;
-
-    if tag == TorchDType::Bool {
-        let bytes: Vec<u8> = values.into_iter().map(|v| u8::from(v == 0)).collect();
-        let out = Tensor::from_vec(bytes, dims, input.tensor()?.device())
-            .map_err(|e| candle_err(OP, e))?;
-        return finish(py, out, tag);
-    }
-    let storage = PyDtype::new(tag).storage(OP)?;
-    let out = Tensor::from_vec(values.into_iter().map(|v| !v).collect::<Vec<i64>>(), dims,
-                               input.tensor()?.device())
-        .and_then(|t| t.fast_to(storage))
+    let source = input.tensor()?;
+    let storage = source.dtype();
+    // The all-ones value of the storage, as an `i64` narrowed on the host by
+    // `host_const`: `1` for `bool`, `u8::MAX`/`u32::MAX` unsigned, `-1` signed.
+    let ones: i64 = match (tag, storage) {
+        (TorchDType::Bool, _) => 1,
+        (_, candle_core::DType::U8) => i64::from(u8::MAX),
+        (_, candle_core::DType::U32) => i64::from(u32::MAX),
+        _ => -1,
+    };
+    let out = host_const(ones, &[storage], source.device())
+        .and_then(|all| all.broadcast_sub(source))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
@@ -13813,26 +13948,20 @@ fn extremum_default(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(op, e))?;
 
-    if tag.is_floating_point() {
-        let nan_count = flat
-            .ne(&flat)
-            .and_then(|m| m.to_dtype(candle_core::DType::I64))
-            .and_then(|m| m.sum_all())
-            .and_then(|s| s.to_scalar::<i64>())
-            .map_err(|e| candle_err(op, e))?;
-        if nan_count > 0 {
-            let storage = PyDtype::new(tag).storage(op)?;
-            let out = host_full(f64::NAN, &[storage], (), flat.device())
-                .map_err(|e| candle_err(op, e))?;
-            return finish(py, out, tag);
-        }
-    }
-
-    let out = match which {
-        Extremum::Max => flat.max(0),
-        Extremum::Min => flat.min(0),
-    }
-    .map_err(|e| candle_err(op, e))?;
+    // **The value is read at the index, on the device** (issue #29). The NaN
+    // rule used to be a `to_scalar` of the NaN count -- a readback that put
+    // `max.default` on `MPS_HOST_READBACK_OPS`, and `generate` calls
+    // `unfinished_sequences.max()` every step. `first_extremum_index` already
+    // answers "the first NaN if there is one, else the first extremum", so the
+    // element at that index *is* upstream's answer: `nan` when there is a NaN,
+    // the extremum otherwise -- and `-inf` for an all-`-inf` input, which
+    // candle's Metal `max` does not give (its fold starts at the finite
+    // lowest, so it answers `-3.4e38`; measured, issue #29).
+    let index = first_extremum_index(op, &flat, 0, tag, which)?;
+    let out = flat
+        .index_select(&index, 0)
+        .and_then(|v| v.reshape(()))
+        .map_err(|e| candle_err(op, e))?;
     finish(py, out, tag)
 }
 
@@ -13954,11 +14083,19 @@ fn amax_default(
 /// of two equal elements, which is the one respect in which its fold is
 /// exactly right.
 ///
-/// Returns `None` for an integral or boolean dtype (there is no NaN to find,
-/// and the mask passes would be pure cost) **and** for a float tensor that
-/// happens to contain none. The second case is not just an optimisation: it
-/// keeps a NaN-free reduction bit-for-bit on the path it already took, so the
-/// prefill hash cannot move because of a correction that never applies.
+/// Returns `None` for an integral or boolean dtype: there is no NaN to find,
+/// and the mask passes would be pure cost.
+///
+/// **A float input is corrected unconditionally** (issue #29). This used to
+/// return `None` for a float tensor holding no NaN, decided by a `to_scalar`
+/// of the NaN count -- a readback, which put every caller on
+/// `MPS_HOST_READBACK_OPS`. The correction is a `where_cond` whose mask is
+/// all zero when there is no NaN, so it hands back its `on_false` operand
+/// unchanged: the bits of a NaN-free reduction are the bits they were.
+///
+/// The flags stay `u8` (`ne`'s own answer): candle's `max` and `argmax`
+/// reductions have `u8` arms on the CPU and on Metal, and the reduced flags
+/// *are* the `where_cond` mask.
 fn nan_along_dim(
     op: &str,
     source: &Tensor,
@@ -13968,28 +14105,77 @@ fn nan_along_dim(
     if !tag.is_floating_point() {
         return Ok(None);
     }
-    // `f32` rather than the `u8` that `ne` yields: candle generates `argmax`
-    // for the float and wide-integer arms, and `u8` is not one of them.
-    let flags = source
-        .ne(source)
-        .and_then(|m| m.to_dtype(candle_core::DType::F32))
-        .map_err(|e| candle_err(op, e))?;
-    let total = flags
-        .sum_all()
-        .and_then(|s| s.to_scalar::<f32>())
-        .map_err(|e| candle_err(op, e))?;
-    if total == 0.0 {
-        return Ok(None);
-    }
-    let any = flags
-        .max_keepdim(dim)
-        .and_then(|m| m.ne(0f32))
-        .map_err(|e| candle_err(op, e))?;
+    let flags = source.ne(source).map_err(|e| candle_err(op, e))?;
+    let any = flags.max_keepdim(dim).map_err(|e| candle_err(op, e))?;
     let first = flags
         .argmax_keepdim(dim)
         .and_then(|t| t.to_dtype(candle_core::DType::I64))
         .map_err(|e| candle_err(op, e))?;
     Ok(Some((any, first)))
+}
+
+/// `I8` widened to `I64`, everything else as it is.
+///
+/// candle's Metal backend has no `I8` reduction or `I8` index kernels for the
+/// shapes the callers need, and every `i8` is an `i64`, so the widening is
+/// exact; on the CPU it is a cast that changes no answer.
+fn widen_i8(op: &str, t: &Tensor) -> PyResult<Tensor> {
+    if t.dtype() == candle_core::DType::I8 {
+        t.to_dtype(candle_core::DType::I64).map_err(|e| candle_err(op, e))
+    } else {
+        Ok(t.clone())
+    }
+}
+
+/// The index of the **first** maximum (or minimum) along `dim`, keeping the
+/// dimension, as `i64` -- with a NaN, the first NaN's -- in candle ops on the
+/// tensor's own device. The index `argmax`, `max.default` and `max.dim` (and
+/// their `min` mirrors) report.
+///
+/// **Not candle's `argmax_keepdim` on the values**, for a reason read off
+/// `candle-metal-kernels`' `reduce.metal` and then confirmed by measuring the
+/// value half: the Metal fold is seeded with `numeric_limits<T>::lowest()`,
+/// which for a float is the finite `-3.4e38`, not `-inf`, and it breaks ties
+/// by the lower index. So on Metal `max([-inf, -inf])` answers `-3.4e38`
+/// (measured through `amax`, issue #29), and an argmax over `[-inf, -3.4e38]`
+/// would tie the seed's index 0 with the real element 1 and answer 0 where
+/// upstream answers 1. Instead:
+///
+/// 1. `extreme = max_keepdim(x)` -- possibly the seed, never above the true
+///    maximum;
+/// 2. `argmax_keepdim(x == extreme)` over the 0/1 byte mask -- the first `1`,
+///    since the `u8` fold also ties by the lower index (and on the CPU it
+///    keeps the first of equal elements). If `extreme` was the seed because
+///    every element is `-inf`, the mask is all zero and the answer is 0, which
+///    is upstream's answer for an all-`-inf` slice;
+/// 3. the NaN correction from `nan_along_dim`, which replaces the index by the
+///    first NaN's wherever the slice holds one.
+///
+/// Upstream's tie rule is the documented one: the first maximal index.
+fn first_extremum_index(
+    op: &str,
+    source: &Tensor,
+    dim: usize,
+    tag: TorchDType,
+    which: Extremum,
+) -> PyResult<Tensor> {
+    let work = widen_i8(op, source)?;
+    let extreme = match which {
+        Extremum::Max => work.max_keepdim(dim),
+        Extremum::Min => work.min_keepdim(dim),
+    }
+    .map_err(|e| candle_err(op, e))?;
+    let first_hit = work
+        .broadcast_eq(&extreme)
+        .and_then(|hits| hits.argmax_keepdim(dim))
+        .and_then(|t| t.to_dtype(candle_core::DType::I64))
+        .map_err(|e| candle_err(op, e))?;
+    match nan_along_dim(op, &work, dim, tag)? {
+        Some((any, first)) => any
+            .where_cond(&first, &first_hit)
+            .map_err(|e| candle_err(op, e)),
+        None => Ok(first_hit),
+    }
 }
 
 /// A NaN of `tag`'s dtype, shaped like `like`. Built through `f64` and
@@ -14341,28 +14527,14 @@ fn extremum_dim(
     let tag = input.tag();
     let source = input.tensor()?;
 
-    // Reduced with the dimension kept whatever the caller asked for, so the
-    // NaN correction below has one shape to work in; the squeeze is at the end.
-    let (values, indices) = match which {
-        Extremum::Max => (source.max_keepdim(dim), source.argmax_keepdim(dim)),
-        Extremum::Min => (source.min_keepdim(dim), source.argmin_keepdim(dim)),
-    };
-    let mut values = values.map_err(|e| candle_err(op, e))?;
-    // int64, like `argmax` above: candle yields u32, which would be a visible
-    // dtype divergence the first time an index is used.
-    let mut indices = indices
-        .and_then(|t| t.to_dtype(candle_core::DType::I64))
-        .map_err(|e| candle_err(op, e))?;
-
-    if let Some((any, first)) = nan_along_dim(op, source, dim, tag)? {
-        let nans = nan_shaped_like(op, &values, tag)?;
-        values = any
-            .where_cond(&nans, &values)
-            .map_err(|e| candle_err(op, e))?;
-        indices = any
-            .where_cond(&first, &indices)
-            .map_err(|e| candle_err(op, e))?;
-    }
+    // Reduced with the dimension kept whatever the caller asked for; the
+    // squeeze is at the end. The index is `first_extremum_index`'s -- first
+    // NaN, else first extremum -- and the value is **gathered at it**, so the
+    // pair cannot disagree and `nan`/`-inf` come out as the elements they are
+    // rather than as candle's Metal fold seed (issue #29). `int64` indices,
+    // like `argmax` above: candle's own are `u32`.
+    let mut indices = first_extremum_index(op, source, dim, tag, which)?;
+    let mut values = gather_at(op, source, &indices, dim)?;
 
     if !keepdim {
         values = values.squeeze(dim).map_err(|e| candle_err(op, e))?;
@@ -14379,6 +14551,22 @@ fn extremum_dim(
         .bind(py)
         .call1(pair)?
         .unbind())
+}
+
+/// `source.gather(index, dim)` for any storage candle can gather on every
+/// backend. Metal has no `gather` arm for `u8` (or `i8`) data with `i64`
+/// indices, so those are gathered as `i64` and narrowed back -- exact both
+/// ways.
+fn gather_at(op: &str, source: &Tensor, index: &Tensor, dim: usize) -> PyResult<Tensor> {
+    let storage = source.dtype();
+    match storage {
+        candle_core::DType::U8 | candle_core::DType::I8 => source
+            .to_dtype(candle_core::DType::I64)
+            .and_then(|wide| wide.gather(index, dim))
+            .and_then(|v| v.to_dtype(storage))
+            .map_err(|e| candle_err(op, e)),
+        _ => source.gather(index, dim).map_err(|e| candle_err(op, e)),
+    }
 }
 
 /// The 0/1 byte mask both `any` and `all` reduce over.

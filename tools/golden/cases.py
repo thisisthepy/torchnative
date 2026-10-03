@@ -31095,3 +31095,165 @@ for _op in (
     assert _op in CASE_BUILDERS, _op
     CASE_BUILDERS[_op] = _with_float8(_op, CASE_BUILDERS[_op])
 del _op
+
+
+# --- issue #29: the generate-path kernels rewritten onto the device ------------
+#
+# `argmax`, `max`/`min` (whole-tensor and `.dim`), `isin` and the bitwise ops
+# stopped reading their operands to the host so greedy `generate` can run on
+# `mps`. The CPU runs the *same* candle-op formulas the GPU does, so these
+# cases are the CPU half of that rewrite's agreement -- each one aimed at a
+# step of the new arithmetic a plain-values case cannot reach:
+#
+# * ties: `first_extremum_index` relies on the 0/1 mask's argmax keeping the
+#   first `1`; upstream documents "the first maximal value";
+# * `-inf` and the finite lowest: candle's Metal fold is seeded with the
+#   finite lowest, which is why the index is found by equality rather than
+#   by `argmax` on the values -- `[-inf, lowest]` is the case that separates
+#   the two, and an all-`-inf` slice is the case where the mask is all zero;
+# * NaN absent: `nan_along_dim` now corrects unconditionally, so a NaN-free
+#   float input must come back exactly as before;
+# * bitwise: negative values, the signed extremes, `int64 & bool` (the
+#   `generate` call) and unsigned widths -- the bit-plane decomposition's
+#   sign handling is the part that can be wrong.
+#
+# What these cannot find: anything Metal-only (the fold seed, fast-math
+# denormal flushing). That is test_mpsgen.py, against upstream in a subprocess.
+
+_I29_LOWEST = {"float32": -3.4028234663852886e38, "float16": -65504.0,
+               "bfloat16": -3.3895313892515355e38, "float64": -1.7976931348623157e308}
+
+
+def _i29_case(op, name, run_torch, run_c, note=""):
+    # `max.dim`/`min.dim` answer `(values, indices)`; the harness's pair
+    # checker is the one their own builder uses.
+    check = _pair_result_check if op in ("aten.max.dim", "aten.min.dim") else None
+    return Case(name=f"{name} [issue #29]", op=op, run_torch=run_torch, run_c=run_c, note=note,
+                value_check=check)
+
+
+def _issue29_extra(op, torch_module, c_module, torch_call):
+    inf = float("inf")
+    out = []
+
+    def pair(flat, shape, dtype_name):
+        return pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+
+    if op in ("aten.argmax.default", "aten.max.dim", "aten.min.dim",
+              "aten.max.default", "aten.min.default"):
+        reduce_dim = op != "aten.max.default" and op != "aten.min.default"
+        for dtype_name in ("float32", "float16", "bfloat16", "float64"):
+            low = _I29_LOWEST[dtype_name]
+            rows = [
+                ([3.0, 7.0, 7.0, 1.0], "tie -- the first maximal index"),
+                ([7.0, 1.0, 7.0, 7.0], "tie at index 0 and later"),
+                ([-inf, -inf, -inf, -inf], "all -inf -- the equality mask is all zero"),
+                ([-inf, low, -inf, low], "-inf before the finite lowest"),
+                ([inf, -inf, inf, 0.0], "+inf tie"),
+                ([1e-40 if dtype_name != "float16" else 1e-7, 0.0, -0.0, 0.0], "a subnormal maximum"),
+                ([0.0, -0.0, 0.0, -0.0], "signed zeros compare equal"),
+            ]
+            if op == "aten.min.dim" or op == "aten.min.default":
+                rows = [([-v for v in flat], note.replace("-inf", "+inf")) for flat, note in rows]
+            for flat, note in rows:
+                for shape, dim in (((4,), 0), ((2, 2), 1), ((2, 2), 0)):
+                    if not reduce_dim and dim != 0:
+                        continue
+                    t, c = pair(flat, shape, dtype_name)
+                    if reduce_dim:
+                        out.append(_i29_case(op, f"{op}(dtype={dtype_name}, {shape}, dim={dim}) {note}",
+                                             lambda t=t, dim=dim: torch_call(t, dim),
+                                             lambda c=c, dim=dim: c_module._aten_dispatch(op, c, dim), note))
+                    else:
+                        out.append(_i29_case(op, f"{op}(dtype={dtype_name}, {shape}) {note}",
+                                             lambda t=t: torch_call(t),
+                                             lambda c=c: c_module._aten_dispatch(op, c), note))
+        for dtype_name in ("int64", "int32", "int8", "uint8"):
+            lo = {"int64": -2 ** 63, "int32": -2 ** 31, "int8": -128, "uint8": 0}[dtype_name]
+            for flat, note in (([lo, lo, lo], "all at the minimum"), ([2, 9, 9], "tie"),
+                               ([lo, 0, lo], "the minimum around a zero")):
+                t, c = pair(flat, (3,), dtype_name)
+                if reduce_dim:
+                    out.append(_i29_case(op, f"{op}(dtype={dtype_name}) {note}",
+                                         lambda t=t: torch_call(t, 0),
+                                         lambda c=c: c_module._aten_dispatch(op, c, 0), note))
+                else:
+                    out.append(_i29_case(op, f"{op}(dtype={dtype_name}) {note}",
+                                         lambda t=t: torch_call(t),
+                                         lambda c=c: c_module._aten_dispatch(op, c), note))
+
+    if op == "aten.isin.Tensor_Tensor":
+        nan = float("nan")
+        for dtype_name in ("float32", "float16", "bfloat16"):
+            e_t, e_c = pair([nan, 0.0, -0.0, inf, 1.5], (5,), dtype_name)
+            s_t, s_c = pair([nan, -0.0, inf], (3,), dtype_name)
+            out.append(_i29_case(op, f"isin(dtype={dtype_name}) nan never matches, -0.0 matches 0.0",
+                                 lambda e=e_t, s=s_t: torch_call(e, s),
+                                 lambda e=e_c, s=s_c: c_module._aten_dispatch(op, e, s)))
+        e_t, e_c = pair([5, 7, 9, 2, 3], (1, 5), "int64")
+        s_t, s_c = pair([2, 3], (2,), "int64")
+        out.append(_i29_case(op, "isin(int64 [1,5] in eos ids [2,3]) -- generate's EosTokenCriteria shape",
+                             lambda: torch_call(e_t, s_t), lambda: c_module._aten_dispatch(op, e_c, s_c)))
+        e_t, e_c = pair([], (0,), "int64")
+        out.append(_i29_case(op, "isin(empty elements)",
+                             lambda: torch_call(e_t, s_t), lambda: c_module._aten_dispatch(op, e_c, s_c)))
+
+    bitwise = {"aten.bitwise_and.Tensor", "aten.bitwise_or.Tensor", "aten.bitwise_xor.Tensor"}
+    if op in bitwise:
+        # Every value exactly representable in float64: the pair is built
+        # through `_tensor_from_flat`'s f64 list, which would round
+        # `2**62 + 3` on the way in and fail the case on its *input*.
+        signed = {"int64": [-2 ** 63, -1, -2, 0, 5, 2 ** 62 + 2 ** 41, -(2 ** 53) - 8],
+                  "int32": [-2 ** 31, -1, -2, 0, 5, 2 ** 31 - 1, -77],
+                  "int8": [-128, -1, -2, 0, 5, 127, -77],
+                  "uint8": [255, 1, 2, 0, 5, 128, 77]}
+        for dtype_name, values in signed.items():
+            other = list(reversed(values))
+            a_t, a_c = pair(values, (7,), dtype_name)
+            b_t, b_c = pair(other, (7,), dtype_name)
+            out.append(_i29_case(op, f"{op}({dtype_name}, signed extremes and negatives)",
+                                 lambda a=a_t, b=b_t: torch_call(a, b),
+                                 lambda a=a_c, b=b_c: c_module._aten_dispatch(op, a, b)))
+        a_t, a_c = pair([0, 1, 1, 5, -3, 2 ** 40], (6,), "int64")
+        m_t, m_c = pair([True, False, True, True, True, False], (6,), "bool")
+        out.append(_i29_case(op, f"{op}(int64, bool) -- generate's unfinished & ~criteria",
+                             lambda: torch_call(a_t, m_t), lambda: c_module._aten_dispatch(op, a_c, m_c)))
+        r_t, r_c = pair([7, -9], (2, 1), "int64")
+        out.append(_i29_case(op, f"{op}(int64 [2,1] x int64 [6]) broadcast",
+                             lambda: torch_call(r_t, a_t), lambda: c_module._aten_dispatch(op, r_c, a_c)))
+        p_t, p_c = pair([True, False, True, False], (4,), "bool")
+        q_t, q_c = pair([True, True, False, False], (4,), "bool")
+        out.append(_i29_case(op, f"{op}(bool, bool) truth table",
+                             lambda: torch_call(p_t, q_t), lambda: c_module._aten_dispatch(op, p_c, q_c)))
+
+    if op == "aten.bitwise_not.default":
+        for dtype_name, values in (("int64", [-2 ** 63, -1, 0, 2 ** 62, 12345]),
+                                   ("int32", [-2 ** 31, -1, 0, 2 ** 31 - 1, 7]),
+                                   ("int16", [-2 ** 15, -1, 0, 2 ** 15 - 1, 7]),
+                                   ("int8", [-128, -1, 0, 127, 7]),
+                                   ("uint8", [0, 1, 128, 254, 255]),
+                                   ("bool", [True, False, True, False, False])):
+            a_t, a_c = pair(values, (5,), dtype_name)
+            out.append(_i29_case(op, f"bitwise_not({dtype_name}) extremes",
+                                 lambda a=a_t: torch_call(a), lambda a=a_c: c_module._aten_dispatch(op, a)))
+    return out
+
+
+def _with_issue29(op, builder):
+    def wrapped(torch_module, c_module, torch_call):
+        return list(builder(torch_module, c_module, torch_call)) + _issue29_extra(
+            op, torch_module, c_module, torch_call
+        )
+
+    return wrapped
+
+
+for _op in (
+    "aten.argmax.default", "aten.max.default", "aten.min.default",
+    "aten.max.dim", "aten.min.dim", "aten.isin.Tensor_Tensor",
+    "aten.bitwise_and.Tensor", "aten.bitwise_or.Tensor", "aten.bitwise_xor.Tensor",
+    "aten.bitwise_not.default",
+):
+    assert _op in CASE_BUILDERS, _op
+    CASE_BUILDERS[_op] = _with_issue29(_op, CASE_BUILDERS[_op])
+del _op
