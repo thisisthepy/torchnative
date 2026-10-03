@@ -42,9 +42,13 @@ run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
 
 `rust/torch_c/pytests/test_docrefs.py` runs in the gate and enforces:
 
-1. **No `docs/*.md` reference in the tree dangles.** Roughly six thousand
-   references name documents by path, in Markdown prose, Rust comments, Python
-   docstrings and workflow files. A move that misses one is invisible otherwise.
+1. **No `docs/*.md` reference in a tracked file dangles.** 7,081 references in
+   438 tracked files (counted 2026-10-03) name documents by path, in Markdown
+   prose, Rust comments, Python docstrings and workflow files. A move that
+   misses one is invisible otherwise. The scan is `git ls-files`, so scratch
+   notes, logs and worktrees inside the checkout are not read, and a test
+   bounds the scan's cost on a 1 MB single-character file -- an earlier
+   pattern was quadratic and hung the gate on a leaked log (GitHub issue #8).
 2. **No new document lands at the top level of `docs/`.** That is the failure
    this index exists to stop, and prose asking for it would not have stopped it.
 3. **No documentation path is built from split string literals.**
