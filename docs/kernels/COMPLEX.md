@@ -134,8 +134,8 @@ something to carry for four architectures in the tail.
 > this one: it adds an enum arm, which is exactly the "touched nothing structural" case above.
 > The claim this section makes is that there is **no complex fork**, so that is what is pinned.
 
-<!-- DOCWATCH: symbol-in-file vendor/int8-candle-0.11.0-cpu.patch Complex absent -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/dtype.rs Complex absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch Complex absent -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/dtype.rs Complex absent -->
 
 ---
 

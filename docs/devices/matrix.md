@@ -51,7 +51,7 @@ carrying the verdicts across.
 > | Cells moved REFUSES → AGREES | **109, across 32 operators.** The whole in-place family on Metal. §7.7 |
 > | Cells moved REFUSES → REACHES | **3**, `uniform_`, which has no oracle because it draws. §7.7 |
 > | The gate that moved them | **one**: `write_into` was a host-side strided scatter over a `&mut CpuStorage`. §7.7 |
-> | Change to `vendor/candle-core` | **none.** The device path is candle's published `slice_set` → `copy2d` → Metal blit. §7.7 |
+> | Change to `torchnative/rust/vendor/candle-core` | **none.** The device path is candle's published `slice_set` → `copy2d` → Metal blit. §7.7 |
 > | In-place operators that now reach on `mps` | **31 of 43**, measured one by one. The other 12 are two named gates, not twelve. §7.8 |
 > | Silently wrong answers found by re-measuring | **1, and it is older than this round**, `clamp`/`clamp_min` drop NaN on Metal. Fixed. §7.9 |
 > | Metal dispatch counter | **still none.** Unchanged ceiling on every `mps` placement claim in this document. §7.5 |
@@ -414,7 +414,7 @@ constant on the host and moves it, landed for `mul.Scalar` inside a rotary
 embedding (docs/devices/MPSFWD.md §2), and its docstring already carries the
 whole argument. Nine operators simply still called `Tensor::full(v, shape,
 device)`. `host_full` is `host_const` with a shape, and adopting it closes all
-25 cells, **no kernel, and nothing in `vendor/candle-core` touched.**
+25 cells, **no kernel, and nothing in `torchnative/rust/vendor/candle-core` touched.**
 
 The trap in the obvious cheaper fix is recorded because it is invisible on
 `float32`, which is the dtype anyone would test it on: narrowing the `f64` to
@@ -620,7 +620,7 @@ from the 24 and why `test_constset.py` measures it directly. Nine operators
 × three dtypes = **27**, which is what that file covers and what closed.
 **25 was a pre-int8 figure and no run of this tree produces it.** The claim
 §4.3b was making, one helper, nine operators, no kernel, nothing in
-`vendor/candle-core` touched: is confirmed; only its arithmetic is not.
+`torchnative/rust/vendor/candle-core` touched: is confirmed; only its arithmetic is not.
 
 **`round.decimals` was never outside the sweep.** §4.3b lists three call sites
 "the sweep never reached": `amax`'s NaN seed, `nan_shaped_like`, and
@@ -1363,7 +1363,7 @@ That is the standard `softmax_on_device` was landed at (MPSATTN.md §3.1), and
 it is **weaker than a counter**, which is why this section says so instead of
 grading around it.
 
-A counter would have to go in `vendor/candle-core`, at the Metal
+A counter would have to go in `torchnative/rust/vendor/candle-core`, at the Metal
 backend's host-readback path. That is a change to a fork whose documented
 contract is "two inputs and nothing else" (docs/numerics/INT8.md §1.2) and
 whose patch `scripts/vendor/vendor_candle.sh --check` verifies byte for byte in the
@@ -1439,7 +1439,7 @@ view addresses are one unbroken run of `numel` elements starting at
 (`metal_backend/mod.rs`). `tensor.rs::write_on_device` is that call plus two
 guards, and every line of it is on the pinned crate's public API.
 
-**No change to `vendor/candle-core`, and that was checked rather than assumed
+**No change to `torchnative/rust/vendor/candle-core`, and that was checked rather than assumed
 before any code was written.** The fork's contract is "two inputs and nothing
 else" (docs/numerics/INT8.md §1.2) and `scripts/vendor/vendor_candle.sh --check`
 verifies its patch byte for byte in the gate. Two candle-side designs *were*
@@ -1626,13 +1626,13 @@ use:
 | `host_uploads`, `host_upload_bytes` | `MetalDevice::new_buffer_with_data()` | host → device |
 | `host_downloads`, `host_download_bytes` | `MetalStorage::to_cpu()` | device → host |
 
-**The counters are in `vendor/candle-core`, and they had to be.** §7.5 named
+**The counters are in `torchnative/rust/vendor/candle-core`, and they had to be.** §7.5 named
 that as the reason not to build it inside a round about something else; this
 round was given the fork. They cannot live on this side of the FFI boundary:
 a counter in `aten.rs` counts what this crate *intended*, and a host-computed
 twin intends exactly what the real kernel intends. Only candle can say whether
 a compute encoder was opened. Every edit went into
-`vendor/int8-candle-0.11.0-cpu.patch` and the tree was regenerated from it, so
+`torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` and the tree was regenerated from it, so
 `sh scripts/vendor/vendor_candle.sh --check` still passes byte for byte.
 
 **What `compute_encoders` is, stated narrowly enough that it cannot be
@@ -1665,9 +1665,9 @@ remain where §7.5 put them until someone writes the assertion. The instrument
 now exists; the work of pointing it at each cell does not.
 
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/device.rs metal_counters present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs COMPUTE_ENCODERS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/device.rs note_compute_encoder present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_abs_on_mps_opens_a_metal_kernel_and_reads_nothing_back present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_a_cpu_op_moves_no_metal_counter present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalcount.py test_a_readback_costs_exactly_the_tensors_bytes present -->
@@ -1926,7 +1926,7 @@ sweep to M-B.
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_metalplace.py test_the_readback_derivation_scan_reaches_these_kernels present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/aten.rs softmax_on_device present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/src/tensor.rs twin_softmax absent -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs note_host_download present -->
 
 ### 7.15 `candle_metal_kernels::DType`: the instantiation is macro-driven, and that is the shape of the `I8` decision
 
@@ -2243,9 +2243,9 @@ opposite of what §4.3a's headline implied.
 
 #### What was vendored, and on what terms
 
-`vendor/candle-metal-kernels/`, committed, on **exactly** the terms
-`vendor/candle-core/` is on: the sha256-pinned published crate plus
-`vendor/int8-candle-metal-kernels-0.11.0.patch`, regenerated by
+`torchnative/rust/vendor/candle-metal-kernels/`, committed, on **exactly** the terms
+`torchnative/rust/vendor/candle-core/` is on: the sha256-pinned published crate plus
+`torchnative/rust/vendor/int8-candle-metal-kernels-0.11.0.patch`, regenerated by
 `sh scripts/vendor/vendor_candle.sh` and verified byte for byte by `--check` in the
 gate. `vendor_candle.sh` was extended to loop over both crates rather than
 gaining a sibling script, and `test_int8.py` now runs the same four vendoring
@@ -2308,12 +2308,12 @@ M-2 and M-5.
 
 <!-- DOCWATCH: symbol-in-file scripts/vendor/vendor_candle.sh candle-metal-kernels present -->
 <!-- DOCWATCH: symbol-in-file torchnative/rust/torch_c/Cargo.toml candle-metal-kernels present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/lib.rs I8 present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/binary.metal "init_binary_k(bop, bop, i8, int8_t, int8_t)" present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i8, int8_t)" present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/metal_src/ternary.metal where_u8_i8 present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
-<!-- DOCWATCH: symbol-in-file vendor/candle-core/src/metal_backend/mod.rs cast_i8_f32 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/lib.rs I8 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/metal_src/binary.metal "init_binary_k(bop, bop, i8, int8_t, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/metal_src/cast.metal "init_cast_all(i8, int8_t)" present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/metal_src/ternary.metal where_u8_i8 present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-metal-kernels/src/utils.rs primitive!(i8) present -->
+<!-- DOCWATCH: symbol-in-file torchnative/rust/vendor/candle-core/src/metal_backend/mod.rs cast_i8_f32 present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_builds_on_mps_and_makes_the_round_trip present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_binary_operators_agree_with_upstream_on_mps present -->
 <!-- DOCWATCH: symbol-in-file tests/devices/mps/test_i8mps.py test_int8_casts_agree_with_upstream_on_mps present -->

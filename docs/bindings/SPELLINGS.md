@@ -216,7 +216,7 @@ tril triu flip gather index_select`) 중 커널이 **새로 생긴 것은 `split
 세 출력 전부).
 
 **전체 vendor 트리(`import torch`)로도 시도했으나 판단 근거로 쓰지 않았다.** `TORCH_USE_RTLD_GLOBAL=1`로
-`vendor/`를 얹어 실제로 실행해 보면, `x.argmax()`처럼 이미 동작이 확인된 기존 스펠링조차
+`torchnative/rust/vendor/`를 얹어 실제로 실행해 보면, `x.argmax()`처럼 이미 동작이 확인된 기존 스펠링조차
 `torch._C._functorch.is_functorch_wrapped_tensor`에서 막힌다. 이번 회차가 만든 문제가
 아니라 vendor 트리를 통한 메서드 호출 전반에 걸친 기존 벽이다(범위 밖의 `_functorch` 서브모듈
 배선 문제로 보인다, 원인은 추적하지 않았다). 그래서 지난 회차와 같은 방법(`loader.load_shim()`로

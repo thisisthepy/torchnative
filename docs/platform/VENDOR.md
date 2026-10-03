@@ -32,7 +32,7 @@ DESIGN.md §2 는 이 프로젝트의 핵심 베팅을 한 문장으로 적어 �
 | abi3 | **켬.** `abi3-py313`, 세 타깃 전부 종료 코드 0, 호스트 스모크 13/13 |
 | 산출물 이름 | `_C.so` → **`_C.abi3.so`** (ABI3.md §7 항목 2) |
 | 벤더링한 것 | torch **2.13.0** 파이썬 트리, `.py` **2285 개**, 53 MB, 네이티브 산출물 **0 개** |
-| 저장소 배치 | `vendor/` 안, **`.gitignore` 로 제외**. 재현은 `scripts/vendor/vendor_torch.sh` |
+| 저장소 배치 | `torchnative/rust/vendor/` 안, **`.gitignore` 로 제외**. 재현은 `scripts/vendor/vendor_torch.sh` |
 | **엄격 모드 `import torch`** | **`torch/__init__.py:1050` 에서 정지.** `_initExtension` 없음 |
 | 기록 모드 `import torch` | `torch/__init__.py:2885` (전체 3087 행의 **93%**) 까지. `torch._decomp` 안에서 정지 |
 | `import transformers` | **성공(종료 코드 0), 그리고 `is_torch_available() == True`**, 이것이 함정입니다 (§5) |
@@ -85,7 +85,7 @@ ABI3.md §7 의 항목 3(`nm -u` × `stable_abi.toml` 감사를 CI 게이트로)
 
 ### 저장소 안, 그러나 커밋하지 않음
 
-`vendor/` 를 저장소 안에 두되 트리는 `.gitignore` 로 제외하고, **재현 스크립트만 커밋 대상**으로
+`torchnative/rust/vendor/` 를 저장소 안에 두되 트리는 `.gitignore` 로 제외하고, **재현 스크립트만 커밋 대상**으로
 남겼습니다. 근거는 두 가지입니다.
 
 - 파이썬 트리만 53 MB · 2285 파일입니다. 저장소에 넣으면 이후 모든 clone·diff·리뷰가 그 무게를
@@ -94,7 +94,7 @@ ABI3.md §7 의 항목 3(`nm -u` × `stable_abi.toml` 감사를 CI 게이트로)
   하드코딩된 iOS `-F` 경로와 같은 함정을 다른 자리에 다시 파는 셈입니다.
 
 ```
-vendor/
+torchnative/rust/vendor/
 ├─ vendor_torch.sh     상류 트리를 가져온다        (커밋됨)
 ├─ install_shim.sh     우리 `_C` 를 구멍에 넣는다  (커밋됨)
 ├─ probe.py            벽을 찾는 계측기            (커밋됨)
@@ -147,7 +147,7 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
 
 인터프리터는 **spike-venv 의 3.13.0** 을 씁니다. torch 의 서드파티 의존(sympy·networkx·filelock·
 fsspec·jinja2·typing_extensions)이 이미 거기 있고, `PYTHONPATH` 가 `site-packages` 보다 앞서므로
-**벤더링 트리가 설치된 torch 를 가립니다.** `torch.__file__` 이 `vendor/` 아래를 가리키는 것으로
+**벤더링 트리가 설치된 torch 를 가립니다.** `torch.__file__` 이 `torchnative/rust/vendor/` 아래를 가리키는 것으로
 확인했습니다. 이렇게 하지 않으면 나오는 벽이 "우리 `_C` 의 부족" 이 아니라 "의존 패키지 없음" 이
 되어 측정이 무의미해집니다.
 

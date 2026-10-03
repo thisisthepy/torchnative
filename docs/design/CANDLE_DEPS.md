@@ -419,8 +419,8 @@ sh tests/run.sh              # 62/62 스모크 테스트 전부 ok              
 > **2026-09-15 정정, 3 번의 크기 전제가 틀렸습니다.** 24MB 는 워크스페이스 전체였고, crates.io
 > 에 **게시된** `candle-core-0.11.0.crate` 는 `cargo package` 가 `Cargo.toml` 을 정규화해 두어
 > 워크스페이스 없이 홀로 빌드되며 **1.9MB** 입니다. `torch.int8` 을 위한 `I8` 포크가 바로 그
-> 형태로 착지했습니다: `vendor/candle-core/` (커밋됨), `[patch.crates-io]` 는 상대 경로
+> 형태로 착지했습니다: `torchnative/rust/vendor/candle-core/` (커밋됨), `[patch.crates-io]` 는 상대 경로
 > `../../vendor/candle-core`, sha256 고정과 재생성 검사는 `scripts/vendor/vendor_candle.sh`
 > (`docs/numerics/INT8.md` §1.2). **다만 이 문서의 최적화(`tokenizers` 제거)는 그 포크에 싣지
-> 않았습니다**. 별개의 결정이고, 필요하면 `vendor/int8-candle-0.11.0-cpu.patch` 에 hunk 를
+> 않았습니다**. 별개의 결정이고, 필요하면 `torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch` 에 hunk 를
 > 더하는 것으로 켤 수 있습니다.

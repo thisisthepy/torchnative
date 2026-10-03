@@ -2,8 +2,8 @@
 # Materialise the candle forks that give this crate `DType::I8`, or check that
 # the committed copies are exactly those forks.
 #
-#   sh scripts/vendor/vendor_candle.sh           write  vendor/candle-core/
-#                                              and vendor/candle-metal-kernels/
+#   sh scripts/vendor/vendor_candle.sh           write  torchnative/rust/vendor/candle-core/
+#                                              and torchnative/rust/vendor/candle-metal-kernels/
 #   sh scripts/vendor/vendor_candle.sh --check   rebuild both in a temp dir and diff
 #
 # TWO crates, because `DType::I8` is two halves that are useless apart. The
@@ -21,13 +21,13 @@
 #   not one chosen here. `.cargo_vcs_info.json` inside it names candle commit
 #   31f35b1, the same one docs/design/CANDLE_DEPS.md cloned.
 #
-#   vendor/int8-candle-0.11.0-cpu.patch, applied with `git apply`. (The name
+#   torchnative/rust/vendor/int8-candle-0.11.0-cpu.patch, applied with `git apply`. (The name
 #   says `cpu` for where the work started; the file has carried Metal counters
 #   and now Metal `I8` for some time. It is quoted by docs/numerics/INT8.md
 #   §1.2 and tests/numerics/test_int8.py, so it is left alone.)
 #
 #   candle-metal-kernels 0.11.0, pinned by the sha256 the lock already
-#   recorded, plus vendor/int8-candle-metal-kernels-0.11.0.patch.
+#   recorded, plus torchnative/rust/vendor/int8-candle-metal-kernels-0.11.0.patch.
 #
 # The *published* crate rather than a clone of candle's repository, on purpose:
 # `cargo package` normalises `Cargo.toml`, so the published crate stands alone.
@@ -74,16 +74,16 @@ sha256_for() {
 
 patch_for() {
     case "$1" in
-    candle-core)          echo "$repo/vendor/int8-candle-$version-cpu.patch" ;;
-    candle-metal-kernels) echo "$repo/vendor/int8-candle-metal-kernels-$version.patch" ;;
+    candle-core)          echo "$repo/torchnative/rust/vendor/int8-candle-$version-cpu.patch" ;;
+    candle-metal-kernels) echo "$repo/torchnative/rust/vendor/int8-candle-metal-kernels-$version.patch" ;;
     *) echo "patch_for: unknown crate $1" >&2; exit 2 ;;
     esac
 }
 
 dest_for() {
     case "$1" in
-    candle-core)          echo "${TORCHNATIVE_CANDLE_DIR:-$repo/vendor/candle-core}" ;;
-    candle-metal-kernels) echo "${TORCHNATIVE_CANDLE_KERNELS_DIR:-$repo/vendor/candle-metal-kernels}" ;;
+    candle-core)          echo "${TORCHNATIVE_CANDLE_DIR:-$repo/torchnative/rust/vendor/candle-core}" ;;
+    candle-metal-kernels) echo "${TORCHNATIVE_CANDLE_KERNELS_DIR:-$repo/torchnative/rust/vendor/candle-metal-kernels}" ;;
     esac
 }
 

@@ -15,7 +15,7 @@ Vulkan was the only backend where the experiment could be *run* (AGENTS.md §13.
 On Metal the failure mode could not be excluded, only hoped against.
 
 `_C._metal_counters()` is the instrument. Its six numbers are incremented
-inside `vendor/candle-core`'s Metal backend, at the doors candle itself opens:
+inside `torchnative/rust/vendor/candle-core`'s Metal backend, at the doors candle itself opens:
 
     compute_encoders     MetalDevice::command_encoder()      kernel launches
     blit_encoders        MetalDevice::blit_command_encoder() device copies
