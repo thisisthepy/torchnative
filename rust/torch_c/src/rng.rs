@@ -28,6 +28,7 @@
 //! Everything here is deliberately arithmetic-for-arithmetic with the C++,
 //! down to `2.0f * c10::pi<double>` being evaluated in double and only then
 //! narrowed. Where upstream writes `std::fma`, this writes `mul_add`.
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,71 @@ pub fn default_generator() -> MutexGuard<'static, CpuGenerator> {
         // the interpreter, and nothing here can panic while the state is
         // half-written.
         Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Independent streams -- `torch.Generator()`
+// ---------------------------------------------------------------------------
+
+/// Every `torch.Generator()` owns one `CpuGenerator`, kept here under a small
+/// integer id that the Python object carries as `_shim_gen_id`.
+///
+/// The stream is leaked (`Box::leak`) so a kernel can hold a
+/// `MutexGuard<'static, CpuGenerator>` -- the same type `default_generator()`
+/// returns -- and every kernel body stays as it was upstream-shaped: it takes
+/// `&mut CpuGenerator` and does not care whose. `stream_free` reclaims it when
+/// the Python object dies. That is sound because a kernel holds its guard only
+/// while it runs, under the GIL, and `__del__` cannot run in the middle of one.
+///
+/// `None` is the default generator, so a call that names no generator and a
+/// call that names `torch.default_generator` take the same path.
+static STREAMS: OnceLock<Mutex<HashMap<u64, &'static Mutex<CpuGenerator>>>> = OnceLock::new();
+static NEXT_STREAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn streams() -> MutexGuard<'static, HashMap<u64, &'static Mutex<CpuGenerator>>> {
+    match STREAMS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+/// A new independent stream. A fresh `torch.Generator()` is seeded with the
+/// default seed 67280421310721, as upstream's is -- not from the clock -- so
+/// an unseeded generator is reproducible the way upstream's is.
+pub const DEFAULT_GENERATOR_SEED: u64 = 67280421310721;
+
+pub fn stream_new(seed: u64) -> u64 {
+    let id = NEXT_STREAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let gen: &'static Mutex<CpuGenerator> = Box::leak(Box::new(Mutex::new(CpuGenerator::new(seed))));
+    streams().insert(id, gen);
+    id
+}
+
+pub fn stream_free(id: u64) {
+    if let Some(gen) = streams().remove(&id) {
+        // SAFETY: `gen` came from `Box::leak` in `stream_new`, it was just
+        // removed from the only table that handed out references, and kernels
+        // lock a stream only while holding the GIL, which the caller of
+        // `stream_free` (a Python `__del__`) also holds -- so no guard is live.
+        drop(unsafe { Box::from_raw(gen as *const Mutex<CpuGenerator> as *mut Mutex<CpuGenerator>) });
+    }
+}
+
+/// The generator a kernel should draw from: stream `id`, or the process-wide
+/// default when `id` is `None`. An unknown id is a freed generator -- a bug on
+/// the Python side -- and panics rather than quietly drawing from another
+/// stream.
+pub fn stream(id: Option<u64>) -> MutexGuard<'static, CpuGenerator> {
+    let Some(id) = id else {
+        return default_generator();
+    };
+    let gen: &'static Mutex<CpuGenerator> = *streams()
+        .get(&id)
+        .unwrap_or_else(|| panic!("torch._C shim: generator stream {id} was freed"));
+    match gen.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
     }
 }
 
@@ -707,6 +773,53 @@ pub fn register(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()
         seed
     }
 
+    /// `torch.Generator()` -- a new independent stream; returns its id.
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_new")]
+    fn shim_gen_new() -> u64 {
+        stream_new(DEFAULT_GENERATOR_SEED)
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_free")]
+    fn shim_gen_free(id: u64) {
+        stream_free(id);
+    }
+
+    /// `Generator.manual_seed(seed)` on stream `id`; same seed remap as the
+    /// default generator's, same refusal outside the 64-bit range.
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_manual_seed")]
+    fn shim_gen_manual_seed(id: u64, seed: i128) -> PyResult<u64> {
+        let seed = normalise_seed(seed).ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Overflow when unpacking long: {seed} is outside the inclusive range \
+                 [-0x8000_0000_0000_0000, 0xffff_ffff_ffff_ffff]"
+            ))
+        })?;
+        stream(Some(id)).set_current_seed(seed);
+        Ok(seed)
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_initial_seed")]
+    fn shim_gen_initial_seed(id: u64) -> u64 {
+        stream(Some(id)).current_seed()
+    }
+
+    #[pyfunction]
+    #[pyo3(name = "_shim_gen_reseed")]
+    fn shim_gen_reseed(id: u64) -> u64 {
+        let seed = nondeterministic_seed();
+        stream(Some(id)).set_current_seed(seed);
+        seed
+    }
+
+    m.add_function(wrap_pyfunction!(shim_gen_new, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_gen_free, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_gen_manual_seed, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_gen_initial_seed, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_gen_reseed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_manual_seed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_initial_seed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_reseed, m)?)?;

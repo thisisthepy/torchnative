@@ -202,22 +202,18 @@ import transformers.generation.continuous_batching.continuous_api as cbapi
 
 IS_SHIM = hasattr(torch._C, "_aten_implemented")
 
-# Two host walls that are not this test's subject, removed on BOTH sides alike
-# and named here so nobody reads this test as covering them (issue #13):
-#  1. On a host where mps is available, CB pins its cpu IO buffers
-#     (`len(get_available_devices()) > 1`). Upstream 2.13.0 answers
-#     `torch.zeros(..., device="cpu", pin_memory=True)` with an *mps* tensor and
-#     its own cpu forward then fails; the shim refuses `pin_memory=True` by name.
-#     A cpu-only host takes the unpinned branch, which is what is forced here.
-#  2. CB sizes its cache through `torch.mps.recommended_max_memory()` and two
-#     siblings whenever mps is available, even for a cpu model; the shim raises
-#     NotImplementedError for all three. Explicit `num_blocks` and
-#     `max_batch_tokens` do not avoid the call.
-cbio.get_available_devices = lambda: ["cpu"]
-if torch.backends.mps.is_available():
-    torch.mps.recommended_max_memory = lambda: 8 << 30
-    torch.mps.current_allocated_memory = lambda: 0
-    torch.mps.driver_allocated_memory = lambda: 0
+# Upstream only: on a host where mps is available, upstream CB pins its cpu IO
+# buffers (`len(get_available_devices()) > 1`), and upstream 2.13.0 answers
+# `torch.zeros(..., device="cpu", pin_memory=True)` with an *mps* tensor -- so its
+# own cpu forward then fails (issue #30, measured). That is upstream not running
+# a cpu model on a Mac, not a property under test; forcing the unpinned branch is
+# what lets the *reference* run at all. The shim gets no such help: it accepts
+# `pin_memory=True` on cpu, serves an ordinary cpu tensor, and its
+# `torch.mps.recommended_max_memory()` and two siblings answer from Metal
+# (`test_cbwalls.py` pins each by itself). Both of #13's stubs are gone from this
+# side, so `generate_batch` below runs on the shim's own answers.
+if not IS_SHIM:
+    cbio.get_available_devices = lambda: ["cpu"]
 
 errors = []
 _crit = cbapi.ContinuousBatchingManager._handle_critical_error
@@ -226,13 +222,16 @@ def _record(self, error, bp):
     return _crit(self, error, bp)
 cbapi.ContinuousBatchingManager._handle_critical_error = _record
 
-attn, sampling = sys.argv[1], sys.argv[2]
-cfg = transformers.Qwen3Config(
+attn, sampling, arch, dtype_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+common = dict(
     vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
     num_attention_heads=4, num_key_value_heads=2, head_dim=16,
     max_position_embeddings=256, tie_word_embeddings=False, attn_implementation=attn,
 )
-model = transformers.Qwen3ForCausalLM(cfg)
+if arch == "qwen3":
+    model = transformers.Qwen3ForCausalLM(transformers.Qwen3Config(**common))
+else:
+    model = transformers.LlamaForCausalLM(transformers.LlamaConfig(**common))
 # Weights from Python's RNG: the two builds' torch RNGs differ, the model must not.
 rng = random.Random(1234)
 with torch.no_grad():
@@ -241,6 +240,7 @@ with torch.no_grad():
         if name.endswith("norm.weight"):
             vals = [1.0 + v for v in vals]
         p.copy_(torch.tensor(vals, dtype=torch.float32).reshape(p.shape))
+model = model.to(getattr(torch, dtype_name))
 model.eval()
 
 prng = random.Random(1)
@@ -266,21 +266,32 @@ print(json.dumps({"is_shim": IS_SHIM, "errors": errors,
 """
 
 
-def _generate_batch(attn: str, sampling: str, shim: bool) -> dict:
+def _generate_batch(attn: str, sampling: str, shim: bool, arch: str = "qwen3",
+                    dtype: str = "float32") -> dict:
+    marker = "attn, sampling, arch, dtype_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]"
+    assert marker in _GENERATE_BATCH_SCRIPT
     script = _GENERATE_BATCH_SCRIPT.replace(
-        "attn, sampling = sys.argv[1], sys.argv[2]", f"attn, sampling = {attn!r}, {sampling!r}"
+        marker, f"attn, sampling, arch, dtype_name = {attn!r}, {sampling!r}, {arch!r}, {dtype!r}"
     )
     return _run_side(script, shim=shim, timeout=600)
 
 
 def test_generate_batch_greedy_tokens_match_upstream_on_cpu_for_both_paged_attentions():
-    for attn in ("paged|sdpa", "paged|eager"):
-        shim = _generate_batch(attn, "greedy", shim=True)
-        upstream = _generate_batch(attn, "greedy", shim=False)
-        assert not upstream["errors"], (attn, "upstream", upstream["errors"])
-        assert not shim["errors"], (attn, "shim", shim["errors"])
-        assert len(upstream["tokens"]) == 3 and all(len(t) == 6 for t in upstream["tokens"]), upstream
-        assert shim["tokens"] == upstream["tokens"], (attn, shim["tokens"], upstream["tokens"])
+    # #13's configs, 2 architectures x 2 attentions x 2 dtypes, each cell its own
+    # pair of subprocesses. The shim side runs with no stub (see the script).
+    for arch in ("qwen3", "llama"):
+        for attn in ("paged|sdpa", "paged|eager"):
+            for dtype in ("float32", "bfloat16"):
+                cell = (arch, attn, dtype)
+                shim = _generate_batch(attn, "greedy", shim=True, arch=arch, dtype=dtype)
+                upstream = _generate_batch(attn, "greedy", shim=False, arch=arch, dtype=dtype)
+                assert not upstream["errors"], (cell, "upstream", upstream["errors"])
+                assert not shim["errors"], (cell, "shim", shim["errors"])
+                assert len(upstream["tokens"]) == 3 and all(
+                    len(t) == 6 for t in upstream["tokens"]
+                ), (cell, upstream)
+                assert shim["tokens"] == upstream["tokens"], (
+                    cell, shim["tokens"], upstream["tokens"])
 
 
 def test_generate_batch_with_per_request_sampling_completes_on_cpu():

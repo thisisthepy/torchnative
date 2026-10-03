@@ -2637,15 +2637,30 @@ def test_normal_caches_the_other_half_of_the_pair_on_the_generator():
     assert again.tolist() == first.tolist()
 
 
-def test_uniform_refuses_a_generator_it_does_not_own():
-    # There is one generator here. A `torch.Generator()` of one's own has no
-    # state, and serving it from the default stream would look like it worked.
+def test_uniform_serves_a_generator_from_its_own_stream_and_refuses_a_foreign_object():
+    # A `torch.Generator()` has a stream of its own (issue #30): drawing from it
+    # must not move the default stream, and an object that merely looks like a
+    # generator, owning no stream, is still refused by name.
     other = _C.Generator()
+    other.manual_seed(5)
     x = _t([0.0, 0.0], [2])
+    _C._shim_manual_seed(9)
+    expected_default = _t([0.0, 0.0], [2]).uniform_(0.0, 1.0).tolist()
+    _C._shim_manual_seed(9)
+    assert x.uniform_(0.0, 1.0, generator=other) is x
+    drawn = x.tolist()
+    after = _t([0.0, 0.0], [2]).uniform_(0.0, 1.0).tolist()
+    assert after == expected_default, "a draw from a separate generator moved the default stream"
+    other.manual_seed(5)
+    assert _t([0.0, 0.0], [2]).uniform_(0.0, 1.0, generator=other).tolist() == drawn
+
+    class _NotAGenerator:
+        pass
+
     try:
-        x.uniform_(0.0, 1.0, generator=other)
-    except NotImplementedError as e:
-        assert "torch.default_generator" in str(e)
+        x.uniform_(0.0, 1.0, generator=_NotAGenerator())
+    except (NotImplementedError, TypeError):
+        pass
     else:
         raise AssertionError("a foreign generator was accepted")
     # The default one is fine, named explicitly.
@@ -3133,13 +3148,12 @@ def test_randn_generator_kwarg_reaches_the_same_stream_as_manual_seed():
     _C._shim_manual_seed(5)
     b = _C._VariableFunctions.randn(3, generator=_C.default_generator)
     assert a.tolist() == b.tolist()
+    # A generator of one's own draws the same numbers as the default stream
+    # seeded the same way (the global stream reproduces upstream's mt19937).
     other = _C.Generator()
-    try:
-        _C._VariableFunctions.randn(3, generator=other)
-    except NotImplementedError as e:
-        assert "torch.default_generator" in str(e)
-    else:
-        raise AssertionError("a foreign generator was accepted")
+    other.manual_seed(5)
+    c = _C._VariableFunctions.randn(3, generator=other)
+    assert c.tolist() == a.tolist()
 
 
 def test_normal_size_overload_matches_manual_composition():

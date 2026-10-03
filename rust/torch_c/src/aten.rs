@@ -10451,6 +10451,11 @@ fn randint(
         kwargs,
         &[(options_at + 1, "layout"), (options_at + 3, "pin_memory")],
     )?;
+    // The `*_generator` overloads reach this kernel through the binder's key
+    // alias (bootstrap.py `_GENERATOR_KEY_ALIAS`): same draws, own stream.
+    // `generator` is keyword-only in every schema, so no positional slot is
+    // consulted (`usize::MAX`): `options_at - 1` would be `size`.
+    let gen_id = generator_arg(op, args, kwargs, usize::MAX, "generator")?;
     let label = device_arg_or_label(args, kwargs, options_at + 2, "device", &PyDevice::cpu())?;
 
     if high <= low {
@@ -10489,7 +10494,7 @@ fn randint(
     let values = if numel == 0 {
         Vec::new()
     } else {
-        let mut gen = crate::rng::default_generator();
+        let mut gen = crate::rng::stream(gen_id);
         crate::rng::randint_from_to_fill(&mut gen, numel, from, to)
     };
     let tensor = randint_narrow(op, values, size, storage, &device)?;
@@ -10526,6 +10531,7 @@ fn randperm(
     let n = int_arg(args, kwargs, 0, "n")?.ok_or_else(|| missing(OP, "n"))?;
     let dtype = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(TorchDType::Int64);
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
+    let gen_id = generator_arg(OP, args, kwargs, usize::MAX, "generator")?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::cpu())?;
 
     if n < 0 {
@@ -10587,7 +10593,7 @@ fn randperm(
     let values = if n == 0 {
         Vec::new()
     } else {
-        let mut gen = crate::rng::default_generator();
+        let mut gen = crate::rng::stream(gen_id);
         crate::rng::randperm_fill(&mut gen, n as usize)
     };
     let tensor = randint_narrow(OP, values, vec![n as usize], storage, &device)?;
@@ -19019,36 +19025,41 @@ fn rng_float_dtype(op: &str, tag: TorchDType) -> PyResult<candle_core::DType> {
     }
 }
 
-/// The `Generator? generator=None` tail both schemas carry.
+/// The `Generator? generator=None` tail the RNG schemas carry.
 ///
-/// There is exactly one generator here -- the process-wide default that
-/// `torch.default_generator` names -- so a *different* generator is refused by
-/// name rather than silently served from the default stream, which would make
-/// `torch.Generator().manual_seed(0)` look like it worked while sharing state
-/// with everything else. `None` is the common case and never even arrives:
-/// the overload resolver drops arguments equal to their schema default.
+/// Returns which stream to draw from: `None` is the process-wide default
+/// (`torch.default_generator`, or no generator named), `Some(id)` is a
+/// `torch.Generator()` made by this shim, whose stream `rng::stream` looks up.
+/// Anything else that claims to be a generator -- an object the shim did not
+/// make, or one whose stream is gone -- is refused by name rather than served
+/// from the default stream, which would make `torch.Generator().manual_seed(0)`
+/// look like it worked while sharing state with everything else.
 fn generator_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
     name: &str,
-) -> PyResult<()> {
+) -> PyResult<Option<u64>> {
     let Some(value) = optional(args, kwargs, index, name)? else {
-        return Ok(());
+        return Ok(None);
     };
     if value.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     if value
         .getattr("_shim_is_default_generator")
         .is_ok_and(|flag| flag.is_truthy().unwrap_or(false))
     {
-        return Ok(());
+        return Ok(None);
+    }
+    if let Ok(id) = value.getattr("_shim_gen_id").and_then(|v| v.extract::<u64>()) {
+        return Ok(Some(id));
     }
     Err(not_implemented(format!(
-        "{op}: only torch.default_generator is implemented in torch._C shim; \
-         a separate torch.Generator has no state of its own here"
+        "{op}: this generator was not made by torch._C shim's torch.Generator() \
+         (it has no stream of its own here); only torch.default_generator and \
+         generators from torch.Generator() are implemented"
     )))
 }
 
@@ -19135,7 +19146,7 @@ fn uniform_inplace(
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let from = float_arg(args, kwargs, 1, "from", 0.0)?;
     let to = float_arg(args, kwargs, 2, "to", 1.0)?;
-    generator_arg(OP, args, kwargs, 3, "generator")?;
+    let gen_id = generator_arg(OP, args, kwargs, 3, "generator")?;
     let target = rng_target(OP, &receiver)?;
 
     // torch's own check, message included.
@@ -19145,7 +19156,7 @@ fn uniform_inplace(
         )));
     }
 
-    let mut gen = crate::rng::default_generator();
+    let mut gen = crate::rng::stream(gen_id);
     let replacement = if target.storage == candle_core::DType::F64 {
         let mut values = crate::rng::uniform_fill_f64(&mut gen, target.numel, from, to);
         for value in values.iter_mut() {
@@ -19211,7 +19222,7 @@ fn normal_inplace(
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let mean = float_arg(args, kwargs, 1, "mean", 0.0)?;
     let std = float_arg(args, kwargs, 2, "std", 1.0)?;
-    generator_arg(OP, args, kwargs, 3, "generator")?;
+    let gen_id = generator_arg(OP, args, kwargs, 3, "generator")?;
     let target = rng_target(OP, &receiver)?;
 
     if !(std >= 0.0) {
@@ -19220,7 +19231,7 @@ fn normal_inplace(
         )));
     }
 
-    let mut gen = crate::rng::default_generator();
+    let mut gen = crate::rng::stream(gen_id);
     let values_f64: Option<Vec<f64>>;
     let values_f32: Option<Vec<f32>>;
 
@@ -19313,7 +19324,7 @@ fn bernoulli_inplace_float(
 
     let receiver = tensor_receiver(OP, args, kwargs)?;
     let p = float_arg(args, kwargs, 1, "p", 0.5)?;
-    generator_arg(OP, args, kwargs, 2, "generator")?;
+    let gen_id = generator_arg(OP, args, kwargs, 2, "generator")?;
 
     // torch's own check, message included. Written as `!(0 <= p <= 1)` rather
     // than `p < 0 || p > 1` so that `nan` is refused -- upstream's
@@ -19355,7 +19366,7 @@ fn bernoulli_inplace_float(
         )
     };
 
-    let mut gen = crate::rng::default_generator();
+    let mut gen = crate::rng::stream(gen_id);
     let draws = crate::rng::uniform_fill_f64(&mut gen, numel, 0.0, 1.0);
     drop(gen);
 
@@ -25723,7 +25734,7 @@ fn multinomial_default(
     let num_samples =
         int_arg(args, kwargs, 1, "num_samples")?.ok_or_else(|| missing(OP, "num_samples"))?;
     let replacement = bool_arg(args, kwargs, 2, "replacement")?.unwrap_or(false);
-    generator_arg(OP, args, kwargs, 3, "generator")?;
+    let gen_id = generator_arg(OP, args, kwargs, 3, "generator")?;
 
     let tag = input.tag();
     if !tag.is_floating_point() {
@@ -25783,7 +25794,7 @@ fn multinomial_default(
         }
 
         let q = {
-            let mut gen = crate::rng::default_generator();
+            let mut gen = crate::rng::stream(gen_id);
             crate::rng::exponential_serial(&mut gen, probs.len(), 1.0)
         };
         let q = narrow_through(OP, q, storage, &device)?;
@@ -25860,7 +25871,7 @@ fn multinomial_default(
             }
         };
         let mut picks = Vec::with_capacity(n_dist * n_sample);
-        let mut gen = crate::rng::default_generator();
+        let mut gen = crate::rng::stream(gen_id);
         for i in 0..n_dist {
             let row = &probs[i * n_categories..(i + 1) * n_categories];
             let mut cum = vec![0.0f64; n_categories];

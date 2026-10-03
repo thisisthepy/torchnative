@@ -1119,6 +1119,110 @@ fn mps_probe(py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
     Ok(d.into_any().unbind())
 }
 
+// ---------------------------------------------------------------------------
+// torch.mps memory queries
+// ---------------------------------------------------------------------------
+
+/// The cached `MetalDevice` at index 0, or the refusal that names why there is
+/// none. The three `_mps_*Memory` functions below share it.
+///
+/// Index 0 only: `torch.mps.*` takes no device argument, and upstream's own
+/// MPS allocator is a single process-wide object.
+#[cfg(target_vendor = "apple")]
+fn mps_memory_device(what: &str) -> PyResult<candle_core::MetalDevice> {
+    let resolved = PyDevice {
+        kind: "mps".to_string(),
+        index: Some(0),
+    }
+    .resolve()
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim: {what}: no Metal device could be opened ({e})"
+        ))
+    })?;
+    match resolved {
+        Device::Metal(m) => Ok(m),
+        _ => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "torch._C shim: {what}: resolving mps:0 did not give a Metal device"
+        ))),
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn mps_no_metal(what: &str) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "torch._C shim: {what}: this build has no Metal (it is not an Apple \
+         target), so there is no MTLDevice to ask. torch.backends.mps.is_available() \
+         is False here, which is the gate callers are meant to test first"
+    ))
+}
+
+/// `torch.mps.recommended_max_memory()` -- `MTLDevice.recommendedMaxWorkingSetSize`,
+/// read from the device, not estimated. Upstream returns the same property
+/// (`torch/mps/__init__.py`: "returned from device.recommendedMaxWorkingSetSize").
+#[pyfunction]
+#[pyo3(name = "_mps_recommendedMaxMemory")]
+fn mps_recommended_max_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_recommendedMaxMemory")?;
+        Ok(m.metal_device().recommended_max_working_set_size() as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_recommendedMaxMemory"))
+    }
+}
+
+/// `torch.mps.driver_allocated_memory()` -- `MTLDevice.currentAllocatedSize`,
+/// the driver's total for the process. It includes this crate's pooled
+/// buffers that are free but not yet released, so it does **not** fall when a
+/// tensor dies; that is also what upstream documents for it ("includes cached
+/// allocations in MPSAllocator pools").
+#[pyfunction]
+#[pyo3(name = "_mps_driverAllocatedMemory")]
+fn mps_driver_allocated_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_driverAllocatedMemory")?;
+        Ok(m.metal_device().current_allocated_size() as u64)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_driverAllocatedMemory"))
+    }
+}
+
+/// `torch.mps.current_allocated_memory()` -- bytes of buffers in this crate's
+/// Metal allocator that a live storage (or an in-flight command) still holds:
+/// `MetalDevice::live_buffer_bytes`, a vendored addition to candle's backend
+/// (`vendor/int8-candle-0.11.0-cpu.patch`). It is a count of what this crate
+/// allocated, and it falls when the last reference to a storage goes, because
+/// the allocator's own "free" test is the one it applies.
+///
+/// Unit: `Buffer::length()`, which candle rounds up to a power of two, so a
+/// tensor of 2^k bytes moves it by exactly that and any other size by the
+/// rounded size. Not counted: buffers made by `new_private_buffer`, which are
+/// not pooled. Upstream counts tensor-owned allocator bytes with its own
+/// rounding; the two agree on what is measured, not on every digit.
+#[pyfunction]
+#[pyo3(name = "_mps_currentAllocatedMemory")]
+fn mps_current_allocated_memory() -> PyResult<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        let m = mps_memory_device("_mps_currentAllocatedMemory")?;
+        m.live_buffer_bytes()
+            .map(|b| b as u64)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim: _mps_currentAllocatedMemory: {e}"
+            )))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        Err(mps_no_metal("_mps_currentAllocatedMemory"))
+    }
+}
+
 /// Refuse a float64 tensor on a Metal device, by name, at the moment it would
 /// be wrapped -- rather than letting it exist and fail op by op.
 ///
@@ -1875,6 +1979,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_probe, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
     m.add_function(wrap_pyfunction!(mps_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_recommended_max_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_driver_allocated_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_current_allocated_memory, m)?)?;
     m.add_function(wrap_pyfunction!(metal_counters, m)?)?;
     Ok(())
 }

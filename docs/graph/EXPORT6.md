@@ -357,7 +357,9 @@ running a model probe on the same machine at the time.
 4. `has_default_value()` was `default_value is not None`, which made 1 and 3
    impossible to fix independently.
 5. `layout=torch.strided` was refused by every factory.
-6. `pin_memory=False` was refused by every factory.
+6. `pin_memory=False` was refused by every factory. (Update, issue #30: `pin_memory=True` on a
+   cpu target is now served as an ordinary unpinned cpu tensor; a non-cpu target still refuses by
+   name. The test that pinned the old `True` refusal was rewritten, see `docs/kernels/RANDOM.md` §3.)
 
 **Tests added**: 11 in `rust/torch_c/pytests/test_export6.py`. Every one
 compares against upstream torch's own answer in a second subprocess rather than
@@ -379,7 +381,7 @@ gap this round closed. §3.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_the_torchscript_type_singletons_are_the_objects_a_schema_hands_out present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_set_on_a_meta_tensor_with_a_meta_storage_is_metadata_and_is_allowed present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_layout_strided_is_accepted_and_every_other_layout_is_still_refused present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_pin_memory_false_is_accepted_and_pin_memory_true_is_still_refused present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export6.py test_pin_memory_false_agrees_with_upstream_and_true_gives_an_unpinned_cpu_tensor present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _default_python_value present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs seat_positionally present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/storage.rs is_meta_storage present -->
