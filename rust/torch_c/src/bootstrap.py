@@ -6200,8 +6200,16 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             return index
         if len(ellipses) > 1:
             raise IndexError("an index can only have a single ellipsis ('...')")
+        # A bool/uint8 mask consumes as many dims as it has (upstream's
+        # `count_specified_dimensions`); every other index consumes one.
+        # `y[0, m2, ..., 2]` with a 2-D `m2` is where counting it as one goes
+        # wrong: the ellipsis would expand one dim too wide.
         consumed = sum(
-            1 for item in index if item is not None and item is not Ellipsis
+            item.dim()
+            if isinstance(item, tensorbase) and item.dtype in (module.bool, module.uint8)
+            else 1
+            for item in index
+            if item is not None and item is not Ellipsis
         )
         at = ellipses[0]
         fill = (slice(None),) * max(self.dim() - consumed, 0)
@@ -6283,6 +6291,108 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     return tuple(index)
         return (index,)
 
+    def _mixed_getitem(self, index):
+        """Basic and advanced indices in one subscript -- `x[0, t]`.
+
+        Upstream's `applySlicing` walks the index once: an integer is a
+        `select.int` *at the current dim, which does not advance*, a slice is a
+        `slice.Tensor` (nothing for a full slice) and advances, a `None` is an
+        `unsqueeze` and advances, and a tensor is *recorded* at the current
+        dim rather than applied. One `index.Tensor` over the recorded tensors
+        closes the walk. Measured with a `TorchDispatchMode` logger on torch
+        2.13.0, `x` of shape (2, 5, 6, 7):
+
+            x[0, t]          (3, 6, 7)  [select.int, index.Tensor]
+            x[0, :, u]       (5, 3, 7)  [select.int, index.Tensor]
+            x[:, t, 0]       (2, 3, 7)  [select.int, index.Tensor]
+            x[1:, t]         (1, 3, 6, 7)  [slice.Tensor, index.Tensor]
+            x[0, None, t]    (1, 3, 6, 7)  [select.int, unsqueeze, index.Tensor]
+            x[0, t, 1, u]    (3,)       [select.int, select.int, index.Tensor]
+            x[z, t]          (3, 6, 7)  [_local_scalar_dense, select.int, index.Tensor]
+            y[0, m2, 1]      (3, 3)     [select.int, select.int, index.Tensor]
+
+        The second row is the one a NumPy-shaped implementation gets wrong:
+        NumPy treats the `0` as an advanced index too and, because a slice
+        separates it from `u`, moves the broadcast dims to the front --
+        (3, 5, 7). Upstream selects first, so there is nothing to move.
+
+        Two upstream details are reproduced exactly: a 0-d *integer* tensor
+        index is read out (`_local_scalar_dense`) and selected like a Python
+        int (row 7), and a bool/uint8 mask advances the walk by its own rank,
+        not by one (row 8 -- the `1` selects dim 2, after a 2-D mask).
+
+        The call site that made this necessary is transformers' continuous
+        batching (issue #13): `batch_data["input_ids"][0, logits_indices]` in
+        `generation/continuous_batching/model_runner.py:187` (5.15.1), reached
+        whenever a logits processor is active -- i.e. every sampling request.
+
+        Refused by name rather than approximated (AGENTS.md §18): a Python `bool` in a mixed
+        index (upstream lowers it to a 0-d mask -- `unsqueeze`, `empty`,
+        `fill_` -- not measured as used); a 0-d bool/uint8/float tensor index;
+        and a bool/uint8 mask of rank > 1 followed by another tensor index,
+        where the recorded list's layout after the mask has not been measured.
+        """
+        result = self
+        dim = 0
+        indices = []
+        wide_mask_seen = False
+        for item in index:
+            if item is None:
+                result = dispatch("aten.unsqueeze.default", result, dim)
+                dim += 1
+            elif isinstance(item, bool):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__getitem__ with a "
+                    "Python bool index mixed with other indices"
+                )
+            elif isinstance(item, int):
+                result = dispatch("aten.select.int", result, dim, item)
+            elif isinstance(item, slice):
+                if not _is_full_slice(item):
+                    result = dispatch(
+                        "aten.slice.Tensor",
+                        result,
+                        dim,
+                        item.start,
+                        item.stop,
+                        1 if item.step is None else item.step,
+                    )
+                dim += 1
+            elif _is_sequence_index(item) or isinstance(item, tensorbase):
+                tensor = (
+                    _lift_sequence_index(item) if _is_sequence_index(item) else item
+                )
+                is_mask = tensor.dtype in (module.bool, module.uint8)
+                if tensor.dim() == 0:
+                    if is_mask or tensor.is_floating_point():
+                        raise NotImplementedError(
+                            "not implemented in torch._C shim: TensorBase.__getitem__ "
+                            f"with a 0-d {tensor.dtype} tensor index mixed with other "
+                            "indices"
+                        )
+                    position = dispatch("aten._local_scalar_dense.default", tensor)
+                    result = dispatch("aten.select.int", result, dim, position)
+                    continue
+                if wide_mask_seen:
+                    raise NotImplementedError(
+                        "not implemented in torch._C shim: TensorBase.__getitem__ with "
+                        "a tensor index after a bool/uint8 mask of rank > 1 in a mixed "
+                        "index"
+                    )
+                indices.extend([None] * (dim - len(indices)))
+                indices.append(tensor)
+                if is_mask:
+                    wide_mask_seen = tensor.dim() > 1
+                    dim += tensor.dim()
+                else:
+                    dim += 1
+            else:
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: TensorBase.__getitem__ with "
+                    f"an index of type {type(item).__name__}"
+                )
+        return dispatch("aten.index.Tensor", result, indices)
+
     def __getitem__(self, index):
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
@@ -6299,12 +6409,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                 )
                 for item in index
             ):
-                raise NotImplementedError(
-                    "not implemented in torch._C shim: TensorBase.__getitem__ mixing "
-                    "a tensor index with integer or slice indices -- upstream applies "
-                    "basic indexing first and then aten.index.Tensor, and this shim "
-                    "does not reproduce that composition yet"
-                )
+                return _mixed_getitem(self, index)
             result = self
             dim = 0
             for item in index:

@@ -2456,15 +2456,17 @@ def test_getitem_decomposes_into_aten_calls():
     assert x[mask].tolist() == [[1.0, 2.0], [5.0, 6.0]]
 
 
-def test_getitem_refuses_mixing_a_tensor_with_a_slice():
+def test_getitem_mixing_a_mask_with_a_slice_gives_upstreams_answer():
+    # This test used to pin the refusal. Issue #13 implemented the mixed walk
+    # (continuous batching's `input_ids[0, logits_indices]` needed it), so it
+    # now pins upstream's answer instead, measured on torch 2.13.0:
+    # `x[mask, 0:1]` -> [[1.0], [5.0]], shape (2, 1). The full case list,
+    # compared against upstream in a separate process, is test_cbpath.py.
     x = _t([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2])
     mask = _t([1.0, 0.0, 1.0], [3], _C.bool)
-    try:
-        x[mask, 0:1]
-    except NotImplementedError:
-        pass
-    else:
-        raise AssertionError("mixed basic/advanced indexing is not implemented")
+    got = x[mask, 0:1]
+    assert tuple(got.shape) == (2, 1), got.shape
+    assert got.tolist() == [[1.0], [5.0]], got.tolist()
 
 
 def test_in_place_ops_mutate_the_receiver():
