@@ -553,7 +553,7 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor \
   $PY scripts/vendor/probe.py --mode strict --target torch; echo "EXIT=$?"
 
 $PY tests/golden/compare.py; echo "EXIT=$?"
-(cd crates/torch_c && ./pytests/run.sh); echo "EXIT=$?"
+bash tests/run.sh; echo "EXIT=$?"
 ```
 
 **`gen_surface.py` 는 벤더링 트리를 요구합니다.** 생성된 `surface.json` 은 크레이트에 있으므로

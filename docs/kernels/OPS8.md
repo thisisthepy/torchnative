@@ -334,7 +334,7 @@ DIST=/Volumes/macMini/caches/target-python
 cd crates/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
 
 # 호스트 빌드 + 스모크
-PYTHON=$PY ./pytests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
+PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 
 # 골든 · 스키마 — PYTHONPATH=vendor 를 **붙이지 않는다**.
 # 붙이면 벤더링 트리가 상류 torch 를 가려서 비교의 양쪽이 같은 것이 되고 가짜 실패가 난다.

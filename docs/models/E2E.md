@@ -117,7 +117,7 @@ argmax/topk, 아니면 누적합+이분탐색)와 그 워드 소비량을, `(n_c
 
 세 테스트 모두, **shim 쪽 입력만** 건드려 상류와 의도적으로 어긋나게 만든 뒤(=커널은 그대로,
 `src/` 는 전혀 건드리지 않음 — 다른 두 에이전트가 그 디렉터리에서 동시에 작업 중이었으므로),
-`PYTHON=$PY ./pytests/run.sh` 로 다시 돌려 `FAIL` 로 잡히는지 보고, 원래대로 되돌린 뒤
+`PYTHON=$PY bash tests/run.sh` 로 다시 돌려 `FAIL` 로 잡히는지 보고, 원래대로 되돌린 뒤
 `git diff`(정확히는 되돌린 파일과 되돌리기 전 사본의 `diff`)로 완전히 원상복구됐는지 확인했습니다.
 
 | 테스트 | 무엇을 깼나 | 결과 |
@@ -287,7 +287,7 @@ x 3 시드 재측정, `max_scale` 열). `HARNESS.md` 가 예시로 든 `k=512` �
 **로짓 assert.** `test_do_sample_matches_upstream_across_configs_and_reseed_modes` 의 첫 번째
 구성(`reseed, temperature=1.0, top_k=50, top_p=0.95, seed=0`)에서, 셰임 쪽 `c_logits` 의 마지막
 스텝 첫 원소에 `+5.9e-4` 를 더해(§ARCH.md 의 틀린-gelu 오차와 같은 자릿수) 임시로 주입한 뒤
-`./pytests/run.sh` 를 다시 돌렸습니다:
+`bash tests/run.sh` 를 다시 돌렸습니다:
 
 ```
 FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionError:
@@ -301,7 +301,7 @@ FAIL test_do_sample_matches_upstream_across_configs_and_reseed_modes: AssertionE
 
 원상복구 후 `diff /tmp/test_shim.py.orig tests/test_shim.py` 류의 바이트 비교와
 `git diff tests/test_shim.py` 로 주입 코드가 한 줄도 남지 않았음을 확인했고,
-`./pytests/run.sh` 를 다시 돌려 65 개 전부 `ok`, `EXIT=0` 을 재확인했습니다.
+`bash tests/run.sh` 를 다시 돌려 65 개 전부 `ok`, `EXIT=0` 을 재확인했습니다.
 
 **greedy 테스트의 기존 로짓 assert** 는 이미 §4 표에서 확인되어 있던 것을 재사용했습니다(다시
 깨지는지는 새로 확인하지 않았습니다 — 로직을 바꾸지 않고 상수 이름만 바꿨으므로).

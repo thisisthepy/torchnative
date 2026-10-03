@@ -244,7 +244,7 @@ undefined 로 남은 `Py*` 심볼은 **올바른 모양**입니다 — 로드 �
 ### 링크 성공은 증명이 아니다 — 그래서 호스트에서 돌렸다
 
 ```
-$ ./pytests/run.sh
+$ bash tests/run.sh
 ok   test_add_broadcasts_and_applies_alpha
 ok   test_add_refuses_to_guess_a_promotion
 ok   test_device_is_a_label_not_a_backend
@@ -394,7 +394,7 @@ DIST=/Volumes/macMini/caches/target-python
 cd crates/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준으로 찾는다
 
 # 호스트 + 실제 임포트 검증
-./pytests/run.sh; echo "EXIT=$?"
+bash tests/run.sh; echo "EXIT=$?"
 
 # Android
 ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/27.1.12297006 \

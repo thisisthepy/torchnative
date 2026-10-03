@@ -385,7 +385,7 @@ DIST=/Volumes/macMini/caches/target-python
 ./scripts/vendor/vendor_torch.sh
 
 cd crates/torch_c            # cd 필수 — .cargo/config.toml 은 cwd 기준
-PYTHON=$PY ./pytests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
+PYTHON=$PY bash tests/run.sh > /tmp/smoke.log 2>&1; echo "EXIT=$?"
 
 # 골든 · 스키마 — PYTHONPATH=vendor 를 붙이지 않는다.
 cd ../..

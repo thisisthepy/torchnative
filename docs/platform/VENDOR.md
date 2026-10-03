@@ -53,7 +53,7 @@ pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py313"] }
 
 | 타깃 | 종료 코드 | 산출물 크기 | 비고 |
 |---|---|---|---|
-| `aarch64-apple-darwin` | **0** | 1,406,592 B | `./pytests/run.sh` **13/13 통과** |
+| `aarch64-apple-darwin` | **0** | 1,406,592 B | `bash tests/run.sh` **13/13 통과** |
 | `aarch64-linux-android` | **0** | 2,274,800 B | |
 | `aarch64-apple-ios` | **0** | 1,496,544 B | |
 

@@ -488,7 +488,7 @@ PY=/Volumes/macMini/caches/spike-venv/bin/python
 ./scripts/vendor/install_shim.sh                       # 빌드 + 구멍에 넣기
 $PY tests/golden/compare.py;                        echo "EXIT=$?"
 $PY tests/verify_schemas.py;         echo "EXIT=$?"
-(cd crates/torch_c && ./pytests/run.sh);              echo "EXIT=$?"
+bash tests/run.sh;              echo "EXIT=$?"
 
 TORCH_USE_RTLD_GLOBAL=1 PYTHONPATH=$PWD/vendor $PY -c \
   "import torch; print(torch.full((2,), True).dtype, torch.arange(0,5,2).tolist())"

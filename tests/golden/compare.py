@@ -18,7 +18,7 @@ Needs a Python environment with real upstream torch installed (this repo's
 scratch venv has it: /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv, torch 2.13.0), and
 a built host artefact for `_C` (default host build location per
 docs/design/TORCH_C.md §7: /Volumes/macMini/thisisthepy/torchnative/.caches/cargo-target/release/lib_C.dylib,
-or built fresh via `cd crates/torch_c && ./pytests/run.sh` first).
+or built fresh via `bash tests/run.sh` first).
 
     /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tests/golden/compare.py
     /Volumes/macMini/thisisthepy/torchnative/.caches/spike-venv/bin/python tests/golden/compare.py \

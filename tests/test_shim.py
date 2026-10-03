@@ -6,7 +6,7 @@ renamed to `_C.so`, actually imports and computes.
 
 Run it against a built extension:
 
-    ./pytests/run.sh                      # builds, renames, runs
+    bash tests/run.sh                      # builds, renames, runs
     PYTHONPATH=<dir with _C.so> python3 -m pytest tests/test_shim.py
 
 Written with plain asserts so it runs under pytest or on its own, without
