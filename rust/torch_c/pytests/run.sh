@@ -354,6 +354,17 @@ fi
 # in $TMPDIR, which the OS purges). Reaping them would mean deleting a
 # directory this run does not own, which is the move that caused the
 # defect above; the storage is not worth reintroducing it.
+#
+# `TORCHNATIVE_GATE_RUNNER`: set only by `.github/workflows/gate.yml` (issue
+# #24). It names a hosted runner in `tools/ci/gate_suites.py`, and the ledger
+# then does not execute the suites that runner cannot run -- printing a SKIP
+# line for each, by name and with the reason -- and refuses to start if a
+# suite is in neither the CI list nor the local-only list. Unset, as it is on
+# the Mac, every suite runs exactly as before. Never set it locally to make a
+# gate shorter: the shortened run would read as the full gate.
+if [ -n "${TORCHNATIVE_GATE_RUNNER:-}" ]; then
+    echo "gate: CI runner '$TORCHNATIVE_GATE_RUNNER' -- suites it cannot run are skipped by name (tools/ci/gate_suites.py)"
+fi
 suite_failed=0
 suite_logs="$stage/suite-logs.$$"
 rm -rf "$suite_logs"
@@ -363,6 +374,7 @@ mkdir -p "$suite_logs"
     --python "${PYTHON:-python3}" \
     --suite-env "PYTHONPATH=$stage:$crate_dir/pytests" \
     ${vk_env:+--suite-env "$vk_env"} \
+    ${TORCHNATIVE_GATE_RUNNER:+--runner "$TORCHNATIVE_GATE_RUNNER"} \
     -- "$crate_dir"/pytests/test_*.py || suite_failed=1
 "${PYTHON:-python3}" "$crate_dir/pytests/vulkan_coverage.py" "$suite_logs"/*.log || suite_failed=1
 [ "$suite_failed" -eq 0 ] || exit 1

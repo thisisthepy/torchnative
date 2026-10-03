@@ -41,6 +41,14 @@ So the loop moved here, where the accounting can exist:
 The `SUITE LEDGER:` line at the end is therefore the only total worth quoting
 from a gate run: it is the one that has been checked against the files.
 
+* **On a CI runner (`--runner`, issue #24) nothing drops out unnamed.** The
+  plan comes from `tools/ci/gate_suites.py`. A suite in neither its CI list nor
+  its local-only list stops the run before any suite executes. A suite not
+  planned for the runner is not executed, and its log holds one line --
+  `SKIP <suite>: (whole suite) -- not run on CI runner '<r>': <reason>` -- so
+  it is in the SKIP column and named, and the `CI PLAN:` line lists every one.
+  Without `--runner` (the local gate) every suite runs, as before.
+
 `run.sh` additionally stages these logs in a per-run, PID-suffixed directory
 and holds a lock on `$stage`, so the collision cannot be staged in the first
 place. This script is the second line: it assumes nothing about who else is
@@ -48,6 +56,7 @@ on the machine and verifies what it reports.
 """
 
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -57,6 +66,18 @@ from pathlib import Path
 _OK = re.compile(r"^ok\s")
 _FAIL = re.compile(r"^FAIL\s")
 _SKIP = re.compile(r"^SKIP\s")
+
+
+_MANIFEST = Path(__file__).resolve().parents[3] / "tools" / "ci" / "gate_suites.py"
+
+
+def _load_manifest(path):
+    spec = importlib.util.spec_from_file_location("_gate_suites", path)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def tally(text):
@@ -93,6 +114,13 @@ def main(argv=None):
     ap.add_argument("--suite-env", action="append", default=[],
                     metavar="NAME=VALUE",
                     help="environment entry for each suite subprocess")
+    ap.add_argument("--runner", default=None,
+                    help="a CI runner named in tools/ci/gate_suites.py RUNNERS. "
+                         "Suites not planned for it are not executed; each is "
+                         "printed as a SKIP line naming it and the reason. "
+                         "Unset (the local gate): every suite runs, as before")
+    ap.add_argument("--manifest", default=str(_MANIFEST),
+                    help="the suite classification (default: %(default)s)")
     ap.add_argument("suites", nargs="*", help="the caller's glob expansion")
     args = ap.parse_args(argv)
 
@@ -124,6 +152,27 @@ def main(argv=None):
                 "suites run that are not files in %s: %s"
                 % (args.pytests, ", ".join(extra)))
 
+    # 1b. On a CI runner (issue #24), the plan for it. Refused before any
+    #     suite runs if a suite is in neither the CI list nor the local-only
+    #     list: a CI that goes green on a subset nobody chose is the failure
+    #     this exists to stop (tools/ci/gate_suites.py's docstring).
+    not_here = {}
+    if args.runner is not None:
+        try:
+            gs = _load_manifest(args.manifest)
+            _run, not_here, plan_problems = gs.plan(args.runner, on_disk)
+        except Exception as exc:                          # noqa: BLE001
+            print(f"SUITE LEDGER: FATAL -- cannot plan for CI runner "
+                  f"{args.runner!r}: {type(exc).__name__}: {exc}", flush=True)
+            return 1
+        if plan_problems:
+            for line in plan_problems:
+                print("SUITE LEDGER: FAIL -- " + line, flush=True)
+            print("SUITE LEDGER: refusing to run on CI runner %r: the suites "
+                  "run on CI plus the local-only suites would not be the full "
+                  "gate." % args.runner, flush=True)
+            return 1
+
     printed = {}   # suite -> (ok, fail, skip) as it went into the aggregate
     ran_rc = {}
     suite_failed = 0
@@ -132,9 +181,17 @@ def main(argv=None):
         name = suite.name
         log_path = logs / (name + ".log")
         print(f"--- {name} ---", flush=True)
-        with open(log_path, "wb") as fh:
-            rc = subprocess.call([python, str(suite)], stdout=fh,
-                                 stderr=subprocess.STDOUT, env=env)
+        if name in not_here:
+            # Not executed, and not silent: the line goes into the suite's
+            # log like any output, so the re-read below reconciles it too.
+            with open(log_path, "wb") as fh:
+                fh.write((gs.skip_line(name, args.runner, not_here[name])
+                          + "\n").encode())
+            rc = 0
+        else:
+            with open(log_path, "wb") as fh:
+                rc = subprocess.call([python, str(suite)], stdout=fh,
+                                     stderr=subprocess.STDOUT, env=env)
         ran_rc[name] = rc
         if rc != 0:
             suite_failed = 1
@@ -186,6 +243,12 @@ def main(argv=None):
             "log directory %s holds logs this run did not write: %s -- a "
             "second gate is staging into it" % (logs, ", ".join(stray)))
 
+    if args.runner is not None:
+        print("CI PLAN: runner=%s ran=%d/%d not-run=%d (UNVERIFIED on this "
+              "runner, local-only here): %s"
+              % (args.runner, len(printed) - len(not_here), len(printed),
+                 len(not_here), ", ".join(sorted(not_here)) or "none"),
+              flush=True)
     failed_suites = sorted(n for n, rc in ran_rc.items() if rc != 0)
     print("SUITE LEDGER: suites=%d/%d ok=%d FAIL=%d SKIP=%d "
           "(printed and re-read from %s; they agree)"
