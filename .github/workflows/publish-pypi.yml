@@ -254,7 +254,7 @@ jobs:
   gate:
     runs-on: macos-15  # Metal's MTLResidencySet is macOS 15+; candle's device setup panics on 14 (#65 follow-up)
     needs: [preflight, vendor]
-    timeout-minutes: 90
+    timeout-minutes: 180  # suites ~40 min + DOCWATCH's live probes ~70 min on a hosted macOS VM (run 37187795192)
     steps:
       - uses: actions/checkout@v4
         with:
